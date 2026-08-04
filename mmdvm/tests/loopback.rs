@@ -204,7 +204,7 @@ async fn send_dstar_header_writes_after_space_reported() -> TestResult {
     );
 
     // Now simulate the modem reporting dstar_space=10 (v2 layout).
-    //  mode=DStar(1), state=0, reserved=0, dstar=10, dmr1=0, dmr2=0,
+    //  mode=Dstar(1), state=0, reserved=0, dstar=10, dmr1=0, dmr2=0,
     //  ysf=0, p25=0, nxdn=0, reserved=0, fm=0, pocsag=0
     let status_payload = vec![1u8, 0, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0];
     modem_write(
@@ -267,11 +267,11 @@ async fn dstar_header_rx_emits_event() -> TestResult {
     )
     .await?;
 
-    // Drain events until we see DStarHeaderRx or a shutdown.
+    // Drain events until we see DstarHeaderRx or a shutdown.
     let mut seen = false;
     for _ in 0..20 {
         tokio::time::advance(Duration::from_millis(11)).await;
-        if let Ok(Some(Event::DStarHeaderRx { bytes })) =
+        if let Ok(Some(Event::DstarHeaderRx { bytes })) =
             timeout(Duration::from_millis(50), modem.next_event()).await
         {
             assert_eq!(bytes.as_slice(), header.as_slice());
@@ -279,7 +279,7 @@ async fn dstar_header_rx_emits_event() -> TestResult {
             break;
         }
     }
-    assert!(seen, "expected a DStarHeaderRx event");
+    assert!(seen, "expected a DstarHeaderRx event");
     Ok(())
 }
 
@@ -308,7 +308,7 @@ async fn frame_fragmented_byte_at_a_time_reassembles() -> TestResult {
     let mut seen = false;
     for _ in 0..20 {
         tokio::time::advance(Duration::from_millis(11)).await;
-        if let Ok(Some(Event::DStarDataRx { bytes })) =
+        if let Ok(Some(Event::DstarDataRx { bytes })) =
             timeout(Duration::from_millis(50), modem.next_event()).await
         {
             assert_eq!(
@@ -345,8 +345,8 @@ async fn two_frames_in_one_write_produce_ordered_events() -> TestResult {
     for _ in 0..20 {
         tokio::time::advance(Duration::from_millis(11)).await;
         match timeout(Duration::from_millis(50), modem.next_event()).await {
-            Ok(Some(Event::DStarDataRx { .. })) => events.push("data"),
-            Ok(Some(Event::DStarEot)) => {
+            Ok(Some(Event::DstarDataRx { .. })) => events.push("data"),
+            Ok(Some(Event::DstarEot)) => {
                 events.push("eot");
                 break;
             }
@@ -378,7 +378,7 @@ async fn v1_handshake_selects_v1_status_offsets() -> TestResult {
     .await?;
 
     // v1 status layout: [unused, mode(1), state(2), dstar(3),
-    // dmr1(4), dmr2(5), ysf(6)]; mode DStar, CD set, dstar=12.
+    // dmr1(4), dmr2(5), ysf(6)]; mode Dstar, CD set, dstar=12.
     // Misparsed as v2 this would read mode=Idle from payload[0] and
     // reject the 7-byte payload as too short.
     modem_write(
@@ -411,7 +411,7 @@ async fn v1_handshake_selects_v1_status_offsets() -> TestResult {
     }
     assert!(saw_version, "expected the v1 Version event first");
     let status = status.ok_or("expected a Status event parsed with v1 offsets")?;
-    assert_eq!(status.mode, ModemMode::DStar);
+    assert_eq!(status.mode, ModemMode::Dstar);
     assert!(status.cd(), "CD flag lives at v1 offset 2");
     assert!(!status.tx());
     assert_eq!(status.dstar_space, 12);
@@ -478,7 +478,7 @@ async fn resync_recovers_past_spurious_frame_start_in_garbage() -> TestResult {
         tokio::time::advance(Duration::from_millis(11)).await;
         if matches!(
             timeout(Duration::from_millis(50), modem.next_event()).await,
-            Ok(Some(Event::DStarEot))
+            Ok(Some(Event::DstarEot))
         ) {
             saw_eot = true;
             break;
@@ -539,7 +539,7 @@ async fn set_mode_resolves_ok_on_ack() -> TestResult {
     let _init =
         collect_frames_until(&mut modem_side, |_| None::<()>, Duration::from_millis(100)).await;
 
-    let (set_result, drive_result) = tokio::join!(modem.set_mode(ModemMode::DStar), async {
+    let (set_result, drive_result) = tokio::join!(modem.set_mode(ModemMode::Dstar), async {
         // Wait for the SetMode frame on the wire, then ACK it.
         let hit = collect_frames_until(
             &mut modem_side,
@@ -573,7 +573,7 @@ async fn set_mode_resolves_err_on_nak() -> TestResult {
     let _init =
         collect_frames_until(&mut modem_side, |_| None::<()>, Duration::from_millis(100)).await;
 
-    let (set_result, drive_result) = tokio::join!(modem.set_mode(ModemMode::DStar), async {
+    let (set_result, drive_result) = tokio::join!(modem.set_mode(ModemMode::Dstar), async {
         let hit = collect_frames_until(
             &mut modem_side,
             |f| (f.command == MMDVM_SET_MODE).then_some(()),
@@ -615,7 +615,7 @@ async fn set_mode_times_out_on_silent_modem() -> TestResult {
 
     // The modem never replies. set_mode must not hang; it must fail
     // with a response timeout in bounded time.
-    let result = timeout(Duration::from_secs(30), modem.set_mode(ModemMode::DStar)).await;
+    let result = timeout(Duration::from_secs(30), modem.set_mode(ModemMode::Dstar)).await;
     let inner = result.map_err(|_| "set_mode must not hang on a silent modem")?;
     assert!(
         matches!(inner, Err(ShellError::ResponseTimeout)),
@@ -639,7 +639,7 @@ async fn set_mode_ignores_ack_for_a_different_command() -> TestResult {
         collect_frames_until(&mut modem_side, |_| None::<()>, Duration::from_millis(100)).await;
 
     let (set_result, drive_result) = tokio::join!(
-        timeout(Duration::from_secs(30), modem.set_mode(ModemMode::DStar)),
+        timeout(Duration::from_secs(30), modem.set_mode(ModemMode::Dstar)),
         async {
             let hit = collect_frames_until(
                 &mut modem_side,
@@ -880,7 +880,7 @@ async fn malformed_responses_emit_protocol_violation() -> TestResult {
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn full_event_channel_does_not_block_loop() -> TestResult {
+async fn lagging_event_consumer_gets_exact_loss_without_blocking_loop() -> TestResult {
     let (client_side, mut modem_side) = duplex_pair();
     let mut modem = AsyncModem::spawn(client_side);
 
@@ -889,7 +889,7 @@ async fn full_event_channel_does_not_block_loop() -> TestResult {
         collect_frames_until(&mut modem_side, |_| None::<()>, Duration::from_millis(100)).await;
 
     // Flood the loop with 300 inbound EOT frames without consuming a
-    // single event, more than the event channel can hold. A loop
+    // single event, 44 more than the 256-slot event ring can hold. A loop
     // that blocks on event delivery wedges here and can never process
     // another command (the deadlock: consumer waits on the loop, the
     // loop waits on the consumer).
@@ -903,6 +903,14 @@ async fn full_event_channel_does_not_block_loop() -> TestResult {
     assert!(
         matches!(result, Ok(Ok(()))),
         "loop must stay responsive with a full event channel: {result:?}"
+    );
+
+    // The gap is part of the typed event stream. It must not be
+    // relegated to a log line or silently inferred from missing EOTs.
+    let loss = timeout(Duration::from_millis(500), modem.next_event()).await;
+    assert!(
+        matches!(loss, Ok(Some(Event::EventsDropped { count: 44 }))),
+        "receiver must report the exact overwritten count: {loss:?}"
     );
     Ok(())
 }
@@ -932,7 +940,7 @@ async fn malformed_bytes_are_swallowed() -> TestResult {
     modem_side
         .write_all(&[0x13, 0x37, 0xDE, 0xAD, 0xBE, 0xEF])
         .await?;
-    // Then an actually-valid DStarEot frame.
+    // Then an actually-valid DstarEot frame.
     modem_write(&mut modem_side, &MmdvmFrame::new(MMDVM_DSTAR_EOT)).await?;
 
     // Loop should still be alive and able to emit events.
@@ -941,7 +949,7 @@ async fn malformed_bytes_are_swallowed() -> TestResult {
         tokio::time::advance(Duration::from_millis(11)).await;
         if matches!(
             timeout(Duration::from_millis(50), modem.next_event()).await,
-            Ok(Some(Event::DStarEot))
+            Ok(Some(Event::DstarEot))
         ) {
             saw_eot = true;
             break;

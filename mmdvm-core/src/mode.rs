@@ -23,7 +23,7 @@ pub enum ModemMode {
     /// No mode active.
     Idle,
     /// D-STAR digital voice.
-    DStar,
+    Dstar,
     /// DMR Tier II digital voice.
     Dmr,
     /// Yaesu System Fusion (C4FM).
@@ -52,7 +52,7 @@ impl ModemMode {
     pub const fn as_byte(self) -> u8 {
         match self {
             Self::Idle => MODE_IDLE,
-            Self::DStar => MODE_DSTAR,
+            Self::Dstar => MODE_DSTAR,
             Self::Dmr => MODE_DMR,
             Self::Ysf => MODE_YSF,
             Self::P25 => MODE_P25,
@@ -75,7 +75,7 @@ impl ModemMode {
     #[must_use]
     pub const fn from_byte(b: u8) -> Self {
         match b {
-            MODE_DSTAR => Self::DStar,
+            MODE_DSTAR => Self::Dstar,
             MODE_DMR => Self::Dmr,
             MODE_YSF => Self::Ysf,
             MODE_P25 => Self::P25,
@@ -100,7 +100,7 @@ mod tests {
     fn roundtrip_all_known_modes() {
         let all = [
             ModemMode::Idle,
-            ModemMode::DStar,
+            ModemMode::Dstar,
             ModemMode::Dmr,
             ModemMode::Ysf,
             ModemMode::P25,
@@ -128,7 +128,7 @@ mod tests {
 
     #[test]
     fn mode_byte_values_match_command_constants() {
-        assert_eq!(ModemMode::DStar.as_byte(), MODE_DSTAR);
+        assert_eq!(ModemMode::Dstar.as_byte(), MODE_DSTAR);
         assert_eq!(ModemMode::Fm.as_byte(), MODE_FM);
         assert_eq!(ModemMode::Quit.as_byte(), MODE_QUIT);
     }

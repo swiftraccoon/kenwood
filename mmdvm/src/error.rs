@@ -52,9 +52,9 @@ mod tests {
     #[test]
     fn buffer_full_reports_mode() {
         let err = ShellError::BufferFull {
-            mode: ModemMode::DStar,
+            mode: ModemMode::Dstar,
         };
-        assert!(err.to_string().contains("DStar"));
+        assert!(err.to_string().contains("Dstar"));
     }
 
     #[test]

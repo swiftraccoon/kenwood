@@ -76,7 +76,7 @@ async fn modem_write(stream: &mut DuplexStream, frame: &MmdvmFrame) -> TestResul
 
 /// v2 status payload with the given `dstar_space`.
 fn status_v2(dstar_space: u8) -> Vec<u8> {
-    //  mode=DStar(1), state=0, reserved=0, dstar=N, dmr1=0, dmr2=0,
+    //  mode=Dstar(1), state=0, reserved=0, dstar=N, dmr1=0, dmr2=0,
     //  ysf=0, p25=0, nxdn=0, reserved=0, fm=0, pocsag=0
     vec![1, 0, 0, dstar_space, 0, 0, 0, 0, 0, 0, 0, 0]
 }

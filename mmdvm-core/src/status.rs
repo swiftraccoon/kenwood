@@ -307,11 +307,11 @@ mod tests {
 
     #[test]
     fn v1_minimum_payload() -> TestResult {
-        // proto=1, mode=DStar, state=0 (all flags clear), dstar=10,
+        // proto=1, mode=Dstar, state=0 (all flags clear), dstar=10,
         // dmr1/dmr2/ysf=0: the 7-byte v1 minimum.
         let payload = [1, 1, 0, 10, 0, 0, 0];
         let s = ModemStatus::parse_v1(&payload)?;
-        assert_eq!(s.mode, ModemMode::DStar);
+        assert_eq!(s.mode, ModemMode::Dstar);
         assert!(!s.tx());
         assert_eq!(s.dstar_space, 10);
         assert_eq!(s.fm_space, 0, "v1 always reports 0 FM space");
@@ -341,7 +341,7 @@ mod tests {
 
     #[test]
     fn v2_includes_fm_space() -> TestResult {
-        // Index layout: mode=1(DStar), state=0, reserved=0, dstar=2,
+        // Index layout: mode=1(Dstar), state=0, reserved=0, dstar=2,
         // dmr1=3, dmr2=4, ysf=5, p25=6, nxdn=7, reserved=0, fm=8, pocsag=9.
         let payload = [1, 0, 0, 2, 3, 4, 5, 6, 7, 0, 8, 9];
         let s = ModemStatus::parse_v2(&payload)?;

@@ -85,7 +85,7 @@ impl TxQueue {
             command: MMDVM_DSTAR_HEADER,
             payload: bytes.to_vec(),
             slots_required: DSTAR_HEADER_SLOTS,
-            mode: ModemMode::DStar,
+            mode: ModemMode::Dstar,
         })
     }
 
@@ -99,7 +99,7 @@ impl TxQueue {
             command: MMDVM_DSTAR_DATA,
             payload: bytes.to_vec(),
             slots_required: DSTAR_DATA_SLOTS,
-            mode: ModemMode::DStar,
+            mode: ModemMode::Dstar,
         })
     }
 
@@ -113,7 +113,7 @@ impl TxQueue {
             command: MMDVM_DSTAR_EOT,
             payload: Vec::new(),
             slots_required: DSTAR_EOT_SLOTS,
-            mode: ModemMode::DStar,
+            mode: ModemMode::Dstar,
         })
     }
 
@@ -172,7 +172,7 @@ mod tests {
             .ok_or("expected frame")?;
         assert_eq!(head.command, MMDVM_DSTAR_HEADER);
         assert_eq!(head.slots_required, DSTAR_HEADER_SLOTS);
-        assert_eq!(head.mode, ModemMode::DStar);
+        assert_eq!(head.mode, ModemMode::Dstar);
         assert!(q.is_empty());
         Ok(())
     }

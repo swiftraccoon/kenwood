@@ -2,7 +2,7 @@
 //! task.
 
 use mmdvm_core::ModemMode;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::error::ShellError;
@@ -18,7 +18,7 @@ use super::{Command, Event, ModemLoop};
 /// unboundedly.
 const COMMAND_CHANNEL_CAPACITY: usize = 32;
 
-/// Capacity of the event channel from modem task to handle.
+/// Capacity of the event ring from modem task to handle.
 ///
 /// Events cover both periodic status pushes and inbound radio frames.
 /// 256 covers a full D-STAR transmission (~100 voice frames) plus
@@ -46,7 +46,7 @@ const SET_MODE_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from
 #[derive(Debug)]
 pub struct AsyncModem<T: Transport + 'static> {
     command_tx: mpsc::Sender<Command>,
-    event_rx: mpsc::Receiver<Event>,
+    event_rx: broadcast::Receiver<Event>,
     join_handle: Option<JoinHandle<Result<T, ShellError>>>,
 }
 
@@ -76,7 +76,7 @@ impl<T: Transport + 'static> AsyncModem<T> {
     #[must_use]
     pub fn spawn(transport: T) -> Self {
         let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
-        let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let (event_tx, event_rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
 
         let loop_state = ModemLoop::new(transport, command_rx, event_tx);
         let join_handle = tokio::spawn(async move { loop_state.run().await });
@@ -94,15 +94,19 @@ impl<T: Transport + 'static> AsyncModem<T> {
     /// has been fully drained.
     ///
     /// Consume events promptly: the modem loop never blocks on a slow
-    /// consumer. If the event channel fills up, further events are
-    /// dropped (and counted in a `warn` log) until the consumer
-    /// catches up, mirroring the reference's fixed-size ring buffers.
+    /// consumer. If the bounded event ring wraps, the next call returns
+    /// [`Event::EventsDropped`] with the exact number of overwritten
+    /// events before delivery resumes at the oldest retained event.
     ///
     /// # Cancellation safety
     ///
-    /// Cancel-safe: backed by `tokio::sync::mpsc::Receiver::recv`.
+    /// Cancel-safe: backed by `tokio::sync::broadcast::Receiver::recv`.
     pub async fn next_event(&mut self) -> Option<Event> {
-        self.event_rx.recv().await
+        match self.event_rx.recv().await {
+            Ok(event) => Some(event),
+            Err(broadcast::error::RecvError::Lagged(count)) => Some(Event::EventsDropped { count }),
+            Err(broadcast::error::RecvError::Closed) => None,
+        }
     }
 
     /// Enqueue a D-STAR header for transmission.
@@ -313,7 +317,7 @@ impl<T: Transport + 'static> AsyncModem<T> {
         // Drain any remaining events so the loop can finish its
         // flush. Once the send half drops (when the loop exits), this
         // terminates, also immediately if the loop was already gone.
-        while self.event_rx.recv().await.is_some() {}
+        while self.next_event().await.is_some() {}
 
         // Reclaim the transport from the task.
         let handle = self.join_handle.take().ok_or(ShellError::SessionClosed)?;

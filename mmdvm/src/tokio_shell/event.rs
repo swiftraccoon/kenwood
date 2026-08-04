@@ -26,20 +26,20 @@ pub enum Event {
         reason: NakReason,
     },
     /// D-STAR header received from the radio's MMDVM TX (41 bytes).
-    DStarHeaderRx {
+    DstarHeaderRx {
         /// The 41 raw header bytes.
         bytes: [u8; 41],
     },
     /// D-STAR voice data received from the radio (9 AMBE + 3 slow
     /// data = 12 bytes).
-    DStarDataRx {
+    DstarDataRx {
         /// The 12 raw voice-frame bytes.
         bytes: [u8; 12],
     },
     /// D-STAR signal lost from the radio side.
-    DStarLost,
+    DstarLost,
     /// D-STAR end-of-transmission from the radio side.
-    DStarEot,
+    DstarEot,
     /// Debug text from the modem firmware
     /// (`MMDVM_DEBUG1..DEBUG5`).
     Debug {
@@ -79,6 +79,17 @@ pub enum Event {
     TxDropped {
         /// Number of frames discarded.
         frames: usize,
+    },
+    /// The bounded event ring overwrote events before the consumer
+    /// could receive them.
+    ///
+    /// This is an explicit stream discontinuity. The modem loop never
+    /// blocks event delivery because doing so could deadlock a caller
+    /// awaiting a command reply, but a slow consumer is told exactly
+    /// how many events it missed instead of observing a silent gap.
+    EventsDropped {
+        /// Exact number of overwritten events.
+        count: u64,
     },
     /// The modem sent a frame that violates the protocol layout for
     /// its command byte (wrong payload length or unparseable

@@ -12,11 +12,11 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 #[test]
 fn parse_v1_all_flags_set() -> TestResult {
-    // proto=1, mode=DStar(1), state=0x7F (every flag set), dstar=0,
+    // proto=1, mode=Dstar(1), state=0x7F (every flag set), dstar=0,
     // dmr1/dmr2/ysf=0.
     let payload = [1, 1, 0x7F, 0, 0, 0, 0];
     let s = ModemStatus::parse_v1(&payload)?;
-    assert_eq!(s.mode, ModemMode::DStar);
+    assert_eq!(s.mode, ModemMode::Dstar);
     assert!(s.tx());
     assert!(s.adc_overflow());
     assert!(s.rx_overflow());
@@ -102,7 +102,7 @@ fn parse_v1_optional_tail_fields_default_to_zero() -> TestResult {
 fn parse_v2_includes_fm_space() -> TestResult {
     // Explicitly test the new v2 FM-space field, which didn't exist in v1.
     let mut payload = [0u8; 12];
-    payload[0] = 1; // mode=DStar (just for diversity)
+    payload[0] = 1; // mode=Dstar (just for diversity)
     payload[10] = 0x42;
     let s = ModemStatus::parse_v2(&payload)?;
     assert_eq!(s.fm_space, 0x42);

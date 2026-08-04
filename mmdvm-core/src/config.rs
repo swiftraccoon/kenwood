@@ -70,12 +70,12 @@ mod tests {
     #[test]
     fn struct_fields_are_publicly_writable() {
         let mut c = ModemConfig::idle();
-        c.mode = ModemMode::DStar;
+        c.mode = ModemMode::Dstar;
         c.mode_flags = 0x01;
         c.tx_delay = 10;
         c.rx_level = 128;
         c.tx_level = 128;
-        assert_eq!(c.mode, ModemMode::DStar);
+        assert_eq!(c.mode, ModemMode::Dstar);
         assert_eq!(c.tx_delay, 10);
     }
 }

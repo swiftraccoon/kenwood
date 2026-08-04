@@ -30,7 +30,7 @@ use mmdvm_core::{
     decode_frame, encode_frame,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::Instant;
 
 use crate::error::ShellError;
@@ -82,7 +82,7 @@ pub(crate) struct ModemLoop<T: Transport> {
     transport: T,
     rx_buffer: Vec<u8>,
     command_rx: mpsc::Receiver<Command>,
-    event_tx: mpsc::Sender<Event>,
+    event_tx: broadcast::Sender<Event>,
     tx_queue: TxQueue,
     dstar_space: u8,
     protocol_version: u8,
@@ -95,9 +95,6 @@ pub(crate) struct ModemLoop<T: Transport> {
     /// (`MMDVM/SerialPort.cpp` `processMessage`), so the caller's
     /// result reflects whether the mode change actually happened.
     pending_set_mode: Option<oneshot::Sender<Result<(), ShellError>>>,
-    /// Events dropped since the event channel was last writable.
-    /// See [`ModemLoop::emit_event`].
-    dropped_events: u64,
 }
 
 impl<T: Transport> ModemLoop<T> {
@@ -105,7 +102,7 @@ impl<T: Transport> ModemLoop<T> {
     pub(crate) fn new(
         transport: T,
         command_rx: mpsc::Receiver<Command>,
-        event_tx: mpsc::Sender<Event>,
+        event_tx: broadcast::Sender<Event>,
     ) -> Self {
         Self {
             transport,
@@ -120,7 +117,6 @@ impl<T: Transport> ModemLoop<T> {
             shutting_down: false,
             flush_deadline: None,
             pending_set_mode: None,
-            dropped_events: 0,
         }
     }
 
@@ -316,7 +312,7 @@ impl<T: Transport> ModemLoop<T> {
                     self.tx_queue
                         .push_dstar_header(bytes)
                         .map_err(|_| ShellError::BufferFull {
-                            mode: ModemMode::DStar,
+                            mode: ModemMode::Dstar,
                         });
                 let _send_result = reply.send(result);
             }
@@ -325,7 +321,7 @@ impl<T: Transport> ModemLoop<T> {
                     self.tx_queue
                         .push_dstar_data(bytes)
                         .map_err(|_| ShellError::BufferFull {
-                            mode: ModemMode::DStar,
+                            mode: ModemMode::Dstar,
                         });
                 let _send_result = reply.send(result);
             }
@@ -334,7 +330,7 @@ impl<T: Transport> ModemLoop<T> {
                     .tx_queue
                     .push_dstar_eot()
                     .map_err(|_| ShellError::BufferFull {
-                        mode: ModemMode::DStar,
+                        mode: ModemMode::Dstar,
                     });
                 let _send_result = reply.send(result);
             }
@@ -459,10 +455,10 @@ impl<T: Transport> ModemLoop<T> {
             MMDVM_DSTAR_HEADER => self.emit_dstar_header(&frame.payload),
             MMDVM_DSTAR_DATA => self.emit_dstar_data(&frame.payload),
             MMDVM_DSTAR_LOST => {
-                self.emit_event(Event::DStarLost);
+                self.emit_event(Event::DstarLost);
             }
             MMDVM_DSTAR_EOT => {
-                self.emit_event(Event::DStarEot);
+                self.emit_event(Event::DstarEot);
             }
             MMDVM_DEBUG1 | MMDVM_DEBUG2 | MMDVM_DEBUG3 | MMDVM_DEBUG4 | MMDVM_DEBUG5
             | MMDVM_DEBUG_DUMP => {
@@ -519,7 +515,7 @@ impl<T: Transport> ModemLoop<T> {
     /// Emit [`Event::ProtocolViolation`] for a frame whose payload
     /// doesn't match its command's wire layout, with a matching
     /// `warn` log.
-    fn protocol_violation(&mut self, command: u8, detail: &str) {
+    fn protocol_violation(&self, command: u8, detail: &str) {
         tracing::warn!(
             target: "mmdvm::tokio_shell",
             command = format!("0x{command:02X}"),
@@ -532,51 +528,29 @@ impl<T: Transport> ModemLoop<T> {
         });
     }
 
-    /// Deliver an event to the consumer without ever blocking the
-    /// loop.
+    /// Deliver an event to the bounded consumer ring without ever
+    /// blocking the loop.
     ///
-    /// The event channel is bounded; blocking on a full channel would
+    /// Blocking on a full channel would
     /// deadlock a single-task consumer that is awaiting a command
     /// reply while the channel is full (the consumer waits on the
-    /// loop, the loop waits on the consumer). The reference instead
-    /// decouples modem I/O from its consumer with fixed-size ring
-    /// buffers that lose data when full. We mirror that: excess
-    /// events are dropped and counted.
-    fn emit_event(&mut self, event: Event) {
-        match self.event_tx.try_send(event) {
-            Ok(()) => {
-                if self.dropped_events > 0 {
-                    tracing::warn!(
-                        target: "mmdvm::tokio_shell",
-                        dropped = self.dropped_events,
-                        "event channel recovered; events were dropped while it was full"
-                    );
-                    self.dropped_events = 0;
-                }
-            }
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                if self.dropped_events == 0 {
-                    tracing::warn!(
-                        target: "mmdvm::tokio_shell",
-                        "event channel full; dropping events until the consumer catches up"
-                    );
-                }
-                self.dropped_events += 1;
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                tracing::debug!(
-                    target: "mmdvm::tokio_shell",
-                    "event consumer dropped; suppressing further events"
-                );
-            }
+    /// loop, the loop waits on the consumer). A broadcast channel is a
+    /// fixed-size ring: it keeps the loop nonblocking and its receiver
+    /// reports the exact overwritten count as [`Event::EventsDropped`].
+    fn emit_event(&self, event: Event) {
+        if self.event_tx.send(event).is_err() {
+            tracing::debug!(
+                target: "mmdvm::tokio_shell",
+                "event consumer dropped; suppressing further events"
+            );
         }
     }
 
     /// Parse a D-STAR header payload and emit the corresponding
     /// event.
-    fn emit_dstar_header(&mut self, payload: &[u8]) {
+    fn emit_dstar_header(&self, payload: &[u8]) {
         if let Ok(bytes) = <[u8; 41]>::try_from(payload) {
-            self.emit_event(Event::DStarHeaderRx { bytes });
+            self.emit_event(Event::DstarHeaderRx { bytes });
         } else {
             self.protocol_violation(
                 MMDVM_DSTAR_HEADER,
@@ -590,9 +564,9 @@ impl<T: Transport> ModemLoop<T> {
 
     /// Parse a D-STAR voice data payload and emit the corresponding
     /// event.
-    fn emit_dstar_data(&mut self, payload: &[u8]) {
+    fn emit_dstar_data(&self, payload: &[u8]) {
         if let Ok(bytes) = <[u8; 12]>::try_from(payload) {
-            self.emit_event(Event::DStarDataRx { bytes });
+            self.emit_event(Event::DstarDataRx { bytes });
         } else {
             self.protocol_violation(
                 MMDVM_DSTAR_DATA,
@@ -609,7 +583,7 @@ impl<T: Transport> ModemLoop<T> {
     /// `command` selects the level: DEBUG1..DEBUG5 map to 1..5, and
     /// `MMDVM_DEBUG_DUMP` uses level 0 as a sentinel for "this is a
     /// raw hex dump rather than readable text".
-    fn emit_debug(&mut self, command: u8, payload: &[u8]) {
+    fn emit_debug(&self, command: u8, payload: &[u8]) {
         let level = match command {
             MMDVM_DEBUG1 => 1,
             MMDVM_DEBUG2 => 2,

@@ -22,13 +22,13 @@ fn idle_config_defaults() {
 #[test]
 fn fields_are_writable() {
     let mut c = ModemConfig::idle();
-    c.mode = ModemMode::DStar;
+    c.mode = ModemMode::Dstar;
     c.mode_flags = 0x01;
     c.rx_level = 50;
     c.tx_level = 128;
     c.tx_delay = 10;
     c.invert = 0x02;
-    assert_eq!(c.mode, ModemMode::DStar);
+    assert_eq!(c.mode, ModemMode::Dstar);
     assert_eq!(c.mode_flags, 0x01);
     assert_eq!(c.rx_level, 50);
     assert_eq!(c.tx_level, 128);
