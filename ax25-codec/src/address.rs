@@ -220,6 +220,16 @@ impl Ssid {
     pub const fn get(self) -> u8 {
         self.0
     }
+
+    /// Return this SSID minus one, keeping zero at zero.
+    ///
+    /// This is useful for APRS New-N digipeater hop counters. Because the
+    /// operation starts from a validated [`Ssid`], its result is also a
+    /// valid [`Ssid`] and needs no fallback or repeated range check.
+    #[must_use]
+    pub const fn saturating_decrement(self) -> Self {
+        Self(self.0.saturating_sub(1))
+    }
 }
 
 impl fmt::Display for Ssid {
@@ -288,6 +298,48 @@ impl Ax25Address {
     pub const fn from_parts(callsign: Callsign, ssid: Ssid) -> Self {
         Self { callsign, ssid }
     }
+
+    /// Parse a canonical display-form address.
+    ///
+    /// Accepted values are an uppercase AX.25 callsign by itself, such as
+    /// `"W1AW"`, or a callsign followed by an SSID from 1 through 15, such
+    /// as `"N0CALL-7"`. Because SSID zero is displayed without a suffix,
+    /// `-0` and zero-padded suffixes are rejected rather than silently
+    /// normalized.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Ax25Error::InvalidCallsign`], [`Ax25Error::InvalidSsid`],
+    /// or [`Ax25Error::InvalidAddress`] when `value` is not canonical.
+    pub fn from_canonical_str(value: &str) -> Result<Self, Ax25Error> {
+        let (callsign, ssid) = match value.split_once('-') {
+            None => (Callsign::new(value)?, Ssid::ZERO),
+            Some((callsign, suffix)) => {
+                if suffix.is_empty() {
+                    return Err(Ax25Error::InvalidAddress(
+                        "SSID suffix must not be empty".to_string(),
+                    ));
+                }
+                if suffix.starts_with('0') {
+                    return Err(Ax25Error::InvalidAddress(
+                        "SSID zero must be omitted and nonzero SSIDs must not be zero-padded"
+                            .to_string(),
+                    ));
+                }
+                if !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return Err(Ax25Error::InvalidAddress(
+                        "SSID suffix must contain only decimal digits".to_string(),
+                    ));
+                }
+                let raw_ssid = suffix.parse::<u8>().map_err(|_| {
+                    Ax25Error::InvalidAddress("SSID suffix must be in the range 1-15".to_string())
+                })?;
+                (Callsign::new(callsign)?, Ssid::new(raw_ssid)?)
+            }
+        };
+
+        Ok(Self::from_parts(callsign, ssid))
+    }
 }
 
 impl fmt::Display for Ax25Address {
@@ -297,6 +349,14 @@ impl fmt::Display for Ax25Address {
         } else {
             write!(f, "{}-{}", self.callsign, self.ssid)
         }
+    }
+}
+
+impl core::str::FromStr for Ax25Address {
+    type Err = Ax25Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::from_canonical_str(value)
     }
 }
 
@@ -444,5 +504,44 @@ mod tests {
             matches!(r, Err(Ax25Error::InvalidSsid(16))),
             "expected InvalidSsid(16), got {r:?}"
         );
+    }
+
+    #[test]
+    fn ssid_saturating_decrement_preserves_the_valid_range() -> TestResult {
+        assert_eq!(Ssid::ZERO.saturating_decrement(), Ssid::ZERO);
+        assert_eq!(Ssid::new(1)?.saturating_decrement(), Ssid::ZERO);
+        assert_eq!(Ssid::new(Ssid::MAX)?.saturating_decrement().get(), 14);
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_address_parser_preserves_display_form() -> TestResult {
+        let without_ssid = Ax25Address::from_canonical_str("W1AW")?;
+        let with_ssid = Ax25Address::from_canonical_str("N0CALL-15")?;
+
+        assert_eq!(without_ssid.to_string(), "W1AW");
+        assert_eq!(without_ssid.ssid, Ssid::ZERO);
+        assert_eq!(with_ssid.to_string(), "N0CALL-15");
+        assert_eq!(with_ssid.ssid, Ssid::new(15)?);
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_address_parser_rejects_normalizing_inputs() {
+        for invalid in [
+            "n0call-7",
+            "N0CALL-0",
+            "N0CALL-00",
+            "N0CALL-07",
+            "N0CALL-",
+            "N0CALL-16",
+            "N0CALL-A",
+            "N0CALL-7-1",
+        ] {
+            assert!(
+                Ax25Address::from_canonical_str(invalid).is_err(),
+                "accepted noncanonical address {invalid:?}"
+            );
+        }
     }
 }

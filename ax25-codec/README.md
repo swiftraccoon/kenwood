@@ -8,7 +8,8 @@ AX.25 v2.2 frame encode/decode. `no_std` + `alloc`, sans-io.
 - `parse_ax25(&[u8]) -> Result<Ax25Packet, Ax25Error>` and `build_ax25(&Ax25Packet) -> Vec<u8>`.
 - `Ax25Control` classification: Information / Supervisory{RR, RNR, REJ, SREJ} / Unnumbered{UI, SABM, DISC, DM, UA, FRMR, XID, TEST, ...}.
 - `Ax25Pid` enum with 14 canonical values (NoLayer3, NetRom, Ip, Arp, Appletalk, TexNet, LinkQuality, FlexNet, ...).
-- `CommandResponse` classification per AX.25 v2.2 §6.1.2.
+- Lossless `CommandResponse` classification per AX.25 v2.2 §6.1.2,
+  including both pre-v2.0 equal-C-bit wire forms.
 - `ax25_fcs(&[u8]) -> u16` CRC-16-CCITT.
 - Validated address types: `Ax25Address`, `Callsign` (1–6 ASCII upper/digit), `Ssid` (0–15), and `RouteEntry` (a digipeater hop: address + H-bit).
 
