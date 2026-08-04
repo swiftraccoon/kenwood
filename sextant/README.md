@@ -13,7 +13,7 @@ listening; treat transmit as experimental.**
 ## Features
 
 - Connect to DExtra / DPlus / DCS reflectors: searchable directory
-  (XLX registry + DPlus host list), favorites, recent-connection
+  (bundled entries + DPlus auth host list), favorites, recent-connection
   shortcuts, auto-reconnect with backoff.
 - Receive voice: AMBE decode with packet-loss concealment, playback
   priming against network jitter, click-free stream boundaries, and
@@ -27,6 +27,12 @@ listening; treat transmit as experimental.**
 - Audio device selection, RX recording to WAV, local WAV playback.
 - Windowed-sinc resampling between the hardware rate and the 8 kHz
   codec rate (anti-aliasing built in).
+
+On the first launch after upgrading from a version that used the plaintext
+XLX registry, Sextant resets the saved reflector target plus host-bearing
+favorites and recents. Those older settings did not record whether an address
+was entered manually or copied from the registry; unrelated settings are kept,
+and newly entered manual targets persist normally.
 
 ## UI
 

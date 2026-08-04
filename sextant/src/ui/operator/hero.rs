@@ -7,7 +7,7 @@
 
 use eframe::egui;
 
-use crate::app::App;
+use crate::app::{App, render_slow_data_text};
 use crate::session::ConnStatus;
 use crate::theme;
 use crate::ui::Overlay;
@@ -138,7 +138,8 @@ fn receiving(app: &App, ui: &mut egui::Ui) {
             .open_url(egui::OpenUrl::new_tab(crate::ui::format::qrz_url(callsign)));
     }
     route_line(app, ui);
-    if let Some(text) = &app.last_slow_data {
+    if let Some(message) = &app.last_slow_data {
+        let text = render_slow_data_text(message);
         ui.label(egui::RichText::new(format!("“{text}”")).color(theme::TEXT_SECONDARY));
     }
     position_line(app, ui);

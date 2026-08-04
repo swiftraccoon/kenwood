@@ -58,7 +58,7 @@ fn sheet_contents(app: &mut App, ui: &mut egui::Ui, focus_search: bool) {
             }
             if ui
                 .small_button("↻")
-                .on_hover_text("Refresh directory")
+                .on_hover_text("Refresh DPlus auth directory")
                 .clicked()
             {
                 app.refresh_directory();

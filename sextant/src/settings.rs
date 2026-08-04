@@ -28,6 +28,12 @@ use tracing::{debug, warn};
 /// Maximum entries kept in the recent-connections list.
 pub(crate) const RECENTS_CAP: usize = 8;
 
+/// Marks settings whose persisted reflector addresses were created after
+/// automatic plaintext-XLX directory ingestion was removed. Older settings
+/// cannot distinguish a manual address from one copied out of that directory,
+/// so their host-bearing fields need a one-time reset.
+const REFLECTOR_ADDRESS_EPOCH: &str = "bundled-manual-dplus-v1";
+
 /// Which clock timestamps are displayed in (heard list, event log).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum TimeMode {
@@ -248,7 +254,13 @@ impl Settings {
             }
         };
         match parse(&raw) {
-            Ok(s) => {
+            Ok(mut s) => {
+                if migrate_legacy_reflector_addresses(&raw, &mut s) {
+                    warn!(
+                        path = %path.display(),
+                        "discarded saved reflector addresses from before the trusted-source migration"
+                    );
+                }
                 debug!(path = %path.display(), "loaded settings");
                 s
             }
@@ -287,6 +299,7 @@ impl Settings {
 fn serialize(s: &Settings) -> String {
     let mut out = String::with_capacity(256);
     out.push_str("# sextant GUI settings, auto-saved on disconnect / app exit.\n");
+    push_string(&mut out, "reflector_address_epoch", REFLECTOR_ADDRESS_EPOCH);
     push_string(&mut out, "callsign", &s.callsign);
     push_string(&mut out, "reflector_host", &s.reflector_host);
     push_string(&mut out, "reflector_port", &s.reflector_port);
@@ -317,6 +330,31 @@ fn serialize(s: &Settings) -> String {
         push_string(&mut out, &format!("recent.{i}"), &encode_saved(r));
     }
     out
+}
+
+/// Reset host-bearing state from settings written before reflector-address
+/// provenance could be distinguished. This intentionally retains unrelated
+/// operator, radio, audio, and UI settings. Returns whether a migration ran.
+fn migrate_legacy_reflector_addresses(raw: &str, settings: &mut Settings) -> bool {
+    let is_current = raw.lines().any(|line| {
+        let Some((key, value)) = split_kv(line.trim()) else {
+            return false;
+        };
+        key == "reflector_address_epoch"
+            && parse_quoted(value).as_deref() == Some(REFLECTOR_ADDRESS_EPOCH)
+    });
+    if is_current {
+        return false;
+    }
+
+    let defaults = Settings::default();
+    settings.reflector_host = defaults.reflector_host;
+    settings.reflector_port = defaults.reflector_port;
+    settings.reflector_callsign = defaults.reflector_callsign;
+    settings.protocol = defaults.protocol;
+    settings.favorites.clear();
+    settings.recents.clear();
+    true
 }
 
 fn push_string(out: &mut String, key: &str, value: &str) {
@@ -448,7 +486,8 @@ fn parse_quoted(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        RECENTS_CAP, RxAudioMode, SavedHost, Settings, TimeMode, parse, push_recent, serialize,
+        RECENTS_CAP, REFLECTOR_ADDRESS_EPOCH, RxAudioMode, SavedHost, Settings, TimeMode,
+        migrate_legacy_reflector_addresses, parse, push_recent, serialize,
     };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -558,6 +597,53 @@ mod tests {
         let parsed = parse(&serialize(&original)).map_err(|e| format!("parse: {e}"))?;
         assert_eq!(parsed.favorites, original.favorites);
         assert_eq!(parsed.recents, original.recents);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_settings_discard_unprovenanced_reflector_addresses() -> TestResult {
+        let raw = concat!(
+            "callsign = \"KQ4NIT\"\n",
+            "reflector_host = \"attacker-controlled.example\"\n",
+            "reflector_port = \"30001\"\n",
+            "reflector_callsign = \"XLX999\"\n",
+            "protocol = \"DExtra\"\n",
+            "favorite.0 = \"XLX999|attacker-controlled.example|30001|DExtra|C\"\n",
+            "recent.0 = \"XLX999|attacker-controlled.example|30001|DExtra|C\"\n",
+        );
+        let mut parsed = parse(raw).map_err(|e| format!("parse: {e}"))?;
+
+        assert!(migrate_legacy_reflector_addresses(raw, &mut parsed));
+        assert_eq!(parsed.callsign, "KQ4NIT", "unrelated settings survive");
+        assert_eq!(parsed.reflector_host, "127.0.0.1");
+        assert_eq!(parsed.reflector_callsign, "POLARIS");
+        assert!(parsed.favorites.is_empty());
+        assert!(parsed.recents.is_empty());
+
+        let migrated_raw = serialize(&parsed);
+        let mut reloaded = parse(&migrated_raw).map_err(|e| format!("parse: {e}"))?;
+        assert!(
+            !migrate_legacy_reflector_addresses(&migrated_raw, &mut reloaded),
+            "the persisted marker makes the migration idempotent"
+        );
+        assert_eq!(reloaded, parsed);
+        Ok(())
+    }
+
+    #[test]
+    fn current_settings_epoch_preserves_explicit_addresses() -> TestResult {
+        let original = Settings {
+            reflector_host: "manual.example".into(),
+            favorites: vec![saved("XRF757")],
+            ..Settings::default()
+        };
+        let raw = serialize(&original);
+        assert!(raw.contains(REFLECTOR_ADDRESS_EPOCH));
+        let mut parsed = parse(&raw).map_err(|e| format!("parse: {e}"))?;
+
+        assert!(!migrate_legacy_reflector_addresses(&raw, &mut parsed));
+        assert_eq!(parsed.reflector_host, "manual.example");
+        assert_eq!(parsed.favorites, original.favorites);
         Ok(())
     }
 

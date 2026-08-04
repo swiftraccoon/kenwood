@@ -22,6 +22,7 @@
 use std::net::SocketAddr;
 use std::sync::mpsc as std_mpsc;
 
+use dstar_gateway_core::slowdata::SlowDataTextMessage;
 use dstar_gateway_core::types::{Callsign, Module, ProtocolKind};
 use eframe::egui;
 use tokio::runtime::Runtime;
@@ -76,7 +77,7 @@ pub(crate) struct App {
     /// when a new stream starts (the hero attributes it to the
     /// speaker on screen) and on Disconnect; per-station history
     /// lives in the heard list.
-    pub(crate) last_slow_data: Option<String>,
+    pub(crate) last_slow_data: Option<SlowDataTextMessage>,
     /// Stations heard this session.
     pub(crate) heard: HeardList,
     /// Most recent decoded RX position (latitude, longitude).
@@ -281,22 +282,14 @@ impl App {
         if settings.rx_audio.is_enhanced() {
             audio.send(AudioCommand::SetRxEnhance(true));
         }
-        // Load the reflector directory from cache, then kick off a
-        // background refresh so the picker is populated immediately
-        // and updated when the network call returns.
-        let directory = ReflectorDirectory::load_cached();
+        // Start from the bundled directory. Legacy generated XLX caches are
+        // intentionally not loaded because their plaintext source cannot be
+        // authenticated.
+        let directory = ReflectorDirectory::bundled_only();
         let (directory_tx, directory_rx) = std_mpsc::channel();
         {
-            let tx = directory_tx.clone();
-            let _join = runtime.spawn(async move {
-                let _send = tx.send(crate::hosts::fetch_directory().await);
-            });
-        }
-        {
             // Authoritative REF list from the DPlus auth server, the
-            // same startup exchange every DPlus dongle performs. Must
-            // outrank the XLX registry's REF-alias entries, which
-            // point at unrelated XLX reflectors.
+            // same startup exchange every DPlus dongle performs.
             let tx = directory_tx.clone();
             let callsign = settings.callsign.clone();
             let _join = runtime.spawn(async move {
@@ -382,44 +375,36 @@ impl App {
         }
     }
 
-    /// Drain pending [`DirectoryUpdate`]s from background fetches into
-    /// the directory, refreshing the on-disk cache on success.
+    /// Drain pending [`DirectoryUpdate`]s from background `DPlus` auth
+    /// fetches into the directory.
     fn drain_directory(&mut self) {
         while let Ok(update) = self.directory_rx.try_recv() {
             match update {
-                DirectoryUpdate::Loaded { hosts, when } => {
-                    self.directory.replace_fetched(hosts, &when);
-                    self.directory.save_cache(&when);
-                }
                 DirectoryUpdate::AuthLoaded { hosts } => {
                     let count = hosts.len();
-                    self.directory.merge_hosts(hosts);
+                    self.directory.replace_auth_hosts(hosts);
                     self.append_log_line(
                         LogLevel::Info,
-                        format!("merged {count} REF hosts from the dstargateway auth server"),
+                        format!("loaded {count} REF hosts from the dstargateway auth server"),
                     );
                 }
-                DirectoryUpdate::Failed(err) => {
-                    self.directory
-                        .set_status(format!("reflector list: fetch failed ({err}); using cache"));
+                DirectoryUpdate::AuthFailed(err) => {
+                    self.directory.set_status(format!(
+                        "reflector list: DPlus auth fetch failed ({err}); bundled list available"
+                    ));
                     self.append_log_line(
                         LogLevel::Error,
-                        format!("reflector directory fetch failed: {err}"),
+                        format!("DPlus reflector directory fetch failed: {err}"),
                     );
                 }
             }
         }
     }
 
-    /// Spawn an on-demand reflector-directory refresh (both the XLX
-    /// registry and the authoritative dstargateway REF list).
+    /// Spawn an on-demand refresh of the authoritative dstargateway REF list.
     pub(crate) fn refresh_directory(&mut self) {
         self.directory
-            .set_status("reflector list: fetching…".into());
-        let tx = self.directory_tx.clone();
-        let _join = self.runtime.spawn(async move {
-            let _send = tx.send(crate::hosts::fetch_directory().await);
-        });
+            .set_status("reflector list: fetching DPlus auth directory…".into());
         let tx = self.directory_tx.clone();
         let callsign = self.callsign.clone();
         let _join = self.runtime.spawn(async move {
@@ -537,15 +522,16 @@ impl App {
                     self.last_error = Some(e.clone());
                     self.append_log_line(LogLevel::Error, e);
                 }
-                SessionEvent::SlowDataMessage { stream_id, text } => {
+                SessionEvent::SlowDataMessage { stream_id, message } => {
+                    let rendered = render_slow_data_text(&message);
                     self.append_log_line(
                         LogLevel::Event,
-                        format!("SlowData sid=0x{stream_id:04X}: {text:?}"),
+                        format!("SlowData sid=0x{stream_id:04X}: {rendered:?}"),
                     );
                     if let Some(callsign) = self.current_rx_callsign.clone() {
-                        self.heard.record_message(&callsign, text.clone());
+                        self.heard.record_message(&callsign, rendered);
                     }
-                    self.last_slow_data = Some(text);
+                    self.last_slow_data = Some(message);
                 }
                 SessionEvent::GpsPosition {
                     stream_id,
@@ -590,10 +576,10 @@ impl App {
                             source: crate::hosts::HostSource::DPlusAuth,
                         })
                         .collect();
-                    self.directory.merge_hosts(merged);
+                    self.directory.replace_auth_hosts(merged);
                     self.append_log_line(
                         LogLevel::Info,
-                        format!("merged {count} REF hosts from DPlus auth"),
+                        format!("loaded {count} REF hosts from DPlus auth"),
                     );
                 }
             }
@@ -808,18 +794,17 @@ impl App {
 
     /// Push the current slow-data text + GPS beacon to the audio
     /// worker. Called whenever the operator edits a slow-data field.
-    pub(crate) fn push_slow_data(&self) {
-        let text = if self.tx_slow_text.is_empty() {
-            None
-        } else {
-            Some(self.tx_slow_text.clone())
-        };
+    pub(crate) fn push_slow_data(&mut self) {
         let gps = if self.tx_gps.enabled {
             self.parse_tx_gps()
         } else {
             None
         };
-        self.audio.send(AudioCommand::SetSlowData { text, gps });
+        let (command, error) = build_slow_data_update(&self.tx_slow_text, gps);
+        self.audio.send(command);
+        if let Some(error) = error {
+            self.last_error = Some(error);
+        }
     }
 
     /// Parse the manual GPS fields into a [`TxPosition`], or `None` if
@@ -889,6 +874,41 @@ impl App {
     }
 }
 
+/// Build the next slow-data worker update without retaining stale text when
+/// validation rejects the operator's latest edit.
+fn build_slow_data_update(input: &str, gps: Option<TxPosition>) -> (AudioCommand, Option<String>) {
+    let text = if input.is_empty() {
+        None
+    } else {
+        match SlowDataTextMessage::try_from_text(input) {
+            Ok(message) => Some(message),
+            Err(error) => {
+                return (
+                    AudioCommand::SetSlowData { text: None, gps },
+                    Some(format!("Slow-data text rejected: {error}")),
+                );
+            }
+        }
+    };
+    (AudioCommand::SetSlowData { text, gps }, None)
+}
+
+/// Render validated slow-data text or an exact diagnostic for opaque bytes.
+pub(crate) fn render_slow_data_text(message: &SlowDataTextMessage) -> String {
+    match message.text() {
+        Ok(text) => text.to_owned(),
+        Err(error) => {
+            let hexadecimal = message
+                .as_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02X}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("<invalid slow-data bytes: {hexadecimal}; {error}>")
+        }
+    }
+}
+
 impl eframe::App for App {
     /// Persist form state when the window closes, covering the common
     /// case of quitting without an explicit disconnect.
@@ -937,7 +957,9 @@ impl eframe::App for App {
 
 #[cfg(test)]
 mod tests {
-    use super::{LogFilter, LogLevel};
+    use super::{LogFilter, LogLevel, build_slow_data_update};
+    use crate::audio::AudioCommand;
+    use crate::geo::TxPosition;
 
     #[test]
     fn status_text_covers_every_variant() {
@@ -963,5 +985,31 @@ mod tests {
         assert!(LogFilter::Events.admits(LogLevel::Error));
         assert!(!LogFilter::Errors.admits(LogLevel::Event));
         assert!(LogFilter::Errors.admits(LogLevel::Error));
+    }
+
+    #[test]
+    fn rejected_slow_data_text_clears_stale_text_and_keeps_gps() {
+        let gps = TxPosition {
+            latitude: 35.5951,
+            longitude: -82.5515,
+            symbol: '/',
+            comment: "test".to_owned(),
+        };
+        let (command, error) = build_slow_data_update(&"X".repeat(21), Some(gps.clone()));
+
+        assert!(
+            error.is_some_and(|message| message.contains("maximum is 20 bytes")),
+            "validation error should state the wire limit"
+        );
+        assert!(
+            matches!(
+                command,
+                AudioCommand::SetSlowData {
+                    text: None,
+                    gps: Some(actual),
+                } if actual == gps
+            ),
+            "a rejected edit must clear scheduled text without dropping valid GPS"
+        );
     }
 }

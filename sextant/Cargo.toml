@@ -18,7 +18,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Protocol.
-dstar-gateway = { path = "../dstar-gateway", features = ["hosts-fetcher"] }
+dstar-gateway = { path = "../dstar-gateway" }
 dstar-gateway-core = { path = "../dstar-gateway-core" }
 # Voice codec: enable encoder feature for TX path. This pulls the
 # GPL-3.0-or-later provisions in via mbelib-rs's encoder module, which

@@ -33,7 +33,7 @@ use std::time::Duration;
 use cpal::SampleFormat;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use dstar_gateway_core::dprs::{DprsReport, Latitude, Longitude, encode_dprs};
-use dstar_gateway_core::slowdata::{encode_text_message, scramble};
+use dstar_gateway_core::slowdata::{SlowDataTextMessage, encode_text_message, scramble};
 use dstar_gateway_core::types::Callsign;
 use dstar_gateway_core::voice::{DSTAR_NULL_SLOW_DATA_BYTES, DSTAR_SYNC_BYTES, VoiceFrame};
 use mbelib_rs::enhance_live::{LiveWaveEnhancer, LiveWaveStream};
@@ -123,8 +123,8 @@ pub(crate) enum AudioCommand {
     /// Set the operator's slow-data text and/or GPS beacon. Either
     /// field may be `None`. Takes effect on the next TX frame.
     SetSlowData {
-        /// Slow-data text message (≤20 chars; longer is truncated).
-        text: Option<String>,
+        /// Validated fixed-width slow-data text message.
+        text: Option<SlowDataTextMessage>,
         /// Manual GPS position to beacon.
         gps: Option<TxPosition>,
     },
@@ -592,12 +592,10 @@ struct TxSlowData {
 impl TxSlowData {
     /// Rebuild the fragment sequence from the operator's current text
     /// and position. `my_call` names the DPRS sentence's station.
-    fn set(&mut self, text: Option<&str>, gps: Option<&TxPosition>, my_call: &str) {
+    fn set(&mut self, text: Option<SlowDataTextMessage>, gps: Option<&TxPosition>, my_call: &str) {
         let mut fragments = Vec::new();
-        if let Some(t) = text
-            && !t.is_empty()
-        {
-            fragments.extend(encode_text_message(t));
+        if let Some(message) = text {
+            fragments.extend(encode_text_message(message));
         }
         if let Some(pos) = gps.and_then(TxPosition::validated) {
             fragments.extend(encode_gps_fragments(pos, my_call));
@@ -976,8 +974,7 @@ impl AudioWorker {
                 tracing::info!(my_call, "TX path enabled; mic capture active");
             }
             AudioCommand::SetSlowData { text, gps } => {
-                self.tx_slow_data
-                    .set(text.as_deref(), gps.as_ref(), &self.tx_my_call);
+                self.tx_slow_data.set(text, gps.as_ref(), &self.tx_my_call);
             }
             AudioCommand::EnumerateDevices => {
                 let (inputs, outputs) = enumerate_devices();
@@ -1974,13 +1971,14 @@ mod tests {
     }
 
     #[test]
-    fn tx_slow_data_text_roundtrips_through_collector() {
-        use dstar_gateway_core::slowdata::SlowDataTextCollector;
+    fn tx_slow_data_text_roundtrips_through_collector() -> TestResult {
+        use dstar_gateway_core::slowdata::{SlowDataTextCollector, SlowDataTextMessage};
 
         let mut sched = super::TxSlowData::default();
-        sched.set(Some("CQ TEST"), None, "W1AW");
-        // `encode_text_message` yields exactly 8 fragments for non-empty
-        // text; pull them and feed the RX collector at seq 1..=8.
+        let message = SlowDataTextMessage::try_from_text("CQ TEST")?;
+        sched.set(Some(message), None, "W1AW");
+        // `encode_text_message` yields exactly 8 fragments; pull them
+        // and feed the RX collector at seq 1..=8.
         let mut collector = SlowDataTextCollector::new();
         for seq in 1u8..=8 {
             let Some(frag) = sched.next_fragment() else {
@@ -1993,6 +1991,7 @@ mod tests {
             matches!(&msg, Some(m) if m.starts_with(b"CQ TEST")),
             "TX-scheduled text must decode back through the RX collector, got {msg:?}"
         );
+        Ok(())
     }
 
     #[test]

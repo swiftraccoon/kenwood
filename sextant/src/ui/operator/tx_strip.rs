@@ -11,9 +11,6 @@ use crate::session::ConnStatus;
 use crate::theme;
 use crate::ui::Overlay;
 
-/// D-STAR slow-data text messages carry at most 20 characters.
-const MSG_MAX_CHARS: usize = 20;
-
 /// Render the strip contents (the caller supplies the inset panel).
 pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
@@ -59,7 +56,7 @@ fn transmit_button(app: &mut App, ui: &mut egui::Ui) {
     }
 }
 
-/// The ≤20-char slow-data message field.
+/// The ≤20-byte printable-ASCII slow-data message field.
 fn msg_field(app: &mut App, ui: &mut egui::Ui) {
     ui.label(theme::section_label("msg"));
     let resp = ui.add(
@@ -69,9 +66,6 @@ fn msg_field(app: &mut App, ui: &mut egui::Ui) {
             .font(egui::TextStyle::Monospace),
     );
     if resp.changed() {
-        if app.tx_slow_text.chars().count() > MSG_MAX_CHARS {
-            app.tx_slow_text = app.tx_slow_text.chars().take(MSG_MAX_CHARS).collect();
-        }
         app.push_slow_data();
     }
 }

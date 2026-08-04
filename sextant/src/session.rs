@@ -24,13 +24,13 @@ use std::time::{Duration, Instant};
 use crate::audio::{AudioCommand, AudioHandle};
 use crate::geo::{GpsPosition, parse_gps_sentence};
 use dstar_gateway::tokio_shell::{AsyncSession, ShellError};
-use dstar_gateway_core::header::DStarHeader;
+use dstar_gateway_core::header::DstarHeader;
 use dstar_gateway_core::session::Driver;
 use dstar_gateway_core::session::client::{
     ClientStateKind, Configured, Connecting, DExtra, DPlus, Dcs, Event, Protocol, Session,
     VoiceEndReason,
 };
-use dstar_gateway_core::slowdata::SlowDataTextCollector;
+use dstar_gateway_core::slowdata::{SlowDataTextCollector, SlowDataTextMessage};
 use dstar_gateway_core::types::{Callsign, Module, ProtocolKind, StreamId, Suffix};
 use dstar_gateway_core::voice::{AMBE_SILENCE, DSTAR_SYNC_BYTES, VoiceFrame};
 use tokio::net::UdpSocket;
@@ -40,7 +40,7 @@ use tokio::time::timeout;
 /// Pair an active runtime session with the configuration it was
 /// established with. The cfg fields (operator callsign, modules,
 /// reflector callsign) are needed to build correctly-routed `rpt1` /
-/// `rpt2` headers at TX time; see [`DStarHeader::for_relay`] for the
+/// `rpt2` headers at TX time; see [`DstarHeader::for_relay`] for the
 /// `rpt[7]` module-byte invariant that strict reflectors enforce.
 struct ActiveSession {
     runtime: RuntimeSession,
@@ -113,7 +113,7 @@ pub(crate) struct RxRoute {
 
 impl RxRoute {
     /// Extract the display-trimmed routing fields from a header.
-    fn from_header(header: &DStarHeader) -> Self {
+    fn from_header(header: &DstarHeader) -> Self {
         Self {
             suffix: header.my_suffix.to_string().trim().to_owned(),
             to: header.ur_call.to_string().trim().to_owned(),
@@ -173,8 +173,8 @@ pub(crate) enum SessionEvent {
     SlowDataMessage {
         /// Source stream-id (so the GUI can correlate with `VoiceStart`).
         stream_id: u16,
-        /// 20-character text message (UTF-8 lossy, trailing spaces trimmed).
-        text: String,
+        /// Exact 20-byte wire message with a separately validated text view.
+        message: SlowDataTextMessage,
     },
     /// A GPS position decoded from incoming slow data.
     GpsPosition {
@@ -234,7 +234,7 @@ impl RuntimeSession {
         }
     }
 
-    async fn send_header(&mut self, header: DStarHeader, sid: StreamId) -> Result<(), ShellError> {
+    async fn send_header(&mut self, header: DstarHeader, sid: StreamId) -> Result<(), ShellError> {
         match self {
             Self::DPlus(s) => s.send_header(header, sid).await,
             Self::DExtra(s) => s.send_header(header, sid).await,
@@ -594,16 +594,13 @@ fn decide_runtime_event(event: RuntimeEvent, state: &mut EventState) -> Vec<Even
             state.slow_data.push(slow, seq);
             let gps = state.gps.push(slow, seq);
             decisions.push(EventDecision::AudioRxFrame(frame));
-            if let Some(msg_bytes) = state.slow_data.take_message() {
-                let text = String::from_utf8_lossy(&msg_bytes).trim_end().to_string();
-                if !text.is_empty() {
-                    decisions.push(EventDecision::EmitSessionEvent(
-                        SessionEvent::SlowDataMessage {
-                            stream_id: state.rx_stream_id,
-                            text,
-                        },
-                    ));
-                }
+            if let Some(message) = state.slow_data.take_message() {
+                decisions.push(EventDecision::EmitSessionEvent(
+                    SessionEvent::SlowDataMessage {
+                        stream_id: state.rx_stream_id,
+                        message,
+                    },
+                ));
             }
             if let Some(pos) = gps {
                 decisions.push(EventDecision::EmitSessionEvent(SessionEvent::GpsPosition {
@@ -1186,13 +1183,13 @@ async fn connect_dcs(cfg: &ConnectConfig) -> Result<AsyncSession<Dcs>, String> {
 
 /// Begin a voice TX: allocate a stream-id, build and send the header,
 /// return the tracking state. The header is built via
-/// [`DStarHeader::for_relay`] so `rpt1[7]` / `rpt2[7]` carry the
+/// [`DstarHeader::for_relay`] so `rpt1[7]` / `rpt2[7]` carry the
 /// validated module letters strict reflectors (xlxd-derived) demand.
 async fn start_tx(active: &mut ActiveSession) -> Result<TxStream, String> {
     let Some(sid) = StreamId::new(rand_stream_id()) else {
         return Err("stream id zero; retry".into());
     };
-    let header = DStarHeader::for_relay(
+    let header = DstarHeader::for_relay(
         active.cfg.callsign,
         active.cfg.local_module,
         active.cfg.reflector_callsign,
@@ -1220,7 +1217,7 @@ async fn start_tx(active: &mut ActiveSession) -> Result<TxStream, String> {
 /// TX pipeline sanity check: send `seconds` worth of AMBE silence.
 /// Proves header + voice + EOT reach the reflector without needing
 /// mic capture or the AMBE encoder. Uses the operator's configured
-/// callsign and the same [`DStarHeader::for_relay`] convention as
+/// callsign and the same [`DstarHeader::for_relay`] convention as
 /// real PTT, so the silence test exercises the same wire identity
 /// the operator will be transmitting under.
 async fn tx_silence(
@@ -1246,7 +1243,7 @@ async fn tx_silence(
         return Err("stream id zero; retry".into());
     };
 
-    let header = DStarHeader::for_relay(
+    let header = DstarHeader::for_relay(
         active.cfg.callsign,
         active.cfg.local_module,
         active.cfg.reflector_callsign,
@@ -1341,6 +1338,7 @@ mod tests {
         decide_runtime_event,
     };
     use dstar_gateway_core::session::client::VoiceEndReason;
+    use dstar_gateway_core::slowdata::SlowDataTextMessage;
     use dstar_gateway_core::types::StreamId;
     use dstar_gateway_core::voice::{AMBE_SILENCE, DSTAR_SYNC_BYTES, VoiceFrame};
 
@@ -1492,7 +1490,7 @@ mod tests {
             [0x43, b' ', b' '],
             [b' ', b' ', b' '],
         ];
-        let mut emitted_message: Option<String> = None;
+        let mut emitted_message: Option<SlowDataTextMessage> = None;
         for (seq, half) in (1u8..).zip(halves.iter()) {
             let frame = VoiceFrame {
                 ambe: AMBE_SILENCE,
@@ -1503,19 +1501,69 @@ mod tests {
             for d in decisions {
                 if let EventDecision::EmitSessionEvent(SessionEvent::SlowDataMessage {
                     stream_id,
-                    text,
+                    message,
                 }) = d
                 {
                     assert_eq!(
                         stream_id, 0xABCD,
                         "slow-data message tagged with active stream"
                     );
-                    emitted_message = Some(text);
+                    emitted_message = Some(message);
                 }
             }
         }
-        let text = emitted_message.ok_or("no slow-data message emitted after 8 halves")?;
-        assert_eq!(text, "CQ working", "trailing spaces trimmed");
+        let message = emitted_message.ok_or("no slow-data message emitted after 8 halves")?;
+        assert_eq!(message.text()?, "CQ working", "trailing spaces trimmed");
+        Ok(())
+    }
+
+    #[test]
+    fn slow_data_preserves_invalid_text_bytes_without_replacement() -> TestResult {
+        use dstar_gateway_core::slowdata::scramble;
+
+        let mut state = EventState {
+            rx_stream_id: 0xBEEF,
+            ..EventState::default()
+        };
+        let halves: [[u8; 3]; 8] = [
+            [0x40, b'A', 0xFF],
+            [b' ', b' ', b' '],
+            [0x41, b' ', b' '],
+            [b' ', b' ', b' '],
+            [0x42, b' ', b' '],
+            [b' ', b' ', b' '],
+            [0x43, b' ', b' '],
+            [b' ', b' ', b' '],
+        ];
+        let mut completed = None;
+        for (seq, half) in (1u8..).zip(halves) {
+            let decisions = decide_runtime_event(
+                RuntimeEvent::VoiceFrame {
+                    seq,
+                    frame: VoiceFrame {
+                        ambe: AMBE_SILENCE,
+                        slow_data: scramble(half),
+                    },
+                },
+                &mut state,
+            );
+            for decision in decisions {
+                if let EventDecision::EmitSessionEvent(SessionEvent::SlowDataMessage {
+                    message,
+                    ..
+                }) = decision
+                {
+                    completed = Some(message);
+                }
+            }
+        }
+
+        let message = completed.ok_or("no slow-data message emitted")?;
+        assert_eq!(message.as_bytes().get(..2), Some([b'A', 0xFF].as_slice()));
+        assert_eq!(
+            message.text().map_err(|error| (error.index, error.byte)),
+            Err((1, 0xFF))
+        );
         Ok(())
     }
 
@@ -1558,7 +1606,7 @@ mod tests {
             [0x43, b' ', b' '],
             [b' ', b' ', b' '],
         ];
-        let mut text: Option<String> = None;
+        let mut message: Option<SlowDataTextMessage> = None;
         for (seq, half) in (1u8..).zip(halves.iter()) {
             let decisions = decide_runtime_event(
                 RuntimeEvent::VoiceFrame {
@@ -1572,17 +1620,18 @@ mod tests {
             );
             for d in decisions {
                 if let EventDecision::EmitSessionEvent(SessionEvent::SlowDataMessage {
-                    text: t,
+                    message: completed,
                     ..
                 }) = d
                 {
-                    text = Some(t);
+                    message = Some(completed);
                 }
             }
         }
-        let final_text = text.ok_or("no slow-data message emitted after fresh stream")?;
+        let final_message = message.ok_or("no slow-data message emitted after fresh stream")?;
         assert_eq!(
-            final_text, "NEW",
+            final_message.text()?,
+            "NEW",
             "fresh stream's message must not include slot from prior partial"
         );
         Ok(())
