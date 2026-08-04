@@ -11,12 +11,10 @@
 //!
 //! ## Coverage
 //!
-//! The normal REPL scenarios are intentionally minimal: just enough to
-//! let an integration test exit the REPL loop cleanly after reading
-//! the radio model. More elaborate scenarios (D-STAR, APRS) belong
-//! in dedicated test fixture files loaded via
-//! [`MockTransport::from_fixture`](kenwood_thd75::transport::MockTransport::from_fixture)
-//! rather than code-generated here.
+//! The normal CAT scenario is intentionally minimal. APRS and D-STAR
+//! scenarios pair command-script fixtures with exact byte sequences here,
+//! because their binary KISS and MMDVM frames cannot be represented by the
+//! transport's text fixture format.
 
 use kenwood_thd75::transport::MockTransport;
 
@@ -26,22 +24,27 @@ use kenwood_thd75::transport::MockTransport;
 /// names: `"simple"` (minimal CAT identification flow), `"empty"`
 /// (empty mock that rejects every write), `"mmdvm"` (radio in DV
 /// Gateway / Reflector Terminal Mode: CAT identification fails and an
-/// MMDVM probe answers, so the REPL takes the terminal-mode path).
+/// MMDVM probe answers, so the REPL takes the terminal-mode path), and
+/// `"mmdvm_dstar"` (the same startup followed by a strict D-STAR modem
+/// initialization and noninteractive shutdown). `"mmdvm_dstar_idle"` allows
+/// periodic status writes for an interactive prompt-liveness test.
 #[must_use]
 pub fn build(name: &str) -> Option<MockTransport> {
     match name {
         "simple" => Some(simple_scenario()),
         "empty" => Some(MockTransport::new()),
         "mmdvm" => Some(mmdvm_scenario()),
+        "mmdvm_dstar" => Some(mmdvm_dstar_scenario()),
+        "mmdvm_dstar_idle" => Some(mmdvm_dstar_idle_scenario()),
         "aprs" => Some(aprs_scenario()),
         _ => None,
     }
 }
 
-/// Minimal scenario covering `Radio::connect_safe` plus one `identify`
+/// Minimal scenario covering `Radio::connect_with_tnc_exit` plus one `identify`
 /// round-trip and one `get_firmware_version` round-trip.
 ///
-/// `connect_safe` sends a six-write preamble (`\r`, `\r`, `ETX`, the
+/// `connect_with_tnc_exit` sends a six-write preamble (`\r`, `\r`, `ETX`, the
 /// KISS Return frame `C0 FF C0`, `\rTC 1\r`, `TN 0,0\r`) followed by a
 /// drained read; each of those writes is programmed against an empty
 /// response so the mock's exchange queue drains cleanly. The subsequent
@@ -50,9 +53,9 @@ pub fn build(name: &str) -> Option<MockTransport> {
 fn simple_scenario() -> MockTransport {
     let mut mock = MockTransport::new();
 
-    // connect_safe preamble. Each write is expected in order and
+    // connect_with_tnc_exit preamble. Each write is expected in order and
     // responds with empty bytes so the drain read at the end of
-    // connect_safe is fed from the last pending_response slot.
+    // connect_with_tnc_exit is fed from the last pending_response slot.
     mock.expect(b"\r", b"");
     mock.expect(b"\r", b"");
     mock.expect(&[0x03], b"");
@@ -69,12 +72,11 @@ fn simple_scenario() -> MockTransport {
     mock.expect(b"BC\r", b"BC 0\r");
     mock.expect(b"IO\r", b"IO 0\r");
 
-    // From here on, accept any further writes without validation so
-    // the integration test can run additional commands (`id`, `quit`)
-    // without having to predict the exact wire output. Subsequent
-    // reads will error (pending_response empty), which surfaces as
-    // command-level errors that the script can absorb.
-    mock.expect_any_write();
+    // The final scripted `id` command performs another complete CAT
+    // exchange. Keep the idle transport pending afterward, matching a
+    // connected serial device with no unsolicited bytes.
+    mock.expect(b"ID\r", b"ID TH-D75\r");
+    mock.pend_when_empty();
 
     mock
 }
@@ -87,14 +89,15 @@ fn simple_scenario() -> MockTransport {
 /// [`AprsClient::start`](kenwood_thd75::AprsClient) waits for at the
 /// default 1200 bps. After that, [`MockTransport::expect_any_write`]
 /// absorbs every KISS frame the transmit commands emit (they are
-/// write-only), so an integration test can exercise `position`,
+/// write-only) while a later exact identity exchange proves CAT restoration,
+/// so an integration test can exercise `position`,
 /// `compressed`, `mice`, `object`, `status`, and `motion` without
 /// predicting exact wire bytes; the per-format wire encodings are
 /// already pinned by the `kenwood-thd75` and `aprs` unit tests.
 fn aprs_scenario() -> MockTransport {
     let mut mock = MockTransport::new();
 
-    // connect_safe preamble (identical to the simple scenario).
+    // connect_with_tnc_exit preamble (identical to the simple scenario).
     mock.expect(b"\r", b"");
     mock.expect(b"\r", b"");
     mock.expect(&[0x03], b"");
@@ -106,32 +109,38 @@ fn aprs_scenario() -> MockTransport {
     mock.expect(b"ID\r", b"ID TH-D75\r");
     mock.expect(b"FV\r", b"FV 1.03.00\r");
 
-    // `aprs start` enters KISS mode at 1200 bps (TncBaud::Bps1200 = 0),
+    // `aprs start` enters KISS mode at 1200 bps (PacketDataRate::Bps1200 = 0),
     // which sends `TN 2,0\r` and waits for the echo.
     mock.expect(b"TN 2,0\r", b"TN 2,0\r");
 
     // Every subsequent KISS transmit frame and the KISS-exit frame from
-    // `aprs stop` are write-only; absorb them without validation.
+    // `aprs stop` are write-only; absorb them without validation. The exact
+    // ID exchange remains queued until restore_cat_after_mode_exit sends it.
     mock.expect_any_write();
+    mock.expect(b"ID\r", b"ID TH-D75\r");
+    // CAT restoration proves a quiet boundary both before and after the
+    // identity exchange. An idle serial link waits; it does not report a
+    // read error merely because no byte is immediately available.
+    mock.pend_when_empty();
 
     mock
 }
 
 /// Radio in a DV Gateway / Reflector Terminal Mode: CAT identification
 /// fails (the radio speaks MMDVM binary, not CAT) but the MMDVM
-/// `GET_VERSION` probe answers, so `Radio::diagnose_link` classifies
+/// `GET_VERSION` probe answers, so `Radio::probe_silent_link` classifies
 /// the link as [`kenwood_thd75::LinkDiagnosis::MmdvmMode`] and the REPL
 /// takes the terminal-mode startup path.
 ///
-/// Used by the integration test that asserts the terminal-mode guard
-/// intercepts CAT commands with guidance instead of letting each one
-/// block for the full command timeout.
+/// Used by the integration test that asserts the terminal-ready state
+/// intercepts CAT commands with guidance instead of letting each one block for
+/// the full command timeout.
 fn mmdvm_scenario() -> MockTransport {
     let mut mock = MockTransport::new();
 
-    // connect_safe preamble (same as the simple scenario): each write
+    // connect_with_tnc_exit preamble (same as the simple scenario): each write
     // is programmed against an empty response so the drain read at the
-    // end of connect_safe is satisfied cleanly.
+    // end of connect_with_tnc_exit is satisfied cleanly.
     mock.expect(b"\r", b"");
     mock.expect(b"\r", b"");
     mock.expect(&[0x03], b"");
@@ -142,17 +151,76 @@ fn mmdvm_scenario() -> MockTransport {
     // identify() sends `ID\r`. In a DV Gateway mode the CAT parser is
     // offline, so the radio answers `?` (or nothing); `?` keeps the
     // transport alive while making identify() return an error, which is
-    // what drives the REPL into the diagnose_link path.
+    // what drives the REPL into the probe_silent_link path.
     mock.expect(b"ID\r", b"?\r");
 
-    // diagnose_link() sends the MMDVM GET_VERSION frame and an
+    // probe_silent_link() sends the MMDVM GET_VERSION frame and an
     // 0xE0-framed reply is positive proof of a DV Gateway mode.
-    mock.expect(b"\xE0\x03\x00", b"\xE0\x0F\x00\x01MMDVM");
+    mock.expect(b"\xE0\x03\x00", b"\xE0\x0E\x00\x01MMDVM 2018");
 
-    // Absorb any trailing writes (the `quit` path calls disconnect()).
-    // No CAT command in this scenario reaches the radio: the
-    // terminal-mode guard intercepts them before dispatch.
+    mock
+}
+
+/// Radio already in Reflector Terminal Mode, followed by the exact MMDVM
+/// writes needed to initialize and stop a D-STAR gateway session.
+///
+/// This scenario deliberately has no catch-all write allowance. In
+/// particular, a CAT recovery preamble sent after the positive binary-mode
+/// proof fails immediately instead of being mistaken for valid gateway I/O.
+fn mmdvm_dstar_scenario() -> MockTransport {
+    let mut mock = mmdvm_dstar_init_scenario();
+
+    // Script EOF stops the gateway without prompting. The persistent Menu 650
+    // setting remains enabled, but the MMDVM owner still emits its ordinary
+    // raw TNC-exit command before returning and closing the transport.
+    mock.expect(b"TN 0,0\r", b"");
+    mock.pend_when_empty();
+
+    mock
+}
+
+/// Interactive D-STAR scenario that accepts periodic status polls while the
+/// input prompt remains idle, then still requires the exact gateway-stop
+/// command at EOF.
+fn mmdvm_dstar_idle_scenario() -> MockTransport {
+    let mut mock = mmdvm_dstar_init_scenario();
+
+    // The 250 ms MMDVM status poll is intentionally variable with wall-clock
+    // scheduling. Accept those write-only frames while retaining the exact
+    // shutdown boundary below. The strict sibling scenario independently
+    // rejects every unexpected startup/init write.
     mock.expect_any_write();
+    mock.expect(b"TN 0,0\r", b"");
+    mock.pend_when_empty();
+
+    mock
+}
+
+/// Exact common startup through acknowledged D-STAR `SetMode`.
+fn mmdvm_dstar_init_scenario() -> MockTransport {
+    let mut mock = MockTransport::new();
+
+    // connect_with_tnc_exit preamble.
+    mock.expect(b"\r", b"");
+    mock.expect(b"\r", b"");
+    mock.expect(&[0x03], b"");
+    mock.expect(&[0xC0, 0xFF, 0xC0], b"");
+    mock.expect(b"\rTC 1\r", b"");
+    mock.expect(b"TN 0,0\r", b"");
+
+    // CAT is offline, but the complete MMDVM version frame proves the binary
+    // protocol boundary and authorizes conversion into the typed session.
+    mock.expect(b"ID\r", b"?\r");
+    mock.expect(b"\xE0\x03\x00", b"\xE0\x0E\x00\x01MMDVM 2018");
+
+    // AsyncModem's initial version and status requests precede gateway init.
+    mock.expect(b"\xE0\x03\x00", b"");
+    mock.expect(b"\xE0\x03\x01", b"");
+
+    // D-STAR-only SetConfig, then SetMode(Dstar), each with its correlated
+    // MMDVM acknowledgement.
+    mock.expect(b"\xE0\x09\x02\x00\x01\x0A\x01\x80\x80", b"\xE0\x04\x70\x02");
+    mock.expect(b"\xE0\x04\x03\x01", b"\xE0\x04\x70\x03");
 
     mock
 }

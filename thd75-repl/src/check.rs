@@ -8,9 +8,10 @@
 //! their screen reader to verify the mechanically checked output contract.
 
 use crate::{help_text, lint, output};
+use dstar_gateway_core::{Callsign, Module, ReflectorCallsign};
 use kenwood_thd75::types::{
-    Band, BatteryLevel, BeaconMode, DetectOutputMode, PowerLevel, RadioClock, RadioDateTime,
-    TncBaud, TncMode,
+    Band, BatteryLevel, BeaconMode, FirmwareIdentity, GpsSettings, PacketDataRate, PowerLevel,
+    RadioClock, RadioDateTime, RadioModel, TncMode, UsbAudioOutput,
 };
 
 /// One entry in the coverage table: a human-readable source name and
@@ -28,7 +29,7 @@ const COVERAGE: &[(&str, Generator)] = &[
     ("output::power_read", gen_power_read),
     ("output::power_set", gen_power_set),
     ("output::tnc_mode", gen_tnc_mode),
-    ("output::beacon_type", gen_beacon_type),
+    ("output::beacon_mode", gen_beacon_mode),
     ("output::squelch_read", gen_squelch_read),
     ("output::squelch_set", gen_squelch_set),
     ("output::smeter", gen_smeter),
@@ -47,7 +48,7 @@ const COVERAGE: &[(&str, Generator)] = &[
     ("output::channels_summary", gen_channels_summary),
     ("output::tx_offset", gen_tx_offset),
     ("output::step_size", gen_step_size),
-    ("output::gps_config", gen_gps_config),
+    ("output::gps_settings", gen_gps_settings),
     ("output::urcall_read", gen_urcall_read),
     ("output::urcall_set", gen_urcall_set),
     ("output::reflector_connected", gen_reflector_connected),
@@ -116,15 +117,15 @@ fn gen_power_read() -> Vec<String> {
 fn gen_tnc_mode() -> Vec<String> {
     let mut v = Vec::new();
     for mode in [TncMode::Off, TncMode::Aprs, TncMode::Kiss] {
-        for baud in [TncBaud::Bps1200, TncBaud::Bps9600] {
-            v.push(output::tnc_mode_read(mode, baud));
-            v.push(output::tnc_mode_set(mode, baud));
+        for data_rate in [PacketDataRate::Bps1200, PacketDataRate::Bps9600] {
+            v.push(output::tnc_mode_read(mode, data_rate));
+            v.push(output::tnc_mode_set(mode, data_rate));
         }
     }
     v
 }
 
-fn gen_beacon_type() -> Vec<String> {
+fn gen_beacon_mode() -> Vec<String> {
     let mut v = Vec::new();
     for mode in [
         BeaconMode::Manual,
@@ -132,8 +133,8 @@ fn gen_beacon_type() -> Vec<String> {
         BeaconMode::Auto,
         BeaconMode::SmartBeaconing,
     ] {
-        v.push(output::beacon_type_read(mode));
-        v.push(output::beacon_type_set(mode));
+        v.push(output::beacon_mode_read(mode));
+        v.push(output::beacon_mode_set(mode));
     }
     v
 }
@@ -169,7 +170,7 @@ fn gen_battery() -> Vec<String> {
         BatteryLevel::TwoThirds,
         BatteryLevel::Full,
         BatteryLevel::Charging,
-        BatteryLevel::Raw5,
+        BatteryLevel::Unidentified5,
     ]
     .iter()
     .map(|l| output::battery(*l))
@@ -177,11 +178,17 @@ fn gen_battery() -> Vec<String> {
 }
 
 fn gen_radio_model() -> Vec<String> {
-    vec![output::radio_model("TH-D75")]
+    vec![output::radio_model(RadioModel::ThD75)]
 }
 
 fn gen_firmware_version() -> Vec<String> {
-    vec![output::firmware_version("1.03")]
+    let firmware = checked_standard_firmware();
+    vec![output::firmware_version(&firmware)]
+}
+
+fn checked_standard_firmware() -> FirmwareIdentity {
+    FirmwareIdentity::new("1.03")
+        .unwrap_or_else(|error| unreachable!("static firmware identity is valid: {error}"))
 }
 
 fn gen_clock() -> Vec<String> {
@@ -269,12 +276,12 @@ fn gen_step_size() -> Vec<String> {
     ]
 }
 
-fn gen_gps_config() -> Vec<String> {
+fn gen_gps_settings() -> Vec<String> {
     vec![
-        output::gps_config(true, true),
-        output::gps_config(false, false),
-        output::gps_config(true, false),
-        output::gps_config(false, true),
+        output::gps_settings(GpsSettings::new(true, true)),
+        output::gps_settings(GpsSettings::new(false, false)),
+        output::gps_settings(GpsSettings::new(true, false)),
+        output::gps_settings(GpsSettings::new(false, true)),
     ]
 }
 
@@ -307,12 +314,12 @@ fn gen_operation_band() -> Vec<String> {
 
 fn gen_usb_output() -> Vec<String> {
     vec![
-        output::usb_output_read(DetectOutputMode::Af),
-        output::usb_output_read(DetectOutputMode::If),
-        output::usb_output_read(DetectOutputMode::Detect),
-        output::usb_output_set(DetectOutputMode::Af),
-        output::usb_output_set(DetectOutputMode::If),
-        output::usb_output_set(DetectOutputMode::Detect),
+        output::usb_output_read(UsbAudioOutput::Audio),
+        output::usb_output_read(UsbAudioOutput::IntermediateFrequency),
+        output::usb_output_read(UsbAudioOutput::Detect),
+        output::usb_output_set(UsbAudioOutput::Audio),
+        output::usb_output_set(UsbAudioOutput::IntermediateFrequency),
+        output::usb_output_set(UsbAudioOutput::Detect),
     ]
 }
 
@@ -350,6 +357,9 @@ fn gen_aprs_events() -> Vec<String> {
 }
 
 fn gen_dstar_events() -> Vec<String> {
+    let reflector = ReflectorCallsign::try_from_str("REF030")
+        .unwrap_or_else(|error| unreachable!("static reflector is valid: {error}"));
+    let destination = Callsign::from_wire_bytes(*b"W1AW    ");
     vec![
         output::dstar_voice_start("W1AW", "P", "CQCQCQ"),
         output::dstar_voice_start("W1AW", "", "W9ABC"),
@@ -363,8 +373,8 @@ fn gen_dstar_events() -> Vec<String> {
         output::dstar_command_echo().to_string(),
         output::dstar_command_unlink().to_string(),
         output::dstar_command_info().to_string(),
-        output::dstar_command_link("REF030", 'C'),
-        output::dstar_command_callsign("W1AW"),
+        output::dstar_command_link(&reflector, Module::C),
+        output::dstar_command_callsign(&destination),
         output::dstar_modem_status(5, false),
         output::dstar_modem_status(0, true),
         output::reflector_event_connected().to_string(),
@@ -379,10 +389,11 @@ fn gen_dstar_events() -> Vec<String> {
 }
 
 fn gen_startup() -> Vec<String> {
+    let firmware = checked_standard_firmware();
     vec![
         output::startup_banner("0.1.0"),
         output::connected_via("/dev/cu.usbmodem1234"),
-        output::startup_identified("TH-D75", "1.03"),
+        output::startup_identified(RadioModel::ThD75, &firmware),
         output::type_help_hint().to_string(),
         output::goodbye().to_string(),
     ]
@@ -392,6 +403,7 @@ fn gen_mode_help() -> Vec<String> {
     let mut v = Vec::new();
     for blob in [
         help_text::CAT_MODE_HELP,
+        help_text::TERMINAL_MODE_HELP,
         help_text::APRS_MODE_HELP,
         help_text::DSTAR_MODE_HELP,
     ] {

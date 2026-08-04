@@ -36,7 +36,10 @@
 
 use kenwood_thd75::Radio;
 use kenwood_thd75::transport::Transport;
-use kenwood_thd75::types::{Band, DetectOutputMode, Mode};
+use kenwood_thd75::types::{
+    Band, BandMode, DstarCallsign, DstarSuffix, GpsSettings, Module, OperatingMode,
+    ReflectorCallsign, RegularChannel, UsbAudioOutput,
+};
 use thd75_repl::aprintln;
 
 /// Parse a band argument ("a" or "b"), defaulting to A.
@@ -48,8 +51,11 @@ fn parse_band(s: Option<&&str>) -> Band {
 }
 
 /// Human-readable band name.
-fn band_name(band: Band) -> &'static str {
-    if band == Band::A { "A" } else { "B" }
+const fn band_name(band: Band) -> &'static str {
+    match band {
+        Band::A => "A",
+        Band::B => "B",
+    }
 }
 
 /// Format a duration for screen reader speech.
@@ -119,36 +125,37 @@ pub(crate) async fn frequency<T: Transport>(radio: &mut Radio<T>, args: &[&str])
     }
 }
 
-/// Read or set the TNC protocol mode. Args: `[aprs|kiss] [1200|9600]`.
+/// Read or set the CAT-safe TNC protocol mode. Args: `[off|aprs] [1200|9600]`.
 ///
-/// With no arguments, reads the current mode and speed. Setting KISS
-/// here only changes the mode flag; use `aprs start` for a managed
-/// KISS session. APRS mode hands packet operation to the radio's own
+/// With no arguments, reads the current mode and speed. Use `aprs start` for
+/// an owned KISS session. APRS mode hands packet operation to the radio's own
 /// firmware.
 pub(crate) async fn tnc_mode<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
     let Some(&mode_arg) = args.first() else {
         match radio.get_tnc_mode().await {
-            Ok((mode, baud)) => aprintln!("{}", thd75_repl::output::tnc_mode_read(mode, baud)),
+            Ok(state) => aprintln!(
+                "{}",
+                thd75_repl::output::tnc_mode_read(state.mode, state.data_rate)
+            ),
             Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
         }
         return;
     };
     let mode = match mode_arg.to_lowercase().as_str() {
-        "off" => kenwood_thd75::types::TncMode::Off,
-        "aprs" => kenwood_thd75::types::TncMode::Aprs,
-        "kiss" => kenwood_thd75::types::TncMode::Kiss,
+        "off" => kenwood_thd75::types::TncControlMode::Off,
+        "aprs" => kenwood_thd75::types::TncControlMode::Aprs,
         other => {
             aprintln!(
                 "{}",
                 thd75_repl::output::error(format_args!("unknown TNC mode: {other}"))
             );
-            aprintln!("Valid modes: off, aprs, kiss");
+            aprintln!("Valid modes: off, aprs. Use 'aprs start' for KISS.");
             return;
         }
     };
-    let baud = match args.get(1) {
-        None | Some(&"1200") => kenwood_thd75::types::TncBaud::Bps1200,
-        Some(&"9600") => kenwood_thd75::types::TncBaud::Bps9600,
+    let data_rate = match args.get(1) {
+        None | Some(&"1200") => kenwood_thd75::types::PacketDataRate::Bps1200,
+        Some(&"9600") => kenwood_thd75::types::PacketDataRate::Bps9600,
         Some(other) => {
             aprintln!(
                 "{}",
@@ -157,21 +164,24 @@ pub(crate) async fn tnc_mode<T: Transport>(radio: &mut Radio<T>, args: &[&str]) 
             return;
         }
     };
-    match radio.set_tnc_mode(mode, baud).await {
-        Ok(()) => aprintln!("{}", thd75_repl::output::tnc_mode_set(mode, baud)),
+    match radio.set_tnc_mode(mode, data_rate).await {
+        Ok(()) => aprintln!(
+            "{}",
+            thd75_repl::output::tnc_mode_set(mode.into(), data_rate)
+        ),
         Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
     }
 }
 
-/// Read or set the firmware beacon type. Args: `[manual|ptt|auto|smart]`.
+/// Read or set the firmware beacon mode. Args: `[manual|ptt|auto|smart]`.
 ///
 /// Auto, smart, and PTT make the radio transmit BY ITSELF while its
 /// TNC is in APRS mode, so those settings go through the transmit
 /// confirmation gate.
-pub(crate) async fn beacon_type<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
+pub(crate) async fn beacon_mode<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
     let Some(&arg) = args.first() else {
-        match radio.get_beacon_type().await {
-            Ok(mode) => aprintln!("{}", thd75_repl::output::beacon_type_read(mode)),
+        match radio.get_beacon_mode().await {
+            Ok(mode) => aprintln!("{}", thd75_repl::output::beacon_mode_read(mode)),
             Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
         }
         return;
@@ -184,9 +194,9 @@ pub(crate) async fn beacon_type<T: Transport>(radio: &mut Radio<T>, args: &[&str
         other => {
             aprintln!(
                 "{}",
-                thd75_repl::output::error(format_args!("unknown beacon type: {other}"))
+                thd75_repl::output::error(format_args!("unknown beacon mode: {other}"))
             );
-            aprintln!("Valid types: manual, ptt, auto, smart");
+            aprintln!("Valid modes: manual, ptt, auto, smart");
             return;
         }
     };
@@ -199,8 +209,8 @@ pub(crate) async fn beacon_type<T: Transport>(radio: &mut Radio<T>, args: &[&str
     if transmits && !thd75_repl::confirm::tx_confirm() {
         return;
     }
-    match radio.set_beacon_type(mode).await {
-        Ok(()) => aprintln!("{}", thd75_repl::output::beacon_type_set(mode)),
+    match radio.set_beacon_mode(mode).await {
+        Ok(()) => aprintln!("{}", thd75_repl::output::beacon_mode_set(mode)),
         Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
     }
 }
@@ -300,18 +310,10 @@ pub(crate) async fn step_up<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
     }
     .await;
     match result {
-        Ok(()) => match radio.get_frequency(band).await {
-            Ok(frequency) => aprintln!(
-                "{}",
-                thd75_repl::output::stepped_up(band, frequency.as_hz())
-            ),
-            Err(e) => aprintln!(
-                "{}",
-                thd75_repl::output::error(format_args!(
-                    "stepped up but could not read back frequency: {e}"
-                ))
-            ),
-        },
+        Ok(frequency) => aprintln!(
+            "{}",
+            thd75_repl::output::stepped_up(band, frequency.as_hz())
+        ),
         Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
     }
 }
@@ -337,8 +339,9 @@ pub(crate) async fn step_down<T: Transport>(radio: &mut Radio<T>, args: &[&str])
 // Tuning
 // ---------------------------------------------------------------------------
 
-/// Parse a direct-frequency request and report the library's fail-closed
-/// FO/FQ safety error. Args: `<a|b> <mhz>`.
+/// Parse a direct-frequency request and report the current frequency.
+///
+/// Arbitrary CAT frequency writes are not qualified. Args: `<a|b> <mhz>`.
 #[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -371,9 +374,21 @@ pub(crate) async fn tune<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
     }
 
     let hz = (mhz * 1_000_000.0) as u32;
-    let freq = kenwood_thd75::types::Frequency::new(hz);
-    match radio.tune_frequency(band, freq).await {
-        Ok(()) => aprintln!("{}", thd75_repl::output::tuned_to(band, hz)),
+    match radio.get_frequency(band).await {
+        Ok(current) if current.as_hz() == hz => aprintln!(
+            "{}",
+            thd75_repl::output::error(
+                "already at the requested frequency; arbitrary CAT frequency writes are not qualified"
+            )
+        ),
+        Ok(current) => aprintln!(
+            "{}",
+            thd75_repl::output::error(format_args!(
+                "Band {} is at {} Hz; arbitrary CAT frequency writes are not qualified",
+                band_name(band),
+                current.as_hz()
+            ))
+        ),
         Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
     }
 }
@@ -388,22 +403,36 @@ pub(crate) async fn channel<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
         aprintln!("Usage: ch <channel number>");
         return;
     };
-    let Ok(ch_num) = ch_str.parse::<u16>() else {
+    let Ok(raw_channel) = ch_str.parse::<u16>() else {
         aprintln!(
             "{}",
             thd75_repl::output::error(format_args!("invalid channel number: {ch_str}"))
         );
         return;
     };
+    let Ok(channel) = RegularChannel::new(raw_channel) else {
+        aprintln!(
+            "{}",
+            thd75_repl::output::error(format_args!(
+                "channel number must be {} through {}: {ch_str}",
+                RegularChannel::MIN,
+                RegularChannel::MAX
+            ))
+        );
+        return;
+    };
 
-    match radio.read_channel(ch_num).await {
+    match radio.get_regular_channel_record(channel).await {
         Ok(ch) => aprintln!(
             "{}",
-            thd75_repl::output::channel_read(ch_num, ch.rx_frequency.as_hz())
+            thd75_repl::output::channel_read(
+                channel.as_raw(),
+                ch.channel.receive_frequency.as_hz(),
+            )
         ),
         Err(e) => aprintln!(
             "{}",
-            thd75_repl::output::error(format_args!("reading channel {ch_num}: {e}"))
+            thd75_repl::output::error(format_args!("reading channel {channel}: {e}"))
         ),
     }
 }
@@ -411,13 +440,43 @@ pub(crate) async fn channel<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
 /// List programmed memory channels in a range. Args: `[start] [end]`.
 /// Default range is 0 through 19.
 pub(crate) async fn channels<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
-    let start: u16 = args.first().and_then(|s| s.parse().ok()).unwrap_or(0);
-    // Saturate rather than overflow when the default range extends
-    // past u16::MAX (e.g. `channels 65530`).
-    let end: u16 = args
-        .get(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| start.saturating_add(20));
+    let start = if let Some(value) = args.first() {
+        let Ok(start) = value.parse::<u16>() else {
+            aprintln!(
+                "{}",
+                thd75_repl::output::error(format_args!("invalid start channel number: {value}"))
+            );
+            return;
+        };
+        start
+    } else {
+        RegularChannel::MIN
+    };
+    let Ok(first) = RegularChannel::new(start) else {
+        aprintln!(
+            "{}",
+            thd75_repl::output::error(format_args!(
+                "start channel must be {} through {}: {start}",
+                RegularChannel::MIN,
+                RegularChannel::MAX
+            ))
+        );
+        return;
+    };
+
+    let exclusive_limit = RegularChannel::MAX + 1;
+    let end = if let Some(value) = args.get(1) {
+        let Ok(end) = value.parse::<u16>() else {
+            aprintln!(
+                "{}",
+                thd75_repl::output::error(format_args!("invalid end channel number: {value}"))
+            );
+            return;
+        };
+        end
+    } else {
+        start.saturating_add(20).min(exclusive_limit)
+    };
     if end <= start {
         aprintln!(
             "{}",
@@ -427,20 +486,41 @@ pub(crate) async fn channels<T: Transport>(radio: &mut Radio<T>, args: &[&str]) 
         );
         return;
     }
+    if end > exclusive_limit {
+        aprintln!(
+            "{}",
+            thd75_repl::output::error(format_args!(
+                "exclusive end channel must be 1 through {exclusive_limit}: {end}"
+            ))
+        );
+        return;
+    }
+
+    let last_channel = RegularChannel::new(end - 1)
+        .unwrap_or_else(|_| unreachable!("validated exclusive channel range"));
 
     aprintln!("{}", thd75_repl::output::channels_reading(start, end - 1));
-    match radio.read_channels(start..end).await {
-        Ok(list) => {
-            if list.is_empty() {
+    match radio
+        .read_regular_channel_records(RegularChannel::range_inclusive(first, last_channel))
+        .await
+    {
+        Ok(channel_entries) => {
+            if channel_entries.is_empty() {
                 aprintln!("{}", thd75_repl::output::channels_summary(0));
             } else {
-                for (num, ch) in &list {
+                for (num, ch) in &channel_entries {
                     aprintln!(
                         "{}",
-                        thd75_repl::output::channel_read(*num, ch.rx_frequency.as_hz())
+                        thd75_repl::output::channel_read(
+                            num.as_raw(),
+                            ch.channel.receive_frequency.as_hz()
+                        )
                     );
                 }
-                aprintln!("{}", thd75_repl::output::channels_summary(list.len()));
+                aprintln!(
+                    "{}",
+                    thd75_repl::output::channels_summary(channel_entries.len())
+                );
             }
         }
         Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
@@ -460,35 +540,29 @@ pub(crate) async fn vfo<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
         Ok(ch) => {
             aprintln!(
                 "{}",
-                thd75_repl::output::frequency(band, ch.rx_frequency.as_hz())
+                thd75_repl::output::frequency(band, ch.receive_frequency.as_hz())
             );
             aprintln!(
                 "{}",
-                thd75_repl::output::step_size_read(band, &ch.step_size.to_string())
+                thd75_repl::output::step_size_read(band, &ch.receive_step.to_string())
             );
-            if ch.tx_offset.as_hz() != 0 {
+            if ch.transmit_offset_or_frequency.as_hz() != 0 {
                 aprintln!(
                     "{}",
-                    thd75_repl::output::tx_offset(band, ch.tx_offset.as_hz())
+                    thd75_repl::output::tx_offset(band, ch.transmit_offset_or_frequency.as_hz())
                 );
             }
+            aprintln!(
+                "{}",
+                thd75_repl::output::mode_read(band, &ch.mode.to_string())
+            );
         }
         Err(e) => {
             aprintln!(
                 "{}",
                 thd75_repl::output::error(format_args!("reading VFO: {e}"))
             );
-            return;
         }
-    }
-
-    // Read mode separately (not embedded in ChannelMemory).
-    match radio.get_mode(band).await {
-        Ok(m) => aprintln!("{}", thd75_repl::output::mode_read(band, &m.to_string())),
-        Err(e) => aprintln!(
-            "{}",
-            thd75_repl::output::error(format_args!("reading mode: {e}"))
-        ),
     }
 }
 
@@ -498,11 +572,11 @@ pub(crate) async fn vfo<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
 
 /// Read or set the operating mode on a band. Args: `[a|b] [mode_name]`.
 /// Valid modes: fm, nfm, am, dv, lsb, usb, cw, dr, wfm.
-pub(crate) async fn set_mode<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
+pub(crate) async fn set_operating_mode<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
     if args.len() < 2 {
         // Read mode.
         let band = parse_band(args.first());
-        match radio.get_mode(band).await {
+        match radio.get_operating_mode(band).await {
             Ok(m) => aprintln!("{}", thd75_repl::output::mode_read(band, &m.to_string())),
             Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
         }
@@ -514,15 +588,15 @@ pub(crate) async fn set_mode<T: Transport>(radio: &mut Radio<T>, args: &[&str]) 
         return;
     };
     let mode = match mode_arg.to_lowercase().as_str() {
-        "fm" => Mode::Fm,
-        "nfm" => Mode::Nfm,
-        "am" => Mode::Am,
-        "dv" => Mode::Dv,
-        "lsb" => Mode::Lsb,
-        "usb" => Mode::Usb,
-        "cw" => Mode::Cw,
-        "dr" => Mode::Dr,
-        "wfm" => Mode::Wfm,
+        "fm" => OperatingMode::Fm,
+        "nfm" => OperatingMode::Nfm,
+        "am" => OperatingMode::Am,
+        "dv" => OperatingMode::Dv,
+        "lsb" => OperatingMode::Lsb,
+        "usb" => OperatingMode::Usb,
+        "cw" => OperatingMode::Cw,
+        "dr" => OperatingMode::Dr,
+        "wfm" => OperatingMode::Wfm,
         other => {
             aprintln!(
                 "{}",
@@ -533,7 +607,7 @@ pub(crate) async fn set_mode<T: Transport>(radio: &mut Radio<T>, args: &[&str]) 
         }
     };
 
-    match radio.set_mode(band, mode).await {
+    match radio.set_operating_mode(band, mode).await {
         Ok(()) => aprintln!("{}", thd75_repl::output::mode_set(band, &mode.to_string())),
         Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
     }
@@ -659,13 +733,21 @@ pub(crate) async fn vox<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
 /// Read or set dual-band display mode. Args: `[on|off]`.
 pub(crate) async fn dual_band<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
     if let Some(val) = args.first().and_then(|s| parse_bool(s)) {
-        match radio.set_dual_band(val).await {
+        let mode = if val {
+            BandMode::Dual
+        } else {
+            BandMode::Single
+        };
+        match radio.set_band_mode(mode).await {
             Ok(()) => aprintln!("{}", thd75_repl::output::dual_band(val)),
             Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
         }
     } else {
-        match radio.get_dual_band().await {
-            Ok(on) => aprintln!("{}", thd75_repl::output::dual_band(on)),
+        match radio.get_band_mode().await {
+            Ok(mode) => aprintln!(
+                "{}",
+                thd75_repl::output::dual_band(matches!(mode, BandMode::Dual))
+            ),
             Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
         }
     }
@@ -675,10 +757,13 @@ pub(crate) async fn dual_band<T: Transport>(radio: &mut Radio<T>, args: &[&str])
 // FM broadcast radio
 // ---------------------------------------------------------------------------
 
-/// Read or set the FM broadcast radio receiver. Args: `[on|off]`.
+/// Read the FM broadcast radio receiver state.
+///
+/// A supplied `on`/`off` argument updates Menu 700 through verified MCP
+/// read-modify-write and reconnects to CAT before returning.
 pub(crate) async fn fm_radio<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
     if let Some(val) = args.first().and_then(|s| parse_bool(s)) {
-        match radio.set_fm_radio(val).await {
+        match radio.set_fm_radio_via_mcp(val).await {
             Ok(()) => aprintln!("{}", thd75_repl::output::fm_radio(val)),
             Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
         }
@@ -715,7 +800,7 @@ pub(crate) async fn step_size<T: Transport>(radio: &mut Radio<T>, args: &[&str])
         }
     } else {
         match radio.get_step_size(band).await {
-            Ok((_b, step)) => aprintln!(
+            Ok(step) => aprintln!(
                 "{}",
                 thd75_repl::output::step_size_read(band, &step.to_string())
             ),
@@ -739,22 +824,30 @@ pub(crate) async fn recall<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
     let Some(&ch_str) = args.get(1) else {
         return;
     };
-    let Ok(ch) = ch_str.parse::<u16>() else {
+    let Ok(raw_channel) = ch_str.parse::<u16>() else {
         aprintln!("Error: invalid channel number: {ch_str}");
         return;
     };
+    let Ok(channel) = RegularChannel::new(raw_channel) else {
+        aprintln!(
+            "Error: channel number must be {} through {}: {ch_str}",
+            RegularChannel::MIN,
+            RegularChannel::MAX
+        );
+        return;
+    };
 
-    match radio.tune_channel(band, ch).await {
-        Ok(()) => aprintln!("Band {} recalled channel {ch}", band_name(band)),
+    match radio.tune_channel(band, channel).await {
+        Ok(()) => aprintln!("Band {} recalled channel {channel}", band_name(band)),
         Err(e) => aprintln!("Error: {e}"),
     }
 }
 
 // ---------------------------------------------------------------------------
-// GPS config
+// GPS settings
 // ---------------------------------------------------------------------------
 
-/// Set GPS receiver and PC output configuration. Args: `<on|off> <on|off>`.
+/// Set GPS receiver and PC output settings. Args: `<on|off> <on|off>`.
 /// First argument controls the GPS receiver, second controls PC serial output.
 pub(crate) async fn gps<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
     if args.len() < 2 {
@@ -773,8 +866,9 @@ pub(crate) async fn gps<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
         return;
     };
 
-    match radio.set_gps_config(gps_on, pc_on).await {
-        Ok(()) => aprintln!("{}", thd75_repl::output::gps_config(gps_on, pc_on)),
+    let settings = GpsSettings::new(gps_on, pc_on);
+    match radio.set_gps_settings(settings).await {
+        Ok(()) => aprintln!("{}", thd75_repl::output::gps_settings(settings)),
         Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
     }
 }
@@ -788,10 +882,11 @@ pub(crate) async fn gps<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
 pub(crate) async fn urcall<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
     if args.is_empty() {
         match radio.get_urcall().await {
-            Ok((call, suffix)) => {
-                let call = call.trim();
-                let suffix = suffix.trim();
-                aprintln!("{}", thd75_repl::output::urcall_read(call, suffix));
+            Ok(entry) => {
+                aprintln!(
+                    "{}",
+                    thd75_repl::output::urcall_read(entry.callsign.as_str(), entry.suffix.as_str())
+                );
             }
             Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
         }
@@ -801,9 +896,24 @@ pub(crate) async fn urcall<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
     let Some(&callsign) = args.first() else {
         return;
     };
-    let suffix = args.get(1).unwrap_or(&"");
+    let suffix = args.get(1).copied().unwrap_or("");
+    let callsign = match DstarCallsign::new(callsign) {
+        Ok(callsign) => callsign,
+        Err(e) => {
+            aprintln!("{}", thd75_repl::output::error(e));
+            return;
+        }
+    };
+    let suffix = match DstarSuffix::new(suffix) {
+        Ok(suffix) => suffix,
+        Err(e) => {
+            aprintln!("{}", thd75_repl::output::error(e));
+            return;
+        }
+    };
+    let callsign_display = callsign.as_str().to_owned();
     match radio.set_urcall(callsign, suffix).await {
-        Ok(()) => aprintln!("{}", thd75_repl::output::urcall_set(callsign)),
+        Ok(()) => aprintln!("{}", thd75_repl::output::urcall_set(&callsign_display)),
         Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
     }
 }
@@ -831,16 +941,41 @@ pub(crate) async fn reflector<T: Transport>(radio: &mut Radio<T>, args: &[&str])
     let (Some(&name), Some(&module_arg)) = (args.first(), args.get(1)) else {
         return;
     };
-    let module = module_arg.chars().next().unwrap_or('A');
-    match radio.connect_reflector(name, module).await {
-        Ok(()) => aprintln!("{}", thd75_repl::output::reflector_connected(name, module)),
+    let name_typed = match ReflectorCallsign::try_from_str(name) {
+        Ok(name) => name,
+        Err(e) => {
+            aprintln!("{}", thd75_repl::output::error(e));
+            return;
+        }
+    };
+    let mut module_chars = module_arg.chars();
+    let module = if let (Some(module), None) = (module_chars.next(), module_chars.next()) {
+        match Module::try_from_char(module) {
+            Ok(module) => module,
+            Err(e) => {
+                aprintln!("{}", thd75_repl::output::error(e));
+                return;
+            }
+        }
+    } else {
+        aprintln!(
+            "{}",
+            thd75_repl::output::error("reflector module must be exactly one uppercase letter")
+        );
+        return;
+    };
+    match radio.prepare_reflector_link(name_typed, module).await {
+        Ok(()) => aprintln!(
+            "{}",
+            thd75_repl::output::reflector_connected(name, module.as_char())
+        ),
         Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
     }
 }
 
 /// Disconnect from the currently linked D-STAR reflector.
 pub(crate) async fn unreflector<T: Transport>(radio: &mut Radio<T>) {
-    match radio.disconnect_reflector().await {
+    match radio.prepare_reflector_unlink().await {
         Ok(()) => aprintln!("{}", thd75_repl::output::reflector_disconnected()),
         Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
     }
@@ -890,16 +1025,16 @@ pub(crate) async fn band<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
 /// the required steps is printed after the error.
 pub(crate) async fn ifout<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
     let Some(arg) = args.first() else {
-        match radio.get_io_port().await {
+        match radio.get_usb_audio_output().await {
             Ok(mode) => aprintln!("{}", thd75_repl::output::usb_output_read(mode)),
             Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
         }
         return;
     };
     let target = match arg.to_lowercase().as_str() {
-        "af" => DetectOutputMode::Af,
-        "if" => DetectOutputMode::If,
-        "detect" => DetectOutputMode::Detect,
+        "audio" | "af" => UsbAudioOutput::Audio,
+        "intermediate-frequency" | "if" => UsbAudioOutput::IntermediateFrequency,
+        "detect" => UsbAudioOutput::Detect,
         other => {
             aprintln!(
                 "{}",
@@ -910,11 +1045,11 @@ pub(crate) async fn ifout<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
             return;
         }
     };
-    match radio.set_io_port(target).await {
+    match radio.set_usb_audio_output(target).await {
         Ok(()) => aprintln!("{}", thd75_repl::output::usb_output_set(target)),
         Err(e) => {
             aprintln!("{}", thd75_repl::output::error(e));
-            if !matches!(target, DetectOutputMode::Af) {
+            if !matches!(target, UsbAudioOutput::Audio) {
                 aprintln!("IF and Detect require Single Band mode on Band B.");
                 aprintln!("Type band b, then dualband off, and try again.");
             }
@@ -959,7 +1094,7 @@ pub(crate) async fn status<T: Transport>(radio: &mut Radio<T>) {
         aprintln!("Radio model: not available");
     }
     if let Ok(fw) = radio.get_firmware_version().await {
-        aprintln!("{}", thd75_repl::output::firmware_version(fw));
+        aprintln!("{}", thd75_repl::output::firmware_version(&fw));
     } else {
         aprintln!("Firmware version: not available");
     }
@@ -974,8 +1109,11 @@ pub(crate) async fn status<T: Transport>(radio: &mut Radio<T>) {
         aprintln!("Radio clock: not available");
     }
     aprintln!("Key lock: not available (no verified CAT operation)");
-    if let Ok(on) = radio.get_dual_band().await {
-        aprintln!("{}", thd75_repl::output::dual_band(on));
+    if let Ok(mode) = radio.get_band_mode().await {
+        aprintln!(
+            "{}",
+            thd75_repl::output::dual_band(matches!(mode, BandMode::Dual))
+        );
     } else {
         aprintln!("Dual band: not available");
     }
@@ -997,7 +1135,7 @@ pub(crate) async fn status<T: Transport>(radio: &mut Radio<T>) {
         } else {
             aprintln!("Band {name} frequency: not available");
         }
-        if let Ok(m) = radio.get_mode(band).await {
+        if let Ok(m) = radio.get_operating_mode(band).await {
             aprintln!("{}", thd75_repl::output::mode_read(band, &m.to_string()));
         } else {
             aprintln!("Band {name} mode: not available");

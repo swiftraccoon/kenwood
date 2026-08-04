@@ -15,15 +15,19 @@
 //! - Lines under 80 characters (no wrapping in standard terminals)
 //! - ASCII printable only (no box-drawing or symbols)
 
+use dstar_gateway_core::{Callsign, Module, ReflectorCallsign};
 use kenwood_thd75::types::{
-    Band, BatteryLevel, BeaconMode, DetectOutputMode, PowerLevel, RadioClock, TncBaud, TncMode,
+    Band, BatteryLevel, BeaconMode, FirmwareIdentity, GpsSettings, PacketDataRate, PowerLevel,
+    RadioClock, RadioModel, TncMode, UsbAudioOutput,
 };
 
-/// Human-readable band name. Matches the pre-extraction helper which
-/// returned "A" for `Band::A` and "B" for every other variant.
+/// Human-readable band name.
 #[must_use]
-pub fn band_name(band: Band) -> &'static str {
-    if band == Band::A { "A" } else { "B" }
+pub const fn band_name(band: Band) -> &'static str {
+    match band {
+        Band::A => "A",
+        Band::B => "B",
+    }
 }
 
 /// Format a frequency in megahertz for natural speech output.
@@ -87,7 +91,7 @@ pub fn tx_offset(band: Band, hz: u32) -> String {
 }
 
 /// `Band {A|B} mode: {mode}` (for VFO readout - the full mode name
-/// comes from `kenwood_thd75::types::Mode::fmt`).
+/// comes from `kenwood_thd75::types::OperatingMode::fmt`).
 #[must_use]
 pub fn mode_read(band: Band, mode_display: &str) -> String {
     format!("Band {} mode: {mode_display}", band_name(band))
@@ -111,37 +115,43 @@ pub fn mode_set(band: Band, mode_display: &str) -> String {
     format!("Band {} mode set to {mode_display}", band_name(band))
 }
 
-/// Spell out a TNC data speed without abbreviations.
+/// Spell out a packet data rate without abbreviations.
 #[must_use]
-pub const fn tnc_baud_display(baud: TncBaud) -> &'static str {
-    match baud {
-        TncBaud::Bps1200 => "1200 bits per second",
-        TncBaud::Bps9600 => "9600 bits per second",
+pub const fn packet_data_rate_display(data_rate: PacketDataRate) -> &'static str {
+    match data_rate {
+        PacketDataRate::Bps1200 => "1200 bits per second",
+        PacketDataRate::Bps9600 => "9600 bits per second",
     }
 }
 
 /// Format a TNC mode readout.
 #[must_use]
-pub fn tnc_mode_read(mode: TncMode, baud: TncBaud) -> String {
-    format!("TNC mode: {mode} at {}", tnc_baud_display(baud))
+pub fn tnc_mode_read(mode: TncMode, data_rate: PacketDataRate) -> String {
+    format!(
+        "TNC mode: {mode} at {}",
+        packet_data_rate_display(data_rate)
+    )
 }
 
 /// Format a TNC mode change confirmation.
 #[must_use]
-pub fn tnc_mode_set(mode: TncMode, baud: TncBaud) -> String {
-    format!("TNC mode set to {mode} at {}", tnc_baud_display(baud))
+pub fn tnc_mode_set(mode: TncMode, data_rate: PacketDataRate) -> String {
+    format!(
+        "TNC mode set to {mode} at {}",
+        packet_data_rate_display(data_rate)
+    )
 }
 
-/// Format a firmware beacon type readout.
+/// Format a firmware beacon mode readout.
 #[must_use]
-pub fn beacon_type_read(mode: BeaconMode) -> String {
-    format!("Firmware beacon type: {mode}")
+pub fn beacon_mode_read(mode: BeaconMode) -> String {
+    format!("Firmware beacon mode: {mode}")
 }
 
-/// Format a firmware beacon type change confirmation.
+/// Format a firmware beacon mode change confirmation.
 #[must_use]
-pub fn beacon_type_set(mode: BeaconMode) -> String {
-    format!("Firmware beacon type set to {mode}")
+pub fn beacon_mode_set(mode: BeaconMode) -> String {
+    format!("Firmware beacon mode set to {mode}")
 }
 
 /// Human-readable power level name with watts in full.
@@ -202,7 +212,7 @@ pub const fn battery_level_display(level: BatteryLevel) -> &'static str {
         BatteryLevel::TwoThirds => "two thirds",
         BatteryLevel::Full => "full",
         BatteryLevel::Charging => "charging",
-        BatteryLevel::Raw5 => "state 5, meaning not yet qualified",
+        BatteryLevel::Unidentified5 => "state 5, meaning not yet qualified",
     }
 }
 
@@ -214,13 +224,13 @@ pub const fn on_off(value: bool) -> &'static str {
 
 /// `Radio model: {model}`.
 #[must_use]
-pub fn radio_model(model: impl std::fmt::Display) -> String {
+pub fn radio_model(model: RadioModel) -> String {
     format!("Radio model: {model}")
 }
 
 /// `Firmware version: {version}`.
 #[must_use]
-pub fn firmware_version(version: impl std::fmt::Display) -> String {
+pub fn firmware_version(version: &FirmwareIdentity) -> String {
     format!("Firmware version: {version}")
 }
 
@@ -334,8 +344,12 @@ pub fn channels_summary(count: usize) -> String {
 
 /// `GPS: {on|off}, PC output: {on|off}`.
 #[must_use]
-pub fn gps_config(gps_on: bool, pc_on: bool) -> String {
-    format!("GPS: {}, PC output: {}", on_off(gps_on), on_off(pc_on))
+pub fn gps_settings(settings: GpsSettings) -> String {
+    format!(
+        "GPS: {}, PC output: {}",
+        on_off(settings.enabled()),
+        on_off(settings.pc_output())
+    )
 }
 
 /// `Destination callsign: {call}` or `... suffix {suffix}`.
@@ -386,13 +400,13 @@ pub fn operation_band_set(band: Band) -> String {
 
 /// `USB audio output: {AF|IF|Detect}` (CAT IO, radio Menu 102).
 #[must_use]
-pub fn usb_output_read(mode: DetectOutputMode) -> String {
+pub fn usb_output_read(mode: UsbAudioOutput) -> String {
     format!("USB audio output: {mode}")
 }
 
 /// `USB audio output set to {AF|IF|Detect}`.
 #[must_use]
-pub fn usb_output_set(mode: DetectOutputMode) -> String {
+pub fn usb_output_set(mode: UsbAudioOutput) -> String {
     format!("USB audio output set to {mode}")
 }
 
@@ -598,13 +612,13 @@ pub const fn dstar_command_info() -> &'static str {
 
 /// `D-STAR command: link to {reflector} module {module}.`
 #[must_use]
-pub fn dstar_command_link(reflector: &str, module: char) -> String {
+pub fn dstar_command_link(reflector: &ReflectorCallsign, module: Module) -> String {
     format!("D-STAR command: link to {reflector} module {module}.")
 }
 
 /// `D-STAR command: route to callsign {call}.`
 #[must_use]
-pub fn dstar_command_callsign(call: &str) -> String {
+pub fn dstar_command_callsign(call: &Callsign) -> String {
     format!("D-STAR command: route to callsign {call}.")
 }
 
@@ -703,7 +717,7 @@ pub const fn type_help_hint() -> &'static str {
 
 /// `Radio model: {model}. Firmware version: {fw}.`
 #[must_use]
-pub fn startup_identified(model: &str, firmware: &str) -> String {
+pub fn startup_identified(model: RadioModel, firmware: &FirmwareIdentity) -> String {
     format!("Radio model: {model}. Firmware version: {firmware}.")
 }
 
@@ -872,7 +886,7 @@ mod tests {
             (BatteryLevel::Full, "Battery level: full"),
             (BatteryLevel::Charging, "Battery level: charging"),
             (
-                BatteryLevel::Raw5,
+                BatteryLevel::Unidentified5,
                 "Battery level: state 5, meaning not yet qualified",
             ),
         ];
@@ -885,16 +899,18 @@ mod tests {
 
     #[test]
     fn radio_model_format() {
-        let s = radio_model("TH-D75");
+        let s = radio_model(RadioModel::ThD75);
         assert_eq!(s, "Radio model: TH-D75");
         assert_lint(&s);
     }
 
     #[test]
-    fn firmware_version_format() {
-        let s = firmware_version("1.03");
+    fn firmware_version_format() -> Result<(), kenwood_thd75::error::ValidationError> {
+        let version = FirmwareIdentity::new("1.03")?;
+        let s = firmware_version(&version);
         assert_eq!(s, "Firmware version: 1.03");
         assert_lint(&s);
+        Ok(())
     }
 
     #[test]
@@ -982,12 +998,24 @@ mod tests {
     }
 
     #[test]
-    fn gps_config_format() {
-        assert_eq!(gps_config(true, true), "GPS: on, PC output: on");
-        assert_eq!(gps_config(false, true), "GPS: off, PC output: on");
-        assert_eq!(gps_config(true, false), "GPS: on, PC output: off");
-        assert_eq!(gps_config(false, false), "GPS: off, PC output: off");
-        assert_lint(&gps_config(true, true));
+    fn gps_settings_format() {
+        assert_eq!(
+            gps_settings(GpsSettings::new(true, true)),
+            "GPS: on, PC output: on"
+        );
+        assert_eq!(
+            gps_settings(GpsSettings::new(false, true)),
+            "GPS: off, PC output: on"
+        );
+        assert_eq!(
+            gps_settings(GpsSettings::new(true, false)),
+            "GPS: on, PC output: off"
+        );
+        assert_eq!(
+            gps_settings(GpsSettings::new(false, false)),
+            "GPS: off, PC output: off"
+        );
+        assert_lint(&gps_settings(GpsSettings::new(true, true)));
     }
 
     #[test]
@@ -1030,25 +1058,25 @@ mod tests {
 
     #[test]
     fn usb_output_formats() {
-        use kenwood_thd75::types::DetectOutputMode;
+        use kenwood_thd75::types::UsbAudioOutput;
         assert_eq!(
-            usb_output_read(DetectOutputMode::Af),
-            "USB audio output: AF"
+            usb_output_read(UsbAudioOutput::Audio),
+            "USB audio output: Audio"
         );
         assert_eq!(
-            usb_output_read(DetectOutputMode::If),
-            "USB audio output: IF"
+            usb_output_read(UsbAudioOutput::IntermediateFrequency),
+            "USB audio output: Intermediate Frequency"
         );
         assert_eq!(
-            usb_output_read(DetectOutputMode::Detect),
+            usb_output_read(UsbAudioOutput::Detect),
             "USB audio output: Detect"
         );
         assert_eq!(
-            usb_output_set(DetectOutputMode::If),
-            "USB audio output set to IF"
+            usb_output_set(UsbAudioOutput::IntermediateFrequency),
+            "USB audio output set to Intermediate Frequency"
         );
-        assert_lint(&usb_output_read(DetectOutputMode::Af));
-        assert_lint(&usb_output_set(DetectOutputMode::Detect));
+        assert_lint(&usb_output_read(UsbAudioOutput::Audio));
+        assert_lint(&usb_output_set(UsbAudioOutput::Detect));
     }
 
     #[test]
@@ -1132,6 +1160,9 @@ mod tests {
 
     #[test]
     fn dstar_events_pass_lint() {
+        let reflector = ReflectorCallsign::try_from_str("REF030")
+            .unwrap_or_else(|error| unreachable!("static reflector is valid: {error}"));
+        let destination = Callsign::from_wire_bytes(*b"W1AW    ");
         let cases: Vec<String> = vec![
             dstar_voice_start("W1AW", "P", "CQCQCQ"),
             dstar_voice_start("W1AW", "", "W9ABC"),
@@ -1145,8 +1176,8 @@ mod tests {
             dstar_command_echo().to_string(),
             dstar_command_unlink().to_string(),
             dstar_command_info().to_string(),
-            dstar_command_link("REF030", 'C'),
-            dstar_command_callsign("W1AW"),
+            dstar_command_link(&reflector, Module::C),
+            dstar_command_callsign(&destination),
             dstar_modem_status(5, false),
             dstar_modem_status(0, true),
             reflector_event_connected().to_string(),
@@ -1194,12 +1225,14 @@ mod tests {
     }
 
     #[test]
-    fn startup_strings_lint() {
+    fn startup_strings_lint() -> Result<(), kenwood_thd75::error::ValidationError> {
+        let firmware = FirmwareIdentity::new("1.03")?;
         assert_lint(&startup_banner("0.1.0"));
         assert_lint(&connected_via("/dev/cu.usbmodem1234"));
         assert_lint(goodbye());
         assert_lint(type_help_hint());
-        assert_lint(&startup_identified("TH-D75", "1.03"));
+        assert_lint(&startup_identified(RadioModel::ThD75, &firmware));
+        Ok(())
     }
 
     #[test]
@@ -1228,11 +1261,13 @@ mod tests {
     }
 
     #[test]
-    fn startup_identified_format() {
+    fn startup_identified_format() -> Result<(), kenwood_thd75::error::ValidationError> {
+        let firmware = FirmwareIdentity::new("1.03")?;
         assert_eq!(
-            startup_identified("TH-D75", "1.03"),
+            startup_identified(RadioModel::ThD75, &firmware),
             "Radio model: TH-D75. Firmware version: 1.03."
         );
+        Ok(())
     }
 
     proptest::proptest! {

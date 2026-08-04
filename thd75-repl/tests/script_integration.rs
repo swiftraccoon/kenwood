@@ -25,7 +25,9 @@ use tracing_appender as _;
 use tracing_subscriber as _;
 
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+use std::{io::Write as _, thread};
 
 use thd75_repl::lint;
 
@@ -95,7 +97,7 @@ fn cat_basics_script_lints_clean() -> TestResult {
         "missing band read line in stdout:\n{stdout}"
     );
     assert!(
-        stdout.contains("USB audio output: AF"),
+        stdout.contains("USB audio output: Audio"),
         "missing USB output read line in stdout:\n{stdout}"
     );
     assert!(
@@ -131,6 +133,110 @@ fn terminal_mode_guard_intercepts_cat_commands() -> TestResult {
         lint_result.is_ok(),
         "terminal-mode stdout violates rules: {lint_result:#?}\nstdout:\n{stdout}"
     );
+    Ok(())
+}
+
+#[test]
+fn terminal_mode_starts_dstar_without_cat_recovery() -> TestResult {
+    // The strict scenario permits only the positive terminal-mode probe,
+    // MMDVM startup/init frames, and EOF cleanup. Any CAT recovery write after
+    // binary proof makes gateway initialization fail and the process exit
+    // nonzero.
+    let (ok, stdout, stderr) = run_with_script("terminal_mode_dstar_start.txt", "mmdvm_dstar")?;
+
+    assert!(
+        ok,
+        "terminal-mode D-STAR startup failed; stdout={stdout:?} stderr={stderr:?}"
+    );
+    for expected in [
+        "Radio is in D-STAR Reflector Terminal Mode.",
+        "Radio is already in Reflector Terminal Mode.",
+        "MMDVM modem initialized.",
+        "D-STAR gateway active.",
+        "The radio is still in Reflector Terminal Mode.",
+        "Goodbye.",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected:?} in stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+    for forbidden in [
+        "CAT response boundary is ambiguous",
+        "CAT recovery failed",
+        "timed out",
+        "radio connection lost",
+    ] {
+        assert!(
+            !stdout.contains(forbidden),
+            "unexpected {forbidden:?} in stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+    let lint_result = lint::check_output(&stdout);
+    assert!(
+        lint_result.is_ok(),
+        "terminal-mode D-STAR stdout violates rules: {lint_result:#?}\nstdout:\n{stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn idle_dstar_prompt_keeps_mmdvm_transport_running() -> TestResult {
+    // Hold interactive stdin open beyond the modem loop's five-second write
+    // deadline. A blocking readline on the LocalSet thread starves the MMDVM
+    // transport pump and makes the next `listen` report a dead radio link.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_thd75-repl"))
+        .args([
+            "--mock-radio",
+            "mmdvm_dstar_idle",
+            "dstar",
+            "start",
+            "KQ4NIT",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdin = child.stdin.take().ok_or("child stdin was not piped")?;
+
+    thread::sleep(Duration::from_secs(8));
+    stdin.write_all(b"listen\n")?;
+    stdin.flush()?;
+    drop(stdin);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut timed_out = false;
+    while child.try_wait()?.is_none() {
+        if Instant::now() >= deadline {
+            timed_out = true;
+            child.kill()?;
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let output = child.wait_with_output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(
+        !timed_out && output.status.success(),
+        "idle-prompt child did not stop cleanly; stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        stdout.contains("D-STAR gateway active.") && stdout.contains("Goodbye."),
+        "idle-prompt flow missed startup or cleanup:\n{stdout}\nstderr:\n{stderr}"
+    );
+    for forbidden in [
+        "radio link failed",
+        "write timed out",
+        "stopping D-STAR gateway",
+    ] {
+        assert!(
+            !stdout.contains(forbidden) && !stderr.contains(forbidden),
+            "idle prompt starved or lost the modem ({forbidden:?}):\n\
+             stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
     Ok(())
 }
 

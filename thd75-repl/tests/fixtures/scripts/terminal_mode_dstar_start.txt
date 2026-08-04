@@ -1,0 +1,4 @@
+# Radio starts in Reflector Terminal Mode and the positive MMDVM proof must
+# flow directly into gateway initialization. Script EOF performs a clean,
+# noninteractive gateway shutdown without contacting a reflector.
+dstar start KQ4NIT

@@ -29,7 +29,7 @@ pub(crate) fn discover_and_open(
     let usb_ports = SerialTransport::discover_usb()?;
     if let Some(info) = usb_ports.first() {
         let path = info.port_name.clone();
-        let transport = SerialTransport::open(&path, baud)?;
+        let transport = SerialTransport::open_with_baud(&path, baud)?;
         return Ok((path, EitherTransport::Serial(transport)));
     }
 
@@ -48,7 +48,7 @@ fn open_explicit(
         let bt = kenwood_thd75::BluetoothTransport::open(None)?;
         return Ok((path.to_string(), EitherTransport::Bluetooth(bt)));
     }
-    let transport = SerialTransport::open(path, baud)?;
+    let transport = SerialTransport::open_with_baud(path, baud)?;
     Ok((path.to_string(), EitherTransport::Serial(transport)))
 }
 
@@ -80,7 +80,7 @@ fn open_bluetooth(baud: u32) -> Result<(String, EitherTransport), Box<dyn std::e
     let bt_ports = SerialTransport::discover_bluetooth()?;
     if let Some(info) = bt_ports.first() {
         let path = info.port_name.clone();
-        let transport = SerialTransport::open(&path, baud)?;
+        let transport = SerialTransport::open_with_baud(&path, baud)?;
         return Ok((path, EitherTransport::Serial(transport)));
     }
     Err("Error: no TH-D75 found on USB or Bluetooth. Use --port to specify.".into())

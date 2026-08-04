@@ -24,7 +24,7 @@ pub const ALL_COMMANDS: &[&str] = &[
     "squelch",
     "power",
     "tnc",
-    "beacontype",
+    "beaconmode",
     "att",
     "meter",
     "lock",
@@ -72,7 +72,7 @@ pub fn for_command(cmd: &str) -> Option<&'static str> {
         "squelch" | "sq" => Some(SQUELCH_HELP),
         "power" | "pwr" => Some(POWER_HELP),
         "tnc" => Some(TNC_HELP),
-        "beacontype" => Some(BEACONTYPE_HELP),
+        "beaconmode" => Some(BEACONMODE_HELP),
         "att" | "attenuator" => Some(ATT_HELP),
         "meter" | "smeter" => Some(METER_HELP),
         "lock" => Some(LOCK_HELP),
@@ -173,6 +173,16 @@ aprs start MYCALL 7: Enter APRS mode with callsign and SSID
 -- D-STAR gateway mode --
 dstar start MYCALL XRF030C: Enter D-STAR gateway with reflector";
 
+/// Help shown when startup proved persistent MMDVM framing but no gateway
+/// session is active yet.
+pub const TERMINAL_MODE_HELP: &str = "The radio is in D-STAR Reflector Terminal Mode.
+CAT commands are unavailable on this link.
+dstar start MYCALL: Start the D-STAR gateway without a reflector
+dstar start MYCALL REF030C: Start and connect to a reflector
+help dstar: Show detailed D-STAR startup help
+quit: Exit without changing the radio setting
+To restore CAT, set Menu 650 (DV Gateway) to Off and restart.";
+
 /// APRS mode help text listing APRS-specific commands.
 pub const APRS_MODE_HELP: &str = "You are in APRS packet radio mode.
 -- APRS commands --
@@ -186,7 +196,8 @@ status QRV mobile: Send a status report with your own text
 motion 35.30 -82.46 55 180: SmartBeaconing update, speed in kilometers per hour
 beacon: Send a status beacon
 stations: List recently heard stations
-igate r/35.30/-82.46/100: Bridge RF to APRS-IS with a filter
+igate r/35.30/-82.46/100 2 60 30 30: Bridge RF and APRS-IS
+Requires explicit locality and time limits for Internet-to-RF gating.
 aprs stop: Leave APRS mode, return to normal radio control
 quit: Exit the program";
 
@@ -253,9 +264,9 @@ tnc aprs: Hand packet operation to the radio firmware (APRS mode).
 tnc kiss: Set KISS mode. Prefer aprs start for a managed session.
 An optional second word sets the speed, 1200 or 9600.";
 
-const BEACONTYPE_HELP: &str = "beacontype: Read or set the firmware beacon type.
-Usage: beacontype reads the current setting.
-beacontype manual, ptt, auto, or smart sets it.
+const BEACONMODE_HELP: &str = "beaconmode: Read or set the firmware beacon mode.
+Usage: beaconmode reads the current setting.
+beaconmode manual, ptt, auto, or smart sets it.
 Auto, smart, and ptt make the radio transmit by itself while the
 TNC is in APRS mode, so those settings ask for transmit confirmation.";
 
@@ -378,7 +389,7 @@ Index maps: 7=20, 8=25, 9=30, 10=50, 11=100 kilohertz.
 Example: step a 5
 Related commands: up, down";
 
-const GPS_HELP: &str = "gps: Set the GPS receiver and PC output configuration.
+const GPS_HELP: &str = "gps: Set the GPS receiver and PC output settings.
 Syntax: gps [on or off] [on or off]
 First argument controls the GPS receiver.
 Second argument controls PC serial output of NMEA sentences.
@@ -512,6 +523,7 @@ mod tests {
     fn mode_help_texts_pass_lint() {
         for (name, text) in [
             ("CAT_MODE_HELP", CAT_MODE_HELP),
+            ("TERMINAL_MODE_HELP", TERMINAL_MODE_HELP),
             ("APRS_MODE_HELP", APRS_MODE_HELP),
             ("DSTAR_MODE_HELP", DSTAR_MODE_HELP),
         ] {
