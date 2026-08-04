@@ -1,8 +1,9 @@
 //! APRS item reports, object reports, and queries (APRS 1.0.1 ch. 11 & 15).
 
 use crate::error::AprsError;
-use crate::packet::AprsTimestamp;
+use crate::packet::AprsReportTimestamp;
 use crate::position::{AprsPosition, parse_compressed_body, parse_uncompressed_body};
+use crate::text::{ObjectName, decode_wire_ascii};
 
 /// An APRS object report (data type `;`).
 ///
@@ -14,21 +15,12 @@ use crate::position::{AprsPosition, parse_compressed_body, parse_uncompressed_bo
 /// information via Menu No. 550 (Object 1-3).
 #[derive(Debug, Clone, PartialEq)]
 pub struct AprsObject {
-    /// Object name (up to 9 characters).
-    pub name: String,
+    /// Validated object name (up to 9 printable ASCII bytes).
+    pub name: ObjectName,
     /// Whether the object is live (`true`) or killed (`false`).
     pub live: bool,
-    /// Raw 7-byte timestamp string as observed on the wire.
-    ///
-    /// Preserved verbatim for round-trip fidelity. For most callers
-    /// the typed [`Self::timestamp_parsed`] view is more useful.
-    pub timestamp: String,
-    /// Typed timestamp, parsed from [`Self::timestamp`] via
-    /// [`AprsTimestamp::parse`]. `None` when the wire bytes do not
-    /// satisfy any of the four spec-defined timestamp shapes
-    /// (DHM Zulu, DHM local, HMS, MDHM). The raw form is still
-    /// available in [`Self::timestamp`] for diagnostics.
-    pub timestamp_parsed: Option<AprsTimestamp>,
+    /// Required seven-byte DHM or HMS timestamp.
+    pub timestamp: AprsReportTimestamp,
     /// Position data.
     pub position: AprsPosition,
 }
@@ -96,16 +88,17 @@ pub fn parse_aprs_object(info: &[u8]) -> Result<AprsObject, AprsError> {
         _ => return Err(AprsError::InvalidFormat),
     };
 
-    let name = String::from_utf8_lossy(name_bytes).trim().to_string();
+    let name_wire = decode_wire_ascii("APRS object name", name_bytes)?;
+    let name = ObjectName::new(name_wire.trim_end_matches(' ')).map_err(|_| {
+        AprsError::InvalidObjectName("wire name must contain 1-9 printable ASCII bytes")
+    })?;
 
     // After the name and live/killed flag, there's a 7-char timestamp
     // then position data.
     let pos_body = info.get(11..).ok_or(AprsError::InvalidFormat)?;
     let ts_bytes = pos_body.get(..7).ok_or(AprsError::InvalidFormat)?;
-    let timestamp = String::from_utf8_lossy(ts_bytes).to_string();
-    // Try to surface the typed AprsTimestamp for callers that want it;
-    // the raw `timestamp` is always kept for round-trip fidelity.
-    let timestamp_parsed = AprsTimestamp::parse(&timestamp);
+    let timestamp_wire = decode_wire_ascii("APRS object timestamp", ts_bytes)?;
+    let timestamp = AprsReportTimestamp::from_wire(timestamp_wire)?;
     let pos_data = pos_body.get(7..).ok_or(AprsError::InvalidFormat)?;
 
     let first = *pos_data.first().ok_or(AprsError::InvalidFormat)?;
@@ -119,7 +112,6 @@ pub fn parse_aprs_object(info: &[u8]) -> Result<AprsObject, AprsError> {
         name,
         live,
         timestamp,
-        timestamp_parsed,
         position,
     })
 }
@@ -195,7 +187,7 @@ pub fn parse_aprs_query(info: &[u8]) -> Result<AprsQuery, AprsError> {
     }
 
     let body_bytes = info.get(1..).unwrap_or(&[]);
-    let body = String::from_utf8_lossy(body_bytes);
+    let body = decode_wire_ascii("APRS query body", body_bytes)?;
     let text = body.trim_end_matches('\r');
 
     // Standard APRS queries per APRS 1.0.1 Chapter 15.
@@ -229,9 +221,9 @@ mod tests {
     fn parse_object_live() -> TestResult {
         let info = b";TORNADO  *092345z4903.50N/07201.75W-Tornado warning";
         let obj = parse_aprs_object(info)?;
-        assert_eq!(obj.name, "TORNADO");
+        assert_eq!(obj.name.as_str(), "TORNADO");
         assert!(obj.live);
-        assert_eq!(obj.timestamp, "092345z");
+        assert_eq!(obj.timestamp.to_wire_string(), "092345z");
         assert!(
             (obj.position.latitude - 49.058_333).abs() < 0.001,
             "lat check"
@@ -243,7 +235,7 @@ mod tests {
     fn parse_object_killed() -> TestResult {
         let info = b";MARATHON _092345z4903.50N/07201.75W-Event over";
         let obj = parse_aprs_object(info)?;
-        assert_eq!(obj.name, "MARATHON");
+        assert_eq!(obj.name.as_str(), "MARATHON");
         assert!(!obj.live);
         Ok(())
     }
@@ -252,6 +244,46 @@ mod tests {
     fn parse_object_rejects_bad_live_flag() {
         let info = b";TORNADO  X092345z4903.50N/07201.75W-";
         assert!(parse_aprs_object(info).is_err(), "bad flag must error");
+    }
+
+    #[test]
+    fn parse_object_rejects_malformed_report_timestamp() {
+        let info = b";TORNADO  *092345X4903.50N/07201.75W-";
+
+        assert_eq!(
+            parse_aprs_object(info),
+            Err(AprsError::InvalidTimestamp(
+                "7-byte timestamp must end in 'z', '/', or 'h'",
+            )),
+        );
+    }
+
+    #[test]
+    fn parse_object_rejects_eight_byte_weather_timestamp() {
+        let info = b";TORNADO  *010112344903.50N/07201.75W-";
+
+        assert!(
+            matches!(parse_aprs_object(info), Err(AprsError::InvalidTimestamp(_))),
+            "object accepted the positionless-weather MMDDHHMM timestamp",
+        );
+    }
+
+    #[test]
+    fn parse_object_rejects_non_ascii_name_without_replacement() -> TestResult {
+        let mut info = b";TORNADO  *092345z4903.50N/07201.75W-".to_vec();
+        *info
+            .get_mut(1)
+            .ok_or("static object fixture must contain its first name byte")? = 0xFF;
+
+        assert_eq!(
+            parse_aprs_object(&info),
+            Err(AprsError::InvalidTextByte {
+                field: "APRS object name",
+                index: 0,
+                byte: 0xFF,
+            }),
+        );
+        Ok(())
     }
 
     // ---- APRS item tests ----
@@ -362,5 +394,17 @@ mod tests {
     fn parse_query_with_trailing_cr() -> TestResult {
         assert_eq!(parse_aprs_query(b"?APRSP\r")?, AprsQuery::Position);
         Ok(())
+    }
+
+    #[test]
+    fn parse_query_rejects_non_ascii_body_without_replacement() {
+        assert_eq!(
+            parse_aprs_query(b"?PING\xFF"),
+            Err(AprsError::InvalidTextByte {
+                field: "APRS query body",
+                index: 4,
+                byte: 0xFF,
+            }),
+        );
     }
 }

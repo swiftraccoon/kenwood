@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use crate::packet::AprsData;
 use crate::position::AprsPosition;
-use crate::weather::AprsWeather;
+use crate::weather::{AprsPositionlessWeatherReport, AprsWeather};
 
 /// Earth's mean radius in kilometres (WGS-84 volumetric mean).
 const EARTH_RADIUS_KM: f64 = 6_371.0;
@@ -46,6 +46,9 @@ pub struct StationEntry {
     pub last_status: Option<String>,
     /// Most recent weather report.
     pub last_weather: Option<AprsWeather>,
+    /// Most recent standalone weather report, retaining its mandatory
+    /// timestamp and trailing station comment.
+    pub last_positionless_weather: Option<AprsPositionlessWeatherReport>,
     /// Total number of packets received from this station.
     pub packet_count: u32,
     /// Digipeater path from the most recent packet.
@@ -79,6 +82,7 @@ impl StationList {
                 position: None,
                 last_status: None,
                 last_weather: None,
+                last_positionless_weather: None,
                 packet_count: 0,
                 last_path: Vec::new(),
             });
@@ -125,8 +129,9 @@ impl StationList {
                 // weather data from it, they can re-parse the payload
                 // via a dedicated decoder.
             }
-            AprsData::Weather(wx) => {
-                entry.last_weather = Some(wx.clone());
+            AprsData::PositionlessWeather(report) => {
+                entry.last_weather = Some(report.weather.clone());
+                entry.last_positionless_weather = Some(report.clone());
             }
         }
 
@@ -220,11 +225,14 @@ mod tests {
     use crate::message::AprsMessage;
     use crate::packet::{AprsDataExtension, PositionAmbiguity};
     use crate::status::AprsStatus;
+    use crate::units::Fahrenheit;
+    use crate::weather::{Humidity, ThreeDigitWeatherValue, WindDirection};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     fn make_position(lat: f64, lon: f64) -> AprsData {
         AprsData::Position(AprsPosition {
+            timestamp: None,
             latitude: lat,
             longitude: lon,
             symbol_table: '/',
@@ -236,6 +244,7 @@ mod tests {
             extensions: AprsDataExtension::default(),
             mice_message: None,
             mice_altitude_m: None,
+            mice_telemetry: None,
             ambiguity: PositionAmbiguity::None,
         })
     }
@@ -247,18 +256,24 @@ mod tests {
         })
     }
 
-    fn make_weather() -> AprsData {
-        AprsData::Weather(AprsWeather {
-            wind_direction: Some(180),
-            wind_speed: Some(10),
-            wind_gust: None,
-            temperature: Some(72),
-            rain_1h: None,
-            rain_24h: None,
-            rain_since_midnight: None,
-            humidity: Some(55),
-            pressure: None,
-        })
+    fn make_weather() -> Result<AprsData, crate::error::AprsError> {
+        let mut weather = AprsWeather::new();
+        weather.set_wind_direction(Some(
+            WindDirection::new(180).map_err(|_| crate::error::AprsError::InvalidFormat)?,
+        ));
+        weather.set_wind_speed(Some(
+            ThreeDigitWeatherValue::new(10).map_err(|_| crate::error::AprsError::InvalidFormat)?,
+        ));
+        weather.set_temperature(Some(Fahrenheit::new(72)?));
+        weather.set_humidity(Some(
+            Humidity::new(55).map_err(|_| crate::error::AprsError::InvalidFormat)?,
+        ));
+        Ok(AprsData::PositionlessWeather(
+            AprsPositionlessWeatherReport::new(
+                crate::packet::AprsWeatherTimestamp::month_day_hour_minute_utc(10, 9, 23, 45)?,
+                weather,
+            ),
+        ))
     }
 
     #[test]
@@ -325,9 +340,10 @@ mod tests {
         assert_eq!(entry.last_status.as_deref(), Some("Sunny"));
         assert!(entry.last_weather.is_none());
 
-        sl.update("WX1", &make_weather(), &[], t0);
+        sl.update("WX1", &make_weather()?, &[], t0);
         let entry = sl.get("WX1").ok_or("expected WX1 entry")?;
         assert!(entry.last_weather.is_some());
+        assert!(entry.last_positionless_weather.is_some());
         assert_eq!(entry.packet_count, 2);
         Ok(())
     }

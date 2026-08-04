@@ -15,12 +15,26 @@ pub enum AprsError {
     /// Mic-E data requires the AX.25 destination address for decoding.
     #[error("Mic-E data requires destination address \u{2014} use parse_aprs_data_full()")]
     MicERequiresDestination,
+    /// An optional Mic-E telemetry block had the wrong width or invalid hex.
+    #[error("invalid Mic-E telemetry: {0}")]
+    InvalidMiceTelemetry(&'static str),
     /// A digipeater path string could not be parsed.
     #[error("invalid digipeater path: {0}")]
     InvalidPath(String),
     /// The message text is too long (APRS 1.0.1 §14: max 67 characters).
     #[error("APRS message text exceeds 67 characters ({0} bytes)")]
     MessageTooLong(usize),
+
+    /// A textual wire field contained a byte outside seven-bit ASCII.
+    #[error("{field} contains non-ASCII byte {byte:#04X} at byte index {index}")]
+    InvalidTextByte {
+        /// Name of the wire field being decoded.
+        field: &'static str,
+        /// Zero-based byte index within that field.
+        index: usize,
+        /// Byte that cannot be represented by the APRS text field.
+        byte: u8,
+    },
 
     // --- Validation variants for wire newtypes ---
     /// Latitude is not finite or outside `-90.0..=90.0`.
@@ -34,6 +48,10 @@ pub enum AprsError {
     /// Speed value is out of range.
     #[error("invalid speed: {0}")]
     InvalidSpeed(&'static str),
+
+    /// A `SmartBeaconing` configuration violates an algorithm invariant.
+    #[error("invalid SmartBeaconing configuration: {0}")]
+    InvalidSmartBeaconingConfig(&'static str),
 
     /// Course is outside `0..=360` degrees.
     #[error("invalid course: {0}")]
@@ -59,7 +77,7 @@ pub enum AprsError {
     #[error("invalid tocall: {0}")]
     InvalidTocall(&'static str),
 
-    /// Digipeater alias failed validation (empty, non-ASCII).
+    /// Digipeater alias base failed AX.25 callsign validation.
     #[error("invalid digipeater alias: {0}")]
     InvalidDigipeaterAlias(&'static str),
 
@@ -74,9 +92,8 @@ pub enum AprsError {
     #[error("invalid APRS item name: {0}")]
     InvalidItemName(&'static str),
 
-    /// Object or item timestamp wire string failed to parse as one of
-    /// the three APRS 1.0.1 §6 forms (DHM `z`, DHM `/`, HMS `h`, or
-    /// MDHM unsuffixed).
+    /// A report or positionless-weather timestamp failed shape or range
+    /// validation.
     #[error("invalid APRS timestamp: {0}")]
     InvalidTimestamp(&'static str),
 }

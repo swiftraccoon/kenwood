@@ -4,7 +4,7 @@
 //! validates at construction and rejects out-of-range values, making
 //! illegal APRS packets unrepresentable.
 
-use core::fmt;
+use core::{fmt, num::NonZeroU16};
 
 use ax25_codec::Callsign;
 
@@ -31,8 +31,8 @@ use crate::error::AprsError;
 /// minute, and minute `60` rolls into `+1` degree. The result always
 /// satisfies `minutes < 60` and `hundredths < 100`.
 ///
-/// `value_abs` must already be the non-negative magnitude of an
-/// in-range coordinate (callers clamp / validate first).
+/// `value_abs` must already be the non-negative magnitude of a validated,
+/// in-range coordinate.
 pub(crate) fn format_ddmm_hundredths(value_abs: f64, deg_width: usize) -> String {
     // Total hundredths-of-a-minute across the whole value, rounded to
     // the nearest integer. For a clamped latitude (<=90) this is at
@@ -41,7 +41,7 @@ pub(crate) fn format_ddmm_hundredths(value_abs: f64, deg_width: usize) -> String
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
-        reason = "value_abs is a non-negative, range-clamped coordinate magnitude, so \
+        reason = "value_abs is a non-negative, validated coordinate magnitude, so \
                   value_abs * 6000 is in 0..=1_080_000 and the rounded cast to u32 cannot \
                   truncate or sign-flip"
     )]
@@ -66,8 +66,7 @@ pub(crate) fn format_ddmm_hundredths(value_abs: f64, deg_width: usize) -> String
 /// Geographic latitude in decimal degrees, validated to `[-90.0, 90.0]`.
 ///
 /// Positive = North, negative = South. Rejects NaN and out-of-range
-/// values. Use [`Self::new`] for fallible construction and
-/// [`Self::new_clamped`] when you prefer silent clamping.
+/// values.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct Latitude(f64);
 
@@ -76,6 +75,8 @@ impl Latitude {
     pub const MIN: f64 = -90.0;
     /// Maximum valid latitude (North Pole).
     pub const MAX: f64 = 90.0;
+    /// The equator (`0°`).
+    pub const EQUATOR: Self = Self(0.0);
 
     /// Create a latitude, rejecting NaN or out-of-range values.
     ///
@@ -90,22 +91,6 @@ impl Latitude {
             ));
         }
         Ok(Self(degrees))
-    }
-
-    /// Create a latitude, clamping any input to `[-90.0, 90.0]`. NaN
-    /// becomes `0.0`.
-    #[must_use]
-    #[expect(
-        clippy::missing_const_for_fn,
-        reason = "clippy suggests `const fn` based on structural shape, but `f64::clamp` \
-                  is not const-stable yet (tracked at rust-lang/rust#93396). Cannot be made \
-                  `const` until that stabilizes."
-    )]
-    pub fn new_clamped(degrees: f64) -> Self {
-        if degrees.is_nan() {
-            return Self(0.0);
-        }
-        Self(degrees.clamp(Self::MIN, Self::MAX))
     }
 
     /// Return the latitude as decimal degrees.
@@ -140,6 +125,8 @@ impl Longitude {
     pub const MIN: f64 = -180.0;
     /// Maximum valid longitude (International Date Line, east side).
     pub const MAX: f64 = 180.0;
+    /// The prime meridian (`0°`).
+    pub const PRIME_MERIDIAN: Self = Self(0.0);
 
     /// Create a longitude, rejecting NaN or out-of-range values.
     ///
@@ -154,21 +141,6 @@ impl Longitude {
             ));
         }
         Ok(Self(degrees))
-    }
-
-    /// Create a longitude, clamping to `[-180.0, 180.0]`. NaN → `0.0`.
-    #[must_use]
-    #[expect(
-        clippy::missing_const_for_fn,
-        reason = "clippy suggests `const fn` based on structural shape, but `f64::clamp` \
-                  is not const-stable yet (tracked at rust-lang/rust#93396). Cannot be made \
-                  `const` until that stabilizes."
-    )]
-    pub fn new_clamped(degrees: f64) -> Self {
-        if degrees.is_nan() {
-            return Self(0.0);
-        }
-        Self(degrees.clamp(Self::MIN, Self::MAX))
     }
 
     /// Return the longitude as decimal degrees.
@@ -196,24 +168,14 @@ impl Longitude {
 // Speed
 // ---------------------------------------------------------------------------
 
-/// A ground-speed measurement with explicit units.
+/// A validated ground-speed measurement.
 ///
-/// APRS uses multiple unit conventions depending on context:
-/// - **Knots**: Mic-E and course/speed extension on wire
-/// - **`Km/h`**: `SmartBeaconing` parameters
-/// - **Mph**: US weather station display convention
-///
-/// This enum keeps each unit distinct and provides lossless conversions
-/// so callers never accidentally mix them.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Speed {
-    /// Nautical miles per hour.
-    Knots(u16),
-    /// Kilometres per hour (decimal to allow `SmartBeaconing` thresholds).
-    Kmh(f64),
-    /// Statute miles per hour.
-    Mph(u16),
-}
+/// The canonical representation is kilometers per hour. Named constructors
+/// make the caller's input unit explicit and reject negative, non-finite, or
+/// conversion-overflowing values. Accessors return decimal values and never
+/// silently round to an integer wire field.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub struct Speed(f64);
 
 impl Speed {
     /// Conversion factor: 1 knot = `1.852` `km/h`.
@@ -221,37 +183,134 @@ impl Speed {
     /// Conversion factor: 1 mph = `1.609_344` `km/h`.
     pub const MPH_TO_KMH: f64 = 1.609_344;
 
-    /// Convert to `km/h`.
-    #[must_use]
-    pub fn as_kmh(self) -> f64 {
-        match self {
-            Self::Knots(k) => f64::from(k) * Self::KNOTS_TO_KMH,
-            Self::Kmh(k) => k,
-            Self::Mph(m) => f64::from(m) * Self::MPH_TO_KMH,
-        }
+    /// Create a speed measured in kilometers per hour.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsError::InvalidSpeed`] unless `kmh` is finite and
+    /// non-negative.
+    pub fn from_kmh(kmh: f64) -> Result<Self, AprsError> {
+        Self::from_converted_kmh(kmh)
     }
 
-    /// Convert to knots (rounded to nearest integer).
-    #[must_use]
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "APRS speeds are physical quantities the caller is responsible for keeping \
-                  sane: u16 covers 0..65535 knots which exceeds every terrestrial APRS use \
-                  case (satellites up to ~14,000 knots, aircraft to ~2000 knots). \
-                  `cast_possible_truncation` fires on `.round() as u16` because clippy can't \
-                  prove the f64 is bounded; `cast_sign_loss` fires because the `Kmh` and \
-                  `Mph` variants internally store non-negative floats but the types don't \
-                  enforce it. A fix-the-code version of this method would use \
-                  `.round().clamp(0.0, f64::from(u16::MAX)) as u16` to make the saturation \
-                  explicit; left as `#[expect]` pending that refactor."
-    )]
-    pub fn as_knots(self) -> u16 {
-        match self {
-            Self::Knots(k) => k,
-            Self::Kmh(k) => (k / Self::KNOTS_TO_KMH).round() as u16,
-            Self::Mph(m) => (f64::from(m) * Self::MPH_TO_KMH / Self::KNOTS_TO_KMH).round() as u16,
+    /// Create a speed measured in knots.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsError::InvalidSpeed`] unless `knots` and its converted
+    /// value are finite and non-negative.
+    pub fn from_knots(knots: f64) -> Result<Self, AprsError> {
+        if !knots.is_finite() || knots < 0.0 {
+            return Err(AprsError::InvalidSpeed(
+                "knots must be finite and non-negative",
+            ));
         }
+        Self::from_converted_kmh(knots * Self::KNOTS_TO_KMH)
+    }
+
+    /// Create a speed measured in statute miles per hour.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsError::InvalidSpeed`] unless `mph` and its converted
+    /// value are finite and non-negative.
+    pub fn from_mph(mph: f64) -> Result<Self, AprsError> {
+        if !mph.is_finite() || mph < 0.0 {
+            return Err(AprsError::InvalidSpeed(
+                "miles per hour must be finite and non-negative",
+            ));
+        }
+        Self::from_converted_kmh(mph * Self::MPH_TO_KMH)
+    }
+
+    fn from_converted_kmh(kmh: f64) -> Result<Self, AprsError> {
+        if !kmh.is_finite() || kmh < 0.0 {
+            return Err(AprsError::InvalidSpeed(
+                "speed must be finite and non-negative",
+            ));
+        }
+        Ok(Self(kmh))
+    }
+
+    /// Return the speed in kilometers per hour.
+    #[must_use]
+    pub const fn as_kmh(self) -> f64 {
+        self.0
+    }
+
+    /// Return the speed in knots.
+    #[must_use]
+    pub fn as_knots(self) -> f64 {
+        self.0 / Self::KNOTS_TO_KMH
+    }
+
+    /// Return the speed in statute miles per hour.
+    #[must_use]
+    pub fn as_mph(self) -> f64 {
+        self.0 / Self::MPH_TO_KMH
+    }
+}
+
+/// A Mic-E wire speed in whole knots (`0..=799`).
+///
+/// Mic-E allocates three decimal digits across its speed/course bytes. This
+/// type prevents the encoder from silently clamping a larger speed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MiceSpeed(u16);
+
+impl MiceSpeed {
+    /// Maximum representable Mic-E speed in knots.
+    pub const MAX_KNOTS: u16 = 799;
+
+    /// Create a Mic-E speed from whole knots.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsError::InvalidSpeed`] when `knots > 799`.
+    pub const fn new(knots: u16) -> Result<Self, AprsError> {
+        if knots > Self::MAX_KNOTS {
+            return Err(AprsError::InvalidSpeed(
+                "Mic-E speed must be 0-799 whole knots",
+            ));
+        }
+        Ok(Self(knots))
+    }
+
+    /// Return the whole-knot Mic-E wire value.
+    #[must_use]
+    pub const fn as_knots(self) -> u16 {
+        self.0
+    }
+}
+
+/// A validated true heading in decimal degrees (`0..=360`).
+///
+/// Unlike [`Course`], this type retains fractional sensor precision and does
+/// not assign a special "unknown" meaning to zero. Use it for navigation and
+/// `SmartBeaconing` calculations.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub struct Heading(f64);
+
+impl Heading {
+    /// Create a true heading.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsError::InvalidCourse`] unless `degrees` is finite and
+    /// inside `0..=360`.
+    pub fn new(degrees: f64) -> Result<Self, AprsError> {
+        if !degrees.is_finite() || !(0.0..=360.0).contains(&degrees) {
+            return Err(AprsError::InvalidCourse(
+                "heading must be finite and in 0-360 degrees",
+            ));
+        }
+        Ok(Self(degrees))
+    }
+
+    /// Return the heading in decimal degrees.
+    #[must_use]
+    pub const fn as_degrees(self) -> f64 {
+        self.0
     }
 }
 
@@ -323,6 +382,17 @@ impl MessageId {
         Ok(Self(s.to_owned()))
     }
 
+    /// Create the decimal message ID for a nonzero sequence number.
+    ///
+    /// Every nonzero `u16` formats as one to five ASCII digits, so this
+    /// constructor is infallible while preserving the same invariant as
+    /// [`Self::new`]. It is useful for state machines that generate APRS
+    /// message IDs from a wrapping counter.
+    #[must_use]
+    pub fn from_sequence_number(sequence: NonZeroU16) -> Self {
+        Self(sequence.to_string())
+    }
+
     /// Return the ID as a string slice.
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -388,16 +458,15 @@ impl SymbolTable {
     }
 }
 
-/// A full APRS symbol (table selector + 1-byte code).
+/// A validated APRS symbol (table selector + one-byte code).
 ///
-/// Example: `AprsSymbol { table: SymbolTable::Primary, code: b'>' }` is
-/// the car icon (`/>`).
+/// Construct symbols with [`Self::new`] or [`Self::from_chars`]. The fields
+/// are private so an invalid wire symbol cannot be represented after
+/// construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AprsSymbol {
-    /// Symbol table selector.
-    pub table: SymbolTable,
-    /// Symbol code character (1 byte, spec range is `!` through `~`).
-    pub code: u8,
+    table: SymbolTable,
+    code: u8,
 }
 
 impl AprsSymbol {
@@ -416,6 +485,76 @@ impl AprsSymbol {
         table: SymbolTable::Primary,
         code: b'_',
     };
+
+    /// Create a symbol from a validated table and an APRS wire byte.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsError::InvalidSymbol`] unless `code` is printable
+    /// ASCII (`!` through `~`), as required by APRS 1.0.1 §5.1.
+    pub const fn new(table: SymbolTable, code: u8) -> Result<Self, AprsError> {
+        if code < b'!' || code > b'~' {
+            return Err(AprsError::InvalidSymbol(
+                "code must be printable ASCII (0x21-0x7E)",
+            ));
+        }
+        Ok(Self { table, code })
+    }
+
+    /// Parse the table selector and symbol code from user-facing characters.
+    ///
+    /// This checks that each `char` is representable as exactly one ASCII
+    /// wire byte before conversion. Unicode characters are rejected instead
+    /// of being truncated to an unrelated byte.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsError::InvalidSymbolTable`] for an invalid table or
+    /// [`AprsError::InvalidSymbol`] for a non-ASCII/non-printable code.
+    pub fn from_chars(table: char, code: char) -> Result<Self, AprsError> {
+        if !table.is_ascii() {
+            return Err(AprsError::InvalidSymbolTable(
+                "must be one ASCII byte: '/', '\\\\', 0-9, or A-Z",
+            ));
+        }
+        if !code.is_ascii() {
+            return Err(AprsError::InvalidSymbol(
+                "code must be one printable ASCII byte (0x21-0x7E)",
+            ));
+        }
+        let table = SymbolTable::from_byte(table as u8)?;
+        Self::new(table, code as u8)
+    }
+
+    /// Return the validated symbol-table selector.
+    #[must_use]
+    pub const fn table(self) -> SymbolTable {
+        self.table
+    }
+
+    /// Return the symbol-table selector as its APRS wire byte.
+    #[must_use]
+    pub const fn table_byte(self) -> u8 {
+        self.table.as_byte()
+    }
+
+    /// Return the symbol code as its APRS wire byte.
+    #[must_use]
+    pub const fn code(self) -> u8 {
+        self.code
+    }
+
+    /// Return the symbol-table selector as a user-facing character.
+    #[must_use]
+    pub const fn table_char(self) -> char {
+        self.table.as_byte() as char
+    }
+
+    /// Return the symbol code as a user-facing character.
+    #[must_use]
+    pub const fn code_char(self) -> char {
+        self.code as char
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -554,13 +693,6 @@ mod tests {
     }
 
     #[test]
-    fn latitude_clamped() {
-        assert!((Latitude::new_clamped(200.0).as_degrees() - 90.0).abs() < f64::EPSILON);
-        assert!((Latitude::new_clamped(-200.0).as_degrees() - (-90.0)).abs() < f64::EPSILON);
-        assert!((Latitude::new_clamped(f64::NAN).as_degrees() - 0.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
     fn longitude_accepts_valid_range() -> TestResult {
         let _lon = Longitude::new(180.0)?;
         let _lon = Longitude::new(-180.0)?;
@@ -578,16 +710,69 @@ mod tests {
             Longitude::new(-180.01),
             Err(AprsError::InvalidLongitude(_))
         ));
+        assert!(matches!(
+            Longitude::new(f64::NAN),
+            Err(AprsError::InvalidLongitude(_))
+        ));
+        assert!(matches!(
+            Longitude::new(f64::INFINITY),
+            Err(AprsError::InvalidLongitude(_))
+        ));
     }
 
     #[test]
-    fn speed_conversions() {
-        let s = Speed::Knots(10);
+    fn speed_conversions() -> TestResult {
+        let s = Speed::from_knots(10.0)?;
         assert!((s.as_kmh() - 18.52).abs() < 1e-6);
-        let s = Speed::Kmh(100.0);
-        assert_eq!(s.as_knots(), 54); // 100 / 1.852 ≈ 54.0
-        let s = Speed::Mph(60);
+        let s = Speed::from_kmh(100.0)?;
+        assert!((s.as_knots() - 53.995_680_345_6).abs() < 1e-9);
+        let s = Speed::from_mph(60.0)?;
         assert!((s.as_kmh() - 96.5606).abs() < 1e-3);
+        assert!((s.as_mph() - 60.0).abs() < 1e-9);
+        Ok(())
+    }
+
+    #[test]
+    fn speed_rejects_negative_non_finite_and_conversion_overflow() {
+        assert!(matches!(
+            Speed::from_kmh(-0.1),
+            Err(AprsError::InvalidSpeed(_))
+        ));
+        assert!(matches!(
+            Speed::from_knots(f64::NAN),
+            Err(AprsError::InvalidSpeed(_))
+        ));
+        assert!(matches!(
+            Speed::from_mph(f64::MAX),
+            Err(AprsError::InvalidSpeed(_))
+        ));
+    }
+
+    #[test]
+    fn mice_speed_validates_wire_range() -> TestResult {
+        assert_eq!(MiceSpeed::new(0)?.as_knots(), 0);
+        assert_eq!(MiceSpeed::new(799)?.as_knots(), 799);
+        assert!(matches!(
+            MiceSpeed::new(800),
+            Err(AprsError::InvalidSpeed(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn heading_validates_sensor_range() -> TestResult {
+        assert!((Heading::new(0.0)?.as_degrees() - 0.0).abs() < f64::EPSILON);
+        assert!((Heading::new(123.45)?.as_degrees() - 123.45).abs() < f64::EPSILON);
+        assert!((Heading::new(360.0)?.as_degrees() - 360.0).abs() < f64::EPSILON);
+        assert!(matches!(
+            Heading::new(-0.1),
+            Err(AprsError::InvalidCourse(_))
+        ));
+        assert!(matches!(
+            Heading::new(f64::INFINITY),
+            Err(AprsError::InvalidCourse(_))
+        ));
+        Ok(())
     }
 
     #[test]
@@ -609,6 +794,18 @@ mod tests {
         assert_eq!(MessageId::new("12345")?.as_str(), "12345");
         assert_eq!(MessageId::new("ABC")?.as_str(), "ABC");
         Ok(())
+    }
+
+    #[test]
+    fn message_id_from_sequence_number_covers_u16_boundaries() {
+        assert_eq!(
+            MessageId::from_sequence_number(NonZeroU16::MIN).as_str(),
+            "1"
+        );
+        assert_eq!(
+            MessageId::from_sequence_number(NonZeroU16::MAX).as_str(),
+            "65535"
+        );
     }
 
     #[test]
@@ -659,6 +856,41 @@ mod tests {
             assert_eq!(table.as_byte(), b);
         }
         Ok(())
+    }
+
+    #[test]
+    fn aprs_symbol_round_trip() -> TestResult {
+        let symbol = AprsSymbol::from_chars('/', '>')?;
+        assert_eq!(symbol.table(), SymbolTable::Primary);
+        assert_eq!(symbol.table_byte(), b'/');
+        assert_eq!(symbol.code(), b'>');
+        assert_eq!(symbol.table_char(), '/');
+        assert_eq!(symbol.code_char(), '>');
+        Ok(())
+    }
+
+    #[test]
+    fn aprs_symbol_rejects_non_printable_code() {
+        assert!(matches!(
+            AprsSymbol::new(SymbolTable::Primary, b' '),
+            Err(AprsError::InvalidSymbol(_))
+        ));
+        assert!(matches!(
+            AprsSymbol::new(SymbolTable::Primary, 0x7F),
+            Err(AprsError::InvalidSymbol(_))
+        ));
+    }
+
+    #[test]
+    fn aprs_symbol_rejects_unicode_instead_of_truncating_it() {
+        assert!(matches!(
+            AprsSymbol::from_chars('\u{2215}', '>'),
+            Err(AprsError::InvalidSymbolTable(_))
+        ));
+        assert!(matches!(
+            AprsSymbol::from_chars('/', '\u{013E}'),
+            Err(AprsError::InvalidSymbol(_))
+        ));
     }
 
     #[test]

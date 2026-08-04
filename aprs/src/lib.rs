@@ -47,23 +47,22 @@ mod smart_beaconing;
 mod station_list;
 mod status;
 mod telemetry;
+mod text;
 mod units;
 mod weather;
 
 pub use build::{
-    build_aprs_item, build_aprs_item_checked, build_aprs_item_checked_packet,
-    build_aprs_item_packet, build_aprs_message, build_aprs_message_checked,
-    build_aprs_message_packet, build_aprs_mice, build_aprs_mice_with_message,
-    build_aprs_mice_with_message_packet, build_aprs_object, build_aprs_object_with_timestamp,
-    build_aprs_object_with_timestamp_checked, build_aprs_object_with_timestamp_checked_packet,
-    build_aprs_object_with_timestamp_packet, build_aprs_position_compressed,
-    build_aprs_position_compressed_packet, build_aprs_position_report,
-    build_aprs_position_report_packet, build_aprs_position_weather,
+    build_aprs_bulletin, build_aprs_bulletin_packet, build_aprs_item, build_aprs_item_packet,
+    build_aprs_message, build_aprs_message_packet, build_aprs_mice, build_aprs_mice_with_message,
+    build_aprs_mice_with_message_packet, build_aprs_object, build_aprs_object_packet,
+    build_aprs_position_compressed, build_aprs_position_compressed_packet,
+    build_aprs_position_report, build_aprs_position_report_packet, build_aprs_position_weather,
     build_aprs_position_weather_packet, build_aprs_status, build_aprs_status_packet,
     build_aprs_telemetry, build_aprs_telemetry_bits, build_aprs_telemetry_bits_packet,
     build_aprs_telemetry_eqns, build_aprs_telemetry_eqns_packet, build_aprs_telemetry_packet,
     build_aprs_telemetry_parm, build_aprs_telemetry_parm_packet, build_aprs_telemetry_unit,
-    build_aprs_telemetry_unit_packet, build_aprs_weather, build_aprs_weather_packet,
+    build_aprs_telemetry_unit_packet, build_aprs_timestamped_status,
+    build_aprs_timestamped_status_packet, build_aprs_weather, build_aprs_weather_packet,
     build_query_response_position,
 };
 pub use digipeater::{
@@ -77,11 +76,13 @@ pub use message::{AprsMessage, MAX_APRS_MESSAGE_TEXT_LEN, classify_ack_rej, pars
 pub use messenger::{
     AprsMessenger, INCOMING_DEDUP_WINDOW, MAX_RETRIES, MessengerConfig, RETRY_INTERVAL,
 };
-pub use mic_e::{MiceMessage, mice_message_bits, parse_aprs_data_full, parse_mice_position};
+pub use mic_e::{
+    MiceMessage, MiceTelemetry, mice_message_bits, parse_aprs_data_full, parse_mice_position,
+};
 pub use packet::{
-    AprsData, AprsDataExtension, AprsPacket, AprsTimestamp, MessageKind, ParseContext, Phg,
-    PhgDirectivity, PositionAmbiguity, TelemetryDefinition, TelemetryParameters, parse_aprs_data,
-    parse_aprs_extensions,
+    AprsData, AprsDataExtension, AprsPacket, AprsReportTimestamp, AprsReportTimestampFormat,
+    AprsWeatherTimestamp, MessageKind, ParseContext, Phg, PhgDirectivity, PositionAmbiguity,
+    TelemetryDefinition, TelemetryParameters, parse_aprs_data, parse_aprs_extensions,
 };
 pub use position::{
     AprsPosition, decode_base91_4, parse_aprs_position, parse_compressed_body,
@@ -89,9 +90,23 @@ pub use position::{
 };
 pub use smart_beaconing::{BeaconReason, BeaconState, SmartBeaconing, SmartBeaconingConfig};
 pub use station_list::{StationEntry, StationList};
-pub use status::{AprsStatus, MAX_APRS_STATUS_TEXT_LEN, parse_aprs_status};
-pub use telemetry::{AprsTelemetry, parse_aprs_telemetry};
-pub use units::{
-    AprsSymbol, Course, Fahrenheit, Latitude, Longitude, MessageId, Speed, SymbolTable, Tocall,
+pub use status::{AprsStatus, AprsStatusTimestamp, MAX_APRS_STATUS_TEXT_LEN, parse_aprs_status};
+pub use telemetry::{
+    AprsTelemetry, TelemetryAnalogValue, TelemetryChannel, TelemetryComment,
+    TelemetryEquationCoefficients, TelemetryLabels, TelemetryProjectTitle, TelemetrySequence,
+    TelemetryValueError, parse_aprs_telemetry,
 };
-pub use weather::{AprsWeather, extract_position_weather, parse_aprs_weather_positionless};
+pub use text::{
+    AprsTextError, AprsTextField, BulletinText, CompressedPositionText, ItemName, MessageAddressee,
+    MessageText, MiceStatusText, ObjectName, PositionReportText, StatusText, TimestampedStatusText,
+    WeatherComment,
+};
+pub use units::{
+    AprsSymbol, Course, Fahrenheit, Heading, Latitude, Longitude, MessageId, MiceSpeed, Speed,
+    SymbolTable, Tocall,
+};
+pub use weather::{
+    AprsPositionlessWeatherReport, AprsWeather, BarometricPressure, Humidity, Luminosity,
+    ThreeDigitWeatherValue, WeatherValueError, WindDirection, extract_position_weather,
+    parse_aprs_weather_positionless,
+};

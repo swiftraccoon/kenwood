@@ -8,6 +8,7 @@
 use crate::error::AprsError;
 use crate::packet::{AprsData, PositionAmbiguity, parse_aprs_extensions};
 use crate::position::AprsPosition;
+use crate::text::decode_wire_ascii;
 use crate::weather::extract_position_weather;
 
 /// Mic-E standard message code.
@@ -34,6 +35,26 @@ pub enum MiceMessage {
     Priority,
     /// Emergency: (000, 111) always means emergency.
     Emergency,
+}
+
+/// Optional telemetry carried after the nine mandatory Mic-E bytes.
+///
+/// APRS 1.0.1 chapter 10 defines three distinct wire encodings. Keeping the
+/// encoding in the variant preserves whether five values arrived as printable
+/// hexadecimal or as the legacy binary form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MiceTelemetry {
+    /// A grave-accent flag followed by hexadecimal channels 1 and 3.
+    HexadecimalTwo {
+        /// Telemetry channel 1.
+        channel_1: u8,
+        /// Telemetry channel 3.
+        channel_3: u8,
+    },
+    /// An apostrophe flag followed by five hexadecimal channel values.
+    HexadecimalFive([u8; 5]),
+    /// A `0x1D` flag followed by five opaque 8-bit channel values.
+    BinaryFive([u8; 5]),
 }
 
 /// Parse a Mic-E encoded APRS position (APRS101.PDF Chapter 10).
@@ -142,9 +163,8 @@ pub fn parse_mice_position(destination: &str, info: &[u8]) -> Result<AprsPositio
     let symbol_code = header.get(7).map_or('/', |&b| b as char);
     let symbol_table = header.get(8).map_or('/', |&b| b as char);
 
-    let comment = info.get(9..).map_or_else(String::new, |rest| {
-        String::from_utf8_lossy(rest).into_owned()
-    });
+    let optional_bytes = info.get(9..).ok_or(AprsError::InvalidFormat)?;
+    let (comment, mice_telemetry) = decode_mice_optional_data(optional_bytes)?;
 
     // Decode the Mic-E standard message code from destination chars 0-2
     // (APRS 1.0.1 §10.1 Table 10). `None` if any char is in the custom range.
@@ -157,9 +177,10 @@ pub fn parse_mice_position(destination: &str, info: &[u8]) -> Result<AprsPositio
     // offset from -10000) per APRS 1.0.1 §10.1.1.
     let mice_altitude_m = mice_decode_altitude(&comment);
 
-    let weather = extract_position_weather(symbol_code, &comment);
+    let weather = extract_position_weather(symbol_code, &comment)?;
     let extensions = parse_aprs_extensions(&comment);
     Ok(AprsPosition {
+        timestamp: None,
         latitude,
         longitude,
         symbol_table,
@@ -171,9 +192,99 @@ pub fn parse_mice_position(destination: &str, info: &[u8]) -> Result<AprsPositio
         extensions,
         mice_message,
         mice_altitude_m,
+        mice_telemetry,
         // Mic-E positions are not subject to §8.1.6 ambiguity masking.
         ambiguity: PositionAmbiguity::None,
     })
+}
+
+/// Decode the optional field following a Mic-E symbol-table byte.
+///
+/// Telemetry is classified before text decoding because the legacy `0x1D`
+/// form intentionally contains arbitrary bytes at or above `0x80`.
+fn decode_mice_optional_data(bytes: &[u8]) -> Result<(String, Option<MiceTelemetry>), AprsError> {
+    let Some(&flag) = bytes.first() else {
+        return Ok((String::new(), None));
+    };
+
+    let telemetry = match flag {
+        b'`' => {
+            let payload = bytes.get(1..).ok_or(AprsError::InvalidMiceTelemetry(
+                "missing two-channel hexadecimal payload",
+            ))?;
+            if payload.len() != 4 {
+                return Err(AprsError::InvalidMiceTelemetry(
+                    "two-channel hexadecimal telemetry must contain exactly 4 digits",
+                ));
+            }
+            MiceTelemetry::HexadecimalTwo {
+                channel_1: decode_hex_byte(payload, 0)?,
+                channel_3: decode_hex_byte(payload, 2)?,
+            }
+        }
+        b'\'' => {
+            let payload = bytes.get(1..).ok_or(AprsError::InvalidMiceTelemetry(
+                "missing five-channel hexadecimal payload",
+            ))?;
+            if payload.len() != 10 {
+                return Err(AprsError::InvalidMiceTelemetry(
+                    "five-channel hexadecimal telemetry must contain exactly 10 digits",
+                ));
+            }
+            let mut channels = [0_u8; 5];
+            for (index, channel) in channels.iter_mut().enumerate() {
+                *channel = decode_hex_byte(payload, index * 2)?;
+            }
+            MiceTelemetry::HexadecimalFive(channels)
+        }
+        0x1D => {
+            let payload: [u8; 5] = bytes
+                .get(1..)
+                .ok_or(AprsError::InvalidMiceTelemetry(
+                    "missing five-channel binary payload",
+                ))?
+                .try_into()
+                .map_err(|_| {
+                    AprsError::InvalidMiceTelemetry(
+                        "five-channel binary telemetry must contain exactly 5 bytes",
+                    )
+                })?;
+            MiceTelemetry::BinaryFive(payload)
+        }
+        _ => {
+            let comment = decode_wire_ascii("APRS Mic-E comment", bytes)?.to_owned();
+            return Ok((comment, None));
+        }
+    };
+
+    Ok((String::new(), Some(telemetry)))
+}
+
+fn decode_hex_byte(bytes: &[u8], offset: usize) -> Result<u8, AprsError> {
+    let high = *bytes.get(offset).ok_or(AprsError::InvalidMiceTelemetry(
+        "truncated hexadecimal value",
+    ))?;
+    let low = *bytes
+        .get(offset + 1)
+        .ok_or(AprsError::InvalidMiceTelemetry(
+            "truncated hexadecimal value",
+        ))?;
+    let high = hex_nibble(high).ok_or(AprsError::InvalidMiceTelemetry(
+        "telemetry values must use ASCII hexadecimal digits",
+    ))?;
+    let low = hex_nibble(low).ok_or(AprsError::InvalidMiceTelemetry(
+        "telemetry values must use ASCII hexadecimal digits",
+    ))?;
+    Ok((high << 4) | low)
+}
+
+const fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
 }
 
 /// Decode Mic-E speed and course from the 3-byte SP/DC/SE block
@@ -436,6 +547,7 @@ mod tests {
         ];
 
         let pos = parse_mice_position(dest, info)?;
+        assert_eq!(pos.timestamp, None);
         assert!((pos.latitude - 35.258).abs() < 0.01, "lat={}", pos.latitude);
         assert!(
             (pos.longitude - (-97.755)).abs() < 0.01,
@@ -447,6 +559,76 @@ mod tests {
         assert_eq!(pos.speed_knots, Some(121));
         assert_eq!(pos.course_degrees, Some(212));
         Ok(())
+    }
+
+    #[test]
+    fn parse_mice_rejects_non_ascii_comment_without_replacement() {
+        let info: &[u8] = &[0x60, 125, 73, 58, 40, 40, 40, b'>', b'/', b'o', b'k', 0xFF];
+
+        assert_eq!(
+            parse_mice_position("SUQU5P", info),
+            Err(AprsError::InvalidTextByte {
+                field: "APRS Mic-E comment",
+                index: 2,
+                byte: 0xFF,
+            }),
+        );
+    }
+
+    #[test]
+    fn parse_mice_accepts_all_binary_telemetry_octets() -> TestResult {
+        let info: &[u8] = &[
+            0x60, 125, 73, 58, 40, 40, 40, b'>', b'/', 0x1D, 0x80, 0x00, 0xFF, 0x7F, 0x01,
+        ];
+
+        let position = parse_mice_position("SUQU5P", info)?;
+        assert_eq!(
+            position.mice_telemetry,
+            Some(MiceTelemetry::BinaryFive([0x80, 0x00, 0xFF, 0x7F, 0x01]))
+        );
+        assert!(position.comment.is_empty());
+        assert_eq!(position.mice_altitude_m, None);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_mice_decodes_printable_telemetry_forms() -> TestResult {
+        let mandatory = [0x60, 125, 73, 58, 40, 40, 40, b'>', b'/'];
+
+        let mut two = mandatory.to_vec();
+        two.extend_from_slice(b"`00fF");
+        assert_eq!(
+            parse_mice_position("SUQU5P", &two)?.mice_telemetry,
+            Some(MiceTelemetry::HexadecimalTwo {
+                channel_1: 0,
+                channel_3: 255,
+            })
+        );
+
+        let mut five = mandatory.to_vec();
+        five.extend_from_slice(b"'00017f80FF");
+        assert_eq!(
+            parse_mice_position("SUQU5P", &five)?.mice_telemetry,
+            Some(MiceTelemetry::HexadecimalFive([0, 1, 127, 128, 255]))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_mice_rejects_malformed_telemetry_without_reclassifying_it_as_text() {
+        let mut info = vec![0x60, 125, 73, 58, 40, 40, 40, b'>', b'/'];
+        info.extend_from_slice(&[0x1D, 1, 2, 3, 4]);
+        assert!(matches!(
+            parse_mice_position("SUQU5P", &info),
+            Err(AprsError::InvalidMiceTelemetry(_))
+        ));
+
+        info.truncate(9);
+        info.extend_from_slice(b"`0X00");
+        assert!(matches!(
+            parse_mice_position("SUQU5P", &info),
+            Err(AprsError::InvalidMiceTelemetry(_))
+        ));
     }
 
     #[test]

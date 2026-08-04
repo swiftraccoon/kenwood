@@ -2,6 +2,7 @@
 
 use crate::error::AprsError;
 use crate::packet::MessageKind;
+use crate::text::decode_wire_ascii;
 
 /// Maximum APRS message text length in bytes (APRS 1.0.1 §14).
 pub const MAX_APRS_MESSAGE_TEXT_LEN: usize = 67;
@@ -41,64 +42,72 @@ impl AprsMessage {
     /// Classify this message by addressee / text pattern per APRS 1.0.1
     /// §14 and bulletin conventions.
     ///
-    /// The classification ladder, in spec-mandated precedence order:
+    /// The classification ladder is:
     ///
-    /// 1. **`AckRej`**: text begins with `ack`/`rej` + 1-5 alnum
-    ///    (control frames use a regular station addressee but the text
-    ///    shape disambiguates).
-    /// 2. **`NwsBulletin`**: addressee starts with `NWS-`, `SKY-`,
+    /// 1. **`NwsBulletin`**: addressee starts with `NWS-`, `SKY-`,
     ///    `CWA-`, or `BOM-` per APRS 1.0.1 §14 p.74.
-    /// 3. **`Bulletin { number }`**: addressee is exactly `BLN<digit>`
+    /// 2. **`Bulletin { number }`**: addressee is exactly `BLN<digit>`
     ///    (general bulletin) per APRS 1.0.1 §14 p.73.
-    /// 4. **`Announcement { letter }`**: addressee is exactly
+    /// 3. **`Announcement { letter }`**: addressee is exactly
     ///    `BLN<uppercase letter>` per APRS 1.0.1 §14 p.73.
-    /// 5. **`GroupBulletin { group }`**: addressee is `BLN` + 1-5
-    ///    alnum chars not matched by (3) or (4), per APRS 1.0.1 §14
+    /// 4. **`GroupBulletin { group }`**: addressee is `BLN` + 1-5
+    ///    alnum chars not matched by (2) or (3), per APRS 1.0.1 §14
     ///    p.74 (the spec's canonical form is `BLN<digit><group>` but
     ///    in-the-wild traffic uses many variations, so we accept any
     ///    multi-char tail).
+    /// 5. **`AckRej`**: for a regular station addressee, text begins with
+    ///    `ack`/`rej` + 1-5 alnum.
     /// 6. **`Direct`**: anything else.
     #[must_use]
     pub fn kind(&self) -> MessageKind {
         let addr = self.addressee.trim();
-        // Check ack/rej on text first: control frames use a regular
-        // addressee.
+        // Bulletin addressees select bulletin text semantics regardless of
+        // body spelling. In particular, a legitimate bulletin body such as
+        // `ack123` is not an acknowledgement control frame.
+        if let Some(kind) = bulletin_kind_from_addressee(addr) {
+            return kind;
+        }
+
+        // Control frames use a regular station addressee; the text shape
+        // disambiguates them from other directed messages.
         if classify_ack_rej(&self.text).is_some() {
             return MessageKind::AckRej;
         }
-        // NWS bulletins use well-known prefixes.
-        if addr.starts_with("NWS-")
-            || addr.starts_with("SKY-")
-            || addr.starts_with("CWA-")
-            || addr.starts_with("BOM-")
-        {
-            return MessageKind::NwsBulletin;
-        }
-        // BLN-family classification: order matters. Single digit →
-        // numeric bulletin; single uppercase letter → announcement;
-        // multi-char tail → group bulletin.
-        if let Some(rest) = addr.strip_prefix("BLN") {
-            if rest.len() == 1
-                && let Some(b) = rest.bytes().next()
-            {
-                if b.is_ascii_digit() {
-                    return MessageKind::Bulletin { number: b - b'0' };
-                }
-                if b.is_ascii_uppercase() {
-                    return MessageKind::Announcement { letter: b as char };
-                }
-            }
-            // Group bulletin: BLN + 2..=5 alphanumeric chars (the
-            // length-1 single-letter / single-digit cases are handled
-            // above as Announcement / Bulletin respectively).
-            if (2..=5).contains(&rest.len()) && rest.bytes().all(|b| b.is_ascii_alphanumeric()) {
-                return MessageKind::GroupBulletin {
-                    group: rest.to_owned(),
-                };
-            }
-        }
         MessageKind::Direct
     }
+}
+
+/// Classify the APRS bulletin/announcement family using only its addressee.
+fn bulletin_kind_from_addressee(addr: &str) -> Option<MessageKind> {
+    if addr.starts_with("NWS-")
+        || addr.starts_with("SKY-")
+        || addr.starts_with("CWA-")
+        || addr.starts_with("BOM-")
+    {
+        return Some(MessageKind::NwsBulletin);
+    }
+
+    let rest = addr.strip_prefix("BLN")?;
+    if rest.len() == 1
+        && let Some(byte) = rest.bytes().next()
+    {
+        if byte.is_ascii_digit() {
+            return Some(MessageKind::Bulletin {
+                number: byte - b'0',
+            });
+        }
+        if byte.is_ascii_uppercase() {
+            return Some(MessageKind::Announcement {
+                letter: byte as char,
+            });
+        }
+    }
+    if (2..=5).contains(&rest.len()) && rest.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return Some(MessageKind::GroupBulletin {
+            group: rest.to_owned(),
+        });
+    }
+    None
 }
 
 /// Classify a message text as an APRS ack or rej control frame.
@@ -145,24 +154,34 @@ pub fn parse_aprs_message(info: &[u8]) -> Result<AprsMessage, AprsError> {
 
     // Addressee is exactly 9 characters (space-padded)
     let addressee_raw = info.get(1..10).ok_or(AprsError::InvalidFormat)?;
-    let addressee = String::from_utf8_lossy(addressee_raw).trim().to_string();
+    let addressee = decode_wire_ascii("APRS message addressee", addressee_raw)?
+        .trim()
+        .to_owned();
 
     if info.get(10) != Some(&b':') {
         return Err(AprsError::InvalidFormat);
     }
 
     let body = info.get(11..).unwrap_or(&[]);
-    let body_str = String::from_utf8_lossy(body).into_owned();
+    let body_str = decode_wire_ascii("APRS message body", body)?;
     let trimmed_body = body_str.trim_end_matches(['\r', '\n']);
 
-    // Split on `{` for message ID and APRS 1.2 reply-ack extension.
+    // Split on `{` for message ID and APRS 1.2 reply-ack extension only for
+    // directed messages. APRS 1.0.1 reserves `{` in directed-message text
+    // because it introduces this trailer, but explicitly permits it as
+    // ordinary bulletin/announcement text. Applying the trailer grammar to a
+    // bulletin would silently truncate bodies such as `AR_ASHLEY,{S9JbA`.
     // Four possible trailer forms to recognise (checked from richest):
     //   1. `text{MM}AA`  is reply-ack: MM is this msg's id, AA is ack
     //   2. `text{MM}`    is a reply-ack capability advertisement: MM is
     //                      this msg's id, no ack piggybacked
     //   3. `text{MM`     is a plain message id
     //   4. `text`        has no trailer
-    let (text, message_id, reply_ack) = parse_message_trailer(trimmed_body);
+    let (text, message_id, reply_ack) = if is_bulletin_addressee(&addressee) {
+        (trimmed_body.to_owned(), None, None)
+    } else {
+        parse_message_trailer(trimmed_body)
+    };
 
     Ok(AprsMessage {
         addressee,
@@ -170,6 +189,11 @@ pub fn parse_aprs_message(info: &[u8]) -> Result<AprsMessage, AprsError> {
         message_id,
         reply_ack,
     })
+}
+
+/// Whether an addressee selects APRS bulletin/announcement text semantics.
+fn is_bulletin_addressee(addressee: &str) -> bool {
+    bulletin_kind_from_addressee(addressee).is_some()
 }
 
 /// Parse the optional `{MM}AA` / `{MM}` / `{MM` trailer of an APRS
@@ -252,6 +276,31 @@ mod tests {
     }
 
     #[test]
+    fn parse_bulletin_keeps_brace_suffix_as_literal_text() -> TestResult {
+        let msg = parse_aprs_message(b":NWS-WARN :AR_ASHLEY,{S9JbA")?;
+        assert_eq!(msg.kind(), MessageKind::NwsBulletin);
+        assert_eq!(msg.text, "AR_ASHLEY,{S9JbA");
+        assert_eq!(msg.message_id, None);
+        assert_eq!(msg.reply_ack, None);
+
+        let announcement = parse_aprs_message(b":BLNA     :VERSION {A1")?;
+        assert_eq!(
+            announcement.kind(),
+            MessageKind::Announcement { letter: 'A' }
+        );
+        assert_eq!(announcement.text, "VERSION {A1");
+        assert_eq!(announcement.message_id, None);
+
+        let control_like = parse_aprs_message(b":BLN3     :ack123")?;
+        assert_eq!(
+            control_like.kind(),
+            MessageKind::Bulletin { number: 3 },
+            "a bulletin addressee takes precedence over ack-like body text"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn parse_message_ack() -> TestResult {
         let info = b":N0CALL   :ack123";
         let msg = parse_aprs_message(info)?;
@@ -265,6 +314,42 @@ mod tests {
             parse_aprs_message(b":SHORT:hi").is_err(),
             "short input rejected",
         );
+    }
+
+    #[test]
+    fn parse_message_rejects_non_ascii_addressee_without_replacement() -> TestResult {
+        let mut info = b":N0CALL   :Hello".to_vec();
+        *info
+            .get_mut(1)
+            .ok_or("static message fixture must contain its first addressee byte")? = 0xFF;
+
+        assert_eq!(
+            parse_aprs_message(&info),
+            Err(AprsError::InvalidTextByte {
+                field: "APRS message addressee",
+                index: 0,
+                byte: 0xFF,
+            }),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_message_rejects_non_ascii_body_without_replacement() -> TestResult {
+        let mut info = b":N0CALL   :Hello".to_vec();
+        *info
+            .get_mut(11)
+            .ok_or("static message fixture must contain its first body byte")? = 0xFF;
+
+        assert_eq!(
+            parse_aprs_message(&info),
+            Err(AprsError::InvalidTextByte {
+                field: "APRS message body",
+                index: 0,
+                byte: 0xFF,
+            }),
+        );
+        Ok(())
     }
 
     #[test]

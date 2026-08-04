@@ -1,8 +1,11 @@
 //! APRS position reports (uncompressed and compressed).
 
 use crate::error::AprsError;
-use crate::mic_e::MiceMessage;
-use crate::packet::{AprsDataExtension, PositionAmbiguity, parse_aprs_extensions};
+use crate::mic_e::{MiceMessage, MiceTelemetry};
+use crate::packet::{
+    AprsDataExtension, AprsReportTimestamp, PositionAmbiguity, parse_aprs_extensions,
+};
+use crate::text::decode_wire_ascii;
 use crate::weather::{AprsWeather, extract_position_weather};
 
 /// A parsed APRS position report.
@@ -14,6 +17,9 @@ use crate::weather::{AprsWeather, extract_position_weather};
 /// automatically and exposed via [`Self::extensions`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct AprsPosition {
+    /// Optional seven-byte timestamp carried by `/` and `@` reports.
+    /// Untimestamped `!`/`=` reports and Mic-E positions use `None`.
+    pub timestamp: Option<AprsReportTimestamp>,
     /// Latitude in decimal degrees (positive = North).
     pub latitude: f64,
     /// Longitude in decimal degrees (positive = East).
@@ -47,6 +53,9 @@ pub struct AprsPosition {
     /// Mic-E altitude in metres, decoded from the comment per APRS 1.0.1
     /// §10.1.1 (three base-91 chars followed by `}`, offset from -10000).
     pub mice_altitude_m: Option<i32>,
+    /// Optional Mic-E telemetry decoded from the field that is mutually
+    /// exclusive with Mic-E status text.
+    pub mice_telemetry: Option<MiceTelemetry>,
     /// Position ambiguity level (APRS 1.0.1 §8.1.6).
     ///
     /// Stations can deliberately reduce their precision by replacing
@@ -210,23 +219,33 @@ fn unmask_coord_digits(
 /// Returns [`AprsError`] if the format is unrecognized or coordinates are invalid.
 pub fn parse_aprs_position(info: &[u8]) -> Result<AprsPosition, AprsError> {
     let data_type = *info.first().ok_or(AprsError::InvalidFormat)?;
-    let body = match data_type {
+    let (body, timestamp) = match data_type {
         // Position without timestamp: ! or =
-        b'!' | b'=' => info.get(1..).ok_or(AprsError::InvalidFormat)?,
+        b'!' | b'=' => (info.get(1..).ok_or(AprsError::InvalidFormat)?, None),
         // Position with timestamp: / or @
-        // Timestamp is 7 characters after the type byte
-        b'/' | b'@' => info.get(8..).ok_or(AprsError::InvalidFormat)?,
+        // Timestamp is exactly 7 characters after the type byte.
+        b'/' | b'@' => {
+            let timestamp_bytes = info.get(1..8).ok_or(AprsError::InvalidFormat)?;
+            let timestamp_wire = decode_wire_ascii("APRS position timestamp", timestamp_bytes)?;
+            let timestamp = AprsReportTimestamp::from_wire(timestamp_wire)?;
+            (
+                info.get(8..).ok_or(AprsError::InvalidFormat)?,
+                Some(timestamp),
+            )
+        }
         _ => return Err(AprsError::InvalidFormat),
     };
 
     let first = *body.first().ok_or(AprsError::InvalidFormat)?;
     // Detect compressed vs uncompressed: if the first byte is a digit (0-9),
     // it's uncompressed latitude. Otherwise it's a compressed symbol table char.
-    if first.is_ascii_digit() {
+    let mut position = if first.is_ascii_digit() {
         parse_uncompressed_body(body)
     } else {
         parse_compressed_body(body)
-    }
+    }?;
+    position.timestamp = timestamp;
+    Ok(position)
 }
 
 /// Parse uncompressed APRS position body.
@@ -255,11 +274,11 @@ pub fn parse_uncompressed_body(body: &[u8]) -> Result<AprsPosition, AprsError> {
         PositionAmbiguity::FourDigits => 4,
     });
 
-    let comment = body.get(19..).map_or_else(String::new, |rest| {
-        String::from_utf8_lossy(rest).into_owned()
-    });
+    let comment_bytes = body.get(19..).ok_or(AprsError::InvalidFormat)?;
+    let comment =
+        decode_wire_ascii("APRS uncompressed-position comment", comment_bytes)?.to_owned();
 
-    let weather = extract_position_weather(symbol_code, &comment);
+    let weather = extract_position_weather(symbol_code, &comment)?;
     let extensions = parse_aprs_extensions(&comment);
     // If the comment had a CSE/SPD extension, surface it on speed/course
     // too so callers that only read those fields see the data.
@@ -268,6 +287,7 @@ pub fn parse_uncompressed_body(body: &[u8]) -> Result<AprsPosition, AprsError> {
         None => (None, None),
     };
     Ok(AprsPosition {
+        timestamp: None,
         latitude,
         longitude,
         symbol_table,
@@ -279,6 +299,7 @@ pub fn parse_uncompressed_body(body: &[u8]) -> Result<AprsPosition, AprsError> {
         extensions,
         mice_message: None,
         mice_altitude_m: None,
+        mice_telemetry: None,
         ambiguity,
     })
 }
@@ -317,11 +338,10 @@ pub fn parse_compressed_body(body: &[u8]) -> Result<AprsPosition, AprsError> {
     let (compressed_altitude_ft, compressed_course_speed) =
         decode_compressed_tail(cs_byte, s_byte, t_byte);
 
-    let comment = body.get(13..).map_or_else(String::new, |rest| {
-        String::from_utf8_lossy(rest).into_owned()
-    });
+    let comment_bytes = body.get(13..).ok_or(AprsError::InvalidFormat)?;
+    let comment = decode_wire_ascii("APRS compressed-position comment", comment_bytes)?.to_owned();
 
-    let weather = extract_position_weather(symbol_code, &comment);
+    let weather = extract_position_weather(symbol_code, &comment)?;
     let extensions = parse_aprs_extensions(&comment);
     // Surface course/speed into the direct fields too.
     let (speed_knots, course_degrees) =
@@ -335,6 +355,7 @@ pub fn parse_compressed_body(body: &[u8]) -> Result<AprsPosition, AprsError> {
         extensions
     };
     Ok(AprsPosition {
+        timestamp: None,
         latitude,
         longitude,
         symbol_table,
@@ -346,6 +367,7 @@ pub fn parse_compressed_body(body: &[u8]) -> Result<AprsPosition, AprsError> {
         extensions: final_extensions,
         mice_message: None,
         mice_altitude_m: None,
+        mice_telemetry: None,
         // Compressed positions do not use APRS §8.1.6 ambiguity.
         ambiguity: PositionAmbiguity::None,
     })
@@ -446,6 +468,8 @@ pub fn decode_base91_4(bytes: &[u8]) -> Result<u32, AprsError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::units::Fahrenheit;
+    use crate::weather::{BarometricPressure, Humidity, ThreeDigitWeatherValue, WindDirection};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -455,6 +479,7 @@ mod tests {
     fn parse_aprs_position_no_timestamp() -> TestResult {
         let info = b"!4903.50N/07201.75W-Test comment";
         let pos = parse_aprs_position(info)?;
+        assert_eq!(pos.timestamp, None);
         // 49 degrees 3.50 minutes N = 49.058333...
         assert!(
             (pos.latitude - 49.058_333).abs() < 0.001,
@@ -474,12 +499,45 @@ mod tests {
     }
 
     #[test]
+    fn parse_uncompressed_position_rejects_non_ascii_comment_without_replacement() -> TestResult {
+        let mut info = b"!4903.50N/07201.75W-comment".to_vec();
+        *info
+            .last_mut()
+            .ok_or("static uncompressed-position fixture must contain a comment")? = 0xFF;
+
+        assert_eq!(
+            parse_aprs_position(&info),
+            Err(AprsError::InvalidTextByte {
+                field: "APRS uncompressed-position comment",
+                index: 6,
+                byte: 0xFF,
+            }),
+        );
+        Ok(())
+    }
+
+    #[test]
     fn parse_aprs_position_with_timestamp() -> TestResult {
         // '@' type with DHM timestamp "092345z"
         let info = b"@092345z4903.50N/07201.75W-";
         let pos = parse_aprs_position(info)?;
+        assert_eq!(
+            pos.timestamp,
+            Some(AprsReportTimestamp::day_hour_minute_utc(9, 23, 45)?),
+        );
         assert!((pos.latitude - 49.058_333).abs() < 0.001, "lat check");
         assert!((pos.longitude - (-72.029_166)).abs() < 0.001, "lon check");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_aprs_position_without_messaging_retains_local_timestamp() -> TestResult {
+        let pos = parse_aprs_position(b"/110000/4903.50N/07201.75W-")?;
+
+        assert_eq!(
+            pos.timestamp,
+            Some(AprsReportTimestamp::day_hour_minute_local(11, 0, 0)?),
+        );
         Ok(())
     }
 
@@ -504,7 +562,74 @@ mod tests {
     fn parse_aprs_position_messaging_enabled() -> TestResult {
         let info = b"=4903.50N/07201.75W-";
         let pos = parse_aprs_position(info)?;
+        assert_eq!(pos.timestamp, None);
         assert!((pos.latitude - 49.058_333).abs() < 0.001, "lat check");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_timestamped_positions_reject_malformed_timestamps() {
+        let uncompressed = b"/092345X4903.50N/07201.75W-";
+        let compressed = b"@09A345z/%Ztl'&XW> sT";
+
+        assert!(
+            matches!(
+                parse_aprs_position(uncompressed),
+                Err(AprsError::InvalidTimestamp(_))
+            ),
+            "uncompressed position accepted an unknown timestamp suffix",
+        );
+        assert!(
+            matches!(
+                parse_aprs_position(compressed),
+                Err(AprsError::InvalidTimestamp(_))
+            ),
+            "compressed position accepted a non-decimal timestamp component",
+        );
+    }
+
+    #[test]
+    fn parse_timestamped_positions_reject_out_of_range_timestamps() {
+        let uncompressed = b"/002345z4903.50N/07201.75W-";
+        let compressed = b"@092445z/%Ztl'&XW> sT";
+
+        assert_eq!(
+            parse_aprs_position(uncompressed),
+            Err(AprsError::InvalidTimestamp("day must be 1-31")),
+        );
+        assert_eq!(
+            parse_aprs_position(compressed),
+            Err(AprsError::InvalidTimestamp("hour must be 0-23")),
+        );
+    }
+
+    #[test]
+    fn parse_timestamped_positions_reject_non_ascii_timestamps() -> TestResult {
+        let mut uncompressed = b"/092345z4903.50N/07201.75W-".to_vec();
+        *uncompressed
+            .get_mut(3)
+            .ok_or("static uncompressed fixture must contain timestamp byte 3")? = 0xFF;
+        let mut compressed = b"@092345z/%Ztl'&XW> sT".to_vec();
+        *compressed
+            .get_mut(6)
+            .ok_or("static compressed fixture must contain timestamp byte 6")? = 0x80;
+
+        assert_eq!(
+            parse_aprs_position(&uncompressed),
+            Err(AprsError::InvalidTextByte {
+                field: "APRS position timestamp",
+                index: 2,
+                byte: 0xFF,
+            }),
+        );
+        assert_eq!(
+            parse_aprs_position(&compressed),
+            Err(AprsError::InvalidTextByte {
+                field: "APRS position timestamp",
+                index: 5,
+                byte: 0x80,
+            }),
+        );
         Ok(())
     }
 
@@ -609,6 +734,7 @@ mod tests {
         info.extend_from_slice(body);
 
         let pos = parse_aprs_position(&info)?;
+        assert_eq!(pos.timestamp, None);
         assert!((pos.latitude - 80.828).abs() < 0.01, "lat={}", pos.latitude);
         assert!(
             (pos.longitude - (-156.018)).abs() < 0.01,
@@ -621,12 +747,34 @@ mod tests {
     }
 
     #[test]
+    fn parse_compressed_position_rejects_non_ascii_comment_without_replacement() -> TestResult {
+        let mut info = b"!/%Ztl'&XW> sTcomment".to_vec();
+        *info
+            .last_mut()
+            .ok_or("static compressed-position fixture must contain a comment")? = 0xFF;
+
+        assert_eq!(
+            parse_aprs_position(&info),
+            Err(AprsError::InvalidTextByte {
+                field: "APRS compressed-position comment",
+                index: 6,
+                byte: 0xFF,
+            }),
+        );
+        Ok(())
+    }
+
+    #[test]
     fn parse_aprs_compressed_with_timestamp() -> TestResult {
         let mut info = Vec::new();
         info.push(b'@');
         info.extend_from_slice(b"092345z"); // 7-char timestamp
         info.extend_from_slice(b"/%Ztl'&XW> sT"); // compressed body
         let pos = parse_aprs_position(&info)?;
+        assert_eq!(
+            pos.timestamp,
+            Some(AprsReportTimestamp::day_hour_minute_utc(9, 23, 45)?),
+        );
         assert!((pos.latitude - 80.828).abs() < 0.01, "lat check");
         Ok(())
     }
@@ -727,14 +875,20 @@ mod tests {
         let pos = parse_aprs_position(info)?;
         assert_eq!(pos.symbol_code, '_');
         let wx = pos.weather.ok_or("embedded weather missing")?;
-        assert_eq!(wx.wind_direction, Some(90));
-        assert_eq!(wx.wind_speed, Some(10));
-        assert_eq!(wx.wind_gust, Some(15));
-        assert_eq!(wx.temperature, Some(72));
-        assert_eq!(wx.rain_1h, Some(1));
-        assert_eq!(wx.rain_since_midnight, Some(20));
-        assert_eq!(wx.humidity, Some(55));
-        assert_eq!(wx.pressure, Some(10135));
+        assert_eq!(wx.wind_direction().map(WindDirection::degrees), Some(90));
+        assert_eq!(wx.wind_speed().map(ThreeDigitWeatherValue::value), Some(10),);
+        assert_eq!(wx.wind_gust().map(ThreeDigitWeatherValue::value), Some(15),);
+        assert_eq!(wx.temperature().map(Fahrenheit::get), Some(72));
+        assert_eq!(wx.rain_1h().map(ThreeDigitWeatherValue::value), Some(1),);
+        assert_eq!(
+            wx.rain_since_midnight().map(ThreeDigitWeatherValue::value),
+            Some(20),
+        );
+        assert_eq!(wx.humidity().map(Humidity::percent), Some(55));
+        assert_eq!(
+            wx.pressure().map(BarometricPressure::tenths_hpa),
+            Some(10_135),
+        );
         Ok(())
     }
 

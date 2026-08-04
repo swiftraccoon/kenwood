@@ -6,7 +6,7 @@ APRS (Automatic Packet Reporting System) protocol stack. std-only, sans-io.
 
 **Parsers.** Position (uncompressed + compressed), Mic-E (with speed/course from `dest` bytes + `info[4..7]`), weather (positionless and position-embedded, CSE/SPD + 13-field), status, telemetry, messages, items, objects, queries, third-party, grid square, raw GPS, user-defined.
 
-**Builders.** Position reports (plain, compressed, and weather-bearing), Mic-E, weather, status, messages, items, timestamped objects, telemetry data/metadata, and query responses. Most `build_aprs_*` helpers return KISS-wrapped bytes; matching `_packet` variants return `Ax25Packet`, and checked message/item/object variants reject values that the convenience builders would truncate.
+**Builders.** Position reports (plain, compressed, and weather-bearing), Mic-E, weather, status, directed messages, bulletins/announcements, items, timestamped objects, telemetry data/metadata, and query responses. Most `build_aprs_*` helpers return KISS-wrapped bytes; matching `_packet` variants return `Ax25Packet`, and typed wire values reject unrepresentable input without truncation.
 
 **Stateful algorithms.**
 
@@ -15,7 +15,7 @@ APRS (Automatic Packet Reporting System) protocol stack. std-only, sans-io.
 - `AprsMessenger`: ack/rej classification via strict `^(ack|rej)[A-Za-z0-9]{1,5}$`, per-message retry backoff, incoming dedup window.
 - `StationList`: heard-station database with expiry and bounded capacity.
 
-**Validated newtypes.** `Latitude`, `Longitude`, `Speed`, `Course`, `MessageId`, `SymbolTable`, `AprsSymbol`, `Fahrenheit`, `Tocall`.
+**Validated newtypes.** Numeric and symbolic fields include `Latitude`, `Longitude`, `Speed`, `Course`, `MessageId`, `SymbolTable`, `AprsSymbol`, `Fahrenheit`, and `Tocall`. Text builders use lossless printable-ASCII values rather than truncating strings: `MessageText` keeps `{` reserved for directed-message IDs, `BulletinText` permits it as ordinary bulletin text, `PositionReportText` allows 43 bytes for uncompressed positions/objects/items, `CompressedPositionText` allows 40 bytes after compressed `csT`, and `MiceStatusText` allows the remaining 247 bytes while reserving all telemetry prefixes. Mic-E parsing exposes printable and legacy binary telemetry through `MiceTelemetry`.
 
 ## Time handling
 

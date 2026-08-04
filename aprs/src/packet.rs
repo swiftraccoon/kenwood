@@ -4,7 +4,7 @@
 //! APRS data type identifier), the [`parse_aprs_data`] dispatcher, and a
 //! handful of shared primitive types: [`AprsDataExtension`], [`Phg`],
 //! [`PhgDirectivity`], [`PositionAmbiguity`], [`ParseContext`],
-//! [`AprsTimestamp`], [`TelemetryDefinition`], and [`TelemetryParameters`].
+//! [`AprsReportTimestamp`], [`TelemetryDefinition`], and [`TelemetryParameters`].
 
 use core::fmt;
 
@@ -16,7 +16,8 @@ use crate::message::{AprsMessage, parse_aprs_message};
 use crate::position::{AprsPosition, parse_aprs_position};
 use crate::status::{AprsStatus, parse_aprs_status};
 use crate::telemetry::{AprsTelemetry, parse_aprs_telemetry};
-use crate::weather::{AprsWeather, parse_aprs_weather_positionless};
+use crate::text::decode_wire_ascii;
+use crate::weather::{AprsPositionlessWeatherReport, parse_aprs_weather_positionless};
 
 // ---------------------------------------------------------------------------
 // ParseContext
@@ -98,197 +99,313 @@ pub enum PositionAmbiguity {
 }
 
 // ---------------------------------------------------------------------------
-// AprsTimestamp
+// AprsReportTimestamp
 // ---------------------------------------------------------------------------
 
-/// An APRS timestamp as used by object and position-with-timestamp
-/// reports (APRS 1.0.1 §6.1).
+/// A validated seven-byte APRS timestamp used by position and object reports
+/// (APRS 1.0.1 §6.1).
 ///
-/// Four formats are defined on the wire:
+/// Three formats are defined on the wire:
 ///
 /// | Suffix | Meaning | Digits |
 /// |--------|---------|--------|
 /// | `z`    | Day / hour / minute, zulu | DDHHMM |
 /// | `/`    | Day / hour / minute, local| DDHHMM |
 /// | `h`    | Hour / minute / second, zulu | HHMMSS |
-/// | (none) | Month / day / hour / minute, zulu (11 chars) | MDHM |
+///
+/// Its fields are private so an out-of-range calendar component cannot
+/// reach an encoder. Use one of the named constructors or [`Self::from_wire`].
+/// Status reports accept only the DHM-UTC subset, represented separately by
+/// [`crate::AprsStatusTimestamp`].
+/// The distinct eight-byte `MMDDHHMM` timestamp used only by positionless
+/// weather reports is represented by [`AprsWeatherTimestamp`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum AprsTimestamp {
-    /// Day / hour / minute in Zulu (UTC) time. Format `DDHHMMz`.
-    DhmZulu {
-        /// Day of month, 1-31.
-        day: u8,
-        /// Hour, 0-23.
-        hour: u8,
-        /// Minute, 0-59.
-        minute: u8,
-    },
-    /// Day / hour / minute in local time. Format `DDHHMM/`.
-    DhmLocal {
-        /// Day of month, 1-31.
-        day: u8,
-        /// Hour, 0-23.
-        hour: u8,
-        /// Minute, 0-59.
-        minute: u8,
-    },
-    /// Hour / minute / second in Zulu (UTC) time. Format `HHMMSSh`.
-    Hms {
-        /// Hour, 0-23.
-        hour: u8,
-        /// Minute, 0-59.
-        minute: u8,
-        /// Second, 0-59.
-        second: u8,
-    },
-    /// Month / day / hour / minute in Zulu (UTC) time (no suffix).
-    /// Format `MMDDHHMM`.
-    Mdhm {
-        /// Month, 1-12.
-        month: u8,
-        /// Day of month, 1-31.
-        day: u8,
-        /// Hour, 0-23.
-        hour: u8,
-        /// Minute, 0-59.
-        minute: u8,
-    },
+pub struct AprsReportTimestamp(AprsReportTimestampValue);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum AprsReportTimestampValue {
+    DayHourMinuteUtc { day: u8, hour: u8, minute: u8 },
+    DayHourMinuteLocal { day: u8, hour: u8, minute: u8 },
+    HourMinuteSecondUtc { hour: u8, minute: u8, second: u8 },
 }
 
-impl AprsTimestamp {
-    /// Format this timestamp as the exact 7-byte APRS wire representation
-    /// (or 8 bytes for `Mdhm`).
+/// The wire format carried by an [`AprsReportTimestamp`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AprsReportTimestampFormat {
+    /// Day, hour, and minute in UTC (`DDHHMMz`).
+    DayHourMinuteUtc,
+    /// Day, hour, and minute in local time (`DDHHMM/`).
+    DayHourMinuteLocal,
+    /// Hour, minute, and second in UTC (`HHMMSSh`).
+    HourMinuteSecondUtc,
+}
+
+impl AprsReportTimestamp {
+    /// Create a day/hour/minute UTC timestamp (`DDHHMMz`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsError::InvalidTimestamp`] unless `day` is 1-31,
+    /// `hour` is 0-23, and `minute` is 0-59.
+    pub fn day_hour_minute_utc(day: u8, hour: u8, minute: u8) -> Result<Self, AprsError> {
+        validate_day_hour_minute(day, hour, minute)?;
+        Ok(Self(AprsReportTimestampValue::DayHourMinuteUtc {
+            day,
+            hour,
+            minute,
+        }))
+    }
+
+    /// Create a day/hour/minute local-time timestamp (`DDHHMM/`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsError::InvalidTimestamp`] unless `day` is 1-31,
+    /// `hour` is 0-23, and `minute` is 0-59.
+    pub fn day_hour_minute_local(day: u8, hour: u8, minute: u8) -> Result<Self, AprsError> {
+        validate_day_hour_minute(day, hour, minute)?;
+        Ok(Self(AprsReportTimestampValue::DayHourMinuteLocal {
+            day,
+            hour,
+            minute,
+        }))
+    }
+
+    /// Create an hour/minute/second UTC timestamp (`HHMMSSh`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsError::InvalidTimestamp`] unless `hour` is 0-23 and
+    /// `minute` and `second` are 0-59.
+    pub const fn hour_minute_second_utc(
+        hour: u8,
+        minute: u8,
+        second: u8,
+    ) -> Result<Self, AprsError> {
+        if hour > 23 {
+            return Err(AprsError::InvalidTimestamp("hour must be 0-23"));
+        }
+        if minute > 59 {
+            return Err(AprsError::InvalidTimestamp("minute must be 0-59"));
+        }
+        if second > 59 {
+            return Err(AprsError::InvalidTimestamp("second must be 0-59"));
+        }
+        Ok(Self(AprsReportTimestampValue::HourMinuteSecondUtc {
+            hour,
+            minute,
+            second,
+        }))
+    }
+
+    /// Return the timestamp's APRS wire format.
     #[must_use]
-    pub fn to_wire_string(self) -> String {
-        match self {
-            Self::DhmZulu { day, hour, minute } => {
-                format!("{day:02}{hour:02}{minute:02}z")
+    pub const fn format(self) -> AprsReportTimestampFormat {
+        match self.0 {
+            AprsReportTimestampValue::DayHourMinuteUtc { .. } => {
+                AprsReportTimestampFormat::DayHourMinuteUtc
             }
-            Self::DhmLocal { day, hour, minute } => {
-                format!("{day:02}{hour:02}{minute:02}/")
+            AprsReportTimestampValue::DayHourMinuteLocal { .. } => {
+                AprsReportTimestampFormat::DayHourMinuteLocal
             }
-            Self::Hms {
-                hour,
-                minute,
-                second,
-            } => {
-                format!("{hour:02}{minute:02}{second:02}h")
-            }
-            Self::Mdhm {
-                month,
-                day,
-                hour,
-                minute,
-            } => {
-                format!("{month:02}{day:02}{hour:02}{minute:02}")
+            AprsReportTimestampValue::HourMinuteSecondUtc { .. } => {
+                AprsReportTimestampFormat::HourMinuteSecondUtc
             }
         }
+    }
+
+    /// Format this timestamp as its exact seven-byte APRS wire representation.
+    #[must_use]
+    pub fn to_wire_string(self) -> String {
+        self.to_string()
     }
 
     /// Parse an APRS timestamp from its wire-format string.
     ///
-    /// Accepts the four spec-defined forms (APRS 1.0.1 §6 pp.22-23):
+    /// Accepts the three spec-defined seven-byte report forms (APRS 1.0.1
+    /// §6 pp.22-23):
     ///
     /// | Length | Suffix | Variant                  | Spec form  |
     /// |-------:|--------|--------------------------|------------|
-    /// | 7      | `z`    | [`Self::DhmZulu`]        | `DDHHMMz`  |
-    /// | 7      | `/`    | [`Self::DhmLocal`]       | `DDHHMM/`  |
-    /// | 7      | `h`    | [`Self::Hms`]            | `HHMMSSh`  |
-    /// | 8      | (none) | [`Self::Mdhm`]           | `MMDDHHMM` |
+    /// | 7      | `z`    | day/hour/minute UTC      | `DDHHMMz`  |
+    /// | 7      | `/`    | day/hour/minute local    | `DDHHMM/`  |
+    /// | 7      | `h`    | hour/minute/second UTC   | `HHMMSSh`  |
     ///
     /// All non-suffix bytes must be ASCII digits. Range checks per
-    /// spec: day 1..=31, hour 0..=23, minute 0..=59, second 0..=59,
-    /// month 1..=12. Zero day/month and out-of-range hour/minute
-    /// values yield `None` so the parser can reject malformed input
-    /// instead of surfacing a wrong-looking `AprsTimestamp`. Earlier
-    /// code generations stored object timestamps as raw `String`
-    /// because no parser existed.
-    #[must_use]
-    pub fn parse(wire: &str) -> Option<Self> {
-        // Helper: parse two ASCII digits at byte offset.
-        fn pair(s: &str, idx: usize) -> Option<u8> {
-            let bytes = s.as_bytes();
-            let hi = *bytes.get(idx)?;
-            let lo = *bytes.get(idx + 1)?;
-            if !hi.is_ascii_digit() || !lo.is_ascii_digit() {
-                return None;
-            }
-            Some((hi - b'0') * 10 + (lo - b'0'))
-        }
+    /// spec: day 1..=31, hour 0..=23, minute 0..=59, and second 0..=59.
+    /// Zero day and out-of-range clock fields are rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsError::InvalidTimestamp`] for a malformed shape,
+    /// non-decimal component, unknown suffix, or out-of-range component.
+    pub fn from_wire(wire: &str) -> Result<Self, AprsError> {
         match wire.len() {
             7 => {
-                let p0 = pair(wire, 0)?;
-                let p1 = pair(wire, 2)?;
-                let p2 = pair(wire, 4)?;
-                match wire.as_bytes().get(6).copied()? {
-                    b'z' => {
-                        // DHM Zulu: DD HH MM z
-                        if !(1..=31).contains(&p0) {
-                            return None;
-                        }
-                        if p1 > 23 || p2 > 59 {
-                            return None;
-                        }
-                        Some(Self::DhmZulu {
-                            day: p0,
-                            hour: p1,
-                            minute: p2,
-                        })
-                    }
-                    b'/' => {
-                        // DHM local: DD HH MM /
-                        if !(1..=31).contains(&p0) {
-                            return None;
-                        }
-                        if p1 > 23 || p2 > 59 {
-                            return None;
-                        }
-                        Some(Self::DhmLocal {
-                            day: p0,
-                            hour: p1,
-                            minute: p2,
-                        })
-                    }
-                    b'h' => {
-                        // HMS Zulu: HH MM SS h
-                        if p0 > 23 || p1 > 59 || p2 > 59 {
-                            return None;
-                        }
-                        Some(Self::Hms {
-                            hour: p0,
-                            minute: p1,
-                            second: p2,
-                        })
-                    }
-                    _ => None,
+                let p0 = parse_timestamp_pair(wire, 0)?;
+                let p1 = parse_timestamp_pair(wire, 2)?;
+                let p2 = parse_timestamp_pair(wire, 4)?;
+                match wire.as_bytes().get(6).copied() {
+                    Some(b'z') => Self::day_hour_minute_utc(p0, p1, p2),
+                    Some(b'/') => Self::day_hour_minute_local(p0, p1, p2),
+                    Some(b'h') => Self::hour_minute_second_utc(p0, p1, p2),
+                    _ => Err(AprsError::InvalidTimestamp(
+                        "7-byte timestamp must end in 'z', '/', or 'h'",
+                    )),
                 }
             }
-            8 => {
-                // MDHM unsuffixed: MM DD HH MM (typically Zulu;
-                // spec leaves zone implementation-defined).
-                let month = pair(wire, 0)?;
-                let day = pair(wire, 2)?;
-                let hour = pair(wire, 4)?;
-                let minute = pair(wire, 6)?;
-                if !(1..=12).contains(&month) {
-                    return None;
-                }
-                if !(1..=31).contains(&day) {
-                    return None;
-                }
-                if hour > 23 || minute > 59 {
-                    return None;
-                }
-                Some(Self::Mdhm {
-                    month,
-                    day,
-                    hour,
-                    minute,
-                })
-            }
-            _ => None,
+            _ => Err(AprsError::InvalidTimestamp(
+                "report timestamp must be exactly 7 bytes",
+            )),
         }
     }
+}
+
+impl fmt::Display for AprsReportTimestamp {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            AprsReportTimestampValue::DayHourMinuteUtc { day, hour, minute } => {
+                write!(formatter, "{day:02}{hour:02}{minute:02}z")
+            }
+            AprsReportTimestampValue::DayHourMinuteLocal { day, hour, minute } => {
+                write!(formatter, "{day:02}{hour:02}{minute:02}/")
+            }
+            AprsReportTimestampValue::HourMinuteSecondUtc {
+                hour,
+                minute,
+                second,
+            } => write!(formatter, "{hour:02}{minute:02}{second:02}h"),
+        }
+    }
+}
+
+impl core::str::FromStr for AprsReportTimestamp {
+    type Err = AprsError;
+
+    fn from_str(wire: &str) -> Result<Self, Self::Err> {
+        Self::from_wire(wire)
+    }
+}
+
+/// A validated positionless-weather timestamp (`MMDDHHMM`).
+///
+/// APRS reserves this unsuffixed eight-byte UTC form for positionless
+/// weather reports. Keeping it separate from [`AprsReportTimestamp`] prevents
+/// builders from emitting it in position, object, or status frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AprsWeatherTimestamp {
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+}
+
+impl AprsWeatherTimestamp {
+    /// Create a month/day/hour/minute UTC weather timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsError::InvalidTimestamp`] unless `month` is 1-12,
+    /// `day` exists in that month (allowing February 29 because the wire
+    /// format has no year), `hour` is 0-23, and `minute` is 0-59.
+    pub fn month_day_hour_minute_utc(
+        month: u8,
+        day: u8,
+        hour: u8,
+        minute: u8,
+    ) -> Result<Self, AprsError> {
+        if month == 0 || month > 12 {
+            return Err(AprsError::InvalidTimestamp("month must be 1-12"));
+        }
+        validate_day_hour_minute(day, hour, minute)?;
+        let maximum_day = match month {
+            2 => 29,
+            4 | 6 | 9 | 11 => 30,
+            _ => 31,
+        };
+        if day > maximum_day {
+            return Err(AprsError::InvalidTimestamp("day is not valid for month"));
+        }
+        Ok(Self {
+            month,
+            day,
+            hour,
+            minute,
+        })
+    }
+
+    /// Parse an exact eight-byte `MMDDHHMM` timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsError::InvalidTimestamp`] for the wrong length,
+    /// non-decimal bytes, or out-of-range components.
+    pub fn from_wire(wire: &str) -> Result<Self, AprsError> {
+        if wire.len() != 8 {
+            return Err(AprsError::InvalidTimestamp(
+                "weather timestamp must be exactly 8 bytes",
+            ));
+        }
+        Self::month_day_hour_minute_utc(
+            parse_timestamp_pair(wire, 0)?,
+            parse_timestamp_pair(wire, 2)?,
+            parse_timestamp_pair(wire, 4)?,
+            parse_timestamp_pair(wire, 6)?,
+        )
+    }
+
+    /// Format this timestamp as its exact eight-byte wire representation.
+    #[must_use]
+    pub fn to_wire_string(self) -> String {
+        self.to_string()
+    }
+}
+
+impl fmt::Display for AprsWeatherTimestamp {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{:02}{:02}{:02}{:02}",
+            self.month, self.day, self.hour, self.minute
+        )
+    }
+}
+
+impl core::str::FromStr for AprsWeatherTimestamp {
+    type Err = AprsError;
+
+    fn from_str(wire: &str) -> Result<Self, Self::Err> {
+        Self::from_wire(wire)
+    }
+}
+
+fn parse_timestamp_pair(wire: &str, index: usize) -> Result<u8, AprsError> {
+    let bytes = wire.as_bytes();
+    let high = *bytes
+        .get(index)
+        .ok_or(AprsError::InvalidTimestamp("timestamp is too short"))?;
+    let low = *bytes
+        .get(index + 1)
+        .ok_or(AprsError::InvalidTimestamp("timestamp is too short"))?;
+    if !high.is_ascii_digit() || !low.is_ascii_digit() {
+        return Err(AprsError::InvalidTimestamp(
+            "timestamp components must be decimal digits",
+        ));
+    }
+    Ok((high - b'0') * 10 + (low - b'0'))
+}
+
+const fn validate_day_hour_minute(day: u8, hour: u8, minute: u8) -> Result<(), AprsError> {
+    if day == 0 || day > 31 {
+        return Err(AprsError::InvalidTimestamp("day must be 1-31"));
+    }
+    if hour > 23 {
+        return Err(AprsError::InvalidTimestamp("hour must be 0-23"));
+    }
+    if minute > 59 {
+        return Err(AprsError::InvalidTimestamp("minute must be 0-59"));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -859,8 +976,8 @@ pub enum AprsData {
     Object(AprsObject),
     /// Item report (named, with position, no timestamp).
     Item(AprsItem),
-    /// Weather report (temperature, wind, rain, pressure, humidity).
-    Weather(AprsWeather),
+    /// Standalone positionless weather report with its mandatory timestamp.
+    PositionlessWeather(AprsPositionlessWeatherReport),
     /// Telemetry report (analog values and digital status).
     Telemetry(AprsTelemetry),
     /// Query (position, status, message, or direction finding).
@@ -986,7 +1103,7 @@ pub fn parse_aprs_data(info: &[u8]) -> Result<AprsData, AprsError> {
         // Item
         b')' => parse_aprs_item(info).map(AprsData::Item),
         // Positionless weather
-        b'_' => parse_aprs_weather_positionless(info).map(AprsData::Weather),
+        b'_' => parse_aprs_weather_positionless(info).map(AprsData::PositionlessWeather),
         // Telemetry
         b'T' => parse_aprs_telemetry(info).map(AprsData::Telemetry),
         // Query
@@ -1045,7 +1162,7 @@ fn parse_aprs_third_party(info: &[u8]) -> Result<AprsData, AprsError> {
         .get(colon + 1..)
         .ok_or(AprsError::InvalidFormat)?
         .to_vec();
-    let header = String::from_utf8_lossy(header_bytes).into_owned();
+    let header = decode_wire_ascii("APRS third-party header", header_bytes)?.to_owned();
     Ok(AprsData::ThirdParty { header, payload })
 }
 
@@ -1057,7 +1174,7 @@ fn parse_aprs_grid(info: &[u8]) -> Result<AprsData, AprsError> {
         return Err(AprsError::InvalidFormat);
     }
     let tail = info.get(1..).unwrap_or(&[]);
-    let body = String::from_utf8_lossy(tail)
+    let body = decode_wire_ascii("APRS Maidenhead grid", tail)?
         .trim_end_matches(['\r', '\n', ' '])
         .to_owned();
     // Maidenhead locators are built in 2-char pairs, so only even lengths
@@ -1111,8 +1228,7 @@ fn parse_aprs_raw_gps(info: &[u8]) -> Result<AprsData, AprsError> {
         return Err(AprsError::InvalidFormat);
     }
     let tail = info.get(1..).unwrap_or(&[]);
-    let body = std::str::from_utf8(tail)
-        .map_err(|_| AprsError::InvalidFormat)?
+    let body = decode_wire_ascii("APRS NMEA sentence", tail)?
         .trim_end_matches(['\r', '\n'])
         .to_owned();
     Ok(AprsData::RawGps(body))
@@ -1129,9 +1245,7 @@ fn parse_aprs_capabilities(info: &[u8]) -> Result<AprsData, AprsError> {
         return Err(AprsError::InvalidFormat);
     }
     let tail = info.get(1..).unwrap_or(&[]);
-    let body = std::str::from_utf8(tail)
-        .map_err(|_| AprsError::InvalidFormat)?
-        .trim_end_matches(['\r', '\n']);
+    let body = decode_wire_ascii("APRS station capabilities", tail)?.trim_end_matches(['\r', '\n']);
     let mut tokens: Vec<(String, String)> = Vec::new();
     for entry in body.split(',') {
         let entry = entry.trim();
@@ -1219,10 +1333,10 @@ mod tests {
 
     #[test]
     fn dispatch_weather() {
-        let info = b"_01011234c180s005t072";
+        let info = b"_01011234c180s005g...t072";
         assert!(
-            matches!(parse_aprs_data(info), Ok(AprsData::Weather(_))),
-            "expected Weather variant",
+            matches!(parse_aprs_data(info), Ok(AprsData::PositionlessWeather(_))),
+            "expected PositionlessWeather variant",
         );
     }
 
@@ -1243,6 +1357,19 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_third_party_rejects_non_ascii_header_without_replacement() {
+        let info = b"}\xFF>APK005:!4903.50N/07201.75W-";
+        assert_eq!(
+            parse_aprs_data(info),
+            Err(AprsError::InvalidTextByte {
+                field: "APRS third-party header",
+                index: 0,
+                byte: 0xFF,
+            }),
+        );
+    }
+
+    #[test]
     fn dispatch_grid_locator() -> TestResult {
         let info = b"[EM13qc";
         let result = parse_aprs_data(info)?;
@@ -1251,6 +1378,18 @@ mod tests {
             "expected Grid, got {result:?}",
         );
         Ok(())
+    }
+
+    #[test]
+    fn dispatch_grid_rejects_non_ascii_without_replacement() {
+        assert_eq!(
+            parse_aprs_data(b"[EM13\xFFc"),
+            Err(AprsError::InvalidTextByte {
+                field: "APRS Maidenhead grid",
+                index: 4,
+                byte: 0xFF,
+            }),
+        );
     }
 
     #[test]
@@ -1449,23 +1588,17 @@ mod tests {
     // ---- Timestamp tests ----
 
     #[test]
-    fn aprs_timestamp_dhm_zulu_format() {
-        let ts = AprsTimestamp::DhmZulu {
-            day: 9,
-            hour: 23,
-            minute: 45,
-        };
+    fn aprs_timestamp_dhm_zulu_format() -> TestResult {
+        let ts = AprsReportTimestamp::day_hour_minute_utc(9, 23, 45)?;
         assert_eq!(ts.to_wire_string(), "092345z");
+        Ok(())
     }
 
     #[test]
-    fn aprs_timestamp_hms_format() {
-        let ts = AprsTimestamp::Hms {
-            hour: 12,
-            minute: 0,
-            second: 1,
-        };
+    fn aprs_timestamp_hms_format() -> TestResult {
+        let ts = AprsReportTimestamp::hour_minute_second_utc(12, 0, 1)?;
         assert_eq!(ts.to_wire_string(), "120001h");
+        Ok(())
     }
 
     // ---- Extensions parser tests ----
@@ -1609,64 +1742,41 @@ mod tests {
         assert!(ext.phg.is_none(), "space height should be rejected");
     }
 
-    // ---- AprsTimestamp::parse round-trip ----
+    // ---- AprsReportTimestamp::from_wire round-trip ----
 
     #[test]
     fn aprs_timestamp_parse_dhm_zulu() -> TestResult {
-        let ts = AprsTimestamp::parse("092345z").ok_or("expected valid DHM Zulu")?;
-        assert_eq!(
-            ts,
-            AprsTimestamp::DhmZulu {
-                day: 9,
-                hour: 23,
-                minute: 45,
-            },
-        );
+        let ts = AprsReportTimestamp::from_wire("092345z")?;
+        assert_eq!(ts, AprsReportTimestamp::day_hour_minute_utc(9, 23, 45)?);
+        assert_eq!(ts.format(), AprsReportTimestampFormat::DayHourMinuteUtc);
         assert_eq!(ts.to_wire_string(), "092345z");
         Ok(())
     }
 
     #[test]
     fn aprs_timestamp_parse_dhm_local() -> TestResult {
-        let ts = AprsTimestamp::parse("110000/").ok_or("expected valid DHM local")?;
-        assert_eq!(
-            ts,
-            AprsTimestamp::DhmLocal {
-                day: 11,
-                hour: 0,
-                minute: 0,
-            },
-        );
+        let ts = AprsReportTimestamp::from_wire("110000/")?;
+        assert_eq!(ts, AprsReportTimestamp::day_hour_minute_local(11, 0, 0)?);
+        assert_eq!(ts.format(), AprsReportTimestampFormat::DayHourMinuteLocal);
         assert_eq!(ts.to_wire_string(), "110000/");
         Ok(())
     }
 
     #[test]
     fn aprs_timestamp_parse_hms() -> TestResult {
-        let ts = AprsTimestamp::parse("234517h").ok_or("expected valid HMS")?;
-        assert_eq!(
-            ts,
-            AprsTimestamp::Hms {
-                hour: 23,
-                minute: 45,
-                second: 17,
-            },
-        );
+        let ts = AprsReportTimestamp::from_wire("234517h")?;
+        assert_eq!(ts, AprsReportTimestamp::hour_minute_second_utc(23, 45, 17)?);
+        assert_eq!(ts.format(), AprsReportTimestampFormat::HourMinuteSecondUtc);
         assert_eq!(ts.to_wire_string(), "234517h");
         Ok(())
     }
 
     #[test]
-    fn aprs_timestamp_parse_mdhm() -> TestResult {
-        let ts = AprsTimestamp::parse("10092345").ok_or("expected valid MDHM")?;
+    fn aprs_weather_timestamp_parse_mdhm() -> TestResult {
+        let ts = AprsWeatherTimestamp::from_wire("10092345")?;
         assert_eq!(
             ts,
-            AprsTimestamp::Mdhm {
-                month: 10,
-                day: 9,
-                hour: 23,
-                minute: 45,
-            },
+            AprsWeatherTimestamp::month_day_hour_minute_utc(10, 9, 23, 45)?,
         );
         assert_eq!(ts.to_wire_string(), "10092345");
         Ok(())
@@ -1675,57 +1785,58 @@ mod tests {
     #[test]
     fn aprs_timestamp_parse_rejects_malformed() {
         // Wrong length
-        assert!(AprsTimestamp::parse("123456").is_none());
-        assert!(AprsTimestamp::parse("1234567890").is_none());
+        assert!(AprsReportTimestamp::from_wire("123456").is_err());
+        assert!(AprsReportTimestamp::from_wire("1234567890").is_err());
         // Unknown suffix
-        assert!(AprsTimestamp::parse("123456X").is_none());
+        assert!(AprsReportTimestamp::from_wire("123456X").is_err());
         // Non-digit
-        assert!(AprsTimestamp::parse("1A2345z").is_none());
+        assert!(AprsReportTimestamp::from_wire("1A2345z").is_err());
         // Out-of-range day (0 or > 31)
-        assert!(AprsTimestamp::parse("002345z").is_none());
-        assert!(AprsTimestamp::parse("322345z").is_none());
+        assert!(AprsReportTimestamp::from_wire("002345z").is_err());
+        assert!(AprsReportTimestamp::from_wire("322345z").is_err());
         // Out-of-range hour
-        assert!(AprsTimestamp::parse("092445z").is_none());
+        assert!(AprsReportTimestamp::from_wire("092445z").is_err());
         // Out-of-range minute
-        assert!(AprsTimestamp::parse("092360z").is_none());
-        // MDHM: month 0 / month 13
-        assert!(AprsTimestamp::parse("00091234").is_none());
-        assert!(AprsTimestamp::parse("13091234").is_none());
+        assert!(AprsReportTimestamp::from_wire("092360z").is_err());
+        // The eight-byte weather form is not a report timestamp.
+        assert!(AprsReportTimestamp::from_wire("00091234").is_err());
+        assert!(AprsReportTimestamp::from_wire("13091234").is_err());
     }
 
     #[test]
     fn aprs_timestamp_round_trip_all_variants() -> TestResult {
         // Build each variant, format to wire, parse back, expect identity.
         let cases = [
-            AprsTimestamp::DhmZulu {
-                day: 9,
-                hour: 23,
-                minute: 45,
-            },
-            AprsTimestamp::DhmLocal {
-                day: 15,
-                hour: 12,
-                minute: 0,
-            },
-            AprsTimestamp::Hms {
-                hour: 23,
-                minute: 45,
-                second: 17,
-            },
-            AprsTimestamp::Mdhm {
-                month: 7,
-                day: 4,
-                hour: 8,
-                minute: 30,
-            },
+            AprsReportTimestamp::day_hour_minute_utc(9, 23, 45)?,
+            AprsReportTimestamp::day_hour_minute_local(15, 12, 0)?,
+            AprsReportTimestamp::hour_minute_second_utc(23, 45, 17)?,
         ];
         for original in cases {
             let wire = original.to_wire_string();
-            let parsed = AprsTimestamp::parse(&wire)
-                .ok_or_else(|| format!("parse({wire}) returned None for {original:?}"))?;
+            let parsed = AprsReportTimestamp::from_wire(&wire)?;
             assert_eq!(parsed, original, "round-trip mismatch for {original:?}");
         }
         Ok(())
+    }
+
+    #[test]
+    fn aprs_timestamp_constructors_reject_invalid_components() {
+        assert!(AprsReportTimestamp::day_hour_minute_utc(0, 0, 0).is_err());
+        assert!(AprsReportTimestamp::day_hour_minute_local(32, 0, 0).is_err());
+        assert!(AprsReportTimestamp::hour_minute_second_utc(24, 0, 0).is_err());
+        assert!(AprsReportTimestamp::hour_minute_second_utc(0, 60, 0).is_err());
+        assert!(AprsReportTimestamp::hour_minute_second_utc(0, 0, 60).is_err());
+    }
+
+    #[test]
+    fn aprs_weather_timestamp_rejects_invalid_components() {
+        assert!(AprsWeatherTimestamp::month_day_hour_minute_utc(0, 1, 0, 0).is_err());
+        assert!(AprsWeatherTimestamp::month_day_hour_minute_utc(13, 1, 0, 0).is_err());
+        assert!(AprsWeatherTimestamp::month_day_hour_minute_utc(2, 30, 0, 0).is_err());
+        assert!(AprsWeatherTimestamp::month_day_hour_minute_utc(4, 31, 0, 0).is_err());
+        assert!(AprsWeatherTimestamp::from_wire("0101123").is_err());
+        assert!(AprsWeatherTimestamp::from_wire("010112345").is_err());
+        assert!(AprsWeatherTimestamp::from_wire("01AA1234").is_err());
     }
 
     #[test]

@@ -15,13 +15,15 @@
 //! it down.
 
 use std::collections::HashMap;
+use std::num::NonZeroU16;
 use std::time::{Duration, Instant};
 
-use ax25_codec::{Ax25Address, RouteEntry};
+use ax25_codec::{Ax25Address, DigipeaterPath};
 
 use crate::build::build_aprs_message;
-use crate::error::AprsError;
-use crate::message::{AprsMessage, MAX_APRS_MESSAGE_TEXT_LEN, classify_ack_rej};
+use crate::message::{AprsMessage, classify_ack_rej};
+use crate::text::{MessageAddressee, MessageText};
+use crate::units::MessageId;
 
 /// How long an incoming message's `(source, msgno)` stays in the dedup
 /// cache before being purged.
@@ -62,12 +64,12 @@ impl Default for MessengerConfig {
 #[derive(Debug)]
 struct PendingMessage {
     /// Sequence ID for ack matching.
-    message_id: String,
+    message_id: MessageId,
     /// Station this message was sent to. An acknowledgement is only
     /// honoured when it arrives FROM this station: over open RF, a
     /// message number alone is not proof of delivery, and matching on
     /// it lets any third party cancel our retries.
-    addressee: String,
+    addressee: MessageAddressee,
     /// Pre-built KISS wire frame for retransmission.
     wire_frame: Vec<u8>,
     /// Number of transmission attempts so far.
@@ -94,11 +96,11 @@ pub struct AprsMessenger {
     /// This station's callsign/SSID.
     my_callsign: Ax25Address,
     /// Digipeater path used for outgoing message frames.
-    digipeater_path: Vec<RouteEntry>,
+    digipeater_path: DigipeaterPath,
     /// Messages awaiting acknowledgement.
     pending_messages: Vec<PendingMessage>,
     /// Counter for generating unique message IDs.
-    next_message_id: u16,
+    next_message_id: NonZeroU16,
     /// Dedup cache for incoming messages keyed on `(source_call, msgno)`.
     incoming_seen: HashMap<(String, String), Instant>,
     /// Tunable retry / dedup behaviour.
@@ -108,7 +110,7 @@ pub struct AprsMessenger {
 impl AprsMessenger {
     /// Create a new messenger with the default config.
     #[must_use]
-    pub fn new(callsign: Ax25Address, digipeater_path: Vec<RouteEntry>) -> Self {
+    pub fn new(callsign: Ax25Address, digipeater_path: DigipeaterPath) -> Self {
         Self::with_config(callsign, digipeater_path, MessengerConfig::default())
     }
 
@@ -116,43 +118,46 @@ impl AprsMessenger {
     #[must_use]
     pub fn with_config(
         callsign: Ax25Address,
-        digipeater_path: Vec<RouteEntry>,
+        digipeater_path: DigipeaterPath,
         config: MessengerConfig,
     ) -> Self {
         Self {
             my_callsign: callsign,
             digipeater_path,
             pending_messages: Vec::new(),
-            next_message_id: 1,
+            next_message_id: NonZeroU16::MIN,
             incoming_seen: HashMap::new(),
             config,
         }
     }
 
-    /// Queue a message for transmission. Returns the assigned message ID.
+    /// Queue a validated message for transmission and return its assigned ID.
     ///
     /// The message is immediately available from
-    /// [`next_frame_to_send`](Self::next_frame_to_send). Text longer than
-    /// [`MAX_APRS_MESSAGE_TEXT_LEN`] (67 bytes, APRS 1.0.1 §14) is silently
-    /// truncated; use [`Self::send_message_checked`] if you want a hard
-    /// error instead.
+    /// [`next_frame_to_send`](Self::next_frame_to_send). The typed addressee
+    /// and text ensure the frame is wire-representable without truncation.
     ///
     /// The freshly-queued message records no `last_sent` time (`None`),
     /// which marks it immediately eligible for transmission on the next
     /// call to [`next_frame_to_send`](Self::next_frame_to_send),
     /// regardless of the monotonic clock's origin. `now` is accepted for
     /// API consistency with the other time-aware methods.
-    pub fn send_message(&mut self, addressee: &str, text: &str, _now: Instant) -> String {
+    pub fn send_message(
+        &mut self,
+        addressee: &MessageAddressee,
+        text: &MessageText,
+        _now: Instant,
+    ) -> MessageId {
         // Pick a fresh ID, skipping any that clash with still-pending
         // messages. The ID space is `1..=u16::MAX` (65 535 slots), far
         // more than MAX_RETRIES of in-flight messages, so this loop
         // always terminates.
         let message_id = loop {
-            let candidate = self.next_message_id.to_string();
-            self.next_message_id = self.next_message_id.wrapping_add(1);
-            if self.next_message_id == 0 {
-                self.next_message_id = 1;
-            }
+            let candidate = MessageId::from_sequence_number(self.next_message_id);
+            self.next_message_id = self
+                .next_message_id
+                .checked_add(1)
+                .unwrap_or(NonZeroU16::MIN);
             if !self
                 .pending_messages
                 .iter()
@@ -177,7 +182,7 @@ impl AprsMessenger {
         // origin.
         self.pending_messages.push(PendingMessage {
             message_id: message_id.clone(),
-            addressee: addressee.to_owned(),
+            addressee: addressee.clone(),
             wire_frame,
             attempts: 0,
             last_sent: None,
@@ -205,9 +210,10 @@ impl AprsMessenger {
             // A never-sent message (`last_sent == None`) is eligible
             // immediately; a previously-sent one only once the retry
             // interval has elapsed.
-            let eligible = msg
-                .last_sent
-                .is_none_or(|last| now.duration_since(last) >= retry_interval);
+            let eligible = msg.last_sent.is_none_or(|last| {
+                now.checked_duration_since(last)
+                    .is_some_and(|elapsed| elapsed >= retry_interval)
+            });
             if eligible {
                 msg.attempts += 1;
                 msg.last_sent = Some(now);
@@ -226,49 +232,32 @@ impl AprsMessenger {
     /// for a frame that never went on air would silently exhaust the
     /// retry budget.
     #[must_use]
-    pub fn peek_frame_to_send(&self, now: Instant) -> Option<(String, Vec<u8>)> {
+    pub fn peek_frame_to_send(&self, now: Instant) -> Option<(MessageId, Vec<u8>)> {
         let max_retries = self.config.max_retries;
         let retry_interval = self.config.retry_interval;
         self.pending_messages
             .iter()
             .find(|msg| {
                 msg.attempts < max_retries
-                    && msg
-                        .last_sent
-                        .is_none_or(|last| now.duration_since(last) >= retry_interval)
+                    && msg.last_sent.is_none_or(|last| {
+                        now.checked_duration_since(last)
+                            .is_some_and(|elapsed| elapsed >= retry_interval)
+                    })
             })
             .map(|msg| (msg.message_id.clone(), msg.wire_frame.clone()))
     }
 
     /// Record that the frame for `message_id` was transmitted at
     /// `now`. The counterpart of [`Self::peek_frame_to_send`].
-    pub fn commit_send(&mut self, message_id: &str, now: Instant) {
+    pub fn commit_send(&mut self, message_id: &MessageId, now: Instant) {
         if let Some(msg) = self
             .pending_messages
             .iter_mut()
-            .find(|m| m.message_id == message_id)
+            .find(|m| &m.message_id == message_id)
         {
             msg.attempts += 1;
             msg.last_sent = Some(now);
         }
-    }
-
-    /// Like [`Self::send_message`] but returns `Err(MessageTooLong)` if
-    /// the text exceeds the APRS 1.0.1 §14 limit of 67 bytes.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AprsError::MessageTooLong`] when the text is too long.
-    pub fn send_message_checked(
-        &mut self,
-        addressee: &str,
-        text: &str,
-        now: Instant,
-    ) -> Result<String, AprsError> {
-        if text.len() > MAX_APRS_MESSAGE_TEXT_LEN {
-            return Err(AprsError::MessageTooLong(text.len()));
-        }
-        Ok(self.send_message(addressee, text, now))
     }
 
     /// Check whether an incoming message is a duplicate of one recently
@@ -306,21 +295,31 @@ impl AprsMessenger {
             return false;
         };
         let key = (source.to_owned(), id.clone());
-        self.incoming_seen
-            .get(&key)
-            .is_some_and(|t| now.duration_since(*t) < window)
+        self.incoming_seen.get(&key).is_some_and(|seen_at| {
+            now.checked_duration_since(*seen_at)
+                .is_none_or(|elapsed| elapsed < window)
+        })
     }
 
     /// Record an incoming message in the dedup cache. The counterpart
     /// of [`Self::is_duplicate_incoming`]. Also expires stale entries.
     pub fn mark_incoming_seen(&mut self, source: &str, msg: &AprsMessage, now: Instant) {
         let window = self.config.incoming_dedup_window;
-        self.incoming_seen
-            .retain(|_, t| now.duration_since(*t) < window);
+        self.incoming_seen.retain(|_, seen_at| {
+            now.checked_duration_since(*seen_at)
+                .is_none_or(|elapsed| elapsed < window)
+        });
         if let Some(ref id) = msg.message_id {
-            let _prior = self
+            let key = (source.to_owned(), id.clone());
+            let _seen_at = self
                 .incoming_seen
-                .insert((source.to_owned(), id.clone()), now);
+                .entry(key)
+                .and_modify(|seen_at| {
+                    if now > *seen_at {
+                        *seen_at = now;
+                    }
+                })
+                .or_insert(now);
         }
     }
 
@@ -360,16 +359,19 @@ impl AprsMessenger {
 
         // (1) Standalone ack/rej control frame: `ack<id>` / `rej<id>`.
         if let Some((_is_ack, id)) = classify_ack_rej(&msg.text) {
-            self.pending_messages
-                .retain(|p| !(p.message_id == id && p.addressee.eq_ignore_ascii_case(source)));
+            self.pending_messages.retain(|p| {
+                !(p.message_id.as_str() == id && p.addressee.as_str().eq_ignore_ascii_case(source))
+            });
         }
 
         // (2) APRS 1.1/1.2 reply-ack: the `{MM}AA` trailer's `AA` field
         // acknowledges our outbound message number. Compared verbatim,
         // matching the format the standalone-ack path uses.
         if let Some(ref acked) = msg.reply_ack {
-            self.pending_messages
-                .retain(|p| !(&p.message_id == acked && p.addressee.eq_ignore_ascii_case(source)));
+            self.pending_messages.retain(|p| {
+                !(p.message_id.as_str() == acked
+                    && p.addressee.as_str().eq_ignore_ascii_case(source))
+            });
         }
 
         self.pending_messages.len() < before
@@ -379,8 +381,8 @@ impl AprsMessenger {
     ///
     /// The ack is sent back to `from` with text `ack{message_id}`.
     #[must_use]
-    pub fn build_ack(&self, from: &str, message_id: &str) -> Vec<u8> {
-        let text = format!("ack{message_id}");
+    pub fn build_ack(&self, from: &MessageAddressee, message_id: &MessageId) -> Vec<u8> {
+        let text = MessageText::acknowledgement(message_id);
         build_aprs_message(&self.my_callsign, from, &text, None, &self.digipeater_path)
     }
 
@@ -388,8 +390,8 @@ impl AprsMessenger {
     ///
     /// The rej is sent back to `from` with text `rej{message_id}`.
     #[must_use]
-    pub fn build_rej(&self, from: &str, message_id: &str) -> Vec<u8> {
-        let text = format!("rej{message_id}");
+    pub fn build_rej(&self, from: &MessageAddressee, message_id: &MessageId) -> Vec<u8> {
+        let text = MessageText::rejection(message_id);
         build_aprs_message(&self.my_callsign, from, &text, None, &self.digipeater_path)
     }
 
@@ -399,7 +401,7 @@ impl AprsMessenger {
     /// Takes `now: Instant` for API consistency with the other time-aware
     /// methods even though no clock-dependent logic is currently used here:
     /// the decision is based on attempt count, not elapsed time.
-    pub fn cleanup_expired(&mut self, _now: Instant) -> Vec<String> {
+    pub fn cleanup_expired(&mut self, _now: Instant) -> Vec<MessageId> {
         let mut expired = Vec::new();
         let max_retries = self.config.max_retries;
         self.pending_messages.retain(|m| {
@@ -423,7 +425,7 @@ impl AprsMessenger {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ax25_codec::parse_ax25;
+    use ax25_codec::{RouteEntry, parse_ax25};
     use kiss_tnc::decode_kiss_frame;
 
     use crate::message::parse_aprs_message as parse_msg;
@@ -432,30 +434,54 @@ mod tests {
 
     fn test_callsign() -> Ax25Address {
         Ax25Address::new("N0CALL", 7)
-            .unwrap_or_else(|_| unreachable!("N0CALL-7 is statically valid"))
+            .unwrap_or_else(|_| unreachable!("N0CALL-7 is a valid static test address"))
     }
 
-    fn default_digipeater_path() -> Vec<RouteEntry> {
-        vec![
-            RouteEntry::new("WIDE1", 1)
-                .unwrap_or_else(|_| unreachable!("WIDE1-1 is statically valid")),
-            RouteEntry::new("WIDE2", 1)
-                .unwrap_or_else(|_| unreachable!("WIDE2-1 is statically valid")),
-        ]
+    fn default_digipeater_path() -> DigipeaterPath {
+        let wide1 = RouteEntry::new("WIDE1", 1)
+            .unwrap_or_else(|_| unreachable!("WIDE1-1 is a valid static test route"));
+        let wide2 = RouteEntry::new("WIDE2", 1)
+            .unwrap_or_else(|_| unreachable!("WIDE2-1 is a valid static test route"));
+        DigipeaterPath::new(vec![wide1, wide2])
+            .unwrap_or_else(|_| unreachable!("two entries fit an AX.25 path"))
     }
 
     fn test_messenger() -> AprsMessenger {
         AprsMessenger::new(test_callsign(), default_digipeater_path())
     }
 
+    fn test_addressee(value: &str) -> MessageAddressee {
+        MessageAddressee::new(value)
+            .unwrap_or_else(|_| unreachable!("test callers provide valid addressees"))
+    }
+
+    fn test_text(value: &str) -> MessageText {
+        MessageText::new(value)
+            .unwrap_or_else(|_| unreachable!("test callers provide valid message text"))
+    }
+
+    fn test_message_id(value: &str) -> MessageId {
+        MessageId::new(value)
+            .unwrap_or_else(|_| unreachable!("test callers provide valid message IDs"))
+    }
+
+    fn queue_test_message(
+        messenger: &mut AprsMessenger,
+        addressee: &str,
+        text: &str,
+        now: Instant,
+    ) -> MessageId {
+        messenger.send_message(&test_addressee(addressee), &test_text(text), now)
+    }
+
     #[test]
     fn send_message_assigns_incrementing_ids() {
         let t0 = Instant::now();
         let mut m = test_messenger();
-        let id1 = m.send_message("W1AW", "Hello", t0);
-        let id2 = m.send_message("W1AW", "World", t0);
-        assert_eq!(id1, "1");
-        assert_eq!(id2, "2");
+        let id1 = queue_test_message(&mut m, "W1AW", "Hello", t0);
+        let id2 = queue_test_message(&mut m, "W1AW", "World", t0);
+        assert_eq!(id1.as_str(), "1");
+        assert_eq!(id2.as_str(), "2");
         assert_eq!(m.pending_count(), 2);
     }
 
@@ -463,7 +489,7 @@ mod tests {
     fn next_frame_returns_pending_message() -> TestResult {
         let t0 = Instant::now();
         let mut m = test_messenger();
-        let _id = m.send_message("W1AW", "Test", t0);
+        let _id = queue_test_message(&mut m, "W1AW", "Test", t0);
 
         // Message was created with last_sent in the past, so it should be ready.
         let frame = m.next_frame_to_send(t0);
@@ -472,7 +498,7 @@ mod tests {
         // Verify the frame decodes to a valid APRS message.
         let kiss = decode_kiss_frame(&wire)?;
         let packet = parse_ax25(&kiss.data)?;
-        let msg = parse_msg(&packet.info)?;
+        let msg = parse_msg(packet.information())?;
         assert_eq!(msg.addressee, "W1AW");
         assert_eq!(msg.text, "Test");
         assert_eq!(msg.message_id, Some("1".to_owned()));
@@ -486,7 +512,7 @@ mod tests {
         // attempt, only an explicit commit does.
         let t0 = Instant::now();
         let mut m = test_messenger();
-        let id = m.send_message("W1AW", "Test", t0);
+        let id = queue_test_message(&mut m, "W1AW", "Test", t0);
 
         let (peek_id, _wire) = m.peek_frame_to_send(t0).ok_or("expected a frame")?;
         assert_eq!(peek_id, id);
@@ -529,7 +555,7 @@ mod tests {
     fn next_frame_returns_none_when_recently_sent() {
         let t0 = Instant::now();
         let mut m = test_messenger();
-        let _id = m.send_message("W1AW", "Test", t0);
+        let _id = queue_test_message(&mut m, "W1AW", "Test", t0);
 
         // First call sends the message.
         let _frame = m.next_frame_to_send(t0);
@@ -538,10 +564,22 @@ mod tests {
     }
 
     #[test]
+    fn regressing_clock_does_not_retry_or_panic() {
+        let earlier = Instant::now();
+        let t0 = earlier + Duration::from_secs(1);
+        let mut messenger = test_messenger();
+        let _id = queue_test_message(&mut messenger, "W1AW", "Test", t0);
+
+        assert!(messenger.next_frame_to_send(t0).is_some());
+        assert!(messenger.next_frame_to_send(earlier).is_none());
+        assert!(messenger.peek_frame_to_send(earlier).is_none());
+    }
+
+    #[test]
     fn process_incoming_ack_removes_pending() {
         let t0 = Instant::now();
         let mut m = test_messenger();
-        let id = m.send_message("W1AW", "Hello", t0);
+        let id = queue_test_message(&mut m, "W1AW", "Hello", t0);
         assert_eq!(m.pending_count(), 1);
 
         let ack = AprsMessage {
@@ -563,7 +601,7 @@ mod tests {
     fn process_incoming_ack_from_a_third_party_does_not_clear_pending() {
         let t0 = Instant::now();
         let mut m = test_messenger();
-        let id = m.send_message("W1AW", "Hello", t0);
+        let id = queue_test_message(&mut m, "W1AW", "Hello", t0);
         assert_eq!(m.pending_count(), 1);
 
         // K9XYZ was never the addressee, so its ack must be ignored.
@@ -603,13 +641,13 @@ mod tests {
     fn process_incoming_reply_ack_from_a_third_party_does_not_clear_pending() {
         let t0 = Instant::now();
         let mut m = test_messenger();
-        let id = m.send_message("W1AW", "Hello", t0);
+        let id = queue_test_message(&mut m, "W1AW", "Hello", t0);
 
         let spoofed = AprsMessage {
             addressee: "N0CALL".to_owned(),
             text: "hi".to_owned(),
             message_id: Some("07".to_owned()),
-            reply_ack: Some(id.clone()),
+            reply_ack: Some(id.to_string()),
         };
         assert!(
             !m.process_incoming("K9XYZ", &spoofed),
@@ -621,7 +659,7 @@ mod tests {
             addressee: "N0CALL".to_owned(),
             text: "hi".to_owned(),
             message_id: Some("08".to_owned()),
-            reply_ack: Some(id),
+            reply_ack: Some(id.to_string()),
         };
         assert!(m.process_incoming("W1AW", &genuine));
         assert_eq!(m.pending_count(), 0);
@@ -631,7 +669,7 @@ mod tests {
     fn process_incoming_rej_removes_pending() {
         let t0 = Instant::now();
         let mut m = test_messenger();
-        let id = m.send_message("W1AW", "Hello", t0);
+        let id = queue_test_message(&mut m, "W1AW", "Hello", t0);
 
         let rej = AprsMessage {
             addressee: "N0CALL".to_owned(),
@@ -647,7 +685,7 @@ mod tests {
     fn process_incoming_unrelated_message_returns_false() {
         let t0 = Instant::now();
         let mut m = test_messenger();
-        let _id = m.send_message("W1AW", "Hello", t0);
+        let _id = queue_test_message(&mut m, "W1AW", "Hello", t0);
 
         let unrelated = AprsMessage {
             addressee: "N0CALL".to_owned(),
@@ -662,11 +700,11 @@ mod tests {
     #[test]
     fn build_ack_produces_valid_frame() -> TestResult {
         let m = test_messenger();
-        let wire = m.build_ack("W1AW", "42");
+        let wire = m.build_ack(&test_addressee("W1AW"), &test_message_id("42"));
 
         let kiss = decode_kiss_frame(&wire)?;
         let packet = parse_ax25(&kiss.data)?;
-        let msg = parse_msg(&packet.info)?;
+        let msg = parse_msg(packet.information())?;
         assert_eq!(msg.addressee, "W1AW");
         assert_eq!(msg.text, "ack42");
         Ok(())
@@ -675,11 +713,11 @@ mod tests {
     #[test]
     fn build_rej_produces_valid_frame() -> TestResult {
         let m = test_messenger();
-        let wire = m.build_rej("W1AW", "42");
+        let wire = m.build_rej(&test_addressee("W1AW"), &test_message_id("42"));
 
         let kiss = decode_kiss_frame(&wire)?;
         let packet = parse_ax25(&kiss.data)?;
-        let msg = parse_msg(&packet.info)?;
+        let msg = parse_msg(packet.information())?;
         assert_eq!(msg.addressee, "W1AW");
         assert_eq!(msg.text, "rej42");
         Ok(())
@@ -689,7 +727,7 @@ mod tests {
     fn cleanup_expired_removes_maxed_messages() {
         let t0 = Instant::now();
         let mut m = test_messenger();
-        let id = m.send_message("W1AW", "Test", t0);
+        let id = queue_test_message(&mut m, "W1AW", "Test", t0);
 
         // Exhaust all retries by advancing time past the retry interval
         // each round. Sans-io: we mint the timestamps; no real waiting.
@@ -706,20 +744,20 @@ mod tests {
     }
 
     #[test]
-    fn send_message_checked_rejects_too_long_text() {
-        let t0 = Instant::now();
-        let mut m = test_messenger();
+    fn oversized_message_text_is_rejected_before_queueing() {
+        let m = test_messenger();
         let long = "x".repeat(100);
-        assert!(m.send_message_checked("W1AW", &long, t0).is_err());
+        assert!(MessageText::new(&long).is_err());
         assert_eq!(m.pending_count(), 0);
     }
 
     #[test]
-    fn send_message_checked_accepts_boundary_length() {
+    fn send_message_accepts_boundary_length() {
         let t0 = Instant::now();
         let mut m = test_messenger();
         let text = "x".repeat(67);
-        assert!(m.send_message_checked("W1AW", &text, t0).is_ok());
+        let _id = queue_test_message(&mut m, "W1AW", &text, t0);
+        assert_eq!(m.pending_count(), 1);
     }
 
     #[test]
@@ -769,10 +807,31 @@ mod tests {
     }
 
     #[test]
+    fn regressing_clock_preserves_incoming_dedup_entry() -> TestResult {
+        let earlier = Instant::now();
+        let t0 = earlier + Duration::from_secs(1);
+        let mut messenger = test_messenger();
+        let message = parse_msg(b":N0CALL   :hello{42")?;
+
+        messenger.mark_incoming_seen("W1AW", &message, t0);
+        assert!(messenger.is_duplicate_incoming("W1AW", &message, earlier));
+
+        messenger.mark_incoming_seen("W1AW", &message, earlier);
+        let inside_window_offset = INCOMING_DEDUP_WINDOW
+            .checked_sub(Duration::from_secs(1))
+            .ok_or("incoming dedup window must exceed one second")?;
+        let still_inside_original_window = t0
+            .checked_add(inside_window_offset)
+            .ok_or("test instant must support the dedup-window offset")?;
+        assert!(messenger.is_duplicate_incoming("W1AW", &message, still_inside_original_window,));
+        Ok(())
+    }
+
+    #[test]
     fn process_incoming_ignores_false_positive_message() {
         let t0 = Instant::now();
         let mut m = test_messenger();
-        let _id = m.send_message("W1AW", "Hello", t0);
+        let _id = queue_test_message(&mut m, "W1AW", "Hello", t0);
 
         // Regression: this used to be treated as an ack for msg "nowle".
         let false_ack = AprsMessage {
@@ -790,8 +849,8 @@ mod tests {
         let t0 = Instant::now();
         let mut m = test_messenger();
         // Pending outbound message "1".
-        let id = m.send_message("W1AW", "ping", t0);
-        assert_eq!(id, "1");
+        let id = queue_test_message(&mut m, "W1AW", "ping", t0);
+        assert_eq!(id.as_str(), "1");
         assert_eq!(m.pending_count(), 1);
 
         // Incoming ":N0CALL   :hi{05}1", a *new* inbound message id "05"
@@ -801,7 +860,7 @@ mod tests {
             addressee: "N0CALL".to_owned(),
             text: "hi".to_owned(),
             message_id: Some("05".to_owned()),
-            reply_ack: Some(id),
+            reply_ack: Some(id.to_string()),
         };
         assert!(
             m.process_incoming("W1AW", &reply_ack),
@@ -814,7 +873,7 @@ mod tests {
     fn process_incoming_reply_ack_message_is_still_new_incoming() {
         let t0 = Instant::now();
         let mut m = test_messenger();
-        let id = m.send_message("W1AW", "ping", t0);
+        let id = queue_test_message(&mut m, "W1AW", "ping", t0);
 
         // A reply-ack message acks our outbound AND is a fresh inbound
         // message in its own right, so is_new_incoming must still surface it.
@@ -822,7 +881,7 @@ mod tests {
             addressee: "N0CALL".to_owned(),
             text: "hi".to_owned(),
             message_id: Some("05".to_owned()),
-            reply_ack: Some(id),
+            reply_ack: Some(id.to_string()),
         };
         assert!(
             m.is_new_incoming("W1AW", &reply_ack, t0),
@@ -838,7 +897,7 @@ mod tests {
     fn process_incoming_reply_ack_no_match_does_not_panic() {
         let t0 = Instant::now();
         let mut m = test_messenger();
-        let _id = m.send_message("W1AW", "ping", t0); // pending "1"
+        let _id = queue_test_message(&mut m, "W1AW", "ping", t0); // pending "1"
 
         // Reply-ack "99" matches no pending message: must not panic, must
         // not clear anything, and the message is still a new incoming.
@@ -867,7 +926,7 @@ mod tests {
         // send must still wait a full retry_interval.
         let t0 = Instant::now();
         let mut m = test_messenger();
-        let _id = m.send_message("W1AW", "ping", t0);
+        let _id = queue_test_message(&mut m, "W1AW", "ping", t0);
 
         // First frame: emitted immediately at t0.
         let first = m.next_frame_to_send(t0);
@@ -902,11 +961,11 @@ mod tests {
     fn message_id_wraps_around_skipping_zero() {
         let t0 = Instant::now();
         let mut m = test_messenger();
-        m.next_message_id = u16::MAX;
-        let id1 = m.send_message("W1AW", "A", t0);
-        assert_eq!(id1, u16::MAX.to_string());
+        m.next_message_id = NonZeroU16::MAX;
+        let id1 = queue_test_message(&mut m, "W1AW", "A", t0);
+        assert_eq!(id1.as_str(), u16::MAX.to_string());
         // After wrapping, 0 is skipped, so next is 1.
-        let id2 = m.send_message("W1AW", "B", t0);
-        assert_eq!(id2, "1");
+        let id2 = queue_test_message(&mut m, "W1AW", "B", t0);
+        assert_eq!(id2.as_str(), "1");
     }
 }

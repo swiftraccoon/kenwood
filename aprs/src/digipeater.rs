@@ -26,10 +26,12 @@ use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::{Duration, Instant};
 
-use ax25_codec::{Ax25Address, Ax25Packet, MAX_DIGIPEATERS, RouteEntry, Ssid};
+use ax25_codec::{
+    Ax25Address, Ax25Packet, Ax25Pid, Callsign, DigipeaterPath, MAX_DIGIPEATERS, RouteEntry, Ssid,
+};
 
 #[cfg(test)]
-use ax25_codec::CommandResponse;
+use ax25_codec::{Ax25Control, CommandResponse};
 
 use crate::error::AprsError;
 
@@ -52,34 +54,56 @@ pub const DEFAULT_VISCOUS_DELAY: Duration = Duration::from_secs(0);
 ///
 /// APRS digipeater configurations use named aliases (`WIDE1`, `CA`,
 /// `TRACE`, etc.) to identify which path entries should be relayed.
-/// This newtype wraps the alias string with ergonomic equality checks
-/// and validation (ASCII, uppercase, non-empty).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct DigipeaterAlias(String);
+/// This newtype uses the AX.25 callsign character and width rules while
+/// distinguishing a New-N alias base from an exact [`Ax25Address`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DigipeaterAlias(Callsign);
 
 impl DigipeaterAlias {
-    /// Create a new alias, rejecting empty or non-ASCII input.
+    /// Maximum alias-base length, leaving one AX.25 callsign byte for the
+    /// New-N requested-hop digit.
+    pub const MAX_LEN: usize = Callsign::MAX_LEN - 1;
+
+    /// Create a new alias base using AX.25 callsign rules.
+    ///
+    /// Input is accepted case-insensitively and normalized to uppercase.
     ///
     /// # Errors
     ///
-    /// Returns [`AprsError::InvalidDigipeaterAlias`] on invalid input.
+    /// Returns [`AprsError::InvalidDigipeaterAlias`] if the base is empty,
+    /// longer than five bytes, or contains anything other than ASCII letters
+    /// and digits. Five bytes is the maximum because a New-N path callsign
+    /// appends one requested-hop digit within AX.25's six-byte field.
     pub fn new(s: &str) -> Result<Self, AprsError> {
-        if s.is_empty() || !s.is_ascii() {
-            return Err(AprsError::InvalidDigipeaterAlias("must be non-empty ASCII"));
+        let callsign = Callsign::new_case_insensitive(s).map_err(|_| {
+            AprsError::InvalidDigipeaterAlias(
+                "must be 1-5 ASCII letters or digits without an SSID suffix",
+            )
+        })?;
+        if callsign.len() > Self::MAX_LEN {
+            return Err(AprsError::InvalidDigipeaterAlias(
+                "must leave room for the New-N hop digit (maximum 5 bytes)",
+            ));
         }
-        Ok(Self(s.to_ascii_uppercase()))
+        Ok(Self(callsign))
     }
 
     /// Return the alias as a string slice.
     #[must_use]
     pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    /// Return the validated AX.25 callsign component used as the alias base.
+    #[must_use]
+    pub const fn as_callsign(&self) -> &Callsign {
         &self.0
     }
 }
 
 impl std::fmt::Display for DigipeaterAlias {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        self.0.fmt(f)
     }
 }
 
@@ -95,19 +119,19 @@ impl std::fmt::Display for DigipeaterAlias {
 #[derive(Debug, Clone)]
 pub struct DigipeaterConfig {
     /// Our callsign (used for `UIdigipeat` and `UItrace` path insertion).
-    pub callsign: Ax25Address,
-    /// `UIdigipeat` aliases (e.g., `["WIDE1-1"]`). Relay if path contains
-    /// this alias, replace with our callsign + completion flag.
-    pub uidigipeat_aliases: Vec<String>,
+    callsign: Ax25Address,
+    /// Exact `UIdigipeat` addresses (e.g., `WIDE1-1`). Relay if the path
+    /// contains one, then replace it with our callsign + completion flag.
+    uidigipeat_aliases: Vec<Ax25Address>,
     /// `UIflood` alias base (e.g., `"CA"`). Relay and decrement hop count.
     /// The SSID encodes the remaining hop count.
-    pub uiflood_alias: Option<String>,
+    uiflood_alias: Option<DigipeaterAlias>,
     /// `UItrace` alias base (e.g., `"WIDE"`). Relay, decrement hop count,
     /// and insert our callsign in the path.
-    pub uitrace_alias: Option<String>,
+    uitrace_alias: Option<DigipeaterAlias>,
     /// How long a recently-seen packet is remembered in the dedup cache.
-    /// Defaults to [`DEFAULT_DEDUP_TTL`] (30 s).
-    pub dedup_ttl: Duration,
+    /// Defaults to [`DEFAULT_DEDUP_TTL`] (30 s). Zero disables deduplication.
+    dedup_ttl: Duration,
     /// Viscous delay: how long to hold a relay candidate before
     /// actually transmitting it. `0` disables the feature (default).
     ///
@@ -117,7 +141,7 @@ pub struct DigipeaterConfig {
     /// cancels its own pending relay. This lets a fill-in digi stay
     /// quiet in well-covered areas while still providing coverage in
     /// RF gaps.
-    pub viscous_delay: Duration,
+    viscous_delay: Duration,
     /// Rolling cache of recently-relayed packet hashes, mapping each hash to
     /// the time it was last relayed. Populated on successful relay. Duplicate
     /// detection reads the stored timestamp directly (an entry counts as a
@@ -137,13 +161,13 @@ pub struct DigipeaterConfig {
 }
 
 impl DigipeaterConfig {
-    /// Build a new config with an empty dedup cache and the default TTL.
+    /// Build a new config with empty runtime caches and default timing.
     #[must_use]
     pub fn new(
         callsign: Ax25Address,
-        uidigipeat_aliases: Vec<String>,
-        uiflood_alias: Option<String>,
-        uitrace_alias: Option<String>,
+        uidigipeat_aliases: Vec<Ax25Address>,
+        uiflood_alias: Option<DigipeaterAlias>,
+        uitrace_alias: Option<DigipeaterAlias>,
     ) -> Self {
         Self {
             callsign,
@@ -156,6 +180,86 @@ impl DigipeaterConfig {
             last_prune: None,
             pending_viscous: HashMap::new(),
         }
+    }
+
+    /// Return this station's digipeater address.
+    #[must_use]
+    pub const fn callsign(&self) -> &Ax25Address {
+        &self.callsign
+    }
+
+    /// Replace this station's digipeater address.
+    pub fn set_callsign(&mut self, callsign: Ax25Address) {
+        self.callsign = callsign;
+    }
+
+    /// Return the exact addresses handled by `UIdigipeat`.
+    #[must_use]
+    pub fn uidigipeat_aliases(&self) -> &[Ax25Address] {
+        &self.uidigipeat_aliases
+    }
+
+    /// Replace the exact addresses handled by `UIdigipeat`.
+    pub fn set_uidigipeat_aliases(&mut self, aliases: Vec<Ax25Address>) {
+        self.uidigipeat_aliases = aliases;
+    }
+
+    /// Return the `UIflood` New-N alias base, if configured.
+    #[must_use]
+    pub const fn uiflood_alias(&self) -> Option<&DigipeaterAlias> {
+        self.uiflood_alias.as_ref()
+    }
+
+    /// Replace or disable the `UIflood` New-N alias base.
+    pub fn set_uiflood_alias(&mut self, alias: Option<DigipeaterAlias>) {
+        self.uiflood_alias = alias;
+    }
+
+    /// Return the `UItrace` New-N alias base, if configured.
+    #[must_use]
+    pub const fn uitrace_alias(&self) -> Option<&DigipeaterAlias> {
+        self.uitrace_alias.as_ref()
+    }
+
+    /// Replace or disable the `UItrace` New-N alias base.
+    pub fn set_uitrace_alias(&mut self, alias: Option<DigipeaterAlias>) {
+        self.uitrace_alias = alias;
+    }
+
+    /// Return the rolling deduplication window.
+    ///
+    /// Zero means deduplication is disabled.
+    #[must_use]
+    pub const fn dedup_ttl(&self) -> Duration {
+        self.dedup_ttl
+    }
+
+    /// Set the rolling deduplication window.
+    ///
+    /// Zero is valid and disables deduplication. Switching to zero clears
+    /// existing dedup state immediately.
+    pub fn set_dedup_ttl(&mut self, dedup_ttl: Duration) {
+        self.dedup_ttl = dedup_ttl;
+        self.last_prune = None;
+        if dedup_ttl.is_zero() {
+            self.dedup_cache.clear();
+        }
+    }
+
+    /// Return the viscous relay delay.
+    ///
+    /// Zero means relay candidates are returned immediately.
+    #[must_use]
+    pub const fn viscous_delay(&self) -> Duration {
+        self.viscous_delay
+    }
+
+    /// Set the viscous relay delay.
+    ///
+    /// Zero disables deferral. Already-pending candidates become eligible
+    /// on the next non-regressing [`Self::drain_ready_viscous`] call.
+    pub const fn set_viscous_delay(&mut self, viscous_delay: Duration) {
+        self.viscous_delay = viscous_delay;
     }
 
     /// Drain any pending viscous relays whose delay window has elapsed.
@@ -171,11 +275,16 @@ impl DigipeaterConfig {
         let mut ready = Vec::new();
         let mut remaining = HashMap::new();
         for (k, (t, p)) in self.pending_viscous.drain() {
-            if now.duration_since(t) >= delay {
+            if now
+                .checked_duration_since(t)
+                .is_some_and(|elapsed| elapsed >= delay)
+            {
                 ready.push(p);
                 // Record this relay in the dedup cache to prevent
                 // re-relaying if the packet comes around again.
-                let _prev = self.dedup_cache.insert(k, now);
+                if !self.dedup_ttl.is_zero() {
+                    let _prev = self.dedup_cache.insert(k, now);
+                }
             } else {
                 let _prev = remaining.insert(k, (t, p));
             }
@@ -243,7 +352,7 @@ impl DigipeaterConfig {
         // Typed classification instead of a raw `!= 0x03` compare: UI
         // frames may legally carry the P/F bit (control 0x13), and
         // `is_ui()` masks it off before matching.
-        if !packet.is_ui() || packet.protocol != 0xF0 {
+        if !packet.is_ui() || packet.protocol_identifier() != Some(Ax25Pid::NoLayer3) {
             return DigiAction::NotUiFrame;
         }
 
@@ -260,11 +369,10 @@ impl DigipeaterConfig {
         // TTL; a stale entry that has not yet been reclaimed is ignored.
         self.prune_dedup(now);
         let packet_hash = hash_packet_identity(packet);
-        if self
-            .dedup_cache
-            .get(&packet_hash)
-            .is_some_and(|&t| now.duration_since(t) < self.dedup_ttl)
-        {
+        if self.dedup_cache.get(&packet_hash).is_some_and(|&t| {
+            now.checked_duration_since(t)
+                .is_none_or(|elapsed| elapsed < self.dedup_ttl)
+        }) {
             return DigiAction::Duplicate;
         }
 
@@ -272,10 +380,10 @@ impl DigipeaterConfig {
         // If we have a pending viscous relay for this packet and the
         // packet arrives again, it means someone else relayed it. Drop
         // the pending entry and suppress our own relay.
-        if self.viscous_delay > Duration::from_secs(0)
-            && self.pending_viscous.remove(&packet_hash).is_some()
-        {
-            let _prev = self.dedup_cache.insert(packet_hash, now);
+        if !self.viscous_delay.is_zero() && self.pending_viscous.remove(&packet_hash).is_some() {
+            if !self.dedup_ttl.is_zero() {
+                let _prev = self.dedup_cache.insert(packet_hash, now);
+            }
             return DigiAction::Duplicate;
         }
 
@@ -295,38 +403,35 @@ impl DigipeaterConfig {
         // `UIflood`/`UItrace` use New-N-Paradigm matching (callsign is the
         // base plus a baked-in `n` digit, with N remaining hops in the SSID);
         // see `matches_new_n_alias` for the on-wire encoding. `UIdigipeat`
-        // matches a verbatim `CALL`/`CALL-SSID` alias token. None of these
+        // matches a validated full address exactly. None of these checks
         // allocate per packet.
         let callsign = digi.address.callsign.as_str();
         let hops_remaining = digi.address.ssid.get() > 0;
-        let action = if self
-            .uidigipeat_aliases
-            .iter()
-            .any(|a| uidigipeat_alias_matches(&digi.address, a))
-        {
-            apply_uidigipeat(&self.callsign, packet, first_unused)
-        } else if self
-            .uiflood_alias
-            .as_deref()
-            .is_some_and(|a| hops_remaining && matches_new_n_alias(callsign, a))
-        {
-            apply_uiflood(packet, first_unused)
-        } else if self
-            .uitrace_alias
-            .as_deref()
-            .is_some_and(|a| hops_remaining && matches_new_n_alias(callsign, a))
-        {
-            apply_uitrace(&self.callsign, packet, first_unused)
-        } else {
-            DigiAction::Drop
-        };
+        let action =
+            if self
+                .uidigipeat_aliases
+                .iter()
+                .any(|alias| &digi.address == alias)
+            {
+                apply_uidigipeat(&self.callsign, packet, first_unused)
+            } else if self.uiflood_alias.as_ref().is_some_and(|alias| {
+                hops_remaining && matches_new_n_alias(callsign, alias.as_str())
+            }) {
+                apply_uiflood(packet, first_unused)
+            } else if self.uitrace_alias.as_ref().is_some_and(|alias| {
+                hops_remaining && matches_new_n_alias(callsign, alias.as_str())
+            }) {
+                apply_uitrace(&self.callsign, packet, first_unused)
+            } else {
+                DigiAction::Drop
+            };
 
         // --- 5. Record successful relay in dedup cache ---
         if let DigiAction::Relay {
             ref modified_packet,
         } = action
         {
-            if self.viscous_delay > Duration::from_secs(0) {
+            if !self.viscous_delay.is_zero() {
                 // Defer the relay: hold it in the viscous queue. The
                 // dedup cache is only populated once we actually
                 // transmit (in `drain_ready_viscous`).
@@ -335,7 +440,9 @@ impl DigipeaterConfig {
                     .insert(packet_hash, (now, modified_packet.clone()));
                 return DigiAction::Drop;
             }
-            let _previous = self.dedup_cache.insert(packet_hash, now);
+            if !self.dedup_ttl.is_zero() {
+                let _previous = self.dedup_cache.insert(packet_hash, now);
+            }
         }
 
         action
@@ -363,7 +470,10 @@ impl DigipeaterConfig {
         if !due {
             return;
         }
-        self.dedup_cache.retain(|_, t| now.duration_since(*t) < ttl);
+        self.dedup_cache.retain(|_, t| {
+            now.checked_duration_since(*t)
+                .is_none_or(|elapsed| elapsed < ttl)
+        });
         self.last_prune = Some(now);
     }
 
@@ -376,23 +486,25 @@ impl DigipeaterConfig {
 
 /// Hash a packet's identity tuple `(source, destination, info)` for dedup.
 ///
-/// Uses `DefaultHasher` which is SipHash-1-3 in std. The hash is only used
-/// locally within one process lifetime for dedup, so randomized seeding is
-/// fine (actually preferred, as it makes the cache unpredictable).
+/// Uses [`DefaultHasher`] as an in-process cache-key compressor. A hasher
+/// created directly with [`DefaultHasher::new`] is deterministically
+/// initialized, not randomly seeded; its algorithm and output are not a
+/// stable persistence or interchange format. These hashes are never exposed
+/// or stored beyond the current process.
 fn hash_packet_identity(packet: &Ax25Packet) -> u64 {
     let mut h = DefaultHasher::new();
     packet.source.callsign.as_str().hash(&mut h);
     packet.source.ssid.get().hash(&mut h);
     packet.destination.callsign.as_str().hash(&mut h);
     packet.destination.ssid.get().hash(&mut h);
-    packet.info.hash(&mut h);
+    packet.information().hash(&mut h);
     h.finish()
 }
 
 /// Check whether our callsign appears in the digipeater path with the
 /// has-been-repeated bit set. If so, the packet has already passed through
 /// this station and relaying it again would create a routing loop.
-fn own_callsign_already_relayed(own: &Ax25Address, path: &[RouteEntry]) -> bool {
+fn own_callsign_already_relayed(own: &Ax25Address, path: &DigipeaterPath) -> bool {
     path.iter().any(|d| {
         d.has_repeated
             && d.address
@@ -428,18 +540,14 @@ fn apply_uiflood(packet: &Ax25Packet, idx: usize) -> DigiAction {
     let Some(digi) = packet.digipeaters.get(idx) else {
         return DigiAction::Drop;
     };
-    let new_ssid_raw = digi.address.ssid.get().saturating_sub(1);
-    // SSID is already validated 0-15, and new_ssid_raw is strictly
-    // smaller, so `new(...)` cannot fail. Fall back to zero if the
-    // codec's validator ever disagrees.
-    let new_ssid = Ssid::new(new_ssid_raw).unwrap_or(Ssid::ZERO);
+    let new_ssid = digi.address.ssid.saturating_decrement();
     let callsign = digi.address.callsign.clone();
 
     let mut modified = packet.clone();
     let Some(slot) = modified.digipeaters.get_mut(idx) else {
         return DigiAction::Drop;
     };
-    if new_ssid_raw == 0 {
+    if new_ssid == Ssid::ZERO {
         *slot = RouteEntry {
             address: Ax25Address::from_parts(callsign, Ssid::ZERO),
             has_repeated: true,
@@ -466,32 +574,37 @@ fn apply_uitrace(callsign: &Ax25Address, packet: &Ax25Packet, idx: usize) -> Dig
     }
 
     // Snapshot the alias digipeater's callsign + current hop count;
-    // after `modified.digipeaters.insert` the indices shift and we can
+    // after `modified.digipeaters.try_insert` the indices shift and we can
     // no longer borrow from the original slice without re-indexing.
     let Some(source_digi) = packet.digipeaters.get(idx) else {
         return DigiAction::Drop;
     };
     let alias_callsign = source_digi.address.callsign.clone();
-    let new_ssid_raw = source_digi.address.ssid.get().saturating_sub(1);
-    let new_ssid = Ssid::new(new_ssid_raw).unwrap_or(Ssid::ZERO);
+    let new_ssid = source_digi.address.ssid.saturating_decrement();
 
     let mut modified = packet.clone();
 
     // Insert our callsign (marked as used) before the current entry.
-    modified.digipeaters.insert(
-        idx,
-        RouteEntry {
-            address: callsign.clone(),
-            has_repeated: true,
-        },
-    );
+    if modified
+        .digipeaters
+        .try_insert(
+            idx,
+            RouteEntry {
+                address: callsign.clone(),
+                has_repeated: true,
+            },
+        )
+        .is_err()
+    {
+        return DigiAction::Drop;
+    }
 
     // The original entry shifted to idx+1; update its hop count.
     let trace_idx = idx + 1;
     let Some(slot) = modified.digipeaters.get_mut(trace_idx) else {
         return DigiAction::Drop;
     };
-    if new_ssid_raw == 0 {
+    if new_ssid == Ssid::ZERO {
         *slot = RouteEntry {
             address: Ax25Address::from_parts(alias_callsign, Ssid::ZERO),
             has_repeated: true,
@@ -565,35 +678,6 @@ fn strip_prefix_ignore_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a st
     }
 }
 
-/// Compare a digipeater address against a full `UIdigipeat` alias string
-/// (e.g. `"WIDE1-1"`, `"RELAY"`) without allocating.
-///
-/// `UIdigipeat` aliases are matched as complete `CALL` or `CALL-SSID` tokens
-/// (no New-N digit synthesis; the alias is taken verbatim). The comparison
-/// is ASCII-case-insensitive and mirrors the `Ax25Address` `Display` form
-/// (`CALL` when the SSID is zero, otherwise `CALL-SSID`) so it stays
-/// behaviourally identical to the previous `format!`-based check.
-fn uidigipeat_alias_matches(addr: &Ax25Address, alias: &str) -> bool {
-    let (alias_call, alias_ssid) = alias
-        .split_once('-')
-        .map_or((alias, None), |(c, s)| (c, Some(s)));
-    if !addr.callsign.as_str().eq_ignore_ascii_case(alias_call) {
-        return false;
-    }
-    // Resolve the alias to a single expected SSID and compare:
-    // - `WIDE1-1` form: the suffix must parse to the address SSID.
-    // - bare `RELAY` form (no `-SSID`): `Display` omits the SSID only when it
-    //   is zero, so the address must carry SSID 0 to match.
-    let expected_ssid = match alias_ssid {
-        Some(s) => match s.parse::<u8>() {
-            Ok(n) => n,
-            Err(_) => return false,
-        },
-        None => 0,
-    };
-    addr.ssid.get() == expected_ssid
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -621,24 +705,34 @@ mod tests {
         entry
     }
 
+    fn make_alias(base: &str) -> DigipeaterAlias {
+        DigipeaterAlias::new(base)
+            .unwrap_or_else(|_| unreachable!("test fixture alias base is statically valid"))
+    }
+
     fn make_packet(digipeaters: Vec<RouteEntry>) -> Ax25Packet {
-        Ax25Packet {
-            source: make_addr("N0CALL", 7),
-            destination: make_addr("APK005", 0),
-            digipeaters,
-            command_or_response: Some(CommandResponse::Command),
-            control: 0x03,
-            protocol: 0xF0,
-            info: b"!3518.00N/08414.00W-test".to_vec(),
-        }
+        make_packet_with_poll_final(digipeaters, false)
+    }
+
+    fn make_packet_with_poll_final(digipeaters: Vec<RouteEntry>, poll_final: bool) -> Ax25Packet {
+        Ax25Packet::unnumbered_information(
+            make_addr("N0CALL", 7),
+            make_addr("APK005", 0),
+            DigipeaterPath::new(digipeaters)
+                .unwrap_or_else(|_| unreachable!("test fixtures use at most eight digipeaters")),
+            CommandResponse::Command,
+            poll_final,
+            Ax25Pid::NoLayer3,
+            b"!3518.00N/08414.00W-test".to_vec(),
+        )
     }
 
     fn make_config() -> DigipeaterConfig {
         DigipeaterConfig::new(
             make_addr("MYDIGI", 0),
-            vec!["WIDE1-1".to_owned()],
-            Some("CA".to_owned()),
-            Some("WIDE".to_owned()),
+            vec![make_addr("WIDE1", 1)],
+            Some(make_alias("CA")),
+            Some(make_alias("WIDE")),
         )
     }
 
@@ -704,6 +798,19 @@ mod tests {
     }
 
     #[test]
+    fn uidigipeat_requires_an_exact_address_match() {
+        let mut config = DigipeaterConfig::new(
+            make_addr("MYDIGI", 0),
+            vec![make_addr("WIDE1", 1)],
+            None,
+            None,
+        );
+        let packet = make_packet(vec![make_digi("WIDE1", 2)]);
+
+        assert_eq!(config.process(&packet, Instant::now()), DigiAction::Drop);
+    }
+
+    #[test]
     fn uidigipeat_all_used_drops() {
         let mut config = make_config();
         let packet = make_packet(vec![make_digi("WIDE1*", 1)]);
@@ -747,15 +854,15 @@ mod tests {
         digipeaters: Vec<RouteEntry>,
         info: &[u8],
     ) -> Result<Ax25Packet, Box<dyn std::error::Error>> {
-        let packet = Ax25Packet {
-            source: make_addr("N0CALL", 7),
-            destination: make_addr("APK005", 0),
-            digipeaters,
-            command_or_response: Some(CommandResponse::Command),
-            control: 0x03,
-            protocol: 0xF0,
-            info: info.to_vec(),
-        };
+        let packet = Ax25Packet::unnumbered_information(
+            make_addr("N0CALL", 7),
+            make_addr("APK005", 0),
+            DigipeaterPath::new(digipeaters)?,
+            CommandResponse::Command,
+            false,
+            Ax25Pid::NoLayer3,
+            info.to_vec(),
+        );
         let bytes = ax25_codec::build_ax25(&packet);
         let parsed = ax25_codec::parse_ax25(&bytes)?;
         assert_eq!(parsed, packet, "codec round-trip must be lossless");
@@ -817,7 +924,7 @@ mod tests {
             make_addr("MYDIGI", 0),
             vec![],
             None,
-            Some("WIDE".to_owned()),
+            Some(make_alias("WIDE")),
         );
         let packet = parsed_packet(vec![make_digi("WIDE7", 1)], b"!widen last")?;
         let t0 = Instant::now();
@@ -928,8 +1035,8 @@ mod tests {
         let mut config = DigipeaterConfig::new(
             make_addr("MYDIGI", 0),
             vec![],
-            Some("CA".to_owned()),   // flood base CA
-            Some("GATE".to_owned()), // trace base GATE
+            Some(make_alias("CA")),   // flood base CA
+            Some(make_alias("GATE")), // trace base GATE
         );
         let packet = make_packet(vec![make_digi("WIDE2", 2)]);
         let t0 = Instant::now();
@@ -1041,8 +1148,17 @@ mod tests {
     #[test]
     fn non_ui_frame_yields_not_ui_frame() {
         let mut config = make_config();
-        let mut packet = make_packet(vec![make_digi("WIDE1", 1)]);
-        packet.control = 0x01; // Not a UI frame.
+        let ui = make_packet(vec![make_digi("WIDE1", 1)]);
+        let packet = Ax25Packet::try_new(
+            ui.source,
+            ui.destination,
+            ui.digipeaters,
+            ui.command_or_response,
+            Ax25Control::from_byte(0x01),
+            None,
+            Vec::new(),
+        )
+        .unwrap_or_else(|_| unreachable!("RR without PID or information is valid"));
         let t0 = Instant::now();
 
         assert_eq!(config.process(&packet, t0), DigiAction::NotUiFrame);
@@ -1062,8 +1178,7 @@ mod tests {
         let plain_action = plain_config.process(&plain, t0);
 
         let mut pf_config = make_config();
-        let mut pf = make_packet(vec![make_digi("WIDE1", 1)]);
-        pf.control = 0x13; // UI with the P/F bit set.
+        let pf = make_packet_with_poll_final(vec![make_digi("WIDE1", 1)], true);
         let pf_action = pf_config.process(&pf, t0);
 
         let DigiAction::Relay {
@@ -1081,7 +1196,7 @@ mod tests {
         // Identical path modification; the frame keeps its own control
         // byte on retransmission.
         assert_eq!(pf_relay.digipeaters, plain_relay.digipeaters);
-        assert_eq!(pf_relay.control, 0x13);
+        assert_eq!(pf_relay.control_byte(), 0x13);
         Ok(())
     }
 
@@ -1095,10 +1210,44 @@ mod tests {
     }
 
     #[test]
+    fn config_accessors_and_setters_preserve_typed_values() {
+        let mut config = make_config();
+        assert_eq!(config.callsign(), &make_addr("MYDIGI", 0));
+        assert_eq!(config.uidigipeat_aliases(), &[make_addr("WIDE1", 1)]);
+        assert_eq!(
+            config.uiflood_alias().map(DigipeaterAlias::as_str),
+            Some("CA")
+        );
+        assert_eq!(
+            config.uitrace_alias().map(DigipeaterAlias::as_str),
+            Some("WIDE")
+        );
+        assert_eq!(config.dedup_ttl(), DEFAULT_DEDUP_TTL);
+        assert_eq!(config.viscous_delay(), DEFAULT_VISCOUS_DELAY);
+
+        config.set_callsign(make_addr("NEW", 1));
+        config.set_uidigipeat_aliases(vec![make_addr("RELAY", 0)]);
+        config.set_uiflood_alias(None);
+        config.set_uitrace_alias(Some(make_alias("TRACE")));
+        config.set_dedup_ttl(Duration::from_secs(12));
+        config.set_viscous_delay(Duration::from_secs(3));
+
+        assert_eq!(config.callsign(), &make_addr("NEW", 1));
+        assert_eq!(config.uidigipeat_aliases(), &[make_addr("RELAY", 0)]);
+        assert!(config.uiflood_alias().is_none());
+        assert_eq!(
+            config.uitrace_alias().map(DigipeaterAlias::as_str),
+            Some("TRACE")
+        );
+        assert_eq!(config.dedup_ttl(), Duration::from_secs(12));
+        assert_eq!(config.viscous_delay(), Duration::from_secs(3));
+    }
+
+    #[test]
     fn case_insensitive_alias_match() -> TestResult {
         let mut config = DigipeaterConfig::new(
             make_addr("MYDIGI", 0),
-            vec!["wide1-1".to_owned()],
+            vec![make_addr("wide1", 1)],
             None,
             None,
         );
@@ -1118,15 +1267,18 @@ mod tests {
         let mut config = DigipeaterConfig::new(
             make_addr("MYDIGI", 0),
             vec![],
-            Some("CA".to_owned()),
-            Some("WIDE".to_owned()),
+            Some(make_alias("CA")),
+            Some(make_alias("WIDE")),
         );
 
         let t0 = Instant::now();
 
         // UIflood packet (distinct info so dedup doesn't fire between cases).
         let mut flood_pkt = make_packet(vec![make_digi("CA", 2)]);
-        flood_pkt.info = b"!3518.00N/08414.00W-flood".to_vec();
+        *flood_pkt
+            .information_mut()
+            .unwrap_or_else(|| unreachable!("UI frame has an information field")) =
+            b"!3518.00N/08414.00W-flood".to_vec();
         match config.process(&flood_pkt, t0) {
             DigiAction::Relay { modified_packet } => {
                 // Should NOT insert callsign (flood, not trace).
@@ -1142,7 +1294,10 @@ mod tests {
 
         // UItrace packet.
         let mut trace_pkt = make_packet(vec![make_digi("WIDE", 2)]);
-        trace_pkt.info = b"!3518.00N/08414.00W-trace".to_vec();
+        *trace_pkt
+            .information_mut()
+            .unwrap_or_else(|| unreachable!("UI frame has an information field")) =
+            b"!3518.00N/08414.00W-trace".to_vec();
         match config.process(&trace_pkt, t0) {
             DigiAction::Relay { modified_packet } => {
                 // Should insert callsign (trace).
@@ -1178,8 +1333,12 @@ mod tests {
         let mut config = make_config();
         let mut p1 = make_packet(vec![make_digi("WIDE1", 1)]);
         let mut p2 = make_packet(vec![make_digi("WIDE1", 1)]);
-        p1.info = b"!3518.00N/08414.00W-one".to_vec();
-        p2.info = b"!3518.00N/08414.00W-two".to_vec();
+        *p1.information_mut()
+            .unwrap_or_else(|| unreachable!("UI frame has an information field")) =
+            b"!3518.00N/08414.00W-one".to_vec();
+        *p2.information_mut()
+            .unwrap_or_else(|| unreachable!("UI frame has an information field")) =
+            b"!3518.00N/08414.00W-two".to_vec();
         let t0 = Instant::now();
 
         assert!(matches!(config.process(&p1, t0), DigiAction::Relay { .. }));
@@ -1195,7 +1354,7 @@ mod tests {
         // for the full TTL window and admitted once past it, even though no
         // sweep necessarily ran in between.
         let mut config = make_config();
-        config.dedup_ttl = Duration::from_secs(30);
+        config.set_dedup_ttl(Duration::from_secs(30));
         let packet = make_packet(vec![make_digi("WIDE1", 1)]);
         let t0 = Instant::now();
 
@@ -1227,7 +1386,7 @@ mod tests {
         // not run on every call (we only observe its effect: the original
         // entry survives until the window elapses).
         let mut config = make_config();
-        config.dedup_ttl = Duration::from_secs(30);
+        config.set_dedup_ttl(Duration::from_secs(30));
         let t0 = Instant::now();
 
         let first = make_packet(vec![make_digi("WIDE1", 1)]);
@@ -1239,7 +1398,10 @@ mod tests {
         // A distinct packet 1 s later relays and adds a second entry; the
         // first entry must still be present (not yet expired, sweep or not).
         let mut second = make_packet(vec![make_digi("WIDE1", 1)]);
-        second.info = b"!3518.00N/08414.00W-second".to_vec();
+        *second
+            .information_mut()
+            .unwrap_or_else(|| unreachable!("UI frame has an information field")) =
+            b"!3518.00N/08414.00W-second".to_vec();
         assert!(matches!(
             config.process(&second, t0 + Duration::from_secs(1)),
             DigiAction::Relay { .. }
@@ -1255,30 +1417,51 @@ mod tests {
     }
 
     #[test]
-    fn dedup_prunes_expired_entries() {
+    fn zero_dedup_ttl_disables_duplicate_suppression_and_clears_state() {
         let mut config = make_config();
-        // Zero TTL so any "past" entry is instantly expired.
-        config.dedup_ttl = Duration::from_secs(0);
-
         let packet = make_packet(vec![make_digi("WIDE1", 1)]);
         let t0 = Instant::now();
         assert!(matches!(
             config.process(&packet, t0),
             DigiAction::Relay { .. }
         ));
-        // With zero TTL the previous entry is pruned, so the same packet
-        // can be relayed again; pass the same instant to force the
-        // pruning branch (`now.duration_since(t) < 0s` is false).
+        assert_eq!(config.dedup_cache_len(), 1);
+
+        config.set_dedup_ttl(Duration::ZERO);
+        assert_eq!(config.dedup_ttl(), Duration::ZERO);
+        assert_eq!(config.dedup_cache_len(), 0);
+
+        // With dedup explicitly disabled, repeated packets relay even at the
+        // same instant and no cache entries accumulate.
         assert!(matches!(
             config.process(&packet, t0),
             DigiAction::Relay { .. }
         ));
+        assert!(matches!(
+            config.process(&packet, t0),
+            DigiAction::Relay { .. }
+        ));
+        assert_eq!(config.dedup_cache_len(), 0);
+    }
+
+    #[test]
+    fn regressing_process_time_is_conservatively_treated_as_duplicate() {
+        let mut config = make_config();
+        let packet = make_packet(vec![make_digi("WIDE1", 1)]);
+        let earlier = Instant::now();
+        let later = earlier + Duration::from_secs(10);
+
+        assert!(matches!(
+            config.process(&packet, later),
+            DigiAction::Relay { .. }
+        ));
+        assert_eq!(config.process(&packet, earlier), DigiAction::Duplicate);
     }
 
     #[test]
     fn viscous_delay_defers_initial_relay() {
         let mut config = make_config();
-        config.viscous_delay = Duration::from_secs(5);
+        config.set_viscous_delay(Duration::from_secs(5));
         let packet = make_packet(vec![make_digi("WIDE1", 1)]);
         let t0 = Instant::now();
         // With viscous_delay enabled, the first sighting is deferred.
@@ -1289,7 +1472,7 @@ mod tests {
     #[test]
     fn viscous_delay_cancels_if_someone_else_relays() {
         let mut config = make_config();
-        config.viscous_delay = Duration::from_secs(5);
+        config.set_viscous_delay(Duration::from_secs(5));
         let packet = make_packet(vec![make_digi("WIDE1", 1)]);
         let t0 = Instant::now();
         // Defer.
@@ -1301,9 +1484,28 @@ mod tests {
     }
 
     #[test]
+    fn regressing_viscous_drain_time_keeps_candidate_pending() {
+        let mut config = make_config();
+        config.set_viscous_delay(Duration::from_secs(5));
+        let packet = make_packet(vec![make_digi("WIDE1", 1)]);
+        let earlier = Instant::now();
+        let queued_at = earlier + Duration::from_secs(10);
+
+        assert_eq!(config.process(&packet, queued_at), DigiAction::Drop);
+        assert!(config.drain_ready_viscous(earlier).is_empty());
+        assert_eq!(
+            config
+                .drain_ready_viscous(queued_at + Duration::from_secs(5))
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn viscous_delay_zero_fires_immediately() {
         let mut config = make_config();
-        config.viscous_delay = Duration::from_secs(0);
+        config.set_viscous_delay(Duration::ZERO);
+        assert_eq!(config.viscous_delay(), Duration::ZERO);
         let packet = make_packet(vec![make_digi("WIDE1", 1)]);
         let t0 = Instant::now();
         assert!(matches!(
@@ -1339,7 +1541,7 @@ mod tests {
     #[test]
     fn drain_ready_viscous_returns_entries_past_delay() -> TestResult {
         let mut config = make_config();
-        config.viscous_delay = Duration::from_secs(5);
+        config.set_viscous_delay(Duration::from_secs(5));
         let packet = make_packet(vec![make_digi("WIDE1", 1)]);
         let t0 = Instant::now();
         assert_eq!(config.process(&packet, t0), DigiAction::Drop);
@@ -1375,10 +1577,22 @@ mod tests {
     }
 
     #[test]
-    fn alias_uppercases_input() -> TestResult {
-        let a = DigipeaterAlias::new("wide1-1")?;
-        assert_eq!(a.as_str(), "WIDE1-1");
-        assert_eq!(format!("{a}"), "WIDE1-1");
+    fn alias_rejects_ssid_suffix_punctuation_and_excess_width() {
+        for invalid in ["WIDE1-1", "WIDE_", "ABCDEF", "TOOLONG"] {
+            assert!(matches!(
+                DigipeaterAlias::new(invalid),
+                Err(AprsError::InvalidDigipeaterAlias(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn alias_uppercases_valid_ax25_base() -> TestResult {
+        let alias = DigipeaterAlias::new("trace")?;
+        assert_eq!(alias.as_str(), "TRACE");
+        assert_eq!(alias.as_callsign().as_str(), "TRACE");
+        assert_eq!(alias.as_str().len(), DigipeaterAlias::MAX_LEN);
+        assert_eq!(format!("{alias}"), "TRACE");
         Ok(())
     }
 }

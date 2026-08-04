@@ -14,8 +14,83 @@
 //! Earlier code generations parsed only sub-format (1), discarding the
 //! structural data of the others.
 
+use std::fmt;
+
 use crate::error::AprsError;
-use crate::packet::AprsTimestamp;
+use crate::packet::{AprsReportTimestamp, AprsReportTimestampFormat};
+use crate::text::decode_wire_ascii;
+
+/// A validated APRS status timestamp in day/hour/minute UTC form.
+///
+/// APRS status reports permit only the seven-byte `DDHHMMz` timestamp.
+/// Position and object reports also permit local DHM and UTC HMS forms, so
+/// their broader [`AprsReportTimestamp`] type cannot represent this field
+/// without allowing invalid status states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AprsStatusTimestamp(AprsReportTimestamp);
+
+impl AprsStatusTimestamp {
+    /// Create a day/hour/minute UTC status timestamp (`DDHHMMz`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsError::InvalidTimestamp`] unless `day` is 1-31,
+    /// `hour` is 0-23, and `minute` is 0-59.
+    pub fn day_hour_minute_utc(day: u8, hour: u8, minute: u8) -> Result<Self, AprsError> {
+        AprsReportTimestamp::day_hour_minute_utc(day, hour, minute).map(Self)
+    }
+
+    /// Parse an exact seven-byte `DDHHMMz` status timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsError::InvalidTimestamp`] for malformed or out-of-range
+    /// fields and for the local-DHM or UTC-HMS formats that status reports do
+    /// not permit.
+    pub fn from_wire(wire: &str) -> Result<Self, AprsError> {
+        Self::try_from(AprsReportTimestamp::from_wire(wire)?)
+    }
+
+    /// Format this timestamp as its exact seven-byte wire representation.
+    #[must_use]
+    pub fn to_wire_string(self) -> String {
+        self.to_string()
+    }
+}
+
+impl fmt::Display for AprsStatusTimestamp {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl core::str::FromStr for AprsStatusTimestamp {
+    type Err = AprsError;
+
+    fn from_str(wire: &str) -> Result<Self, Self::Err> {
+        Self::from_wire(wire)
+    }
+}
+
+impl From<AprsStatusTimestamp> for AprsReportTimestamp {
+    fn from(timestamp: AprsStatusTimestamp) -> Self {
+        timestamp.0
+    }
+}
+
+impl TryFrom<AprsReportTimestamp> for AprsStatusTimestamp {
+    type Error = AprsError;
+
+    fn try_from(timestamp: AprsReportTimestamp) -> Result<Self, Self::Error> {
+        if timestamp.format() == AprsReportTimestampFormat::DayHourMinuteUtc {
+            Ok(Self(timestamp))
+        } else {
+            Err(AprsError::InvalidTimestamp(
+                "status timestamp must use DDHHMMz day/hour/minute UTC format",
+            ))
+        }
+    }
+}
 
 /// An APRS status report (data type `>`).
 ///
@@ -31,14 +106,13 @@ pub struct AprsStatus {
     /// stripped). When the status carries no structured prefix this
     /// is the entire body.
     pub text: String,
-    /// Optional 7-byte DHM-Zulu timestamp prefix (`DDHHMMz`), parsed via
-    /// [`AprsTimestamp::parse`]. Per APRS 1.0.1 §16 p.80 a status report's
-    /// timestamp can *only* be DHM-Zulu, so this is always the
-    /// [`AprsTimestamp::DhmZulu`] variant when present. `None` when the
+    /// Optional 7-byte DHM-Zulu timestamp prefix (`DDHHMMz`). Per APRS 1.0.1
+    /// §16 p.80 a status report's timestamp can only be day/hour/minute UTC.
+    /// `None` when the
     /// body did not begin with a well-formed DHM-Zulu timestamp (an HMS or
     /// DHM-local 7-byte prefix is treated as status text, not a
     /// timestamp).
-    pub timestamp: Option<AprsTimestamp>,
+    pub timestamp: Option<AprsStatusTimestamp>,
     /// Optional Maidenhead grid locator prefix (4 or 6 ASCII chars
     /// per APRS 1.0.1 §6 grid-square rules).
     pub grid_locator: Option<String>,
@@ -82,20 +156,20 @@ pub fn parse_aprs_status(info: &[u8]) -> Result<AprsStatus, AprsError> {
         return Err(AprsError::InvalidFormat);
     }
     let body = info.get(1..).unwrap_or(&[]);
-    let body_str = String::from_utf8_lossy(body);
+    let body_str = decode_wire_ascii("APRS status body", body)?;
 
     // Sub-format 2: DHM-Zulu timestamp prefix (7 bytes).
     //
     // APRS 1.0.1 §16 p.80: "The timestamp can only be in DHM zulu format."
     // Unlike position/object reports, a status report MUST NOT carry an
-    // HMS (`HHMMSSh`) or DHM-local (`DDHHMM/`) timestamp. `AprsTimestamp::
-    // parse` happily accepts those other forms, so a free-text status like
+    // HMS (`HHMMSSh`) or DHM-local (`DDHHMM/`) timestamp. The broader report
+    // timestamp type accepts those other forms, so a free-text status like
     // ">120000hrs since reset" would otherwise mis-parse "120000h" as an
     // HMS timestamp and silently truncate the text to "rs since reset".
-    // Only strip the prefix when it is the spec-legal `DhmZulu` variant;
+    // Only strip the prefix when it is the spec-legal DHM-UTC format;
     // any other parse result means the leading bytes are status text.
     if let Some(prefix) = body_str.get(..7)
-        && let Some(ts @ AprsTimestamp::DhmZulu { .. }) = AprsTimestamp::parse(prefix)
+        && let Ok(ts) = AprsStatusTimestamp::from_wire(prefix)
     {
         let rest = body_str.get(7..).unwrap_or("").trim_end().to_owned();
         return Ok(AprsStatus {
@@ -239,17 +313,25 @@ mod tests {
     }
 
     #[test]
+    fn parse_status_rejects_non_ascii_body_without_replacement() {
+        assert_eq!(
+            parse_aprs_status(b">ok\xFF"),
+            Err(AprsError::InvalidTextByte {
+                field: "APRS status body",
+                index: 2,
+                byte: 0xFF,
+            }),
+        );
+    }
+
+    #[test]
     fn parse_status_with_dhm_zulu_timestamp() -> TestResult {
         // Sub-format 2: DHM-Zulu timestamp followed by free text.
         let info = b">092345zOn the air";
         let status = parse_aprs_status(info)?;
         assert_eq!(
             status.timestamp,
-            Some(AprsTimestamp::DhmZulu {
-                day: 9,
-                hour: 23,
-                minute: 45,
-            }),
+            Some(AprsStatusTimestamp::day_hour_minute_utc(9, 23, 45)?),
         );
         assert_eq!(status.text, "On the air");
         Ok(())
@@ -296,14 +378,46 @@ mod tests {
         let status = parse_aprs_status(info)?;
         assert_eq!(
             status.timestamp,
-            Some(AprsTimestamp::DhmZulu {
-                day: 9,
-                hour: 23,
-                minute: 45,
-            }),
+            Some(AprsStatusTimestamp::day_hour_minute_utc(9, 23, 45)?),
         );
         assert_eq!(status.text, "Real status");
         Ok(())
+    }
+
+    #[test]
+    fn status_timestamp_round_trips_dhm_utc() -> TestResult {
+        let timestamp = AprsStatusTimestamp::day_hour_minute_utc(9, 23, 45)?;
+
+        assert_eq!(timestamp.to_wire_string(), "092345z");
+        assert_eq!(AprsStatusTimestamp::from_wire("092345z")?, timestamp);
+        assert_eq!("092345z".parse::<AprsStatusTimestamp>()?, timestamp);
+        assert_eq!(
+            AprsReportTimestamp::from(timestamp),
+            AprsReportTimestamp::day_hour_minute_utc(9, 23, 45)?,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn status_timestamp_rejects_other_report_formats() -> TestResult {
+        let local = AprsReportTimestamp::day_hour_minute_local(11, 0, 0)?;
+        let hms = AprsReportTimestamp::hour_minute_second_utc(23, 45, 17)?;
+
+        assert!(AprsStatusTimestamp::try_from(local).is_err());
+        assert!(AprsStatusTimestamp::try_from(hms).is_err());
+        assert!(AprsStatusTimestamp::from_wire("110000/").is_err());
+        assert!(AprsStatusTimestamp::from_wire("234517h").is_err());
+        assert!(AprsStatusTimestamp::from_wire("01011234").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn status_timestamp_rejects_malformed_and_out_of_range_values() {
+        assert!(AprsStatusTimestamp::from_wire("092345X").is_err());
+        assert!(AprsStatusTimestamp::from_wire("09A345z").is_err());
+        assert!(AprsStatusTimestamp::day_hour_minute_utc(0, 0, 0).is_err());
+        assert!(AprsStatusTimestamp::day_hour_minute_utc(9, 24, 0).is_err());
+        assert!(AprsStatusTimestamp::day_hour_minute_utc(9, 23, 60).is_err());
     }
 
     #[test]
