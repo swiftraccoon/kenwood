@@ -1,5 +1,7 @@
 //! Error types for APRS-IS operations.
 
+use crate::uplink::AprsIsUplinkLineError;
+
 /// Errors that can occur during APRS-IS operations.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -24,45 +26,24 @@ pub enum AprsIsError {
     #[error("APRS-IS login rejected: {0}")]
     LoginRejected(String),
 
-    /// An outbound packet line would exceed the APRS-IS spec's 512-byte
-    /// limit (including the trailing `CRLF`). Per
-    /// <http://www.aprs-is.net/Connecting.aspx>: "No line may exceed
-    /// 512 bytes including the CR/LF sequence." Servers silently
-    /// truncate offending lines, so the client rejects them up-front
-    /// to make the failure mode visible.
-    #[error("APRS-IS line too long: {actual} bytes (max {max})")]
-    LineTooLong {
-        /// Length of the offending line including CRLF.
-        actual: usize,
-        /// Spec maximum (`512`).
-        max: usize,
-    },
+    /// Outbound bytes did not form one safe, correctly framed APRS-IS
+    /// line.
+    #[error("invalid APRS-IS uplink line: {0}")]
+    InvalidUplinkLine(#[from] AprsIsUplinkLineError),
 
-    /// An inbound line from the server exceeded the read cap without a
-    /// terminating newline. A malicious or buggy server (the client
-    /// connects to arbitrary internet servers) can stream bytes with no
-    /// `\n` to grow the read buffer until the process runs out of
-    /// memory; the reader bounds each line and returns this error
-    /// instead of growing unboundedly. The oversized line is drained up
-    /// to the next newline so the stream resynchronises rather than
-    /// wedging. See [`crate::MAX_IS_READ_LINE_BYTES`].
-    #[error("APRS-IS inbound line exceeded {max} bytes without a newline")]
+    /// An inbound line from the server exceeded the read cap. A malicious or
+    /// buggy server can otherwise stream an unbounded line until the process
+    /// runs out of memory. The oversized line is drained up to its next
+    /// newline, or rejected at EOF, rather than exposing its retained prefix
+    /// as a packet. See [`crate::MAX_IS_READ_LINE_BYTES`].
+    #[error("APRS-IS inbound line exceeded {max} bytes")]
     ReadLineTooLong {
         /// Read cap in bytes that was exceeded.
         max: usize,
     },
 
-    /// An outbound line body contained an embedded carriage return or
-    /// line feed. Every APRS-IS line is framed by appending `CRLF`, so a
-    /// raw `\r`/`\n` inside the caller- or RF-supplied content would
-    /// inject a second, forged line onto the uplink stream. The send
-    /// path rejects such bodies before writing them. See
-    /// [`crate::AprsIsClient::send_raw_line`].
-    #[error("APRS-IS line body contains an embedded CR or LF")]
-    EmbeddedNewline,
-
     /// A login field failed validation before the handshake line was
-    /// built. Per <http://www.aprs-is.net/Connecting.aspx>, the
+    /// built. Per <https://www.aprs-is.net/Connecting.aspx>, the
     /// software name and version must each be one word ("Do not use
     /// spaces") and the callsign is alphanumeric ASCII; an embedded
     /// space or `CRLF` would corrupt the space-delimited handshake or

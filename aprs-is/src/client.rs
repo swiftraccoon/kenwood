@@ -57,6 +57,7 @@ use crate::error::AprsIsError;
 use crate::events::{AprsIsEvent, AprsIsPacket};
 use crate::line::{format_is_packet, parse_is_line};
 use crate::login::{AprsIsConfig, Passcode, build_login_string};
+use crate::uplink::AprsIsUplinkLine;
 
 /// Extract the server hostname from a `# logresp ... verified, server X`
 /// comment line. Returns `None` if the `server` clause is absent.
@@ -81,15 +82,6 @@ pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(120);
 /// Default connect timeout for the initial TCP handshake + login.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Maximum APRS-IS line length on the wire, in bytes, **including**
-/// the trailing `\r\n`.
-///
-/// Per <http://www.aprs-is.net/Connecting.aspx>: "No line may exceed
-/// 512 bytes including the CR/LF sequence." Servers silently truncate
-/// lines that exceed this limit; rejecting the send up-front turns the
-/// truncation into a visible error.
-pub const MAX_IS_LINE_BYTES: usize = 512;
-
 /// Maximum length, in bytes, of a single inbound line read from the
 /// server before the reader gives up and resynchronises.
 ///
@@ -98,13 +90,14 @@ pub const MAX_IS_LINE_BYTES: usize = 512;
 /// `read_until(b'\n', ..)` would grow the line buffer until the process
 /// runs out of memory (a denial-of-service). This cap bounds the buffer.
 ///
-/// The value is double [`MAX_IS_LINE_BYTES`] (the *outbound* 512-byte
+/// The value is double [`crate::MAX_IS_LINE_BYTES`] (the *outbound* 512-byte
 /// spec limit including `CRLF`). APRS-IS payloads sit well under 512
 /// bytes, but inbound lines can legitimately carry a verbose server
 /// comment or a long path, so the doubled headroom avoids rejecting any
-/// valid line while still capping memory at a fixed, small bound. A line
-/// that reaches this length without a terminating newline yields
-/// [`AprsIsError::ReadLineTooLong`].
+/// valid line while still capping memory at a fixed, small bound. A line that
+/// exceeds this length (including its newline when present) yields
+/// [`AprsIsError::ReadLineTooLong`]; an exact-cap final line at EOF remains
+/// valid.
 pub const MAX_IS_READ_LINE_BYTES: usize = 1024;
 
 /// Keepalive comment text (sent as `# aprs-is keepalive\r\n`).
@@ -118,11 +111,13 @@ const KEEPALIVE_COMMENT: &str = "# aprs-is keepalive";
 /// clean EOF. `buf` is **not** cleared; the caller clears it.
 ///
 /// Unlike [`AsyncBufReadExt::read_until`], this caps the amount of data
-/// buffered for a single line: if `max` bytes accumulate without a `\n`,
-/// the function drains and discards the rest of the oversized line up to
-/// (and including) the next newline so the stream stays framed, then
-/// returns [`AprsIsError::ReadLineTooLong`]. This prevents a server that
-/// never sends a newline from growing `buf` without bound.
+/// buffered for a single line: once more than `max` bytes arrive, the function
+/// drains and discards the rest of the oversized line up to (and including)
+/// the next newline so the stream stays framed, then returns
+/// [`AprsIsError::ReadLineTooLong`]. If EOF arrives first, the error is still
+/// returned rather than exposing the retained prefix as a packet. This
+/// prevents a server that never sends a newline from growing `buf` without
+/// bound.
 async fn read_is_line<R>(
     reader: &mut R,
     buf: &mut Vec<u8>,
@@ -132,13 +127,17 @@ where
     R: AsyncBufReadExt + Unpin,
 {
     let mut copied = 0usize;
+    let mut overflowed = false;
     loop {
         let chunk = reader.fill_buf().await.map_err(AprsIsError::Read)?;
         if chunk.is_empty() {
-            // EOF. Anything already copied is an unterminated final line;
-            // surface what we have so the caller can parse it (or detect
-            // a clean `Ok(0)` close).
-            return Ok(copied);
+            // EOF. Surface an in-cap unterminated final line, but never turn
+            // the retained prefix of an oversized line into a valid packet.
+            return if overflowed {
+                Err(AprsIsError::ReadLineTooLong { max })
+            } else {
+                Ok(copied)
+            };
         }
 
         // Newline found in this chunk: the line ends at `pos`, and this
@@ -178,33 +177,15 @@ where
             buf.extend_from_slice(head);
             copied += take;
         }
+        if take < chunk.len() {
+            overflowed = true;
+        }
         let consume_n = chunk.len();
         reader.consume(consume_n);
         // `copied` never exceeds `max`; once it reaches `max` we keep
         // draining subsequent chunks (take == 0) until the newline, then
         // return ReadLineTooLong above.
     }
-}
-
-/// `true` if `line` has a `\r` or `\n` anywhere except as a single
-/// trailing line terminator.
-///
-/// APRS-IS frames each line with a trailing `CRLF`; a `\r`/`\n` embedded
-/// in the body would split one write into two lines, the second forged.
-/// Callers pass lines that already carry their own terminator (`\n` or
-/// `\r\n`), so this strips at most one trailing terminator and then
-/// checks the remaining body. Examples:
-/// - `"data\r\n"` → body `"data"` → `false` (allowed).
-/// - `"data\n"` → body `"data"` → `false` (allowed).
-/// - `"data"` → body `"data"` → `false` (allowed, unterminated).
-/// - `"a\r\nN0CALL>X:forged\r\n"` → body `"a\r\nN0CALL>X:forged"`
-///   contains an embedded `\r\n` → `true` (rejected).
-fn line_body_has_embedded_newline(line: &str) -> bool {
-    // Strip a single trailing terminator: an optional `\n`, then an
-    // optional `\r` that immediately preceded it.
-    let body = line.strip_suffix('\n').unwrap_or(line);
-    let body = body.strip_suffix('\r').unwrap_or(body);
-    body.contains('\r') || body.contains('\n')
 }
 
 /// Async TCP client for APRS-IS.
@@ -268,6 +249,8 @@ impl AprsIsClient {
     ///
     /// Returns [`AprsIsError::InvalidLoginField`] if a login field
     /// (callsign / software name / version / filter) is invalid,
+    /// [`AprsIsError::InvalidUplinkLine`] if the completed login line
+    /// exceeds the APRS-IS 512-byte limit,
     /// [`AprsIsError::Connect`] if TCP connect fails or times out, or
     /// [`AprsIsError::Write`] if the login string cannot be sent.
     pub async fn connect(config: AprsIsConfig) -> Result<Self, AprsIsError> {
@@ -278,6 +261,7 @@ impl AprsIsClient {
         // invalid field (whitespace/CRLF that could corrupt or inject the
         // handshake) fails fast without a wasted TCP connection.
         let login = build_login_string(&config)?;
+        let login = AprsIsUplinkLine::from_wire_bytes(login.as_bytes())?;
 
         let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr))
             .await
@@ -290,7 +274,7 @@ impl AprsIsClient {
             .map_err(AprsIsError::Connect)?;
 
         // Disable Nagle's algorithm per the explicit recommendation at
-        // <http://www.aprs-is.net/Connecting.aspx>: "If your client
+        // <https://www.aprs-is.net/Connecting.aspx>: "If your client
         // software is bidirectional (sends and receives), turn off the
         // Nagle algorithm when connecting to APRS-IS as it can
         // introduce significant delays (TCP_NODELAY)." APRS lines are
@@ -364,8 +348,7 @@ impl AprsIsClient {
     ///
     /// # Errors
     ///
-    /// Returns [`AprsIsError::Connect`] if the TCP connect fails or
-    /// [`AprsIsError::Write`] if the login string cannot be sent.
+    /// Returns the same errors as [`connect`](Self::connect).
     pub async fn reconnect(&mut self) -> Result<(), AprsIsError> {
         tracing::info!("APRS-IS reconnecting");
         let new = Self::connect(self.config.clone()).await?;
@@ -491,7 +474,9 @@ impl AprsIsClient {
     ///
     /// # Errors
     ///
-    /// Returns [`AprsIsError::Write`] if the write fails.
+    /// Returns [`AprsIsError::InvalidUplinkLine`] if any input inserts a
+    /// framing byte or makes the completed line exceed 512 bytes, or
+    /// [`AprsIsError::Write`] if the socket write or flush fails.
     pub async fn send_packet(
         &mut self,
         source: &str,
@@ -499,56 +484,23 @@ impl AprsIsClient {
         path: &[&str],
         data: &str,
     ) -> Result<(), AprsIsError> {
-        let line = format_is_packet(source, destination, path, data);
-        self.send_raw_line(&line).await
+        let line = format_is_packet(source, destination, path, data)?;
+        self.send_uplink_line(&line).await
     }
 
-    /// Send a raw line to the server (must already be CRLF-terminated).
+    /// Send one already validated APRS-IS uplink line.
     ///
-    /// Use this for custom formatting or to forward packets from RF.
-    /// This is the single send choke point: every outbound line (packet
-    /// formatting, keepalives, and direct raw forwarding) funnels
-    /// through here, so the CR/LF-injection guard below covers all of
-    /// them regardless of who built the string.
+    /// This is the byte-preserving send path for RF packets, including
+    /// Mic-E and other information fields that are not valid UTF-8.
     ///
-    /// # CRLF-injection guard
-    ///
-    /// APRS-IS lines are framed by a trailing `CRLF`. A `\r` or `\n`
-    /// embedded in the **body** of the line (anything before a single
-    /// trailing terminator) would split the write into a second, forged
-    /// packet on the uplink stream. Because the client may forward
-    /// caller- or RF-supplied content (e.g. an AX.25 info field decoded
-    /// via `from_utf8_lossy`, which can contain a raw `0x0A`), this
-    /// method rejects any line whose body contains an embedded `\r`/`\n`
-    /// with [`AprsIsError::EmbeddedNewline`] rather than writing it. A
-    /// single trailing terminator (`\n` or `\r\n`) is permitted, since
-    /// that is the line's own framing.
-    ///
-    /// # Length limit
-    ///
-    /// Per APRS-IS spec at <http://www.aprs-is.net/Connecting.aspx>,
-    /// "No line may exceed 512 bytes including the CR/LF sequence."
-    /// This method enforces the limit and returns
-    /// [`AprsIsError::LineTooLong`] for over-length input rather than
-    /// letting the server silently truncate the wire bytes. See
-    /// [`MAX_IS_LINE_BYTES`].
+    /// The [`AprsIsUplinkLine`] type proves that the bytes have exactly
+    /// one trailing `CRLF`, no embedded framing bytes, and fit within the
+    /// APRS-IS 512-byte line limit.
     ///
     /// # Errors
     ///
-    /// Returns [`AprsIsError::EmbeddedNewline`] if the line body contains
-    /// an embedded `\r`/`\n`; [`AprsIsError::LineTooLong`] if the line
-    /// exceeds [`MAX_IS_LINE_BYTES`]; or [`AprsIsError::Write`] if the
-    /// underlying socket write fails.
-    pub async fn send_raw_line(&mut self, line: &str) -> Result<(), AprsIsError> {
-        if line_body_has_embedded_newline(line) {
-            return Err(AprsIsError::EmbeddedNewline);
-        }
-        if line.len() > MAX_IS_LINE_BYTES {
-            return Err(AprsIsError::LineTooLong {
-                actual: line.len(),
-                max: MAX_IS_LINE_BYTES,
-            });
-        }
+    /// Returns [`AprsIsError::Write`] if the socket write or flush fails.
+    pub async fn send_uplink_line(&mut self, line: &AprsIsUplinkLine) -> Result<(), AprsIsError> {
         self.writer
             .write_all(line.as_bytes())
             .await
@@ -556,6 +508,37 @@ impl AprsIsClient {
         self.writer.flush().await.map_err(AprsIsError::Write)?;
         self.last_write = Instant::now();
         Ok(())
+    }
+
+    /// Validate and send exact APRS-IS wire bytes.
+    ///
+    /// The bytes must end with exactly one `CRLF`; the body must contain
+    /// no carriage return or line feed; and the complete line must be no
+    /// longer than [`crate::MAX_IS_LINE_BYTES`]. Validation never decodes the
+    /// bytes as UTF-8, so accepted bytes reach the socket unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsIsError::InvalidUplinkLine`] when framing, injection,
+    /// or length validation fails, or [`AprsIsError::Write`] when the
+    /// socket write or flush fails.
+    pub async fn send_raw_bytes(&mut self, wire: &[u8]) -> Result<(), AprsIsError> {
+        let line = AprsIsUplinkLine::from_wire_bytes(wire)?;
+        self.send_uplink_line(&line).await
+    }
+
+    /// Validate and send a UTF-8 APRS-IS wire line.
+    ///
+    /// This compatibility helper is appropriate for text-only callers.
+    /// RF uplinks should use [`send_uplink_line`](Self::send_uplink_line)
+    /// or [`send_raw_bytes`](Self::send_raw_bytes) so no UTF-8 conversion
+    /// can alter the information bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`send_raw_bytes`](Self::send_raw_bytes).
+    pub async fn send_raw_line(&mut self, line: &str) -> Result<(), AprsIsError> {
+        self.send_raw_bytes(line.as_bytes()).await
     }
 
     /// Send a keepalive comment line unconditionally.
@@ -660,10 +643,19 @@ mod tests {
     async fn recv_captured(
         rx: oneshot::Receiver<Vec<u8>>,
     ) -> Result<String, Box<dyn std::error::Error>> {
+        let bytes = recv_captured_bytes(rx).await?;
+        Ok(String::from_utf8(bytes)?)
+    }
+
+    /// Await exact bytes captured by a mock server, including non-UTF-8
+    /// information fields.
+    async fn recv_captured_bytes(
+        rx: oneshot::Receiver<Vec<u8>>,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let bytes = tokio::time::timeout(Duration::from_secs(5), rx)
             .await
             .map_err(|_| "mock server handler did not report captured bytes within 5s")??;
-        Ok(String::from_utf8(bytes)?)
+        Ok(bytes)
     }
 
     /// Write all of `data` to `stream`; swallow any I/O error since the
@@ -754,15 +746,9 @@ mod tests {
 
     #[tokio::test]
     async fn next_event_survives_non_utf8_in_packet() -> TestResult {
-        // Regression guard: pre-fix, BufReader::read_line
-        // returned io::ErrorKind::InvalidData on the first non-UTF-8
-        // byte and disconnected the session. Mic-E and raw weather
-        // packets routinely carry bytes ≥ 0x80, so a strict UTF-8 read
-        // would kill the connection on the first such packet.
-        //
-        // Post-fix the lossy decoder replaces invalid bytes with
-        // U+FFFD in the `line` view, while the original bytes are
-        // preserved in `raw`.
+        // Mic-E and raw weather packets routinely carry bytes ≥ 0x80.
+        // The lossy display view replaces invalid UTF-8 with U+FFFD,
+        // while `raw` preserves the original bytes exactly.
         let payload: &[u8] = &[
             b'N', b'0', b'C', b'A', b'L', b'L', b'>', b'A', b'P', b'K', b'0', b'0', b'5', b':',
             b'`', // Mic-E type byte
@@ -1055,17 +1041,6 @@ mod tests {
 
     // --- Bounded inbound read (BUG 1: unbounded line-read DoS) ---
 
-    #[test]
-    fn line_body_embedded_newline_detection() {
-        // Trailing terminators are allowed; embedded CR/LF is not.
-        assert!(!line_body_has_embedded_newline("data\r\n"));
-        assert!(!line_body_has_embedded_newline("data\n"));
-        assert!(!line_body_has_embedded_newline("data"));
-        assert!(line_body_has_embedded_newline("a\r\nN0CALL>X:forged\r\n"));
-        assert!(line_body_has_embedded_newline("a\nb\n"));
-        assert!(line_body_has_embedded_newline("mid\rline\r\n"));
-    }
-
     #[tokio::test]
     async fn read_is_line_reads_a_normal_line() -> TestResult {
         let data: &[u8] = b"N0CALL>APK005:hello\r\nnext line\n";
@@ -1096,21 +1071,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_is_line_bounds_huge_no_newline_chunk() -> TestResult {
+    async fn read_is_line_rejects_huge_no_newline_chunk_at_eof() -> TestResult {
         // A server streams far more than the cap with NO newline, then
         // EOF. The buffer must stay bounded by the cap rather than
         // growing to the input size (the OOM vector).
         let data = vec![b'A'; MAX_IS_READ_LINE_BYTES * 64];
         let mut reader = BufReader::new(data.as_slice());
         let mut buf = Vec::new();
-        let n = read_is_line(&mut reader, &mut buf, MAX_IS_READ_LINE_BYTES).await?;
+        let result = read_is_line(&mut reader, &mut buf, MAX_IS_READ_LINE_BYTES).await;
         assert!(
             buf.len() <= MAX_IS_READ_LINE_BYTES,
             "buffer grew past the cap: {} > {}",
             buf.len(),
             MAX_IS_READ_LINE_BYTES
         );
-        assert_eq!(n, buf.len());
+        assert!(
+            matches!(
+                result,
+                Err(AprsIsError::ReadLineTooLong { max }) if max == MAX_IS_READ_LINE_BYTES
+            ),
+            "expected oversized EOF error, got {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_is_line_accepts_exact_cap_at_eof() -> TestResult {
+        let data = vec![b'A'; MAX_IS_READ_LINE_BYTES];
+        let mut reader = BufReader::new(data.as_slice());
+        let mut buf = Vec::new();
+        let n = read_is_line(&mut reader, &mut buf, MAX_IS_READ_LINE_BYTES).await?;
+        assert_eq!(n, MAX_IS_READ_LINE_BYTES);
+        assert_eq!(buf, data);
         Ok(())
     }
 
@@ -1163,8 +1155,13 @@ mod tests {
             .send_packet("N0CALL", "APK005", &[], "a\r\nN0CALL>X:forged")
             .await;
         assert!(
-            matches!(result, Err(AprsIsError::EmbeddedNewline)),
-            "expected EmbeddedNewline, got {result:?}"
+            matches!(
+                result,
+                Err(AprsIsError::InvalidUplinkLine(
+                    crate::AprsIsUplinkLineError::EmbeddedNewline { .. }
+                ))
+            ),
+            "expected an embedded-newline validation error, got {result:?}"
         );
         // Close the socket so the capture ends at EOF, then prove the
         // login line is the ONLY thing that went on the wire; the
@@ -1189,7 +1186,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_raw_line_rejects_embedded_newline_but_allows_terminator() -> TestResult {
+    async fn send_raw_line_rejects_embedded_newline_but_allows_crlf() -> TestResult {
         let addr = spawn_mock_server(|mut stream| async move {
             let mut buf = [0u8; 1024];
             let _ = read_some(&mut stream, &mut buf).await;
@@ -1198,14 +1195,75 @@ mod tests {
         .await?;
 
         let mut client = AprsIsClient::connect(test_config(addr)).await?;
-        // Embedded newline in the body → rejected.
+        // Embedded newline in the body is rejected.
         let injected = client.send_raw_line("good\r\nEVIL>X:forged\r\n").await;
         assert!(
-            matches!(injected, Err(AprsIsError::EmbeddedNewline)),
-            "expected EmbeddedNewline, got {injected:?}"
+            matches!(
+                injected,
+                Err(AprsIsError::InvalidUplinkLine(
+                    crate::AprsIsUplinkLineError::EmbeddedNewline { .. }
+                ))
+            ),
+            "expected an embedded-newline validation error, got {injected:?}"
         );
-        // A normal CRLF-terminated line (no embedded newline) → accepted.
+        // A normal CRLF-terminated line is accepted.
         client.send_raw_line("N0CALL>APK005:ok\r\n").await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_raw_bytes_preserves_non_utf8_wire_bytes() -> TestResult {
+        let (tx, rx) = oneshot::channel::<Vec<u8>>();
+        let addr = spawn_mock_server(move |mut stream| async move {
+            let captured = read_lines_capture(&mut stream, 2).await;
+            drop(tx.send(captured));
+        })
+        .await?;
+
+        let mut client = AprsIsClient::connect(test_config(addr)).await?;
+        let packet: &[u8] = b"N0CALL>APK005:`\xC1\x82\x91\r\n";
+        client.send_raw_bytes(packet).await?;
+
+        let wire = recv_captured_bytes(rx).await?;
+        let packet_start = wire
+            .iter()
+            .position(|&byte| byte == b'\n')
+            .map(|offset| offset + 1)
+            .ok_or("captured login had no newline")?;
+        assert_eq!(wire.get(packet_start..), Some(packet));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_raw_bytes_requires_crlf_and_enforces_wire_limit() -> TestResult {
+        let addr = spawn_mock_server(|mut stream| async move {
+            let mut buf = [0u8; 1024];
+            let _ = read_some(&mut stream, &mut buf).await;
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        })
+        .await?;
+
+        let mut client = AprsIsClient::connect(test_config(addr)).await?;
+        for invalid in [
+            b"N0CALL>APK005:test".as_slice(),
+            b"N0CALL>APK005:test\n".as_slice(),
+        ] {
+            assert!(matches!(
+                client.send_raw_bytes(invalid).await,
+                Err(AprsIsError::InvalidUplinkLine(
+                    crate::AprsIsUplinkLineError::MissingCrlf
+                ))
+            ));
+        }
+
+        let mut oversized = vec![b'A'; crate::MAX_IS_LINE_BYTES - 1];
+        oversized.extend_from_slice(b"\r\n");
+        assert!(matches!(
+            client.send_raw_bytes(&oversized).await,
+            Err(AprsIsError::InvalidUplinkLine(
+                crate::AprsIsUplinkLineError::TooLong { .. }
+            ))
+        ));
         Ok(())
     }
 
@@ -1259,5 +1317,19 @@ mod tests {
             result.map(|_| "Ok(client)")
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn connect_rejects_oversized_login_before_opening_socket() {
+        let mut config = AprsIsConfig::new("N0CALL");
+        config.filter = "A".repeat(crate::MAX_IS_LINE_BYTES);
+
+        let result = AprsIsClient::connect(config).await;
+        assert!(matches!(
+            result,
+            Err(AprsIsError::InvalidUplinkLine(
+                crate::AprsIsUplinkLineError::TooLong { .. }
+            ))
+        ));
     }
 }

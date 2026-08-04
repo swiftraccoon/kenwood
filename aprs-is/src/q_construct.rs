@@ -9,14 +9,14 @@
 //!
 //! This module exposes:
 //!
-//! - The [`QConstruct`] enum (all nine spec values).
+//! - The [`QConstruct`] enum (all ten spec values).
 //! - [`format_is_packet_with_qconstruct`]: a *naive* line builder
 //!   that simply appends `,qXX,GATE` to a path. Suitable when the
 //!   caller has already computed the correct construct and gate
 //!   callsign; not a full `IGate`.
 //! - [`igate_format_for_is`]: a *strict*, append-only `IGate` path
-//!   rewriter that implements the <http://www.aprs-is.net/q.aspx> and
-//!   <http://www.aprs-is.net/IGating.aspx> algorithm: refuses to gate
+//!   rewriter that implements the <https://www.aprs-is.net/q.aspx> and
+//!   <https://www.aprs-is.net/IGating.aspx> algorithm: refuses to gate
 //!   when the sender opted out, then gates the heard path **verbatim**
 //!   (every hop preserved, including its has-been-repeated `*` marker)
 //!   and appends exactly `,<qconstruct>,<IGATECALL>` to the end. The
@@ -29,17 +29,15 @@
 //! while shipping only the naive append helper. The strict rewriter
 //! lives in [`igate_format_for_is`].
 
-use std::borrow::Cow;
-
 use ax25_codec::{Ax25Address, RouteEntry};
 
-use crate::line::format_is_packet;
 use crate::login::Passcode;
+use crate::uplink::{AprsIsUplinkLine, AprsIsUplinkLineError};
 
 /// APRS-IS Q-construct tag (path identifier that records how a packet
 /// entered the APRS-IS network).
 ///
-/// Per <http://www.aprs-is.net/q.aspx>, every packet seen by an APRS-IS
+/// Per <https://www.aprs-is.net/q.aspx>, every packet seen by an APRS-IS
 /// server has exactly one Q-construct inserted into its path. Servers
 /// that relay packets propagate the construct unchanged; servers that
 /// originate packets add one based on the packet's source.
@@ -94,7 +92,7 @@ impl QConstruct {
     /// Parse a path element as a Q-construct if it matches one of the
     /// well-known forms. Returns `None` otherwise.
     ///
-    /// The leading `*` (has-been-repeated) marker, if present, is
+    /// The trailing `*` (has-been-repeated) marker, if present, is
     /// trimmed before matching: a path element like `qAR*` decodes to
     /// `Some(QAR)`. Per q.aspx the construct should never carry that
     /// marker on the wire, but tolerant parsing keeps the rewriter
@@ -141,8 +139,14 @@ impl std::fmt::Display for QConstruct {
 /// - pick `qAR` vs `qAr` from the login verification state.
 ///
 /// Use [`igate_format_for_is`] when you need the full
-/// <http://www.aprs-is.net/q.aspx> rewriting algorithm.
-#[must_use]
+/// <https://www.aprs-is.net/q.aspx> rewriting algorithm.
+///
+/// # Errors
+///
+/// Returns [`AprsIsUplinkLineError::EmbeddedNewline`] if any supplied text
+/// contains a carriage return or line feed, or
+/// [`AprsIsUplinkLineError::TooLong`] if the completed wire line exceeds 512
+/// bytes including its trailing `CRLF`.
 pub fn format_is_packet_with_qconstruct(
     source: &str,
     destination: &str,
@@ -150,7 +154,7 @@ pub fn format_is_packet_with_qconstruct(
     qconstruct: QConstruct,
     gate_callsign: &str,
     data: &str,
-) -> String {
+) -> Result<AprsIsUplinkLine, AprsIsUplinkLineError> {
     let mut packet = format!("{source}>{destination}");
     for p in path {
         packet.push(',');
@@ -162,8 +166,7 @@ pub fn format_is_packet_with_qconstruct(
     packet.push_str(gate_callsign);
     packet.push(':');
     packet.push_str(data);
-    packet.push_str("\r\n");
-    packet
+    AprsIsUplinkLine::from_body_bytes(packet.as_bytes())
 }
 
 // ---------------------------------------------------------------------------
@@ -173,9 +176,10 @@ pub fn format_is_packet_with_qconstruct(
 /// Reasons an `IGate` refuses to gate an RF packet into APRS-IS.
 ///
 /// Each variant corresponds to a specific gating rule from
-/// <http://www.aprs-is.net/IGating.aspx>. Returned by
-/// [`igate_format_for_is`] so the caller can log *why* the packet was
-/// suppressed rather than silently dropping it.
+/// <https://www.aprs-is.net/IGating.aspx>. Returned directly by
+/// [`igate_rewritten_path`] and wrapped by
+/// [`IGateFormatError::GatingRefused`] from [`igate_format_for_is`] so
+/// callers can log why a packet was suppressed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum IGateError {
@@ -215,9 +219,22 @@ impl std::fmt::Display for IGateError {
 
 impl std::error::Error for IGateError {}
 
+/// Why an RF packet could not become one APRS-IS uplink line.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum IGateFormatError {
+    /// APRS-IS gating rules prohibit forwarding this RF packet.
+    #[error("RF packet is not eligible for APRS-IS gating: {0}")]
+    GatingRefused(#[from] IGateError),
+
+    /// The resulting bytes violate APRS-IS framing or length rules.
+    #[error("RF packet cannot form a safe APRS-IS uplink line: {0}")]
+    InvalidUplinkLine(#[from] AprsIsUplinkLineError),
+}
+
 /// Pick the Q-construct to insert when gating an RF-heard packet into
 /// APRS-IS, per the "Client Generated" table at
-/// <http://www.aprs-is.net/q.aspx>.
+/// <https://www.aprs-is.net/q.aspx>.
 ///
 /// The choice depends solely on the `IGate`'s login state:
 ///
@@ -245,8 +262,8 @@ const fn qconstruct_for_igate(passcode: Passcode) -> QConstruct {
 }
 
 /// Format an APRS-IS line by rewriting an RF-heard packet's path per
-/// the canonical `IGate` algorithm at <http://www.aprs-is.net/q.aspx>
-/// and <http://www.aprs-is.net/IGating.aspx>.
+/// the canonical `IGate` algorithm at <https://www.aprs-is.net/q.aspx>
+/// and <https://www.aprs-is.net/IGating.aspx>.
 ///
 /// # Algorithm
 ///
@@ -274,8 +291,13 @@ const fn qconstruct_for_igate(passcode: Passcode) -> QConstruct {
 /// 3. **Append the q-construct + `IGate` callsign** at the end. The
 ///    construct is [`QConstruct::QAR`] for a verified login,
 ///    [`QConstruct::QAO`] (letter O) for a receive-only login.
-/// 4. **Serialise** as a CRLF-terminated TNC2 line via the existing
-///    [`crate::format_is_packet`] helper.
+/// 4. **Normalize terminal TNC framing.** Some radios put one or more `CR`
+///    or `LF` delimiter bytes at the end of the AX.25 information field.
+///    TNC2/APRS-IS represents those as line framing, not payload, so they are
+///    removed before the one canonical `CRLF` is appended. Framing bytes
+///    anywhere else remain an error, preventing line injection.
+/// 5. **Serialize** as a validated, CRLF-terminated
+///    [`AprsIsUplinkLine`] without decoding the information bytes.
 ///
 /// # Parameters
 ///
@@ -284,8 +306,9 @@ const fn qconstruct_for_igate(passcode: Passcode) -> QConstruct {
 ///   tocall).
 /// - `rf_path`: Digipeater path slots from the RF frame. Each slot is
 ///   gated verbatim, preserving its has-been-repeated `*` marker.
-/// - `info`: Packet info field bytes. Decoded losslessly for the
-///   data portion of the IS line; non-UTF-8 bytes become U+FFFD.
+/// - `info`: Packet information field bytes. Non-UTF-8 Mic-E data is preserved
+///   exactly; terminal TNC `CR`/`LF` delimiters are normalized as described
+///   above.
 /// - `igate`: This `IGate`'s callsign + SSID, as appears on the wire
 ///   after the q-construct.
 /// - `passcode`: The `IGate`'s login state. Verified → `qAR`,
@@ -293,9 +316,10 @@ const fn qconstruct_for_igate(passcode: Passcode) -> QConstruct {
 ///
 /// # Errors
 ///
-/// Returns [`IGateError`] when the packet must not be gated. Callers
-/// typically log this and drop the packet rather than treating it as
-/// a hard failure.
+/// Returns [`IGateFormatError::GatingRefused`] when the packet must not
+/// be gated. Returns [`IGateFormatError::InvalidUplinkLine`] if the
+/// information field contains a framing byte or the complete line would
+/// exceed the APRS-IS 512-byte limit.
 ///
 /// # Examples
 ///
@@ -319,15 +343,15 @@ const fn qconstruct_for_igate(passcode: Passcode) -> QConstruct {
 /// // The heard `WIDE1-1*` is preserved verbatim (marker and all);
 /// // only `,qAR,N0CALL-7` is appended.
 /// assert_eq!(
-///     line,
-///     "W1AW>APK005,WIDE1-1*,qAR,N0CALL-7:!4903.50N/07201.75W-\r\n",
+///     line.as_bytes(),
+///     b"W1AW>APK005,WIDE1-1*,qAR,N0CALL-7:!4903.50N/07201.75W-\r\n",
 /// );
 /// ```
 ///
 /// # Notes
 ///
 /// - The output line is byte-for-byte ready to send to an APRS-IS
-///   server via [`crate::AprsIsClient::send_raw_line`].
+///   server via [`crate::AprsIsClient::send_uplink_line`].
 /// - This function does **not** modify the input packet; rewriting is
 ///   pure-data.
 pub fn igate_format_for_is(
@@ -337,70 +361,40 @@ pub fn igate_format_for_is(
     info: &[u8],
     igate: &Ax25Address,
     passcode: Passcode,
-) -> Result<String, IGateError> {
-    // Rule 1a: source TCPIP/TCPXX → packet originated from IS.
-    let src_call = source.callsign.as_str();
-    if src_call == "TCPIP" || src_call == "TCPXX" {
-        return Err(IGateError::SourceIsInternet);
-    }
-
-    // Rule 1b: third-party header → already gated once.
-    if info.first() == Some(&b'}') {
-        return Err(IGateError::ThirdPartyPacket);
-    }
-
-    // Rule 1c-f: walk the path checking each markers.
-    for entry in rf_path {
-        let call = entry.address.callsign.as_str();
-        match call {
-            "NOGATE" => return Err(IGateError::PathBlocksGating),
-            "RFONLY" => return Err(IGateError::PathIsRfOnly),
-            "TCPIP" | "TCPXX" => return Err(IGateError::PathAlreadyGated),
-            _ if entry.address == *igate => return Err(IGateError::LoopDetected),
-            _ => {}
-        }
-    }
-
-    // Gate the heard path verbatim, then append the q-construct +
-    // IGate callsign. IGating.aspx: "No modification of the TNC2 format
-    // line should be made except to add ,qAR,IGATECALL to the end of
-    // the path." Each hop is serialised via `RouteEntry::Display`,
-    // which preserves the trailing `*` has-been-repeated marker (the
-    // q.aspx example keeps `WIDE1*`). Unused hops are *not* dropped and
-    // `*` is *not* stripped. A real RF AX.25 frame never carries a
-    // q-construct on the wire (q-constructs only exist on APRS-IS), and
-    // `RouteEntry` callsigns are validated uppercase alphanumerics, so
-    // `qAR`/`qAr`/… can never appear as a heard hop, so no q-construct
-    // filtering is needed here.
-    let qconstruct = qconstruct_for_igate(passcode);
-    let mut path_parts: Vec<String> = Vec::with_capacity(rf_path.len() + 2);
-    for entry in rf_path {
-        path_parts.push(entry.to_string());
-    }
-    path_parts.push(qconstruct.as_str().to_owned());
-    path_parts.push(igate.to_string());
-
-    // Build the final line. The info field may contain non-UTF-8
-    // bytes (Mic-E, raw weather); preserve them via lossy decode for
-    // the IS line; callers that need byte-exact fidelity should use
-    // [`format_is_packet`] directly with a pre-decoded `&str`.
-    let path_refs: Vec<&str> = path_parts.iter().map(String::as_str).collect();
-    let data: Cow<'_, str> = String::from_utf8_lossy(info);
+) -> Result<AprsIsUplinkLine, IGateFormatError> {
+    let path_parts = igate_rewritten_path(source, rf_path, info, igate, passcode)?;
     let source_str = source.to_string();
     let destination_str = destination.to_string();
-    Ok(format_is_packet(
-        &source_str,
-        &destination_str,
-        &path_refs,
-        &data,
-    ))
+
+    let mut body = Vec::new();
+    body.extend_from_slice(source_str.as_bytes());
+    body.push(b'>');
+    body.extend_from_slice(destination_str.as_bytes());
+    for part in &path_parts {
+        body.push(b',');
+        body.extend_from_slice(part.as_bytes());
+    }
+    body.push(b':');
+    body.extend_from_slice(trim_terminal_tnc_framing(info));
+
+    Ok(AprsIsUplinkLine::from_body_bytes(&body)?)
+}
+
+fn trim_terminal_tnc_framing(mut info: &[u8]) -> &[u8] {
+    while matches!(info.last(), Some(b'\r' | b'\n')) {
+        info = info
+            .get(..info.len() - 1)
+            .unwrap_or_else(|| unreachable!("a last byte implies a non-empty slice"));
+    }
+    info
 }
 
 /// Convenience wrapper around [`igate_format_for_is`] for callers that
 /// already have a fully-formed `Ax25Packet` and just want the IS line.
 ///
 /// Equivalent to passing `packet.source`, `packet.destination`,
-/// `packet.digipeaters`, `packet.info` to [`igate_format_for_is`].
+/// `packet.digipeaters`, and `packet.information()` to
+/// [`igate_format_for_is`].
 ///
 /// # Errors
 ///
@@ -409,12 +403,12 @@ pub fn igate_format_packet_for_is(
     packet: &ax25_codec::Ax25Packet,
     igate: &Ax25Address,
     passcode: Passcode,
-) -> Result<String, IGateError> {
+) -> Result<AprsIsUplinkLine, IGateFormatError> {
     igate_format_for_is(
         &packet.source,
         &packet.destination,
-        &packet.digipeaters,
-        &packet.info,
+        packet.digipeaters.as_slice(),
+        packet.information(),
         igate,
         passcode,
     )
@@ -499,6 +493,12 @@ mod tests {
             .unwrap_or_else(|_| unreachable!("statically valid digi in test: {call}-{ssid}"))
     }
 
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
     #[test]
     fn qconstruct_round_trip() {
         let all = [
@@ -531,7 +531,7 @@ mod tests {
     }
 
     #[test]
-    fn format_is_packet_with_qconstruct_injects_tag() {
+    fn format_is_packet_with_qconstruct_injects_tag() -> TestResult {
         let pkt = format_is_packet_with_qconstruct(
             "N0CALL",
             "APK005",
@@ -539,11 +539,92 @@ mod tests {
             QConstruct::QAC,
             "N0CALL",
             "!4903.50N/07201.75W-",
-        );
+        )?;
         assert_eq!(
-            pkt,
-            "N0CALL>APK005,WIDE1-1,qAC,N0CALL:!4903.50N/07201.75W-\r\n"
+            pkt.as_bytes(),
+            b"N0CALL>APK005,WIDE1-1,qAC,N0CALL:!4903.50N/07201.75W-\r\n"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn format_is_packet_with_qconstruct_rejects_framing_in_every_text_field() {
+        for result in [
+            format_is_packet_with_qconstruct(
+                "N0CALL\rFORGED",
+                "APK005",
+                &[],
+                QConstruct::QAC,
+                "GATE",
+                "data",
+            ),
+            format_is_packet_with_qconstruct(
+                "N0CALL",
+                "APK005\nFORGED",
+                &[],
+                QConstruct::QAC,
+                "GATE",
+                "data",
+            ),
+            format_is_packet_with_qconstruct(
+                "N0CALL",
+                "APK005",
+                &["WIDE1-1\r\nFORGED"],
+                QConstruct::QAC,
+                "GATE",
+                "data",
+            ),
+            format_is_packet_with_qconstruct(
+                "N0CALL",
+                "APK005",
+                &[],
+                QConstruct::QAC,
+                "GATE\nFORGED",
+                "data",
+            ),
+            format_is_packet_with_qconstruct(
+                "N0CALL",
+                "APK005",
+                &[],
+                QConstruct::QAC,
+                "GATE",
+                "data\r\nFORGED>APRS:packet",
+            ),
+        ] {
+            assert!(matches!(
+                result,
+                Err(AprsIsUplinkLineError::EmbeddedNewline { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn format_is_packet_with_qconstruct_enforces_wire_limit() -> TestResult {
+        let prefix = b"N0CALL>APK005,qAC,GATE:";
+        let maximum_data = "X".repeat(crate::MAX_IS_LINE_BYTES - prefix.len() - 2);
+        let maximum = format_is_packet_with_qconstruct(
+            "N0CALL",
+            "APK005",
+            &[],
+            QConstruct::QAC,
+            "GATE",
+            &maximum_data,
+        )?;
+        assert_eq!(maximum.as_bytes().len(), crate::MAX_IS_LINE_BYTES);
+
+        let oversized_data = format!("{maximum_data}X");
+        assert!(matches!(
+            format_is_packet_with_qconstruct(
+                "N0CALL",
+                "APK005",
+                &[],
+                QConstruct::QAC,
+                "GATE",
+                &oversized_data,
+            ),
+            Err(AprsIsUplinkLineError::TooLong { .. })
+        ));
+        Ok(())
     }
 
     // ----- igate_format_for_is rewriter -----
@@ -560,8 +641,8 @@ mod tests {
 
         let line = igate_format_for_is(&src, &dst, &path, b"!4903.50N/07201.75W-", &igate, pass)?;
         assert_eq!(
-            line,
-            "W1AW>APK005,WIDE1-1*,qAR,N0CALL-7:!4903.50N/07201.75W-\r\n"
+            line.as_bytes(),
+            b"W1AW>APK005,WIDE1-1*,qAR,N0CALL-7:!4903.50N/07201.75W-\r\n"
         );
         Ok(())
     }
@@ -578,13 +659,22 @@ mod tests {
 
         let line = igate_format_for_is(&src, &dst, &path, b"!4903.50N/07201.75W-", &igate, pass)?;
         assert_eq!(
-            line,
-            "W1AW>APK005,WIDE1-1*,qAO,N0CALL-7:!4903.50N/07201.75W-\r\n"
+            line.as_bytes(),
+            b"W1AW>APK005,WIDE1-1*,qAO,N0CALL-7:!4903.50N/07201.75W-\r\n"
         );
         // Guard against the qAO/qAr and qAO/qAo confusions.
-        assert!(line.contains(",qAO,"), "expected capital-O qAO: {line}");
-        assert!(!line.contains(",qAr,"), "must not emit server qAr: {line}");
-        assert!(!line.contains(",qAo,"), "must not emit server qAo: {line}");
+        assert!(
+            contains_bytes(line.as_bytes(), b",qAO,"),
+            "expected capital-O qAO: {line:?}"
+        );
+        assert!(
+            !contains_bytes(line.as_bytes(), b",qAr,"),
+            "must not emit server qAr: {line:?}"
+        );
+        assert!(
+            !contains_bytes(line.as_bytes(), b",qAo,"),
+            "must not emit server qAo: {line:?}"
+        );
         Ok(())
     }
 
@@ -606,8 +696,8 @@ mod tests {
 
         let line = igate_format_for_is(&src, &dst, &path, b"!data", &igate, pass)?;
         assert_eq!(
-            line,
-            "W1AW>APK005,WIDE1-1*,WIDE2-2*,WIDE3-3,qAR,N0CALL-7:!data\r\n"
+            line.as_bytes(),
+            b"W1AW>APK005,WIDE1-1*,WIDE2-2*,WIDE3-3,qAR,N0CALL-7:!data\r\n"
         );
         Ok(())
     }
@@ -626,8 +716,8 @@ mod tests {
         let line = igate_format_for_is(&src, &dst, &path, b"test", &igate, pass)?;
         // Heard hop keeps `*`; unrepeated hop is kept without `*`.
         assert!(
-            line.contains(",WIDE1-1*,WIDE2-1,qAR,"),
-            "full heard path should be preserved: {line}"
+            contains_bytes(line.as_bytes(), b",WIDE1-1*,WIDE2-1,qAR,"),
+            "full heard path should be preserved: {line:?}"
         );
         Ok(())
     }
@@ -646,7 +736,14 @@ mod tests {
         let pass = Passcode::Verified(12_345);
 
         let line = igate_format_for_is(&src, &dst, &path, b"test", &igate, pass)?;
-        assert_eq!(line.matches(",qAR,").count(), 1, "exactly one qAR: {line}");
+        assert_eq!(
+            line.as_bytes()
+                .windows(b",qAR,".len())
+                .filter(|window| *window == b",qAR,")
+                .count(),
+            1,
+            "exactly one qAR: {line:?}"
+        );
         Ok(())
     }
 
@@ -659,7 +756,12 @@ mod tests {
         let pass = Passcode::Verified(12_345);
 
         let result = igate_format_for_is(&src, &dst, &path, b"test", &igate, pass);
-        assert_eq!(result, Err(IGateError::PathBlocksGating));
+        assert_eq!(
+            result,
+            Err(IGateFormatError::GatingRefused(
+                IGateError::PathBlocksGating
+            ))
+        );
     }
 
     #[test]
@@ -672,7 +774,7 @@ mod tests {
 
         assert_eq!(
             igate_format_for_is(&src, &dst, &path, b"test", &igate, pass),
-            Err(IGateError::PathIsRfOnly)
+            Err(IGateFormatError::GatingRefused(IGateError::PathIsRfOnly))
         );
     }
 
@@ -686,7 +788,9 @@ mod tests {
 
         assert_eq!(
             igate_format_for_is(&src, &dst, &path, b"test", &igate, pass),
-            Err(IGateError::PathAlreadyGated)
+            Err(IGateFormatError::GatingRefused(
+                IGateError::PathAlreadyGated
+            ))
         );
     }
 
@@ -700,7 +804,9 @@ mod tests {
 
         assert_eq!(
             igate_format_for_is(&src, &dst, &path, b"test", &igate, pass),
-            Err(IGateError::SourceIsInternet)
+            Err(IGateFormatError::GatingRefused(
+                IGateError::SourceIsInternet
+            ))
         );
     }
 
@@ -715,7 +821,9 @@ mod tests {
         // Info field starts with `}` (third-party header).
         assert_eq!(
             igate_format_for_is(&src, &dst, &path, b"}wrapped", &igate, pass),
-            Err(IGateError::ThirdPartyPacket)
+            Err(IGateFormatError::GatingRefused(
+                IGateError::ThirdPartyPacket
+            ))
         );
     }
 
@@ -730,7 +838,7 @@ mod tests {
 
         assert_eq!(
             igate_format_for_is(&src, &dst, &path, b"test", &igate, pass),
-            Err(IGateError::LoopDetected)
+            Err(IGateFormatError::GatingRefused(IGateError::LoopDetected))
         );
     }
 
@@ -744,15 +852,16 @@ mod tests {
         let pass = Passcode::Verified(12_345);
 
         let line = igate_format_for_is(&src, &dst, &path, b"!4903.50N/07201.75W-", &igate, pass)?;
-        assert_eq!(line, "W1AW>APK005,qAR,N0CALL-7:!4903.50N/07201.75W-\r\n");
+        assert_eq!(
+            line.as_bytes(),
+            b"W1AW>APK005,qAR,N0CALL-7:!4903.50N/07201.75W-\r\n"
+        );
         Ok(())
     }
 
     #[test]
-    fn igate_format_preserves_non_utf8_info_lossily() -> TestResult {
-        // Mic-E and binary weather data carry bytes ≥ 0x80. The lossy
-        // decode replaces invalid UTF-8 sequences with U+FFFD; the line
-        // remains a well-formed Rust `String`.
+    fn igate_format_preserves_non_utf8_info_exactly() -> TestResult {
+        // Mic-E and binary weather data carry bytes at or above 0x80.
         let src = addr("W1AW", 0);
         let dst = addr("APK005", 0);
         let path = vec![];
@@ -761,8 +870,77 @@ mod tests {
 
         let info: &[u8] = &[b'`', 0xC1, 0x82, b'X'];
         let line = igate_format_for_is(&src, &dst, &path, info, &igate, pass)?;
-        assert!(line.starts_with("W1AW>APK005,qAR,N0CALL-7:`"));
-        assert!(line.contains('\u{FFFD}'), "expected U+FFFD in {line}");
+        let mut expected = b"W1AW>APK005,qAR,N0CALL-7:".to_vec();
+        expected.extend_from_slice(info);
+        expected.extend_from_slice(b"\r\n");
+        assert_eq!(line.as_bytes(), expected);
+        Ok(())
+    }
+
+    #[test]
+    fn igate_format_rejects_information_field_framing_bytes() {
+        let src = addr("W1AW", 0);
+        let dst = addr("APK005", 0);
+        let igate = addr("N0CALL", 7);
+        let pass = Passcode::Verified(12_345);
+
+        let result = igate_format_for_is(&src, &dst, &[], b"good\r\nEVIL>X:forged", &igate, pass);
+        assert!(matches!(
+            result,
+            Err(IGateFormatError::InvalidUplinkLine(
+                AprsIsUplinkLineError::EmbeddedNewline { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn igate_format_normalizes_only_terminal_tnc_framing() -> TestResult {
+        let src = addr("W1AW", 0);
+        let dst = addr("APK005", 0);
+        let igate = addr("N0CALL", 7);
+        let pass = Passcode::Verified(12_345);
+
+        for terminated in [b">status\r".as_slice(), b">status\n", b">status\r\n"] {
+            let line = igate_format_for_is(&src, &dst, &[], terminated, &igate, pass)?;
+            assert_eq!(line.as_bytes(), b"W1AW>APK005,qAR,N0CALL-7:>status\r\n");
+        }
+
+        let injected = igate_format_for_is(
+            &src,
+            &dst,
+            &[],
+            b">status\r\nEVIL>APRS:forged\r",
+            &igate,
+            pass,
+        );
+        assert!(matches!(
+            injected,
+            Err(IGateFormatError::InvalidUplinkLine(
+                AprsIsUplinkLineError::EmbeddedNewline { .. }
+            ))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn igate_format_enforces_framed_line_limit() -> TestResult {
+        let src = addr("W1AW", 0);
+        let dst = addr("APK005", 0);
+        let igate = addr("N0CALL", 7);
+        let pass = Passcode::Verified(12_345);
+        let prefix = b"W1AW>APK005,qAR,N0CALL-7:";
+
+        let maximum_info = vec![b'A'; crate::MAX_IS_LINE_BYTES - prefix.len() - 2];
+        let maximum = igate_format_for_is(&src, &dst, &[], &maximum_info, &igate, pass)?;
+        assert_eq!(maximum.as_bytes().len(), crate::MAX_IS_LINE_BYTES);
+
+        let oversized_info = vec![b'A'; maximum_info.len() + 1];
+        assert!(matches!(
+            igate_format_for_is(&src, &dst, &[], &oversized_info, &igate, pass),
+            Err(IGateFormatError::InvalidUplinkLine(
+                AprsIsUplinkLineError::TooLong { .. }
+            ))
+        ));
         Ok(())
     }
 

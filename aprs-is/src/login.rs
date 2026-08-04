@@ -152,18 +152,58 @@ pub fn aprs_is_passcode(callsign: &str) -> i32 {
     i32::from(hash & 0x7FFF)
 }
 
-/// Validate a login field that must be a single non-empty "word".
+/// Validate an APRS-IS login identity against the published wire grammar.
+fn validate_login_callsign(value: &str) -> Result<(), AprsIsError> {
+    let invalid = |reason| AprsIsError::InvalidLoginField {
+        field: "callsign",
+        reason,
+    };
+
+    if !value.is_ascii() {
+        return Err(invalid("must contain only ASCII characters"));
+    }
+    if value.len() > 9 {
+        return Err(invalid("must not exceed 9 ASCII characters including SSID"));
+    }
+    if value.matches('-').count() > 1 {
+        return Err(invalid("may contain only one SSID separator"));
+    }
+
+    let (base, suffix) = value
+        .split_once('-')
+        .map_or((value, None), |(base, suffix)| (base, Some(suffix)));
+    if base.len() < 3 {
+        return Err(invalid(
+            "base callsign must contain at least 3 alphanumeric characters",
+        ));
+    }
+    if !base.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return Err(invalid(
+            "base callsign must contain only ASCII alphanumeric characters",
+        ));
+    }
+    if let Some(suffix) = suffix {
+        if !(1..=2).contains(&suffix.len()) {
+            return Err(invalid("SSID must contain 1 or 2 characters"));
+        }
+        if !suffix.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+            return Err(invalid(
+                "SSID must contain only ASCII alphanumeric characters",
+            ));
+        }
+        if suffix == "0" {
+            return Err(invalid("SSID zero must be omitted"));
+        }
+    }
+    Ok(())
+}
+
+/// Validate a non-callsign login field that must be one non-empty word.
 ///
-/// Per <http://www.aprs-is.net/Connecting.aspx>, the software name and
-/// version must each be one word ("Do not use spaces"), and a
-/// login/callsign is "alphanumeric ASCII characters only" with at most a
-/// single hyphen-SSID. The login line is space-delimited, so any
-/// embedded whitespace (space, tab, …) or `CRLF`/control character in
-/// these fields would either shift the keyword parsing or, for a raw
-/// `\n`, inject a second handshake line. We reject the whole class of
-/// ASCII whitespace and control characters here rather than enumerating
-/// the exact callsign grammar, which is stricter than necessary but
-/// never rejects a valid value.
+/// Per <https://www.aprs-is.net/Connecting.aspx>, the software name and
+/// version must each be one word ("Do not use spaces"). The login line is
+/// space-delimited, so any embedded whitespace or control character would
+/// shift the keyword parsing or inject another handshake line.
 fn validate_login_word(field: &'static str, value: &str) -> Result<(), AprsIsError> {
     if value.is_empty() {
         return Err(AprsIsError::InvalidLoginField {
@@ -183,7 +223,7 @@ fn validate_login_word(field: &'static str, value: &str) -> Result<(), AprsIsErr
 /// Validate the filter clause, which legitimately contains spaces
 /// between sub-clauses but must not carry a `CR`/`LF`.
 ///
-/// Per <http://www.aprs-is.net/Connecting.aspx> the `servercommand`
+/// Per <https://www.aprs-is.net/Connecting.aspx> the `servercommand`
 /// (e.g. `filter r/33/-96/25`) allows spaces, so unlike the software
 /// name/version we only reject the line terminators: a `\r`/`\n` inside
 /// the filter would inject a second handshake line.
@@ -203,21 +243,22 @@ fn validate_filter(value: &str) -> Result<(), AprsIsError> {
 ///
 /// If the filter is empty, the `filter` clause is omitted.
 ///
-/// The callsign, software name, and software version are validated as
-/// single whitespace-free words and the filter is checked for embedded
-/// `CRLF` before the line is assembled. This is the choke point for the
-/// handshake: an unvalidated value could otherwise corrupt the
+/// The callsign is validated against APRS-IS's ASCII-alphanumeric,
+/// optional-SSID, and nine-byte identity grammar. Software name/version are
+/// validated as single whitespace-free words, and the filter is checked for
+/// embedded `CRLF` before the line is assembled. This is the choke point for
+/// the handshake: an unvalidated value could otherwise corrupt the
 /// space-delimited login line or inject a second handshake line onto the
-/// stream. See <http://www.aprs-is.net/Connecting.aspx> ("Login Format
+/// stream. See <https://www.aprs-is.net/Connecting.aspx> ("Login Format
 /// Rules"; software name/version "Do not use spaces").
 ///
 /// # Errors
 ///
-/// Returns [`AprsIsError::InvalidLoginField`] if the callsign, software
-/// name, or software version contains whitespace or a control character
-/// (or is empty), or if the filter contains a `\r`/`\n`.
+/// Returns [`AprsIsError::InvalidLoginField`] if the callsign violates the
+/// APRS-IS identity grammar, the software name/version is empty or contains
+/// whitespace/control characters, or the filter contains a `\r`/`\n`.
 pub fn build_login_string(config: &AprsIsConfig) -> Result<String, AprsIsError> {
-    validate_login_word("callsign", &config.callsign)?;
+    validate_login_callsign(&config.callsign)?;
     validate_login_word("software_name", &config.software_name)?;
     validate_login_word("software_version", &config.software_version)?;
     validate_filter(&config.filter)?;
@@ -416,6 +457,44 @@ mod tests {
             ),
             "expected InvalidLoginField(callsign), got {result:?}"
         );
+    }
+
+    #[test]
+    fn login_string_enforces_complete_aprs_is_identity_grammar() {
+        for invalid in [
+            "",
+            "NO",
+            "N0_CALL",
+            "N0CALL-0",
+            "N0CALL-",
+            "N0CALL-ABC",
+            "N0CALL-A-",
+            "N0CALL-1-2",
+            "N0CALL1234",
+            "NØCALL",
+            "N0CALL*",
+        ] {
+            let config = AprsIsConfig::new(invalid);
+            assert!(
+                matches!(
+                    build_login_string(&config),
+                    Err(AprsIsError::InvalidLoginField {
+                        field: "callsign",
+                        ..
+                    })
+                ),
+                "accepted invalid login identity {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn login_string_accepts_case_preserved_two_character_ssid()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = AprsIsConfig::new("ae5pl-TS");
+        let login = build_login_string(&config)?;
+        assert!(login.starts_with("user ae5pl-TS pass "));
+        Ok(())
     }
 
     #[test]

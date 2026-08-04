@@ -1,6 +1,6 @@
 //! APRS-IS server-side filter expressions.
 //!
-//! Per <http://www.aprs-is.net/javAPRSFilter.aspx>, APRS-IS servers
+//! Per <https://www.aprs-is.net/javAPRSFilter.aspx>, APRS-IS servers
 //! accept a small filter-expression language for selecting which
 //! packets to deliver to a client connection. Each filter line is a
 //! whitespace-separated list of clauses; matching is **OR** across
