@@ -108,6 +108,15 @@ final class APRSOperationsWorkspaceTests: XCTestCase {
         XCTAssertEqual(position?.longitude, -71.0589)
         XCTAssertNil(APRSTransmitValidator.position(latitude: "91", longitude: "0"))
         XCTAssertNil(APRSTransmitValidator.position(latitude: "0", longitude: "-181"))
+
+        XCTAssertNil(
+            APRSTransmitValidator.positionTextError(String(repeating: "x", count: 43))
+        )
+        XCTAssertNotNil(
+            APRSTransmitValidator.positionTextError(String(repeating: "x", count: 44))
+        )
+        XCTAssertNotNil(APRSTransmitValidator.positionTextError("non-ASCII 🚗"))
+        XCTAssertNotNil(APRSTransmitValidator.positionTextError("reserved | delimiter"))
     }
 
     func testSettingQueryIncludesOnlyAPRSAndUsesMenuOrder() {

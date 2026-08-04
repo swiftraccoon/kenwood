@@ -447,6 +447,11 @@ public actor AzimuthUSBSerialTransport: AzimuthRadioTransport {
             return reason
         case AzimuthUSBLinkError.serviceNotFound:
             return "TH-D75 USB service not found"
+        case AzimuthUSBLinkError.ambiguousDevices(let paths):
+            let names = paths.map { ($0 as NSString).lastPathComponent }
+                .joined(separator: ", ")
+            return "Multiple TH-D75 USB serial devices are attached (\(names)). "
+                + "Choose an exact device path or disconnect all but one radio."
         case AzimuthUSBLinkError.openFailed(let code):
             return "USB open failed: \(azimuthKernReturnString(code))"
         case AzimuthUSBLinkError.notOpen:

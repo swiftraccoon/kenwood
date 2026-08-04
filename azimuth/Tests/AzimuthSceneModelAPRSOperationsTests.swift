@@ -50,7 +50,7 @@ final class AzimuthSceneModelAPRSOperationsTests: XCTestCase {
         let configuration = APRSSessionConfiguration(
             stationCallsign: "W1AW-9",
             path: "WIDE1-1,WIDE2-1",
-            baud: .bps9600,
+            dataRate: .bps9600,
             symbolTable: "/",
             symbolCode: ">",
             txDelay10ms: 35,
@@ -157,7 +157,7 @@ final class AzimuthSceneModelAPRSOperationsTests: XCTestCase {
         let configuration = APRSSessionConfiguration(
             stationCallsign: "W1AW-9",
             path: "WIDE1-1,WIDE2-1",
-            baud: .bps1200,
+            dataRate: .bps1200,
             symbolTable: "/",
             symbolCode: ">",
             txDelay10ms: 50,

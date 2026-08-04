@@ -118,6 +118,7 @@ targets:
       # and screen modules, whose native Objective-C shims reference these
       # system frameworks even though Azimuth itself uses USB-C.
       - sdk: IOBluetooth.framework
+      - sdk: IOKit.framework
       - sdk: Vision.framework
     info:
       path: macOS/Info.plist

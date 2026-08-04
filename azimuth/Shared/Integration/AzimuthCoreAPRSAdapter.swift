@@ -15,7 +15,7 @@ enum AzimuthCoreAPRSAdapter {
         AprsSessionConfig(
             stationCallsign: configuration.stationCallsign,
             path: configuration.path,
-            baud: coreBaud(configuration.baud),
+            dataRate: coreDataRate(configuration.dataRate),
             symbolTable: configuration.symbolTable,
             symbolCode: configuration.symbolCode,
             txDelay10ms: configuration.txDelay10ms,
@@ -108,7 +108,7 @@ enum AzimuthCoreAPRSAdapter {
         APRSSessionConfiguration(
             stationCallsign: record.stationCallsign,
             path: record.path,
-            baud: baud(record.baud),
+            dataRate: dataRate(record.dataRate),
             symbolTable: record.symbolTable,
             symbolCode: record.symbolCode,
             txDelay10ms: record.txDelay10ms,
@@ -119,15 +119,15 @@ enum AzimuthCoreAPRSAdapter {
         )
     }
 
-    private static func coreBaud(_ baud: APRSTNCBaud) -> AprsTncBaud {
-        switch baud {
+    private static func coreDataRate(_ dataRate: APRSPacketDataRate) -> AprsPacketDataRate {
+        switch dataRate {
         case .bps1200: return .bps1200
         case .bps9600: return .bps9600
         }
     }
 
-    private static func baud(_ baud: AprsTncBaud) -> APRSTNCBaud {
-        switch baud {
+    private static func dataRate(_ dataRate: AprsPacketDataRate) -> APRSPacketDataRate {
+        switch dataRate {
         case .bps1200: return .bps1200
         case .bps9600: return .bps9600
         }

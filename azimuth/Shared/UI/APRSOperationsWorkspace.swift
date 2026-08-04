@@ -579,11 +579,11 @@ struct APRSOperationsWorkspace: View {
                     )
 
                     VStack(alignment: .leading, spacing: 6) {
-                        Text("TNC data rate")
+                        Text("Packet data rate")
                             .font(.subheadline.weight(.semibold))
-                        Picker("TNC data rate", selection: $configuration.baud) {
-                            ForEach(APRSTNCBaud.allCases) { baud in
-                                Text(baud.title).tag(baud)
+                        Picker("Packet data rate", selection: $configuration.dataRate) {
+                            ForEach(APRSPacketDataRate.allCases) { dataRate in
+                                Text(dataRate.title).tag(dataRate)
                             }
                         }
                         .labelsHidden()
@@ -1596,6 +1596,11 @@ private struct APRSPositionTransmitView: View {
                 TextField("Longitude (−180…180)", text: $longitude)
                 TextField("Comment (optional)", text: $comment, axis: .vertical)
                     .lineLimit(2...4)
+                if let commentError = APRSTransmitValidator.positionTextError(comment) {
+                    Text(commentError)
+                        .font(.caption)
+                        .foregroundStyle(AzimuthPalette.caution)
+                }
             }
 
             Section {
@@ -1618,7 +1623,11 @@ private struct APRSPositionTransmitView: View {
             }
             ToolbarItem(placement: .confirmationAction) {
                 Button("Review & Transmit") { showsConfirmation = true }
-                    .disabled(parsedPosition == nil || isSending)
+                    .disabled(
+                        parsedPosition == nil
+                            || APRSTransmitValidator.positionTextError(comment) != nil
+                            || isSending
+                    )
             }
         }
         .sheet(isPresented: $showsConfirmation) {
@@ -1661,7 +1670,9 @@ private struct APRSPositionTransmitView: View {
 
     @MainActor
     private func performSend() async {
-        guard !isSending, let position = parsedPosition else { return }
+        guard !isSending,
+              let position = parsedPosition,
+              APRSTransmitValidator.positionTextError(comment) == nil else { return }
         isSending = true
         defer { isSending = false }
         do {
@@ -1676,6 +1687,8 @@ private struct APRSPositionTransmitView: View {
 enum APRSTransmitValidator {
     /// APRS message text is at most 67 bytes in the protocol implementation.
     static let maximumMessageBytes = 67
+    /// Uncompressed position text has 43 bytes after the symbol code.
+    static let maximumPositionTextBytes = 43
 
     static func messageError(
         addressee: String,
@@ -1699,6 +1712,20 @@ enum APRSTransmitValidator {
                   }) else {
                 return "Message ID must contain 1–5 ASCII letters or digits."
             }
+        }
+        return nil
+    }
+
+    static func positionTextError(_ text: String) -> String? {
+        let bytes = Array(text.utf8)
+        guard bytes.count <= maximumPositionTextBytes else {
+            return "Position comment must contain at most \(maximumPositionTextBytes) ASCII bytes."
+        }
+        guard bytes.allSatisfy({ (0x20...0x7E).contains($0) }) else {
+            return "Position comment must contain only printable ASCII characters."
+        }
+        guard !bytes.contains(0x7C), !bytes.contains(0x7E) else {
+            return "Position comment cannot contain | or ~."
         }
         return nil
     }

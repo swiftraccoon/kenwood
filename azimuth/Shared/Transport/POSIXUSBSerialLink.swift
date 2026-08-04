@@ -6,6 +6,7 @@
 import Darwin
 import Dispatch
 import Foundation
+import IOKit
 
 /// Native macOS transport through Apple's public CDC ACM tty service.
 /// No dext or private framework is needed on macOS: the TH-D75 appears as a
@@ -13,6 +14,13 @@ import Foundation
 public final class POSIXAzimuthUSBSerialLink: AzimuthUSBSerialLink, @unchecked Sendable {
     public static let deviceDirectory = "/dev"
     public static let calloutPrefix = "cu.usbmodem"
+    static let thD75VendorID: UInt16 = 0x2166
+    static let thD75ProductID: UInt16 = 0x9023
+
+    struct USBIdentity: Equatable {
+        let vendorID: UInt16
+        let productID: UInt16
+    }
 
     private let requestedPath: String?
     private let operationLock = NSLock()
@@ -25,8 +33,8 @@ public final class POSIXAzimuthUSBSerialLink: AzimuthUSBSerialLink, @unchecked S
     private var readabilitySource: DispatchSourceRead?
     private var doorbell: (@Sendable (Bool) -> Void)?
 
-    /// Pass an exact callout path when a future picker offers more than one
-    /// attached CDC radio. Nil deterministically selects the first path.
+    /// Pass an exact verified TH-D75 callout path when more than one radio is
+    /// attached. Nil is accepted only when discovery finds exactly one radio.
     public init(devicePath: String? = nil) {
         requestedPath = devicePath
     }
@@ -38,10 +46,11 @@ public final class POSIXAzimuthUSBSerialLink: AzimuthUSBSerialLink, @unchecked S
     }
 
     public func servicePresent() -> Bool {
+        let verifiedPaths = Self.availableDevicePaths()
         if let requestedPath {
-            return FileManager.default.fileExists(atPath: requestedPath)
+            return verifiedPaths.contains(requestedPath)
         }
-        return !Self.availableDevicePaths().isEmpty
+        return !verifiedPaths.isEmpty
     }
 
     public func open() throws {
@@ -51,8 +60,10 @@ public final class POSIXAzimuthUSBSerialLink: AzimuthUSBSerialLink, @unchecked S
         defer { lock.unlock() }
         guard fileDescriptor < 0 else { return }
 
-        let path = requestedPath ?? Self.availableDevicePaths().first
-        guard let path else { throw AzimuthUSBLinkError.serviceNotFound }
+        let path = try Self.selectDevicePath(
+            requestedPath: requestedPath,
+            verifiedPaths: Self.availableDevicePaths()
+        )
 
         let opened = Darwin.open(path, O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC)
         guard opened >= 0 else {
@@ -237,11 +248,108 @@ public final class POSIXAzimuthUSBSerialLink: AzimuthUSBSerialLink, @unchecked S
     public static func availableDevicePaths(
         directory: String = deviceDirectory
     ) -> [String] {
+        availableDevicePaths(
+            directory: directory,
+            identityProvider: registeredUSBIdentity(for:)
+        )
+    }
+
+    static func availableDevicePaths(
+        directory: String,
+        identityProvider: (String) -> USBIdentity?
+    ) -> [String] {
         let names = (try? FileManager.default.contentsOfDirectory(atPath: directory)) ?? []
         return names
             .filter { $0.hasPrefix(calloutPrefix) }
             .sorted()
             .map { (directory as NSString).appendingPathComponent($0) }
+            .filter { path in
+                identityProvider(path) == USBIdentity(
+                    vendorID: thD75VendorID,
+                    productID: thD75ProductID
+                )
+            }
+    }
+
+    static func selectDevicePath(
+        requestedPath: String?,
+        verifiedPaths: [String]
+    ) throws -> String {
+        if let requestedPath {
+            guard verifiedPaths.contains(requestedPath) else {
+                throw AzimuthUSBLinkError.serviceNotFound
+            }
+            return requestedPath
+        }
+        guard let onlyPath = verifiedPaths.first else {
+            throw AzimuthUSBLinkError.serviceNotFound
+        }
+        guard verifiedPaths.count == 1 else {
+            throw AzimuthUSBLinkError.ambiguousDevices(verifiedPaths)
+        }
+        return onlyPath
+    }
+
+    /// Resolve the tty's IORegistry ancestry before treating it as a radio.
+    /// A `/dev/cu.usbmodem*` basename alone also describes development boards,
+    /// phones, and unrelated CDC devices and is not safe identification.
+    private static func registeredUSBIdentity(for path: String) -> USBIdentity? {
+        guard let matching = IOServiceMatching("IOSerialBSDClient") else {
+            return nil
+        }
+        var iterator: io_iterator_t = 0
+        guard IOServiceGetMatchingServices(
+            kIOMainPortDefault,
+            matching,
+            &iterator
+        ) == KERN_SUCCESS else {
+            return nil
+        }
+        defer { IOObjectRelease(iterator) }
+
+        while true {
+            let service = IOIteratorNext(iterator)
+            guard service != IO_OBJECT_NULL else { return nil }
+
+            let calloutPath = IORegistryEntryCreateCFProperty(
+                service,
+                "IOCalloutDevice" as CFString,
+                kCFAllocatorDefault,
+                0
+            )?.takeRetainedValue() as? String
+            if calloutPath == path {
+                let identity = registeredUSBIdentity(for: service)
+                IOObjectRelease(service)
+                return identity
+            }
+            IOObjectRelease(service)
+        }
+    }
+
+    private static func registeredUSBIdentity(for service: io_service_t) -> USBIdentity? {
+        let options = IOOptionBits(
+            kIORegistryIterateRecursively | kIORegistryIterateParents
+        )
+        guard let vendor = IORegistryEntrySearchCFProperty(
+            service,
+            kIOServicePlane,
+            "idVendor" as CFString,
+            kCFAllocatorDefault,
+            options
+        ) as? NSNumber,
+        let product = IORegistryEntrySearchCFProperty(
+            service,
+            kIOServicePlane,
+            "idProduct" as CFString,
+            kCFAllocatorDefault,
+            options
+        ) as? NSNumber else {
+            return nil
+        }
+        return USBIdentity(
+            vendorID: vendor.uint16Value,
+            productID: product.uint16Value
+        )
     }
 
     private func readabilityChanged() {

@@ -3,6 +3,21 @@
 
 import Foundation
 
+/// Resume a staged startup only if the owning session survived its suspended
+/// preparation step. Keeping the check and side effect in one helper prevents a
+/// caller from accidentally activating a system resource before noticing that
+/// Stop/background invalidated the session.
+@MainActor
+func resumeIFDSPStartupIfCurrent<Prepared>(
+    after suspendedPreparation: () async throws -> Void,
+    isCurrent: () -> Bool,
+    prepare: () throws -> Prepared
+) async rethrows -> Prepared? {
+    try await suspendedPreparation()
+    guard isCurrent() else { return nil }
+    return try prepare()
+}
+
 #if os(iOS)
 @preconcurrency import AVFAudio
 
@@ -73,7 +88,9 @@ final class IFDSPAudioStreamService: IFDSPLiveStreaming {
         activeSessionID = sessionID
         currentState = .requestingPermission
 
-        guard await audioPermissionIsGranted() else {
+        let permissionGranted = await audioPermissionIsGranted()
+        guard activeSessionID == sessionID else { return }
+        guard permissionGranted else {
             activeSessionID = nil
             currentState = .failed(
                 message: "Audio-input permission is off. Allow Azimuth in Settings to capture the radio's USB IF stream.",
@@ -81,11 +98,17 @@ final class IFDSPAudioStreamService: IFDSPLiveStreaming {
             )
             return
         }
-        guard activeSessionID == sessionID else { return }
 
         do {
-            try await Task.detached { try processor.reset() }.value
-            let selectedInput = try prepareAudioSession()
+            guard let selectedInput = try await resumeIFDSPStartupIfCurrent(
+                after: {
+                    try await Task.detached { try processor.reset() }.value
+                },
+                isCurrent: { self.activeSessionID == sessionID },
+                prepare: { try self.prepareAudioSession() }
+            ) else {
+                return
+            }
             try await verifySelectedRoute(selectedInput)
             guard activeSessionID == sessionID else { return }
             currentState = .starting(routeName: selectedInput.portName)
@@ -95,6 +118,7 @@ final class IFDSPAudioStreamService: IFDSPLiveStreaming {
                 sessionID: sessionID
             )
         } catch let error as IFDSPAudioStreamError {
+            guard activeSessionID == sessionID else { return }
             finishCapture(publishIdle: false)
             switch error {
             case .noUSBAudioInput(let availableInputs):
@@ -106,6 +130,7 @@ final class IFDSPAudioStreamService: IFDSPLiveStreaming {
                 )
             }
         } catch {
+            guard activeSessionID == sessionID else { return }
             finishCapture(publishIdle: false)
             currentState = .failed(
                 message: "Live IF capture failed: \(error.localizedDescription)",

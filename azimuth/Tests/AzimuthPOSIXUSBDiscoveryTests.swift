@@ -8,7 +8,7 @@ import XCTest
 @testable import Azimuth
 
 final class AzimuthPOSIXUSBDiscoveryTests: XCTestCase {
-    func testDiscoveryIncludesOnlySortedCalloutDevices() throws {
+    func testDiscoveryIncludesOnlySortedVerifiedTHD75CalloutDevices() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(
@@ -16,19 +16,78 @@ final class AzimuthPOSIXUSBDiscoveryTests: XCTestCase {
             withIntermediateDirectories: false
         )
         defer { try? FileManager.default.removeItem(at: directory) }
-        for name in ["cu.usbmodemB", "tty.usbmodemA", "cu.Bluetooth", "cu.usbmodemA"] {
+        for name in [
+            "cu.usbmodemC",
+            "cu.usbmodemB",
+            "tty.usbmodemA",
+            "cu.Bluetooth",
+            "cu.usbmodemA",
+        ] {
             XCTAssertTrue(FileManager.default.createFile(
                 atPath: directory.appendingPathComponent(name).path,
                 contents: Data()
             ))
         }
 
-        XCTAssertEqual(
-            POSIXAzimuthUSBSerialLink.availableDevicePaths(directory: directory.path),
-            ["cu.usbmodemA", "cu.usbmodemB"].map {
-                directory.appendingPathComponent($0).path
+        let radioA = directory.appendingPathComponent("cu.usbmodemA").path
+        let unrelatedB = directory.appendingPathComponent("cu.usbmodemB").path
+        let radioC = directory.appendingPathComponent("cu.usbmodemC").path
+        let verified = POSIXAzimuthUSBSerialLink.availableDevicePaths(
+            directory: directory.path,
+            identityProvider: { path in
+                if path == radioA || path == radioC {
+                    return .init(
+                        vendorID: POSIXAzimuthUSBSerialLink.thD75VendorID,
+                        productID: POSIXAzimuthUSBSerialLink.thD75ProductID
+                    )
+                }
+                if path == unrelatedB {
+                    return .init(vendorID: 0x2341, productID: 0x0043)
+                }
+                return nil
             }
         )
+
+        XCTAssertEqual(verified, [radioA, radioC])
+    }
+
+    func testImplicitSelectionRejectsMultipleVerifiedRadios() throws {
+        let paths = ["/dev/cu.usbmodemA", "/dev/cu.usbmodemB"]
+
+        XCTAssertThrowsError(
+            try POSIXAzimuthUSBSerialLink.selectDevicePath(
+                requestedPath: nil,
+                verifiedPaths: paths
+            )
+        ) { error in
+            guard case AzimuthUSBLinkError.ambiguousDevices(let found) = error else {
+                return XCTFail("unexpected error: \(error)")
+            }
+            XCTAssertEqual(found, paths)
+        }
+        XCTAssertEqual(
+            try POSIXAzimuthUSBSerialLink.selectDevicePath(
+                requestedPath: paths[1],
+                verifiedPaths: paths
+            ),
+            paths[1]
+        )
+        XCTAssertThrowsError(
+            try POSIXAzimuthUSBSerialLink.selectDevicePath(
+                requestedPath: "/dev/cu.usbmodem-unverified",
+                verifiedPaths: paths
+            )
+        ) { error in
+            XCTAssertEqual(error as? AzimuthUSBLinkError, .serviceNotFound)
+        }
+        XCTAssertThrowsError(
+            try POSIXAzimuthUSBSerialLink.selectDevicePath(
+                requestedPath: nil,
+                verifiedPaths: []
+            )
+        ) { error in
+            XCTAssertEqual(error as? AzimuthUSBLinkError, .serviceNotFound)
+        }
     }
 }
 

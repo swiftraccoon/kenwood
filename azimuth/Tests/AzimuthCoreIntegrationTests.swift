@@ -473,7 +473,7 @@ final class AzimuthLiveRadioControllerTests: XCTestCase {
         let configuration = AprsSessionConfig(
             stationCallsign: "N0CALL-7",
             path: "WIDE1-1",
-            baud: .bps1200,
+            dataRate: .bps1200,
             symbolTable: "/",
             symbolCode: ">",
             txDelay10ms: 50,

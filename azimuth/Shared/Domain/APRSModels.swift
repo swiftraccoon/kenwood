@@ -3,7 +3,7 @@
 
 import Foundation
 
-enum APRSTNCBaud: String, CaseIterable, Identifiable, Equatable, Sendable {
+enum APRSPacketDataRate: String, CaseIterable, Identifiable, Equatable, Sendable {
     case bps1200
     case bps9600
 
@@ -22,7 +22,7 @@ enum APRSTNCBaud: String, CaseIterable, Identifiable, Equatable, Sendable {
 struct APRSSessionConfiguration: Equatable, Sendable {
     var stationCallsign: String
     var path: String
-    var baud: APRSTNCBaud
+    var dataRate: APRSPacketDataRate
     var symbolTable: String
     var symbolCode: String
     var txDelay10ms: UInt8
@@ -34,7 +34,7 @@ struct APRSSessionConfiguration: Equatable, Sendable {
     static let receiveOnly = APRSSessionConfiguration(
         stationCallsign: "",
         path: "WIDE1-1,WIDE2-1",
-        baud: .bps1200,
+        dataRate: .bps1200,
         symbolTable: "/",
         symbolCode: ">",
         txDelay10ms: 50,

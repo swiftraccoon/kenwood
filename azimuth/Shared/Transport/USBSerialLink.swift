@@ -170,6 +170,7 @@ public func azimuthKernReturnString(_ value: Int32) -> String {
 public enum AzimuthUSBLinkError: Error, Sendable, Equatable {
     case unsupportedEnvironment(String)
     case serviceNotFound
+    case ambiguousDevices([String])
     case openFailed(code: Int32)
     case notOpen
     case invalidTransferLength(Int)
