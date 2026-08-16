@@ -24,9 +24,15 @@
 //! let frame = KissFrame::data(vec![/* AX.25 */]);
 //! kiss.send_frame(&frame).await?;
 //!
-//! // Exit KISS mode, then prove that ordinary CAT framing is restored.
-//! let mut radio = kiss.exit().await.map_err(|(_session, e)| e)?;
-//! radio.restore_cat_after_mode_exit().await?;
+//! // Exit KISS mode; the desynchronized radio must be restored (or
+//! // taken explicitly unproven) before ordinary CAT commands.
+//! let radio = kiss
+//!     .exit()
+//!     .await
+//!     .map_err(|(_session, e)| e)?
+//!     .restore()
+//!     .await
+//!     .map_err(|(_desynced, e)| e)?;
 //! # Ok(())
 //! # }
 //! ```
@@ -44,7 +50,7 @@ use crate::types::{
     KissDuplex, KissPersistence, KissSlotTime, KissTxDelay, KissTxTail, PacketDataRate, TncMode,
 };
 
-use super::{Radio, cat_restore_state::CatRestoreState};
+use super::{DesyncedRadio, Radio, cat_restore_state::CatRestoreState};
 
 /// Default timeout for KISS receive operations (10 seconds).
 const KISS_RECEIVE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -465,17 +471,17 @@ impl<T: Transport> KissSession<T> {
 
     /// Exit KISS mode by sending the `CMD_RETURN` (`0xFF`) frame.
     ///
-    /// The returned [`Radio`] is deliberately desynchronized because binary
-    /// bytes may remain buffered after the return frame. Call
-    /// [`Radio::restore_cat_after_mode_exit`] and require it to succeed before
-    /// reporting or resuming ordinary CAT operation.
+    /// Binary bytes may remain buffered after the return frame, so the
+    /// radio comes back wrapped in [`DesyncedRadio`]: call
+    /// [`DesyncedRadio::restore`] to drain the residue and re-prove the
+    /// CAT boundary before ordinary commands.
     ///
     /// # Errors
     ///
     /// Returns the session back together with the error if the exit
     /// write fails, so the already-owned transport survives for an exact
     /// retry without an unnecessary reconnect.
-    pub async fn exit(mut self) -> Result<Radio<T>, (Self, Error)> {
+    pub async fn exit(mut self) -> Result<DesyncedRadio<T>, (Self, Error)> {
         tracing::info!("exiting KISS mode");
         if let Err(e) = self.send_frame(&KissFrame::return_command()).await {
             return Err((self, e));
@@ -484,7 +490,21 @@ impl<T: Transport> KissSession<T> {
         // Small delay to let the TNC switch back to CAT mode.
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        Ok(self.cat_restore.rebuild_desynchronized(self.transport))
+        Ok(DesyncedRadio::new(
+            self.cat_restore.rebuild_desynchronized(self.transport),
+        ))
+    }
+
+    /// Reclaim the [`Radio`] after a failed [`exit`](Self::exit) without
+    /// retrying the exit.
+    ///
+    /// The KISS Return frame may never have reached the TNC, so the
+    /// radio may still be in KISS mode. The returned radio is marked
+    /// recovery-required: ordinary CAT must be re-proved (see
+    /// [`Radio::restore_cat_after_mode_exit`]) before further use.
+    #[must_use]
+    pub fn into_radio_recovery_required(self) -> Radio<T> {
+        self.cat_restore.rebuild_desynchronized(self.transport)
     }
 }
 
@@ -738,7 +758,11 @@ mod tests {
         // CMD_RETURN frame: C0 FF C0
         session.transport.expect(&[FEND, 0xFF, FEND], &[]);
 
-        let radio = session.exit().await.map_err(|(_, e)| e)?;
+        let radio = session
+            .exit()
+            .await
+            .map_err(|(_, e)| e)?
+            .into_radio_unproven();
         assert_eq!(radio.timeout, Duration::from_millis(731));
         assert_eq!(
             radio
@@ -759,6 +783,39 @@ mod tests {
         );
         assert!(radio.desynced);
         assert!(radio.codec.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exit_then_restore_proves_cat_through_the_wrapper() -> TestResult {
+        let radio = mock_radio_for_kiss(PacketDataRate::Bps1200);
+        let mut session = radio
+            .enter_kiss(PacketDataRate::Bps1200)
+            .await
+            .map_err(|(_, e)| e)?;
+
+        // CMD_RETURN, then the CAT recovery preamble and identity proof
+        // that `restore` must drive.
+        session.transport.expect(&[FEND, 0xFF, FEND], &[]);
+        session.transport.expect(b"\r", b"");
+        session.transport.expect(b"\r", b"");
+        session.transport.expect(&[0x03], b"");
+        session.transport.expect(&[0xC0, 0xFF, 0xC0], b"");
+        session.transport.expect(b"\rTC 1\r", b"");
+        session.transport.expect(b"TN 0,0\r", b"");
+        session.transport.expect(b"ID\r", b"ID TH-D75\r");
+        session.transport.pend_when_empty();
+
+        let radio = session
+            .exit()
+            .await
+            .map_err(|(_, e)| e)?
+            .restore()
+            .await
+            .map_err(|(_, e)| e)?;
+        assert!(!radio.desynced);
+        assert!(!radio.cat_recovery_required());
+        radio.transport.assert_complete();
         Ok(())
     }
 

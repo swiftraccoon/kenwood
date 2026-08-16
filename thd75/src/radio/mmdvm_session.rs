@@ -36,9 +36,14 @@
 //! // ... use session.modem_mut() for raw MMDVM operations, or build a
 //! // DstarGateway on top of it ...
 //!
-//! // Exit MMDVM mode, then prove that ordinary CAT framing is restored.
-//! let mut radio = session.exit().await?;
-//! radio.restore_cat_after_mode_exit().await?;
+//! // Exit MMDVM mode; the desynchronized radio must be restored (or
+//! // taken explicitly unproven) before ordinary CAT commands.
+//! let radio = session
+//!     .exit()
+//!     .await?
+//!     .restore()
+//!     .await
+//!     .map_err(|(_desynced, e)| e)?;
 //! # Ok(())
 //! # }
 //! ```
@@ -52,7 +57,7 @@ use crate::protocol::{Command, Response};
 use crate::transport::{MmdvmTransportAdapter, Transport};
 use crate::types::{PacketDataRate, TncMode};
 
-use super::{Radio, cat_restore_state::CatRestoreState};
+use super::{DesyncedRadio, Radio, cat_restore_state::CatRestoreState};
 
 /// Wait time after the `TN 0,0` exit command before rebuilding the
 /// `Radio`. Matches the pre-refactor delay so the TNC has time to
@@ -200,17 +205,18 @@ impl<T: Transport + Unpin + 'static> MmdvmSession<T> {
     ///
     /// Shuts down the [`::mmdvm::AsyncModem`], recovering the transport,
     /// sends `TN 0,0` on the raw transport to return the radio's TNC to
-    /// normal APRS mode, then rebuilds the `Radio` from saved state. The
-    /// returned radio is deliberately desynchronized; callers must require
-    /// [`Radio::restore_cat_after_mode_exit`] to succeed before reporting or
-    /// resuming ordinary CAT operation.
+    /// normal APRS mode, then rebuilds the radio from saved state. Binary
+    /// residue may remain, so the radio comes back wrapped in
+    /// [`DesyncedRadio`]: call [`DesyncedRadio::restore`] before ordinary
+    /// CAT commands. Unlike the KISS exit, a failure here cannot return
+    /// the session: the modem shutdown has already consumed it.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Transport`] if the `TN 0,0` write fails, or
     /// translates [`::mmdvm::ShellError`] into [`Error::Transport`] /
     /// [`Error::Protocol`] as appropriate.
-    pub async fn exit(self) -> Result<Radio<T>, Error> {
+    pub async fn exit(self) -> Result<DesyncedRadio<T>, Error> {
         tracing::info!("exiting MMDVM mode");
 
         let (modem, restore) = self.into_parts();
@@ -276,7 +282,7 @@ impl<T: Transport + Unpin + 'static> MmdvmRadioRestore<T> {
     pub(crate) async fn exit_and_rebuild(
         self,
         modem: AsyncModem<MmdvmTransportAdapter<T>>,
-    ) -> Result<Radio<T>, Error> {
+    ) -> Result<DesyncedRadio<T>, Error> {
         // Shutdown returns the MmdvmTransportAdapter holding our T.
         let adapter = modem.shutdown().await.map_err(shell_err_to_thd75_err)?;
 
@@ -316,7 +322,9 @@ impl<T: Transport + Unpin + 'static> MmdvmRadioRestore<T> {
         // Small delay to let the TNC switch back to CAT mode.
         tokio::time::sleep(EXIT_SWITCH_DELAY).await;
 
-        Ok(self.cat_restore.rebuild_desynchronized(inner))
+        Ok(DesyncedRadio::new(
+            self.cat_restore.rebuild_desynchronized(inner),
+        ))
     }
 }
 
@@ -442,7 +450,7 @@ mod tests {
                 radio.cat_state = crate::radio::CatState::BinaryProven;
 
                 let session = radio.into_mmdvm_session().map_err(|(_, error)| error)?;
-                let radio = session.exit().await?;
+                let radio = session.exit().await?.into_radio_unproven();
 
                 assert_eq!(radio.timeout, Duration::from_millis(731));
                 assert_eq!(

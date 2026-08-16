@@ -74,9 +74,15 @@
 //!     }
 //! }
 //!
-//! // Clean shutdown: exit KISS, then prove ordinary CAT framing.
-//! let mut radio = client.stop().await.map_err(|(_client, e)| e)?;
-//! radio.restore_cat_after_mode_exit().await?;
+//! // Clean shutdown: exit KISS, then prove ordinary CAT framing
+//! // through the must-use wrapper.
+//! let radio = client
+//!     .stop()
+//!     .await
+//!     .map_err(|(_client, e)| e)?
+//!     .restore()
+//!     .await
+//!     .map_err(|(_desynced, e)| e)?;
 //! # Ok(())
 //! # }
 //! ```
@@ -106,10 +112,10 @@ use kiss_tnc::{KissCommand, KissFrame, encode_kiss_frame};
 
 use crate::aprs::ax25_to_kiss_wire;
 use crate::error::Error;
-use crate::radio::Radio;
 use crate::radio::kiss_session::KissSession;
+use crate::radio::{DesyncedRadio, Radio};
 use crate::transport::Transport;
-use crate::types::PacketDataRate;
+use crate::types::{KissParams, PacketDataRate};
 
 /// Default receive timeout for `next_event` polling (500 ms).
 ///
@@ -241,12 +247,14 @@ impl IGateRfLocality {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::error::ValidationError::IGateLocalityOutOfRange`] for
+    /// Returns [`crate::error::ValidationError::SettingOutOfRange`] for
     /// values above the eight-entry AX.25 digipeater-path maximum.
     pub const fn new(maximum_repeated_hops: u8) -> Result<Self, crate::error::ValidationError> {
         if maximum_repeated_hops > 8 {
-            return Err(crate::error::ValidationError::IGateLocalityOutOfRange {
-                maximum: maximum_repeated_hops,
+            return Err(crate::error::ValidationError::SettingOutOfRange {
+                name: "IGate locality repeated-hop maximum",
+                value: maximum_repeated_hops,
+                detail: "must be 0-8",
             });
         }
         Ok(Self {
@@ -450,7 +458,11 @@ enum IGateToRfCandidate {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct AprsClientConfig {
-    source: Ax25Address,
+    /// Station identity for transmission. `None` is receive-only: every
+    /// transmit path fails closed with [`Error::ReceiveOnly`] and no
+    /// automatic transmission (acks, query responses, digipeating,
+    /// `IGate`-to-RF) is configured.
+    source: Option<Ax25Address>,
     symbol: AprsSymbol,
     /// Packet data rate. Default: 1200 bps (AFSK).
     data_rate: PacketDataRate,
@@ -493,6 +505,9 @@ pub struct AprsClientConfig {
     /// `auto_query_response` is `true`. Update via
     /// [`AprsClient::set_query_response_position`].
     auto_query_position: Option<(Latitude, Longitude)>,
+    /// KISS device parameters applied by [`AprsClient::start`] right
+    /// after entering KISS mode. Default: all `None` (no writes).
+    kiss_params: KissParams,
 }
 
 impl AprsClientConfig {
@@ -525,6 +540,35 @@ impl AprsClientConfig {
     /// is invalid or if the standard path cannot be constructed.
     pub fn try_new(callsign: &str, ssid: u8) -> Result<Self, crate::error::ValidationError> {
         Self::new(validate_station_address(callsign, ssid)?)
+    }
+
+    /// Create a receive-only configuration with no station identity.
+    ///
+    /// The client decodes RF traffic into events and maintains the
+    /// station list as usual, but every transmit path fails closed
+    /// with [`Error::ReceiveOnly`], and no automatic transmission is
+    /// configured: auto-ack, query responses, digipeating, and
+    /// `IGate`-to-RF are all off, and the outgoing digipeater path is
+    /// empty. Monitoring receivers that hold no callsign authorization
+    /// use this instead of inventing a placeholder identity.
+    #[must_use]
+    pub fn receive_only() -> Self {
+        Self {
+            source: None,
+            symbol: AprsSymbol::CAR,
+            data_rate: PacketDataRate::Bps1200,
+            beacon_comment: PositionReportText::default(),
+            smart_beaconing: SmartBeaconingConfig::default(),
+            digipeater: None,
+            max_stations: NonZeroUsize::MIN.saturating_add(499),
+            station_timeout: Duration::from_secs(3600),
+            igate_to_rf: None,
+            auto_ack: false,
+            digipeater_path: DigipeaterPath::empty(),
+            auto_query_response: false,
+            auto_query_position: None,
+            kiss_params: KissParams::default(),
+        }
     }
 
     /// Start building a configuration with the fluent builder.
@@ -567,10 +611,11 @@ impl AprsClientConfig {
         Self::builder(validate_station_address(callsign, ssid)?)
     }
 
-    /// Return this station's validated AX.25 source address.
+    /// Return this station's validated AX.25 source address, or `None`
+    /// for a [receive-only](Self::receive_only) configuration.
     #[must_use]
-    pub const fn source(&self) -> &Ax25Address {
-        &self.source
+    pub const fn source(&self) -> Option<&Ax25Address> {
+        self.source.as_ref()
     }
 
     /// Return the configured APRS symbol.
@@ -665,6 +710,7 @@ pub struct AprsClientConfigBuilder {
     digipeater_path: DigipeaterPath,
     auto_query_response: bool,
     auto_query_position: Option<(Latitude, Longitude)>,
+    kiss_params: KissParams,
 }
 
 impl AprsClientConfigBuilder {
@@ -700,6 +746,7 @@ impl AprsClientConfigBuilder {
             digipeater_path,
             auto_query_response: true,
             auto_query_position: None,
+            kiss_params: KissParams::default(),
         })
     }
 
@@ -784,6 +831,15 @@ impl AprsClientConfigBuilder {
         self
     }
 
+    /// KISS device parameters to write when entering KISS mode.
+    ///
+    /// Fields left `None` keep the radio's own current values.
+    #[must_use]
+    pub const fn kiss_params(mut self, params: KissParams) -> Self {
+        self.kiss_params = params;
+        self
+    }
+
     /// Cache a position for auto query responses.
     #[must_use]
     pub const fn auto_query_position(mut self, latitude: Latitude, longitude: Longitude) -> Self {
@@ -795,7 +851,7 @@ impl AprsClientConfigBuilder {
     #[must_use]
     pub fn build(self) -> AprsClientConfig {
         AprsClientConfig {
-            source: self.source,
+            source: Some(self.source),
             symbol: self.symbol,
             data_rate: self.data_rate,
             beacon_comment: self.beacon_comment,
@@ -808,6 +864,7 @@ impl AprsClientConfigBuilder {
             digipeater_path: self.digipeater_path,
             auto_query_response: self.auto_query_response,
             auto_query_position: self.auto_query_position,
+            kiss_params: self.kiss_params,
         }
     }
 }
@@ -923,8 +980,11 @@ pub struct AprsClient<T: Transport> {
     session: KissSession<T>,
     config: AprsClientConfig,
     /// The station's AX.25 address, validated once at [`Self::start`].
-    my_addr: Ax25Address,
-    messenger: AprsMessenger,
+    /// `None` for a receive-only client; every transmit path then fails
+    /// closed with [`Error::ReceiveOnly`].
+    my_addr: Option<Ax25Address>,
+    /// Ack/retry machinery; absent for a receive-only client.
+    messenger: Option<AprsMessenger>,
     stations: StationList,
     /// Stateful Internet-to-RF eligibility history. Absent unless the host
     /// deliberately enabled transmission with [`IGateToRfConfig`].
@@ -946,6 +1006,10 @@ pub struct AprsClient<T: Transport> {
     /// APRS-IS, not just the ones that fall through to
     /// [`AprsEvent::RawPacket`].
     last_rf_packet: Option<Ax25Packet>,
+    /// Exact AX.25 wire bytes of the most recent KISS data frame,
+    /// captured before parsing so undecodable frames are journaled
+    /// too. Taken (and cleared) via [`Self::take_last_rf_frame_raw`].
+    last_rf_frame_raw: Option<Vec<u8>>,
 }
 
 impl<T: Transport> std::fmt::Debug for AprsClient<T> {
@@ -953,9 +1017,39 @@ impl<T: Transport> std::fmt::Debug for AprsClient<T> {
         f.debug_struct("AprsClient")
             .field("config", &self.config)
             .field("stations_count", &self.stations.len())
-            .field("pending_messages", &self.messenger.pending_count())
+            .field(
+                "pending_messages",
+                &self
+                    .messenger
+                    .as_ref()
+                    .map_or(0, AprsMessenger::pending_count),
+            )
             .finish_non_exhaustive()
     }
+}
+
+/// Write each configured KISS device parameter through the session's
+/// typed setters, in KISS command order.
+async fn apply_kiss_params<T: Transport>(
+    session: &mut KissSession<T>,
+    params: KissParams,
+) -> Result<(), Error> {
+    if let Some(delay) = params.tx_delay {
+        session.set_tx_delay(delay).await?;
+    }
+    if let Some(persistence) = params.persistence {
+        session.set_persistence(persistence).await?;
+    }
+    if let Some(slot_time) = params.slot_time {
+        session.set_slot_time(slot_time).await?;
+    }
+    if let Some(tx_tail) = params.tx_tail {
+        session.set_tx_tail(tx_tail).await?;
+    }
+    if let Some(duplex) = params.duplex {
+        session.set_duplex(duplex).await?;
+    }
+    Ok(())
 }
 
 impl<T: Transport> AprsClient<T> {
@@ -983,7 +1077,24 @@ impl<T: Transport> AprsClient<T> {
         };
         session.set_receive_timeout(EVENT_POLL_TIMEOUT);
 
-        let messenger = AprsMessenger::new(my_addr.clone(), config.digipeater_path.clone());
+        // Apply any configured KISS device parameters before traffic
+        // flows. On failure the KISS entry is unwound so the caller
+        // gets the radio back; if even the unwind fails, the radio is
+        // reclaimed marked recovery-required.
+        if let Err(error) = apply_kiss_params(&mut session, config.kiss_params).await {
+            // The caller receives the apply error either way; the radio
+            // still tracks its own recovery obligation internally.
+            return match session.exit().await {
+                Ok(desynced) => Err((desynced.into_radio_unproven(), error)),
+                Err((session, _exit_error)) => Err((session.into_radio_recovery_required(), error)),
+            };
+        }
+
+        // Receive-only clients carry no messenger: the ack/retry machine
+        // exists to transmit under a station identity.
+        let messenger = my_addr
+            .clone()
+            .map(|addr| AprsMessenger::new(addr, config.digipeater_path.clone()));
         let stations = StationList::new(config.max_stations.get(), config.station_timeout);
         let igate_to_rf = config
             .igate_to_rf
@@ -1000,21 +1111,22 @@ impl<T: Transport> AprsClient<T> {
             beaconing,
             pending_events: VecDeque::new(),
             last_rf_packet: None,
+            last_rf_frame_raw: None,
         })
     }
 
-    /// Stop the APRS client, exiting KISS mode and returning the [`Radio`].
+    /// Stop the APRS client, exiting KISS mode.
     ///
-    /// The returned radio is deliberately desynchronized because unread
-    /// binary frames may remain on the transport. Call
-    /// [`Radio::restore_cat_after_mode_exit`] before using CAT again or
-    /// reporting that CAT mode has been restored.
+    /// Unread binary frames may remain on the transport, so the radio
+    /// comes back wrapped in [`DesyncedRadio`]: call
+    /// [`DesyncedRadio::restore`] before using CAT again or reporting
+    /// that CAT mode has been restored.
     ///
     /// # Errors
     ///
     /// Returns the client back together with the error if the KISS
     /// exit command fails, so the transport survives for a retry.
-    pub async fn stop(self) -> Result<Radio<T>, (Box<Self>, Error)> {
+    pub async fn stop(self) -> Result<DesyncedRadio<T>, (Box<Self>, Error)> {
         let Self {
             session,
             config,
@@ -1025,6 +1137,7 @@ impl<T: Transport> AprsClient<T> {
             beaconing,
             pending_events,
             last_rf_packet,
+            last_rf_frame_raw,
         } = self;
         match session.exit().await {
             Ok(radio) => Ok(radio),
@@ -1039,6 +1152,7 @@ impl<T: Transport> AprsClient<T> {
                     beaconing,
                     pending_events,
                     last_rf_packet,
+                    last_rf_frame_raw,
                 }),
                 e,
             )),
@@ -1126,14 +1240,18 @@ impl<T: Transport> AprsClient<T> {
     /// `MessageExpired` events for any messages that exhausted their
     /// retry budget.
     async fn process_retries(&mut self, now: Instant) -> Result<(), Error> {
+        // A receive-only client has no messenger and nothing to retry.
+        let Some(messenger) = self.messenger.as_mut() else {
+            return Ok(());
+        };
         // Peek → transmit → commit: if this future is cancelled during
         // the write, the attempt is not burned and the retry fires
         // again next cycle instead of silently vanishing.
-        if let Some((id, frame)) = self.messenger.peek_frame_to_send(now) {
+        if let Some((id, frame)) = messenger.peek_frame_to_send(now) {
             self.session.send_wire(&frame).await?;
-            self.messenger.commit_send(&id, now);
+            messenger.commit_send(&id, now);
         }
-        for id in self.messenger.cleanup_expired(now) {
+        for id in messenger.cleanup_expired(now) {
             self.pending_events.push_back(AprsEvent::MessageExpired(id));
         }
         Ok(())
@@ -1160,6 +1278,9 @@ impl<T: Transport> AprsClient<T> {
         if frame.command != KissCommand::Data {
             return Ok(None);
         }
+        // Journal the exact wire bytes before any parse attempt, so
+        // undecodable frames are captured too.
+        self.last_rf_frame_raw = Some(frame.data.clone());
         Ok(match parse_ax25(&frame.data) {
             Ok(packet) => Some(packet),
             Err(e) => {
@@ -1236,6 +1357,17 @@ impl<T: Transport> AprsClient<T> {
         self.last_rf_packet.take()
     }
 
+    /// Take the exact AX.25 wire bytes of the most recently received
+    /// KISS data frame, clearing the tap.
+    ///
+    /// The bytes are captured before parsing, so a journaling consumer
+    /// records undecodable frames too; pair with
+    /// [`Self::take_last_rf_packet`] when the parsed view is also
+    /// wanted.
+    pub const fn take_last_rf_frame_raw(&mut self) -> Option<Vec<u8>> {
+        self.last_rf_frame_raw.take()
+    }
+
     fn record_rf_igate_observation(&mut self, packet: &Ax25Packet, now: Instant) {
         let Some(igate) = &mut self.igate_to_rf else {
             return;
@@ -1280,16 +1412,21 @@ impl<T: Transport> AprsClient<T> {
             // Check-then-mark, NOT check-and-mark: marking happens
             // only after the message was fully processed, so a
             // cancelled delivery (mid auto-ack send) does not eat the
-            // message and dedup away its RF retries.
+            // message and dedup away its RF retries. A receive-only
+            // client has no messenger: nothing is addressed to it, so
+            // messages flow through as monitor traffic with no dedup
+            // state to maintain.
             if self
                 .messenger
-                .is_duplicate_incoming(&packet.source.callsign, msg, now)
+                .as_mut()
+                .is_some_and(|m| m.is_duplicate_incoming(&packet.source.callsign, msg, now))
             {
                 return Ok(None);
             }
             let event = self.handle_incoming_message(msg, &packet.source).await?;
-            self.messenger
-                .mark_incoming_seen(&packet.source.callsign, msg, now);
+            if let Some(messenger) = self.messenger.as_mut() {
+                messenger.mark_incoming_seen(&packet.source.callsign, msg, now);
+            }
             return Ok(event);
         }
 
@@ -1364,6 +1501,28 @@ impl<T: Transport> AprsClient<T> {
         }
     }
 
+    /// Send a one-shot APRS message with no message number.
+    ///
+    /// Without a message number the recipient sends no ack, and this
+    /// client keeps no retry state: the frame goes on the air exactly
+    /// once. Use [`Self::send_message`] for reliable (ack/retry)
+    /// delivery.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ReceiveOnly`] when the client has no station
+    /// identity, or a transport error if the transmission fails.
+    pub async fn send_message_unacked(
+        &mut self,
+        addressee: &MessageAddressee,
+        text: &MessageText,
+    ) -> Result<(), Error> {
+        let source = self.my_addr.clone().ok_or(Error::ReceiveOnly)?;
+        let wire =
+            aprs::build_aprs_message(&source, addressee, text, None, &self.config.digipeater_path);
+        self.session.send_wire(&wire).await
+    }
+
     /// Send an APRS message to a station. Returns the message ID for tracking.
     ///
     /// The message is queued with the [`AprsMessenger`] for automatic
@@ -1378,13 +1537,14 @@ impl<T: Transport> AprsClient<T> {
         text: &MessageText,
     ) -> Result<MessageId, Error> {
         let now = Instant::now();
-        let message_id = self.messenger.send_message(addressee, text, now);
+        let messenger = self.messenger.as_mut().ok_or(Error::ReceiveOnly)?;
+        let message_id = messenger.send_message(addressee, text, now);
 
         // Send the first frame immediately (peek → write → commit, so
         // a cancelled write leaves the first attempt unburned).
-        if let Some((id, frame)) = self.messenger.peek_frame_to_send(now) {
+        if let Some((id, frame)) = messenger.peek_frame_to_send(now) {
             self.session.send_wire(&frame).await?;
-            self.messenger.commit_send(&id, now);
+            messenger.commit_send(&id, now);
         }
 
         Ok(message_id)
@@ -1435,7 +1595,7 @@ impl<T: Transport> AprsClient<T> {
         comment: &PositionReportText,
         now: Instant,
     ) -> Result<(), Error> {
-        let source = self.my_addr.clone();
+        let source = self.my_addr.clone().ok_or(Error::ReceiveOnly)?;
         let wire = build_aprs_position_report(
             &source,
             latitude,
@@ -1487,7 +1647,7 @@ impl<T: Transport> AprsClient<T> {
         comment: &CompressedPositionText,
         now: Instant,
     ) -> Result<(), Error> {
-        let source = self.my_addr.clone();
+        let source = self.my_addr.clone().ok_or(Error::ReceiveOnly)?;
         let wire = build_aprs_position_compressed(
             &source,
             latitude,
@@ -1524,7 +1684,7 @@ impl<T: Transport> AprsClient<T> {
         course: Course,
         status_text: &MiceStatusText,
     ) -> Result<(), Error> {
-        let source = self.my_addr.clone();
+        let source = self.my_addr.clone().ok_or(Error::ReceiveOnly)?;
         let wire = build_aprs_mice(
             &source,
             latitude,
@@ -1546,7 +1706,7 @@ impl<T: Transport> AprsClient<T> {
     ///
     /// Returns an error if the transmission fails.
     pub async fn send_status(&mut self, text: &StatusText) -> Result<(), Error> {
-        let source = self.my_addr.clone();
+        let source = self.my_addr.clone().ok_or(Error::ReceiveOnly)?;
         let wire = build_aprs_status(&source, text, &self.config.digipeater_path);
         self.session.send_wire(&wire).await?;
         Ok(())
@@ -1562,7 +1722,7 @@ impl<T: Transport> AprsClient<T> {
         timestamp: AprsStatusTimestamp,
         text: &TimestampedStatusText,
     ) -> Result<(), Error> {
-        let source = self.my_addr.clone();
+        let source = self.my_addr.clone().ok_or(Error::ReceiveOnly)?;
         let wire =
             build_aprs_timestamped_status(&source, timestamp, text, &self.config.digipeater_path);
         self.session.send_wire(&wire).await?;
@@ -1591,7 +1751,7 @@ impl<T: Transport> AprsClient<T> {
         longitude: Longitude,
         comment: &PositionReportText,
     ) -> Result<(), Error> {
-        let source = self.my_addr.clone();
+        let source = self.my_addr.clone().ok_or(Error::ReceiveOnly)?;
         let wire = build_aprs_object(
             &source,
             name,
@@ -1653,10 +1813,11 @@ impl<T: Transport> AprsClient<T> {
         &self.stations
     }
 
-    /// Get the messenger state (pending message count, etc).
+    /// Get the messenger state (pending message count, etc), or `None`
+    /// for a receive-only client, which carries no ack/retry machinery.
     #[must_use]
-    pub const fn messenger(&self) -> &AprsMessenger {
-        &self.messenger
+    pub const fn messenger(&self) -> Option<&AprsMessenger> {
+        self.messenger.as_ref()
     }
 
     /// Get the current configuration.
@@ -1705,7 +1866,11 @@ impl<T: Transport> AprsClient<T> {
         packet: &Ax25Packet,
         login: Passcode,
     ) -> Result<AprsIsUplinkLine, IGateFormatError> {
-        igate_format_packet_for_is(packet, &self.my_addr, login)
+        let my_addr = self
+            .my_addr
+            .as_ref()
+            .ok_or(IGateFormatError::MissingIdentity)?;
+        igate_format_packet_for_is(packet, my_addr, login)
     }
 
     fn evaluate_gate_from_is(
@@ -1802,7 +1967,7 @@ impl<T: Transport> AprsClient<T> {
         // when an APRS-IS identity is used on RF. The original unvalidated
         // input is never reparsed or copied, preventing parser/serializer
         // disagreement and CRLF leakage.
-        let igate_call = self.my_addr.clone();
+        let igate_call = self.my_addr.clone().ok_or(Error::ReceiveOnly)?;
         let igate_text = igate_call.to_string();
         let source_text =
             canonical_rf_header_identity(is_packet.source().as_str()).unwrap_or_else(|| {
@@ -2013,7 +2178,13 @@ impl<T: Transport> AprsClient<T> {
         msg: &AprsMessage,
         from: &Ax25Address,
     ) -> Result<Option<AprsEvent>, Error> {
-        let my_call = self.config.source.callsign.as_str();
+        // A receive-only client has no address, so no message is ever
+        // "for us": everything is monitor traffic.
+        let Some(source) = self.config.source.as_ref() else {
+            let entry = self.stations.get(&from.callsign).cloned();
+            return Ok(entry.map(AprsEvent::StationHeard));
+        };
+        let my_call = source.callsign.as_str();
 
         // Check if this message is addressed to us.
         if !msg.addressee.eq_ignore_ascii_case(my_call) {
@@ -2030,7 +2201,11 @@ impl<T: Transport> AprsClient<T> {
             let Ok(id) = MessageId::new(id) else {
                 return Ok(None);
             };
-            if self.messenger.process_incoming(&from.callsign, msg) {
+            if self
+                .messenger
+                .as_mut()
+                .is_some_and(|m| m.process_incoming(&from.callsign, msg))
+            {
                 return Ok(Some(if is_ack {
                     AprsEvent::MessageDelivered(id)
                 } else {
@@ -2043,11 +2218,12 @@ impl<T: Transport> AprsClient<T> {
 
         // Regular message addressed to us; auto-ack if configured.
         if self.config.auto_ack
+            && let Some(messenger) = self.messenger.as_ref()
             && let Some(ref id) = msg.message_id
             && let Ok(addressee) = MessageAddressee::new(from.callsign.as_str())
             && let Ok(message_id) = MessageId::new(id)
         {
-            let ack_frame = self.messenger.build_ack(&addressee, &message_id);
+            let ack_frame = messenger.build_ack(&addressee, &message_id);
             self.session.send_wire(&ack_frame).await?;
         }
 
@@ -2062,7 +2238,7 @@ impl<T: Transport> AprsClient<T> {
             && let Some((lat, lon)) = self.config.auto_query_position
         {
             tracing::info!(from = %from.callsign, "responding to ?APRSP query");
-            let source = self.my_addr.clone();
+            let source = self.my_addr.clone().ok_or(Error::ReceiveOnly)?;
             let wire = build_query_response_position(
                 &source,
                 lat,
@@ -2196,10 +2372,17 @@ mod tests {
         let radio = mock_radio(PacketDataRate::Bps1200);
         let config = test_config()?;
         let client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
-        assert_eq!(client.config().source().callsign, "N0CALL");
-        assert_eq!(client.config().source().ssid, 7);
+        let source = client.config().source().ok_or("expected an identity")?;
+        assert_eq!(source.callsign, "N0CALL");
+        assert_eq!(source.ssid, 7);
         assert_eq!(client.stations().len(), 0);
-        assert_eq!(client.messenger().pending_count(), 0);
+        assert_eq!(
+            client
+                .messenger()
+                .ok_or("expected a messenger")?
+                .pending_count(),
+            0
+        );
         Ok(())
     }
 
@@ -2248,7 +2431,13 @@ mod tests {
 
         let id = client.send_message(&addressee, &text).await?;
         assert_eq!(id.as_str(), "1");
-        assert_eq!(client.messenger().pending_count(), 1);
+        assert_eq!(
+            client
+                .messenger()
+                .ok_or("expected a messenger")?
+                .pending_count(),
+            1
+        );
         Ok(())
     }
 
@@ -2301,6 +2490,134 @@ mod tests {
                 &compressed_text("compressed"),
             )
             .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn raw_frame_tap_captures_exact_ax25_bytes() -> TestResult {
+        let radio = mock_radio(PacketDataRate::Bps1200);
+        let config = test_config()?;
+        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+
+        let packet = Ax25Packet::unnumbered_information(
+            Ax25Address::new("W1AW", 0)?,
+            Ax25Address::new("APK005", 0)?,
+            DigipeaterPath::empty(),
+            CommandResponse::Command,
+            false,
+            Ax25Pid::NoLayer3,
+            b"!3515.00N/09745.00W>mobile".to_vec(),
+        );
+        let ax25_bytes = build_ax25(&packet);
+        client
+            .session
+            .transport
+            .queue_read(&encode_kiss_frame(&KissFrame::data(ax25_bytes.clone())));
+
+        let _event = client.next_event().await?;
+        assert_eq!(
+            client.take_last_rf_frame_raw().as_deref(),
+            Some(ax25_bytes.as_slice()),
+            "the journal tap must hold the exact received AX.25 bytes"
+        );
+        assert!(
+            client.take_last_rf_frame_raw().is_none(),
+            "taking clears the tap"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_message_unacked_transmits_once_with_no_retry_state() -> TestResult {
+        let radio = mock_radio(PacketDataRate::Bps1200);
+        let config = test_config()?;
+        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+
+        let addressee = MessageAddressee::new("KQ4NIT")?;
+        let text = MessageText::new("one-shot")?;
+        let expected = aprs::build_aprs_message(
+            &test_address()?,
+            &addressee,
+            &text,
+            None,
+            &default_digipeater_path()?,
+        );
+        client.session.transport.expect(&expected, &[]);
+
+        client.send_message_unacked(&addressee, &text).await?;
+        client.session.transport.assert_complete();
+        assert_eq!(
+            client
+                .messenger()
+                .ok_or("expected a messenger")?
+                .pending_count(),
+            0,
+            "an unacked send must leave no retry state"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn start_applies_configured_kiss_params() -> TestResult {
+        use kiss_tnc::{KissPort, encode_kiss_frame};
+
+        use crate::types::{KissParams, KissTxDelay};
+
+        let mut mock = MockTransport::new();
+        mock.expect(b"TN 2,0\r", b"TN 2,0\r");
+        let delay = KissTxDelay::from_milliseconds(300)?;
+        let delay_frame = encode_kiss_frame(&KissFrame {
+            port: KissPort::TH_D75,
+            command: KissCommand::TxDelay,
+            data: vec![delay.to_wire_byte()],
+        });
+        mock.expect(&delay_frame, &[]);
+        let radio = Radio::new(mock);
+
+        let config = AprsClientConfig::try_builder("N0CALL", 7)?
+            .kiss_params(KissParams {
+                tx_delay: Some(delay),
+                ..KissParams::default()
+            })
+            .build();
+        let client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+
+        // The strict-FIFO mock proves the parameter frame went on the
+        // wire during start, in order, and nothing else was sent.
+        client.session.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn receive_only_client_decodes_but_refuses_transmit() -> TestResult {
+        let radio = mock_radio(PacketDataRate::Bps1200);
+        let config = AprsClientConfig::receive_only();
+        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+
+        // RX still decodes into events with no station identity.
+        let info = b"!3515.00N/09745.00W>mobile";
+        let wire = build_kiss_data_frame("W1AW", 0, info);
+        client.session.transport.queue_read(&wire);
+        let event = client
+            .next_event()
+            .await?
+            .ok_or("expected a decoded event in receive-only mode")?;
+        let heard = matches!(
+            &event,
+            AprsEvent::StationHeard(entry) if entry.callsign == "W1AW"
+        ) || matches!(
+            &event,
+            AprsEvent::PositionReceived { source, .. } if source == "W1AW"
+        );
+        assert!(heard, "unexpected event in receive-only mode: {event:?}");
+
+        // Every transmit path fails closed with the typed error.
+        let text = StatusText::new("QRV")?;
+        let result = client.send_status(&text).await;
+        assert!(
+            matches!(result, Err(Error::ReceiveOnly)),
+            "transmit must fail closed in receive-only mode: {result:?}"
+        );
         Ok(())
     }
 
@@ -2380,8 +2697,9 @@ mod tests {
             .auto_ack(false)
             .max_stations(NonZeroUsize::new(100).ok_or("100 must be nonzero")?)
             .build();
-        assert_eq!(cfg.source().callsign, "N0CALL");
-        assert_eq!(cfg.source().ssid, 9);
+        let cfg_source = cfg.source().ok_or("expected an identity")?;
+        assert_eq!(cfg_source.callsign, "N0CALL");
+        assert_eq!(cfg_source.ssid, 9);
         assert_eq!(cfg.symbol(), AprsSymbol::CAR);
         assert_eq!(cfg.beacon_comment().as_str(), "test");
         assert!(!cfg.auto_ack());
@@ -2408,8 +2726,9 @@ mod tests {
     #[test]
     fn config_defaults() -> TestResult {
         let config = AprsClientConfig::try_new("W1AW", 0)?;
-        assert_eq!(config.source().callsign, "W1AW");
-        assert_eq!(config.source().ssid, 0);
+        let source = config.source().ok_or("expected an identity")?;
+        assert_eq!(source.callsign, "W1AW");
+        assert_eq!(source.ssid, 0);
         assert_eq!(config.symbol(), AprsSymbol::CAR);
         assert!(config.auto_ack());
         assert!(config.digipeater().is_none());
@@ -2499,8 +2818,9 @@ mod tests {
     #[test]
     fn config_preserves_typed_source_address() -> TestResult {
         let config = AprsClientConfig::try_new("KQ4NIT", 9)?;
-        assert_eq!(config.source().callsign, "KQ4NIT");
-        assert_eq!(config.source().ssid, 9);
+        let source = config.source().ok_or("expected an identity")?;
+        assert_eq!(source.callsign, "KQ4NIT");
+        assert_eq!(source.ssid, 9);
         Ok(())
     }
 

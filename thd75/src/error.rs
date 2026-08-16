@@ -57,17 +57,27 @@ pub enum Error {
     Validation(#[from] ValidationError),
 
     /// A received KISS frame was malformed or exceeded the framing limit.
+    #[cfg(feature = "aprs")]
     #[error(transparent)]
     Kiss(#[from] kiss_tnc::KissError),
 
     /// An APRS-IS packet line was malformed or used noncanonical AX.25
     /// identities.
+    #[cfg(feature = "aprs")]
     #[error(transparent)]
     AprsIsLine(#[from] aprs_is::AprsIsLineError),
 
     /// An APRS information field was malformed for its declared data type.
     #[error(transparent)]
     AprsPacket(#[from] aprs::AprsError),
+
+    /// The APRS client was constructed receive-only and cannot transmit.
+    #[cfg(feature = "aprs")]
+    #[error(
+        "APRS client is receive-only; construct its configuration with a \
+         station identity to transmit"
+    )]
+    ReceiveOnly,
 
     /// Wrapping an APRS-IS packet as a third-party RF packet would exceed the
     /// AX.25 information-field limit.
@@ -86,12 +96,27 @@ pub enum Error {
     Verify(#[from] crate::verify::VerifyError),
 
     /// The radio rejected the command with `?\r`.
-    #[error("radio rejected the command (`?` response)")]
-    CommandRejected,
+    #[error("radio rejected the {mnemonic} command (`?` response)")]
+    CommandRejected {
+        /// CAT mnemonic of the rejected command (e.g. `FQ`, `VM`).
+        mnemonic: String,
+    },
+
+    /// Recalling a memory channel was refused because the channel is
+    /// empty (0 Hz receive frequency); recalling it would leave the
+    /// radio in an unusable state.
+    #[error("memory channel {channel} is empty")]
+    EmptyMemoryChannel {
+        /// The empty channel.
+        channel: crate::types::RegularChannel,
+    },
 
     /// The radio returned "not available" (`N\r`): command not supported in current mode.
-    #[error("command not available in current radio mode")]
-    NotAvailableInCurrentMode,
+    #[error("{mnemonic} command not available in current radio mode")]
+    NotAvailableInCurrentMode {
+        /// CAT mnemonic of the refused command (e.g. `ID`, `UP`).
+        mnemonic: String,
+    },
 
     /// A mode write returned a semantic rejection and its required readback
     /// also failed, so the resulting radio state could not be proved.
@@ -371,6 +396,152 @@ pub enum Error {
         /// Number of host snapshot commands attempted.
         attempts: u8,
     },
+
+    /// A stepped-tuning operation requires the band in VFO tuning mode.
+    #[error(
+        "stepped tuning requires band {band} in VFO tuning mode so the selected memory, call, \
+         or weather channel is never changed; current tuning mode is {current:?}"
+    )]
+    VfoTuningRequired {
+        /// Band whose tuning mode was checked.
+        band: crate::types::Band,
+        /// Tuning mode that band reported.
+        current: crate::types::TuningMode,
+    },
+
+    /// The USB audio output did not engage as requested.
+    #[error(
+        "USB audio output {requested:?} did not engage (read back {actual:?}); IF and Detect \
+         output require Single Band mode on Band B"
+    )]
+    IfTapNotEngaged {
+        /// Output selection that was written.
+        requested: crate::types::UsbAudioOutput,
+        /// Output selection the radio reported afterwards.
+        actual: crate::types::UsbAudioOutput,
+    },
+
+    /// A stepped retune target is not a whole number of tuning steps away.
+    #[error(
+        "retune target {target} is not a whole number of {step} steps from {current}; \
+         change the tuning step or pick an on-step target"
+    )]
+    RetuneOffStep {
+        /// Frequency before the retune.
+        current: crate::types::Frequency,
+        /// Requested target frequency.
+        target: crate::types::Frequency,
+        /// Tuning step the radio reported.
+        step: crate::types::StepSize,
+    },
+
+    /// A stepped retune would need more UP/DW steps than the bound allows.
+    #[error("retune needs {steps_required} steps (maximum {maximum}); tune the radio closer first")]
+    RetuneSpanTooLarge {
+        /// Steps the walk would require.
+        steps_required: u32,
+        /// Upper bound on steps per retune call.
+        maximum: u32,
+    },
+
+    /// A stepped retune finished on a different frequency than requested.
+    #[error(
+        "retune landed on {actual} instead of {requested}; the USB audio output remains on \
+         the audio path"
+    )]
+    RetuneNotVerified {
+        /// Frequency the caller requested.
+        requested: crate::types::Frequency,
+        /// Frequency the radio reported after stepping.
+        actual: crate::types::Frequency,
+    },
+
+    /// A menu-field schema operation failed before or after MCP I/O.
+    #[error(transparent)]
+    Schema(#[from] crate::memory::SchemaError),
+
+    /// A compare-exchange MCP batch failed; the nested error retains which
+    /// pages may already have changed.
+    #[error(transparent)]
+    McpPageExchange(#[from] crate::radio::programming::McpPageExchangeError),
+
+    /// A menu-patch compare-exchange referenced a page absent from the
+    /// caller's snapshot, so no expected bytes exist to compare against.
+    #[error(
+        "menu patch touches page 0x{page:04X}, which the supplied snapshot never read; \
+         re-read the snapshot with every patched field included"
+    )]
+    McpSnapshotPageMissing {
+        /// The patched page missing from the snapshot.
+        page: WritableMcpPage,
+    },
+
+    /// The link never proved MMDVM after a Reflector Terminal Mode write.
+    #[error(
+        "the radio did not answer MMDVM probes within {window:?} after the Menu 650 write; if \
+         the radio's screen shows TERM, check Menu 985 (DV Gateway PC Input/Output): it must \
+         be set to the interface this connection uses. Do not repeat the memory write; another \
+         attempt only reboots the radio again"
+    )]
+    TerminalModeNotEngaged {
+        /// Transition window that elapsed without MMDVM proof.
+        window: Duration,
+    },
+}
+
+impl Error {
+    /// Whether this failure means the physical link should be treated as
+    /// down.
+    ///
+    /// True for transport-layer failures and command timeouts; the remedy is
+    /// [`Radio::reconnect`](crate::radio::Radio::reconnect) (or rebuilding
+    /// the transport). Semantic radio replies such as
+    /// [`Error::CommandRejected`] leave the link healthy and return false.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use kenwood_thd75::error::Error;
+    ///
+    /// assert!(Error::Timeout(Duration::from_secs(5)).is_link_lost());
+    /// let rejected = Error::CommandRejected { mnemonic: "FQ".to_string() };
+    /// assert!(!rejected.is_link_lost());
+    /// assert!(Error::CatRecoveryRequired.requires_recovery());
+    /// ```
+    #[must_use]
+    pub const fn is_link_lost(&self) -> bool {
+        matches!(self, Self::Transport(_) | Self::Timeout(_))
+    }
+
+    /// Whether this failure leaves the CAT stream refusing ordinary commands
+    /// until an explicit recovery API runs.
+    ///
+    /// True for every error that reports a poisoned or unresolved stream
+    /// boundary, and for everything [`Error::is_link_lost`] covers (a failed
+    /// or timed-out exchange leaves the request/response boundary
+    /// unresolved). The remedy is
+    /// [`Radio::recover_cat`](crate::radio::Radio::recover_cat) or
+    /// [`Radio::reconnect`](crate::radio::Radio::reconnect).
+    ///
+    /// This classifies the error value itself. A [`Error::Protocol`] frame
+    /// error can also poison the handle without being classified here;
+    /// [`Radio::cat_recovery_required`](crate::radio::Radio::cat_recovery_required)
+    /// remains the authoritative live-state check.
+    #[must_use]
+    pub const fn requires_recovery(&self) -> bool {
+        self.is_link_lost()
+            || matches!(
+                self,
+                Self::CatRecoveryRequired
+                    | Self::MemoryReadStreamPoisoned
+                    | Self::McpInterrupted
+                    | Self::McpExitAlreadySent
+                    | Self::McpCleanupNotProved { .. }
+                    | Self::McpOperationAndCleanupFailed { .. }
+                    | Self::CatRestorationFailed { .. }
+            )
+    }
 }
 
 /// Errors originating from the transport layer (serial port / Bluetooth).
@@ -385,6 +556,22 @@ pub enum TransportError {
         /// The underlying I/O error.
         source: std::io::Error,
     },
+
+    /// The isolated macOS Bluetooth helper could not select one paired radio,
+    /// be prepared or launched, or complete its readiness handshake.
+    #[error("Bluetooth helper failed during {context}")]
+    BluetoothHelper {
+        /// Operation or resource that failed.
+        context: String,
+        /// The underlying process or pipe error.
+        source: std::io::Error,
+    },
+
+    /// More than one paired Bluetooth device has the requested display name.
+    #[error(
+        "multiple paired Bluetooth devices have the requested name; pass an exact Bluetooth address instead"
+    )]
+    BluetoothDeviceNameAmbiguous,
 
     /// No matching serial device was found.
     #[error("no matching serial device found")]
@@ -531,14 +718,6 @@ pub enum ProtocolError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ValidationError {
-    /// An Internet-to-RF `IGate` locality limit exceeds the bounded AX.25
-    /// digipeater path domain.
-    #[error("IGate locality allows {maximum} repeated hops (must be 0-8)")]
-    IGateLocalityOutOfRange {
-        /// Rejected maximum count of repeated path entries.
-        maximum: u8,
-    },
-
     /// An Internet-to-RF `IGate` eligibility period is zero or exceeds a
     /// protocol-defined maximum.
     #[error("invalid Internet-to-RF IGate {field} period {value:?}: {detail}")]
@@ -550,84 +729,6 @@ pub enum ValidationError {
         /// Exact valid domain.
         detail: &'static str,
     },
-
-    /// The CTCSS tone code is outside the valid range 0-50
-    /// (0-49 = the 50 CTCSS tones, 50 = the 1750 Hz tone burst).
-    #[error("tone code {0} out of range (must be 0-50)")]
-    ToneCodeOutOfRange(
-        /// The invalid tone code.
-        u8,
-    ),
-
-    /// The band index is outside the valid range 0-1.
-    #[error("band index {0} out of range (must be 0-1)")]
-    BandOutOfRange(
-        /// The invalid band index.
-        u8,
-    ),
-
-    /// The operating mode is outside the valid range 0-9.
-    #[error("operating mode {0} out of range (must be 0-9: FM/DV/AM/LSB/USB/CW/NFM/DR/WFM/CW-R)")]
-    OperatingModeOutOfRange(
-        /// The invalid operating-mode value.
-        u8,
-    ),
-
-    /// A channel-record mode is outside the valid range 0-8.
-    #[error("channel mode {0} out of range (must be 0-8: FM/DV/AM/LSB/USB/CW/NFM/DR/WFM)")]
-    ChannelModeOutOfRange(
-        /// The invalid channel mode value.
-        u8,
-    ),
-
-    /// The power level is outside the valid range 0-3.
-    #[error("power level {0} out of range (must be 0-3: High/Medium/Low/ExtraLow)")]
-    PowerLevelOutOfRange(
-        /// The invalid power level.
-        u8,
-    ),
-
-    /// A channel tone-mode nibble is not one of its five one-hot values.
-    #[error("tone mode 0x{0:X} is invalid (expected 0, 1, 2, 4, or 8)")]
-    ToneModeOutOfRange(
-        /// The invalid channel tone-mode nibble.
-        u8,
-    ),
-
-    /// The channel shift is outside the four values implemented by the radio.
-    #[error("shift direction {0} out of range (must be 0-3)")]
-    ShiftOutOfRange(
-        /// The invalid shift direction.
-        u8,
-    ),
-
-    /// The step size index is outside the valid range 0-11.
-    #[error("step size {0} out of range (must be 0-11)")]
-    StepSizeOutOfRange(
-        /// The invalid step size.
-        u8,
-    ),
-
-    /// The fine step index is outside the valid range 0-3.
-    #[error("fine step {0} out of range (must be 0-3)")]
-    FineStepOutOfRange(
-        /// The invalid fine step.
-        u8,
-    ),
-
-    /// The DCS code index is not in the valid code table.
-    #[error("DCS code index {0} not in valid code table")]
-    DcsCodeInvalid(
-        /// The invalid DCS code index.
-        u8,
-    ),
-
-    /// A CTCSS decoder code is outside the 50-entry CTCSS table.
-    #[error("CTCSS code index {0} out of range (must be 0-49)")]
-    CtcssCodeOutOfRange(
-        /// The invalid CTCSS code index.
-        u8,
-    ),
 
     /// A memory channel display name exceeds its 16-byte storage field.
     #[error("channel display name is {len} bytes long (maximum is 16)")]
@@ -801,30 +902,6 @@ pub enum ValidationError {
         /// Invalid byte found after the first NUL.
         value: u8,
     },
-
-    /// A stored channel has the erased or empty receive-frequency marker.
-    #[error(
-        "stored channel receive frequency {0} Hz is invalid \
-         (must be 1-4,294,967,294 Hz)"
-    )]
-    FrequencyOutOfRange(
-        /// The invalid frequency in Hz.
-        u32,
-    ),
-
-    /// The digital squelch code is outside the valid range 0-99.
-    #[error("digital squelch code {0} out of range (must be 0-99)")]
-    DigitalSquelchCodeOutOfRange(
-        /// The invalid digital squelch code.
-        u8,
-    ),
-
-    /// The cross-tone type is outside the valid range 0-3.
-    #[error("cross-tone type {0} out of range (must be 0-3)")]
-    CrossToneTypeOutOfRange(
-        /// The invalid cross-tone type value.
-        u8,
-    ),
 
     /// The channel number is outside the valid range.
     #[error("channel {channel} out of range (max {max})")]
@@ -1159,8 +1236,15 @@ mod tests {
     fn validation_error_display() {
         // 50 (the 1750 Hz tone burst) is VALID, so the message must
         // state the real accepted range.
-        let err = ValidationError::ToneCodeOutOfRange(51);
-        assert_eq!(err.to_string(), "tone code 51 out of range (must be 0-50)");
+        let err = ValidationError::SettingOutOfRange {
+            name: "tone code",
+            value: 51,
+            detail: "must be 0-50 (0-49 CTCSS tones, 50 = 1750 Hz tone burst)",
+        };
+        assert_eq!(
+            err.to_string(),
+            "tone code value 51 out of range (must be 0-50 (0-49 CTCSS tones, 50 = 1750 Hz tone burst))"
+        );
     }
 
     #[test]
@@ -1200,8 +1284,13 @@ mod tests {
     #[test]
     fn operating_mode_error_message_covers_full_range() {
         // OperatingMode accepts 0-9 (including WFM=8 and CW-R=9); the message
-        // must not claim 0-7.
-        let err = ValidationError::OperatingModeOutOfRange(10);
+        // must not claim 0-7. The construction lives in `types::mode`; this
+        // pins the shared variant's rendering of that domain text.
+        let err = ValidationError::SettingOutOfRange {
+            name: "operating mode",
+            value: 10,
+            detail: "must be 0-9: FM/DV/AM/LSB/USB/CW/NFM/DR/WFM/CW-R",
+        };
         let msg = err.to_string();
         assert!(
             msg.contains("0-9"),
@@ -1222,7 +1311,11 @@ mod tests {
 
     #[test]
     fn error_from_validation() {
-        let val_err = ValidationError::BandOutOfRange(2);
+        let val_err = ValidationError::SettingOutOfRange {
+            name: "band index",
+            value: 2,
+            detail: "must be 0-1",
+        };
         let err: Error = val_err.into();
         assert!(matches!(err, Error::Validation(_)));
     }
@@ -1264,6 +1357,7 @@ mod tests {
         assert!(matches!(err, Error::Protocol(_)));
     }
 
+    #[cfg(feature = "aprs")]
     #[test]
     fn error_from_kiss() {
         let err: Error = kiss_tnc::KissError::FrameTooLong.into();
@@ -1277,5 +1371,51 @@ mod tests {
     fn timeout_error_display() {
         let err = Error::Timeout(Duration::from_secs(5));
         assert!(err.to_string().contains("5s"));
+    }
+
+    /// Sample semantic rejection for classification tests.
+    fn rejected() -> Error {
+        Error::CommandRejected {
+            mnemonic: "FQ".to_string(),
+        }
+    }
+
+    #[test]
+    fn link_lost_classification_covers_transport_and_timeout() {
+        assert!(Error::Timeout(Duration::from_secs(5)).is_link_lost());
+        assert!(Error::Transport(TransportError::NotFound).is_link_lost());
+        assert!(!rejected().is_link_lost());
+        assert!(
+            !Error::NotAvailableInCurrentMode {
+                mnemonic: "ID".to_string()
+            }
+            .is_link_lost()
+        );
+        assert!(!Error::CatRecoveryRequired.is_link_lost());
+    }
+
+    #[test]
+    fn recovery_classification_covers_poisoned_stream_states() {
+        assert!(Error::CatRecoveryRequired.requires_recovery());
+        assert!(Error::MemoryReadStreamPoisoned.requires_recovery());
+        assert!(Error::McpInterrupted.requires_recovery());
+        assert!(
+            Error::McpCleanupNotProved {
+                cleanup: Box::new(rejected())
+            }
+            .requires_recovery()
+        );
+        assert!(
+            Error::CatRestorationFailed {
+                in_place: Box::new(rejected()),
+                reconnect: Box::new(rejected())
+            }
+            .requires_recovery()
+        );
+        // A command-phase timeout leaves the exchange boundary unresolved,
+        // so it is both link loss and a recovery-required state.
+        assert!(Error::Timeout(Duration::from_secs(5)).requires_recovery());
+        assert!(!rejected().requires_recovery());
+        assert!(!Error::NotIdentified.requires_recovery());
     }
 }

@@ -99,7 +99,11 @@ impl TryFrom<u8> for Band {
         match value {
             0 => Ok(Self::A),
             1 => Ok(Self::B),
-            _ => Err(ValidationError::BandOutOfRange(value)),
+            _ => Err(ValidationError::SettingOutOfRange {
+                name: "band index",
+                value,
+                detail: "must be 0-1",
+            }),
         }
     }
 }
@@ -145,10 +149,17 @@ mod tests {
     fn band_error_variant() -> Result<(), Box<dyn std::error::Error>> {
         let err = Band::try_from(Band::COUNT)
             .err()
-            .ok_or("expected BandOutOfRange but got Ok")?;
+            .ok_or("expected a band-index SettingOutOfRange but got Ok")?;
         assert!(
-            matches!(err, ValidationError::BandOutOfRange(2)),
-            "expected BandOutOfRange(2), got {err:?}"
+            matches!(
+                err,
+                ValidationError::SettingOutOfRange {
+                    name: "band index",
+                    value: 2,
+                    ..
+                }
+            ),
+            "expected band-index SettingOutOfRange(2), got {err:?}"
         );
         Ok(())
     }

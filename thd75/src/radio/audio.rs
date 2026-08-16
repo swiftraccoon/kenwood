@@ -16,6 +16,22 @@ impl<T: Transport> Radio<T> {
     /// Bare `AG\r` returns the global gain level. A band-indexed read returns
     /// `?`, so this is a global query.
     ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use kenwood_thd75::{MockTransport, Radio};
+    ///
+    /// let mut mock = MockTransport::new();
+    /// mock.expect(b"AG\r", b"AG 020\r");
+    ///
+    /// let mut radio = Radio::new(mock);
+    /// assert_eq!(radio.get_af_gain().await?.as_raw(), 20);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.

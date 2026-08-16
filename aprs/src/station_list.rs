@@ -55,6 +55,19 @@ pub struct StationEntry {
     pub last_path: Vec<String>,
 }
 
+impl StationEntry {
+    /// How long ago this station was heard, as of `now`.
+    ///
+    /// Sans-io like the rest of this crate: the caller supplies the
+    /// clock reading. Saturates to zero if `now` precedes the entry's
+    /// own timestamp, so display code never panics on clock skew
+    /// between capture and render.
+    #[must_use]
+    pub fn age(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.last_heard)
+    }
+}
+
 impl StationList {
     /// Create a new station list with the given capacity and age limits.
     #[must_use]
@@ -281,6 +294,24 @@ mod tests {
         let sl = StationList::new(100, Duration::from_secs(3600));
         assert!(sl.is_empty());
         assert_eq!(sl.len(), 0);
+    }
+
+    #[test]
+    fn station_entry_age_is_duration_since_last_heard() -> TestResult {
+        let mut sl = StationList::new(100, Duration::from_secs(3600));
+        let pos = make_position(35.0, -97.0);
+        let t0 = Instant::now();
+        sl.update("N0CALL", &pos, &[], t0);
+
+        let entry = sl.get("N0CALL").ok_or("expected N0CALL entry")?;
+        assert_eq!(
+            entry.age(t0 + Duration::from_secs(90)),
+            Duration::from_secs(90)
+        );
+        // A caller clock that has not advanced past the entry reports
+        // zero age rather than panicking.
+        assert_eq!(entry.age(t0), Duration::ZERO);
+        Ok(())
     }
 
     #[test]

@@ -22,7 +22,7 @@ pub mod gateway;
 // consumers don't need to depend on it directly.
 /// An exact event emitted by the asynchronous MMDVM modem loop.
 pub use ::mmdvm::Event as MmdvmEvent;
-pub use dstar_gateway_core::{SlowDataTextMessage, WireTextError};
+pub use dstar_gateway_core::{DstarHeader, SlowDataTextMessage, Suffix, WireTextError};
 pub use mmdvm_core::{MmdvmError, ModemMode, ModemStatus, NakReason};
 
 pub use gateway::{

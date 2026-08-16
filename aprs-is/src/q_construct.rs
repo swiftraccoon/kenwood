@@ -230,6 +230,11 @@ pub enum IGateFormatError {
     /// The resulting bytes violate APRS-IS framing or length rules.
     #[error("RF packet cannot form a safe APRS-IS uplink line: {0}")]
     InvalidUplinkLine(#[from] AprsIsUplinkLineError),
+
+    /// The gate holds no station identity, so the q-construct path
+    /// (which embeds the gate callsign) cannot be formed.
+    #[error("IGate has no station identity to embed in the q-construct path")]
+    MissingIdentity,
 }
 
 /// Pick the Q-construct to insert when gating an RF-heard packet into

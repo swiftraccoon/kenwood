@@ -266,7 +266,9 @@ impl SerialTransport {
     ///
     /// # Errors
     ///
-    /// Returns [`TransportError::Open`] if the port cannot be opened.
+    /// Returns [`TransportError::Open`] if the port cannot be opened, or if
+    /// no tokio runtime is active on the calling thread (the opened stream
+    /// must register with a tokio reactor).
     pub fn open(path: &str) -> Result<Self, TransportError> {
         Self::open_with_baud(path, Self::DEFAULT_BAUD)
     }
@@ -279,8 +281,22 @@ impl SerialTransport {
     ///
     /// # Errors
     ///
-    /// Returns [`TransportError::Open`] if the port cannot be opened.
+    /// Returns [`TransportError::Open`] if the port cannot be opened, or if
+    /// no tokio runtime is active on the calling thread (the opened stream
+    /// must register with a tokio reactor).
     pub fn open_with_baud(path: &str, baud: u32) -> Result<Self, TransportError> {
+        // tokio-serial registers the opened stream with the active tokio
+        // reactor and panics when none exists; refuse with a typed error
+        // first so callers on plain threads get a normal failure path.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return Err(TransportError::Open {
+                path: path.to_owned(),
+                source: std::io::Error::other(
+                    "no tokio runtime is active on this thread; open the serial transport \
+                     from inside a tokio runtime (for example under `Runtime::enter`)",
+                ),
+            });
+        }
         let (is_bt, actual_baud, flow) = Self::connection_settings(path, baud);
 
         tracing::info!(
@@ -511,6 +527,21 @@ mod tests {
         assert_eq!(SerialTransport::USB_VID, 0x2166);
         assert_eq!(SerialTransport::USB_PID, 0x9023);
         assert_eq!(SerialTransport::DEFAULT_BAUD, 115_200);
+    }
+
+    #[test]
+    fn open_outside_tokio_runtime_is_a_typed_error() -> Result<(), Box<dyn std::error::Error>> {
+        // tokio-serial's SerialStream::open panics (not Err) when no tokio
+        // reactor is active; the transport must refuse before reaching it.
+        let result = SerialTransport::open("/dev/cu.usbmodem-thd75-test");
+        let Err(TransportError::Open { source, .. }) = result else {
+            return Err(format!("expected a typed Open error, got {result:?}").into());
+        };
+        assert!(
+            source.to_string().contains("tokio runtime"),
+            "the error must name the missing tokio runtime: {source}"
+        );
+        Ok(())
     }
 
     #[test]

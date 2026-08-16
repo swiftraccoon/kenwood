@@ -37,7 +37,7 @@
 use kenwood_thd75::Radio;
 use kenwood_thd75::transport::Transport;
 use kenwood_thd75::types::{
-    Band, BandMode, DstarCallsign, DstarSuffix, GpsSettings, Module, OperatingMode,
+    Band, BandMode, DstarCallsign, DstarSuffix, Frequency, GpsSettings, Module, OperatingMode,
     ReflectorCallsign, RegularChannel, UsbAudioOutput,
 };
 use thd75_repl::aprintln;
@@ -341,14 +341,8 @@ pub(crate) async fn step_down<T: Transport>(radio: &mut Radio<T>, args: &[&str])
 
 /// Parse a direct-frequency request and report the current frequency.
 ///
-/// Arbitrary CAT frequency writes are not qualified. Args: `<a|b> <mhz>`.
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "Frequencies are entered in megahertz (e.g. 146.52), multiplied by 1_000_000 to yield \
-              at most ~1.3e9, well within u32 range. The parsed f64 is validated finite and \
-              positive above, so the `as u32` truncation and sign-loss are both fine."
-)]
+/// Step-tune a band's VFO with individually verified UP/DW steps.
+/// Args: `<a|b> <mhz>`. Direct FO/FQ frequency writes remain quarantined.
 pub(crate) async fn tune<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
     if args.len() < 2 {
         aprintln!("Usage: tune <a or b> <frequency in megahertz>");
@@ -361,33 +355,19 @@ pub(crate) async fn tune<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
         return;
     };
 
-    let Ok(mhz) = freq_str.parse::<f64>() else {
-        aprintln!("Error: invalid frequency: {freq_str}");
-        return;
+    let target = match Frequency::from_mhz_str(freq_str) {
+        Ok(target) => target,
+        Err(e) => {
+            aprintln!("{}", thd75_repl::output::error(e));
+            return;
+        }
     };
-    // `parse::<f64>` accepts negative numbers, NaN, and infinity;
-    // an unguarded `as u32` would silently saturate those to 0 and
-    // tune the radio to 0 hertz instead of reporting the mistake.
-    if !mhz.is_finite() || mhz <= 0.0 {
-        aprintln!("Error: frequency must be a positive number in megahertz: {freq_str}");
-        return;
-    }
 
-    let hz = (mhz * 1_000_000.0) as u32;
-    match radio.get_frequency(band).await {
-        Ok(current) if current.as_hz() == hz => aprintln!(
-            "{}",
-            thd75_repl::output::error(
-                "already at the requested frequency; arbitrary CAT frequency writes are not qualified"
-            )
-        ),
-        Ok(current) => aprintln!(
-            "{}",
-            thd75_repl::output::error(format_args!(
-                "Band {} is at {} Hz; arbitrary CAT frequency writes are not qualified",
-                band_name(band),
-                current.as_hz()
-            ))
+    match radio.step_tune(band, target).await {
+        Ok(landed) => aprintln!(
+            "Tuned band {} to {}.",
+            band_name(band),
+            thd75_repl::output::freq_mhz(landed.as_hz())
         ),
         Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
     }

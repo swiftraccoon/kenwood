@@ -1,13 +1,13 @@
 //! Command grammar for the listener prompt.
 
 use if_dsp::DemodMode;
+use kenwood_thd75::types::{Frequency, StepSize};
 
 /// A parsed prompt command.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Command {
-    /// Tune the radio (value in megahertz, already validated on the
-    /// 5 kHz raster).
-    Tune(f64),
+    /// Tune the radio (already validated in range and on the 5 kHz raster).
+    Tune(Frequency),
     /// Switch the computer-side demodulator.
     Mode(DemodMode),
     /// Set the audio passband width in hertz.
@@ -24,10 +24,10 @@ pub enum Command {
     Quit,
 }
 
-/// Lowest tunable frequency in megahertz (Band B receive floor).
-const MIN_MHZ: f64 = 0.1;
-/// Highest tunable frequency in megahertz (Band B receive ceiling).
-const MAX_MHZ: f64 = 524.0;
+/// Lowest tunable frequency in hertz (Band B receive floor, 0.1 MHz).
+const MIN_HZ: u32 = 100_000;
+/// Highest tunable frequency in hertz (Band B receive ceiling, 524 MHz).
+const MAX_HZ: u32 = 524_000_000;
 
 /// Parse one prompt line. Errors are complete, accessible sentences;
 /// the caller adds the `Error: ` prefix.
@@ -61,20 +61,17 @@ fn parse_tune(arg: Option<&str>) -> Result<Command, String> {
     let Some(arg) = arg else {
         return Err("Usage: tune followed by megahertz, like tune 435.640.".to_owned());
     };
-    let mhz: f64 = arg
-        .parse()
+    let freq = Frequency::from_mhz_str(arg)
         .map_err(|_ignored| format!("Not a frequency: {arg:?}. Example: tune 435.640."))?;
-    if !mhz.is_finite() || !(MIN_MHZ..=MAX_MHZ).contains(&mhz) {
+    if !(MIN_HZ..=MAX_HZ).contains(&freq.as_hz()) {
         return Err("Frequency out of range. Use 0.1 through 524 megahertz.".to_owned());
     }
     // The listener pins a 5 kHz step; the radio silently snaps other
     // frequencies to that raster, so reject them with guidance.
-    let hz = mhz * 1_000_000.0;
-    let raster = hz / 5_000.0;
-    if (raster - raster.round()).abs() > 1e-6 {
+    if !freq.is_aligned_to(StepSize::Hz5000) {
         return Err("Use a multiple of 5 kilohertz, like 435.640 or 14.070.".to_owned());
     }
-    Ok(Command::Tune(mhz))
+    Ok(Command::Tune(freq))
 }
 
 fn parse_mode(arg: Option<&str>) -> Result<Command, String> {
@@ -127,7 +124,10 @@ mod tests {
 
     #[test]
     fn parses_every_command() {
-        assert_eq!(parse("tune 435.640"), Ok(Command::Tune(435.640)));
+        assert_eq!(
+            parse("tune 435.640"),
+            Ok(Command::Tune(Frequency::new(435_640_000)))
+        );
         assert_eq!(parse("MODE usb"), Ok(Command::Mode(DemodMode::Usb)));
         assert_eq!(parse("mode LSB"), Ok(Command::Mode(DemodMode::Lsb)));
         assert_eq!(parse("filter 2.4"), Ok(Command::Filter(2_400.0)));
@@ -145,7 +145,10 @@ mod tests {
             matches!(&e, Err(msg) if msg.contains("5 kilohertz")),
             "expected raster guidance, got {e:?}"
         );
-        assert_eq!(parse("tune 14.070"), Ok(Command::Tune(14.070)));
+        assert_eq!(
+            parse("tune 14.070"),
+            Ok(Command::Tune(Frequency::new(14_070_000)))
+        );
     }
 
     #[test]

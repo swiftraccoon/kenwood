@@ -54,6 +54,24 @@ use super::Radio;
 impl<T: Transport> Radio<T> {
     /// Read the current frequency data for the given band (FQ read).
     ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use kenwood_thd75::types::Band;
+    /// use kenwood_thd75::{MockTransport, Radio};
+    ///
+    /// let mut mock = MockTransport::new();
+    /// mock.expect(b"FQ 0\r", b"FQ 0,0145000000\r");
+    ///
+    /// let mut radio = Radio::new(mock);
+    /// let frequency = radio.get_frequency(Band::A).await?;
+    /// assert_eq!(frequency.as_hz(), 145_000_000);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
@@ -87,6 +105,24 @@ impl<T: Transport> Radio<T> {
     }
 
     /// Get the operating mode for the given band (MD read).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use kenwood_thd75::types::{Band, OperatingMode};
+    /// use kenwood_thd75::{MockTransport, Radio};
+    ///
+    /// let mut mock = MockTransport::new();
+    /// mock.expect(b"MD 0\r", b"MD 0,0\r");
+    ///
+    /// let mut radio = Radio::new(mock);
+    /// let mode = radio.get_operating_mode(Band::A).await?;
+    /// assert_eq!(mode, OperatingMode::Fm);
+    /// # Ok(())
+    /// # }
+    /// ```
     ///
     /// # Errors
     ///
@@ -125,7 +161,9 @@ impl<T: Transport> Radio<T> {
         tracing::debug!(?band, ?mode, "setting operating mode");
         let response = match self.execute(Command::SetOperatingMode { band, mode }).await {
             Ok(response) => response,
-            Err(error @ (Error::CommandRejected | Error::NotAvailableInCurrentMode)) => {
+            Err(
+                error @ (Error::CommandRejected { .. } | Error::NotAvailableInCurrentMode { .. }),
+            ) => {
                 return match self.get_operating_mode(band).await {
                     Ok(readback) if readback == mode => Ok(()),
                     Ok(_) => Err(error),
@@ -184,6 +222,24 @@ impl<T: Transport> Radio<T> {
 
     /// Get the squelch level for the given band (SQ read).
     ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use kenwood_thd75::types::{Band, SquelchLevel};
+    /// use kenwood_thd75::{MockTransport, Radio};
+    ///
+    /// let mut mock = MockTransport::new();
+    /// mock.expect(b"SQ 0\r", b"SQ 0,05\r");
+    ///
+    /// let mut radio = Radio::new(mock);
+    /// let level = radio.get_squelch(Band::A).await?;
+    /// assert_eq!(level, SquelchLevel::new(5)?);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
@@ -210,6 +266,23 @@ impl<T: Transport> Radio<T> {
     /// # Wire format
     ///
     /// `SQ band,level\r` where band is 0 (A) or 1 (B) and level is a single digit 0-6.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use kenwood_thd75::types::{Band, SquelchLevel};
+    /// use kenwood_thd75::{MockTransport, Radio};
+    ///
+    /// let mut mock = MockTransport::new();
+    /// mock.expect(b"SQ 0,4\r", b"SQ 0,4\r");
+    ///
+    /// let mut radio = Radio::new(mock);
+    /// radio.set_squelch(Band::A, SquelchLevel::new(4)?).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     ///
     /// # Errors
     ///
@@ -357,6 +430,22 @@ impl<T: Transport> Radio<T> {
 
     /// Get the exact firmware identity (FV read).
     ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use kenwood_thd75::{MockTransport, Radio};
+    ///
+    /// let mut mock = MockTransport::new();
+    /// mock.expect(b"FV\r", b"FV 1.03.000\r");
+    ///
+    /// let mut radio = Radio::new(mock);
+    /// assert_eq!(radio.get_firmware_version().await?.as_str(), "1.03.000");
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
@@ -391,6 +480,23 @@ impl<T: Transport> Radio<T> {
 
     /// Get the current active band (BC read).
     ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use kenwood_thd75::types::Band;
+    /// use kenwood_thd75::{MockTransport, Radio};
+    ///
+    /// let mut mock = MockTransport::new();
+    /// mock.expect(b"BC\r", b"BC 1\r");
+    ///
+    /// let mut radio = Radio::new(mock);
+    /// assert_eq!(radio.get_band().await?, Band::B);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
@@ -410,6 +516,23 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Warning
     /// This is an ACTION command that switches the radio's active band.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use kenwood_thd75::types::Band;
+    /// use kenwood_thd75::{MockTransport, Radio};
+    ///
+    /// let mut mock = MockTransport::new();
+    /// mock.expect(b"BC 1\r", b"BC 1\r");
+    ///
+    /// let mut radio = Radio::new(mock);
+    /// radio.set_band(Band::B).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     ///
     /// # Errors
     ///
@@ -662,13 +785,20 @@ impl<T: Transport> Radio<T> {
     /// Returns an error if entering programming mode, reading or writing the
     /// setting page, verifying the write, exiting, or reconnecting fails.
     pub async fn set_fm_radio_via_mcp(&mut self, enabled: bool) -> Result<(), Error> {
-        const PAGE: u16 = 0x0010;
-        const BYTE_INDEX: usize = 0x40;
+        use super::mcp_offsets;
 
-        tracing::info!(enabled, offset = 0x1040, "setting FM Radio mode via MCP");
-        self.modify_memory_page(programming::WritableMcpPage::new(PAGE)?, |data| {
-            data[BYTE_INDEX] = u8::from(enabled);
-        })
+        tracing::info!(
+            enabled,
+            offset = mcp_offsets::FM_RADIO_MODE,
+            "setting FM Radio mode via MCP"
+        );
+        self.modify_memory_page(
+            programming::WritableMcpPage::new(mcp_offsets::page(mcp_offsets::FM_RADIO_MODE))?,
+            |data| {
+                data[const { mcp_offsets::byte_index(mcp_offsets::FM_RADIO_MODE) }] =
+                    u8::from(enabled);
+            },
+        )
         .await
     }
 

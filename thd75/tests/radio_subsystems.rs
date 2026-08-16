@@ -124,7 +124,7 @@ async fn transmit_aprs_beacon_preserves_tnc_not_ready() -> TestResult {
     let mut radio = Radio::new(mock);
     assert!(matches!(
         radio.transmit_aprs_beacon().await,
-        Err(Error::NotAvailableInCurrentMode)
+        Err(Error::NotAvailableInCurrentMode { .. })
     ));
     Ok(())
 }

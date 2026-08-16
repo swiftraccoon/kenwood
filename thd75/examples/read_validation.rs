@@ -113,7 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("typed ME => skipped (MR reported output-only {selector})");
                 }
             }
-            Err(Error::NotAvailableInCurrentMode) => {
+            Err(Error::NotAvailableInCurrentMode { .. }) => {
                 println!(
                     "typed MR {band_number} => NotAvailableInCurrentMode (band is not in memory mode)"
                 );
@@ -128,7 +128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for address in addresses {
         match radio.get_channel_record(address).await {
             Ok(record) => println!("typed ME {address} => {record:#?}"),
-            Err(Error::NotAvailableInCurrentMode) => {
+            Err(Error::NotAvailableInCurrentMode { .. }) => {
                 println!("typed ME {address} => NotAvailableInCurrentMode");
             }
             Err(error) => return Err(error.into()),

@@ -42,6 +42,16 @@ behavior has been checked against the radio or an exact, lossless file format.
 - **Session resilience**: `Radio::reconnect()` re-establishes a dropped USB or Bluetooth link on the same transport identity (surviving USB re-enumeration and MCP programming-mode exits), and `RadioLinkRecovery` explicitly retries with capped exponential backoff while broadcasting typed link events. MCP writes verify by read-back before reporting success.
 - **Async**: Built on tokio. All radio operations are async.
 
+## Cargo features
+
+Both features are enabled by default; a CAT-only consumer can depend with
+`default-features = false` for the core control surface alone.
+
+| Feature | Adds | Stays in the core without it |
+|---------|------|------------------------------|
+| `aprs` | The `AprsClient` stack (radio + KISS session + APRS-IS uplink glue), the `KissSession` binary TNC session, and the `aprs-is`/`kiss-tnc` re-exports | CAT APRS settings, GPS position types, TNC mode commands, and the sans-io `aprs`/`ax25-codec` type layer |
+| `dstar` | The `DstarGateway` reflector client and the `MmdvmSession` modem session over the tokio `mmdvm` crate | The Menu 650 terminal-mode lifecycle, MMDVM link diagnosis (`mmdvm-core` only), and CAT D-STAR settings |
+
 ## API vocabulary
 
 The public API follows these naming rules:
@@ -406,18 +416,26 @@ of the repository.
 | Linux | `/dev/ttyACM*` | `/dev/rfcomm*` via `SerialTransport` |
 | Windows | `COM*` | BT COM port via `SerialTransport` |
 
-On macOS, `BluetoothTransport` re-executes the signed host binary as a private
-RFCOMM helper because Apple's synchronous and asynchronous write paths can both
-block indefinitely when flow-control credit stalls. The parent communicates
-through nonblocking raw pipes. A failed, timed-out, or cancelled write destroys
-the helper because the transmitted prefix is ambiguous; close, reconnect, and
-drop do the same. A command-response read timeout instead leaves the byte stream
-available for the radio layer's stale-response drain, while helper EOF or a read
-error destroys it. Cleanup is bounded and cannot wedge the application. A
-dedicated liveness-pipe watchdog also exits an orphaned helper if its parent
-disappears. Native startup uses one 20-second SDP/baseband/RFCOMM deadline beneath
-the parent's 22-second bound, and buffers radio ingress until the readiness
-prefix is complete. One helper owns the TH-D75 SPP channel per process.
+On macOS, `BluetoothTransport` runs a signed executable containing its private
+RFCOMM helper constructor because Apple's synchronous and asynchronous write
+paths can both block indefinitely when flow-control credit stalls. Command-line
+clients use their current executable. Sandboxed applications embed a helper
+signed for sandbox inheritance and pass its absolute path to
+`BluetoothTransport::open_with_helper_executable`. Radio selection accepts an
+exact paired-device name or Bluetooth address, with the address taking
+precedence. A name shared by multiple paired devices is rejected so callers can
+select the intended radio by its exact address.
+
+The parent communicates through nonblocking raw pipes. A failed, timed-out, or
+cancelled write destroys the helper because the transmitted prefix is
+ambiguous; close, reconnect, and drop do the same. A command-response read
+timeout instead leaves the byte stream available for the radio layer's
+stale-response drain, while helper EOF or a read error destroys it. Cleanup is
+bounded and cannot wedge the application. A dedicated liveness-pipe watchdog
+also exits an orphaned helper if its parent disappears. Native startup uses one
+20-second SDP/baseband/RFCOMM deadline beneath the parent's 22-second bound, and
+buffers radio ingress until the readiness prefix is complete. One helper owns
+the TH-D75 SPP channel per process.
 
 A newly launched helper can observe an already-connected Bluetooth baseband
 before that process's Classic manager is ready to open RFCOMM. If the first

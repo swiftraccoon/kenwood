@@ -190,6 +190,21 @@ impl SMeterReading {
             _ => "S?",
         }
     }
+
+    /// The numeric S-unit for this reading, matching [`Self::s_unit`]'s
+    /// nonlinear display table (raw 0-5 map to S0, S1, S3, S5, S7, S9).
+    #[must_use]
+    pub const fn s_unit_value(&self) -> u8 {
+        match self.0 {
+            0 => 0,
+            1 => 1,
+            2 => 3,
+            3 => 5,
+            4 => 7,
+            // `new` bounds raw values to 0-5, so this arm is raw value 5.
+            _ => 9,
+        }
+    }
 }
 
 impl TryFrom<u8> for SMeterReading {
@@ -249,6 +264,10 @@ pub enum TuningMode {
 impl TuningMode {
     /// Number of valid VFO/memory mode values (0-3).
     pub const COUNT: u8 = 4;
+
+    /// Every tuning mode, in `VM` wire-value order.
+    pub const ALL: [Self; Self::COUNT as usize] =
+        [Self::Vfo, Self::Memory, Self::Call, Self::Weather];
 }
 
 impl fmt::Display for TuningMode {
@@ -1734,6 +1753,27 @@ mod tests {
             assert_eq!(u8::from(val), v, "GpsRadioMode round-trip failed at {v}");
         }
         assert!(GpsRadioMode::try_from(GpsRadioMode::COUNT).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn tuning_mode_all_lists_every_wire_value_in_order() {
+        for (raw, mode) in (0_u8..).zip(TuningMode::ALL) {
+            assert_eq!(u8::from(mode), raw);
+        }
+        assert_eq!(TuningMode::ALL.len(), usize::from(TuningMode::COUNT));
+    }
+
+    #[test]
+    fn s_meter_numeric_s_units_match_the_display_table() -> TestResult {
+        for (raw, s_unit) in [(0, 0), (1, 1), (2, 3), (3, 5), (4, 7), (5, 9)] {
+            let reading = SMeterReading::new(raw)?;
+            assert_eq!(
+                reading.s_unit_value(),
+                s_unit,
+                "raw {raw} must report S{s_unit}"
+            );
+        }
         Ok(())
     }
 }

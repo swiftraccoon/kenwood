@@ -468,6 +468,13 @@ fn transport_err_to_io(err: TransportError) -> io::Error {
         TransportError::Open { path, source } => {
             io::Error::new(source.kind(), format!("failed to open {path}: {source}"))
         }
+        TransportError::BluetoothHelper { context, source } => io::Error::new(
+            source.kind(),
+            format!("Bluetooth helper failed during {context}: {source}"),
+        ),
+        error @ TransportError::BluetoothDeviceNameAmbiguous => {
+            io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
+        }
         TransportError::BrokerUnavailable => {
             io::Error::new(io::ErrorKind::BrokenPipe, "transport broker unavailable")
         }
@@ -900,6 +907,26 @@ mod tests {
                 .contains("deliberate transport write failure"),
             "transport error text was not preserved: {error}",
         );
+    }
+
+    #[test]
+    fn bluetooth_helper_error_keeps_io_kind_and_context() {
+        let error = transport_err_to_io(TransportError::BluetoothHelper {
+            context: "launching /Applications/AzimuthBluetoothHelper".to_owned(),
+            source: io::Error::new(io::ErrorKind::PermissionDenied, "sandbox denied exec"),
+        });
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("AzimuthBluetoothHelper"));
+        assert!(error.to_string().contains("sandbox denied exec"));
+    }
+
+    #[test]
+    fn ambiguous_bluetooth_name_maps_to_actionable_invalid_input() {
+        let error = transport_err_to_io(TransportError::BluetoothDeviceNameAmbiguous);
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("exact Bluetooth address"));
     }
 
     #[tokio::test]

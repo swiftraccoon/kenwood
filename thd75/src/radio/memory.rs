@@ -76,7 +76,7 @@ impl<T: Transport> Radio<T> {
                         results.push((channel, data));
                     }
                 }
-                Err(Error::NotAvailableInCurrentMode) => {
+                Err(Error::NotAvailableInCurrentMode { .. }) => {
                     // Channel is empty/not programmed, so skip it.
                 }
                 Err(e) => return Err(e),
@@ -169,7 +169,7 @@ mod tests {
             .get_regular_channel_record(RegularChannel::new(999)?)
             .await;
         assert!(
-            matches!(result, Err(Error::NotAvailableInCurrentMode)),
+            matches!(result, Err(Error::NotAvailableInCurrentMode { .. })),
             "expected NotAvailableInCurrentMode, got {result:?}"
         );
         Ok(())

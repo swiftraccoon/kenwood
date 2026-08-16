@@ -9,9 +9,9 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::app::{App, DstarMode, McpState, Pane};
 
-/// Format a duration since `then` as a human-readable "ago" string.
-fn ago(then: Instant) -> String {
-    let secs = then.elapsed().as_secs();
+/// Format a last-heard entry's age as a human-readable "ago" string.
+fn ago(entry: &kenwood_thd75::LastHeardEntry) -> String {
+    let secs = entry.age(Instant::now()).as_secs();
     if secs < 60 {
         format!("{secs}s ago")
     } else if secs < 3600 {
@@ -59,7 +59,7 @@ fn gateway_callsign(callsign: kenwood_thd75::ObservedDstarCallsign) -> String {
     )
 }
 
-fn gateway_suffix(suffix: dstar_gateway_core::Suffix) -> String {
+fn gateway_suffix(suffix: kenwood_thd75::dstar_gateway::Suffix) -> String {
     suffix.text().map_or_else(
         |error| invalid_wire_bytes(suffix.as_bytes(), error),
         str::to_owned,
@@ -300,7 +300,7 @@ fn render_gateway(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_area
 
             let callsign = format!("{:<9}", gateway_callsign(entry.callsign));
             let dest = format!("{:<9}", gateway_callsign(entry.destination));
-            let time = ago(entry.timestamp);
+            let time = ago(entry);
 
             let style = if is_selected {
                 Style::default()
@@ -408,7 +408,7 @@ fn render_gateway(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_area
             gateway_callsign(entry.repeater2),
             Color::White,
         ));
-        detail_lines.push(kv_line("Last heard", ago(entry.timestamp), Color::White));
+        detail_lines.push(kv_line("Last heard", ago(entry), Color::White));
     } else {
         detail_lines.push(Line::from(Span::styled(
             " No transmission yet",

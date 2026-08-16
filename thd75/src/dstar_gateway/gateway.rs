@@ -76,8 +76,12 @@
 //!     }
 //! }
 //!
-//! let mut radio = gw.stop().await?;
-//! radio.restore_cat_after_mode_exit().await?;
+//! let radio = gw
+//!     .stop()
+//!     .await?
+//!     .restore()
+//!     .await
+//!     .map_err(|(_desynced, e)| e)?;
 //! # Ok(())
 //! # }
 //! ```
@@ -93,8 +97,8 @@ use dstar_gateway_core::{
 use mmdvm_core::{MMDVM_SET_CONFIG, ModemMode, ModemStatus};
 
 use crate::error::Error;
-use crate::radio::Radio;
 use crate::radio::mmdvm_session::{MmdvmRadioRestore, MmdvmSession};
+use crate::radio::{DesyncedRadio, Radio};
 use crate::transport::{MmdvmTransportAdapter, Transport};
 use crate::types::dstar::UrCallAction;
 use crate::types::{DstarCallsign, DstarSuffix, PacketDataRate};
@@ -335,6 +339,19 @@ pub struct LastHeardEntry {
     pub timestamp: Instant,
 }
 
+impl LastHeardEntry {
+    /// How long ago this station was heard, as of `now`.
+    ///
+    /// The caller supplies the clock reading (typically
+    /// `Instant::now()`), keeping display code testable. Saturates to
+    /// zero if `now` precedes the entry's own timestamp, so render
+    /// paths never panic on clock skew.
+    #[must_use]
+    pub fn age(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.timestamp)
+    }
+}
+
 /// A D-STAR receive frame that violated the gateway stream state.
 ///
 /// These violations are non-fatal: they are surfaced as typed events so a
@@ -498,7 +515,9 @@ impl<T: Transport + Unpin + 'static> DstarGateway<T> {
             Err((restore, modem, init_err)) => {
                 // Init failed; roll back MMDVM mode to recover the Radio.
                 match restore.exit_and_rebuild(modem).await {
-                    Ok(radio) => Err((Some(radio), init_err)),
+                    // The caller receives the init error; the radio
+                    // still tracks its own recovery obligation.
+                    Ok(desynced) => Err((Some(desynced.into_radio_unproven()), init_err)),
                     Err(exit_err) => {
                         // Both init AND rollback failed (one USB
                         // unplug does it). No Radio can be returned
@@ -603,17 +622,17 @@ impl<T: Transport + Unpin + 'static> DstarGateway<T> {
         })
     }
 
-    /// Stop the gateway, exiting MMDVM mode and returning the [`Radio`].
+    /// Stop the gateway, exiting MMDVM mode.
     ///
-    /// The returned radio is deliberately desynchronized because unread
-    /// MMDVM frames may remain on the transport. Call
-    /// [`Radio::restore_cat_after_mode_exit`] before using CAT again or
-    /// reporting that CAT mode has been restored.
+    /// Unread MMDVM frames may remain on the transport, so the radio
+    /// comes back wrapped in [`DesyncedRadio`]: call
+    /// [`DesyncedRadio::restore`] before using CAT again or reporting
+    /// that CAT mode has been restored.
     ///
     /// # Errors
     ///
     /// Returns an error if the MMDVM exit command fails.
-    pub async fn stop(self) -> Result<Radio<T>, Error> {
+    pub async fn stop(self) -> Result<DesyncedRadio<T>, Error> {
         self.restore.exit_and_rebuild(self.modem).await
     }
 
@@ -1629,6 +1648,27 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn last_heard_entry_age_is_duration_since_timestamp() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let t0 = Instant::now();
+        let entry = LastHeardEntry {
+            callsign: Callsign::try_from_str("W1AW")?.into(),
+            suffix: Suffix::EMPTY,
+            destination: Callsign::try_from_str("CQCQCQ")?.into(),
+            repeater1: Callsign::try_from_str("DIRECT")?.into(),
+            repeater2: Callsign::try_from_str("DIRECT")?.into(),
+            timestamp: t0,
+        };
+        assert_eq!(
+            entry.age(t0 + Duration::from_secs(30)),
+            Duration::from_secs(30)
+        );
+        // Clock skew between capture and render must not panic.
+        assert_eq!(entry.age(t0), Duration::ZERO);
+        Ok(())
+    }
+
     // -------------------------------------------------------------------
     // Event enum tests
     // -------------------------------------------------------------------
@@ -2262,7 +2302,9 @@ mod tests {
         // the process must not abort; the combined error carries
         // both causes for the operator.
         let init = Error::Timeout(Duration::from_secs(2));
-        let exit = Error::CommandRejected;
+        let exit = Error::CommandRejected {
+            mnemonic: "0M".to_string(),
+        };
         let err = double_fault_error(&init, &exit);
         let mut chain_text = String::new();
         let mut source: Option<&dyn std::error::Error> = Some(&err);
@@ -2274,7 +2316,7 @@ mod tests {
             source = e.source();
         }
         assert!(
-            chain_text.contains("timed out") && chain_text.contains("rejected the command"),
+            chain_text.contains("timed out") && chain_text.contains("rejected the 0M command"),
             "both causes must be reported: {chain_text}"
         );
 
@@ -2290,7 +2332,7 @@ mod tests {
         }
         assert!(
             chain_text.contains("timed out")
-                && chain_text.contains("rejected the command")
+                && chain_text.contains("rejected the 0M command")
                 && chain_text.contains("diagnose from scratch"),
             "persistent reclaim fault must retain both causes and recovery: {chain_text}"
         );

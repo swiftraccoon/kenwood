@@ -2834,7 +2834,7 @@ mod tests {
 
         let result = radio.exit_programming_mode().await;
         assert!(
-            matches!(result, Err(Error::CommandRejected)),
+            matches!(result, Err(Error::CommandRejected { .. })),
             "cached-state restore failure must remain an ordinary error: {result:?}"
         );
         assert_eq!(

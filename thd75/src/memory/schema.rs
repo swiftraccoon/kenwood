@@ -107,6 +107,19 @@ pub enum FieldCodec {
 }
 
 impl FieldCodec {
+    /// Number of image bytes this codec occupies.
+    ///
+    /// Bit-level codecs share their byte with other fields but still occupy
+    /// exactly one image byte for span purposes.
+    #[must_use]
+    pub const fn encoded_len(self) -> usize {
+        match self {
+            Self::Byte { .. } | Self::Bool | Self::BitBool { .. } | Self::BitField { .. } => 1,
+            Self::FixedString { len, .. } | Self::Bytes { len } => len,
+            Self::Unsigned { width, .. } | Self::Signed { width, .. } => width as usize,
+        }
+    }
+
     /// Short human-readable name for the expected value kind.
     #[must_use]
     pub const fn value_kind(self) -> &'static str {
@@ -161,6 +174,45 @@ impl FieldDescriptor {
             len: 1,
             image_len: programming::TOTAL_SIZE,
         })
+    }
+
+    /// Every physical MCP page the field's encoded bytes touch, ascending.
+    ///
+    /// Multi-byte fields can span pages (the widest generated field spans
+    /// hundreds), so sparse reads must fetch this whole list rather than
+    /// [`Self::page`] alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SchemaError::OffsetTooLarge`] when a spanned page cannot be
+    /// represented by the 16-bit page address, or
+    /// [`SchemaError::OutOfBounds`] when the span leaves the physical image.
+    pub fn pages(self) -> Result<Vec<McpPage>, SchemaError> {
+        let len = self.codec.encoded_len().max(1);
+        let last_offset = self
+            .offset
+            .checked_add(len - 1)
+            .ok_or(SchemaError::OffsetTooLarge {
+                field: self.name,
+                offset: self.offset,
+            })?;
+        let first_page = self.offset / programming::PAGE_SIZE;
+        let last_page = last_offset / programming::PAGE_SIZE;
+        let mut pages = Vec::with_capacity(last_page - first_page + 1);
+        for page in first_page..=last_page {
+            let page = u16::try_from(page).map_err(|_| SchemaError::OffsetTooLarge {
+                field: self.name,
+                offset: last_offset,
+            })?;
+            let page = McpPage::new(page).map_err(|_| SchemaError::OutOfBounds {
+                field: self.name,
+                offset: self.offset,
+                len,
+                image_len: programming::TOTAL_SIZE,
+            })?;
+            pages.push(page);
+        }
+        Ok(pages)
     }
 
     /// Decode this field from a complete raw MCP image.
@@ -1399,6 +1451,61 @@ fn decode_signed(bytes: &[u8], width: IntegerWidth, endian: Endian) -> i64 {
     i64::from_ne_bytes(extended.to_ne_bytes())
 }
 
+impl super::menu_fields::StorageTransform {
+    /// Convert a stored raw integer into its display-unit value, rounded to
+    /// one decimal place (the official application's display precision).
+    ///
+    /// Returns `None` when the transform's numerator is zero (malformed
+    /// metadata) or the raw value exceeds the exactly-representable integer
+    /// range of `f64`.
+    #[must_use]
+    pub fn decode_display(&self, raw: u64) -> Option<f64> {
+        const EXACT_INTEGER_BOUND: u64 = 1 << 53;
+        if self.numerator == 0 || raw > EXACT_INTEGER_BOUND {
+            return None;
+        }
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "raw is bounded to 2^53 above, and generated numerators and denominators \
+                      are small unit ratios, so every conversion here is exact"
+        )]
+        let value = (raw as f64) * (self.denominator as f64) / (self.numerator as f64);
+        Some((value * 10.0).round() / 10.0)
+    }
+
+    /// Convert a display-unit value into the stored raw integer:
+    /// `round(display * numerator / denominator)`.
+    ///
+    /// Returns `None` for a non-finite input, a zero denominator, a negative
+    /// result, or a result beyond the exactly-representable integer range of
+    /// `f64`. Field-domain validation stays with the patch planner:
+    /// [`PatchPlanner::set`] enforces generated domains on the encoded value.
+    #[must_use]
+    pub fn encode_display(&self, display: f64) -> Option<u64> {
+        /// Largest f64 value that is still an exactly-representable integer.
+        const EXACT_INTEGER_BOUND: f64 = 9_007_199_254_740_992.0;
+        if !display.is_finite() || self.denominator == 0 {
+            return None;
+        }
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "generated numerators and denominators are small unit ratios; the \
+                      conversion is exact"
+        )]
+        let encoded = (display * self.numerator as f64 / self.denominator as f64).round();
+        if !(0.0..=EXACT_INTEGER_BOUND).contains(&encoded) {
+            return None;
+        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "encoded is a rounded integer proven within 0..=2^53 by the containment \
+                      check above"
+        )]
+        Some(encoded as u64)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2058,5 +2165,114 @@ mod tests {
             ),
             "an over-wide signed domain must not truncate: {signed_result:?}"
         );
+    }
+
+    #[test]
+    fn encoded_len_covers_every_codec_shape() {
+        assert_eq!(FieldCodec::Byte { min: 0, max: 5 }.encoded_len(), 1);
+        assert_eq!(FieldCodec::Bool.encoded_len(), 1);
+        assert_eq!(FieldCodec::BitBool { mask: 0x08 }.encoded_len(), 1);
+        assert_eq!(
+            FieldCodec::BitField {
+                mask: 0x30,
+                shift: 4,
+                min: 0,
+                max: 3
+            }
+            .encoded_len(),
+            1
+        );
+        assert_eq!(
+            FieldCodec::FixedString {
+                len: 16,
+                encoding: StringEncoding::Utf8,
+                padding: 0
+            }
+            .encoded_len(),
+            16
+        );
+        assert_eq!(
+            FieldCodec::Unsigned {
+                width: 4,
+                endian: Endian::Little,
+                min: 0,
+                max: 100
+            }
+            .encoded_len(),
+            4
+        );
+        assert_eq!(
+            FieldCodec::Signed {
+                width: 2,
+                endian: Endian::Big,
+                min: -5,
+                max: 5
+            }
+            .encoded_len(),
+            2
+        );
+        assert_eq!(FieldCodec::Bytes { len: 300 }.encoded_len(), 300);
+    }
+
+    #[test]
+    fn pages_lists_the_whole_span_in_ascending_order() -> TestResult {
+        let single = FieldDescriptor::new("test.single", 10, FieldCodec::Bool);
+        assert_eq!(single.pages()?, vec![McpPage::new(0)?]);
+
+        let straddles = FieldDescriptor::new(
+            "test.straddle",
+            programming::PAGE_SIZE - 1,
+            FieldCodec::Bytes { len: 2 },
+        );
+        assert_eq!(straddles.pages()?, vec![McpPage::new(0)?, McpPage::new(1)?]);
+
+        let wide = FieldDescriptor::new("test.wide_span", 0, FieldCodec::Bytes { len: 300 });
+        assert_eq!(wide.pages()?, vec![McpPage::new(0)?, McpPage::new(1)?]);
+
+        let outside =
+            FieldDescriptor::new("test.outside", programming::TOTAL_SIZE, FieldCodec::Bool);
+        let outside_result = outside.pages();
+        assert!(
+            matches!(outside_result, Err(SchemaError::OutOfBounds { .. })),
+            "a span outside the image must be refused: {outside_result:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn storage_transform_round_trips_the_documented_scaling() -> TestResult {
+        use crate::memory::menu_fields::StorageTransform;
+
+        // A real generated ratio: stored per-minute rate for a
+        // seconds-denominated display value.
+        let per_minute = StorageTransform {
+            input_unit: "seconds",
+            numerator: 10_000,
+            denominator: 60,
+        };
+        assert_eq!(per_minute.encode_display(3.0), Some(500));
+        let decoded = per_minute
+            .decode_display(500)
+            .ok_or("decode of an in-range raw value must succeed")?;
+        assert!(
+            (decoded - 3.0).abs() < f64::EPSILON,
+            "raw 500 must decode to 3.0 seconds, got {decoded}"
+        );
+
+        let zero_numerator = StorageTransform {
+            input_unit: "x",
+            numerator: 0,
+            denominator: 60,
+        };
+        assert_eq!(zero_numerator.decode_display(1), None);
+        let zero_denominator = StorageTransform {
+            input_unit: "x",
+            numerator: 10,
+            denominator: 0,
+        };
+        assert_eq!(zero_denominator.encode_display(1.0), None);
+        assert_eq!(per_minute.encode_display(f64::NAN), None);
+        assert_eq!(per_minute.encode_display(-1.0), None);
+        Ok(())
     }
 }

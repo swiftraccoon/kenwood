@@ -87,22 +87,72 @@ pub enum OperatingMode {
 impl OperatingMode {
     /// Number of valid mode values (0-9).
     pub const COUNT: u8 = 10;
+
+    /// Every operating mode, in `MD` wire-value order.
+    pub const ALL: [Self; Self::COUNT as usize] = [
+        Self::Fm,
+        Self::Dv,
+        Self::Am,
+        Self::Lsb,
+        Self::Usb,
+        Self::Cw,
+        Self::Nfm,
+        Self::Dr,
+        Self::Wfm,
+        Self::CwReverse,
+    ];
+
+    /// Canonical operator-facing mode name; also the [`fmt::Display`] form
+    /// and the name accepted by this type's [`FromStr`](std::str::FromStr)
+    /// implementation.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use kenwood_thd75::types::OperatingMode;
+    ///
+    /// assert_eq!(OperatingMode::CwReverse.name(), "CW-R");
+    /// assert_eq!("usb".parse::<OperatingMode>()?, OperatingMode::Usb);
+    /// # Ok::<(), kenwood_thd75::error::ValidationError>(())
+    /// ```
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Fm => "FM",
+            Self::Dv => "DV",
+            Self::Am => "AM",
+            Self::Lsb => "LSB",
+            Self::Usb => "USB",
+            Self::Cw => "CW",
+            Self::Nfm => "NFM",
+            Self::Dr => "DR",
+            Self::Wfm => "WFM",
+            Self::CwReverse => "CW-R",
+        }
+    }
 }
 
 impl fmt::Display for OperatingMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Fm => f.write_str("FM"),
-            Self::Dv => f.write_str("DV"),
-            Self::Am => f.write_str("AM"),
-            Self::Lsb => f.write_str("LSB"),
-            Self::Usb => f.write_str("USB"),
-            Self::Cw => f.write_str("CW"),
-            Self::Nfm => f.write_str("NFM"),
-            Self::Dr => f.write_str("DR"),
-            Self::Wfm => f.write_str("WFM"),
-            Self::CwReverse => f.write_str("CW-R"),
-        }
+        f.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for OperatingMode {
+    type Err = ValidationError;
+
+    /// Parse the canonical mode name (the [`fmt::Display`] form), ASCII
+    /// case-insensitively.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|mode| text.eq_ignore_ascii_case(mode.name()))
+            .ok_or_else(|| ValidationError::InvalidTextValue {
+                name: "operating mode",
+                value: text.to_owned(),
+                detail: "must be one of FM, DV, AM, LSB, USB, CW, NFM, DR, WFM, CW-R",
+                reason: "unrecognized mode name".to_owned(),
+            })
     }
 }
 
@@ -121,7 +171,11 @@ impl TryFrom<u8> for OperatingMode {
             7 => Ok(Self::Dr),
             8 => Ok(Self::Wfm),
             9 => Ok(Self::CwReverse),
-            _ => Err(ValidationError::OperatingModeOutOfRange(value)),
+            _ => Err(ValidationError::SettingOutOfRange {
+                name: "operating mode",
+                value,
+                detail: "must be 0-9: FM/DV/AM/LSB/USB/CW/NFM/DR/WFM/CW-R",
+            }),
         }
     }
 }
@@ -165,6 +219,22 @@ pub enum PowerLevel {
 impl PowerLevel {
     /// Number of valid power level values (0-3).
     pub const COUNT: u8 = 4;
+
+    /// Every power level, in `PC` wire-value order (highest power first).
+    pub const ALL: [Self; Self::COUNT as usize] =
+        [Self::High, Self::Medium, Self::Low, Self::ExtraLow];
+
+    /// Nominal transmit power in milliwatts (User Manual Chapter 28 values
+    /// at external DC 13.8 V or battery 7.4 V).
+    #[must_use]
+    pub const fn as_milliwatts(self) -> u32 {
+        match self {
+            Self::High => 5_000,
+            Self::Medium => 2_000,
+            Self::Low => 500,
+            Self::ExtraLow => 50,
+        }
+    }
 }
 
 impl fmt::Display for PowerLevel {
@@ -187,7 +257,11 @@ impl TryFrom<u8> for PowerLevel {
             1 => Ok(Self::Medium),
             2 => Ok(Self::Low),
             3 => Ok(Self::ExtraLow),
-            _ => Err(ValidationError::PowerLevelOutOfRange(value)),
+            _ => Err(ValidationError::SettingOutOfRange {
+                name: "power level",
+                value,
+                detail: "must be 0-3: High/Medium/Low/ExtraLow",
+            }),
         }
     }
 }
@@ -218,6 +292,14 @@ pub enum ShiftDirection {
 impl ShiftDirection {
     /// Number of channel-shift values.
     pub const COUNT: u8 = 4;
+
+    /// Every shift direction, in wire-value order.
+    pub const ALL: [Self; Self::COUNT as usize] = [
+        Self::Simplex,
+        Self::Plus,
+        Self::Minus,
+        Self::Minus7Point6MHz,
+    ];
 }
 
 impl TryFrom<u8> for ShiftDirection {
@@ -229,7 +311,11 @@ impl TryFrom<u8> for ShiftDirection {
             1 => Ok(Self::Plus),
             2 => Ok(Self::Minus),
             3 => Ok(Self::Minus7Point6MHz),
-            _ => Err(ValidationError::ShiftOutOfRange(value)),
+            _ => Err(ValidationError::SettingOutOfRange {
+                name: "shift direction",
+                value,
+                detail: "must be 0-3",
+            }),
         }
     }
 }
@@ -319,6 +405,22 @@ impl StepSize {
     /// Number of valid step size values (0-11).
     pub const COUNT: u8 = 12;
 
+    /// Every step size, in wire-value order (ascending step).
+    pub const ALL: [Self; Self::COUNT as usize] = [
+        Self::Hz5000,
+        Self::Hz6250,
+        Self::Hz8330,
+        Self::Hz9000,
+        Self::Hz10000,
+        Self::Hz12500,
+        Self::Hz15000,
+        Self::Hz20000,
+        Self::Hz25000,
+        Self::Hz30000,
+        Self::Hz50000,
+        Self::Hz100000,
+    ];
+
     /// Returns the step size in Hz.
     #[must_use]
     pub const fn as_hz(self) -> u32 {
@@ -381,7 +483,11 @@ impl TryFrom<u8> for StepSize {
             9 => Ok(Self::Hz30000),
             10 => Ok(Self::Hz50000),
             11 => Ok(Self::Hz100000),
-            _ => Err(ValidationError::StepSizeOutOfRange(value)),
+            _ => Err(ValidationError::SettingOutOfRange {
+                name: "step size",
+                value,
+                detail: "must be 0-11",
+            }),
         }
     }
 }
@@ -423,6 +529,19 @@ pub enum ChannelMode {
 impl ChannelMode {
     /// Number of valid channel-mode values (0-8).
     pub const COUNT: u8 = 9;
+
+    /// Every stored-channel mode, in wire-value order.
+    pub const ALL: [Self; Self::COUNT as usize] = [
+        Self::Fm,
+        Self::Dv,
+        Self::Am,
+        Self::Lsb,
+        Self::Usb,
+        Self::Cw,
+        Self::Nfm,
+        Self::Dr,
+        Self::Wfm,
+    ];
 }
 
 impl fmt::Display for ChannelMode {
@@ -455,7 +574,11 @@ impl TryFrom<u8> for ChannelMode {
             6 => Ok(Self::Nfm),
             7 => Ok(Self::Dr),
             8 => Ok(Self::Wfm),
-            _ => Err(ValidationError::ChannelModeOutOfRange(value)),
+            _ => Err(ValidationError::SettingOutOfRange {
+                name: "channel mode",
+                value,
+                detail: "must be 0-8: FM/DV/AM/LSB/USB/CW/NFM/DR/WFM",
+            }),
         }
     }
 }
@@ -527,10 +650,17 @@ mod tests {
     fn operating_mode_error_variant() -> TestResult {
         let err = OperatingMode::try_from(OperatingMode::COUNT)
             .err()
-            .ok_or("expected OperatingModeOutOfRange error but got Ok")?;
+            .ok_or("expected an operating-mode SettingOutOfRange error but got Ok")?;
         assert!(
-            matches!(err, ValidationError::OperatingModeOutOfRange(10)),
-            "expected OperatingModeOutOfRange(10), got {err:?}"
+            matches!(
+                err,
+                ValidationError::SettingOutOfRange {
+                    name: "operating mode",
+                    value: 10,
+                    ..
+                }
+            ),
+            "expected operating-mode SettingOutOfRange(10), got {err:?}"
         );
         Ok(())
     }
@@ -579,10 +709,17 @@ mod tests {
     fn power_level_error_variant() -> TestResult {
         let err = PowerLevel::try_from(PowerLevel::COUNT)
             .err()
-            .ok_or("expected PowerLevelOutOfRange error but got Ok")?;
+            .ok_or("expected a power-level SettingOutOfRange error but got Ok")?;
         assert!(
-            matches!(err, ValidationError::PowerLevelOutOfRange(4)),
-            "expected PowerLevelOutOfRange(4), got {err:?}"
+            matches!(
+                err,
+                ValidationError::SettingOutOfRange {
+                    name: "power level",
+                    value: 4,
+                    ..
+                }
+            ),
+            "expected power-level SettingOutOfRange(4), got {err:?}"
         );
         Ok(())
     }
@@ -637,10 +774,17 @@ mod tests {
     fn shift_direction_error_variant() -> TestResult {
         let err = ShiftDirection::try_from(ShiftDirection::COUNT)
             .err()
-            .ok_or("expected ShiftOutOfRange error but got Ok")?;
+            .ok_or("expected a shift-direction SettingOutOfRange error but got Ok")?;
         assert!(
-            matches!(err, ValidationError::ShiftOutOfRange(4)),
-            "expected ShiftOutOfRange(4), got {err:?}"
+            matches!(
+                err,
+                ValidationError::SettingOutOfRange {
+                    name: "shift direction",
+                    value: 4,
+                    ..
+                }
+            ),
+            "expected shift-direction SettingOutOfRange(4), got {err:?}"
         );
         Ok(())
     }
@@ -675,10 +819,17 @@ mod tests {
     fn step_size_error_variant() -> TestResult {
         let err = StepSize::try_from(StepSize::COUNT)
             .err()
-            .ok_or("expected StepSizeOutOfRange error but got Ok")?;
+            .ok_or("expected a step-size SettingOutOfRange error but got Ok")?;
         assert!(
-            matches!(err, ValidationError::StepSizeOutOfRange(12)),
-            "expected StepSizeOutOfRange(12), got {err:?}"
+            matches!(
+                err,
+                ValidationError::SettingOutOfRange {
+                    name: "step size",
+                    value: 12,
+                    ..
+                }
+            ),
+            "expected step-size SettingOutOfRange(12), got {err:?}"
         );
         Ok(())
     }
@@ -743,10 +894,17 @@ mod tests {
     fn channel_mode_error_variant() -> TestResult {
         let err = ChannelMode::try_from(ChannelMode::COUNT)
             .err()
-            .ok_or("expected ChannelModeOutOfRange error but got Ok")?;
+            .ok_or("expected a channel-mode SettingOutOfRange error but got Ok")?;
         assert!(
-            matches!(err, ValidationError::ChannelModeOutOfRange(9)),
-            "expected ChannelModeOutOfRange(9), got {err:?}"
+            matches!(
+                err,
+                ValidationError::SettingOutOfRange {
+                    name: "channel mode",
+                    value: 9,
+                    ..
+                }
+            ),
+            "expected channel-mode SettingOutOfRange(9), got {err:?}"
         );
         Ok(())
     }
@@ -775,5 +933,59 @@ mod tests {
         assert!(ChannelMode::try_from(ChannelMode::COUNT).is_err());
         assert!(ChannelMode::try_from(OperatingMode::CwReverse).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn all_consts_list_every_wire_value_in_order() {
+        for (raw, mode) in (0_u8..).zip(OperatingMode::ALL) {
+            assert_eq!(u8::from(mode), raw);
+        }
+        for (raw, level) in (0_u8..).zip(PowerLevel::ALL) {
+            assert_eq!(u8::from(level), raw);
+        }
+        for (raw, direction) in (0_u8..).zip(ShiftDirection::ALL) {
+            assert_eq!(u8::from(direction), raw);
+        }
+        for (raw, step) in (0_u8..).zip(StepSize::ALL) {
+            assert_eq!(u8::from(step), raw);
+        }
+        for (raw, mode) in (0_u8..).zip(ChannelMode::ALL) {
+            assert_eq!(u8::from(mode), raw);
+        }
+        assert_eq!(OperatingMode::ALL.len(), usize::from(OperatingMode::COUNT));
+        assert_eq!(PowerLevel::ALL.len(), usize::from(PowerLevel::COUNT));
+        assert_eq!(
+            ShiftDirection::ALL.len(),
+            usize::from(ShiftDirection::COUNT)
+        );
+        assert_eq!(StepSize::ALL.len(), usize::from(StepSize::COUNT));
+        assert_eq!(ChannelMode::ALL.len(), usize::from(ChannelMode::COUNT));
+    }
+
+    #[test]
+    fn operating_mode_parses_canonical_names() -> TestResult {
+        for mode in OperatingMode::ALL {
+            let reparsed: OperatingMode = mode.to_string().parse()?;
+            assert_eq!(reparsed, mode);
+        }
+        assert_eq!("fm".parse::<OperatingMode>()?, OperatingMode::Fm);
+        assert_eq!("cw-r".parse::<OperatingMode>()?, OperatingMode::CwReverse);
+        let unknown = "FMX".parse::<OperatingMode>();
+        assert!(
+            matches!(
+                unknown,
+                Err(crate::error::ValidationError::InvalidTextValue { .. })
+            ),
+            "unknown mode name must be rejected: {unknown:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn power_level_reports_nominal_milliwatts() {
+        assert_eq!(PowerLevel::High.as_milliwatts(), 5_000);
+        assert_eq!(PowerLevel::Medium.as_milliwatts(), 2_000);
+        assert_eq!(PowerLevel::Low.as_milliwatts(), 500);
+        assert_eq!(PowerLevel::ExtraLow.as_milliwatts(), 50);
     }
 }

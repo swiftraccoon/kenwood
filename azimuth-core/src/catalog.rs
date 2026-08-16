@@ -282,35 +282,12 @@ pub fn decode_setting_display_value(
         .ok_or_else(|| SettingConversionError::NoTransform {
             setting_id: setting_id.clone(),
         })?;
-    if transform.numerator == 0 {
-        return Err(SettingConversionError::InvalidDisplayValue {
+    transform
+        .decode_display(raw_value)
+        .ok_or_else(|| SettingConversionError::InvalidDisplayValue {
             setting_id,
-            detail: "transform numerator is zero".to_owned(),
-        });
-    }
-    let raw = raw_value.to_string().parse::<f64>().map_err(|error| {
-        SettingConversionError::InvalidDisplayValue {
-            setting_id: setting_id.clone(),
-            detail: error.to_string(),
-        }
-    })?;
-    let numerator = transform
-        .numerator
-        .to_string()
-        .parse::<f64>()
-        .map_err(|error| SettingConversionError::InvalidDisplayValue {
-            setting_id: setting_id.clone(),
-            detail: error.to_string(),
-        })?;
-    let denominator = transform
-        .denominator
-        .to_string()
-        .parse::<f64>()
-        .map_err(|error| SettingConversionError::InvalidDisplayValue {
-            setting_id: setting_id.clone(),
-            detail: error.to_string(),
-        })?;
-    Ok((raw * denominator / numerator * 10.0).round() / 10.0)
+            detail: "raw value is not representable through the storage transform".to_owned(),
+        })
 }
 
 /// Convert a display-unit value to the authoritative raw stored integer.
@@ -333,39 +310,12 @@ pub fn encode_setting_display_value(
         .ok_or_else(|| SettingConversionError::NoTransform {
             setting_id: setting_id.clone(),
         })?;
-    if !display_value.is_finite() || transform.denominator == 0 {
-        return Err(SettingConversionError::InvalidDisplayValue {
-            setting_id,
-            detail: "value must be finite and the transform divisor must be nonzero".to_owned(),
-        });
-    }
-    let numerator = transform
-        .numerator
-        .to_string()
-        .parse::<f64>()
-        .map_err(|error| SettingConversionError::InvalidDisplayValue {
-            setting_id: setting_id.clone(),
-            detail: error.to_string(),
-        })?;
-    let denominator = transform
-        .denominator
-        .to_string()
-        .parse::<f64>()
-        .map_err(|error| SettingConversionError::InvalidDisplayValue {
-            setting_id: setting_id.clone(),
-            detail: error.to_string(),
-        })?;
-    let encoded = (display_value * numerator / denominator).round();
-    if encoded < 0.0 {
-        return Err(SettingConversionError::InvalidDisplayValue {
-            setting_id,
-            detail: "converted raw value is negative".to_owned(),
-        });
-    }
-    let raw = format!("{encoded:.0}").parse::<u64>().map_err(|error| {
+    let raw = transform.encode_display(display_value).ok_or_else(|| {
         SettingConversionError::InvalidDisplayValue {
             setting_id: setting_id.clone(),
-            detail: error.to_string(),
+            detail: "display value is not representable through the storage transform (it must \
+                     be finite and scale to a nonnegative exact integer)"
+                .to_owned(),
         }
     })?;
     validate_value(field, &SettingValue::Unsigned { value: raw })
@@ -441,17 +391,6 @@ pub(crate) fn build_patch_plan(
     }
     let patches = planner.finish().map_err(|error| error.to_string())?;
     Ok((patches, fields))
-}
-
-pub(crate) const fn encoded_len(codec: FieldCodec) -> usize {
-    match codec {
-        FieldCodec::Byte { .. }
-        | FieldCodec::Bool
-        | FieldCodec::BitBool { .. }
-        | FieldCodec::BitField { .. } => 1,
-        FieldCodec::FixedString { len, .. } | FieldCodec::Bytes { len } => len,
-        FieldCodec::Unsigned { width, .. } | FieldCodec::Signed { width, .. } => width as usize,
-    }
 }
 
 fn validate_change(change: &SettingChange) -> Result<(), String> {
@@ -561,7 +500,7 @@ fn setting_record(field: &MenuField) -> SettingRecord {
             SettingPresentation::Direct
         },
         offset: u64::try_from(field.descriptor.offset).unwrap_or(u64::MAX),
-        byte_length: u64::try_from(encoded_len(codec)).unwrap_or(u64::MAX),
+        byte_length: u64::try_from(codec.encoded_len()).unwrap_or(u64::MAX),
         bit_mask,
         bit_shift,
         unsigned_min,
@@ -667,7 +606,7 @@ mod tests {
             assert_eq!(record.id, field.descriptor.name);
             assert_eq!(
                 record.byte_length,
-                u64::try_from(encoded_len(field.descriptor.codec)).unwrap_or(u64::MAX)
+                u64::try_from(field.descriptor.codec.encoded_len()).unwrap_or(u64::MAX)
             );
             assert_eq!(record.options.len(), field.options.len());
             assert_eq!(record.allowed_values, field.allowed_values);

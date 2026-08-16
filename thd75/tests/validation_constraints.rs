@@ -632,21 +632,26 @@ fn cw_pitch_boundary() {
 #[test]
 fn all_validation_error_variants_display() {
     let variants: Vec<ValidationError> = vec![
-        ValidationError::ToneCodeOutOfRange(99),
-        ValidationError::BandOutOfRange(99),
-        ValidationError::OperatingModeOutOfRange(99),
-        ValidationError::PowerLevelOutOfRange(99),
-        ValidationError::ToneModeOutOfRange(99),
-        ValidationError::ShiftOutOfRange(99),
-        ValidationError::StepSizeOutOfRange(99),
-        ValidationError::DcsCodeInvalid(99),
-        ValidationError::FrequencyOutOfRange(99),
+        ValidationError::SettingOutOfRange {
+            name: "tone code",
+            value: 99,
+            detail: "must be 0-50",
+        },
+        ValidationError::IntegerOutOfRange {
+            name: "stored channel receive frequency",
+            value: 0,
+            detail: "must be 1-4,294,967,294 Hz",
+        },
     ];
     for (i, variant) in variants.iter().enumerate() {
         let msg = variant.to_string();
         assert!(
             !msg.is_empty(),
             "ValidationError variant {i} has empty display"
+        );
+        assert!(
+            msg.contains("99") || msg.contains('0'),
+            "ValidationError variant {i} must include the rejected value: {msg}"
         );
     }
 }

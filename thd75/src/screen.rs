@@ -138,6 +138,22 @@ impl ScreenFrame {
         rgb
     }
 
+    /// Render display-ready RGBA8888 bytes: [`Self::to_rgb888`] with an
+    /// opaque alpha byte after every pixel, row-major top-down.
+    ///
+    /// This is the layout GPU texture uploads and most native image views
+    /// consume directly, so FFI consumers need not append alpha per pixel.
+    #[must_use]
+    pub fn to_rgba8888(&self) -> Vec<u8> {
+        let mut rgba = Vec::with_capacity(SCREEN_WIDTH * SCREEN_HEIGHT * 4);
+        let (pixels, _remainder) = self.rgb565_le.as_slice().as_chunks::<2>();
+        for pair in pixels {
+            rgba.extend_from_slice(&zero_extend_rgb565(u16::from_le_bytes(*pair)));
+            rgba.push(0xFF);
+        }
+        rgba
+    }
+
     /// Render the same 24-bit, bottom-up BMP representation stock firmware
     /// writes for its Screen Capture function.
     #[must_use]
@@ -256,6 +272,30 @@ mod tests {
         let frame = ScreenFrame::from_rgb565_le(bytes)?;
 
         assert_eq!(frame.crc32(), 0x9877_0B66);
+        Ok(())
+    }
+
+    #[test]
+    fn rgba8888_is_rgb888_with_opaque_alpha() -> TestResult {
+        let mut bytes = vec![0_u8; SCREEN_BYTES];
+        // A recognizable first pixel: RGB565 pure red, little-endian.
+        bytes
+            .get_mut(..2)
+            .ok_or("test frame cannot hold one pixel")?
+            .copy_from_slice(&0xF800_u16.to_le_bytes());
+        let frame = ScreenFrame::from_rgb565_le(bytes)?;
+
+        let rgb = frame.to_rgb888();
+        let rgba = frame.to_rgba8888();
+        assert_eq!(rgba.len(), SCREEN_WIDTH * SCREEN_HEIGHT * 4);
+        for (pixel_rgb, pixel_rgba) in rgb.chunks_exact(3).zip(rgba.chunks_exact(4)) {
+            assert_eq!(
+                pixel_rgba.get(..3),
+                Some(pixel_rgb),
+                "color bytes must match to_rgb888"
+            );
+            assert_eq!(pixel_rgba.get(3), Some(&0xFF), "alpha must be opaque");
+        }
         Ok(())
     }
 }

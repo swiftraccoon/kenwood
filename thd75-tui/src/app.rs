@@ -1076,7 +1076,7 @@ pub(crate) struct App {
     /// Current D-STAR text message (from slow data).
     pub dstar_text_message: Option<kenwood_thd75::SlowDataTextMessage>,
     /// Current D-STAR RX header (gateway mode).
-    pub dstar_rx_header: Option<dstar_gateway_core::DstarHeader>,
+    pub dstar_rx_header: Option<kenwood_thd75::DstarHeader>,
     /// Whether a D-STAR voice transmission is active.
     pub dstar_rx_active: bool,
     /// D-STAR URCALL input buffer (when prompting).
@@ -2353,27 +2353,27 @@ impl App {
                 SettingRow::VoxGain => {
                     let cur = self.state.vox_gain.as_raw();
                     let next = if delta > 0 {
-                        cur.saturating_add(1).min(9)
+                        cur.saturating_add(1).min(VoxGain::MAX)
                     } else {
                         cur.saturating_sub(1)
                     };
                     if let Ok(gain) = VoxGain::new(next) {
                         let _send = tx.send(crate::event::RadioCommand::SetVoxGain(gain));
+                        self.status_message = Some(format!("VOX Gain → {next}"));
                     }
-                    self.status_message = Some(format!("VOX Gain → {next}"));
                     return;
                 }
                 SettingRow::VoxDelay => {
                     let cur = self.state.vox_delay.as_raw();
                     let next = if delta > 0 {
-                        cur.saturating_add(1).min(30)
+                        cur.saturating_add(1).min(VoxDelay::MAX)
                     } else {
                         cur.saturating_sub(1)
                     };
                     if let Ok(delay) = VoxDelay::new(next) {
                         let _send = tx.send(crate::event::RadioCommand::SetVoxDelay(delay));
+                        self.status_message = Some(format!("VOX Delay → {next}"));
                     }
-                    self.status_message = Some(format!("VOX Delay → {next}"));
                     return;
                 }
                 SettingRow::StepSizeA => {
@@ -4067,6 +4067,35 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn vox_delay_adjust_clamps_to_the_lib_maximum_and_reports_only_sent_values() -> TestResult {
+        use kenwood_thd75::types::VoxDelay;
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::with_cache_path(String::new(), None);
+        app.cmd_tx = Some(tx);
+        app.main_view = MainView::SettingsCat;
+        app.settings_cat_index = cat_settings()
+            .iter()
+            .position(|row| matches!(row, SettingRow::VoxDelay))
+            .ok_or("VOX delay row missing from the CAT settings table")?;
+        app.state.vox_delay = VoxDelay::MS_3000;
+
+        app.adjust_setting(1);
+
+        let sent = rx.try_recv()?;
+        assert!(
+            matches!(sent, RadioCommand::SetVoxDelay(delay) if delay.as_raw() == VoxDelay::MAX),
+            "stepping past the top must clamp to the radio's maximum: {sent:?}"
+        );
+        let message = app.status_message.clone().ok_or("missing status message")?;
+        assert!(
+            message.contains(&VoxDelay::MAX.to_string()),
+            "the status line must report the value actually sent: {message}"
+        );
+        Ok(())
+    }
+
     fn app_with_gps_settings(settings: GpsSettings) -> (App, UnboundedReceiver<RadioCommand>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::with_cache_path(String::new(), None);
@@ -4216,7 +4245,8 @@ mod tests {
 
         match rx.try_recv()? {
             RadioCommand::EnterAprs { config } => {
-                assert_eq!(config.source().to_string(), "KQ4NIT-9");
+                let source = config.source().ok_or("expected a station identity")?;
+                assert_eq!(source.to_string(), "KQ4NIT-9");
                 Ok(())
             }
             other => Err(format!("expected EnterAprs, got {other:?}").into()),

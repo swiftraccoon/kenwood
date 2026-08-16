@@ -25,14 +25,29 @@ tokio = { version = "1", features = [
 tokio-serial = "5"
 thiserror = "2"
 tracing = "0.1"
+# The sans-io `aprs` and `ax25-codec` crates are mandatory: the core CAT
+# type layer builds on their validated types (GPS latitude/longitude,
+# AX.25 callsigns in APRS settings). Only the client stacks are optional.
 aprs = { path = "../aprs" }
-aprs-is = { path = "../aprs-is" }
+aprs-is = { path = "../aprs-is", optional = true }
 ax25-codec = { path = "../ax25-codec" }
 dstar-gateway-core = { path = "../dstar-gateway-core" }
 encoding_rs = "0.8"
-kiss-tnc = { path = "../kiss-tnc" }
+kiss-tnc = { path = "../kiss-tnc", optional = true }
 mmdvm-core = { path = "../mmdvm-core" }
-mmdvm = { path = "../mmdvm" }
+mmdvm = { path = "../mmdvm", optional = true }
+
+[features]
+default = ["aprs", "dstar"]
+# APRS client stack: the `thd75::aprs` client owning Radio + KISS session,
+# the KISS TNC session itself, the KISS/APRS-IS error variants, and the
+# aprs-is / kiss-tnc re-exports. CAT-level APRS settings, GPS types, and
+# TNC mode commands stay in the core.
+aprs = ["dep:aprs-is", "dep:kiss-tnc"]
+# D-STAR reflector-gateway stack: `thd75::dstar_gateway` and the tokio MMDVM
+# modem session. The Menu 650 terminal-mode lifecycle, MMDVM link diagnosis,
+# and CAT D-STAR settings stay in the core (they need only `mmdvm-core`).
+dstar = ["dep:mmdvm"]
 
 [build-dependencies]
 cc = "1"
@@ -41,6 +56,21 @@ cc = "1"
 proptest = "1"
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "signal", "test-util"] }
+# Unconditional for test/example targets so their dep acknowledgements and
+# direct protocol-layer use compile under --no-default-features; the lib's
+# optional dependencies remain feature-gated for downstream consumers.
+aprs-is = { path = "../aprs-is" }
+kiss-tnc = { path = "../kiss-tnc" }
+mmdvm = { path = "../mmdvm" }
+
+# Integration tests that exercise the feature-gated `thd75::aprs` module.
+[[test]]
+name = "kiss_roundtrip"
+required-features = ["aprs"]
+
+[[test]]
+name = "kiss_real_captures"
+required-features = ["aprs"]
 
 # These live-radio tools also contain offline unit tests. Register only those
 # examples as test targets so the harness executes their tests, never `main`.

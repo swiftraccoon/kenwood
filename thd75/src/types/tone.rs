@@ -75,12 +75,16 @@ impl ToneCode {
     ///
     /// # Errors
     ///
-    /// Returns [`ValidationError::ToneCodeOutOfRange`] if `index > 50`.
+    /// Returns [`ValidationError::SettingOutOfRange`] if `index > 50`.
     pub const fn new(index: u8) -> Result<Self, ValidationError> {
         if index <= 50 {
             Ok(Self(index))
         } else {
-            Err(ValidationError::ToneCodeOutOfRange(index))
+            Err(ValidationError::SettingOutOfRange {
+                name: "tone code",
+                value: index,
+                detail: "must be 0-50 (0-49 CTCSS tones, 50 = 1750 Hz tone burst)",
+            })
         }
     }
 
@@ -130,12 +134,16 @@ impl CtcssCode {
     ///
     /// # Errors
     ///
-    /// Returns [`ValidationError::CtcssCodeOutOfRange`] for index 50 or above.
+    /// Returns [`ValidationError::SettingOutOfRange`] for index 50 or above.
     pub const fn new(index: u8) -> Result<Self, ValidationError> {
         if index <= Self::MAX_INDEX {
             Ok(Self(index))
         } else {
-            Err(ValidationError::CtcssCodeOutOfRange(index))
+            Err(ValidationError::SettingOutOfRange {
+                name: "CTCSS code index",
+                value: index,
+                detail: "must be 0-49",
+            })
         }
     }
 
@@ -209,12 +217,16 @@ impl DcsCode {
     ///
     /// # Errors
     ///
-    /// Returns [`ValidationError::DcsCodeInvalid`] if `index >= 104`.
+    /// Returns [`ValidationError::SettingOutOfRange`] if `index >= 104`.
     pub const fn new(index: u8) -> Result<Self, ValidationError> {
         if index < 104 {
             Ok(Self(index))
         } else {
-            Err(ValidationError::DcsCodeInvalid(index))
+            Err(ValidationError::SettingOutOfRange {
+                name: "DCS code index",
+                value: index,
+                detail: "not in the 104-entry DCS code table (must be 0-103)",
+            })
         }
     }
 
@@ -306,7 +318,11 @@ impl TryFrom<u8> for ToneMode {
             2 => Ok(Self::Dcs),
             4 => Ok(Self::Ctcss),
             8 => Ok(Self::Tone),
-            _ => Err(ValidationError::ToneModeOutOfRange(value)),
+            _ => Err(ValidationError::SettingOutOfRange {
+                name: "tone mode",
+                value,
+                detail: "expected one-hot 0, 1, 2, 4, or 8",
+            }),
         }
     }
 }

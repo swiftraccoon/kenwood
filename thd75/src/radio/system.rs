@@ -64,6 +64,23 @@ impl<T: Transport> Radio<T> {
     /// Returns 0=Empty (Red), 1=1/3 (Yellow), 2=2/3 (Green), 3=Full (Green),
     /// 4=Charging (USB power connected). Read-only.
     ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use kenwood_thd75::types::BatteryLevel;
+    /// use kenwood_thd75::{MockTransport, Radio};
+    ///
+    /// let mut mock = MockTransport::new();
+    /// mock.expect(b"BL\r", b"BL 3\r");
+    ///
+    /// let mut radio = Radio::new(mock);
+    /// assert_eq!(radio.get_battery_level().await?, BatteryLevel::Full);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
@@ -403,22 +420,19 @@ impl<T: Transport> Radio<T> {
     /// Returns an error if entering programming mode, reading or writing the
     /// setting page, verifying the write, exiting, or reconnecting fails.
     pub async fn set_beep_via_mcp(&mut self, enabled: bool) -> Result<(), Error> {
-        const OFFSET: usize = 0x1071;
-        // 0x1071 / 256 = 0x10 = 16, fits in u16.
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "OFFSET (0x1071) / 256 = 0x10 is the constant page index in the MCP memory \
-                      map. The division's compile-time result fits trivially in u16; truncation \
-                      can only occur if MCP_SIZE exceeds u16::MAX pages (~16 MB), far beyond the \
-                      D75's 512 KB image."
-        )]
-        const PAGE: u16 = (OFFSET / 256) as u16;
-        const BYTE_INDEX: usize = OFFSET % 256;
+        use super::mcp_offsets;
 
-        tracing::info!(enabled, offset = OFFSET, "setting key beep via MCP");
-        self.modify_memory_page(programming::WritableMcpPage::new(PAGE)?, |data| {
-            data[BYTE_INDEX] = u8::from(enabled);
-        })
+        tracing::info!(
+            enabled,
+            offset = mcp_offsets::BEEP,
+            "setting key beep via MCP"
+        );
+        self.modify_memory_page(
+            programming::WritableMcpPage::new(mcp_offsets::page(mcp_offsets::BEEP))?,
+            |data| {
+                data[const { mcp_offsets::byte_index(mcp_offsets::BEEP) }] = u8::from(enabled);
+            },
+        )
         .await
     }
 
@@ -443,27 +457,21 @@ impl<T: Transport> Radio<T> {
         &mut self,
         volume: LinkedVolumeLevel,
     ) -> Result<(), Error> {
-        const OFFSET: usize = 0x1072;
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "OFFSET (0x1072) / 256 = 0x10 is the constant page index in the MCP memory \
-                      map. The division's compile-time result fits trivially in u16; truncation \
-                      can only occur if MCP_SIZE exceeds u16::MAX pages (~16 MB), far beyond the \
-                      D75's 512 KB image."
-        )]
-        const PAGE: u16 = (OFFSET / 256) as u16;
-        const BYTE_INDEX: usize = OFFSET % 256;
+        use super::mcp_offsets;
 
         let raw_volume = u8::from(volume);
 
         tracing::info!(
             volume = raw_volume,
-            offset = OFFSET,
+            offset = mcp_offsets::BEEP_VOLUME,
             "setting beep volume via MCP"
         );
-        self.modify_memory_page(programming::WritableMcpPage::new(PAGE)?, |data| {
-            data[BYTE_INDEX] = raw_volume;
-        })
+        self.modify_memory_page(
+            programming::WritableMcpPage::new(mcp_offsets::page(mcp_offsets::BEEP_VOLUME))?,
+            |data| {
+                data[const { mcp_offsets::byte_index(mcp_offsets::BEEP_VOLUME) }] = raw_volume;
+            },
+        )
         .await
     }
 
@@ -484,22 +492,19 @@ impl<T: Transport> Radio<T> {
     /// Returns an error if entering programming mode, reading or writing the
     /// setting page, verifying the write, exiting, or reconnecting fails.
     pub async fn set_vox_via_mcp(&mut self, enabled: bool) -> Result<(), Error> {
-        const OFFSET: usize = 0x101B;
-        // 0x101B / 256 = 0x10 = 16, fits in u16.
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "OFFSET (0x101B) / 256 = 0x10 is the constant page index in the MCP memory \
-                      map. The division's compile-time result fits trivially in u16; truncation \
-                      can only occur if MCP_SIZE exceeds u16::MAX pages (~16 MB), far beyond the \
-                      D75's 512 KB image."
-        )]
-        const PAGE: u16 = (OFFSET / 256) as u16;
-        const BYTE_INDEX: usize = OFFSET % 256;
+        use super::mcp_offsets;
 
-        tracing::info!(enabled, offset = OFFSET, "setting VOX enable via MCP");
-        self.modify_memory_page(programming::WritableMcpPage::new(PAGE)?, |data| {
-            data[BYTE_INDEX] = u8::from(enabled);
-        })
+        tracing::info!(
+            enabled,
+            offset = mcp_offsets::VOX,
+            "setting VOX enable via MCP"
+        );
+        self.modify_memory_page(
+            programming::WritableMcpPage::new(mcp_offsets::page(mcp_offsets::VOX))?,
+            |data| {
+                data[const { mcp_offsets::byte_index(mcp_offsets::VOX) }] = u8::from(enabled);
+            },
+        )
         .await
     }
 
@@ -520,22 +525,19 @@ impl<T: Transport> Radio<T> {
     /// Returns an error if entering programming mode, reading or writing the
     /// setting page, verifying the write, exiting, or reconnecting fails.
     pub async fn set_bluetooth_via_mcp(&mut self, enabled: bool) -> Result<(), Error> {
-        const OFFSET: usize = 0x1078;
-        // 0x1078 / 256 = 0x10 = 16, fits in u16.
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "OFFSET (0x1078) / 256 = 0x10 is the constant page index in the MCP memory \
-                      map. The division's compile-time result fits trivially in u16; truncation \
-                      can only occur if MCP_SIZE exceeds u16::MAX pages (~16 MB), far beyond the \
-                      D75's 512 KB image."
-        )]
-        const PAGE: u16 = (OFFSET / 256) as u16;
-        const BYTE_INDEX: usize = OFFSET % 256;
+        use super::mcp_offsets;
 
-        tracing::info!(enabled, offset = OFFSET, "setting Bluetooth via MCP");
-        self.modify_memory_page(programming::WritableMcpPage::new(PAGE)?, |data| {
-            data[BYTE_INDEX] = u8::from(enabled);
-        })
+        tracing::info!(
+            enabled,
+            offset = mcp_offsets::BLUETOOTH,
+            "setting Bluetooth via MCP"
+        );
+        self.modify_memory_page(
+            programming::WritableMcpPage::new(mcp_offsets::page(mcp_offsets::BLUETOOTH))?,
+            |data| {
+                data[const { mcp_offsets::byte_index(mcp_offsets::BLUETOOTH) }] = u8::from(enabled);
+            },
+        )
         .await
     }
 }

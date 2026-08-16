@@ -12,8 +12,5 @@ use tokio as _;
 /// Pure format functions for every user-facing string.
 pub mod output;
 
-/// Radio session state: save, configure, restore.
-pub mod session;
-
 /// Command grammar for the listener prompt.
 pub mod parser;

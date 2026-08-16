@@ -43,9 +43,9 @@ use kenwood_thd75::LinkDiagnosis;
 use kenwood_thd75::memory::{
     MCP_D75_SCHEMA_FIRMWARE, MCP_D75_SCHEMA_FIRMWARE_IDENTITIES, is_supported_mcp_d75_schema_target,
 };
-use kenwood_thd75::radio::programming::{DetachedMcpPageUpdate, WritableMcpPage};
+use kenwood_thd75::radio::programming::DetachedMcpPageUpdate;
 use kenwood_thd75::transport::EitherTransport;
-use kenwood_thd75::types::{DstarCallsign, FirmwareIdentity, RadioModel};
+use kenwood_thd75::types::{DstarCallsign, DvGatewayMode, FirmwareIdentity, RadioModel};
 use kenwood_thd75::{
     AprsClient, AprsClientConfig, AprsEvent, AprsReportTimestamp, Ax25Address, DigipeaterConfig,
     IGateRfLocality, IGateToRfConfig, MessageAddressee, MessageText, StatusText,
@@ -54,13 +54,11 @@ use kenwood_thd75::{DstarEvent, DstarGateway, DstarGatewayConfig};
 use kenwood_thd75::{FirmwareProfile, Radio};
 
 use dstar_gateway::auth::AuthClient;
-use dstar_gateway::tokio_shell::{AsyncSession, ShellError};
+use dstar_gateway::tokio_shell::{AnyAsyncSession, AnyEvent, AsyncSession};
 use dstar_gateway_core::header::DstarHeader;
 use dstar_gateway_core::hosts::HostFile;
-use dstar_gateway_core::session::Driver;
 use dstar_gateway_core::session::client::{
-    ClientStateKind, Connected, Connecting, DExtra, DPlus, Dcs, DisconnectReason, Event, Session,
-    VoiceEndReason,
+    Connected, Connecting, DExtra, DPlus, Dcs, DisconnectReason, Session,
 };
 use dstar_gateway_core::types::ProtocolKind;
 use dstar_gateway_core::voice::VoiceFrame;
@@ -773,10 +771,10 @@ struct DstarSession {
     reflector_callsign: Callsign,
     /// Current RX stream ID from reflector (`None` = no active stream).
     rx_stream_id: Option<StreamId>,
-    /// Echo test state: records TX frames and plays them back.
-    echo: EchoState,
-    /// When true, the next TX is captured for echo regardless of URCALL.
-    echo_armed: bool,
+    /// Echo test unit: records TX frames and schedules their playback
+    /// (the `echo` REPL command arms it; URCALL `"       E"` triggers
+    /// it per ircDDBGateway convention).
+    echo: dstar_gateway_core::echo::EchoUnit,
     /// Slow data decoder for incoming reflector voice frames.
     /// Decodes text messages embedded in the slow data bytes.
     rx_slow_data: SlowDataTextCollector,
@@ -1112,38 +1110,6 @@ fn install_process_interrupt_task(critical_slot: CriticalSignalSlot) -> std::io:
     Ok(())
 }
 
-/// Echo test state machine.
-///
-/// Records the user's TX audio and plays it back locally through the
-/// radio, verifying the full MMDVM voice path without involving a
-/// reflector. Triggered by the `echo` REPL command (arms the next TX)
-/// or by URCALL `"       E"` per ircDDBGateway convention.
-///
-/// Max 60 seconds of audio (3000 frames at 50 fps).
-#[derive(Debug)]
-enum EchoState {
-    /// Echo test not active.
-    Idle,
-    /// Recording TX audio. Stores the original header and AMBE frames.
-    Recording {
-        /// Original D-STAR header from the TX stream.
-        header: DstarHeader,
-        /// Buffered AMBE voice frames.
-        frames: Vec<VoiceFrame>,
-    },
-    /// Waiting briefly before playback (per ircDDBGateway `REPLY_TIME`).
-    Waiting {
-        /// Original D-STAR header from the TX stream.
-        header: DstarHeader,
-        /// Buffered AMBE voice frames.
-        frames: Vec<VoiceFrame>,
-        /// When the wait started.
-        since: std::time::Instant,
-    },
-    /// Playing back recorded audio to the radio.
-    Playing,
-}
-
 impl std::fmt::Debug for DstarSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DstarSession")
@@ -1153,152 +1119,15 @@ impl std::fmt::Debug for DstarSession {
     }
 }
 
-/// Protocol-generic wrapper over [`AsyncSession<P>`] for runtime dispatch.
-///
-/// thd75-repl supports all three reflector protocols at runtime via
-/// the `link` command, but the new typestate API is protocol-parametric
-/// at compile time. This enum fans the handle out into per-protocol
-/// variants so the repl can hold a single session value regardless of
-/// which protocol the user connected to, and dispatch to the right
-/// inner `AsyncSession<P>` for voice TX / event reception.
-#[derive(Debug)]
-enum ReflectorSession {
-    /// `DPlus` (REF) session handle.
-    DPlus(AsyncSession<DPlus>),
-    /// `DExtra` (XRF/XLX) session handle.
-    DExtra(AsyncSession<DExtra>),
-    /// `DCS` session handle.
-    Dcs(AsyncSession<Dcs>),
-}
+/// Protocol-erased reflector session; events arrive as the equally
+/// erased [`AnyEvent`], which the runtime handlers
+/// (`relay_reflector_to_radio`, `trace_reflector_event`,
+/// `print_reflector_event`) consume directly.
+type ReflectorSession = AnyAsyncSession;
 
-/// Runtime-unified event mirror of [`Event<P>`].
-///
-/// The inner event data is identical across the three protocols;
-/// this enum exists only to erase the `P: Protocol` parameter for the
-/// runtime event-handling functions (`relay_reflector_to_radio`,
-/// `trace_reflector_event`, `print_reflector_event`) that don't care
-/// which protocol produced a given event.
-#[derive(Debug)]
-enum RuntimeEvent {
-    /// Session reached `Connected`.
-    Connected,
-    /// Session left `Connected` with a reason.
-    Disconnected(DisconnectReason),
-    /// Keepalive echo from the reflector.
-    PollEcho,
-    /// A new voice stream started.
-    VoiceStart {
-        /// Stream id of the new stream.
-        stream_id: StreamId,
-        /// Decoded D-STAR header.
-        header: Box<DstarHeader>,
-    },
-    /// A voice frame within an active stream.
-    VoiceFrame {
-        /// Stream id the frame belongs to.
-        stream_id: StreamId,
-        /// Frame sequence (0-20).
-        seq: u8,
-        /// Voice frame payload.
-        frame: Box<VoiceFrame>,
-    },
-    /// A voice stream ended.
-    VoiceEnd {
-        /// Stream id of the terminated stream.
-        stream_id: StreamId,
-        /// Why the stream ended.
-        reason: VoiceEndReason,
-    },
-}
-
-impl<P> From<Event<P>> for RuntimeEvent
-where
-    P: dstar_gateway_core::session::client::Protocol,
-{
-    fn from(e: Event<P>) -> Self {
-        match e {
-            Event::Connected { .. } => Self::Connected,
-            Event::Disconnected { reason } => Self::Disconnected(reason),
-            Event::PollEcho { .. } => Self::PollEcho,
-            Event::VoiceStart {
-                stream_id, header, ..
-            } => Self::VoiceStart {
-                stream_id,
-                header: Box::new(header),
-            },
-            Event::VoiceFrame {
-                stream_id,
-                seq,
-                frame,
-            } => Self::VoiceFrame {
-                stream_id,
-                seq,
-                frame: Box::new(frame),
-            },
-            Event::VoiceEnd { stream_id, reason } => Self::VoiceEnd { stream_id, reason },
-            // `Event` is `#[non_exhaustive]` and carries a private
-            // `__Phantom` variant to thread the `P` type parameter.
-            // Catch any future additions here.
-            _ => unreachable!("Event<P> is exhaustively matched above"),
-        }
-    }
-}
-
-impl ReflectorSession {
-    /// Drain the next runtime event from whichever protocol variant is active.
-    async fn next_event(&mut self) -> Option<RuntimeEvent> {
-        match self {
-            Self::DPlus(s) => s.next_event().await.map(RuntimeEvent::from),
-            Self::DExtra(s) => s.next_event().await.map(RuntimeEvent::from),
-            Self::Dcs(s) => s.next_event().await.map(RuntimeEvent::from),
-        }
-    }
-
-    /// Send a voice header and start a new outbound voice stream.
-    async fn send_header(
-        &mut self,
-        header: DstarHeader,
-        stream_id: StreamId,
-    ) -> Result<(), ShellError> {
-        match self {
-            Self::DPlus(s) => s.send_header(header, stream_id).await,
-            Self::DExtra(s) => s.send_header(header, stream_id).await,
-            Self::Dcs(s) => s.send_header(header, stream_id).await,
-        }
-    }
-
-    /// Send a voice data frame on the active stream.
-    async fn send_voice(
-        &mut self,
-        stream_id: StreamId,
-        seq: u8,
-        frame: VoiceFrame,
-    ) -> Result<(), ShellError> {
-        match self {
-            Self::DPlus(s) => s.send_voice(stream_id, seq, frame).await,
-            Self::DExtra(s) => s.send_voice(stream_id, seq, frame).await,
-            Self::Dcs(s) => s.send_voice(stream_id, seq, frame).await,
-        }
-    }
-
-    /// Send a voice EOT packet, ending the outbound stream.
-    async fn send_eot(&mut self, stream_id: StreamId, seq: u8) -> Result<(), ShellError> {
-        match self {
-            Self::DPlus(s) => s.send_eot(stream_id, seq).await,
-            Self::DExtra(s) => s.send_eot(stream_id, seq).await,
-            Self::Dcs(s) => s.send_eot(stream_id, seq).await,
-        }
-    }
-
-    /// Request a graceful disconnect from the reflector.
-    async fn disconnect(&mut self) -> Result<(), ShellError> {
-        match self {
-            Self::DPlus(s) => s.disconnect().await,
-            Self::DExtra(s) => s.disconnect().await,
-            Self::Dcs(s) => s.disconnect().await,
-        }
-    }
-}
+/// Erased session event; alias so call sites read at the same level
+/// of abstraction as [`ReflectorSession`].
+type RuntimeEvent = AnyEvent;
 
 /// Main REPL loop. Manages CAT, terminal-ready, APRS, and D-STAR states.
 /// Each state owns the radio transport exclusively.
@@ -1442,9 +1271,15 @@ async fn run_repl(
             // EOF or Ctrl-C: disconnect cleanly.
             let radio = match state {
                 ReplState::Cat(r) | ReplState::Terminal(r) => Some(*r),
-                ReplState::Aprs(c) => Some(c.stop().await.map_err(|(_client, error)| {
-                    format!("stopping APRS at end of input: {error}")
-                })?),
+                ReplState::Aprs(c) => Some(
+                    c.stop()
+                        .await
+                        .map_err(|(_client, error)| {
+                            format!("stopping APRS at end of input: {error}")
+                        })?
+                        // Disconnecting next, so CAT re-proof is moot.
+                        .into_radio_unproven(),
+                ),
                 ReplState::Dstar(mut s) => {
                     if let Some(ref mut r) = s.reflector {
                         drop(r.disconnect().await);
@@ -1457,9 +1292,14 @@ async fn run_repl(
                     // way to walk them through a reconnect.
                     println!("The radio is still in Reflector Terminal Mode.");
                     println!("Set Menu 650 (DV Gateway) to Off to restore normal operation.");
-                    Some(radio.map_err(|error| {
-                        format!("stopping D-STAR gateway at end of input: {error}")
-                    })?)
+                    Some(
+                        radio
+                            .map_err(|error| {
+                                format!("stopping D-STAR gateway at end of input: {error}")
+                            })?
+                            // Disconnecting next, so CAT re-proof is moot.
+                            .into_radio_unproven(),
+                    )
                 }
             };
             if let Some(r) = radio {
@@ -1522,7 +1362,12 @@ async fn run_repl(
                 let radio = match state {
                     ReplState::Aprs(client) => {
                         println!("Exiting APRS mode.");
-                        client.stop().await.ok()
+                        // Disconnecting next, so CAT re-proof is moot.
+                        client
+                            .stop()
+                            .await
+                            .ok()
+                            .map(kenwood_thd75::DesyncedRadio::into_radio_unproven)
                     }
                     ReplState::Dstar(mut session) => {
                         println!("Exiting D-STAR mode and restoring normal radio mode.");
@@ -1729,12 +1574,12 @@ async fn run_repl(
             ReplState::Aprs(mut client) => {
                 if cmd == "aprs" && parts.get(1).is_some_and(|s| *s == "stop") {
                     match client.stop().await {
-                        Ok(mut radio) => match radio.restore_cat_after_mode_exit().await {
-                            Ok(()) => {
+                        Ok(desynced) => match desynced.restore().await {
+                            Ok(radio) => {
                                 aprintln!("APRS mode stopped. Returned to CAT mode.");
                                 ReplState::Cat(Box::new(radio))
                             }
-                            Err(error) => {
+                            Err((desynced, error)) => {
                                 println!(
                                     "{}",
                                     thd75_repl::output::error(format_args!(
@@ -1742,7 +1587,7 @@ async fn run_repl(
                                              {error}"
                                     ))
                                 );
-                                drop(radio.disconnect().await);
+                                drop(desynced.into_radio_unproven().disconnect().await);
                                 break;
                             }
                         },
@@ -2312,6 +2157,19 @@ async fn dispatch_aprs(client: &mut AprsClient<EitherTransport>, cmd: &str, part
     }
 }
 
+/// APRS-IS login callsign (`CALL` or `CALL-SSID`) for the client's
+/// station identity, or `None` when APRS was started receive-only.
+fn igate_login_call(client: &AprsClient<EitherTransport>) -> Option<String> {
+    let station = client.config().source()?;
+    let callsign = station.callsign.as_str();
+    let ssid = station.ssid.get();
+    Some(if ssid > 0 {
+        format!("{callsign}-{ssid}")
+    } else {
+        callsign.to_owned()
+    })
+}
+
 /// Run the `IGate` bridge: APRS-IS ↔ RF.
 ///
 /// Connects to the default APRS-IS server, forwards received RF packets
@@ -2320,13 +2178,9 @@ async fn dispatch_aprs(client: &mut AprsClient<EitherTransport>, cmd: &str, part
 async fn run_igate(client: &mut AprsClient<EitherTransport>, filter: &str) {
     use kenwood_thd75::{AprsIsClient, AprsIsConfig, AprsIsEvent, IGateFormatError};
 
-    let station = client.config().source();
-    let callsign = station.callsign.as_str();
-    let ssid = station.ssid.get();
-    let login_call = if ssid > 0 {
-        format!("{callsign}-{ssid}")
-    } else {
-        callsign.to_owned()
+    let Some(login_call) = igate_login_call(client) else {
+        aprintln!("Error: the IGate needs a station identity; APRS was started receive-only");
+        return;
     };
 
     println!("Connecting to APRS-IS as {login_call}.");
@@ -2600,7 +2454,7 @@ async fn run_set_gateway_off(transport: EitherTransport) -> Result<(), Box<dyn s
     if profile.supports_bare_gateway() {
         let gateway = radio.read_gateway().await?;
         println!("Verified TH-D75 firmware {firmware}; Menu 650 is {gateway}.");
-        if gateway == kenwood_thd75::types::DvGatewayMode::Off {
+        if gateway == DvGatewayMode::Off {
             radio.disconnect().await?;
             println!("DV Gateway is already off; no memory write or reboot was needed.");
             return Ok(());
@@ -2667,12 +2521,10 @@ async fn clear_gateway_mode_with_interrupt<I>(
 where
     I: Future<Output = std::io::Result<()>>,
 {
-    let page = WritableMcpPage::new(GATEWAY_MODE_PAGE)
-        .map_err(|error| format!("invalid Menu 650 MCP page: {error}"))?;
     let interrupt_result = {
-        let write = radio.modify_memory_page_detached_if_changed(page, |data| {
-            data[GATEWAY_MODE_BYTE] = 0;
-        });
+        // The schema target was proved by this flow's own identity reads;
+        // the library owns the registry-pinned Menu 650 offset.
+        let write = radio.set_dv_gateway_mode_detached_unverified(DvGatewayMode::Off);
         tokio::pin!(write);
         tokio::pin!(interrupt);
         tokio::select! {
@@ -2703,18 +2555,16 @@ where
 /// page whose CAT connection was restored without a flash write.
 async fn write_gateway_mode_with_interrupt<I>(
     radio: &mut Radio<EitherTransport>,
-    value: u8,
+    mode: DvGatewayMode,
     interrupt: I,
 ) -> Result<DetachedMcpPageUpdate, String>
 where
     I: Future<Output = std::io::Result<()>>,
 {
-    let page = WritableMcpPage::new(GATEWAY_MODE_PAGE)
-        .map_err(|error| format!("invalid Menu 650 MCP page: {error}"))?;
     let interrupt_result = {
-        let write = radio.modify_memory_page_detached_if_changed(page, |data| {
-            data[GATEWAY_MODE_BYTE] = value;
-        });
+        // The caller proved the schema target with its own identity reads;
+        // the library owns the registry-pinned Menu 650 offset.
+        let write = radio.set_dv_gateway_mode_detached_unverified(mode);
         tokio::pin!(write);
         tokio::pin!(interrupt);
         tokio::select! {
@@ -2791,16 +2641,6 @@ async fn mcp_termination_signal() -> std::io::Result<()> {
 async fn mcp_termination_signal() -> std::io::Result<()> {
     tokio::signal::ctrl_c().await
 }
-
-/// MCP offset for DV Gateway mode setting (0=Off, 1=Reflector Terminal).
-/// Firmware-verified: GW CAT handler reads from this offset (read-only via CAT).
-const GATEWAY_MODE_MCP_OFFSET: u16 = 0x1CA0;
-
-/// MCP page containing the gateway mode byte.
-const GATEWAY_MODE_PAGE: u16 = GATEWAY_MODE_MCP_OFFSET / 256;
-
-/// Byte index within the page.
-const GATEWAY_MODE_BYTE: usize = (GATEWAY_MODE_MCP_OFFSET % 256) as usize;
 
 const TERMINAL_MODE_TRANSITION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
@@ -2902,7 +2742,13 @@ async fn ensure_terminal_mode(
             .map(|_signal| ())
             .map_err(std::io::Error::other)
     };
-    let page_update = match write_gateway_mode_with_interrupt(&mut radio, 1, interrupt).await {
+    let page_update = match write_gateway_mode_with_interrupt(
+        &mut radio,
+        DvGatewayMode::ReflectorTerminal,
+        interrupt,
+    )
+    .await
+    {
         Ok(update) => update,
         Err(error) => {
             // Once the page operation starts, an error or caught termination
@@ -3218,8 +3064,7 @@ async fn enter_dstar(
         reflector_module,
         reflector_callsign,
         rx_stream_id: None,
-        echo: EchoState::Idle,
-        echo_armed: false,
+        echo: dstar_gateway_core::echo::EchoUnit::new(),
         rx_slow_data: SlowDataTextCollector::new(),
         rx_last_slow_text: None,
         tx_text: None,
@@ -3457,7 +3302,7 @@ fn load_host_files() -> HostFile {
     hosts
 }
 
-/// Connect timeout for the manual handshake loop.
+/// Connect deadline handed to the shared handshake pump.
 const REFLECTOR_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Bind an ephemeral local UDP socket for a new reflector session.
@@ -3468,73 +3313,24 @@ async fn bind_reflector_socket() -> Result<std::sync::Arc<tokio::net::UdpSocket>
         .map_err(|e| format!("UDP bind failed: {e}"))
 }
 
-/// Drive a `Session<P, Connecting>` through the reflector handshake
-/// until the sans-io core reports [`ClientStateKind::Connected`] or
-/// [`ClientStateKind::Closed`] (rejected), or the configured deadline
-/// elapses. Returns the promoted `Session<P, Connected>` on success.
+/// Drive a `Session<P, Connecting>` through the reflector handshake via
+/// the shared pump in `dstar_gateway::tokio_shell::drive_connecting`,
+/// flattening its typed [`ConnectError`](dstar_gateway::tokio_shell::ConnectError)
+/// into this module's `String` error convention.
 ///
 /// Shared between [`connect_dextra`], [`connect_dplus`], and
 /// [`connect_dcs`]; the handshake packet count differs across
-/// protocols but the polling loop is identical (drain outbound,
-/// recv with short timeout, feed `handle_input`, repeat).
+/// protocols but the pump is identical.
 async fn drive_handshake_to_connected<P>(
-    mut session: Session<P, Connecting>,
+    session: Session<P, Connecting>,
     socket: &tokio::net::UdpSocket,
 ) -> Result<Session<P, Connected>, String>
 where
     P: dstar_gateway_core::session::client::Protocol,
 {
-    let deadline = std::time::Instant::now() + REFLECTOR_CONNECT_TIMEOUT;
-    let mut buf = [0u8; 2048];
-
-    loop {
-        match session.state_kind() {
-            ClientStateKind::Connected => break,
-            ClientStateKind::Closed => {
-                return Err("reflector rejected the connection".to_string());
-            }
-            _ => {}
-        }
-
-        if std::time::Instant::now() >= deadline {
-            return Err("timeout waiting for reflector acknowledgement".to_string());
-        }
-
-        // Drain any outbound packets the core wants to send.
-        while let Some(tx) = session.poll_transmit(std::time::Instant::now()) {
-            let _ = socket
-                .send_to(tx.payload, tx.dst)
-                .await
-                .map_err(|e| format!("handshake send failed: {e}"))?;
-        }
-
-        // Wait for either an inbound datagram or a short polling tick.
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            socket.recv_from(&mut buf),
-        )
+    dstar_gateway::tokio_shell::drive_connecting(session, socket, REFLECTOR_CONNECT_TIMEOUT)
         .await
-        {
-            Ok(Ok((n, src))) => {
-                let Some(bytes) = buf.get(..n) else {
-                    continue;
-                };
-                session
-                    .handle_input(std::time::Instant::now(), src, bytes)
-                    .map_err(|e| format!("handshake decode failed: {e}"))?;
-            }
-            Ok(Err(e)) => return Err(format!("handshake recv failed: {e}")),
-            Err(_) => {
-                // No datagram within the polling window, so let the core
-                // fire any timers (keepalives, retransmits).
-                session.handle_timeout(std::time::Instant::now());
-            }
-        }
-    }
-
-    session
-        .promote()
-        .map_err(|f| format!("promote to Connected failed: {}", f.error))
+        .map_err(|error| error.to_string())
 }
 
 /// Build and drive a full `DExtra` connect handshake.
@@ -3723,14 +3519,11 @@ async fn connect_reflector(callsign: Callsign, link: &LinkArg) -> Result<Reflect
 
     // Prefix-based protocol detection covers the stock Pi-Star host
     // files (REF/XRF/XLX/DCS). Vanity entries in Local_Hosts.txt fall
-    // through to port-based inference (20001=DPlus, 30001=DExtra,
-    // 30051=DCS); any other port defaults to DExtra because
-    // Local_Hosts.txt is parsed with that port.
-    let protocol = ProtocolKind::from_reflector_prefix(ref_name).unwrap_or(match entry.port {
-        20001 => ProtocolKind::DPlus,
-        30051 => ProtocolKind::Dcs,
-        _ => ProtocolKind::DExtra,
-    });
+    // through to port-based inference; any other port defaults to
+    // DExtra because Local_Hosts.txt is parsed with that port.
+    let protocol = ProtocolKind::from_reflector_prefix(ref_name)
+        .or_else(|| ProtocolKind::from_port(entry.port))
+        .unwrap_or(ProtocolKind::DExtra);
 
     let addr = format!("{}:{}", entry.address, entry.port)
         .to_socket_addrs()
@@ -3808,7 +3601,9 @@ async fn exit_dstar(
     let radio = gw
         .stop()
         .await
-        .map_err(|e| format!("Gateway stop failed: {e}"))?;
+        .map_err(|e| format!("Gateway stop failed: {e}"))?
+        // Disconnecting next, so CAT re-proof is moot.
+        .into_radio_unproven();
 
     // Disconnect BT to release the RFCOMM channel.
     drop(radio.disconnect().await);
@@ -4107,7 +3902,9 @@ async fn dstar_poll_cycle(session: &mut DstarSession) {
             // automatically.
             if matches!(
                 event,
-                RuntimeEvent::Disconnected(DisconnectReason::KeepaliveInactivity)
+                RuntimeEvent::Disconnected {
+                    reason: DisconnectReason::KeepaliveInactivity
+                }
             ) {
                 session.reflector = None;
                 try_reconnect_reflector(session).await;
@@ -4301,7 +4098,7 @@ async fn dispatch_dstar(session: &mut DstarSession, cmd: &str, parts: &[&str]) {
             if !thd75_repl::confirm::tx_confirm() {
                 return;
             }
-            session.echo_armed = true;
+            session.echo.arm();
             println!(
                 "Echo test: transmit now. Your audio will be recorded \
                  and played back."
@@ -4386,33 +4183,18 @@ fn render_slow_data_text(message: &SlowDataTextMessage) -> String {
     )
 }
 
-/// Maximum echo recording length (60 seconds at 50 frames/sec).
-const ECHO_MAX_FRAMES: usize = 60 * 50;
-
-/// Transition echo from Recording to Waiting (ready for playback).
+/// Finish the echo recording and announce its length.
 fn finish_echo_recording(session: &mut DstarSession) {
-    let echo = std::mem::replace(&mut session.echo, EchoState::Idle);
-    if let EchoState::Recording { header, frames } = echo {
+    if let Some(count) = session.echo.on_voice_end(std::time::Instant::now()) {
         #[expect(
             clippy::cast_precision_loss,
-            reason = "Echo buffer is capped at ECHO_MAX_FRAMES (3000), which fits exactly in \
+            reason = "The echo buffer is capped at 3000 frames, which fits exactly in \
                       f64's 52-bit mantissa, so the usize→f64 conversion never loses precision."
         )]
-        let secs = frames.len() as f64 / 50.0;
+        let secs = count as f64 / 50.0;
         println!("Echo test: recorded {secs:.1} seconds of audio. Playing back.");
-        session.echo = EchoState::Waiting {
-            header,
-            frames,
-            since: std::time::Instant::now(),
-        };
     }
 }
-
-/// Delay before echo playback starts (milliseconds).
-///
-/// Per ircDDBGateway `REPLY_TIME`, a short pause so the user hears
-/// a clear break between their TX and the playback.
-const ECHO_REPLY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Build the outbound reflector [`DstarHeader`] from the
 /// kenwood-thd75 header emitted by the radio.
@@ -4432,21 +4214,17 @@ fn build_reflector_header(
     reflector_module: Module,
     header: &DstarHeader,
 ) -> DstarHeader {
-    let mut hdr = DstarHeader::for_relay(
+    // Preserve the radio's flag bytes: `for_relay` zeroes them (correct
+    // for a TX-from-scratch client), so chain the source flags back on.
+    DstarHeader::for_relay(
         station_callsign,
         local_module,
         reflector_callsign,
         reflector_module,
         header.my_call,
         header.my_suffix,
-    );
-    // Preserve the radio's flag bytes. The helper zeroes them by
-    // default, which is correct for sextant's TX-from-scratch path
-    // but loses any repeater flags the radio sets in this relay path.
-    hdr.flag1 = header.flag1;
-    hdr.flag2 = header.flag2;
-    hdr.flag3 = header.flag3;
-    hdr
+    )
+    .with_flags(header.flag1, header.flag2, header.flag3)
 }
 
 /// Relay a radio MMDVM event to the reflector, or record for echo test.
@@ -4456,44 +4234,30 @@ fn build_reflector_header(
 /// being relayed to any reflector. This matches the `ircDDBGateway`
 /// echo test convention.
 async fn relay_radio_to_reflector(session: &mut DstarSession, event: &DstarEvent) {
-    // Echo test interception: either the `echo` command armed it, or
-    // URCALL is "       E" (per ircDDBGateway convention).
-    if let DstarEvent::VoiceStart(header) = event
-        && (session.echo_armed || header.ur_call.as_bytes() == b"       E")
-    {
-        session.echo_armed = false;
-        println!(
-            "Echo test: recording from {}. Transmit up to 60 seconds.",
-            render_gateway_callsign(header.my_call)
-        );
-        session.echo = EchoState::Recording {
-            header: *header,
-            frames: Vec::with_capacity(256),
-        };
-        return;
-    }
-
-    // If we're currently recording for echo, buffer frames.
-    if matches!(session.echo, EchoState::Recording { .. }) {
+    // Echo test interception (the `echo` command armed the unit, or
+    // URCALL is "       E" per ircDDBGateway convention). A VoiceStart
+    // during a live recording means the previous stream's end was
+    // lost: finish what we have, then treat this stream normally.
+    if let DstarEvent::VoiceStart(header) = event {
+        if session.echo.is_recording() {
+            finish_echo_recording(session);
+        }
+        if session.echo.on_voice_start(header) {
+            println!(
+                "Echo test: recording from {}. Transmit up to 60 seconds.",
+                render_gateway_callsign(header.my_call)
+            );
+            return;
+        }
+    } else if session.echo.is_recording() {
         match event {
             DstarEvent::VoiceData(frame) => {
-                if let EchoState::Recording { frames, .. } = &mut session.echo
-                    && frames.len() < ECHO_MAX_FRAMES
-                {
-                    frames.push(*frame);
-                }
+                session.echo.on_voice_frame(*frame);
                 return;
             }
             DstarEvent::VoiceEnd | DstarEvent::VoiceLost => {
                 finish_echo_recording(session);
                 return;
-            }
-            DstarEvent::VoiceStart(_) => {
-                // New stream started before VoiceEnd, so the previous
-                // stream's end was lost. Finish what we have.
-                finish_echo_recording(session);
-                // Don't return; let this VoiceStart fall through to
-                // normal processing below.
             }
             _ => {}
         }
@@ -4515,7 +4279,7 @@ async fn relay_radio_to_reflector(session: &mut DstarSession, event: &DstarEvent
     match event {
         DstarEvent::VoiceStart(header) => {
             // Generate a new stream ID for this transmission.
-            let sid = rand_stream_id();
+            let sid = dstar_gateway::tokio_shell::fresh_stream_id();
             session.tx_stream_id = Some(sid);
             session.tx_seq = 0;
             session.tx_slow_data_idx = 0;
@@ -4581,44 +4345,24 @@ async fn relay_radio_to_reflector(session: &mut DstarSession, event: &DstarEvent
 /// the 20 ms AMBE frame interval, so the modem sees roughly its
 /// native 50 fps consumption rate.
 async fn echo_playback_tick(session: &mut DstarSession) {
-    // Check if we're in Waiting and the delay has elapsed.
-    let should_play = matches!(
-        &session.echo,
-        EchoState::Waiting { since, .. } if since.elapsed() >= ECHO_REPLY_DELAY
-    );
-
-    if !should_play {
+    // The unit hands over the recorded stream exactly once, with the
+    // playback header already built per ircDDBGateway EchoUnit.cpp
+    // (MY = gateway callsign, suffix "ECHO", YOUR = "CQCQCQ  ").
+    let Some(playback) = session
+        .echo
+        .poll_playback(std::time::Instant::now(), session.callsign)
+    else {
         return;
-    }
-
-    // Move to Playing state and extract the buffered data.
-    let echo = std::mem::replace(&mut session.echo, EchoState::Playing);
-    let EchoState::Waiting { header, frames, .. } = echo else {
-        return;
-    };
-
-    // Build the echo playback header per ircDDBGateway EchoUnit.cpp:
-    // MY = gateway callsign, MY suffix = "ECHO", YOUR = "CQCQCQ  ".
-    let echo_header = DstarHeader {
-        flag1: header.flag1,
-        flag2: header.flag2,
-        flag3: header.flag3,
-        rpt2: header.rpt2,
-        rpt1: header.rpt1,
-        ur_call: Callsign::from_wire_bytes(*b"CQCQCQ  "),
-        my_call: session.callsign,
-        my_suffix: Suffix::from_wire_bytes(*b"ECHO"),
     };
 
     // Send header to radio.
-    if let Err(e) = session.gateway.send_header(&echo_header).await {
+    if let Err(e) = session.gateway.send_header(&playback.header).await {
         println!("Echo playback error: header: {e}");
-        session.echo = EchoState::Idle;
         return;
     }
 
     // Play back each frame with 20ms pacing.
-    for frame in &frames {
+    for frame in &playback.frames {
         if let Err(e) = session.gateway.send_voice_unpaced(frame).await {
             println!("Echo playback error: voice: {e}");
             break;
@@ -4640,7 +4384,6 @@ async fn echo_playback_tick(session: &mut DstarSession) {
     }
 
     println!("Echo test: playback complete.");
-    session.echo = EchoState::Idle;
 }
 
 /// Run the poll loop for an echo test cycle.
@@ -4663,19 +4406,18 @@ async fn run_echo_monitor(session: &mut DstarSession) {
         tokio::select! {
             _ = &mut ctrl_c => {
                 println!("Echo test cancelled.");
-                session.echo_armed = false;
-                session.echo = EchoState::Idle;
+                session.echo = dstar_gateway_core::echo::EchoUnit::new();
                 break;
             }
             () = dstar_poll_cycle(session) => {}
         }
 
-        if !started && !matches!(session.echo, EchoState::Idle) {
+        if !started && !session.echo.is_idle() {
             started = true;
         }
 
-        // Exit once playback is complete (Idle after having recorded).
-        if started && matches!(session.echo, EchoState::Idle) {
+        // Exit once playback is complete (idle after having recorded).
+        if started && session.echo.is_idle() {
             break;
         }
     }
@@ -4683,27 +4425,6 @@ async fn run_echo_monitor(session: &mut DstarSession) {
     session
         .gateway
         .set_event_timeout(std::time::Duration::from_millis(500));
-}
-
-/// Generate a random non-zero stream ID.
-///
-/// Uses system time entropy (not cryptographic, just needs to be
-/// per-stream unique). The low bit is forced to 1 so the result is
-/// always non-zero, making the `StreamId::new` unwrap trivial.
-fn rand_stream_id() -> StreamId {
-    use std::time::SystemTime;
-    let t = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "Stream IDs are 16-bit per the D-STAR protocol, so deliberate truncation of the \
-                  64-bit seconds-since-epoch and the XOR result is how we derive a per-stream \
-                  unique ID. Only the low 16 bits of entropy matter here."
-    )]
-    let id = ((t.subsec_nanos() ^ (t.as_secs() as u32)) as u16) | 0x0001;
-    StreamId::new(id)
-        .unwrap_or_else(|| unreachable!("low bit forced to 1 guarantees a non-zero stream id"))
 }
 
 /// Build the header to send to the radio's MMDVM modem when relaying
@@ -4725,40 +4446,16 @@ fn build_radio_header(
     local_module: Module,
     header: &DstarHeader,
 ) -> DstarHeader {
-    const DSTAR_REPEATER_MASK: u8 = 0x40;
-
-    let cs_bytes = station_callsign.as_bytes();
-
-    let mut rpt_buf = [b' '; 8];
-    if let Some(dst) = rpt_buf.get_mut(..7)
-        && let Some(src) = cs_bytes.get(..7)
-    {
-        dst.copy_from_slice(src);
-    }
-    if let Some(slot) = rpt_buf.get_mut(7) {
-        *slot = local_module.as_byte();
-    }
-    let rpt = Callsign::from_wire_bytes(rpt_buf);
-
-    let ur_call = Callsign::from_wire_bytes(*b"CQCQCQ  ");
-
-    DstarHeader {
-        flag1: header.flag1 | DSTAR_REPEATER_MASK,
-        flag2: header.flag2,
-        flag3: header.flag3,
-        rpt2: rpt,
-        rpt1: rpt,
-        ur_call,
-        my_call: header.my_call,
-        my_suffix: header.my_suffix,
-    }
+    DstarHeader::for_radio_relay(station_callsign, local_module, header)
 }
 
 /// Relay a reflector event to the radio MMDVM modem.
 async fn relay_reflector_to_radio(session: &mut DstarSession, event: &RuntimeEvent) {
     let gw = &mut session.gateway;
     match event {
-        RuntimeEvent::VoiceStart { header, stream_id } => {
+        RuntimeEvent::VoiceStart {
+            header, stream_id, ..
+        } => {
             // Deduplicate: only send header once per stream.
             if session.rx_stream_id == Some(*stream_id) {
                 return;
@@ -4893,7 +4590,7 @@ async fn relay_reflector_to_radio(session: &mut DstarSession, event: &RuntimeEve
                     // this frame only if the next real frame
                     // doesn't arrive before `PAD_INITIAL_THRESHOLD` past
                     // this moment.
-                    session.last_rx_voice_frame = Some(**frame);
+                    session.last_rx_voice_frame = Some(*frame);
                     session.last_relay_at = Some(std::time::Instant::now());
                     session.pad_frames_emitted = 0;
                 }
@@ -4946,7 +4643,9 @@ async fn relay_reflector_to_radio(session: &mut DstarSession, event: &RuntimeEve
                 );
             }
         }
-        RuntimeEvent::Connected | RuntimeEvent::Disconnected(_) | RuntimeEvent::PollEcho => {}
+        // Connected / Disconnected / PollEcho carry no voice payload
+        // to relay; future erased variants are equally inert here.
+        _ => {}
     }
 }
 
@@ -4977,20 +4676,22 @@ fn print_slow_data_text_message(message: &SlowDataTextMessage) {
 /// can filter just this firehose via `RUST_LOG` if they want.
 fn trace_reflector_event(event: &RuntimeEvent) {
     match event {
-        RuntimeEvent::Connected => {
+        RuntimeEvent::Connected { .. } => {
             tracing::trace!(target: "thd75_repl::reflector", "event: Connected");
         }
-        RuntimeEvent::Disconnected(reason) => {
+        RuntimeEvent::Disconnected { reason } => {
             tracing::trace!(
                 target: "thd75_repl::reflector",
                 reason = ?reason,
                 "event: Disconnected"
             );
         }
-        RuntimeEvent::PollEcho => {
+        RuntimeEvent::PollEcho { .. } => {
             tracing::trace!(target: "thd75_repl::reflector", "event: PollEcho");
         }
-        RuntimeEvent::VoiceStart { header, stream_id } => {
+        RuntimeEvent::VoiceStart {
+            header, stream_id, ..
+        } => {
             tracing::trace!(
                 target: "thd75_repl::reflector",
                 stream_id = %stream_id,
@@ -5038,6 +4739,9 @@ fn trace_reflector_event(event: &RuntimeEvent) {
                 "event: VoiceEnd"
             );
         }
+        other => {
+            tracing::trace!(target: "thd75_repl::reflector", event = ?other, "event: other");
+        }
     }
 }
 
@@ -5050,10 +4754,10 @@ fn trace_reflector_event(event: &RuntimeEvent) {
 /// would otherwise see zeros.
 fn print_reflector_event(event: &RuntimeEvent, session: &DstarSession) {
     match event {
-        RuntimeEvent::Connected => {
+        RuntimeEvent::Connected { .. } => {
             aprintln!("{}", thd75_repl::output::reflector_event_connected());
         }
-        RuntimeEvent::Disconnected(reason) => match reason {
+        RuntimeEvent::Disconnected { reason } => match reason {
             DisconnectReason::Rejected => {
                 aprintln!("{}", thd75_repl::output::reflector_event_rejected());
             }
@@ -5061,10 +4765,6 @@ fn print_reflector_event(event: &RuntimeEvent, session: &DstarSession) {
                 aprintln!("{}", thd75_repl::output::reflector_event_disconnected());
             }
         },
-        RuntimeEvent::PollEcho | RuntimeEvent::VoiceFrame { .. } => {
-            // Silent: keepalives and individual voice frames are too
-            // frequent to announce.
-        }
         RuntimeEvent::VoiceStart { header, .. } => {
             let my_call = render_gateway_callsign(header.my_call);
             let my_suffix = render_gateway_suffix(header.my_suffix);
@@ -5096,6 +4796,10 @@ fn print_reflector_event(event: &RuntimeEvent, session: &DstarSession) {
                 thd75_repl::output::reflector_event_voice_end(frames, duration_ms)
             );
         }
+        // Silent: keepalives and individual voice frames are too
+        // frequent to announce, and future erased variants have
+        // nothing to announce either.
+        _ => {}
     }
 }
 
@@ -5326,11 +5030,18 @@ mod offset_tests {
 #[cfg(test)]
 mod gateway_off_tests {
     use super::{
-        DetachedMcpPageUpdate, DstarEntryRadio, GATEWAY_MODE_BYTE, GATEWAY_MODE_PAGE,
-        PROCESS_SIGNAL_EXIT_CODE, ProcessSignal, ProcessSignalRouter, ensure_terminal_mode,
-        enter_dstar, route_process_signal, run_set_gateway_off, validate_gateway_mcp_target,
-        write_gateway_mode_with_interrupt,
+        DetachedMcpPageUpdate, DstarEntryRadio, PROCESS_SIGNAL_EXIT_CODE, ProcessSignal,
+        ProcessSignalRouter, ensure_terminal_mode, enter_dstar, route_process_signal,
+        run_set_gateway_off, validate_gateway_mcp_target, write_gateway_mode_with_interrupt,
     };
+    use kenwood_thd75::types::DvGatewayMode;
+
+    /// Wire pins for the Menu 650 MCP scripts below. The production offset
+    /// is registry-pinned inside kenwood-thd75 (`radio/terminal_mode.rs`);
+    /// firmware-verified: the GW CAT handler reads this offset.
+    const GATEWAY_MODE_PAGE: u16 = 0x1C;
+    /// Byte index of the gateway mode value within its page.
+    const GATEWAY_MODE_BYTE: usize = 0xA0;
     use kenwood_thd75::error::TransportError;
     use kenwood_thd75::memory::MCP_D75_SCHEMA_FIRMWARE_IDENTITIES;
     use kenwood_thd75::protocol::programming;
@@ -5820,9 +5531,13 @@ mod gateway_off_tests {
 
         let mut radio = Radio::new(EitherTransport::Mock(mock));
         let interrupt = std::future::pending::<std::io::Result<()>>();
-        let changed = write_gateway_mode_with_interrupt(&mut radio, 1, interrupt)
-            .await
-            .map_err(std::io::Error::other)?;
+        let changed = write_gateway_mode_with_interrupt(
+            &mut radio,
+            DvGatewayMode::ReflectorTerminal,
+            interrupt,
+        )
+        .await
+        .map_err(std::io::Error::other)?;
         assert_eq!(changed, DetachedMcpPageUpdate::ChangedRadioRebooting);
         Ok(())
     }
@@ -5844,9 +5559,13 @@ mod gateway_off_tests {
 
         let mut radio = Radio::new(EitherTransport::Mock(mock));
         let interrupt = std::future::pending::<std::io::Result<()>>();
-        let changed = write_gateway_mode_with_interrupt(&mut radio, 1, interrupt)
-            .await
-            .map_err(std::io::Error::other)?;
+        let changed = write_gateway_mode_with_interrupt(
+            &mut radio,
+            DvGatewayMode::ReflectorTerminal,
+            interrupt,
+        )
+        .await
+        .map_err(std::io::Error::other)?;
         assert_eq!(changed, DetachedMcpPageUpdate::UnchangedCatReady);
         Ok(())
     }
@@ -5883,7 +5602,9 @@ mod gateway_off_tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             Ok::<(), std::io::Error>(())
         };
-        let Err(error) = write_gateway_mode_with_interrupt(&mut radio, 0, interrupt).await else {
+        let Err(error) =
+            write_gateway_mode_with_interrupt(&mut radio, DvGatewayMode::Off, interrupt).await
+        else {
             return Err("interrupted gateway write unexpectedly succeeded".into());
         };
         assert!(
@@ -5910,7 +5631,13 @@ mod gateway_off_tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             Ok::<(), std::io::Error>(())
         };
-        let Err(error) = write_gateway_mode_with_interrupt(&mut radio, 1, interrupt).await else {
+        let Err(error) = write_gateway_mode_with_interrupt(
+            &mut radio,
+            DvGatewayMode::ReflectorTerminal,
+            interrupt,
+        )
+        .await
+        else {
             return Err("interrupted gateway write unexpectedly succeeded".into());
         };
         assert!(

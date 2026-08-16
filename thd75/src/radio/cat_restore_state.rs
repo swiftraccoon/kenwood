@@ -148,6 +148,7 @@ impl CatRestoreState {
     /// This is intentionally valid only for a clean in-place transport
     /// reclaim. A reconnect requires a fresh binary diagnosis and must not
     /// retain the old proof.
+    #[cfg(any(feature = "dstar", test))]
     pub(super) fn rebuild_binary_proven<T: Transport>(self, transport: T) -> Radio<T> {
         self.rebuild(transport, CatState::BinaryProven, false, LinkState::Up)
     }
@@ -290,7 +291,9 @@ mod tests {
         assert_eq!(radio.mcp_saved_timeout, Some(Duration::from_millis(731)));
 
         radio.mcp_saved_timeout = None;
-        radio.mcp_pending_exit_error = Some(Error::CommandRejected);
+        radio.mcp_pending_exit_error = Some(Error::CommandRejected {
+            mnemonic: "0M".to_string(),
+        });
         let Err((radio, error)) = radio.into_binary_mode_parts() else {
             return Err("pending MCP exit error unexpectedly entered a binary session".into());
         };

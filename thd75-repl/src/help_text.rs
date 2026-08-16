@@ -153,7 +153,7 @@ step a 5: Set frequency step size by index, 0 through 11
 -- Tuning --
 up: Step frequency up on band A (or: up b)
 down: Step frequency down on band A (or: down b)
-tune: Unavailable; direct frequency writes fail closed
+tune a 146.520: Step band A's VFO to 146.520 megahertz
 recall a 5: Recall memory channel 5 on band A
 -- Memory channels --
 ch 5: Read memory channel 5
@@ -356,14 +356,14 @@ Example: down
 Example: down b
 Related commands: up, step, tune";
 
-const TUNE_HELP: &str = "tune: Direct frequency tuning is unavailable.
-The FO/FQ writer is not qualified.
-This command fails before radio input or output.
+const TUNE_HELP: &str = "tune: Step a band's VFO to a frequency.
+Walks with verified up and down steps; every step is read back.
+The band must be in VFO mode; the target must sit on the tuning step.
+Direct FO/FQ frequency writes remain unavailable.
 Syntax: tune [a or b] [frequency in megahertz]
 Example: tune a 146.520
 Example: tune b 446.000
-Use up, down, or recall for qualified frequency changes.
-Related commands: freq, up, down, recall";
+Related commands: freq, up, down, step, recall";
 
 const RECALL_HELP: &str = "recall: Recall a memory channel on a band.
 Syntax: recall [a or b] [channel number]

@@ -2,7 +2,8 @@
 
 use std::fmt;
 
-use crate::error::ProtocolError;
+use crate::error::{ProtocolError, ValidationError};
+use crate::types::mode::StepSize;
 
 /// Radio frequency in Hz.
 ///
@@ -161,6 +162,94 @@ impl Frequency {
         Ok(Self(hz))
     }
 
+    /// Parse a decimal megahertz string into an exact frequency.
+    ///
+    /// Accepts an unsigned decimal number with an optional fractional part of
+    /// at most six digits (hertz resolution), such as `"145.190"`, `"435"`,
+    /// or `"0.000001"`. Both parts must be nonempty when a decimal point is
+    /// present. No sign, unit suffix, exponent, or digit grouping is accepted.
+    /// The conversion is exact integer arithmetic; no floating-point rounding
+    /// is involved.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use kenwood_thd75::types::{Frequency, StepSize};
+    ///
+    /// let freq = Frequency::from_mhz_str("146.520")?;
+    /// assert_eq!(freq.as_hz(), 146_520_000);
+    /// assert!(freq.is_aligned_to(StepSize::Hz5000));
+    /// assert!(Frequency::from_mhz_str("146.52 MHz").is_err());
+    /// # Ok::<(), kenwood_thd75::error::ValidationError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::InvalidTextValue`] when the text is not an
+    /// exact, in-range decimal megahertz value.
+    pub fn from_mhz_str(text: &str) -> Result<Self, ValidationError> {
+        const DETAIL: &str = "must be an unsigned decimal megahertz value with at most six \
+                              fractional digits, 0-4294.967295 MHz";
+        /// Hz multiplier for a fractional part of the indexed length.
+        const SCALES: [u64; 7] = [1_000_000, 100_000, 10_000, 1_000, 100, 10, 1];
+        let invalid = |reason: &str| ValidationError::InvalidTextValue {
+            name: "frequency",
+            value: text.to_owned(),
+            detail: DETAIL,
+            reason: reason.to_owned(),
+        };
+
+        let (whole, fraction) = match text.split_once('.') {
+            Some((whole, fraction)) => (whole, fraction),
+            None => (text, ""),
+        };
+        if whole.is_empty() {
+            return Err(invalid("missing digits before the decimal point"));
+        }
+        if text.contains('.') && fraction.is_empty() {
+            return Err(invalid("missing digits after the decimal point"));
+        }
+        if !whole.bytes().all(|byte| byte.is_ascii_digit())
+            || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(invalid("contains a character other than a decimal digit"));
+        }
+        let scale = SCALES
+            .get(fraction.len())
+            .copied()
+            .ok_or_else(|| invalid("more than six fractional digits is below 1 Hz resolution"))?;
+        let megahertz: u64 = whole
+            .parse()
+            .map_err(|_| invalid("integer part exceeds the representable range"))?;
+        let fraction_hz = if fraction.is_empty() {
+            0
+        } else {
+            let digits: u64 = fraction
+                .parse()
+                .map_err(|_| invalid("fractional part exceeds the representable range"))?;
+            digits * scale
+        };
+        let hz = megahertz
+            .checked_mul(1_000_000)
+            .and_then(|hz| hz.checked_add(fraction_hz))
+            .ok_or_else(|| invalid("exceeds 4294.967295 MHz"))?;
+        let hz = u32::try_from(hz).map_err(|_| invalid("exceeds 4294.967295 MHz"))?;
+        Ok(Self(hz))
+    }
+
+    /// Report whether this frequency sits on the radio's nominal integer
+    /// raster for `step`.
+    ///
+    /// Alignment is computed against [`StepSize::as_hz`], the same integer
+    /// hertz value this library uses for the step everywhere else. The
+    /// 8.33 kHz airband selection is therefore checked against its nominal
+    /// 8,330 Hz raster, matching the step's library-wide integer
+    /// representation.
+    #[must_use]
+    pub const fn is_aligned_to(self, step: StepSize) -> bool {
+        self.0.is_multiple_of(step.as_hz())
+    }
+
     /// Returns the frequency as a 4-byte little-endian array.
     #[must_use]
     pub const fn to_le_bytes(self) -> [u8; 4] {
@@ -276,5 +365,51 @@ mod tests {
     fn frequency_to_bytes_le() {
         let f = Frequency::new(145_000_000);
         assert_eq!(f.to_le_bytes(), 145_000_000u32.to_le_bytes());
+    }
+
+    #[test]
+    fn frequency_from_mhz_str_parses_exact_decimals() -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(Frequency::from_mhz_str("145.190")?.as_hz(), 145_190_000);
+        assert_eq!(Frequency::from_mhz_str("145.19")?.as_hz(), 145_190_000);
+        assert_eq!(Frequency::from_mhz_str("435")?.as_hz(), 435_000_000);
+        assert_eq!(Frequency::from_mhz_str("0.100")?.as_hz(), 100_000);
+        assert_eq!(Frequency::from_mhz_str("0.000001")?.as_hz(), 1);
+        assert_eq!(Frequency::from_mhz_str("4294.967295")?.as_hz(), u32::MAX);
+        Ok(())
+    }
+
+    #[test]
+    fn frequency_from_mhz_str_rejects_non_representable_input() {
+        for rejected in [
+            "",
+            ".",
+            "145.",
+            ".190",
+            "145.1234567",
+            "4294.967296",
+            "abc",
+            "145.19 MHz",
+            "-145.190",
+            "+145.190",
+            "1e3",
+            "145..190",
+            "145,190",
+        ] {
+            let result = Frequency::from_mhz_str(rejected);
+            assert!(
+                result.is_err(),
+                "non-representable MHz text was accepted: {rejected:?} -> {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn frequency_alignment_uses_integer_raster() {
+        use crate::types::StepSize;
+        assert!(Frequency::new(146_520_000).is_aligned_to(StepSize::Hz5000));
+        assert!(!Frequency::new(146_522_000).is_aligned_to(StepSize::Hz5000));
+        assert!(Frequency::new(83_300_000).is_aligned_to(StepSize::Hz8330));
+        assert!(!Frequency::new(118_005_000).is_aligned_to(StepSize::Hz8330));
+        assert!(Frequency::new(0).is_aligned_to(StepSize::Hz12500));
     }
 }

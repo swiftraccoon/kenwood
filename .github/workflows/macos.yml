@@ -37,6 +37,8 @@ jobs:
       # check, so those passes were pure duplicate work.
       - run: cargo clippy --all-targets -- -D warnings
         working-directory: thd75
+      - run: cargo clippy --all-targets --no-default-features -- -D warnings
+        working-directory: thd75
       - run: cargo clippy --all-targets -- -D warnings
         working-directory: thd75-tui
       - run: cargo clippy --all-targets -- -D warnings
@@ -56,6 +58,8 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
         working-directory: pulsar
       - run: cargo test
+        working-directory: thd75
+      - run: cargo test --no-default-features
         working-directory: thd75
       - run: cargo test
         working-directory: thd75-tui

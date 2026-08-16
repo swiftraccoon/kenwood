@@ -24,23 +24,32 @@
 // host's CFRunLoop instead. Even the deprecated write:length:sleep:NO method
 // is a runtime trampoline to writeSync: (the sleep argument is ignored).
 //
-// The hard boundary is therefore a helper *process*. The Rust parent spawns
-// its own executable with the private environment sentinel below. This
-// constructor runs before Rust main, owns every IOBluetooth object, exposes
-// stdin/stdout as raw serial byte streams, and exits. If IOBluetooth wedges,
-// the parent remains responsive and SIGKILLs this process during timeout or
-// cleanup. Re-executing the signed host avoids a separate unsigned helper
-// artifact and works for examples and applications embedding the library.
+// The hard boundary is therefore a helper *process*. The Rust parent spawns a
+// signed executable containing this constructor with the private environment
+// sentinel below. This constructor runs before main, owns every IOBluetooth
+// object, exposes stdin/stdout as raw serial byte streams, and exits. If
+// IOBluetooth wedges, the parent remains responsive and SIGKILLs this process
+// during timeout or cleanup. Command-line clients can re-execute themselves;
+// sandboxed applications provide a separately signed inheriting helper.
 
 #define BT_HELPER_SENTINEL_ENV "THD75_BT_HELPER_PROCESS_V1"
 #define BT_HELPER_SENTINEL_VALUE "4d7f29c8b35a"
 #define BT_HELPER_DEVICE_ENV "THD75_BT_HELPER_DEVICE"
 #define BT_HELPER_CHANNEL_ENV "THD75_BT_HELPER_CHANNEL"
+#define BT_HELPER_CONTROL_ENV "THD75_BT_HELPER_CONTROL_MODE"
 #define BT_HELPER_TEST_ENV "THD75_BT_HELPER_TEST_MODE"
 #define BT_HELPER_LIVENESS_FD_ENV "THD75_BT_HELPER_LIVENESS_FD"
 #define BT_HELPER_PRE_READY_CAPACITY 4096
+#define BT_HELPER_MAX_PAIRED_CANDIDATES 64
+#define BT_HELPER_CANDIDATE_HINT_CACHED_SPP (1u << 0)
+#define BT_HELPER_CANDIDATE_HINT_D75_NAME (1u << 1)
 
 static const uint8_t kReadyMagic[] = "THD75BT-READY-v1";
+
+// The selected identifier matched more than one paired device name. Keep
+// this distinct from 71, whose process-local open race is retried once.
+#define BT_HELPER_EXIT_AMBIGUOUS_DEVICE_NAME 87
+#define BT_HELPER_EXIT_TOO_MANY_PAIRED_DEVICES 88
 
 // Opt-in shim tracing. Set THD75_BT_TRACE=1 on the parent. The helper
 // inherits stderr, so every line carries its PID and can be correlated with
@@ -282,20 +291,39 @@ static void destroy_rfcomm_context(RfcommContext *ctx) {
 // Runs only in the helper process's main thread, which owns and pumps the
 // CFRunLoop used for all IOBluetooth callbacks.
 static RfcommContext *open_rfcomm(const char *device_identifier,
-                                  uint8_t rfcomm_channel) {
+                                  uint8_t rfcomm_channel,
+                                  int *ambiguous_device_name) {
     @autoreleasepool {
+        *ambiguous_device_name = 0;
         NSString *identifier = [NSString
             stringWithUTF8String:device_identifier];
+        if (!identifier) return NULL;
         IOBluetoothDevice *device = nil;
+        IOBluetoothDevice *name_match = nil;
+        NSUInteger name_match_count = 0;
         for (IOBluetoothDevice *candidate in
              [IOBluetoothDevice pairedDevices]) {
-            if ([candidate.name isEqualToString:identifier] ||
-                [candidate.addressString
-                    caseInsensitiveCompare:identifier] == NSOrderedSame) {
+            // An exact address is globally identifying and takes precedence
+            // even when an earlier device happened to share the same name.
+            NSString *candidate_address = candidate.addressString;
+            if (candidate_address &&
+                [candidate_address caseInsensitiveCompare:identifier]
+                    == NSOrderedSame) {
                 device = candidate;
                 break;
             }
+            if ([candidate.name isEqualToString:identifier]) {
+                name_match = candidate;
+                name_match_count++;
+            }
         }
+        if (!device && name_match_count > 1) {
+            *ambiguous_device_name = 1;
+            bt_trace("paired device name is ambiguous name=%s matches=%lu",
+                     device_identifier, (unsigned long)name_match_count);
+            return NULL;
+        }
+        if (!device) device = name_match;
         if (!device) return NULL;
 
         RfcommContext *ctx = calloc(1, sizeof(RfcommContext));
@@ -388,8 +416,14 @@ static int write_all(int fd, const uint8_t *bytes, size_t length) {
 }
 
 static int run_helper(const char *device_name, uint8_t channel_id) {
-    RfcommContext *ctx = open_rfcomm(device_name, channel_id);
+    int ambiguous_device_name = 0;
+    RfcommContext *ctx = open_rfcomm(
+        device_name, channel_id, &ambiguous_device_name
+    );
     if (!ctx) {
+        if (ambiguous_device_name) {
+            return BT_HELPER_EXIT_AMBIGUOUS_DEVICE_NAME;
+        }
         bt_trace("RFCOMM open failed device=%s channel=%u",
                  device_name, channel_id);
         return 71;
@@ -470,45 +504,101 @@ static int run_helper(const char *device_name, uint8_t channel_id) {
     return exit_code;
 }
 
-// Helper control modes that run through the same current-executable
-// constructor and stdin/stdout framing as the production radio stream.
-// `paired-v1` keeps even discovery's IOBluetooth objects in a short-lived
-// helper; `echo-v1` and `hang-v1` are no-radio lifecycle probes. The exact
-// helper sentinel is still required, so an ambient mode variable alone has no
-// effect.
-static int run_test_helper(const char *mode) {
+static int device_has_cached_spp_channel(IOBluetoothDevice *device,
+                                         uint8_t channel_id) {
+    IOBluetoothSDPUUID *uuid = [IOBluetoothSDPUUID
+        uuid16:kBluetoothSDPUUID16ServiceClassSerialPort];
+    IOBluetoothSDPServiceRecord *record =
+        [device getServiceRecordForUUID:uuid];
+    if (!record) return 0;
+    BluetoothRFCOMMChannelID cached_channel = 0;
+    return [record getRFCOMMChannelID:&cached_channel] == kIOReturnSuccess &&
+           cached_channel == channel_id;
+}
+
+static int device_name_looks_like_d75(IOBluetoothDevice *device) {
+    NSString *name = device.name;
+    if (!name) return 0;
+    return [name rangeOfString:@"D75"
+                       options:NSCaseInsensitiveSearch].location != NSNotFound;
+}
+
+// Returns 0 after writing one record, 1 when the framework record is unusable,
+// and -1 on stdout failure.
+static int write_paired_device_record(IOBluetoothDevice *device,
+                                      uint8_t hints) {
+    NSData *address = [[device addressString]
+        dataUsingEncoding:NSUTF8StringEncoding];
+    NSString *display_name = device.name ?: device.addressString;
+    NSData *name = [display_name dataUsingEncoding:NSUTF8StringEncoding];
+    if (!address || !name || address.length == 0 ||
+        address.length > UINT16_MAX || name.length == 0 ||
+        name.length > UINT16_MAX) {
+        return 1;
+    }
+    uint8_t header[5] = {
+        hints,
+        (uint8_t)(address.length >> 8),
+        (uint8_t)address.length,
+        (uint8_t)(name.length >> 8),
+        (uint8_t)name.length,
+    };
+    if (write_all(STDOUT_FILENO, header, sizeof(header)) != 0 ||
+        write_all(STDOUT_FILENO, address.bytes, address.length) != 0 ||
+        write_all(STDOUT_FILENO, name.bytes, name.length) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+// Production helper control modes use the same early constructor as the raw
+// radio stream. Enumeration prefers cached channel-2 SPP records, then D75-like
+// names, then the remaining paired devices. The last tier preserves support for
+// a custom Menu 935 name even when macOS has no cached SDP record.
+static int run_control_helper(const char *mode) {
     if (write_all(STDOUT_FILENO, kReadyMagic, sizeof(kReadyMagic) - 1) != 0) {
         return 79;
     }
-    if (strcmp(mode, "paired-v1") == 0) {
+    if (strcmp(mode, "paired-v2") == 0) {
         @autoreleasepool {
-            for (IOBluetoothDevice *device in
-                 [IOBluetoothDevice pairedDevices]) {
-                NSData *address = [[device addressString]
-                    dataUsingEncoding:NSUTF8StringEncoding];
-                NSString *display_name = device.name ?: device.addressString;
-                NSData *name = [display_name
-                    dataUsingEncoding:NSUTF8StringEncoding];
-                if (!address || !name || address.length == 0 ||
-                    address.length > UINT16_MAX || name.length > UINT16_MAX) {
-                    continue;
-                }
-                uint8_t lengths[4] = {
-                    (uint8_t)(address.length >> 8),
-                    (uint8_t)address.length,
-                    (uint8_t)(name.length >> 8),
-                    (uint8_t)name.length,
-                };
-                if (write_all(STDOUT_FILENO, lengths, sizeof(lengths)) != 0 ||
-                    write_all(STDOUT_FILENO, address.bytes, address.length) != 0 ||
-                    write_all(STDOUT_FILENO, name.bytes, name.length) != 0) {
-                    return 86;
+            NSArray *devices = [IOBluetoothDevice pairedDevices];
+            NSUInteger emitted = 0;
+            for (NSUInteger tier = 0; tier < 3; tier++) {
+                for (IOBluetoothDevice *device in devices) {
+                    int cached_spp = device_has_cached_spp_channel(device, 2);
+                    int looks_like_d75 = device_name_looks_like_d75(device);
+                    int selected = (tier == 0 && cached_spp) ||
+                                   (tier == 1 && !cached_spp && looks_like_d75) ||
+                                   (tier == 2 && !cached_spp && !looks_like_d75);
+                    if (!selected) continue;
+                    if (emitted >= BT_HELPER_MAX_PAIRED_CANDIDATES) {
+                        return BT_HELPER_EXIT_TOO_MANY_PAIRED_DEVICES;
+                    }
+                    uint8_t hints = 0;
+                    if (cached_spp) {
+                        hints |= BT_HELPER_CANDIDATE_HINT_CACHED_SPP;
+                    }
+                    if (looks_like_d75) {
+                        hints |= BT_HELPER_CANDIDATE_HINT_D75_NAME;
+                    }
+                    int result = write_paired_device_record(device, hints);
+                    if (result < 0) return 86;
+                    if (result == 0) emitted++;
                 }
             }
-            const uint8_t terminator[4] = {0, 0, 0, 0};
+            const uint8_t terminator[5] = {0, 0, 0, 0, 0};
             return write_all(STDOUT_FILENO, terminator,
                              sizeof(terminator)) == 0 ? 0 : 86;
         }
+    }
+    return 82;
+}
+
+// No-radio lifecycle probes. The exact helper sentinel is still required, so
+// an ambient test-mode variable alone has no effect.
+static int run_test_helper(const char *mode) {
+    if (write_all(STDOUT_FILENO, kReadyMagic, sizeof(kReadyMagic) - 1) != 0) {
+        return 79;
     }
     if (strcmp(mode, "echo-v1") == 0) {
         uint8_t bytes[512];
@@ -550,6 +640,9 @@ static void bluetooth_helper_constructor(void) {
         start_parent_liveness_watchdog((int)parsed_liveness) != 0) {
         _exit(85);
     }
+
+    const char *control_mode = getenv(BT_HELPER_CONTROL_ENV);
+    if (control_mode && control_mode[0]) _exit(run_control_helper(control_mode));
 
     const char *test_mode = getenv(BT_HELPER_TEST_ENV);
     if (test_mode && test_mode[0]) _exit(run_test_helper(test_mode));

@@ -5,6 +5,57 @@ use crate::transport::Transport;
 
 use super::{CatState, LinkState, McpPhase, Radio};
 
+/// A radio whose CAT stream is unproven after a binary-session exit.
+///
+/// Binary sessions (KISS, MMDVM) leave residue on the wire when they
+/// end, so the exchange boundary must be re-proved before ordinary
+/// commands. This wrapper makes that obligation a compile-time fact:
+/// the only paths out are [`Self::restore`] (drain residue, re-prove
+/// identity) or the explicitly named [`Self::into_radio_unproven`]
+/// for callers that will reconnect or run their own recovery instead.
+#[must_use = "restore the CAT stream (or take the radio explicitly unproven) before further use"]
+#[derive(Debug)]
+pub struct DesyncedRadio<T: Transport>(Radio<T>);
+
+impl<T: Transport> DesyncedRadio<T> {
+    /// Wrap a radio handed back by a binary-session exit.
+    ///
+    /// Constructed by the KISS and MMDVM session exits, which are the
+    /// two binary modes whose transports survive their exit.
+    #[cfg(any(feature = "aprs", feature = "dstar"))]
+    pub(crate) const fn new(radio: Radio<T>) -> Self {
+        Self(radio)
+    }
+
+    /// Drain binary residue and re-prove the CAT exchange boundary.
+    ///
+    /// On success the returned radio is ready for ordinary commands.
+    ///
+    /// # Errors
+    ///
+    /// Returns the wrapper back with the recovery error; the radio's
+    /// internal state still marks recovery as required, so a retry or
+    /// [`Radio::reconnect`] remains possible via
+    /// [`Self::into_radio_unproven`].
+    pub async fn restore(mut self) -> Result<Radio<T>, (Self, Error)> {
+        match self.0.restore_cat_after_mode_exit().await {
+            Ok(()) => Ok(self.0),
+            Err(error) => Err((self, error)),
+        }
+    }
+
+    /// Take the radio without proving the CAT stream.
+    ///
+    /// The radio still tracks its own recovery-required state, so
+    /// ordinary commands keep failing until [`Radio::recover_cat`] or
+    /// [`Radio::reconnect`] succeeds; this hatch only transfers that
+    /// obligation to the caller.
+    #[must_use]
+    pub fn into_radio_unproven(self) -> Radio<T> {
+        self.0
+    }
+}
+
 impl<T: Transport> Radio<T> {
     /// Recover a long-lived handle so ordinary CAT commands are safe again.
     ///

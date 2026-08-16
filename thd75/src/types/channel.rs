@@ -822,7 +822,11 @@ impl TryFrom<u8> for CrossToneType {
             1 => Ok(Self::ToneDcs),
             2 => Ok(Self::DcsCtcss),
             3 => Ok(Self::ToneCtcss),
-            _ => Err(ValidationError::CrossToneTypeOutOfRange(value)),
+            _ => Err(ValidationError::SettingOutOfRange {
+                name: "cross-tone type",
+                value,
+                detail: "must be 0-3",
+            }),
         }
     }
 }
@@ -1001,7 +1005,11 @@ impl TryFrom<u8> for FineStep {
             1 => Ok(Self::Hz100),
             2 => Ok(Self::Hz500),
             3 => Ok(Self::Hz1000),
-            _ => Err(ValidationError::FineStepOutOfRange(value)),
+            _ => Err(ValidationError::SettingOutOfRange {
+                name: "fine step",
+                value,
+                detail: "must be 0-3",
+            }),
         }
     }
 }
@@ -1089,12 +1097,16 @@ impl StoredChannel {
     ///
     /// # Errors
     ///
-    /// Returns [`ValidationError::FrequencyOutOfRange`] when the receive
+    /// Returns [`ValidationError::IntegerOutOfRange`] when the receive
     /// frequency is zero or the erased `u32::MAX` marker.
     pub const fn validate_programmed(&self) -> Result<(), ValidationError> {
         let frequency = self.receive_frequency.as_hz();
         if frequency == 0 || frequency == u32::MAX {
-            Err(ValidationError::FrequencyOutOfRange(frequency))
+            Err(ValidationError::IntegerOutOfRange {
+                name: "stored channel receive frequency",
+                value: frequency as i64,
+                detail: "must be 1-4,294,967,294 Hz",
+            })
         } else {
             Ok(())
         }
@@ -1301,7 +1313,7 @@ impl StoredChannelData {
     ///
     /// # Errors
     ///
-    /// Returns [`ValidationError::FrequencyOutOfRange`] when the receive
+    /// Returns [`ValidationError::IntegerOutOfRange`] when the receive
     /// frequency is zero or the erased `u32::MAX` marker.
     pub fn new_programmed(channel: StoredChannel) -> Result<Self, ValidationError> {
         channel.validate_programmed()?;

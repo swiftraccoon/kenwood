@@ -141,6 +141,16 @@ if [ -n "$PKG" ] && [ "$PKG" != "mbelib-rs" ]; then
     MBELIB_MATRIX=0
 fi
 
+# kenwood-thd75's aprs/dstar client stacks are feature-gated; the
+# workspace passes cover the default (both on) and --all-features.
+# The CAT-only core and each single-feature configuration have their
+# own cfg fallout, so exercise them explicitly when the crate is in
+# scope.
+THD75_MATRIX=1
+if [ -n "$PKG" ] && [ "$PKG" != "kenwood-thd75" ]; then
+    THD75_MATRIX=0
+fi
+
 # The mdBook lives under dstar-gateway; only build it when that crate
 # is in scope.
 BOOK_BUILD=1
@@ -957,6 +967,17 @@ if [ "$MBELIB_MATRIX" -eq 1 ]; then
         --jobs "$MAIN_JOBS" --target-dir "$CLIPPY_TARGET_DIR" -- -D warnings
 fi
 
+# kenwood-thd75 feature matrix: the CAT-only core and each client stack
+# alone. The default and --all-features passes above cover both-on.
+if [ "$THD75_MATRIX" -eq 1 ]; then
+    run "${CLIPPY_ENV[@]}" cargo clippy -p kenwood-thd75 --all-targets --no-default-features \
+        --jobs "$MAIN_JOBS" --target-dir "$CLIPPY_TARGET_DIR" -- -D warnings
+    run "${CLIPPY_ENV[@]}" cargo clippy -p kenwood-thd75 --all-targets --no-default-features \
+        --features aprs --jobs "$MAIN_JOBS" --target-dir "$CLIPPY_TARGET_DIR" -- -D warnings
+    run "${CLIPPY_ENV[@]}" cargo clippy -p kenwood-thd75 --all-targets --no-default-features \
+        --features dstar --jobs "$MAIN_JOBS" --target-dir "$CLIPPY_TARGET_DIR" -- -D warnings
+fi
+
 # Clippy is complete. On normal hosts, start both isolated documentation
 # variants immediately so they can overlap the tail of the base test suite and
 # the small feature-test matrix. Constrained hosts run docs serially later.
@@ -995,6 +1016,10 @@ join_test_group
 if [ -z "$PKG" ] || [ "$PKG" = "thd75-repl" ]; then
     run "${TEST_ENV[@]}" CARGO_TARGET_DIR="$TEST_TARGET_DIR" \
         cargo nextest run -p thd75-repl --features testing --all-targets
+fi
+if [ "$THD75_MATRIX" -eq 1 ]; then
+    run "${TEST_ENV[@]}" CARGO_TARGET_DIR="$TEST_TARGET_DIR" \
+        cargo nextest run -p kenwood-thd75 --no-default-features --all-targets
 fi
 if [ "$MBELIB_MATRIX" -eq 1 ]; then
     run "${TEST_ENV[@]}" CARGO_TARGET_DIR="$TEST_TARGET_DIR" \

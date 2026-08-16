@@ -245,7 +245,7 @@ async fn radio_not_available_response() -> TestResult {
     let mut radio = Radio::new(mock);
     let result = radio.identify().await;
     assert!(
-        matches!(result, Err(Error::NotAvailableInCurrentMode)),
+        matches!(result, Err(Error::NotAvailableInCurrentMode { .. })),
         "expected NotAvailableInCurrentMode, got {result:?}"
     );
     Ok(())

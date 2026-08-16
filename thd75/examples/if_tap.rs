@@ -1,6 +1,8 @@
 //! Capture the TH-D75's AF, IF, and detector outputs, then restore the settings
-//! changed for the capture. Tune Band B to the requested frequency before
-//! starting; direct-frequency writes are intentionally outside this example.
+//! changed for the capture. The typed IF-tap session owns the whole lifecycle:
+//! it guards Band B VFO mode, snapshots every touched setting, proves
+//! engagement by readback, retunes to the requested frequency with the
+//! verified UP/DW walk, and restores in the hardware-required order on exit.
 //!
 //! The radio's USB interface carries a capture-only audio function whose
 //! device name is "ADC stream IN" (mono 48 kHz), not "TH-D75". With
@@ -40,16 +42,14 @@ use tracing as _;
 
 use std::error::Error;
 
-use kenwood_thd75::Radio;
 use kenwood_thd75::transport::SerialTransport;
-use kenwood_thd75::types::{
-    Band, BandMode, Frequency, OperatingMode, SquelchLevel, UsbAudioOutput,
-};
+use kenwood_thd75::types::{Frequency, OperatingMode, UsbAudioOutput};
+use kenwood_thd75::{IfTapConfig, IfTapSession, Radio};
 
 /// Default capture frequency: a 70 cm slot on the 5 kHz raster, proving
 /// IF output works on VHF/UHF (the per-sub-band default mode table is
 /// only a default).
-const DEFAULT_MHZ: f64 = 435.640;
+const DEFAULT_FREQUENCY: Frequency = Frequency::new(435_640_000);
 
 fn ffmpeg_available() -> bool {
     std::process::Command::new("ffmpeg")
@@ -113,72 +113,31 @@ async fn settle() {
     tokio::time::sleep(std::time::Duration::from_millis(700)).await;
 }
 
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "megahertz input is validated finite and positive below; multiplied by 1e6 it \
-              stays well inside u32 for every frequency the radio accepts"
-)]
 fn parse_mhz(arg: Option<String>) -> Result<Frequency, Box<dyn Error>> {
-    let mhz: f64 = match arg {
-        None => DEFAULT_MHZ,
-        Some(s) => s
-            .parse()
-            .map_err(|e| format!("invalid frequency {s:?}: {e}"))?,
-    };
-    if !mhz.is_finite() || mhz <= 0.0 {
-        return Err("frequency must be a positive number in megahertz".into());
-    }
-    Ok(Frequency::new((mhz * 1_000_000.0) as u32))
+    arg.map_or_else(
+        || Ok(DEFAULT_FREQUENCY),
+        |s| Frequency::from_mhz_str(&s).map_err(|e| format!("invalid frequency {s:?}: {e}").into()),
+    )
 }
 
-async fn run_test(
-    radio: &mut Radio<SerialTransport>,
+async fn run_captures(
+    session: &mut IfTapSession<'_, SerialTransport>,
     freq: Frequency,
     idx: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
-    // Preconditions for IF/Detect: operation band B, Single Band mode,
-    // non-DV mode.
-    radio.set_band(Band::B).await?;
-    radio.set_band_mode(BandMode::Single).await?;
-    let current = radio.get_frequency(Band::B).await?;
-    if current != freq {
-        return Err(format!(
-            "Band B is at {} Hz, not {} Hz; tune the radio directly before running this example",
-            current.as_hz(),
-            freq.as_hz()
-        )
-        .into());
-    }
-    radio
-        .set_operating_mode(Band::B, OperatingMode::Usb)
-        .await?;
-    radio
-        .set_squelch(Band::B, SquelchLevel::try_from(0)?)
-        .await?;
+    // Land Band B on the requested frequency under the engaged tap: the
+    // verified UP/DW walk refuses off-step or distant targets.
+    let landed = session.step_to_frequency(freq).await?;
     println!(
-        "configured: single-band B, {} Hz, USB, squelch open",
-        freq.as_hz()
+        "tuned: single-band B, {} Hz, USB, squelch open, IF engaged",
+        landed.as_hz()
     );
-    settle().await;
-
-    if let Some(idx) = idx {
-        capture(idx, "if_af_ref.wav")?;
-    }
-
-    radio
-        .set_usb_audio_output(UsbAudioOutput::IntermediateFrequency)
-        .await?;
-    let now = radio.get_usb_audio_output().await?;
-    if !matches!(now, UsbAudioOutput::IntermediateFrequency) {
-        return Err(format!("IO readback after set If: {now} - IF not engaged").into());
-    }
-    println!("IO = IF engaged (readback confirmed)");
     settle().await;
     if let Some(idx) = idx {
         capture(idx, "if_tap.wav")?;
     }
 
+    let radio = session.radio();
     radio.set_usb_audio_output(UsbAudioOutput::Detect).await?;
     let now = radio.get_usb_audio_output().await?;
     if matches!(now, UsbAudioOutput::Detect) {
@@ -189,6 +148,19 @@ async fn run_test(
         }
     } else {
         println!("warning: Detect readback gave {now}; skipping detect step");
+    }
+
+    // AF reference last: drop to the audio path (exit re-forces it anyway).
+    let radio = session.radio();
+    radio.set_usb_audio_output(UsbAudioOutput::Audio).await?;
+    let now = radio.get_usb_audio_output().await?;
+    if matches!(now, UsbAudioOutput::Audio) {
+        settle().await;
+        if let Some(idx) = idx {
+            capture(idx, "if_af_ref.wav")?;
+        }
+    } else {
+        println!("warning: Audio readback gave {now}; skipping AF reference");
     }
 
     if idx.is_none() {
@@ -222,38 +194,43 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let info = radio.identify().await?;
     println!("connected: {}", info.model);
 
-    // Save every setting the test touches.
-    let band0 = radio.get_band().await?;
-    let band_mode0 = radio.get_band_mode().await?;
-    let usb_audio_output0 = radio.get_usb_audio_output().await?;
-    let sq0 = radio.get_squelch(Band::B).await?;
-    let mode0 = radio.get_operating_mode(Band::B).await?;
-    let freq0 = radio.get_frequency(Band::B).await?;
-    println!(
-        "saved state: band={band0:?} band_mode={band_mode0} usb_audio_output={usb_audio_output0} squelch={} mode={mode0} freq={} Hz",
-        u8::from(sq0),
-        freq0.as_hz()
-    );
+    // The session guards Band B VFO mode, saves every touched setting,
+    // applies single-band B / USB / squelch-open, and proves IF engaged.
+    // A mid-configure failure rolls the radio back before returning.
+    let mut session = match radio
+        .enter_if_tap(IfTapConfig::new(OperatingMode::Usb))
+        .await
+    {
+        Ok(session) => session,
+        Err(error) => {
+            for (step, step_error) in error.rollback.failures() {
+                println!("rollback failure: {step}: {step_error}");
+            }
+            drop(radio.disconnect().await);
+            return Err(error.to_string().into());
+        }
+    };
+    println!("IF tap engaged; snapshot: {:?}", session.saved_state());
 
-    let result = run_test(&mut radio, freq, idx.as_deref()).await;
+    let result = run_captures(&mut session, freq, idx.as_deref()).await;
     if let Err(e) = &result {
         println!("TEST ERROR (restoring anyway): {e}");
     }
 
-    // Best-effort restore, then verify it landed.
+    // Ordered restore with per-step reporting. Frequency stays where the
+    // operator tuned it; everything else returns to the snapshot.
     println!("restoring saved state...");
-    drop(radio.set_usb_audio_output(usb_audio_output0).await);
-    drop(radio.set_squelch(Band::B, sq0).await);
-    drop(radio.set_operating_mode(Band::B, mode0).await);
-    let frequency_restored = matches!(radio.get_frequency(Band::B).await, Ok(now) if now == freq0);
-    drop(radio.set_band_mode(band_mode0).await);
-    drop(radio.set_band(band0).await);
-    let usb_audio_output_v = radio.get_usb_audio_output().await?;
-    let band_mode_v = radio.get_band_mode().await?;
-    let band_v = radio.get_band().await?;
-    println!(
-        "restored: usb_audio_output={usb_audio_output_v} band_mode={band_mode_v} band={band_v:?} frequency={frequency_restored}"
-    );
+    let report = session.exit().await;
+    if report.is_complete() {
+        println!("restored: every saved setting confirmed");
+    } else {
+        for (step, error) in report.failures() {
+            println!("restore failure: {step}: {error}");
+        }
+        for step in report.not_attempted() {
+            println!("restore skipped: {step}");
+        }
+    }
 
     drop(radio.disconnect().await);
     result.map(|()| println!("IF tap example complete"))

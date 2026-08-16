@@ -11,24 +11,31 @@
 pub mod aprs;
 pub mod audio;
 pub mod automation;
+#[cfg(any(feature = "aprs", feature = "dstar", test))]
 mod cat_restore_state;
 pub mod diagnostics;
 pub mod dstar;
-#[path = "freq.rs"]
 pub mod freq;
 pub mod gps;
+pub mod if_tap;
+#[cfg(feature = "aprs")]
 pub mod kiss_session;
+mod mcp_offsets;
 pub mod memory;
 pub mod memory_read;
 pub mod menu;
+#[cfg(feature = "dstar")]
 pub mod mmdvm_session;
 pub mod packet;
 pub mod programming;
 pub mod raw_protocol_session;
 mod recovery;
+pub use recovery::DesyncedRadio;
 mod response_correlation;
 pub mod scan;
+pub mod state_monitor;
 pub mod system;
+pub mod terminal_mode;
 pub mod tuning;
 
 use std::time::Duration;
@@ -574,7 +581,10 @@ impl<T: Transport> Radio<T> {
                 }
                 let aligned_terminal = matches!(
                     &inner,
-                    Ok(_) | Err(Error::CommandRejected | Error::NotAvailableInCurrentMode)
+                    Ok(_)
+                        | Err(
+                            Error::CommandRejected { .. } | Error::NotAvailableInCurrentMode { .. }
+                        )
                 );
                 if aligned_terminal {
                     // Clear synchronously, with no await after the correlated
@@ -647,10 +657,14 @@ impl<T: Transport> Radio<T> {
 
                 // Error/not-available are always responses to the current command.
                 if frame == b"?" {
-                    return Err(Error::CommandRejected);
+                    return Err(Error::CommandRejected {
+                        mnemonic: expected_mnemonic.to_string(),
+                    });
                 }
                 if frame == b"N" {
-                    return Err(Error::NotAvailableInCurrentMode);
+                    return Err(Error::NotAvailableInCurrentMode {
+                        mnemonic: expected_mnemonic.to_string(),
+                    });
                 }
 
                 if frame_mnemonic != Some(expected_mnemonic.as_bytes()) {
@@ -1062,14 +1076,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn radio_error_response() -> TestResult {
+    async fn radio_error_response_names_the_rejected_mnemonic() -> TestResult {
         let mut mock = MockTransport::new();
         mock.expect(b"FQ 0\r", b"?\r");
         let mut radio = Radio::new(mock);
         let result = radio.execute(Command::GetFrequency { band: Band::A }).await;
         assert!(
-            matches!(result, Err(Error::CommandRejected)),
-            "expected CommandRejected, got {result:?}"
+            matches!(&result, Err(Error::CommandRejected { mnemonic }) if mnemonic == "FQ"),
+            "rejection must carry the mnemonic the radio refused: {result:?}"
+        );
+        let message = result.map_or_else(|e| e.to_string(), |r| format!("{r:?}"));
+        assert!(
+            message.contains("FQ"),
+            "operator-facing message names the command: {message}"
         );
         Ok(())
     }
@@ -1187,8 +1206,8 @@ mod tests {
         let mut radio = Radio::new(mock);
         let result = radio.execute(Command::GetRadioId).await;
         assert!(
-            matches!(result, Err(Error::NotAvailableInCurrentMode)),
-            "expected NotAvailableInCurrentMode, got {result:?}"
+            matches!(&result, Err(Error::NotAvailableInCurrentMode { mnemonic }) if mnemonic == "ID"),
+            "the not-available error must carry the refused mnemonic: {result:?}"
         );
         assert_eq!(radio.cat_state, CatState::Ready);
         assert_eq!(*radio.link_state().borrow(), LinkState::Up);

@@ -171,6 +171,8 @@ pub(crate) async fn spawn_with_transport(
         let mut s_meter_b = SMeterReading::ZERO;
         let mut busy_a = false;
         let mut busy_b = false;
+        // Lib-owned fold of AI pushes + the BY-gated SM policy.
+        let mut monitor = kenwood_thd75::StateMonitor::new();
 
         // Wrap in Option so we can take() for APRS mode (which consumes
         // the Radio by value via enter_kiss) and put it back after.
@@ -282,38 +284,29 @@ pub(crate) async fn spawn_with_transport(
                             }
                         }
                         Ok(notification) = notifications.recv() => {
-                            // Process AI-pushed notifications. The radio sends these
-                            // automatically when state changes (AI 1 mode). This is
-                            // faster than polling and avoids firmware quirks.
-                            use kenwood_thd75::protocol::Response;
-                            // Other AI notifications (FQ, MD, SQ, VM, etc.) are
-                            // handled implicitly: the next poll cycle will read
-                            // the updated values. AI mode ensures we don't miss
-                            // rapid changes between poll cycles.
-                            if let Response::Busy { band, busy } = notification {
-                                // BY gate: squelch open → poll SM; closed → zero meter
-                                if busy {
+                            // Fold AI-pushed notifications through the lib's
+                            // StateMonitor; the only change needing radio I/O
+                            // is BecameBusy (the BY-gated one-shot SM read).
+                            // Other AI pushes (FQ, MD, SQ, VM, etc.) also fold
+                            // into the monitor; the next poll cycle re-reads
+                            // whatever it displays from the radio directly.
+                            if let Some(change) = monitor.apply(&notification) {
+                                if let kenwood_thd75::StateChange::BecameBusy { band } = change {
                                     match radio.get_smeter(band).await {
-                                        Ok(level) => match band {
-                                            Band::A => { s_meter_a = level; busy_a = true; }
-                                            Band::B => { s_meter_b = level; busy_b = true; }
-                                        },
+                                        Ok(level) => monitor.apply_smeter(band, level),
                                         Err(e) => {
+                                            // Busy already folded; only the
+                                            // meter reading is missing.
                                             tracing::warn!(?band, "SM read failed on BY: {e}");
-                                            // Still mark busy even though SM read failed
-                                            match band {
-                                                Band::A => busy_a = true,
-                                                Band::B => busy_b = true,
-                                            }
                                         }
                                     }
-                                } else {
-                                    let zero = SMeterReading::ZERO;
-                                    match band {
-                                        Band::A => { s_meter_a = zero; busy_a = false; }
-                                        Band::B => { s_meter_b = zero; busy_b = false; }
-                                    }
                                 }
+                                let a = monitor.band(Band::A);
+                                let b = monitor.band(Band::B);
+                                s_meter_a = a.s_meter.unwrap_or(SMeterReading::ZERO);
+                                busy_a = a.busy.unwrap_or(false);
+                                s_meter_b = b.s_meter.unwrap_or(SMeterReading::ZERO);
+                                busy_b = b.busy.unwrap_or(false);
                             }
                         }
                         Some(cmd) = cmd_rx.recv() => {
@@ -650,7 +643,7 @@ pub(crate) async fn spawn_with_transport(
                         }
                     }
                 }
-                // Exponential backoff: 1s, 2s, 3s, ... up to 10s
+                // Linear backoff capped at ten intervals: 1s, 2s, ... 10s.
                 let delay = RECONNECT_INTERVAL * attempts.min(10);
                 tokio::time::sleep(delay).await;
             }
@@ -742,8 +735,11 @@ async fn poll_once(
         radio.get_battery_level(),
         kenwood_thd75::types::BatteryLevel::Empty
     );
-    // BE (beep) is a firmware stub on D75: always returns N.
-    // Beep state is read from MCP image instead. Skip polling.
+    // Bare BE is the APRS beacon transmit action (it returns N when the
+    // TNC is not ready), not a beep preference, so it must not be polled
+    // here. The verified beep setting lives in MCP memory and is shown by
+    // the settings view; this placeholder stays false until a state read
+    // is wired to that MCP field.
     let beep = false;
     let band_mode = global_read!(radio, "DL", radio.get_band_mode(), BandMode::Single);
     let bluetooth = global_read!(radio, "BT", radio.get_bluetooth(), false);
@@ -978,17 +974,17 @@ async fn enter_aprs_session(
     let exit_result = run_aprs_loop(&mut client, tx, cmd_rx).await;
 
     match client.stop().await {
-        Ok(mut new_radio) => {
+        Ok(desynced) => {
             if let Err(msg) = exit_result {
                 let _send = tx.send(Message::AprsError(msg));
             }
-            if let Err(error) = new_radio.restore_cat_after_mode_exit().await {
-                return Err(EnterAprsError::RadioRecoveryFailed {
+            match desynced.restore().await {
+                Ok(new_radio) => Ok(new_radio),
+                Err((desynced, error)) => Err(EnterAprsError::RadioRecoveryFailed {
                     message: format!("KISS exit succeeded, but CAT restoration failed: {error}"),
-                    radio: Some(Box::new(new_radio)),
-                });
+                    radio: Some(Box::new(desynced.into_radio_unproven())),
+                }),
             }
-            Ok(new_radio)
         }
         Err((_client, e)) => Err(EnterAprsError::RadioRecoveryFailed {
             message: format!("KISS exit failed: {e}"),
@@ -1105,17 +1101,17 @@ async fn enter_dstar_session(
     let exit_result = run_dstar_loop(&mut gateway, tx, cmd_rx).await;
 
     match gateway.stop().await {
-        Ok(mut new_radio) => {
+        Ok(desynced) => {
             if let Err(msg) = exit_result {
                 let _send = tx.send(Message::DstarError(msg));
             }
-            if let Err(error) = new_radio.restore_cat_after_mode_exit().await {
-                return Err(EnterDstarError::RadioRecoveryFailed {
+            match desynced.restore().await {
+                Ok(new_radio) => Ok(new_radio),
+                Err((desynced, error)) => Err(EnterDstarError::RadioRecoveryFailed {
                     message: format!("MMDVM exit succeeded, but CAT restoration failed: {error}"),
-                    radio: Some(Box::new(new_radio)),
-                });
+                    radio: Some(Box::new(desynced.into_radio_unproven())),
+                }),
             }
-            Ok(new_radio)
         }
         Err(e) => Err(EnterDstarError::RadioRecoveryFailed {
             message: format!("D-STAR gateway stop failed: {e}"),

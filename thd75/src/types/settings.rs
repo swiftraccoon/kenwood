@@ -79,6 +79,21 @@ pub enum BacklightControl {
 impl BacklightControl {
     /// Number of CAT/MCP values accepted by Menu No. 900 (`0..=3`).
     pub const COUNT: u8 = 4;
+
+    /// Every backlight control mode, in ascending raw-value (menu) order.
+    pub const ALL: [Self; Self::COUNT as usize] =
+        [Self::Manual, Self::On, Self::Auto, Self::AutoDcIn];
+}
+
+impl std::fmt::Display for BacklightControl {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Manual => "Manual",
+            Self::On => "On",
+            Self::Auto => "Auto",
+            Self::AutoDcIn => "Auto (DC-IN)",
+        })
+    }
 }
 
 /// LCD brightness (Menu No. 902, `radio.LcdBrightness`).
@@ -91,6 +106,24 @@ pub enum LcdBrightness {
     Medium = 1,
     /// High brightness.
     High = 2,
+}
+
+impl LcdBrightness {
+    /// Number of LCD brightness choices (raw `0..=2`).
+    pub const COUNT: u8 = 3;
+
+    /// Every LCD brightness choice, in ascending raw-value (menu) order.
+    pub const ALL: [Self; Self::COUNT as usize] = [Self::Low, Self::Medium, Self::High];
+}
+
+impl std::fmt::Display for LcdBrightness {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Low => "Low",
+            Self::Medium => "Medium",
+            Self::High => "High",
+        })
+    }
 }
 
 /// Text displayed for approximately two seconds when the TH-D75 powers on.
@@ -251,6 +284,32 @@ pub enum SingleBandDisplay {
     DemodulationMode = 4,
 }
 
+impl SingleBandDisplay {
+    /// Number of single-band display choices (raw `0..=4`).
+    pub const COUNT: u8 = 5;
+
+    /// Every single-band display choice, in ascending raw-value (menu) order.
+    pub const ALL: [Self; Self::COUNT as usize] = [
+        Self::Off,
+        Self::GpsAltitude,
+        Self::GpsGroundSpeed,
+        Self::Date,
+        Self::DemodulationMode,
+    ];
+}
+
+impl std::fmt::Display for SingleBandDisplay {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Off => "Off",
+            Self::GpsAltitude => "GPS (Altitude)",
+            Self::GpsGroundSpeed => "GPS (GS)",
+            Self::Date => "Date",
+            Self::DemodulationMode => "Demodulation Mode",
+        })
+    }
+}
+
 /// S-meter and power-meter design (Menu No. 905).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -263,6 +322,24 @@ pub enum MeterType {
     Type3 = 2,
 }
 
+impl MeterType {
+    /// Number of meter designs (raw `0..=2`).
+    pub const COUNT: u8 = 3;
+
+    /// Every meter design, in ascending raw-value (menu) order.
+    pub const ALL: [Self; Self::COUNT as usize] = [Self::Type1, Self::Type2, Self::Type3];
+}
+
+impl std::fmt::Display for MeterType {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Type1 => "Type1",
+            Self::Type2 => "Type2",
+            Self::Type3 => "Type3",
+        })
+    }
+}
+
 /// LCD background color (Menu No. 906).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -271,6 +348,23 @@ pub enum BackgroundColor {
     Black = 0,
     /// White background.
     White = 1,
+}
+
+impl BackgroundColor {
+    /// Number of background color choices (raw `0..=1`).
+    pub const COUNT: u8 = 2;
+
+    /// Every background color choice, in ascending raw-value (menu) order.
+    pub const ALL: [Self; Self::COUNT as usize] = [Self::Black, Self::White];
+}
+
+impl std::fmt::Display for BackgroundColor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Black => "Black",
+            Self::White => "White",
+        })
+    }
 }
 
 /// Notification backlight behavior (Menu No. 907).
@@ -283,6 +377,24 @@ pub enum InformationBacklight {
     Lcd = 1,
     /// Illuminate the LCD and keys.
     LcdAndKeys = 2,
+}
+
+impl InformationBacklight {
+    /// Number of notification backlight choices (raw `0..=2`).
+    pub const COUNT: u8 = 3;
+
+    /// Every notification backlight choice, in ascending raw-value (menu) order.
+    pub const ALL: [Self; Self::COUNT as usize] = [Self::Off, Self::Lcd, Self::LcdAndKeys];
+}
+
+impl std::fmt::Display for InformationBacklight {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Off => "Off",
+            Self::Lcd => "LCD",
+            Self::LcdAndKeys => "LCD + Key",
+        })
+    }
 }
 
 /// Independent LED indicator controls (Menu No. 181).
@@ -393,6 +505,42 @@ pub enum AudioBalance {
     OperationBandOnly = 9,
 }
 
+impl AudioBalance {
+    /// Number of audio balance choices (raw `0..=9`).
+    pub const COUNT: u8 = 10;
+
+    /// Every audio balance choice, in ascending raw-value (menu) order.
+    pub const ALL: [Self; Self::COUNT as usize] = [
+        Self::A100B0,
+        Self::A100B25,
+        Self::A100B50,
+        Self::A100B75,
+        Self::A100B100,
+        Self::A75B100,
+        Self::A50B100,
+        Self::A25B100,
+        Self::A0B100,
+        Self::OperationBandOnly,
+    ];
+}
+
+impl std::fmt::Display for AudioBalance {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::A100B0 => "A:100/B:0",
+            Self::A100B25 => "A:100/B:25",
+            Self::A100B50 => "A:100/B:50",
+            Self::A100B75 => "A:100/B:75",
+            Self::A100B100 => "A:100/B:100",
+            Self::A75B100 => "A:75/B:100",
+            Self::A50B100 => "A:50/B:100",
+            Self::A25B100 => "A:25/B:100",
+            Self::A0B100 => "A:0/B:100",
+            Self::OperationBandOnly => "Operation Band Only",
+        })
+    }
+}
+
 /// Callsign pronunciation method (Menu No. 919).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -403,6 +551,25 @@ pub enum CallsignReadout {
     FullPhonetics = 1,
     /// Read only the suffix phonetically.
     SuffixPhonetics = 2,
+}
+
+impl CallsignReadout {
+    /// Number of callsign readout choices (raw `0..=2`).
+    pub const COUNT: u8 = 3;
+
+    /// Every callsign readout choice, in ascending raw-value (menu) order.
+    pub const ALL: [Self; Self::COUNT as usize] =
+        [Self::Standard, Self::FullPhonetics, Self::SuffixPhonetics];
+}
+
+impl std::fmt::Display for CallsignReadout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Standard => "Standard",
+            Self::FullPhonetics => "Phonetics (Full)",
+            Self::SuffixPhonetics => "Phonetics (Suffix)",
+        })
+    }
 }
 
 /// USB audio capture level (Menu No. 91A).
@@ -426,6 +593,36 @@ pub enum UsbAudioOutputLevel {
     Level6 = 5,
     /// Level 7.
     Level7 = 6,
+}
+
+impl UsbAudioOutputLevel {
+    /// Number of USB audio output levels (raw `0..=6`).
+    pub const COUNT: u8 = 7;
+
+    /// Every USB audio output level, in ascending raw-value (menu) order.
+    pub const ALL: [Self; Self::COUNT as usize] = [
+        Self::Level1,
+        Self::Level2,
+        Self::Level3,
+        Self::Level4,
+        Self::Level5,
+        Self::Level6,
+        Self::Level7,
+    ];
+}
+
+impl std::fmt::Display for UsbAudioOutputLevel {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Level1 => "Level 1",
+            Self::Level2 => "Level 2",
+            Self::Level3 => "Level 3",
+            Self::Level4 => "Level 4",
+            Self::Level5 => "Level 5",
+            Self::Level6 => "Level 6",
+            Self::Level7 => "Level 7",
+        })
+    }
 }
 
 /// One TH-D75 TX equalizer band level, from -9 through +3 dB.
@@ -668,6 +865,24 @@ pub enum MicSensitivity {
     Low = 2,
 }
 
+impl MicSensitivity {
+    /// Number of microphone sensitivity choices (raw `0..=2`).
+    pub const COUNT: u8 = 3;
+
+    /// Every microphone sensitivity choice, in ascending raw-value (menu) order.
+    pub const ALL: [Self; Self::COUNT as usize] = [Self::High, Self::Medium, Self::Low];
+}
+
+impl std::fmt::Display for MicSensitivity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::High => "High",
+            Self::Medium => "Medium",
+            Self::Low => "Low",
+        })
+    }
+}
+
 /// Voice guidance speed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -680,6 +895,26 @@ pub enum VoiceGuideSpeed {
     Speed3 = 2,
     /// Voice guidance speed 4.
     Speed4 = 3,
+}
+
+impl VoiceGuideSpeed {
+    /// Number of voice guidance speeds (raw `0..=3`).
+    pub const COUNT: u8 = 4;
+
+    /// Every voice guidance speed, in ascending raw-value (menu) order.
+    pub const ALL: [Self; Self::COUNT as usize] =
+        [Self::Speed1, Self::Speed2, Self::Speed3, Self::Speed4];
+}
+
+impl std::fmt::Display for VoiceGuideSpeed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Speed1 => "Speed 1",
+            Self::Speed2 => "Speed 2",
+            Self::Speed3 => "Speed 3",
+            Self::Speed4 => "Speed 4",
+        })
+    }
 }
 
 /// Receiver beat-shift type (`radio.BeatShift`, raw 0-7).
@@ -707,6 +942,38 @@ pub enum BeatShift {
     Type7 = 6,
     /// Beat shift type 8.
     Type8 = 7,
+}
+
+impl BeatShift {
+    /// Number of beat-shift types (raw `0..=7`).
+    pub const COUNT: u8 = 8;
+
+    /// Every beat-shift type, in ascending raw-value (menu) order.
+    pub const ALL: [Self; Self::COUNT as usize] = [
+        Self::Type1,
+        Self::Type2,
+        Self::Type3,
+        Self::Type4,
+        Self::Type5,
+        Self::Type6,
+        Self::Type7,
+        Self::Type8,
+    ];
+}
+
+impl std::fmt::Display for BeatShift {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Type1 => "Type1",
+            Self::Type2 => "Type2",
+            Self::Type3 => "Type3",
+            Self::Type4 => "Type4",
+            Self::Type5 => "Type5",
+            Self::Type6 => "Type6",
+            Self::Type7 => "Type7",
+            Self::Type8 => "Type8",
+        })
+    }
 }
 
 /// Transmit time-out timer selection (`radio.TimeOutTimer`).
@@ -741,6 +1008,24 @@ pub enum TransmitTimeout {
 }
 
 impl TransmitTimeout {
+    /// Number of transmit time-out selections (raw `0..=10`).
+    pub const COUNT: u8 = 11;
+
+    /// Every transmit time-out selection, in ascending raw-value (menu) order.
+    pub const ALL: [Self; Self::COUNT as usize] = [
+        Self::Seconds30,
+        Self::Seconds60,
+        Self::Seconds90,
+        Self::Seconds120,
+        Self::Seconds150,
+        Self::Seconds180,
+        Self::Seconds210,
+        Self::Seconds240,
+        Self::Seconds270,
+        Self::Seconds300,
+        Self::Seconds600,
+    ];
+
     /// Returns the selected transmit limit in seconds.
     #[must_use]
     pub const fn as_seconds(self) -> u16 {
@@ -760,6 +1045,25 @@ impl TransmitTimeout {
     }
 }
 
+impl std::fmt::Display for TransmitTimeout {
+    /// Renders the menu label, which the radio states in minutes.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Seconds30 => "0.5 min",
+            Self::Seconds60 => "1.0 min",
+            Self::Seconds90 => "1.5 min",
+            Self::Seconds120 => "2.0 min",
+            Self::Seconds150 => "2.5 min",
+            Self::Seconds180 => "3.0 min",
+            Self::Seconds210 => "3.5 min",
+            Self::Seconds240 => "4.0 min",
+            Self::Seconds270 => "4.5 min",
+            Self::Seconds300 => "5.0 min",
+            Self::Seconds600 => "10.0 min",
+        })
+    }
+}
+
 /// SSB receive high-cut filter selection (`radio.SsbHighCut`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -774,6 +1078,32 @@ pub enum SsbHighCut {
     Khz2_8 = 3,
     /// 3.0 kHz.
     Khz3_0 = 4,
+}
+
+impl SsbHighCut {
+    /// Number of SSB high-cut selections (raw `0..=4`).
+    pub const COUNT: u8 = 5;
+
+    /// Every SSB high-cut selection, in ascending raw-value (menu) order.
+    pub const ALL: [Self; Self::COUNT as usize] = [
+        Self::Khz2_2,
+        Self::Khz2_4,
+        Self::Khz2_6,
+        Self::Khz2_8,
+        Self::Khz3_0,
+    ];
+}
+
+impl std::fmt::Display for SsbHighCut {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Khz2_2 => "2.2 kHz",
+            Self::Khz2_4 => "2.4 kHz",
+            Self::Khz2_6 => "2.6 kHz",
+            Self::Khz2_8 => "2.8 kHz",
+            Self::Khz3_0 => "3.0 kHz",
+        })
+    }
 }
 
 /// CW receive filter width selection (`radio.CwWidth`).
@@ -792,6 +1122,32 @@ pub enum CwFilterWidth {
     Khz2_0 = 4,
 }
 
+impl CwFilterWidth {
+    /// Number of CW filter width selections (raw `0..=4`).
+    pub const COUNT: u8 = 5;
+
+    /// Every CW filter width selection, in ascending raw-value (menu) order.
+    pub const ALL: [Self; Self::COUNT as usize] = [
+        Self::Khz0_3,
+        Self::Khz0_5,
+        Self::Khz1_0,
+        Self::Khz1_5,
+        Self::Khz2_0,
+    ];
+}
+
+impl std::fmt::Display for CwFilterWidth {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Khz0_3 => "0.3 kHz",
+            Self::Khz0_5 => "0.5 kHz",
+            Self::Khz1_0 => "1.0 kHz",
+            Self::Khz1_5 => "1.5 kHz",
+            Self::Khz2_0 => "2.0 kHz",
+        })
+    }
+}
+
 /// AM receive high-cut filter selection (`radio.AmHighCut`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -804,6 +1160,26 @@ pub enum AmHighCut {
     Khz6_0 = 2,
     /// 7.5 kHz.
     Khz7_5 = 3,
+}
+
+impl AmHighCut {
+    /// Number of AM high-cut selections (raw `0..=3`).
+    pub const COUNT: u8 = 4;
+
+    /// Every AM high-cut selection, in ascending raw-value (menu) order.
+    pub const ALL: [Self; Self::COUNT as usize] =
+        [Self::Khz3_0, Self::Khz4_5, Self::Khz6_0, Self::Khz7_5];
+}
+
+impl std::fmt::Display for AmHighCut {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Khz3_0 => "3.0 kHz",
+            Self::Khz4_5 => "4.5 kHz",
+            Self::Khz6_0 => "6.0 kHz",
+            Self::Khz7_5 => "7.5 kHz",
+        })
+    }
 }
 
 /// Scan restart delay from 1 through 10 seconds.
@@ -846,6 +1222,23 @@ pub enum RepeaterCallKey {
     Tone1750Hz = 1,
 }
 
+impl RepeaterCallKey {
+    /// Number of repeater CALL key functions (raw `0..=1`).
+    pub const COUNT: u8 = 2;
+
+    /// Every repeater CALL key function, in ascending raw-value (menu) order.
+    pub const ALL: [Self; Self::COUNT as usize] = [Self::CallChannel, Self::Tone1750Hz];
+}
+
+impl std::fmt::Display for RepeaterCallKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::CallChannel => "CALL",
+            Self::Tone1750Hz => "1,750 [Hz]",
+        })
+    }
+}
+
 /// DTMF tone duration selection (`radio.DtmfSpeed`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -859,6 +1252,12 @@ pub enum DtmfToneDuration {
 }
 
 impl DtmfToneDuration {
+    /// Number of DTMF tone duration selections (raw `0..=2`).
+    pub const COUNT: u8 = 3;
+
+    /// Every DTMF tone duration selection, in ascending raw-value (menu) order.
+    pub const ALL: [Self; Self::COUNT as usize] = [Self::Ms50, Self::Ms100, Self::Ms150];
+
     /// Returns the duration of each DTMF tone in milliseconds.
     #[must_use]
     pub const fn as_milliseconds(self) -> u16 {
@@ -867,6 +1266,16 @@ impl DtmfToneDuration {
             Self::Ms100 => 100,
             Self::Ms150 => 150,
         }
+    }
+}
+
+impl std::fmt::Display for DtmfToneDuration {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Ms50 => "50 ms",
+            Self::Ms100 => "100 ms",
+            Self::Ms150 => "150 ms",
+        })
     }
 }
 
@@ -983,6 +1392,26 @@ pub enum VoiceAnnounceMode {
     Auto2 = 3,
 }
 
+impl VoiceAnnounceMode {
+    /// Number of voice announcement modes (raw `0..=3`).
+    pub const COUNT: u8 = 4;
+
+    /// Every voice announcement mode, in ascending raw-value (menu) order.
+    pub const ALL: [Self; Self::COUNT as usize] =
+        [Self::Off, Self::Manual, Self::Auto1, Self::Auto2];
+}
+
+impl std::fmt::Display for VoiceAnnounceMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Off => "Off",
+            Self::Manual => "Manual",
+            Self::Auto1 => "Auto1",
+            Self::Auto2 => "Auto2",
+        })
+    }
+}
+
 /// Battery saver interval (`radio.BatterySaver`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -1009,6 +1438,42 @@ pub enum BatterySaverInterval {
     Seconds5 = 9,
 }
 
+impl BatterySaverInterval {
+    /// Number of battery saver selections (raw `0..=9`).
+    pub const COUNT: u8 = 10;
+
+    /// Every battery saver selection, in ascending raw-value (menu) order.
+    pub const ALL: [Self; Self::COUNT as usize] = [
+        Self::Off,
+        Self::Seconds0_2,
+        Self::Seconds0_4,
+        Self::Seconds0_6,
+        Self::Seconds0_8,
+        Self::Seconds1,
+        Self::Seconds2,
+        Self::Seconds3,
+        Self::Seconds4,
+        Self::Seconds5,
+    ];
+}
+
+impl std::fmt::Display for BatterySaverInterval {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Off => "Off",
+            Self::Seconds0_2 => "0.2 s",
+            Self::Seconds0_4 => "0.4 s",
+            Self::Seconds0_6 => "0.6 s",
+            Self::Seconds0_8 => "0.8 s",
+            Self::Seconds1 => "1.0 s",
+            Self::Seconds2 => "2.0 s",
+            Self::Seconds3 => "3.0 s",
+            Self::Seconds4 => "4.0 s",
+            Self::Seconds5 => "5.0 s",
+        })
+    }
+}
+
 /// Host interface selected for GPS or APRS PC output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -1017,6 +1482,23 @@ pub enum PcOutputInterface {
     Usb = 0,
     /// Bluetooth serial interface.
     Bluetooth = 1,
+}
+
+impl PcOutputInterface {
+    /// Number of PC output interface choices (raw `0..=1`).
+    pub const COUNT: u8 = 2;
+
+    /// Every PC output interface choice, in ascending raw-value (menu) order.
+    pub const ALL: [Self; Self::COUNT as usize] = [Self::Usb, Self::Bluetooth];
+}
+
+impl std::fmt::Display for PcOutputInterface {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Usb => "USB",
+            Self::Bluetooth => "Bluetooth",
+        })
+    }
 }
 
 /// One official front-panel PF key function.
@@ -1080,6 +1562,78 @@ pub enum FrontPanelPfFunction {
     Tone1750Hz = 29,
     /// Memory registration.
     MemoryInput = 30,
+}
+
+impl FrontPanelPfFunction {
+    /// Number of official front-panel PF selections in the gapped raw
+    /// domain (`0..=30`).
+    pub const COUNT: u8 = 27;
+
+    /// Every official front-panel PF function, in ascending raw-value
+    /// (menu) order.
+    pub const ALL: [Self; Self::COUNT as usize] = [
+        Self::Recording,
+        Self::VoiceMessage1,
+        Self::VoiceMessage2,
+        Self::VoiceMessage3,
+        Self::VoiceMessage4,
+        Self::VoiceGuidance,
+        Self::BatteryLevel,
+        Self::Vox,
+        Self::GroupName,
+        Self::Balance,
+        Self::Gps,
+        Self::TrackLog,
+        Self::Squelch,
+        Self::Shift,
+        Self::Step,
+        Self::Power,
+        Self::KeyLock,
+        Self::Lockout,
+        Self::MemoryToVfo,
+        Self::ToneSelect,
+        Self::NewMemory,
+        Self::VoiceAlert,
+        Self::LcdBrightness,
+        Self::DtmfChannel0,
+        Self::EcholinkChannel0,
+        Self::Tone1750Hz,
+        Self::MemoryInput,
+    ];
+}
+
+impl std::fmt::Display for FrontPanelPfFunction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Recording => "Recording",
+            Self::VoiceMessage1 => "Voice Message 1",
+            Self::VoiceMessage2 => "Voice Message 2",
+            Self::VoiceMessage3 => "Voice Message 3",
+            Self::VoiceMessage4 => "Voice Message 4",
+            Self::VoiceGuidance => "Voice Guidance",
+            Self::BatteryLevel => "Battery Level",
+            Self::Vox => "VOX",
+            Self::GroupName => "Group Name",
+            Self::Balance => "Balance",
+            Self::Gps => "GPS",
+            Self::TrackLog => "Track LOG",
+            Self::Squelch => "SQL",
+            Self::Shift => "SHIFT",
+            Self::Step => "STEP",
+            Self::Power => "LOW",
+            Self::KeyLock => "Key Lock",
+            Self::Lockout => "Lockout",
+            Self::MemoryToVfo => "M>V",
+            Self::ToneSelect => "T.SEL",
+            Self::NewMemory => "NEW",
+            Self::VoiceAlert => "Voice Alert",
+            Self::LcdBrightness => "LCD Brightness",
+            Self::DtmfChannel0 => "DTMF CH0",
+            Self::EcholinkChannel0 => "ECHOLINK CH0",
+            Self::Tone1750Hz => "1,750 [Hz] Tone",
+            Self::MemoryInput => "M.IN",
+        })
+    }
 }
 
 /// One official microphone PF key function (Menus No. 942-944).
@@ -1192,6 +1746,124 @@ pub enum MicrophonePfFunction {
     Down = 55,
 }
 
+impl MicrophonePfFunction {
+    /// Number of official microphone PF selections in the gapped raw
+    /// domain (`0..=55`).
+    pub const COUNT: u8 = 50;
+
+    /// Every official microphone PF function, in ascending raw-value
+    /// (menu) order.
+    pub const ALL: [Self; Self::COUNT as usize] = [
+        Self::Recording,
+        Self::VoiceMessage1,
+        Self::VoiceMessage2,
+        Self::VoiceMessage3,
+        Self::VoiceMessage4,
+        Self::VoiceGuidance,
+        Self::BatteryLevel,
+        Self::Vox,
+        Self::GroupName,
+        Self::Balance,
+        Self::Gps,
+        Self::TrackLog,
+        Self::Squelch,
+        Self::Shift,
+        Self::Step,
+        Self::Power,
+        Self::KeyLock,
+        Self::Lockout,
+        Self::MemoryToVfo,
+        Self::ToneSelect,
+        Self::NewMemory,
+        Self::VoiceAlert,
+        Self::LcdBrightness,
+        Self::DtmfChannel0,
+        Self::EcholinkChannel0,
+        Self::Tone1750Hz,
+        Self::ScreenCapture,
+        Self::Mode,
+        Self::Menu,
+        Self::BandSelect,
+        Self::Vfo,
+        Self::MemoryRecall,
+        Self::Call,
+        Self::Message,
+        Self::List,
+        Self::Beacon,
+        Self::Reverse,
+        Self::Tone,
+        Self::Megahertz,
+        Self::Mark,
+        Self::Dual,
+        Self::Aprs,
+        Self::Object,
+        Self::Attenuator,
+        Self::Fine,
+        Self::Position,
+        Self::Band,
+        Self::Monitor,
+        Self::Up,
+        Self::Down,
+    ];
+}
+
+impl std::fmt::Display for MicrophonePfFunction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Recording => "Recording",
+            Self::VoiceMessage1 => "Voice Message 1",
+            Self::VoiceMessage2 => "Voice Message 2",
+            Self::VoiceMessage3 => "Voice Message 3",
+            Self::VoiceMessage4 => "Voice Message 4",
+            Self::VoiceGuidance => "Voice Guidance",
+            Self::BatteryLevel => "Battery Level",
+            Self::Vox => "VOX",
+            Self::GroupName => "Group Name",
+            Self::Balance => "Balance",
+            Self::Gps => "GPS",
+            Self::TrackLog => "Track LOG",
+            Self::Squelch => "SQL",
+            Self::Shift => "SHIFT",
+            Self::Step => "STEP",
+            Self::Power => "LOW",
+            Self::KeyLock => "Key Lock",
+            Self::Lockout => "Lockout",
+            Self::MemoryToVfo => "M>V",
+            Self::ToneSelect => "T.SEL",
+            Self::NewMemory => "NEW",
+            Self::VoiceAlert => "Voice Alert",
+            Self::LcdBrightness => "LCD Brightness",
+            Self::DtmfChannel0 => "DTMF CH0",
+            Self::EcholinkChannel0 => "ECHOLINK CH0",
+            Self::Tone1750Hz => "1,750 [Hz] Tone",
+            Self::ScreenCapture => "Screen Capture",
+            Self::Mode => "MODE",
+            Self::Menu => "MENU",
+            Self::BandSelect => "A/B",
+            Self::Vfo => "VFO",
+            Self::MemoryRecall => "MR",
+            Self::Call => "CALL",
+            Self::Message => "MSG",
+            Self::List => "LIST",
+            Self::Beacon => "BCON",
+            Self::Reverse => "REV",
+            Self::Tone => "TONE",
+            Self::Megahertz => "MHz",
+            Self::Mark => "MARK",
+            Self::Dual => "DUAL",
+            Self::Aprs => "APRS",
+            Self::Object => "OBJ",
+            Self::Attenuator => "ATT",
+            Self::Fine => "FINE",
+            Self::Position => "POS",
+            Self::Band => "BAND",
+            Self::Monitor => "MONI",
+            Self::Up => "UP",
+            Self::Down => "DOWN",
+        })
+    }
+}
+
 /// Automatic cursor-shift delay for text entry (Menu No. 945).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -1204,6 +1876,26 @@ pub enum CursorShift {
     Seconds1_5 = 2,
     /// Shift after 2.0 seconds.
     Seconds2 = 3,
+}
+
+impl CursorShift {
+    /// Number of cursor-shift selections (raw `0..=3`).
+    pub const COUNT: u8 = 4;
+
+    /// Every cursor-shift selection, in ascending raw-value (menu) order.
+    pub const ALL: [Self; Self::COUNT as usize] =
+        [Self::Off, Self::Seconds1, Self::Seconds1_5, Self::Seconds2];
+}
+
+impl std::fmt::Display for CursorShift {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Off => "Off",
+            Self::Seconds1 => "1.0 s",
+            Self::Seconds1_5 => "1.5 s",
+            Self::Seconds2 => "2.0 s",
+        })
+    }
 }
 
 /// Exact stored time-zone selector used by Menu No. 951.
@@ -1231,6 +1923,23 @@ pub enum UsbFunction {
     ComAndAudioOutput = 0,
     /// USB mass-storage access to the memory card.
     MassStorage = 1,
+}
+
+impl UsbFunction {
+    /// Number of USB device functions (raw `0..=1`).
+    pub const COUNT: u8 = 2;
+
+    /// Every USB device function, in ascending raw-value (menu) order.
+    pub const ALL: [Self; Self::COUNT as usize] = [Self::ComAndAudioOutput, Self::MassStorage];
+}
+
+impl std::fmt::Display for UsbFunction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::ComAndAudioOutput => "COM + AF/IF Output",
+            Self::MassStorage => "Mass Storage",
+        })
+    }
 }
 
 /// A stored PF assignment byte that is not an official menu selection.
@@ -1391,6 +2100,26 @@ pub enum AutoPowerOff {
     Min60 = 3,
 }
 
+impl AutoPowerOff {
+    /// Number of auto power off selections (raw `0..=3`).
+    pub const COUNT: u8 = 4;
+
+    /// Every auto power off selection, in ascending raw-value (menu) order.
+    pub const ALL: [Self; Self::COUNT as usize] =
+        [Self::Off, Self::Min15, Self::Min30, Self::Min60];
+}
+
+impl std::fmt::Display for AutoPowerOff {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Off => "Off",
+            Self::Min15 => "15 min",
+            Self::Min30 => "30 min",
+            Self::Min60 => "60 min",
+        })
+    }
+}
+
 /// Independent lock-type checkboxes (Menu No. 960).
 ///
 /// MCP stores these as two independent bits. All four combinations are valid,
@@ -1437,6 +2166,26 @@ pub enum SpeedDistanceUnit {
     Knots = 2,
 }
 
+impl SpeedDistanceUnit {
+    /// Number of speed and distance unit choices (raw `0..=2`).
+    pub const COUNT: u8 = 3;
+
+    /// Every speed and distance unit choice, in ascending raw-value (menu)
+    /// order.
+    pub const ALL: [Self; Self::COUNT as usize] =
+        [Self::MilesPerHour, Self::KilometersPerHour, Self::Knots];
+}
+
+impl std::fmt::Display for SpeedDistanceUnit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::MilesPerHour => "mi/h , mile",
+            Self::KilometersPerHour => "km/h , km",
+            Self::Knots => "knots , nm",
+        })
+    }
+}
+
 /// Altitude and rainfall measurement units.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -1445,6 +2194,24 @@ pub enum AltitudeRainUnit {
     FeetInch = 0,
     /// Meters / millimeters.
     MetersMm = 1,
+}
+
+impl AltitudeRainUnit {
+    /// Number of altitude and rainfall unit choices (raw `0..=1`).
+    pub const COUNT: u8 = 2;
+
+    /// Every altitude and rainfall unit choice, in ascending raw-value (menu)
+    /// order.
+    pub const ALL: [Self; Self::COUNT as usize] = [Self::FeetInch, Self::MetersMm];
+}
+
+impl std::fmt::Display for AltitudeRainUnit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::FeetInch => "feet , inch",
+            Self::MetersMm => "m , mm",
+        })
+    }
 }
 
 /// Temperature measurement units.
@@ -1457,6 +2224,24 @@ pub enum TemperatureUnit {
     Celsius = 1,
 }
 
+impl TemperatureUnit {
+    /// Number of temperature unit choices (raw `0..=1`).
+    pub const COUNT: u8 = 2;
+
+    /// Every temperature unit choice, in ascending raw-value (menu) order.
+    pub const ALL: [Self; Self::COUNT as usize] = [Self::Fahrenheit, Self::Celsius];
+}
+
+impl std::fmt::Display for TemperatureUnit {
+    /// Renders the exact menu label, which spells out "degree".
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Fahrenheit => "degree F",
+            Self::Celsius => "degree C",
+        })
+    }
+}
+
 /// Language selection (Menu No. 990).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -1465,6 +2250,23 @@ pub enum Language {
     English = 0,
     /// Japanese.
     Japanese = 1,
+}
+
+impl Language {
+    /// Number of language choices (raw `0..=1`).
+    pub const COUNT: u8 = 2;
+
+    /// Every language choice, in ascending raw-value (menu) order.
+    pub const ALL: [Self; Self::COUNT as usize] = [Self::English, Self::Japanese];
+}
+
+impl std::fmt::Display for Language {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::English => "English",
+            Self::Japanese => "Japanese",
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2422,5 +3224,160 @@ mod tests {
         };
         assert_eq!(units.coordinates, CoordinateFormat::Dmm);
         assert_eq!(units.grid_square, GridSquareFormat::Maidenhead);
+    }
+
+    // -----------------------------------------------------------------------
+    // ALL/COUNT/Display affordances for closed settings domains
+    // -----------------------------------------------------------------------
+
+    fn assert_closed_settings_domain<T>(
+        all: &[T],
+        count: u8,
+    ) -> Result<(), Box<dyn std::error::Error>>
+    where
+        T: Copy + PartialEq + std::fmt::Debug + TryFrom<u8, Error = ValidationError> + Into<u8>,
+    {
+        assert_eq!(all.len(), usize::from(count), "ALL length must equal COUNT");
+        for (previous, current) in all.iter().zip(all.iter().skip(1)) {
+            let previous_raw: u8 = (*previous).into();
+            let current_raw: u8 = (*current).into();
+            assert!(
+                previous_raw < current_raw,
+                "ALL must ascend by raw value: {previous:?} then {current:?}"
+            );
+        }
+        for &variant in all {
+            let raw: u8 = variant.into();
+            let decoded = T::try_from(raw)?;
+            assert_eq!(decoded, variant, "raw {raw} must decode back to ALL entry");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn all_constants_cover_each_closed_settings_domain_in_raw_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_closed_settings_domain(&BacklightControl::ALL, BacklightControl::COUNT)?;
+        assert_closed_settings_domain(&LcdBrightness::ALL, LcdBrightness::COUNT)?;
+        assert_closed_settings_domain(&SingleBandDisplay::ALL, SingleBandDisplay::COUNT)?;
+        assert_closed_settings_domain(&MeterType::ALL, MeterType::COUNT)?;
+        assert_closed_settings_domain(&BackgroundColor::ALL, BackgroundColor::COUNT)?;
+        assert_closed_settings_domain(&InformationBacklight::ALL, InformationBacklight::COUNT)?;
+        assert_closed_settings_domain(&AudioBalance::ALL, AudioBalance::COUNT)?;
+        assert_closed_settings_domain(&CallsignReadout::ALL, CallsignReadout::COUNT)?;
+        assert_closed_settings_domain(&UsbAudioOutputLevel::ALL, UsbAudioOutputLevel::COUNT)?;
+        assert_closed_settings_domain(&MicSensitivity::ALL, MicSensitivity::COUNT)?;
+        assert_closed_settings_domain(&VoiceGuideSpeed::ALL, VoiceGuideSpeed::COUNT)?;
+        assert_closed_settings_domain(&BeatShift::ALL, BeatShift::COUNT)?;
+        assert_closed_settings_domain(&TransmitTimeout::ALL, TransmitTimeout::COUNT)?;
+        assert_closed_settings_domain(&SsbHighCut::ALL, SsbHighCut::COUNT)?;
+        assert_closed_settings_domain(&CwFilterWidth::ALL, CwFilterWidth::COUNT)?;
+        assert_closed_settings_domain(&AmHighCut::ALL, AmHighCut::COUNT)?;
+        assert_closed_settings_domain(&RepeaterCallKey::ALL, RepeaterCallKey::COUNT)?;
+        assert_closed_settings_domain(&DtmfToneDuration::ALL, DtmfToneDuration::COUNT)?;
+        assert_closed_settings_domain(&VoiceAnnounceMode::ALL, VoiceAnnounceMode::COUNT)?;
+        assert_closed_settings_domain(&BatterySaverInterval::ALL, BatterySaverInterval::COUNT)?;
+        assert_closed_settings_domain(&PcOutputInterface::ALL, PcOutputInterface::COUNT)?;
+        assert_closed_settings_domain(&FrontPanelPfFunction::ALL, FrontPanelPfFunction::COUNT)?;
+        assert_closed_settings_domain(&MicrophonePfFunction::ALL, MicrophonePfFunction::COUNT)?;
+        assert_closed_settings_domain(&CursorShift::ALL, CursorShift::COUNT)?;
+        assert_closed_settings_domain(&UsbFunction::ALL, UsbFunction::COUNT)?;
+        assert_closed_settings_domain(&AutoPowerOff::ALL, AutoPowerOff::COUNT)?;
+        assert_closed_settings_domain(&SpeedDistanceUnit::ALL, SpeedDistanceUnit::COUNT)?;
+        assert_closed_settings_domain(&AltitudeRainUnit::ALL, AltitudeRainUnit::COUNT)?;
+        assert_closed_settings_domain(&TemperatureUnit::ALL, TemperatureUnit::COUNT)?;
+        assert_closed_settings_domain(&Language::ALL, Language::COUNT)?;
+        Ok(())
+    }
+
+    #[test]
+    fn display_labels_render_display_and_audio_menu_text() {
+        assert_eq!(BacklightControl::Manual.to_string(), "Manual");
+        assert_eq!(BacklightControl::AutoDcIn.to_string(), "Auto (DC-IN)");
+        assert_eq!(LcdBrightness::Low.to_string(), "Low");
+        assert_eq!(LcdBrightness::High.to_string(), "High");
+        assert_eq!(SingleBandDisplay::GpsAltitude.to_string(), "GPS (Altitude)");
+        assert_eq!(
+            SingleBandDisplay::DemodulationMode.to_string(),
+            "Demodulation Mode"
+        );
+        assert_eq!(MeterType::Type1.to_string(), "Type1");
+        assert_eq!(MeterType::Type3.to_string(), "Type3");
+        assert_eq!(BackgroundColor::Black.to_string(), "Black");
+        assert_eq!(BackgroundColor::White.to_string(), "White");
+        assert_eq!(InformationBacklight::Lcd.to_string(), "LCD");
+        assert_eq!(InformationBacklight::LcdAndKeys.to_string(), "LCD + Key");
+        assert_eq!(AudioBalance::A100B0.to_string(), "A:100/B:0");
+        assert_eq!(
+            AudioBalance::OperationBandOnly.to_string(),
+            "Operation Band Only"
+        );
+        assert_eq!(CallsignReadout::Standard.to_string(), "Standard");
+        assert_eq!(
+            CallsignReadout::SuffixPhonetics.to_string(),
+            "Phonetics (Suffix)"
+        );
+        assert_eq!(UsbAudioOutputLevel::Level1.to_string(), "Level 1");
+        assert_eq!(UsbAudioOutputLevel::Level7.to_string(), "Level 7");
+        assert_eq!(VoiceAnnounceMode::Off.to_string(), "Off");
+        assert_eq!(VoiceAnnounceMode::Auto2.to_string(), "Auto2");
+        assert_eq!(VoiceGuideSpeed::Speed1.to_string(), "Speed 1");
+        assert_eq!(VoiceGuideSpeed::Speed4.to_string(), "Speed 4");
+    }
+
+    #[test]
+    fn display_labels_render_txrx_and_system_menu_text() {
+        assert_eq!(MicSensitivity::High.to_string(), "High");
+        assert_eq!(MicSensitivity::Low.to_string(), "Low");
+        assert_eq!(BeatShift::Type1.to_string(), "Type1");
+        assert_eq!(BeatShift::Type8.to_string(), "Type8");
+        assert_eq!(TransmitTimeout::Seconds30.to_string(), "0.5 min");
+        assert_eq!(TransmitTimeout::Seconds600.to_string(), "10.0 min");
+        assert_eq!(SsbHighCut::Khz2_2.to_string(), "2.2 kHz");
+        assert_eq!(SsbHighCut::Khz3_0.to_string(), "3.0 kHz");
+        assert_eq!(CwFilterWidth::Khz0_3.to_string(), "0.3 kHz");
+        assert_eq!(CwFilterWidth::Khz2_0.to_string(), "2.0 kHz");
+        assert_eq!(AmHighCut::Khz3_0.to_string(), "3.0 kHz");
+        assert_eq!(AmHighCut::Khz7_5.to_string(), "7.5 kHz");
+        assert_eq!(RepeaterCallKey::CallChannel.to_string(), "CALL");
+        assert_eq!(RepeaterCallKey::Tone1750Hz.to_string(), "1,750 [Hz]");
+        assert_eq!(DtmfToneDuration::Ms50.to_string(), "50 ms");
+        assert_eq!(DtmfToneDuration::Ms150.to_string(), "150 ms");
+        assert_eq!(BatterySaverInterval::Off.to_string(), "Off");
+        assert_eq!(BatterySaverInterval::Seconds0_2.to_string(), "0.2 s");
+        assert_eq!(BatterySaverInterval::Seconds5.to_string(), "5.0 s");
+        assert_eq!(AutoPowerOff::Off.to_string(), "Off");
+        assert_eq!(AutoPowerOff::Min60.to_string(), "60 min");
+        assert_eq!(CursorShift::Off.to_string(), "Off");
+        assert_eq!(CursorShift::Seconds1_5.to_string(), "1.5 s");
+        assert_eq!(SpeedDistanceUnit::MilesPerHour.to_string(), "mi/h , mile");
+        assert_eq!(SpeedDistanceUnit::Knots.to_string(), "knots , nm");
+        assert_eq!(AltitudeRainUnit::FeetInch.to_string(), "feet , inch");
+        assert_eq!(AltitudeRainUnit::MetersMm.to_string(), "m , mm");
+        assert_eq!(TemperatureUnit::Fahrenheit.to_string(), "degree F");
+        assert_eq!(TemperatureUnit::Celsius.to_string(), "degree C");
+        assert_eq!(Language::English.to_string(), "English");
+        assert_eq!(Language::Japanese.to_string(), "Japanese");
+    }
+
+    #[test]
+    fn display_labels_render_pf_key_and_interface_menu_text() {
+        assert_eq!(FrontPanelPfFunction::Squelch.to_string(), "SQL");
+        assert_eq!(FrontPanelPfFunction::Power.to_string(), "LOW");
+        assert_eq!(
+            FrontPanelPfFunction::Tone1750Hz.to_string(),
+            "1,750 [Hz] Tone"
+        );
+        assert_eq!(FrontPanelPfFunction::MemoryInput.to_string(), "M.IN");
+        assert_eq!(MicrophonePfFunction::BandSelect.to_string(), "A/B");
+        assert_eq!(MicrophonePfFunction::Megahertz.to_string(), "MHz");
+        assert_eq!(MicrophonePfFunction::Down.to_string(), "DOWN");
+        assert_eq!(PcOutputInterface::Usb.to_string(), "USB");
+        assert_eq!(PcOutputInterface::Bluetooth.to_string(), "Bluetooth");
+        assert_eq!(
+            UsbFunction::ComAndAudioOutput.to_string(),
+            "COM + AF/IF Output"
+        );
+        assert_eq!(UsbFunction::MassStorage.to_string(), "Mass Storage");
     }
 }

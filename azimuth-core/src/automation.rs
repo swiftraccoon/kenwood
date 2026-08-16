@@ -7,16 +7,16 @@ use std::time::Duration;
 use ax25_codec::build_ax25;
 use kenwood_thd75::error::Error as RadioError;
 use kenwood_thd75::memory::{
-    DecodedFieldValue, MCP_D75_MENU_FIELDS, MenuField, PatchSet,
-    is_supported_mcp_d75_schema_target, menu_field,
+    DecodedFieldValue, MCP_D75_MENU_FIELDS, MenuField, PatchSet, menu_field,
 };
-use kenwood_thd75::protocol::programming::{PAGE_SIZE, TOTAL_SIZE};
+use kenwood_thd75::protocol::programming::PAGE_SIZE;
 use kenwood_thd75::radio::Radio;
 use kenwood_thd75::radio::automation::{
     AutomationAbi, AutomationSession, AutomationSnapshot, FrontPanelKey as RadioFrontPanelKey,
     GuardedKeyError, GuardedKeyOutcome,
 };
 use kenwood_thd75::radio::kiss_session::KissSession;
+use kenwood_thd75::radio::menu::MenuFieldSnapshot;
 use kenwood_thd75::radio::programming::{
     McpPage, McpPageExchange, McpPageExchangeError, McpPageExchangeOperationError, WritableMcpPage,
 };
@@ -31,12 +31,10 @@ use crate::aprs::{
     AprsActivityRecord, AprsActivityStore, AprsOperationalSnapshot, AprsSessionConfig,
     AprsSessionStatus,
 };
-use crate::catalog::{
-    SettingChange, SettingValue, build_patch_plan, encoded_len, validate_changes,
-};
+use crate::catalog::{SettingChange, SettingValue, build_patch_plan, validate_changes};
 use crate::if_dsp_radio::{
-    IF_CENTER_HZ, SavedIfDspRadioState, configure_if_dsp_radio, restore_if_dsp_radio,
-    retune_if_dsp_radio, save_if_dsp_radio_state,
+    EngageIfDspError, IF_CENTER_HZ, SavedIfDspRadioState, engage_if_dsp_radio,
+    restore_if_dsp_radio, retune_if_dsp_radio,
 };
 use crate::transport::{ByteTransport, SwiftByteTransport};
 
@@ -1202,7 +1200,9 @@ async fn run_controller(
                     let detail = format!("could not apply KISS parameters: {error}");
                     match kiss.exit().await {
                         Ok(returned_radio) => {
-                            radio = returned_radio;
+                            // The deferred-restore flag below owns the
+                            // CAT re-proof on the next loop turn.
+                            radio = returned_radio.into_radio_unproven();
                             restore_cat_after_kiss_return = true;
                             deferred_reply = Some(DeferredReply::FailedAprsStart { reply, detail });
                             continue;
@@ -1233,7 +1233,8 @@ async fn run_controller(
                         lock_aprs_store(&aprs).mark_restoring();
                         match kiss.exit().await {
                             Ok(returned_radio) => {
-                                radio = returned_radio;
+                                // Deferred restore re-proves CAT next turn.
+                                radio = returned_radio.into_radio_unproven();
                                 restore_cat_after_kiss_return = true;
                                 deferred_reply = Some(DeferredReply::StopAprs { reply });
                             }
@@ -1249,11 +1250,14 @@ async fn run_controller(
                         lock_aprs_store(&aprs).mark_restoring();
                         let result = match kiss.exit().await {
                             Ok(returned_radio) => {
-                                returned_radio.disconnect().await.map_err(|error| {
-                                    AutomationError::Shutdown {
+                                // Shutting down: disconnect, no re-proof.
+                                returned_radio
+                                    .into_radio_unproven()
+                                    .disconnect()
+                                    .await
+                                    .map_err(|error| AutomationError::Shutdown {
                                         detail: error.to_string(),
-                                    }
-                                })
+                                    })
                             }
                             Err((_kiss, error)) => Err(AutomationError::Shutdown {
                                 detail: format!("KISS Return failed during shutdown: {error}"),
@@ -1275,57 +1279,44 @@ async fn run_controller(
                     continue;
                 }
                 settings_snapshot = None;
-                match save_if_dsp_radio_state(&mut radio).await {
-                    Ok(saved) => match configure_if_dsp_radio(&mut radio).await {
-                        Ok(()) => {
-                            let active = ActiveIfDspSession {
-                                saved,
-                                current_frequency_hz: saved.band_b_frequency_hz(),
-                                output_verified: true,
-                            };
-                            if_dsp_session = Some(active);
-                            deferred_reply = Some(DeferredReply::IfDsp {
-                                operation: "IF-DSP prepare",
-                                rollback_if_undelivered: true,
-                                reply,
-                                result: Ok(active.status()),
-                            });
-                        }
-                        Err(setup_detail) => {
-                            let report = restore_if_dsp_radio(&mut radio, saved).await;
-                            let result = if report.is_exact() {
-                                Err(AutomationError::IfDspOperation {
-                                    detail: format!(
-                                        "{setup_detail}; the complete pre-session state was restored"
-                                    ),
-                                })
-                            } else {
-                                if_dsp_session = Some(ActiveIfDspSession {
-                                    saved,
-                                    current_frequency_hz: saved.band_b_frequency_hz(),
-                                    output_verified: false,
-                                });
-                                Err(AutomationError::IfDspRestoration {
-                                    detail: format!(
-                                        "setup failed ({setup_detail}); {}",
-                                        report.summary()
-                                    ),
-                                })
-                            };
-                            deferred_reply = Some(DeferredReply::IfDsp {
-                                operation: "failed IF-DSP prepare cleanup",
-                                rollback_if_undelivered: true,
-                                reply,
-                                result,
-                            });
-                        }
-                    },
-                    Err(detail) => {
+                // The library session performs the snapshot, configuration,
+                // engagement proof, and failure rollback atomically; only
+                // the incomplete-rollback case leaves a dirty session for a
+                // later restore retry.
+                match engage_if_dsp_radio(&mut radio).await {
+                    Ok(saved) => {
+                        let active = ActiveIfDspSession {
+                            saved,
+                            current_frequency_hz: saved.band_b_frequency_hz(),
+                            output_verified: true,
+                        };
+                        if_dsp_session = Some(active);
                         deferred_reply = Some(DeferredReply::IfDsp {
-                            operation: "IF-DSP state snapshot",
+                            operation: "IF-DSP prepare",
+                            rollback_if_undelivered: true,
+                            reply,
+                            result: Ok(active.status()),
+                        });
+                    }
+                    Err(EngageIfDspError::Clean(detail)) => {
+                        deferred_reply = Some(DeferredReply::IfDsp {
+                            operation: "IF-DSP prepare",
                             rollback_if_undelivered: true,
                             reply,
                             result: Err(AutomationError::IfDspOperation { detail }),
+                        });
+                    }
+                    Err(EngageIfDspError::Dirty { detail, saved }) => {
+                        if_dsp_session = Some(ActiveIfDspSession {
+                            saved,
+                            current_frequency_hz: saved.band_b_frequency_hz(),
+                            output_verified: false,
+                        });
+                        deferred_reply = Some(DeferredReply::IfDsp {
+                            operation: "failed IF-DSP prepare cleanup",
+                            rollback_if_undelivered: true,
+                            reply,
+                            result: Err(AutomationError::IfDspRestoration { detail }),
                         });
                     }
                 }
@@ -1860,13 +1851,6 @@ async fn read_settings(
     ensure_settings_target(radio, false).await?;
     let fields = select_fields(requested_ids)?;
     let pages = pages_for_fields(&fields)?;
-    let pages: Vec<McpPage> = pages
-        .into_iter()
-        .map(McpPage::new)
-        .collect::<Result<_, _>>()
-        .map_err(|error| AutomationError::SettingsRead {
-            detail: error.to_string(),
-        })?;
     let live_pages = radio
         .read_sparse_memory_pages(&pages)
         .await
@@ -2030,22 +2014,10 @@ async fn ensure_settings_target(
     radio: &mut Radio<SwiftByteTransport>,
     applying: bool,
 ) -> Result<(), AutomationError> {
-    let identity = radio.identify().await.map_err(|error| {
-        settings_operation_error(applying, format!("radio identity failed: {error}"))
-    })?;
-    let firmware = radio.get_firmware_version().await.map_err(|error| {
-        settings_operation_error(applying, format!("firmware identity failed: {error}"))
-    })?;
-    if !is_supported_mcp_d75_schema_target(identity.model, &firmware) {
-        return Err(settings_operation_error(
-            applying,
-            format!(
-                "schema requires exact TH-D75 firmware 1.03; connected model {} firmware {}",
-                identity.model, firmware
-            ),
-        ));
-    }
-    Ok(())
+    radio
+        .verify_mcp_schema_target()
+        .await
+        .map_err(|error| settings_operation_error(applying, error.to_string()))
 }
 
 fn settings_operation_error(applying: bool, detail: String) -> AutomationError {
@@ -2087,64 +2059,48 @@ fn select_fields(
     Ok(fields)
 }
 
-fn pages_for_fields(fields: &[&MenuField]) -> Result<Vec<u16>, AutomationError> {
+fn pages_for_fields(fields: &[&MenuField]) -> Result<Vec<McpPage>, AutomationError> {
     let mut pages = BTreeSet::new();
     for field in fields {
-        let length = encoded_len(field.descriptor.codec);
-        let end = field.descriptor.offset.checked_add(length).ok_or_else(|| {
-            AutomationError::SettingsRead {
-                detail: format!("setting {} offset overflow", field.descriptor.name),
-            }
-        })?;
-        if end > TOTAL_SIZE || length == 0 {
-            return Err(AutomationError::SettingsRead {
-                detail: format!(
-                    "setting {} lies outside the MCP image",
-                    field.descriptor.name
-                ),
-            });
-        }
-        let first = field.descriptor.offset / PAGE_SIZE;
-        let last = end.saturating_sub(1) / PAGE_SIZE;
-        for page in first..=last {
-            let page = u16::try_from(page).map_err(|error| AutomationError::SettingsRead {
-                detail: error.to_string(),
-            })?;
-            let _new = pages.insert(page);
-        }
+        pages.extend(
+            field
+                .descriptor
+                .pages()
+                .map_err(|error| AutomationError::SettingsRead {
+                    detail: error.to_string(),
+                })?,
+        );
     }
     Ok(pages.into_iter().collect())
-}
-
-fn image_from_pages(pages: &BTreeMap<u16, [u8; PAGE_SIZE]>) -> Result<Vec<u8>, AutomationError> {
-    let mut image = vec![0_u8; TOTAL_SIZE];
-    for (&page, bytes) in pages {
-        let start = usize::from(page).saturating_mul(PAGE_SIZE);
-        let end = start.saturating_add(PAGE_SIZE);
-        let destination =
-            image
-                .get_mut(start..end)
-                .ok_or_else(|| AutomationError::SettingsRead {
-                    detail: format!("MCP page 0x{page:04X} lies outside the image"),
-                })?;
-        destination.copy_from_slice(bytes);
-    }
-    Ok(image)
 }
 
 fn decode_values(
     field_ids: &[String],
     pages: &BTreeMap<u16, [u8; PAGE_SIZE]>,
 ) -> Result<Vec<SettingValueRecord>, AutomationError> {
-    let image = image_from_pages(pages)?;
+    let snapshot_pages = pages
+        .iter()
+        .map(|(&page, data)| {
+            McpPage::new(page)
+                .map(|page| (page, *data))
+                .map_err(|error| AutomationError::SettingsRead {
+                    detail: error.to_string(),
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let snapshot = MenuFieldSnapshot::from_pages(snapshot_pages).map_err(|error| {
+        AutomationError::SettingsRead {
+            detail: error.to_string(),
+        }
+    })?;
     field_ids
         .iter()
         .map(|identifier| {
             let field = menu_field(identifier).ok_or_else(|| AutomationError::SettingsRead {
                 detail: format!("unknown cached setting identifier {identifier}"),
             })?;
-            let value = field
-                .read(&image)
+            let value = snapshot
+                .value(field)
                 .map_err(|error| AutomationError::SettingsRead {
                     detail: error.to_string(),
                 })?;
@@ -2317,7 +2273,13 @@ mod tests {
             .enter_kiss(PacketDataRate::Bps1200)
             .await
             .map_err(|(_, error)| error)?;
-        let mut radio = kiss.exit().await.map_err(|(_, error)| error)?;
+        // Take the unproven hatch deliberately: the point of this test
+        // is that the radio itself stays fail-closed until restored.
+        let mut radio = kiss
+            .exit()
+            .await
+            .map_err(|(_, error)| error)?
+            .into_radio_unproven();
 
         let direct_qualification = radio.qualify_automation().await;
         assert!(
@@ -2348,9 +2310,11 @@ mod tests {
             .enter_kiss(PacketDataRate::Bps1200)
             .await
             .map_err(|(_, error)| error)?;
-        let mut radio = kiss.exit().await.map_err(|(_, error)| error)?;
-
-        radio.restore_cat_after_mode_exit().await?;
+        let desynced = kiss.exit().await.map_err(|(_, error)| error)?;
+        let mut radio = match desynced.restore().await {
+            Ok(radio) => radio,
+            Err((_desynced, error)) => return Err(error.into()),
+        };
         assert_eq!(radio.identify().await?.model, RadioModel::ThD75);
         Ok(())
     }

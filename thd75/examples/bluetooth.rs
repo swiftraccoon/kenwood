@@ -5,7 +5,7 @@
 //!
 //! Usage:
 //! ```text
-//! # macOS: optionally pass a paired Bluetooth device name
+//! # macOS: optionally pass an exact paired-device name or address
 //! cargo run -p kenwood-thd75 --example bluetooth
 //! cargo run -p kenwood-thd75 --example bluetooth -- TH-D75
 //!
@@ -49,14 +49,14 @@ const DEFAULT_BT_PORT: Option<&str> = None;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use kenwood_thd75::transport::BluetoothTransport;
 
-    let device_name = std::env::args().nth(1);
+    let device_identifier = std::env::args().nth(1);
     println!(
         "Connecting via native Bluetooth RFCOMM to {}...",
-        device_name.as_deref().unwrap_or("TH-D75")
+        device_identifier.as_deref().unwrap_or("TH-D75")
     );
     println!("(Radio must be paired via Menu 934 first.)\n");
 
-    let transport = BluetoothTransport::open(device_name.as_deref())?;
+    let transport = BluetoothTransport::open(device_identifier.as_deref())?;
     inspect_radio(transport).await
 }
 
@@ -92,6 +92,10 @@ async fn inspect_radio<T: Transport>(transport: T) -> Result<(), Box<dyn std::er
     let fw = radio.get_firmware_version().await?;
     println!("Firmware: {fw}");
     let firmware_profile = FirmwareProfile::from_identity(&fw);
+
+    let serial_information = radio.get_serial_information().await?;
+    println!("Serial:   {}", serial_information.serial_number());
+    println!("Model code: {}", serial_information.model_code());
 
     let tnc = radio.get_tnc_mode().await?;
     println!("TNC mode: {} ({})", tnc.mode, tnc.data_rate);

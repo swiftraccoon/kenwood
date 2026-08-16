@@ -327,6 +327,26 @@ impl fmt::Display for KissDuplex {
     }
 }
 
+/// KISS TNC device parameters to apply on entering KISS mode.
+///
+/// Each `None` field leaves the radio's own current value (Menu 508
+/// and friends) untouched; only `Some` fields are written, in
+/// declaration order. The default is all `None`: entering KISS mode
+/// changes no device parameters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KissParams {
+    /// TX delay (KISS command `0x01`).
+    pub tx_delay: Option<KissTxDelay>,
+    /// CSMA persistence (KISS command `0x02`).
+    pub persistence: Option<KissPersistence>,
+    /// CSMA slot time (KISS command `0x03`).
+    pub slot_time: Option<KissSlotTime>,
+    /// TX tail (KISS command `0x04`).
+    pub tx_tail: Option<KissTxTail>,
+    /// Duplex mode (KISS command `0x05`).
+    pub duplex: Option<KissDuplex>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

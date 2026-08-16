@@ -19,6 +19,8 @@ mod if_dsp;
 #[forbid(unsafe_code)]
 mod if_dsp_radio;
 #[forbid(unsafe_code)]
+mod terminal_mode;
+#[forbid(unsafe_code)]
 mod transport;
 
 pub use aprs::{
@@ -39,6 +41,10 @@ pub use catalog::{
 };
 pub use if_dsp::{
     IfDspConfiguration, IfDspError, IfDspFrame, IfDspMode, IfDspProcessor, IfDspSpectrum,
+};
+pub use terminal_mode::{
+    DvGatewayRecoveryError, DvGatewayRecoveryOperation, DvGatewayRecoveryOutcome,
+    validate_bluetooth_recovery_helper,
 };
 pub use transport::{ByteTransport, ByteTransportError};
 

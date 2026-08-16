@@ -64,7 +64,7 @@ async fn tune_channel_empty_channel_is_error() -> TestResult {
     let mut radio = Radio::new(mock);
     let result = radio.tune_channel(Band::A, RegularChannel::new(21)?).await;
     assert!(
-        matches!(result, Err(Error::CommandRejected)),
+        matches!(result, Err(Error::EmptyMemoryChannel { .. })),
         "an empty channel must be an error per the documented contract: {result:?}"
     );
     Ok(())

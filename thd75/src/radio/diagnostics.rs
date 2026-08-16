@@ -473,7 +473,9 @@ mod tests {
         );
         radio.mcp_saved_timeout = None;
 
-        radio.mcp_pending_exit_error = Some(crate::Error::CommandRejected);
+        radio.mcp_pending_exit_error = Some(crate::Error::CommandRejected {
+            mnemonic: "0M".to_string(),
+        });
         assert_eq!(
             radio.probe_silent_link().await,
             LinkDiagnosis::ReconnectRequired

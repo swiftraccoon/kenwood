@@ -675,12 +675,16 @@ impl DigitalSquelchCode {
     ///
     /// # Errors
     ///
-    /// Returns [`ValidationError::DigitalSquelchCodeOutOfRange`] if `code > 99`.
+    /// Returns [`ValidationError::SettingOutOfRange`] if `code > 99`.
     pub const fn new(code: u8) -> Result<Self, ValidationError> {
         if code <= 99 {
             Ok(Self(code))
         } else {
-            Err(ValidationError::DigitalSquelchCodeOutOfRange(code))
+            Err(ValidationError::SettingOutOfRange {
+                name: "digital squelch code",
+                value: code,
+                detail: "must be 0-99",
+            })
         }
     }
 

@@ -108,9 +108,10 @@ async fn set_operating_mode_preserves_rejection_after_nonmatching_readback() -> 
     mock.expect(b"MD 0\r", b"MD 0,0\r");
     let mut radio = Radio::new(mock);
 
+    let result = radio.set_operating_mode(Band::A, OperatingMode::Am).await;
     assert!(matches!(
-        radio.set_operating_mode(Band::A, OperatingMode::Am).await,
-        Err(Error::CommandRejected)
+        &result,
+        Err(Error::CommandRejected { mnemonic }) if mnemonic == "MD"
     ));
     Ok(())
 }

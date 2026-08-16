@@ -1,9 +1,10 @@
 //! Accessible SSB/CW/AM demodulator for the TH-D75 IF-over-USB stream.
 //!
 //! Contains the CAT setup, 12 kHz `ADC stream IN` capture, `if-dsp`
-//! demodulation, playback, and accessible prompt pipeline. A connected-radio
-//! session starts only when Band B is already at the requested frequency;
-//! the library intentionally exposes no arbitrary CAT frequency writer.
+//! demodulation, playback, and accessible prompt pipeline. Startup and the
+//! `tune` command land Band B on the requested frequency through the
+//! library's qualified UP/DW stepping retune; off-step or distant targets
+//! are refused with guidance.
 //!
 //! Design notes:
 //! - No `tokio::signal`: Ctrl-C arrives as a rustyline interrupt and
@@ -12,9 +13,11 @@
 //!   channel -> callback; volume and signal level cross threads as
 //!   `AtomicU32` float bits; overruns/underruns are counters plus a
 //!   once-per-session announcement.
-//! - Every radio setting that may be touched is saved first. Exit performs a
-//!   best-effort restore and reports each failed field. Frequency is never
-//!   written, so exit verifies that it still matches the saved value.
+//! - Radio state discipline lives in the library's IF-tap session:
+//!   `enter_if_tap` saves every touched setting (including the tuning step)
+//!   and proves engagement; `restore_if_tap` restores in the
+//!   hardware-required order and reports per-step failures. Frequency is
+//!   deliberately not restored: tuning is user-directed.
 
 // The accessibility-lint dev-dependency is used by the library's unit
 // tests; the bin's test build links dev-deps too.
@@ -28,11 +31,11 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use if_dsp::{Channelizer, ChannelizerConfig, DemodMode};
-use kenwood_thd75::Radio;
 use kenwood_thd75::transport::SerialTransport;
-use kenwood_thd75::types::Band;
+use kenwood_thd75::types::{Frequency, OperatingMode, StepSize, UsbAudioOutput};
+use kenwood_thd75::{IfTapConfig, IfTapRestoreReport, IfTapSavedState, Radio};
+use thd75_listen::output;
 use thd75_listen::parser::{self, Command};
-use thd75_listen::{output, session};
 
 /// Default startup frequency: the 70 cm slot the IF tap was
 /// hardware-verified on.
@@ -179,17 +182,7 @@ fn parse_args() -> Result<CliArgs, String> {
             "--freq" => {
                 let raw = args.next().ok_or("--freq needs megahertz")?;
                 match parser::parse(&format!("tune {raw}")) {
-                    Ok(Command::Tune(mhz)) => {
-                        #[expect(
-                            clippy::cast_possible_truncation,
-                            clippy::cast_sign_loss,
-                            reason = "the parser bounds the value to 0.1-524 MHz, \
-                                      so hertz fits u32 and is positive"
-                        )]
-                        {
-                            freq_hz = (mhz * 1_000_000.0).round() as u32;
-                        }
-                    }
+                    Ok(Command::Tune(freq)) => freq_hz = freq.as_hz(),
                     Ok(_) | Err(_) => return Err(format!("invalid --freq value {raw:?}")),
                 }
             }
@@ -222,9 +215,9 @@ fn run() -> Result<(), String> {
         .build()
         .map_err(|e| format!("runtime: {e}"))?;
 
-    // Serial discovery and open must run inside the runtime context:
-    // the serial stream registers with the tokio reactor and PANICS
-    // (rather than erroring) when none is active.
+    // Serial discovery and open must run inside the runtime context: the
+    // serial stream registers with the tokio reactor. Without this guard
+    // the library refuses with a typed error naming the missing runtime.
     let transport = {
         let _reactor = rt.enter();
         let port = find_serial_port(args.port)?;
@@ -237,9 +230,21 @@ fn run() -> Result<(), String> {
         .block_on(radio.identify())
         .map_err(|e| format!("the radio did not identify over CAT: {e}"))?;
 
-    let saved = rt
-        .block_on(session::save_state(&mut radio))
-        .map_err(|e| format!("saving radio state: {e}"))?;
+    // Engage the IF tap. The library saves every touched setting (band,
+    // band mode, output, squelch, operating mode, and the tuning step),
+    // applies the listening configuration, and proves IF output engaged by
+    // readback; a mid-configure failure rolls the radio back first.
+    let config = IfTapConfig::new(OperatingMode::Usb).with_step(StepSize::Hz5000);
+    let saved: IfTapSavedState = match rt.block_on(radio.enter_if_tap(config)) {
+        Ok(session) => session.into_saved_state(),
+        Err(enter_error) => {
+            print_restore_report(&enter_error.rollback);
+            drop(rt.block_on(radio.disconnect()));
+            return Err(format!(
+                "configuring the radio for listening: {enter_error}"
+            ));
+        }
+    };
 
     // Every path from here restores the radio before returning.
     let result = run_session(&rt, &mut radio, &input_dev, &output_dev, args.freq_hz);
@@ -250,13 +255,11 @@ fn run() -> Result<(), String> {
     };
 
     if recovery_error.is_none() {
-        let report = rt.block_on(session::restore(&mut radio, saved));
-        if report.failed.is_empty() {
+        let report = rt.block_on(radio.restore_if_tap(saved));
+        if report.is_complete() {
             println!("{}", output::goodbye());
         } else {
-            for item in report.failed {
-                println!("{}", output::restore_warning(item));
-            }
+            print_restore_report(&report);
         }
     } else {
         println!(
@@ -293,16 +296,12 @@ fn run_session(
     output_dev: &cpal::Device,
     freq_hz: u32,
 ) -> Result<(), String> {
-    let initial_frequency = rt
-        .block_on(radio.get_frequency(Band::B))
-        .map_err(|e| format!("reading initial Band-B frequency: {e}"))?;
-    if initial_frequency.as_hz() != freq_hz {
-        return Err(format!(
-            "Band B is at {} Hz, not {freq_hz} Hz; tune the radio directly before starting because arbitrary CAT frequency writes are not qualified",
-            initial_frequency.as_hz()
-        ));
-    }
-    rt.block_on(session::configure_for_listening(radio))?;
+    // Land Band B on the requested frequency. When it already matches this
+    // is a pure verification; otherwise the library steps there with the
+    // qualified UP/DW commands, dropping the IF output during the walk
+    // (frequency writes are rejected while the tap is engaged) and
+    // re-engaging it afterwards with a readback proof.
+    rt.block_on(retune(radio, Frequency::new(freq_hz)))?;
 
     let shared = Arc::new(SharedAudio {
         volume_bits: AtomicU32::new(taper(DEFAULT_VOLUME).to_bits()),
@@ -449,22 +448,13 @@ fn run_session(
             }
         };
         match command {
-            Command::Tune(mhz) => {
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    clippy::cast_sign_loss,
-                    reason = "the parser bounds the value to 0.1-524 MHz, \
-                              so hertz fits u32 and is positive"
-                )]
-                let hz = (mhz * 1_000_000.0).round() as u32;
-                match rt.block_on(retune(radio, hz)) {
-                    Ok(()) => {
-                        current_hz = hz;
-                        println!("{}", output::tuned(hz));
-                    }
-                    Err(e) => println!("{}", output::error(e)),
+            Command::Tune(freq) => match rt.block_on(retune(radio, freq)) {
+                Ok(()) => {
+                    current_hz = freq.as_hz();
+                    println!("{}", output::tuned(freq.as_hz()));
                 }
-            }
+                Err(e) => println!("{}", output::error(e)),
+            },
             Command::Mode(mode) => {
                 current_mode = mode;
                 current_filter = mode.default_filter_hz();
@@ -530,19 +520,27 @@ fn run_session(
     Ok(())
 }
 
-/// Verify that Band B is already on the requested frequency.
-async fn retune(radio: &mut Radio<SerialTransport>, hz: u32) -> Result<(), String> {
-    let current = radio
-        .get_frequency(Band::B)
+/// Land Band B on `target` under the engaged IF tap.
+///
+/// Delegates to the library's qualified UP/DW stepping retune: an equal
+/// frequency verifies without touching the radio; otherwise the walk is
+/// bounded, verified by readback, and the IF output is re-engaged with a
+/// readback proof.
+async fn retune(radio: &mut Radio<SerialTransport>, target: Frequency) -> Result<(), String> {
+    radio
+        .retune_if_tap(target, UsbAudioOutput::IntermediateFrequency)
         .await
-        .map_err(|e| format!("reading Band-B frequency: {e}"))?;
-    if current.as_hz() == hz {
-        Ok(())
-    } else {
-        Err(format!(
-            "Band B is at {} Hz, not {hz} Hz; tune the radio directly because arbitrary CAT frequency writes are not qualified",
-            current.as_hz()
-        ))
+        .map(|_landed| ())
+        .map_err(|e| format!("retuning Band B: {e}"))
+}
+
+/// Speak one warning line per restore step that failed or was skipped.
+fn print_restore_report(report: &IfTapRestoreReport) {
+    for (step, _error) in report.failures() {
+        println!("{}", output::restore_warning(&step.to_string()));
+    }
+    for step in report.not_attempted() {
+        println!("{}", output::restore_warning(&step.to_string()));
     }
 }
 

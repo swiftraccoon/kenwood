@@ -68,15 +68,34 @@
 //! - [`aprs`]: TH-D75-specific APRS glue, namely [`AprsClient`] owning a [`Radio`]
 //!   and [`KissSession`], the stored-settings bridge, and digipeater-path helpers.
 //!   Generic KISS/AX.25/APRS decoding lives in the `kiss-tnc`, `ax25-codec`,
-//!   and `aprs` sibling crates.
+//!   and `aprs` sibling crates. Requires the `aprs` cargo feature (default).
 //! - [`dstar_gateway`]: D-STAR gateway client ([`DstarGateway`]) for Reflector Terminal
 //!   Mode, built on the `mmdvm-core` framing codec and `dstar-gateway-core`
-//!   protocol crates.
+//!   protocol crates. Requires the `dstar` cargo feature (default).
 //! - [`session`]: explicit link recovery, covering the reconnect backoff policy
 //!   and the opt-in wrapper that drives [`Radio::reconnect`](radio::Radio::reconnect).
 //! - [`error`]: error types for transport, protocol, and validation failures.
+//!
+//! # Cargo features
+//!
+//! Both features are on by default; a CAT-only consumer can use
+//! `default-features = false` for the core control surface alone.
+//!
+//! - **`aprs`** enables the APRS client stack: the [`aprs`] module ([`AprsClient`]
+//!   owning the radio, KISS session, and APRS-IS uplink glue), the
+//!   [`KissSession`] binary TNC session, and the `aprs-is`/`kiss-tnc`
+//!   re-exports. CAT-level APRS settings, GPS position types, and TNC mode
+//!   commands are always available; the sans-io `aprs` and `ax25-codec`
+//!   crates back those core types and are unconditional dependencies.
+//! - **`dstar`** enables the D-STAR reflector-gateway stack: the [`dstar_gateway`]
+//!   module ([`DstarGateway`]) and the [`MmdvmSession`] modem session over
+//!   the tokio `mmdvm` crate. The Menu 650 terminal-mode lifecycle, MMDVM
+//!   link diagnosis, and CAT D-STAR settings are always available (they
+//!   need only the sans-io `mmdvm-core`).
 
+#[cfg(feature = "aprs")]
 pub mod aprs;
+#[cfg(feature = "dstar")]
 pub mod dstar_gateway;
 pub mod error;
 pub mod memory;
@@ -97,14 +116,29 @@ pub mod verify;
 use proptest as _;
 #[cfg(test)]
 use serde_json as _;
+// The client-stack crates are unconditional dev-dependencies (for tests and
+// examples); with the corresponding lib feature off, the lib-test unit sees
+// them without using them, so acknowledge them for that configuration only.
+#[cfg(all(test, not(feature = "aprs")))]
+use aprs_is as _;
+#[cfg(all(test, not(feature = "aprs")))]
+use kiss_tnc as _;
+#[cfg(all(test, not(feature = "dstar")))]
+use mmdvm as _;
 
 // Convenience re-exports for the most commonly used types.
 pub use error::Error;
 pub use radio::diagnostics::LinkDiagnosis;
+pub use radio::if_tap::{
+    IfTapConfig, IfTapEnterError, IfTapRestoreReport, IfTapRestoreStep, IfTapSavedState,
+    IfTapSession,
+};
 pub use radio::programming::{McpPage, McpSession, WritableMcpPage};
-pub use radio::{FirmwareProfile, Radio};
+pub use radio::state_monitor::{BandState, StateChange, StateMonitor};
+pub use radio::terminal_mode::{TerminalModeTransition, TerminalModeTransitionError};
+pub use radio::{DesyncedRadio, FirmwareProfile, Radio};
 #[cfg(target_os = "macos")]
-pub use transport::BluetoothTransport;
+pub use transport::{BluetoothTransport, PairedBluetoothCandidate};
 pub use transport::{EitherTransport, MockTransport, SerialTransport, Transport};
 pub use types::{
     ChannelDisplayName, FirmwareIdentity, HardwareVariant, ModelCode, RadioModel, RadioRegion,
@@ -136,21 +170,26 @@ pub use ::aprs::{
     build_aprs_timestamped_status, build_aprs_weather, build_query_response_position,
     parse_aprs_extensions,
 };
+#[cfg(feature = "aprs")]
 pub use aprs_is::{
     AprsIsClient, AprsIsConfig, AprsIsError, AprsIsEvent, AprsIsUplinkLine, AprsIsUplinkLineError,
     IGateFormatError, Passcode, aprs_is_passcode, build_login_string, format_is_packet,
     parse_is_line,
 };
 pub use ax25_codec::{Ax25Address, Ax25Error, Ax25Packet, DigipeaterPath};
+#[cfg(feature = "aprs")]
 pub use kiss_tnc::{KissError, KissFrame};
 
 // D75-specific re-exports.
+#[cfg(feature = "aprs")]
 pub use aprs::client::{AprsClient, AprsClientConfig, AprsEvent, IGateRfLocality, IGateToRfConfig};
 
 // KISS session re-export.
+#[cfg(feature = "aprs")]
 pub use radio::kiss_session::KissSession;
 
 // MMDVM session re-export.
+#[cfg(feature = "dstar")]
 pub use radio::mmdvm_session::MmdvmSession;
 
 // Link-recovery policy.
@@ -160,10 +199,11 @@ pub use session::ReconnectPolicy;
 // async event loop lives in mmdvm. The types re-exported here
 // compose those crates into the D-STAR-specific surface
 // TH-D75 consumers use.
+#[cfg(feature = "dstar")]
 pub use dstar_gateway::{
-    DstarEvent, DstarGateway, DstarGatewayConfig, DstarProtocolViolation, DstarStatusReflector,
-    DstarStatusReflectorError, LastHeardEntry, MmdvmError, ModemMode, ModemStatus, NakReason,
-    ObservedDstarCallsign, SlowDataTextMessage, WireTextError,
+    DstarEvent, DstarGateway, DstarGatewayConfig, DstarHeader, DstarProtocolViolation,
+    DstarStatusReflector, DstarStatusReflectorError, LastHeardEntry, MmdvmError, ModemMode,
+    ModemStatus, NakReason, ObservedDstarCallsign, SlowDataTextMessage, WireTextError,
 };
 
 // SD card re-exports.

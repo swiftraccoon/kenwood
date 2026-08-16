@@ -36,17 +36,20 @@ impl<T: Transport> Radio<T> {
         &mut self,
         method: ScanResumeMethod,
     ) -> Result<(), Error> {
-        const PAGE: u16 = 0x0010;
-        const BYTE_INDEX: usize = 0x0C;
+        use super::mcp_offsets;
 
         tracing::info!(
             ?method,
-            offset = 0x100C,
+            offset = mcp_offsets::SCAN_RESUME_ANALOG,
             "setting analog scan resume via MCP"
         );
-        self.modify_memory_page(programming::WritableMcpPage::new(PAGE)?, |data| {
-            data[BYTE_INDEX] = method.as_raw();
-        })
+        self.modify_memory_page(
+            programming::WritableMcpPage::new(mcp_offsets::page(mcp_offsets::SCAN_RESUME_ANALOG))?,
+            |data| {
+                data[const { mcp_offsets::byte_index(mcp_offsets::SCAN_RESUME_ANALOG) }] =
+                    method.as_raw();
+            },
+        )
         .await
     }
 
@@ -72,17 +75,20 @@ impl<T: Transport> Radio<T> {
         &mut self,
         method: ScanResumeMethod,
     ) -> Result<(), Error> {
-        const PAGE: u16 = 0x0010;
-        const BYTE_INDEX: usize = 0x0D;
+        use super::mcp_offsets;
 
         tracing::info!(
             ?method,
-            offset = 0x100D,
+            offset = mcp_offsets::SCAN_RESUME_DIGITAL,
             "setting digital scan resume via MCP"
         );
-        self.modify_memory_page(programming::WritableMcpPage::new(PAGE)?, |data| {
-            data[BYTE_INDEX] = method.as_raw();
-        })
+        self.modify_memory_page(
+            programming::WritableMcpPage::new(mcp_offsets::page(mcp_offsets::SCAN_RESUME_DIGITAL))?,
+            |data| {
+                data[const { mcp_offsets::byte_index(mcp_offsets::SCAN_RESUME_DIGITAL) }] =
+                    method.as_raw();
+            },
+        )
         .await
     }
 

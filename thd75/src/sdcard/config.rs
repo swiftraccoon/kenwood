@@ -545,7 +545,10 @@ mod tests {
         )
         .err()
         .ok_or("zero-frequency programmed channel should be rejected")?;
-        assert!(matches!(error, ValidationError::FrequencyOutOfRange(0)));
+        assert!(matches!(
+            error,
+            ValidationError::IntegerOutOfRange { value: 0, .. }
+        ));
         Ok(())
     }
 

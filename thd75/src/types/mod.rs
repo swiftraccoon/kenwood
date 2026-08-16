@@ -58,7 +58,7 @@ pub use identity::{
     FirmwareIdentity, HardwareVariant, ModelCode, RadioModel, RadioRegion, RadioType,
     SerialInformation, SerialNumber,
 };
-pub use kiss::{KissDuplex, KissPersistence, KissSlotTime, KissTxDelay, KissTxTail};
+pub use kiss::{KissDuplex, KissParams, KissPersistence, KissSlotTime, KissTxDelay, KissTxTail};
 pub use mode::{ChannelMode, OperatingMode, PowerLevel, ShiftDirection, StepSize};
 pub use radio_params::{
     AfGainLevel, AntennaInput, BandMode, BatteryLevel, BeaconMode, DstarSlot, DvGatewayMode,
