@@ -139,8 +139,8 @@ impl DstarHeader {
     /// the stream, surfaced to other clients as the speaker.
     ///
     /// Callers that need to preserve the original flag bytes (e.g.
-    /// `thd75-repl` relaying a radio's TX header) can mutate
-    /// `flag1`/`flag2`/`flag3` after construction.
+    /// `thd75-repl` relaying a radio's TX header) chain
+    /// [`Self::with_flags`] afterwards.
     #[must_use]
     pub fn for_relay(
         operator: Callsign,
@@ -159,6 +159,43 @@ impl DstarHeader {
             ur_call: Callsign::from_wire_bytes(*b"CQCQCQ  "),
             my_call,
             my_suffix,
+        }
+    }
+
+    /// Replace the three flag bytes, keeping every other field.
+    ///
+    /// [`DstarHeader::for_relay`] zeroes the flags, which is correct for a
+    /// TX-from-scratch client; a relay path that must preserve the source
+    /// header's repeater flags chains this on afterwards.
+    #[must_use]
+    pub const fn with_flags(mut self, flag1: u8, flag2: u8, flag3: u8) -> Self {
+        self.flag1 = flag1;
+        self.flag2 = flag2;
+        self.flag3 = flag3;
+        self
+    }
+
+    /// Rebuild an incoming network header for radio-side RF playout.
+    ///
+    /// The `MMDVMHost` radio-header convention (`MMDVMHost/DStarControl.cpp:749-754`):
+    /// `rpt1` and `rpt2` both carry the local station callsign plus module,
+    /// `ur_call` becomes `CQCQCQ`, and the repeater bit (`0x40`) is set on
+    /// `flag1`. The remaining flag bytes and the speaker identity are
+    /// preserved from the incoming header.
+    #[must_use]
+    pub fn for_radio_relay(station: Callsign, local_module: Module, incoming: &Self) -> Self {
+        /// D-STAR flag1 repeater bit.
+        const REPEATER_MASK: u8 = 0x40;
+        let rpt = rpt_field(station, local_module);
+        Self {
+            flag1: incoming.flag1 | REPEATER_MASK,
+            flag2: incoming.flag2,
+            flag3: incoming.flag3,
+            rpt2: rpt,
+            rpt1: rpt,
+            ur_call: Callsign::from_wire_bytes(*b"CQCQCQ  "),
+            my_call: incoming.my_call,
+            my_suffix: incoming.my_suffix,
         }
     }
 
@@ -456,5 +493,57 @@ mod tests {
         let encoded = hdr.encode();
         let decoded = DstarHeader::decode(&encoded);
         assert_eq!(decoded.my_suffix.as_bytes(), b"ECHO");
+    }
+
+    #[test]
+    fn with_flags_overrides_only_the_flag_bytes() {
+        let relayed = DstarHeader::for_relay(
+            Callsign::from_wire_bytes(*b"W1AW    "),
+            Module::C,
+            Callsign::from_wire_bytes(*b"REF030  "),
+            Module::C,
+            Callsign::from_wire_bytes(*b"W1AW    "),
+            Suffix::from_wire_bytes(*b"D75 "),
+        )
+        .with_flags(0x40, 0x01, 0x02);
+        assert_eq!(relayed.flag1, 0x40);
+        assert_eq!(relayed.flag2, 0x01);
+        assert_eq!(relayed.flag3, 0x02);
+        assert_eq!(relayed.ur_call.as_bytes(), b"CQCQCQ  ");
+        assert_eq!(relayed.rpt1.as_bytes(), b"W1AW   C");
+        assert_eq!(relayed.rpt2.as_bytes(), b"REF030 C");
+    }
+
+    #[test]
+    fn radio_relay_header_follows_the_repeater_convention() {
+        let incoming = DstarHeader {
+            flag1: 0x00,
+            flag2: 0x01,
+            flag3: 0x02,
+            my_call: Callsign::from_wire_bytes(*b"KQ4NIT  "),
+            my_suffix: Suffix::from_wire_bytes(*b"D75 "),
+            ..test_header()
+        };
+        let radio = DstarHeader::for_radio_relay(
+            Callsign::from_wire_bytes(*b"W1AW    "),
+            Module::C,
+            &incoming,
+        );
+        assert_eq!(radio.flag1, 0x40, "the repeater bit must be set");
+        assert_eq!(radio.flag2, 0x01, "other flags must be preserved");
+        assert_eq!(radio.flag3, 0x02);
+        assert_eq!(radio.rpt1.as_bytes(), b"W1AW   C");
+        assert_eq!(
+            radio.rpt2.as_bytes(),
+            b"W1AW   C",
+            "rpt1 and rpt2 both carry the local station"
+        );
+        assert_eq!(radio.ur_call.as_bytes(), b"CQCQCQ  ");
+        assert_eq!(
+            radio.my_call.as_bytes(),
+            b"KQ4NIT  ",
+            "the speaker identity must be preserved"
+        );
+        assert_eq!(radio.my_suffix.as_bytes(), b"D75 ");
     }
 }

@@ -33,6 +33,21 @@ impl StreamId {
     pub const fn get(self) -> u16 {
         self.0.get()
     }
+
+    /// Derive a valid stream ID from arbitrary seed bits.
+    ///
+    /// Non-zero seeds map to themselves; the protocol-reserved zero
+    /// maps to `1`. D-STAR stream IDs only need to differ from the
+    /// previous stream on the same link (receivers key state on the
+    /// ID changing), so callers can feed clock bits or any other
+    /// cheap entropy without a rejection-and-retry loop.
+    #[must_use]
+    pub const fn from_seed(seed: u16) -> Self {
+        match NonZeroU16::new(seed) {
+            Some(nz) => Self(nz),
+            None => Self(NonZeroU16::MIN),
+        }
+    }
 }
 
 impl std::fmt::Display for StreamId {
@@ -64,5 +79,17 @@ mod tests {
         let sid = StreamId::new(0x00AB).ok_or("non-zero must be accepted")?;
         assert_eq!(format!("{sid}"), "0x00AB");
         Ok(())
+    }
+
+    #[test]
+    fn from_seed_preserves_non_zero_seeds() {
+        assert_eq!(StreamId::from_seed(0x0001).get(), 0x0001);
+        assert_eq!(StreamId::from_seed(0x1234).get(), 0x1234);
+        assert_eq!(StreamId::from_seed(0xFFFF).get(), 0xFFFF);
+    }
+
+    #[test]
+    fn from_seed_maps_zero_to_a_valid_id() {
+        assert_eq!(StreamId::from_seed(0).get(), 1);
     }
 }

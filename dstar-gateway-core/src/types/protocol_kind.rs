@@ -32,6 +32,22 @@ impl ProtocolKind {
         }
     }
 
+    /// Identify the protocol from its default UDP port.
+    ///
+    /// The exact inverse of [`ProtocolKind::default_port`]: `20001` is
+    /// `DPlus`, `30001` is `DExtra`, `30051` is `DCS`. Returns `None` for
+    /// every other port; nonstandard deployments need explicit protocol
+    /// selection rather than a guess.
+    #[must_use]
+    pub const fn from_port(port: u16) -> Option<Self> {
+        match port {
+            20001 => Some(Self::DPlus),
+            30001 => Some(Self::DExtra),
+            30051 => Some(Self::Dcs),
+            _ => None,
+        }
+    }
+
     /// Whether this protocol requires TCP authentication before UDP linking.
     ///
     /// Only `DPlus` requires this; see
@@ -148,5 +164,14 @@ mod tests {
     #[test]
     fn protocol_kind_from_reflector_prefix_too_short() {
         assert_eq!(ProtocolKind::from_reflector_prefix("XR"), None);
+    }
+
+    #[test]
+    fn protocol_kind_from_port_inverts_default_port() {
+        for kind in [ProtocolKind::DPlus, ProtocolKind::DExtra, ProtocolKind::Dcs] {
+            assert_eq!(ProtocolKind::from_port(kind.default_port()), Some(kind));
+        }
+        assert_eq!(ProtocolKind::from_port(30052), None);
+        assert_eq!(ProtocolKind::from_port(0), None);
     }
 }

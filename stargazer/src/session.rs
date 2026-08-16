@@ -9,17 +9,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
-use dstar_gateway::tokio_shell::AsyncSession;
+use dstar_gateway::tokio_shell::{AnyAsyncSession, AnyEvent, AsyncSession, drive_connecting};
 use dstar_gateway_core::codec::dplus::HostList;
-use dstar_gateway_core::session::Driver;
 use dstar_gateway_core::session::client::{
-    ClientStateKind, Configured, Connecting, DExtra, DPlus, Dcs, Event, Protocol, Session,
-    VoiceEndReason,
+    Configured, DExtra, DPlus, Dcs, Session, VoiceEndReason,
 };
 use dstar_gateway_core::{Callsign, DstarHeader, Module, StreamId, VoiceFrame};
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
-use tokio::time::timeout;
 
 use crate::capture::{
     CaptureDurationLimit, CaptureManager, CompletedRecording, ConcurrentCaptureLimit, EndReason,
@@ -111,21 +108,21 @@ enum LinkEvent {
     Other,
 }
 
-fn erase<P: Protocol>(ev: Event<P>) -> LinkEvent {
+fn erase(ev: AnyEvent) -> LinkEvent {
     match ev {
-        Event::Disconnected { reason } => LinkEvent::Disconnected {
+        AnyEvent::Disconnected { reason } => LinkEvent::Disconnected {
             reason: format!("{reason:?}"),
         },
-        Event::VoiceStart {
+        AnyEvent::VoiceStart {
             stream_id,
             header,
             diagnostics,
         } => LinkEvent::VoiceStart {
             stream_id,
-            header,
+            header: *header,
             diagnostics: diagnostics.iter().map(|d| format!("{d:?}")).collect(),
         },
-        Event::VoiceFrame {
+        AnyEvent::VoiceFrame {
             stream_id,
             seq,
             frame,
@@ -134,7 +131,7 @@ fn erase<P: Protocol>(ev: Event<P>) -> LinkEvent {
             seq,
             frame,
         },
-        Event::VoiceEnd { stream_id, reason } => LinkEvent::VoiceEnd {
+        AnyEvent::VoiceEnd { stream_id, reason } => LinkEvent::VoiceEnd {
             stream_id,
             end_reason: match reason {
                 VoiceEndReason::Eot => EndReason::Eot,
@@ -149,33 +146,13 @@ fn erase<P: Protocol>(ev: Event<P>) -> LinkEvent {
 }
 
 /// A connected session of any protocol.
-enum RuntimeSession {
-    /// `DPlus` session.
-    DPlus(AsyncSession<DPlus>),
-    /// `DExtra` session.
-    DExtra(AsyncSession<DExtra>),
-    /// DCS session.
-    Dcs(AsyncSession<Dcs>),
-}
+type RuntimeSession = AnyAsyncSession;
 
-impl RuntimeSession {
-    async fn next_event(&mut self) -> Option<LinkEvent> {
-        match self {
-            Self::DPlus(s) => s.next_event().await.map(erase),
-            Self::DExtra(s) => s.next_event().await.map(erase),
-            Self::Dcs(s) => s.next_event().await.map(erase),
-        }
-    }
-
-    async fn disconnect(&mut self) {
-        let result = match self {
-            Self::DPlus(s) => s.disconnect().await,
-            Self::DExtra(s) => s.disconnect().await,
-            Self::Dcs(s) => s.disconnect().await,
-        };
-        if let Err(e) = result {
-            tracing::debug!(error = %e, "disconnect");
-        }
+/// Disconnect, downgrading failures to a debug log; recorder teardown
+/// must not abort on an already-dead link.
+async fn disconnect_quietly(session: &mut RuntimeSession) {
+    if let Err(e) = session.disconnect().await {
+        tracing::debug!(error = %e, "disconnect");
     }
 }
 
@@ -194,46 +171,9 @@ async fn bind_socket() -> Result<Arc<UdpSocket>, String> {
     Ok(Arc::new(sock))
 }
 
-/// Drive the protocol-generic UDP handshake until Connected.
-async fn run_handshake<P>(
-    connecting: &mut Session<P, Connecting>,
-    sock: &UdpSocket,
-) -> Result<(), String>
-where
-    P: Protocol,
-{
-    for _ in 0..4_u8 {
-        if let Some(tx) = connecting.poll_transmit(Instant::now()) {
-            let _bytes = sock
-                .send_to(tx.payload, tx.dst)
-                .await
-                .map_err(|e| format!("send handshake: {e}"))?;
-        }
-        let mut buf = [0u8; 128];
-        match timeout(Duration::from_secs(5), sock.recv_from(&mut buf)).await {
-            Ok(Ok((n, src))) => {
-                let slice = buf.get(..n).unwrap_or(&[]);
-                connecting
-                    .handle_input(Instant::now(), src, slice)
-                    .map_err(|e| format!("handshake input: {e}"))?;
-                match connecting.state_kind() {
-                    ClientStateKind::Connected => return Ok(()),
-                    ClientStateKind::Closed => {
-                        return Err("reflector refused the link".to_string());
-                    }
-                    _ => {}
-                }
-            }
-            Ok(Err(e)) => return Err(format!("recv handshake: {e}")),
-            Err(_) => return Err("handshake timeout".to_string()),
-        }
-    }
-    if connecting.state_kind() == ClientStateKind::Connected {
-        Ok(())
-    } else {
-        Err("handshake did not reach Connected".to_string())
-    }
-}
+/// Overall deadline for the UDP connect handshake (the shared pump in
+/// `dstar-gateway` polls inside this window).
+const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
 
 async fn connect(
     target: &Target,
@@ -267,13 +207,12 @@ async fn connect(
             let authed = configured
                 .authenticate(host_list)
                 .map_err(|f| format!("authenticate: {}", f.error))?;
-            let mut connecting = authed
+            let connecting = authed
                 .connect(Instant::now())
                 .map_err(|f| format!("connect: {}", f.error))?;
-            run_handshake(&mut connecting, &sock).await?;
-            let connected = connecting
-                .promote()
-                .map_err(|f| format!("promote: {}", f.error))?;
+            let connected = drive_connecting(connecting, &sock, HANDSHAKE_DEADLINE)
+                .await
+                .map_err(|e| format!("handshake: {e}"))?;
             RuntimeSession::DPlus(AsyncSession::spawn(connected, sock))
         }
         ProtocolChoice::Dextra => {
@@ -284,13 +223,12 @@ async fn connect(
                 .reflector_callsign(target.reflector_callsign)
                 .peer(peer)
                 .build();
-            let mut connecting = configured
+            let connecting = configured
                 .connect(Instant::now())
                 .map_err(|f| format!("connect: {}", f.error))?;
-            run_handshake(&mut connecting, &sock).await?;
-            let connected = connecting
-                .promote()
-                .map_err(|f| format!("promote: {}", f.error))?;
+            let connected = drive_connecting(connecting, &sock, HANDSHAKE_DEADLINE)
+                .await
+                .map_err(|e| format!("handshake: {e}"))?;
             RuntimeSession::DExtra(AsyncSession::spawn(connected, sock))
         }
         ProtocolChoice::Dcs => {
@@ -301,13 +239,12 @@ async fn connect(
                 .reflector_callsign(target.reflector_callsign)
                 .peer(peer)
                 .build();
-            let mut connecting = configured
+            let connecting = configured
                 .connect(Instant::now())
                 .map_err(|f| format!("connect: {}", f.error))?;
-            run_handshake(&mut connecting, &sock).await?;
-            let connected = connecting
-                .promote()
-                .map_err(|f| format!("promote: {}", f.error))?;
+            let connected = drive_connecting(connecting, &sock, HANDSHAKE_DEADLINE)
+                .await
+                .map_err(|e| format!("handshake: {e}"))?;
             RuntimeSession::Dcs(AsyncSession::spawn(connected, sock))
         }
     };
@@ -364,7 +301,7 @@ async fn pump_session(
     let label: &str = &label;
     loop {
         tokio::select! {
-            ev = session.next_event() => match ev {
+            ev = session.next_event() => match ev.map(erase) {
                 None => {
                     tracing::warn!(target = %label, "session loop exited");
                     for rec in mgr.finalize_all(EndReason::Disconnect, Utc::now()) {
@@ -390,7 +327,7 @@ async fn pump_session(
                         for rec in mgr.finalize_all(EndReason::Disconnect, Utc::now()) {
                             write_recording(writer, rec).await;
                         }
-                        session.disconnect().await;
+                        disconnect_quietly(session).await;
                         return SessionOutcome::Dropped;
                     }
                 }
@@ -415,7 +352,7 @@ async fn pump_session(
                             for rec in mgr.finalize_all(EndReason::Disconnect, Utc::now()) {
                                 write_recording(writer, rec).await;
                             }
-                            session.disconnect().await;
+                            disconnect_quietly(session).await;
                             return SessionOutcome::Dropped;
                         }
                     }
@@ -433,7 +370,7 @@ async fn pump_session(
                     for rec in mgr.finalize_all(EndReason::Shutdown, Utc::now()) {
                         write_recording(writer, rec).await;
                     }
-                    session.disconnect().await;
+                    disconnect_quietly(session).await;
                     return SessionOutcome::ShutdownRequested;
                 }
             }

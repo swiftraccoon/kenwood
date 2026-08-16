@@ -21,10 +21,8 @@ use dstar_gateway::auth::AuthClient;
 use dstar_gateway::tokio_shell::AsyncSession;
 use dstar_gateway_core::codec::dplus::HostList;
 use dstar_gateway_core::header::{DstarHeader, ENCODED_LEN as HEADER_ENCODED_LEN};
-use dstar_gateway_core::session::Driver;
 use dstar_gateway_core::session::client::{
-    ClientStateKind, Connected, Connecting, DExtra, DPlus, Dcs, DisconnectReason, Event, Session,
-    VoiceEndReason,
+    Connected, Connecting, DExtra, DPlus, Dcs, DisconnectReason, Event, Session, VoiceEndReason,
 };
 use dstar_gateway_core::slowdata::{SlowDataTextCollector, descramble};
 use dstar_gateway_core::voice::VoiceFrame;
@@ -84,32 +82,17 @@ impl ReflectorSession {
     /// `my_call` / `my_suffix` / flags pass through unchanged; they
     /// identify the operator and their tail (`/D75`, `/M`, etc.).
     fn build_reflector_header(&self, radio: &DstarHeader) -> DstarHeader {
-        let mut rpt1_buf = [b' '; 8];
-        let cs_bytes = self.station_callsign.as_bytes();
-        rpt1_buf[..7].copy_from_slice(&cs_bytes[..7]);
-        rpt1_buf[7] = self.local_module_typed.as_byte();
-        let rpt1 = Callsign::from_wire_bytes(rpt1_buf);
-
-        let mut rpt2_buf = [b' '; 8];
-        let refl_bytes = self.reflector_callsign.as_bytes();
-        rpt2_buf[..7].copy_from_slice(&refl_bytes[..7]);
-        rpt2_buf[7] = self.reflector_module_typed.as_byte();
-        let rpt2 = Callsign::from_wire_bytes(rpt2_buf);
-
-        // `try_from_str("CQCQCQ")` is infallible for a valid static
-        // string, but const construction needs a wire-byte literal.
-        let ur_call = Callsign::from_wire_bytes(*b"CQCQCQ  ");
-
-        DstarHeader {
-            flag1: radio.flag1,
-            flag2: radio.flag2,
-            flag3: radio.flag3,
-            rpt2,
-            rpt1,
-            ur_call,
-            my_call: radio.my_call,
-            my_suffix: radio.my_suffix,
-        }
+        // `for_relay` zeroes the flags (correct for a TX-from-scratch
+        // client); chain the radio's source flags back on for this relay.
+        DstarHeader::for_relay(
+            self.station_callsign,
+            self.local_module_typed,
+            self.reflector_callsign,
+            self.reflector_module_typed,
+            radio.my_call,
+            radio.my_suffix,
+        )
+        .with_flags(radio.flag1, radio.flag2, radio.flag3)
     }
 }
 
@@ -1407,68 +1390,24 @@ async fn bind_local_socket() -> Result<Arc<UdpSocket>, ReflectorError> {
         .map_err(|e| ReflectorError::SocketBindFailed(format!("{e}")))
 }
 
-/// Drive a `Session<P, Connecting>` to `Connected` by polling the sans-io
-/// core and pumping the UDP socket until the reflector ACKs the LINK.
+/// Drive a `Session<P, Connecting>` to `Connected` via the shared pump
+/// in `dstar_gateway::tokio_shell::drive_connecting`, mapping its typed
+/// failures onto [`ReflectorError`].
 async fn drive_handshake_to_connected<P>(
-    mut session: Session<P, Connecting>,
+    session: Session<P, Connecting>,
     socket: &UdpSocket,
 ) -> Result<Session<P, Connected>, ReflectorError>
 where
     P: dstar_gateway_core::session::client::Protocol,
 {
-    let deadline = std::time::Instant::now() + HANDSHAKE_TIMEOUT;
-    let mut buf = [0u8; 2048];
-
-    loop {
-        match session.state_kind() {
-            ClientStateKind::Connected => break,
-            ClientStateKind::Closed => {
-                return Err(ReflectorError::ConnectFailed(
-                    "reflector rejected the connection".to_owned(),
-                ));
-            }
-            _ => {}
-        }
-
-        if std::time::Instant::now() >= deadline {
-            return Err(ReflectorError::HandshakeTimeout);
-        }
-
-        while let Some(tx) = session.poll_transmit(std::time::Instant::now()) {
-            let _bytes_sent = socket.send_to(tx.payload, tx.dst).await.map_err(|e| {
-                ReflectorError::ConnectFailed(format!("handshake send failed: {e}"))
-            })?;
-        }
-
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            socket.recv_from(&mut buf),
-        )
+    dstar_gateway::tokio_shell::drive_connecting(session, socket, HANDSHAKE_TIMEOUT)
         .await
-        {
-            Ok(Ok((n, src))) => {
-                if let Some(bytes) = buf.get(..n) {
-                    session
-                        .handle_input(std::time::Instant::now(), src, bytes)
-                        .map_err(|e| {
-                            ReflectorError::ConnectFailed(format!("handshake decode failed: {e}"))
-                        })?;
-                }
+        .map_err(|error| match error {
+            dstar_gateway::tokio_shell::ConnectError::TimedOut(_) => {
+                ReflectorError::HandshakeTimeout
             }
-            Ok(Err(e)) => {
-                return Err(ReflectorError::ConnectFailed(format!(
-                    "handshake recv failed: {e}"
-                )));
-            }
-            Err(_) => {
-                session.handle_timeout(std::time::Instant::now());
-            }
-        }
-    }
-
-    session.promote().map_err(|f| {
-        ReflectorError::ConnectFailed(format!("promote to Connected failed: {}", f.error))
-    })
+            other => ReflectorError::ConnectFailed(other.to_string()),
+        })
 }
 
 /// Build, connect, and spawn a `DExtra` session.

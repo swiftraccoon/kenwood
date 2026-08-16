@@ -23,19 +23,18 @@ use std::time::{Duration, Instant};
 
 use crate::audio::{AudioCommand, AudioHandle};
 use crate::geo::{GpsPosition, parse_gps_sentence};
-use dstar_gateway::tokio_shell::{AsyncSession, ShellError};
+use dstar_gateway::tokio_shell::{
+    AnyAsyncSession, AnyEvent, AsyncSession, ConnectError, drive_connecting, fresh_stream_id,
+};
 use dstar_gateway_core::header::DstarHeader;
-use dstar_gateway_core::session::Driver;
 use dstar_gateway_core::session::client::{
-    ClientStateKind, Configured, Connecting, DExtra, DPlus, Dcs, Event, Protocol, Session,
-    VoiceEndReason,
+    Configured, DExtra, DPlus, Dcs, Session, VoiceEndReason,
 };
 use dstar_gateway_core::slowdata::{SlowDataTextCollector, SlowDataTextMessage};
 use dstar_gateway_core::types::{Callsign, Module, ProtocolKind, StreamId, Suffix};
 use dstar_gateway_core::voice::{AMBE_SILENCE, DSTAR_SYNC_BYTES, VoiceFrame};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
-use tokio::time::timeout;
 
 /// Pair an active runtime session with the configuration it was
 /// established with. The cfg fields (operator callsign, modules,
@@ -209,68 +208,9 @@ pub(crate) enum SessionEvent {
 /// Protocol-generic wrapper over `AsyncSession<P>`. Borrowed verbatim
 /// from the pattern in `thd75-repl/src/main.rs`; same runtime-state
 /// dispatch so the event-pump code can be protocol-agnostic.
-enum RuntimeSession {
-    DPlus(AsyncSession<DPlus>),
-    DExtra(AsyncSession<DExtra>),
-    Dcs(AsyncSession<Dcs>),
-}
-
-impl RuntimeSession {
-    async fn next_event(&mut self) -> Option<RuntimeEvent> {
-        match self {
-            Self::DPlus(s) => s.next_event().await.map(RuntimeEvent::from_dplus),
-            Self::DExtra(s) => s.next_event().await.map(RuntimeEvent::from_dextra),
-            Self::Dcs(s) => s.next_event().await.map(RuntimeEvent::from_dcs),
-        }
-    }
-
-    /// Watch receiver for the instant of the last datagram from the
-    /// reflector; see [`AsyncSession::activity`].
-    fn activity(&self) -> tokio::sync::watch::Receiver<Instant> {
-        match self {
-            Self::DPlus(s) => s.activity(),
-            Self::DExtra(s) => s.activity(),
-            Self::Dcs(s) => s.activity(),
-        }
-    }
-
-    async fn send_header(&mut self, header: DstarHeader, sid: StreamId) -> Result<(), ShellError> {
-        match self {
-            Self::DPlus(s) => s.send_header(header, sid).await,
-            Self::DExtra(s) => s.send_header(header, sid).await,
-            Self::Dcs(s) => s.send_header(header, sid).await,
-        }
-    }
-
-    async fn send_voice(
-        &mut self,
-        sid: StreamId,
-        seq: u8,
-        frame: VoiceFrame,
-    ) -> Result<(), ShellError> {
-        match self {
-            Self::DPlus(s) => s.send_voice(sid, seq, frame).await,
-            Self::DExtra(s) => s.send_voice(sid, seq, frame).await,
-            Self::Dcs(s) => s.send_voice(sid, seq, frame).await,
-        }
-    }
-
-    async fn send_eot(&mut self, sid: StreamId, seq: u8) -> Result<(), ShellError> {
-        match self {
-            Self::DPlus(s) => s.send_eot(sid, seq).await,
-            Self::DExtra(s) => s.send_eot(sid, seq).await,
-            Self::Dcs(s) => s.send_eot(sid, seq).await,
-        }
-    }
-
-    async fn disconnect(&mut self) -> Result<(), ShellError> {
-        match self {
-            Self::DPlus(s) => s.disconnect().await,
-            Self::DExtra(s) => s.disconnect().await,
-            Self::Dcs(s) => s.disconnect().await,
-        }
-    }
-}
+/// Protocol-erased reflector session; the GUI-facing event mapping is
+/// [`RuntimeEvent::from`] over the erased [`AnyEvent`].
+type RuntimeSession = AnyAsyncSession;
 
 /// Lightweight state kept while an outgoing voice stream is live.
 ///
@@ -363,32 +303,22 @@ enum RuntimeEvent {
     Other(String),
 }
 
-impl RuntimeEvent {
-    fn from_dplus(ev: Event<DPlus>) -> Self {
-        Self::from_event(ev)
-    }
-    fn from_dextra(ev: Event<DExtra>) -> Self {
-        Self::from_event(ev)
-    }
-    fn from_dcs(ev: Event<Dcs>) -> Self {
-        Self::from_event(ev)
-    }
-
-    fn from_event<P: Protocol + std::fmt::Debug>(ev: Event<P>) -> Self {
+impl From<AnyEvent> for RuntimeEvent {
+    fn from(ev: AnyEvent) -> Self {
         match ev {
-            Event::VoiceStart {
+            AnyEvent::VoiceStart {
                 stream_id, header, ..
             } => Self::VoiceStart {
                 stream_id,
                 my_call: header.my_call.to_string(),
                 route: RxRoute::from_header(&header),
             },
-            Event::VoiceEnd { stream_id, reason } => Self::VoiceEnd { stream_id, reason },
-            Event::VoiceFrame { seq, frame, .. } => Self::VoiceFrame { seq, frame },
-            Event::Disconnected { reason } => Self::Disconnected {
+            AnyEvent::VoiceEnd { stream_id, reason } => Self::VoiceEnd { stream_id, reason },
+            AnyEvent::VoiceFrame { seq, frame, .. } => Self::VoiceFrame { seq, frame },
+            AnyEvent::Disconnected { reason } => Self::Disconnected {
                 reason: format!("{reason:?}"),
             },
-            Event::PollEcho { .. } => Self::Keepalive,
+            AnyEvent::PollEcho { .. } => Self::Keepalive,
             other => Self::Other(format!("{other:?}")),
         }
     }
@@ -992,7 +922,7 @@ async fn sleep_until_reconnect(at: Option<(tokio::time::Instant, u8)>) {
 /// when no session is active (disables the select branch cleanly).
 async fn next_event_opt(session: Option<&mut ActiveSession>) -> Option<RuntimeEvent> {
     match session {
-        Some(s) => s.runtime.next_event().await,
+        Some(s) => s.runtime.next_event().await.map(RuntimeEvent::from),
         None => std::future::pending().await,
     }
 }
@@ -1044,56 +974,9 @@ async fn bind_session_socket() -> Result<Arc<UdpSocket>, String> {
     Ok(Arc::new(sock))
 }
 
-/// Drive the protocol-generic UDP handshake loop: pump up to 4
-/// `poll_transmit` / `recv` pairs, settling when the core reaches
-/// `ClientStateKind::Connected`. Per-protocol `connect_*` functions
-/// build the typestate path (auth for `DPlus`, none for `DExtra`/`Dcs`)
-/// and then defer the actual datagram exchange here.
-async fn run_handshake<P>(
-    connecting: &mut Session<P, Connecting>,
-    sock: &UdpSocket,
-) -> Result<(), String>
-where
-    P: Protocol,
-{
-    for _ in 0..4_u8 {
-        if let Some(tx) = connecting.poll_transmit(Instant::now()) {
-            let _bytes = sock
-                .send_to(tx.payload, tx.dst)
-                .await
-                .map_err(|e| format!("send handshake: {e}"))?;
-        }
-        let mut buf = [0u8; 128];
-        match timeout(Duration::from_secs(5), sock.recv_from(&mut buf)).await {
-            Ok(Ok((n, src))) => {
-                let slice = buf.get(..n).unwrap_or(&[]);
-                connecting
-                    .handle_input(Instant::now(), src, slice)
-                    .map_err(|e| format!("handshake input: {e}"))?;
-                match connecting.state_kind() {
-                    ClientStateKind::Connected => return Ok(()),
-                    // A login NAK (DPlus BUSY) closes the session, so
-                    // surface the refusal immediately instead of
-                    // idling into a misleading 5-second timeout.
-                    ClientStateKind::Closed => {
-                        return Err("reflector refused the link (BUSY); \
-                             DPlus authorization for your callsign/IP may \
-                             still be propagating"
-                            .into());
-                    }
-                    _ => {}
-                }
-            }
-            Ok(Err(e)) => return Err(format!("recv handshake: {e}")),
-            Err(_) => return Err("handshake timeout".into()),
-        }
-    }
-    if connecting.state_kind() == ClientStateKind::Connected {
-        Ok(())
-    } else {
-        Err("handshake did not reach Connected".into())
-    }
-}
+/// Overall deadline for the UDP connect handshake (the shared pump in
+/// `dstar-gateway` polls inside this window).
+const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
 
 async fn connect_dextra(cfg: &ConnectConfig) -> Result<AsyncSession<DExtra>, String> {
     let sock = bind_session_socket().await?;
@@ -1104,13 +987,12 @@ async fn connect_dextra(cfg: &ConnectConfig) -> Result<AsyncSession<DExtra>, Str
         .reflector_callsign(cfg.reflector_callsign)
         .peer(cfg.peer)
         .build();
-    let mut connecting = configured
+    let connecting = configured
         .connect(Instant::now())
         .map_err(|f| format!("connect: {}", f.error))?;
-    run_handshake(&mut connecting, &sock).await?;
-    let connected = connecting
-        .promote()
-        .map_err(|f| format!("promote: {}", f.error))?;
+    let connected = drive_connecting(connecting, &sock, HANDSHAKE_DEADLINE)
+        .await
+        .map_err(|e| format!("handshake: {e}"))?;
     Ok(AsyncSession::spawn(connected, sock))
 }
 
@@ -1152,14 +1034,26 @@ async fn connect_dplus(
     let authed = configured
         .authenticate(host_list.clone())
         .map_err(|f| format!("authenticate: {}", f.error))?;
-    let mut connecting = authed
+    let connecting = authed
         .connect(Instant::now())
         .map_err(|f| format!("connect: {}", f.error))?;
-    run_handshake(&mut connecting, &sock).await?;
-    let connected = connecting
-        .promote()
-        .map_err(|f| format!("promote: {}", f.error))?;
+    let connected = drive_connecting(connecting, &sock, HANDSHAKE_DEADLINE)
+        .await
+        .map_err(describe_dplus_handshake_error)?;
     Ok((AsyncSession::spawn(connected, sock), auth, host_list))
+}
+
+/// A login NAK (`DPlus` BUSY) closes the session and surfaces as
+/// [`ConnectError::Rejected`]; name the likely cause instead of
+/// passing a bare rejection to the operator.
+fn describe_dplus_handshake_error(e: ConnectError) -> String {
+    match e {
+        ConnectError::Rejected => "reflector refused the link (BUSY); \
+             DPlus authorization for your callsign/IP may still be \
+             propagating"
+            .to_string(),
+        other => format!("handshake: {other}"),
+    }
 }
 
 async fn connect_dcs(cfg: &ConnectConfig) -> Result<AsyncSession<Dcs>, String> {
@@ -1171,13 +1065,12 @@ async fn connect_dcs(cfg: &ConnectConfig) -> Result<AsyncSession<Dcs>, String> {
         .reflector_callsign(cfg.reflector_callsign)
         .peer(cfg.peer)
         .build();
-    let mut connecting = configured
+    let connecting = configured
         .connect(Instant::now())
         .map_err(|f| format!("connect: {}", f.error))?;
-    run_handshake(&mut connecting, &sock).await?;
-    let connected = connecting
-        .promote()
-        .map_err(|f| format!("promote: {}", f.error))?;
+    let connected = drive_connecting(connecting, &sock, HANDSHAKE_DEADLINE)
+        .await
+        .map_err(|e| format!("handshake: {e}"))?;
     Ok(AsyncSession::spawn(connected, sock))
 }
 
@@ -1186,9 +1079,7 @@ async fn connect_dcs(cfg: &ConnectConfig) -> Result<AsyncSession<Dcs>, String> {
 /// [`DstarHeader::for_relay`] so `rpt1[7]` / `rpt2[7]` carry the
 /// validated module letters strict reflectors (xlxd-derived) demand.
 async fn start_tx(active: &mut ActiveSession) -> Result<TxStream, String> {
-    let Some(sid) = StreamId::new(rand_stream_id()) else {
-        return Err("stream id zero; retry".into());
-    };
+    let sid = fresh_stream_id();
     let header = DstarHeader::for_relay(
         active.cfg.callsign,
         active.cfg.local_module,
@@ -1239,9 +1130,7 @@ async fn tx_silence(
     )]
     let total_frames = frames_f as u32;
 
-    let Some(sid) = StreamId::new(rand_stream_id()) else {
-        return Err("stream id zero; retry".into());
-    };
+    let sid = fresh_stream_id();
 
     let header = DstarHeader::for_relay(
         active.cfg.callsign,
@@ -1311,24 +1200,6 @@ async fn tx_silence(
         )))
         .await;
     Ok(())
-}
-
-/// Simple PRNG for stream IDs; it doesn't need to be cryptographic. A
-/// time-seeded `u16` is plenty to avoid accidental overlap with the
-/// previous stream while PTT bounces.
-fn rand_stream_id() -> u16 {
-    use std::time::SystemTime;
-    let nanos = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |d| d.subsec_nanos());
-    // Map to 1..=0xFFFF to avoid the zero that `StreamId::new` rejects.
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "Intentional truncation of u32 nanos to u16: we want the low 16 bits \
-                  as a seed for StreamId. OR with 0x1 then .max(1) guarantees non-zero."
-    )]
-    let v = (nanos as u16) | 0x1;
-    v.max(1)
 }
 
 #[cfg(test)]
@@ -1950,8 +1821,9 @@ mod tests {
     /// a real dstargateway REF refusal looked like before the fix).
     #[tokio::test]
     async fn dplus_busy_rejection_fails_fast_with_refusal() -> TestResult {
-        use std::time::Instant;
+        use std::time::{Duration, Instant};
 
+        use dstar_gateway::tokio_shell::{ConnectError, drive_connecting};
         use dstar_gateway_core::codec::dplus::HostList;
         use dstar_gateway_core::session::client::{Configured, DPlus, Session};
         use dstar_gateway_core::types::{Callsign, Module};
@@ -1981,13 +1853,21 @@ mod tests {
         let authed = configured
             .authenticate(HostList::new())
             .map_err(|f| f.error.to_string())?;
-        let mut connecting = authed
+        let connecting = authed
             .connect(Instant::now())
             .map_err(|f| f.error.to_string())?;
-        let result = super::run_handshake(&mut connecting, &sock).await;
+        let error = match drive_connecting(connecting, &sock, Duration::from_secs(5)).await {
+            Ok(_connected) => return Err("BUSY handshake unexpectedly connected".into()),
+            Err(e) => e,
+        };
         assert!(
-            matches!(result, Err(ref e) if e.contains("refused")),
-            "BUSY must surface as an immediate refusal, got {result:?}"
+            matches!(error, ConnectError::Rejected),
+            "BUSY must surface as a rejection, not a timeout: {error:?}"
+        );
+        let message = super::describe_dplus_handshake_error(error);
+        assert!(
+            message.contains("refused"),
+            "operator message names the refusal: {message}"
         );
         Ok(())
     }

@@ -17,6 +17,7 @@
 
 pub mod codec;
 pub mod dprs;
+pub mod echo;
 pub mod error;
 pub mod header;
 pub mod hosts;
