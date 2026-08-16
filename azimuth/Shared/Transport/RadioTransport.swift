@@ -36,6 +36,9 @@ public protocol AzimuthRadioTransport: Sendable {
     var device: AzimuthRadioDevice { get }
     var state: AzimuthRadioTransportState { get async }
     var stateStream: AsyncStream<AzimuthRadioTransportState> { get }
+    /// Stable serial identifier reported by the physical USB device, when the
+    /// platform can prove one for the currently opened endpoint.
+    var hardwareSerialNumber: String? { get async }
 
     func open() async throws
     func close() async
@@ -47,6 +50,10 @@ public protocol AzimuthRadioTransport: Sendable {
     /// Suspends until at least one byte is available. An empty result means
     /// the connection closed (or this individual read was cancelled).
     func read(maxBytes: Int) async throws -> [UInt8]
+}
+
+public extension AzimuthRadioTransport {
+    var hardwareSerialNumber: String? { get async { nil } }
 }
 
 public enum AzimuthRadioTransportError: LocalizedError, Sendable, Equatable {

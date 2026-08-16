@@ -70,6 +70,7 @@ final class AzimuthSceneModel {
     private(set) var catalog: RadioSettingCatalog
     private(set) var catalogLoadState: CatalogLoadState
     private(set) var isRadioOperationInFlight = false
+    private(set) var isCATRecoveryInFlight = false
     private(set) var assistantWorkflow: AssistantWorkflowState = .idle
     private(set) var manualSettingApplyState: ManualSettingApplyState = .idle
     private(set) var aprsState: APRSOperationalState
@@ -80,6 +81,7 @@ final class AzimuthSceneModel {
     private(set) var ifDSPModeState: IFDSPRadioModeState
     private(set) var isIFDSPOperationInFlight = false
     private(set) var operationError: String?
+    private(set) var catRecoveryAlert: RadioCATRecoveryAlert?
 
     @ObservationIgnored private let radioController: any RadioControlling
     @ObservationIgnored private let catalogProvider: any RadioSettingCatalogProviding
@@ -91,6 +93,7 @@ final class AzimuthSceneModel {
     @ObservationIgnored private var aprsUpdatesTask: Task<Void, Never>?
     @ObservationIgnored private var ifDSPUpdatesTask: Task<Void, Never>?
     @ObservationIgnored private var catalogTask: Task<Void, Never>?
+    @ObservationIgnored private var catRecoveryTask: Task<Void, Error>?
     @ObservationIgnored private var sceneLifecycleTask: Task<Void, Never>?
     @ObservationIgnored private var sceneLifecycleSequence: UInt64 = 0
     @ObservationIgnored private var sceneIsBackgrounded = false
@@ -233,19 +236,90 @@ final class AzimuthSceneModel {
         guard !isRadioOperationInFlight else { return }
         isRadioOperationInFlight = true
         operationError = nil
+        catRecoveryAlert = nil
         defer { isRadioOperationInFlight = false }
         do {
             try await radioController.connect()
             radioState = radioController.currentState
             reloadCatalog()
+        } catch RadioControllerError.usbMmdvmMode {
+            radioState = radioController.currentState
+            catRecoveryAlert = .usbMmdvmMode(
+                automaticRecoveryAvailable: radioController.automaticCATRecoveryAvailable
+            )
         } catch {
             operationError = error.localizedDescription
             radioState = radioController.currentState
         }
     }
 
+    func restoreCATFromUSBMMDVM() async {
+        guard !isRadioOperationInFlight else { return }
+        guard radioController.automaticCATRecoveryAvailable else {
+            catRecoveryAlert = .recoveryFailed(
+                message: "Automatic CAT recovery is unavailable for this radio connection."
+            )
+            return
+        }
+
+        catRecoveryAlert = nil
+        operationError = nil
+        isRadioOperationInFlight = true
+        isCATRecoveryInFlight = true
+        let recoveryTask = Task { @MainActor [radioController] in
+            try await radioController.restoreCATFromUSBMMDVM()
+        }
+        catRecoveryTask = recoveryTask
+        defer {
+            catRecoveryTask = nil
+            isCATRecoveryInFlight = false
+            isRadioOperationInFlight = false
+        }
+        do {
+            try await withTaskCancellationHandler {
+                try await recoveryTask.value
+            } onCancel: {
+                recoveryTask.cancel()
+            }
+            radioState = radioController.currentState
+            reloadCatalog()
+        } catch is CancellationError {
+            catRecoveryAlert = nil
+            radioState = radioController.currentState
+        } catch {
+            catRecoveryAlert = .recoveryFailed(message: error.localizedDescription)
+            radioState = radioController.currentState
+        }
+    }
+
+    /// Stop an approved automatic recovery and wait for the controller to
+    /// finish any MCP cleanup before presenting the radio as disconnected.
+    func cancelCATRecovery() async {
+        guard isCATRecoveryInFlight else { return }
+        let recoveryTask = catRecoveryTask
+        recoveryTask?.cancel()
+        await radioController.disconnect()
+        do {
+            try await recoveryTask?.value
+            catRecoveryAlert = nil
+        } catch is CancellationError {
+            catRecoveryAlert = nil
+        } catch {
+            // A late cancellation can finish a Menu 650 operation before it
+            // stops the USB reconnect. Preserve that truthful outcome.
+            catRecoveryAlert = .recoveryFailed(message: error.localizedDescription)
+        }
+        radioState = radioController.currentState
+        synchronizeIFDSPModeState()
+    }
+
+    func dismissCATRecoveryAlert() {
+        catRecoveryAlert = nil
+    }
+
     func disconnectRadio() async {
         guard !isRadioOperationInFlight, !isIFDSPOperationInFlight else { return }
+        catRecoveryAlert = nil
         isRadioOperationInFlight = true
         defer { isRadioOperationInFlight = false }
         if let restorationError = await stopIFDSPStreamAndRestoreRadio() {

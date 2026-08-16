@@ -171,6 +171,7 @@ public enum AzimuthUSBLinkError: Error, Sendable, Equatable {
     case unsupportedEnvironment(String)
     case serviceNotFound
     case ambiguousDevices([String])
+    case openedDeviceIdentityUnstable(String)
     case openFailed(code: Int32)
     case notOpen
     case invalidTransferLength(Int)
@@ -199,6 +200,8 @@ public protocol AzimuthUSBSerialLink: Sendable {
     func dextLog() throws -> [AzimuthUSBDextLogEntry]
     func commServicePresent() -> Bool?
     var connectionDescription: String { get }
+    /// USB descriptor serial for the currently opened physical device.
+    var hardwareSerialNumber: String? { get }
 }
 
 public extension AzimuthUSBSerialLink {
@@ -207,4 +210,5 @@ public extension AzimuthUSBSerialLink {
     func dextLog() throws -> [AzimuthUSBDextLogEntry] { [] }
     func commServicePresent() -> Bool? { nil }
     var connectionDescription: String { "USB-C" }
+    var hardwareSerialNumber: String? { nil }
 }

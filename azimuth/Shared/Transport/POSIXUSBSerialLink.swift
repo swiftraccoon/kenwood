@@ -20,23 +20,132 @@ public final class POSIXAzimuthUSBSerialLink: AzimuthUSBSerialLink, @unchecked S
     struct USBIdentity: Equatable {
         let vendorID: UInt16
         let productID: UInt16
+        let serialNumber: String?
+
+        init(vendorID: UInt16, productID: UInt16, serialNumber: String? = nil) {
+            self.vendorID = vendorID
+            self.productID = productID
+            self.serialNumber = serialNumber
+        }
+    }
+
+    struct RegisteredUSBDevice: Equatable {
+        let identity: USBIdentity
+        let registryEntryID: UInt64
+    }
+
+    struct OpenedDeviceNode: Equatable {
+        let device: UInt64
+        let inode: UInt64
+        let rawDevice: UInt64
+        let mode: UInt16
+
+        var isCharacterDevice: Bool {
+            mode & UInt16(S_IFMT) == UInt16(S_IFCHR)
+        }
+    }
+
+    struct BoundUSBDevice: Equatable {
+        let fileDescriptor: Int32
+        let path: String
+        let identity: USBIdentity
+    }
+
+    struct OpenSystemAccess {
+        let availableDevicePaths: () -> [String]
+        let registeredUSBDevice: (String) -> RegisteredUSBDevice?
+        let openFileDescriptor: (String) throws -> Int32
+        let nodeForFileDescriptor: (Int32) throws -> OpenedDeviceNode
+        let nodeForPath: (String) throws -> OpenedDeviceNode
+        let configure: (Int32) throws -> Void
+        let closeFileDescriptor: (Int32) -> Void
+    }
+
+    /// Owns one read source's exact descriptor until Dispatch has finished all
+    /// event delivery for that source. Keeping this separate from the link's
+    /// current descriptor prevents an old source from closing a reused fd.
+    private final class ReadabilitySession: @unchecked Sendable {
+        let fileDescriptor: Int32
+        let generation: UInt64
+
+        private let closeFileDescriptor: (Int32) -> Void
+        private let cancellationCompletion = DispatchGroup()
+
+        init(
+            fileDescriptor: Int32,
+            generation: UInt64,
+            closeFileDescriptor: @escaping (Int32) -> Void
+        ) {
+            self.fileDescriptor = fileDescriptor
+            self.generation = generation
+            self.closeFileDescriptor = closeFileDescriptor
+            cancellationCompletion.enter()
+        }
+
+        var cancellationHasCompleted: Bool {
+            cancellationCompletion.wait(timeout: .now()) == .success
+        }
+
+        func finishCancellation() {
+            closeFileDescriptor(fileDescriptor)
+            cancellationCompletion.leave()
+        }
+
+        func waitForCancellation() {
+            cancellationCompletion.wait()
+        }
+    }
+
+    private struct ReadabilitySourceSession {
+        let source: DispatchSourceRead
+        let session: ReadabilitySession
+    }
+
+    private struct ArmedDoorbell {
+        let fileDescriptor: Int32
+        let generation: UInt64
+        let callback: @Sendable (Bool) -> Void
     }
 
     private let requestedPath: String?
+    private let openSystemAccess: OpenSystemAccess
     private let operationLock = NSLock()
     private let lock = NSLock()
-    private let eventQueue = DispatchQueue(
-        label: "org.swiftraccoon.azimuth.posix-usb"
-    )
+    private let eventQueue: DispatchQueue
+    private let eventQueueKey = DispatchSpecificKey<Bool>()
     private var fileDescriptor: Int32 = -1
+    private var connectionGeneration: UInt64 = 0
     private var openedPath: String?
-    private var readabilitySource: DispatchSourceRead?
-    private var doorbell: (@Sendable (Bool) -> Void)?
+    /// Identity bound during `open()` to the exact device node held by
+    /// `fileDescriptor`. Never re-resolve this from a reusable tty pathname.
+    private var openedIdentity: USBIdentity?
+    private var readabilitySourceSession: ReadabilitySourceSession?
+    /// A cancelled source remains retained until its handler has closed the
+    /// old descriptor. The next `open()` waits on this barrier before touching
+    /// the tty path or asserting DTR/RTS for a new session.
+    private var retiringReadabilitySourceSession: ReadabilitySourceSession?
+    private var doorbell: ArmedDoorbell?
 
     /// Pass an exact verified TH-D75 callout path when more than one radio is
     /// attached. Nil is accepted only when discovery finds exactly one radio.
     public init(devicePath: String? = nil) {
         requestedPath = devicePath
+        openSystemAccess = Self.productionOpenSystemAccess
+        eventQueue = DispatchQueue(label: "org.swiftraccoon.azimuth.posix-usb")
+        eventQueue.setSpecific(key: eventQueueKey, value: true)
+    }
+
+    init(
+        devicePath: String? = nil,
+        openSystemAccess: OpenSystemAccess,
+        eventQueue: DispatchQueue = DispatchQueue(
+            label: "org.swiftraccoon.azimuth.posix-usb.test"
+        )
+    ) {
+        requestedPath = devicePath
+        self.openSystemAccess = openSystemAccess
+        self.eventQueue = eventQueue
+        eventQueue.setSpecific(key: eventQueueKey, value: true)
     }
 
     public var connectionDescription: String {
@@ -45,8 +154,14 @@ public final class POSIXAzimuthUSBSerialLink: AzimuthUSBSerialLink, @unchecked S
         return openedPath ?? requestedPath ?? "macOS USB CDC"
     }
 
+    public var hardwareSerialNumber: String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return openedIdentity?.serialNumber
+    }
+
     public func servicePresent() -> Bool {
-        let verifiedPaths = Self.availableDevicePaths()
+        let verifiedPaths = openSystemAccess.availableDevicePaths()
         if let requestedPath {
             return verifiedPaths.contains(requestedPath)
         }
@@ -56,34 +171,42 @@ public final class POSIXAzimuthUSBSerialLink: AzimuthUSBSerialLink, @unchecked S
     public func open() throws {
         operationLock.lock()
         defer { operationLock.unlock() }
+        try waitForRetiringReadabilitySource()
         lock.lock()
         defer { lock.unlock() }
         guard fileDescriptor < 0 else { return }
 
-        let path = try Self.selectDevicePath(
+        let opened = try Self.openAndBindDevice(
             requestedPath: requestedPath,
-            verifiedPaths: Self.availableDevicePaths()
+            access: openSystemAccess
         )
 
-        let opened = Darwin.open(path, O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC)
-        guard opened >= 0 else {
-            throw AzimuthUSBLinkError.systemCall(operation: "open \(path)", code: errno)
-        }
-        do {
-            try Self.configure(fd: opened)
-        } catch {
-            Darwin.close(opened)
-            throw error
-        }
-
+        connectionGeneration &+= 1
+        let session = ReadabilitySession(
+            fileDescriptor: opened.fileDescriptor,
+            generation: connectionGeneration,
+            closeFileDescriptor: openSystemAccess.closeFileDescriptor
+        )
         let source = DispatchSource.makeReadSource(
-            fileDescriptor: opened,
+            fileDescriptor: opened.fileDescriptor,
             queue: eventQueue
         )
-        source.setEventHandler { [weak self] in self?.readabilityChanged() }
-        fileDescriptor = opened
-        openedPath = path
-        readabilitySource = source
+        source.setEventHandler { [weak self, session] in
+            self?.readabilityChanged(
+                fileDescriptor: session.fileDescriptor,
+                generation: session.generation
+            )
+        }
+        source.setCancelHandler { [session] in
+            session.finishCancellation()
+        }
+        fileDescriptor = opened.fileDescriptor
+        openedPath = opened.path
+        openedIdentity = opened.identity
+        readabilitySourceSession = ReadabilitySourceSession(
+            source: source,
+            session: session
+        )
         source.resume()
     }
 
@@ -91,17 +214,23 @@ public final class POSIXAzimuthUSBSerialLink: AzimuthUSBSerialLink, @unchecked S
         operationLock.lock()
         defer { operationLock.unlock() }
         lock.lock()
-        let opened = fileDescriptor
-        let source = readabilitySource
-        let pendingDoorbell = doorbell
+        let sourceSession = readabilitySourceSession
+        let pendingDoorbell = doorbell?.callback
+        connectionGeneration &+= 1
         fileDescriptor = -1
         openedPath = nil
-        readabilitySource = nil
+        openedIdentity = nil
+        readabilitySourceSession = nil
+        if let sourceSession {
+            precondition(retiringReadabilitySourceSession == nil)
+            retiringReadabilitySourceSession = sourceSession
+        }
         doorbell = nil
         lock.unlock()
 
-        source?.cancel()
-        if opened >= 0 { Darwin.close(opened) }
+        // The cancel handler, and only the cancel handler, owns and closes the
+        // exact descriptor captured by this source. `open()` waits for it.
+        sourceSession?.source.cancel()
         pendingDoorbell?(false)
     }
 
@@ -229,7 +358,12 @@ public final class POSIXAzimuthUSBSerialLink: AzimuthUSBSerialLink, @unchecked S
             )
         }
         let opened = fileDescriptor
-        doorbell = onFire
+        let generation = connectionGeneration
+        doorbell = ArmedDoorbell(
+            fileDescriptor: opened,
+            generation: generation,
+            callback: onFire
+        )
         lock.unlock()
 
         // Dispatch sources are level-triggered, but an explicit readiness
@@ -241,7 +375,11 @@ public final class POSIXAzimuthUSBSerialLink: AzimuthUSBSerialLink, @unchecked S
             revents: 0
         )
         if Darwin.poll(&descriptor, 1, 0) > 0 {
-            consumeDoorbell(dataAvailable: true)
+            consumeDoorbell(
+                dataAvailable: true,
+                fileDescriptor: opened,
+                generation: generation
+            )
         }
     }
 
@@ -264,10 +402,8 @@ public final class POSIXAzimuthUSBSerialLink: AzimuthUSBSerialLink, @unchecked S
             .sorted()
             .map { (directory as NSString).appendingPathComponent($0) }
             .filter { path in
-                identityProvider(path) == USBIdentity(
-                    vendorID: thD75VendorID,
-                    productID: thD75ProductID
-                )
+                guard let identity = identityProvider(path) else { return false }
+                return isTHD75(identity)
             }
     }
 
@@ -290,10 +426,55 @@ public final class POSIXAzimuthUSBSerialLink: AzimuthUSBSerialLink, @unchecked S
         return onlyPath
     }
 
+    static func openAndBindDevice(
+        requestedPath: String?,
+        access: OpenSystemAccess
+    ) throws -> BoundUSBDevice {
+        let path = try selectDevicePath(
+            requestedPath: requestedPath,
+            verifiedPaths: access.availableDevicePaths()
+        )
+        guard let identityBeforeOpen = access.registeredUSBDevice(path) else {
+            throw AzimuthUSBLinkError.openedDeviceIdentityUnstable(path)
+        }
+
+        let fileDescriptor = try access.openFileDescriptor(path)
+        var mustClose = true
+        defer {
+            if mustClose { access.closeFileDescriptor(fileDescriptor) }
+        }
+
+        let openedNode = try access.nodeForFileDescriptor(fileDescriptor)
+        let pathNodeBeforeIdentity = try access.nodeForPath(path)
+        guard openedNode.isCharacterDevice,
+              openedNode == pathNodeBeforeIdentity,
+              let identityAfterOpen = access.registeredUSBDevice(path),
+              identityAfterOpen == identityBeforeOpen else {
+            throw AzimuthUSBLinkError.openedDeviceIdentityUnstable(path)
+        }
+        let pathNodeAfterIdentity = try access.nodeForPath(path)
+        guard openedNode == pathNodeAfterIdentity,
+              isTHD75(identityAfterOpen.identity) else {
+            throw AzimuthUSBLinkError.openedDeviceIdentityUnstable(path)
+        }
+
+        try access.configure(fileDescriptor)
+        mustClose = false
+        return BoundUSBDevice(
+            fileDescriptor: fileDescriptor,
+            path: path,
+            identity: identityAfterOpen.identity
+        )
+    }
+
     /// Resolve the tty's IORegistry ancestry before treating it as a radio.
     /// A `/dev/cu.usbmodem*` basename alone also describes development boards,
     /// phones, and unrelated CDC devices and is not safe identification.
     private static func registeredUSBIdentity(for path: String) -> USBIdentity? {
+        registeredUSBDevice(for: path)?.identity
+    }
+
+    private static func registeredUSBDevice(for path: String) -> RegisteredUSBDevice? {
         guard let matching = IOServiceMatching("IOSerialBSDClient") else {
             return nil
         }
@@ -319,8 +500,17 @@ public final class POSIXAzimuthUSBSerialLink: AzimuthUSBSerialLink, @unchecked S
             )?.takeRetainedValue() as? String
             if calloutPath == path {
                 let identity = registeredUSBIdentity(for: service)
+                var registryEntryID: UInt64 = 0
+                let registryResult = IORegistryEntryGetRegistryEntryID(
+                    service,
+                    &registryEntryID
+                )
                 IOObjectRelease(service)
-                return identity
+                guard let identity, registryResult == KERN_SUCCESS else { return nil }
+                return RegisteredUSBDevice(
+                    identity: identity,
+                    registryEntryID: registryEntryID
+                )
             }
             IOObjectRelease(service)
         }
@@ -346,22 +536,165 @@ public final class POSIXAzimuthUSBSerialLink: AzimuthUSBSerialLink, @unchecked S
         ) as? NSNumber else {
             return nil
         }
+        let serialNumber = ["USB Serial Number", "kUSBSerialNumberString"]
+            .lazy
+            .compactMap { key in
+                IORegistryEntrySearchCFProperty(
+                    service,
+                    kIOServicePlane,
+                    key as CFString,
+                    kCFAllocatorDefault,
+                    options
+                ) as? String
+            }
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty }
         return USBIdentity(
             vendorID: vendor.uint16Value,
-            productID: product.uint16Value
+            productID: product.uint16Value,
+            serialNumber: serialNumber
         )
     }
 
-    private func readabilityChanged() {
-        consumeDoorbell(dataAvailable: true)
+    static func isTHD75(_ identity: USBIdentity) -> Bool {
+        identity.vendorID == thD75VendorID
+            && identity.productID == thD75ProductID
     }
 
-    private func consumeDoorbell(dataAvailable: Bool) {
+    private static var productionOpenSystemAccess: OpenSystemAccess {
+        OpenSystemAccess(
+            availableDevicePaths: { availableDevicePaths() },
+            registeredUSBDevice: { registeredUSBDevice(for: $0) },
+            openFileDescriptor: { path in
+                let opened = Darwin.open(
+                    path,
+                    O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW
+                )
+                guard opened >= 0 else {
+                    throw AzimuthUSBLinkError.systemCall(
+                        operation: "open \(path)",
+                        code: errno
+                    )
+                }
+                return opened
+            },
+            nodeForFileDescriptor: { try openedDeviceNode(fileDescriptor: $0) },
+            nodeForPath: { try openedDeviceNode(path: $0) },
+            configure: { try configure(fd: $0) },
+            closeFileDescriptor: { _ = Darwin.close($0) }
+        )
+    }
+
+    static func openedDeviceNode(
+        device: UInt64,
+        inode: UInt64,
+        rawDevice: UInt64,
+        mode: UInt16
+    ) -> OpenedDeviceNode {
+        OpenedDeviceNode(
+            device: device,
+            inode: inode,
+            rawDevice: rawDevice,
+            mode: mode
+        )
+    }
+
+    private static func openedDeviceNode(fileDescriptor: Int32) throws -> OpenedDeviceNode {
+        var status = stat()
+        guard Darwin.fstat(fileDescriptor, &status) == 0 else {
+            throw AzimuthUSBLinkError.systemCall(
+                operation: "fstat opened USB serial device",
+                code: errno
+            )
+        }
+        return openedDeviceNode(status)
+    }
+
+    private static func openedDeviceNode(path: String) throws -> OpenedDeviceNode {
+        var status = stat()
+        let result = path.withCString {
+            Darwin.fstatat(AT_FDCWD, $0, &status, 0)
+        }
+        guard result == 0 else {
+            throw AzimuthUSBLinkError.systemCall(
+                operation: "stat \(path)",
+                code: errno
+            )
+        }
+        return openedDeviceNode(status)
+    }
+
+    private static func openedDeviceNode(_ status: stat) -> OpenedDeviceNode {
+        openedDeviceNode(
+            device: UInt64(status.st_dev),
+            inode: UInt64(status.st_ino),
+            rawDevice: UInt64(status.st_rdev),
+            mode: UInt16(status.st_mode)
+        )
+    }
+
+    private func readabilityChanged(fileDescriptor: Int32, generation: UInt64) {
+        consumeDoorbell(
+            dataAvailable: true,
+            fileDescriptor: fileDescriptor,
+            generation: generation
+        )
+    }
+
+    private func consumeDoorbell(
+        dataAvailable: Bool,
+        fileDescriptor eventFileDescriptor: Int32,
+        generation eventGeneration: UInt64
+    ) {
         lock.lock()
-        let callback = doorbell
+        guard Self.eventMatchesCurrentSession(
+            eventFileDescriptor: eventFileDescriptor,
+            eventGeneration: eventGeneration,
+            currentFileDescriptor: fileDescriptor,
+            currentGeneration: connectionGeneration
+        ),
+        let armed = doorbell,
+        armed.fileDescriptor == eventFileDescriptor,
+        armed.generation == eventGeneration else {
+            lock.unlock()
+            return
+        }
         doorbell = nil
         lock.unlock()
-        callback?(dataAvailable)
+        armed.callback(dataAvailable)
+    }
+
+    static func eventMatchesCurrentSession(
+        eventFileDescriptor: Int32,
+        eventGeneration: UInt64,
+        currentFileDescriptor: Int32,
+        currentGeneration: UInt64
+    ) -> Bool {
+        eventFileDescriptor >= 0
+            && eventFileDescriptor == currentFileDescriptor
+            && eventGeneration == currentGeneration
+    }
+
+    private func waitForRetiringReadabilitySource() throws {
+        lock.lock()
+        let retiring = retiringReadabilitySourceSession
+        lock.unlock()
+        guard let retiring else { return }
+
+        if DispatchQueue.getSpecific(key: eventQueueKey) == true,
+           !retiring.session.cancellationHasCompleted {
+            throw AzimuthUSBLinkError.systemCall(
+                operation: "reopen USB serial from its read event callback",
+                code: EDEADLK
+            )
+        }
+        retiring.session.waitForCancellation()
+
+        lock.lock()
+        if retiringReadabilitySourceSession?.session === retiring.session {
+            retiringReadabilitySourceSession = nil
+        }
+        lock.unlock()
     }
 
     private func currentFileDescriptor() throws -> Int32 {

@@ -13,6 +13,8 @@
     <key>CFBundleVersion</key><string>$(CURRENT_PROJECT_VERSION)</string>
     <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
     <key>LSMinimumSystemVersion</key><string>$(MACOSX_DEPLOYMENT_TARGET)</string>
+    <key>NSBluetoothAlwaysUsageDescription</key><string>Azimuth uses the paired TH-D75 Bluetooth control link to restore CAT when USB-C is in MMDVM mode.</string>
+    <key>NSBluetoothPeripheralUsageDescription</key><string>Azimuth uses the paired TH-D75 Bluetooth control link to restore CAT when USB-C is in MMDVM mode.</string>
     <key>NSPrincipalClass</key><string>NSApplication</string>
 </dict>
 </plist>

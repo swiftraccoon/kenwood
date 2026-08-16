@@ -112,7 +112,17 @@ struct RadioWorkspace: View {
             .disabled(model.isRadioOperationInFlight)
             .accessibilityIdentifier("azimuth.radio.connect")
         case .connecting:
-            EmptyView()
+            if model.isCATRecoveryInFlight {
+                Button {
+                    Task { await model.cancelCATRecovery() }
+                } label: {
+                    Label("Stop and Disconnect", systemImage: "stop.circle")
+                }
+                .help(
+                    "Stops before Menu 650 when possible. If the radio operation has already started, Azimuth finishes it safely before disconnecting."
+                )
+                .accessibilityIdentifier("azimuth.radio.cancel-cat-recovery")
+            }
         case .connected:
             Button(role: .destructive) {
                 Task { await model.disconnectRadio() }

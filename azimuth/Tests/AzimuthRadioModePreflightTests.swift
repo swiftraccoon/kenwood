@@ -8,7 +8,7 @@ import XCTest
 final class AzimuthRadioModePreflightTests: XCTestCase {
     func testMMDVMResponseIsClassifiedAndEntireFrameIsDrained() async throws {
         let transport = RadioModeTestTransport(
-            reads: [[0xE0], [0x06], [0x00, 0x41, 0x42, 0x43]]
+            reads: [[0xE0], [0x12], [0x00, 0x01] + Array("TH-D75 RTM1.00".utf8)]
         )
         let preflight = AzimuthRadioModePreflight(
             transport: transport,
@@ -22,6 +22,159 @@ final class AzimuthRadioModePreflightTests: XCTestCase {
         XCTAssertEqual(transport.writes, [[0xE0, 0x03, 0x00]])
         XCTAssertEqual(transport.remainingScriptedReadCount, 0)
         XCTAssertEqual(transport.activeReadCount, 0)
+    }
+
+    func testStaleByteBeforeMMDVMResponseDoesNotHideValidatedFrame() async throws {
+        let transport = RadioModeTestTransport(
+            reads: [
+                [0x7F],
+                [0xE0, 0x12, 0x00, 0x01] + Array("TH-D75 RTM1.00".utf8),
+            ]
+        )
+        let preflight = AzimuthRadioModePreflight(
+            transport: transport,
+            probeTimeout: .milliseconds(100),
+            parserResetTimeout: .milliseconds(5)
+        )
+
+        let mode = try await preflight.prepareForAutomation()
+
+        XCTAssertEqual(mode, .mmdvm)
+        XCTAssertEqual(transport.writes, [[0xE0, 0x03, 0x00]])
+        XCTAssertEqual(transport.remainingScriptedReadCount, 0)
+        XCTAssertEqual(transport.activeReadCount, 0)
+    }
+
+    func testDelayedMMDVMResponseDuringCATResetStillWinsClassification() async throws {
+        let transport = RadioModeTestTransport(
+            reads: [[0xE0, 0x12, 0x00, 0x01] + Array("TH-D75 RTM1.00".utf8)],
+            silentReadCount: 1
+        )
+        let preflight = AzimuthRadioModePreflight(
+            transport: transport,
+            probeTimeout: .milliseconds(5),
+            parserResetTimeout: .milliseconds(100)
+        )
+
+        let mode = try await preflight.prepareForAutomation()
+
+        XCTAssertEqual(mode, .mmdvm)
+        XCTAssertEqual(transport.writes, [[0xE0, 0x03, 0x00], [0x0D]])
+        XCTAssertEqual(transport.remainingScriptedReadCount, 0)
+        XCTAssertEqual(transport.activeReadCount, 0)
+    }
+
+    func testTruncatedMMDVMFrameCannotAuthorizeRecovery() async throws {
+        let transport = RadioModeTestTransport(
+            reads: [[0xE0], [0x12], [0x00, 0x01] + Array("TH-D75".utf8)]
+        )
+        let preflight = AzimuthRadioModePreflight(
+            transport: transport,
+            probeTimeout: .milliseconds(10),
+            parserResetTimeout: .milliseconds(5)
+        )
+
+        let mode = try await preflight.prepareForAutomation()
+
+        XCTAssertEqual(mode, .unresponsive)
+        XCTAssertEqual(transport.writes, [[0xE0, 0x03, 0x00], [0x0D]])
+        XCTAssertEqual(transport.activeReadCount, 0)
+    }
+
+    func testPartialMMDVMSyncCannotBeReinterpretedAsCATAfterReset() async throws {
+        let transport = RadioModeTestTransport(
+            reads: [[0x3F, 0x0D, 0xE0], [0x3F, 0x0D]]
+        )
+        let preflight = AzimuthRadioModePreflight(
+            transport: transport,
+            probeTimeout: .milliseconds(100),
+            parserResetTimeout: .milliseconds(20)
+        )
+
+        let mode = try await preflight.prepareForAutomation()
+
+        XCTAssertEqual(mode, .unresponsive)
+        XCTAssertEqual(transport.writes, [[0xE0, 0x03, 0x00], [0x0D]])
+        XCTAssertEqual(transport.remainingScriptedReadCount, 0)
+        XCTAssertEqual(transport.activeReadCount, 0)
+    }
+
+    func testEchoedMMDVMRequestCannotAuthorizeRecovery() async throws {
+        let transport = RadioModeTestTransport(reads: [[0xE0], [0x03], [0x00]])
+        let preflight = AzimuthRadioModePreflight(
+            transport: transport,
+            probeTimeout: .milliseconds(10),
+            parserResetTimeout: .milliseconds(5)
+        )
+
+        let mode = try await preflight.prepareForAutomation()
+
+        XCTAssertEqual(mode, .unresponsive)
+        XCTAssertEqual(transport.writes, [[0xE0, 0x03, 0x00], [0x0D]])
+    }
+
+    func testWrongMMDVMCommandCannotAuthorizeRecovery() async throws {
+        let transport = RadioModeTestTransport(
+            reads: [[0xE0], [0x05], [0x01, 0x01, 0x41]]
+        )
+        let preflight = AzimuthRadioModePreflight(
+            transport: transport,
+            probeTimeout: .milliseconds(10),
+            parserResetTimeout: .milliseconds(5)
+        )
+
+        let mode = try await preflight.prepareForAutomation()
+
+        XCTAssertEqual(mode, .unresponsive)
+        XCTAssertEqual(transport.writes, [[0xE0, 0x03, 0x00], [0x0D]])
+    }
+
+    func testNonTextMMDVMDescriptionCannotAuthorizeRecovery() async throws {
+        let transport = RadioModeTestTransport(
+            reads: [[0xE0, 0x05, 0x00, 0x01, 0xFF]]
+        )
+        let preflight = AzimuthRadioModePreflight(
+            transport: transport,
+            probeTimeout: .milliseconds(10),
+            parserResetTimeout: .milliseconds(5)
+        )
+
+        let mode = try await preflight.prepareForAutomation()
+
+        XCTAssertEqual(mode, .unresponsive)
+        XCTAssertEqual(transport.writes, [[0xE0, 0x03, 0x00], [0x0D]])
+    }
+
+    func testControlByteInMMDVMDescriptionCannotAuthorizeRecovery() async throws {
+        let transport = RadioModeTestTransport(
+            reads: [[0xE0, 0x0D, 0x00, 0x01] + Array("TH-D75 ".utf8) + [0x09, 0x58]]
+        )
+        let preflight = AzimuthRadioModePreflight(
+            transport: transport,
+            probeTimeout: .milliseconds(10),
+            parserResetTimeout: .milliseconds(5)
+        )
+
+        let mode = try await preflight.prepareForAutomation()
+
+        XCTAssertEqual(mode, .unresponsive)
+        XCTAssertEqual(transport.writes, [[0xE0, 0x03, 0x00], [0x0D]])
+    }
+
+    func testAnotherMMDVMImplementationCannotAuthorizeTHD75Recovery() async throws {
+        let transport = RadioModeTestTransport(
+            reads: [[0xE0, 0x0E, 0x00, 0x01] + Array("MMDVM 2018".utf8)]
+        )
+        let preflight = AzimuthRadioModePreflight(
+            transport: transport,
+            probeTimeout: .milliseconds(10),
+            parserResetTimeout: .milliseconds(5)
+        )
+
+        let mode = try await preflight.prepareForAutomation()
+
+        XCTAssertEqual(mode, .unresponsive)
+        XCTAssertEqual(transport.writes, [[0xE0, 0x03, 0x00], [0x0D]])
     }
 
     func testSilenceFromBothProbesIsNotMisreportedAsCAT() async throws {
@@ -58,7 +211,26 @@ final class AzimuthRadioModePreflightTests: XCTestCase {
         XCTAssertEqual(transport.activeReadCount, 0)
     }
 
-    func testCATRejectionIsDrainedAndParserIsResetBeforeAutomation() async throws {
+    func testNonTerminatedGarbageDuringCATResetIsNotCATProof() async throws {
+        let transport = RadioModeTestTransport(
+            reads: [[0x41, 0x42, 0x43]],
+            silentReadCount: 1
+        )
+        let preflight = AzimuthRadioModePreflight(
+            transport: transport,
+            probeTimeout: .milliseconds(5),
+            parserResetTimeout: .milliseconds(20)
+        )
+
+        let mode = try await preflight.prepareForAutomation()
+
+        XCTAssertEqual(mode, .unresponsive)
+        XCTAssertEqual(transport.writes, [[0xE0, 0x03, 0x00], [0x0D]])
+        XCTAssertEqual(transport.remainingScriptedReadCount, 0)
+        XCTAssertEqual(transport.activeReadCount, 0)
+    }
+
+    func testCompleteCATResponseAfterResetClassifiesCAT() async throws {
         let transport = RadioModeTestTransport(
             reads: [[0x3F, 0x0D], [0x3F, 0x0D]]
         )

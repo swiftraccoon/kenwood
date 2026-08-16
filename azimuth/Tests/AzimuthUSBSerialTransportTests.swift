@@ -25,9 +25,11 @@ private final class AzimuthMockUSBLink: AzimuthUSBSerialLink, @unchecked Sendabl
     private var doorbellArmCalls = 0
     private var immediateDoorbellCallbacks = 0
     private var afterEmptyDrainInjection: [UInt8]?
+    private var savedCloseDoorbells: [@Sendable (Bool) -> Void] = []
 
     var backpressureResponses = 0
     var failArm = false
+    var saveDoorbellOnClose = false
 
     var present: Bool {
         get { lock.withLock { serviceAvailable } }
@@ -92,6 +94,13 @@ private final class AzimuthMockUSBLink: AzimuthUSBSerialLink, @unchecked Sendabl
         lock.withLock { afterEmptyDrainInjection = bytes }
     }
 
+    func takeSavedCloseDoorbell() -> (@Sendable (Bool) -> Void)? {
+        lock.withLock {
+            guard !savedCloseDoorbells.isEmpty else { return nil }
+            return savedCloseDoorbells.removeFirst()
+        }
+    }
+
     func servicePresent() -> Bool {
         lock.withLock {
             presenceChecks += 1
@@ -118,8 +127,13 @@ private final class AzimuthMockUSBLink: AzimuthUSBSerialLink, @unchecked Sendabl
         let callback: (@Sendable (Bool) -> Void)? = lock.withLock {
             opened = false
             closes += 1
-            defer { doorbell = nil }
-            return doorbell
+            let callback = doorbell
+            doorbell = nil
+            if saveDoorbellOnClose, let callback {
+                savedCloseDoorbells.append(callback)
+                return nil
+            }
+            return callback
         }
         callback?(false)
     }
@@ -287,6 +301,43 @@ final class AzimuthUSBSerialTransportTests: XCTestCase {
         await transport.close()
     }
 
+    func testClosedServiceWaitCannotReopenOrClobberNewerConnection() async throws {
+        let link = AzimuthMockUSBLink()
+        link.present = false
+        link.serviceRegistrationWaitNanoseconds = 400_000_000
+        let transport = AzimuthUSBSerialTransport(link: link)
+        let staleOpen = Task { try await transport.open() }
+
+        for _ in 0..<1_000 {
+            if link.servicePresenceCheckCount >= 2 { break }
+            await Task.yield()
+        }
+        XCTAssertGreaterThanOrEqual(link.servicePresenceCheckCount, 2)
+
+        await transport.close()
+        link.present = true
+        try await transport.open()
+
+        do {
+            try await staleOpen.value
+            XCTFail("superseded open should report cancellation")
+        } catch is CancellationError {
+            // The close/new open generation intentionally superseded it.
+        } catch {
+            XCTFail("unexpected stale-open error: \(error)")
+        }
+
+        XCTAssertEqual(link.openCount, 1)
+        let connectedState = await transport.state
+        XCTAssertEqual(connectedState, .connected)
+
+        async let read = transport.read(maxBytes: 8)
+        link.sendFromRadio([0x44])
+        let bytes = try await read
+        XCTAssertEqual(bytes, [0x44])
+        await transport.close()
+    }
+
     func testOpenRejectsDataOnlyDriverRegistration() async {
         let link = AzimuthMockUSBLink()
         link.controlPresent = false
@@ -426,6 +477,50 @@ final class AzimuthUSBSerialTransportTests: XCTestCase {
         try await Task.sleep(nanoseconds: 20_000_000)
         let state = await transport.state
         XCTAssertEqual(state, .disconnected)
+    }
+
+    func testDelayedDoorbellsFromClosedGenerationsCannotAffectReopenedLink() async throws {
+        let link = AzimuthMockUSBLink()
+        link.saveDoorbellOnClose = true
+        let transport = AzimuthUSBSerialTransport(link: link)
+
+        try await transport.open()
+        await transport.close()
+        let staleLinkDown = try XCTUnwrap(link.takeSavedCloseDoorbell())
+
+        try await transport.open()
+        let closesAfterFirstReopen = link.closeCount
+        staleLinkDown(false)
+        for _ in 0..<20 { await Task.yield() }
+        let stateAfterStaleLinkDown = await transport.state
+        XCTAssertEqual(stateAfterStaleLinkDown, .connected)
+        XCTAssertEqual(link.closeCount, closesAfterFirstReopen)
+
+        async let firstRead = transport.read(maxBytes: 8)
+        link.sendFromRadio([0x31])
+        let firstBytes = try await firstRead
+        XCTAssertEqual(firstBytes, [0x31])
+
+        await transport.close()
+        let staleReadability = try XCTUnwrap(link.takeSavedCloseDoorbell())
+        try await transport.open()
+        let drainCallsAfterSecondReopen = link.drainCallCount
+        let armCallsAfterSecondReopen = link.doorbellArmCallCount
+        let closesAfterSecondReopen = link.closeCount
+
+        staleReadability(true)
+        for _ in 0..<20 { await Task.yield() }
+        let stateAfterStaleReadability = await transport.state
+        XCTAssertEqual(stateAfterStaleReadability, .connected)
+        XCTAssertEqual(link.drainCallCount, drainCallsAfterSecondReopen)
+        XCTAssertEqual(link.doorbellArmCallCount, armCallsAfterSecondReopen)
+        XCTAssertEqual(link.closeCount, closesAfterSecondReopen)
+
+        async let secondRead = transport.read(maxBytes: 8)
+        link.sendFromRadio([0x32])
+        let secondBytes = try await secondRead
+        XCTAssertEqual(secondBytes, [0x32])
+        await transport.close()
     }
 
     func testOneCancelledReadDoesNotCloseSibling() async throws {

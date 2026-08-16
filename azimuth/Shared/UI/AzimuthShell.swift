@@ -36,6 +36,30 @@ struct AzimuthShell: View {
                 break
             }
         }
+        .alert(
+            model.catRecoveryAlert?.title ?? "USB-C Is in MMDVM Mode",
+            isPresented: Binding(
+                get: { model.catRecoveryAlert != nil },
+                set: { if !$0 { model.dismissCATRecoveryAlert() } }
+            )
+        ) {
+            if model.catRecoveryAlert?.automaticRecoveryAvailable == true {
+                Button("Restore CAT Automatically") {
+                    Task { await model.restoreCATFromUSBMMDVM() }
+                }
+            }
+            if model.catRecoveryAlert?.isRecoveryOffer == true {
+                Button("Not Now", role: .cancel) {
+                    model.dismissCATRecoveryAlert()
+                }
+            } else {
+                Button("OK", role: .cancel) {
+                    model.dismissCATRecoveryAlert()
+                }
+            }
+        } message: {
+            Text(model.catRecoveryAlert?.message ?? "CAT control is unavailable.")
+        }
     }
 
     #if os(macOS)

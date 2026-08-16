@@ -112,15 +112,55 @@ enum RadioFrontPanelKey: String, CaseIterable, Hashable, Sendable {
 enum RadioControllerError: LocalizedError, Equatable, Sendable {
     case adapterUnavailable
     case capabilityUnavailable(String)
+    case usbMmdvmMode
     case operationFailed(String)
 
     var errorDescription: String? {
         switch self {
         case .adapterUnavailable:
             return "No TH-D75 control adapter is installed in this build."
+        case .usbMmdvmMode:
+            return "The TH-D75 USB-C interface returned a valid MMDVM response, so CAT control is unavailable on that interface."
         case .capabilityUnavailable(let reason), .operationFailed(let reason):
             return reason
         }
+    }
+}
+
+enum RadioCATRecoveryAlert: Equatable, Sendable {
+    case usbMmdvmMode(automaticRecoveryAvailable: Bool)
+    case recoveryFailed(message: String)
+
+    var title: String {
+        switch self {
+        case .usbMmdvmMode:
+            return "USB-C Is in MMDVM Mode"
+        case .recoveryFailed:
+            return "CAT Recovery Failed"
+        }
+    }
+
+    var message: String {
+        switch self {
+        case .usbMmdvmMode(true):
+            return "The TH-D75 USB-C interface returned a validated MMDVM version response instead of CAT. This can be caused by DV Gateway or another MMDVM session. Azimuth can use its paired Bluetooth control link, verify the same radio, turn Menu 650 off if needed, and reconnect only after USB-C proves CAT. The radio restarts if Menu 650 changes, and recovery can take more than a minute."
+        case .usbMmdvmMode(false):
+            return "The TH-D75 USB-C interface returned a validated MMDVM version response instead of CAT. End any active MMDVM or DV Gateway session. If no host session is active, set Menu 650 (DV Gateway) to Off and power-cycle the radio, then reconnect."
+        case .recoveryFailed(let message):
+            return message
+        }
+    }
+
+    var automaticRecoveryAvailable: Bool {
+        switch self {
+        case .usbMmdvmMode(let available): return available
+        case .recoveryFailed: return false
+        }
+    }
+
+    var isRecoveryOffer: Bool {
+        if case .usbMmdvmMode = self { return true }
+        return false
     }
 }
 
@@ -179,8 +219,10 @@ struct RadioSettingApplyReport: Equatable, Sendable {
 protocol RadioControlling: AnyObject {
     var currentState: RadioWorkspaceState { get }
     var updates: AsyncStream<RadioWorkspaceState> { get }
+    var automaticCATRecoveryAvailable: Bool { get }
 
     func connect() async throws
+    func restoreCATFromUSBMMDVM() async throws
     func disconnect() async
     func refreshScreen() async throws
     func refreshSettings() async throws
@@ -189,6 +231,16 @@ protocol RadioControlling: AnyObject {
         _ changes: [ValidatedRadioSettingChange],
         progress: @escaping @MainActor @Sendable (RadioSettingApplyProgress) -> Void
     ) async throws -> RadioSettingApplyReport
+}
+
+extension RadioControlling {
+    var automaticCATRecoveryAvailable: Bool { false }
+
+    func restoreCATFromUSBMMDVM() async throws {
+        throw RadioControllerError.capabilityUnavailable(
+            "Automatic USB MMDVM-to-CAT recovery is unavailable in this build."
+        )
+    }
 }
 
 /// Honest standalone default. It makes the complete UI previewable without

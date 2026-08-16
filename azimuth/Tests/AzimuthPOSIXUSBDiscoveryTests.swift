@@ -89,6 +89,484 @@ final class AzimuthPOSIXUSBDiscoveryTests: XCTestCase {
             XCTAssertEqual(error as? AzimuthUSBLinkError, .serviceNotFound)
         }
     }
+
+    func testOpenedDeviceBindingIncludesNodeIdentityAndCharacterType() {
+        let character = POSIXAzimuthUSBSerialLink.openedDeviceNode(
+            device: 7,
+            inode: 11,
+            rawDevice: 13,
+            mode: UInt16(S_IFCHR) | 0o600
+        )
+        let replacement = POSIXAzimuthUSBSerialLink.openedDeviceNode(
+            device: 7,
+            inode: 12,
+            rawDevice: 14,
+            mode: UInt16(S_IFCHR) | 0o600
+        )
+
+        XCTAssertTrue(character.isCharacterDevice)
+        XCTAssertNotEqual(character, replacement)
+        XCTAssertFalse(
+            POSIXAzimuthUSBSerialLink.openedDeviceNode(
+                device: 7,
+                inode: 11,
+                rawDevice: 13,
+                mode: UInt16(S_IFREG) | 0o600
+            ).isCharacterDevice
+        )
+    }
+
+    func testTHD75QualificationUsesBothUSBIdentifiers() {
+        let exact = POSIXAzimuthUSBSerialLink.USBIdentity(
+            vendorID: POSIXAzimuthUSBSerialLink.thD75VendorID,
+            productID: POSIXAzimuthUSBSerialLink.thD75ProductID,
+            serialNumber: "C0000001"
+        )
+        XCTAssertTrue(POSIXAzimuthUSBSerialLink.isTHD75(exact))
+        XCTAssertFalse(POSIXAzimuthUSBSerialLink.isTHD75(.init(
+            vendorID: exact.vendorID,
+            productID: 0x0001,
+            serialNumber: exact.serialNumber
+        )))
+        XCTAssertFalse(POSIXAzimuthUSBSerialLink.isTHD75(.init(
+            vendorID: 0x0001,
+            productID: exact.productID,
+            serialNumber: exact.serialNumber
+        )))
+    }
+
+    func testOpenBindingPublishesOnlyStableRegistryAndNodeIdentity() throws {
+        let fixture = POSIXOpenFixture()
+
+        let opened = try POSIXAzimuthUSBSerialLink.openAndBindDevice(
+            requestedPath: nil,
+            access: fixture.access()
+        )
+
+        XCTAssertEqual(opened.fileDescriptor, fixture.fileDescriptor)
+        XCTAssertEqual(opened.path, fixture.path)
+        XCTAssertEqual(opened.identity.serialNumber, "C0000001")
+        XCTAssertEqual(fixture.configureCallCount, 1)
+        XCTAssertTrue(fixture.closedFileDescriptors.isEmpty)
+    }
+
+    func testOpenBindingRejectsRegistryEntrySwapAndClosesDescriptor() {
+        let fixture = POSIXOpenFixture()
+        fixture.registeredDevices[1] = .init(
+            identity: fixture.identity,
+            registryEntryID: 0xBEEF
+        )
+
+        assertUnstableIdentity(fixture)
+    }
+
+    func testOpenBindingRejectsDeviceNodeSwapAndClosesDescriptor() {
+        let fixture = POSIXOpenFixture()
+        fixture.pathNodes[1] = POSIXAzimuthUSBSerialLink.openedDeviceNode(
+            device: 7,
+            inode: 99,
+            rawDevice: 101,
+            mode: UInt16(S_IFCHR) | 0o600
+        )
+
+        assertUnstableIdentity(fixture)
+    }
+
+    func testOpenBindingRejectsNonCharacterDescriptorAndClosesIt() {
+        let fixture = POSIXOpenFixture()
+        let regular = POSIXAzimuthUSBSerialLink.openedDeviceNode(
+            device: 7,
+            inode: 11,
+            rawDevice: 13,
+            mode: UInt16(S_IFREG) | 0o600
+        )
+        fixture.fileDescriptorNode = regular
+        fixture.pathNodes = [regular, regular]
+
+        assertUnstableIdentity(fixture)
+    }
+
+    func testOpenBindingClosesDescriptorWhenConfigurationFails() {
+        let fixture = POSIXOpenFixture()
+        fixture.configurationError = .systemCall(
+            operation: "test configure",
+            code: EIO
+        )
+
+        XCTAssertThrowsError(
+            try POSIXAzimuthUSBSerialLink.openAndBindDevice(
+                requestedPath: nil,
+                access: fixture.access()
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? AzimuthUSBLinkError,
+                fixture.configurationError
+            )
+        }
+        XCTAssertEqual(fixture.closedFileDescriptors, [fixture.fileDescriptor])
+    }
+
+    func testOpenedSerialIsCachedUntilCloseAndThenCleared() throws {
+        var descriptors = [Int32](repeating: -1, count: 2)
+        XCTAssertEqual(Darwin.pipe(&descriptors), 0)
+        let fixture = POSIXOpenFixture(fileDescriptor: descriptors[0])
+        fixture.closeRealFileDescriptor = true
+        let link = POSIXAzimuthUSBSerialLink(openSystemAccess: fixture.access())
+        defer {
+            link.close()
+            _ = Darwin.close(descriptors[1])
+        }
+
+        XCTAssertNil(link.hardwareSerialNumber)
+        try link.open()
+        XCTAssertEqual(link.hardwareSerialNumber, "C0000001")
+
+        // A pathname lookup after open must never replace the cached identity.
+        fixture.registeredDevices = [.init(
+            identity: .init(
+                vendorID: POSIXAzimuthUSBSerialLink.thD75VendorID,
+                productID: POSIXAzimuthUSBSerialLink.thD75ProductID,
+                serialNumber: "C0000002"
+            ),
+            registryEntryID: 0xBEEF
+        )]
+        XCTAssertEqual(link.hardwareSerialNumber, "C0000001")
+
+        link.close()
+        XCTAssertEqual(fixture.descriptorClosed.wait(timeout: .now() + 1), .success)
+        XCTAssertNil(link.hardwareSerialNumber)
+        XCTAssertEqual(fixture.closedFileDescriptors, [descriptors[0]])
+    }
+
+    func testReadabilityEventRejectsReusedDescriptorFromOlderGeneration() {
+        XCTAssertTrue(POSIXAzimuthUSBSerialLink.eventMatchesCurrentSession(
+            eventFileDescriptor: 42,
+            eventGeneration: 7,
+            currentFileDescriptor: 42,
+            currentGeneration: 7
+        ))
+        XCTAssertFalse(POSIXAzimuthUSBSerialLink.eventMatchesCurrentSession(
+            eventFileDescriptor: 42,
+            eventGeneration: 7,
+            currentFileDescriptor: 42,
+            currentGeneration: 8
+        ))
+        XCTAssertFalse(POSIXAzimuthUSBSerialLink.eventMatchesCurrentSession(
+            eventFileDescriptor: 41,
+            eventGeneration: 7,
+            currentFileDescriptor: 42,
+            currentGeneration: 7
+        ))
+    }
+
+    func testCloseQuiescesOldReadSourceBeforeReopenTouchesTTY() throws {
+        let fixture = try POSIXLifecycleFixture()
+        let eventQueue = DispatchQueue(label: "org.swiftraccoon.azimuth.posix-usb.race-test")
+        eventQueue.suspend()
+        var eventQueueIsSuspended = true
+        let link = POSIXAzimuthUSBSerialLink(
+            openSystemAccess: fixture.access(),
+            eventQueue: eventQueue
+        )
+        defer {
+            if eventQueueIsSuspended { eventQueue.resume() }
+            link.close()
+            fixture.closeWriteDescriptors()
+        }
+
+        try link.open()
+        let oldDoorbell = POSIXDoorbellRecorder()
+        try link.armDoorbell { hasData in
+            oldDoorbell.record(hasData)
+        }
+        try fixture.writeToSession(0, byte: 0x11)
+
+        link.close()
+        XCTAssertEqual(oldDoorbell.fired.wait(timeout: .now() + 1), .success)
+        XCTAssertEqual(oldDoorbell.values, [false])
+        XCTAssertEqual(fixture.closedFileDescriptors, [])
+
+        let reopenStarted = DispatchSemaphore(value: 0)
+        let reopenFinished = DispatchSemaphore(value: 0)
+        let reopenResult = POSIXReopenResult()
+        DispatchQueue.global().async {
+            reopenStarted.signal()
+            do {
+                try link.open()
+            } catch {
+                reopenResult.record(error)
+            }
+            reopenFinished.signal()
+        }
+        XCTAssertEqual(reopenStarted.wait(timeout: .now() + 1), .success)
+        XCTAssertEqual(reopenFinished.wait(timeout: .now() + 0.1), .timedOut)
+        XCTAssertEqual(fixture.openedFileDescriptors.count, 1)
+        XCTAssertEqual(fixture.closedFileDescriptors, [])
+
+        eventQueue.resume()
+        eventQueueIsSuspended = false
+        XCTAssertEqual(reopenFinished.wait(timeout: .now() + 1), .success)
+        XCTAssertNil(reopenResult.error)
+        XCTAssertEqual(
+            fixture.lifecycleEvents,
+            [
+                .opened(fixture.readFileDescriptors[0]),
+                .closed(fixture.readFileDescriptors[0]),
+                .opened(fixture.readFileDescriptors[1]),
+            ]
+        )
+
+        let currentDoorbell = POSIXDoorbellRecorder()
+        try link.armDoorbell { hasData in
+            currentDoorbell.record(hasData)
+        }
+        try fixture.writeToSession(1, byte: 0x22)
+        XCTAssertEqual(currentDoorbell.fired.wait(timeout: .now() + 1), .success)
+        XCTAssertEqual(currentDoorbell.values, [true])
+
+        link.close()
+        XCTAssertEqual(fixture.descriptorClosed.wait(timeout: .now() + 1), .success)
+        XCTAssertEqual(fixture.descriptorClosed.wait(timeout: .now() + 1), .success)
+        XCTAssertEqual(
+            fixture.closedFileDescriptors,
+            fixture.readFileDescriptors
+        )
+    }
+
+    private func assertUnstableIdentity(
+        _ fixture: POSIXOpenFixture,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertThrowsError(
+            try POSIXAzimuthUSBSerialLink.openAndBindDevice(
+                requestedPath: nil,
+                access: fixture.access()
+            ),
+            file: file,
+            line: line
+        ) { error in
+            XCTAssertEqual(
+                error as? AzimuthUSBLinkError,
+                .openedDeviceIdentityUnstable(fixture.path),
+                file: file,
+                line: line
+            )
+        }
+        XCTAssertEqual(
+            fixture.closedFileDescriptors,
+            [fixture.fileDescriptor],
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(fixture.configureCallCount, 0, file: file, line: line)
+    }
+}
+
+private final class POSIXOpenFixture {
+    let path = "/dev/cu.usbmodem-test"
+    let identity = POSIXAzimuthUSBSerialLink.USBIdentity(
+        vendorID: POSIXAzimuthUSBSerialLink.thD75VendorID,
+        productID: POSIXAzimuthUSBSerialLink.thD75ProductID,
+        serialNumber: "C0000001"
+    )
+    let fileDescriptor: Int32
+    var registeredDevices: [POSIXAzimuthUSBSerialLink.RegisteredUSBDevice?]
+    var fileDescriptorNode: POSIXAzimuthUSBSerialLink.OpenedDeviceNode
+    var pathNodes: [POSIXAzimuthUSBSerialLink.OpenedDeviceNode]
+    var configurationError: AzimuthUSBLinkError?
+    var configureCallCount = 0
+    var closedFileDescriptors: [Int32] = []
+    var closeRealFileDescriptor = false
+    let descriptorClosed = DispatchSemaphore(value: 0)
+
+    init(fileDescriptor: Int32 = 42) {
+        self.fileDescriptor = fileDescriptor
+        let node = POSIXAzimuthUSBSerialLink.openedDeviceNode(
+            device: 7,
+            inode: 11,
+            rawDevice: 13,
+            mode: UInt16(S_IFCHR) | 0o600
+        )
+        fileDescriptorNode = node
+        pathNodes = [node, node]
+        let registered = POSIXAzimuthUSBSerialLink.RegisteredUSBDevice(
+            identity: identity,
+            registryEntryID: 0xCAFE
+        )
+        registeredDevices = [registered, registered]
+    }
+
+    func access() -> POSIXAzimuthUSBSerialLink.OpenSystemAccess {
+        .init(
+            availableDevicePaths: { [self] in [path] },
+            registeredUSBDevice: { _ in
+                guard !self.registeredDevices.isEmpty else { return nil }
+                return self.registeredDevices.removeFirst()
+            },
+            openFileDescriptor: { _ in self.fileDescriptor },
+            nodeForFileDescriptor: { _ in self.fileDescriptorNode },
+            nodeForPath: { _ in
+                guard !self.pathNodes.isEmpty else {
+                    throw AzimuthUSBLinkError.openedDeviceIdentityUnstable(self.path)
+                }
+                return self.pathNodes.removeFirst()
+            },
+            configure: { _ in
+                self.configureCallCount += 1
+                if let configurationError = self.configurationError {
+                    throw configurationError
+                }
+            },
+            closeFileDescriptor: { descriptor in
+                self.closedFileDescriptors.append(descriptor)
+                if self.closeRealFileDescriptor { _ = Darwin.close(descriptor) }
+                self.descriptorClosed.signal()
+            }
+        )
+    }
+}
+
+private final class POSIXReopenResult: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recordedError: Error?
+
+    var error: Error? {
+        lock.withLock { recordedError }
+    }
+
+    func record(_ error: Error) {
+        lock.withLock { recordedError = error }
+    }
+}
+
+private final class POSIXDoorbellRecorder: @unchecked Sendable {
+    let fired = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var recordedValues: [Bool] = []
+
+    var values: [Bool] {
+        lock.withLock { recordedValues }
+    }
+
+    func record(_ value: Bool) {
+        lock.withLock { recordedValues.append(value) }
+        fired.signal()
+    }
+}
+
+private final class POSIXLifecycleFixture: @unchecked Sendable {
+    enum Event: Equatable {
+        case opened(Int32)
+        case closed(Int32)
+    }
+
+    let path = "/dev/cu.usbmodem-race-test"
+    let identity = POSIXAzimuthUSBSerialLink.USBIdentity(
+        vendorID: POSIXAzimuthUSBSerialLink.thD75VendorID,
+        productID: POSIXAzimuthUSBSerialLink.thD75ProductID,
+        serialNumber: "C0000001"
+    )
+    let readFileDescriptors: [Int32]
+    let writeFileDescriptors: [Int32]
+    let descriptorClosed = DispatchSemaphore(value: 0)
+
+    private let lock = NSLock()
+    private var remainingReadFileDescriptors: [Int32]
+    private var recordedOpenedFileDescriptors: [Int32] = []
+    private var recordedClosedFileDescriptors: [Int32] = []
+    private var recordedLifecycleEvents: [Event] = []
+    private var writeDescriptorsAreClosed = false
+
+    init() throws {
+        var first = [Int32](repeating: -1, count: 2)
+        guard Darwin.pipe(&first) == 0 else {
+            throw AzimuthUSBLinkError.systemCall(operation: "create first test pipe", code: errno)
+        }
+        var second = [Int32](repeating: -1, count: 2)
+        guard Darwin.pipe(&second) == 0 else {
+            _ = Darwin.close(first[0])
+            _ = Darwin.close(first[1])
+            throw AzimuthUSBLinkError.systemCall(operation: "create second test pipe", code: errno)
+        }
+        readFileDescriptors = [first[0], second[0]]
+        writeFileDescriptors = [first[1], second[1]]
+        remainingReadFileDescriptors = readFileDescriptors
+    }
+
+    var openedFileDescriptors: [Int32] {
+        lock.withLock { recordedOpenedFileDescriptors }
+    }
+
+    var closedFileDescriptors: [Int32] {
+        lock.withLock { recordedClosedFileDescriptors }
+    }
+
+    var lifecycleEvents: [Event] {
+        lock.withLock { recordedLifecycleEvents }
+    }
+
+    func access() -> POSIXAzimuthUSBSerialLink.OpenSystemAccess {
+        let node = POSIXAzimuthUSBSerialLink.openedDeviceNode(
+            device: 7,
+            inode: 11,
+            rawDevice: 13,
+            mode: UInt16(S_IFCHR) | 0o600
+        )
+        let registered = POSIXAzimuthUSBSerialLink.RegisteredUSBDevice(
+            identity: identity,
+            registryEntryID: 0xCAFE
+        )
+        return .init(
+            availableDevicePaths: { [path] in [path] },
+            registeredUSBDevice: { _ in registered },
+            openFileDescriptor: { [self] _ in
+                try lock.withLock {
+                    guard !remainingReadFileDescriptors.isEmpty else {
+                        throw AzimuthUSBLinkError.systemCall(
+                            operation: "open exhausted test descriptor",
+                            code: EMFILE
+                        )
+                    }
+                    let descriptor = remainingReadFileDescriptors.removeFirst()
+                    recordedOpenedFileDescriptors.append(descriptor)
+                    recordedLifecycleEvents.append(.opened(descriptor))
+                    return descriptor
+                }
+            },
+            nodeForFileDescriptor: { _ in node },
+            nodeForPath: { _ in node },
+            configure: { _ in },
+            closeFileDescriptor: { [self] descriptor in
+                _ = Darwin.close(descriptor)
+                lock.withLock {
+                    recordedClosedFileDescriptors.append(descriptor)
+                    recordedLifecycleEvents.append(.closed(descriptor))
+                }
+                descriptorClosed.signal()
+            }
+        )
+    }
+
+    func writeToSession(_ index: Int, byte: UInt8) throws {
+        var byte = byte
+        let result = withUnsafePointer(to: &byte) {
+            Darwin.write(writeFileDescriptors[index], $0, 1)
+        }
+        guard result == 1 else {
+            throw AzimuthUSBLinkError.systemCall(operation: "write test pipe", code: errno)
+        }
+    }
+
+    func closeWriteDescriptors() {
+        let descriptors: [Int32] = lock.withLock {
+            guard !writeDescriptorsAreClosed else { return [] }
+            writeDescriptorsAreClosed = true
+            return writeFileDescriptors
+        }
+        for descriptor in descriptors { _ = Darwin.close(descriptor) }
+    }
 }
 
 #endif

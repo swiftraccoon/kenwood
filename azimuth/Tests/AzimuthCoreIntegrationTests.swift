@@ -237,6 +237,16 @@ final class AzimuthCoreCatalogTests: XCTestCase {
     }
 }
 
+#if os(macOS)
+@MainActor
+final class AzimuthBluetoothHelperPackagingTests: XCTestCase {
+    func testBundledRecoveryHelperLaunchesInsideAppSandbox() async throws {
+        let candidateCount = try await validateBluetoothRecoveryHelper()
+        XCTAssertLessThanOrEqual(candidateCount, 64)
+    }
+}
+#endif
+
 @MainActor
 final class AzimuthLiveRadioControllerTests: XCTestCase {
     func testApprovedListExecutesAsOneCoreBatchAndPublishesVerifiedValues() async throws {
@@ -279,31 +289,329 @@ final class AzimuthLiveRadioControllerTests: XCTestCase {
         await controller.disconnect()
     }
 
-    func testMMDVMPreflightStopsBeforeCoreAndExplainsHowToRestoreCAT() async throws {
+    func testMMDVMPreflightStopsBeforeCoreAndPreservesTypedRecoveryCondition() async throws {
         let transport = IntegrationTestTransport()
         let core = IntegrationTestCore()
         let connector = IntegrationTestCoreConnector(core: core)
+        let recovery = IntegrationTestCATRecovery()
         let controller = try AzimuthLiveRadioController(
             transport: transport,
             connectCore: { transport in
                 try await connector.connect(transport: transport)
             },
-            prepareRadioForAutomation: { _ in .mmdvm }
+            prepareRadioForAutomation: { _ in .mmdvm },
+            recoverUSBMMDVM: { serialNumber in recovery.operation(serialNumber) },
+            automaticCATRecoveryAvailable: true
         )
 
         do {
             try await controller.connect()
             XCTFail("MMDVM mode must not enter the strict automation core")
-        } catch {
-            XCTAssertTrue(error.localizedDescription.contains("Menu 650"))
+        } catch let error as RadioControllerError {
+            XCTAssertEqual(error, .usbMmdvmMode)
         }
 
         XCTAssertEqual(connector.callCount, 0)
+        XCTAssertEqual(recovery.callCount, 0)
+        XCTAssertEqual(transport.closeCallCount, 1)
         guard case .failed(let message) = controller.currentState.connection else {
             return XCTFail("The workspace should publish an actionable connection failure")
         }
-        XCTAssertTrue(message.contains("DV Gateway/MMDVM"))
-        XCTAssertTrue(message.contains("Menu 650"))
+        XCTAssertTrue(message.contains("valid MMDVM response"))
+        XCTAssertTrue(message.contains("CAT control is unavailable"))
+    }
+
+    func testApprovedMMDVMRecoveryUsesBluetoothThenProvesUSBAndConnectsCore() async throws {
+        let transport = IntegrationTestTransport()
+        let core = IntegrationTestCore()
+        let connector = IntegrationTestCoreConnector(core: core)
+        let preflight = IntegrationTestModePreflight(modes: [.mmdvm, .cat, .cat])
+        let recovery = IntegrationTestCATRecovery()
+        let controller = try AzimuthLiveRadioController(
+            transport: transport,
+            connectCore: { transport in
+                try await connector.connect(transport: transport)
+            },
+            prepareRadioForAutomation: { _ in try preflight.nextMode() },
+            recoverUSBMMDVM: { serialNumber in recovery.operation(serialNumber) },
+            automaticCATRecoveryAvailable: true,
+            catRecoveryWindow: .seconds(1),
+            catRecoveryPollInterval: .milliseconds(1)
+        )
+
+        do {
+            try await controller.connect()
+            XCTFail("The first MMDVM observation must require user consent")
+        } catch let error as RadioControllerError {
+            XCTAssertEqual(error, .usbMmdvmMode)
+        }
+        XCTAssertEqual(recovery.callCount, 0)
+
+        try await controller.restoreCATFromUSBMMDVM()
+
+        XCTAssertEqual(recovery.callCount, 1)
+        XCTAssertEqual(recovery.lastExpectedSerialNumber, "C3C10368")
+        XCTAssertEqual(preflight.callCount, 3)
+        XCTAssertEqual(connector.callCount, 1)
+        XCTAssertTrue(controller.currentState.connection.isConnected)
+        await controller.disconnect()
+    }
+
+    func testDisconnectBeforeBluetoothRecoveryStartsPreventsMutation() async throws {
+        let transport = IntegrationTestTransport()
+        let recovery = IntegrationTestCATRecovery()
+        let controller = try AzimuthLiveRadioController(
+            transport: transport,
+            prepareRadioForAutomation: { _ in .mmdvm },
+            recoverUSBMMDVM: { serialNumber in recovery.operation(serialNumber) },
+            automaticCATRecoveryAvailable: true
+        )
+
+        do {
+            try await controller.connect()
+            XCTFail("MMDVM mode must stop ordinary CAT connection")
+        } catch let error as RadioControllerError {
+            XCTAssertEqual(error, .usbMmdvmMode)
+        }
+
+        transport.blockNextClose()
+        let restoreTask = Task {
+            try await controller.restoreCATFromUSBMMDVM()
+        }
+        try await waitUntil { transport.hasBlockedClose }
+
+        await controller.disconnect()
+
+        XCTAssertEqual(recovery.callCount, 0)
+        XCTAssertEqual(controller.currentState.connection, .disconnected)
+        transport.releaseBlockedClose()
+        do {
+            try await restoreTask.value
+            XCTFail("Recovery invalidated before Bluetooth starts must be cancelled")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+        XCTAssertEqual(recovery.callCount, 0)
+    }
+
+    func testDisconnectCancelsAndWaitsForInFlightBluetoothRecovery() async throws {
+        let transport = IntegrationTestTransport()
+        let recovery = IntegrationTestBlockingCATRecovery()
+        let controller = try AzimuthLiveRadioController(
+            transport: transport,
+            prepareRadioForAutomation: { _ in .mmdvm },
+            recoverUSBMMDVM: { serialNumber in recovery.operation(serialNumber) },
+            automaticCATRecoveryAvailable: true
+        )
+
+        do {
+            try await controller.connect()
+            XCTFail("MMDVM mode must stop ordinary CAT connection")
+        } catch let error as RadioControllerError {
+            XCTAssertEqual(error, .usbMmdvmMode)
+        }
+
+        let restoreTask = Task {
+            try await controller.restoreCATFromUSBMMDVM()
+        }
+        try await waitUntil { recovery.hasStarted }
+        let disconnectTask = Task {
+            await controller.disconnect()
+        }
+        try await waitUntil { recovery.cancellationObserved }
+
+        XCTAssertNotEqual(controller.currentState.connection, .disconnected)
+        recovery.complete()
+        await disconnectTask.value
+        do {
+            try await restoreTask.value
+            XCTFail("A completed Menu 650 result must remain visible after disconnect")
+        } catch let error as RadioControllerError {
+            guard case .operationFailed(let detail) = error else {
+                return XCTFail("Expected a truthful completed-operation error, got \(error)")
+            }
+            XCTAssertTrue(detail.contains("Menu 650 was changed to Off"))
+            XCTAssertTrue(detail.contains("USB-C CAT reconnect was stopped"))
+        }
+        XCTAssertEqual(controller.currentState.connection, .disconnected)
+        XCTAssertTrue(recovery.cancellationObserved)
+    }
+
+    func testSwiftTaskCancellationSignalsNativeOperationAndAwaitsItsFinish() async throws {
+        let transport = IntegrationTestTransport()
+        let recovery = IntegrationTestBlockingCATRecovery()
+        let controller = try AzimuthLiveRadioController(
+            transport: transport,
+            prepareRadioForAutomation: { _ in .mmdvm },
+            recoverUSBMMDVM: { serialNumber in recovery.operation(serialNumber) },
+            automaticCATRecoveryAvailable: true
+        )
+
+        do {
+            try await controller.connect()
+            XCTFail("MMDVM mode must stop ordinary CAT connection")
+        } catch let error as RadioControllerError {
+            XCTAssertEqual(error, .usbMmdvmMode)
+        }
+
+        let restoreTask = Task {
+            try await controller.restoreCATFromUSBMMDVM()
+        }
+        try await waitUntil { recovery.hasStarted }
+        restoreTask.cancel()
+        try await waitUntil { recovery.cancellationObserved }
+
+        XCTAssertFalse(recovery.hasFinished)
+        recovery.complete()
+        do {
+            try await restoreTask.value
+            XCTFail("A completed Menu 650 result must remain visible after late cancellation")
+        } catch let error as RadioControllerError {
+            guard case .operationFailed(let detail) = error else {
+                return XCTFail("Expected a truthful completed-operation error, got \(error)")
+            }
+            XCTAssertTrue(detail.contains("Menu 650 was changed to Off"))
+            XCTAssertTrue(detail.contains("USB-C CAT reconnect was stopped"))
+        }
+        XCTAssertTrue(recovery.hasFinished)
+        await controller.disconnect()
+    }
+
+    func testAutomaticRecoveryIsRejectedAfterAnUnrelatedConnectionFailure() async throws {
+        let transport = IntegrationTestTransport()
+        let recovery = IntegrationTestCATRecovery()
+        let controller = try AzimuthLiveRadioController(
+            transport: transport,
+            prepareRadioForAutomation: { _ in .unresponsive },
+            recoverUSBMMDVM: { serialNumber in recovery.operation(serialNumber) },
+            automaticCATRecoveryAvailable: true
+        )
+
+        do {
+            try await controller.connect()
+            XCTFail("An unresponsive USB connection must fail")
+        } catch {
+            XCTAssertFalse(error is CancellationError)
+        }
+
+        do {
+            try await controller.restoreCATFromUSBMMDVM()
+            XCTFail("An unrelated failure must not authorize a Menu 650 write")
+        } catch let error as RadioControllerError {
+            guard case .capabilityUnavailable(let reason) = error else {
+                return XCTFail("Expected capabilityUnavailable, got \(error)")
+            }
+            XCTAssertTrue(reason.contains("validated USB MMDVM response"))
+        }
+        XCTAssertEqual(recovery.callCount, 0)
+    }
+
+    func testMMDVMRecoveryIsUnavailableWithoutAStableUSBSerialIdentity() async throws {
+        let transport = IntegrationTestTransport(hardwareSerialNumber: nil)
+        let recovery = IntegrationTestCATRecovery()
+        let controller = try AzimuthLiveRadioController(
+            transport: transport,
+            prepareRadioForAutomation: { _ in .mmdvm },
+            recoverUSBMMDVM: { serialNumber in recovery.operation(serialNumber) },
+            automaticCATRecoveryAvailable: true
+        )
+
+        do {
+            try await controller.connect()
+            XCTFail("MMDVM mode must stop ordinary CAT connection")
+        } catch let error as RadioControllerError {
+            XCTAssertEqual(error, .usbMmdvmMode)
+        }
+        XCTAssertFalse(controller.automaticCATRecoveryAvailable)
+
+        do {
+            try await controller.restoreCATFromUSBMMDVM()
+            XCTFail("Recovery without a USB serial identity must fail closed")
+        } catch let error as RadioControllerError {
+            guard case .capabilityUnavailable(let reason) = error else {
+                return XCTFail("Expected capabilityUnavailable, got \(error)")
+            }
+            XCTAssertTrue(reason.contains("stable radio serial number"))
+        }
+        XCTAssertEqual(recovery.callCount, 0)
+    }
+
+    func testRecoveryRejectsADifferentUSBRadioAfterBluetoothWork() async throws {
+        let transport = IntegrationTestTransport()
+        let connector = IntegrationTestCoreConnector(core: IntegrationTestCore())
+        let controller = try AzimuthLiveRadioController(
+            transport: transport,
+            connectCore: { transport in
+                try await connector.connect(transport: transport)
+            },
+            prepareRadioForAutomation: { _ in .mmdvm },
+            recoverUSBMMDVM: { _ in
+                IntegrationTestImmediateCATRecoveryOperation {
+                    transport.setHardwareSerialNumber("C5310165")
+                    return .changedRadioRebooting
+                }
+            },
+            automaticCATRecoveryAvailable: true,
+            catRecoveryWindow: .milliseconds(20),
+            catRecoveryPollInterval: .milliseconds(1)
+        )
+
+        do {
+            try await controller.connect()
+            XCTFail("MMDVM mode must stop ordinary CAT connection")
+        } catch let error as RadioControllerError {
+            XCTAssertEqual(error, .usbMmdvmMode)
+        }
+
+        do {
+            try await controller.restoreCATFromUSBMMDVM()
+            XCTFail("A different USB radio must not be accepted after recovery")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("different USB radio"))
+            XCTAssertTrue(error.localizedDescription.contains("C3C10368"))
+            XCTAssertTrue(error.localizedDescription.contains("C5310165"))
+        }
+        XCTAssertEqual(connector.callCount, 0)
+    }
+
+    func testRecoveryFinalConnectRechecksIdentityAfterCDCReopen() async throws {
+        let transport = IntegrationTestTransport()
+        transport.setHardwareSerialNumber("C5310165", onOpen: 4)
+        let connector = IntegrationTestCoreConnector(core: IntegrationTestCore())
+        let preflight = IntegrationTestModePreflight(
+            modes: [.mmdvm, .cat, .unresponsive, .cat]
+        )
+        let recovery = IntegrationTestCATRecovery()
+        let controller = try AzimuthLiveRadioController(
+            transport: transport,
+            connectCore: { transport in
+                try await connector.connect(transport: transport)
+            },
+            prepareRadioForAutomation: { _ in try preflight.nextMode() },
+            recoverUSBMMDVM: { serialNumber in recovery.operation(serialNumber) },
+            automaticCATRecoveryAvailable: true,
+            catRecoveryWindow: .seconds(1),
+            catRecoveryPollInterval: .milliseconds(1)
+        )
+
+        do {
+            try await controller.connect()
+            XCTFail("The first MMDVM observation must require user consent")
+        } catch let error as RadioControllerError {
+            XCTAssertEqual(error, .usbMmdvmMode)
+        }
+
+        do {
+            try await controller.restoreCATFromUSBMMDVM()
+            XCTFail("A replacement radio on the CDC retry must not enter the core")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("CDC recovery reopen"))
+            XCTAssertTrue(error.localizedDescription.contains("C3C10368"))
+            XCTAssertTrue(error.localizedDescription.contains("C5310165"))
+        }
+        XCTAssertEqual(transport.openCallCount, 4)
+        XCTAssertEqual(preflight.callCount, 3)
+        XCTAssertEqual(connector.callCount, 0)
     }
 
     func testUnresponsiveCDCSessionIsReopenedOnceBeforeCoreConnection() async throws {
@@ -602,15 +910,128 @@ private final class IntegrationTestModePreflight: @unchecked Sendable {
     }
 }
 
+private final class IntegrationTestCATRecovery: AzimuthCATRecoveryOperation, @unchecked Sendable {
+    private let lock = NSLock()
+    private var calls = 0
+    private var expectedSerialNumber: String?
+
+    var callCount: Int { lock.withLock { calls } }
+    var lastExpectedSerialNumber: String? { lock.withLock { expectedSerialNumber } }
+
+    func operation(_ serialNumber: String) -> any AzimuthCATRecoveryOperation {
+        lock.withLock { expectedSerialNumber = serialNumber }
+        return self
+    }
+
+    func cancel() {}
+
+    func run() async throws -> DvGatewayRecoveryOutcome {
+        lock.withLock {
+            calls += 1
+        }
+        return .changedRadioRebooting
+    }
+}
+
+private final class IntegrationTestBlockingCATRecovery: AzimuthCATRecoveryOperation, @unchecked Sendable {
+    private let lock = NSLock()
+    private var started = false
+    private var cancelled = false
+    private var finished = false
+    private var continuation: CheckedContinuation<DvGatewayRecoveryOutcome, Never>?
+
+    var hasStarted: Bool { lock.withLock { started } }
+    var cancellationObserved: Bool { lock.withLock { cancelled } }
+    var hasFinished: Bool { lock.withLock { finished } }
+
+    func operation(_ serialNumber: String) -> any AzimuthCATRecoveryOperation {
+        _ = serialNumber
+        return self
+    }
+
+    func cancel() {
+        lock.withLock { cancelled = true }
+    }
+
+    func run() async throws -> DvGatewayRecoveryOutcome {
+        let outcome = await withCheckedContinuation { continuation in
+            lock.withLock {
+                self.continuation = continuation
+                started = true
+            }
+        }
+        lock.withLock { finished = true }
+        return outcome
+    }
+
+    func complete() {
+        let pending = lock.withLock {
+            let pending = continuation
+            continuation = nil
+            return pending
+        }
+        pending?.resume(returning: .changedRadioRebooting)
+    }
+}
+
+private final class IntegrationTestImmediateCATRecoveryOperation:
+    AzimuthCATRecoveryOperation,
+    @unchecked Sendable
+{
+    private let body: @Sendable () -> DvGatewayRecoveryOutcome
+
+    init(body: @escaping @Sendable () -> DvGatewayRecoveryOutcome) {
+        self.body = body
+    }
+
+    func cancel() {}
+
+    func run() async throws -> DvGatewayRecoveryOutcome {
+        body()
+    }
+}
+
 private final class IntegrationTestTransport: AzimuthRadioTransport, @unchecked Sendable {
     let device = AzimuthRadioDevice.thD75USBC
     private let lock = NSLock()
+    private var serialNumber: String?
     private var currentState: AzimuthRadioTransportState = .disconnected
     private var opens = 0
     private var closes = 0
+    private var serialNumberByOpen: [Int: String] = [:]
+    private var shouldBlockNextClose = false
+    private var blockedCloseContinuation: CheckedContinuation<Void, Never>?
+
+    init(hardwareSerialNumber: String? = "C3C10368") {
+        serialNumber = hardwareSerialNumber
+    }
+
+    var hardwareSerialNumber: String? { lock.withLock { serialNumber } }
+
+    func setHardwareSerialNumber(_ value: String?) {
+        lock.withLock { serialNumber = value }
+    }
+
+    func setHardwareSerialNumber(_ value: String, onOpen openCall: Int) {
+        lock.withLock { serialNumberByOpen[openCall] = value }
+    }
 
     var openCallCount: Int { lock.withLock { opens } }
     var closeCallCount: Int { lock.withLock { closes } }
+    var hasBlockedClose: Bool { lock.withLock { blockedCloseContinuation != nil } }
+
+    func blockNextClose() {
+        lock.withLock { shouldBlockNextClose = true }
+    }
+
+    func releaseBlockedClose() {
+        let continuation = lock.withLock {
+            let continuation = blockedCloseContinuation
+            blockedCloseContinuation = nil
+            return continuation
+        }
+        continuation?.resume()
+    }
 
     var state: AzimuthRadioTransportState {
         get async { lock.withLock { currentState } }
@@ -626,14 +1047,25 @@ private final class IntegrationTestTransport: AzimuthRadioTransport, @unchecked 
     func open() async throws {
         lock.withLock {
             opens += 1
+            if let scheduledSerialNumber = serialNumberByOpen.removeValue(forKey: opens) {
+                serialNumber = scheduledSerialNumber
+            }
             currentState = .connected
         }
     }
 
     func close() async {
-        lock.withLock {
+        let shouldBlock = lock.withLock {
             closes += 1
             currentState = .disconnected
+            let shouldBlock = shouldBlockNextClose
+            shouldBlockNextClose = false
+            return shouldBlock
+        }
+        if shouldBlock {
+            await withCheckedContinuation { continuation in
+                lock.withLock { blockedCloseContinuation = continuation }
+            }
         }
     }
 

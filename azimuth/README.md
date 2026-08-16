@@ -89,7 +89,10 @@ Kenwood TH-D75.
 - **Learn the D75.** Ship an original, searchable capability guide with
   task-oriented walkthroughs and contextual help.
 - **USB first.** Use USB-C on M-series iPads through USBDriverKit, and the
-  system CDC serial device on macOS.
+  system CDC serial device on macOS. If macOS validates an MMDVM version
+  response on USB-C, Azimuth can offer to use the paired Bluetooth control
+  link to verify the same radio, turn Menu 650 off if needed, and prove USB
+  CAT has returned.
 
 ## Safety contract
 
@@ -100,7 +103,9 @@ explicitly accepts it. Accepted changes use stale-value checks and verified
 read-back. RF transmission, reset, and firmware workflows remain outside the
 settings planner and require dedicated UI. APRS and IF-DSP temporarily own the
 serial session, so CAT-backed screen and settings operations resume only after
-their stop-and-requalification path succeeds.
+their stop-and-requalification path succeeds. Azimuth does not change Menu 650
+during connection probing. On macOS it offers the Bluetooth recovery as a
+separate choice only after USB-C has positively answered as MMDVM.
 
 ## Development
 
