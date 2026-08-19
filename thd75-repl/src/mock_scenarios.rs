@@ -162,7 +162,7 @@ fn mmdvm_scenario() -> MockTransport {
 }
 
 /// Radio already in Reflector Terminal Mode, followed by the exact MMDVM
-/// writes needed to initialize and stop a D-STAR gateway session.
+/// writes needed to initialize a D-STAR gateway session.
 ///
 /// This scenario deliberately has no catch-all write allowance. In
 /// particular, a CAT recovery preamble sent after the positive binary-mode
@@ -170,27 +170,24 @@ fn mmdvm_scenario() -> MockTransport {
 fn mmdvm_dstar_scenario() -> MockTransport {
     let mut mock = mmdvm_dstar_init_scenario();
 
-    // Script EOF stops the gateway without prompting. The persistent Menu 650
-    // setting remains enabled, but the MMDVM owner still emits its ordinary
-    // raw TNC-exit command before returning and closing the transport.
-    mock.expect(b"TN 0,0\r", b"");
+    // Script EOF stops the host gateway while preserving persistent Menu 650
+    // mode. Shutdown must not emit the transient CAT-side `TN 0,0` command.
     mock.pend_when_empty();
 
     mock
 }
 
 /// Interactive D-STAR scenario that accepts periodic status polls while the
-/// input prompt remains idle, then still requires the exact gateway-stop
-/// command at EOF.
+/// input prompt remains idle, then shuts the host gateway down at EOF without
+/// a transient CAT-side exit.
 fn mmdvm_dstar_idle_scenario() -> MockTransport {
     let mut mock = mmdvm_dstar_init_scenario();
 
     // The 250 ms MMDVM status poll is intentionally variable with wall-clock
     // scheduling. Accept those write-only frames while retaining the exact
-    // shutdown boundary below. The strict sibling scenario independently
-    // rejects every unexpected startup/init write.
+    // shutdown boundary. The strict sibling scenario independently rejects
+    // every unexpected startup/init write.
     mock.expect_any_write();
-    mock.expect(b"TN 0,0\r", b"");
     mock.pend_when_empty();
 
     mock

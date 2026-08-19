@@ -50,7 +50,7 @@ use kenwood_thd75::{
     AprsClient, AprsClientConfig, AprsEvent, AprsReportTimestamp, Ax25Address, DigipeaterConfig,
     IGateRfLocality, IGateToRfConfig, MessageAddressee, MessageText, StatusText,
 };
-use kenwood_thd75::{DstarEvent, DstarGateway, DstarGatewayConfig};
+use kenwood_thd75::{DstarEvent, DstarGateway, DstarGatewayConfig, PersistentMmdvm};
 use kenwood_thd75::{FirmwareProfile, Radio};
 
 use dstar_gateway::auth::AuthClient;
@@ -655,9 +655,9 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let script_strict = cli.script_strict;
 
-    // Run the async REPL inside a LocalSet because the MMDVM transport
-    // adapter uses `spawn_local`. Bluetooth's CFRunLoop lives entirely in
-    // the private transport helper and does not depend on this LocalSet.
+    // Keep the REPL's existing local owner scope. The MMDVM pump itself is
+    // runtime-spawned, and Bluetooth's CFRunLoop lives entirely in the private
+    // transport helper.
     let local = tokio::task::LocalSet::new();
     local.block_on(
         &rt,
@@ -740,7 +740,7 @@ impl DstarEntryRadio {
 /// the reflector UDP client.
 struct DstarSession {
     /// Radio-side MMDVM gateway.
-    gateway: DstarGateway<EitherTransport>,
+    gateway: DstarGateway<EitherTransport, PersistentMmdvm>,
     /// Reflector-side UDP session wrapper (runtime-dispatched across
     /// all three supported protocols).
     reflector: Option<ReflectorSession>,
@@ -1230,8 +1230,7 @@ async fn run_repl(
     };
 
     // Rustyline performs a blocking terminal read. Move the editor through
-    // `spawn_blocking` for each interactive prompt so the LocalSet remains
-    // free to drive the MMDVM transport pump and other radio tasks.
+    // `spawn_blocking` so the async runtime remains free to drive radio tasks.
     let mut rl = Some(rustyline::DefaultEditor::new()?);
     let mut pending_command = initial_command;
     let mut script_commands: std::collections::VecDeque<String> = std::collections::VecDeque::new();
@@ -1292,14 +1291,9 @@ async fn run_repl(
                     // way to walk them through a reconnect.
                     println!("The radio is still in Reflector Terminal Mode.");
                     println!("Set Menu 650 (DV Gateway) to Off to restore normal operation.");
-                    Some(
-                        radio
-                            .map_err(|error| {
-                                format!("stopping D-STAR gateway at end of input: {error}")
-                            })?
-                            // Disconnecting next, so CAT re-proof is moot.
-                            .into_radio_unproven(),
-                    )
+                    Some(radio.map_err(|error| {
+                        format!("stopping D-STAR gateway at end of input: {error}")
+                    })?)
                 }
             };
             if let Some(r) = radio {
@@ -2489,22 +2483,22 @@ async fn run_set_gateway_off(transport: EitherTransport) -> Result<(), Box<dyn s
     }
 }
 
-/// Attempt to leave Reflector Terminal Mode without operator keypresses.
+/// Leave Reflector Terminal Mode through the non-gateway control interface.
 ///
-/// The DV Gateway flag lives in radio flash and the CAT parser is gone
-/// in this mode, but the MCP programming handshake (`0M PROGRAM`) may
-/// still be routed by the firmware even while the gateway app owns the
-/// port. Try it: on success the flag is cleared (verified by read-back
-/// inside the session) and the radio reboots into normal control; the
-/// current link drops with the reboot. Once boot completes, the caller
-/// may open a new transport normally. On handshake timeout the radio is
-/// unchanged and the caller falls back to the guided operator exit.
+/// The DV Gateway flag lives in radio flash and the gateway-owned interface
+/// does not route the MCP programming handshake (`0M PROGRAM`). This operation
+/// therefore requires the other interface selected by Menu 985, such as USB
+/// when Bluetooth owns the gateway. On success the flag is cleared (verified
+/// by read-back inside the session) and the radio reboots into normal control;
+/// the current link drops with the reboot. Once boot completes, the caller may
+/// open a new transport normally.
 ///
 /// # Errors
 ///
-/// Returns an error if programming-mode entry, the page read, the page
-/// write, or the exit write fails. Entry timing out because the
-/// gateway app swallowed the handshake is the expected failure shape.
+/// Returns an error if programming-mode entry, the page read, the page write,
+/// or the exit write fails. A timeout on the gateway-owned interface leaves
+/// the radio unchanged; retry over the non-gateway interface or use the front
+/// panel.
 async fn automated_terminal_exit(
     radio: &mut Radio<EitherTransport>,
 ) -> Result<DetachedMcpPageUpdate, String> {
@@ -3585,33 +3579,28 @@ async fn connect_reflector(callsign: Callsign, link: &LinkArg) -> Result<Reflect
     Ok(session)
 }
 
-/// Exit D-STAR gateway mode and restore CAT mode.
-///
-/// Stops the gateway, disconnects, then does an MCP write to set
-/// the gateway mode back to Off (0x1CA0 = 0). Reconnects in CAT mode.
+/// Stop D-STAR gateway traffic, then wait for the operator to turn Menu 650
+/// off before reconnecting and proving CAT mode.
 async fn exit_dstar(
-    gw: DstarGateway<EitherTransport>,
+    gw: DstarGateway<EitherTransport, PersistentMmdvm>,
     cli_port: Option<&str>,
     cli_baud: u32,
 ) -> Result<Radio<EitherTransport>, String> {
-    // Stop the gateway. This sends TN 0,0 which won't actually exit
-    // Reflector Terminal Mode (that's a firmware setting, not a TNC
-    // mode). But it cleanly ends our MMDVM session.
+    // Stop the gateway without sending the transient `TN 0,0` exit. Menu 650
+    // keeps this link in persistent Reflector Terminal Mode.
     println!("Stopping D-STAR gateway.");
     let radio = gw
         .stop()
         .await
-        .map_err(|e| format!("Gateway stop failed: {e}"))?
-        // Disconnecting next, so CAT re-proof is moot.
-        .into_radio_unproven();
+        .map_err(|e| format!("Gateway stop failed: {e}"))?;
 
     // Disconnect BT to release the RFCOMM channel.
     drop(radio.disconnect().await);
 
-    // The radio is still in Reflector Terminal Mode. We cannot
-    // MCP-write it back to Off because MCP requires CAT mode, but
-    // the radio speaks MMDVM binary in TERM mode. This is the same
-    // limitation d75link has: the user must change Menu 650 manually.
+    // The radio is still in Reflector Terminal Mode. Its gateway-owned link
+    // does not route MCP entry, and this session does not own a qualified
+    // transport on the other interface. The operator must change Menu 650 on
+    // the front panel before this same-link reconnect can prove CAT.
     println!("D-STAR gateway stopped.");
     println!("Please set Menu 650 (DV Gateway) to Off on the radio.");
     println!("Press Enter when done.");

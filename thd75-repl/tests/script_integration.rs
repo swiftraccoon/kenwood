@@ -183,8 +183,8 @@ fn terminal_mode_starts_dstar_without_cat_recovery() -> TestResult {
 #[test]
 fn idle_dstar_prompt_keeps_mmdvm_transport_running() -> TestResult {
     // Hold interactive stdin open beyond the modem loop's five-second write
-    // deadline. A blocking readline on the LocalSet thread starves the MMDVM
-    // transport pump and makes the next `listen` report a dead radio link.
+    // deadline. A blocking readline must not starve async radio work or make
+    // the next `listen` report a dead radio link.
     let mut child = Command::new(env!("CARGO_BIN_EXE_thd75-repl"))
         .args([
             "--mock-radio",
