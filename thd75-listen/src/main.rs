@@ -16,8 +16,8 @@
 //! - Radio state discipline lives in the library's IF-tap session:
 //!   `enter_if_tap` saves every touched setting (including the tuning step)
 //!   and proves engagement; `restore_if_tap` restores in the
-//!   hardware-required order and reports per-step failures. Frequency is
-//!   deliberately not restored: tuning is user-directed.
+//!   hardware-required order, including the original frequency on the saved
+//!   tuning raster, and reports per-step failures.
 
 // The accessibility-lint dev-dependency is used by the library's unit
 // tests; the bin's test build links dev-deps too.
@@ -247,7 +247,14 @@ fn run() -> Result<(), String> {
     };
 
     // Every path from here restores the radio before returning.
-    let result = run_session(&rt, &mut radio, &input_dev, &output_dev, args.freq_hz);
+    let result = run_session(
+        &rt,
+        &mut radio,
+        &saved,
+        &input_dev,
+        &output_dev,
+        args.freq_hz,
+    );
     let recovery_error = if radio.cat_recovery_required() {
         rt.block_on(radio.recover_cat()).err()
     } else {
@@ -292,6 +299,7 @@ fn run() -> Result<(), String> {
 fn run_session(
     rt: &tokio::runtime::Runtime,
     radio: &mut Radio<SerialTransport>,
+    saved: &IfTapSavedState,
     input_dev: &cpal::Device,
     output_dev: &cpal::Device,
     freq_hz: u32,
@@ -301,7 +309,7 @@ fn run_session(
     // qualified UP/DW commands, dropping the IF output during the walk
     // (frequency writes are rejected while the tap is engaged) and
     // re-engaging it afterwards with a readback proof.
-    rt.block_on(retune(radio, Frequency::new(freq_hz)))?;
+    rt.block_on(retune(radio, saved, Frequency::new(freq_hz)))?;
 
     let shared = Arc::new(SharedAudio {
         volume_bits: AtomicU32::new(taper(DEFAULT_VOLUME).to_bits()),
@@ -448,7 +456,7 @@ fn run_session(
             }
         };
         match command {
-            Command::Tune(freq) => match rt.block_on(retune(radio, freq)) {
+            Command::Tune(freq) => match rt.block_on(retune(radio, saved, freq)) {
                 Ok(()) => {
                     current_hz = freq.as_hz();
                     println!("{}", output::tuned(freq.as_hz()));
@@ -526,9 +534,13 @@ fn run_session(
 /// frequency verifies without touching the radio; otherwise the walk is
 /// bounded, verified by readback, and the IF output is re-engaged with a
 /// readback proof.
-async fn retune(radio: &mut Radio<SerialTransport>, target: Frequency) -> Result<(), String> {
+async fn retune(
+    radio: &mut Radio<SerialTransport>,
+    saved: &IfTapSavedState,
+    target: Frequency,
+) -> Result<(), String> {
     radio
-        .retune_if_tap(target, UsbAudioOutput::IntermediateFrequency)
+        .retune_if_tap(saved, target, UsbAudioOutput::IntermediateFrequency)
         .await
         .map(|_landed| ())
         .map_err(|e| format!("retuning Band B: {e}"))
