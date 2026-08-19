@@ -89,7 +89,9 @@ static void free_child_environment(char **environment, size_t inherited_count,
     free(environment);
 }
 
-static char **make_child_environment(const char *device, const char *mode,
+static char **make_child_environment(const char *device,
+                                     const char *control_mode,
+                                     const char *test_mode,
                                      const char *liveness_descriptor,
                                      size_t *inherited_count_out,
                                      size_t *assignment_count_out) {
@@ -98,6 +100,7 @@ static char **make_child_environment(const char *device, const char *mode,
         BT_HELPER_DEVICE_ENV,
         BT_HELPER_CHANNEL_ENV,
         BT_HELPER_LIVENESS_FD_ENV,
+        BT_HELPER_CONTROL_ENV,
         BT_HELPER_TEST_ENV,
     };
     const char *values[] = {
@@ -105,8 +108,10 @@ static char **make_child_environment(const char *device, const char *mode,
         device,
         "2",
         liveness_descriptor,
-        mode,
+        control_mode,
+        test_mode,
     };
+    const size_t required_key_count = 4;
     const size_t key_count = sizeof(keys) / sizeof(keys[0]);
     size_t inherited_count = 0;
     for (char **entry = environ; entry && *entry; entry++) {
@@ -120,7 +125,9 @@ static char **make_child_environment(const char *device, const char *mode,
         if (!replaced) inherited_count++;
     }
 
-    size_t assignment_count = mode[0] ? key_count : key_count - 1;
+    size_t assignment_count = required_key_count;
+    if (control_mode[0]) assignment_count++;
+    if (test_mode[0]) assignment_count++;
     char **result = calloc(
         inherited_count + assignment_count + 1, sizeof(char *)
     );
@@ -137,7 +144,10 @@ static char **make_child_environment(const char *device, const char *mode,
         }
         if (!replaced) result[destination++] = *entry;
     }
-    for (size_t key_index = 0; key_index < assignment_count; key_index++) {
+    for (size_t key_index = 0; key_index < key_count; key_index++) {
+        if (key_index >= required_key_count && !values[key_index][0]) {
+            continue;
+        }
         result[destination] = environment_assignment(
             keys[key_index], values[key_index]
         );
@@ -160,6 +170,58 @@ static int add_dup_and_close(posix_spawn_file_actions_t *actions,
     );
     if (result != 0 || source == destination) return result;
     return posix_spawn_file_actions_addclose(actions, source);
+}
+
+static const char *control_mode_for_spawn_mode(int mode) {
+    return mode == 1 ? "paired-v2" : "";
+}
+
+static const char *test_mode_for_spawn_mode(int mode) {
+    return mode == 2 ? "echo-v1" : mode == 3 ? "hang-v1" : "";
+}
+
+static const char *child_environment_value(char **environment,
+                                           const char *key) {
+    for (char **entry = environment; entry && *entry; entry++) {
+        if (key_matches(*entry, key)) {
+            return *entry + strlen(key) + 1;
+        }
+    }
+    return NULL;
+}
+
+// Verifies that production control and no-radio test modes remain separated
+// when the Swift test target exercises the wrapper without invoking Bluetooth.
+int lodestar_bt_helper_environment_protocol_probe(void) {
+    static const char *expected_control[] = {NULL, "paired-v2", NULL, NULL};
+    static const char *expected_test[] = {NULL, NULL, "echo-v1", "hang-v1"};
+    for (int mode = 0; mode <= 3; mode++) {
+        size_t inherited_count = 0;
+        size_t assignment_count = 0;
+        char **environment = make_child_environment(
+            "-", control_mode_for_spawn_mode(mode),
+            test_mode_for_spawn_mode(mode), "123",
+            &inherited_count, &assignment_count
+        );
+        if (!environment) return 0;
+        const char *control = child_environment_value(
+            environment, BT_HELPER_CONTROL_ENV
+        );
+        const char *test = child_environment_value(
+            environment, BT_HELPER_TEST_ENV
+        );
+        int control_matches = expected_control[mode]
+            ? control && strcmp(control, expected_control[mode]) == 0
+            : !control;
+        int test_matches = expected_test[mode]
+            ? test && strcmp(test, expected_test[mode]) == 0
+            : !test;
+        free_child_environment(
+            environment, inherited_count, assignment_count
+        );
+        if (!control_matches || !test_matches) return 0;
+    }
+    return 1;
 }
 
 // Spawn modes: 0 = production RFCOMM byte stream, 1 = paired-device list,
@@ -242,13 +304,12 @@ int lodestar_bt_helper_spawn(const char *executable, const char *device,
         return -1;
     }
 
-    const char *test_mode = mode == 1 ? "paired-v1" :
-                            mode == 2 ? "echo-v1" :
-                            mode == 3 ? "hang-v1" : "";
+    const char *control_mode = control_mode_for_spawn_mode(mode);
+    const char *test_mode = test_mode_for_spawn_mode(mode);
     size_t inherited_count = 0;
     size_t assignment_count = 0;
     char **child_environment = make_child_environment(
-        device, test_mode, child_liveness_text,
+        device, control_mode, test_mode, child_liveness_text,
         &inherited_count, &assignment_count
     );
     if (!child_environment) {

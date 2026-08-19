@@ -12,7 +12,7 @@ import Darwin
 /// its own signed binary with a private environment handshake; an Objective-C
 /// constructor takes over before SwiftUI starts and owns RFCOMM plus its main
 /// run loop in that disposable helper process. Parent/child stdin and stdout
-/// are the raw radio byte stream.
+/// carry framed discovery records or the raw radio byte stream.
 ///
 /// This process boundary is required because every IOBluetooth write API can
 /// ultimately block inside the framework without a cancellation primitive.
@@ -105,6 +105,25 @@ public actor IOBluetoothTransport: RadioTransport {
     /// slot release, including a child intentionally wedged after READY.
     nonisolated static func helperReapProbe() throws {
         try BluetoothHelperProcess.reapProbe()
+    }
+
+    /// Verifies that paired discovery uses production control mode while
+    /// echo and hang probes remain isolated as test modes.
+    nonisolated static func helperEnvironmentProtocolProbe() -> Bool {
+        lodestar_bt_helper_environment_protocol_probe() == 1
+    }
+
+    /// Parses one complete paired-device helper payload for protocol tests.
+    nonisolated static func helperParsePairedDevicePayload(
+        _ payload: [UInt8]
+    ) -> [BluetoothDevice]? {
+        BluetoothHelperProcess.parsePairedDevicePayloadForTesting(payload)
+    }
+
+    /// Runs the signed discovery helper and distinguishes a complete
+    /// empty list from spawn, timeout, framing, or termination failure.
+    nonisolated static func helperPairedDevicesForTesting() -> [BluetoothDevice]? {
+        BluetoothHelperProcess.pairedDevicesForTesting()
     }
     #endif
 
@@ -539,7 +558,13 @@ private func lodestar_bt_helper_terminate(
     _ holdsSlot: Int32
 ) -> Int32
 
+@_silgen_name("lodestar_bt_helper_environment_protocol_probe")
+private func lodestar_bt_helper_environment_protocol_probe() -> Int32
+
 private let bluetoothHelperReadyMagic = Array("THD75BT-READY-v1".utf8)
+private let bluetoothPairedCandidateKnownHints: UInt8 = 0x03
+private let bluetoothMaxPairedCandidates = 64
+private let bluetoothMaxPairedDisplayNameBytes = 1_024
 
 private enum BluetoothHelperMode: Int32 {
     case radio = 0
@@ -602,8 +627,12 @@ private struct BluetoothHelperProcess {
     }
 
     static func pairedDevices() -> [BluetoothDevice] {
+        readPairedDevices() ?? []
+    }
+
+    private static func readPairedDevices() -> [BluetoothDevice]? {
         guard var process = try? spawn(device: "-", mode: .pairedDevices) else {
-            return []
+            return nil
         }
         var bytes: [UInt8] = []
         let deadline = ContinuousClock.now.advanced(by: .seconds(2))
@@ -643,10 +672,20 @@ private struct BluetoothHelperProcess {
             process.holdsSlot ? 1 : 0
         )
         process.livenessFD = -1
-        return pairedPayload(bytes) ?? []
+        return pairedPayload(bytes)
     }
 
     #if DEBUG
+    static func parsePairedDevicePayloadForTesting(
+        _ payload: [UInt8]
+    ) -> [BluetoothDevice]? {
+        pairedPayload(payload)
+    }
+
+    static func pairedDevicesForTesting() -> [BluetoothDevice]? {
+        readPairedDevices()
+    }
+
     static func echoProbe(_ payload: [UInt8]) throws -> [UInt8] {
         guard payload.count <= 512 else {
             throw RadioTransportError.writeFailed(
@@ -813,15 +852,26 @@ private struct BluetoothHelperProcess {
         }
         var cursor = bluetoothHelperReadyMagic.count
         var devices: [BluetoothDevice] = []
+        var addresses: Set<String> = []
         while true {
-            guard bytes.count - cursor >= 4 else { return nil }
-            let addressLength = Int(bytes[cursor]) << 8
-                | Int(bytes[cursor + 1])
-            let nameLength = Int(bytes[cursor + 2]) << 8
-                | Int(bytes[cursor + 3])
-            cursor += 4
-            if addressLength == 0 && nameLength == 0 { return devices }
-            guard addressLength > 0,
+            guard bytes.count - cursor >= 5 else { return nil }
+            let hints = bytes[cursor]
+            let addressLength = Int(bytes[cursor + 1]) << 8
+                | Int(bytes[cursor + 2])
+            let nameLength = Int(bytes[cursor + 3]) << 8
+                | Int(bytes[cursor + 4])
+            cursor += 5
+            guard hints & ~bluetoothPairedCandidateKnownHints == 0 else {
+                return nil
+            }
+            if addressLength == 0 && nameLength == 0 {
+                guard hints == 0, cursor == bytes.count else { return nil }
+                return devices
+            }
+            guard addressLength == 17,
+                  nameLength > 0,
+                  nameLength <= bluetoothMaxPairedDisplayNameBytes,
+                  devices.count < bluetoothMaxPairedCandidates,
                   bytes.count - cursor >= addressLength + nameLength else {
                 return nil
             }
@@ -830,8 +880,10 @@ private struct BluetoothHelperProcess {
             let nameBytes = bytes[cursor..<(cursor + nameLength)]
             cursor += nameLength
             guard let address = String(bytes: addressBytes, encoding: .utf8),
+                  isExactBluetoothAddress(address),
+                  addresses.insert(address.lowercased()).inserted,
                   let name = String(bytes: nameBytes, encoding: .utf8) else {
-                continue
+                return nil
             }
             devices.append(BluetoothDevice(
                 id: address,
@@ -839,6 +891,28 @@ private struct BluetoothHelperProcess {
                 address: address
             ))
         }
+    }
+
+    private static func isExactBluetoothAddress(_ address: String) -> Bool {
+        let bytes = Array(address.utf8)
+        guard bytes.count == 17 else { return false }
+        var separator: UInt8?
+        for (index, byte) in bytes.enumerated() {
+            if [2, 5, 8, 11, 14].contains(index) {
+                guard byte == 0x2D || byte == 0x3A else { return false }
+                if let separator {
+                    guard byte == separator else { return false }
+                } else {
+                    separator = byte
+                }
+            } else {
+                let isDigit = (0x30...0x39).contains(byte)
+                let isUpperHex = (0x41...0x46).contains(byte)
+                let isLowerHex = (0x61...0x66).contains(byte)
+                guard isDigit || isUpperHex || isLowerHex else { return false }
+            }
+        }
+        return true
     }
 }
 

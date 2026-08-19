@@ -26,6 +26,72 @@ final class MockTransportTests: XCTestCase {
         try IOBluetoothTransport.helperReapProbe()
     }
 
+    func testBluetoothHelperSeparatesProductionControlAndTestModes() {
+        XCTAssertTrue(IOBluetoothTransport.helperEnvironmentProtocolProbe())
+    }
+
+    func testBluetoothHelperParsesV2CandidateHintsAndFiveByteHeaders() {
+        let address = "00-11-22-33-44-55"
+        let name = "Field Radio"
+        var payload = Array("THD75BT-READY-v1".utf8)
+        payload.append(0x03)
+        payload.append(contentsOf: UInt16(address.utf8.count).bigEndianBytes)
+        payload.append(contentsOf: UInt16(name.utf8.count).bigEndianBytes)
+        payload.append(contentsOf: address.utf8)
+        payload.append(contentsOf: name.utf8)
+        payload.append(contentsOf: [0, 0, 0, 0, 0])
+
+        XCTAssertEqual(
+            IOBluetoothTransport.helperParsePairedDevicePayload(payload),
+            [BluetoothDevice(id: address, name: name, address: address)]
+        )
+    }
+
+    func testBluetoothHelperRejectsLegacyV1AndUnknownHintPayloads() {
+        let address = "00-11-22-33-44-55"
+        let name = "TH-D75"
+        var legacy = Array("THD75BT-READY-v1".utf8)
+        legacy.append(contentsOf: UInt16(address.utf8.count).bigEndianBytes)
+        legacy.append(contentsOf: UInt16(name.utf8.count).bigEndianBytes)
+        legacy.append(contentsOf: address.utf8)
+        legacy.append(contentsOf: name.utf8)
+        legacy.append(contentsOf: [0, 0, 0, 0])
+        XCTAssertNil(IOBluetoothTransport.helperParsePairedDevicePayload(legacy))
+
+        var unknownHint = Array("THD75BT-READY-v1".utf8)
+        unknownHint.append(0x80)
+        unknownHint.append(contentsOf: UInt16(address.utf8.count).bigEndianBytes)
+        unknownHint.append(contentsOf: UInt16(name.utf8.count).bigEndianBytes)
+        unknownHint.append(contentsOf: address.utf8)
+        unknownHint.append(contentsOf: name.utf8)
+        unknownHint.append(contentsOf: [0, 0, 0, 0, 0])
+        XCTAssertNil(IOBluetoothTransport.helperParsePairedDevicePayload(unknownHint))
+    }
+
+    func testLiveBluetoothHelperReturnsExpectedPairedRadio() throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["LODESTAR_HARDWARE_BLUETOOTH_ENUMERATION"] == "1" else {
+            throw XCTSkip("Set LODESTAR_HARDWARE_BLUETOOTH_ENUMERATION=1 for live discovery")
+        }
+        guard let expectedAddress = environment["LODESTAR_HARDWARE_BLUETOOTH_ADDRESS"],
+              !expectedAddress.isEmpty else {
+            return XCTFail(
+                "Set LODESTAR_HARDWARE_BLUETOOTH_ADDRESS to the paired radio address."
+            )
+        }
+        guard let devices = IOBluetoothTransport.helperPairedDevicesForTesting() else {
+            return XCTFail(
+                "The signed paired-device helper did not return a complete v2 payload."
+            )
+        }
+        XCTAssertTrue(
+            devices.contains {
+                $0.address.caseInsensitiveCompare(expectedAddress) == .orderedSame
+            },
+            "The complete helper payload did not contain the expected paired radio."
+        )
+    }
+
     func testBluetoothCancelledReadPreservesFollowingBytes() async throws {
         let transport = IOBluetoothTransport.helperTestTransport()
         try await transport.open()
@@ -133,6 +199,12 @@ final class MockTransportTests: XCTestCase {
         await mock.push([0xAA])
         let siblingResult = try await second.value
         XCTAssertEqual(siblingResult, [0xAA])
+    }
+}
+
+private extension UInt16 {
+    var bigEndianBytes: [UInt8] {
+        [UInt8(self >> 8), UInt8(self & 0xFF)]
     }
 }
 
