@@ -962,10 +962,21 @@ pub(crate) struct AprsStationCache {
 #[derive(Debug)]
 pub(crate) enum McpState {
     Idle,
-    Reading { page: u16, total: u16 },
-    Loaded { image: MemoryImage, modified: bool },
-    Writing { page: u16, total: u16 },
-    Reconnecting,
+    Reading {
+        page: u16,
+        total: u16,
+    },
+    Loaded {
+        image: MemoryImage,
+        modified: bool,
+    },
+    Writing {
+        page: u16,
+        total: u16,
+        /// Image retained while the write is in flight so success and failure
+        /// both return the operator to a usable cached image.
+        image: MemoryImage,
+    },
 }
 
 /// All events that can flow into the update loop.
@@ -1261,11 +1272,17 @@ impl App {
                 true
             }
             Message::McpProgress { page, total } => {
-                self.mcp = if matches!(self.mcp, McpState::Writing { .. }) {
-                    McpState::Writing { page, total }
+                if let McpState::Writing {
+                    page: current_page,
+                    total: current_total,
+                    ..
+                } = &mut self.mcp
+                {
+                    *current_page = page;
+                    *current_total = total;
                 } else {
-                    McpState::Reading { page, total }
-                };
+                    self.mcp = McpState::Reading { page, total };
+                }
                 true
             }
             Message::McpReadComplete(data) => {
@@ -1288,14 +1305,26 @@ impl App {
                 true
             }
             Message::McpWriteComplete => {
-                self.mcp = McpState::Reconnecting;
-                self.status_message = Some("MCP write complete, reconnecting...".into());
+                let previous = std::mem::replace(&mut self.mcp, McpState::Idle);
+                self.mcp = match previous {
+                    McpState::Writing { image, .. } => {
+                        if let Some(ref path) = self.cache_path {
+                            save_cache_to(path, image.as_raw());
+                        }
+                        McpState::Loaded {
+                            image,
+                            modified: false,
+                        }
+                    }
+                    other => other,
+                };
+                self.status_message = Some("MCP write complete; radio control restored".into());
                 true
             }
             Message::McpByteWritten { offset, value } => {
                 // Update the cached memory image with the single byte that
                 // was just written via MCP, so the TUI stays in sync without
-                // requiring a full re-read after reconnect.
+                // requiring a full re-read after the radio's internal reset.
                 if let McpState::Loaded { ref mut image, .. } = self.mcp {
                     if let Some(byte) = image.as_raw_mut().get_mut(offset as usize) {
                         *byte = value;
@@ -1304,14 +1333,24 @@ impl App {
                         save_cache_to(path, image.as_raw());
                     }
                 }
+                self.status_message = Some(format!(
+                    "MCP 0x{offset:04X} = {value}; radio control restored"
+                ));
                 true
             }
             Message::McpError(err) => {
-                // Only reset to Idle if we don't have a loaded image.
-                // A failed MCP write shouldn't destroy the cached data.
-                if !matches!(self.mcp, McpState::Loaded { .. }) {
-                    self.mcp = McpState::Idle;
-                }
+                // A failed write retains the exact image the operator was
+                // trying to write. Only a failed read with no prior image
+                // returns to Idle.
+                let previous = std::mem::replace(&mut self.mcp, McpState::Idle);
+                self.mcp = match previous {
+                    McpState::Writing { image, .. } => McpState::Loaded {
+                        image,
+                        modified: true,
+                    },
+                    loaded @ McpState::Loaded { .. } => loaded,
+                    _ => McpState::Idle,
+                };
                 self.status_message = Some(format!("MCP error: {err}"));
                 true
             }
@@ -2035,16 +2074,20 @@ impl App {
                 true
             }
             KeyCode::Char('w') if self.main_view == MainView::Mcp => {
-                if let McpState::Loaded { ref image, .. } = self.mcp {
+                let previous = std::mem::replace(&mut self.mcp, McpState::Idle);
+                if let McpState::Loaded { image, .. } = previous {
                     let data = image.as_raw().to_vec();
                     self.mcp = McpState::Writing {
                         page: 0,
                         total: kenwood_thd75::protocol::programming::TOTAL_PAGES,
+                        image,
                     };
                     self.status_message = Some("Starting MCP write...".into());
                     if let Some(ref tx) = self.cmd_tx {
                         let _send = tx.send(crate::event::RadioCommand::WriteMemory(data));
                     }
+                } else {
+                    self.mcp = previous;
                 }
                 true
             }
@@ -3626,8 +3669,8 @@ mod tests {
     use tokio::sync::mpsc::UnboundedReceiver;
 
     use super::{
-        App, AprsMode, AprsStationCache, DstarMode, InputMode, MainView, McpState, Message, Pane,
-        RadioState, SettingRow, cat_settings, next_linked_volume, next_pf_key,
+        App, AprsMode, AprsStationCache, DstarMode, InputMode, MainView, McpState, MemoryImage,
+        Message, Pane, RadioState, SettingRow, cat_settings, next_linked_volume, next_pf_key,
         parse_reflector_input,
     };
     use crate::event::RadioCommand;
@@ -3688,11 +3731,9 @@ mod tests {
     ///
     /// The cache exists so the operator can keep working (and retry the
     /// write) after a transient MCP failure; resetting to `Idle` on
-    /// error threw away a 55-second full-memory read. The guard is one
-    /// `matches!`, trivially deleted by a future refactor, and nothing
-    /// pinned it until now.
+    /// error threw away a 55-second full-memory read.
     #[test]
-    fn mcp_error_preserves_a_loaded_image() {
+    fn mcp_error_preserves_a_loaded_image() -> TestResult {
         let mut app = App::with_cache_path(String::new(), None);
         let raw = vec![0u8; 500_480];
         assert!(app.update(Message::McpReadComplete(raw)));
@@ -3707,6 +3748,18 @@ mod tests {
             "a failed MCP write must not destroy the cached image"
         );
 
+        let image = MemoryImage::from_raw(vec![0x5A; 500_480])?;
+        app.mcp = McpState::Writing {
+            page: 12,
+            total: 100,
+            image,
+        };
+        assert!(app.update(Message::McpError("in-flight write failed".into())));
+        assert!(
+            matches!(app.mcp, McpState::Loaded { modified: true, .. }),
+            "a real in-flight write failure must restore the retained image"
+        );
+
         // With no image loaded, an error DOES return to Idle.
         let mut fresh = App::with_cache_path(String::new(), None);
         assert!(fresh.update(Message::McpError("read failed".into())));
@@ -3714,10 +3767,40 @@ mod tests {
             matches!(fresh.mcp, McpState::Idle),
             "without a loaded image, an MCP error resets to Idle"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_write_completion_restores_loaded_state_without_reconnect() -> TestResult {
+        let mut app = App::with_cache_path(String::new(), None);
+        app.connected = true;
+        let image = MemoryImage::from_raw(vec![0xA5; 500_480])?;
+        app.mcp = McpState::Writing {
+            page: 100,
+            total: 100,
+            image,
+        };
+
+        assert!(app.update(Message::McpWriteComplete));
+        let McpState::Loaded {
+            ref image,
+            modified,
+        } = app.mcp
+        else {
+            return Err("completed write must restore the loaded image".into());
+        };
+        assert!(!modified, "completed write must clear the modified flag");
+        assert_eq!(image.as_raw().first().copied(), Some(0xA5));
+        assert!(app.connected, "successful MCP recovery must stay connected");
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("MCP write complete; radio control restored")
+        );
+        Ok(())
     }
 
     /// `McpByteWritten` patches the cached image in place, so the TUI
-    /// stays in sync without a full re-read after reconnect.
+    /// stays in sync without a full re-read after the radio's internal reset.
     #[test]
     fn mcp_byte_written_patches_the_cached_image() -> TestResult {
         let mut app = App::with_cache_path(String::new(), None);
@@ -3877,11 +3960,12 @@ mod tests {
     /// is in flight, progress ticks stay `Writing` (the UI otherwise
     /// reports "Reading page N/M" during a write).
     #[test]
-    fn mcp_progress_does_not_downgrade_a_write_to_a_read() {
+    fn mcp_progress_does_not_downgrade_a_write_to_a_read() -> TestResult {
         let mut app = App::with_cache_path(String::new(), None);
         app.mcp = McpState::Writing {
             page: 0,
             total: 100,
+            image: MemoryImage::from_raw(vec![0; 500_480])?,
         };
 
         assert!(app.update(Message::McpProgress {
@@ -3905,6 +3989,7 @@ mod tests {
             "progress with no write in flight is a read, got {:?}",
             reader.mcp
         );
+        Ok(())
     }
 
     /// Connection-state messages drive the `connected` flag both ways.

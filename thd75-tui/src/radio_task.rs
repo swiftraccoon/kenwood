@@ -3,7 +3,9 @@ use std::time::Duration;
 use kenwood_thd75::FirmwareProfile;
 use kenwood_thd75::LinkDiagnosis;
 use kenwood_thd75::Radio;
+use kenwood_thd75::StateMonitor;
 use kenwood_thd75::WritableMcpPage;
+use kenwood_thd75::radio::LinkState;
 use kenwood_thd75::transport::EitherTransport;
 use kenwood_thd75::transport::SerialTransport;
 use kenwood_thd75::transport::Transport;
@@ -22,6 +24,35 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Reconnect poll interval after disconnect.
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Clear every AI-derived display value when a radio stream is replaced.
+///
+/// A fresh subscription has no relationship to the previous stream. Keeping
+/// the old monitor snapshot would let the next unrelated AI notification copy
+/// stale busy and S-meter values back into the TUI.
+const fn reset_ai_display_state(
+    monitor: &mut StateMonitor,
+    s_meter_a: &mut SMeterReading,
+    s_meter_b: &mut SMeterReading,
+    busy_a: &mut bool,
+    busy_b: &mut bool,
+) {
+    *monitor = StateMonitor::new();
+    *s_meter_a = SMeterReading::ZERO;
+    *s_meter_b = SMeterReading::ZERO;
+    *busy_a = false;
+    *busy_b = false;
+}
+
+/// Whether an MCP operation left this radio unsafe for ordinary CAT traffic.
+///
+/// High-level MCP APIs reopen and identify the same transport before returning.
+/// Their operation may still return an error after CAT recovery succeeds, so
+/// the error variant alone is not a reliable reconnect signal.
+fn reconnect_required_after_mcp<T: Transport>(radio: &Radio<T>) -> bool {
+    let link_state = radio.link_state();
+    radio.cat_recovery_required() || *link_state.borrow() == LinkState::Down
+}
 
 /// A failure to bring the radio up into CAT control mode.
 ///
@@ -172,7 +203,7 @@ pub(crate) async fn spawn_with_transport(
         let mut busy_a = false;
         let mut busy_b = false;
         // Lib-owned fold of AI pushes + the BY-gated SM policy.
-        let mut monitor = kenwood_thd75::StateMonitor::new();
+        let mut monitor = StateMonitor::new();
 
         // Wrap in Option so we can take() for APRS mode (which consumes
         // the Radio by value via enter_kiss) and put it back after.
@@ -204,10 +235,13 @@ pub(crate) async fn spawn_with_transport(
                             tracing::warn!("AI mode after APRS exit: {e}");
                         }
                         notifications = r.subscribe();
-                        s_meter_a = SMeterReading::ZERO;
-                        s_meter_b = SMeterReading::ZERO;
-                        busy_a = false;
-                        busy_b = false;
+                        reset_ai_display_state(
+                            &mut monitor,
+                            &mut s_meter_a,
+                            &mut s_meter_b,
+                            &mut busy_a,
+                            &mut busy_b,
+                        );
                         radio_opt = Some(r);
                         let _send = tx.send(Message::AprsStopped);
                         continue 'outer;
@@ -235,10 +269,13 @@ pub(crate) async fn spawn_with_transport(
                             tracing::warn!("AI mode after D-STAR exit: {e}");
                         }
                         notifications = r.subscribe();
-                        s_meter_a = SMeterReading::ZERO;
-                        s_meter_b = SMeterReading::ZERO;
-                        busy_a = false;
-                        busy_b = false;
+                        reset_ai_display_state(
+                            &mut monitor,
+                            &mut s_meter_a,
+                            &mut s_meter_b,
+                            &mut busy_a,
+                            &mut busy_b,
+                        );
                         radio_opt = Some(r);
                         let _send = tx.send(Message::DstarStopped);
                         continue 'outer;
@@ -316,6 +353,7 @@ pub(crate) async fn spawn_with_transport(
                                     let result = radio.read_memory_image_with_progress(move |page, total| {
                                         let _send = tx2.send(Message::McpProgress { page, total });
                                     }).await;
+                                    let reconnect_required = reconnect_required_after_mcp(radio);
                                     match result {
                                         Ok(data) => {
                                             let _send = tx.send(Message::McpReadComplete(data));
@@ -324,16 +362,29 @@ pub(crate) async fn spawn_with_transport(
                                             let _send = tx.send(Message::McpError(format!("{e}")));
                                         }
                                     }
-                                    // The TH-D75's USB stack always resets when exiting MCP
-                                    // programming mode. The connection is guaranteed to drop.
-                                    let _send = tx.send(Message::Disconnected);
-                                    break; // Go to reconnect
+                                    if reconnect_required {
+                                        let _send = tx.send(Message::Disconnected);
+                                        break; // Go to reconnect
+                                    }
+                                    // MCP temporarily replaces the byte stream. Drop
+                                    // anything queued on the pre-MCP receiver before
+                                    // accepting fresh AI state from the restored CAT
+                                    // session.
+                                    notifications = radio.subscribe();
+                                    reset_ai_display_state(
+                                        &mut monitor,
+                                        &mut s_meter_a,
+                                        &mut s_meter_b,
+                                        &mut busy_a,
+                                        &mut busy_b,
+                                    );
                                 }
                                 crate::event::RadioCommand::WriteMemory(data) => {
                                     let tx2 = tx.clone();
                                     let result = radio.write_memory_image_with_progress(&data, move |page, total| {
                                         let _send = tx2.send(Message::McpProgress { page, total });
                                     }).await;
+                                    let reconnect_required = reconnect_required_after_mcp(radio);
                                     match result {
                                         Ok(()) => {
                                             let _send = tx.send(Message::McpWriteComplete);
@@ -342,10 +393,18 @@ pub(crate) async fn spawn_with_transport(
                                             let _send = tx.send(Message::McpError(format!("{e}")));
                                         }
                                     }
-                                    // The TH-D75's USB stack always resets when exiting MCP
-                                    // programming mode. The connection is guaranteed to drop.
-                                    let _send = tx.send(Message::Disconnected);
-                                    break; // Go to reconnect
+                                    if reconnect_required {
+                                        let _send = tx.send(Message::Disconnected);
+                                        break; // Go to reconnect
+                                    }
+                                    notifications = radio.subscribe();
+                                    reset_ai_display_state(
+                                        &mut monitor,
+                                        &mut s_meter_a,
+                                        &mut s_meter_b,
+                                        &mut busy_a,
+                                        &mut busy_b,
+                                    );
                                 }
                                 crate::event::RadioCommand::TuneChannel { band, channel } => {
                                     if let Err(e) = radio.tune_channel(band, channel).await {
@@ -438,33 +497,41 @@ pub(crate) async fn spawn_with_transport(
                                 }
                                 crate::event::RadioCommand::McpWriteByte { offset, value } => {
                                     // Single-page MCP write for settings the D75 rejects via CAT.
-                                    // Enters MCP mode, modifies one byte, exits. USB/BT drops.
+                                    // The library exits MCP, reopens, and proves CAT before return.
                                     let page = offset / 256;
                                     let byte_idx = (offset % 256) as usize;
                                     let _send = tx.send(Message::RadioError(format!("Writing MCP 0x{offset:04X}...")));
-                                    match WritableMcpPage::new(page) {
-                                        Ok(page) => match radio.modify_memory_page(page, |data| {
+                                    let result = match WritableMcpPage::new(page) {
+                                        Ok(page) => radio.modify_memory_page(page, |data| {
                                             if let Some(byte) = data.get_mut(byte_idx) {
                                                 *byte = value;
                                             }
-                                        }).await {
-                                            Ok(()) => {
-                                                // Update the in-memory MCP cache so the TUI
-                                                // stays in sync without requiring a full re-read.
-                                                let _send = tx.send(Message::McpByteWritten { offset, value });
-                                                let _send = tx.send(Message::RadioError(format!("MCP 0x{offset:04X} = {value}; reconnecting...")));
-                                            }
-                                            Err(e) => {
-                                                let _send = tx.send(Message::McpError(format!("MCP write 0x{offset:04X}: {e}")));
-                                            }
-                                        },
+                                        }).await,
+                                        Err(e) => Err(e),
+                                    };
+                                    let reconnect_required = reconnect_required_after_mcp(radio);
+                                    match result {
+                                        Ok(()) => {
+                                            // Update the in-memory MCP cache so the TUI
+                                            // stays in sync without requiring a full re-read.
+                                            let _send = tx.send(Message::McpByteWritten { offset, value });
+                                        }
                                         Err(e) => {
                                             let _send = tx.send(Message::McpError(format!("MCP write 0x{offset:04X}: {e}")));
                                         }
                                     }
-                                    // USB/BT drops after MCP exit
-                                    let _send = tx.send(Message::Disconnected);
-                                    break; // Go to reconnect loop
+                                    if reconnect_required {
+                                        let _send = tx.send(Message::Disconnected);
+                                        break; // Go to reconnect loop
+                                    }
+                                    notifications = radio.subscribe();
+                                    reset_ai_display_state(
+                                        &mut monitor,
+                                        &mut s_meter_a,
+                                        &mut s_meter_b,
+                                        &mut busy_a,
+                                        &mut busy_b,
+                                    );
                                 }
                                 crate::event::RadioCommand::SetUrcall { callsign, suffix } => {
                                     let callsign = match DstarCallsign::new(&callsign) {
@@ -618,10 +685,13 @@ pub(crate) async fn spawn_with_transport(
                                     )));
                                 }
                                 notifications = new_radio.subscribe();
-                                s_meter_a = SMeterReading::ZERO;
-                                s_meter_b = SMeterReading::ZERO;
-                                busy_a = false;
-                                busy_b = false;
+                                reset_ai_display_state(
+                                    &mut monitor,
+                                    &mut s_meter_a,
+                                    &mut s_meter_b,
+                                    &mut busy_a,
+                                    &mut busy_b,
+                                );
                                 let _send = tx.send(Message::Reconnected);
                                 let _send = tx.send(Message::RadioUpdate(RadioState {
                                     firmware_version,
@@ -1222,9 +1292,96 @@ fn discover_and_open(port: Option<&str>, baud: u32) -> Result<(String, EitherTra
 mod tests {
     use super::*;
     use kenwood_thd75::MockTransport;
-    use kenwood_thd75::radio::LinkState;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn mcp_page_response(page: u16, data: &[u8; 256]) -> Vec<u8> {
+        let [page_hi, page_lo] = page.to_be_bytes();
+        let mut response = vec![b'W', page_hi, page_lo, 0, 0];
+        response.extend_from_slice(data);
+        response
+    }
+
+    #[test]
+    fn replacing_ai_stream_clears_monitor_and_display_state() -> TestResult {
+        let mut monitor = StateMonitor::new();
+        let _change = monitor.apply(&kenwood_thd75::protocol::Response::Busy {
+            band: Band::A,
+            busy: true,
+        });
+        monitor.apply_smeter(Band::A, SMeterReading::new(5)?);
+        let mut s_meter_a = SMeterReading::new(5)?;
+        let mut s_meter_b = SMeterReading::new(3)?;
+        let mut busy_a = true;
+        let mut busy_b = true;
+
+        reset_ai_display_state(
+            &mut monitor,
+            &mut s_meter_a,
+            &mut s_meter_b,
+            &mut busy_a,
+            &mut busy_b,
+        );
+
+        assert_eq!(monitor, StateMonitor::new());
+        assert_eq!(s_meter_a, SMeterReading::ZERO);
+        assert_eq!(s_meter_b, SMeterReading::ZERO);
+        assert!(!busy_a);
+        assert!(!busy_b);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn completed_mcp_recovery_keeps_the_outer_connection() -> TestResult {
+        use kenwood_thd75::protocol::programming::{self, McpPage};
+
+        let page = McpPage::new(0x20)?;
+        let data = [0x5A; programming::PAGE_SIZE];
+        let mut mock = MockTransport::new();
+        mock.expect(programming::ENTER_PROGRAMMING, programming::ENTER_RESPONSE);
+        mock.expect(
+            &programming::build_read_command(page),
+            &mcp_page_response(page.as_raw(), &data),
+        );
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+        mock.expect(&[programming::EXIT], &[programming::ACK]);
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\r", b"ID TH-D75\r");
+
+        let mut radio = Radio::new(EitherTransport::Mock(mock));
+        let read = radio.read_memory_pages(page, 1).await?;
+        assert_eq!(read, data);
+        assert_eq!(*radio.link_state().borrow(), LinkState::Up);
+        assert!(!radio.cat_recovery_required());
+        assert!(
+            !reconnect_required_after_mcp(&radio),
+            "the high-level MCP operation already reopened and proved CAT"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pre_io_mcp_validation_error_keeps_the_outer_connection() {
+        let mut radio = Radio::new(EitherTransport::Mock(MockTransport::new()));
+        let result = radio.write_memory_image(&[]).await;
+
+        assert!(result.is_err(), "wrong-sized image must be rejected");
+        assert!(
+            !reconnect_required_after_mcp(&radio),
+            "a pre-I/O validation error must not disconnect a healthy radio"
+        );
+    }
+
+    #[tokio::test]
+    async fn actual_link_loss_requires_outer_reconnect() {
+        let mut mock = MockTransport::new();
+        mock.expect_eof(b"ID\r");
+        let mut radio = Radio::new(EitherTransport::Mock(mock));
+
+        let result = radio.identify().await;
+        assert!(result.is_err(), "the scripted EOF must fail identity");
+        assert!(reconnect_required_after_mcp(&radio));
+    }
 
     #[tokio::test]
     async fn azimuth_poll_skips_bare_gm_and_gw_without_waiting() -> TestResult {

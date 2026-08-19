@@ -63,7 +63,7 @@ pub(crate) enum RadioCommand {
         step: kenwood_thd75::types::StepSize,
     },
     /// Write a single byte to MCP memory via `modify_memory_page`.
-    /// Enters MCP mode, modifies one byte, exits. USB drops and reconnects.
+    /// Enters MCP mode, modifies one byte, exits, and restores CAT.
     /// Used for settings where CAT writes are rejected by D75 firmware.
     McpWriteByte { offset: u16, value: u8 },
     /// Set the transmit power level for the given band.

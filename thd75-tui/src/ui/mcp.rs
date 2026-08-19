@@ -16,7 +16,7 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_a
             let text = " Press [r] to read memory from radio\n Press [w] to write memory to radio";
             frame.render_widget(Paragraph::new(text).block(block), list_area);
         }
-        McpState::Reading { page, total } | McpState::Writing { page, total } => {
+        McpState::Reading { page, total } | McpState::Writing { page, total, .. } => {
             let label = if matches!(app.mcp, McpState::Reading { .. }) {
                 "Reading"
             } else {
@@ -51,10 +51,6 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_a
             let text = format!(
                 " Memory loaded{status}\n\n Press [r] to re-read\n Press [w] to write to radio\n\n Switch to [c]hannels to browse"
             );
-            frame.render_widget(Paragraph::new(text).block(block), list_area);
-        }
-        McpState::Reconnecting => {
-            let text = " Reconnecting to radio after MCP write...\n Waiting for USB device...";
             frame.render_widget(Paragraph::new(text).block(block), list_area);
         }
     }
