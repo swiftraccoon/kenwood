@@ -21,6 +21,7 @@ use kenwood_thd75::radio::programming::{
     McpPage, McpPageExchange, McpPageExchangeError, McpPageExchangeOperationError, WritableMcpPage,
 };
 use kenwood_thd75::screen::{SCREEN_HEIGHT, SCREEN_WIDTH};
+use kenwood_thd75::transport::Transport as RadioTransport;
 use kenwood_thd75::types::{
     KissDuplex, KissPersistence, KissSlotTime, KissTxDelay, KissTxTail, PacketDataRate,
 };
@@ -222,7 +223,7 @@ pub struct SettingReadResult {
     pub values: Vec<SettingValueRecord>,
 }
 
-/// Result for one accepted change after verified page execution.
+/// Result for one accepted change after post-exit live verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum SettingChangeOutcome {
     /// The approved value differed and its containing page was verified.
@@ -247,11 +248,12 @@ pub struct SettingChangeResult {
 pub struct SettingApplyReport {
     /// Reviewed snapshot consumed by this batch.
     pub previous_snapshot_id: u64,
-    /// MCP pages actually written and read-back verified.
+    /// MCP pages actually written and immediately read-back verified.
     pub pages_written: Vec<u16>,
     /// Result for every approved change in caller order.
     pub changes: Vec<SettingChangeResult>,
-    /// Refreshed values and concurrency token after the verified batch.
+    /// Values fetched in a second live MCP session after the write session
+    /// exited and CAT was restored, plus their new concurrency token.
     pub refreshed_values: SettingReadResult,
 }
 
@@ -643,15 +645,13 @@ impl AutomationController {
         response.await.map_err(response_lost)
     }
 
-    /// Attempt to retune Band B using the hardware-required AF → tune → IF sequence.
+    /// Retune Band B using the hardware-required AF → tune → IF sequence.
     ///
     /// The original pre-session frequency remains in the saved restoration
-    /// snapshot. The current `kenwood-thd75` direct-frequency writer fails
-    /// closed before I/O, so this operation currently resumes IF, attempts the
-    /// pre-session restore, and returns an error. If a writer is qualified
-    /// later, success must still mean that the new frequency and IF-output
-    /// re-engagement were both readback verified. Any retune failure ends the
-    /// IF session; an incomplete restore is retained as `NeedsRestoration`.
+    /// snapshot. Retuning uses bounded UP/DW steps with a frequency readback
+    /// after every step, then independently proves that the IF output was
+    /// re-engaged. Any retune failure ends the IF session; an incomplete
+    /// restore is retained as `NeedsRestoration`.
     ///
     /// # Errors
     ///
@@ -676,9 +676,9 @@ impl AutomationController {
     ///
     /// A failed field remains represented as `NeedsRestoration` so callers can
     /// retry restoration without mistaking the physical IF output for active.
-    /// The current direct-frequency quarantine means the frequency step cannot
-    /// succeed even when it was never changed. Success is returned only after
-    /// every step passes readback and automation control is requalified.
+    /// The saved tuning step is restored before the original frequency is
+    /// walked back. Success is returned only after every step passes readback
+    /// and automation control is requalified.
     ///
     /// # Errors
     ///
@@ -768,7 +768,10 @@ impl AutomationController {
     /// radio layer reads all affected live pages and compares every byte with
     /// the reviewed pages before starting any write. A mismatch returns
     /// [`AutomationError::SettingsSnapshotStale`] with zero writes. Matching
-    /// pages are changed and immediately read-back verified.
+    /// pages are changed and immediately read-back verified. After CAT is
+    /// restored, the complete retained snapshot is fetched again in a second
+    /// MCP session. The report is returned only when those post-exit live
+    /// values match every approved change.
     ///
     /// # Errors
     ///
@@ -1326,39 +1329,41 @@ async fn run_controller(
                 reply,
             } => {
                 let result = match if_dsp_session {
-                    Some(active) => match retune_if_dsp_radio(&mut radio, frequency_hz).await {
-                        Ok(()) => {
-                            let retuned = ActiveIfDspSession {
-                                current_frequency_hz: frequency_hz,
-                                output_verified: true,
-                                ..active
-                            };
-                            if_dsp_session = Some(retuned);
-                            Ok(retuned.status())
-                        }
-                        Err(retune_detail) => {
-                            let report = restore_if_dsp_radio(&mut radio, active.saved).await;
-                            if report.is_exact() {
-                                if_dsp_session = None;
-                                Err(AutomationError::IfDspOperation {
-                                    detail: format!(
-                                        "retune failed ({retune_detail}); the original radio state was restored and the IF-DSP session was stopped"
-                                    ),
-                                })
-                            } else {
-                                if_dsp_session = Some(ActiveIfDspSession {
-                                    output_verified: false,
+                    Some(active) => {
+                        match retune_if_dsp_radio(&mut radio, active.saved, frequency_hz).await {
+                            Ok(()) => {
+                                let retuned = ActiveIfDspSession {
+                                    current_frequency_hz: frequency_hz,
+                                    output_verified: true,
                                     ..active
-                                });
-                                Err(AutomationError::IfDspRestoration {
-                                    detail: format!(
-                                        "retune failed ({retune_detail}); {}",
-                                        report.summary()
-                                    ),
-                                })
+                                };
+                                if_dsp_session = Some(retuned);
+                                Ok(retuned.status())
+                            }
+                            Err(retune_detail) => {
+                                let report = restore_if_dsp_radio(&mut radio, active.saved).await;
+                                if report.is_exact() {
+                                    if_dsp_session = None;
+                                    Err(AutomationError::IfDspOperation {
+                                        detail: format!(
+                                            "retune failed ({retune_detail}); the original radio state was restored and the IF-DSP session was stopped"
+                                        ),
+                                    })
+                                } else {
+                                    if_dsp_session = Some(ActiveIfDspSession {
+                                        output_verified: false,
+                                        ..active
+                                    });
+                                    Err(AutomationError::IfDspRestoration {
+                                        detail: format!(
+                                            "retune failed ({retune_detail}); {}",
+                                            report.summary()
+                                        ),
+                                    })
+                                }
                             }
                         }
-                    },
+                    }
                     None => Err(AutomationError::IfDspModeInactive),
                 };
                 deferred_reply = Some(DeferredReply::IfDsp {
@@ -1879,8 +1884,8 @@ async fn read_settings(
     Ok((result, snapshot))
 }
 
-async fn apply_settings(
-    radio: &mut Radio<SwiftByteTransport>,
+async fn apply_settings<T: RadioTransport>(
+    radio: &mut Radio<T>,
     cached_snapshot: &mut Option<SettingsSnapshot>,
     next_snapshot_id: &mut u64,
     changes: &[SettingChange],
@@ -1934,7 +1939,7 @@ async fn apply_settings(
             })
             .collect::<Result<_, AutomationError>>()?;
 
-    let pages_written = radio
+    let pages_written: Vec<u16> = radio
         .compare_exchange_memory_pages(&exchanges)
         .await
         .map_err(|error| map_exchange_error(&error))?
@@ -1942,34 +1947,12 @@ async fn apply_settings(
         .map(WritableMcpPage::as_raw)
         .collect();
 
-    let mut refreshed_pages = consumed.pages;
-    for (page, replacement) in replacements {
-        let _old = refreshed_pages.insert(page, replacement);
-    }
-    let refreshed_snapshot_id = take_identifier(next_snapshot_id);
-    let refreshed_records = decode_values(&consumed.field_ids, &refreshed_pages)?;
-    let refreshed_values = SettingReadResult {
-        snapshot_id: refreshed_snapshot_id,
-        values: refreshed_records,
-    };
-    *cached_snapshot = Some(SettingsSnapshot {
-        id: refreshed_snapshot_id,
-        pages: refreshed_pages,
-        field_ids: consumed.field_ids,
-    });
-
-    let change_results = changes
-        .iter()
-        .map(|change| SettingChangeResult {
-            setting_id: change.setting_id.clone(),
-            outcome: if change.expected_value == change.desired_value {
-                SettingChangeOutcome::AlreadyCurrent
-            } else {
-                SettingChangeOutcome::Applied
-            },
-            value: change.desired_value.clone(),
-        })
-        .collect();
+    let (refreshed_values, refreshed_snapshot) =
+        refresh_settings_after_apply(radio, consumed, next_snapshot_id, &pages_written).await?;
+    let verified_changes =
+        verify_refreshed_changes(changes, &refreshed_values.values, &pages_written);
+    *cached_snapshot = Some(refreshed_snapshot);
+    let change_results = verified_changes?;
 
     Ok(SettingApplyReport {
         previous_snapshot_id: snapshot_id,
@@ -1979,12 +1962,115 @@ async fn apply_settings(
     })
 }
 
+async fn refresh_settings_after_apply<T: RadioTransport>(
+    radio: &mut Radio<T>,
+    consumed: SettingsSnapshot,
+    next_snapshot_id: &mut u64,
+    pages_written: &[u16],
+) -> Result<(SettingReadResult, SettingsSnapshot), AutomationError> {
+    let refresh_pages = consumed
+        .pages
+        .keys()
+        .copied()
+        .map(|page| {
+            McpPage::new(page).map_err(|error| AutomationError::SettingsApply {
+                detail: format!(
+                    "settings were applied, but cached MCP page 0x{page:04X} could not be selected for live refresh: {error}"
+                ),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let refreshed_pages = radio
+        .read_sparse_memory_pages(&refresh_pages)
+        .await
+        .map_err(|error| AutomationError::SettingsApply {
+            detail: format!(
+                "settings were applied and verified on pages {pages_written:?}, but the post-exit live refresh failed: {error}; reconnect and read the radio before making another change"
+            ),
+        })?
+        .into_iter()
+        .map(|(page, data)| (page.as_raw(), data))
+        .collect::<BTreeMap<_, _>>();
+    let refreshed_records = decode_values(&consumed.field_ids, &refreshed_pages).map_err(|error| {
+        AutomationError::SettingsApply {
+            detail: format!(
+                "settings were applied and live pages were refreshed, but their stored values could not be decoded: {error}"
+            ),
+        }
+    })?;
+    let refreshed_snapshot_id = take_identifier(next_snapshot_id);
+    let refreshed_values = SettingReadResult {
+        snapshot_id: refreshed_snapshot_id,
+        values: refreshed_records,
+    };
+    let refreshed_snapshot = SettingsSnapshot {
+        id: refreshed_snapshot_id,
+        pages: refreshed_pages,
+        field_ids: consumed.field_ids,
+    };
+    Ok((refreshed_values, refreshed_snapshot))
+}
+
+fn verify_refreshed_changes(
+    changes: &[SettingChange],
+    refreshed: &[SettingValueRecord],
+    pages_written: &[u16],
+) -> Result<Vec<SettingChangeResult>, AutomationError> {
+    let live_values: BTreeMap<&str, &SettingValue> = refreshed
+        .iter()
+        .map(|record| (record.setting_id.as_str(), &record.value))
+        .collect();
+    changes
+        .iter()
+        .map(|change| {
+            let actual = live_values.get(change.setting_id.as_str()).ok_or_else(|| {
+                AutomationError::SettingsApply {
+                    detail: format!(
+                        "post-exit live refresh omitted approved setting {}",
+                        change.setting_id
+                    ),
+                }
+            })?;
+            if *actual != &change.desired_value {
+                return Err(AutomationError::SettingsApply {
+                    detail: format!(
+                        "post-exit live read-back for {} was {actual:?}, not the approved value {:?}; pages {pages_written:?} were written and the cached snapshot now reflects the radio",
+                        change.setting_id, change.desired_value
+                    ),
+                });
+            }
+            Ok(SettingChangeResult {
+                setting_id: change.setting_id.clone(),
+                outcome: if change.expected_value == change.desired_value {
+                    SettingChangeOutcome::AlreadyCurrent
+                } else {
+                    SettingChangeOutcome::Applied
+                },
+                value: (*actual).clone(),
+            })
+        })
+        .collect()
+}
+
 fn verify_setting_preconditions(
     changes: &[SettingChange],
     fields: &[&MenuField],
     snapshot: &SettingsSnapshot,
     patches: &PatchSet,
 ) -> Result<(), AutomationError> {
+    let reviewed_ids: BTreeSet<&str> = snapshot.field_ids.iter().map(String::as_str).collect();
+    for change in changes {
+        if !reviewed_ids.contains(change.setting_id.as_str()) {
+            return Err(AutomationError::SettingPreconditionFailed {
+                setting_id: change.setting_id.clone(),
+                expected: format!("{:?}", change.expected_value),
+                actual: format!(
+                    "setting was not included in reviewed snapshot {}",
+                    snapshot.id
+                ),
+            });
+        }
+    }
     let field_ids = fields
         .iter()
         .map(|field| field.descriptor.name.to_owned())
@@ -2010,8 +2096,8 @@ fn verify_setting_preconditions(
     Ok(())
 }
 
-async fn ensure_settings_target(
-    radio: &mut Radio<SwiftByteTransport>,
+async fn ensure_settings_target<T: RadioTransport>(
+    radio: &mut Radio<T>,
     applying: bool,
 ) -> Result<(), AutomationError> {
     radio
@@ -2099,11 +2185,12 @@ fn decode_values(
             let field = menu_field(identifier).ok_or_else(|| AutomationError::SettingsRead {
                 detail: format!("unknown cached setting identifier {identifier}"),
             })?;
-            let value = snapshot
-                .value(field)
-                .map_err(|error| AutomationError::SettingsRead {
-                    detail: error.to_string(),
-                })?;
+            let value =
+                snapshot
+                    .stored_value(field)
+                    .map_err(|error| AutomationError::SettingsRead {
+                        detail: error.to_string(),
+                    })?;
             Ok(SettingValueRecord {
                 setting_id: field.descriptor.name.to_owned(),
                 value: setting_value(value),
@@ -2189,6 +2276,7 @@ const fn take_identifier(next: &mut u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kenwood_thd75::protocol::programming;
     use kenwood_thd75::screen::{SCREEN_BYTES, ScreenFrame};
     use kenwood_thd75::transport::MockTransport;
     use kenwood_thd75::types::{PacketDataRate, RadioModel};
@@ -2203,6 +2291,41 @@ mod tests {
         transport.expect(&[FEND, 0xFF, FEND], b"");
         transport.expect(b"\rTC 1\r", b"");
         transport.expect(b"TN 0,0\r", b"");
+    }
+
+    fn mcp_read_response(page: u16, data: &[u8; PAGE_SIZE]) -> Vec<u8> {
+        let [high, low] = page.to_be_bytes();
+        let mut response = vec![b'W', high, low, 0, 0];
+        response.extend_from_slice(data);
+        response
+    }
+
+    fn expect_mcp_page_read(transport: &mut MockTransport, page: McpPage, data: &[u8; PAGE_SIZE]) {
+        let command = programming::build_read_command(page);
+        transport.expect(&command, &mcp_read_response(page.as_raw(), data));
+        transport.expect(&[programming::ACK], &[programming::ACK]);
+    }
+
+    fn expect_mcp_exit(transport: &mut MockTransport) {
+        transport.expect(&[programming::EXIT], &[programming::ACK]);
+        transport.expect_reopen(Ok(()));
+        transport.expect(b"ID\r", b"ID TH-D75\r");
+    }
+
+    fn expect_mcp_page_exchange(
+        transport: &mut MockTransport,
+        page: McpPage,
+        expected: &[u8; PAGE_SIZE],
+        replacement: &[u8; PAGE_SIZE],
+    ) -> TestResult {
+        transport.expect(programming::ENTER_PROGRAMMING, programming::ENTER_RESPONSE);
+        expect_mcp_page_read(transport, page, expected);
+        let write =
+            programming::build_write_command(WritableMcpPage::new(page.as_raw())?, replacement);
+        transport.expect(&write, &[programming::ACK]);
+        expect_mcp_page_read(transport, page, replacement);
+        expect_mcp_exit(transport);
+        Ok(())
     }
 
     #[test]
@@ -2247,6 +2370,250 @@ mod tests {
         let pages = pages_for_fields(&[field])?;
 
         assert_eq!(pages.len(), 338, "86,400 bytes span 338 MCP pages");
+        Ok(())
+    }
+
+    #[test]
+    fn setting_snapshot_decode_preserves_off_menu_pf_assignment() -> TestResult {
+        let mut page = [0_u8; PAGE_SIZE];
+        page[0x7A] = 31;
+        let pages = BTreeMap::from([(0x10, page)]);
+        let identifiers = vec!["radio.Pf1PfKey".to_owned()];
+
+        let records = decode_values(&identifiers, &pages)?;
+
+        assert_eq!(records.len(), 1);
+        let record = records.first().ok_or("decoded PF1 record missing")?;
+        assert_eq!(
+            record.value,
+            SettingValue::Unsigned { value: 31 },
+            "hardware-stored Screen Capture must not make the complete settings read fail"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn setting_apply_refuses_post_exit_live_readback_mismatch() -> TestResult {
+        let page = McpPage::new(0x10)?;
+        let before = [0_u8; PAGE_SIZE];
+        let mut requested = before;
+        *requested
+            .get_mut(0x71)
+            .ok_or("beep byte missing from MCP page")? = 1;
+
+        let mut transport = MockTransport::new();
+        transport.expect(b"ID\r", b"ID TH-D75\r");
+        transport.expect(b"FV\r", b"FV 1.03.AZM\r");
+        expect_mcp_page_exchange(&mut transport, page, &before, &requested)?;
+
+        // The immediate in-session verification above succeeds, but the
+        // second session observes that the radio did not retain the change.
+        transport.expect(programming::ENTER_PROGRAMMING, programming::ENTER_RESPONSE);
+        expect_mcp_page_read(&mut transport, page, &before);
+        expect_mcp_exit(&mut transport);
+
+        let mut radio = Radio::new(transport);
+        let mut cached_snapshot = Some(SettingsSnapshot {
+            id: 41,
+            pages: BTreeMap::from([(page.as_raw(), before)]),
+            field_ids: vec!["radio.Beep".to_owned()],
+        });
+        let mut next_snapshot_id = 42;
+        let changes = [SettingChange {
+            setting_id: "radio.Beep".to_owned(),
+            snapshot_id: 41,
+            expected_value: SettingValue::Boolean { value: false },
+            desired_value: SettingValue::Boolean { value: true },
+        }];
+
+        let result = apply_settings(
+            &mut radio,
+            &mut cached_snapshot,
+            &mut next_snapshot_id,
+            &changes,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                &result,
+                Err(AutomationError::SettingsApply { detail })
+                    if detail.contains("post-exit live read-back")
+                        && detail.contains("radio.Beep")
+            ),
+            "a reverted post-exit value must not be reported as verified: {result:?}"
+        );
+        let refreshed = cached_snapshot
+            .as_ref()
+            .ok_or("actual post-exit snapshot was not retained")?;
+        assert_eq!(refreshed.id, 42);
+        let live = decode_values(&refreshed.field_ids, &refreshed.pages)?;
+        assert_eq!(
+            live.first().map(|record| &record.value),
+            Some(&SettingValue::Boolean { value: false }),
+            "the retained snapshot must contain the radio's actual value"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn setting_apply_rejects_an_unreviewed_field_from_a_cached_page() -> TestResult {
+        let page = McpPage::new(0x10)?;
+        let snapshot = SettingsSnapshot {
+            id: 71,
+            pages: BTreeMap::from([(page.as_raw(), [0_u8; PAGE_SIZE])]),
+            field_ids: vec!["radio.Beep".to_owned()],
+        };
+        let changes = [SettingChange {
+            setting_id: "radio.BeepVolume".to_owned(),
+            snapshot_id: 71,
+            expected_value: SettingValue::Unsigned { value: 0 },
+            desired_value: SettingValue::Unsigned { value: 1 },
+        }];
+        let (patches, fields) = build_patch_plan(&changes).map_err(std::io::Error::other)?;
+
+        let result = verify_setting_preconditions(&changes, &fields, &snapshot, &patches);
+
+        assert!(
+            matches!(
+                result,
+                Err(AutomationError::SettingPreconditionFailed {
+                    setting_id,
+                    actual,
+                    ..
+                }) if setting_id == "radio.BeepVolume"
+                    && actual.contains("not included in reviewed snapshot 71")
+            ),
+            "sharing a cached page must not authorize an unreviewed field"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn setting_apply_reports_and_caches_second_live_mcp_snapshot() -> TestResult {
+        let page = McpPage::new(0x10)?;
+        let before = [0_u8; PAGE_SIZE];
+        let mut requested = before;
+        *requested
+            .get_mut(0x71)
+            .ok_or("beep byte missing from MCP page")? = 1;
+        let mut post_exit = requested;
+        *post_exit
+            .get_mut(0x72)
+            .ok_or("beep-volume byte missing from MCP page")? = 3;
+
+        let mut transport = MockTransport::new();
+        transport.expect(b"ID\r", b"ID TH-D75\r");
+        transport.expect(b"FV\r", b"FV 1.03.AZM\r");
+        expect_mcp_page_exchange(&mut transport, page, &before, &requested)?;
+        transport.expect(programming::ENTER_PROGRAMMING, programming::ENTER_RESPONSE);
+        expect_mcp_page_read(&mut transport, page, &post_exit);
+        expect_mcp_exit(&mut transport);
+
+        let field_ids = vec!["radio.Beep".to_owned(), "radio.BeepVolume".to_owned()];
+        let mut radio = Radio::new(transport);
+        let mut cached_snapshot = Some(SettingsSnapshot {
+            id: 51,
+            pages: BTreeMap::from([(page.as_raw(), before)]),
+            field_ids: field_ids.clone(),
+        });
+        let mut next_snapshot_id = 52;
+        let changes = [SettingChange {
+            setting_id: "radio.Beep".to_owned(),
+            snapshot_id: 51,
+            expected_value: SettingValue::Boolean { value: false },
+            desired_value: SettingValue::Boolean { value: true },
+        }];
+
+        let report = apply_settings(
+            &mut radio,
+            &mut cached_snapshot,
+            &mut next_snapshot_id,
+            &changes,
+        )
+        .await?;
+
+        assert_eq!(report.pages_written, [page.as_raw()]);
+        assert_eq!(
+            report.changes.first().map(|result| &result.value),
+            Some(&SettingValue::Boolean { value: true })
+        );
+        assert_eq!(report.refreshed_values.snapshot_id, 52);
+        assert_eq!(
+            report
+                .refreshed_values
+                .values
+                .iter()
+                .find(|record| record.setting_id == "radio.BeepVolume")
+                .map(|record| &record.value),
+            Some(&SettingValue::Unsigned { value: 3 }),
+            "an untouched value changed after exit and must come from the second live read"
+        );
+
+        let cached = cached_snapshot
+            .as_ref()
+            .ok_or("post-exit live snapshot was not cached")?;
+        assert_eq!(cached.id, 52);
+        let cached_values = decode_values(&field_ids, &cached.pages)?;
+        assert_eq!(cached_values, report.refreshed_values.values);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn setting_apply_surfaces_failed_post_exit_refresh() -> TestResult {
+        let page = McpPage::new(0x10)?;
+        let before = [0_u8; PAGE_SIZE];
+        let mut requested = before;
+        *requested
+            .get_mut(0x71)
+            .ok_or("beep byte missing from MCP page")? = 1;
+
+        let mut transport = MockTransport::new();
+        transport.expect(b"ID\r", b"ID TH-D75\r");
+        transport.expect(b"FV\r", b"FV 1.03.AZM\r");
+        expect_mcp_page_exchange(&mut transport, page, &before, &requested)?;
+        transport.expect(
+            programming::ENTER_PROGRAMMING,
+            b"invalid programming response",
+        );
+        expect_mcp_exit(&mut transport);
+
+        let mut radio = Radio::new(transport);
+        let mut cached_snapshot = Some(SettingsSnapshot {
+            id: 61,
+            pages: BTreeMap::from([(page.as_raw(), before)]),
+            field_ids: vec!["radio.Beep".to_owned()],
+        });
+        let mut next_snapshot_id = 62;
+        let changes = [SettingChange {
+            setting_id: "radio.Beep".to_owned(),
+            snapshot_id: 61,
+            expected_value: SettingValue::Boolean { value: false },
+            desired_value: SettingValue::Boolean { value: true },
+        }];
+
+        let result = apply_settings(
+            &mut radio,
+            &mut cached_snapshot,
+            &mut next_snapshot_id,
+            &changes,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                &result,
+                Err(AutomationError::SettingsApply { detail })
+                    if detail.contains("post-exit live refresh failed")
+                        && detail.contains("[16]")
+            ),
+            "a failed post-write refresh must retain the write outcome: {result:?}"
+        );
+        assert!(
+            cached_snapshot.is_none(),
+            "a failed live refresh must not retain synthesized replacement bytes"
+        );
+        assert_eq!(next_snapshot_id, 62);
         Ok(())
     }
 

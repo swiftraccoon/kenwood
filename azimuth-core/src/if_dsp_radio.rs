@@ -2,33 +2,31 @@
 //!
 //! The lifecycle itself is library-owned: `Radio::enter_if_tap` guards
 //! Band-B VFO mode, snapshots every touched setting (including the tuning
-//! step), configures single-band B / USB / squelch-open / 5 kHz step,
-//! proves IF engagement by readback, and rolls back on a mid-configure
-//! failure; `Radio::restore_if_tap` restores in the hardware-required
-//! order; `Radio::retune_if_tap` steps with the verified UP/DW walk. This
-//! module adapts those calls to the actor's stored-state shape and the
-//! Swift-facing report strings.
+//! step and original frequency), configures single-band B / USB /
+//! squelch-open / 5 kHz step, proves IF engagement by readback, and rolls
+//! back on a mid-configure failure; `Radio::restore_if_tap` restores in the
+//! hardware-required order; `Radio::retune_if_tap` steps with the verified
+//! UP/DW walk. This module adapts those calls to the actor's stored-state
+//! shape and the Swift-facing report strings.
 
 use kenwood_thd75::radio::if_tap::IfTapRestoreReport;
 use kenwood_thd75::transport::Transport;
-use kenwood_thd75::types::{Band, Frequency, OperatingMode, StepSize, UsbAudioOutput};
+use kenwood_thd75::types::{Frequency, OperatingMode, StepSize, UsbAudioOutput};
 use kenwood_thd75::{IfTapConfig, IfTapSavedState, Radio};
 
 /// Fixed center of the TH-D75 real low-IF USB stream.
 pub(crate) const IF_CENTER_HZ: u32 = 12_000;
 
-/// Complete snapshot of every radio value changed by IF capture, plus the
-/// Band-B frequency observed before engagement.
+/// Complete snapshot of every radio value changed by IF capture.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SavedIfDspRadioState {
     if_tap: IfTapSavedState,
-    band_b_frequency: Frequency,
 }
 
 impl SavedIfDspRadioState {
     /// Band-B frequency which was active before IF capture began.
     pub(crate) const fn band_b_frequency_hz(self) -> u32 {
-        self.band_b_frequency.as_hz()
+        self.if_tap.band_b_frequency().as_hz()
     }
 }
 
@@ -72,20 +70,15 @@ pub(crate) enum EngageIfDspError {
 /// Engage the 12 kHz USB IF output through the library session.
 ///
 /// Snapshot, configuration, engagement proof, and failure rollback are one
-/// atomic library operation; this adapter additionally records the Band-B
-/// frequency observed before engagement for status reporting.
+/// atomic library operation. The library snapshot includes Band B's original
+/// frequency for both status reporting and verified restoration.
 pub(crate) async fn engage_if_dsp_radio<T: Transport>(
     radio: &mut Radio<T>,
 ) -> Result<SavedIfDspRadioState, EngageIfDspError> {
-    let band_b_frequency = radio
-        .get_frequency(Band::B)
-        .await
-        .map_err(|error| EngageIfDspError::Clean(format!("reading Band-B frequency: {error}")))?;
     let config = IfTapConfig::new(OperatingMode::Usb).with_step(StepSize::Hz5000);
     match radio.enter_if_tap(config).await {
         Ok(session) => Ok(SavedIfDspRadioState {
             if_tap: session.into_saved_state(),
-            band_b_frequency,
         }),
         Err(error) => {
             let detail = if error.rollback.is_complete() {
@@ -102,10 +95,7 @@ pub(crate) async fn engage_if_dsp_radio<T: Transport>(
             match error.snapshot {
                 Some(if_tap) => Err(EngageIfDspError::Dirty {
                     detail,
-                    saved: SavedIfDspRadioState {
-                        if_tap,
-                        band_b_frequency,
-                    },
+                    saved: SavedIfDspRadioState { if_tap },
                 }),
                 None => Err(EngageIfDspError::Clean(detail)),
             }
@@ -117,13 +107,17 @@ pub(crate) async fn engage_if_dsp_radio<T: Transport>(
 ///
 /// Each step is confirmed by a frequency readback (the radio can swallow
 /// rapid consecutive steps), the tap drops to the audio path during the
-/// walk, and IF output is re-engaged with a readback proof afterwards.
+/// walk, and IF output is re-engaged with a readback proof afterwards. The
+/// original `saved` frequency bounds every target so cumulative retunes can
+/// always be restored by the same bounded walk.
 pub(crate) async fn retune_if_dsp_radio<T: Transport>(
     radio: &mut Radio<T>,
+    saved: SavedIfDspRadioState,
     frequency_hz: u32,
 ) -> Result<(), String> {
     radio
         .retune_if_tap(
+            &saved.if_tap,
             Frequency::new(frequency_hz),
             UsbAudioOutput::IntermediateFrequency,
         )
@@ -132,10 +126,8 @@ pub(crate) async fn retune_if_dsp_radio<T: Transport>(
         .map_err(|error| format!("retuning Band B: {error}"))
 }
 
-/// Restore every saved value in the hardware-required order.
-///
-/// Frequency is deliberately not restored: tuning is user-directed through
-/// [`retune_if_dsp_radio`].
+/// Restore every saved value, including Band B's pre-session frequency, in
+/// the hardware-required order.
 pub(crate) async fn restore_if_dsp_radio<T: Transport>(
     radio: &mut Radio<T>,
     saved: SavedIfDspRadioState,
@@ -167,21 +159,26 @@ mod tests {
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     /// The library enter script for this adapter's configuration (USB mode,
-    /// squelch open, 5 kHz step), preceded by the adapter's frequency read.
+    /// squelch open, 5 kHz step, and original-frequency snapshot).
     fn queue_engage_script(mock: &mut MockTransport) {
-        mock.expect(b"FQ 1\r", b"FQ 1,0145240000\r");
         mock.expect(b"VM 1\r", b"VM 1,0\r");
         mock.expect(b"BC\r", b"BC 0\r");
         mock.expect(b"DL\r", b"DL 0\r");
         mock.expect(b"IO\r", b"IO 0\r");
         mock.expect(b"SQ 1\r", b"SQ 1,2\r");
         mock.expect(b"MD 1\r", b"MD 1,0\r");
+        mock.expect(b"FQ 1\r", b"FQ 1,0145240000\r");
         mock.expect(b"SF 1\r", b"SF 1,5\r");
         mock.expect(b"BC 1\r", b"BC 1\r");
+        mock.expect(b"BC\r", b"BC 1\r");
         mock.expect(b"DL 1\r", b"DL 1\r");
+        mock.expect(b"DL\r", b"DL 1\r");
         mock.expect(b"SF 1,0\r", b"SF 1,0\r");
+        mock.expect(b"SF 1\r", b"SF 1,0\r");
         mock.expect(b"MD 1,4\r", b"MD 1,4\r");
+        mock.expect(b"MD 1\r", b"MD 1,4\r");
         mock.expect(b"SQ 1,0\r", b"SQ 1,0\r");
+        mock.expect(b"SQ 1\r", b"SQ 1,0\r");
         mock.expect(b"IO 1\r", b"IO 1\r");
         mock.expect(b"IO\r", b"IO 1\r");
     }
@@ -202,22 +199,30 @@ mod tests {
     #[tokio::test]
     async fn engage_reports_clean_when_the_library_rolls_back() -> TestResult {
         let mut mock = MockTransport::new();
-        mock.expect(b"FQ 1\r", b"FQ 1,0145240000\r");
         mock.expect(b"VM 1\r", b"VM 1,0\r");
         mock.expect(b"BC\r", b"BC 0\r");
         mock.expect(b"DL\r", b"DL 0\r");
         mock.expect(b"IO\r", b"IO 0\r");
         mock.expect(b"SQ 1\r", b"SQ 1,2\r");
         mock.expect(b"MD 1\r", b"MD 1,0\r");
+        mock.expect(b"FQ 1\r", b"FQ 1,0145240000\r");
         mock.expect(b"SF 1\r", b"SF 1,5\r");
         mock.expect(b"BC 1\r", b"BC 1\r");
+        mock.expect(b"BC\r", b"BC 1\r");
         mock.expect(b"DL 1\r", b"?\r");
         mock.expect(b"IO 0\r", b"IO 0\r");
-        mock.expect(b"SQ 1,2\r", b"SQ 1,2\r");
-        mock.expect(b"MD 1,0\r", b"MD 1,0\r");
+        mock.expect(b"IO\r", b"IO 0\r");
         mock.expect(b"SF 1,5\r", b"SF 1,5\r");
+        mock.expect(b"SF 1\r", b"SF 1,5\r");
+        mock.expect(b"FQ 1\r", b"FQ 1,0145240000\r");
+        mock.expect(b"SQ 1,2\r", b"SQ 1,2\r");
+        mock.expect(b"SQ 1\r", b"SQ 1,2\r");
+        mock.expect(b"MD 1,0\r", b"MD 1,0\r");
+        mock.expect(b"MD 1\r", b"MD 1,0\r");
         mock.expect(b"DL 0\r", b"DL 0\r");
+        mock.expect(b"DL\r", b"DL 0\r");
         mock.expect(b"BC 0\r", b"BC 0\r");
+        mock.expect(b"BC\r", b"BC 0\r");
         let mut radio = Radio::new(mock);
 
         let result = engage_if_dsp_radio(&mut radio).await;
@@ -233,15 +238,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restore_maps_the_typed_report_into_step_strings() -> TestResult {
+    async fn restore_maps_independent_readback_mismatch_into_step_strings() -> TestResult {
         let mut mock = MockTransport::new();
         queue_engage_script(&mut mock);
         mock.expect(b"IO 0\r", b"IO 0\r");
-        mock.expect(b"SQ 1,2\r", b"?\r");
-        mock.expect(b"MD 1,0\r", b"MD 1,0\r");
+        mock.expect(b"IO\r", b"IO 0\r");
         mock.expect(b"SF 1,5\r", b"SF 1,5\r");
+        mock.expect(b"SF 1\r", b"SF 1,5\r");
+        mock.expect(b"FQ 1\r", b"FQ 1,0145240000\r");
+        mock.expect(b"SQ 1,2\r", b"SQ 1,2\r");
+        mock.expect(b"SQ 1\r", b"SQ 1,0\r");
+        mock.expect(b"MD 1,0\r", b"MD 1,0\r");
+        mock.expect(b"MD 1\r", b"MD 1,0\r");
         mock.expect(b"DL 0\r", b"DL 0\r");
+        mock.expect(b"DL\r", b"DL 0\r");
         mock.expect(b"BC 0\r", b"BC 0\r");
+        mock.expect(b"BC\r", b"BC 0\r");
         let mut radio = Radio::new(mock);
 
         let saved = engage_if_dsp_radio(&mut radio)
@@ -259,22 +271,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retune_delegates_to_the_verified_walk() -> TestResult {
+    async fn retune_then_restore_returns_to_the_original_frequency() -> TestResult {
         let mut mock = MockTransport::new();
         queue_engage_script(&mut mock);
         mock.expect(b"FQ 1\r", b"FQ 1,0145240000\r");
         mock.expect(b"SF 1\r", b"SF 1,0\r");
         mock.expect(b"IO 0\r", b"IO 0\r");
+        mock.expect(b"IO\r", b"IO 0\r");
         mock.expect(b"UP\r", b"UP\r");
         mock.expect(b"FQ 1\r", b"FQ 1,0145245000\r");
+        mock.expect(b"UP\r", b"UP\r");
+        mock.expect(b"FQ 1\r", b"FQ 1,0145250000\r");
+        mock.expect(b"UP\r", b"UP\r");
+        mock.expect(b"FQ 1\r", b"FQ 1,0145255000\r");
+        mock.expect(b"UP\r", b"UP\r");
+        mock.expect(b"FQ 1\r", b"FQ 1,0145260000\r");
+        mock.expect(b"UP\r", b"UP\r");
+        mock.expect(b"FQ 1\r", b"FQ 1,0145265000\r");
         mock.expect(b"IO 1\r", b"IO 1\r");
         mock.expect(b"IO\r", b"IO 1\r");
+
+        mock.expect(b"IO 0\r", b"IO 0\r");
+        mock.expect(b"IO\r", b"IO 0\r");
+        mock.expect(b"SF 1,5\r", b"SF 1,5\r");
+        mock.expect(b"SF 1\r", b"SF 1,5\r");
+        mock.expect(b"FQ 1\r", b"FQ 1,0145265000\r");
+        mock.expect(b"BC\r", b"BC 1\r");
+        mock.expect(b"SF 1\r", b"SF 1,5\r");
+        mock.expect(b"DW\r", b"DW\r");
+        mock.expect(b"FQ 1\r", b"FQ 1,0145252500\r");
+        mock.expect(b"DW\r", b"DW\r");
+        mock.expect(b"FQ 1\r", b"FQ 1,0145240000\r");
+        mock.expect(b"SQ 1,2\r", b"SQ 1,2\r");
+        mock.expect(b"SQ 1\r", b"SQ 1,2\r");
+        mock.expect(b"MD 1,0\r", b"MD 1,0\r");
+        mock.expect(b"MD 1\r", b"MD 1,0\r");
+        mock.expect(b"DL 0\r", b"DL 0\r");
+        mock.expect(b"DL\r", b"DL 0\r");
+        mock.expect(b"BC 0\r", b"BC 0\r");
+        mock.expect(b"BC\r", b"BC 0\r");
         let mut radio = Radio::new(mock);
 
-        let _saved = engage_if_dsp_radio(&mut radio)
+        let saved = engage_if_dsp_radio(&mut radio)
             .await
             .map_err(|error| format!("{error:?}"))?;
-        retune_if_dsp_radio(&mut radio, 145_245_000).await?;
+        retune_if_dsp_radio(&mut radio, saved, 145_265_000).await?;
+        let report = restore_if_dsp_radio(&mut radio, saved).await;
+        assert!(
+            report.is_exact(),
+            "the adapter must restore the original Band B frequency: {report:?}"
+        );
         Ok(())
     }
 }

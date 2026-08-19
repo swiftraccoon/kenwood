@@ -68,6 +68,16 @@ pub enum SettingPresentation {
     Blob,
 }
 
+/// Radio lifecycle required to change one stored setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum SettingWritePolicy {
+    /// The setting may be changed through the ordinary stale-safe MCP batch.
+    Generic,
+    /// The setting requires a purpose-built operation that owns disruption,
+    /// restart, and reconnection outside the generic editor.
+    DedicatedLifecycle,
+}
+
 /// One labeled raw value in a finite setting domain.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct SettingOption {
@@ -92,7 +102,7 @@ pub struct SettingStorageTransform {
     pub display_decimal_places: u8,
 }
 
-/// Complete app-facing metadata for one writable MCP-D75 field.
+/// Complete app-facing metadata for one stored MCP-D75 field.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct SettingRecord {
     /// Stable identifier used by reads, plans, and writes.
@@ -133,6 +143,34 @@ pub struct SettingRecord {
     pub storage_transform: Option<SettingStorageTransform>,
     /// Whether the value is a large persistent blob.
     pub is_blob: bool,
+    /// Lifecycle policy enforced before any generic setting write.
+    pub write_policy: SettingWritePolicy,
+    /// Whether changing this field requires a radio restart.
+    pub requires_restart: bool,
+    /// Whether changing this field invalidates the active transport session.
+    pub requires_reconnect: bool,
+    /// User-facing reason a dedicated-lifecycle field is read-only here.
+    pub write_restriction: Option<String>,
+}
+
+const DV_GATEWAY_MODE_SETTING_ID: &str = "dv.DvGatewayModeDvGateway";
+const USB_FUNCTION_SETTING_ID: &str = "radio.UsbFunction";
+
+#[derive(Debug, Clone, Copy)]
+struct SettingLifecycle {
+    write_policy: SettingWritePolicy,
+    requires_restart: bool,
+    requires_reconnect: bool,
+    write_restriction: Option<&'static str>,
+}
+
+impl SettingLifecycle {
+    const GENERIC: Self = Self {
+        write_policy: SettingWritePolicy::Generic,
+        requires_restart: false,
+        requires_reconnect: false,
+        write_restriction: None,
+    };
 }
 
 /// Rejected raw/display conversion.
@@ -249,11 +287,13 @@ pub struct SettingPlanValidation {
     pub batch_error: Option<String>,
 }
 
-/// Return all 400 writable MCP-D75 setting records.
+/// Return all 400 stored MCP-D75 setting records.
 ///
 /// The records are projected directly from `kenwood-thd75`'s generated
 /// registry, so the app and Rust write path cannot drift onto separate field
-/// definitions.
+/// definitions. Most records permit generic stale-safe writes; disruptive
+/// records declare [`SettingWritePolicy::DedicatedLifecycle`] and are
+/// rejected by the generic planner.
 #[must_use]
 #[uniffi::export]
 pub fn setting_catalog() -> Vec<SettingRecord> {
@@ -396,7 +436,9 @@ pub(crate) fn build_patch_plan(
 fn validate_change(change: &SettingChange) -> Result<(), String> {
     let field = menu_field(&change.setting_id)
         .ok_or_else(|| format!("unknown setting identifier {}", change.setting_id))?;
-    validate_value(field, &change.expected_value)
+    validate_write_policy(field)?;
+    field
+        .validate_stored_value(change.expected_value.as_field_value())
         .map_err(|error| format!("invalid expected value: {error}"))?;
     validate_value(field, &change.desired_value)
         .map_err(|error| format!("invalid desired value: {error}"))
@@ -421,6 +463,17 @@ fn validate_value(field: &MenuField, value: &SettingValue) -> Result<(), String>
         .map_err(|error| error.to_string())?;
     let _patches = planner.finish().map_err(|error| error.to_string())?;
     Ok(())
+}
+
+fn validate_write_policy(field: &MenuField) -> Result<(), String> {
+    let lifecycle = setting_lifecycle(field.descriptor.name);
+    if lifecycle.write_policy == SettingWritePolicy::Generic {
+        return Ok(());
+    }
+    Err(lifecycle.write_restriction.map_or_else(
+        || "this setting requires a dedicated radio lifecycle".to_owned(),
+        str::to_owned,
+    ))
 }
 
 fn validate_batch(changes: &[SettingChange]) -> Result<(), String> {
@@ -459,6 +512,7 @@ fn validate_batch(changes: &[SettingChange]) -> Result<(), String> {
 
 fn setting_record(field: &MenuField) -> SettingRecord {
     let codec = field.descriptor.codec;
+    let lifecycle = setting_lifecycle(field.descriptor.name);
     let (bit_mask, bit_shift) = match codec {
         FieldCodec::BitBool { mask } => (Some(mask), None),
         FieldCodec::BitField { mask, shift, .. } => (Some(mask), Some(shift)),
@@ -527,6 +581,32 @@ fn setting_record(field: &MenuField) -> SettingRecord {
                 display_decimal_places: 1,
             }),
         is_blob: field.is_blob,
+        write_policy: lifecycle.write_policy,
+        requires_restart: lifecycle.requires_restart,
+        requires_reconnect: lifecycle.requires_reconnect,
+        write_restriction: lifecycle.write_restriction.map(str::to_owned),
+    }
+}
+
+fn setting_lifecycle(identifier: &str) -> SettingLifecycle {
+    match identifier {
+        DV_GATEWAY_MODE_SETTING_ID => SettingLifecycle {
+            write_policy: SettingWritePolicy::DedicatedLifecycle,
+            requires_restart: true,
+            requires_reconnect: true,
+            write_restriction: Some(
+                "Menu 650 changes the radio's control protocol and reboots the radio; use the dedicated DV Gateway lifecycle instead of the generic settings editor.",
+            ),
+        },
+        USB_FUNCTION_SETTING_ID => SettingLifecycle {
+            write_policy: SettingWritePolicy::DedicatedLifecycle,
+            requires_restart: true,
+            requires_reconnect: true,
+            write_restriction: Some(
+                "Menu 980 replaces the active USB control interface; changing it needs a purpose-built disconnect and reconnect lifecycle that is unavailable in the generic settings editor.",
+            ),
+        },
+        _ => SettingLifecycle::GENERIC,
     }
 }
 
@@ -586,11 +666,7 @@ mod tests {
         let catalog = setting_catalog();
         let identifiers: BTreeSet<&str> = catalog.iter().map(|record| record.id.as_str()).collect();
 
-        assert_eq!(
-            catalog.len(),
-            400,
-            "catalog must expose all writable fields"
-        );
+        assert_eq!(catalog.len(), 400, "catalog must expose all stored fields");
         assert_eq!(
             identifiers.len(),
             catalog.len(),
@@ -642,6 +718,39 @@ mod tests {
     }
 
     #[test]
+    fn disruptive_settings_export_dedicated_lifecycle_truth() {
+        let catalog = setting_catalog();
+        let dedicated: Vec<&SettingRecord> = catalog
+            .iter()
+            .filter(|record| record.write_policy == SettingWritePolicy::DedicatedLifecycle)
+            .collect();
+
+        assert_eq!(
+            dedicated
+                .iter()
+                .map(|record| record.id.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([DV_GATEWAY_MODE_SETTING_ID, USB_FUNCTION_SETTING_ID])
+        );
+        for record in dedicated {
+            assert!(record.requires_restart, "{} must report restart", record.id);
+            assert!(
+                record.requires_reconnect,
+                "{} must report transport replacement",
+                record.id
+            );
+            assert!(
+                record
+                    .write_restriction
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("generic settings editor")),
+                "{} must explain why the generic editor is unavailable",
+                record.id
+            );
+        }
+    }
+
+    #[test]
     fn plan_validation_rejects_unknown_and_out_of_domain_values() {
         let invalid = vec![
             SettingChange {
@@ -689,6 +798,94 @@ mod tests {
         assert!(report.accepted, "valid batch must pass: {report:?}");
         assert_eq!(fields.len(), 2);
         assert_eq!(patches.len(), 1, "shared-byte changes must coalesce");
+        Ok(())
+    }
+
+    #[test]
+    fn generic_validation_rejects_disruptive_settings_and_mixed_batches() {
+        let ordinary = SettingChange {
+            setting_id: "radio.Beep".to_owned(),
+            snapshot_id: 11,
+            expected_value: SettingValue::Boolean { value: false },
+            desired_value: SettingValue::Boolean { value: true },
+        };
+        let gateway = SettingChange {
+            setting_id: DV_GATEWAY_MODE_SETTING_ID.to_owned(),
+            snapshot_id: 11,
+            expected_value: SettingValue::Unsigned { value: 0 },
+            desired_value: SettingValue::Unsigned { value: 1 },
+        };
+        let usb = SettingChange {
+            setting_id: USB_FUNCTION_SETTING_ID.to_owned(),
+            snapshot_id: 11,
+            expected_value: SettingValue::Unsigned { value: 0 },
+            desired_value: SettingValue::Unsigned { value: 1 },
+        };
+
+        for disruptive in [&gateway, &usb] {
+            let report = validate_setting_changes(vec![disruptive.clone()]);
+            assert!(
+                !report.accepted,
+                "{} must be rejected",
+                disruptive.setting_id
+            );
+            assert!(
+                report
+                    .changes
+                    .first()
+                    .and_then(|change| change.detail.as_deref())
+                    .is_some_and(|detail| detail.contains("generic settings editor")),
+                "{} must name the required lifecycle: {report:?}",
+                disruptive.setting_id
+            );
+        }
+
+        let mixed = validate_setting_changes(vec![ordinary, gateway]);
+        assert!(!mixed.accepted, "a mixed batch must fail as a whole");
+        assert!(mixed.changes.first().is_some_and(|change| change.accepted));
+        assert!(
+            mixed.changes.get(1).is_some_and(|change| !change.accepted),
+            "the disruptive member must carry the rejection: {mixed:?}"
+        );
+    }
+
+    #[test]
+    fn off_menu_snapshot_value_can_be_replaced_but_not_requested() -> TestResult {
+        let replace = SettingChange {
+            setting_id: "radio.Pf1PfKey".to_owned(),
+            snapshot_id: 12,
+            expected_value: SettingValue::Unsigned { value: 31 },
+            desired_value: SettingValue::Unsigned { value: 30 },
+        };
+        let report = validate_setting_changes(vec![replace.clone()]);
+        let (patches, fields) = build_patch_plan(&[replace]).map_err(std::io::Error::other)?;
+
+        assert!(
+            report.accepted,
+            "an exact off-menu expected value must remain usable for concurrency control: {report:?}"
+        );
+        assert_eq!(fields.len(), 1);
+        assert_eq!(patches.len(), 1);
+
+        let preserve = SettingChange {
+            setting_id: "radio.Pf1PfKey".to_owned(),
+            snapshot_id: 12,
+            expected_value: SettingValue::Unsigned { value: 30 },
+            desired_value: SettingValue::Unsigned { value: 31 },
+        };
+        let rejected = validate_setting_changes(vec![preserve]);
+        assert!(
+            !rejected.accepted,
+            "off-menu desired values must stay rejected"
+        );
+        let rejection_detail = rejected
+            .changes
+            .first()
+            .and_then(|change| change.detail.as_deref());
+        assert!(
+            rejection_detail.is_some_and(|detail| detail.contains("invalid desired value")),
+            "the rejection must identify the unsafe side of the change: {rejected:?}"
+        );
         Ok(())
     }
 
