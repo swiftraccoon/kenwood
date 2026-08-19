@@ -49,6 +49,18 @@ use response_correlation::correlate;
 /// Default timeout for command execution (5 seconds).
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Required idle interval after the packet-mode recovery preamble.
+const CAT_RECOVERY_QUIET_WINDOW: Duration = Duration::from_millis(500);
+
+/// Hard wall-clock bound for draining replies and binary residue produced by
+/// the recovery preamble.
+const CAT_RECOVERY_DRAIN_LIMIT: Duration = Duration::from_secs(5);
+
+/// Hard byte bound for recovery residue. Packet-mode exit replies are tiny;
+/// crossing this bound means the line is still actively owned by another
+/// protocol and must not be presented as CAT-ready.
+const CAT_RECOVERY_DRAIN_BYTE_LIMIT: usize = 64 * 1024;
+
 /// Exact firmware identity used by the Azimuth automation build.
 pub const AZIMUTH_AUTOMATION_FIRMWARE: &str = "1.03.AZM";
 
@@ -284,7 +296,8 @@ impl<T: Transport> Radio<T> {
     ///
     /// This constructor performs no I/O and does not verify the radio or
     /// recover a transport left in a packet mode. Use
-    /// [`Self::connect_with_tnc_exit`] when the link's prior mode is unknown.
+    /// [`Self::connect_with_tnc_exit`] when a transient `TN`-selected packet
+    /// mode may still own the link.
     #[must_use]
     pub fn new(transport: T) -> Self {
         tracing::info!("creating radio state");
@@ -307,16 +320,21 @@ impl<T: Transport> Radio<T> {
     ///    mode the three bytes are line noise flushed by the next
     ///    leading `\r`.
     /// 5. `\rTC 1\r` (TNC exit command)
-    /// 6. `TN 0,0\r` (returns from MMDVM/packet modes)
+    /// 6. `TN 0,0\r` (returns from transient `TN`-selected packet modes)
     ///
-    /// After the preamble, the radio should be in normal CAT mode regardless
-    /// of its previous state.
+    /// This preamble targets transient APRS, KISS, and MMDVM modes selected by
+    /// `TN`. It cannot disable persistent DV Gateway / Reflector Terminal
+    /// Mode selected by Menu No. 650; that mode keeps the link's CAT parser
+    /// unavailable until the setting is changed through another control path.
+    /// This method also does not identify the radio or otherwise prove that CAT
+    /// is answering; call [`Self::identify`] when that proof is required.
     ///
     /// # Errors
     ///
-    /// Returns an error if any preamble write fails. A write failure means the
-    /// recovery sequence never reached the radio, and reporting success would
-    /// leave the caller debugging mysterious first-command failures.
+    /// Returns an error if any preamble write fails, the transport disconnects
+    /// during the bounded residue drain, or the line never reaches a complete
+    /// quiet window. Reporting success in any of those cases could let stale
+    /// bytes satisfy the caller's first CAT exchange.
     pub async fn connect_with_tnc_exit(transport: T) -> Result<Self, Error> {
         tracing::info!("creating radio with TNC exit preamble");
         let mut radio = Self::new(transport);
@@ -360,16 +378,66 @@ impl<T: Transport> Radio<T> {
             .map_err(Error::Transport)?;
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        // Replies vary with the starting mode. Discard one available chunk;
-        // the exact recovery proof that follows requires a full quiet window
-        // and rejects any delayed residue.
-        let mut drain = [0_u8; 4096];
-        drop(
-            tokio::time::timeout(Duration::from_millis(500), self.transport.read(&mut drain)).await,
-        );
+        // Replies vary with the starting mode and may be split across several
+        // reads. Drain until a complete quiet window, rather than discarding a
+        // single chunk and letting a queued stale frame satisfy the caller's
+        // next CAT proof.
+        self.drain_cat_recovery_residue().await?;
         self.codec.clear();
         self.last_cmd_time = None;
         Ok(())
+    }
+
+    async fn drain_cat_recovery_residue(&mut self) -> Result<(), Error> {
+        let started = tokio::time::Instant::now();
+        let mut drained = 0_usize;
+        let mut buffer = [0_u8; 4096];
+
+        loop {
+            let elapsed = started.elapsed();
+            let Some(remaining) = CAT_RECOVERY_DRAIN_LIMIT.checked_sub(elapsed) else {
+                return Err(cat_recovery_drain_limit_error(drained));
+            };
+            let wait = remaining.min(CAT_RECOVERY_QUIET_WINDOW);
+            match tokio::time::timeout(wait, self.transport.read(&mut buffer)).await {
+                Err(_elapsed) if wait == CAT_RECOVERY_QUIET_WINDOW => return Ok(()),
+                Err(_elapsed) => return Err(cat_recovery_drain_limit_error(drained)),
+                Ok(Err(TransportError::Read(source)))
+                    if source.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    return Ok(());
+                }
+                Ok(Err(error)) => {
+                    let _previous = self.link_state_tx.send_replace(LinkState::Down);
+                    return Err(Error::Transport(error));
+                }
+                Ok(Ok(0)) => {
+                    let _previous = self.link_state_tx.send_replace(LinkState::Down);
+                    return Err(Error::Transport(TransportError::Disconnected(
+                        std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "radio disconnected while draining packet-mode recovery residue",
+                        ),
+                    )));
+                }
+                Ok(Ok(count)) => {
+                    if count > buffer.len() {
+                        let _previous = self.link_state_tx.send_replace(LinkState::Down);
+                        return Err(Error::Transport(TransportError::Read(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "transport reported {count} bytes for a {}-byte CAT recovery buffer",
+                                buffer.len()
+                            ),
+                        ))));
+                    }
+                    drained = drained.saturating_add(count);
+                    if drained > CAT_RECOVERY_DRAIN_BYTE_LIMIT {
+                        return Err(cat_recovery_drain_limit_error(drained));
+                    }
+                }
+            }
+        }
     }
 
     /// Subscribe to auto-info notifications.
@@ -980,6 +1048,20 @@ impl<T: Transport> Radio<T> {
     }
 }
 
+fn cat_recovery_drain_limit_error(drained: usize) -> Error {
+    Error::Protocol(ProtocolError::UnexpectedResponse {
+        expected: format!(
+            "a quiet CAT line for {} ms after packet-mode recovery",
+            CAT_RECOVERY_QUIET_WINDOW.as_millis()
+        ),
+        actual: format!(
+            "recovery residue remained active after draining {drained} bytes within {} ms",
+            CAT_RECOVERY_DRAIN_LIMIT.as_millis()
+        )
+        .into_bytes(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1245,6 +1327,27 @@ mod tests {
             result.is_err(),
             "a dead write path must fail connect_with_tnc_exit"
         );
+    }
+
+    #[tokio::test]
+    async fn connect_with_tnc_exit_drains_every_queued_residue_chunk() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"\r", b"");
+        mock.expect(b"\r", b"");
+        mock.expect(&[0x03], b"");
+        mock.expect(&[0xC0, 0xFF, 0xC0], b"");
+        mock.expect(b"\rTC 1\r", b"");
+        mock.expect(b"TN 0,0\r", b"");
+        mock.queue_read(b"TN 0,0\r");
+        mock.queue_read_delayed(b"ID TH-D75\r", 50);
+        mock.expect(b"ID\r", b"ID TH-D75\r");
+
+        let mut radio = Radio::connect_with_tnc_exit(mock).await?;
+        let identity = radio.identify().await?;
+
+        assert_eq!(identity.model, RadioModel::ThD75);
+        radio.transport.assert_complete();
+        Ok(())
     }
 
     #[tokio::test]

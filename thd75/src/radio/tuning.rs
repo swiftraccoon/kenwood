@@ -10,7 +10,7 @@ use crate::types::{Band, ChannelDisplayName, Frequency, RegularChannel, StepSize
 
 use super::Radio;
 
-/// Upper bound on UP/DW steps a single verified walk will perform.
+/// Upper bound on successful UP/DW frequency steps in one verified walk.
 pub const MAX_RETUNE_STEPS: u32 = 1_000;
 
 /// Consecutive verified-as-unmoved steps after which a walk fails closed.
@@ -90,7 +90,7 @@ impl<T: Transport> Radio<T> {
     /// tuning mode, [`Error::RetuneOffStep`] when `target` is not a whole
     /// number of tuning steps away, [`Error::RetuneSpanTooLarge`] beyond
     /// [`MAX_RETUNE_STEPS`] steps, and [`Error::RetuneNotVerified`] when the
-    /// walk stalls or exceeds its budget.
+    /// walk stalls or moves without verified progress toward the target.
     pub async fn step_tune(&mut self, band: Band, target: Frequency) -> Result<Frequency, Error> {
         if self.get_band().await? != band {
             self.set_band(band).await?;
@@ -111,7 +111,8 @@ impl<T: Transport> Radio<T> {
         self.verified_step_walk(band, current, target, step).await
     }
 
-    /// The shared verified walk: one step, one readback, stall detection.
+    /// The shared verified walk: one step, one readback, stall and progress
+    /// validation.
     pub(crate) async fn verified_step_walk(
         &mut self,
         band: Band,
@@ -120,15 +121,9 @@ impl<T: Transport> Radio<T> {
         step: StepSize,
     ) -> Result<Frequency, Error> {
         let step_hz = step.as_hz();
-        let mut attempts: u32 = 0;
+        preflight_walk(current, target, step)?;
         let mut consecutive_stalls: u8 = 0;
         while current != target {
-            if attempts >= MAX_RETUNE_STEPS {
-                return Err(Error::RetuneNotVerified {
-                    requested: target,
-                    actual: current,
-                });
-            }
             let remaining = current.as_hz().abs_diff(target.as_hz());
             if !remaining.is_multiple_of(step_hz) {
                 return Err(Error::RetuneOffStep {
@@ -142,7 +137,6 @@ impl<T: Transport> Radio<T> {
             } else {
                 self.frequency_down_blind().await?;
             }
-            attempts = attempts.saturating_add(1);
             let landed = self.get_frequency(band).await?;
             if landed == current {
                 consecutive_stalls = consecutive_stalls.saturating_add(1);
@@ -153,6 +147,13 @@ impl<T: Transport> Radio<T> {
                     });
                 }
             } else {
+                let landed_remaining = landed.as_hz().abs_diff(target.as_hz());
+                if landed_remaining >= remaining {
+                    return Err(Error::RetuneNotVerified {
+                        requested: target,
+                        actual: landed,
+                    });
+                }
                 consecutive_stalls = 0;
             }
             current = landed;
@@ -375,6 +376,120 @@ mod tests {
                 })
             ),
             "memory tuning mode must refuse stepped tuning: {result:?}"
+        );
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verified_step_walk_rejects_wrong_direction() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"UP\r", b"UP\r");
+        mock.expect(b"FQ 1\r", b"FQ 1,0144995000\r");
+        let mut radio = Radio::new(mock);
+
+        let result = radio
+            .verified_step_walk(
+                Band::B,
+                Frequency::new(145_000_000),
+                Frequency::new(145_010_000),
+                StepSize::Hz5000,
+            )
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(Error::RetuneNotVerified { requested, actual })
+                    if requested.as_hz() == 145_010_000
+                        && actual.as_hz() == 144_995_000
+            ),
+            "movement away from the target must fail immediately: {result:?}"
+        );
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verified_step_walk_rejects_a_nonprogressing_frequency_jump() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"UP\r", b"UP\r");
+        mock.expect(b"FQ 1\r", b"FQ 1,0145100000\r");
+        let mut radio = Radio::new(mock);
+
+        let result = radio
+            .verified_step_walk(
+                Band::B,
+                Frequency::new(145_000_000),
+                Frequency::new(145_010_000),
+                StepSize::Hz5000,
+            )
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(Error::RetuneNotVerified { requested, actual })
+                    if requested.as_hz() == 145_010_000
+                        && actual.as_hz() == 145_100_000
+            ),
+            "a jump farther from the target must fail immediately: {result:?}"
+        );
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verified_step_walk_rejects_overshoot_before_it_can_oscillate() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"UP\r", b"UP\r");
+        mock.expect(b"FQ 1\r", b"FQ 1,0145010000\r");
+        let mut radio = Radio::new(mock);
+
+        let result = radio
+            .verified_step_walk(
+                Band::B,
+                Frequency::new(145_000_000),
+                Frequency::new(145_005_000),
+                StepSize::Hz5000,
+            )
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(Error::RetuneNotVerified { requested, actual })
+                    if requested.as_hz() == 145_005_000
+                        && actual.as_hz() == 145_010_000
+            ),
+            "an equal-distance overshoot must fail before UP and DW can alternate: {result:?}"
+        );
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn maximum_span_survives_a_swallowed_step() -> TestResult {
+        let start = Frequency::new(145_000_000);
+        let target = Frequency::new(150_000_000);
+        let step = StepSize::Hz5000;
+        let mut mock = MockTransport::new();
+
+        mock.expect(b"UP\r", b"UP\r");
+        mock.expect(b"FQ 1\r", b"FQ 1,0145000000\r");
+        for index in 1..=MAX_RETUNE_STEPS {
+            mock.expect(b"UP\r", b"UP\r");
+            let frequency = start.as_hz() + index * step.as_hz();
+            let response = format!("FQ 1,{frequency:010}\r");
+            mock.expect(b"FQ 1\r", response.as_bytes());
+        }
+        let mut radio = Radio::new(mock);
+
+        assert_eq!(
+            radio
+                .verified_step_walk(Band::B, start, target, step)
+                .await?,
+            target
         );
         radio.transport.assert_complete();
         Ok(())

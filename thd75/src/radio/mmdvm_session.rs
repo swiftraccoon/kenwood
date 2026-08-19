@@ -48,6 +48,7 @@
 //! # }
 //! ```
 
+use std::marker::PhantomData;
 use std::time::Duration;
 
 use ::mmdvm::AsyncModem;
@@ -64,24 +65,36 @@ use super::{DesyncedRadio, Radio, cat_restore_state::CatRestoreState};
 /// switch back to CAT mode.
 const EXIT_SWITCH_DELAY: Duration = Duration::from_millis(100);
 
+/// Gateway entered from ordinary CAT with the transient `TN 3,x` command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransientMmdvm;
+
+/// Gateway attached to persistent DV Gateway / Reflector Terminal Mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PersistentMmdvm;
+
 /// An MMDVM session that owns the radio transport via an
 /// [`::mmdvm::AsyncModem`].
 ///
 /// While this session is active, the transport speaks the MMDVM binary
 /// framing protocol and all I/O is funneled through the spawned
-/// modem-loop task. CAT commands are unavailable until
-/// [`MmdvmSession::exit`] is called.
+/// modem-loop task. Its lifecycle marker distinguishes a transient `TN`
+/// session, whose [`MmdvmSession::exit`] returns to CAT, from persistent
+/// Reflector Terminal Mode, whose
+/// [`MmdvmSession::<T, PersistentMmdvm>::shutdown`] preserves binary mode.
 ///
 /// The session is consumed on entry (via [`Radio::enter_mmdvm`]) and
 /// returned on exit.
-pub struct MmdvmSession<T: Transport + Unpin + 'static> {
+pub struct MmdvmSession<T: Transport + Unpin + 'static, Lifecycle = TransientMmdvm> {
     /// Async MMDVM modem driving the transport.
     modem: AsyncModem<MmdvmTransportAdapter<T>>,
     /// Radio state cached for restoration on exit.
     cat_restore: CatRestoreState,
+    /// Compile-time record of how this MMDVM session was entered.
+    lifecycle: PhantomData<fn() -> Lifecycle>,
 }
 
-impl<T: Transport + Unpin + 'static> std::fmt::Debug for MmdvmSession<T> {
+impl<T: Transport + Unpin + 'static, Lifecycle> std::fmt::Debug for MmdvmSession<T, Lifecycle> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MmdvmSession").finish_non_exhaustive()
     }
@@ -106,13 +119,23 @@ impl<T: Transport + Unpin + 'static> Radio<T> {
         reason = "The ownership-preserving error matches enter_mmdvm: callers need the original \
                   Radio to reconnect or recover MCP without losing the selected transport"
     )]
-    pub fn into_mmdvm_session(self) -> Result<MmdvmSession<T>, (Self, Error)> {
+    pub fn into_mmdvm_session(self) -> Result<MmdvmSession<T, PersistentMmdvm>, (Self, Error)> {
         let (transport, cat_restore) = self.into_binary_mode_parts()?;
+        Ok(Self::mmdvm_session_with_lifecycle(transport, cat_restore))
+    }
 
+    fn mmdvm_session_with_lifecycle<Lifecycle>(
+        transport: T,
+        cat_restore: CatRestoreState,
+    ) -> MmdvmSession<T, Lifecycle> {
         tracing::info!("wrapping transport as MMDVM session (radio already in gateway mode)");
         let adapter = MmdvmTransportAdapter::new(transport);
         let modem = AsyncModem::spawn(adapter);
-        Ok(MmdvmSession { modem, cat_restore })
+        MmdvmSession {
+            modem,
+            cat_restore,
+            lifecycle: PhantomData,
+        }
     }
 
     /// Enter MMDVM mode, consuming this [`Radio`] and returning an [`MmdvmSession`].
@@ -170,11 +193,15 @@ impl<T: Transport + Unpin + 'static> Radio<T> {
             }
         }
 
-        self.into_mmdvm_session()
+        let (transport, cat_restore) = self.into_binary_mode_parts()?;
+        Ok(Self::mmdvm_session_with_lifecycle::<TransientMmdvm>(
+            transport,
+            cat_restore,
+        ))
     }
 }
 
-impl<T: Transport + Unpin + 'static> MmdvmSession<T> {
+impl<T: Transport + Unpin + 'static, Lifecycle> MmdvmSession<T, Lifecycle> {
     /// Mutable access to the underlying [`::mmdvm::AsyncModem`].
     ///
     /// Consumers that need low-level MMDVM control (custom status polls,
@@ -196,16 +223,18 @@ impl<T: Transport + Unpin + 'static> MmdvmSession<T> {
             self.modem,
             MmdvmRadioRestore {
                 cat_restore: self.cat_restore,
-                _phantom: std::marker::PhantomData,
+                _phantom: PhantomData,
             },
         )
     }
+}
 
+impl<T: Transport + Unpin + 'static> MmdvmSession<T> {
     /// Exit MMDVM mode and return the [`Radio`].
     ///
     /// Shuts down the [`::mmdvm::AsyncModem`], recovering the transport,
-    /// sends `TN 0,0` on the raw transport to return the radio's TNC to
-    /// normal APRS mode, then rebuilds the radio from saved state. Binary
+    /// sends `TN 0,0` on the raw transport to turn the radio's transient TNC
+    /// mode off, then rebuilds the radio from saved state. Binary
     /// residue may remain, so the radio comes back wrapped in
     /// [`DesyncedRadio`]: call [`DesyncedRadio::restore`] before ordinary
     /// CAT commands. Unlike the KISS exit, a failure here cannot return
@@ -224,6 +253,23 @@ impl<T: Transport + Unpin + 'static> MmdvmSession<T> {
     }
 }
 
+impl<T: Transport + Unpin + 'static> MmdvmSession<T, PersistentMmdvm> {
+    /// Stop this host session while preserving persistent MMDVM mode.
+    ///
+    /// The modem and transport pumps are shut down cleanly, but no transient
+    /// `TN 0,0` exit is sent. The returned radio remains proved to speak MMDVM
+    /// and can start another persistent session on the same link.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the modem loop or transport pump cannot be
+    /// reclaimed without invalidating the persistent binary-link proof.
+    pub async fn shutdown(self) -> Result<Radio<T>, Error> {
+        let (modem, restore) = self.into_parts();
+        restore.shutdown_and_rebuild_binary(modem).await
+    }
+}
+
 /// Radio restore state carried alongside the [`::mmdvm::AsyncModem`] during
 /// MMDVM operation. Keeps the `Radio`'s CAT-mode codec, notifications,
 /// timeouts, and VFO/memory cache alive so they can be restored on exit.
@@ -233,7 +279,7 @@ impl<T: Transport + Unpin + 'static> MmdvmSession<T> {
 /// `AsyncModem::shutdown`.
 pub(crate) struct MmdvmRadioRestore<T: Transport + Unpin + 'static> {
     cat_restore: CatRestoreState,
-    _phantom: std::marker::PhantomData<fn() -> T>,
+    _phantom: PhantomData<fn() -> T>,
 }
 
 impl<T: Transport + Unpin + 'static> std::fmt::Debug for MmdvmRadioRestore<T> {
@@ -314,9 +360,8 @@ impl<T: Transport + Unpin + 'static> MmdvmRadioRestore<T> {
             }
         };
 
-        // Send TN 0,0 on the raw transport to switch the TNC back to
-        // APRS mode. The adapter is dropped; we speak ASCII CAT on T
-        // directly now.
+        // Send TN 0,0 on the raw transport to turn the transient TNC mode
+        // off. The adapter is dropped; we speak ASCII CAT on T directly now.
         inner.write(b"TN 0,0\r").await.map_err(Error::Transport)?;
 
         // Small delay to let the TNC switch back to CAT mode.
@@ -369,7 +414,7 @@ mod tests {
     use crate::transport::MockTransport;
     use crate::types::PacketDataRate;
 
-    type TestResult = Result<(), Box<dyn std::error::Error>>;
+    type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
     /// Helper: create a Radio with a mock that expects the TN 3,x command.
     fn mock_radio_for_mmdvm(data_rate: PacketDataRate) -> Radio<MockTransport> {
@@ -377,25 +422,25 @@ mod tests {
         let tn_resp = format!("TN 3,{}\r", u8::from(data_rate));
         let mut mock = MockTransport::new();
         mock.expect(tn_cmd.as_bytes(), tn_resp.as_bytes());
+        mock.pend_when_empty();
         Radio::new(mock)
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn enter_mmdvm_sends_tn_command() -> TestResult {
-        // `enter_mmdvm` constructs an `MmdvmTransportAdapter`, which
-        // spawns its pump task via `tokio::task::spawn_local`. Run
-        // inside a `LocalSet` so the spawn succeeds.
-        tokio::task::LocalSet::new()
-            .run_until(async {
-                let radio = mock_radio_for_mmdvm(PacketDataRate::Bps1200);
-                let session = radio
-                    .enter_mmdvm(PacketDataRate::Bps1200)
-                    .await
-                    .map_err(|(_, e)| e)?;
-                assert!(format!("{session:?}").contains("MmdvmSession"));
-                Ok(())
-            })
-            .await
+        // Match clients such as thd75-tui, which own the radio in a spawned
+        // task on a multi-thread runtime.
+        tokio::spawn(async {
+            let radio = mock_radio_for_mmdvm(PacketDataRate::Bps1200);
+            let session = radio
+                .enter_mmdvm(PacketDataRate::Bps1200)
+                .await
+                .map_err(|(_, e)| e)?;
+            assert!(format!("{session:?}").contains("MmdvmSession"));
+            TestResult::Ok(())
+        })
+        .await??;
+        Ok(())
     }
 
     #[tokio::test]
@@ -433,10 +478,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exit_returns_desynchronized_radio_with_preserved_cat_state() -> TestResult {
+    async fn transient_exit_returns_desynchronized_radio_with_preserved_cat_state() -> TestResult {
         tokio::task::LocalSet::new()
             .run_until(async {
                 let mut transport = MockTransport::new();
+                transport.expect(b"TN 3,1\r", b"TN 3,1\r");
                 transport.expect_any_write();
                 transport.expect(b"TN 0,0\r", b"");
                 transport.pend_when_empty();
@@ -447,9 +493,10 @@ mod tests {
                 radio.auto_info_enabled = true;
                 radio.gps_settings = Some(crate::types::GpsSettings::new(true, true));
                 radio.gps_sentences = Some(crate::types::NmeaSentences::all());
-                radio.cat_state = crate::radio::CatState::BinaryProven;
-
-                let session = radio.into_mmdvm_session().map_err(|(_, error)| error)?;
+                let session = radio
+                    .enter_mmdvm(PacketDataRate::Bps9600)
+                    .await
+                    .map_err(|(_, error)| error)?;
                 let radio = session.exit().await?.into_radio_unproven();
 
                 assert_eq!(radio.timeout, Duration::from_millis(731));
@@ -476,6 +523,30 @@ mod tests {
                 Ok(())
             })
             .await
+    }
+
+    #[tokio::test]
+    async fn persistent_shutdown_preserves_binary_mode_without_transient_exit() -> TestResult {
+        let mut transport = MockTransport::new();
+        transport.expect_any_write();
+        transport.pend_when_empty();
+        let mut radio = Radio::new(transport);
+        radio.cat_state = crate::radio::CatState::BinaryProven;
+
+        let session = radio.into_mmdvm_session().map_err(|(_, error)| error)?;
+        let radio = session.shutdown().await?;
+
+        assert_eq!(radio.cat_state, crate::radio::CatState::BinaryProven);
+        assert!(
+            radio
+                .transport
+                .writes()
+                .iter()
+                .all(|write| write != b"TN 0,0\r"),
+            "persistent session shutdown must not send the transient CAT exit"
+        );
+        radio.transport.assert_complete();
+        Ok(())
     }
 
     #[tokio::test]

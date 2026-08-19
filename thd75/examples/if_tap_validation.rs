@@ -35,7 +35,7 @@ use kenwood_thd75::transport::SerialTransport;
 use kenwood_thd75::types::{
     Band, BandMode, Frequency, OperatingMode, SquelchLevel, StepSize, TuningMode, UsbAudioOutput,
 };
-use kenwood_thd75::{IfTapConfig, Radio};
+use kenwood_thd75::{IfTapConfig, IfTapSavedState, Radio};
 
 /// One line of evidence; failures flip the process exit code.
 fn check(passed: &mut bool, label: &str, ok: bool, detail: &str) {
@@ -117,6 +117,7 @@ async fn validate_engaged(
 /// Step two 5 kHz steps up and walk back, verifying each landing.
 async fn validate_retune_walk(
     radio: &mut Radio<SerialTransport>,
+    saved: &IfTapSavedState,
     passed: &mut bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let start = radio.get_frequency(Band::B).await?;
@@ -125,7 +126,7 @@ async fn validate_retune_walk(
         .ok_or("frequency walk would overflow")?;
     println!("Retuning {start} -> {up_two} via qualified stepping...");
     let there = radio
-        .retune_if_tap(up_two, UsbAudioOutput::IntermediateFrequency)
+        .retune_if_tap(saved, up_two, UsbAudioOutput::IntermediateFrequency)
         .await;
     match there {
         Ok(landed) => check(
@@ -142,7 +143,7 @@ async fn validate_retune_walk(
         ),
     }
     let back = radio
-        .retune_if_tap(start, UsbAudioOutput::IntermediateFrequency)
+        .retune_if_tap(saved, start, UsbAudioOutput::IntermediateFrequency)
         .await;
     match back {
         Ok(landed) => check(
@@ -271,7 +272,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Entered; snapshot taken: {saved:?}");
 
     validate_engaged(&mut radio, &mut passed).await?;
-    validate_retune_walk(&mut radio, &mut passed).await?;
+    validate_retune_walk(&mut radio, &saved, &mut passed).await?;
 
     // Ordered restore, then prove every saved value landed.
     let report = radio.restore_if_tap(saved).await;

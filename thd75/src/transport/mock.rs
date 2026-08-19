@@ -27,6 +27,7 @@ enum MockRead {
 pub struct MockTransport {
     exchanges: VecDeque<(Vec<u8>, Vec<MockRead>)>,
     pending: VecDeque<MockRead>,
+    writes: Vec<Vec<u8>>,
     accept_any_write: bool,
     pend_when_empty: bool,
     /// When the front `Delayed` entry started waiting. Persists
@@ -46,6 +47,7 @@ impl MockTransport {
         Self {
             exchanges: VecDeque::new(),
             pending: VecDeque::new(),
+            writes: Vec::new(),
             accept_any_write: false,
             pend_when_empty: false,
             delay_started: None,
@@ -205,6 +207,12 @@ impl MockTransport {
         self.pend_when_empty = true;
     }
 
+    /// Every write presented to this transport, in wire order.
+    #[must_use]
+    pub fn writes(&self) -> &[Vec<u8>] {
+        &self.writes
+    }
+
     /// Panic if any expected exchanges remain unconsumed.
     ///
     /// # Panics
@@ -265,6 +273,7 @@ impl Default for MockTransport {
 impl Transport for MockTransport {
     async fn write(&mut self, data: &[u8]) -> Result<(), TransportError> {
         tracing::debug!(bytes = data.len(), "mock: write");
+        self.writes.push(data.to_vec());
 
         if self.accept_any_write {
             let matches_next_exchange = self

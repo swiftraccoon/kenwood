@@ -62,16 +62,44 @@ impl MenuFieldSnapshot {
 
     /// Decode one menu field from the snapshot.
     ///
-    /// The field's pages must have been part of the snapshot's read set;
-    /// decoding a field outside it sees zero-filled bytes and typically
-    /// fails its domain validation rather than returning invented data.
+    /// Every page occupied by the field must be present in the snapshot.
     ///
     /// # Errors
     ///
-    /// Returns the schema decode error for malformed or out-of-domain
+    /// Returns [`SchemaError::SnapshotPageMissing`] when any required page was
+    /// not fetched, or the schema decode error for malformed or out-of-domain
     /// stored bytes.
     pub fn value(&self, field: &MenuField) -> Result<DecodedFieldValue, SchemaError> {
+        self.ensure_field_covered(field)?;
         field.descriptor.read(&self.image)
+    }
+
+    /// Decode one menu field exactly as stored in the snapshot.
+    ///
+    /// Unlike [`Self::value`], this preserves raw values that the radio stores
+    /// outside the official writable menu domain. Storage-shape validation is
+    /// still enforced, and the write planner remains strict.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SchemaError::SnapshotPageMissing`] when any required page was
+    /// not fetched, or the schema decode error for malformed stored bytes or
+    /// an invalid field descriptor.
+    pub fn stored_value(&self, field: &MenuField) -> Result<DecodedFieldValue, SchemaError> {
+        self.ensure_field_covered(field)?;
+        field.read_stored(&self.image)
+    }
+
+    fn ensure_field_covered(&self, field: &MenuField) -> Result<(), SchemaError> {
+        for page in field.descriptor.pages()? {
+            if self.page(page).is_none() {
+                return Err(SchemaError::SnapshotPageMissing {
+                    field: field.descriptor.name,
+                    page,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// The fetched pages, ascending, exactly as read from the radio.
@@ -252,7 +280,7 @@ mod tests {
     use crate::error::Error;
     use crate::memory::PatchPlanner;
     use crate::memory::menu_fields::menu_field;
-    use crate::memory::schema::{DecodedFieldValue, FieldValue};
+    use crate::memory::schema::{DecodedFieldValue, FieldValue, SchemaError};
     use crate::protocol::programming;
     use crate::radio::Radio;
     use crate::transport::MockTransport;
@@ -310,6 +338,50 @@ mod tests {
         let snapshot = radio.read_menu_snapshot(&[]).await?;
         assert!(snapshot.pages().is_empty());
         radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[test]
+    fn menu_snapshot_preserves_off_menu_stored_values() -> TestResult {
+        let pf1 = menu_field("radio.Pf1PfKey").ok_or("registry entry missing: radio.Pf1PfKey")?;
+        let mut stored = [0_u8; programming::PAGE_SIZE];
+        stored[0x7A] = 31;
+        let snapshot =
+            MenuFieldSnapshot::from_pages(vec![(programming::McpPage::new(0x10)?, stored)])?;
+
+        assert_eq!(snapshot.stored_value(pf1)?, DecodedFieldValue::Unsigned(31));
+        assert!(
+            snapshot.value(pf1).is_err(),
+            "the strict writable-domain decoder must remain available"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn menu_snapshot_never_invents_values_for_unfetched_pages() -> TestResult {
+        let beep = menu_field("radio.Beep").ok_or("registry entry missing: radio.Beep")?;
+        let snapshot = MenuFieldSnapshot::from_pages(Vec::new())?;
+        let expected = SchemaError::SnapshotPageMissing {
+            field: "radio.Beep",
+            page: programming::McpPage::new(0x10)?,
+        };
+
+        assert_eq!(snapshot.value(beep), Err(expected.clone()));
+        assert_eq!(snapshot.stored_value(beep), Err(expected));
+
+        let bitmap = menu_field("radio.PoweronBitmap")
+            .ok_or("registry entry missing: radio.PoweronBitmap")?;
+        let first_page = programming::McpPage::new(0x500)?;
+        let partial =
+            MenuFieldSnapshot::from_pages(vec![(first_page, [0_u8; programming::PAGE_SIZE])])?;
+        assert_eq!(
+            partial.stored_value(bitmap),
+            Err(SchemaError::SnapshotPageMissing {
+                field: "radio.PoweronBitmap",
+                page: programming::McpPage::new(0x501)?,
+            }),
+            "every page of a multi-page field must be present"
+        );
         Ok(())
     }
 

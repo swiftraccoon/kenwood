@@ -573,6 +573,10 @@ pub enum TransportError {
     )]
     BluetoothDeviceNameAmbiguous,
 
+    /// A caller cancelled a bounded macOS Bluetooth discovery or open.
+    #[error("Bluetooth helper open was interrupted")]
+    BluetoothOpenInterrupted,
+
     /// No matching serial device was found.
     #[error("no matching serial device found")]
     NotFound,

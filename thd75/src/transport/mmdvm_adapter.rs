@@ -34,13 +34,12 @@
 //! after a clean exit without dummy replacement channels; terminal transport
 //! errors remain errors rather than being discarded during recovery.
 //!
-//! # Local task ownership
+//! # Task ownership
 //!
-//! The pump uses [`tokio::task::spawn_local`], so callers must construct this
-//! adapter inside a [`tokio::task::LocalSet`]. This is an adapter ownership
-//! choice, not an `IOBluetooth` thread-affinity requirement: native macOS
-//! Bluetooth owns its framework objects and `CFRunLoop` in a private helper
-//! process.
+//! The pump uses [`tokio::spawn`]. [`crate::Transport`] requires `Send`, and
+//! native macOS Bluetooth owns its framework objects and `CFRunLoop` in a
+//! private helper process, so the adapter does not require a
+//! [`tokio::task::LocalSet`].
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -299,15 +298,19 @@ impl<T: Transport + 'static> std::fmt::Debug for MmdvmTransportAdapter<T> {
 impl<T: Transport + 'static> MmdvmTransportAdapter<T> {
     /// Wrap an existing transport.
     ///
-    /// Spawns the pump task on the current [`tokio::task::LocalSet`]
-    /// via [`tokio::task::spawn_local`]. **Panics** if no `LocalSet`
-    /// is active; see the [module-level docs](self).
+    /// Spawns the pump task on the current Tokio runtime.
+    ///
+    /// See the [module-level docs](self) for the pump-task ownership model.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called without an active Tokio runtime.
     #[must_use]
     pub fn new(inner: T) -> Self {
         let (write_tx, write_rx) = mpsc::channel::<WriteRequest>(WRITE_CHANNEL_CAPACITY);
         let (read_tx, read_rx) = mpsc::channel::<Vec<u8>>(READ_CHANNEL_CAPACITY);
         let terminal_failure = Arc::new(Mutex::new(None));
-        let pump = tokio::task::spawn_local(pump_task(
+        let pump = tokio::spawn(pump_task(
             inner,
             write_rx,
             read_tx,
@@ -474,6 +477,9 @@ fn transport_err_to_io(err: TransportError) -> io::Error {
         ),
         error @ TransportError::BluetoothDeviceNameAmbiguous => {
             io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
+        }
+        error @ TransportError::BluetoothOpenInterrupted => {
+            io::Error::new(io::ErrorKind::Interrupted, error.to_string())
         }
         TransportError::BrokerUnavailable => {
             io::Error::new(io::ErrorKind::BrokenPipe, "transport broker unavailable")
@@ -800,7 +806,7 @@ mod tests {
     use tokio::sync::Notify;
     use tokio::task::LocalSet;
 
-    type TestResult = Result<(), Box<dyn std::error::Error>>;
+    type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
     #[derive(Debug, Default)]
     struct WriteGate {
@@ -944,6 +950,27 @@ mod tests {
                 Ok(())
             })
             .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn adapter_runs_inside_spawned_multithread_task() -> TestResult {
+        tokio::spawn(async {
+            let mut mock = MockTransport::new();
+            mock.expect(b"PING\r", b"PONG\r");
+            mock.pend_when_empty();
+            let mut adapter = MmdvmTransportAdapter::new(mock);
+
+            adapter.write_all(b"PING\r").await?;
+            let mut buf = [0_u8; 16];
+            let n = adapter.read(&mut buf).await?;
+            assert_eq!(buf.get(..n).ok_or("slice")?, b"PONG\r");
+
+            let recovered = adapter.shutdown_and_recover().await?;
+            recovered.assert_complete();
+            TestResult::Ok(())
+        })
+        .await??;
+        Ok(())
     }
 
     #[tokio::test]

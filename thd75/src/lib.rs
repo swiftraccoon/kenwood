@@ -138,7 +138,7 @@ pub use radio::state_monitor::{BandState, StateChange, StateMonitor};
 pub use radio::terminal_mode::{TerminalModeTransition, TerminalModeTransitionError};
 pub use radio::{DesyncedRadio, FirmwareProfile, Radio};
 #[cfg(target_os = "macos")]
-pub use transport::{BluetoothTransport, PairedBluetoothCandidate};
+pub use transport::{BluetoothOpenCancellation, BluetoothTransport, PairedBluetoothCandidate};
 pub use transport::{EitherTransport, MockTransport, SerialTransport, Transport};
 pub use types::{
     ChannelDisplayName, FirmwareIdentity, HardwareVariant, ModelCode, RadioModel, RadioRegion,
@@ -203,7 +203,8 @@ pub use session::ReconnectPolicy;
 pub use dstar_gateway::{
     DstarEvent, DstarGateway, DstarGatewayConfig, DstarHeader, DstarProtocolViolation,
     DstarStatusReflector, DstarStatusReflectorError, LastHeardEntry, MmdvmError, ModemMode,
-    ModemStatus, NakReason, ObservedDstarCallsign, SlowDataTextMessage, WireTextError,
+    ModemStatus, NakReason, ObservedDstarCallsign, PersistentMmdvm, SlowDataTextMessage,
+    TransientMmdvm, WireTextError,
 };
 
 // SD card re-exports.

@@ -40,6 +40,34 @@ impl MenuField {
         self.descriptor.read(image)
     }
 
+    /// Decode this field's stored value without treating an off-menu raw
+    /// value as corrupt.
+    ///
+    /// The storage representation remains fully validated, but the official
+    /// writable enum, choice, and numeric domains are not applied. This lets
+    /// callers preserve and compare factory or firmware-added values that the
+    /// public menu cannot select. [`Self::plan_value`] remains strict.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the field is outside the image, its descriptor
+    /// is malformed, or the stored bytes cannot be represented by its codec.
+    pub fn read_stored(&self, image: &[u8]) -> Result<DecodedFieldValue, SchemaError> {
+        self.descriptor.read_stored(image)
+    }
+
+    /// Validate an expected snapshot value against the storage
+    /// representation without accepting it as a writable value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the value kind or representation cannot fit the
+    /// field's storage codec. Writable domain membership is intentionally not
+    /// checked; use [`Self::plan_value`] for desired values.
+    pub fn validate_stored_value(&self, value: FieldValue<'_>) -> Result<(), SchemaError> {
+        self.descriptor.validate_stored_value(value)
+    }
+
     /// Validate and add a value to a masked patch plan.
     ///
     /// In addition to storage-codec validation, this rejects gap values for
@@ -113,6 +141,64 @@ mod tests {
                 field: "radio.AutoWeatherScan",
                 value: 3,
             })
+        );
+        assert_eq!(
+            field.read_stored(&image),
+            Ok(DecodedFieldValue::Unsigned(3)),
+            "stored-value decoding must preserve an encodable choice gap"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn off_menu_pf_assignment_is_lossless_but_not_writable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let field = menu_field("radio.Pf1PfKey").ok_or("generated PF1 field missing")?;
+        let mut image = vec![0; field.descriptor.offset + 1];
+        let stored = image
+            .get_mut(field.descriptor.offset)
+            .ok_or("generated PF1 field offset missing")?;
+        *stored = 31;
+
+        assert_eq!(
+            field.read_stored(&image),
+            Ok(DecodedFieldValue::Unsigned(31)),
+            "the radio's Screen Capture assignment must survive a snapshot"
+        );
+        assert!(
+            matches!(
+                field.read(&image),
+                Err(SchemaError::UnsignedOutOfRange {
+                    field: "radio.Pf1PfKey",
+                    value: 31,
+                    max: 30,
+                    ..
+                })
+            ),
+            "strict setting reads must continue to enforce the writable domain"
+        );
+        field.validate_stored_value(FieldValue::Unsigned(31))?;
+
+        let mut planner = PatchPlanner::new();
+        assert_eq!(
+            field.plan_value(&mut planner, FieldValue::Unsigned(31)),
+            Err(SchemaError::DisallowedValue {
+                field: "radio.Pf1PfKey",
+                value: 31,
+            }),
+            "the off-menu assignment must never become writable"
+        );
+        assert!(
+            matches!(
+                field.validate_stored_value(FieldValue::Unsigned(256)),
+                Err(SchemaError::UnsignedOutOfRange {
+                    field: "radio.Pf1PfKey",
+                    value: 256,
+                    min: 0,
+                    max: 255,
+                })
+            ),
+            "expected values still have to fit the physical storage byte"
         );
         Ok(())
     }

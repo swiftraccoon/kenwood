@@ -144,6 +144,12 @@ pub struct FieldDescriptor {
     pub codec: FieldCodec,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValueDomain {
+    Stored,
+    Writable,
+}
+
 impl FieldDescriptor {
     /// Construct a field descriptor.
     #[must_use]
@@ -226,6 +232,45 @@ impl FieldDescriptor {
     /// this descriptor names a generated menu field, its finite enum or
     /// UI-choice domain is enforced as well.
     pub fn read(self, image: &[u8]) -> Result<DecodedFieldValue, SchemaError> {
+        self.decode(image, ValueDomain::Writable)
+    }
+
+    /// Decode this field's exact stored value from a complete raw MCP image.
+    ///
+    /// Unlike [`Self::read`], this accepts every value representable by the
+    /// storage codec even when the value is outside the radio's official
+    /// writable menu domain. This is intended for lossless snapshots of
+    /// factory, firmware-added, and otherwise off-menu values. It does not
+    /// relax [`PatchPlanner`] or any other write path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an out-of-bounds field, malformed codec, or an
+    /// invalid stored representation such as a non-boolean byte in a boolean
+    /// field or malformed fixed-width text.
+    pub fn read_stored(self, image: &[u8]) -> Result<DecodedFieldValue, SchemaError> {
+        self.decode(image, ValueDomain::Stored)
+    }
+
+    /// Validate that a typed value is representable by this field's storage
+    /// codec without requiring it to be in the writable menu domain.
+    ///
+    /// This is suitable for optimistic-concurrency expected values copied
+    /// from [`Self::read_stored`]. Callers must still use [`PatchPlanner`] to
+    /// validate any value that will be written.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a mismatched value kind, a value wider than the
+    /// storage representation, malformed text or byte lengths, malformed
+    /// codec metadata, or a stale generated descriptor.
+    pub fn validate_stored_value(self, value: FieldValue<'_>) -> Result<(), SchemaError> {
+        let _catalog_field = self.validate_catalog_descriptor()?;
+        let _encoded = encode_field(&self, value, ValueDomain::Stored)?;
+        Ok(())
+    }
+
+    fn validate_catalog_descriptor(self) -> Result<Option<&'static super::MenuField>, SchemaError> {
         let menu_field = super::menu_field(self.name);
         if let Some(field) = menu_field
             && field.descriptor != self
@@ -236,11 +281,18 @@ impl FieldDescriptor {
                 expected_offset: field.descriptor.offset,
             });
         }
+        Ok(menu_field)
+    }
+
+    fn decode(self, image: &[u8], domain: ValueDomain) -> Result<DecodedFieldValue, SchemaError> {
+        let menu_field = self.validate_catalog_descriptor()?;
 
         let decoded = match self.codec {
             FieldCodec::Byte { min, max } => {
                 let value = u64::from(read_byte(image, self.name, self.offset)?);
-                validate_unsigned(self.name, value, u64::from(min), u64::from(max))?;
+                if domain == ValueDomain::Writable {
+                    validate_unsigned(self.name, value, u64::from(min), u64::from(max))?;
+                }
                 DecodedFieldValue::Unsigned(value)
             }
             FieldCodec::Bool => {
@@ -261,7 +313,9 @@ impl FieldDescriptor {
                 validate_bit_codec(self.name, mask, shift, min, max)?;
                 let byte = read_byte(image, self.name, self.offset)?;
                 let value = u64::from((byte & mask) >> shift);
-                validate_unsigned(self.name, value, u64::from(min), u64::from(max))?;
+                if domain == ValueDomain::Writable {
+                    validate_unsigned(self.name, value, u64::from(min), u64::from(max))?;
+                }
                 DecodedFieldValue::Unsigned(value)
             }
             FieldCodec::FixedString {
@@ -298,7 +352,9 @@ impl FieldDescriptor {
                 validate_unsigned_capacity(self.name, width, max)?;
                 let bytes = read_range(image, self.name, self.offset, width.bytes())?;
                 let value = decode_unsigned(bytes, endian);
-                validate_unsigned(self.name, value, min, max)?;
+                if domain == ValueDomain::Writable {
+                    validate_unsigned(self.name, value, min, max)?;
+                }
                 DecodedFieldValue::Unsigned(value)
             }
             FieldCodec::Signed {
@@ -311,7 +367,9 @@ impl FieldDescriptor {
                 validate_signed_capacity(self.name, width, min, max)?;
                 let bytes = read_range(image, self.name, self.offset, width.bytes())?;
                 let value = decode_signed(bytes, width, endian);
-                validate_signed(self.name, value, min, max)?;
+                if domain == ValueDomain::Writable {
+                    validate_signed(self.name, value, min, max)?;
+                }
                 DecodedFieldValue::Signed(value)
             }
             FieldCodec::Bytes { len } => {
@@ -319,7 +377,9 @@ impl FieldDescriptor {
             }
         };
 
-        if let Some(field) = menu_field {
+        if domain == ValueDomain::Writable
+            && let Some(field) = menu_field
+        {
             field.validate_patch_value(decoded.as_field_value())?;
         }
 
@@ -504,6 +564,13 @@ pub enum SchemaError {
         /// Available image byte count.
         image_len: usize,
     },
+    /// A sparse snapshot does not contain a page required by the field.
+    SnapshotPageMissing {
+        /// Field whose bytes were requested.
+        field: &'static str,
+        /// Required page absent from the snapshot.
+        page: McpPage,
+    },
     /// An offset cannot be represented by a 16-bit MCP page number.
     OffsetTooLarge {
         /// Field name.
@@ -625,12 +692,11 @@ impl fmt::Display for SchemaError {
                 len,
                 image_len,
             } => fmt_out_of_bounds(f, field, *offset, *len, *image_len),
-            Self::OffsetTooLarge { field, offset } => {
-                write!(
-                    f,
-                    "field {field} offset 0x{offset:X} exceeds MCP addressing"
-                )
-            }
+            Self::SnapshotPageMissing { field, page } => write!(
+                f,
+                "field {field} requires MCP page 0x{page:04X}, which was not fetched"
+            ),
+            Self::OffsetTooLarge { field, offset } => fmt_offset_too_large(f, field, *offset),
             Self::WriteProtected { field, page } => write!(
                 f,
                 "field {field} touches write-protected factory calibration page 0x{page:04X}"
@@ -656,6 +722,17 @@ impl fmt::Display for SchemaError {
             } => fmt_patch_conflict(f, field, existing, *offset, *mask),
         }
     }
+}
+
+fn fmt_offset_too_large(
+    formatter: &mut fmt::Formatter<'_>,
+    field: &str,
+    offset: usize,
+) -> fmt::Result {
+    write!(
+        formatter,
+        "field {field} offset 0x{offset:X} exceeds MCP addressing"
+    )
 }
 
 fn fmt_catalog_descriptor_mismatch(
@@ -924,7 +1001,7 @@ impl PatchPlanner {
             }
             menu_field.validate_patch_value(value)?;
         }
-        let encoded = encode_field(field, value)?;
+        let encoded = encode_field(field, value, ValueDomain::Writable)?;
         for (absolute, mask, bits) in encoded {
             self.merge_byte(field.name, absolute, mask, bits)?;
         }
@@ -1039,16 +1116,22 @@ const fn type_mismatch(field: &FieldDescriptor, value: FieldValue<'_>) -> Schema
 fn encode_field(
     field: &FieldDescriptor,
     value: FieldValue<'_>,
+    domain: ValueDomain,
 ) -> Result<Vec<(usize, u8, u8)>, SchemaError> {
     match (field.codec, value) {
         (FieldCodec::Byte { min, max }, FieldValue::Unsigned(value)) => {
+            let (accepted_min, accepted_max) = if domain == ValueDomain::Writable {
+                (u64::from(min), u64::from(max))
+            } else {
+                (0, u64::from(u8::MAX))
+            };
+            validate_unsigned(field.name, value, accepted_min, accepted_max)?;
             let byte = u8::try_from(value).map_err(|_| SchemaError::UnsignedOutOfRange {
                 field: field.name,
                 value,
-                min: u64::from(min),
-                max: u64::from(max),
+                min: accepted_min,
+                max: accepted_max,
             })?;
-            validate_unsigned(field.name, value, u64::from(min), u64::from(max))?;
             Ok(vec![(field.offset, u8::MAX, byte)])
         }
         (FieldCodec::Bool, FieldValue::Bool(value)) => {
@@ -1068,12 +1151,17 @@ fn encode_field(
             FieldValue::Unsigned(value),
         ) => {
             validate_bit_codec(field.name, mask, shift, min, max)?;
-            validate_unsigned(field.name, value, u64::from(min), u64::from(max))?;
+            let (accepted_min, accepted_max) = if domain == ValueDomain::Writable {
+                (u64::from(min), u64::from(max))
+            } else {
+                (0, u64::from(mask >> shift))
+            };
+            validate_unsigned(field.name, value, accepted_min, accepted_max)?;
             let byte = u8::try_from(value).map_err(|_| SchemaError::UnsignedOutOfRange {
                 field: field.name,
                 value,
-                min: u64::from(min),
-                max: u64::from(max),
+                min: accepted_min,
+                max: accepted_max,
             })?;
             let shifted = (byte << shift) & mask;
             Ok(vec![(field.offset, mask, shifted)])
@@ -1141,7 +1229,12 @@ fn encode_field(
         ) => {
             let width = validate_width(field.name, width)?;
             validate_unsigned_capacity(field.name, width, max)?;
-            validate_unsigned(field.name, value, min, max)?;
+            let (accepted_min, accepted_max) = if domain == ValueDomain::Writable {
+                (min, max)
+            } else {
+                (0, unsigned_storage_max(width))
+            };
+            validate_unsigned(field.name, value, accepted_min, accepted_max)?;
             let bytes = match endian {
                 Endian::Little => value.to_le_bytes(),
                 Endian::Big => value.to_be_bytes(),
@@ -1159,7 +1252,12 @@ fn encode_field(
         ) => {
             let width = validate_width(field.name, width)?;
             validate_signed_capacity(field.name, width, min, max)?;
-            validate_signed(field.name, value, min, max)?;
+            let (accepted_min, accepted_max) = if domain == ValueDomain::Writable {
+                (min, max)
+            } else {
+                signed_storage_bounds(width)
+            };
+            validate_signed(field.name, value, accepted_min, accepted_max)?;
             let bytes = match endian {
                 Endian::Little => value.to_le_bytes(),
                 Endian::Big => value.to_be_bytes(),
@@ -1321,6 +1419,23 @@ impl IntegerWidth {
 
 fn validate_width(field: &'static str, width: u8) -> Result<IntegerWidth, SchemaError> {
     IntegerWidth::new(field, width)
+}
+
+fn unsigned_storage_max(width: IntegerWidth) -> u64 {
+    if width.0 == 8 {
+        u64::MAX
+    } else {
+        (1_u64 << width.bits()) - 1
+    }
+}
+
+fn signed_storage_bounds(width: IntegerWidth) -> (i64, i64) {
+    if width.0 == 8 {
+        (i64::MIN, i64::MAX)
+    } else {
+        let half = 1_i64 << (width.bits() - 1);
+        (-half, half - 1)
+    }
 }
 
 /// Reject an unsigned domain wider than the encoded byte width, which would

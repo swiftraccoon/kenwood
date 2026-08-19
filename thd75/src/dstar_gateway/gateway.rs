@@ -87,6 +87,7 @@
 //! ```
 
 use std::collections::VecDeque;
+use std::marker::PhantomData;
 use std::time::{Duration, Instant};
 
 use ::mmdvm::{AsyncModem, Event};
@@ -97,7 +98,9 @@ use dstar_gateway_core::{
 use mmdvm_core::{MMDVM_SET_CONFIG, ModemMode, ModemStatus};
 
 use crate::error::Error;
-use crate::radio::mmdvm_session::{MmdvmRadioRestore, MmdvmSession};
+use crate::radio::mmdvm_session::{
+    MmdvmRadioRestore, MmdvmSession, PersistentMmdvm, TransientMmdvm,
+};
 use crate::radio::{DesyncedRadio, Radio};
 use crate::transport::{MmdvmTransportAdapter, Transport};
 use crate::types::dstar::UrCallAction;
@@ -436,11 +439,13 @@ pub enum DstarEvent {
 ///
 /// See the [module-level documentation](self) for architecture details
 /// and a full usage example.
-pub struct DstarGateway<T: Transport + Unpin + 'static> {
+pub struct DstarGateway<T: Transport + Unpin + 'static, Lifecycle = TransientMmdvm> {
     /// The underlying MMDVM async modem.
     modem: AsyncModem<MmdvmTransportAdapter<T>>,
-    /// Radio-state restore envelope used on [`Self::stop`].
+    /// Radio-state restore envelope consumed by the lifecycle-specific stop.
     restore: MmdvmRadioRestore<T>,
+    /// Compile-time record of how this MMDVM session was entered.
+    lifecycle: PhantomData<fn() -> Lifecycle>,
     /// Gateway configuration.
     config: DstarGatewayConfig,
     /// Slow data decoder for the current RX stream.
@@ -475,7 +480,7 @@ pub struct DstarGateway<T: Transport + Unpin + 'static> {
     last_health_bits: Option<u8>,
 }
 
-impl<T: Transport + Unpin + 'static> std::fmt::Debug for DstarGateway<T> {
+impl<T: Transport + Unpin + 'static, Lifecycle> std::fmt::Debug for DstarGateway<T, Lifecycle> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DstarGateway")
             .field("config", &self.config)
@@ -536,7 +541,9 @@ impl<T: Transport + Unpin + 'static> DstarGateway<T> {
             }
         }
     }
+}
 
+impl<T: Transport + Unpin + 'static> DstarGateway<T, PersistentMmdvm> {
     /// Start the D-STAR gateway on a radio already in MMDVM mode.
     ///
     /// Use this when the radio was put into DV Gateway / Reflector
@@ -579,7 +586,9 @@ impl<T: Transport + Unpin + 'static> DstarGateway<T> {
             }
         }
     }
+}
 
+impl<T: Transport + Unpin + 'static, Lifecycle> DstarGateway<T, Lifecycle> {
     /// Build a gateway from an already-prepared [`MmdvmSession`].
     ///
     /// Runs the D-STAR init handshake (`SetConfig` + `SetMode`) and,
@@ -587,7 +596,7 @@ impl<T: Transport + Unpin + 'static> DstarGateway<T> {
     /// returns the `(restore, modem, error)` triple so the caller can
     /// clean up the MMDVM session before surfacing the error.
     async fn build_from_session(
-        session: MmdvmSession<T>,
+        session: MmdvmSession<T, Lifecycle>,
         config: DstarGatewayConfig,
     ) -> Result<
         Self,
@@ -606,6 +615,7 @@ impl<T: Transport + Unpin + 'static> DstarGateway<T> {
         Ok(Self {
             modem,
             restore,
+            lifecycle: PhantomData,
             config,
             slow_data: SlowDataTextCollector::new(),
             slow_data_frame_index: 0,
@@ -621,7 +631,9 @@ impl<T: Transport + Unpin + 'static> DstarGateway<T> {
             last_health_bits: None,
         })
     }
+}
 
+impl<T: Transport + Unpin + 'static> DstarGateway<T> {
     /// Stop the gateway, exiting MMDVM mode.
     ///
     /// Unread MMDVM frames may remain on the transport, so the radio
@@ -635,7 +647,27 @@ impl<T: Transport + Unpin + 'static> DstarGateway<T> {
     pub async fn stop(self) -> Result<DesyncedRadio<T>, Error> {
         self.restore.exit_and_rebuild(self.modem).await
     }
+}
 
+impl<T: Transport + Unpin + 'static> DstarGateway<T, PersistentMmdvm> {
+    /// Stop the gateway while preserving persistent MMDVM mode.
+    ///
+    /// The modem and transport pumps are shut down cleanly, but no ASCII
+    /// `TN 0,0` command is sent because Reflector Terminal Mode is controlled
+    /// by Menu 650 rather than the transient TNC mode. The returned [`Radio`]
+    /// remains positively identified as a binary MMDVM link and can be passed
+    /// to [`Self::start_gateway_mode`] again.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the modem loop or transport pump cannot be
+    /// reclaimed without invalidating the persistent binary-link proof.
+    pub async fn stop(self) -> Result<Radio<T>, Error> {
+        self.restore.shutdown_and_rebuild_binary(self.modem).await
+    }
+}
+
+impl<T: Transport + Unpin + 'static, Lifecycle> DstarGateway<T, Lifecycle> {
     /// Process pending I/O and return the next event.
     ///
     /// Each call waits up to [`Self::set_event_timeout`] for a new MMDVM
@@ -1738,7 +1770,6 @@ mod tests {
     /// transport once started): the D-STAR init ACKs are delivered
     /// with wire-latency delays so they arrive after the writes they
     /// answer, and `extra_reads` are appended for the test body.
-    /// Must run inside a `tokio::task::LocalSet`.
     async fn started_gateway(
         extra_reads: &[(&[u8], u64)],
     ) -> Result<DstarGateway<MockTransport>, BoxTestErr> {
@@ -1769,7 +1800,25 @@ mod tests {
             .map_err(|(_, e)| -> BoxTestErr { format!("gateway start failed: {e}").into() })
     }
 
-    type BoxTestErr = Box<dyn std::error::Error>;
+    /// Build a fully-started gateway on a pre-proved persistent MMDVM link.
+    async fn started_persistent_gateway()
+    -> Result<DstarGateway<MockTransport, PersistentMmdvm>, BoxTestErr> {
+        let mut mock = MockTransport::new();
+        mock.expect_any_write();
+        mock.pend_when_empty();
+        mock.queue_read_delayed(&[0xE0, 4, 0x70, 0x02], 20);
+        mock.queue_read_delayed(&[0xE0, 4, 0x70, 0x03], 150);
+
+        let mut radio = Radio::new(mock);
+        radio.cat_state = crate::radio::CatState::BinaryProven;
+        DstarGateway::start_gateway_mode(radio, test_config()?)
+            .await
+            .map_err(|(_, error)| -> BoxTestErr {
+                format!("persistent gateway start failed: {error}").into()
+            })
+    }
+
+    type BoxTestErr = Box<dyn std::error::Error + Send + Sync>;
 
     #[tokio::test]
     async fn persistent_start_conversion_failure_returns_the_intact_radio() -> Result<(), BoxTestErr>
@@ -1819,6 +1868,37 @@ mod tests {
                 Ok(())
             })
             .await
+    }
+
+    #[tokio::test]
+    async fn stop_uses_the_entry_lifecycles_distinct_exit_paths() -> Result<(), BoxTestErr> {
+        let transient = started_gateway(&[]).await?;
+        let transient = transient.stop().await?.into_radio_unproven();
+        assert!(
+            transient
+                .transport
+                .writes()
+                .iter()
+                .any(|write| write == b"TN 0,0\r"),
+            "a CAT-entered MMDVM session must issue its qualified transient exit"
+        );
+
+        let persistent = started_persistent_gateway().await?.stop().await?;
+        assert_eq!(
+            persistent.cat_state,
+            crate::radio::CatState::BinaryProven,
+            "stopping Reflector Terminal Mode must preserve binary-link proof"
+        );
+        assert!(
+            persistent
+                .transport
+                .writes()
+                .iter()
+                .all(|write| write != b"TN 0,0\r"),
+            "persistent MMDVM must never receive the transient ASCII exit"
+        );
+        persistent.transport.assert_complete();
+        Ok(())
     }
 
     #[tokio::test]

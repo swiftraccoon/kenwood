@@ -217,8 +217,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         println!("TEST ERROR (restoring anyway): {e}");
     }
 
-    // Ordered restore with per-step reporting. Frequency stays where the
-    // operator tuned it; everything else returns to the snapshot.
+    // Ordered restore with per-step reporting, including the original Band B
+    // frequency through the saved tuning raster.
     println!("restoring saved state...");
     let report = session.exit().await;
     if report.is_complete() {

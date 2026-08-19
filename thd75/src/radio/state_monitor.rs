@@ -148,6 +148,10 @@ impl StateMonitor {
             }
             Response::Busy { band, busy } => {
                 let state = self.band_mut(band);
+                match (state.busy, busy) {
+                    (Some(true), true) | (Some(false), false) => return None,
+                    _ => {}
+                }
                 state.busy = Some(busy);
                 if busy {
                     Some(StateChange::BecameBusy { band })
@@ -203,6 +207,51 @@ mod tests {
             Some(SMeterReading::ZERO),
             "a closed squelch means a zero meter, no SM poll"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_busy_state_does_not_report_a_second_transition() -> TestResult {
+        let mut monitor = StateMonitor::new();
+
+        assert_eq!(
+            monitor.apply(&Response::Busy {
+                band: Band::A,
+                busy: true,
+            }),
+            Some(StateChange::BecameBusy { band: Band::A })
+        );
+        monitor.apply_smeter(Band::A, SMeterReading::new(4)?);
+        assert_eq!(
+            monitor.apply(&Response::Busy {
+                band: Band::A,
+                busy: true,
+            }),
+            None,
+            "a repeated open-squelch push must not request another SM read"
+        );
+        assert_eq!(
+            monitor.band(Band::A).s_meter,
+            Some(SMeterReading::new(4)?),
+            "a repeated busy push must preserve the serviced meter reading"
+        );
+
+        assert_eq!(
+            monitor.apply(&Response::Busy {
+                band: Band::A,
+                busy: false,
+            }),
+            Some(StateChange::BecameIdle { band: Band::A })
+        );
+        assert_eq!(
+            monitor.apply(&Response::Busy {
+                band: Band::A,
+                busy: false,
+            }),
+            None,
+            "a repeated closed-squelch push must not report another transition"
+        );
+        assert_eq!(monitor.band(Band::A).s_meter, Some(SMeterReading::ZERO));
         Ok(())
     }
 
