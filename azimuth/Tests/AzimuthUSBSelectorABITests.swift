@@ -109,11 +109,23 @@ final class AzimuthUSBSelectorABITests: XCTestCase {
         )
         XCTAssertEqual(
             try XCTUnwrap(Self.logEntry(event: 21, code: 0, a: 0, b: 1_024)).text,
-            "#42 bulk-IN submit initial OK bytes=1024"
+            "#42 bulk-IN submit session start OK bytes=1024"
         )
         XCTAssertEqual(
             try XCTUnwrap(Self.logEntry(event: 22, code: 0, a: 2, b: 0)).text,
             "#42 bulk-IN complete OK bytes=2 priorStreak=0"
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(Self.logEntry(event: 24, code: 0, a: 7, b: 1)).text,
+            "#42 RX session reset OK discarded=7 inFlight=true"
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(Self.logEntry(event: 12, code: 0, a: 12, b: 0)).text,
+            "#42 link failed: IN session reset"
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(Self.logEntry(event: 12, code: 0, a: 13, b: 0)).text,
+            "#42 link failed: unexpected IN abort"
         )
     }
 

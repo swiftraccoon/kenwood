@@ -11,9 +11,12 @@ private final class AzimuthMockUSBLink: AzimuthUSBSerialLink, @unchecked Sendabl
     private var buffered: [UInt8] = []
     private var doorbell: (@Sendable (Bool) -> Void)?
     private var recordedWrites: [[UInt8]] = []
+    private var writeAttempts = 0
     private var recordedBaudRates: [UInt32] = []
     private var closes = 0
     private var opens = 0
+    private var openAttempts = 0
+    private var scriptedOpenFailures: [AzimuthUSBLinkError] = []
     private var serviceAvailable = true
     private var controlServiceAvailable = true
     private var registrationWaitNanoseconds: UInt64 = 0
@@ -23,13 +26,20 @@ private final class AzimuthMockUSBLink: AzimuthUSBSerialLink, @unchecked Sendabl
     private var dextLogChecks = 0
     private var drainCalls = 0
     private var doorbellArmCalls = 0
+    private var doorbellArmAttempts = 0
+    private var scriptedArmFailures: [AzimuthUSBLinkError] = []
     private var immediateDoorbellCallbacks = 0
     private var afterEmptyDrainInjection: [UInt8]?
     private var savedCloseDoorbells: [@Sendable (Bool) -> Void] = []
+    private var remainingBackpressureResponses = 0
 
-    var backpressureResponses = 0
     var failArm = false
     var saveDoorbellOnClose = false
+
+    var backpressureResponses: Int {
+        get { lock.withLock { remainingBackpressureResponses } }
+        set { lock.withLock { remainingBackpressureResponses = newValue } }
+    }
 
     var present: Bool {
         get { lock.withLock { serviceAvailable } }
@@ -50,6 +60,10 @@ private final class AzimuthMockUSBLink: AzimuthUSBSerialLink, @unchecked Sendabl
         lock.withLock { recordedWrites }
     }
 
+    var writeAttemptCount: Int {
+        lock.withLock { writeAttempts }
+    }
+
     var baudRates: [UInt32] {
         lock.withLock { recordedBaudRates }
     }
@@ -60,6 +74,10 @@ private final class AzimuthMockUSBLink: AzimuthUSBSerialLink, @unchecked Sendabl
 
     var openCount: Int {
         lock.withLock { opens }
+    }
+
+    var openAttemptCount: Int {
+        lock.withLock { openAttempts }
     }
 
     var servicePresenceCheckCount: Int {
@@ -86,12 +104,24 @@ private final class AzimuthMockUSBLink: AzimuthUSBSerialLink, @unchecked Sendabl
         lock.withLock { doorbellArmCalls }
     }
 
+    var doorbellArmAttemptCount: Int {
+        lock.withLock { doorbellArmAttempts }
+    }
+
     var immediateDoorbellCallbackCount: Int {
         lock.withLock { immediateDoorbellCallbacks }
     }
 
     func injectAfterNextEmptyDrain(_ bytes: [UInt8]) {
         lock.withLock { afterEmptyDrainInjection = bytes }
+    }
+
+    func failNextOpen(with error: AzimuthUSBLinkError) {
+        lock.withLock { scriptedOpenFailures.append(error) }
+    }
+
+    func failNextArm(with error: AzimuthUSBLinkError) {
+        lock.withLock { scriptedArmFailures.append(error) }
     }
 
     func takeSavedCloseDoorbell() -> (@Sendable (Bool) -> Void)? {
@@ -117,7 +147,11 @@ private final class AzimuthMockUSBLink: AzimuthUSBSerialLink, @unchecked Sendabl
 
     func open() throws {
         try lock.withLock {
+            openAttempts += 1
             guard serviceAvailable else { throw AzimuthUSBLinkError.serviceNotFound }
+            if !scriptedOpenFailures.isEmpty {
+                throw scriptedOpenFailures.removeFirst()
+            }
             opens += 1
             opened = true
         }
@@ -151,8 +185,9 @@ private final class AzimuthMockUSBLink: AzimuthUSBSerialLink, @unchecked Sendabl
     func write(_ bytes: [UInt8]) throws {
         try lock.withLock {
             guard opened else { throw AzimuthUSBLinkError.notOpen }
-            if backpressureResponses > 0 {
-                backpressureResponses -= 1
+            writeAttempts += 1
+            if remainingBackpressureResponses > 0 {
+                remainingBackpressureResponses -= 1
                 throw AzimuthUSBLinkError.backpressure
             }
             recordedWrites.append(bytes)
@@ -178,6 +213,10 @@ private final class AzimuthMockUSBLink: AzimuthUSBSerialLink, @unchecked Sendabl
         var fireImmediately = false
         try lock.withLock {
             guard opened else { throw AzimuthUSBLinkError.notOpen }
+            doorbellArmAttempts += 1
+            if !scriptedArmFailures.isEmpty {
+                throw scriptedArmFailures.removeFirst()
+            }
             if failArm { throw AzimuthUSBLinkError.callFailed(code: -1) }
             doorbellArmCalls += 1
             if buffered.isEmpty {
@@ -301,6 +340,112 @@ final class AzimuthUSBSerialTransportTests: XCTestCase {
         await transport.close()
     }
 
+    func testOpenRetriesStaleNoDeviceServiceWithinRegistrationWindow() async throws {
+        try await assertTransientOpenRetry(
+            code: Int32(bitPattern: 0xE00002C0)
+        )
+    }
+
+    func testOpenRetriesStaleNotAttachedServiceWithinRegistrationWindow() async throws {
+        try await assertTransientOpenRetry(
+            code: Int32(bitPattern: 0xE00002D9)
+        )
+    }
+
+    func testOpenRetriesServiceDisappearingBetweenPresenceCheckAndOpen() async throws {
+        let link = AzimuthMockUSBLink()
+        link.serviceRegistrationWaitNanoseconds = 400_000_000
+        link.failNextOpen(with: .serviceNotFound)
+        let transport = AzimuthUSBSerialTransport(link: link)
+
+        try await transport.open()
+
+        XCTAssertEqual(link.openAttemptCount, 2)
+        XCTAssertEqual(link.openCount, 1)
+        let connectedState = await transport.state
+        XCTAssertEqual(connectedState, .connected)
+        await transport.close()
+    }
+
+    func testOpenRetriesTransientDoorbellFailureFromTerminatingDext() async throws {
+        let link = AzimuthMockUSBLink()
+        link.serviceRegistrationWaitNanoseconds = 400_000_000
+        link.failNextArm(
+            with: .callFailed(code: Int32(bitPattern: 0xE00002D6))
+        )
+        let transport = AzimuthUSBSerialTransport(link: link)
+
+        try await transport.open()
+
+        XCTAssertEqual(link.openAttemptCount, 2)
+        XCTAssertEqual(link.openCount, 2)
+        XCTAssertEqual(link.closeCount, 1)
+        XCTAssertEqual(link.doorbellArmAttemptCount, 2)
+        XCTAssertEqual(link.doorbellArmCallCount, 1)
+        let connectedState = await transport.state
+        XCTAssertEqual(connectedState, .connected)
+        await transport.close()
+    }
+
+    func testCloseDuringTransientSessionRetryCannotClobberReopenedLink() async throws {
+        let link = AzimuthMockUSBLink()
+        link.serviceRegistrationWaitNanoseconds = 400_000_000
+        link.failNextOpen(
+            with: .openFailed(code: Int32(bitPattern: 0xE00002C0))
+        )
+        let transport = AzimuthUSBSerialTransport(link: link)
+        let staleOpen = Task { try await transport.open() }
+
+        for _ in 0..<1_000 {
+            if link.openAttemptCount >= 1 { break }
+            await Task.yield()
+        }
+        XCTAssertEqual(link.openAttemptCount, 1)
+
+        await transport.close()
+        try await transport.open()
+
+        do {
+            try await staleOpen.value
+            XCTFail("the superseded retry must report cancellation")
+        } catch is CancellationError {
+            // The explicit close and reopen own the newer generation.
+        } catch {
+            XCTFail("unexpected stale-open error: \(error)")
+        }
+
+        XCTAssertEqual(link.openCount, 1)
+        XCTAssertEqual(link.closeCount, 2)
+        let connectedState = await transport.state
+        XCTAssertEqual(connectedState, .connected)
+        try await transport.write([0x51])
+        XCTAssertEqual(link.writes, [[0x51]])
+        await transport.close()
+    }
+
+    func testOpenDoesNotRetryTransientServiceFailureWithoutRegistrationWindow() async {
+        let link = AzimuthMockUSBLink()
+        link.failNextOpen(
+            with: .openFailed(code: Int32(bitPattern: 0xE00002C0))
+        )
+        let transport = AzimuthUSBSerialTransport(link: link)
+
+        do {
+            try await transport.open()
+            XCTFail("a link without a registration window must fail immediately")
+        } catch let error as AzimuthRadioTransportError {
+            guard case .openFailed(let reason) = error else {
+                return XCTFail("unexpected transport error: \(error)")
+            }
+            XCTAssertTrue(reason.contains("kIOReturnNoDevice"))
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+
+        XCTAssertEqual(link.openAttemptCount, 1)
+        XCTAssertEqual(link.openCount, 0)
+    }
+
     func testClosedServiceWaitCannotReopenOrClobberNewerConnection() async throws {
         let link = AzimuthMockUSBLink()
         link.present = false
@@ -411,6 +556,38 @@ final class AzimuthUSBSerialTransportTests: XCTestCase {
         XCTAssertEqual(link.writes, [[1, 2, 3]])
     }
 
+    func testBackpressuredWriteCannotCrossCloseAndReopenGeneration() async throws {
+        let link = AzimuthMockUSBLink()
+        link.backpressureResponses = 20
+        let transport = AzimuthUSBSerialTransport(link: link)
+        try await transport.open()
+        let staleWrite = Task { try await transport.write([0x41]) }
+
+        for _ in 0..<1_000 {
+            if link.writeAttemptCount >= 1 { break }
+            await Task.yield()
+        }
+        XCTAssertGreaterThanOrEqual(link.writeAttemptCount, 1)
+
+        await transport.close()
+        try await transport.open()
+
+        do {
+            try await staleWrite.value
+            XCTFail("a write owned by the closed generation must fail")
+        } catch let error as AzimuthRadioTransportError {
+            XCTAssertEqual(error, .notConnected)
+        } catch {
+            XCTFail("unexpected stale-write error: \(error)")
+        }
+
+        XCTAssertEqual(link.writes, [])
+        link.backpressureResponses = 0
+        try await transport.write([0x42])
+        XCTAssertEqual(link.writes, [[0x42]])
+        await transport.close()
+    }
+
     func testParkedReadHonorsLimitAndRetainsRemainder() async throws {
         let link = AzimuthMockUSBLink()
         let transport = AzimuthUSBSerialTransport(link: link)
@@ -477,6 +654,36 @@ final class AzimuthUSBSerialTransportTests: XCTestCase {
         try await Task.sleep(nanoseconds: 20_000_000)
         let state = await transport.state
         XCTAssertEqual(state, .disconnected)
+    }
+
+    func testLinkDropDiscardsSwiftReceiveBufferBeforeReopen() async throws {
+        let link = AzimuthMockUSBLink()
+        let transport = AzimuthUSBSerialTransport(link: link)
+        try await transport.open()
+        let drainsBeforeArrival = link.drainCallCount
+
+        link.sendFromRadio([0x11, 0x22])
+        for _ in 0..<1_000 {
+            if link.drainCallCount >= drainsBeforeArrival + 2 { break }
+            await Task.yield()
+        }
+        XCTAssertGreaterThanOrEqual(link.drainCallCount, drainsBeforeArrival + 2)
+
+        link.unplug()
+        for _ in 0..<1_000 {
+            if await transport.state == .disconnected { break }
+            await Task.yield()
+        }
+        let disconnectedState = await transport.state
+        XCTAssertEqual(disconnectedState, .disconnected)
+
+        try await transport.open()
+        async let reopenedRead = transport.read(maxBytes: 8)
+        try await Task.sleep(nanoseconds: 20_000_000)
+        link.sendFromRadio([0x33])
+        let reopenedBytes = try await reopenedRead
+        XCTAssertEqual(reopenedBytes, [0x33])
+        await transport.close()
     }
 
     func testDelayedDoorbellsFromClosedGenerationsCannotAffectReopenedLink() async throws {
@@ -551,5 +758,21 @@ final class AzimuthUSBSerialTransportTests: XCTestCase {
             XCTAssertEqual(link.statusCheckCount, 1)
             XCTAssertEqual(link.dextLogCheckCount, 1)
         }
+    }
+
+    private func assertTransientOpenRetry(code: Int32) async throws {
+        let link = AzimuthMockUSBLink()
+        link.serviceRegistrationWaitNanoseconds = 400_000_000
+        link.failNextOpen(with: .openFailed(code: code))
+        let transport = AzimuthUSBSerialTransport(link: link)
+
+        try await transport.open()
+
+        XCTAssertEqual(link.openAttemptCount, 2)
+        XCTAssertEqual(link.openCount, 1)
+        XCTAssertEqual(link.closeCount, 1)
+        let connectedState = await transport.state
+        XCTAssertEqual(connectedState, .connected)
+        await transport.close()
     }
 }

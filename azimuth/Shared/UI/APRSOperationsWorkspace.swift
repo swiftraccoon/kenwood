@@ -17,6 +17,7 @@ struct APRSWorkspace: View {
             configuration: $configuration,
             settingDefinitions: model.catalog.filtered(query: "", group: .aprs),
             settingValues: model.radioState.settingValues,
+            controlConnectionName: controlConnectionName,
             isExternalOperationInFlight: model.isAPRSOperationInFlight,
             startSession: { configuration in
                 await model.startAPRS(configuration)
@@ -51,6 +52,13 @@ struct APRSWorkspace: View {
             Text(model.operationError ?? "Unknown APRS error")
         }
     }
+
+    private var controlConnectionName: String {
+        if case .connected(_, let transport) = model.radioState.connection {
+            return transport
+        }
+        return model.selectedRadioEndpoint?.transport.title ?? "selected control link"
+    }
 }
 
 /// Operator surface for one host-owned APRS KISS session.
@@ -63,6 +71,7 @@ struct APRSOperationsWorkspace: View {
     @Binding var configuration: APRSSessionConfiguration
     let settingDefinitions: [RadioSettingDefinition]
     let settingValues: [String: ProposedSettingValue]
+    let controlConnectionName: String
     let isExternalOperationInFlight: Bool
     let startSession: @MainActor (APRSSessionConfiguration) async throws -> Void
     let stopSession: @MainActor () async throws -> Void
@@ -126,7 +135,7 @@ struct APRSOperationsWorkspace: View {
             APRSConfirmationSheet(
                 title: configuration.isReceiveOnly
                     ? "Start receive-only KISS?" : "Start APRS KISS?",
-                message: "Azimuth will give this USB serial session to the KISS TNC. "
+                message: "Azimuth will give the \(controlConnectionName) control session to the KISS TNC. "
                     + "The Radio screen, CAT controls, and persistent settings are paused "
                     + "until you stop APRS and CAT is restored.",
                 symbol: "antenna.radiowaves.left.and.right",
@@ -677,7 +686,7 @@ struct APRSOperationsWorkspace: View {
 
                 if catIsPaused {
                     Label(
-                        "Persistent setting reads and writes are unavailable while KISS owns USB serial. Stop the session to edit these menus.",
+                        "Persistent setting reads and writes are unavailable while KISS owns the \(controlConnectionName) control link. Stop the session to edit these menus.",
                         systemImage: "pause.rectangle.fill"
                     )
                     .font(.caption)
@@ -804,9 +813,9 @@ struct APRSOperationsWorkspace: View {
 
     private var modeOwnershipText: String {
         if catIsPaused {
-            return "KISS owns this USB serial session. Radio screen streaming, front-panel CAT control, and persistent settings are paused; stopping APRS restores them."
+            return "KISS owns the \(controlConnectionName) control session. Radio screen streaming, front-panel CAT control, and persistent settings are paused; stopping APRS restores them."
         }
-        return "KISS and CAT cannot own the TH-D75 USB serial session at the same time. Starting APRS visibly pauses the Radio and Settings surfaces until restoration completes."
+        return "KISS and CAT cannot own the TH-D75 \(controlConnectionName) control session at the same time. Starting APRS visibly pauses the Radio and Settings surfaces until restoration completes."
     }
 
     private var searchPrompt: String {

@@ -28,6 +28,15 @@ private func azimuthUSBError(_ message: String) {
     azimuthUSBTransportLog.error("\(message, privacy: .public)")
 }
 
+private let azimuthUSBServicePollNanoseconds: UInt64 = 100_000_000
+private let azimuthIOReturnNoDevice = Int32(bitPattern: 0xE00002C0)
+private let azimuthIOReturnTimeout = Int32(bitPattern: 0xE00002D6)
+private let azimuthIOReturnOffline = Int32(bitPattern: 0xE00002D7)
+private let azimuthIOReturnNotReady = Int32(bitPattern: 0xE00002D8)
+private let azimuthIOReturnNotAttached = Int32(bitPattern: 0xE00002D9)
+private let azimuthIOReturnAborted = Int32(bitPattern: 0xE00002EB)
+private let azimuthIOReturnNotResponding = Int32(bitPattern: 0xE00002ED)
+
 /// Synchronous generation gate for callbacks that may arrive on an OS queue
 /// after the actor has closed and reopened the underlying USB session.
 private final class AzimuthUSBConnectionGeneration: @unchecked Sendable {
@@ -45,6 +54,12 @@ private final class AzimuthUSBConnectionGeneration: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return value == generation
+    }
+
+    func current() -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
     }
 }
 
@@ -91,8 +106,13 @@ public actor AzimuthUSBSerialTransport: AzimuthRadioTransport {
 
     public func open() async throws {
         guard currentState != .connected else { return }
-        let generation = connectionGeneration.advance()
+        var generation = connectionGeneration.advance()
         updateState(.connecting)
+
+        let registrationWaitNanoseconds = link.serviceRegistrationWaitNanoseconds
+        let registrationDeadline = Self.registrationDeadline(
+            waitNanoseconds: registrationWaitNanoseconds
+        )
 
         var dataServicePresent = link.servicePresent()
         var controlServicePresent = link.commServicePresent()
@@ -104,11 +124,14 @@ public actor AzimuthUSBSerialTransport: AzimuthRadioTransport {
 
         do {
             if (!dataServicePresent || controlServicePresent == false),
-               link.serviceRegistrationWaitNanoseconds > 0 {
-                let attempts = max(1, Int(link.serviceRegistrationWaitNanoseconds / 100_000_000))
+               registrationWaitNanoseconds > 0 {
+                let attempts = max(
+                    1,
+                    Int(registrationWaitNanoseconds / azimuthUSBServicePollNanoseconds)
+                )
                 azimuthUSBNotice(
                     "[Azimuth USB] waiting for DriverKit data/control services: "
-                        + "timeoutMs=\(link.serviceRegistrationWaitNanoseconds / 1_000_000)"
+                        + "timeoutMs=\(registrationWaitNanoseconds / 1_000_000)"
                 )
                 var completedChecks = 0
                 for attempt in 0..<attempts {
@@ -116,7 +139,7 @@ public actor AzimuthUSBSerialTransport: AzimuthRadioTransport {
                     controlServicePresent = link.commServicePresent()
                     completedChecks = attempt + 1
                     if dataServicePresent && controlServicePresent != false { break }
-                    try await Task.sleep(nanoseconds: 100_000_000)
+                    try await Task.sleep(nanoseconds: azimuthUSBServicePollNanoseconds)
                     try ensureOpenIsCurrent(generation)
                 }
                 try ensureOpenIsCurrent(generation)
@@ -162,15 +185,64 @@ public actor AzimuthUSBSerialTransport: AzimuthRadioTransport {
             try ensureOpenIsCurrent(generation)
             azimuthUSBNotice("[Azimuth USB] opening DriverKit user client")
             linkOpenWasAttempted = true
-            try link.open()
+            var openAttempt = 1
+            while true {
+                do {
+                    try ensureOpenIsCurrent(generation)
+                    try link.open()
+                    try ensureOpenIsCurrent(generation)
+                    linkDown = false
+                    try armDoorbell(generation: generation)
+                    // The dext/tty may already contain bytes. This also closes
+                    // the arm-vs-arrival race when the link's immediate
+                    // callback is async.
+                    try drainEverything(source: "open")
+                    try ensureOpenIsCurrent(generation)
+                    break
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    guard Self.isTransientSessionEstablishmentError(error),
+                          let registrationDeadline,
+                          ContinuousClock.now < registrationDeadline else {
+                        throw error
+                    }
+                    try ensureOpenIsCurrent(generation)
+
+                    // A terminating dext can vanish after IOServiceOpen but
+                    // before its doorbell/read selectors become usable. Move
+                    // to a fresh callback generation, close the complete
+                    // partial session, and retry within the original service
+                    // registration window.
+                    generation = connectionGeneration.advance()
+                    linkDown = true
+                    link.close()
+                    receiveBuffer.removeAll(keepingCapacity: false)
+                    resumeAllReaders(with: [])
+                    azimuthUSBNotice(
+                        "[Azimuth USB] transient DriverKit session failure: "
+                            + "attempt=\(openAttempt) "
+                            + "error=\(Self.describe(error)); retrying"
+                    )
+                    let retryAt = ContinuousClock.now.advanced(
+                        by: .nanoseconds(Int64(azimuthUSBServicePollNanoseconds))
+                    )
+                    try await Task.sleep(
+                        until: min(retryAt, registrationDeadline),
+                        clock: .continuous
+                    )
+                    try ensureOpenIsCurrent(generation)
+                    guard ContinuousClock.now < registrationDeadline else {
+                        throw error
+                    }
+                    openAttempt += 1
+                }
+            }
             try ensureOpenIsCurrent(generation)
-            azimuthUSBNotice("[Azimuth USB] DriverKit user client open succeeded")
-            linkDown = false
-            try armDoorbell(generation: generation)
-            // The dext/tty may already contain bytes. This also closes the
-            // arm-vs-arrival race when the link's immediate callback is async.
-            try drainEverything(source: "open")
-            try ensureOpenIsCurrent(generation)
+            azimuthUSBNotice(
+                "[Azimuth USB] DriverKit session establishment succeeded: "
+                    + "attempt=\(openAttempt)"
+            )
             updateState(.connected)
             emitDiagnosticSnapshot(context: "open complete", includeDriverDetails: true)
         } catch is CancellationError {
@@ -235,13 +307,17 @@ public actor AzimuthUSBSerialTransport: AzimuthRadioTransport {
             throw AzimuthRadioTransportError.notConnected
         }
         guard !bytes.isEmpty else { return }
+        let generation = connectionGeneration.current()
 
         // Selector v1 is explicitly bounded to 4096 bytes. Chunking here lets
         // callers submit larger automation payloads without widening the ABI.
         var offset = 0
         while offset < bytes.count {
             let end = min(offset + AzimuthUSBABIV1.maximumTransferBytes, bytes.count)
-            try await writeChunk(Array(bytes[offset..<end]))
+            try await writeChunk(
+                Array(bytes[offset..<end]),
+                generation: generation
+            )
             offset = end
         }
     }
@@ -306,8 +382,9 @@ public actor AzimuthUSBSerialTransport: AzimuthRadioTransport {
         return lines.joined(separator: "\n")
     }
 
-    private func writeChunk(_ bytes: [UInt8]) async throws {
+    private func writeChunk(_ bytes: [UInt8], generation: UInt64) async throws {
         for attempt in 0...Self.backpressureRetries {
+            try ensureWriteIsCurrent(generation)
             azimuthUSBTrace(
                 "[Azimuth USB] write chunk: bytes=\(bytes.count) "
                     + "attempt=\(attempt + 1)/\(Self.backpressureRetries + 1)"
@@ -329,6 +406,7 @@ public actor AzimuthUSBSerialTransport: AzimuthRadioTransport {
                     )
                 }
                 try await Task.sleep(nanoseconds: Self.backpressureDelayNanoseconds)
+                try ensureWriteIsCurrent(generation)
             } catch {
                 let reason = Self.describe(error)
                 azimuthUSBError("[Azimuth USB] write failed: \(reason)")
@@ -343,6 +421,15 @@ public actor AzimuthUSBSerialTransport: AzimuthRadioTransport {
     private func ensureOpenIsCurrent(_ generation: UInt64) throws {
         guard connectionGeneration.isCurrent(generation) else {
             throw CancellationError()
+        }
+        try Task.checkCancellation()
+    }
+
+    private func ensureWriteIsCurrent(_ generation: UInt64) throws {
+        guard connectionGeneration.isCurrent(generation),
+              currentState == .connected,
+              !linkDown else {
+            throw AzimuthRadioTransportError.notConnected
         }
         try Task.checkCancellation()
     }
@@ -448,6 +535,7 @@ public actor AzimuthUSBSerialTransport: AzimuthRadioTransport {
         linkDown = true
         _ = connectionGeneration.advance()
         link.close()
+        receiveBuffer.removeAll(keepingCapacity: false)
         resumeAllReaders(with: [])
         updateState(.disconnected)
     }
@@ -539,6 +627,14 @@ public actor AzimuthUSBSerialTransport: AzimuthRadioTransport {
         case AzimuthUSBLinkError.openedDeviceIdentityUnstable(let path):
             return "The USB identity for \((path as NSString).lastPathComponent) changed while "
                 + "Azimuth opened it. No radio operation was attempted; reconnect USB-C and retry."
+        case AzimuthUSBLinkError.openedDeviceSerialMismatch(
+            let path,
+            let expected,
+            let actual
+        ):
+            return "The USB path \((path as NSString).lastPathComponent) now belongs to a different radio. "
+                + "Expected serial \(expected), found \(actual ?? "no stable serial number"). "
+                + "No radio operation was attempted; refresh connections and choose the intended TH-D75."
         case AzimuthUSBLinkError.openFailed(let code):
             return "USB open failed: \(azimuthKernReturnString(code))"
         case AzimuthUSBLinkError.notOpen:
@@ -560,6 +656,40 @@ public actor AzimuthUSBSerialTransport: AzimuthRadioTransport {
 
     private static func presenceText(_ presence: Bool?) -> String {
         presence.map(String.init) ?? "not-applicable"
+    }
+
+    private static func registrationDeadline(
+        waitNanoseconds: UInt64
+    ) -> ContinuousClock.Instant? {
+        guard waitNanoseconds > 0 else { return nil }
+        let boundedNanoseconds = min(waitNanoseconds, UInt64(Int64.max))
+        return ContinuousClock.now.advanced(
+            by: .nanoseconds(Int64(boundedNanoseconds))
+        )
+    }
+
+    /// Only registry and dext-lifetime failures are retried. Permission,
+    /// exclusivity, bad arguments, and ABI failures remain terminal.
+    private static func isTransientSessionEstablishmentError(_ error: Error) -> Bool {
+        switch error {
+        case AzimuthUSBLinkError.serviceNotFound:
+            return true
+        case AzimuthUSBLinkError.openFailed(let code):
+            return code == azimuthIOReturnNoDevice
+                || code == azimuthIOReturnNotAttached
+        case AzimuthUSBLinkError.notOpen:
+            return true
+        case AzimuthUSBLinkError.callFailed(let code):
+            return code == azimuthIOReturnNoDevice
+                || code == azimuthIOReturnTimeout
+                || code == azimuthIOReturnOffline
+                || code == azimuthIOReturnNotReady
+                || code == azimuthIOReturnNotAttached
+                || code == azimuthIOReturnAborted
+                || code == azimuthIOReturnNotResponding
+        default:
+            return false
+        }
     }
 
     private static var missingServiceDescription: String {

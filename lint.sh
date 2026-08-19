@@ -821,7 +821,7 @@ check_azimuth_generated_plists() {
     tmp=$(mktemp -d)
     cp azimuth/project.yml "$tmp/project.yml"
     touch "$tmp/project-local.yml"
-    cp -R azimuth/Shared azimuth/iPad azimuth/macOS azimuth/Tests \
+    cp -R azimuth/Shared azimuth/iPad azimuth/iPadTests azimuth/macOS azimuth/Tests \
         azimuth/Driver "$tmp/"
     if ! xcodegen generate --quiet --only-plists \
         --spec "$tmp/project.yml" --project-root "$tmp" --project "$tmp"; then

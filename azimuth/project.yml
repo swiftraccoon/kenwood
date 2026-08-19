@@ -18,7 +18,7 @@ settings:
     SWIFT_STRICT_CONCURRENCY: complete
     DEVELOPMENT_TEAM: ""
     MARKETING_VERSION: "0.1.0"
-    CURRENT_PROJECT_VERSION: "11"
+    CURRENT_PROJECT_VERSION: "13"
     GENERATE_INFOPLIST_FILE: NO
     ENABLE_USER_SCRIPT_SANDBOXING: NO
     CODE_SIGN_IDENTITY: "-"
@@ -115,9 +115,10 @@ targets:
       - framework: AzimuthCore.xcframework
         embed: false
       - sdk: FoundationModels.framework
-      # USB-C remains the primary Azimuth transport. Native Bluetooth is the
-      # alternate CAT link used, with consent, to inspect Menu 650 when USB-C
-      # has returned a validated MMDVM version response.
+      # macOS offers USB-C and paired Bluetooth as selectable control links.
+      # The same native Bluetooth path can also provide a non-destructive CAT
+      # handoff or an explicitly approved Menu 650 recovery when USB is MMDVM.
+      - sdk: CoreBluetooth.framework
       - sdk: IOBluetooth.framework
       - sdk: IOKit.framework
       - sdk: Vision.framework
@@ -135,8 +136,8 @@ targets:
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         LSMinimumSystemVersion: $(MACOSX_DEPLOYMENT_TARGET)
         LSApplicationCategoryType: public.app-category.utilities
-        NSBluetoothAlwaysUsageDescription: Azimuth uses the paired TH-D75 Bluetooth control link to restore CAT when USB-C is in MMDVM mode.
-        NSBluetoothPeripheralUsageDescription: Azimuth uses the paired TH-D75 Bluetooth control link to restore CAT when USB-C is in MMDVM mode.
+        NSBluetoothAlwaysUsageDescription: Azimuth uses a paired TH-D75 Bluetooth control link when you select Bluetooth or approve CAT recovery.
+        NSBluetoothPeripheralUsageDescription: Azimuth uses a paired TH-D75 Bluetooth control link when you select Bluetooth or approve CAT recovery.
         NSPrincipalClass: NSApplication
     settings:
       base:
@@ -182,6 +183,19 @@ targets:
         GENERATE_INFOPLIST_FILE: YES
         PRODUCT_BUNDLE_IDENTIFIER: org.swiftraccoon.azimuth.mac.tests
 
+  AzimuthIPadTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: iPadTests
+    dependencies:
+      - target: AzimuthIPad
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: org.swiftraccoon.azimuth.ipad.tests
+        TARGETED_DEVICE_FAMILY: "2"
+
 schemes:
   AzimuthMac:
     build:
@@ -213,5 +227,9 @@ schemes:
     build:
       targets:
         AzimuthIPad: all
+        AzimuthIPadTests: [test]
+    test:
+      targets:
+        - AzimuthIPadTests
     run:
       config: Debug

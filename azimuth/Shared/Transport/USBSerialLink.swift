@@ -108,7 +108,8 @@ public struct AzimuthUSBDextLogEntry: Sendable, Equatable {
             let reasons = ["unknown", "stop", "IN errors", "IN stall re-arm",
                            "IN re-arm", "OUT submit", "OUT buffer", "OUT completion",
                            "OUT short completion", "OUT session reset",
-                           "OUT valid length", "client session setup"]
+                           "OUT valid length", "client session setup", "IN session reset",
+                           "unexpected IN abort"]
             let reason = a < UInt64(reasons.count) ? reasons[Int(a)] : "unknown \(a)"
             return "#\(sequence) link failed: \(reason)"
         case 13: return "#\(sequence) read copied \(b)/\(a)"
@@ -127,13 +128,16 @@ public struct AzimuthUSBDextLogEntry: Sendable, Equatable {
         case 20:
             return "#\(sequence) session SET_CONTROL_LINE_STATE DTR|RTS -> \(result)"
         case 21:
-            let stages = ["initial", "re-arm", "stall re-arm"]
+            let stages = ["session start", "re-arm", "stall re-arm"]
             let stage = a < UInt64(stages.count) ? stages[Int(a)] : "unknown \(a)"
             return "#\(sequence) bulk-IN submit \(stage) \(result) bytes=\(b)"
         case 22:
             return "#\(sequence) bulk-IN complete \(result) bytes=\(a) priorStreak=\(b)"
         case 23:
             return "#\(sequence) session SET_CONTROL_LINE_STATE none -> \(result)"
+        case 24:
+            return "#\(sequence) RX session reset \(result) "
+                + "discarded=\(a) inFlight=\(b == 1)"
         default: return "#\(sequence) event=\(event) code=\(code) a=\(a) b=\(b)"
         }
     }
@@ -172,6 +176,11 @@ public enum AzimuthUSBLinkError: Error, Sendable, Equatable {
     case serviceNotFound
     case ambiguousDevices([String])
     case openedDeviceIdentityUnstable(String)
+    case openedDeviceSerialMismatch(
+        path: String,
+        expected: String,
+        actual: String?
+    )
     case openFailed(code: Int32)
     case notOpen
     case invalidTransferLength(Int)

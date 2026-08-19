@@ -43,8 +43,13 @@ struct AzimuthShell: View {
                 set: { if !$0 { model.dismissCATRecoveryAlert() } }
             )
         ) {
+            if model.catRecoveryAlert?.bluetoothFallbackAvailable == true {
+                Button("Try Bluetooth") {
+                    Task { await model.connectViaBluetoothFromUSBMMDVM() }
+                }
+            }
             if model.catRecoveryAlert?.automaticRecoveryAvailable == true {
-                Button("Restore CAT Automatically") {
+                Button("Try Automatic Recovery") {
                     Task { await model.restoreCATFromUSBMMDVM() }
                 }
             }
@@ -126,10 +131,29 @@ struct AzimuthShell: View {
     private var sidebarConnectionDetail: String {
         switch model.radioState.connection {
         case .connected(_, let transport): return transport.uppercased()
-        case .connecting: return "USB CONTROL"
-        case .failed: return "CHECK RADIO"
-        case .disconnected: return "USB NOT CONNECTED"
+        case .connecting:
+            switch model.radioConnectionActivity {
+            case .bluetoothHandoff:
+                return "BLUETOOTH HANDOFF"
+            case .menu650Recovery:
+                return "USB-C CAT RECOVERY"
+            case .connection:
+                return selectedConnectionLabel(suffix: "CONTROL")
+            case nil:
+                return selectedConnectionLabel(suffix: "CONTROL")
+            }
+        case .failed:
+            return selectedConnectionLabel(suffix: "CHECK RADIO")
+        case .disconnected:
+            return selectedConnectionLabel(suffix: "NOT CONNECTED")
         }
+    }
+
+    private func selectedConnectionLabel(suffix: String) -> String {
+        guard let endpoint = model.selectedRadioEndpoint else {
+            return "NO CONNECTION SELECTED"
+        }
+        return "\(endpoint.transport.title.uppercased()) \(suffix)"
     }
     #endif
 

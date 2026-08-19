@@ -22,6 +22,47 @@ final class AzimuthCoreCatalogTests: XCTestCase {
         }
     }
 
+    func testDisruptiveCorePoliciesKeepMenus650And980ReadOnly() async throws {
+        let catalog = try await AzimuthCoreCatalogProvider().catalog()
+        let disruptiveIDs: Set<String> = [
+            "dv.DvGatewayModeDvGateway",
+            "radio.UsbFunction",
+        ]
+        let records = settingCatalog().filter { $0.writePolicy == .dedicatedLifecycle }
+
+        XCTAssertEqual(Set(records.map(\.id)), disruptiveIDs)
+        for record in records {
+            XCTAssertTrue(record.requiresRestart, record.id)
+            XCTAssertTrue(record.requiresReconnect, record.id)
+            XCTAssertNotNil(record.writeRestriction, record.id)
+
+            let definition = try XCTUnwrap(catalog.definition(id: record.id))
+            XCTAssertTrue(definition.isSpecializedEditor, record.id)
+            XCTAssertTrue(definition.requiresRestart, record.id)
+            XCTAssertTrue(definition.requiresReconnect, record.id)
+            XCTAssertEqual(definition.summary, record.writeRestriction, record.id)
+
+            let plan = AssistantPlanValidator.validate(
+                request: "Change \(definition.title)",
+                draft: AssistantPlanDraft(
+                    summary: "Change a disruptive setting.",
+                    needsClarification: false,
+                    changes: [
+                        .init(
+                            settingID: record.id,
+                            proposedValue: "1",
+                            rationale: "Requested change"
+                        ),
+                    ]
+                ),
+                catalog: catalog,
+                currentValues: [record.id: .choice(rawValue: 0)]
+            )
+            XCTAssertEqual(plan.changes.first?.validation, .specializedEditorRequired, record.id)
+            XCTAssertFalse(plan.isFullyValidated, record.id)
+        }
+    }
+
     func testHandheldMenuNumbersAreCompleteConservativeAndSearchable() async throws {
         let catalog = try await AzimuthCoreCatalogProvider().catalog()
 
@@ -241,8 +282,7 @@ final class AzimuthCoreCatalogTests: XCTestCase {
 @MainActor
 final class AzimuthBluetoothHelperPackagingTests: XCTestCase {
     func testBundledRecoveryHelperLaunchesInsideAppSandbox() async throws {
-        let candidateCount = try await validateBluetoothRecoveryHelper()
-        XCTAssertLessThanOrEqual(candidateCount, 64)
+        try await validateBluetoothRecoveryHelper()
     }
 }
 #endif
@@ -289,6 +329,105 @@ final class AzimuthLiveRadioControllerTests: XCTestCase {
         await controller.disconnect()
     }
 
+    func testBluetoothCATPreflightConnectsAndPublishesBluetoothTransport() async throws {
+        let transport = IntegrationTestTransport(connectionKind: .bluetooth)
+        let core = IntegrationTestCore()
+        let connector = IntegrationTestCoreConnector(core: core)
+        let controller = try AzimuthLiveRadioController(
+            transport: transport,
+            connectCore: { transport in
+                try await connector.connect(transport: transport)
+            },
+            prepareRadioForAutomation: { _ in .cat }
+        )
+
+        try await controller.connect()
+
+        XCTAssertEqual(transport.openCallCount, 1)
+        XCTAssertEqual(connector.callCount, 1)
+        XCTAssertEqual(
+            controller.currentState.connection,
+            .connected(device: "Kenwood TH-D75", transport: "Bluetooth")
+        )
+        await controller.disconnect()
+    }
+
+    func testBluetoothMMDVMRejectsCATWithoutAuthorizingUSBRecovery() async throws {
+        let transport = IntegrationTestTransport(connectionKind: .bluetooth)
+        let connector = IntegrationTestCoreConnector(core: IntegrationTestCore())
+        let recovery = IntegrationTestCATRecovery()
+        let controller = try AzimuthLiveRadioController(
+            transport: transport,
+            connectCore: { transport in
+                try await connector.connect(transport: transport)
+            },
+            prepareRadioForAutomation: { _ in .mmdvm },
+            recoverUSBMMDVM: { serialNumber, _ in recovery.operation(serialNumber) },
+            automaticCATRecoveryAvailable: true
+        )
+
+        do {
+            try await controller.connect()
+            XCTFail("Bluetooth MMDVM mode must not enter CAT automation")
+        } catch let error as RadioControllerError {
+            guard case .operationFailed(let reason) = error else {
+                return XCTFail("Bluetooth MMDVM must be an operation error, got \(error)")
+            }
+            XCTAssertTrue(reason.contains("selected Bluetooth interface"))
+            XCTAssertTrue(reason.contains("choose USB-C"))
+        }
+
+        XCTAssertEqual(transport.openCallCount, 1)
+        XCTAssertEqual(transport.closeCallCount, 1)
+        XCTAssertEqual(connector.callCount, 0)
+        XCTAssertFalse(controller.automaticCATRecoveryAvailable)
+        XCTAssertNil(recovery.lastExpectedSerialNumber)
+
+        do {
+            try await controller.restoreCATFromUSBMMDVM()
+            XCTFail("Bluetooth MMDVM must never authorize the USB Menu 650 recovery path")
+        } catch let error as RadioControllerError {
+            guard case .capabilityUnavailable(let reason) = error else {
+                return XCTFail("Expected unavailable USB recovery, got \(error)")
+            }
+            XCTAssertTrue(reason.contains("validated USB MMDVM response"))
+        }
+        XCTAssertEqual(recovery.callCount, 0)
+    }
+
+    func testTwoUnresponsiveBluetoothSessionsReopenOnceAndReportBluetoothFailure() async throws {
+        let transport = IntegrationTestTransport(connectionKind: .bluetooth)
+        let connector = IntegrationTestCoreConnector(core: IntegrationTestCore())
+        let preflight = IntegrationTestModePreflight(
+            modes: [.unresponsive, .unresponsive]
+        )
+        let controller = try AzimuthLiveRadioController(
+            transport: transport,
+            connectCore: { transport in
+                try await connector.connect(transport: transport)
+            },
+            prepareRadioForAutomation: { _ in try preflight.nextMode() }
+        )
+
+        do {
+            try await controller.connect()
+            XCTFail("Two silent Bluetooth sessions must not enter CAT automation")
+        } catch let error as RadioControllerError {
+            guard case .operationFailed(let reason) = error else {
+                return XCTFail("Expected a Bluetooth operation error, got \(error)")
+            }
+            XCTAssertTrue(reason.contains("Bluetooth control link once"))
+            XCTAssertTrue(reason.contains("Bluetooth connection is enabled"))
+            XCTAssertFalse(reason.contains("CDC control-line reset"))
+        }
+
+        XCTAssertEqual(preflight.callCount, 2)
+        XCTAssertEqual(transport.openCallCount, 2)
+        XCTAssertEqual(transport.closeCallCount, 2)
+        XCTAssertEqual(connector.callCount, 0)
+        XCTAssertFalse(controller.automaticCATRecoveryAvailable)
+    }
+
     func testMMDVMPreflightStopsBeforeCoreAndPreservesTypedRecoveryCondition() async throws {
         let transport = IntegrationTestTransport()
         let core = IntegrationTestCore()
@@ -300,7 +439,7 @@ final class AzimuthLiveRadioControllerTests: XCTestCase {
                 try await connector.connect(transport: transport)
             },
             prepareRadioForAutomation: { _ in .mmdvm },
-            recoverUSBMMDVM: { serialNumber in recovery.operation(serialNumber) },
+            recoverUSBMMDVM: { serialNumber, _ in recovery.operation(serialNumber) },
             automaticCATRecoveryAvailable: true
         )
 
@@ -321,6 +460,90 @@ final class AzimuthLiveRadioControllerTests: XCTestCase {
         XCTAssertTrue(message.contains("CAT control is unavailable"))
     }
 
+    func testDeniedBluetoothAuthorizationDoesNotConsumeMMDVMRecoveryOrLaunchHelper() async throws {
+        let transport = IntegrationTestTransport()
+        let authorization = IntegrationTestBluetoothRecoveryAuthorization(.denied)
+        let recoveryFactoryCalls = IntegrationTestCallCounter()
+        let recovery = IntegrationTestCATRecovery()
+        let controller = try AzimuthLiveRadioController(
+            transport: transport,
+            prepareRadioForAutomation: { _ in .mmdvm },
+            authorizeBluetoothRecovery: {
+                try await authorization.authorize()
+            },
+            recoverUSBMMDVM: { serialNumber, _ in
+                recoveryFactoryCalls.record()
+                return recovery.operation(serialNumber)
+            },
+            automaticCATRecoveryAvailable: true
+        )
+
+        do {
+            try await controller.connect()
+            XCTFail("MMDVM mode must stop ordinary CAT connection")
+        } catch let error as RadioControllerError {
+            XCTAssertEqual(error, .usbMmdvmMode)
+        }
+        let failedState = controller.currentState
+
+        do {
+            try await controller.restoreCATFromUSBMMDVM()
+            XCTFail("Denied foreground Bluetooth authorization must fail closed")
+        } catch let error as AzimuthBluetoothAuthorizationError {
+            XCTAssertEqual(error, .denied)
+        }
+
+        XCTAssertEqual(authorization.callCount, 1)
+        XCTAssertEqual(recoveryFactoryCalls.callCount, 0)
+        XCTAssertEqual(recovery.callCount, 0)
+        XCTAssertTrue(controller.automaticCATRecoveryAvailable)
+        XCTAssertEqual(controller.currentState, failedState)
+    }
+
+    func testCancelledBluetoothAuthorizationDoesNotConsumeMMDVMRecoveryOrLaunchHelper() async throws {
+        let transport = IntegrationTestTransport()
+        let authorization = IntegrationTestBluetoothRecoveryAuthorization(.blocked)
+        let recoveryFactoryCalls = IntegrationTestCallCounter()
+        let recovery = IntegrationTestCATRecovery()
+        let controller = try AzimuthLiveRadioController(
+            transport: transport,
+            prepareRadioForAutomation: { _ in .mmdvm },
+            authorizeBluetoothRecovery: {
+                try await authorization.authorize()
+            },
+            recoverUSBMMDVM: { serialNumber, _ in
+                recoveryFactoryCalls.record()
+                return recovery.operation(serialNumber)
+            },
+            automaticCATRecoveryAvailable: true
+        )
+
+        do {
+            try await controller.connect()
+            XCTFail("MMDVM mode must stop ordinary CAT connection")
+        } catch let error as RadioControllerError {
+            XCTAssertEqual(error, .usbMmdvmMode)
+        }
+        var authorizationStarted = authorization.started.makeAsyncIterator()
+        let restore = Task { try await controller.restoreCATFromUSBMMDVM() }
+        let didStart: Void? = await authorizationStarted.next()
+        XCTAssertNotNil(didStart)
+        restore.cancel()
+
+        do {
+            try await restore.value
+            XCTFail("Cancelled foreground authorization must stop recovery")
+        } catch is CancellationError {
+            // Expected.
+        }
+        XCTAssertEqual(recoveryFactoryCalls.callCount, 0)
+        XCTAssertEqual(recovery.callCount, 0)
+        XCTAssertTrue(controller.automaticCATRecoveryAvailable)
+        guard case .failed = controller.currentState.connection else {
+            return XCTFail("Cancellation before recovery must preserve the MMDVM failure state")
+        }
+    }
+
     func testApprovedMMDVMRecoveryUsesBluetoothThenProvesUSBAndConnectsCore() async throws {
         let transport = IntegrationTestTransport()
         let core = IntegrationTestCore()
@@ -333,7 +556,7 @@ final class AzimuthLiveRadioControllerTests: XCTestCase {
                 try await connector.connect(transport: transport)
             },
             prepareRadioForAutomation: { _ in try preflight.nextMode() },
-            recoverUSBMMDVM: { serialNumber in recovery.operation(serialNumber) },
+            recoverUSBMMDVM: { serialNumber, _ in recovery.operation(serialNumber) },
             automaticCATRecoveryAvailable: true,
             catRecoveryWindow: .seconds(1),
             catRecoveryPollInterval: .milliseconds(1)
@@ -357,13 +580,59 @@ final class AzimuthLiveRadioControllerTests: XCTestCase {
         await controller.disconnect()
     }
 
+    func testMMDVMRecoveryPassesKnownQualifiedBluetoothAddress() async throws {
+        let baseTransport = IntegrationTestTransport()
+        let transport = IntegrationSameRadioTransport(
+            base: baseTransport,
+            knownQualifiedAddress: "AA:BB:CC:DD:EE:FF"
+        )
+        let core = IntegrationTestCore()
+        let connector = IntegrationTestCoreConnector(core: core)
+        let preflight = IntegrationTestModePreflight(modes: [.mmdvm, .cat, .cat])
+        let recovery = IntegrationTestCATRecovery()
+        let controller = try AzimuthLiveRadioController(
+            transport: transport,
+            connectCore: { transport in
+                try await connector.connect(transport: transport)
+            },
+            prepareRadioForAutomation: { _ in try preflight.nextMode() },
+            recoverUSBMMDVM: { serialNumber, qualifiedAddress in
+                recovery.operation(
+                    serialNumber,
+                    qualifiedBluetoothAddress: qualifiedAddress
+                )
+            },
+            automaticCATRecoveryAvailable: true,
+            catRecoveryWindow: .seconds(1),
+            catRecoveryPollInterval: .milliseconds(1)
+        )
+        do {
+            try await controller.connect()
+            XCTFail("Initial USB MMDVM detection must require consent")
+        } catch let error as RadioControllerError {
+            XCTAssertEqual(error, .usbMmdvmMode)
+        }
+
+        try await controller.restoreCATFromUSBMMDVM()
+
+        XCTAssertEqual(recovery.lastExpectedSerialNumber, "C3C10368")
+        XCTAssertEqual(
+            recovery.lastQualifiedBluetoothAddress,
+            "AA:BB:CC:DD:EE:FF"
+        )
+        XCTAssertEqual(transport.knownAddressRequestCount, 1)
+        XCTAssertGreaterThanOrEqual(transport.usbRecoverySelectionCount, 1)
+        XCTAssertEqual(connector.callCount, 1)
+        await controller.disconnect()
+    }
+
     func testDisconnectBeforeBluetoothRecoveryStartsPreventsMutation() async throws {
         let transport = IntegrationTestTransport()
         let recovery = IntegrationTestCATRecovery()
         let controller = try AzimuthLiveRadioController(
             transport: transport,
             prepareRadioForAutomation: { _ in .mmdvm },
-            recoverUSBMMDVM: { serialNumber in recovery.operation(serialNumber) },
+            recoverUSBMMDVM: { serialNumber, _ in recovery.operation(serialNumber) },
             automaticCATRecoveryAvailable: true
         )
 
@@ -394,13 +663,53 @@ final class AzimuthLiveRadioControllerTests: XCTestCase {
         XCTAssertEqual(recovery.callCount, 0)
     }
 
+    func testDisconnectDuringBluetoothHandoffDoesNotReauthorizeRecovery() async throws {
+        let baseTransport = IntegrationTestTransport()
+        let transport = IntegrationSameRadioTransport(
+            base: baseTransport,
+            knownQualifiedAddress: nil
+        )
+        let controller = try AzimuthLiveRadioController(
+            transport: transport,
+            prepareRadioForAutomation: { _ in .mmdvm },
+            automaticCATRecoveryAvailable: true
+        )
+
+        do {
+            try await controller.connect()
+            XCTFail("MMDVM mode must stop ordinary CAT connection")
+        } catch let error as RadioControllerError {
+            XCTAssertEqual(error, .usbMmdvmMode)
+        }
+        XCTAssertTrue(controller.automaticCATRecoveryAvailable)
+        XCTAssertTrue(controller.bluetoothCATFallbackAvailable)
+
+        baseTransport.blockOpen(call: 2)
+        let handoff = Task {
+            try await controller.connectViaBluetoothFromUSBMMDVM()
+        }
+        try await waitUntil { baseTransport.hasBlockedOpen }
+
+        await controller.disconnect()
+
+        do {
+            try await handoff.value
+            XCTFail("Disconnect must cancel the Bluetooth handoff")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+        XCTAssertEqual(controller.currentState.connection, .disconnected)
+        XCTAssertFalse(controller.automaticCATRecoveryAvailable)
+        XCTAssertFalse(controller.bluetoothCATFallbackAvailable)
+    }
+
     func testDisconnectCancelsAndWaitsForInFlightBluetoothRecovery() async throws {
         let transport = IntegrationTestTransport()
         let recovery = IntegrationTestBlockingCATRecovery()
         let controller = try AzimuthLiveRadioController(
             transport: transport,
             prepareRadioForAutomation: { _ in .mmdvm },
-            recoverUSBMMDVM: { serialNumber in recovery.operation(serialNumber) },
+            recoverUSBMMDVM: { serialNumber, _ in recovery.operation(serialNumber) },
             automaticCATRecoveryAvailable: true
         )
 
@@ -443,7 +752,7 @@ final class AzimuthLiveRadioControllerTests: XCTestCase {
         let controller = try AzimuthLiveRadioController(
             transport: transport,
             prepareRadioForAutomation: { _ in .mmdvm },
-            recoverUSBMMDVM: { serialNumber in recovery.operation(serialNumber) },
+            recoverUSBMMDVM: { serialNumber, _ in recovery.operation(serialNumber) },
             automaticCATRecoveryAvailable: true
         )
 
@@ -477,13 +786,57 @@ final class AzimuthLiveRadioControllerTests: XCTestCase {
         await controller.disconnect()
     }
 
+    func testStoppingPostMutationUSBCATPollPreservesCompletedOutcome() async throws {
+        let transport = IntegrationTestTransport()
+        transport.blockOpen(call: 2)
+        let controller = try AzimuthLiveRadioController(
+            transport: transport,
+            prepareRadioForAutomation: { _ in .mmdvm },
+            recoverUSBMMDVM: { _, _ in
+                IntegrationTestImmediateCATRecoveryOperation {
+                    .changedRadioRebooting
+                }
+            },
+            automaticCATRecoveryAvailable: true,
+            catRecoveryWindow: .seconds(60),
+            catRecoveryPollInterval: .milliseconds(1)
+        )
+
+        do {
+            try await controller.connect()
+            XCTFail("MMDVM mode must stop ordinary CAT connection")
+        } catch let error as RadioControllerError {
+            XCTAssertEqual(error, .usbMmdvmMode)
+        }
+
+        let restoreTask = Task {
+            try await controller.restoreCATFromUSBMMDVM()
+        }
+        try await waitUntil { transport.hasBlockedOpen }
+        restoreTask.cancel()
+        await controller.disconnect()
+
+        do {
+            try await restoreTask.value
+            XCTFail("Stopping the USB poll must report the completed Menu 650 result")
+        } catch let error as RadioControllerError {
+            guard case .operationFailed(let detail) = error else {
+                return XCTFail("Expected a truthful completed-operation error, got \(error)")
+            }
+            XCTAssertTrue(detail.contains("Menu 650 was changed to Off"))
+            XCTAssertTrue(detail.contains("USB-C CAT reconnect was stopped"))
+        }
+        XCTAssertEqual(transport.openCallCount, 2)
+        XCTAssertEqual(controller.currentState.connection, .disconnected)
+    }
+
     func testAutomaticRecoveryIsRejectedAfterAnUnrelatedConnectionFailure() async throws {
         let transport = IntegrationTestTransport()
         let recovery = IntegrationTestCATRecovery()
         let controller = try AzimuthLiveRadioController(
             transport: transport,
             prepareRadioForAutomation: { _ in .unresponsive },
-            recoverUSBMMDVM: { serialNumber in recovery.operation(serialNumber) },
+            recoverUSBMMDVM: { serialNumber, _ in recovery.operation(serialNumber) },
             automaticCATRecoveryAvailable: true
         )
 
@@ -512,7 +865,7 @@ final class AzimuthLiveRadioControllerTests: XCTestCase {
         let controller = try AzimuthLiveRadioController(
             transport: transport,
             prepareRadioForAutomation: { _ in .mmdvm },
-            recoverUSBMMDVM: { serialNumber in recovery.operation(serialNumber) },
+            recoverUSBMMDVM: { serialNumber, _ in recovery.operation(serialNumber) },
             automaticCATRecoveryAvailable: true
         )
 
@@ -545,7 +898,7 @@ final class AzimuthLiveRadioControllerTests: XCTestCase {
                 try await connector.connect(transport: transport)
             },
             prepareRadioForAutomation: { _ in .mmdvm },
-            recoverUSBMMDVM: { _ in
+            recoverUSBMMDVM: { _, _ in
                 IntegrationTestImmediateCATRecoveryOperation {
                     transport.setHardwareSerialNumber("C5310165")
                     return .changedRadioRebooting
@@ -588,7 +941,7 @@ final class AzimuthLiveRadioControllerTests: XCTestCase {
                 try await connector.connect(transport: transport)
             },
             prepareRadioForAutomation: { _ in try preflight.nextMode() },
-            recoverUSBMMDVM: { serialNumber in recovery.operation(serialNumber) },
+            recoverUSBMMDVM: { serialNumber, _ in recovery.operation(serialNumber) },
             automaticCATRecoveryAvailable: true,
             catRecoveryWindow: .seconds(1),
             catRecoveryPollInterval: .milliseconds(1)
@@ -605,7 +958,7 @@ final class AzimuthLiveRadioControllerTests: XCTestCase {
             try await controller.restoreCATFromUSBMMDVM()
             XCTFail("A replacement radio on the CDC retry must not enter the core")
         } catch {
-            XCTAssertTrue(error.localizedDescription.contains("CDC recovery reopen"))
+            XCTAssertTrue(error.localizedDescription.contains("USB-C recovery reopen"))
             XCTAssertTrue(error.localizedDescription.contains("C3C10368"))
             XCTAssertTrue(error.localizedDescription.contains("C5310165"))
         }
@@ -667,6 +1020,56 @@ final class AzimuthLiveRadioControllerTests: XCTestCase {
         XCTAssertEqual(connector.callCount, 0)
     }
 
+    func testDisconnectCancelsAndAwaitsConnectionBeforeAReopen() async throws {
+        let transport = IntegrationTestTransport()
+        let core = IntegrationTestCore()
+        let connector = IntegrationTestCoreConnector(core: core)
+        let preflight = IntegrationTestBlockingModePreflight()
+        let controller = try AzimuthLiveRadioController(
+            transport: transport,
+            connectCore: { transport in
+                try await connector.connect(transport: transport)
+            },
+            prepareRadioForAutomation: { _ in
+                try await preflight.nextMode()
+            }
+        )
+        let staleConnect = Task { try await controller.connect() }
+        try await waitUntil { preflight.hasStarted }
+
+        let disconnect = Task { await controller.disconnect() }
+        try await waitUntil { preflight.cancellationObserved }
+
+        XCTAssertFalse(preflight.hasFinished)
+        XCTAssertEqual(transport.closeCallCount, 0)
+        preflight.releaseFirstCall()
+        await disconnect.value
+
+        do {
+            try await staleConnect.value
+            XCTFail("the disconnected connection attempt must report cancellation")
+        } catch is CancellationError {
+            // Disconnect invalidated and joined the complete connection task.
+        } catch {
+            XCTFail("unexpected stale-connection error: \(error)")
+        }
+
+        XCTAssertTrue(preflight.hasFinished)
+        XCTAssertEqual(transport.openCallCount, 1)
+        XCTAssertEqual(transport.closeCallCount, 1)
+        XCTAssertEqual(connector.callCount, 0)
+        XCTAssertEqual(controller.currentState.connection, .disconnected)
+
+        try await controller.connect()
+
+        XCTAssertEqual(preflight.callCount, 2)
+        XCTAssertEqual(transport.openCallCount, 2)
+        XCTAssertEqual(transport.closeCallCount, 1)
+        XCTAssertEqual(connector.callCount, 1)
+        XCTAssertTrue(controller.currentState.connection.isConnected)
+        await controller.disconnect()
+    }
+
     func testAPRSOwnsSerialLinkUntilCoreConfirmsExactCATRestoration() async throws {
         let transport = IntegrationTestTransport()
         let core = IntegrationTestCore()
@@ -704,6 +1107,80 @@ final class AzimuthLiveRadioControllerTests: XCTestCase {
         XCTAssertGreaterThan(core.screenCaptureCallCount, capturesBeforeStop)
         XCTAssertTrue(controller.currentState.capabilities.settingRead.isAvailable)
         XCTAssertTrue(controller.currentState.capabilities.screenStreaming.isAvailable)
+        await controller.disconnect()
+    }
+
+    func testUSBAPRSStartsWhenMenu983RoutesKISSToUSB() async throws {
+        let transport = IntegrationTestTransport(connectionKind: .usb)
+        let core = IntegrationTestCore(kissInterfaceRawValue: 0)
+        let controller = try makeController(transport: transport, core: core)
+        try await controller.connect()
+
+        try await controller.startAPRS(.receiveOnly)
+
+        XCTAssertEqual(core.startAprsCallCount, 1)
+        XCTAssertEqual(controller.currentAPRSState.status.phase, .active)
+        await controller.disconnect()
+    }
+
+    func testUSBAPRSRejectsMenu983BluetoothBeforeKISSEntry() async throws {
+        let transport = IntegrationTestTransport(connectionKind: .usb)
+        let core = IntegrationTestCore(kissInterfaceRawValue: 1)
+        let controller = try makeController(transport: transport, core: core)
+        try await controller.connect()
+
+        do {
+            try await controller.startAPRS(.receiveOnly)
+            XCTFail("USB control must reject a Bluetooth-routed KISS session")
+        } catch let error as RadioControllerError {
+            guard case .capabilityUnavailable(let reason) = error else {
+                return XCTFail("Expected a Menu 983 capability error, got \(error)")
+            }
+            XCTAssertTrue(reason.contains("Menu 983"))
+            XCTAssertTrue(reason.contains("routes KISS to Bluetooth"))
+            XCTAssertTrue(reason.contains("Set Menu 983 (KISS) to USB-C"))
+        }
+
+        XCTAssertEqual(core.startAprsCallCount, 0)
+        XCTAssertEqual(controller.currentAPRSState.status.phase, .inactive)
+        XCTAssertTrue(controller.currentState.capabilities.settingRead.isAvailable)
+        await controller.disconnect()
+    }
+
+    func testBluetoothAPRSStartsWhenMenu983RoutesKISSToBluetooth() async throws {
+        let transport = IntegrationTestTransport(connectionKind: .bluetooth)
+        let core = IntegrationTestCore(kissInterfaceRawValue: 1)
+        let controller = try makeController(transport: transport, core: core)
+        try await controller.connect()
+
+        try await controller.startAPRS(.receiveOnly)
+
+        XCTAssertEqual(core.startAprsCallCount, 1)
+        XCTAssertEqual(controller.currentAPRSState.status.phase, .active)
+        await controller.disconnect()
+    }
+
+    func testBluetoothAPRSRejectsMenu983USBBeforeKISSEntry() async throws {
+        let transport = IntegrationTestTransport(connectionKind: .bluetooth)
+        let core = IntegrationTestCore(kissInterfaceRawValue: 0)
+        let controller = try makeController(transport: transport, core: core)
+        try await controller.connect()
+
+        do {
+            try await controller.startAPRS(.receiveOnly)
+            XCTFail("Bluetooth control must reject a USB-routed KISS session")
+        } catch let error as RadioControllerError {
+            guard case .capabilityUnavailable(let reason) = error else {
+                return XCTFail("Expected a Menu 983 capability error, got \(error)")
+            }
+            XCTAssertTrue(reason.contains("Menu 983"))
+            XCTAssertTrue(reason.contains("routes KISS to USB-C"))
+            XCTAssertTrue(reason.contains("Set Menu 983 (KISS) to Bluetooth"))
+        }
+
+        XCTAssertEqual(core.startAprsCallCount, 0)
+        XCTAssertEqual(controller.currentAPRSState.status.phase, .inactive)
+        XCTAssertTrue(controller.currentState.capabilities.settingRead.isAvailable)
         await controller.disconnect()
     }
 
@@ -910,16 +1387,71 @@ private final class IntegrationTestModePreflight: @unchecked Sendable {
     }
 }
 
+private final class IntegrationTestBlockingModePreflight: @unchecked Sendable {
+    private let lock = NSLock()
+    private var calls = 0
+    private var started = false
+    private var cancelled = false
+    private var finished = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    var callCount: Int { lock.withLock { calls } }
+    var hasStarted: Bool { lock.withLock { started } }
+    var cancellationObserved: Bool { lock.withLock { cancelled } }
+    var hasFinished: Bool { lock.withLock { finished } }
+
+    func nextMode() async throws -> AzimuthRadioWireMode {
+        let shouldBlock = lock.withLock { () -> Bool in
+            calls += 1
+            return calls == 1
+        }
+        guard shouldBlock else { return .cat }
+
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                lock.withLock {
+                    self.continuation = continuation
+                    started = true
+                }
+            }
+        } onCancel: {
+            self.lock.withLock { self.cancelled = true }
+        }
+        lock.withLock { finished = true }
+        try Task.checkCancellation()
+        return .cat
+    }
+
+    func releaseFirstCall() {
+        let pending = lock.withLock {
+            let pending = continuation
+            continuation = nil
+            return pending
+        }
+        pending?.resume()
+    }
+}
+
 private final class IntegrationTestCATRecovery: AzimuthCATRecoveryOperation, @unchecked Sendable {
     private let lock = NSLock()
     private var calls = 0
     private var expectedSerialNumber: String?
+    private var qualifiedBluetoothAddress: String?
 
     var callCount: Int { lock.withLock { calls } }
     var lastExpectedSerialNumber: String? { lock.withLock { expectedSerialNumber } }
+    var lastQualifiedBluetoothAddress: String? {
+        lock.withLock { qualifiedBluetoothAddress }
+    }
 
-    func operation(_ serialNumber: String) -> any AzimuthCATRecoveryOperation {
-        lock.withLock { expectedSerialNumber = serialNumber }
+    func operation(
+        _ serialNumber: String,
+        qualifiedBluetoothAddress: String? = nil
+    ) -> any AzimuthCATRecoveryOperation {
+        lock.withLock {
+            expectedSerialNumber = serialNumber
+            self.qualifiedBluetoothAddress = qualifiedBluetoothAddress
+        }
         return self
     }
 
@@ -930,6 +1462,51 @@ private final class IntegrationTestCATRecovery: AzimuthCATRecoveryOperation, @un
             calls += 1
         }
         return .changedRadioRebooting
+    }
+}
+
+private final class IntegrationTestCallCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var calls = 0
+
+    var callCount: Int { lock.withLock { calls } }
+
+    func record() {
+        lock.withLock { calls += 1 }
+    }
+}
+
+private final class IntegrationTestBluetoothRecoveryAuthorization: @unchecked Sendable {
+    enum Behavior: Sendable {
+        case denied
+        case blocked
+    }
+
+    let started: AsyncStream<Void>
+
+    private let lock = NSLock()
+    private let behavior: Behavior
+    private let startedContinuation: AsyncStream<Void>.Continuation
+    private var calls = 0
+
+    init(_ behavior: Behavior) {
+        self.behavior = behavior
+        var continuation: AsyncStream<Void>.Continuation!
+        started = AsyncStream { continuation = $0 }
+        startedContinuation = continuation
+    }
+
+    var callCount: Int { lock.withLock { calls } }
+
+    func authorize() async throws {
+        lock.withLock { calls += 1 }
+        startedContinuation.yield(())
+        switch behavior {
+        case .denied:
+            throw AzimuthBluetoothAuthorizationError.denied
+        case .blocked:
+            try await Task.sleep(for: .seconds(60))
+        }
     }
 }
 
@@ -992,17 +1569,33 @@ private final class IntegrationTestImmediateCATRecoveryOperation:
 }
 
 private final class IntegrationTestTransport: AzimuthRadioTransport, @unchecked Sendable {
-    let device = AzimuthRadioDevice.thD75USBC
+    let device: AzimuthRadioDevice
     private let lock = NSLock()
     private var serialNumber: String?
     private var currentState: AzimuthRadioTransportState = .disconnected
     private var opens = 0
     private var closes = 0
     private var serialNumberByOpen: [Int: String] = [:]
+    private var blockedOpenCall: Int?
+    private var openIsBlocked = false
     private var shouldBlockNextClose = false
     private var blockedCloseContinuation: CheckedContinuation<Void, Never>?
 
-    init(hardwareSerialNumber: String? = "C3C10368") {
+    init(
+        hardwareSerialNumber: String? = "C3C10368",
+        connectionKind: AzimuthRadioConnectionKind = .usb
+    ) {
+        switch connectionKind {
+        case .usb:
+            device = .thD75USBC
+        case .bluetooth:
+            device = AzimuthRadioDevice(
+                id: "bluetooth:00-11-22-33-44-55",
+                name: "Kenwood TH-D75",
+                connectionKind: .bluetooth,
+                connection: "Bluetooth"
+            )
+        }
         serialNumber = hardwareSerialNumber
     }
 
@@ -1019,6 +1612,11 @@ private final class IntegrationTestTransport: AzimuthRadioTransport, @unchecked 
     var openCallCount: Int { lock.withLock { opens } }
     var closeCallCount: Int { lock.withLock { closes } }
     var hasBlockedClose: Bool { lock.withLock { blockedCloseContinuation != nil } }
+    var hasBlockedOpen: Bool { lock.withLock { openIsBlocked } }
+
+    func blockOpen(call: Int) {
+        lock.withLock { blockedOpenCall = call }
+    }
 
     func blockNextClose() {
         lock.withLock { shouldBlockNextClose = true }
@@ -1045,13 +1643,24 @@ private final class IntegrationTestTransport: AzimuthRadioTransport, @unchecked 
     }
 
     func open() async throws {
-        lock.withLock {
+        let shouldBlock = lock.withLock { () -> Bool in
             opens += 1
             if let scheduledSerialNumber = serialNumberByOpen.removeValue(forKey: opens) {
                 serialNumber = scheduledSerialNumber
             }
-            currentState = .connected
+            let shouldBlock = blockedOpenCall == opens
+            if shouldBlock {
+                blockedOpenCall = nil
+                openIsBlocked = true
+                currentState = .connecting
+            }
+            return shouldBlock
         }
+        if shouldBlock {
+            defer { lock.withLock { openIsBlocked = false } }
+            try await Task.sleep(for: .seconds(60))
+        }
+        lock.withLock { currentState = .connected }
     }
 
     func close() async {
@@ -1074,6 +1683,62 @@ private final class IntegrationTestTransport: AzimuthRadioTransport, @unchecked 
     func read(maxBytes: Int) async throws -> [UInt8] { [] }
 }
 
+private final class IntegrationSameRadioTransport:
+    AzimuthRadioTransport, AzimuthSameRadioBluetoothSelecting, @unchecked Sendable
+{
+    private let lock = NSLock()
+    private let base: IntegrationTestTransport
+    private let knownQualifiedAddress: String?
+    private var knownAddressRequests = 0
+    private var usbRecoverySelections = 0
+
+    init(
+        base: IntegrationTestTransport,
+        knownQualifiedAddress: String?
+    ) {
+        self.base = base
+        self.knownQualifiedAddress = knownQualifiedAddress
+    }
+
+    var knownAddressRequestCount: Int {
+        lock.withLock { knownAddressRequests }
+    }
+
+    var usbRecoverySelectionCount: Int {
+        lock.withLock { usbRecoverySelections }
+    }
+
+    var device: AzimuthRadioDevice { base.device }
+    var state: AzimuthRadioTransportState { get async { await base.state } }
+    var stateStream: AsyncStream<AzimuthRadioTransportState> { base.stateStream }
+    var hardwareSerialNumber: String? { get async { base.hardwareSerialNumber } }
+
+    func open() async throws { try await base.open() }
+    func close() async { await base.close() }
+    func setBaudRate(baud: UInt32) throws { try base.setBaudRate(baud: baud) }
+    func write(_ bytes: [UInt8]) async throws { try await base.write(bytes) }
+    func read(maxBytes: Int) async throws -> [UInt8] {
+        try await base.read(maxBytes: maxBytes)
+    }
+
+    func selectBluetoothForSameRadio(expectedSerialNumber: String) async throws {
+        _ = expectedSerialNumber
+    }
+
+    func knownQualifiedBluetoothAddress(
+        expectedSerialNumber: String
+    ) async throws -> String? {
+        _ = expectedSerialNumber
+        lock.withLock { knownAddressRequests += 1 }
+        return knownQualifiedAddress
+    }
+
+    func selectUSBForRecovery(expectedSerialNumber: String) async throws {
+        _ = expectedSerialNumber
+        lock.withLock { usbRecoverySelections += 1 }
+    }
+}
+
 private final class IntegrationTestCore: AutomationControllerProtocol, @unchecked Sendable {
     private let lock = NSLock()
     private var lease: UInt64 = 0
@@ -1085,12 +1750,18 @@ private final class IntegrationTestCore: AutomationControllerProtocol, @unchecke
     private var settingReadCalls = 0
     private var screenCaptureCalls = 0
     private var aprsStopCalls = 0
+    private var aprsStartCalls = 0
+    private let kissInterfaceRawValue: UInt64
     private var aprsStatus = IntegrationTestCore.aprsStatus(
         phase: .inactive,
         configuration: nil
     )
     private var aprsRows: [AprsActivityRecord] = []
     private var pendingAprsStop: CheckedContinuation<AprsSessionStatus, Error>?
+
+    init(kissInterfaceRawValue: UInt64 = 0) {
+        self.kissInterfaceRawValue = kissInterfaceRawValue
+    }
 
     var applyCallCount: Int { lock.withLock { applyCalls } }
     var guardedTapCallCount: Int { lock.withLock { tapCalls } }
@@ -1099,6 +1770,7 @@ private final class IntegrationTestCore: AutomationControllerProtocol, @unchecke
     var settingReadCallCount: Int { lock.withLock { settingReadCalls } }
     var screenCaptureCallCount: Int { lock.withLock { screenCaptureCalls } }
     var stopAprsCallCount: Int { lock.withLock { aprsStopCalls } }
+    var startAprsCallCount: Int { lock.withLock { aprsStartCalls } }
 
     func abi() -> AutomationAbiRecord {
         AutomationAbiRecord(version: 3, features: 0x7F, maxKey: 24, maxPhase: 1)
@@ -1114,7 +1786,16 @@ private final class IntegrationTestCore: AutomationControllerProtocol, @unchecke
             }
             let read = SettingReadResult(
                 snapshotId: previous + 1,
-                values: [SettingValueRecord(settingId: "radio.Beep", value: .boolean(value: beep))]
+                values: [
+                    SettingValueRecord(
+                        settingId: "radio.Beep",
+                        value: .boolean(value: beep)
+                    ),
+                    SettingValueRecord(
+                        settingId: "radio.KissModeInterface",
+                        value: .unsigned(value: kissInterfaceRawValue)
+                    ),
+                ]
             )
             let results = changes.map {
                 SettingChangeResult(settingId: $0.settingId, outcome: .applied, value: $0.desiredValue)
@@ -1156,7 +1837,16 @@ private final class IntegrationTestCore: AutomationControllerProtocol, @unchecke
             settingReadCalls += 1
             return SettingReadResult(
                 snapshotId: 41,
-                values: [SettingValueRecord(settingId: "radio.Beep", value: .boolean(value: beep))]
+                values: [
+                    SettingValueRecord(
+                        settingId: "radio.Beep",
+                        value: .boolean(value: beep)
+                    ),
+                    SettingValueRecord(
+                        settingId: "radio.KissModeInterface",
+                        value: .unsigned(value: kissInterfaceRawValue)
+                    ),
+                ]
             )
         }
     }
@@ -1179,6 +1869,7 @@ private final class IntegrationTestCore: AutomationControllerProtocol, @unchecke
 
     func startAprs(config: AprsSessionConfig) async throws -> AprsSessionStatus {
         lock.withLock {
+            aprsStartCalls += 1
             aprsStatus = Self.aprsStatus(phase: .active, configuration: config)
             aprsRows.append(
                 Self.aprsActivity(

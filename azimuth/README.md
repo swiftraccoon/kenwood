@@ -72,15 +72,18 @@ Kenwood TH-D75.
 - **Physical IF analysis.** On iPadOS, save and read-back-verify the radio state,
   reserve Band B, and capture the real 48 kHz mono `ADC stream IN` feed at the
   current VFO frequency. USB, LSB, CW, and AM processing drives the spectrum,
-  waterfall, passband, level, clipping, and capture-loss views. Direct
-  frequency retuning currently fails closed until a qualified FO/FQ writer is
-  available, and demodulated audio playback remains disabled until a safe
-  non-radio output route is verified.
+  waterfall, passband, level, clipping, and capture-loss views. Bounded
+  retuning uses individually read-back-verified UP/DW steps and restores the
+  original frequency; direct FO/FQ writes remain quarantined. Demodulated
+  audio playback remains disabled until a safe non-radio output route is
+  verified.
 - **Every setting, understandable.** Present the complete 400-record MCP
   catalog with search, direct radio menu numbers where defined, official option
   domains, staged diffs, confirmation, stale-value protection, and read-back
-  verification. The 399 scalar values use the generic live editor; the power-on
-  bitmap remains read-only there until a specialized editor is supplied.
+  verification. The app reads all 399 scalar values; 397 use the generic live
+  editor. The power-on bitmap and disruptive Menu 650/980 settings remain
+  read-only there; disruptive changes are available only through a dedicated
+  lifecycle on platforms where Azimuth can safely own the required transport.
 - **Ask Azimuth.** Use Apple's on-device Foundation Models framework to turn
   natural language into a typed, explainable before-and-after plan. The model
   never emits raw CAT bytes or memory offsets. Azimuth validates every item,
@@ -88,11 +91,23 @@ Kenwood TH-D75.
   through the trusted radio controller only after the operator accepts it.
 - **Learn the D75.** Ship an original, searchable capability guide with
   task-oriented walkthroughs and contextual help.
-- **USB first.** Use USB-C on M-series iPads through USBDriverKit, and the
-  system CDC serial device on macOS. If macOS validates an MMDVM version
-  response on USB-C, Azimuth can offer to use the paired Bluetooth control
-  link to verify the same radio, turn Menu 650 off if needed, and prove USB
-  CAT has returned.
+- **Choose the macOS control link.** Use USB-C on M-series iPads through
+  USBDriverKit. On macOS, choose either the system USB serial device or an exact
+  paired Bluetooth address; Azimuth keeps one CAT/MCP owner active at a time.
+  USB choices are bound to the radio's stable USB descriptor serial, not a
+  reusable `/dev/cu.usbmodem*` pathname, and recovery follows that same radio
+  if its tty path changes after reboot. The ordinary Bluetooth picker shows
+  likely TH-D75 candidates only. On first use, Azimuth asks for macOS Bluetooth
+  access in the foreground before launching its isolated RFCOMM helper; a
+  denial leaves USB-C usable and points to Privacy & Security > Bluetooth. An
+  explicit custom-name search can CAT-probe
+  other paired devices and adds only radios it proves; that probe may exit a
+  transient KISS or MMDVM packet session but does not change persistent menus.
+  If USB-C positively answers as MMDVM, Azimuth first offers a non-destructive
+  handoff to the same radio over Bluetooth. Turning Menu 650 off and returning
+  control to USB remains a separate, explicitly approved operation. iPadOS has
+  no second TH-D75 CAT path while USB-C carries MMDVM, so the app explains the
+  manual recovery instead of presenting a false automatic option.
 
 ## Safety contract
 
@@ -100,12 +115,16 @@ The model cannot touch the radio. It proposes catalog setting identifiers and
 typed values only. Azimuth validates them against the live catalog and retained
 preconditions, presents a concrete diff, and sends nothing unless the operator
 explicitly accepts it. Accepted changes use stale-value checks and verified
-read-back. RF transmission, reset, and firmware workflows remain outside the
-settings planner and require dedicated UI. APRS and IF-DSP temporarily own the
-serial session, so CAT-backed screen and settings operations resume only after
-their stop-and-requalification path succeeds. Azimuth does not change Menu 650
-during connection probing. On macOS it offers the Bluetooth recovery as a
-separate choice only after USB-C has positively answered as MMDVM.
+post-exit read-back. Menu 650, Menu 980, RF transmission, reset, and firmware
+workflows remain outside the generic settings planner and require dedicated UI.
+APRS and IF-DSP temporarily own the serial session, so CAT-backed screen and
+settings operations resume only after their stop-and-requalification path
+succeeds. Azimuth does not change Menu 650 during connection probing. On macOS,
+using Bluetooth without changing the radio and turning Menu 650 off to restore
+USB are separate choices shown only after USB-C has positively answered as
+MMDVM. Starting APRS also verifies that Menu 983 routes KISS to the selected
+USB-C or Bluetooth control link; a mismatch stops before packet-mode entry and
+is never changed silently.
 
 ## Development
 
@@ -123,3 +142,12 @@ selection blocker instead of analyzing the wrong input.
 Lifecycle, recovery, and failure diagnostics are logged by default. Set the
 scheme environment variable `AZIMUTH_VERBOSE_USB_TRACE=1` when packet-by-packet
 core, transport, and doorbell tracing is needed.
+
+Hardware acceptance tests are opt-in. On a physical iPad with the radio already
+in DV Gateway/MMDVM mode, set `AZIMUTH_HARDWARE_IPAD_MMDVM_PROMPT=1` to verify
+that ordinary connection stops at the recovery prompt without constructing or
+running a Menu 650 operation. macOS Bluetooth-primary and destructive recovery
+tests use `AZIMUTH_HARDWARE_BLUETOOTH_PRIMARY=1` and
+`AZIMUTH_HARDWARE_BLUETOOTH_RECOVERY=1` respectively; see
+`AzimuthCATRecoveryPromptHardwareTests` and
+`AzimuthCATRecoveryHardwareTests` for the required variables.

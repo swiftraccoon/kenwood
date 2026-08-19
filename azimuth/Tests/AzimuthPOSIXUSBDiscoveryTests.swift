@@ -135,6 +135,23 @@ final class AzimuthPOSIXUSBDiscoveryTests: XCTestCase {
         )))
     }
 
+    func testUSBEndpointIdentityUsesDescriptorSerialWithPathFallback() {
+        XCTAssertEqual(
+            AzimuthUSBEndpoint.stableID(
+                devicePath: "/dev/cu.usbmodem101",
+                usbSerialNumber: "C0000001"
+            ),
+            "usb:serial:C0000001"
+        )
+        XCTAssertEqual(
+            AzimuthUSBEndpoint.stableID(
+                devicePath: "/dev/cu.usbmodem101",
+                usbSerialNumber: nil
+            ),
+            "tty:/dev/cu.usbmodem101"
+        )
+    }
+
     func testOpenBindingPublishesOnlyStableRegistryAndNodeIdentity() throws {
         let fixture = POSIXOpenFixture()
 
@@ -147,6 +164,39 @@ final class AzimuthPOSIXUSBDiscoveryTests: XCTestCase {
         XCTAssertEqual(opened.path, fixture.path)
         XCTAssertEqual(opened.identity.serialNumber, "C0000001")
         XCTAssertEqual(fixture.configureCallCount, 1)
+        XCTAssertTrue(fixture.closedFileDescriptors.isEmpty)
+    }
+
+    func testExactEndpointRejectsDifferentRadioAtReusedPathBeforeOpen() {
+        let fixture = POSIXOpenFixture()
+        fixture.registeredDevices = [
+            .init(
+                identity: .init(
+                    vendorID: POSIXAzimuthUSBSerialLink.thD75VendorID,
+                    productID: POSIXAzimuthUSBSerialLink.thD75ProductID,
+                    serialNumber: "C0000002"
+                ),
+                registryEntryID: 0xBEEF
+            ),
+        ]
+        let link = POSIXAzimuthUSBSerialLink(
+            devicePath: fixture.path,
+            expectedSerialNumber: "C0000001",
+            openSystemAccess: fixture.access()
+        )
+
+        XCTAssertThrowsError(try link.open()) { error in
+            XCTAssertEqual(
+                error as? AzimuthUSBLinkError,
+                .openedDeviceSerialMismatch(
+                    path: fixture.path,
+                    expected: "C0000001",
+                    actual: "C0000002"
+                )
+            )
+        }
+        XCTAssertEqual(fixture.openFileDescriptorCallCount, 0)
+        XCTAssertEqual(fixture.configureCallCount, 0)
         XCTAssertTrue(fixture.closedFileDescriptors.isEmpty)
     }
 
@@ -376,6 +426,7 @@ private final class POSIXOpenFixture {
     var fileDescriptorNode: POSIXAzimuthUSBSerialLink.OpenedDeviceNode
     var pathNodes: [POSIXAzimuthUSBSerialLink.OpenedDeviceNode]
     var configurationError: AzimuthUSBLinkError?
+    var openFileDescriptorCallCount = 0
     var configureCallCount = 0
     var closedFileDescriptors: [Int32] = []
     var closeRealFileDescriptor = false
@@ -405,7 +456,10 @@ private final class POSIXOpenFixture {
                 guard !self.registeredDevices.isEmpty else { return nil }
                 return self.registeredDevices.removeFirst()
             },
-            openFileDescriptor: { _ in self.fileDescriptor },
+            openFileDescriptor: { _ in
+                self.openFileDescriptorCallCount += 1
+                return self.fileDescriptor
+            },
             nodeForFileDescriptor: { _ in self.fileDescriptorNode },
             nodeForPath: { _ in
                 guard !self.pathNodes.isEmpty else {

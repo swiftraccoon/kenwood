@@ -65,11 +65,16 @@ final class IFDSPWorkspaceTests: XCTestCase {
         XCTAssertEqual(image.bitsPerPixel, 32)
     }
 
-    func testOperationalFrequencyEntryRequiresARepresentableFiveKilohertzStep() {
+    func testOperationalFrequencyEntryRequiresQualifiedBandBRangesAndFiveKilohertzSteps() {
         XCTAssertEqual(IFDSPFrequencyEntry.frequencyHz(fromMHz: "145.500"), 145_500_000)
         XCTAssertEqual(IFDSPFrequencyEntry.frequencyHz(fromMHz: " 433.925 "), 433_925_000)
         XCTAssertEqual(IFDSPFrequencyEntry.frequencyHz(fromMHz: "0.100"), 100_000)
+        XCTAssertEqual(IFDSPFrequencyEntry.frequencyHz(fromMHz: "75.995"), 75_995_000)
+        XCTAssertEqual(IFDSPFrequencyEntry.frequencyHz(fromMHz: "108.000"), 108_000_000)
         XCTAssertEqual(IFDSPFrequencyEntry.frequencyHz(fromMHz: "523.995"), 523_995_000)
+        XCTAssertNil(IFDSPFrequencyEntry.frequencyHz(fromMHz: "76.000"))
+        XCTAssertNil(IFDSPFrequencyEntry.frequencyHz(fromMHz: "100.000"))
+        XCTAssertNil(IFDSPFrequencyEntry.frequencyHz(fromMHz: "107.995"))
         XCTAssertNil(IFDSPFrequencyEntry.frequencyHz(fromMHz: "145.502"))
         XCTAssertNil(IFDSPFrequencyEntry.frequencyHz(fromMHz: "524.000"))
         XCTAssertNil(IFDSPFrequencyEntry.frequencyHz(fromMHz: "not a frequency"))

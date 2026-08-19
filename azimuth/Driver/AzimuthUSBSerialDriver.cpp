@@ -77,6 +77,7 @@ enum AzimuthEvent : uint32_t {
     kEventBulkInSubmit = 21,
     kEventBulkInComplete = 22,
     kEventSessionControlClear = 23,
+    kEventRxSessionReset = 24,
 };
 }
 
@@ -113,6 +114,10 @@ struct AzimuthUSBSerialDriver_IVars
 
     bool linkUp = false;
     bool stopping = false;
+    // Bulk IN belongs to an attached app session. The dext itself can outlive
+    // several user clients, but a pending read must never cross that boundary.
+    bool rxSessionActive = false;
+    bool rxInFlight = false;
     uint32_t inErrorStreak = 0;
     uint32_t baudRate = 115200;
 
@@ -150,11 +155,89 @@ static void LinkFailed(AzimuthUSBSerialDriver_IVars *ivars,
     Log("link failed: %s", why);
     LogEvent(ivars, kEventLinkFailed, 0, reason, 0);
     ivars->linkUp = false;
+    // A completion already queued by DriverKit may still arrive. It may log
+    // its terminal result, but it must not copy or re-arm for a dead session.
+    ivars->rxSessionActive = false;
     if (ivars->doorbell && ivars->userClient) {
         LogEvent(ivars, kEventDoorbellFired, kIOReturnAborted, 0, 0);
         ivars->userClient->FireDoorbell(ivars->doorbell, kIOReturnAborted);
     }
     OSSafeReleaseNULL(ivars->doorbell);
+}
+
+/// Submit the sole bulk-IN request owned by the current app session.
+///
+/// Flight state is established before AsyncIO so a reentrant completion cannot
+/// be overwritten after it has already submitted the next request.
+static kern_return_t SubmitClientRx(
+    AzimuthUSBSerialDriver_IVars *ivars,
+    uint64_t stage)
+{
+    if (!ivars->linkUp || !ivars->rxSessionActive) {
+        return kIOReturnNotAttached;
+    }
+    if (ivars->rxInFlight) return kIOReturnBusy;
+    if (!ivars->inPipe || !ivars->inBuffer || !ivars->inAction) {
+        return kIOReturnNotAttached;
+    }
+
+    kern_return_t result = ivars->inBuffer->SetLength(kInBufferSize);
+    if (result == kIOReturnSuccess) {
+        ivars->rxInFlight = true;
+        result = ivars->inPipe->AsyncIO(
+            ivars->inBuffer, kInBufferSize, ivars->inAction, 0);
+        if (result != kIOReturnSuccess) ivars->rxInFlight = false;
+    }
+    LogEvent(ivars, kEventBulkInSubmit, result, stage, kInBufferSize);
+    return result;
+}
+
+static uint64_t ClearClientRxState(AzimuthUSBSerialDriver_IVars *ivars)
+{
+    const uint64_t discarded = RxCount(ivars);
+    ivars->rxHead = 0;
+    ivars->rxTail = 0;
+    ivars->rxOverflow = 0;
+    ivars->inErrorStreak = 0;
+    return discarded;
+}
+
+/// End the old app's receive session before its user client can disappear.
+/// Setting rxSessionActive false before synchronous Abort is the completion
+/// gate: the aborted callback can neither copy stale bytes nor re-arm itself.
+static kern_return_t ResetClientRx(AzimuthUSBSerialDriver_IVars *ivars)
+{
+    const bool wasInFlight = ivars->rxInFlight;
+    ivars->rxSessionActive = false;
+
+    kern_return_t result = kIOReturnSuccess;
+    if (wasInFlight) {
+        if (!ivars->inPipe) {
+            result = kIOReturnNotAttached;
+        } else {
+            result = ivars->inPipe->Abort(
+                kIOUSBAbortSynchronous, kIOReturnAborted, nullptr);
+        }
+        if (result == kIOReturnSuccess) ivars->rxInFlight = false;
+    }
+
+    const uint64_t discarded = ClearClientRxState(ivars);
+    LogEvent(ivars, kEventRxSessionReset, result,
+             discarded, wasInFlight ? 1 : 0);
+    if (result != kIOReturnSuccess) {
+        LinkFailed(ivars, "bulk-IN session reset failed", 12);
+    }
+    return result;
+}
+
+static kern_return_t StartClientRx(AzimuthUSBSerialDriver_IVars *ivars)
+{
+    if (ivars->rxInFlight || ivars->rxSessionActive) return kIOReturnBusy;
+    ClearClientRxState(ivars);
+    ivars->rxSessionActive = true;
+    const kern_return_t result = SubmitClientRx(ivars, 0);
+    if (result != kIOReturnSuccess) ivars->rxSessionActive = false;
+    return result;
 }
 
 /// Submit one FIFO chunk. Flight state is established before AsyncIO so even a
@@ -326,11 +409,11 @@ static kern_return_t PrepareClientSerialSession(
     const kern_return_t lineResult = ApplyBaudRate(ivars, ivars->baudRate);
     LogEvent(ivars, kEventSessionLineCoding, lineResult,
              ivars->baudRate, 0);
+    if (lineResult != kIOReturnSuccess) return lineResult;
 
     const kern_return_t setResult = ApplyControlLineState(ivars, kCDCDTRRTS);
     LogEvent(ivars, kEventSessionControlSet, setResult, kCDCDTRRTS, 0);
 
-    if (lineResult != kIOReturnSuccess) return lineResult;
     if (setResult != kIOReturnSuccess) return setResult;
 
     // Give the radio's CDC firmware a bounded interval to consume the control
@@ -360,6 +443,9 @@ kern_return_t IMPL(AzimuthUSBSerialDriver, Start)
     ivars->txLength = 0;
     ivars->txInFlight = false;
     ivars->txExpectedLength = 0;
+    ivars->rxSessionActive = false;
+    ivars->rxInFlight = false;
+    ClearClientRxState(ivars);
     ivars->baudRate = 115200;
 
     ivars->interface = OSDynamicCast(IOUSBHostInterface, provider);
@@ -522,16 +608,8 @@ kern_return_t IMPL(AzimuthUSBSerialDriver, Start)
     LogEvent(ivars, kEventStartControlLine, result,
              kCDCControlLinesClosed, 0);
 
-    result = ivars->inPipe->AsyncIO(
-        ivars->inBuffer, kInBufferSize, ivars->inAction, 0);
-    LogEvent(ivars, kEventBulkInSubmit, result, 0, kInBufferSize);
-    if (result != kIOReturnSuccess) {
-        LogEvent(ivars, kEventStartFailed, result, 12, 0);
-        ReleaseHardware(this, ivars, true);
-        Stop(provider, SUPERDISPATCH);
-        return result;
-    }
-
+    // Do not arm bulk IN while the serial session is closed. The first app
+    // client applies line coding, asserts DTR|RTS, and then owns a fresh read.
     ivars->linkUp = true;
     result = RegisterService();
     if (result != kIOReturnSuccess) {
@@ -549,10 +627,13 @@ kern_return_t IMPL(AzimuthUSBSerialDriver, Start)
 kern_return_t IMPL(AzimuthUSBSerialDriver, Stop)
 {
     ivars->stopping = true;
+    ivars->rxSessionActive = false;
     ivars->txLength = 0;
     if (ivars->inPipe) {
         ivars->inPipe->Abort(kIOUSBAbortSynchronous, kIOReturnAborted, nullptr);
     }
+    ivars->rxInFlight = false;
+    ClearClientRxState(ivars);
     if (ivars->outPipe) {
         ivars->outPipe->Abort(kIOUSBAbortSynchronous, kIOReturnAborted, nullptr);
     }
@@ -570,7 +651,14 @@ void IMPL(AzimuthUSBSerialDriver, BulkInComplete)
     (void)completionTimestamp;
     LogEvent(ivars, kEventBulkInComplete, status,
              actualByteCount, ivars->inErrorStreak);
-    if (status == kIOReturnAborted || ivars->stopping) return;
+    ivars->rxInFlight = false;
+    if (ivars->stopping || !ivars->rxSessionActive) {
+        return;
+    }
+    if (status == kIOReturnAborted) {
+        LinkFailed(ivars, "unexpected bulk-IN abort", 13);
+        return;
+    }
 
     if (status != kIOReturnSuccess) {
         ivars->inErrorStreak++;
@@ -581,9 +669,7 @@ void IMPL(AzimuthUSBSerialDriver, BulkInComplete)
             return;
         }
         ivars->inPipe->ClearStall(true);
-        const kern_return_t rearmResult = ivars->inPipe->AsyncIO(
-            ivars->inBuffer, kInBufferSize, ivars->inAction, 0);
-        LogEvent(ivars, kEventBulkInSubmit, rearmResult, 2, kInBufferSize);
+        const kern_return_t rearmResult = SubmitClientRx(ivars, 2);
         if (rearmResult != kIOReturnSuccess) {
             LinkFailed(ivars, "bulk-IN re-arm after stall", 3);
         }
@@ -615,9 +701,7 @@ void IMPL(AzimuthUSBSerialDriver, BulkInComplete)
         }
     }
 
-    const kern_return_t rearmResult = ivars->inPipe->AsyncIO(
-        ivars->inBuffer, kInBufferSize, ivars->inAction, 0);
-    LogEvent(ivars, kEventBulkInSubmit, rearmResult, 1, kInBufferSize);
+    const kern_return_t rearmResult = SubmitClientRx(ivars, 1);
     if (rearmResult != kIOReturnSuccess) {
         LinkFailed(ivars, "bulk-IN re-arm", 4);
     }
@@ -738,6 +822,11 @@ kern_return_t AzimuthUSBSerialDriver::RegisterDoorbell(
                     ivars->doorbell, kIOReturnAborted);
                 OSSafeReleaseNULL(ivars->doorbell);
             }
+            kern_return_t rxResetResult = kIOReturnSuccess;
+            if (ivars->rxSessionActive || ivars->rxInFlight
+                || RxCount(ivars) > 0) {
+                rxResetResult = ResetClientRx(ivars);
+            }
             uint64_t activeBytes = 0;
             uint64_t queuedBytes = 0;
             const kern_return_t resetResult = ResetClientTx(
@@ -745,13 +834,24 @@ kern_return_t AzimuthUSBSerialDriver::RegisterDoorbell(
             ivars->userClient = client;
             LogEvent(ivars, kEventClientAttach, resetResult,
                      activeBytes, queuedBytes);
-            if (resetResult != kIOReturnSuccess) {
+            if (rxResetResult != kIOReturnSuccess) {
+                result = rxResetResult;
+            } else if (resetResult != kIOReturnSuccess) {
                 result = resetResult;
             } else {
                 result = PrepareClientSerialSession(ivars);
+                if (result == kIOReturnSuccess) {
+                    result = StartClientRx(ivars);
+                }
             }
         }
         if (result != kIOReturnSuccess) {
+            if (ivars->interface && !ivars->stopping) {
+                const kern_return_t clearResult = ApplyControlLineState(
+                    ivars, kCDCControlLinesClosed);
+                LogEvent(ivars, kEventSessionControlClear, clearResult,
+                         kCDCControlLinesClosed, 0);
+            }
             action->release();
             LinkFailed(ivars, "client serial session preparation failed", 11);
             return;
@@ -787,13 +887,15 @@ void AzimuthUSBSerialDriver::UnregisterUserClient(AzimuthUserClient *client)
             ivars->userClient->FireDoorbell(ivars->doorbell, kIOReturnAborted);
             OSSafeReleaseNULL(ivars->doorbell);
         }
+        const kern_return_t rxResetResult = ResetClientRx(ivars);
         uint64_t activeBytes = 0;
         uint64_t queuedBytes = 0;
         const kern_return_t resetResult = ResetClientTx(
             ivars, &activeBytes, &queuedBytes);
         LogEvent(ivars, kEventClientDetach, resetResult,
                  activeBytes, queuedBytes);
-        if (resetResult == kIOReturnSuccess
+        if (rxResetResult == kIOReturnSuccess
+            && resetResult == kIOReturnSuccess
             && ivars->linkUp
             && !ivars->stopping) {
             const kern_return_t clearResult = ApplyControlLineState(

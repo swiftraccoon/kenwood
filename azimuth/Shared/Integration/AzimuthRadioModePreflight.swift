@@ -23,13 +23,40 @@ enum AzimuthRadioModePreflightError: LocalizedError, Sendable, Equatable {
     var errorDescription: String? {
         switch self {
         case .transportClosed(let stage):
-            return "The TH-D75 USB-C connection closed during \(stage)."
+            return "The TH-D75 connection closed during \(stage)."
         case .usbMmdvmMode:
-            return "The TH-D75 USB-C interface returned a valid MMDVM response, so CAT control is unavailable on that interface."
+            return "After Azimuth sent the TH-D75 packet-mode exit sequence, the USB-C interface returned a valid MMDVM response, so CAT control is unavailable on that interface after recovery."
         case .cdcUnresponsive:
-            return "Azimuth reopened the TH-D75 USB-C control session once and retried after a CDC control-line reset, but the radio did not answer. Power-cycle the radio, confirm Menu 980 is COM + AF/IF Output, then reconnect USB-C."
+            return "Azimuth sent the TH-D75 packet-mode exit sequence, then retried after a CDC control-line reset and one USB-C control-session reopen, but the radio did not answer. Power-cycle the radio, confirm Menu 980 is COM + AF/IF Output, then reconnect USB-C."
         }
     }
+}
+
+struct AzimuthPacketModeRecoveryTiming: Sendable {
+    let initialFlushDelay: Duration
+    let kissReturnDelay: Duration
+    let tncExitDelay: Duration
+    let finalSettleDelay: Duration
+    let quietWindow: Duration
+    let residueDrainLimit: Duration
+
+    static let radio = Self(
+        initialFlushDelay: .milliseconds(300),
+        kissReturnDelay: .milliseconds(100),
+        tncExitDelay: .milliseconds(100),
+        finalSettleDelay: .milliseconds(300),
+        quietWindow: .milliseconds(500),
+        residueDrainLimit: .seconds(5)
+    )
+
+    static let immediate = Self(
+        initialFlushDelay: .zero,
+        kissReturnDelay: .zero,
+        tncExitDelay: .zero,
+        finalSettleDelay: .zero,
+        quietWindow: .zero,
+        residueDrainLimit: .zero
+    )
 }
 
 /// Establishes a known wire mode and a clean CAT command boundary before the
@@ -37,121 +64,196 @@ enum AzimuthRadioModePreflightError: LocalizedError, Sendable, Equatable {
 struct AzimuthRadioModePreflight: Sendable {
     private static let getVersionProbe: [UInt8] = [0xE0, 0x03, 0x00]
     private static let carriageReturn: [UInt8] = [0x0D]
+    private static let endTransmission: [UInt8] = [0x03]
+    private static let kissReturn: [UInt8] = [0xC0, 0xFF, 0xC0]
+    private static let tncExit: [UInt8] = Array("\rTC 1\r".utf8)
+    private static let packetModeExit: [UInt8] = Array("TN 0,0\r".utf8)
+    private static let identifyProbe: [UInt8] = Array("ID\r".utf8)
 
     let transport: any AzimuthRadioTransport
     let probeTimeout: Duration
-    let parserResetTimeout: Duration
+    let catIdentityTimeout: Duration
+    let packetModeRecoveryTiming: AzimuthPacketModeRecoveryTiming
 
     init(
         transport: any AzimuthRadioTransport,
         probeTimeout: Duration = .seconds(2),
-        parserResetTimeout: Duration = .milliseconds(300)
+        catIdentityTimeout: Duration = .seconds(2),
+        packetModeRecoveryTiming: AzimuthPacketModeRecoveryTiming = .radio
     ) {
         self.transport = transport
         self.probeTimeout = probeTimeout
-        self.parserResetTimeout = parserResetTimeout
+        self.catIdentityTimeout = catIdentityTimeout
+        self.packetModeRecoveryTiming = packetModeRecoveryTiming
     }
 
     func prepareForAutomation() async throws -> AzimuthRadioWireMode {
-        azimuthRadioModeLog.notice("[Azimuth Radio] Mode probe started")
-        try await transport.write(Self.getVersionProbe)
+        azimuthRadioModeLog.notice("[Azimuth Radio] Packet-mode recovery started")
 
-        var observation = WireObservationAccumulator()
-        var probeByteCount = 0
-        let probeDeadline = ContinuousClock.now.advanced(by: probeTimeout)
-
-        probeLoop: while ContinuousClock.now < probeDeadline {
-            guard let chunk = try await readChunk(maxBytes: 64, deadline: probeDeadline) else {
-                break
-            }
-            guard !chunk.isEmpty else {
-                throw AzimuthRadioModePreflightError.transportClosed(
-                    stage: "radio mode detection"
-                )
-            }
-            probeByteCount += chunk.count
-
-            switch observation.ingest(chunk) {
-            case .mmdvm(let frameByteCount):
-                logMMDVM(frameByteCount: frameByteCount)
-                return .mmdvm
-            case .catLine:
-                // This line may be the binary probe's rejection or stale CAT
-                // output. It is useful only as a reason to reset promptly.
-                // CAT is not proved until a complete line arrives after that
-                // reset write.
-                break probeLoop
-            case .none:
-                continue
-            }
-        }
-        try Task.checkCancellation()
-
-        if probeByteCount == 0 {
-            azimuthRadioModeLog.info(
-                "[Azimuth Radio] Mode probe was silent; resetting CAT parser"
-            )
-        } else {
-            azimuthRadioModeLog.info(
-                "[Azimuth Radio] Mode probe received \(probeByteCount, privacy: .public) unclassified bytes; resetting CAT parser"
-            )
-        }
-
-        // The binary probe has no CR. On a CAT link, a bare CR terminates that
-        // partial command and the TH-D75 answers with a complete CAT error
-        // line. Start CAT framing at this write, but retain the MMDVM scanner:
-        // a delayed GET_VERSION frame can arrive during the reset window.
-        observation.resetCATLineFraming()
+        // Recover the USB control channel before classifying it. KISS ignores
+        // the ASCII commands, so its protocol-defined Return frame is
+        // required. `TN 0,0` also exits a transient MMDVM mode selected by the
+        // TNC command. Persistent DV Gateway mode ignores this sequence and is
+        // identified by the fresh MMDVM probe after CAT identity fails. This
+        // ordering matches the Rust radio connection path and prevents a
+        // recoverable transient MMDVM session from being mistaken for Menu 650.
         try await transport.write(Self.carriageReturn)
+        try await transport.write(Self.carriageReturn)
+        try await sleepForRecovery(packetModeRecoveryTiming.initialFlushDelay)
+        try await transport.write(Self.endTransmission)
+        try await transport.write(Self.kissReturn)
+        try await sleepForRecovery(packetModeRecoveryTiming.kissReturnDelay)
+        try await transport.write(Self.tncExit)
+        try await sleepForRecovery(packetModeRecoveryTiming.tncExitDelay)
+        try await transport.write(Self.packetModeExit)
+        try await sleepForRecovery(packetModeRecoveryTiming.finalSettleDelay)
 
-        let resetDeadline = ContinuousClock.now.advanced(by: parserResetTimeout)
+        // Starting modes produce different residue. Drain every queued chunk
+        // and require one complete quiet window, subject to a hard wall-clock
+        // limit. No bytes from this drain can classify the recovered mode.
+        guard try await drainRecoveryResidue() else {
+            azimuthRadioModeLog.error(
+                "[Azimuth Radio] Packet-mode recovery residue did not become quiet within the bounded drain"
+            )
+            return .unresponsive
+        }
+
+        // Accept CAT only after one fresh, isolated exact identity response.
+        var identity = StrictCATIdentityAccumulator()
+        try await transport.write(Self.identifyProbe)
+
+        let resetDeadline = ContinuousClock.now.advanced(by: catIdentityTimeout)
         var resetByteCount = 0
-        var sawCompleteCATLine = false
-        while ContinuousClock.now < resetDeadline {
+        catProbeLoop: while ContinuousClock.now < resetDeadline {
             guard let chunk = try await readChunk(maxBytes: 64, deadline: resetDeadline) else {
                 break
             }
             guard !chunk.isEmpty else {
-                throw AzimuthRadioModePreflightError.transportClosed(stage: "CAT parser reset")
+                throw AzimuthRadioModePreflightError.transportClosed(stage: "CAT identity probe")
             }
             resetByteCount += chunk.count
 
-            switch observation.ingest(chunk) {
-            case .mmdvm(let frameByteCount):
-                logMMDVM(frameByteCount: frameByteCount)
-                return .mmdvm
-            case .catLine:
-                sawCompleteCATLine = true
-            case .none:
+            switch identity.ingest(chunk) {
+            case .identity:
+                guard try await requirePostIdentityQuiet() else {
+                    azimuthRadioModeLog.error(
+                        "[Azimuth Radio] CAT identity response was followed by unexpected bytes"
+                    )
+                    break catProbeLoop
+                }
+                azimuthRadioModeLog.info(
+                    "[Azimuth Radio] CAT identity probe received \(resetByteCount, privacy: .public) bytes"
+                )
+                azimuthRadioModeLog.notice(
+                    "[Azimuth Radio] Mode probe classified CAT; TH-D75 identity confirmed"
+                )
+                return .cat
+            case .invalid:
+                // A rejection, stale prefix, another identity, or trailing
+                // data violates the isolated proof. Do not accept a later
+                // identity from the same exchange.
+                break
+            case .incomplete:
+                break
+            }
+            if identity.isInvalid {
                 break
             }
         }
         try Task.checkCancellation()
 
         azimuthRadioModeLog.info(
-            "[Azimuth Radio] CAT parser reset drained \(resetByteCount, privacy: .public) bytes"
+            "[Azimuth Radio] CAT identity probe received \(resetByteCount, privacy: .public) bytes"
         )
 
-        // An E0 sync without a complete, validated GET_VERSION frame is an
-        // unresolved binary boundary. Do not reinterpret a later printable
-        // suffix as CAT.
-        guard sawCompleteCATLine, !observation.sawMMDVMSync else {
-            azimuthRadioModeLog.error(
-                "[Azimuth Radio] Mode probe did not produce a complete, unambiguous CAT or MMDVM response"
-            )
-            return .unresponsive
+        // CAT did not answer after transient packet-mode recovery. Start a
+        // new binary accumulator and require a response to a fresh probe, so
+        // pre-recovery MMDVM residue cannot authorize the disruptive Menu 650
+        // recovery prompt.
+        var observation = WireObservationAccumulator()
+        azimuthRadioModeLog.notice("[Azimuth Radio] MMDVM mode probe started")
+        try await transport.write(Self.getVersionProbe)
+
+        let probeDeadline = ContinuousClock.now.advanced(by: probeTimeout)
+        var probeByteCount = 0
+        while ContinuousClock.now < probeDeadline {
+            guard let chunk = try await readChunk(maxBytes: 64, deadline: probeDeadline) else {
+                break
+            }
+            guard !chunk.isEmpty else {
+                throw AzimuthRadioModePreflightError.transportClosed(
+                    stage: "MMDVM mode detection"
+                )
+            }
+            probeByteCount += chunk.count
+
+            if case .mmdvm(let frameByteCount) = observation.ingest(chunk) {
+                logMMDVM(frameByteCount: frameByteCount)
+                return .mmdvm
+            }
         }
+        try Task.checkCancellation()
 
-        azimuthRadioModeLog.notice(
-            "[Azimuth Radio] Mode probe classified CAT; parser reset complete"
+        azimuthRadioModeLog.info(
+            "[Azimuth Radio] MMDVM mode probe received \(probeByteCount, privacy: .public) bytes"
         )
-        return .cat
+
+        azimuthRadioModeLog.error(
+            "[Azimuth Radio] Mode probe did not produce a complete, unambiguous CAT or MMDVM response"
+        )
+        return .unresponsive
     }
 
     private func logMMDVM(frameByteCount: Int) {
         azimuthRadioModeLog.notice(
             "[Azimuth Radio] Mode probe classified MMDVM (\(frameByteCount, privacy: .public) validated response bytes)"
         )
+    }
+
+    private func sleepForRecovery(_ duration: Duration) async throws {
+        guard duration != .zero else { return }
+        try await Task.sleep(for: duration)
+    }
+
+    /// Returns true only after one complete quiet window. Each received chunk
+    /// restarts that window, while the independent hard limit bounds an active
+    /// or hostile stream.
+    private func drainRecoveryResidue() async throws -> Bool {
+        let quietWindow = packetModeRecoveryTiming.quietWindow
+        guard quietWindow != .zero else { return true }
+
+        let drainDeadline = ContinuousClock.now.advanced(
+            by: packetModeRecoveryTiming.residueDrainLimit
+        )
+        while ContinuousClock.now < drainDeadline {
+            let quietDeadline = ContinuousClock.now.advanced(by: quietWindow)
+            let canWaitForFullQuietWindow = quietDeadline <= drainDeadline
+            let readDeadline = canWaitForFullQuietWindow ? quietDeadline : drainDeadline
+            guard let chunk = try await readChunk(maxBytes: 4096, deadline: readDeadline) else {
+                return canWaitForFullQuietWindow
+            }
+            guard !chunk.isEmpty else {
+                throw AzimuthRadioModePreflightError.transportClosed(
+                    stage: "packet-mode recovery"
+                )
+            }
+        }
+        return false
+    }
+
+    private func requirePostIdentityQuiet() async throws -> Bool {
+        let quietWindow = packetModeRecoveryTiming.quietWindow
+        guard quietWindow != .zero else { return true }
+        let deadline = ContinuousClock.now.advanced(by: quietWindow)
+        guard let chunk = try await readChunk(maxBytes: 1, deadline: deadline) else {
+            return true
+        }
+        guard !chunk.isEmpty else {
+            throw AzimuthRadioModePreflightError.transportClosed(
+                stage: "post-identity quiet check"
+            )
+        }
+        return false
     }
 
     private func readChunk(
@@ -177,16 +279,13 @@ struct AzimuthRadioModePreflight: Sendable {
 
 private enum WireObservation {
     case none
-    case catLine
     case mmdvm(frameByteCount: Int)
 }
 
-/// Carries framing state across the GET_VERSION probe and CAT reset.
+/// Carries framing state across reads from one fresh MMDVM probe.
 ///
 /// MMDVM recognition scans every possible sync position, so stale bytes and
 /// an invalid earlier candidate cannot hide a later valid GET_VERSION frame.
-/// CAT framing can be reset independently, while an unresolved MMDVM sync is
-/// retained to keep partial binary input from being reinterpreted as ASCII.
 private struct WireObservationAccumulator {
     private static let mmdvmSync: UInt8 = 0xE0
     private static let getVersionCommand: UInt8 = 0x00
@@ -194,18 +293,8 @@ private struct WireObservationAccumulator {
     private static let thD75DescriptionPrefix = Array("TH-D75 ".utf8)
 
     private var mmdvmBytes: [UInt8] = []
-    private var catLines = CATLineScanner()
-    private(set) var sawMMDVMSync = false
-
-    mutating func resetCATLineFraming() {
-        catLines = CATLineScanner()
-    }
 
     mutating func ingest(_ bytes: [UInt8]) -> WireObservation {
-        if bytes.contains(Self.mmdvmSync) {
-            sawMMDVMSync = true
-        }
-
         mmdvmBytes.append(contentsOf: bytes)
         if let frameByteCount = Self.validMMDVMVersionFrameLength(in: mmdvmBytes) {
             return .mmdvm(frameByteCount: frameByteCount)
@@ -216,8 +305,7 @@ private struct WireObservationAccumulator {
         if mmdvmBytes.count > Self.maximumMMDVMFrameLength {
             mmdvmBytes.removeFirst(mmdvmBytes.count - Self.maximumMMDVMFrameLength)
         }
-
-        return catLines.ingest(bytes) ? .catLine : .none
+        return .none
     }
 
     private static func validMMDVMVersionFrameLength(in bytes: [UInt8]) -> Int? {
@@ -274,62 +362,29 @@ private struct WireObservationAccumulator {
     }
 }
 
-/// Minimal CAT line framing and lexical validation for mode proof.
-///
-/// CAT frames are printable ASCII terminated by CR. The two-character
-/// mnemonic form and the protocol's one-byte `?` and `N` responses are
-/// accepted. NMEA sentences, arbitrary binary bytes, partial lines, and an
-/// empty CR are not CAT proof.
-private struct CATLineScanner {
-    private static let maximumLineLength = 64 * 1024
+/// Requires the complete response stream to be exactly `ID TH-D75\r`.
+/// A valid identity after any leading or trailing byte is not fresh isolated
+/// proof and must not authorize the strict automation core.
+private struct StrictCATIdentityAccumulator {
+    private static let expected = Array("ID TH-D75\r".utf8)
 
-    private var line: [UInt8] = []
-    private var overflowed = false
+    private var bytes: [UInt8] = []
+    private(set) var isInvalid = false
 
-    mutating func ingest(_ bytes: [UInt8]) -> Bool {
-        var foundValidLine = false
-        for byte in bytes {
-            if byte == 0x0D {
-                if !overflowed, Self.isValidCATLine(line) {
-                    foundValidLine = true
-                }
-                line.removeAll(keepingCapacity: true)
-                overflowed = false
-                continue
-            }
-
-            // NMEA uses CRLF. The shared CAT codec skips the LF residue at a
-            // frame boundary, so mirror that behavior here.
-            if byte == 0x0A, line.isEmpty {
-                continue
-            }
-            guard !overflowed else { continue }
-            guard line.count < Self.maximumLineLength else {
-                line.removeAll(keepingCapacity: true)
-                overflowed = true
-                continue
-            }
-            line.append(byte)
+    mutating func ingest(_ chunk: [UInt8]) -> StrictCATIdentityObservation {
+        guard !isInvalid else { return .invalid }
+        bytes.append(contentsOf: chunk)
+        guard bytes.count <= Self.expected.count,
+              Self.expected.starts(with: bytes) else {
+            isInvalid = true
+            return .invalid
         }
-        return foundValidLine
+        return bytes == Self.expected ? .identity : .incomplete
     }
+}
 
-    private static func isValidCATLine(_ bytes: [UInt8]) -> Bool {
-        if bytes == [UInt8(ascii: "?")] || bytes == [UInt8(ascii: "N")] {
-            return true
-        }
-        guard bytes.count >= 2,
-              bytes.allSatisfy({ (0x20 ... 0x7E).contains($0) }),
-              isMnemonicByte(bytes[0]),
-              isMnemonicByte(bytes[1]),
-              bytes.count == 2 || bytes[2] == UInt8(ascii: " ") else {
-            return false
-        }
-        return true
-    }
-
-    private static func isMnemonicByte(_ byte: UInt8) -> Bool {
-        (UInt8(ascii: "A") ... UInt8(ascii: "Z")).contains(byte)
-            || (UInt8(ascii: "0") ... UInt8(ascii: "9")).contains(byte)
-    }
+private enum StrictCATIdentityObservation {
+    case incomplete
+    case invalid
+    case identity
 }

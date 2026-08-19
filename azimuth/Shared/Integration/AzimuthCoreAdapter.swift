@@ -196,16 +196,19 @@ struct AzimuthCoreSettingSchema: Sendable {
 
     private static func definition(for record: SettingRecord) throws -> RadioSettingDefinition {
         let mapped = try domain(for: record)
+        let dedicatedLifecycle = record.writePolicy == .dedicatedLifecycle
+        let specialized = mapped.specialized || dedicatedLifecycle
         return RadioSettingDefinition(
             id: record.id,
             group: group(for: record),
             title: record.displayName,
-            summary: summary(for: record, specialized: mapped.specialized),
+            summary: record.writeRestriction ?? summary(for: record, specialized: specialized),
             domain: mapped.domain,
             menuNumbers: THD75MenuNumberIndex.numbers(for: record.id),
             schemaReference: "MCP-D75 \(menuName(record.menu)) • 0x\(String(record.offset, radix: 16, uppercase: true))",
-            requiresRestart: false,
-            isSpecializedEditor: mapped.specialized
+            requiresRestart: record.requiresRestart,
+            requiresReconnect: record.requiresReconnect,
+            isSpecializedEditor: specialized
         )
     }
 

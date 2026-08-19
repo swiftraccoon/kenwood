@@ -34,6 +34,12 @@ public final class POSIXAzimuthUSBSerialLink: AzimuthUSBSerialLink, @unchecked S
         let registryEntryID: UInt64
     }
 
+    struct AvailableDeviceDescriptor: Equatable, Sendable {
+        let path: String
+        let serialNumber: String?
+        let registryEntryID: UInt64
+    }
+
     struct OpenedDeviceNode: Equatable {
         let device: UInt64
         let inode: UInt64
@@ -108,6 +114,10 @@ public final class POSIXAzimuthUSBSerialLink: AzimuthUSBSerialLink, @unchecked S
     }
 
     private let requestedPath: String?
+    /// Stable USB descriptor serial captured by endpoint discovery. When set,
+    /// opening the reusable tty pathname is permitted only while it still
+    /// resolves to that same physical radio.
+    private let expectedSerialNumber: String?
     private let openSystemAccess: OpenSystemAccess
     private let operationLock = NSLock()
     private let lock = NSLock()
@@ -128,8 +138,12 @@ public final class POSIXAzimuthUSBSerialLink: AzimuthUSBSerialLink, @unchecked S
 
     /// Pass an exact verified TH-D75 callout path when more than one radio is
     /// attached. Nil is accepted only when discovery finds exactly one radio.
-    public init(devicePath: String? = nil) {
+    public init(
+        devicePath: String? = nil,
+        expectedSerialNumber: String? = nil
+    ) {
         requestedPath = devicePath
+        self.expectedSerialNumber = expectedSerialNumber
         openSystemAccess = Self.productionOpenSystemAccess
         eventQueue = DispatchQueue(label: "org.swiftraccoon.azimuth.posix-usb")
         eventQueue.setSpecific(key: eventQueueKey, value: true)
@@ -137,12 +151,14 @@ public final class POSIXAzimuthUSBSerialLink: AzimuthUSBSerialLink, @unchecked S
 
     init(
         devicePath: String? = nil,
+        expectedSerialNumber: String? = nil,
         openSystemAccess: OpenSystemAccess,
         eventQueue: DispatchQueue = DispatchQueue(
             label: "org.swiftraccoon.azimuth.posix-usb.test"
         )
     ) {
         requestedPath = devicePath
+        self.expectedSerialNumber = expectedSerialNumber
         self.openSystemAccess = openSystemAccess
         self.eventQueue = eventQueue
         eventQueue.setSpecific(key: eventQueueKey, value: true)
@@ -178,6 +194,7 @@ public final class POSIXAzimuthUSBSerialLink: AzimuthUSBSerialLink, @unchecked S
 
         let opened = try Self.openAndBindDevice(
             requestedPath: requestedPath,
+            expectedSerialNumber: expectedSerialNumber,
             access: openSystemAccess
         )
 
@@ -386,10 +403,30 @@ public final class POSIXAzimuthUSBSerialLink: AzimuthUSBSerialLink, @unchecked S
     public static func availableDevicePaths(
         directory: String = deviceDirectory
     ) -> [String] {
-        availableDevicePaths(
-            directory: directory,
-            identityProvider: registeredUSBIdentity(for:)
-        )
+        availableDeviceDescriptors(directory: directory).map(\.path)
+    }
+
+    static func availableDeviceDescriptors(
+        directory: String = deviceDirectory
+    ) -> [AvailableDeviceDescriptor] {
+        let names = (try? FileManager.default.contentsOfDirectory(
+            atPath: directory
+        )) ?? []
+        return names
+            .filter { $0.hasPrefix(calloutPrefix) }
+            .sorted()
+            .map { (directory as NSString).appendingPathComponent($0) }
+            .compactMap { path in
+                guard let registered = registeredUSBDevice(for: path),
+                      isTHD75(registered.identity) else {
+                    return nil
+                }
+                return AvailableDeviceDescriptor(
+                    path: path,
+                    serialNumber: registered.identity.serialNumber,
+                    registryEntryID: registered.registryEntryID
+                )
+            }
     }
 
     static func availableDevicePaths(
@@ -428,6 +465,7 @@ public final class POSIXAzimuthUSBSerialLink: AzimuthUSBSerialLink, @unchecked S
 
     static func openAndBindDevice(
         requestedPath: String?,
+        expectedSerialNumber: String? = nil,
         access: OpenSystemAccess
     ) throws -> BoundUSBDevice {
         let path = try selectDevicePath(
@@ -436,6 +474,14 @@ public final class POSIXAzimuthUSBSerialLink: AzimuthUSBSerialLink, @unchecked S
         )
         guard let identityBeforeOpen = access.registeredUSBDevice(path) else {
             throw AzimuthUSBLinkError.openedDeviceIdentityUnstable(path)
+        }
+        if let expectedSerialNumber,
+           identityBeforeOpen.identity.serialNumber != expectedSerialNumber {
+            throw AzimuthUSBLinkError.openedDeviceSerialMismatch(
+                path: path,
+                expected: expectedSerialNumber,
+                actual: identityBeforeOpen.identity.serialNumber
+            )
         }
 
         let fileDescriptor = try access.openFileDescriptor(path)
@@ -451,6 +497,14 @@ public final class POSIXAzimuthUSBSerialLink: AzimuthUSBSerialLink, @unchecked S
               let identityAfterOpen = access.registeredUSBDevice(path),
               identityAfterOpen == identityBeforeOpen else {
             throw AzimuthUSBLinkError.openedDeviceIdentityUnstable(path)
+        }
+        if let expectedSerialNumber,
+           identityAfterOpen.identity.serialNumber != expectedSerialNumber {
+            throw AzimuthUSBLinkError.openedDeviceSerialMismatch(
+                path: path,
+                expected: expectedSerialNumber,
+                actual: identityAfterOpen.identity.serialNumber
+            )
         }
         let pathNodeAfterIdentity = try access.nodeForPath(path)
         guard openedNode == pathNodeAfterIdentity,
@@ -731,19 +785,27 @@ public final class POSIXAzimuthUSBSerialLink: AzimuthUSBSerialLink, @unchecked S
 
 public extension AzimuthUSBSerialTransport {
     nonisolated static func platformDefault(
-        devicePath: String? = nil
+        devicePath: String? = nil,
+        expectedSerialNumber: String? = nil
     ) -> AzimuthUSBSerialTransport {
         AzimuthUSBSerialTransport(
-            link: POSIXAzimuthUSBSerialLink(devicePath: devicePath)
+            link: POSIXAzimuthUSBSerialLink(
+                devicePath: devicePath,
+                expectedSerialNumber: expectedSerialNumber
+            )
         )
     }
 
     nonisolated static func availableDevices() -> [AzimuthRadioDevice] {
-        POSIXAzimuthUSBSerialLink.availableDevicePaths().map { path in
+        POSIXAzimuthUSBSerialLink.availableDeviceDescriptors().map { descriptor in
             AzimuthRadioDevice(
-                id: "tty:\(path)",
+                id: AzimuthUSBEndpoint.stableID(
+                    devicePath: descriptor.path,
+                    usbSerialNumber: descriptor.serialNumber
+                ),
                 name: "Kenwood TH-D75",
-                connection: path
+                connectionKind: .usb,
+                connection: "USB-C"
             )
         }
     }

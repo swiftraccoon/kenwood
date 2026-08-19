@@ -33,9 +33,35 @@ struct AzimuthApp: App {
 
         let records = settingCatalog()
         do {
+            let transport: any AzimuthRadioTransport
+            let endpointSelector: any RadioEndpointSelecting
+            #if os(macOS)
+            let selectableTransport = try AzimuthSelectableRadioTransport(
+                usbFactory: AzimuthPlatformUSBTransportFactory(),
+                bluetoothFactory: AzimuthGeneratedBluetoothLinkFactory()
+            )
+            transport = selectableTransport
+            endpointSelector = AzimuthSelectableRadioEndpointSelector(
+                router: selectableTransport
+            )
+            #else
+            transport = AzimuthUSBSerialTransport.platformDefault()
+            endpointSelector = FixedUSBRadioEndpointSelector()
+            #endif
+            let authorizeBluetoothRecovery:
+                AzimuthLiveRadioController.BluetoothRecoveryAuthorization
+            #if os(macOS)
+            authorizeBluetoothRecovery = {
+                try await AzimuthMacBluetoothAuthorizationProvider.shared
+                    .ensureBluetoothAuthorization()
+            }
+            #else
+            authorizeBluetoothRecovery = {}
+            #endif
             let radioController = try AzimuthLiveRadioController(
-                transport: AzimuthUSBSerialTransport.platformDefault(),
-                records: records
+                transport: transport,
+                records: records,
+                authorizeBluetoothRecovery: authorizeBluetoothRecovery
             )
             let catalogProvider = try AzimuthCoreCatalogProvider(records: records)
             _model = State(
@@ -46,6 +72,7 @@ struct AzimuthApp: App {
                     aprsController: radioController,
                     ifDSPStream: IFDSPAudioStreamService(),
                     ifDSPModeController: radioController,
+                    radioEndpointSelector: endpointSelector,
                     initialCatalog: catalogProvider.initialCatalog
                 )
             )

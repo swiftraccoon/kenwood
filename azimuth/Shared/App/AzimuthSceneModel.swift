@@ -59,6 +59,15 @@ enum ManualSettingApplyState: Equatable, Sendable {
     case failed(report: RadioSettingApplyReport?, message: String)
 }
 
+enum RadioConnectionActivity: Equatable, Sendable {
+    /// Ordinary connection to the endpoint selected in the picker.
+    case connection
+    /// Non-destructive same-radio USB-to-Bluetooth CAT handoff.
+    case bluetoothHandoff
+    /// Explicitly approved Menu 650 change followed by USB CAT recovery.
+    case menu650Recovery
+}
+
 /// The single observable model consumed by the independent SwiftUI shell.
 /// Generated bindings and transport implementations are injected exclusively
 /// through the domain protocols below.
@@ -67,10 +76,17 @@ enum ManualSettingApplyState: Equatable, Sendable {
 final class AzimuthSceneModel {
     var route: AzimuthRoute = .radio
     private(set) var radioState: RadioWorkspaceState
+    private(set) var radioEndpoints: [RadioEndpoint]
+    private(set) var selectedRadioEndpointID: String?
+    private(set) var radioEndpointRefreshState: RadioEndpointRefreshState
+    private(set) var radioEndpointDiscoveryWarning: String?
+    private(set) var pairedBluetoothDeviceCount: UInt32?
+    private(set) var likelyBluetoothRadioCount: UInt32?
+    private(set) var bluetoothRadioSearchState: BluetoothRadioSearchState = .idle
     private(set) var catalog: RadioSettingCatalog
     private(set) var catalogLoadState: CatalogLoadState
     private(set) var isRadioOperationInFlight = false
-    private(set) var isCATRecoveryInFlight = false
+    private(set) var radioConnectionActivity: RadioConnectionActivity?
     private(set) var assistantWorkflow: AssistantWorkflowState = .idle
     private(set) var manualSettingApplyState: ManualSettingApplyState = .idle
     private(set) var aprsState: APRSOperationalState
@@ -84,16 +100,21 @@ final class AzimuthSceneModel {
     private(set) var catRecoveryAlert: RadioCATRecoveryAlert?
 
     @ObservationIgnored private let radioController: any RadioControlling
+    @ObservationIgnored private let radioEndpointSelector: any RadioEndpointSelecting
     @ObservationIgnored private let catalogProvider: any RadioSettingCatalogProviding
     @ObservationIgnored private let assistantPlanner: any AssistantPlanning
     @ObservationIgnored private let aprsController: any APRSControlling
     @ObservationIgnored private let ifDSPStream: any IFDSPLiveStreaming
     @ObservationIgnored private let ifDSPModeController: any IFDSPModeControlling
     @ObservationIgnored private var radioUpdatesTask: Task<Void, Never>?
+    @ObservationIgnored private var radioEndpointRefreshTask: Task<Void, Never>?
+    @ObservationIgnored private var bluetoothRadioSearchTask: Task<Void, Never>?
+    @ObservationIgnored private var radioEndpointRefreshSequence: UInt64 = 0
     @ObservationIgnored private var aprsUpdatesTask: Task<Void, Never>?
     @ObservationIgnored private var ifDSPUpdatesTask: Task<Void, Never>?
     @ObservationIgnored private var catalogTask: Task<Void, Never>?
-    @ObservationIgnored private var catRecoveryTask: Task<Void, Error>?
+    @ObservationIgnored private var radioConnectionTask: Task<Void, Error>?
+    @ObservationIgnored private var radioConnectionCancellationGeneration: UInt64 = 0
     @ObservationIgnored private var sceneLifecycleTask: Task<Void, Never>?
     @ObservationIgnored private var sceneLifecycleSequence: UInt64 = 0
     @ObservationIgnored private var sceneIsBackgrounded = false
@@ -108,18 +129,31 @@ final class AzimuthSceneModel {
         aprsController: (any APRSControlling)? = nil,
         ifDSPStream: (any IFDSPLiveStreaming)? = nil,
         ifDSPModeController: (any IFDSPModeControlling)? = nil,
+        radioEndpointSelector: (any RadioEndpointSelecting)? = nil,
         initialCatalog: RadioSettingCatalog? = nil
     ) {
         let resolvedAPRSController = aprsController ?? UnavailableAPRSController()
         let resolvedIFDSPStream = ifDSPStream ?? UnavailableIFDSPLiveStream()
         let resolvedIFDSPModeController = ifDSPModeController ?? UnavailableIFDSPModeController()
+        let resolvedEndpointSelector = radioEndpointSelector ?? FixedUSBRadioEndpointSelector()
+        let initialEndpoints = Self.validInitialEndpoints(
+            resolvedEndpointSelector.initialEndpoints
+        )
         self.radioController = radioController
+        self.radioEndpointSelector = resolvedEndpointSelector
         self.catalogProvider = catalogProvider
         self.assistantPlanner = assistantPlanner
         self.aprsController = resolvedAPRSController
         self.ifDSPStream = resolvedIFDSPStream
         self.ifDSPModeController = resolvedIFDSPModeController
         radioState = radioController.currentState
+        radioEndpoints = initialEndpoints
+        selectedRadioEndpointID = initialEndpoints.first?.id
+        radioEndpointRefreshState = initialEndpoints.isEmpty ? .idle : .ready
+        radioEndpointDiscoveryWarning = nil
+        pairedBluetoothDeviceCount = resolvedEndpointSelector
+            .initialPairedBluetoothDeviceCount
+        likelyBluetoothRadioCount = nil
         aprsState = resolvedAPRSController.currentAPRSState
         ifDSPState = resolvedIFDSPStream.currentState
         ifDSPConfiguration = resolvedIFDSPStream.configuration
@@ -139,6 +173,19 @@ final class AzimuthSceneModel {
 
     var assistantAvailability: AssistantAvailability {
         assistantPlanner.availability
+    }
+
+    var isCATRecoveryInFlight: Bool {
+        radioConnectionActivity == .menu650Recovery
+    }
+
+    var isBluetoothHandoffInFlight: Bool {
+        radioConnectionActivity == .bluetoothHandoff
+    }
+
+    private var hasFreshPairedBluetoothDevice: Bool {
+        radioEndpointRefreshState == .ready
+            && (pairedBluetoothDeviceCount ?? 0) > 0
     }
 
     var assistantCanAccept: Bool {
@@ -191,6 +238,7 @@ final class AzimuthSceneModel {
                 }
             }
         }
+        refreshRadioEndpoints()
         reloadCatalog()
     }
 
@@ -232,30 +280,320 @@ final class AzimuthSceneModel {
         }
     }
 
+    var selectedRadioEndpoint: RadioEndpoint? {
+        guard let selectedRadioEndpointID else { return nil }
+        return radioEndpoints.first { $0.id == selectedRadioEndpointID }
+    }
+
+    var canSelectRadioEndpoint: Bool {
+        guard !isRadioOperationInFlight,
+              !bluetoothRadioSearchState.isSearching else {
+            return false
+        }
+        switch radioState.connection {
+        case .disconnected, .failed:
+            if radioEndpointRefreshState.isRefreshing {
+                return radioEndpoints.contains { $0.transport == .usb }
+            }
+            return true
+        case .connecting, .connected:
+            return false
+        }
+    }
+
+    /// During optional Bluetooth inventory, already validated USB rows remain
+    /// safe to select. Bluetooth rows wait for the fresh paired snapshot so a
+    /// stale address cannot race helper discovery.
+    func canSelectRadioEndpoint(id: String) -> Bool {
+        guard canSelectRadioEndpoint,
+              let endpoint = radioEndpoints.first(where: { $0.id == id }) else {
+            return false
+        }
+        return !radioEndpointRefreshState.isRefreshing
+            || endpoint.transport == .usb
+    }
+
+    /// A previously validated exact endpoint remains connectable while an
+    /// optional discovery refresh is still inventorying Bluetooth devices.
+    /// Discovery may enrich the picker later, but never delays USB control.
+    var canConnectSelectedRadioEndpoint: Bool {
+        guard !isRadioOperationInFlight,
+              !bluetoothRadioSearchState.isSearching,
+              let selectedRadioEndpointID,
+              let endpoint = radioEndpoints.first(
+                where: { $0.id == selectedRadioEndpointID }
+              ) else {
+            return false
+        }
+        if radioEndpointRefreshState.isRefreshing,
+           endpoint.transport == .bluetooth {
+            return false
+        }
+        switch radioState.connection {
+        case .disconnected, .failed:
+            return true
+        case .connecting, .connected:
+            return false
+        }
+    }
+
+    var radioEndpointRefreshError: String? {
+        guard case .failed(let message) = radioEndpointRefreshState else { return nil }
+        return message
+    }
+
+    var canFindCustomNamedBluetoothRadios: Bool {
+        guard radioEndpointSelector.supportsCustomNamedBluetoothSearch,
+              !isRadioOperationInFlight,
+              !radioEndpointRefreshState.isRefreshing,
+              !bluetoothRadioSearchState.isSearching,
+              radioEndpointRefreshState == .ready,
+              let pairedBluetoothDeviceCount,
+              let likelyBluetoothRadioCount,
+              pairedBluetoothDeviceCount > likelyBluetoothRadioCount else {
+            return false
+        }
+        switch radioState.connection {
+        case .disconnected, .failed:
+            break
+        case .connecting, .connected:
+            return false
+        }
+        if case .completed = bluetoothRadioSearchState { return false }
+        return true
+    }
+
+    var showsCustomNamedBluetoothRadioSearch: Bool {
+        radioEndpointSelector.supportsCustomNamedBluetoothSearch
+            && (pairedBluetoothDeviceCount ?? 0) > 0
+    }
+
+    func selectRadioEndpoint(id: String) {
+        guard canSelectRadioEndpoint(id: id) else {
+            return
+        }
+        selectedRadioEndpointID = id
+    }
+
+    /// Replace the endpoint list from one complete platform snapshot.
+    ///
+    /// A refresh preserves the current stable identifier when it remains
+    /// available. Failed or malformed snapshots leave the last usable list
+    /// and selection intact.
+    @discardableResult
+    func refreshRadioEndpoints() -> Task<Void, Never> {
+        guard !isRadioOperationInFlight,
+              !bluetoothRadioSearchState.isSearching else { return Task {} }
+        switch radioState.connection {
+        case .disconnected, .failed:
+            break
+        case .connecting, .connected:
+            return Task {}
+        }
+
+        radioEndpointRefreshTask?.cancel()
+        radioEndpointRefreshSequence &+= 1
+        let sequence = radioEndpointRefreshSequence
+        radioEndpointRefreshState = .refreshing
+        let task = Task { @MainActor [weak self, radioEndpointSelector] in
+            do {
+                let snapshot = try await radioEndpointSelector.refreshEndpoints()
+                try Task.checkCancellation()
+                guard let self, self.radioEndpointRefreshSequence == sequence else { return }
+                let validated = try Self.validateRadioEndpoints(snapshot.endpoints)
+                let retainedSelection = self.selectedRadioEndpointID.flatMap { selected in
+                    validated.contains(where: { $0.id == selected }) ? selected : nil
+                }
+                self.radioEndpoints = validated
+                self.selectedRadioEndpointID = retainedSelection ?? validated.first?.id
+                self.radioEndpointRefreshState = .ready
+                self.radioEndpointDiscoveryWarning = snapshot.warning
+                self.pairedBluetoothDeviceCount = snapshot.pairedBluetoothDeviceCount
+                self.likelyBluetoothRadioCount = snapshot.likelyBluetoothRadioCount
+                self.bluetoothRadioSearchState = .idle
+                self.refreshCATRecoveryOfferAvailability()
+                self.radioEndpointRefreshTask = nil
+            } catch is CancellationError {
+                guard let self, self.radioEndpointRefreshSequence == sequence else { return }
+                self.radioEndpointRefreshState = self.radioEndpoints.isEmpty ? .idle : .ready
+                self.radioEndpointRefreshTask = nil
+                return
+            } catch {
+                guard let self, self.radioEndpointRefreshSequence == sequence else { return }
+                self.radioEndpointRefreshState = .failed(message: error.localizedDescription)
+                self.radioEndpointDiscoveryWarning = nil
+                self.pairedBluetoothDeviceCount = nil
+                self.likelyBluetoothRadioCount = nil
+                self.radioEndpointRefreshTask = nil
+            }
+        }
+        radioEndpointRefreshTask = task
+        return task
+    }
+
+    /// Explicitly probe paired devices omitted from the likely-radio picker.
+    /// The selector returns only CAT-proved TH-D75 endpoints; arbitrary paired
+    /// devices are never promoted into the radio list.
+    @discardableResult
+    func findCustomNamedBluetoothRadios() -> Task<Void, Never> {
+        guard canFindCustomNamedBluetoothRadios else { return Task {} }
+        bluetoothRadioSearchTask?.cancel()
+        bluetoothRadioSearchState = .searching
+        let endpointIDsBeforeSearch = Set(radioEndpoints.map(\.id))
+        let task = Task {
+            @MainActor [weak self, radioEndpointSelector, endpointIDsBeforeSearch] in
+            do {
+                let result = try await radioEndpointSelector
+                    .findCustomNamedBluetoothRadios()
+                guard let self else { return }
+                let validated = try Self.validateRadioEndpoints(
+                    result.snapshot.endpoints
+                )
+                let retainedSelection = self.selectedRadioEndpointID.flatMap { selected in
+                    validated.contains(where: { $0.id == selected }) ? selected : nil
+                }
+                self.radioEndpoints = validated
+                self.selectedRadioEndpointID = retainedSelection ?? validated.first?.id
+                self.radioEndpointDiscoveryWarning = result.snapshot.warning
+                self.pairedBluetoothDeviceCount =
+                    result.snapshot.pairedBluetoothDeviceCount
+                self.likelyBluetoothRadioCount =
+                    result.snapshot.likelyBluetoothRadioCount
+                let radiosFound = validated.filter { endpoint in
+                    endpoint.transport == .bluetooth
+                        && !endpointIDsBeforeSearch.contains(endpoint.id)
+                }.count
+                if result.wasCancelled {
+                    self.bluetoothRadioSearchState = .stopped(
+                        probed: result.probedCandidateCount,
+                        total: result.totalUnhintedCandidateCount,
+                        radiosFound: radiosFound
+                    )
+                } else if result.isComplete {
+                    self.bluetoothRadioSearchState = .completed(
+                        probed: result.probedCandidateCount,
+                        total: result.totalUnhintedCandidateCount,
+                        radiosFound: radiosFound
+                    )
+                } else {
+                    self.bluetoothRadioSearchState = .incomplete(
+                        probed: result.probedCandidateCount,
+                        total: result.totalUnhintedCandidateCount,
+                        radiosFound: radiosFound
+                    )
+                }
+                self.bluetoothRadioSearchTask = nil
+            } catch is CancellationError {
+                self?.bluetoothRadioSearchState = .idle
+                self?.bluetoothRadioSearchTask = nil
+            } catch {
+                self?.bluetoothRadioSearchState = .failed(
+                    message: error.localizedDescription
+                )
+                self?.bluetoothRadioSearchTask = nil
+            }
+        }
+        bluetoothRadioSearchTask = task
+        return task
+    }
+
+    func cancelCustomNamedBluetoothRadioSearch() async {
+        guard bluetoothRadioSearchState.isSearching else { return }
+        let task = bluetoothRadioSearchTask
+        task?.cancel()
+        await task?.value
+    }
+
     func connectRadio() async {
         guard !isRadioOperationInFlight else { return }
         isRadioOperationInFlight = true
         operationError = nil
         catRecoveryAlert = nil
-        defer { isRadioOperationInFlight = false }
+        radioConnectionActivity = .connection
+        let connectionTask = Task { @MainActor [weak self] in
+            guard let self else { throw CancellationError() }
+            guard let selectedRadioEndpointID = self.selectedRadioEndpointID else {
+                throw self.radioEndpoints.isEmpty
+                    ? RadioEndpointSelectionError.noEndpoints
+                    : RadioEndpointSelectionError.noSelection
+            }
+            guard let endpoint = self.radioEndpoints.first(
+                where: { $0.id == selectedRadioEndpointID }
+            ) else {
+                throw RadioEndpointSelectionError.invalidEndpoint(
+                    id: selectedRadioEndpointID
+                )
+            }
+            if self.radioEndpointRefreshState.isRefreshing,
+               endpoint.transport == .bluetooth {
+                throw RadioEndpointSelectionError.refreshInProgress
+            }
+            try await self.radioEndpointSelector.selectEndpoint(
+                id: selectedRadioEndpointID
+            )
+            try Task.checkCancellation()
+            try await self.radioController.connect()
+        }
+        radioConnectionTask = connectionTask
+        defer {
+            radioConnectionTask = nil
+            radioConnectionActivity = nil
+            isRadioOperationInFlight = false
+        }
         do {
-            try await radioController.connect()
+            try await withTaskCancellationHandler {
+                try await connectionTask.value
+            } onCancel: {
+                connectionTask.cancel()
+            }
+            await synchronizeSelectedRadioEndpoint()
             radioState = radioController.currentState
             reloadCatalog()
         } catch RadioControllerError.usbMmdvmMode {
             radioState = radioController.currentState
             catRecoveryAlert = .usbMmdvmMode(
-                automaticRecoveryAvailable: radioController.automaticCATRecoveryAvailable
+                automaticRecoveryAvailable:
+                    radioController.automaticCATRecoveryAvailable
+                    && hasFreshPairedBluetoothDevice,
+                bluetoothFallbackAvailable:
+                    radioController.bluetoothCATFallbackAvailable
+                    && hasFreshPairedBluetoothDevice
             )
+        } catch is CancellationError {
+            operationError = nil
+            catRecoveryAlert = nil
+            radioState = radioController.currentState
         } catch {
             operationError = error.localizedDescription
             radioState = radioController.currentState
         }
     }
 
+    private static func validInitialEndpoints(
+        _ endpoints: [RadioEndpoint]
+    ) -> [RadioEndpoint] {
+        (try? validateRadioEndpoints(endpoints)) ?? []
+    }
+
+    private static func validateRadioEndpoints(
+        _ endpoints: [RadioEndpoint]
+    ) throws -> [RadioEndpoint] {
+        var identifiers: Set<String> = []
+        for endpoint in endpoints {
+            guard !endpoint.id.isEmpty, !endpoint.name.isEmpty else {
+                throw RadioEndpointSelectionError.malformedEndpoint
+            }
+            guard identifiers.insert(endpoint.id).inserted else {
+                throw RadioEndpointSelectionError.duplicateEndpoint(id: endpoint.id)
+            }
+        }
+        return endpoints
+    }
+
     func restoreCATFromUSBMMDVM() async {
         guard !isRadioOperationInFlight else { return }
-        guard radioController.automaticCATRecoveryAvailable else {
+        guard radioController.automaticCATRecoveryAvailable,
+              hasFreshPairedBluetoothDevice else {
             catRecoveryAlert = .recoveryFailed(
                 message: "Automatic CAT recovery is unavailable for this radio connection."
             )
@@ -265,14 +603,15 @@ final class AzimuthSceneModel {
         catRecoveryAlert = nil
         operationError = nil
         isRadioOperationInFlight = true
-        isCATRecoveryInFlight = true
+        radioConnectionActivity = .menu650Recovery
+        let cancellationGeneration = radioConnectionCancellationGeneration
         let recoveryTask = Task { @MainActor [radioController] in
             try await radioController.restoreCATFromUSBMMDVM()
         }
-        catRecoveryTask = recoveryTask
+        radioConnectionTask = recoveryTask
         defer {
-            catRecoveryTask = nil
-            isCATRecoveryInFlight = false
+            radioConnectionTask = nil
+            radioConnectionActivity = nil
             isRadioOperationInFlight = false
         }
         do {
@@ -281,40 +620,155 @@ final class AzimuthSceneModel {
             } onCancel: {
                 recoveryTask.cancel()
             }
+            await synchronizeSelectedRadioEndpoint()
             radioState = radioController.currentState
             reloadCatalog()
         } catch is CancellationError {
-            catRecoveryAlert = nil
+            catRecoveryAlert = radioConnectionCancellationGeneration
+                == cancellationGeneration
+                ? pendingUSBMMDVMRecoveryOffer()
+                : nil
             radioState = radioController.currentState
         } catch {
-            catRecoveryAlert = .recoveryFailed(message: error.localizedDescription)
+            catRecoveryAlert = usbMMDVMRecoveryFailureAlert(error: error)
+            if error is AzimuthBluetoothAuthorizationError {
+                radioEndpointDiscoveryWarning =
+                    "Bluetooth connections unavailable: \(error.localizedDescription)"
+            }
             radioState = radioController.currentState
         }
     }
 
-    /// Stop an approved automatic recovery and wait for the controller to
-    /// finish any MCP cleanup before presenting the radio as disconnected.
-    func cancelCATRecovery() async {
-        guard isCATRecoveryInFlight else { return }
-        let recoveryTask = catRecoveryTask
-        recoveryTask?.cancel()
+    func connectViaBluetoothFromUSBMMDVM() async {
+        guard !isRadioOperationInFlight else { return }
+        guard radioController.bluetoothCATFallbackAvailable,
+              hasFreshPairedBluetoothDevice else {
+            catRecoveryAlert = .recoveryFailed(
+                message: "A same-radio Bluetooth CAT connection is unavailable for this radio connection."
+            )
+            return
+        }
+
+        catRecoveryAlert = nil
+        operationError = nil
+        isRadioOperationInFlight = true
+        radioConnectionActivity = .bluetoothHandoff
+        let cancellationGeneration = radioConnectionCancellationGeneration
+        let recoveryTask = Task { @MainActor [radioController] in
+            try await radioController.connectViaBluetoothFromUSBMMDVM()
+        }
+        radioConnectionTask = recoveryTask
+        defer {
+            radioConnectionTask = nil
+            radioConnectionActivity = nil
+            isRadioOperationInFlight = false
+        }
+        do {
+            try await withTaskCancellationHandler {
+                try await recoveryTask.value
+            } onCancel: {
+                recoveryTask.cancel()
+            }
+            await synchronizeSelectedRadioEndpoint()
+            radioState = radioController.currentState
+            reloadCatalog()
+        } catch is CancellationError {
+            catRecoveryAlert = radioConnectionCancellationGeneration
+                == cancellationGeneration
+                ? pendingUSBMMDVMRecoveryOffer()
+                : nil
+            radioState = radioController.currentState
+        } catch {
+            catRecoveryAlert = usbMMDVMRecoveryFailureAlert(error: error)
+            if error is AzimuthBluetoothAuthorizationError {
+                radioEndpointDiscoveryWarning =
+                    "Bluetooth connections unavailable: \(error.localizedDescription)"
+            }
+            radioState = radioController.currentState
+        }
+    }
+
+    /// Stop the current connection, handoff, or approved recovery and wait
+    /// until its transport/native cleanup has finished before publishing the
+    /// disconnected state.
+    func cancelRadioConnection() async {
+        guard let activity = radioConnectionActivity else { return }
+        radioConnectionCancellationGeneration &+= 1
+        let connectionTask = radioConnectionTask
+        connectionTask?.cancel()
         await radioController.disconnect()
         do {
-            try await recoveryTask?.value
+            try await connectionTask?.value
             catRecoveryAlert = nil
         } catch is CancellationError {
             catRecoveryAlert = nil
         } catch {
-            // A late cancellation can finish a Menu 650 operation before it
-            // stops the USB reconnect. Preserve that truthful outcome.
-            catRecoveryAlert = .recoveryFailed(message: error.localizedDescription)
+            if activity == .menu650Recovery {
+                // A late cancellation can finish a Menu 650 operation before
+                // it stops USB reconnect. Preserve that truthful outcome.
+                catRecoveryAlert = .recoveryFailed(message: error.localizedDescription)
+            }
         }
+        operationError = nil
         radioState = radioController.currentState
         synchronizeIFDSPModeState()
     }
 
+    func cancelCATRecovery() async {
+        guard isCATRecoveryInFlight else { return }
+        await cancelRadioConnection()
+    }
+
     func dismissCATRecoveryAlert() {
         catRecoveryAlert = nil
+    }
+
+    private func refreshCATRecoveryOfferAvailability() {
+        let automatic = radioController.automaticCATRecoveryAvailable
+            && hasFreshPairedBluetoothDevice
+        let bluetooth = radioController.bluetoothCATFallbackAvailable
+            && hasFreshPairedBluetoothDevice
+        switch catRecoveryAlert {
+        case .usbMmdvmMode:
+            catRecoveryAlert = .usbMmdvmMode(
+                automaticRecoveryAvailable: automatic,
+                bluetoothFallbackAvailable: bluetooth
+            )
+        case .recoveryFailed(let message, _, _):
+            catRecoveryAlert = .recoveryFailed(
+                message: message,
+                automaticRecoveryAvailable: automatic,
+                bluetoothFallbackAvailable: bluetooth
+            )
+        case nil:
+            break
+        }
+    }
+
+    private func pendingUSBMMDVMRecoveryOffer() -> RadioCATRecoveryAlert? {
+        let automatic = radioController.automaticCATRecoveryAvailable
+            && hasFreshPairedBluetoothDevice
+        let bluetooth = radioController.bluetoothCATFallbackAvailable
+            && hasFreshPairedBluetoothDevice
+        guard automatic || bluetooth else { return nil }
+        return .usbMmdvmMode(
+            automaticRecoveryAvailable: automatic,
+            bluetoothFallbackAvailable: bluetooth
+        )
+    }
+
+    private func usbMMDVMRecoveryFailureAlert(
+        error: Error
+    ) -> RadioCATRecoveryAlert {
+        let automatic = radioController.automaticCATRecoveryAvailable
+            && hasFreshPairedBluetoothDevice
+        let bluetooth = radioController.bluetoothCATFallbackAvailable
+            && hasFreshPairedBluetoothDevice
+        return .recoveryFailed(
+            message: error.localizedDescription,
+            automaticRecoveryAvailable: automatic,
+            bluetoothFallbackAvailable: bluetooth
+        )
     }
 
     func disconnectRadio() async {
@@ -329,6 +783,31 @@ final class AzimuthSceneModel {
         await radioController.disconnect()
         radioState = radioController.currentState
         synchronizeIFDSPModeState()
+    }
+
+    private func synchronizeSelectedRadioEndpoint() async {
+        guard let endpoint = await radioEndpointSelector.selectedEndpoint(),
+              !endpoint.id.isEmpty,
+              !endpoint.name.isEmpty else {
+            return
+        }
+        if let index = radioEndpoints.firstIndex(where: { $0.id == endpoint.id }) {
+            var synchronized = radioEndpoints
+            synchronized[index] = endpoint
+            guard let validated = try? Self.validateRadioEndpoints(synchronized) else {
+                return
+            }
+            radioEndpoints = validated
+            selectedRadioEndpointID = endpoint.id
+            return
+        }
+        guard let validated = try? Self.validateRadioEndpoints(
+            radioEndpoints + [endpoint]
+        ) else {
+            return
+        }
+        radioEndpoints = validated
+        selectedRadioEndpointID = endpoint.id
     }
 
     func startAPRS(_ configuration: APRSSessionConfiguration) async {

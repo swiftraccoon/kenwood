@@ -3,15 +3,34 @@
 
 import Foundation
 
+public enum AzimuthRadioConnectionKind: String, Sendable, Equatable {
+    case usb
+    case bluetooth
+
+    var title: String {
+        switch self {
+        case .usb: return "USB-C"
+        case .bluetooth: return "Bluetooth"
+        }
+    }
+}
+
 /// A physical radio endpoint that Azimuth can open.
 public struct AzimuthRadioDevice: Identifiable, Sendable, Equatable {
     public let id: String
     public let name: String
+    public let connectionKind: AzimuthRadioConnectionKind
     public let connection: String
 
-    public init(id: String, name: String, connection: String) {
+    public init(
+        id: String,
+        name: String,
+        connectionKind: AzimuthRadioConnectionKind,
+        connection: String
+    ) {
         self.id = id
         self.name = name
+        self.connectionKind = connectionKind
         self.connection = connection
     }
 
@@ -20,6 +39,7 @@ public struct AzimuthRadioDevice: Identifiable, Sendable, Equatable {
     public static let thD75USBC = AzimuthRadioDevice(
         id: "usb:2166:9023",
         name: "Kenwood TH-D75",
+        connectionKind: .usb,
         connection: "USB-C"
     )
 }
@@ -36,8 +56,8 @@ public protocol AzimuthRadioTransport: Sendable {
     var device: AzimuthRadioDevice { get }
     var state: AzimuthRadioTransportState { get async }
     var stateStream: AsyncStream<AzimuthRadioTransportState> { get }
-    /// Stable serial identifier reported by the physical USB device, when the
-    /// platform can prove one for the currently opened endpoint.
+    /// Stable serial identifier for the physical radio, when the selected
+    /// connection can prove one for its currently opened endpoint.
     var hardwareSerialNumber: String? { get async }
 
     func open() async throws
@@ -50,6 +70,27 @@ public protocol AzimuthRadioTransport: Sendable {
     /// Suspends until at least one byte is available. An empty result means
     /// the connection closed (or this individual read was cancelled).
     func read(maxBytes: Int) async throws -> [UInt8]
+}
+
+/// Optional handoff supported by a transport router that can replace a failed
+/// USB control session with the paired Bluetooth link for the same radio.
+///
+/// Selection is non-destructive and does not open the new link. The next
+/// ordinary controller connection performs the bounded Bluetooth serial proof.
+protocol AzimuthSameRadioBluetoothSelecting: Sendable {
+    func selectBluetoothForSameRadio(
+        expectedSerialNumber: String
+    ) async throws
+
+    /// Exact address already CAT-qualified for this serial, when unique.
+    func knownQualifiedBluetoothAddress(
+        expectedSerialNumber: String
+    ) async throws -> String?
+
+    /// Refresh USB discovery and select the current tty path for this serial.
+    func selectUSBForRecovery(
+        expectedSerialNumber: String
+    ) async throws
 }
 
 public extension AzimuthRadioTransport {
@@ -65,7 +106,7 @@ public enum AzimuthRadioTransportError: LocalizedError, Sendable, Equatable {
     public var errorDescription: String? {
         switch self {
         case .notConnected:
-            return "The TH-D75 USB connection is not open."
+            return "The TH-D75 radio connection is not open."
         case .openFailed(let reason), .writeFailed(let reason), .readFailed(let reason):
             return reason
         }

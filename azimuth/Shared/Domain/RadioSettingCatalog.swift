@@ -334,6 +334,7 @@ struct RadioSettingDefinition: Identifiable, Hashable, Sendable {
     let menuNumbers: [String]
     let schemaReference: String?
     let requiresRestart: Bool
+    let requiresReconnect: Bool
     let isSpecializedEditor: Bool
 
     var menuNumberLabel: String? {
@@ -493,7 +494,7 @@ extension RadioSettingCatalog {
             preview("digitalSquelch", .digitalVoice, "Digital Squelch", "Filters received digital voice by code or callsign.", choices("Off", "Code", "Callsign")),
             preview("memoryName", .memory, "Memory Name", "Label shown for a stored channel.", .text(maxLength: 16, encoding: .utf8), specialized: true),
             preview("scanResume", .memory, "Scan Resume", "Behavior after scan activity is detected.", choices("Time", "Carrier", "Seek")),
-            preview("usbFunction", .connectivity, "USB Function", "Function presented by the radio's USB connection.", choices("COM + Audio", "Mass Storage"), restart: true),
+            preview("usbFunction", .connectivity, "USB Function", "Function presented by the radio's USB connection.", choices("COM + Audio", "Mass Storage"), specialized: true, restart: true, reconnect: true),
             preview("bluetooth", .connectivity, "Bluetooth", "Enables the radio's Bluetooth subsystem.", .boolean),
         ]
     )
@@ -505,7 +506,8 @@ extension RadioSettingCatalog {
         _ summary: String,
         _ domain: RadioSettingDomain,
         specialized: Bool = false,
-        restart: Bool = false
+        restart: Bool = false,
+        reconnect: Bool = false
     ) -> RadioSettingDefinition {
         RadioSettingDefinition(
             id: "preview.\(group.rawValue).\(id)",
@@ -516,6 +518,7 @@ extension RadioSettingCatalog {
             menuNumbers: [],
             schemaReference: nil,
             requiresRestart: restart,
+            requiresReconnect: reconnect,
             isSpecializedEditor: specialized
         )
     }

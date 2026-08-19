@@ -626,7 +626,7 @@ struct IFDSPWorkspace: View {
     private var frequencyEntryError: String? {
         guard case .active = model.ifDSPModeState else { return nil }
         guard parsedFrequencyHz != nil else {
-            return "Enter 0.100–523.995 MHz on a 5 kHz boundary; the radio will enforce its supported receive ranges."
+            return "Enter 0.100–75.995 or 108.000–523.995 MHz on a 5 kHz boundary."
         }
         return nil
     }
@@ -771,15 +771,19 @@ struct IFDSPWorkspace: View {
 }
 
 enum IFDSPFrequencyEntry {
+    private static let lowerBandBRange: ClosedRange<UInt32> = 100_000...75_995_000
+    private static let upperBandBRange: ClosedRange<UInt32> = 108_000_000...523_995_000
+
     static func frequencyHz(fromMHz text: String) -> UInt32? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let megahertz = Double(trimmed),
               megahertz.isFinite,
               (0.100...523.995).contains(megahertz) else { return nil }
         let roundedHz = Int64((megahertz * 1_000_000).rounded())
-        guard roundedHz >= 100_000,
-              roundedHz <= 523_995_000,
-              roundedHz.isMultiple(of: 5_000) else { return nil }
-        return UInt32(roundedHz)
+        guard let frequencyHz = UInt32(exactly: roundedHz),
+              frequencyHz.isMultiple(of: 5_000),
+              lowerBandBRange.contains(frequencyHz) || upperBandBRange.contains(frequencyHz)
+        else { return nil }
+        return frequencyHz
     }
 }

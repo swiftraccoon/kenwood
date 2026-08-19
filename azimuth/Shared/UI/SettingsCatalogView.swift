@@ -125,7 +125,7 @@ struct SettingsCatalogView: View {
                 HStack(alignment: .top) {
                     VStack(alignment: .leading, spacing: 6) {
                         AzimuthEyebrow("Complete configuration")
-                        Text("Search, inspect, and apply every field in the reviewed TH-D75 schema.")
+                        Text("Search and inspect every reviewed TH-D75 field; safely apply ordinary settings.")
                             .font(.callout)
                             .foregroundStyle(.secondary)
                     }
@@ -135,7 +135,7 @@ struct SettingsCatalogView: View {
 
                 VStack(alignment: .leading, spacing: 8) {
                     AzimuthEyebrow("Complete configuration")
-                    Text("Search, inspect, and apply every field in the reviewed TH-D75 schema.")
+                    Text("Search and inspect every reviewed TH-D75 field; safely apply ordinary settings.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                     sourceBadge
@@ -577,6 +577,7 @@ private struct SettingEditorView: View {
                     LabeledContent("Schema location", value: schemaReference)
                 }
                 LabeledContent("Restart required", value: definition.requiresRestart ? "Yes" : "No")
+                LabeledContent("Reconnect required", value: definition.requiresReconnect ? "Yes" : "No")
             }
         }
     }

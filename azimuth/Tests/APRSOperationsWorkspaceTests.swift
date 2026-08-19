@@ -175,6 +175,7 @@ final class APRSOperationsWorkspaceTests: XCTestCase {
             menuNumbers: [menu],
             schemaReference: nil,
             requiresRestart: false,
+            requiresReconnect: false,
             isSpecializedEditor: false
         )
     }
