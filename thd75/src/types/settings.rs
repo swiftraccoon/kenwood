@@ -1474,7 +1474,10 @@ impl std::fmt::Display for BatterySaverInterval {
     }
 }
 
-/// Host interface selected for GPS or APRS PC output.
+/// Host interface selected by radio features that route PC data.
+///
+/// This closed menu domain is shared by GPS/APRS output, KISS and digital
+/// gateway routing, including Menu 985 for D-STAR DV Gateway traffic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum PcOutputInterface {

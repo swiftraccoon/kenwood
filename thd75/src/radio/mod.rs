@@ -141,6 +141,17 @@ pub(crate) enum McpPhase {
     ExitSent,
 }
 
+/// Whether the MCP byte stream is between complete exchanges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum McpWireBoundary {
+    /// No MCP command, response, or ACK handshake is partially in flight.
+    #[default]
+    Quiescent,
+    /// A command or handshake was polled but did not reach its exact terminal
+    /// response; sending another byte could corrupt the radio's parser.
+    Ambiguous,
+}
+
 /// Whether ordinary CAT framing has a proved request/response boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum CatState {
@@ -224,6 +235,8 @@ pub struct Radio<T: Transport> {
     /// `ExitSent` phase additionally prevents recovery from sending a second
     /// raw exit byte after cancellation.
     pub(crate) mcp_phase: McpPhase,
+    /// Framing boundary within an active MCP session.
+    pub(crate) mcp_wire_boundary: McpWireBoundary,
     /// The CAT timeout saved while an MCP session temporarily raises
     /// it; restored on session end or interrupted-session recovery.
     pub(crate) mcp_saved_timeout: Option<Duration>,
@@ -283,6 +296,7 @@ impl<T: Transport> Radio<T> {
             cat_state: CatState::Ready,
             gm_poisoned: false,
             mcp_phase: McpPhase::Inactive,
+            mcp_wire_boundary: McpWireBoundary::Quiescent,
             mcp_saved_timeout: None,
             mcp_pending_exit_error: None,
             link_state_tx: link_tx,
@@ -938,6 +952,7 @@ impl<T: Transport> Radio<T> {
         !matches!(self.cat_state, CatState::Ready)
             || self.gm_poisoned
             || !matches!(self.mcp_phase, McpPhase::Inactive)
+            || !matches!(self.mcp_wire_boundary, McpWireBoundary::Quiescent)
     }
 
     /// Refuse every non-reconnect I/O path after an incomplete strict GM

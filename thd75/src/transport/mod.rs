@@ -43,7 +43,7 @@ pub mod mock;
 pub mod serial;
 
 #[cfg(any(target_os = "macos", all(doc, unix)))]
-pub use bluetooth::{BluetoothOpenCancellation, BluetoothTransport, PairedBluetoothCandidate};
+pub use bluetooth::{BluetoothOpenCancellation, BluetoothTransport, PairedBluetoothDevice};
 pub use broker::{BrokerHandle, MainThreadBroker};
 pub use either::EitherTransport;
 pub use mmdvm_adapter::{MmdvmTransportAdapter, MmdvmTransportRecoveryError};

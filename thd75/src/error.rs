@@ -346,6 +346,17 @@ pub enum Error {
     )]
     McpInterrupted,
 
+    /// An MCP command or ACK handshake ended without a proved byte boundary.
+    ///
+    /// Sending the raw exit byte could complete a partial frame or consume a
+    /// stale acknowledgement. The transport is closed and the radio must be
+    /// power-cycled before any further protocol traffic.
+    #[error(
+        "MCP wire boundary is ambiguous; the connection was closed without sending an exit byte; \
+         fully power-cycle the radio before reconnecting"
+    )]
+    McpWireBoundaryUnproved,
+
     /// A GM memory read was requested before the installed patched target was
     /// attested on this connection.
     #[error(
@@ -465,6 +476,11 @@ pub enum Error {
     #[error(transparent)]
     McpPageExchange(#[from] crate::radio::programming::McpPageExchangeError),
 
+    /// A sparse detached MCP update failed; the nested error retains which
+    /// page writes may have started and which were read-back verified.
+    #[error(transparent)]
+    DetachedMcpPageUpdate(#[from] crate::radio::programming::DetachedMcpPageUpdateError),
+
     /// A menu-patch compare-exchange referenced a page absent from the
     /// caller's snapshot, so no expected bytes exist to compare against.
     #[error(
@@ -476,12 +492,11 @@ pub enum Error {
         page: WritableMcpPage,
     },
 
-    /// The link never proved MMDVM after a Reflector Terminal Mode write.
+    /// The link never proved MMDVM after a verified route-and-mode update.
     #[error(
-        "the radio did not answer MMDVM probes within {window:?} after the Menu 650 write; if \
-         the radio's screen shows TERM, check Menu 985 (DV Gateway PC Input/Output): it must \
-         be set to the interface this connection uses. Do not repeat the memory write; another \
-         attempt only reboots the radio again"
+        "the radio did not answer MMDVM probes within {window:?} after Menu 985 and Menu 650 \
+         were read-back verified for this connection; do not repeat the memory update, because \
+         another attempt only reboots the radio again"
     )]
     TerminalModeNotEngaged {
         /// Transition window that elapsed without MMDVM proof.
@@ -510,8 +525,21 @@ impl Error {
     /// assert!(Error::CatRecoveryRequired.requires_recovery());
     /// ```
     #[must_use]
-    pub const fn is_link_lost(&self) -> bool {
-        matches!(self, Self::Transport(_) | Self::Timeout(_))
+    pub fn is_link_lost(&self) -> bool {
+        match self {
+            Self::Transport(_) | Self::Timeout(_) => true,
+            Self::McpCleanupNotProved { cleanup } => cleanup.is_link_lost(),
+            Self::McpOperationAndCleanupFailed { operation, cleanup } => {
+                operation.is_link_lost() || cleanup.is_link_lost()
+            }
+            Self::CatRestorationFailed {
+                in_place,
+                reconnect,
+            } => in_place.is_link_lost() || reconnect.is_link_lost(),
+            Self::McpPageExchange(error) => error.is_link_lost(),
+            Self::DetachedMcpPageUpdate(error) => error.is_link_lost(),
+            _ => false,
+        }
     }
 
     /// Whether this failure leaves the CAT stream refusing ordinary commands
@@ -529,18 +557,23 @@ impl Error {
     /// [`Radio::cat_recovery_required`](crate::radio::Radio::cat_recovery_required)
     /// remains the authoritative live-state check.
     #[must_use]
-    pub const fn requires_recovery(&self) -> bool {
-        self.is_link_lost()
-            || matches!(
-                self,
-                Self::CatRecoveryRequired
-                    | Self::MemoryReadStreamPoisoned
-                    | Self::McpInterrupted
-                    | Self::McpExitAlreadySent
-                    | Self::McpCleanupNotProved { .. }
-                    | Self::McpOperationAndCleanupFailed { .. }
-                    | Self::CatRestorationFailed { .. }
-            )
+    pub fn requires_recovery(&self) -> bool {
+        if self.is_link_lost() {
+            return true;
+        }
+        match self {
+            Self::CatRecoveryRequired
+            | Self::MemoryReadStreamPoisoned
+            | Self::McpInterrupted
+            | Self::McpWireBoundaryUnproved
+            | Self::McpExitAlreadySent
+            | Self::McpCleanupNotProved { .. }
+            | Self::McpOperationAndCleanupFailed { .. }
+            | Self::CatRestorationFailed { .. } => true,
+            Self::McpPageExchange(error) => error.requires_recovery(),
+            Self::DetachedMcpPageUpdate(error) => error.requires_recovery(),
+            _ => false,
+        }
     }
 }
 

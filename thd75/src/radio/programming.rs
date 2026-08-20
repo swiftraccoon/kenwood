@@ -17,9 +17,11 @@
 //! Entering programming mode makes the radio stop responding to normal
 //! CAT commands. The display shows "PROG MCP". An explicit session entered
 //! with [`Radio::enter_mcp`] must be closed with [`McpSession::exit`]. If the
-//! session or its exit future is dropped, call
-//! [`Radio::recover_from_interrupted_mcp`] before issuing CAT commands. The
-//! one-shot high-level methods handle entry and exit automatically.
+//! session or an exchange future is dropped, issue no further CAT command and
+//! call [`Radio::recover_from_interrupted_mcp`]. Recovery sends the MCP exit
+//! byte only from a proved quiescent frame boundary; an ambiguous partial
+//! exchange is closed fail-safe and requires a radio power cycle. One-shot
+//! high-level methods enforce the same boundary rule on ordinary errors.
 //!
 //! # Connection Lifetime
 //!
@@ -42,7 +44,7 @@ use crate::types::{
     ChannelDisplayName, RegularChannel, StoredChannelData, StoredChannelFlag, StoredChannelSlot,
 };
 
-use super::{McpPhase, Radio};
+use super::{McpPhase, McpWireBoundary, Radio};
 
 pub use crate::protocol::programming::{McpPage, WritableMcpPage};
 
@@ -76,12 +78,147 @@ const DATA_BACKED_CHANNEL_FLAG_PAGE_COUNT: u16 = 18;
 /// Outcome of a conditional detached MCP page update.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DetachedMcpPageUpdate {
-    /// The page already held the requested bytes; no write occurred and CAT
-    /// was restored and identified before returning.
+    /// Every requested page already held the requested bytes; no write
+    /// occurred and CAT was restored and identified before returning.
     UnchangedCatReady,
-    /// A verified write occurred and the radio is rebooting; the caller owns
-    /// transport recovery and must not treat the current handle as CAT-ready.
+    /// At least one verified write occurred and the radio is rebooting; the
+    /// caller owns transport recovery and must not treat the current handle as
+    /// CAT-ready.
     ChangedRadioRebooting,
+}
+
+/// Failure of a sparse detached MCP update, with page-write progress.
+///
+/// A page enters `possibly_written_pages` before its wire write is polled and
+/// enters `verified_written_pages` only after immediate read-back succeeds.
+/// This distinction lets a recovery path report partial multi-page outcomes
+/// without pretending an acknowledged or interrupted write was atomic.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum DetachedMcpPageUpdateError {
+    /// No page was supplied, so no CAT proof or programming transition ran.
+    #[error("detached MCP update requires at least one writable page")]
+    EmptyPageSet,
+    /// MCP entry failed before any page exchange.
+    #[error("entering MCP for detached page update failed: {source}")]
+    Entry {
+        /// Underlying entry failure.
+        #[source]
+        source: Box<Error>,
+    },
+    /// A page operation failed; cleanup succeeded.
+    #[error(
+        "detached MCP page update failed; possibly written pages: \
+         {possibly_written_pages:?}; verified pages: {verified_written_pages:?}: {source}"
+    )]
+    Operation {
+        /// Pages whose write may have started, in ascending order.
+        possibly_written_pages: Vec<WritableMcpPage>,
+        /// Pages whose write and immediate read-back both succeeded.
+        verified_written_pages: Vec<WritableMcpPage>,
+        /// Underlying page failure.
+        #[source]
+        source: Box<Error>,
+    },
+    /// Page operations succeeded, but the selected exit path failed.
+    #[error(
+        "detached MCP page update cleanup failed; possibly written pages: \
+         {possibly_written_pages:?}; verified pages: {verified_written_pages:?}: {source}"
+    )]
+    Cleanup {
+        /// Pages whose write may have started, in ascending order.
+        possibly_written_pages: Vec<WritableMcpPage>,
+        /// Pages whose write and immediate read-back both succeeded.
+        verified_written_pages: Vec<WritableMcpPage>,
+        /// Underlying cleanup failure.
+        #[source]
+        source: Box<Error>,
+    },
+    /// Both a page operation and cleanup failed.
+    #[error(
+        "detached MCP page update failed ({operation}); possibly written pages: \
+         {possibly_written_pages:?}; verified pages: {verified_written_pages:?}; cleanup also \
+         failed: {cleanup}"
+    )]
+    OperationAndCleanup {
+        /// Pages whose write may have started, in ascending order.
+        possibly_written_pages: Vec<WritableMcpPage>,
+        /// Pages whose write and immediate read-back both succeeded.
+        verified_written_pages: Vec<WritableMcpPage>,
+        /// Underlying page failure.
+        operation: Box<Error>,
+        /// Underlying cleanup failure.
+        #[source]
+        cleanup: Box<Error>,
+    },
+}
+
+impl DetachedMcpPageUpdateError {
+    /// Pages whose wire write may have started, in ascending order.
+    #[must_use]
+    pub fn possibly_written_pages(&self) -> &[WritableMcpPage] {
+        match self {
+            Self::EmptyPageSet | Self::Entry { .. } => &[],
+            Self::Operation {
+                possibly_written_pages,
+                ..
+            }
+            | Self::Cleanup {
+                possibly_written_pages,
+                ..
+            }
+            | Self::OperationAndCleanup {
+                possibly_written_pages,
+                ..
+            } => possibly_written_pages,
+        }
+    }
+
+    /// Pages whose write and immediate read-back both succeeded.
+    #[must_use]
+    pub fn verified_written_pages(&self) -> &[WritableMcpPage] {
+        match self {
+            Self::EmptyPageSet | Self::Entry { .. } => &[],
+            Self::Operation {
+                verified_written_pages,
+                ..
+            }
+            | Self::Cleanup {
+                verified_written_pages,
+                ..
+            }
+            | Self::OperationAndCleanup {
+                verified_written_pages,
+                ..
+            } => verified_written_pages,
+        }
+    }
+
+    /// Whether this structured failure contains a lost physical link.
+    pub(crate) fn is_link_lost(&self) -> bool {
+        match self {
+            Self::EmptyPageSet => false,
+            Self::Entry { source }
+            | Self::Operation { source, .. }
+            | Self::Cleanup { source, .. } => source.is_link_lost(),
+            Self::OperationAndCleanup {
+                operation, cleanup, ..
+            } => operation.is_link_lost() || cleanup.is_link_lost(),
+        }
+    }
+
+    /// Whether this structured failure contains a poisoned protocol boundary.
+    pub(crate) fn requires_recovery(&self) -> bool {
+        match self {
+            Self::EmptyPageSet => false,
+            Self::Entry { source }
+            | Self::Operation { source, .. }
+            | Self::Cleanup { source, .. } => source.requires_recovery(),
+            Self::OperationAndCleanup {
+                operation, cleanup, ..
+            } => operation.requires_recovery() || cleanup.requires_recovery(),
+        }
+    }
 }
 
 /// One page in an ordered, compare-and-exchange MCP transaction.
@@ -182,6 +319,20 @@ impl McpPageExchangeOperationError {
             | Self::Write { page, .. } => *page,
         }
     }
+
+    fn is_link_lost(&self) -> bool {
+        match self {
+            Self::Read { source, .. } | Self::Write { source, .. } => source.is_link_lost(),
+            Self::CompareMismatch { .. } => false,
+        }
+    }
+
+    fn requires_recovery(&self) -> bool {
+        match self {
+            Self::Read { source, .. } | Self::Write { source, .. } => source.requires_recovery(),
+            Self::CompareMismatch { .. } => false,
+        }
+    }
 }
 
 /// A rejected or failed ordered MCP page compare-and-exchange transaction.
@@ -271,6 +422,32 @@ impl McpPageExchangeError {
                 ..
             } => possibly_written_pages,
             Self::DuplicatePage { .. } | Self::Entry { .. } => &[],
+        }
+    }
+
+    /// Whether this transaction failure contains a lost physical link.
+    pub(crate) fn is_link_lost(&self) -> bool {
+        match self {
+            Self::DuplicatePage { .. } => false,
+            Self::Entry { source } => source.is_link_lost(),
+            Self::Operation { operation, .. } => operation.is_link_lost(),
+            Self::Cleanup { cleanup, .. } => cleanup.is_link_lost(),
+            Self::OperationAndCleanup {
+                operation, cleanup, ..
+            } => operation.is_link_lost() || cleanup.is_link_lost(),
+        }
+    }
+
+    /// Whether this transaction failure contains a poisoned protocol boundary.
+    pub(crate) fn requires_recovery(&self) -> bool {
+        match self {
+            Self::DuplicatePage { .. } => false,
+            Self::Entry { source } => source.requires_recovery(),
+            Self::Operation { operation, .. } => operation.requires_recovery(),
+            Self::Cleanup { cleanup, .. } => cleanup.requires_recovery(),
+            Self::OperationAndCleanup {
+                operation, cleanup, ..
+            } => operation.requires_recovery() || cleanup.requires_recovery(),
         }
     }
 }
@@ -449,8 +626,9 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Errors
     ///
-    /// Returns an error if entry, any page read, or exit fails.
-    /// Programming mode is always exited, even on error.
+    /// Returns an error if entry, any page read, or cleanup fails. Cleanup
+    /// sends the MCP exit byte only from a proved exchange boundary; otherwise
+    /// it closes the transport and requires a radio power cycle.
     pub async fn read_memory_image(&mut self) -> Result<Vec<u8>, Error> {
         self.read_memory_image_with_progress(|_, _| {}).await
     }
@@ -462,8 +640,9 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Errors
     ///
-    /// Returns an error if entry, any page read, or exit fails.
-    /// Programming mode is always exited, even on error.
+    /// Returns an error if entry, any page read, or cleanup fails. Cleanup
+    /// sends the MCP exit byte only from a proved exchange boundary; otherwise
+    /// it closes the transport and requires a radio power cycle.
     pub async fn read_memory_image_with_progress<F>(
         &mut self,
         mut on_progress: F,
@@ -496,8 +675,9 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns [`Error::McpInvalidImageSize`] if the image is the wrong size.
-    /// Returns an error if entry, any page write, or exit fails.
-    /// Programming mode is always exited, even on error.
+    /// Returns an error if entry, any page write, or cleanup fails. Cleanup
+    /// sends the MCP exit byte only from a proved exchange boundary; otherwise
+    /// it closes the transport and requires a radio power cycle.
     pub async fn write_memory_image(&mut self, image: &[u8]) -> Result<(), Error> {
         self.write_memory_image_with_progress(image, |_, _| {})
             .await
@@ -511,8 +691,9 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns [`Error::McpInvalidImageSize`] if the image is the wrong size.
-    /// Returns an error if entry, any page write, or exit fails.
-    /// Programming mode is always exited, even on error.
+    /// Returns an error if entry, any page write, or cleanup fails. Cleanup
+    /// sends the MCP exit byte only from a proved exchange boundary; otherwise
+    /// it closes the transport and requires a radio power cycle.
     pub async fn write_memory_image_with_progress<F>(
         &mut self,
         image: &[u8],
@@ -624,8 +805,9 @@ impl<T: Transport> Radio<T> {
     ///
     /// Returns [`Error::McpPageOutOfRange`] before any I/O if the complete
     /// requested range is not inside the radio's memory image. Returns an
-    /// error if entry, any page read, or exit fails.
-    /// Programming mode is always exited, even on error.
+    /// error if entry, any page read, or cleanup fails. Cleanup sends the MCP
+    /// exit byte only from a proved exchange boundary; otherwise it closes the
+    /// transport and requires a radio power cycle.
     pub async fn read_memory_pages(
         &mut self,
         start_page: McpPage,
@@ -655,9 +837,9 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Errors
     ///
-    /// Returns an error if entry, any page read, or exit fails. Programming
-    /// mode is always exited after a successful entry, even when a page read
-    /// fails.
+    /// Returns an error if entry, any page read, or cleanup fails. Cleanup
+    /// sends the MCP exit byte only from a proved exchange boundary; otherwise
+    /// it closes the transport and requires a radio power cycle.
     pub async fn read_sparse_memory_pages(
         &mut self,
         pages: &[McpPage],
@@ -676,9 +858,9 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Errors
     ///
-    /// Returns an error if entry, any page read, or exit fails. Programming
-    /// mode is always exited after a successful entry, even when a page read
-    /// fails.
+    /// Returns an error if entry, any page read, or cleanup fails. Cleanup
+    /// sends the MCP exit byte only from a proved exchange boundary; otherwise
+    /// it closes the transport and requires a radio power cycle.
     pub async fn read_sparse_memory_pages_with_progress<F>(
         &mut self,
         pages: &[McpPage],
@@ -717,8 +899,8 @@ impl<T: Transport> Radio<T> {
         }
         .await;
 
-        // Always exit programming mode after a successful entry, including a
-        // page-read failure.
+        // Attempt cleanup after a successful entry. The cleanup path sends E
+        // only if the failed operation left a proved exchange boundary.
         let exit_result = self.exit_programming_mode().await;
 
         self.finish_mcp_operation(result, exit_result)
@@ -738,8 +920,9 @@ impl<T: Transport> Radio<T> {
     /// Returns [`Error::McpInvalidImageSize`] before any I/O if `data` is not
     /// page-aligned, and [`Error::McpPageOutOfRange`] if the complete target
     /// range is not inside the radio's memory image.
-    /// Returns an error if entry, any page write, or exit fails.
-    /// Programming mode is always exited, even on error.
+    /// Returns an error if entry, any page write, or cleanup fails. Cleanup
+    /// sends the MCP exit byte only from a proved exchange boundary; otherwise
+    /// it closes the transport and requires a radio power cycle.
     pub async fn write_memory_pages(
         &mut self,
         start_page: WritableMcpPage,
@@ -922,8 +1105,9 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Errors
     ///
-    /// Returns an error if entry, the page read, or exit fails.
-    /// Programming mode is always exited, even on error.
+    /// Returns an error if entry, the page read, or cleanup fails. Cleanup
+    /// sends the MCP exit byte only from a proved exchange boundary; otherwise
+    /// it closes the transport and requires a radio power cycle.
     pub async fn read_page(
         &mut self,
         page: McpPage,
@@ -943,8 +1127,9 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Errors
     ///
-    /// Returns an error if entry, the page write, or exit fails.
-    /// Programming mode is always exited, even on error.
+    /// Returns an error if entry, the page write, or cleanup fails. Cleanup
+    /// sends the MCP exit byte only from a proved exchange boundary; otherwise
+    /// it closes the transport and requires a radio power cycle.
     pub async fn write_page(
         &mut self,
         page: WritableMcpPage,
@@ -969,8 +1154,9 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Errors
     ///
-    /// Returns an error if entry, the page write, or exit fails.
-    /// Programming mode is always exited, even on error.
+    /// Returns an error if entry, the page write, or cleanup fails. Cleanup
+    /// sends the MCP exit byte only from a proved exchange boundary; otherwise
+    /// it closes the transport and requires a radio power cycle.
     pub async fn write_page_unverified(
         &mut self,
         page: WritableMcpPage,
@@ -1011,12 +1197,12 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns an error if entry, any page read, a changed-page write or
-    /// verification, or exit fails.
-    /// Programming mode is always exited after a successful entry, even when
-    /// a read, write, or verification fails. A failed read cannot change the
-    /// radio, but if a write or its verification fails partway through the
-    /// batch, pages written earlier in the same session remain changed; the
-    /// error identifies only the failing page.
+    /// verification, or cleanup fails. Cleanup sends the MCP exit byte only
+    /// from a proved exchange boundary; otherwise it closes the transport and
+    /// requires a radio power cycle. A failed read cannot change the radio,
+    /// but if a write or its verification fails partway through the batch,
+    /// pages written earlier in the same session remain changed; the error
+    /// identifies only the failing page.
     pub async fn modify_memory_pages<F>(
         &mut self,
         pages: &[WritableMcpPage],
@@ -1059,11 +1245,127 @@ impl<T: Transport> Radio<T> {
         }
         .await;
 
-        // Always exit programming mode after a successful entry, including
-        // read and verified-write failure paths.
+        // Attempt cleanup after a successful entry. The cleanup path sends E
+        // only if the failed operation left a proved exchange boundary.
         let exit_result = self.exit_programming_mode().await;
 
         self.finish_mcp_operation(result, exit_result)
+    }
+
+    /// Selectively modify sparse pages and detach only when a write occurred.
+    ///
+    /// `pages` may be unordered and may contain duplicates. Each distinct
+    /// page is read exactly once before `modify` is called for any page. The
+    /// callback then receives each page in ascending order. Only pages whose
+    /// contents actually changed are written, in ascending order, and every
+    /// write is verified by immediate read-back.
+    ///
+    /// An empty page list is rejected before I/O because no operation ran that
+    /// could truthfully return a CAT-ready connection proof.
+    ///
+    /// # Connection lifetime
+    ///
+    /// If at least one page changed, the detached exit path returns
+    /// [`DetachedMcpPageUpdate::ChangedRadioRebooting`] and leaves transport
+    /// recovery to the caller while the new settings take effect. If no page
+    /// changed, the normal exit path reconnects, proves CAT identity, and
+    /// returns [`DetachedMcpPageUpdate::UnchangedCatReady`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DetachedMcpPageUpdateError::EmptyPageSet`] before I/O for an
+    /// empty request, or a structured entry, page-I/O, verification, or cleanup
+    /// failure. After an operation failure, cleanup exits and reconnects only
+    /// when the binary stream is at a proved exchange boundary. An ambiguous
+    /// partial command or handshake is closed without another protocol byte
+    /// and requires a radio power cycle. The error retains pages whose writes
+    /// may have started and the stricter subset whose read-back succeeded. A
+    /// failed read cannot change the radio because all reads finish before any
+    /// callback or write.
+    pub async fn modify_memory_pages_detached_if_changed<F>(
+        &mut self,
+        pages: &[WritableMcpPage],
+        mut modify: F,
+    ) -> Result<DetachedMcpPageUpdate, DetachedMcpPageUpdateError>
+    where
+        F: FnMut(WritableMcpPage, &mut [u8; programming::PAGE_SIZE]),
+    {
+        let pages: std::collections::BTreeSet<WritableMcpPage> = pages.iter().copied().collect();
+
+        if pages.is_empty() {
+            return Err(DetachedMcpPageUpdateError::EmptyPageSet);
+        }
+
+        self.enter_programming_mode().await.map_err(|source| {
+            DetachedMcpPageUpdateError::Entry {
+                source: Box::new(source),
+            }
+        })?;
+
+        let mut possibly_written_pages = Vec::with_capacity(pages.len());
+        let mut verified_written_pages = Vec::with_capacity(pages.len());
+        let result: Result<bool, Error> = async {
+            // Complete every read before exposing bytes to the callback or
+            // starting a write. A read failure therefore cannot leave a
+            // partially changed set of pages on the radio.
+            let mut page_data = Vec::with_capacity(pages.len());
+            for page in pages {
+                let original = self.read_single_page(page.page()).await?;
+                page_data.push((page, original, original));
+            }
+
+            for (page, _, modified) in &mut page_data {
+                modify(*page, modified);
+            }
+
+            let mut changed = false;
+            for (page, original, modified) in &page_data {
+                if original != modified {
+                    // Record before polling the write. Cancellation or a
+                    // missing ACK can mean some or all bytes reached the
+                    // radio even though verification did not finish.
+                    possibly_written_pages.push(*page);
+                    self.write_single_page(*page, modified).await?;
+                    verified_written_pages.push(*page);
+                    changed = true;
+                }
+            }
+
+            Ok(changed)
+        }
+        .await;
+
+        let exit_result = if matches!(&result, Ok(true)) {
+            self.exit_programming_mode_detached().await
+        } else {
+            self.exit_programming_mode().await
+        };
+
+        match (result, exit_result) {
+            (Ok(changed), Ok(())) => Ok(if changed {
+                DetachedMcpPageUpdate::ChangedRadioRebooting
+            } else {
+                DetachedMcpPageUpdate::UnchangedCatReady
+            }),
+            (Err(source), Ok(())) => Err(DetachedMcpPageUpdateError::Operation {
+                possibly_written_pages,
+                verified_written_pages,
+                source: Box::new(source),
+            }),
+            (Ok(_), Err(source)) => Err(DetachedMcpPageUpdateError::Cleanup {
+                possibly_written_pages,
+                verified_written_pages,
+                source: Box::new(source),
+            }),
+            (Err(operation), Err(cleanup)) => {
+                Err(DetachedMcpPageUpdateError::OperationAndCleanup {
+                    possibly_written_pages,
+                    verified_written_pages,
+                    operation: Box::new(operation),
+                    cleanup: Box::new(cleanup),
+                })
+            }
+        }
     }
 
     /// Read a memory page, apply in-place modifications, and write it back
@@ -1082,8 +1384,10 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Errors
     ///
-    /// Returns an error if entry, the page read, the page write, or exit
-    /// fails. Programming mode is always exited, even on error.
+    /// Returns an error if entry, the page read, the page write, or cleanup
+    /// fails. Cleanup sends the MCP exit byte only from a proved exchange
+    /// boundary; otherwise it closes the transport and requires a radio power
+    /// cycle.
     pub async fn modify_memory_page<F>(
         &mut self,
         page: WritableMcpPage,
@@ -1108,7 +1412,8 @@ impl<T: Transport> Radio<T> {
         }
         .await;
 
-        // Always exit programming mode, even on error.
+        // Attempt cleanup after the operation. The cleanup path sends E only
+        // if the failed operation left a proved exchange boundary.
         let exit_result = self.exit_programming_mode().await;
 
         self.finish_mcp_operation(result, exit_result)
@@ -1312,8 +1617,9 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Errors
     ///
-    /// Returns an error if entry, any page read, or exit fails.
-    /// Programming mode is always exited, even on error.
+    /// Returns an error if entry, any page read, or cleanup fails. Cleanup
+    /// sends the MCP exit byte only from a proved exchange boundary; otherwise
+    /// it closes the transport and requires a radio power cycle.
     pub async fn read_channel_flags(&mut self) -> Result<Vec<StoredChannelFlag>, Error> {
         self.enter_programming_mode().await?;
 
@@ -1377,8 +1683,9 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Errors
     ///
-    /// Returns an error if entry, any page read, or exit fails.
-    /// Programming mode is always exited, even on error.
+    /// Returns an error if entry, any page read, or cleanup fails. Cleanup
+    /// sends the MCP exit byte only from a proved exchange boundary; otherwise
+    /// it closes the transport and requires a radio power cycle.
     pub async fn read_all_channels(&mut self) -> Result<Vec<StoredChannelSlot>, Error> {
         self.enter_programming_mode().await?;
 
@@ -1485,8 +1792,9 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Errors
     ///
-    /// Returns an error if the read fails. Programming mode is always
-    /// exited, even on error.
+    /// Returns an error if the read or MCP cleanup fails. An ambiguous binary
+    /// exchange is closed without sending an exit byte and requires a radio
+    /// power cycle.
     pub async fn read_configuration(&mut self) -> Result<crate::memory::MemoryImage, Error> {
         let raw = self.read_memory_image().await?;
         crate::memory::MemoryImage::from_raw(raw).map_err(|e| {
@@ -1505,8 +1813,9 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Errors
     ///
-    /// Returns an error if the read fails. Programming mode is always
-    /// exited, even on error.
+    /// Returns an error if the read or MCP cleanup fails. An ambiguous binary
+    /// exchange is closed without sending an exit byte and requires a radio
+    /// power cycle.
     pub async fn read_configuration_with_progress<F>(
         &mut self,
         on_progress: F,
@@ -1531,8 +1840,9 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Errors
     ///
-    /// Returns an error if the write fails. Programming mode is always
-    /// exited, even on error.
+    /// Returns an error if the write or MCP cleanup fails. An ambiguous binary
+    /// exchange is closed without sending an exit byte and requires a radio
+    /// power cycle.
     pub async fn write_configuration(
         &mut self,
         image: &crate::memory::MemoryImage,
@@ -1547,8 +1857,9 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Errors
     ///
-    /// Returns an error if the write fails. Programming mode is always
-    /// exited, even on error.
+    /// Returns an error if the write or MCP cleanup fails. An ambiguous binary
+    /// exchange is closed without sending an exit byte and requires a radio
+    /// power cycle.
     pub async fn write_configuration_with_progress<F>(
         &mut self,
         image: &crate::memory::MemoryImage,
@@ -1623,6 +1934,7 @@ impl<T: Transport> Radio<T> {
         // future is cancelled from here on, the radio may be in (or
         // entering) PROG MCP mode and CAT must refuse until recovery.
         self.mcp_phase = McpPhase::Active;
+        self.mcp_wire_boundary = McpWireBoundary::Ambiguous;
 
         let entry: Result<(), Error> = async {
             self.transport
@@ -1676,6 +1988,8 @@ impl<T: Transport> Radio<T> {
 
             tracing::info!("programming mode entered, staying at {PROGRAMMING_BAUD} baud");
 
+            self.mcp_wire_boundary = McpWireBoundary::Quiescent;
+
             Ok(())
         }
         .await;
@@ -1707,6 +2021,9 @@ impl<T: Transport> Radio<T> {
     /// proof clears the programming-session poison but does not hide the
     /// original acknowledgement error.
     async fn exit_programming_mode(&mut self) -> Result<(), Error> {
+        if self.mcp_wire_boundary == McpWireBoundary::Ambiguous {
+            return self.close_ambiguous_mcp_boundary().await;
+        }
         if let Err(error) = self.send_programming_exit().await {
             // Store this before the next await. If reset settling or
             // reconnect is cancelled, recovery can still surface the
@@ -1737,6 +2054,10 @@ impl<T: Transport> Radio<T> {
     async fn exit_programming_mode_detached(&mut self) -> Result<(), Error> {
         tracing::info!("exiting programming mode");
 
+        if self.mcp_wire_boundary == McpWireBoundary::Ambiguous {
+            return self.close_ambiguous_mcp_boundary().await;
+        }
+
         self.send_programming_exit().await?;
         self.settle_after_programming_exit().await;
 
@@ -1744,7 +2065,25 @@ impl<T: Transport> Radio<T> {
         // caller expects the link to disappear. The exact ACK is its
         // terminal proof that MCP accepted the one exit byte.
         self.mcp_phase = McpPhase::Inactive;
+        self.mcp_wire_boundary = McpWireBoundary::Quiescent;
         Ok(())
+    }
+
+    /// Close without writing any protocol byte after a partial MCP exchange.
+    async fn close_ambiguous_mcp_boundary(&mut self) -> Result<(), Error> {
+        tracing::error!(
+            "MCP exchange boundary is ambiguous; closing without sending the exit byte"
+        );
+        self.desynced = true;
+        let _ = self.link_state_tx.send_replace(super::LinkState::Down);
+        let boundary = Error::McpWireBoundaryUnproved;
+        match self.transport.close().await {
+            Ok(()) => Err(boundary),
+            Err(close) => Err(Error::McpOperationAndCleanupFailed {
+                operation: Box::new(boundary),
+                cleanup: Box::new(Error::Transport(close)),
+            }),
+        }
     }
 
     /// Send exactly one raw MCP exit byte and require its one-byte ACK.
@@ -1762,6 +2101,7 @@ impl<T: Transport> Radio<T> {
         // Set this before polling the transport write. From this point on,
         // recovery must conservatively assume that E reached the radio.
         self.mcp_phase = McpPhase::ExitSent;
+        self.mcp_wire_boundary = McpWireBoundary::Ambiguous;
         self.desynced = true;
         tokio::time::timeout(
             MCP_EXIT_ACK_TIMEOUT,
@@ -1788,6 +2128,8 @@ impl<T: Transport> Radio<T> {
         if ack[0] != programming::ACK {
             return Err(Error::McpExitNotAcknowledged { got: ack[0] });
         }
+
+        self.mcp_wire_boundary = McpWireBoundary::Quiescent;
 
         Ok(())
     }
@@ -1870,6 +2212,7 @@ impl<T: Transport> Radio<T> {
         // succeeds. Cancellation or failure while restoring optional
         // cached state must not re-poison an independently proved CAT link.
         guard.cat_proved = true;
+        guard.radio.mcp_wire_boundary = McpWireBoundary::Quiescent;
         let result = guard.radio.restore_state_after_reconnect().await;
         guard.restore_finished = true;
         result
@@ -1878,10 +2221,12 @@ impl<T: Transport> Radio<T> {
     /// Recover after an MCP programming session's future was cancelled
     /// mid-transfer (e.g. by a caller-side `tokio::time::timeout`).
     ///
-    /// Sends the MCP exit byte at most once, restores the saved CAT timeout,
-    /// and reconnects to prove normal CAT operation. If an earlier future
-    /// was cancelled after the exit phase began, recovery only settles and
-    /// reconnects; it never retransmits `E`. CAT commands refuse with
+    /// Sends the MCP exit byte only when the stream is at a proved quiescent
+    /// exchange boundary, restores the saved CAT timeout, and reconnects to
+    /// prove normal CAT operation. An ambiguous partial exchange is closed
+    /// without sending any more bytes and requires a radio power cycle. If an
+    /// earlier future was cancelled after the exit phase began, recovery only
+    /// settles and reconnects; it never retransmits `E`. CAT commands refuse with
     /// [`Error::McpInterrupted`] until CAT reconnect/identity is proved. A
     /// no-op if no session was interrupted and no retained exit anomaly
     /// remains to be reported.
@@ -2037,6 +2382,7 @@ impl<T: Transport> Radio<T> {
         tracing::debug!(page = page.as_raw(), "reading page");
 
         // Send R command (5 bytes).
+        self.mcp_wire_boundary = McpWireBoundary::Ambiguous;
         self.transport.write(&cmd).await.map_err(Error::Transport)?;
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
@@ -2135,6 +2481,8 @@ impl<T: Transport> Radio<T> {
             });
         }
 
+        self.mcp_wire_boundary = McpWireBoundary::Quiescent;
+
         Ok(())
     }
 
@@ -2177,6 +2525,7 @@ impl<T: Transport> Radio<T> {
         tracing::debug!(page = page.as_raw(), "writing page");
 
         // Send W command (261 bytes).
+        self.mcp_wire_boundary = McpWireBoundary::Ambiguous;
         self.transport.write(&cmd).await.map_err(Error::Transport)?;
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
@@ -2208,6 +2557,8 @@ impl<T: Transport> Radio<T> {
                 got: ack_buf[0],
             });
         }
+
+        self.mcp_wire_boundary = McpWireBoundary::Quiescent;
 
         Ok(())
     }
@@ -2258,13 +2609,14 @@ impl<T: Transport> Radio<T> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DATA_BACKED_CHANNEL_FLAG_PAGE_COUNT, McpPage, McpPageExchange, McpPageExchangeError,
-        McpPageExchangeOperationError, WritableMcpPage,
+        DATA_BACKED_CHANNEL_FLAG_PAGE_COUNT, DetachedMcpPageUpdate, DetachedMcpPageUpdateError,
+        McpPage, McpPageExchange, McpPageExchangeError, McpPageExchangeOperationError,
+        WritableMcpPage,
     };
     use crate::error::{Error, ProtocolError, TransportError};
     use crate::protocol::programming;
     use crate::protocol::{Command, Response};
-    use crate::radio::{CatState, McpPhase, Radio};
+    use crate::radio::{CatState, LinkState, McpPhase, McpWireBoundary, Radio};
     use crate::transport::{MockTransport, Transport};
     use crate::types::{
         Band, ChannelDisplayName, Frequency, MemoryChannelBand, MemoryGroup, RegularChannel,
@@ -2582,19 +2934,33 @@ mod tests {
             .ok_or("test W response unexpectedly shorter than 32 bytes")?;
         mock.expect_partial_then_hang(&cmd, partial);
 
-        // No retry and no host ACK are scripted. The ambiguous response
-        // must fail directly into the normal MCP exit path.
-        mock.expect(b"E", &[programming::ACK]);
-        mock.expect_reopen(Ok(()));
-        mock.expect(b"ID\r", b"ID TH-D75\r");
+        // No retry, host ACK, raw exit, or reconnect is scripted. The partial
+        // frame leaves the wire boundary ambiguous, so cleanup must close the
+        // transport without transmitting another protocol byte.
 
         let mut radio = Radio::new(mock);
         let page_timeout = std::time::Duration::from_millis(50);
         radio.set_timeout(page_timeout);
         let result = radio.read_page(McpPage::new(page)?).await;
         assert!(
-            matches!(result, Err(Error::Timeout(timeout)) if timeout == page_timeout),
-            "partial frame must time out without retrying: {result:?}"
+            matches!(
+                &result,
+                Err(Error::McpOperationAndCleanupFailed { operation, cleanup })
+                    if matches!(operation.as_ref(), Error::Timeout(timeout) if *timeout == page_timeout)
+                        && matches!(
+                            cleanup.as_ref(),
+                            Error::McpCleanupNotProved { cleanup }
+                                if matches!(cleanup.as_ref(), Error::McpWireBoundaryUnproved)
+                        )
+            ),
+            "partial frame must time out and refuse raw-E cleanup: {result:?}"
+        );
+        assert_eq!(radio.mcp_phase, McpPhase::Active);
+        assert_eq!(radio.mcp_wire_boundary, McpWireBoundary::Ambiguous);
+        assert_eq!(
+            *radio.link_state().borrow(),
+            LinkState::Down,
+            "closing an ambiguous MCP stream must publish the lost link"
         );
         radio.transport.assert_complete();
         Ok(())
@@ -2612,22 +2978,26 @@ mod tests {
         mock.expect(&command, &response);
         mock.expect(&[programming::ACK], &[programming::ACK]);
 
-        mock.expect(b"E", &[programming::ACK]);
-        mock.expect_reopen(Ok(()));
-        mock.expect(b"ID\r", b"ID TH-D75\r");
-
         let mut radio = Radio::new(mock);
         let result = radio.read_page(McpPage::new(page)?).await;
         assert!(
             matches!(
-                result,
-                Err(Error::McpPageReadNotAcknowledged {
-                    page,
-                    got: 0x15,
-                }) if page.as_raw() == 0x0020
+                &result,
+                Err(Error::McpOperationAndCleanupFailed { operation, cleanup })
+                    if matches!(
+                        operation.as_ref(),
+                        Error::McpPageReadNotAcknowledged { page, got: 0x15 }
+                            if page.as_raw() == 0x0020
+                    ) && matches!(
+                        cleanup.as_ref(),
+                        Error::McpCleanupNotProved { cleanup }
+                            if matches!(cleanup.as_ref(), Error::McpWireBoundaryUnproved)
+                    )
             ),
-            "the byte after one W frame must remain visible to the ACK parser: {result:?}"
+            "the trailing byte must reach the ACK parser and force fail-closed cleanup: {result:?}"
         );
+        assert_eq!(radio.mcp_phase, McpPhase::Active);
+        assert_eq!(radio.mcp_wire_boundary, McpWireBoundary::Ambiguous);
         radio.transport.assert_complete();
         Ok(())
     }
@@ -2646,24 +3016,29 @@ mod tests {
         );
         mock.expect(&[programming::ACK], &[0x15]);
 
-        // A bad trailing ACK makes the exchange unsafe to retry. Cleanup is
-        // the only remaining scripted operation.
-        mock.expect(b"E", &[programming::ACK]);
-        mock.expect_reopen(Ok(()));
-        mock.expect(b"ID\r", b"ID TH-D75\r");
+        // A bad trailing ACK makes the exchange unsafe to retry or exit. No
+        // further protocol byte is scripted; cleanup must only close.
 
         let mut radio = Radio::new(mock);
         let result = radio.read_page(McpPage::new(requested_page)?).await;
         assert!(
             matches!(
-                result,
-                Err(Error::McpPageReadNotAcknowledged {
-                    page,
-                    got: 0x15,
-                }) if page.as_raw() == 0x0021
+                &result,
+                Err(Error::McpOperationAndCleanupFailed { operation, cleanup })
+                    if matches!(
+                        operation.as_ref(),
+                        Error::McpPageReadNotAcknowledged { page, got: 0x15 }
+                            if page.as_raw() == 0x0021
+                    ) && matches!(
+                        cleanup.as_ref(),
+                        Error::McpCleanupNotProved { cleanup }
+                            if matches!(cleanup.as_ref(), Error::McpWireBoundaryUnproved)
+                    )
             ),
             "wrong-page retry must require the radio's trailing ACK: {result:?}"
         );
+        assert_eq!(radio.mcp_phase, McpPhase::Active);
+        assert_eq!(radio.mcp_wire_boundary, McpWireBoundary::Ambiguous);
         radio.transport.assert_complete();
         Ok(())
     }
@@ -2695,18 +3070,15 @@ mod tests {
             "CAT after a cancelled MCP session must refuse: {refused:?}"
         );
 
-        // Recovery sends the exit byte, reconnects, and restores
-        // normal operation.
-        radio.transport.expect(b"E", &[programming::ACK]);
-        radio.transport.expect_reopen(Ok(()));
-        radio.transport.expect(b"ID\r", b"ID TH-D75\r");
-        radio.recover_from_interrupted_mcp().await?;
-
-        radio.transport.expect(b"MD 0\r", b"MD 0,0\r");
-        let response = radio
-            .execute(Command::GetOperatingMode { band: Band::A })
-            .await?;
-        assert!(matches!(response, Response::OperatingMode { .. }));
+        // The cancelled read has no proved frame boundary. Recovery must
+        // close without sending E or attempting CAT on the same transport.
+        let recovery = radio.recover_from_interrupted_mcp().await;
+        assert!(
+            matches!(recovery, Err(Error::McpWireBoundaryUnproved)),
+            "ambiguous recovery must require a power cycle: {recovery:?}"
+        );
+        assert_eq!(radio.mcp_phase, McpPhase::Active);
+        assert_eq!(radio.mcp_wire_boundary, McpWireBoundary::Ambiguous);
         radio.transport.assert_complete();
         Ok(())
     }
@@ -3021,7 +3393,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn sparse_read_reports_operation_and_unproved_reconnect_failures() -> TestResult {
+    async fn sparse_read_reports_operation_and_ambiguous_boundary_cleanup() -> TestResult {
         let mut mock = MockTransport::new();
         mock.expect(b"\r0M PROGRAM\r", b"0M\r");
 
@@ -3030,8 +3402,6 @@ mod tests {
         // The short frame is followed by MockTransport's WouldBlock error,
         // producing a transfer failure without a timeout retry.
         mock.expect(&read, b"W");
-        mock.expect(b"E", &[programming::ACK]);
-        mock.expect_reopen(Err(TransportError::ReopenUnsupported));
 
         let mut radio = Radio::new(mock);
         let result = radio.read_sparse_memory_pages(&[page]).await;
@@ -3043,8 +3413,12 @@ mod tests {
                     "the original page-read failure was not retained: {operation:?}"
                 );
                 assert!(
-                    matches!(&*cleanup, Error::McpCleanupNotProved { .. }),
-                    "the unproved reconnect failure was not prioritized: {cleanup:?}"
+                    matches!(
+                        &*cleanup,
+                        Error::McpCleanupNotProved { cleanup }
+                            if matches!(cleanup.as_ref(), Error::McpWireBoundaryUnproved)
+                    ),
+                    "the ambiguous boundary cleanup was not retained: {cleanup:?}"
                 );
             }
             other => {
@@ -3054,9 +3428,10 @@ mod tests {
             }
         }
         assert!(
-            radio.mcp_phase == McpPhase::ExitSent,
-            "failed CAT proof must leave MCP recovery state poisoned"
+            radio.mcp_phase == McpPhase::Active,
+            "ambiguous read cleanup must not claim that E was sent"
         );
+        assert_eq!(radio.mcp_wire_boundary, McpWireBoundary::Ambiguous);
         radio.transport.assert_complete();
         Ok(())
     }
@@ -3068,7 +3443,17 @@ mod tests {
 
         let page = McpPage::new(0x0010)?;
         let read = programming::build_read_command(page);
-        mock.expect(&read, b"W");
+        // Two complete, acknowledged wrong-page responses leave the wire at
+        // a quiescent boundary while still producing an operation failure.
+        // That is the condition under which sending E remains safe.
+        let wrong_page = McpPage::new(page.as_raw() + 1)?;
+        for _ in 0..2 {
+            mock.expect(
+                &read,
+                &build_w_response(wrong_page.as_raw(), &[0xA5; programming::PAGE_SIZE])?,
+            );
+            mock.expect(&[programming::ACK], &[programming::ACK]);
+        }
         mock.expect(b"E", &[0x15]);
         mock.expect_reopen(Ok(()));
         mock.expect(b"ID\r", b"ID TH-D75\r");
@@ -3078,7 +3463,11 @@ mod tests {
         match result {
             Err(Error::McpOperationAndCleanupFailed { operation, cleanup }) => {
                 assert!(
-                    matches!(&*operation, Error::Transport(_)),
+                    matches!(
+                        &*operation,
+                        Error::McpPageMismatch { requested, answered }
+                            if *requested == page && *answered == wrong_page
+                    ),
                     "original page-read failure was not retained: {operation:?}"
                 );
                 assert!(
@@ -3100,11 +3489,9 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn failed_entry_retains_failed_exit_and_reconnect_cleanup() -> TestResult {
+    async fn failed_entry_closes_without_sending_an_unframed_exit() -> TestResult {
         let mut mock = MockTransport::new();
         mock.expect(b"\r0M PROGRAM\r", b"not-an-mcp-entry-acknowledgement");
-        mock.expect(b"E", &[0x15]);
-        mock.expect_reopen(Err(TransportError::ReopenUnsupported));
 
         let mut radio = Radio::new(mock);
         let result = radio.read_page(McpPage::new(0)?).await;
@@ -3115,45 +3502,24 @@ mod tests {
                     matches!(&*operation, Error::Protocol(_)),
                     "the failed entry was not retained: {operation:?}"
                 );
-                match *cleanup {
-                    Error::McpOperationAndCleanupFailed {
-                        operation: exit,
-                        cleanup: reconnect,
-                    } => {
-                        assert!(
-                            matches!(&*exit, Error::McpExitNotAcknowledged { got: 0x15 }),
-                            "the failed exit acknowledgement was not retained: {exit:?}"
-                        );
-                        match *reconnect {
-                            Error::McpCleanupNotProved { cleanup: source } => {
-                                assert!(
-                                    matches!(&*source, Error::Transport(_)),
-                                    "the reconnect proof failure was not retained: {source:?}"
-                                );
-                            }
-                            other => {
-                                return Err(format!(
-                                    "unproved reconnect lacked power-cycle guidance: {other:?}"
-                                )
-                                .into());
-                            }
-                        }
-                    }
-                    other => {
-                        return Err(
-                            format!("expected failed exit plus reconnect, got {other:?}").into(),
-                        );
-                    }
-                }
+                assert!(
+                    matches!(
+                        cleanup.as_ref(),
+                        Error::McpCleanupNotProved { cleanup }
+                            if matches!(cleanup.as_ref(), Error::McpWireBoundaryUnproved)
+                    ),
+                    "failed entry did not retain its ambiguous-boundary cleanup: {cleanup:?}"
+                );
             }
             other => {
                 return Err(format!("expected failed entry plus cleanup, got {other:?}").into());
             }
         }
         assert!(
-            radio.mcp_phase == McpPhase::ExitSent,
-            "failed entry cleanup must keep CAT blocked"
+            radio.mcp_phase == McpPhase::Active,
+            "failed entry cleanup must not claim that E was sent"
         );
+        assert_eq!(radio.mcp_wire_boundary, McpWireBoundary::Ambiguous);
         radio.transport.assert_complete();
         Ok(())
     }
@@ -3426,17 +3792,18 @@ mod tests {
         // which fails the page read without triggering the timeout retry.
         mock.expect(&read, b"W");
 
-        mock.expect(b"E", &[programming::ACK]);
-        mock.expect_reopen(Ok(()));
-        mock.expect(b"ID\r", b"ID TH-D75\r");
-
         let mut radio = Radio::new(mock);
         let result = radio.read_sparse_memory_pages(&[McpPage::new(page)?]).await;
 
+        let Err(error) = result else {
+            return Err("short page response unexpectedly succeeded".into());
+        };
         assert!(
-            matches!(result, Err(Error::Transport(_))),
-            "short page response should surface as a transport error: {result:?}"
+            error.to_string().contains("MCP wire boundary is ambiguous"),
+            "short page response must refuse unsafe raw-E cleanup: {error}"
         );
+        assert_eq!(radio.mcp_phase, McpPhase::Active);
+        assert_eq!(radio.mcp_wire_boundary, McpWireBoundary::Ambiguous);
         radio.transport.assert_complete();
         Ok(())
     }
@@ -3539,6 +3906,429 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn detached_multi_page_modify_writes_ascending_then_skips_reconnect() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"\r0M PROGRAM\r", b"0M\r");
+
+        let low_page = WritableMcpPage::new(0x0010)?;
+        let high_page = WritableMcpPage::new(0x001C)?;
+        let low_original = [0x11; programming::PAGE_SIZE];
+        let high_original = [0x22; programming::PAGE_SIZE];
+
+        // The caller supplies unordered, duplicate pages. Both complete reads
+        // must occur once, in ascending order, before either write begins.
+        for (page, original) in [(low_page, &low_original), (high_page, &high_original)] {
+            let read = programming::build_read_command(page.page());
+            mock.expect(&read, &build_w_response(page.as_raw(), original)?);
+            mock.expect(&[programming::ACK], &[programming::ACK]);
+        }
+
+        let mut low_modified = low_original;
+        let mut high_modified = high_original;
+        set_byte(&mut low_modified, 0x71, 0xA1)?;
+        set_byte(&mut high_modified, 0xA0, 0xB2)?;
+
+        // Writes and their immediate read-back verification also retain the
+        // distinct pages' ascending order.
+        for (page, modified) in [(low_page, &low_modified), (high_page, &high_modified)] {
+            let write = programming::build_write_command(page, modified);
+            mock.expect(&write, &[programming::ACK]);
+            let readback = programming::build_read_command(page.page());
+            mock.expect(&readback, &build_w_response(page.as_raw(), modified)?);
+            mock.expect(&[programming::ACK], &[programming::ACK]);
+        }
+
+        // A changed batch deliberately uses the detached exit: no reopen or
+        // CAT identity exchange is present in this strict script.
+        mock.expect(b"E", &[programming::ACK]);
+
+        let mut radio = Radio::new(mock);
+        let mut visited = Vec::new();
+        let outcome = radio
+            .modify_memory_pages_detached_if_changed(
+                &[high_page, low_page, high_page],
+                |page, data| {
+                    visited.push(page);
+                    if page == low_page {
+                        if let Some(byte) = data.get_mut(0x71) {
+                            *byte = 0xA1;
+                        }
+                    } else if page == high_page
+                        && let Some(byte) = data.get_mut(0xA0)
+                    {
+                        *byte = 0xB2;
+                    }
+                },
+            )
+            .await?;
+
+        assert_eq!(visited, vec![low_page, high_page]);
+        assert_eq!(outcome, DetachedMcpPageUpdate::ChangedRadioRebooting);
+        assert_eq!(radio.mcp_phase, McpPhase::Inactive);
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn detached_multi_page_modify_unchanged_restores_cat() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"\r0M PROGRAM\r", b"0M\r");
+
+        let page = WritableMcpPage::new(0x001C)?;
+        let original = [0x5A; programming::PAGE_SIZE];
+        let read = programming::build_read_command(page.page());
+        mock.expect(&read, &build_w_response(page.as_raw(), &original)?);
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+
+        // No write is scripted. An unchanged batch must take the normal exit
+        // path and prove the reopened link speaks CAT.
+        mock.expect(b"E", &[programming::ACK]);
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\r", b"ID TH-D75\r");
+
+        let mut radio = Radio::new(mock);
+        let mut visited = Vec::new();
+        let outcome = radio
+            .modify_memory_pages_detached_if_changed(&[page, page], |visited_page, _| {
+                visited.push(visited_page);
+            })
+            .await?;
+
+        assert_eq!(visited, vec![page]);
+        assert_eq!(outcome, DetachedMcpPageUpdate::UnchangedCatReady);
+        assert_eq!(radio.mcp_phase, McpPhase::Inactive);
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn detached_multi_page_empty_request_is_rejected_without_io() -> TestResult {
+        let mock = MockTransport::new();
+        let mut radio = Radio::new(mock);
+        let mut callback_called = false;
+        let result = radio
+            .modify_memory_pages_detached_if_changed(&[], |_, _| callback_called = true)
+            .await;
+
+        assert!(
+            matches!(result, Err(DetachedMcpPageUpdateError::EmptyPageSet)),
+            "empty request must not claim that CAT was proved: {result:?}"
+        );
+        assert!(
+            !callback_called,
+            "empty request must not invoke its callback"
+        );
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[test]
+    fn detached_update_wrapper_preserves_nested_recovery_and_link_classification() {
+        let timed_out: Error = DetachedMcpPageUpdateError::Entry {
+            source: Box::new(Error::Timeout(std::time::Duration::from_secs(1))),
+        }
+        .into();
+        assert!(timed_out.is_link_lost());
+        assert!(timed_out.requires_recovery());
+
+        let ambiguous_cleanup: Error = DetachedMcpPageUpdateError::OperationAndCleanup {
+            possibly_written_pages: Vec::new(),
+            verified_written_pages: Vec::new(),
+            operation: Box::new(Error::CommandRejected {
+                mnemonic: "W".to_owned(),
+            }),
+            cleanup: Box::new(Error::McpWireBoundaryUnproved),
+        }
+        .into();
+        assert!(!ambiguous_cleanup.is_link_lost());
+        assert!(ambiguous_cleanup.requires_recovery());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn detached_multi_page_read_failure_writes_nothing_and_restores_cat() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"\r0M PROGRAM\r", b"0M\r");
+
+        let low_page = WritableMcpPage::new(0x0010)?;
+        let high_page = WritableMcpPage::new(0x001C)?;
+        let low_original = [0x11; programming::PAGE_SIZE];
+        let low_read = programming::build_read_command(low_page.page());
+        mock.expect(
+            &low_read,
+            &build_w_response(low_page.as_raw(), &low_original)?,
+        );
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+
+        // The second page is incomplete. Because the W frame boundary is not
+        // proved, cleanup must close without sending raw E.
+        let high_read = programming::build_read_command(high_page.page());
+        mock.expect(&high_read, b"W");
+
+        let mut radio = Radio::new(mock);
+        let mut callback_called = false;
+        let result = radio
+            .modify_memory_pages_detached_if_changed(&[high_page, low_page], |_, _| {
+                callback_called = true;
+            })
+            .await;
+
+        let Err(error) = result else {
+            return Err("short page response unexpectedly succeeded".into());
+        };
+        assert!(
+            matches!(
+                &error,
+                DetachedMcpPageUpdateError::OperationAndCleanup { operation, .. }
+                    if matches!(operation.as_ref(), Error::Transport(_))
+            ),
+            "short page response should retain its transport error: {error:?}"
+        );
+        assert!(
+            error.possibly_written_pages().is_empty(),
+            "a read failure cannot have started any write"
+        );
+        assert!(
+            error.verified_written_pages().is_empty(),
+            "a read failure cannot have verified any write"
+        );
+        assert!(
+            !callback_called,
+            "a failed read must prevent every callback and write"
+        );
+        assert_eq!(radio.mcp_phase, McpPhase::Active);
+        assert_eq!(radio.mcp_wire_boundary, McpWireBoundary::Ambiguous);
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn detached_multi_page_partial_write_failure_restores_cat() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"\r0M PROGRAM\r", b"0M\r");
+
+        let low_page = WritableMcpPage::new(0x0010)?;
+        let high_page = WritableMcpPage::new(0x001C)?;
+        let low_original = [0x11; programming::PAGE_SIZE];
+        let high_original = [0x22; programming::PAGE_SIZE];
+        for (page, original) in [(low_page, &low_original), (high_page, &high_original)] {
+            let read = programming::build_read_command(page.page());
+            mock.expect(&read, &build_w_response(page.as_raw(), original)?);
+            mock.expect(&[programming::ACK], &[programming::ACK]);
+        }
+
+        let mut low_modified = low_original;
+        let mut high_modified = high_original;
+        set_byte(&mut low_modified, 0x71, 0xA1)?;
+        set_byte(&mut high_modified, 0xA0, 0xB2)?;
+
+        // The first changed page is written and verified successfully.
+        let low_write = programming::build_write_command(low_page, &low_modified);
+        mock.expect(&low_write, &[programming::ACK]);
+        let low_readback = programming::build_read_command(low_page.page());
+        mock.expect(
+            &low_readback,
+            &build_w_response(low_page.as_raw(), &low_modified)?,
+        );
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+
+        // The second write reaches the transport but receives no ACK. The
+        // operation must close without writing raw E because the W-frame
+        // boundary is not proved.
+        let high_write = programming::build_write_command(high_page, &high_modified);
+        mock.expect(&high_write, &[]);
+
+        let mut radio = Radio::new(mock);
+        let result = radio
+            .modify_memory_pages_detached_if_changed(&[high_page, low_page], |page, data| {
+                if page == low_page {
+                    if let Some(byte) = data.get_mut(0x71) {
+                        *byte = 0xA1;
+                    }
+                } else if page == high_page
+                    && let Some(byte) = data.get_mut(0xA0)
+                {
+                    *byte = 0xB2;
+                }
+            })
+            .await;
+
+        let Err(error) = result else {
+            return Err("missing write ACK unexpectedly succeeded".into());
+        };
+        assert!(
+            matches!(
+                &error,
+                DetachedMcpPageUpdateError::Operation { source, .. }
+                    if matches!(source.as_ref(), Error::Transport(_))
+            ) || matches!(
+                &error,
+                DetachedMcpPageUpdateError::OperationAndCleanup { operation, .. }
+                    if matches!(operation.as_ref(), Error::Transport(_))
+            ),
+            "missing write ACK should retain its transport error: {error:?}"
+        );
+        assert_eq!(
+            error.possibly_written_pages(),
+            &[low_page, high_page],
+            "both the completed and interrupted writes may have reached the radio"
+        );
+        assert_eq!(
+            error.verified_written_pages(),
+            &[low_page],
+            "only the first page completed read-back verification"
+        );
+        assert_eq!(radio.mcp_phase, McpPhase::Active);
+        assert_eq!(radio.mcp_wire_boundary, McpWireBoundary::Ambiguous);
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn detached_multi_page_second_verify_mismatch_reports_partial_progress() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"\r0M PROGRAM\r", b"0M\r");
+
+        let low_page = WritableMcpPage::new(0x0010)?;
+        let high_page = WritableMcpPage::new(0x001C)?;
+        let low_original = [0x11; programming::PAGE_SIZE];
+        let high_original = [0x22; programming::PAGE_SIZE];
+        for (page, original) in [(low_page, &low_original), (high_page, &high_original)] {
+            let read = programming::build_read_command(page.page());
+            mock.expect(&read, &build_w_response(page.as_raw(), original)?);
+            mock.expect(&[programming::ACK], &[programming::ACK]);
+        }
+
+        let low_modified = [0xA1; programming::PAGE_SIZE];
+        let high_modified = [0xB2; programming::PAGE_SIZE];
+        let low_write = programming::build_write_command(low_page, &low_modified);
+        mock.expect(&low_write, &[programming::ACK]);
+        let low_read = programming::build_read_command(low_page.page());
+        mock.expect(
+            &low_read,
+            &build_w_response(low_page.as_raw(), &low_modified)?,
+        );
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+
+        let high_write = programming::build_write_command(high_page, &high_modified);
+        mock.expect(&high_write, &[programming::ACK]);
+        let high_read = programming::build_read_command(high_page.page());
+        let mut mismatched = high_modified;
+        set_byte(&mut mismatched, 0xA0, 0xE3)?;
+        mock.expect(
+            &high_read,
+            &build_w_response(high_page.as_raw(), &mismatched)?,
+        );
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+
+        // The read-back handshake completed, so the boundary is quiescent and
+        // the normal error cleanup can safely exit and prove CAT identity.
+        mock.expect(b"E", &[programming::ACK]);
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\r", b"ID TH-D75\r");
+
+        let mut radio = Radio::new(mock);
+        let result = radio
+            .modify_memory_pages_detached_if_changed(&[high_page, low_page], |_, data| {
+                let fill = if data.first().copied() == Some(0x11) {
+                    0xA1
+                } else {
+                    0xB2
+                };
+                data.fill(fill);
+            })
+            .await;
+
+        let Err(error) = result else {
+            return Err("mismatched second-page read-back unexpectedly succeeded".into());
+        };
+        assert!(
+            matches!(
+                &error,
+                DetachedMcpPageUpdateError::Operation { source, .. }
+                    if matches!(
+                        source.as_ref(),
+                        Error::McpVerifyMismatch {
+                            page,
+                            offset: 0xA0,
+                            expected: 0xB2,
+                            actual: 0xE3,
+                        } if *page == high_page
+                    )
+            ),
+            "second-page verification mismatch lost its typed cause: {error:?}"
+        );
+        assert_eq!(error.possibly_written_pages(), &[low_page, high_page]);
+        assert_eq!(error.verified_written_pages(), &[low_page]);
+        assert_eq!(radio.mcp_phase, McpPhase::Inactive);
+        assert_eq!(radio.mcp_wire_boundary, McpWireBoundary::Quiescent);
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn detached_multi_page_exit_failure_reports_all_verified_writes() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"\r0M PROGRAM\r", b"0M\r");
+
+        let low_page = WritableMcpPage::new(0x0010)?;
+        let high_page = WritableMcpPage::new(0x001C)?;
+        let low_original = [0x11; programming::PAGE_SIZE];
+        let high_original = [0x22; programming::PAGE_SIZE];
+        for (page, original) in [(low_page, &low_original), (high_page, &high_original)] {
+            let read = programming::build_read_command(page.page());
+            mock.expect(&read, &build_w_response(page.as_raw(), original)?);
+            mock.expect(&[programming::ACK], &[programming::ACK]);
+        }
+
+        let low_modified = [0xA1; programming::PAGE_SIZE];
+        let high_modified = [0xB2; programming::PAGE_SIZE];
+        for (page, modified) in [(low_page, &low_modified), (high_page, &high_modified)] {
+            let write = programming::build_write_command(page, modified);
+            mock.expect(&write, &[programming::ACK]);
+            let read = programming::build_read_command(page.page());
+            mock.expect(&read, &build_w_response(page.as_raw(), modified)?);
+            mock.expect(&[programming::ACK], &[programming::ACK]);
+        }
+
+        // Every page is verified before the detached exit receives its NAK.
+        // No reconnect is attempted by this intentionally detached path.
+        mock.expect(b"E", &[0x15]);
+
+        let mut radio = Radio::new(mock);
+        let result = radio
+            .modify_memory_pages_detached_if_changed(&[high_page, low_page], |_, data| {
+                let fill = if data.first().copied() == Some(0x11) {
+                    0xA1
+                } else {
+                    0xB2
+                };
+                data.fill(fill);
+            })
+            .await;
+
+        let Err(error) = result else {
+            return Err("NAKed detached exit unexpectedly succeeded".into());
+        };
+        assert!(
+            matches!(
+                &error,
+                DetachedMcpPageUpdateError::Cleanup { source, .. }
+                    if matches!(
+                        source.as_ref(),
+                        Error::McpExitNotAcknowledged { got: 0x15 }
+                    )
+            ),
+            "detached exit failure lost its typed cause: {error:?}"
+        );
+        assert_eq!(error.possibly_written_pages(), &[low_page, high_page]);
+        assert_eq!(error.verified_written_pages(), &[low_page, high_page]);
+        assert_eq!(radio.mcp_phase, McpPhase::ExitSent);
+        assert_eq!(radio.mcp_wire_boundary, McpWireBoundary::Ambiguous);
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
     #[tokio::test]
     async fn writable_mcp_page_rejects_factory_calibration_before_io() -> TestResult {
         let mock = MockTransport::new();
@@ -3573,7 +4363,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn modify_memory_pages_exits_after_read_failure() -> TestResult {
+    async fn modify_memory_pages_closes_after_ambiguous_read_failure() -> TestResult {
         let mut mock = MockTransport::new();
         mock.expect(b"\r0M PROGRAM\r", b"0M\r");
 
@@ -3583,19 +4373,26 @@ mod tests {
         // which fails the page read without triggering the timeout retry.
         mock.expect(&read, b"W");
 
-        mock.expect(b"E", &[programming::ACK]);
-        mock.expect_reopen(Ok(()));
-        mock.expect(b"ID\r", b"ID TH-D75\r");
-
         let mut radio = Radio::new(mock);
         let result = radio
             .modify_memory_pages(&[WritableMcpPage::new(page)?], |_, _| {})
             .await;
 
         assert!(
-            matches!(result, Err(Error::Transport(_))),
-            "short page response should surface as a transport error: {result:?}"
+            matches!(
+                &result,
+                Err(Error::McpOperationAndCleanupFailed { operation, cleanup })
+                    if matches!(operation.as_ref(), Error::Transport(_))
+                        && matches!(
+                            cleanup.as_ref(),
+                            Error::McpCleanupNotProved { cleanup }
+                                if matches!(cleanup.as_ref(), Error::McpWireBoundaryUnproved)
+                        )
+            ),
+            "short page response must retain its error and refuse raw-E cleanup: {result:?}"
         );
+        assert_eq!(radio.mcp_phase, McpPhase::Active);
+        assert_eq!(radio.mcp_wire_boundary, McpWireBoundary::Ambiguous);
         radio.transport.assert_complete();
         Ok(())
     }
@@ -3773,11 +4570,9 @@ mod tests {
         set_byte(&mut response, 4, 0x01)?;
         mock.expect(&read_cmd, &response);
 
-        // The invalid W frame must not receive a host ACK or reach the patch
-        // callback. The operation-error path requires normal CAT proof.
-        mock.expect(b"E", &[programming::ACK]);
-        mock.expect_reopen(Ok(()));
-        mock.expect(b"ID\r", b"ID TH-D75\r");
+        // The invalid W frame must not receive a host ACK, raw E, or reach the
+        // patch callback. Its framing boundary cannot be proved after parse
+        // failure, so cleanup closes the transport without another byte.
 
         let mut radio = Radio::new(mock);
         let mut callback_called = false;
@@ -3786,10 +4581,16 @@ mod tests {
             .await;
         assert!(
             matches!(
-                result,
-                Err(Error::Protocol(ProtocolError::WriteResponseNonzeroOffset {
-                    got: 1
-                }))
+                &result,
+                Err(Error::McpOperationAndCleanupFailed { operation, cleanup })
+                    if matches!(
+                        operation.as_ref(),
+                        Error::Protocol(ProtocolError::WriteResponseNonzeroOffset { got: 1 })
+                    ) && matches!(
+                        cleanup.as_ref(),
+                        Error::McpCleanupNotProved { cleanup }
+                            if matches!(cleanup.as_ref(), Error::McpWireBoundaryUnproved)
+                    )
             ),
             "nonzero W offset was not rejected: {result:?}"
         );
@@ -3799,9 +4600,10 @@ mod tests {
         );
         assert_eq!(
             radio.mcp_phase,
-            McpPhase::Inactive,
-            "CAT identity proof should clear MCP after rejecting the frame"
+            McpPhase::Active,
+            "ambiguous parse failure must not claim that E was sent"
         );
+        assert_eq!(radio.mcp_wire_boundary, McpWireBoundary::Ambiguous);
         radio.transport.assert_complete();
         Ok(())
     }
@@ -3817,12 +4619,9 @@ mod tests {
         let partial = full_response
             .get(..32)
             .ok_or("test W response unexpectedly shorter than 32 bytes")?;
-        // The partial W times out. A delayed ACK then sits ahead of the
-        // actual E response and can falsely satisfy a detached exit that
-        // relies on one byte alone.
+        // The partial W times out. A delayed ACK could falsely satisfy a raw
+        // exit if cleanup wrote E, so no E or reconnect is scripted.
         mock.expect_partial_then_hang_with_late(&read_cmd, partial, &[programming::ACK]);
-        mock.expect(b"E", &[programming::ACK]);
-        mock.expect_reopen(Err(TransportError::ReopenUnsupported));
 
         let mut radio = Radio::new(mock);
         let page_timeout = std::time::Duration::from_millis(50);
@@ -3842,8 +4641,12 @@ mod tests {
                     "partial page failure was not retained: {operation:?}"
                 );
                 assert!(
-                    matches!(&*cleanup, Error::McpCleanupNotProved { .. }),
-                    "stale ACK incorrectly proved the detached exit: {cleanup:?}"
+                    matches!(
+                        &*cleanup,
+                        Error::McpCleanupNotProved { cleanup }
+                            if matches!(cleanup.as_ref(), Error::McpWireBoundaryUnproved)
+                    ),
+                    "ambiguous cleanup did not refuse the stale ACK: {cleanup:?}"
                 );
             }
             other => {
@@ -3855,9 +4658,10 @@ mod tests {
         }
         assert_eq!(
             radio.mcp_phase,
-            McpPhase::ExitSent,
-            "failed CAT identity proof must keep detached cleanup poisoned"
+            McpPhase::Active,
+            "ambiguous cleanup must not claim that E was sent"
         );
+        assert_eq!(radio.mcp_wire_boundary, McpWireBoundary::Ambiguous);
         radio.transport.assert_complete();
         Ok(())
     }
@@ -4042,10 +4846,8 @@ mod tests {
         let second_write = programming::build_write_command(second_page, &second_replacement);
         mock.expect(&second_write, &[0x15]);
 
-        // Cleanup remains mandatory after the failed W acknowledgement.
-        mock.expect(b"E", &[programming::ACK]);
-        mock.expect_reopen(Ok(()));
-        mock.expect(b"ID\r", b"ID TH-D75\r");
+        // A NAK does not prove the W exchange boundary. No raw exit or CAT
+        // reconnect is scripted; cleanup must fail closed by closing.
 
         let exchanges = [
             McpPageExchange::new(first_page, first_expected, first_replacement),
@@ -4066,7 +4868,11 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                McpPageExchangeError::Operation { operation, .. }
+                McpPageExchangeError::OperationAndCleanup {
+                    operation,
+                    cleanup,
+                    ..
+                }
                     if matches!(
                         operation.as_ref(),
                         McpPageExchangeOperationError::Write { page, source }
@@ -4076,11 +4882,15 @@ mod tests {
                                     Error::McpWriteNotAcknowledged { page, got: 0x15 }
                                         if *page == second_page
                                 )
+                    ) && matches!(
+                        cleanup.as_ref(),
+                        Error::McpWireBoundaryUnproved
                     )
             ),
             "write failure lost its page or typed cause: {error:?}"
         );
-        assert_eq!(radio.mcp_phase, McpPhase::Inactive);
+        assert_eq!(radio.mcp_phase, McpPhase::Active);
+        assert_eq!(radio.mcp_wire_boundary, McpWireBoundary::Ambiguous);
         radio.transport.assert_complete();
         Ok(())
     }

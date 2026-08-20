@@ -4,16 +4,19 @@
 //!
 //! - `--off-via-bluetooth`: with the radio in terminal mode bound to USB,
 //!   connect over native Bluetooth (the port that still answers CAT), write
-//!   Menu 650 off through [`Radio::set_dv_gateway_mode_detached`], then poll
+//!   Menu 650 off through [`Radio::disable_dv_gateway_detached`], then poll
 //!   the USB port until CAT identity answers again.
 //! - `--enter-via-usb`: with the radio in normal CAT mode, run
 //!   [`Radio::enter_reflector_terminal_mode`] over USB and report the MMDVM
 //!   proof or the transition timeout.
+//! - `--inspect-via-bluetooth`: read the stored Menu 650 and Menu 985 bytes
+//!   over the CAT-capable Bluetooth side without changing either setting.
 //!
 //! Usage:
 //! ```text
 //! cargo run -p kenwood-thd75 --example terminal_mode_validation -- --off-via-bluetooth
 //! cargo run -p kenwood-thd75 --example terminal_mode_validation -- --enter-via-usb /dev/cu.usbmodem101
+//! cargo run -p kenwood-thd75 --example terminal_mode_validation -- --inspect-via-bluetooth
 //! ```
 
 // Deps visible to every kenwood-thd75 example target but unused here.
@@ -36,9 +39,10 @@ use tracing as _;
 #[cfg(target_os = "macos")]
 use std::time::Duration;
 
-use kenwood_thd75::transport::SerialTransport;
 #[cfg(target_os = "macos")]
-use kenwood_thd75::types::DvGatewayMode;
+use kenwood_thd75::protocol::programming::McpPage;
+use kenwood_thd75::transport::SerialTransport;
+use kenwood_thd75::types::PcOutputInterface;
 use kenwood_thd75::{Radio, TerminalModeTransition};
 
 /// How long to wait for CAT to return after the Menu 650 off reboot.
@@ -64,10 +68,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .ok_or("usage: --enter-via-usb <serial port>")?;
             enter_via_usb(&port).await
         }
-        other => Err(
-            format!("unknown mode {other:?}; use --off-via-bluetooth or --enter-via-usb").into(),
-        ),
+        "--inspect-via-bluetooth" => inspect_via_bluetooth().await,
+        other => Err(format!(
+            "unknown mode {other:?}; use --off-via-bluetooth, --enter-via-usb, or \
+                 --inspect-via-bluetooth"
+        )
+        .into()),
     }
+}
+
+/// Read the two persistent terminal-mode selectors without changing them.
+#[cfg(target_os = "macos")]
+async fn inspect_via_bluetooth() -> Result<(), Box<dyn std::error::Error>> {
+    use kenwood_thd75::transport::BluetoothTransport;
+
+    const INTERFACE_PAGE: u16 = 0x10;
+    const INTERFACE_BYTE: usize = 0x93;
+    const GATEWAY_PAGE: u16 = 0x1C;
+    const GATEWAY_BYTE: usize = 0xA0;
+
+    let transport = BluetoothTransport::open(None)?;
+    let mut radio = Radio::connect_with_tnc_exit(transport).await?;
+    let identity = radio.identify().await?;
+    let firmware = radio.get_firmware_version().await?;
+    println!("Bluetooth CAT: {} firmware {firmware}", identity.model);
+
+    let pages = radio
+        .read_sparse_memory_pages(&[McpPage::new(INTERFACE_PAGE)?, McpPage::new(GATEWAY_PAGE)?])
+        .await?;
+    let interface_page = pages
+        .iter()
+        .find(|(page, _)| page.as_raw() == INTERFACE_PAGE)
+        .ok_or("Menu 985 page was not returned")?;
+    let gateway_page = pages
+        .iter()
+        .find(|(page, _)| page.as_raw() == GATEWAY_PAGE)
+        .ok_or("Menu 650 page was not returned")?;
+    let interface_raw = interface_page.1[INTERFACE_BYTE];
+    let interface = PcOutputInterface::try_from(interface_raw)?;
+    let gateway_raw = gateway_page.1[GATEWAY_BYTE];
+    println!("Menu 650 DV Gateway raw value: {gateway_raw}");
+    println!("Menu 985 DV Gateway interface: {interface} (raw {interface_raw})");
+    radio.disconnect().await?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn inspect_via_bluetooth() -> std::future::Ready<Result<(), Box<dyn std::error::Error>>> {
+    std::future::ready(Err(
+        "--inspect-via-bluetooth requires the native macOS Bluetooth transport".into(),
+    ))
 }
 
 /// Write Menu 650 off over Bluetooth, then wait for USB CAT to return.
@@ -87,9 +137,7 @@ async fn off_via_bluetooth(usb_port: Option<&str>) -> Result<(), Box<dyn std::er
     );
 
     println!("[3/4] Writing Menu 650 (DV Gateway) off via detached MCP update...");
-    let update = radio
-        .set_dv_gateway_mode_detached(DvGatewayMode::Off)
-        .await?;
+    let update = radio.disable_dv_gateway_detached().await?;
     println!("      detached update result: {update:?}");
     drop(radio.disconnect().await);
 
@@ -155,7 +203,7 @@ async fn enter_via_usb(port: &str) -> Result<(), Box<dyn std::error::Error>> {
         TerminalModeTransition::RECOMMENDED.poll_interval(),
     );
     match radio
-        .enter_reflector_terminal_mode(TerminalModeTransition::RECOMMENDED)
+        .enter_reflector_terminal_mode(PcOutputInterface::Usb, TerminalModeTransition::RECOMMENDED)
         .await
     {
         Ok(radio) => {

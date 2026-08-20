@@ -40,9 +40,7 @@
 #define BT_HELPER_TEST_ENV "THD75_BT_HELPER_TEST_MODE"
 #define BT_HELPER_LIVENESS_FD_ENV "THD75_BT_HELPER_LIVENESS_FD"
 #define BT_HELPER_PRE_READY_CAPACITY 4096
-#define BT_HELPER_MAX_PAIRED_CANDIDATES 64
-#define BT_HELPER_CANDIDATE_HINT_CACHED_SPP (1u << 0)
-#define BT_HELPER_CANDIDATE_HINT_D75_NAME (1u << 1)
+#define BT_HELPER_MAX_PAIRED_DEVICES 64
 
 static const uint8_t kReadyMagic[] = "THD75BT-READY-v1";
 
@@ -288,6 +286,38 @@ static void destroy_rfcomm_context(RfcommContext *ctx) {
     free(ctx);
 }
 
+static int is_ascii_hex_digit(char byte) {
+    return (byte >= '0' && byte <= '9') ||
+           (byte >= 'A' && byte <= 'F') ||
+           (byte >= 'a' && byte <= 'f');
+}
+
+static int device_identifier_is_exact_address(const char *identifier) {
+    if (!identifier || strlen(identifier) != 17) return 0;
+    char separator = identifier[2];
+    if (separator != '-' && separator != ':') return 0;
+    for (size_t index = 0; index < 17; index++) {
+        if ((index + 1) % 3 == 0) {
+            if (identifier[index] != separator) return 0;
+        } else if (!is_ascii_hex_digit(identifier[index])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+// Shared by production selection and the Rust regression test. An address is
+// identity-bearing even when another paired device was given that exact text
+// as its display name, so it must never enter the name-matching path.
+int bt_device_identifier_matches_display_name(const char *identifier,
+                                               const char *display_name) {
+    if (!identifier || !display_name ||
+        device_identifier_is_exact_address(identifier)) {
+        return 0;
+    }
+    return strcmp(identifier, display_name) == 0;
+}
+
 // Runs only in the helper process's main thread, which owns and pumps the
 // CFRunLoop used for all IOBluetooth callbacks.
 static RfcommContext *open_rfcomm(const char *device_identifier,
@@ -298,25 +328,32 @@ static RfcommContext *open_rfcomm(const char *device_identifier,
         NSString *identifier = [NSString
             stringWithUTF8String:device_identifier];
         if (!identifier) return NULL;
+        int exact_address_selector =
+            device_identifier_is_exact_address(device_identifier);
         IOBluetoothDevice *device = nil;
         IOBluetoothDevice *name_match = nil;
         NSUInteger name_match_count = 0;
-        for (IOBluetoothDevice *candidate in
+        for (IOBluetoothDevice *paired_device in
              [IOBluetoothDevice pairedDevices]) {
             // An exact address is globally identifying and takes precedence
             // even when an earlier device happened to share the same name.
-            NSString *candidate_address = candidate.addressString;
-            if (candidate_address &&
-                [candidate_address caseInsensitiveCompare:identifier]
+            NSString *paired_address = paired_device.addressString;
+            if (paired_address &&
+                [paired_address caseInsensitiveCompare:identifier]
                     == NSOrderedSame) {
-                device = candidate;
+                device = paired_device;
                 break;
             }
-            if ([candidate.name isEqualToString:identifier]) {
-                name_match = candidate;
+            if (bt_device_identifier_matches_display_name(
+                    device_identifier, paired_device.name.UTF8String)) {
+                name_match = paired_device;
                 name_match_count++;
             }
         }
+        // An exact-address request is identity-bearing. If that paired
+        // address disappeared, never reinterpret the same bytes as a display
+        // name and silently open a different device.
+        if (!device && exact_address_selector) return NULL;
         if (!device && name_match_count > 1) {
             *ambiguous_device_name = 1;
             bt_trace("paired device name is ambiguous name=%s matches=%lu",
@@ -504,29 +541,9 @@ static int run_helper(const char *device_name, uint8_t channel_id) {
     return exit_code;
 }
 
-static int device_has_cached_spp_channel(IOBluetoothDevice *device,
-                                         uint8_t channel_id) {
-    IOBluetoothSDPUUID *uuid = [IOBluetoothSDPUUID
-        uuid16:kBluetoothSDPUUID16ServiceClassSerialPort];
-    IOBluetoothSDPServiceRecord *record =
-        [device getServiceRecordForUUID:uuid];
-    if (!record) return 0;
-    BluetoothRFCOMMChannelID cached_channel = 0;
-    return [record getRFCOMMChannelID:&cached_channel] == kIOReturnSuccess &&
-           cached_channel == channel_id;
-}
-
-static int device_name_looks_like_d75(IOBluetoothDevice *device) {
-    NSString *name = device.name;
-    if (!name) return 0;
-    return [name rangeOfString:@"D75"
-                       options:NSCaseInsensitiveSearch].location != NSNotFound;
-}
-
 // Returns 0 after writing one record, 1 when the framework record is unusable,
 // and -1 on stdout failure.
-static int write_paired_device_record(IOBluetoothDevice *device,
-                                      uint8_t hints) {
+static int write_paired_device_record(IOBluetoothDevice *device) {
     NSData *address = [[device addressString]
         dataUsingEncoding:NSUTF8StringEncoding];
     NSString *display_name = device.name ?: device.addressString;
@@ -536,8 +553,7 @@ static int write_paired_device_record(IOBluetoothDevice *device,
         name.length > UINT16_MAX) {
         return 1;
     }
-    uint8_t header[5] = {
-        hints,
+    uint8_t header[4] = {
         (uint8_t)(address.length >> 8),
         (uint8_t)address.length,
         (uint8_t)(name.length >> 8),
@@ -552,41 +568,26 @@ static int write_paired_device_record(IOBluetoothDevice *device,
 }
 
 // Production helper control modes use the same early constructor as the raw
-// radio stream. Enumeration prefers cached channel-2 SPP records, then D75-like
-// names, then the remaining paired devices. The last tier preserves support for
-// a custom Menu 935 name even when macOS has no cached SDP record.
+// radio stream. Enumeration returns every bounded paired device using only its
+// exact address and display name. Radio identity is established later, after
+// the user or same-radio recovery policy chooses an exact address.
 static int run_control_helper(const char *mode) {
     if (write_all(STDOUT_FILENO, kReadyMagic, sizeof(kReadyMagic) - 1) != 0) {
         return 79;
     }
-    if (strcmp(mode, "paired-v2") == 0) {
+    if (strcmp(mode, "paired") == 0) {
         @autoreleasepool {
             NSArray *devices = [IOBluetoothDevice pairedDevices];
             NSUInteger emitted = 0;
-            for (NSUInteger tier = 0; tier < 3; tier++) {
-                for (IOBluetoothDevice *device in devices) {
-                    int cached_spp = device_has_cached_spp_channel(device, 2);
-                    int looks_like_d75 = device_name_looks_like_d75(device);
-                    int selected = (tier == 0 && cached_spp) ||
-                                   (tier == 1 && !cached_spp && looks_like_d75) ||
-                                   (tier == 2 && !cached_spp && !looks_like_d75);
-                    if (!selected) continue;
-                    if (emitted >= BT_HELPER_MAX_PAIRED_CANDIDATES) {
-                        return BT_HELPER_EXIT_TOO_MANY_PAIRED_DEVICES;
-                    }
-                    uint8_t hints = 0;
-                    if (cached_spp) {
-                        hints |= BT_HELPER_CANDIDATE_HINT_CACHED_SPP;
-                    }
-                    if (looks_like_d75) {
-                        hints |= BT_HELPER_CANDIDATE_HINT_D75_NAME;
-                    }
-                    int result = write_paired_device_record(device, hints);
-                    if (result < 0) return 86;
-                    if (result == 0) emitted++;
+            for (IOBluetoothDevice *device in devices) {
+                if (emitted >= BT_HELPER_MAX_PAIRED_DEVICES) {
+                    return BT_HELPER_EXIT_TOO_MANY_PAIRED_DEVICES;
                 }
+                int result = write_paired_device_record(device);
+                if (result < 0) return 86;
+                if (result == 0) emitted++;
             }
-            const uint8_t terminator[5] = {0, 0, 0, 0, 0};
+            const uint8_t terminator[4] = {0, 0, 0, 0};
             return write_all(STDOUT_FILENO, terminator,
                              sizeof(terminator)) == 0 ? 0 : 86;
         }
@@ -628,6 +629,13 @@ static void bluetooth_helper_constructor(void) {
     // A dead parent should yield EPIPE rather than terminating in a signal
     // while the helper is unwinding its channel.
     signal(SIGPIPE, SIG_IGN);
+    // Interactive clients own Ctrl-C/Ctrl-\ and may use them to leave a
+    // monitor without ending the radio connection. The helper shares the
+    // parent's foreground process group, so it must not inherit the default
+    // terminal-signal actions. Parent-liveness EOF and explicit TERM/KILL
+    // cleanup remain authoritative.
+    signal(SIGINT, SIG_IGN);
+    signal(SIGQUIT, SIG_IGN);
 
     const char *liveness_env = getenv(BT_HELPER_LIVENESS_FD_ENV);
     if (!liveness_env || !liveness_env[0]) _exit(85);

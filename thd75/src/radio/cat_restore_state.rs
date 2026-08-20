@@ -7,7 +7,7 @@ use crate::protocol::{Codec, Response};
 use crate::transport::Transport;
 use crate::types::{FirmwareIdentity, GpsSettings, NmeaSentences, TuningMode};
 
-use super::{CatState, LinkState, McpPhase, Radio};
+use super::{CatState, LinkState, McpPhase, McpWireBoundary, Radio};
 
 /// Host-side CAT state that survives a temporary binary-protocol session.
 ///
@@ -71,6 +71,7 @@ impl<T: Transport> Radio<T> {
             cat_state: _,
             gm_poisoned: _,
             mcp_phase: _,
+            mcp_wire_boundary: _,
             mcp_saved_timeout: _,
             mcp_pending_exit_error: _,
             link_state_tx,
@@ -125,6 +126,7 @@ impl CatRestoreState {
             cat_state,
             gm_poisoned: false,
             mcp_phase: McpPhase::Inactive,
+            mcp_wire_boundary: McpWireBoundary::Quiescent,
             mcp_saved_timeout: None,
             mcp_pending_exit_error: None,
             link_state_tx: self.link_state_tx,

@@ -244,7 +244,9 @@ impl SerialTransport {
     #[must_use]
     pub fn is_bluetooth_port(path: &str) -> bool {
         let lower = path.to_lowercase();
-        lower.contains("th-d75")
+        let name = lower.rsplit('/').next().unwrap_or(&lower);
+        name.starts_with("cu.th-d75")
+            || name.starts_with("tty.th-d75")
             || lower.contains("rfcomm")
             || (lower.contains("bluetooth") && !lower.contains("incoming"))
     }
@@ -285,6 +287,29 @@ impl SerialTransport {
     /// no tokio runtime is active on the calling thread (the opened stream
     /// must register with a tokio reactor).
     pub fn open_with_baud(path: &str, baud: u32) -> Result<Self, TransportError> {
+        let (is_bluetooth, _, _) = Self::connection_settings(path, baud);
+        Self::open_classified(path, baud, is_bluetooth)
+    }
+
+    /// Open a serial endpoint explicitly known to be Bluetooth SPP.
+    ///
+    /// This is required on platforms such as Windows where USB and Bluetooth
+    /// endpoints both use opaque `COM` names. It applies the fixed Bluetooth
+    /// rate and RTS/CTS without guessing from the path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::Open`] if the endpoint cannot be opened or
+    /// no Tokio runtime is active.
+    pub fn open_bluetooth(path: &str) -> Result<Self, TransportError> {
+        Self::open_classified(path, Self::DEFAULT_BAUD, true)
+    }
+
+    fn open_classified(
+        path: &str,
+        requested_baud: u32,
+        is_bluetooth: bool,
+    ) -> Result<Self, TransportError> {
         // tokio-serial registers the opened stream with the active tokio
         // reactor and panics when none exists; refuse with a typed error
         // first so callers on plain threads get a normal failure path.
@@ -297,7 +322,11 @@ impl SerialTransport {
                 ),
             });
         }
-        let (is_bt, actual_baud, flow) = Self::connection_settings(path, baud);
+        let (is_bt, actual_baud, flow) = if is_bluetooth {
+            (true, BT_BAUD, FlowControl::Hardware)
+        } else {
+            (false, requested_baud, FlowControl::None)
+        };
 
         tracing::info!(
             path = %path,
@@ -380,7 +409,10 @@ impl SerialTransport {
 
         let matching: Vec<_> = ports
             .into_iter()
-            .filter(|p| Self::is_bluetooth_port(&p.port_name))
+            .filter(|p| {
+                matches!(&p.port_type, tokio_serial::SerialPortType::BluetoothPort)
+                    || Self::is_bluetooth_port(&p.port_name)
+            })
             .collect();
 
         tracing::info!(
@@ -554,17 +586,25 @@ mod tests {
             "/dev/cu.Bluetooth-Incoming-Port"
         ));
         assert!(!SerialTransport::is_bluetooth_port("COM3"));
+        assert!(!SerialTransport::is_bluetooth_port(
+            "/dev/serial/by-id/usb-JVCKENWOOD_TH-D75_1234"
+        ));
     }
 
     #[test]
-    fn default_open_has_the_standard_usb_signature() {
+    fn serial_open_constructors_have_typed_signatures() {
         fn require_open_signatures(
             _: fn(&str) -> Result<SerialTransport, TransportError>,
             _: fn(&str, u32) -> Result<SerialTransport, TransportError>,
+            _: fn(&str) -> Result<SerialTransport, TransportError>,
         ) {
         }
 
-        require_open_signatures(SerialTransport::open, SerialTransport::open_with_baud);
+        require_open_signatures(
+            SerialTransport::open,
+            SerialTransport::open_with_baud,
+            SerialTransport::open_bluetooth,
+        );
     }
 
     #[test]

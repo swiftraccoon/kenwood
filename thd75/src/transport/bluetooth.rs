@@ -42,6 +42,11 @@ mod inner {
 
     unsafe extern "C" {
         fn bt_helper_link_anchor();
+        #[cfg(test)]
+        fn bt_device_identifier_matches_display_name(
+            identifier: *const std::ffi::c_char,
+            display_name: *const std::ffi::c_char,
+        ) -> i32;
         fn bt_fd_set_nonblocking(fd: i32) -> i32;
         fn bt_liveness_pipe_create(read_fd: *mut i32, write_fd: *mut i32) -> i32;
         fn bt_helper_prepare_liveness_fd(source_fd: i32, target_fd: i32) -> i32;
@@ -60,7 +65,7 @@ mod inner {
     const HELPER_DEVICE_ENV: &str = "THD75_BT_HELPER_DEVICE";
     const HELPER_CHANNEL_ENV: &str = "THD75_BT_HELPER_CHANNEL";
     const HELPER_CONTROL_ENV: &str = "THD75_BT_HELPER_CONTROL_MODE";
-    const HELPER_PAIRED_CONTROL_MODE: &str = "paired-v2";
+    const HELPER_PAIRED_CONTROL_MODE: &str = "paired";
     const HELPER_TEST_ENV: &str = "THD75_BT_HELPER_TEST_MODE";
     const HELPER_LIVENESS_FD_ENV: &str = "THD75_BT_HELPER_LIVENESS_FD";
     const HELPER_LIVENESS_FD: i32 = 3;
@@ -97,22 +102,16 @@ mod inner {
     const HELPER_VALIDATION_CHALLENGE: &[u8] = b"AZIMUTH-BT-HELPER-v1";
 
     /// Maximum paired records accepted from one signed helper invocation.
-    const MAX_PAIRED_CANDIDATES: usize = 64;
+    const MAX_PAIRED_DEVICES: usize = 64;
 
     /// Bluetooth names are normally limited to 248 bytes. This larger bound
     /// tolerates framework formatting while keeping the helper payload finite.
     const MAX_PAIRED_DISPLAY_NAME_BYTES: usize = 1024;
 
-    /// One hint byte, four length bytes, one exact address, and one bounded
-    /// display name per record, followed by the five-byte terminator.
+    /// Four length bytes, one exact address, and one bounded display name per
+    /// record, followed by the four-byte terminator.
     const MAX_PAIRED_PAYLOAD_BYTES: usize =
-        MAX_PAIRED_CANDIDATES * (5 + 17 + MAX_PAIRED_DISPLAY_NAME_BYTES) + 5;
-
-    /// Enumeration metadata that justifies retrying a transient probe open.
-    const PAIRED_CANDIDATE_HINT_CACHED_SPP: u8 = 1 << 0;
-    const PAIRED_CANDIDATE_HINT_D75_NAME: u8 = 1 << 1;
-    const PAIRED_CANDIDATE_KNOWN_HINTS: u8 =
-        PAIRED_CANDIDATE_HINT_CACHED_SPP | PAIRED_CANDIDATE_HINT_D75_NAME;
+        MAX_PAIRED_DEVICES * (4 + 17 + MAX_PAIRED_DISPLAY_NAME_BYTES) + 4;
 
     /// Native helper exit for a display name shared by multiple paired radios.
     const HELPER_EXIT_AMBIGUOUS_DEVICE_NAME: i32 = 87;
@@ -153,17 +152,14 @@ mod inner {
     /// transport's one-handle-per-process invariant across helper processes.
     static HELPER_PROCESS_SLOT_RESERVED: AtomicBool = AtomicBool::new(false);
 
-    /// One paired Bluetooth device that can be tried by exact address.
+    /// One paired Bluetooth device identified by its exact address.
     #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct PairedBluetoothCandidate {
+    pub struct PairedBluetoothDevice {
         address: String,
         display_name: String,
-        /// Native cached-SPP or D75-name evidence. This is deliberately not a
-        /// public identity claim; it controls only a bounded transient retry.
-        retry_transient_probe_not_found: bool,
     }
 
-    impl PairedBluetoothCandidate {
+    impl PairedBluetoothDevice {
         /// Canonical uppercase-hyphen address for unambiguous selection.
         #[must_use]
         pub fn address(&self) -> &str {
@@ -174,16 +170,6 @@ mod inner {
         #[must_use]
         pub fn display_name(&self) -> &str {
             &self.display_name
-        }
-
-        /// Whether native metadata makes this a reasonable TH-D75 probe.
-        ///
-        /// This is a cached-SPP or D75-name hint, not a radio identity claim.
-        /// Callers performing an identity-sensitive operation must still query
-        /// the radio and verify its exact CAT serial.
-        #[must_use]
-        pub const fn is_thd75_candidate(&self) -> bool {
-            self.retry_transient_probe_not_found
         }
     }
 
@@ -231,15 +217,15 @@ mod inner {
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum PairedCandidateOpenPurpose {
+    enum PairedDeviceOpenPurpose {
         Probe,
         Selected,
     }
 
-    impl PairedCandidateOpenPurpose {
-        const fn retries_transient_not_found(self, candidate: &PairedBluetoothCandidate) -> bool {
+    impl PairedDeviceOpenPurpose {
+        const fn retries_transient_not_found(self) -> bool {
             match self {
-                Self::Probe => candidate.retry_transient_probe_not_found,
+                Self::Probe => false,
                 Self::Selected => true,
             }
         }
@@ -372,10 +358,10 @@ mod inner {
             validate_helper_launch(&helper_executable, HELPER_VALIDATION_TIMEOUT)
         }
 
-        /// Enumerate paired devices that can be tried as SPP candidates.
+        /// Enumerate paired Bluetooth devices for later exact qualification.
         ///
         /// Discovery runs in the same isolated native helper used for RFCOMM,
-        /// but it performs no radio I/O. Each returned candidate carries the
+        /// but it performs no radio I/O. Each returned device carries the
         /// exact Bluetooth address required for unambiguous later selection.
         /// The helper invocation, record count, field sizes, and total payload
         /// are independently bounded.
@@ -385,14 +371,14 @@ mod inner {
         /// Returns [`TransportError::BluetoothHelper`] if the current
         /// executable cannot be located, the helper cannot be launched, the
         /// discovery deadline expires, or its framed response is invalid.
-        pub fn paired_spp_candidates() -> Result<Vec<PairedBluetoothCandidate>, TransportError> {
+        pub fn paired_devices() -> Result<Vec<PairedBluetoothDevice>, TransportError> {
             let executable = std::env::current_exe().map_err(|source| {
                 bluetooth_helper_error("locating the current executable", source)
             })?;
-            Self::paired_spp_candidates_with_helper_executable(executable)
+            Self::paired_devices_with_helper_executable(executable)
         }
 
-        /// Enumerate paired SPP candidates through a specific signed helper.
+        /// Enumerate paired devices through a specific signed helper.
         ///
         /// Sandboxed applications should pass their separately signed,
         /// sandbox-inheriting helper executable. The path must be absolute and
@@ -403,20 +389,20 @@ mod inner {
         ///
         /// Returns [`TransportError::BluetoothHelper`] if the path or helper
         /// lifecycle is invalid, discovery exceeds its bound, or the helper's
-        /// candidate framing is malformed.
-        pub fn paired_spp_candidates_with_helper_executable(
+        /// device framing is malformed.
+        pub fn paired_devices_with_helper_executable(
             helper_executable: impl AsRef<Path>,
-        ) -> Result<Vec<PairedBluetoothCandidate>, TransportError> {
-            Self::paired_spp_candidates_with_helper_executable_cancellable(
+        ) -> Result<Vec<PairedBluetoothDevice>, TransportError> {
+            Self::paired_devices_with_helper_executable_cancellable(
                 helper_executable,
                 &BluetoothOpenCancellation::default(),
             )
         }
 
-        /// Enumerate paired SPP candidates with synchronous cancellation.
+        /// Enumerate paired devices with synchronous cancellation.
         ///
         /// This has the same bounds and identity semantics as
-        /// [`Self::paired_spp_candidates_with_helper_executable`]. A sticky
+        /// [`Self::paired_devices_with_helper_executable`]. A sticky
         /// cancellation request terminates an active helper and returns
         /// [`TransportError::BluetoothOpenInterrupted`].
         ///
@@ -424,111 +410,109 @@ mod inner {
         ///
         /// Returns the ordinary discovery errors or
         /// [`TransportError::BluetoothOpenInterrupted`] when cancelled.
-        pub fn paired_spp_candidates_with_helper_executable_cancellable(
+        pub fn paired_devices_with_helper_executable_cancellable(
             helper_executable: impl AsRef<Path>,
             cancellation: &BluetoothOpenCancellation,
-        ) -> Result<Vec<PairedBluetoothCandidate>, TransportError> {
+        ) -> Result<Vec<PairedBluetoothDevice>, TransportError> {
             let helper_executable = validate_helper_executable(helper_executable.as_ref())?;
             cancellation.check()?;
-            enumerate_paired_candidates(&helper_executable, cancellation)
+            enumerate_paired_devices(&helper_executable, cancellation)
         }
 
-        /// Probe one enumerated candidate by its exact address.
+        /// Probe one enumerated device by its exact address.
         ///
-        /// Candidate enumeration carries native cached-SPP and D75-name hints.
-        /// A hinted candidate gets the transport's single transient
-        /// [`TransportError::NotFound`] retry; an unhinted candidate gets one
-        /// attempt so a scan does not repeatedly wake unrelated paired phones.
-        /// Each attempt remains independently bounded.
+        /// A probe performs one bounded open. Callers scanning an unqualified
+        /// paired-device set must apply CAT identity checks before treating an
+        /// opened endpoint as a radio.
         ///
         /// # Errors
         ///
         /// Returns [`TransportError::BluetoothHelper`] if the signed helper
         /// cannot be launched or prepared, and [`TransportError::NotFound`] if
-        /// this exact candidate does not expose the TH-D75 SPP channel.
-        pub fn probe_paired_candidate_with_helper_executable(
-            candidate: &PairedBluetoothCandidate,
+        /// this exact device does not expose the TH-D75 SPP channel.
+        pub fn probe_paired_device_with_helper_executable(
+            device: &PairedBluetoothDevice,
             helper_executable: impl AsRef<Path>,
         ) -> Result<Self, TransportError> {
-            Self::probe_paired_candidate_with_helper_executable_cancellable(
-                candidate,
+            Self::probe_paired_device_with_helper_executable_cancellable(
+                device,
                 helper_executable,
                 &BluetoothOpenCancellation::default(),
             )
         }
 
-        /// Probe one exact paired candidate with synchronous cancellation.
+        /// Probe one exact paired device with synchronous cancellation.
         ///
         /// # Errors
         ///
         /// Returns the ordinary probe errors or
         /// [`TransportError::BluetoothOpenInterrupted`] when cancelled.
-        pub fn probe_paired_candidate_with_helper_executable_cancellable(
-            candidate: &PairedBluetoothCandidate,
+        pub fn probe_paired_device_with_helper_executable_cancellable(
+            device: &PairedBluetoothDevice,
             helper_executable: impl AsRef<Path>,
             cancellation: &BluetoothOpenCancellation,
         ) -> Result<Self, TransportError> {
             let helper_executable = validate_helper_executable(helper_executable.as_ref())?;
             cancellation.check()?;
-            Self::open_exact_paired_candidate(
-                candidate,
+            Self::open_exact_paired_device(
+                device,
                 &helper_executable,
-                PairedCandidateOpenPurpose::Probe,
+                PairedDeviceOpenPurpose::Probe,
                 cancellation,
             )
         }
 
-        /// Open one selected candidate by its exact address.
+        /// Open one selected paired device by its exact address.
         ///
         /// This uses the same single transient [`TransportError::NotFound`]
         /// retry as [`Self::open_with_helper_executable`]. Callers that are
-        /// still scanning an unqualified candidate set should use
-        /// [`Self::probe_paired_candidate_with_helper_executable`] instead.
+        /// still scanning an unqualified device set should use
+        /// [`Self::probe_paired_device_with_helper_executable`] instead.
         ///
         /// # Errors
         ///
         /// Returns [`TransportError::BluetoothHelper`] if the signed helper
         /// cannot be launched or prepared, and [`TransportError::NotFound`] if
-        /// this exact candidate cannot be opened in either bounded attempt.
-        pub fn open_paired_candidate_with_helper_executable(
-            candidate: &PairedBluetoothCandidate,
+        /// this exact device cannot be opened in either bounded attempt.
+        pub fn open_paired_device_with_helper_executable(
+            device: &PairedBluetoothDevice,
             helper_executable: impl AsRef<Path>,
         ) -> Result<Self, TransportError> {
-            Self::open_paired_candidate_with_helper_executable_cancellable(
-                candidate,
+            Self::open_paired_device_with_helper_executable_cancellable(
+                device,
                 helper_executable,
                 &BluetoothOpenCancellation::default(),
             )
         }
 
-        /// Open one selected exact candidate with synchronous cancellation.
+        /// Open one selected exact device with synchronous cancellation.
         ///
         /// # Errors
         ///
-        /// Returns the ordinary selected-candidate errors or
+        /// Returns the ordinary selected-device errors or
         /// [`TransportError::BluetoothOpenInterrupted`] when cancelled.
-        pub fn open_paired_candidate_with_helper_executable_cancellable(
-            candidate: &PairedBluetoothCandidate,
+        pub fn open_paired_device_with_helper_executable_cancellable(
+            device: &PairedBluetoothDevice,
             helper_executable: impl AsRef<Path>,
             cancellation: &BluetoothOpenCancellation,
         ) -> Result<Self, TransportError> {
             let helper_executable = validate_helper_executable(helper_executable.as_ref())?;
             cancellation.check()?;
-            Self::open_exact_paired_candidate(
-                candidate,
+            Self::open_exact_paired_device(
+                device,
                 &helper_executable,
-                PairedCandidateOpenPurpose::Selected,
+                PairedDeviceOpenPurpose::Selected,
                 cancellation,
             )
         }
 
-        fn open_exact_paired_candidate(
-            candidate: &PairedBluetoothCandidate,
+        fn open_exact_paired_device(
+            device: &PairedBluetoothDevice,
             helper_executable: &Path,
-            purpose: PairedCandidateOpenPurpose,
+            purpose: PairedDeviceOpenPurpose,
             cancellation: &BluetoothOpenCancellation,
         ) -> Result<Self, TransportError> {
-            let retry_not_found = purpose.retries_transient_not_found(candidate);
+            let retry_not_found = purpose.retries_transient_not_found();
             let max_attempts = if retry_not_found {
                 HELPER_OPEN_MAX_ATTEMPTS
             } else {
@@ -538,7 +522,7 @@ mod inner {
                 retry_not_found,
                 |attempt| {
                     Self::open_once(
-                        Some(candidate.address()),
+                        Some(device.address()),
                         helper_executable,
                         attempt,
                         max_attempts,
@@ -547,7 +531,7 @@ mod inner {
                 },
                 |delay| {
                     tracing::warn!(
-                        device = %candidate.address(),
+                        device = %device.address(),
                         failed_attempt = 1,
                         next_attempt = 2,
                         delay_ms = delay.as_millis(),
@@ -571,9 +555,10 @@ mod inner {
         /// path can take about 45 seconds.
         ///
         /// `device_name` can be either a paired device's exact display name or
-        /// its exact Bluetooth address. Address matching takes precedence. A
-        /// display name shared by multiple paired devices fails closed; pass
-        /// the exact address to select one of those radios.
+        /// its exact Bluetooth address. An address is a strict selector and
+        /// never falls back to name matching. A display name shared by
+        /// multiple paired devices fails closed; pass the exact address to
+        /// select one of those radios.
         ///
         /// # Errors
         ///
@@ -609,7 +594,8 @@ mod inner {
         /// `helper_executable` must be absolute. Reopen operations preserve
         /// and reuse the validated path.
         /// Device selection follows [`Self::open`]: an exact Bluetooth address
-        /// takes precedence, and a non-unique display name is rejected.
+        /// never falls back to a display name, and a non-unique display name
+        /// is rejected.
         ///
         /// # Errors
         ///
@@ -943,10 +929,10 @@ mod inner {
         }
     }
 
-    fn enumerate_paired_candidates(
+    fn enumerate_paired_devices(
         helper_executable: &Path,
         cancellation: &BluetoothOpenCancellation,
-    ) -> Result<Vec<PairedBluetoothCandidate>, TransportError> {
+    ) -> Result<Vec<PairedBluetoothDevice>, TransportError> {
         cancellation.check()?;
         let mut process_slot = Some(HelperProcessSlot::reserve()?);
 
@@ -987,7 +973,7 @@ mod inner {
         let result =
             await_helper_ready_until(&mut child, &mut helper_stdout, deadline, cancellation)
                 .and_then(|()| {
-                    collect_paired_candidate_payload(
+                    collect_paired_device_payload(
                         &mut child,
                         &mut helper_stdout,
                         deadline,
@@ -995,17 +981,17 @@ mod inner {
                     )
                 })
                 .and_then(|payload| {
-                    parse_paired_candidate_payload(&payload).map_err(|source| {
-                        bluetooth_helper_error("parsing paired Bluetooth candidates", source)
+                    parse_paired_device_payload(&payload).map_err(|source| {
+                        bluetooth_helper_error("parsing paired Bluetooth devices", source)
                     })
                 });
         drop(helper_stdout);
 
         match result {
-            Ok(candidates) => {
+            Ok(devices) => {
                 drop(parent_liveness);
                 drop(process_slot.take());
-                Ok(candidates)
+                Ok(devices)
             }
             Err(error) => {
                 terminate_child(child, process_slot.take(), Some(parent_liveness), false);
@@ -1014,7 +1000,7 @@ mod inner {
         }
     }
 
-    fn collect_paired_candidate_payload(
+    fn collect_paired_device_payload(
         child: &mut Child,
         stdout: &mut ChildStdout,
         deadline: Instant,
@@ -1032,7 +1018,7 @@ mod inner {
                     }
                     let detail = match status.code() {
                         Some(HELPER_EXIT_TOO_MANY_PAIRED_DEVICES) => format!(
-                            "paired-device enumeration exceeded the {MAX_PAIRED_CANDIDATES}-candidate safety bound"
+                            "paired-device enumeration exceeded the {MAX_PAIRED_DEVICES}-device safety bound"
                         ),
                         _ => format!("paired-device helper exited with {status}"),
                     };
@@ -1090,7 +1076,7 @@ mod inner {
                 }
                 Err(source) => {
                     return Err(bluetooth_helper_error(
-                        "reading paired Bluetooth candidates",
+                        "reading paired Bluetooth devices",
                         source,
                     ));
                 }
@@ -1098,33 +1084,21 @@ mod inner {
         }
     }
 
-    fn parse_paired_candidate_payload(payload: &[u8]) -> io::Result<Vec<PairedBluetoothCandidate>> {
-        let mut candidates: Vec<PairedBluetoothCandidate> = Vec::new();
+    fn parse_paired_device_payload(payload: &[u8]) -> io::Result<Vec<PairedBluetoothDevice>> {
+        let mut devices: Vec<PairedBluetoothDevice> = Vec::new();
         let mut offset = 0_usize;
         loop {
-            let (hints, address_length, name_length, record_offset) =
-                paired_candidate_record_lengths(payload, offset)?;
+            let (address_length, name_length, record_offset) =
+                paired_device_record_lengths(payload, offset)?;
             offset = record_offset;
-            if hints & !PAIRED_CANDIDATE_KNOWN_HINTS != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("paired-device record contains unknown hints: 0x{hints:02x}"),
-                ));
-            }
             if address_length == 0 && name_length == 0 {
-                if hints != 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "paired-device terminator contains candidate hints",
-                    ));
-                }
                 if offset != payload.len() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "paired-device payload contains bytes after its terminator",
                     ));
                 }
-                return Ok(candidates);
+                return Ok(devices);
             }
             if address_length == 0 || name_length == 0 {
                 return Err(io::Error::new(
@@ -1132,10 +1106,10 @@ mod inner {
                     "paired-device record contains an empty field",
                 ));
             }
-            if candidates.len() >= MAX_PAIRED_CANDIDATES {
+            if devices.len() >= MAX_PAIRED_DEVICES {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("paired-device payload exceeded {MAX_PAIRED_CANDIDATES} candidates"),
+                    format!("paired-device payload exceeded {MAX_PAIRED_DEVICES} devices"),
                 ));
             }
             if address_length != 17 || name_length > MAX_PAIRED_DISPLAY_NAME_BYTES {
@@ -1175,10 +1149,7 @@ mod inner {
                     format!("paired-device address is not exact: {raw_address:?}"),
                 ));
             };
-            if candidates
-                .iter()
-                .any(|candidate| candidate.address == address)
-            {
+            if devices.iter().any(|device| device.address == address) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("paired-device address is duplicated: {address}"),
@@ -1190,20 +1161,19 @@ mod inner {
                     format!("paired-device name is not UTF-8: {error}"),
                 )
             })?;
-            candidates.push(PairedBluetoothCandidate {
+            devices.push(PairedBluetoothDevice {
                 address,
                 display_name: display_name.to_owned(),
-                retry_transient_probe_not_found: hints != 0,
             });
             offset = record_end;
         }
     }
 
-    fn paired_candidate_record_lengths(
+    fn paired_device_record_lengths(
         payload: &[u8],
         offset: usize,
-    ) -> io::Result<(u8, usize, usize, usize)> {
-        let header_end = offset.checked_add(5).ok_or_else(|| {
+    ) -> io::Result<(usize, usize, usize)> {
+        let header_end = offset.checked_add(4).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 "paired-device record header length overflow",
@@ -1215,14 +1185,13 @@ mod inner {
                 "paired-device payload ended before its terminator",
             )
         })?;
-        let &[hints, address_high, address_low, name_high, name_low] = header else {
+        let &[address_high, address_low, name_high, name_low] = header else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "paired-device record header has the wrong size",
             ));
         };
         Ok((
-            hints,
             usize::from(u16::from_be_bytes([address_high, address_low])),
             usize::from(u16::from_be_bytes([name_high, name_low])),
             header_end,
@@ -1795,6 +1764,7 @@ mod inner {
     #[cfg(test)]
     mod tests {
         use std::error::Error;
+        use std::ffi::CString;
         use std::io::{self, Read as _, Write as _};
         use std::os::fd::{AsRawFd as _, OwnedFd};
         use std::os::unix::process::ExitStatusExt as _;
@@ -1808,13 +1778,12 @@ mod inner {
             HELPER_LIVENESS_FD, HELPER_LIVENESS_FD_ENV, HELPER_OPEN_MAX_ATTEMPTS,
             HELPER_OPEN_RETRY_DELAY, HELPER_READY_MAGIC, HELPER_SENTINEL_ENV,
             HELPER_SENTINEL_VALUE, HELPER_TEST_ENV, HELPER_VALIDATION_CHALLENGE, HelperProcessSlot,
-            HelperWriteCancellation, PAIRED_CANDIDATE_HINT_CACHED_SPP,
-            PAIRED_CANDIDATE_HINT_D75_NAME, PairedCandidateOpenPurpose, SYNC_REAP_BUDGET,
-            TransportError, await_helper_ready, await_helper_ready_cancellable,
-            bt_helper_link_anchor, create_liveness_pipe, helper_exit_error, new_helper_command,
-            open_with_not_found_retry_policy, parse_paired_candidate_payload, prepare_liveness_fd,
-            set_nonblocking, terminate_child, validate_helper_echo_until,
-            validate_helper_executable,
+            HelperWriteCancellation, PairedDeviceOpenPurpose, SYNC_REAP_BUDGET, TransportError,
+            await_helper_ready, await_helper_ready_cancellable,
+            bt_device_identifier_matches_display_name, bt_helper_link_anchor, create_liveness_pipe,
+            helper_exit_error, new_helper_command, open_with_not_found_retry_policy,
+            parse_paired_device_payload, prepare_liveness_fd, set_nonblocking, terminate_child,
+            validate_helper_echo_until, validate_helper_executable,
         };
 
         type TestResult = Result<(), Box<dyn Error>>;
@@ -1823,7 +1792,7 @@ mod inner {
         fn native_iobluetooth_is_confined_to_process_helper() {
             let shim = include_str!("bluetooth_mac.m");
             let rust = include_str!("bluetooth.rs")
-                .split_once("    #[cfg(test)]")
+                .split_once("    #[cfg(test)]\n    mod tests")
                 .map_or(include_str!("bluetooth.rs"), |(production, _tests)| {
                     production
                 });
@@ -1833,6 +1802,11 @@ mod inner {
             assert!(shim.contains("__attribute__((constructor))"));
             assert!(shim.contains("THD75_BT_HELPER_PROCESS_V1"));
             assert!(shim.contains("THD75_BT_HELPER_TEST_MODE"));
+            assert!(shim.contains("signal(SIGINT, SIG_IGN)"));
+            assert!(shim.contains("signal(SIGQUIT, SIG_IGN)"));
+            assert!(!shim.contains("signal(SIGTERM, SIG_IGN)"));
+            assert!(shim.contains("strcmp(mode, \"paired\")"));
+            assert!(!shim.contains("paired-v"));
             assert!(shim.contains("parent_liveness_watchdog"));
             assert!(shim.contains("pre_ready"));
             assert!(shim.contains("monotonic_seconds() + 20.0"));
@@ -1848,7 +1822,7 @@ mod inner {
         }
 
         #[test]
-        fn native_device_selection_prefers_address_and_rejects_duplicate_names() {
+        fn native_device_selection_keeps_exact_addresses_strict() {
             let shim = include_str!("bluetooth_mac.m");
             let address_match = shim.find("caseInsensitiveCompare:identifier]");
             let name_match = shim.find("name_match_count++");
@@ -1857,9 +1831,61 @@ mod inner {
                 (address_match, name_match),
                 (Some(address), Some(name)) if address < name
             ));
+            assert!(shim.contains("device_identifier_is_exact_address"));
+            assert!(shim.contains("bt_device_identifier_matches_display_name("));
+            assert!(shim.contains("if (!device && exact_address_selector) return NULL;"));
             assert!(shim.contains("if (!device && name_match_count > 1)"));
             assert!(shim.contains("BT_HELPER_EXIT_AMBIGUOUS_DEVICE_NAME 87"));
             assert!(shim.contains("return BT_HELPER_EXIT_AMBIGUOUS_DEVICE_NAME"));
+        }
+
+        #[test]
+        fn absent_exact_address_cannot_match_device_named_like_address() -> TestResult {
+            let exact_address = CString::new("AA-BB-CC-DD-EE-FF")?;
+            let same_display_name = CString::new("AA-BB-CC-DD-EE-FF")?;
+            let ordinary_name = CString::new("Field Radio")?;
+
+            // SAFETY: Every pointer comes from a live `CString` and remains
+            // valid for the duration of each read-only native predicate call.
+            let exact_match = unsafe {
+                bt_device_identifier_matches_display_name(
+                    exact_address.as_ptr(),
+                    same_display_name.as_ptr(),
+                )
+            };
+            // SAFETY: Both inputs are live, NUL-terminated `CString` values.
+            let ordinary_match = unsafe {
+                bt_device_identifier_matches_display_name(
+                    ordinary_name.as_ptr(),
+                    ordinary_name.as_ptr(),
+                )
+            };
+
+            assert_eq!(exact_match, 0);
+            assert_eq!(ordinary_match, 1);
+            Ok(())
+        }
+
+        #[test]
+        fn paired_device_inventory_uses_only_address_and_name_metadata() {
+            let shim = include_str!("bluetooth_mac.m");
+            let inventory = shim
+                .split_once("static int run_control_helper")
+                .and_then(|(_, remainder)| remainder.split_once("static int run_test_helper"))
+                .map_or("", |(inventory, _)| inventory);
+
+            assert!(inventory.contains("[IOBluetoothDevice pairedDevices]"));
+            assert!(inventory.contains("write_paired_device_record(device)"));
+            assert!(!inventory.contains("device_name_looks_like_d75"));
+            assert!(!inventory.contains("tier"));
+            assert!(!inventory.contains("device_has_cached_spp_channel"));
+            assert!(!inventory.contains("performSDPQuery"));
+            assert!(!inventory.contains("getServiceRecordForUUID"));
+            assert!(!inventory.contains(".services"));
+            assert!(!inventory.contains("[device services]"));
+            assert!(!inventory.contains("getServices"));
+            assert!(!inventory.contains("openConnection"));
+            assert!(!inventory.contains("openRFCOMMChannel"));
         }
 
         #[test]
@@ -1943,87 +1969,47 @@ mod inner {
         }
 
         #[test]
-        fn paired_candidate_parser_accepts_exact_addresses_and_custom_names() -> TestResult {
-            let payload = paired_candidate_payload(&[
+        fn paired_device_parser_accepts_exact_addresses_and_arbitrary_display_names() -> TestResult
+        {
+            let payload = paired_device_payload(&[
                 ("00-11-22-33-44-55", "TH-D75"),
                 ("AA:BB:CC:DD:EE:FF", "Field Radio One"),
             ])?;
 
-            let candidates = parse_paired_candidate_payload(&payload)?;
+            let devices = parse_paired_device_payload(&payload)?;
 
-            assert_eq!(candidates.len(), 2);
+            assert_eq!(devices.len(), 2);
             assert_eq!(
-                candidates
-                    .first()
-                    .map(super::PairedBluetoothCandidate::address),
+                devices.first().map(super::PairedBluetoothDevice::address),
                 Some("00-11-22-33-44-55")
             );
             assert_eq!(
-                candidates
-                    .get(1)
-                    .map(super::PairedBluetoothCandidate::address),
+                devices.get(1).map(super::PairedBluetoothDevice::address),
                 Some("AA-BB-CC-DD-EE-FF")
             );
             assert_eq!(
-                candidates
+                devices
                     .get(1)
-                    .map(super::PairedBluetoothCandidate::display_name),
+                    .map(super::PairedBluetoothDevice::display_name),
                 Some("Field Radio One")
             );
             Ok(())
         }
 
         #[test]
-        fn paired_candidate_parser_preserves_only_known_probe_retry_hints() -> TestResult {
-            let payload = paired_candidate_payload_with_hints(&[
-                (
-                    PAIRED_CANDIDATE_HINT_CACHED_SPP,
-                    "00-11-22-33-44-55",
-                    "Field Radio",
-                ),
-                (
-                    PAIRED_CANDIDATE_HINT_D75_NAME,
-                    "AA-BB-CC-DD-EE-FF",
-                    "TH-D75",
-                ),
-                (0, "12-34-56-78-9A-BC", "Phone"),
-            ])?;
-
-            let candidates = parse_paired_candidate_payload(&payload)?;
-
-            let retry_hints = candidates
-                .iter()
-                .map(|candidate| {
-                    PairedCandidateOpenPurpose::Probe.retries_transient_not_found(candidate)
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(retry_hints, [true, true, false]);
-            assert_eq!(
-                candidates
-                    .iter()
-                    .map(super::PairedBluetoothCandidate::is_thd75_candidate)
-                    .collect::<Vec<_>>(),
-                [true, true, false]
-            );
-
-            let unknown_hint_payload =
-                paired_candidate_payload_with_hints(&[(0x80, "00-11-22-33-44-55", "Radio")])?;
-            let Err(error) = parse_paired_candidate_payload(&unknown_hint_payload) else {
-                return Err("unknown candidate hint was accepted".into());
-            };
-            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-            assert!(error.to_string().contains("unknown hints"));
-            Ok(())
+        fn paired_device_probe_policy_does_not_use_device_metadata() {
+            assert!(!PairedDeviceOpenPurpose::Probe.retries_transient_not_found());
+            assert!(PairedDeviceOpenPurpose::Selected.retries_transient_not_found());
         }
 
         #[test]
-        fn paired_candidate_parser_rejects_duplicate_exact_addresses() -> TestResult {
-            let payload = paired_candidate_payload(&[
+        fn paired_device_parser_rejects_duplicate_exact_addresses() -> TestResult {
+            let payload = paired_device_payload(&[
                 ("00-11-22-33-44-55", "First"),
                 ("00:11:22:33:44:55", "Second"),
             ])?;
 
-            let Err(error) = parse_paired_candidate_payload(&payload) else {
+            let Err(error) = parse_paired_device_payload(&payload) else {
                 return Err("duplicate Bluetooth address was accepted".into());
             };
 
@@ -2033,10 +2019,10 @@ mod inner {
         }
 
         #[test]
-        fn paired_candidate_parser_rejects_name_like_or_truncated_selectors() -> TestResult {
+        fn paired_device_parser_rejects_name_like_or_truncated_selectors() -> TestResult {
             for address in ["TH-D75", "00-11-22-33-44", "00-11-22-33-44-GG"] {
-                let payload = paired_candidate_payload(&[(address, "Radio")])?;
-                let Err(error) = parse_paired_candidate_payload(&payload) else {
+                let payload = paired_device_payload(&[(address, "Radio")])?;
+                let Err(error) = parse_paired_device_payload(&payload) else {
                     return Err("non-address Bluetooth selector was accepted".into());
                 };
                 assert_eq!(error.kind(), io::ErrorKind::InvalidData);
@@ -2049,18 +2035,18 @@ mod inner {
         }
 
         #[test]
-        fn paired_candidate_parser_requires_one_final_terminator() -> TestResult {
-            let mut truncated = paired_candidate_payload(&[("00-11-22-33-44-55", "Radio")])?;
+        fn paired_device_parser_requires_one_final_terminator() -> TestResult {
+            let mut truncated = paired_device_payload(&[("00-11-22-33-44-55", "Radio")])?;
             truncated.truncate(truncated.len().saturating_sub(2));
-            let Err(truncated_error) = parse_paired_candidate_payload(&truncated) else {
-                return Err("truncated candidate payload was accepted".into());
+            let Err(truncated_error) = parse_paired_device_payload(&truncated) else {
+                return Err("truncated paired-device payload was accepted".into());
             };
             assert_eq!(truncated_error.kind(), io::ErrorKind::UnexpectedEof);
 
-            let mut trailing = paired_candidate_payload(&[("00-11-22-33-44-55", "Radio")])?;
+            let mut trailing = paired_device_payload(&[("00-11-22-33-44-55", "Radio")])?;
             trailing.push(0x41);
-            let Err(trailing_error) = parse_paired_candidate_payload(&trailing) else {
-                return Err("bytes after candidate terminator were accepted".into());
+            let Err(trailing_error) = parse_paired_device_payload(&trailing) else {
+                return Err("bytes after paired-device terminator were accepted".into());
             };
             assert_eq!(trailing_error.kind(), io::ErrorKind::InvalidData);
             Ok(())
@@ -2249,15 +2235,14 @@ mod inner {
 
         #[test]
         fn selected_exact_address_recovers_from_one_transient_not_found() -> TestResult {
-            let candidate = parse_paired_candidate_payload(&paired_candidate_payload(&[(
+            let device = parse_paired_device_payload(&paired_device_payload(&[(
                 "00-11-22-33-44-55",
-                "Custom Name",
+                "Field Control",
             )])?)?
             .into_iter()
             .next()
-            .ok_or("candidate payload was unexpectedly empty")?;
-            let retry_not_found =
-                PairedCandidateOpenPurpose::Selected.retries_transient_not_found(&candidate);
+            .ok_or("paired-device payload was unexpectedly empty")?;
+            let retry_not_found = PairedDeviceOpenPurpose::Selected.retries_transient_not_found();
             let mut attempts = Vec::new();
             let mut delays = Vec::new();
 
@@ -2268,7 +2253,7 @@ mod inner {
                     if attempt == 1 {
                         Err(TransportError::NotFound)
                     } else {
-                        Ok(candidate.address())
+                        Ok(device.address())
                     }
                 },
                 |delay| {
@@ -2284,7 +2269,7 @@ mod inner {
         }
 
         #[test]
-        fn helper_probe_policy_does_not_retry_unhinted_not_found() {
+        fn helper_probe_policy_does_not_retry_an_unqualified_device() {
             let mut attempts = Vec::new();
             let mut delays = Vec::new();
             let result = open_with_not_found_retry_policy::<()>(
@@ -2458,6 +2443,38 @@ mod inner {
         }
 
         #[test]
+        fn interactive_sigint_does_not_kill_the_radio_helper() -> TestResult {
+            let (mut child, mut stdin, mut stdout, parent_liveness) =
+                spawn_native_test_helper("echo-v1")?;
+            let mut ready = [0_u8; HELPER_READY_MAGIC.len()];
+            stdout.read_exact(&mut ready)?;
+            assert_eq!(&ready, HELPER_READY_MAGIC);
+
+            let signal = Command::new("/bin/kill")
+                .args(["-INT", &child.id().to_string()])
+                .output()?;
+            assert!(
+                signal.status.success(),
+                "failed to signal helper: {signal:?}"
+            );
+            assert!(
+                child.try_wait()?.is_none(),
+                "the helper inherited the terminal's default SIGINT action"
+            );
+
+            let payload = b"still-connected";
+            stdin.write_all(payload)?;
+            drop(stdin);
+            let mut echoed = Vec::new();
+            let _ = stdout.read_to_end(&mut echoed)?;
+            let status = child.wait()?;
+            drop(parent_liveness);
+            assert!(status.success());
+            assert_eq!(echoed, payload);
+            Ok(())
+        }
+
+        #[test]
         fn wedged_current_executable_helper_is_bounded_and_reaped() -> TestResult {
             let (child, stdin, mut stdout, parent_liveness) = spawn_native_test_helper("hang-v1")?;
             let pid = child.id();
@@ -2601,39 +2618,21 @@ mod inner {
             Ok((child, stdin, stdout, parent_liveness))
         }
 
-        fn paired_candidate_payload(records: &[(&str, &str)]) -> Result<Vec<u8>, Box<dyn Error>> {
+        fn paired_device_payload(records: &[(&str, &str)]) -> Result<Vec<u8>, Box<dyn Error>> {
             let mut payload = Vec::new();
             for (address, name) in records {
                 let address_length = u16::try_from(address.len())?;
                 let name_length = u16::try_from(name.len())?;
-                payload.push(0);
                 payload.extend_from_slice(&address_length.to_be_bytes());
                 payload.extend_from_slice(&name_length.to_be_bytes());
                 payload.extend_from_slice(address.as_bytes());
                 payload.extend_from_slice(name.as_bytes());
             }
-            payload.extend_from_slice(&[0, 0, 0, 0, 0]);
-            Ok(payload)
-        }
-
-        fn paired_candidate_payload_with_hints(
-            records: &[(u8, &str, &str)],
-        ) -> Result<Vec<u8>, Box<dyn Error>> {
-            let mut payload = Vec::new();
-            for (hints, address, name) in records {
-                let address_length = u16::try_from(address.len())?;
-                let name_length = u16::try_from(name.len())?;
-                payload.push(*hints);
-                payload.extend_from_slice(&address_length.to_be_bytes());
-                payload.extend_from_slice(&name_length.to_be_bytes());
-                payload.extend_from_slice(address.as_bytes());
-                payload.extend_from_slice(name.as_bytes());
-            }
-            payload.extend_from_slice(&[0, 0, 0, 0, 0]);
+            payload.extend_from_slice(&[0, 0, 0, 0]);
             Ok(payload)
         }
     }
 }
 
 #[cfg(any(target_os = "macos", all(doc, unix)))]
-pub use inner::{BluetoothOpenCancellation, BluetoothTransport, PairedBluetoothCandidate};
+pub use inner::{BluetoothOpenCancellation, BluetoothTransport, PairedBluetoothDevice};

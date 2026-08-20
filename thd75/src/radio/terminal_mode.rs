@@ -1,17 +1,18 @@
-//! Reflector Terminal Mode lifecycle: the Menu 650 DV gateway transition.
+//! Reflector Terminal Mode lifecycle: Menu 985 routing plus Menu 650 mode.
 //!
 //! Enabling Reflector Terminal Mode is not an ordinary setting write: the
-//! Menu 650 byte lives only in MCP memory, the write reboots the radio, and
-//! the rebooted firmware first answers CAT for tens of seconds before the
-//! gateway application takes over and the link switches to the MMDVM
-//! protocol (hardware-verified: CAT alive around +10 s, dead around +49 s,
-//! MMDVM answering afterwards). This module owns that whole transition so
-//! applications stop hand-coding raw MCP offsets and reboot polling:
+//! Menu 985 and Menu 650 live only in MCP memory, an enabling update reboots
+//! the radio, and the rebooted firmware first answers CAT for tens of seconds
+//! before the gateway application takes over and the link switches to the
+//! MMDVM protocol (hardware-verified: CAT alive around +10 s, dead around
+//! +49 s, MMDVM answering afterwards). This module owns that whole transition
+//! so applications stop hand-coding raw MCP offsets and reboot polling:
 //!
-//! - [`Radio::set_dv_gateway_mode_detached`] performs the qualified,
-//!   schema-gated Menu 650 write with the detached MCP exit (the reboot is
-//!   expected; a normal exit's CAT reconnect would race it). The byte offset
-//!   is pinned to the generated menu registry by test.
+//! - [`Radio::set_reflector_terminal_mode_detached`] performs one qualified,
+//!   schema-gated MCP transaction that binds Menu 985 to the caller-selected
+//!   host interface and enables Menu 650. Both bytes are read back before the
+//!   detached exit; the reboot is expected, so a normal CAT reconnect would
+//!   race it. Both offsets are pinned to the generated menu registry by test.
 //! - [`Radio::enter_reflector_terminal_mode`] composes the write with the
 //!   reboot wait: it polls the same transport identity with MMDVM probes,
 //!   reopening between attempts, until terminal mode answers or the window
@@ -21,9 +22,9 @@
 //!   [`MmdvmSession`](crate::radio::mmdvm_session) entry points, never to
 //!   ordinary CAT.
 //!
-//! Once the Menu 650 write may have reached the radio, this module never
-//! hands the handle back for ordinary CAT: the firmware can still switch to
-//! MMDVM tens of seconds later, so an early-boot CAT answer proves nothing.
+//! Once either terminal-setting write may have reached the radio, this module
+//! never hands the handle back for ordinary CAT: the firmware can still switch
+//! to MMDVM tens of seconds later, so an early-boot CAT answer proves nothing.
 //! Failure paths after that point close the connection and report `None` for
 //! the radio.
 
@@ -34,12 +35,18 @@ use crate::protocol::programming::{self, WritableMcpPage};
 use crate::radio::diagnostics::LinkDiagnosis;
 use crate::radio::programming::DetachedMcpPageUpdate;
 use crate::transport::Transport;
-use crate::types::DvGatewayMode;
+use crate::types::{DvGatewayMode, PcOutputInterface};
 
 use super::Radio;
 
 /// Generated registry name of the Menu 650 DV gateway mode field.
 const GATEWAY_MODE_FIELD_NAME: &str = "dv.DvGatewayModeDvGateway";
+
+/// Generated registry name of Menu 985's DV Gateway interface field.
+const GATEWAY_INTERFACE_FIELD_NAME: &str = "radio.DvGatewayInterface";
+
+/// MCP offset of Menu 985's DV Gateway interface byte.
+const GATEWAY_INTERFACE_OFFSET: usize = 0x1093;
 
 /// MCP offset of the Menu 650 DV gateway mode byte.
 ///
@@ -58,6 +65,17 @@ const GATEWAY_MODE_PAGE: u16 = (GATEWAY_MODE_OFFSET / programming::PAGE_SIZE) as
 
 /// Byte index of the gateway mode value within its page.
 const GATEWAY_MODE_BYTE: usize = GATEWAY_MODE_OFFSET % programming::PAGE_SIZE;
+
+/// MCP page containing the Menu 985 interface byte.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "GATEWAY_INTERFACE_OFFSET / PAGE_SIZE is 0x10 and the registry pin test keeps the \
+              offset inside the 500 KB image"
+)]
+const GATEWAY_INTERFACE_PAGE: u16 = (GATEWAY_INTERFACE_OFFSET / programming::PAGE_SIZE) as u16;
+
+/// Byte index of the Menu 985 interface value within its page.
+const GATEWAY_INTERFACE_BYTE: usize = GATEWAY_INTERFACE_OFFSET % programming::PAGE_SIZE;
 
 /// Why a terminal-mode transition policy could not be constructed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -128,73 +146,122 @@ impl TerminalModeTransition {
 }
 
 impl<T: Transport> Radio<T> {
-    /// Write the Menu 650 DV gateway mode with the detached MCP exit.
+    /// Bind Reflector Terminal Mode to one host interface and enable it.
     ///
     /// The connected radio is first proved to be the exact MCP-D75 schema
-    /// target ([`Radio::verify_mcp_schema_target`]). The write itself uses
-    /// the detached page update: when the stored byte already matches, no
-    /// write happens and MCP exits normally; when it changes, the radio
-    /// reboots into the requested mode and this connection's CAT framing is
-    /// gone until the caller handles the transition. Prefer
+    /// target ([`Radio::verify_mcp_schema_target`]). Menu 985 is set to
+    /// `interface` and Menu 650 is set to Reflector Terminal in one sparse MCP
+    /// session. Both pages are read before either is written, changed pages
+    /// are verified by read-back, and the session exits detached whenever
+    /// either setting changed. If both already match, no write occurs and CAT
+    /// is restored normally. Prefer
     /// [`Radio::enter_reflector_terminal_mode`], which owns that wait.
     ///
     /// # Errors
     ///
     /// Returns [`Error::McpUnsupportedSchemaTarget`] before any MCP entry for
     /// an unqualified model or firmware, and MCP entry, page, exit, or
-    /// recovery errors from the detached update. After an error the normal
-    /// MCP recovery rules apply
-    /// ([`Radio::recover_from_interrupted_mcp`], reconnect).
-    pub async fn set_dv_gateway_mode_detached(
+    /// recovery errors from the detached update. The structured error reports
+    /// which selector pages may have been written and which were read-back
+    /// verified. An ambiguous binary exchange is already closed without an
+    /// exit byte and requires a radio power cycle.
+    pub async fn set_reflector_terminal_mode_detached(
         &mut self,
-        mode: DvGatewayMode,
+        interface: PcOutputInterface,
     ) -> Result<DetachedMcpPageUpdate, Error> {
         self.verify_mcp_schema_target().await?;
-        self.set_dv_gateway_mode_detached_unverified(mode).await
+        self.set_reflector_terminal_mode_detached_unverified(interface)
+            .await
     }
 
-    /// The detached Menu 650 write without the schema preflight.
+    /// Configure Menu 985 and Menu 650 without repeating schema preflight.
     ///
     /// For callers that have already proved the exact MCP-D75 schema target
     /// on this connection (their own [`Radio::verify_mcp_schema_target`]
     /// call, typically because they also needed the identity for messaging).
-    /// Prefer [`Radio::set_dv_gateway_mode_detached`], which verifies first.
+    /// Prefer [`Radio::set_reflector_terminal_mode_detached`], which verifies
+    /// first.
     ///
     /// # Errors
     ///
-    /// MCP entry, page, exit, or recovery errors from the detached update;
-    /// after an error the normal MCP recovery rules apply.
-    pub async fn set_dv_gateway_mode_detached_unverified(
+    /// MCP entry, page, exit, or recovery errors from the detached update. An
+    /// ambiguous binary exchange is already closed without an exit byte and
+    /// requires a radio power cycle.
+    pub async fn set_reflector_terminal_mode_detached_unverified(
         &mut self,
-        mode: DvGatewayMode,
+        interface: PcOutputInterface,
     ) -> Result<DetachedMcpPageUpdate, Error> {
-        let value = match mode {
-            DvGatewayMode::Off => 0_u8,
-            DvGatewayMode::ReflectorTerminal => 1,
-        };
+        let interface_value = u8::from(interface);
+        let mode_value = u8::from(DvGatewayMode::ReflectorTerminal);
+        tracing::info!(
+            interface_field = GATEWAY_INTERFACE_FIELD_NAME,
+            interface_offset = GATEWAY_INTERFACE_OFFSET,
+            interface = %interface,
+            mode_field = GATEWAY_MODE_FIELD_NAME,
+            mode_offset = GATEWAY_MODE_OFFSET,
+            "binding and enabling Reflector Terminal Mode via detached MCP update"
+        );
+        let interface_page = WritableMcpPage::new(GATEWAY_INTERFACE_PAGE)?;
+        let mode_page = WritableMcpPage::new(GATEWAY_MODE_PAGE)?;
+        self.modify_memory_pages_detached_if_changed(&[interface_page, mode_page], |page, data| {
+            match page.as_raw() {
+                GATEWAY_INTERFACE_PAGE => data[GATEWAY_INTERFACE_BYTE] = interface_value,
+                GATEWAY_MODE_PAGE => data[GATEWAY_MODE_BYTE] = mode_value,
+                _ => unreachable!("only the two terminal-mode pages were requested"),
+            }
+        })
+        .await
+        .map_err(Error::from)
+    }
+
+    /// Disable DV Gateway mode with a detached, schema-qualified MCP update.
+    ///
+    /// Menu 985 is deliberately left unchanged because no interface owns the
+    /// gateway after Menu 650 is Off. If Menu 650 is already Off, no flash
+    /// write occurs and the normal MCP exit restores CAT.
+    ///
+    /// # Errors
+    ///
+    /// Returns schema preflight, MCP entry, page, exit, or recovery errors.
+    pub async fn disable_dv_gateway_detached(&mut self) -> Result<DetachedMcpPageUpdate, Error> {
+        self.verify_mcp_schema_target().await?;
+        self.disable_dv_gateway_detached_unverified().await
+    }
+
+    /// Disable DV Gateway mode after the caller already proved the schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns MCP entry, page, exit, or recovery errors.
+    pub async fn disable_dv_gateway_detached_unverified(
+        &mut self,
+    ) -> Result<DetachedMcpPageUpdate, Error> {
         tracing::info!(
             field = GATEWAY_MODE_FIELD_NAME,
             offset = GATEWAY_MODE_OFFSET,
-            value,
-            "writing DV gateway mode via detached MCP update"
+            "disabling DV gateway mode via detached MCP update"
         );
         let page = WritableMcpPage::new(GATEWAY_MODE_PAGE)?;
-        self.modify_memory_page_detached_if_changed(page, |data| {
-            data[GATEWAY_MODE_BYTE] = value;
+        let off = u8::from(DvGatewayMode::Off);
+        self.modify_memory_pages_detached_if_changed(&[page], |_, data| {
+            data[GATEWAY_MODE_BYTE] = off;
         })
         .await
+        .map_err(Error::from)
     }
 
     /// Put the radio into Reflector Terminal Mode and prove its link speaks
     /// MMDVM.
     ///
-    /// Composes the schema preflight, the detached Menu 650 write, and the
+    /// Composes the schema preflight, the detached Menu 985 / Menu 650 update, and the
     /// reboot wait: the same transport identity is probed with MMDVM
     /// `GET_VERSION` frames, reopening between attempts, until terminal mode
-    /// answers or `transition.window()` elapses. Even when the stored byte
-    /// was already Reflector Terminal, the wait still runs: the MCP exit
-    /// reset the radio, and an early-boot CAT answer proves nothing about
-    /// the mode the firmware settles into.
+    /// answers or `transition.window()` elapses. The caller must explicitly
+    /// provide the physical host interface it owns; Menu 985 is written and
+    /// verified together with Menu 650 before the reboot. Even when both
+    /// stored bytes already match, the wait still runs: the MCP exit reset the
+    /// radio, and an early-boot CAT answer proves nothing about the mode the
+    /// firmware settles into.
     ///
     /// On success the returned radio is positively proved to speak MMDVM.
     /// Do not issue ordinary CAT on it.
@@ -210,7 +277,10 @@ impl<T: Transport> Radio<T> {
     /// let radio = Radio::connect_with_tnc_exit(transport).await?;
     ///
     /// match radio
-    ///     .enter_reflector_terminal_mode(TerminalModeTransition::RECOMMENDED)
+    ///     .enter_reflector_terminal_mode(
+    ///         kenwood_thd75::types::PcOutputInterface::Usb,
+    ///         TerminalModeTransition::RECOMMENDED,
+    ///     )
     ///     .await
     /// {
     ///     Ok(radio) => { /* hand the MMDVM-proved radio to DstarGateway */ drop(radio); }
@@ -227,32 +297,42 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Errors
     ///
-    /// A failure before the Menu 650 write can have reached the radio
-    /// returns the radio back (`Some`), still usable for CAT. Once the write
-    /// may have landed, failure paths close the connection and return `None`
-    /// with the underlying error;
-    /// [`Error::TerminalModeNotEngaged`] reports an expired transition
-    /// window, including the Menu 985 interface-binding guidance.
+    /// A completed schema rejection before MCP entry returns the radio
+    /// (`Some`) only while its CAT boundary remains proved. A failed or
+    /// malformed identity exchange closes the connection and returns `None`,
+    /// as does every MCP entry, update, cleanup, or transition failure;
+    /// [`Error::TerminalModeNotEngaged`] reports an expired transition window
+    /// after both stored selectors were read-back verified.
     pub async fn enter_reflector_terminal_mode(
         mut self,
+        interface: PcOutputInterface,
         transition: TerminalModeTransition,
     ) -> Result<Self, (Option<Self>, Error)> {
         if let Err(error) = self.verify_mcp_schema_target().await {
+            if self.cat_recovery_required() || error.requires_recovery() {
+                drop(self.disconnect().await);
+                return Err((None, error));
+            }
             return Err((Some(self), error));
         }
 
         match self
-            .set_dv_gateway_mode_detached_unverified(DvGatewayMode::ReflectorTerminal)
+            .set_reflector_terminal_mode_detached_unverified(interface)
             .await
         {
             Ok(DetachedMcpPageUpdate::ChangedRadioRebooting) => {
-                tracing::info!("Menu 650 changed; radio rebooting into terminal mode");
+                tracing::info!(
+                    %interface,
+                    "Menu 985 and/or Menu 650 changed; radio rebooting into terminal mode"
+                );
             }
             Ok(DetachedMcpPageUpdate::UnchangedCatReady) => {
                 // The MCP exit still reset the radio; the CAT proof from the
                 // unchanged path can be the early boot window only.
                 tracing::info!(
-                    "Menu 650 already Reflector Terminal; waiting for MMDVM after the MCP reset"
+                    %interface,
+                    "Menu 985 route and Menu 650 mode already matched; waiting for MMDVM after \
+                     the MCP reset"
                 );
             }
             Err(error) => {
@@ -317,12 +397,18 @@ mod tests {
     const PROBE: [u8; 3] = [MMDVM_FRAME_START, 0x03, MMDVM_GET_VERSION];
 
     #[test]
-    fn registry_pins_the_gateway_offset() -> TestResult {
-        let field = menu_field(GATEWAY_MODE_FIELD_NAME)
+    fn registry_pins_both_terminal_mode_offsets() -> TestResult {
+        let mode_field = menu_field(GATEWAY_MODE_FIELD_NAME)
             .ok_or("the generated registry must contain the DV gateway mode field")?;
         assert_eq!(
-            field.descriptor.offset, GATEWAY_MODE_OFFSET,
-            "the local offset constant must match the generated registry"
+            mode_field.descriptor.offset, GATEWAY_MODE_OFFSET,
+            "the local mode offset must match the generated registry"
+        );
+        let interface_field = menu_field(GATEWAY_INTERFACE_FIELD_NAME)
+            .ok_or("the generated registry must contain the DV gateway interface field")?;
+        assert_eq!(
+            interface_field.descriptor.offset, GATEWAY_INTERFACE_OFFSET,
+            "the local interface offset must match the generated registry"
         );
         Ok(())
     }
@@ -344,28 +430,56 @@ mod tests {
         );
     }
 
-    /// Queue the schema preflight plus the changed-byte detached MCP write:
-    /// enter, read (byte 0), verified write of byte 1, verification
-    /// read-back, detached exit ACK.
+    /// Queue the schema preflight plus one two-page detached update that
+    /// changes Menu 985 from USB to Bluetooth and Menu 650 from Off to
+    /// Reflector Terminal.
     fn queue_changed_gateway_write(mock: &mut MockTransport) -> TestResult {
         mock.expect(b"ID\r", b"ID TH-D75\r");
         mock.expect(b"FV\r", b"FV 1.03\r");
         mock.expect(programming::ENTER_PROGRAMMING, programming::ENTER_RESPONSE);
 
-        let page_raw = GATEWAY_MODE_PAGE;
-        let original = [0_u8; programming::PAGE_SIZE];
-        let mut modified = original;
-        modified[GATEWAY_MODE_BYTE] = 1;
+        let interface_original = [0_u8; programming::PAGE_SIZE];
+        let mut interface_modified = interface_original;
+        interface_modified[GATEWAY_INTERFACE_BYTE] = u8::from(PcOutputInterface::Bluetooth);
+        let mode_original = [0_u8; programming::PAGE_SIZE];
+        let mut mode_modified = mode_original;
+        mode_modified[GATEWAY_MODE_BYTE] = 1;
 
-        let read = programming::build_read_command(programming::McpPage::new(page_raw)?);
-        mock.expect(&read, &build_w_response(page_raw, &original));
+        let interface_read =
+            programming::build_read_command(programming::McpPage::new(GATEWAY_INTERFACE_PAGE)?);
+        mock.expect(
+            &interface_read,
+            &build_w_response(GATEWAY_INTERFACE_PAGE, &interface_original),
+        );
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+        let mode_read =
+            programming::build_read_command(programming::McpPage::new(GATEWAY_MODE_PAGE)?);
+        mock.expect(
+            &mode_read,
+            &build_w_response(GATEWAY_MODE_PAGE, &mode_original),
+        );
         mock.expect(&[programming::ACK], &[programming::ACK]);
 
-        let write = programming::build_write_command(WritableMcpPage::new(page_raw)?, &modified);
-        mock.expect(&write, &[programming::ACK]);
-        mock.expect(&read, &build_w_response(page_raw, &modified));
+        let interface_write = programming::build_write_command(
+            WritableMcpPage::new(GATEWAY_INTERFACE_PAGE)?,
+            &interface_modified,
+        );
+        mock.expect(&interface_write, &[programming::ACK]);
+        mock.expect(
+            &interface_read,
+            &build_w_response(GATEWAY_INTERFACE_PAGE, &interface_modified),
+        );
         mock.expect(&[programming::ACK], &[programming::ACK]);
-
+        let mode_write = programming::build_write_command(
+            WritableMcpPage::new(GATEWAY_MODE_PAGE)?,
+            &mode_modified,
+        );
+        mock.expect(&mode_write, &[programming::ACK]);
+        mock.expect(
+            &mode_read,
+            &build_w_response(GATEWAY_MODE_PAGE, &mode_modified),
+        );
+        mock.expect(&[programming::ACK], &[programming::ACK]);
         mock.expect(&[programming::EXIT], &[programming::ACK]);
         Ok(())
     }
@@ -379,7 +493,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn enter_writes_menu_650_then_proves_mmdvm() -> TestResult {
+    async fn enter_binds_menu_985_enables_menu_650_then_proves_mmdvm() -> TestResult {
         let mut mock = MockTransport::new();
         queue_changed_gateway_write(&mut mock)?;
         // First probe: no answer; the transport is reopened. Second probe:
@@ -391,7 +505,9 @@ mod tests {
 
         let transition =
             TerminalModeTransition::new(Duration::from_secs(30), Duration::from_secs(1))?;
-        let result = radio.enter_reflector_terminal_mode(transition).await;
+        let result = radio
+            .enter_reflector_terminal_mode(PcOutputInterface::Bluetooth, transition)
+            .await;
         let Ok(radio) = result else {
             return Err(format!("terminal-mode entry must succeed: {result:?}").into());
         };
@@ -413,13 +529,15 @@ mod tests {
 
         let transition =
             TerminalModeTransition::new(Duration::from_secs(2), Duration::from_secs(1))?;
-        let result = radio.enter_reflector_terminal_mode(transition).await;
+        let result = radio
+            .enter_reflector_terminal_mode(PcOutputInterface::Bluetooth, transition)
+            .await;
         let Err((returned, error)) = result else {
             return Err("an unanswered transition window must fail".into());
         };
         assert!(
             returned.is_none(),
-            "after the Menu 650 write the radio must never be handed back for CAT"
+            "after the terminal-mode update the radio must never be handed back for CAT"
         );
         assert!(
             matches!(error, Error::TerminalModeNotEngaged { window } if window == transition.window()),
@@ -436,7 +554,10 @@ mod tests {
         let radio = Radio::new(mock);
 
         let result = radio
-            .enter_reflector_terminal_mode(TerminalModeTransition::RECOMMENDED)
+            .enter_reflector_terminal_mode(
+                PcOutputInterface::Bluetooth,
+                TerminalModeTransition::RECOMMENDED,
+            )
             .await;
         let Err((returned, error)) = result else {
             return Err("an unqualified schema target must be refused".into());
@@ -450,14 +571,48 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn schema_identity_timeout_closes_instead_of_returning_poisoned_cat() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect_hang(b"ID\r");
+        let radio = Radio::new(mock);
+
+        let result = radio
+            .enter_reflector_terminal_mode(
+                PcOutputInterface::Bluetooth,
+                TerminalModeTransition::RECOMMENDED,
+            )
+            .await;
+        let Err((returned, error)) = result else {
+            return Err("an unanswered identity exchange must fail".into());
+        };
+        assert!(
+            returned.is_none(),
+            "a timed-out CAT identity exchange must not return a poisoned handle"
+        );
+        assert!(error.is_link_lost());
+        assert!(error.requires_recovery());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn unverified_detached_setter_skips_the_identity_exchanges() -> TestResult {
         let mut mock = MockTransport::new();
         mock.expect(programming::ENTER_PROGRAMMING, programming::ENTER_RESPONSE);
-        let mut stored = [0_u8; programming::PAGE_SIZE];
-        stored[GATEWAY_MODE_BYTE] = 1;
-        let read = programming::build_read_command(programming::McpPage::new(GATEWAY_MODE_PAGE)?);
-        mock.expect(&read, &build_w_response(GATEWAY_MODE_PAGE, &stored));
+        let mut interface = [0_u8; programming::PAGE_SIZE];
+        interface[GATEWAY_INTERFACE_BYTE] = u8::from(PcOutputInterface::Bluetooth);
+        let interface_read =
+            programming::build_read_command(programming::McpPage::new(GATEWAY_INTERFACE_PAGE)?);
+        mock.expect(
+            &interface_read,
+            &build_w_response(GATEWAY_INTERFACE_PAGE, &interface),
+        );
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+        let mut mode = [0_u8; programming::PAGE_SIZE];
+        mode[GATEWAY_MODE_BYTE] = 1;
+        let mode_read =
+            programming::build_read_command(programming::McpPage::new(GATEWAY_MODE_PAGE)?);
+        mock.expect(&mode_read, &build_w_response(GATEWAY_MODE_PAGE, &mode));
         mock.expect(&[programming::ACK], &[programming::ACK]);
         mock.expect(&[programming::EXIT], &[programming::ACK]);
         mock.expect_reopen(Ok(()));
@@ -465,7 +620,7 @@ mod tests {
         let mut radio = Radio::new(mock);
 
         let update = radio
-            .set_dv_gateway_mode_detached_unverified(DvGatewayMode::ReflectorTerminal)
+            .set_reflector_terminal_mode_detached_unverified(PcOutputInterface::Bluetooth)
             .await?;
         assert!(
             matches!(update, DetachedMcpPageUpdate::UnchangedCatReady),
@@ -476,15 +631,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detached_setter_skips_the_write_when_the_byte_matches() -> TestResult {
+    async fn qualified_setter_skips_writes_when_both_bytes_match() -> TestResult {
         let mut mock = MockTransport::new();
         mock.expect(b"ID\r", b"ID TH-D75\r");
         mock.expect(b"FV\r", b"FV 1.03\r");
         mock.expect(programming::ENTER_PROGRAMMING, programming::ENTER_RESPONSE);
-        let mut stored = [0_u8; programming::PAGE_SIZE];
-        stored[GATEWAY_MODE_BYTE] = 1;
-        let read = programming::build_read_command(programming::McpPage::new(GATEWAY_MODE_PAGE)?);
-        mock.expect(&read, &build_w_response(GATEWAY_MODE_PAGE, &stored));
+        let interface = [0_u8; programming::PAGE_SIZE];
+        let interface_read =
+            programming::build_read_command(programming::McpPage::new(GATEWAY_INTERFACE_PAGE)?);
+        mock.expect(
+            &interface_read,
+            &build_w_response(GATEWAY_INTERFACE_PAGE, &interface),
+        );
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+        let mut mode = [0_u8; programming::PAGE_SIZE];
+        mode[GATEWAY_MODE_BYTE] = 1;
+        let mode_read =
+            programming::build_read_command(programming::McpPage::new(GATEWAY_MODE_PAGE)?);
+        mock.expect(&mode_read, &build_w_response(GATEWAY_MODE_PAGE, &mode));
         mock.expect(&[programming::ACK], &[programming::ACK]);
         // Unchanged: normal exit with CAT restoration.
         mock.expect(&[programming::EXIT], &[programming::ACK]);
@@ -493,11 +657,59 @@ mod tests {
         let mut radio = Radio::new(mock);
 
         let update = radio
-            .set_dv_gateway_mode_detached(DvGatewayMode::ReflectorTerminal)
+            .set_reflector_terminal_mode_detached(PcOutputInterface::Usb)
             .await?;
         assert!(
             matches!(update, DetachedMcpPageUpdate::UnchangedCatReady),
             "a matching byte must skip the write: {update:?}"
+        );
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn qualified_setter_corrects_route_when_mode_is_already_enabled() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"ID\r", b"ID TH-D75\r");
+        mock.expect(b"FV\r", b"FV 1.03\r");
+        mock.expect(programming::ENTER_PROGRAMMING, programming::ENTER_RESPONSE);
+
+        let interface_original = [0_u8; programming::PAGE_SIZE];
+        let mut interface_modified = interface_original;
+        interface_modified[GATEWAY_INTERFACE_BYTE] = u8::from(PcOutputInterface::Bluetooth);
+        let mut mode = [0_u8; programming::PAGE_SIZE];
+        mode[GATEWAY_MODE_BYTE] = 1;
+        let interface_read =
+            programming::build_read_command(programming::McpPage::new(GATEWAY_INTERFACE_PAGE)?);
+        mock.expect(
+            &interface_read,
+            &build_w_response(GATEWAY_INTERFACE_PAGE, &interface_original),
+        );
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+        let mode_read =
+            programming::build_read_command(programming::McpPage::new(GATEWAY_MODE_PAGE)?);
+        mock.expect(&mode_read, &build_w_response(GATEWAY_MODE_PAGE, &mode));
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+
+        let interface_write = programming::build_write_command(
+            WritableMcpPage::new(GATEWAY_INTERFACE_PAGE)?,
+            &interface_modified,
+        );
+        mock.expect(&interface_write, &[programming::ACK]);
+        mock.expect(
+            &interface_read,
+            &build_w_response(GATEWAY_INTERFACE_PAGE, &interface_modified),
+        );
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+        mock.expect(&[programming::EXIT], &[programming::ACK]);
+
+        let mut radio = Radio::new(mock);
+        let update = radio
+            .set_reflector_terminal_mode_detached(PcOutputInterface::Bluetooth)
+            .await?;
+        assert!(
+            matches!(update, DetachedMcpPageUpdate::ChangedRadioRebooting),
+            "a route-only correction must use the detached reboot path: {update:?}"
         );
         radio.transport.assert_complete();
         Ok(())
