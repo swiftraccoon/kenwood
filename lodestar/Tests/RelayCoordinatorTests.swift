@@ -11,7 +11,8 @@ final class RelayCoordinatorTests: XCTestCase {
         let mock = MockRadioTransport()
         transportCoordinator.transportFactory = { _ in mock }
         transportCoordinator.select(.mockTHD75)
-        await mock.script(response: [0xE0, 0x04, 0x00, 0x01], for: [0xE0, 0x03, 0x00])
+        let version = [0xE0, 0x0E, 0x00, 0x01] + Array("MMDVM 2018".utf8)
+        await mock.script(response: version, for: [0xE0, 0x03, 0x00])
         await transportCoordinator.connect()
         XCTAssertEqual(transportCoordinator.radioMode, .mmdvm)
 

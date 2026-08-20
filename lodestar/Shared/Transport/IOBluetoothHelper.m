@@ -173,7 +173,7 @@ static int add_dup_and_close(posix_spawn_file_actions_t *actions,
 }
 
 static const char *control_mode_for_spawn_mode(int mode) {
-    return mode == 1 ? "paired-v2" : "";
+    return mode == 1 ? "paired" : "";
 }
 
 static const char *test_mode_for_spawn_mode(int mode) {
@@ -193,7 +193,7 @@ static const char *child_environment_value(char **environment,
 // Verifies that production control and no-radio test modes remain separated
 // when the Swift test target exercises the wrapper without invoking Bluetooth.
 int lodestar_bt_helper_environment_protocol_probe(void) {
-    static const char *expected_control[] = {NULL, "paired-v2", NULL, NULL};
+    static const char *expected_control[] = {NULL, "paired", NULL, NULL};
     static const char *expected_test[] = {NULL, NULL, "echo-v1", "hang-v1"};
     for (int mode = 0; mode <= 3; mode++) {
         size_t inherited_count = 0;

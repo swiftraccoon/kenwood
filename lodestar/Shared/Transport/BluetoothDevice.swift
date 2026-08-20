@@ -3,7 +3,11 @@
 
 import Foundation
 
-/// A paired Bluetooth device the user can select as a radio.
+/// One paired Bluetooth endpoint identified by its stable address.
+///
+/// The picker presents paired endpoints without guessing from their display
+/// names. Opening always uses `address`; connection setup then proves the
+/// selected endpoint speaks the expected radio protocol.
 public struct BluetoothDevice: Identifiable, Sendable, Hashable {
     /// Stable identifier: the device's Bluetooth address string.
     public let id: String

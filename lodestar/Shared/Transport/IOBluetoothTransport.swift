@@ -20,6 +20,7 @@ import Darwin
 /// uncertain partial command can never leave a reusable transport behind.
 public actor IOBluetoothTransport: RadioTransport {
     public let device: BluetoothDevice
+    public nonisolated let pcOutputInterface: PcOutputInterface = .bluetooth
     private var _state: RadioTransportState = .disconnected
     private let stateContinuation: AsyncStream<RadioTransportState>.Continuation
     public nonisolated let stateStream: AsyncStream<RadioTransportState>
@@ -49,8 +50,11 @@ public actor IOBluetoothTransport: RadioTransport {
 
     public var state: RadioTransportState { _state }
 
-    /// Enumerate paired devices in a bounded, short-lived helper process.
-    /// Even discovery therefore keeps IOBluetooth objects out of the app.
+    /// Enumerate every bounded paired device in a short-lived helper.
+    ///
+    /// Discovery is metadata-only and does not guess radio identity from a
+    /// display name. The user chooses one exact address; connection setup
+    /// proves the endpoint's wire protocol before publishing it as connected.
     public nonisolated static func pairedDevices() -> [BluetoothDevice] {
         #if os(macOS)
         return BluetoothHelperProcess.pairedDevices()
@@ -129,6 +133,11 @@ public actor IOBluetoothTransport: RadioTransport {
 
     public func open() async throws {
         #if os(macOS)
+        guard BluetoothHelperProcess.isExactBluetoothAddress(device.address) else {
+            throw RadioTransportError.openFailed(
+                reason: "Bluetooth connection requires the selected device's exact address"
+            )
+        }
         guard !openInProgress, helper == nil else {
             throw RadioTransportError.openFailed(
                 reason: "A Bluetooth helper is already opening or connected"
@@ -562,8 +571,7 @@ private func lodestar_bt_helper_terminate(
 private func lodestar_bt_helper_environment_protocol_probe() -> Int32
 
 private let bluetoothHelperReadyMagic = Array("THD75BT-READY-v1".utf8)
-private let bluetoothPairedCandidateKnownHints: UInt8 = 0x03
-private let bluetoothMaxPairedCandidates = 64
+private let bluetoothMaxPairedDevices = 64
 private let bluetoothMaxPairedDisplayNameBytes = 1_024
 
 private enum BluetoothHelperMode: Int32 {
@@ -854,24 +862,20 @@ private struct BluetoothHelperProcess {
         var devices: [BluetoothDevice] = []
         var addresses: Set<String> = []
         while true {
-            guard bytes.count - cursor >= 5 else { return nil }
-            let hints = bytes[cursor]
-            let addressLength = Int(bytes[cursor + 1]) << 8
-                | Int(bytes[cursor + 2])
-            let nameLength = Int(bytes[cursor + 3]) << 8
-                | Int(bytes[cursor + 4])
-            cursor += 5
-            guard hints & ~bluetoothPairedCandidateKnownHints == 0 else {
-                return nil
-            }
+            guard bytes.count - cursor >= 4 else { return nil }
+            let addressLength = Int(bytes[cursor]) << 8
+                | Int(bytes[cursor + 1])
+            let nameLength = Int(bytes[cursor + 2]) << 8
+                | Int(bytes[cursor + 3])
+            cursor += 4
             if addressLength == 0 && nameLength == 0 {
-                guard hints == 0, cursor == bytes.count else { return nil }
+                guard cursor == bytes.count else { return nil }
                 return devices
             }
             guard addressLength == 17,
                   nameLength > 0,
                   nameLength <= bluetoothMaxPairedDisplayNameBytes,
-                  devices.count < bluetoothMaxPairedCandidates,
+                  devices.count < bluetoothMaxPairedDevices,
                   bytes.count - cursor >= addressLength + nameLength else {
                 return nil
             }
@@ -893,7 +897,7 @@ private struct BluetoothHelperProcess {
         }
     }
 
-    private static func isExactBluetoothAddress(_ address: String) -> Bool {
+    fileprivate static func isExactBluetoothAddress(_ address: String) -> Bool {
         let bytes = Array(address.utf8)
         guard bytes.count == 17 else { return false }
         var separator: UInt8?

@@ -30,42 +30,47 @@ final class MockTransportTests: XCTestCase {
         XCTAssertTrue(IOBluetoothTransport.helperEnvironmentProtocolProbe())
     }
 
-    func testBluetoothHelperParsesV2CandidateHintsAndFiveByteHeaders() {
+    func testBluetoothHelperReturnsAllPairedDevicesWithoutNameFiltering() {
         let address = "00-11-22-33-44-55"
         let name = "Field Radio"
+        let headsetAddress = "AA-BB-CC-DD-EE-FF"
+        let headsetName = "Headset"
         var payload = Array("THD75BT-READY-v1".utf8)
-        payload.append(0x03)
         payload.append(contentsOf: UInt16(address.utf8.count).bigEndianBytes)
         payload.append(contentsOf: UInt16(name.utf8.count).bigEndianBytes)
         payload.append(contentsOf: address.utf8)
         payload.append(contentsOf: name.utf8)
-        payload.append(contentsOf: [0, 0, 0, 0, 0])
+        payload.append(contentsOf: UInt16(headsetAddress.utf8.count).bigEndianBytes)
+        payload.append(contentsOf: UInt16(headsetName.utf8.count).bigEndianBytes)
+        payload.append(contentsOf: headsetAddress.utf8)
+        payload.append(contentsOf: headsetName.utf8)
+        payload.append(contentsOf: [0, 0, 0, 0])
 
         XCTAssertEqual(
             IOBluetoothTransport.helperParsePairedDevicePayload(payload),
-            [BluetoothDevice(id: address, name: name, address: address)]
+            [
+                BluetoothDevice(id: address, name: name, address: address),
+                BluetoothDevice(
+                    id: headsetAddress,
+                    name: headsetName,
+                    address: headsetAddress
+                ),
+            ]
         )
     }
 
-    func testBluetoothHelperRejectsLegacyV1AndUnknownHintPayloads() {
+    func testBluetoothHelperRejectsMalformedAndTrailingPayloads() {
         let address = "00-11-22-33-44-55"
         let name = "TH-D75"
-        var legacy = Array("THD75BT-READY-v1".utf8)
-        legacy.append(contentsOf: UInt16(address.utf8.count).bigEndianBytes)
-        legacy.append(contentsOf: UInt16(name.utf8.count).bigEndianBytes)
-        legacy.append(contentsOf: address.utf8)
-        legacy.append(contentsOf: name.utf8)
-        legacy.append(contentsOf: [0, 0, 0, 0])
-        XCTAssertNil(IOBluetoothTransport.helperParsePairedDevicePayload(legacy))
+        var truncated = Array("THD75BT-READY-v1".utf8)
+        truncated.append(contentsOf: UInt16(address.utf8.count).bigEndianBytes)
+        truncated.append(contentsOf: UInt16(name.utf8.count).bigEndianBytes)
+        truncated.append(contentsOf: address.utf8.dropLast())
+        XCTAssertNil(IOBluetoothTransport.helperParsePairedDevicePayload(truncated))
 
-        var unknownHint = Array("THD75BT-READY-v1".utf8)
-        unknownHint.append(0x80)
-        unknownHint.append(contentsOf: UInt16(address.utf8.count).bigEndianBytes)
-        unknownHint.append(contentsOf: UInt16(name.utf8.count).bigEndianBytes)
-        unknownHint.append(contentsOf: address.utf8)
-        unknownHint.append(contentsOf: name.utf8)
-        unknownHint.append(contentsOf: [0, 0, 0, 0, 0])
-        XCTAssertNil(IOBluetoothTransport.helperParsePairedDevicePayload(unknownHint))
+        var trailing = Array("THD75BT-READY-v1".utf8)
+        trailing.append(contentsOf: [0, 0, 0, 0, 0xAA])
+        XCTAssertNil(IOBluetoothTransport.helperParsePairedDevicePayload(trailing))
     }
 
     func testLiveBluetoothHelperReturnsExpectedPairedRadio() throws {
@@ -81,7 +86,7 @@ final class MockTransportTests: XCTestCase {
         }
         guard let devices = IOBluetoothTransport.helperPairedDevicesForTesting() else {
             return XCTFail(
-                "The signed paired-device helper did not return a complete v2 payload."
+                "The signed paired-device helper did not return a complete payload."
             )
         }
         XCTAssertTrue(
@@ -90,6 +95,27 @@ final class MockTransportTests: XCTestCase {
             },
             "The complete helper payload did not contain the expected paired radio."
         )
+    }
+
+    func testBluetoothTransportRejectsNameInAddressFieldBeforeSpawningHelper() async {
+        let named = BluetoothDevice(
+            id: "TH-D75",
+            name: "TH-D75",
+            address: "TH-D75"
+        )
+        let transport = IOBluetoothTransport(device: named)
+
+        do {
+            try await transport.open()
+            XCTFail("a display name must never reach the exact-address open path")
+        } catch let error as RadioTransportError {
+            guard case .openFailed(let reason) = error else {
+                return XCTFail("expected openFailed, got \(error)")
+            }
+            XCTAssertTrue(reason.contains("exact address"), reason)
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
     }
 
     func testBluetoothCancelledReadPreservesFollowingBytes() async throws {
@@ -142,11 +168,12 @@ final class MockTransportTests: XCTestCase {
     func testScriptedResponseAndWriteCapture() async throws {
         let mock = MockRadioTransport()
         try await mock.open()
-        // MMDVM GetVersion probe: 0xE0 0x03 0x00 → version response frame.
-        await mock.script(response: [0xE0, 0x04, 0x00, 0x01], for: [0xE0, 0x03, 0x00])
+        // MMDVM GetVersion probe: 0xE0 0x03 0x00 to a typed v1 response.
+        let version = [0xE0, 0x0E, 0x00, 0x01] + Array("MMDVM 2018".utf8)
+        await mock.script(response: version, for: [0xE0, 0x03, 0x00])
         try await mock.write([0xE0, 0x03, 0x00])
         let reply = try await mock.read(maxBytes: 16)
-        XCTAssertEqual(reply, [0xE0, 0x04, 0x00, 0x01])
+        XCTAssertEqual(reply, version)
         let written = await mock.writtenBytes()
         XCTAssertEqual(written, [[0xE0, 0x03, 0x00]])
     }
@@ -200,6 +227,63 @@ final class MockTransportTests: XCTestCase {
         let siblingResult = try await second.value
         XCTAssertEqual(siblingResult, [0xAA])
     }
+
+    func testModeProbeRejectsTruncatedMmdvmPrefix() async throws {
+        let mock = MockRadioTransport()
+        try await mock.open()
+        await mock.script(
+            response: [0xE0],
+            for: Array(mmdvmGetVersionProbe())
+        )
+
+        let mode = try await RadioModeProber(
+            transport: mock,
+            timeout: .milliseconds(50)
+        ).probe()
+
+        XCTAssertEqual(mode, .unrecognized(firstByte: 0xE0))
+    }
+
+    func testModeProbeRequiresGetVersionCommandInCompleteMmdvmFrame() async throws {
+        let mock = MockRadioTransport()
+        try await mock.open()
+        await mock.script(
+            response: [0xE0, 0x03, 0x01],
+            for: Array(mmdvmGetVersionProbe())
+        )
+
+        let mode = try await RadioModeProber(transport: mock).probe()
+
+        XCTAssertEqual(mode, .unrecognized(firstByte: 0xE0))
+    }
+
+    func testModeProbeRejectsEchoedGetVersionRequest() async throws {
+        let mock = MockRadioTransport()
+        try await mock.open()
+        let probe = Array(mmdvmGetVersionProbe())
+        await mock.script(response: probe, for: probe)
+
+        let mode = try await RadioModeProber(transport: mock).probe()
+
+        XCTAssertEqual(mode, .unrecognized(firstByte: 0xE0))
+    }
+
+    func testModeProbeLeavesCoalescedFollowingFrameUnread() async throws {
+        let mock = MockRadioTransport()
+        try await mock.open()
+        let version = [0xE0, 0x0E, 0x00, 0x01] + Array("MMDVM 2018".utf8)
+        let following: [UInt8] = [0xE0, 0x03, 0x01]
+        await mock.script(
+            response: version + following,
+            for: Array(mmdvmGetVersionProbe())
+        )
+
+        let mode = try await RadioModeProber(transport: mock).probe()
+        let unread = try await mock.read(maxBytes: following.count)
+
+        XCTAssertEqual(mode, .mmdvm)
+        XCTAssertEqual(unread, following)
+    }
 }
 
 private extension UInt16 {
@@ -222,6 +306,300 @@ final class McpSessionTests: XCTestCase {
 
     private func pageFrame(_ page: UInt16, data: [UInt8]) throws -> [UInt8] {
         Array(try buildWritePageCmd(page: page, data: Data(data)))
+    }
+
+    private func assertReflectorTerminalModeUpdate(
+        selecting interface: PcOutputInterface,
+        from storedInterface: UInt8,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        let mock = MockRadioTransport()
+        try await mock.open()
+        let session = McpSession(transport: mock)
+
+        let interfacePage: UInt16 = 0x0010
+        let modePage: UInt16 = 0x001C
+        let settings = reflectorTerminalSettings(interface: interface)
+        var currentInterface = [UInt8](repeating: 0, count: 256)
+        currentInterface[0x93] = storedInterface
+        var expectedInterface = currentInterface
+        expectedInterface[0x93] = settings.interfaceValue
+        let currentMode = [UInt8](repeating: 0, count: 256)
+        var expectedMode = currentMode
+        expectedMode[0xA0] = 1
+
+        let interfaceRead = Array(buildReadPageCmd(page: interfacePage))
+        let modeRead = Array(buildReadPageCmd(page: modePage))
+        let interfaceWrite = try pageFrame(interfacePage, data: expectedInterface)
+        let modeWrite = try pageFrame(modePage, data: expectedMode)
+
+        await mock.script(
+            response: Array("0M\r".utf8),
+            for: Array(buildEnterCmd())
+        )
+        await mock.scriptSequence(
+            responses: [
+                try pageFrame(interfacePage, data: currentInterface),
+                try pageFrame(interfacePage, data: expectedInterface),
+            ],
+            for: interfaceRead
+        )
+        await mock.scriptSequence(
+            responses: [
+                try pageFrame(modePage, data: currentMode),
+                try pageFrame(modePage, data: expectedMode),
+            ],
+            for: modeRead
+        )
+        await mock.script(response: [0x06], for: interfaceWrite)
+        await mock.script(response: [0x06], for: modeWrite)
+        await mock.scriptSequence(
+            responses: [[0x06], [0x06], [0x06], [0x06]],
+            for: [0x06]
+        )
+        await mock.script(response: [0x06], for: [UInt8(ascii: "E")])
+
+        try await session.enableReflectorTerminalMode(on: interface)
+
+        let written = await mock.writtenBytes()
+        XCTAssertEqual(
+            written,
+            [
+                Array("ID\r".utf8),
+                Array("FV\r".utf8),
+                Array(buildEnterCmd()),
+                interfaceRead,
+                [0x06],
+                modeRead,
+                [0x06],
+                interfaceWrite,
+                interfaceRead,
+                [0x06],
+                modeWrite,
+                modeRead,
+                [0x06],
+                [UInt8(ascii: "E")],
+            ],
+            "both settings must be read and read-back verified in one MCP session",
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(
+            written.filter { $0 == Array(buildEnterCmd()) }.count,
+            1,
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(
+            written.filter { $0 == [UInt8(ascii: "E")] }.count,
+            1,
+            file: file,
+            line: line
+        )
+    }
+
+    func testReflectorTerminalModeSelectsBluetoothBeforeEnablingMode() async throws {
+        let bluetooth = reflectorTerminalSettings(interface: .bluetooth)
+        let usb = reflectorTerminalSettings(interface: .usb)
+        XCTAssertEqual(bluetooth.interfaceValue, 1)
+        try await assertReflectorTerminalModeUpdate(
+            selecting: .bluetooth,
+            from: usb.interfaceValue
+        )
+    }
+
+    func testReflectorTerminalModeSelectsUsbBeforeEnablingMode() async throws {
+        let bluetooth = reflectorTerminalSettings(interface: .bluetooth)
+        let usb = reflectorTerminalSettings(interface: .usb)
+        XCTAssertEqual(usb.interfaceValue, 0)
+        try await assertReflectorTerminalModeUpdate(
+            selecting: .usb,
+            from: bluetooth.interfaceValue
+        )
+    }
+
+    func testReflectorTerminalModeRouteOnlyWritesOnlyMenu985Page() async throws {
+        let mock = MockRadioTransport()
+        try await mock.open()
+        let session = McpSession(transport: mock)
+        let settings = reflectorTerminalSettings(interface: .bluetooth)
+        let interfacePage = pageOf(offset: settings.interfaceOffset)
+        let modePage = pageOf(offset: settings.modeOffset)
+        let interfaceRead = Array(buildReadPageCmd(page: interfacePage))
+        let modeRead = Array(buildReadPageCmd(page: modePage))
+
+        var currentInterface = [UInt8](repeating: 0, count: 256)
+        var expectedInterface = currentInterface
+        expectedInterface[Int(byteOf(offset: settings.interfaceOffset))] = settings.interfaceValue
+        var currentMode = [UInt8](repeating: 0, count: 256)
+        currentMode[Int(byteOf(offset: settings.modeOffset))] = settings.modeValue
+        let interfaceWrite = try pageFrame(interfacePage, data: expectedInterface)
+
+        await mock.script(response: Array("0M\r".utf8), for: Array(buildEnterCmd()))
+        await mock.scriptSequence(
+            responses: [
+                try pageFrame(interfacePage, data: currentInterface),
+                try pageFrame(interfacePage, data: expectedInterface),
+            ],
+            for: interfaceRead
+        )
+        await mock.script(
+            response: try pageFrame(modePage, data: currentMode),
+            for: modeRead
+        )
+        await mock.script(response: [0x06], for: interfaceWrite)
+        await mock.scriptSequence(responses: [[0x06], [0x06], [0x06]], for: [0x06])
+        await mock.script(response: [0x06], for: [UInt8(ascii: "E")])
+
+        try await session.enableReflectorTerminalMode(on: .bluetooth)
+
+        let writes = await mock.writtenBytes()
+        XCTAssertEqual(
+            writes,
+            [
+                Array("ID\r".utf8), Array("FV\r".utf8), Array(buildEnterCmd()),
+                interfaceRead, [0x06], modeRead, [0x06], interfaceWrite,
+                interfaceRead, [0x06], [UInt8(ascii: "E")],
+            ]
+        )
+    }
+
+    func testReflectorTerminalModeModeOnlyWritesOnlyMenu650Page() async throws {
+        let mock = MockRadioTransport()
+        try await mock.open()
+        let session = McpSession(transport: mock)
+        let settings = reflectorTerminalSettings(interface: .usb)
+        let interfacePage = pageOf(offset: settings.interfaceOffset)
+        let modePage = pageOf(offset: settings.modeOffset)
+        let interfaceRead = Array(buildReadPageCmd(page: interfacePage))
+        let modeRead = Array(buildReadPageCmd(page: modePage))
+
+        var currentInterface = [UInt8](repeating: 0, count: 256)
+        currentInterface[Int(byteOf(offset: settings.interfaceOffset))] = settings.interfaceValue
+        let currentMode = [UInt8](repeating: 0, count: 256)
+        var expectedMode = currentMode
+        expectedMode[Int(byteOf(offset: settings.modeOffset))] = settings.modeValue
+        let modeWrite = try pageFrame(modePage, data: expectedMode)
+
+        await mock.script(response: Array("0M\r".utf8), for: Array(buildEnterCmd()))
+        await mock.script(
+            response: try pageFrame(interfacePage, data: currentInterface),
+            for: interfaceRead
+        )
+        await mock.scriptSequence(
+            responses: [
+                try pageFrame(modePage, data: currentMode),
+                try pageFrame(modePage, data: expectedMode),
+            ],
+            for: modeRead
+        )
+        await mock.script(response: [0x06], for: modeWrite)
+        await mock.scriptSequence(responses: [[0x06], [0x06], [0x06]], for: [0x06])
+        await mock.script(response: [0x06], for: [UInt8(ascii: "E")])
+
+        try await session.enableReflectorTerminalMode(on: .usb)
+
+        let writes = await mock.writtenBytes()
+        XCTAssertEqual(
+            writes,
+            [
+                Array("ID\r".utf8), Array("FV\r".utf8), Array(buildEnterCmd()),
+                interfaceRead, [0x06], modeRead, [0x06], modeWrite,
+                modeRead, [0x06], [UInt8(ascii: "E")],
+            ]
+        )
+    }
+
+    func testReflectorTerminalModeUnchangedWritesNoPage() async throws {
+        let mock = MockRadioTransport()
+        try await mock.open()
+        let session = McpSession(transport: mock)
+        let settings = reflectorTerminalSettings(interface: .bluetooth)
+        let interfacePage = pageOf(offset: settings.interfaceOffset)
+        let modePage = pageOf(offset: settings.modeOffset)
+        let interfaceRead = Array(buildReadPageCmd(page: interfacePage))
+        let modeRead = Array(buildReadPageCmd(page: modePage))
+
+        var currentInterface = [UInt8](repeating: 0, count: 256)
+        currentInterface[Int(byteOf(offset: settings.interfaceOffset))] = settings.interfaceValue
+        var currentMode = [UInt8](repeating: 0, count: 256)
+        currentMode[Int(byteOf(offset: settings.modeOffset))] = settings.modeValue
+
+        await mock.script(response: Array("0M\r".utf8), for: Array(buildEnterCmd()))
+        await mock.script(
+            response: try pageFrame(interfacePage, data: currentInterface),
+            for: interfaceRead
+        )
+        await mock.script(
+            response: try pageFrame(modePage, data: currentMode),
+            for: modeRead
+        )
+        await mock.scriptSequence(responses: [[0x06], [0x06]], for: [0x06])
+        await mock.script(response: [0x06], for: [UInt8(ascii: "E")])
+
+        try await session.enableReflectorTerminalMode(on: .bluetooth)
+
+        let writes = await mock.writtenBytes()
+        XCTAssertEqual(
+            writes,
+            [
+                Array("ID\r".utf8), Array("FV\r".utf8), Array(buildEnterCmd()),
+                interfaceRead, [0x06], modeRead, [0x06], [UInt8(ascii: "E")],
+            ]
+        )
+        XCTAssertFalse(writes.contains { $0.first == UInt8(ascii: "W") })
+    }
+
+    func testReflectorTerminalModePartialFailureReportsPossiblyAndVerifiedPages() async throws {
+        let mock = MockRadioTransport()
+        try await mock.open()
+        let session = McpSession(transport: mock)
+        let settings = reflectorTerminalSettings(interface: .bluetooth)
+        let interfacePage = pageOf(offset: settings.interfaceOffset)
+        let modePage = pageOf(offset: settings.modeOffset)
+        let interfaceRead = Array(buildReadPageCmd(page: interfacePage))
+        let modeRead = Array(buildReadPageCmd(page: modePage))
+
+        let currentInterface = [UInt8](repeating: 0, count: 256)
+        var expectedInterface = currentInterface
+        expectedInterface[Int(byteOf(offset: settings.interfaceOffset))] = settings.interfaceValue
+        let currentMode = [UInt8](repeating: 0, count: 256)
+        var expectedMode = currentMode
+        expectedMode[Int(byteOf(offset: settings.modeOffset))] = settings.modeValue
+        let interfaceWrite = try pageFrame(interfacePage, data: expectedInterface)
+        let modeWrite = try pageFrame(modePage, data: expectedMode)
+
+        await mock.script(response: Array("0M\r".utf8), for: Array(buildEnterCmd()))
+        await mock.scriptSequence(
+            responses: [
+                try pageFrame(interfacePage, data: currentInterface),
+                try pageFrame(interfacePage, data: expectedInterface),
+            ],
+            for: interfaceRead
+        )
+        await mock.script(
+            response: try pageFrame(modePage, data: currentMode),
+            for: modeRead
+        )
+        await mock.script(response: [0x06], for: interfaceWrite)
+        await mock.script(response: [0x15], for: modeWrite)
+        await mock.scriptSequence(responses: [[0x06], [0x06], [0x06]], for: [0x06])
+        await mock.script(response: [0x06], for: [UInt8(ascii: "E")])
+
+        do {
+            try await session.enableReflectorTerminalMode(on: .bluetooth)
+            XCTFail("second page failure must not report success")
+        } catch let error as McpOrchestratorError {
+            guard case .terminalSettingsUpdateFailed(
+                _, let possiblyWrittenPages, let verifiedWrittenPages
+            ) = error else {
+                return XCTFail("expected structured terminal update error, got \(error)")
+            }
+            XCTAssertEqual(possiblyWrittenPages, [interfacePage, modePage])
+            XCTAssertEqual(verifiedWrittenPages, [interfacePage])
+            XCTAssertTrue(error.localizedDescription.contains("0x10, 0x1C"))
+        }
     }
 
     func testEntryRequiresExactTypedIdAndFirmwareImmediatelyBeforeMcp() async throws {
@@ -256,7 +634,13 @@ final class McpSessionTests: XCTestCase {
             try await session.enterProgramming()
             XCTFail("unqualified firmware must be rejected")
         } catch let error as McpOrchestratorError {
-            XCTAssertEqual(error, .unsupportedFirmware(actual: "1.04"))
+            XCTAssertEqual(
+                error,
+                .unsupportedFirmware(
+                    actual: "1.04",
+                    accepted: ["1.03", "1.03.000", "1.03.AZM"]
+                )
+            )
         }
 
         let written = await mock.writtenBytes()
@@ -312,6 +696,19 @@ final class McpSessionTests: XCTestCase {
         try await mock.open()
         await mock.script(
             response: Array("FV 1.03.000\r".utf8),
+            for: Array("FV\r".utf8)
+        )
+        let session = McpSession(transport: mock)
+        try await enter(session, over: mock)
+        await mock.script(response: [0x06], for: [UInt8(ascii: "E")])
+        try await session.exitProgramming()
+    }
+
+    func testEntryAcceptsAzimuthFirmwareIdentity() async throws {
+        let mock = MockRadioTransport()
+        try await mock.open()
+        await mock.script(
+            response: Array("FV 1.03.AZM\r".utf8),
             for: Array("FV\r".utf8)
         )
         let session = McpSession(transport: mock)

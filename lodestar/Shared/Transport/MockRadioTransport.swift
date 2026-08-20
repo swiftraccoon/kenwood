@@ -17,6 +17,7 @@ import Foundation
 /// without scripting.
 public actor MockRadioTransport: RadioTransport {
     public let device: BluetoothDevice
+    public nonisolated let pcOutputInterface: PcOutputInterface
     private var _state: RadioTransportState = .disconnected
     private let stateContinuation: AsyncStream<RadioTransportState>.Continuation
     public nonisolated let stateStream: AsyncStream<RadioTransportState>
@@ -27,13 +28,18 @@ public actor MockRadioTransport: RadioTransport {
     private var nextReadID: UInt64 = 0
     private var scripted: [[UInt8]: [[UInt8]]] = [:]
     private var writes: [[UInt8]] = []
+    private let openDelayNanoseconds: UInt64
     private let closeDelayNanoseconds: UInt64
 
     public init(
         device: BluetoothDevice = .mockTHD75,
+        pcOutputInterface: PcOutputInterface = .bluetooth,
+        openDelayNanoseconds: UInt64 = 10_000_000,
         closeDelayNanoseconds: UInt64 = 0
     ) {
         self.device = device
+        self.pcOutputInterface = pcOutputInterface
+        self.openDelayNanoseconds = openDelayNanoseconds
         self.closeDelayNanoseconds = closeDelayNanoseconds
         var cont: AsyncStream<RadioTransportState>.Continuation!
         self.stateStream = AsyncStream { c in cont = c }
@@ -85,7 +91,7 @@ public actor MockRadioTransport: RadioTransport {
 
     public func open() async throws {
         updateState(.connecting)
-        try await Task.sleep(nanoseconds: 10_000_000)
+        try await Task.sleep(nanoseconds: openDelayNanoseconds)
         updateState(.connected)
     }
 

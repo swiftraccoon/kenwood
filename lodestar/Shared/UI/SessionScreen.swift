@@ -81,8 +81,7 @@ struct SessionScreen: View {
 
 }
 
-/// Firmware-qualified Menu 650 setup card. Menu 985 is deliberately not
-/// written: its raw USB/Bluetooth value mapping is not independently proved.
+/// Firmware-qualified setup for the selected host interface and terminal mode.
 struct McpCard: View {
     let transport: TransportCoordinator
 
@@ -91,12 +90,16 @@ struct McpCard: View {
             VStack(alignment: .leading, spacing: 10) {
                 Label("Enable Reflector Terminal Mode", systemImage: "gearshape.2")
                     .font(.headline)
-                Text("Verifies the exact TH-D75 model and firmware, then changes Menu 650 only. Lodestar does not write Menu 985 because its raw USB/Bluetooth mapping is not yet independently verified.")
+                Text("Verifies the exact TH-D75 model and firmware, routes Menu 985 "
+                     + "to the connected transport, and enables Menu 650 "
+                     + "in one programming session.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
 
                 Button {
-                    Task { await transport.enableReflectorTerminalMode() }
+                    Task {
+                        await transport.enableReflectorTerminalMode()
+                    }
                 } label: {
                     Label("Enable Terminal Mode", systemImage: "arrow.up.right.circle.fill")
                 }
@@ -118,15 +121,13 @@ struct McpCard: View {
                 ProgressView().controlSize(.small)
                 Text(msg).font(.caption.monospaced())
             }
-        case .succeededRebooting:
+        case .succeeded:
             VStack(alignment: .leading, spacing: 4) {
                 Label("Reflector Terminal Mode enabled", systemImage: "checkmark.seal.fill")
                     .foregroundStyle(.green)
                     .font(.callout)
-                Text("Radio is rebooting; the app reconnects automatically. On the "
-                     + "radio, make sure Menu 985 (DV Gateway Interface) matches this "
-                     + "connection (USB on iPad, Bluetooth on Mac) and "
-                     + "Menu 650 is Terminal Mode. Mode should then read MMDVM.")
+                Text("Menu 985 routes DV Gateway to this connection, Menu 650 is Reflector "
+                     + "Terminal Mode, and the same radio has reconnected with MMDVM framing.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Button("OK") { transport.acknowledgeMcpStatus() }
@@ -145,12 +146,14 @@ struct McpCard: View {
             }
         }
     }
+
 }
 
 /// Device-picker sheet; mirrors the reflector sheet pattern.
 private struct DevicePickerSheet: View {
     let coordinator: TransportCoordinator
     @Environment(\.dismiss) private var dismiss
+    @State private var connectionTask: Task<Void, Never>?
 
     var body: some View {
         NavigationStack {
@@ -167,6 +170,11 @@ private struct DevicePickerSheet: View {
             #endif
             .toolbar { toolbar }
             .onAppear { coordinator.refreshPairedDevices() }
+            .onDisappear {
+                connectionTask?.cancel()
+                connectionTask = nil
+                coordinator.cancelConnectionAttempt()
+            }
         }
         #if os(macOS)
         .frame(minWidth: 420, minHeight: 360)
@@ -192,9 +200,10 @@ private struct DevicePickerSheet: View {
     private var macBody: some View {
         if coordinator.availableDevices.isEmpty {
             ContentUnavailableView {
-                Label("No paired radios", systemImage: "antenna.radiowaves.left.and.right.slash")
+                Label("No paired devices", systemImage: "antenna.radiowaves.left.and.right.slash")
             } description: {
-                Text("Pair your TH-D75 in **System Settings → Bluetooth** (menu 934 on the radio enables pairing).")
+                Text("Pair your TH-D75 in **System Settings → Bluetooth** "
+                     + "(Menu 934 enables pairing), then refresh.")
             } actions: {
                 Button("Refresh") {
                     coordinator.refreshPairedDevices()
@@ -202,8 +211,18 @@ private struct DevicePickerSheet: View {
                 .buttonStyle(.borderedProminent)
             }
         } else {
-            List(coordinator.availableDevices) { dev in
-                deviceButton(dev)
+            List {
+                Section {
+                    ForEach(coordinator.availableDevices) { dev in
+                        deviceButton(dev)
+                    }
+                } header: {
+                    Text("Paired Bluetooth Devices")
+                } footer: {
+                    Text("Choose the radio. Lodestar opens only that exact Bluetooth address "
+                         + "and accepts it only after exact CAT ID TH-D75 or complete MMDVM "
+                         + "GetVersion framing is proved.")
+                }
             }
         }
     }
@@ -239,8 +258,10 @@ private struct DevicePickerSheet: View {
     private func deviceButton(_ dev: BluetoothDevice) -> some View {
         Button {
             coordinator.select(dev)
-            Task {
+            connectionTask?.cancel()
+            connectionTask = Task {
                 await coordinator.connect()
+                guard !Task.isCancelled, coordinator.state == .connected else { return }
                 dismiss()
             }
         } label: {

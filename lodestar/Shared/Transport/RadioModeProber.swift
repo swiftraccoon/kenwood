@@ -10,11 +10,12 @@ private let log = Logger(subsystem: "org.swiftraccoon.lodestar", category: "radi
 public enum RadioMode: Equatable, Sendable {
     /// Haven't probed yet, or probe is in flight.
     case unknown
-    /// Radio responds to CAT ASCII. Menu 650 (DV Gateway) is `Off`.
+    /// The attached interface responds to CAT ASCII. Menu 650 may be `Off`,
+    /// or Menu 985 may route an enabled DV Gateway to the other interface.
     case cat
-    /// Radio responds with MMDVM binary framing (first byte `0xE0`).
-    /// Menu 650 is `Reflector Terminal` (or `Access Point`). The BT
-    /// channel is no longer a CAT channel; it carries MMDVM frames.
+    /// Radio returned a complete MMDVM `GetVersion` frame.
+    /// Menu 650 is `Reflector Terminal` (or `Access Point`), and Menu 985
+    /// routes DV Gateway to this attached interface instead of the other one.
     case mmdvm
     /// The probe got a response we can't classify.
     case unrecognized(firstByte: UInt8)
@@ -22,11 +23,11 @@ public enum RadioMode: Equatable, Sendable {
 
 /// Determines whether the attached radio is currently in MMDVM or CAT
 /// mode by sending the MMDVM `GetVersion` probe and inspecting the
-/// first response byte.
+/// response framing.
 ///
-/// Matches `thd75-repl::detect_mmdvm_mode`: MMDVM firmware responds in
-/// ~20 ms with a `0xE0`-prefixed frame, while CAT mode either ignores
-/// the probe (nothing arrives) or returns `?` / `N` (not 0xE0).
+/// MMDVM firmware responds to `GetVersion` with a complete binary frame,
+/// while CAT mode either ignores the probe or returns `?` / `N`. A prefix,
+/// silence, or unrelated valid command is not MMDVM proof.
 public struct RadioModeProber {
     public let transport: RadioTransport
     public let timeout: Duration
@@ -41,33 +42,18 @@ public struct RadioModeProber {
         let probe = Array(mmdvmGetVersionProbe())
         log.info("radio-mode probe: sending \(Self.hex(probe))")
 
+        try Task.checkCancellation()
         try await transport.write(probe)
+        try Task.checkCancellation()
 
-        // Read up to 64 bytes or time out. MMDVM responds with a full
-        // version frame (usually 40-60 bytes). Silence or a short
-        // ASCII reply (`?\r`, `N\r`) means CAT.
         let deadline = ContinuousClock.now.advanced(by: timeout)
-        var buffer: [UInt8] = []
-        while buffer.count < 64, ContinuousClock.now < deadline {
-            let remaining = 64 - buffer.count
-            let chunk = try await readChunkWithTimeout(
-                transport: transport, maxBytes: remaining, deadline: deadline
-            )
-            guard let chunk else { break } // timed out
-            if chunk.isEmpty { break }     // transport closed
-            buffer.append(contentsOf: chunk)
-            // As soon as we have the first byte, we can classify, but
-            // keep draining briefly to absorb the rest of the frame so
-            // the next caller's read starts on a clean byte boundary.
-            if buffer.count >= 1 {
-                break
-            }
-        }
-
-        log.info("radio-mode probe: received \(buffer.count) bytes: \(Self.hex(buffer))")
-
-        switch buffer.first {
-        case nil:
+        let firstChunk = try await readChunkWithTimeout(
+            transport: transport,
+            maxBytes: 1,
+            deadline: deadline
+        )
+        try Task.checkCancellation()
+        guard let firstChunk, let first = firstChunk.first else {
             // No response at all. Radio either isn't listening, is
             // asleep, or is in CAT mode and simply ignored our probe.
             // We classify this as CAT because MMDVM firmware always
@@ -92,44 +78,93 @@ public struct RadioModeProber {
                 log.info("radio-mode probe: flushed \(Self.hex(chunk))")
             }
             return .cat
-        case 0xE0:
-            // Drain whatever's left of the frame (~50 bytes) so it
-            // doesn't poison the next read.
-            _ = try? await drainFrame(startBuffer: buffer, deadline: deadline)
-            return .mmdvm
-        case .some(let byte)
-            where byte == UInt8(ascii: "?") || byte == UInt8(ascii: "N"):
+        }
+
+        if first == UInt8(ascii: "?") || first == UInt8(ascii: "N") {
+            await drainCatLine(until: deadline)
             return .cat
-        case .some(let b):
-            return .unrecognized(firstByte: b)
+        }
+        guard first == 0xE0 else {
+            return .unrecognized(firstByte: first)
+        }
+
+        // Read exactly the advertised MMDVM frame length. This both prevents
+        // a prefix or echoed request from proving terminal mode and leaves a
+        // coalesced following frame for the relay reader.
+        var frameBytes = [first]
+        guard let length = try await readOneByte(until: deadline) else {
+            return .unrecognized(firstByte: first)
+        }
+        frameBytes.append(length)
+        let frameLength: Int
+        if length == 0 {
+            guard let extended = try await readOneByte(until: deadline) else {
+                return .unrecognized(firstByte: first)
+            }
+            frameBytes.append(extended)
+            frameLength = Int(extended) + 255
+        } else {
+            frameLength = Int(length)
+        }
+        guard frameLength >= 3 else {
+            return .unrecognized(firstByte: first)
+        }
+        while frameBytes.count < frameLength {
+            let chunk = try await readChunkWithTimeout(
+                transport: transport,
+                maxBytes: frameLength - frameBytes.count,
+                deadline: deadline
+            )
+            try Task.checkCancellation()
+            guard let chunk, !chunk.isEmpty else {
+                return .unrecognized(firstByte: first)
+            }
+            frameBytes.append(contentsOf: chunk)
+        }
+
+        do {
+            let decoded = try decodeMmdvmBytes(bytes: Data(frameBytes))
+            guard decoded.bytesConsumed == frameBytes.count,
+                  let frame = decoded.frame,
+                  frame.command == 0x00 else {
+                return .unrecognized(firstByte: first)
+            }
+            let version = try parseMmdvmVersionPayload(payload: frame.payload)
+            log.info(
+                "radio-mode probe: proved MMDVM protocol \(version.protocol), \(version.description, privacy: .public)"
+            )
+            return .mmdvm
+        } catch {
+            log.warning("radio-mode probe: invalid GetVersion response: \(error)")
+            return .unrecognized(firstByte: first)
         }
     }
 
-    /// Having seen `0xE0` as the first byte, keep reading until we've
-    /// absorbed the whole MMDVM frame. Best-effort: if we time out or
-    /// the frame is malformed, we move on; the next read will handle
-    /// any leftover garbage.
-    private func drainFrame(
-        startBuffer: [UInt8], deadline: ContinuousClock.Instant
-    ) async throws {
-        var buffer = startBuffer
-        // Length byte is `buffer[1]`, and the whole frame is that many bytes.
-        while buffer.count < 2, ContinuousClock.now < deadline {
-            let chunk = try await readChunkWithTimeout(
-                transport: transport, maxBytes: 1, deadline: deadline
-            )
-            guard let chunk, !chunk.isEmpty else { return }
-            buffer.append(contentsOf: chunk)
+    private func readOneByte(
+        until deadline: ContinuousClock.Instant
+    ) async throws -> UInt8? {
+        let chunk = try await readChunkWithTimeout(
+            transport: transport,
+            maxBytes: 1,
+            deadline: deadline
+        )
+        try Task.checkCancellation()
+        guard let chunk else {
+            return nil
         }
-        guard buffer.count >= 2 else { return }
-        let want = Int(buffer[1])
-        while buffer.count < want, ContinuousClock.now < deadline {
-            let remaining = want - buffer.count
-            let chunk = try await readChunkWithTimeout(
-                transport: transport, maxBytes: remaining, deadline: deadline
-            )
-            guard let chunk, !chunk.isEmpty else { return }
-            buffer.append(contentsOf: chunk)
+        return chunk.first
+    }
+
+    private func drainCatLine(until deadline: ContinuousClock.Instant) async {
+        while ContinuousClock.now < deadline {
+            guard let chunk = try? await readChunkWithTimeout(
+                transport: transport,
+                maxBytes: 64,
+                deadline: deadline
+            ), !chunk.isEmpty else {
+                return
+            }
+            if chunk.contains(0x0D) { return }
         }
     }
 

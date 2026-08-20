@@ -40,6 +40,7 @@ private let log = Logger(subsystem: "org.swiftraccoon.lodestar", category: "usb-
 /// `availableDevices()` stays empty and the UI remains reflector-only.
 public actor USBSerialTransport: RadioTransport {
     public let device: BluetoothDevice
+    public nonisolated let pcOutputInterface: PcOutputInterface = .usb
     private let link: any USBSerialLink
     private var _state: RadioTransportState = .disconnected
     private let stateContinuation: AsyncStream<RadioTransportState>.Continuation

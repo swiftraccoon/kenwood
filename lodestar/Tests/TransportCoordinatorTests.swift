@@ -10,6 +10,135 @@ final class TransportCoordinatorTests: XCTestCase {
         Array(try buildWritePageCmd(page: page, data: Data(data)))
     }
 
+    private func mmdvmVersionResponse() -> [UInt8] {
+        [0xE0, 0x0E, 0x00, 0x01] + Array("MMDVM 2018".utf8)
+    }
+
+    func testRefreshShowsEveryPairedDeviceWithoutNameFiltering() {
+        let radio = BluetoothDevice(
+            id: "00-11-22-33-44-55",
+            name: "Field Radio",
+            address: "00-11-22-33-44-55"
+        )
+        let headset = BluetoothDevice(
+            id: "20-11-22-33-44-55",
+            name: "Headphones",
+            address: "20-11-22-33-44-55"
+        )
+        let coordinator = TransportCoordinator()
+        coordinator.bluetoothPairedDevicesProvider = { [radio, headset] }
+
+        coordinator.refreshPairedDevices()
+        XCTAssertEqual(coordinator.availableDevices, [radio, headset])
+    }
+
+    func testConnectOpensOnlySelectedAddressAndRequiresExactCatIdentity() async throws {
+        let selected = BluetoothDevice(
+            id: "30-11-22-33-44-55",
+            name: "Field Radio",
+            address: "30-11-22-33-44-55"
+        )
+        let coordinator = TransportCoordinator()
+        let mock = MockRadioTransport(device: selected)
+        var openedDevices: [BluetoothDevice] = []
+        await mock.script(
+            response: Array("?\r".utf8),
+            for: Array(mmdvmGetVersionProbe())
+        )
+        coordinator.transportFactory = { device in
+            openedDevices.append(device)
+            return mock
+        }
+        coordinator.select(selected)
+
+        await coordinator.connect()
+
+        XCTAssertEqual(openedDevices, [selected])
+        XCTAssertEqual(coordinator.state, .connected)
+        XCTAssertEqual(coordinator.radioMode, .cat)
+        XCTAssertNotNil(coordinator.relayTransport)
+        let writes = await mock.writtenBytes()
+        XCTAssertEqual(
+            writes,
+            [Array(mmdvmGetVersionProbe()), Array("ID\r".utf8)]
+        )
+    }
+
+    func testConnectRejectsWrongCatModelWithoutPublishingTransport() async throws {
+        let candidate = BluetoothDevice(
+            id: "30-11-22-33-44-55",
+            name: "Serial Device",
+            address: "30-11-22-33-44-55"
+        )
+        let coordinator = TransportCoordinator()
+        let mock = MockRadioTransport(device: candidate)
+        await mock.script(
+            response: Array("?\r".utf8),
+            for: Array(mmdvmGetVersionProbe())
+        )
+        await mock.script(
+            response: Array("ID NOT-A-TH-D75\r".utf8),
+            for: Array("ID\r".utf8)
+        )
+        coordinator.transportFactory = { _ in mock }
+        coordinator.select(candidate)
+
+        await coordinator.connect()
+        let temporaryState = await mock.state
+
+        XCTAssertEqual(temporaryState, .disconnected)
+        XCTAssertNil(coordinator.relayTransport)
+        guard case .failed(let message) = coordinator.state else {
+            return XCTFail("wrong model must fail connection")
+        }
+        XCTAssertTrue(message.contains("not exact model TH-D75"), message)
+    }
+
+    func testPickerCancellationPreventsStaleOpenFromPublishingConnection() async throws {
+        let coordinator = TransportCoordinator()
+        let mock = MockRadioTransport(openDelayNanoseconds: 500_000_000)
+        coordinator.transportFactory = { _ in mock }
+        coordinator.select(.mockTHD75)
+
+        let connection = Task { @MainActor in
+            await coordinator.connect()
+        }
+        try await Task.sleep(nanoseconds: 30_000_000)
+        coordinator.cancelConnectionAttempt()
+        connection.cancel()
+        await connection.value
+
+        XCTAssertEqual(coordinator.state, .disconnected)
+        XCTAssertNil(coordinator.relayTransport)
+        let mockState = await mock.state
+        XCTAssertEqual(mockState, .disconnected)
+    }
+
+    func testPickerCancellationDuringProtocolProofPreventsStaleConnection() async throws {
+        let coordinator = TransportCoordinator()
+        let mock = MockRadioTransport(openDelayNanoseconds: 0)
+        coordinator.transportFactory = { _ in mock }
+        coordinator.select(.mockTHD75)
+
+        let connection = Task { @MainActor in
+            await coordinator.connect()
+        }
+        for _ in 0..<100 {
+            let writes = await mock.writtenBytes()
+            if writes.contains(Array(mmdvmGetVersionProbe())) { break }
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        coordinator.cancelConnectionAttempt()
+        connection.cancel()
+        await connection.value
+
+        XCTAssertEqual(coordinator.state, .disconnected)
+        XCTAssertEqual(coordinator.radioMode, .unknown)
+        XCTAssertNil(coordinator.relayTransport)
+        let mockState = await mock.state
+        XCTAssertEqual(mockState, .disconnected)
+    }
+
     func testConnectUsesInjectedTransportFactory() async throws {
         let coordinator = TransportCoordinator()
         let mock = MockRadioTransport()
@@ -18,7 +147,7 @@ final class TransportCoordinatorTests: XCTestCase {
         // read (CheckedContinuation isn't cancellation-aware), so an
         // unanswered probe hangs connect(). Script any non-empty reply so
         // the probe read resumes and connect() finishes.
-        await mock.script(response: [0xE0, 0x03, 0x00], for: [0xE0, 0x03, 0x00])
+        await mock.script(response: mmdvmVersionResponse(), for: [0xE0, 0x03, 0x00])
         coordinator.transportFactory = { _ in mock }
         coordinator.select(.mockTHD75)
 
@@ -35,7 +164,7 @@ final class TransportCoordinatorTests: XCTestCase {
         coordinator.transportFactory = { _ in mock }
         coordinator.select(.mockTHD75)
         // Probe gets an MMDVM version response → radioMode == .mmdvm.
-        await mock.script(response: [0xE0, 0x04, 0x00, 0x01], for: [0xE0, 0x03, 0x00])
+        await mock.script(response: mmdvmVersionResponse(), for: [0xE0, 0x03, 0x00])
         await coordinator.connect()
         XCTAssertEqual(coordinator.radioMode, .mmdvm)
 
@@ -63,8 +192,8 @@ final class TransportCoordinatorTests: XCTestCase {
         // Script BOTH probes so the initial connect and the reconnect
         // finish promptly instead of waiting out the 2 s probe timeout;
         // classification (.mmdvm here) is irrelevant to the asserts.
-        await first.script(response: [0xE0, 0x04, 0x00, 0x01], for: [0xE0, 0x03, 0x00])
-        await second.script(response: [0xE0, 0x04, 0x00, 0x01], for: [0xE0, 0x03, 0x00])
+        await first.script(response: mmdvmVersionResponse(), for: [0xE0, 0x03, 0x00])
+        await second.script(response: mmdvmVersionResponse(), for: [0xE0, 0x03, 0x00])
         await coordinator.connect()
         await first.simulateUnexpectedClose()
         try await Task.sleep(nanoseconds: 500_000_000)
@@ -87,11 +216,11 @@ final class TransportCoordinatorTests: XCTestCase {
         coordinator.reconnectDelaysNs = []
         coordinator.select(.mockTHD75)
         await first.script(
-            response: [0xE0, 0x04, 0x00, 0x01],
+            response: mmdvmVersionResponse(),
             for: Array(mmdvmGetVersionProbe())
         )
         await second.script(
-            response: [0xE0, 0x04, 0x00, 0x01],
+            response: mmdvmVersionResponse(),
             for: Array(mmdvmGetVersionProbe())
         )
         await coordinator.connect()
@@ -129,11 +258,11 @@ final class TransportCoordinatorTests: XCTestCase {
         coordinator.reconnectDelaysNs = [50_000_000]
         coordinator.select(.mockTHD75)
         await first.script(
-            response: [0xE0, 0x04, 0x00, 0x01],
+            response: mmdvmVersionResponse(),
             for: Array(mmdvmGetVersionProbe())
         )
         await second.script(
-            response: [0xE0, 0x04, 0x00, 0x01],
+            response: mmdvmVersionResponse(),
             for: Array(mmdvmGetVersionProbe())
         )
         await coordinator.connect()
@@ -156,7 +285,7 @@ final class TransportCoordinatorTests: XCTestCase {
         }
         coordinator.reconnectDelaysNs = [50_000_000]
         coordinator.select(.mockTHD75)
-        await mock.script(response: [0xE0, 0x04, 0x00, 0x01], for: [0xE0, 0x03, 0x00])
+        await mock.script(response: mmdvmVersionResponse(), for: [0xE0, 0x03, 0x00])
         await coordinator.connect()
         await coordinator.disconnect()
         // Give any (wrongly) scheduled reconnect ample time to fire.
@@ -180,7 +309,7 @@ final class TransportCoordinatorTests: XCTestCase {
         // fires well inside the assertion grace period.
         coordinator.reconnectDelaysNs = [150_000_000]
         coordinator.select(.mockTHD75)
-        await first.script(response: [0xE0, 0x04, 0x00, 0x01], for: [0xE0, 0x03, 0x00])
+        await first.script(response: mmdvmVersionResponse(), for: [0xE0, 0x03, 0x00])
         await coordinator.connect()
 
         // Unexpected drop schedules the reconnect...
@@ -212,11 +341,11 @@ final class TransportCoordinatorTests: XCTestCase {
         coordinator.reconnectDelaysNs = [0]
         coordinator.select(.mockTHD75)
         await first.script(
-            response: [0xE0, 0x04, 0x00, 0x01],
+            response: mmdvmVersionResponse(),
             for: Array(mmdvmGetVersionProbe())
         )
         await second.script(
-            response: [0xE0, 0x04, 0x00, 0x01],
+            response: mmdvmVersionResponse(),
             for: Array(mmdvmGetVersionProbe())
         )
         await coordinator.connect()
@@ -253,8 +382,8 @@ final class TransportCoordinatorTests: XCTestCase {
             return handedOut == 1 ? first : second
         }
         coordinator.select(.mockTHD75)
-        await first.script(response: [0xE0, 0x04, 0x00, 0x01], for: [0xE0, 0x03, 0x00])
-        await second.script(response: [0xE0, 0x04, 0x00, 0x01], for: [0xE0, 0x03, 0x00])
+        await first.script(response: mmdvmVersionResponse(), for: [0xE0, 0x03, 0x00])
+        await second.script(response: mmdvmVersionResponse(), for: [0xE0, 0x03, 0x00])
         await coordinator.connect()
         guard case .connected = coordinator.state else {
             return XCTFail("precondition: connect failed, state \(coordinator.state)")
@@ -416,7 +545,7 @@ final class TransportCoordinatorTests: XCTestCase {
         coordinator.transportFactory = { _ in mock }
         coordinator.select(.mockTHD75)
         await mock.script(
-            response: [0xE0, 0x04, 0x00, 0x01],
+            response: mmdvmVersionResponse(),
             for: Array(mmdvmGetVersionProbe())
         )
         await coordinator.connect()
@@ -432,24 +561,41 @@ final class TransportCoordinatorTests: XCTestCase {
 
     func testOverlappingCoordinatorMcpFlowsCannotCreateTwoSessions() async throws {
         let coordinator = TransportCoordinator()
-        let mock = MockRadioTransport()
-        coordinator.transportFactory = { _ in mock }
+        let cat = MockRadioTransport()
+        let terminal = MockRadioTransport()
+        var handedOut = 0
+        coordinator.transportFactory = { _ in
+            handedOut += 1
+            return handedOut == 1 ? cat : terminal
+        }
         coordinator.reconnectDelaysNs = []
+        coordinator.terminalModePollDelayNs = 0
+        coordinator.terminalModeTransitionWindow = .seconds(1)
         coordinator.select(.mockTHD75)
-        await mock.script(
+        await cat.script(
             response: [UInt8(ascii: "?")],
+            for: Array(mmdvmGetVersionProbe())
+        )
+        await terminal.script(
+            response: mmdvmVersionResponse(),
             for: Array(mmdvmGetVersionProbe())
         )
         await coordinator.connect()
 
-        var page = [UInt8](repeating: 0, count: 256)
-        page[0xA0] = 1
-        await mock.script(
-            response: try pageFrame(0x001C, data: page),
+        var interfacePage = [UInt8](repeating: 0, count: 256)
+        interfacePage[0x93] = reflectorTerminalSettings(interface: .bluetooth).interfaceValue
+        var modePage = [UInt8](repeating: 0, count: 256)
+        modePage[0xA0] = 1
+        await cat.script(
+            response: try pageFrame(0x0010, data: interfacePage),
+            for: Array(buildReadPageCmd(page: 0x0010))
+        )
+        await cat.script(
+            response: try pageFrame(0x001C, data: modePage),
             for: Array(buildReadPageCmd(page: 0x001C))
         )
-        await mock.script(response: [0x06], for: [0x06])
-        await mock.script(response: [0x06], for: [UInt8(ascii: "E")])
+        await cat.scriptSequence(responses: [[0x06], [0x06]], for: [0x06])
+        await cat.script(response: [0x06], for: [UInt8(ascii: "E")])
 
         let first = Task { @MainActor in
             await coordinator.enableReflectorTerminalMode()
@@ -462,16 +608,16 @@ final class TransportCoordinatorTests: XCTestCase {
         await coordinator.enableReflectorTerminalMode()
         await coordinator.probeRadioMode()
         await coordinator.disconnect()
-        let stateDuringMcp = await mock.state
+        let stateDuringMcp = await cat.state
         XCTAssertEqual(
             stateDuringMcp,
             .connected,
             "public disconnect must not close a transport owned by MCP cleanup"
         )
-        await mock.push(Array("0M\r".utf8))
+        await cat.push(Array("0M\r".utf8))
         await first.value
 
-        let writes = await mock.writtenBytes()
+        let writes = await cat.writtenBytes()
         XCTAssertEqual(
             writes.filter { $0 == Array(buildEnterCmd()) }.count,
             1,
@@ -485,6 +631,111 @@ final class TransportCoordinatorTests: XCTestCase {
         XCTAssertEqual(
             writes.filter { $0 == [UInt8(ascii: "E")] }.count,
             1
+        )
+        XCTAssertEqual(handedOut, 2)
+        XCTAssertEqual(coordinator.state, .connected)
+        XCTAssertEqual(coordinator.radioMode, .mmdvm)
+        XCTAssertEqual(coordinator.mcpStatus, .succeeded)
+    }
+
+    func testTerminalTransitionRejectsEarlyCatAndDerivesUsbRouteFromTransport() async throws {
+        let device = BluetoothDevice(
+            id: "40-11-22-33-44-55",
+            name: "Selected Radio",
+            address: "40-11-22-33-44-55"
+        )
+        let cat = MockRadioTransport(device: device, pcOutputInterface: .usb)
+        let earlyCat = MockRadioTransport(device: device, pcOutputInterface: .usb)
+        let terminal = MockRadioTransport(device: device, pcOutputInterface: .usb)
+        let coordinator = TransportCoordinator()
+        var openedDevices: [BluetoothDevice] = []
+        var handedOut = 0
+        coordinator.transportFactory = { selected in
+            openedDevices.append(selected)
+            handedOut += 1
+            switch handedOut {
+            case 1: return cat
+            case 2: return earlyCat
+            default: return terminal
+            }
+        }
+        coordinator.terminalModePollDelayNs = 0
+        coordinator.terminalModeTransitionWindow = .seconds(1)
+        coordinator.select(device)
+
+        await cat.script(
+            response: Array("?\r".utf8),
+            for: Array(mmdvmGetVersionProbe())
+        )
+        await coordinator.connect()
+
+        let settings = reflectorTerminalSettings(interface: .usb)
+        let interfacePage = pageOf(offset: settings.interfaceOffset)
+        let modePage = pageOf(offset: settings.modeOffset)
+        let interfaceRead = Array(buildReadPageCmd(page: interfacePage))
+        let modeRead = Array(buildReadPageCmd(page: modePage))
+        var currentInterface = [UInt8](repeating: 0, count: 256)
+        currentInterface[Int(byteOf(offset: settings.interfaceOffset))] =
+            reflectorTerminalSettings(interface: .bluetooth).interfaceValue
+        var expectedInterface = currentInterface
+        expectedInterface[Int(byteOf(offset: settings.interfaceOffset))] =
+            settings.interfaceValue
+        var currentMode = [UInt8](repeating: 0, count: 256)
+        currentMode[Int(byteOf(offset: settings.modeOffset))] = settings.modeValue
+        let interfaceWrite = try pageFrame(interfacePage, data: expectedInterface)
+
+        await cat.script(response: Array("0M\r".utf8), for: Array(buildEnterCmd()))
+        await cat.scriptSequence(
+            responses: [
+                try pageFrame(interfacePage, data: currentInterface),
+                try pageFrame(interfacePage, data: expectedInterface),
+            ],
+            for: interfaceRead
+        )
+        await cat.script(
+            response: try pageFrame(modePage, data: currentMode),
+            for: modeRead
+        )
+        await cat.script(response: [0x06], for: interfaceWrite)
+        await cat.scriptSequence(responses: [[0x06], [0x06], [0x06]], for: [0x06])
+        await cat.script(response: [0x06], for: [UInt8(ascii: "E")])
+        await earlyCat.script(
+            response: Array("?\r".utf8),
+            for: Array(mmdvmGetVersionProbe())
+        )
+        await terminal.script(
+            response: mmdvmVersionResponse(),
+            for: Array(mmdvmGetVersionProbe())
+        )
+
+        await coordinator.enableReflectorTerminalMode()
+
+        XCTAssertEqual(openedDevices, [device, device, device])
+        XCTAssertEqual(handedOut, 3)
+        XCTAssertEqual(coordinator.state, .connected)
+        XCTAssertEqual(coordinator.radioMode, .mmdvm)
+        XCTAssertEqual(coordinator.mcpStatus, .succeeded)
+        XCTAssertNotNil(coordinator.relayTransport)
+        let initialState = await cat.state
+        let earlyState = await earlyCat.state
+        let terminalState = await terminal.state
+        let earlyWrites = await earlyCat.writtenBytes()
+        let terminalWrites = await terminal.writtenBytes()
+        XCTAssertEqual(initialState, .disconnected)
+        XCTAssertEqual(earlyState, .disconnected)
+        XCTAssertEqual(terminalState, .connected)
+
+        let catWrites = await cat.writtenBytes()
+        XCTAssertTrue(catWrites.contains(interfaceWrite))
+        XCTAssertEqual(catWrites.filter { $0.first == UInt8(ascii: "W") }.count, 1)
+        XCTAssertEqual(
+            earlyWrites,
+            [Array(mmdvmGetVersionProbe())],
+            "early CAT is retryable and must not be mistaken for transition success"
+        )
+        XCTAssertEqual(
+            terminalWrites,
+            [Array(mmdvmGetVersionProbe())]
         )
     }
 
@@ -504,13 +755,19 @@ final class TransportCoordinatorTests: XCTestCase {
             response: Array("0M\r".utf8),
             for: Array(buildEnterCmd())
         )
-        var page = [UInt8](repeating: 0, count: 256)
-        page[0xA0] = 1
+        var interfacePage = [UInt8](repeating: 0, count: 256)
+        interfacePage[0x93] = reflectorTerminalSettings(interface: .bluetooth).interfaceValue
+        var modePage = [UInt8](repeating: 0, count: 256)
+        modePage[0xA0] = 1
         await mock.script(
-            response: try pageFrame(0x001C, data: page),
+            response: try pageFrame(0x0010, data: interfacePage),
+            for: Array(buildReadPageCmd(page: 0x0010))
+        )
+        await mock.script(
+            response: try pageFrame(0x001C, data: modePage),
             for: Array(buildReadPageCmd(page: 0x001C))
         )
-        await mock.script(response: [0x06], for: [0x06])
+        await mock.scriptSequence(responses: [[0x06], [0x06]], for: [0x06])
         await mock.script(response: [0x15], for: [UInt8(ascii: "E")])
 
         await coordinator.enableReflectorTerminalMode()
@@ -532,6 +789,7 @@ final class TransportCoordinatorTests: XCTestCase {
     /// Mock whose open() always throws, for failure-path tests.
     private struct FailingTransport: RadioTransport {
         let device: BluetoothDevice = .mockTHD75
+        let pcOutputInterface: PcOutputInterface = .bluetooth
         var state: RadioTransportState { get async { .failed(message: "boom") } }
         var stateStream: AsyncStream<RadioTransportState> { AsyncStream { $0.finish() } }
         func open() async throws { throw RadioTransportError.openFailed(reason: "boom") }

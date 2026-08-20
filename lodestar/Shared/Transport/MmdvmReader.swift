@@ -10,10 +10,11 @@ private let log = Logger(subsystem: "org.swiftraccoon.lodestar", category: "mmdv
 /// frames and publishes them as an `AsyncStream<MmdvmFrame>`. Once
 /// started, runs until `stop()` is called or the transport closes.
 ///
-/// Used in MMDVM mode (after flipping Menu 650) when the BT channel
-/// carries `[0xE0, len, cmd, payload...]` framing instead of CAT
-/// ASCII. The reader is deliberately transport-agnostic: give it any
-/// `RadioTransport` and it pulls bytes through `transport.read(...)`.
+/// Used after Menu 985 routes DV Gateway to the attached interface and
+/// Menu 650 enables terminal mode, so that interface carries
+/// `[0xE0, len, cmd, payload...]` framing instead of CAT ASCII. The reader
+/// is deliberately transport-agnostic: give it any `RadioTransport` and it
+/// pulls bytes through `transport.read(...)`.
 public actor MmdvmReader {
     public let transport: RadioTransport
     public nonisolated let frames: AsyncStream<MmdvmFrame>

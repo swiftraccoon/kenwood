@@ -53,7 +53,9 @@ public final class TransportCoordinator {
     /// `RelayCoordinator` can run an `MmdvmReader`/`MmdvmWriter`
     /// alongside the coordinator's own calls. All I/O still serialises
     /// through the transport actor.
-    public var relayTransport: RadioTransport? { transport }
+    public var relayTransport: RadioTransport? {
+        state == .connected ? transport : nil
+    }
 
     /// Builds the concrete transport for a device. Overridable so tests
     /// can substitute `MockRadioTransport`; defaults to the platform
@@ -66,8 +68,25 @@ public final class TransportCoordinator {
         #endif
     }
 
+    /// Metadata source for paired-device UI. Internal so tests can supply a
+    /// deterministic list without consulting the host's Bluetooth cache.
+    var bluetoothPairedDevicesProvider: @MainActor () -> [BluetoothDevice] = {
+        IOBluetoothTransport.pairedDevices()
+    }
+
+    /// Notification seam for launch auto-connect failures. Tests replace this
+    /// instead of posting into the developer's Notification Center.
+    var autoConnectFailureNotifier: @MainActor (String) -> Void = { reason in
+        NotificationManager.shared.autoConnectFailed(what: "Radio", reason: reason)
+    }
+
     /// Backoff schedule for post-drop reconnects. Overridable in tests.
     public var reconnectDelaysNs: [UInt64] = [3_000_000_000, 10_000_000_000, 30_000_000_000]
+
+    /// Reboot-to-MMDVM polling interval and bound. Internal tests shorten both;
+    /// production follows the hardware-verified three-second/90-second policy.
+    var terminalModePollDelayNs: UInt64 = 3_000_000_000
+    var terminalModeTransitionWindow: Duration = .seconds(90)
 
     private var transport: RadioTransport?
     private var stateObserver: Task<Void, Never>?
@@ -110,13 +129,13 @@ public final class TransportCoordinator {
     public enum McpStatus: Equatable, Sendable {
         case idle
         case running(String)      // human-readable progress message
-        case succeededRebooting   // radio dropped the connection; user must reconnect
+        case succeeded            // same exact link positively answered MMDVM
         case failed(String)
     }
 
     public func refreshPairedDevices() {
         #if os(macOS)
-        availableDevices = IOBluetoothTransport.pairedDevices()
+        availableDevices = bluetoothPairedDevicesProvider()
         #else
         availableDevices = USBSerialTransport.availableDevices()
         #endif
@@ -124,6 +143,22 @@ public final class TransportCoordinator {
 
     public func select(_ device: BluetoothDevice) {
         selectedDevice = device
+    }
+
+    /// Invalidate a picker-owned connection attempt before its suspended open
+    /// or protocol proof can publish state. A completed connection is not an
+    /// attempt and is deliberately left intact when the picker dismisses.
+    public func cancelConnectionAttempt() {
+        guard state == .connecting, !mcpOperationInFlight else { return }
+        transportGeneration &+= 1
+        stopObservingState()
+        let openingTransport = transport
+        transport = nil
+        state = .disconnected
+        radioMode = .unknown
+        Task {
+            await openingTransport?.close()
+        }
     }
 
     /// User-driven connect. Cancels any pending post-drop reconnect (the
@@ -160,11 +195,18 @@ public final class TransportCoordinator {
         isBusy = true
         defer { isBusy = false }
         radioMode = .unknown
+        state = .connecting
 
         let t = transportFactory(device)
         transport = t
-        observeState(of: t)
         do {
+            guard Self.canonicalBluetoothAddress(t.device.address)
+                    == Self.canonicalBluetoothAddress(device.address) else {
+                throw RadioConnectionQualificationError.transportIdentityMismatch(
+                    selected: device.address,
+                    opened: t.device.address
+                )
+            }
             try await t.open()
             guard attemptGeneration == transportGeneration else {
                 log.info("Discarding transport opened after background teardown")
@@ -176,26 +218,27 @@ public final class TransportCoordinator {
                     reason: "transport closed before connection setup completed"
                 )
             }
-            // `open()` has a connected-state postcondition, but the observer
-            // task may not have consumed its buffered `.connected` event yet.
-            // Publish the postcondition synchronously before `connect()` can
-            // return; a later buffered `.connecting` event is ignored below.
+            try Task.checkCancellation()
+            let provedMode = try await qualifyOpenedRadio(t)
+            try Task.checkCancellation()
+            guard attemptGeneration == transportGeneration else {
+                log.info("Discarding transport qualified after background teardown")
+                await t.close()
+                return
+            }
+
+            // Do not expose the byte stream to the relay or publish connected
+            // until either exact CAT identity or a complete MMDVM GetVersion
+            // frame has proved the selected endpoint is the radio.
+            radioMode = provedMode
+            lastProbeErrorText = nil
+            observeState(of: t)
             state = .connected
             // Remember this radio so `tryAutoConnect()` can find it on
             // the next launch. Captured unconditionally; the user's
             // `autoConnectRadio` toggle controls whether we act on it.
             rememberedRadioAddress = device.address
             rememberedRadioName = device.name
-            // Once open, fire off a mode probe so the UI can show the
-            // right affordances (MCP button only if still in CAT mode).
-            try Task.checkCancellation()
-            await probeRadioModeOwned()
-            try Task.checkCancellation()
-            guard attemptGeneration == transportGeneration else {
-                log.info("Discarding transport probed after background teardown")
-                await t.close()
-                return
-            }
         } catch {
             if attemptGeneration == transportGeneration {
                 state = .failed(message: error.displayMessage)
@@ -208,6 +251,38 @@ public final class TransportCoordinator {
         }
     }
 
+    /// Prove one freshly opened exact endpoint before publishing it.
+    ///
+    /// A complete MMDVM GetVersion reply positively identifies an already
+    /// terminal-mode radio. Every CAT-like result, including silence, must
+    /// then return the exact `ID TH-D75` response.
+    private func qualifyOpenedRadio(_ openedTransport: RadioTransport) async throws -> RadioMode {
+        isProbingMode = true
+        defer { isProbingMode = false }
+        let mode = try await RadioModeProber(transport: openedTransport).probe()
+        switch mode {
+        case .mmdvm:
+            log.info("Connection qualified by complete MMDVM GetVersion framing")
+            return .mmdvm
+        case .cat:
+            let expectedModel = mcpD75SchemaTarget().model
+            let model = try await identifyModel(on: openedTransport)
+            guard model == expectedModel else {
+                throw RadioConnectionQualificationError.wrongModel(
+                    expected: expectedModel,
+                    actual: model
+                )
+            }
+            lastResponseText = "Identify: \(model)"
+            log.info("Connection qualified by exact CAT ID \(expectedModel, privacy: .public)")
+            return .cat
+        case .unknown:
+            throw RadioConnectionQualificationError.modeNotProved
+        case .unrecognized(let firstByte):
+            throw RadioConnectionQualificationError.unrecognizedFraming(firstByte: firstByte)
+        }
+    }
+
     /// Auto-reconnect to the remembered radio on launch, if enabled and
     /// the remembered device is still paired. Idempotent and silent when
     /// conditions aren't met, so it is safe to call unconditionally from
@@ -217,7 +292,10 @@ public final class TransportCoordinator {
         guard autoConnectRadio, transport == nil else { return }
         guard let address = rememberedRadioAddress else { return }
         refreshPairedDevices()
-        guard let device = availableDevices.first(where: { $0.address == address }) else {
+        guard let device = availableDevices.first(where: {
+            Self.canonicalBluetoothAddress($0.address)
+                == Self.canonicalBluetoothAddress(address)
+        }) else {
             log.info("Auto-connect: remembered radio \(address) not in paired list; skipping")
             return
         }
@@ -225,7 +303,7 @@ public final class TransportCoordinator {
         select(device)
         await connect()
         if case .failed(let message) = state {
-            NotificationManager.shared.autoConnectFailed(what: "Radio", reason: message)
+            autoConnectFailureNotifier(message)
         }
     }
 
@@ -385,22 +463,15 @@ public final class TransportCoordinator {
         }
     }
 
-    /// Flip Menu 650 (DV Gateway) to Reflector Terminal Mode via an MCP
-    /// programming-mode write. The radio drops the BT connection after
-    /// the exit byte and reboots; the coordinator transitions to
-    /// `.disconnected` and the user must re-pair / reconnect.
+    /// Route DV Gateway to the connected transport's physical interface and enable
+    /// Reflector Terminal Mode in one verified MCP programming session.
+    /// Success is published only after the same exact device address reopens
+    /// and returns a complete MMDVM GetVersion frame.
     public func enableReflectorTerminalMode() async {
         guard !mcpOperationInFlight else {
             log.warning("Ignoring overlapping MCP setup request")
             return
         }
-        #if os(iOS)
-        mcpStatus = .failed(
-            "Radio programming is disabled on iPad because app suspension can "
-                + "interrupt MCP cleanup. No radio setting was changed."
-        )
-        return
-        #else
         guard let t = transport, case .connected = state else {
             mcpStatus = .failed("Not connected to the radio.")
             return
@@ -423,55 +494,103 @@ public final class TransportCoordinator {
             isBusy = false
         }
         mcpStatus = .running("Entering programming mode…")
-        log.info("MCP: enable Reflector Terminal Mode starting")
+        let interface = t.pcOutputInterface
+        let settings = reflectorTerminalSettings(interface: interface)
+        log.info(
+            "MCP: binding Menu 985 to interface value \(settings.interfaceValue) and enabling Menu 650"
+        )
 
         let session = McpSession(transport: t)
         guard await proveCatModeForMcp() else { return }
         quarantineTransportForMcp()
         do {
-            // `enterProgramming` performs exact typed ID/FV target
-            // qualification immediately before its entry wire write.
-            mcpStatus = .running("Qualifying TH-D75 firmware 1.03…")
-            try await session.enterProgramming()
-            mcpStatus = .running("Reading page 0x1C…")
-            let page = pageOf(offset: 0x1CA0)
-            let byte = byteOf(offset: 0x1CA0)
-            let currentData = try await session.readPage(page)
-            let patched = try patchPageByte(
-                pageData: currentData, offset: byte, value: 1
-            )
-            if currentData == patched {
-                log.info("MCP: radio already in Reflector Terminal Mode; skipping write")
-                mcpStatus = .running("Already enabled; exiting programming mode…")
-            } else {
-                mcpStatus = .running("Writing page 0x1C…")
-                try await session.writePage(page, data: patched)
-                mcpStatus = .running("Exiting programming mode…")
-            }
-            try await session.exitProgramming()
+            // The session performs exact typed ID/FV qualification, reads
+            // both pages before any write, and read-back verifies Menu 985
+            // and Menu 650 before its one-shot programming-mode exit.
+            mcpStatus = .running("Configuring Menu 985 and Menu 650…")
+            try await session.enableReflectorTerminalMode(on: interface)
 
             await detachAfterMcpAttempt(t)
-            mcpStatus = .succeededRebooting
-            log.info("MCP: enable Reflector Terminal Mode succeeded")
-            // The radio reboots itself on programming-mode exit (its
-            // protocol, same as over Bluetooth). Reconnect automatically
-            // as it re-enumerates, with no manual reconnect step.
-            scheduleRadioReconnect()
+            state = .connecting
+            mcpStatus = .running("Radio is rebooting; waiting for Terminal Mode…")
+            log.info("MCP: settings verified; quarantining early CAT until MMDVM answers")
+            try await awaitTerminalMode(on: t.device)
+            mcpStatus = .succeeded
+            log.info("MCP: same exact device positively answered MMDVM GetVersion")
         } catch {
             log.error("MCP: enable Reflector Terminal Mode failed: \(error)")
             let mustDetach = await session.requiresTransportDetach()
-            let exitProved = await session.exitWasProved()
             if mustDetach {
                 await detachAfterMcpAttempt(t)
-                if exitProved {
-                    scheduleRadioReconnect()
-                }
             } else {
                 await restoreObservationAfterSafeQualificationFailure(t)
             }
             mcpStatus = .failed(error.displayMessage)
         }
-        #endif
+    }
+
+    /// Reopen one exact device until the rebooted gateway application proves
+    /// complete MMDVM framing. Silence, open failures, malformed 0xE0 prefixes,
+    /// and early-boot CAT are all retryable transition observations.
+    private func awaitTerminalMode(on device: BluetoothDevice) async throws {
+        let deadline = ContinuousClock.now.advanced(by: terminalModeTransitionWindow)
+        var lastObservation = "no probe completed"
+
+        while ContinuousClock.now < deadline {
+            try Task.checkCancellation()
+            if terminalModePollDelayNs > 0 {
+                try await Task.sleep(nanoseconds: terminalModePollDelayNs)
+            }
+            try Task.checkCancellation()
+            guard ContinuousClock.now < deadline else { break }
+
+            let candidate = transportFactory(device)
+            guard Self.canonicalBluetoothAddress(candidate.device.address)
+                    == Self.canonicalBluetoothAddress(device.address) else {
+                await candidate.close()
+                throw RadioConnectionQualificationError.transportIdentityMismatch(
+                    selected: device.address,
+                    opened: candidate.device.address
+                )
+            }
+
+            do {
+                try await candidate.open()
+                guard case .connected = await candidate.state else {
+                    throw RadioTransportError.openFailed(
+                        reason: "transport closed before terminal-mode probing"
+                    )
+                }
+                let mode = try await RadioModeProber(transport: candidate).probe()
+                guard mode == .mmdvm else {
+                    lastObservation = "radio answered \(String(describing: mode))"
+                    log.info("Terminal transition not ready: \(lastObservation, privacy: .public)")
+                    await candidate.close()
+                    continue
+                }
+
+                transport = candidate
+                radioMode = .mmdvm
+                lastProbeErrorText = nil
+                observeState(of: candidate)
+                state = .connected
+                rememberedRadioAddress = device.address
+                rememberedRadioName = device.name
+                return
+            } catch is CancellationError {
+                await candidate.close()
+                throw CancellationError()
+            } catch {
+                lastObservation = error.displayMessage
+                log.info("Terminal transition probe failed: \(lastObservation, privacy: .public)")
+                await candidate.close()
+            }
+        }
+
+        throw RadioConnectionQualificationError.terminalModeNotEngaged(
+            window: terminalModeTransitionWindow,
+            lastObservation: lastObservation
+        )
     }
 
     public func acknowledgeMcpStatus() {
@@ -576,6 +695,40 @@ public final class TransportCoordinator {
         }
         guard selectedDevice != nil else { return }
         await connect()
+    }
+
+    /// Read one typed CAT identity response from an already-open transport.
+    private func identifyModel(on transport: RadioTransport) async throws -> String {
+        try await transport.write(encodeCat(command: .identify))
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        var buffer: [UInt8] = []
+        while !buffer.contains(0x0D), buffer.count < 256 {
+            guard let chunk = try await readChunkWithTimeout(
+                transport: transport,
+                maxBytes: 256 - buffer.count,
+                deadline: deadline
+            ) else {
+                throw RadioConnectionQualificationError.noCatIdentityResponse
+            }
+            guard !chunk.isEmpty else {
+                throw RadioConnectionQualificationError.transportClosed
+            }
+            buffer.append(contentsOf: chunk)
+        }
+        guard let carriageReturn = buffer.firstIndex(of: 0x0D) else {
+            throw RadioConnectionQualificationError.invalidCatIdentityResponse
+        }
+        let response = parseCatLine(line: Array(buffer[..<carriageReturn]))
+        guard case .identify(let model) = response else {
+            throw RadioConnectionQualificationError.unexpectedCatResponse(
+                String(describing: response)
+            )
+        }
+        return model
+    }
+
+    private static func canonicalBluetoothAddress(_ address: String) -> String {
+        address.lowercased()
     }
 
     /// Acquire the coordinator's transport transaction lease synchronously,
@@ -725,6 +878,47 @@ public final class TransportCoordinator {
             return "N (not available in current mode)"
         case .raw(let line):
             return "Raw: \(line)"
+        }
+    }
+}
+
+private enum RadioConnectionQualificationError: Error, Sendable {
+    case transportIdentityMismatch(selected: String, opened: String)
+    case transportClosed
+    case noCatIdentityResponse
+    case invalidCatIdentityResponse
+    case unexpectedCatResponse(String)
+    case wrongModel(expected: String, actual: String)
+    case modeNotProved
+    case unrecognizedFraming(firstByte: UInt8)
+    case terminalModeNotEngaged(window: Duration, lastObservation: String)
+}
+
+extension RadioConnectionQualificationError: LocalizedError {
+    var errorDescription: String? {
+        switch self {
+        case .transportIdentityMismatch(let selected, let opened):
+            return "The transport factory opened \(opened), not the selected exact address "
+                + "\(selected). The connection was closed."
+        case .transportClosed:
+            return "The radio connection closed before identity was proved."
+        case .noCatIdentityResponse:
+            return "The selected device did not answer CAT ID TH-D75 or a complete MMDVM "
+                + "GetVersion probe, so it was not accepted as the radio."
+        case .invalidCatIdentityResponse:
+            return "The selected device returned an invalid CAT identity line."
+        case .unexpectedCatResponse(let response):
+            return "The selected device returned \(response) instead of CAT identity."
+        case .wrongModel(let expected, let actual):
+            return "CAT identified \(actual), not exact model \(expected). The connection was closed."
+        case .modeNotProved:
+            return "The selected device's radio protocol could not be proved."
+        case .unrecognizedFraming(let firstByte):
+            return "The selected device returned unrecognized framing beginning with 0x"
+                + String(format: "%02X", firstByte) + "."
+        case .terminalModeNotEngaged(let window, let lastObservation):
+            return "Menu 985 and Menu 650 were verified, but the same radio did not return a "
+                + "complete MMDVM GetVersion frame within \(window): \(lastObservation)."
         }
     }
 }

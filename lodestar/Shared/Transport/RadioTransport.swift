@@ -22,6 +22,9 @@ public protocol RadioTransport: Sendable {
     /// The device this transport talks to.
     var device: BluetoothDevice { get }
 
+    /// Menu 985 value corresponding to this transport's physical link.
+    var pcOutputInterface: PcOutputInterface { get }
+
     /// Current state. Kept in sync with `stateStream`.
     var state: RadioTransportState { get async }
 

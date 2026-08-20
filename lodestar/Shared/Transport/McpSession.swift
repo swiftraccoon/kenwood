@@ -15,7 +15,7 @@ private let log = Logger(subsystem: "org.swiftraccoon.lodestar", category: "mcp"
 /// (`lodestar-core::mcp`); this type only sequences them.
 ///
 /// **Important:** Every firmware-offset flow first proves the exact
-/// supported target (`ID TH-D75`, `FV 1.03`). Once entry wire traffic
+/// supported target (`ID TH-D75` plus a schema-qualified `FV` identity). Once entry wire traffic
 /// starts, this actor owns cleanup: every exit attempt is one-shot, the
 /// transport is closed, and the session becomes terminal.
 public actor McpSession {
@@ -29,12 +29,6 @@ public actor McpSession {
         case exitSent
         case terminal
     }
-
-    private static let supportedModel = "TH-D75"
-    private static let supportedFirmwareWireValues: Set<String> = [
-        "1.03",
-        "1.03.000",
-    ]
 
     private var phase: Phase = .inactive
     private var operationInFlight = false
@@ -62,7 +56,8 @@ public actor McpSession {
 
     // MARK: - Primitive steps
 
-    /// Prove `TH-D75` firmware `1.03`, then send `0M PROGRAM\r`.
+    /// Prove the exact Rust-exported MCP-D75 schema target, then send
+    /// `0M PROGRAM\r`.
     ///
     /// The `FV` response is the last completed transaction before the
     /// MCP entry write. The phase becomes `entering` before that write so
@@ -73,7 +68,6 @@ public actor McpSession {
     }
 
     private func enterProgrammingOwned() async throws {
-        try requireCleanupCapablePlatform()
         try requirePhase(.inactive, operation: "enter programming mode")
         phase = .qualifying
         do {
@@ -96,7 +90,7 @@ public actor McpSession {
         phase = .entering
         operationInFlight = true
         do {
-            log.info("MCP enter: sending 0M PROGRAM to qualified TH-D75 firmware 1.03")
+            log.info("MCP enter: sending 0M PROGRAM to qualified MCP-D75 schema target")
             try await writeWithDeadline(
                 Array(buildEnterCmd()),
                 operation: "MCP entry",
@@ -259,63 +253,84 @@ public actor McpSession {
 
     // MARK: - High-level orchestration
 
-    /// Flip Menu 650 (DV Gateway) to Reflector Terminal Mode.
+    /// Route DV Gateway to `interface` and enable Reflector Terminal Mode.
     ///
-    /// Full sequence: enter programming → read page 0x1C → patch byte
-    /// 0xA0 = 1 → write page 0x1C → exit programming. After this
-    /// returns (successfully or not), the caller **must** close the
-    /// transport; the radio will reboot into the new mode.
-    public func enableReflectorTerminalMode() async throws {
+    /// One programming session reads both affected pages before writing
+    /// either one, patches Menu 985 at `0x1093` and Menu 650 at `0x1CA0`,
+    /// verifies every changed page by read-back, then exits programming mode.
+    /// Once programming entry begins, this session owns cleanup and closes the
+    /// transport. A successful exit reboots the radio into the new mode.
+    public func enableReflectorTerminalMode(
+        on interface: PcOutputInterface
+    ) async throws {
         try beginExclusiveFlow(operation: "enable Reflector Terminal Mode")
         defer { exclusiveFlowInProgress = false }
+        let settings = reflectorTerminalSettings(interface: interface)
+        var possiblyWrittenPages: [UInt16] = []
+        var verifiedWrittenPages: [UInt16] = []
         do {
             try await enterProgrammingOwned()
 
-            let offset = UniFFI_GatewayModeOffset
-            let page = pageOf(offset: offset)
-            let byte = byteOf(offset: offset)
+            let interfacePage = pageOf(offset: settings.interfaceOffset)
+            let interfaceByte = byteOf(offset: settings.interfaceOffset)
+            let modePage = pageOf(offset: settings.modeOffset)
+            let modeByte = byteOf(offset: settings.modeOffset)
 
-            let current = try await readPageOwned(page)
-            let patched = try patchPageByte(
-                pageData: current,
-                offset: byte,
-                value: 1 // GATEWAY_MODE_REFLECTOR_TERMINAL
+            // Read both pages before either write. A read failure cannot leave
+            // the radio with only half of the requested setting pair changed.
+            let currentInterface = try await readPageOwned(interfacePage)
+            let currentMode = try await readPageOwned(modePage)
+            let patchedInterface = try patchPageByte(
+                pageData: currentInterface,
+                offset: interfaceByte,
+                value: settings.interfaceValue
+            )
+            let patchedMode = try patchPageByte(
+                pageData: currentMode,
+                offset: modeByte,
+                value: settings.modeValue
             )
 
-            // Idempotence: if the radio is already in Reflector Terminal
-            // Mode, skip the write. Saves a flash cycle.
-            if current == patched {
-                log.info("MCP: radio already in Reflector Terminal Mode, skipping write")
+            // Route the interface first, then enable the mode. Each write is
+            // followed by a complete page read-back before the next begins.
+            if currentInterface == patchedInterface {
+                log.info("MCP: Menu 985 already selects the requested interface")
             } else {
-                try await writePageOwned(page, data: patched)
+                possiblyWrittenPages.append(interfacePage)
+                try await writePageOwned(interfacePage, data: patchedInterface)
+                verifiedWrittenPages.append(interfacePage)
+            }
+
+            if currentMode == patchedMode {
+                log.info("MCP: Menu 650 already selects Reflector Terminal Mode")
+            } else {
+                possiblyWrittenPages.append(modePage)
+                try await writePageOwned(modePage, data: patchedMode)
+                verifiedWrittenPages.append(modePage)
             }
 
             try await exitProgrammingOwned()
         } catch {
-            throw await finishHighLevelFailure(error)
+            let terminalError = await finishHighLevelFailure(error)
+            throw McpOrchestratorError.terminalSettingsUpdateFailed(
+                detail: terminalError.displayMessage,
+                possiblyWrittenPages: possiblyWrittenPages,
+                verifiedWrittenPages: verifiedWrittenPages
+            )
         }
     }
 
     // MARK: - Private helpers
 
-    private func requireCleanupCapablePlatform() throws {
-        #if os(iOS)
-        // iOS can suspend the process without enough bounded execution time
-        // to prove the one-shot MCP exit handshake. Refuse before any CAT or
-        // programming-mode byte, even if this actor is used without the UI
-        // coordinator's platform gate.
-        throw McpOrchestratorError.platformCleanupNotGuaranteed
-        #endif
-    }
-
     private func qualifyFirmwareOffsetTarget() async throws {
+        let target = mcpD75SchemaTarget()
         let identity = try await transactCat(.identify)
         guard case .identify(let model) = identity else {
             throw McpOrchestratorError.unexpectedCatResponse(
                 command: "ID", actual: String(describing: identity)
             )
         }
-        guard model == Self.supportedModel else {
+        guard model == target.model else {
             throw McpOrchestratorError.unsupportedModel(actual: model)
         }
 
@@ -325,11 +340,16 @@ public actor McpSession {
                 command: "FV", actual: String(describing: firmware)
             )
         }
-        guard Self.supportedFirmwareWireValues.contains(version) else {
-            throw McpOrchestratorError.unsupportedFirmware(actual: version)
+        guard target.firmwareIdentities.contains(version) else {
+            throw McpOrchestratorError.unsupportedFirmware(
+                actual: version,
+                accepted: target.firmwareIdentities
+            )
         }
 
-        log.info("MCP target qualified: TH-D75 firmware 1.03")
+        log.info(
+            "MCP target qualified: \(model, privacy: .public) \(version, privacy: .public)"
+        )
     }
 
     private func transactCat(_ command: CatCommand) async throws -> CatResponse {
@@ -682,20 +702,8 @@ public actor McpSession {
     }
 }
 
-/// MCP gateway-mode offset (Menu 650). Mirrors the Rust-side constant
-/// `GATEWAY_MODE_OFFSET = 0x1CA0`. We define it here instead of calling
-/// a UniFFI-generated accessor because UniFFI doesn't emit plain Rust
-/// constants to Swift; round-tripping through a function would be
-/// overkill for a single `u16`.
-private let UniFFI_GatewayModeOffset: UInt16 = 0x1CA0
-
-/// Gateway-mode value for Reflector Terminal Mode (Menu 650 = 1).
-private let UniFFI_GatewayModeReflectorTerminal: UInt8 = 1
-
 /// Errors from `McpSession`.
 public enum McpOrchestratorError: Error, Equatable, Sendable {
-    /// The platform cannot guarantee time for a bounded one-shot MCP cleanup.
-    case platformCleanupNotGuaranteed
     /// An MCP step was invoked before entry or after the terminal exit attempt.
     case invalidPhase(operation: String, expected: String, actual: String)
     /// Another primitive already owns the session's transport exchange.
@@ -712,8 +720,14 @@ public enum McpOrchestratorError: Error, Equatable, Sendable {
     case unexpectedCatResponse(command: String, actual: String)
     /// Firmware-offset MCP access is limited to the exact TH-D75 model.
     case unsupportedModel(actual: String)
-    /// Firmware-offset MCP access is limited to firmware 1.03.
-    case unsupportedFirmware(actual: String)
+    /// Firmware-offset MCP access is limited to the schema-qualified identities.
+    case unsupportedFirmware(actual: String, accepted: [String])
+    /// A paired Menu 985/Menu 650 update failed, with conservative write state.
+    case terminalSettingsUpdateFailed(
+        detail: String,
+        possiblyWrittenPages: [UInt16],
+        verifiedWrittenPages: [UInt16]
+    )
     /// Did not receive `0M\r` from the radio within the timeout.
     case enterTimeout(receivedSoFar: [UInt8])
     /// Received something other than `0M\r` during entry.
@@ -745,9 +759,6 @@ public enum McpOrchestratorError: Error, Equatable, Sendable {
 extension McpOrchestratorError: LocalizedError {
     public var errorDescription: String? {
         switch self {
-        case .platformCleanupNotGuaranteed:
-            return "Radio programming is disabled on this platform because app suspension "
-                + "can interrupt MCP cleanup. No radio setting was changed."
         case .invalidPhase(let operation, let expected, let actual):
             return "Cannot \(operation): MCP session is \(actual), expected \(expected)."
         case .operationInProgress(let operation):
@@ -766,10 +777,18 @@ extension McpOrchestratorError: LocalizedError {
         case .unsupportedModel(let actual):
             return "Refusing firmware-offset MCP access to model \(actual); "
                 + "the validated target is exactly TH-D75."
-        case .unsupportedFirmware(let actual):
+        case .unsupportedFirmware(let actual, let accepted):
             return "Refusing firmware-offset MCP access to firmware \(actual); "
-                + "the validated TH-D75 firmware 1.03 wire forms are "
-                + "1.03 and 1.03.000."
+                + "the validated TH-D75 firmware identities are "
+                + accepted.joined(separator: ", ") + "."
+        case .terminalSettingsUpdateFailed(
+            let detail,
+            let possiblyWrittenPages,
+            let verifiedWrittenPages
+        ):
+            return "Reflector Terminal Mode update failed: \(detail) Pages whose writes may "
+                + "have reached the radio: \(Self.pageList(possiblyWrittenPages)); pages "
+                + "verified by read-back: \(Self.pageList(verifiedWrittenPages))."
         case .enterTimeout(let received):
             return "MCP entry timed out after receiving \(received.count) byte(s)."
         case .enterUnexpectedReply(let received):
@@ -810,5 +829,12 @@ extension McpOrchestratorError: LocalizedError {
             return "MCP operation failed: \(operation) Cleanup also failed: \(cleanup) "
                 + "The link was closed; power-cycle the radio before retrying."
         }
+    }
+
+    private static func pageList(_ pages: [UInt16]) -> String {
+        guard !pages.isEmpty else { return "none" }
+        return pages
+            .map { "0x" + String($0, radix: 16, uppercase: true) }
+            .joined(separator: ", ")
     }
 }
