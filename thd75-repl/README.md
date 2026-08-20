@@ -8,7 +8,7 @@ Accessible command-line REPL for the Kenwood TH-D75 transceiver. Its screen-read
   stepping, memory recall, mode, squelch, power, and VOX
 - D-STAR reflector gateway (DPlus/DExtra/DCS, REF/XRF/XLX/DCS reflectors)
 - APRS KISS mode (packet radio)
-- Auto-detect Reflector Terminal Mode on startup
+- Auto-detect a complete DV Gateway/MMDVM wire response on startup
 - Offer to download Pi-Star host files when connecting to a reflector without them
 - Plain text output, one line at a time
 - No box drawing, escape sequences, or cursor repositioning

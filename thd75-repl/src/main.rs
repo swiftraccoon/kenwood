@@ -35,7 +35,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 
 use thd75_repl::aprintln;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use dstar_gateway_core::slowdata::{
     SlowDataTextCollector, SlowDataTextMessage, encode_text_message,
 };
@@ -45,7 +45,9 @@ use kenwood_thd75::memory::{
 };
 use kenwood_thd75::radio::programming::DetachedMcpPageUpdate;
 use kenwood_thd75::transport::EitherTransport;
-use kenwood_thd75::types::{DstarCallsign, DvGatewayMode, FirmwareIdentity, RadioModel};
+use kenwood_thd75::types::{
+    DstarCallsign, DvGatewayMode, FirmwareIdentity, PcOutputInterface, RadioModel,
+};
 use kenwood_thd75::{
     AprsClient, AprsClientConfig, AprsEvent, AprsReportTimestamp, Ax25Address, DigipeaterConfig,
     IGateRfLocality, IGateToRfConfig, MessageAddressee, MessageText, StatusText,
@@ -54,7 +56,7 @@ use kenwood_thd75::{DstarEvent, DstarGateway, DstarGatewayConfig, PersistentMmdv
 use kenwood_thd75::{FirmwareProfile, Radio};
 
 use dstar_gateway::auth::AuthClient;
-use dstar_gateway::tokio_shell::{AnyAsyncSession, AnyEvent, AsyncSession};
+use dstar_gateway::tokio_shell::{AnyAsyncSession, AnyEvent, AsyncSession, ShellError};
 use dstar_gateway_core::header::DstarHeader;
 use dstar_gateway_core::hosts::HostFile;
 use dstar_gateway_core::session::client::{
@@ -65,6 +67,24 @@ use dstar_gateway_core::voice::VoiceFrame;
 use dstar_gateway_core::{Callsign, Module, StreamId, Suffix};
 
 static PROCESS_SIGNAL_EXIT_CODE: AtomicI32 = AtomicI32::new(0);
+
+/// Physical interface represented by an otherwise ambiguous explicit port.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum PortInterface {
+    /// USB CDC control port.
+    Usb,
+    /// Bluetooth SPP control port.
+    Bluetooth,
+}
+
+impl From<PortInterface> for PcOutputInterface {
+    fn from(interface: PortInterface) -> Self {
+        match interface {
+            PortInterface::Usb => Self::Usb,
+            PortInterface::Bluetooth => Self::Bluetooth,
+        }
+    }
+}
 
 /// Log verbosity level for the opt-in file sink.
 ///
@@ -142,6 +162,14 @@ struct Cli {
     /// Serial port path (default: auto-discover USB, then Bluetooth).
     #[arg(short, long)]
     port: Option<String>,
+
+    /// Physical interface used by `--port` when its path is ambiguous.
+    ///
+    /// Auto-discovered endpoints and recognizable USB/Bluetooth paths do not
+    /// need this. Windows `COM` ports and custom symlinks must specify it
+    /// before a CAT session can enable persistent D-STAR gateway mode.
+    #[arg(long, value_enum, requires = "port")]
+    port_interface: Option<PortInterface>,
 
     /// Baud rate for serial connection.
     #[arg(short, long, default_value_t = 115_200)]
@@ -435,17 +463,18 @@ fn init_logging(cli: &Cli) -> LoggingGuard {
 /// is unavailable and a serial port is present; an error-driven
 /// fallback branch never gets the chance to run.
 /// Factored out of `main` so the mock + real transport branches stay
-/// symmetric: both return the same `(path, transport, runtime)` shape.
+/// symmetric: both return the same `(opened transport, runtime)` shape.
 fn open_real_transport(
     cli_port: Option<&str>,
     cli_baud: u32,
-) -> Result<(String, EitherTransport, tokio::runtime::Runtime), Box<dyn std::error::Error>> {
+    port_interface: Option<PcOutputInterface>,
+) -> Result<(transport::OpenedTransport, tokio::runtime::Runtime), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Runtime::new()?;
-    let (path, transport) = {
+    let opened = {
         let _reactor = rt.enter();
-        transport::discover_and_open(cli_port, cli_baud)?
+        transport::discover_and_open(cli_port, cli_baud, port_interface)?
     };
-    Ok((path, transport, rt))
+    Ok((opened, rt))
 }
 
 /// Parse a UTC offset string like `+05:30`, `-08:00`, `+0530`, or
@@ -543,6 +572,45 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+/// Apply process-global output and confirmation options before startup output.
+fn configure_process_options(cli: &Cli) -> bool {
+    thd75_repl::set_history_capacity(cli.history_lines);
+
+    if cli.yes {
+        thd75_repl::confirm::set_required(false);
+    }
+    // Script mode also covers piped stdin: a confirmation prompt cannot be
+    // answered there without consuming the next queued command.
+    let in_script_mode = cli.script.is_some();
+    if in_script_mode || !std::io::stdin().is_terminal() {
+        thd75_repl::confirm::set_script_mode(true);
+    }
+
+    if cli.timestamps {
+        thd75_repl::TIMESTAMPS.store(true, Ordering::Relaxed);
+    }
+    if cli.local_time || cli.utc_offset.is_some() {
+        thd75_repl::TIMESTAMPS.store(true, Ordering::Relaxed);
+        let offset_secs = cli.utc_offset.as_ref().map_or_else(
+            || {
+                detect_utc_offset_seconds().unwrap_or_else(|| {
+                    println!("Warning: could not detect local time zone. Using UTC.");
+                    0
+                })
+            },
+            |spec| {
+                parse_utc_offset(spec).unwrap_or_else(|error| {
+                    println!("Warning: invalid --utc-offset {spec:?}: {error}. Using UTC.");
+                    0
+                })
+            },
+        );
+        thd75_repl::UTC_OFFSET_SECS.store(offset_secs, Ordering::Relaxed);
+    }
+
+    in_script_mode
+}
+
 fn run_main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
@@ -552,47 +620,7 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(thd75_repl::check::run());
     }
 
-    // Configure history buffer capacity before any output is
-    // recorded so the first banner line is captured at the correct
-    // size.
-    thd75_repl::set_history_capacity(cli.history_lines);
-
-    // Apply the --yes flag and script mode settings to the transmit
-    // confirmation module so the first transmit command respects them.
-    if cli.yes {
-        thd75_repl::confirm::set_required(false);
-    }
-    // Script mode also covers piped stdin: the transmit confirmation
-    // prompt cannot be answered when stdin is not a terminal;
-    // reading the answer would silently consume the next queued
-    // command line instead.
-    let in_script_mode = cli.script.is_some();
-    if in_script_mode || !std::io::stdin().is_terminal() {
-        thd75_repl::confirm::set_script_mode(true);
-    }
-
-    if cli.timestamps {
-        thd75_repl::TIMESTAMPS.store(true, Ordering::Relaxed);
-    }
-
-    if cli.local_time || cli.utc_offset.is_some() {
-        thd75_repl::TIMESTAMPS.store(true, Ordering::Relaxed);
-        let offset_secs = cli.utc_offset.as_ref().map_or_else(
-            || {
-                detect_utc_offset_seconds().unwrap_or_else(|| {
-                    eprintln!("Warning: could not detect local time zone. Using UTC.");
-                    0
-                })
-            },
-            |spec| {
-                parse_utc_offset(spec).unwrap_or_else(|e| {
-                    eprintln!("Warning: invalid --utc-offset {spec:?}: {e}. Using UTC.");
-                    0
-                })
-            },
-        );
-        thd75_repl::UTC_OFFSET_SECS.store(offset_secs, Ordering::Relaxed);
-    }
+    let in_script_mode = configure_process_options(&cli);
 
     // Configure logging before anything else so the file captures
     // the full startup sequence. The guard returned here must live
@@ -615,7 +643,7 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
     // discovery entirely and construct a programmed `MockTransport`
     // instead.
     #[cfg(feature = "testing")]
-    let (path, transport, rt) = if let Some(ref scenario) = cli.mock_radio {
+    let (opened, rt) = if let Some(ref scenario) = cli.mock_radio {
         let mock = thd75_repl::mock_scenarios::build(scenario).ok_or_else(|| {
             format!(
                 "Unknown mock scenario: {scenario}. Known: simple, empty, mmdvm, mmdvm_dstar, \
@@ -623,14 +651,35 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
             )
         })?;
         let rt = tokio::runtime::Runtime::new()?;
-        (format!("mock:{scenario}"), EitherTransport::Mock(mock), rt)
+        (
+            transport::OpenedTransport {
+                label: format!("mock:{scenario}"),
+                transport: EitherTransport::Mock(mock),
+                endpoint_interface: transport::EndpointInterface::Known(PcOutputInterface::Usb),
+            },
+            rt,
+        )
     } else {
-        open_real_transport(cli.port.as_deref(), cli.baud)?
+        open_real_transport(
+            cli.port.as_deref(),
+            cli.baud,
+            cli.port_interface.map(PcOutputInterface::from),
+        )?
     };
     #[cfg(not(feature = "testing"))]
-    let (path, transport, rt) = open_real_transport(cli.port.as_deref(), cli.baud)?;
+    let (opened, rt) = open_real_transport(
+        cli.port.as_deref(),
+        cli.baud,
+        cli.port_interface.map(PcOutputInterface::from),
+    )?;
 
-    println!("{}", thd75_repl::output::connected_via(&path));
+    let transport::OpenedTransport {
+        label,
+        transport,
+        endpoint_interface,
+    } = opened;
+
+    println!("{}", thd75_repl::output::connected_via(&label));
 
     // `--set-gateway-off`: clear the DV Gateway flag and exit, without
     // entering the interactive loop. Runs over whatever port answered
@@ -670,6 +719,8 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
             script_strict,
             in_script_mode,
             cli.exit_terminal_mode,
+            endpoint_interface,
+            cli.port_interface.map(PcOutputInterface::from),
         ),
     )?;
 
@@ -710,10 +761,11 @@ enum ReplState {
     /// keep this variant's size near its siblings'
     /// (`clippy::large_enum_variant`).
     Cat(Box<Radio<EitherTransport>>),
-    /// Persistent Reflector Terminal Mode has been proved on the link, but
-    /// the radio has not yet been consumed by a D-STAR gateway session.
-    /// CAT commands are invalid in this state.
-    Terminal(Box<Radio<EitherTransport>>),
+    /// Complete MMDVM version framing has been proved on the link, but the
+    /// radio has not yet been consumed by a D-STAR gateway session. This
+    /// proves the wire protocol, not which persistent DV Gateway mode the
+    /// operator selected in Menu 650. CAT commands are invalid here.
+    Mmdvm(Box<Radio<EitherTransport>>),
     /// APRS/KISS mode: radio consumed by `AprsClient`.
     Aprs(Box<AprsClient<EitherTransport>>),
     /// D-STAR gateway/MMDVM mode: radio consumed by `DstarGateway`.
@@ -724,16 +776,24 @@ enum ReplState {
 /// proved to speak persistent MMDVM framing.
 enum DstarEntryRadio {
     Cat(Radio<EitherTransport>),
-    Terminal(Radio<EitherTransport>),
+    Mmdvm(Radio<EitherTransport>),
 }
 
 impl DstarEntryRadio {
     fn into_repl_state(self) -> ReplState {
         match self {
             Self::Cat(radio) => ReplState::Cat(Box::new(radio)),
-            Self::Terminal(radio) => ReplState::Terminal(Box::new(radio)),
+            Self::Mmdvm(radio) => ReplState::Mmdvm(Box::new(radio)),
         }
     }
+}
+
+/// Why the interactive owner loop ended without an orderly quit/EOF return.
+enum ReplLoopExit {
+    /// A transport or protocol failure consumed the only radio owner.
+    RadioConnectionLost,
+    /// The command handler already printed the complete terminal error.
+    ErrorAlreadyReported,
 }
 
 /// Active D-STAR session holding both the radio MMDVM gateway and
@@ -942,7 +1002,6 @@ impl ProcessSignalRouter {
             receiver,
             critical_slot: self.critical_slot.clone(),
             armed: true,
-            last_signal: None,
         })
     }
 }
@@ -952,22 +1011,14 @@ struct CriticalSignalGuard {
     receiver: tokio::sync::mpsc::UnboundedReceiver<ProcessSignal>,
     critical_slot: CriticalSignalSlot,
     armed: bool,
-    last_signal: Option<ProcessSignal>,
 }
 
 impl CriticalSignalGuard {
     async fn recv(&mut self) -> Result<ProcessSignal, String> {
-        let signal = self
-            .receiver
+        self.receiver
             .recv()
             .await
-            .ok_or_else(|| "process signal router stopped".to_owned())?;
-        self.last_signal = Some(signal);
-        Ok(signal)
-    }
-
-    const fn last_signal(&self) -> Option<ProcessSignal> {
-        self.last_signal
+            .ok_or_else(|| "process signal router stopped".to_owned())
     }
 
     /// Atomically unregister this critical operation, then check for a signal
@@ -1129,7 +1180,42 @@ type ReflectorSession = AnyAsyncSession;
 /// of abstraction as [`ReflectorSession`].
 type RuntimeEvent = AnyEvent;
 
-/// Main REPL loop. Manages CAT, terminal-ready, APRS, and D-STAR states.
+/// Close the reflector side without allowing a stalled UDP task to block
+/// recovery of the radio-side terminal mode.
+async fn disconnect_reflector(session: &mut ReflectorSession) {
+    match session.disconnect().await {
+        Ok(()) => {
+            aprintln!("Disconnected from reflector.");
+        }
+        Err(ShellError::DisconnectUnacknowledged) => {
+            aprintln!(
+                "The reflector did not acknowledge the disconnect; the local reflector session \
+                 closed after its protocol timeout."
+            );
+        }
+        Err(ShellError::DisconnectedBeforeUnlink { reason }) => match reason {
+            DisconnectReason::KeepaliveInactivity => {
+                aprintln!("The reflector link had already closed after inactivity.");
+            }
+            DisconnectReason::Rejected => {
+                aprintln!("The reflector link was already closed after rejection.");
+            }
+            _ => {
+                aprintln!("The reflector session had already closed: {reason:?}.");
+            }
+        },
+        Err(error) => {
+            println!(
+                "{}",
+                thd75_repl::output::error(format_args!(
+                    "reflector disconnect did not complete: {error}. Continuing radio recovery"
+                ))
+            );
+        }
+    }
+}
+
+/// Main REPL loop. Manages CAT, MMDVM-ready, APRS, and D-STAR states.
 /// Each state owns the radio transport exclusively.
 #[expect(
     clippy::cognitive_complexity,
@@ -1153,6 +1239,8 @@ async fn run_repl(
     script_strict: bool,
     in_script_mode: bool,
     exit_terminal_mode: bool,
+    mut endpoint_interface: transport::EndpointInterface,
+    port_interface_override: Option<PcOutputInterface>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // `script_strict` is reserved for a future enhancement that halts
     // the REPL loop on the first command error. Silencing the
@@ -1197,7 +1285,15 @@ async fn run_repl(
                         "This gateway link cannot prove the radio model and firmware required \
                          for a safe automated memory write."
                     );
-                    radio = guide_exit_terminal_mode(radio, cli_port.as_deref(), cli_baud).await?;
+                    let (restored_radio, restored_interface) = guide_exit_terminal_mode(
+                        radio,
+                        cli_port.as_deref(),
+                        cli_baud,
+                        port_interface_override,
+                    )
+                    .await?;
+                    radio = restored_radio;
+                    endpoint_interface = restored_interface;
                     let identity = radio.identify().await?;
                     let firmware = radio.get_firmware_version().await?;
                     println!(
@@ -1208,11 +1304,11 @@ async fn run_repl(
                     ReplState::Cat(Box::new(radio))
                 }
                 LinkDiagnosis::MmdvmMode => {
-                    // CAT is offline in this mode. Remember it so the
                     // Store the binary-proved owner in its dedicated state so
-                    // CAT dispatch is unreachable and unsupported commands get
-                    // actionable guidance without a timeout.
-                    println!("Radio is in D-STAR Reflector Terminal Mode.");
+                    // CAT dispatch is unreachable. MMDVM framing proves the
+                    // DV Gateway wire protocol, but cannot distinguish
+                    // Reflector Terminal from Access Point mode.
+                    println!("Radio is in DV Gateway/MMDVM mode.");
                     println!("CAT commands like freq, mode, and status do not work in this mode.");
                     println!("To use D-STAR now: dstar start <callsign> [reflector]");
                     println!("  Example: dstar start W1AW REF030C");
@@ -1220,7 +1316,7 @@ async fn run_repl(
                         "To restore normal radio control: set Menu No. 650 (DV Gateway) to Off,"
                     );
                     println!("  then restart, or relaunch with --exit-terminal-mode.");
-                    ReplState::Terminal(Box::new(radio))
+                    ReplState::Mmdvm(Box::new(radio))
                 }
                 LinkDiagnosis::Unresponsive => {
                     return Err(LinkDiagnosis::Unresponsive.guidance().into());
@@ -1240,9 +1336,9 @@ async fn run_repl(
         }
     }
 
-    loop {
+    let loop_exit = loop {
         let prompt = match &state {
-            ReplState::Cat(_) | ReplState::Terminal(_) => "d75> ",
+            ReplState::Cat(_) | ReplState::Mmdvm(_) => "d75> ",
             ReplState::Aprs(_) => "aprs> ",
             ReplState::Dstar(_) => "dstar> ",
         };
@@ -1269,7 +1365,7 @@ async fn run_repl(
         let Some(line) = line else {
             // EOF or Ctrl-C: disconnect cleanly.
             let radio = match state {
-                ReplState::Cat(r) | ReplState::Terminal(r) => Some(*r),
+                ReplState::Cat(r) | ReplState::Mmdvm(r) => Some(*r),
                 ReplState::Aprs(c) => Some(
                     c.stop()
                         .await
@@ -1280,16 +1376,16 @@ async fn run_repl(
                         .into_radio_unproven(),
                 ),
                 ReplState::Dstar(mut s) => {
-                    if let Some(ref mut r) = s.reflector {
-                        drop(r.disconnect().await);
+                    if let Some(mut reflector) = s.reflector.take() {
+                        disconnect_reflector(&mut reflector).await;
                     }
                     let radio = s.gateway.stop().await;
                     // Mirror the guidance the interactive quit path
                     // gives via `exit_dstar`: the radio stays in
-                    // Reflector Terminal Mode until the operator
-                    // changes Menu 650, and end-of-input gives us no
-                    // way to walk them through a reconnect.
-                    println!("The radio is still in Reflector Terminal Mode.");
+                    // DV Gateway/MMDVM mode until the operator changes Menu
+                    // 650, and end-of-input gives us no way to walk them
+                    // through a reconnect.
+                    println!("The radio is still in DV Gateway/MMDVM mode.");
                     println!("Set Menu 650 (DV Gateway) to Off to restore normal operation.");
                     Some(radio.map_err(|error| {
                         format!("stopping D-STAR gateway at end of input: {error}")
@@ -1342,7 +1438,7 @@ async fn run_repl(
                 } else {
                     let text = match &state {
                         ReplState::Cat(_) => thd75_repl::help_text::CAT_MODE_HELP,
-                        ReplState::Terminal(_) => thd75_repl::help_text::TERMINAL_MODE_HELP,
+                        ReplState::Mmdvm(_) => thd75_repl::help_text::MMDVM_MODE_HELP,
                         ReplState::Aprs(_) => thd75_repl::help_text::APRS_MODE_HELP,
                         ReplState::Dstar(_) => thd75_repl::help_text::DSTAR_MODE_HELP,
                     };
@@ -1365,11 +1461,18 @@ async fn run_repl(
                     }
                     ReplState::Dstar(mut session) => {
                         println!("Exiting D-STAR mode and restoring normal radio mode.");
-                        if let Some(ref mut refl) = session.reflector {
-                            drop(refl.disconnect().await);
+                        if let Some(mut reflector) = session.reflector.take() {
+                            disconnect_reflector(&mut reflector).await;
                         }
-                        match exit_dstar(session.gateway, cli_port.as_deref(), cli_baud).await {
-                            Ok(r) => Some(r),
+                        match exit_dstar(
+                            session.gateway,
+                            cli_port.as_deref(),
+                            cli_baud,
+                            port_interface_override,
+                        )
+                        .await
+                        {
+                            Ok((r, _)) => Some(r),
                             Err(e) => {
                                 println!(
                                     "{}",
@@ -1381,7 +1484,7 @@ async fn run_repl(
                             }
                         }
                     }
-                    ReplState::Cat(r) | ReplState::Terminal(r) => Some(*r),
+                    ReplState::Cat(r) | ReplState::Mmdvm(r) => Some(*r),
                 };
                 if let Some(r) = radio {
                     drop(r.disconnect().await);
@@ -1477,10 +1580,10 @@ async fn run_repl(
             _ => {}
         }
 
-        // A terminal-ready owner has positive MMDVM framing proof, not CAT
+        // An MMDVM-ready owner has positive binary framing proof, not CAT
         // ownership. Keep ordinary radio and APRS commands away from it; only
         // D-STAR startup may consume this state.
-        if matches!(&state, ReplState::Terminal(_)) && cmd != "dstar" {
+        if matches!(&state, ReplState::Mmdvm(_)) && cmd != "dstar" {
             println!("{}", LinkDiagnosis::MmdvmMode.guidance());
             println!("Then restart this program, or relaunch with --exit-terminal-mode.");
             println!("Or type dstar start <callsign> [reflector] to use D-STAR now.");
@@ -1505,7 +1608,7 @@ async fn run_repl(
                             thd75_repl::output::error(format_args!("CAT recovery failed: {error}"))
                         );
                         drop(radio.disconnect().await);
-                        break;
+                        break ReplLoopExit::RadioConnectionLost;
                     }
                     aprintln!("CAT link recovered.");
                 }
@@ -1526,7 +1629,7 @@ async fn run_repl(
                                 "{}",
                                 thd75_repl::output::error(format_args!("entering APRS mode: {e}"))
                             );
-                            break;
+                            break ReplLoopExit::RadioConnectionLost;
                         }
                     }
                 } else if cmd == "dstar" && parts.get(1).is_some_and(|s| *s == "start") {
@@ -1534,34 +1637,36 @@ async fn run_repl(
                         DstarEntryRadio::Cat(*radio),
                         parts.get(2..).unwrap_or(&[]),
                         &process_signals,
+                        endpoint_interface,
                     )
                     .await
                     {
                         Some(next_state) => next_state,
-                        None => break,
+                        None => break ReplLoopExit::ErrorAlreadyReported,
                     }
                 } else {
                     ReplState::Cat(radio)
                 }
             }
 
-            ReplState::Terminal(radio) => {
+            ReplState::Mmdvm(radio) => {
                 if cmd == "dstar" && parts.get(1).is_some_and(|s| *s == "start") {
                     match start_dstar_repl(
-                        DstarEntryRadio::Terminal(*radio),
+                        DstarEntryRadio::Mmdvm(*radio),
                         parts.get(2..).unwrap_or(&[]),
                         &process_signals,
+                        endpoint_interface,
                     )
                     .await
                     {
                         Some(next_state) => next_state,
-                        None => break,
+                        None => break ReplLoopExit::ErrorAlreadyReported,
                     }
                 } else {
                     println!("Usage: dstar start <callsign> [reflector]");
                     println!("  Enters D-STAR gateway mode. Optionally connects to a reflector.");
                     println!("  Example: dstar start W1AW REF030C");
-                    ReplState::Terminal(radio)
+                    ReplState::Mmdvm(radio)
                 }
             }
 
@@ -1582,7 +1687,7 @@ async fn run_repl(
                                     ))
                                 );
                                 drop(desynced.into_radio_unproven().disconnect().await);
-                                break;
+                                break ReplLoopExit::RadioConnectionLost;
                             }
                         },
                         Err((_client, e)) => {
@@ -1590,7 +1695,7 @@ async fn run_repl(
                                 "{}",
                                 thd75_repl::output::error(format_args!("stopping APRS: {e}"))
                             );
-                            break;
+                            break ReplLoopExit::RadioConnectionLost;
                         }
                     }
                 } else {
@@ -1601,11 +1706,19 @@ async fn run_repl(
 
             ReplState::Dstar(mut session) => {
                 if cmd == "dstar" && parts.get(1).is_some_and(|s| *s == "stop") {
-                    if let Some(ref mut refl) = session.reflector {
-                        drop(refl.disconnect().await);
+                    if let Some(mut reflector) = session.reflector.take() {
+                        disconnect_reflector(&mut reflector).await;
                     }
-                    match exit_dstar(session.gateway, cli_port.as_deref(), cli_baud).await {
-                        Ok(radio) => {
+                    match exit_dstar(
+                        session.gateway,
+                        cli_port.as_deref(),
+                        cli_baud,
+                        port_interface_override,
+                    )
+                    .await
+                    {
+                        Ok((radio, reopened_interface)) => {
+                            endpoint_interface = reopened_interface;
                             // `exit_dstar` reconnected and verified CAT
                             // control, so this owner is no longer terminal.
                             aprintln!("D-STAR mode stopped. Returned to normal radio control.");
@@ -1616,7 +1729,7 @@ async fn run_repl(
                                 "{}",
                                 thd75_repl::output::error(format_args!("exiting D-STAR mode: {e}"))
                             );
-                            break;
+                            break ReplLoopExit::RadioConnectionLost;
                         }
                     }
                 } else if cmd == "monitor" {
@@ -1632,13 +1745,16 @@ async fn run_repl(
                 }
             }
         };
-    }
+    };
 
-    // The loop only breaks (rather than returning) when the radio
-    // connection was lost mid-session. Surface that as a real error
-    // so scripts and automation see a non-zero exit code; `main`
-    // prints it with the `Error:` prefix via `Display`.
-    Err("radio connection lost. Please close and reopen the program.".into())
+    match loop_exit {
+        ReplLoopExit::RadioConnectionLost => {
+            // Surface unreported ownership loss as a real error so scripts and
+            // automation see a non-zero exit code; `main` supplies `Error:`.
+            Err("radio connection lost. Please close and reopen the program.".into())
+        }
+        ReplLoopExit::ErrorAlreadyReported => Ok(()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2395,7 +2511,8 @@ async fn guide_exit_terminal_mode(
     mut radio: Radio<EitherTransport>,
     cli_port: Option<&str>,
     cli_baud: u32,
-) -> Result<Radio<EitherTransport>, String> {
+    port_interface_override: Option<PcOutputInterface>,
+) -> Result<(Radio<EitherTransport>, transport::EndpointInterface), String> {
     loop {
         println!("{}", LinkDiagnosis::MmdvmMode.guidance());
         println!();
@@ -2407,17 +2524,18 @@ async fn guide_exit_terminal_mode(
         println!("Reconnecting...");
         tokio::time::sleep(std::time::Duration::from_secs(4)).await;
 
-        let (_path, transport) = transport::discover_and_open(cli_port, cli_baud)
+        let opened = transport::discover_and_open(cli_port, cli_baud, port_interface_override)
             .map_err(|e| format!("Reconnect failed: {e}"))?;
-        radio = Radio::connect_with_tnc_exit(transport)
+        let reopened_interface = opened.endpoint_interface;
+        radio = Radio::connect_with_tnc_exit(opened.transport)
             .await
             .map_err(|e| format!("Connect failed: {e}"))?;
 
         if radio.identify().await.is_ok() {
             println!("Radio restored to CAT control mode.");
-            return Ok(radio);
+            return Ok((radio, reopened_interface));
         }
-        println!("The radio is still in Reflector Terminal Mode. Try again.");
+        println!("The radio is still in DV Gateway/MMDVM mode. Try again.");
     }
 }
 
@@ -2460,27 +2578,85 @@ async fn run_set_gateway_off(transport: EitherTransport) -> Result<(), Box<dyn s
     }
 
     println!("Clearing Menu 650 via its firmware-verified MCP byte.");
-    match automated_terminal_exit(&mut radio).await {
-        Ok(DetachedMcpPageUpdate::UnchangedCatReady) => {
-            radio.disconnect().await?;
-            println!("DV Gateway is already off; no memory write or reboot was needed.");
-            Ok(())
+    println!("Attempting automated exit: clearing the DV Gateway flag via memory write.");
+    let process_signals = ProcessSignalRouter::install()?;
+    let mut critical_signals = process_signals.begin_critical()?;
+    let operation = clear_gateway_mode_with_interrupt(&mut radio, critical_signals.recv()).await;
+    let late_signal = critical_signals.finish().err();
+
+    match operation {
+        InterruptibleMcpOperation::Completed(Ok(update)) if late_signal.is_none() => {
+            finish_gateway_clear(radio, update).await
         }
-        Ok(DetachedMcpPageUpdate::ChangedRadioRebooting) => {
-            drop(radio.disconnect().await);
+        InterruptibleMcpOperation::Completed(Ok(update)) => {
+            finish_gateway_clear(radio, update).await?;
             println!(
-                "DV Gateway flag cleared. The radio reboots into normal control mode. \
-                 Reconnect for CAT or APRS once it finishes."
+                "{} after the verified Menu 650 operation completed. The reported radio outcome \
+                 above is authoritative.",
+                late_signal.unwrap_or_else(|| "process signal received".to_owned())
             );
             Ok(())
         }
-        Err(e) => Err(format!(
-            "could not clear the DV Gateway flag: {e}\n\
-             If the radio is in Reflector Terminal Mode over this port, connect \
-             through the OTHER interface (USB when Menu 985 is Bluetooth) and retry."
-        )
-        .into()),
+        InterruptibleMcpOperation::Completed(Err(error)) => {
+            gateway_clear_failure(radio, error, late_signal.as_deref()).await
+        }
+        InterruptibleMcpOperation::Interrupted { signal, completion } => match completion {
+            Ok(update) => {
+                finish_gateway_clear(radio, update).await?;
+                println!(
+                    "{}. The signal was held until the verified Menu 650 operation completed; \
+                     the reported radio outcome above is authoritative.",
+                    describe_mcp_interrupt(signal)
+                );
+                Ok(())
+            }
+            Err(error) => {
+                let interruption = describe_mcp_interrupt(signal);
+                gateway_clear_failure(radio, error, Some(&interruption)).await
+            }
+        },
     }
+}
+
+async fn finish_gateway_clear(
+    radio: Radio<EitherTransport>,
+    update: DetachedMcpPageUpdate,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match update {
+        DetachedMcpPageUpdate::UnchangedCatReady => {
+            radio.disconnect().await?;
+            println!("DV Gateway is already off; no memory write or reboot was needed.");
+        }
+        DetachedMcpPageUpdate::ChangedRadioRebooting => {
+            drop(radio.disconnect().await);
+            println!(
+                "DV Gateway flag clear was read-back verified. The radio is rebooting into normal \
+                 control mode; reconnect for CAT or APRS once it finishes."
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn gateway_clear_failure(
+    radio: Radio<EitherTransport>,
+    error: kenwood_thd75::Error,
+    interruption: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let requires_recovery = error.requires_recovery() || radio.cat_recovery_required();
+    drop(radio.disconnect().await);
+    let interruption = interruption.map_or_else(String::new, |reason| format!("{reason}; "));
+    let guidance = if requires_recovery {
+        "The binary boundary is not safe for another command. Do not retry either memory update; \
+         fully power-cycle the radio first."
+    } else {
+        "No write was started. This may be the gateway-owned interface; reconnect through the \
+         other interface (USB when Menu 985 is Bluetooth) before retrying."
+    };
+    Err(format!(
+        "{interruption}the Menu 650 operation completed with an error: {error}\n{guidance}"
+    )
+    .into())
 }
 
 /// Leave Reflector Terminal Mode through the non-gateway control interface.
@@ -2493,17 +2669,20 @@ async fn run_set_gateway_off(transport: EitherTransport) -> Result<(), Box<dyn s
 /// the current link drops with the reboot. Once boot completes, the caller may
 /// open a new transport normally.
 ///
-/// # Errors
-///
-/// Returns an error if programming-mode entry, the page read, the page write,
-/// or the exit write fails. A timeout on the gateway-owned interface leaves
-/// the radio unchanged; retry over the non-gateway interface or use the front
-/// panel.
-async fn automated_terminal_exit(
-    radio: &mut Radio<EitherTransport>,
-) -> Result<DetachedMcpPageUpdate, String> {
-    println!("Attempting automated exit: clearing the DV Gateway flag via memory write.");
-    clear_gateway_mode_with_interrupt(radio, mcp_termination_signal()).await
+#[derive(Debug)]
+enum InterruptibleMcpOperation {
+    Completed(Result<DetachedMcpPageUpdate, kenwood_thd75::Error>),
+    Interrupted {
+        signal: Result<ProcessSignal, String>,
+        completion: Result<DetachedMcpPageUpdate, kenwood_thd75::Error>,
+    },
+}
+
+fn describe_mcp_interrupt(signal: Result<ProcessSignal, String>) -> String {
+    signal.map_or_else(
+        |error| format!("MCP signal listener failed: {error}"),
+        |signal| format!("{} signal received", signal.description()),
+    )
 }
 
 /// Clear Menu 650 while avoiding a write and detached reboot when its byte is
@@ -2511,129 +2690,58 @@ async fn automated_terminal_exit(
 async fn clear_gateway_mode_with_interrupt<I>(
     radio: &mut Radio<EitherTransport>,
     interrupt: I,
-) -> Result<DetachedMcpPageUpdate, String>
+) -> InterruptibleMcpOperation
 where
-    I: Future<Output = std::io::Result<()>>,
+    I: Future<Output = Result<ProcessSignal, String>>,
 {
-    let interrupt_result = {
-        // The schema target was proved by this flow's own identity reads;
-        // the library owns the registry-pinned Menu 650 offset.
-        let write = radio.set_dv_gateway_mode_detached_unverified(DvGatewayMode::Off);
-        tokio::pin!(write);
-        tokio::pin!(interrupt);
-        tokio::select! {
-            biased;
-            result = &mut write => {
-                return result.map_err(|error| format!("MCP write failed: {error}"));
-            }
-            signal = &mut interrupt => signal,
-        }
-    };
-
-    let interruption = interrupt_result.map_or_else(
-        |error| {
-            format!(
-                "MCP termination listener failed ({error}); the Menu 650 operation was cancelled; \
-                 the setting may already have changed"
-            )
+    // The schema target was proved by this flow's own identity reads; the
+    // library owns the registry-pinned Menu 650 offset.
+    let operation = radio.disable_dv_gateway_detached_unverified();
+    tokio::pin!(operation);
+    tokio::pin!(interrupt);
+    tokio::select! {
+        biased;
+        result = &mut operation => InterruptibleMcpOperation::Completed(result),
+        signal = &mut interrupt => {
+            // Latch the signal but do not drop a binary exchange at an
+            // arbitrary byte boundary. The bounded library operation owns
+            // cleanup and its exact result remains authoritative.
+            let completion = operation.await;
+            InterruptibleMcpOperation::Interrupted { signal, completion }
         },
-        |()| "Menu 650 operation interrupted; the setting may already have changed".to_owned(),
-    );
-    Err(recover_interrupted_gateway_write(radio, interruption).await)
+    }
 }
 
-/// Apply the Menu 650 byte while treating catchable process termination as
-/// an interrupted MCP transaction that must be explicitly recovered.
+/// Bind Menu 985 to the active endpoint and enable Menu 650 while treating a
+/// catchable process termination as an interrupted MCP transaction that must
+/// be explicitly recovered.
 ///
 /// Returns a named outcome distinguishing a detached reboot from an unchanged
 /// page whose CAT connection was restored without a flash write.
-async fn write_gateway_mode_with_interrupt<I>(
+async fn write_terminal_mode_with_interrupt<I>(
     radio: &mut Radio<EitherTransport>,
-    mode: DvGatewayMode,
+    pc_interface: PcOutputInterface,
     interrupt: I,
-) -> Result<DetachedMcpPageUpdate, String>
+) -> InterruptibleMcpOperation
 where
-    I: Future<Output = std::io::Result<()>>,
+    I: Future<Output = Result<ProcessSignal, String>>,
 {
-    let interrupt_result = {
-        // The caller proved the schema target with its own identity reads;
-        // the library owns the registry-pinned Menu 650 offset.
-        let write = radio.set_dv_gateway_mode_detached_unverified(mode);
-        tokio::pin!(write);
-        tokio::pin!(interrupt);
-        tokio::select! {
-            biased;
-            result = &mut write => return result.map_err(|error| format!("MCP write failed: {error}")),
-            signal = &mut interrupt => signal,
-        }
-    };
-
-    let interruption = interrupt_result.map_or_else(
-        |error| {
-            format!(
-                "MCP termination listener failed ({error}); the Menu 650 write was cancelled; \
-                 the setting may already have changed"
-            )
-        },
-        |()| "Menu 650 write interrupted; the setting may already have changed".to_owned(),
-    );
-    Err(recover_interrupted_gateway_write(radio, interruption).await)
-}
-
-async fn recover_interrupted_gateway_write(
-    radio: &mut Radio<EitherTransport>,
-    interruption: String,
-) -> String {
-    match radio.recover_from_interrupted_mcp().await {
-        Ok(()) => {
-            format!("{interruption}; MCP exit and normal CAT recovery completed")
-        }
-        Err(recovery_error) => match radio.identify().await {
-            Ok(_) => format!(
-                "{interruption}; normal CAT is restored, but MCP exit reported: {recovery_error}"
-            ),
-            Err(probe_error) => format!(
-                "{interruption}; MCP exit and normal CAT recovery were not proved: \
-                 {recovery_error}; CAT probe also failed: {probe_error}; do not retry the \
-                 memory write blindly; fully power-cycle the radio and inspect Menu 650"
-            ),
+    // The caller proved the schema target with its own identity reads; the
+    // library owns both registry-pinned Menu 985 / Menu 650 offsets.
+    let operation = radio.set_reflector_terminal_mode_detached_unverified(pc_interface);
+    tokio::pin!(operation);
+    tokio::pin!(interrupt);
+    tokio::select! {
+        biased;
+        result = &mut operation => InterruptibleMcpOperation::Completed(result),
+        signal = &mut interrupt => {
+            // Latch termination, then let the bounded two-page operation
+            // finish its current exchange and cleanup. Dropping it here could
+            // turn a raw exit byte into page payload.
+            let completion = operation.await;
+            InterruptibleMcpOperation::Interrupted { signal, completion }
         },
     }
-}
-
-#[cfg(unix)]
-async fn mcp_termination_signal() -> std::io::Result<()> {
-    use tokio::signal::unix::{SignalKind, signal};
-
-    let mut terminate = signal(SignalKind::terminate())?;
-    let mut hangup = signal(SignalKind::hangup())?;
-    tokio::select! {
-        result = tokio::signal::ctrl_c() => result,
-        _ = terminate.recv() => Ok(()),
-        _ = hangup.recv() => Ok(()),
-    }
-}
-
-#[cfg(windows)]
-async fn mcp_termination_signal() -> std::io::Result<()> {
-    use tokio::signal::windows;
-
-    let mut ctrl_break = windows::ctrl_break()?;
-    let mut ctrl_close = windows::ctrl_close()?;
-    let mut ctrl_logoff = windows::ctrl_logoff()?;
-    let mut ctrl_shutdown = windows::ctrl_shutdown()?;
-    tokio::select! {
-        result = tokio::signal::ctrl_c() => result,
-        _ = ctrl_break.recv() => Ok(()),
-        _ = ctrl_close.recv() => Ok(()),
-        _ = ctrl_logoff.recv() => Ok(()),
-        _ = ctrl_shutdown.recv() => Ok(()),
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-async fn mcp_termination_signal() -> std::io::Result<()> {
-    tokio::signal::ctrl_c().await
 }
 
 const TERMINAL_MODE_TRANSITION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
@@ -2660,8 +2768,8 @@ fn validate_gateway_mcp_target(
         return Ok(());
     }
     Err(format!(
-        "refusing the Menu 650 write: MCP offset 0x1CA0 is qualified only for vendor firmware \
-         {MCP_D75_SCHEMA_FIRMWARE}; accepted exact CAT FV identities are \
+        "refusing the Menu 985 / Menu 650 update: MCP offsets 0x1093 and 0x1CA0 are qualified \
+         only for vendor firmware {MCP_D75_SCHEMA_FIRMWARE}; accepted exact CAT FV identities are \
          {MCP_D75_SCHEMA_FIRMWARE_IDENTITIES:?}, got {firmware}"
     ))
 }
@@ -2686,6 +2794,7 @@ fn validate_gateway_mcp_target(
 async fn ensure_terminal_mode(
     mut radio: Radio<EitherTransport>,
     process_signals: &ProcessSignalRouter,
+    pc_interface: PcOutputInterface,
 ) -> Result<Radio<EitherTransport>, (Option<Radio<EitherTransport>>, String)> {
     println!("Checking if radio is already in D-STAR gateway mode.");
     // The offset below is qualified only for the TH-D75 1.03 memory schema.
@@ -2718,8 +2827,8 @@ async fn ensure_terminal_mode(
     // Enabling Reflector Terminal Mode via an MCP write reboots the radio,
     // drops this connection, and eventually changes the interface protocol.
     println!(
-        "Verified {} firmware {firmware}; enabling D-STAR Reflector Terminal Mode via memory \
-         write.",
+        "Verified {} firmware {firmware}; routing DV Gateway to {pc_interface} and enabling \
+         Reflector Terminal Mode in one verified memory update.",
         identity.model
     );
     let mut critical_signals = match process_signals.begin_critical() {
@@ -2729,52 +2838,68 @@ async fn ensure_terminal_mode(
     // Detached: this write reboots the radio out of CAT mode, so the normal
     // exit-path CAT reconnect would race a deliberate protocol transition.
     // The identity-preserving diagnostic reopen below owns recovery.
-    let interrupt = async {
-        critical_signals
-            .recv()
-            .await
-            .map(|_signal| ())
-            .map_err(std::io::Error::other)
-    };
-    let page_update = match write_gateway_mode_with_interrupt(
-        &mut radio,
-        DvGatewayMode::ReflectorTerminal,
-        interrupt,
-    )
-    .await
-    {
-        Ok(update) => update,
-        Err(error) => {
-            // Once the page operation starts, an error or caught termination
-            // can mean the verified write landed even if recovery briefly
-            // proved CAT during the radio's early boot window. Never hand that
-            // handle back for ordinary CAT: the firmware may still switch to
-            // MMDVM tens of seconds later.
-            drop(radio.disconnect().await);
-            let signal_context = critical_signals
-                .last_signal()
-                .map_or_else(String::new, |signal| {
-                    format!("; {} signal received", signal.description())
-                });
-            let router_context = critical_signals
-                .finish()
-                .err()
-                .map_or_else(String::new, |finish_error| format!("; {finish_error}"));
-            return Err((
-                None,
-                format!(
-                    "{error}{signal_context}{router_context}; terminal-mode write outcome is \
-                     uncertain, so this connection was \
-                     closed instead of resuming CAT. Do not repeat the memory write blindly; \
-                     wait for the radio to finish booting and inspect Menu 650."
-                ),
-            ));
-        }
-    };
+    let interrupt = critical_signals.recv();
+    let page_update =
+        match write_terminal_mode_with_interrupt(&mut radio, pc_interface, interrupt).await {
+            InterruptibleMcpOperation::Completed(Ok(update)) => update,
+            InterruptibleMcpOperation::Completed(Err(error)) => {
+                // Once the page operation starts, its structured failure may
+                // report possible or verified writes. Never hand the handle
+                // back for CAT: firmware may still switch to MMDVM later.
+                drop(radio.disconnect().await);
+                let router_context = critical_signals
+                    .finish()
+                    .err()
+                    .map_or_else(String::new, |finish_error| format!("; {finish_error}"));
+                return Err((
+                    None,
+                    format!(
+                        "terminal-mode update completed with an error: {error}{router_context}. \
+                         The connection was closed instead of resuming CAT. Follow the nested \
+                         recovery guidance and use the reported possible/verified page lists; do \
+                         not repeat the memory update blindly."
+                    ),
+                ));
+            }
+            InterruptibleMcpOperation::Interrupted { signal, completion } => {
+                drop(radio.disconnect().await);
+                let signal = describe_mcp_interrupt(signal);
+                let router_context = critical_signals
+                    .finish()
+                    .err()
+                    .map_or_else(String::new, |error| format!("; {error}"));
+                let completion = match completion {
+                    Ok(DetachedMcpPageUpdate::ChangedRadioRebooting) => {
+                        "Menu 985 / Menu 650 changes were read-back verified and the radio is \
+                         rebooting"
+                            .to_owned()
+                    }
+                    Ok(DetachedMcpPageUpdate::UnchangedCatReady) => {
+                        "Menu 985 / Menu 650 already matched and MCP cleanup completed its radio \
+                         reset"
+                            .to_owned()
+                    }
+                    Err(error) => format!(
+                        "the bounded update completed with an error: {error}; use its \
+                         possible/verified page lists and recovery guidance"
+                    ),
+                };
+                return Err((
+                    None,
+                    format!(
+                        "{signal}{router_context}; {completion}. Terminal-mode transition proof \
+                         was stopped and the connection was closed."
+                    ),
+                ));
+            }
+        };
 
     match page_update {
         DetachedMcpPageUpdate::ChangedRadioRebooting => {
-            println!("Menu 650 changed; the radio is rebooting into terminal mode.");
+            println!(
+                "Menu 985 / Menu 650 update verified; the radio is rebooting into terminal mode \
+                 on {pc_interface}."
+            );
         }
         DetachedMcpPageUpdate::UnchangedCatReady => {
             // Even an unchanged MCP operation resets and re-enumerates the radio
@@ -2782,8 +2907,8 @@ async fn ensure_terminal_mode(
             // be only the early boot window before the terminal application takes
             // over, so it is not safe to hand this handle back as ordinary CAT.
             println!(
-                "Menu 650 was already Reflector Terminal. MCP exit reset the radio; waiting for \
-                 terminal mode on this same interface."
+                "Menu 985 already selected {pc_interface} and Menu 650 was already Reflector \
+                 Terminal. MCP exit reset the radio; waiting on this same interface."
             );
         }
     }
@@ -2793,7 +2918,7 @@ async fn ensure_terminal_mode(
     // takes over. Probe, then reopen this exact transport identity after every
     // negative result. A raw probe that lands in the temporary CAT window is
     // discarded with that reopen instead of contaminating a later ID command.
-    println!("Waiting for MMDVM on the selected interface.");
+    println!("Waiting for MMDVM on {pc_interface}.");
     let deadline = tokio::time::Instant::now() + TERMINAL_MODE_TRANSITION_TIMEOUT;
     loop {
         let outcome = {
@@ -2856,7 +2981,7 @@ async fn ensure_terminal_mode(
                     format!(
                         "Terminal-mode transition stopped because {reason}{additional_signal}. \
                          The connection was closed; wait for the radio to finish booting and do \
-                         not repeat the memory write blindly."
+                         not repeat the Menu 985 / Menu 650 update blindly."
                     ),
                 ));
             }
@@ -2876,11 +3001,9 @@ async fn ensure_terminal_mode(
     }
     Err((
         None,
-        "Terminal mode was enabled, but the selected link did not start answering MMDVM \
-         probes during the transition window.\n\
-         If the radio's screen shows TERM, check Menu 985 (DV Gateway PC Input/Output): it \
-         must be set to the interface you connected through (USB or Bluetooth).\n\
-         Not retrying the memory write, because another attempt would only reboot the radio \
+        "Menu 985 and Menu 650 were read-back verified, but the selected link did not start \
+         answering MMDVM probes during the transition window.\n\
+         Not retrying the memory update, because another attempt would only reboot the radio \
          again."
             .into(),
     ))
@@ -2891,6 +3014,7 @@ async fn start_dstar_repl(
     entry_radio: DstarEntryRadio,
     args: &[&str],
     process_signals: &ProcessSignalRouter,
+    endpoint_interface: transport::EndpointInterface,
 ) -> Option<ReplState> {
     if args.is_empty() {
         println!("Error: callsign required. Usage: dstar start <callsign> [reflector]");
@@ -2898,7 +3022,7 @@ async fn start_dstar_repl(
         return Some(entry_radio.into_repl_state());
     }
 
-    match enter_dstar(entry_radio, args, process_signals).await {
+    match enter_dstar(entry_radio, args, process_signals, endpoint_interface).await {
         Ok(mut session) => {
             if session.reflector.is_some() {
                 println!("Monitoring. Press Ctrl-C to return to prompt.");
@@ -2960,19 +3084,58 @@ fn parse_dstar_start(args: &[&str]) -> Result<DstarStartRequest, String> {
     })
 }
 
-/// Enter D-STAR gateway (MMDVM) mode.
+/// Produce a positively proved MMDVM owner for D-STAR startup.
 ///
 /// A CAT owner is qualified and transitioned into Reflector Terminal Mode via
-/// [`ensure_terminal_mode`]. A terminal owner already carries positive MMDVM
-/// framing proof and bypasses every CAT and MCP operation. Gateway-init errors
-/// return a terminal owner; validation and CAT-side preflight errors preserve
-/// the caller's original state.
+/// [`ensure_terminal_mode`]. An MMDVM owner already carries positive complete
+/// framing proof and bypasses every CAT and MCP operation.
 ///
 /// On a recoverable error, returns the radio with its protocol state attached.
+async fn prepare_dstar_radio(
+    entry_radio: DstarEntryRadio,
+    process_signals: &ProcessSignalRouter,
+    endpoint_interface: transport::EndpointInterface,
+) -> Result<Radio<EitherTransport>, (Option<DstarEntryRadio>, String)> {
+    match entry_radio {
+        DstarEntryRadio::Mmdvm(radio) => {
+            println!("Checking if radio is already in D-STAR gateway mode.");
+            println!("The selected link already speaks MMDVM.");
+            Ok(radio)
+        }
+        DstarEntryRadio::Cat(radio) => {
+            let pc_interface = match endpoint_interface {
+                transport::EndpointInterface::Known(interface) => interface,
+                transport::EndpointInterface::UnspecifiedExplicitPort => {
+                    return Err((
+                        Some(DstarEntryRadio::Cat(radio)),
+                        "the explicit serial port does not identify whether it is USB or \
+                         Bluetooth. Relaunch with --port-interface usb or \
+                         --port-interface bluetooth before enabling persistent D-STAR mode"
+                            .to_owned(),
+                    ));
+                }
+            };
+            match ensure_terminal_mode(radio, process_signals, pc_interface).await {
+                Ok(radio) => Ok(radio),
+                Err((Some(radio), error)) => {
+                    let (radio, error) = recover_cat_after_failed_mode_entry(radio, error).await;
+                    Err((radio.map(DstarEntryRadio::Cat), error))
+                }
+                Err((None, error)) => Err((None, error)),
+            }
+        }
+    }
+}
+
+/// Validate the request, acquire an MMDVM owner, and start D-STAR gateway mode.
+///
+/// Gateway-init errors return an MMDVM owner; validation and CAT-side
+/// preflight errors preserve the caller's original state when safe.
 async fn enter_dstar(
     entry_radio: DstarEntryRadio,
     args: &[&str],
     process_signals: &ProcessSignalRouter,
+    endpoint_interface: transport::EndpointInterface,
 ) -> Result<DstarSession, (Option<DstarEntryRadio>, String)> {
     let request = match parse_dstar_start(args) {
         Ok(request) => request,
@@ -2985,21 +3148,7 @@ async fn enter_dstar(
         link: link_arg,
     } = request;
 
-    let radio = match entry_radio {
-        DstarEntryRadio::Terminal(radio) => {
-            println!("Checking if radio is already in D-STAR gateway mode.");
-            println!("Radio is already in Reflector Terminal Mode.");
-            radio
-        }
-        DstarEntryRadio::Cat(radio) => match ensure_terminal_mode(radio, process_signals).await {
-            Ok(radio) => radio,
-            Err((Some(radio), error)) => {
-                let (radio, error) = recover_cat_after_failed_mode_entry(radio, error).await;
-                return Err((radio.map(DstarEntryRadio::Cat), error));
-            }
-            Err((None, error)) => return Err((None, error)),
-        },
-    };
+    let radio = prepare_dstar_radio(entry_radio, process_signals, endpoint_interface).await?;
 
     // Radio is now in MMDVM mode. Start the gateway.
     println!("Starting D-STAR gateway as {callsign}.");
@@ -3009,7 +3158,7 @@ async fn enter_dstar(
         Ok(gw) => gw,
         Err((radio, error)) => {
             return Err((
-                radio.map(DstarEntryRadio::Terminal),
+                radio.map(DstarEntryRadio::Mmdvm),
                 format!("Gateway init failed: {error}"),
             ));
         }
@@ -3585,9 +3734,10 @@ async fn exit_dstar(
     gw: DstarGateway<EitherTransport, PersistentMmdvm>,
     cli_port: Option<&str>,
     cli_baud: u32,
-) -> Result<Radio<EitherTransport>, String> {
+    port_interface_override: Option<PcOutputInterface>,
+) -> Result<(Radio<EitherTransport>, transport::EndpointInterface), String> {
     // Stop the gateway without sending the transient `TN 0,0` exit. Menu 650
-    // keeps this link in persistent Reflector Terminal Mode.
+    // keeps this link in its persistent DV Gateway/MMDVM mode.
     println!("Stopping D-STAR gateway.");
     let radio = gw
         .stop()
@@ -3597,7 +3747,7 @@ async fn exit_dstar(
     // Disconnect BT to release the RFCOMM channel.
     drop(radio.disconnect().await);
 
-    // The radio is still in Reflector Terminal Mode. Its gateway-owned link
+    // The radio is still in DV Gateway/MMDVM mode. Its gateway-owned link
     // does not route MCP entry, and this session does not own a qualified
     // transport on the other interface. The operator must change Menu 650 on
     // the front panel before this same-link reconnect can prove CAT.
@@ -3617,19 +3767,20 @@ async fn exit_dstar(
     println!("Reconnecting.");
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
-    let (_path, transport) = transport::discover_and_open(cli_port, cli_baud)
+    let opened = transport::discover_and_open(cli_port, cli_baud, port_interface_override)
         .map_err(|e| format!("Reconnect failed: {e}"))?;
 
-    let mut radio = Radio::connect_with_tnc_exit(transport)
+    let reopened_interface = opened.endpoint_interface;
+    let mut radio = Radio::connect_with_tnc_exit(opened.transport)
         .await
         .map_err(|e| format!("Connect failed: {e}"))?;
 
     // Verify we're back in CAT mode.
     if radio.identify().await.is_ok() {
         println!("Radio restored to normal mode.");
-        Ok(radio)
+        Ok((radio, reopened_interface))
     } else {
-        println!("Error: radio is still in Reflector Terminal Mode.");
+        println!("Error: radio is still in DV Gateway/MMDVM mode.");
         println!("Please set Menu 650 to Off and restart the REPL.");
         Err("Radio still in MMDVM mode".into())
     }
@@ -3999,6 +4150,10 @@ async fn dispatch_dstar(session: &mut DstarSession, cmd: &str, parts: &[&str]) {
                 );
                 return;
             }
+            if session.reflector.is_some() {
+                println!("Already linked. Run unlink before connecting to another reflector.");
+                return;
+            }
             let Some(&link_arg) = parts.get(1) else {
                 return;
             };
@@ -4030,17 +4185,8 @@ async fn dispatch_dstar(session: &mut DstarSession, cmd: &str, parts: &[&str]) {
             }
         }
         "unlink" => {
-            if let Some(ref mut client) = session.reflector {
-                match client.disconnect().await {
-                    Ok(()) => {
-                        aprintln!("Disconnected from reflector.");
-                        session.reflector = None;
-                    }
-                    Err(e) => println!(
-                        "{}",
-                        thd75_repl::output::error(format_args!("disconnecting: {e}"))
-                    ),
-                }
+            if let Some(mut reflector) = session.reflector.take() {
+                disconnect_reflector(&mut reflector).await;
             } else {
                 println!("Not connected to a reflector.");
             }
@@ -5019,19 +5165,23 @@ mod offset_tests {
 #[cfg(test)]
 mod gateway_off_tests {
     use super::{
-        DetachedMcpPageUpdate, DstarEntryRadio, PROCESS_SIGNAL_EXIT_CODE, ProcessSignal,
-        ProcessSignalRouter, ensure_terminal_mode, enter_dstar, route_process_signal,
-        run_set_gateway_off, validate_gateway_mcp_target, write_gateway_mode_with_interrupt,
+        DetachedMcpPageUpdate, DstarEntryRadio, InterruptibleMcpOperation,
+        PROCESS_SIGNAL_EXIT_CODE, ProcessSignal, ProcessSignalRouter,
+        clear_gateway_mode_with_interrupt, ensure_terminal_mode, enter_dstar, route_process_signal,
+        run_set_gateway_off, transport, validate_gateway_mcp_target,
+        write_terminal_mode_with_interrupt,
     };
-    use kenwood_thd75::types::DvGatewayMode;
+    use kenwood_thd75::types::PcOutputInterface;
 
-    /// Wire pins for the Menu 650 MCP scripts below. The production offset
-    /// is registry-pinned inside kenwood-thd75 (`radio/terminal_mode.rs`);
-    /// firmware-verified: the GW CAT handler reads this offset.
+    /// Wire pins for Menu 985 / Menu 650 scripts below. Production offsets
+    /// are registry-pinned inside `kenwood-thd75::radio::terminal_mode`.
+    const GATEWAY_INTERFACE_PAGE: u16 = 0x10;
+    /// Byte index of the Menu 985 DV Gateway interface value.
+    const GATEWAY_INTERFACE_BYTE: usize = 0x93;
+    /// Page containing Menu 650.
     const GATEWAY_MODE_PAGE: u16 = 0x1C;
     /// Byte index of the gateway mode value within its page.
     const GATEWAY_MODE_BYTE: usize = 0xA0;
-    use kenwood_thd75::error::TransportError;
     use kenwood_thd75::memory::MCP_D75_SCHEMA_FIRMWARE_IDENTITIES;
     use kenwood_thd75::protocol::programming;
     use kenwood_thd75::transport::{EitherTransport, MockTransport};
@@ -5047,6 +5197,92 @@ mod gateway_off_tests {
         response.extend_from_slice(&[b'W', page_hi, page_lo, 0, 0]);
         response.extend_from_slice(data);
         response
+    }
+
+    /// Queue one sparse update that changes both the selected interface and
+    /// the persistent gateway mode, including read-back verification.
+    fn expect_changed_terminal_mode_update(
+        mock: &mut MockTransport,
+        target: PcOutputInterface,
+    ) -> TestResult {
+        mock.expect(programming::ENTER_PROGRAMMING, programming::ENTER_RESPONSE);
+
+        let mut interface_original = [0x5A; programming::PAGE_SIZE];
+        interface_original[GATEWAY_INTERFACE_BYTE] = match target {
+            PcOutputInterface::Usb => u8::from(PcOutputInterface::Bluetooth),
+            PcOutputInterface::Bluetooth => u8::from(PcOutputInterface::Usb),
+        };
+        let mut interface_modified = interface_original;
+        interface_modified[GATEWAY_INTERFACE_BYTE] = u8::from(target);
+        let mut mode_original = [0x5A; programming::PAGE_SIZE];
+        mode_original[GATEWAY_MODE_BYTE] = 0;
+        let mut mode_modified = mode_original;
+        mode_modified[GATEWAY_MODE_BYTE] = 1;
+
+        let interface_read =
+            programming::build_read_command(programming::McpPage::new(GATEWAY_INTERFACE_PAGE)?);
+        mock.expect(
+            &interface_read,
+            &page_response(GATEWAY_INTERFACE_PAGE, &interface_original),
+        );
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+        let mode_read =
+            programming::build_read_command(programming::McpPage::new(GATEWAY_MODE_PAGE)?);
+        mock.expect(
+            &mode_read,
+            &page_response(GATEWAY_MODE_PAGE, &mode_original),
+        );
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+
+        let interface_write = programming::build_write_command(
+            programming::WritableMcpPage::new(GATEWAY_INTERFACE_PAGE)?,
+            &interface_modified,
+        );
+        mock.expect(&interface_write, &[programming::ACK]);
+        mock.expect(
+            &interface_read,
+            &page_response(GATEWAY_INTERFACE_PAGE, &interface_modified),
+        );
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+        let mode_write = programming::build_write_command(
+            programming::WritableMcpPage::new(GATEWAY_MODE_PAGE)?,
+            &mode_modified,
+        );
+        mock.expect(&mode_write, &[programming::ACK]);
+        mock.expect(
+            &mode_read,
+            &page_response(GATEWAY_MODE_PAGE, &mode_modified),
+        );
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+        mock.expect(&[programming::EXIT], &[programming::ACK]);
+        Ok(())
+    }
+
+    /// Queue reads proving that Menu 985 and Menu 650 already match.
+    fn expect_unchanged_terminal_mode_update(
+        mock: &mut MockTransport,
+        target: PcOutputInterface,
+    ) -> TestResult {
+        mock.expect(programming::ENTER_PROGRAMMING, programming::ENTER_RESPONSE);
+        let mut interface = [0x5A; programming::PAGE_SIZE];
+        interface[GATEWAY_INTERFACE_BYTE] = u8::from(target);
+        let mut mode = [0x5A; programming::PAGE_SIZE];
+        mode[GATEWAY_MODE_BYTE] = 1;
+        let interface_read =
+            programming::build_read_command(programming::McpPage::new(GATEWAY_INTERFACE_PAGE)?);
+        mock.expect(
+            &interface_read,
+            &page_response(GATEWAY_INTERFACE_PAGE, &interface),
+        );
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+        let mode_read =
+            programming::build_read_command(programming::McpPage::new(GATEWAY_MODE_PAGE)?);
+        mock.expect(&mode_read, &page_response(GATEWAY_MODE_PAGE, &mode));
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+        mock.expect(&[programming::EXIT], &[programming::ACK]);
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\x0D", b"ID TH-D75\x0D");
+        Ok(())
     }
 
     #[tokio::test]
@@ -5131,7 +5367,8 @@ mod gateway_off_tests {
 
         let radio = Radio::new(EitherTransport::Mock(mock));
         let signals = ProcessSignalRouter::disconnected_for_test();
-        let error = match ensure_terminal_mode(radio, &signals).await {
+        let error = match ensure_terminal_mode(radio, &signals, PcOutputInterface::Bluetooth).await
+        {
             Ok(_) => return Err("wrong-model terminal-mode write unexpectedly succeeded".into()),
             Err((_, error)) => error,
         };
@@ -5150,7 +5387,8 @@ mod gateway_off_tests {
 
         let radio = Radio::new(EitherTransport::Mock(mock));
         let signals = ProcessSignalRouter::disconnected_for_test();
-        let error = match ensure_terminal_mode(radio, &signals).await {
+        let error = match ensure_terminal_mode(radio, &signals, PcOutputInterface::Bluetooth).await
+        {
             Ok(_) => {
                 return Err("wrong-firmware terminal-mode write unexpectedly succeeded".into());
             }
@@ -5175,10 +5413,11 @@ mod gateway_off_tests {
 
         let radio = Radio::new(EitherTransport::Mock(mock));
         let signals = ProcessSignalRouter::disconnected_for_test();
-        let Err((Some(DstarEntryRadio::Terminal(mut radio)), error)) = enter_dstar(
-            DstarEntryRadio::Terminal(radio),
+        let Err((Some(DstarEntryRadio::Mmdvm(mut radio)), error)) = enter_dstar(
+            DstarEntryRadio::Mmdvm(radio),
             &["KQ4NIT", "REF030"],
             &signals,
+            transport::EndpointInterface::Known(PcOutputInterface::Bluetooth),
         )
         .await
         else {
@@ -5196,8 +5435,13 @@ mod gateway_off_tests {
 
         let radio = Radio::new(EitherTransport::Mock(mock));
         let signals = ProcessSignalRouter::disconnected_for_test();
-        let Err((Some(DstarEntryRadio::Cat(mut radio)), error)) =
-            enter_dstar(DstarEntryRadio::Cat(radio), &["KQ4NIT", "REF030"], &signals).await
+        let Err((Some(DstarEntryRadio::Cat(mut radio)), error)) = enter_dstar(
+            DstarEntryRadio::Cat(radio),
+            &["KQ4NIT", "REF030"],
+            &signals,
+            transport::EndpointInterface::Known(PcOutputInterface::Bluetooth),
+        )
+        .await
         else {
             return Err("invalid reflector did not preserve the untouched CAT radio".into());
         };
@@ -5214,25 +5458,7 @@ mod gateway_off_tests {
         let mut mock = MockTransport::new();
         mock.expect(b"ID\x0D", b"ID TH-D75\x0D");
         mock.expect(b"FV\x0D", b"FV 1.03.AZM\x0D");
-        mock.expect(programming::ENTER_PROGRAMMING, programming::ENTER_RESPONSE);
-
-        let mut original = [0x5A; programming::PAGE_SIZE];
-        original[GATEWAY_MODE_BYTE] = 0;
-        let read_command =
-            programming::build_read_command(programming::McpPage::new(GATEWAY_MODE_PAGE)?);
-        mock.expect(&read_command, &page_response(GATEWAY_MODE_PAGE, &original));
-        mock.expect(&[programming::ACK], &[programming::ACK]);
-
-        let mut modified = original;
-        modified[GATEWAY_MODE_BYTE] = 1;
-        let write_command = programming::build_write_command(
-            programming::WritableMcpPage::new(GATEWAY_MODE_PAGE)?,
-            &modified,
-        );
-        mock.expect(&write_command, &[programming::ACK]);
-        mock.expect(&read_command, &page_response(GATEWAY_MODE_PAGE, &modified));
-        mock.expect(&[programming::ACK], &[programming::ACK]);
-        mock.expect(&[programming::EXIT], &[programming::ACK]);
+        expect_changed_terminal_mode_update(&mut mock, PcOutputInterface::Bluetooth)?;
 
         // The first binary probe lands before terminal mode is ready. The
         // helper must reopen this same transport, issue no CAT command, and
@@ -5243,7 +5469,8 @@ mod gateway_off_tests {
 
         let radio = Radio::new(EitherTransport::Mock(mock));
         let signals = ProcessSignalRouter::disconnected_for_test();
-        let radio = match ensure_terminal_mode(radio, &signals).await {
+        let radio = match ensure_terminal_mode(radio, &signals, PcOutputInterface::Bluetooth).await
+        {
             Ok(radio) => radio,
             Err((_, error)) => return Err(error.into()),
         };
@@ -5257,31 +5484,40 @@ mod gateway_off_tests {
     }
 
     #[tokio::test]
+    async fn ambiguous_explicit_port_refuses_terminal_write_before_io() -> TestResult {
+        let mut mock = MockTransport::new();
+        // This identity exchange is intentionally queued for after the
+        // refusal. If entry touched the wire first, strict ordering fails.
+        mock.expect(b"ID\x0D", b"ID TH-D75\x0D");
+
+        let radio = Radio::new(EitherTransport::Mock(mock));
+        let signals = ProcessSignalRouter::disconnected_for_test();
+        let Err((Some(DstarEntryRadio::Cat(mut radio)), error)) = enter_dstar(
+            DstarEntryRadio::Cat(radio),
+            &["KQ4NIT"],
+            &signals,
+            transport::EndpointInterface::UnspecifiedExplicitPort,
+        )
+        .await
+        else {
+            return Err("ambiguous explicit port did not preserve the untouched CAT radio".into());
+        };
+        assert!(
+            error.contains("--port-interface usb") && error.contains("--port-interface bluetooth"),
+            "ambiguous-port refusal lost its exact recovery options: {error}"
+        );
+        assert_eq!(radio.identify().await?.model, RadioModel::ThD75);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn gateway_init_failure_keeps_the_recovered_radio_terminal_guarded() -> TestResult {
         tokio::task::LocalSet::new()
             .run_until(async {
                 let mut mock = MockTransport::new();
                 mock.expect(b"ID\x0D", b"ID TH-D75\x0D");
                 mock.expect(b"FV\x0D", b"FV 1.03.AZM\x0D");
-                mock.expect(programming::ENTER_PROGRAMMING, programming::ENTER_RESPONSE);
-
-                let mut original = [0x5A; programming::PAGE_SIZE];
-                original[GATEWAY_MODE_BYTE] = 0;
-                let read_command =
-                    programming::build_read_command(programming::McpPage::new(GATEWAY_MODE_PAGE)?);
-                mock.expect(&read_command, &page_response(GATEWAY_MODE_PAGE, &original));
-                mock.expect(&[programming::ACK], &[programming::ACK]);
-
-                let mut modified = original;
-                modified[GATEWAY_MODE_BYTE] = 1;
-                let write_command = programming::build_write_command(
-                    programming::WritableMcpPage::new(GATEWAY_MODE_PAGE)?,
-                    &modified,
-                );
-                mock.expect(&write_command, &[programming::ACK]);
-                mock.expect(&read_command, &page_response(GATEWAY_MODE_PAGE, &modified));
-                mock.expect(&[programming::ACK], &[programming::ACK]);
-                mock.expect(&[programming::EXIT], &[programming::ACK]);
+                expect_changed_terminal_mode_update(&mut mock, PcOutputInterface::Bluetooth)?;
 
                 // The bounded diagnosis consumes exactly the version frame;
                 // the following SetConfig NAK remains for gateway init.
@@ -5294,8 +5530,13 @@ mod gateway_off_tests {
 
                 let radio = Radio::new(EitherTransport::Mock(mock));
                 let signals = ProcessSignalRouter::disconnected_for_test();
-                let Err((Some(DstarEntryRadio::Terminal(_radio)), error)) =
-                    enter_dstar(DstarEntryRadio::Cat(radio), &["KQ4NIT"], &signals).await
+                let Err((Some(DstarEntryRadio::Mmdvm(_radio)), error)) = enter_dstar(
+                    DstarEntryRadio::Cat(radio),
+                    &["KQ4NIT"],
+                    &signals,
+                    transport::EndpointInterface::Known(PcOutputInterface::Bluetooth),
+                )
+                .await
                 else {
                     return Err::<(), Box<dyn std::error::Error>>(
                         "gateway init failure lost the retryable radio".into(),
@@ -5316,27 +5557,18 @@ mod gateway_off_tests {
         let mut mock = MockTransport::new();
         mock.expect(b"ID\x0D", b"ID TH-D75\x0D");
         mock.expect(b"FV\x0D", b"FV 1.03.AZM\x0D");
-        mock.expect(programming::ENTER_PROGRAMMING, programming::ENTER_RESPONSE);
+        expect_unchanged_terminal_mode_update(&mut mock, PcOutputInterface::Bluetooth)?;
 
-        let mut original = [0x5A; programming::PAGE_SIZE];
-        original[GATEWAY_MODE_BYTE] = 1;
-        let read_command =
-            programming::build_read_command(programming::McpPage::new(GATEWAY_MODE_PAGE)?);
-        mock.expect(&read_command, &page_response(GATEWAY_MODE_PAGE, &original));
-        mock.expect(&[programming::ACK], &[programming::ACK]);
-
-        // An unchanged MCP page still takes the normal exit path, whose radio
+        // An unchanged MCP update still takes the normal exit path, whose radio
         // reset and early CAT proof can precede the terminal application by
-        // tens of seconds. There is deliberately no page write here, but the
-        // high-level transition must continue until binary mode is proved.
-        mock.expect(&[programming::EXIT], &[programming::ACK]);
-        mock.expect_reopen(Ok(()));
-        mock.expect(b"ID\x0D", b"ID TH-D75\x0D");
+        // tens of seconds. There are deliberately no page writes here, but
+        // the high-level transition must continue until binary mode is proved.
         mock.expect(b"\xE0\x03\x00", b"\xE0\x0E\x00\x01MMDVM 2018");
 
         let radio = Radio::new(EitherTransport::Mock(mock));
         let signals = ProcessSignalRouter::disconnected_for_test();
-        let radio = match ensure_terminal_mode(radio, &signals).await {
+        let radio = match ensure_terminal_mode(radio, &signals, PcOutputInterface::Bluetooth).await
+        {
             Ok(radio) => radio,
             Err((_, error)) => return Err(error.into()),
         };
@@ -5356,24 +5588,7 @@ mod gateway_off_tests {
         let mut mock = MockTransport::new();
         mock.expect(b"ID\x0D", b"ID TH-D75\x0D");
         mock.expect(b"FV\x0D", b"FV 1.03.AZM\x0D");
-        mock.expect(programming::ENTER_PROGRAMMING, programming::ENTER_RESPONSE);
-
-        let mut original = [0x5A; programming::PAGE_SIZE];
-        original[GATEWAY_MODE_BYTE] = 0;
-        let read_command =
-            programming::build_read_command(programming::McpPage::new(GATEWAY_MODE_PAGE)?);
-        mock.expect(&read_command, &page_response(GATEWAY_MODE_PAGE, &original));
-        mock.expect(&[programming::ACK], &[programming::ACK]);
-        let mut modified = original;
-        modified[GATEWAY_MODE_BYTE] = 1;
-        let write_command = programming::build_write_command(
-            programming::WritableMcpPage::new(GATEWAY_MODE_PAGE)?,
-            &modified,
-        );
-        mock.expect(&write_command, &[programming::ACK]);
-        mock.expect(&read_command, &page_response(GATEWAY_MODE_PAGE, &modified));
-        mock.expect(&[programming::ACK], &[programming::ACK]);
-        mock.expect(&[programming::EXIT], &[programming::ACK]);
+        expect_changed_terminal_mode_update(&mut mock, PcOutputInterface::Bluetooth)?;
         mock.expect_hang(b"\xE0\x03\x00");
 
         let radio = Radio::new(EitherTransport::Mock(mock));
@@ -5383,7 +5598,7 @@ mod gateway_off_tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             route_process_signal(ProcessSignal::Terminate, &critical_slot);
         });
-        let result = ensure_terminal_mode(radio, &signals).await;
+        let result = ensure_terminal_mode(radio, &signals, PcOutputInterface::Bluetooth).await;
         interrupter.await?;
         let exit_code = PROCESS_SIGNAL_EXIT_CODE.swap(0, Ordering::AcqRel);
 
@@ -5496,71 +5711,45 @@ mod gateway_off_tests {
     }
 
     #[tokio::test]
-    async fn terminal_mode_enable_writes_and_verifies_menu_650() -> TestResult {
+    async fn terminal_mode_enable_writes_and_verifies_menu_985_and_menu_650() -> TestResult {
         let mut mock = MockTransport::new();
-        mock.expect(programming::ENTER_PROGRAMMING, programming::ENTER_RESPONSE);
-
-        let mut original = [0x5A; programming::PAGE_SIZE];
-        original[GATEWAY_MODE_BYTE] = 0;
-        let read_command =
-            programming::build_read_command(programming::McpPage::new(GATEWAY_MODE_PAGE)?);
-        mock.expect(&read_command, &page_response(GATEWAY_MODE_PAGE, &original));
-        mock.expect(&[programming::ACK], &[programming::ACK]);
-
-        let mut modified = original;
-        modified[GATEWAY_MODE_BYTE] = 1;
-        let write_command = programming::build_write_command(
-            programming::WritableMcpPage::new(GATEWAY_MODE_PAGE)?,
-            &modified,
-        );
-        mock.expect(&write_command, &[programming::ACK]);
-        mock.expect(&read_command, &page_response(GATEWAY_MODE_PAGE, &modified));
-        mock.expect(&[programming::ACK], &[programming::ACK]);
-        mock.expect(&[programming::EXIT], &[programming::ACK]);
+        expect_changed_terminal_mode_update(&mut mock, PcOutputInterface::Bluetooth)?;
 
         let mut radio = Radio::new(EitherTransport::Mock(mock));
-        let interrupt = std::future::pending::<std::io::Result<()>>();
-        let changed = write_gateway_mode_with_interrupt(
-            &mut radio,
-            DvGatewayMode::ReflectorTerminal,
-            interrupt,
-        )
-        .await
-        .map_err(std::io::Error::other)?;
+        let interrupt = std::future::pending::<Result<ProcessSignal, String>>();
+        let InterruptibleMcpOperation::Completed(Ok(changed)) =
+            write_terminal_mode_with_interrupt(&mut radio, PcOutputInterface::Bluetooth, interrupt)
+                .await
+        else {
+            return Err(
+                "uninterrupted terminal update did not return its successful result".into(),
+            );
+        };
         assert_eq!(changed, DetachedMcpPageUpdate::ChangedRadioRebooting);
         Ok(())
     }
 
     #[tokio::test]
-    async fn terminal_mode_enable_avoids_rewriting_existing_value() -> TestResult {
+    async fn terminal_mode_enable_avoids_rewriting_matching_route_and_mode() -> TestResult {
         let mut mock = MockTransport::new();
-        mock.expect(programming::ENTER_PROGRAMMING, programming::ENTER_RESPONSE);
-
-        let mut original = [0x5A; programming::PAGE_SIZE];
-        original[GATEWAY_MODE_BYTE] = 1;
-        let read_command =
-            programming::build_read_command(programming::McpPage::new(GATEWAY_MODE_PAGE)?);
-        mock.expect(&read_command, &page_response(GATEWAY_MODE_PAGE, &original));
-        mock.expect(&[programming::ACK], &[programming::ACK]);
-        mock.expect(&[programming::EXIT], &[programming::ACK]);
-        mock.expect_reopen(Ok(()));
-        mock.expect(b"ID\x0D", b"ID TH-D75\x0D");
+        expect_unchanged_terminal_mode_update(&mut mock, PcOutputInterface::Bluetooth)?;
 
         let mut radio = Radio::new(EitherTransport::Mock(mock));
-        let interrupt = std::future::pending::<std::io::Result<()>>();
-        let changed = write_gateway_mode_with_interrupt(
-            &mut radio,
-            DvGatewayMode::ReflectorTerminal,
-            interrupt,
-        )
-        .await
-        .map_err(std::io::Error::other)?;
+        let interrupt = std::future::pending::<Result<ProcessSignal, String>>();
+        let InterruptibleMcpOperation::Completed(Ok(changed)) =
+            write_terminal_mode_with_interrupt(&mut radio, PcOutputInterface::Bluetooth, interrupt)
+                .await
+        else {
+            return Err(
+                "uninterrupted unchanged update did not return its successful result".into(),
+            );
+        };
         assert_eq!(changed, DetachedMcpPageUpdate::UnchangedCatReady);
         Ok(())
     }
 
     #[tokio::test]
-    async fn interrupted_gateway_write_recovers_after_page_may_have_changed() -> TestResult {
+    async fn interrupted_gateway_write_reports_ambiguous_partial_progress() -> TestResult {
         let mut mock = MockTransport::new();
         mock.expect(programming::ENTER_PROGRAMMING, programming::ENTER_RESPONSE);
 
@@ -5582,59 +5771,55 @@ mod gateway_off_tests {
         mock.expect(&write_command, &[programming::ACK]);
         mock.expect_hang(&read_command);
 
-        mock.expect(&[programming::EXIT], &[programming::ACK]);
-        mock.expect_reopen(Ok(()));
-        mock.expect(b"ID\x0D", b"ID TH-D75\x0D");
-
         let mut radio = Radio::new(EitherTransport::Mock(mock));
         let interrupt = async {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            Ok::<(), std::io::Error>(())
+            Ok(ProcessSignal::Interrupt)
         };
-        let Err(error) =
-            write_gateway_mode_with_interrupt(&mut radio, DvGatewayMode::Off, interrupt).await
+        let InterruptibleMcpOperation::Interrupted {
+            signal: Ok(ProcessSignal::Interrupt),
+            completion: Err(error),
+        } = clear_gateway_mode_with_interrupt(&mut radio, interrupt).await
         else {
-            return Err("interrupted gateway write unexpectedly succeeded".into());
+            return Err("interrupted gateway write lost its signal or failure outcome".into());
         };
         assert!(
-            error.contains("setting may already have changed")
-                && error.contains("normal CAT recovery completed"),
-            "interruption guidance lost partial-write or recovery state: {error}"
+            error.requires_recovery()
+                && error.to_string().contains("possibly written pages: [")
+                && error.to_string().contains("verified pages: []")
+                && error.to_string().contains("wire boundary is ambiguous"),
+            "interruption outcome lost partial-write or ambiguous-boundary state: {error}"
         );
         Ok(())
     }
 
     #[tokio::test]
-    async fn interrupted_gateway_write_with_unproved_exit_requires_power_cycle() -> TestResult {
+    async fn interrupted_terminal_read_with_unproved_boundary_requires_recovery() -> TestResult {
         let mut mock = MockTransport::new();
         mock.expect(programming::ENTER_PROGRAMMING, programming::ENTER_RESPONSE);
 
         let read_command =
-            programming::build_read_command(programming::McpPage::new(GATEWAY_MODE_PAGE)?);
+            programming::build_read_command(programming::McpPage::new(GATEWAY_INTERFACE_PAGE)?);
         mock.expect_hang(&read_command);
-        mock.expect(&[programming::EXIT], &[programming::ACK]);
-        mock.expect_reopen(Err(TransportError::ReopenUnsupported));
 
         let mut radio = Radio::new(EitherTransport::Mock(mock));
         let interrupt = async {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            Ok::<(), std::io::Error>(())
+            Ok(ProcessSignal::Interrupt)
         };
-        let Err(error) = write_gateway_mode_with_interrupt(
-            &mut radio,
-            DvGatewayMode::ReflectorTerminal,
-            interrupt,
-        )
-        .await
+        let InterruptibleMcpOperation::Interrupted {
+            signal: Ok(ProcessSignal::Interrupt),
+            completion: Err(error),
+        } = write_terminal_mode_with_interrupt(&mut radio, PcOutputInterface::Bluetooth, interrupt)
+            .await
         else {
-            return Err("interrupted gateway write unexpectedly succeeded".into());
+            return Err("interrupted terminal read lost its signal or failure outcome".into());
         };
         assert!(
-            error.contains("setting may already have changed")
-                && error.contains("were not proved")
-                && error.contains("do not retry")
-                && error.contains("fully power-cycle"),
-            "unproved-exit guidance was incomplete: {error}"
+            error.requires_recovery()
+                && error.to_string().contains("possibly written pages: []")
+                && error.to_string().contains("wire boundary is ambiguous"),
+            "unproved-boundary outcome was incomplete: {error}"
         );
         Ok(())
     }

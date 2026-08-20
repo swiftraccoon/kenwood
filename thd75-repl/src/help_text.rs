@@ -173,9 +173,9 @@ aprs start MYCALL 7: Enter APRS mode with callsign and SSID
 -- D-STAR gateway mode --
 dstar start MYCALL XRF030C: Enter D-STAR gateway with reflector";
 
-/// Help shown when startup proved persistent MMDVM framing but no gateway
-/// session is active yet.
-pub const TERMINAL_MODE_HELP: &str = "The radio is in D-STAR Reflector Terminal Mode.
+/// Help shown when startup proved MMDVM framing but no gateway session is
+/// active yet. Framing alone does not identify the Menu 650 mode.
+pub const MMDVM_MODE_HELP: &str = "The selected radio link speaks DV Gateway/MMDVM.
 CAT commands are unavailable on this link.
 dstar start MYCALL: Start the D-STAR gateway without a reflector
 dstar start MYCALL REF030C: Start and connect to a reflector
@@ -523,7 +523,7 @@ mod tests {
     fn mode_help_texts_pass_lint() {
         for (name, text) in [
             ("CAT_MODE_HELP", CAT_MODE_HELP),
-            ("TERMINAL_MODE_HELP", TERMINAL_MODE_HELP),
+            ("MMDVM_MODE_HELP", MMDVM_MODE_HELP),
             ("APRS_MODE_HELP", APRS_MODE_HELP),
             ("DSTAR_MODE_HELP", DSTAR_MODE_HELP),
         ] {

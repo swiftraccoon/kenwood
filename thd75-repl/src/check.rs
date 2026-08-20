@@ -403,7 +403,7 @@ fn gen_mode_help() -> Vec<String> {
     let mut v = Vec::new();
     for blob in [
         help_text::CAT_MODE_HELP,
-        help_text::TERMINAL_MODE_HELP,
+        help_text::MMDVM_MODE_HELP,
         help_text::APRS_MODE_HELP,
         help_text::DSTAR_MODE_HELP,
     ] {

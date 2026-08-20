@@ -117,8 +117,8 @@ fn terminal_mode_guard_intercepts_cat_commands() -> TestResult {
     let (_ok, stdout, stderr) = run_with_script("terminal_mode.txt", "mmdvm")?;
 
     assert!(
-        stdout.contains("Reflector Terminal Mode"),
-        "missing terminal-mode notice in stdout:\n{stdout}\nstderr:\n{stderr}"
+        stdout.contains("DV Gateway/MMDVM mode"),
+        "missing MMDVM-mode notice in stdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
         stdout.contains("650"),
@@ -149,11 +149,11 @@ fn terminal_mode_starts_dstar_without_cat_recovery() -> TestResult {
         "terminal-mode D-STAR startup failed; stdout={stdout:?} stderr={stderr:?}"
     );
     for expected in [
-        "Radio is in D-STAR Reflector Terminal Mode.",
-        "Radio is already in Reflector Terminal Mode.",
+        "Radio is in DV Gateway/MMDVM mode.",
+        "The selected link already speaks MMDVM.",
         "MMDVM modem initialized.",
         "D-STAR gateway active.",
-        "The radio is still in Reflector Terminal Mode.",
+        "The radio is still in DV Gateway/MMDVM mode.",
         "Goodbye.",
     ] {
         assert!(
