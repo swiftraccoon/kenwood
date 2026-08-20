@@ -12,8 +12,8 @@
 //!   rejection, and click-free stream edges for on-device monitoring.
 //! - [`cat`]: minimal CAT codec covering the `ID` identify and `FV`
 //!   firmware-version commands.
-//! - [`mcp`]: programming-protocol primitives for flipping menu 650
-//!   (DV Gateway) into Reflector Terminal Mode.
+//! - [`mcp`]: programming-protocol primitives plus the qualified Menu 985
+//!   and Menu 650 schema for entering Reflector Terminal Mode.
 //! - [`mmdvm`]: MMDVM frame codec and the `GetVersion` probe used for
 //!   radio-mode detection.
 //! - [`reflector`]: `DPlus` / `DExtra` / `DCS` reflector list loaded
@@ -45,13 +45,16 @@ pub mod session;
 pub use audio::{RxAudioPipeline, RxStreamEnd, RxStreamStats};
 pub use cat::{CatCommand, CatResponse, encode_cat, parse_cat_line};
 pub use mcp::{
-    GATEWAY_MODE_ACCESS_POINT, GATEWAY_MODE_OFF, GATEWAY_MODE_OFFSET,
-    GATEWAY_MODE_REFLECTOR_TERMINAL, McpError, McpPage, build_enter_cmd, build_exit_cmd,
-    build_read_page_cmd, build_write_page_cmd, byte_of, page_of, parse_w_frame, patch_page_byte,
+    GATEWAY_INTERFACE_OFFSET, GATEWAY_MODE_ACCESS_POINT, GATEWAY_MODE_OFF, GATEWAY_MODE_OFFSET,
+    GATEWAY_MODE_REFLECTOR_TERMINAL, MCP_D75_SCHEMA_FIRMWARE_IDENTITIES, MCP_D75_SCHEMA_MODEL,
+    McpD75SchemaTarget, McpError, McpPage, PcOutputInterface, ReflectorTerminalSettings,
+    build_enter_cmd, build_exit_cmd, build_read_page_cmd, build_write_page_cmd, byte_of,
+    mcp_d75_schema_target, page_of, parse_w_frame, patch_page_byte, reflector_terminal_settings,
 };
 pub use mmdvm::{
     MMDVM_CMD_GET_VERSION, MMDVM_START_BYTE, MmdvmDecodeResult, MmdvmFrame, MmdvmFrameError,
-    build_mmdvm_frame, decode_mmdvm_bytes, looks_like_mmdvm_response, mmdvm_get_version_probe,
+    MmdvmVersionResponse, build_mmdvm_frame, decode_mmdvm_bytes, mmdvm_get_version_probe,
+    parse_mmdvm_version_payload,
 };
 pub use reflector::{
     DirectoryEntry, DirectorySource, Reflector, ReflectorProtocol, default_reflectors,

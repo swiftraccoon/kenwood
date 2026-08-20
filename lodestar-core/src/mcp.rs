@@ -25,10 +25,11 @@
 //!
 //! # Reflector Terminal Mode
 //!
-//! Menu 650 (DV Gateway) lives at MCP offset
-//! [`GATEWAY_MODE_OFFSET`] (`0x1CA0`). Setting this byte to
-//! `1` puts the radio into Reflector Terminal Mode after the next
-//! reboot (the radio reboots on `E` / transport close).
+//! Reflector Terminal Mode is a paired setting: Menu 985 selects the
+//! physical PC interface and Menu 650 selects the gateway mode. The typed
+//! schema returned by [`reflector_terminal_settings`] keeps both offsets and
+//! stored values on the Rust side so Swift never duplicates firmware-specific
+//! constants.
 
 use thiserror::Error;
 
@@ -62,8 +63,11 @@ pub const MAX_WRITABLE_PAGE: u16 = 1952; // 0x07A0
 /// Values: `0` = Off, `1` = Reflector Terminal, `2` = Access Point.
 /// Setting this to `1` and exiting programming mode puts the radio
 /// into Reflector Terminal mode on the next reboot, at which point
-/// the BT SPP speaks MMDVM binary framing instead of CAT ASCII.
+/// the selected PC interface speaks MMDVM binary framing instead of CAT ASCII.
 pub const GATEWAY_MODE_OFFSET: u16 = 0x1CA0;
+
+/// MCP byte offset of the DV Gateway interface setting (Menu 985).
+pub const GATEWAY_INTERFACE_OFFSET: u16 = 0x1093;
 
 /// Gateway mode value: Off.
 pub const GATEWAY_MODE_OFF: u8 = 0;
@@ -71,6 +75,77 @@ pub const GATEWAY_MODE_OFF: u8 = 0;
 pub const GATEWAY_MODE_REFLECTOR_TERMINAL: u8 = 1;
 /// Gateway mode value: Access Point.
 pub const GATEWAY_MODE_ACCESS_POINT: u8 = 2;
+
+/// Exact CAT model qualified for the bundled MCP-D75 schema.
+pub const MCP_D75_SCHEMA_MODEL: &str = "TH-D75";
+
+/// Exact CAT firmware identities qualified for the bundled MCP-D75 schema.
+pub const MCP_D75_SCHEMA_FIRMWARE_IDENTITIES: &[&str] = &["1.03", "1.03.000", "1.03.AZM"];
+
+/// Physical host interface selected by Menu 985.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum PcOutputInterface {
+    /// USB CDC data interface.
+    Usb,
+    /// Bluetooth Classic SPP interface.
+    Bluetooth,
+}
+
+impl PcOutputInterface {
+    const fn stored_value(self) -> u8 {
+        match self {
+            Self::Usb => 0,
+            Self::Bluetooth => 1,
+        }
+    }
+}
+
+/// Exact model and firmware identities accepted for MCP-D75 schema access.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct McpD75SchemaTarget {
+    /// Exact CAT `ID` model string.
+    pub model: String,
+    /// Exact CAT `FV` strings whose memory layout has been qualified.
+    pub firmware_identities: Vec<String>,
+}
+
+/// Firmware-specific stored fields used to enter Reflector Terminal Mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct ReflectorTerminalSettings {
+    /// MCP offset of Menu 985.
+    pub interface_offset: u16,
+    /// Stored Menu 985 value for the requested physical link.
+    pub interface_value: u8,
+    /// MCP offset of Menu 650.
+    pub mode_offset: u16,
+    /// Stored Menu 650 value for Reflector Terminal Mode.
+    pub mode_value: u8,
+}
+
+/// Return the exact MCP-D75 schema qualification contract.
+#[must_use]
+#[uniffi::export]
+pub fn mcp_d75_schema_target() -> McpD75SchemaTarget {
+    McpD75SchemaTarget {
+        model: MCP_D75_SCHEMA_MODEL.to_owned(),
+        firmware_identities: MCP_D75_SCHEMA_FIRMWARE_IDENTITIES
+            .iter()
+            .map(|identity| (*identity).to_owned())
+            .collect(),
+    }
+}
+
+/// Return the paired Menu 985 and Menu 650 values for one host interface.
+#[must_use]
+#[uniffi::export]
+pub fn reflector_terminal_settings(interface: PcOutputInterface) -> ReflectorTerminalSettings {
+    ReflectorTerminalSettings {
+        interface_offset: GATEWAY_INTERFACE_OFFSET,
+        interface_value: interface.stored_value(),
+        mode_offset: GATEWAY_MODE_OFFSET,
+        mode_value: GATEWAY_MODE_REFLECTOR_TERMINAL,
+    }
+}
 
 /// Errors surfaced by the MCP primitives.
 #[derive(Debug, Clone, Error, PartialEq, Eq, uniffi::Error)]
@@ -272,10 +347,12 @@ pub fn patch_page_byte(page_data: Vec<u8>, offset: u8, value: u8) -> Result<Vec<
 #[cfg(test)]
 mod tests {
     use super::{
-        ACK, ENTER_PROGRAMMING_CMD, EXIT_CMD, GATEWAY_MODE_OFFSET, GATEWAY_MODE_REFLECTOR_TERMINAL,
-        MAX_WRITABLE_PAGE, McpError, PAGE_SIZE, W_FRAME_SIZE, build_enter_cmd, build_exit_cmd,
-        build_read_page_cmd, build_write_page_cmd, byte_of, page_of, parse_w_frame,
-        patch_page_byte,
+        ACK, ENTER_PROGRAMMING_CMD, EXIT_CMD, GATEWAY_INTERFACE_OFFSET, GATEWAY_MODE_OFFSET,
+        GATEWAY_MODE_REFLECTOR_TERMINAL, MAX_WRITABLE_PAGE, MCP_D75_SCHEMA_FIRMWARE_IDENTITIES,
+        MCP_D75_SCHEMA_MODEL, McpError, PAGE_SIZE, PcOutputInterface, W_FRAME_SIZE,
+        build_enter_cmd, build_exit_cmd, build_read_page_cmd, build_write_page_cmd, byte_of,
+        mcp_d75_schema_target, page_of, parse_w_frame, patch_page_byte,
+        reflector_terminal_settings,
     };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -395,6 +472,37 @@ mod tests {
     fn page_and_byte_of_gateway_offset() {
         assert_eq!(page_of(GATEWAY_MODE_OFFSET), 0x1C);
         assert_eq!(byte_of(GATEWAY_MODE_OFFSET), 0xA0);
+    }
+
+    #[test]
+    fn terminal_schema_maps_both_physical_interfaces() {
+        let usb = reflector_terminal_settings(PcOutputInterface::Usb);
+        let bluetooth = reflector_terminal_settings(PcOutputInterface::Bluetooth);
+
+        assert_eq!(usb.interface_offset, GATEWAY_INTERFACE_OFFSET);
+        assert_eq!(usb.interface_value, 0);
+        assert_eq!(bluetooth.interface_offset, GATEWAY_INTERFACE_OFFSET);
+        assert_eq!(bluetooth.interface_value, 1);
+        assert_eq!(usb.mode_offset, GATEWAY_MODE_OFFSET);
+        assert_eq!(usb.mode_value, GATEWAY_MODE_REFLECTOR_TERMINAL);
+        assert_eq!(bluetooth.mode_offset, GATEWAY_MODE_OFFSET);
+        assert_eq!(bluetooth.mode_value, GATEWAY_MODE_REFLECTOR_TERMINAL);
+    }
+
+    #[test]
+    fn schema_target_includes_azimuth_firmware_identity() {
+        let target = mcp_d75_schema_target();
+        assert_eq!(target.model, MCP_D75_SCHEMA_MODEL);
+        assert_eq!(
+            target.firmware_identities,
+            MCP_D75_SCHEMA_FIRMWARE_IDENTITIES
+        );
+        assert!(
+            target
+                .firmware_identities
+                .iter()
+                .any(|identity| identity == "1.03.AZM")
+        );
     }
 
     #[test]

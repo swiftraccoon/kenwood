@@ -11,20 +11,20 @@
 //! - Build MMDVM frames (for example, `GetVersion` for mode probing and
 //!   D-STAR header, data, and end-of-transmission frames for voice relay).
 //! - Decode arbitrary MMDVM bytes coming off the radio.
-//! - Detect whether the radio is currently in MMDVM mode by looking
-//!   at the first byte of a response: `0xE0` means MMDVM, anything
-//!   else (or silence / `'?'` / `'N'`) means CAT.
+//! - Prove MMDVM mode by decoding a complete response to `GetVersion`.
+//!   A leading `0xE0` without a complete frame is never sufficient proof.
 //!
 //! Heavy lifting lives in the `mmdvm-core` crate; this module is a
 //! thin `UniFFI` wrapper.
 
 use mmdvm_core::frame::{MmdvmFrame as CoreFrame, decode_frame, encode_frame};
-use mmdvm_core::{MMDVM_FRAME_START, MMDVM_GET_VERSION};
+use mmdvm_core::{MMDVM_FRAME_START, MMDVM_GET_VERSION, VersionResponse as CoreVersionResponse};
 use thiserror::Error;
 
-/// The MMDVM frame-start byte (`0xE0`). A response from the radio
-/// starting with this byte means it's in MMDVM (Reflector Terminal)
-/// mode; CAT mode won't produce this byte.
+/// The MMDVM frame-start byte (`0xE0`).
+///
+/// This byte identifies a candidate frame. Callers must decode the complete
+/// frame before treating a transport as MMDVM.
 pub const MMDVM_START_BYTE: u8 = MMDVM_FRAME_START;
 
 /// MMDVM `GetVersion` command byte (`0x00`).
@@ -62,6 +62,9 @@ pub enum MmdvmFrameError {
         /// The unexpected byte.
         actual: u8,
     },
+    /// `GetVersion` payload was not a proved protocol v1/v2 response.
+    #[error("invalid MMDVM GetVersion response payload")]
+    InvalidVersionResponse,
 }
 
 impl From<mmdvm_core::MmdvmError> for MmdvmFrameError {
@@ -75,6 +78,7 @@ impl From<mmdvm_core::MmdvmError> for MmdvmFrameError {
                 got: u32::from(len),
             },
             mmdvm_core::MmdvmError::InvalidStartByte { got } => Self::BadStart { actual: got },
+            mmdvm_core::MmdvmError::InvalidVersionResponse => Self::InvalidVersionResponse,
             // Response-parsing errors (wrong status layout, version
             // payload) aren't reachable from `encode_frame` or
             // `decode_frame`, but enum is `#[non_exhaustive]` so cover them.
@@ -118,6 +122,15 @@ pub struct MmdvmDecodeResult {
     /// Number of bytes consumed. `0` means the buffer holds a partial
     /// frame; the caller should keep accumulating and try again.
     pub bytes_consumed: u32,
+}
+
+/// Proved protocol and description from an MMDVM `GetVersion` payload.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MmdvmVersionResponse {
+    /// MMDVM protocol version. Lodestar accepts only version 1 or 2.
+    pub protocol: u8,
+    /// Nonempty modem description supplied by the radio.
+    pub description: String,
 }
 
 /// Build the 3-byte `GetVersion` probe frame: `[0xE0, 0x03, 0x00]`.
@@ -166,27 +179,40 @@ pub fn decode_mmdvm_bytes(bytes: Vec<u8>) -> Result<MmdvmDecodeResult, MmdvmFram
     }
 }
 
-/// Quick test used by mode-probe callers: is the first byte `0xE0`?
+/// Parse and validate one MMDVM `GetVersion` response payload.
 ///
-/// Returning `true` is the cheapest possible signal that the radio is
-/// in Reflector Terminal Mode. A caller who wants more certainty can
-/// feed the same bytes through [`decode_mmdvm_bytes`] to verify a
-/// full frame parses out.
-#[must_use]
+/// This rejects an echoed three-byte request because that frame has no
+/// payload. A response proves terminal mode only when it reports protocol 1
+/// or 2 and includes a nonempty description.
+///
+/// # Errors
+///
+/// Returns [`MmdvmFrameError::InvalidVersionResponse`] for an empty,
+/// truncated, unsupported, or description-free payload.
 #[expect(
     clippy::needless_pass_by_value,
-    reason = "UniFFI FFI boundary: takes owned `Vec<u8>` so Swift can hand it in directly."
+    reason = "UniFFI FFI boundary: `sequence<u8>` in UDL maps to owned `Vec<u8>`."
 )]
 #[uniffi::export]
-pub fn looks_like_mmdvm_response(bytes: Vec<u8>) -> bool {
-    bytes.first().copied() == Some(MMDVM_FRAME_START)
+pub fn parse_mmdvm_version_payload(
+    payload: Vec<u8>,
+) -> Result<MmdvmVersionResponse, MmdvmFrameError> {
+    let version = CoreVersionResponse::parse(&payload)
+        .map_err(|_| MmdvmFrameError::InvalidVersionResponse)?;
+    if !matches!(version.protocol, 1 | 2) || version.description.is_empty() {
+        return Err(MmdvmFrameError::InvalidVersionResponse);
+    }
+    Ok(MmdvmVersionResponse {
+        protocol: version.protocol,
+        description: version.description,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         MMDVM_CMD_GET_VERSION, MMDVM_START_BYTE, MmdvmFrameError, build_mmdvm_frame,
-        decode_mmdvm_bytes, looks_like_mmdvm_response, mmdvm_get_version_probe,
+        decode_mmdvm_bytes, mmdvm_get_version_probe, parse_mmdvm_version_payload,
     };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -257,18 +283,17 @@ mod tests {
     }
 
     #[test]
-    fn looks_like_mmdvm_happy() {
-        assert!(looks_like_mmdvm_response(vec![0xE0, 0x03, 0x00]));
-    }
+    fn version_payload_requires_supported_protocol_and_description() -> TestResult {
+        let parsed = parse_mmdvm_version_payload(b"\x01MMDVM 2018".to_vec())?;
+        assert_eq!(parsed.protocol, 1);
+        assert_eq!(parsed.description, "MMDVM 2018");
 
-    #[test]
-    fn looks_like_mmdvm_rejects_cat() {
-        assert!(!looks_like_mmdvm_response(vec![b'?', b'\r']));
-        assert!(!looks_like_mmdvm_response(vec![b'I', b'D', b' ']));
-    }
-
-    #[test]
-    fn looks_like_mmdvm_rejects_empty() {
-        assert!(!looks_like_mmdvm_response(vec![]));
+        for invalid in [vec![], vec![1], b"\x03MMDVM".to_vec()] {
+            assert_eq!(
+                parse_mmdvm_version_payload(invalid),
+                Err(MmdvmFrameError::InvalidVersionResponse)
+            );
+        }
+        Ok(())
     }
 }
