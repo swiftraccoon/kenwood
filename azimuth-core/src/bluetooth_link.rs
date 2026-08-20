@@ -1,9 +1,6 @@
 //! Swift-facing macOS Bluetooth Classic SPP byte transport.
 
-use std::sync::{
-    Arc, Mutex as StandardMutex,
-    atomic::{AtomicU8, Ordering},
-};
+use std::sync::{Arc, Mutex as StandardMutex};
 
 use kenwood_thd75::types::SerialNumber;
 
@@ -15,17 +12,17 @@ use kenwood_thd75::{
     transport::{BluetoothTransport, Transport},
 };
 #[cfg(target_os = "macos")]
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(target_os = "macos")]
 use tokio::sync::{Mutex, Notify};
 
+use crate::terminal_mode::canonicalize_bluetooth_address;
 #[cfg(test)]
 use crate::terminal_mode::is_exact_bluetooth_address;
-use crate::terminal_mode::{RecoveryCancellation, canonicalize_bluetooth_address};
 #[cfg(target_os = "macos")]
 use crate::terminal_mode::{
-    bundled_bluetooth_helper_executable, enumerate_bluetooth_candidates,
-    open_selected_bluetooth_transport, scan_unhinted_bluetooth_candidates, transport_error_detail,
+    RecoveryCancellation, bundled_bluetooth_helper_executable, enumerate_paired_bluetooth_devices,
+    open_selected_bluetooth_transport, transport_error_detail,
 };
 
 /// Largest byte vector accepted by one Swift-facing link operation.
@@ -35,85 +32,28 @@ use crate::terminal_mode::{
 /// allocation from becoming an unbounded helper-pipe operation.
 const MAXIMUM_BLUETOOTH_TRANSFER_BYTES: u32 = 4_096;
 
-/// A paired macOS Bluetooth Classic SPP candidate.
+/// A paired macOS Bluetooth Classic device.
 ///
 /// `display_name` is presentation only. `address` is the exact stable selector
 /// that must be passed back when constructing an address-bound link.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
-pub struct BluetoothRadioCandidate {
+pub struct BluetoothPairedDevice {
     /// Exact Bluetooth address returned by `IOBluetooth`.
     pub address: String,
     /// Human-readable paired-device name.
     pub display_name: String,
 }
 
-/// One bounded paired-device discovery snapshot for the radio picker.
+/// One bounded paired-device discovery snapshot for the connection picker.
 ///
-/// `likely_radio_candidates` contains only devices with native cached-SPP or
-/// D75-name evidence. `total_paired_device_count` covers the complete bounded
-/// snapshot, including custom-named radios without either hint. The latter lets
-/// Azimuth truthfully offer exact USB-serial matching without presenting every
-/// paired phone or headset as though it were a radio.
+/// Every record is an unqualified paired device. Its exact address is stable
+/// selection identity; its display name is presentation only. Opening a record
+/// still requires strict CAT identity qualification before Azimuth treats it
+/// as a TH-D75.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
-pub struct BluetoothRadioDiscovery {
-    /// Paired devices carrying non-authoritative TH-D75 candidate evidence.
-    pub likely_radio_candidates: Vec<BluetoothRadioCandidate>,
-    /// Sorted canonical address inventory for pruning stale qualified rows.
-    ///
-    /// These addresses are membership evidence only and must not be presented
-    /// as radio choices without likely-candidate or CAT proof.
-    pub paired_device_addresses: Vec<String>,
-    /// Number of all paired devices in this same bounded native snapshot.
-    pub total_paired_device_count: u32,
-}
-
-/// One custom-named radio proved by exact CAT identity during a bounded scan.
-///
-/// The proof is intentionally repeated whenever this endpoint later opens;
-/// discovery does not turn a transient observation into permanent trust.
-#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
-pub struct QualifiedBluetoothRadioCandidate {
-    /// Exact paired Bluetooth address.
-    pub address: String,
-    /// Human-readable name cached by macOS.
-    pub display_name: String,
-    /// Exact eight-character CAT serial observed during this scan.
-    pub cat_serial_number: String,
-}
-
-/// Result of one explicit bounded custom-name radio search.
-#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
-pub struct BluetoothRadioSearchResult {
-    /// Only candidates that answered as an exact TH-D75 and returned valid AE.
-    pub radio_candidates: Vec<QualifiedBluetoothRadioCandidate>,
-    /// Likely radio candidates from the same paired-device snapshot.
-    ///
-    /// This allows the picker to atomically promote a formerly unhinted device
-    /// without retaining a duplicate custom-search row.
-    pub likely_radio_candidates: Vec<BluetoothRadioCandidate>,
-    /// Full sorted canonical paired-device address inventory from this search.
-    ///
-    /// These addresses are membership evidence only. They let the caller
-    /// prune previously qualified rows that are no longer paired.
-    pub paired_device_addresses: Vec<String>,
-    /// Number of all paired devices in the same search snapshot.
-    pub total_paired_device_count: u32,
-    /// Canonical exact addresses whose proof completed during this pass.
-    pub completed_probe_addresses: Vec<String>,
-    /// Prior exclusions still present in the current unhinted inventory plus
-    /// this pass's completed probes, sorted and deduplicated.
-    pub current_completed_probe_addresses: Vec<String>,
-    /// Number of unhinted candidate probes that completed during this pass.
-    pub completed_probe_count: u32,
-    /// Number of unhinted devices in the operation's paired snapshot.
-    pub total_unhinted_candidate_count: u32,
-    /// Whether every unhinted device fit within the count and time bounds.
-    pub is_complete: bool,
-    /// Whether cancellation stopped this pass before it became complete.
-    pub was_cancelled: bool,
-    /// Whether count and current-address metadata came from a completed paired
-    /// snapshot. This is false only when cancellation interrupted enumeration.
-    pub has_inventory_snapshot: bool,
+pub struct BluetoothDeviceDiscovery {
+    /// Every paired device from the bounded native snapshot.
+    pub devices: Vec<BluetoothPairedDevice>,
 }
 
 /// How a normal Azimuth Bluetooth link chooses one paired radio.
@@ -125,7 +65,7 @@ pub enum BluetoothLinkTarget {
         /// [`discover_paired_bluetooth_devices`].
         address: String,
     },
-    /// Enumerate paired candidates and select only the radio whose CAT serial
+    /// Enumerate paired devices and select only the radio whose CAT serial
     /// exactly matches the stable serial previously learned from USB.
     ExpectedUsbSerial {
         /// Exact validated eight-character TH-D75 serial number.
@@ -194,12 +134,6 @@ pub enum BluetoothLinkError {
     /// Explicit cancellation interrupted a pending Bluetooth helper open.
     #[error("the pending Bluetooth open was interrupted")]
     OpenInterrupted,
-    /// Explicit cancellation interrupted a custom-name radio search.
-    #[error("the Bluetooth radio search was interrupted")]
-    SearchInterrupted,
-    /// A one-shot custom-name search was invoked more than once.
-    #[error("this Bluetooth radio search operation has already run")]
-    SearchAlreadyRun,
     /// A read or write exceeded the bounded foreign-call transfer size.
     #[error("Bluetooth transfer length {requested} is outside 1..={maximum} bytes")]
     InvalidTransferLength {
@@ -304,159 +238,6 @@ pub struct BluetoothByteTransport {
     matched_identity: StandardMutex<MatchedBluetoothIdentity>,
 }
 
-const BLUETOOTH_DISCOVERY_FRESH: u8 = 0;
-const BLUETOOTH_DISCOVERY_STARTED: u8 = 1;
-
-/// One cancellable, bounded search for custom-named paired TH-D75 radios.
-///
-/// Normal discovery intentionally hides unhinted phones, headsets, and other
-/// paired devices. This explicit operation opens the omitted candidates one at
-/// a time, recovers transient packet mode, and requires exact `ID TH-D75` plus
-/// a valid CAT `AE` response. It never exposes a device that failed proof.
-#[derive(Debug, uniffi::Object)]
-pub struct BluetoothRadioSearchOperation {
-    cancellation: RecoveryCancellation,
-    run_state: AtomicU8,
-    previously_completed_probe_addresses: Vec<String>,
-}
-
-#[uniffi::export(async_runtime = "tokio")]
-impl BluetoothRadioSearchOperation {
-    /// Construct a fresh, idle custom-name search.
-    ///
-    /// `previously_completed_probe_addresses` is the accumulated exact-address
-    /// set from prior result pages. It is syntax-validated, canonicalized, and
-    /// used only against the new paired snapshot, so a newly paired different
-    /// address is never skipped.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BluetoothLinkError::InvalidAddress`] for a malformed
-    /// exclusion rather than silently hiding an arbitrary candidate.
-    #[uniffi::constructor]
-    pub fn new(
-        previously_completed_probe_addresses: Vec<String>,
-    ) -> Result<Arc<Self>, BluetoothLinkError> {
-        let mut canonical_addresses = previously_completed_probe_addresses
-            .into_iter()
-            .map(|address| {
-                canonicalize_bluetooth_address(&address)
-                    .ok_or(BluetoothLinkError::InvalidAddress { address })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        canonical_addresses.sort_unstable();
-        canonical_addresses.dedup();
-        Ok(Arc::new(Self {
-            cancellation: RecoveryCancellation::default(),
-            run_state: AtomicU8::new(BLUETOOTH_DISCOVERY_FRESH),
-            previously_completed_probe_addresses: canonical_addresses,
-        }))
-    }
-
-    /// Request cancellation synchronously.
-    ///
-    /// The signal is sticky across the Swift-to-Rust future registration race
-    /// and terminates an active helper rather than waiting for its full bound.
-    pub fn cancel(&self) {
-        self.cancellation.request();
-    }
-
-    /// Run this bounded search exactly once.
-    ///
-    /// Only paired devices omitted from normal likely-radio discovery are
-    /// considered. The result reports whether count or wall-clock bounds
-    /// prevented a complete scan.
-    ///
-    /// # Errors
-    ///
-    /// Returns a typed platform, repeated-run, or native helper failure.
-    /// Cancellation normally returns a partial result with `was_cancelled`;
-    /// a candidate that simply does not prove TH-D75 identity is not an
-    /// operation error and is omitted from the result.
-    #[cfg_attr(
-        not(target_os = "macos"),
-        expect(
-            clippy::unused_async,
-            reason = "UniFFI keeps the search API asynchronous on every target, while only macOS performs awaited helper work"
-        )
-    )]
-    pub async fn run(self: Arc<Self>) -> Result<BluetoothRadioSearchResult, BluetoothLinkError> {
-        let _previous_state = self
-            .run_state
-            .compare_exchange(
-                BLUETOOTH_DISCOVERY_FRESH,
-                BLUETOOTH_DISCOVERY_STARTED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .map_err(|_actual| BluetoothLinkError::SearchAlreadyRun)?;
-        if self.cancellation.check().is_err() {
-            return Ok(cancelled_radio_search_result(
-                &self.previously_completed_probe_addresses,
-            ));
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            let helper =
-                bundled_bluetooth_helper_executable().map_err(map_discovery_recovery_error)?;
-            let scan = scan_unhinted_bluetooth_candidates(
-                helper,
-                &self.previously_completed_probe_addresses,
-                &self.cancellation,
-            )
-            .await
-            .map_err(map_discovery_recovery_error)?;
-            let completed_probe_count =
-                u32::try_from(scan.completed_probe_count).map_err(|error| {
-                    BluetoothLinkError::BluetoothUnavailable {
-                        operation: "custom-name discovery".to_owned(),
-                        detail: format!("completed probe count did not fit u32: {error}"),
-                    }
-                })?;
-            let total_unhinted_candidate_count = u32::try_from(scan.total_unhinted_candidate_count)
-                .map_err(|error| BluetoothLinkError::BluetoothUnavailable {
-                    operation: "custom-name discovery".to_owned(),
-                    detail: format!("unhinted candidate count did not fit u32: {error}"),
-                })?;
-            let inventory = bluetooth_radio_discovery_from_native(&scan.paired_candidates)?;
-            let mut radio_candidates = scan
-                .qualified
-                .into_iter()
-                .map(|qualified| QualifiedBluetoothRadioCandidate {
-                    address: qualified.candidate.address().to_owned(),
-                    display_name: qualified.candidate.display_name().to_owned(),
-                    cat_serial_number: qualified.serial_number.to_string(),
-                })
-                .collect::<Vec<_>>();
-            radio_candidates.sort_by(|left, right| {
-                left.display_name
-                    .to_lowercase()
-                    .cmp(&right.display_name.to_lowercase())
-                    .then_with(|| left.address.cmp(&right.address))
-            });
-            Ok(BluetoothRadioSearchResult {
-                radio_candidates,
-                likely_radio_candidates: inventory.likely_radio_candidates,
-                paired_device_addresses: inventory.paired_device_addresses,
-                total_paired_device_count: inventory.total_paired_device_count,
-                completed_probe_addresses: scan.completed_probe_addresses,
-                current_completed_probe_addresses: scan.current_completed_probe_addresses,
-                completed_probe_count,
-                total_unhinted_candidate_count,
-                is_complete: scan.is_complete,
-                was_cancelled: scan.was_cancelled,
-                has_inventory_snapshot: scan.has_inventory_snapshot,
-            })
-        }
-
-        #[cfg(not(target_os = "macos"))]
-        {
-            Err(BluetoothLinkError::UnsupportedPlatform)
-        }
-    }
-}
-
 #[uniffi::export(async_runtime = "tokio")]
 impl BluetoothByteTransport {
     /// Construct a closed link for an exact address or USB-serial target.
@@ -531,7 +312,7 @@ impl BluetoothByteTransport {
     ///
     /// Address targets open that address as an unqualified byte stream so the
     /// caller can run Azimuth's packet-mode preflight. USB-serial targets use
-    /// the signed helper's bounded paired-candidate snapshot and identity probes
+    /// the signed helper's bounded paired-device snapshot and identity probes
     /// to auto-match the same physical radio. Both serial-qualified target
     /// forms recover transient packet mode and query the final opened endpoint
     /// again before exposing it to byte operations.
@@ -1014,15 +795,11 @@ fn validate_target_without_opening(target: BluetoothLinkTarget) -> Result<(), Bl
     }
 }
 
-/// Enumerate the bounded paired SPP snapshot through Azimuth's signed helper.
+/// Enumerate the bounded paired-device snapshot through Azimuth's signed helper.
 ///
-/// The likely-candidate list contains only exact addresses with bounded UTF-8
-/// display names for devices carrying native cached-SPP or D75-name evidence.
-/// The total and canonical-address inventory cover the same snapshot before
-/// filtering, so stale qualified rows can be pruned and a custom-named TH-D75
-/// can still make serial-based recovery available without making every paired
-/// device look like a proven radio. Candidate evidence is not an identity
-/// claim; serial-sensitive operations still perform CAT proof.
+/// Every bounded device is returned with its exact canonical address and
+/// display name. Discovery performs no radio I/O and makes no TH-D75 identity
+/// claim. Exact selection is followed by CAT qualification during connection.
 ///
 /// # Errors
 ///
@@ -1030,7 +807,7 @@ fn validate_target_without_opening(target: BluetoothLinkTarget) -> Result<(), Bl
 /// bounded helper/discovery failure on macOS.
 #[uniffi::export(async_runtime = "tokio")]
 pub async fn discover_paired_bluetooth_devices()
--> Result<BluetoothRadioDiscovery, BluetoothLinkError> {
+-> Result<BluetoothDeviceDiscovery, BluetoothLinkError> {
     #[cfg(target_os = "macos")]
     {
         let helper = bundled_bluetooth_helper_executable().map_err(|error| {
@@ -1039,13 +816,13 @@ pub async fn discover_paired_bluetooth_devices()
                 detail: error.to_string(),
             }
         })?;
-        let native = enumerate_bluetooth_candidates(helper)
+        let native = enumerate_paired_bluetooth_devices(helper)
             .await
             .map_err(|error| BluetoothLinkError::BluetoothUnavailable {
                 operation: "paired-device enumeration".to_owned(),
                 detail: error.to_string(),
             })?;
-        bluetooth_radio_discovery_from_native(&native)
+        bluetooth_device_discovery_from_native(&native)
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -1055,57 +832,48 @@ pub async fn discover_paired_bluetooth_devices()
 }
 
 #[cfg(target_os = "macos")]
-fn bluetooth_radio_discovery_from_native(
-    native: &[kenwood_thd75::PairedBluetoothCandidate],
-) -> Result<BluetoothRadioDiscovery, BluetoothLinkError> {
-    let total_paired_device_count =
-        u32::try_from(native.len()).map_err(|error| BluetoothLinkError::BluetoothUnavailable {
-            operation: "paired-device enumeration".to_owned(),
-            detail: format!("paired-device count did not fit u32: {error}"),
-        })?;
-    let mut paired_device_addresses = native
+fn bluetooth_device_discovery_from_native(
+    native: &[kenwood_thd75::PairedBluetoothDevice],
+) -> Result<BluetoothDeviceDiscovery, BluetoothLinkError> {
+    let mut devices = native
         .iter()
-        .map(|candidate| {
-            canonicalize_bluetooth_address(candidate.address()).ok_or_else(|| {
+        .map(|device| {
+            let address = canonicalize_bluetooth_address(device.address()).ok_or_else(|| {
                 BluetoothLinkError::BluetoothUnavailable {
                     operation: "paired-device enumeration".to_owned(),
                     detail: format!(
                         "native helper returned a non-canonical Bluetooth address: {}",
-                        candidate.address()
+                        device.address()
                     ),
                 }
+            })?;
+            Ok(BluetoothPairedDevice {
+                address,
+                display_name: device.display_name().to_owned(),
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    paired_device_addresses.sort_unstable();
-    if paired_device_addresses
+    devices.sort_by(|left, right| {
+        left.display_name
+            .to_lowercase()
+            .cmp(&right.display_name.to_lowercase())
+            .then_with(|| left.address.cmp(&right.address))
+    });
+    let mut addresses = devices
+        .iter()
+        .map(|device| device.address.as_str())
+        .collect::<Vec<_>>();
+    addresses.sort_unstable();
+    if addresses
         .windows(2)
-        .any(|pair| pair.first() == pair.get(1))
+        .any(|pair| matches!(pair, [left, right] if left == right))
     {
         return Err(BluetoothLinkError::BluetoothUnavailable {
             operation: "paired-device enumeration".to_owned(),
             detail: "native helper returned duplicate paired-device addresses".to_owned(),
         });
     }
-    let mut likely_radio_candidates = native
-        .iter()
-        .filter(|candidate| candidate.is_thd75_candidate())
-        .map(|candidate| BluetoothRadioCandidate {
-            address: candidate.address().to_owned(),
-            display_name: candidate.display_name().to_owned(),
-        })
-        .collect::<Vec<_>>();
-    likely_radio_candidates.sort_by(|left, right| {
-        left.display_name
-            .to_lowercase()
-            .cmp(&right.display_name.to_lowercase())
-            .then_with(|| left.address.cmp(&right.address))
-    });
-    Ok(BluetoothRadioDiscovery {
-        likely_radio_candidates,
-        paired_device_addresses,
-        total_paired_device_count,
-    })
+    Ok(BluetoothDeviceDiscovery { devices })
 }
 
 fn validate_transfer_length(length: usize) -> Result<(), BluetoothLinkError> {
@@ -1222,42 +990,6 @@ fn map_recovery_open_error(
             operation: "USB-serial auto-match".to_owned(),
             detail: other.to_string(),
         },
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn map_discovery_recovery_error(
-    error: crate::terminal_mode::DvGatewayRecoveryError,
-) -> BluetoothLinkError {
-    match error {
-        crate::terminal_mode::DvGatewayRecoveryError::Cancelled => {
-            BluetoothLinkError::SearchInterrupted
-        }
-        crate::terminal_mode::DvGatewayRecoveryError::UnsupportedPlatform => {
-            BluetoothLinkError::UnsupportedPlatform
-        }
-        other => BluetoothLinkError::BluetoothUnavailable {
-            operation: "custom-name discovery".to_owned(),
-            detail: other.to_string(),
-        },
-    }
-}
-
-fn cancelled_radio_search_result(
-    previously_completed_probe_addresses: &[String],
-) -> BluetoothRadioSearchResult {
-    BluetoothRadioSearchResult {
-        radio_candidates: Vec::new(),
-        likely_radio_candidates: Vec::new(),
-        paired_device_addresses: Vec::new(),
-        total_paired_device_count: 0,
-        completed_probe_addresses: Vec::new(),
-        current_completed_probe_addresses: previously_completed_probe_addresses.to_vec(),
-        completed_probe_count: 0,
-        total_unhinted_candidate_count: 0,
-        is_complete: false,
-        was_cancelled: true,
-        has_inventory_snapshot: false,
     }
 }
 
@@ -1381,23 +1113,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn custom_search_validates_canonicalizes_and_deduplicates_exclusions() -> TestResult {
-        let search = BluetoothRadioSearchOperation::new(vec![
-            "40:f3:b0:ae:1c:95".to_owned(),
-            "40-F3-B0-AE-1C-95".to_owned(),
-        ])?;
-        assert_eq!(
-            search.previously_completed_probe_addresses,
-            vec!["40-F3-B0-AE-1C-95"]
-        );
-        assert!(matches!(
-            BluetoothRadioSearchOperation::new(vec!["TH-D75".to_owned()]),
-            Err(BluetoothLinkError::InvalidAddress { .. })
-        ));
-        Ok(())
-    }
-
     #[cfg(target_os = "macos")]
     #[test]
     fn constructor_stores_native_exact_address_form() -> TestResult {
@@ -1467,40 +1182,6 @@ mod tests {
         link.set_baud_rate(115_200);
         assert_eq!(link.matched_cat_serial()?, None);
         link.close().await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn custom_name_search_cancellation_is_sticky_and_operation_is_one_shot() -> TestResult {
-        let search = BluetoothRadioSearchOperation::new(Vec::new())?;
-        search.cancel();
-
-        let cancelled = Arc::clone(&search).run().await?;
-        assert!(cancelled.was_cancelled);
-        assert!(!cancelled.is_complete);
-        assert!(!cancelled.has_inventory_snapshot);
-        assert!(cancelled.radio_candidates.is_empty());
-        assert!(cancelled.completed_probe_addresses.is_empty());
-        assert_eq!(
-            search.run().await,
-            Err(BluetoothLinkError::SearchAlreadyRun)
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn cancellation_before_second_page_preserves_progress_without_claiming_a_snapshot()
-    -> TestResult {
-        let prior = vec!["40-F3-B0-AE-1C-95".to_owned()];
-        let search = BluetoothRadioSearchOperation::new(prior.clone())?;
-        search.cancel();
-
-        let cancelled = search.run().await?;
-
-        assert!(cancelled.was_cancelled);
-        assert!(!cancelled.has_inventory_snapshot);
-        assert_eq!(cancelled.current_completed_probe_addresses, prior);
-        assert_eq!(cancelled.total_unhinted_candidate_count, 0);
         Ok(())
     }
 

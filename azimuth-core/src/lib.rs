@@ -37,9 +37,8 @@ pub use automation::{
     SettingValueRecord, connect_automation,
 };
 pub use bluetooth_link::{
-    BluetoothByteTransport, BluetoothLinkError, BluetoothLinkTarget, BluetoothRadioCandidate,
-    BluetoothRadioDiscovery, BluetoothRadioSearchOperation, BluetoothRadioSearchResult,
-    QualifiedBluetoothRadioCandidate, discover_paired_bluetooth_devices,
+    BluetoothByteTransport, BluetoothDeviceDiscovery, BluetoothLinkError, BluetoothLinkTarget,
+    BluetoothPairedDevice, discover_paired_bluetooth_devices,
 };
 pub use catalog::{
     SettingChange, SettingChangeValidation, SettingConversionError, SettingMenu, SettingOption,

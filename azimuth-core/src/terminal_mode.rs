@@ -8,34 +8,33 @@ use std::sync::{
 use kenwood_thd75::radio::programming::DetachedMcpPageUpdate;
 #[cfg(target_os = "macos")]
 use kenwood_thd75::{
-    PairedBluetoothCandidate, Radio,
+    PairedBluetoothDevice, Radio,
     error::TransportError,
     transport::{BluetoothOpenCancellation, BluetoothTransport, Transport},
-    types::{DvGatewayMode, SerialNumber},
+    types::SerialNumber,
 };
 
 #[cfg(target_os = "macos")]
 const BLUETOOTH_HELPER_EXECUTABLE: &str = "AzimuthBluetoothHelper";
 
-/// Candidate qualification must fit inside this complete wall-clock budget.
+/// Paired-device qualification must fit inside this complete wall-clock budget.
 #[cfg(target_os = "macos")]
-const BLUETOOTH_CANDIDATE_PROBE_WINDOW: std::time::Duration = std::time::Duration::from_secs(100);
+const BLUETOOTH_DEVICE_PROBE_WINDOW: std::time::Duration = std::time::Duration::from_secs(100);
 
-/// A D75-likely probe can use two 22-second native opens with a one-second
-/// retry delay, followed by 800ms of packet-exit delays, up to five seconds of
-/// residue drain, one five-second CAT command, and bounded teardown. Sixty
-/// seconds admits that complete operation with margin; do not begin another
-/// candidate when less remains.
+/// One probe can use a 22-second native open, followed by 800ms of packet-exit
+/// delays, up to five seconds of residue drain, one five-second CAT command,
+/// and bounded teardown. Sixty seconds admits that complete operation with
+/// margin; do not begin another device when less remains.
 #[cfg(target_os = "macos")]
-const BLUETOOTH_CANDIDATE_PROBE_RESERVE: std::time::Duration = std::time::Duration::from_secs(60);
+const BLUETOOTH_DEVICE_PROBE_RESERVE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Independent count ceiling below the signed helper's framing limit.
 #[cfg(target_os = "macos")]
-const MAX_BLUETOOTH_CANDIDATE_PROBES: usize = 8;
+const MAX_BLUETOOTH_DEVICE_PROBES: usize = 8;
 
 #[cfg(target_os = "macos")]
-fn bluetooth_candidate_probe_fits(remaining: std::time::Duration) -> bool {
-    remaining >= BLUETOOTH_CANDIDATE_PROBE_RESERVE
+fn bluetooth_device_probe_fits(remaining: std::time::Duration) -> bool {
+    remaining >= BLUETOOTH_DEVICE_PROBE_RESERVE
 }
 
 /// Serialize only Azimuth's short helper validation/enumeration processes.
@@ -50,11 +49,11 @@ static BLUETOOTH_HELPER_ENUMERATION_GATE: tokio::sync::Mutex<()> =
 /// Serialize bounded identity scans without queueing live RFCOMM ownership.
 ///
 /// Enumeration has its own shorter gate above. This gate covers only the
-/// sequential open/ID/AE/close probes used by serial matching and explicit
-/// custom-name discovery. The lower process lease still makes a scan fail
+/// sequential open/ID/AE/close operations used by serial matching. The lower
+/// process lease still makes a scan fail
 /// closed when a normal Bluetooth link already owns the radio.
 #[cfg(target_os = "macos")]
-static BLUETOOTH_CANDIDATE_QUALIFICATION_GATE: tokio::sync::Mutex<()> =
+static BLUETOOTH_DEVICE_QUALIFICATION_GATE: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
 
 const CANCELLATION_REQUESTED: u8 = 1 << 0;
@@ -178,35 +177,10 @@ impl Drop for OperationRunGuard<'_> {
 }
 
 #[cfg(target_os = "macos")]
-enum BluetoothCandidateProbe {
+enum BluetoothDeviceProbe {
     Unavailable,
     Identified(SerialNumber),
     IdentityFailed(String),
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Debug)]
-pub(crate) struct QualifiedBluetoothCandidate {
-    pub(crate) candidate: PairedBluetoothCandidate,
-    pub(crate) serial_number: SerialNumber,
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Debug)]
-pub(crate) struct BluetoothCandidateScan {
-    /// Complete paired-device snapshot used to derive the unhinted page.
-    ///
-    /// This remains empty only when cancellation interrupted enumeration
-    /// before a snapshot was available.
-    pub(crate) paired_candidates: Vec<PairedBluetoothCandidate>,
-    pub(crate) qualified: Vec<QualifiedBluetoothCandidate>,
-    pub(crate) completed_probe_addresses: Vec<String>,
-    pub(crate) current_completed_probe_addresses: Vec<String>,
-    pub(crate) completed_probe_count: usize,
-    pub(crate) total_unhinted_candidate_count: usize,
-    pub(crate) is_complete: bool,
-    pub(crate) was_cancelled: bool,
-    pub(crate) has_inventory_snapshot: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -273,7 +247,7 @@ fn map_transport_failure(error: &TransportError) -> DvGatewayRecoveryError {
 /// On macOS this exercises the signed sandbox-inheriting helper's private
 /// sentinel dispatch, readiness handshake, bidirectional pipe framing, and
 /// clean exit using a fixed no-radio echo. Bluetooth authorization, discovery,
-/// candidate qualification, and radio I/O remain separate foreground product
+/// paired-device qualification and radio I/O remain separate foreground product
 /// operations.
 ///
 /// # Errors
@@ -306,11 +280,11 @@ pub async fn validate_bluetooth_recovery_helper() -> Result<(), DvGatewayRecover
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) async fn enumerate_bluetooth_candidates(
+pub(crate) async fn enumerate_paired_bluetooth_devices(
     helper_executable: std::path::PathBuf,
-) -> Result<Vec<PairedBluetoothCandidate>, DvGatewayRecoveryError> {
+) -> Result<Vec<PairedBluetoothDevice>, DvGatewayRecoveryError> {
     let enumeration_guard = BLUETOOTH_HELPER_ENUMERATION_GATE.lock().await;
-    enumerate_bluetooth_candidates_with_guard(
+    enumerate_paired_bluetooth_devices_with_guard(
         helper_executable,
         enumeration_guard,
         BluetoothOpenCancellation::default(),
@@ -319,16 +293,16 @@ pub(crate) async fn enumerate_bluetooth_candidates(
 }
 
 #[cfg(target_os = "macos")]
-async fn enumerate_bluetooth_candidates_with_guard(
+async fn enumerate_paired_bluetooth_devices_with_guard(
     helper_executable: std::path::PathBuf,
     enumeration_guard: tokio::sync::MutexGuard<'static, ()>,
     open_cancellation: BluetoothOpenCancellation,
-) -> Result<Vec<PairedBluetoothCandidate>, DvGatewayRecoveryError> {
+) -> Result<Vec<PairedBluetoothDevice>, DvGatewayRecoveryError> {
     tokio::task::spawn_blocking(move || {
         // Keep the guard inside the blocking closure. Dropping the async
         // waiter must not admit another helper before this process exits.
         let _enumeration_guard = enumeration_guard;
-        BluetoothTransport::paired_spp_candidates_with_helper_executable_cancellable(
+        BluetoothTransport::paired_devices_with_helper_executable_cancellable(
             helper_executable,
             &open_cancellation,
         )
@@ -339,11 +313,11 @@ async fn enumerate_bluetooth_candidates_with_guard(
 }
 
 #[cfg(target_os = "macos")]
-async fn enumerate_bluetooth_candidates_cancellable(
+async fn enumerate_paired_bluetooth_devices_cancellable(
     helper_executable: std::path::PathBuf,
     cancellation: &RecoveryCancellation,
-) -> Result<Vec<PairedBluetoothCandidate>, DvGatewayRecoveryError> {
-    let result = enumerate_bluetooth_candidates_with_guard(
+) -> Result<Vec<PairedBluetoothDevice>, DvGatewayRecoveryError> {
+    let result = enumerate_paired_bluetooth_devices_with_guard(
         helper_executable,
         acquire_bluetooth_helper_enumeration_gate(cancellation).await?,
         cancellation.bluetooth_open_cancellation(),
@@ -367,15 +341,15 @@ async fn acquire_bluetooth_helper_enumeration_gate(
 }
 
 #[cfg(target_os = "macos")]
-async fn open_exact_bluetooth_candidate(
-    candidate: PairedBluetoothCandidate,
+async fn open_exact_bluetooth_device(
+    device: PairedBluetoothDevice,
     helper_executable: std::path::PathBuf,
     cancellation: &RecoveryCancellation,
 ) -> Result<Option<BluetoothTransport>, DvGatewayRecoveryError> {
     let open_cancellation = cancellation.bluetooth_open_cancellation();
     let task_result = tokio::task::spawn_blocking(move || {
-        BluetoothTransport::open_paired_candidate_with_helper_executable_cancellable(
-            &candidate,
+        BluetoothTransport::open_paired_device_with_helper_executable_cancellable(
+            &device,
             helper_executable,
             &open_cancellation,
         )
@@ -391,15 +365,15 @@ async fn open_exact_bluetooth_candidate(
 }
 
 #[cfg(target_os = "macos")]
-async fn probe_exact_bluetooth_candidate(
-    candidate: PairedBluetoothCandidate,
+async fn probe_exact_bluetooth_device(
+    device: PairedBluetoothDevice,
     helper_executable: std::path::PathBuf,
     cancellation: &RecoveryCancellation,
 ) -> Result<Option<BluetoothTransport>, DvGatewayRecoveryError> {
     let open_cancellation = cancellation.bluetooth_open_cancellation();
     let task_result = tokio::task::spawn_blocking(move || {
-        BluetoothTransport::probe_paired_candidate_with_helper_executable_cancellable(
-            &candidate,
+        BluetoothTransport::probe_paired_device_with_helper_executable_cancellable(
+            &device,
             helper_executable,
             &open_cancellation,
         )
@@ -415,19 +389,16 @@ async fn probe_exact_bluetooth_candidate(
 }
 
 #[cfg(target_os = "macos")]
-async fn probe_bluetooth_candidate_identity(
-    candidate: &PairedBluetoothCandidate,
+async fn probe_bluetooth_device_identity(
+    device: &PairedBluetoothDevice,
     helper_executable: &std::path::Path,
     cancellation: &RecoveryCancellation,
-) -> Result<BluetoothCandidateProbe, DvGatewayRecoveryError> {
-    let opened = probe_exact_bluetooth_candidate(
-        candidate.clone(),
-        helper_executable.to_owned(),
-        cancellation,
-    )
-    .await?;
+) -> Result<BluetoothDeviceProbe, DvGatewayRecoveryError> {
+    let opened =
+        probe_exact_bluetooth_device(device.clone(), helper_executable.to_owned(), cancellation)
+            .await?;
     let Some(transport) = opened else {
-        return Ok(BluetoothCandidateProbe::Unavailable);
+        return Ok(BluetoothDeviceProbe::Unavailable);
     };
 
     let connection = Radio::connect_with_tnc_exit(transport);
@@ -442,18 +413,18 @@ async fn probe_bluetooth_candidate_identity(
     };
     let mut radio = match connected {
         Ok(radio) => radio,
-        Err(error) => return Ok(BluetoothCandidateProbe::IdentityFailed(error.to_string())),
+        Err(error) => return Ok(BluetoothDeviceProbe::IdentityFailed(error.to_string())),
     };
-    let identity = query_bluetooth_candidate_identity(&mut radio, cancellation).await;
+    let identity = query_bluetooth_device_identity(&mut radio, cancellation).await;
     drop(radio.disconnect().await);
     identity
 }
 
 #[cfg(target_os = "macos")]
-async fn query_bluetooth_candidate_identity<T: Transport>(
+async fn query_bluetooth_device_identity<T: Transport>(
     radio: &mut Radio<T>,
     cancellation: &RecoveryCancellation,
-) -> Result<BluetoothCandidateProbe, DvGatewayRecoveryError> {
+) -> Result<BluetoothDeviceProbe, DvGatewayRecoveryError> {
     let model_identity = {
         let query = radio.identify();
         tokio::pin!(query);
@@ -467,7 +438,7 @@ async fn query_bluetooth_candidate_identity<T: Transport>(
         return Err(DvGatewayRecoveryError::Cancelled);
     };
     if let Err(error) = model_identity {
-        return Ok(BluetoothCandidateProbe::IdentityFailed(format!(
+        return Ok(BluetoothDeviceProbe::IdentityFailed(format!(
             "exact CAT ID failed: {error}"
         )));
     }
@@ -485,58 +456,49 @@ async fn query_bluetooth_candidate_identity<T: Transport>(
     };
     cancellation.check()?;
     Ok(match identity {
-        Ok(information) => BluetoothCandidateProbe::Identified(information.into_parts().0),
-        Err(error) => BluetoothCandidateProbe::IdentityFailed(format!("CAT AE failed: {error}")),
+        Ok(information) => BluetoothDeviceProbe::Identified(information.into_parts().0),
+        Err(error) => BluetoothDeviceProbe::IdentityFailed(format!("CAT AE failed: {error}")),
     })
 }
 
 #[cfg(target_os = "macos")]
-async fn acquire_bluetooth_candidate_qualification_gate(
+async fn acquire_bluetooth_device_qualification_gate(
     cancellation: &RecoveryCancellation,
 ) -> Result<tokio::sync::MutexGuard<'static, ()>, DvGatewayRecoveryError> {
     cancellation.check()?;
     let guard = tokio::select! {
         biased;
         () = cancellation.cancelled() => return Err(DvGatewayRecoveryError::Cancelled),
-        guard = BLUETOOTH_CANDIDATE_QUALIFICATION_GATE.lock() => guard,
+        guard = BLUETOOTH_DEVICE_QUALIFICATION_GATE.lock() => guard,
     };
     cancellation.check().map(|()| guard)
 }
 
 #[cfg(target_os = "macos")]
-async fn select_matching_bluetooth_candidate(
-    candidates: &[PairedBluetoothCandidate],
+async fn select_matching_bluetooth_device(
+    devices: &[PairedBluetoothDevice],
     expected: &SerialNumber,
     helper_executable: &std::path::Path,
     cancellation: &RecoveryCancellation,
-) -> Result<PairedBluetoothCandidate, DvGatewayRecoveryError> {
+) -> Result<PairedBluetoothDevice, DvGatewayRecoveryError> {
     cancellation.check()?;
-    if candidates.is_empty() {
+    if devices.is_empty() {
         return Err(DvGatewayRecoveryError::BluetoothUnavailable {
             detail: "macOS reported no paired Bluetooth devices; pair the TH-D75 and retry"
                 .to_owned(),
         });
     }
-    let _qualification_guard = acquire_bluetooth_candidate_qualification_gate(cancellation).await?;
-    let deadline = std::time::Instant::now() + BLUETOOTH_CANDIDATE_PROBE_WINDOW;
+    let _qualification_guard = acquire_bluetooth_device_qualification_gate(cancellation).await?;
+    let deadline = std::time::Instant::now() + BLUETOOTH_DEVICE_PROBE_WINDOW;
     let mut attempted = 0_usize;
     let mut nonmatching = Vec::new();
     let mut identity_failures = Vec::new();
     let mut stopped_reason = None;
 
-    let prioritized = candidates
-        .iter()
-        .filter(|candidate| candidate.is_thd75_candidate())
-        .chain(
-            candidates
-                .iter()
-                .filter(|candidate| !candidate.is_thd75_candidate()),
-        )
-        .take(MAX_BLUETOOTH_CANDIDATE_PROBES);
-    for candidate in prioritized {
+    for device in devices.iter().take(MAX_BLUETOOTH_DEVICE_PROBES) {
         cancellation.check()?;
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if !bluetooth_candidate_probe_fits(remaining) {
+        if !bluetooth_device_probe_fits(remaining) {
             stopped_reason = Some(
                 "too little time remained in the 100-second qualification window to safely begin another bounded probe"
                     .to_owned(),
@@ -545,279 +507,66 @@ async fn select_matching_bluetooth_candidate(
         }
         attempted += 1;
 
-        match probe_bluetooth_candidate_identity(candidate, helper_executable, cancellation).await?
-        {
-            BluetoothCandidateProbe::Unavailable => {}
-            BluetoothCandidateProbe::Identified(actual) => {
+        match probe_bluetooth_device_identity(device, helper_executable, cancellation).await? {
+            BluetoothDeviceProbe::Unavailable => {}
+            BluetoothDeviceProbe::Identified(actual) => {
                 if &actual == expected {
                     // CAT serial is the stable USB identity used for this
                     // recovery. Reopen this exact address and verify the same
                     // serial again before the MCP mutation gate. Unrelated
                     // paired devices cannot invalidate that positive proof.
-                    return Ok(candidate.clone());
+                    return Ok(device.clone());
                 }
                 nonmatching.push(format!(
                     "{} ({}) reported {actual}",
-                    candidate.display_name(),
-                    candidate.address()
+                    device.display_name(),
+                    device.address()
                 ));
             }
-            BluetoothCandidateProbe::IdentityFailed(error) => {
+            BluetoothDeviceProbe::IdentityFailed(error) => {
                 identity_failures.push(format!(
                     "{} ({}) did not answer CAT AE: {error}",
-                    candidate.display_name(),
-                    candidate.address()
+                    device.display_name(),
+                    device.address()
                 ));
             }
         }
         if std::time::Instant::now() > deadline {
             stopped_reason = Some(
-                "the 100-second Bluetooth candidate qualification deadline was exceeded".to_owned(),
+                "the 100-second Bluetooth device qualification deadline was exceeded".to_owned(),
             );
             break;
         }
     }
 
-    if stopped_reason.is_none() && attempted < candidates.len() {
+    if stopped_reason.is_none() && attempted < devices.len() {
         stopped_reason = Some(format!(
-            "the {MAX_BLUETOOTH_CANDIDATE_PROBES}-candidate qualification cap was reached after prioritizing cached-SPP and D75-name evidence"
+            "the {MAX_BLUETOOTH_DEVICE_PROBES}-device qualification cap was reached"
         ));
     }
 
     if let Some(reason) = stopped_reason {
         return Err(DvGatewayRecoveryError::BluetoothIdentityUnavailable {
             detail: format!(
-                "Bluetooth candidate qualification was incomplete: tried {attempted} of {} paired candidates because {reason}; no setting was changed",
-                candidates.len()
+                "Bluetooth device qualification was incomplete: tried {attempted} of {} paired devices because {reason}; no setting was changed",
+                devices.len()
             ),
         });
     }
 
     let mut detail = format!(
-        "no paired Bluetooth candidate proved USB radio serial {expected}; tried {attempted} of {} candidates",
-        candidates.len()
+        "no paired Bluetooth device proved USB radio serial {expected}; tried {attempted} of {} devices",
+        devices.len()
     );
     if !nonmatching.is_empty() {
         detail.push_str("; different radios: ");
         detail.push_str(&nonmatching.join(", "));
     }
     if !identity_failures.is_empty() {
-        detail.push_str("; unresolved candidates: ");
+        detail.push_str("; unresolved devices: ");
         detail.push_str(&identity_failures.join(", "));
     }
     Err(DvGatewayRecoveryError::BluetoothIdentityUnavailable { detail })
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) async fn scan_unhinted_bluetooth_candidates(
-    helper_executable: std::path::PathBuf,
-    previously_completed_probe_addresses: &[String],
-    cancellation: &RecoveryCancellation,
-) -> Result<BluetoothCandidateScan, DvGatewayRecoveryError> {
-    let candidates =
-        match enumerate_bluetooth_candidates_cancellable(helper_executable.clone(), cancellation)
-            .await
-        {
-            Ok(candidates) => candidates,
-            Err(DvGatewayRecoveryError::Cancelled) => {
-                return Ok(cancelled_bluetooth_candidate_scan_without_snapshot(
-                    previously_completed_probe_addresses,
-                ));
-            }
-            Err(error) => return Err(error),
-        };
-    let unhinted = candidates
-        .iter()
-        .filter(|candidate| !candidate.is_thd75_candidate())
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut scan = scan_unhinted_bluetooth_snapshot(
-        unhinted,
-        helper_executable,
-        previously_completed_probe_addresses,
-        cancellation,
-    )
-    .await?;
-    scan.paired_candidates = candidates;
-    Ok(scan)
-}
-
-#[cfg(target_os = "macos")]
-async fn scan_unhinted_bluetooth_snapshot(
-    unhinted: Vec<PairedBluetoothCandidate>,
-    helper_executable: std::path::PathBuf,
-    previously_completed_probe_addresses: &[String],
-    cancellation: &RecoveryCancellation,
-) -> Result<BluetoothCandidateScan, DvGatewayRecoveryError> {
-    let total_unhinted_candidate_count = unhinted.len();
-    let current_previous_completed_probe_addresses = retained_completed_probe_addresses(
-        &unhinted,
-        previously_completed_probe_addresses,
-        PairedBluetoothCandidate::address,
-    );
-    if unhinted.is_empty() {
-        return Ok(BluetoothCandidateScan {
-            paired_candidates: Vec::new(),
-            qualified: Vec::new(),
-            completed_probe_addresses: Vec::new(),
-            current_completed_probe_addresses: Vec::new(),
-            completed_probe_count: 0,
-            total_unhinted_candidate_count,
-            is_complete: true,
-            was_cancelled: false,
-            has_inventory_snapshot: true,
-        });
-    }
-
-    let _qualification_guard =
-        match acquire_bluetooth_candidate_qualification_gate(cancellation).await {
-            Ok(guard) => guard,
-            Err(DvGatewayRecoveryError::Cancelled) => {
-                return Ok(cancelled_bluetooth_candidate_scan_with_snapshot(
-                    total_unhinted_candidate_count,
-                    current_previous_completed_probe_addresses,
-                ));
-            }
-            Err(error) => return Err(error),
-        };
-    let page = bounded_incomplete_probe_page(
-        &unhinted,
-        previously_completed_probe_addresses,
-        PairedBluetoothCandidate::address,
-    );
-    let remaining_candidate_count = total_unhinted_candidate_count
-        .saturating_sub(current_previous_completed_probe_addresses.len());
-    let deadline = std::time::Instant::now() + BLUETOOTH_CANDIDATE_PROBE_WINDOW;
-    let mut qualified = Vec::new();
-    let mut completed_probe_addresses = Vec::new();
-    let mut was_cancelled = false;
-    for candidate in page {
-        if cancellation.check().is_err() {
-            was_cancelled = true;
-            break;
-        }
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if !bluetooth_candidate_probe_fits(remaining) {
-            break;
-        }
-        let probe =
-            match probe_bluetooth_candidate_identity(candidate, &helper_executable, cancellation)
-                .await
-            {
-                Ok(probe) => probe,
-                Err(DvGatewayRecoveryError::Cancelled) => {
-                    was_cancelled = true;
-                    break;
-                }
-                Err(error) => return Err(error),
-            };
-        completed_probe_addresses.push(candidate.address().to_owned());
-        if let BluetoothCandidateProbe::Identified(serial_number) = probe {
-            qualified.push(QualifiedBluetoothCandidate {
-                candidate: candidate.clone(),
-                serial_number,
-            });
-        }
-        if std::time::Instant::now() > deadline {
-            break;
-        }
-    }
-    let completed_probe_count = completed_probe_addresses.len();
-    let mut current_completed_probe_addresses = current_previous_completed_probe_addresses;
-    current_completed_probe_addresses.extend(completed_probe_addresses.iter().cloned());
-    current_completed_probe_addresses.sort_unstable();
-    current_completed_probe_addresses.dedup();
-
-    Ok(BluetoothCandidateScan {
-        paired_candidates: Vec::new(),
-        qualified,
-        completed_probe_addresses,
-        current_completed_probe_addresses,
-        completed_probe_count,
-        total_unhinted_candidate_count,
-        is_complete: !was_cancelled && completed_probe_count == remaining_candidate_count,
-        was_cancelled,
-        has_inventory_snapshot: true,
-    })
-}
-
-#[cfg(target_os = "macos")]
-fn cancelled_bluetooth_candidate_scan_without_snapshot(
-    previously_completed_probe_addresses: &[String],
-) -> BluetoothCandidateScan {
-    BluetoothCandidateScan {
-        paired_candidates: Vec::new(),
-        qualified: Vec::new(),
-        completed_probe_addresses: Vec::new(),
-        current_completed_probe_addresses: previously_completed_probe_addresses.to_vec(),
-        completed_probe_count: 0,
-        total_unhinted_candidate_count: 0,
-        is_complete: false,
-        was_cancelled: true,
-        has_inventory_snapshot: false,
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn cancelled_bluetooth_candidate_scan_with_snapshot(
-    total_unhinted_candidate_count: usize,
-    current_completed_probe_addresses: Vec<String>,
-) -> BluetoothCandidateScan {
-    BluetoothCandidateScan {
-        paired_candidates: Vec::new(),
-        qualified: Vec::new(),
-        completed_probe_addresses: Vec::new(),
-        current_completed_probe_addresses,
-        completed_probe_count: 0,
-        total_unhinted_candidate_count,
-        is_complete: false,
-        was_cancelled: true,
-        has_inventory_snapshot: true,
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn bounded_incomplete_probe_page<'candidate, T, Address>(
-    candidates: &'candidate [T],
-    previously_completed_probe_addresses: &[String],
-    address: Address,
-) -> Vec<&'candidate T>
-where
-    Address: for<'item> Fn(&'item T) -> &'item str,
-{
-    let previously_completed = previously_completed_probe_addresses
-        .iter()
-        .map(String::as_str)
-        .collect::<std::collections::BTreeSet<_>>();
-    let mut page = candidates.iter().collect::<Vec<_>>();
-    page.sort_by(|left, right| address(left).cmp(address(right)));
-    page.into_iter()
-        .filter(|candidate| !previously_completed.contains(address(candidate)))
-        .take(MAX_BLUETOOTH_CANDIDATE_PROBES)
-        .collect()
-}
-
-#[cfg(target_os = "macos")]
-fn retained_completed_probe_addresses<T, Address>(
-    candidates: &[T],
-    previously_completed_probe_addresses: &[String],
-    address: Address,
-) -> Vec<String>
-where
-    Address: for<'candidate> Fn(&'candidate T) -> &'candidate str,
-{
-    let current_addresses = candidates
-        .iter()
-        .map(address)
-        .collect::<std::collections::BTreeSet<_>>();
-    let mut retained = previously_completed_probe_addresses
-        .iter()
-        .filter(|candidate| current_addresses.contains(candidate.as_str()))
-        .cloned()
-        .collect::<Vec<_>>();
-    retained.sort_unstable();
-    retained.dedup();
-    retained
 }
 
 #[cfg(target_os = "macos")]
@@ -856,21 +605,18 @@ pub(crate) async fn open_selected_bluetooth_transport(
         });
     }
 
-    // With no explicit selection, never trust whichever paired device happens
-    // to carry the factory default name. Enumerate the bounded snapshot and
-    // qualify candidates by the exact serial learned from USB before opening
+    // With no explicit selection, never trust a paired device's display name.
+    // Enumerate the bounded snapshot and qualify devices by the exact serial
+    // learned from USB before opening
     // the selected address for the setting operation.
-    let candidates =
-        enumerate_bluetooth_candidates_cancellable(helper_executable.clone(), cancellation).await?;
-    let selected = select_matching_bluetooth_candidate(
-        &candidates,
-        expected,
-        &helper_executable,
-        cancellation,
-    )
-    .await?;
+    let devices =
+        enumerate_paired_bluetooth_devices_cancellable(helper_executable.clone(), cancellation)
+            .await?;
+    let selected =
+        select_matching_bluetooth_device(&devices, expected, &helper_executable, cancellation)
+            .await?;
     let exact_address = selected.address().to_owned();
-    let transport = open_exact_bluetooth_candidate(selected, helper_executable, cancellation)
+    let transport = open_exact_bluetooth_device(selected, helper_executable, cancellation)
         .await?
         .ok_or_else(|| DvGatewayRecoveryError::BluetoothUnavailable {
             detail: "the serial-matched Bluetooth radio became unavailable before the selected Bluetooth handoff completed; bring the radio within range and retry"
@@ -1178,7 +924,7 @@ async fn disable_dv_gateway_mode_via_bluetooth(
     .await?;
 
     // A prior client may have left this independently selected SPP endpoint in
-    // transient KISS or MMDVM mode after the candidate probe disconnected.
+    // transient KISS or MMDVM mode after the paired-device probe disconnected.
     // Recover the CAT boundary again before trusting AE or crossing the MCP
     // mutation gate. The owned future is cancellation-selected so dropping it
     // also drops the helper-backed transport during preamble sleeps or drain.
@@ -1214,10 +960,7 @@ async fn disable_dv_gateway_mode_via_bluetooth(
         drop(radio.disconnect().await);
         return Err(error);
     }
-    let update = match radio
-        .set_dv_gateway_mode_detached_unverified(DvGatewayMode::Off)
-        .await
-    {
+    let update = match radio.disable_dv_gateway_detached_unverified().await {
         Ok(update) => update,
         Err(operation_error) => {
             let recovery = radio.recover_from_interrupted_mcp().await;
@@ -1359,87 +1102,12 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn candidate_probe_admission_keeps_the_complete_recovery_budget() {
-        assert!(!bluetooth_candidate_probe_fits(
+    fn device_probe_admission_keeps_the_complete_recovery_budget() {
+        assert!(!bluetooth_device_probe_fits(
             std::time::Duration::from_secs(59)
         ));
-        assert!(bluetooth_candidate_probe_fits(
-            BLUETOOTH_CANDIDATE_PROBE_RESERVE
-        ));
-        assert!(BLUETOOTH_CANDIDATE_PROBE_RESERVE < BLUETOOTH_CANDIDATE_PROBE_WINDOW);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn custom_candidate_pages_advance_past_eight_in_stable_address_order()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let candidates = (0_u8..10)
-            .rev()
-            .map(|suffix| {
-                let colon_form = format!("40:f3:b0:ae:1c:{suffix:02x}");
-                canonicalize_bluetooth_address(&colon_form)
-                    .ok_or_else(|| format!("test address was invalid: {colon_form}"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let first = bounded_incomplete_probe_page(&candidates, &[], String::as_str);
-        let first_addresses = first
-            .iter()
-            .map(|address| (*address).clone())
-            .collect::<Vec<_>>();
-        assert_eq!(first_addresses.len(), MAX_BLUETOOTH_CANDIDATE_PROBES);
-        assert_eq!(
-            first_addresses.first().map(String::as_str),
-            Some("40-F3-B0-AE-1C-00")
-        );
-        assert_eq!(
-            first_addresses.last().map(String::as_str),
-            Some("40-F3-B0-AE-1C-07")
-        );
-
-        let second = bounded_incomplete_probe_page(&candidates, &first_addresses, String::as_str);
-        let second_addresses = second
-            .iter()
-            .map(|address| address.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            second_addresses,
-            vec!["40-F3-B0-AE-1C-08", "40-F3-B0-AE-1C-09"]
-        );
-
-        // Before the second pass, -00 was unpaired and -01 gained a native
-        // radio hint, so neither remains in the unhinted scan inventory.
-        let changed_inventory = candidates
-            .iter()
-            .filter(|address| !address.ends_with("-00") && !address.ends_with("-01"))
-            .cloned()
-            .collect::<Vec<_>>();
-        let retained = retained_completed_probe_addresses(
-            &changed_inventory,
-            &first_addresses,
-            String::as_str,
-        );
-        assert_eq!(
-            retained,
-            vec![
-                "40-F3-B0-AE-1C-02",
-                "40-F3-B0-AE-1C-03",
-                "40-F3-B0-AE-1C-04",
-                "40-F3-B0-AE-1C-05",
-                "40-F3-B0-AE-1C-06",
-                "40-F3-B0-AE-1C-07",
-            ]
-        );
-        let changed_second =
-            bounded_incomplete_probe_page(&changed_inventory, &first_addresses, String::as_str);
-        let changed_second_addresses = changed_second
-            .iter()
-            .map(|address| address.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            changed_second_addresses,
-            vec!["40-F3-B0-AE-1C-08", "40-F3-B0-AE-1C-09"]
-        );
-        Ok(())
+        assert!(bluetooth_device_probe_fits(BLUETOOTH_DEVICE_PROBE_RESERVE));
+        assert!(BLUETOOTH_DEVICE_PROBE_RESERVE < BLUETOOTH_DEVICE_PROBE_WINDOW);
     }
 
     #[cfg(target_os = "macos")]
@@ -1449,7 +1117,7 @@ mod tests {
         let first = BLUETOOTH_HELPER_ENUMERATION_GATE.lock().await;
         let cancellation = RecoveryCancellation::default();
         let operation = async {
-            let enumeration = enumerate_bluetooth_candidates_cancellable(
+            let enumeration = enumerate_paired_bluetooth_devices_cancellable(
                 std::path::PathBuf::from("unused-helper-path"),
                 &cancellation,
             );
@@ -1495,7 +1163,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn custom_candidate_proof_requires_exact_thd75_id_before_ae()
+    async fn paired_device_proof_requires_exact_thd75_id_before_ae()
     -> Result<(), Box<dyn std::error::Error>> {
         let cancellation = RecoveryCancellation::default();
 
@@ -1503,19 +1171,19 @@ mod tests {
         exact_transport.expect(b"ID\r", b"ID TH-D75\r");
         exact_transport.expect(b"AE\r", b"AE C3C10368,K01\r");
         let mut exact_radio = Radio::new(exact_transport);
-        let exact = query_bluetooth_candidate_identity(&mut exact_radio, &cancellation).await?;
+        let exact = query_bluetooth_device_identity(&mut exact_radio, &cancellation).await?;
         assert!(matches!(
             exact,
-            BluetoothCandidateProbe::Identified(serial) if serial.as_str() == "C3C10368"
+            BluetoothDeviceProbe::Identified(serial) if serial.as_str() == "C3C10368"
         ));
 
         let mut other_transport = MockTransport::new();
         other_transport.expect(b"ID\r", b"ID TH-D74\r");
         let mut other_radio = Radio::new(other_transport);
-        let other = query_bluetooth_candidate_identity(&mut other_radio, &cancellation).await?;
+        let other = query_bluetooth_device_identity(&mut other_radio, &cancellation).await?;
         assert!(matches!(
             other,
-            BluetoothCandidateProbe::IdentityFailed(detail)
+            BluetoothDeviceProbe::IdentityFailed(detail)
                 if detail.contains("exact CAT ID failed")
         ));
         Ok(())

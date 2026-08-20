@@ -809,10 +809,10 @@ impl AutomationController {
 
 /// Connect through Swift's USB byte stream and prove the automation extension.
 ///
-/// Qualification attests the exact TH-D75 model, CAT firmware identity
-/// `1.03.AZM`, patched hooks, complete V1.03.AZM runtime, ABI, aperture bounds,
-/// and stable metadata. It then runs the missing-snapshot refusal canary before
-/// returning the controller.
+/// Qualification attests a valid CAT serial response, the exact TH-D75 model,
+/// CAT firmware identity `1.03.AZM`, patched hooks, complete V1.03.AZM runtime,
+/// ABI, aperture bounds, and stable metadata. It then runs the missing-snapshot
+/// refusal canary before returning the controller.
 ///
 /// # Errors
 ///
@@ -1097,9 +1097,14 @@ async fn run_controller(
         } else {
             Ok(())
         };
-        let qualification = match cat_synchronization {
-            Ok(()) => qualify_automation(&mut radio).await,
-            Err(detail) => Err(detail),
+        let initial_serial_identity = if initial_ready.is_some() {
+            verify_radio_serial_identity(&mut radio).await
+        } else {
+            Ok(())
+        };
+        let qualification = match (cat_synchronization, initial_serial_identity) {
+            (Ok(()), Ok(())) => qualify_automation(&mut radio).await,
+            (Err(detail), _) | (_, Err(detail)) => Err(detail),
         };
         let mut session = match qualification {
             Ok(session) => session,
@@ -1456,6 +1461,14 @@ async fn qualify_automation(
         .map_err(|error| error.to_string())?;
     drop(canary);
     Ok(session)
+}
+
+async fn verify_radio_serial_identity(radio: &mut Radio<SwiftByteTransport>) -> Result<(), String> {
+    radio
+        .get_serial_information()
+        .await
+        .map(|_information| ())
+        .map_err(|error| format!("CAT serial identity failed: {error}"))
 }
 
 #[expect(
