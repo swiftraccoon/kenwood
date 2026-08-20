@@ -135,7 +135,7 @@ final class AzimuthRadioEndpointSelectionTests: XCTestCase {
             id: "bluetooth:AA:BB:CC:DD:EE:FF",
             name: "Field TH-D75",
             transport: .bluetooth,
-            detail: "AA:BB:CC:DD:EE:FF"
+            detail: "AA-BB-CC-DD-EE-FF"
         )
         let selector = EndpointTestSelector(initialEndpoints: [usb, bluetooth])
         selector.resolvedEndpoint = resolved
@@ -307,60 +307,6 @@ final class AzimuthRadioEndpointSelectionTests: XCTestCase {
         await refresh.value
     }
 
-    func testCustomSearchRequiresAtLeastOneUnhintedPairedDevice() async {
-        let selector = EndpointTestSelector(initialEndpoints: [usb, bluetooth])
-        selector.customSearchSupported = true
-        selector.nextRefresh = .success([usb, bluetooth])
-        selector.nextPairedBluetoothDeviceCount = 1
-        selector.nextLikelyBluetoothRadioCount = 1
-        let model = makeModel(selector: selector)
-
-        await model.refreshRadioEndpoints().value
-
-        XCTAssertFalse(model.canFindCustomNamedBluetoothRadios)
-
-        selector.nextPairedBluetoothDeviceCount = 2
-        await model.refreshRadioEndpoints().value
-
-        XCTAssertTrue(model.canFindCustomNamedBluetoothRadios)
-    }
-
-    func testCustomSearchAddsOnlySelectorProvedEndpoint() async {
-        let proven = RadioEndpoint(
-            id: "bluetooth:10:20:30:40:50:60",
-            name: "Portable D75",
-            transport: .bluetooth,
-            detail: "10:20:30:40:50:60"
-        )
-        let selector = EndpointTestSelector(initialEndpoints: [usb])
-        selector.customSearchSupported = true
-        selector.nextRefresh = .success([usb])
-        selector.nextPairedBluetoothDeviceCount = 1
-        selector.nextLikelyBluetoothRadioCount = 0
-        selector.nextCustomSearchResult = RadioEndpointBluetoothSearchResult(
-            snapshot: RadioEndpointDiscoverySnapshot(
-                endpoints: [usb, proven],
-                pairedBluetoothDeviceCount: 1,
-                likelyBluetoothRadioCount: 0
-            ),
-            probedCandidateCount: 1,
-            totalUnhintedCandidateCount: 1,
-            isComplete: true,
-            wasCancelled: false
-        )
-        let model = makeModel(selector: selector)
-        await model.refreshRadioEndpoints().value
-
-        await model.findCustomNamedBluetoothRadios().value
-
-        XCTAssertEqual(model.radioEndpoints, [usb, proven])
-        XCTAssertEqual(
-            model.bluetoothRadioSearchState,
-            .completed(probed: 1, total: 1, radiosFound: 1)
-        )
-        XCTAssertFalse(model.canFindCustomNamedBluetoothRadios)
-    }
-
     func testFixedDefaultSelectorKeepsExistingUSBConnectBehavior() async {
         let controller = EndpointTestRadioController()
         let model = AzimuthSceneModel(
@@ -419,17 +365,12 @@ private final class EndpointTestSelector: RadioEndpointSelecting {
     var nextRefresh: Result<[RadioEndpoint], Error>?
     var nextWarning: String?
     var nextPairedBluetoothDeviceCount: UInt32?
-    var nextLikelyBluetoothRadioCount: UInt32?
-    var customSearchSupported = false
-    var nextCustomSearchResult: RadioEndpointBluetoothSearchResult?
     var refreshDelay: Duration?
     var selectionError: Error?
     var resolvedEndpoint: RadioEndpoint?
     private(set) var refreshCallCount = 0
     private(set) var selectedEndpointIDs: [String] = []
     private let events: EndpointEventRecorder?
-
-    var supportsCustomNamedBluetoothSearch: Bool { customSearchSupported }
 
     init(
         initialEndpoints: [RadioEndpoint],
@@ -447,17 +388,8 @@ private final class EndpointTestSelector: RadioEndpointSelecting {
         return RadioEndpointDiscoverySnapshot(
             endpoints: try nextRefresh?.get() ?? initialEndpoints,
             warning: nextWarning,
-            pairedBluetoothDeviceCount: nextPairedBluetoothDeviceCount,
-            likelyBluetoothRadioCount: nextLikelyBluetoothRadioCount
+            pairedBluetoothDeviceCount: nextPairedBluetoothDeviceCount
         )
-    }
-
-    func findCustomNamedBluetoothRadios() async throws
-        -> RadioEndpointBluetoothSearchResult {
-        guard let nextCustomSearchResult else {
-            throw RadioEndpointSelectionError.customBluetoothSearchUnavailable
-        }
-        return nextCustomSearchResult
     }
 
     func selectEndpoint(id: String) async throws {

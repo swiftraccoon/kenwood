@@ -352,7 +352,7 @@ final class AzimuthLiveRadioControllerTests: XCTestCase {
         await controller.disconnect()
     }
 
-    func testBluetoothMMDVMRejectsCATWithoutAuthorizingUSBRecovery() async throws {
+    func testBluetoothMMDVMIsTypedWithoutAuthorizingMenu650Recovery() async throws {
         let transport = IntegrationTestTransport(connectionKind: .bluetooth)
         let connector = IntegrationTestCoreConnector(core: IntegrationTestCore())
         let recovery = IntegrationTestCATRecovery()
@@ -370,17 +370,14 @@ final class AzimuthLiveRadioControllerTests: XCTestCase {
             try await controller.connect()
             XCTFail("Bluetooth MMDVM mode must not enter CAT automation")
         } catch let error as RadioControllerError {
-            guard case .operationFailed(let reason) = error else {
-                return XCTFail("Bluetooth MMDVM must be an operation error, got \(error)")
-            }
-            XCTAssertTrue(reason.contains("selected Bluetooth interface"))
-            XCTAssertTrue(reason.contains("choose USB-C"))
+            XCTAssertEqual(error, .bluetoothMmdvmMode)
         }
 
         XCTAssertEqual(transport.openCallCount, 1)
         XCTAssertEqual(transport.closeCallCount, 1)
         XCTAssertEqual(connector.callCount, 0)
         XCTAssertFalse(controller.automaticCATRecoveryAvailable)
+        XCTAssertFalse(controller.usbCATFallbackAvailable)
         XCTAssertNil(recovery.lastExpectedSerialNumber)
 
         do {
@@ -393,6 +390,46 @@ final class AzimuthLiveRadioControllerTests: XCTestCase {
             XCTAssertTrue(reason.contains("validated USB MMDVM response"))
         }
         XCTAssertEqual(recovery.callCount, 0)
+    }
+
+    func testBluetoothMMDVMOffersAndRunsConsentedExactUSBHandoff() async throws {
+        let transport = IntegrationBluetoothMMDVMUSBTransport()
+        let connector = IntegrationTestCoreConnector(core: IntegrationTestCore())
+        let preflight = IntegrationTestModePreflight(modes: [.mmdvm, .cat])
+        let recovery = IntegrationTestCATRecovery()
+        let controller = try AzimuthLiveRadioController(
+            transport: transport,
+            connectCore: { transport in
+                try await connector.connect(transport: transport)
+            },
+            prepareRadioForAutomation: { _ in try preflight.nextMode() },
+            recoverUSBMMDVM: { serialNumber, _ in recovery.operation(serialNumber) },
+            automaticCATRecoveryAvailable: true
+        )
+
+        do {
+            try await controller.connect()
+            XCTFail("Bluetooth MMDVM mode must wait for handoff consent")
+        } catch let error as RadioControllerError {
+            XCTAssertEqual(error, .bluetoothMmdvmMode)
+        }
+
+        XCTAssertTrue(controller.usbCATFallbackAvailable)
+        XCTAssertEqual(transport.usbSelectionCount, 0)
+        XCTAssertEqual(connector.callCount, 0)
+        XCTAssertEqual(recovery.callCount, 0)
+
+        try await controller.connectViaUSBFromBluetoothMMDVM()
+
+        XCTAssertEqual(transport.usbSelectionCount, 1)
+        XCTAssertEqual(connector.callCount, 1)
+        XCTAssertEqual(recovery.callCount, 0)
+        XCTAssertFalse(controller.usbCATFallbackAvailable)
+        XCTAssertEqual(
+            controller.currentState.connection,
+            .connected(device: "Kenwood TH-D75", transport: "USB-C")
+        )
+        await controller.disconnect()
     }
 
     func testTwoUnresponsiveBluetoothSessionsReopenOnceAndReportBluetoothFailure() async throws {
@@ -1736,6 +1773,44 @@ private final class IntegrationSameRadioTransport:
     func selectUSBForRecovery(expectedSerialNumber: String) async throws {
         _ = expectedSerialNumber
         lock.withLock { usbRecoverySelections += 1 }
+    }
+}
+
+private final class IntegrationBluetoothMMDVMUSBTransport:
+    AzimuthRadioTransport, AzimuthBluetoothMMDVMUSBSelecting, @unchecked Sendable
+{
+    private let lock = NSLock()
+    private let base = IntegrationTestTransport(connectionKind: .bluetooth)
+    private var selectedDevice = AzimuthRadioDevice(
+        id: "bluetooth:00-11-22-33-44-55",
+        name: "Kenwood TH-D75",
+        connectionKind: .bluetooth,
+        connection: "Bluetooth"
+    )
+    private var usbSelections = 0
+
+    var usbSelectionCount: Int { lock.withLock { usbSelections } }
+    var device: AzimuthRadioDevice { lock.withLock { selectedDevice } }
+    var state: AzimuthRadioTransportState { get async { await base.state } }
+    var stateStream: AsyncStream<AzimuthRadioTransportState> { base.stateStream }
+    var hardwareSerialNumber: String? { get async { base.hardwareSerialNumber } }
+
+    func open() async throws { try await base.open() }
+    func close() async { await base.close() }
+    func setBaudRate(baud: UInt32) throws { try base.setBaudRate(baud: baud) }
+    func write(_ bytes: [UInt8]) async throws { try await base.write(bytes) }
+    func read(maxBytes: Int) async throws -> [UInt8] {
+        try await base.read(maxBytes: maxBytes)
+    }
+
+    func hasSoleIdentifiedUSBEndpoint() async throws -> Bool { true }
+
+    func selectSoleUSBForBluetoothMMDVM() async throws -> String {
+        lock.withLock {
+            selectedDevice = .thD75USBC
+            usbSelections += 1
+        }
+        return "C3C10368"
     }
 }
 

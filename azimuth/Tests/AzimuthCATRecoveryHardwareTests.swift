@@ -16,11 +16,84 @@ import XCTest
 /// `AZIMUTH_HARDWARE_BLUETOOTH_PRIMARY=1` and the exact paired address in
 /// `AZIMUTH_HARDWARE_BLUETOOTH_ADDRESS`; it runs the ordinary Azimuth mode
 /// preflight, automation qualification, settings read, and screen capture.
+/// When the selected Bluetooth interface intentionally carries persistent
+/// MMDVM traffic, `AZIMUTH_HARDWARE_BLUETOOTH_MMDVM=1` plus the same exact
+/// address proves discovery, exact-address opening, and typed MMDVM detection
+/// without changing Menu 650.
 /// The full prompt and USB reconnect test additionally requires the attached
 /// radio to begin in DV Gateway mode and uses
 /// `AZIMUTH_HARDWARE_DV_GATEWAY_RECOVERY=1`.
 @MainActor
 final class AzimuthCATRecoveryHardwareTests: XCTestCase {
+    func testLiveSelectableBluetoothEndpointProvesMMDVMWithoutMutation() async throws {
+        guard ProcessInfo.processInfo.environment[
+            "AZIMUTH_HARDWARE_BLUETOOTH_MMDVM"
+        ] == "1" else {
+            throw XCTSkip(
+                "Set AZIMUTH_HARDWARE_BLUETOOTH_MMDVM=1 for the live radio test."
+            )
+        }
+        guard let expectedAddress = ProcessInfo.processInfo.environment[
+            "AZIMUTH_HARDWARE_BLUETOOTH_ADDRESS"
+        ], !expectedAddress.isEmpty else {
+            throw XCTSkip(
+                "Set AZIMUTH_HARDWARE_BLUETOOTH_ADDRESS to the exact paired radio address."
+            )
+        }
+
+        let records = settingCatalog()
+        let router = try AzimuthSelectableRadioTransport(
+            usbFactory: AzimuthPlatformUSBTransportFactory(),
+            bluetoothFactory: AzimuthGeneratedBluetoothLinkFactory()
+        )
+        let selector = AzimuthSelectableRadioEndpointSelector(router: router)
+        let controller = try AzimuthLiveRadioController(
+            transport: router,
+            records: records
+        )
+        let provider = try AzimuthCoreCatalogProvider(records: records)
+        let model = AzimuthSceneModel(
+            radioController: controller,
+            catalogProvider: provider,
+            assistantPlanner: OnDeviceAssistantPlanner(),
+            radioEndpointSelector: selector,
+            initialCatalog: provider.initialCatalog
+        )
+
+        await model.refreshRadioEndpoints().value
+        let normalizedExpectedAddress = expectedAddress.replacingOccurrences(
+            of: "-",
+            with: ":"
+        )
+        let matching = model.radioEndpoints.filter {
+            $0.transport == .bluetooth
+                && $0.detail?
+                    .replacingOccurrences(of: "-", with: ":")
+                    .caseInsensitiveCompare(normalizedExpectedAddress) == .orderedSame
+        }
+        XCTAssertEqual(
+            matching.count,
+            1,
+            "Paired discovery must expose the exact selected address once. Refresh state: \(model.radioEndpointRefreshState). Bluetooth warning: \(model.radioEndpointDiscoveryWarning ?? "none"). Refresh error: \(model.radioEndpointRefreshError ?? "none")."
+        )
+        guard let endpoint = matching.first else { return }
+        model.selectRadioEndpoint(id: endpoint.id)
+
+        await model.connectRadio()
+        let operationError = model.operationError
+        let recoveryAlert = model.catRecoveryAlert
+        let connection = model.radioState.connection
+        await controller.disconnect()
+
+        XCTAssertNil(operationError)
+        guard case .bluetoothMmdvmMode = recoveryAlert else {
+            return XCTFail(
+                "Azimuth must prove persistent Bluetooth MMDVM mode and stop before CAT automation."
+            )
+        }
+        XCTAssertFalse(connection.isConnected)
+    }
+
     func testLiveSelectableBluetoothEndpointCompletesAutomationConnection() async throws {
         guard ProcessInfo.processInfo.environment[
             "AZIMUTH_HARDWARE_BLUETOOTH_PRIMARY"

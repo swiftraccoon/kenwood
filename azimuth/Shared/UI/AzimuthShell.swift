@@ -43,6 +43,11 @@ struct AzimuthShell: View {
                 set: { if !$0 { model.dismissCATRecoveryAlert() } }
             )
         ) {
+            if model.catRecoveryAlert?.usbFallbackAvailable == true {
+                Button("Try USB-C") {
+                    Task { await model.connectViaUSBFromBluetoothMMDVM() }
+                }
+            }
             if model.catRecoveryAlert?.bluetoothFallbackAvailable == true {
                 Button("Try Bluetooth") {
                     Task { await model.connectViaBluetoothFromUSBMMDVM() }
@@ -135,6 +140,8 @@ struct AzimuthShell: View {
             switch model.radioConnectionActivity {
             case .bluetoothHandoff:
                 return "BLUETOOTH HANDOFF"
+            case .usbHandoff:
+                return "USB-C HANDOFF"
             case .menu650Recovery:
                 return "USB-C CAT RECOVERY"
             case .connection:

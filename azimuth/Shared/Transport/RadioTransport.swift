@@ -93,6 +93,17 @@ protocol AzimuthSameRadioBluetoothSelecting: Sendable {
     ) async throws
 }
 
+/// Optional non-destructive handoff from a Bluetooth interface that is
+/// carrying persistent MMDVM traffic to the sole attached USB-C radio.
+///
+/// Availability never changes selection. Selection occurs only after the user
+/// accepts the recovery prompt, and returns the USB device's stable serial so
+/// the subsequent CAT connection can prove the exact endpoint again.
+protocol AzimuthBluetoothMMDVMUSBSelecting: Sendable {
+    func hasSoleIdentifiedUSBEndpoint() async throws -> Bool
+    func selectSoleUSBForBluetoothMMDVM() async throws -> String
+}
+
 public extension AzimuthRadioTransport {
     var hardwareSerialNumber: String? { get async { nil } }
 }

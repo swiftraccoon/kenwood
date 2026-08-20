@@ -45,7 +45,6 @@ struct RadioWorkspace: View {
                 if let endpointWarning = model.radioEndpointDiscoveryWarning {
                     macEndpointDiscoveryWarning(endpointWarning)
                 }
-                macBluetoothRadioSearchResult
                 #endif
 
                 radioConsole
@@ -79,7 +78,6 @@ struct RadioWorkspace: View {
         ToolbarItemGroup(placement: .primaryAction) {
             macEndpointPicker
             macEndpointRefreshAction
-            macCustomNamedBluetoothSearchAction
             connectionToolbarStatus
             connectionToolbarAction
         }
@@ -164,87 +162,6 @@ struct RadioWorkspace: View {
             .help("Refresh USB-C and paired Bluetooth connections")
             .accessibilityIdentifier("azimuth.radio.refresh-endpoints")
         }
-    }
-
-    @ViewBuilder
-    private var macCustomNamedBluetoothSearchAction: some View {
-        if model.showsCustomNamedBluetoothRadioSearch {
-            if model.bluetoothRadioSearchState.isSearching {
-                Button {
-                    Task { await model.cancelCustomNamedBluetoothRadioSearch() }
-                } label: {
-                    Label("Stop Bluetooth Search", systemImage: "stop.circle")
-                }
-                .help("Stop after the current native probe is interrupted safely. TH-D75 radios proved by completed probes remain listed; persistent menu settings are not changed.")
-                .accessibilityIdentifier("azimuth.radio.stop-custom-bluetooth-search")
-            } else {
-                Button {
-                    model.findCustomNamedBluetoothRadios()
-                } label: {
-                    Label(
-                        "Find Custom-Named TH-D75…",
-                        systemImage: "dot.radiowaves.left.and.right"
-                    )
-                }
-                .disabled(!model.canFindCustomNamedBluetoothRadios)
-                .help("CAT-probe paired devices omitted from the picker and add only exact endpoints proved to be TH-D75 radios. A probe may exit transient KISS or MMDVM packet mode on a paired TH-D75, but it does not change persistent menu settings.")
-                .accessibilityIdentifier("azimuth.radio.find-custom-bluetooth")
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var macBluetoothRadioSearchResult: some View {
-        switch model.bluetoothRadioSearchState {
-        case .idle, .searching:
-            EmptyView()
-        case .completed(let probed, let total, let radiosFound):
-            macBluetoothRadioSearchPanel(
-                "Custom-name search checked \(probed) of \(total) paired-device candidates and added \(radiosFound) proved TH-D75 connection\(radiosFound == 1 ? "" : "s").",
-                warning: false
-            )
-        case .incomplete(let probed, let total, let radiosFound):
-            macBluetoothRadioSearchPanel(
-                "Custom-name search reached its safety bound after \(probed) of \(total) candidates and added \(radiosFound) proved TH-D75 connection\(radiosFound == 1 ? "" : "s"). You can search again.",
-                warning: true
-            )
-        case .stopped(let probed, let total, let radiosFound):
-            macBluetoothRadioSearchPanel(
-                "Custom-name search stopped after \(probed) of \(total) candidates. It retained \(radiosFound) TH-D75 connection\(radiosFound == 1 ? "" : "s") proved during this pass; persistent menu settings were not changed.",
-                warning: true
-            )
-        case .failed(let message):
-            macBluetoothRadioSearchPanel(
-                "Custom-name Bluetooth search failed: \(message)",
-                warning: true
-            )
-        }
-    }
-
-    private func macBluetoothRadioSearchPanel(
-        _ message: String,
-        warning: Bool
-    ) -> some View {
-        InstrumentPanel {
-            HStack(alignment: .firstTextBaseline, spacing: 12) {
-                Label(
-                    message,
-                    systemImage: warning
-                        ? "exclamationmark.triangle.fill"
-                        : "checkmark.circle.fill"
-                )
-                .foregroundStyle(warning ? .orange : AzimuthPalette.signal)
-                Spacer()
-                if warning {
-                    Button("Try Again") {
-                        model.findCustomNamedBluetoothRadios()
-                    }
-                    .disabled(!model.canFindCustomNamedBluetoothRadios)
-                }
-            }
-            .font(.callout)
-        }
-        .accessibilityIdentifier("azimuth.radio.custom-bluetooth-search-result")
     }
 
     private func macEndpointDiscoveryError(_ message: String) -> some View {
@@ -340,6 +257,8 @@ struct RadioWorkspace: View {
             return "Connecting to TH-D75"
         case .bluetoothHandoff:
             return "Connecting to the same TH-D75 over Bluetooth"
+        case .usbHandoff:
+            return "Connecting to the TH-D75 over USB-C"
         case .menu650Recovery:
             return "Restoring USB-C CAT control"
         }
@@ -351,6 +270,7 @@ struct RadioWorkspace: View {
         switch activity {
         case .connection: return "Stop Connecting"
         case .bluetoothHandoff: return "Stop Bluetooth Handoff"
+        case .usbHandoff: return "Stop USB-C Handoff"
         case .menu650Recovery: return "Stop CAT Recovery"
         }
     }
@@ -363,6 +283,8 @@ struct RadioWorkspace: View {
             return "Stops this connection attempt and waits for the selected transport to close safely."
         case .bluetoothHandoff:
             return "Stops the non-destructive Bluetooth handoff and leaves Menu 650 unchanged."
+        case .usbHandoff:
+            return "Stops the non-destructive USB-C handoff and leaves Menu 650 unchanged."
         case .menu650Recovery:
             return "Stops before Menu 650 when possible. If the approved radio operation has already started, Azimuth finishes it safely before disconnecting."
         }
@@ -374,6 +296,7 @@ struct RadioWorkspace: View {
         switch activity {
         case .connection: return "azimuth.radio.cancel-connection"
         case .bluetoothHandoff: return "azimuth.radio.cancel-bluetooth-handoff"
+        case .usbHandoff: return "azimuth.radio.cancel-usb-handoff"
         case .menu650Recovery: return "azimuth.radio.cancel-cat-recovery"
         }
     }

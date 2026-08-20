@@ -10,8 +10,8 @@ import Foundation
 public struct AzimuthBluetoothEndpoint: Identifiable, Sendable, Equatable {
     public let address: String
     public let displayName: String
-    /// CAT serial proved during an explicit custom-name search. When present,
-    /// every later exact-address open re-proves this identity.
+    /// CAT serial proved during same-radio USB-to-Bluetooth recovery. When
+    /// present, every later exact-address open re-proves this identity.
     public let verifiedCATSerialNumber: String?
 
     public var id: String {
@@ -65,79 +65,22 @@ public extension AzimuthBluetoothByteLink {
 
 /// One native paired-device inventory.
 ///
-/// Only likely radio candidates belong in the endpoint picker. The total is
-/// kept separately because a TH-D75 with a custom Bluetooth name or no cached
-/// SPP metadata can still be found and proved by the same-radio serial scan.
+/// Every endpoint is shown in the picker. Its exact address is selection
+/// identity and its display name is presentation only; neither claims that the
+/// device is a TH-D75.
 public struct AzimuthBluetoothDiscoverySnapshot: Sendable, Equatable {
-    public let likelyRadioEndpoints: [AzimuthBluetoothEndpoint]
-    public let totalPairedDeviceCount: UInt32
-    /// Canonical exact addresses for membership checks. These are never
-    /// presented as radio endpoints until a hint or CAT proof qualifies them.
-    public let pairedDeviceAddresses: [String]
+    public let pairedEndpoints: [AzimuthBluetoothEndpoint]
 
     public init(
-        likelyRadioEndpoints: [AzimuthBluetoothEndpoint],
-        totalPairedDeviceCount: UInt32,
-        pairedDeviceAddresses: [String]
+        pairedEndpoints: [AzimuthBluetoothEndpoint]
     ) {
-        self.likelyRadioEndpoints = likelyRadioEndpoints
-        self.totalPairedDeviceCount = totalPairedDeviceCount
-        self.pairedDeviceAddresses = pairedDeviceAddresses
-    }
-}
-
-/// Result of explicitly probing paired devices omitted from normal discovery.
-public struct AzimuthBluetoothRadioSearchSnapshot: Sendable, Equatable {
-    public let provenRadioEndpoints: [AzimuthBluetoothEndpoint]
-    /// Likely-radio rows from the exact paired inventory used by this search.
-    /// Authoritative only when `hasInventorySnapshot` is true.
-    public let likelyRadioEndpoints: [AzimuthBluetoothEndpoint]
-    /// Canonical membership inventory observed by this search pass.
-    public let pairedDeviceAddresses: [String]
-    public let totalPairedDeviceCount: UInt32
-    public let probedAddresses: [String]
-    /// Authoritative cumulative exclusions still present in the inventory
-    /// observed by this pass, plus addresses completed during this pass.
-    public let currentProbedAddresses: [String]
-    public let hasInventorySnapshot: Bool
-    public let probedCandidateCount: UInt32
-    public let totalUnhintedCandidateCount: UInt32
-    public let isComplete: Bool
-    public let wasCancelled: Bool
-
-    public init(
-        provenRadioEndpoints: [AzimuthBluetoothEndpoint],
-        likelyRadioEndpoints: [AzimuthBluetoothEndpoint],
-        pairedDeviceAddresses: [String],
-        totalPairedDeviceCount: UInt32,
-        probedAddresses: [String],
-        currentProbedAddresses: [String],
-        hasInventorySnapshot: Bool,
-        probedCandidateCount: UInt32,
-        totalUnhintedCandidateCount: UInt32,
-        isComplete: Bool,
-        wasCancelled: Bool
-    ) {
-        self.provenRadioEndpoints = provenRadioEndpoints
-        self.likelyRadioEndpoints = likelyRadioEndpoints
-        self.pairedDeviceAddresses = pairedDeviceAddresses
-        self.totalPairedDeviceCount = totalPairedDeviceCount
-        self.probedAddresses = probedAddresses
-        self.currentProbedAddresses = currentProbedAddresses
-        self.hasInventorySnapshot = hasInventorySnapshot
-        self.probedCandidateCount = probedCandidateCount
-        self.totalUnhintedCandidateCount = totalUnhintedCandidateCount
-        self.isComplete = isComplete
-        self.wasCancelled = wasCancelled
+        self.pairedEndpoints = pairedEndpoints
     }
 }
 
 /// Discovers paired devices and creates a link for an exact address.
 public protocol AzimuthBluetoothLinkFactory: Sendable {
     func pairedDeviceDiscovery() async throws -> AzimuthBluetoothDiscoverySnapshot
-    func findCustomNamedRadios(
-        previouslyProbedAddresses: [String]
-    ) async throws -> AzimuthBluetoothRadioSearchSnapshot
     func makeLink(exactAddress: String) async throws -> any AzimuthBluetoothByteLink
     func makeLink(
         exactAddress: String,
@@ -159,24 +102,18 @@ public struct AzimuthBluetoothCoreBridge: AzimuthBluetoothLinkFactory, Sendable 
         -> any AzimuthBluetoothByteLink
     public typealias QualifiedLinkBuilder = @Sendable (String, String) async throws
         -> any AzimuthBluetoothByteLink
-    public typealias RadioSearch = @Sendable ([String]) async throws
-        -> AzimuthBluetoothRadioSearchSnapshot
-
     private let discover: EndpointDiscovery
     private let buildExactLink: ExactLinkBuilder
     private let buildQualifiedLink: QualifiedLinkBuilder
     private let buildMatchingLink: ExactLinkBuilder
-    private let search: RadioSearch
 
     public init(
         discover: @escaping EndpointDiscovery,
-        search: @escaping RadioSearch,
         buildExactLink: @escaping ExactLinkBuilder,
         buildQualifiedLink: @escaping QualifiedLinkBuilder,
         buildMatchingLink: @escaping ExactLinkBuilder
     ) {
         self.discover = discover
-        self.search = search
         self.buildExactLink = buildExactLink
         self.buildQualifiedLink = buildQualifiedLink
         self.buildMatchingLink = buildMatchingLink
@@ -184,12 +121,6 @@ public struct AzimuthBluetoothCoreBridge: AzimuthBluetoothLinkFactory, Sendable 
 
     public func pairedDeviceDiscovery() async throws -> AzimuthBluetoothDiscoverySnapshot {
         try await discover()
-    }
-
-    public func findCustomNamedRadios(
-        previouslyProbedAddresses: [String]
-    ) async throws -> AzimuthBluetoothRadioSearchSnapshot {
-        try await search(previouslyProbedAddresses)
     }
 
     public func makeLink(exactAddress: String) async throws -> any AzimuthBluetoothByteLink {

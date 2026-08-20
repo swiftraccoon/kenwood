@@ -51,6 +51,7 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
 
     private let transport: any AzimuthRadioTransport
     private let sameRadioBluetoothSelector: (any AzimuthSameRadioBluetoothSelecting)?
+    private let bluetoothMmdvmUSBSelector: (any AzimuthBluetoothMMDVMUSBSelecting)?
     private let coreTransport: AzimuthCoreByteTransport
     private let schema: AzimuthCoreSettingSchema
     private let connectCore: CoreConnector
@@ -82,6 +83,8 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
     private var usbMmdvmExpectedRadioSerialNumber: String?
     private var usbMmdvmRecoverySlot: USBMMDVMRecoverySlot?
     private var nextUSBMMDVMRecoveryID: UInt64 = 0
+    private var bluetoothMmdvmUSBHandoffPending = false
+    private var bluetoothMmdvmUSBHandoffAvailable = false
 
     var automaticCATRecoveryAvailable: Bool {
         supportsAutomaticCATRecovery && usbMmdvmExpectedRadioSerialNumber != nil
@@ -89,6 +92,10 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
 
     var bluetoothCATFallbackAvailable: Bool {
         sameRadioBluetoothSelector != nil && usbMmdvmExpectedRadioSerialNumber != nil
+    }
+
+    var usbCATFallbackAvailable: Bool {
+        bluetoothMmdvmUSBHandoffPending && bluetoothMmdvmUSBHandoffAvailable
     }
 
     private struct CaptureSlot {
@@ -139,6 +146,8 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
         self.transport = transport
         sameRadioBluetoothSelector =
             transport as? any AzimuthSameRadioBluetoothSelecting
+        bluetoothMmdvmUSBSelector =
+            transport as? any AzimuthBluetoothMMDVMUSBSelecting
         coreTransport = AzimuthCoreByteTransport(radioTransport: transport)
         schema = try AzimuthCoreSettingSchema(records: records)
         self.connectCore = connectCore
@@ -232,6 +241,8 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
         try beginExclusive("connect")
         usbMmdvmRecoveryPending = false
         usbMmdvmExpectedRadioSerialNumber = nil
+        bluetoothMmdvmUSBHandoffPending = false
+        bluetoothMmdvmUSBHandoffAvailable = false
         sessionEpoch &+= 1
         let epoch = sessionEpoch
         stopScreenPolling()
@@ -308,9 +319,7 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
                     usbMmdvmExpectedRadioSerialNumber = await transport.hardwareSerialNumber
                     throw AzimuthRadioModePreflightError.usbMmdvmMode
                 }
-                throw RadioControllerError.operationFailed(
-                    "The selected Bluetooth interface returned a validated MMDVM response after Azimuth sent the packet-mode exit sequence, so that interface cannot carry CAT while it is assigned to DV Gateway. Disconnect and choose USB-C, or change the radio's DV Gateway interface assignment before retrying Bluetooth."
-                )
+                throw AzimuthRadioModePreflightError.bluetoothMmdvmMode
             }
             guard wireMode == .cat else {
                 if connectionKind == .usb {
@@ -405,6 +414,8 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
         } catch {
             let detectedUSBMMDVM =
                 (error as? AzimuthRadioModePreflightError) == .usbMmdvmMode
+            let detectedBluetoothMMDVM =
+                (error as? AzimuthRadioModePreflightError) == .bluetoothMmdvmMode
             azimuthRadioCoreLog.error(
                 "[Azimuth Radio] Connection failed during \(connectionStage, privacy: .public) type=\(azimuthRadioErrorIdentity(error), privacy: .public) detail=\(error.localizedDescription, privacy: .private)"
             )
@@ -423,6 +434,14 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
             if !detectedUSBMMDVM {
                 usbMmdvmExpectedRadioSerialNumber = nil
             }
+            bluetoothMmdvmUSBHandoffPending = detectedBluetoothMMDVM
+            if detectedBluetoothMMDVM {
+                bluetoothMmdvmUSBHandoffAvailable =
+                    (try? await bluetoothMmdvmUSBSelector?
+                        .hasSoleIdentifiedUSBEndpoint()) == true
+            } else {
+                bluetoothMmdvmUSBHandoffAvailable = false
+            }
             var failed = RadioWorkspaceState.disconnected
             failed.connection = .failed(message: Self.describe(error))
             publish(failed)
@@ -433,7 +452,47 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
             if detectedUSBMMDVM {
                 throw RadioControllerError.usbMmdvmMode
             }
+            if detectedBluetoothMMDVM {
+                throw RadioControllerError.bluetoothMmdvmMode
+            }
             throw RadioControllerError.operationFailed(Self.describe(error))
+        }
+    }
+
+    /// Switch a Bluetooth MMDVM connection to the sole exact USB-C endpoint.
+    ///
+    /// This path is non-destructive. It changes only the host-side transport
+    /// selection, then runs the ordinary CAT model and serial qualification.
+    func connectViaUSBFromBluetoothMMDVM() async throws {
+        guard bluetoothMmdvmUSBHandoffPending,
+              bluetoothMmdvmUSBHandoffAvailable,
+              case .failed = currentState.connection,
+              let bluetoothMmdvmUSBSelector else {
+            throw RadioControllerError.capabilityUnavailable(
+                "USB-C CAT handoff requires a validated Bluetooth MMDVM response and exactly one serial-identified USB-C radio."
+            )
+        }
+
+        let authorizedEpoch = sessionEpoch
+        await transport.close()
+        do {
+            try requireEpoch(authorizedEpoch)
+            let expectedSerialNumber = try await bluetoothMmdvmUSBSelector
+                .selectSoleUSBForBluetoothMMDVM()
+            try requireEpoch(authorizedEpoch)
+            bluetoothMmdvmUSBHandoffPending = false
+            bluetoothMmdvmUSBHandoffAvailable = false
+            try await connect(expectedRadioSerialNumber: expectedSerialNumber)
+        } catch {
+            if error is CancellationError || disconnectInProgress {
+                throw CancellationError()
+            }
+            guard sessionEpoch == authorizedEpoch else { throw error }
+            bluetoothMmdvmUSBHandoffPending = true
+            bluetoothMmdvmUSBHandoffAvailable =
+                (try? await bluetoothMmdvmUSBSelector
+                    .hasSoleIdentifiedUSBEndpoint()) == true
+            throw error
         }
     }
 
@@ -468,6 +527,8 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
         try beginExclusive(operation)
         usbMmdvmRecoveryPending = false
         usbMmdvmExpectedRadioSerialNumber = nil
+        bluetoothMmdvmUSBHandoffPending = false
+        bluetoothMmdvmUSBHandoffAvailable = false
         sessionEpoch &+= 1
         let epoch = sessionEpoch
         stopScreenPolling()
@@ -679,6 +740,8 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
         exclusiveOperation = nil
         usbMmdvmRecoveryPending = false
         usbMmdvmExpectedRadioSerialNumber = nil
+        bluetoothMmdvmUSBHandoffPending = false
+        bluetoothMmdvmUSBHandoffAvailable = false
         ifDSPModeState = .inactive
         publish(.disconnected)
         publishAPRSUnavailable(

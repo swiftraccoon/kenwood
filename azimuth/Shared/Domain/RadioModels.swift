@@ -15,11 +15,12 @@ enum RadioConnectionState: Equatable, Sendable {
     }
 }
 
-/// One user-selectable path to a physical TH-D75.
+/// One user-selectable host endpoint.
 ///
 /// The identifier is opaque to the UI. A platform selector can use a stable
 /// USB registry identity or an exact Bluetooth address without exposing either
-/// as connection policy in the scene model.
+/// as connection policy in the scene model. A paired Bluetooth endpoint is not
+/// accepted as a TH-D75 until connection-time CAT model and serial proof.
 struct RadioEndpoint: Identifiable, Equatable, Sendable {
     let id: String
     let name: String
@@ -65,44 +66,20 @@ struct RadioEndpointDiscoverySnapshot: Equatable, Sendable {
     let endpoints: [RadioEndpoint]
     let warning: String?
     /// Total paired macOS Bluetooth devices observed by the same fresh native
-    /// inventory, including devices omitted from the likely-radio picker.
+    /// inventory.
     /// `nil` means Bluetooth discovery was unavailable, not that the count was
     /// known to be zero.
     let pairedBluetoothDeviceCount: UInt32?
-    /// Count of ordinary hint-matched Bluetooth rows from the same inventory.
-    /// This excludes exact radios added by explicit CAT qualification.
-    let likelyBluetoothRadioCount: UInt32?
 
     init(
         endpoints: [RadioEndpoint],
         warning: String? = nil,
-        pairedBluetoothDeviceCount: UInt32? = nil,
-        likelyBluetoothRadioCount: UInt32? = nil
+        pairedBluetoothDeviceCount: UInt32? = nil
     ) {
         self.endpoints = endpoints
         self.warning = warning
         self.pairedBluetoothDeviceCount = pairedBluetoothDeviceCount
-        self.likelyBluetoothRadioCount = likelyBluetoothRadioCount
     }
-}
-
-struct RadioEndpointBluetoothSearchResult: Equatable, Sendable {
-    let snapshot: RadioEndpointDiscoverySnapshot
-    let probedCandidateCount: UInt32
-    let totalUnhintedCandidateCount: UInt32
-    let isComplete: Bool
-    let wasCancelled: Bool
-}
-
-enum BluetoothRadioSearchState: Equatable, Sendable {
-    case idle
-    case searching
-    case completed(probed: UInt32, total: UInt32, radiosFound: Int)
-    case incomplete(probed: UInt32, total: UInt32, radiosFound: Int)
-    case stopped(probed: UInt32, total: UInt32, radiosFound: Int)
-    case failed(message: String)
-
-    var isSearching: Bool { self == .searching }
 }
 
 enum RadioEndpointSelectionError: LocalizedError, Equatable, Sendable {
@@ -112,7 +89,6 @@ enum RadioEndpointSelectionError: LocalizedError, Equatable, Sendable {
     case malformedEndpoint
     case invalidEndpoint(id: String)
     case duplicateEndpoint(id: String)
-    case customBluetoothSearchUnavailable
 
     var errorDescription: String? {
         switch self {
@@ -128,8 +104,6 @@ enum RadioEndpointSelectionError: LocalizedError, Equatable, Sendable {
             return "The selected radio connection \(id) is no longer available. Refresh the connection list and choose again."
         case .duplicateEndpoint(let id):
             return "Radio discovery returned the connection identifier \(id) more than once. No selection was changed."
-        case .customBluetoothSearchUnavailable:
-            return "This radio connection provider cannot search for custom-named Bluetooth radios."
         }
     }
 }
@@ -150,15 +124,8 @@ protocol RadioEndpointSelecting: AnyObject {
     /// already owns a complete Bluetooth inventory.
     var initialPairedBluetoothDeviceCount: UInt32? { get }
 
-    /// Whether this selector can CAT-probe unhinted paired devices and return
-    /// only exact endpoints proved to be TH-D75 radios.
-    var supportsCustomNamedBluetoothSearch: Bool { get }
-
     /// Return a fresh, complete endpoint snapshot.
     func refreshEndpoints() async throws -> RadioEndpointDiscoverySnapshot
-
-    func findCustomNamedBluetoothRadios() async throws
-        -> RadioEndpointBluetoothSearchResult
 
     /// Prepare one listed endpoint for the next controller connection.
     func selectEndpoint(id: String) async throws
@@ -173,11 +140,6 @@ protocol RadioEndpointSelecting: AnyObject {
 
 extension RadioEndpointSelecting {
     var initialPairedBluetoothDeviceCount: UInt32? { nil }
-    var supportsCustomNamedBluetoothSearch: Bool { false }
-    func findCustomNamedBluetoothRadios() async throws
-        -> RadioEndpointBluetoothSearchResult {
-        throw RadioEndpointSelectionError.customBluetoothSearchUnavailable
-    }
     func selectedEndpoint() async -> RadioEndpoint? { nil }
 }
 
@@ -191,8 +153,7 @@ final class FixedUSBRadioEndpointSelector: RadioEndpointSelecting {
     func refreshEndpoints() async throws -> RadioEndpointDiscoverySnapshot {
         RadioEndpointDiscoverySnapshot(
             endpoints: initialEndpoints,
-            pairedBluetoothDeviceCount: 0,
-            likelyBluetoothRadioCount: 0
+            pairedBluetoothDeviceCount: 0
         )
     }
 
@@ -305,6 +266,7 @@ enum RadioControllerError: LocalizedError, Equatable, Sendable {
     case adapterUnavailable
     case capabilityUnavailable(String)
     case usbMmdvmMode
+    case bluetoothMmdvmMode
     case operationFailed(String)
 
     var errorDescription: String? {
@@ -313,6 +275,8 @@ enum RadioControllerError: LocalizedError, Equatable, Sendable {
             return "No TH-D75 control adapter is installed in this build."
         case .usbMmdvmMode:
             return "After Azimuth sent the TH-D75 packet-mode exit sequence, the USB-C interface returned a valid MMDVM response, so CAT control is unavailable on that interface after recovery."
+        case .bluetoothMmdvmMode:
+            return "After Azimuth sent the TH-D75 packet-mode exit sequence, the Bluetooth interface returned a valid MMDVM response, so CAT control is unavailable while DV Gateway is routed to Bluetooth."
         case .capabilityUnavailable(let reason), .operationFailed(let reason):
             return reason
         }
@@ -324,6 +288,7 @@ enum RadioCATRecoveryAlert: Equatable, Sendable {
         automaticRecoveryAvailable: Bool,
         bluetoothFallbackAvailable: Bool
     )
+    case bluetoothMmdvmMode(usbFallbackAvailable: Bool)
     case recoveryFailed(
         message: String,
         automaticRecoveryAvailable: Bool = false,
@@ -334,6 +299,8 @@ enum RadioCATRecoveryAlert: Equatable, Sendable {
         switch self {
         case .usbMmdvmMode:
             return "USB-C Remains in MMDVM Mode"
+        case .bluetoothMmdvmMode:
+            return "Bluetooth Is in MMDVM Mode"
         case .recoveryFailed:
             return "CAT Recovery Failed"
         }
@@ -353,6 +320,10 @@ enum RadioCATRecoveryAlert: Equatable, Sendable {
             #else
             return "Azimuth already sent the transient packet-mode exit sequence, but the TH-D75 USB-C interface returned a validated MMDVM version response instead of CAT. Automatic recovery needs a configured, paired TH-D75 Bluetooth control link because the gateway-owned USB interface does not route the programming commands needed to change Menu 650. End any active MMDVM or DV Gateway session. If no host session is active, set Menu 650 (DV Gateway) to Off and power-cycle the radio, then reconnect."
             #endif
+        case .bluetoothMmdvmMode(true):
+            return "Azimuth proved that the selected Bluetooth interface is carrying persistent TH-D75 MMDVM traffic for DV Gateway. The radio cannot answer CAT on Bluetooth in this state. Azimuth found exactly one serial-identified USB-C radio and can switch to that exact endpoint without changing Menu 650, or you can leave the radio unchanged."
+        case .bluetoothMmdvmMode(false):
+            return "Azimuth proved that the selected Bluetooth interface is carrying persistent TH-D75 MMDVM traffic for DV Gateway. The radio cannot answer CAT on Bluetooth in this state. Connect exactly one serial-identified TH-D75 over USB-C, refresh connections, and retry, or leave the radio unchanged."
         case .recoveryFailed(let message, _, _):
             return message
         }
@@ -361,6 +332,7 @@ enum RadioCATRecoveryAlert: Equatable, Sendable {
     var automaticRecoveryAvailable: Bool {
         switch self {
         case .usbMmdvmMode(let available, _): return available
+        case .bluetoothMmdvmMode: return false
         case .recoveryFailed(_, let available, _): return available
         }
     }
@@ -368,7 +340,15 @@ enum RadioCATRecoveryAlert: Equatable, Sendable {
     var bluetoothFallbackAvailable: Bool {
         switch self {
         case .usbMmdvmMode(_, let available): return available
+        case .bluetoothMmdvmMode: return false
         case .recoveryFailed(_, _, let available): return available
+        }
+    }
+
+    var usbFallbackAvailable: Bool {
+        switch self {
+        case .bluetoothMmdvmMode(let available): return available
+        case .usbMmdvmMode, .recoveryFailed: return false
         }
     }
 
@@ -376,6 +356,8 @@ enum RadioCATRecoveryAlert: Equatable, Sendable {
         switch self {
         case .usbMmdvmMode:
             true
+        case .bluetoothMmdvmMode(let available):
+            available
         case .recoveryFailed(_, let automatic, let bluetooth):
             automatic || bluetooth
         }
@@ -439,10 +421,12 @@ protocol RadioControlling: AnyObject {
     var updates: AsyncStream<RadioWorkspaceState> { get }
     var automaticCATRecoveryAvailable: Bool { get }
     var bluetoothCATFallbackAvailable: Bool { get }
+    var usbCATFallbackAvailable: Bool { get }
 
     func connect() async throws
     func restoreCATFromUSBMMDVM() async throws
     func connectViaBluetoothFromUSBMMDVM() async throws
+    func connectViaUSBFromBluetoothMMDVM() async throws
     func disconnect() async
     func refreshScreen() async throws
     func refreshSettings() async throws
@@ -456,6 +440,7 @@ protocol RadioControlling: AnyObject {
 extension RadioControlling {
     var automaticCATRecoveryAvailable: Bool { false }
     var bluetoothCATFallbackAvailable: Bool { false }
+    var usbCATFallbackAvailable: Bool { false }
 
     func restoreCATFromUSBMMDVM() async throws {
         throw RadioControllerError.capabilityUnavailable(
@@ -466,6 +451,12 @@ extension RadioControlling {
     func connectViaBluetoothFromUSBMMDVM() async throws {
         throw RadioControllerError.capabilityUnavailable(
             "A same-radio Bluetooth CAT handoff is unavailable in this build."
+        )
+    }
+
+    func connectViaUSBFromBluetoothMMDVM() async throws {
+        throw RadioControllerError.capabilityUnavailable(
+            "A USB-C CAT handoff from Bluetooth MMDVM mode is unavailable in this build."
         )
     }
 }

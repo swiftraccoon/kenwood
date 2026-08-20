@@ -163,13 +163,9 @@ private final class AzimuthRouterMockBluetoothFactory: AzimuthBluetoothLinkFacto
     @unchecked Sendable
 {
     let discoveryStarted: AsyncStream<Void>
-    let searchStarted: AsyncStream<Void>
     private let lock = NSLock()
     private let discoveryStartedContinuation: AsyncStream<Void>.Continuation
-    private let searchStartedContinuation: AsyncStream<Void>.Continuation
-    private var candidates: [AzimuthBluetoothEndpoint]
-    private var totalPairedDeviceCount: UInt32
-    private var pairedDeviceAddresses: [String]
+    private var devices: [AzimuthBluetoothEndpoint]
     private var discoveryError: Error?
     private var exactLinks: [String: AzimuthRouterMockBluetoothLink]
     private let matchingLink: AzimuthRouterMockBluetoothLink
@@ -177,59 +173,29 @@ private final class AzimuthRouterMockBluetoothFactory: AzimuthBluetoothLinkFacto
     private var requestedQualifiedTargets: [String] = []
     private var requestedSerialNumbers: [String] = []
     private var discoveries = 0
-    private var searchResults: [AzimuthBluetoothRadioSearchSnapshot] = []
-    private var searchExclusions: [[String]] = []
     private var shouldBlockDiscovery = false
     private var discoveryContinuation: CheckedContinuation<Void, Never>?
-    private var shouldBlockSearch = false
-    private var searchContinuation: CheckedContinuation<Void, Never>?
 
     init(
-        candidates: [AzimuthBluetoothEndpoint],
+        devices: [AzimuthBluetoothEndpoint],
         exactLinks: [String: AzimuthRouterMockBluetoothLink],
         matchingLink: AzimuthRouterMockBluetoothLink
     ) {
-        self.candidates = candidates
-        totalPairedDeviceCount = UInt32(candidates.count)
-        pairedDeviceAddresses = candidates.map(\.address)
+        self.devices = devices
         self.exactLinks = exactLinks
         self.matchingLink = matchingLink
         var continuation: AsyncStream<Void>.Continuation!
         discoveryStarted = AsyncStream { continuation = $0 }
         discoveryStartedContinuation = continuation
-        var searchStreamContinuation: AsyncStream<Void>.Continuation!
-        searchStarted = AsyncStream { searchStreamContinuation = $0 }
-        searchStartedContinuation = searchStreamContinuation
     }
 
     var exactRequests: [String] { lock.withLock { requestedAddresses } }
     var qualifiedRequests: [String] { lock.withLock { requestedQualifiedTargets } }
     var serialRequests: [String] { lock.withLock { requestedSerialNumbers } }
     var discoveryCount: Int { lock.withLock { discoveries } }
-    var recordedSearchExclusions: [[String]] { lock.withLock { searchExclusions } }
 
-    func replaceCandidates(_ endpoints: [AzimuthBluetoothEndpoint]) {
-        lock.withLock {
-            candidates = endpoints
-            totalPairedDeviceCount = UInt32(endpoints.count)
-            pairedDeviceAddresses = endpoints.map(\.address)
-        }
-    }
-
-    func replaceDiscovery(
-        likelyCandidates: [AzimuthBluetoothEndpoint],
-        totalPairedDeviceCount: UInt32,
-        pairedDeviceAddresses: [String]? = nil
-    ) {
-        lock.withLock {
-            candidates = likelyCandidates
-            self.totalPairedDeviceCount = totalPairedDeviceCount
-            self.pairedDeviceAddresses = pairedDeviceAddresses
-                ?? Self.syntheticPairedAddresses(
-                    candidates: likelyCandidates,
-                    total: totalPairedDeviceCount
-                )
-        }
+    func replaceDevices(_ endpoints: [AzimuthBluetoothEndpoint]) {
+        lock.withLock { devices = endpoints }
     }
 
     func failDiscovery(with error: Error) {
@@ -249,23 +215,6 @@ private final class AzimuthRouterMockBluetoothFactory: AzimuthBluetoothLinkFacto
         continuation?.resume()
     }
 
-    func blockNextSearch() {
-        lock.withLock { shouldBlockSearch = true }
-    }
-
-    func releaseSearch() {
-        let continuation = lock.withLock {
-            let continuation = searchContinuation
-            searchContinuation = nil
-            return continuation
-        }
-        continuation?.resume()
-    }
-
-    func enqueueSearchResult(_ result: AzimuthBluetoothRadioSearchSnapshot) {
-        lock.withLock { searchResults.append(result) }
-    }
-
     func pairedDeviceDiscovery() async throws -> AzimuthBluetoothDiscoverySnapshot {
         let shouldBlock = lock.withLock {
             let block = shouldBlockDiscovery
@@ -282,46 +231,8 @@ private final class AzimuthRouterMockBluetoothFactory: AzimuthBluetoothLinkFacto
             discoveries += 1
             if let discoveryError { throw discoveryError }
             return AzimuthBluetoothDiscoverySnapshot(
-                likelyRadioEndpoints: candidates,
-                totalPairedDeviceCount: totalPairedDeviceCount,
-                pairedDeviceAddresses: pairedDeviceAddresses
+                pairedEndpoints: devices
             )
-        }
-    }
-
-    private static func syntheticPairedAddresses(
-        candidates: [AzimuthBluetoothEndpoint],
-        total: UInt32
-    ) -> [String] {
-        var addresses = candidates.map(\.address)
-        while addresses.count < Int(total) {
-            addresses.append(
-                String(format: "FE:ED:00:00:00:%02X", addresses.count)
-            )
-        }
-        return addresses
-    }
-
-    func findCustomNamedRadios(
-        previouslyProbedAddresses: [String]
-    ) async throws -> AzimuthBluetoothRadioSearchSnapshot {
-        let shouldBlock = lock.withLock {
-            let block = shouldBlockSearch
-            shouldBlockSearch = false
-            return block
-        }
-        if shouldBlock {
-            await withCheckedContinuation { continuation in
-                lock.withLock { searchContinuation = continuation }
-                searchStartedContinuation.yield(())
-            }
-        }
-        return try lock.withLock {
-            searchExclusions.append(previouslyProbedAddresses)
-            guard !searchResults.isEmpty else {
-                throw RadioEndpointSelectionError.customBluetoothSearchUnavailable
-            }
-            return searchResults.removeFirst()
         }
     }
 
@@ -433,13 +344,6 @@ private final class AzimuthOutOfOrderBluetoothFactory:
         }
     }
 
-    func findCustomNamedRadios(
-        previouslyProbedAddresses: [String]
-    ) async throws -> AzimuthBluetoothRadioSearchSnapshot {
-        _ = previouslyProbedAddresses
-        throw RadioEndpointSelectionError.customBluetoothSearchUnavailable
-    }
-
     func makeLink(
         exactAddress: String
     ) async throws -> any AzimuthBluetoothByteLink {
@@ -501,9 +405,7 @@ final class AzimuthSelectableRadioTransportTests: XCTestCase {
         bluetoothFactory.complete(
             call: 1,
             with: AzimuthBluetoothDiscoverySnapshot(
-                likelyRadioEndpoints: [Self.secondBluetooth],
-                totalPairedDeviceCount: 1,
-                pairedDeviceAddresses: [Self.secondBluetooth.address]
+                pairedEndpoints: [Self.secondBluetooth]
             )
         )
         let current = try await newer.value
@@ -512,9 +414,7 @@ final class AzimuthSelectableRadioTransportTests: XCTestCase {
         bluetoothFactory.complete(
             call: 0,
             with: AzimuthBluetoothDiscoverySnapshot(
-                likelyRadioEndpoints: [Self.firstBluetooth],
-                totalPairedDeviceCount: 1,
-                pairedDeviceAddresses: [Self.firstBluetooth.address]
+                pairedEndpoints: [Self.firstBluetooth]
             )
         )
         do {
@@ -758,11 +658,7 @@ final class AzimuthSelectableRadioTransportTests: XCTestCase {
             matchedAddress: qualified.address
         )
         let factory = makeFactory(matchingLink: matching)
-        factory.replaceDiscovery(
-            likelyCandidates: [qualified],
-            totalPairedDeviceCount: 1,
-            pairedDeviceAddresses: [qualified.address]
-        )
+        factory.replaceDevices([qualified])
         let router = try AzimuthSelectableRadioTransport(
             usbFactory: makeUSBFactory(),
             bluetoothFactory: factory
@@ -799,11 +695,7 @@ final class AzimuthSelectableRadioTransportTests: XCTestCase {
             verifiedCATSerialNumber: "B3B00001"
         )
         let factory = makeFactory()
-        factory.replaceDiscovery(
-            likelyCandidates: [first, second],
-            totalPairedDeviceCount: 2,
-            pairedDeviceAddresses: [first.address, second.address]
-        )
+        factory.replaceDevices([first, second])
         let router = try AzimuthSelectableRadioTransport(
             usbFactory: makeUSBFactory(),
             bluetoothFactory: factory
@@ -824,20 +716,17 @@ final class AzimuthSelectableRadioTransportTests: XCTestCase {
         XCTAssertTrue(factory.qualifiedRequests.isEmpty)
     }
 
-    func testUnhintedFallbackCanBeReselectedAndRemainsSerialQualified() async throws {
-        let customNamed = AzimuthBluetoothEndpoint(
+    func testSameRadioFallbackCanBeReselectedAndRemainsSerialQualified() async throws {
+        let arbitrarilyNamed = AzimuthBluetoothEndpoint(
             address: "10-20-30-40-50-60",
             displayName: "Field Control"
         )
         let matching = AzimuthRouterMockBluetoothLink(
             serialNumber: "B3B00001",
-            matchedAddress: customNamed.address
+            matchedAddress: arbitrarilyNamed.address
         )
         let factory = makeFactory(matchingLink: matching)
-        factory.replaceDiscovery(
-            likelyCandidates: [],
-            totalPairedDeviceCount: 1
-        )
+        factory.replaceDevices([arbitrarilyNamed])
         let router = try AzimuthSelectableRadioTransport(
             usbFactory: makeUSBFactory(),
             bluetoothFactory: factory
@@ -856,10 +745,10 @@ final class AzimuthSelectableRadioTransportTests: XCTestCase {
         XCTAssertEqual(factory.serialRequests, ["B3B00001"])
         XCTAssertEqual(
             factory.qualifiedRequests,
-            ["\(customNamed.address)|B3B00001"]
+            ["\(arbitrarilyNamed.address)|B3B00001"]
         )
         let reselectedEndpointID = await router.selectedEndpointID
-        XCTAssertEqual(reselectedEndpointID, customNamed.id)
+        XCTAssertEqual(reselectedEndpointID, arbitrarilyNamed.id)
         await router.close()
     }
 
@@ -889,9 +778,9 @@ final class AzimuthSelectableRadioTransportTests: XCTestCase {
         await router.close()
     }
 
-    func testFreshDiscoveryRetainsStillPairedUnhintedQualifiedEndpoint() async throws {
+    func testFreshDiscoveryRetainsStillPairedQualifiedEndpoint() async throws {
         let custom = AzimuthBluetoothEndpoint(
-            address: "10:20:30:40:50:60",
+            address: "10-20-30-40-50-60",
             displayName: "Kenwood TH-D75"
         )
         let matching = AzimuthRouterMockBluetoothLink(
@@ -899,11 +788,7 @@ final class AzimuthSelectableRadioTransportTests: XCTestCase {
             matchedAddress: custom.address
         )
         let factory = makeFactory(matchingLink: matching)
-        factory.replaceDiscovery(
-            likelyCandidates: [],
-            totalPairedDeviceCount: 1,
-            pairedDeviceAddresses: [custom.address]
-        )
+        factory.replaceDevices([custom])
         let router = try AzimuthSelectableRadioTransport(
             usbFactory: makeUSBFactory(),
             bluetoothFactory: factory
@@ -927,7 +812,7 @@ final class AzimuthSelectableRadioTransportTests: XCTestCase {
 
     func testFreshDiscoveryRemovesUnpairedQualifiedEndpoint() async throws {
         let custom = AzimuthBluetoothEndpoint(
-            address: "10:20:30:40:50:60",
+            address: "10-20-30-40-50-60",
             displayName: "Kenwood TH-D75"
         )
         let matching = AzimuthRouterMockBluetoothLink(
@@ -935,11 +820,7 @@ final class AzimuthSelectableRadioTransportTests: XCTestCase {
             matchedAddress: custom.address
         )
         let factory = makeFactory(matchingLink: matching)
-        factory.replaceDiscovery(
-            likelyCandidates: [],
-            totalPairedDeviceCount: 1,
-            pairedDeviceAddresses: [custom.address]
-        )
+        factory.replaceDevices([custom])
         let router = try AzimuthSelectableRadioTransport(
             usbFactory: makeUSBFactory(),
             bluetoothFactory: factory
@@ -949,11 +830,7 @@ final class AzimuthSelectableRadioTransportTests: XCTestCase {
         try await router.open()
         await router.close()
 
-        factory.replaceDiscovery(
-            likelyCandidates: [],
-            totalPairedDeviceCount: 0,
-            pairedDeviceAddresses: []
-        )
+        factory.replaceDevices([])
         let refreshed = try await router.availableEndpointSnapshot()
 
         XCTAssertFalse(refreshed.endpoints.contains { $0.id == custom.id })
@@ -987,13 +864,67 @@ final class AzimuthSelectableRadioTransportTests: XCTestCase {
         await router.close()
     }
 
+    func testBluetoothMMDVMHandoffSelectsSoleExactUSBEndpoint() async throws {
+        let usb = AzimuthRouterMockTransport(device: Self.firstUSB.device)
+        let router = try AzimuthSelectableRadioTransport(
+            usbFactory: makeUSBFactory(transport: usb),
+            bluetoothFactory: makeFactory()
+        )
+        _ = try await router.availableEndpointSnapshot()
+        try await router.selectEndpoint(id: Self.firstBluetooth.id)
+
+        let fallbackAvailable = try await router.hasSoleIdentifiedUSBEndpoint()
+        XCTAssertTrue(fallbackAvailable)
+        let serialNumber = try await router.selectSoleUSBForBluetoothMMDVM()
+        let selectedEndpointID = await router.selectedEndpointID
+        let selectedEndpoint = await router.selectedRadioEndpoint()
+
+        XCTAssertEqual(serialNumber, Self.firstUSB.usbSerialNumber)
+        XCTAssertEqual(selectedEndpointID, Self.firstUSB.id)
+        XCTAssertEqual(selectedEndpoint?.detail, Self.firstUSB.devicePath)
+        XCTAssertEqual(usb.openCount, 0)
+    }
+
+    func testBluetoothMMDVMHandoffRejectsAmbiguousUSBInventory() async throws {
+        let first = AzimuthRouterMockTransport(device: Self.firstUSB.device)
+        let second = AzimuthRouterMockTransport(device: Self.secondUSB.device)
+        let usbFactory = AzimuthRouterMockUSBFactory(
+            endpoints: [Self.firstUSB, Self.secondUSB],
+            transports: [
+                Self.firstUSB.id: first,
+                Self.secondUSB.id: second,
+            ]
+        )
+        let router = try AzimuthSelectableRadioTransport(
+            usbFactory: usbFactory,
+            bluetoothFactory: makeFactory()
+        )
+        _ = try await router.availableEndpointSnapshot()
+        try await router.selectEndpoint(id: Self.firstBluetooth.id)
+
+        let fallbackAvailable = try await router.hasSoleIdentifiedUSBEndpoint()
+        XCTAssertFalse(fallbackAvailable)
+        let error = try await captureError {
+            _ = try await router.selectSoleUSBForBluetoothMMDVM()
+        }
+
+        XCTAssertEqual(
+            error as? AzimuthRadioSelectionError,
+            .bluetoothMmdvmUSBFallbackUnavailable(attachedUSBCount: 2)
+        )
+        let selectedEndpointID = await router.selectedEndpointID
+        XCTAssertEqual(selectedEndpointID, Self.firstBluetooth.id)
+        XCTAssertEqual(first.openCount, 0)
+        XCTAssertEqual(second.openCount, 0)
+    }
+
     func testRefreshRejectsDuplicateStableIdentifiers() async throws {
         let duplicate = AzimuthBluetoothEndpoint(
             address: Self.firstBluetooth.address,
             displayName: "Renamed radio"
         )
         let factory = makeFactory()
-        factory.replaceCandidates([Self.firstBluetooth, duplicate])
+        factory.replaceDevices([Self.firstBluetooth, duplicate])
         let router = try AzimuthSelectableRadioTransport(
             usbFactory: makeUSBFactory(),
             bluetoothFactory: factory
@@ -1208,51 +1139,6 @@ final class AzimuthSelectableRadioTransportTests: XCTestCase {
         )
     }
 
-    func testCustomSearchUsesUSBSnapshotTakenAfterBlockedProbe() async throws {
-        let bluetoothFactory = makeFactory()
-        bluetoothFactory.replaceDiscovery(
-            likelyCandidates: [],
-            totalPairedDeviceCount: 1
-        )
-        bluetoothFactory.enqueueSearchResult(
-            AzimuthBluetoothRadioSearchSnapshot(
-                provenRadioEndpoints: [],
-                likelyRadioEndpoints: [],
-                pairedDeviceAddresses: ["FE:ED:00:00:00:00"],
-                totalPairedDeviceCount: 1,
-                probedAddresses: ["FE:ED:00:00:00:00"],
-                currentProbedAddresses: ["FE:ED:00:00:00:00"],
-                hasInventorySnapshot: true,
-                probedCandidateCount: 1,
-                totalUnhintedCandidateCount: 1,
-                isComplete: true,
-                wasCancelled: false
-            )
-        )
-        let usbFactory = makeUSBFactory()
-        let router = try AzimuthSelectableRadioTransport(
-            usbFactory: usbFactory,
-            bluetoothFactory: bluetoothFactory
-        )
-        _ = try await router.availableEndpointSnapshot()
-        bluetoothFactory.blockNextSearch()
-        var searchStarted = bluetoothFactory.searchStarted.makeAsyncIterator()
-        let search = Task { try await router.findCustomNamedBluetoothRadios() }
-        let didStart: Void? = await searchStarted.next()
-        XCTAssertNotNil(didStart)
-
-        usbFactory.replaceEndpoints([Self.secondUSB])
-        bluetoothFactory.releaseSearch()
-        let result = try await search.value
-
-        XCTAssertEqual(
-            result.snapshot.endpoints
-                .filter { $0.transport == .usb }
-                .map(\.detail),
-            [Self.secondUSB.devicePath]
-        )
-    }
-
     func testBluetoothSelectionUsesRetainedSnapshotWithoutSecondHelperLaunch() async throws {
         let bluetoothFactory = makeFactory()
         let router = try AzimuthSelectableRadioTransport(
@@ -1273,19 +1159,15 @@ final class AzimuthSelectableRadioTransportTests: XCTestCase {
         await router.close()
     }
 
-    func testCustomNamedPairedDeviceEnablesSerialScanWithoutPickerRow() async throws {
-        let customNamed = AzimuthBluetoothEndpoint(
+    func testArbitrarilyNamedPairedDeviceAppearsInPickerAndOpensByExactAddress() async throws {
+        let arbitrarilyNamed = AzimuthBluetoothEndpoint(
             address: "10-20-30-40-50-60",
             displayName: "Field Control"
         )
-        let matching = AzimuthRouterMockBluetoothLink(
-            serialNumber: "B3B00001",
-            matchedAddress: customNamed.address
-        )
-        let bluetoothFactory = makeFactory(matchingLink: matching)
-        bluetoothFactory.replaceDiscovery(
-            likelyCandidates: [],
-            totalPairedDeviceCount: 1
+        let exact = AzimuthRouterMockBluetoothLink(serialNumber: nil)
+        let bluetoothFactory = makeFactory(
+            devices: [arbitrarilyNamed],
+            exactLinks: [arbitrarilyNamed.address: exact]
         )
         let router = try AzimuthSelectableRadioTransport(
             usbFactory: makeUSBFactory(),
@@ -1293,28 +1175,20 @@ final class AzimuthSelectableRadioTransportTests: XCTestCase {
         )
 
         let snapshot = try await router.availableEndpointSnapshot()
-        XCTAssertEqual(snapshot.endpoints.map(\.transport), [.usb])
+        XCTAssertEqual(snapshot.endpoints.map(\.transport), [.usb, .bluetooth])
         XCTAssertEqual(snapshot.pairedBluetoothDeviceCount, 1)
 
-        _ = try await router.selectBluetooth(
-            matchingSerialNumber: "B3B00001"
-        )
+        try await router.selectEndpoint(id: arbitrarilyNamed.id)
         try await router.open()
 
-        XCTAssertEqual(bluetoothFactory.serialRequests, ["B3B00001"])
-        let resolvedCustomEndpointID = await router.selectedEndpointID
-        XCTAssertEqual(resolvedCustomEndpointID, customNamed.id)
-        let resolvedDetail = await router.selectedRadioEndpoint()?.detail
-        XCTAssertEqual(resolvedDetail, customNamed.address)
+        XCTAssertEqual(bluetoothFactory.exactRequests, [arbitrarilyNamed.address])
+        XCTAssertEqual(exact.openCount, 1)
         await router.close()
     }
 
     func testZeroPairedDevicesReportsKnownZeroWithoutPickerRows() async throws {
         let bluetoothFactory = makeFactory()
-        bluetoothFactory.replaceDiscovery(
-            likelyCandidates: [],
-            totalPairedDeviceCount: 0
-        )
+        bluetoothFactory.replaceDevices([])
         let router = try AzimuthSelectableRadioTransport(
             usbFactory: makeUSBFactory(),
             bluetoothFactory: bluetoothFactory
@@ -1327,470 +1201,9 @@ final class AzimuthSelectableRadioTransportTests: XCTestCase {
         XCTAssertNil(snapshot.warning)
     }
 
-    func testCustomNamedSearchAdvancesPastEightWithExactExclusions() async throws {
-        let bluetoothFactory = makeFactory()
-        bluetoothFactory.replaceDiscovery(
-            likelyCandidates: [Self.firstBluetooth, Self.secondBluetooth],
-            totalPairedDeviceCount: 11
-        )
-        let addresses = (1...9).map {
-            String(format: "10:20:30:40:50:%02X", $0)
-        }
-        let firstProven = AzimuthBluetoothEndpoint(
-            address: addresses[7],
-            displayName: "Field Seven",
-            verifiedCATSerialNumber: "B3B00007"
-        )
-        let secondProven = AzimuthBluetoothEndpoint(
-            address: addresses[8],
-            displayName: "Field Eight",
-            verifiedCATSerialNumber: "B3B00008"
-        )
-        bluetoothFactory.enqueueSearchResult(
-            AzimuthBluetoothRadioSearchSnapshot(
-                provenRadioEndpoints: [firstProven],
-                likelyRadioEndpoints: [Self.firstBluetooth, Self.secondBluetooth],
-                pairedDeviceAddresses: [
-                    Self.firstBluetooth.address,
-                    Self.secondBluetooth.address,
-                ] + addresses,
-                totalPairedDeviceCount: 11,
-                probedAddresses: Array(addresses.prefix(8)),
-                currentProbedAddresses: Array(addresses.prefix(8)),
-                hasInventorySnapshot: true,
-                probedCandidateCount: 8,
-                totalUnhintedCandidateCount: 9,
-                isComplete: false,
-                wasCancelled: false
-            )
-        )
-        bluetoothFactory.enqueueSearchResult(
-            AzimuthBluetoothRadioSearchSnapshot(
-                provenRadioEndpoints: [secondProven],
-                likelyRadioEndpoints: [Self.firstBluetooth, Self.secondBluetooth],
-                pairedDeviceAddresses: [
-                    Self.firstBluetooth.address,
-                    Self.secondBluetooth.address,
-                ] + addresses,
-                totalPairedDeviceCount: 11,
-                probedAddresses: [addresses[8]],
-                currentProbedAddresses: addresses,
-                hasInventorySnapshot: true,
-                probedCandidateCount: 1,
-                totalUnhintedCandidateCount: 9,
-                isComplete: true,
-                wasCancelled: false
-            )
-        )
-        let router = try AzimuthSelectableRadioTransport(
-            usbFactory: makeUSBFactory(),
-            bluetoothFactory: bluetoothFactory
-        )
-        _ = try await router.availableEndpointSnapshot()
-
-        let firstPass = try await router.findCustomNamedBluetoothRadios()
-        let secondPass = try await router.findCustomNamedBluetoothRadios()
-
-        XCTAssertFalse(firstPass.isComplete)
-        XCTAssertEqual(firstPass.probedCandidateCount, 8)
-        XCTAssertTrue(secondPass.isComplete)
-        XCTAssertEqual(secondPass.probedCandidateCount, 9)
-        XCTAssertEqual(
-            bluetoothFactory.recordedSearchExclusions,
-            [[], Array(addresses.prefix(8)).sorted()]
-        )
-        XCTAssertTrue(secondPass.snapshot.endpoints.contains { $0.id == firstProven.id })
-        XCTAssertTrue(secondPass.snapshot.endpoints.contains { $0.id == secondProven.id })
-        let knownAddress = try await router.knownQualifiedBluetoothAddress(
-            expectedSerialNumber: "B3B00007"
-        )
-        XCTAssertEqual(
-            knownAddress,
-            firstProven.address,
-            "Recovery must reuse the proved exact address instead of rescanning a bounded inventory."
-        )
-    }
-
-    func testStoppedCustomNamedSearchRetainsCompletedProofs() async throws {
-        let bluetoothFactory = makeFactory()
-        bluetoothFactory.replaceDiscovery(
-            likelyCandidates: [],
-            totalPairedDeviceCount: 2
-        )
-        let proven = AzimuthBluetoothEndpoint(
-            address: "10:20:30:40:50:60",
-            displayName: "Portable D75",
-            verifiedCATSerialNumber: "B3B00009"
-        )
-        bluetoothFactory.enqueueSearchResult(
-            AzimuthBluetoothRadioSearchSnapshot(
-                provenRadioEndpoints: [proven],
-                likelyRadioEndpoints: [],
-                pairedDeviceAddresses: [
-                    proven.address,
-                    "FE:ED:00:00:00:01",
-                ],
-                totalPairedDeviceCount: 2,
-                probedAddresses: [proven.address],
-                currentProbedAddresses: [proven.address],
-                hasInventorySnapshot: true,
-                probedCandidateCount: 1,
-                totalUnhintedCandidateCount: 2,
-                isComplete: false,
-                wasCancelled: true
-            )
-        )
-        let router = try AzimuthSelectableRadioTransport(
-            usbFactory: makeUSBFactory(),
-            bluetoothFactory: bluetoothFactory
-        )
-        _ = try await router.availableEndpointSnapshot()
-
-        let stopped = try await router.findCustomNamedBluetoothRadios()
-
-        XCTAssertTrue(stopped.wasCancelled)
-        XCTAssertFalse(stopped.isComplete)
-        XCTAssertEqual(stopped.probedCandidateCount, 1)
-        XCTAssertTrue(stopped.snapshot.endpoints.contains { $0.id == proven.id })
-    }
-
-    func testCancelledSecondPassBeforeInventoryRetainsPriorProgress() async throws {
-        let bluetoothFactory = makeFactory()
-        bluetoothFactory.replaceDiscovery(
-            likelyCandidates: [],
-            totalPairedDeviceCount: 2
-        )
-        let firstAddress = "FE:ED:00:00:00:00"
-        bluetoothFactory.enqueueSearchResult(
-            AzimuthBluetoothRadioSearchSnapshot(
-                provenRadioEndpoints: [],
-                likelyRadioEndpoints: [],
-                pairedDeviceAddresses: [
-                    firstAddress,
-                    "FE:ED:00:00:00:01",
-                ],
-                totalPairedDeviceCount: 2,
-                probedAddresses: [firstAddress],
-                currentProbedAddresses: [firstAddress],
-                hasInventorySnapshot: true,
-                probedCandidateCount: 1,
-                totalUnhintedCandidateCount: 2,
-                isComplete: false,
-                wasCancelled: false
-            )
-        )
-        bluetoothFactory.enqueueSearchResult(
-            AzimuthBluetoothRadioSearchSnapshot(
-                provenRadioEndpoints: [],
-                likelyRadioEndpoints: [],
-                pairedDeviceAddresses: [],
-                totalPairedDeviceCount: 0,
-                probedAddresses: [],
-                currentProbedAddresses: [firstAddress],
-                hasInventorySnapshot: false,
-                probedCandidateCount: 0,
-                totalUnhintedCandidateCount: 0,
-                isComplete: false,
-                wasCancelled: true
-            )
-        )
-        let router = try AzimuthSelectableRadioTransport(
-            usbFactory: makeUSBFactory(),
-            bluetoothFactory: bluetoothFactory
-        )
-        _ = try await router.availableEndpointSnapshot()
-        _ = try await router.findCustomNamedBluetoothRadios()
-        bluetoothFactory.blockNextSearch()
-        var started = bluetoothFactory.searchStarted.makeAsyncIterator()
-        let second = Task { try await router.findCustomNamedBluetoothRadios() }
-        let didStart: Void? = await started.next()
-        XCTAssertNotNil(didStart)
-        second.cancel()
-        bluetoothFactory.releaseSearch()
-
-        let result = try await second.value
-
-        XCTAssertTrue(result.wasCancelled)
-        XCTAssertEqual(result.probedCandidateCount, 1)
-        XCTAssertEqual(result.totalUnhintedCandidateCount, 2)
-        XCTAssertEqual(
-            bluetoothFactory.recordedSearchExclusions,
-            [[], [firstAddress]]
-        )
-    }
-
-    func testCustomSearchRejectsUnaccountedCompletedAddress() async throws {
-        let bluetoothFactory = makeFactory()
-        bluetoothFactory.replaceDiscovery(
-            likelyCandidates: [],
-            totalPairedDeviceCount: 2
-        )
-        bluetoothFactory.enqueueSearchResult(
-            AzimuthBluetoothRadioSearchSnapshot(
-                provenRadioEndpoints: [],
-                likelyRadioEndpoints: [],
-                pairedDeviceAddresses: [
-                    "FE:ED:00:00:00:00",
-                    "FE:ED:00:00:00:01",
-                ],
-                totalPairedDeviceCount: 2,
-                probedAddresses: ["FE:ED:00:00:00:00"],
-                currentProbedAddresses: [
-                    "FE:ED:00:00:00:00",
-                    "FE:ED:00:00:00:01",
-                ],
-                hasInventorySnapshot: true,
-                probedCandidateCount: 1,
-                totalUnhintedCandidateCount: 2,
-                isComplete: true,
-                wasCancelled: false
-            )
-        )
-        let router = try AzimuthSelectableRadioTransport(
-            usbFactory: makeUSBFactory(),
-            bluetoothFactory: bluetoothFactory
-        )
-        _ = try await router.availableEndpointSnapshot()
-
-        let error = try await captureError {
-            _ = try await router.findCustomNamedBluetoothRadios()
-        }
-
-        XCTAssertEqual(
-            error as? RadioEndpointSelectionError,
-            .malformedEndpoint
-        )
-    }
-
-    func testCustomSearchRejectsEndpointWithoutCATSerialProof() async throws {
-        let bluetoothFactory = makeFactory()
-        bluetoothFactory.replaceDiscovery(
-            likelyCandidates: [],
-            totalPairedDeviceCount: 1
-        )
-        let unproved = AzimuthBluetoothEndpoint(
-            address: "FE:ED:00:00:00:00",
-            displayName: "Unproved device"
-        )
-        bluetoothFactory.enqueueSearchResult(
-            AzimuthBluetoothRadioSearchSnapshot(
-                provenRadioEndpoints: [unproved],
-                likelyRadioEndpoints: [],
-                pairedDeviceAddresses: [unproved.address],
-                totalPairedDeviceCount: 1,
-                probedAddresses: [unproved.address],
-                currentProbedAddresses: [unproved.address],
-                hasInventorySnapshot: true,
-                probedCandidateCount: 1,
-                totalUnhintedCandidateCount: 1,
-                isComplete: true,
-                wasCancelled: false
-            )
-        )
-        let router = try AzimuthSelectableRadioTransport(
-            usbFactory: makeUSBFactory(),
-            bluetoothFactory: bluetoothFactory
-        )
-        _ = try await router.availableEndpointSnapshot()
-
-        let error = try await captureError {
-            _ = try await router.findCustomNamedBluetoothRadios()
-        }
-
-        XCTAssertEqual(
-            error as? RadioEndpointSelectionError,
-            .malformedEndpoint
-        )
-    }
-
-    func testSearchProgressPrunesAddressesMissingFromCurrentInventory() async throws {
-        let bluetoothFactory = makeFactory()
-        bluetoothFactory.replaceDiscovery(
-            likelyCandidates: [],
-            totalPairedDeviceCount: 2
-        )
-        let removed = "FE:ED:00:00:00:00"
-        let retained = "FE:ED:00:00:00:01"
-        bluetoothFactory.enqueueSearchResult(
-            AzimuthBluetoothRadioSearchSnapshot(
-                provenRadioEndpoints: [],
-                likelyRadioEndpoints: [],
-                pairedDeviceAddresses: [removed, retained],
-                totalPairedDeviceCount: 2,
-                probedAddresses: [removed],
-                currentProbedAddresses: [removed],
-                hasInventorySnapshot: true,
-                probedCandidateCount: 1,
-                totalUnhintedCandidateCount: 2,
-                isComplete: false,
-                wasCancelled: false
-            )
-        )
-        bluetoothFactory.enqueueSearchResult(
-            AzimuthBluetoothRadioSearchSnapshot(
-                provenRadioEndpoints: [],
-                likelyRadioEndpoints: [],
-                pairedDeviceAddresses: [retained],
-                totalPairedDeviceCount: 1,
-                probedAddresses: [retained],
-                currentProbedAddresses: [retained],
-                hasInventorySnapshot: true,
-                probedCandidateCount: 1,
-                totalUnhintedCandidateCount: 1,
-                isComplete: true,
-                wasCancelled: false
-            )
-        )
-        let router = try AzimuthSelectableRadioTransport(
-            usbFactory: makeUSBFactory(),
-            bluetoothFactory: bluetoothFactory
-        )
-        _ = try await router.availableEndpointSnapshot()
-
-        _ = try await router.findCustomNamedBluetoothRadios()
-        let result = try await router.findCustomNamedBluetoothRadios()
-
-        XCTAssertTrue(result.isComplete)
-        XCTAssertEqual(result.probedCandidateCount, 1)
-        XCTAssertEqual(result.totalUnhintedCandidateCount, 1)
-        XCTAssertEqual(
-            bluetoothFactory.recordedSearchExclusions,
-            [[], [removed]]
-        )
-    }
-
-    func testCustomSearchPrunesQualifiedEndpointUnpairedBetweenPasses() async throws {
-        let bluetoothFactory = makeFactory()
-        let removed = AzimuthBluetoothEndpoint(
-            address: "10:20:30:40:50:60",
-            displayName: "Field D75",
-            verifiedCATSerialNumber: "B3B00009"
-        )
-        let retainedAddress = "10:20:30:40:50:61"
-        bluetoothFactory.replaceDiscovery(
-            likelyCandidates: [],
-            totalPairedDeviceCount: 2,
-            pairedDeviceAddresses: [removed.address, retainedAddress]
-        )
-        bluetoothFactory.enqueueSearchResult(
-            AzimuthBluetoothRadioSearchSnapshot(
-                provenRadioEndpoints: [removed],
-                likelyRadioEndpoints: [],
-                pairedDeviceAddresses: [removed.address, retainedAddress],
-                totalPairedDeviceCount: 2,
-                probedAddresses: [removed.address],
-                currentProbedAddresses: [removed.address],
-                hasInventorySnapshot: true,
-                probedCandidateCount: 1,
-                totalUnhintedCandidateCount: 2,
-                isComplete: false,
-                wasCancelled: false
-            )
-        )
-        bluetoothFactory.enqueueSearchResult(
-            AzimuthBluetoothRadioSearchSnapshot(
-                provenRadioEndpoints: [],
-                likelyRadioEndpoints: [],
-                pairedDeviceAddresses: [retainedAddress],
-                totalPairedDeviceCount: 1,
-                probedAddresses: [retainedAddress],
-                currentProbedAddresses: [retainedAddress],
-                hasInventorySnapshot: true,
-                probedCandidateCount: 1,
-                totalUnhintedCandidateCount: 1,
-                isComplete: true,
-                wasCancelled: false
-            )
-        )
-        let router = try AzimuthSelectableRadioTransport(
-            usbFactory: makeUSBFactory(),
-            bluetoothFactory: bluetoothFactory
-        )
-        _ = try await router.availableEndpointSnapshot()
-
-        let first = try await router.findCustomNamedBluetoothRadios()
-        let second = try await router.findCustomNamedBluetoothRadios()
-
-        XCTAssertTrue(first.snapshot.endpoints.contains { $0.id == removed.id })
-        XCTAssertFalse(second.snapshot.endpoints.contains { $0.id == removed.id })
-        XCTAssertEqual(second.snapshot.pairedBluetoothDeviceCount, 1)
-        XCTAssertEqual(second.snapshot.likelyBluetoothRadioCount, 0)
-    }
-
-    func testCustomSearchPromotesNowLikelyEndpointAndRetainsSerialProof() async throws {
-        let bluetoothFactory = makeFactory()
-        let proved = AzimuthBluetoothEndpoint(
-            address: Self.firstBluetooth.address,
-            displayName: "Custom Field Name",
-            verifiedCATSerialNumber: "B3B00001"
-        )
-        let remainingAddress = "10:20:30:40:50:61"
-        let refreshedLikely = AzimuthBluetoothEndpoint(
-            address: proved.address,
-            displayName: "TH-D75 Living Room"
-        )
-        bluetoothFactory.replaceDiscovery(
-            likelyCandidates: [],
-            totalPairedDeviceCount: 2,
-            pairedDeviceAddresses: [proved.address, remainingAddress]
-        )
-        bluetoothFactory.enqueueSearchResult(
-            AzimuthBluetoothRadioSearchSnapshot(
-                provenRadioEndpoints: [proved],
-                likelyRadioEndpoints: [],
-                pairedDeviceAddresses: [proved.address, remainingAddress],
-                totalPairedDeviceCount: 2,
-                probedAddresses: [proved.address],
-                currentProbedAddresses: [proved.address],
-                hasInventorySnapshot: true,
-                probedCandidateCount: 1,
-                totalUnhintedCandidateCount: 2,
-                isComplete: false,
-                wasCancelled: false
-            )
-        )
-        bluetoothFactory.enqueueSearchResult(
-            AzimuthBluetoothRadioSearchSnapshot(
-                provenRadioEndpoints: [],
-                likelyRadioEndpoints: [refreshedLikely],
-                pairedDeviceAddresses: [proved.address, remainingAddress],
-                totalPairedDeviceCount: 2,
-                probedAddresses: [remainingAddress],
-                currentProbedAddresses: [remainingAddress],
-                hasInventorySnapshot: true,
-                probedCandidateCount: 1,
-                totalUnhintedCandidateCount: 1,
-                isComplete: true,
-                wasCancelled: false
-            )
-        )
-        let router = try AzimuthSelectableRadioTransport(
-            usbFactory: makeUSBFactory(),
-            bluetoothFactory: bluetoothFactory
-        )
-        _ = try await router.availableEndpointSnapshot()
-        _ = try await router.findCustomNamedBluetoothRadios()
-
-        let second = try await router.findCustomNamedBluetoothRadios()
-        let refreshed = try XCTUnwrap(
-            second.snapshot.endpoints.first { $0.id == proved.id }
-        )
-        XCTAssertEqual(refreshed.name, refreshedLikely.displayName)
-        XCTAssertEqual(second.snapshot.likelyBluetoothRadioCount, 1)
-
-        try await router.selectEndpoint(id: proved.id)
-        try await router.open()
-
-        XCTAssertEqual(
-            bluetoothFactory.qualifiedRequests,
-            ["\(proved.address)|B3B00001"]
-        )
-        await router.close()
-    }
-
     func testBluetoothSelectionRejectsIdentifierAbsentFromRetainedSnapshot() async throws {
         let bluetoothFactory = makeFactory()
-        bluetoothFactory.replaceCandidates([Self.firstBluetooth])
+        bluetoothFactory.replaceDevices([Self.firstBluetooth])
         let router = try AzimuthSelectableRadioTransport(
             usbFactory: makeUSBFactory(),
             bluetoothFactory: bluetoothFactory
@@ -1810,6 +1223,8 @@ final class AzimuthSelectableRadioTransportTests: XCTestCase {
     }
 
     private func makeFactory(
+        devices: [AzimuthBluetoothEndpoint]? = nil,
+        exactLinks: [String: AzimuthRouterMockBluetoothLink]? = nil,
         firstLink: AzimuthRouterMockBluetoothLink = .init(serialNumber: "B3B00001"),
         secondLink: AzimuthRouterMockBluetoothLink = .init(serialNumber: "B3B00002"),
         matchingLink: AzimuthRouterMockBluetoothLink = .init(
@@ -1818,8 +1233,8 @@ final class AzimuthSelectableRadioTransportTests: XCTestCase {
         )
     ) -> AzimuthRouterMockBluetoothFactory {
         AzimuthRouterMockBluetoothFactory(
-            candidates: [Self.firstBluetooth, Self.secondBluetooth],
-            exactLinks: [
+            devices: devices ?? [Self.firstBluetooth, Self.secondBluetooth],
+            exactLinks: exactLinks ?? [
                 Self.firstBluetooth.address: firstLink,
                 Self.secondBluetooth.address: secondLink,
             ],

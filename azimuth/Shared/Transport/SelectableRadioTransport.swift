@@ -31,18 +31,17 @@ private enum AzimuthTransportSelection: Sendable, Equatable {
 /// Errors from endpoint discovery, selection, and same-radio qualification.
 public enum AzimuthRadioSelectionError: LocalizedError, Sendable, Equatable {
     case transportIsOpen
-    case bluetoothSearchInProgress
     case ambiguousQualifiedBluetoothSerial(serialNumber: String)
     case expectedUSBRadioUnavailable(serialNumber: String)
     case differentUSBRadioAtRetainedPath(expected: String, actual: String?)
     case resolvedBluetoothAddressUnavailable
+    case bluetoothMmdvmUSBFallbackUnavailable(attachedUSBCount: Int)
+    case bluetoothMmdvmUSBIdentityUnavailable
 
     public var errorDescription: String? {
         switch self {
         case .transportIsOpen:
             "Disconnect the current radio before changing connection methods."
-        case .bluetoothSearchInProgress:
-            "Wait for the custom-named Bluetooth radio search to finish or stop it before connecting."
         case .ambiguousQualifiedBluetoothSerial(let serialNumber):
             "More than one retained Bluetooth address claims CAT serial \(serialNumber). Refresh paired devices before continuing."
         case .expectedUSBRadioUnavailable(let serialNumber):
@@ -51,6 +50,10 @@ public enum AzimuthRadioSelectionError: LocalizedError, Sendable, Equatable {
             "A different USB radio appeared at the recovery path. Expected \(expected), found \(actual ?? "no stable serial number")."
         case .resolvedBluetoothAddressUnavailable:
             "The same-radio Bluetooth link opened without reporting its exact paired address. Azimuth closed it rather than retaining an ambiguous connection."
+        case .bluetoothMmdvmUSBFallbackUnavailable(let attachedUSBCount):
+            "Automatic USB-C handoff requires exactly one attached TH-D75; found \(attachedUSBCount). Choose the intended USB-C endpoint in the connection picker."
+        case .bluetoothMmdvmUSBIdentityUnavailable:
+            "The sole attached USB-C radio has no stable USB serial identity, so Azimuth will not select it automatically."
         }
     }
 }
@@ -93,13 +96,13 @@ private final class AzimuthSelectedDeviceSlot: @unchecked Sendable {
     }
 }
 
-/// Routes one Azimuth controller to either USB or one exact Bluetooth radio.
+/// Routes one Azimuth controller to either USB or one exact Bluetooth device.
 ///
 /// Only one child transport is active at a time. Endpoint changes are accepted
 /// only while disconnected, stale child state is generation-fenced, and the
 /// same-radio fallback delegates exact serial qualification to the core.
 public actor AzimuthSelectableRadioTransport: AzimuthRadioTransport,
-    AzimuthSameRadioBluetoothSelecting
+    AzimuthSameRadioBluetoothSelecting, AzimuthBluetoothMMDVMUSBSelecting
 {
     private struct CleanupSlot: Sendable {
         let id: UInt64
@@ -120,11 +123,6 @@ public actor AzimuthSelectableRadioTransport: AzimuthRadioTransport,
     private var selected: AzimuthTransportSelection?
     private var retainedUSBEndpoint: AzimuthUSBEndpoint?
     private var lastBluetoothEndpoints: [AzimuthBluetoothEndpoint] = []
-    private var lastTotalPairedBluetoothDeviceCount: UInt32?
-    private var lastLikelyBluetoothRadioCount: UInt32?
-    private var customSearchProbedAddresses: Set<String> = []
-    private var lastCustomSearchTotalUnhintedCandidateCount: UInt32?
-    private var bluetoothSearchInProgress = false
     private var endpointDiscoveryGeneration: UInt64 = 0
     private var activeTransport: (any AzimuthRadioTransport)?
     private var activeSelection: AzimuthTransportSelection?
@@ -194,13 +192,10 @@ public actor AzimuthSelectableRadioTransport: AzimuthRadioTransport,
 
     public var hardwareSerialNumber: String? { currentHardwareSerialNumber }
 
-    /// Returns USB followed by likely-radio entries from one paired-device
-    /// inventory. The inventory's total paired count remains independent so a
-    /// custom-named TH-D75 can still authorize a serial-qualified handoff try.
+    /// Returns USB followed by every device in one bounded paired-device
+    /// inventory. Bluetooth display names are presentation only; connection
+    /// later qualifies the selected exact address over CAT.
     func availableEndpointSnapshot() async throws -> RadioEndpointDiscoverySnapshot {
-        guard !bluetoothSearchInProgress else {
-            throw AzimuthRadioSelectionError.bluetoothSearchInProgress
-        }
         endpointDiscoveryGeneration &+= 1
         let discoveryGeneration = endpointDiscoveryGeneration
         let discoveryResult: Result<AzimuthBluetoothDiscoverySnapshot, Error>
@@ -228,130 +223,31 @@ public actor AzimuthSelectableRadioTransport: AzimuthRadioTransport,
                 $0.verifiedCATSerialNumber != nil
             }
             lastBluetoothEndpoints = retainedQualified
-            lastTotalPairedBluetoothDeviceCount = nil
-            lastLikelyBluetoothRadioCount = nil
             return RadioEndpointDiscoverySnapshot(
                 endpoints: usb.map(Self.radioEndpoint(for:)) + retainedQualified.map {
                     Self.radioEndpoint(for: $0)
                 },
                 warning: "Bluetooth connections unavailable: \(Self.describe(error))",
-                pairedBluetoothDeviceCount: nil,
-                likelyBluetoothRadioCount: nil
+                pairedBluetoothDeviceCount: nil
             )
         }
         let usb = usbFactory.availableEndpoints()
         try Self.validateUSBEndpoints(usb)
         try ensureCurrentEndpointDiscovery(discoveryGeneration)
-        let likelyBluetooth = bluetoothDiscovery.likelyRadioEndpoints
-        let bluetooth = Self.mergeLikelyBluetoothEndpoints(
-            likelyBluetooth,
-            retainingQualifiedFrom: lastBluetoothEndpoints,
-            pairedDeviceAddresses: bluetoothDiscovery.pairedDeviceAddresses
+        let bluetooth = Self.mergeBluetoothEndpoints(
+            bluetoothDiscovery.pairedEndpoints,
+            retainingQualifiedFrom: lastBluetoothEndpoints
         )
         try Self.validateCombinedEndpointIDs(usb: usb, bluetooth: bluetooth)
         lastBluetoothEndpoints = bluetooth
-        lastTotalPairedBluetoothDeviceCount =
-            bluetoothDiscovery.totalPairedDeviceCount
-        lastLikelyBluetoothRadioCount = UInt32(likelyBluetooth.count)
-        customSearchProbedAddresses = []
-        lastCustomSearchTotalUnhintedCandidateCount = nil
+        guard let pairedDeviceCount = UInt32(exactly: bluetooth.count) else {
+            throw RadioEndpointSelectionError.malformedEndpoint
+        }
         return RadioEndpointDiscoverySnapshot(
             endpoints: usb.map(Self.radioEndpoint(for:)) + bluetooth.map {
                 Self.radioEndpoint(for: $0)
             },
-            pairedBluetoothDeviceCount: bluetoothDiscovery.totalPairedDeviceCount,
-            likelyBluetoothRadioCount: UInt32(likelyBluetooth.count)
-        )
-    }
-
-    /// Explicitly CAT-probe paired devices omitted from the ordinary picker.
-    /// Only exact endpoints proved as TH-D75 radios are merged into the
-    /// retained snapshot. A partial bounded result keeps its proven rows while
-    /// reporting that the search was incomplete.
-    func findCustomNamedBluetoothRadios() async throws
-        -> RadioEndpointBluetoothSearchResult {
-        guard activeTransport == nil, cleanupSlot == nil else {
-            throw AzimuthRadioSelectionError.transportIsOpen
-        }
-        guard !bluetoothSearchInProgress else {
-            throw AzimuthRadioSelectionError.bluetoothSearchInProgress
-        }
-        // An explicit radio search supersedes a still-running optional picker
-        // refresh. The generated discovery call is not Swift-cancellable, so
-        // invalidate its eventual result before starting this newer inventory.
-        endpointDiscoveryGeneration &+= 1
-        bluetoothSearchInProgress = true
-        defer { bluetoothSearchInProgress = false }
-
-        let previousProbedAddresses = customSearchProbedAddresses
-        let search = try await bluetoothFactory.findCustomNamedRadios(
-            previouslyProbedAddresses: previousProbedAddresses.sorted()
-        )
-        let usb = usbFactory.availableEndpoints()
-        try Self.validateUSBEndpoints(usb)
-        try Self.validateBluetoothRadioSearch(
-            search,
-            previouslyProbedAddresses: previousProbedAddresses
-        )
-        if search.hasInventorySnapshot {
-            let discovery = AzimuthBluetoothDiscoverySnapshot(
-                likelyRadioEndpoints: search.likelyRadioEndpoints,
-                totalPairedDeviceCount: search.totalPairedDeviceCount,
-                pairedDeviceAddresses: search.pairedDeviceAddresses
-            )
-            try Self.validateBluetoothDiscovery(discovery)
-            customSearchProbedAddresses = Set(search.currentProbedAddresses)
-            lastCustomSearchTotalUnhintedCandidateCount =
-                search.totalUnhintedCandidateCount
-            lastTotalPairedBluetoothDeviceCount =
-                search.totalPairedDeviceCount
-            lastLikelyBluetoothRadioCount =
-                UInt32(search.likelyRadioEndpoints.count)
-        }
-        let effectiveTotal = lastCustomSearchTotalUnhintedCandidateCount
-            ?? search.totalUnhintedCandidateCount
-
-        var merged = if search.hasInventorySnapshot {
-            Self.mergeLikelyBluetoothEndpoints(
-                search.likelyRadioEndpoints,
-                retainingQualifiedFrom: lastBluetoothEndpoints,
-                pairedDeviceAddresses: search.pairedDeviceAddresses
-            )
-        } else {
-            lastBluetoothEndpoints
-        }
-        for proven in search.provenRadioEndpoints {
-            if let index = merged.firstIndex(where: { $0.id == proven.id }) {
-                // Prefer the newly serial-qualified record over a presentation-
-                // only discovery hint for the same exact address.
-                merged[index] = proven
-            } else {
-                merged.append(proven)
-            }
-        }
-        try Self.validateCombinedEndpointIDs(usb: usb, bluetooth: merged)
-        lastBluetoothEndpoints = merged
-
-        let warning: String?
-        if search.isComplete {
-            warning = nil
-        } else {
-            warning = "Bluetooth radio search checked \(customSearchProbedAddresses.count) of \(effectiveTotal) unhinted paired devices before its safety bound. Any proved TH-D75 connections were retained."
-        }
-        let snapshot = RadioEndpointDiscoverySnapshot(
-            endpoints: usb.map(Self.radioEndpoint(for:)) + merged.map {
-                Self.radioEndpoint(for: $0)
-            },
-            warning: warning,
-            pairedBluetoothDeviceCount: lastTotalPairedBluetoothDeviceCount,
-            likelyBluetoothRadioCount: lastLikelyBluetoothRadioCount
-        )
-        return RadioEndpointBluetoothSearchResult(
-            snapshot: snapshot,
-            probedCandidateCount: UInt32(customSearchProbedAddresses.count),
-            totalUnhintedCandidateCount: effectiveTotal,
-            isComplete: search.isComplete,
-            wasCancelled: search.wasCancelled
+            pairedBluetoothDeviceCount: pairedDeviceCount
         )
     }
 
@@ -363,9 +259,6 @@ public actor AzimuthSelectableRadioTransport: AzimuthRadioTransport,
     /// that the paired endpoint is still available. Display names are never
     /// used as connection identity.
     func selectEndpoint(id: String) async throws {
-        guard !bluetoothSearchInProgress else {
-            throw AzimuthRadioSelectionError.bluetoothSearchInProgress
-        }
         guard activeTransport == nil, cleanupSlot == nil else {
             throw AzimuthRadioSelectionError.transportIsOpen
         }
@@ -378,18 +271,18 @@ public actor AzimuthSelectableRadioTransport: AzimuthRadioTransport,
             updateState(.disconnected)
             return
         }
-        guard let candidate = lastBluetoothEndpoints.first(where: { $0.id == id }) else {
+        guard let endpoint = lastBluetoothEndpoints.first(where: { $0.id == id }) else {
             throw RadioEndpointSelectionError.invalidEndpoint(id: id)
         }
-        if let serialNumber = candidate.verifiedCATSerialNumber {
+        if let serialNumber = endpoint.verifiedCATSerialNumber {
             selected = .qualifiedBluetooth(
-                candidate,
+                endpoint,
                 expectedUSBSerial: serialNumber
             )
         } else {
-            selected = .bluetooth(candidate)
+            selected = .bluetooth(endpoint)
         }
-        selectedDeviceSlot.replace(with: candidate.device)
+        selectedDeviceSlot.replace(with: endpoint.device)
         updateState(.disconnected)
     }
 
@@ -491,10 +384,38 @@ public actor AzimuthSelectableRadioTransport: AzimuthRadioTransport,
         updateState(.disconnected)
     }
 
-    public func open() async throws {
-        guard !bluetoothSearchInProgress else {
-            throw AzimuthRadioSelectionError.bluetoothSearchInProgress
+    /// Return whether one exact, serial-identified USB endpoint is available
+    /// for a consented handoff from Bluetooth MMDVM mode.
+    func hasSoleIdentifiedUSBEndpoint() async throws -> Bool {
+        let refreshed = usbFactory.availableEndpoints()
+        try Self.validateUSBEndpoints(refreshed)
+        return refreshed.count == 1 && refreshed.first?.usbSerialNumber != nil
+    }
+
+    /// Select the sole exact USB endpoint without opening or changing the
+    /// radio. The next ordinary connection re-proves CAT model and serial.
+    func selectSoleUSBForBluetoothMMDVM() async throws -> String {
+        guard activeTransport == nil, cleanupSlot == nil else {
+            throw AzimuthRadioSelectionError.transportIsOpen
         }
+        let refreshed = usbFactory.availableEndpoints()
+        try Self.validateUSBEndpoints(refreshed)
+        guard refreshed.count == 1, let endpoint = refreshed.first else {
+            throw AzimuthRadioSelectionError.bluetoothMmdvmUSBFallbackUnavailable(
+                attachedUSBCount: refreshed.count
+            )
+        }
+        guard let serialNumber = endpoint.usbSerialNumber else {
+            throw AzimuthRadioSelectionError.bluetoothMmdvmUSBIdentityUnavailable
+        }
+        retainedUSBEndpoint = endpoint
+        selected = .usb(endpoint)
+        selectedDeviceSlot.replace(with: endpoint.device)
+        updateState(.disconnected)
+        return serialNumber
+    }
+
+    public func open() async throws {
         guard cleanupSlot == nil else {
             throw AzimuthRadioSelectionError.transportIsOpen
         }
@@ -513,14 +434,14 @@ public actor AzimuthSelectableRadioTransport: AzimuthRadioTransport,
         switch selection {
         case .usb(let endpoint):
             transport = try usbFactory.makeTransport(endpoint: endpoint)
-        case .bluetooth(let candidate):
+        case .bluetooth(let endpoint):
             transport = AzimuthBluetoothRadioTransport(
-                endpoint: candidate,
+                endpoint: endpoint,
                 factory: bluetoothFactory
             )
-        case .qualifiedBluetooth(let candidate, let serialNumber):
+        case .qualifiedBluetooth(let endpoint, let serialNumber):
             transport = AzimuthBluetoothRadioTransport(
-                endpoint: candidate,
+                endpoint: endpoint,
                 expectedUSBSerialNumber: serialNumber,
                 factory: bluetoothFactory
             )
@@ -774,25 +695,20 @@ public actor AzimuthSelectableRadioTransport: AzimuthRadioTransport,
         return retained
     }
 
-    private static func mergeLikelyBluetoothEndpoints(
-        _ likely: [AzimuthBluetoothEndpoint],
-        retainingQualifiedFrom previous: [AzimuthBluetoothEndpoint],
-        pairedDeviceAddresses: [String]
+    private static func mergeBluetoothEndpoints(
+        _ current: [AzimuthBluetoothEndpoint],
+        retainingQualifiedFrom previous: [AzimuthBluetoothEndpoint]
     ) -> [AzimuthBluetoothEndpoint] {
-        let pairedIDs = Set(
-            pairedDeviceAddresses.map(AzimuthBluetoothEndpoint.stableID(for:))
-        )
         var qualifiedByID: [
             String: (endpoint: AzimuthBluetoothEndpoint, serialNumber: String)
         ] = [:]
         for endpoint in previous {
-            guard pairedIDs.contains(endpoint.id),
-                  let serialNumber = endpoint.verifiedCATSerialNumber else {
+            guard let serialNumber = endpoint.verifiedCATSerialNumber else {
                 continue
             }
             qualifiedByID[endpoint.id] = (endpoint, serialNumber)
         }
-        var merged = likely.map { endpoint in
+        return current.map { endpoint in
             guard let qualified = qualifiedByID[endpoint.id] else {
                 return endpoint
             }
@@ -802,11 +718,6 @@ public actor AzimuthSelectableRadioTransport: AzimuthRadioTransport,
                 verifiedCATSerialNumber: qualified.serialNumber
             )
         }
-        let existingIDs = Set(merged.map(\.id))
-        merged.append(contentsOf: qualifiedByID.values.compactMap { qualified in
-            existingIDs.contains(qualified.endpoint.id) ? nil : qualified.endpoint
-        })
-        return merged
     }
 
     private func pairedBluetoothDiscovery() async throws -> AzimuthBluetoothDiscoverySnapshot {
@@ -825,27 +736,8 @@ public actor AzimuthSelectableRadioTransport: AzimuthRadioTransport,
     private static func validateBluetoothDiscovery(
         _ discovery: AzimuthBluetoothDiscoverySnapshot
     ) throws {
-        let endpoints = discovery.likelyRadioEndpoints
+        let endpoints = discovery.pairedEndpoints
         try Self.validateBluetoothEndpoints(endpoints)
-        let pairedIDs = Set(
-            discovery.pairedDeviceAddresses.map(AzimuthBluetoothEndpoint.stableID(for:))
-        )
-        guard let pairedAddressCount = UInt32(
-            exactly: discovery.pairedDeviceAddresses.count
-        ),
-              pairedAddressCount == discovery.totalPairedDeviceCount,
-              pairedIDs.count == discovery.pairedDeviceAddresses.count,
-              discovery.pairedDeviceAddresses.allSatisfy({ !$0.isEmpty }),
-              endpoints.allSatisfy({ pairedIDs.contains($0.id) }) else {
-            throw RadioEndpointSelectionError.malformedEndpoint
-        }
-        var identifiers: Set<String> = []
-        for endpoint in endpoints where !identifiers.insert(endpoint.id).inserted {
-            throw RadioEndpointSelectionError.duplicateEndpoint(id: endpoint.id)
-        }
-        guard UInt32(endpoints.count) <= discovery.totalPairedDeviceCount else {
-            throw RadioEndpointSelectionError.malformedEndpoint
-        }
     }
 
     private static func validateBluetoothEndpoints(
@@ -853,7 +745,7 @@ public actor AzimuthSelectableRadioTransport: AzimuthRadioTransport,
     ) throws {
         var identifiers: Set<String> = []
         for endpoint in endpoints {
-            guard !endpoint.address.isEmpty,
+            guard isCanonicalBluetoothAddress(endpoint.address),
                   !endpoint.displayName.isEmpty,
                   endpoint.verifiedCATSerialNumber?.isEmpty != true else {
                 throw RadioEndpointSelectionError.malformedEndpoint
@@ -866,86 +758,21 @@ public actor AzimuthSelectableRadioTransport: AzimuthRadioTransport,
         }
     }
 
-    private static func validateBluetoothRadioSearch(
-        _ search: AzimuthBluetoothRadioSearchSnapshot,
-        previouslyProbedAddresses: Set<String>
-    ) throws {
-        try validateBluetoothEndpoints(search.provenRadioEndpoints)
-        let probedAddresses = Set(search.probedAddresses)
-        let currentProbedAddresses = Set(search.currentProbedAddresses)
-        let pairedIDs = Set(
-            search.pairedDeviceAddresses.map(AzimuthBluetoothEndpoint.stableID(for:))
-        )
-        let likelyIDs = Set(search.likelyRadioEndpoints.map(\.id))
-        let probedIDs = Set(
-            search.probedAddresses.map(AzimuthBluetoothEndpoint.stableID(for:))
-        )
-        let currentProbedIDs = Set(
-            search.currentProbedAddresses.map(AzimuthBluetoothEndpoint.stableID(for:))
-        )
-        guard let provenCount = UInt32(exactly: search.provenRadioEndpoints.count),
-              let returnedProbedCount = UInt32(exactly: probedAddresses.count),
-              let likelyCount = UInt32(exactly: search.likelyRadioEndpoints.count),
-              returnedProbedCount == search.probedCandidateCount,
-              probedAddresses.count == search.probedAddresses.count,
-              currentProbedAddresses.count == search.currentProbedAddresses.count,
-              probedAddresses.allSatisfy({ !$0.isEmpty }),
-              currentProbedAddresses.allSatisfy({ !$0.isEmpty }),
-              probedAddresses.isDisjoint(with: previouslyProbedAddresses),
-              search.provenRadioEndpoints.allSatisfy({
-                  $0.verifiedCATSerialNumber != nil
-                      && probedAddresses.contains($0.address)
-              }),
-              search.probedCandidateCount <= search.totalUnhintedCandidateCount,
-              provenCount <= search.probedCandidateCount,
-              search.hasInventorySnapshot
-                || (probedAddresses.isEmpty
-                    && currentProbedAddresses == previouslyProbedAddresses
-                    && search.provenRadioEndpoints.isEmpty
-                    && search.likelyRadioEndpoints.isEmpty
-                    && search.pairedDeviceAddresses.isEmpty
-                    && search.totalPairedDeviceCount == 0
-                    && !search.isComplete
-                    && search.wasCancelled),
-              !search.hasInventorySnapshot
-                || currentProbedAddresses.isSuperset(of: probedAddresses),
-              !search.hasInventorySnapshot
-                || currentProbedAddresses.isSubset(
-                    of: previouslyProbedAddresses.union(probedAddresses)
-                ),
-              !search.hasInventorySnapshot
-                || currentProbedAddresses.count <= search.totalUnhintedCandidateCount,
-              !search.hasInventorySnapshot
-                || probedIDs.isSubset(of: pairedIDs),
-              !search.hasInventorySnapshot
-                || currentProbedIDs.isSubset(of: pairedIDs),
-              !search.hasInventorySnapshot
-                || probedIDs.isDisjoint(with: likelyIDs),
-              !search.hasInventorySnapshot
-                || currentProbedIDs.isDisjoint(with: likelyIDs),
-              !search.hasInventorySnapshot
-                || search.provenRadioEndpoints.allSatisfy({
-                    pairedIDs.contains($0.id)
-                        && !likelyIDs.contains($0.id)
-                }),
-              !search.hasInventorySnapshot
-                || likelyCount <= search.totalPairedDeviceCount,
-              !search.hasInventorySnapshot
-                || search.totalUnhintedCandidateCount
-                    == search.totalPairedDeviceCount
-                        - likelyCount,
-              !search.isComplete
-                || (search.hasInventorySnapshot
-                    && currentProbedAddresses.count
-                        == search.totalUnhintedCandidateCount)
-        else {
-            throw RadioEndpointSelectionError.malformedEndpoint
+    private static func isCanonicalBluetoothAddress(_ address: String) -> Bool {
+        let bytes = Array(address.utf8)
+        guard bytes.count == 17 else { return false }
+        for (index, byte) in bytes.enumerated() {
+            if index % 3 == 2 {
+                guard byte == 0x2D else { return false }
+            } else {
+                let decimal: ClosedRange<UInt8> = 0x30 ... 0x39
+                let uppercaseHex: ClosedRange<UInt8> = 0x41 ... 0x46
+                guard decimal.contains(byte) || uppercaseHex.contains(byte) else {
+                    return false
+                }
+            }
         }
-        var identifiers: Set<String> = []
-        for endpoint in search.provenRadioEndpoints
-        where !identifiers.insert(endpoint.id).inserted {
-            throw RadioEndpointSelectionError.duplicateEndpoint(id: endpoint.id)
-        }
+        return true
     }
 
     private static func validateUSBEndpoints(
@@ -984,7 +811,6 @@ public actor AzimuthSelectableRadioTransport: AzimuthRadioTransport,
 @MainActor
 final class AzimuthSelectableRadioEndpointSelector: RadioEndpointSelecting {
     let initialEndpoints: [RadioEndpoint]
-    let supportsCustomNamedBluetoothSearch = true
     private let router: AzimuthSelectableRadioTransport
 
     init(router: AzimuthSelectableRadioTransport) {
@@ -994,11 +820,6 @@ final class AzimuthSelectableRadioEndpointSelector: RadioEndpointSelecting {
 
     func refreshEndpoints() async throws -> RadioEndpointDiscoverySnapshot {
         try await router.availableEndpointSnapshot()
-    }
-
-    func findCustomNamedBluetoothRadios() async throws
-        -> RadioEndpointBluetoothSearchResult {
-        try await router.findCustomNamedBluetoothRadios()
     }
 
     func selectEndpoint(id: String) async throws {

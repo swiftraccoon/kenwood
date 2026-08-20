@@ -96,16 +96,19 @@ Kenwood TH-D75.
   paired Bluetooth address; Azimuth keeps one CAT/MCP owner active at a time.
   USB choices are bound to the radio's stable USB descriptor serial, not a
   reusable `/dev/cu.usbmodem*` pathname, and recovery follows that same radio
-  if its tty path changes after reboot. The ordinary Bluetooth picker shows
-  likely TH-D75 candidates only. On first use, Azimuth asks for macOS Bluetooth
-  access in the foreground before launching its isolated RFCOMM helper; a
-  denial leaves USB-C usable and points to Privacy & Security > Bluetooth. An
-  explicit custom-name search can CAT-probe
-  other paired devices and adds only radios it proves; that probe may exit a
-  transient KISS or MMDVM packet session but does not change persistent menus.
+  if its tty path changes after reboot. The Bluetooth picker shows every paired
+  device by its native display name and exact address. On first use, Azimuth
+  asks for macOS Bluetooth access in the foreground before launching its
+  isolated RFCOMM helper; a denial leaves USB-C usable and points to Privacy &
+  Security > Bluetooth. Choosing a Bluetooth device opens only that exact
+  address, then requires strict CAT model and serial identity before accepting
+  it as a TH-D75.
   If USB-C positively answers as MMDVM, Azimuth first offers a non-destructive
   handoff to the same radio over Bluetooth. Turning Menu 650 off and returning
-  control to USB remains a separate, explicitly approved operation. iPadOS has
+  control to USB remains a separate, explicitly approved operation. If
+  Bluetooth positively answers as MMDVM, Azimuth can offer a non-destructive
+  handoff to the sole serial-identified USB-C endpoint. That action changes
+  only the selected host transport and leaves Menu 650 untouched. iPadOS has
   no second TH-D75 CAT path while USB-C carries MMDVM, so the app explains the
   manual recovery instead of presenting a false automatic option.
 

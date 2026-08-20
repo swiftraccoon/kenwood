@@ -6,6 +6,33 @@ import XCTest
 
 @MainActor
 final class AzimuthCATRecoveryPromptTests: XCTestCase {
+    func testBluetoothMMDVMOffersUSBHandoffWithoutActingBeforeConsent() async {
+        let controller = CATRecoveryTestController(
+            connectionError: .bluetoothMmdvmMode,
+            usbFallbackAvailable: true
+        )
+        let model = makeModel(controller: controller)
+        model.selectRadioEndpoint(id: RadioEndpoint.catRecoveryBluetooth.id)
+
+        await model.connectRadio()
+
+        XCTAssertEqual(
+            model.catRecoveryAlert,
+            .bluetoothMmdvmMode(usbFallbackAvailable: true)
+        )
+        XCTAssertEqual(controller.usbFallbackCallCount, 0)
+        XCTAssertTrue(model.catRecoveryAlert?.message.contains("without changing Menu 650") == true)
+
+        await model.connectViaUSBFromBluetoothMMDVM()
+
+        XCTAssertEqual(controller.usbFallbackCallCount, 1)
+        XCTAssertNil(model.catRecoveryAlert)
+        XCTAssertEqual(
+            model.radioState.connection,
+            .connected(device: "Kenwood TH-D75", transport: "USB-C")
+        )
+    }
+
     func testMMDVMDetectionOffersRecoveryWithoutWritingBeforeConsent() async {
         let controller = CATRecoveryTestController()
         let model = makeModel(controller: controller)
@@ -314,7 +341,7 @@ final class AzimuthCATRecoveryPromptTests: XCTestCase {
         )
         let model = makeModel(
             controller: controller,
-            likelyBluetoothCandidate: false,
+            includePairedBluetoothDevice: false,
             totalPairedBluetoothDevices: 0
         )
 
@@ -332,20 +359,20 @@ final class AzimuthCATRecoveryPromptTests: XCTestCase {
         )
     }
 
-    func testCustomNamedPairedDeviceOffersHonestSerialQualifiedTry() async {
+    func testEveryPairedDeviceOffersHonestSerialQualifiedTry() async {
         let controller = CATRecoveryTestController(
             automaticRecoveryAvailable: true,
             bluetoothFallbackAvailable: true
         )
         let model = makeModel(
             controller: controller,
-            likelyBluetoothCandidate: false,
+            bluetoothEndpoint: .catRecoveryBluetooth,
             totalPairedBluetoothDevices: 1
         )
 
         await model.connectRadio()
 
-        XCTAssertEqual(model.radioEndpoints, [.defaultUSBC])
+        XCTAssertEqual(model.radioEndpoints, [.defaultUSBC, .catRecoveryBluetooth])
         XCTAssertEqual(model.pairedBluetoothDeviceCount, 1)
         XCTAssertEqual(
             model.catRecoveryAlert,
@@ -361,11 +388,12 @@ final class AzimuthCATRecoveryPromptTests: XCTestCase {
 
     private func makeModel(
         controller: CATRecoveryTestController,
-        likelyBluetoothCandidate: Bool = true,
+        includePairedBluetoothDevice: Bool = true,
+        bluetoothEndpoint: RadioEndpoint = .catRecoveryBluetooth,
         totalPairedBluetoothDevices: UInt32 = 1
     ) -> AzimuthSceneModel {
-        let endpoints: [RadioEndpoint] = likelyBluetoothCandidate
-            ? [.defaultUSBC, .catRecoveryBluetooth]
+        let endpoints: [RadioEndpoint] = includePairedBluetoothDevice
+            ? [.defaultUSBC, bluetoothEndpoint]
             : [.defaultUSBC]
         return AzimuthSceneModel(
             radioController: controller,
@@ -385,7 +413,7 @@ private extension RadioEndpoint {
         id: "bluetooth:00:11:22:33:44:55",
         name: "Kenwood TH-D75",
         transport: .bluetooth,
-        detail: "00:11:22:33:44:55"
+        detail: "00-11-22-33-44-55"
     )
 }
 
@@ -424,6 +452,7 @@ private final class CATRecoveryTestController: RadioControlling {
     private(set) var connectCallCount = 0
     private(set) var recoveryCallCount = 0
     private(set) var bluetoothFallbackCallCount = 0
+    private(set) var usbFallbackCallCount = 0
     private(set) var disconnectCallCount = 0
     private(set) var recoveryStarted = false
     private(set) var recoveryCancellationObserved = false
@@ -436,6 +465,8 @@ private final class CATRecoveryTestController: RadioControlling {
     private let blockBluetoothFallback: Bool
     private let bluetoothFallbackFailure: String?
     private let lateCancellationFailure: String?
+    private let connectionError: RadioControllerError
+    private(set) var usbCATFallbackAvailable: Bool
 
     init(
         recoveryFailure: String? = nil,
@@ -445,8 +476,10 @@ private final class CATRecoveryTestController: RadioControlling {
         blockBluetoothFallback: Bool = false,
         bluetoothFallbackFailure: String? = nil,
         lateCancellationFailure: String? = nil,
+        connectionError: RadioControllerError = .usbMmdvmMode,
         automaticRecoveryAvailable: Bool = true,
-        bluetoothFallbackAvailable: Bool = false
+        bluetoothFallbackAvailable: Bool = false,
+        usbFallbackAvailable: Bool = false
     ) {
         self.recoveryFailure = recoveryFailure
         self.denyBluetoothAuthorization = denyBluetoothAuthorization
@@ -455,8 +488,10 @@ private final class CATRecoveryTestController: RadioControlling {
         self.blockBluetoothFallback = blockBluetoothFallback
         self.bluetoothFallbackFailure = bluetoothFallbackFailure
         self.lateCancellationFailure = lateCancellationFailure
+        self.connectionError = connectionError
         automaticCATRecoveryAvailable = automaticRecoveryAvailable
         bluetoothCATFallbackAvailable = bluetoothFallbackAvailable
+        usbCATFallbackAvailable = usbFallbackAvailable
     }
 
     var updates: AsyncStream<RadioWorkspaceState> {
@@ -474,7 +509,7 @@ private final class CATRecoveryTestController: RadioControlling {
             message: "The TH-D75 is using USB-C for DV Gateway/MMDVM data."
         )
         currentState = failed
-        throw RadioControllerError.usbMmdvmMode
+        throw connectionError
     }
 
     func restoreCATFromUSBMMDVM() async throws {
@@ -531,6 +566,23 @@ private final class CATRecoveryTestController: RadioControlling {
         }
         currentState = RadioWorkspaceState(
             connection: .connected(device: "Kenwood TH-D75", transport: "Bluetooth"),
+            capabilities: RadioCapabilities(
+                screenStreaming: .available,
+                frontPanelControl: .available,
+                settingRead: .available,
+                settingWrite: .available
+            ),
+            screenFrame: nil,
+            telemetry: .unavailable,
+            settingValues: [:],
+            lastScreenError: nil
+        )
+    }
+
+    func connectViaUSBFromBluetoothMMDVM() async throws {
+        usbFallbackCallCount += 1
+        currentState = RadioWorkspaceState(
+            connection: .connected(device: "Kenwood TH-D75", transport: "USB-C"),
             capabilities: RadioCapabilities(
                 screenStreaming: .available,
                 frontPanelControl: .available,

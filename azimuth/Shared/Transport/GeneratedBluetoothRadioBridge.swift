@@ -20,55 +20,12 @@ struct AzimuthGeneratedBluetoothLinkFactory: AzimuthBluetoothLinkFactory {
         try await authorization.ensureBluetoothAuthorization()
         let discovery = try await discoverPairedBluetoothDevices()
         return AzimuthBluetoothDiscoverySnapshot(
-            likelyRadioEndpoints: discovery.likelyRadioCandidates.map {
+            pairedEndpoints: discovery.devices.map {
                 AzimuthBluetoothEndpoint(
                     address: $0.address,
                     displayName: $0.displayName
                 )
-            },
-            totalPairedDeviceCount: discovery.totalPairedDeviceCount,
-            pairedDeviceAddresses: discovery.pairedDeviceAddresses
-        )
-    }
-
-    func findCustomNamedRadios(
-        previouslyProbedAddresses: [String]
-    ) async throws -> AzimuthBluetoothRadioSearchSnapshot {
-        try await authorization.ensureBluetoothAuthorization()
-        let operation = try BluetoothRadioSearchOperation(
-            previouslyCompletedProbeAddresses: previouslyProbedAddresses
-        )
-        let result = try await withTaskCancellationHandler {
-            // A cancelled operation intentionally returns a normal partial
-            // result. Consume it even though this Swift task remains marked
-            // cancelled so completed CAT proofs are not discarded.
-            try await operation.run()
-        } onCancel: {
-            operation.cancel()
-        }
-        return AzimuthBluetoothRadioSearchSnapshot(
-            provenRadioEndpoints: result.radioCandidates.map {
-                AzimuthBluetoothEndpoint(
-                    address: $0.address,
-                    displayName: $0.displayName,
-                    verifiedCATSerialNumber: $0.catSerialNumber
-                )
-            },
-            likelyRadioEndpoints: result.likelyRadioCandidates.map {
-                AzimuthBluetoothEndpoint(
-                    address: $0.address,
-                    displayName: $0.displayName
-                )
-            },
-            pairedDeviceAddresses: result.pairedDeviceAddresses,
-            totalPairedDeviceCount: result.totalPairedDeviceCount,
-            probedAddresses: result.completedProbeAddresses,
-            currentProbedAddresses: result.currentCompletedProbeAddresses,
-            hasInventorySnapshot: result.hasInventorySnapshot,
-            probedCandidateCount: result.completedProbeCount,
-            totalUnhintedCandidateCount: result.totalUnhintedCandidateCount,
-            isComplete: result.isComplete,
-            wasCancelled: result.wasCancelled
+            }
         )
     }
 

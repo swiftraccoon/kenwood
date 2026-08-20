@@ -213,7 +213,7 @@ schemes:
             app="${TARGET_BUILD_DIR}/${FULL_PRODUCT_NAME}"
             helper="${app}/Contents/MacOS/AzimuthBluetoothHelper"
             entitlements="${SRCROOT}/macOS/BluetoothHelper/AzimuthBluetoothHelper.entitlements"
-            identity="${EXPANDED_CODE_SIGN_IDENTITY:--}"
+            identity="${EXPANDED_CODE_SIGN_IDENTITY:-${CODE_SIGN_IDENTITY:--}}"
             /usr/bin/codesign --force --sign "${identity}" \
               --preserve-metadata=identifier,flags \
               --entitlements "${entitlements}" \

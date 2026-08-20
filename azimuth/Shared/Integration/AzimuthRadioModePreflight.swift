@@ -18,6 +18,7 @@ enum AzimuthRadioWireMode: Sendable, Equatable {
 enum AzimuthRadioModePreflightError: LocalizedError, Sendable, Equatable {
     case transportClosed(stage: String)
     case usbMmdvmMode
+    case bluetoothMmdvmMode
     case cdcUnresponsive
 
     var errorDescription: String? {
@@ -26,6 +27,8 @@ enum AzimuthRadioModePreflightError: LocalizedError, Sendable, Equatable {
             return "The TH-D75 connection closed during \(stage)."
         case .usbMmdvmMode:
             return "After Azimuth sent the TH-D75 packet-mode exit sequence, the USB-C interface returned a valid MMDVM response, so CAT control is unavailable on that interface after recovery."
+        case .bluetoothMmdvmMode:
+            return "After Azimuth sent the TH-D75 packet-mode exit sequence, the Bluetooth interface returned a valid MMDVM response, so CAT control is unavailable on that interface while DV Gateway is routed to Bluetooth."
         case .cdcUnresponsive:
             return "Azimuth sent the TH-D75 packet-mode exit sequence, then retried after a CDC control-line reset and one USB-C control-session reopen, but the radio did not answer. Power-cycle the radio, confirm Menu 980 is COM + AF/IF Output, then reconnect USB-C."
         }
