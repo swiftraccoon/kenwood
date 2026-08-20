@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::fake_reflector::FakeReflector;
-use dstar_gateway::tokio_shell::AsyncSession;
+use dstar_gateway::tokio_shell::{AsyncSession, ShellError};
 use dstar_gateway_core::header::DstarHeader;
 use dstar_gateway_core::session::Driver;
 use dstar_gateway_core::session::client::{ClientStateKind, Configured, DExtra, Event, Session};
@@ -121,16 +121,15 @@ async fn dextra_connect_via_loopback_and_send_voice() -> Result<(), Box<dyn std:
     );
 
     // 9. Graceful disconnect. The UNLINK sails through the shell and
-    //    arrives at the fake; the DExtra state machine doesn't wait
-    //    for a reply.
-    async_session.disconnect().await?;
+    //    arrives at the fake. This harness deliberately does not echo
+    //    an acknowledgement, so the typed no-ACK outcome is expected.
+    let disconnect_result = async_session.disconnect().await;
+    assert!(
+        matches!(disconnect_result, Err(ShellError::DisconnectUnacknowledged)),
+        "DExtra fake does not acknowledge UNLINK: {disconnect_result:?}"
+    );
 
-    // 10. Drain any final events before the session task exits. We
-    //     don't assert on a specific disconnect reason: the DExtra
-    //     reflector harness doesn't echo the UNLINK, so the reason
-    //     surfaces as `DisconnectTimeout` once the 2 s deadline
-    //     fires. Dropping the handle terminates the loop well
-    //     before that, which is the intended shell behavior.
+    // 10. Dropping the completed handle terminates the session task.
     drop(async_session);
 
     Ok(())
@@ -231,6 +230,10 @@ async fn activity_watch_updates_on_inbound_datagram() -> Result<(), Box<dyn std:
         *activity.borrow() > before,
         "activity instant must advance past the pre-datagram value"
     );
-    async_session.disconnect().await?;
+    let disconnect_result = async_session.disconnect().await;
+    assert!(
+        matches!(disconnect_result, Err(ShellError::DisconnectUnacknowledged)),
+        "DExtra fake does not acknowledge UNLINK: {disconnect_result:?}"
+    );
     Ok(())
 }

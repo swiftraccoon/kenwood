@@ -2,6 +2,7 @@
 //! tokio-specific failure modes (channel closed).
 
 use dstar_gateway_core::error::Error as CoreError;
+use dstar_gateway_core::session::client::DisconnectReason;
 
 /// Errors raised by the tokio shell.
 #[derive(Debug, thiserror::Error)]
@@ -15,17 +16,22 @@ pub enum ShellError {
     #[error("session task closed")]
     SessionClosed,
 
-    /// Disconnect did not complete within the timeout.
-    ///
-    /// Never returned by the current shell: [`AsyncSession::disconnect`]
-    /// takes no deadline and resolves as soon as the session loop
-    /// acknowledges the request. A disconnect that times out is reported
-    /// by the core as `Event::Disconnected(DisconnectReason::DisconnectTimeout)`
-    /// on the event stream instead.
-    ///
-    /// [`AsyncSession::disconnect`]: crate::tokio_shell::AsyncSession::disconnect
-    #[error("disconnect timed out")]
-    DisconnectTimeout,
+    /// The session task did not report any disconnect outcome before the
+    /// shell deadline.
+    #[error("disconnect stalled before the session task reported an outcome")]
+    DisconnectStalled,
+
+    /// The core closed the local session after the reflector failed to
+    /// acknowledge UNLINK within the protocol deadline.
+    #[error("reflector did not acknowledge unlink; local session closed after protocol timeout")]
+    DisconnectUnacknowledged,
+
+    /// The session ended for another reason before UNLINK was acknowledged.
+    #[error("session ended before unlink was acknowledged: {reason:?}")]
+    DisconnectedBeforeUnlink {
+        /// Terminal reason reported by the core.
+        reason: DisconnectReason,
+    },
 }
 
 #[cfg(test)]
@@ -39,8 +45,20 @@ mod tests {
     }
 
     #[test]
-    fn shell_error_disconnect_timeout_display() {
-        let err = ShellError::DisconnectTimeout;
-        assert_eq!(err.to_string(), "disconnect timed out");
+    fn shell_error_disconnect_stalled_display() {
+        let err = ShellError::DisconnectStalled;
+        assert_eq!(
+            err.to_string(),
+            "disconnect stalled before the session task reported an outcome"
+        );
+    }
+
+    #[test]
+    fn shell_error_disconnect_unacknowledged_display() {
+        let err = ShellError::DisconnectUnacknowledged;
+        assert_eq!(
+            err.to_string(),
+            "reflector did not acknowledge unlink; local session closed after protocol timeout"
+        );
     }
 }

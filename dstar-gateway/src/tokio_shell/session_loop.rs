@@ -221,15 +221,13 @@ impl<P: Protocol> SessionLoop<P> {
             Command::Disconnect { reply } => {
                 // `disconnect_in_place` advances the internal state
                 // machine to `Disconnecting` without consuming the
-                // typestate handle. We intentionally swallow any
-                // encoder failure here: the caller only waits for
-                // the signal that the request was observed; they
-                // then drain events until `Event::Disconnected`
-                // arrives (or the channel closes).
-                drop(self.session.disconnect_in_place(now));
-                // `Result<(), ()>` is `Copy`, so `drop` is a no-op
-                // lint trigger; assign to `_` to explicitly discard.
-                let _send_result: Result<(), ()> = reply.send(());
+                // typestate handle. The reply reports command acceptance;
+                // the terminal outcome follows on the event channel.
+                let result = self
+                    .session
+                    .disconnect_in_place(now)
+                    .map_err(ShellError::Core);
+                drop(reply.send(result));
             }
         }
     }

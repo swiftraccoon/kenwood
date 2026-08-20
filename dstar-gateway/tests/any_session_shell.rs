@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::fake_reflector::FakeReflector;
-use dstar_gateway::tokio_shell::{AnyAsyncSession, AsyncSession, drive_connecting};
+use dstar_gateway::tokio_shell::{AnyAsyncSession, AsyncSession, ShellError, drive_connecting};
 use dstar_gateway_core::header::DstarHeader;
 use dstar_gateway_core::session::client::{Configured, DExtra, Session};
 use dstar_gateway_core::types::{Callsign, Module, ProtocolKind, StreamId, Suffix};
@@ -74,7 +74,11 @@ async fn erased_session_drives_a_full_dextra_tx_flow() -> TestResult {
     assert_eq!(eot_count, 1, "exactly one frame carries the EOT bit");
 
     let links_before = received.iter().filter(|p| p.len() == 11).count();
-    session.disconnect().await?;
+    let disconnect_result = session.disconnect().await;
+    assert!(
+        matches!(disconnect_result, Err(ShellError::DisconnectUnacknowledged)),
+        "DExtra fake does not acknowledge UNLINK: {disconnect_result:?}"
+    );
     tokio::time::sleep(Duration::from_millis(100)).await;
     let links_after = fake
         .received_packets()

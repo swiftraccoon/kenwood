@@ -2,10 +2,10 @@
 
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use dstar_gateway_core::header::DstarHeader;
-use dstar_gateway_core::session::client::{Connected, Event, Protocol, Session};
+use dstar_gateway_core::session::client::{Connected, DisconnectReason, Event, Protocol, Session};
 use dstar_gateway_core::types::StreamId;
 use dstar_gateway_core::voice::VoiceFrame;
 use tokio::net::UdpSocket;
@@ -31,6 +31,14 @@ const COMMAND_CHANNEL_CAPACITY: usize = 32;
 /// upper bound of ≈100 frames) plus some headroom.
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 
+/// Upper bound for delivering a disconnect command and observing the
+/// core's terminal event.
+///
+/// Every supported protocol has a two-second UNLINK deadline. The
+/// additional margin covers command dispatch and event delivery even
+/// when the consumer has allowed the bounded event queue to fill.
+const DISCONNECT_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Async handle to a session running in a spawned tokio task.
 ///
 /// Methods translate to commands sent over an internal channel and
@@ -48,6 +56,12 @@ pub struct AsyncSession<P: Protocol> {
     /// Instant of the most recent datagram from the peer, published
     /// by the session loop. Cloned out via [`Self::activity`].
     pub(crate) activity_rx: watch::Receiver<Instant>,
+    /// Whether a disconnect command has been accepted by the command
+    /// channel. This survives cancellation so a later call can resume
+    /// waiting instead of enqueueing a second state transition.
+    pub(crate) disconnect_requested: bool,
+    /// Terminal outcome already observed through `next_event`.
+    pub(crate) disconnect_reason: Option<DisconnectReason>,
     pub(crate) _protocol: PhantomData<P>,
 }
 
@@ -107,6 +121,8 @@ impl<P: Protocol> AsyncSession<P> {
             command_tx,
             event_rx,
             activity_rx,
+            disconnect_requested: false,
+            disconnect_reason: None,
             _protocol: PhantomData,
         }
     }
@@ -135,7 +151,11 @@ impl<P: Protocol> AsyncSession<P> {
     /// leaves the channel in a clean state and any undelivered events
     /// remain queued for the next call.
     pub async fn next_event(&mut self) -> Option<Event<P>> {
-        self.event_rx.recv().await
+        let event = self.event_rx.recv().await;
+        if let Some(Event::Disconnected { reason }) = event.as_ref() {
+            self.disconnect_reason = Some(*reason);
+        }
+        event
     }
 
     /// Send a voice header and start a new outbound voice stream.
@@ -227,35 +247,115 @@ impl<P: Protocol> AsyncSession<P> {
         rx.await.map_err(|_| ShellError::SessionClosed)?
     }
 
-    /// Request a graceful disconnect.
+    /// Gracefully disconnect and return the terminal outcome.
     ///
-    /// Sends an UNLINK to the reflector and returns when the loop
-    /// has enqueued it. The caller should continue polling
-    /// [`Self::next_event`] until [`Event::Disconnected`] arrives,
-    /// then drop the session.
+    /// Sends an UNLINK, drains any queued events that would otherwise
+    /// backpressure the session loop, and waits until
+    /// [`Event::Disconnected`] reports either an acknowledgement or the
+    /// protocol's own two-second deadline. The entire operation has a
+    /// five-second shell deadline, so a stalled task cannot hold shutdown
+    /// indefinitely.
     ///
     /// # Errors
     ///
     /// - [`ShellError::SessionClosed`] if the session task has exited
+    /// - [`ShellError::DisconnectStalled`] if the session task does not
+    ///   report a terminal outcome before the shell deadline
+    /// - [`ShellError::DisconnectUnacknowledged`] if the reflector does
+    ///   not acknowledge UNLINK before the protocol deadline
+    /// - [`ShellError::DisconnectedBeforeUnlink`] if the session has
+    ///   already ended for another reason
+    /// - [`ShellError::Core`] if the core rejects the state transition
     ///
     /// # Cancellation safety
     ///
-    /// This method is **not** cancel-safe. Cancelling the future drives
-    /// a state-machine transition (`Connected` → `Disconnecting`) that
-    /// may be partially complete: the UNLINK may already be in the
-    /// outbox even though the reply oneshot has been dropped. Callers
-    /// that cancel `disconnect()` should treat the session as
-    /// indeterminate and drop the handle rather than attempting further
-    /// sends. For graceful shutdown, always `await` this method to
-    /// completion before dropping the session.
+    /// This method is cancel-safe. Once the command is enqueued, that fact
+    /// is retained in the handle. Calling `disconnect` again resumes
+    /// draining and waiting for the same terminal event rather than
+    /// attempting a second transition.
     pub async fn disconnect(&mut self) -> Result<(), ShellError> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.command_tx
-            .send(Command::Disconnect { reply: tx })
+        let deadline = tokio::time::Instant::now() + DISCONNECT_COMPLETION_TIMEOUT;
+        if let Some(reason) = self.disconnect_reason {
+            return disconnect_result(reason);
+        }
+
+        // Free existing event-channel capacity before asking the loop to
+        // process a command. This is the common shutdown case after a caller
+        // has temporarily stopped polling a busy reflector.
+        while let Ok(event) = self.event_rx.try_recv() {
+            if let Event::Disconnected { reason } = event {
+                self.disconnect_reason = Some(reason);
+                return disconnect_result(reason);
+            }
+        }
+
+        let mut command_reply = if self.disconnect_requested {
+            None
+        } else {
+            let (reply, receiver) = tokio::sync::oneshot::channel();
+            tokio::time::timeout_at(
+                deadline,
+                self.command_tx.send(Command::Disconnect { reply }),
+            )
             .await
+            .map_err(|_| ShellError::DisconnectStalled)?
             .map_err(|_| ShellError::SessionClosed)?;
-        rx.await.map_err(|_| ShellError::SessionClosed)?;
-        Ok(())
+            self.disconnect_requested = true;
+            Some(receiver)
+        };
+
+        let completion = async {
+            loop {
+                if let Some(receiver) = command_reply.as_mut() {
+                    tokio::select! {
+                        biased;
+
+                        event = self.event_rx.recv() => {
+                            let Some(event) = event else {
+                                return Err(ShellError::SessionClosed);
+                            };
+                            if let Event::Disconnected { reason } = event {
+                                self.disconnect_reason = Some(reason);
+                                return Ok(reason);
+                            }
+                        }
+
+                        reply = receiver => {
+                            match reply.map_err(|_| ShellError::SessionClosed)? {
+                                Ok(()) => command_reply = None,
+                                Err(error) => {
+                                    // The core did not enter Disconnecting, so
+                                    // a later call may make a fresh request.
+                                    self.disconnect_requested = false;
+                                    return Err(error);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    let Some(event) = self.event_rx.recv().await else {
+                        return Err(ShellError::SessionClosed);
+                    };
+                    if let Event::Disconnected { reason } = event {
+                        self.disconnect_reason = Some(reason);
+                        return Ok(reason);
+                    }
+                }
+            }
+        };
+
+        let reason = tokio::time::timeout_at(deadline, completion)
+            .await
+            .map_err(|_| ShellError::DisconnectStalled)??;
+        disconnect_result(reason)
+    }
+}
+
+const fn disconnect_result(reason: DisconnectReason) -> Result<(), ShellError> {
+    match reason {
+        DisconnectReason::UnlinkAcked => Ok(()),
+        DisconnectReason::DisconnectTimeout => Err(ShellError::DisconnectUnacknowledged),
+        reason => Err(ShellError::DisconnectedBeforeUnlink { reason }),
     }
 }
 
@@ -264,5 +364,152 @@ impl<P: Protocol> Drop for AsyncSession<P> {
         // Dropping command_tx closes the channel, which signals
         // the session task to exit on its next loop iteration.
         // No explicit shutdown needed.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dstar_gateway_core::session::client::DExtra;
+
+    type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    fn test_session(
+        command_tx: mpsc::Sender<Command>,
+        event_rx: mpsc::Receiver<Event<DExtra>>,
+    ) -> AsyncSession<DExtra> {
+        let (_activity_tx, activity_rx) = watch::channel(Instant::now());
+        AsyncSession {
+            command_tx,
+            event_rx,
+            activity_rx,
+            disconnect_requested: false,
+            disconnect_reason: None,
+            _protocol: PhantomData,
+        }
+    }
+
+    fn poll_echo() -> Event<DExtra> {
+        Event::PollEcho {
+            peer: ([127, 0, 0, 1], 20_001).into(),
+        }
+    }
+
+    fn disconnected() -> Event<DExtra> {
+        Event::Disconnected {
+            reason: DisconnectReason::UnlinkAcked,
+        }
+    }
+
+    #[tokio::test]
+    async fn disconnect_drains_a_full_event_channel_before_command_dispatch() -> TestResult {
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let (event_tx, event_rx) = mpsc::channel(1);
+        event_tx.send(poll_echo()).await?;
+
+        let (blocked_send_started, blocked_send_observed) = tokio::sync::oneshot::channel();
+        let loop_task = tokio::spawn(async move {
+            let _send_result = blocked_send_started.send(());
+            event_tx.send(poll_echo()).await?;
+            let Some(Command::Disconnect { reply }) = command_rx.recv().await else {
+                return Err("disconnect command channel closed".into());
+            };
+            drop(reply.send(Ok(())));
+            event_tx.send(disconnected()).await?;
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        });
+        blocked_send_observed.await?;
+
+        let mut session = test_session(command_tx, event_rx);
+        tokio::time::timeout(Duration::from_secs(1), session.disconnect()).await??;
+        loop_task.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_disconnect_resumes_without_a_second_command() -> TestResult {
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let (event_tx, event_rx) = mpsc::channel(1);
+        let (command_seen, command_observed) = tokio::sync::oneshot::channel();
+        let (release_event, event_released) = tokio::sync::oneshot::channel();
+        let loop_task = tokio::spawn(async move {
+            let Some(Command::Disconnect { reply }) = command_rx.recv().await else {
+                return Err("disconnect command channel closed".into());
+            };
+            drop(reply.send(Ok(())));
+            let _send_result = command_seen.send(());
+            event_released.await?;
+            event_tx.send(disconnected()).await?;
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        });
+
+        let mut session = test_session(command_tx, event_rx);
+        let mut first_attempt = Box::pin(session.disconnect());
+        tokio::select! {
+            result = first_attempt.as_mut() => {
+                return Err(format!("disconnect completed before cancellation: {result:?}").into());
+            }
+            observed = command_observed => {
+                observed?;
+            }
+        }
+        drop(first_attempt);
+
+        let _send_result = release_event.send(());
+        session.disconnect().await?;
+        loop_task.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejected_disconnect_can_be_requested_again() -> TestResult {
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let (event_tx, event_rx) = mpsc::channel(1);
+        let loop_task = tokio::spawn(async move {
+            let Some(Command::Disconnect { reply: first }) = command_rx.recv().await else {
+                return Err("first disconnect command channel closed".into());
+            };
+            drop(first.send(Err(ShellError::DisconnectStalled)));
+
+            let Some(Command::Disconnect { reply: second }) = command_rx.recv().await else {
+                return Err("second disconnect command channel closed".into());
+            };
+            drop(second.send(Ok(())));
+            event_tx.send(disconnected()).await?;
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        });
+
+        let mut session = test_session(command_tx, event_rx);
+        let first = session.disconnect().await;
+        assert!(
+            matches!(first, Err(ShellError::DisconnectStalled)),
+            "command rejection was not surfaced: {first:?}"
+        );
+        session.disconnect().await?;
+        loop_task.await??;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disconnect_has_a_shell_deadline_when_no_terminal_event_arrives() -> TestResult {
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let (event_tx, event_rx) = mpsc::channel(1);
+        let loop_task = tokio::spawn(async move {
+            let Some(Command::Disconnect { reply }) = command_rx.recv().await else {
+                return;
+            };
+            drop(reply.send(Ok(())));
+            std::future::pending::<()>().await;
+            drop(event_tx);
+        });
+
+        let mut session = test_session(command_tx, event_rx);
+        let result = session.disconnect().await;
+        assert!(
+            matches!(result, Err(ShellError::DisconnectStalled)),
+            "expected bounded shell timeout, got {result:?}"
+        );
+        loop_task.abort();
+        Ok(())
     }
 }

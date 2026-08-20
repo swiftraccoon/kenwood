@@ -43,10 +43,12 @@ pub enum Command {
         reply: tokio::sync::oneshot::Sender<Result<(), ShellError>>,
     },
 
-    /// Initiate a graceful disconnect and wait for UNLINK ACK or timeout.
+    /// Initiate a graceful disconnect.
     Disconnect {
-        /// Reply channel: fires when disconnect is complete.
-        reply: tokio::sync::oneshot::Sender<()>,
+        /// Reply channel: confirms that the core accepted the request.
+        /// Protocol completion is reported separately as
+        /// `Event::Disconnected`.
+        reply: tokio::sync::oneshot::Sender<Result<(), ShellError>>,
     },
 }
 
