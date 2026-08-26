@@ -46,7 +46,7 @@ use kenwood_thd75::memory::{
 use kenwood_thd75::radio::programming::DetachedMcpPageUpdate;
 use kenwood_thd75::transport::EitherTransport;
 use kenwood_thd75::types::{
-    DstarCallsign, DvGatewayMode, FirmwareIdentity, PcOutputInterface, RadioModel,
+    DstarCallsign, DvGatewayMode, FirmwareIdentity, PcOutputInterface, RadioModel, TncDataBand,
 };
 use kenwood_thd75::{
     AprsClient, AprsClientConfig, AprsEvent, AprsReportTimestamp, Ax25Address, DigipeaterConfig,
@@ -646,8 +646,8 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
     let (opened, rt) = if let Some(ref scenario) = cli.mock_radio {
         let mock = thd75_repl::mock_scenarios::build(scenario).ok_or_else(|| {
             format!(
-                "Unknown mock scenario: {scenario}. Known: simple, empty, mmdvm, mmdvm_dstar, \
-                 mmdvm_dstar_idle, aprs."
+                "Unknown mock scenario: {scenario}. Known: simple, empty, mmdvm, \
+                 mmdvm_takeover, mmdvm_dstar, mmdvm_dstar_idle, aprs."
             )
         })?;
         let rt = tokio::runtime::Runtime::new()?;
@@ -1253,74 +1253,93 @@ async fn run_repl(
     // retain their normal process-termination behavior.
     let process_signals = ProcessSignalRouter::install()?;
 
-    // Ordinary startup uses the universal TNC recovery preamble. Persistent
-    // terminal-mode entry stays in this process and preserves the selected
-    // transport identity, so startup never runs during the reboot boundary.
-    let mut radio = Radio::connect_with_tnc_exit(transport).await?;
-
-    let mut state = match radio.identify().await {
-        Ok(info) => {
-            let firmware = radio.get_firmware_version().await?;
-            println!(
-                "{}",
-                thd75_repl::output::startup_identified(info.model, &firmware,)
-            );
-            println!("{}", thd75_repl::output::type_help_hint());
-            ReplState::Cat(Box::new(radio))
+    // Preserve an already-ready CAT link with a read-only identity proof. If
+    // the bounded packet-mode fallback still cannot prove CAT, retain this
+    // exact transport owner long enough to distinguish persistent MMDVM from
+    // an unresponsive link.
+    let mut radio = Radio::new(transport);
+    let cat_ready = match radio.prepare_cat_or_retain_for_diagnosis().await {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::debug!(%error, "CAT preparation failed; checking for a persistent binary owner");
+            false
         }
-        Err(_) => {
-            // CAT identification failed; probe the link to find out why.
-            match radio.probe_silent_link().await {
-                LinkDiagnosis::ReconnectRequired => {
-                    return Err(LinkDiagnosis::ReconnectRequired.guidance().into());
+    };
+
+    let cat_startup = if cat_ready {
+        match radio.identify().await {
+            Ok(info) => match radio.get_firmware_version().await {
+                Ok(firmware) => Some((info, firmware)),
+                Err(error) => {
+                    tracing::debug!(%error, "firmware qualification failed after CAT preparation; checking for binary takeover");
+                    None
                 }
-                LinkDiagnosis::MmdvmMode if exit_terminal_mode => {
-                    // CAT is offline on this link, so neither model nor
-                    // firmware can be qualified before an offset-based MCP
-                    // write. Keep this path read-only and guide the operator.
-                    // Fully automated exit remains available through
-                    // `--set-gateway-off` on the other, CAT-capable interface,
-                    // where ID/FV are proved before touching flash.
-                    println!(
-                        "This gateway link cannot prove the radio model and firmware required \
+            },
+            Err(error) => {
+                tracing::debug!(%error, "CAT identity disappeared after preparation; checking for binary takeover");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut state = if let Some((info, firmware)) = cat_startup {
+        println!(
+            "{}",
+            thd75_repl::output::startup_identified(info.model, &firmware,)
+        );
+        println!("{}", thd75_repl::output::type_help_hint());
+        ReplState::Cat(Box::new(radio))
+    } else {
+        match radio.probe_silent_link().await {
+            LinkDiagnosis::ReconnectRequired => {
+                return Err(LinkDiagnosis::ReconnectRequired.guidance().into());
+            }
+            LinkDiagnosis::MmdvmMode if exit_terminal_mode => {
+                // CAT is offline on this link, so neither model nor
+                // firmware can be qualified before an offset-based MCP
+                // write. Keep this path read-only and guide the operator.
+                // Fully automated exit remains available through
+                // `--set-gateway-off` on the other, CAT-capable interface,
+                // where ID/FV are proved before touching flash.
+                println!(
+                    "This gateway link cannot prove the radio model and firmware required \
                          for a safe automated memory write."
-                    );
-                    let (restored_radio, restored_interface) = guide_exit_terminal_mode(
-                        radio,
-                        cli_port.as_deref(),
-                        cli_baud,
-                        port_interface_override,
-                    )
-                    .await?;
-                    radio = restored_radio;
-                    endpoint_interface = restored_interface;
-                    let identity = radio.identify().await?;
-                    let firmware = radio.get_firmware_version().await?;
-                    println!(
-                        "{}",
-                        thd75_repl::output::startup_identified(identity.model, &firmware,)
-                    );
-                    println!("{}", thd75_repl::output::type_help_hint());
-                    ReplState::Cat(Box::new(radio))
-                }
-                LinkDiagnosis::MmdvmMode => {
-                    // Store the binary-proved owner in its dedicated state so
-                    // CAT dispatch is unreachable. MMDVM framing proves the
-                    // DV Gateway wire protocol, but cannot distinguish
-                    // Reflector Terminal from Access Point mode.
-                    println!("Radio is in DV Gateway/MMDVM mode.");
-                    println!("CAT commands like freq, mode, and status do not work in this mode.");
-                    println!("To use D-STAR now: dstar start <callsign> [reflector]");
-                    println!("  Example: dstar start W1AW REF030C");
-                    println!(
-                        "To restore normal radio control: set Menu No. 650 (DV Gateway) to Off,"
-                    );
-                    println!("  then restart, or relaunch with --exit-terminal-mode.");
-                    ReplState::Mmdvm(Box::new(radio))
-                }
-                LinkDiagnosis::Unresponsive => {
-                    return Err(LinkDiagnosis::Unresponsive.guidance().into());
-                }
+                );
+                let (restored_radio, restored_interface) = guide_exit_terminal_mode(
+                    radio,
+                    cli_port.as_deref(),
+                    cli_baud,
+                    port_interface_override,
+                )
+                .await?;
+                radio = restored_radio;
+                endpoint_interface = restored_interface;
+                let identity = radio.identify().await?;
+                let firmware = radio.get_firmware_version().await?;
+                println!(
+                    "{}",
+                    thd75_repl::output::startup_identified(identity.model, &firmware,)
+                );
+                println!("{}", thd75_repl::output::type_help_hint());
+                ReplState::Cat(Box::new(radio))
+            }
+            LinkDiagnosis::MmdvmMode => {
+                // Store the binary-proved owner in its dedicated state so
+                // CAT dispatch is unreachable. MMDVM framing proves the
+                // DV Gateway wire protocol, but cannot distinguish
+                // Reflector Terminal from Access Point mode.
+                println!("Radio is in DV Gateway/MMDVM mode.");
+                println!("CAT commands like freq, mode, and status do not work in this mode.");
+                println!("To use D-STAR now: dstar start <callsign> [reflector]");
+                println!("  Example: dstar start W1AW REF030C");
+                println!("To restore normal radio control: set Menu No. 650 (DV Gateway) to Off,");
+                println!("  then restart, or relaunch with --exit-terminal-mode.");
+                ReplState::Mmdvm(Box::new(radio))
+            }
+            LinkDiagnosis::Unresponsive => {
+                return Err(LinkDiagnosis::Unresponsive.guidance().into());
             }
         }
     };
@@ -1807,8 +1826,9 @@ async fn dispatch_cat(radio: &mut Radio<EitherTransport>, cmd: &str, parts: &[&s
             if parts.get(1).is_some_and(|s| *s == "start") {
                 // Handled by caller after dispatch.
             } else {
-                println!("Usage: aprs start <callsign> [ssid] [digi]");
+                println!("Usage: aprs start <callsign> <a or b> [ssid] [digi]");
                 println!("  Enters APRS KISS mode. Type aprs stop to exit.");
+                println!("  The required band selects the TNC data band, not packet speed.");
                 println!("  Add digi to enable the WIDE1-1 fill-in digipeater.");
             }
         }
@@ -1864,13 +1884,13 @@ async fn enter_aprs(
             }
         };
         let digi_cfg = DigipeaterConfig::new(addr.clone(), vec![wide1], None, None);
-        match AprsClientConfig::builder(addr) {
+        match AprsClientConfig::builder(addr, parsed.data_band) {
             Ok(builder) => builder.digipeater(digi_cfg).build(),
             Err(e) => return Err((Some(radio), format!("{e}"))),
         }
     } else {
-        match AprsClientConfig::try_new(&parsed.callsign, parsed.ssid) {
-            Ok(config) => config,
+        match AprsClientConfig::try_builder(&parsed.callsign, parsed.ssid, parsed.data_band) {
+            Ok(builder) => builder.build(),
             Err(e) => return Err((Some(radio), format!("{e}"))),
         }
     };
@@ -3153,7 +3173,8 @@ async fn enter_dstar(
     // Radio is now in MMDVM mode. Start the gateway.
     println!("Starting D-STAR gateway as {callsign}.");
 
-    let config = DstarGatewayConfig::new(gateway_callsign);
+    // Preserve the TH-D75 AZM transient-gateway wire choice `TN 3,1`.
+    let config = DstarGatewayConfig::new(gateway_callsign, TncDataBand::B);
     let gateway = match DstarGateway::start_gateway_mode(radio, config).await {
         Ok(gw) => gw,
         Err((radio, error)) => {

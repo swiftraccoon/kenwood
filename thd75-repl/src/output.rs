@@ -17,8 +17,8 @@
 
 use dstar_gateway_core::{Callsign, Module, ReflectorCallsign};
 use kenwood_thd75::types::{
-    Band, BatteryLevel, BeaconMode, FirmwareIdentity, GpsSettings, PacketDataRate, PowerLevel,
-    RadioClock, RadioModel, TncMode, UsbAudioOutput,
+    Band, BatteryLevel, BeaconMode, FirmwareIdentity, GpsSettings, PowerLevel, RadioClock,
+    RadioModel, TncDataBand, TncMode, UsbAudioOutput,
 };
 
 /// Human-readable band name.
@@ -115,31 +115,26 @@ pub fn mode_set(band: Band, mode_display: &str) -> String {
     format!("Band {} mode set to {mode_display}", band_name(band))
 }
 
-/// Spell out a packet data rate without abbreviations.
-#[must_use]
-pub const fn packet_data_rate_display(data_rate: PacketDataRate) -> &'static str {
-    match data_rate {
-        PacketDataRate::Bps1200 => "1200 bits per second",
-        PacketDataRate::Bps9600 => "9600 bits per second",
-    }
-}
-
 /// Format a TNC mode readout.
 #[must_use]
-pub fn tnc_mode_read(mode: TncMode, data_rate: PacketDataRate) -> String {
-    format!(
-        "TNC mode: {mode} at {}",
-        packet_data_rate_display(data_rate)
-    )
+pub fn tnc_mode_read(mode: TncMode, data_band: TncDataBand) -> String {
+    format!("TNC mode: {mode} on Band {}", tnc_data_band_name(data_band))
 }
 
 /// Format a TNC mode change confirmation.
 #[must_use]
-pub fn tnc_mode_set(mode: TncMode, data_rate: PacketDataRate) -> String {
+pub fn tnc_mode_set(mode: TncMode, data_band: TncDataBand) -> String {
     format!(
-        "TNC mode set to {mode} at {}",
-        packet_data_rate_display(data_rate)
+        "TNC mode set to {mode} on Band {}",
+        tnc_data_band_name(data_band)
     )
+}
+
+const fn tnc_data_band_name(data_band: TncDataBand) -> &'static str {
+    match data_band {
+        TncDataBand::A => "A",
+        TncDataBand::B => "B",
+    }
 }
 
 /// Format a firmware beacon mode readout.

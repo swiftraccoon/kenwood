@@ -62,7 +62,7 @@ preamble() {
 
 phase1() { # RX soak: 20 minutes of live decode, then the station list.
   preamble
-  say "aprs start $call 7"
+  say "aprs start $call a 7"
   say "monitor"
   sleep 1200
   interrupt_repl
@@ -75,7 +75,7 @@ phase2() { # TX beacons: every format, 30-second spacing.
   lat="${APRS_LAT:?set APRS_LAT in decimal degrees}"
   lon="${APRS_LON:?set APRS_LON in decimal degrees}"
   preamble
-  say "aprs start $call 7"
+  say "aprs start $call a 7"
   say "position $lat $lon REPL validation uncompressed"
   sleep 30
   say "compressed $lat $lon REPL validation compressed"
@@ -93,7 +93,7 @@ phase2() { # TX beacons: every format, 30-second spacing.
 phase3() { # Messaging: WXBOT round-trip plus expiry to a silent call.
   wx="${APRS_WX_QUERY:?set APRS_WX_QUERY, for example a US zip code}"
   preamble
-  say "aprs start $call 7"
+  say "aprs start $call a 7"
   say "msg WXBOT $wx"
   say "msg N0CALL expiry test"
   say "monitor"
@@ -105,7 +105,7 @@ phase3() { # Messaging: WXBOT round-trip plus expiry to a silent call.
 
 phase4digi() { # WIDE1-1 fill-in digipeater, time-boxed to 10 minutes.
   preamble
-  say "aprs start $call 7 digi"
+  say "aprs start $call a 7 digi"
   say "monitor"
   sleep 600
   interrupt_repl
@@ -117,7 +117,7 @@ phase4igate() { # IGate RF<->IS, time-boxed to 10 minutes.
   lat="${APRS_LAT:?set APRS_LAT in decimal degrees}"
   lon="${APRS_LON:?set APRS_LON in decimal degrees}"
   preamble
-  say "aprs start $call 7"
+  say "aprs start $call a 7"
   say "igate r/$lat/$lon/50"
   sleep 600
   interrupt_repl
@@ -129,7 +129,7 @@ phase5() { # SmartBeaconing: first beacon, fast-rate interval, corner peg.
   lat="${APRS_LAT:?set APRS_LAT in decimal degrees}"
   lon="${APRS_LON:?set APRS_LON in decimal degrees}"
   preamble
-  say "aprs start $call 7"
+  say "aprs start $call a 7"
   # t=0: first motion sample at highway speed -> immediate first beacon.
   say "motion $lat $lon 80 0"
   # Same speed and heading: nothing due until the fast rate elapses

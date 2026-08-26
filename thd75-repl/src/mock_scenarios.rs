@@ -25,6 +25,8 @@ use kenwood_thd75::transport::MockTransport;
 /// (empty mock that rejects every write), `"mmdvm"` (radio in DV
 /// Gateway / Reflector Terminal Mode: CAT identification fails and an
 /// MMDVM probe answers, so the REPL takes the terminal-mode path), and
+/// `"mmdvm_takeover"` (CAT preparation succeeds before the radio switches to
+/// persistent MMDVM during startup qualification), and
 /// `"mmdvm_dstar"` (the same startup followed by a strict D-STAR modem
 /// initialization and noninteractive shutdown). `"mmdvm_dstar_idle"` allows
 /// periodic status writes for an interactive prompt-liveness test.
@@ -34,6 +36,7 @@ pub fn build(name: &str) -> Option<MockTransport> {
         "simple" => Some(simple_scenario()),
         "empty" => Some(MockTransport::new()),
         "mmdvm" => Some(mmdvm_scenario()),
+        "mmdvm_takeover" => Some(mmdvm_takeover_scenario()),
         "mmdvm_dstar" => Some(mmdvm_dstar_scenario()),
         "mmdvm_dstar_idle" => Some(mmdvm_dstar_idle_scenario()),
         "aprs" => Some(aprs_scenario()),
@@ -41,27 +44,18 @@ pub fn build(name: &str) -> Option<MockTransport> {
     }
 }
 
-/// Minimal scenario covering `Radio::connect_with_tnc_exit` plus one `identify`
-/// round-trip and one `get_firmware_version` round-trip.
+/// Minimal scenario covering the read-only CAT startup proof plus one
+/// `identify` round-trip and one `get_firmware_version` round-trip.
 ///
-/// `connect_with_tnc_exit` sends a six-write preamble (`\r`, `\r`, `ETX`, the
-/// KISS Return frame `C0 FF C0`, `\rTC 1\r`, `TN 0,0\r`) followed by a
-/// drained read; each of those writes is programmed against an empty
-/// response so the mock's exchange queue drains cleanly. The subsequent
-/// CAT reads match the `ID\r` and `FV\r` commands issued by the REPL
-/// startup.
+/// An exact `ID TH-D75` response takes the CAT-preserving fast path, so startup
+/// must not send the packet-mode recovery preamble. The subsequent CAT reads
+/// match the `ID\r` and `FV\r` commands issued by the REPL startup.
 fn simple_scenario() -> MockTransport {
     let mut mock = MockTransport::new();
 
-    // connect_with_tnc_exit preamble. Each write is expected in order and
-    // responds with empty bytes so the drain read at the end of
-    // connect_with_tnc_exit is fed from the last pending_response slot.
-    mock.expect(b"\r", b"");
-    mock.expect(b"\r", b"");
-    mock.expect(&[0x03], b"");
-    mock.expect(&[0xC0, 0xFF, 0xC0], b"");
-    mock.expect(b"\rTC 1\r", b"");
-    mock.expect(b"TN 0,0\r", b"");
+    // The first exact identity is the read-only CAT preparation fast path.
+    // Its success proves that no packet-mode recovery write is needed.
+    mock.expect(b"ID\r", b"ID TH-D75\r");
 
     // CAT identification round-trips. The REPL startup calls
     // radio.identify() then radio.get_firmware_version().
@@ -84,8 +78,8 @@ fn simple_scenario() -> MockTransport {
 /// Radio that identifies normally, then accepts a KISS-mode entry so
 /// the APRS transmit commands can be driven end-to-end.
 ///
-/// Extends the [`simple_scenario`] startup (connect preamble + `ID` +
-/// `FV`) with the `TN 2,0\r` KISS-entry echo that
+/// Extends the [`simple_scenario`] startup (read-only CAT proof + `ID` + `FV`)
+/// with the `TN 2,0\r` KISS-entry echo that
 /// [`AprsClient::start`](kenwood_thd75::AprsClient) waits for at the
 /// default 1200 bps. After that, [`MockTransport::expect_any_write`]
 /// absorbs every KISS frame the transmit commands emit (they are
@@ -97,20 +91,17 @@ fn simple_scenario() -> MockTransport {
 fn aprs_scenario() -> MockTransport {
     let mut mock = MockTransport::new();
 
-    // connect_with_tnc_exit preamble (identical to the simple scenario).
-    mock.expect(b"\r", b"");
-    mock.expect(b"\r", b"");
-    mock.expect(&[0x03], b"");
-    mock.expect(&[0xC0, 0xFF, 0xC0], b"");
-    mock.expect(b"\rTC 1\r", b"");
-    mock.expect(b"TN 0,0\r", b"");
+    // Exact CAT identity takes the read-only startup fast path. The absence of
+    // recovery-preamble expectations makes an unnecessary mode write fail.
+    mock.expect(b"ID\r", b"ID TH-D75\r");
 
     // Startup identification, so the REPL enters normal CAT mode.
     mock.expect(b"ID\r", b"ID TH-D75\r");
     mock.expect(b"FV\r", b"FV 1.03.00\r");
 
-    // `aprs start` enters KISS mode at 1200 bps (PacketDataRate::Bps1200 = 0),
-    // which sends `TN 2,0\r` and waits for the echo.
+    // `aprs start` enters KISS mode on TNC data Band A (wire value 0), which
+    // sends `TN 2,0\r` and waits for the echo. Packet speed is configured
+    // separately through the KISS Set Hardware command.
     mock.expect(b"TN 2,0\r", b"TN 2,0\r");
 
     // Every subsequent KISS transmit frame and the KISS-exit frame from
@@ -126,11 +117,12 @@ fn aprs_scenario() -> MockTransport {
     mock
 }
 
-/// Radio in a DV Gateway / Reflector Terminal Mode: CAT identification
-/// fails (the radio speaks MMDVM binary, not CAT) but the MMDVM
-/// `GET_VERSION` probe answers, so `Radio::probe_silent_link` classifies
-/// the link as [`kenwood_thd75::LinkDiagnosis::MmdvmMode`] and the REPL
-/// takes the terminal-mode startup path.
+/// Radio in a DV Gateway / Reflector Terminal Mode: both the read-only CAT
+/// proof and the exact proof after packet-mode fallback fail because the radio
+/// speaks MMDVM binary, not CAT. The subsequent MMDVM `GET_VERSION` probe
+/// answers, so `Radio::probe_silent_link` classifies the retained link as
+/// [`kenwood_thd75::LinkDiagnosis::MmdvmMode`] and the REPL takes the
+/// terminal-mode startup path.
 ///
 /// Used by the integration test that asserts the terminal-ready state
 /// intercepts CAT commands with guidance instead of letting each one block for
@@ -138,9 +130,11 @@ fn aprs_scenario() -> MockTransport {
 fn mmdvm_scenario() -> MockTransport {
     let mut mock = MockTransport::new();
 
-    // connect_with_tnc_exit preamble (same as the simple scenario): each write
-    // is programmed against an empty response so the drain read at the
-    // end of connect_with_tnc_exit is satisfied cleanly.
+    // Persistent MMDVM cannot answer the read-only CAT fast path.
+    mock.expect(b"ID\r", b"?\r");
+
+    // The bounded packet-mode fallback still runs, but cannot disable the
+    // persistent mode selected by Menu 650.
     mock.expect(b"\r", b"");
     mock.expect(b"\r", b"");
     mock.expect(&[0x03], b"");
@@ -148,15 +142,35 @@ fn mmdvm_scenario() -> MockTransport {
     mock.expect(b"\rTC 1\r", b"");
     mock.expect(b"TN 0,0\r", b"");
 
-    // identify() sends `ID\r`. In a DV Gateway mode the CAT parser is
-    // offline, so the radio answers `?` (or nothing); `?` keeps the
-    // transport alive while making identify() return an error, which is
-    // what drives the REPL into the probe_silent_link path.
+    // The required post-fallback CAT proof also fails. The retained Radio
+    // owner can then perform the explicit MMDVM diagnosis below.
     mock.expect(b"ID\r", b"?\r");
 
     // probe_silent_link() sends the MMDVM GET_VERSION frame and an
     // 0xE0-framed reply is positive proof of a DV Gateway mode.
     mock.expect(b"\xE0\x03\x00", b"\xE0\x0E\x00\x01MMDVM 2018");
+
+    // A connected but idle serial link blocks while the strict CAT proof checks
+    // for quiet and after the MMDVM response has been consumed. It does not
+    // report WouldBlock merely because no unsolicited byte is ready.
+    mock.pend_when_empty();
+
+    mock
+}
+
+/// Radio that switches from proved CAT to persistent MMDVM during startup.
+///
+/// This pins the real transition window where CAT preparation succeeds, the
+/// following model and firmware qualification begins, and Menu 650 takes over
+/// the transport before startup publishes a CAT owner.
+fn mmdvm_takeover_scenario() -> MockTransport {
+    let mut mock = MockTransport::new();
+
+    mock.expect(b"ID\r", b"ID TH-D75\r");
+    mock.expect(b"ID\r", b"ID TH-D75\r");
+    mock.expect(b"FV\r", b"?\r");
+    mock.expect(b"\xE0\x03\x00", b"\xE0\x0E\x00\x01MMDVM 2018");
+    mock.pend_when_empty();
 
     mock
 }
@@ -197,7 +211,10 @@ fn mmdvm_dstar_idle_scenario() -> MockTransport {
 fn mmdvm_dstar_init_scenario() -> MockTransport {
     let mut mock = MockTransport::new();
 
-    // connect_with_tnc_exit preamble.
+    // Persistent MMDVM cannot answer the read-only CAT fast path.
+    mock.expect(b"ID\r", b"?\r");
+
+    // The packet-mode fallback cannot disable persistent Menu 650 mode.
     mock.expect(b"\r", b"");
     mock.expect(b"\r", b"");
     mock.expect(&[0x03], b"");
@@ -205,8 +222,9 @@ fn mmdvm_dstar_init_scenario() -> MockTransport {
     mock.expect(b"\rTC 1\r", b"");
     mock.expect(b"TN 0,0\r", b"");
 
-    // CAT is offline, but the complete MMDVM version frame proves the binary
-    // protocol boundary and authorizes conversion into the typed session.
+    // The post-fallback CAT proof also fails. The complete MMDVM version frame
+    // then proves the binary protocol boundary and authorizes conversion into
+    // the typed session.
     mock.expect(b"ID\r", b"?\r");
     mock.expect(b"\xE0\x03\x00", b"\xE0\x0E\x00\x01MMDVM 2018");
 

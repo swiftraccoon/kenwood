@@ -169,7 +169,7 @@ unreflector: Disconnect from reflector
 gps on on: Set GPS receiver on, PC output on
 gps off off: Set GPS receiver off, PC output off
 -- APRS packet radio mode --
-aprs start MYCALL 7: Enter APRS mode with callsign and SSID
+aprs start MYCALL b 7: Enter APRS on TNC Band B with callsign and SSID
 -- D-STAR gateway mode --
 dstar start MYCALL XRF030C: Enter D-STAR gateway with reflector";
 
@@ -258,11 +258,12 @@ Example: squelch a 3
 Related commands: meter";
 
 const TNC_HELP: &str = "tnc: Read or set the built-in TNC protocol mode.
-Usage: tnc reads the current mode and speed.
-tnc off: Turn the TNC off (no packet mode, plain radio control).
-tnc aprs: Hand packet operation to the radio firmware (APRS mode).
-tnc kiss: Set KISS mode. Prefer aprs start for a managed session.
-An optional second word sets the speed, 1200 or 9600.";
+Usage: tnc reads the current mode and selected TNC data band.
+tnc off [a or b]: Turn the TNC off and select its data band.
+tnc aprs [a or b]: Hand packet operation to the radio firmware on that band.
+When the band is omitted, the current TNC data band is retained.
+Use aprs start for managed KISS.
+Packet speed is a separate radio setting; it is not a TN parameter.";
 
 const BEACONMODE_HELP: &str = "beaconmode: Read or set the firmware beacon mode.
 Usage: beaconmode reads the current setting.
@@ -420,9 +421,10 @@ Example: unreflector
 Related commands: reflector";
 
 const APRS_HELP: &str = "aprs: Enter or leave APRS packet radio mode.
-Syntax: aprs start [callsign] [ssid]
+Syntax: aprs start <callsign> <a or b> [ssid] [digi]
 Syntax: aprs stop
-Example: aprs start W1AW 7
+Example: aprs start W1AW b 7
+The required a or b value selects the TNC data band, not packet speed.
 Related commands: beacon, msg, position";
 
 const DSTAR_HELP: &str = "dstar: Enter or leave D-STAR gateway mode.

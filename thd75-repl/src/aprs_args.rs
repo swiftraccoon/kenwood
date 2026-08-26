@@ -5,6 +5,7 @@
 //! by the dispatcher and therefore follow the accessibility phrasing
 //! rules: complete sentences, units spelled out, concrete examples.
 
+use kenwood_thd75::types::TncDataBand;
 use kenwood_thd75::{
     CompressedPositionText, Course, Heading, Latitude, Longitude, MiceSpeed, MiceStatusText,
     ObjectName, PositionReportText, Speed,
@@ -232,34 +233,46 @@ pub fn parse_object(args: &[&str]) -> Result<ObjectArgs, String> {
 pub struct StartArgs {
     /// Station callsign, upper-cased for the AX.25 wire.
     pub callsign: String,
+    /// TNC data band used by the one `TN 2,x` KISS transition.
+    pub data_band: TncDataBand,
     /// AX.25 SSID, 0 through 15.
     pub ssid: u8,
     /// Whether to enable the WIDE1-1 fill-in digipeater.
     pub digi: bool,
 }
 
-/// Parse `<callsign> [ssid] [digi]`.
+/// Parse `<callsign> <a|b> [ssid] [digi]`.
 ///
 /// The callsign is upper-cased (AX.25 callsigns are upper-case on the
-/// wire, so `aprs start w1aw` behaves like the intended call). The
-/// SSID defaults to 0. A trailing `digi` keyword enables the WIDE1-1
-/// fill-in digipeater.
+/// wire, so `aprs start w1aw a` behaves like the intended call). The
+/// TNC data band is mandatory because it is a distinct radio routing
+/// choice, not a packet-speed encoding. SSID defaults to 0. A trailing `digi`
+/// keyword enables the WIDE1-1 fill-in digipeater.
 ///
 /// # Errors
 ///
-/// Returns a message when the callsign is missing, the SSID is not a
-/// number from 0 through 15, or extra arguments follow.
+/// Returns a message when the callsign or data band is missing, the band is
+/// not A or B, the SSID is not a number from 0 through 15, or extra arguments
+/// follow.
 pub fn parse_start(args: &[&str]) -> Result<StartArgs, String> {
-    let Some(raw_callsign) = args.first() else {
+    let [raw_callsign, raw_data_band, rest @ ..] = args else {
         return Err(
-            "callsign required. Usage: aprs start <callsign> then an optional SSID and the word digi. Example: aprs start W1AW 7."
+            "callsign and data band required. Usage: aprs start <callsign> <a or b> [ssid] [digi]. Example: aprs start W1AW b 7."
                 .to_string(),
         );
     };
     let callsign = raw_callsign.to_ascii_uppercase();
+    let data_band = match raw_data_band.to_ascii_lowercase().as_str() {
+        "a" => TncDataBand::A,
+        "b" => TncDataBand::B,
+        _ => {
+            return Err(format!(
+                "invalid TNC data band {raw_data_band:?}. Use a or b."
+            ));
+        }
+    };
     let mut ssid: u8 = 0;
     let mut digi = false;
-    let rest = args.get(1..).unwrap_or(&[]);
     match rest {
         [] => {}
         [one] if one.eq_ignore_ascii_case("digi") => digi = true,
@@ -273,12 +286,14 @@ pub fn parse_start(args: &[&str]) -> Result<StartArgs, String> {
         }
         _ => {
             return Err(
-                "too many arguments. Usage: aprs start <callsign> <ssid> digi.".to_string(),
+                "too many arguments. Usage: aprs start <callsign> <a or b> [ssid] [digi]."
+                    .to_string(),
             );
         }
     }
     Ok(StartArgs {
         callsign,
+        data_band,
         ssid,
         digi,
     })
@@ -370,20 +385,24 @@ mod tests {
     #[test]
     fn start_grammar_covers_ssid_and_digi() -> TestResult {
         assert_eq!(
-            parse_start(&["w1aw"])?,
+            parse_start(&["w1aw", "a"])?,
             StartArgs {
                 callsign: "W1AW".to_string(),
+                data_band: TncDataBand::A,
                 ssid: 0,
                 digi: false
             }
         );
-        assert_eq!(parse_start(&["W1AW", "7"])?.ssid, 7);
-        assert!(parse_start(&["W1AW", "digi"])?.digi);
-        let both = parse_start(&["W1AW", "7", "DIGI"])?;
-        assert!(both.digi && both.ssid == 7);
+        assert_eq!(parse_start(&["W1AW", "b", "7"])?.ssid, 7);
+        assert_eq!(parse_start(&["W1AW", "B"])?.data_band, TncDataBand::B);
+        assert!(parse_start(&["W1AW", "a", "digi"])?.digi);
+        let both = parse_start(&["W1AW", "b", "7", "DIGI"])?;
+        assert!(both.digi && both.ssid == 7 && both.data_band == TncDataBand::B);
         assert!(parse_start(&[]).is_err());
-        assert!(parse_start(&["W1AW", "16"]).is_err());
-        assert!(parse_start(&["W1AW", "7", "loud"]).is_err());
+        assert!(parse_start(&["W1AW"]).is_err());
+        assert!(parse_start(&["W1AW", "c"]).is_err());
+        assert!(parse_start(&["W1AW", "a", "16"]).is_err());
+        assert!(parse_start(&["W1AW", "b", "7", "loud"]).is_err());
         Ok(())
     }
 }

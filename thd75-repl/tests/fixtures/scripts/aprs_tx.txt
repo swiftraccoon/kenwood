@@ -1,6 +1,6 @@
 # APRS transmit surface: drives every TX command through the REPL
 # against the `aprs` mock scenario. Requires --yes (script-mode TX gate).
-aprs start N0CALL 7
+aprs start N0CALL a 7
 position 35.30 -82.46 Portable
 compressed 35.30 -82.46 Portable
 mice 35.30 -82.46 25 90 Portable

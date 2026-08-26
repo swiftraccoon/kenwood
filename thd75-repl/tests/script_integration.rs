@@ -137,6 +137,33 @@ fn terminal_mode_guard_intercepts_cat_commands() -> TestResult {
 }
 
 #[test]
+fn terminal_mode_takeover_after_cat_proof_is_detected() -> TestResult {
+    // CAT preparation can succeed during the Menu 650 transition window and
+    // disappear while model and firmware qualification is still running. The
+    // retained owner must still reach positive MMDVM diagnosis.
+    let (_ok, stdout, stderr) = run_with_script("terminal_mode.txt", "mmdvm_takeover")?;
+
+    assert!(
+        stdout.contains("DV Gateway/MMDVM mode"),
+        "missing MMDVM takeover notice in stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("650"),
+        "post-CAT takeover should retain Menu 650 guidance:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("timed out"),
+        "post-CAT takeover timed out instead of reaching the MMDVM guard:\n{stdout}"
+    );
+    let lint_result = lint::check_output(&stdout);
+    assert!(
+        lint_result.is_ok(),
+        "takeover stdout violates rules: {lint_result:#?}\nstdout:\n{stdout}"
+    );
+    Ok(())
+}
+
+#[test]
 fn terminal_mode_starts_dstar_without_cat_recovery() -> TestResult {
     // The strict scenario permits only the positive terminal-mode probe,
     // MMDVM startup/init frames, and EOF cleanup. Any CAT recovery write after

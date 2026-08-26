@@ -68,7 +68,7 @@ beacon_cycle() {
   say "battery"
   say "step a 0"
   say "tune a 144.390"
-  say "aprs start $call 7"
+  say "aprs start $call a 7"
   sleep 2
   say "position $lat $lon reach test $n"
   sleep 3

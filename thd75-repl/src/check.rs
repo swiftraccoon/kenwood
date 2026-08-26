@@ -10,8 +10,8 @@
 use crate::{help_text, lint, output};
 use dstar_gateway_core::{Callsign, Module, ReflectorCallsign};
 use kenwood_thd75::types::{
-    Band, BatteryLevel, BeaconMode, FirmwareIdentity, GpsSettings, PacketDataRate, PowerLevel,
-    RadioClock, RadioDateTime, RadioModel, TncMode, UsbAudioOutput,
+    Band, BatteryLevel, BeaconMode, FirmwareIdentity, GpsSettings, PowerLevel, RadioClock,
+    RadioDateTime, RadioModel, TncDataBand, TncMode, UsbAudioOutput,
 };
 
 /// One entry in the coverage table: a human-readable source name and
@@ -117,9 +117,9 @@ fn gen_power_read() -> Vec<String> {
 fn gen_tnc_mode() -> Vec<String> {
     let mut v = Vec::new();
     for mode in [TncMode::Off, TncMode::Aprs, TncMode::Kiss] {
-        for data_rate in [PacketDataRate::Bps1200, PacketDataRate::Bps9600] {
-            v.push(output::tnc_mode_read(mode, data_rate));
-            v.push(output::tnc_mode_set(mode, data_rate));
+        for data_band in [TncDataBand::A, TncDataBand::B] {
+            v.push(output::tnc_mode_read(mode, data_band));
+            v.push(output::tnc_mode_set(mode, data_band));
         }
     }
     v

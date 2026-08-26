@@ -125,22 +125,29 @@ pub(crate) async fn frequency<T: Transport>(radio: &mut Radio<T>, args: &[&str])
     }
 }
 
-/// Read or set the CAT-safe TNC protocol mode. Args: `[off|aprs] [1200|9600]`.
+/// Read or set the CAT-safe TNC protocol mode. Args: `[off|aprs] [a|b]`.
 ///
-/// With no arguments, reads the current mode and speed. Use `aprs start` for
-/// an owned KISS session. APRS mode hands packet operation to the radio's own
-/// firmware.
+/// With no arguments, reads the current mode and selected TNC data band. Use
+/// `aprs start` for an owned KISS session. APRS mode hands packet operation to
+/// the radio's own firmware. Packet speed is a separate radio setting.
 pub(crate) async fn tnc_mode<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
     let Some(&mode_arg) = args.first() else {
         match radio.get_tnc_mode().await {
             Ok(state) => aprintln!(
                 "{}",
-                thd75_repl::output::tnc_mode_read(state.mode, state.data_rate)
+                thd75_repl::output::tnc_mode_read(state.mode, state.data_band)
             ),
             Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
         }
         return;
     };
+    if args.len() > 2 {
+        aprintln!(
+            "{}",
+            thd75_repl::output::error("usage: tnc [off or aprs] [a or b]")
+        );
+        return;
+    }
     let mode = match mode_arg.to_lowercase().as_str() {
         "off" => kenwood_thd75::types::TncControlMode::Off,
         "aprs" => kenwood_thd75::types::TncControlMode::Aprs,
@@ -153,21 +160,30 @@ pub(crate) async fn tnc_mode<T: Transport>(radio: &mut Radio<T>, args: &[&str]) 
             return;
         }
     };
-    let data_rate = match args.get(1) {
-        None | Some(&"1200") => kenwood_thd75::types::PacketDataRate::Bps1200,
-        Some(&"9600") => kenwood_thd75::types::PacketDataRate::Bps9600,
+    let data_band = match args.get(1) {
+        None => match radio.get_tnc_mode().await {
+            Ok(state) => state.data_band,
+            Err(e) => {
+                aprintln!("{}", thd75_repl::output::error(e));
+                return;
+            }
+        },
+        Some(value) if value.eq_ignore_ascii_case("a") => kenwood_thd75::types::TncDataBand::A,
+        Some(value) if value.eq_ignore_ascii_case("b") => kenwood_thd75::types::TncDataBand::B,
         Some(other) => {
             aprintln!(
                 "{}",
-                thd75_repl::output::error(format_args!("unknown speed {other}. Use 1200 or 9600."))
+                thd75_repl::output::error(format_args!(
+                    "unknown TNC data band {other}. Use a or b."
+                ))
             );
             return;
         }
     };
-    match radio.set_tnc_mode(mode, data_rate).await {
+    match radio.set_tnc_mode(mode, data_band).await {
         Ok(()) => aprintln!(
             "{}",
-            thd75_repl::output::tnc_mode_set(mode.into(), data_rate)
+            thd75_repl::output::tnc_mode_set(mode.into(), data_band)
         ),
         Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
     }
