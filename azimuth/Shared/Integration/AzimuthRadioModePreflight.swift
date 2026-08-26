@@ -28,7 +28,7 @@ enum AzimuthRadioModePreflightError: LocalizedError, Sendable, Equatable {
         case .usbMmdvmMode:
             return "After Azimuth sent the TH-D75 packet-mode exit sequence, the USB-C interface returned a valid MMDVM response, so CAT control is unavailable on that interface after recovery."
         case .bluetoothMmdvmMode:
-            return "After Azimuth sent the TH-D75 packet-mode exit sequence, the Bluetooth interface returned a valid MMDVM response, so CAT control is unavailable on that interface while DV Gateway is routed to Bluetooth."
+            return "After Azimuth sent the TH-D75 packet-mode exit sequence, the Bluetooth interface returned a validated TH-D75 MMDVM response instead of CAT. That proves CAT was unavailable during this probe, but does not by itself identify the persistent radio setting which selected MMDVM."
         case .cdcUnresponsive:
             return "Azimuth sent the TH-D75 packet-mode exit sequence, then retried after a CDC control-line reset and one USB-C control-session reopen, but the radio did not answer. Power-cycle the radio, confirm Menu 980 is COM + AF/IF Output, then reconnect USB-C."
         }
@@ -51,14 +51,15 @@ struct AzimuthPacketModeRecoveryTiming: Sendable {
         quietWindow: .milliseconds(500),
         residueDrainLimit: .seconds(5)
     )
+}
 
-    static let immediate = Self(
-        initialFlushDelay: .zero,
-        kissReturnDelay: .zero,
-        tncExitDelay: .zero,
-        finalSettleDelay: .zero,
-        quietWindow: .zero,
-        residueDrainLimit: .zero
+struct AzimuthCATPreservationTiming: Sendable {
+    let quietWindow: Duration
+    let responseTimeout: Duration
+
+    static let radio = Self(
+        quietWindow: .milliseconds(100),
+        responseTimeout: .milliseconds(500)
     )
 }
 
@@ -76,21 +77,34 @@ struct AzimuthRadioModePreflight: Sendable {
     let transport: any AzimuthRadioTransport
     let probeTimeout: Duration
     let catIdentityTimeout: Duration
+    let catPreservationTiming: AzimuthCATPreservationTiming
     let packetModeRecoveryTiming: AzimuthPacketModeRecoveryTiming
 
     init(
         transport: any AzimuthRadioTransport,
         probeTimeout: Duration = .seconds(2),
         catIdentityTimeout: Duration = .seconds(2),
+        catPreservationTiming: AzimuthCATPreservationTiming = .radio,
         packetModeRecoveryTiming: AzimuthPacketModeRecoveryTiming = .radio
     ) {
         self.transport = transport
         self.probeTimeout = probeTimeout
         self.catIdentityTimeout = catIdentityTimeout
+        self.catPreservationTiming = catPreservationTiming
         self.packetModeRecoveryTiming = packetModeRecoveryTiming
     }
 
     func prepareForAutomation() async throws -> AzimuthRadioWireMode {
+        try Task.checkCancellation()
+        azimuthRadioModeLog.notice(
+            "[Azimuth Radio] CAT-preserving wire-mode preflight started"
+        )
+
+        if try await proveCATWithoutPacketModeRecovery() == .cat {
+            return .cat
+        }
+        try Task.checkCancellation()
+
         azimuthRadioModeLog.notice("[Azimuth Radio] Packet-mode recovery started")
 
         // Recover the USB control channel before classifying it. KISS ignores
@@ -100,15 +114,15 @@ struct AzimuthRadioModePreflight: Sendable {
         // identified by the fresh MMDVM probe after CAT identity fails. This
         // ordering matches the Rust radio connection path and prevents a
         // recoverable transient MMDVM session from being mistaken for Menu 650.
-        try await transport.write(Self.carriageReturn)
-        try await transport.write(Self.carriageReturn)
+        try await writeRecoveryBytes(Self.carriageReturn)
+        try await writeRecoveryBytes(Self.carriageReturn)
         try await sleepForRecovery(packetModeRecoveryTiming.initialFlushDelay)
-        try await transport.write(Self.endTransmission)
-        try await transport.write(Self.kissReturn)
+        try await writeRecoveryBytes(Self.endTransmission)
+        try await writeRecoveryBytes(Self.kissReturn)
         try await sleepForRecovery(packetModeRecoveryTiming.kissReturnDelay)
-        try await transport.write(Self.tncExit)
+        try await writeRecoveryBytes(Self.tncExit)
         try await sleepForRecovery(packetModeRecoveryTiming.tncExitDelay)
-        try await transport.write(Self.packetModeExit)
+        try await writeRecoveryBytes(Self.packetModeExit)
         try await sleepForRecovery(packetModeRecoveryTiming.finalSettleDelay)
 
         // Starting modes produce different residue. Drain every queued chunk
@@ -121,53 +135,30 @@ struct AzimuthRadioModePreflight: Sendable {
             return .unresponsive
         }
 
-        // Accept CAT only after one fresh, isolated exact identity response.
-        var identity = StrictCATIdentityAccumulator()
-        try await transport.write(Self.identifyProbe)
-
-        let resetDeadline = ContinuousClock.now.advanced(by: catIdentityTimeout)
-        var resetByteCount = 0
-        catProbeLoop: while ContinuousClock.now < resetDeadline {
-            guard let chunk = try await readChunk(maxBytes: 64, deadline: resetDeadline) else {
-                break
-            }
-            guard !chunk.isEmpty else {
-                throw AzimuthRadioModePreflightError.transportClosed(stage: "CAT identity probe")
-            }
-            resetByteCount += chunk.count
-
-            switch identity.ingest(chunk) {
-            case .identity:
-                guard try await requirePostIdentityQuiet() else {
-                    azimuthRadioModeLog.error(
-                        "[Azimuth Radio] CAT identity response was followed by unexpected bytes"
-                    )
-                    break catProbeLoop
-                }
-                azimuthRadioModeLog.info(
-                    "[Azimuth Radio] CAT identity probe received \(resetByteCount, privacy: .public) bytes"
-                )
-                azimuthRadioModeLog.notice(
-                    "[Azimuth Radio] Mode probe classified CAT; TH-D75 identity confirmed"
-                )
-                return .cat
-            case .invalid:
-                // A rejection, stale prefix, another identity, or trailing
-                // data violates the isolated proof. Do not accept a later
-                // identity from the same exchange.
-                break
-            case .incomplete:
-                break
-            }
-            if identity.isInvalid {
-                break
-            }
-        }
+        // The residue drain established the pre-query quiet boundary. Accept
+        // CAT only after one new exact identity response, followed by the
+        // recovery timing's full quiet window.
+        let postRecoveryIdentity = try await proveCATIdentity(
+            responseTimeout: catIdentityTimeout,
+            postIdentityQuietWindow: packetModeRecoveryTiming.quietWindow,
+            stage: "post-recovery CAT identity probe"
+        )
         try Task.checkCancellation()
 
-        azimuthRadioModeLog.info(
-            "[Azimuth Radio] CAT identity probe received \(resetByteCount, privacy: .public) bytes"
-        )
+        switch postRecoveryIdentity {
+        case .proved(let byteCount):
+            azimuthRadioModeLog.info(
+                "[Azimuth Radio] Post-recovery CAT identity probe received \(byteCount, privacy: .public) bytes"
+            )
+            azimuthRadioModeLog.notice(
+                "[Azimuth Radio] Mode probe classified CAT after packet-mode recovery; TH-D75 identity confirmed"
+            )
+            return .cat
+        case .unavailable(let byteCount):
+            azimuthRadioModeLog.info(
+                "[Azimuth Radio] Post-recovery CAT identity proof unavailable after \(byteCount, privacy: .public) response bytes"
+            )
+        }
 
         // CAT did not answer after transient packet-mode recovery. Start a
         // new binary accumulator and require a response to a fresh probe, so
@@ -207,6 +198,47 @@ struct AzimuthRadioModePreflight: Sendable {
         return .unresponsive
     }
 
+    /// Proves an already-reopened endpoint is ordinary TH-D75 CAT without
+    /// sending any packet-mode recovery or MMDVM bytes. This is the only safe
+    /// preflight while a rebooting recovery is expected to preserve the TNC
+    /// data band established by its authenticated settings transaction.
+    func proveCATWithoutPacketModeRecovery() async throws -> AzimuthRadioWireMode {
+        try Task.checkCancellation()
+
+        // A normal CAT connection must not have its saved TNC data band
+        // overwritten by a blind `TN 0,0`. Require a quiet input boundary and
+        // one fresh, isolated TH-D75 identity before sending any packet-mode
+        // recovery bytes.
+        guard try await requireQuiet(
+            for: catPreservationTiming.quietWindow,
+            stage: "pre-recovery CAT quiet check"
+        ) else {
+            azimuthRadioModeLog.info(
+                "[Azimuth Radio] Pre-recovery CAT boundary contained residue"
+            )
+            return .unresponsive
+        }
+        switch try await proveCATIdentity(
+            responseTimeout: catPreservationTiming.responseTimeout,
+            postIdentityQuietWindow: catPreservationTiming.quietWindow,
+            stage: "pre-recovery CAT identity probe"
+        ) {
+        case .proved(let byteCount):
+            azimuthRadioModeLog.info(
+                "[Azimuth Radio] Pre-recovery CAT identity probe received \(byteCount, privacy: .public) bytes"
+            )
+            azimuthRadioModeLog.notice(
+                "[Azimuth Radio] Mode probe classified CAT without packet-mode recovery; TH-D75 identity confirmed"
+            )
+            return .cat
+        case .unavailable(let byteCount):
+            azimuthRadioModeLog.info(
+                "[Azimuth Radio] Pre-recovery CAT identity proof unavailable after \(byteCount, privacy: .public) response bytes"
+            )
+            return .unresponsive
+        }
+    }
+
     private func logMMDVM(frameByteCount: Int) {
         azimuthRadioModeLog.notice(
             "[Azimuth Radio] Mode probe classified MMDVM (\(frameByteCount, privacy: .public) validated response bytes)"
@@ -214,8 +246,14 @@ struct AzimuthRadioModePreflight: Sendable {
     }
 
     private func sleepForRecovery(_ duration: Duration) async throws {
+        try Task.checkCancellation()
         guard duration != .zero else { return }
         try await Task.sleep(for: duration)
+    }
+
+    private func writeRecoveryBytes(_ bytes: [UInt8]) async throws {
+        try Task.checkCancellation()
+        try await transport.write(bytes)
     }
 
     /// Returns true only after one complete quiet window. Each received chunk
@@ -244,8 +282,11 @@ struct AzimuthRadioModePreflight: Sendable {
         return false
     }
 
-    private func requirePostIdentityQuiet() async throws -> Bool {
-        let quietWindow = packetModeRecoveryTiming.quietWindow
+    private func requireQuiet(
+        for quietWindow: Duration,
+        stage: String
+    ) async throws -> Bool {
+        try Task.checkCancellation()
         guard quietWindow != .zero else { return true }
         let deadline = ContinuousClock.now.advanced(by: quietWindow)
         guard let chunk = try await readChunk(maxBytes: 1, deadline: deadline) else {
@@ -253,10 +294,56 @@ struct AzimuthRadioModePreflight: Sendable {
         }
         guard !chunk.isEmpty else {
             throw AzimuthRadioModePreflightError.transportClosed(
-                stage: "post-identity quiet check"
+                stage: stage
             )
         }
         return false
+    }
+
+    /// Proves CAT only when the complete exchange is exactly `ID TH-D75\r` and
+    /// no trailing byte arrives during the supplied quiet window. A malformed,
+    /// incomplete, silent, or noisy exchange is unavailable proof, not
+    /// permission to accept a later identity from the same exchange.
+    private func proveCATIdentity(
+        responseTimeout: Duration,
+        postIdentityQuietWindow: Duration,
+        stage: String
+    ) async throws -> CATIdentityProof {
+        try Task.checkCancellation()
+        try await transport.write(Self.identifyProbe)
+
+        var identity = StrictCATIdentityAccumulator()
+        let deadline = ContinuousClock.now.advanced(by: responseTimeout)
+        var byteCount = 0
+        while ContinuousClock.now < deadline {
+            guard let chunk = try await readChunk(maxBytes: 64, deadline: deadline) else {
+                break
+            }
+            guard !chunk.isEmpty else {
+                throw AzimuthRadioModePreflightError.transportClosed(stage: stage)
+            }
+            byteCount += chunk.count
+
+            switch identity.ingest(chunk) {
+            case .identity:
+                guard try await requireQuiet(
+                    for: postIdentityQuietWindow,
+                    stage: "post-identity quiet check"
+                ) else {
+                    azimuthRadioModeLog.error(
+                        "[Azimuth Radio] CAT identity response was followed by unexpected bytes"
+                    )
+                    return .unavailable(byteCount: byteCount)
+                }
+                return .proved(byteCount: byteCount)
+            case .invalid:
+                return .unavailable(byteCount: byteCount)
+            case .incomplete:
+                break
+            }
+        }
+        try Task.checkCancellation()
+        return .unavailable(byteCount: byteCount)
     }
 
     private func readChunk(
@@ -278,6 +365,11 @@ struct AzimuthRadioModePreflight: Sendable {
             return result
         }
     }
+}
+
+private enum CATIdentityProof {
+    case proved(byteCount: Int)
+    case unavailable(byteCount: Int)
 }
 
 private enum WireObservation {

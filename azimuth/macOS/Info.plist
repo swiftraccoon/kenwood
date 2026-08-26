@@ -28,6 +28,8 @@
 	<string>Azimuth uses a paired TH-D75 Bluetooth control link when you select Bluetooth or approve CAT recovery.</string>
 	<key>NSBluetoothPeripheralUsageDescription</key>
 	<string>Azimuth uses a paired TH-D75 Bluetooth control link when you select Bluetooth or approve CAT recovery.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Azimuth uses audio input only to capture the connected TH-D75 USB IF stream.</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 </dict>

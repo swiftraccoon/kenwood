@@ -76,7 +76,8 @@ private struct IFDSPSettingsDashboard: View {
                             .font(.title2.bold())
                         Text(
                             "Live values below come from the TH-D75 settings snapshot. "
-                                + "Azimuth does not currently ingest or analyze its USB audio stream."
+                                + "The live IF-DSP workspace separately proves the exact USB device "
+                                + "and analyzes its physical USB audio stream."
                         )
                         .font(.callout)
                         .foregroundStyle(.secondary)
@@ -121,13 +122,14 @@ private struct IFDSPSettingsDashboard: View {
 
     @ViewBuilder
     private var snapshotPill: some View {
+        let hasLiveSettingValues = !model.radioState.settingValues.isEmpty
         switch model.radioState.connection {
         case .connected:
             AzimuthStatusPill(
-                title: model.radioState.capabilities.settingRead.isAvailable ? "SNAPSHOT LIVE" : "READ PENDING",
-                symbol: model.radioState.capabilities.settingRead.isAvailable
+                title: hasLiveSettingValues ? "SNAPSHOT LIVE" : "READ PENDING",
+                symbol: hasLiveSettingValues
                     ? "checkmark.circle.fill" : "clock.arrow.circlepath",
-                color: model.radioState.capabilities.settingRead.isAvailable
+                color: hasLiveSettingValues
                     ? AzimuthPalette.signal : AzimuthPalette.caution
             )
         case .connecting:
@@ -345,8 +347,8 @@ private struct IFDSPSettingsDashboard: View {
                 }
 
                 Label(
-                    "IF supports AM, LSB, USB, and CW. Azimuth does not currently read runtime IO selection, single-band state, or the KISS/DV constraints, and its control session does not consume USB audio samples.",
-                    systemImage: "exclamationmark.circle"
+                    "IF-DSP supports AM, LSB, USB, and CW. Before capture, Azimuth proves the USB CAT and audio interfaces share the same physical TH-D75, reserves and verifies the radio state, and then analyzes live USB audio samples.",
+                    systemImage: "checkmark.shield"
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -596,6 +598,11 @@ private struct IFDSPSettingsDashboard: View {
         .disabled(
             !model.radioState.capabilities.settingRead.isAvailable
                 || model.isRadioOperationInFlight
+        )
+        .help(
+            "Reads the complete settings snapshot through MCP programming mode. "
+                + "Exiting MCP restarts the TH-D75; Azimuth then reconnects. "
+                + "This read is intentionally deferred on initial connection."
         )
         .accessibilityIdentifier("azimuth.ifdsp.refresh")
     }

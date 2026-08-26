@@ -6,10 +6,11 @@ import XCTest
 
 @MainActor
 final class AzimuthCATRecoveryPromptTests: XCTestCase {
-    func testBluetoothMMDVMOffersUSBHandoffWithoutActingBeforeConsent() async {
+    func testBluetoothMMDVMOffersUSBHandoffAndRoutingWithoutActingBeforeConsent() async {
         let controller = CATRecoveryTestController(
             connectionError: .bluetoothMmdvmMode,
-            usbFallbackAvailable: true
+            usbFallbackAvailable: true,
+            automaticBluetoothCATRoutingAvailable: true
         )
         let model = makeModel(controller: controller)
         model.selectRadioEndpoint(id: RadioEndpoint.catRecoveryBluetooth.id)
@@ -18,19 +19,202 @@ final class AzimuthCATRecoveryPromptTests: XCTestCase {
 
         XCTAssertEqual(
             model.catRecoveryAlert,
-            .bluetoothMmdvmMode(usbFallbackAvailable: true)
+            .bluetoothMmdvmMode(
+                usbFallbackAvailable: true,
+                automaticBluetoothCATRoutingAvailable: true
+            )
         )
         XCTAssertEqual(controller.usbFallbackCallCount, 0)
-        XCTAssertTrue(model.catRecoveryAlert?.message.contains("without changing Menu 650") == true)
+        XCTAssertEqual(controller.bluetoothRoutingCallCount, 0)
+        let message = model.catRecoveryAlert?.message ?? ""
+        XCTAssertTrue(message.contains("validated TH-D75 MMDVM version response"))
+        XCTAssertTrue(message.contains("exactly one verified TH-D75 USB-C endpoint"))
+        XCTAssertTrue(message.contains("does not by itself identify which radio setting"))
+        XCTAssertTrue(message.contains("first prove CAT through USB-C"))
+        XCTAssertTrue(message.contains("route it to USB-C"))
+        XCTAssertFalse(message.contains("serial-identified"))
+        XCTAssertFalse(message.localizedCaseInsensitiveContains("persistent"))
+        XCTAssertFalse(message.contains("Menu 985"))
 
         await model.connectViaUSBFromBluetoothMMDVM()
 
         XCTAssertEqual(controller.usbFallbackCallCount, 1)
+        XCTAssertEqual(controller.bluetoothRoutingCallCount, 0)
         XCTAssertNil(model.catRecoveryAlert)
         XCTAssertEqual(
             model.radioState.connection,
             .connected(device: "Kenwood TH-D75", transport: "USB-C")
         )
+    }
+
+    func testApprovedGatewayRoutingUsesUSBControlAndReconnectsBluetooth() async {
+        let controller = CATRecoveryTestController(
+            connectionError: .bluetoothMmdvmMode,
+            usbFallbackAvailable: true,
+            automaticBluetoothCATRoutingAvailable: true
+        )
+        let model = makeModel(controller: controller)
+        model.selectRadioEndpoint(id: RadioEndpoint.catRecoveryBluetooth.id)
+        await model.connectRadio()
+
+        await model.routeDVGatewayToUSBCAndReconnectBluetooth()
+
+        XCTAssertEqual(controller.bluetoothRoutingCallCount, 1)
+        XCTAssertEqual(controller.usbFallbackCallCount, 0)
+        XCTAssertNil(model.catRecoveryAlert)
+        XCTAssertNil(model.operationError)
+        XCTAssertEqual(
+            model.radioState.connection,
+            .connected(device: "Kenwood TH-D75", transport: "Bluetooth")
+        )
+    }
+
+    func testBluetoothMMDVMWithoutUSBExplainsCableMustBeOnThisMac() async {
+        let controller = CATRecoveryTestController(
+            connectionError: .bluetoothMmdvmMode,
+            usbFallbackAvailable: true,
+            automaticBluetoothCATRoutingAvailable: true
+        )
+        let model = makeModel(
+            controller: controller,
+            includeUSBEndpoint: false
+        )
+        model.selectRadioEndpoint(id: RadioEndpoint.catRecoveryBluetooth.id)
+
+        await model.connectRadio()
+
+        XCTAssertEqual(
+            model.catRecoveryAlert,
+            .bluetoothMmdvmMode(
+                usbFallbackAvailable: false,
+                automaticBluetoothCATRoutingAvailable: false
+            )
+        )
+        XCTAssertTrue(model.catRecoveryAlert?.message.contains("to this Mac") == true)
+        XCTAssertTrue(model.catRecoveryAlert?.message.contains("your iPad") == true)
+        XCTAssertTrue(
+            model.catRecoveryAlert?.message.contains(
+                "exactly one verified TH-D75 USB-C endpoint"
+            ) == true
+        )
+        XCTAssertTrue(model.catRecoveryAlert?.message.contains("No radio setting was changed") == true)
+        XCTAssertFalse(
+            model.catRecoveryAlert?.automaticBluetoothCATRoutingAvailable == true
+        )
+        XCTAssertFalse(model.catRecoveryAlert?.isRecoveryOffer == true)
+    }
+
+    func testBluetoothMMDVMCopyStatesOnlyFreshProbeEvidence() {
+        for usbFallbackAvailable in [false, true] {
+            for automaticRoutingAvailable in [false, true] {
+                let alert = RadioCATRecoveryAlert.bluetoothMmdvmMode(
+                    usbFallbackAvailable: usbFallbackAvailable,
+                    automaticBluetoothCATRoutingAvailable: automaticRoutingAvailable
+                )
+
+                XCTAssertEqual(alert.title, "Bluetooth Returned an MMDVM Response")
+                XCTAssertTrue(
+                    alert.message.contains("validated TH-D75 MMDVM version response")
+                )
+                XCTAssertTrue(
+                    alert.message.contains("exactly one verified TH-D75 USB-C endpoint")
+                )
+                XCTAssertTrue(
+                    alert.message.contains(
+                        "does not by itself identify which radio setting selected MMDVM"
+                    )
+                )
+                XCTAssertFalse(alert.message.contains("serial-identified"))
+                XCTAssertFalse(alert.message.localizedCaseInsensitiveContains("persistent"))
+                XCTAssertFalse(alert.message.contains("Menu 985"))
+                XCTAssertFalse(alert.message.contains("gateway is routed"))
+            }
+        }
+
+        let errorMessage = RadioControllerError.bluetoothMmdvmMode.localizedDescription
+        XCTAssertTrue(errorMessage.contains("validated TH-D75 MMDVM version response"))
+        XCTAssertFalse(errorMessage.localizedCaseInsensitiveContains("persistent"))
+        XCTAssertFalse(errorMessage.contains("DV Gateway"))
+        XCTAssertFalse(errorMessage.contains("Menu 985"))
+    }
+
+    func testGatewayRoutingWithoutVerifiedUSBExplainsEndpointRequirement() async {
+        let controller = CATRecoveryTestController(
+            connectionError: .bluetoothMmdvmMode,
+            automaticBluetoothCATRoutingAvailable: true
+        )
+        let model = makeModel(
+            controller: controller,
+            includeUSBEndpoint: false
+        )
+        model.selectRadioEndpoint(id: RadioEndpoint.catRecoveryBluetooth.id)
+        await model.connectRadio()
+
+        await model.routeDVGatewayToUSBCAndReconnectBluetooth()
+
+        XCTAssertEqual(controller.bluetoothRoutingCallCount, 0)
+        XCTAssertEqual(
+            model.catRecoveryAlert,
+            .recoveryFailed(
+                message: "Automatic DV Gateway routing needs exactly one verified TH-D75 USB-C endpoint connected to this Mac."
+            )
+        )
+    }
+
+    func testGatewayRoutingFailureKeepsBothBluetoothRecoveryActionsRetryable() async {
+        let controller = CATRecoveryTestController(
+            routingFailure: "The USB-C radio did not finish the verified Menu 985 update.",
+            connectionError: .bluetoothMmdvmMode,
+            usbFallbackAvailable: true,
+            automaticBluetoothCATRoutingAvailable: true
+        )
+        let model = makeModel(controller: controller)
+        model.selectRadioEndpoint(id: RadioEndpoint.catRecoveryBluetooth.id)
+        await model.connectRadio()
+
+        await model.routeDVGatewayToUSBCAndReconnectBluetooth()
+
+        XCTAssertEqual(
+            model.catRecoveryAlert,
+            .recoveryFailed(
+                message: "The USB-C radio did not finish the verified Menu 985 update.",
+                usbFallbackAvailable: true,
+                automaticBluetoothCATRoutingAvailable: true
+            )
+        )
+        await model.routeDVGatewayToUSBCAndReconnectBluetooth()
+        XCTAssertEqual(controller.bluetoothRoutingCallCount, 2)
+    }
+
+    func testUserCanCancelGatewayRoutingAndWaitForSafeDisconnect() async {
+        let controller = CATRecoveryTestController(
+            blockRouting: true,
+            connectionError: .bluetoothMmdvmMode,
+            usbFallbackAvailable: true,
+            automaticBluetoothCATRoutingAvailable: true
+        )
+        let model = makeModel(controller: controller)
+        model.selectRadioEndpoint(id: RadioEndpoint.catRecoveryBluetooth.id)
+        await model.connectRadio()
+
+        let routingTask = Task { @MainActor in
+            await model.routeDVGatewayToUSBCAndReconnectBluetooth()
+        }
+        for _ in 0..<1_000 where !controller.bluetoothRoutingStarted {
+            await Task.yield()
+        }
+        XCTAssertTrue(controller.bluetoothRoutingStarted)
+        XCTAssertEqual(model.radioConnectionActivity, .gatewayRoutingRecovery)
+        XCTAssertTrue(model.isCATRecoveryInFlight)
+
+        await model.cancelCATRecovery()
+        await routingTask.value
+
+        XCTAssertEqual(controller.disconnectCallCount, 1)
+        XCTAssertTrue(controller.bluetoothRoutingCancellationObserved)
+        XCTAssertEqual(model.radioState.connection, .disconnected)
+        XCTAssertNil(model.radioConnectionActivity)
+        XCTAssertNil(model.catRecoveryAlert)
     }
 
     func testMMDVMDetectionOffersRecoveryWithoutWritingBeforeConsent() async {
@@ -388,13 +572,18 @@ final class AzimuthCATRecoveryPromptTests: XCTestCase {
 
     private func makeModel(
         controller: CATRecoveryTestController,
+        includeUSBEndpoint: Bool = true,
         includePairedBluetoothDevice: Bool = true,
         bluetoothEndpoint: RadioEndpoint = .catRecoveryBluetooth,
         totalPairedBluetoothDevices: UInt32 = 1
     ) -> AzimuthSceneModel {
-        let endpoints: [RadioEndpoint] = includePairedBluetoothDevice
-            ? [.defaultUSBC, bluetoothEndpoint]
-            : [.defaultUSBC]
+        var endpoints: [RadioEndpoint] = []
+        if includeUSBEndpoint {
+            endpoints.append(.defaultUSBC)
+        }
+        if includePairedBluetoothDevice {
+            endpoints.append(bluetoothEndpoint)
+        }
         return AzimuthSceneModel(
             radioController: controller,
             catalogProvider: PreviewRadioSettingCatalogProvider(),
@@ -453,20 +642,26 @@ private final class CATRecoveryTestController: RadioControlling {
     private(set) var recoveryCallCount = 0
     private(set) var bluetoothFallbackCallCount = 0
     private(set) var usbFallbackCallCount = 0
+    private(set) var bluetoothRoutingCallCount = 0
     private(set) var disconnectCallCount = 0
     private(set) var recoveryStarted = false
     private(set) var recoveryCancellationObserved = false
     private(set) var bluetoothFallbackStarted = false
     private(set) var bluetoothFallbackCancellationObserved = false
+    private(set) var bluetoothRoutingStarted = false
+    private(set) var bluetoothRoutingCancellationObserved = false
     private let recoveryFailure: String?
     private let denyBluetoothAuthorization: Bool
     private let cancelRecovery: Bool
     private let blockRecovery: Bool
     private let blockBluetoothFallback: Bool
+    private let blockRouting: Bool
     private let bluetoothFallbackFailure: String?
+    private let routingFailure: String?
     private let lateCancellationFailure: String?
     private let connectionError: RadioControllerError
     private(set) var usbCATFallbackAvailable: Bool
+    private(set) var automaticBluetoothCATRoutingAvailable: Bool
 
     init(
         recoveryFailure: String? = nil,
@@ -474,24 +669,31 @@ private final class CATRecoveryTestController: RadioControlling {
         cancelRecovery: Bool = false,
         blockRecovery: Bool = false,
         blockBluetoothFallback: Bool = false,
+        blockRouting: Bool = false,
         bluetoothFallbackFailure: String? = nil,
+        routingFailure: String? = nil,
         lateCancellationFailure: String? = nil,
         connectionError: RadioControllerError = .usbMmdvmMode,
         automaticRecoveryAvailable: Bool = true,
         bluetoothFallbackAvailable: Bool = false,
-        usbFallbackAvailable: Bool = false
+        usbFallbackAvailable: Bool = false,
+        automaticBluetoothCATRoutingAvailable: Bool = false
     ) {
         self.recoveryFailure = recoveryFailure
         self.denyBluetoothAuthorization = denyBluetoothAuthorization
         self.cancelRecovery = cancelRecovery
         self.blockRecovery = blockRecovery
         self.blockBluetoothFallback = blockBluetoothFallback
+        self.blockRouting = blockRouting
         self.bluetoothFallbackFailure = bluetoothFallbackFailure
+        self.routingFailure = routingFailure
         self.lateCancellationFailure = lateCancellationFailure
         self.connectionError = connectionError
         automaticCATRecoveryAvailable = automaticRecoveryAvailable
         bluetoothCATFallbackAvailable = bluetoothFallbackAvailable
         usbCATFallbackAvailable = usbFallbackAvailable
+        self.automaticBluetoothCATRoutingAvailable =
+            automaticBluetoothCATRoutingAvailable
     }
 
     var updates: AsyncStream<RadioWorkspaceState> {
@@ -583,6 +785,35 @@ private final class CATRecoveryTestController: RadioControlling {
         usbFallbackCallCount += 1
         currentState = RadioWorkspaceState(
             connection: .connected(device: "Kenwood TH-D75", transport: "USB-C"),
+            capabilities: RadioCapabilities(
+                screenStreaming: .available,
+                frontPanelControl: .available,
+                settingRead: .available,
+                settingWrite: .available
+            ),
+            screenFrame: nil,
+            telemetry: .unavailable,
+            settingValues: [:],
+            lastScreenError: nil
+        )
+    }
+
+    func routeDVGatewayToUSBCAndReconnectBluetooth() async throws {
+        bluetoothRoutingCallCount += 1
+        bluetoothRoutingStarted = true
+        if blockRouting {
+            do {
+                try await Task.sleep(for: .seconds(60))
+            } catch is CancellationError {
+                bluetoothRoutingCancellationObserved = true
+                throw CancellationError()
+            }
+        }
+        if let routingFailure {
+            throw RadioControllerError.operationFailed(routingFailure)
+        }
+        currentState = RadioWorkspaceState(
+            connection: .connected(device: "Kenwood TH-D75", transport: "Bluetooth"),
             capabilities: RadioCapabilities(
                 screenStreaming: .available,
                 frontPanelControl: .available,

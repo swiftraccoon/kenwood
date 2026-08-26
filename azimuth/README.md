@@ -69,14 +69,18 @@ Kenwood TH-D75.
   the session receive-only. Message and manual-position transmission are
   explicit, confirmed, one-shot operations; periodic SmartBeaconing and message
   acknowledgement retry/correlation are not implemented.
-- **Physical IF analysis.** On iPadOS, save and read-back-verify the radio state,
-  reserve Band B, and capture the real 48 kHz mono `ADC stream IN` feed at the
-  current VFO frequency. USB, LSB, CW, and AM processing drives the spectrum,
-  waterfall, passband, level, clipping, and capture-loss views. Bounded
-  retuning uses individually read-back-verified UP/DW steps and restores the
-  original frequency; direct FO/FQ writes remain quarantined. Demodulated
-  audio playback remains disabled until a safe non-radio output route is
-  verified.
+- **Physical IF analysis.** On iPadOS and macOS, save and read-back-verify the
+  radio state, reserve Band B, and capture the real 48 kHz mono `ADC stream IN`
+  feed at the current VFO frequency. On macOS, CAT `AE` proves the radio, and
+  Azimuth opens the CoreAudio input only when its IORegistry USB-device ancestor
+  is the same nonzero ancestor as the proved USB CDC interface. USB descriptor
+  serials are not used as radio identity. Azimuth never falls back to the
+  default input, a display-name match, or a sole generic USB device. USB, LSB,
+  CW, and AM processing drives the spectrum, waterfall, passband, level,
+  clipping, and capture-loss views. Bounded retuning uses individually
+  read-back-verified UP/DW steps and restores the original frequency; direct
+  FO/FQ writes remain quarantined. Demodulated audio playback remains disabled
+  until a safe non-radio output route is verified.
 - **Every setting, understandable.** Present the complete 400-record MCP
   catalog with search, direct radio menu numbers where defined, official option
   domains, staged diffs, confirmation, stale-value protection, and read-back
@@ -84,6 +88,9 @@ Kenwood TH-D75.
   editor. The power-on bitmap and disruptive Menu 650/980 settings remain
   read-only there; disruptive changes are available only through a dedicated
   lifecycle on platforms where Azimuth can safely own the required transport.
+  The initial connection intentionally defers the full MCP settings snapshot.
+  An explicit settings read enters MCP programming mode; exiting MCP restarts
+  the radio, after which Azimuth reopens and requalifies CAT automatically.
 - **Ask Azimuth.** Use Apple's on-device Foundation Models framework to turn
   natural language into a typed, explainable before-and-after plan. The model
   never emits raw CAT bytes or memory offsets. Azimuth validates every item,
@@ -94,23 +101,24 @@ Kenwood TH-D75.
 - **Choose the macOS control link.** Use USB-C on M-series iPads through
   USBDriverKit. On macOS, choose either the system USB serial device or an exact
   paired Bluetooth address; Azimuth keeps one CAT/MCP owner active at a time.
-  USB choices are bound to the radio's stable USB descriptor serial, not a
-  reusable `/dev/cu.usbmodem*` pathname, and recovery follows that same radio
-  if its tty path changes after reboot. The Bluetooth picker shows every paired
-  device by its native display name and exact address. On first use, Azimuth
-  asks for macOS Bluetooth access in the foreground before launching its
-  isolated RFCOMM helper; a denial leaves USB-C usable and points to Privacy &
-  Security > Bluetooth. Choosing a Bluetooth device opens only that exact
-  address, then requires strict CAT model and serial identity before accepting
-  it as a TH-D75.
+  USB discovery records the interface's nonzero IORegistry USB-device ancestor,
+  not just a reusable `/dev/cu.usbmodem*` pathname. Every accepted CAT session
+  still proves the TH-D75 model and `AE` serial; descriptor serials are not
+  treated as radio identity. The Bluetooth picker shows every paired device by
+  its native display name and exact address. On first use, Azimuth asks for
+  macOS Bluetooth access in the foreground before launching its isolated RFCOMM
+  helper; a denial leaves USB-C usable and points to Privacy & Security >
+  Bluetooth. Choosing a Bluetooth device opens only that exact address, then
+  requires strict CAT model and serial identity before accepting it as a TH-D75.
   If USB-C positively answers as MMDVM, Azimuth first offers a non-destructive
   handoff to the same radio over Bluetooth. Turning Menu 650 off and returning
   control to USB remains a separate, explicitly approved operation. If
   Bluetooth positively answers as MMDVM, Azimuth can offer a non-destructive
-  handoff to the sole serial-identified USB-C endpoint. That action changes
-  only the selected host transport and leaves Menu 650 untouched. iPadOS has
-  no second TH-D75 CAT path while USB-C carries MMDVM, so the app explains the
-  manual recovery instead of presenting a false automatic option.
+  handoff to the sole VID/PID-qualified USB-C endpoint, then accepts it only if
+  CAT proves the same `AE` radio. That action changes only the selected host
+  transport and leaves Menu 650 untouched. iPadOS has no second TH-D75 CAT path
+  while USB-C carries MMDVM, so the app explains the manual recovery instead of
+  presenting a false automatic option.
 
 ## Safety contract
 
@@ -123,11 +131,20 @@ workflows remain outside the generic settings planner and require dedicated UI.
 APRS and IF-DSP temporarily own the serial session, so CAT-backed screen and
 settings operations resume only after their stop-and-requalification path
 succeeds. Azimuth does not change Menu 650 during connection probing. On macOS,
-using Bluetooth without changing the radio and turning Menu 650 off to restore
-USB are separate choices shown only after USB-C has positively answered as
-MMDVM. Starting APRS also verifies that Menu 983 routes KISS to the selected
-USB-C or Bluetooth control link; a mismatch stops before packet-mode entry and
-is never changed silently.
+if IF-DSP is rejected in the current radio mode while CAT is connected over
+Bluetooth and the radio is also present over USB-C, it offers a dedicated
+`Inspect DV Gateway and Start IF-DSP` action. Azimuth changes nothing unless
+the operator explicitly accepts that action. It then inspects Menu 650, sets it
+to Off only if needed, waits for any required restart, and accepts the USB-C
+path only after CAT proves the same `AE` radio before starting IF capture.
+Starting APRS consumes one reviewed settings snapshot that proves Menu 983
+routes KISS to the selected USB-C or Bluetooth control link and that Menu 506
+contains a valid Band A or Band B selection. Packet speed remains a separate
+KISS setting. A route mismatch or invalid TNC band stops before packet-mode
+entry. If the radio then refuses KISS in its current mode, Azimuth can offer a
+separately approved, same-radio inspection of Menu 983, Menu 506, and Menu 650;
+it changes Menu 650 only when needed and retries once with the freshly verified
+band.
 
 ## Development
 
@@ -138,9 +155,12 @@ open Azimuth.xcodeproj
 ```
 
 USBDriverKit requires a physical M-series iPad and a TH-D75. The Simulator is
-for UI, assistant, catalog, and recorded-transport tests. Live IF capture is
-currently iPadOS-only; the macOS build reports its explicit CoreAudio-device
-selection blocker instead of analyzing the wrong input.
+for UI, assistant, catalog, and recorded-transport tests. On macOS, live IF
+capture uses the explicit CoreAudio input whose nonzero IORegistry USB-device
+ancestor matches the currently opened, CAT-qualified TH-D75 CDC interface.
+CAT `AE`, not the USB descriptor serial, proves radio identity. A missing or
+mismatched ancestor stops capture; Azimuth never substitutes the default input,
+a name match, or the only USB audio device.
 
 Lifecycle, recovery, and failure diagnostics are logged by default. Set the
 scheme environment variable `AZIMUTH_VERBOSE_USB_TRACE=1` when packet-by-packet

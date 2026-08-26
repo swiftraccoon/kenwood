@@ -267,6 +267,9 @@ enum RadioControllerError: LocalizedError, Equatable, Sendable {
     case capabilityUnavailable(String)
     case usbMmdvmMode
     case bluetoothMmdvmMode
+    case aprsDVGatewayRecoveryRequired
+    case ifDspDVGatewayRecoveryRequired
+    case ifDspCurrentModeUnavailable
     case operationFailed(String)
 
     var errorDescription: String? {
@@ -276,9 +279,97 @@ enum RadioControllerError: LocalizedError, Equatable, Sendable {
         case .usbMmdvmMode:
             return "After Azimuth sent the TH-D75 packet-mode exit sequence, the USB-C interface returned a valid MMDVM response, so CAT control is unavailable on that interface after recovery."
         case .bluetoothMmdvmMode:
-            return "After Azimuth sent the TH-D75 packet-mode exit sequence, the Bluetooth interface returned a valid MMDVM response, so CAT control is unavailable while DV Gateway is routed to Bluetooth."
+            return "After Azimuth sent the TH-D75 packet-mode exit sequence, the selected Bluetooth interface returned a validated TH-D75 MMDVM version response instead of CAT. CAT control was unavailable on that Bluetooth connection during the probe."
+        case .aprsDVGatewayRecoveryRequired:
+            return "The TH-D75 refused KISS in its current mode. With approval, Azimuth can inspect Menu 983 (KISS interface), Menu 506 (TNC data band), and Menu 650 (DV Gateway) together. It will set Menu 650 to Off only if needed, reconnect the same endpoint and radio identity, and retry this APRS configuration once with the freshly verified TNC band."
+        case .ifDspDVGatewayRecoveryRequired:
+            return "IF-DSP needs USB-C CAT and audio control. Before leaving the current Bluetooth CAT session, Azimuth must inspect Menu 650 (DV Gateway), set it to Off only if needed, and prove the same radio over USB-C. Exiting MCP resets the radio’s CAT and USB interfaces even when no setting write is needed."
+        case .ifDspCurrentModeUnavailable:
+            return "IF-DSP couldn’t start because the radio would not allow Band B control in its current mode. Return the radio to normal dual-band VFO operation and stop DV Gateway or any other special operating mode, then try again. Azimuth restored and verified the complete pre-session radio state."
         case .capabilityUnavailable(let reason), .operationFailed(let reason):
             return reason
+        }
+    }
+}
+
+enum APRSDVGatewayRecoveryAlert: Equatable, Sendable {
+    case offer(connectionName: String, automaticRecoveryAvailable: Bool)
+    case failed(message: String)
+
+    var title: String {
+        switch self {
+        case .offer:
+            "Inspect DV Gateway?"
+        case .failed:
+            "APRS Recovery Failed"
+        }
+    }
+
+    var message: String {
+        switch self {
+        case .offer(let connectionName, true):
+            "The TH-D75 refused KISS in its current mode. With your approval, Azimuth will read Menu 983 (KISS interface), Menu 506 (TNC data band), and Menu 650 (DV Gateway) together. A mismatched KISS route or invalid TNC band stops recovery without changing a setting. Azimuth will set Menu 650 to Off only if needed, reconnect only the same selected \(connectionName) endpoint, prove the same radio, and retry once with the freshly verified band. Exiting MCP resets CAT even when Menu 650 is already Off. No radio setting will change unless you approve."
+        case .offer(let connectionName, false):
+            "The TH-D75 refused KISS in its current mode, but Azimuth cannot safely inspect the selected \(connectionName) endpoint automatically. Leave the radio unchanged, or inspect Menu 983, Menu 506, Menu 650, and the current operating mode on the radio before reconnecting and trying APRS again."
+        case .failed(let message):
+            message
+        }
+    }
+
+    var automaticRecoveryAvailable: Bool {
+        switch self {
+        case .offer(_, let available): available
+        case .failed: false
+        }
+    }
+
+    var dismissalButtonTitle: String {
+        switch self {
+        case .offer:
+            "Leave Radio Unchanged"
+        case .failed:
+            "Dismiss"
+        }
+    }
+}
+
+enum IFDSPDVGatewayRecoveryAlert: Equatable, Sendable {
+    case offer(automaticRecoveryAvailable: Bool)
+    case failed(message: String)
+
+    var title: String {
+        switch self {
+        case .offer:
+            "Inspect DV Gateway?"
+        case .failed:
+            "IF-DSP Recovery Failed"
+        }
+    }
+
+    var message: String {
+        switch self {
+        case .offer(true):
+            "IF-DSP needs USB-C CAT and audio control. With your approval, Azimuth will inspect Menu 650 (DV Gateway) on the current Bluetooth CAT session and set it to Off only if needed. Exiting MCP resets the radio’s CAT and USB interfaces even when no setting write is needed. Azimuth will then switch to the attached USB-C endpoint, prove that it is the same TH-D75, verify its exact audio input, and start IF-DSP."
+        case .offer(false):
+            "IF-DSP needs USB-C CAT and audio control, but Azimuth cannot safely inspect Menu 650 and prove a same-radio USB-C endpoint for this connection. Leave the radio unchanged, or set Menu 650 to Off on the radio and reconnect over USB-C before starting IF-DSP."
+        case .failed(let message):
+            message
+        }
+    }
+
+    var automaticRecoveryAvailable: Bool {
+        switch self {
+        case .offer(let available): available
+        case .failed: false
+        }
+    }
+
+    var dismissalButtonTitle: String {
+        switch self {
+        case .offer:
+            "Leave Radio Unchanged"
+        case .failed:
+            "Dismiss"
         }
     }
 }
@@ -288,11 +379,16 @@ enum RadioCATRecoveryAlert: Equatable, Sendable {
         automaticRecoveryAvailable: Bool,
         bluetoothFallbackAvailable: Bool
     )
-    case bluetoothMmdvmMode(usbFallbackAvailable: Bool)
+    case bluetoothMmdvmMode(
+        usbFallbackAvailable: Bool,
+        automaticBluetoothCATRoutingAvailable: Bool
+    )
     case recoveryFailed(
         message: String,
         automaticRecoveryAvailable: Bool = false,
-        bluetoothFallbackAvailable: Bool = false
+        bluetoothFallbackAvailable: Bool = false,
+        usbFallbackAvailable: Bool = false,
+        automaticBluetoothCATRoutingAvailable: Bool = false
     )
 
     var title: String {
@@ -300,7 +396,7 @@ enum RadioCATRecoveryAlert: Equatable, Sendable {
         case .usbMmdvmMode:
             return "USB-C Remains in MMDVM Mode"
         case .bluetoothMmdvmMode:
-            return "Bluetooth Is in MMDVM Mode"
+            return "Bluetooth Returned an MMDVM Response"
         case .recoveryFailed:
             return "CAT Recovery Failed"
         }
@@ -320,11 +416,15 @@ enum RadioCATRecoveryAlert: Equatable, Sendable {
             #else
             return "Azimuth already sent the transient packet-mode exit sequence, but the TH-D75 USB-C interface returned a validated MMDVM version response instead of CAT. Automatic recovery needs a configured, paired TH-D75 Bluetooth control link because the gateway-owned USB interface does not route the programming commands needed to change Menu 650. End any active MMDVM or DV Gateway session. If no host session is active, set Menu 650 (DV Gateway) to Off and power-cycle the radio, then reconnect."
             #endif
-        case .bluetoothMmdvmMode(true):
-            return "Azimuth proved that the selected Bluetooth interface is carrying persistent TH-D75 MMDVM traffic for DV Gateway. The radio cannot answer CAT on Bluetooth in this state. Azimuth found exactly one serial-identified USB-C radio and can switch to that exact endpoint without changing Menu 650, or you can leave the radio unchanged."
-        case .bluetoothMmdvmMode(false):
-            return "Azimuth proved that the selected Bluetooth interface is carrying persistent TH-D75 MMDVM traffic for DV Gateway. The radio cannot answer CAT on Bluetooth in this state. Connect exactly one serial-identified TH-D75 over USB-C, refresh connections, and retry, or leave the radio unchanged."
-        case .recoveryFailed(let message, _, _):
+        case .bluetoothMmdvmMode(true, true):
+            return "Azimuth's fresh probe received a validated TH-D75 MMDVM version response from the selected Bluetooth interface instead of CAT. That proves CAT was unavailable on that connection during the probe, but it does not by itself identify which radio setting selected MMDVM. Azimuth found exactly one verified TH-D75 USB-C endpoint on this Mac. You can try that endpoint for CAT without changing the radio. Or, with your approval, Azimuth can first prove CAT through USB-C, inspect the DV Gateway routing, route it to USB-C if needed, and reconnect the original Bluetooth endpoint after any required radio restart. A routing change restarts the radio and can take more than a minute."
+        case .bluetoothMmdvmMode(true, false):
+            return "Azimuth's fresh probe received a validated TH-D75 MMDVM version response from the selected Bluetooth interface instead of CAT. That proves CAT was unavailable on that connection during the probe, but it does not by itself identify which radio setting selected MMDVM. Azimuth found exactly one verified TH-D75 USB-C endpoint on this Mac. You can try that endpoint for CAT without changing the radio."
+        case .bluetoothMmdvmMode(false, true):
+            return "Azimuth's fresh probe received a validated TH-D75 MMDVM version response from the selected Bluetooth interface instead of CAT. That proves CAT was unavailable on that connection during the probe, but it does not by itself identify which radio setting selected MMDVM. Azimuth found exactly one verified TH-D75 USB-C endpoint on this Mac. With your approval, Azimuth can first prove CAT through USB-C, inspect the DV Gateway routing, route it to USB-C if needed, and reconnect the original Bluetooth endpoint after any required radio restart. A routing change restarts the radio and can take more than a minute."
+        case .bluetoothMmdvmMode(false, false):
+            return "Azimuth's fresh probe received a validated TH-D75 MMDVM version response from the selected Bluetooth interface instead of CAT. That proves CAT was unavailable on that connection during the probe, but it does not by itself identify which radio setting selected MMDVM. Azimuth needs exactly one verified TH-D75 USB-C endpoint connected to this Mac before it can test an alternate CAT path or offer automatic routing. A cable connected to your iPad does not provide this Mac with that endpoint. Connect the radio to this Mac, refresh Connections, and retry. No radio setting was changed."
+        case .recoveryFailed(let message, _, _, _, _):
             return message
         }
     }
@@ -333,7 +433,7 @@ enum RadioCATRecoveryAlert: Equatable, Sendable {
         switch self {
         case .usbMmdvmMode(let available, _): return available
         case .bluetoothMmdvmMode: return false
-        case .recoveryFailed(_, let available, _): return available
+        case .recoveryFailed(_, let available, _, _, _): return available
         }
     }
 
@@ -341,14 +441,23 @@ enum RadioCATRecoveryAlert: Equatable, Sendable {
         switch self {
         case .usbMmdvmMode(_, let available): return available
         case .bluetoothMmdvmMode: return false
-        case .recoveryFailed(_, _, let available): return available
+        case .recoveryFailed(_, _, let available, _, _): return available
         }
     }
 
     var usbFallbackAvailable: Bool {
         switch self {
-        case .bluetoothMmdvmMode(let available): return available
-        case .usbMmdvmMode, .recoveryFailed: return false
+        case .bluetoothMmdvmMode(let available, _): return available
+        case .recoveryFailed(_, _, _, let available, _): return available
+        case .usbMmdvmMode: return false
+        }
+    }
+
+    var automaticBluetoothCATRoutingAvailable: Bool {
+        switch self {
+        case .bluetoothMmdvmMode(_, let available): return available
+        case .recoveryFailed(_, _, _, _, let available): return available
+        case .usbMmdvmMode: return false
         }
     }
 
@@ -356,10 +465,10 @@ enum RadioCATRecoveryAlert: Equatable, Sendable {
         switch self {
         case .usbMmdvmMode:
             true
-        case .bluetoothMmdvmMode(let available):
-            available
-        case .recoveryFailed(_, let automatic, let bluetooth):
-            automatic || bluetooth
+        case .bluetoothMmdvmMode(let usb, let routing):
+            usb || routing
+        case .recoveryFailed(_, let automatic, let bluetooth, let usb, let routing):
+            automatic || bluetooth || usb || routing
         }
     }
 }
@@ -422,11 +531,17 @@ protocol RadioControlling: AnyObject {
     var automaticCATRecoveryAvailable: Bool { get }
     var bluetoothCATFallbackAvailable: Bool { get }
     var usbCATFallbackAvailable: Bool { get }
+    var automaticBluetoothCATRoutingAvailable: Bool { get }
+    var automaticIFDSPDVGatewayRecoveryAvailable: Bool { get }
+    var currentRadioSerialNumber: String? { get }
+    var currentIFDSPUSBInputProof: IFDSPUSBInputProof? { get }
 
     func connect() async throws
     func restoreCATFromUSBMMDVM() async throws
     func connectViaBluetoothFromUSBMMDVM() async throws
     func connectViaUSBFromBluetoothMMDVM() async throws
+    func routeDVGatewayToUSBCAndReconnectBluetooth() async throws
+    func disableDVGatewayAndReconnectForIFDSP() async throws
     func disconnect() async
     func refreshScreen() async throws
     func refreshSettings() async throws
@@ -441,6 +556,10 @@ extension RadioControlling {
     var automaticCATRecoveryAvailable: Bool { false }
     var bluetoothCATFallbackAvailable: Bool { false }
     var usbCATFallbackAvailable: Bool { false }
+    var automaticBluetoothCATRoutingAvailable: Bool { false }
+    var automaticIFDSPDVGatewayRecoveryAvailable: Bool { false }
+    var currentRadioSerialNumber: String? { nil }
+    var currentIFDSPUSBInputProof: IFDSPUSBInputProof? { nil }
 
     func restoreCATFromUSBMMDVM() async throws {
         throw RadioControllerError.capabilityUnavailable(
@@ -457,6 +576,18 @@ extension RadioControlling {
     func connectViaUSBFromBluetoothMMDVM() async throws {
         throw RadioControllerError.capabilityUnavailable(
             "A USB-C CAT handoff from Bluetooth MMDVM mode is unavailable in this build."
+        )
+    }
+
+    func routeDVGatewayToUSBCAndReconnectBluetooth() async throws {
+        throw RadioControllerError.capabilityUnavailable(
+            "Automatic DV Gateway routing to USB-C is unavailable in this build."
+        )
+    }
+
+    func disableDVGatewayAndReconnectForIFDSP() async throws {
+        throw RadioControllerError.capabilityUnavailable(
+            "Automatic IF-DSP DV Gateway recovery is unavailable in this build."
         )
     }
 }

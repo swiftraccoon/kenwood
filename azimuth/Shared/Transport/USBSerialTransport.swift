@@ -104,6 +104,14 @@ public actor AzimuthUSBSerialTransport: AzimuthRadioTransport {
 
     public var hardwareSerialNumber: String? { link.hardwareSerialNumber }
 
+    public var macOSUSBDeviceRegistryEntryID: UInt64? {
+        guard let registryEntryID = link.macOSUSBDeviceRegistryEntryID,
+              registryEntryID != 0 else {
+            return nil
+        }
+        return registryEntryID
+    }
+
     public func open() async throws {
         guard currentState != .connected else { return }
         var generation = connectionGeneration.advance()

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later OR GPL-3.0-or-later
 
 import Foundation
+@preconcurrency import AVFAudio
 
 /// Resume a staged startup only if the owning session survived its suspended
 /// preparation step. Keeping the check and side effect in one helper prevents a
@@ -19,7 +20,6 @@ func resumeIFDSPStartupIfCurrent<Prepared>(
 }
 
 #if os(iOS)
-@preconcurrency import AVFAudio
 
 /// Captures the TH-D75 USB Audio Class input and feeds physical PCM to Rust.
 /// The DriverKit extension owns only the two CDC interfaces, so Apple's audio
@@ -33,7 +33,8 @@ final class IFDSPAudioStreamService: IFDSPLiveStreaming {
     private(set) var configuration: IFDSPConfiguration
 
     let monitoringState: IFDSPMonitoringState = .unavailable(
-        reason: "Demodulated playback stays off until Azimuth can verify an output route that is not the radio's paired USB audio output."
+        reason: "Demodulated playback stays off until Azimuth can verify an output route "
+            + "that is not the radio's paired USB audio output."
     )
 
     let updates: AsyncStream<IFDSPLiveStreamState>
@@ -50,6 +51,10 @@ final class IFDSPAudioStreamService: IFDSPLiveStreaming {
     private var mediaResetObserver: NSObjectProtocol?
     private var activeSessionID: UUID?
     private var selectedInputUID: String?
+    private var preparedAudioInput: (
+        token: IFDSPPreparedAudioInput,
+        input: AVAudioSessionPortDescription
+    )?
 
     init(configuration: IFDSPConfiguration = .standard) {
         self.configuration = configuration
@@ -74,51 +79,63 @@ final class IFDSPAudioStreamService: IFDSPLiveStreaming {
         stateContinuation.yield(currentState)
     }
 
-    func start() async {
-        guard !currentState.isStreaming, activeSessionID == nil else { return }
+    func preflight(
+        inputProof _: IFDSPUSBInputProof
+    ) async -> IFDSPPreparedAudioInput? {
+        guard !currentState.isStreaming, activeSessionID == nil else { return nil }
         guard let processor else {
             currentState = .failed(
                 message: "The IF DSP engine is unavailable: \(processorStartupError ?? "unknown error")",
                 lastFrame: currentState.latestFrame
             )
-            return
+            return nil
         }
 
-        let sessionID = UUID()
-        activeSessionID = sessionID
+        let token = IFDSPPreparedAudioInput()
+        activeSessionID = token.id
         currentState = .requestingPermission
 
         let permissionGranted = await audioPermissionIsGranted()
-        guard activeSessionID == sessionID else { return }
+        guard activeSessionID == token.id else { return nil }
+        do {
+            try Task.checkCancellation()
+        } catch {
+            finishCapture(publishIdle: true)
+            return nil
+        }
         guard permissionGranted else {
             activeSessionID = nil
             currentState = .failed(
                 message: "Audio-input permission is off. Allow Azimuth in Settings to capture the radio's USB IF stream.",
                 lastFrame: currentState.latestFrame
             )
-            return
+            return nil
         }
 
         do {
             guard let selectedInput = try await resumeIFDSPStartupIfCurrent(
                 after: {
                     try await Task.detached { try processor.reset() }.value
+                    try Task.checkCancellation()
                 },
-                isCurrent: { self.activeSessionID == sessionID },
+                isCurrent: { self.activeSessionID == token.id },
                 prepare: { try self.prepareAudioSession() }
             ) else {
-                return
+                return nil
             }
+            try Task.checkCancellation()
             try await verifySelectedRoute(selectedInput)
-            guard activeSessionID == sessionID else { return }
+            try Task.checkCancellation()
+            guard activeSessionID == token.id else { return nil }
+            preparedAudioInput = (token, selectedInput)
             currentState = .starting(routeName: selectedInput.portName)
-            try startCapture(
-                from: selectedInput,
-                processor: processor,
-                sessionID: sessionID
-            )
+            return token
+        } catch is CancellationError {
+            guard activeSessionID == token.id else { return nil }
+            finishCapture(publishIdle: true)
+            return nil
         } catch let error as IFDSPAudioStreamError {
-            guard activeSessionID == sessionID else { return }
+            guard activeSessionID == token.id else { return nil }
             finishCapture(publishIdle: false)
             switch error {
             case .noUSBAudioInput(let availableInputs):
@@ -129,8 +146,55 @@ final class IFDSPAudioStreamService: IFDSPLiveStreaming {
                     lastFrame: currentState.latestFrame
                 )
             }
+            return nil
         } catch {
-            guard activeSessionID == sessionID else { return }
+            guard activeSessionID == token.id else { return nil }
+            finishCapture(publishIdle: false)
+            currentState = .failed(
+                message: "Live IF capture failed: \(error.localizedDescription)",
+                lastFrame: currentState.latestFrame
+            )
+            return nil
+        }
+    }
+
+    func start(preparedInput token: IFDSPPreparedAudioInput) async {
+        // A stale token must never tear down a newer preflight/capture.
+        guard activeSessionID == token.id else { return }
+        guard let preparedAudioInput,
+              preparedAudioInput.token == token,
+              let processor else {
+            if currentState.isStreaming { return }
+            finishCapture(publishIdle: false)
+            currentState = .failed(
+                message: "The prepared USB audio input expired before capture could start.",
+                lastFrame: currentState.latestFrame
+            )
+            return
+        }
+
+        do {
+            try await verifySelectedRoute(preparedAudioInput.input)
+            try Task.checkCancellation()
+            guard activeSessionID == token.id,
+                  self.preparedAudioInput?.token == token else {
+                return
+            }
+            let selectedInput = try revalidatedInput(
+                selectedUID: preparedAudioInput.input.uid
+            )
+            self.preparedAudioInput = nil
+            currentState = .starting(routeName: selectedInput.portName)
+            try startCapture(
+                from: selectedInput,
+                processor: processor,
+                sessionID: token.id
+            )
+        } catch is CancellationError {
+            guard activeSessionID == token.id else { return }
+            finishCapture(publishIdle: true)
+        } catch {
+            guard activeSessionID == token.id else { return }
             finishCapture(publishIdle: false)
             currentState = .failed(
                 message: "Live IF capture failed: \(error.localizedDescription)",
@@ -218,6 +282,20 @@ final class IFDSPAudioStreamService: IFDSPLiveStreaming {
             selected: selectedInput.portName,
             currentInputs: session.currentRoute.inputs.map(\.portName)
         )
+    }
+
+    private func revalidatedInput(
+        selectedUID: String
+    ) throws -> AVAudioSessionPortDescription {
+        let current = AVAudioSession.sharedInstance().availableInputs ?? []
+        guard let input = current.first(where: {
+            $0.portType == .usbAudio && $0.uid == selectedUID
+        }) else {
+            throw IFDSPAudioStreamError.noUSBAudioInput(
+                availableInputs: current.map(\.portName).sorted()
+            )
+        }
+        return input
     }
 
     nonisolated static func selectRadioInput(
@@ -435,6 +513,7 @@ final class IFDSPAudioStreamService: IFDSPLiveStreaming {
 
     private func finishCapture(publishIdle: Bool) {
         activeSessionID = nil
+        preparedAudioInput = nil
         pcmContinuation?.finish()
         pcmContinuation = nil
         workerTask?.cancel()
@@ -468,9 +547,16 @@ final class IFDSPAudioStreamService: IFDSPLiveStreaming {
     }
 }
 
-private struct IFDSPSourcePCMBlock: Sendable {
+#endif
+
+struct IFDSPSourcePCMBlock: Sendable {
     let samples: [Float]
     let sampleRate: Double
+
+    init(samples: [Float], sampleRate: Double) {
+        self.samples = samples
+        self.sampleRate = sampleRate
+    }
 
     init?(buffer: AVAudioPCMBuffer) {
         guard buffer.format.commonFormat == .pcmFormatFloat32,
@@ -499,7 +585,7 @@ private struct IFDSPSourcePCMBlock: Sendable {
     }
 }
 
-private final class IFDSPCaptureCounter: @unchecked Sendable {
+final class IFDSPCaptureCounter: @unchecked Sendable {
     private let lock = NSLock()
     private var statistics = IFDSPCaptureStatistics()
 
@@ -514,11 +600,26 @@ private final class IFDSPCaptureCounter: @unchecked Sendable {
     func recordDroppedBlock(sampleCount: Int) {
         lock.withLock { statistics.recordDroppedBlock(sampleCount: sampleCount) }
     }
+
+    func recordDroppedBlocks(blockCount: Int, sampleCount: Int) {
+        let blockCount = max(blockCount, 0)
+        let sampleCount = max(sampleCount, 0)
+        guard blockCount > 0 else { return }
+        lock.withLock {
+            let samplesPerBlock = sampleCount / blockCount
+            let remainder = sampleCount % blockCount
+            for index in 0..<blockCount {
+                statistics.recordDroppedBlock(
+                    sampleCount: samplesPerBlock + (index < remainder ? 1 : 0)
+                )
+            }
+        }
+    }
 }
 
 /// Keeps at most one pending main-actor publication. DSP and capture continue
 /// when rendering is temporarily busy instead of accumulating UI work.
-private final class IFDSPFrameMailbox: @unchecked Sendable {
+final class IFDSPFrameMailbox: @unchecked Sendable {
     private let lock = NSLock()
     private var latestFrame: IFDSPLiveFrame?
     private var deliveryScheduled = false
@@ -542,7 +643,7 @@ private final class IFDSPFrameMailbox: @unchecked Sendable {
     }
 }
 
-private final class IFDSPPCMRateConverter {
+final class IFDSPPCMRateConverter {
     private let converter: AVAudioConverter
     private let sourceFormat: AVAudioFormat
     private let targetFormat: AVAudioFormat
@@ -714,34 +815,485 @@ private enum IFDSPAudioStreamError: LocalizedError {
     }
 }
 
-#else
+#if os(macOS)
 
-/// macOS needs explicit CoreAudio device selection and an audio-input sandbox
-/// entitlement before it can safely avoid the built-in microphone. This
-/// implementation reports that blocker rather than analyzing the wrong input.
+struct IFDSPMacAudioReadinessPolicy: Sendable {
+    let maximumAttempts: Int
+    let retryDelayNanoseconds: UInt64
+
+    static let standard = Self(
+        maximumAttempts: 10,
+        retryDelayNanoseconds: 100_000_000
+    )
+    static let immediate = Self(maximumAttempts: 1, retryDelayNanoseconds: 0)
+}
+
+/// Captures only a HAL input whose CoreAudio UID is proven through IORegistry
+/// to belong to a TH-D75 USB device. The system default input is never read or
+/// changed, and loss of the selected device ends capture without fallback.
 @MainActor
 final class IFDSPAudioStreamService: IFDSPLiveStreaming {
-    private(set) var currentState: IFDSPLiveStreamState
+    private(set) var currentState: IFDSPLiveStreamState {
+        didSet { stateContinuation.yield(currentState) }
+    }
     private(set) var configuration: IFDSPConfiguration
-    let monitoringState: IFDSPMonitoringState
+    let monitoringState: IFDSPMonitoringState = .unavailable(
+        reason: "Demodulated playback stays off until Azimuth can verify an output route "
+            + "that is not the radio's paired USB audio output."
+    )
     let updates: AsyncStream<IFDSPLiveStreamState>
 
-    init(configuration: IFDSPConfiguration = .standard) {
+    private let stateContinuation: AsyncStream<IFDSPLiveStreamState>.Continuation
+    private let processor: IfDspProcessor?
+    private let processorStartupError: String?
+    private let audioBackend: any IFDSPMacAudioBackend
+    private let requestAudioPermission: @MainActor @Sendable () async -> Bool
+    private let readinessPolicy: IFDSPMacAudioReadinessPolicy
+    private var activeSessionID: UUID?
+    private var preparedAudioInput: (
+        token: IFDSPPreparedAudioInput,
+        device: IFDSPMacAudioDevice
+    )?
+    private var captureSession: (any IFDSPMacAudioCaptureSession)?
+    private var pcmContinuation: AsyncStream<IFDSPSourcePCMBlock>.Continuation?
+    private var workerTask: Task<Void, Never>?
+
+    init(
+        configuration: IFDSPConfiguration = .standard,
+        audioBackend: any IFDSPMacAudioBackend = IFDSPSystemMacAudioBackend(),
+        readinessPolicy: IFDSPMacAudioReadinessPolicy = .standard,
+        requestAudioPermission: @escaping @MainActor @Sendable () async -> Bool = {
+            await IFDSPAudioStreamService.audioPermissionIsGranted()
+        }
+    ) {
         self.configuration = configuration
-        let reason = "Live IF capture on macOS requires explicit CoreAudio device selection and is not enabled in this build."
-        currentState = .failed(message: reason, lastFrame: nil)
-        monitoringState = .unavailable(reason: reason)
-        updates = AsyncStream { continuation in
-            continuation.yield(.failed(message: reason, lastFrame: nil))
-            continuation.finish()
+        self.audioBackend = audioBackend
+        self.readinessPolicy = readinessPolicy
+        self.requestAudioPermission = requestAudioPermission
+        let pair = AsyncStream<IFDSPLiveStreamState>.makeStream(
+            bufferingPolicy: .bufferingNewest(1)
+        )
+        updates = pair.stream
+        stateContinuation = pair.continuation
+
+        do {
+            processor = try IfDspProcessor(configuration: configuration.coreValue)
+            processorStartupError = nil
+            currentState = .idle
+        } catch {
+            processor = nil
+            processorStartupError = error.localizedDescription
+            currentState = .failed(
+                message: "The IF DSP engine could not start: \(error.localizedDescription)",
+                lastFrame: nil
+            )
+        }
+        stateContinuation.yield(currentState)
+    }
+
+    func preflight(
+        inputProof: IFDSPUSBInputProof
+    ) async -> IFDSPPreparedAudioInput? {
+        guard !currentState.isStreaming, activeSessionID == nil else { return nil }
+        guard let processor else {
+            currentState = .failed(
+                message: "The IF DSP engine is unavailable: \(processorStartupError ?? "unknown error")",
+                lastFrame: currentState.latestFrame
+            )
+            return nil
+        }
+        guard let expectedUSBDeviceRegistryEntryID =
+            inputProof.macOSUSBDeviceRegistryEntryID else {
+            currentState = .failed(
+                message: IFDSPMacAudioError.missingMacOSUSBDeviceRegistryEntryID
+                    .localizedDescription,
+                lastFrame: currentState.latestFrame
+            )
+            return nil
+        }
+        guard expectedUSBDeviceRegistryEntryID != 0 else {
+            currentState = .failed(
+                message: IFDSPMacAudioError.invalidExpectedUSBDeviceRegistryEntryID
+                    .localizedDescription,
+                lastFrame: currentState.latestFrame
+            )
+            return nil
+        }
+
+        let token = IFDSPPreparedAudioInput()
+        activeSessionID = token.id
+        currentState = .requestingPermission
+
+        let permissionGranted = await requestAudioPermission()
+        guard activeSessionID == token.id else { return nil }
+        do {
+            try Task.checkCancellation()
+        } catch {
+            finishCapture(publishIdle: true)
+            return nil
+        }
+        guard permissionGranted else {
+            activeSessionID = nil
+            currentState = .failed(
+                message: "Audio-input permission is off. Allow Azimuth in System Settings "
+                    + "to capture the radio's USB IF stream.",
+                lastFrame: currentState.latestFrame
+            )
+            return nil
+        }
+
+        do {
+            let selected = try await waitForExactInput(
+                expectedUSBDeviceRegistryEntryID: expectedUSBDeviceRegistryEntryID,
+                expectedCATSerialNumber: inputProof.catSerialNumber,
+                sessionID: token.id
+            )
+            try await Task.detached { try processor.reset() }.value
+            try Task.checkCancellation()
+            guard activeSessionID == token.id else { return nil }
+            let revalidated = try audioBackend.revalidate(selected)
+            guard revalidated.hasSamePhysicalIdentity(as: selected) else {
+                throw IFDSPMacAudioError.deviceIdentityChanged
+            }
+            try requireCaptureReady(revalidated)
+            try Task.checkCancellation()
+            guard activeSessionID == token.id else { return nil }
+
+            preparedAudioInput = (token, revalidated)
+            currentState = .starting(routeName: revalidated.name)
+            return token
+        } catch is CancellationError {
+            guard activeSessionID == token.id else { return nil }
+            finishCapture(publishIdle: true)
+            return nil
+        } catch let error as IFDSPMacAudioError {
+            guard activeSessionID == token.id else { return nil }
+            finishCapture(publishIdle: false)
+            switch error {
+            case .noVerifiedTHD75Input(
+                let availableInputs,
+                let candidateRejections
+            ) where candidateRejections.isEmpty:
+                currentState = .waitingForUSBAudio(availableInputs: availableInputs)
+            default:
+                currentState = .failed(
+                    message: error.localizedDescription,
+                    lastFrame: currentState.latestFrame
+                )
+            }
+            return nil
+        } catch {
+            guard activeSessionID == token.id else { return nil }
+            finishCapture(publishIdle: false)
+            currentState = .failed(
+                message: "Live IF capture failed: \(error.localizedDescription)",
+                lastFrame: currentState.latestFrame
+            )
+            return nil
         }
     }
 
-    func start() async {}
-    func stop() {}
-    func setConfiguration(_ configuration: IFDSPConfiguration) async {
-        self.configuration = configuration
+    func start(preparedInput token: IFDSPPreparedAudioInput) async {
+        guard activeSessionID == token.id else { return }
+        guard let preparedAudioInput,
+              preparedAudioInput.token == token,
+              let processor else {
+            if currentState.isStreaming { return }
+            finishCapture(publishIdle: false)
+            currentState = .failed(
+                message: "The prepared TH-D75 USB audio input expired before capture could start.",
+                lastFrame: currentState.latestFrame
+            )
+            return
+        }
+        self.preparedAudioInput = nil
+
+        do {
+            try Task.checkCancellation()
+            let revalidated = try audioBackend.revalidate(
+                preparedAudioInput.device
+            )
+            guard revalidated.hasSamePhysicalIdentity(
+                as: preparedAudioInput.device
+            ) else {
+                throw IFDSPMacAudioError.deviceIdentityChanged
+            }
+            try requireCaptureReady(revalidated)
+            try Task.checkCancellation()
+            guard activeSessionID == token.id else { return }
+            currentState = .starting(routeName: revalidated.name)
+            try startCapture(
+                from: revalidated,
+                processor: processor,
+                sessionID: token.id
+            )
+        } catch is CancellationError {
+            guard activeSessionID == token.id else { return }
+            finishCapture(publishIdle: true)
+        } catch {
+            guard activeSessionID == token.id else { return }
+            finishCapture(publishIdle: false)
+            currentState = .failed(
+                message: error.localizedDescription,
+                lastFrame: currentState.latestFrame
+            )
+        }
     }
+
+    func stop() {
+        finishCapture(publishIdle: true)
+    }
+
+    func setConfiguration(_ configuration: IFDSPConfiguration) async {
+        guard let processor else {
+            currentState = .failed(
+                message: "The IF DSP engine is unavailable: \(processorStartupError ?? "unknown error")",
+                lastFrame: currentState.latestFrame
+            )
+            return
+        }
+        do {
+            try await Task.detached {
+                try processor.setConfiguration(configuration: configuration.coreValue)
+            }.value
+            self.configuration = configuration
+        } catch {
+            currentState = .failed(
+                message: "The IF DSP configuration was rejected: \(error.localizedDescription)",
+                lastFrame: currentState.latestFrame
+            )
+        }
+    }
+
+    private func waitForExactInput(
+        expectedUSBDeviceRegistryEntryID: UInt64,
+        expectedCATSerialNumber: String,
+        sessionID: UUID
+    ) async throws -> IFDSPMacAudioDevice {
+        let maximumAttempts = max(readinessPolicy.maximumAttempts, 1)
+        var lastRetryableError: IFDSPMacAudioError?
+        for attempt in 0..<maximumAttempts {
+            try Task.checkCancellation()
+            guard activeSessionID == sessionID else {
+                throw CancellationError()
+            }
+            do {
+                let inventory = try audioBackend.availableDeviceInventory()
+                guard inventory.queryFailures.isEmpty else {
+                    throw IFDSPMacAudioError.audioDeviceInventoryIncomplete(
+                        queryFailures: inventory.queryFailures
+                    )
+                }
+                return try IFDSPMacAudioDeviceSelector.selectTHD75Input(
+                    from: inventory.devices,
+                    expectedUSBDeviceRegistryEntryID:
+                        expectedUSBDeviceRegistryEntryID,
+                    expectedCATSerialNumber: expectedCATSerialNumber
+                )
+            } catch let error as IFDSPMacAudioError {
+                guard error.isRetryableAudioReadinessFailure else {
+                    throw error
+                }
+                lastRetryableError = error
+            }
+            if attempt + 1 < maximumAttempts,
+               readinessPolicy.retryDelayNanoseconds > 0 {
+                try await Task.sleep(
+                    nanoseconds: readinessPolicy.retryDelayNanoseconds
+                )
+                try Task.checkCancellation()
+            }
+        }
+        throw lastRetryableError
+            ?? IFDSPMacAudioError.noVerifiedTHD75Input(
+                availableInputs: [],
+                candidateRejections: []
+            )
+    }
+
+    private func requireCaptureReady(
+        _ device: IFDSPMacAudioDevice
+    ) throws {
+        let reasons = device.captureRejectionReasons
+        guard reasons.isEmpty else {
+            throw IFDSPMacAudioError.expectedRadioAudioNotReady(
+                name: device.name,
+                reasons: reasons
+            )
+        }
+    }
+
+    private func startCapture(
+        from device: IFDSPMacAudioDevice,
+        processor: IfDspProcessor,
+        sessionID: UUID
+    ) throws {
+        let route = IFDSPInputRoute(
+            name: device.name,
+            kind: .usbAudio,
+            sourceSampleRate: device.sampleRate,
+            sourceChannelCount: device.inputChannelCount
+        )
+        let captureCounter = IFDSPCaptureCounter()
+        let frameMailbox = IFDSPFrameMailbox()
+        let pair = AsyncStream<IFDSPSourcePCMBlock>.makeStream(
+            bufferingPolicy: .bufferingNewest(8)
+        )
+        pcmContinuation = pair.continuation
+        workerTask = makeWorker(
+            stream: pair.stream,
+            processor: processor,
+            route: route,
+            captureCounter: captureCounter,
+            frameMailbox: frameMailbox,
+            sessionID: sessionID
+        )
+
+        captureSession = try audioBackend.startCapture(
+            device: device,
+            receive: { block in
+                captureCounter.recordSourceBlock(sampleCount: block.samples.count)
+                switch pair.continuation.yield(block) {
+                case .enqueued:
+                    break
+                case .dropped(let droppedBlock):
+                    captureCounter.recordDroppedBlock(
+                        sampleCount: droppedBlock.samples.count
+                    )
+                case .terminated:
+                    break
+                @unknown default:
+                    break
+                }
+            },
+            overrun: { blockCount, sampleCount in
+                captureCounter.recordDroppedBlocks(
+                    blockCount: blockCount,
+                    sampleCount: sampleCount
+                )
+            },
+            deviceLost: { [weak self] reason in
+                Task { @MainActor [weak self] in
+                    guard self?.activeSessionID == sessionID else { return }
+                    let lastFrame = self?.currentState.latestFrame
+                    self?.finishCapture(publishIdle: false)
+                    self?.currentState = .paused(reason: reason, lastFrame: lastFrame)
+                }
+            },
+            captureFailed: { [weak self] reason in
+                Task { @MainActor [weak self] in
+                    guard self?.activeSessionID == sessionID else { return }
+                    let lastFrame = self?.currentState.latestFrame
+                    self?.finishCapture(publishIdle: false)
+                    self?.currentState = .failed(message: reason, lastFrame: lastFrame)
+                }
+            }
+        )
+        currentState = .streaming(route: route, frame: nil)
+    }
+
+    private func makeWorker(
+        stream: AsyncStream<IFDSPSourcePCMBlock>,
+        processor: IfDspProcessor,
+        route: IFDSPInputRoute,
+        captureCounter: IFDSPCaptureCounter,
+        frameMailbox: IFDSPFrameMailbox,
+        sessionID: UUID
+    ) -> Task<Void, Never> {
+        Task.detached(priority: .userInitiated) { [weak self] in
+            var rateConverter: IFDSPPCMRateConverter?
+            var latestSpectrum: IFDSPSpectrum?
+            var batcher = IFDSPPCMBlockBatcher(targetSampleCount: 4_800)
+            do {
+                for await sourceBlock in stream {
+                    guard !Task.isCancelled else { return }
+                    let samples = try IFDSPPCMRateConverter.convert(
+                        sourceBlock,
+                        cachedConverter: &rateConverter
+                    )
+                    guard !samples.isEmpty else { continue }
+                    batcher.append(samples)
+                    while let batch = batcher.nextBatch() {
+                        guard !Task.isCancelled else { return }
+                        let coreFrame = try processor.processPcm(samples: batch)
+                        if let spectrum = coreFrame.spectrum {
+                            latestSpectrum = spectrum.domainValue
+                        }
+                        let capture = captureCounter.snapshot
+                        let frame = IFDSPLiveFrame(
+                            sequence: coreFrame.sequence,
+                            inputSampleCount: coreFrame.inputSampleCount,
+                            inputLevelDBFS: Double(coreFrame.inputLevelDbfs),
+                            outputLevelDBFS: Double(coreFrame.outputLevelDbfs),
+                            spectrum: latestSpectrum,
+                            clippedSampleCount: coreFrame.clippedSampleCount,
+                            sourceBlockCount: capture.sourceBlockCount,
+                            sourceSampleCount: capture.sourceSampleCount,
+                            droppedBlockCount: capture.droppedBlockCount,
+                            droppedSampleCount: capture.droppedSampleCount,
+                            capturedAt: Date()
+                        )
+                        guard frameMailbox.offer(frame) else { continue }
+                        Task { @MainActor [weak self] in
+                            guard let frame = frameMailbox.takeLatest(),
+                                  self?.activeSessionID == sessionID else { return }
+                            self?.currentState = .streaming(route: route, frame: frame)
+                        }
+                    }
+                }
+                guard !Task.isCancelled else { return }
+                Task { @MainActor [weak self] in
+                    guard self?.activeSessionID == sessionID else { return }
+                    let lastFrame = self?.currentState.latestFrame
+                    self?.finishCapture(publishIdle: false)
+                    self?.currentState = .paused(
+                        reason: "The TH-D75 USB audio input stopped delivering PCM.",
+                        lastFrame: lastFrame
+                    )
+                }
+            } catch {
+                Task { @MainActor [weak self] in
+                    guard self?.activeSessionID == sessionID else { return }
+                    let lastFrame = self?.currentState.latestFrame
+                    self?.finishCapture(publishIdle: false)
+                    self?.currentState = .failed(
+                        message: "IF DSP processing stopped: \(error.localizedDescription)",
+                        lastFrame: lastFrame
+                    )
+                }
+            }
+        }
+    }
+
+    private func finishCapture(publishIdle: Bool) {
+        activeSessionID = nil
+        preparedAudioInput = nil
+        pcmContinuation?.finish()
+        pcmContinuation = nil
+        workerTask?.cancel()
+        workerTask = nil
+        captureSession?.stop()
+        captureSession = nil
+        if publishIdle { currentState = .idle }
+    }
+
+    private static func audioPermissionIsGranted() async -> Bool {
+        switch AVAudioApplication.shared.recordPermission {
+        case .granted:
+            return true
+        case .denied:
+            return false
+        case .undetermined:
+            return await withCheckedContinuation { continuation in
+                AVAudioApplication.requestRecordPermission { granted in
+                    continuation.resume(returning: granted)
+                }
+            }
+        @unknown default:
+            return false
+        }
+    }
+
 }
 
 #endif

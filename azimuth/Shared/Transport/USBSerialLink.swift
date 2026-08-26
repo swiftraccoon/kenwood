@@ -211,6 +211,9 @@ public protocol AzimuthUSBSerialLink: Sendable {
     var connectionDescription: String { get }
     /// USB descriptor serial for the currently opened physical device.
     var hardwareSerialNumber: String? { get }
+    /// IORegistry ID of the currently opened physical USB-device ancestor on
+    /// macOS. This is nil for DriverKit and whenever the link is closed.
+    var macOSUSBDeviceRegistryEntryID: UInt64? { get }
 }
 
 public extension AzimuthUSBSerialLink {
@@ -220,4 +223,5 @@ public extension AzimuthUSBSerialLink {
     func commServicePresent() -> Bool? { nil }
     var connectionDescription: String { "USB-C" }
     var hardwareSerialNumber: String? { nil }
+    var macOSUSBDeviceRegistryEntryID: UInt64? { nil }
 }

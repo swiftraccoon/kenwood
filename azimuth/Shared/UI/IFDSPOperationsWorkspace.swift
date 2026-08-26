@@ -45,7 +45,7 @@ struct IFDSPWorkspace: View {
             if case .active = state { synchronizeFrequencyEntry() }
         }
         .alert(
-            "IF-DSP operation",
+            "IF-DSP Couldn’t Continue",
             isPresented: Binding(
                 get: { model.operationError != nil },
                 set: { if !$0 { model.dismissOperationError() } }
@@ -77,6 +77,31 @@ struct IFDSPWorkspace: View {
                     routeMetrics
                 }
             }
+        }
+        .alert(
+            model.ifDSPDVGatewayRecoveryAlert?.title ?? "Inspect DV Gateway?",
+            isPresented: Binding(
+                get: { model.ifDSPDVGatewayRecoveryAlert != nil },
+                set: { if !$0 { model.dismissIFDSPDVGatewayRecoveryAlert() } }
+            )
+        ) {
+            if model.ifDSPDVGatewayRecoveryAlert?.automaticRecoveryAvailable == true {
+                Button("Inspect DV Gateway and Start IF-DSP") {
+                    Task { await model.inspectDVGatewayAndStartIFDSP() }
+                }
+            }
+            Button(
+                model.ifDSPDVGatewayRecoveryAlert?.dismissalButtonTitle
+                    ?? "Dismiss",
+                role: .cancel
+            ) {
+                model.dismissIFDSPDVGatewayRecoveryAlert()
+            }
+        } message: {
+            Text(
+                model.ifDSPDVGatewayRecoveryAlert?.message
+                    ?? "Azimuth needs your approval before inspecting or changing Menu 650."
+            )
         }
     }
 
@@ -120,7 +145,9 @@ struct IFDSPWorkspace: View {
 
     private var captureButton: some View {
         Button {
-            if captureCanStop {
+            if model.radioConnectionActivity == .ifDSPGatewayRecovery {
+                Task { await model.cancelRadioConnection() }
+            } else if captureCanStop {
                 Task { await model.stopIFDSP() }
             } else {
                 Task { await model.startIFDSP() }
@@ -366,8 +393,21 @@ struct IFDSPWorkspace: View {
                                 || model.ifDSPModeState.reservesRadioState
                                 || !model.radioState.capabilities.settingRead.isAvailable
                         )
+                        .help(
+                            "Reads the complete settings snapshot through MCP programming mode. "
+                                + "Exiting MCP restarts the TH-D75; Azimuth then reconnects."
+                        )
                     }
                 }
+
+                Label(
+                    "The initial connection intentionally defers the full settings snapshot. "
+                        + "Read Radio enters MCP programming mode; exiting MCP restarts the "
+                        + "TH-D75, and Azimuth reconnects automatically.",
+                    systemImage: "arrow.trianglehead.2.clockwise.rotate.90"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
 
                 LazyVGrid(
                     columns: [GridItem(.adaptive(minimum: 220), spacing: 10)],
@@ -433,7 +473,14 @@ struct IFDSPWorkspace: View {
 
     @ViewBuilder
     private var captureStatusPill: some View {
-        switch model.ifDSPModeState {
+        if model.radioConnectionActivity == .ifDSPGatewayRecovery {
+            AzimuthStatusPill(
+                title: "RECOVERING RADIO",
+                symbol: "arrow.clockwise.circle.fill",
+                color: AzimuthPalette.caution
+            )
+        } else {
+            switch model.ifDSPModeState {
         case .preparing:
             AzimuthStatusPill(
                 title: "CONFIGURING RADIO",
@@ -466,6 +513,7 @@ struct IFDSPWorkspace: View {
             )
         case .inactive, .active:
             audioStatusPill
+            }
         }
     }
 
@@ -506,10 +554,13 @@ struct IFDSPWorkspace: View {
     }
 
     private var captureDetail: String {
+        if model.radioConnectionActivity == .ifDSPGatewayRecovery {
+            return "Inspecting Menu 650, changing it only if needed, and proving the same TH-D75 over USB-C before IF-DSP begins."
+        }
         switch model.ifDSPModeState {
         case .preparing:
-            return "Saving the current radio state and readback-verifying Band B USB IF "
-                + "output before audio capture."
+            return "Proving the exact USB-C radio, saving its current state, and "
+                + "readback-verifying Band B USB IF output before audio capture."
         case .active(let status):
             return "Band B is reserved at \(formatFrequencyMHz(status.bandBFrequencyHz)); "
                 + "USB IF center is \(formatFrequencyKHz(status.ifCenterHz)). "
@@ -572,11 +623,15 @@ struct IFDSPWorkspace: View {
     }
 
     private var captureCanStop: Bool {
+        if model.radioConnectionActivity == .ifDSPGatewayRecovery { return true }
         if model.ifDSPModeState.reservesRadioState { return true }
         return model.ifDSPState.isStreaming
     }
 
     private var captureButtonTitle: String {
+        if model.radioConnectionActivity == .ifDSPGatewayRecovery {
+            return "Stop Recovery"
+        }
         switch model.ifDSPModeState {
         case .preparing:
             return "Configuring Radio"

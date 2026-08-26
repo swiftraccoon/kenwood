@@ -188,8 +188,17 @@ struct APRSOperationalState: Equatable, Sendable {
 protocol APRSControlling: AnyObject {
     var currentAPRSState: APRSOperationalState { get }
     var aprsUpdates: AsyncStream<APRSOperationalState> { get }
+    /// Whether the current authenticated CAT owner can perform the explicitly
+    /// approved Menu 983/Menu 506/Menu 650 recovery retained by a refused start.
+    var automaticAPRSDVGatewayRecoveryAvailable: Bool { get }
 
     func startAPRS(_ configuration: APRSSessionConfiguration) async throws
+    /// Inspect Menu 983, Menu 506, and Menu 650 over the retained CAT owner,
+    /// change Menu 650 only when needed, reconnect the same endpoint, and retry
+    /// the refused configuration exactly once with the freshly verified band.
+    func recoverDVGatewayAndRetryAPRS() async throws
+    /// Discard a refused-start recovery offer without touching the radio.
+    func discardAPRSDVGatewayRecovery()
     func stopAPRS() async throws
     func sendAPRSMessage(
         addressee: String,
@@ -201,6 +210,18 @@ protocol APRSControlling: AnyObject {
         longitude: Double,
         comment: String
     ) async throws -> APRSActivity
+}
+
+extension APRSControlling {
+    var automaticAPRSDVGatewayRecoveryAvailable: Bool { false }
+
+    func recoverDVGatewayAndRetryAPRS() async throws {
+        throw RadioControllerError.capabilityUnavailable(
+            "Automatic APRS radio-mode recovery is unavailable for this connection."
+        )
+    }
+
+    func discardAPRSDVGatewayRecovery() {}
 }
 
 @MainActor

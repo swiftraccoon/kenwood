@@ -36,7 +36,11 @@ public enum AzimuthRadioSelectionError: LocalizedError, Sendable, Equatable {
     case differentUSBRadioAtRetainedPath(expected: String, actual: String?)
     case resolvedBluetoothAddressUnavailable
     case bluetoothMmdvmUSBFallbackUnavailable(attachedUSBCount: Int)
-    case bluetoothMmdvmUSBIdentityUnavailable
+    case bluetoothMmdvmOriginalBluetoothUnavailable
+    case bluetoothMmdvmUSBRoutingContextUnavailable
+    case bluetoothReconnectContextUnavailable
+    case ifDSPOriginalBluetoothUnavailable
+    case ifDSPUSBHandoffContextUnavailable
 
     public var errorDescription: String? {
         switch self {
@@ -52,8 +56,16 @@ public enum AzimuthRadioSelectionError: LocalizedError, Sendable, Equatable {
             "The same-radio Bluetooth link opened without reporting its exact paired address. Azimuth closed it rather than retaining an ambiguous connection."
         case .bluetoothMmdvmUSBFallbackUnavailable(let attachedUSBCount):
             "Automatic USB-C handoff requires exactly one attached TH-D75; found \(attachedUSBCount). Choose the intended USB-C endpoint in the connection picker."
-        case .bluetoothMmdvmUSBIdentityUnavailable:
-            "The sole attached USB-C radio has no stable USB serial identity, so Azimuth will not select it automatically."
+        case .bluetoothMmdvmOriginalBluetoothUnavailable:
+            "DV Gateway USB-C routing requires the exact Bluetooth address which positively answered MMDVM. Refresh connections and select that Bluetooth endpoint again."
+        case .bluetoothMmdvmUSBRoutingContextUnavailable:
+            "The exact Bluetooth endpoint retained for DV Gateway USB-C routing is no longer available. Retry from the Bluetooth MMDVM prompt."
+        case .bluetoothReconnectContextUnavailable:
+            "The exact Bluetooth endpoint used before the radio restart is no longer selected. Reconnect that Bluetooth endpoint before retrying."
+        case .ifDSPOriginalBluetoothUnavailable:
+            "IF-DSP USB-C handoff requires the exact Bluetooth endpoint from the connected CAT session."
+        case .ifDSPUSBHandoffContextUnavailable:
+            "The retained IF-DSP USB-C handoff context is no longer available. Retry from the connected Bluetooth CAT session."
         }
     }
 }
@@ -102,12 +114,18 @@ private final class AzimuthSelectedDeviceSlot: @unchecked Sendable {
 /// only while disconnected, stale child state is generation-fenced, and the
 /// same-radio fallback delegates exact serial qualification to the core.
 public actor AzimuthSelectableRadioTransport: AzimuthRadioTransport,
-    AzimuthSameRadioBluetoothSelecting, AzimuthBluetoothMMDVMUSBSelecting
+    AzimuthSameRadioBluetoothSelecting, AzimuthSameRadioUSBRefreshing,
+    AzimuthBluetoothMMDVMUSBSelecting, AzimuthIFDSPUSBSelecting
 {
     private struct CleanupSlot: Sendable {
         let id: UInt64
         let task: Task<Void, Never>
         let finalState: AzimuthRadioTransportState
+    }
+
+    private struct IFDSPUSBHandoffContext: Sendable {
+        let bluetoothEndpoint: AzimuthBluetoothEndpoint
+        let usbEndpoint: AzimuthUSBEndpoint
     }
 
     public nonisolated let stateStream: AsyncStream<AzimuthRadioTransportState>
@@ -122,6 +140,9 @@ public actor AzimuthSelectableRadioTransport: AzimuthRadioTransport,
 
     private var selected: AzimuthTransportSelection?
     private var retainedUSBEndpoint: AzimuthUSBEndpoint?
+    private var retainedBluetoothMmdvmRoutingEndpoint: AzimuthBluetoothEndpoint?
+    private var retainedBluetoothReconnectEndpoint: AzimuthBluetoothEndpoint?
+    private var retainedIFDSPUSBHandoff: IFDSPUSBHandoffContext?
     private var lastBluetoothEndpoints: [AzimuthBluetoothEndpoint] = []
     private var endpointDiscoveryGeneration: UInt64 = 0
     private var activeTransport: (any AzimuthRadioTransport)?
@@ -129,6 +150,7 @@ public actor AzimuthSelectableRadioTransport: AzimuthRadioTransport,
     private var stateObserver: Task<Void, Never>?
     private var currentState: AzimuthRadioTransportState = .disconnected
     private var currentHardwareSerialNumber: String?
+    private var currentMacOSUSBDeviceRegistryEntryID: UInt64?
     private var generation: UInt64 = 0
     private var cleanupSlot: CleanupSlot?
     private var nextCleanupID: UInt64 = 0
@@ -191,6 +213,10 @@ public actor AzimuthSelectableRadioTransport: AzimuthRadioTransport,
     public var state: AzimuthRadioTransportState { currentState }
 
     public var hardwareSerialNumber: String? { currentHardwareSerialNumber }
+
+    public var macOSUSBDeviceRegistryEntryID: UInt64? {
+        currentMacOSUSBDeviceRegistryEntryID
+    }
 
     /// Returns USB followed by every device in one bounded paired-device
     /// inventory. Bluetooth display names are presentation only; connection
@@ -265,6 +291,9 @@ public actor AzimuthSelectableRadioTransport: AzimuthRadioTransport,
         let usb = usbFactory.availableEndpoints()
         try Self.validateUSBEndpoints(usb)
         if let endpoint = usb.first(where: { $0.id == id }) {
+            retainedIFDSPUSBHandoff = nil
+            retainedBluetoothMmdvmRoutingEndpoint = nil
+            retainedBluetoothReconnectEndpoint = nil
             selected = .usb(endpoint)
             retainedUSBEndpoint = endpoint
             selectedDeviceSlot.replace(with: endpoint.device)
@@ -274,6 +303,9 @@ public actor AzimuthSelectableRadioTransport: AzimuthRadioTransport,
         guard let endpoint = lastBluetoothEndpoints.first(where: { $0.id == id }) else {
             throw RadioEndpointSelectionError.invalidEndpoint(id: id)
         }
+        retainedIFDSPUSBHandoff = nil
+        retainedBluetoothMmdvmRoutingEndpoint = nil
+        retainedBluetoothReconnectEndpoint = nil
         if let serialNumber = endpoint.verifiedCATSerialNumber {
             selected = .qualifiedBluetooth(
                 endpoint,
@@ -305,6 +337,9 @@ public actor AzimuthSelectableRadioTransport: AzimuthRadioTransport,
                 serialNumber: expectedSerialNumber
             )
         }
+        retainedIFDSPUSBHandoff = nil
+        retainedBluetoothMmdvmRoutingEndpoint = nil
+        retainedBluetoothReconnectEndpoint = nil
         if let retained = retainedMatches.first {
             selected = .qualifiedBluetooth(
                 retained,
@@ -332,6 +367,42 @@ public actor AzimuthSelectableRadioTransport: AzimuthRadioTransport,
         _ = try await selectBluetooth(
             matchingSerialNumber: expectedSerialNumber
         )
+    }
+
+    func qualifySelectedBluetoothForReconnect(
+        expectedSerialNumber: String
+    ) async throws {
+        guard activeTransport == nil, cleanupSlot == nil else {
+            throw AzimuthRadioSelectionError.transportIsOpen
+        }
+        guard let retained = retainedBluetoothReconnectEndpoint else {
+            throw AzimuthRadioSelectionError.bluetoothReconnectContextUnavailable
+        }
+        defer { retainedBluetoothReconnectEndpoint = nil }
+        let selectedEndpoint: AzimuthBluetoothEndpoint
+        switch selected {
+        case .bluetooth(let endpoint),
+             .qualifiedBluetooth(let endpoint, _):
+            selectedEndpoint = endpoint
+        case .usb, .bluetoothMatchingUSBSerial, nil:
+            throw AzimuthRadioSelectionError.bluetoothReconnectContextUnavailable
+        }
+        guard selectedEndpoint.id == retained.id else {
+            throw AzimuthRadioSelectionError.bluetoothReconnectContextUnavailable
+        }
+        let qualified = retainQualifiedBluetoothEndpoint(
+            AzimuthBluetoothEndpoint(
+                address: retained.address,
+                displayName: retained.displayName,
+                verifiedCATSerialNumber: expectedSerialNumber
+            )
+        )
+        selected = .qualifiedBluetooth(
+            qualified,
+            expectedUSBSerial: expectedSerialNumber
+        )
+        selectedDeviceSlot.replace(with: qualified.device)
+        updateState(.disconnected)
     }
 
     func knownQualifiedBluetoothAddress(
@@ -378,25 +449,137 @@ public actor AzimuthSelectableRadioTransport: AzimuthRadioTransport,
                 serialNumber: expectedSerialNumber
             )
         }
+        retainedIFDSPUSBHandoff = nil
+        retainedBluetoothMmdvmRoutingEndpoint = nil
+        retainedBluetoothReconnectEndpoint = nil
         retainedUSBEndpoint = current
         selected = .usb(current)
         selectedDeviceSlot.replace(with: current.device)
         updateState(.disconnected)
     }
 
-    /// Return whether one exact, serial-identified USB endpoint is available
-    /// for a consented handoff from Bluetooth MMDVM mode.
-    func hasSoleIdentifiedUSBEndpoint() async throws -> Bool {
+    func refreshSelectedUSBForSameRadioRecovery() async throws -> Bool {
+        guard activeTransport == nil, cleanupSlot == nil else {
+            throw AzimuthRadioSelectionError.transportIsOpen
+        }
+        guard case .usb(let retained) = selected,
+              retainedUSBEndpoint == retained else {
+            return false
+        }
         let refreshed = usbFactory.availableEndpoints()
         try Self.validateUSBEndpoints(refreshed)
-        return refreshed.count == 1 && refreshed.first?.usbSerialNumber != nil
+        guard let endpoint = Self.refreshedRetainedUSBEndpoint(
+            retained: retained,
+            available: refreshed
+        ) else {
+            return false
+        }
+        retainedUSBEndpoint = endpoint
+        selected = .usb(endpoint)
+        selectedDeviceSlot.replace(with: endpoint.device)
+        updateState(.disconnected)
+        return true
+    }
+
+    /// Return whether one exact, verified TH-D75 USB endpoint is available for
+    /// a consented handoff from a Bluetooth link that answered MMDVM.
+    func hasSoleVerifiedUSBEndpoint() async throws -> Bool {
+        let refreshed = usbFactory.availableEndpoints()
+        try Self.validateUSBEndpoints(refreshed)
+        return refreshed.count == 1
+    }
+
+    func retainSoleIFDSPUSBEndpoint() async throws -> Bool {
+        guard cleanupSlot == nil else {
+            throw AzimuthRadioSelectionError.transportIsOpen
+        }
+        let bluetoothEndpoint: AzimuthBluetoothEndpoint
+        switch selected {
+        case .bluetooth(let endpoint), .qualifiedBluetooth(let endpoint, _):
+            bluetoothEndpoint = endpoint
+        case .usb, .bluetoothMatchingUSBSerial, nil:
+            retainedIFDSPUSBHandoff = nil
+            throw AzimuthRadioSelectionError.ifDSPOriginalBluetoothUnavailable
+        }
+        let refreshed = usbFactory.availableEndpoints()
+        try Self.validateUSBEndpoints(refreshed)
+        guard refreshed.count == 1, let endpoint = refreshed.first else {
+            retainedIFDSPUSBHandoff = nil
+            return false
+        }
+        retainedIFDSPUSBHandoff = IFDSPUSBHandoffContext(
+            bluetoothEndpoint: bluetoothEndpoint,
+            usbEndpoint: endpoint
+        )
+        return true
+    }
+
+    func selectRetainedIFDSPUSBEndpoint() async throws -> Bool {
+        guard activeTransport == nil, cleanupSlot == nil else {
+            throw AzimuthRadioSelectionError.transportIsOpen
+        }
+        guard let context = retainedIFDSPUSBHandoff else {
+            throw AzimuthRadioSelectionError.ifDSPUSBHandoffContextUnavailable
+        }
+        let refreshed = usbFactory.availableEndpoints()
+        try Self.validateUSBEndpoints(refreshed)
+        guard let endpoint = Self.refreshedRetainedUSBEndpoint(
+            retained: context.usbEndpoint,
+            available: refreshed
+        ) else {
+            return false
+        }
+        retainedUSBEndpoint = endpoint
+        selected = .usb(endpoint)
+        selectedDeviceSlot.replace(with: endpoint.device)
+        updateState(.disconnected)
+        return true
+    }
+
+    func restoreRetainedIFDSPBluetoothEndpoint(
+        expectedSerialNumber: String
+    ) async throws {
+        guard activeTransport == nil, cleanupSlot == nil else {
+            throw AzimuthRadioSelectionError.transportIsOpen
+        }
+        guard let context = retainedIFDSPUSBHandoff else {
+            throw AzimuthRadioSelectionError.ifDSPUSBHandoffContextUnavailable
+        }
+        let qualified = retainQualifiedBluetoothEndpoint(
+            AzimuthBluetoothEndpoint(
+                address: context.bluetoothEndpoint.address,
+                displayName: context.bluetoothEndpoint.displayName,
+                verifiedCATSerialNumber: expectedSerialNumber
+            )
+        )
+        selected = .qualifiedBluetooth(
+            qualified,
+            expectedUSBSerial: expectedSerialNumber
+        )
+        selectedDeviceSlot.replace(with: qualified.device)
+        retainedIFDSPUSBHandoff = nil
+        updateState(.disconnected)
+    }
+
+    func finishRetainedIFDSPUSBHandoff() async {
+        retainedIFDSPUSBHandoff = nil
     }
 
     /// Select the sole exact USB endpoint without opening or changing the
-    /// radio. The next ordinary connection re-proves CAT model and serial.
-    func selectSoleUSBForBluetoothMMDVM() async throws -> String {
+    /// radio. The exact Bluetooth endpoint currently selected is retained for
+    /// the separately consented Menu 985 / Menu 650 routing lifecycle. The next
+    /// USB operation proves CAT model and obtains the authoritative radio
+    /// serial with `AE`; no USB descriptor serial is required.
+    func selectSoleUSBForBluetoothMMDVM() async throws {
         guard activeTransport == nil, cleanupSlot == nil else {
             throw AzimuthRadioSelectionError.transportIsOpen
+        }
+        let originalBluetoothEndpoint: AzimuthBluetoothEndpoint
+        switch selected {
+        case .bluetooth(let endpoint), .qualifiedBluetooth(let endpoint, _):
+            originalBluetoothEndpoint = endpoint
+        case .usb, .bluetoothMatchingUSBSerial, nil:
+            throw AzimuthRadioSelectionError.bluetoothMmdvmOriginalBluetoothUnavailable
         }
         let refreshed = usbFactory.availableEndpoints()
         try Self.validateUSBEndpoints(refreshed)
@@ -405,14 +588,69 @@ public actor AzimuthSelectableRadioTransport: AzimuthRadioTransport,
                 attachedUSBCount: refreshed.count
             )
         }
-        guard let serialNumber = endpoint.usbSerialNumber else {
-            throw AzimuthRadioSelectionError.bluetoothMmdvmUSBIdentityUnavailable
-        }
+        retainedIFDSPUSBHandoff = nil
+        retainedBluetoothMmdvmRoutingEndpoint = originalBluetoothEndpoint
         retainedUSBEndpoint = endpoint
         selected = .usb(endpoint)
         selectedDeviceSlot.replace(with: endpoint.device)
         updateState(.disconnected)
-        return serialNumber
+    }
+
+    /// Select the exact Bluetooth address retained before USB routing and make
+    /// the next open prove its CAT serial equals the serial obtained from CAT
+    /// on the retained exact USB endpoint before routing.
+    ///
+    /// No paired-device scan or display-name matching is permitted here. A
+    /// different physical radio at the address fails inside the qualified exact
+    /// Bluetooth link before its byte stream reaches the controller.
+    func selectOriginalBluetoothAfterUSBRouting(
+        expectedSerialNumber: String
+    ) async throws {
+        guard activeTransport == nil, cleanupSlot == nil else {
+            throw AzimuthRadioSelectionError.transportIsOpen
+        }
+        guard let original = retainedBluetoothMmdvmRoutingEndpoint else {
+            throw AzimuthRadioSelectionError.bluetoothMmdvmUSBRoutingContextUnavailable
+        }
+        guard case .usb(let selectedUSB) = selected,
+              selectedUSB == retainedUSBEndpoint else {
+            throw AzimuthRadioSelectionError.bluetoothMmdvmUSBRoutingContextUnavailable
+        }
+
+        retainedIFDSPUSBHandoff = nil
+        let qualified = retainQualifiedBluetoothEndpoint(
+            AzimuthBluetoothEndpoint(
+                address: original.address,
+                displayName: original.displayName,
+                verifiedCATSerialNumber: expectedSerialNumber
+            )
+        )
+        selected = .qualifiedBluetooth(
+            qualified,
+            expectedUSBSerial: expectedSerialNumber
+        )
+        selectedDeviceSlot.replace(with: qualified.device)
+        retainedBluetoothMmdvmRoutingEndpoint = nil
+        updateState(.disconnected)
+    }
+
+    /// Restore the exact raw Bluetooth endpoint after a failure which is known
+    /// to precede the USB mutation gate.
+    ///
+    /// The MMDVM response did not contain a unit serial, so this deliberately
+    /// does not attach the USB descriptor serial as if it had been proved.
+    func restoreOriginalBluetoothAfterUSBRoutingFailure() async throws {
+        guard activeTransport == nil, cleanupSlot == nil else {
+            throw AzimuthRadioSelectionError.transportIsOpen
+        }
+        guard let original = retainedBluetoothMmdvmRoutingEndpoint else {
+            throw AzimuthRadioSelectionError.bluetoothMmdvmUSBRoutingContextUnavailable
+        }
+        retainedIFDSPUSBHandoff = nil
+        selected = .bluetooth(original)
+        selectedDeviceSlot.replace(with: original.device)
+        retainedBluetoothMmdvmRoutingEndpoint = nil
+        updateState(.disconnected)
     }
 
     public func open() async throws {
@@ -479,9 +717,14 @@ public actor AzimuthSelectableRadioTransport: AzimuthRadioTransport,
             }
             let hardwareSerialNumber = await transport.hardwareSerialNumber
             try ensureCurrent(attempt, selection: attemptSelection)
+            let usbDeviceRegistryEntryID = await transport
+                .macOSUSBDeviceRegistryEntryID
+            try ensureCurrent(attempt, selection: attemptSelection)
             let childState = await transport.state
             try ensureCurrent(attempt, selection: attemptSelection)
             currentHardwareSerialNumber = hardwareSerialNumber
+            currentMacOSUSBDeviceRegistryEntryID = usbDeviceRegistryEntryID
+                .flatMap { $0 == 0 ? nil : $0 }
             updateState(childState)
         } catch is CancellationError {
             if attempt == generation {
@@ -510,14 +753,17 @@ public actor AzimuthSelectableRadioTransport: AzimuthRadioTransport,
         stateObserver?.cancel()
         stateObserver = nil
         let transport = activeTransport
+        let closingSelection = activeSelection
         activeTransport = nil
         activeSelection = nil
         currentHardwareSerialNumber = nil
+        currentMacOSUSBDeviceRegistryEntryID = nil
         activeSlot.replace(with: nil)
         guard let transport else {
             updateState(.disconnected)
             return
         }
+        retainBluetoothReconnectEndpoint(from: closingSelection)
         let cleanup = startCleanup(
             transport,
             finalState: .disconnected
@@ -542,7 +788,10 @@ public actor AzimuthSelectableRadioTransport: AzimuthRadioTransport,
         } catch is CancellationError {
             throw CancellationError()
         } catch {
-            if attempt == generation { currentHardwareSerialNumber = nil }
+            if attempt == generation {
+                currentHardwareSerialNumber = nil
+                currentMacOSUSBDeviceRegistryEntryID = nil
+            }
             throw error
         }
     }
@@ -558,7 +807,10 @@ public actor AzimuthSelectableRadioTransport: AzimuthRadioTransport,
         } catch is CancellationError {
             throw CancellationError()
         } catch {
-            if attempt == generation { currentHardwareSerialNumber = nil }
+            if attempt == generation {
+                currentHardwareSerialNumber = nil
+                currentMacOSUSBDeviceRegistryEntryID = nil
+            }
             throw error
         }
     }
@@ -586,10 +838,15 @@ public actor AzimuthSelectableRadioTransport: AzimuthRadioTransport,
         case .connected:
             guard let transport = activeTransport else { return }
             let serialNumber = await transport.hardwareSerialNumber
+            let usbDeviceRegistryEntryID = await transport
+                .macOSUSBDeviceRegistryEntryID
             guard attempt == generation, activeTransport != nil else { return }
             currentHardwareSerialNumber = serialNumber
+            currentMacOSUSBDeviceRegistryEntryID = usbDeviceRegistryEntryID
+                .flatMap { $0 == 0 ? nil : $0 }
         case .disconnected, .failed:
             currentHardwareSerialNumber = nil
+            currentMacOSUSBDeviceRegistryEntryID = nil
         case .connecting:
             break
         }
@@ -615,6 +872,7 @@ public actor AzimuthSelectableRadioTransport: AzimuthRadioTransport,
         activeTransport = nil
         activeSelection = nil
         currentHardwareSerialNumber = nil
+        currentMacOSUSBDeviceRegistryEntryID = nil
         activeSlot.replace(with: nil)
         let cleanup = startCleanup(transport, finalState: finalState)
         await cleanup.task.value
@@ -693,6 +951,53 @@ public actor AzimuthSelectableRadioTransport: AzimuthRadioTransport,
         )
         lastBluetoothEndpoints[index] = retained
         return retained
+    }
+
+    private func retainBluetoothReconnectEndpoint(
+        from selection: AzimuthTransportSelection?
+    ) {
+        switch selection {
+        case .bluetooth(let endpoint), .qualifiedBluetooth(let endpoint, _):
+            retainedBluetoothReconnectEndpoint = endpoint
+        case .usb, .bluetoothMatchingUSBSerial, nil:
+            retainedBluetoothReconnectEndpoint = nil
+        }
+    }
+
+    /// Follow the endpoint retained before consent without treating any USB
+    /// descriptor field as radio identity. Registry identity is strongest while
+    /// the original enumeration remains alive; serial and path are continuity
+    /// hints across re-enumeration. If every hint changed, only a sole qualified
+    /// endpoint is safe to probe, and CAT `AE` remains the final authority.
+    private static func refreshedRetainedUSBEndpoint(
+        retained: AzimuthUSBEndpoint,
+        available: [AzimuthUSBEndpoint]
+    ) -> AzimuthUSBEndpoint? {
+        let registryMatches = available.filter {
+            $0.usbDeviceRegistryEntryID == retained.usbDeviceRegistryEntryID
+        }
+        if registryMatches.count == 1 {
+            return registryMatches[0]
+        }
+        if registryMatches.count > 1 {
+            return nil
+        }
+        if let serialNumber = retained.usbSerialNumber {
+            let serialMatches = available.filter {
+                $0.usbSerialNumber == serialNumber
+            }
+            if serialMatches.count == 1 {
+                return serialMatches[0]
+            }
+        }
+        let pathMatches = available.filter {
+            $0.devicePath == retained.devicePath
+        }
+        if pathMatches.count == 1 {
+            return pathMatches[0]
+        }
+        guard available.count == 1 else { return nil }
+        return available[0]
     }
 
     private static func mergeBluetoothEndpoints(
@@ -783,6 +1088,7 @@ public actor AzimuthSelectableRadioTransport: AzimuthRadioTransport,
             guard !endpoint.id.isEmpty,
                   !endpoint.displayName.isEmpty,
                   !endpoint.devicePath.isEmpty,
+                  endpoint.usbDeviceRegistryEntryID != 0,
                   endpoint.usbSerialNumber?.isEmpty != true,
                   endpoint.id == AzimuthUSBEndpoint.stableID(
                       devicePath: endpoint.devicePath,

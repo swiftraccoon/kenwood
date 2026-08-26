@@ -19,6 +19,87 @@ final class AzimuthRadioEndpointSelectionTests: XCTestCase {
         detail: "00-11-22-33-44-55"
     )
 
+    private let unrelatedBluetooth = RadioEndpoint(
+        id: "bluetooth:66-77-88-99-AA-BB",
+        name: "42\" OLED",
+        transport: .bluetooth,
+        detail: "66-77-88-99-AA-BB"
+    )
+
+    func testBluetoothOnlyInitialSelectionPrefersTheStockRadioName() {
+        let selector = EndpointTestSelector(
+            initialEndpoints: [unrelatedBluetooth, bluetooth]
+        )
+        let model = makeModel(selector: selector)
+
+        XCTAssertEqual(
+            model.radioEndpoints,
+            [unrelatedBluetooth, bluetooth]
+        )
+        XCTAssertEqual(model.selectedRadioEndpointID, bluetooth.id)
+    }
+
+    func testBluetoothOnlyRefreshPrefersTheStockRadioNameWithoutASelection() async {
+        let lowercaseRadio = RadioEndpoint(
+            id: bluetooth.id,
+            name: "th-d75",
+            transport: .bluetooth,
+            detail: bluetooth.detail
+        )
+        let selector = EndpointTestSelector(initialEndpoints: [])
+        selector.nextRefresh = .success([unrelatedBluetooth, lowercaseRadio])
+        let model = makeModel(selector: selector)
+
+        await model.refreshRadioEndpoints().value
+
+        XCTAssertEqual(
+            model.radioEndpoints,
+            [unrelatedBluetooth, lowercaseRadio]
+        )
+        XCTAssertEqual(model.selectedRadioEndpointID, lowercaseRadio.id)
+    }
+
+    func testRefreshPreservesAnExplicitUnrelatedBluetoothSelection() async {
+        let selector = EndpointTestSelector(
+            initialEndpoints: [unrelatedBluetooth, bluetooth]
+        )
+        let model = makeModel(selector: selector)
+        model.selectRadioEndpoint(id: unrelatedBluetooth.id)
+        selector.nextRefresh = .success([unrelatedBluetooth, bluetooth])
+
+        await model.refreshRadioEndpoints().value
+
+        XCTAssertEqual(model.selectedRadioEndpointID, unrelatedBluetooth.id)
+    }
+
+    func testRefreshReplacesAnAutomaticUnrelatedSelectionWhenTheRadioAppears() async {
+        let selector = EndpointTestSelector(
+            initialEndpoints: [unrelatedBluetooth]
+        )
+        let model = makeModel(selector: selector)
+        XCTAssertEqual(model.selectedRadioEndpointID, unrelatedBluetooth.id)
+        selector.nextRefresh = .success([unrelatedBluetooth, bluetooth])
+
+        await model.refreshRadioEndpoints().value
+
+        XCTAssertEqual(model.selectedRadioEndpointID, bluetooth.id)
+    }
+
+    func testBluetoothOnlySelectionFallsBackToTheFirstDeviceWithoutStockName() {
+        let second = RadioEndpoint(
+            id: "bluetooth:CC-DD-EE-FF-00-11",
+            name: "Custom Radio Name",
+            transport: .bluetooth,
+            detail: "CC-DD-EE-FF-00-11"
+        )
+        let selector = EndpointTestSelector(
+            initialEndpoints: [unrelatedBluetooth, second]
+        )
+        let model = makeModel(selector: selector)
+
+        XCTAssertEqual(model.selectedRadioEndpointID, unrelatedBluetooth.id)
+    }
+
     func testRefreshPreservesASelectedStableEndpoint() async {
         let selector = EndpointTestSelector(initialEndpoints: [usb, bluetooth])
         let model = makeModel(selector: selector)

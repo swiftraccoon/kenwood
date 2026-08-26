@@ -68,6 +68,22 @@ enum RadioConnectionActivity: Equatable, Sendable {
     case usbHandoff
     /// Explicitly approved Menu 650 change followed by USB CAT recovery.
     case menu650Recovery
+    /// Explicitly approved Menu 985 route to USB-C followed by Bluetooth CAT recovery.
+    case gatewayRoutingRecovery
+    /// Explicitly approved Menu 650 inspection followed by exact USB-C recovery for IF-DSP.
+    case ifDSPGatewayRecovery
+    /// Explicitly approved APRS Menu 983/Menu 506/Menu 650 inspection followed by exact-endpoint recovery.
+    case aprsGatewayRecovery
+
+    var mayChangePersistentRadioConfiguration: Bool {
+        switch self {
+        case .menu650Recovery, .gatewayRoutingRecovery, .ifDSPGatewayRecovery,
+             .aprsGatewayRecovery:
+            true
+        case .connection, .bluetoothHandoff, .usbHandoff:
+            false
+        }
+    }
 }
 
 /// The single observable model consumed by the independent SwiftUI shell.
@@ -98,6 +114,8 @@ final class AzimuthSceneModel {
     private(set) var isIFDSPOperationInFlight = false
     private(set) var operationError: String?
     private(set) var catRecoveryAlert: RadioCATRecoveryAlert?
+    private(set) var ifDSPDVGatewayRecoveryAlert: IFDSPDVGatewayRecoveryAlert?
+    private(set) var aprsDVGatewayRecoveryAlert: APRSDVGatewayRecoveryAlert?
 
     @ObservationIgnored private let radioController: any RadioControlling
     @ObservationIgnored private let radioEndpointSelector: any RadioEndpointSelecting
@@ -109,6 +127,7 @@ final class AzimuthSceneModel {
     @ObservationIgnored private var radioUpdatesTask: Task<Void, Never>?
     @ObservationIgnored private var radioEndpointRefreshTask: Task<Void, Never>?
     @ObservationIgnored private var radioEndpointRefreshSequence: UInt64 = 0
+    @ObservationIgnored private var userSelectedRadioEndpointID: String?
     @ObservationIgnored private var aprsUpdatesTask: Task<Void, Never>?
     @ObservationIgnored private var ifDSPUpdatesTask: Task<Void, Never>?
     @ObservationIgnored private var catalogTask: Task<Void, Never>?
@@ -147,7 +166,9 @@ final class AzimuthSceneModel {
         self.ifDSPModeController = resolvedIFDSPModeController
         radioState = radioController.currentState
         radioEndpoints = initialEndpoints
-        selectedRadioEndpointID = initialEndpoints.first?.id
+        selectedRadioEndpointID = Self.automaticRadioEndpointID(
+            in: initialEndpoints
+        )
         radioEndpointRefreshState = initialEndpoints.isEmpty ? .idle : .ready
         radioEndpointDiscoveryWarning = nil
         pairedBluetoothDeviceCount = resolvedEndpointSelector
@@ -174,7 +195,7 @@ final class AzimuthSceneModel {
     }
 
     var isCATRecoveryInFlight: Bool {
-        radioConnectionActivity == .menu650Recovery
+        radioConnectionActivity?.mayChangePersistentRadioConfiguration == true
     }
 
     var isBluetoothHandoffInFlight: Bool {
@@ -347,6 +368,7 @@ final class AzimuthSceneModel {
         guard canSelectRadioEndpoint(id: id) else {
             return
         }
+        userSelectedRadioEndpointID = id
         selectedRadioEndpointID = id
     }
 
@@ -375,15 +397,18 @@ final class AzimuthSceneModel {
                 try Task.checkCancellation()
                 guard let self, self.radioEndpointRefreshSequence == sequence else { return }
                 let validated = try Self.validateRadioEndpoints(snapshot.endpoints)
-                let retainedSelection = self.selectedRadioEndpointID.flatMap { selected in
+                let retainedUserSelection = self.userSelectedRadioEndpointID.flatMap { selected in
                     validated.contains(where: { $0.id == selected }) ? selected : nil
                 }
+                self.userSelectedRadioEndpointID = retainedUserSelection
                 self.radioEndpoints = validated
-                self.selectedRadioEndpointID = retainedSelection ?? validated.first?.id
+                self.selectedRadioEndpointID = retainedUserSelection
+                    ?? Self.automaticRadioEndpointID(in: validated)
                 self.radioEndpointRefreshState = .ready
                 self.radioEndpointDiscoveryWarning = snapshot.warning
                 self.pairedBluetoothDeviceCount = snapshot.pairedBluetoothDeviceCount
                 self.refreshCATRecoveryOfferAvailability()
+                self.refreshIFDSPDVGatewayRecoveryOfferAvailability()
                 self.radioEndpointRefreshTask = nil
             } catch is CancellationError {
                 guard let self, self.radioEndpointRefreshSequence == sequence else { return }
@@ -407,6 +432,9 @@ final class AzimuthSceneModel {
         isRadioOperationInFlight = true
         operationError = nil
         catRecoveryAlert = nil
+        ifDSPDVGatewayRecoveryAlert = nil
+        aprsDVGatewayRecoveryAlert = nil
+        aprsController.discardAPRSDVGatewayRecovery()
         radioConnectionActivity = .connection
         let connectionTask = Task { @MainActor [weak self] in
             guard let self else { throw CancellationError() }
@@ -462,6 +490,9 @@ final class AzimuthSceneModel {
             catRecoveryAlert = .bluetoothMmdvmMode(
                 usbFallbackAvailable:
                     radioController.usbCATFallbackAvailable
+                    && hasFreshUSBEndpoint,
+                automaticBluetoothCATRoutingAvailable:
+                    radioController.automaticBluetoothCATRoutingAvailable
                     && hasFreshUSBEndpoint
             )
         } catch is CancellationError {
@@ -474,10 +505,85 @@ final class AzimuthSceneModel {
         }
     }
 
+    /// Runs the explicitly approved Menu 650 inspection, changes it only when
+    /// needed, proves the same radio over USB-C, and resumes the interrupted
+    /// IF-DSP start exactly once.
+    func inspectDVGatewayAndStartIFDSP() async {
+        guard !isRadioOperationInFlight, !isIFDSPOperationInFlight else { return }
+        guard radioController.automaticIFDSPDVGatewayRecoveryAvailable else {
+            ifDSPDVGatewayRecoveryAlert = .failed(
+                message: "Automatic IF-DSP recovery needs the connected Bluetooth CAT radio and its verified TH-D75 USB-C endpoint on this Mac. No radio setting was changed."
+            )
+            return
+        }
+
+        ifDSPDVGatewayRecoveryAlert = nil
+        operationError = nil
+        isRadioOperationInFlight = true
+        radioConnectionActivity = .ifDSPGatewayRecovery
+        let cancellationGeneration = radioConnectionCancellationGeneration
+        let recoveryTask = Task { @MainActor [radioController] in
+            try await radioController.disableDVGatewayAndReconnectForIFDSP()
+        }
+        radioConnectionTask = recoveryTask
+
+        do {
+            try await withTaskCancellationHandler {
+                try await recoveryTask.value
+            } onCancel: {
+                recoveryTask.cancel()
+            }
+            await synchronizeSelectedRadioEndpoint()
+            radioState = radioController.currentState
+            reloadCatalog()
+            radioConnectionTask = nil
+            radioConnectionActivity = nil
+            isRadioOperationInFlight = false
+            await startIFDSP()
+        } catch is CancellationError {
+            radioConnectionTask = nil
+            radioConnectionActivity = nil
+            isRadioOperationInFlight = false
+            ifDSPDVGatewayRecoveryAlert = nil
+            radioState = radioController.currentState
+        } catch {
+            radioConnectionTask = nil
+            radioConnectionActivity = nil
+            isRadioOperationInFlight = false
+            radioState = radioController.currentState
+            if radioConnectionCancellationGeneration == cancellationGeneration {
+                ifDSPDVGatewayRecoveryAlert = .failed(
+                    message: error.localizedDescription
+                )
+            }
+        }
+    }
+
     private static func validInitialEndpoints(
         _ endpoints: [RadioEndpoint]
     ) -> [RadioEndpoint] {
         (try? validateRadioEndpoints(endpoints)) ?? []
+    }
+
+    /// Choose a useful endpoint only when the user has not made a valid
+    /// selection. USB remains the first automatic choice when attached. On a
+    /// Bluetooth-only Mac, prefer the radio's stock paired name instead of an
+    /// unrelated device which happens to sort first. This is presentation
+    /// policy only; connection-time CAT qualification still proves TH-D75
+    /// identity before the endpoint is accepted.
+    private static func automaticRadioEndpointID(
+        in endpoints: [RadioEndpoint]
+    ) -> String? {
+        if let usb = endpoints.first(where: { $0.transport == .usb }) {
+            return usb.id
+        }
+        if let stockNamedBluetooth = endpoints.first(where: {
+            $0.transport == .bluetooth
+                && $0.name.caseInsensitiveCompare("TH-D75") == .orderedSame
+        }) {
+            return stockNamedBluetooth.id
+        }
+        return endpoints.first?.id
     }
 
     private static func validateRadioEndpoints(
@@ -629,11 +735,56 @@ final class AzimuthSceneModel {
         } catch is CancellationError {
             catRecoveryAlert = radioConnectionCancellationGeneration
                 == cancellationGeneration
-                ? pendingBluetoothMMDVMHandoffOffer()
+                ? pendingBluetoothMMDVMRecoveryOffer()
                 : nil
             radioState = radioController.currentState
         } catch {
-            catRecoveryAlert = .recoveryFailed(message: error.localizedDescription)
+            catRecoveryAlert = bluetoothMMDVMRecoveryFailureAlert(error: error)
+            radioState = radioController.currentState
+        }
+    }
+
+    func routeDVGatewayToUSBCAndReconnectBluetooth() async {
+        guard !isRadioOperationInFlight else { return }
+        guard radioController.automaticBluetoothCATRoutingAvailable,
+              hasFreshUSBEndpoint else {
+            catRecoveryAlert = .recoveryFailed(
+                message: "Automatic DV Gateway routing needs exactly one verified TH-D75 USB-C endpoint connected to this Mac."
+            )
+            return
+        }
+
+        catRecoveryAlert = nil
+        operationError = nil
+        isRadioOperationInFlight = true
+        radioConnectionActivity = .gatewayRoutingRecovery
+        let cancellationGeneration = radioConnectionCancellationGeneration
+        let routingTask = Task { @MainActor [radioController] in
+            try await radioController.routeDVGatewayToUSBCAndReconnectBluetooth()
+        }
+        radioConnectionTask = routingTask
+        defer {
+            radioConnectionTask = nil
+            radioConnectionActivity = nil
+            isRadioOperationInFlight = false
+        }
+        do {
+            try await withTaskCancellationHandler {
+                try await routingTask.value
+            } onCancel: {
+                routingTask.cancel()
+            }
+            await synchronizeSelectedRadioEndpoint()
+            radioState = radioController.currentState
+            reloadCatalog()
+        } catch is CancellationError {
+            catRecoveryAlert = radioConnectionCancellationGeneration
+                == cancellationGeneration
+                ? pendingBluetoothMMDVMRecoveryOffer()
+                : nil
+            radioState = radioController.currentState
+        } catch {
+            catRecoveryAlert = bluetoothMMDVMRecoveryFailureAlert(error: error)
             radioState = radioController.currentState
         }
     }
@@ -650,12 +801,23 @@ final class AzimuthSceneModel {
         do {
             try await connectionTask?.value
             catRecoveryAlert = nil
+            aprsDVGatewayRecoveryAlert = nil
         } catch is CancellationError {
             catRecoveryAlert = nil
+            aprsDVGatewayRecoveryAlert = nil
         } catch {
-            if activity == .menu650Recovery {
-                // A late cancellation can finish a Menu 650 operation before
-                // it stops USB reconnect. Preserve that truthful outcome.
+            if activity == .ifDSPGatewayRecovery {
+                ifDSPDVGatewayRecoveryAlert = .failed(
+                    message: error.localizedDescription
+                )
+            } else if activity == .aprsGatewayRecovery {
+                aprsDVGatewayRecoveryAlert = .failed(
+                    message: error.localizedDescription
+                )
+            } else if activity.mayChangePersistentRadioConfiguration {
+                // A late cancellation can finish an approved Menu 650 or
+                // Menu 985 operation before it stops reconnect. Preserve that
+                // truthful outcome.
                 catRecoveryAlert = .recoveryFailed(message: error.localizedDescription)
             }
         }
@@ -673,12 +835,18 @@ final class AzimuthSceneModel {
         catRecoveryAlert = nil
     }
 
+    func dismissIFDSPDVGatewayRecoveryAlert() {
+        ifDSPDVGatewayRecoveryAlert = nil
+    }
+
     private func refreshCATRecoveryOfferAvailability() {
         let automatic = radioController.automaticCATRecoveryAvailable
             && hasFreshPairedBluetoothDevice
         let bluetooth = radioController.bluetoothCATFallbackAvailable
             && hasFreshPairedBluetoothDevice
         let usb = radioController.usbCATFallbackAvailable
+            && hasFreshUSBEndpoint
+        let bluetoothRouting = radioController.automaticBluetoothCATRoutingAvailable
             && hasFreshUSBEndpoint
         switch catRecoveryAlert {
         case .usbMmdvmMode:
@@ -688,24 +856,40 @@ final class AzimuthSceneModel {
             )
         case .bluetoothMmdvmMode:
             catRecoveryAlert = .bluetoothMmdvmMode(
-                usbFallbackAvailable: usb
+                usbFallbackAvailable: usb,
+                automaticBluetoothCATRoutingAvailable: bluetoothRouting
             )
-        case .recoveryFailed(let message, _, _):
+        case .recoveryFailed(let message, _, _, _, _):
             catRecoveryAlert = .recoveryFailed(
                 message: message,
                 automaticRecoveryAvailable: automatic,
-                bluetoothFallbackAvailable: bluetooth
+                bluetoothFallbackAvailable: bluetooth,
+                usbFallbackAvailable: usb,
+                automaticBluetoothCATRoutingAvailable: bluetoothRouting
             )
         case nil:
             break
         }
     }
 
-    private func pendingBluetoothMMDVMHandoffOffer() -> RadioCATRecoveryAlert? {
+    private func refreshIFDSPDVGatewayRecoveryOfferAvailability() {
+        guard case .offer = ifDSPDVGatewayRecoveryAlert else { return }
+        ifDSPDVGatewayRecoveryAlert = .offer(
+            automaticRecoveryAvailable:
+                radioController.automaticIFDSPDVGatewayRecoveryAvailable
+        )
+    }
+
+    private func pendingBluetoothMMDVMRecoveryOffer() -> RadioCATRecoveryAlert? {
         let usb = radioController.usbCATFallbackAvailable
             && hasFreshUSBEndpoint
-        guard usb else { return nil }
-        return .bluetoothMmdvmMode(usbFallbackAvailable: true)
+        let routing = radioController.automaticBluetoothCATRoutingAvailable
+            && hasFreshUSBEndpoint
+        guard usb || routing else { return nil }
+        return .bluetoothMmdvmMode(
+            usbFallbackAvailable: usb,
+            automaticBluetoothCATRoutingAvailable: routing
+        )
     }
 
     private func pendingUSBMMDVMRecoveryOffer() -> RadioCATRecoveryAlert? {
@@ -734,9 +918,26 @@ final class AzimuthSceneModel {
         )
     }
 
+    private func bluetoothMMDVMRecoveryFailureAlert(
+        error: Error
+    ) -> RadioCATRecoveryAlert {
+        let usb = radioController.usbCATFallbackAvailable
+            && hasFreshUSBEndpoint
+        let routing = radioController.automaticBluetoothCATRoutingAvailable
+            && hasFreshUSBEndpoint
+        return .recoveryFailed(
+            message: error.localizedDescription,
+            usbFallbackAvailable: usb,
+            automaticBluetoothCATRoutingAvailable: routing
+        )
+    }
+
     func disconnectRadio() async {
         guard !isRadioOperationInFlight, !isIFDSPOperationInFlight else { return }
         catRecoveryAlert = nil
+        ifDSPDVGatewayRecoveryAlert = nil
+        aprsDVGatewayRecoveryAlert = nil
+        aprsController.discardAPRSDVGatewayRecovery()
         isRadioOperationInFlight = true
         defer { isRadioOperationInFlight = false }
         if let restorationError = await stopIFDSPStreamAndRestoreRadio() {
@@ -754,6 +955,8 @@ final class AzimuthSceneModel {
               !endpoint.name.isEmpty else {
             return
         }
+        let synchronizedUserSelection = userSelectedRadioEndpointID
+            == selectedRadioEndpointID
         if let index = radioEndpoints.firstIndex(where: { $0.id == endpoint.id }) {
             var synchronized = radioEndpoints
             synchronized[index] = endpoint
@@ -762,6 +965,9 @@ final class AzimuthSceneModel {
             }
             radioEndpoints = validated
             selectedRadioEndpointID = endpoint.id
+            if synchronizedUserSelection {
+                userSelectedRadioEndpointID = endpoint.id
+            }
             return
         }
         guard let validated = try? Self.validateRadioEndpoints(
@@ -771,22 +977,110 @@ final class AzimuthSceneModel {
         }
         radioEndpoints = validated
         selectedRadioEndpointID = endpoint.id
+        if synchronizedUserSelection {
+            userSelectedRadioEndpointID = endpoint.id
+        }
     }
 
     func startAPRS(_ configuration: APRSSessionConfiguration) async {
         guard !isAPRSOperationInFlight, !isRadioOperationInFlight else { return }
         isAPRSOperationInFlight = true
         operationError = nil
+        aprsDVGatewayRecoveryAlert = nil
         defer { isAPRSOperationInFlight = false }
         do {
             try await aprsController.startAPRS(configuration)
             aprsState = aprsController.currentAPRSState
             radioState = radioController.currentState
+        } catch RadioControllerError.aprsDVGatewayRecoveryRequired {
+            operationError = nil
+            aprsState = aprsController.currentAPRSState
+            radioState = radioController.currentState
+            aprsDVGatewayRecoveryAlert = .offer(
+                connectionName: aprsControlConnectionName,
+                automaticRecoveryAvailable:
+                    aprsController.automaticAPRSDVGatewayRecoveryAvailable
+            )
         } catch {
             operationError = error.localizedDescription
             aprsState = aprsController.currentAPRSState
             radioState = radioController.currentState
         }
+    }
+
+    /// Runs the one approved, AE-bound recovery on the current CAT actor,
+    /// reconnects the exact selected endpoint, and retries the retained APRS
+    /// configuration once. A second current-mode refusal becomes a dismiss-only
+    /// failure and cannot recreate the consent offer.
+    func inspectDVGatewayAndRetryAPRS() async {
+        guard !isRadioOperationInFlight, !isAPRSOperationInFlight else { return }
+        guard aprsController.automaticAPRSDVGatewayRecoveryAvailable else {
+            aprsDVGatewayRecoveryAlert = .failed(
+                message: "Automatic APRS recovery no longer has the original authenticated CAT owner, selected endpoint, radio identity, and KISS route proof. No radio setting was changed. Start APRS again from a current radio connection."
+            )
+            return
+        }
+
+        aprsDVGatewayRecoveryAlert = nil
+        operationError = nil
+        isRadioOperationInFlight = true
+        isAPRSOperationInFlight = true
+        radioConnectionActivity = .aprsGatewayRecovery
+        let cancellationGeneration = radioConnectionCancellationGeneration
+        let recoveryTask = Task { @MainActor [aprsController] in
+            try await aprsController.recoverDVGatewayAndRetryAPRS()
+        }
+        radioConnectionTask = recoveryTask
+        defer {
+            radioConnectionTask = nil
+            radioConnectionActivity = nil
+            isRadioOperationInFlight = false
+            isAPRSOperationInFlight = false
+        }
+
+        do {
+            try await withTaskCancellationHandler {
+                try await recoveryTask.value
+            } onCancel: {
+                recoveryTask.cancel()
+            }
+            await synchronizeSelectedRadioEndpoint()
+            aprsState = aprsController.currentAPRSState
+            radioState = radioController.currentState
+            reloadCatalog()
+        } catch is CancellationError {
+            aprsDVGatewayRecoveryAlert = nil
+            aprsState = aprsController.currentAPRSState
+            radioState = radioController.currentState
+        } catch {
+            aprsState = aprsController.currentAPRSState
+            radioState = radioController.currentState
+            if radioConnectionCancellationGeneration == cancellationGeneration {
+                aprsDVGatewayRecoveryAlert = .failed(
+                    message: error.localizedDescription
+                )
+            }
+        }
+    }
+
+    func dismissAPRSDVGatewayRecoveryAlert() {
+        aprsController.discardAPRSDVGatewayRecovery()
+        aprsDVGatewayRecoveryAlert = nil
+    }
+
+    /// SwiftUI closes an alert after either button action. Hiding that
+    /// presentation must not discard the one-use proof before an approved
+    /// recovery task gets scheduled; only the explicit cancel action discards
+    /// the proof.
+    func hideAPRSDVGatewayRecoveryAlertPresentation() {
+        aprsDVGatewayRecoveryAlert = nil
+    }
+
+    private var aprsControlConnectionName: String {
+        if case .connected(_, let transport) = radioState.connection {
+            return transport
+        }
+        return selectedRadioEndpoint?.transport.title ?? "radio"
     }
 
     func stopAPRS() async {
@@ -857,20 +1151,19 @@ final class AzimuthSceneModel {
         }
     }
 
-    /// Enters one coherent IF operating mode: save and verify the radio first,
-    /// then accept samples only from the selected physical USB audio input.
+    /// Enters one coherent IF operating mode: prove the exact USB-C CAT/audio
+    /// device, save and verify the radio, then accept samples only from it.
     /// A capture which cannot actually start never leaves the radio in IF mode.
     func startIFDSP() async {
         guard !isIFDSPOperationInFlight, !isRadioOperationInFlight else { return }
         guard radioState.connection.isConnected else {
-            operationError = "Connect the TH-D75 over USB-C before starting IF-DSP."
+            operationError = "Connect the TH-D75 over Bluetooth or USB-C before starting IF-DSP."
             return
         }
         guard !ifDSPModeState.reservesRadioState else {
             operationError = "Restore the current IF-DSP radio state before starting another session."
             return
         }
-
         isIFDSPOperationInFlight = true
         operationError = nil
         defer {
@@ -878,12 +1171,57 @@ final class AzimuthSceneModel {
             radioState = radioController.currentState
         }
 
+        var audioPreflightCompleted = false
         do {
+            let preparedAudioInput: IFDSPPreparedAudioInput
+            if let inputProof = radioController.currentIFDSPUSBInputProof {
+                guard let prepared = await ifDSPStream.preflight(
+                    inputProof: inputProof
+                ) else {
+                    synchronizeIFDSPStreamState()
+                    let audioFailure = ifDSPStartFailureDescription(ifDSPState)
+                    ifDSPStream.stop()
+                    synchronizeIFDSPStreamState()
+                    guard !Task.isCancelled else { return }
+                    operationError = audioFailure
+                    return
+                }
+                preparedAudioInput = prepared
+                audioPreflightCompleted = true
+                synchronizeIFDSPStreamState()
+                guard !Task.isCancelled else {
+                    ifDSPStream.stop()
+                    synchronizeIFDSPStreamState()
+                    return
+                }
+            } else {
+                // A Bluetooth connection has no USB audio proof. The
+                // controller uses this call only to retain the exact USB
+                // endpoint and surface the typed, pre-mutation consent offer.
+                // It must not return successfully without a USB proof.
+                _ = try await ifDSPModeController.prepareIFDSPMode()
+                synchronizeIFDSPModeState()
+                let proofFailure = "Azimuth could not prove that the USB-C CAT and audio interfaces belong to the connected TH-D75, so audio capture was not started."
+                do {
+                    try await ifDSPModeController.restoreIFDSPMode()
+                    synchronizeIFDSPModeState()
+                    operationError = "\(proofFailure) Azimuth restored and verified the saved radio state."
+                } catch {
+                    synchronizeIFDSPModeState()
+                    operationError = ifDSPModeState.reservesRadioState
+                        ? "\(proofFailure) Azimuth still could not verify the saved radio state. \(error.localizedDescription) Return the radio to normal dual-band VFO operation, then choose Retry Restore before starting IF-DSP again."
+                        : "\(proofFailure) Azimuth restored and verified the saved radio state, but the CAT settings/screen workspace could not be refreshed: \(error.localizedDescription) Reconnect before trying again."
+                }
+                return
+            }
+
             _ = try await ifDSPModeController.prepareIFDSPMode()
             synchronizeIFDSPModeState()
+            try Task.checkCancellation()
 
-            await ifDSPStream.start()
+            await ifDSPStream.start(preparedInput: preparedAudioInput)
             synchronizeIFDSPStreamState()
+            try Task.checkCancellation()
             guard ifDSPState.isStreaming else {
                 let audioFailure = ifDSPStartFailureDescription(ifDSPState)
                 ifDSPStream.stop()
@@ -891,28 +1229,46 @@ final class AzimuthSceneModel {
                 do {
                     try await ifDSPModeController.restoreIFDSPMode()
                     synchronizeIFDSPModeState()
-                    operationError = audioFailure
+                    operationError = "\(audioFailure) Azimuth restored and verified the saved radio state."
                 } catch {
                     synchronizeIFDSPModeState()
-                    operationError = "\(audioFailure) Radio restoration also failed: \(error.localizedDescription)"
+                    operationError = ifDSPModeState.reservesRadioState
+                        ? "\(audioFailure) Azimuth still could not verify the saved radio state. \(error.localizedDescription) Return the radio to normal dual-band VFO operation, then choose Retry Restore before starting IF-DSP again."
+                        : "\(audioFailure) Azimuth restored and verified the saved radio state, but the CAT settings/screen workspace could not be refreshed: \(error.localizedDescription) Reconnect before trying again."
                 }
                 return
             }
+        } catch RadioControllerError.ifDspDVGatewayRecoveryRequired {
+            if audioPreflightCompleted {
+                ifDSPStream.stop()
+                synchronizeIFDSPStreamState()
+            }
+            synchronizeIFDSPModeState()
+            operationError = nil
+            ifDSPDVGatewayRecoveryAlert = .offer(
+                automaticRecoveryAvailable:
+                    radioController.automaticIFDSPDVGatewayRecoveryAvailable
+            )
         } catch {
             let startFailure = error.localizedDescription
             ifDSPStream.stop()
             synchronizeIFDSPStreamState()
             synchronizeIFDSPModeState()
+            let restorationWasPending = ifDSPModeState.reservesRadioState
             do {
                 // A partial prepare keeps its saved snapshot in the core. This
                 // second restoration attempt is intentional and safe when the
                 // failed prepare had already cleaned itself up.
                 try await ifDSPModeController.restoreIFDSPMode()
                 synchronizeIFDSPModeState()
-                operationError = startFailure
+                operationError = restorationWasPending
+                    ? "IF-DSP couldn’t start, but Azimuth restored and verified the saved radio state. Correct the radio mode or connection problem, then try again."
+                    : startFailure
             } catch {
                 synchronizeIFDSPModeState()
-                operationError = "\(startFailure) Radio restoration also failed: \(error.localizedDescription)"
+                operationError = ifDSPModeState.reservesRadioState
+                    ? "IF-DSP couldn’t start, and Azimuth still could not verify the saved radio state. \(error.localizedDescription) Return the radio to normal dual-band VFO operation, then choose Retry Restore before starting IF-DSP again."
+                    : "IF-DSP couldn’t start, but Azimuth restored and verified the saved radio state. The CAT settings/screen workspace could not be refreshed: \(error.localizedDescription) Reconnect before trying again."
             }
         }
     }
@@ -1286,17 +1642,17 @@ final class AzimuthSceneModel {
             let visible = inputs.isEmpty
                 ? "No audio inputs were visible."
                 : "Visible inputs: \(inputs.joined(separator: ", "))."
-            return "The TH-D75 USB audio input was not available. \(visible) The saved radio state was restored."
+            return "The TH-D75 USB audio input was not available. \(visible)"
         case .paused(let reason, _):
-            return "IF audio stopped during startup: \(reason) The saved radio state was restored."
+            return "IF audio stopped during startup: \(reason)"
         case .failed(let message, _):
-            return "IF audio could not start: \(message) The saved radio state was restored."
+            return "IF audio could not start: \(message)"
         case .idle:
-            return "IF audio did not start. The saved radio state was restored."
+            return "IF audio did not start."
         case .requestingPermission:
-            return "Audio-input permission did not complete. The saved radio state was restored."
+            return "Audio-input permission did not complete."
         case .starting(let routeName):
-            return "The \(routeName) audio route did not begin streaming. The saved radio state was restored."
+            return "The \(routeName) audio route did not begin streaming."
         case .streaming:
             return ""
         }

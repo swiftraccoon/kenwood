@@ -29,6 +29,98 @@ protocol AzimuthCATRecoveryOperation: AnyObject, Sendable {
 
 extension DvGatewayRecoveryOperation: AzimuthCATRecoveryOperation {}
 
+protocol AzimuthDvGatewayUsbRoutingOperation: AnyObject, Sendable {
+    func cancel()
+    func run() async throws -> DvGatewayUsbRoutingResult
+}
+
+extension DvGatewayUsbRoutingOperation: AzimuthDvGatewayUsbRoutingOperation {}
+
+protocol AzimuthDvGatewayCatDisableOperation: AnyObject, Sendable {
+    func cancel()
+    func run() async throws -> DvGatewayCatDisableResult
+}
+
+protocol AzimuthAPRSCurrentModeRecoveryOperation: AnyObject, Sendable {
+    func cancel()
+    func run() async throws -> AprsCurrentModeRecoveryResult
+}
+
+private final class AzimuthAutomationDVGatewayCatDisableOperation:
+    AzimuthDvGatewayCatDisableOperation,
+    @unchecked Sendable
+{
+    private let core: any AutomationControllerProtocol
+    private let expectedRadioSerialNumber: String
+
+    init(
+        core: any AutomationControllerProtocol,
+        expectedRadioSerialNumber: String
+    ) {
+        self.core = core
+        self.expectedRadioSerialNumber = expectedRadioSerialNumber
+    }
+
+    func cancel() {
+        core.cancelDvGatewayDisable()
+    }
+
+    func run() async throws -> DvGatewayCatDisableResult {
+        try await core.disableDvGateway(
+            expectedRadioSerialNumber: expectedRadioSerialNumber
+        )
+    }
+}
+
+private final class AzimuthAutomationAPRSCurrentModeRecoveryOperation:
+    AzimuthAPRSCurrentModeRecoveryOperation,
+    @unchecked Sendable
+{
+    private let core: any AutomationControllerProtocol
+    private let expectedRadioSerialNumber: String
+    private let expectedKISSInterfaceRawValue: UInt8
+
+    init(
+        core: any AutomationControllerProtocol,
+        expectedRadioSerialNumber: String,
+        expectedKISSInterfaceRawValue: UInt8
+    ) {
+        self.core = core
+        self.expectedRadioSerialNumber = expectedRadioSerialNumber
+        self.expectedKISSInterfaceRawValue = expectedKISSInterfaceRawValue
+    }
+
+    func cancel() {
+        core.cancelAprsCurrentModeRecovery()
+    }
+
+    func run() async throws -> AprsCurrentModeRecoveryResult {
+        try await core.recoverAprsCurrentMode(
+            expectedRadioSerialNumber: expectedRadioSerialNumber,
+            expectedKissInterfaceRawValue: expectedKISSInterfaceRawValue
+        )
+    }
+}
+
+private struct ExpectedCATRadioIdentityMismatch: LocalizedError, Sendable {
+    let expected: String
+    let actual: String
+
+    var errorDescription: String? {
+        "The automation core proved CAT radio \(actual), but this connection was bound to radio \(expected). Azimuth closed the connection."
+    }
+}
+
+private struct IFDSPUSBRetryObservation: Error, Sendable {}
+
+private struct IFDSPUSBInputProofUnavailable: LocalizedError, Sendable {
+    let expectedRadioSerialNumber: String
+
+    var errorDescription: String? {
+        "USB-C CAT proved radio \(expectedRadioSerialNumber), but the current USB enumeration did not provide the physical input identity required for IF-DSP."
+    }
+}
+
 /// Live product controller. It owns one qualified automation core, one optimistic
 /// settings snapshot, and one authenticated screen lease at a time.
 @MainActor
@@ -41,23 +133,44 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
         _ expectedRadioSerialNumber: String,
         _ qualifiedBluetoothAddress: String?
     ) throws -> any AzimuthCATRecoveryOperation
+    typealias BluetoothMMDVMUSBRoutingFactory = @Sendable (
+        _ transport: ByteTransport
+    ) throws -> any AzimuthDvGatewayUsbRoutingOperation
+    typealias ConnectedCATDVGatewayDisableFactory = @Sendable (
+        _ core: any AutomationControllerProtocol,
+        _ expectedRadioSerialNumber: String
+    ) throws -> any AzimuthDvGatewayCatDisableOperation
+    typealias ConnectedCATAPRSCurrentModeRecoveryFactory = @Sendable (
+        _ core: any AutomationControllerProtocol,
+        _ expectedRadioSerialNumber: String,
+        _ expectedKISSInterfaceRawValue: UInt8
+    ) throws -> any AzimuthAPRSCurrentModeRecoveryOperation
     typealias BluetoothRecoveryAuthorization = @Sendable () async throws -> Void
 
     private(set) var currentState: RadioWorkspaceState
     let updates: AsyncStream<RadioWorkspaceState>
+    private(set) var currentRadioSerialNumber: String?
+    private(set) var currentIFDSPUSBInputProof: IFDSPUSBInputProof?
     private(set) var currentAPRSState: APRSOperationalState
     let aprsUpdates: AsyncStream<APRSOperationalState>
     private(set) var ifDSPModeState: IFDSPRadioModeState = .inactive
 
     private let transport: any AzimuthRadioTransport
     private let sameRadioBluetoothSelector: (any AzimuthSameRadioBluetoothSelecting)?
+    private let sameRadioUSBSelector: (any AzimuthSameRadioUSBRefreshing)?
     private let bluetoothMmdvmUSBSelector: (any AzimuthBluetoothMMDVMUSBSelecting)?
+    private let ifDSPUSBSelector: (any AzimuthIFDSPUSBSelecting)?
     private let coreTransport: AzimuthCoreByteTransport
     private let schema: AzimuthCoreSettingSchema
     private let connectCore: CoreConnector
     private let prepareRadioForAutomation: RadioModePreflight
+    private let proveRadioCATWithoutPacketModeRecovery: RadioModePreflight
     private let authorizeBluetoothRecovery: BluetoothRecoveryAuthorization
     private let makeUSBMMDVMRecovery: USBMMDVMRecoveryFactory
+    private let makeBluetoothMMDVMUSBRouting: BluetoothMMDVMUSBRoutingFactory
+    private let makeConnectedCATDVGatewayDisable: ConnectedCATDVGatewayDisableFactory
+    private let makeConnectedCATAPRSCurrentModeRecovery:
+        ConnectedCATAPRSCurrentModeRecoveryFactory
     private let supportsAutomaticCATRecovery: Bool
     private let catRecoveryWindow: Duration
     private let catRecoveryPollInterval: Duration
@@ -83,8 +196,19 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
     private var usbMmdvmExpectedRadioSerialNumber: String?
     private var usbMmdvmRecoverySlot: USBMMDVMRecoverySlot?
     private var nextUSBMMDVMRecoveryID: UInt64 = 0
+    private var bluetoothMmdvmRoutingSlot: BluetoothMMDVMRoutingSlot?
+    private var nextBluetoothMMDVMRoutingID: UInt64 = 0
     private var bluetoothMmdvmUSBHandoffPending = false
     private var bluetoothMmdvmUSBHandoffAvailable = false
+    private var connectedCatCoreCloseSlot: ConnectedCATCoreCloseSlot?
+    private var nextConnectedCATCoreCloseID: UInt64 = 0
+    private var connectedCatDisableSlot: ConnectedCATDisableSlot?
+    private var nextConnectedCATDisableID: UInt64 = 0
+    private var connectedCatAPRSRecoverySlot: ConnectedCATAPRSRecoverySlot?
+    private var nextConnectedCATAPRSRecoveryID: UInt64 = 0
+    private var ifDSPUSBHandoffGeneration: UInt64 = 0
+    private var aprsRecoveryGeneration: UInt64 = 0
+    private var pendingAPRSDVGatewayRecovery: APRSDVGatewayRecoveryProof?
 
     var automaticCATRecoveryAvailable: Bool {
         supportsAutomaticCATRecovery && usbMmdvmExpectedRadioSerialNumber != nil
@@ -96,6 +220,43 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
 
     var usbCATFallbackAvailable: Bool {
         bluetoothMmdvmUSBHandoffPending && bluetoothMmdvmUSBHandoffAvailable
+    }
+
+    var automaticBluetoothCATRoutingAvailable: Bool {
+        bluetoothMmdvmUSBHandoffPending && bluetoothMmdvmUSBHandoffAvailable
+    }
+
+    var automaticIFDSPDVGatewayRecoveryAvailable: Bool {
+        supportsAutomaticCATRecovery
+            && transport.device.connectionKind == .bluetooth
+            && currentState.connection.isConnected
+            && ifDSPUSBSelector != nil
+            && core != nil
+            && currentRadioSerialNumber != nil
+            && !ifDSPModeState.reservesRadioState
+            && !currentAPRSState.status.phase.ownsSerialLink
+            && connectedCatCoreCloseSlot == nil
+            && connectedCatDisableSlot == nil
+            && !disconnectInProgress
+    }
+
+    var automaticAPRSDVGatewayRecoveryAvailable: Bool {
+        guard let proof = pendingAPRSDVGatewayRecovery else { return false }
+        return supportsAutomaticCATRecovery
+            && currentState.connection.isConnected
+            && core != nil
+            && currentRadioSerialNumber == proof.radioSerialNumber
+            && sessionEpoch == proof.sessionEpoch
+            && transport.device == proof.device
+            && !ifDSPModeState.reservesRadioState
+            && !currentAPRSState.status.phase.ownsSerialLink
+            && connectedCatCoreCloseSlot == nil
+            && connectedCatDisableSlot == nil
+            && connectedCatAPRSRecoverySlot == nil
+            && !disconnectInProgress
+            && (proof.device.connectionKind == .usb
+                ? sameRadioUSBSelector != nil
+                : sameRadioBluetoothSelector != nil)
     }
 
     private struct CaptureSlot {
@@ -119,6 +280,37 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
         let task: Task<DvGatewayRecoveryOutcome, Error>
     }
 
+    private struct BluetoothMMDVMRoutingSlot {
+        let id: UInt64
+        let operation: any AzimuthDvGatewayUsbRoutingOperation
+        let task: Task<DvGatewayUsbRoutingResult, Error>
+    }
+
+    private struct ConnectedCATDisableSlot {
+        let id: UInt64
+        let operation: any AzimuthDvGatewayCatDisableOperation
+        let task: Task<DvGatewayCatDisableResult, Error>
+    }
+
+    private struct ConnectedCATAPRSRecoverySlot {
+        let id: UInt64
+        let operation: any AzimuthAPRSCurrentModeRecoveryOperation
+        let task: Task<AprsCurrentModeRecoveryResult, Error>
+    }
+
+    private struct ConnectedCATCoreCloseSlot {
+        let id: UInt64
+        let task: Task<Void, Error>
+    }
+
+    private struct APRSDVGatewayRecoveryProof: Equatable, Sendable {
+        let configuration: APRSSessionConfiguration
+        let kissInterfaceRawValue: UInt8
+        let radioSerialNumber: String
+        let device: AzimuthRadioDevice
+        let sessionEpoch: UInt64
+    }
+
     init(
         transport: any AzimuthRadioTransport,
         records: [SettingRecord] = settingCatalog(),
@@ -128,6 +320,11 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
         prepareRadioForAutomation: @escaping RadioModePreflight = { transport in
             try await AzimuthRadioModePreflight(transport: transport).prepareForAutomation()
         },
+        proveRadioCATWithoutPacketModeRecovery:
+            @escaping RadioModePreflight = { transport in
+                try await AzimuthRadioModePreflight(transport: transport)
+                    .proveCATWithoutPacketModeRecovery()
+            },
         authorizeBluetoothRecovery: @escaping BluetoothRecoveryAuthorization = {},
         recoverUSBMMDVM: @escaping USBMMDVMRecoveryFactory = {
             expectedRadioSerialNumber,
@@ -139,21 +336,54 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
                 }
             )
         },
+        routeBluetoothMMDVMToUSB: @escaping BluetoothMMDVMUSBRoutingFactory = {
+            transport in
+            DvGatewayUsbRoutingOperation(transport: transport)
+        },
+        disableDVGatewayOverConnectedCAT:
+            @escaping ConnectedCATDVGatewayDisableFactory = {
+                core,
+                expectedRadioSerialNumber in
+                AzimuthAutomationDVGatewayCatDisableOperation(
+                    core: core,
+                    expectedRadioSerialNumber: expectedRadioSerialNumber
+                )
+            },
+        recoverAPRSCurrentModeOverConnectedCAT:
+            @escaping ConnectedCATAPRSCurrentModeRecoveryFactory = {
+                core,
+                expectedRadioSerialNumber,
+                expectedKISSInterfaceRawValue in
+                AzimuthAutomationAPRSCurrentModeRecoveryOperation(
+                    core: core,
+                    expectedRadioSerialNumber: expectedRadioSerialNumber,
+                    expectedKISSInterfaceRawValue: expectedKISSInterfaceRawValue
+                )
+            },
         automaticCATRecoveryAvailable: Bool = azimuthPlatformSupportsAutomaticCATRecovery,
-        catRecoveryWindow: Duration = .seconds(60),
+        catRecoveryWindow: Duration = .seconds(90),
         catRecoveryPollInterval: Duration = .seconds(3)
     ) throws {
         self.transport = transport
         sameRadioBluetoothSelector =
             transport as? any AzimuthSameRadioBluetoothSelecting
+        sameRadioUSBSelector =
+            transport as? any AzimuthSameRadioUSBRefreshing
         bluetoothMmdvmUSBSelector =
             transport as? any AzimuthBluetoothMMDVMUSBSelecting
+        ifDSPUSBSelector = transport as? any AzimuthIFDSPUSBSelecting
         coreTransport = AzimuthCoreByteTransport(radioTransport: transport)
         schema = try AzimuthCoreSettingSchema(records: records)
         self.connectCore = connectCore
         self.prepareRadioForAutomation = prepareRadioForAutomation
+        self.proveRadioCATWithoutPacketModeRecovery =
+            proveRadioCATWithoutPacketModeRecovery
         self.authorizeBluetoothRecovery = authorizeBluetoothRecovery
         makeUSBMMDVMRecovery = recoverUSBMMDVM
+        makeBluetoothMMDVMUSBRouting = routeBluetoothMMDVMToUSB
+        makeConnectedCATDVGatewayDisable = disableDVGatewayOverConnectedCAT
+        makeConnectedCATAPRSCurrentModeRecovery =
+            recoverAPRSCurrentModeOverConnectedCAT
         supportsAutomaticCATRecovery = automaticCATRecoveryAvailable
         self.catRecoveryWindow = catRecoveryWindow
         self.catRecoveryPollInterval = catRecoveryPollInterval
@@ -176,10 +406,16 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
     }
 
     func connect() async throws {
-        try await connect(expectedRadioSerialNumber: nil)
+        try await connect(
+            expectedRadioSerialNumber: nil,
+            allowsPacketModeRecovery: true
+        )
     }
 
-    private func connect(expectedRadioSerialNumber: String?) async throws {
+    private func connect(
+        expectedRadioSerialNumber: String?,
+        allowsPacketModeRecovery: Bool
+    ) async throws {
         guard !disconnectInProgress else {
             throw RadioControllerError.capabilityUnavailable(
                 "Wait for the current disconnect to finish."
@@ -197,7 +433,8 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
         let task = Task { @MainActor [weak self] in
             guard let self else { throw CancellationError() }
             try await self.runConnectionAttempt(
-                expectedRadioSerialNumber: expectedRadioSerialNumber
+                expectedRadioSerialNumber: expectedRadioSerialNumber,
+                allowsPacketModeRecovery: allowsPacketModeRecovery
             )
         }
         connectionSlot = ConnectionSlot(id: connectionID, task: task)
@@ -210,7 +447,9 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
         }
     }
 
-    private func runRadioModePreflight() async throws -> AzimuthRadioWireMode {
+    private func runRadioModePreflight(
+        allowsPacketModeRecovery: Bool
+    ) async throws -> AzimuthRadioWireMode {
         guard preflightSlot == nil else {
             throw RadioControllerError.capabilityUnavailable(
                 "Wait for the current radio mode check to finish."
@@ -221,7 +460,12 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
         nextPreflightID &+= 1
         let task = Task { @MainActor [weak self] in
             guard let self else { throw CancellationError() }
-            return try await self.prepareRadioForAutomation(self.transport)
+            if allowsPacketModeRecovery {
+                return try await self.prepareRadioForAutomation(self.transport)
+            }
+            return try await self.proveRadioCATWithoutPacketModeRecovery(
+                self.transport
+            )
         }
         preflightSlot = RadioModePreflightSlot(id: preflightID, task: task)
         defer { clearPreflightSlot(id: preflightID) }
@@ -233,7 +477,10 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
         }
     }
 
-    private func runConnectionAttempt(expectedRadioSerialNumber: String?) async throws {
+    private func runConnectionAttempt(
+        expectedRadioSerialNumber: String?,
+        allowsPacketModeRecovery: Bool
+    ) async throws {
         guard !currentState.connection.isConnected else { return }
         let connectionDescription = transport.device.connection
         let connectionKind = transport.device.connectionKind
@@ -243,6 +490,9 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
         usbMmdvmExpectedRadioSerialNumber = nil
         bluetoothMmdvmUSBHandoffPending = false
         bluetoothMmdvmUSBHandoffAvailable = false
+        pendingAPRSDVGatewayRecovery = nil
+        currentRadioSerialNumber = nil
+        currentIFDSPUSBInputProof = nil
         sessionEpoch &+= 1
         let epoch = sessionEpoch
         stopScreenPolling()
@@ -292,9 +542,11 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
             )
 
             connectionStage = "radio mode preflight"
-            var wireMode = try await runRadioModePreflight()
+            var wireMode = try await runRadioModePreflight(
+                allowsPacketModeRecovery: allowsPacketModeRecovery
+            )
             try requireEpoch(epoch)
-            if wireMode == .unresponsive {
+            if wireMode == .unresponsive, allowsPacketModeRecovery {
                 connectionStage = "\(connectionDescription) session recovery"
                 azimuthRadioCoreLog.notice(
                     "[Azimuth Radio] \(connectionDescription, privacy: .public) session was unresponsive; reopening once"
@@ -311,10 +563,12 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
                     "[Azimuth Radio] \(connectionDescription, privacy: .public) session reopened; retrying mode probe"
                 )
                 connectionStage = "radio mode preflight retry"
-                wireMode = try await runRadioModePreflight()
+                wireMode = try await runRadioModePreflight(
+                    allowsPacketModeRecovery: allowsPacketModeRecovery
+                )
                 try requireEpoch(epoch)
             }
-            if wireMode == .mmdvm {
+            if allowsPacketModeRecovery, wireMode == .mmdvm {
                 if connectionKind == .usb {
                     usbMmdvmExpectedRadioSerialNumber = await transport.hardwareSerialNumber
                     throw AzimuthRadioModePreflightError.usbMmdvmMode
@@ -322,6 +576,11 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
                 throw AzimuthRadioModePreflightError.bluetoothMmdvmMode
             }
             guard wireMode == .cat else {
+                if !allowsPacketModeRecovery {
+                    throw RadioControllerError.operationFailed(
+                        "The selected endpoint opened, but ordinary CAT was not ready during this recovery poll. Azimuth sent no packet-mode recovery command and will wait before probing the same endpoint again."
+                    )
+                }
                 if connectionKind == .usb {
                     throw AzimuthRadioModePreflightError.cdcUnresponsive
                 }
@@ -343,13 +602,26 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
             }
             establishedCore = connectedCore
             try requireEpoch(epoch)
+            let abi = connectedCore.abi()
+            guard !abi.radioSerialNumber.isEmpty else {
+                throw RadioControllerError.operationFailed(
+                    "The connected automation core did not retain the CAT AE radio identity."
+                )
+            }
+            if let expectedRadioSerialNumber,
+               abi.radioSerialNumber != expectedRadioSerialNumber {
+                throw ExpectedCATRadioIdentityMismatch(
+                    expected: expectedRadioSerialNumber,
+                    actual: abi.radioSerialNumber
+                )
+            }
+            try requireEpoch(epoch)
             core = connectedCore
+            currentRadioSerialNumber = abi.radioSerialNumber
             installAPRSSnapshot(
                 connectedCore.aprsSnapshot(afterSequence: nil),
                 retainingHistory: false
             )
-
-            let abi = connectedCore.abi()
             azimuthRadioCoreLog.notice(
                 "[Azimuth Core] connectAutomation succeeded (ABI \(abi.version, privacy: .public))"
             )
@@ -361,26 +633,6 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
             connectedState.telemetry.firmware = "V1.03.AZM"
             connectedState.telemetry.operatingMode = "Automation ABI \(abi.version)"
             publish(connectedState)
-
-            connectionStage = "initial settings refresh"
-            azimuthRadioCoreLog.notice("[Azimuth Core] Initial settings refresh started")
-            let settings: SettingReadResult
-            do {
-                settings = try await connectedCore.readSettingValues(settingIds: nil)
-                try requireEpoch(epoch)
-                try installSettings(settings)
-            } catch {
-                azimuthRadioCoreLog.error(
-                    "[Azimuth Core] Initial settings refresh failed type=\(azimuthRadioErrorIdentity(error), privacy: .public) detail=\(error.localizedDescription, privacy: .private)"
-                )
-                throw error
-            }
-            let settingsSummary =
-                "[Azimuth Core] Initial settings refresh succeeded "
-                + "(liveScalarValues=\(settings.values.count)/\(schema.scalarSettingCount) "
-                + "deferredBlobs=\(schema.deferredBlobCount) "
-                + "catalog=\(schema.records.count))"
-            azimuthRadioCoreLog.notice("\(settingsSummary, privacy: .public)")
 
             connectionStage = "initial screen refresh"
             azimuthRadioCoreLog.notice("[Azimuth Core] Initial screen refresh started")
@@ -401,12 +653,21 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
             connectionStage = "ready-state publication"
             try requireEpoch(epoch)
 
+            // Bind audio to the currently open USB enumeration while retaining
+            // CAT `AE` as the authoritative radio identity.
+            await refreshCurrentIFDSPUSBInputProof(
+                core: connectedCore,
+                epoch: epoch
+            )
+
             var ready = currentState
             ready.capabilities = RadioCapabilities(
                 screenStreaming: .available,
                 frontPanelControl: .available,
                 settingRead: .available,
-                settingWrite: .available
+                settingWrite: .unavailable(
+                    reason: "Read the radio settings before writing."
+                )
             )
             publish(ready)
             startScreenPolling(epoch: epoch)
@@ -428,6 +689,8 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
             }
             await transport.close()
             core = nil
+            currentRadioSerialNumber = nil
+            currentIFDSPUSBInputProof = nil
             settingSnapshotID = nil
             ifDSPModeState = .inactive
             usbMmdvmRecoveryPending = detectedUSBMMDVM
@@ -438,7 +701,7 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
             if detectedBluetoothMMDVM {
                 bluetoothMmdvmUSBHandoffAvailable =
                     (try? await bluetoothMmdvmUSBSelector?
-                        .hasSoleIdentifiedUSBEndpoint()) == true
+                        .hasSoleVerifiedUSBEndpoint()) == true
             } else {
                 bluetoothMmdvmUSBHandoffAvailable = false
             }
@@ -455,6 +718,9 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
             if detectedBluetoothMMDVM {
                 throw RadioControllerError.bluetoothMmdvmMode
             }
+            if let identityMismatch = error as? ExpectedCATRadioIdentityMismatch {
+                throw identityMismatch
+            }
             throw RadioControllerError.operationFailed(Self.describe(error))
         }
     }
@@ -469,7 +735,7 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
               case .failed = currentState.connection,
               let bluetoothMmdvmUSBSelector else {
             throw RadioControllerError.capabilityUnavailable(
-                "USB-C CAT handoff requires a validated Bluetooth MMDVM response and exactly one serial-identified USB-C radio."
+                "USB-C CAT handoff requires a validated Bluetooth MMDVM response and exactly one verified TH-D75 USB-C endpoint."
             )
         }
 
@@ -477,12 +743,14 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
         await transport.close()
         do {
             try requireEpoch(authorizedEpoch)
-            let expectedSerialNumber = try await bluetoothMmdvmUSBSelector
-                .selectSoleUSBForBluetoothMMDVM()
+            try await bluetoothMmdvmUSBSelector.selectSoleUSBForBluetoothMMDVM()
             try requireEpoch(authorizedEpoch)
             bluetoothMmdvmUSBHandoffPending = false
             bluetoothMmdvmUSBHandoffAvailable = false
-            try await connect(expectedRadioSerialNumber: expectedSerialNumber)
+            try await connect(
+                expectedRadioSerialNumber: nil,
+                allowsPacketModeRecovery: true
+            )
         } catch {
             if error is CancellationError || disconnectInProgress {
                 throw CancellationError()
@@ -491,8 +759,389 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
             bluetoothMmdvmUSBHandoffPending = true
             bluetoothMmdvmUSBHandoffAvailable =
                 (try? await bluetoothMmdvmUSBSelector
-                    .hasSoleIdentifiedUSBEndpoint()) == true
+                    .hasSoleVerifiedUSBEndpoint()) == true
             throw error
+        }
+    }
+
+    /// Use the sole exact USB-C CAT endpoint to route Reflector Terminal traffic
+    /// to USB-C, then reopen the originally selected Bluetooth address and prove
+    /// it belongs to the radio identified by CAT over that USB endpoint.
+    ///
+    /// The caller owns the explicit mutation consent. Nothing is written until
+    /// exact USB endpoint, CAT mode, CAT serial, model, firmware, and MCP schema
+    /// have all been proved. The Bluetooth address is never replaced by a name
+    /// match or a different paired device.
+    func routeDVGatewayToUSBCAndReconnectBluetooth() async throws {
+        guard bluetoothMmdvmUSBHandoffPending,
+              bluetoothMmdvmUSBHandoffAvailable,
+              case .failed = currentState.connection,
+              let bluetoothMmdvmUSBSelector else {
+            throw RadioControllerError.capabilityUnavailable(
+                "Automatic Bluetooth CAT routing requires a validated Bluetooth MMDVM response and exactly one verified TH-D75 USB-C endpoint connected to this Mac."
+            )
+        }
+
+        let operation = "DV Gateway routing to USB-C"
+        try beginExclusive(operation)
+        bluetoothMmdvmUSBHandoffPending = false
+        bluetoothMmdvmUSBHandoffAvailable = false
+        sessionEpoch &+= 1
+        let epoch = sessionEpoch
+        stopScreenPolling()
+        stopAPRSPolling()
+        captureSlot?.task.cancel()
+        captureSlot = nil
+        settingSnapshotID = nil
+        core = nil
+        currentRadioSerialNumber = nil
+        currentIFDSPUSBInputProof = nil
+        ifDSPModeState = .inactive
+        publish(
+            RadioWorkspaceState(
+                connection: .connecting,
+                capabilities: RadioCapabilities(
+                    screenStreaming: .preparing,
+                    frontPanelControl: .preparing,
+                    settingRead: .preparing,
+                    settingWrite: .preparing
+                ),
+                screenFrame: nil,
+                telemetry: .unavailable,
+                settingValues: [:],
+                lastScreenError: nil
+            )
+        )
+        publishAPRS(
+            .unavailable(
+                "Routing DV Gateway to USB-C and waiting for Bluetooth CAT control."
+            )
+        )
+
+        var expectedRadioSerialNumber: String?
+        var routingOperationStarted = false
+        var routingOutcome: DvGatewayUsbRoutingOutcome?
+        do {
+            await transport.close()
+            try requireEpoch(epoch)
+            try await bluetoothMmdvmUSBSelector.selectSoleUSBForBluetoothMMDVM()
+            try requireEpoch(epoch)
+
+            try await transport.open()
+            try requireEpoch(epoch)
+            let usbMode = try await runRadioModePreflight(
+                allowsPacketModeRecovery: true
+            )
+            try requireEpoch(epoch)
+            guard usbMode == .cat else {
+                throw RadioControllerError.operationFailed(
+                    "The alternate USB-C endpoint did not prove CAT mode, so Azimuth did not change Menu 985 or Menu 650."
+                )
+            }
+
+            let nativeOperation = try makeBluetoothMMDVMUSBRouting(coreTransport)
+            let routingID = nextBluetoothMMDVMRoutingID
+            nextBluetoothMMDVMRoutingID &+= 1
+            let routingTask = Task { try await nativeOperation.run() }
+            bluetoothMmdvmRoutingSlot = BluetoothMMDVMRoutingSlot(
+                id: routingID,
+                operation: nativeOperation,
+                task: routingTask
+            )
+            routingOperationStarted = true
+            let routingResult: DvGatewayUsbRoutingResult
+            do {
+                routingResult = try await withTaskCancellationHandler {
+                    try await routingTask.value
+                } onCancel: {
+                    nativeOperation.cancel()
+                }
+            } catch {
+                clearBluetoothMMDVMRoutingSlot(id: routingID)
+                if case DvGatewayUsbRoutingError.Cancelled = error {
+                    throw CancellationError()
+                }
+                throw error
+            }
+            clearBluetoothMMDVMRoutingSlot(id: routingID)
+            let outcome = routingResult.outcome
+            let provedRadioSerialNumber = routingResult.radioSerialNumber
+            expectedRadioSerialNumber = provedRadioSerialNumber
+            routingOutcome = outcome
+            switch outcome {
+            case .changedRadioRebooting:
+                azimuthRadioCoreLog.notice(
+                    "[Azimuth Radio] Menu 985 routed DV Gateway to USB-C; waiting for Bluetooth CAT after restart"
+                )
+            case .alreadyRouted:
+                azimuthRadioCoreLog.notice(
+                    "[Azimuth Radio] Menu 985 already routed DV Gateway to USB-C; proving Bluetooth CAT"
+                )
+            }
+            if Task.isCancelled || epoch != sessionEpoch {
+                throw Self.completedBluetoothRoutingInterruptedError(outcome)
+            }
+
+            await transport.close()
+            try requireEpoch(epoch)
+            try await bluetoothMmdvmUSBSelector
+                .selectOriginalBluetoothAfterUSBRouting(
+                    expectedSerialNumber: provedRadioSerialNumber
+                )
+            try requireEpoch(epoch)
+            do {
+                try await waitForBluetoothCATRecovery(
+                    epoch: epoch,
+                    outcome: outcome,
+                    expectedRadioSerialNumber: provedRadioSerialNumber
+                )
+            } catch is CancellationError {
+                throw Self.completedBluetoothRoutingInterruptedError(outcome)
+            }
+        } catch {
+            if epoch == sessionEpoch {
+                await transport.close()
+                let canRetryWithoutInspectingRadio = routingOutcome == nil
+                    && (!routingOperationStarted
+                        || Self.isPreMutationBluetoothRoutingResult(error))
+                if canRetryWithoutInspectingRadio {
+                    try? await bluetoothMmdvmUSBSelector
+                        .restoreOriginalBluetoothAfterUSBRoutingFailure()
+                    bluetoothMmdvmUSBHandoffPending = true
+                    bluetoothMmdvmUSBHandoffAvailable =
+                        (try? await bluetoothMmdvmUSBSelector
+                            .hasSoleVerifiedUSBEndpoint()) == true
+                }
+                endExclusive(operation)
+                var failed = RadioWorkspaceState.disconnected
+                failed.connection = .failed(message: Self.describe(error))
+                publish(failed)
+                publishAPRSUnavailable(
+                    "APRS is unavailable because DV Gateway routing failed."
+                )
+            }
+            if error is CancellationError { throw error }
+            throw RadioControllerError.operationFailed(Self.describe(error))
+        }
+
+        endExclusive(operation)
+        guard let expectedRadioSerialNumber else {
+            throw RadioControllerError.operationFailed(
+                "DV Gateway routing completed without retaining the USB radio identity."
+            )
+        }
+        try await connect(
+            expectedRadioSerialNumber: expectedRadioSerialNumber,
+            allowsPacketModeRecovery: true
+        )
+    }
+
+    /// Inspect and, if needed, turn Menu 650 off over the currently approved
+    /// Bluetooth CAT endpoint, then move control to the retained USB-C endpoint.
+    ///
+    /// The caller owns the explicit persistent-setting consent. Merely
+    /// attempting IF-DSP never enters the persistent mutation lifecycle. A sole
+    /// qualified USB endpoint is retained before the existing automation owner
+    /// is closed. USB descriptor serials are not identity; the post-reboot CAT
+    /// core must prove the same `AE` serial before USB control is published.
+    func disableDVGatewayAndReconnectForIFDSP() async throws {
+        guard automaticIFDSPDVGatewayRecoveryAvailable,
+              let ifDSPUSBSelector,
+              let closingCore = core,
+              let approvedRadioSerialNumber = currentRadioSerialNumber else {
+            throw RadioControllerError.capabilityUnavailable(
+                "Automatic IF-DSP recovery requires an approved Bluetooth CAT session and an attached TH-D75 USB-C endpoint."
+            )
+        }
+
+        let retainedUSBAvailable: Bool
+        do {
+            retainedUSBAvailable = try await ifDSPUSBSelector
+                .retainSoleIFDSPUSBEndpoint()
+        } catch {
+            throw RadioControllerError.operationFailed(
+                "Azimuth could not retain the attached TH-D75 USB-C endpoint before inspecting Menu 650. \(Self.describe(error)) No radio setting was changed."
+            )
+        }
+        do {
+            try Task.checkCancellation()
+        } catch {
+            await ifDSPUSBSelector.finishRetainedIFDSPUSBHandoff()
+            throw error
+        }
+        guard retainedUSBAvailable else {
+            throw RadioControllerError.capabilityUnavailable(
+                "Automatic IF-DSP recovery needs exactly one attached, qualified TH-D75 USB-C endpoint. Connect the radio to this Mac, refresh Connections, and retry. No radio setting was changed."
+            )
+        }
+        guard automaticIFDSPDVGatewayRecoveryAvailable,
+              core === closingCore,
+              currentRadioSerialNumber == approvedRadioSerialNumber else {
+            await ifDSPUSBSelector.finishRetainedIFDSPUSBHandoff()
+            throw CancellationError()
+        }
+
+        // Construct the typed actor command before relinquishing the healthy
+        // connected state. A factory/validation failure performs no radio I/O,
+        // so it must not orphan or tear down the authenticated CAT owner.
+        let nativeOperation: any AzimuthDvGatewayCatDisableOperation
+        do {
+            nativeOperation = try makeConnectedCATDVGatewayDisable(
+                closingCore,
+                approvedRadioSerialNumber
+            )
+        } catch {
+            await ifDSPUSBSelector.finishRetainedIFDSPUSBHandoff()
+            throw RadioControllerError.operationFailed(Self.describe(error))
+        }
+
+        let operation = "IF-DSP DV Gateway recovery"
+        do {
+            try beginExclusive(operation)
+        } catch {
+            await ifDSPUSBSelector.finishRetainedIFDSPUSBHandoff()
+            throw error
+        }
+        ifDSPUSBHandoffGeneration &+= 1
+        let handoffGeneration = ifDSPUSBHandoffGeneration
+        sessionEpoch &+= 1
+        let epoch = sessionEpoch
+        stopScreenPolling()
+        stopAPRSPolling()
+        captureSlot?.task.cancel()
+        captureSlot = nil
+        settingSnapshotID = nil
+        core = nil
+        currentRadioSerialNumber = nil
+        currentIFDSPUSBInputProof = nil
+        ifDSPModeState = .inactive
+        publish(
+            RadioWorkspaceState(
+                connection: .connecting,
+                capabilities: RadioCapabilities(
+                    screenStreaming: .preparing,
+                    frontPanelControl: .preparing,
+                    settingRead: .preparing,
+                    settingWrite: .preparing
+                ),
+                screenFrame: nil,
+                telemetry: .unavailable,
+                settingValues: [:],
+                lastScreenError: nil
+            )
+        )
+        publishAPRS(
+            .unavailable(
+                "Inspecting Menu 650 over approved Bluetooth CAT, then waiting for same-radio USB-C CAT."
+            )
+        )
+
+        var completedOutcome: DvGatewayRecoveryOutcome?
+        var expectedRadioSerialNumber: String?
+        do {
+            let disableID = nextConnectedCATDisableID
+            nextConnectedCATDisableID &+= 1
+            // This uncancelled worker owns both the approved operation and the
+            // old actor's terminal shutdown. The operation may consume the
+            // actor itself; in that case `close()` returns ControllerClosed,
+            // which still proves there is no live receiver left on the byte
+            // stream. Pre-dispatch failures instead close and join that actor
+            // here before any Swift transport close or state publication.
+            let disableTask = Task {
+                do {
+                    let result = try await nativeOperation.run()
+                    _ = try? await closingCore.close()
+                    return result
+                } catch {
+                    _ = try? await closingCore.close()
+                    throw error
+                }
+            }
+            connectedCatDisableSlot = ConnectedCATDisableSlot(
+                id: disableID,
+                operation: nativeOperation,
+                task: disableTask
+            )
+            let result: DvGatewayCatDisableResult
+            do {
+                result = try await withTaskCancellationHandler {
+                    try await disableTask.value
+                } onCancel: {
+                    nativeOperation.cancel()
+                }
+            } catch {
+                clearConnectedCATDisableSlot(id: disableID)
+                if case DvGatewayCatDisableError.Cancelled = error {
+                    throw CancellationError()
+                }
+                throw error
+            }
+            clearConnectedCATDisableSlot(id: disableID)
+            completedOutcome = result.outcome
+            guard result.radioSerialNumber == approvedRadioSerialNumber else {
+                throw RadioControllerError.operationFailed(
+                    "\(Self.connectedCATDisableOutcomeDescription(result.outcome)) for CAT radio \(result.radioSerialNumber), but the approved automation session belonged to radio \(approvedRadioSerialNumber). USB-C handoff was stopped."
+                )
+            }
+            expectedRadioSerialNumber = result.radioSerialNumber
+
+            guard !Task.isCancelled, epoch == sessionEpoch else {
+                throw Self.completedConnectedCATDisableInterruptedError(result.outcome)
+            }
+
+            await transport.close()
+            try requireEpoch(epoch)
+        } catch {
+            if let disableSlot = connectedCatDisableSlot {
+                disableSlot.operation.cancel()
+                _ = try? await disableSlot.task.value
+                clearConnectedCATDisableSlot(id: disableSlot.id)
+            }
+            if epoch == sessionEpoch {
+                await transport.close()
+                endExclusive(operation)
+                let detail = Self.describe(error)
+                var failed = RadioWorkspaceState.disconnected
+                failed.connection = .failed(message: detail)
+                publish(failed)
+                publishAPRSUnavailable(
+                    "APRS is unavailable because IF-DSP DV Gateway recovery did not finish."
+                )
+            }
+            await ifDSPUSBSelector.finishRetainedIFDSPUSBHandoff()
+            if let completedOutcome, error is CancellationError {
+                throw Self.completedConnectedCATDisableInterruptedError(completedOutcome)
+            }
+            if error is CancellationError { throw error }
+            throw RadioControllerError.operationFailed(Self.describe(error))
+        }
+
+        endExclusive(operation)
+        guard let outcome = completedOutcome,
+              let expectedRadioSerialNumber else {
+            throw RadioControllerError.operationFailed(
+                "Menu 650 recovery finished without retaining the proved Bluetooth radio identity."
+            )
+        }
+        guard !Task.isCancelled else {
+            throw Self.completedConnectedCATDisableInterruptedError(outcome)
+        }
+
+        do {
+            try await waitForRetainedUSBCAfterDVGatewayDisable(
+                selector: ifDSPUSBSelector,
+                handoffGeneration: handoffGeneration,
+                outcome: outcome,
+                expectedRadioSerialNumber: expectedRadioSerialNumber
+            )
+            await ifDSPUSBSelector.finishRetainedIFDSPUSBHandoff()
+        } catch is CancellationError {
+            throw Self.completedConnectedCATDisableInterruptedError(outcome)
+        } catch {
+            await ifDSPUSBSelector.finishRetainedIFDSPUSBHandoff()
+            throw RadioControllerError.operationFailed(
+                "\(Self.connectedCATDisableOutcomeDescription(outcome)), but Azimuth could not prove same-radio USB-C CAT control. \(Self.describe(error))"
+            )
         }
     }
 
@@ -537,6 +1186,8 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
         captureSlot = nil
         settingSnapshotID = nil
         core = nil
+        currentRadioSerialNumber = nil
+        currentIFDSPUSBInputProof = nil
         ifDSPModeState = .inactive
         publish(
             RadioWorkspaceState(
@@ -648,7 +1299,10 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
         }
 
         endExclusive(operation)
-        try await connect(expectedRadioSerialNumber: expectedRadioSerialNumber)
+        try await connect(
+            expectedRadioSerialNumber: expectedRadioSerialNumber,
+            allowsPacketModeRecovery: true
+        )
     }
 
     func connectViaBluetoothFromUSBMMDVM() async throws {
@@ -669,7 +1323,10 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
                 expectedSerialNumber: expectedRadioSerialNumber
             )
             try requireEpoch(authorizedEpoch)
-            try await connect(expectedRadioSerialNumber: expectedRadioSerialNumber)
+            try await connect(
+                expectedRadioSerialNumber: expectedRadioSerialNumber,
+                allowsPacketModeRecovery: true
+            )
         } catch {
             await transport.close()
             if error is CancellationError || disconnectInProgress {
@@ -700,6 +1357,11 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
         disconnectInProgress = true
         defer { disconnectInProgress = false }
         sessionEpoch &+= 1
+        ifDSPUSBHandoffGeneration &+= 1
+        aprsRecoveryGeneration &+= 1
+        pendingAPRSDVGatewayRecovery = nil
+        currentRadioSerialNumber = nil
+        currentIFDSPUSBInputProof = nil
         stopScreenPolling()
         stopAPRSPolling()
         captureSlot?.task.cancel()
@@ -714,12 +1376,41 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
             _ = try? await preflightSlot.task.value
             clearPreflightSlot(id: preflightSlot.id)
         }
+        if let closeSlot = connectedCatCoreCloseSlot {
+            // The old automation actor remains the transport owner until this
+            // uncancelled close completes. Do not publish disconnected or let
+            // another owner open the byte stream while it is still closing.
+            _ = try? await closeSlot.task.value
+            clearConnectedCATCoreCloseSlot(id: closeSlot.id)
+        }
         if let recoverySlot = usbMmdvmRecoverySlot {
             // Native cancel is synchronous, while the uncancelled worker owns
             // Rust cleanup. Do not publish disconnected until it returns.
             recoverySlot.operation.cancel()
             _ = try? await recoverySlot.task.value
             clearUSBMMDVMRecoverySlot(id: recoverySlot.id)
+        }
+        if let routingSlot = bluetoothMmdvmRoutingSlot {
+            // As with Menu 650 recovery, native cancellation is synchronous
+            // but the Rust worker retains cleanup ownership until completion.
+            routingSlot.operation.cancel()
+            _ = try? await routingSlot.task.value
+            clearBluetoothMMDVMRoutingSlot(id: routingSlot.id)
+        }
+        if let disableSlot = connectedCatDisableSlot {
+            // A late cancellation must not drop the MCP setter after its
+            // mutation gate. The native worker retains cleanup ownership and
+            // publishes its completed outcome before disconnect continues.
+            disableSlot.operation.cancel()
+            _ = try? await disableSlot.task.value
+            clearConnectedCATDisableSlot(id: disableSlot.id)
+        }
+        if let recoverySlot = connectedCatAPRSRecoverySlot {
+            // The current-actor APRS recovery owns its mutation result and
+            // terminal actor shutdown until this uncancelled worker returns.
+            recoverySlot.operation.cancel()
+            _ = try? await recoverySlot.task.value
+            clearConnectedCATAPRSRecoverySlot(id: recoverySlot.id)
         }
         screenPauseDepth = 0
         settingSnapshotID = nil
@@ -737,6 +1428,7 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
             }
         }
         await transport.close()
+        await ifDSPUSBSelector?.finishRetainedIFDSPUSBHandoff()
         exclusiveOperation = nil
         usbMmdvmRecoveryPending = false
         usbMmdvmExpectedRadioSerialNumber = nil
@@ -765,6 +1457,10 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
         await settleCapture()
         do {
             let frame = try await captureFresh(core: context.core, epoch: context.epoch)
+            await refreshCurrentIFDSPUSBInputProof(
+                core: context.core,
+                epoch: context.epoch
+            )
             azimuthRadioCoreLog.notice(
                 "[Azimuth Core] Screen refresh succeeded (\(frame.width, privacy: .public)x\(frame.height, privacy: .public), \(frame.rgba8888.count, privacy: .public) RGBA bytes)"
             )
@@ -799,10 +1495,18 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
             try installSettings(read)
             setSettingCapabilities(.available, .available)
             await recaptureAfterSettings(core: context.core, epoch: context.epoch)
+            await refreshCurrentIFDSPUSBInputProof(
+                core: context.core,
+                epoch: context.epoch
+            )
             azimuthRadioCoreLog.notice(
                 "[Azimuth Core] Settings refresh succeeded (\(read.values.count, privacy: .public) values)"
             )
         } catch {
+            if context.epoch == sessionEpoch,
+               transport.device.connectionKind == .usb {
+                currentIFDSPUSBInputProof = nil
+            }
             azimuthRadioCoreLog.error(
                 "[Azimuth Core] Settings refresh failed type=\(azimuthRadioErrorIdentity(error), privacy: .public) detail=\(error.localizedDescription, privacy: .private)"
             )
@@ -833,6 +1537,9 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
             try installScreen(result.screen)
             switch result.disposition {
             case .dispatched, .dispatchedAfterDeadline:
+                invalidateSettingsSnapshot(
+                    writeReason: "A front-panel key was sent after the last settings read. Refresh settings before writing."
+                )
                 return
             case .contextChanged:
                 throw RadioControllerError.operationFailed(
@@ -954,6 +1661,10 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
                 )
             )
             await recaptureAfterSettings(core: context.core, epoch: context.epoch)
+            await refreshCurrentIFDSPUSBInputProof(
+                core: context.core,
+                epoch: context.epoch
+            )
             return RadioSettingApplyReport(results: results)
         } catch {
             if invokedCoreBatch, context.epoch == sessionEpoch {
@@ -964,6 +1675,59 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
     }
 
     // MARK: - USB IF-DSP radio ownership
+
+    /// Retain the sole attached USB-C endpoint and surface the explicit
+    /// Menu 650 inspection/change consent while the authenticated Bluetooth
+    /// CAT actor and its exact transport remain untouched.
+    ///
+    /// A Bluetooth-started IF-DSP session must ultimately own USB CAT/audio.
+    /// Inspecting Menu 650 requires MCP. Its `E` exit resets CAT and USB and
+    /// takes roughly five seconds to reconnect even when no setting write is
+    /// needed; a changed value uses the detached reboot path. Therefore the
+    /// inspection and transport handoff belong after explicit consent rather
+    /// than behind a speculative USB probe.
+    private func handoffBluetoothCATToUSBForIFDSPIfNeeded() async throws {
+        guard currentState.connection.isConnected,
+              transport.device.connectionKind == .bluetooth,
+              currentIFDSPUSBInputProof == nil else { return }
+        guard supportsAutomaticCATRecovery,
+              let ifDSPUSBSelector,
+              let approvedCore = core,
+              let approvedRadioSerialNumber = currentRadioSerialNumber else {
+            throw RadioControllerError.capabilityUnavailable(
+                "IF-DSP needs USB-C CAT control from the connected TH-D75. Connect the radio to this Mac over USB-C and retry."
+            )
+        }
+
+        let retainedUSBAvailable: Bool
+        do {
+            retainedUSBAvailable = try await ifDSPUSBSelector
+                .retainSoleIFDSPUSBEndpoint()
+        } catch {
+            throw RadioControllerError.operationFailed(
+                "Azimuth could not retain the attached USB-C endpoint for IF-DSP recovery. \(Self.describe(error)) No radio setting was changed."
+            )
+        }
+        guard retainedUSBAvailable else {
+            throw RadioControllerError.capabilityUnavailable(
+                "IF-DSP needs exactly one attached, qualified TH-D75 USB-C endpoint. No radio setting was changed."
+            )
+        }
+        do {
+            try Task.checkCancellation()
+        } catch {
+            await ifDSPUSBSelector.finishRetainedIFDSPUSBHandoff()
+            throw error
+        }
+        guard core === approvedCore,
+              currentRadioSerialNumber == approvedRadioSerialNumber,
+              currentState.connection.isConnected,
+              transport.device.connectionKind == .bluetooth else {
+            await ifDSPUSBSelector.finishRetainedIFDSPUSBHandoff()
+            throw CancellationError()
+        }
+        throw RadioControllerError.ifDspDVGatewayRecoveryRequired
+    }
 
     @discardableResult
     func prepareIFDSPMode() async throws -> IFDSPRadioModeStatus {
@@ -977,13 +1741,17 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
                 "Stop APRS before preparing the radio for IF-DSP."
             )
         }
+        try await handoffBluetoothCATToUSBForIFDSPIfNeeded()
 
         let operation = "IF-DSP prepare"
         try beginExclusive(operation)
-        guard currentState.connection.isConnected, let core else {
+        guard currentState.connection.isConnected,
+              transport.device.connectionKind == .usb,
+              currentIFDSPUSBInputProof != nil,
+              let core else {
             endExclusive(operation)
             throw RadioControllerError.capabilityUnavailable(
-                "Connect the TH-D75 over USB-C before starting IF-DSP."
+                "Connect and prove the TH-D75 over USB-C before starting IF-DSP."
             )
         }
         let epoch = sessionEpoch
@@ -1001,6 +1769,7 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
             let coreStatus = try await core.prepareIfDsp()
             if Task.isCancelled { throw CancellationError() }
             try requireEpoch(epoch)
+            await refreshCurrentIFDSPUSBInputProof(core: core, epoch: epoch)
             let status = try Self.activeIFDSPStatus(coreStatus)
             ifDSPModeState = .active(status)
             publishCATUnavailableForIFDSP(
@@ -1014,11 +1783,12 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
                 core: core,
                 after: error
             )
+            let presentationError = Self.ifDSPPresentationError(error)
             if error is CancellationError, !restorationPending {
                 ifDSPModeState = .inactive
             } else {
                 ifDSPModeState = .failed(
-                    message: Self.describe(error),
+                    message: presentationError.localizedDescription,
                     restorationPending: restorationPending
                 )
             }
@@ -1028,7 +1798,7 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
             }
             endExclusive(operation)
             if error is CancellationError { throw error }
-            throw RadioControllerError.operationFailed(Self.describe(error))
+            throw presentationError
         }
     }
 
@@ -1139,6 +1909,21 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
     // MARK: - APRS KISS operations
 
     func startAPRS(_ configuration: APRSSessionConfiguration) async throws {
+        pendingAPRSDVGatewayRecovery = nil
+        try await startAPRS(
+            configuration,
+            retainedRouteProof: nil,
+            recoveredDataBand: nil,
+            permitsRecoveryOffer: true
+        )
+    }
+
+    private func startAPRS(
+        _ configuration: APRSSessionConfiguration,
+        retainedRouteProof: APRSDVGatewayRecoveryProof?,
+        recoveredDataBand: TncDataBand?,
+        permitsRecoveryOffer: Bool
+    ) async throws {
         guard !ifDSPModeState.reservesRadioState else {
             throw RadioControllerError.capabilityUnavailable(
                 "Restore the IF-DSP radio session before starting APRS."
@@ -1151,12 +1936,65 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
                 "Stop the current APRS KISS session before starting another one."
             )
         }
-        try requireKISSInterfaceMatchesSelectedTransport()
+
+        let kissInterfaceRawValue: UInt8
+        let startAuthority: AprsStartAuthority
+        if let retainedRouteProof {
+            guard retainedRouteProof.configuration == configuration,
+                  retainedRouteProof.device == transport.device,
+                  currentRadioSerialNumber == retainedRouteProof.radioSerialNumber,
+                  context.core.abi().radioSerialNumber
+                    == retainedRouteProof.radioSerialNumber,
+                  retainedRouteProof.kissInterfaceRawValue
+                    == Self.kissInterfaceRawValue(for: transport.device) else {
+                throw RadioControllerError.capabilityUnavailable(
+                    "The one-use APRS recovery proof no longer matches the pending configuration, selected endpoint, KISS route, and CAT radio identity. Start APRS again from current radio settings."
+                )
+            }
+            guard let recoveredDataBand else {
+                throw RadioControllerError.capabilityUnavailable(
+                    "The one-use APRS recovery proof did not retain the freshly verified Menu 506 data band. Start APRS again from current radio settings."
+                )
+            }
+            kissInterfaceRawValue = retainedRouteProof.kissInterfaceRawValue
+            startAuthority = .currentModeRecovery(
+                expectedRadioSerialNumber: retainedRouteProof.radioSerialNumber,
+                expectedDataBand: recoveredDataBand
+            )
+        } else {
+            guard recoveredDataBand == nil else {
+                throw RadioControllerError.capabilityUnavailable(
+                    "A recovered Menu 506 data band cannot authorize a new APRS start without its same-endpoint recovery proof. Refresh radio settings and start again."
+                )
+            }
+            let settingsAuthority = try requireAPRSSettingsSnapshotAuthority()
+            kissInterfaceRawValue = settingsAuthority.kissInterfaceRawValue
+            startAuthority = .settingsSnapshot(
+                snapshotId: settingsAuthority.snapshotID,
+                expectedKissInterfaceRawValue: settingsAuthority.kissInterfaceRawValue
+            )
+        }
+        guard let radioSerialNumber = currentRadioSerialNumber,
+              !radioSerialNumber.isEmpty,
+              context.core.abi().radioSerialNumber == radioSerialNumber else {
+            throw RadioControllerError.capabilityUnavailable(
+                "APRS start requires the current CAT actor and its exact AE radio identity. Reconnect the selected endpoint before trying again."
+            )
+        }
+        let candidateRecoveryProof = APRSDVGatewayRecoveryProof(
+            configuration: configuration,
+            kissInterfaceRawValue: kissInterfaceRawValue,
+            radioSerialNumber: radioSerialNumber,
+            device: transport.device,
+            sessionEpoch: context.epoch
+        )
 
         stopScreenPolling()
         stopAPRSPolling()
         await settleCapture()
-        settingSnapshotID = nil
+        invalidateSettingsSnapshot(
+            writeReason: "Read the radio settings again before writing."
+        )
         var starting = currentAPRSState
         starting.status.phase = .starting
         starting.status.startedAt = Date()
@@ -1170,7 +2008,8 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
 
         do {
             _ = try await context.core.startAprs(
-                config: AzimuthCoreAPRSAdapter.coreConfiguration(configuration)
+                config: AzimuthCoreAPRSAdapter.coreConfiguration(configuration),
+                authority: startAuthority
             )
             try requireEpoch(context.epoch)
             installAPRSSnapshot(
@@ -1183,8 +2022,10 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
                 mode: "APRS KISS",
                 reason: "APRS KISS owns the radio control link. Stop APRS to restore CAT control."
             )
+            pendingAPRSDVGatewayRecovery = nil
             startAPRSPolling(epoch: context.epoch)
         } catch {
+            let currentModeDetail = Self.aprsCurrentModeDetail(error)
             if context.epoch == sessionEpoch {
                 installAPRSSnapshot(
                     context.core.aprsSnapshot(
@@ -1199,14 +2040,56 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
                 )
             }
             if error is CancellationError { throw error }
+            if let currentModeDetail {
+                azimuthRadioCoreLog.notice(
+                    "APRS KISS was refused in the current radio mode after exact CAT restoration: \(currentModeDetail, privacy: .private)"
+                )
+                let recoveredSameCATOwner = context.epoch == sessionEpoch
+                    && currentState.connection.isConnected
+                    && core === context.core
+                    && currentRadioSerialNumber
+                        == candidateRecoveryProof.radioSerialNumber
+                    && transport.device == candidateRecoveryProof.device
+                    && currentAPRSState.status.phase == .inactive
+                if permitsRecoveryOffer,
+                   recoveredSameCATOwner,
+                   supportsAutomaticCATRecovery {
+                    pendingAPRSDVGatewayRecovery = candidateRecoveryProof
+                    throw RadioControllerError.aprsDVGatewayRecoveryRequired
+                }
+                pendingAPRSDVGatewayRecovery = nil
+                if !permitsRecoveryOffer, recoveredSameCATOwner {
+                    throw RadioControllerError.operationFailed(
+                        "The TH-D75 still refused KISS after Azimuth verified Menu 983, Menu 506, and Menu 650 together, reset CAT, reconnected the same radio endpoint, and retried this APRS configuration once with the fresh TNC band. The radio remains in CAT mode. Dismiss this message and inspect the radio's current operating mode before starting a new attempt."
+                    )
+                }
+                if recoveredSameCATOwner {
+                    throw RadioControllerError.operationFailed(
+                        "The TH-D75 refused KISS in its current mode. Automatic inspection is unavailable for this connection, so Azimuth left the radio unchanged. Inspect Menu 983, Menu 506, Menu 650, and the current operating mode on the radio before reconnecting and trying APRS again."
+                    )
+                }
+                throw RadioControllerError.operationFailed(
+                    "The TH-D75 refused KISS in its current mode, and Azimuth could not retain the same authenticated CAT owner for automatic recovery. Reconnect the selected endpoint before trying APRS again."
+                )
+            }
             throw RadioControllerError.operationFailed(Self.describe(error))
         }
     }
 
-    /// Fail before KISS takes ownership when Menu 983 routes packet bytes to
-    /// a different physical interface than this controller currently owns.
+    /// Fail before KISS takes ownership unless one reviewed settings snapshot
+    /// contains a valid Menu 506 TNC band and routes Menu 983 packet bytes to
+    /// the physical interface this controller currently owns. The Rust actor
+    /// independently consumes and validates that same snapshot before `TN`.
     /// Persistent radio settings are never changed implicitly here.
-    private func requireKISSInterfaceMatchesSelectedTransport() throws {
+    private func requireAPRSSettingsSnapshotAuthority() throws -> (
+        snapshotID: UInt64,
+        kissInterfaceRawValue: UInt8
+    ) {
+        guard let snapshotID = settingSnapshotID, snapshotID != 0 else {
+            throw RadioControllerError.capabilityUnavailable(
+                "Azimuth has no current settings snapshot for APRS. Refresh radio settings, then try APRS again."
+            )
+        }
         let settingID = "radio.KissModeInterface"
         guard let stored = currentState.settingValues[settingID] else {
             throw RadioControllerError.capabilityUnavailable(
@@ -1217,6 +2100,19 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
               rawValue == 0 || rawValue == 1 else {
             throw RadioControllerError.capabilityUnavailable(
                 "Menu 983 (KISS interface) returned an unsupported value. Refresh radio settings and verify the menu on the radio before starting APRS."
+            )
+        }
+
+        let dataBandSettingID = "aprs.TncDataBand"
+        guard let storedDataBand = currentState.settingValues[dataBandSettingID] else {
+            throw RadioControllerError.capabilityUnavailable(
+                "Azimuth has not read Menu 506 (TNC data band) from this radio. Refresh radio settings, then try APRS again."
+            )
+        }
+        guard case .choice(let rawDataBand) = storedDataBand,
+              rawDataBand == 0 || rawDataBand == 1 else {
+            throw RadioControllerError.capabilityUnavailable(
+                "Menu 506 (TNC data band) returned an unsupported value. Refresh radio settings and verify the menu on the radio before starting APRS."
             )
         }
 
@@ -1231,6 +2127,231 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
                 "Menu 983 routes KISS to \(configuredName), but Azimuth is connected over \(selectedName). Set Menu 983 (KISS) to \(selectedName), refresh radio settings, then start APRS again."
             )
         }
+        return (snapshotID, UInt8(rawValue))
+    }
+
+    private static func kissInterfaceRawValue(
+        for device: AzimuthRadioDevice
+    ) -> UInt8 {
+        device.connectionKind == .usb ? 0 : 1
+    }
+
+    private static func aprsCurrentModeDetail(_ error: Error) -> String? {
+        if case AutomationError.AprsCurrentModeUnavailable(let detail) = error {
+            return detail
+        }
+        return nil
+    }
+
+    func discardAPRSDVGatewayRecovery() {
+        pendingAPRSDVGatewayRecovery = nil
+    }
+
+    func recoverDVGatewayAndRetryAPRS() async throws {
+        guard automaticAPRSDVGatewayRecoveryAvailable,
+              let proof = pendingAPRSDVGatewayRecovery,
+              let closingCore = core,
+              currentRadioSerialNumber == proof.radioSerialNumber else {
+            throw RadioControllerError.capabilityUnavailable(
+                "Automatic APRS recovery requires the original authenticated CAT actor, selected endpoint, radio identity, and KISS route proof. No radio setting was changed."
+            )
+        }
+        pendingAPRSDVGatewayRecovery = nil
+
+        let nativeOperation: any AzimuthAPRSCurrentModeRecoveryOperation
+        do {
+            nativeOperation = try makeConnectedCATAPRSCurrentModeRecovery(
+                closingCore,
+                proof.radioSerialNumber,
+                proof.kissInterfaceRawValue
+            )
+        } catch {
+            throw RadioControllerError.operationFailed(Self.describe(error))
+        }
+
+        let operation = "APRS current-mode recovery"
+        try beginExclusive(operation)
+        aprsRecoveryGeneration &+= 1
+        let recoveryGeneration = aprsRecoveryGeneration
+        sessionEpoch &+= 1
+        stopScreenPolling()
+        stopAPRSPolling()
+        captureSlot?.task.cancel()
+        captureSlot = nil
+        settingSnapshotID = nil
+        core = nil
+        currentRadioSerialNumber = nil
+        currentIFDSPUSBInputProof = nil
+        ifDSPModeState = .inactive
+        publish(
+            RadioWorkspaceState(
+                connection: .connecting,
+                capabilities: RadioCapabilities(
+                    screenStreaming: .preparing,
+                    frontPanelControl: .preparing,
+                    settingRead: .preparing,
+                    settingWrite: .preparing
+                ),
+                screenFrame: nil,
+                telemetry: .unavailable,
+                settingValues: [:],
+                lastScreenError: nil
+            )
+        )
+        publishAPRS(
+            .unavailable(
+                "Verifying Menu 983, Menu 506, and Menu 650, then waiting for the same radio endpoint."
+            )
+        )
+
+        var completedOutcome: DvGatewayRecoveryOutcome?
+        var completedDataBand: TncDataBand?
+        do {
+            let recoveryID = nextConnectedCATAPRSRecoveryID
+            nextConnectedCATAPRSRecoveryID &+= 1
+            let recoveryTask = Task {
+                do {
+                    let result = try await nativeOperation.run()
+                    _ = try? await closingCore.close()
+                    return result
+                } catch {
+                    _ = try? await closingCore.close()
+                    throw error
+                }
+            }
+            connectedCatAPRSRecoverySlot = ConnectedCATAPRSRecoverySlot(
+                id: recoveryID,
+                operation: nativeOperation,
+                task: recoveryTask
+            )
+
+            let result: AprsCurrentModeRecoveryResult
+            do {
+                result = try await withTaskCancellationHandler {
+                    try await recoveryTask.value
+                } onCancel: {
+                    nativeOperation.cancel()
+                }
+            } catch {
+                clearConnectedCATAPRSRecoverySlot(id: recoveryID)
+                if case AprsCurrentModeRecoveryError.Cancelled = error {
+                    throw CancellationError()
+                }
+                if case AprsCurrentModeRecoveryError.CompletedButReleaseFailed(
+                    let completed,
+                    _
+                ) = error {
+                    completedOutcome = completed.outcome
+                    completedDataBand = completed.dataBand
+                }
+                throw error
+            }
+            clearConnectedCATAPRSRecoverySlot(id: recoveryID)
+            completedOutcome = result.outcome
+            completedDataBand = result.dataBand
+
+            guard result.radioSerialNumber == proof.radioSerialNumber else {
+                throw RadioControllerError.operationFailed(
+                    "\(Self.connectedCATDisableOutcomeDescription(result.outcome)) for CAT radio \(result.radioSerialNumber), but the approved APRS session belonged to radio \(proof.radioSerialNumber). Same-endpoint reconnect was stopped."
+                )
+            }
+            guard result.kissInterfaceRawValue == proof.kissInterfaceRawValue else {
+                throw RadioControllerError.operationFailed(
+                    "\(Self.connectedCATDisableOutcomeDescription(result.outcome)), but the approved operation returned KISS route \(result.kissInterfaceRawValue) while the selected endpoint requires route \(proof.kissInterfaceRawValue). Same-endpoint reconnect was stopped."
+                )
+            }
+            try requireAPRSRecovery(recoveryGeneration)
+
+            await transport.close()
+            try requireAPRSRecovery(recoveryGeneration)
+            guard transport.device == proof.device else {
+                throw RadioControllerError.operationFailed(
+                    "The selected radio endpoint changed after the approved Menu 650 operation. Azimuth refused to reconnect a different endpoint."
+                )
+            }
+            if proof.device.connectionKind == .bluetooth {
+                guard let sameRadioBluetoothSelector else {
+                    throw RadioControllerError.capabilityUnavailable(
+                        "The selected Bluetooth transport cannot retain its exact paired address for same-radio recovery."
+                    )
+                }
+                try await sameRadioBluetoothSelector
+                    .qualifySelectedBluetoothForReconnect(
+                        expectedSerialNumber: proof.radioSerialNumber
+                    )
+                try requireAPRSRecovery(recoveryGeneration)
+                guard transport.device == proof.device else {
+                    throw RadioControllerError.operationFailed(
+                        "The selected Bluetooth endpoint changed while it was being bound to the approved CAT serial. Azimuth refused to reconnect it."
+                    )
+                }
+            }
+        } catch {
+            if let recoverySlot = connectedCatAPRSRecoverySlot {
+                recoverySlot.operation.cancel()
+                _ = try? await recoverySlot.task.value
+                clearConnectedCATAPRSRecoverySlot(id: recoverySlot.id)
+            }
+            let detail = Self.aprsRecoveryFailureDescription(
+                error,
+                completedOutcome: completedOutcome
+            )
+            if recoveryGeneration == aprsRecoveryGeneration {
+                await transport.close()
+                endExclusive(operation)
+                var failed = RadioWorkspaceState.disconnected
+                failed.connection = .failed(message: detail)
+                publish(failed)
+                publishAPRSUnavailable(
+                    "APRS is unavailable because the approved radio-mode recovery did not finish."
+                )
+            }
+            if let completedOutcome, error is CancellationError {
+                throw Self.completedAPRSRecoveryInterruptedError(completedOutcome)
+            }
+            if error is CancellationError { throw error }
+            throw RadioControllerError.operationFailed(detail)
+        }
+
+        endExclusive(operation)
+        guard let outcome = completedOutcome else {
+            throw RadioControllerError.operationFailed(
+                "APRS radio-mode recovery finished without retaining its verified Menu 650 outcome."
+            )
+        }
+        guard let dataBand = completedDataBand else {
+            throw RadioControllerError.operationFailed(
+                "APRS radio-mode recovery finished without retaining the verified Menu 506 data band."
+            )
+        }
+        guard !Task.isCancelled else {
+            throw Self.completedAPRSRecoveryInterruptedError(outcome)
+        }
+
+        let reconnectedProof: APRSDVGatewayRecoveryProof
+        do {
+            reconnectedProof = try await waitForSameEndpointAfterAPRSRecovery(
+                proof: proof,
+                recoveryGeneration: recoveryGeneration,
+                outcome: outcome
+            )
+        } catch is CancellationError {
+            throw Self.completedAPRSRecoveryInterruptedError(outcome)
+        } catch {
+            throw RadioControllerError.operationFailed(
+                Self.aprsRecoveryFailureDescription(
+                    error,
+                    completedOutcome: outcome
+                )
+            )
+        }
+
+        try await startAPRS(
+            reconnectedProof.configuration,
+            retainedRouteProof: reconnectedProof,
+            recoveredDataBand: dataBand,
+            permitsRecoveryOffer: false
+        )
     }
 
     func stopAPRS() async throws {
@@ -1586,7 +2707,9 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
                     try requireEpoch(epoch)
                     continue
                 }
-                let mode = try await runRadioModePreflight()
+                let mode = try await runRadioModePreflight(
+                    allowsPacketModeRecovery: false
+                )
                 try Task.checkCancellation()
                 try requireEpoch(epoch)
                 switch mode {
@@ -1633,11 +2756,352 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
         )
     }
 
+    private func waitForBluetoothCATRecovery(
+        epoch: UInt64,
+        outcome: DvGatewayUsbRoutingOutcome,
+        expectedRadioSerialNumber: String
+    ) async throws {
+        let deadline = ContinuousClock.now.advanced(by: catRecoveryWindow)
+        var lastObservation = "Bluetooth had not reopened yet."
+
+        while ContinuousClock.now < deadline {
+            try Task.checkCancellation()
+            try requireEpoch(epoch)
+            await transport.close()
+            do {
+                try requireEpoch(epoch)
+                try await transport.open()
+                try requireEpoch(epoch)
+                try await requireExpectedRadioIdentity(
+                    expectedRadioSerialNumber,
+                    stage: "the post-routing Bluetooth reopen"
+                )
+                let mode = try await runRadioModePreflight(
+                    allowsPacketModeRecovery: false
+                )
+                try Task.checkCancellation()
+                try requireEpoch(epoch)
+                switch mode {
+                case .cat:
+                    azimuthRadioCoreLog.notice(
+                        "[Azimuth Radio] Bluetooth CAT returned after DV Gateway routing"
+                    )
+                    await transport.close()
+                    try requireEpoch(epoch)
+                    return
+                case .mmdvm:
+                    lastObservation = "Bluetooth was still carrying MMDVM data."
+                case .unresponsive:
+                    lastObservation = "Bluetooth reopened but did not answer CAT."
+                }
+            } catch is CancellationError {
+                if epoch == sessionEpoch {
+                    await transport.close()
+                }
+                throw CancellationError()
+            } catch let error as RadioControllerError {
+                if epoch == sessionEpoch {
+                    await transport.close()
+                }
+                throw error
+            } catch {
+                lastObservation = Self.describe(error)
+            }
+            try requireEpoch(epoch)
+            await transport.close()
+            try requireEpoch(epoch)
+
+            guard ContinuousClock.now < deadline else { break }
+            try await Task.sleep(for: catRecoveryPollInterval)
+        }
+
+        let seconds = max(Int64(1), catRecoveryWindow.components.seconds)
+        let routingState = switch outcome {
+        case .changedRadioRebooting:
+            "Menu 985 was changed to route DV Gateway to USB-C"
+        case .alreadyRouted:
+            "Menu 985 was already routed to USB-C"
+        }
+        throw RadioControllerError.operationFailed(
+            "\(routingState), but Bluetooth CAT did not return during the \(seconds)-second recovery window. \(lastObservation) Power-cycle the radio before reconnecting Bluetooth."
+        )
+    }
+
+    /// Await an uncancelled core shutdown while exposing ownership to
+    /// `disconnect()`. The byte transport cannot be opened by another core until
+    /// this slot has completed.
+    private func closeConnectedCoreForTransportHandoff(
+        _ closingCore: any AutomationControllerProtocol,
+        epoch: UInt64
+    ) async throws {
+        let closeID = nextConnectedCATCoreCloseID
+        nextConnectedCATCoreCloseID &+= 1
+        let closeTask = Task { try await closingCore.close() }
+        connectedCatCoreCloseSlot = ConnectedCATCoreCloseSlot(
+            id: closeID,
+            task: closeTask
+        )
+        do {
+            try await closeTask.value
+        } catch {
+            clearConnectedCATCoreCloseSlot(id: closeID)
+            throw error
+        }
+        clearConnectedCATCoreCloseSlot(id: closeID)
+        try requireEpoch(epoch)
+    }
+
+    private func requireIFDSPUSBHandoff(_ generation: UInt64) throws {
+        guard generation == ifDSPUSBHandoffGeneration,
+              !disconnectInProgress else {
+            throw CancellationError()
+        }
+        try Task.checkCancellation()
+    }
+
+    private func requireAPRSRecovery(_ generation: UInt64) throws {
+        guard generation == aprsRecoveryGeneration,
+              !disconnectInProgress else {
+            throw CancellationError()
+        }
+        try Task.checkCancellation()
+    }
+
+    /// Reopen only the endpoint retained by the refused APRS start. USB refreshes
+    /// the selected endpoint through descriptor-neutral physical continuity
+    /// hints when its tty path changes; Bluetooth is already rebound to its
+    /// exact paired address and expected CAT serial before this loop begins.
+    /// Every successful candidate must still prove the approved `AE` identity
+    /// in the newly created automation core. Poll attempts use CAT-only
+    /// preflight and never send packet-mode recovery bytes, so an early-open
+    /// endpoint cannot overwrite the Menu 506 band returned by the approved
+    /// MCP operation.
+    private func waitForSameEndpointAfterAPRSRecovery(
+        proof: APRSDVGatewayRecoveryProof,
+        recoveryGeneration: UInt64,
+        outcome: DvGatewayRecoveryOutcome
+    ) async throws -> APRSDVGatewayRecoveryProof {
+        let deadline = ContinuousClock.now.advanced(by: catRecoveryWindow)
+        var lastObservation = "The selected endpoint had not returned to CAT yet."
+
+        while ContinuousClock.now < deadline {
+            try requireAPRSRecovery(recoveryGeneration)
+            guard Self.aprsRecoveryDeviceMatches(
+                transport.device,
+                retainedDevice: proof.device
+            ) else {
+                throw RadioControllerError.operationFailed(
+                    "The selected endpoint changed during APRS recovery. Azimuth refused to open a different endpoint."
+                )
+            }
+            if proof.device.connectionKind == .usb {
+                guard let sameRadioUSBSelector else {
+                    throw RadioControllerError.capabilityUnavailable(
+                        "The selected USB-C transport cannot follow the same endpoint across radio re-enumeration."
+                    )
+                }
+                guard try await sameRadioUSBSelector
+                    .refreshSelectedUSBForSameRadioRecovery() else {
+                    lastObservation = "The retained USB-C endpoint had not re-enumerated yet."
+                    try requireAPRSRecovery(recoveryGeneration)
+                    try await Task.sleep(for: catRecoveryPollInterval)
+                    continue
+                }
+                try requireAPRSRecovery(recoveryGeneration)
+                guard transport.device.connectionKind == .usb else {
+                    throw RadioControllerError.operationFailed(
+                        "USB-C discovery changed the selected endpoint during APRS recovery. Azimuth refused to open it."
+                    )
+                }
+            }
+            do {
+                try await connect(
+                    expectedRadioSerialNumber: proof.radioSerialNumber,
+                    allowsPacketModeRecovery: false
+                )
+                try requireAPRSRecovery(recoveryGeneration)
+                guard Self.aprsRecoveryDeviceMatches(
+                          transport.device,
+                          retainedDevice: proof.device
+                      ),
+                      currentRadioSerialNumber == proof.radioSerialNumber,
+                      core?.abi().radioSerialNumber == proof.radioSerialNumber else {
+                    throw RadioControllerError.operationFailed(
+                        "The recovered connection did not retain the exact selected endpoint and approved CAT radio identity."
+                    )
+                }
+                azimuthRadioCoreLog.notice(
+                    "[Azimuth Radio] Same endpoint and CAT radio proved after APRS current-mode recovery"
+                )
+                return APRSDVGatewayRecoveryProof(
+                    configuration: proof.configuration,
+                    kissInterfaceRawValue: proof.kissInterfaceRawValue,
+                    radioSerialNumber: proof.radioSerialNumber,
+                    device: transport.device,
+                    sessionEpoch: sessionEpoch
+                )
+            } catch let identityMismatch as ExpectedCATRadioIdentityMismatch {
+                throw identityMismatch
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let error as RadioControllerError {
+                switch error {
+                case .usbMmdvmMode, .bluetoothMmdvmMode:
+                    lastObservation = "The selected endpoint was still carrying DV Gateway packet data."
+                case .operationFailed(let detail),
+                     .capabilityUnavailable(let detail):
+                    lastObservation = detail
+                default:
+                    lastObservation = error.localizedDescription
+                }
+            } catch {
+                lastObservation = Self.describe(error)
+            }
+
+            try requireAPRSRecovery(recoveryGeneration)
+            await transport.close()
+            try requireAPRSRecovery(recoveryGeneration)
+            guard Self.aprsRecoveryDeviceMatches(
+                transport.device,
+                retainedDevice: proof.device
+            ) else {
+                throw RadioControllerError.operationFailed(
+                    "The selected endpoint changed while Azimuth was waiting for CAT to return."
+                )
+            }
+            guard ContinuousClock.now < deadline else { break }
+            try await Task.sleep(for: catRecoveryPollInterval)
+        }
+
+        let seconds = max(Int64(1), catRecoveryWindow.components.seconds)
+        throw RadioControllerError.operationFailed(
+            "\(Self.connectedCATDisableOutcomeDescription(outcome)), but the same selected \(proof.device.connection) endpoint and CAT radio did not return during the \(seconds)-second recovery window. \(lastObservation) Leave the radio connected and retry after it finishes restarting."
+        )
+    }
+
+    private static func aprsRecoveryDeviceMatches(
+        _ currentDevice: AzimuthRadioDevice,
+        retainedDevice: AzimuthRadioDevice
+    ) -> Bool {
+        if retainedDevice.connectionKind == .usb {
+            return currentDevice.connectionKind == .usb
+        }
+        return currentDevice == retainedDevice
+    }
+
+    /// Release a successfully connected intermediate USB core before restoring
+    /// Bluetooth or reporting that a required physical USB proof is unavailable.
+    private func releaseCurrentCoreForIFDSPHandoff() async throws {
+        stopScreenPolling()
+        stopAPRSPolling()
+        captureSlot?.task.cancel()
+        captureSlot = nil
+        let closingCore = core
+        core = nil
+        currentRadioSerialNumber = nil
+        currentIFDSPUSBInputProof = nil
+        settingSnapshotID = nil
+        ifDSPModeState = .inactive
+        sessionEpoch &+= 1
+        let epoch = sessionEpoch
+        if let closingCore {
+            try await closeConnectedCoreForTransportHandoff(
+                closingCore,
+                epoch: epoch
+            )
+        }
+        await transport.close()
+        try requireEpoch(epoch)
+        publish(.disconnected)
+    }
+
+    /// Poll USB discovery through the full radio reboot/re-enumeration window.
+    /// Selection uses only retained physical hints. Success requires the final
+    /// USB automation core to prove the approved Bluetooth CAT `AE` serial and
+    /// publish a current USB-device/audio ancestor proof.
+    private func waitForRetainedUSBCAfterDVGatewayDisable(
+        selector: any AzimuthIFDSPUSBSelecting,
+        handoffGeneration: UInt64,
+        outcome: DvGatewayRecoveryOutcome,
+        expectedRadioSerialNumber: String
+    ) async throws {
+        let deadline = ContinuousClock.now.advanced(by: catRecoveryWindow)
+        var lastObservation = "The retained USB-C endpoint had not re-enumerated yet."
+
+        while ContinuousClock.now < deadline {
+            try requireIFDSPUSBHandoff(handoffGeneration)
+            await transport.close()
+            do {
+                guard try await selector.selectRetainedIFDSPUSBEndpoint() else {
+                    lastObservation = "The retained USB-C endpoint had not re-enumerated yet."
+                    throw IFDSPUSBRetryObservation()
+                }
+                try requireIFDSPUSBHandoff(handoffGeneration)
+                try await connect(
+                    expectedRadioSerialNumber: expectedRadioSerialNumber,
+                    allowsPacketModeRecovery: false
+                )
+                try requireIFDSPUSBHandoff(handoffGeneration)
+                guard transport.device.connectionKind == .usb,
+                      currentRadioSerialNumber == expectedRadioSerialNumber else {
+                    throw RadioControllerError.operationFailed(
+                        "The post-reboot connection did not remain on the retained USB-C endpoint."
+                    )
+                }
+                guard currentIFDSPUSBInputProof?.catSerialNumber
+                        == expectedRadioSerialNumber else {
+                    try await releaseCurrentCoreForIFDSPHandoff()
+                    throw IFDSPUSBInputProofUnavailable(
+                        expectedRadioSerialNumber: expectedRadioSerialNumber
+                    )
+                }
+                azimuthRadioCoreLog.notice(
+                    "[Azimuth Radio] Same-radio USB CAT proved after Menu 650 recovery"
+                )
+                return
+            } catch is IFDSPUSBRetryObservation {
+                // Absence during reboot is expected and remains retryable.
+            } catch let identityMismatch as ExpectedCATRadioIdentityMismatch {
+                throw identityMismatch
+            } catch let proofError as IFDSPUSBInputProofUnavailable {
+                throw proofError
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let error as RadioControllerError {
+                switch error {
+                case .usbMmdvmMode:
+                    lastObservation = "USB-C was still carrying MMDVM data."
+                case .operationFailed(let detail):
+                    lastObservation = detail
+                default:
+                    lastObservation = error.localizedDescription
+                }
+            } catch {
+                lastObservation = Self.describe(error)
+            }
+            try requireIFDSPUSBHandoff(handoffGeneration)
+            await transport.close()
+            try requireIFDSPUSBHandoff(handoffGeneration)
+
+            guard ContinuousClock.now < deadline else { break }
+            try await Task.sleep(for: catRecoveryPollInterval)
+        }
+
+        let seconds = max(Int64(1), catRecoveryWindow.components.seconds)
+        throw RadioControllerError.operationFailed(
+            "\(Self.connectedCATDisableOutcomeDescription(outcome)), but same-radio USB-C CAT did not return during the \(seconds)-second recovery window. \(lastObservation) Leave the radio connected over USB-C and retry after it finishes restarting."
+        )
+    }
+
     private func requireExpectedRadioIdentity(
         _ expectedSerialNumber: String?,
         stage: String
     ) async throws {
         guard let expectedSerialNumber else { return }
+        // A TH-D75 USB CDC endpoint may omit iSerial or expose a descriptor
+        // value unrelated to CAT `AE`. USB identity is proved only after the
+        // automation core reads `AE` from this exact opened byte stream.
+        guard transport.device.connectionKind != .usb else { return }
         let actualSerialNumber = await transport.hardwareSerialNumber
         guard actualSerialNumber == expectedSerialNumber else {
             throw RadioControllerError.operationFailed(
@@ -1696,16 +3160,18 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
         core: any AutomationControllerProtocol,
         epoch: UInt64
     ) async throws {
-        let fresh = try await core.readSettingValues(settingIds: nil)
         try requireEpoch(epoch)
-        try installSettings(fresh)
+        settingSnapshotID = nil
 
         var restoring = currentState
+        restoring.settingValues = [:]
         restoring.capabilities = RadioCapabilities(
             screenStreaming: .preparing,
             frontPanelControl: .preparing,
             settingRead: .available,
-            settingWrite: .available
+            settingWrite: .unavailable(
+                reason: "Read the radio settings before writing."
+            )
         )
         restoring.telemetry.operatingMode = "Automation ABI \(core.abi().version)"
         publish(restoring)
@@ -1715,6 +3181,7 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
         } catch {
             await handleScreenFailure(error, epoch: epoch)
         }
+        await refreshCurrentIFDSPUSBInputProof(core: core, epoch: epoch)
         if epoch == sessionEpoch, currentState.connection.isConnected {
             startScreenPolling(epoch: epoch)
         }
@@ -1725,6 +3192,20 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
         epoch: UInt64,
         originalError: Error
     ) async {
+        if Self.aprsCurrentModeDetail(originalError) != nil {
+            // The aligned current-mode result is an in-session refusal. The
+            // same automation actor and CAT attestation remain valid, so do
+            // not delay consent behind another synchronous screen capture.
+            // Revoke every stale UI lease,
+            // publish guarded CAT availability, and let ordinary polling obtain
+            // the next authenticated screen after this operation releases its
+            // exclusive owner.
+            restoreCATWorkspaceAfterAlignedAPRSRefusal(
+                core: core,
+                epoch: epoch
+            )
+            return
+        }
         if Self.isTerminalAutomationRestoration(originalError) {
             // A typed restoration failure is emitted only after the Rust
             // actor cannot re-establish automation control. The actor then
@@ -1738,9 +3219,11 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
             return
         }
         do {
-            // A failed KISS entry can return its error before the actor's
-            // follow-up automation qualification finishes. This read is serialized
-            // behind that proof and therefore cannot re-enable CAT early.
+            // A typed current-mode refusal retains the already qualified CAT
+            // actor. Other failed KISS entries may finish a follow-up CAT
+            // qualification before this call returns. In either case, the
+            // workspace is republished only through the actor that returned
+            // the error and only while its session epoch is still current.
             try await restoreCATWorkspace(core: core, epoch: epoch)
             if currentAPRSState.status.phase == .failed {
                 var recovered = currentAPRSState
@@ -1751,6 +3234,33 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
             let detail = "\(Self.describe(originalError)) CAT recovery also failed: \(Self.describe(error))"
             await transitionToLostConnection(message: detail, epoch: epoch)
         }
+    }
+
+    private func restoreCATWorkspaceAfterAlignedAPRSRefusal(
+        core: any AutomationControllerProtocol,
+        epoch: UInt64
+    ) {
+        guard epoch == sessionEpoch,
+              self.core === core,
+              currentState.connection.isConnected else { return }
+        settingSnapshotID = nil
+        var restored = currentState
+        restored.screenFrame = nil
+        restored.settingValues = [:]
+        restored.capabilities = RadioCapabilities(
+            screenStreaming: .preparing,
+            frontPanelControl: .unavailable(
+                reason: "Waiting for a fresh authenticated radio screen."
+            ),
+            settingRead: .available,
+            settingWrite: .unavailable(
+                reason: "Read the radio settings before writing."
+            )
+        )
+        restored.telemetry.operatingMode = "Automation ABI \(core.abi().version)"
+        restored.lastScreenError = nil
+        publish(restored)
+        startScreenPolling(epoch: epoch)
     }
 
     private static func isTerminalAutomationRestoration(_ error: Error) -> Bool {
@@ -1791,6 +3301,35 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
             }
         }
         await recaptureAfterSettings(core: core, epoch: epoch)
+        await refreshCurrentIFDSPUSBInputProof(core: core, epoch: epoch)
+    }
+
+    /// Refresh the CAT-to-USB-audio join after any core operation which may
+    /// close/reopen CDC or re-enumerate the radio. Uncertainty clears authority;
+    /// it never preserves a registry ID from an earlier USB enumeration.
+    private func refreshCurrentIFDSPUSBInputProof(
+        core: any AutomationControllerProtocol,
+        epoch: UInt64
+    ) async {
+        guard epoch == sessionEpoch else { return }
+        guard transport.device.connectionKind == .usb,
+              let currentRadioSerialNumber,
+              core.abi().radioSerialNumber == currentRadioSerialNumber else {
+            currentIFDSPUSBInputProof = nil
+            return
+        }
+        let registryEntryID = await transport.macOSUSBDeviceRegistryEntryID
+        guard epoch == sessionEpoch else { return }
+        #if os(macOS)
+        guard let registryEntryID, registryEntryID != 0 else {
+            currentIFDSPUSBInputProof = nil
+            return
+        }
+        #endif
+        currentIFDSPUSBInputProof = try? IFDSPUSBInputProof(
+            catSerialNumber: currentRadioSerialNumber,
+            macOSUSBDeviceRegistryEntryID: registryEntryID
+        )
     }
 
     private func handleScreenFailure(_ error: Error, epoch: UInt64) async {
@@ -1830,6 +3369,8 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
             "[Azimuth Radio] Connection lost: \(message, privacy: .public)"
         )
         sessionEpoch &+= 1
+        aprsRecoveryGeneration &+= 1
+        pendingAPRSDVGatewayRecovery = nil
         stopScreenPolling()
         stopAPRSPolling()
         captureSlot?.task.cancel()
@@ -1837,12 +3378,15 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
         screenPauseDepth = 0
         let failedCore = core
         core = nil
+        currentRadioSerialNumber = nil
+        currentIFDSPUSBInputProof = nil
         settingSnapshotID = nil
         ifDSPModeState = .inactive
         if let failedCore {
             try? await failedCore.close()
         }
         await transport.close()
+        await ifDSPUSBSelector?.finishRetainedIFDSPUSBHandoff()
         var failed = RadioWorkspaceState.disconnected
         failed.connection = .failed(message: message)
         publish(failed)
@@ -1953,6 +3497,26 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
         usbMmdvmRecoverySlot = nil
     }
 
+    private func clearBluetoothMMDVMRoutingSlot(id: UInt64) {
+        guard bluetoothMmdvmRoutingSlot?.id == id else { return }
+        bluetoothMmdvmRoutingSlot = nil
+    }
+
+    private func clearConnectedCATDisableSlot(id: UInt64) {
+        guard connectedCatDisableSlot?.id == id else { return }
+        connectedCatDisableSlot = nil
+    }
+
+    private func clearConnectedCATAPRSRecoverySlot(id: UInt64) {
+        guard connectedCatAPRSRecoverySlot?.id == id else { return }
+        connectedCatAPRSRecoverySlot = nil
+    }
+
+    private func clearConnectedCATCoreCloseSlot(id: UInt64) {
+        guard connectedCatCoreCloseSlot?.id == id else { return }
+        connectedCatCoreCloseSlot = nil
+    }
+
     private func setSettingCapabilities(
         _ read: RadioCapabilityState,
         _ write: RadioCapabilityState
@@ -1960,6 +3524,14 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
         var state = currentState
         state.capabilities.settingRead = read
         state.capabilities.settingWrite = write
+        publish(state)
+    }
+
+    private func invalidateSettingsSnapshot(writeReason: String) {
+        settingSnapshotID = nil
+        var state = currentState
+        state.settingValues = [:]
+        state.capabilities.settingWrite = .unavailable(reason: writeReason)
         publish(state)
     }
 
@@ -2046,6 +3618,16 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
         }
     }
 
+    private static func ifDSPPresentationError(_ error: Error) -> RadioControllerError {
+        if case AutomationError.IfDspCurrentModeUnavailable(let detail) = error {
+            azimuthRadioCoreLog.notice(
+                "IF-DSP was refused in the current radio mode after exact rollback: \(detail, privacy: .public)"
+            )
+            return .ifDspCurrentModeUnavailable
+        }
+        return .operationFailed(Self.describe(error))
+    }
+
     private static func describe(_ error: Error) -> String {
         switch error {
         case AutomationError.UsbTransport(let detail): return "Radio transport failed: \(detail)"
@@ -2078,12 +3660,18 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
             return "Start an APRS KISS session before using this packet operation."
         case AutomationError.InvalidAprsConfiguration(let detail):
             return "Invalid APRS configuration: \(detail)"
+        case AutomationError.AprsStartAuthority(let detail):
+            return "APRS start was refused because its reviewed settings authority is no longer valid. \(detail)"
+        case AutomationError.AprsCurrentModeUnavailable:
+            return "The TH-D75 refused KISS in its current operating mode."
         case AutomationError.AprsOperation(let detail):
             return "APRS operation failed: \(detail)"
         case AutomationError.IfDspModeActive:
             return "IF-DSP owns a saved radio state. Stop IF-DSP before using conflicting controls."
         case AutomationError.IfDspModeInactive:
             return "Prepare the radio for IF-DSP before using this operation."
+        case AutomationError.IfDspCurrentModeUnavailable:
+            return RadioControllerError.ifDspCurrentModeUnavailable.localizedDescription
         case AutomationError.IfDspOperation(let detail):
             return "IF-DSP radio operation failed: \(detail)"
         case AutomationError.IfDspRestoration(let detail):
@@ -2107,6 +3695,71 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
             return "Azimuth could not turn Menu 650 (DV Gateway) off. \(detail)"
         case DvGatewayRecoveryError.OutcomeUncertain(let detail):
             return "The Menu 650 write outcome is uncertain. \(detail) Power-cycle the radio and inspect Menu 650 before retrying."
+        case DvGatewayCatDisableError.Cancelled:
+            return "IF-DSP DV Gateway recovery was cancelled before Menu 650 could be changed."
+        case DvGatewayCatDisableError.ControllerUnavailable(let detail):
+            return "The authenticated Bluetooth radio session ended before Azimuth could inspect Menu 650. \(detail) No radio setting was changed."
+        case DvGatewayCatDisableError.InvalidExpectedRadioSerial(let detail):
+            return "Azimuth refused to open the Menu 650 mutation gate because the approved CAT session serial is invalid. \(detail) No radio setting was changed."
+        case DvGatewayCatDisableError.CatIdentityUnavailable(let detail):
+            return "Azimuth could not read the selected Bluetooth radio's CAT serial identity. \(detail)"
+        case DvGatewayCatDisableError.RadioIdentityMismatch(let expected, let actual):
+            return "Azimuth refused to change Menu 650 because the selected Bluetooth endpoint now identifies as radio \(actual), but the approved CAT session belonged to radio \(expected). No radio setting was changed."
+        case DvGatewayCatDisableError.RadioQualification(let detail):
+            return "Azimuth refused to change Menu 650 because the selected Bluetooth radio did not pass exact model, firmware, and schema qualification. \(detail)"
+        case DvGatewayCatDisableError.RadioOperation(let detail):
+            return "Azimuth could not finish turning Menu 650 off after the mutation gate opened. \(detail) Inspect Menu 650 before retrying."
+        case DvGatewayCatDisableError.OutcomeUncertain(let detail):
+            return "The Menu 650 write outcome is uncertain. \(detail) Power-cycle the radio and inspect Menu 650 before retrying."
+        case AprsCurrentModeRecoveryError.Cancelled:
+            return "APRS recovery was cancelled before the persistent-setting mutation gate. No radio setting was changed."
+        case AprsCurrentModeRecoveryError.ControllerUnavailable(let detail):
+            return "The authenticated CAT actor ended before Azimuth could verify Menu 983, Menu 506, and Menu 650 together. \(detail) No radio setting was changed."
+        case AprsCurrentModeRecoveryError.InvalidExpectedRadioSerial(let detail):
+            return "Azimuth refused to open APRS recovery because the approved CAT serial is invalid. \(detail) No radio setting was changed."
+        case AprsCurrentModeRecoveryError.InvalidExpectedKissInterface(let value):
+            return "Azimuth refused to open APRS recovery because KISS route \(value) is not USB-C or Bluetooth. No radio setting was changed."
+        case AprsCurrentModeRecoveryError.CatIdentityUnavailable(let detail):
+            return "Azimuth could not re-read the selected endpoint's CAT serial identity. \(detail) No radio setting was changed."
+        case AprsCurrentModeRecoveryError.RadioIdentityMismatch(let expected, let actual):
+            return "Azimuth refused to inspect or change Menu 650 because the selected endpoint now identifies as radio \(actual), but the approved APRS session belonged to radio \(expected). No radio setting was changed."
+        case AprsCurrentModeRecoveryError.RadioQualification(let detail):
+            return "Azimuth refused APRS recovery because the selected radio did not pass exact model, firmware, and schema qualification. \(detail) No radio setting was changed."
+        case AprsCurrentModeRecoveryError.KissInterfaceMismatch(let expected, let actual):
+            return "Menu 983 now routes KISS to \(Self.kissInterfaceDescription(actual)), but the selected endpoint requires \(Self.kissInterfaceDescription(expected)). Azimuth stopped before changing Menu 650. No radio setting was changed."
+        case AprsCurrentModeRecoveryError.KissInterfaceMismatchAndCleanupFailed(
+            let expected,
+            let actual,
+            let detail
+        ):
+            return "Menu 983 routes KISS to \(Self.kissInterfaceDescription(actual)), but the selected endpoint requires \(Self.kissInterfaceDescription(expected)). No radio setting was changed, but CAT cleanup failed. \(detail)"
+        case AprsCurrentModeRecoveryError.InvalidTncDataBand(let actual):
+            return "Menu 506 returned unsupported TNC data-band value \(actual). Azimuth stopped before changing Menu 650. No radio setting was changed."
+        case AprsCurrentModeRecoveryError.InvalidTncDataBandAndCleanupFailed(
+            let actual,
+            let detail
+        ):
+            return "Menu 506 returned unsupported TNC data-band value \(actual). No radio setting was changed, but CAT cleanup failed. \(detail)"
+        case AprsCurrentModeRecoveryError.RadioOperation(let detail):
+            return "Azimuth could not finish the approved Menu 650 operation. \(detail) Inspect Menu 650 before retrying APRS."
+        case AprsCurrentModeRecoveryError.NoSettingChanged(let detail):
+            return "APRS recovery did not complete, but no persistent setting write started. \(detail) Reconnect the selected endpoint before trying again."
+        case AprsCurrentModeRecoveryError.CompletedButReleaseFailed(let result, let detail):
+            return "\(Self.connectedCATDisableOutcomeDescription(result.outcome)); Menu 983 and Menu 506 were also verified, but Azimuth could not release the old CAT connection. \(detail) Reconnect the selected endpoint before trying again."
+        case AprsCurrentModeRecoveryError.OutcomeUncertain(let detail):
+            return "The approved Menu 650 outcome is uncertain. \(detail) Power-cycle the radio and inspect Menu 650 before retrying APRS."
+        case DvGatewayUsbRoutingError.Cancelled:
+            return "DV Gateway routing was cancelled before Menu 985 or Menu 650 could be changed."
+        case DvGatewayUsbRoutingError.OperationAlreadyRun:
+            return "This DV Gateway routing operation has already finished. Start a new routing attempt."
+        case DvGatewayUsbRoutingError.UsbCatIdentityUnavailable(let detail):
+            return "Azimuth could not read the selected USB-C radio's CAT serial identity. \(detail)"
+        case DvGatewayUsbRoutingError.RadioQualification(let detail):
+            return "Azimuth refused to route DV Gateway because the selected USB-C radio did not pass exact model, firmware, and schema qualification. \(detail)"
+        case DvGatewayUsbRoutingError.RadioOperation(let detail):
+            return "Azimuth could not finish routing DV Gateway to USB-C after the mutation gate opened. \(detail) Inspect Menu 985 and Menu 650 before retrying."
+        case DvGatewayUsbRoutingError.OutcomeUncertain(let detail):
+            return "The Menu 985 and Menu 650 routing outcome is uncertain. \(detail) Power-cycle the radio and inspect both settings before retrying."
         case let localized as LocalizedError:
             return localized.errorDescription ?? String(describing: error)
         default:
@@ -2118,6 +3771,17 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
         switch error {
         case DvGatewayRecoveryError.RadioOperation,
              DvGatewayRecoveryError.OutcomeUncertain:
+            true
+        default:
+            false
+        }
+    }
+
+    private static func isPreMutationBluetoothRoutingResult(_ error: Error) -> Bool {
+        switch error {
+        case DvGatewayUsbRoutingError.Cancelled,
+             DvGatewayUsbRoutingError.UsbCatIdentityUnavailable,
+             DvGatewayUsbRoutingError.RadioQualification:
             true
         default:
             false
@@ -2137,5 +3801,84 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
                 "Menu 650 was already Off. The USB-C CAT reconnect was stopped; reconnect to finish restoring radio control."
             )
         }
+    }
+
+    private static func completedBluetoothRoutingInterruptedError(
+        _ outcome: DvGatewayUsbRoutingOutcome
+    ) -> RadioControllerError {
+        switch outcome {
+        case .changedRadioRebooting:
+            .operationFailed(
+                "Menu 985 was changed to route DV Gateway to USB-C and the radio is rebooting. The Bluetooth CAT reconnect was stopped; reconnect after the radio finishes restarting."
+            )
+        case .alreadyRouted:
+            .operationFailed(
+                "Menu 985 was already routed to USB-C and Menu 650 was already Reflector Terminal. The Bluetooth CAT proof was stopped; reconnect to finish restoring Bluetooth control."
+            )
+        }
+    }
+
+    private static func connectedCATDisableOutcomeDescription(
+        _ outcome: DvGatewayRecoveryOutcome
+    ) -> String {
+        switch outcome {
+        case .changedRadioRebooting:
+            "Menu 650 was changed to Off"
+        case .alreadyOffCatReady:
+            "Menu 650 was already Off"
+        }
+    }
+
+    private static func kissInterfaceDescription(_ rawValue: UInt8) -> String {
+        switch rawValue {
+        case 0: "USB-C"
+        case 1: "Bluetooth"
+        default: "unsupported route \(rawValue)"
+        }
+    }
+
+    private static func completedConnectedCATDisableInterruptedError(
+        _ outcome: DvGatewayRecoveryOutcome
+    ) -> RadioControllerError {
+        switch outcome {
+        case .changedRadioRebooting:
+            .operationFailed(
+                "Menu 650 was changed to Off and the radio is rebooting. The same-radio USB-C handoff was stopped; retry after the radio finishes restarting."
+            )
+        case .alreadyOffCatReady:
+            .operationFailed(
+                "Menu 650 was already Off. The same-radio USB-C handoff was stopped; retry to finish USB-C CAT qualification."
+            )
+        }
+    }
+
+    private static func completedAPRSRecoveryInterruptedError(
+        _ outcome: DvGatewayRecoveryOutcome
+    ) -> RadioControllerError {
+        switch outcome {
+        case .changedRadioRebooting:
+            .operationFailed(
+                "Menu 650 was changed to Off and the radio is rebooting. The same-endpoint CAT reconnect and one-time APRS retry were stopped; reconnect after the radio finishes restarting."
+            )
+        case .alreadyOffCatReady:
+            .operationFailed(
+                "Menu 650 was already Off, and exiting MCP reset CAT without changing the setting. The same-endpoint reconnect and one-time APRS retry were stopped; reconnect before starting APRS again."
+            )
+        }
+    }
+
+    private static func aprsRecoveryFailureDescription(
+        _ error: Error,
+        completedOutcome: DvGatewayRecoveryOutcome?
+    ) -> String {
+        guard let completedOutcome else { return describe(error) }
+        if error is CancellationError {
+            return completedAPRSRecoveryInterruptedError(completedOutcome)
+                .localizedDescription
+        }
+        let outcome = connectedCATDisableOutcomeDescription(completedOutcome)
+        let detail = describe(error)
+        guard !detail.hasPrefix(outcome) else { return detail }
+        return "\(outcome), but exact-endpoint CAT reconnect preparation failed. \(detail)"
     }
 }

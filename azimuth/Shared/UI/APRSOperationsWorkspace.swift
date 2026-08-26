@@ -41,6 +41,35 @@ struct APRSWorkspace: View {
             }
         )
         .alert(
+            model.aprsDVGatewayRecoveryAlert?.title ?? "Inspect DV Gateway?",
+            isPresented: Binding(
+                get: { model.aprsDVGatewayRecoveryAlert != nil },
+                set: {
+                    if !$0 {
+                        model.hideAPRSDVGatewayRecoveryAlertPresentation()
+                    }
+                }
+            )
+        ) {
+            if model.aprsDVGatewayRecoveryAlert?.automaticRecoveryAvailable == true {
+                Button("Inspect DV Gateway and Retry APRS") {
+                    Task { await model.inspectDVGatewayAndRetryAPRS() }
+                }
+            }
+            Button(
+                model.aprsDVGatewayRecoveryAlert?.dismissalButtonTitle
+                    ?? "Dismiss",
+                role: .cancel
+            ) {
+                model.dismissAPRSDVGatewayRecoveryAlert()
+            }
+        } message: {
+            Text(
+                model.aprsDVGatewayRecoveryAlert?.message
+                    ?? "Azimuth needs your approval before inspecting Menu 983, Menu 506, and Menu 650 or changing Menu 650."
+            )
+        }
+        .alert(
             "APRS operation",
             isPresented: Binding(
                 get: { model.operationError != nil },

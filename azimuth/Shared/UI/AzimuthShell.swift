@@ -44,22 +44,27 @@ struct AzimuthShell: View {
             )
         ) {
             if model.catRecoveryAlert?.usbFallbackAvailable == true {
-                Button("Try USB-C") {
+                Button("Use USB-C") {
                     Task { await model.connectViaUSBFromBluetoothMMDVM() }
                 }
             }
+            if model.catRecoveryAlert?.automaticBluetoothCATRoutingAvailable == true {
+                Button("Route Gateway to USB-C") {
+                    Task { await model.routeDVGatewayToUSBCAndReconnectBluetooth() }
+                }
+            }
             if model.catRecoveryAlert?.bluetoothFallbackAvailable == true {
-                Button("Try Bluetooth") {
+                Button("Use Bluetooth") {
                     Task { await model.connectViaBluetoothFromUSBMMDVM() }
                 }
             }
             if model.catRecoveryAlert?.automaticRecoveryAvailable == true {
-                Button("Try Automatic Recovery") {
+                Button("Turn Off DV Gateway and Restore USB-C") {
                     Task { await model.restoreCATFromUSBMMDVM() }
                 }
             }
             if model.catRecoveryAlert?.isRecoveryOffer == true {
-                Button("Not Now", role: .cancel) {
+                Button("Leave Radio Unchanged", role: .cancel) {
                     model.dismissCATRecoveryAlert()
                 }
             } else {
@@ -144,6 +149,12 @@ struct AzimuthShell: View {
                 return "USB-C HANDOFF"
             case .menu650Recovery:
                 return "USB-C CAT RECOVERY"
+            case .gatewayRoutingRecovery:
+                return "GATEWAY ROUTING"
+            case .ifDSPGatewayRecovery:
+                return "IF-DSP RECOVERY"
+            case .aprsGatewayRecovery:
+                return "APRS RECOVERY"
             case .connection:
                 return selectedConnectionLabel(suffix: "CONTROL")
             case nil:

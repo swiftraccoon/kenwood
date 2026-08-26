@@ -6,6 +6,8 @@ import XCTest
 @testable import Azimuth
 
 final class AzimuthRadioModePreflightTests: XCTestCase {
+    private static let identifyWrite = Array("ID\r".utf8)
+    private static let mmdvmProbeWrite: [UInt8] = [0xE0, 0x03, 0x00]
     private static let packetModeRecoveryWrites: [[UInt8]] = [
         [0x0D],
         [0x0D],
@@ -14,12 +16,35 @@ final class AzimuthRadioModePreflightTests: XCTestCase {
         Array("\rTC 1\r".utf8),
         Array("TN 0,0\r".utf8),
     ]
-    private static let recoveredCATWrites = packetModeRecoveryWrites + [
-        Array("ID\r".utf8),
-    ]
+    private static let recoveredCATWrites = [identifyWrite]
+        + packetModeRecoveryWrites
+        + [identifyWrite]
     private static let persistentMMDVMWrites = recoveredCATWrites + [
-        [0xE0, 0x03, 0x00],
+        mmdvmProbeWrite,
     ]
+    private static let residueDetectedRecoveredCATWrites = packetModeRecoveryWrites + [
+        identifyWrite,
+    ]
+    private static let residueDetectedPersistentMMDVMWrites =
+        residueDetectedRecoveredCATWrites + [
+            mmdvmProbeWrite,
+        ]
+    private static let focusedRecoveryTiming = AzimuthPacketModeRecoveryTiming(
+        initialFlushDelay: .zero,
+        kissReturnDelay: .zero,
+        tncExitDelay: .zero,
+        finalSettleDelay: .zero,
+        quietWindow: .milliseconds(1),
+        residueDrainLimit: .milliseconds(50)
+    )
+    private static let residueDetectingCATTiming = AzimuthCATPreservationTiming(
+        quietWindow: .milliseconds(5),
+        responseTimeout: .milliseconds(5)
+    )
+    private static let immediateCATTiming = AzimuthCATPreservationTiming(
+        quietWindow: .zero,
+        responseTimeout: .milliseconds(5)
+    )
     private static let drainOnlyRecoveryTiming = AzimuthPacketModeRecoveryTiming(
         initialFlushDelay: .zero,
         kissReturnDelay: .zero,
@@ -33,14 +58,79 @@ final class AzimuthRadioModePreflightTests: XCTestCase {
         transport: any AzimuthRadioTransport,
         probeTimeout: Duration,
         catIdentityTimeout: Duration,
-        packetModeRecoveryTiming: AzimuthPacketModeRecoveryTiming = .immediate
+        catPreservationTiming: AzimuthCATPreservationTiming? = nil,
+        packetModeRecoveryTiming: AzimuthPacketModeRecoveryTiming =
+            AzimuthRadioModePreflightTests.focusedRecoveryTiming
     ) -> AzimuthRadioModePreflight {
         AzimuthRadioModePreflight(
             transport: transport,
             probeTimeout: probeTimeout,
             catIdentityTimeout: catIdentityTimeout,
+            catPreservationTiming: catPreservationTiming ?? AzimuthCATPreservationTiming(
+                quietWindow: .milliseconds(1),
+                responseTimeout: catIdentityTimeout
+            ),
             packetModeRecoveryTiming: packetModeRecoveryTiming
         )
+    }
+
+    func testNormalCATIsProvedBeforeRecoveryAndNeverWritesPacketModeExit() async throws {
+        let transport = RadioModeTestTransport(
+            responsesForWrite: { bytes in
+                bytes == Self.identifyWrite ? [Array("ID TH-D75\r".utf8)] : []
+            }
+        )
+        let preflight = makePreflight(
+            transport: transport,
+            probeTimeout: .milliseconds(5),
+            catIdentityTimeout: .milliseconds(5),
+            catPreservationTiming: Self.residueDetectingCATTiming
+        )
+
+        let mode = try await preflight.prepareForAutomation()
+
+        XCTAssertEqual(mode, .cat)
+        XCTAssertEqual(transport.writes, [Self.identifyWrite])
+        XCTAssertFalse(transport.writes.contains(Array("TN 0,0\r".utf8)))
+        XCTAssertEqual(transport.remainingScriptedReadCount, 0)
+        XCTAssertEqual(transport.activeReadCount, 0)
+    }
+
+    func testCATOnlyProofFailureNeverWritesRecoveryOrMMDVMProbe() async throws {
+        let transport = RadioModeTestTransport()
+        let preflight = makePreflight(
+            transport: transport,
+            probeTimeout: .milliseconds(5),
+            catIdentityTimeout: .milliseconds(5),
+            catPreservationTiming: Self.immediateCATTiming
+        )
+
+        let mode = try await preflight.proveCATWithoutPacketModeRecovery()
+
+        XCTAssertEqual(mode, .unresponsive)
+        XCTAssertEqual(transport.writes, [Self.identifyWrite])
+        XCTAssertFalse(transport.writes.contains(Array("TN 0,0\r".utf8)))
+        XCTAssertFalse(transport.writes.contains(Self.mmdvmProbeWrite))
+        XCTAssertEqual(transport.activeReadCount, 0)
+    }
+
+    func testCATOnlyProofRejectsQueuedResidueWithoutWritingAnyProbe() async throws {
+        let transport = RadioModeTestTransport(reads: [[0x3F, 0x0D]])
+        let preflight = makePreflight(
+            transport: transport,
+            probeTimeout: .milliseconds(5),
+            catIdentityTimeout: .milliseconds(5),
+            catPreservationTiming: Self.residueDetectingCATTiming
+        )
+
+        let mode = try await preflight.proveCATWithoutPacketModeRecovery()
+
+        XCTAssertEqual(mode, .unresponsive)
+        XCTAssertTrue(transport.writes.isEmpty)
+        XCTAssertFalse(transport.writes.contains(Array("TN 0,0\r".utf8)))
+        XCTAssertFalse(transport.writes.contains(Self.mmdvmProbeWrite))
+        XCTAssertEqual(transport.remainingScriptedReadCount, 1)
+        XCTAssertEqual(transport.activeReadCount, 0)
     }
 
     func testPersistentMMDVMResponseAfterRecoveryIsClassifiedAndEntireFrameIsDrained() async throws {
@@ -96,13 +186,14 @@ final class AzimuthRadioModePreflightTests: XCTestCase {
             transport: transport,
             probeTimeout: .milliseconds(5),
             catIdentityTimeout: .milliseconds(100),
+            catPreservationTiming: Self.residueDetectingCATTiming,
             packetModeRecoveryTiming: Self.drainOnlyRecoveryTiming
         )
 
         let mode = try await preflight.prepareForAutomation()
 
         XCTAssertEqual(mode, .unresponsive)
-        XCTAssertEqual(transport.writes, Self.persistentMMDVMWrites)
+        XCTAssertEqual(transport.writes, Self.residueDetectedPersistentMMDVMWrites)
         XCTAssertEqual(transport.remainingScriptedReadCount, 0)
         XCTAssertEqual(transport.activeReadCount, 0)
     }
@@ -139,6 +230,7 @@ final class AzimuthRadioModePreflightTests: XCTestCase {
             transport: transport,
             probeTimeout: .milliseconds(100),
             catIdentityTimeout: .milliseconds(20),
+            catPreservationTiming: Self.residueDetectingCATTiming,
             packetModeRecoveryTiming: Self.drainOnlyRecoveryTiming
         )
 
@@ -147,7 +239,7 @@ final class AzimuthRadioModePreflightTests: XCTestCase {
         XCTAssertEqual(mode, .cat)
         XCTAssertEqual(
             transport.writes,
-            Self.recoveredCATWrites
+            Self.residueDetectedRecoveredCATWrites
         )
         XCTAssertEqual(transport.remainingScriptedReadCount, 0)
         XCTAssertEqual(transport.activeReadCount, 0)
@@ -264,16 +356,21 @@ final class AzimuthRadioModePreflightTests: XCTestCase {
         XCTAssertEqual(transport.activeReadCount, 0)
     }
 
-    func testTransientPacketModeRecoveryProvesCATBeforeMMDVMProbe() async throws {
+    func testFailedFastIdentityFallsBackExactlyOnceAndRecoversCAT() async throws {
+        let identityWrites = ThreadSafeOccurrenceCounter()
         let transport = RadioModeTestTransport(
             responsesForWrite: { bytes in
-                bytes == Array("ID\r".utf8) ? [Array("ID TH-D75\r".utf8)] : []
+                guard bytes == Self.identifyWrite else { return [] }
+                return identityWrites.next() == 2
+                    ? [Array("ID TH-D75\r".utf8)]
+                    : []
             }
         )
         let preflight = makePreflight(
             transport: transport,
             probeTimeout: .milliseconds(5),
-            catIdentityTimeout: .milliseconds(20)
+            catIdentityTimeout: .milliseconds(20),
+            catPreservationTiming: Self.immediateCATTiming
         )
 
         let mode = try await preflight.prepareForAutomation()
@@ -283,11 +380,52 @@ final class AzimuthRadioModePreflightTests: XCTestCase {
             transport.writes,
             Self.recoveredCATWrites
         )
+        XCTAssertEqual(
+            transport.writes.filter { $0 == Array("TN 0,0\r".utf8) }.count,
+            1
+        )
+        XCTAssertEqual(transport.remainingScriptedReadCount, 0)
+        XCTAssertEqual(transport.activeReadCount, 0)
+    }
+
+    func testAmbiguousFastIdentityFallsBackExactlyOnceAndRecoversCAT() async throws {
+        let identityWrites = ThreadSafeOccurrenceCounter()
+        let transport = RadioModeTestTransport(
+            responsesForWrite: { bytes in
+                guard bytes == Self.identifyWrite else { return [] }
+                return identityWrites.next() == 1
+                    ? [Array("ID TH-D75\r".utf8) + [0x3F]]
+                    : [Array("ID TH-D75\r".utf8)]
+            }
+        )
+        let preflight = makePreflight(
+            transport: transport,
+            probeTimeout: .milliseconds(5),
+            catIdentityTimeout: .milliseconds(20),
+            catPreservationTiming: Self.immediateCATTiming
+        )
+
+        let mode = try await preflight.prepareForAutomation()
+
+        XCTAssertEqual(mode, .cat)
+        XCTAssertEqual(transport.writes, Self.recoveredCATWrites)
+        XCTAssertEqual(
+            transport.writes.filter { $0 == Array("TN 0,0\r".utf8) }.count,
+            1
+        )
         XCTAssertEqual(transport.remainingScriptedReadCount, 0)
         XCTAssertEqual(transport.activeReadCount, 0)
     }
 
     func testProductionRecoveryTimingMatchesProvenRadioSequence() {
+        XCTAssertEqual(
+            AzimuthCATPreservationTiming.radio.quietWindow,
+            .milliseconds(100)
+        )
+        XCTAssertEqual(
+            AzimuthCATPreservationTiming.radio.responseTimeout,
+            .milliseconds(500)
+        )
         XCTAssertEqual(
             AzimuthPacketModeRecoveryTiming.radio.initialFlushDelay,
             .milliseconds(300)
@@ -473,13 +611,14 @@ final class AzimuthRadioModePreflightTests: XCTestCase {
             transport: transport,
             probeTimeout: .milliseconds(100),
             catIdentityTimeout: .milliseconds(20),
+            catPreservationTiming: Self.residueDetectingCATTiming,
             packetModeRecoveryTiming: Self.drainOnlyRecoveryTiming
         )
 
         let mode = try await preflight.prepareForAutomation()
 
         XCTAssertEqual(mode, .unresponsive)
-        XCTAssertEqual(transport.writes, Self.persistentMMDVMWrites)
+        XCTAssertEqual(transport.writes, Self.residueDetectedPersistentMMDVMWrites)
         XCTAssertEqual(transport.remainingScriptedReadCount, 0)
         XCTAssertEqual(transport.activeReadCount, 0)
     }
@@ -498,15 +637,21 @@ final class AzimuthRadioModePreflightTests: XCTestCase {
             transport: transport,
             probeTimeout: .seconds(30),
             catIdentityTimeout: .seconds(30),
+            catPreservationTiming: Self.immediateCATTiming,
             packetModeRecoveryTiming: timing
         )
         let task = Task { try await preflight.prepareForAutomation() }
 
         let drainStartDeadline = ContinuousClock.now.advanced(by: .seconds(1))
-        while transport.activeReadCount == 0,
+        while (transport.writes.count < Self.recoveredCATWrites.count - 1
+                || transport.activeReadCount == 0),
               ContinuousClock.now < drainStartDeadline {
             try await Task.sleep(for: .milliseconds(1))
         }
+        XCTAssertEqual(
+            transport.writes,
+            [Self.identifyWrite] + Self.packetModeRecoveryWrites
+        )
         XCTAssertEqual(transport.activeReadCount, 1)
         task.cancel()
 
@@ -516,16 +661,23 @@ final class AzimuthRadioModePreflightTests: XCTestCase {
         } catch is CancellationError {
             // Expected.
         }
-        XCTAssertEqual(transport.writes, Self.packetModeRecoveryWrites)
+        XCTAssertEqual(
+            transport.writes,
+            [Self.identifyWrite] + Self.packetModeRecoveryWrites
+        )
         XCTAssertEqual(transport.activeReadCount, 0)
     }
 
-    func testCancellationRemovesParkedCATIdentityReadBeforeMMDVMProbe() async throws {
+    func testCancellationDuringPreRecoveryQuietSendsNoRecoveryBytes() async throws {
         let transport = RadioModeTestTransport()
         let preflight = makePreflight(
             transport: transport,
             probeTimeout: .seconds(30),
-            catIdentityTimeout: .milliseconds(5)
+            catIdentityTimeout: .seconds(30),
+            catPreservationTiming: AzimuthCATPreservationTiming(
+                quietWindow: .seconds(30),
+                responseTimeout: .seconds(30)
+            )
         )
         let task = Task { try await preflight.prepareForAutomation() }
 
@@ -535,15 +687,50 @@ final class AzimuthRadioModePreflightTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(1))
         }
         XCTAssertEqual(transport.activeReadCount, 1)
+        XCTAssertTrue(transport.writes.isEmpty)
         task.cancel()
 
         do {
             _ = try await task.value
-            XCTFail("A cancelled CAT identity probe must not continue into MMDVM probing")
+            XCTFail("A cancelled pre-recovery quiet check must not enter recovery")
         } catch is CancellationError {
             // Expected.
         }
-        XCTAssertEqual(transport.writes, Self.recoveredCATWrites)
+        XCTAssertTrue(transport.writes.isEmpty)
+        XCTAssertFalse(transport.writes.contains(Array("TN 0,0\r".utf8)))
+        XCTAssertEqual(transport.activeReadCount, 0)
+    }
+
+    func testCancellationDuringFastCATIdentityReadSendsNoRecoveryBytes() async throws {
+        let transport = RadioModeTestTransport()
+        let preflight = makePreflight(
+            transport: transport,
+            probeTimeout: .seconds(30),
+            catIdentityTimeout: .seconds(30),
+            catPreservationTiming: AzimuthCATPreservationTiming(
+                quietWindow: .zero,
+                responseTimeout: .seconds(30)
+            )
+        )
+        let task = Task { try await preflight.prepareForAutomation() }
+
+        let readStartDeadline = ContinuousClock.now.advanced(by: .seconds(1))
+        while transport.activeReadCount == 0,
+              ContinuousClock.now < readStartDeadline {
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        XCTAssertEqual(transport.activeReadCount, 1)
+        XCTAssertEqual(transport.writes, [Self.identifyWrite])
+        task.cancel()
+
+        do {
+            _ = try await task.value
+            XCTFail("A cancelled fast CAT identity probe must not enter recovery")
+        } catch is CancellationError {
+            // Expected.
+        }
+        XCTAssertEqual(transport.writes, [Self.identifyWrite])
+        XCTAssertFalse(transport.writes.contains(Array("TN 0,0\r".utf8)))
         XCTAssertEqual(transport.activeReadCount, 0)
     }
 
@@ -561,18 +748,19 @@ final class AzimuthRadioModePreflightTests: XCTestCase {
             transport: transport,
             probeTimeout: .milliseconds(5),
             catIdentityTimeout: .milliseconds(5),
+            catPreservationTiming: Self.immediateCATTiming,
             packetModeRecoveryTiming: timing
         )
         let task = Task { try await preflight.prepareForAutomation() }
 
         let recoveryStartDeadline = ContinuousClock.now.advanced(by: .seconds(1))
-        while transport.writes.count < 2,
+        while transport.writes.count < 3,
               ContinuousClock.now < recoveryStartDeadline {
             try await Task.sleep(for: .milliseconds(1))
         }
         XCTAssertEqual(
             transport.writes,
-            [[0x0D], [0x0D]]
+            [Self.identifyWrite, [0x0D], [0x0D]]
         )
         task.cancel()
 
@@ -584,9 +772,21 @@ final class AzimuthRadioModePreflightTests: XCTestCase {
         }
         XCTAssertEqual(
             transport.writes,
-            [[0x0D], [0x0D]]
+            [Self.identifyWrite, [0x0D], [0x0D]]
         )
         XCTAssertEqual(transport.activeReadCount, 0)
+    }
+}
+
+private final class ThreadSafeOccurrenceCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+
+    func next() -> Int {
+        lock.withLock {
+            value += 1
+            return value
+        }
     }
 }
 

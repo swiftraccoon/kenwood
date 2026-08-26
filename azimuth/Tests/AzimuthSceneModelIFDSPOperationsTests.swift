@@ -7,7 +7,247 @@ import XCTest
 
 @MainActor
 final class AzimuthSceneModelIFDSPOperationsTests: XCTestCase {
-    func testStartPreparesRadioBeforeStartingPhysicalAudio() async {
+    func testNoUSBInputProofAfterPreparationRestoresWithoutStartingAudio() async {
+        let events = IFDSPTestEvents()
+        let radio = IFDSPTestRadioController(events: events, transport: "Bluetooth")
+        radio.currentIFDSPUSBInputProof = nil
+        let mode = IFDSPTestModeController(events: events)
+        let stream = IFDSPTestStream(events: events, startResult: .testStreaming)
+        let model = makeModel(radio: radio, mode: mode, stream: stream)
+
+        await model.startIFDSP()
+
+        XCTAssertEqual(events.values, ["radio.prepare", "radio.restore"])
+        XCTAssertTrue(
+            model.operationError?.contains(
+                "could not prove that the USB-C CAT and audio interfaces belong"
+            ) == true
+        )
+        XCTAssertNil(stream.lastInputProof)
+        XCTAssertEqual(model.ifDSPModeState, .inactive)
+    }
+
+    func testBluetoothUSBMMDVMBlockOffersMenu650InspectionBeforeMutationOrAudio() async {
+        let events = IFDSPTestEvents()
+        let radio = IFDSPTestRadioController(events: events, transport: "Bluetooth")
+        radio.automaticIFDSPDVGatewayRecoveryAvailable = true
+        radio.currentIFDSPUSBInputProof = nil
+        let mode = IFDSPTestModeController(events: events)
+        mode.prepareError = RadioControllerError.ifDspDVGatewayRecoveryRequired
+        let stream = IFDSPTestStream(events: events, startResult: .testStreaming)
+        let model = makeModel(radio: radio, mode: mode, stream: stream)
+
+        await model.startIFDSP()
+
+        XCTAssertEqual(events.values, ["radio.prepare"])
+        XCTAssertEqual(
+            model.ifDSPDVGatewayRecoveryAlert,
+            .offer(automaticRecoveryAvailable: true)
+        )
+        XCTAssertNil(model.operationError)
+        XCTAssertEqual(radio.disableDVGatewayCallCount, 0)
+        XCTAssertNil(stream.lastInputProof)
+        XCTAssertTrue(
+            model.ifDSPDVGatewayRecoveryAlert?.message.contains(
+                "IF-DSP needs USB-C CAT and audio control"
+            ) == true
+        )
+        XCTAssertTrue(
+            model.ifDSPDVGatewayRecoveryAlert?.message.contains(
+                "set it to Off only if needed"
+            ) == true
+        )
+        XCTAssertFalse(
+            model.ifDSPDVGatewayRecoveryAlert?.message.contains(
+                "Menu 650 is set"
+            ) == true
+        )
+        XCTAssertTrue(
+            model.ifDSPDVGatewayRecoveryAlert?.message.contains(
+                "resets the radio’s CAT and USB interfaces even when no setting write is needed"
+            ) == true
+        )
+    }
+
+    func testProvedUSBAudioPreflightRunsBeforeRadioPreparation() async {
+        let events = IFDSPTestEvents()
+        let radio = IFDSPTestRadioController(events: events, transport: "USB-C")
+        let mode = IFDSPTestModeController(events: events)
+        let stream = IFDSPTestStream(events: events, startResult: .testStreaming)
+        let model = makeModel(radio: radio, mode: mode, stream: stream)
+
+        await model.startIFDSP()
+
+        XCTAssertEqual(
+            events.values,
+            ["audio.preflight", "radio.prepare", "audio.start"]
+        )
+        XCTAssertEqual(stream.lastInputProof, .testProof)
+        XCTAssertTrue(model.ifDSPState.isStreaming)
+        XCTAssertNil(model.ifDSPDVGatewayRecoveryAlert)
+        guard case .connected(_, let transport) = model.radioState.connection else {
+            return XCTFail("IF-DSP should remain connected through proved USB-C CAT")
+        }
+        XCTAssertEqual(transport, "USB-C")
+    }
+
+    func testApprovedDVGatewayRecoveryReconnectsBeforeResumingIFDSPOnce() async {
+        let events = IFDSPTestEvents()
+        let radio = IFDSPTestRadioController(events: events, transport: "Bluetooth")
+        radio.automaticIFDSPDVGatewayRecoveryAvailable = true
+        radio.currentIFDSPUSBInputProof = nil
+        radio.inputProofAfterDVGatewayRecovery = .testProof
+        let mode = IFDSPTestModeController(events: events)
+        mode.prepareError = RadioControllerError.ifDspDVGatewayRecoveryRequired
+        let stream = IFDSPTestStream(events: events, startResult: .testStreaming)
+        let model = makeModel(radio: radio, mode: mode, stream: stream)
+        await model.startIFDSP()
+        mode.prepareError = nil
+        events.values.removeAll()
+
+        await model.inspectDVGatewayAndStartIFDSP()
+
+        XCTAssertEqual(
+            events.values,
+            [
+                "radio.disable-dv-gateway",
+                "audio.preflight",
+                "radio.prepare",
+                "audio.start",
+            ]
+        )
+        XCTAssertEqual(radio.disableDVGatewayCallCount, 1)
+        XCTAssertNil(model.ifDSPDVGatewayRecoveryAlert)
+        XCTAssertTrue(model.ifDSPState.isStreaming)
+        XCTAssertEqual(stream.lastInputProof, .testProof)
+        guard case .connected(_, let transport) = model.radioState.connection else {
+            return XCTFail("Approved recovery should leave CAT on the proved USB-C endpoint")
+        }
+        XCTAssertEqual(transport, "USB-C")
+    }
+
+    func testDecliningDVGatewayRecoveryLeavesRadioAndAudioUntouched() async {
+        let events = IFDSPTestEvents()
+        let radio = IFDSPTestRadioController(events: events, transport: "Bluetooth")
+        radio.automaticIFDSPDVGatewayRecoveryAvailable = true
+        radio.currentIFDSPUSBInputProof = nil
+        let mode = IFDSPTestModeController(events: events)
+        mode.prepareError = RadioControllerError.ifDspDVGatewayRecoveryRequired
+        let stream = IFDSPTestStream(events: events, startResult: .testStreaming)
+        let model = makeModel(radio: radio, mode: mode, stream: stream)
+        await model.startIFDSP()
+        events.values.removeAll()
+
+        model.dismissIFDSPDVGatewayRecoveryAlert()
+
+        XCTAssertEqual(events.values, [])
+        XCTAssertEqual(radio.disableDVGatewayCallCount, 0)
+        XCTAssertEqual(model.ifDSPState, .idle)
+    }
+
+    func testRejectedDVGatewayRecoveryDoesNotOfferTheSameActionAgain() async {
+        let events = IFDSPTestEvents()
+        let radio = IFDSPTestRadioController(events: events, transport: "Bluetooth")
+        radio.automaticIFDSPDVGatewayRecoveryAvailable = true
+        radio.currentIFDSPUSBInputProof = nil
+        radio.disableDVGatewayError = RadioControllerError.capabilityUnavailable(
+            "The attached USB-C endpoint could not be proved. No radio setting was changed."
+        )
+        let mode = IFDSPTestModeController(events: events)
+        mode.prepareError = RadioControllerError.ifDspDVGatewayRecoveryRequired
+        let stream = IFDSPTestStream(events: events, startResult: .testStreaming)
+        let model = makeModel(radio: radio, mode: mode, stream: stream)
+        await model.startIFDSP()
+        events.values.removeAll()
+
+        await model.inspectDVGatewayAndStartIFDSP()
+
+        XCTAssertEqual(events.values, ["radio.disable-dv-gateway"])
+        XCTAssertEqual(radio.disableDVGatewayCallCount, 1)
+        XCTAssertEqual(
+            model.ifDSPDVGatewayRecoveryAlert,
+            .failed(
+                message: "The attached USB-C endpoint could not be proved. No radio setting was changed."
+            )
+        )
+        XCTAssertFalse(
+            model.ifDSPDVGatewayRecoveryAlert?.automaticRecoveryAvailable == true
+        )
+        XCTAssertEqual(
+            model.ifDSPDVGatewayRecoveryAlert?.dismissalButtonTitle,
+            "Dismiss"
+        )
+    }
+
+    func testCancelledDVGatewayInspectionDoesNotRelaunchOffer() async {
+        let events = IFDSPTestEvents()
+        let radio = IFDSPTestRadioController(events: events, transport: "Bluetooth")
+        radio.automaticIFDSPDVGatewayRecoveryAvailable = true
+        radio.currentIFDSPUSBInputProof = nil
+        radio.waitForDVGatewayRecoveryCancellation = true
+        let mode = IFDSPTestModeController(events: events)
+        mode.prepareError = RadioControllerError.ifDspDVGatewayRecoveryRequired
+        let stream = IFDSPTestStream(events: events, startResult: .testStreaming)
+        let model = makeModel(radio: radio, mode: mode, stream: stream)
+        await model.startIFDSP()
+
+        let recovery = Task { await model.inspectDVGatewayAndStartIFDSP() }
+        await assertEventually {
+            radio.disableDVGatewayCallCount == 1
+        }
+        recovery.cancel()
+        await recovery.value
+
+        XCTAssertNil(model.ifDSPDVGatewayRecoveryAlert)
+        XCTAssertEqual(radio.disableDVGatewayCallCount, 1)
+        XCTAssertNil(stream.lastInputProof)
+
+        await model.startIFDSP()
+
+        XCTAssertEqual(
+            model.ifDSPDVGatewayRecoveryAlert,
+            .offer(automaticRecoveryAvailable: true)
+        )
+        XCTAssertEqual(radio.disableDVGatewayCallCount, 1)
+    }
+
+    func testPostAttemptFailureRequiresAFreshIFDSPPreflightBeforeAnotherApproval() async {
+        let events = IFDSPTestEvents()
+        let radio = IFDSPTestRadioController(events: events, transport: "Bluetooth")
+        radio.automaticIFDSPDVGatewayRecoveryAvailable = true
+        radio.currentIFDSPUSBInputProof = nil
+        radio.disableDVGatewayError = RadioControllerError.operationFailed(
+            "The radio restarted, but its Bluetooth CAT connection did not return."
+        )
+        let mode = IFDSPTestModeController(events: events)
+        mode.prepareError = RadioControllerError.ifDspDVGatewayRecoveryRequired
+        let stream = IFDSPTestStream(events: events, startResult: .testStreaming)
+        let model = makeModel(radio: radio, mode: mode, stream: stream)
+        await model.startIFDSP()
+
+        await model.inspectDVGatewayAndStartIFDSP()
+
+        XCTAssertEqual(
+            model.ifDSPDVGatewayRecoveryAlert,
+            .failed(
+                message: "The radio restarted, but its Bluetooth CAT connection did not return."
+            )
+        )
+        XCTAssertFalse(
+            model.ifDSPDVGatewayRecoveryAlert?.automaticRecoveryAvailable == true
+        )
+
+        model.dismissIFDSPDVGatewayRecoveryAlert()
+        await model.startIFDSP()
+
+        XCTAssertEqual(
+            model.ifDSPDVGatewayRecoveryAlert,
+            .offer(automaticRecoveryAvailable: true)
+        )
+        XCTAssertEqual(radio.disableDVGatewayCallCount, 1)
+    }
+
+    func testStartPreflightsPhysicalAudioBeforePreparingRadio() async {
         let events = IFDSPTestEvents()
         let radio = IFDSPTestRadioController(events: events)
         let mode = IFDSPTestModeController(events: events)
@@ -16,19 +256,26 @@ final class AzimuthSceneModelIFDSPOperationsTests: XCTestCase {
 
         await model.startIFDSP()
 
-        XCTAssertEqual(events.values, ["radio.prepare", "audio.start"])
+        XCTAssertEqual(
+            events.values,
+            ["audio.preflight", "radio.prepare", "audio.start"]
+        )
+        XCTAssertEqual(stream.lastInputProof, .testProof)
         XCTAssertEqual(model.ifDSPModeState, .active(.testStatus))
         XCTAssertTrue(model.ifDSPState.isStreaming)
         XCTAssertNil(model.operationError)
     }
 
-    func testMissingUSBAudioStopsCaptureAndRestoresRadioImmediately() async {
+    func testMissingUSBAudioDoesNotPrepareOrRestoreTheRadio() async {
         let events = IFDSPTestEvents()
         let radio = IFDSPTestRadioController(events: events)
         let mode = IFDSPTestModeController(events: events)
         let stream = IFDSPTestStream(
             events: events,
-            startResult: .waitingForUSBAudio(availableInputs: ["iPad Microphone"])
+            startResult: .testStreaming,
+            preflightFailure: .waitingForUSBAudio(
+                availableInputs: ["iPad Microphone"]
+            )
         )
         let model = makeModel(radio: radio, mode: mode, stream: stream)
 
@@ -36,11 +283,78 @@ final class AzimuthSceneModelIFDSPOperationsTests: XCTestCase {
 
         XCTAssertEqual(
             events.values,
-            ["radio.prepare", "audio.start", "audio.stop", "radio.restore"]
+            ["audio.preflight", "audio.stop"]
         )
         XCTAssertEqual(model.ifDSPModeState, .inactive)
         XCTAssertEqual(model.ifDSPState, .idle)
         XCTAssertTrue(model.operationError?.contains("TH-D75 USB audio input was not available") == true)
+    }
+
+    func testCancellationAfterAudioPreflightCannotPrepareTheRadio() async {
+        let events = IFDSPTestEvents()
+        let radio = IFDSPTestRadioController(events: events)
+        let mode = IFDSPTestModeController(events: events)
+        let stream = IFDSPTestStream(events: events, startResult: .testStreaming)
+        stream.waitForPreflightCancellation = true
+        let model = makeModel(radio: radio, mode: mode, stream: stream)
+
+        let start = Task { await model.startIFDSP() }
+        await assertEventually {
+            events.values.contains("audio.preflight")
+        }
+        start.cancel()
+        await start.value
+
+        XCTAssertEqual(events.values, ["audio.preflight", "audio.stop"])
+        XCTAssertFalse(events.values.contains("radio.prepare"))
+        XCTAssertEqual(model.ifDSPModeState, .inactive)
+        XCTAssertNil(model.operationError)
+    }
+
+    func testCancellationAfterRadioPreparationRestoresBeforeAudioStart() async {
+        let events = IFDSPTestEvents()
+        let radio = IFDSPTestRadioController(events: events)
+        let mode = IFDSPTestModeController(events: events)
+        mode.prepareAction = {
+            withUnsafeCurrentTask { task in
+                task?.cancel()
+            }
+        }
+        let stream = IFDSPTestStream(events: events, startResult: .testStreaming)
+        let model = makeModel(radio: radio, mode: mode, stream: stream)
+
+        await model.startIFDSP()
+
+        XCTAssertEqual(
+            events.values,
+            ["audio.preflight", "radio.prepare", "audio.stop", "radio.restore"]
+        )
+        XCTAssertFalse(events.values.contains("audio.start"))
+        XCTAssertEqual(model.ifDSPModeState, .inactive)
+    }
+
+    func testCancellationAfterAudioStartStopsCaptureAndRestoresRadio() async {
+        let events = IFDSPTestEvents()
+        let radio = IFDSPTestRadioController(events: events)
+        let mode = IFDSPTestModeController(events: events)
+        let stream = IFDSPTestStream(events: events, startResult: .testStreaming)
+        stream.cancelDuringStart = true
+        let model = makeModel(radio: radio, mode: mode, stream: stream)
+
+        await model.startIFDSP()
+
+        XCTAssertEqual(
+            events.values,
+            [
+                "audio.preflight",
+                "radio.prepare",
+                "audio.start",
+                "audio.stop",
+                "radio.restore",
+            ]
+        )
+        XCTAssertEqual(model.ifDSPState, .idle)
+        XCTAssertEqual(model.ifDSPModeState, .inactive)
     }
 
     func testUserStopEndsAudioBeforeRestoringEveryRadioField() async {
@@ -175,6 +489,94 @@ final class AzimuthSceneModelIFDSPOperationsTests: XCTestCase {
         XCTAssertEqual(model.ifDSPModeState, .inactive)
     }
 
+    func testPrepareFailureWithFailedRestorationReportsOneOutcomeAndKeepsRetryState() async throws {
+        let events = IFDSPTestEvents()
+        let radio = IFDSPTestRadioController(events: events)
+        let mode = IFDSPTestModeController(events: events)
+        let stream = IFDSPTestStream(events: events, startResult: .testStreaming)
+        let model = makeModel(radio: radio, mode: mode, stream: stream)
+        mode.prepareError = IFDSPTestError.prepareRejected
+        mode.prepareRestorationPending = true
+        mode.restoreError = .restoreRejected
+
+        await model.startIFDSP()
+
+        XCTAssertEqual(
+            events.values,
+            ["audio.preflight", "radio.prepare", "audio.stop", "radio.restore"]
+        )
+        XCTAssertEqual(model.ifDSPState, .idle)
+        guard case .failed(_, let restorationPending) = model.ifDSPModeState else {
+            return XCTFail("A failed restore must keep the IF-DSP radio state reserved")
+        }
+        XCTAssertTrue(restorationPending, "The workspace must continue to offer Retry Restore")
+        XCTAssertTrue(model.ifDSPModeState.reservesRadioState)
+
+        let error = try XCTUnwrap(model.operationError)
+        XCTAssertEqual(
+            error,
+            "IF-DSP couldn’t start, and Azimuth still could not verify the saved radio state. "
+                + "The saved radio state could not be restored. Return the radio to normal "
+                + "dual-band VFO operation, then choose Retry Restore before starting IF-DSP again."
+        )
+        XCTAssertFalse(error.contains("The IF tap could not be prepared."))
+        XCTAssertFalse(error.contains("Radio restoration also failed"))
+        XCTAssertTrue(error.contains("Retry Restore"))
+    }
+
+    func testPrepareFailureWithSuccessfulRestorationReportsTheCompletedOutcome() async throws {
+        let events = IFDSPTestEvents()
+        let radio = IFDSPTestRadioController(events: events)
+        let mode = IFDSPTestModeController(events: events)
+        let stream = IFDSPTestStream(events: events, startResult: .testStreaming)
+        let model = makeModel(radio: radio, mode: mode, stream: stream)
+        mode.prepareError = IFDSPTestError.prepareRejected
+        mode.prepareRestorationPending = true
+
+        await model.startIFDSP()
+
+        XCTAssertEqual(
+            events.values,
+            ["audio.preflight", "radio.prepare", "audio.stop", "radio.restore"]
+        )
+        XCTAssertEqual(model.ifDSPModeState, .inactive)
+        XCTAssertFalse(model.ifDSPModeState.reservesRadioState)
+        XCTAssertEqual(
+            model.operationError,
+            "IF-DSP couldn’t start, but Azimuth restored and verified the saved radio state. "
+                + "Correct the radio mode or connection problem, then try again."
+        )
+        XCTAssertFalse(model.operationError?.contains("could not restore") == true)
+        XCTAssertFalse(model.operationError?.contains("Retry Restore") == true)
+    }
+
+    func testPrepareFailureWithPostRestoreRefreshFailureDoesNotOfferRetryRestore() async throws {
+        let events = IFDSPTestEvents()
+        let radio = IFDSPTestRadioController(events: events)
+        let mode = IFDSPTestModeController(events: events)
+        let stream = IFDSPTestStream(events: events, startResult: .testStreaming)
+        let model = makeModel(radio: radio, mode: mode, stream: stream)
+        mode.prepareError = IFDSPTestError.prepareRejected
+        mode.prepareRestorationPending = true
+        mode.restoreError = .restoreRejected
+        mode.restoreCompletesBeforeError = true
+
+        await model.startIFDSP()
+
+        XCTAssertEqual(
+            events.values,
+            ["audio.preflight", "radio.prepare", "audio.stop", "radio.restore"]
+        )
+        XCTAssertEqual(model.ifDSPModeState, .inactive)
+        XCTAssertFalse(model.ifDSPModeState.reservesRadioState)
+        let error = try XCTUnwrap(model.operationError)
+        XCTAssertTrue(error.contains("restored and verified the saved radio state"))
+        XCTAssertTrue(error.contains("settings/screen workspace could not be refreshed"))
+        XCTAssertTrue(error.contains("Reconnect before trying again"))
+        XCTAssertFalse(error.contains("still could not verify"))
+        XCTAssertFalse(error.contains("Retry Restore"))
+    }
+
     func testBackgroundRestoresBeforeDisconnectAndDoesNotRestartIFMode() async {
         let events = IFDSPTestEvents()
         let radio = IFDSPTestRadioController(events: events)
@@ -303,7 +705,9 @@ private final class IFDSPTestEvents {
 private final class IFDSPTestModeController: IFDSPModeControlling {
     private(set) var ifDSPModeState: IFDSPRadioModeState = .inactive
     private let events: IFDSPTestEvents
-    var prepareError: IFDSPTestError?
+    var prepareError: (any Error)?
+    var prepareAction: (() -> Void)?
+    var prepareRestorationPending = false
     var retuneError: IFDSPTestError?
     var retuneRestorationPending = false
     var retuneDelayNanoseconds: UInt64 = 0
@@ -315,9 +719,13 @@ private final class IFDSPTestModeController: IFDSPModeControlling {
     }
 
     func prepareIFDSPMode() async throws -> IFDSPRadioModeStatus {
+        prepareAction?()
         events.values.append("radio.prepare")
         if let prepareError {
-            ifDSPModeState = .failed(message: prepareError.localizedDescription, restorationPending: false)
+            ifDSPModeState = .failed(
+                message: prepareError.localizedDescription,
+                restorationPending: prepareRestorationPending
+            )
             throw prepareError
         }
         ifDSPModeState = .active(.testStatus)
@@ -365,10 +773,20 @@ private final class IFDSPTestStream: IFDSPLiveStreaming {
     private let continuation: AsyncStream<IFDSPLiveStreamState>.Continuation
     private let events: IFDSPTestEvents
     private let startResult: IFDSPLiveStreamState
+    private let preflightFailure: IFDSPLiveStreamState?
+    private var preparedInput: IFDSPPreparedAudioInput?
+    private(set) var lastInputProof: IFDSPUSBInputProof?
+    var waitForPreflightCancellation = false
+    var cancelDuringStart = false
 
-    init(events: IFDSPTestEvents, startResult: IFDSPLiveStreamState) {
+    init(
+        events: IFDSPTestEvents,
+        startResult: IFDSPLiveStreamState,
+        preflightFailure: IFDSPLiveStreamState? = nil
+    ) {
         self.events = events
         self.startResult = startResult
+        self.preflightFailure = preflightFailure
         let stream = AsyncStream.makeStream(
             of: IFDSPLiveStreamState.self,
             bufferingPolicy: .bufferingNewest(16)
@@ -378,12 +796,52 @@ private final class IFDSPTestStream: IFDSPLiveStreaming {
         continuation.yield(currentState)
     }
 
-    func start() async {
+    func preflight(
+        inputProof: IFDSPUSBInputProof
+    ) async -> IFDSPPreparedAudioInput? {
+        lastInputProof = inputProof
+        events.values.append("audio.preflight")
+        if waitForPreflightCancellation {
+            do {
+                try await Task.sleep(for: .seconds(60))
+            } catch is CancellationError {
+                return nil
+            } catch {
+                return nil
+            }
+        }
+        if let preflightFailure {
+            publish(preflightFailure)
+            return nil
+        }
+        let preparedInput = IFDSPPreparedAudioInput()
+        self.preparedInput = preparedInput
+        publish(.starting(routeName: "TH-D75 USB Audio"))
+        return preparedInput
+    }
+
+    func start(preparedInput: IFDSPPreparedAudioInput) async {
+        guard self.preparedInput == preparedInput else {
+            publish(
+                .failed(
+                    message: "The prepared test audio input expired.",
+                    lastFrame: nil
+                )
+            )
+            return
+        }
+        self.preparedInput = nil
         events.values.append("audio.start")
         publish(startResult)
+        if cancelDuringStart {
+            withUnsafeCurrentTask { task in
+                task?.cancel()
+            }
+        }
     }
 
     func stop() {
+        preparedInput = nil
         events.values.append("audio.stop")
         publish(.idle)
     }
@@ -400,14 +858,21 @@ private final class IFDSPTestStream: IFDSPLiveStreaming {
 
 @MainActor
 private final class IFDSPTestRadioController: RadioControlling {
-    private(set) var currentState = IFDSPTestRadioController.connectedState
+    private(set) var currentState: RadioWorkspaceState
     let updates: AsyncStream<RadioWorkspaceState>
 
     private let continuation: AsyncStream<RadioWorkspaceState>.Continuation
     private let events: IFDSPTestEvents
+    var automaticIFDSPDVGatewayRecoveryAvailable = false
+    var currentIFDSPUSBInputProof: IFDSPUSBInputProof? = .testProof
+    var inputProofAfterDVGatewayRecovery: IFDSPUSBInputProof?
+    var disableDVGatewayError: (any Error)?
+    var waitForDVGatewayRecoveryCancellation = false
+    private(set) var disableDVGatewayCallCount = 0
 
-    init(events: IFDSPTestEvents) {
+    init(events: IFDSPTestEvents, transport: String = "USB-C") {
         self.events = events
+        currentState = Self.connectedState(transport: transport)
         let stream = AsyncStream.makeStream(
             of: RadioWorkspaceState.self,
             bufferingPolicy: .bufferingNewest(8)
@@ -419,7 +884,7 @@ private final class IFDSPTestRadioController: RadioControlling {
 
     func connect() async throws {
         events.values.append("connection.connect")
-        currentState = Self.connectedState
+        currentState = Self.connectedState(transport: "USB-C")
         continuation.yield(currentState)
     }
 
@@ -427,6 +892,28 @@ private final class IFDSPTestRadioController: RadioControlling {
         events.values.append("connection.disconnect")
         currentState = .disconnected
         continuation.yield(currentState)
+    }
+
+    func publishConnected(transport: String) {
+        currentState = Self.connectedState(transport: transport)
+        continuation.yield(currentState)
+    }
+
+    func disableDVGatewayAndReconnectForIFDSP() async throws {
+        disableDVGatewayCallCount += 1
+        events.values.append("radio.disable-dv-gateway")
+        if waitForDVGatewayRecoveryCancellation {
+            do {
+                try await Task.sleep(for: .seconds(60))
+            } catch {
+                throw CancellationError()
+            }
+        }
+        if let disableDVGatewayError { throw disableDVGatewayError }
+        if let inputProofAfterDVGatewayRecovery {
+            currentIFDSPUSBInputProof = inputProofAfterDVGatewayRecovery
+            publishConnected(transport: "USB-C")
+        }
     }
 
     func refreshScreen() async throws {}
@@ -440,19 +927,21 @@ private final class IFDSPTestRadioController: RadioControlling {
         RadioSettingApplyReport(results: [])
     }
 
-    private static let connectedState = RadioWorkspaceState(
-        connection: .connected(device: "TH-D75", transport: "USB-C"),
-        capabilities: RadioCapabilities(
-            screenStreaming: .available,
-            frontPanelControl: .available,
-            settingRead: .available,
-            settingWrite: .available
-        ),
-        screenFrame: nil,
-        telemetry: .unavailable,
-        settingValues: [:],
-        lastScreenError: nil
-    )
+    private static func connectedState(transport: String) -> RadioWorkspaceState {
+        RadioWorkspaceState(
+            connection: .connected(device: "TH-D75", transport: transport),
+            capabilities: RadioCapabilities(
+                screenStreaming: .available,
+                frontPanelControl: .available,
+                settingRead: .available,
+                settingWrite: .available
+            ),
+            screenFrame: nil,
+            telemetry: .unavailable,
+            settingValues: [:],
+            lastScreenError: nil
+        )
+    }
 }
 
 @MainActor
@@ -469,12 +958,15 @@ private final class IFDSPTestPlanner: AssistantPlanning {
 }
 
 private enum IFDSPTestError: LocalizedError {
+    case prepareRejected
     case retuneRejected
     case restoreRejected
     case unexpectedAssistant
 
     var errorDescription: String? {
         switch self {
+        case .prepareRejected:
+            "The IF tap could not be prepared."
         case .retuneRejected:
             "The retune was rejected."
         case .restoreRejected:
@@ -489,6 +981,13 @@ private extension IFDSPRadioModeStatus {
     static let testStatus = IFDSPRadioModeStatus(
         bandBFrequencyHz: 145_500_000,
         ifCenterHz: 12_000
+    )
+}
+
+private extension IFDSPUSBInputProof {
+    static let testProof = try! IFDSPUSBInputProof(
+        catSerialNumber: "C3C10368",
+        macOSUSBDeviceRegistryEntryID: nil
     )
 }
 

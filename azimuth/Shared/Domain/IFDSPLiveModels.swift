@@ -179,6 +179,63 @@ enum IFDSPLiveStreamState: Equatable, Sendable {
     }
 }
 
+/// Exact authority for selecting the physical USB IF input.
+///
+/// CAT `AE` remains the radio identity. On macOS, the nonzero IORegistry ID
+/// joins the currently opened, CAT-qualified USB CDC interface to its sibling
+/// CoreAudio interface during the same device enumeration. The registry ID is
+/// intentionally optional only because iPadOS does not expose this macOS
+/// identity mechanism.
+struct IFDSPUSBInputProof: Equatable, Sendable {
+    enum ValidationError: LocalizedError, Equatable, Sendable {
+        case invalidCATSerial
+        case invalidMacOSUSBDeviceRegistryEntryID
+
+        var errorDescription: String? {
+            switch self {
+            case .invalidCATSerial:
+                "The active CAT session did not provide a valid TH-D75 serial identity."
+            case .invalidMacOSUSBDeviceRegistryEntryID:
+                "The USB device did not provide a valid macOS registry identity."
+            }
+        }
+    }
+
+    let catSerialNumber: String
+    let macOSUSBDeviceRegistryEntryID: UInt64?
+
+    init(
+        catSerialNumber: String,
+        macOSUSBDeviceRegistryEntryID: UInt64?
+    ) throws {
+        let bytes = Array(catSerialNumber.utf8)
+        guard bytes.count == 8,
+              bytes.allSatisfy({ byte in
+                  (0x20 ... 0x7E).contains(byte) && byte != 0x2C
+              }) else {
+            throw ValidationError.invalidCATSerial
+        }
+        if let macOSUSBDeviceRegistryEntryID,
+           macOSUSBDeviceRegistryEntryID == 0 {
+            throw ValidationError.invalidMacOSUSBDeviceRegistryEntryID
+        }
+        self.catSerialNumber = catSerialNumber
+        self.macOSUSBDeviceRegistryEntryID = macOSUSBDeviceRegistryEntryID
+    }
+}
+
+/// One service-owned, single-use authorization to start the exact audio input
+/// which passed permission, physical USB identity, and format preflight.
+/// Radio mutation happens only after a token exists; starting consumes it and
+/// revalidates the selected input immediately before capture.
+struct IFDSPPreparedAudioInput: Equatable, Sendable {
+    let id: UUID
+
+    init(id: UUID = UUID()) {
+        self.id = id
+    }
+}
+
 /// Integration boundary for a real Apple audio route feeding the Rust DSP.
 @MainActor
 protocol IFDSPLiveStreaming: AnyObject {
@@ -187,7 +244,8 @@ protocol IFDSPLiveStreaming: AnyObject {
     var configuration: IFDSPConfiguration { get }
     var monitoringState: IFDSPMonitoringState { get }
 
-    func start() async
+    func preflight(inputProof: IFDSPUSBInputProof) async -> IFDSPPreparedAudioInput?
+    func start(preparedInput: IFDSPPreparedAudioInput) async
     func stop()
     func setConfiguration(_ configuration: IFDSPConfiguration) async
 }
@@ -213,7 +271,11 @@ final class UnavailableIFDSPLiveStream: IFDSPLiveStreaming {
         }
     }
 
-    func start() async {}
+    func preflight(inputProof: IFDSPUSBInputProof) async -> IFDSPPreparedAudioInput? {
+        _ = inputProof
+        return nil
+    }
+    func start(preparedInput: IFDSPPreparedAudioInput) async {}
     func stop() {}
     func setConfiguration(_ configuration: IFDSPConfiguration) async {}
 }

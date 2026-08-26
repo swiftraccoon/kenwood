@@ -15,6 +15,11 @@ public struct AzimuthUSBEndpoint: Identifiable, Sendable, Equatable {
     /// Stable IORegistry USB serial used to follow the same radio when its CDC
     /// tty path changes after a reboot.
     public let usbSerialNumber: String?
+    /// IORegistry ID of the physical USB-device ancestor shared by this CDC
+    /// interface and its CoreAudio sibling during the current enumeration.
+    /// This value changes when the device re-enumerates and is never a radio
+    /// serial number.
+    public let usbDeviceRegistryEntryID: UInt64
 
     public var device: AzimuthRadioDevice {
         AzimuthRadioDevice(
@@ -37,12 +42,18 @@ public struct AzimuthUSBEndpoint: Identifiable, Sendable, Equatable {
         id: String,
         displayName: String,
         devicePath: String,
-        usbSerialNumber: String? = nil
+        usbSerialNumber: String? = nil,
+        usbDeviceRegistryEntryID: UInt64
     ) {
+        precondition(
+            usbDeviceRegistryEntryID != 0,
+            "A USB endpoint requires a nonzero USB-device registry entry ID"
+        )
         self.id = id
         self.displayName = displayName
         self.devicePath = devicePath
         self.usbSerialNumber = usbSerialNumber
+        self.usbDeviceRegistryEntryID = usbDeviceRegistryEntryID
     }
 }
 
@@ -98,7 +109,8 @@ public struct AzimuthPlatformUSBTransportFactory: AzimuthUSBTransportFactory {
                 ),
                 displayName: "Kenwood TH-D75",
                 devicePath: descriptor.path,
-                usbSerialNumber: descriptor.serialNumber
+                usbSerialNumber: descriptor.serialNumber,
+                usbDeviceRegistryEntryID: descriptor.usbDeviceRegistryEntryID
             )
         }
     }

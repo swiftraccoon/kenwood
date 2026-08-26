@@ -3,6 +3,7 @@
 
 #if os(macOS)
 
+import Darwin
 import Foundation
 import XCTest
 @testable import Azimuth
@@ -116,6 +117,21 @@ final class AzimuthPOSIXUSBDiscoveryTests: XCTestCase {
         )
     }
 
+    func testOpenedDeviceBindingAcceptsHighBitDarwinDeviceIdentifier() {
+        var status = stat()
+        status.st_dev = Int32(bitPattern: 0xE1A0_B96C)
+        status.st_ino = 1_469
+        status.st_rdev = 150_994_951
+        status.st_mode = UInt16(S_IFCHR) | 0o600
+
+        let node = POSIXAzimuthUSBSerialLink.openedDeviceNode(status)
+
+        XCTAssertEqual(node.device, status.st_dev)
+        XCTAssertEqual(node.inode, status.st_ino)
+        XCTAssertEqual(node.rawDevice, status.st_rdev)
+        XCTAssertTrue(node.isCharacterDevice)
+    }
+
     func testTHD75QualificationUsesBothUSBIdentifiers() {
         let exact = POSIXAzimuthUSBSerialLink.USBIdentity(
             vendorID: POSIXAzimuthUSBSerialLink.thD75VendorID,
@@ -163,6 +179,30 @@ final class AzimuthPOSIXUSBDiscoveryTests: XCTestCase {
         XCTAssertEqual(opened.fileDescriptor, fixture.fileDescriptor)
         XCTAssertEqual(opened.path, fixture.path)
         XCTAssertEqual(opened.identity.serialNumber, "C0000001")
+        XCTAssertEqual(opened.usbDeviceRegistryEntryID, 0xCAFE)
+        XCTAssertEqual(fixture.configureCallCount, 1)
+        XCTAssertTrue(fixture.closedFileDescriptors.isEmpty)
+    }
+
+    func testOpenBindingAcceptsTHD75WithoutDescriptorSerial() throws {
+        let fixture = POSIXOpenFixture()
+        let anonymous = POSIXAzimuthUSBSerialLink.RegisteredUSBDevice(
+            identity: .init(
+                vendorID: POSIXAzimuthUSBSerialLink.thD75VendorID,
+                productID: POSIXAzimuthUSBSerialLink.thD75ProductID,
+                serialNumber: nil
+            ),
+            usbDeviceRegistryEntryID: 0xCAFE
+        )
+        fixture.registeredDevices = [anonymous, anonymous]
+
+        let opened = try POSIXAzimuthUSBSerialLink.openAndBindDevice(
+            requestedPath: fixture.path,
+            access: fixture.access()
+        )
+
+        XCTAssertNil(opened.identity.serialNumber)
+        XCTAssertEqual(opened.usbDeviceRegistryEntryID, 0xCAFE)
         XCTAssertEqual(fixture.configureCallCount, 1)
         XCTAssertTrue(fixture.closedFileDescriptors.isEmpty)
     }
@@ -176,7 +216,7 @@ final class AzimuthPOSIXUSBDiscoveryTests: XCTestCase {
                     productID: POSIXAzimuthUSBSerialLink.thD75ProductID,
                     serialNumber: "C0000002"
                 ),
-                registryEntryID: 0xBEEF
+                usbDeviceRegistryEntryID: 0xBEEF
             ),
         ]
         let link = POSIXAzimuthUSBSerialLink(
@@ -204,7 +244,7 @@ final class AzimuthPOSIXUSBDiscoveryTests: XCTestCase {
         let fixture = POSIXOpenFixture()
         fixture.registeredDevices[1] = .init(
             identity: fixture.identity,
-            registryEntryID: 0xBEEF
+            usbDeviceRegistryEntryID: 0xBEEF
         )
 
         assertUnstableIdentity(fixture)
@@ -269,8 +309,10 @@ final class AzimuthPOSIXUSBDiscoveryTests: XCTestCase {
         }
 
         XCTAssertNil(link.hardwareSerialNumber)
+        XCTAssertNil(link.macOSUSBDeviceRegistryEntryID)
         try link.open()
         XCTAssertEqual(link.hardwareSerialNumber, "C0000001")
+        XCTAssertEqual(link.macOSUSBDeviceRegistryEntryID, 0xCAFE)
 
         // A pathname lookup after open must never replace the cached identity.
         fixture.registeredDevices = [.init(
@@ -279,14 +321,37 @@ final class AzimuthPOSIXUSBDiscoveryTests: XCTestCase {
                 productID: POSIXAzimuthUSBSerialLink.thD75ProductID,
                 serialNumber: "C0000002"
             ),
-            registryEntryID: 0xBEEF
+            usbDeviceRegistryEntryID: 0xBEEF
         )]
         XCTAssertEqual(link.hardwareSerialNumber, "C0000001")
+        XCTAssertEqual(link.macOSUSBDeviceRegistryEntryID, 0xCAFE)
 
         link.close()
         XCTAssertEqual(fixture.descriptorClosed.wait(timeout: .now() + 1), .success)
         XCTAssertNil(link.hardwareSerialNumber)
+        XCTAssertNil(link.macOSUSBDeviceRegistryEntryID)
         XCTAssertEqual(fixture.closedFileDescriptors, [descriptors[0]])
+    }
+
+    func testOpenBindingRejectsZeroUSBDeviceRegistryIdentity() {
+        let fixture = POSIXOpenFixture()
+        fixture.registeredDevices[0] = .init(
+            identity: fixture.identity,
+            usbDeviceRegistryEntryID: 0
+        )
+
+        XCTAssertThrowsError(
+            try POSIXAzimuthUSBSerialLink.openAndBindDevice(
+                requestedPath: nil,
+                access: fixture.access()
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? AzimuthUSBLinkError,
+                .openedDeviceIdentityUnstable(fixture.path)
+            )
+        }
+        XCTAssertEqual(fixture.openFileDescriptorCallCount, 0)
     }
 
     func testReadabilityEventRejectsReusedDescriptorFromOlderGeneration() {
@@ -444,7 +509,7 @@ private final class POSIXOpenFixture {
         pathNodes = [node, node]
         let registered = POSIXAzimuthUSBSerialLink.RegisteredUSBDevice(
             identity: identity,
-            registryEntryID: 0xCAFE
+            usbDeviceRegistryEntryID: 0xCAFE
         )
         registeredDevices = [registered, registered]
     }
@@ -570,7 +635,7 @@ private final class POSIXLifecycleFixture: @unchecked Sendable {
         )
         let registered = POSIXAzimuthUSBSerialLink.RegisteredUSBDevice(
             identity: identity,
-            registryEntryID: 0xCAFE
+            usbDeviceRegistryEntryID: 0xCAFE
         )
         return .init(
             availableDevicePaths: { [path] in [path] },

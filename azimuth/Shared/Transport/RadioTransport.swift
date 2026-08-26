@@ -59,6 +59,10 @@ public protocol AzimuthRadioTransport: Sendable {
     /// Stable serial identifier for the physical radio, when the selected
     /// connection can prove one for its currently opened endpoint.
     var hardwareSerialNumber: String? { get async }
+    /// Current macOS IORegistry ID for the physical USB-device ancestor shared
+    /// by the opened CDC and CoreAudio interfaces. Nil on other platforms and
+    /// for every non-USB or closed transport.
+    var macOSUSBDeviceRegistryEntryID: UInt64? { get async }
 
     func open() async throws
     func close() async
@@ -91,21 +95,80 @@ protocol AzimuthSameRadioBluetoothSelecting: Sendable {
     func selectUSBForRecovery(
         expectedSerialNumber: String
     ) async throws
+
+    /// Retain the currently selected exact Bluetooth address and require its
+    /// next open to prove the supplied CAT serial. This is used after a
+    /// consented setting change reboots the same radio.
+    func qualifySelectedBluetoothForReconnect(
+        expectedSerialNumber: String
+    ) async throws
 }
 
-/// Optional non-destructive handoff from a Bluetooth interface that is
-/// carrying persistent MMDVM traffic to the sole attached USB-C radio.
+/// Host-side continuity for the currently selected USB endpoint after a radio
+/// reset. USB descriptor fields and registry IDs are only re-enumeration hints;
+/// the controller must still prove the expected radio with CAT `AE` after open.
+protocol AzimuthSameRadioUSBRefreshing: Sendable {
+    /// Refresh discovery and select the unique candidate which follows the
+    /// current USB endpoint. Returns false while that candidate is absent or
+    /// ambiguous and never treats a USB descriptor serial as CAT identity.
+    func refreshSelectedUSBForSameRadioRecovery() async throws -> Bool
+}
+
+/// Optional non-destructive handoff from a Bluetooth interface that answered
+/// MMDVM to the sole attached, verified TH-D75 USB-C endpoint.
 ///
 /// Availability never changes selection. Selection occurs only after the user
-/// accepts the recovery prompt, and returns the USB device's stable serial so
-/// the subsequent CAT connection can prove the exact endpoint again.
+/// accepts the recovery prompt. USB descriptors are not treated as radio
+/// identity because a conforming TH-D75 may expose no USB serial string; the
+/// subsequent CAT operation obtains the authoritative unit serial with `AE`.
 protocol AzimuthBluetoothMMDVMUSBSelecting: Sendable {
-    func hasSoleIdentifiedUSBEndpoint() async throws -> Bool
-    func selectSoleUSBForBluetoothMMDVM() async throws -> String
+    func hasSoleVerifiedUSBEndpoint() async throws -> Bool
+    func selectSoleUSBForBluetoothMMDVM() async throws
+
+    /// Restore the exact Bluetooth address retained before the USB routing
+    /// operation, requiring its CAT serial to match the serial proved over CAT
+    /// on the selected USB endpoint. This never scans or selects by display
+    /// name.
+    func selectOriginalBluetoothAfterUSBRouting(
+        expectedSerialNumber: String
+    ) async throws
+
+    /// Restore the exact raw Bluetooth selection after a pre-mutation failure.
+    /// No serial qualification is attached because the MMDVM link could not
+    /// prove one before the failed USB operation.
+    func restoreOriginalBluetoothAfterUSBRoutingFailure() async throws
+}
+
+/// Retained host-side routing context for IF-DSP handoff from one exact
+/// Bluetooth endpoint to the sole attached TH-D75 USB CDC endpoint.
+///
+/// USB descriptor serials are never radio identity. Selection retains physical
+/// enumeration hints only so the same candidate can be followed across a radio
+/// restart. The controller accepts the handoff only after CAT `AE` from the
+/// opened USB transport exactly matches the approved Bluetooth CAT session.
+protocol AzimuthIFDSPUSBSelecting: Sendable {
+    /// Refresh USB discovery and retain the sole qualified endpoint without
+    /// changing or closing the current Bluetooth selection.
+    func retainSoleIFDSPUSBEndpoint() async throws -> Bool
+
+    /// Refresh discovery and select the retained USB candidate if it is
+    /// currently present. Returns false while it is absent or ambiguous.
+    func selectRetainedIFDSPUSBEndpoint() async throws -> Bool
+
+    /// Restore the exact Bluetooth address retained by the pre-handoff check,
+    /// binding its next open to the approved CAT `AE` serial.
+    func restoreRetainedIFDSPBluetoothEndpoint(
+        expectedSerialNumber: String
+    ) async throws
+
+    /// Discard completed or failed handoff authority without changing the
+    /// selected endpoint.
+    func finishRetainedIFDSPUSBHandoff() async
 }
 
 public extension AzimuthRadioTransport {
     var hardwareSerialNumber: String? { get async { nil } }
+    var macOSUSBDeviceRegistryEntryID: UInt64? { get async { nil } }
 }
 
 public enum AzimuthRadioTransportError: LocalizedError, Sendable, Equatable {

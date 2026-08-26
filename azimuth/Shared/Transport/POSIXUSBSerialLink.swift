@@ -31,20 +31,20 @@ public final class POSIXAzimuthUSBSerialLink: AzimuthUSBSerialLink, @unchecked S
 
     struct RegisteredUSBDevice: Equatable {
         let identity: USBIdentity
-        let registryEntryID: UInt64
+        let usbDeviceRegistryEntryID: UInt64
     }
 
     struct AvailableDeviceDescriptor: Equatable, Sendable {
         let path: String
         let serialNumber: String?
-        let registryEntryID: UInt64
+        let usbDeviceRegistryEntryID: UInt64
     }
 
     struct OpenedDeviceNode: Equatable {
-        let device: UInt64
-        let inode: UInt64
-        let rawDevice: UInt64
-        let mode: UInt16
+        let device: dev_t
+        let inode: ino_t
+        let rawDevice: dev_t
+        let mode: mode_t
 
         var isCharacterDevice: Bool {
             mode & UInt16(S_IFMT) == UInt16(S_IFCHR)
@@ -55,6 +55,7 @@ public final class POSIXAzimuthUSBSerialLink: AzimuthUSBSerialLink, @unchecked S
         let fileDescriptor: Int32
         let path: String
         let identity: USBIdentity
+        let usbDeviceRegistryEntryID: UInt64
     }
 
     struct OpenSystemAccess {
@@ -129,6 +130,12 @@ public final class POSIXAzimuthUSBSerialLink: AzimuthUSBSerialLink, @unchecked S
     /// Identity bound during `open()` to the exact device node held by
     /// `fileDescriptor`. Never re-resolve this from a reusable tty pathname.
     private var openedIdentity: USBIdentity?
+    /// Current IORegistry identity of the physical USB-device ancestor shared
+    /// by this CDC interface and the radio's CoreAudio interface.
+    ///
+    /// Registry entry IDs are valid only for the current enumeration, so this
+    /// value is published only while the exact bound descriptor remains open.
+    private var openedUSBDeviceRegistryEntryID: UInt64?
     private var readabilitySourceSession: ReadabilitySourceSession?
     /// A cancelled source remains retained until its handler has closed the
     /// old descriptor. The next `open()` waits on this barrier before touching
@@ -176,6 +183,12 @@ public final class POSIXAzimuthUSBSerialLink: AzimuthUSBSerialLink, @unchecked S
         return openedIdentity?.serialNumber
     }
 
+    public var macOSUSBDeviceRegistryEntryID: UInt64? {
+        lock.lock()
+        defer { lock.unlock() }
+        return openedUSBDeviceRegistryEntryID
+    }
+
     public func servicePresent() -> Bool {
         let verifiedPaths = openSystemAccess.availableDevicePaths()
         if let requestedPath {
@@ -220,6 +233,7 @@ public final class POSIXAzimuthUSBSerialLink: AzimuthUSBSerialLink, @unchecked S
         fileDescriptor = opened.fileDescriptor
         openedPath = opened.path
         openedIdentity = opened.identity
+        openedUSBDeviceRegistryEntryID = opened.usbDeviceRegistryEntryID
         readabilitySourceSession = ReadabilitySourceSession(
             source: source,
             session: session
@@ -237,6 +251,7 @@ public final class POSIXAzimuthUSBSerialLink: AzimuthUSBSerialLink, @unchecked S
         fileDescriptor = -1
         openedPath = nil
         openedIdentity = nil
+        openedUSBDeviceRegistryEntryID = nil
         readabilitySourceSession = nil
         if let sourceSession {
             precondition(retiringReadabilitySourceSession == nil)
@@ -418,13 +433,14 @@ public final class POSIXAzimuthUSBSerialLink: AzimuthUSBSerialLink, @unchecked S
             .map { (directory as NSString).appendingPathComponent($0) }
             .compactMap { path in
                 guard let registered = registeredUSBDevice(for: path),
+                      registered.usbDeviceRegistryEntryID != 0,
                       isTHD75(registered.identity) else {
                     return nil
                 }
                 return AvailableDeviceDescriptor(
                     path: path,
                     serialNumber: registered.identity.serialNumber,
-                    registryEntryID: registered.registryEntryID
+                    usbDeviceRegistryEntryID: registered.usbDeviceRegistryEntryID
                 )
             }
     }
@@ -475,6 +491,9 @@ public final class POSIXAzimuthUSBSerialLink: AzimuthUSBSerialLink, @unchecked S
         guard let identityBeforeOpen = access.registeredUSBDevice(path) else {
             throw AzimuthUSBLinkError.openedDeviceIdentityUnstable(path)
         }
+        guard identityBeforeOpen.usbDeviceRegistryEntryID != 0 else {
+            throw AzimuthUSBLinkError.openedDeviceIdentityUnstable(path)
+        }
         if let expectedSerialNumber,
            identityBeforeOpen.identity.serialNumber != expectedSerialNumber {
             throw AzimuthUSBLinkError.openedDeviceSerialMismatch(
@@ -495,6 +514,7 @@ public final class POSIXAzimuthUSBSerialLink: AzimuthUSBSerialLink, @unchecked S
         guard openedNode.isCharacterDevice,
               openedNode == pathNodeBeforeIdentity,
               let identityAfterOpen = access.registeredUSBDevice(path),
+              identityAfterOpen.usbDeviceRegistryEntryID != 0,
               identityAfterOpen == identityBeforeOpen else {
             throw AzimuthUSBLinkError.openedDeviceIdentityUnstable(path)
         }
@@ -517,7 +537,8 @@ public final class POSIXAzimuthUSBSerialLink: AzimuthUSBSerialLink, @unchecked S
         return BoundUSBDevice(
             fileDescriptor: fileDescriptor,
             path: path,
-            identity: identityAfterOpen.identity
+            identity: identityAfterOpen.identity,
+            usbDeviceRegistryEntryID: identityAfterOpen.usbDeviceRegistryEntryID
         )
     }
 
@@ -553,61 +574,105 @@ public final class POSIXAzimuthUSBSerialLink: AzimuthUSBSerialLink, @unchecked S
                 0
             )?.takeRetainedValue() as? String
             if calloutPath == path {
-                let identity = registeredUSBIdentity(for: service)
-                var registryEntryID: UInt64 = 0
-                let registryResult = IORegistryEntryGetRegistryEntryID(
-                    service,
-                    &registryEntryID
-                )
+                let registered = thD75USBDeviceAncestor(startingAt: service)
                 IOObjectRelease(service)
-                guard let identity, registryResult == KERN_SUCCESS else { return nil }
-                return RegisteredUSBDevice(
-                    identity: identity,
-                    registryEntryID: registryEntryID
-                )
+                return registered
             }
             IOObjectRelease(service)
         }
     }
 
-    private static func registeredUSBIdentity(for service: io_service_t) -> USBIdentity? {
-        let options = IOOptionBits(
-            kIORegistryIterateRecursively | kIORegistryIterateParents
-        )
-        guard let vendor = IORegistryEntrySearchCFProperty(
-            service,
-            kIOServicePlane,
-            "idVendor" as CFString,
-            kCFAllocatorDefault,
-            options
-        ) as? NSNumber,
-        let product = IORegistryEntrySearchCFProperty(
-            service,
-            kIOServicePlane,
-            "idProduct" as CFString,
-            kCFAllocatorDefault,
-            options
-        ) as? NSNumber else {
-            return nil
-        }
-        let serialNumber = ["USB Serial Number", "kUSBSerialNumberString"]
-            .lazy
-            .compactMap { key in
-                IORegistryEntrySearchCFProperty(
-                    service,
-                    kIOServicePlane,
-                    key as CFString,
-                    kCFAllocatorDefault,
-                    options
-                ) as? String
+    /// Resolve the first physical USB-device ancestor, never a USB interface
+    /// or the child IOSerialBSDClient. Its registry ID is also observed from
+    /// the sibling CoreAudio engine and therefore forms the exact
+    /// in-enumeration join between CAT and IF audio.
+    static func thD75USBDeviceAncestor(
+        startingAt entry: io_registry_entry_t
+    ) -> RegisteredUSBDevice? {
+        var current = entry
+        IOObjectRetain(current)
+        defer { IOObjectRelease(current) }
+
+        while current != IO_OBJECT_NULL {
+            if isPhysicalUSBDevice(current) {
+                guard let vendor = localNumberProperty(
+                    entry: current,
+                    key: "idVendor"
+                ),
+                let product = localNumberProperty(
+                    entry: current,
+                    key: "idProduct"
+                ) else {
+                    return nil
+                }
+                let identity = USBIdentity(
+                    vendorID: vendor.uint16Value,
+                    productID: product.uint16Value,
+                    serialNumber: ["USB Serial Number", "kUSBSerialNumberString"]
+                        .lazy
+                        .compactMap { localStringProperty(entry: current, key: $0) }
+                        .first { !$0.isEmpty }
+                )
+                guard isTHD75(identity) else {
+                    return nil
+                }
+                var registryEntryID: UInt64 = 0
+                guard IORegistryEntryGetRegistryEntryID(
+                    current,
+                    &registryEntryID
+                ) == KERN_SUCCESS,
+                registryEntryID != 0 else {
+                    return nil
+                }
+                return RegisteredUSBDevice(
+                    identity: identity,
+                    usbDeviceRegistryEntryID: registryEntryID
+                )
             }
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .first { !$0.isEmpty }
-        return USBIdentity(
-            vendorID: vendor.uint16Value,
-            productID: product.uint16Value,
-            serialNumber: serialNumber
-        )
+
+            var parent: io_registry_entry_t = IO_OBJECT_NULL
+            guard IORegistryEntryGetParentEntry(
+                current,
+                kIOServicePlane,
+                &parent
+            ) == KERN_SUCCESS else {
+                break
+            }
+            IOObjectRelease(current)
+            current = parent
+        }
+        return nil
+    }
+
+    private static func isPhysicalUSBDevice(
+        _ entry: io_registry_entry_t
+    ) -> Bool {
+        IOObjectConformsTo(entry, "IOUSBHostDevice") != 0
+            || IOObjectConformsTo(entry, "IOUSBDevice") != 0
+    }
+
+    private static func localStringProperty(
+        entry: io_registry_entry_t,
+        key: String
+    ) -> String? {
+        IORegistryEntryCreateCFProperty(
+            entry,
+            key as CFString,
+            kCFAllocatorDefault,
+            0
+        )?.takeRetainedValue() as? String
+    }
+
+    private static func localNumberProperty(
+        entry: io_registry_entry_t,
+        key: String
+    ) -> NSNumber? {
+        IORegistryEntryCreateCFProperty(
+            entry,
+            key as CFString,
+            kCFAllocatorDefault,
+            0
+        )?.takeRetainedValue() as? NSNumber
     }
 
     static func isTHD75(_ identity: USBIdentity) -> Bool {
@@ -640,10 +705,10 @@ public final class POSIXAzimuthUSBSerialLink: AzimuthUSBSerialLink, @unchecked S
     }
 
     static func openedDeviceNode(
-        device: UInt64,
-        inode: UInt64,
-        rawDevice: UInt64,
-        mode: UInt16
+        device: dev_t,
+        inode: ino_t,
+        rawDevice: dev_t,
+        mode: mode_t
     ) -> OpenedDeviceNode {
         OpenedDeviceNode(
             device: device,
@@ -678,12 +743,12 @@ public final class POSIXAzimuthUSBSerialLink: AzimuthUSBSerialLink, @unchecked S
         return openedDeviceNode(status)
     }
 
-    private static func openedDeviceNode(_ status: stat) -> OpenedDeviceNode {
+    static func openedDeviceNode(_ status: stat) -> OpenedDeviceNode {
         openedDeviceNode(
-            device: UInt64(status.st_dev),
-            inode: UInt64(status.st_ino),
-            rawDevice: UInt64(status.st_rdev),
-            mode: UInt16(status.st_mode)
+            device: status.st_dev,
+            inode: status.st_ino,
+            rawDevice: status.st_rdev,
+            mode: status.st_mode
         )
     }
 

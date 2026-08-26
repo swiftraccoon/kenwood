@@ -289,14 +289,75 @@ final class AzimuthBluetoothHelperPackagingTests: XCTestCase {
 
 @MainActor
 final class AzimuthLiveRadioControllerTests: XCTestCase {
+    func testConnectDoesNotReadSettingsOrEnableWritesWithoutLiveSnapshot() async throws {
+        let transport = IntegrationTestTransport()
+        let core = IntegrationTestCore()
+        let controller = try makeController(transport: transport, core: core)
+
+        try await controller.connect()
+
+        XCTAssertEqual(core.settingReadCallCount, 0)
+        XCTAssertTrue(controller.currentState.settingValues.isEmpty)
+        XCTAssertTrue(controller.currentState.capabilities.settingRead.isAvailable)
+        XCTAssertFalse(controller.currentState.capabilities.settingWrite.isAvailable)
+        XCTAssertEqual(
+            controller.currentState.capabilities.settingWrite,
+            .unavailable(reason: "Read the radio settings before writing.")
+        )
+        await controller.disconnect()
+    }
+
+    func testExplicitSettingsRefreshReadsOnceAndEnablesWrites() async throws {
+        let transport = IntegrationTestTransport()
+        let core = IntegrationTestCore()
+        let controller = try makeController(transport: transport, core: core)
+        try await controller.connect()
+        XCTAssertEqual(core.settingReadCallCount, 0)
+
+        try await controller.refreshSettings()
+
+        XCTAssertEqual(core.settingReadCallCount, 1)
+        XCTAssertEqual(controller.currentState.settingValues["radio.Beep"], .boolean(true))
+        XCTAssertTrue(controller.currentState.capabilities.settingRead.isAvailable)
+        XCTAssertTrue(controller.currentState.capabilities.settingWrite.isAvailable)
+        await controller.disconnect()
+    }
+
+    func testExplicitSettingsRefreshReplacesUSBInputRegistryProof() async throws {
+        let transport = IntegrationTestTransport(connectionKind: .usb)
+        transport.setMacOSUSBDeviceRegistryEntryID(0x2002, onAccess: 2)
+        let core = IntegrationTestCore()
+        let controller = try makeController(transport: transport, core: core)
+
+        try await controller.connect()
+        XCTAssertEqual(
+            controller.currentIFDSPUSBInputProof?.macOSUSBDeviceRegistryEntryID,
+            0x1001
+        )
+
+        try await controller.refreshSettings()
+
+        XCTAssertEqual(core.settingReadCallCount, 1)
+        XCTAssertEqual(
+            controller.currentIFDSPUSBInputProof,
+            try IFDSPUSBInputProof(
+                catSerialNumber: "C3C10368",
+                macOSUSBDeviceRegistryEntryID: 0x2002
+            )
+        )
+        await controller.disconnect()
+    }
+
     func testApprovedListExecutesAsOneCoreBatchAndPublishesVerifiedValues() async throws {
         let transport = IntegrationTestTransport()
         let core = IntegrationTestCore()
         let controller = try makeController(transport: transport, core: core)
         try await controller.connect()
+        try await controller.refreshSettings()
 
         XCTAssertEqual(controller.currentState.telemetry.firmware, "V1.03.AZM")
         XCTAssertEqual(controller.currentState.telemetry.operatingMode, "Automation ABI 3")
+        XCTAssertEqual(controller.currentRadioSerialNumber, "C3C10368")
 
         let report = try await controller.applySettings(
             [
@@ -313,6 +374,7 @@ final class AzimuthLiveRadioControllerTests: XCTestCase {
         XCTAssertTrue(report.succeeded)
         XCTAssertEqual(controller.currentState.settingValues["radio.Beep"], .boolean(false))
         await controller.disconnect()
+        XCTAssertNil(controller.currentRadioSerialNumber)
     }
 
     func testKeyAlwaysUsesFreshestLeaseAfterContinuousCapture() async throws {
@@ -326,6 +388,30 @@ final class AzimuthLiveRadioControllerTests: XCTestCase {
 
         XCTAssertEqual(core.guardedTapCallCount, 1)
         XCTAssertEqual(core.lastGuardedLease, core.lastLeasePresentedToTap)
+        await controller.disconnect()
+    }
+
+    func testDispatchedKeyRevokesReviewedAPRSSettingsAuthority() async throws {
+        let transport = IntegrationTestTransport()
+        let core = IntegrationTestCore()
+        let controller = try makeController(transport: transport, core: core)
+        try await controller.connect()
+        try await controller.refreshSettings()
+
+        try await controller.press(.menu)
+
+        XCTAssertTrue(controller.currentState.settingValues.isEmpty)
+        XCTAssertFalse(controller.currentState.capabilities.settingWrite.isAvailable)
+        do {
+            try await controller.startAPRS(.receiveOnly)
+            XCTFail("A dispatched front-panel key must revoke APRS settings authority")
+        } catch let error as RadioControllerError {
+            guard case .capabilityUnavailable(let reason) = error else {
+                return XCTFail("Expected a refresh requirement, got \(error)")
+            }
+            XCTAssertTrue(reason.contains("Refresh"))
+        }
+        XCTAssertEqual(core.startAprsCallCount, 0)
         await controller.disconnect()
     }
 
@@ -350,6 +436,579 @@ final class AzimuthLiveRadioControllerTests: XCTestCase {
             .connected(device: "Kenwood TH-D75", transport: "Bluetooth")
         )
         await controller.disconnect()
+    }
+
+    func testConnectionRejectsAutomationCoreWithoutCATSerialIdentity() async throws {
+        let transport = IntegrationTestTransport(connectionKind: .bluetooth)
+        let core = IntegrationTestCore(radioSerialNumber: "")
+        let connector = IntegrationTestCoreConnector(core: core)
+        let controller = try AzimuthLiveRadioController(
+            transport: transport,
+            connectCore: { transport in
+                try await connector.connect(transport: transport)
+            },
+            prepareRadioForAutomation: { _ in .cat }
+        )
+
+        do {
+            try await controller.connect()
+            XCTFail("A connected core without its qualified CAT AE identity must be rejected")
+        } catch let error as RadioControllerError {
+            guard case .operationFailed(let detail) = error else {
+                return XCTFail("Expected an identity failure, got \(error)")
+            }
+            XCTAssertTrue(detail.contains("did not retain the CAT AE radio identity"))
+        }
+
+        XCTAssertEqual(connector.callCount, 1)
+        XCTAssertEqual(core.closeCallCount, 1)
+        XCTAssertNil(controller.currentRadioSerialNumber)
+        XCTAssertFalse(controller.automaticIFDSPDVGatewayRecoveryAvailable)
+        await controller.disconnect()
+    }
+
+    func testIFDSPBluetoothStartOffersRecoveryWithoutClosingAuthenticatedCAT() async throws {
+        let transport = IntegrationIFDSPGatewayRecoveryTransport(
+            ifDSPUSBSerialNumber: nil
+        )
+        let bluetoothCore = IntegrationTestCore()
+        let connector = IntegrationTestCoreConnector(core: bluetoothCore)
+        let preflight = IntegrationTestModePreflight(modes: [.cat])
+        let mutationFactoryCalls = IntegrationTestCallCounter()
+        let controller = try AzimuthLiveRadioController(
+            transport: transport,
+            connectCore: { transport in
+                try await connector.connect(transport: transport)
+            },
+            prepareRadioForAutomation: { _ in try preflight.nextMode() },
+            disableDVGatewayOverConnectedCAT: { _, _ in
+                mutationFactoryCalls.record()
+                throw DvGatewayCatDisableError.ControllerUnavailable(
+                    detail: "unexpected test factory invocation"
+                )
+            },
+            automaticCATRecoveryAvailable: true
+        )
+        try await controller.connect()
+
+        do {
+            try await controller.prepareIFDSPMode()
+            XCTFail("USB MMDVM must offer the explicit Menu 650 recovery")
+        } catch let error as RadioControllerError {
+            XCTAssertEqual(error, .ifDspDVGatewayRecoveryRequired)
+        }
+
+        XCTAssertEqual(mutationFactoryCalls.callCount, 0)
+        XCTAssertEqual(bluetoothCore.closeCallCount, 0)
+        XCTAssertEqual(bluetoothCore.screenCaptureCallCount, 1)
+        XCTAssertEqual(connector.callCount, 1)
+        XCTAssertEqual(preflight.callCount, 1)
+        XCTAssertEqual(transport.usbSelectionCount, 0)
+        XCTAssertEqual(transport.bluetoothRestoreCount, 0)
+        XCTAssertNil(transport.lastReconnectSerialNumber)
+        XCTAssertEqual(transport.device.connectionKind, .bluetooth)
+        XCTAssertTrue(controller.currentState.connection.isConnected)
+        XCTAssertEqual(controller.currentRadioSerialNumber, "C3C10368")
+        XCTAssertNil(controller.currentIFDSPUSBInputProof)
+        XCTAssertTrue(transport.retainedIFDSPHandoff)
+        XCTAssertTrue(controller.automaticIFDSPDVGatewayRecoveryAvailable)
+        await controller.disconnect()
+    }
+
+    func testCancelledIFDSPConsentOfferClearsRetainedUSBAndKeepsBluetoothCoreOpen() async throws {
+        let transport = IntegrationIFDSPGatewayRecoveryTransport()
+        transport.blockNextIFDSPRetainCall()
+        let core = IntegrationTestCore()
+        let connector = IntegrationTestCoreConnector(core: core)
+        let controller = try AzimuthLiveRadioController(
+            transport: transport,
+            connectCore: { transport in
+                try await connector.connect(transport: transport)
+            },
+            prepareRadioForAutomation: { _ in .cat },
+            automaticCATRecoveryAvailable: true
+        )
+        try await controller.connect()
+
+        let prepareTask = Task { try await controller.prepareIFDSPMode() }
+        try await waitUntil { transport.hasBlockedIFDSPRetain }
+        prepareTask.cancel()
+        transport.releaseBlockedIFDSPRetainCall()
+
+        do {
+            _ = try await prepareTask.value
+            XCTFail("Cancelled consent preparation unexpectedly completed")
+        } catch is CancellationError {}
+
+        XCTAssertFalse(transport.retainedIFDSPHandoff)
+        XCTAssertEqual(core.closeCallCount, 0)
+        XCTAssertTrue(controller.currentState.connection.isConnected)
+        XCTAssertEqual(controller.currentRadioSerialNumber, "C3C10368")
+        await controller.disconnect()
+    }
+
+    func testCancelledApprovedIFDSPRecoveryClearsRetainedUSBAndKeepsBluetoothCoreOpen() async throws {
+        let transport = IntegrationIFDSPGatewayRecoveryTransport()
+        transport.blockNextIFDSPRetainCall()
+        let core = IntegrationTestCore()
+        let connector = IntegrationTestCoreConnector(core: core)
+        let factoryCalls = IntegrationTestCallCounter()
+        let controller = try AzimuthLiveRadioController(
+            transport: transport,
+            connectCore: { transport in
+                try await connector.connect(transport: transport)
+            },
+            prepareRadioForAutomation: { _ in .cat },
+            disableDVGatewayOverConnectedCAT: { _, _ in
+                factoryCalls.record()
+                throw DvGatewayCatDisableError.ControllerUnavailable(
+                    detail: "unexpected operation construction"
+                )
+            },
+            automaticCATRecoveryAvailable: true
+        )
+        try await controller.connect()
+
+        let recoveryTask = Task {
+            try await controller.disableDVGatewayAndReconnectForIFDSP()
+        }
+        try await waitUntil { transport.hasBlockedIFDSPRetain }
+        recoveryTask.cancel()
+        transport.releaseBlockedIFDSPRetainCall()
+
+        do {
+            try await recoveryTask.value
+            XCTFail("Cancelled approved recovery unexpectedly completed")
+        } catch is CancellationError {}
+
+        XCTAssertEqual(factoryCalls.callCount, 0)
+        XCTAssertFalse(transport.retainedIFDSPHandoff)
+        XCTAssertEqual(core.closeCallCount, 0)
+        XCTAssertTrue(controller.currentState.connection.isConnected)
+        XCTAssertEqual(controller.currentRadioSerialNumber, "C3C10368")
+        await controller.disconnect()
+    }
+
+    func testApprovedIFDSPGatewayRecoveryAcceptsNilUSBDescriptorAndEndsOnSameRadioUSB() async throws {
+        let transport = IntegrationIFDSPGatewayRecoveryTransport(
+            ifDSPUSBSerialNumber: nil
+        )
+        let bluetoothCore = IntegrationTestCore()
+        let usbCore = IntegrationTestCore()
+        let connector = IntegrationTestCoreConnector(cores: [bluetoothCore, usbCore])
+        let preflight = IntegrationTestModePreflight(
+            modes: [.cat, .cat, .cat]
+        )
+        let disable = IntegrationTestCatDisableOperation {
+            return DvGatewayCatDisableResult(
+                outcome: .changedRadioRebooting,
+                radioSerialNumber: "C3C10368"
+            )
+        }
+        let controller = try AzimuthLiveRadioController(
+            transport: transport,
+            connectCore: { transport in
+                try await connector.connect(transport: transport)
+            },
+            prepareRadioForAutomation: { _ in try preflight.nextMode() },
+            proveRadioCATWithoutPacketModeRecovery: { _ in
+                try preflight.nextMode()
+            },
+            disableDVGatewayOverConnectedCAT: {
+                transport,
+                expectedRadioSerialNumber in
+                disable.operation(
+                    core: transport,
+                    expectedRadioSerialNumber: expectedRadioSerialNumber
+                )
+            },
+            automaticCATRecoveryAvailable: true,
+            catRecoveryWindow: .seconds(1),
+            catRecoveryPollInterval: .seconds(30)
+        )
+        try await controller.connect()
+
+        XCTAssertTrue(controller.automaticIFDSPDVGatewayRecoveryAvailable)
+        XCTAssertEqual(controller.currentRadioSerialNumber, "C3C10368")
+        XCTAssertEqual(disable.callCount, 0)
+
+        do {
+            _ = try await controller.prepareIFDSPMode()
+            XCTFail("Bluetooth IF-DSP start must request explicit MCP consent")
+        } catch let error as RadioControllerError {
+            XCTAssertEqual(error, .ifDspDVGatewayRecoveryRequired)
+        }
+
+        XCTAssertEqual(bluetoothCore.closeCallCount, 0)
+        XCTAssertEqual(connector.callCount, 1)
+        XCTAssertEqual(preflight.callCount, 1)
+        XCTAssertEqual(transport.usbSelectionCount, 0)
+
+        let recoveryTask = Task {
+            try await controller.disableDVGatewayAndReconnectForIFDSP()
+        }
+        defer { recoveryTask.cancel() }
+        try await waitUntil { transport.usbSelectionCount == 1 }
+        try await recoveryTask.value
+
+        XCTAssertEqual(disable.callCount, 1)
+        XCTAssertEqual(disable.lastExpectedRadioSerialNumber, "C3C10368")
+        XCTAssertEqual(transport.usbAvailabilityCheckCount, 2)
+        XCTAssertEqual(transport.usbSelectionCount, 1)
+        XCTAssertNil(transport.lastReconnectSerialNumber)
+        XCTAssertEqual(bluetoothCore.closeCallCount, 1)
+        XCTAssertEqual(connector.callCount, 2)
+        XCTAssertEqual(preflight.callCount, 2)
+        XCTAssertEqual(
+            controller.currentState.connection,
+            .connected(device: "Kenwood TH-D75", transport: "USB-C")
+        )
+        XCTAssertEqual(transport.device.connectionKind, .usb)
+        XCTAssertEqual(controller.currentRadioSerialNumber, "C3C10368")
+        XCTAssertEqual(
+            controller.currentIFDSPUSBInputProof,
+            try IFDSPUSBInputProof(
+                catSerialNumber: "C3C10368",
+                macOSUSBDeviceRegistryEntryID: 0x2002
+            )
+        )
+        XCTAssertEqual(usbCore.prepareIfDspCallCount, 0)
+        XCTAssertFalse(transport.retainedIFDSPHandoff)
+        await controller.disconnect()
+    }
+
+    func testIFDSPGatewayRecoveryWithoutSoleUSBDoesNotCloseCoreOrStartMutation() async throws {
+        let transport = IntegrationIFDSPGatewayRecoveryTransport(
+            soleUSBAvailable: false
+        )
+        let core = IntegrationTestCore(dvGatewayModeRawValue: 1)
+        let connector = IntegrationTestCoreConnector(core: core)
+        let disable = IntegrationTestCatDisableOperation {
+            XCTFail("Menu 650 operation must not run without a sole USB endpoint")
+            return DvGatewayCatDisableResult(
+                outcome: .changedRadioRebooting,
+                radioSerialNumber: "C3C10368"
+            )
+        }
+        let controller = try AzimuthLiveRadioController(
+            transport: transport,
+            connectCore: { transport in
+                try await connector.connect(transport: transport)
+            },
+            prepareRadioForAutomation: { _ in .cat },
+            disableDVGatewayOverConnectedCAT: {
+                transport,
+                expectedRadioSerialNumber in
+                disable.operation(
+                    core: transport,
+                    expectedRadioSerialNumber: expectedRadioSerialNumber
+                )
+            },
+            automaticCATRecoveryAvailable: true
+        )
+        try await controller.connect()
+
+        do {
+            try await controller.disableDVGatewayAndReconnectForIFDSP()
+            XCTFail("A missing sole USB endpoint must stop before mutation")
+        } catch let error as RadioControllerError {
+            guard case .capabilityUnavailable(let detail) = error else {
+                return XCTFail("Expected USB capability failure, got \(error)")
+            }
+            XCTAssertTrue(detail.contains("exactly one attached"))
+            XCTAssertTrue(detail.contains("No radio setting was changed"))
+        }
+
+        XCTAssertEqual(disable.callCount, 0)
+        XCTAssertNil(disable.lastExpectedRadioSerialNumber)
+        XCTAssertEqual(core.closeCallCount, 0)
+        XCTAssertEqual(connector.callCount, 1)
+        XCTAssertTrue(controller.currentState.connection.isConnected)
+        XCTAssertEqual(controller.currentRadioSerialNumber, "C3C10368")
+        await controller.disconnect()
+    }
+
+    func testIFDSPGatewayRecoveryReleasesRetainedUSBWhenAnotherOperationIsExclusive() async throws {
+        let transport = IntegrationIFDSPGatewayRecoveryTransport()
+        let core = IntegrationTestCore()
+        core.blockNextSettingRead()
+        let connector = IntegrationTestCoreConnector(core: core)
+        let disable = IntegrationTestCatDisableOperation {
+            XCTFail("An overlapping operation must stop before the actor command runs")
+            return DvGatewayCatDisableResult(
+                outcome: .changedRadioRebooting,
+                radioSerialNumber: "C3C10368"
+            )
+        }
+        let controller = try AzimuthLiveRadioController(
+            transport: transport,
+            connectCore: { transport in
+                try await connector.connect(transport: transport)
+            },
+            prepareRadioForAutomation: { _ in .cat },
+            disableDVGatewayOverConnectedCAT: {
+                core,
+                expectedRadioSerialNumber in
+                disable.operation(
+                    core: core,
+                    expectedRadioSerialNumber: expectedRadioSerialNumber
+                )
+            },
+            automaticCATRecoveryAvailable: true
+        )
+        try await controller.connect()
+
+        let refreshTask = Task { try await controller.refreshSettings() }
+        try await waitUntil { core.hasBlockedSettingRead }
+
+        do {
+            try await controller.disableDVGatewayAndReconnectForIFDSP()
+            XCTFail("An overlapping settings read must retain exclusive ownership")
+        } catch let error as RadioControllerError {
+            guard case .capabilityUnavailable(let detail) = error else {
+                return XCTFail("Expected overlapping-operation refusal, got \(error)")
+            }
+            XCTAssertTrue(detail.contains("settings refresh"))
+        }
+
+        XCTAssertEqual(transport.usbAvailabilityCheckCount, 1)
+        XCTAssertFalse(transport.retainedIFDSPHandoff)
+        XCTAssertEqual(disable.callCount, 0)
+        XCTAssertEqual(core.closeCallCount, 0)
+        XCTAssertTrue(controller.currentState.connection.isConnected)
+        XCTAssertEqual(controller.currentRadioSerialNumber, "C3C10368")
+
+        core.releaseBlockedSettingRead()
+        try await refreshTask.value
+        await controller.disconnect()
+    }
+
+    func testIFDSPGatewayRecoveryRejectsWrongUSBCATAfterMutation() async throws {
+        let transport = IntegrationIFDSPGatewayRecoveryTransport(
+            ifDSPUSBSerialNumber: nil
+        )
+        let bluetoothCore = IntegrationTestCore(radioSerialNumber: "C3C10368")
+        let wrongUSBcore = IntegrationTestCore(radioSerialNumber: "D4D20469")
+        let connector = IntegrationTestCoreConnector(
+            cores: [bluetoothCore, wrongUSBcore]
+        )
+        let preflight = IntegrationTestModePreflight(modes: [.cat, .cat, .cat])
+        let disable = IntegrationTestCatDisableOperation {
+            DvGatewayCatDisableResult(
+                outcome: .changedRadioRebooting,
+                radioSerialNumber: "C3C10368"
+            )
+        }
+        let controller = try AzimuthLiveRadioController(
+            transport: transport,
+            connectCore: { transport in
+                try await connector.connect(transport: transport)
+            },
+            prepareRadioForAutomation: { _ in try preflight.nextMode() },
+            proveRadioCATWithoutPacketModeRecovery: { _ in
+                try preflight.nextMode()
+            },
+            disableDVGatewayOverConnectedCAT: {
+                transport,
+                expectedRadioSerialNumber in
+                disable.operation(
+                    core: transport,
+                    expectedRadioSerialNumber: expectedRadioSerialNumber
+                )
+            },
+            automaticCATRecoveryAvailable: true,
+            catRecoveryWindow: .seconds(1),
+            catRecoveryPollInterval: .milliseconds(1)
+        )
+        try await controller.connect()
+
+        do {
+            try await controller.disableDVGatewayAndReconnectForIFDSP()
+            XCTFail("A different USB CAT AE must be rejected after the approved mutation")
+        } catch let error as RadioControllerError {
+            guard case .operationFailed(let detail) = error else {
+                return XCTFail("Expected a same-radio USB failure, got \(error)")
+            }
+            XCTAssertTrue(detail.contains("Menu 650 was changed to Off"))
+            XCTAssertTrue(detail.contains("proved CAT radio D4D20469"))
+            XCTAssertTrue(detail.contains("bound to radio C3C10368"))
+        }
+
+        XCTAssertEqual(transport.usbAvailabilityCheckCount, 1)
+        XCTAssertEqual(transport.usbSelectionCount, 1)
+        XCTAssertEqual(disable.callCount, 1)
+        XCTAssertEqual(disable.lastExpectedRadioSerialNumber, "C3C10368")
+        XCTAssertEqual(bluetoothCore.closeCallCount, 1)
+        XCTAssertEqual(wrongUSBcore.closeCallCount, 1)
+        XCTAssertEqual(connector.callCount, 2)
+        XCTAssertEqual(transport.device.connectionKind, .usb)
+        XCTAssertNil(controller.currentRadioSerialNumber)
+        XCTAssertNil(controller.currentIFDSPUSBInputProof)
+        XCTAssertFalse(transport.retainedIFDSPHandoff)
+        await controller.disconnect()
+    }
+
+    func testIFDSPGatewayRecoveryBindsApprovedCATSerialBeforeMutation() async throws {
+        let transport = IntegrationIFDSPGatewayRecoveryTransport()
+        let core = IntegrationTestCore(dvGatewayModeRawValue: 1)
+        let connector = IntegrationTestCoreConnector(core: core)
+        let preflight = IntegrationTestModePreflight(modes: [.cat, .cat])
+        let disable = IntegrationTestCatDisableOperation {
+            throw DvGatewayCatDisableError.RadioIdentityMismatch(
+                expected: "C3C10368",
+                actual: "D4D20469"
+            )
+        }
+        let controller = try AzimuthLiveRadioController(
+            transport: transport,
+            connectCore: { transport in
+                try await connector.connect(transport: transport)
+            },
+            prepareRadioForAutomation: { _ in try preflight.nextMode() },
+            disableDVGatewayOverConnectedCAT: {
+                transport,
+                expectedRadioSerialNumber in
+                disable.operation(
+                    core: transport,
+                    expectedRadioSerialNumber: expectedRadioSerialNumber
+                )
+            },
+            automaticCATRecoveryAvailable: true,
+            catRecoveryWindow: .seconds(1),
+            catRecoveryPollInterval: .milliseconds(1)
+        )
+        try await controller.connect()
+        try await controller.refreshSettings()
+
+        do {
+            try await controller.disableDVGatewayAndReconnectForIFDSP()
+            XCTFail("A CAT AE mismatch must stop before the Menu 650 mutation gate")
+        } catch let error as RadioControllerError {
+            guard case .operationFailed(let detail) = error else {
+                return XCTFail("Expected an identity-qualified operation failure, got \(error)")
+            }
+            XCTAssertTrue(detail.contains("approved CAT session belonged to radio C3C10368"))
+            XCTAssertTrue(detail.contains("identifies as radio D4D20469"))
+            XCTAssertTrue(detail.contains("No radio setting was changed"))
+        }
+
+        XCTAssertEqual(disable.callCount, 1)
+        XCTAssertEqual(disable.lastExpectedRadioSerialNumber, "C3C10368")
+        XCTAssertEqual(core.dvGatewayModeRawValueSnapshot, 1)
+        XCTAssertEqual(core.closeCallCount, 1)
+        XCTAssertEqual(connector.callCount, 1)
+        XCTAssertNil(transport.lastReconnectSerialNumber)
+        XCTAssertNil(controller.currentRadioSerialNumber)
+        XCTAssertFalse(transport.retainedIFDSPHandoff)
+        await controller.disconnect()
+    }
+
+    func testIFDSPGatewayRecoveryRejectsInvalidApprovedSerialBeforeMutation() async throws {
+        let transport = IntegrationIFDSPGatewayRecoveryTransport(
+            ifDSPUSBSerialNumber: "invalid"
+        )
+        let core = IntegrationTestCore(
+            dvGatewayModeRawValue: 1,
+            radioSerialNumber: "invalid"
+        )
+        let connector = IntegrationTestCoreConnector(core: core)
+        let preflight = IntegrationTestModePreflight(modes: [.cat, .cat])
+        let factoryCalls = IntegrationTestCallCounter()
+        let controller = try AzimuthLiveRadioController(
+            transport: transport,
+            connectCore: { transport in
+                try await connector.connect(transport: transport)
+            },
+            prepareRadioForAutomation: { _ in try preflight.nextMode() },
+            disableDVGatewayOverConnectedCAT: {
+                _,
+                expectedRadioSerialNumber in
+                factoryCalls.record()
+                throw DvGatewayCatDisableError.InvalidExpectedRadioSerial(
+                    detail: "\(expectedRadioSerialNumber) is not an exact CAT AE serial"
+                )
+            },
+            automaticCATRecoveryAvailable: true
+        )
+        try await controller.connect()
+        try await controller.refreshSettings()
+
+        do {
+            try await controller.disableDVGatewayAndReconnectForIFDSP()
+            XCTFail("An invalid approved serial must stop before operation construction")
+        } catch let error as RadioControllerError {
+            guard case .operationFailed(let detail) = error else {
+                return XCTFail("Expected an invalid-identity failure, got \(error)")
+            }
+            XCTAssertTrue(detail.contains("approved CAT session serial is invalid"))
+            XCTAssertTrue(detail.contains("No radio setting was changed"))
+        }
+
+        XCTAssertEqual(factoryCalls.callCount, 1)
+        XCTAssertEqual(core.dvGatewayModeRawValueSnapshot, 1)
+        XCTAssertEqual(core.closeCallCount, 0)
+        XCTAssertEqual(connector.callCount, 1)
+        XCTAssertNil(transport.lastReconnectSerialNumber)
+        XCTAssertEqual(controller.currentRadioSerialNumber, "invalid")
+        XCTAssertTrue(controller.currentState.connection.isConnected)
+        XCTAssertFalse(transport.retainedIFDSPHandoff)
+        await controller.disconnect()
+    }
+
+    func testDisconnectCancelsAndAwaitsActorOwnedCATDisableWithTruthfulLateOutcome() async throws {
+        let transport = IntegrationIFDSPGatewayRecoveryTransport()
+        let core = IntegrationTestCore(dvGatewayModeRawValue: 1)
+        let connector = IntegrationTestCoreConnector(core: core)
+        let preflight = IntegrationTestModePreflight(modes: [.cat, .cat])
+        let disable = IntegrationTestBlockingCatDisableOperation()
+        let controller = try AzimuthLiveRadioController(
+            transport: transport,
+            connectCore: { transport in
+                try await connector.connect(transport: transport)
+            },
+            prepareRadioForAutomation: { _ in try preflight.nextMode() },
+            disableDVGatewayOverConnectedCAT: {
+                transport,
+                expectedRadioSerialNumber in
+                disable.operation(
+                    core: transport,
+                    expectedRadioSerialNumber: expectedRadioSerialNumber
+                )
+            },
+            automaticCATRecoveryAvailable: true,
+            catRecoveryWindow: .seconds(1),
+            catRecoveryPollInterval: .milliseconds(1)
+        )
+        try await controller.connect()
+        try await controller.refreshSettings()
+
+        let recoveryTask = Task {
+            try await controller.disableDVGatewayAndReconnectForIFDSP()
+        }
+        try await waitUntil { disable.hasStarted }
+        XCTAssertNil(controller.currentRadioSerialNumber)
+        let disconnectTask = Task { await controller.disconnect() }
+        try await waitUntil { disable.cancellationObserved }
+
+        XCTAssertNotEqual(controller.currentState.connection, .disconnected)
+        core.setDVGatewayModeRawValue(0)
+        disable.complete()
+        await disconnectTask.value
+
+        do {
+            try await recoveryTask.value
+            XCTFail("A completed Menu 650 result must remain visible after disconnect")
+        } catch let error as RadioControllerError {
+            guard case .operationFailed(let detail) = error else {
+                return XCTFail("Expected truthful completed outcome, got \(error)")
+            }
+            XCTAssertTrue(detail.contains("Menu 650 was changed to Off"))
+            XCTAssertTrue(detail.contains("same-radio USB-C handoff was stopped"))
+        }
+        XCTAssertTrue(disable.hasFinished)
+        XCTAssertEqual(disable.lastExpectedRadioSerialNumber, "C3C10368")
+        XCTAssertEqual(core.closeCallCount, 1)
+        XCTAssertEqual(controller.currentState.connection, .disconnected)
     }
 
     func testBluetoothMMDVMIsTypedWithoutAuthorizingMenu650Recovery() async throws {
@@ -428,6 +1087,63 @@ final class AzimuthLiveRadioControllerTests: XCTestCase {
         XCTAssertEqual(
             controller.currentState.connection,
             .connected(device: "Kenwood TH-D75", transport: "USB-C")
+        )
+        await controller.disconnect()
+    }
+
+    func testBluetoothMMDVMRoutesGatewayOverExactUSBThenRequalifiesBluetooth() async throws {
+        let transport = IntegrationBluetoothMMDVMUSBTransport()
+        let connector = IntegrationTestCoreConnector(core: IntegrationTestCore())
+        let preflight = IntegrationTestModePreflight(
+            modes: [.mmdvm, .cat, .cat, .cat]
+        )
+        let menu650Recovery = IntegrationTestCATRecovery()
+        let usbRouting = IntegrationTestDvGatewayUsbRouting()
+        let controller = try AzimuthLiveRadioController(
+            transport: transport,
+            connectCore: { transport in
+                try await connector.connect(transport: transport)
+            },
+            prepareRadioForAutomation: { _ in try preflight.nextMode() },
+            proveRadioCATWithoutPacketModeRecovery: { _ in
+                try preflight.nextMode()
+            },
+            recoverUSBMMDVM: { serialNumber, _ in
+                menu650Recovery.operation(serialNumber)
+            },
+            routeBluetoothMMDVMToUSB: { transport in
+                usbRouting.operation(transport: transport)
+            },
+            automaticCATRecoveryAvailable: true,
+            catRecoveryWindow: .seconds(1),
+            catRecoveryPollInterval: .milliseconds(1)
+        )
+
+        do {
+            try await controller.connect()
+            XCTFail("Bluetooth MMDVM mode must wait for routing consent")
+        } catch let error as RadioControllerError {
+            XCTAssertEqual(error, .bluetoothMmdvmMode)
+        }
+
+        XCTAssertTrue(controller.automaticBluetoothCATRoutingAvailable)
+        XCTAssertEqual(transport.usbSelectionCount, 0)
+        XCTAssertEqual(transport.bluetoothRestoreCount, 0)
+        XCTAssertEqual(usbRouting.callCount, 0)
+        XCTAssertEqual(menu650Recovery.callCount, 0)
+
+        try await controller.routeDVGatewayToUSBCAndReconnectBluetooth()
+
+        XCTAssertEqual(transport.usbSelectionCount, 1)
+        XCTAssertEqual(transport.bluetoothRestoreCount, 1)
+        XCTAssertEqual(transport.lastBluetoothExpectedSerial, "C3C10368")
+        XCTAssertEqual(usbRouting.callCount, 1)
+        XCTAssertEqual(menu650Recovery.callCount, 0)
+        XCTAssertEqual(connector.callCount, 1)
+        XCTAssertFalse(controller.automaticBluetoothCATRoutingAvailable)
+        XCTAssertEqual(
+            controller.currentState.connection,
+            .connected(device: "Kenwood TH-D75", transport: "Bluetooth")
         )
         await controller.disconnect()
     }
@@ -593,6 +1309,9 @@ final class AzimuthLiveRadioControllerTests: XCTestCase {
                 try await connector.connect(transport: transport)
             },
             prepareRadioForAutomation: { _ in try preflight.nextMode() },
+            proveRadioCATWithoutPacketModeRecovery: { _ in
+                try preflight.nextMode()
+            },
             recoverUSBMMDVM: { serialNumber, _ in recovery.operation(serialNumber) },
             automaticCATRecoveryAvailable: true,
             catRecoveryWindow: .seconds(1),
@@ -633,6 +1352,9 @@ final class AzimuthLiveRadioControllerTests: XCTestCase {
                 try await connector.connect(transport: transport)
             },
             prepareRadioForAutomation: { _ in try preflight.nextMode() },
+            proveRadioCATWithoutPacketModeRecovery: { _ in
+                try preflight.nextMode()
+            },
             recoverUSBMMDVM: { serialNumber, qualifiedAddress in
                 recovery.operation(
                     serialNumber,
@@ -967,7 +1689,9 @@ final class AzimuthLiveRadioControllerTests: XCTestCase {
     func testRecoveryFinalConnectRechecksIdentityAfterCDCReopen() async throws {
         let transport = IntegrationTestTransport()
         transport.setHardwareSerialNumber("C5310165", onOpen: 4)
-        let connector = IntegrationTestCoreConnector(core: IntegrationTestCore())
+        let connector = IntegrationTestCoreConnector(
+            core: IntegrationTestCore(radioSerialNumber: "C5310165")
+        )
         let preflight = IntegrationTestModePreflight(
             modes: [.mmdvm, .cat, .unresponsive, .cat]
         )
@@ -978,6 +1702,9 @@ final class AzimuthLiveRadioControllerTests: XCTestCase {
                 try await connector.connect(transport: transport)
             },
             prepareRadioForAutomation: { _ in try preflight.nextMode() },
+            proveRadioCATWithoutPacketModeRecovery: { _ in
+                try preflight.nextMode()
+            },
             recoverUSBMMDVM: { serialNumber, _ in recovery.operation(serialNumber) },
             automaticCATRecoveryAvailable: true,
             catRecoveryWindow: .seconds(1),
@@ -995,13 +1722,12 @@ final class AzimuthLiveRadioControllerTests: XCTestCase {
             try await controller.restoreCATFromUSBMMDVM()
             XCTFail("A replacement radio on the CDC retry must not enter the core")
         } catch {
-            XCTAssertTrue(error.localizedDescription.contains("USB-C recovery reopen"))
+            XCTAssertTrue(error.localizedDescription.contains("proved CAT radio C5310165"))
             XCTAssertTrue(error.localizedDescription.contains("C3C10368"))
-            XCTAssertTrue(error.localizedDescription.contains("C5310165"))
         }
         XCTAssertEqual(transport.openCallCount, 4)
-        XCTAssertEqual(preflight.callCount, 3)
-        XCTAssertEqual(connector.callCount, 0)
+        XCTAssertEqual(preflight.callCount, 4)
+        XCTAssertEqual(connector.callCount, 1)
     }
 
     func testUnresponsiveCDCSessionIsReopenedOnceBeforeCoreConnection() async throws {
@@ -1112,6 +1838,7 @@ final class AzimuthLiveRadioControllerTests: XCTestCase {
         let core = IntegrationTestCore()
         let controller = try makeController(transport: transport, core: core)
         try await controller.connect()
+        try await controller.refreshSettings()
 
         var configuration = APRSSessionConfiguration.receiveOnly
         configuration.stationCallsign = "N0CALL-7"
@@ -1140,7 +1867,11 @@ final class AzimuthLiveRadioControllerTests: XCTestCase {
         try await stopTask.value
 
         XCTAssertEqual(controller.currentAPRSState.status.phase, .inactive)
-        XCTAssertGreaterThan(core.settingReadCallCount, settingsBeforeStop)
+        XCTAssertEqual(
+            core.settingReadCallCount,
+            settingsBeforeStop,
+            "CAT restoration must not hide a full MCP settings read/reboot"
+        )
         XCTAssertGreaterThan(core.screenCaptureCallCount, capturesBeforeStop)
         XCTAssertTrue(controller.currentState.capabilities.settingRead.isAvailable)
         XCTAssertTrue(controller.currentState.capabilities.screenStreaming.isAvailable)
@@ -1152,11 +1883,45 @@ final class AzimuthLiveRadioControllerTests: XCTestCase {
         let core = IntegrationTestCore(kissInterfaceRawValue: 0)
         let controller = try makeController(transport: transport, core: core)
         try await controller.connect()
+        try await controller.refreshSettings()
 
         try await controller.startAPRS(.receiveOnly)
 
         XCTAssertEqual(core.startAprsCallCount, 1)
+        XCTAssertEqual(
+            core.lastAprsStartAuthority,
+            .settingsSnapshot(
+                snapshotId: 41,
+                expectedKissInterfaceRawValue: 0
+            )
+        )
         XCTAssertEqual(controller.currentAPRSState.status.phase, .active)
+        await controller.disconnect()
+    }
+
+    func testAPRSRejectsUnsupportedMenu506BeforeKISSEntry() async throws {
+        let transport = IntegrationTestTransport(connectionKind: .usb)
+        let core = IntegrationTestCore(
+            kissInterfaceRawValue: 0,
+            tncDataBandRawValue: 2
+        )
+        let controller = try makeController(transport: transport, core: core)
+        try await controller.connect()
+        try await controller.refreshSettings()
+
+        do {
+            try await controller.startAPRS(.receiveOnly)
+            XCTFail("An unsupported Menu 506 value must stop before KISS entry")
+        } catch let error as RadioControllerError {
+            guard case .capabilityUnavailable(let reason) = error else {
+                return XCTFail("Expected a Menu 506 capability error, got \(error)")
+            }
+            XCTAssertTrue(reason.contains("Menu 506"))
+            XCTAssertTrue(reason.contains("unsupported"))
+        }
+
+        XCTAssertEqual(core.startAprsCallCount, 0)
+        XCTAssertEqual(controller.currentAPRSState.status.phase, .inactive)
         await controller.disconnect()
     }
 
@@ -1165,6 +1930,7 @@ final class AzimuthLiveRadioControllerTests: XCTestCase {
         let core = IntegrationTestCore(kissInterfaceRawValue: 1)
         let controller = try makeController(transport: transport, core: core)
         try await controller.connect()
+        try await controller.refreshSettings()
 
         do {
             try await controller.startAPRS(.receiveOnly)
@@ -1189,10 +1955,18 @@ final class AzimuthLiveRadioControllerTests: XCTestCase {
         let core = IntegrationTestCore(kissInterfaceRawValue: 1)
         let controller = try makeController(transport: transport, core: core)
         try await controller.connect()
+        try await controller.refreshSettings()
 
         try await controller.startAPRS(.receiveOnly)
 
         XCTAssertEqual(core.startAprsCallCount, 1)
+        XCTAssertEqual(
+            core.lastAprsStartAuthority,
+            .settingsSnapshot(
+                snapshotId: 41,
+                expectedKissInterfaceRawValue: 1
+            )
+        )
         XCTAssertEqual(controller.currentAPRSState.status.phase, .active)
         await controller.disconnect()
     }
@@ -1202,6 +1976,7 @@ final class AzimuthLiveRadioControllerTests: XCTestCase {
         let core = IntegrationTestCore(kissInterfaceRawValue: 0)
         let controller = try makeController(transport: transport, core: core)
         try await controller.connect()
+        try await controller.refreshSettings()
 
         do {
             try await controller.startAPRS(.receiveOnly)
@@ -1221,11 +1996,661 @@ final class AzimuthLiveRadioControllerTests: XCTestCase {
         await controller.disconnect()
     }
 
+    func testAPRSCurrentModeRefusalRetainsOnlyOneExplicitRecoveryOffer() async throws {
+        let transport = IntegrationTestTransport(connectionKind: .usb)
+        let core = IntegrationTestCore(
+            kissInterfaceRawValue: 0,
+            aprsStartErrors: [
+                AutomationError.AprsCurrentModeUnavailable(
+                    detail: "current-mode refusal"
+                ),
+            ]
+        )
+        let recovery = IntegrationTestAPRSCurrentModeRecoveryOperation {
+            XCTFail("Consent offer must not inspect or change the radio")
+            return AprsCurrentModeRecoveryResult(
+                outcome: .alreadyOffCatReady,
+                radioSerialNumber: "C3C10368",
+                kissInterfaceRawValue: 0,
+                dataBand: .a
+            )
+        }
+        let controller = try AzimuthLiveRadioController(
+            transport: transport,
+            connectCore: { _ in core },
+            prepareRadioForAutomation: { _ in .cat },
+            recoverAPRSCurrentModeOverConnectedCAT: {
+                core,
+                serial,
+                route in
+                recovery.operation(
+                    core: core,
+                    expectedRadioSerialNumber: serial,
+                    expectedKISSInterfaceRawValue: route
+                )
+            },
+            automaticCATRecoveryAvailable: true
+        )
+        try await controller.connect()
+        try await controller.refreshSettings()
+        let capturesBeforeStart = core.screenCaptureCallCount
+
+        do {
+            try await controller.startAPRS(.receiveOnly)
+            XCTFail("The aligned current-mode refusal must require explicit consent")
+        } catch let error as RadioControllerError {
+            XCTAssertEqual(error, .aprsDVGatewayRecoveryRequired)
+        }
+
+        XCTAssertTrue(controller.automaticAPRSDVGatewayRecoveryAvailable)
+        XCTAssertEqual(recovery.callCount, 0)
+        XCTAssertEqual(core.closeCallCount, 0)
+        XCTAssertEqual(
+            core.screenCaptureCallCount,
+            capturesBeforeStart,
+            "An aligned in-session refusal must not delay consent behind another screen capture"
+        )
+        XCTAssertTrue(controller.currentState.connection.isConnected)
+        XCTAssertTrue(controller.currentState.settingValues.isEmpty)
+        XCTAssertEqual(controller.currentAPRSState.status.phase, .inactive)
+
+        controller.discardAPRSDVGatewayRecovery()
+
+        XCTAssertFalse(controller.automaticAPRSDVGatewayRecoveryAvailable)
+        XCTAssertEqual(recovery.callCount, 0)
+        XCTAssertEqual(core.closeCallCount, 0)
+        await controller.disconnect()
+    }
+
+    func testAPRSCurrentModeRefusalDoesNotRetainOfferWhenAutomaticRecoveryIsUnavailable() async throws {
+        let transport = IntegrationTestTransport(connectionKind: .usb)
+        let core = IntegrationTestCore(
+            kissInterfaceRawValue: 0,
+            aprsStartErrors: [
+                AutomationError.AprsCurrentModeUnavailable(
+                    detail: "current-mode refusal"
+                ),
+            ]
+        )
+        let controller = try AzimuthLiveRadioController(
+            transport: transport,
+            connectCore: { _ in core },
+            prepareRadioForAutomation: { _ in .cat },
+            automaticCATRecoveryAvailable: false
+        )
+        try await controller.connect()
+        try await controller.refreshSettings()
+
+        do {
+            try await controller.startAPRS(.receiveOnly)
+            XCTFail("Unsupported automatic recovery must not retain consent authority")
+        } catch let error as RadioControllerError {
+            guard case .operationFailed(let detail) = error else {
+                return XCTFail("Expected a manual-recovery explanation, got \(error)")
+            }
+            XCTAssertTrue(detail.contains("Automatic inspection is unavailable"))
+            XCTAssertTrue(detail.contains("left the radio unchanged"))
+            XCTAssertFalse(detail.contains("TN"))
+        }
+
+        XCTAssertFalse(controller.automaticAPRSDVGatewayRecoveryAvailable)
+        XCTAssertEqual(core.closeCallCount, 0)
+        XCTAssertTrue(controller.currentState.connection.isConnected)
+        await controller.disconnect()
+    }
+
+    func testApprovedAPRSRecoveryReprovesRouteAndSameEndpointThenRetriesExactConfigOnce() async throws {
+        let originalUSBDevice = AzimuthRadioDevice(
+            id: "tty:/dev/cu.usbmodem101",
+            name: "Kenwood TH-D75",
+            connectionKind: .usb,
+            connection: "USB-C"
+        )
+        let reenumeratedUSBDevice = AzimuthRadioDevice(
+            id: "tty:/dev/cu.usbmodem301",
+            name: originalUSBDevice.name,
+            connectionKind: .usb,
+            connection: originalUSBDevice.connection
+        )
+        let transport = IntegrationTestTransport(
+            connectionKind: .usb,
+            device: originalUSBDevice
+        )
+        transport.setDeviceOnNextSameRadioUSBRefresh(reenumeratedUSBDevice)
+        transport.setSameRadioUSBRefreshResults([false, true])
+        let firstCore = IntegrationTestCore(
+            kissInterfaceRawValue: 0,
+            aprsStartErrors: [
+                AutomationError.AprsCurrentModeUnavailable(
+                    detail: "current-mode refusal"
+                ),
+            ]
+        )
+        let recoveredCore = IntegrationTestCore(kissInterfaceRawValue: 0)
+        let connector = IntegrationTestCoreConnector(
+            cores: [firstCore, recoveredCore]
+        )
+        let normalPreflight = IntegrationTestModePreflight(modes: [.cat])
+        let catOnlyRecoveryPreflight = IntegrationTestModePreflight(modes: [.cat])
+        let recovery = IntegrationTestAPRSCurrentModeRecoveryOperation {
+            AprsCurrentModeRecoveryResult(
+                outcome: .alreadyOffCatReady,
+                radioSerialNumber: "C3C10368",
+                kissInterfaceRawValue: 0,
+                dataBand: .b
+            )
+        }
+        let controller = try AzimuthLiveRadioController(
+            transport: transport,
+            connectCore: { transport in
+                try await connector.connect(transport: transport)
+            },
+            prepareRadioForAutomation: { _ in try normalPreflight.nextMode() },
+            proveRadioCATWithoutPacketModeRecovery: { _ in
+                try catOnlyRecoveryPreflight.nextMode()
+            },
+            recoverAPRSCurrentModeOverConnectedCAT: {
+                core,
+                serial,
+                route in
+                recovery.operation(
+                    core: core,
+                    expectedRadioSerialNumber: serial,
+                    expectedKISSInterfaceRawValue: route
+                )
+            },
+            automaticCATRecoveryAvailable: true,
+            catRecoveryWindow: .seconds(1),
+            catRecoveryPollInterval: .milliseconds(1)
+        )
+        var configuration = APRSSessionConfiguration.receiveOnly
+        configuration.stationCallsign = "N0CALL-7"
+        configuration.path = "WIDE1-1"
+        try await controller.connect()
+        try await controller.refreshSettings()
+        do {
+            try await controller.startAPRS(configuration)
+            XCTFail("The first start must retain an approved-recovery offer")
+        } catch let error as RadioControllerError {
+            XCTAssertEqual(error, .aprsDVGatewayRecoveryRequired)
+        }
+
+        try await controller.recoverDVGatewayAndRetryAPRS()
+
+        XCTAssertEqual(recovery.callCount, 1)
+        XCTAssertEqual(recovery.lastExpectedRadioSerialNumber, "C3C10368")
+        XCTAssertEqual(recovery.lastExpectedKISSInterfaceRawValue, 0)
+        XCTAssertEqual(firstCore.startAprsCallCount, 1)
+        XCTAssertEqual(firstCore.closeCallCount, 1)
+        XCTAssertEqual(recoveredCore.startAprsCallCount, 1)
+        XCTAssertEqual(
+            recoveredCore.lastAprsStartAuthority,
+            .currentModeRecovery(
+                expectedRadioSerialNumber: "C3C10368",
+                expectedDataBand: .b
+            )
+        )
+        XCTAssertEqual(connector.callCount, 2)
+        XCTAssertEqual(normalPreflight.callCount, 1)
+        XCTAssertEqual(catOnlyRecoveryPreflight.callCount, 1)
+        XCTAssertEqual(transport.sameRadioUSBRefreshCallCount, 2)
+        XCTAssertEqual(transport.device, reenumeratedUSBDevice)
+        XCTAssertEqual(transport.openCallCount, 2)
+        XCTAssertEqual(controller.currentAPRSState.status.phase, .active)
+        XCTAssertEqual(
+            controller.currentAPRSState.status.configuration?.stationCallsign,
+            "N0CALL-7"
+        )
+        XCTAssertEqual(
+            controller.currentAPRSState.status.configuration?.path,
+            "WIDE1-1"
+        )
+        XCTAssertTrue(controller.currentState.settingValues.isEmpty)
+        XCTAssertFalse(controller.automaticAPRSDVGatewayRecoveryAvailable)
+        await controller.disconnect()
+    }
+
+    func testApprovedBluetoothAPRSRecoveryRebindsExactEndpointBeforeReconnect() async throws {
+        let baseTransport = IntegrationTestTransport(connectionKind: .bluetooth)
+        let transport = IntegrationSameRadioTransport(
+            base: baseTransport,
+            knownQualifiedAddress: "00-11-22-33-44-55"
+        )
+        let firstCore = IntegrationTestCore(
+            kissInterfaceRawValue: 1,
+            aprsStartErrors: [
+                AutomationError.AprsCurrentModeUnavailable(
+                    detail: "current-mode refusal"
+                ),
+            ]
+        )
+        let recoveredCore = IntegrationTestCore(kissInterfaceRawValue: 1)
+        let connector = IntegrationTestCoreConnector(
+            cores: [firstCore, recoveredCore]
+        )
+        let recovery = IntegrationTestAPRSCurrentModeRecoveryOperation {
+            AprsCurrentModeRecoveryResult(
+                outcome: .changedRadioRebooting,
+                radioSerialNumber: "C3C10368",
+                kissInterfaceRawValue: 1,
+                dataBand: .b
+            )
+        }
+        let controller = try AzimuthLiveRadioController(
+            transport: transport,
+            connectCore: { coreTransport in
+                try await connector.connect(transport: coreTransport)
+            },
+            prepareRadioForAutomation: { _ in .cat },
+            proveRadioCATWithoutPacketModeRecovery: { _ in .cat },
+            recoverAPRSCurrentModeOverConnectedCAT: {
+                core,
+                serial,
+                route in
+                recovery.operation(
+                    core: core,
+                    expectedRadioSerialNumber: serial,
+                    expectedKISSInterfaceRawValue: route
+                )
+            },
+            automaticCATRecoveryAvailable: true,
+            catRecoveryWindow: .seconds(1),
+            catRecoveryPollInterval: .milliseconds(1)
+        )
+        try await controller.connect()
+        try await controller.refreshSettings()
+        _ = try? await controller.startAPRS(.receiveOnly)
+
+        try await controller.recoverDVGatewayAndRetryAPRS()
+
+        XCTAssertEqual(recovery.callCount, 1)
+        XCTAssertEqual(recovery.lastExpectedKISSInterfaceRawValue, 1)
+        XCTAssertEqual(transport.bluetoothReconnectQualificationCount, 1)
+        XCTAssertEqual(
+            transport.lastBluetoothReconnectSerialNumber,
+            "C3C10368"
+        )
+        XCTAssertEqual(baseTransport.openCallCount, 2)
+        XCTAssertEqual(firstCore.closeCallCount, 1)
+        XCTAssertEqual(recoveredCore.startAprsCallCount, 1)
+        XCTAssertEqual(
+            recoveredCore.lastAprsStartAuthority,
+            .currentModeRecovery(
+                expectedRadioSerialNumber: "C3C10368",
+                expectedDataBand: .b
+            )
+        )
+        XCTAssertEqual(controller.currentRadioSerialNumber, "C3C10368")
+        XCTAssertEqual(controller.currentAPRSState.status.phase, .active)
+        await controller.disconnect()
+    }
+
+    func testApprovedAPRSRecoveryStopsBeforeMutationWhenLiveMenu983RouteChanged() async throws {
+        let transport = IntegrationTestTransport(connectionKind: .usb)
+        let core = IntegrationTestCore(
+            kissInterfaceRawValue: 0,
+            aprsStartErrors: [
+                AutomationError.AprsCurrentModeUnavailable(
+                    detail: "current-mode refusal"
+                ),
+            ]
+        )
+        let recovery = IntegrationTestAPRSCurrentModeRecoveryOperation {
+            throw AprsCurrentModeRecoveryError.KissInterfaceMismatch(
+                expected: 0,
+                actual: 1
+            )
+        }
+        let controller = try AzimuthLiveRadioController(
+            transport: transport,
+            connectCore: { _ in core },
+            prepareRadioForAutomation: { _ in .cat },
+            recoverAPRSCurrentModeOverConnectedCAT: {
+                core,
+                serial,
+                route in
+                recovery.operation(
+                    core: core,
+                    expectedRadioSerialNumber: serial,
+                    expectedKISSInterfaceRawValue: route
+                )
+            },
+            automaticCATRecoveryAvailable: true
+        )
+        try await controller.connect()
+        try await controller.refreshSettings()
+        _ = try? await controller.startAPRS(.receiveOnly)
+
+        do {
+            try await controller.recoverDVGatewayAndRetryAPRS()
+            XCTFail("A live Menu 983 mismatch must stop before Menu 650")
+        } catch let error as RadioControllerError {
+            guard case .operationFailed(let detail) = error else {
+                return XCTFail("Expected a route-qualified failure, got \(error)")
+            }
+            XCTAssertTrue(detail.contains("Menu 983 now routes KISS to Bluetooth"))
+            XCTAssertTrue(detail.contains("No radio setting was changed"))
+            XCTAssertFalse(detail.contains("before inspecting"))
+            XCTAssertFalse(detail.contains("TN"))
+        }
+
+        XCTAssertEqual(recovery.callCount, 1)
+        XCTAssertEqual(core.closeCallCount, 1)
+        XCTAssertEqual(transport.openCallCount, 1)
+        XCTAssertFalse(controller.automaticAPRSDVGatewayRecoveryAvailable)
+        await controller.disconnect()
+    }
+
+    func testApprovedAPRSRecoveryRejectsUnexpectedReturnedRouteBeforeReconnect() async throws {
+        let transport = IntegrationTestTransport(connectionKind: .usb)
+        let firstCore = IntegrationTestCore(
+            kissInterfaceRawValue: 0,
+            aprsStartErrors: [
+                AutomationError.AprsCurrentModeUnavailable(
+                    detail: "current-mode refusal"
+                ),
+            ]
+        )
+        let recoveredCore = IntegrationTestCore(kissInterfaceRawValue: 0)
+        let connector = IntegrationTestCoreConnector(cores: [firstCore, recoveredCore])
+        let recovery = IntegrationTestAPRSCurrentModeRecoveryOperation {
+            AprsCurrentModeRecoveryResult(
+                outcome: .alreadyOffCatReady,
+                radioSerialNumber: "C3C10368",
+                kissInterfaceRawValue: 1,
+                dataBand: .b
+            )
+        }
+        let controller = try AzimuthLiveRadioController(
+            transport: transport,
+            connectCore: { coreTransport in
+                try await connector.connect(transport: coreTransport)
+            },
+            prepareRadioForAutomation: { _ in .cat },
+            recoverAPRSCurrentModeOverConnectedCAT: { core, serial, route in
+                recovery.operation(
+                    core: core,
+                    expectedRadioSerialNumber: serial,
+                    expectedKISSInterfaceRawValue: route
+                )
+            },
+            automaticCATRecoveryAvailable: true,
+            catRecoveryWindow: .seconds(1),
+            catRecoveryPollInterval: .milliseconds(1)
+        )
+        try await controller.connect()
+        try await controller.refreshSettings()
+        _ = try? await controller.startAPRS(.receiveOnly)
+
+        do {
+            try await controller.recoverDVGatewayAndRetryAPRS()
+            XCTFail("A route-changing result must not authorize the retry")
+        } catch let error as RadioControllerError {
+            guard case .operationFailed(let detail) = error else {
+                return XCTFail("Expected a route-qualified failure, got \(error)")
+            }
+            XCTAssertTrue(detail.contains("returned KISS route 1"))
+            XCTAssertTrue(detail.contains("requires route 0"))
+        }
+
+        XCTAssertEqual(recovery.callCount, 1)
+        XCTAssertEqual(connector.callCount, 1)
+        XCTAssertEqual(recoveredCore.startAprsCallCount, 0)
+        XCTAssertFalse(controller.automaticAPRSDVGatewayRecoveryAvailable)
+        await controller.disconnect()
+    }
+
+    func testApprovedAPRSRecoveryRejectsDifferentCATRadioBeforeRetry() async throws {
+        let transport = IntegrationTestTransport(connectionKind: .usb)
+        let firstCore = IntegrationTestCore(
+            kissInterfaceRawValue: 0,
+            aprsStartErrors: [
+                AutomationError.AprsCurrentModeUnavailable(
+                    detail: "current-mode refusal"
+                ),
+            ]
+        )
+        let recoveredCore = IntegrationTestCore(
+            kissInterfaceRawValue: 0,
+            radioSerialNumber: "FFFFFFFF"
+        )
+        let connector = IntegrationTestCoreConnector(cores: [firstCore, recoveredCore])
+        let recovery = IntegrationTestAPRSCurrentModeRecoveryOperation {
+            AprsCurrentModeRecoveryResult(
+                outcome: .alreadyOffCatReady,
+                radioSerialNumber: "C3C10368",
+                kissInterfaceRawValue: 0,
+                dataBand: .a
+            )
+        }
+        let controller = try AzimuthLiveRadioController(
+            transport: transport,
+            connectCore: { coreTransport in
+                try await connector.connect(transport: coreTransport)
+            },
+            prepareRadioForAutomation: { _ in .cat },
+            proveRadioCATWithoutPacketModeRecovery: { _ in .cat },
+            recoverAPRSCurrentModeOverConnectedCAT: { core, serial, route in
+                recovery.operation(
+                    core: core,
+                    expectedRadioSerialNumber: serial,
+                    expectedKISSInterfaceRawValue: route
+                )
+            },
+            automaticCATRecoveryAvailable: true,
+            catRecoveryWindow: .seconds(1),
+            catRecoveryPollInterval: .milliseconds(1)
+        )
+        try await controller.connect()
+        try await controller.refreshSettings()
+        _ = try? await controller.startAPRS(.receiveOnly)
+
+        do {
+            try await controller.recoverDVGatewayAndRetryAPRS()
+            XCTFail("A different CAT AE identity must not reach the APRS retry")
+        } catch let error as RadioControllerError {
+            guard case .operationFailed(let detail) = error else {
+                return XCTFail("Expected an identity-qualified failure, got \(error)")
+            }
+            XCTAssertTrue(detail.contains("C3C10368"))
+            XCTAssertTrue(detail.contains("FFFFFFFF"))
+        }
+
+        XCTAssertEqual(recovery.callCount, 1)
+        XCTAssertEqual(connector.callCount, 2)
+        XCTAssertEqual(recoveredCore.startAprsCallCount, 0)
+        XCTAssertFalse(controller.automaticAPRSDVGatewayRecoveryAvailable)
+        await controller.disconnect()
+    }
+
+    func testApprovedAPRSRecoverySecondCurrentModeRefusalDoesNotLoopPrompt() async throws {
+        let transport = IntegrationTestTransport(connectionKind: .usb)
+        let firstCore = IntegrationTestCore(
+            kissInterfaceRawValue: 0,
+            aprsStartErrors: [
+                AutomationError.AprsCurrentModeUnavailable(detail: "first refusal"),
+            ]
+        )
+        let recoveredCore = IntegrationTestCore(
+            kissInterfaceRawValue: 0,
+            aprsStartErrors: [
+                AutomationError.AprsCurrentModeUnavailable(detail: "second refusal"),
+            ]
+        )
+        let connector = IntegrationTestCoreConnector(
+            cores: [firstCore, recoveredCore]
+        )
+        let recovery = IntegrationTestAPRSCurrentModeRecoveryOperation {
+            AprsCurrentModeRecoveryResult(
+                outcome: .alreadyOffCatReady,
+                radioSerialNumber: "C3C10368",
+                kissInterfaceRawValue: 0,
+                dataBand: .a
+            )
+        }
+        let controller = try AzimuthLiveRadioController(
+            transport: transport,
+            connectCore: { transport in
+                try await connector.connect(transport: transport)
+            },
+            prepareRadioForAutomation: { _ in .cat },
+            proveRadioCATWithoutPacketModeRecovery: { _ in .cat },
+            recoverAPRSCurrentModeOverConnectedCAT: {
+                core,
+                serial,
+                route in
+                recovery.operation(
+                    core: core,
+                    expectedRadioSerialNumber: serial,
+                    expectedKISSInterfaceRawValue: route
+                )
+            },
+            automaticCATRecoveryAvailable: true,
+            catRecoveryWindow: .seconds(1),
+            catRecoveryPollInterval: .milliseconds(1)
+        )
+        try await controller.connect()
+        try await controller.refreshSettings()
+        _ = try? await controller.startAPRS(.receiveOnly)
+
+        do {
+            try await controller.recoverDVGatewayAndRetryAPRS()
+            XCTFail("The single retry must surface its second refusal")
+        } catch let error as RadioControllerError {
+            guard case .operationFailed(let detail) = error else {
+                return XCTFail("Expected a dismiss-only retry failure, got \(error)")
+            }
+            XCTAssertTrue(detail.contains("retried this APRS configuration once"))
+            XCTAssertFalse(detail.contains("TN command"))
+            XCTAssertFalse(detail.contains("TN 2,"))
+        }
+
+        XCTAssertEqual(recovery.callCount, 1)
+        XCTAssertEqual(firstCore.startAprsCallCount, 1)
+        XCTAssertEqual(recoveredCore.startAprsCallCount, 1)
+        XCTAssertFalse(controller.automaticAPRSDVGatewayRecoveryAvailable)
+        XCTAssertTrue(controller.currentState.connection.isConnected)
+        XCTAssertEqual(controller.currentAPRSState.status.phase, .inactive)
+        await controller.disconnect()
+    }
+
+    func testApprovedAPRSRecoveryCancellationBeforeGateReturnsNoMutationOutcome() async throws {
+        let transport = IntegrationTestTransport(connectionKind: .usb)
+        let core = IntegrationTestCore(
+            kissInterfaceRawValue: 0,
+            aprsStartErrors: [
+                AutomationError.AprsCurrentModeUnavailable(detail: "first refusal"),
+            ]
+        )
+        let recovery = IntegrationTestCancellableAPRSCurrentModeRecoveryOperation()
+        let controller = try AzimuthLiveRadioController(
+            transport: transport,
+            connectCore: { _ in core },
+            prepareRadioForAutomation: { _ in .cat },
+            recoverAPRSCurrentModeOverConnectedCAT: {
+                actor,
+                serial,
+                route in
+                recovery.operation(
+                    core: actor,
+                    expectedRadioSerialNumber: serial,
+                    expectedKISSInterfaceRawValue: route
+                )
+            },
+            automaticCATRecoveryAvailable: true,
+            catRecoveryWindow: .seconds(1),
+            catRecoveryPollInterval: .milliseconds(1)
+        )
+        try await controller.connect()
+        try await controller.refreshSettings()
+        _ = try? await controller.startAPRS(.receiveOnly)
+
+        let recoveryTask = Task {
+            try await controller.recoverDVGatewayAndRetryAPRS()
+        }
+        try await waitUntil { recovery.hasStarted }
+        recoveryTask.cancel()
+
+        do {
+            try await recoveryTask.value
+            XCTFail("Pre-gate cancellation must stop approved recovery")
+        } catch is CancellationError {
+            // The typed native cancellation proves that no mutation outcome
+            // crossed the persistent-setting gate.
+        } catch {
+            XCTFail("Expected cancellation before mutation, got \(error)")
+        }
+
+        XCTAssertTrue(recovery.cancellationObserved)
+        XCTAssertEqual(core.closeCallCount, 1)
+        XCTAssertEqual(transport.openCallCount, 1)
+        XCTAssertFalse(controller.automaticAPRSDVGatewayRecoveryAvailable)
+        await controller.disconnect()
+    }
+
+    func testLateCancellationWaitsForTruthfulApprovedAPRSRecoveryOutcome() async throws {
+        let transport = IntegrationTestTransport(connectionKind: .usb)
+        let core = IntegrationTestCore(
+            kissInterfaceRawValue: 0,
+            aprsStartErrors: [
+                AutomationError.AprsCurrentModeUnavailable(detail: "first refusal"),
+            ]
+        )
+        let recovery = IntegrationTestBlockingAPRSCurrentModeRecoveryOperation()
+        let controller = try AzimuthLiveRadioController(
+            transport: transport,
+            connectCore: { _ in core },
+            prepareRadioForAutomation: { _ in .cat },
+            recoverAPRSCurrentModeOverConnectedCAT: {
+                actor,
+                serial,
+                route in
+                recovery.operation(
+                    core: actor,
+                    expectedRadioSerialNumber: serial,
+                    expectedKISSInterfaceRawValue: route
+                )
+            },
+            automaticCATRecoveryAvailable: true,
+            catRecoveryWindow: .seconds(1),
+            catRecoveryPollInterval: .milliseconds(1)
+        )
+        try await controller.connect()
+        try await controller.refreshSettings()
+        _ = try? await controller.startAPRS(.receiveOnly)
+
+        let recoveryTask = Task {
+            try await controller.recoverDVGatewayAndRetryAPRS()
+        }
+        try await waitUntil { recovery.hasStarted }
+        recoveryTask.cancel()
+        try await waitUntil { recovery.cancellationObserved }
+        XCTAssertFalse(recovery.hasFinished)
+        recovery.complete(outcome: .changedRadioRebooting)
+
+        do {
+            try await recoveryTask.value
+            XCTFail("Late cancellation must preserve the completed outcome")
+        } catch let error as RadioControllerError {
+            guard case .operationFailed(let detail) = error else {
+                return XCTFail("Expected a truthful completed outcome, got \(error)")
+            }
+            XCTAssertTrue(detail.contains("Menu 650 was changed to Off"))
+            XCTAssertTrue(detail.contains("one-time APRS retry were stopped"))
+        }
+
+        XCTAssertTrue(recovery.hasFinished)
+        XCTAssertEqual(core.closeCallCount, 1)
+        XCTAssertEqual(transport.openCallCount, 1)
+        await controller.disconnect()
+    }
+
     func testAPRSStopAutomationRestorationFailureDoesNotReadTerminatedCore() async throws {
         let transport = IntegrationTestTransport()
         let core = IntegrationTestCore()
         let controller = try makeController(transport: transport, core: core)
         try await controller.connect()
+        try await controller.refreshSettings()
 
         var configuration = APRSSessionConfiguration.receiveOnly
         configuration.stationCallsign = "N0CALL-7"
@@ -1266,6 +2691,7 @@ final class AzimuthLiveRadioControllerTests: XCTestCase {
         let core = IntegrationTestCore()
         let controller = try makeController(transport: transport, core: core)
         try await controller.connect()
+        try await controller.refreshSettings()
 
         try await controller.startAPRS(.receiveOnly)
         let settingsBeforeStop = core.settingReadCallCount
@@ -1282,10 +2708,10 @@ final class AzimuthLiveRadioControllerTests: XCTestCase {
             XCTAssertTrue(error.localizedDescription.contains("stop request was rejected"))
         }
 
-        XCTAssertGreaterThan(
+        XCTAssertEqual(
             core.settingReadCallCount,
             settingsBeforeStop,
-            "A nonterminal APRS error must retain the existing CAT workspace recovery path"
+            "A nonterminal APRS error must restore the CAT workspace without a hidden MCP read"
         )
         XCTAssertTrue(controller.currentState.connection.isConnected)
         await controller.disconnect()
@@ -1386,19 +2812,27 @@ final class AzimuthLiveRadioControllerTests: XCTestCase {
 
 private final class IntegrationTestCoreConnector: @unchecked Sendable {
     private let lock = NSLock()
-    private let core: IntegrationTestCore
+    private var cores: [IntegrationTestCore]
     private var calls = 0
 
     init(core: IntegrationTestCore) {
-        self.core = core
+        cores = [core]
+    }
+
+    init(cores: [IntegrationTestCore]) {
+        precondition(!cores.isEmpty)
+        self.cores = cores
     }
 
     var callCount: Int { lock.withLock { calls } }
 
     func connect(transport: ByteTransport) async throws -> any AutomationControllerProtocol {
         _ = transport
-        lock.withLock { calls += 1 }
-        return core
+        return lock.withLock {
+            calls += 1
+            if cores.count == 1 { return cores[0] }
+            return cores.removeFirst()
+        }
     }
 }
 
@@ -1499,6 +2933,278 @@ private final class IntegrationTestCATRecovery: AzimuthCATRecoveryOperation, @un
             calls += 1
         }
         return .changedRadioRebooting
+    }
+}
+
+private final class IntegrationTestDvGatewayUsbRouting:
+    AzimuthDvGatewayUsbRoutingOperation,
+    @unchecked Sendable
+{
+    private let lock = NSLock()
+    private var calls = 0
+
+    var callCount: Int { lock.withLock { calls } }
+
+    func operation(
+        transport: ByteTransport
+    ) -> any AzimuthDvGatewayUsbRoutingOperation {
+        _ = transport
+        return self
+    }
+
+    func cancel() {}
+
+    func run() async throws -> DvGatewayUsbRoutingResult {
+        lock.withLock { calls += 1 }
+        return DvGatewayUsbRoutingResult(
+            outcome: .changedRadioRebooting,
+            radioSerialNumber: "C3C10368"
+        )
+    }
+}
+
+private final class IntegrationTestCatDisableOperation:
+    AzimuthDvGatewayCatDisableOperation,
+    @unchecked Sendable
+{
+    private let lock = NSLock()
+    private let body: @Sendable () throws -> DvGatewayCatDisableResult
+    private var calls = 0
+    private var expectedRadioSerialNumber: String?
+
+    init(body: @escaping @Sendable () throws -> DvGatewayCatDisableResult) {
+        self.body = body
+    }
+
+    var callCount: Int { lock.withLock { calls } }
+    var lastExpectedRadioSerialNumber: String? {
+        lock.withLock { expectedRadioSerialNumber }
+    }
+
+    func operation(
+        core: any AutomationControllerProtocol,
+        expectedRadioSerialNumber: String
+    ) -> any AzimuthDvGatewayCatDisableOperation {
+        _ = core
+        lock.withLock {
+            self.expectedRadioSerialNumber = expectedRadioSerialNumber
+        }
+        return self
+    }
+
+    func cancel() {}
+
+    func run() async throws -> DvGatewayCatDisableResult {
+        lock.withLock { calls += 1 }
+        return try body()
+    }
+}
+
+private final class IntegrationTestAPRSCurrentModeRecoveryOperation:
+    AzimuthAPRSCurrentModeRecoveryOperation,
+    @unchecked Sendable
+{
+    private let lock = NSLock()
+    private let body: @Sendable () throws -> AprsCurrentModeRecoveryResult
+    private var calls = 0
+    private var expectedRadioSerialNumber: String?
+    private var expectedKISSInterfaceRawValue: UInt8?
+
+    init(
+        body: @escaping @Sendable () throws -> AprsCurrentModeRecoveryResult
+    ) {
+        self.body = body
+    }
+
+    var callCount: Int { lock.withLock { calls } }
+    var lastExpectedRadioSerialNumber: String? {
+        lock.withLock { expectedRadioSerialNumber }
+    }
+    var lastExpectedKISSInterfaceRawValue: UInt8? {
+        lock.withLock { expectedKISSInterfaceRawValue }
+    }
+
+    func operation(
+        core: any AutomationControllerProtocol,
+        expectedRadioSerialNumber: String,
+        expectedKISSInterfaceRawValue: UInt8
+    ) -> any AzimuthAPRSCurrentModeRecoveryOperation {
+        _ = core
+        lock.withLock {
+            self.expectedRadioSerialNumber = expectedRadioSerialNumber
+            self.expectedKISSInterfaceRawValue = expectedKISSInterfaceRawValue
+        }
+        return self
+    }
+
+    func cancel() {}
+
+    func run() async throws -> AprsCurrentModeRecoveryResult {
+        lock.withLock { calls += 1 }
+        return try body()
+    }
+}
+
+private final class IntegrationTestBlockingAPRSCurrentModeRecoveryOperation:
+    AzimuthAPRSCurrentModeRecoveryOperation,
+    @unchecked Sendable
+{
+    private let lock = NSLock()
+    private var started = false
+    private var cancelled = false
+    private var finished = false
+    private var continuation:
+        CheckedContinuation<AprsCurrentModeRecoveryResult, Never>?
+
+    var hasStarted: Bool { lock.withLock { started } }
+    var cancellationObserved: Bool { lock.withLock { cancelled } }
+    var hasFinished: Bool { lock.withLock { finished } }
+
+    func operation(
+        core: any AutomationControllerProtocol,
+        expectedRadioSerialNumber: String,
+        expectedKISSInterfaceRawValue: UInt8
+    ) -> any AzimuthAPRSCurrentModeRecoveryOperation {
+        _ = core
+        _ = expectedRadioSerialNumber
+        _ = expectedKISSInterfaceRawValue
+        return self
+    }
+
+    func cancel() {
+        lock.withLock { cancelled = true }
+    }
+
+    func run() async throws -> AprsCurrentModeRecoveryResult {
+        let result = await withCheckedContinuation { continuation in
+            lock.withLock {
+                self.continuation = continuation
+                started = true
+            }
+        }
+        lock.withLock { finished = true }
+        return result
+    }
+
+    func complete(
+        outcome: DvGatewayRecoveryOutcome = .changedRadioRebooting
+    ) {
+        let pending = lock.withLock {
+            let pending = continuation
+            continuation = nil
+            return pending
+        }
+        pending?.resume(
+            returning: AprsCurrentModeRecoveryResult(
+                outcome: outcome,
+                radioSerialNumber: "C3C10368",
+                kissInterfaceRawValue: 0,
+                dataBand: .a
+            )
+        )
+    }
+}
+
+private final class IntegrationTestCancellableAPRSCurrentModeRecoveryOperation:
+    AzimuthAPRSCurrentModeRecoveryOperation,
+    @unchecked Sendable
+{
+    private let lock = NSLock()
+    private var started = false
+    private var cancelled = false
+    private var continuation:
+        CheckedContinuation<AprsCurrentModeRecoveryResult, Error>?
+
+    var hasStarted: Bool { lock.withLock { started } }
+    var cancellationObserved: Bool { lock.withLock { cancelled } }
+
+    func operation(
+        core: any AutomationControllerProtocol,
+        expectedRadioSerialNumber: String,
+        expectedKISSInterfaceRawValue: UInt8
+    ) -> any AzimuthAPRSCurrentModeRecoveryOperation {
+        _ = core
+        _ = expectedRadioSerialNumber
+        _ = expectedKISSInterfaceRawValue
+        return self
+    }
+
+    func cancel() {
+        let pending = lock.withLock {
+            cancelled = true
+            let pending = continuation
+            continuation = nil
+            return pending
+        }
+        pending?.resume(throwing: AprsCurrentModeRecoveryError.Cancelled)
+    }
+
+    func run() async throws -> AprsCurrentModeRecoveryResult {
+        try await withCheckedThrowingContinuation { continuation in
+            lock.withLock {
+                self.continuation = continuation
+                started = true
+            }
+        }
+    }
+}
+
+private final class IntegrationTestBlockingCatDisableOperation:
+    AzimuthDvGatewayCatDisableOperation,
+    @unchecked Sendable
+{
+    private let lock = NSLock()
+    private var started = false
+    private var cancelled = false
+    private var finished = false
+    private var expectedRadioSerialNumber: String?
+    private var continuation: CheckedContinuation<DvGatewayCatDisableResult, Never>?
+
+    var hasStarted: Bool { lock.withLock { started } }
+    var cancellationObserved: Bool { lock.withLock { cancelled } }
+    var hasFinished: Bool { lock.withLock { finished } }
+    var lastExpectedRadioSerialNumber: String? {
+        lock.withLock { expectedRadioSerialNumber }
+    }
+
+    func operation(
+        core: any AutomationControllerProtocol,
+        expectedRadioSerialNumber: String
+    ) -> any AzimuthDvGatewayCatDisableOperation {
+        _ = core
+        lock.withLock {
+            self.expectedRadioSerialNumber = expectedRadioSerialNumber
+        }
+        return self
+    }
+
+    func cancel() {
+        lock.withLock { cancelled = true }
+    }
+
+    func run() async throws -> DvGatewayCatDisableResult {
+        let result = await withCheckedContinuation { continuation in
+            lock.withLock {
+                self.continuation = continuation
+                started = true
+            }
+        }
+        lock.withLock { finished = true }
+        return result
+    }
+
+    func complete() {
+        let pending = lock.withLock {
+            let pending = continuation
+            continuation = nil
+            return pending
+        }
+        pending?.resume(
+            returning: DvGatewayCatDisableResult(
+                outcome: .changedRadioRebooting,
+                radioSerialNumber: "C3C10368"
+            )
+        )
     }
 }
 
@@ -1605,38 +3311,75 @@ private final class IntegrationTestImmediateCATRecoveryOperation:
     }
 }
 
-private final class IntegrationTestTransport: AzimuthRadioTransport, @unchecked Sendable {
-    let device: AzimuthRadioDevice
+private final class IntegrationTestTransport:
+    AzimuthRadioTransport,
+    AzimuthSameRadioUSBRefreshing,
+    @unchecked Sendable
+{
     private let lock = NSLock()
+    private var selectedDevice: AzimuthRadioDevice
+    private var deviceOnNextSameRadioUSBRefresh: AzimuthRadioDevice?
+    private var sameRadioUSBRefreshResults: [Bool] = []
     private var serialNumber: String?
     private var currentState: AzimuthRadioTransportState = .disconnected
     private var opens = 0
     private var closes = 0
+    private var sameRadioUSBRefreshes = 0
     private var serialNumberByOpen: [Int: String] = [:]
     private var blockedOpenCall: Int?
     private var openIsBlocked = false
     private var shouldBlockNextClose = false
     private var blockedCloseContinuation: CheckedContinuation<Void, Never>?
+    private var registryEntryID: UInt64?
+    private var registryEntryIDByAccess: [Int: UInt64] = [:]
+    private var registryEntryIDAccesses = 0
 
     init(
         hardwareSerialNumber: String? = "C3C10368",
-        connectionKind: AzimuthRadioConnectionKind = .usb
+        connectionKind: AzimuthRadioConnectionKind = .usb,
+        device: AzimuthRadioDevice? = nil
     ) {
-        switch connectionKind {
-        case .usb:
-            device = .thD75USBC
-        case .bluetooth:
-            device = AzimuthRadioDevice(
+        if let device {
+            selectedDevice = device
+        } else {
+            selectedDevice = switch connectionKind {
+            case .usb: .thD75USBC
+            case .bluetooth: AzimuthRadioDevice(
                 id: "bluetooth:00-11-22-33-44-55",
                 name: "Kenwood TH-D75",
                 connectionKind: .bluetooth,
                 connection: "Bluetooth"
             )
+            }
         }
         serialNumber = hardwareSerialNumber
+        registryEntryID = selectedDevice.connectionKind == .usb ? 0x1001 : nil
     }
 
+    var device: AzimuthRadioDevice { lock.withLock { selectedDevice } }
+
     var hardwareSerialNumber: String? { lock.withLock { serialNumber } }
+
+    var macOSUSBDeviceRegistryEntryID: UInt64? {
+        get async {
+            lock.withLock {
+                registryEntryIDAccesses += 1
+                if let scheduled = registryEntryIDByAccess.removeValue(
+                    forKey: registryEntryIDAccesses
+                ) {
+                    registryEntryID = scheduled
+                }
+                return registryEntryID
+            }
+        }
+    }
+
+    func setMacOSUSBDeviceRegistryEntryID(
+        _ value: UInt64,
+        onAccess access: Int
+    ) {
+        lock.withLock { registryEntryIDByAccess[access] = value }
+    }
 
     func setHardwareSerialNumber(_ value: String?) {
         lock.withLock { serialNumber = value }
@@ -1646,8 +3389,19 @@ private final class IntegrationTestTransport: AzimuthRadioTransport, @unchecked 
         lock.withLock { serialNumberByOpen[openCall] = value }
     }
 
+    func setDeviceOnNextSameRadioUSBRefresh(_ value: AzimuthRadioDevice) {
+        lock.withLock { deviceOnNextSameRadioUSBRefresh = value }
+    }
+
+    func setSameRadioUSBRefreshResults(_ values: [Bool]) {
+        lock.withLock { sameRadioUSBRefreshResults = values }
+    }
+
     var openCallCount: Int { lock.withLock { opens } }
     var closeCallCount: Int { lock.withLock { closes } }
+    var sameRadioUSBRefreshCallCount: Int {
+        lock.withLock { sameRadioUSBRefreshes }
+    }
     var hasBlockedClose: Bool { lock.withLock { blockedCloseContinuation != nil } }
     var hasBlockedOpen: Bool { lock.withLock { openIsBlocked } }
 
@@ -1718,6 +3472,195 @@ private final class IntegrationTestTransport: AzimuthRadioTransport, @unchecked 
     func setBaudRate(baud: UInt32) throws {}
     func write(_ bytes: [UInt8]) async throws {}
     func read(maxBytes: Int) async throws -> [UInt8] { [] }
+
+    func refreshSelectedUSBForSameRadioRecovery() async throws -> Bool {
+        lock.withLock {
+            sameRadioUSBRefreshes += 1
+            if !sameRadioUSBRefreshResults.isEmpty,
+               !sameRadioUSBRefreshResults.removeFirst() {
+                return false
+            }
+            if let replacement = deviceOnNextSameRadioUSBRefresh {
+                selectedDevice = replacement
+                deviceOnNextSameRadioUSBRefresh = nil
+            }
+            return selectedDevice.connectionKind == .usb
+        }
+    }
+}
+
+private final class IntegrationIFDSPGatewayRecoveryTransport:
+    AzimuthRadioTransport,
+    AzimuthSameRadioBluetoothSelecting,
+    AzimuthBluetoothMMDVMUSBSelecting,
+    AzimuthIFDSPUSBSelecting,
+    @unchecked Sendable
+{
+    private let lock = NSLock()
+    private let base = IntegrationTestTransport(connectionKind: .bluetooth)
+    private let soleUSBAvailable: Bool
+    private let ifDSPUSBSerialNumber: String?
+    private var selectedDevice = AzimuthRadioDevice(
+        id: "bluetooth:00-11-22-33-44-55",
+        name: "Kenwood TH-D75",
+        connectionKind: .bluetooth,
+        connection: "Bluetooth"
+    )
+    private var retainedIFDSPContext = false
+    private var usbAvailabilityChecks = 0
+    private var usbSelections = 0
+    private var bluetoothRestores = 0
+    private var reconnectSerialNumber: String?
+    private var blockNextIFDSPRetain = false
+    private var ifDSPRetainStarted = false
+    private var ifDSPRetainContinuation: CheckedContinuation<Void, Never>?
+
+    init(
+        soleUSBAvailable: Bool = true,
+        ifDSPUSBSerialNumber: String? = "C3C10368"
+    ) {
+        self.soleUSBAvailable = soleUSBAvailable
+        self.ifDSPUSBSerialNumber = ifDSPUSBSerialNumber
+    }
+
+    var usbAvailabilityCheckCount: Int {
+        lock.withLock { usbAvailabilityChecks }
+    }
+
+    var lastReconnectSerialNumber: String? {
+        lock.withLock { reconnectSerialNumber }
+    }
+
+    var usbSelectionCount: Int { lock.withLock { usbSelections } }
+    var bluetoothRestoreCount: Int { lock.withLock { bluetoothRestores } }
+    var retainedIFDSPHandoff: Bool { lock.withLock { retainedIFDSPContext } }
+    var hasBlockedIFDSPRetain: Bool { lock.withLock { ifDSPRetainStarted } }
+
+    func blockNextIFDSPRetainCall() {
+        lock.withLock { blockNextIFDSPRetain = true }
+    }
+
+    func releaseBlockedIFDSPRetainCall() {
+        let pending = lock.withLock {
+            let pending = ifDSPRetainContinuation
+            ifDSPRetainContinuation = nil
+            return pending
+        }
+        pending?.resume()
+    }
+
+    var device: AzimuthRadioDevice { lock.withLock { selectedDevice } }
+    var state: AzimuthRadioTransportState { get async { await base.state } }
+    var stateStream: AsyncStream<AzimuthRadioTransportState> { base.stateStream }
+    var hardwareSerialNumber: String? {
+        get async {
+            lock.withLock {
+                selectedDevice.connectionKind == .usb
+                    ? ifDSPUSBSerialNumber
+                    : base.hardwareSerialNumber
+            }
+        }
+    }
+    var macOSUSBDeviceRegistryEntryID: UInt64? {
+        get async {
+            lock.withLock {
+                selectedDevice.connectionKind == .usb ? 0x2002 : nil
+            }
+        }
+    }
+
+    func open() async throws { try await base.open() }
+    func close() async { await base.close() }
+    func setBaudRate(baud: UInt32) throws { try base.setBaudRate(baud: baud) }
+    func write(_ bytes: [UInt8]) async throws { try await base.write(bytes) }
+    func read(maxBytes: Int) async throws -> [UInt8] {
+        try await base.read(maxBytes: maxBytes)
+    }
+
+    func selectBluetoothForSameRadio(expectedSerialNumber: String) async throws {
+        _ = expectedSerialNumber
+    }
+
+    func knownQualifiedBluetoothAddress(
+        expectedSerialNumber: String
+    ) async throws -> String? {
+        _ = expectedSerialNumber
+        return nil
+    }
+
+    func selectUSBForRecovery(expectedSerialNumber: String) async throws {
+        _ = expectedSerialNumber
+    }
+
+    func qualifySelectedBluetoothForReconnect(
+        expectedSerialNumber: String
+    ) async throws {
+        lock.withLock { reconnectSerialNumber = expectedSerialNumber }
+    }
+
+    func hasSoleVerifiedUSBEndpoint() async throws -> Bool {
+        soleUSBAvailable
+    }
+
+    func retainSoleIFDSPUSBEndpoint() async throws -> Bool {
+        let shouldBlock = lock.withLock { () -> Bool in
+            usbAvailabilityChecks += 1
+            let shouldBlock = blockNextIFDSPRetain
+            blockNextIFDSPRetain = false
+            return shouldBlock
+        }
+        if shouldBlock {
+            await withCheckedContinuation { continuation in
+                lock.withLock {
+                    ifDSPRetainStarted = true
+                    ifDSPRetainContinuation = continuation
+                }
+            }
+        }
+        return lock.withLock {
+            retainedIFDSPContext = soleUSBAvailable
+            return soleUSBAvailable
+        }
+    }
+
+    func selectRetainedIFDSPUSBEndpoint() async throws -> Bool {
+        lock.withLock {
+            guard retainedIFDSPContext, soleUSBAvailable else { return false }
+            selectedDevice = .thD75USBC
+            usbSelections += 1
+            return true
+        }
+    }
+
+    func restoreRetainedIFDSPBluetoothEndpoint(
+        expectedSerialNumber: String
+    ) async throws {
+        lock.withLock {
+            selectedDevice = AzimuthRadioDevice(
+                id: "bluetooth:00-11-22-33-44-55",
+                name: "Kenwood TH-D75",
+                connectionKind: .bluetooth,
+                connection: "Bluetooth"
+            )
+            reconnectSerialNumber = expectedSerialNumber
+            bluetoothRestores += 1
+            retainedIFDSPContext = false
+        }
+    }
+
+    func finishRetainedIFDSPUSBHandoff() async {
+        lock.withLock { retainedIFDSPContext = false }
+    }
+
+    func selectSoleUSBForBluetoothMMDVM() async throws {}
+
+    func selectOriginalBluetoothAfterUSBRouting(
+        expectedSerialNumber: String
+    ) async throws {
+        _ = expectedSerialNumber
+    }
+
+    func restoreOriginalBluetoothAfterUSBRoutingFailure() async throws {}
 }
 
 private final class IntegrationSameRadioTransport:
@@ -1728,6 +3671,8 @@ private final class IntegrationSameRadioTransport:
     private let knownQualifiedAddress: String?
     private var knownAddressRequests = 0
     private var usbRecoverySelections = 0
+    private var bluetoothReconnectQualifications = 0
+    private var bluetoothReconnectSerialNumber: String?
 
     init(
         base: IntegrationTestTransport,
@@ -1743,6 +3688,12 @@ private final class IntegrationSameRadioTransport:
 
     var usbRecoverySelectionCount: Int {
         lock.withLock { usbRecoverySelections }
+    }
+    var bluetoothReconnectQualificationCount: Int {
+        lock.withLock { bluetoothReconnectQualifications }
+    }
+    var lastBluetoothReconnectSerialNumber: String? {
+        lock.withLock { bluetoothReconnectSerialNumber }
     }
 
     var device: AzimuthRadioDevice { base.device }
@@ -1774,6 +3725,15 @@ private final class IntegrationSameRadioTransport:
         _ = expectedSerialNumber
         lock.withLock { usbRecoverySelections += 1 }
     }
+
+    func qualifySelectedBluetoothForReconnect(
+        expectedSerialNumber: String
+    ) async throws {
+        lock.withLock {
+            bluetoothReconnectQualifications += 1
+            bluetoothReconnectSerialNumber = expectedSerialNumber
+        }
+    }
 }
 
 private final class IntegrationBluetoothMMDVMUSBTransport:
@@ -1788,8 +3748,14 @@ private final class IntegrationBluetoothMMDVMUSBTransport:
         connection: "Bluetooth"
     )
     private var usbSelections = 0
+    private var bluetoothRestores = 0
+    private var bluetoothExpectedSerial: String?
 
     var usbSelectionCount: Int { lock.withLock { usbSelections } }
+    var bluetoothRestoreCount: Int { lock.withLock { bluetoothRestores } }
+    var lastBluetoothExpectedSerial: String? {
+        lock.withLock { bluetoothExpectedSerial }
+    }
     var device: AzimuthRadioDevice { lock.withLock { selectedDevice } }
     var state: AzimuthRadioTransportState { get async { await base.state } }
     var stateStream: AsyncStream<AzimuthRadioTransportState> { base.stateStream }
@@ -1803,14 +3769,39 @@ private final class IntegrationBluetoothMMDVMUSBTransport:
         try await base.read(maxBytes: maxBytes)
     }
 
-    func hasSoleIdentifiedUSBEndpoint() async throws -> Bool { true }
+    func hasSoleVerifiedUSBEndpoint() async throws -> Bool { true }
 
-    func selectSoleUSBForBluetoothMMDVM() async throws -> String {
+    func selectSoleUSBForBluetoothMMDVM() async throws {
         lock.withLock {
             selectedDevice = .thD75USBC
             usbSelections += 1
         }
-        return "C3C10368"
+    }
+
+    func selectOriginalBluetoothAfterUSBRouting(
+        expectedSerialNumber: String
+    ) async throws {
+        lock.withLock {
+            selectedDevice = AzimuthRadioDevice(
+                id: "bluetooth:00-11-22-33-44-55",
+                name: "Kenwood TH-D75",
+                connectionKind: .bluetooth,
+                connection: "Bluetooth"
+            )
+            bluetoothRestores += 1
+            bluetoothExpectedSerial = expectedSerialNumber
+        }
+    }
+
+    func restoreOriginalBluetoothAfterUSBRoutingFailure() async throws {
+        lock.withLock {
+            selectedDevice = AzimuthRadioDevice(
+                id: "bluetooth:00-11-22-33-44-55",
+                name: "Kenwood TH-D75",
+                connectionKind: .bluetooth,
+                connection: "Bluetooth"
+            )
+        }
     }
 }
 
@@ -1826,7 +3817,18 @@ private final class IntegrationTestCore: AutomationControllerProtocol, @unchecke
     private var screenCaptureCalls = 0
     private var aprsStopCalls = 0
     private var aprsStartCalls = 0
+    private var aprsStartAuthorities: [AprsStartAuthority] = []
+    private var aprsStartErrors: [any Error]
+    private var ifDspPrepareCalls = 0
+    private var closeCalls = 0
+    private var shouldBlockNextSettingRead = false
+    private var blockedSettingReadContinuation: CheckedContinuation<Void, Never>?
+    private var shouldBlockNextCoreClose = false
+    private var blockedCoreCloseContinuation: CheckedContinuation<Void, Never>?
     private let kissInterfaceRawValue: UInt64
+    private let tncDataBandRawValue: UInt64
+    private let radioSerialNumber: String
+    private var dvGatewayModeRawValue: UInt64
     private var aprsStatus = IntegrationTestCore.aprsStatus(
         phase: .inactive,
         configuration: nil
@@ -1834,8 +3836,18 @@ private final class IntegrationTestCore: AutomationControllerProtocol, @unchecke
     private var aprsRows: [AprsActivityRecord] = []
     private var pendingAprsStop: CheckedContinuation<AprsSessionStatus, Error>?
 
-    init(kissInterfaceRawValue: UInt64 = 0) {
+    init(
+        kissInterfaceRawValue: UInt64 = 0,
+        tncDataBandRawValue: UInt64 = 0,
+        dvGatewayModeRawValue: UInt64 = 0,
+        radioSerialNumber: String = "C3C10368",
+        aprsStartErrors: [any Error] = []
+    ) {
         self.kissInterfaceRawValue = kissInterfaceRawValue
+        self.tncDataBandRawValue = tncDataBandRawValue
+        self.dvGatewayModeRawValue = dvGatewayModeRawValue
+        self.radioSerialNumber = radioSerialNumber
+        self.aprsStartErrors = aprsStartErrors
     }
 
     var applyCallCount: Int { lock.withLock { applyCalls } }
@@ -1846,9 +3858,59 @@ private final class IntegrationTestCore: AutomationControllerProtocol, @unchecke
     var screenCaptureCallCount: Int { lock.withLock { screenCaptureCalls } }
     var stopAprsCallCount: Int { lock.withLock { aprsStopCalls } }
     var startAprsCallCount: Int { lock.withLock { aprsStartCalls } }
+    var lastAprsStartAuthority: AprsStartAuthority? {
+        lock.withLock { aprsStartAuthorities.last }
+    }
+    var prepareIfDspCallCount: Int { lock.withLock { ifDspPrepareCalls } }
+    var closeCallCount: Int { lock.withLock { closeCalls } }
+    var dvGatewayModeRawValueSnapshot: UInt64 {
+        lock.withLock { dvGatewayModeRawValue }
+    }
+    var hasBlockedCoreClose: Bool {
+        lock.withLock { blockedCoreCloseContinuation != nil }
+    }
+    var hasBlockedSettingRead: Bool {
+        lock.withLock { blockedSettingReadContinuation != nil }
+    }
+
+    func blockNextSettingRead() {
+        lock.withLock { shouldBlockNextSettingRead = true }
+    }
+
+    func releaseBlockedSettingRead() {
+        let pending = lock.withLock {
+            let pending = blockedSettingReadContinuation
+            blockedSettingReadContinuation = nil
+            return pending
+        }
+        pending?.resume()
+    }
+
+    func blockNextCoreClose() {
+        lock.withLock { shouldBlockNextCoreClose = true }
+    }
+
+    func releaseBlockedCoreClose() {
+        let pending = lock.withLock {
+            let pending = blockedCoreCloseContinuation
+            blockedCoreCloseContinuation = nil
+            return pending
+        }
+        pending?.resume()
+    }
+
+    func setDVGatewayModeRawValue(_ value: UInt64) {
+        lock.withLock { dvGatewayModeRawValue = value }
+    }
 
     func abi() -> AutomationAbiRecord {
-        AutomationAbiRecord(version: 3, features: 0x7F, maxKey: 24, maxPhase: 1)
+        AutomationAbiRecord(
+            version: 3,
+            features: 0x7F,
+            maxKey: 24,
+            maxPhase: 1,
+            radioSerialNumber: radioSerialNumber
+        )
     }
 
     func applySettingChanges(changes: [SettingChange]) async throws -> SettingApplyReport {
@@ -1869,6 +3931,14 @@ private final class IntegrationTestCore: AutomationControllerProtocol, @unchecke
                     SettingValueRecord(
                         settingId: "radio.KissModeInterface",
                         value: .unsigned(value: kissInterfaceRawValue)
+                    ),
+                    SettingValueRecord(
+                        settingId: "aprs.TncDataBand",
+                        value: .unsigned(value: tncDataBandRawValue)
+                    ),
+                    SettingValueRecord(
+                        settingId: "dv.DvGatewayModeDvGateway",
+                        value: .unsigned(value: dvGatewayModeRawValue)
                     ),
                 ]
             )
@@ -1894,7 +3964,21 @@ private final class IntegrationTestCore: AutomationControllerProtocol, @unchecke
         return Self.frame(lease: nextLease)
     }
 
-    func close() async throws {}
+    func close() async throws {
+        let shouldBlock = lock.withLock { () -> Bool in
+            closeCalls += 1
+            let shouldBlock = shouldBlockNextCoreClose
+            shouldBlockNextCoreClose = false
+            return shouldBlock
+        }
+        if shouldBlock {
+            await withCheckedContinuation { continuation in
+                lock.withLock {
+                    blockedCoreCloseContinuation = continuation
+                }
+            }
+        }
+    }
 
     func guardedTap(leaseId: UInt64, key: FrontPanelKey) async throws -> GuardedTapResult {
         let newLease = lock.withLock { () -> UInt64 in
@@ -1908,6 +3992,18 @@ private final class IntegrationTestCore: AutomationControllerProtocol, @unchecke
     }
 
     func readSettingValues(settingIds: [String]?) async throws -> SettingReadResult {
+        let shouldBlock = lock.withLock { () -> Bool in
+            let shouldBlock = shouldBlockNextSettingRead
+            shouldBlockNextSettingRead = false
+            return shouldBlock
+        }
+        if shouldBlock {
+            await withCheckedContinuation { continuation in
+                lock.withLock {
+                    blockedSettingReadContinuation = continuation
+                }
+            }
+        }
         return lock.withLock { () -> SettingReadResult in
             settingReadCalls += 1
             return SettingReadResult(
@@ -1920,6 +4016,14 @@ private final class IntegrationTestCore: AutomationControllerProtocol, @unchecke
                     SettingValueRecord(
                         settingId: "radio.KissModeInterface",
                         value: .unsigned(value: kissInterfaceRawValue)
+                    ),
+                    SettingValueRecord(
+                        settingId: "aprs.TncDataBand",
+                        value: .unsigned(value: tncDataBandRawValue)
+                    ),
+                    SettingValueRecord(
+                        settingId: "dv.DvGatewayModeDvGateway",
+                        value: .unsigned(value: dvGatewayModeRawValue)
                     ),
                 ]
             )
@@ -1942,9 +4046,18 @@ private final class IntegrationTestCore: AutomationControllerProtocol, @unchecke
         }
     }
 
-    func startAprs(config: AprsSessionConfig) async throws -> AprsSessionStatus {
-        lock.withLock {
+    func startAprs(
+        config: AprsSessionConfig,
+        authority: AprsStartAuthority
+    ) async throws -> AprsSessionStatus {
+        let startError: (any Error)? = lock.withLock {
             aprsStartCalls += 1
+            aprsStartAuthorities.append(authority)
+            guard !aprsStartErrors.isEmpty else { return nil }
+            return aprsStartErrors.removeFirst()
+        }
+        if let startError { throw startError }
+        return lock.withLock {
             aprsStatus = Self.aprsStatus(phase: .active, configuration: config)
             aprsRows.append(
                 Self.aprsActivity(
@@ -2020,7 +4133,33 @@ private final class IntegrationTestCore: AutomationControllerProtocol, @unchecke
     }
 
     func prepareIfDsp() async throws -> IfDspRadioStatus {
-        IfDspRadioStatus(phase: .active, bandBFrequencyHz: 144_390_000, ifCenterHz: 12_000)
+        lock.withLock { ifDspPrepareCalls += 1 }
+        return IfDspRadioStatus(
+            phase: .active,
+            bandBFrequencyHz: 144_390_000,
+            ifCenterHz: 12_000
+        )
+    }
+
+    func cancelDvGatewayDisable() {}
+
+    func disableDvGateway(
+        expectedRadioSerialNumber: String
+    ) async throws -> DvGatewayCatDisableResult {
+        throw DvGatewayCatDisableError.ControllerUnavailable(
+            detail: "test core has no live Menu 650 actor operation for \(expectedRadioSerialNumber)"
+        )
+    }
+
+    func cancelAprsCurrentModeRecovery() {}
+
+    func recoverAprsCurrentMode(
+        expectedRadioSerialNumber: String,
+        expectedKissInterfaceRawValue: UInt8
+    ) async throws -> AprsCurrentModeRecoveryResult {
+        throw AprsCurrentModeRecoveryError.ControllerUnavailable(
+            detail: "test core has no live APRS current-mode operation for \(expectedRadioSerialNumber) route \(expectedKissInterfaceRawValue)"
+        )
     }
 
     func ifDspStatus() async throws -> IfDspRadioStatus {

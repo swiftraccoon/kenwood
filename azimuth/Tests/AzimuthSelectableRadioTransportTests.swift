@@ -15,15 +15,21 @@ private final class AzimuthRouterMockTransport: AzimuthRadioTransport,
     private let continuation: AsyncStream<AzimuthRadioTransportState>.Continuation
     private var currentState: AzimuthRadioTransportState = .disconnected
     private var serialNumber: String?
+    private let usbDeviceRegistryEntryID: UInt64?
     private var opens = 0
     private var closes = 0
     private var recordedWrites: [[UInt8]] = []
     private var recordedBaudRates: [UInt32] = []
     private var reads: [[UInt8]] = []
 
-    init(device: AzimuthRadioDevice, serialNumber: String? = nil) {
+    init(
+        device: AzimuthRadioDevice,
+        serialNumber: String? = nil,
+        macOSUSBDeviceRegistryEntryID: UInt64? = nil
+    ) {
         self.device = device
         self.serialNumber = serialNumber
+        usbDeviceRegistryEntryID = macOSUSBDeviceRegistryEntryID
         var continuation: AsyncStream<AzimuthRadioTransportState>.Continuation!
         stateStream = AsyncStream { continuation = $0 }
         self.continuation = continuation
@@ -35,6 +41,14 @@ private final class AzimuthRouterMockTransport: AzimuthRadioTransport,
 
     var hardwareSerialNumber: String? {
         get async { lock.withLock { serialNumber } }
+    }
+
+    var macOSUSBDeviceRegistryEntryID: UInt64? {
+        get async {
+            lock.withLock { currentState == .connected }
+                ? usbDeviceRegistryEntryID
+                : nil
+        }
     }
 
     var openCount: Int { lock.withLock { opens } }
@@ -370,13 +384,21 @@ final class AzimuthSelectableRadioTransportTests: XCTestCase {
         id: "usb:serial:B3B00001",
         displayName: "Kenwood TH-D75",
         devicePath: "/dev/cu.usbmodem101",
-        usbSerialNumber: "B3B00001"
+        usbSerialNumber: "B3B00001",
+        usbDeviceRegistryEntryID: 0x101
     )
     private static let secondUSB = AzimuthUSBEndpoint(
         id: "usb:serial:B3B00002",
         displayName: "Kenwood TH-D75",
         devicePath: "/dev/cu.usbmodem201",
-        usbSerialNumber: "B3B00002"
+        usbSerialNumber: "B3B00002",
+        usbDeviceRegistryEntryID: 0x201
+    )
+    private static let noDescriptorSerialUSB = AzimuthUSBEndpoint(
+        id: "tty:/dev/cu.usbmodem101",
+        displayName: "Kenwood TH-D75",
+        devicePath: "/dev/cu.usbmodem101",
+        usbDeviceRegistryEntryID: 0x101
     )
     private static let firstBluetooth = AzimuthBluetoothEndpoint(
         address: "00-11-22-33-44-55",
@@ -540,7 +562,8 @@ final class AzimuthSelectableRadioTransportTests: XCTestCase {
         let factory = makeFactory(firstLink: firstLink, secondLink: secondLink)
         let usb = AzimuthRouterMockTransport(
             device: .thD75USBC,
-            serialNumber: "B3B00001"
+            serialNumber: "B3B00001",
+            macOSUSBDeviceRegistryEntryID: 0x101
         )
         let usbFactory = makeUSBFactory(transport: usb)
         let router = try AzimuthSelectableRadioTransport(
@@ -580,7 +603,8 @@ final class AzimuthSelectableRadioTransportTests: XCTestCase {
     func testRouterForwardsUSBStateIdentityBaudAndWritesByDefault() async throws {
         let usb = AzimuthRouterMockTransport(
             device: .thD75USBC,
-            serialNumber: "B3B00001"
+            serialNumber: "B3B00001",
+            macOSUSBDeviceRegistryEntryID: 0x101
         )
         let factory = makeFactory()
         let usbFactory = makeUSBFactory(transport: usb)
@@ -595,17 +619,41 @@ final class AzimuthSelectableRadioTransportTests: XCTestCase {
 
         let openedState = await router.state
         let openedSerialNumber = await router.hardwareSerialNumber
+        let openedUSBDeviceRegistryEntryID = await router
+            .macOSUSBDeviceRegistryEntryID
         XCTAssertEqual(openedState, .connected)
         XCTAssertEqual(openedSerialNumber, "B3B00001")
+        XCTAssertEqual(openedUSBDeviceRegistryEntryID, 0x101)
         XCTAssertEqual(usbFactory.requests, [Self.firstUSB.id])
         XCTAssertEqual(usb.baudRates, [115_200])
         XCTAssertEqual(usb.writes, [[7, 6, 5]])
 
         await router.close()
         let closedSerialNumber = await router.hardwareSerialNumber
+        let closedUSBDeviceRegistryEntryID = await router
+            .macOSUSBDeviceRegistryEntryID
         let closedState = await router.state
         XCTAssertNil(closedSerialNumber)
+        XCTAssertNil(closedUSBDeviceRegistryEntryID)
         XCTAssertEqual(closedState, .disconnected)
+    }
+
+    func testRouterNeverPublishesZeroUSBDeviceRegistryIdentity() async throws {
+        let usb = AzimuthRouterMockTransport(
+            device: .thD75USBC,
+            serialNumber: "B3B00001",
+            macOSUSBDeviceRegistryEntryID: 0
+        )
+        let router = try AzimuthSelectableRadioTransport(
+            usbFactory: makeUSBFactory(transport: usb),
+            bluetoothFactory: makeFactory()
+        )
+
+        try await router.open()
+
+        let registryEntryID = await router.macOSUSBDeviceRegistryEntryID
+        XCTAssertNil(registryEntryID)
+        await router.close()
     }
 
     func testSameRadioFallbackUsesExpectedUSBSerialCoreTarget() async throws {
@@ -865,24 +913,283 @@ final class AzimuthSelectableRadioTransportTests: XCTestCase {
     }
 
     func testBluetoothMMDVMHandoffSelectsSoleExactUSBEndpoint() async throws {
-        let usb = AzimuthRouterMockTransport(device: Self.firstUSB.device)
+        let endpoint = Self.noDescriptorSerialUSB
+        let usb = AzimuthRouterMockTransport(device: endpoint.device)
         let router = try AzimuthSelectableRadioTransport(
-            usbFactory: makeUSBFactory(transport: usb),
+            usbFactory: makeUSBFactory(endpoint: endpoint, transport: usb),
             bluetoothFactory: makeFactory()
         )
         _ = try await router.availableEndpointSnapshot()
         try await router.selectEndpoint(id: Self.firstBluetooth.id)
 
-        let fallbackAvailable = try await router.hasSoleIdentifiedUSBEndpoint()
+        let fallbackAvailable = try await router.hasSoleVerifiedUSBEndpoint()
         XCTAssertTrue(fallbackAvailable)
-        let serialNumber = try await router.selectSoleUSBForBluetoothMMDVM()
+        try await router.selectSoleUSBForBluetoothMMDVM()
         let selectedEndpointID = await router.selectedEndpointID
         let selectedEndpoint = await router.selectedRadioEndpoint()
 
-        XCTAssertEqual(serialNumber, Self.firstUSB.usbSerialNumber)
-        XCTAssertEqual(selectedEndpointID, Self.firstUSB.id)
-        XCTAssertEqual(selectedEndpoint?.detail, Self.firstUSB.devicePath)
+        XCTAssertNil(endpoint.usbSerialNumber)
+        XCTAssertEqual(selectedEndpointID, endpoint.id)
+        XCTAssertEqual(selectedEndpoint?.detail, endpoint.devicePath)
         XCTAssertEqual(usb.openCount, 0)
+    }
+
+    func testIFDSPUSBHandoffRetainsAnonymousEndpointAcrossReenumeration() async throws {
+        let original = Self.noDescriptorSerialUSB
+        let reenumerated = AzimuthUSBEndpoint(
+            id: original.id,
+            displayName: original.displayName,
+            devicePath: original.devicePath,
+            usbSerialNumber: nil,
+            usbDeviceRegistryEntryID: original.usbDeviceRegistryEntryID + 1
+        )
+        let usb = AzimuthRouterMockTransport(device: original.device)
+        let usbFactory = makeUSBFactory(endpoint: original, transport: usb)
+        let router = try AzimuthSelectableRadioTransport(
+            usbFactory: usbFactory,
+            bluetoothFactory: makeFactory()
+        )
+        _ = try await router.availableEndpointSnapshot()
+        try await router.selectEndpoint(id: Self.firstBluetooth.id)
+
+        let retained = try await router.retainSoleIFDSPUSBEndpoint()
+
+        XCTAssertTrue(retained)
+        XCTAssertNil(original.usbSerialNumber)
+        XCTAssertEqual(router.device.connectionKind, .bluetooth)
+        XCTAssertEqual(usb.openCount, 0)
+
+        usbFactory.replaceEndpoints([reenumerated])
+        let selected = try await router.selectRetainedIFDSPUSBEndpoint()
+        let selectedEndpoint = await router.selectedRadioEndpoint()
+
+        XCTAssertTrue(selected)
+        XCTAssertEqual(selectedEndpoint?.id, reenumerated.id)
+        XCTAssertEqual(selectedEndpoint?.detail, reenumerated.devicePath)
+        XCTAssertEqual(router.device.connectionKind, .usb)
+        XCTAssertEqual(usb.openCount, 0)
+    }
+
+    func testSameRadioUSBRecoveryFollowsAnonymousEndpointToNewTTYPath() async throws {
+        let original = Self.noDescriptorSerialUSB
+        let reenumerated = AzimuthUSBEndpoint(
+            id: "tty:/dev/cu.usbmodem301",
+            displayName: original.displayName,
+            devicePath: "/dev/cu.usbmodem301",
+            usbSerialNumber: nil,
+            usbDeviceRegistryEntryID: 0x301
+        )
+        let usb = AzimuthRouterMockTransport(device: reenumerated.device)
+        let usbFactory = AzimuthRouterMockUSBFactory(
+            endpoints: [original],
+            transports: [
+                original.id: usb,
+                reenumerated.id: usb,
+            ]
+        )
+        let router = try AzimuthSelectableRadioTransport(
+            usbFactory: usbFactory,
+            bluetoothFactory: makeFactory()
+        )
+
+        usbFactory.replaceEndpoints([reenumerated])
+        let selected = try await router.refreshSelectedUSBForSameRadioRecovery()
+        let selectedEndpoint = await router.selectedRadioEndpoint()
+
+        XCTAssertTrue(selected)
+        XCTAssertNil(reenumerated.usbSerialNumber)
+        XCTAssertEqual(selectedEndpoint?.id, reenumerated.id)
+        XCTAssertEqual(selectedEndpoint?.detail, reenumerated.devicePath)
+
+        try await router.open()
+        XCTAssertEqual(usbFactory.requestedPaths, [reenumerated.devicePath])
+        await router.close()
+    }
+
+    func testSameRadioUSBRecoveryRejectsAmbiguousAnonymousReenumeration() async throws {
+        let original = Self.noDescriptorSerialUSB
+        let firstCandidate = AzimuthUSBEndpoint(
+            id: "tty:/dev/cu.usbmodem301",
+            displayName: original.displayName,
+            devicePath: "/dev/cu.usbmodem301",
+            usbSerialNumber: nil,
+            usbDeviceRegistryEntryID: 0x301
+        )
+        let secondCandidate = AzimuthUSBEndpoint(
+            id: "tty:/dev/cu.usbmodem401",
+            displayName: original.displayName,
+            devicePath: "/dev/cu.usbmodem401",
+            usbSerialNumber: nil,
+            usbDeviceRegistryEntryID: 0x401
+        )
+        let first = AzimuthRouterMockTransport(device: firstCandidate.device)
+        let second = AzimuthRouterMockTransport(device: secondCandidate.device)
+        let usbFactory = AzimuthRouterMockUSBFactory(
+            endpoints: [original],
+            transports: [
+                firstCandidate.id: first,
+                secondCandidate.id: second,
+            ]
+        )
+        let router = try AzimuthSelectableRadioTransport(
+            usbFactory: usbFactory,
+            bluetoothFactory: makeFactory()
+        )
+
+        usbFactory.replaceEndpoints([firstCandidate, secondCandidate])
+        let selected = try await router.refreshSelectedUSBForSameRadioRecovery()
+        let selectedEndpoint = await router.selectedRadioEndpoint()
+
+        XCTAssertFalse(selected)
+        XCTAssertEqual(selectedEndpoint?.id, original.id)
+        XCTAssertTrue(usbFactory.requestedPaths.isEmpty)
+        XCTAssertEqual(first.openCount, 0)
+        XCTAssertEqual(second.openCount, 0)
+    }
+
+    func testIFDSPUSBHandoffRequiresSoleQualifiedEndpointBeforeSelection() async throws {
+        let first = AzimuthRouterMockTransport(device: Self.firstUSB.device)
+        let second = AzimuthRouterMockTransport(device: Self.secondUSB.device)
+        let usbFactory = AzimuthRouterMockUSBFactory(
+            endpoints: [Self.firstUSB, Self.secondUSB],
+            transports: [
+                Self.firstUSB.id: first,
+                Self.secondUSB.id: second,
+            ]
+        )
+        let router = try AzimuthSelectableRadioTransport(
+            usbFactory: usbFactory,
+            bluetoothFactory: makeFactory()
+        )
+        _ = try await router.availableEndpointSnapshot()
+        try await router.selectEndpoint(id: Self.firstBluetooth.id)
+
+        let retained = try await router.retainSoleIFDSPUSBEndpoint()
+
+        XCTAssertFalse(retained)
+        XCTAssertEqual(router.device.connectionKind, .bluetooth)
+        XCTAssertEqual(first.openCount, 0)
+        XCTAssertEqual(second.openCount, 0)
+    }
+
+    func testBluetoothMMDVMUSBRoutingRestoresOriginalExactAddressWithSerialQualification() async throws {
+        let endpoint = Self.noDescriptorSerialUSB
+        let usb = AzimuthRouterMockTransport(device: endpoint.device)
+        let qualified = AzimuthRouterMockBluetoothLink(
+            serialNumber: "B3B00001",
+            matchedAddress: Self.firstBluetooth.address
+        )
+        let factory = makeFactory(matchingLink: qualified)
+        let router = try AzimuthSelectableRadioTransport(
+            usbFactory: makeUSBFactory(endpoint: endpoint, transport: usb),
+            bluetoothFactory: factory
+        )
+        _ = try await router.availableEndpointSnapshot()
+        try await router.selectEndpoint(id: Self.firstBluetooth.id)
+        try await router.selectSoleUSBForBluetoothMMDVM()
+
+        try await router.selectOriginalBluetoothAfterUSBRouting(
+            expectedSerialNumber: "B3B00001"
+        )
+        let restoredBeforeOpen = await router.selectedRadioEndpoint()
+        try await router.open()
+
+        XCTAssertEqual(restoredBeforeOpen?.id, Self.firstBluetooth.id)
+        XCTAssertEqual(restoredBeforeOpen?.detail, Self.firstBluetooth.address)
+        XCTAssertEqual(
+            factory.qualifiedRequests,
+            ["\(Self.firstBluetooth.address)|B3B00001"]
+        )
+        XCTAssertTrue(factory.exactRequests.isEmpty)
+        XCTAssertTrue(factory.serialRequests.isEmpty)
+        XCTAssertEqual(qualified.openCount, 1)
+        let openedSerialNumber = await router.hardwareSerialNumber
+        XCTAssertEqual(openedSerialNumber, "B3B00001")
+        await router.close()
+    }
+
+    func testClosedBluetoothEndpointIsPromotedForExactSerialQualifiedReconnect() async throws {
+        let raw = AzimuthRouterMockBluetoothLink(serialNumber: nil)
+        let qualified = AzimuthRouterMockBluetoothLink(
+            serialNumber: "B3B00001",
+            matchedAddress: Self.firstBluetooth.address
+        )
+        let factory = makeFactory(
+            exactLinks: [Self.firstBluetooth.address: raw],
+            matchingLink: qualified
+        )
+        let router = try AzimuthSelectableRadioTransport(
+            usbFactory: makeUSBFactory(),
+            bluetoothFactory: factory
+        )
+        _ = try await router.availableEndpointSnapshot()
+        try await router.selectEndpoint(id: Self.firstBluetooth.id)
+
+        try await router.open()
+        await router.close()
+        try await router.qualifySelectedBluetoothForReconnect(
+            expectedSerialNumber: "B3B00001"
+        )
+        try await router.open()
+
+        XCTAssertEqual(factory.exactRequests, [Self.firstBluetooth.address])
+        XCTAssertEqual(
+            factory.qualifiedRequests,
+            ["\(Self.firstBluetooth.address)|B3B00001"]
+        )
+        XCTAssertTrue(factory.serialRequests.isEmpty)
+        XCTAssertEqual(qualified.openCount, 1)
+        let openedSerialNumber = await router.hardwareSerialNumber
+        XCTAssertEqual(openedSerialNumber, "B3B00001")
+        await router.close()
+    }
+
+    func testBluetoothReconnectQualificationRejectsAChangedSelection() async throws {
+        let factory = makeFactory()
+        let router = try AzimuthSelectableRadioTransport(
+            usbFactory: makeUSBFactory(),
+            bluetoothFactory: factory
+        )
+        _ = try await router.availableEndpointSnapshot()
+        try await router.selectEndpoint(id: Self.firstBluetooth.id)
+        try await router.open()
+        await router.close()
+
+        try await router.selectEndpoint(id: Self.secondBluetooth.id)
+        let error = try await captureError {
+            try await router.qualifySelectedBluetoothForReconnect(
+                expectedSerialNumber: "B3B00001"
+            )
+        }
+
+        XCTAssertEqual(
+            error as? AzimuthRadioSelectionError,
+            .bluetoothReconnectContextUnavailable
+        )
+        XCTAssertTrue(factory.qualifiedRequests.isEmpty)
+    }
+
+    func testBluetoothMMDVMPreMutationFailureRestoresOriginalRawExactAddress() async throws {
+        let exact = AzimuthRouterMockBluetoothLink(serialNumber: nil)
+        let factory = makeFactory(
+            exactLinks: [Self.secondBluetooth.address: exact]
+        )
+        let router = try AzimuthSelectableRadioTransport(
+            usbFactory: makeUSBFactory(),
+            bluetoothFactory: factory
+        )
+        _ = try await router.availableEndpointSnapshot()
+        try await router.selectEndpoint(id: Self.secondBluetooth.id)
+        try await router.selectSoleUSBForBluetoothMMDVM()
+
+        try await router.restoreOriginalBluetoothAfterUSBRoutingFailure()
+        try await router.open()
+
+        XCTAssertEqual(factory.exactRequests, [Self.secondBluetooth.address])
+        XCTAssertTrue(factory.qualifiedRequests.isEmpty)
+        XCTAssertTrue(factory.serialRequests.isEmpty)
+        XCTAssertEqual(exact.openCount, 1)
+        await router.close()
     }
 
     func testBluetoothMMDVMHandoffRejectsAmbiguousUSBInventory() async throws {
@@ -902,10 +1209,10 @@ final class AzimuthSelectableRadioTransportTests: XCTestCase {
         _ = try await router.availableEndpointSnapshot()
         try await router.selectEndpoint(id: Self.firstBluetooth.id)
 
-        let fallbackAvailable = try await router.hasSoleIdentifiedUSBEndpoint()
+        let fallbackAvailable = try await router.hasSoleVerifiedUSBEndpoint()
         XCTAssertFalse(fallbackAvailable)
         let error = try await captureError {
-            _ = try await router.selectSoleUSBForBluetoothMMDVM()
+            try await router.selectSoleUSBForBluetoothMMDVM()
         }
 
         XCTAssertEqual(
@@ -1026,13 +1333,15 @@ final class AzimuthSelectableRadioTransportTests: XCTestCase {
             id: "usb:serial:B3B00001",
             displayName: "Kenwood TH-D75",
             devicePath: "/dev/cu.usbmodem101",
-            usbSerialNumber: "B3B00001"
+            usbSerialNumber: "B3B00001",
+            usbDeviceRegistryEntryID: 0x101
         )
         let newEndpoint = AzimuthUSBEndpoint(
             id: oldEndpoint.id,
             displayName: oldEndpoint.displayName,
             devicePath: "/dev/cu.usbmodem301",
-            usbSerialNumber: "B3B00001"
+            usbSerialNumber: "B3B00001",
+            usbDeviceRegistryEntryID: 0x301
         )
         let usb = AzimuthRouterMockTransport(
             device: newEndpoint.device,
@@ -1064,13 +1373,15 @@ final class AzimuthSelectableRadioTransportTests: XCTestCase {
             id: "usb:serial:B3B00001",
             displayName: "Kenwood TH-D75",
             devicePath: "/dev/cu.usbmodem101",
-            usbSerialNumber: "B3B00001"
+            usbSerialNumber: "B3B00001",
+            usbDeviceRegistryEntryID: 0x101
         )
         let replacement = AzimuthUSBEndpoint(
             id: "usb:serial:B3B99999",
             displayName: "Kenwood TH-D75",
             devicePath: oldEndpoint.devicePath,
-            usbSerialNumber: "B3B99999"
+            usbSerialNumber: "B3B99999",
+            usbDeviceRegistryEntryID: 0x999
         )
         let usbFactory = AzimuthRouterMockUSBFactory(
             endpoints: [oldEndpoint],

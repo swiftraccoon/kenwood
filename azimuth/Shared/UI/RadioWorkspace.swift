@@ -261,6 +261,12 @@ struct RadioWorkspace: View {
             return "Connecting to the TH-D75 over USB-C"
         case .menu650Recovery:
             return "Restoring USB-C CAT control"
+        case .gatewayRoutingRecovery:
+            return "Routing DV Gateway to USB-C and restoring Bluetooth CAT control"
+        case .ifDSPGatewayRecovery:
+            return "Turning DV Gateway off and restoring Bluetooth CAT for IF-DSP"
+        case .aprsGatewayRecovery:
+            return "Inspecting APRS radio settings and restoring the selected CAT endpoint"
         }
     }
 
@@ -272,6 +278,9 @@ struct RadioWorkspace: View {
         case .bluetoothHandoff: return "Stop Bluetooth Handoff"
         case .usbHandoff: return "Stop USB-C Handoff"
         case .menu650Recovery: return "Stop CAT Recovery"
+        case .gatewayRoutingRecovery: return "Stop Gateway Routing"
+        case .ifDSPGatewayRecovery: return "Stop IF-DSP Recovery"
+        case .aprsGatewayRecovery: return "Stop APRS Recovery"
         }
     }
 
@@ -287,6 +296,12 @@ struct RadioWorkspace: View {
             return "Stops the non-destructive USB-C handoff and leaves Menu 650 unchanged."
         case .menu650Recovery:
             return "Stops before Menu 650 when possible. If the approved radio operation has already started, Azimuth finishes it safely before disconnecting."
+        case .gatewayRoutingRecovery:
+            return "Stops before Menu 985 when possible. If the approved routing operation has already started, Azimuth finishes it safely before disconnecting."
+        case .ifDSPGatewayRecovery:
+            return "Stops before Menu 650 when possible. If the approved operation has already started, Azimuth finishes it safely and reports the result before disconnecting."
+        case .aprsGatewayRecovery:
+            return "Stops before Menu 650 when possible. If the approved APRS recovery has already started, Azimuth finishes it safely and reports the result before disconnecting."
         }
     }
 
@@ -298,6 +313,9 @@ struct RadioWorkspace: View {
         case .bluetoothHandoff: return "azimuth.radio.cancel-bluetooth-handoff"
         case .usbHandoff: return "azimuth.radio.cancel-usb-handoff"
         case .menu650Recovery: return "azimuth.radio.cancel-cat-recovery"
+        case .gatewayRoutingRecovery: return "azimuth.radio.cancel-gateway-routing"
+        case .ifDSPGatewayRecovery: return "azimuth.radio.cancel-ifdsp-recovery"
+        case .aprsGatewayRecovery: return "azimuth.radio.cancel-aprs-recovery"
         }
     }
 

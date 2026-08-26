@@ -115,6 +115,13 @@ struct SettingsCatalogView: View {
                     model.catalogLoadState == .loading
                         || model.isRadioOperationInFlight
                 )
+                .help(
+                    model.radioState.connection.isConnected
+                        ? "Reads the complete settings snapshot through MCP programming mode. "
+                            + "Exiting MCP restarts the TH-D75; Azimuth then reconnects. "
+                            + "The initial connection intentionally defers this read."
+                        : "Reloads the reviewed settings catalog without contacting the radio."
+                )
             }
         }
     }
@@ -168,6 +175,17 @@ struct SettingsCatalogView: View {
                 )
                 .font(.caption)
                 .foregroundStyle(AzimuthPalette.caution)
+            }
+
+            if model.radioState.connection.isConnected {
+                Label(
+                    "Azimuth intentionally defers the full settings snapshot on initial "
+                        + "connection. Reading it enters MCP programming mode; exiting MCP "
+                        + "restarts the TH-D75, and Azimuth reconnects automatically.",
+                    systemImage: "arrow.trianglehead.2.clockwise.rotate.90"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
         }
         .padding(.vertical, 8)

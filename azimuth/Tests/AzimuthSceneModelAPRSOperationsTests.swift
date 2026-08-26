@@ -74,6 +74,113 @@ final class AzimuthSceneModelAPRSOperationsTests: XCTestCase {
         XCTAssertNil(model.operationError)
     }
 
+    func testCurrentModeRefusalOffersOneExplicitRecoveryWithoutRawCommand() async {
+        let aprs = SceneModelAPRSFakeController(initialState: makeAPRSState())
+        aprs.startError = RadioControllerError.aprsDVGatewayRecoveryRequired
+        aprs.recoveryAvailable = true
+        let model = makeModel(
+            radioController: SceneModelAPRSFakeRadioController(connected: true),
+            aprsController: aprs
+        )
+
+        await model.startAPRS(.receiveOnly)
+
+        XCTAssertEqual(aprs.startConfigurations, [.receiveOnly])
+        XCTAssertNil(model.operationError)
+        guard case .offer(let connectionName, let available) =
+                model.aprsDVGatewayRecoveryAlert else {
+            return XCTFail("Expected an explicit APRS recovery offer")
+        }
+        XCTAssertEqual(connectionName, "USB-C")
+        XCTAssertTrue(available)
+        let message = model.aprsDVGatewayRecoveryAlert?.message ?? ""
+        XCTAssertTrue(message.contains("Menu 983"))
+        XCTAssertTrue(message.contains("Menu 506"))
+        XCTAssertTrue(message.contains("Menu 650"))
+        XCTAssertTrue(message.contains("freshly verified band"))
+        XCTAssertFalse(message.contains("TN command"))
+        XCTAssertFalse(message.contains("TN 2,"))
+        XCTAssertEqual(aprs.recoveryCallCount, 0)
+
+        model.dismissAPRSDVGatewayRecoveryAlert()
+
+        XCTAssertNil(model.aprsDVGatewayRecoveryAlert)
+        XCTAssertEqual(aprs.discardRecoveryCallCount, 1)
+        XCTAssertEqual(aprs.recoveryCallCount, 0)
+    }
+
+    func testApprovedRecoveryRetriesRetainedConfigurationOnce() async {
+        let aprs = SceneModelAPRSFakeController(initialState: makeAPRSState())
+        aprs.startError = RadioControllerError.aprsDVGatewayRecoveryRequired
+        aprs.recoveryAvailable = true
+        let model = makeModel(
+            radioController: SceneModelAPRSFakeRadioController(connected: true),
+            aprsController: aprs
+        )
+
+        await model.startAPRS(.receiveOnly)
+        aprs.startError = nil
+        await model.inspectDVGatewayAndRetryAPRS()
+
+        XCTAssertEqual(aprs.recoveryCallCount, 1)
+        XCTAssertEqual(model.aprsState.status.phase, .active)
+        XCTAssertEqual(model.aprsState.status.configuration, .receiveOnly)
+        XCTAssertNil(model.aprsDVGatewayRecoveryAlert)
+        XCTAssertNil(model.operationError)
+    }
+
+    func testAutomaticAlertDismissalDoesNotDiscardApprovedRecoveryProof() async {
+        let aprs = SceneModelAPRSFakeController(initialState: makeAPRSState())
+        aprs.startError = RadioControllerError.aprsDVGatewayRecoveryRequired
+        aprs.recoveryAvailable = true
+        let model = makeModel(
+            radioController: SceneModelAPRSFakeRadioController(connected: true),
+            aprsController: aprs
+        )
+
+        await model.startAPRS(.receiveOnly)
+        model.hideAPRSDVGatewayRecoveryAlertPresentation()
+
+        XCTAssertNil(model.aprsDVGatewayRecoveryAlert)
+        XCTAssertEqual(aprs.discardRecoveryCallCount, 0)
+        XCTAssertTrue(aprs.automaticAPRSDVGatewayRecoveryAvailable)
+
+        aprs.startError = nil
+        await model.inspectDVGatewayAndRetryAPRS()
+
+        XCTAssertEqual(aprs.recoveryCallCount, 1)
+        XCTAssertEqual(aprs.discardRecoveryCallCount, 0)
+        XCTAssertEqual(model.aprsState.status.phase, .active)
+        XCTAssertNil(model.operationError)
+    }
+
+    func testApprovedRecoveryFailureIsDismissOnlyAndDoesNotLoopOffer() async {
+        let aprs = SceneModelAPRSFakeController(initialState: makeAPRSState())
+        aprs.startError = RadioControllerError.aprsDVGatewayRecoveryRequired
+        aprs.recoveryAvailable = true
+        aprs.recoveryError = RadioControllerError.operationFailed(
+            "The TH-D75 still refused KISS after the one approved retry."
+        )
+        let model = makeModel(
+            radioController: SceneModelAPRSFakeRadioController(connected: true),
+            aprsController: aprs
+        )
+
+        await model.startAPRS(.receiveOnly)
+        await model.inspectDVGatewayAndRetryAPRS()
+
+        XCTAssertEqual(aprs.recoveryCallCount, 1)
+        guard case .failed(let message) = model.aprsDVGatewayRecoveryAlert else {
+            return XCTFail("Expected a dismiss-only recovery failure")
+        }
+        XCTAssertTrue(message.contains("one approved retry"))
+        XCTAssertFalse(message.contains("TN"))
+        XCTAssertFalse(
+            model.aprsDVGatewayRecoveryAlert?.automaticRecoveryAvailable ?? true
+        )
+        XCTAssertNil(model.operationError)
+    }
+
     func testMessageAndPositionSendsDelegateExactArgumentsAndReturnActivity() async throws {
         let aprs = SceneModelAPRSFakeController(
             initialState: makeAPRSState(phase: .active, sessionID: 7)
@@ -241,10 +348,19 @@ private final class SceneModelAPRSFakeController: APRSControlling {
     private(set) var stopCallCount = 0
     private(set) var messageRequests: [MessageRequest] = []
     private(set) var positionRequests: [PositionRequest] = []
+    private(set) var recoveryCallCount = 0
+    private(set) var discardRecoveryCallCount = 0
     var nextMessageActivity: APRSActivity?
     var nextPositionActivity: APRSActivity?
     var messageError: (any Error)?
     var positionError: (any Error)?
+    var startError: (any Error)?
+    var recoveryError: (any Error)?
+    var recoveryAvailable = false
+
+    var automaticAPRSDVGatewayRecoveryAvailable: Bool {
+        recoveryAvailable
+    }
 
     init(initialState: APRSOperationalState) {
         currentAPRSState = initialState
@@ -263,6 +379,26 @@ private final class SceneModelAPRSFakeController: APRSControlling {
 
     func startAPRS(_ configuration: APRSSessionConfiguration) async throws {
         startConfigurations.append(configuration)
+        if let startError { throw startError }
+        activate(configuration)
+    }
+
+    func recoverDVGatewayAndRetryAPRS() async throws {
+        recoveryCallCount += 1
+        recoveryAvailable = false
+        if let recoveryError { throw recoveryError }
+        guard let configuration = startConfigurations.last else {
+            throw SceneModelAPRSTestError.missingStubbedActivity
+        }
+        activate(configuration)
+    }
+
+    func discardAPRSDVGatewayRecovery() {
+        discardRecoveryCallCount += 1
+        recoveryAvailable = false
+    }
+
+    private func activate(_ configuration: APRSSessionConfiguration) {
         var state = currentAPRSState
         state.status.phase = .active
         state.status.sessionID &+= 1

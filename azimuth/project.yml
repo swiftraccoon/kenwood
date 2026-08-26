@@ -119,8 +119,10 @@ targets:
       # The same native Bluetooth path can also provide a non-destructive CAT
       # handoff or an explicitly approved Menu 650 recovery when USB is MMDVM.
       - sdk: CoreBluetooth.framework
+      - sdk: CoreAudio.framework
       - sdk: IOBluetooth.framework
       - sdk: IOKit.framework
+      - sdk: AVFAudio.framework
       - sdk: Vision.framework
       - target: AzimuthBluetoothHelper
         embed: true
@@ -138,6 +140,7 @@ targets:
         LSApplicationCategoryType: public.app-category.utilities
         NSBluetoothAlwaysUsageDescription: Azimuth uses a paired TH-D75 Bluetooth control link when you select Bluetooth or approve CAT recovery.
         NSBluetoothPeripheralUsageDescription: Azimuth uses a paired TH-D75 Bluetooth control link when you select Bluetooth or approve CAT recovery.
+        NSMicrophoneUsageDescription: Azimuth uses audio input only to capture the connected TH-D75 USB IF stream.
         NSPrincipalClass: NSApplication
     settings:
       base:
@@ -145,6 +148,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: org.swiftraccoon.azimuth.mac
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         CODE_SIGN_ENTITLEMENTS: macOS/Azimuth.entitlements
+        ENABLE_HARDENED_RUNTIME: YES
 
   AzimuthBluetoothHelper:
     type: tool
