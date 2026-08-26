@@ -24,23 +24,29 @@ use kenwood_thd75::screen::{SCREEN_HEIGHT, SCREEN_WIDTH};
 use kenwood_thd75::transport::Transport as RadioTransport;
 use kenwood_thd75::types::{
     KissDuplex, KissPersistence, KissSlotTime, KissTxDelay, KissTxTail, PacketDataRate,
+    SerialNumber, TncDataBand as RadioTncDataBand, TncMode, TncState,
 };
 use kiss_tnc::KissCommand;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::aprs::{
     AprsActivityRecord, AprsActivityStore, AprsOperationalSnapshot, AprsSessionConfig,
-    AprsSessionStatus,
+    AprsSessionStatus, AprsStartAuthority,
 };
 use crate::catalog::{SettingChange, SettingValue, build_patch_plan, validate_changes};
 use crate::if_dsp_radio::{
-    EngageIfDspError, IF_CENTER_HZ, SavedIfDspRadioState, engage_if_dsp_radio,
-    restore_if_dsp_radio, retune_if_dsp_radio,
+    EngageIfDspError, IF_CENTER_HZ, SavedIfDspRadioState, engage_if_dsp_session,
+    restore_if_dsp_radio, restore_if_dsp_session, retune_if_dsp_session,
+};
+use crate::terminal_mode::{
+    AprsCurrentModeRecoveryError, AprsCurrentModeRecoveryResult, DvGatewayCatDisableError,
+    DvGatewayCatDisableResult, RecoveryCancellation, disable_dv_gateway_over_cat,
+    recover_aprs_current_mode_over_cat,
 };
 use crate::transport::{ByteTransport, SwiftByteTransport};
 
 /// Exact automation ABI record proved when a controller connects.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct AutomationAbiRecord {
     /// Firmware automation ABI version. V1.03.AZM reports `3`.
     pub version: u8,
@@ -50,15 +56,18 @@ pub struct AutomationAbiRecord {
     pub max_key: u8,
     /// Largest accepted input phase.
     pub max_phase: u8,
+    /// Exact validated CAT `AE` serial for the connected TH-D75.
+    pub radio_serial_number: String,
 }
 
-impl From<AutomationAbi> for AutomationAbiRecord {
-    fn from(value: AutomationAbi) -> Self {
+impl AutomationAbiRecord {
+    fn qualified(value: AutomationAbi, radio_serial_number: String) -> Self {
         Self {
             version: value.version,
             features: value.features,
             max_key: value.max_key,
             max_phase: value.max_phase,
+            radio_serial_number,
         }
     }
 }
@@ -423,6 +432,21 @@ pub enum AutomationError {
     /// An APRS operation requires an active KISS session.
     #[error("APRS KISS mode is not active")]
     AprsModeInactive,
+    /// The radio returned an aligned `N` for the single KISS transition.
+    /// CAT and the existing automation attestation remain valid.
+    #[error("APRS KISS is unavailable in the current radio mode: {detail}")]
+    AprsCurrentModeUnavailable {
+        /// Exact CAT diagnostic retained for logs. User-facing status uses a
+        /// semantic explanation rather than exposing the `TN` mnemonic.
+        detail: String,
+    },
+    /// The retained settings proof or approved recovery proof could not
+    /// authorize this exact APRS transition.
+    #[error("APRS start authority is invalid or stale: {detail}")]
+    AprsStartAuthority {
+        /// Exact missing, mismatched, or malformed proof detail.
+        detail: String,
+    },
     /// APRS session configuration failed validation before any mode change.
     #[error("invalid APRS configuration: {detail}")]
     InvalidAprsConfiguration {
@@ -443,6 +467,14 @@ pub enum AutomationError {
     /// An IF-DSP operation requires a prepared radio session.
     #[error("IF-DSP radio mode is not active")]
     IfDspModeInactive,
+    /// The radio rejected Band-B control in its current mode, and exact
+    /// readbacks proved that no saved IF-DSP value remains dirty.
+    #[error("IF-DSP is unavailable in the current radio mode: {detail}")]
+    IfDspCurrentModeUnavailable {
+        /// Diagnostic command detail for logs; clients should present an
+        /// actionable mode-change instruction instead of raw CAT mnemonics.
+        detail: String,
+    },
     /// IF-DSP radio setup, verification, or retuning failed.
     #[error("IF-DSP radio operation failed: {detail}")]
     IfDspOperation {
@@ -467,6 +499,8 @@ pub struct AutomationController {
     commands: mpsc::Sender<ControllerCommand>,
     abi: AutomationAbiRecord,
     aprs: Arc<Mutex<AprsActivityStore>>,
+    dv_gateway_disable_cancellation: Arc<RecoveryCancellation>,
+    aprs_current_mode_recovery_cancellation: Arc<RecoveryCancellation>,
 }
 
 impl std::fmt::Debug for AutomationController {
@@ -494,7 +528,7 @@ impl AutomationController {
     /// Return the exact ABI proved at connection time.
     #[must_use]
     pub fn abi(self: Arc<Self>) -> AutomationAbiRecord {
-        self.abi
+        self.abi.clone()
     }
 
     /// Return current APRS status, incremental activity rows, and heard stations.
@@ -521,11 +555,17 @@ impl AutomationController {
     pub async fn start_aprs(
         self: Arc<Self>,
         config: AprsSessionConfig,
+        authority: AprsStartAuthority,
     ) -> Result<AprsSessionStatus, AutomationError> {
         drop(config.validate()?);
+        validate_aprs_start_authority_shape(&authority)?;
         let (reply, response) = oneshot::channel();
         self.commands
-            .send(ControllerCommand::StartAprs { config, reply })
+            .send(ControllerCommand::StartAprs {
+                config,
+                authority,
+                reply,
+            })
             .await
             .map_err(|_| AutomationError::ControllerClosed)?;
         response.await.map_err(response_lost)?
@@ -606,7 +646,8 @@ impl AutomationController {
     }
 
     /// Save every affected radio value, configure Band B for USB IF output,
-    /// verify all readbacks, and restore qualified automation control.
+    /// and verify all readbacks inside the existing attested automation
+    /// session.
     ///
     /// Audio capture must not start until this future succeeds. APRS and all
     /// screen/settings/front-panel operations are rejected while the returned
@@ -624,6 +665,139 @@ impl AutomationController {
             .await
             .map_err(|_| AutomationError::ControllerClosed)?;
         response.await.map_err(response_lost)?
+    }
+
+    /// Synchronously request cancellation of an approved DV Gateway disable
+    /// before its atomic MCP mutation gate.
+    ///
+    /// Once the mutation gate has opened, the bounded write, verification,
+    /// cleanup, and truthful outcome complete before the async operation
+    /// returns.
+    pub fn cancel_dv_gateway_disable(self: Arc<Self>) {
+        self.dv_gateway_disable_cancellation.request();
+    }
+
+    /// Inspect Menu 650 on this already-authenticated CAT actor, set it to Off
+    /// only when needed, and terminate actor ownership for an exact reconnect.
+    ///
+    /// The supplied identity must equal both the actor's retained connection
+    /// ABI and a fresh CAT `AE` read immediately before the mutation gate.
+    /// Exact model, firmware, and MCP schema are also requalified before that
+    /// gate. The operation always consumes this actor's radio transport; the
+    /// caller owns the subsequent reconnect of the same approved endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed invalid/mismatched identity or unavailable-controller
+    /// error before the command is accepted. Once accepted, returns the exact
+    /// qualification, cancellation, radio-operation, or uncertain-outcome
+    /// failure after the actor has relinquished the transport.
+    pub async fn disable_dv_gateway(
+        self: Arc<Self>,
+        expected_radio_serial_number: String,
+    ) -> Result<DvGatewayCatDisableResult, DvGatewayCatDisableError> {
+        let expected = SerialNumber::try_from(expected_radio_serial_number).map_err(|error| {
+            DvGatewayCatDisableError::InvalidExpectedRadioSerial {
+                detail: error.to_string(),
+            }
+        })?;
+        let approved =
+            SerialNumber::try_from(self.abi.radio_serial_number.clone()).map_err(|error| {
+                DvGatewayCatDisableError::ControllerUnavailable {
+                    detail: format!("the retained automation ABI serial is invalid: {error}"),
+                }
+            })?;
+        if expected != approved {
+            return Err(DvGatewayCatDisableError::RadioIdentityMismatch {
+                expected: expected.to_string(),
+                actual: approved.to_string(),
+            });
+        }
+
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(ControllerCommand::DisableDvGateway {
+                expected_radio_serial_number: expected,
+                cancellation: Arc::clone(&self.dv_gateway_disable_cancellation),
+                reply,
+            })
+            .await
+            .map_err(|_| DvGatewayCatDisableError::ControllerUnavailable {
+                detail: "the automation command channel is closed".to_owned(),
+            })?;
+        response
+            .await
+            .map_err(|_| DvGatewayCatDisableError::ControllerUnavailable {
+                detail: "the automation actor ended without returning the Menu 650 outcome"
+                    .to_owned(),
+            })?
+    }
+
+    /// Synchronously cancel approved APRS current-mode recovery before its
+    /// atomic MCP gate.
+    pub fn cancel_aprs_current_mode_recovery(self: Arc<Self>) {
+        self.aprs_current_mode_recovery_cancellation.request();
+    }
+
+    /// Re-prove the approved radio, live Menu 983 route, and strict Menu 506
+    /// TNC band, then set Menu 650 to Off only when needed.
+    ///
+    /// Menu 983, Menu 506, and Menu 650 are read in the same MCP transaction.
+    /// A live route mismatch or invalid Menu 506 value performs zero writes.
+    /// Once accepted, this operation consumes the actor's transport so the
+    /// caller can reconnect the same exact endpoint and retry the retained
+    /// APRS configuration once.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed identity, route, qualification, cancellation, operation,
+    /// and uncertain-outcome failures.
+    pub async fn recover_aprs_current_mode(
+        self: Arc<Self>,
+        expected_radio_serial_number: String,
+        expected_kiss_interface_raw_value: u8,
+    ) -> Result<AprsCurrentModeRecoveryResult, AprsCurrentModeRecoveryError> {
+        if expected_kiss_interface_raw_value > 1 {
+            return Err(AprsCurrentModeRecoveryError::InvalidExpectedKissInterface {
+                value: expected_kiss_interface_raw_value,
+            });
+        }
+        let expected = SerialNumber::try_from(expected_radio_serial_number).map_err(|error| {
+            AprsCurrentModeRecoveryError::InvalidExpectedRadioSerial {
+                detail: error.to_string(),
+            }
+        })?;
+        let approved =
+            SerialNumber::try_from(self.abi.radio_serial_number.clone()).map_err(|error| {
+                AprsCurrentModeRecoveryError::ControllerUnavailable {
+                    detail: format!("the retained automation ABI serial is invalid: {error}"),
+                }
+            })?;
+        if expected != approved {
+            return Err(AprsCurrentModeRecoveryError::RadioIdentityMismatch {
+                expected: expected.to_string(),
+                actual: approved.to_string(),
+            });
+        }
+
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(ControllerCommand::RecoverAprsCurrentMode {
+                expected_radio_serial_number: expected,
+                expected_kiss_interface_raw_value,
+                cancellation: Arc::clone(&self.aprs_current_mode_recovery_cancellation),
+                reply,
+            })
+            .await
+            .map_err(|_| AprsCurrentModeRecoveryError::ControllerUnavailable {
+                detail: "the automation command channel is closed".to_owned(),
+            })?;
+        response
+            .await
+            .map_err(|_| AprsCurrentModeRecoveryError::ControllerUnavailable {
+                detail: "the automation actor ended without returning the APRS recovery outcome"
+                    .to_owned(),
+            })?
     }
 
     /// Return the actor's current IF-DSP reservation without changing the radio.
@@ -677,8 +851,9 @@ impl AutomationController {
     /// A failed field remains represented as `NeedsRestoration` so callers can
     /// retry restoration without mistaking the physical IF output for active.
     /// The saved tuning step is restored before the original frequency is
-    /// walked back. Success is returned only after every step passes readback
-    /// and automation control is requalified.
+    /// walked back. Success is returned only after every step passes readback;
+    /// the existing attested automation session remains valid without a second
+    /// firmware qualification.
     ///
     /// # Errors
     ///
@@ -839,6 +1014,8 @@ pub async fn connect_automation(
         commands,
         abi,
         aprs,
+        dv_gateway_disable_cancellation: Arc::new(RecoveryCancellation::default()),
+        aprs_current_mode_recovery_cancellation: Arc::new(RecoveryCancellation::default()),
     }))
 }
 
@@ -862,6 +1039,7 @@ enum ControllerCommand {
     },
     StartAprs {
         config: AprsSessionConfig,
+        authority: AprsStartAuthority,
         reply: oneshot::Sender<Result<AprsSessionStatus, AutomationError>>,
     },
     StopAprs {
@@ -892,6 +1070,17 @@ enum ControllerCommand {
     RestoreIfDsp {
         reply: oneshot::Sender<Result<IfDspRadioStatus, AutomationError>>,
     },
+    DisableDvGateway {
+        expected_radio_serial_number: SerialNumber,
+        cancellation: Arc<RecoveryCancellation>,
+        reply: oneshot::Sender<Result<DvGatewayCatDisableResult, DvGatewayCatDisableError>>,
+    },
+    RecoverAprsCurrentMode {
+        expected_radio_serial_number: SerialNumber,
+        expected_kiss_interface_raw_value: u8,
+        cancellation: Arc<RecoveryCancellation>,
+        reply: oneshot::Sender<Result<AprsCurrentModeRecoveryResult, AprsCurrentModeRecoveryError>>,
+    },
     Shutdown {
         reply: Option<oneshot::Sender<Result<(), AutomationError>>>,
     },
@@ -911,15 +1100,21 @@ enum ActorBreak {
         config: AprsSessionConfig,
         reply: oneshot::Sender<Result<AprsSessionStatus, AutomationError>>,
     },
-    PrepareIfDsp {
-        reply: oneshot::Sender<Result<IfDspRadioStatus, AutomationError>>,
+    FailedAprsTransition {
+        config: AprsSessionConfig,
+        reply: oneshot::Sender<Result<AprsSessionStatus, AutomationError>>,
+        detail: String,
     },
-    RetuneIfDsp {
-        frequency_hz: u32,
-        reply: oneshot::Sender<Result<IfDspRadioStatus, AutomationError>>,
+    DisableDvGateway {
+        expected_radio_serial_number: SerialNumber,
+        cancellation: Arc<RecoveryCancellation>,
+        reply: oneshot::Sender<Result<DvGatewayCatDisableResult, DvGatewayCatDisableError>>,
     },
-    RestoreIfDsp {
-        reply: oneshot::Sender<Result<IfDspRadioStatus, AutomationError>>,
+    RecoverAprsCurrentMode {
+        expected_radio_serial_number: SerialNumber,
+        expected_kiss_interface_raw_value: u8,
+        cancellation: Arc<RecoveryCancellation>,
+        reply: oneshot::Sender<Result<AprsCurrentModeRecoveryResult, AprsCurrentModeRecoveryError>>,
     },
     Shutdown {
         reply: Option<oneshot::Sender<Result<(), AutomationError>>>,
@@ -945,26 +1140,17 @@ enum DeferredReply {
         reply: oneshot::Sender<Result<AprsSessionStatus, AutomationError>>,
         detail: String,
     },
-    IfDsp {
-        operation: &'static str,
-        rollback_if_undelivered: bool,
-        reply: oneshot::Sender<Result<IfDspRadioStatus, AutomationError>>,
-        result: Result<IfDspRadioStatus, AutomationError>,
-    },
+    AbandonedAprsStart,
 }
 
 impl DeferredReply {
-    /// Complete a deferred response. `true` means an unobserved IF prepare
-    /// still owns radio state and must be rolled back by the actor.
-    fn complete(self, aprs: &Mutex<AprsActivityStore>) -> bool {
+    fn complete(self, aprs: &Mutex<AprsActivityStore>) {
         match self {
             Self::Read { reply, result } => {
                 drop(reply.send(Ok(result)));
-                false
             }
             Self::Apply { reply, result } => {
                 drop(reply.send(Ok(result)));
-                false
             }
             Self::StopAprs { reply } => {
                 let status = {
@@ -973,21 +1159,17 @@ impl DeferredReply {
                     store.status()
                 };
                 drop(reply.send(Ok(status)));
-                false
             }
             Self::FailedAprsStart { reply, detail } => {
                 lock_aprs_store(aprs).mark_start_failed_after_restoration(&detail);
                 drop(reply.send(Err(AutomationError::AprsOperation { detail })));
-                false
             }
-            Self::IfDsp {
-                rollback_if_undelivered,
-                reply,
-                result,
-                ..
-            } => {
-                let undelivered = reply.send(result).is_err();
-                rollback_if_undelivered && undelivered
+            Self::AbandonedAprsStart => {
+                let mut store = lock_aprs_store(aprs);
+                store.mark_inactive();
+                store.push_session_note(
+                    "The APRS start caller went away; KISS was stopped and CAT control was restored automatically.",
+                );
             }
         }
     }
@@ -1028,12 +1210,11 @@ impl DeferredReply {
                     detail: combined,
                 })));
             }
-            Self::IfDsp {
-                operation, reply, ..
-            } => drop(reply.send(Err(AutomationError::AutomationRestoration {
-                operation: operation.to_owned(),
-                detail,
-            }))),
+            Self::AbandonedAprsStart => {
+                lock_aprs_store(aprs).mark_failed(format!(
+                    "the APRS start caller went away and automation restoration failed: {detail}"
+                ));
+            }
         }
     }
 }
@@ -1055,11 +1236,277 @@ impl ActiveIfDspSession {
     }
 }
 
+async fn prepare_if_dsp_in_session(
+    session: &mut AutomationSession<'_, SwiftByteTransport>,
+    active_session: &mut Option<ActiveIfDspSession>,
+) -> Result<IfDspRadioStatus, AutomationError> {
+    match engage_if_dsp_session(session).await {
+        Ok(saved) => {
+            let active = ActiveIfDspSession {
+                saved,
+                current_frequency_hz: saved.band_b_frequency_hz(),
+                output_verified: true,
+            };
+            *active_session = Some(active);
+            Ok(active.status())
+        }
+        Err(EngageIfDspError::Clean(detail)) => Err(AutomationError::IfDspOperation { detail }),
+        Err(EngageIfDspError::CurrentModeUnavailable(detail)) => {
+            Err(AutomationError::IfDspCurrentModeUnavailable { detail })
+        }
+        Err(EngageIfDspError::Dirty { detail, saved }) => {
+            *active_session = Some(ActiveIfDspSession {
+                saved,
+                current_frequency_hz: saved.band_b_frequency_hz(),
+                output_verified: false,
+            });
+            Err(AutomationError::IfDspRestoration { detail })
+        }
+    }
+}
+
+async fn retune_if_dsp_in_session(
+    session: &mut AutomationSession<'_, SwiftByteTransport>,
+    active_session: &mut Option<ActiveIfDspSession>,
+    frequency_hz: u32,
+) -> Result<IfDspRadioStatus, AutomationError> {
+    let Some(active) = *active_session else {
+        return Err(AutomationError::IfDspModeInactive);
+    };
+    match retune_if_dsp_session(session, active.saved, frequency_hz).await {
+        Ok(()) => {
+            let retuned = ActiveIfDspSession {
+                current_frequency_hz: frequency_hz,
+                output_verified: true,
+                ..active
+            };
+            *active_session = Some(retuned);
+            Ok(retuned.status())
+        }
+        Err(retune_detail) => {
+            let report = restore_if_dsp_session(session, active.saved).await;
+            if report.is_exact() {
+                *active_session = None;
+                Err(AutomationError::IfDspOperation {
+                    detail: format!(
+                        "retune failed ({retune_detail}); the original radio state was restored and the IF-DSP session was stopped"
+                    ),
+                })
+            } else {
+                *active_session = Some(ActiveIfDspSession {
+                    output_verified: false,
+                    ..active
+                });
+                Err(AutomationError::IfDspRestoration {
+                    detail: format!("retune failed ({retune_detail}); {}", report.summary()),
+                })
+            }
+        }
+    }
+}
+
+async fn restore_if_dsp_in_session(
+    session: &mut AutomationSession<'_, SwiftByteTransport>,
+    active_session: &mut Option<ActiveIfDspSession>,
+) -> Result<IfDspRadioStatus, AutomationError> {
+    let Some(active) = *active_session else {
+        return Err(AutomationError::IfDspModeInactive);
+    };
+    let report = restore_if_dsp_session(session, active.saved).await;
+    if report.is_exact() {
+        *active_session = None;
+        Ok(IfDspRadioStatus::inactive())
+    } else {
+        *active_session = Some(ActiveIfDspSession {
+            output_verified: false,
+            ..active
+        });
+        Err(AutomationError::IfDspRestoration {
+            detail: report.summary(),
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SettingsSnapshot {
     id: u64,
     pages: BTreeMap<u16, [u8; PAGE_SIZE]>,
     field_ids: Vec<String>,
+}
+
+const APRS_KISS_INTERFACE_SETTING_ID: &str = "radio.KissModeInterface";
+const APRS_TNC_DATA_BAND_SETTING_ID: &str = "aprs.TncDataBand";
+
+fn invalid_aprs_start_authority(detail: impl Into<String>) -> AutomationError {
+    AutomationError::AprsStartAuthority {
+        detail: detail.into(),
+    }
+}
+
+fn validate_aprs_start_authority_shape(
+    authority: &AprsStartAuthority,
+) -> Result<(), AutomationError> {
+    match authority {
+        AprsStartAuthority::SettingsSnapshot {
+            snapshot_id,
+            expected_kiss_interface_raw_value,
+        } => {
+            if *snapshot_id == 0 {
+                return Err(invalid_aprs_start_authority(
+                    "settings snapshot identifier must be nonzero",
+                ));
+            }
+            if *expected_kiss_interface_raw_value > 1 {
+                return Err(invalid_aprs_start_authority(format!(
+                    "Menu 983 route {expected_kiss_interface_raw_value} is outside the closed 0/1 domain"
+                )));
+            }
+        }
+        AprsStartAuthority::CurrentModeRecovery {
+            expected_radio_serial_number,
+            ..
+        } => {
+            let _validated_serial = SerialNumber::try_from(expected_radio_serial_number.clone())
+                .map_err(|error| {
+                    invalid_aprs_start_authority(format!(
+                        "approved CAT serial identity is invalid: {error}"
+                    ))
+                })?;
+        }
+    }
+    Ok(())
+}
+
+fn snapshot_unsigned_value(
+    values: &[SettingValueRecord],
+    setting_id: &str,
+) -> Result<u64, AutomationError> {
+    let value = values
+        .iter()
+        .find(|record| record.setting_id == setting_id)
+        .ok_or_else(|| {
+            invalid_aprs_start_authority(format!(
+                "settings snapshot omitted required field {setting_id}"
+            ))
+        })?;
+    match &value.value {
+        SettingValue::Unsigned { value } => Ok(*value),
+        other => Err(invalid_aprs_start_authority(format!(
+            "settings snapshot decoded {setting_id} as {other:?}, not an unsigned choice"
+        ))),
+    }
+}
+
+fn resolve_settings_snapshot_aprs_authority(
+    retained_snapshot: Option<&SettingsSnapshot>,
+    snapshot_id: u64,
+    expected_kiss_interface_raw_value: u8,
+) -> Result<RadioTncDataBand, AutomationError> {
+    let snapshot =
+        retained_snapshot.ok_or(AutomationError::SettingsSnapshotUnavailable { snapshot_id })?;
+    if snapshot.id != snapshot_id {
+        return Err(AutomationError::SettingsSnapshotUnavailable { snapshot_id });
+    }
+    for required in [
+        APRS_KISS_INTERFACE_SETTING_ID,
+        APRS_TNC_DATA_BAND_SETTING_ID,
+    ] {
+        if !snapshot.field_ids.iter().any(|field| field == required) {
+            return Err(invalid_aprs_start_authority(format!(
+                "settings snapshot {snapshot_id} did not review {required}"
+            )));
+        }
+    }
+    let required_ids = vec![
+        APRS_KISS_INTERFACE_SETTING_ID.to_owned(),
+        APRS_TNC_DATA_BAND_SETTING_ID.to_owned(),
+    ];
+    let values = decode_values(&required_ids, &snapshot.pages)?;
+    let route = snapshot_unsigned_value(&values, APRS_KISS_INTERFACE_SETTING_ID)?;
+    if route != u64::from(expected_kiss_interface_raw_value) {
+        return Err(invalid_aprs_start_authority(format!(
+            "reviewed Menu 983 route was {route}, not selected endpoint route {expected_kiss_interface_raw_value}"
+        )));
+    }
+    let raw_band = snapshot_unsigned_value(&values, APRS_TNC_DATA_BAND_SETTING_ID)?;
+    let raw_band = u8::try_from(raw_band).map_err(|_| {
+        invalid_aprs_start_authority(format!(
+            "reviewed Menu 506 value {raw_band} does not fit its wire byte"
+        ))
+    })?;
+    RadioTncDataBand::try_from(raw_band).map_err(|error| {
+        invalid_aprs_start_authority(format!(
+            "reviewed Menu 506 value is not a selectable TNC band: {error}"
+        ))
+    })
+}
+
+fn validate_current_mode_recovery_authority(
+    expected_serial: &SerialNumber,
+    expected_data_band: RadioTncDataBand,
+    actual_serial: &SerialNumber,
+    actual_tnc_state: TncState,
+) -> Result<RadioTncDataBand, AutomationError> {
+    if actual_serial != expected_serial {
+        return Err(invalid_aprs_start_authority(format!(
+            "post-reboot CAT serial {actual_serial} does not match recovered radio {expected_serial}"
+        )));
+    }
+    if actual_tnc_state.mode != TncMode::Off {
+        return Err(invalid_aprs_start_authority(format!(
+            "post-reboot TN mode is {}, not Off",
+            actual_tnc_state.mode
+        )));
+    }
+    if actual_tnc_state.data_band != expected_data_band {
+        return Err(invalid_aprs_start_authority(format!(
+            "post-reboot TN data band {} does not match recovered Menu 506 band {expected_data_band}",
+            actual_tnc_state.data_band
+        )));
+    }
+    Ok(actual_tnc_state.data_band)
+}
+
+async fn resolve_aprs_start_authority<T: RadioTransport>(
+    session: &mut AutomationSession<'_, T>,
+    retained_snapshot: Option<&SettingsSnapshot>,
+    authority: AprsStartAuthority,
+) -> Result<RadioTncDataBand, AutomationError> {
+    validate_aprs_start_authority_shape(&authority)?;
+    match authority {
+        AprsStartAuthority::SettingsSnapshot {
+            snapshot_id,
+            expected_kiss_interface_raw_value,
+        } => resolve_settings_snapshot_aprs_authority(
+            retained_snapshot,
+            snapshot_id,
+            expected_kiss_interface_raw_value,
+        ),
+        AprsStartAuthority::CurrentModeRecovery {
+            expected_radio_serial_number,
+            expected_data_band,
+        } => {
+            let expected_serial =
+                SerialNumber::try_from(expected_radio_serial_number).map_err(|error| {
+                    invalid_aprs_start_authority(format!(
+                        "approved CAT serial identity is invalid: {error}"
+                    ))
+                })?;
+            let (actual_serial, actual_tnc_state) =
+                session.aprs_recovery_state().await.map_err(|error| {
+                    invalid_aprs_start_authority(format!(
+                        "post-reboot CAT identity/TNC-state proof failed: {error}"
+                    ))
+                })?;
+            let expected_data_band = RadioTncDataBand::from(expected_data_band);
+            validate_current_mode_recovery_authority(
+                &expected_serial,
+                expected_data_band,
+                &actual_serial,
+                actual_tnc_state,
+            )
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1098,13 +1545,14 @@ async fn run_controller(
             Ok(())
         };
         let initial_serial_identity = if initial_ready.is_some() {
-            verify_radio_serial_identity(&mut radio).await
+            verify_radio_serial_identity(&mut radio).await.map(Some)
         } else {
-            Ok(())
+            Ok(None)
         };
-        let qualification = match (cat_synchronization, initial_serial_identity) {
-            (Ok(()), Ok(())) => qualify_automation(&mut radio).await,
-            (Err(detail), _) | (_, Err(detail)) => Err(detail),
+        let qualification = match (cat_synchronization, &initial_serial_identity) {
+            (Ok(()), Ok(_)) => qualify_automation(&mut radio).await,
+            (Err(detail), _) => Err(detail),
+            (_, Err(detail)) => Err(detail.clone()),
         };
         let mut session = match qualification {
             Ok(session) => session,
@@ -1133,29 +1581,30 @@ async fn run_controller(
         };
 
         if let Some(reply) = initial_ready.take() {
-            drop(reply.send(Ok(session.abi().into())));
+            let readiness = match initial_serial_identity {
+                Ok(Some(radio_serial_number)) => Ok(AutomationAbiRecord::qualified(
+                    session.abi(),
+                    radio_serial_number,
+                )),
+                Ok(None) => Err(AutomationError::AutomationQualification {
+                    detail: "CAT serial identity was not retained during initial qualification"
+                        .to_owned(),
+                }),
+                Err(detail) => Err(AutomationError::AutomationQualification { detail }),
+            };
+            drop(reply.send(readiness));
         }
         if let Some(reply) = deferred_reply.take() {
-            let rollback_if_dsp = reply.complete(&aprs);
-            if rollback_if_dsp {
-                if let Some(active) = if_dsp_session.take() {
-                    let report = restore_if_dsp_radio(&mut radio, active.saved).await;
-                    if !report.is_exact() {
-                        if_dsp_session = Some(ActiveIfDspSession {
-                            output_verified: false,
-                            ..active
-                        });
-                    }
-                }
-                continue;
-            }
+            reply.complete(&aprs);
         }
 
         let reason = automation_loop(
             &mut session,
             &mut receiver,
             &mut next_screen_lease,
-            if_dsp_session.map_or_else(IfDspRadioStatus::inactive, ActiveIfDspSession::status),
+            &mut settings_snapshot,
+            &mut if_dsp_session,
+            &aprs,
         )
         .await;
 
@@ -1193,7 +1642,7 @@ async fn run_controller(
             ActorBreak::StartAprs { config, reply } => {
                 settings_snapshot = None;
                 lock_aprs_store(&aprs).begin_start(config.clone());
-                let mut kiss = match radio.enter_kiss(config.data_rate.into()).await {
+                let mut kiss = match radio.into_kiss_session() {
                     Ok(kiss) => kiss,
                     Err((returned_radio, error)) => {
                         radio = returned_radio;
@@ -1234,7 +1683,23 @@ async fn run_controller(
                     store.mark_active();
                     store.status()
                 };
-                drop(reply.send(Ok(status)));
+                if reply.send(Ok(status)).is_err() {
+                    lock_aprs_store(&aprs).mark_restoring();
+                    match kiss.exit().await {
+                        Ok(returned_radio) => {
+                            radio = returned_radio.into_radio_unproven();
+                            restore_cat_after_kiss_return = true;
+                            deferred_reply = Some(DeferredReply::AbandonedAprsStart);
+                            continue;
+                        }
+                        Err((_kiss, error)) => {
+                            lock_aprs_store(&aprs).mark_failed(format!(
+                                "the APRS start caller went away and KISS Return failed: {error}"
+                            ));
+                            return;
+                        }
+                    }
+                }
 
                 match aprs_loop(&mut kiss, &mut receiver, &aprs).await {
                     AprsBreak::Stop { reply } => {
@@ -1282,127 +1747,45 @@ async fn run_controller(
                     }
                 }
             }
-            ActorBreak::PrepareIfDsp { reply } => {
-                if reply.is_closed() {
-                    continue;
-                }
+            ActorBreak::FailedAprsTransition {
+                config,
+                reply,
+                detail,
+            } => {
                 settings_snapshot = None;
-                // The library session performs the snapshot, configuration,
-                // engagement proof, and failure rollback atomically; only
-                // the incomplete-rollback case leaves a dirty session for a
-                // later restore retry.
-                match engage_if_dsp_radio(&mut radio).await {
-                    Ok(saved) => {
-                        let active = ActiveIfDspSession {
-                            saved,
-                            current_frequency_hz: saved.band_b_frequency_hz(),
-                            output_verified: true,
-                        };
-                        if_dsp_session = Some(active);
-                        deferred_reply = Some(DeferredReply::IfDsp {
-                            operation: "IF-DSP prepare",
-                            rollback_if_undelivered: true,
-                            reply,
-                            result: Ok(active.status()),
-                        });
-                    }
-                    Err(EngageIfDspError::Clean(detail)) => {
-                        deferred_reply = Some(DeferredReply::IfDsp {
-                            operation: "IF-DSP prepare",
-                            rollback_if_undelivered: true,
-                            reply,
-                            result: Err(AutomationError::IfDspOperation { detail }),
-                        });
-                    }
-                    Err(EngageIfDspError::Dirty { detail, saved }) => {
-                        if_dsp_session = Some(ActiveIfDspSession {
-                            saved,
-                            current_frequency_hz: saved.band_b_frequency_hz(),
-                            output_verified: false,
-                        });
-                        deferred_reply = Some(DeferredReply::IfDsp {
-                            operation: "failed IF-DSP prepare cleanup",
-                            rollback_if_undelivered: true,
-                            reply,
-                            result: Err(AutomationError::IfDspRestoration { detail }),
-                        });
-                    }
-                }
+                lock_aprs_store(&aprs).begin_start(config);
+                restore_cat_after_kiss_return = true;
+                deferred_reply = Some(DeferredReply::FailedAprsStart { reply, detail });
             }
-            ActorBreak::RetuneIfDsp {
-                frequency_hz,
+            ActorBreak::DisableDvGateway {
+                expected_radio_serial_number,
+                cancellation,
                 reply,
             } => {
-                let result = match if_dsp_session {
-                    Some(active) => {
-                        match retune_if_dsp_radio(&mut radio, active.saved, frequency_hz).await {
-                            Ok(()) => {
-                                let retuned = ActiveIfDspSession {
-                                    current_frequency_hz: frequency_hz,
-                                    output_verified: true,
-                                    ..active
-                                };
-                                if_dsp_session = Some(retuned);
-                                Ok(retuned.status())
-                            }
-                            Err(retune_detail) => {
-                                let report = restore_if_dsp_radio(&mut radio, active.saved).await;
-                                if report.is_exact() {
-                                    if_dsp_session = None;
-                                    Err(AutomationError::IfDspOperation {
-                                        detail: format!(
-                                            "retune failed ({retune_detail}); the original radio state was restored and the IF-DSP session was stopped"
-                                        ),
-                                    })
-                                } else {
-                                    if_dsp_session = Some(ActiveIfDspSession {
-                                        output_verified: false,
-                                        ..active
-                                    });
-                                    Err(AutomationError::IfDspRestoration {
-                                        detail: format!(
-                                            "retune failed ({retune_detail}); {}",
-                                            report.summary()
-                                        ),
-                                    })
-                                }
-                            }
-                        }
-                    }
-                    None => Err(AutomationError::IfDspModeInactive),
-                };
-                deferred_reply = Some(DeferredReply::IfDsp {
-                    operation: "IF-DSP retune",
-                    rollback_if_undelivered: false,
-                    reply,
-                    result,
-                });
+                let result = disable_dv_gateway_over_cat(
+                    radio,
+                    &expected_radio_serial_number,
+                    &cancellation,
+                )
+                .await;
+                drop(reply.send(result));
+                return;
             }
-            ActorBreak::RestoreIfDsp { reply } => {
-                let result = match if_dsp_session {
-                    Some(active) => {
-                        let report = restore_if_dsp_radio(&mut radio, active.saved).await;
-                        if report.is_exact() {
-                            if_dsp_session = None;
-                            Ok(IfDspRadioStatus::inactive())
-                        } else {
-                            if_dsp_session = Some(ActiveIfDspSession {
-                                output_verified: false,
-                                ..active
-                            });
-                            Err(AutomationError::IfDspRestoration {
-                                detail: report.summary(),
-                            })
-                        }
-                    }
-                    None => Err(AutomationError::IfDspModeInactive),
-                };
-                deferred_reply = Some(DeferredReply::IfDsp {
-                    operation: "IF-DSP restore",
-                    rollback_if_undelivered: false,
-                    reply,
-                    result,
-                });
+            ActorBreak::RecoverAprsCurrentMode {
+                expected_radio_serial_number,
+                expected_kiss_interface_raw_value,
+                cancellation,
+                reply,
+            } => {
+                let result = recover_aprs_current_mode_over_cat(
+                    radio,
+                    &expected_radio_serial_number,
+                    expected_kiss_interface_raw_value,
+                    &cancellation,
+                )
+                .await;
+                drop(reply.send(result));
+                return;
             }
             ActorBreak::Shutdown { reply } => {
                 let restoration_failure = if let Some(active) = if_dsp_session.take() {
@@ -1463,12 +1846,35 @@ async fn qualify_automation(
     Ok(session)
 }
 
-async fn verify_radio_serial_identity(radio: &mut Radio<SwiftByteTransport>) -> Result<(), String> {
+async fn verify_radio_serial_identity(
+    radio: &mut Radio<SwiftByteTransport>,
+) -> Result<String, String> {
     radio
         .get_serial_information()
         .await
-        .map(|_information| ())
+        .map(|information| information.into_parts().0.to_string())
         .map_err(|error| format!("CAT serial identity failed: {error}"))
+}
+
+fn is_aligned_tn_current_mode_refusal(error: &RadioError) -> bool {
+    matches!(
+        error,
+        RadioError::NotAvailableInCurrentMode { mnemonic } if mnemonic == "TN"
+    )
+}
+
+fn invalidate_aprs_start_leases(
+    pending_screen: &mut Option<PendingScreen>,
+    settings_snapshot: &mut Option<SettingsSnapshot>,
+) {
+    *pending_screen = None;
+    *settings_snapshot = None;
+}
+
+fn aprs_start_reply_abandoned(
+    reply: &oneshot::Sender<Result<AprsSessionStatus, AutomationError>>,
+) -> bool {
+    reply.is_closed()
 }
 
 #[expect(
@@ -1479,11 +1885,13 @@ async fn automation_loop(
     session: &mut AutomationSession<'_, SwiftByteTransport>,
     receiver: &mut mpsc::Receiver<ControllerCommand>,
     next_screen_lease: &mut u64,
-    if_dsp_status: IfDspRadioStatus,
+    settings_snapshot: &mut Option<SettingsSnapshot>,
+    if_dsp_session: &mut Option<ActiveIfDspSession>,
+    aprs: &Mutex<AprsActivityStore>,
 ) -> ActorBreak {
     let mut pending_screen: Option<PendingScreen> = None;
-    let if_dsp_active = if_dsp_status.phase != IfDspRadioPhase::Inactive;
     while let Some(command) = receiver.recv().await {
+        let if_dsp_active = if_dsp_session.is_some();
         match command {
             ControllerCommand::Capture { reply } => {
                 if if_dsp_active {
@@ -1516,6 +1924,7 @@ async fn automation_loop(
                 let result = guarded_tap(
                     session,
                     &mut pending_screen,
+                    settings_snapshot,
                     next_screen_lease,
                     lease_id,
                     key,
@@ -1541,12 +1950,68 @@ async fn automation_loop(
                 }
                 return ActorBreak::ApplySettings { changes, reply };
             }
-            ControllerCommand::StartAprs { config, reply } => {
+            ControllerCommand::StartAprs {
+                config,
+                authority,
+                reply,
+            } => {
                 if if_dsp_active {
                     drop(reply.send(Err(AutomationError::IfDspModeActive)));
                     continue;
                 }
-                return ActorBreak::StartAprs { config, reply };
+                if aprs_start_reply_abandoned(&reply) {
+                    continue;
+                }
+                let data_band = match resolve_aprs_start_authority(
+                    session,
+                    settings_snapshot.as_ref(),
+                    authority,
+                )
+                .await
+                {
+                    Ok(data_band) => data_band,
+                    Err(error) => {
+                        drop(reply.send(Err(error)));
+                        if !session.is_valid() {
+                            return ActorBreak::Fatal;
+                        }
+                        continue;
+                    }
+                };
+                if aprs_start_reply_abandoned(&reply) {
+                    continue;
+                }
+                // Authority is now proved. Revoke both leases synchronously
+                // before the sole TN transition can suspend or change the
+                // transport protocol.
+                invalidate_aprs_start_leases(&mut pending_screen, settings_snapshot);
+                match session.transition_to_kiss(data_band).await {
+                    Ok(()) => return ActorBreak::StartAprs { config, reply },
+                    Err(error) if is_aligned_tn_current_mode_refusal(&error) => {
+                        let detail = error.to_string();
+                        let mut store = lock_aprs_store(aprs);
+                        store.record_start_refusal(
+                            config,
+                            "APRS KISS is unavailable in the radio's current mode. The existing CAT connection remains active.",
+                        );
+                        drop(store);
+                        drop(
+                            reply.send(Err(AutomationError::AprsCurrentModeUnavailable { detail })),
+                        );
+                    }
+                    Err(error) if session.is_valid() => {
+                        drop(reply.send(Err(AutomationError::AprsOperation {
+                            detail: format!("could not enter KISS mode: {error}"),
+                        })));
+                    }
+                    Err(error) => {
+                        return ActorBreak::FailedAprsTransition {
+                            config,
+                            reply,
+                            detail: format!("could not enter KISS mode: {error}"),
+                        };
+                    }
+                }
             }
             ControllerCommand::StopAprs { reply } => {
                 drop(reply.send(Err(AutomationError::AprsModeInactive)));
@@ -1559,29 +2024,94 @@ async fn automation_loop(
                 if if_dsp_active {
                     drop(reply.send(Err(AutomationError::IfDspModeActive)));
                 } else {
-                    return ActorBreak::PrepareIfDsp { reply };
+                    pending_screen = None;
+                    *settings_snapshot = None;
+                    let result = prepare_if_dsp_in_session(session, if_dsp_session).await;
+                    let undelivered = reply.send(result).is_err();
+                    if undelivered && if_dsp_session.is_some() {
+                        drop(restore_if_dsp_in_session(session, if_dsp_session).await);
+                    }
+                    if !session.is_valid() {
+                        return ActorBreak::Fatal;
+                    }
                 }
             }
             ControllerCommand::IfDspStatus { reply } => {
-                let _send_result = reply.send(if_dsp_status);
+                let status = if_dsp_session
+                    .as_ref()
+                    .copied()
+                    .map_or_else(IfDspRadioStatus::inactive, ActiveIfDspSession::status);
+                let _send_result = reply.send(status);
             }
             ControllerCommand::RetuneIfDsp {
                 frequency_hz,
                 reply,
             } => {
                 if if_dsp_active {
-                    return ActorBreak::RetuneIfDsp {
-                        frequency_hz,
-                        reply,
-                    };
+                    pending_screen = None;
+                    let result =
+                        retune_if_dsp_in_session(session, if_dsp_session, frequency_hz).await;
+                    drop(reply.send(result));
+                    if !session.is_valid() {
+                        return ActorBreak::Fatal;
+                    }
+                } else {
+                    drop(reply.send(Err(AutomationError::IfDspModeInactive)));
                 }
-                drop(reply.send(Err(AutomationError::IfDspModeInactive)));
             }
             ControllerCommand::RestoreIfDsp { reply } => {
                 if if_dsp_active {
-                    return ActorBreak::RestoreIfDsp { reply };
+                    pending_screen = None;
+                    let result = restore_if_dsp_in_session(session, if_dsp_session).await;
+                    drop(reply.send(result));
+                    if !session.is_valid() {
+                        return ActorBreak::Fatal;
+                    }
+                } else {
+                    drop(reply.send(Err(AutomationError::IfDspModeInactive)));
                 }
-                drop(reply.send(Err(AutomationError::IfDspModeInactive)));
+            }
+            ControllerCommand::DisableDvGateway {
+                expected_radio_serial_number,
+                cancellation,
+                reply,
+            } => {
+                if if_dsp_active {
+                    drop(
+                        reply.send(Err(DvGatewayCatDisableError::RadioQualification {
+                            detail: "IF-DSP already owns the radio; no setting was changed"
+                                .to_owned(),
+                        })),
+                    );
+                } else {
+                    return ActorBreak::DisableDvGateway {
+                        expected_radio_serial_number,
+                        cancellation,
+                        reply,
+                    };
+                }
+            }
+            ControllerCommand::RecoverAprsCurrentMode {
+                expected_radio_serial_number,
+                expected_kiss_interface_raw_value,
+                cancellation,
+                reply,
+            } => {
+                if if_dsp_active {
+                    drop(
+                        reply.send(Err(AprsCurrentModeRecoveryError::RadioQualification {
+                            detail: "IF-DSP already owns the radio; no setting was changed"
+                                .to_owned(),
+                        })),
+                    );
+                } else {
+                    return ActorBreak::RecoverAprsCurrentMode {
+                        expected_radio_serial_number,
+                        expected_kiss_interface_raw_value,
+                        cancellation,
+                        reply,
+                    };
+                }
             }
             ControllerCommand::Shutdown { reply } => return ActorBreak::Shutdown { reply },
         }
@@ -1674,6 +2204,19 @@ async fn aprs_loop(
                     }
                     ControllerCommand::IfDspStatus { reply } => {
                         let _send_result = reply.send(IfDspRadioStatus::inactive());
+                    }
+                    ControllerCommand::DisableDvGateway { reply, .. } => {
+                        drop(reply.send(Err(DvGatewayCatDisableError::RadioQualification {
+                            detail: "APRS owns the radio; no setting was changed".to_owned(),
+                        })));
+                    }
+                    ControllerCommand::RecoverAprsCurrentMode { reply, .. } => {
+                        drop(reply.send(Err(
+                            AprsCurrentModeRecoveryError::RadioQualification {
+                                detail: "APRS already owns the radio; no setting was changed"
+                                    .to_owned(),
+                            },
+                        )));
                     }
                     ControllerCommand::SendAprsMessage {
                         addressee,
@@ -1794,6 +2337,7 @@ async fn capture_screen(
 async fn guarded_tap(
     session: &mut AutomationSession<'_, SwiftByteTransport>,
     pending_screen: &mut Option<PendingScreen>,
+    settings_snapshot: &mut Option<SettingsSnapshot>,
     next_screen_lease: &mut u64,
     lease_id: u64,
     key: FrontPanelKey,
@@ -1824,6 +2368,15 @@ async fn guarded_tap(
             });
         }
     };
+    if matches!(
+        disposition,
+        GuardedTapDisposition::Dispatched | GuardedTapDisposition::DispatchedAfterDeadline
+    ) {
+        // The physical key may have changed any persistent setting. Revoke
+        // the MCP snapshot before the post-dispatch capture can suspend or
+        // fail, so it can never authorize a later APRS transition.
+        *settings_snapshot = None;
+    }
 
     let post = capture_screen(session, next_screen_lease)
         .await
@@ -2292,7 +2845,7 @@ mod tests {
     use kenwood_thd75::protocol::programming;
     use kenwood_thd75::screen::{SCREEN_BYTES, ScreenFrame};
     use kenwood_thd75::transport::MockTransport;
-    use kenwood_thd75::types::{PacketDataRate, RadioModel};
+    use kenwood_thd75::types::{RadioModel, TncDataBand};
     use kiss_tnc::FEND;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -2638,19 +3191,226 @@ mod tests {
         assert_eq!(next, 2);
     }
 
+    #[test]
+    fn only_aligned_tn_not_available_is_aprs_current_mode_refusal() {
+        assert!(is_aligned_tn_current_mode_refusal(
+            &RadioError::NotAvailableInCurrentMode {
+                mnemonic: "TN".to_owned(),
+            }
+        ));
+        assert!(!is_aligned_tn_current_mode_refusal(
+            &RadioError::NotAvailableInCurrentMode {
+                mnemonic: "BC".to_owned(),
+            }
+        ));
+        assert!(!is_aligned_tn_current_mode_refusal(
+            &RadioError::CommandRejected {
+                mnemonic: "TN".to_owned(),
+            }
+        ));
+    }
+
+    fn aprs_authority_snapshot(
+        id: u64,
+        route: u8,
+        raw_band: u8,
+        field_ids: Vec<String>,
+    ) -> Result<SettingsSnapshot, Box<dyn std::error::Error>> {
+        let mut interface_page = [0_u8; PAGE_SIZE];
+        *interface_page
+            .get_mut(0x90)
+            .ok_or("Menu 983 byte is outside MCP page")? = route;
+        let mut data_band_page = [0_u8; PAGE_SIZE];
+        *data_band_page
+            .get_mut(0x0B)
+            .ok_or("Menu 506 byte is outside MCP page")? = raw_band;
+        Ok(SettingsSnapshot {
+            id,
+            pages: BTreeMap::from([(0x10, interface_page), (0x12, data_band_page)]),
+            field_ids,
+        })
+    }
+
+    fn complete_aprs_authority_fields() -> Vec<String> {
+        vec![
+            APRS_KISS_INTERFACE_SETTING_ID.to_owned(),
+            APRS_TNC_DATA_BAND_SETTING_ID.to_owned(),
+        ]
+    }
+
+    #[test]
+    fn settings_snapshot_aprs_authority_is_exact_and_fail_closed() -> TestResult {
+        for (raw_band, expected) in [(0_u8, RadioTncDataBand::A), (1_u8, RadioTncDataBand::B)] {
+            let snapshot =
+                aprs_authority_snapshot(77, 1, raw_band, complete_aprs_authority_fields())?;
+            assert!(matches!(
+                resolve_settings_snapshot_aprs_authority(Some(&snapshot), 77, 1),
+                Ok(actual) if actual == expected
+            ));
+        }
+
+        let valid = aprs_authority_snapshot(77, 1, 0, complete_aprs_authority_fields())?;
+        assert!(matches!(
+            resolve_settings_snapshot_aprs_authority(None, 77, 1),
+            Err(AutomationError::SettingsSnapshotUnavailable { snapshot_id: 77 })
+        ));
+        assert!(matches!(
+            resolve_settings_snapshot_aprs_authority(Some(&valid), 78, 1),
+            Err(AutomationError::SettingsSnapshotUnavailable { snapshot_id: 78 })
+        ));
+
+        for missing_fields in [
+            vec![APRS_KISS_INTERFACE_SETTING_ID.to_owned()],
+            vec![APRS_TNC_DATA_BAND_SETTING_ID.to_owned()],
+        ] {
+            let snapshot = aprs_authority_snapshot(77, 1, 0, missing_fields)?;
+            assert!(matches!(
+                resolve_settings_snapshot_aprs_authority(Some(&snapshot), 77, 1),
+                Err(AutomationError::AprsStartAuthority { .. })
+            ));
+        }
+
+        assert!(matches!(
+            resolve_settings_snapshot_aprs_authority(Some(&valid), 77, 0),
+            Err(AutomationError::AprsStartAuthority { detail })
+                if detail.contains("Menu 983")
+        ));
+
+        for invalid_band in [2_u8, 3_u8] {
+            let snapshot =
+                aprs_authority_snapshot(77, 1, invalid_band, complete_aprs_authority_fields())?;
+            assert!(matches!(
+                resolve_settings_snapshot_aprs_authority(Some(&snapshot), 77, 1),
+                Err(AutomationError::AprsStartAuthority { detail })
+                    if detail.contains("Menu 506")
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn current_mode_recovery_authority_requires_exact_ae_off_mode_and_band() -> TestResult {
+        let expected_serial = SerialNumber::new("C3C10368")?;
+        let other_serial = SerialNumber::new("C5310165")?;
+        let off_a = TncState {
+            mode: TncMode::Off,
+            data_band: RadioTncDataBand::A,
+        };
+
+        assert!(matches!(
+            validate_current_mode_recovery_authority(
+                &expected_serial,
+                RadioTncDataBand::A,
+                &expected_serial,
+                off_a,
+            ),
+            Ok(RadioTncDataBand::A)
+        ));
+        assert!(matches!(
+            validate_current_mode_recovery_authority(
+                &expected_serial,
+                RadioTncDataBand::A,
+                &other_serial,
+                off_a,
+            ),
+            Err(AutomationError::AprsStartAuthority { detail })
+                if detail.contains("serial")
+        ));
+        assert!(matches!(
+            validate_current_mode_recovery_authority(
+                &expected_serial,
+                RadioTncDataBand::A,
+                &expected_serial,
+                TncState {
+                    mode: TncMode::Aprs,
+                    data_band: RadioTncDataBand::A,
+                },
+            ),
+            Err(AutomationError::AprsStartAuthority { detail })
+                if detail.contains("not Off")
+        ));
+        assert!(matches!(
+            validate_current_mode_recovery_authority(
+                &expected_serial,
+                RadioTncDataBand::B,
+                &expected_serial,
+                off_a,
+            ),
+            Err(AutomationError::AprsStartAuthority { detail })
+                if detail.contains("data band")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn abandoned_start_reply_is_detected_before_authority_consumption() {
+        let (reply, response) = oneshot::channel::<Result<AprsSessionStatus, AutomationError>>();
+        assert!(!aprs_start_reply_abandoned(&reply));
+        drop(response);
+        assert!(aprs_start_reply_abandoned(&reply));
+    }
+
+    #[test]
+    fn proved_aprs_start_revokes_core_settings_write_authority_before_tn() {
+        let mut pending_screen = None;
+        let mut settings_snapshot = Some(SettingsSnapshot {
+            id: 73,
+            pages: BTreeMap::new(),
+            field_ids: vec!["radio.KissModeInterface".to_owned()],
+        });
+
+        invalidate_aprs_start_leases(&mut pending_screen, &mut settings_snapshot);
+
+        assert!(pending_screen.is_none());
+        assert!(
+            settings_snapshot.is_none(),
+            "even aligned TN=N must consume the core-side reviewed settings lease"
+        );
+    }
+
+    #[test]
+    fn refused_aprs_status_is_semantic_and_does_not_leak_tn() {
+        let store = Mutex::new(AprsActivityStore::default());
+        let public_detail = "APRS KISS is unavailable in the radio's current mode. The existing CAT connection remains active.";
+        {
+            let mut journal = lock_aprs_store(&store);
+            journal.record_start_refusal(AprsSessionConfig::default(), public_detail);
+        }
+
+        let snapshot = lock_aprs_store(&store).snapshot(None);
+        assert_eq!(
+            snapshot.status.phase,
+            crate::aprs::AprsSessionPhase::Inactive
+        );
+        assert_eq!(snapshot.status.last_error.as_deref(), Some(public_detail));
+        assert_eq!(snapshot.status.started_at_unix_ms, None);
+        assert!(
+            !snapshot.activities.iter().any(|record| record
+                .summary
+                .contains("screen and settings control are paused")),
+            "a semantic refusal must not claim CAT ownership moved to KISS"
+        );
+        assert!(
+            !snapshot
+                .activities
+                .iter()
+                .any(|record| record.summary.contains("TN")),
+            "the Swift-installed core snapshot must not expose raw CAT mnemonics"
+        );
+    }
+
     #[tokio::test]
     async fn kiss_return_is_synchronized_before_strict_automation_qualification() -> TestResult {
         let mut transport = MockTransport::new();
         transport.expect(b"TN 2,0\r", b"TN 2,0\r");
         transport.expect(&[FEND, 0xFF, FEND], &[]);
-        expect_cat_recovery_preamble(&mut transport);
         transport.expect(b"ID\r", b"ID TH-D75\r");
         transport.expect(b"ID\r", b"ID TH-D75\r");
         transport.pend_when_empty();
 
         let radio = Radio::new(transport);
         let kiss = radio
-            .enter_kiss(PacketDataRate::Bps1200)
+            .enter_kiss(TncDataBand::A)
             .await
             .map_err(|(_, error)| error)?;
         // Take the unproven hatch deliberately: the point of this test
@@ -2677,17 +3437,17 @@ mod tests {
         let mut transport = MockTransport::new();
         transport.expect(b"TN 2,0\r", b"TN 2,0\r");
         transport.expect(&[FEND, 0xFF, FEND], &[]);
+        transport.expect(b"ID\r", b"ID OTHER\r");
         expect_cat_recovery_preamble(&mut transport);
         transport.expect(b"ID\r", b"ID OTHER\r");
         transport.expect_reopen(Ok(()));
-        expect_cat_recovery_preamble(&mut transport);
         transport.expect(b"ID\r", b"ID TH-D75\r");
         transport.expect(b"ID\r", b"ID TH-D75\r");
         transport.pend_when_empty();
 
         let radio = Radio::new(transport);
         let kiss = radio
-            .enter_kiss(PacketDataRate::Bps1200)
+            .enter_kiss(TncDataBand::A)
             .await
             .map_err(|(_, error)| error)?;
         let desynced = kiss.exit().await.map_err(|(_, error)| error)?;
@@ -2697,42 +3457,6 @@ mod tests {
         };
         assert_eq!(radio.identify().await?.model, RadioModel::ThD75);
         Ok(())
-    }
-
-    #[test]
-    fn undelivered_prepare_requests_actor_owned_radio_rollback() {
-        let store = Mutex::new(AprsActivityStore::default());
-        let (reply, response) = oneshot::channel();
-        drop(response);
-        let deferred = DeferredReply::IfDsp {
-            operation: "IF-DSP prepare",
-            rollback_if_undelivered: true,
-            reply,
-            result: Ok(IfDspRadioStatus::active(145_500_000)),
-        };
-
-        assert!(
-            deferred.complete(&store),
-            "a dropped prepare receiver must not silently commit radio ownership"
-        );
-    }
-
-    #[test]
-    fn undelivered_retune_does_not_discard_preexisting_ownership() {
-        let store = Mutex::new(AprsActivityStore::default());
-        let (reply, response) = oneshot::channel();
-        drop(response);
-        let deferred = DeferredReply::IfDsp {
-            operation: "IF-DSP retune",
-            rollback_if_undelivered: false,
-            reply,
-            result: Ok(IfDspRadioStatus::active(145_525_000)),
-        };
-
-        assert!(
-            !deferred.complete(&store),
-            "retune cancellation must leave the caller's existing reservation observable"
-        );
     }
 
     #[test]
@@ -2758,10 +3482,7 @@ mod tests {
 
         // `run_controller` invokes this only after `qualify_automation` returns a
         // proven automation session.
-        assert!(
-            !deferred.complete(&store),
-            "an APRS stop reply never requests IF rollback"
-        );
+        deferred.complete(&store);
         let status = response.try_recv()??;
         assert_eq!(status.phase, crate::aprs::AprsSessionPhase::Inactive);
         assert_eq!(lock_aprs_store(&store).status(), status);
@@ -2814,10 +3535,7 @@ mod tests {
             response.try_recv(),
             Err(oneshot::error::TryRecvError::Empty)
         ));
-        assert!(
-            !deferred.complete(&store),
-            "a failed APRS start reply never requests IF rollback"
-        );
+        deferred.complete(&store);
         let Err(error) = response.try_recv()? else {
             return Err("failed APRS start unexpectedly succeeded".into());
         };

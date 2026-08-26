@@ -9,7 +9,7 @@ use ::aprs::{
     build_aprs_position_report_packet, parse_aprs_data_full,
 };
 use ax25_codec::{Ax25Address, Ax25Packet, DigipeaterPath, build_ax25, parse_ax25};
-use kenwood_thd75::types::PacketDataRate;
+use kenwood_thd75::types::{PacketDataRate, TncDataBand as RadioTncDataBand};
 
 use crate::automation::AutomationError;
 
@@ -32,6 +32,56 @@ impl From<AprsPacketDataRate> for PacketDataRate {
             AprsPacketDataRate::Bps9600 => Self::Bps9600,
         }
     }
+}
+
+/// TNC data band selected by the radio's `TN` mode transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum TncDataBand {
+    /// Band A.
+    A,
+    /// Band B.
+    B,
+}
+
+impl From<TncDataBand> for RadioTncDataBand {
+    fn from(value: TncDataBand) -> Self {
+        match value {
+            TncDataBand::A => Self::A,
+            TncDataBand::B => Self::B,
+        }
+    }
+}
+
+impl From<RadioTncDataBand> for TncDataBand {
+    fn from(value: RadioTncDataBand) -> Self {
+        match value {
+            RadioTncDataBand::A => Self::A,
+            RadioTncDataBand::B => Self::B,
+        }
+    }
+}
+
+/// One explicit, fail-closed authority for an APRS KISS transition.
+///
+/// A normal start derives the TNC band from a retained settings snapshot. The
+/// single retry after caller-approved Menu 650 recovery instead re-proves the
+/// exact radio identity and live TN band without another MCP/reset cycle.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum AprsStartAuthority {
+    /// Consume one retained setting snapshot containing Menu 983 and Menu 506.
+    SettingsSnapshot {
+        /// Opaque identifier returned by the authoritative settings read.
+        snapshot_id: u64,
+        /// Selected endpoint's expected Menu 983 raw value (0=USB-C, 1=Bluetooth).
+        expected_kiss_interface_raw_value: u8,
+    },
+    /// One retry after the approved same-MCP Menu 983/Menu 506/Menu 650 operation.
+    CurrentModeRecovery {
+        /// Exact CAT `AE` serial returned by the approved recovery operation.
+        expected_radio_serial_number: String,
+        /// Menu 506 band proved by the approved recovery operation.
+        expected_data_band: TncDataBand,
+    },
 }
 
 /// Configuration for one host-owned APRS KISS session.
@@ -415,6 +465,41 @@ impl AprsActivityStore {
             summary: format!(
                 "APRS did not start; qualified automation CAT control was restored: {detail}"
             ),
+            raw_packet: String::new(),
+            raw_ax25: Vec::new(),
+            latitude: None,
+            longitude: None,
+            speed_knots: None,
+            course_degrees: None,
+        }));
+    }
+
+    /// Initialize and record a start refusal that left the existing CAT owner
+    /// and automation attestation continuously valid.
+    pub(crate) fn record_start_refusal(&mut self, config: AprsSessionConfig, user_detail: &str) {
+        let session_id = take_identifier(&mut self.next_session_id);
+        self.stations.clear();
+        self.status = AprsSessionStatus {
+            phase: AprsSessionPhase::Inactive,
+            session_id,
+            started_at_unix_ms: None,
+            configuration: Some(config),
+            received_packets: 0,
+            transmitted_packets: 0,
+            decode_failures: 0,
+            dropped_activities: self.status.dropped_activities,
+            last_error: Some(user_detail.to_owned()),
+        };
+        drop(self.push_record(AprsActivityRecord {
+            sequence: 0,
+            session_id: self.status.session_id,
+            timestamp_unix_ms: unix_milliseconds(),
+            direction: AprsActivityDirection::System,
+            kind: AprsActivityKind::Error,
+            source: None,
+            destination: None,
+            path: Vec::new(),
+            summary: format!("APRS did not start; CAT control remained active: {user_detail}"),
             raw_packet: String::new(),
             raw_ax25: Vec::new(),
             latitude: None,

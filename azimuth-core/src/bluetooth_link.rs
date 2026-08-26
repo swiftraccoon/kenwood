@@ -1349,14 +1349,16 @@ mod tests {
         use kenwood_thd75::transport::MockTransport;
 
         let mut transport = MockTransport::new();
+        transport.expect(b"ID\r", b"N\r");
         transport.expect(b"\r", b"");
         transport.expect(b"\r", b"");
         transport.expect(&[0x03], b"");
         transport.expect(&[0xC0, 0xFF, 0xC0], b"");
         transport.expect(b"\rTC 1\r", b"");
-        transport.expect(b"TN 0,0\r", b"");
-        transport.queue_read(recovery_residue);
+        transport.expect(b"TN 0,0\r", recovery_residue);
+        transport.expect(b"ID\r", b"ID TH-D75\r");
         transport.expect(b"AE\r", format!("AE {serial_number},K01\r").as_bytes());
+        transport.pend_when_empty();
         transport
     }
 }

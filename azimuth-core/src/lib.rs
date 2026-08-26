@@ -28,7 +28,8 @@ mod transport;
 
 pub use aprs::{
     AprsActivityDirection, AprsActivityKind, AprsActivityRecord, AprsOperationalSnapshot,
-    AprsPacketDataRate, AprsSessionConfig, AprsSessionPhase, AprsSessionStatus, AprsStationRecord,
+    AprsPacketDataRate, AprsSessionConfig, AprsSessionPhase, AprsSessionStatus, AprsStartAuthority,
+    AprsStationRecord, TncDataBand,
 };
 pub use automation::{
     AutomationAbiRecord, AutomationController, AutomationError, FrontPanelKey,
@@ -51,8 +52,11 @@ pub use if_dsp::{
     IfDspConfiguration, IfDspError, IfDspFrame, IfDspMode, IfDspProcessor, IfDspSpectrum,
 };
 pub use terminal_mode::{
-    BluetoothRecoverySelector, DvGatewayRecoveryError, DvGatewayRecoveryOperation,
-    DvGatewayRecoveryOutcome, validate_bluetooth_recovery_helper,
+    AprsCurrentModeRecoveryError, AprsCurrentModeRecoveryResult, BluetoothRecoverySelector,
+    DvGatewayCatDisableError, DvGatewayCatDisableResult, DvGatewayRecoveryError,
+    DvGatewayRecoveryOperation, DvGatewayRecoveryOutcome, DvGatewayUsbRoutingError,
+    DvGatewayUsbRoutingOperation, DvGatewayUsbRoutingOutcome, DvGatewayUsbRoutingResult,
+    validate_bluetooth_recovery_helper,
 };
 pub use transport::{ByteTransport, ByteTransportError};
 
