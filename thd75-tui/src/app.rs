@@ -11,7 +11,7 @@ use kenwood_thd75::types::{
     FrontPanelPfFunction, GpsSettings, Language, LinkedVolumeLevel, MicSensitivity, NmeaSentences,
     OperatingMode, PcOutputInterface, PowerLevel, RegularChannel, RepeaterCallKey, SMeterReading,
     ScanRestartDelay, ScanResumeMethod, SpeedDistanceUnit, SquelchLevel, SsbHighCut,
-    StoredFrontPanelPfAssignment, TemperatureUnit, TransmitTimeout, VoiceAnnounceMode,
+    StoredFrontPanelPfAssignment, TemperatureUnit, TncDataBand, TransmitTimeout, VoiceAnnounceMode,
     VoiceGuideSpeed, VoxDelay, VoxGain,
 };
 
@@ -3529,7 +3529,9 @@ impl App {
                     return;
                 };
 
-                let config = kenwood_thd75::DstarGatewayConfig::new(callsign);
+                // Preserve the firmware-qualified transient gateway choice
+                // `TN 3,1`; the UI does not expose a separate D-STAR TNC band.
+                let config = kenwood_thd75::DstarGatewayConfig::new(callsign, TncDataBand::B);
                 if let Some(ref tx) = self.cmd_tx {
                     let _send = tx.send(crate::event::RadioCommand::EnterDstar { config });
                     self.status_message = Some("Entering D-STAR gateway mode...".into());
@@ -3635,8 +3637,14 @@ impl App {
                     return;
                 };
 
-                let config = match kenwood_thd75::AprsClientConfig::new(callsign.address().clone())
-                {
+                let data_band = match self.target_band {
+                    kenwood_thd75::types::Band::A => TncDataBand::A,
+                    kenwood_thd75::types::Band::B => TncDataBand::B,
+                };
+                let config = match kenwood_thd75::AprsClientConfig::new(
+                    callsign.address().clone(),
+                    data_band,
+                ) {
                     Ok(config) => Box::new(config),
                     Err(error) => {
                         self.status_message = Some(format!(
@@ -3647,7 +3655,8 @@ impl App {
                 };
                 if let Some(ref tx) = self.cmd_tx {
                     let _send = tx.send(crate::event::RadioCommand::EnterAprs { config });
-                    self.status_message = Some("Entering APRS mode...".into());
+                    self.status_message =
+                        Some(format!("Entering APRS mode on the selected {data_band}..."));
                 }
             }
             AprsMode::Active => {
@@ -3665,6 +3674,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use kenwood_thd75::types::{
         FrontPanelPfFunction, GpsSettings, LinkedVolumeLevel, StoredFrontPanelPfAssignment,
+        TncDataBand,
     };
     use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -3898,6 +3908,7 @@ mod tests {
         match rx.try_recv()? {
             RadioCommand::EnterDstar { config } => {
                 assert_eq!(config.callsign.as_str(), "KQ4NIT");
+                assert_eq!(config.data_band, TncDataBand::B);
             }
             other => return Err(format!("expected EnterDstar, got {other:?}").into()),
         }
@@ -4325,6 +4336,7 @@ mod tests {
         let mut app = App::with_cache_path(String::new(), None);
         app.cmd_tx = Some(tx);
         app.state.aprs_callsign = Some(kenwood_thd75::types::AprsCallsign::new("KQ4NIT-9")?);
+        app.target_band = kenwood_thd75::types::Band::B;
 
         app.toggle_aprs_mode();
 
@@ -4332,6 +4344,11 @@ mod tests {
             RadioCommand::EnterAprs { config } => {
                 let source = config.source().ok_or("expected a station identity")?;
                 assert_eq!(source.to_string(), "KQ4NIT-9");
+                assert_eq!(config.data_band(), TncDataBand::B);
+                assert_eq!(
+                    app.status_message.as_deref(),
+                    Some("Entering APRS mode on the selected Band B...")
+                );
                 Ok(())
             }
             other => Err(format!("expected EnterAprs, got {other:?}").into()),

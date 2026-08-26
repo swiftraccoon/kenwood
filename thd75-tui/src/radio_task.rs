@@ -725,9 +725,9 @@ pub(crate) async fn spawn_with_transport(
 
 /// Connect a replacement transport after a possibly ambiguous mode exit.
 ///
-/// KISS and MMDVM exit failures can leave the radio speaking binary framing,
-/// so every fresh transport used by the reconnect loop must first send the
-/// mode-clearing preamble.
+/// KISS and MMDVM exit failures can leave the radio speaking binary framing.
+/// A fresh transport first proves ordinary CAT without changing the live TNC
+/// data band; only a failed proof sends the packet-mode recovery preamble.
 async fn connect_for_recovery<T: Transport>(
     transport: T,
 ) -> Result<Radio<T>, kenwood_thd75::Error> {
@@ -1292,6 +1292,7 @@ fn discover_and_open(port: Option<&str>, baud: u32) -> Result<(String, EitherTra
 mod tests {
     use super::*;
     use kenwood_thd75::MockTransport;
+    use kenwood_thd75::types::TncDataBand;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -1451,14 +1452,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconnect_connection_sends_mode_clearing_preamble() -> TestResult {
+    async fn reconnect_connection_falls_back_to_mode_clearing_preamble() -> TestResult {
         let mut mock = MockTransport::new();
+        mock.expect(b"ID\r", b"N\r");
         mock.expect(b"\r", b"");
         mock.expect(b"\r", b"");
         mock.expect(&[0x03], b"");
         mock.expect(&[0xC0, 0xFF, 0xC0], b"");
         mock.expect(b"\rTC 1\r", b"");
         mock.expect(b"TN 0,0\r", b"");
+        mock.expect(b"ID\r", b"ID TH-D75\r");
+        mock.pend_when_empty();
 
         let radio = connect_for_recovery(EitherTransport::Mock(mock)).await?;
         drop(radio);
@@ -1468,7 +1472,7 @@ mod tests {
     #[tokio::test]
     async fn aprs_entry_failure_preserves_returned_radio_owner() -> TestResult {
         let radio = Radio::new(EitherTransport::Mock(MockTransport::new()));
-        let config = kenwood_thd75::AprsClientConfig::try_new("N0CALL", 0)?;
+        let config = kenwood_thd75::AprsClientConfig::try_new("N0CALL", 0, TncDataBand::A)?;
         let (message_tx, _message_rx) = mpsc::unbounded_channel();
         let (_command_tx, mut command_rx) = mpsc::unbounded_channel();
 
@@ -1487,7 +1491,8 @@ mod tests {
     #[tokio::test]
     async fn dstar_entry_failure_preserves_returned_radio_owner() -> TestResult {
         let radio = Radio::new(EitherTransport::Mock(MockTransport::new()));
-        let config = kenwood_thd75::DstarGatewayConfig::new(DstarCallsign::new("N0CALL")?);
+        let config =
+            kenwood_thd75::DstarGatewayConfig::new(DstarCallsign::new("N0CALL")?, TncDataBand::B);
         let (message_tx, _message_rx) = mpsc::unbounded_channel();
         let (_command_tx, mut command_rx) = mpsc::unbounded_channel();
 
