@@ -1543,19 +1543,13 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn signal_listener_failure_still_recovers_the_interrupted_snapshot() -> Result {
+    async fn signal_listener_failure_closes_an_ambiguous_snapshot_without_sending_exit() -> Result {
         let mut mock = MockTransport::new();
         mock.expect(programming::ENTER_PROGRAMMING, b"0M\r");
 
         let page = 0x0010;
         let read = programming::build_read_command(programming::McpPage::new(page)?);
         mock.expect_hang(&read);
-        mock.expect(&[programming::EXIT], &[programming::ACK]);
-        mock.expect_reopen(Ok(()));
-        mock.expect(b"ID\r", b"ID TH-D75\r");
-        // A second CAT probe proves the helper returned a usable radio.
-        mock.expect(b"ID\r", b"ID TH-D75\r");
-
         let mut radio = Radio::new(mock);
         let result = read_sparse_with_interrupt(&mut radio, &[page], async {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1568,17 +1562,20 @@ mod tests {
         assert!(
             message.contains("interrupt listener failed")
                 && message.contains("signal backend unavailable")
-                && message.contains("normal CAT recovery completed"),
-            "listener error or recovery outcome was lost: {message}"
+                && message.contains("MCP wire boundary is ambiguous")
+                && message.contains("fully power-cycle the radio"),
+            "listener error or fail-closed recovery guidance was lost: {message}"
         );
 
-        let info = radio.identify().await?;
-        assert_eq!(info.model, RadioModel::ThD75);
+        assert!(
+            radio.identify().await.is_err(),
+            "an ambiguous MCP boundary must not leave a reusable CAT connection"
+        );
         Ok(())
     }
 
     #[tokio::test(start_paused = true)]
-    async fn interrupted_write_recovers_and_warns_about_partial_changes() -> Result {
+    async fn interrupted_write_fails_closed_and_warns_about_partial_changes() -> Result {
         let mut planner = PatchPlanner::new();
         add_assignment(&mut planner, "radio.Beep=on")?;
         let patches = planner.finish()?;
@@ -1604,12 +1601,6 @@ mod tests {
             programming::build_write_command(programming::WritableMcpPage::new(page)?, &modified);
         mock.expect_hang(&write);
 
-        mock.expect(&[programming::EXIT], &[programming::ACK]);
-        mock.expect_reopen(Ok(()));
-        mock.expect(b"ID\r", b"ID TH-D75\r");
-        // A final probe proves the helper returned a CAT-capable radio.
-        mock.expect(b"ID\r", b"ID TH-D75\r");
-
         let mut radio = Radio::new(mock);
         let result = apply_patches_with_interrupt(&mut radio, &patches, async {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1621,12 +1612,15 @@ mod tests {
         let message = error.to_string();
         assert!(
             message.contains("one or more earlier pages may already have changed")
-                && message.contains("normal CAT recovery completed"),
-            "partial-write warning or recovery outcome was lost: {message}"
+                && message.contains("MCP wire boundary is ambiguous")
+                && message.contains("fully power-cycle the radio"),
+            "partial-write warning or fail-closed guidance was lost: {message}"
         );
 
-        let info = radio.identify().await?;
-        assert_eq!(info.model, RadioModel::ThD75);
+        assert!(
+            radio.identify().await.is_err(),
+            "an interrupted page write must not leave a reusable CAT connection"
+        );
         Ok(())
     }
 }

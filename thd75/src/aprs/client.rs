@@ -29,13 +29,14 @@
 //!     PositionReportText, Radio,
 //! };
 //! use kenwood_thd75::transport::SerialTransport;
+//! use kenwood_thd75::types::TncDataBand;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let transport = SerialTransport::open("/dev/cu.usbmodem1234")?;
 //! let radio = Radio::new(transport);
 //!
 //! let station = Ax25Address::new("N0CALL", 7)?;
-//! let config = AprsClientConfig::new(station)?;
+//! let config = AprsClientConfig::new(station, TncDataBand::A)?;
 //! let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
 //!
 //! // Send a message
@@ -115,7 +116,7 @@ use crate::error::Error;
 use crate::radio::kiss_session::KissSession;
 use crate::radio::{DesyncedRadio, Radio};
 use crate::transport::Transport;
-use crate::types::{KissParams, PacketDataRate};
+use crate::types::{KissParams, PacketDataRate, TncDataBand};
 
 /// Default receive timeout for `next_event` polling (500 ms).
 ///
@@ -466,6 +467,8 @@ pub struct AprsClientConfig {
     symbol: AprsSymbol,
     /// Packet data rate. Default: 1200 bps (AFSK).
     data_rate: PacketDataRate,
+    /// TNC data band selected by the `TN` transition.
+    data_band: TncDataBand,
     /// Default comment appended to position beacons.
     beacon_comment: PositionReportText,
     /// `SmartBeaconing` algorithm configuration.
@@ -527,8 +530,11 @@ impl AprsClientConfig {
     /// Returns [`crate::error::ValidationError`] if the library's standard
     /// outgoing path fails its own validation. The static path is checked
     /// through the public parser rather than silently dropping bad entries.
-    pub fn new(source: Ax25Address) -> Result<Self, crate::error::ValidationError> {
-        Ok(Self::builder(source)?.build())
+    pub fn new(
+        source: Ax25Address,
+        data_band: TncDataBand,
+    ) -> Result<Self, crate::error::ValidationError> {
+        Ok(Self::builder(source, data_band)?.build())
     }
 
     /// Parse a caller-provided callsign and SSID, then create the default
@@ -538,8 +544,12 @@ impl AprsClientConfig {
     ///
     /// Returns [`crate::error::ValidationError`] if either address component
     /// is invalid or if the standard path cannot be constructed.
-    pub fn try_new(callsign: &str, ssid: u8) -> Result<Self, crate::error::ValidationError> {
-        Self::new(validate_station_address(callsign, ssid)?)
+    pub fn try_new(
+        callsign: &str,
+        ssid: u8,
+        data_band: TncDataBand,
+    ) -> Result<Self, crate::error::ValidationError> {
+        Self::new(validate_station_address(callsign, ssid)?, data_band)
     }
 
     /// Create a receive-only configuration with no station identity.
@@ -552,11 +562,12 @@ impl AprsClientConfig {
     /// empty. Monitoring receivers that hold no callsign authorization
     /// use this instead of inventing a placeholder identity.
     #[must_use]
-    pub fn receive_only() -> Self {
+    pub fn receive_only(data_band: TncDataBand) -> Self {
         Self {
             source: None,
             symbol: AprsSymbol::CAR,
             data_rate: PacketDataRate::Bps1200,
+            data_band,
             beacon_comment: PositionReportText::default(),
             smart_beaconing: SmartBeaconingConfig::default(),
             digipeater: None,
@@ -579,8 +590,9 @@ impl AprsClientConfig {
     /// use kenwood_thd75::{
     ///     AprsClientConfig, AprsSymbol, Ax25Address, PositionReportText,
     /// };
+    /// use kenwood_thd75::types::TncDataBand;
     /// let station = Ax25Address::new("N0CALL", 9)?;
-    /// let config = AprsClientConfig::builder(station)?
+    /// let config = AprsClientConfig::builder(station, TncDataBand::A)?
     ///     .symbol(AprsSymbol::CAR)
     ///     .beacon_comment(PositionReportText::new("mobile")?)
     ///     .auto_ack(true)
@@ -594,8 +606,9 @@ impl AprsClientConfig {
     /// digipeater path cannot be constructed.
     pub fn builder(
         source: Ax25Address,
+        data_band: TncDataBand,
     ) -> Result<AprsClientConfigBuilder, crate::error::ValidationError> {
-        AprsClientConfigBuilder::new(source)
+        AprsClientConfigBuilder::new(source, data_band)
     }
 
     /// Parse a callsign and SSID, then start the fluent builder.
@@ -607,8 +620,9 @@ impl AprsClientConfig {
     pub fn try_builder(
         callsign: &str,
         ssid: u8,
+        data_band: TncDataBand,
     ) -> Result<AprsClientConfigBuilder, crate::error::ValidationError> {
-        Self::builder(validate_station_address(callsign, ssid)?)
+        Self::builder(validate_station_address(callsign, ssid)?, data_band)
     }
 
     /// Return this station's validated AX.25 source address, or `None`
@@ -628,6 +642,12 @@ impl AprsClientConfig {
     #[must_use]
     pub const fn data_rate(&self) -> PacketDataRate {
         self.data_rate
+    }
+
+    /// Return the TNC data band selected when entering KISS.
+    #[must_use]
+    pub const fn data_band(&self) -> TncDataBand {
+        self.data_band
     }
 
     /// Return the default position-beacon comment.
@@ -700,6 +720,7 @@ pub struct AprsClientConfigBuilder {
     source: Ax25Address,
     symbol: AprsSymbol,
     data_rate: PacketDataRate,
+    data_band: TncDataBand,
     beacon_comment: PositionReportText,
     smart_beaconing: SmartBeaconingConfig,
     digipeater: Option<DigipeaterConfig>,
@@ -720,7 +741,10 @@ impl AprsClientConfigBuilder {
     ///
     /// Returns [`crate::error::ValidationError`] if the standard outgoing
     /// path cannot be constructed.
-    pub fn new(source: Ax25Address) -> Result<Self, crate::error::ValidationError> {
+    pub fn new(
+        source: Ax25Address,
+        data_band: TncDataBand,
+    ) -> Result<Self, crate::error::ValidationError> {
         let digipeater_path = crate::aprs::default_digipeater_path().map_err(|_| {
             crate::error::ValidationError::AprsWireOutOfRange {
                 field: "default APRS digipeater path",
@@ -731,6 +755,7 @@ impl AprsClientConfigBuilder {
             source,
             symbol: AprsSymbol::CAR,
             data_rate: PacketDataRate::Bps1200,
+            data_band,
             beacon_comment: PositionReportText::default(),
             smart_beaconing: SmartBeaconingConfig::default(),
             digipeater: None,
@@ -761,6 +786,13 @@ impl AprsClientConfigBuilder {
     #[must_use]
     pub const fn data_rate(mut self, data_rate: PacketDataRate) -> Self {
         self.data_rate = data_rate;
+        self
+    }
+
+    /// Select the TNC data band used by the KISS transition.
+    #[must_use]
+    pub const fn data_band(mut self, data_band: TncDataBand) -> Self {
+        self.data_band = data_band;
         self
     }
 
@@ -854,6 +886,7 @@ impl AprsClientConfigBuilder {
             source: Some(self.source),
             symbol: self.symbol,
             data_rate: self.data_rate,
+            data_band: self.data_band,
             beacon_comment: self.beacon_comment,
             smart_beaconing: self.smart_beaconing,
             digipeater: self.digipeater,
@@ -1071,7 +1104,7 @@ impl<T: Transport> AprsClient<T> {
     ) -> Result<Self, (Radio<T>, Error)> {
         let my_addr = config.source.clone();
 
-        let mut session = match radio.enter_kiss(config.data_rate).await {
+        let mut session = match radio.enter_kiss(config.data_band).await {
             Ok(s) => s,
             Err((radio, e)) => return Err((radio, e)),
         };
@@ -1081,7 +1114,12 @@ impl<T: Transport> AprsClient<T> {
         // flows. On failure the KISS entry is unwound so the caller
         // gets the radio back; if even the unwind fails, the radio is
         // reclaimed marked recovery-required.
-        if let Err(error) = apply_kiss_params(&mut session, config.kiss_params).await {
+        let configure_result = async {
+            session.set_hardware_data_rate(config.data_rate).await?;
+            apply_kiss_params(&mut session, config.kiss_params).await
+        }
+        .await;
+        if let Err(error) = configure_result {
             // The caller receives the apply error either way; the radio
             // still tracks its own recovery obligation internally.
             return match session.exit().await {
@@ -2272,22 +2310,23 @@ mod tests {
 
     use crate::aprs::default_digipeater_path;
     use crate::transport::MockTransport;
-    use crate::types::PacketDataRate;
+    use crate::types::TncDataBand;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
     type BoxErr = Box<dyn std::error::Error>;
 
     /// Build a mock Radio that expects the TN 2,x command for KISS entry.
-    fn mock_radio(data_rate: PacketDataRate) -> Radio<MockTransport> {
-        let tn_cmd = format!("TN 2,{}\r", u8::from(data_rate));
-        let tn_resp = format!("TN 2,{}\r", u8::from(data_rate));
+    fn mock_radio(data_band: TncDataBand) -> Radio<MockTransport> {
+        let tn_cmd = format!("TN 2,{}\r", u8::from(data_band));
+        let tn_resp = format!("TN 2,{}\r", u8::from(data_band));
         let mut mock = MockTransport::new();
         mock.expect(tn_cmd.as_bytes(), tn_resp.as_bytes());
+        mock.expect(&[FEND, 0x06, 0x00, FEND], &[]);
         Radio::new(mock)
     }
 
     fn test_config() -> Result<AprsClientConfig, crate::error::ValidationError> {
-        AprsClientConfig::try_new("N0CALL", 7)
+        AprsClientConfig::try_new("N0CALL", 7, TncDataBand::A)
     }
 
     fn test_igate_policy() -> Result<IGateToRfConfig, crate::error::ValidationError> {
@@ -2300,7 +2339,7 @@ mod tests {
     }
 
     fn test_igate_config() -> Result<AprsClientConfig, crate::error::ValidationError> {
-        Ok(AprsClientConfig::try_builder("N0CALL", 7)?
+        Ok(AprsClientConfig::try_builder("N0CALL", 7, TncDataBand::A)?
             .igate_to_rf(test_igate_policy()?)
             .build())
     }
@@ -2369,7 +2408,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_enters_kiss_mode() -> TestResult {
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
         let client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
         let source = client.config().source().ok_or("expected an identity")?;
@@ -2388,7 +2427,7 @@ mod tests {
 
     #[tokio::test]
     async fn stop_exits_kiss_mode() -> TestResult {
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
         let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
 
@@ -2401,17 +2440,17 @@ mod tests {
 
     #[test]
     fn config_rejects_invalid_callsign_at_construction() {
-        assert!(AprsClientConfig::try_new("N0CALL/P", 7).is_err());
+        assert!(AprsClientConfig::try_new("N0CALL/P", 7, TncDataBand::A).is_err());
     }
 
     #[test]
     fn config_rejects_invalid_ssid_at_construction() {
-        assert!(AprsClientConfig::try_new("N0CALL", 99).is_err());
+        assert!(AprsClientConfig::try_new("N0CALL", 99, TncDataBand::A).is_err());
     }
 
     #[tokio::test]
     async fn send_message_queues_and_transmits() -> TestResult {
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
         let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
 
@@ -2443,7 +2482,7 @@ mod tests {
 
     #[tokio::test]
     async fn beacon_position_transmits() -> TestResult {
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
         let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
 
@@ -2469,7 +2508,7 @@ mod tests {
 
     #[tokio::test]
     async fn beacon_position_compressed_transmits() -> TestResult {
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
         let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
 
@@ -2495,7 +2534,7 @@ mod tests {
 
     #[tokio::test]
     async fn raw_frame_tap_captures_exact_ax25_bytes() -> TestResult {
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
         let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
 
@@ -2529,7 +2568,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_message_unacked_transmits_once_with_no_retry_state() -> TestResult {
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
         let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
 
@@ -2565,6 +2604,7 @@ mod tests {
 
         let mut mock = MockTransport::new();
         mock.expect(b"TN 2,0\r", b"TN 2,0\r");
+        mock.expect(&[FEND, 0x06, 0x00, FEND], &[]);
         let delay = KissTxDelay::from_milliseconds(300)?;
         let delay_frame = encode_kiss_frame(&KissFrame {
             port: KissPort::TH_D75,
@@ -2574,7 +2614,7 @@ mod tests {
         mock.expect(&delay_frame, &[]);
         let radio = Radio::new(mock);
 
-        let config = AprsClientConfig::try_builder("N0CALL", 7)?
+        let config = AprsClientConfig::try_builder("N0CALL", 7, TncDataBand::A)?
             .kiss_params(KissParams {
                 tx_delay: Some(delay),
                 ..KissParams::default()
@@ -2590,8 +2630,8 @@ mod tests {
 
     #[tokio::test]
     async fn receive_only_client_decodes_but_refuses_transmit() -> TestResult {
-        let radio = mock_radio(PacketDataRate::Bps1200);
-        let config = AprsClientConfig::receive_only();
+        let radio = mock_radio(TncDataBand::A);
+        let config = AprsClientConfig::receive_only(TncDataBand::A);
         let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
 
         // RX still decodes into events with no station identity.
@@ -2623,7 +2663,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_status_transmits() -> TestResult {
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
         let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
 
@@ -2637,7 +2677,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_timestamped_status_transmits() -> TestResult {
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
         let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
 
@@ -2657,7 +2697,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_object_transmits() -> TestResult {
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
         let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
         let timestamp = AprsReportTimestamp::day_hour_minute_utc(15, 14, 30)?;
@@ -2691,7 +2731,7 @@ mod tests {
 
     #[test]
     fn config_builder_valid() -> TestResult {
-        let cfg = AprsClientConfig::try_builder("N0CALL", 9)?
+        let cfg = AprsClientConfig::try_builder("N0CALL", 9, TncDataBand::A)?
             .symbol(AprsSymbol::CAR)
             .beacon_comment(PositionReportText::new("test")?)
             .auto_ack(false)
@@ -2709,13 +2749,13 @@ mod tests {
 
     #[test]
     fn config_builder_rejects_bad_callsign() {
-        assert!(AprsClientConfig::try_builder("", 0).is_err());
-        assert!(AprsClientConfig::try_builder("TOOLONG", 0).is_err());
+        assert!(AprsClientConfig::try_builder("", 0, TncDataBand::A).is_err());
+        assert!(AprsClientConfig::try_builder("TOOLONG", 0, TncDataBand::A).is_err());
     }
 
     #[test]
     fn config_builder_rejects_bad_ssid() {
-        assert!(AprsClientConfig::try_builder("N0CALL", 16).is_err());
+        assert!(AprsClientConfig::try_builder("N0CALL", 16, TncDataBand::A).is_err());
     }
 
     #[test]
@@ -2725,7 +2765,7 @@ mod tests {
 
     #[test]
     fn config_defaults() -> TestResult {
-        let config = AprsClientConfig::try_new("W1AW", 0)?;
+        let config = AprsClientConfig::try_new("W1AW", 0, TncDataBand::A)?;
         let source = config.source().ok_or("expected an identity")?;
         assert_eq!(source.callsign, "W1AW");
         assert_eq!(source.ssid, 0);
@@ -2817,7 +2857,7 @@ mod tests {
 
     #[test]
     fn config_preserves_typed_source_address() -> TestResult {
-        let config = AprsClientConfig::try_new("KQ4NIT", 9)?;
+        let config = AprsClientConfig::try_new("KQ4NIT", 9, TncDataBand::A)?;
         let source = config.source().ok_or("expected an identity")?;
         assert_eq!(source.callsign, "KQ4NIT");
         assert_eq!(source.ssid, 9);
@@ -2871,7 +2911,7 @@ mod tests {
 
     #[tokio::test]
     async fn format_packet_for_aprs_is_is_byte_exact() -> TestResult {
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
         let client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
 
@@ -2887,7 +2927,7 @@ mod tests {
 
     #[tokio::test]
     async fn format_packet_for_aprs_is_normalizes_terminal_tnc_framing() -> TestResult {
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
         let client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
 
@@ -2910,7 +2950,7 @@ mod tests {
 
     #[tokio::test]
     async fn format_packet_for_aprs_is_preserves_non_utf8_and_login_state() -> TestResult {
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
         let client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
 
@@ -2969,7 +3009,7 @@ mod tests {
 
     #[tokio::test]
     async fn observe_and_evaluate_gate_from_is_rejects_position_reports() -> TestResult {
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let config = test_igate_config()?;
         let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
 
@@ -2982,7 +3022,7 @@ mod tests {
     #[tokio::test]
     async fn observe_and_evaluate_gate_from_is_does_not_treat_bulletins_as_direct_messages()
     -> TestResult {
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let config = test_igate_config()?;
         let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
         let now = Instant::now();
@@ -2995,7 +3035,7 @@ mod tests {
 
     #[tokio::test]
     async fn observe_and_evaluate_gate_from_is_rejects_nogate_in_path() -> TestResult {
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let config = test_igate_config()?;
         let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
 
@@ -3006,7 +3046,7 @@ mod tests {
 
     #[tokio::test]
     async fn observe_and_evaluate_gate_from_is_requires_heard_station() -> TestResult {
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let config = test_igate_config()?;
         let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
 
@@ -3018,7 +3058,7 @@ mod tests {
 
     #[tokio::test]
     async fn observe_and_evaluate_gate_from_is_accepts_message_to_heard_station() -> TestResult {
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let config = test_igate_config()?;
         let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
 
@@ -3035,7 +3075,7 @@ mod tests {
     #[tokio::test]
     async fn observe_and_evaluate_gate_from_is_rejects_unverified_and_opt_out_markers() -> TestResult
     {
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let config = test_igate_config()?;
         let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
         let now = Instant::now();
@@ -3057,7 +3097,7 @@ mod tests {
     #[tokio::test]
     async fn observe_and_evaluate_gate_from_is_is_fail_closed_without_explicit_policy() -> TestResult
     {
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let mut client = AprsClient::start(radio, test_config()?)
             .await
             .map_err(|(_, error)| error)?;
@@ -3070,10 +3110,10 @@ mod tests {
     async fn receiver_locality_uses_explicit_repeated_hop_limit() -> TestResult {
         let minute = Duration::from_secs(60);
         let policy = IGateToRfConfig::new(IGateRfLocality::new(1)?, minute, minute, minute)?;
-        let config = AprsClientConfig::try_builder("N0CALL", 7)?
+        let config = AprsClientConfig::try_builder("N0CALL", 7, TncDataBand::A)?
             .igate_to_rf(policy)
             .build();
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
         let now = Instant::now();
         let repeated_one = ax25_codec::RouteEntry::new("WIDE1", 1)?.marked_used();
@@ -3114,7 +3154,7 @@ mod tests {
 
     #[tokio::test]
     async fn rf_third_party_header_rejects_server_style_identities() -> TestResult {
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let mut client = AprsClient::start(radio, test_igate_config()?)
             .await
             .map_err(|(_, error)| error)?;
@@ -3146,10 +3186,10 @@ mod tests {
             period,
             period,
         )?;
-        let config = AprsClientConfig::try_builder("N0CALL", 7)?
+        let config = AprsClientConfig::try_builder("N0CALL", 7, TncDataBand::A)?
             .igate_to_rf(policy)
             .build();
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
         let observed = Instant::now();
         hear_directly_on_rf(&mut client, "KQ4NIT", observed)?;
@@ -3174,10 +3214,10 @@ mod tests {
             Duration::from_secs(20),
             period,
         )?;
-        let config = AprsClientConfig::try_builder("N0CALL", 7)?
+        let config = AprsClientConfig::try_builder("N0CALL", 7, TncDataBand::A)?
             .igate_to_rf(policy)
             .build();
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
         let observed = Instant::now();
         hear_directly_on_rf(&mut client, "KQ4NIT", observed)?;
@@ -3201,10 +3241,10 @@ mod tests {
             period,
             period,
         )?;
-        let config = AprsClientConfig::try_builder("N0CALL", 7)?
+        let config = AprsClientConfig::try_builder("N0CALL", 7, TncDataBand::A)?
             .igate_to_rf(policy)
             .build();
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
         let observed = Instant::now();
         hear_directly_on_rf(&mut client, "KQ4NIT-9", observed)?;
@@ -3222,7 +3262,7 @@ mod tests {
 
     #[tokio::test]
     async fn packet_observations_update_full_identity_histories() -> TestResult {
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let mut client = AprsClient::start(radio, test_igate_config()?)
             .await
             .map_err(|(_, error)| error)?;
@@ -3267,7 +3307,7 @@ mod tests {
 
     #[tokio::test]
     async fn repeated_tcpip_marker_records_source_as_internet_heard() -> TestResult {
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let mut client = AprsClient::start(radio, test_igate_config()?)
             .await
             .map_err(|(_, error)| error)?;
@@ -3284,7 +3324,7 @@ mod tests {
 
     #[tokio::test]
     async fn acknowledgements_use_the_same_stateful_eligibility_rules() -> TestResult {
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let mut client = AprsClient::start(radio, test_igate_config()?)
             .await
             .map_err(|(_, error)| error)?;
@@ -3300,7 +3340,7 @@ mod tests {
 
     #[tokio::test]
     async fn gated_message_authorizes_exactly_the_next_associated_position() -> TestResult {
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let mut client = AprsClient::start(radio, test_igate_config()?)
             .await
             .map_err(|(_, error)| error)?;
@@ -3332,7 +3372,7 @@ mod tests {
     #[tokio::test]
     async fn associated_position_preserves_path_and_q_construct_blocks() -> TestResult {
         for blocked_path in ["NOGATE-1*", "RFONLY-AA", "TCPXX*", "qAX", "qAZ"] {
-            let radio = mock_radio(PacketDataRate::Bps1200);
+            let radio = mock_radio(TncDataBand::A);
             let mut client = AprsClient::start(radio, test_igate_config()?)
                 .await
                 .map_err(|(_, error)| error)?;
@@ -3358,7 +3398,7 @@ mod tests {
 
     #[tokio::test]
     async fn gate_from_is_wraps_in_third_party_header() -> TestResult {
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let config = test_igate_config()?;
         let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
 
@@ -3386,7 +3426,7 @@ mod tests {
         // structurally by inspecting the built packet's fields rather
         // than the encoded KISS bytes: fewer brittle assertions, same
         // protocol coverage.
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let config = test_igate_config()?;
         let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
 
@@ -3439,7 +3479,7 @@ mod tests {
 
     #[tokio::test]
     async fn gate_from_is_filters_position_report() -> TestResult {
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let config = test_igate_config()?;
         let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
 
@@ -3453,7 +3493,7 @@ mod tests {
 
     #[tokio::test]
     async fn gate_from_is_reports_malformed_input_instead_of_policy_rejection() -> TestResult {
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let config = test_igate_config()?;
         let mut client = AprsClient::start(radio, config)
             .await
@@ -3484,7 +3524,7 @@ mod tests {
 
     #[tokio::test]
     async fn gate_from_is_rejects_non_ascii_message_instead_of_lossy_conversion() -> TestResult {
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let config = test_igate_config()?;
         let mut client = AprsClient::start(radio, config)
             .await
@@ -3506,7 +3546,7 @@ mod tests {
         const INPUT_HEADER: &[u8] = b"W1AW>APK005,qAC,SRV";
         const RF_SOURCE_DESTINATION: &[u8] = b"W1AW>APK005";
 
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let config = test_igate_config()?;
         let mut client = AprsClient::start(radio, config)
             .await
@@ -3567,7 +3607,7 @@ mod tests {
 
     #[tokio::test]
     async fn next_event_position_received() -> TestResult {
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
         let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
 
@@ -3598,7 +3638,7 @@ mod tests {
 
     #[tokio::test]
     async fn next_event_weather_received() -> TestResult {
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
         let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
 
@@ -3650,8 +3690,8 @@ mod tests {
 
     #[tokio::test]
     async fn next_event_message_received() -> TestResult {
-        let radio = mock_radio(PacketDataRate::Bps1200);
-        let config = AprsClientConfig::try_builder("N0CALL", 7)?
+        let radio = mock_radio(TncDataBand::A);
+        let config = AprsClientConfig::try_builder("N0CALL", 7, TncDataBand::A)?
             .auto_ack(false)
             .build();
         let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
@@ -3675,7 +3715,7 @@ mod tests {
 
     #[tokio::test]
     async fn next_event_message_delivered() -> TestResult {
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
         let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
 
@@ -3711,7 +3751,7 @@ mod tests {
 
     #[tokio::test]
     async fn next_event_message_rejected() -> TestResult {
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
         let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
 
@@ -3747,7 +3787,7 @@ mod tests {
 
     #[tokio::test]
     async fn next_event_raw_packet_for_unknown_data() -> TestResult {
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
         let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
 
@@ -3773,7 +3813,7 @@ mod tests {
         // position report surfaces as a typed event (StationHeard /
         // PositionReceived), not RawPacket. `take_last_rf_packet` must still
         // hand back the underlying frame so the IGate can forward it.
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
         let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
 
@@ -3808,7 +3848,7 @@ mod tests {
     async fn idle_cycle_leaves_no_raw_frame_to_gate() -> TestResult {
         // An idle cycle (no frame received) must not leave a stale frame
         // that an IGate would re-gate against an unrelated event.
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
         let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
         let _idle_event = client.next_event().await?;
@@ -3827,7 +3867,7 @@ mod tests {
         // here because the underlying mock transport returns WouldBlock
         // immediately, which the session converts to a Timeout error,
         // which next_event maps to Ok(None) without ever sleeping.
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
         let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
         let event = client.next_event().await?;
@@ -3841,7 +3881,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_motion_first_call_triggers_beacon() -> TestResult {
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
         let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
 
@@ -3870,7 +3910,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_motion_second_call_no_beacon() -> TestResult {
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
         let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
 
@@ -3908,7 +3948,7 @@ mod tests {
 
     #[tokio::test]
     async fn beacon_position_mice_sends_expected_wire_bytes() -> TestResult {
-        let radio = mock_radio(PacketDataRate::Bps1200);
+        let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
         let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
 

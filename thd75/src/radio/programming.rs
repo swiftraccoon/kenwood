@@ -1290,6 +1290,33 @@ impl<T: Transport> Radio<T> {
     where
         F: FnMut(WritableMcpPage, &mut [u8; programming::PAGE_SIZE]),
     {
+        self.try_modify_memory_pages_detached_if_changed(pages, |page, data| {
+            modify(page, data);
+            Ok(())
+        })
+        .await
+    }
+
+    /// Fallible form of [`Self::modify_memory_pages_detached_if_changed`].
+    ///
+    /// Every requested page is read before `modify` is called. Every callback
+    /// must then succeed before the first write starts, so a live MCP
+    /// precondition can reject the transaction with zero writes while still
+    /// using the normal proved CAT cleanup path.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same structured entry, operation, and cleanup failures as
+    /// the infallible form. A callback error is an operation failure with empty
+    /// `possibly_written_pages` and `verified_written_pages`.
+    pub async fn try_modify_memory_pages_detached_if_changed<F>(
+        &mut self,
+        pages: &[WritableMcpPage],
+        mut modify: F,
+    ) -> Result<DetachedMcpPageUpdate, DetachedMcpPageUpdateError>
+    where
+        F: FnMut(WritableMcpPage, &mut [u8; programming::PAGE_SIZE]) -> Result<(), Error>,
+    {
         let pages: std::collections::BTreeSet<WritableMcpPage> = pages.iter().copied().collect();
 
         if pages.is_empty() {
@@ -1315,7 +1342,7 @@ impl<T: Transport> Radio<T> {
             }
 
             for (page, _, modified) in &mut page_data {
-                modify(*page, modified);
+                modify(*page, modified)?;
             }
 
             let mut changed = false;
@@ -2616,7 +2643,9 @@ mod tests {
     use crate::error::{Error, ProtocolError, TransportError};
     use crate::protocol::programming;
     use crate::protocol::{Command, Response};
-    use crate::radio::{CatState, LinkState, McpPhase, McpWireBoundary, Radio};
+    use crate::radio::{
+        BinaryProtocolProof, CatState, LinkState, McpPhase, McpWireBoundary, Radio,
+    };
     use crate::transport::{MockTransport, Transport};
     use crate::types::{
         Band, ChannelDisplayName, Frequency, MemoryChannelBand, MemoryGroup, RegularChannel,
@@ -2636,7 +2665,10 @@ mod tests {
 
     #[tokio::test]
     async fn programming_entry_rejects_untrusted_cat_boundaries_before_io() -> TestResult {
-        for cat_state in [CatState::RecoveryRequired, CatState::BinaryProven] {
+        for cat_state in [
+            CatState::RecoveryRequired,
+            CatState::BinaryProven(BinaryProtocolProof::Mmdvm { data_band: None }),
+        ] {
             let mut radio = Radio::new(MockTransport::new());
             radio.cat_state = cat_state;
 

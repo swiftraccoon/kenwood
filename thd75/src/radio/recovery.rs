@@ -83,7 +83,7 @@ impl<T: Transport> Radio<T> {
 
         match self.cat_state {
             CatState::Ready => Ok(()),
-            CatState::BinaryProven | CatState::RecoveryRequired => {
+            CatState::BinaryProven(_) | CatState::RecoveryRequired => {
                 self.restore_cat_after_mode_exit().await
             }
         }
@@ -95,10 +95,12 @@ impl<T: Transport> Radio<T> {
     /// [`MmdvmSession`](super::mmdvm_session::MmdvmSession) deliberately
     /// returns a recovery-required `Radio`: binary bytes may still be buffered
     /// after the mode-exit command succeeds. This method sends the universal
-    /// packet-mode exit preamble, requires a quiet line, and accepts only one
-    /// isolated exact `ID TH-D75\r` response. If that cannot prove CAT framing,
-    /// it closes and reopens the transport once, repeats the preamble, and
-    /// performs the same isolated proof.
+    /// read-only exact `ID TH-D75\r` fast path before any recovery write. Only
+    /// if that proof fails does it send the universal packet-mode exit preamble
+    /// and repeat the isolated identity proof. If the complete in-place attempt
+    /// fails, it closes and reopens the transport once and applies the same
+    /// proof-first policy. A normal KISS or MMDVM exit therefore retains its
+    /// exact TNC data band.
     ///
     /// Call this before reporting that an APRS, KISS, MMDVM, or D-STAR session
     /// has returned to CAT mode. A successful result proves the exact TH-D75
@@ -124,11 +126,7 @@ impl<T: Transport> Radio<T> {
         self.codec.clear();
         let _previous = self.link_state_tx.send_replace(LinkState::Down);
 
-        let in_place_result = async {
-            self.send_cat_recovery_preamble().await?;
-            self.prove_isolated_cat_identity().await
-        }
-        .await;
+        let in_place_result = self.prove_cat_or_recover_packet_mode().await;
         let in_place = match in_place_result {
             Ok(()) => {
                 self.finish_cat_recovery();
@@ -152,8 +150,7 @@ impl<T: Transport> Radio<T> {
             self.firmware_version = None;
             self.tuning_mode_a = None;
             self.tuning_mode_b = None;
-            self.send_cat_recovery_preamble().await?;
-            self.prove_isolated_cat_identity().await
+            self.prove_cat_or_recover_packet_mode().await
         }
         .await;
 
@@ -169,13 +166,13 @@ impl<T: Transport> Radio<T> {
         }
     }
 
-    async fn prove_isolated_cat_identity(&mut self) -> Result<(), Error> {
+    pub(super) async fn prove_isolated_cat_identity(&mut self) -> Result<(), Error> {
         self.require_strict_quiet().await?;
         self.strict_expect(b"ID\r", b"ID TH-D75\r").await?;
         self.require_strict_quiet().await
     }
 
-    fn finish_cat_recovery(&mut self) {
+    pub(super) fn finish_cat_recovery(&mut self) {
         // No await may appear between the exact proof and these transitions.
         self.codec.clear();
         self.desynced = false;
@@ -202,20 +199,22 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn proves_cat_in_place_without_reopening() -> TestResult {
+    async fn read_only_fast_path_preserves_band_b_without_reopening() -> TestResult {
         let mut transport = MockTransport::new();
-        expect_recovery_preamble(&mut transport);
         transport.expect(b"ID\r", b"ID TH-D75\r");
+        transport.expect(b"TN\r", b"TN 0,1\r");
         transport.pend_when_empty();
         let mut radio = Radio::new(transport);
         radio.desynced = true;
         radio.cat_state = CatState::RecoveryRequired;
 
         radio.recover_cat().await?;
+        let tnc = radio.get_tnc_mode().await?;
 
         assert!(!radio.desynced);
         assert_eq!(radio.cat_state, CatState::Ready);
         assert!(!radio.cat_recovery_required());
+        assert_eq!(tnc.data_band, crate::types::TncDataBand::B);
         radio.transport.assert_complete();
         Ok(())
     }
@@ -223,10 +222,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn reopens_once_when_the_in_place_identity_is_invalid() -> TestResult {
         let mut transport = MockTransport::new();
+        transport.expect(b"ID\r", b"ID OTHER\r");
         expect_recovery_preamble(&mut transport);
         transport.expect(b"ID\r", b"ID OTHER\r");
         transport.expect_reopen(Ok(()));
-        expect_recovery_preamble(&mut transport);
         transport.expect(b"ID\r", b"ID TH-D75\r");
         transport.pend_when_empty();
         let mut radio = Radio::new(transport);
@@ -246,6 +245,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn retains_both_failures_when_reopening_cannot_restore_cat() -> TestResult {
         let mut transport = MockTransport::new();
+        transport.expect(b"ID\r", b"ID OTHER\r");
         expect_recovery_preamble(&mut transport);
         transport.expect(b"ID\r", b"ID OTHER\r");
         transport.expect_reopen(Err(TransportError::ReopenUnsupported));
@@ -284,13 +284,14 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn cancellation_keeps_ordinary_cat_blocked() -> TestResult {
         let mut transport = MockTransport::new();
+        transport.expect(b"ID\r", b"ID OTHER\r");
         expect_recovery_preamble(&mut transport);
         transport.expect_partial_then_hang(b"ID\r", b"ID TH-");
         transport.pend_when_empty();
         let mut radio = Radio::new(transport);
 
         let cancelled = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(3),
             radio.restore_cat_after_mode_exit(),
         )
         .await;
@@ -300,6 +301,20 @@ mod tests {
             radio.identify().await,
             Err(Error::CatRecoveryRequired)
         ));
+        assert_eq!(
+            radio.transport.writes(),
+            &[
+                b"ID\r".to_vec(),
+                b"\r".to_vec(),
+                b"\r".to_vec(),
+                vec![0x03],
+                vec![0xC0, 0xFF, 0xC0],
+                b"\rTC 1\r".to_vec(),
+                b"TN 0,0\r".to_vec(),
+                b"ID\r".to_vec(),
+            ],
+            "cancellation must land only after the fallback identity exchange begins"
+        );
         radio.transport.assert_complete();
         Ok(())
     }
@@ -308,8 +323,11 @@ mod tests {
     async fn delayed_binary_residue_cannot_satisfy_the_identity_proof() -> TestResult {
         let mut transport = MockTransport::new();
         transport.queue_read_delayed(b"binary\rID TH-D75\r", 600);
+        transport.expect_hang(b"ID\r");
         expect_recovery_preamble(&mut transport);
+        transport.expect(b"ID\r", b"ID OTHER\r");
         transport.expect_reopen(Ok(()));
+        transport.expect(b"ID\r", b"N\r");
         expect_recovery_preamble(&mut transport);
         transport.expect_hang(b"ID\r");
         transport.pend_when_empty();

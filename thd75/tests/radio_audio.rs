@@ -46,10 +46,7 @@ async fn get_tnc_mode() -> TestResult {
     let mut radio = Radio::new(mock);
     let state = radio.get_tnc_mode().await?;
     assert_eq!(state.mode, kenwood_thd75::types::TncMode::Off);
-    assert_eq!(
-        state.data_rate,
-        kenwood_thd75::types::PacketDataRate::Bps1200
-    );
+    assert_eq!(state.data_band, kenwood_thd75::types::TncDataBand::A);
     Ok(())
 }
 

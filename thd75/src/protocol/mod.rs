@@ -41,7 +41,7 @@ use crate::types::{
     Frequency, GpsRadioMode, GpsSettings, MemoryChannelAddress, MemoryReadOffset,
     MyPositionSelection, NmeaSentence, NmeaSentences, OperatingMode, PacketDataRate, PowerLevel,
     RadioClock, RadioModel, RadioType, ReadLen, SMeterReading, SerialInformation, SquelchLevel,
-    StepSize, TncMode, TuningMode, UsbAudioOutput, VoxDelay, VoxGain,
+    StepSize, TncDataBand, TncMode, TuningMode, UsbAudioOutput, VoxDelay, VoxGain,
 };
 
 /// A typed CAT wire command.
@@ -359,26 +359,28 @@ pub enum Command {
     // === TNC / D-STAR / Clock (TN, DC, RT) ===
     /// Get TNC mode (TN bare read).
     ///
-    /// Hardware-verified: bare `TN\r` returns `TN mode,data-rate`.
+    /// Hardware-verified: bare `TN\r` returns `TN mode,data-band`.
     /// Band-indexed `TN band\r` returns `?` (rejected).
     ///
     /// Hardware readback confirms that TN returns TNC mode data (for example,
     /// `TN 0,0`).
     ///
-    /// Valid mode values: 0, 1, 2, 3.
-    /// Mode 3 may correspond to MMDVM or Reflector Terminal mode.
+    /// The official TH-D75 grammar defines modes 0 through 2. Firmware
+    /// 1.03.AZM adds exact mode 3 for MMDVM/Reflector Terminal operation;
+    /// its second field remains the typed TNC data band.
     GetTncMode,
     /// Set TNC mode (TN write).
     ///
-    /// Wire format: `TN mode,data_rate\r`.
+    /// Wire format: `TN mode,data_band\r`.
     ///
-    /// Valid mode values: 0, 1, 2, 3.
-    /// Mode 3 may correspond to MMDVM or Reflector Terminal mode.
+    /// The official TH-D75 grammar defines modes 0 through 2. Firmware
+    /// 1.03.AZM adds exact mode 3 for MMDVM/Reflector Terminal operation;
+    /// its second field remains the typed TNC data band.
     SetTncMode {
         /// TNC operating mode (APRS/NAVITRA/KISS/MMDVM).
         mode: TncMode,
-        /// Packet-data rate.
-        data_rate: PacketDataRate,
+        /// TNC data band.
+        data_band: TncDataBand,
     },
     /// Get D-STAR callsign data for a slot (DC read).
     ///
@@ -774,16 +776,17 @@ pub enum Response {
     // === TNC / D-STAR / Clock ===
     /// TNC mode response (TN).
     ///
-    /// Hardware-verified: bare `TN\r` returns `TN mode,data_rate`.
+    /// Hardware-verified: bare `TN\r` returns `TN mode,data_band`.
     /// Example: `TN 0,0`.
     ///
-    /// Valid mode values: 0, 1, 2, 3.
-    /// Mode 3 may correspond to MMDVM or Reflector Terminal mode.
+    /// The official TH-D75 grammar defines modes 0 through 2. Firmware
+    /// 1.03.AZM adds exact mode 3 for MMDVM/Reflector Terminal operation;
+    /// its second field remains the typed TNC data band.
     TncMode {
         /// TNC operating mode.
         mode: TncMode,
-        /// Packet-data rate.
-        data_rate: PacketDataRate,
+        /// TNC data band.
+        data_band: TncDataBand,
     },
     /// D-STAR callsign data response (DC).
     ///
@@ -1095,8 +1098,8 @@ pub fn serialize(cmd: &Command) -> Vec<u8> {
         }
         // TNC / D-STAR / Clock
         Command::GetTncMode => "TN".to_owned(),
-        Command::SetTncMode { mode, data_rate } => {
-            format!("TN {},{}", u8::from(*mode), u8::from(*data_rate))
+        Command::SetTncMode { mode, data_band } => {
+            format!("TN {},{}", u8::from(*mode), u8::from(*data_band))
         }
         Command::GetDstarCallsign { slot } => format!("DC {}", slot.as_raw()),
         Command::SetDstarCallsign {
@@ -1374,7 +1377,7 @@ mod tests {
     fn serialize_set_tnc_mode() {
         let bytes = serialize(&Command::SetTncMode {
             mode: TncMode::Mmdvm,
-            data_rate: PacketDataRate::Bps1200,
+            data_band: TncDataBand::A,
         });
         assert_eq!(bytes, b"TN 3,0\r");
     }

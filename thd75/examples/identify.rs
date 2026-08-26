@@ -92,7 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Power:    {}", if power { "ON" } else { "OFF" });
 
     let tnc = radio.get_tnc_mode().await?;
-    println!("TNC:      {} ({})", tnc.mode, tnc.data_rate);
+    println!("TNC:      {} ({})", tnc.mode, tnc.data_band);
 
     let gps_settings = radio.get_gps_settings().await?;
     println!(

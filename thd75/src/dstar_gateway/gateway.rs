@@ -39,7 +39,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use kenwood_thd75::types::DstarCallsign;
+//! use kenwood_thd75::types::{DstarCallsign, TncDataBand};
 //! use kenwood_thd75::{DstarGateway, DstarGatewayConfig, Radio};
 //! use kenwood_thd75::transport::SerialTransport;
 //!
@@ -47,7 +47,7 @@
 //! let transport = SerialTransport::open("/dev/cu.usbmodem1234")?;
 //! let radio = Radio::new(transport);
 //!
-//! let config = DstarGatewayConfig::new(DstarCallsign::new("N0CALL")?);
+//! let config = DstarGatewayConfig::new(DstarCallsign::new("N0CALL")?, TncDataBand::B);
 //! let mut gw = DstarGateway::start(radio, config).await.map_err(|(_, e)| e)?;
 //!
 //! for _ in 0..10 {
@@ -104,7 +104,7 @@ use crate::radio::mmdvm_session::{
 use crate::radio::{DesyncedRadio, Radio};
 use crate::transport::{MmdvmTransportAdapter, Transport};
 use crate::types::dstar::UrCallAction;
-use crate::types::{DstarCallsign, DstarSuffix, PacketDataRate};
+use crate::types::{DstarCallsign, DstarSuffix, TncDataBand};
 
 /// Default receive timeout for `next_event` polling (500 ms).
 ///
@@ -145,9 +145,8 @@ pub struct DstarGatewayConfig {
     /// Validated MY suffix, space-padded when encoded on the wire.
     /// Default: empty.
     pub suffix: DstarSuffix,
-    /// Packet data rate for MMDVM mode. Default: 9600 bps (GMSK, the
-    /// standard D-STAR data rate).
-    pub data_rate: PacketDataRate,
+    /// Caller-selected TNC data band used while entering MMDVM mode.
+    pub data_band: TncDataBand,
     /// Maximum last-heard entries to keep. Oldest entries are evicted
     /// when this limit is reached. Default: 100.
     pub max_last_heard: usize,
@@ -157,14 +156,13 @@ impl DstarGatewayConfig {
     /// Create a new configuration with sensible defaults.
     ///
     /// - Suffix: empty (encoded as four spaces)
-    /// - Baud: 9600 bps (GMSK, standard for D-STAR voice)
     /// - Max last-heard: 100 entries
     #[must_use]
-    pub fn new(callsign: DstarCallsign) -> Self {
+    pub fn new(callsign: DstarCallsign, data_band: TncDataBand) -> Self {
         Self {
             callsign,
             suffix: DstarSuffix::default(),
-            data_rate: PacketDataRate::Bps9600,
+            data_band,
             max_last_heard: DEFAULT_MAX_LAST_HEARD,
         }
     }
@@ -510,7 +508,7 @@ impl<T: Transport + Unpin + 'static> DstarGateway<T> {
         radio: Radio<T>,
         config: DstarGatewayConfig,
     ) -> Result<Self, (Option<Radio<T>>, Error)> {
-        let session = match radio.enter_mmdvm(config.data_rate).await {
+        let session = match radio.enter_mmdvm(config.data_band).await {
             Ok(s) => s,
             Err((radio, e)) => return Err((Some(radio), e)),
         };
@@ -653,7 +651,7 @@ impl<T: Transport + Unpin + 'static> DstarGateway<T, PersistentMmdvm> {
     /// Stop the gateway while preserving persistent MMDVM mode.
     ///
     /// The modem and transport pumps are shut down cleanly, but no ASCII
-    /// `TN 0,0` command is sent because Reflector Terminal Mode is controlled
+    /// transient `TN 0,x` command is sent because Reflector Terminal Mode is controlled
     /// by Menu 650 rather than the transient TNC mode. The returned [`Radio`]
     /// remains positively identified as a binary MMDVM link and can be passed
     /// to [`Self::start_gateway_mode`] again.
@@ -1531,10 +1529,13 @@ mod tests {
     use super::*;
     use crate::radio::Radio;
     use crate::transport::MockTransport;
-    use crate::types::PacketDataRate;
+    use crate::types::TncDataBand;
 
     fn test_config() -> Result<DstarGatewayConfig, BoxTestErr> {
-        Ok(DstarGatewayConfig::new(DstarCallsign::new("N0CALL")?))
+        Ok(DstarGatewayConfig::new(
+            DstarCallsign::new("N0CALL")?,
+            TncDataBand::B,
+        ))
     }
 
     fn test_header(my_call: &str, ur_call: [u8; 8]) -> Result<DstarHeader, BoxTestErr> {
@@ -1558,10 +1559,10 @@ mod tests {
 
     #[test]
     fn config_defaults() -> Result<(), BoxTestErr> {
-        let config = DstarGatewayConfig::new(DstarCallsign::new("W1AW")?);
+        let config = DstarGatewayConfig::new(DstarCallsign::new("W1AW")?, TncDataBand::B);
         assert_eq!(config.callsign.as_str(), "W1AW");
         assert_eq!(config.suffix, DstarSuffix::default());
-        assert_eq!(config.data_rate, PacketDataRate::Bps9600);
+        assert_eq!(config.data_band, TncDataBand::B);
         assert_eq!(config.max_last_heard, 100);
         Ok(())
     }
@@ -1576,7 +1577,7 @@ mod tests {
 
     #[test]
     fn config_identity_converts_to_exact_wire_widths() -> Result<(), BoxTestErr> {
-        let mut config = DstarGatewayConfig::new(DstarCallsign::new("W1AW")?);
+        let mut config = DstarGatewayConfig::new(DstarCallsign::new("W1AW")?, TncDataBand::B);
         config.suffix = DstarSuffix::new("/P")?;
 
         assert_eq!(config.callsign.to_wire_bytes(), *b"W1AW    ");
@@ -1782,7 +1783,7 @@ mod tests {
         // The pump reads continuously, so pend instead of erroring when
         // the script runs dry.
         mock.pend_when_empty();
-        // enter_mmdvm's TN 3,1 response (Bps9600 default for D-STAR).
+        // enter_mmdvm's TN 3,1 response (firmware-extension mode 3, Band B).
         mock.queue_read(b"TN 3,1\r");
         // ACK for SetConfig (0x02), then for SetMode (0x03). The
         // SetMode ACK is delayed so it lands after set_mode's write
@@ -1794,7 +1795,7 @@ mod tests {
         }
 
         let radio = Radio::new(mock);
-        let config = DstarGatewayConfig::new(DstarCallsign::new("N0CALL")?);
+        let config = DstarGatewayConfig::new(DstarCallsign::new("N0CALL")?, TncDataBand::B);
         DstarGateway::start(radio, config)
             .await
             .map_err(|(_, e)| -> BoxTestErr { format!("gateway start failed: {e}").into() })
@@ -1810,7 +1811,10 @@ mod tests {
         mock.queue_read_delayed(&[0xE0, 4, 0x70, 0x03], 150);
 
         let mut radio = Radio::new(mock);
-        radio.cat_state = crate::radio::CatState::BinaryProven;
+        radio.cat_state =
+            crate::radio::CatState::BinaryProven(crate::radio::BinaryProtocolProof::Mmdvm {
+                data_band: None,
+            });
         DstarGateway::start_gateway_mode(radio, test_config()?)
             .await
             .map_err(|(_, error)| -> BoxTestErr {
@@ -1845,11 +1849,13 @@ mod tests {
                 mock.pend_when_empty();
                 // Reject SetConfig after it reaches the modem loop. The
                 // persistent-mode rollback must reclaim this exact binary
-                // transport and must not issue the CAT-side `TN 0,0` exit.
+                // transport and must not issue a CAT-side transient `TN 0,x` exit.
                 mock.queue_read_delayed(&[0xE0, 5, 0x7F, MMDVM_SET_CONFIG, 4], 20);
 
                 let mut radio = Radio::new(mock);
-                radio.cat_state = crate::radio::CatState::BinaryProven;
+                radio.cat_state = crate::radio::CatState::BinaryProven(
+                    crate::radio::BinaryProtocolProof::Mmdvm { data_band: None },
+                );
                 let Err((Some(radio), error)) =
                     DstarGateway::start_gateway_mode(radio, test_config()?).await
                 else {
@@ -1857,7 +1863,12 @@ mod tests {
                 };
 
                 assert!(matches!(error, Error::Protocol(_)));
-                assert_eq!(radio.cat_state, crate::radio::CatState::BinaryProven);
+                assert_eq!(
+                    radio.cat_state,
+                    crate::radio::CatState::BinaryProven(
+                        crate::radio::BinaryProtocolProof::Mmdvm { data_band: None },
+                    )
+                );
 
                 // Typed conversion is the public safety proof that a caller
                 // can retry D-STAR init without reconnecting or sending CAT.
@@ -1879,14 +1890,16 @@ mod tests {
                 .transport
                 .writes()
                 .iter()
-                .any(|write| write == b"TN 0,0\r"),
+                .any(|write| write == b"TN 0,1\r"),
             "a CAT-entered MMDVM session must issue its qualified transient exit"
         );
 
         let persistent = started_persistent_gateway().await?.stop().await?;
         assert_eq!(
             persistent.cat_state,
-            crate::radio::CatState::BinaryProven,
+            crate::radio::CatState::BinaryProven(crate::radio::BinaryProtocolProof::Mmdvm {
+                data_band: None
+            }),
             "stopping Reflector Terminal Mode must preserve binary-link proof"
         );
         assert!(
@@ -1894,7 +1907,7 @@ mod tests {
                 .transport
                 .writes()
                 .iter()
-                .all(|write| write != b"TN 0,0\r"),
+                .all(|write| write != b"TN 0,0\r" && write != b"TN 0,1\r"),
             "persistent MMDVM must never receive the transient ASCII exit"
         );
         persistent.transport.assert_complete();

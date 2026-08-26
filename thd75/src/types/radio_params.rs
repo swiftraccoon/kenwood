@@ -620,7 +620,8 @@ impl fmt::Display for VoxDelay {
 // PacketDataRate
 // ---------------------------------------------------------------------------
 
-/// Packet-data rate shared by APRS, KISS, and MMDVM operation.
+/// Packet-data rate used by the radio's APRS settings and KISS hardware
+/// command.
 ///
 /// The CAT and stored APRS encodings both use `0` for 1200 bps and `1` for
 /// 9600 bps.
@@ -1084,9 +1085,10 @@ impl From<DvGatewayMode> for u8 {
 /// TNC operating mode.
 ///
 /// Controls the built-in TNC's protocol mode. Used by the `TN` CAT command.
-/// The second field of TN is the data speed (0=1200, 1=9600).
+/// The second field of TN is the TNC data band (0=A, 1=B).
 ///
-/// The four established values cover ordinary CAT, APRS, KISS, and
+/// The official TH-D75 grammar establishes values 0 through 2 for ordinary
+/// CAT, APRS, and KISS. Firmware 1.03.AZM adds exact value 3 for
 /// MMDVM/Reflector Terminal operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TncMode {
@@ -1099,13 +1101,13 @@ pub enum TncMode {
     /// The display shows "APRS 12" (or "APRS 96" at 9600 bps).
     Aprs = 1,
     /// KISS mode: PC-based packet via KISS protocol (index 2).
-    /// Enter with `TN 2,0` (1200 bps) or `TN 2,1` (9600 bps); the
-    /// display shows "KISS 12" / "KISS 96".
+    /// Enter with `TN 2,0` (Band A) or `TN 2,1` (Band B). Packet speed is
+    /// selected separately with `AS` or KISS Set Hardware.
     /// See Operating Tips §2.7, User Manual Chapter 15.
     /// The built-in TNC has 4 KB TX and RX buffers and supports only
     /// KISS mode (no Command mode or Converse mode).
     Kiss = 2,
-    /// MMDVM/Reflector Terminal mode: D-STAR reflector access (index 3).
+    /// Firmware 1.03.AZM MMDVM/Reflector Terminal extension (index 3).
     /// Uses MMDVM serial commands via USB or Bluetooth.
     /// See Operating Tips §4.5.
     Mmdvm = 3,
@@ -1174,13 +1176,13 @@ impl From<TncControlMode> for TncMode {
     }
 }
 
-/// Current TNC mode and packet data rate returned by the `TN` command.
+/// Current TNC mode and data band returned by the `TN` command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TncState {
     /// Current TNC operating mode.
     pub mode: TncMode,
-    /// Current packet data rate.
-    pub data_rate: PacketDataRate,
+    /// Current TNC data band.
+    pub data_band: crate::types::TncDataBand,
 }
 
 // ---------------------------------------------------------------------------

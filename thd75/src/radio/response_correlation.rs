@@ -267,12 +267,12 @@ pub(super) fn correlate(command: &Command, response: &Response) -> ResponseCorre
 
         // TNC, D-STAR, and clock
         Command::GetTncMode => exact_if(matches!(response, Response::TncMode { .. })),
-        Command::SetTncMode { mode, data_rate } => exact_if(matches!(
+        Command::SetTncMode { mode, data_band } => exact_if(matches!(
             response,
             Response::TncMode {
                 mode: response_mode,
-                data_rate: response_data_rate,
-            } if response_mode == mode && response_data_rate == data_rate
+                data_band: response_data_band,
+            } if response_mode == mode && response_data_band == data_band
         )),
         Command::GetDstarCallsign { slot } => exact_if(matches!(
             response,

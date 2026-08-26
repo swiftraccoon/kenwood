@@ -81,7 +81,7 @@ pub struct AprsSettings {
     /// APRS packet-data rate (1200 or 9600 bps).
     pub data_rate: PacketDataRate,
     /// Band used for APRS data transmission.
-    pub data_band: AprsBand,
+    pub data_band: TncDataBand,
     /// DCD (Data Carrier Detect) sense mode.
     pub dcd_sense: DcdSense,
     /// TX delay before packet transmission (Menu No. 508).
@@ -339,16 +339,19 @@ impl AprsSymbolCode {
 // Data band / DCD
 // ---------------------------------------------------------------------------
 
-/// Band used for APRS data transmission and reception.
+/// Data band selected by the `TN` TNC-mode command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum AprsBand {
+pub enum TncDataBand {
     /// Band A only.
     A,
     /// Band B only.
     B,
 }
 
-impl AprsBand {
+impl TncDataBand {
+    /// Number of valid wire values in the closed A/B domain.
+    pub const COUNT: u8 = 2;
+
     /// Returns the documented Menu No. 506 factory choice.
     #[must_use]
     pub const fn factory_default() -> Self {
@@ -356,7 +359,16 @@ impl AprsBand {
     }
 }
 
-impl TryFrom<u8> for AprsBand {
+impl fmt::Display for TncDataBand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::A => "Band A",
+            Self::B => "Band B",
+        })
+    }
+}
+
+impl TryFrom<u8> for TncDataBand {
     type Error = ValidationError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
@@ -364,7 +376,7 @@ impl TryFrom<u8> for AprsBand {
             0 => Ok(Self::A),
             1 => Ok(Self::B),
             _ => Err(ValidationError::SettingOutOfRange {
-                name: "APRS data band",
+                name: "TNC data band",
                 value,
                 detail: "must be 0 (Band A) or 1 (Band B)",
             }),
@@ -372,11 +384,11 @@ impl TryFrom<u8> for AprsBand {
     }
 }
 
-impl From<AprsBand> for u8 {
-    fn from(value: AprsBand) -> Self {
+impl From<TncDataBand> for u8 {
+    fn from(value: TncDataBand) -> Self {
         match value {
-            AprsBand::A => 0,
-            AprsBand::B => 1,
+            TncDataBand::A => 0,
+            TncDataBand::B => 1,
         }
     }
 }
@@ -4081,7 +4093,7 @@ mod tests {
 
     #[test]
     fn menu_enum_domains_round_trip_exact_schema_values() -> TestResult {
-        assert_eq!(AprsBand::factory_default(), AprsBand::A);
+        assert_eq!(TncDataBand::factory_default(), TncDataBand::A);
         assert_eq!(DcdSense::factory_default(), DcdSense::Busy);
         assert_eq!(StatusTextSlot::factory_default().as_raw(), 0);
         let voice_alert = VoiceAlertSettings::factory_default();
@@ -4089,10 +4101,10 @@ mod tests {
         assert_eq!(voice_alert.tone_code(), ToneCode::TONE_100HZ);
 
         for raw in 0..=1 {
-            let band = AprsBand::try_from(raw)?;
+            let band = TncDataBand::try_from(raw)?;
             assert_eq!(u8::from(band), raw);
         }
-        assert!(AprsBand::try_from(2).is_err());
+        assert!(TncDataBand::try_from(2).is_err());
 
         for raw in 0..=2 {
             let sense = DcdSense::try_from(raw)?;

@@ -431,7 +431,11 @@ fn vox_delay_boundary() {
 
 #[test]
 fn packet_data_rate_boundary() {
-    assert_eq!(PacketDataRate::COUNT, 2, "CAT TN/AS domain is 0-1");
+    assert_eq!(
+        PacketDataRate::COUNT,
+        2,
+        "AS and KISS hardware-rate domain is 0-1"
+    );
     assert!(
         PacketDataRate::try_from(PacketDataRate::COUNT - 1).is_ok(),
         "1 is max"
@@ -440,6 +444,15 @@ fn packet_data_rate_boundary() {
         PacketDataRate::try_from(PacketDataRate::COUNT).is_err(),
         "2 must be rejected"
     );
+}
+
+#[test]
+fn tnc_data_band_boundary() {
+    assert_eq!(TncDataBand::COUNT, 2, "TN data-band domain is 0-1");
+    assert!(matches!(TncDataBand::try_from(0), Ok(TncDataBand::A)));
+    assert!(matches!(TncDataBand::try_from(1), Ok(TncDataBand::B)));
+    assert!(TncDataBand::try_from(2).is_err(), "raw 2 must fail closed");
+    assert!(TncDataBand::try_from(3).is_err(), "raw 3 must fail closed");
 }
 
 #[test]

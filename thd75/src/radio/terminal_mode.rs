@@ -35,7 +35,7 @@ use crate::protocol::programming::{self, WritableMcpPage};
 use crate::radio::diagnostics::LinkDiagnosis;
 use crate::radio::programming::DetachedMcpPageUpdate;
 use crate::transport::Transport;
-use crate::types::{DvGatewayMode, PcOutputInterface};
+use crate::types::{DvGatewayMode, PcOutputInterface, TncDataBand};
 
 use super::Radio;
 
@@ -44,6 +44,18 @@ const GATEWAY_MODE_FIELD_NAME: &str = "dv.DvGatewayModeDvGateway";
 
 /// Generated registry name of Menu 985's DV Gateway interface field.
 const GATEWAY_INTERFACE_FIELD_NAME: &str = "radio.DvGatewayInterface";
+
+/// Generated registry name of Menu 983's KISS interface field.
+const KISS_INTERFACE_FIELD_NAME: &str = "radio.KissModeInterface";
+
+/// Generated registry name of Menu 506's TNC data-band field.
+const TNC_DATA_BAND_FIELD_NAME: &str = "aprs.TncDataBand";
+
+/// MCP offset of Menu 983's KISS interface byte.
+const KISS_INTERFACE_OFFSET: usize = 0x1090;
+
+/// MCP offset of Menu 506's TNC data-band byte.
+const TNC_DATA_BAND_OFFSET: usize = 0x120B;
 
 /// MCP offset of Menu 985's DV Gateway interface byte.
 const GATEWAY_INTERFACE_OFFSET: usize = 0x1093;
@@ -76,6 +88,36 @@ const GATEWAY_INTERFACE_PAGE: u16 = (GATEWAY_INTERFACE_OFFSET / programming::PAG
 
 /// Byte index of the Menu 985 interface value within its page.
 const GATEWAY_INTERFACE_BYTE: usize = GATEWAY_INTERFACE_OFFSET % programming::PAGE_SIZE;
+
+/// MCP page containing the Menu 983 KISS interface byte.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "KISS_INTERFACE_OFFSET / PAGE_SIZE is 0x10 and the registry pin test keeps the offset inside the image"
+)]
+const KISS_INTERFACE_PAGE: u16 = (KISS_INTERFACE_OFFSET / programming::PAGE_SIZE) as u16;
+
+/// Byte index of Menu 983 within its page.
+const KISS_INTERFACE_BYTE: usize = KISS_INTERFACE_OFFSET % programming::PAGE_SIZE;
+
+/// MCP page containing the Menu 506 TNC data-band byte.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "TNC_DATA_BAND_OFFSET / PAGE_SIZE is 0x12 and the registry pin test keeps the offset inside the image"
+)]
+const TNC_DATA_BAND_PAGE: u16 = (TNC_DATA_BAND_OFFSET / programming::PAGE_SIZE) as u16;
+
+/// Byte index of Menu 506 within its page.
+const TNC_DATA_BAND_BYTE: usize = TNC_DATA_BAND_OFFSET % programming::PAGE_SIZE;
+
+/// Same-session proof produced while conditionally disabling DV Gateway for
+/// an APRS retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AprsCurrentModeRecoveryUpdate {
+    /// Whether Menu 650 changed or was already Off.
+    pub update: DetachedMcpPageUpdate,
+    /// Strict Menu 506 A/B value read before any write.
+    pub data_band: TncDataBand,
+}
 
 /// Why a terminal-mode transition policy could not be constructed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -250,6 +292,93 @@ impl<T: Transport> Radio<T> {
         .map_err(Error::from)
     }
 
+    /// Prove live Menu 983 routing and strict Menu 506 TNC band, then
+    /// conditionally disable DV Gateway in one MCP transaction.
+    ///
+    /// The exact schema is proved before MCP entry. The Menu 983, Menu 506, and
+    /// Menu 650 pages are all read before preconditions are evaluated or any
+    /// write can start. A route mismatch or invalid Menu 506 value exits with
+    /// zero writes; a valid match changes only Menu 650 when it is not already
+    /// Off.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::KissInterfaceMismatch`] or
+    /// [`Error::InvalidTncDataBand`] (wrapped by the detached MCP operation
+    /// error) after a zero-write cleanup, plus schema and MCP failures.
+    pub async fn disable_dv_gateway_for_kiss_interface_detached(
+        &mut self,
+        expected_interface: PcOutputInterface,
+    ) -> Result<AprsCurrentModeRecoveryUpdate, Error> {
+        self.verify_mcp_schema_target().await?;
+        self.disable_dv_gateway_for_kiss_interface_detached_unverified(expected_interface)
+            .await
+    }
+
+    /// Same-session Menu 983/Menu 506 proof and conditional Menu 650 disable
+    /// after the caller has already proved the exact MCP schema target.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed route mismatch with zero writes, or a detached MCP
+    /// operation/cleanup failure.
+    pub async fn disable_dv_gateway_for_kiss_interface_detached_unverified(
+        &mut self,
+        expected_interface: PcOutputInterface,
+    ) -> Result<AprsCurrentModeRecoveryUpdate, Error> {
+        tracing::info!(
+            interface_field = KISS_INTERFACE_FIELD_NAME,
+            interface_offset = KISS_INTERFACE_OFFSET,
+            expected_interface = %expected_interface,
+            data_band_field = TNC_DATA_BAND_FIELD_NAME,
+            data_band_offset = TNC_DATA_BAND_OFFSET,
+            mode_field = GATEWAY_MODE_FIELD_NAME,
+            mode_offset = GATEWAY_MODE_OFFSET,
+            "proving KISS routing before disabling DV Gateway"
+        );
+        let interface_page = WritableMcpPage::new(KISS_INTERFACE_PAGE)?;
+        let data_band_page = WritableMcpPage::new(TNC_DATA_BAND_PAGE)?;
+        let mode_page = WritableMcpPage::new(GATEWAY_MODE_PAGE)?;
+        let expected_raw = u8::from(expected_interface);
+        let mut proved_data_band = None;
+        let off = u8::from(DvGatewayMode::Off);
+        let update = self
+            .try_modify_memory_pages_detached_if_changed(
+                &[interface_page, data_band_page, mode_page],
+                |page, data| match page.as_raw() {
+                    KISS_INTERFACE_PAGE => {
+                        let actual = data[KISS_INTERFACE_BYTE];
+                        if actual == expected_raw {
+                            Ok(())
+                        } else {
+                            Err(Error::KissInterfaceMismatch {
+                                expected: expected_interface,
+                                actual,
+                            })
+                        }
+                    }
+                    TNC_DATA_BAND_PAGE => {
+                        let actual = data[TNC_DATA_BAND_BYTE];
+                        let data_band = TncDataBand::try_from(actual)
+                            .map_err(|_error| Error::InvalidTncDataBand { actual })?;
+                        proved_data_band = Some(data_band);
+                        Ok(())
+                    }
+                    GATEWAY_MODE_PAGE => {
+                        data[GATEWAY_MODE_BYTE] = off;
+                        Ok(())
+                    }
+                    _ => unreachable!("only Menu 983, Menu 506, and Menu 650 pages were requested"),
+                },
+            )
+            .await
+            .map_err(Error::from)?;
+        let Some(data_band) = proved_data_band else {
+            unreachable!("the requested Menu 506 page must run its callback before success")
+        };
+        Ok(AprsCurrentModeRecoveryUpdate { update, data_band })
+    }
+
     /// Put the radio into Reflector Terminal Mode and prove its link speaks
     /// MMDVM.
     ///
@@ -397,7 +526,7 @@ mod tests {
     const PROBE: [u8; 3] = [MMDVM_FRAME_START, 0x03, MMDVM_GET_VERSION];
 
     #[test]
-    fn registry_pins_both_terminal_mode_offsets() -> TestResult {
+    fn registry_pins_terminal_and_kiss_interface_offsets() -> TestResult {
         let mode_field = menu_field(GATEWAY_MODE_FIELD_NAME)
             .ok_or("the generated registry must contain the DV gateway mode field")?;
         assert_eq!(
@@ -409,6 +538,18 @@ mod tests {
         assert_eq!(
             interface_field.descriptor.offset, GATEWAY_INTERFACE_OFFSET,
             "the local interface offset must match the generated registry"
+        );
+        let kiss_interface_field = menu_field(KISS_INTERFACE_FIELD_NAME)
+            .ok_or("the generated registry must contain the KISS interface field")?;
+        assert_eq!(
+            kiss_interface_field.descriptor.offset, KISS_INTERFACE_OFFSET,
+            "the local KISS interface offset must match the generated registry"
+        );
+        let data_band_field = menu_field(TNC_DATA_BAND_FIELD_NAME)
+            .ok_or("the generated registry must contain the TNC data-band field")?;
+        assert_eq!(
+            data_band_field.descriptor.offset, TNC_DATA_BAND_OFFSET,
+            "the local TNC data-band offset must match the generated registry"
         );
         Ok(())
     }
@@ -625,6 +766,190 @@ mod tests {
         assert!(
             matches!(update, DetachedMcpPageUpdate::UnchangedCatReady),
             "the unverified setter must go straight to MCP: {update:?}"
+        );
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn kiss_route_mismatch_exits_cat_ready_with_zero_writes() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(programming::ENTER_PROGRAMMING, programming::ENTER_RESPONSE);
+        let kiss_page = programming::McpPage::new(KISS_INTERFACE_PAGE)?;
+        let mut interface = [0_u8; programming::PAGE_SIZE];
+        interface[KISS_INTERFACE_BYTE] = u8::from(PcOutputInterface::Usb);
+        let interface_read = programming::build_read_command(kiss_page);
+        mock.expect(
+            &interface_read,
+            &build_w_response(KISS_INTERFACE_PAGE, &interface),
+        );
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+        let mut data_band = [0_u8; programming::PAGE_SIZE];
+        data_band[TNC_DATA_BAND_BYTE] = u8::from(TncDataBand::A);
+        let data_band_read =
+            programming::build_read_command(programming::McpPage::new(TNC_DATA_BAND_PAGE)?);
+        mock.expect(
+            &data_band_read,
+            &build_w_response(TNC_DATA_BAND_PAGE, &data_band),
+        );
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+        let mode_page = programming::McpPage::new(GATEWAY_MODE_PAGE)?;
+        let mut mode = [0_u8; programming::PAGE_SIZE];
+        mode[GATEWAY_MODE_BYTE] = u8::from(DvGatewayMode::ReflectorTerminal);
+        let mode_read = programming::build_read_command(mode_page);
+        mock.expect(&mode_read, &build_w_response(GATEWAY_MODE_PAGE, &mode));
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+        mock.expect(&[programming::EXIT], &[programming::ACK]);
+        mock.expect_reopen(Ok(()));
+        mock.expect(b"ID\r", b"ID TH-D75\r");
+        let mut radio = Radio::new(mock);
+
+        let result = radio
+            .disable_dv_gateway_for_kiss_interface_detached_unverified(PcOutputInterface::Bluetooth)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(Error::DetachedMcpPageUpdate(
+                crate::radio::programming::DetachedMcpPageUpdateError::Operation {
+                    possibly_written_pages,
+                    verified_written_pages,
+                    source,
+                }
+            )) if possibly_written_pages.is_empty()
+                && verified_written_pages.is_empty()
+                && matches!(
+                    *source,
+                    Error::KissInterfaceMismatch {
+                        expected: PcOutputInterface::Bluetooth,
+                        actual: 0,
+                    }
+                )
+        ));
+        assert!(!radio.cat_recovery_required());
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_tnc_data_band_exits_cat_ready_with_zero_writes() -> TestResult {
+        for invalid_band in [2_u8, 3_u8] {
+            let mut mock = MockTransport::new();
+            mock.expect(programming::ENTER_PROGRAMMING, programming::ENTER_RESPONSE);
+            let mut interface = [0_u8; programming::PAGE_SIZE];
+            interface[KISS_INTERFACE_BYTE] = u8::from(PcOutputInterface::Bluetooth);
+            let interface_read =
+                programming::build_read_command(programming::McpPage::new(KISS_INTERFACE_PAGE)?);
+            mock.expect(
+                &interface_read,
+                &build_w_response(KISS_INTERFACE_PAGE, &interface),
+            );
+            mock.expect(&[programming::ACK], &[programming::ACK]);
+            let mut data_band = [0_u8; programming::PAGE_SIZE];
+            data_band[TNC_DATA_BAND_BYTE] = invalid_band;
+            let data_band_read =
+                programming::build_read_command(programming::McpPage::new(TNC_DATA_BAND_PAGE)?);
+            mock.expect(
+                &data_band_read,
+                &build_w_response(TNC_DATA_BAND_PAGE, &data_band),
+            );
+            mock.expect(&[programming::ACK], &[programming::ACK]);
+            let mut mode = [0_u8; programming::PAGE_SIZE];
+            mode[GATEWAY_MODE_BYTE] = u8::from(DvGatewayMode::ReflectorTerminal);
+            let mode_read =
+                programming::build_read_command(programming::McpPage::new(GATEWAY_MODE_PAGE)?);
+            mock.expect(&mode_read, &build_w_response(GATEWAY_MODE_PAGE, &mode));
+            mock.expect(&[programming::ACK], &[programming::ACK]);
+            mock.expect(&[programming::EXIT], &[programming::ACK]);
+            mock.expect_reopen(Ok(()));
+            mock.expect(b"ID\r", b"ID TH-D75\r");
+            let mut radio = Radio::new(mock);
+
+            let result = radio
+                .disable_dv_gateway_for_kiss_interface_detached_unverified(
+                    PcOutputInterface::Bluetooth,
+                )
+                .await;
+
+            let Err(Error::DetachedMcpPageUpdate(
+                crate::radio::programming::DetachedMcpPageUpdateError::Operation {
+                    possibly_written_pages,
+                    verified_written_pages,
+                    source,
+                },
+            )) = result
+            else {
+                return Err(format!(
+                    "raw Menu 506 value {invalid_band} did not produce the typed zero-write error"
+                )
+                .into());
+            };
+            assert!(possibly_written_pages.is_empty());
+            assert!(verified_written_pages.is_empty());
+            assert!(matches!(
+                *source,
+                Error::InvalidTncDataBand { actual } if actual == invalid_band
+            ));
+            assert!(!radio.cat_recovery_required());
+            radio.transport.assert_complete();
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn matching_kiss_route_changes_only_menu_650() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(programming::ENTER_PROGRAMMING, programming::ENTER_RESPONSE);
+        let mut interface = [0_u8; programming::PAGE_SIZE];
+        interface[KISS_INTERFACE_BYTE] = u8::from(PcOutputInterface::Bluetooth);
+        let interface_read =
+            programming::build_read_command(programming::McpPage::new(KISS_INTERFACE_PAGE)?);
+        mock.expect(
+            &interface_read,
+            &build_w_response(KISS_INTERFACE_PAGE, &interface),
+        );
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+        let mut data_band = [0_u8; programming::PAGE_SIZE];
+        data_band[TNC_DATA_BAND_BYTE] = u8::from(TncDataBand::A);
+        let data_band_read =
+            programming::build_read_command(programming::McpPage::new(TNC_DATA_BAND_PAGE)?);
+        mock.expect(
+            &data_band_read,
+            &build_w_response(TNC_DATA_BAND_PAGE, &data_band),
+        );
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+        let mut mode_before = [0_u8; programming::PAGE_SIZE];
+        mode_before[GATEWAY_MODE_BYTE] = u8::from(DvGatewayMode::ReflectorTerminal);
+        let mut mode_after = mode_before;
+        mode_after[GATEWAY_MODE_BYTE] = u8::from(DvGatewayMode::Off);
+        let mode_read =
+            programming::build_read_command(programming::McpPage::new(GATEWAY_MODE_PAGE)?);
+        mock.expect(
+            &mode_read,
+            &build_w_response(GATEWAY_MODE_PAGE, &mode_before),
+        );
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+        let mode_write =
+            programming::build_write_command(WritableMcpPage::new(GATEWAY_MODE_PAGE)?, &mode_after);
+        mock.expect(&mode_write, &[programming::ACK]);
+        mock.expect(
+            &mode_read,
+            &build_w_response(GATEWAY_MODE_PAGE, &mode_after),
+        );
+        mock.expect(&[programming::ACK], &[programming::ACK]);
+        mock.expect(&[programming::EXIT], &[programming::ACK]);
+        let mut radio = Radio::new(mock);
+
+        let result = radio
+            .disable_dv_gateway_for_kiss_interface_detached_unverified(PcOutputInterface::Bluetooth)
+            .await?;
+
+        assert_eq!(
+            result,
+            AprsCurrentModeRecoveryUpdate {
+                update: DetachedMcpPageUpdate::ChangedRadioRebooting,
+                data_band: TncDataBand::A,
+            }
         );
         radio.transport.assert_complete();
         Ok(())

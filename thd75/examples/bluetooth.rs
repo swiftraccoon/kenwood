@@ -98,7 +98,7 @@ async fn inspect_radio<T: Transport>(transport: T) -> Result<(), Box<dyn std::er
     println!("Model code: {}", serial_information.model_code());
 
     let tnc = radio.get_tnc_mode().await?;
-    println!("TNC mode: {} ({})", tnc.mode, tnc.data_rate);
+    println!("TNC mode: {} ({})", tnc.mode, tnc.data_band);
 
     if firmware_profile.supports_bare_gateway() {
         let gateway = radio.read_gateway().await?;

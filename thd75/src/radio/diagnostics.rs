@@ -17,7 +17,7 @@ use std::time::Duration;
 use crate::transport::Transport;
 use mmdvm_core::{MMDVM_FRAME_START, MMDVM_GET_VERSION, VersionResponse, decode_frame};
 
-use super::{CatState, LinkState, McpPhase, Radio};
+use super::{BinaryProtocolProof, CatState, LinkState, McpPhase, Radio};
 
 /// MMDVM `GET_VERSION` request: sync byte `0xE0`, length `0x03`, type `0x00`.
 ///
@@ -145,7 +145,7 @@ impl<T: Transport> Radio<T> {
             self.codec.clear();
             self.last_cmd_time = None;
             self.desynced = false;
-            self.cat_state = CatState::BinaryProven;
+            self.cat_state = CatState::BinaryProven(BinaryProtocolProof::Mmdvm { data_band: None });
         }
         tracing::info!(?diagnosis, "link diagnosis complete");
         diagnosis
@@ -306,9 +306,14 @@ mod tests {
             ),
             "positive MMDVM proof must continue blocking ordinary CAT"
         );
-        assert_eq!(radio.cat_state, CatState::BinaryProven);
+        assert_eq!(
+            radio.cat_state,
+            CatState::BinaryProven(BinaryProtocolProof::Mmdvm { data_band: None })
+        );
         assert_eq!(*radio.link_state().borrow(), LinkState::Down);
-        let (transport, _restore) = radio.into_binary_mode_parts().map_err(|(_, error)| error)?;
+        let (transport, _restore) = radio
+            .into_binary_mode_parts(BinaryProtocolProof::Mmdvm { data_band: None })
+            .map_err(|(_, error)| error)?;
         transport.assert_complete();
         Ok(())
     }
@@ -435,7 +440,10 @@ mod tests {
             ),
             "positive binary framing must not re-enable ordinary CAT"
         );
-        assert_eq!(radio.cat_state, CatState::BinaryProven);
+        assert_eq!(
+            radio.cat_state,
+            CatState::BinaryProven(BinaryProtocolProof::Mmdvm { data_band: None })
+        );
         radio.transport.assert_complete();
         Ok(())
     }

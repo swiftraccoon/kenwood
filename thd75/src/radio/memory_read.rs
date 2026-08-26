@@ -742,7 +742,7 @@ mod tests {
     };
     use crate::error::Error;
     use crate::protocol::Command;
-    use crate::radio::{CatState, Radio};
+    use crate::radio::{BinaryProtocolProof, CatState, Radio};
     use crate::transport::MockTransport;
     use crate::types::{MemoryReadOffset, MemoryReadTarget, ReadLen};
 
@@ -834,7 +834,10 @@ mod tests {
 
     #[tokio::test]
     async fn qualification_rejects_untrusted_cat_boundaries_before_io() -> TestResult {
-        for cat_state in [CatState::RecoveryRequired, CatState::BinaryProven] {
+        for cat_state in [
+            CatState::RecoveryRequired,
+            CatState::BinaryProven(BinaryProtocolProof::Mmdvm { data_band: None }),
+        ] {
             let mut radio = Radio::new(MockTransport::new());
             radio.cat_state = cat_state;
 

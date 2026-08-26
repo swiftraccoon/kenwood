@@ -114,7 +114,7 @@ async fn audio_settings_workflow() -> TestResult {
     assert_eq!(radio.get_af_gain().await?, AfGainLevel::new(20)?);
     let tnc = radio.get_tnc_mode().await?;
     assert_eq!(tnc.mode, TncMode::Off);
-    assert_eq!(tnc.data_rate, PacketDataRate::Bps1200);
+    assert_eq!(tnc.data_band, TncDataBand::A);
     assert!(!radio.get_vox().await?);
     Ok(())
 }

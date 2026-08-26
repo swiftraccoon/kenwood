@@ -3,7 +3,7 @@
 use kenwood_thd75::protocol::programming;
 use kenwood_thd75::radio::Radio;
 use kenwood_thd75::transport::MockTransport;
-use kenwood_thd75::types::{Band, RegularChannel};
+use kenwood_thd75::types::{Band, RegularChannel, TncDataBand, TncMode};
 use kenwood_thd75::{Error, WritableMcpPage};
 
 // Deps visible to every kenwood-thd75 test target but unused here.
@@ -134,20 +134,24 @@ async fn tune_channel_band_b() -> TestResult {
 // connect_with_tnc_exit: TNC exit preamble
 // ---------------------------------------------------------------------------
 
+fn expect_tnc_recovery_fallback(mock: &mut MockTransport) {
+    mock.expect(b"ID\r", b"N\r");
+    mock.expect(b"\r", b"");
+    mock.expect(b"\r", b"");
+    mock.expect(&[0x03], b"");
+    mock.expect(&[0xC0, 0xFF, 0xC0], b"");
+    mock.expect(b"\rTC 1\r", b"");
+    mock.expect(b"TN 0,0\r", b"");
+    mock.expect(b"ID\r", b"ID TH-D75\r");
+    mock.pend_when_empty();
+}
+
 #[tokio::test]
 async fn connect_with_tnc_exit_sends_tnc_exit_preamble() -> TestResult {
-    // connect_with_tnc_exit writes the raw recovery payloads and then
-    // does a best-effort drain read, all ignored on error.  We use
-    // expect_any_write so the mock accepts all writes without validation
-    // (the preamble bytes are not CAT command/response pairs).
     let mut mock = MockTransport::new();
-    mock.expect_any_write();
+    expect_tnc_recovery_fallback(&mut mock);
 
-    // Should not panic or return an error.
-    let radio = Radio::connect_with_tnc_exit(mock).await?;
-
-    // Verify we got a usable Radio back; the mock has no exchanges left.
-    drop(radio);
+    let _radio = Radio::connect_with_tnc_exit(mock).await?;
     Ok(())
 }
 
@@ -160,29 +164,40 @@ async fn connect_with_tnc_exit_preamble_includes_kiss_exit_frame() -> TestResult
     // the ASCII TNC exits, or a stuck-KISS radio stays unreachable
     // even though the transport connects. Hardware-observed 2026-07-18.
     let mut mock = MockTransport::new();
-    mock.expect(b"\r", b"");
-    mock.expect(b"\r", b"");
-    mock.expect(&[0x03], b"");
-    mock.expect(&[0xC0, 0xFF, 0xC0], b"");
-    mock.expect(b"\rTC 1\r", b"");
-    mock.expect(b"TN 0,0\r", b"");
+    expect_tnc_recovery_fallback(&mut mock);
 
-    let radio = Radio::connect_with_tnc_exit(mock).await?;
-    drop(radio);
+    let _radio = Radio::connect_with_tnc_exit(mock).await?;
     Ok(())
 }
 
 #[tokio::test]
 async fn connect_with_tnc_exit_returns_functional_radio() -> TestResult {
-    // After the preamble, connect_with_tnc_exit returns a usable Radio.
+    // A ready CAT link uses the read-only identity fast path and returns a
+    // usable Radio without a packet-mode recovery write.
     // Verify by checking that subscribe() works (it requires a valid Radio).
     let mut mock = MockTransport::new();
-    mock.expect_any_write();
+    mock.expect(b"ID\r", b"ID TH-D75\r");
+    mock.pend_when_empty();
 
     let radio = Radio::connect_with_tnc_exit(mock).await?;
     let _rx = radio.subscribe();
     // If we get here, connect_with_tnc_exit returned a valid Radio instance.
     drop(radio);
+    Ok(())
+}
+
+#[tokio::test]
+async fn connect_with_tnc_exit_preserves_a_ready_band_b_tnc_state() -> TestResult {
+    let mut mock = MockTransport::new();
+    mock.expect(b"ID\r", b"ID TH-D75\r");
+    mock.expect(b"TN\r", b"TN 0,1\r");
+    mock.pend_when_empty();
+
+    let mut radio = Radio::connect_with_tnc_exit(mock).await?;
+    let state = radio.get_tnc_mode().await?;
+
+    assert_eq!(state.mode, TncMode::Off);
+    assert_eq!(state.data_band, TncDataBand::B);
     Ok(())
 }
 

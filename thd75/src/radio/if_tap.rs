@@ -295,10 +295,18 @@ async fn engage_output<T: Transport>(
     radio: &mut Radio<T>,
     output: UsbAudioOutput,
 ) -> Result<(), Error> {
-    radio.set_usb_audio_output(output).await?;
+    let semantic_rejection = match radio.set_usb_audio_output(output).await {
+        Ok(()) => None,
+        Err(error @ (Error::CommandRejected { .. } | Error::NotAvailableInCurrentMode { .. })) => {
+            Some(error)
+        }
+        Err(error) => return Err(error),
+    };
     let actual = radio.get_usb_audio_output().await?;
     if actual == output {
         Ok(())
+    } else if let Some(error) = semantic_rejection {
+        Err(error)
     } else {
         Err(Error::IfTapNotEngaged {
             requested: output,
@@ -572,42 +580,80 @@ impl<T: Transport> Radio<T> {
     }
 
     async fn write_and_verify_if_tap_band(&mut self, requested: Band) -> Result<(), Error> {
-        self.set_band(requested).await?;
+        let semantic_rejection = semantic_set_rejection(self.set_band(requested).await)?;
         let actual = self.get_band().await?;
-        verify_if_tap_value("active band", &requested, &actual)
+        verify_if_tap_write("active band", &requested, &actual, semantic_rejection)
     }
 
     async fn write_and_verify_if_tap_band_mode(
         &mut self,
         requested: BandMode,
     ) -> Result<(), Error> {
-        self.set_band_mode(requested).await?;
+        let semantic_rejection = semantic_set_rejection(self.set_band_mode(requested).await)?;
         let actual = self.get_band_mode().await?;
-        verify_if_tap_value("band mode", &requested, &actual)
+        verify_if_tap_write("band mode", &requested, &actual, semantic_rejection)
     }
 
     async fn write_and_verify_if_tap_step(&mut self, requested: StepSize) -> Result<(), Error> {
-        self.set_step_size(Band::B, requested).await?;
+        let semantic_rejection =
+            semantic_set_rejection(self.set_step_size(Band::B, requested).await)?;
         let actual = self.get_step_size(Band::B).await?;
-        verify_if_tap_value("Band B tuning step", &requested, &actual)
+        verify_if_tap_write(
+            "Band B tuning step",
+            &requested,
+            &actual,
+            semantic_rejection,
+        )
     }
 
     async fn write_and_verify_if_tap_operating_mode(
         &mut self,
         requested: OperatingMode,
     ) -> Result<(), Error> {
-        self.set_operating_mode(Band::B, requested).await?;
+        let semantic_rejection =
+            semantic_set_rejection(self.set_operating_mode(Band::B, requested).await)?;
         let actual = self.get_operating_mode(Band::B).await?;
-        verify_if_tap_value("Band B operating mode", &requested, &actual)
+        verify_if_tap_write(
+            "Band B operating mode",
+            &requested,
+            &actual,
+            semantic_rejection,
+        )
     }
 
     async fn write_and_verify_if_tap_squelch(
         &mut self,
         requested: SquelchLevel,
     ) -> Result<(), Error> {
-        self.set_squelch(Band::B, requested).await?;
+        let semantic_rejection =
+            semantic_set_rejection(self.set_squelch(Band::B, requested).await)?;
         let actual = self.get_squelch(Band::B).await?;
-        verify_if_tap_value("Band B squelch", &requested, &actual)
+        verify_if_tap_write("Band B squelch", &requested, &actual, semantic_rejection)
+    }
+}
+
+fn semantic_set_rejection(result: Result<(), Error>) -> Result<Option<Error>, Error> {
+    match result {
+        Ok(()) => Ok(None),
+        Err(error @ (Error::CommandRejected { .. } | Error::NotAvailableInCurrentMode { .. })) => {
+            Ok(Some(error))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn verify_if_tap_write<Value: std::fmt::Debug + PartialEq>(
+    setting: &'static str,
+    requested: &Value,
+    actual: &Value,
+    semantic_rejection: Option<Error>,
+) -> Result<(), Error> {
+    if actual == requested {
+        Ok(())
+    } else if let Some(error) = semantic_rejection {
+        Err(error)
+    } else {
+        verify_if_tap_value(setting, requested, actual)
     }
 }
 
@@ -827,6 +873,7 @@ mod tests {
         // Single Band selection is rejected; the rollback must restore the
         // full snapshot in the documented order.
         mock.expect(b"DL 1\r", b"?\r");
+        mock.expect(b"DL\r", b"DL 0\r");
         mock.expect(b"IO 0\r", b"IO 0\r");
         mock.expect(b"IO\r", b"IO 0\r");
         mock.expect(b"SF 1,5\r", b"SF 1,5\r");
@@ -857,6 +904,61 @@ mod tests {
         assert!(
             error.snapshot.is_none(),
             "a complete rollback must not retain the snapshot: {error:?}"
+        );
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejected_first_configure_write_proves_unchanged_snapshot_on_rollback() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"VM 1\r", b"VM 1,0\r");
+        mock.expect(b"BC\r", b"BC 0\r");
+        mock.expect(b"DL\r", b"DL 0\r");
+        mock.expect(b"IO\r", b"IO 0\r");
+        mock.expect(b"SQ 1\r", b"SQ 1,2\r");
+        mock.expect(b"MD 1\r", b"MD 1,0\r");
+        mock.expect(b"FQ 1\r", b"FQ 1,0145000000\r");
+        mock.expect(b"SF 1\r", b"SF 1,5\r");
+
+        // The first configure write is unavailable and an immediate readback
+        // proves that it did not change the active band.
+        mock.expect(b"BC 1\r", b"N\r");
+        mock.expect(b"BC\r", b"BC 0\r");
+
+        // Restore still proves every saved field. Semantic setter rejections
+        // are accepted only when their immediate getter exactly matches the
+        // snapshot; no value is inferred from `N` alone.
+        mock.expect(b"IO 0\r", b"IO 0\r");
+        mock.expect(b"IO\r", b"IO 0\r");
+        mock.expect(b"SF 1,5\r", b"N\r");
+        mock.expect(b"SF 1\r", b"SF 1,5\r");
+        mock.expect(b"FQ 1\r", b"FQ 1,0145000000\r");
+        mock.expect(b"SQ 1,2\r", b"N\r");
+        mock.expect(b"SQ 1\r", b"SQ 1,2\r");
+        mock.expect(b"MD 1,0\r", b"MD 1,0\r");
+        mock.expect(b"MD 1\r", b"MD 1,0\r");
+        mock.expect(b"DL 0\r", b"N\r");
+        mock.expect(b"DL\r", b"DL 0\r");
+        mock.expect(b"BC 0\r", b"N\r");
+        mock.expect(b"BC\r", b"BC 0\r");
+
+        let mut radio = Radio::new(mock);
+        let result = radio.enter_if_tap(usb_if_config()).await;
+        let Err(error) = result else {
+            return Err("the unavailable configure write must still refuse IF-DSP".into());
+        };
+        assert!(
+            matches!(*error.source, Error::NotAvailableInCurrentMode { .. }),
+            "unexpected configure failure: {error:?}"
+        );
+        assert!(
+            error.rollback.is_complete(),
+            "readback-proved saved values must complete rollback: {error:?}"
+        );
+        assert!(
+            error.snapshot.is_none(),
+            "a fully proved rollback must not reserve a stale snapshot"
         );
         radio.transport.assert_complete();
         Ok(())
@@ -931,12 +1033,14 @@ mod tests {
         // Configure fails at Single Band selection; during rollback the
         // squelch restore is also rejected, leaving the rollback incomplete.
         mock.expect(b"DL 1\r", b"?\r");
+        mock.expect(b"DL\r", b"DL 0\r");
         mock.expect(b"IO 0\r", b"IO 0\r");
         mock.expect(b"IO\r", b"IO 0\r");
         mock.expect(b"SF 1,5\r", b"SF 1,5\r");
         mock.expect(b"SF 1\r", b"SF 1,5\r");
         mock.expect(b"FQ 1\r", b"FQ 1,0145000000\r");
         mock.expect(b"SQ 1,2\r", b"?\r");
+        mock.expect(b"SQ 1\r", b"SQ 1,0\r");
         mock.expect(b"MD 1,0\r", b"MD 1,0\r");
         mock.expect(b"MD 1\r", b"MD 1,0\r");
         mock.expect(b"DL 0\r", b"DL 0\r");
@@ -997,6 +1101,7 @@ mod tests {
         mock.expect(b"SF 1\r", b"SF 1,5\r");
         mock.expect(b"FQ 1\r", b"FQ 1,0145000000\r");
         mock.expect(b"SQ 1,2\r", b"?\r");
+        mock.expect(b"SQ 1\r", b"SQ 1,0\r");
         mock.expect(b"MD 1,0\r", b"MD 1,0\r");
         mock.expect(b"MD 1\r", b"MD 1,0\r");
         mock.expect(b"DL 0\r", b"DL 0\r");

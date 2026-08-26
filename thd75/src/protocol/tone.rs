@@ -1,13 +1,13 @@
 //! TNC, D-STAR callsign, and real-time clock commands: TN, DC, RT.
 //!
 //! Hardware-verified command behavior:
-//! - TN: TNC mode (bare read, returns `mode,data-rate`)
+//! - TN: TNC mode (bare read, returns `mode,data-band`)
 //! - DC: D-STAR callsign slots 1-6 (slot-indexed, returns `slot,callsign,suffix`)
 //! - RT: Real-time clock (bare read, returns `YYMMDDHHmmss`)
 
 use crate::error::ProtocolError;
-use crate::types::radio_params::{PacketDataRate, TncMode};
-use crate::types::{DstarCallsign, DstarSlot, DstarSuffix, RadioClock};
+use crate::types::radio_params::TncMode;
+use crate::types::{DstarCallsign, DstarSlot, DstarSuffix, RadioClock, TncDataBand};
 
 use super::Response;
 use super::fields::{decimal_u8, split_exact};
@@ -24,25 +24,25 @@ pub(crate) fn parse_tone(mnemonic: &str, payload: &str) -> Option<Result<Respons
     }
 }
 
-/// Parse TN (TNC mode): `"mode,data_rate"` format.
+/// Parse TN (TNC mode): `"mode,data_band"` format.
 ///
-/// Hardware-verified: bare `TN\r` returns `TN mode,data-rate` (e.g., `TN 0,0`).
+/// Hardware-verified: bare `TN\r` returns `TN mode,data-band` (e.g., `TN 0,0`).
 fn parse_tn(payload: &str) -> Result<Response, ProtocolError> {
-    let [mode_str, data_rate_str] = split_exact::<2>(payload, "TN")?;
+    let [mode_str, data_band_str] = split_exact::<2>(payload, "TN")?;
     let mode_raw = decimal_u8(mode_str, "TN", "mode")?;
     let mode = TncMode::try_from(mode_raw).map_err(|e| ProtocolError::FieldParse {
         command: "TN".to_owned(),
         field: "mode".to_owned(),
         detail: e.to_string(),
     })?;
-    let data_rate_raw = decimal_u8(data_rate_str, "TN", "data rate")?;
-    let data_rate =
-        PacketDataRate::try_from(data_rate_raw).map_err(|e| ProtocolError::FieldParse {
+    let data_band_raw = decimal_u8(data_band_str, "TN", "data band")?;
+    let data_band =
+        TncDataBand::try_from(data_band_raw).map_err(|e| ProtocolError::FieldParse {
             command: "TN".to_owned(),
-            field: "data rate".to_owned(),
+            field: "data band".to_owned(),
             detail: e.to_string(),
         })?;
-    Ok(Response::TncMode { mode, data_rate })
+    Ok(Response::TncMode { mode, data_band })
 }
 
 /// Parse DC (D-STAR callsign): `"slot,callsign,suffix"` format.

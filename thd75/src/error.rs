@@ -118,6 +118,26 @@ pub enum Error {
         mnemonic: String,
     },
 
+    /// A same-session MCP precondition proved that Menu 983 routes KISS to a
+    /// different host interface. The guarded operation performed zero writes.
+    #[error(
+        "Menu 983 routes KISS to raw interface {actual}, not the approved {expected} interface; no setting was changed"
+    )]
+    KissInterfaceMismatch {
+        /// Host interface approved by the caller.
+        expected: crate::types::PcOutputInterface,
+        /// Live raw Menu 983 value read in the guarded MCP transaction.
+        actual: u8,
+    },
+
+    /// A same-session MCP read proved that Menu 506 is outside the strict A/B
+    /// domain. The guarded operation performed zero writes.
+    #[error("Menu 506 has invalid raw TNC data band {actual}; no setting was changed")]
+    InvalidTncDataBand {
+        /// Live raw Menu 506 value read in the guarded MCP transaction.
+        actual: u8,
+    },
+
     /// A mode write returned a semantic rejection and its required readback
     /// also failed, so the resulting radio state could not be proved.
     #[error(

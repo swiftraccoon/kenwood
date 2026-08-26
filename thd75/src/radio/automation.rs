@@ -21,9 +21,14 @@ use std::time::Duration;
 use crate::error::{Error, ValidationError};
 use crate::screen::{SCREEN_BYTES, ScreenFrame};
 use crate::transport::Transport;
-use crate::types::{MemoryReadOffset, ReadLen};
+use crate::types::{Frequency, MemoryReadOffset, ReadLen, UsbAudioOutput};
 
-use super::{McpPhase, Radio};
+use super::{
+    McpPhase, Radio,
+    if_tap::{IfTapConfig, IfTapEnterError, IfTapRestoreReport, IfTapSavedState},
+};
+#[cfg(feature = "aprs")]
+use crate::types::{SerialNumber, TncDataBand, TncState};
 
 #[path = "automation_runtime.rs"]
 mod automation_runtime;
@@ -643,6 +648,162 @@ impl<T: Transport> AutomationSession<'_, T> {
     #[must_use]
     pub const fn is_valid(&self) -> bool {
         self.valid
+    }
+
+    /// Read the exact CAT serial identity and complete live TN state while
+    /// retaining this already-attested automation session.
+    ///
+    /// This is the post-reboot proof used before one approved APRS retry. It
+    /// performs no setting write and no mode transition. An unresolved CAT
+    /// boundary invalidates the session but does not invent strict-GM poison.
+    ///
+    /// # Errors
+    ///
+    /// Returns the exact CAT identity or TN read failure. The caller must
+    /// validate both mode and band before authorizing a transition.
+    #[cfg(feature = "aprs")]
+    pub async fn aprs_recovery_state(&mut self) -> Result<(SerialNumber, TncState), Error> {
+        self.require_valid()?;
+        let result = async {
+            let serial = self.radio.get_serial_information().await?.into_parts().0;
+            let state = self.radio.get_tnc_mode().await?;
+            Ok((serial, state))
+        }
+        .await;
+        if result.as_ref().is_err_and(Error::requires_recovery)
+            || self.radio.cat_recovery_required()
+        {
+            self.valid = false;
+        }
+        result
+    }
+
+    /// Perform the single `TN 2,x` transition while retaining this attested
+    /// session on a correlated semantic refusal.
+    ///
+    /// Success means the transport has already changed to KISS and invalidates
+    /// this CAT automation capability. Drop the session and consume the same
+    /// radio through [`Radio::into_kiss_session`](crate::radio::Radio::into_kiss_session);
+    /// the protocol-specific proof is stored on that radio and the ownership
+    /// conversion sends no second `TN` command. A correlated `N` or `?` leaves
+    /// both CAT and this attested session ready, so the caller can report the
+    /// refusal without packet recovery or firmware requalification.
+    ///
+    /// # Errors
+    ///
+    /// Returns the exact CAT transition error. An unresolved boundary poisons
+    /// this session, while an aligned semantic refusal keeps it valid.
+    #[cfg(feature = "aprs")]
+    pub async fn transition_to_kiss(&mut self, data_band: TncDataBand) -> Result<(), Error> {
+        self.require_valid()?;
+        self.guarded_input_lease = None;
+        let result = self.radio.transition_to_kiss(data_band).await;
+        match &result {
+            Ok(()) => {
+                // CAT no longer exists on this transport. Do not set the GM
+                // poison: the already-proved binary boundary must remain
+                // consumable by `into_kiss_session`.
+                self.valid = false;
+            }
+            Err(error) if error.requires_recovery() || self.radio.cat_recovery_required() => {
+                // `Radio::execute` already recorded the exact CAT recovery
+                // obligation. This is not a failed strict-GM exchange, so do
+                // not invent GM poison that would make packet-mode recovery
+                // unreachable.
+                self.valid = false;
+                self.guarded_input_lease = None;
+            }
+            Err(_) => {
+                // `execute` proved an aligned `N`/`?` terminal and restored
+                // CAT readiness. The firmware attestation remains current.
+            }
+        }
+        result
+    }
+
+    /// Configure the typed USB IF tap without discarding this already-attested
+    /// automation session.
+    ///
+    /// Every affected radio value is snapshotted and independently verified by
+    /// the IF-tap implementation. Any authenticated screen lease is revoked
+    /// before ordinary CAT changes the visible radio state. A semantic refusal
+    /// with exact rollback keeps the session usable and does not repeat the
+    /// multi-kilobyte firmware attestation. Any timeout, malformed boundary,
+    /// or link failure which requires CAT recovery poisons the session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IfTapEnterError`] with the exact setup failure and verified
+    /// rollback report. Recovery-required failures invalidate this automation
+    /// session before returning.
+    pub async fn enter_if_tap(
+        &mut self,
+        config: IfTapConfig,
+    ) -> Result<IfTapSavedState, IfTapEnterError> {
+        self.guarded_input_lease = None;
+        let result = self.radio.enter_if_tap(config).await;
+        match result {
+            Ok(session) => Ok(session.into_saved_state()),
+            Err(error) => {
+                let recovery_required = error.source.requires_recovery()
+                    || error
+                        .rollback
+                        .failures()
+                        .iter()
+                        .any(|(_, failure)| failure.requires_recovery())
+                    || self.radio.cat_recovery_required();
+                if recovery_required {
+                    self.poison_after_external_recovery_requirement();
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Retune a live IF tap through the verified bounded step walk while
+    /// retaining the existing automation attestation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the typed CAT, tuning-bound, or readback failure. A failure
+    /// which leaves CAT recovery required invalidates this automation session.
+    pub async fn retune_if_tap(
+        &mut self,
+        saved: &IfTapSavedState,
+        target: Frequency,
+        output: UsbAudioOutput,
+    ) -> Result<Frequency, Error> {
+        self.guarded_input_lease = None;
+        let result = self.radio.retune_if_tap(saved, target, output).await;
+        if result.as_ref().is_err_and(Error::requires_recovery)
+            || self.radio.cat_recovery_required()
+        {
+            self.poison_after_external_recovery_requirement();
+        }
+        result
+    }
+
+    /// Restore a saved IF-tap state with per-field readback verification while
+    /// retaining the existing automation attestation when the CAT link stays
+    /// synchronized.
+    pub async fn restore_if_tap(&mut self, saved: IfTapSavedState) -> IfTapRestoreReport {
+        self.guarded_input_lease = None;
+        let report = self.radio.restore_if_tap(saved).await;
+        if report
+            .failures()
+            .iter()
+            .any(|(_, failure)| failure.requires_recovery())
+            || self.radio.cat_recovery_required()
+        {
+            self.poison_after_external_recovery_requirement();
+        }
+        report
+    }
+
+    const fn poison_after_external_recovery_requirement(&mut self) {
+        self.valid = false;
+        self.radio.gm_poisoned = true;
+        self.radio.desynced = true;
     }
 
     /// Dispatch one verified key phase.
@@ -2408,22 +2569,26 @@ mod tests {
         DISPATCH_ATTESTATION_OFFSET, EXPECTED_ABI, FRAME_HEIGHT, FRAME_STRIDE, FRAME_WIDTH,
         FRAMEBUFFER_ADDRESS, FrontPanelKey, GUARDED_ROUTE_MAX_DURATION, GUARDED_SNAPSHOT_MAX_AGE,
         GuardedDecimalRoute, GuardedDecimalRouteOutcome, GuardedInputLease, GuardedKeyError,
-        GuardedKeyOutcome, GuardedKeyResult, KeyPhase, MAX_CAPTURE_ATTEMPTS, METADATA_LENGTH,
-        METADATA_OFFSET, PIXEL_FORMAT_RGB565LE, PIXEL_LENGTH, PIXEL_OFFSET, READ_HOOK_ATTESTATION,
-        READ_HOOK_ATTESTATION_OFFSET, RESULT_CONTEXT_CHANGED, RESULT_OK, RLE_MAGIC, RLE_OFFSET,
-        RLE_RELATIVE_OFFSET, SNAPSHOT_ADDRESS,
+        GuardedKeyOutcome, GuardedKeyResult, IfTapConfig, KeyPhase, MAX_CAPTURE_ATTEMPTS,
+        METADATA_LENGTH, METADATA_OFFSET, PIXEL_FORMAT_RGB565LE, PIXEL_LENGTH, PIXEL_OFFSET,
+        READ_HOOK_ATTESTATION, READ_HOOK_ATTESTATION_OFFSET, RESULT_CONTEXT_CHANGED, RESULT_OK,
+        RLE_MAGIC, RLE_OFFSET, RLE_RELATIVE_OFFSET, SNAPSHOT_ADDRESS,
     };
     use crate::error::Error;
     use crate::protocol::memread::encode_hex_upper;
-    use crate::radio::{CatState, Radio};
+    use crate::radio::{BinaryProtocolProof, CatState, Radio};
     use crate::screen::{SCREEN_BYTES, ScreenFrame};
     use crate::transport::MockTransport;
+    use crate::types::{Frequency, OperatingMode, StepSize, UsbAudioOutput};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     #[tokio::test]
     async fn qualification_rejects_untrusted_cat_boundaries_before_io() -> TestResult {
-        for cat_state in [CatState::RecoveryRequired, CatState::BinaryProven] {
+        for cat_state in [
+            CatState::RecoveryRequired,
+            CatState::BinaryProven(BinaryProtocolProof::Mmdvm { data_band: None }),
+        ] {
             let mut radio = Radio::new(MockTransport::new());
             radio.cat_state = cat_state;
 
@@ -2678,6 +2843,266 @@ mod tests {
             last_seqlock: 0,
             guarded_input_lease: None,
         }
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "aprs")]
+    async fn aligned_kiss_refusal_retains_attestation_for_one_later_transition() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"TN 2,0\r", b"N\r");
+        mock.expect(b"TN 2,0\r", b"TN 2,0\r");
+        let mut radio = Radio::new(mock);
+
+        {
+            let mut session = direct_automation_session_without_snapshot(&mut radio);
+            let refused = session
+                .transition_to_kiss(crate::types::TncDataBand::A)
+                .await;
+            assert!(matches!(
+                refused,
+                Err(Error::NotAvailableInCurrentMode { mnemonic }) if mnemonic == "TN"
+            ));
+            assert!(
+                session.is_valid(),
+                "an aligned TN=N must retain the already-proved automation session"
+            );
+
+            session
+                .transition_to_kiss(crate::types::TncDataBand::A)
+                .await?;
+            assert!(!session.is_valid(), "accepted TN ends CAT automation");
+        }
+
+        let kiss = radio.into_kiss_session().map_err(|(_, error)| error)?;
+        assert_eq!(
+            kiss.transport.writes(),
+            &[b"TN 2,0\r".to_vec(), b"TN 2,0\r".to_vec()],
+            "one refused request and one accepted request must send TN exactly once each"
+        );
+        kiss.transport.assert_complete();
+        Ok(())
+    }
+
+    fn queue_if_tap_entry(mock: &mut MockTransport) {
+        mock.expect(b"VM 1\r", b"VM 1,0\r");
+        mock.expect(b"BC\r", b"BC 0\r");
+        mock.expect(b"DL\r", b"DL 0\r");
+        mock.expect(b"IO\r", b"IO 0\r");
+        mock.expect(b"SQ 1\r", b"SQ 1,2\r");
+        mock.expect(b"MD 1\r", b"MD 1,0\r");
+        mock.expect(b"FQ 1\r", b"FQ 1,0145000000\r");
+        mock.expect(b"SF 1\r", b"SF 1,5\r");
+        mock.expect(b"BC 1\r", b"BC 1\r");
+        mock.expect(b"BC\r", b"BC 1\r");
+        mock.expect(b"DL 1\r", b"DL 1\r");
+        mock.expect(b"DL\r", b"DL 1\r");
+        mock.expect(b"SF 1,0\r", b"SF 1,0\r");
+        mock.expect(b"SF 1\r", b"SF 1,0\r");
+        mock.expect(b"MD 1,4\r", b"MD 1,4\r");
+        mock.expect(b"MD 1\r", b"MD 1,4\r");
+        mock.expect(b"SQ 1,0\r", b"SQ 1,0\r");
+        mock.expect(b"SQ 1\r", b"SQ 1,0\r");
+        mock.expect(b"IO 1\r", b"IO 1\r");
+        mock.expect(b"IO\r", b"IO 1\r");
+    }
+
+    fn queue_if_tap_retune_to_145_025(mock: &mut MockTransport) {
+        mock.expect(b"FQ 1\r", b"FQ 1,0145000000\r");
+        mock.expect(b"SF 1\r", b"SF 1,0\r");
+        mock.expect(b"IO 0\r", b"IO 0\r");
+        mock.expect(b"IO\r", b"IO 0\r");
+        for frequency in [
+            145_005_000,
+            145_010_000,
+            145_015_000,
+            145_020_000,
+            145_025_000,
+        ] {
+            mock.expect(b"UP\r", b"UP\r");
+            mock.expect(b"FQ 1\r", format!("FQ 1,{frequency:010}\r").as_bytes());
+        }
+        mock.expect(b"IO 1\r", b"IO 1\r");
+        mock.expect(b"IO\r", b"IO 1\r");
+    }
+
+    fn queue_if_tap_restore_from_145_025(mock: &mut MockTransport) {
+        mock.expect(b"IO 0\r", b"IO 0\r");
+        mock.expect(b"IO\r", b"IO 0\r");
+        mock.expect(b"SF 1,5\r", b"SF 1,5\r");
+        mock.expect(b"SF 1\r", b"SF 1,5\r");
+        mock.expect(b"FQ 1\r", b"FQ 1,0145025000\r");
+        mock.expect(b"BC\r", b"BC 1\r");
+        mock.expect(b"SF 1\r", b"SF 1,5\r");
+        mock.expect(b"DW\r", b"DW\r");
+        mock.expect(b"FQ 1\r", b"FQ 1,0145012500\r");
+        mock.expect(b"DW\r", b"DW\r");
+        mock.expect(b"FQ 1\r", b"FQ 1,0145000000\r");
+        mock.expect(b"SQ 1,2\r", b"SQ 1,2\r");
+        mock.expect(b"SQ 1\r", b"SQ 1,2\r");
+        mock.expect(b"MD 1,0\r", b"MD 1,0\r");
+        mock.expect(b"MD 1\r", b"MD 1,0\r");
+        mock.expect(b"DL 0\r", b"DL 0\r");
+        mock.expect(b"DL\r", b"DL 0\r");
+        mock.expect(b"BC 0\r", b"BC 0\r");
+        mock.expect(b"BC\r", b"BC 0\r");
+    }
+
+    fn queue_if_tap_clean_rejection_and_exact_rollback(mock: &mut MockTransport) {
+        mock.expect(b"VM 1\r", b"VM 1,0\r");
+        mock.expect(b"BC\r", b"BC 0\r");
+        mock.expect(b"DL\r", b"DL 0\r");
+        mock.expect(b"IO\r", b"IO 0\r");
+        mock.expect(b"SQ 1\r", b"SQ 1,2\r");
+        mock.expect(b"MD 1\r", b"MD 1,0\r");
+        mock.expect(b"FQ 1\r", b"FQ 1,0145000000\r");
+        mock.expect(b"SF 1\r", b"SF 1,5\r");
+        mock.expect(b"BC 1\r", b"N\r");
+        mock.expect(b"BC\r", b"BC 0\r");
+        mock.expect(b"IO 0\r", b"IO 0\r");
+        mock.expect(b"IO\r", b"IO 0\r");
+        mock.expect(b"SF 1,5\r", b"N\r");
+        mock.expect(b"SF 1\r", b"SF 1,5\r");
+        mock.expect(b"FQ 1\r", b"FQ 1,0145000000\r");
+        mock.expect(b"SQ 1,2\r", b"N\r");
+        mock.expect(b"SQ 1\r", b"SQ 1,2\r");
+        mock.expect(b"MD 1,0\r", b"MD 1,0\r");
+        mock.expect(b"MD 1\r", b"MD 1,0\r");
+        mock.expect(b"DL 0\r", b"N\r");
+        mock.expect(b"DL\r", b"DL 0\r");
+        mock.expect(b"BC 0\r", b"N\r");
+        mock.expect(b"BC\r", b"BC 0\r");
+    }
+
+    #[tokio::test]
+    async fn if_tap_lifecycle_retains_one_attested_session_without_requalification() -> TestResult {
+        let mut mock = MockTransport::new();
+        queue_if_tap_entry(&mut mock);
+        queue_if_tap_retune_to_145_025(&mut mock);
+        queue_if_tap_restore_from_145_025(&mut mock);
+        let snapshot = automation_snapshot(9, 14, 28)?;
+        let mut radio = Radio::new(mock);
+
+        let mut session = direct_automation_session(&mut radio, &snapshot);
+        let saved = session
+            .enter_if_tap(IfTapConfig::new(OperatingMode::Usb).with_step(StepSize::Hz5000))
+            .await?;
+        assert!(session.guarded_input_lease.is_none());
+        assert!(session.is_valid());
+
+        let landed = session
+            .retune_if_tap(
+                &saved,
+                Frequency::new(145_025_000),
+                UsbAudioOutput::IntermediateFrequency,
+            )
+            .await?;
+        assert_eq!(landed.as_hz(), 145_025_000);
+        assert!(session.is_valid());
+
+        let report = session.restore_if_tap(saved).await;
+        assert!(report.is_complete(), "exact restore failed: {report:?}");
+        assert!(session.is_valid());
+
+        radio.transport.assert_complete();
+        let qualification_commands = radio
+            .transport
+            .writes()
+            .iter()
+            .filter(|command| {
+                command.as_slice() == b"ID\r"
+                    || command.as_slice() == b"FV\r"
+                    || command.starts_with(b"GM ")
+            })
+            .count();
+        assert_eq!(
+            qualification_commands, 0,
+            "IF prepare/retune/restore must not repeat firmware qualification"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn malformed_if_entry_poisons_the_attested_session_and_refuses_followup() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"VM 1\r", b"VM malformed\r");
+        let mut radio = Radio::new(mock);
+        let mut session = direct_automation_session_without_snapshot(&mut radio);
+
+        let result = session
+            .enter_if_tap(IfTapConfig::new(OperatingMode::Usb))
+            .await;
+        let Err(error) = result else {
+            return Err("malformed IF entry unexpectedly succeeded".into());
+        };
+        assert!(matches!(*error.source, Error::Protocol(_)));
+        assert!(!session.is_valid());
+        let writes_before_followup = session.radio.transport.writes().len();
+        assert!(matches!(
+            session.capture_screen().await,
+            Err(Error::AutomationNotQualified)
+        ));
+        assert_eq!(
+            session.radio.transport.writes().len(),
+            writes_before_followup,
+            "a poisoned session must refuse follow-up automation before I/O"
+        );
+        session.radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn malformed_if_restore_poisons_the_attested_session_and_refuses_followup() -> TestResult
+    {
+        let mut mock = MockTransport::new();
+        queue_if_tap_entry(&mut mock);
+        mock.expect(b"IO 0\r", b"IO malformed\r");
+        let mut radio = Radio::new(mock);
+        let mut session = direct_automation_session_without_snapshot(&mut radio);
+        let saved = session
+            .enter_if_tap(IfTapConfig::new(OperatingMode::Usb).with_step(StepSize::Hz5000))
+            .await?;
+
+        let report = session.restore_if_tap(saved).await;
+        assert!(!report.is_complete());
+        assert!(!session.is_valid());
+        let writes_before_followup = session.radio.transport.writes().len();
+        assert!(matches!(
+            session.capture_screen().await,
+            Err(Error::AutomationNotQualified)
+        ));
+        assert_eq!(
+            session.radio.transport.writes().len(),
+            writes_before_followup,
+            "a poisoned session must refuse follow-up automation before I/O"
+        );
+        session.radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn clean_if_rejection_with_exact_rollback_keeps_attested_session_valid() -> TestResult {
+        let mut mock = MockTransport::new();
+        queue_if_tap_clean_rejection_and_exact_rollback(&mut mock);
+        let snapshot = automation_snapshot(4, 8, 16)?;
+        let mut radio = Radio::new(mock);
+        let mut session = direct_automation_session(&mut radio, &snapshot);
+
+        let result = session
+            .enter_if_tap(IfTapConfig::new(OperatingMode::Usb).with_step(StepSize::Hz5000))
+            .await;
+        let Err(error) = result else {
+            return Err("unavailable IF entry unexpectedly succeeded".into());
+        };
+        assert!(matches!(
+            *error.source,
+            Error::NotAvailableInCurrentMode { .. }
+        ));
+        assert!(error.rollback.is_complete());
+        assert!(error.snapshot.is_none());
+        assert!(session.is_valid());
+        assert!(session.guarded_input_lease.is_none());
+        session.radio.transport.assert_complete();
+        Ok(())
     }
 
     fn zero_frame() -> Result<(Vec<u8>, u32), Box<dyn std::error::Error>> {

@@ -1,15 +1,16 @@
 //! Integration tests for TN, DC, RT protocol commands.
 //!
 //! Hardware-verified on D75:
-//! - TN: TNC mode (bare read only, returns mode and packet data rate)
+//! - TN: TNC mode (bare read only, returns mode and TNC data band)
 //! - DC: D-STAR callsign slots 1-6 (slot-indexed read)
 //! - RT: Real-time clock (bare read, returns `YYMMDDHHmmss`)
 //!
 //! The D75 RE originally identified these as tone commands, but hardware
 //! testing confirmed the actual semantics documented here.
 
+use kenwood_thd75::error::ProtocolError;
 use kenwood_thd75::protocol::{self, Command, Response};
-use kenwood_thd75::types::{DstarCallsign, DstarSlot, DstarSuffix, PacketDataRate, TncMode};
+use kenwood_thd75::types::{DstarCallsign, DstarSlot, DstarSuffix, TncDataBand, TncMode};
 
 // Deps visible to every kenwood-thd75 test target but unused here.
 // Acknowledged so `unused_crate_dependencies` stays silent without
@@ -45,36 +46,48 @@ fn parse_tn_response() -> TestResult {
     // TN 0 is TNC OFF, hardware-verified 2026-07-18 (display shows no
     // packet-mode indicator). An earlier generation mapped 0 to APRS.
     let r = protocol::parse(b"TN 0,0")?;
-    let Response::TncMode { mode, data_rate } = r else {
+    let Response::TncMode { mode, data_band } = r else {
         return Err(format!("expected TncMode, got {r:?}").into());
     };
     assert_eq!(mode, TncMode::Off);
-    assert_eq!(data_rate, PacketDataRate::Bps1200);
+    assert_eq!(data_band, TncDataBand::A);
     Ok(())
 }
 
 #[test]
 fn parse_tn_kiss_mode() -> TestResult {
     let r = protocol::parse(b"TN 2,0")?;
-    let Response::TncMode { mode, data_rate } = r else {
+    let Response::TncMode { mode, data_band } = r else {
         return Err(format!("expected TncMode, got {r:?}").into());
     };
     assert_eq!(mode, TncMode::Kiss);
-    assert_eq!(data_rate, PacketDataRate::Bps1200);
+    assert_eq!(data_band, TncDataBand::A);
     Ok(())
 }
 
 #[test]
-fn parse_tn_aprs_9600() -> TestResult {
-    // TN 1 is the firmware APRS mode ("APRS 12"/"APRS 96" on the
-    // display); data-rate value 1 = 9600 bps.
+fn parse_tn_aprs_band_b() -> TestResult {
+    // TN mode 1 is firmware APRS mode; the second field selects Band B.
+    // Packet speed is a separate AS/Menu 507/KISS-hardware domain.
     let r = protocol::parse(b"TN 1,1")?;
-    let Response::TncMode { mode, data_rate } = r else {
+    let Response::TncMode { mode, data_band } = r else {
         return Err(format!("expected TncMode, got {r:?}").into());
     };
     assert_eq!(mode, TncMode::Aprs);
-    assert_eq!(data_rate, PacketDataRate::Bps9600);
+    assert_eq!(data_band, TncDataBand::B);
     Ok(())
+}
+
+#[test]
+fn parse_tn_rejects_non_band_second_fields() {
+    for raw in [2_u8, 3_u8] {
+        let frame = format!("TN 0,{raw}");
+        assert!(matches!(
+            protocol::parse(frame.as_bytes()),
+            Err(ProtocolError::FieldParse { command, field, .. })
+                if command == "TN" && field == "data band"
+        ));
+    }
 }
 
 // ============================================================================

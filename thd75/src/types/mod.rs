@@ -70,21 +70,21 @@ pub use tone::{CTCSS_FREQUENCIES, CtcssCode, DCS_CODES, DcsCode, ToneCode, ToneM
 
 // APRS subsystem re-exports.
 pub use aprs::{
-    AltnetAddress, AprsBand, AprsCallsign, AprsIcon, AprsLock, AprsNetwork, AprsNetworkType,
-    AprsSettings, AprsStation, AprsSymbolCode, AprsSymbolTable, AutoReplyCallsignPrefix,
-    AutoReplyDelay, AutoReplySettings, AutoReplyTarget, BeaconControl, BeaconInterval,
-    BulletinGroupCode, BulletinGroupCodes, DcdSense, DigipeaterFunction, DisplayArea, FloodAlias,
-    InterruptTime, MessageGroupCode, MessageGroupCodes, NavitraGroupCode, NavitraGroupMode,
-    NavitraMessage, NavitraMessageSlot, NavitraSettings, NewNPacketPath, NotificationSettings,
-    Others1PacketPath, Others2PacketPath, Others3PacketPath, PacketFilter, PacketFilterDistance,
-    PacketFilterFlags, PacketFilterPositionLimit, PacketPath, PacketPathAbbreviation,
-    PacketPathHops, PositionAmbiguity, PositionComment, QsyDistance, QsyLimitDistance, QsySettings,
+    AltnetAddress, AprsCallsign, AprsIcon, AprsLock, AprsNetwork, AprsNetworkType, AprsSettings,
+    AprsStation, AprsSymbolCode, AprsSymbolTable, AutoReplyCallsignPrefix, AutoReplyDelay,
+    AutoReplySettings, AutoReplyTarget, BeaconControl, BeaconInterval, BulletinGroupCode,
+    BulletinGroupCodes, DcdSense, DigipeaterFunction, DisplayArea, FloodAlias, InterruptTime,
+    MessageGroupCode, MessageGroupCodes, NavitraGroupCode, NavitraGroupMode, NavitraMessage,
+    NavitraMessageSlot, NavitraSettings, NewNPacketPath, NotificationSettings, Others1PacketPath,
+    Others2PacketPath, Others3PacketPath, PacketFilter, PacketFilterDistance, PacketFilterFlags,
+    PacketFilterPositionLimit, PacketPath, PacketPathAbbreviation, PacketPathHops,
+    PositionAmbiguity, PositionComment, QsyDistance, QsyLimitDistance, QsySettings,
     RegionPacketPath, RelayPacketPath, ReplyMessage, RxBeep, StatusTextSlot, StoredAprsMessage,
     StoredDigipeaterSettings, StoredFastRateSeconds, StoredHighSpeed, StoredLowSpeed,
     StoredSlowRateMinutes, StoredSmartBeaconingSettings, StoredStatusText, StoredTurnAngleDegrees,
-    StoredTurnSlope, StoredTurnTimeSeconds, TraceAlias, TxDelay, UiCheckSeconds, UiDigiAlias,
-    UiFloodSubstitution, UserPhrase, VoiceAlertMode, VoiceAlertSettings, WaypointFormat,
-    WaypointNameLength, WaypointOutput, WaypointSettings,
+    StoredTurnSlope, StoredTurnTimeSeconds, TncDataBand, TraceAlias, TxDelay, UiCheckSeconds,
+    UiDigiAlias, UiFloodSubstitution, UserPhrase, VoiceAlertMode, VoiceAlertSettings,
+    WaypointFormat, WaypointNameLength, WaypointOutput, WaypointSettings,
 };
 
 // D-STAR subsystem re-exports.

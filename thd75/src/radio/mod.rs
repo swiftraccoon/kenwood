@@ -43,11 +43,13 @@ use std::time::Duration;
 use crate::error::{Error, ProtocolError, TransportError};
 use crate::protocol::{self, Codec, Command, Response, command_name};
 use crate::transport::Transport;
-use crate::types::{Band, FirmwareIdentity, RadioModel, TuningMode};
+use crate::types::{Band, FirmwareIdentity, RadioModel, TncDataBand, TuningMode};
 use response_correlation::correlate;
 
 /// Default timeout for command execution (5 seconds).
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Complete wall-clock budget for a read-only exact CAT identity fast path.
+const CAT_IDENTITY_FAST_PATH_LIMIT: Duration = Duration::from_secs(2);
 
 /// Required idle interval after the packet-mode recovery preamble.
 const CAT_RECOVERY_QUIET_WINDOW: Duration = Duration::from_millis(500);
@@ -161,9 +163,27 @@ pub(crate) enum CatState {
     /// A complete binary-protocol response or a correlated CAT transition
     /// proved that ownership may move into the corresponding typed binary
     /// session. Ordinary CAT remains blocked.
-    BinaryProven,
+    BinaryProven(BinaryProtocolProof),
     /// A write may have landed without a correlated terminal response.
     RecoveryRequired,
+}
+
+/// Exact binary protocol proved on the selected transport.
+///
+/// `CatState::BinaryProven` blocks CAT generically; this companion proof stops
+/// one binary protocol from consuming a transition or diagnosis established
+/// for another protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BinaryProtocolProof {
+    /// A complete MMDVM response or exact `TN 3,x` echo proved MMDVM framing.
+    Mmdvm {
+        /// Band from an owned transient TN transition; absent for a persistent
+        /// link proved only by MMDVM diagnosis.
+        data_band: Option<TncDataBand>,
+    },
+    /// An exact `TN 2,x` echo proved KISS framing for the selected band.
+    #[cfg(feature = "aprs")]
+    Kiss(TncDataBand),
 }
 
 /// Marks the link down if an in-flight CAT future is dropped before it proves
@@ -318,11 +338,13 @@ impl<T: Transport> Radio<T> {
         Self::from_transport(transport)
     }
 
-    /// Connect with a TNC exit preamble for robustness.
+    /// Connect with a read-only CAT proof and packet-mode recovery fallback.
     ///
-    /// If the radio was left in KISS/TNC mode (e.g., by a crashed application),
-    /// normal CAT commands will fail. This method sends the same exit sequence
-    /// used by Kenwood's desktop software before starting CAT communication:
+    /// The method first requires a quiet line and one exact `ID TH-D75`
+    /// response within a two-second wall-clock budget. A radio already in CAT
+    /// therefore receives no mode-changing recovery write, preserving its live
+    /// `TN` data band. Only when that strict proof fails does it send the same
+    /// exit sequence used by Kenwood's desktop software:
     ///
     /// 1. Two empty frames
     /// 2. 300ms delay
@@ -340,20 +362,86 @@ impl<T: Transport> Radio<T> {
     /// `TN`. It cannot disable persistent DV Gateway / Reflector Terminal
     /// Mode selected by Menu No. 650; that mode keeps the link's CAT parser
     /// unavailable until the setting is changed through another control path.
-    /// This method also does not identify the radio or otherwise prove that CAT
-    /// is answering; call [`Self::identify`] when that proof is required.
+    /// After the fallback it again requires a quiet line and exact TH-D75
+    /// identity. Success therefore proves that ordinary CAT is answering.
     ///
     /// # Errors
     ///
-    /// Returns an error if any preamble write fails, the transport disconnects
-    /// during the bounded residue drain, or the line never reaches a complete
-    /// quiet window. Reporting success in any of those cases could let stale
-    /// bytes satisfy the caller's first CAT exchange.
+    /// Returns an error if neither the read-only fast path nor the fallback can
+    /// prove exact CAT identity, a preamble write fails, the transport
+    /// disconnects during the bounded residue drain, or the line never reaches
+    /// a complete quiet window.
     pub async fn connect_with_tnc_exit(transport: T) -> Result<Self, Error> {
-        tracing::info!("creating radio with TNC exit preamble");
+        tracing::info!("creating radio with read-only CAT proof and packet-mode fallback");
         let mut radio = Self::new(transport);
-        radio.send_cat_recovery_preamble().await?;
+        radio.prepare_cat_or_retain_for_diagnosis().await?;
         Ok(radio)
+    }
+
+    /// Prepare CAT or retain this exact transport for binary diagnosis.
+    ///
+    /// Unlike [`Self::connect_with_tnc_exit`], this method retains the `Radio`
+    /// owner when an attempted CAT preparation fails. A caller that needs to
+    /// distinguish a persistent binary mode may then call
+    /// [`Self::probe_silent_link`]. Once wire preparation begins, failure keeps
+    /// ordinary CAT unavailable until that probe succeeds or CAT recovery is
+    /// retried.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error without performing I/O across an unresolved MCP or GM
+    /// boundary; such a precondition error preserves the prior protocol state
+    /// for its dedicated recovery path. Otherwise, returns the failure from
+    /// exact CAT proof, recovery writes, transport ownership, or the bounded
+    /// residue drain.
+    pub async fn prepare_cat_or_retain_for_diagnosis(&mut self) -> Result<(), Error> {
+        if self.mcp_phase != McpPhase::Inactive
+            || self.mcp_saved_timeout.is_some()
+            || self.mcp_pending_exit_error.is_some()
+        {
+            return Err(Error::McpInterrupted);
+        }
+        self.require_unpoisoned_gm_stream()?;
+
+        // Arm the fail-closed state before the first await. Any cancellation or
+        // failed proof therefore leaves ordinary CAT unavailable while this
+        // owner is retained for binary diagnosis.
+        self.cat_state = CatState::RecoveryRequired;
+        self.desynced = true;
+        self.codec.clear();
+        self.last_cmd_time = None;
+        let _previous = self.link_state_tx.send_replace(LinkState::Down);
+
+        let result = self.prove_cat_or_recover_packet_mode().await;
+        if result.is_ok() {
+            self.finish_cat_recovery();
+        }
+        result
+    }
+
+    async fn prove_cat_or_recover_packet_mode(&mut self) -> Result<(), Error> {
+        let fast_path = tokio::time::timeout(
+            CAT_IDENTITY_FAST_PATH_LIMIT,
+            self.prove_isolated_cat_identity(),
+        )
+        .await;
+        match fast_path {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(error)) => {
+                tracing::debug!(%error, "read-only CAT identity fast path failed; running packet-mode recovery");
+            }
+            Err(_elapsed) => {
+                tracing::debug!(
+                    timeout_ms = CAT_IDENTITY_FAST_PATH_LIMIT.as_millis(),
+                    "read-only CAT identity fast path timed out; running packet-mode recovery"
+                );
+            }
+        }
+
+        self.codec.clear();
+        self.last_cmd_time = None;
+        self.send_cat_recovery_preamble().await?;
+        self.prove_isolated_cat_identity().await
     }
 
     /// Send the universal packet-mode exit sequence without assuming which
@@ -935,7 +1023,9 @@ impl<T: Transport> Radio<T> {
             return Err(Error::MemoryReadStreamPoisoned);
         }
         match self.cat_state {
-            CatState::BinaryProven | CatState::RecoveryRequired => Err(Error::CatRecoveryRequired),
+            CatState::BinaryProven(_) | CatState::RecoveryRequired => {
+                Err(Error::CatRecoveryRequired)
+            }
             CatState::Ready => Ok(()),
         }
     }
@@ -1347,20 +1437,53 @@ mod tests {
     #[tokio::test]
     async fn connect_with_tnc_exit_drains_every_queued_residue_chunk() -> TestResult {
         let mut mock = MockTransport::new();
+        mock.expect(b"ID\r", b"N\r");
+        mock.expect(b"\r", b"");
+        mock.expect(b"\r", b"");
+        mock.expect(&[0x03], b"");
+        mock.expect(&[0xC0, 0xFF, 0xC0], b"");
+        mock.expect(b"\rTC 1\r", b"");
+        mock.expect_reads(b"TN 0,0\r", &[b"TN 0,0\r", b"ID TH-D75\r"]);
+        mock.expect(b"ID\r", b"ID TH-D75\r");
+        mock.expect(b"ID\r", b"ID TH-D75\r");
+        mock.pend_when_empty();
+
+        let mut radio = Radio::connect_with_tnc_exit(mock).await?;
+        let identity = radio.identify().await?;
+
+        assert_eq!(identity.model, RadioModel::ThD75);
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_cat_recovery_retains_the_radio_for_binary_diagnosis() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"ID\r", b"?\r");
         mock.expect(b"\r", b"");
         mock.expect(b"\r", b"");
         mock.expect(&[0x03], b"");
         mock.expect(&[0xC0, 0xFF, 0xC0], b"");
         mock.expect(b"\rTC 1\r", b"");
         mock.expect(b"TN 0,0\r", b"");
-        mock.queue_read(b"TN 0,0\r");
-        mock.queue_read_delayed(b"ID TH-D75\r", 50);
-        mock.expect(b"ID\r", b"ID TH-D75\r");
+        mock.expect(b"ID\r", b"?\r");
+        mock.expect(b"\xE0\x03\x00", b"\xE0\x0E\x00\x01MMDVM 2018");
+        mock.pend_when_empty();
 
-        let mut radio = Radio::connect_with_tnc_exit(mock).await?;
-        let identity = radio.identify().await?;
-
-        assert_eq!(identity.model, RadioModel::ThD75);
+        let mut radio = Radio::new(mock);
+        let recovery = radio.prepare_cat_or_retain_for_diagnosis().await;
+        assert!(
+            recovery.is_err(),
+            "persistent binary mode must not be accepted as CAT: {recovery:?}"
+        );
+        assert!(
+            radio.cat_recovery_required(),
+            "failed initial CAT recovery must keep ordinary CAT blocked"
+        );
+        assert_eq!(
+            radio.probe_silent_link().await,
+            crate::LinkDiagnosis::MmdvmMode
+        );
         radio.transport.assert_complete();
         Ok(())
     }
