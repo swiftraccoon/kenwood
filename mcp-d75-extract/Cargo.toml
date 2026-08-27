@@ -3,7 +3,7 @@ name = "mcp-d75-extract"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
-description = "MCP-D75 menu-schema extractor: turns ILSpy-decompiled serializer writes into a JSON manifest and the generated Rust menu-field registry"
+description = "MCP memory-map extractor for the TH-D75 and TM-D750: turns ILSpy-decompiled serializer writes into JSON manifests, the TH-D75 Rust menu-field registry, and firmware-release diffs"
 license = "GPL-2.0-or-later"
 authors = ["swiftraccoon"]
 repository = "https://github.com/swiftraccoon/kenwood"
@@ -15,6 +15,7 @@ publish = false
 clap = { version = "4", features = ["derive"] }
 fancy-regex = "0.14"
 regex = "1"
+serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
 tempfile = "3"

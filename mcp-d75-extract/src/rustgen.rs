@@ -3,11 +3,14 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
-use serde_json::Value;
-
 use crate::error::{Result, extract_error};
-use crate::tables::GENERATOR;
-use crate::value::{display_name, req, req_array, req_i64, req_str};
+use crate::manifest::{
+    Codec, Domain, EnumCatalog, ExpandedField, Manifest, Menu, Operation, RecordEntry, Role,
+    StorageTransform,
+};
+
+/// Generator name recorded in the `@generated` header.
+const GENERATOR: &str = env!("CARGO_PKG_NAME");
 
 /// Encode a string as a deterministic Rust string literal.
 pub(crate) fn rust_string(value: &str) -> String {
@@ -37,29 +40,85 @@ pub(crate) fn rust_option_string(value: Option<&str>) -> String {
     )
 }
 
+/// One writable field of either kind.
+#[derive(Debug, Clone, Copy)]
+enum Field<'a> {
+    Direct(&'a Operation),
+    Expanded(&'a ExpandedField),
+}
+
+impl<'a> Field<'a> {
+    fn name(self) -> String {
+        match self {
+            Self::Direct(operation) => operation.name.clone().unwrap_or_else(|| "None".to_owned()),
+            Self::Expanded(field) => field.name.clone(),
+        }
+    }
+
+    const fn offset(self) -> u64 {
+        match self {
+            Self::Direct(operation) => operation.offset,
+            Self::Expanded(field) => field.offset,
+        }
+    }
+
+    const fn codec(self) -> &'a Codec {
+        match self {
+            Self::Direct(operation) => &operation.codec,
+            Self::Expanded(field) => &field.codec,
+        }
+    }
+
+    const fn domain(self) -> Option<&'a Domain> {
+        match self {
+            Self::Direct(operation) => operation.domain.as_ref(),
+            Self::Expanded(field) => field.domain.as_ref(),
+        }
+    }
+
+    const fn storage_transform(self) -> Option<&'a StorageTransform> {
+        match self {
+            Self::Direct(_) => None,
+            Self::Expanded(field) => field.storage_transform.as_ref(),
+        }
+    }
+
+    fn is_blob(self) -> bool {
+        matches!(self, Self::Direct(operation) if operation.category.as_deref() == Some("blob"))
+    }
+
+    const fn has_terms(self) -> bool {
+        match self {
+            Self::Direct(operation) => !operation.address.is_absolute(),
+            Self::Expanded(field) => !field.address.is_absolute(),
+        }
+    }
+}
+
 /// Index enum catalogs by qualified name across all menus.
-fn enum_catalogs(schema: &Value) -> Result<HashMap<String, &Value>> {
+fn enum_catalogs(manifest: &Manifest) -> Result<HashMap<&str, &EnumCatalog>> {
     let mut catalogs = HashMap::new();
-    for menu in req_array(schema, "menus")? {
-        for catalog in req_array(menu, "enum_types")? {
-            let name = req_str(catalog, "name")?.to_owned();
-            if catalogs.contains_key(&name) {
-                return Err(extract_error!("duplicate qualified enum catalog: {name}"));
+    for menu in &manifest.menus {
+        for catalog in &menu.enum_types {
+            if catalogs.insert(catalog.name.as_str(), catalog).is_some() {
+                return Err(extract_error!(
+                    "duplicate qualified enum catalog: {}",
+                    catalog.name
+                ));
             }
-            let _previous = catalogs.insert(name, catalog);
         }
     }
     Ok(catalogs)
 }
 
 /// Rust-literal min/max bounds for a little-endian integer width.
-fn rust_integer_bounds(width: i64, signed: bool) -> Result<(String, String)> {
+fn rust_integer_bounds(width: u64, signed: bool) -> Result<(String, String)> {
     if !(1..=8).contains(&width) {
         return Err(extract_error!(
             "integer field width must be in 1..=8, got {width}"
         ));
     }
-    let bits = width * 8;
+    let bits = u32::try_from(width * 8).map_err(|_| extract_error!("width overflow"))?;
     if signed {
         if bits == 64 {
             return Ok(("i64::MIN".to_owned(), "i64::MAX".to_owned()));
@@ -76,26 +135,23 @@ fn rust_integer_bounds(width: i64, signed: bool) -> Result<(String, String)> {
 /// Min/max raw enum values, checked against the storage capacity.
 fn raw_enum_bounds(
     enum_type: &str,
-    catalogs: &HashMap<String, &Value>,
+    catalogs: &HashMap<&str, &EnumCatalog>,
     maximum: i64,
 ) -> Result<(i64, i64)> {
     let catalog = catalogs
         .get(enum_type)
         .ok_or_else(|| extract_error!("field references missing enum catalog: {enum_type}"))?;
-    let options = req_array(catalog, "options")?;
-    if options.is_empty() {
+    if catalog.options.is_empty() {
         return Err(extract_error!("enum catalog has no options: {enum_type}"));
     }
     let mut values = Vec::new();
-    for option in options {
-        let value = option.get("value").and_then(Value::as_i64);
-        match value {
-            Some(value) if (0..=maximum).contains(&value) => values.push(value),
-            _ => {
-                return Err(extract_error!(
-                    "enum {enum_type} contains a value outside its 0..={maximum} storage domain"
-                ));
-            }
+    for option in &catalog.options {
+        if (0..=maximum).contains(&option.value) {
+            values.push(option.value);
+        } else {
+            return Err(extract_error!(
+                "enum {enum_type} contains a value outside its 0..={maximum} storage domain"
+            ));
         }
     }
     let minimum = values.iter().min().copied().unwrap_or_default();
@@ -104,45 +160,31 @@ fn raw_enum_bounds(
 }
 
 /// Inclusive `(min, max)` of a range or choices domain, if any.
-fn domain_bounds(domain: Option<&Value>) -> Result<Option<(i64, i64)>> {
-    let Some(domain) = domain else {
-        return Ok(None);
-    };
-    match req_str(domain, "kind")? {
-        "range" => Ok(Some((req_i64(domain, "min")?, req_i64(domain, "max")?))),
-        "choices" => {
-            let values: Vec<i64> = req_array(domain, "allowed_values")?
-                .iter()
-                .filter_map(Value::as_i64)
-                .collect();
-            if values.is_empty() {
+fn domain_bounds(domain: Option<&Domain>) -> Result<Option<(i64, i64)>> {
+    match domain {
+        None => Ok(None),
+        Some(Domain::Range { min, max, .. }) => Ok(Some((*min, *max))),
+        Some(Domain::Choices { allowed_values, .. }) => {
+            if allowed_values.is_empty() {
                 return Err(extract_error!("choice domain has no allowed values"));
             }
-            let minimum = values.iter().min().copied().unwrap_or_default();
-            let maximum = values.iter().max().copied().unwrap_or_default();
+            let minimum = allowed_values.iter().min().copied().unwrap_or_default();
+            let maximum = allowed_values.iter().max().copied().unwrap_or_default();
             Ok(Some((minimum, maximum)))
         }
-        _ => Err(extract_error!("unsupported field domain: {domain}")),
     }
 }
 
 /// Render a bit-field codec: `BitBool` for boolean values, `BitField` else.
 fn bit_field_codec_lines(
-    codec: &Value,
-    catalogs: &HashMap<String, &Value>,
-    domain: Option<&Value>,
+    bit: u64,
+    width: u64,
+    is_bool: bool,
     enum_type: Option<&str>,
+    catalogs: &HashMap<&str, &EnumCatalog>,
+    domain: Option<&Domain>,
 ) -> Result<Vec<String>> {
-    let bit = codec.get("bit").and_then(Value::as_i64);
-    let width = codec.get("width").and_then(Value::as_i64);
-    let (Some(bit), Some(width)) = (bit, width) else {
-        return Err(extract_error!(
-            "invalid bit field coordinates: bit={:?}, width={:?}",
-            codec.get("bit"),
-            codec.get("width")
-        ));
-    };
-    if width < 1 || bit < 0 {
+    if width < 1 {
         return Err(extract_error!(
             "invalid bit field coordinates: bit={bit}, width={width}"
         ));
@@ -152,8 +194,8 @@ fn bit_field_codec_lines(
             "bit field exceeds one byte: bit={bit}, width={width}"
         ));
     }
-    let mask = ((1_i64 << width) - 1) << bit;
-    if codec.get("value_type").and_then(Value::as_str) == Some("bool") {
+    let mask = ((1_u64 << width) - 1) << bit;
+    if is_bool {
         if width != 1 {
             return Err(extract_error!(
                 "boolean bit field must have width 1, got {width}"
@@ -165,7 +207,8 @@ fn bit_field_codec_lines(
             "}".to_owned(),
         ]);
     }
-    let capacity = (1_i64 << width) - 1;
+    let capacity =
+        i64::try_from((1_u64 << width) - 1).map_err(|_| extract_error!("capacity overflow"))?;
     let (minimum, maximum) = match enum_type {
         Some(enum_type) => raw_enum_bounds(enum_type, catalogs, capacity)?,
         None => domain_bounds(domain)?.unwrap_or((0, capacity)),
@@ -187,8 +230,7 @@ fn bit_field_codec_lines(
 
 /// Render a little-endian integer codec, validating any audited domain
 /// against the storage width.
-fn integer_codec_lines(codec: &Value, domain: Option<&Value>, signed: bool) -> Result<Vec<String>> {
-    let width = req_i64(codec, "width")?;
+fn integer_codec_lines(width: u64, domain: Option<&Domain>, signed: bool) -> Result<Vec<String>> {
     let (default_minimum, default_maximum) = rust_integer_bounds(width, signed)?;
     let bounds = domain_bounds(domain)?;
     let (minimum, maximum) = match bounds {
@@ -228,18 +270,15 @@ fn integer_codec_lines(codec: &Value, domain: Option<&Value>, signed: bool) -> R
 
 /// Render one manifest codec using the crate's real `FieldCodec` type.
 fn rust_codec(
-    codec: &Value,
-    catalogs: &HashMap<String, &Value>,
-    domain: Option<&Value>,
+    codec: &Codec,
+    catalogs: &HashMap<&str, &EnumCatalog>,
+    domain: Option<&Domain>,
 ) -> Result<Vec<String>> {
-    let kind = req_str(codec, "kind")?;
-    let enum_type = codec.get("enum_type").and_then(Value::as_str);
-    match kind {
-        "byte" => {
-            let bounds = domain_bounds(domain)?;
-            let (minimum, maximum) = match enum_type {
+    match codec {
+        Codec::Byte { enum_type, .. } => {
+            let (minimum, maximum) = match enum_type.as_deref() {
                 Some(enum_type) => raw_enum_bounds(enum_type, catalogs, 255)?,
-                None => bounds.unwrap_or((0, 255)),
+                None => domain_bounds(domain)?.unwrap_or((0, 255)),
             };
             if !(0 <= minimum && minimum <= maximum && maximum <= 255) {
                 return Err(extract_error!(
@@ -253,89 +292,112 @@ fn rust_codec(
                 "}".to_owned(),
             ])
         }
-        "bool" => Ok(vec!["FieldCodec::Bool".to_owned()]),
-        "bit_field" => bit_field_codec_lines(codec, catalogs, domain, enum_type),
-        "fixed_string" => {
-            let encoding = match req_str(codec, "encoding")? {
+        Codec::Bool { .. } => Ok(vec!["FieldCodec::Bool".to_owned()]),
+        Codec::BitField {
+            bit,
+            width,
+            value_type,
+            enum_type,
+            ..
+        } => bit_field_codec_lines(
+            *bit,
+            *width,
+            value_type == "bool",
+            enum_type.as_deref(),
+            catalogs,
+            domain,
+        ),
+        Codec::FixedString {
+            encoding,
+            length,
+            padding,
+            ..
+        } => {
+            let encoding = match encoding.as_str() {
                 "utf8" => "StringEncoding::Utf8",
                 "memory_map" => "StringEncoding::MemoryMap",
                 other => return Err(extract_error!("unsupported string encoding: {other}")),
             };
             Ok(vec![
                 "FieldCodec::FixedString {".to_owned(),
-                format!("    len: {},", req_i64(codec, "length")?),
+                format!("    len: {length},"),
                 format!("    encoding: {encoding},"),
-                format!("    padding: {},", req_i64(codec, "padding")?),
+                format!("    padding: {padding},"),
                 "}".to_owned(),
             ])
         }
-        "signed_le" | "unsigned_le" => integer_codec_lines(codec, domain, kind == "signed_le"),
-        "raw_bytes" => {
-            let length = codec
-                .get("length")
-                .and_then(Value::as_i64)
-                .ok_or_else(|| extract_error!("raw byte field has no inferred length"))?;
+        Codec::SignedLe { width, .. } => integer_codec_lines(*width, domain, true),
+        Codec::UnsignedLe { width, .. } => integer_codec_lines(*width, domain, false),
+        Codec::RawBytes { length, .. } => {
+            let length =
+                length.ok_or_else(|| extract_error!("raw byte field has no inferred length"))?;
             Ok(vec![
                 "FieldCodec::Bytes {".to_owned(),
                 format!("    len: {length},"),
                 "}".to_owned(),
             ])
         }
-        other => Err(extract_error!("cannot render field codec kind: {other}")),
+        Codec::ClearRange { .. } => Err(extract_error!(
+            "cannot render field codec kind: clear_range"
+        )),
     }
 }
 
 /// Yield writable direct and expanded fields with their containing menu.
-fn writable_manifest_fields(schema: &Value) -> Result<Vec<(&Value, &Value)>> {
+fn writable_manifest_fields(manifest: &Manifest) -> Result<Vec<(&Menu, Field<'_>)>> {
     let mut fields = Vec::new();
-    for menu in req_array(schema, "menus")? {
-        for operation in req_array(menu, "operations")? {
-            let writable = operation
-                .get("writable")
-                .and_then(Value::as_bool)
-                .unwrap_or(true);
-            if req_str(operation, "role")? == "field" && writable {
-                fields.push((menu, operation));
+    for menu in &manifest.menus {
+        for operation in &menu.operations {
+            if operation.role == Role::Field && operation.writable.unwrap_or(true) {
+                fields.push((menu, Field::Direct(operation)));
             }
         }
-        for record in req_array(menu, "repeated_records")? {
-            let Some(expanded) = record.get("expanded_fields").and_then(Value::as_array) else {
+        for entry in &menu.repeated_records {
+            let RecordEntry::Extracted(record) = entry else {
                 continue;
             };
-            for field in expanded {
-                let writable = field
-                    .get("writable")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(true);
-                if writable {
-                    fields.push((menu, field));
+            for field in &record.expanded_fields {
+                if field.writable.unwrap_or(true) {
+                    fields.push((menu, Field::Expanded(field)));
                 }
             }
+        }
+    }
+    for (menu, field) in &fields {
+        if field.has_terms() {
+            return Err(extract_error!(
+                "Rust registry generation requires absolute addresses; {}.{} has dimension terms",
+                menu.menu,
+                field.name()
+            ));
         }
     }
     Ok(fields)
 }
 
 /// Render a field's storage transform as a Rust `Option` literal.
-fn rust_storage_transform(field: &Value) -> Result<String> {
-    let Some(transform) = field.get("storage_transform") else {
+fn rust_storage_transform(transform: Option<&StorageTransform>) -> Result<String> {
+    let Some(transform) = transform else {
         return Ok("None".to_owned());
     };
-    if transform.get("kind").and_then(Value::as_str) != Some("scaled_integer") {
-        return Err(extract_error!("unsupported storage transform: {transform}"));
+    if transform.kind != "scaled_integer" {
+        return Err(extract_error!(
+            "unsupported storage transform: {}",
+            transform.kind
+        ));
     }
     Ok(format!(
         "Some(StorageTransform {{ input_unit: {}, numerator: {}, denominator: {} }})",
-        rust_string(req_str(transform, "input_unit")?),
-        req_i64(transform, "numerator")?,
-        req_i64(transform, "denominator")?
+        rust_string(&transform.input_unit),
+        transform.numerator,
+        transform.denominator
     ))
 }
 
 /// Fixed preamble of the generated registry: header comment, provenance
 /// constants, and the `MenuOption`/`StorageTransform`/`MenuField` types.
-fn registry_header_lines(schema: &Value) -> Result<Vec<String>> {
-    Ok([
+fn registry_header_lines(manifest: &Manifest) -> Vec<String> {
+    [
         format!("// @generated by {GENERATOR}; do not edit."),
         "//! MCP-D75 menu field registry generated from the reviewed serializer manifest."
             .to_owned(),
@@ -345,13 +407,13 @@ fn registry_header_lines(schema: &Value) -> Result<Vec<String>> {
         "/// Manifest format version used to generate this registry.".to_owned(),
         format!(
             "pub const MCP_D75_SCHEMA_VERSION: u32 = {};",
-            req_i64(schema, "schema_version")?
+            manifest.schema_version
         ),
         "/// SHA-256 of the normalized reviewed `ILSpy` source project.".to_owned(),
         "pub const MCP_D75_SOURCE_SHA256: &str =".to_owned(),
         format!(
             "    {};",
-            rust_string(req_str(req(schema, "source")?, "normalized_source_sha256")?)
+            rust_string(&manifest.source.normalized_source_sha256)
         ),
         String::new(),
         "/// One raw value in an MCP-D75 enum domain.".to_owned(),
@@ -406,44 +468,39 @@ fn registry_header_lines(schema: &Value) -> Result<Vec<String>> {
         "}".to_owned(),
         String::new(),
     ]
-    .to_vec())
+    .to_vec()
 }
 
 /// Render the per-menu enum option constant blocks, filling `option_names`.
 fn option_constant_lines(
-    schema: &Value,
+    manifest: &Manifest,
     option_names: &mut HashMap<String, String>,
 ) -> Result<Vec<String>> {
     let mut lines = Vec::new();
-    for menu in req_array(schema, "menus")? {
-        let menu_name = req_str(menu, "menu")?;
-        for (index, catalog) in req_array(menu, "enum_types")?.iter().enumerate() {
-            let enum_type = req_str(catalog, "name")?;
-            let constant_name = format!("OPTIONS_{}_{index:03}", menu_name.to_uppercase());
-            drop(option_names.insert(enum_type.to_owned(), constant_name.clone()));
+    for menu in &manifest.menus {
+        for (index, catalog) in menu.enum_types.iter().enumerate() {
+            let constant_name = format!("OPTIONS_{}_{index:03}", menu.menu.to_uppercase());
+            drop(option_names.insert(catalog.name.clone(), constant_name.clone()));
             lines.push(format!("static {constant_name}: &[MenuOption] = &["));
-            for option in req_array(catalog, "options")? {
-                let raw = option.get("value").and_then(Value::as_i64);
-                let Some(raw) = raw.filter(|value| *value >= 0) else {
+            for option in &catalog.options {
+                if option.value < 0 {
                     return Err(extract_error!(
-                        "enum {enum_type} has unsupported raw value {:?}",
-                        option.get("value")
+                        "enum {} has unsupported raw value {}",
+                        catalog.name,
+                        option.value
                     ));
-                };
+                }
                 lines.extend([
                     "    MenuOption {".to_owned(),
-                    format!("        raw: {raw},"),
-                    format!(
-                        "        member: {},",
-                        rust_string(req_str(option, "member")?)
-                    ),
+                    format!("        raw: {},", option.value),
+                    format!("        member: {},", rust_string(&option.member)),
                     format!(
                         "        label: {},",
-                        rust_option_string(option.get("label").and_then(Value::as_str))
+                        rust_option_string(option.label.as_deref())
                     ),
                     format!(
                         "        resource_key: {},",
-                        rust_option_string(option.get("resource_key").and_then(Value::as_str))
+                        rust_option_string(option.resource_key.as_deref())
                     ),
                     "    },".to_owned(),
                 ]);
@@ -457,28 +514,24 @@ fn option_constant_lines(
 /// Render the deduplicated allowed-value constants, filling
 /// `choice_value_names` in first-encounter order.
 fn choice_domain_lines(
-    schema: &Value,
+    manifest: &Manifest,
     choice_value_names: &mut Vec<(Vec<i64>, String)>,
 ) -> Result<Vec<String>> {
     let mut lines = Vec::new();
-    for (_menu, field) in writable_manifest_fields(schema)? {
-        let Some(domain) = field.get("domain") else {
+    for (_menu, field) in writable_manifest_fields(manifest)? {
+        let Some(Domain::Choices { allowed_values, .. }) = field.domain() else {
             continue;
         };
-        if domain.get("kind").and_then(Value::as_str) != Some("choices") {
-            continue;
-        }
-        let values: Vec<i64> = req_array(domain, "allowed_values")?
+        if choice_value_names
             .iter()
-            .filter_map(Value::as_i64)
-            .collect();
-        if choice_value_names.iter().any(|(known, _)| *known == values) {
+            .any(|(known, _)| *known == *allowed_values)
+        {
             continue;
         }
         let constant_name = format!("ALLOWED_DOMAIN_{:03}", choice_value_names.len());
         lines.push("#[rustfmt::skip]".to_owned());
         lines.push(format!("static {constant_name}: &[u64] = &["));
-        for raw in &values {
+        for raw in allowed_values {
             if *raw < 0 {
                 return Err(extract_error!(
                     "choice domain has unsupported raw value {raw}"
@@ -487,26 +540,22 @@ fn choice_domain_lines(
             lines.push(format!("    {raw},"));
         }
         lines.extend(["];".to_owned(), String::new()]);
-        choice_value_names.push((values, constant_name));
+        choice_value_names.push((allowed_values.clone(), constant_name));
     }
     Ok(lines)
 }
 
 /// Render one `MenuField` entry of the registry array.
 fn menu_field_entry_lines(
-    menu: &Value,
-    operation: &Value,
-    catalogs: &HashMap<String, &Value>,
+    menu: &Menu,
+    field: Field<'_>,
+    catalogs: &HashMap<&str, &EnumCatalog>,
     option_names: &HashMap<String, String>,
     choice_value_names: &[(Vec<i64>, String)],
 ) -> Result<Vec<String>> {
-    let name = format!(
-        "{}.{}",
-        req_str(menu, "menu")?,
-        display_name(req(operation, "name")?)
-    );
-    let codec = req(operation, "codec")?;
-    let enum_type = codec.get("enum_type").and_then(Value::as_str);
+    let name = format!("{}.{}", menu.menu, field.name());
+    let codec = field.codec();
+    let enum_type = codec.enum_type();
     let options = match enum_type {
         None => "&[]".to_owned(),
         Some(enum_type) => option_names
@@ -514,43 +563,36 @@ fn menu_field_entry_lines(
             .cloned()
             .ok_or_else(|| extract_error!("field {name} references missing option domain"))?,
     };
-    let domain = operation.get("domain");
-    let allowed_values =
-        if domain.and_then(|d| d.get("kind")).and_then(Value::as_str) == Some("choices") {
-            let values: Vec<i64> = domain
-                .and_then(|d| d.get("allowed_values"))
-                .and_then(Value::as_array)
-                .map(|array| array.iter().filter_map(Value::as_i64).collect())
-                .unwrap_or_default();
-            choice_value_names
-                .iter()
-                .find(|(known, _)| *known == values)
-                .map(|(_, constant)| constant.clone())
-                .ok_or_else(|| extract_error!("field {name} references missing option domain"))?
-        } else {
-            "&[]".to_owned()
-        };
+    let domain = field.domain();
+    let allowed_values = if let Some(Domain::Choices { allowed_values, .. }) = domain {
+        choice_value_names
+            .iter()
+            .find(|(known, _)| *known == *allowed_values)
+            .map(|(_, constant)| constant.clone())
+            .ok_or_else(|| extract_error!("field {name} references missing option domain"))?
+    } else {
+        "&[]".to_owned()
+    };
     let mut lines = vec![
         "    MenuField {".to_owned(),
-        format!("        menu: {},", rust_string(req_str(menu, "menu")?)),
+        format!("        menu: {},", rust_string(&menu.menu)),
         format!("        enum_type: {},", rust_option_string(enum_type)),
         "        descriptor: FieldDescriptor::new(".to_owned(),
         format!("            {},", rust_string(&name)),
-        format!("            0x{:X},", req_i64(operation, "offset")?),
+        format!("            0x{:X},", field.offset()),
     ];
     for codec_line in rust_codec(codec, catalogs, domain)? {
         lines.push(format!("            {codec_line}"));
     }
-    let is_blob = operation.get("category").and_then(Value::as_str) == Some("blob");
     lines.extend([
         "        ),".to_owned(),
         format!("        options: {options},"),
         format!("        allowed_values: {allowed_values},"),
         format!(
             "        storage_transform: {},",
-            rust_storage_transform(operation)?
+            rust_storage_transform(field.storage_transform())?
         ),
-        format!("        is_blob: {is_blob},"),
+        format!("        is_blob: {},", field.is_blob()),
         "    },".to_owned(),
     ]);
     Ok(lines)
@@ -560,37 +602,43 @@ fn menu_field_entry_lines(
 ///
 /// # Errors
 ///
-/// Returns an error when the schema is internally inconsistent: a codec
-/// references a missing enum catalog or option domain, a domain exceeds its
-/// storage capacity, or the rendered field count disagrees with the
-/// manifest's summary.
-pub fn rust_text(schema: &Value) -> Result<String> {
-    let catalogs = enum_catalogs(schema)?;
+/// Returns an error when the manifest is not the TH-D75's, when a field
+/// carries dimension terms, when a codec references a missing enum catalog
+/// or option domain, when a domain exceeds its storage capacity, or when the
+/// rendered field count disagrees with the manifest's summary.
+pub fn rust_text(manifest: &Manifest) -> Result<String> {
+    if manifest.model.radio != "thd75" {
+        return Err(extract_error!(
+            "Rust registry generation is defined only for thd75 in this phase; got {}",
+            manifest.model.radio
+        ));
+    }
+    let catalogs = enum_catalogs(manifest)?;
     let mut option_names: HashMap<String, String> = HashMap::new();
     let mut choice_value_names: Vec<(Vec<i64>, String)> = Vec::new();
-    let mut lines = registry_header_lines(schema)?;
-    lines.extend(option_constant_lines(schema, &mut option_names)?);
-    lines.extend(choice_domain_lines(schema, &mut choice_value_names)?);
+    let mut lines = registry_header_lines(manifest);
+    lines.extend(option_constant_lines(manifest, &mut option_names)?);
+    lines.extend(choice_domain_lines(manifest, &mut choice_value_names)?);
     lines.extend([
         "/// All safely writable public fields from the reviewed MCP-D75 serializers.".to_owned(),
         "#[rustfmt::skip]".to_owned(),
         "pub static MCP_D75_MENU_FIELDS: &[MenuField] = &[".to_owned(),
     ]);
     let mut rendered_fields: u64 = 0;
-    for (menu, operation) in writable_manifest_fields(schema)? {
+    for (menu, field) in writable_manifest_fields(manifest)? {
         rendered_fields += 1;
         lines.extend(menu_field_entry_lines(
             menu,
-            operation,
+            field,
             &catalogs,
             &option_names,
             &choice_value_names,
         )?);
     }
-    let expected_fields = req_i64(req(schema, "summary")?, "writable_registry_field_count")?;
-    if i64::try_from(rendered_fields).unwrap_or_default() != expected_fields {
+    if rendered_fields != manifest.summary.writable_registry_field_count {
         return Err(extract_error!(
-            "rendered {rendered_fields} public fields but manifest reports {expected_fields}"
+            "rendered {rendered_fields} public fields but manifest reports {}",
+            manifest.summary.writable_registry_field_count
         ));
     }
     lines.extend([

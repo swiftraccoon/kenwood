@@ -5,6 +5,7 @@
 use clap as _;
 use fancy_regex as _;
 use regex as _;
+use serde as _;
 use serde_json as _;
 use sha2 as _;
 use tempfile as _;

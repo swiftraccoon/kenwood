@@ -1,24 +1,40 @@
-//! Extraction of the public, statically sized repeated-record serializers.
+//! Public repeated-record lists and the private sub-writer catalog (spec D5).
 
-use std::collections::HashMap;
-use std::path::Path;
-
-use serde_json::{Value, json};
-
-use crate::codecs::codec_for_call;
-use crate::csharp::{Patterns, compact_expression, find_balanced_body, split_arguments};
+use crate::address::{
+    Address, RecordBase, SlotSymbol, SymbolScope, Term, resolve_offset, resolve_record_base,
+};
+use crate::class_index::{ClassIndex, ClassInfo};
+use crate::codecs::classify_call;
+use crate::csharp::{compact_expression, split_arguments};
+use crate::discovery::{
+    MethodRef, NestedCall, child_writer, find_base_override, find_writer, resolve_list_target,
+    setter_symbol, slot_symbols, verify_anchor_passthrough,
+};
 use crate::error::{Result, extract_error};
-use crate::sources::{parse_types, source_label};
-use crate::tables::{RECORD_SYMBOLS, RecordSpec, fixed_string_padding_override};
-use crate::value::{display_name, insert, req, req_i64, req_str, without_nulls};
+use crate::manifest::{
+    Codec, ExpandedField, OffsetLayout, PrivateRecord, Record, RecordField, Role, offset_hex,
+};
+use crate::model::{PrivateWriterSpec, RecordSpec, StorageTransformSpec, SymbolOverride};
+use crate::operations::{WriteScope, direct_calls};
+use crate::sources::ClassTypes;
 
-/// Extract the child writer's checked linear or one-override base formula.
-fn record_offset_layout(
-    patterns: &Patterns,
-    body: &str,
-    count: usize,
-) -> Result<(String, Value, Vec<i64>)> {
-    let assignments: Vec<(String, String)> = patterns
+/// The class whose writer makes the nested calls, with its slot symbols.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Owner<'a> {
+    /// Project class index.
+    pub(crate) index: &'a ClassIndex,
+    /// Calling class.
+    pub(crate) class: &'a ClassInfo,
+    /// Slot symbols of the calling class.
+    pub(crate) slots: &'a [SlotSymbol],
+    /// Memory writer class name.
+    pub(crate) writer_class: &'a str,
+}
+
+/// The single `int <var> = <expr containing A_1>;` assignment of a child writer.
+fn base_assignment(scope: &WriteScope<'_>, body: &str, label: &str) -> Result<(String, String)> {
+    let assignments: Vec<(String, String)> = scope
+        .patterns
         .base_assign_re
         .captures_iter(body)
         .map(|capture| {
@@ -36,336 +52,639 @@ fn record_offset_layout(
             )
         })
         .collect();
-    if assignments.len() != 1 {
-        return Err(extract_error!(
-            "record writer must contain exactly one A_1 base assignment, got {assignments:?}"
-        ));
+    match assignments.as_slice() {
+        [(variable, expression)] => Ok((variable.clone(), expression.clone())),
+        _ => Err(extract_error!(
+            "{label} must contain exactly one A_1 base assignment, got {assignments:?}"
+        )),
     }
-    let (variable, expression) = assignments
-        .into_iter()
-        .next()
-        .ok_or_else(|| extract_error!("record writer base assignment vanished"))?;
-    let compact = compact_expression(&expression);
-    if let Some(linear) = patterns.linear_base_re.captures(&compact) {
-        let base: i64 = linear
-            .get(1)
-            .and_then(|digits| digits.as_str().parse().ok())
-            .ok_or_else(|| extract_error!("unparsable record base in {compact}"))?;
-        let stride: i64 = linear
-            .get(2)
-            .and_then(|digits| digits.as_str().parse().ok())
-            .ok_or_else(|| extract_error!("unparsable record stride in {compact}"))?;
-        let count_i64 = i64::try_from(count)
-            .map_err(|_| extract_error!("record count {count} exceeds supported range"))?;
-        let bases = (0..count_i64).map(|index| base + stride * index).collect();
-        return Ok((
-            variable,
-            json!({"kind": "linear", "base": base, "stride": stride}),
-            bases,
-        ));
-    }
-    if let Some(piecewise) = patterns.piecewise_base_re.captures(&compact) {
-        let field = |index: usize| -> Result<i64> {
-            piecewise
-                .get(index)
-                .and_then(|digits| digits.as_str().parse().ok())
-                .ok_or_else(|| extract_error!("unparsable piecewise record base in {compact}"))
-        };
-        let override_index = field(1)?;
-        let override_base = field(2)?;
-        let base = field(3)?;
-        let stride = field(4)?;
-        let count_i64 = i64::try_from(count)
-            .map_err(|_| extract_error!("record count {count} exceeds supported range"))?;
-        if !(0..count_i64).contains(&override_index) {
-            return Err(extract_error!(
-                "record base override index {override_index} is outside count {count}"
-            ));
-        }
-        let mut bases: Vec<i64> = (0..count_i64).map(|index| base + stride * index).collect();
-        let slot = usize::try_from(override_index)
-            .ok()
-            .and_then(|index| bases.get_mut(index))
-            .ok_or_else(|| {
-                extract_error!("record base override index {override_index} is invalid")
-            })?;
-        *slot = override_base;
-        let mut overrides = serde_json::Map::new();
-        drop(overrides.insert(override_index.to_string(), Value::from(override_base)));
-        return Ok((
-            variable,
-            json!({
-                "kind": "linear_with_override",
-                "base": base,
-                "stride": stride,
-                "overrides": overrides,
-            }),
-            bases,
-        ));
-    }
-    Err(extract_error!(
-        "unsupported record base expression: {}",
-        expression.trim()
-    ))
 }
 
-/// Offset of a record write relative to its base-offset variable.
-fn relative_record_offset(expression: &str, variable: &str) -> Result<i64> {
+/// Offset of a record write relative to its base variable.
+fn relative_record_offset(expression: &str, variable: &str) -> Result<u64> {
     let compact = compact_expression(expression);
     if compact == variable {
         return Ok(0);
     }
-    let pattern = regex::Regex::new(&format!(r"^{}\+(\d+)$", regex::escape(variable)))
-        .map_err(|error| extract_error!("record offset pattern failed to compile: {error}"))?;
-    if let Some(capture) = pattern.captures(&compact)
-        && let Some(offset) = capture
-            .get(1)
-            .and_then(|digits| digits.as_str().parse().ok())
-    {
-        return Ok(offset);
-    }
-    Err(extract_error!(
-        "record write offset is not a non-negative constant relative to {variable}: {expression}"
-    ))
+    compact
+        .strip_prefix(variable)
+        .and_then(|rest| rest.strip_prefix('+'))
+        .and_then(|digits| digits.parse::<u64>().ok())
+        .ok_or_else(|| {
+            extract_error!(
+                "record write offset is not a non-negative constant relative to {variable}: {expression}"
+            )
+        })
 }
 
 /// Index of the offset argument for a supported record writer call.
 fn record_offset_argument(method: &str, arguments: &[String]) -> Result<usize> {
-    if matches!(method, "c" | "d") && arguments.len() == 3 {
-        return Ok(1);
+    match (method, arguments.len()) {
+        ("c" | "d", 3) => Ok(1),
+        ("b", 3) => Ok(2),
+        ("a", 2..=4) => Ok(arguments.len() - 1),
+        _ => Err(extract_error!(
+            "unsupported record writer call A_0.{method}({})",
+            arguments.join(", ")
+        )),
     }
-    if method == "b" && arguments.len() == 3 {
-        return Ok(2);
-    }
-    if method == "a" && (2..=4).contains(&arguments.len()) {
-        return Ok(arguments.len() - 1);
-    }
-    Err(extract_error!(
-        "unsupported record writer call A_0.{method}({})",
-        arguments.join(", ")
-    ))
 }
 
-/// Expand per-record relative fields to absolute indexed offsets.
-fn expand_record_fields(list_name: &str, bases: &[i64], fields: &[Value]) -> Result<Vec<Value>> {
-    let mut expanded_fields = Vec::new();
-    for (record_index, base) in bases.iter().enumerate() {
-        for field in fields {
-            if req_str(field, "role")? != "field" {
-                continue;
-            }
-            let offset = base + req_i64(field, "relative_offset")?;
-            let name = display_name(req(field, "name")?);
-            let mut expanded = json!({
-                "record_index": record_index,
-                "name": format!("{list_name}[{record_index}].{name}"),
-                "offset": offset,
-                "offset_hex": format!("0x{offset:04X}"),
-                "codec": req(field, "codec")?.clone(),
-            });
-            for key in [
-                "aliases",
-                "storage_transform",
-                "domain",
-                "writable",
-                "not_writable_reason",
-            ] {
-                if let Some(extra) = field.get(key) {
-                    insert(&mut expanded, key, extra.clone())?;
-                }
-            }
-            expanded_fields.push(expanded);
+fn layout_from(base: &RecordBase) -> OffsetLayout {
+    OffsetLayout {
+        kind: if base.overrides.is_empty() {
+            "linear"
+        } else {
+            "linear_with_override"
         }
+        .to_owned(),
+        base: base.base,
+        stride: Some(base.stride),
+        overrides: base
+            .overrides
+            .iter()
+            .map(|(index, value)| (index.to_string(), *value))
+            .collect(),
+        terms: base.terms.clone(),
     }
-    Ok(expanded_fields)
 }
 
-/// Build one per-record field entry from a single direct writer call.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "single-use helper split out of extract_repeated_record_with for length; the arguments are that function's locals"
-)]
+/// Slot symbols of `target` plus verification that the owner passes its own
+/// symbols through to them via the private `field` that holds the target.
+fn inherited_slots(
+    scope: &WriteScope<'_>,
+    owner: &Owner<'_>,
+    field: &str,
+    target: &ClassInfo,
+) -> Result<Vec<SlotSymbol>> {
+    let slots = slot_symbols(scope.patterns, target, scope.spec)?;
+    for slot in &slots {
+        let owner_symbol = owner
+            .slots
+            .iter()
+            .find(|candidate| candidate.anchor == slot.anchor)
+            .ok_or_else(|| {
+                extract_error!(
+                    "{} declares anchor {} but its owner {} has no symbol for it",
+                    target.name,
+                    slot.anchor,
+                    owner.class.name
+                )
+            })?;
+        verify_anchor_passthrough(owner.class, field, &slot.anchor, &owner_symbol.symbol)?;
+    }
+    Ok(slots)
+}
+
+struct FieldContext<'a> {
+    scope: &'a WriteScope<'a>,
+    record_class: &'a ClassInfo,
+    types: &'a ClassTypes,
+    symbols: &'static [SymbolOverride],
+    variable: &'a str,
+}
+
+fn role_override(role: &str) -> Role {
+    match role {
+        "internal" => Role::Internal,
+        "constant" => Role::Constant,
+        _ => Role::Field,
+    }
+}
+
 fn record_field(
-    patterns: &Patterns,
-    spec: &RecordSpec,
-    types: &crate::sources::ClassTypes,
-    symbol_overrides: &HashMap<&str, Value>,
-    constants: &HashMap<String, i64>,
-    variable: &str,
-    sequence: usize,
+    context: &FieldContext<'_>,
+    sequence: u64,
     writer: &str,
-    call_arguments: &str,
-) -> Result<Value> {
-    let source_class = spec.source_class;
-    let method = spec.method;
-    let mut arguments = split_arguments(call_arguments);
+    argument_text: &str,
+) -> Result<RecordField> {
+    let mut arguments = split_arguments(argument_text);
     let source_expression = arguments
         .first()
         .map(|text| text.trim().to_owned())
         .unwrap_or_default();
-    let override_entry = symbol_overrides.get(source_expression.as_str());
-    let mut parse_properties = types.properties.clone();
-    if let Some(override_value) = override_entry {
-        let override_name = req_str(override_value, "name")?.to_owned();
-        let override_type = req_str(override_value, "csharp_type")?.to_owned();
+    let override_entry = context
+        .symbols
+        .iter()
+        .find(|symbol| symbol.symbol == source_expression);
+    let mut parse_properties = context.types.clone();
+    if let Some(entry) = override_entry {
         if let Some(first) = arguments.first_mut() {
-            first.clone_from(&override_name);
+            entry.name.clone_into(first);
         }
-        drop(parse_properties.insert(override_name, override_type));
+        drop(
+            parse_properties
+                .properties
+                .insert(entry.name.to_owned(), entry.csharp_type.to_owned()),
+        );
     }
     let offset_index = record_offset_argument(writer, &arguments)?;
     let offset_expression = arguments.get(offset_index).cloned().unwrap_or_default();
-    let relative_offset = relative_record_offset(&offset_expression, variable)?;
+    let relative_offset = relative_record_offset(&offset_expression, context.variable)?;
     if let Some(slot) = arguments.get_mut(offset_index) {
         *slot = relative_offset.to_string();
     }
-    let (mut codec, name, role, parsed_offset) = codec_for_call(
-        patterns,
+    let classified = classify_call(
+        context.scope.patterns,
         writer,
         &arguments,
         &parse_properties,
-        &types.private_fields,
-        &types.enums,
-        constants,
+        context.scope.constants,
+        &[],
+        context.scope.spec.value_helpers,
     )?;
-    if parsed_offset != relative_offset {
+    if classified.codec.value_type() == Some("unknown") {
         return Err(extract_error!(
-            "internal record offset mismatch in {source_class}.{method}: \
-             {parsed_offset} versus {relative_offset}"
+            "{}: the value of A_0.{writer}({argument_text}) is neither a typed member nor a spec'd record symbol",
+            context.record_class.name
         ));
     }
-    let field_name: Option<String> = match override_entry {
-        Some(override_value) => Some(req_str(override_value, "name")?.to_owned()),
-        None => name,
-    };
-    if let Some(field_name) = field_name.as_deref()
-        && let Some(padding) = fixed_string_padding_override(source_class, field_name)
-        && codec.get("kind").and_then(Value::as_str) == Some("fixed_string")
+    let mut codec = classified.codec;
+    let name = override_entry.map_or(classified.name, |entry| Some(entry.name.to_owned()));
+    if let (Some(field_name), Codec::FixedString { padding, .. }) = (name.as_deref(), &mut codec)
+        && let Some(fill) = context
+            .scope
+            .spec
+            .padding_override(&context.record_class.name, field_name)
     {
-        insert(&mut codec, "padding", Value::from(padding))?;
+        *padding = fill;
     }
-    let field_role = override_entry
-        .and_then(|override_value| override_value.get("role"))
-        .and_then(Value::as_str)
-        .unwrap_or(role);
-    let mut field = json!({
-        "sequence": sequence,
-        "role": field_role,
-        "name": field_name,
-        "relative_offset": relative_offset,
-        "codec": without_nulls(&codec)?,
+    let role = override_entry
+        .and_then(|entry| entry.role)
+        .map_or(classified.role, role_override);
+    let domain = name.as_deref().and_then(|field_name| {
+        context
+            .scope
+            .spec
+            .record_domain(&context.record_class.name, field_name)
     });
-    if let Some(override_value) = override_entry {
-        for key in ["aliases", "storage_transform"] {
-            if let Some(extra) = override_value.get(key) {
-                insert(&mut field, key, extra.clone())?;
-            }
-        }
-    }
-    let domain_name: Option<String> = req(&field, "name")?.as_str().map(ToOwned::to_owned);
-    if let Some(domain) = domain_name
-        .as_deref()
-        .and_then(|field_name| crate::tables::RECORD_FIELD_DOMAINS.get(&(source_class, field_name)))
-    {
-        insert(&mut field, "domain", domain.clone())?;
-    }
-    if source_class == "MyPositionData"
-        && req(&field, "name")?.as_str() == Some("MyPositionChannel")
-    {
-        insert(&mut field, "writable", Value::from(false))?;
-        insert(
-            &mut field,
-            "not_writable_reason",
-            Value::from("public storage-width byte has no verified MCP-D75 UI/domain semantics"),
-        )?;
-    }
-    Ok(field)
+    let (writable, not_writable_reason) = override_entry
+        .and_then(|entry| entry.not_writable_reason)
+        .map_or((None, None), |reason| {
+            (Some(false), Some(reason.to_owned()))
+        });
+    Ok(RecordField {
+        sequence,
+        role,
+        name,
+        relative_offset,
+        codec,
+        aliases: override_entry
+            .filter(|entry| !entry.aliases.is_empty())
+            .map(|entry| {
+                entry
+                    .aliases
+                    .iter()
+                    .map(|alias| (*alias).to_owned())
+                    .collect()
+            }),
+        storage_transform: override_entry.and_then(|entry| {
+            entry
+                .storage_transform
+                .map(StorageTransformSpec::to_manifest)
+        }),
+        domain,
+        writable,
+        not_writable_reason,
+    })
 }
 
-/// Extract and expand one statically sized public child serializer.
-pub(crate) fn extract_repeated_record_with(
-    patterns: &Patterns,
+fn expand(
+    list: &str,
+    record_class: &str,
+    bases: &[u64],
+    terms: &[Term],
+    fields: &[RecordField],
+) -> Result<Vec<ExpandedField>> {
+    let mut expanded = Vec::new();
+    for (record_index, base) in bases.iter().enumerate() {
+        for field in fields.iter().filter(|field| field.role == Role::Field) {
+            let offset = base
+                .checked_add(field.relative_offset)
+                .ok_or_else(|| extract_error!("expanded record offset overflows"))?;
+            let name = field.name.clone().unwrap_or_else(|| "None".to_owned());
+            expanded.push(ExpandedField {
+                record_index: u64::try_from(record_index)
+                    .map_err(|_| extract_error!("record index overflow"))?,
+                name: format!("{list}[{record_index}].{name}"),
+                writer_class: record_class.to_owned(),
+                offset,
+                offset_hex: offset_hex(offset),
+                address: Address {
+                    base: offset,
+                    terms: terms.to_vec(),
+                },
+                codec: field.codec.clone(),
+                aliases: field.aliases.clone(),
+                storage_transform: field.storage_transform.clone(),
+                domain: field.domain.clone(),
+                writable: field.writable,
+                not_writable_reason: field.not_writable_reason.clone(),
+            });
+        }
+    }
+    Ok(expanded)
+}
+
+fn pinned_overrides(
+    scope: &WriteScope<'_>,
+    owner: &Owner<'_>,
     spec: &RecordSpec,
-    path: &Path,
-    source: &str,
-    source_dir: &Path,
-    constants: &HashMap<String, i64>,
-) -> Result<Value> {
-    let source_class = spec.source_class;
-    let method = spec.method;
-    let count = spec.count;
-    let (body, method_line) = find_balanced_body(
-        source,
-        &format!(
-            r"^\s*public\s+(?:override\s+)?void\s+{}\s*\(\s*m6\s+A_0\s*,\s*int\s+A_1\s*\)",
-            regex::escape(method)
-        ),
-    )?;
-    let (variable, offset_layout, bases) = record_offset_layout(patterns, &body, count)?;
-    let types = parse_types(patterns, source)?;
-    let empty = HashMap::new();
-    let symbol_overrides: &HashMap<&str, Value> =
-        RECORD_SYMBOLS.get(source_class).unwrap_or(&empty);
-    let direct_mention_count = patterns.a0_mention_re.find_iter(&body).count();
-    let direct_matches: Vec<(String, String)> = patterns
-        .direct_call_re
-        .captures_iter(&body)
-        .map(|capture| {
-            (
-                capture
-                    .get(1)
-                    .map(|m| m.as_str())
-                    .unwrap_or_default()
-                    .to_owned(),
-                capture
-                    .get(2)
-                    .map(|m| m.as_str())
-                    .unwrap_or_default()
-                    .to_owned(),
-            )
-        })
-        .collect();
-    if direct_matches.len() != direct_mention_count {
+    field: &str,
+    record_class: &ClassInfo,
+) -> Result<Vec<(String, u64)>> {
+    let Some(base_override) = spec.base_override else {
+        return Ok(Vec::new());
+    };
+    let literal = find_base_override(owner.class, field, base_override.property)?;
+    if literal != base_override.value {
         return Err(extract_error!(
-            "{source_class}.{method} has {direct_mention_count} A_0 calls but only {} \
-             match the supported one-line call shape",
-            direct_matches.len()
+            "{}.{field} assigns {} = {literal}, spec pins {}",
+            owner.class.name,
+            base_override.property,
+            base_override.value
         ));
     }
+    let symbol =
+        setter_symbol(scope.patterns, record_class, base_override.property)?.ok_or_else(|| {
+            extract_error!(
+                "{} has no {} setter",
+                record_class.name,
+                base_override.property
+            )
+        })?;
+    Ok(vec![(symbol, literal)])
+}
 
-    let mut fields = Vec::new();
-    for (sequence, (writer, call_arguments)) in direct_matches.iter().enumerate() {
-        fields.push(record_field(
-            patterns,
-            spec,
-            &types,
-            symbol_overrides,
-            constants,
-            &variable,
-            sequence,
-            writer,
-            call_arguments,
-        )?);
+/// Extract one public record list called from the owner's writer.
+pub(crate) fn extract_record(
+    scope: &WriteScope<'_>,
+    owner: &Owner<'_>,
+    spec: &RecordSpec,
+    call: &NestedCall,
+) -> Result<Record> {
+    let target = resolve_list_target(scope.patterns, owner.class, &call.target)?;
+    if target.property != spec.list {
+        return Err(extract_error!(
+            "{}: call {} resolves to {} but the spec entry is {}",
+            owner.class.name,
+            call.target,
+            target.property,
+            spec.list
+        ));
     }
-
-    let expanded_fields = expand_record_fields(spec.name, &bases, &fields)?;
+    let record_class = owner
+        .index
+        .resolve(owner.class, &target.element_class)
+        .ok_or_else(|| extract_error!("record class {} not found", target.element_class))?;
+    let write = child_writer(
+        scope.patterns,
+        record_class,
+        &call.method,
+        owner.writer_class,
+    )?;
+    let slots = inherited_slots(scope, owner, &target.field, record_class)?;
+    let overrides = pinned_overrides(scope, owner, spec, &target.field, record_class)?;
+    let label = format!("{}.{}", record_class.name, write.method);
+    let (variable, expression) = base_assignment(scope, &write.body, &label)?;
+    let symbol_scope = SymbolScope {
+        constants: scope.constants,
+        slots: &slots,
+        overrides: &overrides,
+    };
+    let base = resolve_record_base(&expression, &symbol_scope)
+        .map_err(|error| extract_error!("{label}: {error}"))?;
+    let bases = base.bases(spec.count)?;
+    let types = scope.index.types(scope.patterns, record_class)?;
+    let context = FieldContext {
+        scope,
+        record_class,
+        types: &types,
+        symbols: scope.spec.record_symbols(&record_class.name),
+        variable: &variable,
+    };
+    let mut fields = Vec::new();
+    for (sequence, (writer, argument_text)) in direct_calls(scope.patterns, &write.body, &label)?
+        .into_iter()
+        .enumerate()
+    {
+        let sequence =
+            u64::try_from(sequence).map_err(|_| extract_error!("record field count overflow"))?;
+        fields.push(record_field(&context, sequence, &writer, &argument_text)?);
+    }
+    let expanded_fields = expand(spec.list, &record_class.name, &bases, &base.terms, &fields)?;
     let field_count_per_record = fields
         .iter()
-        .map(|field| req_str(field, "role").map(|role| u64::from(role == "field")))
-        .sum::<Result<u64>>()?;
-    let relative_path = source_label(path, source_dir);
-    Ok(json!({
-        "name": spec.name,
-        "source_class": source_class,
-        "source_file": relative_path,
-        "write_method": format!("{method}(m6 A_0, int A_1)"),
-        "write_method_line": method_line,
-        "count": count,
-        "offset_layout": offset_layout,
-        "record_base_offsets": bases,
-        "operation_count_per_record": fields.len(),
-        "field_count_per_record": field_count_per_record,
-        "fields": fields,
-        "expanded_fields": expanded_fields,
-    }))
+        .filter(|field| field.role == Role::Field)
+        .count();
+    Ok(Record {
+        name: spec.list.to_owned(),
+        source_class: record_class.name.clone(),
+        source_file: record_class.label.clone(),
+        write_method: write.signature.clone(),
+        write_method_line: u64::try_from(write.line)
+            .map_err(|_| extract_error!("line overflow"))?,
+        count: spec.count,
+        offset_layout: layout_from(&base),
+        record_base_offsets: bases,
+        operation_count_per_record: u64::try_from(fields.len())
+            .map_err(|_| extract_error!("field count overflow"))?,
+        field_count_per_record: u64::try_from(field_count_per_record)
+            .map_err(|_| extract_error!("field count overflow"))?,
+        fields,
+        expanded_fields,
+    })
+}
+
+/// Verify that `expected` is the lowest address a fixed-base private writer
+/// resolves, and return that address's dimension terms.
+///
+/// Candidates come from two places: assignments (`num = 880;`,
+/// `num5 = 332812 + this.m_c;`) and the offset argument of every direct
+/// write the codec classifier understands (`A_0.a((byte)this.m_a, 332810 +
+/// this.m_c)`). Loop counters are literal assignments too (`num4 = 0;`), so
+/// a literal-only assignment can confirm the pinned base but never lowers
+/// it; an assignment takes part in the lowest-address check only when it
+/// references a symbol.
+fn verify_fixed_base(
+    scope: &WriteScope<'_>,
+    target: &ClassInfo,
+    write: &MethodRef,
+    slots: &[SlotSymbol],
+    expected: u64,
+) -> Result<Vec<Term>> {
+    let assignment = regex::Regex::new(r"=\s*([^;=]+);")
+        .map_err(|error| extract_error!("assignment pattern failed to compile: {error}"))?;
+    let symbol_scope = SymbolScope {
+        constants: scope.constants,
+        slots,
+        overrides: &[],
+    };
+    let label = format!("{}.{}", target.name, write.method);
+    let mut pinned: Option<Address> = None;
+    let mut lowest: Option<(Address, String)> = None;
+    let mut consider = |expression: &str, symbolic: bool| {
+        let Ok(address) = resolve_offset(expression, &symbol_scope) else {
+            return;
+        };
+        if address.base == expected && pinned.is_none() {
+            pinned = Some(address.clone());
+        }
+        if symbolic
+            && lowest
+                .as_ref()
+                .is_none_or(|(low, _)| address.base < low.base)
+        {
+            lowest = Some((address, expression.to_owned()));
+        }
+    };
+    for capture in assignment.captures_iter(&write.body) {
+        let expression = capture.get(1).map(|m| m.as_str()).unwrap_or_default();
+        let symbolic = scope.patterns.identifier_re.is_match(expression);
+        consider(expression, symbolic);
+    }
+    let types = scope.index.types(scope.patterns, target)?;
+    for (method, arguments) in direct_calls(scope.patterns, &write.body, &label)? {
+        let arguments = split_arguments(&arguments);
+        if let Ok(classified) = classify_call(
+            scope.patterns,
+            &method,
+            &arguments,
+            &types,
+            scope.constants,
+            slots,
+            scope.spec.value_helpers,
+        ) {
+            consider(&classified.offset_expression, true);
+        }
+    }
+    let pinned = pinned
+        .ok_or_else(|| extract_error!("{label} never resolves the pinned fixed base {expected}"))?;
+    if let Some((low, expression)) = lowest
+        && low.base < expected
+    {
+        return Err(extract_error!(
+            "{label} writes at {} ({expression}), below the pinned fixed base {expected}",
+            low.base
+        ));
+    }
+    Ok(pinned.terms)
+}
+
+/// Catalog one private sub-writer, verifying the spec's pinned base.
+pub(crate) fn catalog_private(
+    scope: &WriteScope<'_>,
+    owner: &Owner<'_>,
+    spec: &PrivateWriterSpec,
+    target: &ClassInfo,
+    calls: &[&NestedCall],
+) -> Result<PrivateRecord> {
+    let call_count =
+        u64::try_from(calls.len()).map_err(|_| extract_error!("call count overflow"))?;
+    if call_count != spec.calls {
+        return Err(extract_error!(
+            "{} is called {call_count} times from {}, spec {} expects {}",
+            target.name,
+            owner.class.name,
+            spec.name,
+            spec.calls
+        ));
+    }
+    let first = calls
+        .first()
+        .ok_or_else(|| extract_error!("private writer {} has no calls", spec.name))?;
+    let (field, _) = first.split_target();
+    let slots = inherited_slots(scope, owner, &field, target)?;
+    let layout = if let Some(stride) = spec.stride {
+        let write = child_writer(scope.patterns, target, &first.method, owner.writer_class)?;
+        let label = format!("{}.{}", target.name, write.method);
+        let (_, expression) = base_assignment(scope, &write.body, &label)?;
+        let base = resolve_record_base(
+            &expression,
+            &SymbolScope {
+                constants: scope.constants,
+                slots: &slots,
+                overrides: &[],
+            },
+        )
+        .map_err(|error| extract_error!("{label}: {error}"))?;
+        if base.base != spec.base || base.stride != stride {
+            return Err(extract_error!(
+                "{label} has base {} stride {}, spec {} pins {} and {stride}",
+                base.base,
+                base.stride,
+                spec.name,
+                spec.base
+            ));
+        }
+        layout_from(&base)
+    } else {
+        let write = find_writer(owner.index, target, scope.patterns)?;
+        if write.method != first.method {
+            return Err(extract_error!(
+                "{} calls {}.{} but that class's writer is {}",
+                owner.class.name,
+                target.name,
+                first.method,
+                write.method
+            ));
+        }
+        let terms = verify_fixed_base(scope, target, &write, &slots, spec.base)?;
+        OffsetLayout {
+            kind: "fixed".to_owned(),
+            base: spec.base,
+            stride: None,
+            overrides: Vec::new(),
+            terms,
+        }
+    };
+    Ok(PrivateRecord {
+        name: spec.name.to_owned(),
+        source_class: target.name.clone(),
+        call_count,
+        count: spec.count,
+        offset_layout: layout,
+        unsupported_public_reason: spec.reason.to_owned(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+
+    use super::*;
+    use crate::csharp::Patterns;
+    use crate::model::THD75;
+    use crate::sources::Sources;
+
+    type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+
+    const OWNER: &str = "public class m1\n{\n\tprivate List<MyPositionData> u;\n\tpublic List<MyPositionData> MyPositionList\n\t{\n\t\tget\n\t\t{\n\t\t\treturn u;\n\t\t}\n\t}\n\tpublic void a0(m6 A_0)\n\t{\n\t\tu[num3].ax(A_0, num3);\n\t}\n}\n";
+    const POSITION: &str = "public class MyPositionData\n{\n\tpublic int Altitude { get { return e; } }\n\tpublic byte MyPositionChannel { get { return f; } }\n\tpublic override void ax(m6 A_0, int A_1)\n\t{\n\t\tint num = 4384 + 32 * A_1;\n\t\tA_0.a(base.c, num + 12);\n\t\tA_0.b(e, 4, num);\n\t\tA_0.a(base.g, 2, num + 12);\n\t\tA_0.a(j, num + 4);\n\t\tA_0.a(m, num + 5);\n\t\tA_0.b(p, 2, num + 6);\n\t\tA_0.a(s, 3, num + 12);\n\t\tA_0.a(v, num + 8);\n\t\tA_0.a(y, num + 9);\n\t\tA_0.b(ab, 2, num + 10);\n\t\tA_0.a(f, num + 13);\n\t\tA_0.c(base.e, num + 14, nb.aa);\n\t}\n}\n";
+    const CONSTANTS: &str =
+        "public class nb\n{\n\tpublic static int aa;\n\tstatic nb()\n\t{\n\t\taa = 8;\n\t}\n}\n";
+
+    fn scope<'a>(
+        patterns: &'a Patterns,
+        index: &'a ClassIndex,
+        constants: &'a HashMap<String, i64>,
+    ) -> WriteScope<'a> {
+        WriteScope {
+            patterns,
+            spec: &THD75,
+            index,
+            constants,
+            slots: &[],
+            overrides: &[],
+        }
+    }
+
+    #[test]
+    fn coordinate_record_keeps_encoded_storage_transform() -> TestResult {
+        let patterns = Patterns::new()?;
+        let sources: Sources = vec![
+            (PathBuf::from("m1.cs"), OWNER.to_owned()),
+            (
+                PathBuf::from("MCP.Models.MemoryMap/MyPositionData.cs"),
+                POSITION.to_owned(),
+            ),
+            (PathBuf::from("nb.cs"), CONSTANTS.to_owned()),
+        ];
+        let index = ClassIndex::build(&patterns, &sources, Path::new(""))?;
+        let constants = crate::sources::parse_constants(&patterns, &sources);
+        let scope = scope(&patterns, &index, &constants);
+        let owner_class = index.get("m1").ok_or("m1 missing")?;
+        let owner = Owner {
+            index: &index,
+            class: owner_class,
+            slots: &[],
+            writer_class: "m6",
+        };
+        let call = NestedCall {
+            target: "u[num3]".to_owned(),
+            method: "ax".to_owned(),
+            index_expression: Some("num3".to_owned()),
+        };
+        let spec = THD75.records.first().ok_or("no record specs")?;
+        let record = extract_record(&scope, &owner, spec, &call)?;
+        assert_eq!(record.operation_count_per_record, 12);
+        assert_eq!(record.field_count_per_record, 11);
+        assert_eq!(
+            record.record_base_offsets,
+            vec![4384, 4416, 4448, 4480, 4512]
+        );
+        assert_eq!(record.expanded_fields.len(), 55);
+        let encoded = record
+            .expanded_fields
+            .iter()
+            .find(|field| field.name == "MyPositionList[0].LatitudeSecondEncoded")
+            .ok_or("encoded latitude field missing")?;
+        assert!(
+            matches!(encoded.codec, Codec::UnsignedLe { width: 2, .. }),
+            "{encoded:?}"
+        );
+        assert_eq!(
+            encoded
+                .storage_transform
+                .as_ref()
+                .map(|transform| transform.numerator),
+            Some(10000)
+        );
+        let channel = record
+            .expanded_fields
+            .iter()
+            .find(|field| field.name == "MyPositionList[4].MyPositionChannel")
+            .ok_or("channel field missing")?;
+        assert_eq!(channel.writable, Some(false));
+        assert_eq!(channel.offset, 4512 + 13);
+        Ok(())
+    }
+
+    #[test]
+    fn catalogs_private_pair_and_blob() -> TestResult {
+        let patterns = Patterns::new()?;
+        let radio = "public class m9\n{\n\tprivate class a4\n\t{\n\t\tprivate int m_a;\n\t\tpublic void b(m6 A_0, int A_1)\n\t\t{\n\t\t\tint num3 = 848 + 16 * A_1;\n\t\t\tA_0.b(this.m_a, 2, num3);\n\t\t}\n\t}\n\tprivate class a5\n\t{\n\t\tprivate byte[] m_b = new byte[42];\n\t\tpublic void b(m6 A_0)\n\t\t{\n\t\t\tint num2 = default(int);\n\t\t\tnum2 = 880;\n\t\t\tA_0.a(this.m_b, num2);\n\t\t}\n\t}\n\tprivate a4 m_a = new a4();\n\tprivate a4 m_b = new a4();\n\tprivate a5 m_c = new a5();\n\tpublic void a0(m6 A_0)\n\t{\n\t\tthis.m_a.b(A_0, 0);\n\t\tthis.m_b.b(A_0, 1);\n\t\tthis.m_c.b(A_0);\n\t}\n}\n";
+        let sources: Sources = vec![(PathBuf::from("m9.cs"), radio.to_owned())];
+        let index = ClassIndex::build(&patterns, &sources, Path::new(""))?;
+        let constants = HashMap::new();
+        let scope = scope(&patterns, &index, &constants);
+        let owner_class = index.get("m9").ok_or("m9 missing")?;
+        let owner = Owner {
+            index: &index,
+            class: owner_class,
+            slots: &[],
+            writer_class: "m6",
+        };
+        let pair_calls = [
+            NestedCall {
+                target: "this.m_a".to_owned(),
+                method: "b".to_owned(),
+                index_expression: Some("0".to_owned()),
+            },
+            NestedCall {
+                target: "this.m_b".to_owned(),
+                method: "b".to_owned(),
+                index_expression: Some("1".to_owned()),
+            },
+        ];
+        let pair_refs: Vec<&NestedCall> = pair_calls.iter().collect();
+        let pair_spec = THD75.private_writers.first().ok_or("no private specs")?;
+        let pair_class = index.get("m9.a4").ok_or("m9.a4 missing")?;
+        let pair = catalog_private(&scope, &owner, pair_spec, pair_class, &pair_refs)?;
+        assert_eq!(pair.name, "private_pair_848");
+        assert_eq!(pair.offset_layout.kind, "linear");
+        assert_eq!(pair.offset_layout.stride, Some(16));
+        let blob_call = NestedCall {
+            target: "this.m_c".to_owned(),
+            method: "b".to_owned(),
+            index_expression: None,
+        };
+        let blob_spec = THD75.private_writers.get(1).ok_or("no blob spec")?;
+        let blob_class = index.get("m9.a5").ok_or("m9.a5 missing")?;
+        let blob = catalog_private(&scope, &owner, blob_spec, blob_class, &[&blob_call])?;
+        assert_eq!(blob.offset_layout.kind, "fixed");
+        assert_eq!(blob.offset_layout.base, 880);
+        Ok(())
+    }
 }

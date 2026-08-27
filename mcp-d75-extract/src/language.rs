@@ -1,58 +1,51 @@
-//! Enum definitions, Kenwood's UTF-16 language INI, and combo-box labels.
+//! Kenwood's UTF-16 language INI and combo-box label joins.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::csharp::{Patterns, normalize_whitespace, split_arguments};
 use crate::error::{Result, extract_error};
+use crate::manifest::LanguageFileInfo;
+use crate::sources::Sources;
 
 /// Language INI sections: `section -> key -> value`.
 pub(crate) type LanguageSections = HashMap<String, HashMap<String, String>>;
 
-/// Parse nested enum members, including C#'s implicit numeric increments.
-pub(crate) fn parse_enum_definitions(
-    patterns: &Patterns,
-    source: &str,
-) -> Result<HashMap<String, Value>> {
-    let mut definitions = HashMap::new();
-    for capture in patterns.enum_body_re.captures_iter(source) {
-        let name = capture.get(1).map(|m| m.as_str()).unwrap_or_default();
-        let underlying_type = capture.get(2).map_or("int", |m| m.as_str());
-        let raw_body = capture.get(3).map(|m| m.as_str()).unwrap_or_default();
-        let body = patterns.enum_comment_re.replace_all(raw_body, "");
-        let mut next_value: i64 = 0;
-        let mut options = Vec::new();
-        for raw_entry in body.split(',') {
-            let entry = raw_entry.trim();
-            if entry.is_empty() {
-                continue;
-            }
-            let entry_capture = patterns
-                .enum_member_re
-                .captures(entry)
-                .ok_or_else(|| extract_error!("unsupported enum member in {name}: {entry:?}"))?;
-            let member = entry_capture.get(1).map(|m| m.as_str()).unwrap_or_default();
-            if let Some(explicit) = entry_capture.get(2)
-                && let Some(value) = crate::csharp::parse_integer(patterns, explicit.as_str())
-            {
-                next_value = value;
-            }
-            options.push(json!({"value": next_value, "member": member}));
-            next_value += 1;
-        }
-        drop(definitions.insert(
-            name.to_owned(),
-            json!({
-                "csharp_name": name,
-                "underlying_type": underlying_type,
-                "options": options,
-            }),
-        ));
+/// Resource key and display label derived from a `DisplayMember` expression.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct ComboMeta {
+    /// Official language-resource key, when the label is resource-backed.
+    pub(crate) resource_key: Option<String>,
+    /// English display label, when one is derivable.
+    pub(crate) label: Option<String>,
+}
+
+/// `(owner class, enum, member) -> metadata`.
+pub(crate) type ComboOptions = HashMap<(String, String, String), ComboMeta>;
+
+/// Per-run patterns built from the discovered resource singleton class.
+struct ResourcePatterns {
+    key: regex::Regex,
+    format: regex::Regex,
+    access_key_prefix: String,
+}
+
+impl ResourcePatterns {
+    fn new(resource_class: &str) -> Result<Self> {
+        let escaped = regex::escape(resource_class);
+        Ok(Self {
+            key: regex::Regex::new(&format!(r"\b{escaped}\.Instance\.([@\w]+)")).map_err(
+                |error| extract_error!("resource key pattern failed to compile: {error}"),
+            )?,
+            format: regex::Regex::new(&format!(
+                r"(?s)^string\.Format\(\s*{escaped}\.Instance\.([@\w]+)\s*,\s*(.*)\)$"
+            ))
+            .map_err(|error| extract_error!("format label pattern failed to compile: {error}"))?,
+            access_key_prefix: format!("{resource_class}.a("),
+        })
     }
-    Ok(definitions)
 }
 
 fn decode_utf16(raw: &[u8], path: &Path) -> Result<String> {
@@ -73,8 +66,8 @@ fn decode_utf16(raw: &[u8], path: &Path) -> Result<String> {
     let units: Vec<u16> = payload
         .chunks_exact(2)
         .map(|pair| {
-            let (first, second) = (pair.first().copied(), pair.get(1).copied());
-            let (low, high) = (first.unwrap_or_default(), second.unwrap_or_default());
+            let low = pair.first().copied().unwrap_or_default();
+            let high = pair.get(1).copied().unwrap_or_default();
             if big_endian {
                 u16::from_be_bytes([low, high])
             } else {
@@ -119,7 +112,7 @@ fn split_lines(text: &str) -> Vec<&str> {
 /// Read Kenwood's UTF-16 language INI without configparser interpolation.
 pub(crate) fn parse_language_file(
     path: Option<&PathBuf>,
-) -> Result<(LanguageSections, Option<Value>)> {
+) -> Result<(LanguageSections, Option<LanguageFileInfo>)> {
     let Some(path) = path else {
         return Ok((HashMap::new(), None));
     };
@@ -154,17 +147,15 @@ pub(crate) fn parse_language_file(
             );
         }
     }
-    let file_name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let sha256 = format!("{:x}", Sha256::digest(&raw));
-    let provenance = json!({
-        "file_name": file_name,
-        "sha256": sha256,
-        "encoding": "UTF-16",
-    });
-    Ok((sections, Some(provenance)))
+    let info = LanguageFileInfo {
+        file_name: path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        sha256: format!("{:x}", Sha256::digest(&raw)),
+        encoding: "UTF-16".to_owned(),
+    };
+    Ok((sections, Some(info)))
 }
 
 /// Resolve a resource property by its longest matching INI section prefix.
@@ -225,24 +216,15 @@ pub(crate) fn format_resource_label(
         .into_owned()
 }
 
-/// Resource key and display label derived from a `DisplayMember` expression.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) struct ComboMeta {
-    /// Official language-resource key, when the label is resource-backed.
-    pub(crate) resource_key: Option<String>,
-    /// English display label, when one is derivable.
-    pub(crate) label: Option<String>,
-}
-
-/// Derive resource key and display label from a `DisplayMember` expression.
-pub(crate) fn combo_label_metadata(
+fn combo_label_metadata(
     patterns: &Patterns,
+    resources: &ResourcePatterns,
     expression: &str,
     sections: &LanguageSections,
 ) -> ComboMeta {
     let normalized = normalize_whitespace(expression);
     let mut metadata = ComboMeta::default();
-    if let Some(resource) = patterns.resource_key_re.captures(&normalized) {
+    if let Some(resource) = resources.key.captures(&normalized) {
         let resource_key = resource
             .get(1)
             .map(|m| m.as_str())
@@ -251,11 +233,10 @@ pub(crate) fn combo_label_metadata(
         let label = language_label(&resource_key, sections);
         metadata.resource_key = Some(resource_key);
         if let Some(label) = label {
-            let formatted = patterns.format_label_re.captures(&normalized).map_or_else(
+            let formatted = resources.format.captures(&normalized).map_or_else(
                 || {
-                    if normalized.starts_with("kb.a(") {
-                        // kb.a() is used for the three access-key strings that need
-                        // their mnemonic underscore removed before display.
+                    if normalized.starts_with(&resources.access_key_prefix) {
+                        // The access-key helper strips the mnemonic underscore before display.
                         label.replace('_', "")
                     } else {
                         label.clone()
@@ -279,26 +260,28 @@ pub(crate) fn combo_label_metadata(
     metadata
 }
 
-/// Join enum members to the combo-box display expression used by MCP-D75.
+/// Join enum members to the combo-box display expressions of the program.
 pub(crate) fn parse_combo_options(
     patterns: &Patterns,
-    sources: &[(PathBuf, String)],
+    sources: &Sources,
     sections: &LanguageSections,
-    serializer_classes: &[String],
-) -> Result<HashMap<(String, String, String), ComboMeta>> {
-    let mut unique: Vec<&String> = serializer_classes.iter().collect();
+    classes: &[String],
+    resource_class: &str,
+) -> Result<ComboOptions> {
+    let resources = ResourcePatterns::new(resource_class)?;
+    let mut unique: Vec<&String> = classes.iter().collect();
     unique.sort();
     unique.dedup();
     let class_pattern = unique
         .iter()
-        .map(|class_name| regex::escape(class_name))
+        .map(|name| regex::escape(name))
         .collect::<Vec<_>>()
         .join("|");
     let entry_pattern = regex::Regex::new(&format!(
         r"(?s)Value\s*=\s*({class_pattern})\.([@\w]+)\.([@\w]+)\s*,\s*DisplayMember\s*=\s*(.*?)\s*\n\s*\}}"
     ))
     .map_err(|error| extract_error!("combo entry pattern failed to compile: {error}"))?;
-    let mut options: HashMap<(String, String, String), ComboMeta> = HashMap::new();
+    let mut options: ComboOptions = HashMap::new();
     for (path, source) in sources {
         for capture in entry_pattern.captures_iter(source) {
             let part = |index: usize| -> String {
@@ -311,6 +294,7 @@ pub(crate) fn parse_combo_options(
             let key = (part(1), part(2), part(3));
             let metadata = combo_label_metadata(
                 patterns,
+                &resources,
                 capture.get(4).map(|m| m.as_str()).unwrap_or_default(),
                 sections,
             );
@@ -321,8 +305,7 @@ pub(crate) fn parse_combo_options(
                         .map(|name| name.to_string_lossy().into_owned())
                         .unwrap_or_default();
                     return Err(extract_error!(
-                        "conflicting combo labels for {}.{}.{} in {file_name}: \
-                         {existing:?} versus {metadata:?}",
+                        "conflicting combo labels for {}.{}.{} in {file_name}: {existing:?} versus {metadata:?}",
                         key.0,
                         key.1,
                         key.2
@@ -334,4 +317,51 @@ pub(crate) fn parse_combo_options(
         }
     }
     Ok(options)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn combo_join_uses_the_discovered_resource_class() -> TestResult {
+        let patterns = Patterns::new()?;
+        let source = "new gd\n{\n\tValue = oa.a.a,\n\tDisplayMember = ky.Instance.Edit_Menu_TestBeatShift_Off\n}\nnew gd\n{\n\tValue = oa.a.b,\n\tDisplayMember = string.Format(ky.Instance.Edit_Menu_TestBeatShift_Numbered, 1)\n}\n";
+        let sources: Sources = vec![(PathBuf::from("combo.cs"), source.to_owned())];
+        let mut sections: LanguageSections = HashMap::new();
+        drop(sections.insert(
+            "Edit_Menu_Test".to_owned(),
+            HashMap::from([
+                ("BeatShift_Off".to_owned(), "Off".to_owned()),
+                ("BeatShift_Numbered".to_owned(), "Choice {0}".to_owned()),
+            ]),
+        ));
+        let combos = parse_combo_options(&patterns, &sources, &sections, &["oa".to_owned()], "ky")?;
+        let off = combos
+            .get(&("oa".to_owned(), "a".to_owned(), "a".to_owned()))
+            .ok_or("member a missing")?;
+        assert_eq!(off.label.as_deref(), Some("Off"));
+        let numbered = combos
+            .get(&("oa".to_owned(), "a".to_owned(), "b".to_owned()))
+            .ok_or("member b missing")?;
+        assert_eq!(numbered.label.as_deref(), Some("Choice 1"));
+        let other_class =
+            parse_combo_options(&patterns, &sources, &sections, &["oa".to_owned()], "kb")?;
+        assert_eq!(
+            other_class.len(),
+            2,
+            "entries are keyed by class, not resource"
+        );
+        assert!(
+            other_class
+                .values()
+                .all(|meta| meta.resource_key.is_none() && meta.label.is_none()),
+            "a wrong resource class must yield no keys or labels: {other_class:?}"
+        );
+        Ok(())
+    }
 }

@@ -4,7 +4,7 @@
 use super::schema::{Endian, FieldCodec, FieldDescriptor, StringEncoding};
 
 /// Manifest format version used to generate this registry.
-pub const MCP_D75_SCHEMA_VERSION: u32 = 3;
+pub const MCP_D75_SCHEMA_VERSION: u32 = 4;
 /// SHA-256 of the normalized reviewed `ILSpy` source project.
 pub const MCP_D75_SOURCE_SHA256: &str =
     "21bcb0c5b76de898daba7da1f62eb91a934c6b225477b23412d34bdae11eb170";

@@ -24,7 +24,7 @@ Rust workspace for Kenwood amateur-radio transceivers: core TH-D75 library, TUI,
 | Radio | Core | TUI | REPL | Status |
 |-------|------|-----|------|--------|
 | TH-D75A/E | [`thd75/`](thd75/) | [`thd75-tui/`](thd75-tui/) | [`thd75-repl/`](thd75-repl/) | experimental |
-| TM-D750 | Planned | Planned | Planned | not started |
+| TM-D750 | Planned | Planned | Planned | memory map extracted ([`tmd750/data/`](tmd750/data/)); crates not started |
 
 ## Crates
 
@@ -40,7 +40,7 @@ expecting stability.
 | [`thd75-repl/`](thd75-repl/) | Screen-reader-friendly REPL (CAT, APRS, D-STAR gateway) | experimental |
 | [`thd75-listen/`](thd75-listen/) | Accessible SSB/CW/AM listener pipeline for the TH-D75's IF-over-USB-audio stream; its executable cannot currently start a session because mandatory initial tuning hits the fail-closed FO write quarantine | experimental |
 | [`if-dsp/`](if-dsp/) | Sans-io DSP for a 12 kHz low-IF stream: channelizer, USB/LSB/CW/AM demodulation, AGC | experimental |
-| [`mcp-d75-extract/`](mcp-d75-extract/) | Generates the TH-D75 menu manifest and Rust field registry from the official programming software | experimental |
+| [`mcp-d75-extract/`](mcp-d75-extract/) | Extracts the TH-D75 and TM-D750 MCP memory-map manifests (plus the TH-D75 Rust field registry) from the official programming software and diffs them across firmware releases | experimental |
 | [`kiss-tnc/`](kiss-tnc/) | KISS TNC wire framing (`no_std` + `alloc`, sans-io) | experimental |
 | [`ax25-codec/`](ax25-codec/) | AX.25 v2.2 frame codec (`no_std` + `alloc`, sans-io) | experimental |
 | [`aprs/`](aprs/) | APRS parser, digipeater, SmartBeaconing, messaging, station list (std, sans-io) | experimental |

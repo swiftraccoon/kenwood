@@ -358,11 +358,12 @@ run_inline "unsafe audit (workspace-wide)" check_unsafe_audit
 # is empty and the step passes vacuously.
 #
 # Exempt, because their bytes are a contract rather than prose:
-#   thd75/data/mcp_d75_menu_schema.json  generated menu manifest
-#   thd75/src/memory/menu_fields.rs      generated field registry
-#   mcp-d75-extract/tests/fixtures/      pinned decompilation fixtures
+#   thd75/data/mcp_d75_menu_schema.json    generated TH-D75 menu manifest
+#   tmd750/data/mcp_d750_menu_schema.json  generated TM-D750 menu manifest
+#   thd75/src/memory/menu_fields.rs        generated field registry
+#   mcp-d75-extract/tests/fixtures/        pinned decompilation fixtures
 check_em_dashes() {
-    local exempt='^thd75/data/mcp_d75_menu_schema\.json$|^thd75/src/memory/menu_fields\.rs$|^mcp-d75-extract/tests/fixtures/'
+    local exempt='^thd75/data/mcp_d75_menu_schema\.json$|^tmd750/data/mcp_d750_menu_schema\.json$|^thd75/src/memory/menu_fields\.rs$|^mcp-d75-extract/tests/fixtures/'
     local em files hits
     em=$(printf '\342\200\224')
     files=$(git ls-files 2>/dev/null | grep -vE "$exempt" || true)

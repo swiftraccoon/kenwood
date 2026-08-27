@@ -1,94 +1,74 @@
-//! MCP-D75 menu schema extractor.
+//! MCP memory-map extractor for the Kenwood TH-D75 and TM-D750.
 //!
-//! This tool turns the four official MCP-D75 menu serializer write methods
-//! into a deterministic JSON manifest. It extracts all direct memory-map
-//! writes from `RadioMenuData`, `GpsMenuData`, `AprsMenuData`, and
-//! `DvMenuData`, including byte, boolean, bit-field, signed/unsigned
-//! little-endian, fixed string, raw-byte, and clear-range operations. It
-//! derives raw enum values from the nested C# enum declarations, joins them
-//! to combo-box display resources, and can resolve those resources through
-//! Kenwood's English language file. It follows the seven public, statically
-//! sized repeated-record serializers and expands their indexed fields while
-//! retaining each checked base/stride formula in the manifest.
+//! The extractor decompiles Kenwood's Memory Control Programs with `ILSpy`
+//! and turns their serializer write methods into a deterministic JSON
+//! manifest. Every write becomes an affine address (`base + stride * index`
+//! over declared dimensions; the TM-D750's Programmable-Memory slots are one
+//! such dimension), a codec, and a name. Obfuscated identifiers (the memory
+//! writer class, the write methods, the resource singleton, per-slot detail
+//! classes, record list backing fields) are discovered structurally with an
+//! exactly-one-candidate check and recorded only as provenance, so a new
+//! program build re-extracts without table edits.
 //!
-//! No Kenwood executable and no verbatim decompiler output is committed.
-//! The test fixtures and inline test sources reproduce structural facts from
-//! the reviewed decompilation (obfuscated identifiers, offsets, and layout
-//! formulas) so the parser's expected shape stays pinned. To decompile and
-//! extract in one step, install ilspycmd 10.1 (the reviewed output used
-//! 10.1.0.8386), then:
+//! No Kenwood executable and no verbatim decompiler output is committed. The
+//! test fixtures reproduce structural facts from the reviewed decompilations
+//! (obfuscated identifiers, offsets, layout formulas) so the parser's expected
+//! shape stays pinned.
 //!
 //! ```text
-//! cargo run -p mcp-d75-extract -- \
-//!   --assembly /path/to/MCP-D75.exe \
-//!   --language-file /path/to/MCP-D75/Language/English.lng \
+//! cargo run -p mcp-d75-extract -- extract --model thd75 \
+//!   --assembly /path/to/MCP-D75.exe --mcp-version 1.03 --firmware 1.03 \
+//!   --language-file /path/to/English.lng \
 //!   --output thd75/data/mcp_d75_menu_schema.json \
-//!   --rust-output thd75/src/memory/menu_fields.rs \
-//!   --strict-known-layout
+//!   --rust-output thd75/src/memory/menu_fields.rs --strict-known-layout
 //! ```
 //!
 //! An existing `ILSpy` project can be used without decompiling again by
 //! passing `--source-dir /path/to/ilspy-output` instead of `--assembly`.
-//! The optional `--rust-output` emits crate-native
-//! `FieldDescriptor`/`FieldCodec` values, enum option metadata, exact
-//! audited numeric/choice domains, repeated-record fields, source
-//! provenance constants, and a case-insensitive `menu.name` lookup. It
-//! consumes only public operations that are verified safe for sparse radio
-//! writes. Use `--check` with the same arguments to verify that both
-//! committed outputs are current. Output contains no timestamp or
-//! machine-local absolute paths.
+//! `--check` verifies that the committed outputs are current without writing.
 //!
-//! The parser is deliberately narrow. It expects `ILSpy`'s one-line `A_0`
-//! method calls and discovers obfuscated class names from the public
-//! `MemoryMap` properties. If `ILSpy` changes that shape, extraction fails
-//! instead of silently omitting a direct writer. `--strict-known-layout`
-//! additionally detects a changed operation count.
+//! ```text
+//! cargo run -p mcp-d75-extract -- diff old_manifest.json new_manifest.json
+//! ```
+//!
+//! `diff` reports added, removed, and changed fields, record layout changes,
+//! and summary deltas between two manifests of one radio; it exits 0 when
+//! they are identical, 1 when differences were reported, and 2 on error.
 
-use std::collections::HashMap;
-use std::path::Path;
-
-use serde_json::Value;
-
+mod address;
+mod class_index;
 mod cli;
 mod codecs;
 mod csharp;
+mod diff;
+mod discovery;
+mod enums;
 mod error;
+mod extract;
 mod language;
+mod manifest;
+pub mod model;
+mod operations;
 mod records;
 mod rustgen;
-mod schema;
 mod sources;
-mod tables;
-mod value;
 
-pub use cli::{Cli, main_with_args, run, write_or_check};
+pub use address::{
+    Address, Affine, RecordBase, SlotSymbol, SymbolScope, Term, parse_affine, resolve_offset,
+    resolve_record_base,
+};
+pub use cli::{
+    Cli, Command, DiffArgs, ExtractArgs, main_with_args, run_diff, run_extract, write_or_check,
+};
+pub use diff::{DiffReport, diff_manifests};
+pub use discovery::{DiscoveredMenu, DiscoveredSummary, discover_project};
 pub use error::{ExtractError, Result};
+pub use extract::{BuildOptions, build_manifest};
+pub use manifest::{
+    Anchor, Codec, Dimension, Domain, EnumCatalog, EnumOption, ExpandedField, LanguageFileInfo,
+    Manifest, Menu, ModelInfo, NestedSerializer, OffsetLayout, Operation, PrivateRecord, Record,
+    RecordEntry, RecordField, ReleaseInfo, Role, SCHEMA_VERSION, SourceInfo, StorageTransform,
+    Summary, WriteMethodRef, json_text, offset_hex, parse_manifest,
+};
+pub use model::{ModelSpec, THD75, TMD750, model_by_id};
 pub use rustgen::rust_text;
-pub use schema::{BuildOptions, build_schema, json_text};
-pub use tables::RecordSpec;
-
-/// Extract and expand one statically sized public child serializer.
-///
-/// This is the library face of the repeated-record extraction used by the
-/// integration tests; `source_dir` only affects the recorded relative
-/// source path.
-///
-/// # Errors
-///
-/// Returns an error when the writer's shape deviates from the reviewed
-/// decompilation: a missing or non-linear base-offset formula, an
-/// unsupported writer call, or an unresolved offset or length.
-pub fn extract_repeated_record<S: std::hash::BuildHasher>(
-    spec: &RecordSpec,
-    path: &Path,
-    source: &str,
-    source_dir: &Path,
-    constants: &HashMap<String, i64, S>,
-) -> Result<Value> {
-    let patterns = csharp::Patterns::new()?;
-    let constants: HashMap<String, i64> = constants
-        .iter()
-        .map(|(name, value)| (name.clone(), *value))
-        .collect();
-    records::extract_repeated_record_with(&patterns, spec, path, source, source_dir, &constants)
-}
