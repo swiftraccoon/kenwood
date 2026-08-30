@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
+use crate::address::Term;
 use crate::error::{Result, extract_error};
 use crate::manifest::{
     Codec, Domain, EnumCatalog, ExpandedField, Manifest, Menu, Operation, RecordEntry, Role,
@@ -11,6 +12,49 @@ use crate::manifest::{
 
 /// Generator name recorded in the `@generated` header.
 const GENERATOR: &str = env!("CARGO_PKG_NAME");
+
+/// Per-radio rendering choices. The TH-D75 target reproduces the registry
+/// the crate has always emitted, byte for byte.
+struct Target {
+    radio: &'static str,
+    prefix: &'static str,
+    product: &'static str,
+    menus_doc: &'static str,
+    terms: bool,
+}
+
+const THD75_TARGET: Target = Target {
+    radio: "thd75",
+    prefix: "MCP_D75",
+    product: "MCP-D75",
+    menus_doc: "(`radio`, `gps`, `aprs`, or `dv`)",
+    terms: false,
+};
+
+const TMD750_TARGET: Target = Target {
+    radio: "tmd750",
+    prefix: "MCP_D750",
+    product: "MCP-D750",
+    menus_doc: "(`radio`, `gps`, `aprs`, `dv`, `ipnet`, or `pm`)",
+    terms: true,
+};
+
+/// Render a decimal literal, grouping digits with `_` once it has six or
+/// more of them (`1929472` becomes `1_929_472`; `86400` stays as it is).
+fn rust_decimal(value: u64) -> String {
+    let digits = value.to_string();
+    if digits.len() < 6 {
+        return digits;
+    }
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push('_');
+        }
+        grouped.push(digit);
+    }
+    grouped
+}
 
 /// Encode a string as a deterministic Rust string literal.
 pub(crate) fn rust_string(value: &str) -> String {
@@ -91,6 +135,13 @@ impl<'a> Field<'a> {
         match self {
             Self::Direct(operation) => !operation.address.is_absolute(),
             Self::Expanded(field) => !field.address.is_absolute(),
+        }
+    }
+
+    fn terms(self) -> &'a [Term] {
+        match self {
+            Self::Direct(operation) => &operation.address.terms,
+            Self::Expanded(field) => &field.address.terms,
         }
     }
 }
@@ -320,7 +371,7 @@ fn rust_codec(
             };
             Ok(vec![
                 "FieldCodec::FixedString {".to_owned(),
-                format!("    len: {length},"),
+                format!("    len: {},", rust_decimal(*length)),
                 format!("    encoding: {encoding},"),
                 format!("    padding: {padding},"),
                 "}".to_owned(),
@@ -333,7 +384,7 @@ fn rust_codec(
                 length.ok_or_else(|| extract_error!("raw byte field has no inferred length"))?;
             Ok(vec![
                 "FieldCodec::Bytes {".to_owned(),
-                format!("    len: {length},"),
+                format!("    len: {},", rust_decimal(length)),
                 "}".to_owned(),
             ])
         }
@@ -344,7 +395,10 @@ fn rust_codec(
 }
 
 /// Yield writable direct and expanded fields with their containing menu.
-fn writable_manifest_fields(manifest: &Manifest) -> Result<Vec<(&Menu, Field<'_>)>> {
+fn writable_manifest_fields<'a>(
+    manifest: &'a Manifest,
+    target: &Target,
+) -> Result<Vec<(&'a Menu, Field<'a>)>> {
     let mut fields = Vec::new();
     for menu in &manifest.menus {
         for operation in &menu.operations {
@@ -364,9 +418,10 @@ fn writable_manifest_fields(manifest: &Manifest) -> Result<Vec<(&Menu, Field<'_>
         }
     }
     for (menu, field) in &fields {
-        if field.has_terms() {
+        if !target.terms && field.has_terms() {
             return Err(extract_error!(
-                "Rust registry generation requires absolute addresses; {}.{} has dimension terms",
+                "Rust registry generation for {} requires absolute addresses; {}.{} has dimension terms",
+                target.radio,
                 menu.menu,
                 field.name()
             ));
@@ -394,29 +449,76 @@ fn rust_storage_transform(transform: Option<&StorageTransform>) -> Result<String
     ))
 }
 
+/// Image length and slot constants for a target with dimension terms;
+/// nothing for a target without them.
+fn slot_constant_lines(manifest: &Manifest, target: &Target) -> Result<Vec<String>> {
+    if !target.terms {
+        return Ok(Vec::new());
+    }
+    let prefix = target.prefix;
+    let slot = manifest
+        .dimensions
+        .iter()
+        .find(|dimension| dimension.name == "pm_slot")
+        .ok_or_else(|| extract_error!("{} manifest declares no pm_slot dimension", target.radio))?;
+    let stride = slot
+        .anchors
+        .iter()
+        .find(|anchor| anchor.property == "OffsetProgrammableMemoryAddress")
+        .map(|anchor| anchor.stride)
+        .ok_or_else(|| {
+            extract_error!("pm_slot dimension has no OffsetProgrammableMemoryAddress anchor")
+        })?;
+    Ok(vec![
+        "/// Bytes in the memory image.".to_owned(),
+        format!(
+            "pub const {prefix}_IMAGE_LENGTH: usize = {};",
+            rust_decimal(manifest.model.image_length)
+        ),
+        "/// Programmable-Memory slots.".to_owned(),
+        format!("pub const {prefix}_SLOT_COUNT: u8 = {};", slot.count),
+        "/// Bytes between one slot's menu block and the next.".to_owned(),
+        format!(
+            "pub const {prefix}_SLOT_STRIDE: u32 = {};",
+            rust_decimal(stride)
+        ),
+    ])
+}
+
 /// Fixed preamble of the generated registry: header comment, provenance
 /// constants, and the `MenuOption`/`StorageTransform`/`MenuField` types.
-fn registry_header_lines(manifest: &Manifest) -> Vec<String> {
-    [
+fn registry_header_lines(manifest: &Manifest, target: &Target) -> Result<Vec<String>> {
+    let prefix = target.prefix;
+    let product = target.product;
+    let schema_use = if target.terms {
+        "use super::schema::{Endian, FieldCodec, FieldDescriptor, StringEncoding, Term};"
+    } else {
+        "use super::schema::{Endian, FieldCodec, FieldDescriptor, StringEncoding};"
+    };
+    let mut lines = vec![
         format!("// @generated by {GENERATOR}; do not edit."),
-        "//! MCP-D75 menu field registry generated from the reviewed serializer manifest."
-            .to_owned(),
+        format!(
+            "//! {product} menu field registry generated from the reviewed serializer manifest."
+        ),
         String::new(),
-        "use super::schema::{Endian, FieldCodec, FieldDescriptor, StringEncoding};".to_owned(),
+        schema_use.to_owned(),
         String::new(),
         "/// Manifest format version used to generate this registry.".to_owned(),
         format!(
-            "pub const MCP_D75_SCHEMA_VERSION: u32 = {};",
+            "pub const {prefix}_SCHEMA_VERSION: u32 = {};",
             manifest.schema_version
         ),
         "/// SHA-256 of the normalized reviewed `ILSpy` source project.".to_owned(),
-        "pub const MCP_D75_SOURCE_SHA256: &str =".to_owned(),
+        format!("pub const {prefix}_SOURCE_SHA256: &str ="),
         format!(
             "    {};",
             rust_string(&manifest.source.normalized_source_sha256)
         ),
+    ];
+    lines.extend(slot_constant_lines(manifest, target)?);
+    lines.extend([
         String::new(),
-        "/// One raw value in an MCP-D75 enum domain.".to_owned(),
+        format!("/// One raw value in an {product} enum domain."),
         "#[derive(Debug, Clone, Copy, PartialEq, Eq)]".to_owned(),
         "pub struct MenuOption {".to_owned(),
         "    /// Value stored in the memory image.".to_owned(),
@@ -440,10 +542,10 @@ fn registry_header_lines(manifest: &Manifest) -> Vec<String> {
         "    pub denominator: i64,".to_owned(),
         "}".to_owned(),
         String::new(),
-        "/// One writable public MCP-D75 menu or repeated-record field.".to_owned(),
+        format!("/// One writable public {product} menu or repeated-record field."),
         "#[derive(Debug, Clone, Copy, PartialEq, Eq)]".to_owned(),
         "pub struct MenuField {".to_owned(),
-        "    /// Top-level MCP menu group (`radio`, `gps`, `aprs`, or `dv`).".to_owned(),
+        format!("    /// Top-level MCP menu group {}.", target.menus_doc),
         "    pub menu: &'static str,".to_owned(),
         "    /// Qualified decompiled enum type, when this field is enum-valued.".to_owned(),
         "    pub enum_type: Option<&'static str>,".to_owned(),
@@ -467,8 +569,8 @@ fn registry_header_lines(manifest: &Manifest) -> Vec<String> {
         "    }".to_owned(),
         "}".to_owned(),
         String::new(),
-    ]
-    .to_vec()
+    ]);
+    Ok(lines)
 }
 
 /// Render the per-menu enum option constant blocks, filling `option_names`.
@@ -515,10 +617,11 @@ fn option_constant_lines(
 /// `choice_value_names` in first-encounter order.
 fn choice_domain_lines(
     manifest: &Manifest,
+    target: &Target,
     choice_value_names: &mut Vec<(Vec<i64>, String)>,
 ) -> Result<Vec<String>> {
     let mut lines = Vec::new();
-    for (_menu, field) in writable_manifest_fields(manifest)? {
+    for (_menu, field) in writable_manifest_fields(manifest, target)? {
         let Some(Domain::Choices { allowed_values, .. }) = field.domain() else {
             continue;
         };
@@ -577,10 +680,31 @@ fn menu_field_entry_lines(
         "    MenuField {".to_owned(),
         format!("        menu: {},", rust_string(&menu.menu)),
         format!("        enum_type: {},", rust_option_string(enum_type)),
-        "        descriptor: FieldDescriptor::new(".to_owned(),
-        format!("            {},", rust_string(&name)),
-        format!("            0x{:X},", field.offset()),
     ];
+    let terms = field.terms();
+    if terms.is_empty() {
+        lines.push("        descriptor: FieldDescriptor::new(".to_owned());
+        lines.push(format!("            {},", rust_string(&name)));
+        lines.push(format!("            0x{:X},", field.offset()));
+    } else {
+        lines.push("        descriptor: FieldDescriptor::with_terms(".to_owned());
+        lines.push(format!("            {},", rust_string(&name)));
+        lines.push(format!("            0x{:X},", field.offset()));
+        lines.push("            &[".to_owned());
+        for term in terms {
+            lines.push("                Term {".to_owned());
+            lines.push(format!(
+                "                    dimension: {},",
+                rust_string(&term.dimension)
+            ));
+            lines.push(format!(
+                "                    stride: {},",
+                rust_decimal(term.stride)
+            ));
+            lines.push("                },".to_owned());
+        }
+        lines.push("            ],".to_owned());
+    }
     for codec_line in rust_codec(codec, catalogs, domain)? {
         lines.push(format!("            {codec_line}"));
     }
@@ -607,25 +731,36 @@ fn menu_field_entry_lines(
 /// or option domain, when a domain exceeds its storage capacity, or when the
 /// rendered field count disagrees with the manifest's summary.
 pub fn rust_text(manifest: &Manifest) -> Result<String> {
-    if manifest.model.radio != "thd75" {
-        return Err(extract_error!(
-            "Rust registry generation is defined only for thd75 in this phase; got {}",
-            manifest.model.radio
-        ));
-    }
+    let target = match manifest.model.radio.as_str() {
+        "thd75" => &THD75_TARGET,
+        "tmd750" => &TMD750_TARGET,
+        other => {
+            return Err(extract_error!(
+                "Rust registry generation is defined for thd75 and tmd750; got {other}"
+            ));
+        }
+    };
     let catalogs = enum_catalogs(manifest)?;
     let mut option_names: HashMap<String, String> = HashMap::new();
     let mut choice_value_names: Vec<(Vec<i64>, String)> = Vec::new();
-    let mut lines = registry_header_lines(manifest);
+    let mut lines = registry_header_lines(manifest, target)?;
     lines.extend(option_constant_lines(manifest, &mut option_names)?);
-    lines.extend(choice_domain_lines(manifest, &mut choice_value_names)?);
+    lines.extend(choice_domain_lines(
+        manifest,
+        target,
+        &mut choice_value_names,
+    )?);
+    let statics = format!("{}_MENU_FIELDS", target.prefix);
     lines.extend([
-        "/// All safely writable public fields from the reviewed MCP-D75 serializers.".to_owned(),
+        format!(
+            "/// All safely writable public fields from the reviewed {} serializers.",
+            target.product
+        ),
         "#[rustfmt::skip]".to_owned(),
-        "pub static MCP_D75_MENU_FIELDS: &[MenuField] = &[".to_owned(),
+        format!("pub static {statics}: &[MenuField] = &["),
     ]);
     let mut rendered_fields: u64 = 0;
-    for (menu, field) in writable_manifest_fields(manifest)? {
+    for (menu, field) in writable_manifest_fields(manifest, target)? {
         rendered_fields += 1;
         lines.extend(menu_field_entry_lines(
             menu,
@@ -648,11 +783,11 @@ pub fn rust_text(manifest: &Manifest) -> Result<String> {
         "/// accepting ASCII case-insensitive input.".to_owned(),
         "#[must_use]".to_owned(),
         "pub fn menu_field(name: &str) -> Option<&'static MenuField> {".to_owned(),
-        "    MCP_D75_MENU_FIELDS".to_owned(),
+        format!("    {statics}"),
         "        .iter()".to_owned(),
         "        .find(|field| field.descriptor.name == name)".to_owned(),
         "        .or_else(|| {".to_owned(),
-        "            MCP_D75_MENU_FIELDS".to_owned(),
+        format!("            {statics}"),
         "                .iter()".to_owned(),
         "                .find(|field| field.descriptor.name.eq_ignore_ascii_case(name))"
             .to_owned(),

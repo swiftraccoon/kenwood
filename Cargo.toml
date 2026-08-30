@@ -14,6 +14,7 @@ members = [
   "kiss-tnc",
   "mbelib-rs",
   "mcp-d75-extract",
+  "tmd750",
   "mmdvm",
   "mmdvm-core",
   "dmr-rewind",

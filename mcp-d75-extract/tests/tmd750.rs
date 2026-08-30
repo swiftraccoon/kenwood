@@ -332,16 +332,23 @@ fn ipv4_helper_values_use_the_pinned_codec() -> TestResult {
 }
 
 #[test]
-fn manifest_round_trips_and_rustgen_refuses_slot_terms() -> TestResult {
+fn manifest_round_trips_and_rustgen_emits_slot_terms() -> TestResult {
     let manifest = manifest()?;
     let json = json_text(&manifest)?;
     assert_eq!(parse_manifest(&json)?, manifest);
-    let refused = rust_text(&manifest);
-    assert!(
-        refused
-            .as_ref()
-            .is_err_and(|error| error.to_string().contains("thd75")),
-        "{refused:?}"
+    let registry = rust_text(&manifest)?;
+    assert!(registry.contains("pub static MCP_D750_MENU_FIELDS: &[MenuField] = &["));
+    assert!(registry.contains("pub const MCP_D750_IMAGE_LENGTH: usize = 1_929_472;"));
+    assert!(registry.contains("pub const MCP_D750_SLOT_STRIDE: u32 = 8192;"));
+    assert!(registry.contains(
+        "FieldDescriptor::with_terms(\n            \"radio.MeterType\",\n            0x50523,\n            &[\n                Term {\n                    dimension: \"pm_slot\",\n                    stride: 8192,\n                },\n            ],"
+    ));
+    assert!(registry.contains("FieldDescriptor::new(\n            \"radio.RepeaterMode\","));
+    assert!(registry.contains("stride: 256_000,"));
+    assert_eq!(
+        rust_text(&manifest)?,
+        registry,
+        "registry rendering must be deterministic"
     );
     Ok(())
 }

@@ -1,0 +1,27 @@
+[package]
+name = "kenwood-tmd750"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "Async Rust library for the Kenwood TM-D750: identity, MCP region programming, and manifest-driven menu fields per Programmable-Memory slot"
+license = "GPL-2.0-or-later"
+repository = "https://github.com/swiftraccoon/kenwood"
+keywords = ["kenwood", "tmd750", "ham-radio", "amateur-radio"]
+categories = ["hardware-support", "encoding"]
+authors = ["swiftraccoon"]
+readme = "README.md"
+publish = false
+
+[dependencies]
+kenwood-thd75 = { path = "../thd75", default-features = false }
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+tokio-serial = "5"
+tracing = "0.1"
+
+[dev-dependencies]
+# Typed access to the committed manifest for the registry agreement test.
+mcp-d75-extract = { path = "../mcp-d75-extract" }
+
+[lints]
+workspace = true

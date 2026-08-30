@@ -55,6 +55,8 @@ jobs:
         working-directory: dmr-rewind
       - run: cargo clippy --all-targets -- -D warnings
         working-directory: pulsar
+      - run: cargo clippy --all-targets -- -D warnings
+        working-directory: tmd750
       - run: cargo test
         working-directory: thd75
       - run: cargo test --no-default-features
@@ -75,6 +77,8 @@ jobs:
         working-directory: mbelib-rs
       - run: cargo test
         working-directory: mcp-d75-extract
+      - run: cargo test
+        working-directory: tmd750
       - run: cargo test
         working-directory: mmdvm-core
       - run: cargo test
