@@ -142,6 +142,16 @@ skip = [
   { crate = "hashbrown@0.16" },
 
   # ─────────────────────────────────────────────────────────────────────
+  # sextant image stack (eframe → image → png → flate2)
+  # ─────────────────────────────────────────────────────────────────────
+
+  # png 0.18 depends on miniz_oxide 0.8 directly while flate2 1.1.10, which
+  # png also depends on, moved to miniz_oxide 0.9. Both copies sit under
+  # sextant's eframe → image → png chain. Dropable when png updates its
+  # miniz_oxide pin to match flate2.
+  { crate = "miniz_oxide@0.8" },
+
+  # ─────────────────────────────────────────────────────────────────────
   # Windows platform shim family 0.52 (serialport + ring on Windows)
   # ─────────────────────────────────────────────────────────────────────
   #
