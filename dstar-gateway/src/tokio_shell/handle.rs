@@ -45,6 +45,12 @@ const DISCONNECT_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
 /// reply over a oneshot. Dropping the handle severs the connection
 /// from the consumer side; the spawned task exits on its next loop.
 ///
+/// Incoming events use a bounded FIFO queue. If it fills, outbound commands
+/// continue to complete and flush their packets to the socket. Further UDP
+/// input and protocol timer processing wait for event capacity, so callers
+/// must keep consuming [`Self::next_event`] for incoming traffic and link
+/// maintenance to progress.
+///
 /// **Drop is not graceful.** For graceful shutdown call
 /// [`AsyncSession::disconnect`]. Drop just severs the connection from
 /// the consumer's side; the reflector eventually times the link out

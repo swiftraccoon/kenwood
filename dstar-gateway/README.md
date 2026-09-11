@@ -110,6 +110,11 @@ the same shape as `DExtra`.
 See the `dstar-gateway/examples/` directory for standalone runnable
 versions of each.
 
+`AsyncSession` delivers incoming events through a bounded FIFO queue.
+Outbound commands and their UDP writes continue when that queue fills.
+Continue consuming `next_event` to make room for incoming traffic and
+protocol timer processing; those remain paused while the queue is full.
+
 ## Features
 
 | Feature | State | Notes |

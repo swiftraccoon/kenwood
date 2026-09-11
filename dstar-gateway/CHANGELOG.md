@@ -102,6 +102,14 @@ real reflectors and is ready for a published release.
   `DSTAR_TEST_TX_OK=1` env var so nobody accidentally keys the
   air on a real-world reflector.
 
+#### Fixed
+
+- `AsyncSession` continues processing outbound commands and sending their
+  UDP packets when the incoming event queue is full, preserving FIFO event
+  delivery. Incoming UDP traffic and protocol timers still wait for event
+  capacity; callers must continue consuming `next_event` for receive and
+  link maintenance to progress.
+
 ### `dstar-gateway-server`
 
 #### Added
