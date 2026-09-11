@@ -1,4 +1,4 @@
-//! Radio identity: model, market type, firmware.
+//! Radio identity: model, opaque radio type, and firmware.
 
 use std::fmt;
 use std::str::FromStr;
@@ -45,47 +45,41 @@ impl fmt::Display for RadioModel {
     }
 }
 
-/// The single printable byte the `TY` command reports.
+/// Exact opaque payload returned by the CAT `TY` query.
 ///
-/// The official program recognizes three values ([`KNOWN_TYPE_BYTES`]);
-/// what they select is a day-one hardware finding recorded in the crate
-/// notes, so this type carries the byte without naming its meaning.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct MarketType(u8);
+/// A stock North American TM-D750 running firmware 1.02 returns `K,2,1`.
+/// Its components remain opaque until their semantics are qualified. Other
+/// hardware variants may use a different printable shape, which is retained.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RadioType(String);
 
-/// Type bytes the official program recognizes.
-pub const KNOWN_TYPE_BYTES: [u8; 3] = [b'J', b'0', b'1'];
-
-impl MarketType {
-    /// Validate a `TY` payload byte (printable ASCII).
+impl RadioType {
+    /// Retain a non-empty printable ASCII payload exactly.
     ///
     /// # Errors
     ///
-    /// Returns [`ValidationError::InvalidMarketTypeByte`] for a non-printable byte.
-    pub const fn new(value: u8) -> Result<Self, ValidationError> {
-        if value.is_ascii_graphic() {
-            Ok(Self(value))
+    /// Returns [`ValidationError::InvalidRadioTypePayload`] for an empty value
+    /// or one containing a non-printable byte.
+    pub fn new(payload: &str) -> Result<Self, ValidationError> {
+        if payload.is_empty() || !payload.bytes().all(|byte| byte.is_ascii_graphic()) {
+            Err(ValidationError::InvalidRadioTypePayload {
+                payload: payload.to_owned(),
+            })
         } else {
-            Err(ValidationError::InvalidMarketTypeByte { value })
+            Ok(Self(payload.to_owned()))
         }
     }
 
-    /// The raw byte.
+    /// The exact `TY` payload.
     #[must_use]
-    pub const fn as_byte(self) -> u8 {
-        self.0
-    }
-
-    /// Whether the official program recognizes this byte.
-    #[must_use]
-    pub fn is_known(self) -> bool {
-        KNOWN_TYPE_BYTES.contains(&self.0)
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
-impl fmt::Display for MarketType {
+impl fmt::Display for RadioType {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}", char::from(self.0))
+        formatter.write_str(&self.0)
     }
 }
 
@@ -162,19 +156,20 @@ mod tests {
     }
 
     #[test]
-    fn market_type_is_a_printable_byte() -> TestResult {
-        let known = MarketType::new(b'J')?;
-        assert!(known.is_known());
-        assert_eq!(known.to_string(), "J");
-        assert!(!MarketType::new(b'X')?.is_known());
-        let rejected = MarketType::new(0x0D);
+    fn radio_type_preserves_the_exact_printable_payload() -> TestResult {
+        let observed = RadioType::new("K,2,1")?;
+        assert_eq!(observed.as_str(), "K,2,1");
+        assert_eq!(observed.to_string(), "K,2,1");
+        assert_eq!(RadioType::new("J")?.as_str(), "J");
+        let rejected = RadioType::new("");
         assert!(
             matches!(
                 rejected,
-                Err(ValidationError::InvalidMarketTypeByte { value: 0x0D })
+                Err(ValidationError::InvalidRadioTypePayload { .. })
             ),
             "{rejected:?}"
         );
+        assert!(RadioType::new("K,\r,1").is_err());
         Ok(())
     }
 

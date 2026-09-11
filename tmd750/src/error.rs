@@ -32,7 +32,7 @@ pub enum Error {
         /// The timeout that elapsed.
         millis: u64,
     },
-    /// The connected radio is not the model and firmware the registry describes.
+    /// The connected radio does not match the conservative schema-target gate.
     #[error(
         "MCP-D750 schema patches support only {expected_model} firmware {expected_firmware} \
          (accepted exact FV identities: {accepted:?}); connected target is model \
@@ -41,14 +41,29 @@ pub enum Error {
     UnsupportedSchemaTarget {
         /// Model the registry was generated for.
         expected_model: &'static str,
-        /// Firmware release the registry was generated for.
+        /// Declared firmware provenance label of the generated registry.
         expected_firmware: &'static str,
-        /// Exact `FV` strings accepted for that release.
+        /// Exact `FV` strings accepted by the schema-target gate.
         accepted: &'static [&'static str],
         /// Model the radio reported.
         actual_model: String,
         /// Firmware the radio reported.
         actual_firmware: String,
+    },
+    /// The connected target has not been qualified for CAT operating-mode writes.
+    #[error(
+        "CAT mode writes support only firmware {expected_firmware} with TY {expected_radio_type}; \
+         connected target reports firmware {actual_firmware} with TY {actual_radio_type}"
+    )]
+    UnsupportedCatWriteTarget {
+        /// Exact qualified `FV` identity.
+        expected_firmware: &'static str,
+        /// Exact qualified `TY` payload.
+        expected_radio_type: &'static str,
+        /// Connected radio's `FV` identity.
+        actual_firmware: String,
+        /// Connected radio's `TY` payload.
+        actual_radio_type: String,
     },
 }
 
@@ -78,10 +93,16 @@ pub enum ValidationError {
         /// The byte.
         value: u8,
     },
-    /// The `TY` payload byte is not printable.
-    #[error("market type byte 0x{value:02X} is not printable ASCII")]
-    InvalidMarketTypeByte {
-        /// The byte.
+    /// The `TY` payload is empty or contains a non-printable byte.
+    #[error("invalid TY radio-type payload {payload:?}; expected non-empty printable ASCII")]
+    InvalidRadioTypePayload {
+        /// The rejected payload.
+        payload: String,
+    },
+    /// A CAT band index is not A or B.
+    #[error("band index {value} is not 0 (A) or 1 (B)")]
+    InvalidBand {
+        /// The rejected wire value.
         value: u8,
     },
     /// An address lies outside the image.
@@ -130,6 +151,12 @@ pub enum ValidationError {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ProtocolError {
+    /// A CAT reply exceeded the bounded line buffer before its terminator.
+    #[error("CAT line exceeds the {limit}-byte limit")]
+    CatLineTooLong {
+        /// Maximum line length, excluding the carriage-return terminator.
+        limit: usize,
+    },
     /// A CAT line held non-ASCII bytes.
     #[error("CAT line is not ASCII: {line:?}")]
     NonAsciiLine {
@@ -202,6 +229,17 @@ pub enum ProtocolError {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum McpError {
+    /// A CAT operation was requested while the radio is in programming mode.
+    #[error("programming mode is active; exit the MCP session before using CAT")]
+    SessionActive,
+    /// An MCP operation was requested without an active programming session.
+    #[error("programming mode is not active")]
+    SessionNotActive,
+    /// An interrupted exchange left the radio's protocol state uncertain.
+    #[error(
+        "radio protocol state is uncertain; restore normal mode and establish a fresh connection"
+    )]
+    RecoveryRequired,
     /// A page lies outside the writable regions.
     #[error("page at {address} (len {len}) lies outside the writable regions")]
     PageNotWritable {

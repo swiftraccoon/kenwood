@@ -45,7 +45,7 @@ async fn patch_a_pm_name_end_to_end() -> TestResult {
     let mut mock = MockTransport::new();
     mock.expect(b"ID\r", b"ID TM-D750\r");
     mock.expect(b"FV\r", b"FV 1.00\r");
-    mock.expect(b"TY\r", b"TY J\r");
+    mock.expect(b"TY\r", b"TY K,2,1\r");
     mock.expect(ENTER, b"0M\r");
     for region in &regions {
         for page in region.pages() {

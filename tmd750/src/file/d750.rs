@@ -2,12 +2,13 @@
 //!
 //! The official program accepts two lengths: the full 1,929,472-byte image,
 //! or only the bytes before the startup-screen area (393,216 bytes) when the
-//! file was saved without it. The header is carried opaquely and reproduced
-//! byte for byte; its field semantics are added as they are pinned.
+//! file was saved without it. Parsed headers are carried opaquely and reproduced
+//! byte for byte. [`ConfigHeader::for_mcp_d750`] constructs the known blank-comment
+//! header for the full file layout; it does not validate firmware compatibility.
 
 use crate::error::FileError;
 use crate::memory::MemoryImage;
-use crate::types::IMAGE_LENGTH;
+use crate::types::{IMAGE_LENGTH, RadioType};
 
 /// Header length.
 pub const HEADER_SIZE: usize = 256;
@@ -45,7 +46,20 @@ impl FileLayout {
     }
 }
 
-/// The opaque 256-byte header.
+/// Failure to construct a compatibility header from an opaque radio type.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ConfigHeaderError {
+    /// The radio type is not three single-byte components separated by commas.
+    #[error(
+        "cannot construct a configuration header from radio type {payload:?}: expected three single-byte components separated by commas"
+    )]
+    UnsupportedRadioType {
+        /// The unchanged radio-type payload that could not be represented.
+        payload: String,
+    },
+}
+
+/// A 256-byte header, preserved opaquely when read from an existing file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigHeader([u8; HEADER_SIZE]);
 
@@ -54,6 +68,58 @@ impl ConfigHeader {
     #[must_use]
     pub const fn from_bytes(bytes: [u8; HEADER_SIZE]) -> Self {
         Self(bytes)
+    }
+
+    /// Construct the blank-comment MCP-D750 V1.00 compatibility header.
+    ///
+    /// This header is for [`FileLayout::Full`]. It contains `MCP-D750` at offset
+    /// 0, the format's application-version marker `V1.00` at offset 8, `TM-D750`
+    /// at offset 16, zero at offset 32, and the three radio-type components at
+    /// offset 128 without their separators. All other bytes are `0xFF`.
+    /// The application marker describes the reproduced file format, not this
+    /// library's version or the radio's firmware.
+    ///
+    /// No component meanings are inferred. For example, `K,2,1` is stored as
+    /// the three ASCII bytes `K21`. Construction neither qualifies a memory
+    /// schema for that radio nor proves that the official application can open
+    /// the eventual file. It does not alter or validate an image, establish read
+    /// coverage, or perform the official writer's image-byte normalization.
+    /// A radio-backed export still requires complete intended-region coverage
+    /// and a matching, validated template for bytes the radio read omits.
+    /// Filling every unread byte with `0xFF` is not an established substitute.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigHeaderError::UnsupportedRadioType`] unless `radio_type`
+    /// consists of exactly three non-comma printable ASCII bytes, separated by
+    /// commas. Other shapes remain valid opaque [`RadioType`] values but have
+    /// no supported representation in a newly constructed header.
+    pub fn for_mcp_d750(radio_type: &RadioType) -> Result<Self, ConfigHeaderError> {
+        let [first, b',', second, b',', third] = radio_type.as_str().as_bytes() else {
+            return Err(ConfigHeaderError::UnsupportedRadioType {
+                payload: radio_type.as_str().to_owned(),
+            });
+        };
+        let components = [*first, *second, *third];
+        if components.contains(&b',') {
+            return Err(ConfigHeaderError::UnsupportedRadioType {
+                payload: radio_type.as_str().to_owned(),
+            });
+        }
+
+        let mut bytes = [0xFF; HEADER_SIZE];
+        for (offset, value) in [
+            (0, b"MCP-D750".as_slice()),
+            (8, b"V1.00".as_slice()),
+            (16, b"TM-D750".as_slice()),
+            (32, &[0]),
+            (128, components.as_slice()),
+        ] {
+            for (destination, source) in bytes.iter_mut().skip(offset).zip(value) {
+                *destination = *source;
+            }
+        }
+        Ok(Self(bytes))
     }
 
     /// The raw bytes.
@@ -176,6 +242,52 @@ mod tests {
             ),
             "{short:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn constructed_header_pins_every_byte_without_touching_an_image() -> TestResult {
+        let header = ConfigHeader::for_mcp_d750(&RadioType::new("K,2,1")?)?;
+        let mut expected = [0xFF; HEADER_SIZE];
+        expected
+            .get_mut(..8)
+            .ok_or("product field")?
+            .copy_from_slice(b"MCP-D750");
+        expected
+            .get_mut(8..13)
+            .ok_or("version field")?
+            .copy_from_slice(b"V1.00");
+        expected
+            .get_mut(16..23)
+            .ok_or("model field")?
+            .copy_from_slice(b"TM-D750");
+        *expected.get_mut(32).ok_or("reserved byte")? = 0;
+        expected
+            .get_mut(128..131)
+            .ok_or("type field")?
+            .copy_from_slice(b"K21");
+        assert_eq!(header.as_bytes(), &expected);
+        Ok(())
+    }
+
+    #[test]
+    fn constructed_header_preserves_other_single_byte_type_components() -> TestResult {
+        let header = ConfigHeader::for_mcp_d750(&RadioType::new("J,0,1")?)?;
+        assert_eq!(header.as_bytes().get(128..131), Some(b"J01".as_slice()));
+        Ok(())
+    }
+
+    #[test]
+    fn constructed_header_rejects_unrepresentable_opaque_type_shapes() -> TestResult {
+        for payload in ["J", "K,22,1", "K,2", "K,2,1,0", ",,2,1", "K,,,1", "K,2,,"] {
+            let result = ConfigHeader::for_mcp_d750(&RadioType::new(payload)?);
+            assert_eq!(
+                result,
+                Err(ConfigHeaderError::UnsupportedRadioType {
+                    payload: payload.to_owned(),
+                }),
+            );
+        }
         Ok(())
     }
 }

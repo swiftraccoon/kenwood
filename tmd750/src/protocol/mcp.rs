@@ -14,12 +14,12 @@ use crate::types::{Address, PAGE_SIZE, Page};
 
 /// Baud rate of the whole programming session.
 pub const BAUD: u32 = 9600;
-/// Programming-mode entry; the leading `\r` clears any stale partial line.
-pub const ENTER: &[u8] = b"\r0M PROGRAM\r";
-/// Line (without terminator) the radio answers to [`ENTER`].
+/// Programming-mode entry sent by the official program, without a leading CR.
+pub const ENTER: &[u8] = b"0M PROGRAM\r";
+/// Exact reply line the official program requires after [`ENTER`].
 ///
-/// The TH-D75 answers `0M`; the TM-D750's reply text is a day-one hardware
-/// finding and this value is provisional until then.
+/// This excludes the carriage-return terminator. The exchange still requires
+/// qualification against the connected radio's firmware.
 pub const ENTER_RESPONSE: &[u8] = b"0M";
 /// Exit byte.
 pub const EXIT: u8 = b'E';

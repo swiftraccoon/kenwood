@@ -2,6 +2,10 @@
 
 use super::{Progress, Radio};
 use crate::error::{Error, McpError, ProtocolError};
+use crate::memory::{
+    MCP_D750_SCHEMA_FIRMWARE, MCP_D750_SCHEMA_FIRMWARE_IDENTITIES, MCP_D750_SCHEMA_MODEL,
+    is_supported_schema_target,
+};
 use crate::protocol::mcp::{
     ACK, BAUD, ENTER, ENTER_RESPONSE, EXIT, FILL, HEADER_LEN, Header, PagePatch, WRITE,
     read_request, regions, write_request,
@@ -126,15 +130,22 @@ impl RegionImage {
 impl<T: Transport> Radio<T> {
     /// Enter programming mode after an identity proof.
     ///
+    /// An interrupted entry exchange leaves the protocol state uncertain.
+    /// Further CAT or MCP traffic is refused until the operator restores normal
+    /// mode and establishes a fresh connection. The expected reply follows the
+    /// official program; unexpected replies are never accepted automatically.
+    ///
     /// # Errors
     ///
     /// Propagates identity failures; returns [`ProtocolError::EntryReply`]
     /// when the radio does not answer the expected entry line.
     pub async fn enter_mcp(&mut self) -> Result<McpSession<'_, T>, Error> {
+        self.require_cat()?;
         if self.identity().is_none() {
             let _proven = self.identify().await?;
         }
         tracing::info!("entering programming mode at {BAUD} baud");
+        self.mark_mcp_uncertain();
         self.set_baud(BAUD)?;
         self.write_all(ENTER).await?;
         let reply = self.read_line("programming mode entry").await?;
@@ -145,14 +156,44 @@ impl<T: Transport> Radio<T> {
             }
             .into());
         }
+        self.record_mcp_entry_reply(reply);
+        self.mark_mcp_ready();
+        self.mcp_session()
+    }
+
+    /// Borrow an existing MCP session at a fully completed exchange boundary.
+    ///
+    /// This sends no bytes and does not enter programming mode. It permits
+    /// explicit cleanup after dropping a session that was idle. The returned
+    /// journal starts empty; retain the previous journal before dropping its
+    /// session if it contains writes that need recovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::SessionNotActive`] outside programming mode, or
+    /// [`McpError::RecoveryRequired`] after an incomplete exchange.
+    pub fn mcp_session(&mut self) -> Result<McpSession<'_, T>, Error> {
+        self.require_mcp_ready()?;
+        let entry_reply = self
+            .mcp_entry_reply()
+            .ok_or(McpError::RecoveryRequired)?
+            .to_vec();
         Ok(McpSession {
             radio: self,
             journal: McpJournal::default(),
+            entry_reply,
         })
     }
 
     /// After an interrupted write, re-enter MCP, read the journaled pages,
-    /// and report which already carry their intended patch. Never writes.
+    /// and report which already carry their intended patch without programming
+    /// memory.
+    ///
+    /// Requires a usable connection; this method does not reopen a disconnected
+    /// transport. After a disconnect, establish the radio's identity over a
+    /// fresh connection before recovering the journal. An uncertain MCP state
+    /// must first be cleared by restoring the radio to normal mode; this method
+    /// never attempts to repair an incomplete frame.
     ///
     /// # Errors
     ///
@@ -185,13 +226,31 @@ impl<T: Transport> Radio<T> {
 }
 
 /// An active programming session; holds the radio until [`McpSession::exit`].
+///
+/// Dropping the session does not send an exit command or restore CAT access.
+/// Use [`Radio::mcp_session`] to resume an idle session. If an exchange fails or
+/// is cancelled, no further traffic is allowed on this managed connection;
+/// an exit byte could otherwise be interpreted as part of an incomplete frame.
 #[derive(Debug)]
 pub struct McpSession<'a, T: Transport> {
     radio: &'a mut Radio<T>,
     journal: McpJournal,
+    entry_reply: Vec<u8>,
 }
 
 impl<T: Transport> McpSession<'_, T> {
+    /// The exact verified programming-entry reply, excluding its terminator.
+    #[must_use]
+    pub fn entry_reply(&self) -> &[u8] {
+        &self.entry_reply
+    }
+
+    /// Whether the last exchange completed and an explicit exit is safe.
+    #[must_use]
+    pub const fn is_ready(&self) -> bool {
+        self.radio.mcp_ready()
+    }
+
     /// Pages written and verified so far.
     #[must_use]
     pub const fn journal(&self) -> &McpJournal {
@@ -202,12 +261,15 @@ impl<T: Transport> McpSession<'_, T> {
     ///
     /// # Errors
     ///
-    /// Returns header, ACK, transport, and timeout errors; nothing is written.
+    /// Returns session-state, header, ACK, transport, and timeout errors.
+    /// Read requests and protocol acknowledgments are sent, but no memory is
+    /// programmed. An incomplete exchange requires operator recovery.
     pub async fn read_regions(
         &mut self,
         regions: &[Region],
         mut progress: impl FnMut(Progress),
     ) -> Result<RegionImage, Error> {
+        self.radio.require_mcp_ready()?;
         let pages: Vec<Page> = regions.iter().flat_map(|region| region.pages()).collect();
         let total = pages.len();
         let mut image = RegionImage::new();
@@ -226,18 +288,32 @@ impl<T: Transport> McpSession<'_, T> {
     }
 
     /// Apply each patch to a freshly read page, write it, read it back, and
-    /// compare. Refuses every patch outside the writable regions before any
-    /// write. On failure the error carries the journal counts.
+    /// compare. Requires the exact model and firmware targeted by the schema,
+    /// and refuses every patch outside the writable regions before any page
+    /// traffic or journal changes. On exchange failure the error carries the
+    /// journal counts.
     ///
     /// # Errors
     ///
-    /// Returns [`McpError::PageNotWritable`] up front, or
+    /// Returns [`Error::UnsupportedSchemaTarget`], session-state errors, or
+    /// [`McpError::PageNotWritable`] up front, or
     /// [`McpError::Interrupted`] wrapping the failure that stopped the write.
     pub async fn write_pages_verified(
         &mut self,
         patches: &[PagePatch],
         mut progress: impl FnMut(Progress),
     ) -> Result<McpWriteReport, Error> {
+        self.radio.require_mcp_ready()?;
+        let identity = self.radio.identity().ok_or(McpError::RecoveryRequired)?;
+        if !is_supported_schema_target(identity.model, &identity.firmware) {
+            return Err(Error::UnsupportedSchemaTarget {
+                expected_model: MCP_D750_SCHEMA_MODEL,
+                expected_firmware: MCP_D750_SCHEMA_FIRMWARE,
+                accepted: MCP_D750_SCHEMA_FIRMWARE_IDENTITIES,
+                actual_model: identity.model.to_string(),
+                actual_firmware: identity.firmware.as_str().to_owned(),
+            });
+        }
         for patch in patches {
             if !regions::is_writable_page(patch.page) {
                 return Err(McpError::PageNotWritable {
@@ -277,16 +353,33 @@ impl<T: Transport> McpSession<'_, T> {
 
     /// Send `E`, expect the ACK, restore the CAT baud rate.
     ///
+    /// Only a fully completed exchange boundary permits exit. Failure or
+    /// cancellation leaves CAT access blocked; no exit is retried automatically.
+    ///
     /// # Errors
     ///
-    /// Returns [`ProtocolError::MissingAck`], transport, and timeout errors.
-    pub async fn exit(self) -> Result<(), Error> {
-        let radio = self.radio;
-        radio.write_all(&[EXIT]).await?;
-        let cat_baud = radio.cat_baud();
-        let result = expect_ack(radio, "MCP exit").await;
-        radio.set_baud(cat_baud)?;
-        result
+    /// Returns session-state, [`ProtocolError::MissingAck`], transport, and
+    /// timeout errors.
+    pub async fn exit(mut self) -> Result<(), Error> {
+        self.acknowledge_exit().await?;
+        self.radio.set_baud(self.radio.cat_baud())?;
+        self.radio.mark_cat_ready();
+        Ok(())
+    }
+
+    /// Stop at the exit ACK without depending on the old handle afterward.
+    ///
+    /// The caller must close and drop the transport. Its protocol state remains
+    /// blocked so no CAT or second programming session can reuse this handle.
+    pub(super) async fn exit_detached(mut self) -> Result<(), Error> {
+        self.acknowledge_exit().await
+    }
+
+    async fn acknowledge_exit(&mut self) -> Result<(), Error> {
+        self.radio.require_mcp_ready()?;
+        self.radio.mark_mcp_uncertain();
+        self.radio.write_all(&[EXIT]).await?;
+        expect_ack(self.radio, "MCP exit").await
     }
 
     async fn write_page_verified(&mut self, patch: &PagePatch) -> Result<(), Error> {
@@ -295,8 +388,10 @@ impl<T: Transport> McpSession<'_, T> {
         self.journal.possibly_written.push(patch.page);
         let mut frame = write_request(patch.page).to_vec();
         frame.extend_from_slice(&data);
+        self.radio.mark_mcp_uncertain();
         self.radio.write_all(&frame).await?;
         expect_ack(self.radio, "MCP page write").await?;
+        self.radio.mark_mcp_ready();
         let read_back = self.read_page(patch.page).await?;
         if let Some(offset) = data
             .iter()
@@ -314,7 +409,9 @@ impl<T: Transport> McpSession<'_, T> {
     }
 
     pub(crate) async fn read_page(&mut self, page: Page) -> Result<Vec<u8>, Error> {
+        self.radio.require_mcp_ready()?;
         let request = read_request(page);
+        self.radio.mark_mcp_uncertain();
         self.radio.write_all(&request).await?;
         let reply = self.radio.read_exact(HEADER_LEN, "MCP read header").await?;
         let reply: [u8; HEADER_LEN] = reply.as_slice().try_into().map_err(|_| {
@@ -342,6 +439,7 @@ impl<T: Transport> McpSession<'_, T> {
         };
         self.radio.write_all(&[ACK]).await?;
         expect_ack(self.radio, "MCP page read").await?;
+        self.radio.mark_mcp_ready();
         Ok(data)
     }
 }

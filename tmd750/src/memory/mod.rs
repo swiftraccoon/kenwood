@@ -2,7 +2,11 @@
 
 pub mod menu_fields;
 mod menu_patch;
+mod pm1_name_update;
+mod pm_name_trial;
 pub mod schema;
+mod terminal;
+mod text;
 
 use crate::error::{SchemaError, ValidationError};
 use crate::types::{FirmwareIdentity, IMAGE_LENGTH, RadioModel, SlotIndex};
@@ -12,18 +16,39 @@ pub use menu_fields::{
     MCP_D750_SLOT_STRIDE, MCP_D750_SOURCE_SHA256, MenuField, MenuOption, StorageTransform,
     menu_field,
 };
+pub use pm_name_trial::{
+    PmNameTrial, PmNameTrialError, PmNameTrialEvent, PmNameTrialSession, PmNameTrialStatus,
+    PmNameTrialWrite,
+};
+pub use pm1_name_update::{
+    Pm1Name, Pm1NameUpdate, Pm1NameUpdateError, Pm1NameUpdateEvent, Pm1NameUpdateSession,
+    Pm1NameUpdateStatus,
+};
 pub use schema::{
     DecodedFieldValue, Endian, FieldCodec, FieldDescriptor, FieldValue, PatchPlanner, PatchSet,
     SLOT_TERM, StringEncoding, Term,
 };
+pub use terminal::{
+    ReflectorTerminalPreflight, TerminalFinding, TerminalGatewayMode, TerminalGatewayRoute,
+    TerminalMode, TerminalMyCallsignIndex, TerminalPreflightError, TerminalUsbFunction,
+    TerminalUsbRoute,
+};
+pub use text::{
+    TextError, TextImage, TextLayoutQualification, TextMetadata, TextPreview, TextScope,
+    TextScopeKind, TextSetting,
+};
 
 /// Model whose layout the generated registry describes.
 pub const MCP_D750_SCHEMA_MODEL: &str = "TM-D750";
-/// Firmware release whose layout the generated registry describes.
+/// Caller-declared firmware provenance label of the generated registry.
+///
+/// This is not a vendor maximum version or proof of hardware compatibility.
 pub const MCP_D750_SCHEMA_FIRMWARE: &str = "1.00";
-/// Exact `FV` identities whose layout matches the registry. The first
-/// hardware `FV` reply fixes the format; a new entry and a new manifest
-/// release land together.
+/// Exact firmware labels accepted by the conservative schema-target gate.
+///
+/// These labels are declared extraction provenance, not hardware qualification
+/// or a vendor firmware compatibility range. Changes require a reviewed
+/// manifest release and separate qualification.
 pub const MCP_D750_SCHEMA_FIRMWARE_IDENTITIES: &[&str] = &["1.00"];
 
 /// Whether a proven identity matches the registry's target.

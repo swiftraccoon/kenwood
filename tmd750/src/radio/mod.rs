@@ -1,20 +1,44 @@
-//! The async radio: identity proof over CAT and entry into MCP.
+//! The async radio: typed CAT control and entry into MCP.
 
+pub mod backup;
+pub mod pm1_name_update;
+mod pm1_page;
+pub mod pm_name_trial;
 pub mod programming;
+pub mod qualification;
 
+use std::collections::VecDeque;
 use std::time::Duration;
 
-use crate::error::{Error, ProtocolError};
+use crate::error::{Error, McpError, ProtocolError};
 use crate::protocol::cat::{Command, LINE_TERMINATOR, Response, parse_line};
 use crate::transport::{Transport, TransportError};
-use crate::types::{FirmwareIdentity, MarketType, RadioModel};
+use crate::types::{
+    Band, DvGatewayMode, FirmwareIdentity, OperatingMode, RadioModel, RadioType, SelectableMode,
+};
 
 pub use programming::{McpJournal, McpSession, McpWriteReport, RecoveryReport, RegionImage};
 
-/// Default reply timeout for one CAT line or one MCP exchange step.
+/// Default timeout for one serial write, CAT line, or MCP exchange step.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(1500);
-/// Default CAT baud rate (a day-one hardware finding may change it).
+/// Hardware-validated default CAT baud rate.
 pub const DEFAULT_CAT_BAUD: u32 = 9600;
+
+/// Maximum accepted CAT reply length, excluding its carriage return.
+///
+/// This host-side resource limit bounds malformed or unterminated replies;
+/// it does not describe a measured radio firmware limit.
+pub const MAX_CAT_LINE_BYTES: usize = 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProtocolState {
+    CatReady,
+    McpReady,
+    RecoveryRequired,
+}
+
+const QUALIFIED_MODE_WRITE_FIRMWARE: &str = "1.02";
+const QUALIFIED_MODE_WRITE_RADIO_TYPE: &str = "K,2,1";
 
 /// Progress of a multi-page transfer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,8 +56,8 @@ pub struct Identity {
     pub model: RadioModel,
     /// Exact `FV` payload.
     pub firmware: FirmwareIdentity,
-    /// The `TY` byte.
-    pub market: MarketType,
+    /// Exact opaque `TY` payload.
+    pub radio_type: RadioType,
 }
 
 /// A TM-D750 behind a transport.
@@ -43,20 +67,30 @@ pub struct Radio<T: Transport> {
     timeout: Duration,
     cat_baud: u32,
     identity: Option<Identity>,
+    receive_buffer: VecDeque<u8>,
+    protocol_state: ProtocolState,
+    mcp_entry_reply: Option<Vec<u8>>,
 }
 
 impl<T: Transport> Radio<T> {
-    /// Wrap a transport; nothing is sent until [`Radio::identify`].
+    /// Wrap a transport without sending commands.
     pub const fn new(transport: T) -> Self {
         Self {
             transport,
             timeout: DEFAULT_TIMEOUT,
             cat_baud: DEFAULT_CAT_BAUD,
             identity: None,
+            receive_buffer: VecDeque::new(),
+            protocol_state: ProtocolState::CatReady,
+            mcp_entry_reply: None,
         }
     }
 
-    /// Change the per-step timeout.
+    /// Change the deadline for each serial write and each reply-reading step.
+    ///
+    /// A write timeout does not prove that no bytes reached the radio. A CAT
+    /// or MCP exchange that is interrupted remains unavailable for further
+    /// commands until the connection and radio protocol boundary are recovered.
     pub const fn set_timeout(&mut self, timeout: Duration) {
         self.timeout = timeout;
     }
@@ -94,28 +128,176 @@ impl<T: Transport> Radio<T> {
             Response::FirmwareVersion { version } => version,
             other => return Err(unexpected("FirmwareVersion", &other)),
         };
-        let market = match self.command(Command::RadioType).await? {
-            Response::RadioType { market } => market,
+        let radio_type = match self.command(Command::RadioType).await? {
+            Response::RadioType(radio_type) => radio_type,
             other => return Err(unexpected("RadioType", &other)),
         };
         let identity = Identity {
             model,
             firmware,
-            market,
+            radio_type,
         };
-        tracing::info!(firmware = %identity.firmware, market = %identity.market, "radio identified");
+        tracing::info!(
+            firmware = %identity.firmware,
+            radio_type = %identity.radio_type,
+            "radio identified"
+        );
         self.identity = Some(identity.clone());
         Ok(identity)
     }
 
+    /// Read the current operating mode for one band.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport, timeout, parse, rejection, or unexpected-response error.
+    pub async fn get_operating_mode(&mut self, band: Band) -> Result<OperatingMode, Error> {
+        match self.command(Command::GetOperatingMode { band }).await? {
+            Response::OperatingMode {
+                band: response_band,
+                mode,
+            } if response_band == band => Ok(mode),
+            other => Err(unexpected("matching OperatingMode", &other)),
+        }
+    }
+
+    /// Select an operating mode and prove the result with an immediate readback.
+    ///
+    /// Only FM and DV are exposed because both were accepted and read back on
+    /// live Band A and Band B hardware. A DR write was rejected, and its read
+    /// value has not yet been observed; it is not CAT-selectable through this API.
+    ///
+    /// # Errors
+    ///
+    /// Proves the radio identity first when needed and refuses targets other
+    /// than the exact firmware and radio type qualified on live hardware.
+    /// Returns an error when that gate fails, the write is rejected, its reply
+    /// does not match, or the immediate readback differs from the request.
+    pub async fn set_operating_mode(
+        &mut self,
+        band: Band,
+        mode: SelectableMode,
+    ) -> Result<(), Error> {
+        let identity = match self.identity().cloned() {
+            Some(identity) => identity,
+            None => self.identify().await?,
+        };
+        if identity.firmware.as_str() != QUALIFIED_MODE_WRITE_FIRMWARE
+            || identity.radio_type.as_str() != QUALIFIED_MODE_WRITE_RADIO_TYPE
+        {
+            return Err(Error::UnsupportedCatWriteTarget {
+                expected_firmware: QUALIFIED_MODE_WRITE_FIRMWARE,
+                expected_radio_type: QUALIFIED_MODE_WRITE_RADIO_TYPE,
+                actual_firmware: identity.firmware.to_string(),
+                actual_radio_type: identity.radio_type.to_string(),
+            });
+        }
+        let requested = OperatingMode::from(mode);
+        match self
+            .command(Command::SetOperatingMode { band, mode })
+            .await?
+        {
+            Response::OperatingMode {
+                band: response_band,
+                mode: response_mode,
+            } if response_band == band && response_mode == requested => {}
+            other => return Err(unexpected("matching OperatingMode write echo", &other)),
+        }
+        let observed = self.get_operating_mode(band).await?;
+        if observed == requested {
+            Ok(())
+        } else {
+            Err(Error::Protocol(ProtocolError::UnexpectedResponse {
+                expected: "operating-mode readback equal to requested mode",
+                actual: format!("band {band} reported {observed}, requested {requested}"),
+            }))
+        }
+    }
+
+    /// Put one band into D-STAR DV mode with verified readback.
+    ///
+    /// This changes the ordinary RF demodulation mode. It does not enable the
+    /// separate persistent DV Gateway or Terminal Mode setting.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors from [`Radio::set_operating_mode`].
+    pub async fn enter_dstar(&mut self, band: Band) -> Result<(), Error> {
+        self.set_operating_mode(band, SelectableMode::Dv).await
+    }
+
+    /// Read the persistent DV Gateway state through the read-only `GW` command.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport, timeout, parse, rejection, or unexpected-response error.
+    pub async fn get_dv_gateway_mode(&mut self) -> Result<DvGatewayMode, Error> {
+        match self.command(Command::GetGatewayMode).await? {
+            Response::GatewayMode(mode) => Ok(mode),
+            other => Err(unexpected("GatewayMode", &other)),
+        }
+    }
+
     pub(crate) async fn command(&mut self, command: Command) -> Result<Response, Error> {
+        self.require_cat()?;
+        self.protocol_state = ProtocolState::RecoveryRequired;
         self.write_all(&command.encode()).await?;
         let line = self.read_line(command.mnemonic()).await?;
-        Ok(parse_line(&line)?)
+        let response = parse_line(&line)?;
+        self.mark_cat_ready();
+        Ok(response)
     }
 
     pub(crate) async fn write_all(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        self.transport.write(bytes).await.map_err(Error::Transport)
+        let timeout = self.timeout;
+        tokio::time::timeout(timeout, self.transport.write(bytes))
+            .await
+            .map_err(|_| Error::Timeout {
+                operation: "serial write",
+                millis: millis(timeout),
+            })?
+            .map_err(Error::Transport)
+    }
+
+    pub(crate) fn require_cat(&self) -> Result<(), Error> {
+        match self.protocol_state {
+            ProtocolState::CatReady => Ok(()),
+            ProtocolState::McpReady => Err(McpError::SessionActive.into()),
+            ProtocolState::RecoveryRequired => Err(McpError::RecoveryRequired.into()),
+        }
+    }
+
+    pub(crate) fn require_mcp_ready(&self) -> Result<(), Error> {
+        match self.protocol_state {
+            ProtocolState::McpReady => Ok(()),
+            ProtocolState::CatReady => Err(McpError::SessionNotActive.into()),
+            ProtocolState::RecoveryRequired => Err(McpError::RecoveryRequired.into()),
+        }
+    }
+
+    pub(crate) fn mark_cat_ready(&mut self) {
+        self.protocol_state = ProtocolState::CatReady;
+        self.mcp_entry_reply = None;
+    }
+
+    pub(crate) const fn mark_mcp_ready(&mut self) {
+        self.protocol_state = ProtocolState::McpReady;
+    }
+
+    pub(crate) const fn mark_mcp_uncertain(&mut self) {
+        self.protocol_state = ProtocolState::RecoveryRequired;
+    }
+
+    pub(crate) const fn mcp_ready(&self) -> bool {
+        matches!(self.protocol_state, ProtocolState::McpReady)
+    }
+
+    pub(crate) fn record_mcp_entry_reply(&mut self, reply: Vec<u8>) {
+        self.mcp_entry_reply = Some(reply);
+    }
+
+    pub(crate) fn mcp_entry_reply(&self) -> Option<&[u8]> {
+        self.mcp_entry_reply.as_deref()
     }
 
     pub(crate) fn set_baud(&mut self, baud: u32) -> Result<(), Error> {
@@ -126,27 +308,35 @@ impl<T: Transport> Radio<T> {
         self.cat_baud
     }
 
-    /// Read bytes until a carriage return; the terminator is dropped.
+    /// Read one bounded CAT line while retaining all bytes after its terminator.
+    ///
+    /// Partial input remains owned by the radio if this future is cancelled.
     pub(crate) async fn read_line(&mut self, operation: &'static str) -> Result<Vec<u8>, Error> {
         let timeout = self.timeout;
-        let transport = &mut self.transport;
         tokio::time::timeout(timeout, async {
-            let mut line = Vec::new();
-            let mut buf = [0u8; 64];
             loop {
-                let count = transport.read(&mut buf).await.map_err(Error::Transport)?;
-                if count == 0 {
-                    return Err(closed("connection closed while reading a CAT line"));
-                }
-                let chunk = buf
-                    .get(..count)
-                    .ok_or_else(|| closed("transport returned more bytes than the buffer holds"))?;
-                for &byte in chunk {
-                    if byte == LINE_TERMINATOR {
-                        return Ok(line);
+                if let Some(length) = self
+                    .receive_buffer
+                    .iter()
+                    .position(|byte| *byte == LINE_TERMINATOR)
+                {
+                    if length > MAX_CAT_LINE_BYTES {
+                        return Err(ProtocolError::CatLineTooLong {
+                            limit: MAX_CAT_LINE_BYTES,
+                        }
+                        .into());
                     }
-                    line.push(byte);
+                    let line = self.receive_buffer.drain(..length).collect();
+                    let _terminator = self.receive_buffer.pop_front();
+                    return Ok(line);
                 }
+                if self.receive_buffer.len() > MAX_CAT_LINE_BYTES {
+                    return Err(ProtocolError::CatLineTooLong {
+                        limit: MAX_CAT_LINE_BYTES,
+                    }
+                    .into());
+                }
+                self.receive_more().await?;
             }
         })
         .await
@@ -156,32 +346,20 @@ impl<T: Transport> Radio<T> {
         })?
     }
 
-    /// Read exactly `len` bytes.
+    /// Read exactly `len` buffered or incoming bytes, retaining any remainder.
+    ///
+    /// Partial input remains owned by the radio if this future is cancelled.
     pub(crate) async fn read_exact(
         &mut self,
         len: usize,
         operation: &'static str,
     ) -> Result<Vec<u8>, Error> {
         let timeout = self.timeout;
-        let transport = &mut self.transport;
         tokio::time::timeout(timeout, async {
-            let mut bytes = Vec::with_capacity(len);
-            let mut buf = [0u8; 256];
-            while bytes.len() < len {
-                let wanted = (len - bytes.len()).min(buf.len());
-                let window = buf
-                    .get_mut(..wanted)
-                    .ok_or_else(|| closed("read window exceeded the buffer"))?;
-                let count = transport.read(window).await.map_err(Error::Transport)?;
-                if count == 0 {
-                    return Err(closed("connection closed during an MCP exchange"));
-                }
-                let chunk = window
-                    .get(..count)
-                    .ok_or_else(|| closed("transport returned more bytes than requested"))?;
-                bytes.extend_from_slice(chunk);
+            while self.receive_buffer.len() < len {
+                self.receive_more().await?;
             }
-            Ok(bytes)
+            Ok(self.receive_buffer.drain(..len).collect())
         })
         .await
         .map_err(|_| Error::Timeout {
@@ -189,7 +367,27 @@ impl<T: Transport> Radio<T> {
             millis: millis(timeout),
         })?
     }
+
+    async fn receive_more(&mut self) -> Result<(), Error> {
+        let mut buffer = [0; 256];
+        let count = self
+            .transport
+            .read(&mut buffer)
+            .await
+            .map_err(Error::Transport)?;
+        if count == 0 {
+            return Err(closed("connection closed while reading a radio reply"));
+        }
+        let chunk = buffer
+            .get(..count)
+            .ok_or_else(|| closed("transport returned more bytes than the buffer holds"))?;
+        self.receive_buffer.extend(chunk);
+        Ok(())
+    }
 }
+
+#[cfg(test)]
+mod io_tests;
 
 fn unexpected(expected: &'static str, actual: &Response) -> Error {
     Error::Protocol(ProtocolError::UnexpectedResponse {

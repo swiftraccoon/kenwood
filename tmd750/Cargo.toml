@@ -15,7 +15,7 @@ publish = false
 [dependencies]
 kenwood-thd75 = { path = "../thd75", default-features = false }
 thiserror = "2"
-tokio = { version = "1", features = ["rt", "macros", "time"] }
+tokio = { version = "1", features = ["rt", "macros", "time", "io-util"] }
 tokio-serial = "5"
 tracing = "0.1"
 

@@ -1,10 +1,4 @@
-//! Kenwood TM-D750 memory programming: identity, MCP region transfers, and
-//! manifest-driven menu fields per Programmable-Memory slot.
-//!
-//! The crate reuses the TH-D75 crate's transports through [`transport`] and
-//! keeps every other layer TM-D750 shaped: address regions with 24-bit
-//! headers, six Programmable-Memory slots as an address term, and a
-//! 1,929,472-byte memory image.
+#![doc = include_str!("../README.md")]
 
 // The extractor is a dev-dependency for the registry agreement test; the
 // library's own unit-test target sees it too and must name it.
@@ -22,7 +16,20 @@ pub mod types;
 pub use error::{Error, FileError, McpError, ProtocolError, SchemaError, ValidationError};
 pub use file::{FileLayout, RadioConfig, parse_d750};
 pub use memory::{MemoryImage, PatchPlanner, PatchSet};
+pub use radio::backup::{McpBackupOutcome, McpBackupReport, McpBackupStage};
+pub use radio::pm_name_trial::{
+    PmNameTrialSessionError, PmNameTrialSessionOutcome, PmNameTrialSessionReport,
+    PmNameTrialSessionStage, PmNameTrialWriteDisposition,
+};
+pub use radio::pm1_name_update::{
+    Pm1NameUpdateSessionError, Pm1NameUpdateSessionOutcome, Pm1NameUpdateSessionReport,
+    Pm1NameUpdateSessionStage, Pm1NameUpdateWriteDisposition,
+};
+pub use radio::qualification::{
+    McpProbeExit, McpProbeOutcome, McpProbeReport, McpProbeSegment, McpProbeStage,
+};
 pub use radio::{Identity, Progress, Radio};
 pub use types::{
-    Address, FirmwareIdentity, IMAGE_LENGTH, MarketType, Page, RadioModel, Region, SlotIndex,
+    Address, Band, DvGatewayMode, FirmwareIdentity, IMAGE_LENGTH, OperatingMode, Page, RadioModel,
+    RadioType, Region, SelectableMode, SlotIndex,
 };

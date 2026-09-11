@@ -11,14 +11,23 @@ use kenwood_tmd750::protocol::mcp::{
 };
 use kenwood_tmd750::radio::Radio;
 use kenwood_tmd750::transport::MockTransport;
-use kenwood_tmd750::{Address, Error, McpError, Page, ProtocolError, Region};
+use kenwood_tmd750::{
+    Address, Band, DvGatewayMode, Error, McpError, OperatingMode, Page, ProtocolError, Region,
+    SelectableMode,
+};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 fn scripted_identity(mock: &mut MockTransport) {
     mock.expect(b"ID\r", b"ID TM-D750\r");
     mock.expect(b"FV\r", b"FV 1.00\r");
-    mock.expect(b"TY\r", b"TY J\r");
+    mock.expect(b"TY\r", b"TY K,2,1\r");
+}
+
+fn scripted_live_identity(mock: &mut MockTransport) {
+    mock.expect(b"ID\r", b"ID TM-D750\r");
+    mock.expect(b"FV\r", b"FV 1.02\r");
+    mock.expect(b"TY\r", b"TY K,2,1\r");
 }
 
 fn read_reply(page: Page, data: &[u8]) -> Vec<u8> {
@@ -43,8 +52,155 @@ async fn identify_proves_the_model_and_caches_it() -> TestResult {
     let mut radio = Radio::new(mock);
     let identity = radio.identify().await?;
     assert_eq!(identity.firmware.as_str(), "1.00");
-    assert_eq!(identity.market.as_byte(), b'J');
+    assert_eq!(identity.radio_type.as_str(), "K,2,1");
     assert_eq!(radio.identity(), Some(&identity));
+    radio.into_transport().assert_complete();
+    Ok(())
+}
+
+#[tokio::test]
+async fn operating_modes_and_gateway_state_are_typed_reads() -> TestResult {
+    let mut mock = MockTransport::new();
+    mock.expect(b"MD 0\r", b"MD 0,0\r");
+    mock.expect(b"MD 1\r", b"MD 1,7\r");
+    mock.expect(b"GW\r", b"GW 2\r");
+    let mut radio = Radio::new(mock);
+    assert_eq!(radio.get_operating_mode(Band::A).await?, OperatingMode::Fm);
+    assert_eq!(
+        radio.get_operating_mode(Band::B).await?,
+        OperatingMode::Unqualified(7)
+    );
+    assert_eq!(
+        radio.get_dv_gateway_mode().await?,
+        DvGatewayMode::Unqualified(2)
+    );
+    radio.into_transport().assert_complete();
+    Ok(())
+}
+
+#[tokio::test]
+async fn dstar_selection_requires_matching_echo_and_readback() -> TestResult {
+    let mut mock = MockTransport::new();
+    scripted_live_identity(&mut mock);
+    mock.expect(b"MD 0,1\r", b"MD 0,1\r");
+    mock.expect(b"MD 0\r", b"MD 0,1\r");
+    let mut radio = Radio::new(mock);
+    radio.enter_dstar(Band::A).await?;
+    radio.into_transport().assert_complete();
+    Ok(())
+}
+
+#[tokio::test]
+async fn mode_selection_refuses_a_mismatched_readback() -> TestResult {
+    let mut mock = MockTransport::new();
+    scripted_live_identity(&mut mock);
+    mock.expect(b"MD 1,1\r", b"MD 1,1\r");
+    mock.expect(b"MD 1\r", b"MD 1,0\r");
+    let mut radio = Radio::new(mock);
+    let result = radio.set_operating_mode(Band::B, SelectableMode::Dv).await;
+    assert!(
+        matches!(
+            result,
+            Err(Error::Protocol(ProtocolError::UnexpectedResponse { .. }))
+        ),
+        "{result:?}"
+    );
+    radio.into_transport().assert_complete();
+    Ok(())
+}
+
+#[tokio::test]
+async fn mode_selection_refuses_an_unqualified_target_before_writing() -> TestResult {
+    let mut mock = MockTransport::new();
+    scripted_identity(&mut mock);
+    let mut radio = Radio::new(mock);
+    let result = radio.set_operating_mode(Band::A, SelectableMode::Dv).await;
+    assert!(
+        matches!(result, Err(Error::UnsupportedCatWriteTarget { .. })),
+        "{result:?}"
+    );
+    radio.into_transport().assert_complete();
+    Ok(())
+}
+
+#[tokio::test]
+async fn mode_selection_refuses_an_unqualified_radio_type_before_writing() -> TestResult {
+    let mut mock = MockTransport::new();
+    mock.expect(b"ID\r", b"ID TM-D750\r");
+    mock.expect(b"FV\r", b"FV 1.02\r");
+    mock.expect(b"TY\r", b"TY K,2,2\r");
+    let mut radio = Radio::new(mock);
+    let result = radio.set_operating_mode(Band::A, SelectableMode::Dv).await;
+    assert!(
+        matches!(
+            result,
+            Err(Error::UnsupportedCatWriteTarget {
+                ref actual_firmware,
+                ref actual_radio_type,
+                ..
+            }) if actual_firmware == "1.02" && actual_radio_type == "K,2,2"
+        ),
+        "{result:?}"
+    );
+    radio.into_transport().assert_complete();
+    Ok(())
+}
+
+#[tokio::test]
+async fn mode_selection_refuses_a_mismatched_write_echo_before_readback() -> TestResult {
+    for reply in [b"MD 1,1\r".as_slice(), b"MD 0,0\r", b"N\r", b"?\r"] {
+        let mut mock = MockTransport::new();
+        scripted_live_identity(&mut mock);
+        mock.expect(b"MD 0,1\r", reply);
+        let mut radio = Radio::new(mock);
+        let result = radio.set_operating_mode(Band::A, SelectableMode::Dv).await;
+        assert!(
+            matches!(
+                result,
+                Err(Error::Protocol(ProtocolError::UnexpectedResponse {
+                    expected: "matching OperatingMode write echo",
+                    ..
+                }))
+            ),
+            "reply {reply:?}: {result:?}"
+        );
+        radio.into_transport().assert_complete();
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn operating_mode_reads_refuse_the_other_bands_reply() -> TestResult {
+    let mut mock = MockTransport::new();
+    mock.expect(b"MD 0\r", b"MD 1,1\r");
+    let mut radio = Radio::new(mock);
+    let result = radio.get_operating_mode(Band::A).await;
+    assert!(
+        matches!(
+            result,
+            Err(Error::Protocol(ProtocolError::UnexpectedResponse { .. }))
+        ),
+        "{result:?}"
+    );
+    radio.into_transport().assert_complete();
+    Ok(())
+}
+
+#[tokio::test]
+async fn mode_selection_refuses_a_readback_from_the_other_band() -> TestResult {
+    let mut mock = MockTransport::new();
+    scripted_live_identity(&mut mock);
+    mock.expect(b"MD 0,1\r", b"MD 0,1\r");
+    mock.expect(b"MD 0\r", b"MD 1,1\r");
+    let mut radio = Radio::new(mock);
+    let result = radio.set_operating_mode(Band::A, SelectableMode::Dv).await;
+    assert!(
+        matches!(
+            result,
+            Err(Error::Protocol(ProtocolError::UnexpectedResponse { .. }))
+        ),
+        "{result:?}"
+    );
     radio.into_transport().assert_complete();
     Ok(())
 }
