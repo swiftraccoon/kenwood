@@ -15,6 +15,7 @@ members = [
   "mbelib-rs",
   "mcp-d75-extract",
   "tmd750",
+  "tmd750-repl",
   "mmdvm",
   "mmdvm-core",
   "dmr-rewind",
