@@ -357,6 +357,18 @@ mod tests {
     }
 
     #[test]
+    fn callsign_padding_policy_is_radio_specific() {
+        assert_eq!(
+            THD75.padding_override("MyCallsignDvGatewayData", "MyCallsignDvGateway"),
+            Some(32)
+        );
+        assert_eq!(
+            TMD750.padding_override("MyCallsignDvGatewayData", "MyCallsignDvGateway"),
+            None
+        );
+    }
+
+    #[test]
     fn thd75_spec_matches_the_reviewed_layout() {
         assert_eq!(THD75.menus.len(), 4);
         assert!(THD75.dimensions.is_empty());

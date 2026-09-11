@@ -2,8 +2,8 @@
 
 use super::{
     AnchorSpec, BaseOverride, BlobSpec, DimensionSpec, DirectDomains, MenuSpec, ModelSpec,
-    PaddingOverride, PrivateWriterSpec, RecordDomains, RecordSpec, ReviewedLayout,
-    StorageTransformSpec, SymbolOverride, ValueHelperSpec, choices_domain, range_domain,
+    PrivateWriterSpec, RecordDomains, RecordSpec, ReviewedLayout, StorageTransformSpec,
+    SymbolOverride, ValueHelperSpec, choices_domain, range_domain,
 };
 
 const POSITION_TRANSFORM: StorageTransformSpec = StorageTransformSpec {
@@ -347,11 +347,7 @@ pub static TMD750: ModelSpec = ModelSpec {
         writable: true,
         reason: None,
     }],
-    padding_overrides: &[PaddingOverride {
-        class: "MyCallsignDvGatewayData",
-        field: "MyCallsignDvGateway",
-        padding: 32,
-    }],
+    padding_overrides: &[],
     value_helpers: &[
         ValueHelperSpec {
             property: "IpAddress",

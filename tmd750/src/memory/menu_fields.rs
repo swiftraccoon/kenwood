@@ -13173,7 +13173,7 @@ pub static MCP_D750_MENU_FIELDS: &[MenuField] = &[
             FieldCodec::FixedString {
                 len: 8,
                 encoding: StringEncoding::Utf8,
-                padding: 32,
+                padding: 0,
             }
         ),
         options: &[],
@@ -13219,7 +13219,7 @@ pub static MCP_D750_MENU_FIELDS: &[MenuField] = &[
             FieldCodec::FixedString {
                 len: 8,
                 encoding: StringEncoding::Utf8,
-                padding: 32,
+                padding: 0,
             }
         ),
         options: &[],
@@ -13265,7 +13265,7 @@ pub static MCP_D750_MENU_FIELDS: &[MenuField] = &[
             FieldCodec::FixedString {
                 len: 8,
                 encoding: StringEncoding::Utf8,
-                padding: 32,
+                padding: 0,
             }
         ),
         options: &[],
@@ -13311,7 +13311,7 @@ pub static MCP_D750_MENU_FIELDS: &[MenuField] = &[
             FieldCodec::FixedString {
                 len: 8,
                 encoding: StringEncoding::Utf8,
-                padding: 32,
+                padding: 0,
             }
         ),
         options: &[],
@@ -13357,7 +13357,7 @@ pub static MCP_D750_MENU_FIELDS: &[MenuField] = &[
             FieldCodec::FixedString {
                 len: 8,
                 encoding: StringEncoding::Utf8,
-                padding: 32,
+                padding: 0,
             }
         ),
         options: &[],
@@ -13403,7 +13403,7 @@ pub static MCP_D750_MENU_FIELDS: &[MenuField] = &[
             FieldCodec::FixedString {
                 len: 8,
                 encoding: StringEncoding::Utf8,
-                padding: 32,
+                padding: 0,
             }
         ),
         options: &[],

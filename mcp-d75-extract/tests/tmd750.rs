@@ -213,8 +213,38 @@ fn records_inherit_the_slot_term_and_fold_pinned_bases() -> TestResult {
     };
     assert!(matches!(
         gateway.fields.first().map(|field| &field.codec),
-        Some(Codec::FixedString { padding: 32, .. })
+        Some(Codec::FixedString { padding: 0, .. })
     ));
+    Ok(())
+}
+
+#[test]
+fn callsign_records_preserve_the_official_nul_padding() -> TestResult {
+    let manifest = manifest()?;
+    let dv = menu(&manifest, "dv")?;
+    let gateway = dv
+        .repeated_records
+        .iter()
+        .find_map(|record| match record {
+            RecordEntry::Extracted(record) if record.name == "MyCallsignDvGatewayList" => {
+                Some(record)
+            }
+            _ => None,
+        })
+        .ok_or("gateway callsign record missing")?;
+    let callsigns = gateway
+        .expanded_fields
+        .iter()
+        .filter(|field| field.name.ends_with(".MyCallsignDvGateway"))
+        .collect::<Vec<_>>();
+    assert_eq!(callsigns.len(), 6);
+    for field in callsigns {
+        assert!(
+            matches!(&field.codec, Codec::FixedString { encoding, length: 8, padding: 0, .. } if encoding == "utf8"),
+            "each D750 callsign must retain the writer's eight-byte NUL-padded codec: {:?}",
+            field.codec
+        );
+    }
     Ok(())
 }
 
