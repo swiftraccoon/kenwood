@@ -250,10 +250,17 @@ async fn read_mmdvm_version_response<T: Transport>(
         match decode_frame(&wire) {
             Ok(Some((frame, consumed))) if consumed == wire.len() => {
                 if frame.command == MMDVM_GET_VERSION
-                    && VersionResponse::parse(&frame.payload).is_ok_and(|version| {
-                        matches!(version.protocol, 1 | 2) && !version.description.is_empty()
-                    })
+                    && let Ok(version) = VersionResponse::parse(&frame.payload)
+                    && matches!(version.protocol, 1 | 2)
+                    && !version.description.is_empty()
                 {
+                    let wire_hex = format!("{wire:02X?}");
+                    tracing::info!(
+                        protocol = version.protocol,
+                        description = %version.description,
+                        %wire_hex,
+                        "validated MMDVM GET_VERSION response"
+                    );
                     return true;
                 }
             }
