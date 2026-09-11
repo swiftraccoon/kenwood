@@ -353,9 +353,9 @@ run_inline "unsafe audit (workspace-wide)" check_unsafe_audit
 # The pattern is assembled from its UTF-8 bytes rather than written
 # literally, so this file does not trip its own check.
 #
-# TRACKED files only: in-flight untracked scratch must not redden the
-# gate. Outside a git checkout (the CI pods receive a tarball) the list
-# is empty and the step passes vacuously.
+# Check tracked files and new, non-ignored files so new crates pass the
+# same gate before they are staged. Ignored local scratch stays excluded.
+# This gate requires a Git checkout to apply those exclusions reliably.
 #
 # Exempt, because their bytes are a contract rather than prose:
 #   thd75/data/mcp_d75_menu_schema.json    generated TH-D75 menu manifest
@@ -365,14 +365,32 @@ run_inline "unsafe audit (workspace-wide)" check_unsafe_audit
 #   mcp-d75-extract/tests/fixtures/        pinned decompilation fixtures
 check_em_dashes() {
     local exempt='^thd75/data/mcp_d75_menu_schema\.json$|^tmd750/data/mcp_d750_menu_schema\.json$|^thd75/src/memory/menu_fields\.rs$|^tmd750/src/memory/menu_fields\.rs$|^mcp-d75-extract/tests/fixtures/'
-    local em files hits
+    local em file file_list hits grep_status
+    local files=()
+    if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        echo "ERROR: prose checks require a Git checkout to exclude ignored scratch."
+        return 1
+    fi
     em=$(printf '\342\200\224')
-    files=$(git ls-files 2>/dev/null | grep -vE "$exempt" || true)
-    [ -n "$files" ] || return 0
-    hits=$(printf '%s\n' "$files" | tr '\n' '\0' | \
-        xargs -0 grep -HnIF -- "$em" 2>/dev/null || true)
+    file_list=$(mktemp) || return 1
+    # Capture first so a failed Git enumeration cannot look like an empty list.
+    if ! git ls-files --cached --others --exclude-standard -z >"$file_list"; then
+        echo "ERROR: unable to enumerate project files for prose checks."
+        rm -f "$file_list"
+        return 1
+    fi
+    while IFS= read -r -d '' file; do
+        if [ -f "$file" ] && [[ ! "$file" =~ $exempt ]]; then
+            files+=("$file")
+        fi
+    done <"$file_list"
+    rm -f "$file_list" || return 1
+    [ ${#files[@]} -gt 0 ] || return 0
+    grep_status=0
+    hits=$(grep -HnIF -- "$em" "${files[@]}") || grep_status=$?
+    [ "$grep_status" -le 1 ] || return 1
     if [ -n "$hits" ]; then
-        echo "ERROR: em dash (U+2014) in committed prose."
+        echo "ERROR: em dash (U+2014) in project prose."
         echo "Use a semicolon between independent clauses, a colon before an"
         echo "elaboration, commas or parentheses for an aside, or reword."
         echo "$hits"
@@ -381,7 +399,7 @@ check_em_dashes() {
     return 0
 }
 
-run_inline "em-dash ban (tracked files)" check_em_dashes
+run_inline "em-dash ban (tracked and new project files)" check_em_dashes
 
 # ---------- required external tools ----------
 # A missing tool is a hard failure; partial gating is worse than no
@@ -708,11 +726,30 @@ check_shell_scripts() {
 }
 
 check_toml_format() {
-    git ls-files -z '*.toml' | xargs -0 taplo fmt --check
+    local file file_list
+    local files=()
+    if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        echo "ERROR: TOML checks require a Git checkout to exclude ignored scratch."
+        return 1
+    fi
+    file_list=$(mktemp) || return 1
+    if ! git ls-files --cached --others --exclude-standard -z -- '*.toml' >"$file_list"; then
+        echo "ERROR: unable to enumerate project files for TOML checks."
+        rm -f "$file_list"
+        return 1
+    fi
+    while IFS= read -r -d '' file; do
+        if [ -f "$file" ]; then
+            files+=("$file")
+        fi
+    done <"$file_list"
+    rm -f "$file_list" || return 1
+    [ ${#files[@]} -gt 0 ] || return 0
+    printf '%s\0' "${files[@]}" | xargs -0 taplo fmt --check
 }
 
 start_bg static "shellcheck all tracked shell scripts" check_shell_scripts
-start_bg static "taplo fmt --check all tracked TOML" check_toml_format
+start_bg static "taplo fmt --check tracked and new project TOML" check_toml_format
 
 if [ "$BOOK_BUILD" -eq 1 ]; then
     start_bg static "mdbook build dstar-gateway/book" mdbook build dstar-gateway/book
