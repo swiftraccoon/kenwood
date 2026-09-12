@@ -154,6 +154,20 @@ xcodegen generate
 open Azimuth.xcodeproj
 ```
 
+The macOS build signs the embedded Bluetooth helper after copying it and before
+Xcode signs the enclosing app. This preserves exactly the sandbox and inheritance
+entitlements, without the extra permissions Xcode injects during Test/Profile
+builds. Other App Sandbox permissions are incompatible with
+[sandbox inheritance](https://developer.apple.com/library/archive/documentation/Miscellaneous/Reference/EntitlementKeyReference/Chapters/EnablingAppSandbox.html).
+The packaging tests validate the actual embedded signature, confirm the host is
+sandboxed, and run a no-radio echo through the helper:
+
+```bash
+xcodebuild test -project Azimuth.xcodeproj -scheme AzimuthMac \
+  -destination 'platform=macOS' \
+  -only-testing:AzimuthTests/AzimuthBluetoothHelperPackagingTests
+```
+
 USBDriverKit requires a physical M-series iPad and a TH-D75. The Simulator is
 for UI, assistant, catalog, and recorded-transport tests. On macOS, live IF
 capture uses the explicit CoreAudio input whose nonzero IORegistry USB-device

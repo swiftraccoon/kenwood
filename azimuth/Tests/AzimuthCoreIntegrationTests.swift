@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later OR GPL-3.0-or-later
 
 import Foundation
+import Security
 import XCTest
 @testable import Azimuth
 
@@ -279,10 +280,50 @@ final class AzimuthCoreCatalogTests: XCTestCase {
 }
 
 #if os(macOS)
-@MainActor
 final class AzimuthBluetoothHelperPackagingTests: XCTestCase {
+    func testBundledRecoveryHelperHasOnlySandboxInheritanceEntitlements() async throws {
+        let helper = try XCTUnwrap(
+            Bundle.main.url(forAuxiliaryExecutable: "AzimuthBluetoothHelper")
+        )
+        let entitlements = try signedEntitlements(for: helper)
+
+        XCTAssertEqual(
+            Set(entitlements.keys),
+            ["com.apple.security.app-sandbox", "com.apple.security.inherit"]
+        )
+        XCTAssertEqual(entitlements["com.apple.security.app-sandbox"] as? Bool, true)
+        XCTAssertEqual(entitlements["com.apple.security.inherit"] as? Bool, true)
+
+        let host = try XCTUnwrap(Bundle.main.executableURL)
+        let hostEntitlements = try signedEntitlements(for: host)
+        XCTAssertEqual(hostEntitlements["com.apple.security.app-sandbox"] as? Bool, true)
+        XCTAssertNotEqual(hostEntitlements["com.apple.security.inherit"] as? Bool, true)
+    }
+
     func testBundledRecoveryHelperLaunchesInsideAppSandbox() async throws {
         try await validateBluetoothRecoveryHelper()
+    }
+
+    private func signedEntitlements(for executable: URL) throws -> [String: Any] {
+        var staticCode: SecStaticCode?
+        XCTAssertEqual(
+            SecStaticCodeCreateWithPath(executable as CFURL, [], &staticCode),
+            errSecSuccess
+        )
+        let code = try XCTUnwrap(staticCode)
+        XCTAssertEqual(
+            SecStaticCodeCheckValidity(code, SecCSFlags(rawValue: kSecCSStrictValidate), nil),
+            errSecSuccess
+        )
+        var information: CFDictionary?
+        XCTAssertEqual(
+            SecCodeCopySigningInformation(
+                code, SecCSFlags(rawValue: kSecCSSigningInformation), &information
+            ),
+            errSecSuccess
+        )
+        let signing = try XCTUnwrap(information as? [String: Any])
+        return try XCTUnwrap(signing[kSecCodeInfoEntitlementsDict as String] as? [String: Any])
     }
 }
 #endif

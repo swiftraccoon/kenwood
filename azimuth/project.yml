@@ -130,6 +130,32 @@ targets:
         codeSign: true
         copy:
           destination: executables
+    postBuildScripts:
+      - name: Sign Sandbox-Inheriting Bluetooth Helper
+        basedOnDependencyAnalysis: false
+        inputFiles:
+          - $(TARGET_BUILD_DIR)/$(EXECUTABLE_FOLDER_PATH)/AzimuthBluetoothHelper
+          - $(SRCROOT)/macOS/BluetoothHelper/AzimuthBluetoothHelper.entitlements
+        script: |
+          set -eu
+          if [ "${CODE_SIGNING_ALLOWED}" = "NO" ]; then
+            exit 0
+          fi
+          # Test/Profile builds inject permissions incompatible with sandbox
+          # inheritance. Sign the embedded helper after copying it and before
+          # Xcode seals the app; a scheme pre-action can run before the build.
+          helper="${TARGET_BUILD_DIR}/${EXECUTABLE_FOLDER_PATH}/AzimuthBluetoothHelper"
+          entitlements="${SRCROOT}/macOS/BluetoothHelper/AzimuthBluetoothHelper.entitlements"
+          helper_identity="${EXPANDED_CODE_SIGN_IDENTITY:-${CODE_SIGN_IDENTITY:-}}"
+          : "${helper_identity:?The Bluetooth helper requires a signing identity}"
+          set -- --force --sign "${helper_identity}" \
+            --preserve-metadata=identifier,flags \
+            --entitlements "${entitlements}" --generate-entitlement-der
+          # Follow Xcode's default timestamp policy for development/archive.
+          if [ "${DEPLOYMENT_POSTPROCESSING:-NO}" != "YES" ]; then
+            set -- "$@" --timestamp=none
+          fi
+          /usr/bin/codesign "$@" "${helper}"
     info:
       path: macOS/Info.plist
       properties:
@@ -209,22 +235,6 @@ schemes:
     test:
       targets:
         - AzimuthTests
-      preActions:
-        - name: Restore Exact Bluetooth Helper Entitlements
-          settingsTarget: AzimuthMac
-          script: |
-            set -eu
-            app="${TARGET_BUILD_DIR}/${FULL_PRODUCT_NAME}"
-            helper="${app}/Contents/MacOS/AzimuthBluetoothHelper"
-            entitlements="${SRCROOT}/macOS/BluetoothHelper/AzimuthBluetoothHelper.entitlements"
-            identity="${EXPANDED_CODE_SIGN_IDENTITY:-${CODE_SIGN_IDENTITY:--}}"
-            /usr/bin/codesign --force --sign "${identity}" \
-              --preserve-metadata=identifier,flags \
-              --entitlements "${entitlements}" \
-              --generate-entitlement-der --timestamp=none "${helper}"
-            /usr/bin/codesign --force --sign "${identity}" \
-              --preserve-metadata=identifier,entitlements,flags \
-              --generate-entitlement-der --timestamp=none "${app}"
     run:
       config: Debug
   AzimuthIPad:
