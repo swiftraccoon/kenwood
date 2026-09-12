@@ -20,8 +20,8 @@ use std::time::Duration;
 
 use crate::error::{Error, ValidationError};
 use crate::screen::{SCREEN_BYTES, ScreenFrame};
-use crate::transport::Transport;
 use crate::types::{Frequency, MemoryReadOffset, ReadLen, UsbAudioOutput};
+use kenwood_transport::Transport;
 
 use super::{
     McpPhase, Radio,
@@ -2578,8 +2578,8 @@ mod tests {
     use crate::protocol::memread::encode_hex_upper;
     use crate::radio::{BinaryProtocolProof, CatState, Radio};
     use crate::screen::{SCREEN_BYTES, ScreenFrame};
-    use crate::transport::MockTransport;
     use crate::types::{Frequency, OperatingMode, StepSize, UsbAudioOutput};
+    use kenwood_transport::MockTransport;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 

@@ -38,12 +38,17 @@ use std::time::Duration;
 
 use crate::protocol::programming::{McpPage, WritableMcpPage};
 
+use kenwood_transport::TransportError;
 use thiserror::Error;
 
 /// Top-level error type for all radio operations.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// The shared D-STAR modem runtime failed during a model-owned lifecycle.
+    #[cfg(feature = "dstar")]
+    #[error(transparent)]
+    Dstar(#[from] ::mmdvm::dstar::DstarError),
     /// A transport-layer (serial/Bluetooth) error occurred.
     #[error(transparent)]
     Transport(#[from] TransportError),
@@ -548,6 +553,16 @@ impl Error {
     pub fn is_link_lost(&self) -> bool {
         match self {
             Self::Transport(_) | Self::Timeout(_) => true,
+            #[cfg(feature = "dstar")]
+            Self::Dstar(error) => matches!(
+                error,
+                ::mmdvm::dstar::DstarError::Timeout(_)
+                    | ::mmdvm::dstar::DstarError::TransportClosed
+                    | ::mmdvm::dstar::DstarError::Fatal { .. }
+                    | ::mmdvm::dstar::DstarError::Shell(
+                        ::mmdvm::ShellError::Io(_) | ::mmdvm::ShellError::SessionClosed
+                    )
+            ),
             Self::McpCleanupNotProved { cleanup } => cleanup.is_link_lost(),
             Self::McpOperationAndCleanupFailed { operation, cleanup } => {
                 operation.is_link_lost() || cleanup.is_link_lost()
@@ -595,89 +610,6 @@ impl Error {
             _ => false,
         }
     }
-}
-
-/// Errors originating from the transport layer (serial port / Bluetooth).
-#[derive(Debug, Error)]
-#[non_exhaustive]
-pub enum TransportError {
-    /// Failed to open the serial port at the given path.
-    #[error("failed to open serial port at {path}")]
-    Open {
-        /// The filesystem path that could not be opened.
-        path: String,
-        /// The underlying I/O error.
-        source: std::io::Error,
-    },
-
-    /// The isolated macOS Bluetooth helper could not select one paired radio,
-    /// be prepared or launched, or complete its readiness handshake.
-    #[error("Bluetooth helper failed during {context}")]
-    BluetoothHelper {
-        /// Operation or resource that failed.
-        context: String,
-        /// The underlying process or pipe error.
-        source: std::io::Error,
-    },
-
-    /// More than one paired Bluetooth device has the requested display name.
-    #[error(
-        "multiple paired Bluetooth devices have the requested name; pass an exact Bluetooth address instead"
-    )]
-    BluetoothDeviceNameAmbiguous,
-
-    /// A caller cancelled a bounded macOS Bluetooth discovery or open.
-    #[error("Bluetooth helper open was interrupted")]
-    BluetoothOpenInterrupted,
-
-    /// No matching serial device was found.
-    #[error("no matching serial device found")]
-    NotFound,
-
-    /// The serial connection was lost.
-    #[error("serial connection lost")]
-    Disconnected(
-        /// The underlying I/O error.
-        #[source]
-        std::io::Error,
-    ),
-
-    /// A write to the serial port failed.
-    #[error("serial write failed")]
-    Write(
-        /// The underlying I/O error.
-        #[source]
-        std::io::Error,
-    ),
-
-    /// A read from the serial port failed.
-    #[error("serial read failed")]
-    Read(
-        /// The underlying I/O error.
-        #[source]
-        std::io::Error,
-    ),
-
-    /// The transport cannot re-establish its own connection.
-    ///
-    /// Returned by the default [`Transport::reopen`] implementation.
-    /// Callers must build a fresh transport instead.
-    ///
-    /// [`Transport::reopen`]: crate::transport::Transport::reopen
-    #[error("this transport cannot reopen its connection")]
-    ReopenUnsupported,
-
-    /// A thread-affine third-party transport refused this reopen call.
-    ///
-    /// The built-in macOS Bluetooth transport is process-isolated and does
-    /// not have this restriction. This variant remains available to custom
-    /// transports whose platform API requires its original opening thread.
-    #[error("reopen must run on the thread that opened the transport")]
-    WrongThread,
-
-    /// The main-thread broker has been dropped and cannot execute more jobs.
-    #[error("the main-thread transport broker is no longer available")]
-    BrokerUnavailable,
 }
 
 /// Errors in the CAT protocol layer (framing, field parsing, etc.).
@@ -1449,6 +1381,45 @@ mod tests {
             .is_link_lost()
         );
         assert!(!Error::CatRecoveryRequired.is_link_lost());
+    }
+
+    #[cfg(feature = "dstar")]
+    #[test]
+    fn shared_modem_errors_preserve_link_loss_classification() {
+        use ::mmdvm::ShellError;
+        use ::mmdvm::dstar::DstarError;
+
+        for error in [
+            DstarError::TransportClosed,
+            DstarError::Timeout(Duration::from_secs(2)),
+            DstarError::Fatal {
+                message: "lost endpoint".to_owned(),
+            },
+            DstarError::Shell(ShellError::SessionClosed),
+            DstarError::Shell(ShellError::Io(std::io::Error::other("lost endpoint"))),
+        ] {
+            let error = Error::Dstar(error);
+            assert!(
+                error.is_link_lost(),
+                "shared link failure lost its classification: {error}"
+            );
+        }
+        for error in [
+            ShellError::Nak {
+                command: 2,
+                reason: mmdvm_core::NakReason::BufferFull,
+            },
+            ShellError::ResponseTimeout,
+            ShellError::BufferFull {
+                mode: mmdvm_core::ModemMode::Dstar,
+            },
+        ] {
+            let error = Error::Dstar(DstarError::Shell(error));
+            assert!(
+                !error.is_link_lost(),
+                "modem rejection was misclassified as link loss: {error}"
+            );
+        }
     }
 
     #[test]

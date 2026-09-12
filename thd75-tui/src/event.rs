@@ -94,7 +94,7 @@ pub(crate) enum RadioCommand {
     /// Enter D-STAR gateway mode using the MMDVM transport.
     EnterDstar {
         /// D-STAR gateway configuration.
-        config: kenwood_thd75::DstarGatewayConfig,
+        config: mmdvm::dstar::DstarModemConfig,
     },
     /// Exit D-STAR gateway mode.
     ExitDstar,

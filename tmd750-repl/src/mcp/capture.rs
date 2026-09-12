@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use kenwood_tmd750::transport::{Transport, TransportError};
+use kenwood_transport::{Transport, TransportError};
 use serde::Serialize;
 use time::OffsetDateTime;
 
@@ -415,7 +415,7 @@ fn capture_baud_error(source: io::Error) -> TransportError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kenwood_tmd750::transport::MockTransport;
+    use kenwood_transport::MockTransport;
 
     type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 

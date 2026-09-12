@@ -1,7 +1,7 @@
 //! Recovery of ordinary CAT operation after an exclusive binary mode.
 
 use crate::error::Error;
-use crate::transport::Transport;
+use kenwood_transport::Transport;
 
 use super::{CatState, LinkState, McpPhase, Radio};
 
@@ -184,8 +184,8 @@ impl<T: Transport> Radio<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::{ProtocolError, TransportError};
-    use crate::transport::MockTransport;
+    use crate::error::ProtocolError;
+    use kenwood_transport::{MockTransport, TransportError};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 

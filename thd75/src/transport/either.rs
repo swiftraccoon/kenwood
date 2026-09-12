@@ -1,9 +1,7 @@
 //! Enum transport that dispatches to either Serial, Bluetooth, or Mock.
 
-use crate::error::TransportError;
-use crate::transport::Transport;
-use crate::transport::mock::MockTransport;
 use crate::transport::serial::SerialTransport;
+use kenwood_transport::{MockTransport, Transport, TransportError};
 
 #[cfg(target_os = "macos")]
 use crate::transport::bluetooth::BluetoothTransport;

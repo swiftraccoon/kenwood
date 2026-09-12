@@ -37,12 +37,12 @@
 //! **never** written by this library. Attempts to write these pages return
 //! [`Error::McpWriteProtected`].
 
-use crate::error::{Error, ProtocolError, TransportError};
+use crate::error::{Error, ProtocolError};
 use crate::protocol::programming;
-use crate::transport::Transport;
 use crate::types::{
     ChannelDisplayName, RegularChannel, StoredChannelData, StoredChannelFlag, StoredChannelSlot,
 };
+use kenwood_transport::{Transport, TransportError};
 
 use super::{McpPhase, McpWireBoundary, Radio};
 
@@ -544,7 +544,8 @@ impl<T: Transport> Radio<T> {
     /// mutable borrow makes interleaved CAT traffic fail to compile:
     ///
     /// ```compile_fail
-    /// use kenwood_thd75::{Error, Radio, Transport};
+    /// use kenwood_thd75::{Error, Radio};
+    /// use kenwood_transport::Transport;
     ///
     /// async fn interleave<T: Transport>(radio: &mut Radio<T>) -> Result<(), Error> {
     ///     let session = radio.enter_mcp().await?;
@@ -2640,17 +2641,17 @@ mod tests {
         McpPage, McpPageExchange, McpPageExchangeError, McpPageExchangeOperationError,
         WritableMcpPage,
     };
-    use crate::error::{Error, ProtocolError, TransportError};
+    use crate::error::{Error, ProtocolError};
     use crate::protocol::programming;
     use crate::protocol::{Command, Response};
     use crate::radio::{
         BinaryProtocolProof, CatState, LinkState, McpPhase, McpWireBoundary, Radio,
     };
-    use crate::transport::{MockTransport, Transport};
     use crate::types::{
         Band, ChannelDisplayName, Frequency, MemoryChannelBand, MemoryGroup, RegularChannel,
         StoredChannel,
     };
+    use kenwood_transport::{MockTransport, Transport, TransportError};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
     type BoxErr = Box<dyn std::error::Error>;

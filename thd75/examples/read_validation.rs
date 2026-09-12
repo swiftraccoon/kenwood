@@ -26,10 +26,10 @@ use tracing as _;
 
 use std::future::Future;
 
-use kenwood_thd75::error::TransportError;
-use kenwood_thd75::transport::{SerialTransport, Transport};
+use kenwood_thd75::transport::SerialTransport;
 use kenwood_thd75::types::{Band, MemoryChannelAddress};
 use kenwood_thd75::{Error, Radio};
+use kenwood_transport::{Transport, TransportError};
 
 #[derive(Debug)]
 struct WireTrace<T> {

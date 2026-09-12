@@ -14,16 +14,10 @@
 
 use std::time::Duration;
 
-use crate::transport::Transport;
-use mmdvm_core::{MMDVM_FRAME_START, MMDVM_GET_VERSION, VersionResponse, decode_frame};
+use ::mmdvm::probe::probe_version;
+use kenwood_transport::Transport;
 
 use super::{BinaryProtocolProof, CatState, LinkState, McpPhase, Radio};
-
-/// MMDVM `GET_VERSION` request: sync byte `0xE0`, length `0x03`, type `0x00`.
-///
-/// A radio in a DV Gateway mode answers this with an `0xE0`-framed
-/// version reply; a radio in any other state ignores it.
-const MMDVM_GET_VERSION_PROBE: [u8; 3] = [MMDVM_FRAME_START, 0x03, MMDVM_GET_VERSION];
 
 /// How long to wait for an MMDVM reply before concluding the link is
 /// unresponsive. MMDVM answers in roughly 20 ms; this is generous.
@@ -126,16 +120,12 @@ impl<T: Transport> Radio<T> {
         let _previous = self.link_state_tx.send_replace(LinkState::Down);
 
         tracing::info!("probing silent link for MMDVM mode");
-        let deadline = tokio::time::Instant::now() + MMDVM_PROBE_TIMEOUT;
-        let write =
-            tokio::time::timeout_at(deadline, self.transport.write(&MMDVM_GET_VERSION_PROBE)).await;
-        if !matches!(write, Ok(Ok(()))) {
-            return LinkDiagnosis::Unresponsive;
-        }
-        let diagnosis = if read_mmdvm_version_response(&mut self.transport, deadline).await {
-            LinkDiagnosis::MmdvmMode
-        } else {
-            LinkDiagnosis::Unresponsive
+        let diagnosis = match probe_version(&mut self.transport, MMDVM_PROBE_TIMEOUT).await {
+            Ok(_version) => LinkDiagnosis::MmdvmMode,
+            Err(error) => {
+                tracing::debug!(%error, "MMDVM version probe did not establish a binary boundary");
+                LinkDiagnosis::Unresponsive
+            }
         };
         if diagnosis == LinkDiagnosis::MmdvmMode {
             // A complete MMDVM frame proves that CAT is no longer the active
@@ -195,107 +185,13 @@ impl<T: Transport> Radio<T> {
     }
 }
 
-/// Read one complete MMDVM `GET_VERSION` response without consuming bytes
-/// beyond its advertised frame length.
-///
-/// Transport reads may split a frame at any byte. Reading the start and length
-/// fields first lets the final read be bounded to the exact remaining length,
-/// so the asynchronous MMDVM session that takes ownership next cannot inherit
-/// the tail of this probe response. Non-frame bytes are skipped while looking
-/// for the next MMDVM sync byte, but only a complete, codec-validated
-/// `GET_VERSION` frame is accepted as proof.
-async fn read_mmdvm_version_response<T: Transport>(
-    transport: &mut T,
-    deadline: tokio::time::Instant,
-) -> bool {
-    loop {
-        let mut start = [0_u8; 1];
-        if !read_exact_until(transport, &mut start, deadline).await {
-            return false;
-        }
-        if start[0] != MMDVM_FRAME_START {
-            continue;
-        }
-
-        let mut length = [0_u8; 1];
-        if !read_exact_until(transport, &mut length, deadline).await {
-            return false;
-        }
-
-        let mut wire = vec![MMDVM_FRAME_START, length[0]];
-        let frame_len = if length[0] == 0 {
-            let mut extended_length = [0_u8; 1];
-            if !read_exact_until(transport, &mut extended_length, deadline).await {
-                return false;
-            }
-            wire.push(extended_length[0]);
-            usize::from(extended_length[0]) + 255
-        } else {
-            let frame_len = usize::from(length[0]);
-            if frame_len < usize::from(mmdvm_core::MIN_FRAME_LEN) {
-                continue;
-            }
-            frame_len
-        };
-
-        let already_read = wire.len();
-        wire.resize(frame_len, 0);
-        let Some(remainder) = wire.get_mut(already_read..) else {
-            return false;
-        };
-        if !read_exact_until(transport, remainder, deadline).await {
-            return false;
-        }
-
-        match decode_frame(&wire) {
-            Ok(Some((frame, consumed))) if consumed == wire.len() => {
-                if frame.command == MMDVM_GET_VERSION
-                    && let Ok(version) = VersionResponse::parse(&frame.payload)
-                    && matches!(version.protocol, 1 | 2)
-                    && !version.description.is_empty()
-                {
-                    let wire_hex = format!("{wire:02X?}");
-                    tracing::info!(
-                        protocol = version.protocol,
-                        description = %version.description,
-                        %wire_hex,
-                        "validated MMDVM GET_VERSION response"
-                    );
-                    return true;
-                }
-            }
-            Ok(Some(_)) => {}
-            Ok(None) | Err(_) => return false,
-        }
-    }
-}
-
-/// Fill one bounded slice before the shared absolute deadline.
-async fn read_exact_until<T: Transport>(
-    transport: &mut T,
-    target: &mut [u8],
-    deadline: tokio::time::Instant,
-) -> bool {
-    let mut filled = 0;
-    while filled < target.len() {
-        let Some(unfilled) = target.get_mut(filled..) else {
-            return false;
-        };
-        let remaining = unfilled.len();
-        let read = tokio::time::timeout_at(deadline, transport.read(unfilled)).await;
-        let count = match read {
-            Ok(Ok(count)) if count > 0 && count <= remaining => count,
-            _ => return false,
-        };
-        filled += count;
-    }
-    true
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::MockTransport;
+    use kenwood_transport::MockTransport;
+    use mmdvm_core::MMDVM_FRAME_START;
+
+    const MMDVM_GET_VERSION_PROBE: [u8; 3] = [0xE0, 0x03, 0x00];
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 

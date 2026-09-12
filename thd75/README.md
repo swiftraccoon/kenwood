@@ -50,9 +50,30 @@ Both features are enabled by default; a CAT-only consumer can depend with
 | Feature | Adds | Stays in the core without it |
 |---------|------|------------------------------|
 | `aprs` | The `AprsClient` stack (radio + KISS session + APRS-IS uplink glue), the `KissSession` binary TNC session, and the `aprs-is`/`kiss-tnc` re-exports | CAT APRS settings, GPS position types, TNC mode commands, and the sans-io `aprs`/`ax25-codec` type layer |
-| `dstar` | The `DstarGateway` reflector client and the `MmdvmSession` modem session over the tokio `mmdvm` crate | The Menu 650 terminal-mode lifecycle, MMDVM link diagnosis (`mmdvm-core` only), and CAT D-STAR settings |
+| `dstar` | The `DstarGateway` lifecycle owner and `MmdvmSession` over the shared `mmdvm::dstar` runtime | The Menu 650 terminal-mode lifecycle, bounded `mmdvm::probe` diagnosis, and CAT D-STAR settings |
 
 ## API vocabulary
+
+Generic `Transport`, `TransportError`, `MockTransport`, and `StreamAdapter`
+types belong to
+[`kenwood-transport`](https://github.com/swiftraccoon/kenwood/tree/main/kenwood-transport).
+Import them directly from `kenwood_transport`. This crate owns TH-D75 serial
+presets, USB discovery and identity-based reopening, native Bluetooth access,
+and the model-specific `EitherTransport` choice. An opened transport alone does
+not establish CAT readiness or permission to change radio settings.
+
+D-STAR framing, configuration, events, and voice processing live in
+[`mmdvm::dstar`](https://github.com/swiftraccoon/kenwood/tree/main/mmdvm).
+Import `DstarModemConfig` and `DstarEvent` there; protocol values such as
+`DstarHeader` and `UrCallAction` come from `dstar-gateway-core`.
+`DstarGateway` owns only the TH-D75 lifecycle around that shared runtime:
+`start(radio, data_band, config)` enters transient TNC mode, while
+`start_gateway_mode(radio, config)` requires existing binary-mode proof.
+Use `modem()` to inspect shared runtime state. Mutating operations such as
+`next_event()` and `send_voice()` delegate through the gateway owner, keeping
+the modem paired with its radio's recovery state. Call `stop()` on that owner
+for lifecycle-specific cleanup. A transient stop still requires CAT
+restoration; a persistent stop preserves binary mode without a CAT exit.
 
 The public API follows these naming rules:
 
@@ -278,7 +299,7 @@ use kenwood_thd75::radio::automation::{
     GuardedDecimalRoute, GuardedDecimalRouteOutcome,
 };
 
-# async fn guarded_route_example<T: kenwood_thd75::Transport>(
+# async fn guarded_route_example<T: kenwood_transport::Transport>(
 #     mut radio: kenwood_thd75::Radio<T>,
 # ) -> Result<(), Box<dyn std::error::Error>> {
 let mut session = radio.qualify_automation().await?;

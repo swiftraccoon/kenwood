@@ -8,11 +8,11 @@
 use crate::error::{Error, ProtocolError};
 use crate::protocol::programming;
 use crate::protocol::{Command, Response};
-use crate::transport::Transport;
 use crate::types::{
     BacklightControl, Band, BandMode, BatteryLevel, LinkedVolumeLevel, RadioClock, RadioType,
     SerialInformation, UsbAudioOutput,
 };
+use kenwood_transport::Transport;
 
 use super::Radio;
 
@@ -70,7 +70,8 @@ impl<T: Transport> Radio<T> {
     /// # #[tokio::main(flavor = "current_thread")]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// use kenwood_thd75::types::BatteryLevel;
-    /// use kenwood_thd75::{MockTransport, Radio};
+    /// use kenwood_thd75::Radio;
+    /// use kenwood_transport::MockTransport;
     ///
     /// let mut mock = MockTransport::new();
     /// mock.expect(b"BL\r", b"BL 3\r");

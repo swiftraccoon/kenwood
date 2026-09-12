@@ -1,8 +1,8 @@
 //! Multi-step workflow integration tests exercising Radio -> Transport -> Protocol -> Types.
 
 use kenwood_thd75::radio::Radio;
-use kenwood_thd75::transport::MockTransport;
 use kenwood_thd75::types::*;
+use kenwood_transport::MockTransport;
 use std::path::Path;
 
 // Deps visible to every kenwood-thd75 test target but unused here.

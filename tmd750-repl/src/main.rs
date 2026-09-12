@@ -16,9 +16,10 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use kenwood_tmd750::transport::{
-    DEFAULT_BAUD, SerialCandidate, SerialTransport, Transport, discover_serial, open_serial,
+    DEFAULT_BAUD, SerialCandidate, SerialTransport, discover_serial, open_serial,
 };
 use kenwood_tmd750::{Band, Identity, OperatingMode, Radio, SelectableMode};
+use kenwood_transport::Transport;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
@@ -554,7 +555,7 @@ fn parse_selectable_mode(word: &str) -> Result<SelectableMode, CommandError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kenwood_tmd750::transport::MockTransport;
+    use kenwood_transport::MockTransport;
 
     type TestResult = Result<(), Box<dyn StdError + Send + Sync>>;
 

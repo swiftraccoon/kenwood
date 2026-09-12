@@ -12,7 +12,8 @@
 //! Then: `cargo run --manifest-path thd75/Cargo.toml --bin gps_capture`
 
 use kenwood_thd75::protocol::Codec;
-use kenwood_thd75::transport::{EitherTransport, SerialTransport, Transport};
+use kenwood_thd75::transport::{EitherTransport, SerialTransport};
+use kenwood_transport::Transport;
 use std::io::Write;
 
 fn open_transport() -> (String, EitherTransport) {

@@ -5,12 +5,13 @@ use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use kenwood_tmd750::memory::{TerminalExitTrial, TerminalExitTrialEvent, TerminalExitTrialStatus};
-use kenwood_tmd750::transport::{SerialCandidate, Transport};
+use kenwood_tmd750::transport::SerialCandidate;
 use kenwood_tmd750::{
     DvGatewayMode, McpProbeExit, Radio, TerminalExitTrialSessionOutcome,
     TerminalExitTrialSessionReport, TerminalExitTrialSessionStage,
     TerminalExitTrialWriteDisposition,
 };
+use kenwood_transport::Transport;
 use serde::Serialize;
 
 use super::super::capture::{CaptureTransport, Event, Recorder, TranscriptSummary};

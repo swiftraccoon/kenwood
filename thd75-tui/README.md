@@ -11,7 +11,10 @@ Terminal UI for the Kenwood TH-D75. Built on [`kenwood-thd75`](../thd75/), [rata
   group columns. Per-channel editing and CAT ME writes are not currently
   available.
 - APRS monitor panel: decoded position (including Mic-E), message, and weather reports, plus digipeated packets, query responses, and a last-heard station list. Status, telemetry, object, and item packets are received but not yet decoded into their own display.
-- D-STAR gateway reflector monitor (via [`dstar-gateway-core`](../dstar-gateway-core/)): link status, heard stations, voice-transmission events.
+- D-STAR modem monitor (via [`mmdvm`](../mmdvm/)): heard stations, voice events,
+  slow-data text, and gateway-command observations. TH-D75 mode entry and
+  restoration remain with the radio library; this panel does not establish a
+  reflector network connection.
 - MCP programming: full memory dump (~55 s at 9600 baud), memory-image
   inspection, and settings patches. Cached at
   `~/Library/Caches/thd75-tui/mcp.bin` on macOS for offline correlation.
@@ -24,6 +27,11 @@ cargo run -p thd75-tui -- [--port /dev/cu.usbmodem*] [--baud 115200] [--exit-ter
 ```
 
 Default port auto-discovers USB (VID `0x2166` / PID `0x9023`) or the paired Bluetooth SPP channel (macOS IOBluetooth RFCOMM; Linux/Windows via the serial emulator).
+
+D-STAR startup requires a configured MY callsign in the loaded MCP image
+(Menu 610). It validates that identity before requesting transient MMDVM on
+Band B. Exiting stops the shared modem, performs the matching radio-mode exit,
+and restores CAT before normal polling resumes.
 
 ## Status
 

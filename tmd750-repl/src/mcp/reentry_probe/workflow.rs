@@ -3,8 +3,9 @@
 use std::fs::File;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use kenwood_tmd750::transport::{SerialCandidate, Transport};
+use kenwood_tmd750::transport::SerialCandidate;
 use kenwood_tmd750::{DvGatewayMode, McpGatewayOffProbeReport, Radio};
+use kenwood_transport::Transport;
 use serde::Serialize;
 
 use super::super::capture::{CaptureTransport, Event, Recorder, TranscriptSummary};

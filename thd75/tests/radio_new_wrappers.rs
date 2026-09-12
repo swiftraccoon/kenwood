@@ -2,12 +2,12 @@
 
 use kenwood_thd75::error::Error;
 use kenwood_thd75::radio::Radio;
-use kenwood_thd75::transport::MockTransport;
 use kenwood_thd75::types::{
     AntennaInput, Band, BeaconMode, DstarSlot, FilterMode, FineStep, GpsSettings,
     MyPositionSelection, NmeaSentences, OperatingMode, PacketDataRate, RegularChannel, StepSize,
     TuningMode, UsbAudioOutput,
 };
+use kenwood_transport::MockTransport;
 
 // Deps visible to every kenwood-thd75 test target but unused here.
 // Acknowledged so `unused_crate_dependencies` stays silent without

@@ -115,8 +115,8 @@ use crate::aprs::ax25_to_kiss_wire;
 use crate::error::Error;
 use crate::radio::kiss_session::KissSession;
 use crate::radio::{DesyncedRadio, Radio};
-use crate::transport::Transport;
 use crate::types::{KissParams, PacketDataRate, TncDataBand};
+use kenwood_transport::{Transport, TransportError};
 
 /// Default receive timeout for `next_event` polling (500 ms).
 ///
@@ -1303,7 +1303,7 @@ impl<T: Transport> AprsClient<T> {
         let frame = match self.session.receive_frame().await {
             Ok(f) => f,
             Err(Error::Timeout(_)) => return Ok(None),
-            Err(Error::Transport(crate::error::TransportError::Read(io_err)))
+            Err(Error::Transport(TransportError::Read(io_err)))
                 if matches!(
                     io_err.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
@@ -2309,8 +2309,8 @@ mod tests {
     use kiss_tnc::FEND;
 
     use crate::aprs::default_digipeater_path;
-    use crate::transport::MockTransport;
     use crate::types::TncDataBand;
+    use kenwood_transport::MockTransport;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
     type BoxErr = Box<dyn std::error::Error>;

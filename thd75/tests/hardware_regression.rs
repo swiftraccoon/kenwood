@@ -193,7 +193,7 @@ fn parse_dw_rejects_obsolete_band_payload() {
 #[tokio::test]
 async fn execute_timeout_field_exists() -> TestResult {
     use kenwood_thd75::radio::Radio;
-    use kenwood_thd75::transport::MockTransport;
+    use kenwood_transport::MockTransport;
     use std::time::Duration;
 
     let mock = MockTransport::new();
@@ -238,7 +238,7 @@ fn parse_error_response_still_works() -> TestResult {
 #[tokio::test]
 async fn radio_not_available_response() -> TestResult {
     use kenwood_thd75::radio::Radio;
-    use kenwood_thd75::transport::MockTransport;
+    use kenwood_transport::MockTransport;
 
     let mut mock = MockTransport::new();
     mock.expect(b"ID\r", b"N\r");

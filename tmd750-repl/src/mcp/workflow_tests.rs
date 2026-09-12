@@ -5,8 +5,9 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use kenwood_tmd750::protocol::mcp::{ACK, read_request, write_request};
-use kenwood_tmd750::transport::{KENWOOD_VID, MockTransport, TMD750_MAIN_PID, TransportError};
+use kenwood_tmd750::transport::{KENWOOD_VID, TMD750_MAIN_PID};
 use kenwood_tmd750::{Address, Page};
+use kenwood_transport::{MockTransport, TransportError};
 use reconnect::{VerificationOutcome, VerificationStage};
 
 type TestResult = Result<(), Box<dyn StdError + Send + Sync>>;

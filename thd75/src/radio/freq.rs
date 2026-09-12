@@ -42,12 +42,12 @@
 use crate::error::{Error, ProtocolError};
 use crate::protocol::programming;
 use crate::protocol::{Command, Response};
-use crate::transport::Transport;
 use crate::types::{
     Band, CatChannelRecord, CurrentMemorySelector, FilterMode, FilterWidthIndex, FineStep,
     FirmwareIdentity, Frequency, MemoryChannelAddress, OperatingMode, PowerLevel, RegularChannel,
     SMeterReading, SquelchLevel, TuningMode,
 };
+use kenwood_transport::Transport;
 
 use super::Radio;
 
@@ -60,7 +60,8 @@ impl<T: Transport> Radio<T> {
     /// # #[tokio::main(flavor = "current_thread")]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// use kenwood_thd75::types::Band;
-    /// use kenwood_thd75::{MockTransport, Radio};
+    /// use kenwood_thd75::Radio;
+    /// use kenwood_transport::MockTransport;
     ///
     /// let mut mock = MockTransport::new();
     /// mock.expect(b"FQ 0\r", b"FQ 0,0145000000\r");
@@ -112,7 +113,8 @@ impl<T: Transport> Radio<T> {
     /// # #[tokio::main(flavor = "current_thread")]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// use kenwood_thd75::types::{Band, OperatingMode};
-    /// use kenwood_thd75::{MockTransport, Radio};
+    /// use kenwood_thd75::Radio;
+    /// use kenwood_transport::MockTransport;
     ///
     /// let mut mock = MockTransport::new();
     /// mock.expect(b"MD 0\r", b"MD 0,0\r");
@@ -228,7 +230,8 @@ impl<T: Transport> Radio<T> {
     /// # #[tokio::main(flavor = "current_thread")]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// use kenwood_thd75::types::{Band, SquelchLevel};
-    /// use kenwood_thd75::{MockTransport, Radio};
+    /// use kenwood_thd75::Radio;
+    /// use kenwood_transport::MockTransport;
     ///
     /// let mut mock = MockTransport::new();
     /// mock.expect(b"SQ 0\r", b"SQ 0,05\r");
@@ -273,7 +276,8 @@ impl<T: Transport> Radio<T> {
     /// # #[tokio::main(flavor = "current_thread")]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// use kenwood_thd75::types::{Band, SquelchLevel};
-    /// use kenwood_thd75::{MockTransport, Radio};
+    /// use kenwood_thd75::Radio;
+    /// use kenwood_transport::MockTransport;
     ///
     /// let mut mock = MockTransport::new();
     /// mock.expect(b"SQ 0,4\r", b"SQ 0,4\r");
@@ -435,7 +439,8 @@ impl<T: Transport> Radio<T> {
     /// ```
     /// # #[tokio::main(flavor = "current_thread")]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// use kenwood_thd75::{MockTransport, Radio};
+    /// use kenwood_thd75::Radio;
+    /// use kenwood_transport::MockTransport;
     ///
     /// let mut mock = MockTransport::new();
     /// mock.expect(b"FV\r", b"FV 1.03.000\r");
@@ -486,7 +491,8 @@ impl<T: Transport> Radio<T> {
     /// # #[tokio::main(flavor = "current_thread")]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// use kenwood_thd75::types::Band;
-    /// use kenwood_thd75::{MockTransport, Radio};
+    /// use kenwood_thd75::Radio;
+    /// use kenwood_transport::MockTransport;
     ///
     /// let mut mock = MockTransport::new();
     /// mock.expect(b"BC\r", b"BC 1\r");
@@ -523,7 +529,8 @@ impl<T: Transport> Radio<T> {
     /// # #[tokio::main(flavor = "current_thread")]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// use kenwood_thd75::types::Band;
-    /// use kenwood_thd75::{MockTransport, Radio};
+    /// use kenwood_thd75::Radio;
+    /// use kenwood_transport::MockTransport;
     ///
     /// let mut mock = MockTransport::new();
     /// mock.expect(b"BC 1\r", b"BC 1\r");

@@ -1,9 +1,10 @@
 //! D-STAR reflector startup over a positively identified MMDVM link.
 //!
-//! The TM-D750 Terminal Mode wire protocol is not assumed. Startup first lets
-//! ordinary CAT identification time out, then sends one MMDVM `GET_VERSION`
-//! probe. Standard modem setup and reflector traffic are allowed only after a
-//! complete MMDVM version response proves that protocol on this exact link.
+//! The TM-D750 Terminal Mode wire protocol is not assumed. Startup requires a
+//! completed initial CAT `ID` write with a silent reply timeout before sending
+//! one MMDVM `GET_VERSION` probe. Standard modem setup and reflector traffic
+//! are allowed only after a complete MMDVM version response proves that
+//! protocol on this exact link.
 //! MMDVM framing cannot distinguish Reflector Terminal from Access Point mode,
 //! so the documented Menu 670 and 650 selections remain operator preconditions.
 
@@ -18,20 +19,20 @@ use dstar_gateway::tokio_shell::{
 };
 use dstar_gateway_core::session::client::{Connected, Connecting, DExtra, DPlus, Dcs, Session};
 use dstar_gateway_core::{Callsign, DstarHeader, Module, ProtocolKind, StreamId, VoiceFrame};
-use kenwood_thd75::types::{DstarCallsign, TncDataBand};
-use kenwood_thd75::{DstarEvent, DstarGateway, DstarGatewayConfig, LinkDiagnosis, PersistentMmdvm};
-use kenwood_tmd750::transport::{DEFAULT_BAUD, SerialTransport, Transport, open_serial};
-use kenwood_tmd750::{Error as Tmd750Error, Radio as CatRadio};
+use kenwood_tmd750::transport::{DEFAULT_BAUD, SerialTransport, open_serial};
+use mmdvm::dstar::{DstarEvent, DstarModemConfig};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
 use crate::{hosts, output, terminal};
 
 mod lifecycle;
+mod modem;
 
 use lifecycle::{
     RelayMode, StreamLifecycle, complete_cycle_or_input, next_event_before_quiet, settle_streams,
 };
+use modem::{prove_mmdvm_or_explain_cat, start_gateway, stop_gateway};
 
 const DSTAR_PROMPT: &str = "dstar> ";
 const EVENT_POLL_TIMEOUT: Duration = Duration::from_millis(5);
@@ -42,12 +43,12 @@ const PAD_INITIAL_THRESHOLD: Duration = Duration::from_millis(100);
 const PAD_FRAMES_MAX: u32 = 30;
 const REFLECTOR_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-type Gateway = DstarGateway<SerialTransport, PersistentMmdvm>;
+type Gateway = modem::Gateway<SerialTransport>;
 
 /// Fully validated arguments for `dstar start`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct StartRequest {
-    callsign: DstarCallsign,
+    modem_config: DstarModemConfig,
     reflector: Option<LinkArg>,
 }
 
@@ -66,27 +67,20 @@ impl StartRequest {
         }
 
         let callsign = raw_callsign.to_ascii_uppercase();
-        let callsign = DstarCallsign::new(&callsign)
+        let modem_config = DstarModemConfig::new(&callsign)
             .map_err(|error| format!("invalid station callsign {callsign:?}: {error}"))?;
-        if callsign.as_str().is_empty() {
-            return Err("station callsign must not be empty".to_owned());
-        }
         let reflector = arguments
             .get(1)
             .map(|value| LinkArg::parse(&value.to_ascii_uppercase()))
             .transpose()?;
         Ok(Self {
-            callsign,
+            modem_config,
             reflector,
         })
     }
 
-    fn gateway_callsign(&self) -> DstarCallsign {
-        self.callsign.clone()
-    }
-
-    fn network_callsign(&self) -> Callsign {
-        (&self.callsign).into()
+    const fn network_callsign(&self) -> Callsign {
+        self.modem_config.callsign()
     }
 }
 
@@ -178,39 +172,20 @@ impl DstarSession {
         }
         let connection = terminal::connection_for_path(path);
         let transport = open_serial(path, baud).map_err(|error| error.to_string())?;
-        let radio = prove_mmdvm_or_explain_cat(transport, connection).await?;
+        let proof = prove_mmdvm_or_explain_cat(transport, connection).await?;
         let callsign = request.network_callsign();
-        let config = DstarGatewayConfig::new(request.gateway_callsign(), TncDataBand::A);
 
         output::line(format_args!(
             "MMDVM framing proved on {path}; it cannot distinguish Reflector Terminal from Access Point mode. Continuing on the operator precondition that Menus 670 and 650 are set to Reflector TERM Mode and Terminal Mode."
         ));
-        let gateway = match DstarGateway::start_gateway_mode(radio, config).await {
-            Ok(gateway) => gateway,
-            Err((Some(radio), error)) => {
-                drop(radio.disconnect().await);
-                return Err(format!("MMDVM D-STAR initialization failed: {error}"));
-            }
-            Err((None, error)) => {
-                return Err(format!(
-                    "MMDVM D-STAR initialization failed and the serial link was lost: {error}"
-                ));
-            }
-        };
+        let gateway = start_gateway(proof, request.modem_config).await?;
         output::line(format_args!("MMDVM modem initialized for D-STAR."));
 
         let reflector = if let Some(link) = request.reflector.as_ref() {
             match connect_reflector(callsign, link).await {
                 Ok(reflector) => Some(reflector),
                 Err(error) => {
-                    let cleanup_error = match gateway.stop().await {
-                        Ok(radio) => radio
-                            .disconnect()
-                            .await
-                            .err()
-                            .map(|cleanup| format!("serial close also failed: {cleanup}")),
-                        Err(cleanup) => Some(format!("MMDVM shutdown also failed: {cleanup}")),
-                    };
+                    let cleanup_error = stop_gateway(gateway).await.err();
                     return Err(cleanup_error.map_or_else(
                         || format!("reflector connection failed: {error}"),
                         |cleanup| format!("reflector connection failed: {error}; {cleanup}"),
@@ -363,17 +338,9 @@ impl DstarSession {
             disconnect_reflector(reflector).await;
         }
         output::line(format_args!("Stopping the D-STAR modem session."));
-        let radio = self
-            .gateway
-            .stop()
-            .await
-            .map_err(|error| format!("MMDVM shutdown failed: {error}"))?;
-        radio
-            .disconnect()
-            .await
-            .map_err(|error| format!("serial close failed: {error}"))?;
+        stop_gateway(self.gateway).await?;
         output::line(format_args!(
-            "D-STAR session stopped. Menu 650 remains in Terminal Mode; set it to Off before using CAT on this port."
+            "D-STAR session stopped. No Gateway setting was changed; set Menu 650 to Off before using CAT on this port."
         ));
         Ok(())
     }
@@ -596,7 +563,7 @@ impl DstarSession {
                     );
                     return;
                 }
-                if let Err(error) = self.gateway.send_voice_unpaced(frame).await {
+                if let Err(error) = self.gateway.send_voice(frame).await {
                     output::error(format_args!(
                         "Error: relaying reflector voice to radio: {error}"
                     ));
@@ -675,7 +642,7 @@ impl DstarSession {
         if last_at.elapsed() < threshold {
             return;
         }
-        if let Err(error) = self.gateway.send_voice_unpaced(&frame).await {
+        if let Err(error) = self.gateway.send_voice(&frame).await {
             tracing::warn!(%error, "silence padding failed");
             self.pad_frames_emitted = PAD_FRAMES_MAX;
             return;
@@ -716,89 +683,6 @@ fn print_reflector_event(event: &AnyEvent) {
             output::error(format_args!("Error: reflector disconnected: {reason:?}."));
         }
         _ => {}
-    }
-}
-
-async fn prove_mmdvm_or_explain_cat<T>(
-    transport: T,
-    connection: terminal::UsbConnection,
-) -> Result<kenwood_thd75::Radio<T>, String>
-where
-    T: Transport + Unpin + 'static,
-{
-    prove_mmdvm_or_explain_cat_with_timeout(
-        transport,
-        kenwood_tmd750::radio::DEFAULT_TIMEOUT,
-        connection,
-    )
-    .await
-}
-
-async fn prove_mmdvm_or_explain_cat_with_timeout<T>(
-    transport: T,
-    cat_timeout: Duration,
-    connection: terminal::UsbConnection,
-) -> Result<kenwood_thd75::Radio<T>, String>
-where
-    T: Transport + Unpin + 'static,
-{
-    let mut cat_radio = CatRadio::new(transport);
-    cat_radio.set_timeout(cat_timeout);
-    match cat_radio.identify().await {
-        Ok(identity) => {
-            let gateway = cat_radio.get_dv_gateway_mode().await;
-            let guidance =
-                terminal::cat_startup_guidance(connection, gateway.as_ref().ok().copied());
-            let gateway = gateway
-                .as_ref()
-                .map_or_else(|error| format!("unreadable ({error})"), ToString::to_string);
-            let message = format!(
-                "{} firmware {} answered normal CAT.\n\
-                 DV Gateway state: {gateway}. No setting was changed.\n{guidance}",
-                identity.model, identity.firmware,
-            );
-            let mut transport = cat_radio.into_transport();
-            Err(match transport.close().await {
-                Ok(()) => message,
-                Err(error) => {
-                    let cause = std::error::Error::source(&error)
-                        .map_or_else(String::new, |cause| format!(": {cause}"));
-                    format!("{message}\nSerial close also failed: {error}{cause}.")
-                }
-            })
-        }
-        Err(error)
-            if matches!(
-                &error,
-                Tmd750Error::Timeout {
-                    operation: "ID",
-                    ..
-                }
-            ) =>
-        {
-            tracing::debug!(%error, "CAT ID was silent; attempting a bounded MMDVM version probe");
-            let transport = cat_radio.into_transport();
-            // This TH-D75 controller is only a typed owner for the shared
-            // transport and MMDVM lifecycle. This branch sends no TH-D75 CAT,
-            // MCP, or `TN` command.
-            let mut radio = kenwood_thd75::Radio::new(transport);
-            match radio.probe_silent_link().await {
-                LinkDiagnosis::MmdvmMode => Ok(radio),
-                diagnosis => {
-                    drop(radio.disconnect().await);
-                    Err(format!(
-                        "CAT was silent, but the endpoint did not answer a complete MMDVM GET_VERSION probe ({diagnosis:?}). No gateway frames were sent. Check Menu 986 routing and Menu 650, or capture the third-party Terminal Mode protocol before trying another transport."
-                    ))
-                }
-            }
-        }
-        Err(error) => {
-            let mut transport = cat_radio.into_transport();
-            drop(transport.close().await);
-            Err(format!(
-                "TM-D750 CAT identification failed before a clean ID timeout, so an MMDVM probe was not safe: {error}"
-            ))
-        }
     }
 }
 
@@ -1004,17 +888,26 @@ fn print_dstar_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kenwood_tmd750::transport::{MockTransport, TransportError};
+    use kenwood_transport::{MockTransport, Transport, TransportError};
+    use modem::prove_mmdvm_or_explain_cat_with_timeout;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Mutex;
 
     const MMDVM_VERSION_PROBE: [u8; 3] = [0xE0, 0x03, 0x00];
+
+    #[derive(Clone, Copy, Debug)]
+    enum WriteBehavior {
+        Normal,
+        Fail,
+        Hang,
+    }
 
     #[derive(Clone, Debug)]
     struct SharedMock {
         inner: Arc<Mutex<MockTransport>>,
         closes: Arc<AtomicUsize>,
         fail_close: bool,
+        write_behavior: WriteBehavior,
     }
 
     impl SharedMock {
@@ -1023,6 +916,7 @@ mod tests {
                 inner: Arc::new(Mutex::new(mock)),
                 closes: Arc::new(AtomicUsize::new(0)),
                 fail_close: false,
+                write_behavior: WriteBehavior::Normal,
             }
         }
 
@@ -1038,7 +932,14 @@ mod tests {
                 0,
                 "no requests may follow a close attempt"
             );
-            self.inner.lock().await.write(data).await
+            self.inner.lock().await.write(data).await?;
+            match self.write_behavior {
+                WriteBehavior::Normal => Ok(()),
+                WriteBehavior::Fail => Err(TransportError::Write(std::io::Error::other(
+                    "injected serial write failure",
+                ))),
+                WriteBehavior::Hang => std::future::pending().await,
+            }
         }
 
         async fn read(&mut self, buffer: &mut [u8]) -> Result<usize, TransportError> {
@@ -1090,7 +991,7 @@ mod tests {
     #[test]
     fn favorite_command_arguments_validate() -> Result<(), String> {
         let request = StartRequest::parse(&["KQ4NIT", "REF030C"])?;
-        assert_eq!(request.callsign.as_str(), "KQ4NIT");
+        assert_eq!(request.network_callsign().as_str(), "KQ4NIT");
         assert_eq!(
             request.network_callsign(),
             Callsign::from_wire_bytes(*b"KQ4NIT  ")
@@ -1107,7 +1008,7 @@ mod tests {
     #[test]
     fn startup_input_is_normalized_before_io() -> Result<(), String> {
         let request = StartRequest::parse(&["kq4nit", "b:ref030c"])?;
-        assert_eq!(request.callsign.as_str(), "KQ4NIT");
+        assert_eq!(request.network_callsign().as_str(), "KQ4NIT");
         let Some(link) = request.reflector else {
             return Err("reflector was not retained".to_owned());
         };
@@ -1124,6 +1025,10 @@ mod tests {
         assert!(StartRequest::parse(&["   "]).is_err());
         assert!(StartRequest::parse(&["KQ4NIT", "REF0301"]).is_err());
         assert!(StartRequest::parse(&["KQ4NIT", "REF030C", "extra"]).is_err());
+        assert!(StartRequest::parse(&["KQ4,NIT"]).is_err());
+        assert!(StartRequest::parse(&["KQ4NIT\r"]).is_err());
+        assert!(StartRequest::parse(&["KQ4NIT   "]).is_err());
+        assert!(StartRequest::parse(&["KQ4NITé"]).is_err());
     }
 
     #[tokio::test]
@@ -1267,6 +1172,7 @@ mod tests {
             vec![b"ID\r".to_vec(), MMDVM_VERSION_PROBE.to_vec()],
             "preflight must stop after strict version proof and leave configuration to gateway startup"
         );
+        assert_eq!(shared.closes.load(Ordering::SeqCst), 0);
         shared.inner.lock().await.assert_complete();
         Ok(())
     }
@@ -1291,5 +1197,209 @@ mod tests {
             vec![b"ID\r".to_vec(), MMDVM_VERSION_PROBE.to_vec()],
             "failed proof must not send SetConfig, SetMode, or gateway traffic"
         );
+        assert_eq!(shared.closes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn partial_id_timeout_never_admits_a_binary_probe() {
+        for prefix in [&b"ID TM-D750"[..], &b"?"[..]] {
+            let mut mock = MockTransport::new();
+            mock.expect_partial_then_hang(b"ID\r", prefix);
+            let shared = SharedMock::new(mock);
+            let result = prove_mmdvm_or_explain_cat_with_timeout(
+                shared.clone(),
+                Duration::from_millis(1),
+                terminal::UsbConnection::Unknown,
+            )
+            .await;
+            assert!(
+                result.is_err_and(|error| error.contains("no MMDVM probe was sent")),
+                "a timed-out partial CAT line is not silence"
+            );
+            assert_eq!(shared.writes().await, vec![b"ID\r".to_vec()]);
+            assert_eq!(shared.closes.load(Ordering::SeqCst), 1);
+            shared.inner.lock().await.assert_complete();
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_initial_write_never_admits_a_binary_probe() {
+        for write_behavior in [WriteBehavior::Fail, WriteBehavior::Hang] {
+            let mut mock = MockTransport::new();
+            mock.expect_hang(b"ID\r");
+            let mut shared = SharedMock::new(mock);
+            shared.write_behavior = write_behavior;
+            let result = prove_mmdvm_or_explain_cat_with_timeout(
+                shared.clone(),
+                Duration::from_millis(1),
+                terminal::UsbConnection::Unknown,
+            )
+            .await;
+            assert!(result.is_err_and(|error| error.contains("no MMDVM probe was sent")));
+            assert_eq!(shared.writes().await, vec![b"ID\r".to_vec()]);
+            assert_eq!(shared.closes.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn later_identity_timeout_never_admits_a_binary_probe() {
+        let mut mock = MockTransport::new();
+        mock.expect(b"ID\r", b"ID TM-D750\r");
+        mock.expect_hang(b"FV\r");
+        let shared = SharedMock::new(mock);
+        let result = prove_mmdvm_or_explain_cat_with_timeout(
+            shared.clone(),
+            Duration::from_millis(1),
+            terminal::UsbConnection::Unknown,
+        )
+        .await;
+        assert!(result.is_err_and(|error| error.contains("no MMDVM probe was sent")));
+        assert_eq!(shared.writes().await, [b"ID\r", b"FV\r"]);
+        assert_eq!(shared.closes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn preflight_failures_retain_the_original_error_and_close_failure() {
+        for cat_reply in [&b"ID TM-D740\r"[..], &b"?\r"[..]] {
+            let mut mock = MockTransport::new();
+            mock.expect(b"ID\r", cat_reply);
+            let mut shared = SharedMock::new(mock);
+            shared.fail_close = true;
+            let result = prove_mmdvm_or_explain_cat_with_timeout(
+                shared.clone(),
+                Duration::from_millis(1),
+                terminal::UsbConnection::Unknown,
+            )
+            .await;
+            assert!(result.is_err_and(|error| {
+                error.contains("CAT identification failed")
+                    && error.contains("Serial close also failed")
+                    && error.contains("injected serial close failure")
+            }));
+            assert_eq!(shared.writes().await, vec![b"ID\r".to_vec()]);
+            assert_eq!(shared.closes.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn binary_proof_failure_retains_its_diagnostic_and_close_failure() {
+        let mut mock = MockTransport::new();
+        mock.expect_hang(b"ID\r");
+        mock.expect(&MMDVM_VERSION_PROBE, &MMDVM_VERSION_PROBE);
+        let mut shared = SharedMock::new(mock);
+        shared.fail_close = true;
+        let result = prove_mmdvm_or_explain_cat_with_timeout(
+            shared.clone(),
+            Duration::from_millis(1),
+            terminal::UsbConnection::Unknown,
+        )
+        .await;
+        assert!(result.is_err_and(|error| {
+            error.contains("complete MMDVM GET_VERSION probe")
+                && error.contains("Serial close also failed")
+                && error.contains("injected serial close failure")
+        }));
+        assert_eq!(
+            shared.writes().await,
+            vec![b"ID\r".to_vec(), MMDVM_VERSION_PROBE.to_vec()]
+        );
+        assert_eq!(shared.closes.load(Ordering::SeqCst), 1);
+    }
+
+    fn modem_startup_mock(config_reply: &[u8], mode_reply: Option<&[u8]>) -> SharedMock {
+        let mut mock = MockTransport::new();
+        mock.expect_hang(b"ID\r");
+        mock.expect(&MMDVM_VERSION_PROBE, b"\xE0\x0E\x00\x01MMDVM 2018");
+        mock.expect(b"\xE0\x09\x02\x00\x01\x0A\x01\x80\x80", config_reply);
+        if let Some(mode_reply) = mode_reply {
+            mock.expect(b"\xE0\x04\x03\x01", mode_reply);
+        }
+        mock.expect_any_write();
+        mock.pend_when_empty();
+        SharedMock::new(mock)
+    }
+
+    async fn prove_test_modem(
+        shared: &SharedMock,
+    ) -> Result<modem::ProvenModem<SharedMock>, String> {
+        prove_mmdvm_or_explain_cat_with_timeout(
+            shared.clone(),
+            Duration::from_millis(1),
+            terminal::UsbConnection::Unknown,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn runtime_shutdown_closes_the_proved_transport_without_mode_exit() -> Result<(), String>
+    {
+        for fail_close in [false, true] {
+            let mut shared = modem_startup_mock(b"\xE0\x04\x70\x02", Some(b"\xE0\x04\x70\x03"));
+            shared.fail_close = fail_close;
+            let proof = prove_test_modem(&shared).await?;
+            let config = DstarModemConfig::new("KQ4NIT").map_err(|error| error.to_string())?;
+            let gateway = start_gateway(proof, config).await?;
+            let result = stop_gateway(gateway).await;
+            if fail_close {
+                assert!(result.is_err_and(|error| {
+                    error.contains("Serial close failed")
+                        && error.contains("injected serial close failure")
+                }));
+            } else {
+                result?;
+            }
+            assert_eq!(shared.closes.load(Ordering::SeqCst), 1);
+            let writes = shared.writes().await;
+            assert_eq!(writes.first(), Some(&b"ID\r".to_vec()));
+            assert!(
+                writes
+                    .iter()
+                    .skip(1)
+                    .all(|bytes| bytes.first() == Some(&0xE0)
+                        && matches!(bytes.get(2), Some(0x00..=0x03)))
+            );
+            assert_eq!(
+                writes
+                    .iter()
+                    .filter(|bytes| bytes.get(2) == Some(&0x03))
+                    .count(),
+                1,
+                "only the startup D-STAR SetMode is permitted; shutdown cannot change persistent mode"
+            );
+            shared.inner.lock().await.assert_complete();
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn initialization_rejection_closes_once_and_retains_cleanup_failure() -> Result<(), String>
+    {
+        for fail_close in [false, true] {
+            let mut shared = modem_startup_mock(b"\xE0\x05\x7F\x02\x04", None);
+            shared.fail_close = fail_close;
+            let proof = prove_test_modem(&shared).await?;
+            let config = DstarModemConfig::new("KQ4NIT").map_err(|error| error.to_string())?;
+            let result = start_gateway(proof, config).await;
+            let Err(error) = result else {
+                return Err("SetConfig rejection must fail startup".to_owned());
+            };
+            assert!(error.contains("MMDVM D-STAR initialization failed"));
+            assert_eq!(error.contains("injected serial close failure"), fail_close);
+            assert_eq!(shared.closes.load(Ordering::SeqCst), 1);
+            let writes = shared.writes().await;
+            assert!(
+                writes
+                    .iter()
+                    .skip(1)
+                    .all(|bytes| bytes.first() == Some(&0xE0)
+                        && matches!(bytes.get(2), Some(0x00..=0x02)))
+            );
+            assert!(
+                !writes.iter().any(|bytes| bytes.get(2) == Some(&0x03)),
+                "rejected setup cannot continue to SetMode or send a mode-exit command"
+            );
+            shared.inner.lock().await.assert_complete();
+        }
+        Ok(())
     }
 }

@@ -15,8 +15,8 @@ use std::io;
 use crate::error::{Error, McpError, SchemaError};
 use crate::memory::{DecodedFieldValue, MenuField, PatchSet};
 use crate::protocol::mcp::regions;
-use crate::transport::Transport;
 use crate::types::{Address, IMAGE_LENGTH, PAGE_SIZE_U32, Page, SlotIndex};
+use kenwood_transport::Transport;
 
 use super::Progress;
 use super::programming::{McpCompareExchangeReport, McpSession, PageReplacement};

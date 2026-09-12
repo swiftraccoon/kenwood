@@ -1,6 +1,6 @@
 //! Public configuration-file boundaries, using independently constructed headers.
 
-use kenwood_thd75 as _;
+use kenwood_transport as _;
 use mcp_d75_extract as _;
 use thiserror as _;
 use tokio as _;

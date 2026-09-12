@@ -14,8 +14,8 @@ use crate::protocol::mcp::{
     ACK, BAUD, ENTER, ENTER_RESPONSE, EXIT, FILL, HEADER_LEN, Header, PagePatch, WRITE,
     read_request, regions, write_request,
 };
-use crate::transport::Transport;
 use crate::types::{IMAGE_LENGTH, Page, Region};
+use kenwood_transport::Transport;
 
 /// Pages the radio may have changed and pages confirmed by read-back.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

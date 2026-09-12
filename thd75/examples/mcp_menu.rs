@@ -59,9 +59,10 @@ use kenwood_thd75::memory::{
 use kenwood_thd75::protocol::programming;
 #[cfg(target_os = "macos")]
 use kenwood_thd75::transport::BluetoothTransport;
-use kenwood_thd75::transport::{EitherTransport, SerialTransport, Transport};
+use kenwood_thd75::transport::{EitherTransport, SerialTransport};
 use kenwood_thd75::types::{FirmwareIdentity, RadioModel};
 use kenwood_thd75::{McpPage, Radio};
+use kenwood_transport::Transport;
 
 type BoxError = Box<dyn std::error::Error>;
 type Result<T = ()> = std::result::Result<T, BoxError>;
@@ -1112,8 +1113,8 @@ mod tests {
         menu_field,
     };
     use kenwood_thd75::protocol::programming;
-    use kenwood_thd75::transport::MockTransport;
     use kenwood_thd75::types::{FirmwareIdentity, RadioModel};
+    use kenwood_transport::MockTransport;
 
     const NO_OPTIONS: &[MenuOption] = &[];
     const ENUM_OPTIONS: &[MenuOption] = &[MenuOption {

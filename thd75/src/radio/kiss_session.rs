@@ -43,13 +43,13 @@ use kiss_tnc::{
     FEND, KissCommand, KissError, KissFrame, KissPort, decode_kiss_frame, encode_kiss_frame,
 };
 
-use crate::error::{Error, ProtocolError, TransportError};
+use crate::error::{Error, ProtocolError};
 use crate::protocol::{Command, Response};
-use crate::transport::Transport;
 use crate::types::{
     KissDuplex, KissPersistence, KissSlotTime, KissTxDelay, KissTxTail, PacketDataRate,
     TncDataBand, TncMode,
 };
+use kenwood_transport::{Transport, TransportError};
 
 use super::{BinaryProtocolProof, DesyncedRadio, Radio, cat_restore_state::CatRestoreState};
 
@@ -546,11 +546,11 @@ impl<T: Transport> KissSession<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::MockTransport;
     use crate::types::{
         KissDuplex, KissPersistence, KissSlotTime, KissTxDelay, KissTxTail, PacketDataRate,
         TncDataBand,
     };
+    use kenwood_transport::MockTransport;
     use kiss_tnc::FEND;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;

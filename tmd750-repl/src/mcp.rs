@@ -24,10 +24,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use kenwood_tmd750::transport::{SerialCandidate, Transport};
+use kenwood_tmd750::transport::SerialCandidate;
 use kenwood_tmd750::{
     Identity, McpProbeExit, McpProbeOutcome, McpProbeReport, McpProbeStage, Radio,
 };
+use kenwood_transport::Transport;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -789,7 +790,7 @@ mod tests {
             exit: McpProbeExit::RecoveryRequired,
             outcome: McpProbeOutcome::Failed {
                 stage: McpProbeStage::SlotRead,
-                error: kenwood_tmd750::transport::TransportError::Read(io::Error::other(
+                error: kenwood_transport::TransportError::Read(io::Error::other(
                     "USB disconnected mid-page",
                 ))
                 .into(),

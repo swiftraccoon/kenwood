@@ -13,8 +13,8 @@ use crate::memory::{
     PmNameTrialStatus, PmNameTrialWrite,
 };
 use crate::radio::qualification::{McpProbeExit, McpProbeSegment};
-use crate::transport::Transport;
 use crate::types::{Address, DvGatewayMode, Page, RadioModel};
+use kenwood_transport::Transport;
 
 /// The step at which a fixed text-trial session stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

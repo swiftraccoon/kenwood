@@ -13,8 +13,8 @@
 
 use std::io;
 
-use crate::error::{Error, ProtocolError, TransportError};
-use crate::transport::Transport;
+use crate::error::{Error, ProtocolError};
+use kenwood_transport::{Transport, TransportError};
 
 use super::{McpPhase, Radio};
 
@@ -163,8 +163,8 @@ fn unclean_cat_boundary(expected: &str, actual: &[u8]) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::MockTransport;
     use crate::types::RadioModel;
+    use kenwood_transport::MockTransport;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 

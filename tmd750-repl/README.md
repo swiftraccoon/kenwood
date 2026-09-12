@@ -40,6 +40,15 @@ cargo run -p tmd750-repl -- --port /dev/cu.usbmodem101
 The default baud rate is the hardware-validated 9600 baud. Use `--baud` only
 when testing a deliberately different configuration.
 
+The TM-D750 library owns USB discovery and the RTS/CTS, DTR, and RTS preset;
+`kenwood-transport` supplies shared physical serial I/O and transport contracts.
+Endpoint selection and post-MCP readiness remain explicit REPL policies, not
+automatic behavior in the shared transport. The experimental D-STAR runtime
+comes directly from `mmdvm::dstar`, with no TH-D75 library dependency. The REPL
+owns TM-D750 protocol admission, the selected connection, and final serial
+close; the shared runtime owns MMDVM D-STAR processing. This separation does
+not qualify additional TM-D750 protocols or lifecycle operations.
+
 The main-unit CAT connection has been hardware-validated. Recognizing the
 control-panel USB identity does not establish equivalent live protocol support.
 The transport does not automatically reopen after a USB disconnect: serial
@@ -788,8 +797,12 @@ DV Gateway uses Band A. The ordinary D-STAR callsign in Menu 610 does not
 substitute for the DV Gateway identity in Menu 651.
 
 After the TERM indicator appears, run the same command again. CAT silence by
-itself proves nothing. The REPL sends only an MMDVM `GET_VERSION` probe and
-requires one complete, decoded version response before it permits modem
+itself proves nothing. Only a completed initial `ID` write followed by a reply
+timeout with zero received bytes permits the MMDVM `GET_VERSION` probe. Partial
+CAT input, failed writes, or later identity-query timeouts close the connection
+without probing another protocol. The probe uses one two-second deadline for
+its write and response and requires one complete, decoded version response
+before it permits modem
 configuration or reflector traffic. A missing, partial, echoed, or non-MMDVM
 reply stops the attempt without sending gateway frames. That reply proves
 MMDVM framing, but it cannot distinguish Reflector Terminal from Access Point
@@ -809,6 +822,12 @@ echo requests are still handled by the modem gateway. `monitor` resumes live
 relay; `status` reports the connection state, and `help` lists commands.
 Menu 650 remains persistent and must be set to Off on the radio before this
 USB port returns to CAT.
+
+Normal shutdown finishes the modem task, recovers the selected transport from
+its stream adapter, and closes it. Startup failures follow the same cleanup
+path once a modem task exists. Cleanup errors remain visible alongside the
+original failure; lost ownership is never reported as a successful close.
+There is no automatic reopen, CAT fallback, or persistent-mode exit command.
 
 The manual states that the interface assigned to DV Gateway does not accept
 PC commands while gateway mode is active. The read-only MCP backup's fresh-CAT
@@ -883,7 +902,8 @@ are never truncated.
 | Windows | `%LOCALAPPDATA%\tmd750-repl\logs\` |
 
 `RUST_LOG` independently enables diagnostic output on stderr, for example
-`RUST_LOG=kenwood_tmd750=trace`. It does not enable a file log. Logs can contain
+`RUST_LOG=kenwood_tmd750=trace,kenwood_transport=trace` includes model diagnostics
+and raw physical transport traffic. It does not enable a file log. Logs can contain
 callsigns, addresses, and radio traffic; review them before sharing. There is
 no automatic retention policy, so remove old logs when you no longer need them.
 

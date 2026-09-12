@@ -5,8 +5,9 @@ use std::io;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 
-use kenwood_tmd750::transport::{KENWOOD_VID, MockTransport, TMD750_MAIN_PID};
+use kenwood_tmd750::transport::{KENWOOD_VID, TMD750_MAIN_PID};
 use kenwood_tmd750::{FirmwareIdentity, RadioModel, RadioType};
+use kenwood_transport::MockTransport;
 use serde_json::{Value, json};
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;

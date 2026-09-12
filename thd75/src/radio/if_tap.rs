@@ -30,10 +30,10 @@
 //! [`Radio::restore_if_tap`].
 
 use crate::error::{Error, ProtocolError};
-use crate::transport::Transport;
 use crate::types::{
     Band, BandMode, Frequency, OperatingMode, SquelchLevel, StepSize, TuningMode, UsbAudioOutput,
 };
+use kenwood_transport::Transport;
 
 use super::Radio;
 
@@ -660,7 +660,7 @@ fn verify_if_tap_write<Value: std::fmt::Debug + PartialEq>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::MockTransport;
+    use kenwood_transport::MockTransport;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 

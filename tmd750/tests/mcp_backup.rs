@@ -1,6 +1,5 @@
 //! Fixed-region backup coverage, partial evidence, and detached lifecycle safety.
 
-use kenwood_thd75 as _;
 use mcp_d75_extract as _;
 use thiserror as _;
 use tokio_serial as _;
@@ -11,11 +10,11 @@ use std::io;
 use std::time::Duration;
 
 use kenwood_tmd750::protocol::mcp::{ACK, read_request, write_request};
-use kenwood_tmd750::transport::{MockTransport, Transport, TransportError};
 use kenwood_tmd750::{
     Error, McpBackupOutcome, McpBackupReport, McpBackupStage, McpError, McpProbeExit, Page,
     Progress, Radio, Region, ValidationError,
 };
+use kenwood_transport::{MockTransport, Transport, TransportError};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 

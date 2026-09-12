@@ -1,7 +1,8 @@
 //! Probe: does SF use hex or decimal for step values >= 10?
 //! Sets step to 50kHz (index 10), reads back, checks if response is "A" or "10".
 use kenwood_thd75::protocol::Codec;
-use kenwood_thd75::transport::{EitherTransport, SerialTransport, Transport};
+use kenwood_thd75::transport::{EitherTransport, SerialTransport};
+use kenwood_transport::Transport;
 
 fn open_transport() -> (String, EitherTransport) {
     if let Ok(ports) = SerialTransport::discover_usb() {

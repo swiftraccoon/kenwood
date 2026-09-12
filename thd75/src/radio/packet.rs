@@ -6,8 +6,8 @@
 
 use crate::error::{Error, ProtocolError};
 use crate::protocol::{Command, Response};
-use crate::transport::Transport;
 use crate::types::{TncControlMode, TncDataBand, TncState};
+use kenwood_transport::Transport;
 
 use super::Radio;
 

@@ -15,10 +15,10 @@ use std::time::Duration;
 
 use crate::error::{Error, McpError, ProtocolError};
 use crate::protocol::cat::{Command, LINE_TERMINATOR, Response, parse_line};
-use crate::transport::{Transport, TransportError};
 use crate::types::{
     Band, DvGatewayMode, FirmwareIdentity, OperatingMode, RadioModel, RadioType, SelectableMode,
 };
+use kenwood_transport::{Transport, TransportError};
 
 pub use programming::{McpJournal, McpSession, McpWriteReport, RecoveryReport, RegionImage};
 

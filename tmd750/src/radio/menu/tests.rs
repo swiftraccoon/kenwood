@@ -10,8 +10,8 @@ use crate::memory::{
     PatchPlanner, SLOT_TERM, menu_field,
 };
 use crate::protocol::mcp::{ACK, read_request, write_request};
-use crate::transport::MockTransport;
 use crate::{Radio, Region};
+use kenwood_transport::MockTransport;
 
 type TestError = Box<dyn std::error::Error>;
 type TestResult = Result<(), TestError>;

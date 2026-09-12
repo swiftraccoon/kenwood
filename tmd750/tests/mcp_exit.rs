@@ -1,6 +1,5 @@
 //! Every MCP exit retires the original handle and requires fresh CAT verification.
 
-use kenwood_thd75 as _;
 use mcp_d75_extract as _;
 use thiserror as _;
 use tokio_serial as _;
@@ -10,11 +9,11 @@ use std::io;
 use std::time::Duration;
 
 use kenwood_tmd750::protocol::mcp::{ACK, BytePatch, EXIT, PagePatch, read_request, write_request};
-use kenwood_tmd750::transport::{MockTransport, Transport, TransportError};
 use kenwood_tmd750::{
     Address, Error, McpError, McpProbeExit, McpProbeOutcome, McpProbeStage, Page, ProtocolError,
     Radio,
 };
+use kenwood_transport::{MockTransport, Transport, TransportError};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 

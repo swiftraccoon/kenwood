@@ -23,7 +23,8 @@
               how to run the probe, which is the documentation that matters here."
 )]
 
-use kenwood_thd75::transport::{EitherTransport, Transport};
+use kenwood_thd75::transport::EitherTransport;
+use kenwood_transport::Transport;
 use std::time::Duration;
 
 fn main() {

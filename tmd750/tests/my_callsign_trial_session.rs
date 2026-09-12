@@ -1,6 +1,5 @@
 //! Fixed MY1 wire scope and guards, using no hardware or radio discovery.
 
-use kenwood_thd75 as _;
 use mcp_d75_extract as _;
 use thiserror as _;
 use tokio_serial as _;
@@ -16,12 +15,12 @@ use kenwood_tmd750::memory::{
     MyCallsignTrial, PmNameTrialError, PmNameTrialSession, PmNameTrialStatus, PmNameTrialWrite,
 };
 use kenwood_tmd750::protocol::mcp::{ACK, read_request, write_request};
-use kenwood_tmd750::transport::{MockTransport, Transport, TransportError};
 use kenwood_tmd750::{
     Address, DvGatewayMode, Error, FirmwareIdentity, Identity, McpError, McpProbeExit, Page,
     PmNameTrialSessionError, PmNameTrialSessionOutcome, PmNameTrialSessionReport,
     PmNameTrialSessionStage, PmNameTrialWriteDisposition, Radio, RadioModel, RadioType,
 };
+use kenwood_transport::{MockTransport, Transport, TransportError};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 

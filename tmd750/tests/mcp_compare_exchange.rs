@@ -1,6 +1,5 @@
 //! Public complete-page compare-and-exchange behavior with simulated transports.
 
-use kenwood_thd75 as _;
 use mcp_d75_extract as _;
 use thiserror as _;
 use tokio_serial as _;
@@ -16,8 +15,8 @@ use std::time::Duration;
 
 use kenwood_tmd750::protocol::mcp::{ACK, read_request, write_request};
 use kenwood_tmd750::radio::programming::{McpJournal, PageReplacement};
-use kenwood_tmd750::transport::{MockTransport, Transport, TransportError};
 use kenwood_tmd750::{Address, Error, McpError, Page, Progress, Radio};
+use kenwood_transport::{MockTransport, Transport, TransportError};
 
 type TestError = Box<dyn std::error::Error>;
 type TestResult = Result<(), TestError>;

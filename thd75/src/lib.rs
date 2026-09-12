@@ -90,8 +90,8 @@
 //! - **`dstar`** enables the D-STAR reflector-gateway stack: the [`dstar_gateway`]
 //!   module ([`DstarGateway`]) and the [`MmdvmSession`] modem session over
 //!   the tokio `mmdvm` crate. The Menu 650 terminal-mode lifecycle, MMDVM
-//!   link diagnosis, and CAT D-STAR settings are always available (they
-//!   need only the sans-io `mmdvm-core`).
+//!   link diagnosis, and CAT D-STAR settings are always available. Diagnosis
+//!   enables only `mmdvm`'s bounded probe, not its spawned modem runtime.
 
 #[cfg(feature = "aprs")]
 pub mod aprs;
@@ -123,8 +123,6 @@ use serde_json as _;
 use aprs_is as _;
 #[cfg(all(test, not(feature = "aprs")))]
 use kiss_tnc as _;
-#[cfg(all(test, not(feature = "dstar")))]
-use mmdvm as _;
 
 // Convenience re-exports for the most commonly used types.
 pub use error::Error;
@@ -139,7 +137,7 @@ pub use radio::terminal_mode::{TerminalModeTransition, TerminalModeTransitionErr
 pub use radio::{DesyncedRadio, FirmwareProfile, Radio};
 #[cfg(target_os = "macos")]
 pub use transport::{BluetoothOpenCancellation, BluetoothTransport, PairedBluetoothDevice};
-pub use transport::{EitherTransport, MockTransport, SerialTransport, Transport};
+pub use transport::{EitherTransport, SerialTransport};
 pub use types::{
     ChannelDisplayName, FirmwareIdentity, HardwareVariant, ModelCode, RadioModel, RadioRegion,
     RadioType, RegularChannel, SerialInformation, SerialNumber,
@@ -195,17 +193,10 @@ pub use radio::mmdvm_session::MmdvmSession;
 // Link-recovery policy.
 pub use session::ReconnectPolicy;
 
-// D-STAR gateway re-exports. Raw codec types live in mmdvm-core; the
-// async event loop lives in mmdvm. The types re-exported here
-// compose those crates into the D-STAR-specific surface
-// TH-D75 consumers use.
+// Only model-owned lifecycle types are exported here. Shared runtime and
+// protocol types are imported directly from their defining crates.
 #[cfg(feature = "dstar")]
-pub use dstar_gateway::{
-    DstarEvent, DstarGateway, DstarGatewayConfig, DstarHeader, DstarProtocolViolation,
-    DstarStatusReflector, DstarStatusReflectorError, LastHeardEntry, MmdvmError, ModemMode,
-    ModemStatus, NakReason, ObservedDstarCallsign, PersistentMmdvm, SlowDataTextMessage,
-    TransientMmdvm, WireTextError,
-};
+pub use dstar_gateway::{DstarGateway, PersistentMmdvm, TransientMmdvm};
 
 // SD card re-exports.
 pub use sdcard::SdCardError;

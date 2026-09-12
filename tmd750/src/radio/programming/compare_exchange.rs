@@ -6,8 +6,8 @@ use super::{McpSession, Progress};
 use crate::error::{Error, McpError};
 use crate::protocol::mcp::regions;
 use crate::radio::menu::{MenuUpdateError, MenuUpdatePlan};
-use crate::transport::Transport;
 use crate::types::Page;
+use kenwood_transport::Transport;
 
 /// Immutable expected and desired bytes for one canonical writable page.
 ///

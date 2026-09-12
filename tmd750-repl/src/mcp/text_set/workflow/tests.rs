@@ -9,10 +9,9 @@ use std::time::Duration;
 
 use kenwood_tmd750::memory::{Pm1Name, Pm1NameUpdate, Pm1NameUpdateStatus};
 use kenwood_tmd750::protocol::mcp::{ACK, read_request, write_request};
-use kenwood_tmd750::transport::{
-    KENWOOD_VID, MockTransport, TMD750_MAIN_PID, Transport, TransportError,
-};
+use kenwood_tmd750::transport::{KENWOOD_VID, TMD750_MAIN_PID};
 use kenwood_tmd750::{Address, FirmwareIdentity, Identity, Page, RadioModel, RadioType};
+use kenwood_transport::{MockTransport, Transport, TransportError};
 
 use super::*;
 use crate::mcp::capture::{Artifacts, create_private_file};

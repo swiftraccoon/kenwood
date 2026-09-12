@@ -102,6 +102,11 @@ dstar> unlink
 dstar> dstar stop
 ```
 
+Startup validates the station identity and reflector before changing radio mode.
+TH-D75 mode entry and restoration remain in `kenwood-thd75`; the shared
+`mmdvm::dstar` runtime handles modem initialization, frame queues, and events.
+Voice remains raw AMBE throughout the relay. The command syntax is unchanged.
+
 ## Logging
 
 By default no log file is created and no tracing output is written;
@@ -129,7 +134,7 @@ For live stderr output (power users, no file), set `RUST_LOG`:
 
 ```
 RUST_LOG=dstar_gateway=debug thd75-repl
-RUST_LOG=dstar_gateway=trace,kenwood_thd75::slow_data=debug thd75-repl
+RUST_LOG=dstar_gateway=trace,mmdvm::dstar=debug thd75-repl
 ```
 
 `RUST_LOG` and `--log-level` are independent: you can combine them

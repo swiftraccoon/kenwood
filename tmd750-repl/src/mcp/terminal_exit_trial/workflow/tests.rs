@@ -14,10 +14,9 @@ use std::time::Duration;
 
 use kenwood_tmd750::memory::{TerminalExitTrial, TerminalExitTrialStatus};
 use kenwood_tmd750::protocol::mcp::{ACK, read_request, write_request};
-use kenwood_tmd750::transport::{
-    KENWOOD_VID, MockTransport, SerialCandidate, TMD750_MAIN_PID, Transport, TransportError,
-};
+use kenwood_tmd750::transport::{KENWOOD_VID, SerialCandidate, TMD750_MAIN_PID};
 use kenwood_tmd750::{Address, FirmwareIdentity, Identity, Page, RadioModel, RadioType};
+use kenwood_transport::{MockTransport, Transport, TransportError};
 
 use super::super::journal::Journal;
 use super::{SessionCaptures, WorkflowResult, run};

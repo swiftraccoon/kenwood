@@ -2,8 +2,8 @@
 
 use kenwood_thd75::error::Error;
 use kenwood_thd75::radio::{FirmwareProfile, Radio};
-use kenwood_thd75::transport::MockTransport;
 use kenwood_thd75::types::{NmeaSentence, NmeaSentences};
+use kenwood_transport::MockTransport;
 
 // Deps visible to every kenwood-thd75 test target but unused here.
 // Acknowledged so `unused_crate_dependencies` stays silent without

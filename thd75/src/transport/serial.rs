@@ -31,13 +31,15 @@
 //! [`open`](SerialTransport::open) uses the standard USB rate, while
 //! [`open_with_baud`](SerialTransport::open_with_baud) accepts an explicit
 //! USB rate. Both auto-detect BT ports and apply the required BT settings.
+//! Byte I/O and descriptor ownership are delegated to `kenwood-transport`;
+//! TH-D75 discovery, line presets, and identity-preserving reopen remain here.
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio_serial::{FlowControl, SerialPort, SerialStream};
+use std::num::NonZeroU32;
 
-use crate::error::TransportError;
-
-use super::Transport;
+use kenwood_transport::serial::{
+    CloseMode, FlowControl, LineState, SerialOptions, SerialTransport as SerialEndpoint,
+};
+use kenwood_transport::{Transport, TransportError};
 
 /// Baud rate for Bluetooth SPP connections.
 const BT_BAUD: u32 = 9600;
@@ -50,19 +52,16 @@ const BT_BAUD: u32 = 9600;
 /// - Windows: `COM*` for both
 #[derive(Debug)]
 pub struct SerialTransport {
-    /// Present while the endpoint is open. `None` is a deliberate
-    /// disconnected state used while reopening: the old descriptor must be
-    /// dropped before an exclusive replacement can be opened.
-    port: Option<SerialStream>,
-    /// Whether the underlying path is a Bluetooth SPP port (detected
-    /// at open time). BT ports must not be shut down explicitly.
+    /// Model-neutral descriptor owner; closing releases it before reopening.
+    endpoint: SerialEndpoint,
+    /// Bluetooth SPP classification, inferred from the initial path or
+    /// selected explicitly. BT ports must not be shut down explicitly.
     is_bluetooth: bool,
-    /// The path this transport was opened at, the reopen fallback
-    /// when USB discovery finds nothing.
+    /// The caller-selected path, retained as the anchor for identity-aware
+    /// USB selection or the fixed Bluetooth endpoint.
     path: String,
-    /// The effective baud currently configured. Tracked so a reopen
-    /// mid-session (e.g. during MCP programming at 9600) comes back
-    /// at the speed the radio is actually speaking.
+    /// Last successfully applied host baud. A USB reopen preserves it;
+    /// Bluetooth reopens reapply the fixed Bluetooth profile.
     baud: u32,
     /// Stable USB identity captured from enumeration. Reopen uses this
     /// instead of selecting the first radio with the same VID/PID.
@@ -230,6 +229,17 @@ fn select_usb_reopen_path(
     Err("the selected USB radio could not be identified after re-enumeration".to_string())
 }
 
+/// Preserve the original classification when opening a replacement handle.
+/// An opaque `COM` path cannot reconstruct explicit Bluetooth selection.
+fn open_replacement<T>(
+    path: &str,
+    baud: u32,
+    is_bluetooth: bool,
+    open: impl FnOnce(&str, u32, bool) -> Result<T, TransportError>,
+) -> Result<T, TransportError> {
+    open(path, baud, is_bluetooth)
+}
+
 impl SerialTransport {
     /// Default baud rate for USB CDC ACM.
     pub const DEFAULT_BAUD: u32 = 115_200;
@@ -251,13 +261,36 @@ impl SerialTransport {
             || (lower.contains("bluetooth") && !lower.contains("incoming"))
     }
 
-    fn connection_settings(path: &str, requested_baud: u32) -> (bool, u32, FlowControl) {
-        let is_bluetooth = Self::is_bluetooth_port(path);
-        if is_bluetooth {
-            (true, BT_BAUD, FlowControl::Hardware)
+    fn serial_options(
+        requested_baud: u32,
+        is_bluetooth: bool,
+    ) -> Result<SerialOptions, std::io::Error> {
+        let actual_baud = if is_bluetooth {
+            BT_BAUD
         } else {
-            (false, requested_baud, FlowControl::None)
-        }
+            requested_baud
+        };
+        let baud = NonZeroU32::new(actual_baud).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "serial baud rate must be nonzero",
+            )
+        })?;
+        Ok(SerialOptions {
+            baud,
+            flow_control: if is_bluetooth {
+                FlowControl::Hardware
+            } else {
+                FlowControl::None
+            },
+            dtr: LineState::Preserve,
+            rts: LineState::Preserve,
+            close_mode: if is_bluetooth {
+                CloseMode::Drop
+            } else {
+                CloseMode::Shutdown
+            },
+        })
     }
 
     /// Open a serial port by path.
@@ -283,12 +316,11 @@ impl SerialTransport {
     ///
     /// # Errors
     ///
-    /// Returns [`TransportError::Open`] if the port cannot be opened, or if
-    /// no tokio runtime is active on the calling thread (the opened stream
-    /// must register with a tokio reactor).
+    /// Returns [`TransportError::Open`] if the port cannot be opened, the
+    /// effective baud rate is zero, or no Tokio runtime is active on the
+    /// calling thread. Opening requires an I/O-enabled Tokio reactor.
     pub fn open_with_baud(path: &str, baud: u32) -> Result<Self, TransportError> {
-        let (is_bluetooth, _, _) = Self::connection_settings(path, baud);
-        Self::open_classified(path, baud, is_bluetooth)
+        Self::open_classified(path, baud, Self::is_bluetooth_port(path))
     }
 
     /// Open a serial endpoint explicitly known to be Bluetooth SPP.
@@ -310,52 +342,30 @@ impl SerialTransport {
         requested_baud: u32,
         is_bluetooth: bool,
     ) -> Result<Self, TransportError> {
-        // tokio-serial registers the opened stream with the active tokio
-        // reactor and panics when none exists; refuse with a typed error
-        // first so callers on plain threads get a normal failure path.
-        if tokio::runtime::Handle::try_current().is_err() {
-            return Err(TransportError::Open {
+        let options = Self::serial_options(requested_baud, is_bluetooth).map_err(|source| {
+            TransportError::Open {
                 path: path.to_owned(),
-                source: std::io::Error::other(
-                    "no tokio runtime is active on this thread; open the serial transport \
-                     from inside a tokio runtime (for example under `Runtime::enter`)",
-                ),
-            });
-        }
-        let (is_bt, actual_baud, flow) = if is_bluetooth {
-            (true, BT_BAUD, FlowControl::Hardware)
-        } else {
-            (false, requested_baud, FlowControl::None)
-        };
-
-        tracing::info!(
-            path = %path,
-            baud = actual_baud,
-            bluetooth = is_bt,
-            flow_control = ?flow,
-            "opening serial port"
-        );
-
-        let builder = tokio_serial::new(path, actual_baud).flow_control(flow);
-        #[cfg(unix)]
-        let builder = builder.exclusive(true);
-        let port = SerialStream::open(&builder).map_err(|e| TransportError::Open {
-            path: path.to_owned(),
-            source: e.into(),
+                source,
+            }
         })?;
-        let usb_identity = if is_bt {
+        tracing::debug!(
+            path,
+            bluetooth = is_bluetooth,
+            "selected TH-D75 serial policy"
+        );
+        let endpoint = SerialEndpoint::open(path, options)?;
+        let usb_identity = if is_bluetooth {
             None
         } else {
             Self::discover_usb()
                 .ok()
                 .and_then(|ports| capture_usb_identity(&usb_candidates(&ports), path))
         };
-        tracing::info!(path = %path, "serial port opened successfully");
         Ok(Self {
-            port: Some(port),
-            is_bluetooth: is_bt,
+            endpoint,
+            is_bluetooth,
             path: path.to_owned(),
-            baud: actual_baud,
+            baud: options.baud.get(),
             usb_identity,
         })
     }
@@ -425,69 +435,21 @@ impl SerialTransport {
 
 impl Transport for SerialTransport {
     fn set_baud_rate(&mut self, baud: u32) -> Result<(), TransportError> {
-        tracing::info!(baud, "changing serial baud rate");
-        self.port
-            .as_mut()
-            .ok_or_else(|| {
-                TransportError::Disconnected(std::io::Error::new(
-                    std::io::ErrorKind::NotConnected,
-                    "serial endpoint is closed",
-                ))
-            })?
-            .set_baud_rate(baud)
-            .map_err(|e| TransportError::Open {
-                path: String::new(),
-                source: std::io::Error::other(e.to_string()),
-            })?;
+        self.endpoint.set_baud_rate(baud)?;
         self.baud = baud;
         Ok(())
     }
 
     async fn write(&mut self, data: &[u8]) -> Result<(), TransportError> {
-        tracing::debug!(bytes = data.len(), "writing to transport");
-        tracing::trace!(raw = ?data, "raw bytes sent");
-        let port = self.port.as_mut().ok_or_else(|| {
-            TransportError::Write(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "serial endpoint is closed",
-            ))
-        })?;
-        port.write_all(data).await.map_err(TransportError::Write)?;
-        port.flush().await.map_err(TransportError::Write)?;
-        Ok(())
+        self.endpoint.write(data).await
     }
 
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
-        let port = self.port.as_mut().ok_or_else(|| {
-            TransportError::Read(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "serial endpoint is closed",
-            ))
-        })?;
-        let n = port.read(buf).await.map_err(TransportError::Read)?;
-        tracing::debug!(bytes = n, "read from transport");
-        if let Some(chunk) = buf.get(..n) {
-            tracing::trace!(raw = ?chunk, "raw bytes received");
-        }
-        Ok(n)
+        self.endpoint.read(buf).await
     }
 
     async fn close(&mut self) -> Result<(), TransportError> {
-        tracing::info!("closing serial transport");
-        let Some(mut port) = self.port.take() else {
-            return Ok(());
-        };
-        // A serial Bluetooth SPP endpoint has no meaningful UART shutdown
-        // operation. Releasing its descriptor is the complete ownership
-        // handoff; only physical serial devices get an explicit shutdown.
-        if self.is_bluetooth {
-            tracing::debug!("Bluetooth SPP port: skipping shutdown, dropping FD instead");
-            return Ok(());
-        }
-        port.shutdown()
-            .await
-            .map_err(TransportError::Disconnected)?;
-        Ok(())
+        self.endpoint.close().await
     }
 
     async fn reopen(&mut self) -> Result<(), TransportError> {
@@ -522,7 +484,8 @@ impl Transport for SerialTransport {
         // Bluetooth SPP paths are stable device nodes. USB paths were
         // selected above against the identity captured at the initial open;
         // an unqualified non-Bluetooth endpoint is deliberately not reopened.
-        let mut fresh = Self::open_with_baud(&path, self.baud)?;
+        let mut fresh =
+            open_replacement(&path, self.baud, self.is_bluetooth, Self::open_classified)?;
         if let Some(identity) = original_identity {
             if identity.serial_number.is_some()
                 && fresh
@@ -608,21 +571,64 @@ mod tests {
     }
 
     #[test]
-    fn explicit_usb_baud_is_preserved_without_flow_control() {
-        let (is_bluetooth, baud, flow) =
-            SerialTransport::connection_settings("/dev/cu.usbmodem1101", 57_600);
-        assert!(!is_bluetooth);
-        assert_eq!(baud, 57_600);
-        assert!(matches!(flow, FlowControl::None));
+    fn explicit_usb_baud_is_preserved_without_flow_control()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let options = SerialTransport::serial_options(57_600, false)?;
+        assert_eq!(options.baud.get(), 57_600);
+        assert_eq!(options.flow_control, FlowControl::None);
+        assert_eq!(options.dtr, LineState::Preserve);
+        assert_eq!(options.rts, LineState::Preserve);
+        assert_eq!(options.close_mode, CloseMode::Shutdown);
+        Ok(())
     }
 
     #[test]
-    fn bluetooth_overrides_requested_baud_and_enables_hardware_flow_control() {
-        let (is_bluetooth, baud, flow) =
-            SerialTransport::connection_settings("/dev/cu.TH-D75", 230_400);
-        assert!(is_bluetooth);
-        assert_eq!(baud, BT_BAUD);
-        assert!(matches!(flow, FlowControl::Hardware));
+    fn bluetooth_overrides_requested_baud_and_enables_hardware_flow_control()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for requested_baud in [0, 230_400] {
+            let options = SerialTransport::serial_options(requested_baud, true)?;
+            assert_eq!(options.baud.get(), BT_BAUD);
+            assert_eq!(options.flow_control, FlowControl::Hardware);
+            assert_eq!(options.dtr, LineState::Preserve);
+            assert_eq!(options.rts, LineState::Preserve);
+            assert_eq!(options.close_mode, CloseMode::Drop);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn zero_usb_baud_fails_before_open() -> Result<(), Box<dyn std::error::Error>> {
+        let result = SerialTransport::open_with_baud("test-endpoint", 0);
+        let Err(TransportError::Open { path, source }) = result else {
+            return Err(format!("expected a typed open error, got {result:?}").into());
+        };
+        assert_eq!(path, "test-endpoint");
+        assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput);
+        Ok(())
+    }
+
+    #[test]
+    fn opaque_bluetooth_reopen_keeps_explicit_classification()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert!(!SerialTransport::is_bluetooth_port("COM3"));
+        let options = open_replacement("COM3", 230_400, true, |path, baud, bluetooth| {
+            assert_eq!(path, "COM3");
+            assert_eq!(baud, 230_400);
+            assert!(
+                bluetooth,
+                "reopen discarded explicit Bluetooth classification"
+            );
+            SerialTransport::serial_options(baud, bluetooth).map_err(|source| {
+                TransportError::Open {
+                    path: path.to_owned(),
+                    source,
+                }
+            })
+        })?;
+        assert_eq!(options.baud.get(), BT_BAUD);
+        assert_eq!(options.flow_control, FlowControl::Hardware);
+        assert_eq!(options.close_mode, CloseMode::Drop);
+        Ok(())
     }
 
     fn usb_candidate(path: &str, serial_number: Option<&str>) -> UsbCandidate {

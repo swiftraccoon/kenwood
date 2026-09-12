@@ -2,7 +2,8 @@
 //! Run: cargo test --test channel_scan -- --ignored --nocapture --test-threads=1
 
 use kenwood_thd75::protocol::Codec;
-use kenwood_thd75::transport::{SerialTransport, Transport};
+use kenwood_thd75::transport::SerialTransport;
+use kenwood_transport::Transport;
 
 #[tokio::test]
 #[ignore]

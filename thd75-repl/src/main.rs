@@ -45,15 +45,14 @@ use kenwood_thd75::memory::{
 };
 use kenwood_thd75::radio::programming::DetachedMcpPageUpdate;
 use kenwood_thd75::transport::EitherTransport;
-use kenwood_thd75::types::{
-    DstarCallsign, DvGatewayMode, FirmwareIdentity, PcOutputInterface, RadioModel, TncDataBand,
-};
+use kenwood_thd75::types::{DvGatewayMode, FirmwareIdentity, PcOutputInterface, RadioModel};
 use kenwood_thd75::{
     AprsClient, AprsClientConfig, AprsEvent, AprsReportTimestamp, Ax25Address, DigipeaterConfig,
     IGateRfLocality, IGateToRfConfig, MessageAddressee, MessageText, StatusText,
 };
-use kenwood_thd75::{DstarEvent, DstarGateway, DstarGatewayConfig, PersistentMmdvm};
+use kenwood_thd75::{DstarGateway, PersistentMmdvm};
 use kenwood_thd75::{FirmwareProfile, Radio};
+use mmdvm::dstar::{DstarEvent, DstarModemConfig, ObservedDstarCallsign};
 
 use dstar_gateway::auth::AuthClient;
 use dstar_gateway::tokio_shell::{AnyAsyncSession, AnyEvent, AsyncSession, ShellError};
@@ -3069,7 +3068,7 @@ async fn start_dstar_repl(
 
 struct DstarStartRequest {
     callsign: String,
-    gateway_callsign: DstarCallsign,
+    modem_config: DstarModemConfig,
     network_callsign: Callsign,
     link: Option<LinkArg>,
 }
@@ -3085,10 +3084,9 @@ fn parse_dstar_start(args: &[&str]) -> Result<DstarStartRequest, String> {
 
     // Callsigns are upper-case on D-STAR headers and DPlus authentication.
     let callsign = raw_callsign.to_ascii_uppercase();
-    let gateway_callsign = DstarCallsign::new(&callsign)
-        .map_err(|error| format!("Invalid station callsign {callsign}: {error}"))?;
-    let network_callsign = Callsign::try_from_str(gateway_callsign.as_str())
-        .map_err(|error| format!("Invalid network callsign {callsign}: {error}"))?;
+    let modem_config = DstarModemConfig::new(&callsign)
+        .map_err(|error| format!("Invalid station callsign {callsign:?}: {error}"))?;
+    let network_callsign = modem_config.callsign();
     let link = args
         .get(1)
         .map(|reflector| reflector.to_ascii_uppercase())
@@ -3098,7 +3096,7 @@ fn parse_dstar_start(args: &[&str]) -> Result<DstarStartRequest, String> {
 
     Ok(DstarStartRequest {
         callsign,
-        gateway_callsign,
+        modem_config,
         network_callsign,
         link,
     })
@@ -3163,7 +3161,7 @@ async fn enter_dstar(
     };
     let DstarStartRequest {
         callsign,
-        gateway_callsign,
+        modem_config,
         network_callsign: callsign_typed,
         link: link_arg,
     } = request;
@@ -3173,9 +3171,7 @@ async fn enter_dstar(
     // Radio is now in MMDVM mode. Start the gateway.
     println!("Starting D-STAR gateway as {callsign}.");
 
-    // Preserve the TH-D75 AZM transient-gateway wire choice `TN 3,1`.
-    let config = DstarGatewayConfig::new(gateway_callsign, TncDataBand::B);
-    let gateway = match DstarGateway::start_gateway_mode(radio, config).await {
+    let gateway = match DstarGateway::start_gateway_mode(radio, modem_config).await {
         Ok(gw) => gw,
         Err((radio, error)) => {
             return Err((
@@ -3942,9 +3938,9 @@ async fn emit_silence_pad_if_needed(session: &mut DstarSession) {
     tracing::trace!(
         target: "thd75_repl::hang_hunt",
         pad_no,
-        "emit_silence_pad: awaiting send_voice_unpaced"
+        "emit_silence_pad: awaiting send_voice"
     );
-    if let Err(e) = session.gateway.send_voice_unpaced(&pad_frame).await {
+    if let Err(e) = session.gateway.send_voice(&pad_frame).await {
         tracing::warn!(
             target: "thd75_repl::reflector",
             error = %e,
@@ -3990,9 +3986,8 @@ const MAX_EVENTS_PER_CYCLE: usize = 24;
 /// dropping the receive popup. Observed live on REF030 C with 85 ms
 /// gaps between BT write bursts mid-stream; confirmed in the trace
 /// log at `kenwood_thd75::transport::bluetooth::inner: BT write`
-/// timestamps. With inline processing, each frame is handed off to
-/// the paced `send_voice` immediately, so the modem sees a steady
-/// 20 ms cadence with no >20 ms gaps inside a stream.
+/// timestamps. Inline processing hands each frame to `send_voice` immediately;
+/// the modem runtime schedules queued writes against its reported buffer space.
 async fn dstar_poll_cycle(session: &mut DstarSession) {
     // Matches the legacy `ReflectorClient::poll` 100 ms inner recv
     // timeout, which gives the reflector session task a short window to
@@ -4100,7 +4095,7 @@ async fn dstar_poll_cycle(session: &mut DstarSession) {
     // already-buffered events with zero wait, subsequent calls
     // wait briefly in case a 20 ms-paced frame arrives mid-drain,
     // and the loop exits as soon as the queue runs dry.
-    let saved_timeout = session.gateway.event_timeout();
+    let saved_timeout = session.gateway.modem().event_timeout();
     session
         .gateway
         .set_event_timeout(std::time::Duration::from_millis(5));
@@ -4213,7 +4208,7 @@ async fn dispatch_dstar(session: &mut DstarSession, cmd: &str, parts: &[&str]) {
             }
         }
         "heard" => {
-            let list = session.gateway.last_heard();
+            let list = session.gateway.modem().last_heard();
             if list.is_empty() {
                 println!("No stations heard yet.");
             } else {
@@ -4317,7 +4312,7 @@ fn render_invalid_wire_bytes(bytes: &[u8], error: dstar_gateway_core::WireTextEr
     format!("<invalid {hexadecimal}: {error}>")
 }
 
-fn render_gateway_callsign(callsign: impl Into<kenwood_thd75::ObservedDstarCallsign>) -> String {
+fn render_gateway_callsign(callsign: impl Into<ObservedDstarCallsign>) -> String {
     let callsign = callsign.into();
     callsign.text().map_or_else(
         |error| render_invalid_wire_bytes(callsign.as_bytes(), error),
@@ -4519,7 +4514,7 @@ async fn echo_playback_tick(session: &mut DstarSession) {
 
     // Play back each frame with 20ms pacing.
     for frame in &playback.frames {
-        if let Err(e) = session.gateway.send_voice_unpaced(frame).await {
+        if let Err(e) = session.gateway.send_voice(frame).await {
             println!("Echo playback error: voice: {e}");
             break;
         }
@@ -4607,7 +4602,7 @@ fn build_radio_header(
 
 /// Relay a reflector event to the radio MMDVM modem.
 async fn relay_reflector_to_radio(session: &mut DstarSession, event: &RuntimeEvent) {
-    let gw = &mut session.gateway;
+    let gateway = &mut session.gateway;
     match event {
         RuntimeEvent::VoiceStart {
             header, stream_id, ..
@@ -4663,7 +4658,7 @@ async fn relay_reflector_to_radio(session: &mut DstarSession, event: &RuntimeEve
                 flag1 = format_args!("{:#04x}", radio_header.flag1),
                 "relay → radio: header"
             );
-            if let Err(e) = gw.send_header(&radio_header).await {
+            if let Err(e) = gateway.send_header(&radio_header).await {
                 println!(
                     "{}",
                     thd75_repl::output::error(format_args!("relaying header to radio: {e}"))
@@ -4700,43 +4695,12 @@ async fn relay_reflector_to_radio(session: &mut DstarSession, event: &RuntimeEve
                 session.rx_last_slow_text = Some(bytes);
             }
 
-            // Use send_voice_unpaced: no host-side pacing. The
-            // correct pattern per `MMDVMHost/Modem.cpp:1049` is
-            // to query the modem's `dstarSpace` status field and
-            // only write when the modem reports buffer room,
-            // letting the modem's own buffer state drive the rate.
-            // We don't yet implement that status-polling loop, so
-            // the second-best option is to let the BT kernel
-            // buffer + 9600 baud UART backpressure naturally
-            // rate-limit our writes.
-            //
-            // Host-side 20 ms pacing is wrong because DPlus
-            // delivers 21 voice packets per ~440 ms superframe
-            // (~47.7 fps, since there's an extra header packet slot
-            // each superframe) while the modem's internal AMBE
-            // decoder consumes at exactly 50 fps. A ~2 ms/frame
-            // shortfall drains the modem's 10-slot buffer after
-            // roughly 2 seconds of continuous audio, then every
-            // subsequent write hits an empty buffer → constant
-            // underrun-driven stutter. Writing as fast as BT
-            // accepts (≈64 fps on 9600 baud) is much closer to
-            // the modem's expected 50 fps consumption rate.
-            //
-            // The REPL's inline event processing in
-            // [`dstar_poll_cycle`] means each reflector frame
-            // flows immediately from UDP → decode → BT write.
-            // There's no drain-then-process batching any more, so
-            // the original reason to pace (avoid bursting a full
-            // superframe followed by 400 ms idle) no longer
-            // applies.
-            //
-            // The mmdvm crate already implements MMDVMHost-style
-            // periodic status polling and gates its TxQueue drain on
-            // `ModemStatus::dstar_space`, so this path is effectively
-            // as close to the reference behavior as we can get.
-            tracing::trace!(target: "thd75_repl::hang_hunt", "relay VoiceFrame: awaiting send_voice_unpaced");
-            let relay_result = gw.send_voice_unpaced(frame).await;
-            tracing::trace!(target: "thd75_repl::hang_hunt", "relay VoiceFrame: send_voice_unpaced returned");
+            // Submit frames without an additional host-side timer. The modem
+            // runtime polls status and gates its transmit queue on reported
+            // D-STAR buffer space, following `MMDVMHost/Modem.cpp:1049`.
+            tracing::trace!(target: "thd75_repl::hang_hunt", "relay VoiceFrame: awaiting send_voice");
+            let relay_result = gateway.send_voice(frame).await;
+            tracing::trace!(target: "thd75_repl::hang_hunt", "relay VoiceFrame: send_voice returned");
             match relay_result {
                 Ok(()) => {
                     // Arm the silence-padding timer: remember this
@@ -4790,7 +4754,7 @@ async fn relay_reflector_to_radio(session: &mut DstarSession, event: &RuntimeEve
             // EOT closes the stream, and that the relay is calling
             // `send_eot` (not silently failing earlier in the path).
             tracing::trace!(target: "thd75_repl::reflector", "relay → radio: EOT");
-            if let Err(e) = gw.send_eot().await {
+            if let Err(e) = gateway.send_eot().await {
                 println!(
                     "{}",
                     thd75_repl::output::error(format_args!(
@@ -5087,7 +5051,7 @@ fn print_dstar_event(event: &DstarEvent) {
             aprintln!("{}", thd75_repl::output::dstar_station_heard(&callsign));
         }
         DstarEvent::UrCallCommand(action) => {
-            use kenwood_thd75::types::UrCallAction;
+            use dstar_gateway_core::UrCallAction;
             let s = match action {
                 UrCallAction::Cq => thd75_repl::output::dstar_command_cq().to_string(),
                 UrCallAction::Echo => thd75_repl::output::dstar_command_echo().to_string(),
@@ -5184,6 +5148,71 @@ mod offset_tests {
 }
 
 #[cfg(test)]
+mod dstar_start_tests {
+    use super::parse_dstar_start;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn startup_uses_one_validated_identity_for_modem_and_network() -> TestResult {
+        let request = parse_dstar_start(&["n0call", "ref030c"])?;
+        assert_eq!(request.callsign, "N0CALL");
+        assert_eq!(request.network_callsign, request.modem_config.callsign());
+        assert_eq!(request.network_callsign.as_bytes(), b"N0CALL  ");
+        assert_eq!(request.modem_config.suffix().as_bytes(), b"    ");
+        assert!(
+            request.link.is_some(),
+            "reflector must remain part of the validated request"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn startup_rejects_invalid_identity_before_preparing_the_radio() {
+        for callsign in [
+            "",
+            "        ",
+            "N0,CALL",
+            "N0\x0DCALL",
+            "N0\nCALL",
+            "NØCALL",
+            "N0CALL   ",
+        ] {
+            assert!(
+                parse_dstar_start(&[callsign]).is_err(),
+                "invalid station identity accepted: {callsign:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_rejects_bad_arguments_and_reflector() {
+        for arguments in [
+            &[][..],
+            &["N0CALL", "REF030C", "extra"][..],
+            &["N0CALL", "REF030?"][..],
+        ] {
+            assert!(
+                parse_dstar_start(arguments).is_err(),
+                "invalid startup arguments accepted: {arguments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_error_cannot_embed_an_operator_supplied_line_terminator() -> TestResult {
+        let error = parse_dstar_start(&["N0\x0DCALL"])
+            .err()
+            .ok_or("control byte must fail identity validation")?;
+        assert!(
+            !error.contains(['\x0D', '\n']),
+            "validation diagnostics must remain one output line: {error:?}"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 mod gateway_off_tests {
     use super::{
         DetachedMcpPageUpdate, DstarEntryRadio, InterruptibleMcpOperation,
@@ -5205,8 +5234,9 @@ mod gateway_off_tests {
     const GATEWAY_MODE_BYTE: usize = 0xA0;
     use kenwood_thd75::memory::MCP_D75_SCHEMA_FIRMWARE_IDENTITIES;
     use kenwood_thd75::protocol::programming;
-    use kenwood_thd75::transport::{EitherTransport, MockTransport};
+    use kenwood_thd75::transport::EitherTransport;
     use kenwood_thd75::{FirmwareIdentity, Radio, RadioModel};
+    use kenwood_transport::MockTransport;
     use std::sync::atomic::Ordering;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -5534,7 +5564,7 @@ mod gateway_off_tests {
     #[tokio::test]
     async fn gateway_init_failure_keeps_the_recovered_radio_terminal_guarded() -> TestResult {
         tokio::task::LocalSet::new()
-            .run_until(async {
+            .run_until(Box::pin(async {
                 let mut mock = MockTransport::new();
                 mock.expect(b"ID\x0D", b"ID TH-D75\x0D");
                 mock.expect(b"FV\x0D", b"FV 1.03.AZM\x0D");
@@ -5564,12 +5594,12 @@ mod gateway_off_tests {
                     );
                 };
 
-                assert!(
-                    error.contains("Gateway init failed") && error.contains("MMDVM ACK for 0x02"),
-                    "gateway init failure lost its modem cause: {error}"
+                assert_eq!(
+                    error, "Gateway init failed: modem rejected command 0x02: DataIncorrect",
+                    "gateway init failure must retain the exact command and NAK reason"
                 );
                 Ok(())
-            })
+            }))
             .await
     }
 

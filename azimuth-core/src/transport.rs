@@ -3,8 +3,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use kenwood_thd75::error::TransportError;
-use kenwood_thd75::transport::Transport;
+use kenwood_transport::{Transport, TransportError};
 
 /// Error returned by the Swift USB implementation.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, uniffi::Error)]

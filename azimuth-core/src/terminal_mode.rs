@@ -8,16 +8,17 @@ use std::sync::{
 #[cfg(target_os = "macos")]
 use kenwood_thd75::{
     PairedBluetoothDevice,
-    error::TransportError,
     transport::{BluetoothOpenCancellation, BluetoothTransport},
 };
 use kenwood_thd75::{
     Radio,
     error::Error as RadioError,
     radio::programming::DetachedMcpPageUpdate,
-    transport::Transport,
     types::{PcOutputInterface, SerialNumber},
 };
+use kenwood_transport::Transport;
+#[cfg(target_os = "macos")]
+use kenwood_transport::TransportError;
 
 use crate::aprs::TncDataBand;
 use crate::transport::{ByteTransport, SwiftByteTransport};
@@ -1962,10 +1963,10 @@ mod tests {
     use super::*;
 
     use kenwood_thd75::{
-        MockTransport,
         protocol::programming,
         protocol::programming::{McpPage, WritableMcpPage},
     };
+    use kenwood_transport::MockTransport;
 
     use crate::transport::ByteTransportError;
 

@@ -14,6 +14,9 @@ publish = false
 
 [dependencies]
 kenwood-thd75 = { path = "../thd75" }
+kenwood-transport = { path = "../kenwood-transport", default-features = false }
+dstar-gateway-core = { path = "../dstar-gateway-core" }
+mmdvm = { path = "../mmdvm", default-features = false, features = ["dstar"] }
 ratatui = "0.30"
 crossterm = "0.29"
 clap = { version = "4", features = ["derive"] }

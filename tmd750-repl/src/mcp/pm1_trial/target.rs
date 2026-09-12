@@ -5,9 +5,9 @@ use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use kenwood_tmd750::memory::{MyCallsignTrial, PmNameTrial, PmNameTrialEvent, PmNameTrialStatus};
-use kenwood_tmd750::transport::Transport;
 use kenwood_tmd750::types::PAGE_SIZE;
 use kenwood_tmd750::{Identity, Page, PmNameTrialSessionReport, Radio};
+use kenwood_transport::Transport;
 use serde::Serialize;
 
 use super::journal::Journal;

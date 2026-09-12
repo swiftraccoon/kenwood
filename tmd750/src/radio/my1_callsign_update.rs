@@ -10,8 +10,8 @@ use crate::memory::{
     My1CallsignUpdateStatus,
 };
 use crate::radio::qualification::{McpProbeExit, McpProbeSegment};
-use crate::transport::Transport;
 use crate::types::{Address, DvGatewayMode, Page, RadioModel};
+use kenwood_transport::Transport;
 
 /// The first failed requirement in one bounded MY1 update session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

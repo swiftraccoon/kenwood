@@ -1023,7 +1023,7 @@ pub(crate) enum Message {
     /// D-STAR did not return a radio with proved ordinary CAT control.
     DstarRecoveryFailed(String),
     /// A D-STAR event was received from the radio task (gateway mode).
-    DstarEvent(kenwood_thd75::DstarEvent),
+    DstarEvent(mmdvm::dstar::DstarEvent),
     /// Error from the D-STAR subsystem.
     DstarError(String),
     Quit,
@@ -1081,13 +1081,13 @@ pub(crate) struct App {
     /// D-STAR mode state.
     pub dstar_mode: DstarMode,
     /// D-STAR last heard entries (gateway mode).
-    pub dstar_last_heard: Vec<kenwood_thd75::LastHeardEntry>,
+    pub dstar_last_heard: Vec<mmdvm::dstar::LastHeardEntry>,
     /// Selected index in the D-STAR last heard list.
     pub dstar_last_heard_index: usize,
     /// Current D-STAR text message (from slow data).
-    pub dstar_text_message: Option<kenwood_thd75::SlowDataTextMessage>,
+    pub dstar_text_message: Option<dstar_gateway_core::SlowDataTextMessage>,
     /// Current D-STAR RX header (gateway mode).
-    pub dstar_rx_header: Option<kenwood_thd75::DstarHeader>,
+    pub dstar_rx_header: Option<dstar_gateway_core::DstarHeader>,
     /// Whether a D-STAR voice transmission is active.
     pub dstar_rx_active: bool,
     /// D-STAR URCALL input buffer (when prompting).
@@ -3412,8 +3412,8 @@ impl App {
     }
 
     /// Toggle APRS mode on or off.
-    fn handle_dstar_event(&mut self, event: kenwood_thd75::DstarEvent) {
-        use kenwood_thd75::DstarEvent;
+    fn handle_dstar_event(&mut self, event: mmdvm::dstar::DstarEvent) {
+        use mmdvm::dstar::DstarEvent;
         match event {
             DstarEvent::VoiceStart(header) => {
                 self.dstar_rx_active = true;
@@ -3529,9 +3529,14 @@ impl App {
                     return;
                 };
 
-                // Preserve the firmware-qualified transient gateway choice
-                // `TN 3,1`; the UI does not expose a separate D-STAR TNC band.
-                let config = kenwood_thd75::DstarGatewayConfig::new(callsign, TncDataBand::B);
+                let config = match mmdvm::dstar::DstarModemConfig::new(callsign.as_str()) {
+                    Ok(config) => config,
+                    Err(error) => {
+                        self.status_message =
+                            Some(format!("D-STAR transmit callsign is invalid: {error}"));
+                        return;
+                    }
+                };
                 if let Some(ref tx) = self.cmd_tx {
                     let _send = tx.send(crate::event::RadioCommand::EnterDstar { config });
                     self.status_message = Some("Entering D-STAR gateway mode...".into());
@@ -3907,8 +3912,7 @@ mod tests {
         app.toggle_dstar_mode();
         match rx.try_recv()? {
             RadioCommand::EnterDstar { config } => {
-                assert_eq!(config.callsign.as_str(), "KQ4NIT");
-                assert_eq!(config.data_band, TncDataBand::B);
+                assert_eq!(config.callsign().text()?, "KQ4NIT");
             }
             other => return Err(format!("expected EnterDstar, got {other:?}").into()),
         }

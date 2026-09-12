@@ -10,8 +10,8 @@ use crate::memory::{
 };
 use crate::protocol::mcp::{ACK, write_request};
 use crate::radio::qualification::{McpProbeExit, McpProbeSegment};
-use crate::transport::Transport;
 use crate::types::{Address, DvGatewayMode, Page};
+use kenwood_transport::Transport;
 
 /// Step reached by one session of the experimental Terminal exit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

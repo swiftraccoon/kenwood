@@ -4,12 +4,13 @@ use std::fs::File;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use kenwood_tmd750::transport::{SerialCandidate, Transport};
+use kenwood_tmd750::transport::SerialCandidate;
 use kenwood_tmd750::{
     DvGatewayMode, McpProbeExit, My1CallsignUpdateSessionOutcome, My1CallsignUpdateSessionReport,
     My1CallsignUpdateSessionStage, My1CallsignUpdateWriteDisposition, Pm1NameUpdateSessionOutcome,
     Pm1NameUpdateSessionReport, Pm1NameUpdateSessionStage, Pm1NameUpdateWriteDisposition, Radio,
 };
+use kenwood_transport::Transport;
 use serde::Serialize;
 
 use super::super::capture::{CaptureTransport, Event, Recorder, TranscriptSummary};

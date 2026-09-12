@@ -9,7 +9,7 @@
 //! # Design notes
 //!
 //! The session holds an [`::mmdvm::AsyncModem`] that owns the transport via a
-//! [`MmdvmTransportAdapter`]. All MMDVM framing, periodic status polling,
+//! [`StreamAdapter`]. All MMDVM framing, periodic status polling,
 //! TX-queue slot gating, and RX frame dispatch happen inside the
 //! `AsyncModem`'s spawned task; the session itself is just a thin
 //! lifecycle wrapper that also caches the [`Radio`]'s CAT-mode state for
@@ -55,8 +55,8 @@ use ::mmdvm::AsyncModem;
 
 use crate::error::{Error, ProtocolError};
 use crate::protocol::{Command, Response};
-use crate::transport::{MmdvmTransportAdapter, Transport};
 use crate::types::{TncDataBand, TncMode};
+use kenwood_transport::{StreamAdapter, Transport, TransportError};
 
 use super::{BinaryProtocolProof, DesyncedRadio, Radio, cat_restore_state::CatRestoreState};
 
@@ -87,7 +87,7 @@ pub struct PersistentMmdvm;
 /// returned on exit.
 pub struct MmdvmSession<T: Transport + Unpin + 'static, Lifecycle = TransientMmdvm> {
     /// Async MMDVM modem driving the transport.
-    modem: AsyncModem<MmdvmTransportAdapter<T>>,
+    modem: AsyncModem<StreamAdapter<T>>,
     /// Radio state cached for restoration on exit.
     cat_restore: CatRestoreState,
     /// TNC data band retained for a transient `TN 0,x` exit.
@@ -137,7 +137,7 @@ impl<T: Transport + Unpin + 'static> Radio<T> {
         data_band: Option<TncDataBand>,
     ) -> MmdvmSession<T, Lifecycle> {
         tracing::info!("wrapping transport as MMDVM session (radio already in gateway mode)");
-        let adapter = MmdvmTransportAdapter::new(transport);
+        let adapter = StreamAdapter::new(transport);
         let modem = AsyncModem::spawn(adapter);
         MmdvmSession {
             modem,
@@ -222,7 +222,7 @@ impl<T: Transport + Unpin + 'static, Lifecycle> MmdvmSession<T, Lifecycle> {
     /// mode changes, raw frame send) work with the handle directly.
     /// Higher-level D-STAR orchestration (headers, voice frames, EOT)
     /// is wrapped by [`crate::dstar_gateway::DstarGateway`].
-    pub const fn modem_mut(&mut self) -> &mut AsyncModem<MmdvmTransportAdapter<T>> {
+    pub const fn modem_mut(&mut self) -> &mut AsyncModem<StreamAdapter<T>> {
         &mut self.modem
     }
 
@@ -232,7 +232,7 @@ impl<T: Transport + Unpin + 'static, Lifecycle> MmdvmSession<T, Lifecycle> {
     /// of the modem while tracking D-STAR-specific state separately.
     /// Returns the associated Radio restore state alongside the modem
     /// so the caller can rebuild the [`Radio`] after shutdown.
-    pub(crate) fn into_parts(self) -> (AsyncModem<MmdvmTransportAdapter<T>>, MmdvmRadioRestore<T>) {
+    pub(crate) fn into_parts(self) -> (AsyncModem<StreamAdapter<T>>, MmdvmRadioRestore<T>) {
         (
             self.modem,
             MmdvmRadioRestore {
@@ -317,7 +317,7 @@ impl<T: Transport + Unpin + 'static> MmdvmRadioRestore<T> {
     /// is deliberately dropped instead of being mislabeled binary-safe.
     pub(crate) async fn shutdown_and_rebuild_binary(
         self,
-        modem: AsyncModem<MmdvmTransportAdapter<T>>,
+        modem: AsyncModem<StreamAdapter<T>>,
     ) -> Result<Radio<T>, Error> {
         let adapter = modem.shutdown().await.map_err(shell_err_to_thd75_err)?;
         let inner = adapter
@@ -325,15 +325,13 @@ impl<T: Transport + Unpin + 'static> MmdvmRadioRestore<T> {
             .await
             .map_err(|recovery_error| {
                 let (_transport, pump_error) = recovery_error.into_parts();
-                Error::Transport(crate::error::TransportError::Disconnected(
-                    std::io::Error::new(
-                        pump_error.kind(),
-                        format!(
-                            "MMDVM transport could not be cleanly reclaimed without invalidating \
+                Error::Transport(TransportError::Disconnected(std::io::Error::new(
+                    pump_error.kind(),
+                    format!(
+                        "MMDVM transport could not be cleanly reclaimed without invalidating \
                          binary proof: {pump_error}"
-                        ),
                     ),
-                ))
+                )))
             })?;
         Ok(self.cat_restore.rebuild_binary_proven(inner))
     }
@@ -345,9 +343,9 @@ impl<T: Transport + Unpin + 'static> MmdvmRadioRestore<T> {
     /// [`Radio::restore_cat_after_mode_exit`] succeeds.
     pub(crate) async fn exit_and_rebuild(
         self,
-        modem: AsyncModem<MmdvmTransportAdapter<T>>,
+        modem: AsyncModem<StreamAdapter<T>>,
     ) -> Result<DesyncedRadio<T>, Error> {
-        // Shutdown returns the MmdvmTransportAdapter holding our T.
+        // Shutdown returns the StreamAdapter holding our T.
         let adapter = modem.shutdown().await.map_err(shell_err_to_thd75_err)?;
 
         // Pull the inner T out of the adapter.
@@ -356,23 +354,21 @@ impl<T: Transport + Unpin + 'static> MmdvmRadioRestore<T> {
             Err(recovery_error) => {
                 let (transport, pump_error) = recovery_error.into_parts();
                 let Some(mut inner) = transport else {
-                    return Err(Error::Transport(
-                        crate::error::TransportError::Disconnected(pump_error),
-                    ));
+                    return Err(Error::Transport(TransportError::Disconnected(pump_error)));
                 };
                 tracing::warn!(
                     error = %pump_error,
                     "MMDVM pump failed; reopening recovered transport before CAT restoration"
                 );
                 if let Err(reopen_error) = inner.reopen().await {
-                    return Err(Error::Transport(
-                        crate::error::TransportError::Disconnected(std::io::Error::new(
+                    return Err(Error::Transport(TransportError::Disconnected(
+                        std::io::Error::new(
                             pump_error.kind(),
                             format!(
                                 "MMDVM pump failed: {pump_error}; recovered transport could not reopen: {reopen_error}"
                             ),
-                        )),
-                    ));
+                        ),
+                    )));
                 }
                 inner
             }
@@ -411,9 +407,7 @@ fn shell_err_to_thd75_err(err: ::mmdvm::ShellError) -> Error {
             field: "frame".to_owned(),
             detail: format!("{e}"),
         }),
-        ::mmdvm::ShellError::Io(e) => {
-            Error::Transport(crate::error::TransportError::Disconnected(e))
-        }
+        ::mmdvm::ShellError::Io(e) => Error::Transport(TransportError::Disconnected(e)),
         ::mmdvm::ShellError::BufferFull { mode } => {
             Error::Protocol(ProtocolError::UnexpectedResponse {
                 expected: format!("MMDVM {mode:?} buffer ready"),
@@ -428,17 +422,17 @@ fn shell_err_to_thd75_err(err: ::mmdvm::ShellError) -> Error {
         }
         // `::mmdvm::ShellError` is `#[non_exhaustive]`. Surface unknown
         // variants as a generic transport disconnection.
-        _ => Error::Transport(crate::error::TransportError::Disconnected(
-            std::io::Error::other("unknown MMDVM shell error"),
-        )),
+        _ => Error::Transport(TransportError::Disconnected(std::io::Error::other(
+            "unknown MMDVM shell error",
+        ))),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::MockTransport;
     use crate::types::TncDataBand;
+    use kenwood_transport::MockTransport;
 
     type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 

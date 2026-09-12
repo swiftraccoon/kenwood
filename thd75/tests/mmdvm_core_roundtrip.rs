@@ -16,6 +16,7 @@ use aprs_is as _;
 use ax25_codec as _;
 use encoding_rs as _;
 use kenwood_thd75 as _;
+use kenwood_transport as _;
 use kiss_tnc as _;
 use mmdvm as _;
 use proptest as _;

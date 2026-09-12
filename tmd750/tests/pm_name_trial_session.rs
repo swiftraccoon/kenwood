@@ -3,7 +3,6 @@
 //! Persistence cases model separate MCP sessions after exit and fresh identity
 //! verification. They do not simulate or independently prove a physical reboot.
 
-use kenwood_thd75 as _;
 use mcp_d75_extract as _;
 use thiserror as _;
 use tokio_serial as _;
@@ -23,12 +22,12 @@ use kenwood_tmd750::memory::{
     PmNameTrialWrite,
 };
 use kenwood_tmd750::protocol::mcp::{ACK, read_request, write_request};
-use kenwood_tmd750::transport::{MockTransport, Transport, TransportError};
 use kenwood_tmd750::{
     Address, Error, FirmwareIdentity, Identity, McpError, McpProbeExit, Page,
     PmNameTrialSessionError, PmNameTrialSessionOutcome, PmNameTrialSessionReport,
     PmNameTrialSessionStage, PmNameTrialWriteDisposition, Radio, RadioModel, RadioType,
 };
+use kenwood_transport::{MockTransport, Transport, TransportError};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 

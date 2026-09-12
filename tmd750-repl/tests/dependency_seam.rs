@@ -1,12 +1,22 @@
-//! Model code must not depend on the TH-D75 library for shared transport I/O.
+//! The TM-D750 application uses model-neutral protocol runtimes directly.
 
+use clap as _;
+use dirs_next as _;
+use dstar_gateway as _;
+use dstar_gateway_core as _;
 use kenwood_tmd750 as _;
 use kenwood_transport as _;
-use mcp_d75_extract as _;
+use mmdvm as _;
+use rustyline as _;
+use serde as _;
+use serde_json as _;
+use tempfile as _;
 use thiserror as _;
+use time as _;
 use tokio as _;
-use tokio_serial as _;
 use tracing as _;
+use tracing_appender as _;
+use tracing_subscriber as _;
 
 use std::path::{Path, PathBuf};
 
@@ -25,26 +35,24 @@ fn rust_sources(directory: &Path, found: &mut Vec<PathBuf>) -> std::io::Result<(
 }
 
 #[test]
-fn model_sources_and_manifest_do_not_depend_on_thd75() -> TestResult {
+fn application_sources_and_manifest_do_not_depend_on_another_radio_model() -> TestResult {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let src = manifest_dir.join("src");
     let mut sources = Vec::new();
-    rust_sources(&src, &mut sources)?;
+    rust_sources(&manifest_dir.join("src"), &mut sources)?;
     let mut offenders = Vec::new();
     for path in &sources {
-        let text = std::fs::read_to_string(path)?;
-        if text.contains("thd75") {
+        if std::fs::read_to_string(path)?.contains("kenwood_thd75") {
             offenders.push(path.display().to_string());
         }
     }
     assert!(
         offenders.is_empty(),
-        "model source depends on the TH-D75 library: {offenders:?}"
+        "application source must use the shared protocol runtime: {offenders:?}"
     );
     let manifest = std::fs::read_to_string(manifest_dir.join("Cargo.toml"))?;
     assert!(
-        !manifest.contains("thd75"),
-        "the model manifest must depend directly on kenwood-transport, never TH-D75",
+        !manifest.contains("kenwood-thd75"),
+        "the application must not acquire another model's controller or native helpers"
     );
     Ok(())
 }

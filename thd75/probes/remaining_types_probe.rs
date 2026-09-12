@@ -3,7 +3,8 @@
 //! Tests SH, MS, SF, BL, US, TY to determine actual wire formats and value ranges.
 //! Run with radio connected via USB: cargo run --bin remaining_types_probe
 use kenwood_thd75::protocol::Codec;
-use kenwood_thd75::transport::{EitherTransport, SerialTransport, Transport};
+use kenwood_thd75::transport::{EitherTransport, SerialTransport};
+use kenwood_transport::Transport;
 
 fn open_transport() -> (String, EitherTransport) {
     if let Ok(ports) = SerialTransport::discover_usb() {

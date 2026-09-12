@@ -3,13 +3,13 @@
 
 use std::time::Duration;
 
-use kenwood_thd75::error::TransportError;
 use kenwood_thd75::radio::{LinkState, Radio};
 use kenwood_thd75::session::{
     LinkEvent, RadioLinkRecovery, ReconnectAttemptLimit, ReconnectPolicy,
 };
-use kenwood_thd75::transport::MockTransport;
 use kenwood_thd75::types::RadioModel;
+use kenwood_transport::MockTransport;
+use kenwood_transport::TransportError;
 
 // Deps visible to every kenwood-thd75 test target but unused here.
 // Acknowledged so `unused_crate_dependencies` stays silent without

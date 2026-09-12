@@ -57,7 +57,8 @@ use std::time::{Duration, Instant};
 use kenwood_thd75::Radio;
 use kenwood_thd75::error::Error as RadioError;
 use kenwood_thd75::protocol::{Codec, programming};
-use kenwood_thd75::transport::{SerialTransport, Transport};
+use kenwood_thd75::transport::SerialTransport;
+use kenwood_transport::Transport;
 
 type BackupError = Box<dyn StdError + Send + Sync>;
 type BackupResult<T> = Result<T, BackupError>;
@@ -1418,7 +1419,7 @@ fn invalid_input(message: impl Into<String>) -> BackupError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kenwood_thd75::transport::MockTransport;
+    use kenwood_transport::MockTransport;
 
     type TestResult = BackupResult<()>;
 

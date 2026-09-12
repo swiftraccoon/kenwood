@@ -4,7 +4,6 @@
 //! or power-cycle persistence. External finalization is explicitly attested by
 //! the test; the live driver may not attest it on behalf of its caller.
 
-use kenwood_thd75 as _;
 use mcp_d75_extract as _;
 use thiserror as _;
 use tokio_serial as _;
@@ -24,12 +23,12 @@ use kenwood_tmd750::memory::{
     Pm1NameUpdateStatus,
 };
 use kenwood_tmd750::protocol::mcp::{ACK, read_request, write_request};
-use kenwood_tmd750::transport::{MockTransport, Transport, TransportError};
 use kenwood_tmd750::{
     Address, Error, FirmwareIdentity, Identity, McpError, McpProbeExit, Page,
     Pm1NameUpdateSessionError, Pm1NameUpdateSessionOutcome, Pm1NameUpdateSessionReport,
     Pm1NameUpdateSessionStage, Pm1NameUpdateWriteDisposition, Radio, RadioModel, RadioType,
 };
+use kenwood_transport::{MockTransport, Transport, TransportError};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 

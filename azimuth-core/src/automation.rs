@@ -21,11 +21,11 @@ use kenwood_thd75::radio::programming::{
     McpPage, McpPageExchange, McpPageExchangeError, McpPageExchangeOperationError, WritableMcpPage,
 };
 use kenwood_thd75::screen::{SCREEN_HEIGHT, SCREEN_WIDTH};
-use kenwood_thd75::transport::Transport as RadioTransport;
 use kenwood_thd75::types::{
     KissDuplex, KissPersistence, KissSlotTime, KissTxDelay, KissTxTail, PacketDataRate,
     SerialNumber, TncDataBand as RadioTncDataBand, TncMode, TncState,
 };
+use kenwood_transport::{Transport as RadioTransport, TransportError};
 use kiss_tnc::KissCommand;
 use tokio::sync::{mpsc, oneshot};
 
@@ -2295,7 +2295,7 @@ async fn aprs_loop(
                         );
                     }
                     Err(RadioError::Timeout(_)) => {}
-                    Err(RadioError::Transport(kenwood_thd75::error::TransportError::Read(error)))
+                    Err(RadioError::Transport(TransportError::Read(error)))
                         if matches!(
                             error.kind(),
                             std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
@@ -2844,8 +2844,8 @@ mod tests {
     use super::*;
     use kenwood_thd75::protocol::programming;
     use kenwood_thd75::screen::{SCREEN_BYTES, ScreenFrame};
-    use kenwood_thd75::transport::MockTransport;
     use kenwood_thd75::types::{RadioModel, TncDataBand};
+    use kenwood_transport::MockTransport;
     use kiss_tnc::FEND;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;

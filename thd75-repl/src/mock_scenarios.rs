@@ -3,7 +3,7 @@
 //! This module is gated behind the `testing` cargo feature; it is not
 //! compiled into release builds. Each scenario is a pre-scripted
 //! sequence of `(request_bytes, response_bytes)` pairs that drive a
-//! [`MockTransport`](kenwood_thd75::transport::MockTransport) through
+//! [`MockTransport`](kenwood_transport::MockTransport) through
 //! a known exchange.
 //!
 //! Used by the `--mock-radio <name>` CLI flag, which is also gated
@@ -16,7 +16,7 @@
 //! because their binary KISS and MMDVM frames cannot be represented by the
 //! transport's text fixture format.
 
-use kenwood_thd75::transport::MockTransport;
+use kenwood_transport::MockTransport;
 
 /// Build a named mock scenario.
 ///

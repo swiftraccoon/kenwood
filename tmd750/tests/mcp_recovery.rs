@@ -1,6 +1,5 @@
 //! Recovery never attributes observed bytes to missing or ambiguous intent.
 
-use kenwood_thd75 as _;
 use mcp_d75_extract as _;
 use thiserror as _;
 use tokio_serial as _;
@@ -10,8 +9,8 @@ use kenwood_tmd750::protocol::mcp::{
     ACK, BytePatch, ENTER, EXIT, PagePatch, read_request, write_request,
 };
 use kenwood_tmd750::radio::McpJournal;
-use kenwood_tmd750::transport::MockTransport;
 use kenwood_tmd750::{Address, Error, McpError, Page, Radio};
+use kenwood_transport::MockTransport;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 

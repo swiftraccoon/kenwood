@@ -16,6 +16,8 @@ use dirs_next as _;
 use dstar_gateway as _;
 use dstar_gateway_core as _;
 use kenwood_thd75 as _;
+use kenwood_transport as _;
+use mmdvm as _;
 use proptest as _;
 use rustyline as _;
 use time as _;

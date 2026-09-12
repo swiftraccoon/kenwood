@@ -7,8 +7,8 @@
 use kenwood_thd75::McpPage;
 use kenwood_thd75::error::Error;
 use kenwood_thd75::radio::{FirmwareProfile, LinkState, Radio};
-use kenwood_thd75::transport::{MockTransport, Transport};
 use kenwood_thd75::types::GpsSettings;
+use kenwood_transport::{MockTransport, Transport, TransportError};
 
 // Deps visible to every kenwood-thd75 test target but unused here.
 // Acknowledged so `unused_crate_dependencies` stays silent without
@@ -154,8 +154,6 @@ async fn reconnect_restores_gps_settings() -> TestResult {
 
 #[tokio::test]
 async fn failed_reopen_leaves_link_down() -> TestResult {
-    use kenwood_thd75::error::TransportError;
-
     let mut mock = MockTransport::new();
     mock.expect_eof(b"FV\r");
     mock.expect_reopen(Err(TransportError::NotFound));
@@ -186,13 +184,13 @@ async fn mock_reopen_reachable_through_trait() -> TestResult {
 struct WedgedWriteTransport;
 
 impl Transport for WedgedWriteTransport {
-    async fn write(&mut self, _d: &[u8]) -> Result<(), kenwood_thd75::error::TransportError> {
+    async fn write(&mut self, _d: &[u8]) -> Result<(), TransportError> {
         std::future::pending().await
     }
-    async fn read(&mut self, _b: &mut [u8]) -> Result<usize, kenwood_thd75::error::TransportError> {
+    async fn read(&mut self, _b: &mut [u8]) -> Result<usize, TransportError> {
         std::future::pending().await
     }
-    async fn close(&mut self) -> Result<(), kenwood_thd75::error::TransportError> {
+    async fn close(&mut self) -> Result<(), TransportError> {
         Ok(())
     }
 }

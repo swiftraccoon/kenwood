@@ -1,7 +1,6 @@
 //! Identify, read the slot menus, decode a PM name, patch it, write it back
 //! verified, exit: the whole slice over the mock transport.
 
-use kenwood_thd75 as _;
 use mcp_d75_extract as _;
 use thiserror as _;
 use tokio_serial as _;
@@ -14,8 +13,8 @@ use kenwood_tmd750::memory::{
 use kenwood_tmd750::protocol::mcp::regions::{GLOBAL_SETTINGS, slot_menu};
 use kenwood_tmd750::protocol::mcp::{ACK, ENTER, EXIT, read_request, write_request};
 use kenwood_tmd750::radio::Radio;
-use kenwood_tmd750::transport::MockTransport;
 use kenwood_tmd750::{Page, Region, SlotIndex};
+use kenwood_transport::MockTransport;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 

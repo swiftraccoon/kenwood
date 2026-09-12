@@ -35,11 +35,11 @@
 //!   users pipe stdout to speech tools or scripts.
 
 use kenwood_thd75::Radio;
-use kenwood_thd75::transport::Transport;
 use kenwood_thd75::types::{
     Band, BandMode, DstarCallsign, DstarSuffix, Frequency, GpsSettings, Module, OperatingMode,
     ReflectorCallsign, RegularChannel, UsbAudioOutput,
 };
+use kenwood_transport::Transport;
 use thd75_repl::aprintln;
 
 /// Parse a band argument ("a" or "b"), defaulting to A.

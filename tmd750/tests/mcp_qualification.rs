@@ -1,16 +1,15 @@
 //! Fixed-scope MCP qualification, including partial evidence and cancellation.
 
-use kenwood_thd75 as _;
 use mcp_d75_extract as _;
 use thiserror as _;
 use tokio_serial as _;
 use tracing as _;
 
 use kenwood_tmd750::protocol::mcp::{ACK, ENTER, EXIT, read_request, write_request};
-use kenwood_tmd750::transport::MockTransport;
 use kenwood_tmd750::{
     Error, McpError, McpProbeExit, McpProbeOutcome, McpProbeStage, Page, Radio, Region,
 };
+use kenwood_transport::MockTransport;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 

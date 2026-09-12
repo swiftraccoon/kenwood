@@ -26,6 +26,7 @@ use kiss_tnc::{KissFrame, decode_kiss_frame, encode_kiss_frame};
 use aprs_is as _;
 use dstar_gateway_core as _;
 use encoding_rs as _;
+use kenwood_transport as _;
 use mmdvm as _;
 use mmdvm_core as _;
 use proptest as _;

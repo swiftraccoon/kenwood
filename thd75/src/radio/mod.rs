@@ -40,10 +40,10 @@ pub mod tuning;
 
 use std::time::Duration;
 
-use crate::error::{Error, ProtocolError, TransportError};
+use crate::error::{Error, ProtocolError};
 use crate::protocol::{self, Codec, Command, Response, command_name};
-use crate::transport::Transport;
 use crate::types::{Band, FirmwareIdentity, RadioModel, TncDataBand, TuningMode};
+use kenwood_transport::{Transport, TransportError};
 use response_correlation::correlate;
 
 /// Default timeout for command execution (5 seconds).
@@ -1074,7 +1074,7 @@ impl<T: Transport> Radio<T> {
     /// Re-establish a dropped link on the same transport identity.
     ///
     /// Closes what remains of the old connection, asks the transport to
-    /// [`reopen`](crate::transport::Transport::reopen), verifies the
+    /// [`reopen`](kenwood_transport::Transport::reopen), verifies the
     /// radio answers by re-running [`identify`](Radio::identify), and
     /// restores auto-information and GPS streaming state if they were
     /// enabled. In-flight commands are never replayed: whatever failed
@@ -1170,8 +1170,8 @@ fn cat_recovery_drain_limit_error(drained: usize) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::MockTransport;
     use crate::types::Band;
+    use kenwood_transport::MockTransport;
     use std::time::Duration;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;

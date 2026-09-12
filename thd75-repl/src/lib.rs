@@ -28,6 +28,8 @@ use clap as _;
 use dirs_next as _;
 use dstar_gateway as _;
 use dstar_gateway_core as _;
+use kenwood_transport as _;
+use mmdvm as _;
 use rustyline as _;
 use time as _;
 use tokio as _;

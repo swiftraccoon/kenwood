@@ -34,9 +34,9 @@ use thiserror as _;
 use tokio_serial as _;
 use tracing as _;
 
-use kenwood_thd75::transport::Transport;
 use kenwood_thd75::types::Band;
 use kenwood_thd75::{FirmwareProfile, Radio};
+use kenwood_transport::Transport;
 
 #[cfg(target_os = "linux")]
 const DEFAULT_BT_PORT: Option<&str> = Some("/dev/rfcomm0");

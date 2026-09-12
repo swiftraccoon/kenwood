@@ -3,7 +3,6 @@
 //! Separate mocked connections model caller-finalized evidence, not hardware
 //! qualification, physical continuity, or an independently observed power cycle.
 
-use kenwood_thd75 as _;
 use mcp_d75_extract as _;
 use thiserror as _;
 use tokio_serial as _;
@@ -23,13 +22,13 @@ use kenwood_tmd750::memory::{
     TerminalExitTrialStatus,
 };
 use kenwood_tmd750::protocol::mcp::{ACK, read_request, write_request};
-use kenwood_tmd750::transport::{MockTransport, Transport, TransportError};
 use kenwood_tmd750::{
     Address, DvGatewayMode, Error, FirmwareIdentity, Identity, McpError, McpProbeExit, Page, Radio,
     RadioModel, RadioType, TerminalExitTrialSessionError, TerminalExitTrialSessionOutcome,
     TerminalExitTrialSessionReport, TerminalExitTrialSessionStage,
     TerminalExitTrialWriteDisposition,
 };
+use kenwood_transport::{MockTransport, Transport, TransportError};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 

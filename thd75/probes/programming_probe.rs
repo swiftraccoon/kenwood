@@ -6,7 +6,8 @@
 //!
 //! Run: cargo test --test programming_probe -- --ignored --nocapture --test-threads=1
 
-use kenwood_thd75::transport::{SerialTransport, Transport};
+use kenwood_thd75::transport::SerialTransport;
+use kenwood_transport::Transport;
 
 async fn read_all_available(transport: &mut SerialTransport, timeout_ms: u64) -> Vec<u8> {
     let mut result = Vec::new();

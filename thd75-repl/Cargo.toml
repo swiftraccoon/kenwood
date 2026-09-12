@@ -26,9 +26,11 @@ path = "src/main.rs"
 testing = []
 
 [dependencies]
+kenwood-transport = { path = "../kenwood-transport", default-features = false }
 kenwood-thd75 = { path = "../thd75" }
 dstar-gateway = { path = "../dstar-gateway" }
 dstar-gateway-core = { path = "../dstar-gateway-core" }
+mmdvm = { path = "../mmdvm", features = ["dstar"] }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = [
   "rt-multi-thread",

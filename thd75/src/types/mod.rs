@@ -94,7 +94,6 @@ pub use dstar::{
     DstarGpsAutoTxInterval, DstarGpsDataTxSentence, DstarGpsDataTxSentences,
     DstarGpsDataTxSettings, DstarMessage, DstarMessageError, DstarQsoEntry, DstarSuffix, DvDrMode,
     EmrVolume, Module, QsoDirection, ReflectorCallsign, ReflectorCommand, RouteSelect,
-    UrCallAction,
 };
 
 // GPS subsystem re-exports.

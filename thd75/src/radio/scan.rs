@@ -8,8 +8,8 @@
 use crate::error::{Error, ProtocolError};
 use crate::protocol::programming;
 use crate::protocol::{Command, Response};
-use crate::transport::Transport;
 use crate::types::{AntennaInput, Band, ScanResumeMethod, StepSize};
+use kenwood_transport::Transport;
 
 use super::Radio;
 

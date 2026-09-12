@@ -4,8 +4,8 @@ use super::qualification::{McpProbeExit, McpProbeSegment};
 use super::{Identity, Progress, Radio};
 use crate::error::Error;
 use crate::protocol::mcp::{ENTER_RESPONSE, regions};
-use crate::transport::Transport;
 use crate::types::{Page, Region};
+use kenwood_transport::Transport;
 
 /// A step in the fixed configuration backup sequence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

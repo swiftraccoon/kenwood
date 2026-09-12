@@ -8,11 +8,11 @@
 
 use std::time::Duration;
 
-use crate::error::{Error, ProtocolError, TransportError};
+use crate::error::{Error, ProtocolError};
 use crate::protocol::memread::{parse_strict_read_reply, plan_read_for_target};
-use crate::transport::Transport;
 use crate::types::{MemoryReadOffset, MemoryReadTarget, ReadLen};
 use crate::verify::StateSnapshot;
+use kenwood_transport::{Transport, TransportError};
 
 use super::{LinkState, McpPhase, Radio};
 
@@ -743,8 +743,8 @@ mod tests {
     use crate::error::Error;
     use crate::protocol::Command;
     use crate::radio::{BinaryProtocolProof, CatState, Radio};
-    use crate::transport::MockTransport;
     use crate::types::{MemoryReadOffset, MemoryReadTarget, ReadLen};
+    use kenwood_transport::MockTransport;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 

@@ -9,8 +9,8 @@ use crate::memory::{
     Pm1NameUpdateStatus,
 };
 use crate::radio::qualification::{McpProbeExit, McpProbeSegment};
-use crate::transport::Transport;
 use crate::types::{Address, Page, RadioModel};
+use kenwood_transport::Transport;
 
 /// The step at which a bounded PM1 name-update session stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

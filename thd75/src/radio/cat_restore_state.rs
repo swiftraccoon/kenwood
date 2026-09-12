@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use crate::error::Error;
 use crate::protocol::{Codec, Response};
-use crate::transport::Transport;
 use crate::types::{FirmwareIdentity, GpsSettings, NmeaSentences, TuningMode};
+use kenwood_transport::Transport;
 
 use super::{BinaryProtocolProof, CatState, LinkState, McpPhase, McpWireBoundary, Radio};
 
@@ -169,8 +169,8 @@ impl CatRestoreState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::MockTransport;
     use crate::types::Band;
+    use kenwood_transport::MockTransport;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 

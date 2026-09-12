@@ -2,8 +2,8 @@
 
 use super::{Identity, Radio};
 use crate::error::{Error, ProtocolError};
-use crate::transport::Transport;
 use crate::types::{DvGatewayMode, Page, RadioModel, Region};
+use kenwood_transport::Transport;
 
 /// A step in the fixed MCP qualification sequence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

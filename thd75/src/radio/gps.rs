@@ -17,8 +17,8 @@
 
 use crate::error::{Error, ProtocolError};
 use crate::protocol::{Command, Response};
-use crate::transport::Transport;
 use crate::types::{GpsRadioMode, GpsSettings, NmeaSentences};
+use kenwood_transport::Transport;
 
 use super::Radio;
 

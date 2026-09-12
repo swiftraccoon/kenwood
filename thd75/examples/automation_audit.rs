@@ -96,6 +96,8 @@ use aprs_is as _;
 use ax25_codec as _;
 use dstar_gateway_core as _;
 use encoding_rs as _;
+#[cfg(not(target_os = "macos"))]
+use kenwood_transport as _;
 use kiss_tnc as _;
 use mmdvm as _;
 use mmdvm_core as _;
@@ -134,12 +136,11 @@ mod macos {
         v103_selection_bands,
     };
     use kenwood_thd75::screen::vision::{NormalizedBounds, TextObservation, require_unique_text};
-    use kenwood_thd75::transport::{
-        BluetoothTransport, EitherTransport, SerialTransport, Transport,
-    };
+    use kenwood_thd75::transport::{BluetoothTransport, EitherTransport, SerialTransport};
     use kenwood_thd75::types::{
         Band, BandMode, ChannelMode, ShiftDirection, StoredChannel, TuningMode,
     };
+    use kenwood_transport::Transport;
     use serde_json::{Value, json};
 
     type AuditError = Box<dyn StdError + Send + Sync>;
@@ -9777,10 +9778,10 @@ mod macos {
         use kenwood_thd75::screen::ui::{V103_SELECTION_RGB565, v103_selection_bands};
         use kenwood_thd75::screen::vision::{NormalizedBounds, TextObservation};
         use kenwood_thd75::screen::{SCREEN_BYTES, SCREEN_WIDTH, ScreenFrame};
-        use kenwood_thd75::transport::MockTransport;
         use kenwood_thd75::types::{
             ChannelMode, Frequency, RadioModel, ShiftDirection, StoredChannel,
         };
+        use kenwood_transport::MockTransport;
 
         type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 

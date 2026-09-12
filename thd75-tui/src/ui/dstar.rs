@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use crate::app::{App, DstarMode, McpState, Pane};
 
 /// Format a last-heard entry's age as a human-readable "ago" string.
-fn ago(entry: &kenwood_thd75::LastHeardEntry) -> String {
+fn ago(entry: &mmdvm::dstar::LastHeardEntry) -> String {
     let secs = entry.age(Instant::now()).as_secs();
     if secs < 60 {
         format!("{secs}s ago")
@@ -43,7 +43,7 @@ fn fmt_callsign(cs: &str) -> String {
 }
 
 /// Render malformed fixed-width wire data without inventing text for it.
-fn invalid_wire_bytes(bytes: &[u8], error: kenwood_thd75::WireTextError) -> String {
+fn invalid_wire_bytes(bytes: &[u8], error: dstar_gateway_core::WireTextError) -> String {
     let hexadecimal = bytes
         .iter()
         .map(|byte| format!("{byte:02X}"))
@@ -52,21 +52,21 @@ fn invalid_wire_bytes(bytes: &[u8], error: kenwood_thd75::WireTextError) -> Stri
     format!("<invalid {hexadecimal}: {error}>")
 }
 
-fn gateway_callsign(callsign: kenwood_thd75::ObservedDstarCallsign) -> String {
+fn gateway_callsign(callsign: mmdvm::dstar::ObservedDstarCallsign) -> String {
     callsign.text().map_or_else(
         |error| invalid_wire_bytes(callsign.as_bytes(), error),
         str::to_owned,
     )
 }
 
-fn gateway_suffix(suffix: kenwood_thd75::dstar_gateway::Suffix) -> String {
+fn gateway_suffix(suffix: dstar_gateway_core::Suffix) -> String {
     suffix.text().map_or_else(
         |error| invalid_wire_bytes(suffix.as_bytes(), error),
         str::to_owned,
     )
 }
 
-fn gateway_text_message(message: &kenwood_thd75::SlowDataTextMessage) -> String {
+fn gateway_text_message(message: &dstar_gateway_core::SlowDataTextMessage) -> String {
     message.text().map_or_else(
         |error| invalid_wire_bytes(message.as_bytes(), error),
         str::to_owned,

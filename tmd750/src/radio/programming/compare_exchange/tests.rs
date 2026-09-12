@@ -1,8 +1,8 @@
 //! Pure replacement validation and fail-closed batch admission.
 
 use crate::Radio;
-use crate::transport::MockTransport;
 use crate::types::Address;
+use kenwood_transport::MockTransport;
 
 use super::*;
 

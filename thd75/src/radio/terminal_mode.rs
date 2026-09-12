@@ -34,8 +34,8 @@ use crate::error::Error;
 use crate::protocol::programming::{self, WritableMcpPage};
 use crate::radio::diagnostics::LinkDiagnosis;
 use crate::radio::programming::DetachedMcpPageUpdate;
-use crate::transport::Transport;
 use crate::types::{DvGatewayMode, PcOutputInterface, TncDataBand};
+use kenwood_transport::Transport;
 
 use super::Radio;
 
@@ -517,7 +517,7 @@ impl<T: Transport> Radio<T> {
 mod tests {
     use super::*;
     use crate::memory::menu_fields::menu_field;
-    use crate::transport::MockTransport;
+    use kenwood_transport::MockTransport;
     use mmdvm_core::{MMDVM_FRAME_START, MMDVM_GET_VERSION};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;

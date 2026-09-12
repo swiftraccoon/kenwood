@@ -12,7 +12,7 @@
 //! A newly launched `IOBluetooth` shim can briefly report an already-connected
 //! baseband before its process-local Classic manager is ready to open RFCOMM.
 //! A native open that reaches that state is bounded and reported as
-//! [`TransportError::NotFound`](crate::error::TransportError::NotFound);
+//! [`TransportError::NotFound`](kenwood_transport::TransportError::NotFound);
 //! construction retries that failure exactly once in a fresh helper after a
 //! short delay. Neither the radio's baseband nor any system Bluetooth process
 //! is torn down as part of open or recovery.
@@ -37,8 +37,7 @@ mod inner {
     };
     use std::time::{Duration, Instant};
 
-    use crate::error::TransportError;
-    use crate::transport::Transport;
+    use kenwood_transport::{Transport, TransportError};
 
     unsafe extern "C" {
         fn bt_helper_link_anchor();

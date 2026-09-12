@@ -13,7 +13,7 @@ use crate::memory::{
     is_supported_mcp_d75_schema_target,
 };
 use crate::protocol::programming::{self, McpPage, WritableMcpPage};
-use crate::transport::Transport;
+use kenwood_transport::Transport;
 
 use super::Radio;
 use super::programming::McpPageExchange;
@@ -283,7 +283,7 @@ mod tests {
     use crate::memory::schema::{DecodedFieldValue, FieldValue, SchemaError};
     use crate::protocol::programming;
     use crate::radio::Radio;
-    use crate::transport::MockTransport;
+    use kenwood_transport::MockTransport;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 

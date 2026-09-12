@@ -2,7 +2,8 @@
 //! Run: cargo test --test mr_probe -- --ignored --nocapture --test-threads=1
 
 use kenwood_thd75::protocol::Codec;
-use kenwood_thd75::transport::{SerialTransport, Transport};
+use kenwood_thd75::transport::SerialTransport;
+use kenwood_transport::Transport;
 
 async fn raw_cmd(transport: &mut SerialTransport, cmd: &str) -> Option<Vec<u8>> {
     let wire = format!("{cmd}\r");

@@ -1,6 +1,6 @@
 //! Error hierarchy: one top-level [`Error`] with typed sub-errors.
 
-pub use crate::transport::TransportError;
+use kenwood_transport::TransportError;
 
 /// Any failure of this crate.
 #[derive(Debug, thiserror::Error)]

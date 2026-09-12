@@ -1,17 +1,16 @@
 //! Public format-checked menu updates on simulated firmware 1.02.
 
-use kenwood_thd75 as _;
 use mcp_d75_extract as _;
 use thiserror as _;
 use tokio_serial as _;
 use tracing as _;
 
 use kenwood_tmd750::protocol::mcp::{ACK, read_request, regions, write_request};
-use kenwood_tmd750::transport::MockTransport;
 use kenwood_tmd750::{
     Error, FirmwareIdentity, Identity, MenuAssignment, MenuFieldSnapshot, MenuUpdatePlan, Page,
     PageReplacement, Radio, RadioModel, RadioType, Region, SlotIndex,
 };
+use kenwood_transport::MockTransport;
 
 type TestError = Box<dyn std::error::Error>;
 type TestResult = Result<(), TestError>;

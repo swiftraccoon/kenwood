@@ -3,7 +3,6 @@
 //! All transports are scripted. Explicit test finalization is a caller
 //! attestation, not hardware, capture-durability, or power-cycle evidence.
 
-use kenwood_thd75 as _;
 use mcp_d75_extract as _;
 use thiserror as _;
 use tokio_serial as _;
@@ -23,13 +22,13 @@ use kenwood_tmd750::memory::{
     My1CallsignUpdateSession as Session, My1CallsignUpdateStatus as Status,
 };
 use kenwood_tmd750::protocol::mcp::{ACK, read_request, write_request};
-use kenwood_tmd750::transport::{MockTransport, Transport, TransportError};
 use kenwood_tmd750::{
     Address, DvGatewayMode, Error, FirmwareIdentity, Identity, McpError, McpProbeExit,
     My1CallsignUpdateSessionError as SessionError, My1CallsignUpdateSessionOutcome as Outcome,
     My1CallsignUpdateSessionReport as Report, My1CallsignUpdateSessionStage as Stage,
     My1CallsignUpdateWriteDisposition as WriteDisposition, Page, Radio, RadioModel, RadioType,
 };
+use kenwood_transport::{MockTransport, Transport, TransportError};
 
 type TestError = Box<dyn std::error::Error>;
 type TestResult = Result<(), TestError>;

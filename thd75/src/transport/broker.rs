@@ -8,7 +8,7 @@
 
 use std::sync::mpsc;
 
-use crate::error::TransportError;
+use kenwood_transport::TransportError;
 
 /// A synchronous job shipped to the broker's thread, paired with the
 /// channel that carries its result back to the submitter.

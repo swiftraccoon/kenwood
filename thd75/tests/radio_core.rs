@@ -1,8 +1,8 @@
 //! Integration tests for radio core methods.
 
 use kenwood_thd75::radio::Radio;
-use kenwood_thd75::transport::MockTransport;
 use kenwood_thd75::types::*;
+use kenwood_transport::MockTransport;
 
 // Deps visible to every kenwood-thd75 test target but unused here.
 // Acknowledged so `unused_crate_dependencies` stays silent without

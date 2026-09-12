@@ -8,11 +8,11 @@ use kenwood_tmd750::memory::{
     My1CallsignUpdate, My1CallsignUpdateEvent, My1CallsignUpdateStatus, Pm1NameUpdate,
     Pm1NameUpdateEvent,
 };
-use kenwood_tmd750::transport::Transport;
 use kenwood_tmd750::types::PAGE_SIZE;
 use kenwood_tmd750::{
     Identity, McpProbeExit, My1CallsignUpdateSessionReport, Page, Pm1NameUpdateSessionReport, Radio,
 };
+use kenwood_transport::Transport;
 use serde::Serialize;
 
 use super::super::reconnect::PostExitVerification;

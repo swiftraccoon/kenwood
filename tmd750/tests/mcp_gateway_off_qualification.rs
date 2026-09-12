@@ -1,6 +1,5 @@
 //! Fixed Gateway-Off probe admission, wire scope, cancellation, and retirement.
 
-use kenwood_thd75 as _;
 use mcp_d75_extract as _;
 use thiserror as _;
 use tokio_serial as _;
@@ -9,11 +8,11 @@ use tracing as _;
 use std::io;
 
 use kenwood_tmd750::protocol::mcp::{ACK, ENTER, EXIT, read_request, write_request};
-use kenwood_tmd750::transport::{MockTransport, Transport, TransportError};
 use kenwood_tmd750::{
     Address, DvGatewayMode, Error, McpError, McpGatewayOffProbeReport, McpProbeExit,
     McpProbeOutcome, McpProbeStage, Page, Radio,
 };
+use kenwood_transport::{MockTransport, Transport, TransportError};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 

@@ -12,11 +12,11 @@
 
 use crate::error::{Error, ProtocolError};
 use crate::protocol::{Command, Response};
-use crate::transport::Transport;
 use crate::types::{
     DstarCallsign, DstarCallsignEntry, DstarSlot, DstarSuffix, DvGatewayMode, Module,
     ReflectorCallsign,
 };
+use kenwood_transport::Transport;
 
 use super::Radio;
 
@@ -371,7 +371,7 @@ impl<T: Transport> Radio<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::MockTransport;
+    use kenwood_transport::MockTransport;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 

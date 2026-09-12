@@ -7,7 +7,8 @@
 //! reveals exactly which struct byte maps to which CAT field.
 
 use kenwood_thd75::protocol::Codec;
-use kenwood_thd75::transport::{EitherTransport, SerialTransport, Transport};
+use kenwood_thd75::transport::{EitherTransport, SerialTransport};
+use kenwood_transport::Transport;
 
 fn open_transport() -> (String, EitherTransport) {
     if let Ok(ports) = SerialTransport::discover_usb() {

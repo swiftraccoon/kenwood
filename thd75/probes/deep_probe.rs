@@ -29,7 +29,8 @@
 mod firmware_guard;
 
 use kenwood_thd75::protocol::Codec;
-use kenwood_thd75::transport::{SerialTransport, Transport};
+use kenwood_thd75::transport::SerialTransport;
+use kenwood_transport::Transport;
 
 async fn raw_cmd(transport: &mut SerialTransport, cmd: &str) -> Option<String> {
     let wire = format!("{cmd}\r");

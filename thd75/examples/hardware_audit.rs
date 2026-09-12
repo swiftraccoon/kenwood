@@ -66,7 +66,8 @@ use kenwood_thd75::protocol::Codec;
 use kenwood_thd75::radio::automation::AutomationAbi;
 #[cfg(target_os = "macos")]
 use kenwood_thd75::transport::BluetoothTransport;
-use kenwood_thd75::transport::{EitherTransport, SerialTransport, Transport};
+use kenwood_thd75::transport::{EitherTransport, SerialTransport};
+use kenwood_transport::Transport;
 use serde_json::{Map, Value, json};
 
 type AuditError = Box<dyn Error + Send + Sync>;
@@ -2892,8 +2893,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    use kenwood_thd75::error::TransportError;
-    use kenwood_thd75::transport::MockTransport;
+    use kenwood_transport::{MockTransport, TransportError};
 
     type TestResult = AuditResult<()>;
 

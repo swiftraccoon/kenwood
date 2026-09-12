@@ -5,10 +5,9 @@ use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use kenwood_tmd750::transport::{
-    SerialCandidate, SerialTransport, Transport, TransportError, discover_serial, open_serial,
-};
+use kenwood_tmd750::transport::{SerialCandidate, SerialTransport, discover_serial, open_serial};
 use kenwood_tmd750::{DvGatewayMode, Identity, Radio};
+use kenwood_transport::{Transport, TransportError};
 use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
 
@@ -776,8 +775,9 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
 
-    use kenwood_tmd750::transport::{KENWOOD_VID, MockTransport, TMD750_MAIN_PID};
+    use kenwood_tmd750::transport::{KENWOOD_VID, TMD750_MAIN_PID};
     use kenwood_tmd750::{FirmwareIdentity, RadioModel, RadioType};
+    use kenwood_transport::MockTransport;
 
     type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 

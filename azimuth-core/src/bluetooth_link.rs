@@ -6,11 +6,10 @@ use kenwood_thd75::types::SerialNumber;
 
 #[cfg(target_os = "macos")]
 use kenwood_thd75::{
-    Radio,
-    error::TransportError,
-    radio::raw_protocol_session::RawProtocolSession,
-    transport::{BluetoothTransport, Transport},
+    Radio, radio::raw_protocol_session::RawProtocolSession, transport::BluetoothTransport,
 };
+#[cfg(target_os = "macos")]
+use kenwood_transport::{Transport, TransportError};
 #[cfg(target_os = "macos")]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(target_os = "macos")]
@@ -1345,8 +1344,8 @@ mod tests {
     fn serial_qualification_transport(
         recovery_residue: &[u8],
         serial_number: &str,
-    ) -> kenwood_thd75::transport::MockTransport {
-        use kenwood_thd75::transport::MockTransport;
+    ) -> kenwood_transport::MockTransport {
+        use kenwood_transport::MockTransport;
 
         let mut transport = MockTransport::new();
         transport.expect(b"ID\r", b"N\r");

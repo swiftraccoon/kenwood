@@ -3,8 +3,8 @@
 use super::Radio;
 use crate::error::{Error, ProtocolError};
 use crate::protocol::mcp::{ACK, write_request};
-use crate::transport::Transport;
 use crate::types::{Address, PAGE_SIZE, Page};
+use kenwood_transport::Transport;
 
 /// No caller-supplied address can reach this experimental frame writer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

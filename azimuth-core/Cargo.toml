@@ -26,6 +26,7 @@ default = []
 bindgen-cli = ["uniffi/cli"]
 
 [dependencies]
+kenwood-transport = { path = "../kenwood-transport", default-features = false }
 aprs = { path = "../aprs" }
 async-trait = "0.1"
 ax25-codec = { path = "../ax25-codec" }

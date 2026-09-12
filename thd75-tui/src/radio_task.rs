@@ -8,11 +8,11 @@ use kenwood_thd75::WritableMcpPage;
 use kenwood_thd75::radio::LinkState;
 use kenwood_thd75::transport::EitherTransport;
 use kenwood_thd75::transport::SerialTransport;
-use kenwood_thd75::transport::Transport;
 use kenwood_thd75::types::{
     Band, BandMode, DstarCallsign, DstarSuffix, DvGatewayMode, GpsRadioMode, Module,
-    ReflectorCallsign, SMeterReading,
+    ReflectorCallsign, SMeterReading, TncDataBand,
 };
+use kenwood_transport::Transport;
 use tokio::sync::mpsc;
 
 use crate::app::{BandState, Message, RadioState};
@@ -213,7 +213,7 @@ pub(crate) async fn spawn_with_transport(
         // APRS mode entry (radio consumed). `aprs_pending` stores an APRS
         // config when the inner loop broke because of an EnterAprs command.
         let mut aprs_pending: Option<Box<kenwood_thd75::AprsClientConfig>> = None;
-        let mut dstar_pending: Option<kenwood_thd75::DstarGatewayConfig> = None;
+        let mut dstar_pending: Option<mmdvm::dstar::DstarModemConfig> = None;
 
         // Main loop: poll + handle commands + process AI notifications
         'outer: loop {
@@ -1152,11 +1152,14 @@ enum EnterDstarError {
 /// D-STAR event loop, and returns the `Radio` after `DstarGateway::stop`.
 async fn enter_dstar_session(
     radio: Radio<EitherTransport>,
-    config: kenwood_thd75::DstarGatewayConfig,
+    config: mmdvm::dstar::DstarModemConfig,
     tx: &mpsc::UnboundedSender<Message>,
     cmd_rx: &mut mpsc::UnboundedReceiver<crate::event::RadioCommand>,
 ) -> Result<Radio<EitherTransport>, EnterDstarError> {
-    let mut gateway = match kenwood_thd75::DstarGateway::start(radio, config).await {
+    // Preserve the firmware-qualified transient gateway choice `TN 3,1`.
+    // TNC band selection belongs to the radio lifecycle, not the shared modem.
+    let mut gateway = match kenwood_thd75::DstarGateway::start(radio, TncDataBand::B, config).await
+    {
         Ok(g) => g,
         Err((radio, e)) => {
             return Err(EnterDstarError::RadioRecoveryFailed {
@@ -1205,7 +1208,7 @@ async fn run_dstar_loop(
                             return Ok(()); // TUI closed
                         }
                     }
-                    Ok(None) | Err(kenwood_thd75::Error::Timeout(_)) => {
+                    Ok(None) | Err(mmdvm::dstar::DstarError::Timeout(_)) => {
                         // Timeout: no activity, loop again.
                     }
                     Err(e) => {
@@ -1291,8 +1294,7 @@ fn discover_and_open(port: Option<&str>, baud: u32) -> Result<(String, EitherTra
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kenwood_thd75::MockTransport;
-    use kenwood_thd75::types::TncDataBand;
+    use kenwood_transport::MockTransport;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -1489,10 +1491,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dstar_worker_preserves_the_qualified_band_b_entry_command() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"ID\r", b"ID TH-D75\r");
+        mock.expect(b"FV\r", b"FV 1.03.AZM\r");
+        // Reject the exact entry command so this bounded test never starts
+        // the binary modem loop or needs a gateway shutdown sequence.
+        mock.expect(b"TN 3,1\r", b"N\r");
+        mock.expect(b"ID\r", b"ID TH-D75\r");
+
+        let mut radio = Radio::new(EitherTransport::Mock(mock));
+        assert_eq!(
+            radio.identify().await?.model,
+            kenwood_thd75::RadioModel::ThD75
+        );
+        assert_eq!(radio.get_firmware_version().await?.as_str(), "1.03.AZM");
+        let config = mmdvm::dstar::DstarModemConfig::new("N0CALL")?;
+        let (message_tx, mut message_rx) = mpsc::unbounded_channel();
+        let (_command_tx, mut command_rx) = mpsc::unbounded_channel();
+
+        let outcome = enter_dstar_session(radio, config, &message_tx, &mut command_rx).await;
+        let Err(EnterDstarError::RadioRecoveryFailed {
+            message,
+            radio: Some(mut radio),
+        }) = outcome
+        else {
+            return Err("rejected Band B entry must return the original CAT owner".into());
+        };
+        assert_eq!(
+            message,
+            "D-STAR gateway start failed: TN command not available in current radio mode"
+        );
+        assert!(
+            !radio.cat_recovery_required(),
+            "a complete CAT rejection must not invent binary mode or require recovery"
+        );
+        assert!(
+            message_rx.try_recv().is_err(),
+            "rejected mode entry must not announce D-STAR startup"
+        );
+        assert_eq!(
+            radio.identify().await?.model,
+            kenwood_thd75::RadioModel::ThD75
+        );
+        (*radio).disconnect().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn dstar_entry_failure_preserves_returned_radio_owner() -> TestResult {
         let radio = Radio::new(EitherTransport::Mock(MockTransport::new()));
-        let config =
-            kenwood_thd75::DstarGatewayConfig::new(DstarCallsign::new("N0CALL")?, TncDataBand::B);
+        let config = mmdvm::dstar::DstarModemConfig::new("N0CALL")?;
         let (message_tx, _message_rx) = mpsc::unbounded_channel();
         let (_command_tx, mut command_rx) = mpsc::unbounded_channel();
 

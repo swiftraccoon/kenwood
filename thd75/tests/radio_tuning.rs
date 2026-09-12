@@ -2,9 +2,9 @@
 
 use kenwood_thd75::protocol::programming;
 use kenwood_thd75::radio::Radio;
-use kenwood_thd75::transport::MockTransport;
 use kenwood_thd75::types::{Band, RegularChannel, TncDataBand, TncMode};
 use kenwood_thd75::{Error, WritableMcpPage};
+use kenwood_transport::MockTransport;
 
 // Deps visible to every kenwood-thd75 test target but unused here.
 // Acknowledged so `unused_crate_dependencies` stays silent without

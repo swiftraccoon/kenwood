@@ -11,9 +11,9 @@
 
 use kenwood_thd75::radio::automation::AutomationSession;
 use kenwood_thd75::radio::if_tap::IfTapRestoreReport;
-use kenwood_thd75::transport::Transport;
 use kenwood_thd75::types::{Frequency, OperatingMode, StepSize, UsbAudioOutput};
 use kenwood_thd75::{Error, IfTapConfig, IfTapSavedState, Radio};
+use kenwood_transport::Transport;
 
 /// Fixed center of the TH-D75 real low-IF USB stream.
 pub(crate) const IF_CENTER_HZ: u32 = 12_000;
@@ -224,7 +224,7 @@ fn is_current_mode_unavailable(error: &Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kenwood_thd75::transport::MockTransport;
+    use kenwood_transport::MockTransport;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 

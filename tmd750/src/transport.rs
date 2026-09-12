@@ -1,15 +1,17 @@
-//! The only module that names the TH-D75 crate: its radio-agnostic transport
-//! trait and mock, plus TM-D750 serial transport and discovery.
+//! TM-D750 endpoint discovery and model-specific serial line settings.
 //!
-//! The TM-D750 transport is local because the radio requires RTS/CTS flow
-//! control with DTR and RTS asserted even over USB. It also has different USB
-//! product identifiers from the TH-D75. Automatic reopening is unsupported:
+//! Physical I/O is provided by [`kenwood_transport`]. The model wrapper selects
+//! RTS/CTS flow control with DTR and RTS asserted, including over USB, and
+//! discovery prioritizes the observed TM-D750 USB identities.
+//! Automatic reopening is unsupported:
 //! a device path alone cannot prove which radio owns a re-enumerated endpoint.
 
-pub use kenwood_thd75::error::TransportError;
-pub use kenwood_thd75::transport::{MockTransport, Transport};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio_serial::{FlowControl, SerialPort, SerialStream};
+use std::num::NonZeroU32;
+
+use kenwood_transport::serial::{
+    CloseMode, FlowControl, LineState, SerialOptions, SerialTransport as SerialIo,
+};
+use kenwood_transport::{Transport, TransportError};
 
 /// JVCKENWOOD's USB vendor id.
 pub const KENWOOD_VID: u16 = 0x2166;
@@ -19,10 +21,6 @@ pub const TMD750_MAIN_PID: u16 = 0x9030;
 pub const TMD750_PANEL_PID: u16 = 0x9032;
 /// Hardware-validated CAT baud rate, also used by the official MCP program.
 pub const DEFAULT_BAUD: u32 = 9600;
-
-const FLOW_CONTROL: FlowControl = FlowControl::Hardware;
-const ASSERT_DTR: bool = true;
-const ASSERT_RTS: bool = true;
 
 /// A serial port that may be a TM-D750; only an `ID` reply proves it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,9 +97,7 @@ pub fn prioritize(candidates: Vec<SerialCandidate>) -> Vec<SerialCandidate> {
 /// device; this transport never treats a stored path as a stable identity.
 #[derive(Debug)]
 pub struct SerialTransport {
-    port: Option<SerialStream>,
-    path: String,
-    baud: u32,
+    inner: SerialIo,
 }
 
 impl SerialTransport {
@@ -110,94 +106,50 @@ impl SerialTransport {
     /// # Errors
     ///
     /// Returns [`TransportError::Open`] when no Tokio runtime is active or
-    /// the endpoint or required modem-line configuration cannot be opened.
+    /// `baud` is zero, or the endpoint or required modem-line configuration
+    /// cannot be opened.
     pub fn open(path: &str, baud: u32) -> Result<Self, TransportError> {
-        if tokio::runtime::Handle::try_current().is_err() {
-            return Err(open_error(
+        let baud = NonZeroU32::new(baud).ok_or_else(|| {
+            open_error(
                 path,
-                std::io::Error::other("no Tokio runtime is active on this thread"),
-            ));
-        }
-        tracing::info!(
-            path,
-            baud,
-            flow_control = ?FLOW_CONTROL,
-            dtr = ASSERT_DTR,
-            rts = ASSERT_RTS,
-            "opening TM-D750 serial endpoint"
-        );
-        let builder = tokio_serial::new(path, baud)
-            .flow_control(FLOW_CONTROL)
-            .dtr_on_open(ASSERT_DTR);
-        #[cfg(unix)]
-        let builder = builder.exclusive(true);
-        let mut port = SerialStream::open(&builder).map_err(|error| open_error(path, error))?;
-        port.write_data_terminal_ready(ASSERT_DTR)
-            .map_err(|error| open_error(path, error))?;
-        port.write_request_to_send(ASSERT_RTS)
-            .map_err(|error| open_error(path, error))?;
-        tracing::info!(path, "TM-D750 serial endpoint opened");
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "baud rate must be nonzero",
+                ),
+            )
+        })?;
         Ok(Self {
-            port: Some(port),
-            path: path.to_owned(),
-            baud,
-        })
-    }
-
-    fn port_mut(&mut self) -> Result<&mut SerialStream, TransportError> {
-        self.port.as_mut().ok_or_else(|| {
-            TransportError::Disconnected(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "serial endpoint is closed",
-            ))
+            inner: SerialIo::open(path, serial_options(baud))?,
         })
     }
 }
 
 impl Transport for SerialTransport {
     async fn write(&mut self, data: &[u8]) -> Result<(), TransportError> {
-        tracing::trace!(path = %self.path, raw = ?data, "serial write requested");
-        let port = self.port_mut()?;
-        port.write_all(data).await.map_err(TransportError::Write)?;
-        port.flush().await.map_err(TransportError::Write)?;
-        tracing::debug!(path = %self.path, bytes = data.len(), "serial write completed");
-        Ok(())
+        self.inner.write(data).await
     }
 
     async fn read(&mut self, buffer: &mut [u8]) -> Result<usize, TransportError> {
-        let count = self
-            .port_mut()?
-            .read(buffer)
-            .await
-            .map_err(TransportError::Read)?;
-        tracing::debug!(path = %self.path, bytes = count, "serial bytes received");
-        if let Some(received) = buffer.get(..count) {
-            tracing::trace!(path = %self.path, raw = ?received, "serial bytes received");
-        }
-        Ok(count)
+        self.inner.read(buffer).await
     }
 
     async fn close(&mut self) -> Result<(), TransportError> {
-        tracing::info!(path = %self.path, "closing TM-D750 serial endpoint");
-        let Some(mut port) = self.port.take() else {
-            return Ok(());
-        };
-        port.shutdown().await.map_err(TransportError::Disconnected)
+        self.inner.close().await
     }
 
     fn set_baud_rate(&mut self, baud: u32) -> Result<(), TransportError> {
-        let path = self.path.clone();
-        tracing::debug!(
-            path,
-            previous_baud = self.baud,
-            baud,
-            "changing serial baud rate"
-        );
-        self.port_mut()?
-            .set_baud_rate(baud)
-            .map_err(|error| open_error(&path, error))?;
-        self.baud = baud;
-        Ok(())
+        self.inner.set_baud_rate(baud)
+    }
+}
+
+/// Model-owned line settings; shared I/O never selects a radio preset.
+const fn serial_options(baud: NonZeroU32) -> SerialOptions {
+    SerialOptions {
+        baud,
+        flow_control: FlowControl::Hardware,
+        dtr: LineState::Assert,
+        rts: LineState::Assert,
+        close_mode: CloseMode::Shutdown,
     }
 }
 
@@ -253,29 +205,29 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn reopening_without_a_stable_identity_is_unsupported() {
-        let mut transport = SerialTransport {
-            port: None,
-            path: "unqualified-endpoint".to_owned(),
-            baud: DEFAULT_BAUD,
-        };
-        let result = transport.reopen().await;
-        assert!(
-            matches!(result, Err(TransportError::ReopenUnsupported)),
-            "{result:?}"
-        );
-        assert!(transport.port.is_none());
+    #[test]
+    fn hardware_serial_settings_are_pinned() -> TestResult {
+        let options = serial_options(NonZeroU32::new(DEFAULT_BAUD).ok_or("zero default baud")?);
+        assert_eq!(DEFAULT_BAUD, 9600);
+        assert_eq!(options.baud.get(), DEFAULT_BAUD);
+        assert!(matches!(options.flow_control, FlowControl::Hardware));
+        assert!(matches!(options.dtr, LineState::Assert));
+        assert!(matches!(options.rts, LineState::Assert));
+        assert!(matches!(options.close_mode, CloseMode::Shutdown));
+        assert_eq!(TMD750_MAIN_PID, 0x9030);
+        assert_eq!(TMD750_PANEL_PID, 0x9032);
+        Ok(())
     }
 
     #[test]
-    fn hardware_serial_settings_are_pinned() {
-        assert_eq!(DEFAULT_BAUD, 9600);
-        assert!(matches!(FLOW_CONTROL, FlowControl::Hardware));
-        const { assert!(ASSERT_DTR) };
-        const { assert!(ASSERT_RTS) };
-        assert_eq!(TMD750_MAIN_PID, 0x9030);
-        assert_eq!(TMD750_PANEL_PID, 0x9032);
+    fn zero_baud_is_rejected_before_opening_an_endpoint() -> TestResult {
+        let result = SerialTransport::open("/dev/tmd750-test", 0);
+        let Err(TransportError::Open { path, source }) = result else {
+            return Err(format!("expected invalid baud error, got {result:?}").into());
+        };
+        assert_eq!(path, "/dev/tmd750-test");
+        assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput);
+        Ok(())
     }
 
     #[test]

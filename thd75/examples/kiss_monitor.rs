@@ -29,8 +29,8 @@ use thiserror as _;
 use tokio_serial as _;
 use tracing as _;
 
-use kenwood_thd75::Transport;
 use kenwood_thd75::transport::SerialTransport;
+use kenwood_transport::Transport;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

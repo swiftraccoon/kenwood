@@ -12,7 +12,7 @@ use std::time::Duration;
 use crate::error::Error;
 use crate::radio::{LinkState, Radio};
 use crate::session::ReconnectPolicy;
-use crate::transport::Transport;
+use kenwood_transport::Transport;
 
 /// Broadcast capacity for [`LinkEvent`]s. Slow subscribers that fall
 /// further behind than this lag (tokio broadcast semantics) skip old

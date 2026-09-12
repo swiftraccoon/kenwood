@@ -2,7 +2,8 @@
 //! Run: cargo test --test bl_dw_probe -- --ignored --nocapture --test-threads=1
 
 use kenwood_thd75::protocol::Codec;
-use kenwood_thd75::transport::{SerialTransport, Transport};
+use kenwood_thd75::transport::SerialTransport;
+use kenwood_transport::Transport;
 
 async fn raw(transport: &mut SerialTransport, cmd: &[u8]) -> Option<String> {
     let _ = transport.write(cmd).await;
