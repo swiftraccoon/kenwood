@@ -32,11 +32,11 @@ fn arguments() -> Vec<String> {
 fn request(backup: PathBuf) -> Result<SetRequest, TestError> {
     Ok(SetRequest {
         backup,
-        expected: Pm1Name::new("PM1")?,
+        expected: parse_value("PM1")?,
         apply: true,
         output: None,
         setting: TextSetting::PmName1,
-        value: Pm1Name::new("Home")?,
+        value: parse_value("Home")?,
     })
 }
 
@@ -88,21 +88,22 @@ fn approval_expected_name_and_supported_scope_are_mandatory() -> TestResult {
         .is_err(),
         "expected current name is required"
     );
-    for setting in TextSetting::all()
-        .iter()
-        .copied()
-        .filter(|setting| *setting != TextSetting::PmName1)
-    {
+    for setting in TextSetting::all().iter().copied().filter(|setting| {
+        !matches!(
+            setting,
+            TextSetting::PmName1 | TextSetting::DstarMyCallsign1
+        )
+    }) {
         let mut candidate = request(PathBuf::from("missing.json"))?;
         candidate.setting = setting;
         assert!(
             candidate.validate_options().is_err(),
-            "{setting} must remain offline-only"
+            "{setting} must remain outside this dedicated text setter"
         );
         assert!(
             candidate
                 .prepare(&endpoint(), DEFAULT_BAUD)
-                .is_err_and(|error| error.to_string().contains("no qualified live setter")),
+                .is_err_and(|error| error.to_string().contains("no dedicated text setter")),
             "unsupported scope must fail before backup access"
         );
     }
@@ -167,7 +168,7 @@ fn invalid_labels_and_no_change_are_rejected_before_any_io() -> TestResult {
             .is_err_and(|error| error.to_string().contains("no name change")),
         "no-op must not touch the backup or radio"
     );
-    candidate.value = Pm1Name::new("Home")?;
+    candidate.value = "Home".to_owned();
     candidate.apply = false;
     assert!(
         candidate
@@ -235,7 +236,9 @@ fn complete_backup_retains_all_unrelated_bytes_and_binds_expected_name() -> Test
     let path = directory.path().join("report.json");
     backup_fixture(&path)?;
     let mut candidate = request(path)?;
-    let update = candidate.prepare(&endpoint(), DEFAULT_BAUD)?;
+    let PreparedUpdate::Pm1(update) = candidate.prepare(&endpoint(), DEFAULT_BAUD)? else {
+        return Err("PM1 request selected a different target".into());
+    };
     assert_eq!(update.original_page().first(), Some(&0x42));
     assert_eq!(update.current_name().as_str(), "PM1");
     assert_eq!(update.desired_name().as_str(), "Home");
@@ -250,7 +253,7 @@ fn complete_backup_retains_all_unrelated_bytes_and_binds_expected_name() -> Test
             "unrelated byte {index} must not change"
         );
     }
-    candidate.expected = Pm1Name::new("Other")?;
+    candidate.expected = "Other".to_owned();
     assert!(
         candidate.prepare(&endpoint(), DEFAULT_BAUD).is_err(),
         "expected current name must match actual captured bytes"

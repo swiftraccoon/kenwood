@@ -51,7 +51,7 @@ impl Artifacts {
         })
     }
 
-    /// Reserve the opt-in verification transcript before opening any connection.
+    /// Reserve the fresh-verification transcript before opening any connection.
     pub(super) fn reserve_post_exit(
         &self,
         cancelled: Arc<AtomicBool>,
@@ -107,6 +107,12 @@ pub(super) fn create_private_file(path: &Path) -> io::Result<File> {
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(super) enum Event<'a> {
+    /// Opening the selected endpoint was requested; this is not protocol proof.
+    OpenRequested { path: &'a str, baud: u32 },
+    /// A new host handle was obtained; firmware readiness is not established.
+    OpenCompleted,
+    /// No handle was obtained from the requested opening operation.
+    OpenFailed { error: Failure },
     /// Bytes supplied to the transport, recorded before dispatch.
     WriteRequested { bytes: &'a [u8] },
     /// The transport accepted and flushed the entire requested write.
@@ -220,6 +226,16 @@ impl<W: Write> Recorder<W> {
 }
 
 impl Recorder<File> {
+    /// Clone this file descriptor solely for synchronizing already flushed events.
+    ///
+    /// The handle must never write or seek. Cloning does not synchronize content;
+    /// the caller must explicitly call `sync_all` at the intended boundary and
+    /// retain any failure before permitting further protocol work.
+    pub(super) fn synchronization_handle(&self) -> io::Result<File> {
+        self.ensure_complete()?;
+        self.writer.try_clone()
+    }
+
     /// Flush and synchronize transcript evidence before accepting a session.
     ///
     /// A prior recording failure still makes this fail even if synchronization

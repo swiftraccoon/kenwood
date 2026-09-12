@@ -122,6 +122,105 @@ impl FieldCodec {
             Self::Bytes { .. } => "bytes",
         }
     }
+
+    fn validate(self, field: &'static str) -> Result<(), SchemaError> {
+        match self {
+            Self::Byte { min, max } if min > max => Err(SchemaError::InvalidCodec {
+                field,
+                property: "unsigned range",
+            }),
+            Self::BitBool { mask } if mask.count_ones() != 1 => Err(SchemaError::InvalidBitField {
+                field,
+                mask,
+                shift: 0,
+            }),
+            Self::BitField {
+                mask,
+                shift,
+                min,
+                max,
+            } => validate_bit_codec(field, mask, shift, min, max),
+            Self::Unsigned {
+                width, min, max, ..
+            } => {
+                validate_integer_width(field, width)?;
+                if min > max {
+                    return Err(SchemaError::InvalidCodec {
+                        field,
+                        property: "unsigned range",
+                    });
+                }
+                let capacity = (1_u128 << (u32::from(width) * 8)) - 1;
+                if u128::from(max) > capacity {
+                    return Err(SchemaError::DomainExceedsWidth { field, width });
+                }
+                Ok(())
+            }
+            Self::Signed {
+                width, min, max, ..
+            } => {
+                validate_integer_width(field, width)?;
+                if min > max {
+                    return Err(SchemaError::InvalidCodec {
+                        field,
+                        property: "signed range",
+                    });
+                }
+                let magnitude = 1_i128 << (u32::from(width) * 8 - 1);
+                if i128::from(min) < -magnitude || i128::from(max) >= magnitude {
+                    return Err(SchemaError::DomainExceedsWidth { field, width });
+                }
+                Ok(())
+            }
+            Self::FixedString { len, .. } | Self::Bytes { len }
+                if !(1..=IMAGE_LENGTH).contains(&len) =>
+            {
+                Err(SchemaError::InvalidCodec {
+                    field,
+                    property: "encoded length",
+                })
+            }
+            Self::Byte { .. }
+            | Self::Bool
+            | Self::BitBool { .. }
+            | Self::FixedString { .. }
+            | Self::Bytes { .. } => Ok(()),
+        }
+    }
+}
+
+const fn validate_integer_width(field: &'static str, width: u8) -> Result<(), SchemaError> {
+    if width == 0 || width > 8 {
+        Err(SchemaError::InvalidIntegerWidth { field, width })
+    } else {
+        Ok(())
+    }
+}
+
+const fn validate_bit_codec(
+    field: &'static str,
+    mask: u8,
+    shift: u8,
+    min: u8,
+    max: u8,
+) -> Result<(), SchemaError> {
+    let shifted = if shift < 8 { mask >> shift } else { 0 };
+    let lower = if shift == 0 || shift >= 8 {
+        0
+    } else {
+        u8::MAX >> (8 - shift)
+    };
+    if mask == 0
+        || shift >= 8
+        || mask & lower != 0
+        || shifted & shifted.wrapping_add(1) != 0
+        || min > max
+        || max > shifted
+    {
+        Err(SchemaError::InvalidBitField { field, mask, shift })
+    } else {
+        Ok(())
+    }
 }
 
 /// One stride-scaled dimension index of a field address.
@@ -186,14 +285,26 @@ impl FieldDescriptor {
         !self.terms.is_empty()
     }
 
+    fn validate(&self) -> Result<(), SchemaError> {
+        self.codec.validate(self.name)?;
+        if let Some(registered) = super::menu_field(self.name)
+            && registered.descriptor != *self
+        {
+            return Err(SchemaError::CatalogDescriptorMismatch { field: self.name });
+        }
+        Ok(())
+    }
+
     /// Resolve the absolute address for `slot`.
     ///
     /// # Errors
     ///
     /// Returns [`SchemaError::SlotRequired`] for a per-slot field without a
     /// slot, [`SchemaError::UnknownDimension`] for a term other than
-    /// `pm_slot`, and [`SchemaError::OutOfBounds`] past the image.
+    /// `pm_slot`, and [`SchemaError::OutOfBounds`] past the image. Malformed
+    /// codec shapes and altered registered descriptors are rejected first.
     pub fn address(&self, slot: Option<SlotIndex>) -> Result<Address, SchemaError> {
+        self.validate()?;
         let mut address = u64::from(self.base);
         for term in self.terms {
             if term.dimension != SLOT_TERM.dimension {
@@ -206,7 +317,14 @@ impl FieldDescriptor {
                 field: self.name,
                 dimension: term.dimension,
             })?;
-            address += u64::from(term.stride) * u64::from(slot.index());
+            address = address
+                .checked_add(u64::from(term.stride) * u64::from(slot.index()))
+                .ok_or_else(|| SchemaError::OutOfBounds {
+                    field: self.name,
+                    address: u64::MAX,
+                    len: self.codec.encoded_len(),
+                    image_length: IMAGE_LENGTH,
+                })?;
         }
         let len = self.codec.encoded_len();
         let out_of_bounds = SchemaError::OutOfBounds {
@@ -215,7 +333,9 @@ impl FieldDescriptor {
             len,
             image_length: IMAGE_LENGTH,
         };
-        let end = address + u64::try_from(len).unwrap_or(u64::MAX);
+        let end = address
+            .checked_add(u64::try_from(len).unwrap_or(u64::MAX))
+            .ok_or_else(|| out_of_bounds.clone())?;
         if end > u64::try_from(IMAGE_LENGTH).unwrap_or(u64::MAX) {
             return Err(out_of_bounds);
         }
@@ -310,8 +430,16 @@ impl FieldDescriptor {
     ///
     /// # Errors
     ///
-    /// Returns type, range, and text errors.
+    /// Returns malformed-codec, registry-integrity, type, range, and text errors.
+    /// A registered field retains its finite writable domain even when callers
+    /// pass its descriptor directly instead of its menu metadata. Registered
+    /// blobs remain available for offline encoding; the planner separately
+    /// enforces radio-write admission.
     pub fn encode(&self, value: FieldValue<'_>) -> Result<Vec<(usize, u8, u8)>, SchemaError> {
+        self.validate()?;
+        if let Some(registered) = super::menu_field(self.name) {
+            registered.validate_value_domain(value)?;
+        }
         let mismatch = |actual: &'static str| SchemaError::TypeMismatch {
             field: self.name,
             expected: self.codec.value_kind(),
@@ -363,7 +491,7 @@ impl FieldDescriptor {
                         max,
                     });
                 }
-                integer_bytes(raw, width, endian)
+                integer_bytes(self.name, raw, width, endian)?
             }
             (
                 FieldCodec::Signed {
@@ -382,7 +510,12 @@ impl FieldDescriptor {
                         max,
                     });
                 }
-                integer_bytes(u64::from_ne_bytes(raw.to_ne_bytes()), width, endian)
+                integer_bytes(
+                    self.name,
+                    u64::from_ne_bytes(raw.to_ne_bytes()),
+                    width,
+                    endian,
+                )?
             }
             (FieldCodec::Bytes { len }, FieldValue::Bytes(bytes)) => {
                 if bytes.len() != len {
@@ -428,6 +561,9 @@ impl FieldDescriptor {
                 max: len,
             });
         }
+        if text.bytes().any(|byte| byte == 0 || byte == padding) {
+            return Err(SchemaError::TextTerminator { field: self.name });
+        }
         if encoding == StringEncoding::MemoryMap
             && let Some(&bad) = text
                 .as_bytes()
@@ -471,20 +607,25 @@ fn unsigned(bytes: &[u8], endian: Endian) -> u64 {
     value
 }
 
-fn integer_bytes(raw: u64, width: u8, endian: Endian) -> Vec<(usize, u8, u8)> {
+fn integer_bytes(
+    field: &'static str,
+    raw: u64,
+    width: u8,
+    endian: Endian,
+) -> Result<Vec<(usize, u8, u8)>, SchemaError> {
     let mut bytes: Vec<u8> = raw
         .to_le_bytes()
         .get(..usize::from(width))
-        .unwrap_or_default()
+        .ok_or(SchemaError::InvalidIntegerWidth { field, width })?
         .to_vec();
     if endian == Endian::Big {
         bytes.reverse();
     }
-    bytes
+    Ok(bytes
         .into_iter()
         .enumerate()
         .map(|(offset, byte)| (offset, 0xFF, byte))
-        .collect()
+        .collect())
 }
 
 /// A value to write.
@@ -555,6 +696,10 @@ impl PatchPlanner {
 
     /// Plan `value` for `field` in `slot`.
     ///
+    /// The entire assignment is validated before the planner changes. A failed
+    /// call preserves every prior claim and retains no prefix of this field.
+    /// Registered descriptors always enforce their compiled writable domains.
+    ///
     /// # Errors
     ///
     /// Returns encode errors, [`SchemaError::NotWritable`] outside the
@@ -567,6 +712,10 @@ impl PatchPlanner {
         value: FieldValue<'_>,
     ) -> Result<&mut Self, SchemaError> {
         let start = field.address(slot)?;
+        if let Some(registered) = super::menu_field(field.name) {
+            registered.validate_patch_value(value)?;
+        }
+        let mut pending = Vec::new();
         for (offset, mask, bits) in field.encode(value)? {
             let address = start
                 .checked_add(u32::try_from(offset).unwrap_or(u32::MAX))
@@ -583,27 +732,32 @@ impl PatchPlanner {
                 });
             }
             let key = address.as_u32();
+            if let Some(claim) = self.claims.get(&key)
+                && claim.mask & mask != 0
+            {
+                return Err(SchemaError::ByteConflict {
+                    first: claim.owner,
+                    second: field.name,
+                    address: key,
+                });
+            }
+            pending.push((
+                key,
+                ByteClaim {
+                    owner: field.name,
+                    mask,
+                    value: bits,
+                },
+            ));
+        }
+        for (key, pending) in pending {
             match self.claims.get_mut(&key) {
-                Some(claim) if claim.mask & mask != 0 => {
-                    return Err(SchemaError::ByteConflict {
-                        first: claim.owner,
-                        second: field.name,
-                        address: key,
-                    });
-                }
                 Some(claim) => {
-                    claim.mask |= mask;
-                    claim.value = (claim.value & !mask) | (bits & mask);
+                    claim.mask |= pending.mask;
+                    claim.value |= pending.value;
                 }
                 None => {
-                    let _fresh = self.claims.insert(
-                        key,
-                        ByteClaim {
-                            owner: field.name,
-                            mask,
-                            value: bits & mask,
-                        },
-                    );
+                    let _fresh = self.claims.insert(key, pending);
                 }
             }
         }
@@ -617,7 +771,7 @@ impl PatchPlanner {
     /// Returns [`SchemaError::NotWritable`] if a claim has no page (cannot
     /// happen after [`PatchPlanner::set`] accepted it).
     pub fn finish(self) -> Result<PatchSet, SchemaError> {
-        let mut pages: BTreeMap<u32, PagePatch> = BTreeMap::new();
+        let mut pages: BTreeMap<u32, (crate::types::Page, Vec<BytePatch>)> = BTreeMap::new();
         for (address, claim) in self.claims {
             let page = Address::new(address)
                 .ok()
@@ -628,18 +782,24 @@ impl PatchPlanner {
                 })?;
             let entry = pages
                 .entry(page.address().as_u32())
-                .or_insert_with(|| PagePatch {
-                    page,
-                    bytes: Vec::new(),
-                });
-            entry.bytes.push(BytePatch {
-                offset: u8::try_from(address - page.address().as_u32()).unwrap_or(u8::MAX),
-                mask: claim.mask,
-                value: claim.value,
-            });
+                .or_insert_with(|| (page, Vec::new()));
+            let offset = u8::try_from(address - page.address().as_u32()).map_err(|_| {
+                SchemaError::OutOfBounds {
+                    field: claim.owner,
+                    address: u64::from(address),
+                    len: 1,
+                    image_length: IMAGE_LENGTH,
+                }
+            })?;
+            entry
+                .1
+                .push(BytePatch::new(offset, claim.mask, claim.value)?);
         }
         Ok(PatchSet {
-            pages: pages.into_values().collect(),
+            pages: pages
+                .into_values()
+                .map(|(page, bytes)| PagePatch::new(page, bytes))
+                .collect::<Result<_, _>>()?,
         })
     }
 }
@@ -669,16 +829,44 @@ impl PatchSet {
         self.pages.len()
     }
 
-    /// Apply every patch to a full image buffer.
-    pub fn apply_to_image(&self, image: &mut [u8]) {
+    /// Apply every patch only when the image contains every complete page.
+    ///
+    /// All bounds are checked before the first mutation. A failed application
+    /// leaves the image unchanged, including pages preceding the missing one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SchemaError::OutOfBounds`] if any complete target page is absent.
+    pub fn apply_to_image(&self, image: &mut [u8]) -> Result<(), SchemaError> {
+        let image_length = image.len();
+        let missing = |page: crate::types::Page| SchemaError::OutOfBounds {
+            field: "patch set",
+            address: u64::from(page.address().as_u32()),
+            len: page.len(),
+            image_length,
+        };
         for patch in &self.pages {
-            let start = patch.page.address().as_usize();
-            if let Some(window) = image.get_mut(start..start + patch.page.len()) {
-                patch.apply(window);
-            }
+            let page = patch.page();
+            let start = page.address().as_usize();
+            let _complete = image
+                .get(start..start + page.len())
+                .ok_or_else(|| missing(page))?;
         }
+        for patch in &self.pages {
+            let page = patch.page();
+            let start = page.address().as_usize();
+            let window = image
+                .get_mut(start..start + page.len())
+                .ok_or_else(|| missing(page))?;
+            patch.apply(window)?;
+        }
+        Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "schema_regression_tests.rs"]
+mod regression_tests;
 
 #[cfg(test)]
 mod tests {
@@ -687,9 +875,9 @@ mod tests {
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     const GLOBAL: FieldDescriptor =
-        FieldDescriptor::new("pm.PmSelect", 323_593, FieldCodec::Byte { min: 0, max: 5 });
+        FieldDescriptor::new("test.Global", 323_593, FieldCodec::Byte { min: 0, max: 5 });
     const PER_SLOT: FieldDescriptor = FieldDescriptor::with_terms(
-        "radio.MeterType",
+        "test.PerSlot",
         328_995,
         &[SLOT_TERM],
         FieldCodec::Byte { min: 0, max: 2 },
@@ -736,7 +924,7 @@ mod tests {
             DecodedFieldValue::Text("HOME".to_owned())
         );
         let signed = FieldDescriptor::new(
-            "gps.MyPositionList[0].Altitude",
+            "test.SignedAltitude",
             329_232,
             FieldCodec::Signed {
                 width: 4,
@@ -776,7 +964,7 @@ mod tests {
         let set = planner.finish()?;
         assert_eq!(set.len(), 2);
         let first_page = set.pages().first().ok_or("no page")?;
-        assert_eq!(first_page.page.address().as_u32(), 327_936 + 1024);
+        assert_eq!(first_page.page().address().as_u32(), 327_936 + 1024);
         let bit_a = FieldDescriptor::new("radio.A", 8, FieldCodec::BitBool { mask: 0x01 });
         let bit_b = FieldDescriptor::new("radio.B", 8, FieldCodec::BitBool { mask: 0x01 });
         let mut clash = PatchPlanner::new();
@@ -786,8 +974,7 @@ mod tests {
             matches!(conflict, Err(SchemaError::ByteConflict { address: 8, .. })),
             "{conflict:?}"
         );
-        let bitmap =
-            FieldDescriptor::new("radio.PoweronBitmap", 393_216, FieldCodec::Bytes { len: 2 });
+        let bitmap = FieldDescriptor::new("test.Bitmap", 393_216, FieldCodec::Bytes { len: 2 });
         let outside = PatchPlanner::new()
             .set(&bitmap, None, FieldValue::Bytes(&[0, 0]))
             .map(|_| ());

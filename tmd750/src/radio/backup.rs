@@ -194,7 +194,7 @@ impl<T: Transport> Radio<T> {
         if should_cancel() {
             report.outcome = McpBackupOutcome::Cancelled;
         }
-        if let Err(error) = session.exit_detached().await {
+        if let Err(error) = session.exit().await {
             report.exit = McpProbeExit::NotAcknowledged;
             report.fail(McpBackupStage::Exit, error);
             return report;

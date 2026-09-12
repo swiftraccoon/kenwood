@@ -25,7 +25,6 @@ fn probe() -> Result<McpProbeReport, Box<dyn StdError + Send + Sync>> {
             },
         ],
         exit: McpProbeExit::Acknowledged,
-        cat_identity: None,
         outcome: McpProbeOutcome::AwaitingCatVerification,
     })
 }
@@ -48,7 +47,16 @@ fn only_complete_detached_evidence_permits_verification() -> TestResult {
         verification_eligibility(&complete, None, &transcript, &cancelled).ok(),
         complete.identity.as_ref()
     );
-    for outcome in [McpProbeOutcome::Complete, McpProbeOutcome::Cancelled] {
+    for outcome in [
+        McpProbeOutcome::Cancelled,
+        McpProbeOutcome::Failed {
+            stage: McpProbeStage::Exit,
+            error: kenwood_tmd750::Error::Timeout {
+                operation: "test exit",
+                millis: 1,
+            },
+        },
+    ] {
         let mut incomplete = probe()?;
         incomplete.outcome = outcome;
         assert!(matches!(
@@ -135,7 +143,7 @@ fn close_capture_and_cancellation_failures_refuse_verification() -> TestResult {
 
 fn artifact() -> Result<ArtifactReport, Box<dyn StdError + Send + Sync>> {
     Ok(ArtifactReport {
-        format_version: 1,
+        format_version: 2,
         software_version: "test",
         started_at_utc: "2026-09-07T00:00:00Z".to_owned(),
         finished_at_utc: "2026-09-07T00:00:01Z".to_owned(),
@@ -150,38 +158,49 @@ fn artifact() -> Result<ArtifactReport, Box<dyn StdError + Send + Sync>> {
         open_error: None,
         signal_error: None,
         close_error: None,
-        post_exit_verification: None,
+        post_exit_verification: PostExitVerification::skipped(
+            SkipReason::OriginalProbeIncomplete,
+            summary()?,
+        ),
     })
 }
 
 #[test]
-fn default_artifact_omits_new_evidence_and_never_completes_a_detached_probe() -> TestResult {
-    let mut report = artifact()?;
+fn probe_artifact_always_records_the_required_fresh_verification() -> TestResult {
+    let report = artifact()?;
     let json = serde_json::to_value(&report)?;
-    assert_eq!(json.get("format_version"), Some(&serde_json::json!(1)));
-    assert!(json.get("post_exit_verification").is_none());
-    assert!(!report.succeeded());
-    report.probe.as_mut().ok_or("missing probe")?.outcome = Outcome::Complete;
-    assert!(report.succeeded());
+    assert_eq!(
+        json.get("format_version"),
+        Some(&serde_json::json!(2)),
+        "probe reports use the fresh-verification format"
+    );
+    assert_eq!(
+        json.pointer("/post_exit_verification/outcome/status"),
+        Some(&serde_json::json!("skipped")),
+        "even skipped verification must have explicit evidence"
+    );
+    assert!(
+        !report.succeeded(),
+        "read and exit evidence alone cannot complete the workflow"
+    );
     Ok(())
 }
 
 #[test]
 fn fresh_match_does_not_erase_original_failure_or_capture_failure() -> TestResult {
     let mut report = artifact()?;
-    report.format_version = 2;
     let mut verification = PostExitVerification::skipped(SkipReason::Cancelled, summary()?);
     verification.outcome = VerificationOutcome::Matched;
-    report.post_exit_verification = Some(verification);
+    report.post_exit_verification = verification;
     assert!(report.succeeded());
     let json = serde_json::to_value(&report)?;
     assert_eq!(
         json.pointer("/probe/outcome/status"),
         Some(&serde_json::json!("awaiting_cat_verification"))
     );
-    assert_eq!(
-        json.pointer("/probe/cat_identity"),
-        Some(&serde_json::Value::Null)
+    assert!(
+        json.pointer("/probe/cat_identity").is_none(),
+        "original-session evidence must not suggest old-handle CAT was queried"
     );
     assert_eq!(
         json.pointer("/post_exit_verification/identity_assurance"),
@@ -195,18 +214,9 @@ fn fresh_match_does_not_erase_original_failure_or_capture_failure() -> TestResul
     )));
     assert!(!report.succeeded());
     report.close_error = None;
-    let verification = report
-        .post_exit_verification
-        .as_mut()
-        .ok_or("missing verification")?;
-    verification.transcript.complete = false;
+    report.post_exit_verification.transcript.complete = false;
     assert!(!report.succeeded());
-    report
-        .post_exit_verification
-        .as_mut()
-        .ok_or("missing verification")?
-        .transcript
-        .complete = true;
+    report.post_exit_verification.transcript.complete = true;
     report.probe.as_mut().ok_or("missing probe")?.outcome = Outcome::Cancelled;
     assert!(!report.succeeded());
     Ok(())

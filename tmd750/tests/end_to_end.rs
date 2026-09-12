@@ -56,19 +56,19 @@ async fn patch_a_pm_name_end_to_end() -> TestResult {
     let _planner = planner.set_menu(pm_name, None, FieldValue::Text("MOBILE"))?;
     let patches = planner.finish()?;
     let mut expected_bytes = radio_image.clone().into_bytes();
-    patches.apply_to_image(&mut expected_bytes);
+    patches.apply_to_image(&mut expected_bytes)?;
     let expected_image = MemoryImage::from_bytes(expected_bytes)?;
     for patch in patches.pages() {
-        script_read(&mut mock, patch.page, radio_image.as_bytes())?;
-        let start = patch.page.address().as_usize();
+        script_read(&mut mock, patch.page(), radio_image.as_bytes())?;
+        let start = patch.page().address().as_usize();
         let written = expected_image
             .as_bytes()
-            .get(start..start + patch.page.len())
+            .get(start..start + patch.page().len())
             .ok_or("patch page outside image")?;
-        let mut frame = write_request(patch.page).to_vec();
+        let mut frame = write_request(patch.page()).to_vec();
         frame.extend_from_slice(written);
         mock.expect(&frame, &[ACK]);
-        script_read(&mut mock, patch.page, expected_image.as_bytes())?;
+        script_read(&mut mock, patch.page(), expected_image.as_bytes())?;
     }
     mock.expect(&[EXIT], &[ACK]);
 

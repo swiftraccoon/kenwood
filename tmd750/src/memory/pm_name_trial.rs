@@ -6,10 +6,13 @@
 
 use std::num::NonZeroU64;
 
+use super::fixed_text_trial::{
+    FixedTextTrial, FixedTextTrialObservation, FixedTextTrialScope, TrialSequence,
+};
 use super::{FieldCodec, FieldValue, MenuField, StringEncoding, menu_field};
 use crate::protocol::mcp::regions::writable_page_for;
 use crate::radio::Identity;
-use crate::types::{PAGE_SIZE, Page, RadioModel};
+use crate::types::{DvGatewayMode, PAGE_SIZE, Page, RadioModel};
 
 const FIELD_NAME: &str = "pm.PmName1";
 const FIELD_ADDRESS: u32 = 323_594;
@@ -35,7 +38,7 @@ pub enum PmNameTrialStatus {
 /// The only two write intents in the fixed trial.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PmNameTrialWrite {
-    /// Replace PM1's name with [`PmNameTrial::TEMPORARY_NAME`].
+    /// Apply the temporary text fixed by the prepared trial's scope.
     Rename,
     /// Restore the exact original page, not a newly synthesized name.
     Restore,
@@ -105,18 +108,6 @@ pub enum PmNameTrialSession {
     VerifyRestoration,
 }
 
-use PmNameTrialSession as Session;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Phase {
-    Fresh(Session),
-    Intent(PmNameTrialWrite),
-    Readback(PmNameTrialWrite),
-    Finalize(Session),
-    Complete,
-    Halted,
-}
-
 /// An offline, unqualified PM1 rename/restore evidence state machine.
 ///
 /// The fixed scope is global PM1 on TM-D750 / firmware 1.02 / type `K,2,1`.
@@ -135,14 +126,7 @@ enum Phase {
 /// with an original-page comparison and finalized cleanup.
 #[derive(Debug)]
 pub struct PmNameTrial {
-    identity: Identity,
-    page: Page,
-    original: [u8; PAGE_SIZE],
-    expected: [u8; PAGE_SIZE],
-    status: PmNameTrialStatus,
-    phase: Phase,
-    sessions: Vec<NonZeroU64>,
-    intents: Vec<NonZeroU64>,
+    sequence: TrialSequence,
 }
 
 impl PmNameTrial {
@@ -231,27 +215,20 @@ impl PmNameTrial {
             return Err(PmNameTrialError::UnsupportedDescriptor);
         }
         Ok(Self {
-            identity: identity.clone(),
-            page,
-            original,
-            expected,
-            status: PmNameTrialStatus::NotWritten,
-            phase: Phase::Fresh(Session::Rename),
-            sessions: Vec::with_capacity(3),
-            intents: Vec::with_capacity(2),
+            sequence: TrialSequence::new(identity, page, original, expected),
         })
     }
 
     /// The single canonical target page, resolved from the generated descriptor.
     #[must_use]
     pub const fn page(&self) -> Page {
-        self.page
+        self.sequence.page()
     }
 
     /// Exact baseline identity, to retain with both immutable page images.
     #[must_use]
     pub const fn identity(&self) -> &Identity {
-        &self.identity
+        self.sequence.identity()
     }
 
     /// Describe the next session only while awaiting a fresh-session event.
@@ -264,29 +241,25 @@ impl PmNameTrial {
     /// Returns [`PmNameTrialError::TerminalState`] after completion or halt,
     /// otherwise [`PmNameTrialError::UnexpectedEvent`] during a session.
     pub const fn next_session(&self) -> Result<PmNameTrialSession, PmNameTrialError> {
-        match self.phase {
-            Phase::Fresh(session) => Ok(session),
-            Phase::Complete | Phase::Halted => Err(PmNameTrialError::TerminalState),
-            _ => Err(PmNameTrialError::UnexpectedEvent),
-        }
+        self.sequence.next_session()
     }
 
     /// Exact immutable captured page to retain in the durable recovery record.
     #[must_use]
     pub const fn original_page(&self) -> &[u8; PAGE_SIZE] {
-        &self.original
+        self.sequence.original_page()
     }
 
     /// Exact immutable temporary page, differing only within the PM1 name.
     #[must_use]
     pub const fn expected_page(&self) -> &[u8; PAGE_SIZE] {
-        &self.expected
+        self.sequence.expected_page()
     }
 
     /// Conservative modeled restoration obligation, not a write-ready predicate.
     #[must_use]
     pub const fn status(&self) -> PmNameTrialStatus {
-        self.status
+        self.sequence.status()
     }
 
     /// Validate and record the exact next caller-attested evidence.
@@ -301,11 +274,7 @@ impl PmNameTrial {
     /// Rejects wrong order, repeated identities of sessions or journal records,
     /// target/version/page mismatches, and every event after halt or completion.
     pub fn record(&mut self, event: PmNameTrialEvent<'_>) -> Result<(), PmNameTrialError> {
-        let result = self.record_inner(event);
-        if result.is_err() && self.phase != Phase::Complete {
-            self.phase = Phase::Halted;
-        }
-        result
+        self.sequence.record(event)
     }
 
     /// Permanently stop evidence acceptance after uncertain framing, failed
@@ -316,106 +285,61 @@ impl PmNameTrial {
     /// remains known. Once an intent was recorded, `PossiblyChanged` survives
     /// halt. A previously completed restoration proof remains completed.
     pub const fn halt(&mut self) {
-        if !matches!(self.phase, Phase::Complete) {
-            self.phase = Phase::Halted;
-        }
+        self.sequence.halt();
+    }
+}
+
+impl FixedTextTrial for PmNameTrial {
+    fn scope(&self) -> FixedTextTrialScope {
+        FixedTextTrialScope::Pm1
     }
 
-    fn record_inner(&mut self, event: PmNameTrialEvent<'_>) -> Result<(), PmNameTrialError> {
-        match (self.phase, event) {
-            (Phase::Complete | Phase::Halted, _) => Err(PmNameTrialError::TerminalState),
-            (
-                Phase::Fresh(session),
-                PmNameTrialEvent::FreshSession {
-                    id,
-                    identity,
-                    memory_format,
-                    whole_page,
-                },
-            ) => self.fresh_session(session, id, identity, memory_format, whole_page),
-            (Phase::Intent(expected), PmNameTrialEvent::DurableWriteIntent { id, write }) => {
-                if write != expected {
-                    return Err(PmNameTrialError::UnexpectedEvent);
-                }
-                if self.intents.contains(&id) {
-                    return Err(PmNameTrialError::ReusedWriteIntent);
-                }
-                self.intents.push(id);
-                self.status = PmNameTrialStatus::PossiblyChanged;
-                self.phase = Phase::Readback(write);
-                Ok(())
-            }
-            (Phase::Readback(write), PmNameTrialEvent::ImmediateReadback { whole_page }) => {
-                let session = match write {
-                    PmNameTrialWrite::Rename => Session::Rename,
-                    PmNameTrialWrite::Restore => Session::Restore,
-                };
-                self.compare_page(whole_page, session == Session::Rename)?;
-                self.phase = Phase::Finalize(session);
-                Ok(())
-            }
-            (Phase::Finalize(session), PmNameTrialEvent::SessionFinalized { id }) => {
-                if self.sessions.last() != Some(&id) {
-                    return Err(PmNameTrialError::SessionMismatch);
-                }
-                self.phase = match session {
-                    Session::Rename => Phase::Fresh(Session::Restore),
-                    Session::Restore => Phase::Fresh(Session::VerifyRestoration),
-                    Session::VerifyRestoration => {
-                        self.status = PmNameTrialStatus::RestorationVerified;
-                        Phase::Complete
-                    }
-                };
-                Ok(())
-            }
-            _ => Err(PmNameTrialError::UnexpectedEvent),
-        }
+    fn identity(&self) -> &Identity {
+        self.identity()
+    }
+
+    fn page(&self) -> Page {
+        self.page()
+    }
+
+    fn original_page(&self) -> &[u8; PAGE_SIZE] {
+        self.original_page()
+    }
+
+    fn expected_page(&self) -> &[u8; PAGE_SIZE] {
+        self.expected_page()
+    }
+
+    fn status(&self) -> PmNameTrialStatus {
+        self.status()
+    }
+
+    fn next_session(&self) -> Result<PmNameTrialSession, PmNameTrialError> {
+        self.next_session()
+    }
+
+    fn halt(&mut self) {
+        self.halt();
+    }
+
+    fn record(&mut self, event: PmNameTrialEvent<'_>) -> Result<(), PmNameTrialError> {
+        self.record(event)
+    }
+
+    fn guard_page(&self) -> Option<Page> {
+        None
     }
 
     fn fresh_session(
         &mut self,
-        session: Session,
-        id: NonZeroU64,
-        identity: &Identity,
-        memory_format: u8,
-        whole_page: &[u8],
+        observation: FixedTextTrialObservation<'_>,
     ) -> Result<(), PmNameTrialError> {
-        if self.sessions.contains(&id) {
-            return Err(PmNameTrialError::ReusedSession);
-        }
-        if identity != &self.identity {
-            return Err(PmNameTrialError::IdentityMismatch);
-        }
-        if memory_format != 0 {
-            return Err(PmNameTrialError::MemoryFormat {
-                actual: memory_format,
-            });
-        }
-        self.compare_page(whole_page, session == Session::Restore)?;
-        self.sessions.push(id);
-        self.phase = match session {
-            Session::Rename => Phase::Intent(PmNameTrialWrite::Rename),
-            Session::Restore => Phase::Intent(PmNameTrialWrite::Restore),
-            Session::VerifyRestoration => Phase::Finalize(session),
-        };
-        Ok(())
-    }
-
-    fn compare_page(&self, bytes: &[u8], changed: bool) -> Result<(), PmNameTrialError> {
-        if bytes.len() != PAGE_SIZE {
-            return Err(PmNameTrialError::PageLength {
-                actual: bytes.len(),
-            });
-        }
-        let expected = if changed {
-            &self.expected
-        } else {
-            &self.original
-        };
-        if bytes != expected {
-            return Err(PmNameTrialError::PageMismatch);
-        }
-        Ok(())
+        self.record(PmNameTrialEvent::FreshSession {
+            id: observation.id,
+            identity: observation.identity,
+            memory_format: observation.memory_format,
+            whole_page: observation.whole_page,
+        })
     }
 }
 
@@ -480,13 +404,13 @@ fn encode_name(field: &MenuField, name: &str) -> Result<[u8; FIELD_LENGTH], PmNa
 #[non_exhaustive]
 pub enum PmNameTrialError {
     /// The generated field or canonical page no longer has the pinned shape.
-    #[error("generated PM1 descriptor is outside this fixed offline trial")]
+    #[error("generated descriptor is outside this fixed offline text trial")]
     UnsupportedDescriptor,
     /// The supplied full identity does not match the fixed target or baseline.
-    #[error("PM1 trial identity does not match the fixed target and baseline")]
+    #[error("fixed text trial identity does not match the target and baseline")]
     IdentityMismatch,
     /// The entire canonical page is required at every comparison.
-    #[error("PM1 trial requires a complete 256-byte page, got {actual} bytes")]
+    #[error("fixed text trial requires a complete 256-byte page, got {actual} bytes")]
     PageLength {
         /// Supplied byte count.
         actual: usize,
@@ -501,29 +425,62 @@ pub enum PmNameTrialError {
     #[error("PM1 already has the fixed trial name")]
     AlreadyTemporaryName,
     /// A fresh session supplied an unsupported memory-format byte.
-    #[error("PM1 trial requires memory-format byte zero, got {actual}")]
+    #[error("fixed text trial requires memory-format byte zero, got {actual}")]
     MemoryFormat {
         /// Observed memory-format byte.
         actual: u8,
     },
     /// Any byte differs from the exact page required at this stage.
-    #[error("PM1 trial whole-page comparison failed; stale restoration is forbidden")]
+    #[error("fixed text trial whole-page comparison failed; stale restoration is forbidden")]
     PageMismatch,
     /// The evidence is not the exact next event in the three-session sequence.
-    #[error("PM1 trial evidence is out of order")]
+    #[error("fixed text trial evidence is out of order")]
     UnexpectedEvent,
     /// A supposed fresh session reused a previously supplied connection ID.
-    #[error("PM1 trial session ID was reused")]
+    #[error("fixed text trial session ID was reused")]
     ReusedSession,
     /// The second intent reused the first intent's durable journal record ID.
-    #[error("PM1 trial durable intent ID was reused")]
+    #[error("fixed text trial durable intent ID was reused")]
     ReusedWriteIntent,
     /// Finalization does not identify the current session.
-    #[error("PM1 trial finalization does not match the current session")]
+    #[error("fixed text trial finalization does not match the current session")]
     SessionMismatch,
     /// The instance is completed or permanently halted; no more events apply.
-    #[error("PM1 trial is terminal and accepts no further evidence")]
+    #[error("fixed text trial is terminal and accepts no further evidence")]
     TerminalState,
+    /// MY1 requires a complete immutable control page in addition to its target.
+    #[error("MY1 trial requires a complete 256-byte control page, got {actual} bytes")]
+    ControlPageLength {
+        /// Supplied control-page byte count.
+        actual: usize,
+    },
+    /// Any control-page byte differs from the original captured page.
+    #[error("MY1 trial immutable control-page comparison failed")]
+    ControlPageMismatch,
+    /// MY1 requires the captured active PM selector to be Off.
+    #[error("MY1 trial requires PM Off, got stored selector {actual}")]
+    PmSelection {
+        /// Captured selector byte.
+        actual: u8,
+    },
+    /// MY1 requires captured and freshly observed DV Gateway Off.
+    #[error("MY1 trial requires Gateway Off, got {actual}")]
+    GatewayMode {
+        /// Captured or freshly observed gateway mode.
+        actual: DvGatewayMode,
+    },
+    /// The captured MY selection must remain the first MY entry.
+    #[error("MY1 trial requires stored MY selector zero, got {actual}")]
+    MySelection {
+        /// Captured selector byte.
+        actual: u8,
+    },
+    /// Only an exactly NUL-filled MY1 baseline is admitted by this fixed trial.
+    #[error("MY1 trial requires exactly eight zero bytes in the original MY1 field")]
+    MyCallsignNotEmpty,
+    /// Fresh MY1 sessions cannot bypass the gateway and full control-page guards.
+    #[error("MY1 trial requires fresh Gateway Off and complete control-page evidence")]
+    FreshGuardsMissing,
 }
 
 #[cfg(test)]

@@ -264,7 +264,13 @@ mod tests {
         );
         assert_eq!(
             parse_line(b"GW 2")?,
-            Response::GatewayMode(DvGatewayMode::Unqualified(2))
+            Response::GatewayMode(DvGatewayMode::Terminal),
+            "the observed Terminal reply must parse as a named read value"
+        );
+        assert_eq!(
+            parse_line(b"GW 1")?,
+            Response::GatewayMode(DvGatewayMode::Unqualified(1)),
+            "unobserved GW 1 must remain losslessly unqualified"
         );
         assert_eq!(parse_line(b"?")?, Response::Rejected);
         assert_eq!(parse_line(b"N")?, Response::NotAvailable);

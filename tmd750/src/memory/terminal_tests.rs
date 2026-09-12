@@ -173,13 +173,24 @@ fn unsafe_text_and_invalid_encoding_are_rejected_in_every_read_string() -> TestR
             ("ABé", 'é'),
         ] {
             let mut image = fixture(slot)?;
-            set_text(&mut image, field, slot, value)?;
+            let descriptor = field.descriptor()?;
+            let start = descriptor.address(Some(slot))?.as_usize();
+            let stored = image
+                .bytes
+                .get_mut(start..start + descriptor.codec.encoded_len())
+                .ok_or("stored text fixture outside image")?;
+            stored.fill(0);
+            stored
+                .get_mut(..value.len())
+                .ok_or("stored text fixture exceeds field capacity")?
+                .copy_from_slice(value.as_bytes());
             assert_eq!(
                 read(&image, slot),
                 Err(TerminalPreflightError::UnsafeText {
                     field: field.label(),
                     character
-                })
+                }),
+                "unsafe captured text must fail read-side validation without relying on encoder admission"
             );
         }
         let mut image = fixture(slot)?;

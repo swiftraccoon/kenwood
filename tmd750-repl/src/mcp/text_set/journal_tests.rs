@@ -4,7 +4,7 @@ mod unix {
     use std::num::NonZeroU64;
     use std::os::unix::fs::{PermissionsExt, symlink};
 
-    use kenwood_tmd750::memory::{Pm1Name, Pm1NameUpdateEvent};
+    use kenwood_tmd750::memory::{Pm1Name, Pm1NameUpdate, Pm1NameUpdateEvent, Pm1NameUpdateStatus};
     use kenwood_tmd750::types::{FirmwareIdentity, RadioModel, RadioType};
     use serde::Serializer;
     use serde_json::Value;

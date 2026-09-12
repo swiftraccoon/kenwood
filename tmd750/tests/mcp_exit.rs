@@ -1,4 +1,4 @@
-//! Qualification that releases post-exit CAT verification to a fresh connection.
+//! Every MCP exit retires the original handle and requires fresh CAT verification.
 
 use kenwood_thd75 as _;
 use mcp_d75_extract as _;
@@ -70,19 +70,19 @@ impl Transport for DepartingEndpoint {
 async fn assert_old_radio_is_retired(radio: &mut Radio<DepartingEndpoint>) {
     let result = radio.identify().await;
     assert!(
-        matches!(result, Err(Error::Mcp(McpError::RecoveryRequired))),
+        matches!(result, Err(Error::Mcp(McpError::ConnectionRetired))),
         "CAT must be refused without touching the retired handle: {result:?}"
     );
     {
         let result = radio.enter_mcp().await;
         assert!(
-            matches!(result, Err(Error::Mcp(McpError::RecoveryRequired))),
+            matches!(result, Err(Error::Mcp(McpError::ConnectionRetired))),
             "MCP entry must be refused on the retired handle: {result:?}"
         );
     }
     let result = radio.mcp_session();
     assert!(
-        matches!(result, Err(Error::Mcp(McpError::RecoveryRequired))),
+        matches!(result, Err(Error::Mcp(McpError::ConnectionRetired))),
         "the retired handle cannot be reborrowed as an idle MCP session: {result:?}"
     );
 }
@@ -146,20 +146,16 @@ fn assert_stopped_at_exit(mock: &MockTransport, count: usize) {
 }
 
 #[tokio::test]
-async fn detached_probe_stops_after_two_fragments_and_exit_ack() -> TestResult {
+async fn probe_stops_after_two_fragments_and_exit_ack() -> TestResult {
     let mut mock = completed_reads()?;
     mock.expect(&[EXIT], &[ACK]);
     let mut radio = Radio::new(DepartingEndpoint::new(mock));
-    let report = radio.probe_mcp_until_exit(|| false).await;
+    let report = radio.probe_mcp(|| false).await;
     assert!(
         matches!(report.outcome, McpProbeOutcome::AwaitingCatVerification),
         "{report:?}"
     );
     assert_eq!(report.exit, McpProbeExit::Acknowledged);
-    assert!(
-        report.cat_identity.is_none(),
-        "old handle must not be used for CAT verification"
-    );
     assert_eq!(
         report
             .identity
@@ -183,7 +179,7 @@ async fn detached_probe_stops_after_two_fragments_and_exit_ack() -> TestResult {
 }
 
 #[tokio::test]
-async fn detached_cancellation_preserves_first_fragment_and_exits_without_cat() -> TestResult {
+async fn cancellation_preserves_first_fragment_and_exits_without_cat() -> TestResult {
     let mut mock = MockTransport::new();
     identity_and_entry(&mut mock);
     read(&mut mock, global_page()?, 0x12);
@@ -191,7 +187,7 @@ async fn detached_cancellation_preserves_first_fragment_and_exits_without_cat() 
     let mut radio = Radio::new(DepartingEndpoint::new(mock));
     let mut checks = 0;
     let report = radio
-        .probe_mcp_until_exit(|| {
+        .probe_mcp(|| {
             checks += 1;
             checks >= 4
         })
@@ -201,7 +197,6 @@ async fn detached_cancellation_preserves_first_fragment_and_exits_without_cat() 
         "{report:?}"
     );
     assert_eq!(report.exit, McpProbeExit::Acknowledged);
-    assert!(report.cat_identity.is_none());
     assert_eq!(report.segments.len(), 1);
     assert_eq!(
         report.segments.first().map(|segment| segment.page),
@@ -219,7 +214,7 @@ async fn rejected_exit_ack_does_not_authorize_fresh_cat_verification() -> TestRe
     let mut mock = completed_reads()?;
     mock.expect(&[EXIT], &[0x15]);
     let mut radio = Radio::new(mock);
-    let report = radio.probe_mcp_until_exit(|| false).await;
+    let report = radio.probe_mcp(|| false).await;
     assert!(
         matches!(
             report.outcome,
@@ -235,7 +230,6 @@ async fn rejected_exit_ack_does_not_authorize_fresh_cat_verification() -> TestRe
     );
     assert_eq!(report.exit, McpProbeExit::NotAcknowledged);
     assert_eq!(report.segments.len(), 2);
-    assert!(report.cat_identity.is_none());
     assert_stopped_at_exit(&radio.into_transport(), 9);
     Ok(())
 }
@@ -246,7 +240,7 @@ async fn absent_exit_ack_remains_a_timeout_not_awaiting_verification() -> TestRe
     mock.expect_hang(&[EXIT]);
     let mut radio = Radio::new(mock);
     radio.set_timeout(Duration::from_millis(5));
-    let report = radio.probe_mcp_until_exit(|| false).await;
+    let report = radio.probe_mcp(|| false).await;
     assert!(
         matches!(
             report.outcome,
@@ -262,19 +256,18 @@ async fn absent_exit_ack_remains_a_timeout_not_awaiting_verification() -> TestRe
     );
     assert_eq!(report.exit, McpProbeExit::NotAcknowledged);
     assert_eq!(report.segments.len(), 2);
-    assert!(report.cat_identity.is_none());
     assert_stopped_at_exit(&radio.into_transport(), 9);
     Ok(())
 }
 
 #[tokio::test]
-async fn detached_read_failure_preserves_prior_evidence_without_sending_exit() -> TestResult {
+async fn read_failure_preserves_prior_evidence_without_sending_exit() -> TestResult {
     let mut mock = MockTransport::new();
     identity_and_entry(&mut mock);
     read(&mut mock, global_page()?, 0x12);
     mock.expect(&read_request(slot_page()?), b"W\x05\x00\x01\x00");
     let mut radio = Radio::new(mock);
-    let report = radio.probe_mcp_until_exit(|| false).await;
+    let report = radio.probe_mcp(|| false).await;
     assert!(
         matches!(
             report.outcome,
@@ -291,7 +284,6 @@ async fn detached_read_failure_preserves_prior_evidence_without_sending_exit() -
         report.segments.first().map(|segment| segment.page),
         Some(global_page()?)
     );
-    assert!(report.cat_identity.is_none());
     let mock = radio.into_transport();
     assert_eq!(mock.writes().len(), 7);
     assert_eq!(
@@ -303,11 +295,11 @@ async fn detached_read_failure_preserves_prior_evidence_without_sending_exit() -
 }
 
 #[tokio::test]
-async fn detached_read_success_does_not_unlock_firmware_102_schema_writes() -> TestResult {
+async fn read_success_does_not_unlock_firmware_102_schema_writes() -> TestResult {
     let mut original = completed_reads()?;
     original.expect(&[EXIT], &[ACK]);
     let mut original = Radio::new(original);
-    let report = original.probe_mcp_until_exit(|| false).await;
+    let report = original.probe_mcp(|| false).await;
     assert!(
         matches!(report.outcome, McpProbeOutcome::AwaitingCatVerification),
         "{report:?}"
@@ -319,14 +311,7 @@ async fn detached_read_success_does_not_unlock_firmware_102_schema_writes() -> T
     fresh.expect(&[EXIT], &[ACK]);
     let mut fresh = Radio::new(fresh);
     let mut session = fresh.enter_mcp().await?;
-    let patch = PagePatch {
-        page: global_page()?,
-        bytes: vec![BytePatch {
-            offset: 2,
-            mask: 0xFF,
-            value: 0x42,
-        }],
-    };
+    let patch = PagePatch::new(global_page()?, vec![BytePatch::new(2, 0xFF, 0x42)?])?;
     let mut progress = Vec::new();
     let result = session
         .write_pages_verified(&[patch], |value| progress.push(value))

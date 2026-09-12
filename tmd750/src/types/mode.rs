@@ -103,10 +103,16 @@ impl From<SelectableMode> for OperatingMode {
 }
 
 /// Persistent DV Gateway mode reported by the read-only `GW` command.
+///
+/// Off and Terminal were observed on firmware 1.02 through main-unit USB,
+/// with the DV Gateway routed to panel USB. A named read value does not
+/// qualify a command to select that mode or prove a reflector connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DvGatewayMode {
     /// DV Gateway is off (`0`).
     Off,
+    /// Terminal Mode is selected (`2`).
+    Terminal,
     /// A wire value not yet assigned a qualified meaning.
     Unqualified(u8),
 }
@@ -115,6 +121,7 @@ impl fmt::Display for DvGatewayMode {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Off => formatter.write_str("Off"),
+            Self::Terminal => formatter.write_str("Terminal"),
             Self::Unqualified(value) => write!(formatter, "unqualified value {value}"),
         }
     }
@@ -124,6 +131,7 @@ impl From<u8> for DvGatewayMode {
     fn from(value: u8) -> Self {
         match value {
             0 => Self::Off,
+            2 => Self::Terminal,
             other => Self::Unqualified(other),
         }
     }
@@ -133,6 +141,7 @@ impl From<DvGatewayMode> for u8 {
     fn from(value: DvGatewayMode) -> Self {
         match value {
             DvGatewayMode::Off => 0,
+            DvGatewayMode::Terminal => 2,
             DvGatewayMode::Unqualified(raw) => raw,
         }
     }
@@ -158,15 +167,49 @@ mod tests {
             assert_eq!(OperatingMode::from(raw), mode);
             assert_eq!(u8::from(mode), raw);
         }
-        for (raw, mode) in [
-            (0, DvGatewayMode::Off),
-            (1, DvGatewayMode::Unqualified(1)),
-            (2, DvGatewayMode::Unqualified(2)),
-        ] {
-            assert_eq!(DvGatewayMode::from(raw), mode);
-            assert_eq!(u8::from(mode), raw);
-        }
         Ok(())
+    }
+
+    #[test]
+    fn gateway_wire_values_have_only_observed_names() {
+        for (raw, mode, label) in [
+            (0, DvGatewayMode::Off, "Off"),
+            (2, DvGatewayMode::Terminal, "Terminal"),
+            (1, DvGatewayMode::Unqualified(1), "unqualified value 1"),
+            (3, DvGatewayMode::Unqualified(3), "unqualified value 3"),
+            (
+                u8::MAX,
+                DvGatewayMode::Unqualified(u8::MAX),
+                "unqualified value 255",
+            ),
+        ] {
+            assert_eq!(
+                DvGatewayMode::from(raw),
+                mode,
+                "only observed GW meanings receive named variants"
+            );
+            assert_eq!(u8::from(mode), raw, "GW evidence must retain its raw value");
+            assert_eq!(
+                mode.to_string(),
+                label,
+                "GW labels must match qualification"
+            );
+        }
+    }
+
+    #[test]
+    fn every_gateway_wire_value_round_trips_losslessly() {
+        for raw in 0..=u8::MAX {
+            let mode = DvGatewayMode::from(raw);
+            assert_eq!(u8::from(mode), raw, "raw GW {raw} must survive conversion");
+            if raw != 0 && raw != 2 {
+                assert_eq!(
+                    mode,
+                    DvGatewayMode::Unqualified(raw),
+                    "unobserved GW {raw} must not acquire a named meaning"
+                );
+            }
+        }
     }
 
     #[test]

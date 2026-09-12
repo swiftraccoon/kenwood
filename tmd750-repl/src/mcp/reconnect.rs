@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 use kenwood_tmd750::transport::{
     SerialCandidate, SerialTransport, Transport, TransportError, discover_serial, open_serial,
 };
-use kenwood_tmd750::{Identity, Radio};
-use serde::Serialize;
+use kenwood_tmd750::{DvGatewayMode, Identity, Radio};
+use serde::ser::SerializeStruct;
+use serde::{Serialize, Serializer};
 
 use super::capture::{CaptureTransport, Recorder, TranscriptSummary};
 use super::reconnect_policy::{ReconnectDecision, classify};
@@ -92,6 +93,8 @@ pub(super) enum SkipReason {
     OriginalTrialIncomplete,
     /// A bounded settings update did not acknowledge its MCP exit.
     OriginalUpdateIncomplete,
+    /// The update's durable recovery journal failed before fresh verification.
+    OriginalUpdateJournalIncomplete,
     /// Original connection release did not succeed.
     OriginalCloseFailed,
     /// Original capture was incomplete.
@@ -114,6 +117,10 @@ pub(super) enum VerificationStage {
     Identity,
     /// Complete CAT identity differed from the original tuple.
     IdentityMismatch,
+    /// The requested fresh Gateway state could not be read completely.
+    Gateway,
+    /// The fresh Gateway state was not the required Off state.
+    GatewayMismatch,
     /// The fresh connection could not be closed successfully.
     Close,
     /// Required transcript recording or durable synchronization failed.
@@ -124,7 +131,7 @@ pub(super) enum VerificationStage {
 #[derive(Debug, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub(super) enum VerificationOutcome {
-    /// Fresh CAT tuple matched, and the fresh connection closed successfully.
+    /// Requested fresh CAT observations matched, and the connection closed.
     Matched,
     /// No fresh connection was eligible to be opened.
     Skipped { reason: SkipReason },
@@ -147,7 +154,8 @@ impl std::fmt::Display for VerificationOutcome {
                 SkipReason::OriginalProbeIncomplete => "original MCP probe was incomplete",
                 SkipReason::OriginalBackupIncomplete => "original MCP backup was incomplete",
                 SkipReason::OriginalTrialIncomplete => "original MCP trial session was incomplete",
-                SkipReason::OriginalUpdateIncomplete => "original PM1 update was incomplete",
+                SkipReason::OriginalUpdateIncomplete => "original text update was incomplete",
+                SkipReason::OriginalUpdateJournalIncomplete => "text update journal was incomplete",
                 SkipReason::OriginalCloseFailed => "original connection close failed",
                 SkipReason::OriginalCaptureIncomplete => "original capture was incomplete",
                 SkipReason::Cancelled => "cancelled before verification",
@@ -159,6 +167,8 @@ impl std::fmt::Display for VerificationOutcome {
                     VerificationStage::Open => "fresh connection open",
                     VerificationStage::Identity => "fresh CAT identity read",
                     VerificationStage::IdentityMismatch => "identity comparison",
+                    VerificationStage::Gateway => "fresh Gateway read",
+                    VerificationStage::GatewayMismatch => "Gateway Off comparison",
                     VerificationStage::Close => "fresh connection close",
                     VerificationStage::Capture => "required transcript capture",
                 };
@@ -198,11 +208,41 @@ enum OperationOutcome {
     Failed { error: Failure },
 }
 
+/// Retain the actual typed identity while preserving the existing JSON shape.
+#[derive(Debug)]
+struct ObservedIdentity(Identity);
+
+impl Serialize for ObservedIdentity {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        IdentityEvidence::from(&self.0).serialize(serializer)
+    }
+}
+
+/// Lossless typed Gateway evidence, including unnamed wire values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GatewayEvidence(DvGatewayMode);
+
+impl Serialize for GatewayEvidence {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let name = match self.0 {
+            DvGatewayMode::Off => "off",
+            DvGatewayMode::Terminal => "terminal",
+            DvGatewayMode::Unqualified(_) => "unqualified",
+        };
+        let mut state = serializer.serialize_struct("GatewayEvidence", 2)?;
+        state.serialize_field("state", name)?;
+        state.serialize_field("raw", &u8::from(self.0))?;
+        state.end()
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct ConnectionAttempt {
     endpoint: ObservedEndpoint,
     open: OperationOutcome,
-    identity: Option<IdentityEvidence>,
+    identity: Option<ObservedIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gateway_mode: Option<GatewayEvidence>,
     close: Option<OperationOutcome>,
 }
 
@@ -213,6 +253,8 @@ pub(super) struct PostExitVerification {
     settle_milliseconds: u64,
     enumeration_budget_milliseconds: u64,
     maximum_open_attempts: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    required_gateway_mode: Option<GatewayEvidence>,
     enumerations: Vec<Enumeration>,
     attempt: Option<ConnectionAttempt>,
     /// Completeness of the independently reserved verification transcript.
@@ -229,6 +271,7 @@ impl PostExitVerification {
             settle_milliseconds: milliseconds(SETTLE),
             enumeration_budget_milliseconds: milliseconds(ENUMERATION_BUDGET),
             maximum_open_attempts: 1,
+            required_gateway_mode: None,
             enumerations: Vec::new(),
             attempt: None,
             transcript,
@@ -239,6 +282,25 @@ impl PostExitVerification {
     /// A successful observation also requires its complete capture.
     pub(super) const fn succeeded(&self) -> bool {
         self.transcript.complete && matches!(self.outcome, VerificationOutcome::Matched)
+    }
+
+    /// Return the actual fresh observations only after required Off verification.
+    ///
+    /// Identity-only verification, incomplete capture, failed close or durable
+    /// synchronization, cancellation, and mismatching Gateway states return
+    /// `None`. Matching identity does not establish physical-unit continuity.
+    pub(super) fn gateway_off_evidence(&self) -> Option<(&Identity, DvGatewayMode)> {
+        if !self.succeeded()
+            || self.required_gateway_mode != Some(GatewayEvidence(DvGatewayMode::Off))
+        {
+            return None;
+        }
+        let attempt = self.attempt.as_ref()?;
+        let mode = attempt.gateway_mode?.0;
+        if mode != DvGatewayMode::Off {
+            return None;
+        }
+        Some((&attempt.identity.as_ref()?.0, mode))
     }
 
     fn fail(&mut self, stage: VerificationStage, error: &(dyn std::error::Error + 'static)) {
@@ -321,6 +383,7 @@ pub(super) async fn verify(
             original_identity,
             cancelled,
             policy: VerificationPolicy::Observational,
+            goal: VerificationGoal::IdentityOnly,
         },
     )
     .await
@@ -349,9 +412,50 @@ pub(super) async fn verify_required(
             original_identity,
             cancelled,
             policy: VerificationPolicy::Required,
+            goal: VerificationGoal::IdentityOnly,
         },
     )
     .await
+}
+
+/// Require fresh matching identity followed by Gateway Off on the same handle.
+///
+/// This makes exactly one eligible open and at most one `GW` query, after the
+/// complete identity matches. It adds no setter, MCP entry, retry, or recovery
+/// traffic. The required transcript, fresh close, and durable synchronization
+/// must all succeed before [`PostExitVerification::gateway_off_evidence`] can
+/// return the actual observations. Cancellation is checked before the Gateway
+/// query, never by dropping an in-flight CAT exchange.
+pub(super) async fn verify_required_gateway_off(
+    backend: &mut impl Backend,
+    endpoint: &SerialCandidate,
+    baud: u32,
+    original_identity: &Identity,
+    recorder: Recorder<File>,
+    cancelled: &AtomicBool,
+) -> PostExitVerification {
+    verify_with(
+        backend,
+        endpoint,
+        recorder,
+        VerificationContext {
+            baud,
+            original_identity,
+            cancelled,
+            policy: VerificationPolicy::Required,
+            goal: VerificationGoal::GatewayOff,
+        },
+    )
+    .await
+}
+
+/// Fixed read scope, independent of observational versus required recording.
+#[derive(Clone, Copy)]
+enum VerificationGoal {
+    /// Preserve the original three-query reconnect workflow.
+    IdentityOnly,
+    /// Additionally require a fresh read-only Gateway Off observation.
+    GatewayOff,
 }
 
 #[derive(Clone, Copy)]
@@ -401,6 +505,7 @@ struct VerificationContext<'a> {
     original_identity: &'a Identity,
     cancelled: &'a AtomicBool,
     policy: VerificationPolicy,
+    goal: VerificationGoal,
 }
 
 async fn verify_with(
@@ -410,6 +515,9 @@ async fn verify_with(
     context: VerificationContext<'_>,
 ) -> PostExitVerification {
     let mut report = PostExitVerification::skipped(SkipReason::Cancelled, recorder.summary());
+    if matches!(context.goal, VerificationGoal::GatewayOff) {
+        report.required_gateway_mode = Some(GatewayEvidence(DvGatewayMode::Off));
+    }
     if context.policy.capture_ready(&recorder, &mut report)
         && !context.cancelled.load(Ordering::Relaxed)
     {
@@ -518,9 +626,9 @@ async fn attempt_identity(
 ) -> Recorder<File> {
     let VerificationContext {
         baud,
-        original_identity,
         cancelled,
         policy,
+        ..
     } = context;
     if !policy.capture_ready(&recorder, report) {
         return recorder;
@@ -551,6 +659,7 @@ async fn attempt_identity(
                 endpoint: endpoint.into(),
                 open: OperationOutcome::Failed { error: failure },
                 identity: None,
+                gateway_mode: None,
                 close: None,
             });
             report.fail(VerificationStage::Open, &error);
@@ -559,30 +668,8 @@ async fn attempt_identity(
     };
     recorder.record(LifecycleEvent::OpenCompleted);
     let mut radio = Radio::new(policy.transport(connection, recorder));
-    let identity = if cancelled.load(Ordering::Relaxed) {
-        report.outcome = VerificationOutcome::Cancelled;
-        None
-    } else {
-        match radio.identify().await {
-            Ok(identity) => {
-                if identity == *original_identity {
-                    report.outcome = VerificationOutcome::Matched;
-                } else {
-                    report.fail(
-                        VerificationStage::IdentityMismatch,
-                        &std::io::Error::other(
-                            "fresh CAT identity tuple differs from the original",
-                        ),
-                    );
-                }
-                Some(identity)
-            }
-            Err(error) => {
-                report.fail(VerificationStage::Identity, &error);
-                None
-            }
-        }
-    };
+    let identity = observe_identity(&mut radio, context, report).await;
+    let gateway_mode = observe_gateway_off(&mut radio, context, report).await;
     let mut transport = radio.into_transport();
     let close_error = close_transport(&mut transport).await;
     let close = close_error
@@ -610,11 +697,77 @@ async fn attempt_identity(
     report.attempt = Some(ConnectionAttempt {
         endpoint: endpoint.into(),
         open: OperationOutcome::Succeeded,
-        identity: identity.as_ref().map(IdentityEvidence::from),
+        identity: identity.map(ObservedIdentity),
+        gateway_mode,
         close: Some(close),
     });
     transport.into_recorder()
 }
+
+/// Finish one complete identity tuple, retaining mismatches as actual evidence.
+async fn observe_identity(
+    radio: &mut Radio<impl Transport>,
+    context: VerificationContext<'_>,
+    report: &mut PostExitVerification,
+) -> Option<Identity> {
+    if context.cancelled.load(Ordering::Relaxed) {
+        report.outcome = VerificationOutcome::Cancelled;
+        return None;
+    }
+    match radio.identify().await {
+        Ok(identity) => {
+            if identity == *context.original_identity {
+                report.outcome = VerificationOutcome::Matched;
+            } else {
+                report.fail(
+                    VerificationStage::IdentityMismatch,
+                    &std::io::Error::other("fresh CAT identity tuple differs from the original"),
+                );
+            }
+            Some(identity)
+        }
+        Err(error) => {
+            report.fail(VerificationStage::Identity, &error);
+            None
+        }
+    }
+}
+
+/// Run the sole additional query only after a matching identity and safe boundary.
+async fn observe_gateway_off(
+    radio: &mut Radio<impl Transport>,
+    context: VerificationContext<'_>,
+    report: &mut PostExitVerification,
+) -> Option<GatewayEvidence> {
+    if !matches!(context.goal, VerificationGoal::GatewayOff)
+        || !matches!(report.outcome, VerificationOutcome::Matched)
+    {
+        return None;
+    }
+    if context.cancelled.load(Ordering::Relaxed) {
+        report.outcome = VerificationOutcome::Cancelled;
+        return None;
+    }
+    match radio.get_dv_gateway_mode().await {
+        Ok(mode) => {
+            if mode != DvGatewayMode::Off {
+                report.fail(
+                    VerificationStage::GatewayMismatch,
+                    &std::io::Error::other(format!("fresh Gateway state is {mode}; required Off")),
+                );
+            }
+            Some(GatewayEvidence(mode))
+        }
+        Err(error) => {
+            report.fail(VerificationStage::Gateway, &error);
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "reconnect/gateway_tests.rs"]
+mod gateway_tests;
 
 #[cfg(test)]
 mod tests {

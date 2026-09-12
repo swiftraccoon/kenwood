@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use kenwood_tmd750::memory::Pm1Name;
+use kenwood_tmd750::memory::{Pm1Name, Pm1NameUpdate, Pm1NameUpdateStatus};
 use kenwood_tmd750::protocol::mcp::{ACK, read_request, write_request};
 use kenwood_tmd750::transport::{
     KENWOOD_VID, MockTransport, TMD750_MAIN_PID, Transport, TransportError,
@@ -891,7 +891,7 @@ fn only_unconfirmed_exit_requests_recovery_without_claiming_restoration() -> Tes
             "uncertain exit must require an explicit recovery boundary"
         );
         assert!(
-            guidance.contains("does not establish which name is stored"),
+            guidance.contains("does not establish which text is stored"),
             "a power cycle must not be described as proof of restoration"
         );
         assert!(

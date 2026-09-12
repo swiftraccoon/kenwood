@@ -3,19 +3,15 @@
 use super::{Identity, Radio};
 use crate::error::{Error, ProtocolError};
 use crate::transport::Transport;
-use crate::types::{Page, Region};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CatVerification {
-    CurrentConnection,
-    Deferred,
-}
+use crate::types::{DvGatewayMode, Page, RadioModel, Region};
 
 /// A step in the fixed MCP qualification sequence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum McpProbeStage {
     /// Fresh CAT model, firmware, and radio-type proof before entry.
     Identity,
+    /// Fresh Gateway query and required Off comparison before entry.
+    Gateway,
     /// Programming-mode entry and its exact expected response.
     Entry,
     /// The 40-byte global fragment at address 8.
@@ -24,8 +20,6 @@ pub enum McpProbeStage {
     SlotRead,
     /// Programming-mode exit and its acknowledgment.
     Exit,
-    /// Fresh CAT identity after exit, compared with the original identity.
-    CatVerification,
 }
 
 /// Whether programming mode was exited during a probe.
@@ -40,15 +34,13 @@ pub enum McpProbeExit {
     RecoveryRequired,
     /// Exit was attempted but its complete success could not be established.
     ///
-    /// No subsequent CAT commands were sent. This includes failure to restore
-    /// the transport's CAT baud rate, even if the exit byte was acknowledged.
+    /// No subsequent CAT commands or baud changes were sent.
     NotAcknowledged,
     /// The radio acknowledged exit.
     ///
-    /// This alone does not prove CAT service returned; inspect the report's
-    /// post-exit identity and outcome as well. The ordinary probe also restores
-    /// the CAT baud rate; the detached probe leaves the old handle untouched
-    /// after the ACK and requires its caller to close it.
+    /// This alone does not prove CAT service returned. The old handle is
+    /// retired without further I/O; the caller must close and drop it before
+    /// independently verifying identity on a fresh connection.
     Acknowledged,
 }
 
@@ -64,20 +56,17 @@ pub struct McpProbeSegment {
 /// Completion, cooperative cancellation, or the first failed probe step.
 #[derive(Debug)]
 pub enum McpProbeOutcome {
-    /// Both fragments were read, exit succeeded, and CAT identity matched.
-    Complete,
     /// Both fragments were read and exit succeeded; CAT was not attempted.
     ///
-    /// Returned by [`Radio::probe_mcp_until_exit`]. The caller must close this
+    /// Returned by [`Radio::probe_mcp`]. The caller must close this
     /// transport before explicitly qualifying a fresh connection. This outcome
     /// does not establish that CAT returned or that the radio's identity matched.
     AwaitingCatVerification,
     /// The caller requested cancellation at a complete exchange boundary.
     ///
-    /// If programming mode had been entered, exit still completed. The ordinary
-    /// [`Radio::probe_mcp`] also verifies CAT; [`Radio::probe_mcp_until_exit`]
-    /// deliberately leaves that verification to a fresh connection. A cleanup
-    /// failure is reported as [`Self::Failed`] instead.
+    /// If programming mode had been entered, exit still completed. The caller
+    /// must release the original handle; any further CAT verification needs a
+    /// fresh connection. A cleanup failure is [`Self::Failed`] instead.
     Cancelled,
     /// The probe stopped at a failed step, retaining earlier observations.
     Failed {
@@ -107,10 +96,25 @@ pub struct McpProbeReport {
     pub segments: Vec<McpProbeSegment>,
     /// Exit disposition, independent of whether all fragments were read.
     pub exit: McpProbeExit,
-    /// Fresh post-exit CAT identity, even when it differs from the original.
-    pub cat_identity: Option<Identity>,
     /// Overall result; a completed read with failed cleanup is a failure.
     pub outcome: McpProbeOutcome,
+}
+
+/// Fixed read-only MCP evidence with an additional Gateway-Off entry guard.
+///
+/// The observed Gateway value belongs to this session's pre-entry CAT query.
+/// It does not establish Gateway state after exit or readiness for another MCP
+/// session. The caller must retire this transport and independently verify a
+/// fresh connection after an acknowledged detached exit.
+#[derive(Debug)]
+pub struct McpGatewayOffProbeReport {
+    /// The fixed fragments, original identity, entry, exit, and first failure.
+    pub probe: McpProbeReport,
+    /// Actual pre-entry Gateway reply, including a rejected non-Off value.
+    ///
+    /// Absent when identity, cancellation, or the Gateway exchange prevented
+    /// obtaining a valid reply. No Gateway setter is sent.
+    pub gateway_mode: Option<DvGatewayMode>,
 }
 
 impl McpProbeReport {
@@ -120,8 +124,7 @@ impl McpProbeReport {
             entry_reply: None,
             segments: Vec::new(),
             exit: McpProbeExit::NotEntered,
-            cat_identity: None,
-            outcome: McpProbeOutcome::Complete,
+            outcome: McpProbeOutcome::AwaitingCatVerification,
         }
     }
 
@@ -131,28 +134,12 @@ impl McpProbeReport {
 }
 
 impl<T: Transport> Radio<T> {
-    /// Qualify MCP entry, two fixed reads, exit, and return to CAT.
+    /// Read the two fixed MCP fragments and acknowledge exit without sending CAT.
     ///
     /// Reads exactly `8..48` and `327681..327936`, using the official transfer
-    /// fragment boundaries. Sends control commands, read requests, and ACKs;
-    /// never sends memory-write or fill commands. No RF transmission is requested.
-    /// Every failure returns the evidence already collected in the report.
-    /// No settings layout compatibility is inferred from a successful probe.
-    ///
-    /// # Cancellation
-    ///
-    /// Await this future to completion. Use `should_cancel` to stop between
-    /// complete exchanges: an entered, synchronized session is exited and CAT
-    /// is verified before returning. Dropping the future cannot perform async
-    /// cleanup and may leave the radio in programming mode. After an incomplete
-    /// exchange, the probe sends no speculative exit or CAT bytes; restore the
-    /// radio to normal operation before opening a fresh connection.
-    pub async fn probe_mcp(&mut self, mut should_cancel: impl FnMut() -> bool) -> McpProbeReport {
-        self.probe_mcp_with_verification(&mut should_cancel, CatVerification::CurrentConnection)
-            .await
-    }
-
-    /// Read the two fixed MCP fragments and acknowledge exit without sending CAT.
+    /// boundaries. Sends identity, entry, read requests, protocol ACKs, and exit;
+    /// never sends memory-write, fill, or RF-transmit commands. Every failure
+    /// preserves earlier completed observations without inventing gap bytes.
     ///
     /// The official program closes its transfer handle after the exit ACK.
     /// The first main-unit USB bench run likewise re-enumerated after that ACK,
@@ -162,8 +149,8 @@ impl<T: Transport> Radio<T> {
     /// After the ACK it performs no baud-rate change and keeps further protocol
     /// access blocked on this handle, which the caller must close and drop.
     ///
-    /// Success returns [`McpProbeOutcome::AwaitingCatVerification`], never
-    /// [`McpProbeOutcome::Complete`]. The report preserves the original identity,
+    /// Success returns [`McpProbeOutcome::AwaitingCatVerification`], not proof of
+    /// CAT readiness. The report preserves the original identity,
     /// both acknowledged fragments, and the exit disposition. No settings schema
     /// is qualified and no memory-write or fill commands are sent.
     ///
@@ -174,41 +161,129 @@ impl<T: Transport> Radio<T> {
     /// sent on this connection, even during cleanup. Close the transport before
     /// any subsequent operation. After an incomplete exchange, restore normal
     /// radio operation before opening another connection.
-    pub async fn probe_mcp_until_exit(
-        &mut self,
-        mut should_cancel: impl FnMut() -> bool,
-    ) -> McpProbeReport {
-        self.probe_mcp_with_verification(&mut should_cancel, CatVerification::Deferred)
-            .await
-    }
-
-    async fn probe_mcp_with_verification(
-        &mut self,
-        should_cancel: &mut impl FnMut() -> bool,
-        verification: CatVerification,
-    ) -> McpProbeReport {
+    pub async fn probe_mcp(&mut self, mut should_cancel: impl FnMut() -> bool) -> McpProbeReport {
         let mut report = McpProbeReport::pending();
         if should_cancel() {
             report.outcome = McpProbeOutcome::Cancelled;
             return report;
         }
-        match self.identify().await {
-            Ok(identity) => report.identity = Some(identity),
-            Err(error) => {
-                report.fail(McpProbeStage::Identity, error);
-                return report;
-            }
+        if !self.identify_mcp_probe(&mut report).await {
+            return report;
         }
         if should_cancel() {
             report.outcome = McpProbeOutcome::Cancelled;
             return report;
         }
+        self.finish_mcp_probe(&mut should_cancel, &mut report).await;
+        report
+    }
+
+    /// Guard a fixed detached MCP read with exact identity and Gateway Off.
+    ///
+    /// Proves TM-D750, firmware `1.02`, and opaque type `K,2,1` exactly once,
+    /// then requires a fresh `GW 0` before entering MCP. Reads only `8..48` and
+    /// `327681..327936`; no settings write, fill, or RF request is sent. These
+    /// narrow guards do not qualify a settings schema or prove firmware-ready
+    /// timing. Other identities and Gateway values refuse entry.
+    ///
+    /// An acknowledged exit leaves the old handle blocked. Close and drop its
+    /// transport before any explicitly authorized fresh CAT verification. This
+    /// method never opens, closes, reopens, retries, or selects a transport.
+    /// Success is [`McpProbeOutcome::AwaitingCatVerification`], not proof that
+    /// Gateway is still Off or a subsequent programming session is ready.
+    ///
+    /// # Cancellation
+    ///
+    /// Await the future to completion. Cancellation is checked before identity,
+    /// between identity and Gateway, after Gateway, and between complete reads.
+    /// An entered, synchronized session still exits; an incomplete entry, read,
+    /// or ACK permits no speculative exit or other protocol command. The caller
+    /// must release the handle and assess recovery before further radio access.
+    pub async fn probe_mcp_gateway_off_until_exit(
+        &mut self,
+        mut should_cancel: impl FnMut() -> bool,
+    ) -> McpGatewayOffProbeReport {
+        let mut report = McpGatewayOffProbeReport {
+            probe: McpProbeReport::pending(),
+            gateway_mode: None,
+        };
+        if should_cancel() {
+            report.probe.outcome = McpProbeOutcome::Cancelled;
+            return report;
+        }
+        if !self.identify_mcp_probe(&mut report.probe).await {
+            return report;
+        }
+        if !report.probe.identity.as_ref().is_some_and(|identity| {
+            identity.model == RadioModel::TmD750
+                && identity.firmware.as_str() == "1.02"
+                && identity.radio_type.as_str() == "K,2,1"
+        }) {
+            report.probe.fail(
+                McpProbeStage::Identity,
+                ProtocolError::UnexpectedResponse {
+                    expected: "TM-D750 / firmware 1.02 / radio type K,2,1 for the Gateway-Off probe",
+                    actual: format!("{:?}", report.probe.identity),
+                }
+                .into(),
+            );
+            return report;
+        }
+        if should_cancel() {
+            report.probe.outcome = McpProbeOutcome::Cancelled;
+            return report;
+        }
+        match self.get_dv_gateway_mode().await {
+            Ok(mode) => report.gateway_mode = Some(mode),
+            Err(error) => {
+                report.probe.fail(McpProbeStage::Gateway, error);
+                return report;
+            }
+        }
+        if report.gateway_mode != Some(DvGatewayMode::Off) {
+            report.probe.fail(
+                McpProbeStage::Gateway,
+                ProtocolError::UnexpectedResponse {
+                    expected: "Gateway Off before the fixed MCP probe",
+                    actual: format!("{:?}", report.gateway_mode),
+                }
+                .into(),
+            );
+            return report;
+        }
+        if should_cancel() {
+            report.probe.outcome = McpProbeOutcome::Cancelled;
+            return report;
+        }
+        self.finish_mcp_probe(&mut should_cancel, &mut report.probe)
+            .await;
+        report
+    }
+
+    async fn identify_mcp_probe(&mut self, report: &mut McpProbeReport) -> bool {
+        match self.identify().await {
+            Ok(identity) => {
+                report.identity = Some(identity);
+                true
+            }
+            Err(error) => {
+                report.fail(McpProbeStage::Identity, error);
+                false
+            }
+        }
+    }
+
+    async fn finish_mcp_probe(
+        &mut self,
+        should_cancel: &mut impl FnMut() -> bool,
+        report: &mut McpProbeReport,
+    ) {
         let mut session = match self.enter_mcp().await {
             Ok(session) => session,
             Err(error) => {
                 report.exit = McpProbeExit::RecoveryRequired;
                 report.fail(McpProbeStage::Entry, error);
-                return report;
+                return;
             }
         };
         report.entry_reply = Some(session.entry_reply().to_vec());
@@ -226,7 +301,7 @@ impl<T: Transport> Radio<T> {
                     Ok(data) => report.segments.push(McpProbeSegment { page, data }),
                     Err(error) => {
                         report.fail(stage, error);
-                        return report;
+                        return;
                     }
                 }
             }
@@ -234,43 +309,11 @@ impl<T: Transport> Radio<T> {
         if should_cancel() {
             report.outcome = McpProbeOutcome::Cancelled;
         }
-        let exit = match verification {
-            CatVerification::CurrentConnection => session.exit().await,
-            CatVerification::Deferred => session.exit_detached().await,
-        };
-        if let Err(error) = exit {
+        if let Err(error) = session.exit().await {
             report.exit = McpProbeExit::NotAcknowledged;
             report.fail(McpProbeStage::Exit, error);
-            return report;
+            return;
         }
         report.exit = McpProbeExit::Acknowledged;
-        match verification {
-            CatVerification::CurrentConnection => self.verify_probe_cat(&mut report).await,
-            CatVerification::Deferred => {
-                if matches!(report.outcome, McpProbeOutcome::Complete) {
-                    report.outcome = McpProbeOutcome::AwaitingCatVerification;
-                }
-            }
-        }
-        report
-    }
-
-    async fn verify_probe_cat(&mut self, report: &mut McpProbeReport) {
-        match self.identify().await {
-            Ok(identity) => {
-                report.cat_identity = Some(identity);
-                if report.cat_identity != report.identity {
-                    report.fail(
-                        McpProbeStage::CatVerification,
-                        ProtocolError::UnexpectedResponse {
-                            expected: "unchanged CAT model, firmware, and radio type after MCP exit",
-                            actual: format!("{:?}", report.cat_identity),
-                        }
-                        .into(),
-                    );
-                }
-            }
-            Err(error) => report.fail(McpProbeStage::CatVerification, error),
-        }
     }
 }

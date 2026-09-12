@@ -310,7 +310,7 @@ pub enum TextLayoutQualification {
 /// assert_eq!(preview.after(), "FIELD");
 ///
 /// let mut edited = image.as_bytes().to_vec();
-/// preview.patches().apply_to_image(&mut edited);
+/// preview.patches().apply_to_image(&mut edited)?;
 /// let edited = MemoryImage::from_bytes(edited)?;
 /// assert_eq!(
 ///     TextImage::new(&edited, &firmware)?.read(TextSetting::PmName1, TextScope::Global)?,

@@ -294,7 +294,7 @@ impl Harness {
             &endpoint(),
             9_600,
             captures.original,
-            captures.post_exit.ok_or("backup requires fresh capture")?,
+            captures.post_exit,
             &self.cancelled,
         )
         .await)
@@ -317,7 +317,7 @@ impl Harness {
             backend: FakeBackend::new(original, fresh, Arc::clone(&log)),
             captures: Some(WorkflowCaptures {
                 original: artifacts.transcript,
-                post_exit: Some(post_exit),
+                post_exit,
             }),
             cancelled,
             log,
@@ -349,15 +349,6 @@ impl Harness {
         )
         .await)
     }
-}
-
-fn verification(
-    result: &WorkflowResult,
-) -> Result<&PostExitVerification, Box<dyn StdError + Send + Sync>> {
-    result
-        .post_exit
-        .as_ref()
-        .ok_or_else(|| "post-exit verification evidence missing".into())
 }
 
 fn backup_script() -> MockTransport {
@@ -509,7 +500,7 @@ async fn backup_fresh_identity_mismatch_retains_backup_and_never_retries() -> Te
 
 fn succeeded(result: WorkflowResult) -> bool {
     ArtifactReport {
-        format_version: if result.post_exit.is_some() { 2 } else { 1 },
+        format_version: 2,
         software_version: env!("CARGO_PKG_VERSION"),
         started_at_utc: "2026-09-07T00:00:00Z".to_owned(),
         finished_at_utc: "2026-09-07T00:00:01Z".to_owned(),
@@ -542,8 +533,10 @@ async fn success_retires_original_before_one_fresh_identity_and_close() -> TestR
         McpProbeOutcome::AwaitingCatVerification
     ));
     assert_eq!(probe.exit, McpProbeExit::Acknowledged);
-    assert!(probe.cat_identity.is_none());
-    assert!(verification(&result)?.succeeded());
+    assert!(
+        result.post_exit.succeeded(),
+        "a separate fresh identity proof is required"
+    );
     let observed = observations(&harness.log)?;
     assert_eq!(writes(&observed, 0), expected_original_writes());
     assert_eq!(writes(&observed, 1), expected_identity_writes());
@@ -569,7 +562,7 @@ async fn original_close_failure_prevents_fresh_open() -> TestResult {
     let result = harness.run().await?;
     assert!(result.close_error.is_some());
     assert!(matches!(
-        verification(&result)?.outcome,
+        result.post_exit.outcome,
         VerificationOutcome::Skipped {
             reason: SkipReason::OriginalCloseFailed
         }
@@ -598,7 +591,7 @@ async fn original_open_failure_has_no_active_retry() -> TestResult {
     assert!(result.open_error.is_some());
     assert!(result.probe.is_none());
     assert!(matches!(
-        verification(&result)?.outcome,
+        result.post_exit.outcome,
         VerificationOutcome::Skipped {
             reason: SkipReason::OriginalOpenFailed
         }
@@ -641,7 +634,7 @@ async fn malformed_second_fragment_preserves_first_and_never_exits_or_reconnects
         vec![0x42; 40]
     );
     assert!(matches!(
-        verification(&result)?.outcome,
+        result.post_exit.outcome,
         VerificationOutcome::Skipped {
             reason: SkipReason::OriginalProbeIncomplete
         }
@@ -679,7 +672,7 @@ async fn cancellation_during_original_read_finishes_page_and_exit_without_reconn
     assert_eq!(probe.exit, McpProbeExit::Acknowledged);
     assert_eq!(probe.segments.len(), 1);
     assert!(matches!(
-        verification(&result)?.outcome,
+        result.post_exit.outcome,
         VerificationOutcome::Skipped {
             reason: SkipReason::Cancelled
         }
@@ -698,29 +691,34 @@ async fn cancellation_during_original_read_finishes_page_and_exit_without_reconn
 }
 
 #[tokio::test]
-async fn cancellation_during_default_original_close_prevents_success() -> TestResult {
-    let mut original = original_script()?;
-    identity(&mut original, b"FV 1.02\r");
-    let mut harness = Harness::new(original, MockTransport::new())?;
-    harness
-        .captures
-        .as_mut()
-        .ok_or("workflow captures missing")?
-        .post_exit = None;
+async fn cancellation_during_original_close_prevents_fresh_open_and_success() -> TestResult {
+    let mut harness = Harness::new(original_script()?, MockTransport::new())?;
     harness.connection(0)?.cancel_on_close = Some(Arc::clone(&harness.cancelled));
     let result = harness.run().await?;
     let probe = result
         .probe
         .as_ref()
         .ok_or("original probe evidence missing")?;
-    assert!(matches!(probe.outcome, McpProbeOutcome::Cancelled));
+    assert!(
+        matches!(probe.outcome, McpProbeOutcome::AwaitingCatVerification),
+        "late cancellation must preserve the completed read and exit observations"
+    );
     assert_eq!(probe.exit, McpProbeExit::Acknowledged);
-    assert!(probe.cat_identity.is_some());
-    assert!(result.post_exit.is_none());
+    assert!(
+        matches!(
+            result.post_exit.outcome,
+            VerificationOutcome::Skipped {
+                reason: SkipReason::Cancelled
+            }
+        ),
+        "required verification must explicitly record why it was skipped"
+    );
     let observed = observations(&harness.log)?;
-    let mut expected = expected_original_writes();
-    expected.extend(expected_identity_writes());
-    assert_eq!(writes(&observed, 0), expected);
+    assert_eq!(
+        writes(&observed, 0),
+        expected_original_writes(),
+        "the original handle must receive no post-exit CAT even on late cancellation"
+    );
     assert_no_fresh_open(&observed);
     assert!(!succeeded(result));
     Ok(())
@@ -734,7 +732,7 @@ async fn cancellation_before_workflow_does_not_open_original() -> TestResult {
     assert_eq!(harness.backend.opens, 0);
     assert!(observations(&harness.log)?.is_empty());
     assert!(matches!(
-        verification(&result)?.outcome,
+        result.post_exit.outcome,
         VerificationOutcome::Skipped {
             reason: SkipReason::Cancelled
         }
@@ -749,7 +747,7 @@ async fn cancellation_during_settle_never_opens_fresh_connection() -> TestResult
     harness.backend.cancel_on_wait = Some(Arc::clone(&harness.cancelled));
     let result = harness.run().await?;
     assert!(matches!(
-        verification(&result)?.outcome,
+        result.post_exit.outcome,
         VerificationOutcome::Cancelled
     ));
     let observed = observations(&harness.log)?;
@@ -773,7 +771,7 @@ async fn fresh_open_failure_is_not_retried() -> TestResult {
     });
     let result = harness.run().await?;
     assert!(matches!(
-        verification(&result)?.outcome,
+        result.post_exit.outcome,
         VerificationOutcome::Failed {
             stage: VerificationStage::Open,
             ..
@@ -792,7 +790,7 @@ async fn fresh_identity_failure_closes_without_retry() -> TestResult {
     let mut harness = Harness::new(original_script()?, fresh)?;
     let result = harness.run().await?;
     assert!(matches!(
-        verification(&result)?.outcome,
+        result.post_exit.outcome,
         VerificationOutcome::Failed {
             stage: VerificationStage::Identity,
             ..
@@ -820,7 +818,7 @@ async fn fresh_firmware_or_type_mismatch_closes_without_retry_or_success() -> Te
         let mut harness = Harness::new(original_script()?, fresh)?;
         let result = harness.run().await?;
         assert!(matches!(
-            verification(&result)?.outcome,
+            result.post_exit.outcome,
             VerificationOutcome::Failed {
                 stage: VerificationStage::IdentityMismatch,
                 ..
@@ -843,7 +841,7 @@ async fn cancellation_during_fresh_identity_finishes_tuple_and_closes() -> TestR
         Some((b"ID\r".to_vec(), Arc::clone(&harness.cancelled)));
     let result = harness.run().await?;
     assert!(matches!(
-        verification(&result)?.outcome,
+        result.post_exit.outcome,
         VerificationOutcome::Cancelled
     ));
     assert_eq!(harness.backend.opens, 2);
@@ -864,7 +862,7 @@ async fn fresh_close_failure_prevents_success_even_after_identity_match() -> Tes
     harness.connection(1)?.close_failure = Some(io::ErrorKind::BrokenPipe);
     let result = harness.run().await?;
     assert!(matches!(
-        verification(&result)?.outcome,
+        result.post_exit.outcome,
         VerificationOutcome::Failed {
             stage: VerificationStage::Close,
             ..
@@ -886,7 +884,7 @@ async fn ambiguous_metadata_never_opens_a_fresh_connection() -> TestResult {
     harness.backend.last_snapshot.push(other);
     let result = harness.run().await?;
     assert!(matches!(
-        verification(&result)?.outcome,
+        result.post_exit.outcome,
         VerificationOutcome::Failed {
             stage: VerificationStage::EndpointSelection,
             ..
@@ -943,7 +941,7 @@ async fn sustained_absence_exhausts_only_passive_enumeration_budget() -> TestRes
     let result = harness.run().await?;
     assert_eq!(harness.backend.elapsed, Duration::from_secs(62));
     assert!(matches!(
-        verification(&result)?.outcome,
+        result.post_exit.outcome,
         VerificationOutcome::Failed {
             stage: VerificationStage::Enumeration,
             ..
@@ -971,7 +969,7 @@ async fn endpoint_at_deadline_is_not_enumerated_or_opened() -> TestResult {
         240
     );
     assert!(matches!(
-        verification(&result)?.outcome,
+        result.post_exit.outcome,
         VerificationOutcome::Failed {
             stage: VerificationStage::Enumeration,
             ..

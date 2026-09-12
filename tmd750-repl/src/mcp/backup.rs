@@ -244,7 +244,6 @@ pub(super) async fn run_workflow(
         }
     };
     let mut radio = Radio::new(CaptureTransport::new(transport, original));
-    radio.set_cat_baud(baud);
     let backup = radio
         .backup_mcp_until_exit(
             || cancelled.load(Ordering::Relaxed),

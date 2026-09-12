@@ -1,5 +1,9 @@
 //! The MCP session: region reads, verified page writes, exit, recovery.
 
+mod compare_exchange;
+
+pub use compare_exchange::{McpCompareExchangeReport, PageReplacement};
+
 use super::{Progress, Radio};
 use crate::error::{Error, McpError, ProtocolError};
 use crate::memory::{
@@ -137,7 +141,10 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Errors
     ///
-    /// Propagates identity failures; returns [`ProtocolError::EntryReply`]
+    /// Returns [`McpError::SessionActive`] during an existing session,
+    /// [`McpError::RecoveryRequired`] after an incomplete exchange, or
+    /// [`McpError::ConnectionRetired`] after an acknowledged exit. Otherwise
+    /// propagates identity failures, and returns [`ProtocolError::EntryReply`]
     /// when the radio does not answer the expected entry line.
     pub async fn enter_mcp(&mut self) -> Result<McpSession<'_, T>, Error> {
         self.require_cat()?;
@@ -170,8 +177,9 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Errors
     ///
-    /// Returns [`McpError::SessionNotActive`] outside programming mode, or
-    /// [`McpError::RecoveryRequired`] after an incomplete exchange.
+    /// Returns [`McpError::SessionNotActive`] outside programming mode,
+    /// [`McpError::RecoveryRequired`] after an incomplete exchange, or
+    /// [`McpError::ConnectionRetired`] after an acknowledged exit.
     pub fn mcp_session(&mut self) -> Result<McpSession<'_, T>, Error> {
         self.require_mcp_ready()?;
         let entry_reply = self
@@ -185,7 +193,7 @@ impl<T: Transport> Radio<T> {
         })
     }
 
-    /// After an interrupted write, re-enter MCP, read the journaled pages,
+    /// After an interrupted write, enter MCP, read the journaled pages,
     /// and report which already carry their intended patch without programming
     /// memory.
     ///
@@ -195,34 +203,83 @@ impl<T: Transport> Radio<T> {
     /// must first be cleared by restoring the radio to normal mode; this method
     /// never attempts to repair an incomplete frame.
     ///
+    /// Every journaled page must have exactly one matching intended patch;
+    /// duplicate journal pages and missing or ambiguous intent are rejected
+    /// before any radio I/O. Intended patches for pages not reached by the
+    /// interrupted write may remain in the supplied plan and are not read.
+    /// An empty journal returns an empty report without entering MCP.
+    ///
+    /// Successful exit retires this connection. Close and drop its transport,
+    /// then independently identify a fresh connection before further operation.
+    /// This report establishes observed patch bits, not unchanged unrelated
+    /// bytes, persistence across a power cycle, or recovered CAT access.
+    ///
     /// # Errors
     ///
-    /// Propagates entry, read, and exit failures.
+    /// Returns [`McpError::RecoveryIntentCount`] or
+    /// [`McpError::DuplicateRecoveryPage`] before I/O, or propagates entry,
+    /// read, and exit failures.
     pub async fn recover(
         &mut self,
         journal: &McpJournal,
         intended: &[PagePatch],
     ) -> Result<RecoveryReport, Error> {
-        let mut session = self.enter_mcp().await?;
+        let recovery = recovery_patches(journal, intended)?;
         let mut report = RecoveryReport {
             applied: Vec::new(),
             pending: Vec::new(),
         };
-        for page in &journal.possibly_written {
-            let current = session.read_page(*page).await?;
-            let applied = intended
-                .iter()
-                .filter(|patch| patch.page == *page)
-                .all(|patch| patch.is_applied(&current));
-            if applied {
-                report.applied.push(*page);
+        if recovery.is_empty() {
+            return Ok(report);
+        }
+        let mut session = self.enter_mcp().await?;
+        for patch in recovery {
+            let page = patch.page();
+            let current = session.read_page(page).await?;
+            if patch.is_applied(&current)? {
+                report.applied.push(page);
             } else {
-                report.pending.push(*page);
+                report.pending.push(page);
             }
         }
         session.exit().await?;
         Ok(report)
     }
+}
+
+/// Resolve every journal entry to one unambiguous intent before entering MCP.
+fn recovery_patches<'a>(
+    journal: &McpJournal,
+    intended: &'a [PagePatch],
+) -> Result<Vec<&'a PagePatch>, McpError> {
+    let mut result = Vec::with_capacity(journal.possibly_written.len());
+    for (index, page) in journal.possibly_written.iter().enumerate() {
+        if journal
+            .possibly_written
+            .iter()
+            .take(index)
+            .any(|previous| previous == page)
+        {
+            return Err(McpError::DuplicateRecoveryPage {
+                address: page.address().as_u32(),
+                len: page.len(),
+            });
+        }
+        let mut matching = intended.iter().filter(|patch| patch.page() == *page);
+        let first = matching.next();
+        let count = usize::from(first.is_some()) + matching.count();
+        match first {
+            Some(patch) if count == 1 => result.push(patch),
+            _ => {
+                return Err(McpError::RecoveryIntentCount {
+                    address: page.address().as_u32(),
+                    len: page.len(),
+                    count,
+                });
+            }
+        }
+    }
+    Ok(result)
 }
 
 /// An active programming session; holds the radio until [`McpSession::exit`].
@@ -304,21 +361,12 @@ impl<T: Transport> McpSession<'_, T> {
         mut progress: impl FnMut(Progress),
     ) -> Result<McpWriteReport, Error> {
         self.radio.require_mcp_ready()?;
-        let identity = self.radio.identity().ok_or(McpError::RecoveryRequired)?;
-        if !is_supported_schema_target(identity.model, &identity.firmware) {
-            return Err(Error::UnsupportedSchemaTarget {
-                expected_model: MCP_D750_SCHEMA_MODEL,
-                expected_firmware: MCP_D750_SCHEMA_FIRMWARE,
-                accepted: MCP_D750_SCHEMA_FIRMWARE_IDENTITIES,
-                actual_model: identity.model.to_string(),
-                actual_firmware: identity.firmware.as_str().to_owned(),
-            });
-        }
+        self.require_schema_target()?;
         for patch in patches {
-            if !regions::is_writable_page(patch.page) {
+            if !regions::is_writable_page(patch.page()) {
                 return Err(McpError::PageNotWritable {
-                    address: patch.page.address().as_u32(),
-                    len: u16::try_from(patch.page.len()).unwrap_or(u16::MAX),
+                    address: patch.page().address().as_u32(),
+                    len: u16::try_from(patch.page().len()).unwrap_or(u16::MAX),
                 }
                 .into());
             }
@@ -351,60 +399,77 @@ impl<T: Transport> McpSession<'_, T> {
         })
     }
 
-    /// Send `E`, expect the ACK, restore the CAT baud rate.
-    ///
-    /// Only a fully completed exchange boundary permits exit. Failure or
-    /// cancellation leaves CAT access blocked; no exit is retried automatically.
-    ///
-    /// # Errors
-    ///
-    /// Returns session-state, [`ProtocolError::MissingAck`], transport, and
-    /// timeout errors.
-    pub async fn exit(mut self) -> Result<(), Error> {
-        self.acknowledge_exit().await?;
-        self.radio.set_baud(self.radio.cat_baud())?;
-        self.radio.mark_cat_ready();
-        Ok(())
-    }
-
     /// Stop at the exit ACK without depending on the old handle afterward.
     ///
     /// The caller must close and drop the transport. Its protocol state remains
     /// blocked so no CAT or second programming session can reuse this handle.
-    pub(super) async fn exit_detached(mut self) -> Result<(), Error> {
+    /// This method performs no baud change, reconnect, retry, or CAT query.
+    /// Acknowledgment does not establish a reboot or readiness on another handle.
+    /// Retain any journal before consuming this session.
+    ///
+    /// # Errors
+    ///
+    /// Returns session-state, acknowledgment, transport, and timeout errors.
+    /// An incomplete exchange prohibits exit; an uncertain exit is not retried.
+    /// Await this future to completion rather than dropping it to cancel I/O.
+    pub async fn exit(mut self) -> Result<(), Error> {
         self.acknowledge_exit().await
+    }
+
+    fn require_schema_target(&self) -> Result<(), Error> {
+        let identity = self.radio.identity().ok_or(McpError::RecoveryRequired)?;
+        if !is_supported_schema_target(identity.model, &identity.firmware) {
+            return Err(Error::UnsupportedSchemaTarget {
+                expected_model: MCP_D750_SCHEMA_MODEL,
+                expected_firmware: MCP_D750_SCHEMA_FIRMWARE,
+                accepted: MCP_D750_SCHEMA_FIRMWARE_IDENTITIES,
+                actual_model: identity.model.to_string(),
+                actual_firmware: identity.firmware.as_str().to_owned(),
+            });
+        }
+        Ok(())
     }
 
     async fn acknowledge_exit(&mut self) -> Result<(), Error> {
         self.radio.require_mcp_ready()?;
         self.radio.mark_mcp_uncertain();
         self.radio.write_all(&[EXIT]).await?;
-        expect_ack(self.radio, "MCP exit").await
+        expect_ack(self.radio, "MCP exit").await?;
+        self.radio.mark_retired();
+        Ok(())
     }
 
     async fn write_page_verified(&mut self, patch: &PagePatch) -> Result<(), Error> {
-        let mut data = self.read_page(patch.page).await?;
-        patch.apply(&mut data);
-        self.journal.possibly_written.push(patch.page);
-        let mut frame = write_request(patch.page).to_vec();
-        frame.extend_from_slice(&data);
+        let mut data = self.read_page(patch.page()).await?;
+        patch.apply(&mut data)?;
+        self.write_data_verified(patch.page(), &data).await
+    }
+
+    /// One shared write/readback implementation for patches and compare-exchange.
+    async fn write_data_verified(&mut self, page: Page, data: &[u8]) -> Result<(), Error> {
+        self.journal.verified.retain(|previous| *previous != page);
+        if !self.journal.possibly_written.contains(&page) {
+            self.journal.possibly_written.push(page);
+        }
+        let mut frame = write_request(page).to_vec();
+        frame.extend_from_slice(data);
         self.radio.mark_mcp_uncertain();
         self.radio.write_all(&frame).await?;
         expect_ack(self.radio, "MCP page write").await?;
         self.radio.mark_mcp_ready();
-        let read_back = self.read_page(patch.page).await?;
+        let read_back = self.read_page(page).await?;
         if let Some(offset) = data
             .iter()
             .zip(read_back.iter())
             .position(|(written, read)| written != read)
         {
             return Err(McpError::VerifyMismatch {
-                address: patch.page.address().as_u32(),
+                address: page.address().as_u32(),
                 offset,
             }
             .into());
         }
-        self.journal.verified.push(patch.page);
+        self.journal.verified.push(page);
         Ok(())
     }
 

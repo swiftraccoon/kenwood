@@ -3,15 +3,20 @@
 #[cfg(all(test, unix))]
 mod tests;
 
+#[cfg(all(test, unix))]
+mod my1_tests;
+
 use std::fs::File;
 use std::num::NonZeroU64;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
-use kenwood_tmd750::memory::{PmNameTrial, PmNameTrialEvent, PmNameTrialStatus, PmNameTrialWrite};
+#[cfg(all(test, unix))]
+use kenwood_tmd750::memory::PmNameTrial;
+use kenwood_tmd750::memory::{PmNameTrialStatus, PmNameTrialWrite};
 use kenwood_tmd750::transport::SerialCandidate;
 use kenwood_tmd750::{
-    McpProbeExit, PmNameTrialSessionOutcome, PmNameTrialSessionReport, PmNameTrialSessionStage,
-    PmNameTrialWriteDisposition, Radio,
+    DvGatewayMode, McpProbeExit, PmNameTrialSessionOutcome, PmNameTrialSessionReport,
+    PmNameTrialSessionStage, PmNameTrialWriteDisposition, Radio,
 };
 use serde::Serialize;
 
@@ -20,6 +25,7 @@ use super::super::reconnect::{self, Backend, PostExitVerification, SkipReason};
 use super::super::{ExitDisposition, Failure, IdentityEvidence, SegmentEvidence, close_transport};
 use super::RestorationStatus;
 use super::journal::Journal;
+use super::target::Trial;
 use crate::output;
 
 #[derive(Debug)]
@@ -33,6 +39,7 @@ pub(super) struct SessionCaptures {
 enum Stage {
     Preparation,
     Identity,
+    GatewayGuard,
     Entry,
     Read { address: u32, length: usize },
     FreshComparison,
@@ -47,6 +54,7 @@ impl From<PmNameTrialSessionStage> for Stage {
         match stage {
             PmNameTrialSessionStage::Preparation => Self::Preparation,
             PmNameTrialSessionStage::Identity => Self::Identity,
+            PmNameTrialSessionStage::GatewayGuard => Self::GatewayGuard,
             PmNameTrialSessionStage::Entry => Self::Entry,
             PmNameTrialSessionStage::Read { page } => Self::Read {
                 address: page.address().as_u32(),
@@ -94,9 +102,29 @@ enum WriteDisposition {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum GatewayEvidence {
+    Off { raw: u8 },
+    Terminal { raw: u8 },
+    Unqualified { raw: u8 },
+}
+
+impl From<DvGatewayMode> for GatewayEvidence {
+    fn from(mode: DvGatewayMode) -> Self {
+        match mode {
+            DvGatewayMode::Off => Self::Off { raw: 0 },
+            DvGatewayMode::Terminal => Self::Terminal { raw: 2 },
+            DvGatewayMode::Unqualified(raw) => Self::Unqualified { raw },
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
 struct CoreEvidence {
     session_id: Option<NonZeroU64>,
     identity: Option<IdentityEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gateway_mode: Option<GatewayEvidence>,
     entry_reply: Option<Vec<u8>>,
     segments: Vec<SegmentEvidence>,
     exit: ExitDisposition,
@@ -111,6 +139,7 @@ impl From<&PmNameTrialSessionReport> for CoreEvidence {
         Self {
             session_id: report.session_id(),
             identity: report.identity.as_ref().map(IdentityEvidence::from),
+            gateway_mode: report.gateway_mode.map(GatewayEvidence::from),
             entry_reply: report.entry_reply.clone(),
             segments: report
                 .segments
@@ -185,7 +214,7 @@ pub(super) struct WorkflowResult {
 }
 
 impl WorkflowResult {
-    pub(super) fn succeeded(&self, trial: &PmNameTrial) -> bool {
+    pub(super) fn succeeded(&self, trial: &impl Trial) -> bool {
         trial.status() == PmNameTrialStatus::RestorationVerified
             && self.sessions.len() == 3
             && self.sessions.iter().all(SessionEvidence::succeeded)
@@ -197,7 +226,7 @@ impl WorkflowResult {
             if let Some(core) = &session.core {
                 if let Outcome::Failed { stage, error } = &core.outcome {
                     output::error(format_args!(
-                        "PM1 session {} failed at {stage:?}: {error}",
+                        "Text-trial session {} failed at {stage:?}: {error}",
                         index + 1
                     ));
                 }
@@ -211,18 +240,20 @@ impl WorkflowResult {
                 ("capture synchronization", &session.synchronization_error),
             ] {
                 if let Some(error) = error {
-                    output::error(format_args!("PM1 {label} failed: {error}"));
+                    output::error(format_args!("Text-trial {label} failed: {error}"));
                 }
             }
             if !session.post_exit.succeeded() {
                 output::error(format_args!(
-                    "PM1 post-exit verification: {}.",
+                    "Text-trial post-exit verification: {}.",
                     session.post_exit.outcome
                 ));
             }
         }
         if let Some(error) = &self.finalization_error {
-            output::error(format_args!("PM1 session finalization failed: {error}"));
+            output::error(format_args!(
+                "Text-trial session finalization failed: {error}"
+            ));
         }
     }
 }
@@ -231,7 +262,7 @@ pub(super) async fn run(
     backend: &mut impl Backend,
     endpoint: &SerialCandidate,
     baud: u32,
-    trial: &mut PmNameTrial,
+    trial: &mut impl Trial,
     journal: &mut Journal,
     captures: Vec<SessionCaptures>,
     cancelled: &AtomicBool,
@@ -242,7 +273,7 @@ pub(super) async fn run(
     };
     for captures in captures {
         output::line(format_args!(
-            "PM1 session {} of 3: fresh identity, full-page comparison, and independent post-exit verification.",
+            "Text-trial session {} of 3: fresh identity, full-page comparison, and independent post-exit verification.",
             result.sessions.len() + 1
         ));
         let session =
@@ -262,11 +293,7 @@ pub(super) async fn run(
         }
         let finalized = id
             .ok_or_else(|| std::io::Error::other("complete trial session lacks its fixed ID"))
-            .and_then(|id| {
-                trial
-                    .record(PmNameTrialEvent::SessionFinalized { id })
-                    .map_err(std::io::Error::other)
-            });
+            .and_then(|id| trial.finalize_session(id).map_err(std::io::Error::other));
         if let Err(error) = finalized {
             result.finalization_error = Some(Failure::from_error(&error));
             trial.halt();
@@ -280,7 +307,7 @@ async fn run_session(
     backend: &mut impl Backend,
     endpoint: &SerialCandidate,
     baud: u32,
-    trial: &mut PmNameTrial,
+    trial: &mut impl Trial,
     journal: &mut Journal,
     captures: SessionCaptures,
     cancelled: &AtomicBool,
@@ -313,14 +340,7 @@ async fn run_session(
         }
     };
     let mut radio = Radio::new(CaptureTransport::required(connection, original));
-    radio.set_cat_baud(baud);
-    let report = radio
-        .run_approved_pm1_trial_session_until_exit(
-            trial,
-            || cancelled.load(Ordering::Relaxed),
-            |trial, write| journal.intent(trial, write),
-        )
-        .await;
+    let report = trial.run_session(&mut radio, cancelled, journal).await;
     let mut transport = radio.into_transport();
     result.close_error = close_transport(&mut transport).await;
     let mut original = transport.into_recorder();

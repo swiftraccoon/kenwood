@@ -1,5 +1,7 @@
 //! Historical Terminal-settings assessment, with no endpoint or write access.
 
+mod compare;
+
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -22,6 +24,8 @@ pub(crate) struct TerminalRequest {
 enum TerminalCommand {
     /// Assess historical Reflector Terminal settings; never test live readiness.
     Preflight(PreflightRequest),
+    /// Compare all captured bytes and annotate candidate Terminal settings.
+    Compare(compare::CompareRequest),
 }
 
 #[derive(Debug, Args)]
@@ -71,36 +75,53 @@ fn assess(
     request: &PreflightRequest,
     snapshot: &Snapshot,
 ) -> AppResult<ReflectorTerminalPreflight> {
+    assess_snapshot(
+        snapshot,
+        request.slot,
+        request.interface.into(),
+        request.interpret_unqualified,
+    )
+}
+
+fn assess_snapshot(
+    snapshot: &Snapshot,
+    slot: SlotIndex,
+    route: TerminalUsbRoute,
+    interpret_unqualified: bool,
+) -> AppResult<ReflectorTerminalPreflight> {
     // Check every dependency before exposing the internal buffer to the view.
     // Unread gaps in that buffer are placeholders, not captured settings.
     let mut covered_image = None;
     for field in ReflectorTerminalPreflight::required_fields()? {
-        covered_image = Some(snapshot.image_for(field, Some(request.slot))?);
+        covered_image = Some(snapshot.image_for(field, Some(slot))?);
     }
     let image = covered_image
         .ok_or_else(|| CommandError("Terminal preflight has no storage descriptors".to_owned()))?;
-    let route = request.interface.into();
-    Ok(if request.interpret_unqualified {
+    Ok(if interpret_unqualified {
         ReflectorTerminalPreflight::interpret_unqualified(
             image,
             &snapshot.identity.firmware,
-            request.slot,
+            slot,
             route,
         )?
     } else {
-        ReflectorTerminalPreflight::read(image, &snapshot.identity.firmware, request.slot, route)?
+        ReflectorTerminalPreflight::read(image, &snapshot.identity.firmware, slot, route)?
     })
 }
 
 /// Run before endpoint enumeration; accepts no transport or connected radio.
 pub(super) fn run(request: &TerminalRequest) -> AppResult<()> {
-    let TerminalCommand::Preflight(request) = &request.command;
-    let snapshot = Snapshot::load(&request.backup)?;
-    let assessment = assess(request, &snapshot)?;
-    for line in describe(&snapshot, &assessment)? {
-        output::line(format_args!("{line}"));
+    match &request.command {
+        TerminalCommand::Preflight(request) => {
+            let snapshot = Snapshot::load(&request.backup)?;
+            let assessment = assess(request, &snapshot)?;
+            for line in describe(&snapshot, &assessment)? {
+                output::line(format_args!("{line}"));
+            }
+            Ok(())
+        }
+        TerminalCommand::Compare(request) => compare::run(request),
     }
-    Ok(())
 }
 
 fn describe(
@@ -158,8 +179,14 @@ fn describe(
         }
     }
     lines.push(
-        "Active DV Gateway rejects CAT on its assigned interface. Another port's CAT access and automatic exit are unqualified."
-            .to_owned(),
+        concat!(
+            "Active DV Gateway rejects CAT on its assigned interface. ",
+            "Main-unit ID/FV/TY/GW queries were observed on firmware 1.02 ",
+            "with Terminal selected and the Gateway routed to panel USB. ",
+            "This does not establish current routing, general CAT access, ",
+            "MCP readiness, or qualified automatic exit."
+        )
+        .to_owned(),
     );
     lines.push(
         "No radio endpoints enumerated or opened. No PM recalled, text normalized, patch generated, or settings changed. Live activation and restoration remain unqualified."

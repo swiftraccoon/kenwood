@@ -1,11 +1,14 @@
 //! The async radio: typed CAT control and entry into MCP.
 
 pub mod backup;
+pub mod menu;
+pub mod my1_callsign_update;
 pub mod pm1_name_update;
 mod pm1_page;
 pub mod pm_name_trial;
 pub mod programming;
 pub mod qualification;
+pub mod terminal_exit_trial;
 
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -21,8 +24,6 @@ pub use programming::{McpJournal, McpSession, McpWriteReport, RecoveryReport, Re
 
 /// Default timeout for one serial write, CAT line, or MCP exchange step.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(1500);
-/// Hardware-validated default CAT baud rate.
-pub const DEFAULT_CAT_BAUD: u32 = 9600;
 
 /// Maximum accepted CAT reply length, excluding its carriage return.
 ///
@@ -35,6 +36,7 @@ enum ProtocolState {
     CatReady,
     McpReady,
     RecoveryRequired,
+    Retired,
 }
 
 const QUALIFIED_MODE_WRITE_FIRMWARE: &str = "1.02";
@@ -65,7 +67,6 @@ pub struct Identity {
 pub struct Radio<T: Transport> {
     transport: T,
     timeout: Duration,
-    cat_baud: u32,
     identity: Option<Identity>,
     receive_buffer: VecDeque<u8>,
     protocol_state: ProtocolState,
@@ -74,11 +75,14 @@ pub struct Radio<T: Transport> {
 
 impl<T: Transport> Radio<T> {
     /// Wrap a transport without sending commands.
+    ///
+    /// The connection must be eligible for CAT. This constructor does not reset
+    /// the radio or repair an incomplete exchange. Rewrapping an old transport
+    /// does not make it a fresh connection after MCP exit.
     pub const fn new(transport: T) -> Self {
         Self {
             transport,
             timeout: DEFAULT_TIMEOUT,
-            cat_baud: DEFAULT_CAT_BAUD,
             identity: None,
             receive_buffer: VecDeque::new(),
             protocol_state: ProtocolState::CatReady,
@@ -95,11 +99,6 @@ impl<T: Transport> Radio<T> {
         self.timeout = timeout;
     }
 
-    /// Change the CAT baud rate restored after an MCP session.
-    pub const fn set_cat_baud(&mut self, baud: u32) {
-        self.cat_baud = baud;
-    }
-
     /// The identity proven by the last [`Radio::identify`].
     #[must_use]
     pub const fn identity(&self) -> Option<&Identity> {
@@ -107,6 +106,11 @@ impl<T: Transport> Radio<T> {
     }
 
     /// Give the transport back.
+    ///
+    /// Extraction does not restore CAT readiness. After MCP exit, close and
+    /// drop this transport before opening and identifying a fresh connection.
+    /// After an incomplete exchange, also restore the radio's normal protocol
+    /// boundary before further traffic; a new wrapper alone is not recovery.
     #[must_use]
     pub fn into_transport(self) -> T {
         self.transport
@@ -264,6 +268,7 @@ impl<T: Transport> Radio<T> {
             ProtocolState::CatReady => Ok(()),
             ProtocolState::McpReady => Err(McpError::SessionActive.into()),
             ProtocolState::RecoveryRequired => Err(McpError::RecoveryRequired.into()),
+            ProtocolState::Retired => Err(McpError::ConnectionRetired.into()),
         }
     }
 
@@ -272,6 +277,7 @@ impl<T: Transport> Radio<T> {
             ProtocolState::McpReady => Ok(()),
             ProtocolState::CatReady => Err(McpError::SessionNotActive.into()),
             ProtocolState::RecoveryRequired => Err(McpError::RecoveryRequired.into()),
+            ProtocolState::Retired => Err(McpError::ConnectionRetired.into()),
         }
     }
 
@@ -288,6 +294,11 @@ impl<T: Transport> Radio<T> {
         self.protocol_state = ProtocolState::RecoveryRequired;
     }
 
+    /// An acknowledged exit retires the old handle without claiming CAT readiness.
+    pub(crate) const fn mark_retired(&mut self) {
+        self.protocol_state = ProtocolState::Retired;
+    }
+
     pub(crate) const fn mcp_ready(&self) -> bool {
         matches!(self.protocol_state, ProtocolState::McpReady)
     }
@@ -302,10 +313,6 @@ impl<T: Transport> Radio<T> {
 
     pub(crate) fn set_baud(&mut self, baud: u32) -> Result<(), Error> {
         self.transport.set_baud_rate(baud).map_err(Error::Transport)
-    }
-
-    pub(crate) const fn cat_baud(&self) -> u32 {
-        self.cat_baud
     }
 
     /// Read one bounded CAT line while retaining all bytes after its terminator.

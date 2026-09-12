@@ -449,16 +449,19 @@ fn print_help() {
         "Press Ctrl-C for the D-STAR prompt, then dstar stop to close it."
     ));
     output::line(format_args!(
-        "Startup only: mcp probe [--output NEW_DIRECTORY], mcp backup, mcp text --help, mcp terminal --help, mcp pm1-trial --help"
+        "Startup only: mcp probe [--output NEW_DIRECTORY], mcp reentry-probe --help, mcp backup, mcp menu --help, mcp text --help, mcp terminal --help, mcp pm1-trial --help, mcp my1-trial --help, mcp terminal-exit-trial --help"
     ));
     output::line(format_args!(
         "Probe/backup capture MCP reads and verify exit; text list/show/preview and terminal preflight inspect local backups."
     ));
     output::line(format_args!(
-        "Text set changes only PM1's name, with an explicit port, current backup, expected name, and --apply."
+        "Text set changes PM1's name or PM-Off MY1, with an explicit port, current backup, expected text, and --apply. Configurable MY1 remains untested on hardware."
     ));
     output::line(format_args!(
         "PM1 trial is a separately approved fixed rename-and-restore experiment, not general settings control."
+    ));
+    output::line(format_args!(
+        "Terminal exit trial is separately approved and experimental; ordinary dstar stop does not invoke it."
     ));
 }
 
@@ -764,7 +767,9 @@ mod tests {
                     "schema label is {}",
                     kenwood_tmd750::memory::MCP_D750_SCHEMA_FIRMWARE
                 ))
-                && guidance.contains("live writes remain unqualified")
+                && guidance.contains("Terminal mode and routing writes remain unqualified")
+                && guidance
+                    .contains("Bounded PM1/MY1 storage trials do not qualify automatic setup")
                 && guidance.contains("not a vendor firmware-version limit"),
             "terminal guidance must explain the qualification gate without inventing a live identity or vendor version restriction"
         );

@@ -72,7 +72,8 @@ async fn operating_modes_and_gateway_state_are_typed_reads() -> TestResult {
     );
     assert_eq!(
         radio.get_dv_gateway_mode().await?,
-        DvGatewayMode::Unqualified(2)
+        DvGatewayMode::Terminal,
+        "the read-only GW query must return the observed Terminal state"
     );
     radio.into_transport().assert_complete();
     Ok(())
@@ -284,23 +285,16 @@ async fn echo_mismatch_is_a_protocol_error() -> TestResult {
     Ok(())
 }
 
-fn patch_for(page: Page) -> PagePatch {
-    PagePatch {
-        page,
-        bytes: vec![BytePatch {
-            offset: 2,
-            mask: 0xFF,
-            value: 0x42,
-        }],
-    }
+fn patch_for(page: Page) -> Result<PagePatch, Box<dyn std::error::Error>> {
+    Ok(PagePatch::new(page, vec![BytePatch::new(2, 0xFF, 0x42)?])?)
 }
 
 #[tokio::test]
 async fn verified_write_reads_patches_writes_and_reads_back() -> TestResult {
     let page = Page::new(Address::new(8)?, 40)?;
-    let patch = patch_for(page);
+    let patch = patch_for(page)?;
     let mut written = vec![0x00; 40];
-    patch.apply(&mut written);
+    patch.apply(&mut written)?;
     let mut expected_write = write_request(page).to_vec();
     expected_write.extend_from_slice(&written);
     let mut mock = MockTransport::new();
@@ -325,9 +319,9 @@ async fn verified_write_reads_patches_writes_and_reads_back() -> TestResult {
 #[tokio::test]
 async fn a_read_back_mismatch_keeps_the_page_in_the_journal() -> TestResult {
     let page = Page::new(Address::new(8)?, 40)?;
-    let patch = patch_for(page);
+    let patch = patch_for(page)?;
     let mut written = vec![0x00; 40];
-    patch.apply(&mut written);
+    patch.apply(&mut written)?;
     let mut expected_write = write_request(page).to_vec();
     expected_write.extend_from_slice(&written);
     let mut mock = MockTransport::new();
@@ -372,7 +366,7 @@ async fn pages_outside_the_writable_regions_are_refused_before_any_write() -> Te
     let mut radio = Radio::new(mock);
     let mut session = radio.enter_mcp().await?;
     let result = session
-        .write_pages_verified(&[patch_for(outside)], |_| {})
+        .write_pages_verified(&[patch_for(outside)?], |_| {})
         .await;
     assert!(
         matches!(
@@ -391,9 +385,9 @@ async fn pages_outside_the_writable_regions_are_refused_before_any_write() -> Te
 #[tokio::test]
 async fn recovery_reports_which_journaled_pages_carry_the_patch() -> TestResult {
     let page = Page::new(Address::new(8)?, 40)?;
-    let patch = patch_for(page);
+    let patch = patch_for(page)?;
     let mut applied = vec![0x00; 40];
-    patch.apply(&mut applied);
+    patch.apply(&mut applied)?;
     let mut mock = MockTransport::new();
     scripted_identity(&mut mock);
     mock.expect(ENTER, b"0M\r");

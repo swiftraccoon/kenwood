@@ -57,15 +57,8 @@ fn ready_mock(firmware: &str) -> MockTransport {
     mock
 }
 
-fn patch(page: Page) -> PagePatch {
-    PagePatch {
-        page,
-        bytes: vec![BytePatch {
-            offset: 2,
-            mask: 0xFF,
-            value: 0x42,
-        }],
-    }
+fn patch(page: Page) -> Result<PagePatch, Box<dyn std::error::Error>> {
+    Ok(PagePatch::new(page, vec![BytePatch::new(2, 0xFF, 0x42)?])?)
 }
 
 fn data_reply(page: Page, data: &[u8]) -> Vec<u8> {
@@ -99,7 +92,6 @@ async fn idle_session_can_be_reborrowed_but_cannot_authorize_cat_before_exit() -
     identity(&mut mock, "1.00");
     mock.expect(b"0M PROGRAM\r", b"0M\r");
     mock.expect(&[EXIT], &[ACK]);
-    identity(&mut mock, "1.00");
     let mut radio = Radio::new(mock);
     {
         let session = radio.enter_mcp().await?;
@@ -121,11 +113,18 @@ async fn idle_session_can_be_reborrowed_but_cannot_authorize_cat_before_exit() -
     let session = radio.mcp_session()?;
     assert_eq!(session.entry_reply(), b"0M");
     session.exit().await?;
-    let _identity = radio.identify().await?;
-    assert!(matches!(
-        radio.mcp_session(),
-        Err(Error::Mcp(McpError::SessionNotActive))
-    ));
+    let identity = radio.identify().await;
+    assert!(
+        matches!(identity, Err(Error::Mcp(McpError::ConnectionRetired))),
+        "acknowledged exit must not admit CAT on the original handle: {identity:?}"
+    );
+    assert!(
+        matches!(
+            radio.mcp_session(),
+            Err(Error::Mcp(McpError::ConnectionRetired))
+        ),
+        "an acknowledged exit cannot be reborrowed as an MCP session"
+    );
     radio.into_transport().assert_complete();
     Ok(())
 }
@@ -212,7 +211,7 @@ async fn mismatched_schema_refuses_all_page_traffic_and_leaves_empty_journal() -
     let mut session = radio.enter_mcp().await?;
     let mut progress = Vec::new();
     let result = session
-        .write_pages_verified(&[patch(page)], |value| progress.push(value))
+        .write_pages_verified(&[patch(page)?], |value| progress.push(value))
         .await;
     assert!(
         matches!(result, Err(Error::UnsupportedSchemaTarget {
@@ -297,9 +296,9 @@ async fn rejected_read_header_and_ack_refuse_exit_and_cat() -> TestResult {
 #[tokio::test]
 async fn cancelled_memory_write_retains_journal_and_refuses_exit() -> TestResult {
     let page = Page::new(Address::new(8)?, 40)?;
-    let patch = patch(page);
+    let patch = patch(page)?;
     let mut intended = vec![0; page.len()];
-    patch.apply(&mut intended);
+    patch.apply(&mut intended)?;
     let mut mock = ready_mock("1.00");
     mock.expect(&read_request(page), &data_reply(page, &[0; 40]));
     mock.expect(&[ACK], &[ACK]);
@@ -325,9 +324,9 @@ async fn cancelled_memory_write_retains_journal_and_refuses_exit() -> TestResult
 #[tokio::test]
 async fn complete_verify_mismatch_still_permits_safe_exit() -> TestResult {
     let page = Page::new(Address::new(8)?, 40)?;
-    let patch = patch(page);
+    let patch = patch(page)?;
     let mut intended = vec![0; page.len()];
-    patch.apply(&mut intended);
+    patch.apply(&mut intended)?;
     let mut mock = ready_mock("1.00");
     mock.expect(&read_request(page), &data_reply(page, &[0; 40]));
     mock.expect(&[ACK], &[ACK]);

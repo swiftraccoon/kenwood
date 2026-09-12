@@ -406,7 +406,7 @@ impl<T: Transport> Radio<T> {
 
     async fn finish_pm1_update_session(&mut self, report: &mut Pm1NameUpdateSessionReport) {
         let result = match self.mcp_session() {
-            Ok(session) => session.exit_detached().await,
+            Ok(session) => session.exit().await,
             Err(error) => Err(error),
         };
         match result {

@@ -1,4 +1,4 @@
-//! Durable, immutable-scope evidence for one operator-approved PM1 update.
+//! Durable, immutable-scope evidence for one operator-approved typed text update.
 
 use std::fs::File;
 use std::io;
@@ -7,13 +7,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use kenwood_tmd750::Identity;
-use kenwood_tmd750::memory::{Pm1NameUpdate, Pm1NameUpdateStatus};
 use kenwood_tmd750::types::{PAGE_SIZE, Page};
 use serde::Serialize;
 
 use super::super::IdentityEvidence;
 use super::super::capture::Recorder;
 use super::UpdateStatus;
+use super::target::{Update, UpdateKind};
 
 #[cfg(unix)]
 const FILENAME: &str = "update-journal.jsonl";
@@ -28,18 +28,22 @@ enum Stage {
 
 #[derive(Debug)]
 struct BoundUpdate {
+    kind: UpdateKind,
     identity: Identity,
     page: Page,
     original: [u8; PAGE_SIZE],
     desired: [u8; PAGE_SIZE],
+    control: Option<(Page, [u8; PAGE_SIZE])>,
 }
 
 impl BoundUpdate {
-    fn matches(&self, update: &Pm1NameUpdate) -> bool {
-        &self.identity == update.identity()
+    fn matches(&self, update: &impl Update) -> bool {
+        self.kind == update.kind()
+            && &self.identity == update.identity()
             && self.page == update.page()
             && &self.original == update.original_page()
             && &self.desired == update.desired_page()
+            && self.control.as_ref().map(|(page, data)| (*page, data)) == update.control_page()
     }
 }
 
@@ -69,6 +73,8 @@ pub(super) struct UpdateJournal {
     bound: Option<BoundUpdate>,
     #[cfg(all(test, unix))]
     fail_evidence: bool,
+    #[cfg(all(test, unix))]
+    fail_raw_sync: bool,
 }
 
 impl UpdateJournal {
@@ -82,7 +88,7 @@ impl UpdateJournal {
         if !metadata.is_dir() || metadata.permissions().mode() & 0o077 != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "PM1 update journal requires a private, non-symlink directory",
+                "text update journal requires a private, non-symlink directory",
             ));
         }
         let directory = directory.canonicalize()?;
@@ -96,6 +102,8 @@ impl UpdateJournal {
             bound: None,
             #[cfg(all(test, unix))]
             fail_evidence: false,
+            #[cfg(all(test, unix))]
+            fail_raw_sync: false,
         })
     }
 
@@ -109,13 +117,13 @@ impl UpdateJournal {
     ///
     /// The caller must require explicit `--apply` approval before calling this
     /// method. Success includes file, directory, and parent-directory sync.
-    pub(super) fn prepare(&mut self, update: &Pm1NameUpdate, backup: &Path) -> io::Result<()> {
+    pub(super) fn prepare(&mut self, update: &impl Update, backup: &Path) -> io::Result<()> {
         self.require(
             self.stage == Stage::Unprepared,
             "journal is already prepared",
         )?;
         self.require(
-            update.status() == Pm1NameUpdateStatus::NotWritten,
+            update.status() == UpdateStatus::NotWritten,
             "update already has a possible write",
         )?;
         self.append(
@@ -125,16 +133,18 @@ impl UpdateJournal {
                 backup,
                 operator_approved_apply: true,
                 automatic_restore: false,
-                qualification: "PM1 name only; TM-D750 firmware 1.02 and type K,2,1",
+                qualification: update.kind().qualification(),
             },
         )?;
         let result = synchronize_directory(&self.directory);
         self.remember(result)?;
         self.bound = Some(BoundUpdate {
+            kind: update.kind(),
             identity: update.identity().clone(),
             page: update.page(),
             original: *update.original_page(),
             desired: *update.desired_page(),
+            control: update.control_page().map(|(page, data)| (page, *data)),
         });
         self.stage = Stage::Prepared;
         Ok(())
@@ -145,13 +155,13 @@ impl UpdateJournal {
     /// The backend calls this only after the engine has accepted a fresh
     /// identity, format byte zero, and exact whole-page before-image. That
     /// validation is attributed explicitly; its raw bytes remain in capture.
-    pub(super) fn intent(&mut self, update: &Pm1NameUpdate) -> io::Result<()> {
+    pub(super) fn intent(&mut self, update: &impl Update) -> io::Result<()> {
         self.intent_with_sync(update, Recorder::synchronize)
     }
 
     fn intent_with_sync(
         &mut self,
-        update: &Pm1NameUpdate,
+        update: &impl Update,
         synchronize: impl FnOnce(&mut Recorder<File>) -> io::Result<()>,
     ) -> io::Result<()> {
         self.check_bound(update)?;
@@ -160,7 +170,7 @@ impl UpdateJournal {
             "journal write intent is out of order",
         )?;
         self.require(
-            update.status() == Pm1NameUpdateStatus::NotWritten,
+            update.status() == UpdateStatus::NotWritten,
             "journal write intent follows a possible write",
         )?;
         self.append_with_sync(
@@ -170,7 +180,10 @@ impl UpdateJournal {
                 session_id: 1,
                 intent_id: 1,
                 memory_format: 0,
-                validation_provenance: "accepted engine FreshSession; raw format fragment and whole page in session capture",
+                validation_provenance: match update.kind() {
+                    UpdateKind::Pm1Name => "accepted engine FreshSession; raw format fragment and whole page in session capture",
+                    UpdateKind::PmOffMy1 => "accepted guarded engine FreshSession; raw Gateway, format, full control and target pages synchronized in session capture before this intent",
+                },
                 status: UpdateStatus::PossiblyChanged,
             },
             synchronize,
@@ -200,13 +213,24 @@ impl UpdateJournal {
         self.fail_evidence = true;
     }
 
+    /// Inject one failure at the next session's actual pre-write raw sync boundary.
+    #[cfg(all(test, unix))]
+    pub(super) const fn fail_raw_sync_for_test(&mut self) {
+        self.fail_raw_sync = true;
+    }
+
+    #[cfg(all(test, unix))]
+    pub(super) fn take_raw_sync_failure_for_test(&mut self) -> bool {
+        std::mem::take(&mut self.fail_raw_sync)
+    }
+
     /// Record the engine's conservative result without automatically restoring
     /// or treating immediate readback as verification across separate sessions.
-    pub(super) fn finish(&mut self, update: &Pm1NameUpdate) -> io::Result<()> {
+    pub(super) fn finish(&mut self, update: &impl Update) -> io::Result<()> {
         self.check_bound(update)?;
         let consistent = match update.status() {
-            Pm1NameUpdateStatus::NotWritten => self.stage == Stage::Prepared,
-            Pm1NameUpdateStatus::PossiblyChanged | Pm1NameUpdateStatus::VerifiedAcrossSessions => {
+            UpdateStatus::NotWritten => self.stage == Stage::Prepared,
+            UpdateStatus::PossiblyChanged | UpdateStatus::VerifiedAcrossSessions => {
                 self.stage == Stage::WriteIntent
             }
         };
@@ -218,9 +242,8 @@ impl UpdateJournal {
             Kind::Finished,
             &Finished {
                 scope: Scope::from(update),
-                status: UpdateStatus::from(update.status()),
-                manual_recovery_may_be_required: update.status()
-                    == Pm1NameUpdateStatus::PossiblyChanged,
+                status: update.status(),
+                manual_recovery_may_be_required: update.status() == UpdateStatus::PossiblyChanged,
                 automatic_restore: false,
             },
         )?;
@@ -228,13 +251,18 @@ impl UpdateJournal {
         Ok(())
     }
 
-    fn check_bound(&mut self, update: &Pm1NameUpdate) -> io::Result<()> {
+    fn check_bound(&mut self, update: &impl Update) -> io::Result<()> {
         self.require(
             self.bound
                 .as_ref()
                 .is_some_and(|bound| bound.matches(update)),
             "journal update differs from its prepared recovery record",
         )
+    }
+
+    /// Refuse new connections after any failed journal append or synchronization.
+    pub(super) fn ensure_complete(&self) -> io::Result<()> {
+        self.healthy()
     }
 
     fn require(&mut self, condition: bool, message: &'static str) -> io::Result<()> {
@@ -308,7 +336,7 @@ fn synchronize_directory(_directory: &Path) -> io::Result<()> {
 fn unsupported_platform() -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,
-        "PM1 updates require Unix private files and directory synchronization",
+        "text updates require Unix private files and directory synchronization",
     )
 }
 
@@ -330,6 +358,8 @@ struct Record<'a, T> {
 
 #[derive(Debug, Serialize)]
 struct Scope<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_kind: Option<UpdateKind>,
     identity: IdentityEvidence,
     field: &'static str,
     page_address: u32,
@@ -338,19 +368,34 @@ struct Scope<'a> {
     desired_page: &'a [u8],
     current_name: &'a str,
     desired_name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    control_page: Option<ControlPage<'a>>,
 }
 
-impl<'a> From<&'a Pm1NameUpdate> for Scope<'a> {
-    fn from(update: &'a Pm1NameUpdate) -> Self {
+#[derive(Debug, Serialize)]
+struct ControlPage<'a> {
+    address: u32,
+    length: usize,
+    data: &'a [u8],
+}
+
+impl<'a, U: Update> From<&'a U> for Scope<'a> {
+    fn from(update: &'a U) -> Self {
         Self {
+            target_kind: (update.kind() == UpdateKind::PmOffMy1).then_some(update.kind()),
             identity: IdentityEvidence::from(update.identity()),
-            field: "pm.PmName1",
+            field: update.field(),
             page_address: update.page().address().as_u32(),
             page_length: update.page().len(),
             original_page: update.original_page(),
             desired_page: update.desired_page(),
-            current_name: update.current_name().as_str(),
-            desired_name: update.desired_name().as_str(),
+            current_name: update.current_text(),
+            desired_name: update.desired_text(),
+            control_page: update.control_page().map(|(page, data)| ControlPage {
+                address: page.address().as_u32(),
+                length: page.len(),
+                data,
+            }),
         }
     }
 }
@@ -385,3 +430,7 @@ struct Finished<'a> {
 #[cfg(test)]
 #[path = "journal_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "my1_journal_tests.rs"]
+mod my1_tests;

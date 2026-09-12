@@ -199,7 +199,7 @@ fn unicode_capacity_is_checked_in_bytes_without_truncation() -> TestResult {
         TextLayoutQualification::RegistryTargetMatched
     );
     let mut patched = image.as_bytes().to_vec();
-    preview.patches().apply_to_image(&mut patched);
+    preview.patches().apply_to_image(&mut patched)?;
     assert_eq!(patched.get(0x4F00A..0x4F01A), Some(exact.as_bytes()));
     assert!(matches!(
         view.preview(TextSetting::PmName1, TextScope::Global, &"é".repeat(9)),
@@ -264,7 +264,7 @@ fn decoding_keeps_interior_spaces_and_trims_only_trailing_padding() -> TestResul
     let preview = view.preview(setting, scope, "EF G  ")?;
     assert_eq!(preview.after(), "EF G  ");
     let mut patched = image.as_bytes().to_vec();
-    preview.patches().apply_to_image(&mut patched);
+    preview.patches().apply_to_image(&mut patched)?;
     assert_eq!(
         patched.get(0x51008..0x51010),
         Some(b"EF G  \0\0".as_slice())
@@ -299,7 +299,7 @@ fn nul_filled_callsign_is_empty_under_both_explicit_layout_modes() -> TestResult
         assert_eq!(preview.firmware(), view.firmware());
         assert_eq!(preview.qualification(), view.qualification());
         let mut bytes = image.as_bytes().to_vec();
-        preview.patches().apply_to_image(&mut bytes);
+        preview.patches().apply_to_image(&mut bytes)?;
         assert_eq!(bytes.get(0x51008..0x51010), Some(b"KQ4NIT\0\0".as_slice()));
     }
     Ok(())
@@ -309,7 +309,11 @@ fn nul_filled_callsign_is_empty_under_both_explicit_layout_modes() -> TestResult
 fn corrupt_stored_text_is_not_silently_truncated_or_replacement_decoded() -> TestResult {
     let setting = TextSetting::PmName1;
     let firmware = FirmwareIdentity::new("1.00")?;
-    let image = image_with(setting, TextScope::Global, "AB\0CD")?;
+    let mut bytes = image_with(setting, TextScope::Global, "AB CD")?.into_bytes();
+    *bytes
+        .get_mut(0x4F00C)
+        .ok_or("PM name interior byte missing")? = 0;
+    let image = MemoryImage::from_bytes(bytes)?;
     let view = TextImage::new(&image, &firmware)?;
     assert_eq!(
         view.read(setting, TextScope::Global),
@@ -359,7 +363,7 @@ fn every_setting_round_trips_without_touching_other_image_bytes() -> TestResult 
             assert_eq!(preview.before(), "OLD");
             assert_eq!(preview.after(), "NEW");
             let mut patched = image.as_bytes().to_vec();
-            preview.patches().apply_to_image(&mut patched);
+            preview.patches().apply_to_image(&mut patched)?;
             let mut expected = image.clone();
             expected.set(
                 &setting.field()?.descriptor,
@@ -385,7 +389,7 @@ fn per_slot_preview_uses_the_selected_slot_and_clears_old_string_tail() -> TestR
     let firmware = FirmwareIdentity::new("1.00")?;
     let preview = TextImage::new(&image, &firmware)?.preview(setting, scope, "A")?;
     let mut bytes = image.as_bytes().to_vec();
-    preview.patches().apply_to_image(&mut bytes);
+    preview.patches().apply_to_image(&mut bytes)?;
     assert_eq!(
         bytes.get(0x5B008..0x5B010),
         Some(b"A\0\0\0\0\0\0\0".as_slice())
@@ -396,7 +400,7 @@ fn per_slot_preview_uses_the_selected_slot_and_clears_old_string_tail() -> TestR
     assert_eq!(preview.before(), "A");
     assert_eq!(preview.after(), "");
     let mut bytes = image.into_bytes();
-    preview.patches().apply_to_image(&mut bytes);
+    preview.patches().apply_to_image(&mut bytes)?;
     assert_eq!(bytes.get(0x5B008..0x5B010), Some([0; 8].as_slice()));
     Ok(())
 }

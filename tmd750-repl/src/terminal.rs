@@ -1,5 +1,6 @@
-//! Manual Terminal Mode instructions bound to the selected USB endpoint.
+//! Terminal guidance bound to observed CAT state and the selected USB endpoint.
 
+use kenwood_tmd750::DvGatewayMode;
 use kenwood_tmd750::memory::MCP_D750_SCHEMA_FIRMWARE;
 use kenwood_tmd750::transport::{
     KENWOOD_VID, SerialCandidate, TMD750_MAIN_PID, TMD750_PANEL_PID, discover_serial,
@@ -55,8 +56,10 @@ pub(super) fn connection_for_path(path: &str) -> UsbConnection {
 pub(super) fn instructions(connection: UsbConnection) -> String {
     format!(
         "Automatic Terminal Mode entry is disabled.\n\
-         The current MCP schema label is {MCP_D750_SCHEMA_FIRMWARE}; live writes remain unqualified.\n\
+         The current MCP schema label is {MCP_D750_SCHEMA_FIRMWARE}.\n\
          That label is not a vendor firmware-version limit.\n\
+         Terminal mode and routing writes remain unqualified.\n\
+         Bounded PM1/MY1 storage trials do not qualify automatic setup.\n\
          Configure the radio manually, in this order:\n\
          Menu 980: COM+AF In/Out.\n\
          {}\n\
@@ -71,6 +74,37 @@ pub(super) fn instructions(connection: UsbConnection) -> String {
          MMDVM framing alone does not prove Reflector Terminal Mode.",
         connection.routing()
     )
+}
+
+/// Explain a CAT startup result without assuming its endpoint carries the modem.
+///
+/// `None` means the Gateway query failed. A successful CAT connection does not
+/// identify the Gateway route or prove MMDVM framing on any other endpoint.
+pub(super) fn cat_startup_guidance(
+    connection: UsbConnection,
+    gateway: Option<DvGatewayMode>,
+) -> String {
+    match gateway {
+        Some(DvGatewayMode::Off) => instructions(connection),
+        Some(DvGatewayMode::Terminal) => concat!(
+            "Terminal Mode is already selected (GW 2).\n",
+            "This endpoint answered CAT; MMDVM is not proved on this connection.\n",
+            "The DV Gateway may be routed to another endpoint.\n",
+            "GW does not identify its route or pair USB endpoints to one radio.\n",
+            "If another endpoint carries the gateway, select it with --port.\n",
+            "No other endpoint was opened or probed.\n",
+            "No automatic setup was attempted."
+        )
+        .to_owned(),
+        Some(DvGatewayMode::Unqualified(_)) | None => concat!(
+            "Gateway state is not confirmed as Off or Terminal.\n",
+            "This endpoint answered CAT; MMDVM is not proved on this connection.\n",
+            "No setup sequence or routing change follows from this response.\n",
+            "No other endpoint was opened or probed.\n",
+            "No automatic setup was attempted."
+        )
+        .to_owned(),
+    }
 }
 
 #[cfg(test)]
@@ -120,6 +154,14 @@ mod tests {
             "declared schema provenance must not become a vendor restriction"
         );
         assert!(
+            guidance.contains("Terminal mode and routing writes remain unqualified."),
+            "the missing qualification concerns Terminal setup, not all storage writes"
+        );
+        assert!(
+            guidance.contains("Bounded PM1/MY1 storage trials do not qualify automatic setup."),
+            "successful storage trials must not imply automatic Terminal support"
+        );
+        assert!(
             guidance.contains("does not accept CAT while active"),
             "operators must not expect the gateway route to keep answering CAT"
         );
@@ -127,5 +169,44 @@ mod tests {
             !guidance.contains("Observed radio:"),
             "static instructions cannot invent a current firmware observation"
         );
+    }
+
+    #[test]
+    fn observed_terminal_and_unknown_states_never_repeat_manual_setup() {
+        for connection in [
+            UsbConnection::MainUnit,
+            UsbConnection::Panel,
+            UsbConnection::Unknown,
+        ] {
+            for gateway in [
+                Some(DvGatewayMode::Terminal),
+                Some(DvGatewayMode::Unqualified(1)),
+                None,
+            ] {
+                let guidance = cat_startup_guidance(connection, gateway);
+                assert!(
+                    guidance.lines().all(|line| line.chars().count() <= 80),
+                    "state-aware guidance must remain readable without wide lines"
+                );
+                for forbidden in [
+                    "Configure the radio manually",
+                    "Menu 650:",
+                    "TERM indicator",
+                    "Menu 986:",
+                    "USB (Panel)",
+                    "USB (Main Unit)",
+                ] {
+                    assert!(
+                        !guidance.contains(forbidden),
+                        "observed active or unknown state must not infer {forbidden}"
+                    );
+                }
+            }
+            assert_eq!(
+                cat_startup_guidance(connection, Some(DvGatewayMode::Off)),
+                instructions(connection),
+                "observed Off retains the existing endpoint-specific instructions"
+            );
+        }
     }
 }

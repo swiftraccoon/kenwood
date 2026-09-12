@@ -162,14 +162,18 @@ async fn assert_blocked<T: Transport>(radio: &mut Radio<T>) {
     assert!(
         matches!(
             radio.identify().await,
-            Err(Error::Mcp(McpError::RecoveryRequired))
+            Err(Error::Mcp(
+                McpError::RecoveryRequired | McpError::ConnectionRetired
+            ))
         ),
         "CAT must not use an uncertain or retired handle"
     );
     assert!(
         matches!(
             radio.mcp_session(),
-            Err(Error::Mcp(McpError::RecoveryRequired))
+            Err(Error::Mcp(
+                McpError::RecoveryRequired | McpError::ConnectionRetired
+            ))
         ),
         "MCP must not reborrow an uncertain or retired handle"
     );

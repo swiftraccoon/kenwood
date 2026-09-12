@@ -1,16 +1,19 @@
-//! Exclusive, synchronized recovery records for the fixed PM1 experiment.
+//! Exclusive, synchronized recovery records for fixed text experiments.
 
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use kenwood_tmd750::Identity;
-use kenwood_tmd750::memory::{PmNameTrial, PmNameTrialStatus, PmNameTrialWrite};
+#[cfg(test)]
+use kenwood_tmd750::memory::PmNameTrial;
+use kenwood_tmd750::memory::{PmNameTrialStatus, PmNameTrialWrite};
 use kenwood_tmd750::types::{PAGE_SIZE, Page};
 use serde::Serialize;
 use time::OffsetDateTime;
 
 use super::super::IdentityEvidence;
+use super::target::{Trial, TrialKind};
 
 #[cfg(unix)]
 const FILENAME: &str = "trial-journal.jsonl";
@@ -69,7 +72,7 @@ fn synchronize_directory(_directory: &Path) -> io::Result<()> {
 fn unsupported_platform() -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,
-        "the PM1 experiment requires Unix private files and directory synchronization",
+        "text experiments require Unix private files and directory synchronization",
     )
 }
 
@@ -96,18 +99,22 @@ enum Stage {
 
 #[derive(Debug)]
 struct BoundTrial {
+    kind: TrialKind,
     identity: Identity,
     page: Page,
     original: [u8; PAGE_SIZE],
     expected: [u8; PAGE_SIZE],
+    control: Option<(Page, [u8; PAGE_SIZE])>,
 }
 
 impl BoundTrial {
-    fn matches(&self, trial: &PmNameTrial) -> bool {
-        &self.identity == trial.identity()
+    fn matches(&self, trial: &impl Trial) -> bool {
+        self.kind == trial.kind()
+            && &self.identity == trial.identity()
             && self.page == trial.page()
             && &self.original == trial.original_page()
             && &self.expected == trial.expected_page()
+            && self.control.as_ref().map(|(page, bytes)| (*page, bytes)) == trial.control_page()
     }
 }
 
@@ -132,7 +139,7 @@ impl Journal<FileSink> {
         if !metadata.is_dir() || metadata.permissions().mode() & 0o077 != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "PM1 journal requires a private, non-symlink directory",
+                "text-trial journal requires a private, non-symlink directory",
             ));
         }
         let directory = directory.canonicalize()?;
@@ -159,12 +166,14 @@ impl<S: DurableWrite> Journal<S> {
         }
     }
 
-    /// Bind recovery bytes and separately confirmed display text before opening
-    /// the radio. The caller must have separately obtained operator approval.
+    /// Bind recovery bytes and the target's explicit baseline precondition before
+    /// opening the radio. Only PM1 requires independent display-name confirmation;
+    /// MY1 requires an empty captured baseline, never a fabricated display claim.
+    /// The caller must have separately obtained operator approval.
     /// Both file and directory entries are synchronized before success.
     pub(super) fn prepare(
         &mut self,
-        trial: &PmNameTrial,
+        trial: &impl Trial,
         backup: &Path,
         confirmed_name: &str,
     ) -> io::Result<()> {
@@ -176,21 +185,24 @@ impl<S: DurableWrite> Journal<S> {
             trial.status() == PmNameTrialStatus::NotWritten,
             "trial already has a write obligation",
         )?;
-        let confirmed = PmNameTrial::prepare_unqualified_offline(
-            trial.identity(),
-            trial.original_page(),
-            confirmed_name,
-        );
+        let confirmed = trial.validate_confirmation(confirmed_name);
         self.require(
             confirmed.is_ok(),
-            "journal display confirmation does not match the trial",
+            "journal baseline confirmation does not match the trial",
         )?;
         self.append(
             Kind::Prepared,
             &Prepared {
-                scope: Scope::from(trial),
+                scope: Scope::new(trial),
                 backup,
-                operator_confirmed_name: confirmed_name,
+                operator_confirmed_name: (trial.kind() == TrialKind::Pm1Name)
+                    .then_some(confirmed_name),
+                baseline_confirmation: match trial.kind() {
+                    TrialKind::Pm1Name => "independently observed PM1 display name",
+                    TrialKind::PmOffMy1 => {
+                        "empty MY1 in completed backup; not independently observed display text"
+                    }
+                },
                 operator_approved_fixed_rename_and_restore: true,
                 layout_qualification: "unqualified",
             },
@@ -198,10 +210,12 @@ impl<S: DurableWrite> Journal<S> {
         let result = self.sink.synchronize_directory();
         self.remember(result)?;
         self.bound = Some(BoundTrial {
+            kind: trial.kind(),
             identity: trial.identity().clone(),
             page: trial.page(),
             original: *trial.original_page(),
             expected: *trial.expected_page(),
+            control: trial.control_page().map(|(page, bytes)| (page, *bytes)),
         });
         self.stage = Stage::Prepared;
         Ok(())
@@ -211,11 +225,7 @@ impl<S: DurableWrite> Journal<S> {
     /// and synchronize before the backend may represent or dispatch any W.
     /// The callback follows the engine's fresh format and full-page validation;
     /// raw observations belong to the separately retained session capture.
-    pub(super) fn intent(
-        &mut self,
-        trial: &PmNameTrial,
-        write: PmNameTrialWrite,
-    ) -> io::Result<()> {
+    pub(super) fn intent(&mut self, trial: &impl Trial, write: PmNameTrialWrite) -> io::Result<()> {
         self.check_bound(trial)?;
         let (required, next, session_id, write) = match write {
             PmNameTrialWrite::Rename => {
@@ -233,7 +243,7 @@ impl<S: DurableWrite> Journal<S> {
             "journal write intent is out of order",
         )?;
         self.append(Kind::WriteIntent, &WriteIntentRecord {
-            scope: Scope::from(trial), session_id, intent_id: session_id, write,
+            scope: Scope::new(trial), session_id, intent_id: session_id, write,
             memory_format: 0,
             validation_provenance: "accepted engine FreshSession; raw format fragment in session capture",
             restoration_status: Status::PossiblyChanged,
@@ -254,7 +264,7 @@ impl<S: DurableWrite> Journal<S> {
 
     /// Record the engine's final conservative status without inferring success
     /// from CAT, process completion, or an immediate original-page readback.
-    pub(super) fn finish(&mut self, trial: &PmNameTrial) -> io::Result<()> {
+    pub(super) fn finish(&mut self, trial: &impl Trial) -> io::Result<()> {
         self.check_bound(trial)?;
         self.require(self.stage != Stage::Finished, "journal is already finished")?;
         let consistent = match trial.status() {
@@ -279,7 +289,7 @@ impl<S: DurableWrite> Journal<S> {
         Ok(())
     }
 
-    fn check_bound(&mut self, trial: &PmNameTrial) -> io::Result<()> {
+    fn check_bound(&mut self, trial: &impl Trial) -> io::Result<()> {
         self.require(
             self.bound
                 .as_ref()
@@ -359,6 +369,7 @@ struct Record<'a, T> {
 
 #[derive(Debug, Serialize)]
 struct Scope<'a> {
+    trial_kind: TrialKind,
     identity: IdentityEvidence,
     field: &'static str,
     page_address: u32,
@@ -366,18 +377,33 @@ struct Scope<'a> {
     original_page: &'a [u8],
     expected_page: &'a [u8],
     temporary_name: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    control_page: Option<ControlPage<'a>>,
 }
 
-impl<'a> From<&'a PmNameTrial> for Scope<'a> {
-    fn from(trial: &'a PmNameTrial) -> Self {
+#[derive(Debug, Serialize)]
+struct ControlPage<'a> {
+    address: u32,
+    length: usize,
+    data: &'a [u8],
+}
+
+impl<'a> Scope<'a> {
+    fn new(trial: &'a impl Trial) -> Self {
         Self {
+            trial_kind: trial.kind(),
             identity: IdentityEvidence::from(trial.identity()),
-            field: "pm.PmName1",
+            field: trial.field(),
             page_address: trial.page().address().as_u32(),
             page_length: trial.page().len(),
             original_page: trial.original_page(),
             expected_page: trial.expected_page(),
-            temporary_name: PmNameTrial::TEMPORARY_NAME,
+            temporary_name: trial.temporary_text(),
+            control_page: trial.control_page().map(|(page, data)| ControlPage {
+                address: page.address().as_u32(),
+                length: page.len(),
+                data,
+            }),
         }
     }
 }
@@ -386,7 +412,9 @@ impl<'a> From<&'a PmNameTrial> for Scope<'a> {
 struct Prepared<'a> {
     scope: Scope<'a>,
     backup: &'a Path,
-    operator_confirmed_name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operator_confirmed_name: Option<&'a str>,
+    baseline_confirmation: &'static str,
     operator_approved_fixed_rename_and_restore: bool,
     layout_qualification: &'static str,
 }

@@ -8,7 +8,9 @@ use tracing as _;
 
 use kenwood_tmd750::protocol::mcp::{ACK, ENTER, EXIT, read_request, write_request};
 use kenwood_tmd750::transport::MockTransport;
-use kenwood_tmd750::{McpProbeExit, McpProbeOutcome, McpProbeStage, Page, Radio, Region};
+use kenwood_tmd750::{
+    Error, McpError, McpProbeExit, McpProbeOutcome, McpProbeStage, Page, Radio, Region,
+};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -42,22 +44,25 @@ fn read(mock: &mut MockTransport, page: Page, value: u8) {
 }
 
 #[tokio::test]
-async fn probe_reads_only_two_official_fragments_and_proves_return_to_cat() -> TestResult {
+async fn probe_reads_only_two_official_fragments_and_requires_fresh_cat() -> TestResult {
     let mut mock = MockTransport::new();
     identity(&mut mock, b"FV 1.02\r");
     mock.expect(ENTER, b"0M\r");
     read(&mut mock, global_page()?, 0xA5);
     read(&mut mock, slot_page()?, 0x5A);
     mock.expect(&[EXIT], &[ACK]);
-    identity(&mut mock, b"FV 1.02\r");
     let mut radio = Radio::new(mock);
     let report = radio.probe_mcp(|| false).await;
     assert!(
-        matches!(report.outcome, McpProbeOutcome::Complete),
+        matches!(report.outcome, McpProbeOutcome::AwaitingCatVerification),
         "{report:?}"
     );
     assert_eq!(report.exit, McpProbeExit::Acknowledged);
-    assert_eq!(report.identity, report.cat_identity);
+    let cat = radio.identify().await;
+    assert!(
+        matches!(cat, Err(Error::Mcp(McpError::ConnectionRetired))),
+        "an acknowledged probe exit requires a new connection: {cat:?}"
+    );
     assert_eq!(report.entry_reply.as_deref(), Some(b"0M".as_slice()));
     assert_eq!(report.segments.len(), 2);
     let global = report.segments.first().ok_or("missing global segment")?;
@@ -106,7 +111,6 @@ async fn cancellation_at_a_page_boundary_exits_and_preserves_the_page() -> TestR
     mock.expect(ENTER, b"0M\r");
     read(&mut mock, global_page()?, 0x42);
     mock.expect(&[EXIT], &[ACK]);
-    identity(&mut mock, b"FV 1.02\r");
     let mut radio = Radio::new(mock);
     let mut checks = 0;
     let report = radio
@@ -120,7 +124,6 @@ async fn cancellation_at_a_page_boundary_exits_and_preserves_the_page() -> TestR
         "{report:?}"
     );
     assert_eq!(report.exit, McpProbeExit::Acknowledged);
-    assert_eq!(report.identity, report.cat_identity);
     assert_eq!(report.segments.len(), 1);
     radio.into_transport().assert_complete();
     Ok(())
@@ -147,7 +150,6 @@ async fn malformed_second_reply_preserves_first_segment_without_blind_exit() -> 
     );
     assert_eq!(report.exit, McpProbeExit::RecoveryRequired);
     assert_eq!(report.segments.len(), 1);
-    assert!(report.cat_identity.is_none());
     radio.into_transport().assert_complete();
     Ok(())
 }
@@ -188,7 +190,7 @@ async fn partial_read_timeout_retains_identity_without_sending_exit() -> TestRes
             report.outcome,
             McpProbeOutcome::Failed {
                 stage: McpProbeStage::GlobalRead,
-                error: kenwood_tmd750::Error::Timeout { .. }
+                error: Error::Timeout { .. }
             }
         ),
         "{report:?}"
@@ -222,34 +224,35 @@ async fn exit_failure_is_not_reported_as_completed_or_followed_by_cat() -> TestR
     );
     assert_eq!(report.exit, McpProbeExit::NotAcknowledged);
     assert_eq!(report.segments.len(), 2);
-    assert!(report.cat_identity.is_none());
     radio.into_transport().assert_complete();
     Ok(())
 }
 
 #[tokio::test]
-async fn identity_change_after_exit_is_a_qualification_failure() -> TestResult {
+async fn fresh_identity_is_a_separate_observation_after_probe_exit() -> TestResult {
     let mut mock = MockTransport::new();
     identity(&mut mock, b"FV 1.02\r");
     mock.expect(ENTER, b"0M\r");
     read(&mut mock, global_page()?, 0);
     read(&mut mock, slot_page()?, 0);
     mock.expect(&[EXIT], &[ACK]);
-    identity(&mut mock, b"FV 1.03\r");
     let mut radio = Radio::new(mock);
     let report = radio.probe_mcp(|| false).await;
     assert!(
-        matches!(
-            report.outcome,
-            McpProbeOutcome::Failed {
-                stage: McpProbeStage::CatVerification,
-                ..
-            }
-        ),
+        matches!(report.outcome, McpProbeOutcome::AwaitingCatVerification),
         "{report:?}"
     );
-    assert_ne!(report.identity, report.cat_identity);
     assert_eq!(report.exit, McpProbeExit::Acknowledged);
     radio.into_transport().assert_complete();
+    let mut fresh = MockTransport::new();
+    identity(&mut fresh, b"FV 1.03\r");
+    let mut fresh = Radio::new(fresh);
+    let observed = fresh.identify().await?;
+    assert_ne!(
+        report.identity.as_ref(),
+        Some(&observed),
+        "a probe cannot establish a future connection's identity"
+    );
+    fresh.into_transport().assert_complete();
     Ok(())
 }

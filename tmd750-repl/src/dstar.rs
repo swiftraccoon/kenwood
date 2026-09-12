@@ -746,18 +746,26 @@ where
     cat_radio.set_timeout(cat_timeout);
     match cat_radio.identify().await {
         Ok(identity) => {
-            let gateway = cat_radio.get_dv_gateway_mode().await.map_or_else(
-                |error| format!("unreadable ({error})"),
-                |mode| mode.to_string(),
+            let gateway = cat_radio.get_dv_gateway_mode().await;
+            let guidance =
+                terminal::cat_startup_guidance(connection, gateway.as_ref().ok().copied());
+            let gateway = gateway
+                .as_ref()
+                .map_or_else(|error| format!("unreadable ({error})"), ToString::to_string);
+            let message = format!(
+                "{} firmware {} answered normal CAT.\n\
+                 DV Gateway state: {gateway}. No setting was changed.\n{guidance}",
+                identity.model, identity.firmware,
             );
             let mut transport = cat_radio.into_transport();
-            drop(transport.close().await);
-            Err(format!(
-                "{} firmware {} answered normal CAT.\nDV Gateway state: {gateway}. No setting was changed.\n{}",
-                identity.model,
-                identity.firmware,
-                terminal::instructions(connection)
-            ))
+            Err(match transport.close().await {
+                Ok(()) => message,
+                Err(error) => {
+                    let cause = std::error::Error::source(&error)
+                        .map_or_else(String::new, |cause| format!(": {cause}"));
+                    format!("{message}\nSerial close also failed: {error}{cause}.")
+                }
+            })
         }
         Err(error)
             if matches!(
@@ -997,6 +1005,7 @@ fn print_dstar_help() {
 mod tests {
     use super::*;
     use kenwood_tmd750::transport::{MockTransport, TransportError};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Mutex;
 
     const MMDVM_VERSION_PROBE: [u8; 3] = [0xE0, 0x03, 0x00];
@@ -1004,12 +1013,16 @@ mod tests {
     #[derive(Clone, Debug)]
     struct SharedMock {
         inner: Arc<Mutex<MockTransport>>,
+        closes: Arc<AtomicUsize>,
+        fail_close: bool,
     }
 
     impl SharedMock {
         fn new(mock: MockTransport) -> Self {
             Self {
                 inner: Arc::new(Mutex::new(mock)),
+                closes: Arc::new(AtomicUsize::new(0)),
+                fail_close: false,
             }
         }
 
@@ -1020,6 +1033,11 @@ mod tests {
 
     impl Transport for SharedMock {
         async fn write(&mut self, data: &[u8]) -> Result<(), TransportError> {
+            assert_eq!(
+                self.closes.load(Ordering::SeqCst),
+                0,
+                "no requests may follow a close attempt"
+            );
             self.inner.lock().await.write(data).await
         }
 
@@ -1028,8 +1046,45 @@ mod tests {
         }
 
         async fn close(&mut self) -> Result<(), TransportError> {
+            let _previous = self.closes.fetch_add(1, Ordering::SeqCst);
+            if self.fail_close {
+                return Err(TransportError::Disconnected(std::io::Error::other(
+                    "injected serial close failure",
+                )));
+            }
             self.inner.lock().await.close().await
         }
+    }
+
+    fn cat_gateway_mock(response: &[u8]) -> SharedMock {
+        let mut mock = MockTransport::new();
+        mock.expect(b"ID\r", b"ID TM-D750\r");
+        mock.expect(b"FV\r", b"FV 1.02\r");
+        mock.expect(b"TY\r", b"TY K,2,1\r");
+        mock.expect(b"GW\r", response);
+        SharedMock::new(mock)
+    }
+
+    async fn cat_startup_diagnostic(
+        shared: &SharedMock,
+        connection: terminal::UsbConnection,
+    ) -> Result<String, String> {
+        let result = prove_mmdvm_or_explain_cat(shared.clone(), connection).await;
+        let Err(guidance) = result else {
+            return Err("CAT must return a diagnostic, not a modem owner".to_owned());
+        };
+        assert_eq!(
+            shared.writes().await,
+            [b"ID\r", b"FV\r", b"TY\r", b"GW\r"],
+            "CAT guidance must send only the four read-only queries"
+        );
+        assert_eq!(
+            shared.closes.load(Ordering::SeqCst),
+            1,
+            "every CAT diagnostic must attempt exactly one close"
+        );
+        shared.inner.lock().await.assert_complete();
+        Ok(guidance)
     }
 
     #[test]
@@ -1086,21 +1141,108 @@ mod tests {
                 "USB (Main Unit)",
             ),
         ] {
-            let mut mock = MockTransport::new();
-            mock.expect(b"ID\r", b"ID TM-D750\r");
-            mock.expect(b"FV\r", b"FV 1.02\r");
-            mock.expect(b"TY\r", b"TY K,2,1\r");
-            mock.expect(b"GW\r", b"GW 0\r");
-            let shared = SharedMock::new(mock);
-            let result = prove_mmdvm_or_explain_cat(shared.clone(), connection).await;
-            let Err(guidance) = result else {
-                return Err("normal CAT must return guidance, not a modem owner".to_owned());
-            };
+            let shared = cat_gateway_mock(b"GW 0\r");
+            let guidance = cat_startup_diagnostic(&shared, connection).await?;
             assert!(guidance.contains(routing));
             assert!(!guidance.contains(forbidden));
             assert!(guidance.contains("No setting was changed"));
-            assert_eq!(shared.writes().await, [b"ID\r", b"FV\r", b"TY\r", b"GW\r"]);
-            shared.inner.lock().await.assert_complete();
+            assert!(guidance.contains("Configure the radio manually"));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn observed_terminal_reports_control_link_without_repeating_setup() -> Result<(), String>
+    {
+        for connection in [
+            terminal::UsbConnection::MainUnit,
+            terminal::UsbConnection::Panel,
+            terminal::UsbConnection::Unknown,
+        ] {
+            let shared = cat_gateway_mock(b"GW 2\r");
+            let guidance = cat_startup_diagnostic(&shared, connection).await?;
+            for expected in [
+                "DV Gateway state: Terminal",
+                "Terminal Mode is already selected (GW 2)",
+                "This endpoint answered CAT; MMDVM is not proved",
+                "may be routed to another endpoint",
+                "GW does not identify its route or pair USB endpoints to one radio",
+                "select it with --port",
+                "No automatic setup was attempted",
+            ] {
+                assert!(
+                    guidance.contains(expected),
+                    "missing {expected}: {guidance}"
+                );
+            }
+            for forbidden in [
+                "Configure the radio manually",
+                "Menu 650:",
+                "TERM indicator",
+            ] {
+                assert!(
+                    !guidance.contains(forbidden),
+                    "observed Terminal must not repeat {forbidden}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unnamed_and_unreadable_gateway_never_infer_mode_or_route() -> Result<(), String> {
+        for (reply, expected) in [
+            (&b"GW 1\r"[..], "DV Gateway state: unqualified value 1"),
+            (&b"N\r"[..], "DV Gateway state: unreadable ("),
+            (&b"GW invalid\r"[..], "DV Gateway state: unreadable ("),
+        ] {
+            let shared = cat_gateway_mock(reply);
+            let guidance =
+                cat_startup_diagnostic(&shared, terminal::UsbConnection::MainUnit).await?;
+            assert!(
+                guidance.contains(expected),
+                "missing {expected}: {guidance}"
+            );
+            assert!(
+                guidance.contains("Gateway state is not confirmed as Off or Terminal"),
+                "an unnamed value or query error does not establish either named state"
+            );
+            for forbidden in [
+                "DV Gateway state: Off.",
+                "Terminal Mode is already selected",
+                "Configure the radio manually",
+                "Menu 986:",
+                "USB (Panel)",
+                "USB (Main Unit)",
+            ] {
+                assert!(
+                    !guidance.contains(forbidden),
+                    "uncertain Gateway state must not infer {forbidden}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cat_diagnostic_retains_gateway_result_when_serial_close_fails() -> Result<(), String> {
+        for (reply, expected) in [
+            (&b"GW 2\r"[..], "DV Gateway state: Terminal"),
+            (&b"N\r"[..], "DV Gateway state: unreadable ("),
+        ] {
+            let mut shared = cat_gateway_mock(reply);
+            shared.fail_close = true;
+            let guidance =
+                cat_startup_diagnostic(&shared, terminal::UsbConnection::MainUnit).await?;
+            assert!(
+                guidance.contains(expected),
+                "cleanup failure must preserve the original Gateway result"
+            );
+            assert!(
+                guidance.contains("Serial close also failed:")
+                    && guidance.contains("injected serial close failure"),
+                "cleanup failure must remain visible: {guidance}"
+            );
         }
         Ok(())
     }

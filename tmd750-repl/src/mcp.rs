@@ -2,11 +2,15 @@
 
 mod backup;
 mod capture;
+mod menu;
+mod menu_apply;
 mod pm1_trial;
 mod reconnect;
 mod reconnect_policy;
+mod reentry_probe;
 mod snapshot;
 mod terminal;
+mod terminal_exit_trial;
 mod text;
 mod text_set;
 
@@ -44,29 +48,59 @@ struct McpCli {
 pub(crate) enum McpCommand {
     /// Capture two fixed memory fragments, MCP exit, and return to CAT.
     Probe(ProbeRequest),
+    /// Run one approved pair of read-only MCP sessions with Gateway Off.
+    ReentryProbe(reentry_probe::Request),
     /// Back up every standard configuration region, then verify fresh CAT.
     Backup(backup::BackupRequest),
-    /// Inspect text offline or explicitly apply the qualified PM1 name setting.
+    /// Discover, inspect, preview, or explicitly apply registered menu fields.
+    Menu(menu::MenuRequest),
+    /// Inspect text offline or explicitly update PM1's name or PM-Off MY1.
     Text(text::TextRequest),
     /// Inspect captured Terminal settings offline; never activates the gateway.
     Terminal(terminal::TerminalRequest),
     /// Run the separately approved, fixed PM1 rename-and-restore experiment.
     Pm1Trial(pm1_trial::TrialRequest),
+    /// Run the separately approved PM Off MY1 KQ4NIT-and-restore experiment.
+    My1Trial(pm1_trial::My1TrialRequest),
+    /// Run one separately approved, guarded Terminal-to-Off experiment.
+    TerminalExitTrial(terminal_exit_trial::Request),
 }
 
 impl McpCommand {
     /// Require a pinned endpoint for every workflow that reconnects.
     pub(crate) fn validate_endpoint_selection(&self, explicit_port: bool) -> AppResult<()> {
         match self {
-            Self::Probe(request) => request.validate_endpoint_selection(explicit_port),
             Self::Text(request) => request.validate_endpoint_selection(explicit_port),
+            Self::Menu(request) => request.validate_endpoint_selection(explicit_port),
             Self::Terminal(_) => Ok(()),
-            Self::Backup(_) | Self::Pm1Trial(_) if explicit_port => Ok(()),
+            Self::Probe(_)
+            | Self::Backup(_)
+            | Self::ReentryProbe(_)
+            | Self::Pm1Trial(_)
+            | Self::My1Trial(_)
+            | Self::TerminalExitTrial(_)
+                if explicit_port =>
+            {
+                Ok(())
+            }
+            Self::Probe(_) => Err(Box::new(crate::CommandError(
+                "mcp probe requires an explicit --port before mcp; USB paths are not physical radio identities"
+                    .to_owned(),
+            ))),
             Self::Backup(_) => Err(Box::new(crate::CommandError(
                 "mcp backup requires an explicit --port before mcp".to_owned(),
             ))),
+            Self::ReentryProbe(_) => Err(Box::new(crate::CommandError(
+                "mcp reentry-probe requires an explicit --port before mcp".to_owned(),
+            ))),
             Self::Pm1Trial(_) => Err(Box::new(crate::CommandError(
                 "mcp pm1-trial requires an explicit --port before mcp".to_owned(),
+            ))),
+            Self::My1Trial(_) => Err(Box::new(crate::CommandError(
+                "mcp my1-trial requires an explicit --port before mcp".to_owned(),
+            ))),
+            Self::TerminalExitTrial(_) => Err(Box::new(crate::CommandError(
+                "mcp terminal-exit-trial requires an explicit --port before mcp".to_owned(),
             ))),
         }
     }
@@ -76,8 +110,14 @@ impl McpCommand {
 pub(crate) fn run_offline(request: &McpCommand) -> Option<AppResult<()>> {
     match request {
         McpCommand::Text(request) => text::run_offline(request),
+        McpCommand::Menu(request) => menu::run_offline(request),
         McpCommand::Terminal(request) => Some(terminal::run(request)),
-        McpCommand::Probe(_) | McpCommand::Backup(_) | McpCommand::Pm1Trial(_) => None,
+        McpCommand::Probe(_)
+        | McpCommand::ReentryProbe(_)
+        | McpCommand::Backup(_)
+        | McpCommand::Pm1Trial(_)
+        | McpCommand::My1Trial(_)
+        | McpCommand::TerminalExitTrial(_) => None,
     }
 }
 
@@ -89,25 +129,6 @@ pub(crate) struct ProbeRequest {
     /// If omitted, reserve a unique directory below ./captures/.
     #[arg(long, value_name = "NEW_DIRECTORY")]
     output: Option<PathBuf>,
-
-    /// Close after MCP exit, then verify CAT on one fresh connection.
-    ///
-    /// Requires an explicit --port before mcp. Never follows a changed path.
-    #[arg(long)]
-    verify_reconnect: bool,
-}
-
-impl ProbeRequest {
-    /// Reject an unpinned reconnect workflow before enumeration or capture.
-    pub(crate) fn validate_endpoint_selection(&self, explicit_port: bool) -> AppResult<()> {
-        if self.verify_reconnect && !explicit_port {
-            return Err(Box::new(crate::CommandError(
-                "--verify-reconnect requires an explicit --port before mcp; USB paths are not physical radio identities"
-                    .to_owned(),
-            )));
-        }
-        Ok(())
-    }
 }
 
 /// Parse original OS arguments without lowercasing paths or splitting spaces.
@@ -167,8 +188,7 @@ struct ArtifactReport {
     open_error: Option<Failure>,
     signal_error: Option<Failure>,
     close_error: Option<Failure>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    post_exit_verification: Option<PostExitVerification>,
+    post_exit_verification: PostExitVerification,
 }
 
 #[derive(Debug, Serialize)]
@@ -177,7 +197,6 @@ struct ProbeEvidence {
     entry_reply: Option<Vec<u8>>,
     segments: Vec<SegmentEvidence>,
     exit: ExitDisposition,
-    cat_identity: Option<IdentityEvidence>,
     outcome: Outcome,
 }
 
@@ -229,22 +248,22 @@ impl From<McpProbeExit> for ExitDisposition {
 #[serde(rename_all = "snake_case")]
 enum Stage {
     Identity,
+    Gateway,
     Entry,
     GlobalRead,
     SlotRead,
     Exit,
-    CatVerification,
 }
 
 impl From<McpProbeStage> for Stage {
     fn from(stage: McpProbeStage) -> Self {
         match stage {
             McpProbeStage::Identity => Self::Identity,
+            McpProbeStage::Gateway => Self::Gateway,
             McpProbeStage::Entry => Self::Entry,
             McpProbeStage::GlobalRead => Self::GlobalRead,
             McpProbeStage::SlotRead => Self::SlotRead,
             McpProbeStage::Exit => Self::Exit,
-            McpProbeStage::CatVerification => Self::CatVerification,
         }
     }
 }
@@ -252,7 +271,6 @@ impl From<McpProbeStage> for Stage {
 #[derive(Debug, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum Outcome {
-    Complete,
     AwaitingCatVerification,
     Cancelled,
     Failed { stage: Stage, error: Failure },
@@ -273,9 +291,7 @@ impl From<&McpProbeReport> for ProbeEvidence {
                 })
                 .collect(),
             exit: report.exit.into(),
-            cat_identity: report.cat_identity.as_ref().map(IdentityEvidence::from),
             outcome: match &report.outcome {
-                McpProbeOutcome::Complete => Outcome::Complete,
                 McpProbeOutcome::AwaitingCatVerification => Outcome::AwaitingCatVerification,
                 McpProbeOutcome::Cancelled => Outcome::Cancelled,
                 McpProbeOutcome::Failed { stage, error } => Outcome::Failed {
@@ -307,10 +323,16 @@ pub(crate) async fn run(
 ) -> AppResult<()> {
     match request {
         McpCommand::Probe(request) => run_probe(endpoint, baud, request).await,
+        McpCommand::ReentryProbe(request) => reentry_probe::run(endpoint, baud, request).await,
         McpCommand::Backup(request) => backup::run(endpoint, baud, request).await,
         McpCommand::Text(request) => text::run_selected(endpoint, baud, request).await,
+        McpCommand::Menu(request) => menu::run_selected(endpoint, baud, request).await,
         McpCommand::Terminal(request) => terminal::run(request),
         McpCommand::Pm1Trial(request) => pm1_trial::run(endpoint, baud, request).await,
+        McpCommand::My1Trial(request) => pm1_trial::run_my1(endpoint, baud, request).await,
+        McpCommand::TerminalExitTrial(request) => {
+            terminal_exit_trial::run(endpoint, baud, request).await
+        }
     }
 }
 
@@ -326,18 +348,12 @@ async fn run_probe(endpoint: &SerialCandidate, baud: u32, request: &ProbeRequest
                 source,
             }
         })?;
-    let post_exit = if request.verify_reconnect {
-        Some(
-            artifacts
-                .reserve_post_exit(Arc::clone(&cancelled))
-                .map_err(|source| ProbeError::Capture {
-                    path: artifacts.directory.clone(),
-                    source,
-                })?,
-        )
-    } else {
-        None
-    };
+    let post_exit = artifacts
+        .reserve_post_exit(Arc::clone(&cancelled))
+        .map_err(|source| ProbeError::Capture {
+            path: artifacts.directory.clone(),
+            source,
+        })?;
     output::line(format_args!(
         "MCP capture: {}.",
         artifacts.directory.display()
@@ -372,7 +388,7 @@ async fn run_probe(endpoint: &SerialCandidate, baud: u32, request: &ProbeRequest
     .await;
     print_workflow_result(&result);
     let report = ArtifactReport {
-        format_version: if request.verify_reconnect { 2 } else { 1 },
+        format_version: 2,
         software_version: env!("CARGO_PKG_VERSION"),
         started_at_utc,
         finished_at_utc: OffsetDateTime::now_utc().format(&Rfc3339)?,
@@ -410,14 +426,13 @@ impl ArtifactReport {
             && self.signal_error.is_none()
             && self.close_error.is_none()
             && self.transcript.complete
-            && match (&self.probe, &self.post_exit_verification) {
-                (Some(probe), None) => matches!(probe.outcome, Outcome::Complete),
-                (Some(probe), Some(verification)) => {
+            && match &self.probe {
+                Some(probe) => {
                     matches!(probe.outcome, Outcome::AwaitingCatVerification)
                         && matches!(probe.exit, ExitDisposition::Acknowledged)
-                        && verification.succeeded()
+                        && self.post_exit_verification.succeeded()
                 }
-                (None, _) => false,
+                None => false,
             }
     }
 }
@@ -425,7 +440,7 @@ impl ArtifactReport {
 #[derive(Debug)]
 struct WorkflowCaptures {
     original: Recorder<File>,
-    post_exit: Option<Recorder<File>>,
+    post_exit: Recorder<File>,
 }
 
 #[derive(Debug)]
@@ -434,7 +449,7 @@ struct WorkflowResult {
     transcript: TranscriptSummary,
     open_error: Option<Failure>,
     close_error: Option<Failure>,
-    post_exit: Option<PostExitVerification>,
+    post_exit: PostExitVerification,
 }
 
 async fn run_workflow(
@@ -453,7 +468,10 @@ async fn run_workflow(
         transcript: original.summary(),
         open_error: None,
         close_error: None,
-        post_exit: None,
+        post_exit: PostExitVerification::skipped(
+            SkipReason::OriginalOpenFailed,
+            post_exit.summary(),
+        ),
     };
     if cancelled.load(Ordering::Relaxed) {
         result.probe = Some(McpProbeReport {
@@ -461,57 +479,35 @@ async fn run_workflow(
             entry_reply: None,
             segments: Vec::new(),
             exit: McpProbeExit::NotEntered,
-            cat_identity: None,
             outcome: McpProbeOutcome::Cancelled,
         });
-        result.post_exit = post_exit.map(|recorder| {
-            PostExitVerification::skipped(SkipReason::Cancelled, recorder.summary())
-        });
+        result.post_exit =
+            PostExitVerification::skipped(SkipReason::Cancelled, post_exit.summary());
         return result;
     }
     let transport = match backend.open(endpoint, baud) {
         Ok(transport) => transport,
         Err(error) => {
             result.open_error = Some(Failure::from_error(&error));
-            result.post_exit = post_exit.map(|recorder| {
-                PostExitVerification::skipped(SkipReason::OriginalOpenFailed, recorder.summary())
-            });
             return result;
         }
     };
     let mut radio = Radio::new(CaptureTransport::new(transport, original));
-    radio.set_cat_baud(baud);
-    let mut probe = if post_exit.is_some() {
-        radio
-            .probe_mcp_until_exit(|| cancelled.load(Ordering::Relaxed))
-            .await
-    } else {
-        radio.probe_mcp(|| cancelled.load(Ordering::Relaxed)).await
-    };
+    let probe = radio.probe_mcp(|| cancelled.load(Ordering::Relaxed)).await;
     let mut transport = radio.into_transport();
     result.close_error = close_transport(&mut transport).await;
     result.transcript = transport.into_recorder().summary();
-    if post_exit.is_none()
-        && cancelled.load(Ordering::Relaxed)
-        && matches!(probe.outcome, McpProbeOutcome::Complete)
-    {
-        probe.outcome = McpProbeOutcome::Cancelled;
-    }
-    if let Some(recorder) = post_exit {
-        result.post_exit = Some(
-            match verification_eligibility(
-                &probe,
-                result.close_error.as_ref(),
-                &result.transcript,
-                cancelled,
-            ) {
-                Ok(identity) => {
-                    reconnect::verify(backend, endpoint, baud, identity, recorder, cancelled).await
-                }
-                Err(reason) => PostExitVerification::skipped(reason, recorder.summary()),
-            },
-        );
-    }
+    result.post_exit = match verification_eligibility(
+        &probe,
+        result.close_error.as_ref(),
+        &result.transcript,
+        cancelled,
+    ) {
+        Ok(identity) => {
+            reconnect::verify(backend, endpoint, baud, identity, post_exit, cancelled).await
+        }
+        Err(reason) => PostExitVerification::skipped(reason, post_exit.summary()),
+    };
     result.probe = Some(probe);
     result
 }
@@ -603,25 +599,20 @@ fn print_workflow_result(result: &WorkflowResult) {
     if let Some(probe) = &result.probe {
         print_probe_result(probe);
     }
-    if let Some(verification) = &result.post_exit {
-        if verification.succeeded() {
-            output::line(format_args!(
-                "Fresh CAT connection verified: selected USB endpoint and identity tuple match. Physical-unit continuity is not proved."
-            ));
-        } else {
-            output::error(format_args!(
-                "Post-exit verification did not complete: {}. Fully power-cycle the radio before another attempt.",
-                verification.outcome
-            ));
-        }
+    if result.post_exit.succeeded() {
+        output::line(format_args!(
+            "Fresh CAT connection verified: selected USB endpoint and identity tuple match. Physical-unit continuity is not proved."
+        ));
+    } else {
+        output::error(format_args!(
+            "Post-exit verification did not complete: {}. No further radio commands will be sent; inspect the report before reconnecting.",
+            result.post_exit.outcome
+        ));
     }
 }
 
 fn print_probe_result(report: &McpProbeReport) {
     match &report.outcome {
-        McpProbeOutcome::Complete => output::line(format_args!(
-            "MCP probe completed: two fragments captured; exit and unchanged CAT identity verified. This does not qualify a settings schema."
-        )),
         McpProbeOutcome::AwaitingCatVerification => output::line(format_args!(
             "MCP fragments and exit ACK captured. Original handle retirement was attempted without post-exit CAT; fresh-connection evidence is reported separately."
         )),
@@ -635,12 +626,6 @@ fn print_probe_result(report: &McpProbeReport) {
     if matches!(
         report.exit,
         McpProbeExit::RecoveryRequired | McpProbeExit::NotAcknowledged
-    ) || matches!(
-        report.outcome,
-        McpProbeOutcome::Failed {
-            stage: McpProbeStage::CatVerification,
-            ..
-        }
     ) {
         output::error(format_args!(
             "Radio state is not verified. Stop using this connection and fully power-cycle the radio before reconnecting. No recovery commands will be sent."
@@ -687,28 +672,16 @@ mod tests {
 
     #[test]
     fn fresh_verification_requires_an_explicit_endpoint() -> TestResult {
-        let McpCommand::Probe(request) =
-            parse(&["mcp", "probe", "--verify-reconnect"].map(str::to_owned))?
-        else {
-            return Err("expected probe request".into());
-        };
-        assert!(
-            request.verify_reconnect,
-            "fresh verification must be explicitly selected"
-        );
+        let request = parse(&["mcp", "probe"].map(str::to_owned))?;
         assert!(
             request.validate_endpoint_selection(false).is_err(),
-            "fresh verification must not auto-select its endpoint"
+            "every probe requires explicit endpoint selection before reconnecting"
         );
         request.validate_endpoint_selection(true)?;
-        let McpCommand::Probe(default) = parse(&["mcp", "probe"].map(str::to_owned))? else {
-            return Err("expected probe request".into());
-        };
         assert!(
-            !default.verify_reconnect,
-            "default probes must never reconnect"
+            parse(&["mcp", "probe", "--verify-reconnect"].map(str::to_owned)).is_err(),
+            "obsolete optional verification must not leave a compatibility path"
         );
-        default.validate_endpoint_selection(false)?;
         Ok(())
     }
 
@@ -814,7 +787,6 @@ mod tests {
                 data: vec![0x42; 40],
             }],
             exit: McpProbeExit::RecoveryRequired,
-            cat_identity: None,
             outcome: McpProbeOutcome::Failed {
                 stage: McpProbeStage::SlotRead,
                 error: kenwood_tmd750::transport::TransportError::Read(io::Error::other(

@@ -128,19 +128,34 @@ impl Transport for DepartingEndpoint {
 async fn assert_protocol_is_blocked(radio: &mut Radio<DepartingEndpoint>) {
     let result = radio.identify().await;
     assert!(
-        matches!(result, Err(Error::Mcp(McpError::RecoveryRequired))),
+        matches!(
+            result,
+            Err(Error::Mcp(
+                McpError::RecoveryRequired | McpError::ConnectionRetired
+            ))
+        ),
         "CAT must not touch the uncertain or retired handle: {result:?}"
     );
     {
         let result = radio.enter_mcp().await;
         assert!(
-            matches!(result, Err(Error::Mcp(McpError::RecoveryRequired))),
+            matches!(
+                result,
+                Err(Error::Mcp(
+                    McpError::RecoveryRequired | McpError::ConnectionRetired
+                ))
+            ),
             "entry must not touch the uncertain or retired handle: {result:?}"
         );
     }
     let result = radio.mcp_session();
     assert!(
-        matches!(result, Err(Error::Mcp(McpError::RecoveryRequired))),
+        matches!(
+            result,
+            Err(Error::Mcp(
+                McpError::RecoveryRequired | McpError::ConnectionRetired
+            ))
+        ),
         "an uncertain or retired handle is not an idle MCP session: {result:?}"
     );
 }

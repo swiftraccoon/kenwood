@@ -15,7 +15,7 @@ use super::snapshot::Snapshot;
 use super::{IdentityEvidence, capture, write_report};
 use crate::{AppResult, CommandError, output};
 
-/// Inspect text offline or select the separately bounded live PM1 setter.
+/// Inspect text offline or select a separately bounded typed text setter.
 #[derive(Debug, Parser)]
 pub(crate) struct TextRequest {
     #[command(subcommand)]
@@ -30,7 +30,7 @@ enum TextCommand {
     Show(Selection),
     /// Preview a text change without altering the backup or applying it to a radio.
     Preview(PreviewRequest),
-    /// Apply PM1's name only, then verify it across MCP exit/re-entry.
+    /// Set PM1's name or PM-Off MY1, then verify across MCP exit/re-entry.
     Set(super::text_set::SetRequest),
 }
 
@@ -189,7 +189,7 @@ fn list() -> AppResult<()> {
         ));
     }
     output::line(format_args!(
-        "Firmware 1.02 requires --interpret-unqualified for show or preview. Only pm-name-1 has a separate live setter: mcp text set --help."
+        "This legacy text view requires --interpret-unqualified on firmware 1.02. Dedicated pm-name-1 and PM-Off MY1 setters: mcp text set --help. General menu discovery, preview, and ordinary updates: mcp menu --help."
     ));
     Ok(())
 }
@@ -335,25 +335,26 @@ impl PreviewArtifact {
             .iter()
             .map(|patch| {
                 let bytes = patch
-                    .bytes
+                    .bytes()
                     .iter()
                     .map(|byte| {
-                        let address = patch.page.address().as_usize() + usize::from(byte.offset);
+                        let address =
+                            patch.page().address().as_usize() + usize::from(byte.offset());
                         let before = *image.as_bytes().get(address).ok_or_else(|| {
                             CommandError("planned text byte exceeds the source image".to_owned())
                         })?;
                         Ok(ByteEvidence {
-                            offset: byte.offset,
-                            mask: byte.mask,
-                            value: byte.value,
+                            offset: byte.offset(),
+                            mask: byte.mask(),
+                            value: byte.value(),
                             before,
-                            after: (before & !byte.mask) | (byte.value & byte.mask),
+                            after: (before & !byte.mask()) | byte.value(),
                         })
                     })
                     .collect::<AppResult<Vec<_>>>()?;
                 Ok(PageEvidence {
-                    address: patch.page.address().as_u32(),
-                    length: patch.page.len(),
+                    address: patch.page().address().as_u32(),
+                    length: patch.page().len(),
                     bytes,
                 })
             })

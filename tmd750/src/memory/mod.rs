@@ -1,20 +1,36 @@
 //! Typed access to the TM-D750 memory image.
 
+mod configuration;
+pub(crate) mod fixed_text_trial;
 pub mod menu_fields;
 mod menu_patch;
+mod menu_policy;
+mod my1_callsign_update;
+mod my_callsign_trial;
 mod pm1_name_update;
 mod pm_name_trial;
 pub mod schema;
 mod terminal;
+mod terminal_exit_trial;
 mod text;
 
 use crate::error::{SchemaError, ValidationError};
 use crate::types::{FirmwareIdentity, IMAGE_LENGTH, RadioModel, SlotIndex};
 
+pub use configuration::{
+    ChangedByte, ChangedPage, ConfigurationError, StandardConfiguration, StandardConfigurationDiff,
+};
 pub use menu_fields::{
     MCP_D750_IMAGE_LENGTH, MCP_D750_MENU_FIELDS, MCP_D750_SCHEMA_VERSION, MCP_D750_SLOT_COUNT,
     MCP_D750_SLOT_STRIDE, MCP_D750_SOURCE_SHA256, MenuField, MenuOption, StorageTransform,
     menu_field,
+};
+pub use menu_patch::MenuValueError;
+pub use menu_policy::{MenuWritePolicy, MenuWritePolicyError};
+pub use my_callsign_trial::MyCallsignTrial;
+pub use my1_callsign_update::{
+    My1Callsign, My1CallsignUpdate, My1CallsignUpdateError, My1CallsignUpdateEvent,
+    My1CallsignUpdateSession, My1CallsignUpdateStatus,
 };
 pub use pm_name_trial::{
     PmNameTrial, PmNameTrialError, PmNameTrialEvent, PmNameTrialSession, PmNameTrialStatus,
@@ -32,6 +48,10 @@ pub use terminal::{
     ReflectorTerminalPreflight, TerminalFinding, TerminalGatewayMode, TerminalGatewayRoute,
     TerminalMode, TerminalMyCallsignIndex, TerminalPreflightError, TerminalUsbFunction,
     TerminalUsbRoute,
+};
+pub use terminal_exit_trial::{
+    TerminalExitTrial, TerminalExitTrialError, TerminalExitTrialEvent, TerminalExitTrialSession,
+    TerminalExitTrialStatus,
 };
 pub use text::{
     TextError, TextImage, TextLayoutQualification, TextMetadata, TextPreview, TextScope,

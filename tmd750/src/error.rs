@@ -230,7 +230,9 @@ pub enum ProtocolError {
 #[non_exhaustive]
 pub enum McpError {
     /// A CAT operation was requested while the radio is in programming mode.
-    #[error("programming mode is active; exit the MCP session before using CAT")]
+    #[error(
+        "programming mode is active; exit MCP, release this connection, and identify a fresh connection before using CAT"
+    )]
     SessionActive,
     /// An MCP operation was requested without an active programming session.
     #[error("programming mode is not active")]
@@ -240,6 +242,31 @@ pub enum McpError {
         "radio protocol state is uncertain; restore normal mode and establish a fresh connection"
     )]
     RecoveryRequired,
+    /// MCP exit was acknowledged; the original connection must be released.
+    #[error(
+        "MCP exit was acknowledged; close this connection and prove identity on a fresh connection"
+    )]
+    ConnectionRetired,
+    /// A journaled page does not have exactly one intended patch.
+    #[error(
+        "recovery page at {address} (len {len}) requires exactly one intended patch; found {count}"
+    )]
+    RecoveryIntentCount {
+        /// Journaled page address.
+        address: u32,
+        /// Journaled page length.
+        len: usize,
+        /// Matching intended patches; zero means no intended value is known.
+        count: usize,
+    },
+    /// A recovery journal repeats the same page.
+    #[error("recovery journal repeats page at {address} (len {len})")]
+    DuplicateRecoveryPage {
+        /// Repeated page address.
+        address: u32,
+        /// Repeated page length.
+        len: usize,
+    },
     /// A page lies outside the writable regions.
     #[error("page at {address} (len {len}) lies outside the writable regions")]
     PageNotWritable {
@@ -247,6 +274,60 @@ pub enum McpError {
         address: u32,
         /// Page length.
         len: u16,
+    },
+    /// A replacement is not one complete page of the writable-region walk.
+    #[error("page at {address} (len {len}) is not a canonical writable transfer page")]
+    NonCanonicalPage {
+        /// Supplied page address.
+        address: u32,
+        /// Supplied page length.
+        len: usize,
+    },
+    /// Expected and replacement bytes must each cover the complete page.
+    #[error(
+        "replacement at {address} needs {page_len} expected and replacement bytes; \
+         received {expected_len} and {replacement_len}"
+    )]
+    ReplacementLength {
+        /// Supplied page address.
+        address: u32,
+        /// Canonical page length.
+        page_len: usize,
+        /// Supplied expected-byte count.
+        expected_len: usize,
+        /// Supplied replacement-byte count.
+        replacement_len: usize,
+    },
+    /// A compare-and-exchange batch names the same page more than once.
+    #[error("compare-and-exchange batch repeats the page at {address}")]
+    DuplicateReplacement {
+        /// Repeated page address.
+        address: u32,
+    },
+    /// Two replacements cover overlapping byte ranges.
+    #[error("compare-and-exchange pages at {first} and {second} overlap")]
+    OverlappingReplacements {
+        /// Earlier page address in ascending address order.
+        first: u32,
+        /// Later page address in ascending address order.
+        second: u32,
+    },
+    /// A fresh complete page differs from its immutable expected before-image.
+    #[error("fresh page at {address} differs from its expected bytes at offset {offset}")]
+    CompareMismatch {
+        /// Compared page address.
+        address: u32,
+        /// First differing offset within the page.
+        offset: usize,
+    },
+    /// The caller could not durably record a page's intent before dispatch.
+    #[error("durable intent for page at {address} failed: {source}")]
+    DurableIntent {
+        /// Page whose write was not dispatched.
+        address: u32,
+        /// Original caller error; earlier batch writes may still have completed.
+        #[source]
+        source: std::io::Error,
     },
     /// A read-back differed from the bytes written.
     #[error("read-back of page at {address} differs from the written bytes at offset {offset}")]
@@ -286,6 +367,134 @@ pub enum McpError {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum SchemaError {
+    /// A named registry descriptor differs from the immutable compiled entry.
+    #[error("field {field} descriptor does not match the compiled registry")]
+    CatalogDescriptorMismatch {
+        /// Registered field name whose metadata was changed.
+        field: &'static str,
+    },
+    /// The codec has a reversed range or an invalid encoded length.
+    #[error("field {field} has an invalid {property}")]
+    InvalidCodec {
+        /// Field containing the invalid codec.
+        field: &'static str,
+        /// Invalid structural property, without caller data.
+        property: &'static str,
+    },
+    /// An integer width is zero or exceeds eight bytes.
+    #[error("field {field} integer width {width} is outside 1..=8")]
+    InvalidIntegerWidth {
+        /// Field containing the invalid width.
+        field: &'static str,
+        /// Rejected byte width.
+        width: u8,
+    },
+    /// An integer domain cannot be represented by the encoded width.
+    #[error("field {field} domain does not fit its {width}-byte encoding")]
+    DomainExceedsWidth {
+        /// Field whose domain exceeds its storage capacity.
+        field: &'static str,
+        /// Declared byte width.
+        width: u8,
+    },
+    /// A bit codec has an invalid mask, shift, or domain.
+    #[error("field {field} has invalid bit codec mask 0x{mask:02X}, shift {shift}")]
+    InvalidBitField {
+        /// Field containing the invalid codec.
+        field: &'static str,
+        /// Declared owned bits.
+        mask: u8,
+        /// Declared shift.
+        shift: u8,
+    },
+    /// A byte patch is empty or contains bits outside its declared mask.
+    #[error("byte patch at offset {offset} has invalid mask 0x{mask:02X} or unmasked value")]
+    InvalidBytePatch {
+        /// Offset within the containing page.
+        offset: u8,
+        /// Declared owned bits.
+        mask: u8,
+    },
+    /// A page patch must contain at least one effective bit claim.
+    #[error("page patch at {address} contains no bit claims")]
+    EmptyPagePatch {
+        /// Address of the page.
+        address: u32,
+    },
+    /// A patch offset lies outside its declared page.
+    #[error("page patch at {address} has offset {offset} outside its {len}-byte page")]
+    PatchOffsetOutOfBounds {
+        /// Address of the page.
+        address: u32,
+        /// Rejected in-page offset.
+        offset: u8,
+        /// Declared page length.
+        len: usize,
+    },
+    /// Two byte patches claim the same bits within a page.
+    #[error("page patch at {address} repeats bits at offset {offset}")]
+    OverlappingPatchBits {
+        /// Address of the page.
+        address: u32,
+        /// Offset of the overlapping claims.
+        offset: u8,
+    },
+    /// A page operation requires its entire exact-length byte buffer.
+    #[error("page at {address} requires {expected} bytes, got {actual}")]
+    PatchBufferLength {
+        /// Address of the page.
+        address: u32,
+        /// Required page length.
+        expected: usize,
+        /// Supplied buffer length.
+        actual: usize,
+    },
+    /// Input text contains the codec's terminator or padding byte.
+    #[error("field {field} text contains a storage terminator")]
+    TextTerminator {
+        /// Field requiring exact round-trippable input.
+        field: &'static str,
+    },
+    /// A global field was given an unrelated Programmable-Memory slot.
+    #[error("field {field} is global; omit the PM slot")]
+    UnexpectedSlot {
+        /// Global field name.
+        field: &'static str,
+    },
+    /// A sparse menu snapshot lacks a complete required page.
+    #[error("snapshot for {field} lacks page {address} (len {len})")]
+    SnapshotPageMissing {
+        /// Field or operation requiring the page.
+        field: &'static str,
+        /// Required page address.
+        address: u32,
+        /// Required page length.
+        len: usize,
+    },
+    /// A snapshot supplied bytes that do not fill its declared page.
+    #[error("snapshot page {address} requires {expected} bytes, got {actual}")]
+    SnapshotPageLength {
+        /// Page address.
+        address: u32,
+        /// Declared page length.
+        expected: usize,
+        /// Supplied byte count.
+        actual: usize,
+    },
+    /// A snapshot page is not part of the known configuration transfer walk.
+    #[error("snapshot page {address} (len {len}) is not a canonical configuration page")]
+    SnapshotPageNotCanonical {
+        /// Rejected page address.
+        address: u32,
+        /// Rejected page length.
+        len: usize,
+    },
+    /// Two snapshot entries claim the same canonical page.
+    #[error("snapshot repeats page {address}")]
+    DuplicateSnapshotPage {
+        /// Repeated page address.
+        address: u32,
+    },
     /// A per-slot field was addressed without a slot.
     #[error("field {field} needs a slot index: it has a {dimension} term")]
     SlotRequired {
@@ -418,12 +627,54 @@ pub enum SchemaError {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum FileError {
-    /// The file length is not header plus image.
-    #[error("file is {actual} bytes; a .d750 file is exactly {expected} bytes")]
+    /// The input does not contain the complete configuration header.
+    #[error("file is {actual} bytes; a .d750 header requires {minimum} bytes")]
+    HeaderTooShort {
+        /// Actual input length.
+        actual: usize,
+        /// Required header length.
+        minimum: usize,
+    },
+    /// The header does not declare a supported full or short file signature.
+    #[error("invalid .d750 signature: {found:02X?}")]
+    InvalidSignature {
+        /// The first eight header bytes; a short signature uses the first seven.
+        found: [u8; 8],
+    },
+    /// The model marker at header offset 16 is not `TM-D750`.
+    #[error("invalid .d750 model marker: {found:02X?}")]
+    InvalidModel {
+        /// The exact seven marker bytes.
+        found: [u8; 7],
+    },
+    /// The reserved header byte at offset 32 is nonzero.
+    #[error("unsupported .d750 reserved byte at offset 32: {value}")]
+    NonzeroReservedByte {
+        /// The actual byte.
+        value: u8,
+    },
+    /// The file length disagrees with the validated header's full or short layout.
+    #[error("file is {actual} bytes; its .d750 signature requires exactly {expected} bytes")]
     Length {
         /// Actual length.
         actual: usize,
-        /// Expected length.
+        /// Total header-plus-payload length selected by the header signature.
         expected: usize,
+    },
+    /// A supplied image payload has the wrong length for the validated header.
+    #[error("image is {actual} bytes; its .d750 header requires exactly {expected} image bytes")]
+    ImageLength {
+        /// Actual payload length, excluding the header.
+        actual: usize,
+        /// Payload length selected by the header signature.
+        expected: usize,
+    },
+    /// An opaque radio type cannot be encoded in a newly constructed header.
+    #[error(
+        "cannot construct a configuration header from radio type {payload:?}: expected three single-byte components separated by commas"
+    )]
+    UnsupportedRadioType {
+        /// The unchanged radio-type payload that could not be represented.
+        payload: String,
     },
 }

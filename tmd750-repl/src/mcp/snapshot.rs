@@ -1,13 +1,14 @@
 //! Strict coverage reconstruction from a completed local configuration report.
 
-use std::fs::File;
-use std::io::{BufReader, Read};
+use std::fs::{File, Metadata};
+use std::io::Read;
 use std::path::Path;
 
-use kenwood_tmd750::memory::FieldDescriptor;
+use kenwood_tmd750::memory::{FieldDescriptor, StandardConfiguration};
 use kenwood_tmd750::protocol::mcp::regions;
 use kenwood_tmd750::{
-    FirmwareIdentity, Identity, MemoryImage, RadioModel, RadioType, Region, SlotIndex,
+    FirmwareIdentity, Identity, MemoryImage, MenuFieldSnapshot, RadioModel, RadioType, Region,
+    SlotIndex,
 };
 use serde::Deserialize;
 
@@ -120,6 +121,25 @@ fn invalid<T>(message: &str) -> AppResult<T> {
     ))))
 }
 
+fn validate_metadata(metadata: &Metadata) -> AppResult<()> {
+    if !metadata.is_file() {
+        return invalid("report input must be a regular file");
+    }
+    if metadata.len() > MAX_REPORT_BYTES {
+        return invalid("report exceeds 32 MiB");
+    }
+    Ok(())
+}
+
+fn read_document(reader: impl Read) -> AppResult<Document> {
+    let mut bytes = Vec::new();
+    let _read = reader.take(MAX_REPORT_BYTES + 1).read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len())? > MAX_REPORT_BYTES {
+        return invalid("report exceeds 32 MiB");
+    }
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
 /// An internal dense buffer whose synthetic gaps cannot be read as fields.
 #[derive(Debug)]
 pub(super) struct Snapshot {
@@ -129,15 +149,38 @@ pub(super) struct Snapshot {
 }
 
 impl Snapshot {
-    /// Load only a complete standard configuration capture, without opening USB.
+    /// Copy complete captured standard pages without exposing synthetic image gaps.
+    pub(super) fn menu_snapshot(&self) -> AppResult<MenuFieldSnapshot> {
+        let pages = regions::menu_regions()
+            .into_iter()
+            .flat_map(Region::pages)
+            .map(|page| Ok((page, self.captured_bytes(page.region())?.to_vec())))
+            .collect::<AppResult<Vec<_>>>()?;
+        Ok(MenuFieldSnapshot::from_pages(pages)?)
+    }
+
+    /// Borrow only the complete, actual standard-page coverage for comparison.
+    pub(super) fn standard_configuration(&self) -> AppResult<StandardConfiguration<'_>> {
+        let pages = regions::menu_regions()
+            .into_iter()
+            .flat_map(Region::pages)
+            .map(|page| Ok((page, self.captured_bytes(page.region())?)))
+            .collect::<AppResult<Vec<_>>>()?;
+        Ok(StandardConfiguration::new(&self.identity, pages)?)
+    }
+
+    /// Load only a complete standard configuration capture from a regular file.
+    ///
+    /// Checks the path before opening and checks the opened file again. Ordinary
+    /// symlinks to regular files are accepted; these checks reject mistaken
+    /// special-file inputs but do not provide race-resistant path opening.
+    /// Metadata and the actual bounded read must both fit within 32 MiB, even
+    /// if the file grows after its metadata was checked.
     pub(super) fn load(path: &Path) -> AppResult<Self> {
+        validate_metadata(&path.metadata()?)?;
         let file = File::open(path)?;
-        if file.metadata()?.len() > MAX_REPORT_BYTES {
-            return invalid("report exceeds 32 MiB");
-        }
-        let document: Document =
-            serde_json::from_reader(BufReader::new(file.take(MAX_REPORT_BYTES)))?;
-        Self::from_document(document)
+        validate_metadata(&file.metadata()?)?;
+        Self::from_document(read_document(file)?)
     }
 
     fn from_document(document: Document) -> AppResult<Self> {
@@ -219,6 +262,97 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn regular_report_load_preserves_source_bytes() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("report.json");
+        let bytes = serde_json::to_vec(&fixture())?;
+        std::fs::write(&path, &bytes)?;
+        let snapshot = Snapshot::load(&path)?;
+        assert_eq!(snapshot.identity.firmware.as_str(), "1.02");
+        assert_eq!(
+            std::fs::read(&path)?,
+            bytes,
+            "loading must not modify the source report"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn directory_input_is_rejected_as_non_regular_before_reading() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let error = Snapshot::load(directory.path())
+            .err()
+            .ok_or("directory input was accepted")?;
+        assert!(
+            error.to_string().contains("regular file"),
+            "a directory must fail the file-kind check, not a later read: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_sparse_report_is_rejected_from_metadata() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("oversized.json");
+        File::create_new(&path)?.set_len(MAX_REPORT_BYTES + 1)?;
+        let error = Snapshot::load(&path)
+            .err()
+            .ok_or("oversized input was accepted")?;
+        assert!(
+            error.to_string().contains("32 MiB"),
+            "oversized metadata must fail before parsing sparse contents: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn actual_read_rejects_excess_bytes_and_stops_after_one_limit_sentinel() -> TestResult {
+        let mut reader = std::io::repeat(b' ').take(MAX_REPORT_BYTES + 2);
+        let error = read_document(&mut reader)
+            .err()
+            .ok_or("oversized read was accepted")?;
+        assert!(
+            error.to_string().contains("32 MiB"),
+            "the actual byte bound must be checked before JSON decoding: {error}"
+        );
+        assert_eq!(
+            reader.limit(),
+            1,
+            "the bounded read must consume at most the limit plus one byte"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn valid_report_at_the_exact_read_limit_is_accepted() -> TestResult {
+        let bytes = serde_json::to_vec(&fixture())?;
+        let padding = MAX_REPORT_BYTES
+            .checked_sub(u64::try_from(bytes.len())?)
+            .ok_or("fixture unexpectedly exceeds the report limit")?;
+        let reader = bytes.as_slice().chain(std::io::repeat(b' ').take(padding));
+        let document = read_document(reader)?;
+        document.validate()?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_a_regular_report_is_accepted() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let target = directory.path().join("target.json");
+        let link = directory.path().join("link.json");
+        std::fs::write(&target, serde_json::to_vec(&fixture())?)?;
+        std::os::unix::fs::symlink(&target, &link)?;
+        let snapshot = Snapshot::load(&link)?;
+        assert_eq!(
+            snapshot.identity.radio_type.as_str(),
+            "K,2,1",
+            "regular-file symlinks must retain the same capture identity"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn complete_capture_preserves_identity_and_only_exposes_captured_fields() -> TestResult {
         let snapshot = Snapshot::from_document(serde_json::from_value(fixture())?)?;
         assert_eq!(snapshot.identity.firmware.as_str(), "1.02");
@@ -248,6 +382,21 @@ pub(super) mod tests {
         assert_eq!(
             snapshot.captured_bytes(Region::new(323_594, 323_610)?)?,
             &[0x42; 16]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn standard_comparison_view_cannot_expose_synthetic_backing_bytes() -> TestResult {
+        let mut snapshot = Snapshot::from_document(serde_json::from_value(fixture())?)?;
+        assert!(
+            snapshot.standard_configuration().is_ok(),
+            "a complete successful capture supplies the standard comparison view"
+        );
+        let _removed = snapshot.coverage.pop().ok_or("fixture coverage missing")?;
+        assert!(
+            snapshot.standard_configuration().is_err(),
+            "dense backing bytes cannot replace missing actual coverage"
         );
         Ok(())
     }

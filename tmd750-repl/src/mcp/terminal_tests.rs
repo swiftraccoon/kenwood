@@ -16,7 +16,7 @@ fn request(path: &Path) -> AppResult<PreflightRequest> {
     })
 }
 
-fn write_fixture(path: &Path, image: &MemoryImage) -> TestResult {
+pub(super) fn write_fixture(path: &Path, image: &MemoryImage) -> TestResult {
     let mut document = super::super::snapshot::tests::fixture();
     let segments = document
         .pointer_mut("/backup/segments")
@@ -41,20 +41,23 @@ fn write_fixture(path: &Path, image: &MemoryImage) -> TestResult {
             .ok_or("fixture segment outside image")?;
         *segment.get_mut("data").ok_or("fixture lacks data")? = serde_json::to_value(bytes)?;
     }
-    super::super::write_report(
-        &mut super::super::capture::create_private_file(path)?,
-        &document,
-    )?;
+    let mut writer = std::io::BufWriter::new(super::super::capture::create_private_file(path)?);
+    super::super::write_report(&mut writer, &document)?;
     Ok(())
 }
 
-fn blank_fixture() -> AppResult<MemoryImage> {
+pub(super) fn blank_fixture() -> AppResult<MemoryImage> {
     Ok(MemoryImage::from_bytes(
         vec![0; kenwood_tmd750::types::IMAGE_LENGTH],
     )?)
 }
 
-fn set(image: &mut MemoryImage, name: &str, slot: SlotIndex, value: FieldValue<'_>) -> TestResult {
+pub(super) fn set(
+    image: &mut MemoryImage,
+    name: &str,
+    slot: SlotIndex,
+    value: FieldValue<'_>,
+) -> TestResult {
     let field = menu_field(name).ok_or("fixture field missing")?;
     image.set(&field.descriptor, Some(slot), value)?;
     Ok(())
@@ -74,7 +77,9 @@ fn parser_requires_explicit_slot_and_interface_and_exposes_no_write_surface() ->
         "--interpret-unqualified",
     ];
     let parsed = TerminalRequest::try_parse_from(arguments)?;
-    let TerminalCommand::Preflight(parsed) = parsed.command;
+    let TerminalCommand::Preflight(parsed) = parsed.command else {
+        return Err("expected preflight command".into());
+    };
     assert_eq!(parsed.backup, PathBuf::from("Capture Case/report.json"));
     assert_eq!(parsed.slot.index(), 5);
     assert_eq!(parsed.interface, UsbInterface::PanelUsb);
@@ -148,9 +153,17 @@ fn firmware_policy_is_explicit_and_output_never_claims_live_readiness() -> TestR
         "Unqualified software-layout interpretation",
         "No radio endpoints enumerated or opened",
         "Live activation and restoration remain unqualified",
+        "Main-unit ID/FV/TY/GW queries were observed on firmware 1.02",
+        "with Terminal selected and the Gateway routed to panel USB",
+        "does not establish current routing, general CAT access",
+        "MCP readiness, or qualified automatic exit",
     ] {
         assert!(output.contains(expected), "missing {expected}: {output}");
     }
+    assert!(
+        !output.contains("Another port's CAT access and automatic exit are unqualified"),
+        "the bounded alternate-port CAT observation must not be discarded"
+    );
     assert_eq!(std::fs::read(&path)?, original);
     Ok(())
 }
@@ -250,6 +263,13 @@ fn even_conflict_free_output_does_not_claim_a_radio_is_ready() -> TestResult {
     let output = describe(&snapshot, &report)?.join("\n");
     assert!(output.contains("No conflicts found by these offline checks"));
     assert!(output.contains("This is not a live-readiness result"));
-    assert!(output.contains("Another port's CAT access and automatic exit are unqualified"));
+    assert!(
+        output.contains("Main-unit ID/FV/TY/GW queries were observed on firmware 1.02"),
+        "the bounded alternate-port CAT finding must remain explicit"
+    );
+    assert!(
+        output.contains("MCP readiness, or qualified automatic exit"),
+        "historical CAT success does not establish automatic exit readiness"
+    );
     Ok(())
 }
