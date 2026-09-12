@@ -101,6 +101,28 @@ jobs:
         working-directory: thd75
         env:
           RUSTDOCFLAGS: "-D warnings"
+      # Check both public and private links before merge. Separate output
+      # directories prevent feature variants from reusing rendered docs.
+      - run: cargo doc --no-deps --document-private-items --lib
+        working-directory: tmd750
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+          CARGO_TARGET_DIR: ../target/doc-tmd750-default
+      - run: cargo doc --no-deps --document-private-items --all-features --lib
+        working-directory: tmd750
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+          CARGO_TARGET_DIR: ../target/doc-tmd750-all
+      - run: cargo doc --no-deps --document-private-items --bins
+        working-directory: tmd750-repl
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+          CARGO_TARGET_DIR: ../target/doc-tmd750-repl-default
+      - run: cargo doc --no-deps --document-private-items --all-features --bins
+        working-directory: tmd750-repl
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+          CARGO_TARGET_DIR: ../target/doc-tmd750-repl-all
       - run: cargo fmt -- --check
         working-directory: thd75
       - run: cargo fmt -- --check

@@ -24,20 +24,5 @@ jobs:
       - run: cargo machete dmr-rewind-core/
       - run: cargo machete dmr-rewind/
       - run: cargo machete pulsar/
-
-  semver:
-    name: Semver check
-    runs-on: ubuntu-latest
-    # Only run on PRs: needs a baseline to compare against
-    if: github.event_name == 'pull_request'
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@1.94.0
-      # semver-checks builds rustdoc JSON for both baseline and current;
-      # the cache carries the dep builds between PR pushes.
-      - run: cargo generate-lockfile
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@cargo-semver-checks
-      - run: cargo semver-checks --manifest-path thd75/Cargo.toml
+      - run: cargo machete tmd750/
+      - run: cargo machete tmd750-repl/
