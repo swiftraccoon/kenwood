@@ -260,48 +260,35 @@ async fn required_off_retains_actual_identity_and_state_after_one_closed_durable
 }
 
 #[tokio::test]
-async fn legacy_wrappers_keep_three_queries_and_the_original_serialized_shape() -> TestResult {
-    for required in [false, true] {
-        let mut backend = FreshBackend::new(identity_script(b"FV 1.02\r", b"TY K,2,1\r"));
-        let recorder = recorder(tempfile::tempfile()?);
-        let identity = identity()?;
-        let cancelled = AtomicBool::new(false);
-        let report = if required {
-            verify_required(
-                &mut backend,
-                &endpoint(),
-                9600,
-                &identity,
-                recorder,
-                &cancelled,
-            )
-            .await
-        } else {
-            verify(
-                &mut backend,
-                &endpoint(),
-                9600,
-                &identity,
-                recorder,
-                &cancelled,
-            )
-            .await
-        };
-        assert!(report.succeeded(), "{report:?}");
-        assert!(report.gateway_off_evidence().is_none());
-        backend.assert_operations(IDENTITY_WRITES, true)?;
-        let encoded = serde_json::to_value(&report)?;
-        assert!(encoded.get("required_gateway_mode").is_none());
-        assert_eq!(
-            encoded.get("attempt"),
-            Some(&json!({
-                "endpoint": {"path":endpoint().path, "usb_vendor_id":KENWOOD_VID, "usb_product_id":TMD750_MAIN_PID},
-                "open": {"status":"succeeded"},
-                "identity": {"model":"TM-D750", "firmware":"1.02", "radio_type":"K,2,1"},
-                "close": {"status":"succeeded"}
-            }))
-        );
-    }
+async fn required_identity_keeps_three_queries_and_the_single_attempt_serialized_shape()
+-> TestResult {
+    let mut backend = FreshBackend::new(identity_script(b"FV 1.02\r", b"TY K,2,1\r"));
+    let recorder = recorder(tempfile::tempfile()?);
+    let identity = identity()?;
+    let cancelled = AtomicBool::new(false);
+    let report = verify_required(
+        &mut backend,
+        &endpoint(),
+        9600,
+        &identity,
+        recorder,
+        &cancelled,
+    )
+    .await;
+    assert!(report.succeeded(), "{report:?}");
+    assert!(report.gateway_off_evidence().is_none());
+    backend.assert_operations(IDENTITY_WRITES, true)?;
+    let encoded = serde_json::to_value(&report)?;
+    assert!(encoded.get("required_gateway_mode").is_none());
+    assert_eq!(
+        encoded.get("attempt"),
+        Some(&json!({
+            "endpoint": {"path":endpoint().path, "usb_vendor_id":KENWOOD_VID, "usb_product_id":TMD750_MAIN_PID},
+            "open": {"status":"succeeded"},
+            "identity": {"model":"TM-D750", "firmware":"1.02", "radio_type":"K,2,1"},
+            "close": {"status":"succeeded"}
+        }))
+    );
     Ok(())
 }
 

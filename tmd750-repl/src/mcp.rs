@@ -35,7 +35,7 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::{AppResult, output};
 use capture::{Artifacts, CaptureTransport, Recorder, TranscriptSummary};
-use reconnect::{Backend, PostExitVerification, SkipReason, SystemBackend};
+use reconnect::{Backend, ReadinessVerification, SkipReason, SystemBackend};
 
 /// Dedicated MCP workflows; none accept arbitrary requests or write addresses.
 #[derive(Debug, Parser)]
@@ -189,7 +189,7 @@ struct ArtifactReport {
     open_error: Option<Failure>,
     signal_error: Option<Failure>,
     close_error: Option<Failure>,
-    post_exit_verification: PostExitVerification,
+    post_exit_verification: ReadinessVerification,
 }
 
 #[derive(Debug, Serialize)]
@@ -389,7 +389,7 @@ async fn run_probe(endpoint: &SerialCandidate, baud: u32, request: &ProbeRequest
     .await;
     print_workflow_result(&result);
     let report = ArtifactReport {
-        format_version: 2,
+        format_version: 3,
         software_version: env!("CARGO_PKG_VERSION"),
         started_at_utc,
         finished_at_utc: OffsetDateTime::now_utc().format(&Rfc3339)?,
@@ -450,7 +450,7 @@ struct WorkflowResult {
     transcript: TranscriptSummary,
     open_error: Option<Failure>,
     close_error: Option<Failure>,
-    post_exit: PostExitVerification,
+    post_exit: ReadinessVerification,
 }
 
 async fn run_workflow(
@@ -469,7 +469,7 @@ async fn run_workflow(
         transcript: original.summary(),
         open_error: None,
         close_error: None,
-        post_exit: PostExitVerification::skipped(
+        post_exit: ReadinessVerification::skipped(
             SkipReason::OriginalOpenFailed,
             post_exit.summary(),
         ),
@@ -483,7 +483,7 @@ async fn run_workflow(
             outcome: McpProbeOutcome::Cancelled,
         });
         result.post_exit =
-            PostExitVerification::skipped(SkipReason::Cancelled, post_exit.summary());
+            ReadinessVerification::skipped(SkipReason::Cancelled, post_exit.summary());
         return result;
     }
     let transport = match backend.open(endpoint, baud) {
@@ -505,9 +505,10 @@ async fn run_workflow(
         cancelled,
     ) {
         Ok(identity) => {
-            reconnect::verify(backend, endpoint, baud, identity, post_exit, cancelled).await
+            reconnect::verify_readiness(backend, endpoint, baud, identity, post_exit, cancelled)
+                .await
         }
-        Err(reason) => PostExitVerification::skipped(reason, post_exit.summary()),
+        Err(reason) => ReadinessVerification::skipped(reason, post_exit.summary()),
     };
     result.probe = Some(probe);
     result
@@ -553,8 +554,11 @@ fn write_report(writer: &mut impl Write, report: &impl Serialize) -> io::Result<
     writer.flush()
 }
 
+/// Host cleanup bound, also reserved by read-only MCP readiness checks.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+
 async fn close_transport(transport: &mut impl Transport) -> Option<Failure> {
-    match tokio::time::timeout(Duration::from_secs(2), transport.close()).await {
+    match tokio::time::timeout(CLOSE_TIMEOUT, transport.close()).await {
         Ok(Ok(())) => None,
         Ok(Err(error)) => Some(Failure::from_error(&error)),
         Err(error) => Some(Failure::from_error(&error)),

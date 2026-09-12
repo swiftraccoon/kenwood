@@ -30,7 +30,7 @@ enum TerminalCommand {
 
 #[derive(Debug, Args)]
 struct PreflightRequest {
-    /// Successful format-3 configuration report, not a raw image or partial probe.
+    /// Complete successful configuration backup, not a raw image or partial probe.
     #[arg(long, value_name = "REPORT")]
     backup: PathBuf,
 

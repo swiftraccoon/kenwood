@@ -6,7 +6,7 @@ use std::sync::Mutex;
 
 use kenwood_tmd750::protocol::mcp::{ACK, read_request, write_request};
 use kenwood_tmd750::transport::{KENWOOD_VID, TMD750_MAIN_PID};
-use kenwood_tmd750::{Address, Page};
+use kenwood_tmd750::{Address, McpBackupReport, Page};
 use kenwood_transport::{MockTransport, TransportError};
 use reconnect::{VerificationOutcome, VerificationStage};
 
@@ -431,7 +431,7 @@ async fn backup_close_failure_keeps_complete_pages_but_prevents_reconnect() -> T
         result
             .backup
             .as_ref()
-            .is_some_and(kenwood_tmd750::McpBackupReport::has_complete_configuration),
+            .is_some_and(McpBackupReport::has_complete_configuration),
         "close failure must not discard completed pages"
     );
     assert_no_fresh_open(&observations(&harness.log)?);
@@ -478,7 +478,7 @@ async fn backup_fresh_identity_mismatch_retains_backup_and_never_retries() -> Te
         result
             .backup
             .as_ref()
-            .is_some_and(kenwood_tmd750::McpBackupReport::has_complete_configuration),
+            .is_some_and(McpBackupReport::has_complete_configuration),
         "fresh mismatch must preserve captured bytes"
     );
     assert_eq!(
@@ -499,9 +499,145 @@ async fn backup_fresh_identity_mismatch_retains_backup_and_never_retries() -> Te
     Ok(())
 }
 
+#[tokio::test]
+async fn backup_silent_id_recovery_preserves_pages_and_roundtrips_the_production_report()
+-> TestResult {
+    let mut silent = MockTransport::new();
+    silent.expect_hang(b"ID\r");
+    let mut harness = Harness::new(backup_script(), silent)?;
+    harness
+        .backend
+        .connections
+        .push_back(Ok(ObservedConnection::new(
+            2,
+            fresh_script(b"FV 1.02\r"),
+            Arc::clone(&harness.log),
+        )));
+    let result = harness.run_backup().await?;
+    assert!(
+        result.succeeded(),
+        "silent ID alone permits CAT reacquisition"
+    );
+    let observed = observations(&harness.log)?;
+    assert_eq!(harness.backend.opens, 3);
+    assert_eq!(writes(&observed, 1), vec![b"ID\r".to_vec()]);
+    assert_eq!(writes(&observed, 2), expected_identity_writes());
+    let dropped = position(&observed, &Observation::Dropped(1))?;
+    let reopened = position(&observed, &Observation::Open(2, endpoint().path, 9_600))?;
+    let between = observed.get(dropped + 1..reopened).ok_or("retry order")?;
+    assert!(between.contains(&Observation::Wait(Duration::from_secs(2))));
+    assert!(between.contains(&Observation::Enumerate));
+    let original = writes(&observed, 0);
+    assert_eq!(
+        original
+            .iter()
+            .filter(|bytes| **bytes == b"0M PROGRAM\r")
+            .count(),
+        1
+    );
+    assert_eq!(original.iter().filter(|bytes| **bytes == b"E").count(), 1);
+    assert!(
+        original
+            .iter()
+            .all(|bytes| !matches!(bytes.first(), Some(b'W' | b'Z')))
+    );
+
+    let report = backup::ArtifactReport::new(
+        &endpoint(),
+        9_600,
+        "2026-09-12T00:00:00Z".to_owned(),
+        "2026-09-12T00:00:10Z".to_owned(),
+        result,
+        None,
+    );
+    let document = serde_json::to_value(&report)?;
+    assert_eq!(document.get("format_version"), Some(&serde_json::json!(4)));
+    assert_eq!(
+        document.pointer("/post_exit_verification/attempts/0/outcome/status"),
+        Some(&serde_json::json!("failed")),
+    );
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("report.json");
+    let mut file = capture::create_private_file(&path)?;
+    write_report(&mut file, &report)?;
+    file.sync_all()?;
+    drop(file);
+    let original_bytes = std::fs::read(&path)?;
+    let snapshot = snapshot::Snapshot::load(&path)?;
+    assert_eq!(snapshot.identity.firmware.as_str(), "1.02");
+    for region in kenwood_tmd750::protocol::mcp::regions::menu_regions() {
+        for page in region.pages() {
+            assert_eq!(
+                snapshot.captured_bytes(page.region())?,
+                vec![0x42; page.len()]
+            );
+        }
+    }
+    assert_eq!(std::fs::read(&path)?, original_bytes);
+    Ok(())
+}
+
+#[tokio::test]
+async fn backup_silent_id_exhaustion_retains_complete_reads_without_reentering_mcp() -> TestResult {
+    let mut first = MockTransport::new();
+    first.expect_hang(b"ID\r");
+    let mut harness = Harness::new(backup_script(), first)?;
+    for id in 2..=4 {
+        let mut silent = MockTransport::new();
+        silent.expect_hang(b"ID\r");
+        harness
+            .backend
+            .connections
+            .push_back(Ok(ObservedConnection::new(
+                id,
+                silent,
+                Arc::clone(&harness.log),
+            )));
+    }
+    let result = harness.run_backup().await?;
+    assert!(!result.succeeded());
+    assert!(
+        result
+            .backup
+            .as_ref()
+            .is_some_and(McpBackupReport::has_complete_configuration)
+    );
+    assert!(matches!(
+        result.post_exit.outcome,
+        VerificationOutcome::Failed {
+            stage: VerificationStage::Readiness,
+            ..
+        }
+    ));
+    assert_eq!(harness.backend.opens, 5, "one MCP and four CAT handles");
+    let observed = observations(&harness.log)?;
+    for id in 1..=4 {
+        assert_eq!(writes(&observed, id), vec![b"ID\r".to_vec()]);
+        assert!(
+            position(&observed, &Observation::Close(id))?
+                < position(&observed, &Observation::Dropped(id))?
+        );
+    }
+    let original = writes(&observed, 0);
+    assert_eq!(
+        original
+            .iter()
+            .filter(|bytes| **bytes == b"0M PROGRAM\r")
+            .count(),
+        1
+    );
+    assert_eq!(original.iter().filter(|bytes| **bytes == b"E").count(), 1);
+    assert!(
+        original
+            .iter()
+            .all(|bytes| !matches!(bytes.first(), Some(b'W' | b'Z')))
+    );
+    Ok(())
+}
+
 fn succeeded(result: WorkflowResult) -> bool {
     ArtifactReport {
-        format_version: 2,
+        format_version: 3,
         software_version: env!("CARGO_PKG_VERSION"),
         started_at_utc: "2026-09-07T00:00:00Z".to_owned(),
         finished_at_utc: "2026-09-07T00:00:01Z".to_owned(),

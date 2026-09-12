@@ -737,8 +737,13 @@ proof that all settings were preserved.
 The serial endpoint was first observed at approximately 11.4 and 11.7 seconds
 after exit ACK; complete fresh CAT identity followed at 11.8 and 12.0 seconds.
 These are polling observations on one unit, not guaranteed firmware timings.
-The companion command uses a two-second settle and up to sixty seconds of
-passive enumeration, followed by at most one fresh CAT attempt.
+The companion fixed-probe and backup commands now use a two-second settle and
+a sixty-second readiness-dispatch budget. They permit at most four freshly
+opened identity attempts, retrying only an entirely silent initial ID timeout
+after clean close and complete capture. Every retry re-enumerates the exact
+selected endpoint; partial replies and other failures stop verification.
+Guarded write workflows retain single-attempt verification. These host bounds
+are not guarantees for operating-system call or radio recovery timing.
 
 Earlier captures remain failures: one tried CAT on the invalidated old USB
 handle, and another exhausted a shorter passive observation window before

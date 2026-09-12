@@ -21,11 +21,11 @@ use crate::{AppResult, CommandError, output};
 /// Compare complete configuration captures without selecting or opening a radio.
 #[derive(Debug, Args)]
 pub(super) struct CompareRequest {
-    /// Successful format-3 report to treat as the earlier configuration.
+    /// Complete successful configuration backup to treat as the earlier state.
     #[arg(long, value_name = "REPORT")]
     before: PathBuf,
 
-    /// Successful format-3 report to treat as the later configuration.
+    /// Complete successful configuration backup to treat as the later state.
     #[arg(long, value_name = "REPORT")]
     after: PathBuf,
 

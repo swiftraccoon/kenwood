@@ -47,7 +47,7 @@ fn replace_json(path: &Path, pointer: &str, value: serde_json::Value) -> TestRes
 fn identity_component(path: &Path, component: &str, value: &str) -> TestResult {
     for base in [
         "/backup/identity",
-        "/post_exit_verification/attempt/identity",
+        "/post_exit_verification/attempts/0/connection/identity",
     ] {
         replace_json(
             path,

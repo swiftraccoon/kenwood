@@ -1,4 +1,8 @@
-//! One explicitly requested, read-only CAT qualification on a fresh handle.
+//! Read-only CAT qualification with explicitly scoped fresh-handle policies.
+
+mod readiness;
+
+pub(super) use readiness::{ReadinessVerification, verify_readiness};
 
 use std::fs::File;
 use std::future::Future;
@@ -13,7 +17,7 @@ use serde::{Serialize, Serializer};
 
 use super::capture::{CaptureTransport, Recorder, TranscriptSummary};
 use super::reconnect_policy::{ReconnectDecision, classify};
-use super::{Failure, IdentityEvidence, close_transport};
+use super::{CLOSE_TIMEOUT, Failure, IdentityEvidence, close_transport};
 
 const SETTLE: Duration = Duration::from_secs(2);
 // The earlier ten-second observation never saw the endpoint return.
@@ -124,10 +128,12 @@ pub(super) enum VerificationStage {
     Close,
     /// Required transcript recording or durable synchronization failed.
     Capture,
+    /// The bounded identity-readiness dispatch window or attempt cap expired.
+    Readiness,
 }
 
 /// Outcome independent of the original MCP report.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub(super) enum VerificationOutcome {
     /// Requested fresh CAT observations matched, and the connection closed.
@@ -170,6 +176,7 @@ impl std::fmt::Display for VerificationOutcome {
                     VerificationStage::GatewayMismatch => "Gateway Off comparison",
                     VerificationStage::Close => "fresh connection close",
                     VerificationStage::Capture => "required transcript capture",
+                    VerificationStage::Readiness => "bounded CAT readiness",
                 };
                 write!(formatter, "{stage} failed: {error}")
             }
@@ -364,30 +371,6 @@ async fn wait_recorded(
     recorder.record(LifecycleEvent::WaitCompleted);
 }
 
-/// Settle, enumerate passively, then make at most one complete CAT attempt.
-pub(super) async fn verify(
-    backend: &mut impl Backend,
-    endpoint: &SerialCandidate,
-    baud: u32,
-    original_identity: &Identity,
-    recorder: Recorder<File>,
-    cancelled: &AtomicBool,
-) -> PostExitVerification {
-    verify_with(
-        backend,
-        endpoint,
-        recorder,
-        VerificationContext {
-            baud,
-            original_identity,
-            cancelled,
-            policy: VerificationPolicy::Observational,
-            goal: VerificationGoal::IdentityOnly,
-        },
-    )
-    .await
-}
-
 /// Verify one fresh CAT connection with fail-closed, synchronized evidence.
 ///
 /// The capture recorder's failure flag need not be the caller's cancellation
@@ -410,8 +393,8 @@ pub(super) async fn verify_required(
             baud,
             original_identity,
             cancelled,
-            policy: VerificationPolicy::Required,
             goal: VerificationGoal::IdentityOnly,
+            dispatch_deadline: None,
         },
     )
     .await
@@ -441,14 +424,14 @@ pub(super) async fn verify_required_gateway_off(
             baud,
             original_identity,
             cancelled,
-            policy: VerificationPolicy::Required,
             goal: VerificationGoal::GatewayOff,
+            dispatch_deadline: None,
         },
     )
     .await
 }
 
-/// Fixed read scope, independent of observational versus required recording.
+/// Fixed read scope; every query requires complete recording.
 #[derive(Clone, Copy)]
 enum VerificationGoal {
     /// Preserve the original three-query reconnect workflow.
@@ -457,45 +440,25 @@ enum VerificationGoal {
     GatewayOff,
 }
 
-#[derive(Clone, Copy)]
-enum VerificationPolicy {
-    Observational,
-    Required,
-}
-
-impl VerificationPolicy {
-    fn capture_ready(self, recorder: &Recorder<File>, report: &mut PostExitVerification) -> bool {
-        if matches!(self, Self::Required)
-            && let Err(error) = recorder.ensure_complete()
-        {
-            if !matches!(report.outcome, VerificationOutcome::Failed { .. }) {
-                report.fail(VerificationStage::Capture, &error);
-            }
-            return false;
-        }
-        true
-    }
-
-    const fn transport<T>(
-        self,
-        connection: T,
-        recorder: Recorder<File>,
-    ) -> CaptureTransport<T, File> {
-        match self {
-            Self::Observational => CaptureTransport::new(connection, recorder),
-            Self::Required => CaptureTransport::required(connection, recorder),
-        }
-    }
-
-    fn finalize(self, recorder: &mut Recorder<File>, report: &mut PostExitVerification) {
-        if matches!(self, Self::Required)
-            && let Err(error) = recorder.synchronize()
-            && !matches!(report.outcome, VerificationOutcome::Failed { .. })
-        {
+/// Stop new operations on capture failure without replacing an earlier failure.
+fn capture_ready(recorder: &Recorder<File>, report: &mut PostExitVerification) -> bool {
+    if let Err(error) = recorder.ensure_complete() {
+        if !matches!(report.outcome, VerificationOutcome::Failed { .. }) {
             report.fail(VerificationStage::Capture, &error);
         }
-        report.transcript = recorder.summary();
+        return false;
     }
+    true
+}
+
+/// Synchronize final evidence while preserving the first verification failure.
+fn finalize_capture(recorder: &mut Recorder<File>, report: &mut PostExitVerification) {
+    if let Err(error) = recorder.synchronize()
+        && !matches!(report.outcome, VerificationOutcome::Failed { .. })
+    {
+        report.fail(VerificationStage::Capture, &error);
+    }
+    report.transcript = recorder.summary();
 }
 
 #[derive(Clone, Copy)]
@@ -503,8 +466,16 @@ struct VerificationContext<'a> {
     baud: u32,
     original_identity: &'a Identity,
     cancelled: &'a AtomicBool,
-    policy: VerificationPolicy,
     goal: VerificationGoal,
+    /// Only bounded read-only reacquisition has a shared dispatch deadline.
+    dispatch_deadline: Option<Duration>,
+}
+
+/// One passive polling clock, shared across attempts when reacquiring CAT.
+#[derive(Clone, Copy)]
+struct EnumerationWindow {
+    started: Duration,
+    budget: Duration,
 }
 
 async fn verify_with(
@@ -517,24 +488,28 @@ async fn verify_with(
     if matches!(context.goal, VerificationGoal::GatewayOff) {
         report.required_gateway_mode = Some(GatewayEvidence(DvGatewayMode::Off));
     }
-    if context.policy.capture_ready(&recorder, &mut report)
-        && !context.cancelled.load(Ordering::Relaxed)
-    {
+    if capture_ready(&recorder, &mut report) && !context.cancelled.load(Ordering::Relaxed) {
         wait_recorded(backend, &mut recorder, SETTLE).await;
+        let window = EnumerationWindow {
+            started: backend.now(),
+            budget: ENUMERATION_BUDGET,
+        };
         if let Some(selected) = await_endpoint(
             backend,
             endpoint,
             &mut recorder,
             &mut report,
             context.cancelled,
-            context.policy,
+            window,
         )
         .await
         {
-            recorder = attempt_identity(backend, &selected, context, recorder, &mut report).await;
+            recorder = attempt_identity(backend, &selected, context, recorder, &mut report)
+                .await
+                .recorder;
         }
     }
-    context.policy.finalize(&mut recorder, &mut report);
+    finalize_capture(&mut recorder, &mut report);
     report
 }
 
@@ -544,18 +519,18 @@ async fn await_endpoint(
     recorder: &mut Recorder<File>,
     report: &mut PostExitVerification,
     cancelled: &AtomicBool,
-    policy: VerificationPolicy,
+    window: EnumerationWindow,
 ) -> Option<SerialCandidate> {
-    let started = backend.now();
+    let EnumerationWindow { started, budget } = window;
     loop {
-        if !policy.capture_ready(recorder, report) {
+        if !capture_ready(recorder, report) {
             return None;
         }
         if cancelled.load(Ordering::Relaxed) {
             report.outcome = VerificationOutcome::Cancelled;
             return None;
         }
-        if backend.now().saturating_sub(started) >= ENUMERATION_BUDGET {
+        if backend.now().saturating_sub(started) >= budget {
             report.fail(
                 VerificationStage::Enumeration,
                 &std::io::Error::new(
@@ -566,7 +541,7 @@ async fn await_endpoint(
             return None;
         }
         recorder.record(LifecycleEvent::EnumerationRequested);
-        if !policy.capture_ready(recorder, report) {
+        if !capture_ready(recorder, report) {
             return None;
         }
         if cancelled.load(Ordering::Relaxed) {
@@ -590,19 +565,16 @@ async fn await_endpoint(
             elapsed_milliseconds: milliseconds(backend.now().saturating_sub(started)),
             candidates: observed,
         });
-        if !policy.capture_ready(recorder, report) {
+        if !capture_ready(recorder, report) {
             return None;
         }
-        if cancelled.load(Ordering::Relaxed)
-            || backend.now().saturating_sub(started) >= ENUMERATION_BUDGET
-        {
+        if cancelled.load(Ordering::Relaxed) || backend.now().saturating_sub(started) >= budget {
             continue;
         }
         match classify(original, &candidates) {
             ReconnectDecision::Ready(selected) => return Some(selected),
             ReconnectDecision::AwaitingEndpoint => {
-                let remaining =
-                    ENUMERATION_BUDGET.saturating_sub(backend.now().saturating_sub(started));
+                let remaining = budget.saturating_sub(backend.now().saturating_sub(started));
                 wait_recorded(backend, recorder, POLL_INTERVAL.min(remaining)).await;
             }
             ReconnectDecision::Rejected(error) => {
@@ -616,36 +588,48 @@ async fn await_endpoint(
     }
 }
 
+/// Retry admission is decided from typed failure and actual handle activity.
+struct IdentityAttempt {
+    recorder: Recorder<File>,
+    silent_identity_timeout: bool,
+}
+
+impl IdentityAttempt {
+    const fn terminal(recorder: Recorder<File>) -> Self {
+        Self {
+            recorder,
+            silent_identity_timeout: false,
+        }
+    }
+}
+
 async fn attempt_identity(
     backend: &mut impl Backend,
     endpoint: &SerialCandidate,
     context: VerificationContext<'_>,
     mut recorder: Recorder<File>,
     report: &mut PostExitVerification,
-) -> Recorder<File> {
+) -> IdentityAttempt {
     let VerificationContext {
-        baud,
-        cancelled,
-        policy,
-        ..
+        baud, cancelled, ..
     } = context;
-    if !policy.capture_ready(&recorder, report) {
-        return recorder;
+    if !capture_ready(&recorder, report) {
+        return IdentityAttempt::terminal(recorder);
     }
     if cancelled.load(Ordering::Relaxed) {
         report.outcome = VerificationOutcome::Cancelled;
-        return recorder;
+        return IdentityAttempt::terminal(recorder);
     }
     recorder.record(LifecycleEvent::OpenRequested {
         path: &endpoint.path,
         baud,
     });
-    if !policy.capture_ready(&recorder, report) {
-        return recorder;
+    if !capture_ready(&recorder, report) {
+        return IdentityAttempt::terminal(recorder);
     }
     if cancelled.load(Ordering::Relaxed) {
         report.outcome = VerificationOutcome::Cancelled;
-        return recorder;
+        return IdentityAttempt::terminal(recorder);
     }
     let connection = match backend.open(endpoint, baud) {
         Ok(connection) => connection,
@@ -662,14 +646,18 @@ async fn attempt_identity(
                 close: None,
             });
             report.fail(VerificationStage::Open, &error);
-            return recorder;
+            return IdentityAttempt::terminal(recorder);
         }
     };
     recorder.record(LifecycleEvent::OpenCompleted);
-    let mut radio = Radio::new(policy.transport(connection, recorder));
-    let identity = observe_identity(&mut radio, context, report).await;
+    let mut radio = Radio::new(CaptureTransport::required(connection, recorder));
+    let observation = observe_identity(&mut radio, context, report, backend.now()).await;
     let gateway_mode = observe_gateway_off(&mut radio, context, report).await;
     let mut transport = radio.into_transport();
+    // identify() begins with ID. No later command can qualify: its dispatch
+    // raises the write count, even if that later write times out.
+    let silent_identity_timeout = matches!(observation, IdentityObservation::TimedOut)
+        && transport.activity().silent_first_exchange();
     let close_error = close_transport(&mut transport).await;
     let close = close_error
         .as_ref()
@@ -678,6 +666,7 @@ async fn attempt_identity(
                 error: error.clone(),
             }
         });
+    let closed = close_error.is_none();
     if let Some(error) = close_error {
         if matches!(
             report.outcome,
@@ -696,11 +685,28 @@ async fn attempt_identity(
     report.attempt = Some(ConnectionAttempt {
         endpoint: endpoint.into(),
         open: OperationOutcome::Succeeded,
-        identity: identity.map(ObservedIdentity),
+        identity: match observation {
+            IdentityObservation::Complete(identity) => Some(ObservedIdentity(identity)),
+            IdentityObservation::TimedOut | IdentityObservation::Failed => None,
+        },
         gateway_mode,
         close: Some(close),
     });
-    transport.into_recorder()
+    let recorder = transport.into_recorder();
+    IdentityAttempt {
+        silent_identity_timeout: silent_identity_timeout && closed && recorder.summary().complete,
+        recorder,
+    }
+}
+
+/// Typed query result; timeout alone does not establish retry eligibility.
+enum IdentityObservation {
+    /// The complete tuple, whether or not it matches the original identity.
+    Complete(Identity),
+    /// A typed query timeout, still requiring dispatch and input evidence.
+    TimedOut,
+    /// Cancellation, transport, parsing, or another terminal query failure.
+    Failed,
 }
 
 /// Finish one complete identity tuple, retaining mismatches as actual evidence.
@@ -708,10 +714,18 @@ async fn observe_identity(
     radio: &mut Radio<impl Transport>,
     context: VerificationContext<'_>,
     report: &mut PostExitVerification,
-) -> Option<Identity> {
+    now: Duration,
+) -> IdentityObservation {
+    if let Some(deadline) = context.dispatch_deadline {
+        if !readiness::can_dispatch(now, deadline) {
+            readiness::budget_exhausted(report);
+            return IdentityObservation::Failed;
+        }
+        radio.set_timeout(readiness::EXCHANGE_TIMEOUT);
+    }
     if context.cancelled.load(Ordering::Relaxed) {
         report.outcome = VerificationOutcome::Cancelled;
-        return None;
+        return IdentityObservation::Failed;
     }
     match radio.identify().await {
         Ok(identity) => {
@@ -723,11 +737,15 @@ async fn observe_identity(
                     &std::io::Error::other("fresh CAT identity tuple differs from the original"),
                 );
             }
-            Some(identity)
+            IdentityObservation::Complete(identity)
         }
         Err(error) => {
             report.fail(VerificationStage::Identity, &error);
-            None
+            if matches!(error, kenwood_tmd750::Error::Timeout { .. }) {
+                IdentityObservation::TimedOut
+            } else {
+                IdentityObservation::Failed
+            }
         }
     }
 }
@@ -767,6 +785,10 @@ async fn observe_gateway_off(
 #[cfg(test)]
 #[path = "reconnect/gateway_tests.rs"]
 mod gateway_tests;
+
+#[cfg(test)]
+#[path = "reconnect/readiness_tests.rs"]
+mod readiness_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1023,7 +1045,7 @@ mod tests {
             VerificationStage::IdentityMismatch,
             &io::Error::other("original identity mismatch"),
         );
-        VerificationPolicy::Required.finalize(&mut recorder, &mut report);
+        finalize_capture(&mut recorder, &mut report);
         assert!(matches!(
             report.outcome,
             VerificationOutcome::Failed {

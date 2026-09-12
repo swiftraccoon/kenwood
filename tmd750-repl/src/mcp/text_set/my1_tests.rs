@@ -398,7 +398,7 @@ fn incomplete_failed_and_update_reports_cannot_be_used_as_backups() -> TestResul
             Value::from("mismatched"),
         ),
         (
-            "/post_exit_verification/attempt/close/status",
+            "/post_exit_verification/attempts/0/connection/close/status",
             Value::from("failed"),
         ),
         (
@@ -468,7 +468,7 @@ fn every_identity_component_and_stored_scope_guard_is_required() -> TestResult {
         let mut document = fixture()?;
         for parent in [
             "/backup/identity",
-            "/post_exit_verification/attempt/identity",
+            "/post_exit_verification/attempts/0/connection/identity",
         ] {
             *document
                 .pointer_mut(&format!("{parent}/{field}"))

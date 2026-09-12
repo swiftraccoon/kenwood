@@ -15,7 +15,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use super::capture::{Artifacts, CaptureTransport, Recorder, TranscriptSummary};
-use super::reconnect::{self, Backend, PostExitVerification, SkipReason, SystemBackend};
+use super::reconnect::{self, Backend, ReadinessVerification, SkipReason, SystemBackend};
 use super::{
     Endpoint, Failure, IdentityEvidence, SegmentEvidence, close_transport, finish_on_interrupt,
 };
@@ -98,8 +98,9 @@ impl From<&McpBackupReport> for Evidence {
     }
 }
 
+/// Serialized evidence from a complete or interrupted standard-region backup.
 #[derive(Debug, Serialize)]
-struct ArtifactReport {
+pub(super) struct ArtifactReport {
     format_version: u8,
     operation: &'static str,
     software_version: &'static str,
@@ -112,7 +113,40 @@ struct ArtifactReport {
     open_error: Option<Failure>,
     close_error: Option<Failure>,
     signal_error: Option<Failure>,
-    post_exit_verification: PostExitVerification,
+    post_exit_verification: ReadinessVerification,
+}
+
+impl ArtifactReport {
+    /// Preserve original read evidence and the complete fresh-CAT result.
+    pub(super) fn new(
+        endpoint: &SerialCandidate,
+        baud: u32,
+        started_at_utc: String,
+        finished_at_utc: String,
+        result: WorkflowResult,
+        signal_error: Option<Failure>,
+    ) -> Self {
+        Self {
+            format_version: 4,
+            operation: "configuration_backup",
+            software_version: env!("CARGO_PKG_VERSION"),
+            started_at_utc,
+            finished_at_utc,
+            endpoint: Endpoint {
+                path: endpoint.path.clone(),
+                usb_vendor_id: endpoint.vid,
+                usb_product_id: endpoint.pid,
+                cat_baud: baud,
+            },
+            scope: "standard_configuration_without_startup_screen; unread gaps are absent, not zero-filled",
+            transcript: result.transcript,
+            backup: result.backup.as_ref().map(Evidence::from),
+            open_error: result.open_error,
+            close_error: result.close_error,
+            signal_error,
+            post_exit_verification: result.post_exit,
+        }
+    }
 }
 
 /// Capture every acknowledged page even when cleanup or later reads fail.
@@ -155,26 +189,14 @@ pub(super) async fn run(
     .await;
     let succeeded = result.succeeded() && signal_error.is_none();
     print_result(&result);
-    let report = ArtifactReport {
-        format_version: 3,
-        operation: "configuration_backup",
-        software_version: env!("CARGO_PKG_VERSION"),
+    let report = ArtifactReport::new(
+        endpoint,
+        baud,
         started_at_utc,
-        finished_at_utc: OffsetDateTime::now_utc().format(&Rfc3339)?,
-        endpoint: Endpoint {
-            path: endpoint.path.clone(),
-            usb_vendor_id: endpoint.vid,
-            usb_product_id: endpoint.pid,
-            cat_baud: baud,
-        },
-        scope: "standard_configuration_without_startup_screen; unread gaps are absent, not zero-filled",
-        transcript: result.transcript,
-        backup: result.backup.as_ref().map(Evidence::from),
-        open_error: result.open_error,
-        close_error: result.close_error,
+        OffsetDateTime::now_utc().format(&Rfc3339)?,
+        result,
         signal_error,
-        post_exit_verification: result.post_exit,
-    };
+    );
     super::write_report(&mut report_file, &report)?;
     report_file.sync_all()?;
     output::line(format_args!(
@@ -200,7 +222,7 @@ pub(super) struct WorkflowResult {
     pub(super) transcript: TranscriptSummary,
     pub(super) open_error: Option<Failure>,
     pub(super) close_error: Option<Failure>,
-    pub(super) post_exit: PostExitVerification,
+    pub(super) post_exit: ReadinessVerification,
 }
 
 impl WorkflowResult {
@@ -229,7 +251,7 @@ pub(super) async fn run_workflow(
         transcript: original.summary(),
         open_error: None,
         close_error: None,
-        post_exit: PostExitVerification::skipped(SkipReason::Cancelled, post_exit.summary()),
+        post_exit: ReadinessVerification::skipped(SkipReason::Cancelled, post_exit.summary()),
     };
     if cancelled.load(Ordering::Relaxed) {
         return result;
@@ -239,7 +261,7 @@ pub(super) async fn run_workflow(
         Err(error) => {
             result.open_error = Some(Failure::from_error(&error));
             result.post_exit =
-                PostExitVerification::skipped(SkipReason::OriginalOpenFailed, post_exit.summary());
+                ReadinessVerification::skipped(SkipReason::OriginalOpenFailed, post_exit.summary());
             return result;
         }
     };
@@ -268,9 +290,10 @@ pub(super) async fn run_workflow(
         cancelled,
     ) {
         Ok(identity) => {
-            reconnect::verify(backend, endpoint, baud, identity, post_exit, cancelled).await
+            reconnect::verify_readiness(backend, endpoint, baud, identity, post_exit, cancelled)
+                .await
         }
-        Err(reason) => PostExitVerification::skipped(reason, post_exit.summary()),
+        Err(reason) => ReadinessVerification::skipped(reason, post_exit.summary()),
     };
     result.backup = Some(backup);
     result

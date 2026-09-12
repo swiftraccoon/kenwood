@@ -278,7 +278,7 @@ fn my1_preflight_requires_exact_firmware_and_complete_type_tuple() -> TestResult
         let mut document = fixture()?;
         for base in [
             "/backup/identity",
-            "/post_exit_verification/attempt/identity",
+            "/post_exit_verification/attempts/0/connection/identity",
         ] {
             *document
                 .pointer_mut(&format!("{base}/{component}"))
@@ -298,7 +298,7 @@ fn my1_preflight_rejects_partial_or_unsuccessful_backup_lifecycles() -> TestResu
     for (pointer, value) in [
         ("/backup/segments", serde_json::json!([])),
         ("/backup/complete_configuration", Value::Bool(false)),
-        ("/format_version", Value::from(4)),
+        ("/format_version", Value::from(5)),
         (
             "/post_exit_verification/outcome/status",
             Value::from("failed"),

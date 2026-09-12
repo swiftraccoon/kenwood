@@ -49,8 +49,9 @@ owns TM-D750 protocol admission, the selected connection, and final serial
 close; the shared runtime owns MMDVM D-STAR processing. This separation does
 not qualify additional TM-D750 protocols or lifecycle operations.
 
-The main-unit CAT connection has been hardware-validated. Recognizing the
-control-panel USB identity does not establish equivalent live protocol support.
+Read-only CAT status has been hardware-validated on both main-unit and
+control-panel USB with firmware 1.02. USB identity alone remains a candidate
+filter, not protocol qualification or proof that a radio is currently ready.
 The transport does not automatically reopen after a USB disconnect: serial
 pathnames can be reassigned. Reconnect the intended radio and select its current
 endpoint for a new session.
@@ -71,22 +72,41 @@ including all six Programmable-Memory slots. It excludes the custom startup
 bitmap and unclassified regions. It sends no settings writes or RF requests.
 Programming temporarily interrupts normal radio operation.
 
-This complete read/exit/reconnect sequence was bench-validated on main-unit USB
-with firmware 1.02 on September 7, 2026. Every captured page matched its raw
-wire response, both connections closed cleanly, and fresh CAT identity matched.
-This observation qualifies the read workflow on that unit, not settings writes.
+The earlier single-attempt read/exit/reconnect sequence was bench-validated on
+main-unit USB with firmware 1.02 on September 7, 2026. Every captured page matched
+its raw wire response, both connections closed cleanly, and fresh CAT identity
+matched. The current backup's bounded CAT reacquisition is software-tested but
+not yet hardware-qualified; the fixed probe's panel-USB recovery result below
+does not qualify full backups or settings writes.
 
-The command closes and drops the original handle after the exit ACK, then uses
-the same bounded, single-attempt fresh CAT verification described below. An
+The command closes and drops the original handle after the exit ACK, waits two
+seconds, then uses [bounded CAT reacquisition](#bounded-cat-reacquisition).
+One sixty-second dispatch window covers passive enumeration, up to four fresh
+connections, and two-second retry waits. Every open requires the original path
+and unchanged recognized VID/PID. Only a completely silent initial `ID` reply
+timeout permits another connection; partial replies, identity mismatches, and
+open, write, close, or capture failures stop recovery. This retries only
+post-exit identity checks, never MCP entry, configuration reads, or exit. An
 explicit `--port` is mandatory. Cancellation finishes the current exchange;
 incomplete framing prohibits speculative exit or recovery commands.
 
-`report.json` uses format version 3 with `operation = "configuration_backup"`.
+`report.json` uses format version 4 with `operation = "configuration_backup"`.
 Its `backup.segments` retain every fully acknowledged page even if a later page,
 cleanup, or fresh verification fails. Addresses and lengths are explicit; unread
-gaps are absent. Original and fresh transcripts remain separate. A successful
-exit requires the entire page schedule, both clean closes and captures, matching
-fresh identity, and a written, flushed, synchronized report.
+gaps are absent. Original and fresh transcripts remain separate.
+`post_exit_verification` records policy limits, elapsed readiness time, every
+entry in `attempts`, the aggregate transcript result, and the final outcome.
+Earlier silent timeouts remain recorded when a later identity check succeeds.
+A successful exit requires the entire page schedule, acknowledged MCP exit,
+clean closes and complete captures for every connection, matching fresh identity,
+and a written, flushed, synchronized report.
+
+Offline inspection and update planning accept complete successful format-4
+backups and historical format-3 backups with their original single-attempt
+evidence. The loader checks the evidence shape for the declared format; it does
+not upgrade reports, reinterpret failed captures as successful, or establish
+the radio's current state. Reports must be regular files no larger than 32 MiB
+and contain every standard page in order with exact addresses and lengths.
 
 This is a standard-region backup, not a full memory dump or a restorable `.d750`
 file. The official application seeds omitted bytes from its current model;
@@ -235,9 +255,10 @@ cancel before write intent; afterward the command finishes the remaining safe
 verification steps. A real failure stops the workflow. Uncertain framing does
 not permit speculative exit, retries, or automatic rollback. Retain the journal
 if a write may have occurred; do not blindly restore an old page. If programming
-exit is unconfirmed, fully power-cycle before reconnecting. A power cycle does
-not establish which name is stored. This workflow requires Unix private-file and
-directory synchronization support.
+exit is unconfirmed, fully power-cycle before reconnecting. This instruction
+concerns an uncertain MCP state, not silence after an acknowledged exit. A power
+cycle does not establish which name is stored. This workflow requires Unix
+private-file and directory synchronization support.
 
 The output directory must be new. It contains a format-5 `report.json` with
 `operation = "pm1_name_update"`, `update-journal.jsonl`, and separate transcripts
@@ -509,7 +530,8 @@ captured configuration before a separately controlled setup or qualification.
 
 ## Compare configuration captures
 
-Compare two successful format-3 configuration-backup reports:
+Compare two successful configuration-backup reports, current format 4 or
+historical format 3:
 
 ```bash
 cargo run -p tmd750-repl -- mcp terminal compare \
@@ -617,7 +639,7 @@ reclassify that failed trial, or qualify automatic Terminal exit/restoration.
 The startup-only `mcp probe` command captures a small, fixed protocol check. It
 reads CAT identity, enters MCP programming mode, reads 40 bytes at address 8
 and 255 bytes at address 327681, then requires MCP exit, releases the original
-handle, and verifies unchanged CAT identity on one fresh connection. It sends
+handle, and uses bounded, identity-only CAT reacquisition. It sends
 no settings writes, fill commands, arbitrary memory requests,
 or RF transmission requests. This is not a backup and does not qualify the
 firmware 1.02 settings layout or enable automatic Terminal Mode entry.
@@ -652,7 +674,7 @@ inside the CAT prompt; quit that prompt and start a dedicated process.
 
 Each capture contains:
 
-- `report.json`: format version 2, software version, UTC start and finish,
+- `report.json`: format version 3, software version, UTC start and finish,
   selected USB path and VID/PID, CAT baud, original-session identity,
   accepted entry reply, acknowledged fragments, exit disposition, outcome,
   separate fresh-connection verification, and connection, signal, capture,
@@ -664,8 +686,8 @@ Each capture contains:
   prove how many bytes reached the radio. Read events contain only returned
   bytes, including empty arrays for zero-length reads. Each event is flushed
   independently of optional trace logging.
-- `post-exit-transcript.jsonl`: passive endpoint observations and the one
-  fresh open, identity exchange, and close, with its own capture summary.
+- `post-exit-transcript.jsonl`: passive endpoint observations and every fresh
+  open, identity attempt, and close, with one aggregate capture summary.
 
 Report fragments have explicit addresses and lengths; gaps are not fabricated
 into a full memory image. Uniform-fill responses are expanded in the report,
@@ -674,63 +696,94 @@ the message and underlying cause chain. A successful protocol check is
 `probe.outcome.status = "awaiting_cat_verification"`; exit and transcript
 completeness are reported separately. Overall success additionally requires
 `post_exit_verification.outcome.status = "matched"` and clean closes/captures.
-The process exits nonzero on cancellation or any protocol, identity,
-capture, signal, or connection-close failure.
+The process exits nonzero on cancellation, a final failed readiness outcome,
+or any original protocol, capture, signal, or connection-close failure. An
+eligible silent identity timeout can precede a successful fresh attempt; the
+report retains that earlier failure rather than rewriting it as successful.
 
 Ctrl-C requests cancellation after the current complete exchange. If the
 connection remains synchronized, MCP exit and the original close still finish.
 Cancellation before fresh verification skips the new connection; cancellation
-during its identity exchange lets the tuple and close finish without retry.
-A transcript write failure requests the same
-boundary-safe stop without interrupting cleanup. After an incomplete protocol
+during an identity attempt lets that bounded attempt and close finish without
+retry. A transcript write failure requests the same boundary-safe stop without
+interrupting cleanup. After an incomplete protocol
 exchange, the tool sends no speculative recovery bytes; follow the printed
-instruction to fully power-cycle the radio before reconnecting. Do not kill
-the process to shorten this wait.
+instruction to fully power-cycle the radio before reconnecting when MCP exit
+is unconfirmed. An acknowledged exit followed by CAT silence is a different
+condition and does not itself establish that a power cycle is needed. Do not
+kill the process to shorten a pending exchange or close.
 
 An abrupt process termination can leave `report.json` empty, and a filesystem
 failure can leave a partial final transcript line. These files are evidence,
 not a guarantee of recovery. Captures may contain private radio settings;
 review them before sharing. Nothing uploads or deletes them automatically.
 
-### Fresh-connection verification
+### Bounded CAT reacquisition
 
-Every probe stops original-handle protocol traffic at the MCP exit ACK;
-neither CAT nor a baud change follows that ACK. It closes and drops that
-handle before considering a fresh connection. An incomplete fragment, missing
-exit ACK, original close or capture failure, or cancellation prevents the
-additional open. The explicit `--port` is required before `mcp`; the tool
-never substitutes an automatically selected port.
+Both `mcp probe` and `mcp backup` stop original-handle protocol traffic at the
+MCP exit ACK; neither CAT nor a baud change follows that ACK. Each workflow
+closes and drops that handle before considering a fresh connection. An
+incomplete read, missing exit ACK, original close or capture failure, or
+cancellation prevents the additional open. The explicit `--port` is required
+before `mcp`; the tool never substitutes an automatically selected port.
 
-The host waits two seconds to settle, then allows up to sixty seconds of passive
-USB enumeration, polling at 250 ms intervals while the selected endpoint is
-absent. These are bounded host policies, not measured firmware timing
-requirements. The exact original path must return with unchanged recognized
-VID/PID. Conflicting metadata, multiple same-role endpoints, or a different
-path stop verification; even a macOS callout/dial-in alias is not substituted
-for the selected path. No unrelated port receives CAT traffic.
+After the two-second settle wait, one sixty-second readiness dispatch window
+covers passive USB enumeration, identity attempts, closes, and waits between
+retries. Enumeration polls at 250 ms intervals while the selected endpoint is
+absent. Before every fresh open, the exact original path must be enumerated
+with unchanged recognized VID/PID. Conflicting metadata, multiple same-role
+endpoints, or a different path stop verification; even a macOS callout/dial-in
+alias is not substituted for the selected path. No unrelated port receives
+CAT traffic.
 
-At most one fresh connection is opened. It sends only `ID`, `FV`, and `TY`,
-compares the complete identity tuple with the original, and closes. Open or
-identity errors and identity mismatches are never retried. Connection closes
-have a two-second bound; the passive enumeration budget does not cancel an
-in-flight CAT exchange. Ctrl-C finishes the current exchange or identity
-attempt and connection close, then skips subsequent work.
+At most four fresh connections can be opened. Each sends only `ID`, `FV`, and
+`TY`, compares the complete identity tuple with the original, and closes. Each
+query has separate 1,500 ms write and reply deadlines; close has a two-second
+bound. Eleven seconds for a complete identity attempt and close must remain
+both before opening and after the open returns. Insufficient remaining time
+stops new identity traffic without abandoning cleanup. Synchronous OS open or
+enumeration calls and host scheduling can exceed these limits, so the policy
+does not promise a hard wall-clock completion deadline.
 
-Original-probe fields remain separate: a successful read-and-exit phase has
-`probe.outcome.status = "awaiting_cat_verification"` and no original-handle
-`cat_identity`. The required `post_exit_verification` object records passive
-enumeration snapshots, the single open/identity/close attempt, its outcome,
-and its independent transcript summary. `post-exit-transcript.jsonl` is
-reserved before the initial radio open and records timestamped waits,
+A retry is admitted only when the first `ID` query times out after its write
+completed, no input bytes arrived, the handle closed and dropped successfully,
+and the complete transcript was synchronized. The tool waits two seconds,
+checks cancellation and the shared remaining budget, then re-enumerates before
+another open. Any partial reply, later `FV` or `TY` failure, write timeout,
+other transport read error, open failure, identity mismatch, close failure, or
+capture failure stops without retry. Ctrl-C finishes the current bounded
+identity attempt and close, then prevents another connection.
+
+Reacquisition sends no MCP entry or exit, reset, setting, Gateway, packet-exit,
+or baud-change commands. These limits are conservative host policy, not
+measured firmware timing requirements or a guarantee of recovery. One panel-USB
+firmware-1.02 run exercised two silent-ID retries before successful identity
+verification, as recorded below. Backup use of this policy is software-tested,
+not yet hardware-qualified. Guarded writes and the separate qualification
+experiments retain their single-attempt fresh-verification policies and report
+shapes. Ordinary CAT and gateway sessions do not acquire automatic reconnect
+behavior.
+
+Original-session fields remain separate: a successful read-and-exit phase has
+`probe.outcome.status` or `backup.outcome.status` equal to
+`"awaiting_cat_verification"`. The required `post_exit_verification` object
+records the policy limits, elapsed readiness time, an `attempts` array, one
+aggregate `transcript` summary, and the final `outcome`. Each array entry retains
+its `enumerations`, optional `connection` with open/identity/close evidence, `outcome`, and
+`retry_admission`. A later match does not erase an earlier timeout; exhausting
+the budget or attempt cap is a final readiness failure. The single
+`post-exit-transcript.jsonl` is reserved before the initial radio open and
+records timestamped waits,
 enumerations, open requests/results, and actual fresh-connection transport
 events. Snapshots include recognized radio endpoints and metadata needed to
 explain conflicts, not unrelated serial or Bluetooth inventory.
 
-Enumeration times in the report are measured from the start of passive
-polling, after the settle wait. When both absence and presence are observed,
-the timestamped transcripts bracket those observations relative to the exit
-ACK and record when the fresh CAT responses complete. These are host observations with
-polling and scheduling uncertainty, not exact firmware-ready timestamps.
+Enumeration times in the report share the readiness window's start, after the
+settle wait; they do not restart for each attempt. When both absence and
+presence are observed, the timestamped transcripts bracket those observations
+relative to the exit ACK and record when the fresh CAT responses complete.
+These are host observations with polling and scheduling uncertainty, not exact
+firmware-ready timestamps.
 
 Exit status is zero only when the original fragments, exit ACK, original
 close/capture, matching fresh CAT tuple, and fresh close/capture all succeed.
@@ -743,11 +796,11 @@ OS-only check. After the operator reported the normal frequency screen, a
 separate fresh identity command returned the same model, firmware, and type,
 then closed successfully. That observation is separate from the original
 failed probe. The exact return time remained unknown; that run's twelve-second
-host window was not a qualified recovery bound. The passive budget has since
-been extended from ten to sixty seconds, without adding active retries.
+host window was not a qualified recovery bound. A subsequent implementation
+extended passive polling from ten to sixty seconds without active retries.
 That failed capture is retained unchanged.
 
-Two subsequent main-unit USB runs on firmware 1.02 completed the same bounded
+Two subsequent main-unit USB runs on firmware 1.02 completed that single-attempt
 workflow: both fixed reads, exit ACK, original close, one fresh matching CAT
 tuple, and fresh close. USB was first detected at approximately 11.4 and
 11.7 seconds after the ACK; CAT identity completed at 11.8 and 12.0 seconds.
@@ -755,7 +808,28 @@ The 295 captured bytes matched earlier runs. Both successful samples detected
 the endpoint within the old window too, so the increased limit alone does
 not explain their success. These bench observations validate the fixed
 read/reconnect workflow on this unit, not a universal recovery deadline,
-full configuration backup, or settings-write compatibility.
+full configuration backup, settings-write compatibility, or the newer retry
+policy.
+
+A later firmware 1.02 panel-USB probe completed both fixed reads, acknowledged
+exit, and closed the original handle. The endpoint returned, but its sole fresh
+`ID` attempt received no bytes before timing out. A later, separate panel CAT
+status check succeeded without a host-sent reset or repeated MCP entry. The
+original probe remains failed. These observations motivate bounded readiness
+handling; they establish neither the exact readiness delay nor the new policy's
+live success.
+
+A subsequent, separately approved panel-USB run on September 12, 2026 completed
+the fixed reads and acknowledged exit, then exercised the bounded retry path.
+The first two fresh connections received no bytes after their ID writes and
+closed after the reply timeouts. Following each close, the runner waited two
+seconds and re-enumerated the exact endpoint. The third connection returned
+matching ID/FV/TY, completing identity 11.72 seconds after the exit ACK, then
+closed cleanly. All 295 bytes matched earlier captures; both transcripts were
+complete and the process exited successfully. A separate status check reported
+both bands FM and Gateway Off. No host reset, repeated MCP entry, settings
+write, or RF request was sent. This validates the observed recovery sequence on
+that unit, not a universal readiness deadline or other MCP workflows.
 
 `post_exit_verification.outcome.status = "matched"` never rewrites the original
 probe outcome. Matching the selected endpoint and CAT tuple is not proof of

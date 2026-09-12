@@ -143,7 +143,7 @@ fn close_capture_and_cancellation_failures_refuse_verification() -> TestResult {
 
 fn artifact() -> Result<ArtifactReport, Box<dyn StdError + Send + Sync>> {
     Ok(ArtifactReport {
-        format_version: 2,
+        format_version: 3,
         software_version: "test",
         started_at_utc: "2026-09-07T00:00:00Z".to_owned(),
         finished_at_utc: "2026-09-07T00:00:01Z".to_owned(),
@@ -158,7 +158,7 @@ fn artifact() -> Result<ArtifactReport, Box<dyn StdError + Send + Sync>> {
         open_error: None,
         signal_error: None,
         close_error: None,
-        post_exit_verification: PostExitVerification::skipped(
+        post_exit_verification: ReadinessVerification::skipped(
             SkipReason::OriginalProbeIncomplete,
             summary()?,
         ),
@@ -171,8 +171,8 @@ fn probe_artifact_always_records_the_required_fresh_verification() -> TestResult
     let json = serde_json::to_value(&report)?;
     assert_eq!(
         json.get("format_version"),
-        Some(&serde_json::json!(2)),
-        "probe reports use the fresh-verification format"
+        Some(&serde_json::json!(3)),
+        "probe reports retain every bounded readiness attempt"
     );
     assert_eq!(
         json.pointer("/post_exit_verification/outcome/status"),
@@ -189,7 +189,7 @@ fn probe_artifact_always_records_the_required_fresh_verification() -> TestResult
 #[test]
 fn fresh_match_does_not_erase_original_failure_or_capture_failure() -> TestResult {
     let mut report = artifact()?;
-    let mut verification = PostExitVerification::skipped(SkipReason::Cancelled, summary()?);
+    let mut verification = ReadinessVerification::skipped(SkipReason::Cancelled, summary()?);
     verification.outcome = VerificationOutcome::Matched;
     report.post_exit_verification = verification;
     assert!(report.succeeded());

@@ -282,6 +282,30 @@ pub(super) struct CaptureTransport<T, W> {
     inner: T,
     recorder: Recorder<W>,
     policy: CapturePolicy,
+    activity: TransportActivity,
+}
+
+/// Per-handle dispatch evidence, independent of parsing and capture success.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct TransportActivity {
+    writes_started: u64,
+    writes_completed: u64,
+    received_bytes: u64,
+}
+
+impl TransportActivity {
+    const EMPTY: Self = Self {
+        writes_started: 0,
+        writes_completed: 0,
+        received_bytes: 0,
+    };
+
+    /// Exactly one completed write and no input, not even a partial reply.
+    ///
+    /// The caller must separately prove the command and typed timeout result.
+    pub(super) const fn silent_first_exchange(self) -> bool {
+        self.writes_started == 1 && self.writes_completed == 1 && self.received_bytes == 0
+    }
 }
 
 impl<T, W> CaptureTransport<T, W> {
@@ -291,6 +315,7 @@ impl<T, W> CaptureTransport<T, W> {
             inner,
             recorder,
             policy: CapturePolicy::Observational,
+            activity: TransportActivity::EMPTY,
         }
     }
 
@@ -306,7 +331,13 @@ impl<T, W> CaptureTransport<T, W> {
             inner,
             recorder,
             policy: CapturePolicy::Required,
+            activity: TransportActivity::EMPTY,
         }
+    }
+
+    /// Inspect actual dispatch activity on this handle, never a prior handle.
+    pub(super) const fn activity(&self) -> TransportActivity {
+        self.activity
     }
 
     fn require_capture(&self, context: &str) -> io::Result<()> {
@@ -331,7 +362,11 @@ impl<T: Transport, W: Write + Send + Sync> Transport for CaptureTransport<T, W> 
         self.recorder.record(Event::WriteRequested { bytes: data });
         self.require_capture("before write dispatch; write was not attempted")
             .map_err(TransportError::Write)?;
+        self.activity.writes_started = self.activity.writes_started.saturating_add(1);
         let result = self.inner.write(data).await;
+        if result.is_ok() {
+            self.activity.writes_completed = self.activity.writes_completed.saturating_add(1);
+        }
         self.recorder.record(match &result {
             Ok(()) => Event::WriteCompleted,
             Err(error) => Event::WriteFailed {
@@ -349,6 +384,10 @@ impl<T: Transport, W: Write + Send + Sync> Transport for CaptureTransport<T, W> 
         let result = self.inner.read(buf).await;
         match &result {
             Ok(count) => {
+                self.activity.received_bytes = self
+                    .activity
+                    .received_bytes
+                    .saturating_add(u64::try_from(*count).unwrap_or(u64::MAX));
                 if let Some(bytes) = buf.get(..*count) {
                     self.recorder.record(Event::ReadCompleted { bytes });
                 } else {
@@ -895,6 +934,7 @@ mod tests {
                 inner: InvalidReadCountTransport,
                 recorder: Recorder::new(Vec::new(), Arc::new(AtomicBool::new(false))),
                 policy,
+                activity: TransportActivity::EMPTY,
             };
             let result = transport.read(&mut [0; 1]).await;
             match policy {
