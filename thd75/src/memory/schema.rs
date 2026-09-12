@@ -966,7 +966,9 @@ impl PatchPlanner {
     /// may be repeated only when both assignments request the same value;
     /// assigning a different value to already-claimed bits is a
     /// [`SchemaError::PatchConflict`].  A later assignment therefore never
-    /// silently replaces an earlier one.
+    /// silently replaces an earlier one. Every assignment is checked in full
+    /// before merging; an error leaves all previously planned bytes and bit
+    /// claims unchanged, and the planner remains usable.
     ///
     /// The descriptor's storage codec is always validated here. Finite enum
     /// and UI-choice domains live in the generated [`MenuField`] metadata; if
@@ -1002,8 +1004,21 @@ impl PatchPlanner {
             menu_field.validate_patch_value(value)?;
         }
         let encoded = encode_field(field, value, ValueDomain::Writable)?;
+        for &(absolute, mask, bits) in &encoded {
+            if let Some(claim) = self.bytes.get(&absolute) {
+                let overlap = claim.mask & mask;
+                if ((claim.value ^ bits) & overlap) != 0 {
+                    return Err(SchemaError::PatchConflict {
+                        field: field.name,
+                        existing: claim.owner,
+                        offset: absolute,
+                        mask: overlap,
+                    });
+                }
+            }
+        }
         for (absolute, mask, bits) in encoded {
-            self.merge_byte(field.name, absolute, mask, bits)?;
+            self.merge_byte(field.name, absolute, mask, bits);
         }
         Ok(self)
     }
@@ -1067,23 +1082,8 @@ impl PatchPlanner {
         })
     }
 
-    fn merge_byte(
-        &mut self,
-        owner: &'static str,
-        offset: usize,
-        mask: u8,
-        value: u8,
-    ) -> Result<(), SchemaError> {
+    fn merge_byte(&mut self, owner: &'static str, offset: usize, mask: u8, value: u8) {
         if let Some(claim) = self.bytes.get_mut(&offset) {
-            let overlap = claim.mask & mask;
-            if ((claim.value ^ value) & overlap) != 0 {
-                return Err(SchemaError::PatchConflict {
-                    field: owner,
-                    existing: claim.owner,
-                    offset,
-                    mask: overlap,
-                });
-            }
             claim.value = (claim.value & !mask) | (value & mask);
             claim.mask |= mask;
         } else {
@@ -1096,7 +1096,6 @@ impl PatchPlanner {
                 },
             );
         }
-        Ok(())
     }
 }
 
@@ -1744,6 +1743,43 @@ mod tests {
             ),
             "conflict must name both fields: {result:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_assignment_preserves_the_entire_existing_plan() -> TestResult {
+        let anchor =
+            FieldDescriptor::new("test.anchor", 0x1011, FieldCodec::Byte { min: 0, max: 255 });
+        let crossing = FieldDescriptor::new("test.crossing", 0x1010, FieldCodec::Bytes { len: 2 });
+        for prefix_claimed in [false, true] {
+            let mut planner = PatchPlanner::new();
+            let mut expected = PatchPlanner::new();
+            if prefix_claimed {
+                let _planner = planner.set(&ENABLE, FieldValue::Unsigned(0))?;
+                let _expected = expected.set(&ENABLE, FieldValue::Unsigned(0))?;
+            }
+            let _planner = planner.set(&anchor, FieldValue::Unsigned(1))?;
+            let _expected = expected.set(&anchor, FieldValue::Unsigned(1))?;
+
+            let result = planner.set(&crossing, FieldValue::Bytes(&[0x08, 0]));
+            assert!(
+                matches!(
+                    result,
+                    Err(SchemaError::PatchConflict {
+                        field: "test.crossing",
+                        existing: "test.anchor",
+                        offset: 0x1011,
+                        ..
+                    })
+                ),
+                "the later byte must reject the entire assignment: {result:?}"
+            );
+            assert_eq!(
+                planner.finish()?,
+                expected.finish()?,
+                "failed assignment must neither insert bytes nor expand existing bit claims"
+            );
+        }
         Ok(())
     }
 
