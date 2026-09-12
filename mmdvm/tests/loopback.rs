@@ -15,6 +15,9 @@ use tokio::time::timeout;
 
 // Acknowledge workspace dev-deps so `-D unused-crate-dependencies`
 // doesn't fire across each integration binary.
+#[cfg(feature = "dstar")]
+use dstar_gateway_core as _;
+use kenwood_transport as _;
 use thiserror as _;
 use tracing as _;
 

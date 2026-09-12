@@ -11,6 +11,7 @@ mod reflector_callsign;
 mod stream_id;
 mod suffix;
 mod type_error;
+mod ur_call_action;
 pub(crate) mod wire_text;
 
 pub use band_letter::BandLetter;
@@ -21,4 +22,5 @@ pub use reflector_callsign::ReflectorCallsign;
 pub use stream_id::StreamId;
 pub use suffix::Suffix;
 pub use type_error::TypeError;
+pub use ur_call_action::UrCallAction;
 pub use wire_text::WireTextError;

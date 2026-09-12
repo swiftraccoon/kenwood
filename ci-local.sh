@@ -183,6 +183,11 @@ ci_pod() {
         # off, silently. Without this pass the network-gated examples and
         # the feature-gated integration tests are never compiled at all.
         step "clippy all-features"   cargo clippy --workspace --all-targets --all-features -- -D warnings
+        step "clippy transport core" cargo clippy -p kenwood-transport --all-targets --no-default-features -- -D warnings
+        step "clippy modem core"     cargo clippy -p mmdvm --all-targets --no-default-features -- -D warnings
+        for mmdvm_features in runtime probe dstar; do
+            step "clippy modem $mmdvm_features" cargo clippy -p mmdvm --all-targets --no-default-features --features "$mmdvm_features" -- -D warnings
+        done
         step "clippy +encoder"       cargo clippy -p mbelib-rs --all-targets --features encoder -- -D warnings
         step "clippy +kenwood"       cargo clippy -p mbelib-rs --all-targets --features kenwood-tables -- -D warnings
         # Full test targets are pod-safe: thd75'"'"'s spec-audit suite
@@ -190,6 +195,11 @@ ci_pod() {
         # to uncommitted fixtures is `#[ignore]`d. (`--lib` here used
         # to hide every integration test from the Linux pods.)
         step "test workspace"        cargo test --workspace
+        step "test transport core"   cargo test -p kenwood-transport --no-default-features
+        step "test modem core"       cargo test -p mmdvm --no-default-features
+        for mmdvm_features in runtime probe dstar; do
+            step "test modem $mmdvm_features" cargo test -p mmdvm --no-default-features --features "$mmdvm_features"
+        done
         step "test +encoder"         cargo test -p mbelib-rs --features encoder
         step "test +kenwood"         cargo test -p mbelib-rs --features kenwood-tables
         step "doc workspace"         env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps

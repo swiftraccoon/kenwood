@@ -1,26 +1,123 @@
 # mmdvm
 
-Tokio async shell for the MMDVM digital-voice modem protocol. Wraps [`mmdvm-core`](../mmdvm-core/) for the event-loop side.
+Async MMDVM modem I/O and a radio-neutral D-STAR voice runtime. Callers supply
+an open connection; this crate never selects an endpoint, sends CAT commands,
+changes radio routing, or reopens a connection.
 
-## Scope
+## Choose the layer
 
-- `AsyncModem::spawn` spawns a background task that owns a `Transport`, drives `mmdvm-core` frame I/O, and returns an `AsyncModem` handle for commands and events.
-- The `transport` module holds the `Transport` trait, blanket-implemented for any async duplex byte stream (`AsyncRead + AsyncWrite + Send + Unpin`); concrete serial/SPP types are supplied by the caller.
-- Periodic 250 ms `GetStatus` polling that corrects local buffer-space estimates from modem reports. Matches the reference MMDVMHost main loop.
-- Per-mode TX queues drained only when the modem reports FIFO-slot availability. D-STAR queue wired today; DMR / YSF / P25 / NXDN / POCSAG / FM present in core but not driven from this shell yet.
+| Feature selection | Entry point | Responsibility |
+| --- | --- | --- |
+| Default (`runtime`) | `AsyncModem::spawn` | Spawned modem loop, raw events, status polling, and bounded TX queues |
+| `default-features = false`, `features = ["probe"]` | `probe::probe_version` | One bounded version exchange; no spawned modem loop |
+| `features = ["dstar"]` | `dstar::DstarModem::initialize` | D-STAR initialization, voice events, slow data, last-heard state, and echo playback; enables `runtime` |
 
-## Scope boundaries
+Enable both `probe` and `dstar` when one application needs identification and
+voice operation. With all features disabled, only the shared shell error and
+async-stream trait remain alongside the core re-export.
 
-Wire-format codec lives in [`mmdvm-core`](../mmdvm-core/). This crate is I/O and scheduling only.
+The production workspace dependency graph has no radio-model crate:
 
-## Reference
+| Dependency | Enabled by | Owns |
+| --- | --- | --- |
+| [`mmdvm-core`](https://github.com/swiftraccoon/kenwood/tree/main/mmdvm-core) | Always | Sans-I/O MMDVM framing and modem response types |
+| [`dstar-gateway-core`](https://github.com/swiftraccoon/kenwood/tree/main/dstar-gateway-core) | `dstar` | D-STAR headers, voice, slow data, and URCALL classification |
+| [`kenwood-transport`](https://github.com/swiftraccoon/kenwood/tree/main/kenwood-transport) | `probe` | Byte-transport trait and errors; its serial feature is not enabled here |
 
-Mirrors the C++ `MMDVMHost` main loop (GPL-2.0-or-later). Portions are derived from MMDVMHost by Jonathan Naylor G4KLX, 2015–2026.
+Reflector networking belongs to the separate
+[`dstar-gateway`](https://github.com/swiftraccoon/kenwood/tree/main/dstar-gateway)
+crate. Radio-specific entry, proof, and restoration stay with each model.
 
-- MMDVMHost: <https://github.com/g4klx/MMDVMHost>
+## Identify a caller-selected connection
 
-## Status
+The `probe` feature borrows `kenwood_transport::Transport`. A caller naming
+that trait also declares a direct `kenwood-transport` dependency; disable its
+default features when no serial backend is needed. One absolute
+deadline covers the request write and every read. Success requires a complete
+protocol-1 or protocol-2 version response with a nonempty description; reads
+leave bytes after that frame untouched.
 
-Pre-release. Exercises D-STAR only. Public API is unstable.
+```rust,no_run
+# #[cfg(feature = "probe")]
+async fn identify<T: kenwood_transport::Transport>(
+    transport: &mut T,
+) -> Result<mmdvm::core::VersionResponse, mmdvm::probe::ProbeError> {
+    mmdvm::probe::probe_version(transport, std::time::Duration::from_secs(2)).await
+}
+```
 
-Part of the [kenwood](..) workspace. License: GPL-2.0-or-later.
+This proves MMDVM framing only on the borrowed connection. It does not prove
+a particular radio identity, distinguish Terminal from Access Point mode, or
+authorize transmission. The caller decides when a probe is appropriate and
+how to retire or recover a failed or cancelled exchange.
+
+## Drive and reclaim a modem
+
+The `runtime` layer accepts any `AsyncRead + AsyncWrite + Send + Unpin`
+stream. For a `kenwood_transport::Transport`, use that crate's `StreamAdapter`.
+The caller must establish the binary protocol before spawning the modem.
+
+```rust,no_run
+# #[cfg(feature = "runtime")]
+async fn drive<S: mmdvm::Transport + 'static>(stream: S) -> Result<S, mmdvm::ShellError> {
+    let mut modem = mmdvm::AsyncModem::spawn(stream);
+    if let Some(event) = modem.next_event().await {
+        println!("{event:?}");
+    }
+    modem.shutdown().await
+}
+```
+
+Spawning sends `GetVersion` and `GetStatus`; the loop then polls status every
+250 ms. D-STAR frames leave its bounded TX queue only when the modem reports
+sufficient FIFO space. Submission success means queued, not transmitted.
+`Event::TxDropped` reports queued frames discarded during shutdown or failure.
+
+`shutdown` awaits the modem task and returns its stream when recovery succeeds.
+For a `StreamAdapter`, also await `shutdown_and_recover` before using its inner
+transport. Only then may model-specific cleanup or restoration proceed.
+Shutdown itself sends no CAT exit, close, or reopen command. Dropping a handle
+does not await cleanup, and a failed modem task can make its stream unrecoverable.
+
+## Add D-STAR voice operation
+
+Construct `DstarModemConfig::new("N0CALL")?.with_suffix("/P")?` before I/O.
+Its identity fields are private: blank callsigns, over-width input, non-printable
+ASCII, and commas are rejected instead of truncated or repaired. The callsign
+and suffix getters return fixed-width protocol values. Receive events preserve
+opaque wire bytes independently of this transmit-configuration validation.
+
+Pass a prepared `AsyncModem` and that configuration to
+`DstarModem::initialize`. It sends D-STAR-only `SetConfig`, waits for its matching
+ACK, then sends correlated `SetMode(Dstar)`. Initialization failure returns the
+original modem handle alongside a typed `DstarError`. `into_modem` returns the
+running handle without I/O, leaving shutdown and radio restoration to its owner.
+The `mmdvm::dstar` module contains a complete initialization/recovery example.
+
+Important operating boundaries:
+
+- `DstarModem::next_event` returning `Ok(None)` means a quiet poll interval, not EOF.
+  Closed or failed modem tasks return errors; dropped event-ring entries
+  remain explicit discontinuities.
+- An exact inbound URCALL echo command records voice until an observed stream
+  boundary. A clean EOT automatically queues playback. This runtime is not a
+  receive-only interface, and echo recording currently has no frame-count cap.
+- The two-second `poll_status` timeout applies between received events, not
+  to the whole operation. Continuing voice traffic can extend the total wait.
+- Waiting for an event is cancellation-safe. TX submission, initialization,
+  and automatic echo playback are not cancellation-atomic: already queued or
+  written commands may still take effect. Cancellation is not rollback.
+
+Only D-STAR transmission is driven by this shell today. Other digital-voice
+formats have core codec support but no corresponding shell TX workflow.
+
+## Reference and status
+
+The modem loop follows
+[`MMDVMHost`](https://github.com/g4klx/MMDVMHost), including periodic status and
+FIFO-space gating. Portions are derived from Jonathan Naylor G4KLX's work,
+2015–2026, under GPL-2.0-or-later.
+
+Experimental API; breaking changes prioritize correctness and clarity.
+Part of the [kenwood workspace](https://github.com/swiftraccoon/kenwood).
+License: GPL-2.0-or-later.

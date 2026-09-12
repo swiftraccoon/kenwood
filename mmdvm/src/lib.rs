@@ -2,26 +2,25 @@
 // G4KLX, Copyright (C) 2015-2026, licensed under GPL-2.0-or-later.
 // See LICENSE for full attribution.
 
-//! Tokio async shell for the MMDVM digital voice modem protocol.
-//!
-//! Builds on the sans-io [`mmdvm-core`] crate to provide an async
-//! handle-and-loop architecture for talking to MMDVM modems like the
-//! Kenwood TH-D75, Pi-Star hotspots, `ZumSpot`, and similar hardware.
-//!
-//! The top-level entry point is [`tokio_shell::AsyncModem::spawn`].
-//!
-//! Mirrors the reference C++ implementation at `MMDVMHost/`:
-//! periodic 250 ms `GetStatus` polls correct local buffer-space
-//! estimates, and per-mode TX queues are drained only when the
-//! modem reports FIFO slot availability.
-//!
-//! [`mmdvm-core`]: https://github.com/swiftraccoon/kenwood/tree/main/mmdvm-core
+#![doc = include_str!("../README.md")]
 
+#[cfg(feature = "dstar")]
+pub mod dstar;
 pub mod error;
+#[cfg(feature = "probe")]
+pub mod probe;
+#[cfg(feature = "runtime")]
 pub mod tokio_shell;
 pub mod transport;
 
 pub use error::ShellError;
 pub use mmdvm_core as core;
+#[cfg(feature = "runtime")]
 pub use tokio_shell::{AsyncModem, Event};
 pub use transport::Transport;
+
+#[cfg(all(test, not(any(feature = "dstar", feature = "probe"))))]
+use kenwood_transport as _;
+
+#[cfg(not(any(feature = "runtime", feature = "probe")))]
+use tracing as _;

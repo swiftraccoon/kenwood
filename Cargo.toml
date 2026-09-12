@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "kenwood-transport",
   "thd75",
   "thd75-tui",
   "thd75-repl",

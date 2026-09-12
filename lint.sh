@@ -151,6 +151,18 @@ if [ -n "$PKG" ] && [ "$PKG" != "kenwood-thd75" ]; then
     THD75_MATRIX=0
 fi
 
+# The neutral transport core must build without its optional serial backend.
+TRANSPORT_MATRIX=1
+if [ -n "$PKG" ] && [ "$PKG" != "kenwood-transport" ]; then
+    TRANSPORT_MATRIX=0
+fi
+
+# Probe-only consumers must not require the spawned modem or D-STAR runtime.
+MMDVM_MATRIX=1
+if [ -n "$PKG" ] && [ "$PKG" != "mmdvm" ]; then
+    MMDVM_MATRIX=0
+fi
+
 # The mdBook lives under dstar-gateway; only build it when that crate
 # is in scope.
 BOOK_BUILD=1
@@ -1006,6 +1018,22 @@ if [ "$MBELIB_MATRIX" -eq 1 ]; then
         --jobs "$MAIN_JOBS" --target-dir "$CLIPPY_TARGET_DIR" -- -D warnings
 fi
 
+# Verify the transport core without platform serial dependencies enabled.
+if [ "$TRANSPORT_MATRIX" -eq 1 ]; then
+    run "${CLIPPY_ENV[@]}" cargo clippy -p kenwood-transport --all-targets --no-default-features \
+        --jobs "$MAIN_JOBS" --target-dir "$CLIPPY_TARGET_DIR" -- -D warnings
+fi
+
+# Keep all modem feature configurations isolated from workspace feature unions.
+if [ "$MMDVM_MATRIX" -eq 1 ]; then
+    run "${CLIPPY_ENV[@]}" cargo clippy -p mmdvm --all-targets --no-default-features \
+        --jobs "$MAIN_JOBS" --target-dir "$CLIPPY_TARGET_DIR" -- -D warnings
+    for mmdvm_features in runtime probe dstar; do
+        run "${CLIPPY_ENV[@]}" cargo clippy -p mmdvm --all-targets --no-default-features \
+            --features "$mmdvm_features" --jobs "$MAIN_JOBS" --target-dir "$CLIPPY_TARGET_DIR" -- -D warnings
+    done
+fi
+
 # kenwood-thd75 feature matrix: the CAT-only core and each client stack
 # alone. The default and --all-features passes above cover both-on.
 if [ "$THD75_MATRIX" -eq 1 ]; then
@@ -1055,6 +1083,18 @@ join_test_group
 if [ -z "$PKG" ] || [ "$PKG" = "thd75-repl" ]; then
     run "${TEST_ENV[@]}" CARGO_TARGET_DIR="$TEST_TARGET_DIR" \
         cargo nextest run -p thd75-repl --features testing --all-targets
+fi
+if [ "$TRANSPORT_MATRIX" -eq 1 ]; then
+    run "${TEST_ENV[@]}" CARGO_TARGET_DIR="$TEST_TARGET_DIR" \
+        cargo nextest run -p kenwood-transport --no-default-features --all-targets
+fi
+if [ "$MMDVM_MATRIX" -eq 1 ]; then
+    run "${TEST_ENV[@]}" CARGO_TARGET_DIR="$TEST_TARGET_DIR" \
+        cargo nextest run -p mmdvm --no-default-features --all-targets
+    for mmdvm_features in runtime probe dstar; do
+        run "${TEST_ENV[@]}" CARGO_TARGET_DIR="$TEST_TARGET_DIR" \
+            cargo nextest run -p mmdvm --no-default-features --features "$mmdvm_features" --all-targets
+    done
 fi
 if [ "$THD75_MATRIX" -eq 1 ]; then
     run "${TEST_ENV[@]}" CARGO_TARGET_DIR="$TEST_TARGET_DIR" \

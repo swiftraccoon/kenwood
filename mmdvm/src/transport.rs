@@ -6,8 +6,8 @@
 //!
 //! - `tokio::io::DuplexStream` for unit tests
 //! - `tokio_serial::SerialStream` for USB-CDC (Kenwood TH-D75)
-//! - `thd75::transport::EitherTransport` for the USB/Bluetooth SPP
-//!   auto-selection used by the TH-D75 crates
+//! - `kenwood_transport::StreamAdapter<kenwood_thd75::EitherTransport>`
+//!   for the USB/Bluetooth SPP auto-selection used by the TH-D75 crates
 
 use tokio::io::{AsyncRead, AsyncWrite};
 

@@ -52,6 +52,7 @@ jobs:
           <body>
             <p>Redirecting to <a href="kenwood_thd75/">kenwood-thd75 documentation</a>.</p>
             <p>Other crates in this workspace:
+              <a href="kenwood_transport/">kenwood-transport</a>,
               <a href="thd75_tui/">thd75-tui</a>,
               <a href="thd75_repl/">thd75-repl</a>,
               <a href="thd75_listen/">thd75-listen</a>,

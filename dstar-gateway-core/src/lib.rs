@@ -50,7 +50,7 @@ pub use slowdata::{
 };
 pub use types::{
     BandLetter, Callsign, Module, ProtocolKind, ReflectorCallsign, StreamId, Suffix, TypeError,
-    WireTextError,
+    UrCallAction, WireTextError,
 };
 pub use validator::{
     AuthHostSkipReason, CallsignField, Diagnostic, DiagnosticSink, NullSink, TracingSink, VecSink,

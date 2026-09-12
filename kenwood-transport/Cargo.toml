@@ -1,0 +1,35 @@
+[package]
+name = "kenwood-transport"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "Model-neutral async byte transports and Tokio stream adapters"
+license = "GPL-2.0-or-later"
+repository = "https://github.com/swiftraccoon/kenwood"
+keywords = ["kenwood", "serial", "transport", "async", "ham-radio"]
+categories = ["hardware-support", "asynchronous"]
+authors = ["swiftraccoon"]
+readme = "README.md"
+publish = false
+
+[features]
+default = ["serial"]
+serial = ["dep:tokio-serial"]
+
+[dependencies]
+tokio = { version = "1", features = [
+  "rt",
+  "macros",
+  "sync",
+  "io-util",
+  "time",
+] }
+tokio-serial = { version = "5", optional = true }
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "test-util"] }
+
+[lints]
+workspace = true

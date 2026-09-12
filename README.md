@@ -35,6 +35,7 @@ expecting stability.
 
 | Crate | Purpose | Stability |
 |-------|---------|-----------|
+| [`kenwood-transport/`](kenwood-transport/) | Model-neutral async byte I/O, strict mocks, explicit serial options, and a bounded Tokio stream adapter; no radio-model or TH-D75 helper dependency | experimental |
 | [`thd75/`](thd75/) | TH-D75 library: CAT, MCP programming, SD-card parsing, transports, high-level `AprsClient` | experimental |
 | [`thd75-tui/`](thd75-tui/) | Terminal UI for the TH-D75 | experimental |
 | [`thd75-repl/`](thd75-repl/) | Screen-reader-friendly REPL (CAT, APRS, D-STAR gateway) | experimental |
@@ -54,7 +55,7 @@ expecting stability.
 | [`dmr-rewind/`](dmr-rewind/) | Receive-only Tokio client for self-service BrandMeister Open DMR Terminal subscriptions | experimental |
 | [`pulsar/`](pulsar/) | Software-only DMR recorder: archives BrandMeister AMBE+2 bursts and per-call metadata | experimental |
 | [`mmdvm-core/`](mmdvm-core/) | Sans-io MMDVM modem protocol codec | experimental |
-| [`mmdvm/`](mmdvm/) | Tokio async shell for MMDVM modems | experimental |
+| [`mmdvm/`](mmdvm/) | Async MMDVM shell, bounded protocol probe, and shared D-STAR voice runtime | experimental |
 | [`mbelib-rs/`](mbelib-rs/) | AMBE 3600×2400 voice codec (decoder default; encoder behind `--features encoder`) | experimental |
 | [`sextant/`](sextant/) | GUI D-STAR reflector client; exercises the laptop-only encode/decode pipeline against a local `polaris` reflector | experimental |
 | [`stargazer/`](stargazer/) | D-STAR reflector recorder and activity survey: listen-only multi-target capture to raw AMBE, WAV, and metadata | experimental |
