@@ -14,7 +14,9 @@ documentation = "https://swiftraccoon.github.io/kenwood/"
 publish = false
 
 [dependencies]
-kenwood-transport = { path = "../kenwood-transport" }
+kenwood-transport = { path = "../kenwood-transport", features = [
+  "native-bluetooth",
+] }
 tokio = { version = "1", features = [
   "rt",
   "macros",
@@ -102,10 +104,10 @@ test = true
 # KNOWN DIVERGENCE FROM WORKSPACE: this crate declares its own [lints.*]
 # blocks (cargo replaces, never merges, the workspace set). Divergences:
 # - `unsafe_code` is `deny` rather than the workspace's `forbid`: this crate
-#   needs two audited, scoped expectations for the IOBluetooth helper and
-#   macOS Vision OCR bridge. Keeping the package-level deny applies the guard
-#   to every Cargo library, test, and example target while allowing those two
-#   reasoned expectations to operate. Manual hardware probes are source-audited
+#   needs one audited, scoped expectation for the macOS Vision OCR bridge.
+#   Keeping the package-level deny applies the guard
+#   to every Cargo library, test, and example target while allowing that
+#   reasoned expectation to operate. Manual hardware probes are source-audited
 #   by `lint.sh` because they are deliberately not Cargo targets.
 # - Everything else mirrors the workspace policy; see the inline notes.
 [lints.rust]

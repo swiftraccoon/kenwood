@@ -152,10 +152,10 @@ fn open_explicit_bluetooth(selector: &str) -> Result<OpenedTransport, Box<dyn st
     if canonical_bluetooth_address(selector).is_none() {
         return Err(exact_bluetooth_selector_guidance(selector).into());
     }
-    let devices = kenwood_thd75::BluetoothTransport::paired_devices()?;
+    let devices = kenwood_transport::bluetooth::BluetoothTransport::paired_devices()?;
     let identities: Vec<_> = devices
         .iter()
-        .map(|device| (device.address(), device.display_name()))
+        .map(|device| (device.address().as_str(), device.display_name()))
         .collect();
     let selected_index = resolve_exact_paired_device_index(selector, &identities)?;
     let selected = devices

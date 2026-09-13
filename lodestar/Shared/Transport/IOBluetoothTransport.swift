@@ -12,7 +12,9 @@ import Darwin
 /// its own signed binary with a private environment handshake; an Objective-C
 /// constructor takes over before SwiftUI starts and owns RFCOMM plus its main
 /// run loop in that disposable helper process. Parent/child stdin and stdout
-/// carry framed discovery records or the raw radio byte stream.
+/// carry framed discovery records or the raw radio byte stream. A radio-open
+/// readiness frame confirms the exact selected address and TH-D75 channel
+/// before the raw stream reader takes ownership of stdout.
 ///
 /// This process boundary is required because every IOBluetooth write API can
 /// ultimately block inside the framework without a cancellation primitive.
@@ -53,8 +55,9 @@ public actor IOBluetoothTransport: RadioTransport {
     /// Enumerate every bounded paired device in a short-lived helper.
     ///
     /// Discovery is metadata-only and does not guess radio identity from a
-    /// display name. The user chooses one exact address; connection setup
-    /// proves the endpoint's wire protocol before publishing it as connected.
+    /// display name. The user chooses one exact address; the app's connection
+    /// coordinator separately proves the wire protocol before admitting the
+    /// radio session. Transport readiness alone does not establish CAT or MMDVM.
     public nonisolated static func pairedDevices() -> [BluetoothDevice] {
         #if os(macOS)
         return BluetoothHelperProcess.pairedDevices()
@@ -122,6 +125,18 @@ public actor IOBluetoothTransport: RadioTransport {
         _ payload: [UInt8]
     ) -> [BluetoothDevice]? {
         BluetoothHelperProcess.parsePairedDevicePayloadForTesting(payload)
+    }
+
+    /// Validates the production radio-open frame without opening a device.
+    nonisolated static func helperValidateRadioReadiness(
+        _ payload: [UInt8],
+        expectedAddress: String
+    ) -> Bool {
+        BluetoothHelperProcess.validReadyFrame(
+            payload,
+            device: expectedAddress,
+            mode: .radio
+        )
     }
 
     /// Runs the signed discovery helper and distinguishes a complete
@@ -394,12 +409,22 @@ public actor IOBluetoothTransport: RadioTransport {
     }
 
     private func awaitReady(generation: UInt64) async throws {
-        var ready = [UInt8](repeating: 0, count: bluetoothHelperReadyMagic.count)
+        // Read precisely the framing width. Any radio bytes coalesced into
+        // the same pipe write remain for the persistent raw-stream reader.
+        var ready = [UInt8](
+            repeating: 0,
+            count: configuredHelperMode.readyFrameByteCount
+        )
         var offset = 0
         let deadline = ContinuousClock.now.advanced(by: .seconds(22))
 
         while offset < ready.count {
             try Task.checkCancellation()
+            guard ContinuousClock.now < deadline else {
+                throw RadioTransportError.openFailed(
+                    reason: "Bluetooth helper did not become ready within 22s"
+                )
+            }
             guard let current = helper,
                   current.generation == generation,
                   current.outputFD >= 0 else {
@@ -425,11 +450,6 @@ public actor IOBluetoothTransport: RadioTransport {
             let readErrno = errno
             if readErrno == EINTR { continue }
             if readErrno == EAGAIN || readErrno == EWOULDBLOCK {
-                guard ContinuousClock.now < deadline else {
-                    throw RadioTransportError.openFailed(
-                        reason: "Bluetooth helper did not become ready within 22s"
-                    )
-                }
                 try await Task.sleep(for: .milliseconds(5))
                 continue
             }
@@ -437,9 +457,13 @@ public actor IOBluetoothTransport: RadioTransport {
                 reason: String(cString: strerror(readErrno))
             )
         }
-        guard ready == bluetoothHelperReadyMagic else {
+        guard BluetoothHelperProcess.validReadyFrame(
+            ready,
+            device: device.address,
+            mode: configuredHelperMode
+        ) else {
             throw RadioTransportError.openFailed(
-                reason: "Bluetooth helper emitted an invalid READY frame"
+                reason: "Bluetooth helper emitted an invalid or mismatched READY endpoint"
             )
         }
     }
@@ -570,7 +594,11 @@ private func lodestar_bt_helper_terminate(
 @_silgen_name("lodestar_bt_helper_environment_protocol_probe")
 private func lodestar_bt_helper_environment_protocol_probe() -> Int32
 
-private let bluetoothHelperReadyMagic = Array("THD75BT-READY-v1".utf8)
+private let bluetoothHelperReadyMagic = Array("KENWBT-READY-v2!".utf8)
+/// Radio-open metadata: 17 ASCII address bytes followed by one raw channel byte.
+private let bluetoothHelperEndpointByteCount = 18
+/// Lodestar's TH-D75 policy, not a default for the shared native backend.
+private let bluetoothD75SPPChannel: UInt8 = 2
 private let bluetoothMaxPairedDevices = 64
 private let bluetoothMaxPairedDisplayNameBytes = 1_024
 
@@ -579,6 +607,11 @@ private enum BluetoothHelperMode: Int32 {
     case pairedDevices = 1
     case echoTest = 2
     case hangTest = 3
+
+    var readyFrameByteCount: Int {
+        bluetoothHelperReadyMagic.count
+            + (self == .radio ? bluetoothHelperEndpointByteCount : 0)
+    }
 }
 
 private struct BluetoothHelperProcess {
@@ -589,6 +622,30 @@ private struct BluetoothHelperProcess {
     var holdsSlot: Bool
     var generation: UInt64 = 0
     var reader: BluetoothHelperPipeReader?
+
+    /// Control and no-radio test operations have no endpoint metadata.
+    /// Radio mode must prove this exact address and the model-owned channel.
+    static func validReadyFrame(
+        _ bytes: [UInt8],
+        device: String,
+        mode: BluetoothHelperMode
+    ) -> Bool {
+        guard bytes.count == mode.readyFrameByteCount,
+              bytes.starts(with: bluetoothHelperReadyMagic) else {
+            return false
+        }
+        guard mode == .radio else { return true }
+        let endpoint = bytes.dropFirst(bluetoothHelperReadyMagic.count)
+        guard endpoint.last == bluetoothD75SPPChannel,
+              let actualAddress = String(bytes: endpoint.dropLast(), encoding: .utf8),
+              isExactBluetoothAddress(actualAddress),
+              isExactBluetoothAddress(device) else {
+            return false
+        }
+        let canonicalActual = actualAddress.replacingOccurrences(of: ":", with: "-")
+        let canonicalExpected = device.replacingOccurrences(of: ":", with: "-")
+        return canonicalActual.caseInsensitiveCompare(canonicalExpected) == .orderedSame
+    }
 
     static func spawn(
         device: String,

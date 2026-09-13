@@ -8,6 +8,9 @@ and Mac (native macOS 26+).
   helper: only that child owns IOBluetooth/RFCOMM, and the parent can kill and
   reap it if a framework write stalls. Cancelled or uncertain writes require
   an explicit fresh connection; cancelling a read preserves buffered bytes.
+  The shared `kenwood-transport` helper confirms the exact selected address
+  and the TH-D75's RFCOMM channel 2 before Swift accepts radio bytes. This
+  endpoint check is separate from the coordinator's CAT or MMDVM proof.
 - **iPad** connects to the radio directly over USB-C: an embedded
   DriverKit extension drives the TH-D75's CDC serial interface on
   M-series iPads. Enable the driver once in **Settings → General →

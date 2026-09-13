@@ -319,16 +319,17 @@ fi
 
 # ---------- unsafe audit ----------
 
-# Workspace lint policy forbids unsafe code in ordinary crates. The TH-D75
-# library has two reasoned FFI expectations; its package-level deny applies
-# to every Cargo library, example, and test target. The two UniFFI crates
+# Workspace lint policy forbids unsafe code in ordinary crates. The shared
+# transport and TH-D75 libraries each have one reasoned FFI expectation;
+# their package-level deny applies to every Cargo library, example, and test
+# target. The two UniFFI crates
 # cannot deny unsafe at the crate root because generated scaffolding contains
 # the required C ABI. Their hand-written modules carry
 # `#[forbid(unsafe_code)]`; this source check guards both hand-written source
 # trees and the manual probe files, and prevents any new lint suppression
-# outside the two audited TH-D75 FFI modules.
+# outside the audited Bluetooth transport and Vision OCR modules.
 check_unsafe_audit() {
-    local allowlist='thd75/src/transport/bluetooth\.rs|thd75/src/screen/vision\.rs'
+    local allowlist='^(\./)?(kenwood-transport/src/bluetooth\.rs|thd75/src/screen/vision\.rs):[0-9]+:'
     local suppressions keyword
     suppressions=$(grep -rnE \
         '(allow|expect)[[:space:]]*\([[:space:]]*unsafe_code|^[[:space:]]*unsafe_code[[:space:]]*,?[[:space:]]*$' \

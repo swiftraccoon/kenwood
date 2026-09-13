@@ -1,5 +1,7 @@
 #![doc = include_str!("../README.md")]
 
+#[cfg(feature = "native-bluetooth")]
+pub mod bluetooth;
 pub mod error;
 pub mod mock;
 #[cfg(feature = "serial")]

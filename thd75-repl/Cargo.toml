@@ -58,6 +58,11 @@ time = { version = "0.3", default-features = false, features = [
 rustyline = "18"
 dirs-next = "2"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+kenwood-transport = { path = "../kenwood-transport", default-features = false, features = [
+  "native-bluetooth",
+] }
+
 # KNOWN DIVERGENCE FROM WORKSPACE: a crate-local [lints.<group>] block
 # fully REPLACES the workspace block (no merge). Both blocks below
 # restate the workspace policy in full; the only differences are the

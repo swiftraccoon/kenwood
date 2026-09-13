@@ -45,7 +45,7 @@ pub mod either;
 pub mod serial;
 
 #[cfg(any(target_os = "macos", all(doc, unix)))]
-pub use bluetooth::{BluetoothOpenCancellation, BluetoothTransport, PairedBluetoothDevice};
+pub use bluetooth::BluetoothTransport;
 pub use broker::{BrokerHandle, MainThreadBroker};
 pub use either::EitherTransport;
 pub use serial::SerialTransport;

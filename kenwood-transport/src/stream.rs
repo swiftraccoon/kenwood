@@ -468,12 +468,16 @@ fn transport_err_to_io(err: TransportError) -> io::Error {
             source.kind(),
             format!("Bluetooth helper failed during {context}: {source}"),
         ),
-        error @ TransportError::BluetoothDeviceNameAmbiguous => {
+        error @ (TransportError::BluetoothDeviceNameAmbiguous
+        | TransportError::BluetoothParameter { .. }) => {
             io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
         }
         error @ TransportError::BluetoothOpenInterrupted => {
             io::Error::new(io::ErrorKind::Interrupted, error.to_string())
         }
+        error @ (TransportError::BluetoothClose { .. }
+        | TransportError::BluetoothOpen { .. }
+        | TransportError::BluetoothOpenWithCleanup { .. }) => io::Error::other(error),
         TransportError::BrokerUnavailable => {
             io::Error::new(io::ErrorKind::BrokenPipe, "transport broker unavailable")
         }
@@ -924,6 +928,25 @@ mod tests {
             error.to_string().contains("sandbox denied exec"),
             "helper I/O failure was not preserved: {error}"
         );
+    }
+
+    #[test]
+    fn combined_bluetooth_failure_keeps_both_typed_causes() {
+        use crate::error::{BluetoothCloseFailure, BluetoothOpenStage};
+        let error = transport_err_to_io(TransportError::BluetoothOpenWithCleanup {
+            stage: BluetoothOpenStage::RfcommDeadline,
+            cleanup: BluetoothCloseFailure::ChannelUnconfirmed,
+        });
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(matches!(
+            error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<TransportError>()),
+            Some(TransportError::BluetoothOpenWithCleanup {
+                stage: BluetoothOpenStage::RfcommDeadline,
+                cleanup: BluetoothCloseFailure::ChannelUnconfirmed,
+            })
+        ));
     }
 
     #[test]

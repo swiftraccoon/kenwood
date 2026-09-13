@@ -6,10 +6,10 @@
 #if TARGET_OS_OSX
 
 // Compile the same audited helper constructor/native RFCOMM implementation
-// used by kenwood-thd75 directly into the signed Lodestar executable. The
+// used by kenwood-transport directly into the signed Lodestar executable. The
 // private environment sentinel makes the constructor inert in the parent and
 // takes over before SwiftUI main only in a child spawned below.
-#include "../../../thd75/src/transport/bluetooth_mac.m"
+#include "../../../kenwood-transport/src/bluetooth_mac.m"
 
 #include <spawn.h>
 #include <sys/wait.h>

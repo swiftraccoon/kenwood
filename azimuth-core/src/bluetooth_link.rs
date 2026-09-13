@@ -9,7 +9,7 @@ use kenwood_thd75::{
     Radio, radio::raw_protocol_session::RawProtocolSession, transport::BluetoothTransport,
 };
 #[cfg(target_os = "macos")]
-use kenwood_transport::{Transport, TransportError};
+use kenwood_transport::{Transport, TransportError, bluetooth::PairedBluetoothDevice};
 #[cfg(target_os = "macos")]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(target_os = "macos")]
@@ -832,26 +832,17 @@ pub async fn discover_paired_bluetooth_devices()
 
 #[cfg(target_os = "macos")]
 fn bluetooth_device_discovery_from_native(
-    native: &[kenwood_thd75::PairedBluetoothDevice],
+    native: &[PairedBluetoothDevice],
 ) -> Result<BluetoothDeviceDiscovery, BluetoothLinkError> {
     let mut devices = native
         .iter()
-        .map(|device| {
-            let address = canonicalize_bluetooth_address(device.address()).ok_or_else(|| {
-                BluetoothLinkError::BluetoothUnavailable {
-                    operation: "paired-device enumeration".to_owned(),
-                    detail: format!(
-                        "native helper returned a non-canonical Bluetooth address: {}",
-                        device.address()
-                    ),
-                }
-            })?;
-            Ok(BluetoothPairedDevice {
-                address,
-                display_name: device.display_name().to_owned(),
-            })
+        .map(|device| BluetoothPairedDevice {
+            // The shared inventory has already validated and canonicalized
+            // this address; strings are only the UniFFI presentation boundary.
+            address: device.address().as_str().to_owned(),
+            display_name: device.display_name().to_owned(),
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Vec<_>>();
     devices.sort_by(|left, right| {
         left.display_name
             .to_lowercase()

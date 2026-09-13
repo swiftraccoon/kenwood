@@ -458,13 +458,18 @@ also exits an orphaned helper if its parent disappears. Native startup uses one
 buffers radio ingress until the readiness prefix is complete. One helper owns
 the TH-D75 SPP channel per process.
 
-A newly launched helper can observe an already-connected Bluetooth baseband
-before that process's Classic manager is ready to open RFCOMM. If the first
-bounded helper reports `NotFound`, `BluetoothTransport::open()` waits one second
-and retries exactly once in a new helper; all other errors return immediately,
-and `reopen()` inherits the same two-attempt maximum. The one retry addresses a
-process-local readiness/baseband race in the fresh helper. Recovery leaves the
-shared baseband and macOS system Bluetooth services alone.
+The TH-D75 wrapper retains one selected-open retry for an absent device or a
+failed native stage on its fixed-channel path. `BluetoothTransport::open()`
+waits one second before that single fresh-helper retry; `reopen()` has the same
+two-attempt maximum. A matching typed opening stage accompanied by
+`ChannelUnconfirmed` may receive that same single retry only after the helper
+has been reaped; both failures remain available to diagnostics. This is not
+proof that the OS cancelled its pending operation. Probes never retry.
+Cancellation, helper launch/framing errors, and cleanup failures without that
+opening-stage/reaped-helper evidence return immediately. The shared transport does
+not retry. A reported opening stage is a host observation, not proof of a
+firmware cause or that another attempt will succeed. Recovery leaves the shared
+baseband and macOS system Bluetooth services alone.
 
 ## Radio compatibility
 

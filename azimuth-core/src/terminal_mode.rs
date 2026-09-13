@@ -6,10 +6,7 @@ use std::sync::{
 };
 
 #[cfg(target_os = "macos")]
-use kenwood_thd75::{
-    PairedBluetoothDevice,
-    transport::{BluetoothOpenCancellation, BluetoothTransport},
-};
+use kenwood_thd75::transport::BluetoothTransport;
 use kenwood_thd75::{
     Radio,
     error::Error as RadioError,
@@ -17,8 +14,10 @@ use kenwood_thd75::{
     types::{PcOutputInterface, SerialNumber},
 };
 use kenwood_transport::Transport;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 use kenwood_transport::TransportError;
+#[cfg(target_os = "macos")]
+use kenwood_transport::bluetooth::{self, BluetoothOpenCancellation, PairedBluetoothDevice};
 
 use crate::aprs::TncDataBand;
 use crate::transport::{ByteTransport, SwiftByteTransport};
@@ -189,7 +188,7 @@ enum BluetoothDeviceProbe {
     IdentityFailed(String),
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn transport_error_detail(error: &TransportError) -> String {
     use std::error::Error as _;
 
@@ -237,13 +236,43 @@ fn map_helper_task_failure(error: &tokio::task::JoinError) -> DvGatewayRecoveryE
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn map_transport_failure(error: &TransportError) -> DvGatewayRecoveryError {
     match error {
         TransportError::BluetoothOpenInterrupted => DvGatewayRecoveryError::Cancelled,
         _other => DvGatewayRecoveryError::BluetoothUnavailable {
             detail: transport_error_detail(error),
         },
+    }
+}
+
+/// Classify one completed fixed-channel open without retrying or replacing its owner.
+///
+/// Only absence and fixed-channel startup failures allow another candidate.
+/// Cleanup, cancellation, helper and SDP service-resolution failures remain terminal.
+#[cfg(any(target_os = "macos", test))]
+fn fixed_channel_open_result<T>(
+    result: Result<T, TransportError>,
+) -> Result<Option<T>, DvGatewayRecoveryError> {
+    use kenwood_transport::error::BluetoothOpenStage;
+
+    match result {
+        Ok(transport) => Ok(Some(transport)),
+        Err(
+            TransportError::NotFound
+            | TransportError::BluetoothOpen {
+                stage:
+                    BluetoothOpenStage::ContextAllocation
+                    | BluetoothOpenStage::SdpStart
+                    | BluetoothOpenStage::SdpCompletion
+                    | BluetoothOpenStage::SdpDeadline
+                    | BluetoothOpenStage::RfcommStart
+                    | BluetoothOpenStage::RfcommCompletion
+                    | BluetoothOpenStage::RfcommDeadline
+                    | BluetoothOpenStage::RfcommEndpoint,
+            },
+        ) => Ok(None),
+        Err(error) => Err(map_transport_failure(&error)),
     }
 }
 
@@ -272,7 +301,7 @@ pub async fn validate_bluetooth_recovery_helper() -> Result<(), DvGatewayRecover
             // Keep the guard until the native child is confirmed reaped, even
             // if the async caller drops its waiter.
             let _validation_guard = validation_guard;
-            BluetoothTransport::validate_helper_launch_with_executable(helper_executable)
+            bluetooth::BluetoothTransport::validate_helper_launch_with_executable(helper_executable)
         })
         .await
         .map_err(|error| map_helper_task_failure(&error))?
@@ -308,7 +337,7 @@ async fn enumerate_paired_bluetooth_devices_with_guard(
         // Keep the guard inside the blocking closure. Dropping the async
         // waiter must not admit another helper before this process exits.
         let _enumeration_guard = enumeration_guard;
-        BluetoothTransport::paired_devices_with_helper_executable_cancellable(
+        bluetooth::BluetoothTransport::paired_devices_with_helper_executable_cancellable(
             helper_executable,
             &open_cancellation,
         )
@@ -363,11 +392,7 @@ async fn open_exact_bluetooth_device(
     .await;
     cancellation.check()?;
     let result = task_result.map_err(|error| map_helper_task_failure(&error))?;
-    match result {
-        Ok(transport) => Ok(Some(transport)),
-        Err(TransportError::NotFound) => Ok(None),
-        Err(error) => Err(map_transport_failure(&error)),
-    }
+    fixed_channel_open_result(result)
 }
 
 #[cfg(target_os = "macos")]
@@ -387,11 +412,7 @@ async fn probe_exact_bluetooth_device(
     .await;
     cancellation.check()?;
     let result = task_result.map_err(|error| map_helper_task_failure(&error))?;
-    match result {
-        Ok(transport) => Ok(Some(transport)),
-        Err(TransportError::NotFound) => Ok(None),
-        Err(error) => Err(map_transport_failure(&error)),
-    }
+    fixed_channel_open_result(result)
 }
 
 #[cfg(target_os = "macos")]
@@ -621,7 +642,7 @@ pub(crate) async fn open_selected_bluetooth_transport(
     let selected =
         select_matching_bluetooth_device(&devices, expected, &helper_executable, cancellation)
             .await?;
-    let exact_address = selected.address().to_owned();
+    let exact_address = selected.address().as_str().to_owned();
     let transport = open_exact_bluetooth_device(selected, helper_executable, cancellation)
         .await?
         .ok_or_else(|| DvGatewayRecoveryError::BluetoothUnavailable {
@@ -1977,6 +1998,101 @@ mod tests {
     const TNC_DATA_BAND_BYTE: usize = 0x0B;
     const GATEWAY_MODE_PAGE: u16 = 0x1C;
     const GATEWAY_MODE_BYTE: usize = 0xA0;
+
+    #[test]
+    fn fixed_channel_candidate_failures_allow_the_next_candidate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use kenwood_transport::error::BluetoothOpenStage;
+
+        for stage in [
+            BluetoothOpenStage::ContextAllocation,
+            BluetoothOpenStage::SdpStart,
+            BluetoothOpenStage::SdpCompletion,
+            BluetoothOpenStage::SdpDeadline,
+            BluetoothOpenStage::RfcommStart,
+            BluetoothOpenStage::RfcommCompletion,
+            BluetoothOpenStage::RfcommDeadline,
+            BluetoothOpenStage::RfcommEndpoint,
+        ] {
+            let candidates = [Err(TransportError::BluetoothOpen { stage }), Ok(42)];
+            let mut attempted = 0;
+            let selected = candidates
+                .into_iter()
+                .find_map(|result| {
+                    attempted += 1;
+                    fixed_channel_open_result(result).transpose()
+                })
+                .transpose()?;
+            assert_eq!(selected, Some(42), "continue after {stage}");
+            assert_eq!(attempted, 2, "consume each candidate once after {stage}");
+        }
+        assert!(
+            fixed_channel_open_result::<()>(Err(TransportError::NotFound))?.is_none(),
+            "an absent paired candidate remains unavailable"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fixed_channel_candidate_terminal_failures_are_not_downgraded() {
+        use kenwood_transport::error::{BluetoothCloseFailure, BluetoothOpenStage};
+
+        let terminal_errors = [
+            TransportError::BluetoothOpen {
+                stage: BluetoothOpenStage::ServiceResolution,
+            },
+            TransportError::BluetoothDeviceNameAmbiguous,
+            TransportError::BluetoothHelper {
+                context: "launching the selected helper".to_owned(),
+                source: std::io::Error::other("scripted helper launch failure"),
+            },
+            TransportError::BluetoothHelper {
+                context: "validating readiness framing".to_owned(),
+                source: std::io::Error::other("scripted framing failure"),
+            },
+            TransportError::BluetoothClose {
+                failure: BluetoothCloseFailure::ChannelUnconfirmed,
+            },
+            TransportError::BluetoothClose {
+                failure: BluetoothCloseFailure::HelperExited { code: Some(89) },
+            },
+            TransportError::BluetoothClose {
+                failure: BluetoothCloseFailure::ForcedTermination,
+            },
+            TransportError::BluetoothClose {
+                failure: BluetoothCloseFailure::ReapPending,
+            },
+        ];
+        for error in terminal_errors {
+            let expected_detail = transport_error_detail(&error);
+            let result = fixed_channel_open_result::<()>(Err(error));
+            assert!(
+                matches!(result, Err(DvGatewayRecoveryError::BluetoothUnavailable { detail }) if detail == expected_detail),
+                "retain terminal failure and its causes: {expected_detail}"
+            );
+        }
+        assert!(
+            matches!(
+                fixed_channel_open_result::<()>(Err(TransportError::BluetoothOpenInterrupted)),
+                Err(DvGatewayRecoveryError::Cancelled)
+            ),
+            "cancellation never becomes an unavailable candidate"
+        );
+    }
+
+    #[test]
+    fn fixed_channel_candidate_success_preserves_the_original_owner()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let owner = Box::new(42);
+        let original = std::ptr::from_ref(owner.as_ref());
+        let admitted = fixed_channel_open_result(Ok(owner))?.ok_or("successful owner lost")?;
+        assert_eq!(
+            std::ptr::from_ref(admitted.as_ref()),
+            original,
+            "classification hands off the exact owner"
+        );
+        Ok(())
+    }
 
     #[derive(Debug)]
     struct UnusedByteTransport;

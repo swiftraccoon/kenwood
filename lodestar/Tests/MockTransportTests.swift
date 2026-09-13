@@ -35,7 +35,7 @@ final class MockTransportTests: XCTestCase {
         let name = "Field Radio"
         let headsetAddress = "AA-BB-CC-DD-EE-FF"
         let headsetName = "Headset"
-        var payload = Array("THD75BT-READY-v1".utf8)
+        var payload = Array("KENWBT-READY-v2!".utf8)
         payload.append(contentsOf: UInt16(address.utf8.count).bigEndianBytes)
         payload.append(contentsOf: UInt16(name.utf8.count).bigEndianBytes)
         payload.append(contentsOf: address.utf8)
@@ -62,15 +62,66 @@ final class MockTransportTests: XCTestCase {
     func testBluetoothHelperRejectsMalformedAndTrailingPayloads() {
         let address = "00-11-22-33-44-55"
         let name = "TH-D75"
-        var truncated = Array("THD75BT-READY-v1".utf8)
+        var truncated = Array("KENWBT-READY-v2!".utf8)
         truncated.append(contentsOf: UInt16(address.utf8.count).bigEndianBytes)
         truncated.append(contentsOf: UInt16(name.utf8.count).bigEndianBytes)
         truncated.append(contentsOf: address.utf8.dropLast())
         XCTAssertNil(IOBluetoothTransport.helperParsePairedDevicePayload(truncated))
 
-        var trailing = Array("THD75BT-READY-v1".utf8)
+        var trailing = Array("KENWBT-READY-v2!".utf8)
         trailing.append(contentsOf: [0, 0, 0, 0, 0xAA])
         XCTAssertNil(IOBluetoothTransport.helperParsePairedDevicePayload(trailing))
+    }
+
+    func testBluetoothRadioReadinessRequiresExactEndpointAndD75Channel() {
+        let address = "00-AA-BB-CC-DD-55"
+        let ready = Array("KENWBT-READY-v2!".utf8)
+        let endpoint = Array(address.utf8) + [UInt8(2)]
+
+        XCTAssertTrue(IOBluetoothTransport.helperValidateRadioReadiness(
+            ready + endpoint,
+            expectedAddress: "00:aa:bb:cc:dd:55"
+        ))
+        XCTAssertFalse(IOBluetoothTransport.helperValidateRadioReadiness(
+            ready,
+            expectedAddress: address
+        ))
+        XCTAssertFalse(IOBluetoothTransport.helperValidateRadioReadiness(
+            ready + endpoint,
+            expectedAddress: "00-AA-BB-CC-DD-56"
+        ))
+        let rejectedChannels: [UInt8] = [0, 1, 3, 27, 30, 31, 255]
+        for channel in rejectedChannels {
+            XCTAssertFalse(IOBluetoothTransport.helperValidateRadioReadiness(
+                ready + Array(address.utf8) + [channel],
+                expectedAddress: address
+            ), "Unexpected RFCOMM channel \(channel) must fail closed")
+        }
+    }
+
+    func testBluetoothRadioReadinessRejectsMalformedFrames() {
+        let address = "00-AA-BB-CC-DD-55"
+        let ready = Array("KENWBT-READY-v2!".utf8)
+        let endpoint = Array(address.utf8) + [UInt8(2)]
+        let frame = ready + endpoint
+        let malformed = [
+            Array(frame.dropLast()),
+            frame + [0],
+            Array("THD75BT-READY-v1".utf8) + endpoint,
+            ready + Array("00-AA:BB-CC-DD-55".utf8) + [2],
+            ready + Array("00-AA-BB-CC-DD-GG".utf8) + [2],
+            ready + [0xFF] + Array(endpoint.dropFirst()),
+        ]
+        for payload in malformed {
+            XCTAssertFalse(IOBluetoothTransport.helperValidateRadioReadiness(
+                payload,
+                expectedAddress: address
+            ), "Malformed helper readiness must fail closed: \(payload)")
+        }
+        XCTAssertFalse(IOBluetoothTransport.helperValidateRadioReadiness(
+            frame,
+            expectedAddress: "TH-D75"
+        ))
     }
 
     func testLiveBluetoothHelperReturnsExpectedPairedRadio() throws {
@@ -429,7 +480,7 @@ final class McpSessionTests: XCTestCase {
         let interfaceRead = Array(buildReadPageCmd(page: interfacePage))
         let modeRead = Array(buildReadPageCmd(page: modePage))
 
-        var currentInterface = [UInt8](repeating: 0, count: 256)
+        let currentInterface = [UInt8](repeating: 0, count: 256)
         var expectedInterface = currentInterface
         expectedInterface[Int(byteOf(offset: settings.interfaceOffset))] = settings.interfaceValue
         var currentMode = [UInt8](repeating: 0, count: 256)

@@ -1,2637 +1,625 @@
-//! Native macOS Bluetooth RFCOMM transport.
+//! TH-D75 Bluetooth selection, fixed-channel opening, and retry policy.
 //!
-//! Bypasses the broken `IOUserBluetoothSerialDriver` serial port driver and
-//! talks directly to the radio through `IOBluetoothRFCOMMChannel`.
-//!
-//! `IOBluetooth` writes can block forever when RFCOMM flow-control credit
-//! stalls, including its nominally asynchronous API (which blocks the main
-//! dispatch queue later). The framework therefore runs in a killable helper
-//! process. The parent communicates with it through non-blocking raw byte
-//! pipes and never calls an `IOBluetooth` write or close routine itself.
-//!
-//! A newly launched `IOBluetooth` shim can briefly report an already-connected
-//! baseband before its process-local Classic manager is ready to open RFCOMM.
-//! A native open that reaches that state is bounded and reported as
-//! [`TransportError::NotFound`](kenwood_transport::TransportError::NotFound);
-//! construction retries that failure exactly once in a fresh helper after a
-//! short delay. Neither the radio's baseband nor any system Bluetooth process
-//! is torn down as part of open or recovery.
-//!
-//! This module is only available on macOS (`cfg(target_os = "macos")`).
+//! The shared transport owns every native object, helper, pipe, and teardown.
+//! This wrapper supplies the TH-D75 default name and qualified channel two,
+//! one transient selected-open retry, and reopening pinned to the actual address.
+//! Reopening is endpoint recovery, not evidence of CAT or operating-mode readiness.
 
-#[cfg(any(target_os = "macos", all(doc, unix)))]
-#[expect(
-    unsafe_code,
-    reason = "The macOS transport uses a small audited C ABI to anchor the Objective-C constructor, configure pipe flags, and install the child's liveness descriptor. Each unsafe call documents its ownership or fd invariant."
-)]
-mod inner {
-    use std::io::{self, Read as _, Write as _};
-    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
-    use std::os::unix::process::CommandExt as _;
-    use std::path::{Path, PathBuf};
-    use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    };
-    use std::time::{Duration, Instant};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
-    use kenwood_transport::{Transport, TransportError};
+use kenwood_transport::bluetooth::{
+    BluetoothAddress, BluetoothDeviceName, BluetoothDeviceSelector, BluetoothOpenCancellation,
+    BluetoothService, BluetoothTransport as NativeBluetoothTransport, PairedBluetoothDevice,
+    RfcommChannel,
+};
+use kenwood_transport::error::{BluetoothCloseFailure, BluetoothOpenStage};
+use kenwood_transport::{Transport, TransportError};
 
-    unsafe extern "C" {
-        fn bt_helper_link_anchor();
-        #[cfg(test)]
-        fn bt_device_identifier_matches_display_name(
-            identifier: *const std::ffi::c_char,
-            display_name: *const std::ffi::c_char,
-        ) -> i32;
-        fn bt_fd_set_nonblocking(fd: i32) -> i32;
-        fn bt_liveness_pipe_create(read_fd: *mut i32, write_fd: *mut i32) -> i32;
-        fn bt_helper_prepare_liveness_fd(source_fd: i32, target_fd: i32) -> i32;
-    }
+/// TH-D75 endpoint policy around the shared native RFCOMM transport.
+#[derive(Debug)]
+pub struct BluetoothTransport {
+    inner: NativeBluetoothTransport,
+    address: BluetoothAddress,
+    helper_executable: PathBuf,
+}
 
-    /// The RFCOMM channel for the TH-D75's SPP (Serial Port) service.
-    const SPP_CHANNEL: u8 = 2;
-
-    /// Default device name for Bluetooth discovery.
-    const DEFAULT_DEVICE_NAME: &str = "TH-D75";
-
-    /// Private launch sentinel recognized by the Objective-C constructor
-    /// before the selected helper reaches ordinary `main`.
-    const HELPER_SENTINEL_ENV: &str = "THD75_BT_HELPER_PROCESS_V1";
-    const HELPER_SENTINEL_VALUE: &str = "4d7f29c8b35a";
-    const HELPER_DEVICE_ENV: &str = "THD75_BT_HELPER_DEVICE";
-    const HELPER_CHANNEL_ENV: &str = "THD75_BT_HELPER_CHANNEL";
-    const HELPER_CONTROL_ENV: &str = "THD75_BT_HELPER_CONTROL_MODE";
-    const HELPER_PAIRED_CONTROL_MODE: &str = "paired";
-    const HELPER_TEST_ENV: &str = "THD75_BT_HELPER_TEST_MODE";
-    const HELPER_LIVENESS_FD_ENV: &str = "THD75_BT_HELPER_LIVENESS_FD";
-    const HELPER_LIVENESS_FD: i32 = 3;
-
-    /// Prefix emitted by the helper after RFCOMM is open and before it
-    /// enables radio ingress on stdout.
-    const HELPER_READY_MAGIC: &[u8; 16] = b"THD75BT-READY-v1";
-
-    /// Maximum time one helper attempt waits for RFCOMM open.
-    /// Two seconds of scheduling margin sit above the native single
-    /// 20-second SDP/baseband/channel-open deadline.
-    const HELPER_OPEN_TIMEOUT: Duration = Duration::from_secs(22);
-
-    /// Delay before the one fresh-helper retry after a native open failure.
-    const HELPER_OPEN_RETRY_DELAY: Duration = Duration::from_secs(1);
-
-    /// Public construction performs at most two independent helper attempts.
-    const HELPER_OPEN_MAX_ATTEMPTS: u8 = 2;
-
-    /// Cold App Sandbox initialization of `IOBluetooth` can exceed five
-    /// seconds before `pairedDevices` returns. Keep the signed helper's whole
-    /// ready/list/exit cycle under the same hard ceiling as one RFCOMM open.
-    const HELPER_ENUMERATION_TIMEOUT: Duration = Duration::from_secs(22);
-
-    /// The no-radio helper packaging probe performs only process launch,
-    /// constructor dispatch, and one short pipe echo.
-    const HELPER_VALIDATION_TIMEOUT: Duration = Duration::from_secs(5);
-
-    /// Sentinel-gated native helper mode used only to validate packaging and
-    /// process/pipe lifecycle without consulting `IOBluetooth`.
-    const HELPER_ECHO_TEST_MODE: &str = "echo-v1";
-
-    /// Fixed challenge proving that both helper pipe directions are live.
-    const HELPER_VALIDATION_CHALLENGE: &[u8] = b"AZIMUTH-BT-HELPER-v1";
-
-    /// Maximum paired records accepted from one signed helper invocation.
-    const MAX_PAIRED_DEVICES: usize = 64;
-
-    /// Bluetooth names are normally limited to 248 bytes. This larger bound
-    /// tolerates framework formatting while keeping the helper payload finite.
-    const MAX_PAIRED_DISPLAY_NAME_BYTES: usize = 1024;
-
-    /// Four length bytes, one exact address, and one bounded display name per
-    /// record, followed by the four-byte terminator.
-    const MAX_PAIRED_PAYLOAD_BYTES: usize =
-        MAX_PAIRED_DEVICES * (4 + 17 + MAX_PAIRED_DISPLAY_NAME_BYTES) + 4;
-
-    /// Native helper exit for a display name shared by multiple paired radios.
-    const HELPER_EXIT_AMBIGUOUS_DEVICE_NAME: i32 = 87;
-
-    /// Native helper exit when the paired-device set exceeds the wire bound.
-    const HELPER_EXIT_TOO_MANY_PAIRED_DEVICES: i32 = 88;
-
-    /// Poll cadence for non-blocking helper pipes.
-    const PIPE_POLL_INTERVAL: Duration = Duration::from_millis(5);
-
-    /// Maximum time to reap a helper after its stdout has already reached EOF.
+impl BluetoothTransport {
+    /// Open the default TH-D75 name or an explicit name/address selector.
     ///
-    /// Pipe EOF can become observable just before `try_wait` publishes the
-    /// process exit status. Waiting briefly preserves the native exit-code 71
-    /// classification without allowing a helper that merely closed stdout to
-    /// stall construction indefinitely.
-    const HELPER_EOF_EXIT_BUDGET: Duration = Duration::from_millis(250);
-
-    /// Hard ceiling for direct transport writes when no outer radio timeout
-    /// is present. Radio operations normally cancel sooner using their own
-    /// configured command timeout.
-    const PIPE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-
-    /// POSIX guarantees atomic non-blocking pipe writes through `PIPE_BUF`;
-    /// macOS reports 512 bytes. Every TH-D75 command frame is at most 261
-    /// bytes, but chunking keeps the transport correct for arbitrary callers.
-    const MACOS_PIPE_BUF: usize = 512;
-
-    /// Healthy helpers get a short EOF-driven graceful-close opportunity
-    /// after the parent drops both pipes.
-    const GRACEFUL_EXIT_BUDGET: Duration = Duration::from_millis(600);
-
-    /// Maximum synchronous time spent checking that SIGKILL reaped the
-    /// helper. A detached waiter owns the child after this additional bound.
-    const SYNC_REAP_BUDGET: Duration = Duration::from_millis(100);
-
-    /// The radio supports one SPP connection. Preserve the prior native
-    /// transport's one-handle-per-process invariant across helper processes.
-    static HELPER_PROCESS_SLOT_RESERVED: AtomicBool = AtomicBool::new(false);
-
-    /// One paired Bluetooth device identified by its exact address.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct PairedBluetoothDevice {
-        address: String,
-        display_name: String,
-    }
-
-    impl PairedBluetoothDevice {
-        /// Canonical uppercase-hyphen address for unambiguous selection.
-        #[must_use]
-        pub fn address(&self) -> &str {
-            &self.address
-        }
-
-        /// Human-readable paired-device name for diagnostics only.
-        #[must_use]
-        pub fn display_name(&self) -> &str {
-            &self.display_name
-        }
-    }
-
-    /// Thread-safe cancellation signal for one bounded Bluetooth helper open.
+    /// An absent device or eligible fixed-channel native opening stage receives
+    /// one fresh-helper retry after one second. That stage remains eligible
+    /// when a matched failure record independently reports unconfirmed channel
+    /// cleanup and the shared transport has reaped the helper. Cleanup alone,
+    /// forced termination, launch and cancellation failures never grant a retry.
+    /// Each attempt is bounded; this does not prove CAT or radio readiness, or
+    /// cancellation of an operation still owned by the operating system.
     ///
-    /// The signal is sticky and may be requested before the helper operation
-    /// starts. Cancellable discovery and open functions check it before
-    /// launch, during readiness polling, and between transient retries.
-    #[derive(Debug, Clone, Default)]
-    pub struct BluetoothOpenCancellation {
-        requested: Arc<AtomicBool>,
+    /// # Errors
+    ///
+    /// Returns selector, helper, native-open, or cancellation failures.
+    pub fn open(device_name: Option<&str>) -> Result<Self, TransportError> {
+        Self::open_with_helper_executable(device_name, executable()?)
     }
 
-    impl BluetoothOpenCancellation {
-        /// Request cancellation. Repeated requests are harmless.
-        pub fn cancel(&self) {
-            self.requested.store(true, Ordering::Release);
-        }
-
-        /// Return whether cancellation has been requested.
-        #[must_use]
-        pub fn is_cancelled(&self) -> bool {
-            self.requested.load(Ordering::Acquire)
-        }
-
-        fn check(&self) -> Result<(), TransportError> {
-            if self.is_cancelled() {
-                Err(TransportError::BluetoothOpenInterrupted)
-            } else {
-                Ok(())
-            }
-        }
-
-        fn wait(&self, duration: Duration) -> Result<(), TransportError> {
-            let deadline = Instant::now() + duration;
-            loop {
-                self.check()?;
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Ok(());
-                }
-                std::thread::sleep(remaining.min(PIPE_POLL_INTERVAL));
-            }
-        }
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum PairedDeviceOpenPurpose {
-        Probe,
-        Selected,
-    }
-
-    impl PairedDeviceOpenPurpose {
-        const fn retries_transient_not_found(self) -> bool {
-            match self {
-                Self::Probe => false,
-                Self::Selected => true,
-            }
-        }
-    }
-
-    /// Native macOS Bluetooth transport using an isolated `IOBluetooth` helper.
-    pub struct BluetoothTransport {
-        child: Option<Child>,
-        helper_stdin: Option<ChildStdin>,
-        helper_stdout: Option<ChildStdout>,
-        /// Parent-owned write end of a dedicated liveness pipe. The helper's
-        /// watchdog exits the process if this end disappears, even when its
-        /// main thread is wedged inside `IOBluetooth`.
-        parent_liveness: Option<OwnedFd>,
-        /// Cleared synchronously by every failed/cancelled write guard and by
-        /// EOF/close, so a killed helper cannot look reusable before reap.
-        helper_healthy: bool,
-        /// Held until this helper has exited (including by the detached
-        /// reaper), preventing two helpers from competing for one SPP channel.
-        process_slot: Option<HelperProcessSlot>,
-        /// The device name or address this transport was opened with (`None`
-        /// used the default name); reopen reuses it.
-        device_name: Option<String>,
-        /// Signed executable that hosts the killable native helper. Apps in
-        /// App Sandbox use a separately signed inheriting helper; command-line
-        /// clients use their current executable.
-        helper_executable: PathBuf,
-    }
-
-    impl std::fmt::Debug for BluetoothTransport {
-        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter
-                .debug_struct("BluetoothTransport")
-                .field("helper_pid", &self.child.as_ref().map(Child::id))
-                .field("helper_healthy", &self.helper_healthy)
-                .field("device_name", &self.device_name)
-                .field("helper_executable", &self.helper_executable)
-                .finish_non_exhaustive()
-        }
-    }
-
-    fn validate_helper_executable(path: &Path) -> Result<PathBuf, TransportError> {
-        if path.is_absolute() {
-            Ok(path.to_path_buf())
-        } else {
-            Err(bluetooth_helper_error(
-                format!("validating executable path {}", path.display()),
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "Bluetooth helper executable path must be absolute",
-                ),
-            ))
-        }
-    }
-
-    fn new_helper_command(helper_executable: &Path, device_name: &str) -> Command {
-        let mut command = Command::new(helper_executable);
-        let _command = command
-            .arg("--thd75-bluetooth-helper")
-            .env(HELPER_SENTINEL_ENV, HELPER_SENTINEL_VALUE)
-            .env(HELPER_DEVICE_ENV, device_name)
-            .env(HELPER_CHANNEL_ENV, SPP_CHANNEL.to_string())
-            .env(HELPER_LIVENESS_FD_ENV, HELPER_LIVENESS_FD.to_string())
-            .env_remove(HELPER_CONTROL_ENV)
-            .env_remove(HELPER_TEST_ENV)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
-        command
-    }
-
-    fn new_helper_control_command(helper_executable: &Path, mode: &str) -> Command {
-        let mut command = Command::new(helper_executable);
-        let _command = command
-            .arg("--thd75-bluetooth-helper-control")
-            .env(HELPER_SENTINEL_ENV, HELPER_SENTINEL_VALUE)
-            .env(HELPER_CONTROL_ENV, mode)
-            .env(HELPER_LIVENESS_FD_ENV, HELPER_LIVENESS_FD.to_string())
-            .env_remove(HELPER_DEVICE_ENV)
-            .env_remove(HELPER_CHANNEL_ENV)
-            .env_remove(HELPER_TEST_ENV)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
-        command
-    }
-
-    fn new_helper_test_command(helper_executable: &Path, mode: &str) -> Command {
-        let mut command = Command::new(helper_executable);
-        let _command = command
-            .arg("--thd75-bluetooth-helper-test")
-            .env(HELPER_SENTINEL_ENV, HELPER_SENTINEL_VALUE)
-            .env(HELPER_TEST_ENV, mode)
-            .env(HELPER_LIVENESS_FD_ENV, HELPER_LIVENESS_FD.to_string())
-            .env_remove(HELPER_CONTROL_ENV)
-            .env_remove(HELPER_DEVICE_ENV)
-            .env_remove(HELPER_CHANNEL_ENV)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
-        command
-    }
-
-    fn bluetooth_helper_error(context: impl Into<String>, source: io::Error) -> TransportError {
-        TransportError::BluetoothHelper {
-            context: context.into(),
-            source,
-        }
-    }
-
-    impl BluetoothTransport {
-        /// Validate one signed helper's launch and bidirectional pipe lifecycle.
-        ///
-        /// This runs the helper's private sentinel-gated `echo-v1` mode with a
-        /// fixed challenge. It verifies constructor dispatch, readiness
-        /// framing, both pipe directions, clean exit, and bounded teardown. It
-        /// deliberately does not initialize `IOBluetooth`, enumerate paired
-        /// devices, or open a radio, so packaging validation is independent of
-        /// ambient Bluetooth state.
-        ///
-        /// # Errors
-        ///
-        /// Returns [`TransportError::BluetoothHelper`] if the path is relative,
-        /// the helper cannot launch, its readiness or echo is invalid, it does
-        /// not exit cleanly, or the five-second lifecycle bound expires.
-        pub fn validate_helper_launch_with_executable(
-            helper_executable: impl AsRef<Path>,
-        ) -> Result<(), TransportError> {
-            let helper_executable = validate_helper_executable(helper_executable.as_ref())?;
-            validate_helper_launch(&helper_executable, HELPER_VALIDATION_TIMEOUT)
-        }
-
-        /// Enumerate paired Bluetooth devices for later exact qualification.
-        ///
-        /// Discovery runs in the same isolated native helper used for RFCOMM,
-        /// but it performs no radio I/O. Each returned device carries the
-        /// exact Bluetooth address required for unambiguous later selection.
-        /// The helper invocation, record count, field sizes, and total payload
-        /// are independently bounded.
-        ///
-        /// # Errors
-        ///
-        /// Returns [`TransportError::BluetoothHelper`] if the current
-        /// executable cannot be located, the helper cannot be launched, the
-        /// discovery deadline expires, or its framed response is invalid.
-        pub fn paired_devices() -> Result<Vec<PairedBluetoothDevice>, TransportError> {
-            let executable = std::env::current_exe().map_err(|source| {
-                bluetooth_helper_error("locating the current executable", source)
-            })?;
-            Self::paired_devices_with_helper_executable(executable)
-        }
-
-        /// Enumerate paired devices through a specific signed helper.
-        ///
-        /// Sandboxed applications should pass their separately signed,
-        /// sandbox-inheriting helper executable. The path must be absolute and
-        /// the executable must contain this crate's native helper constructor.
-        /// This operation does not open RFCOMM or send any bytes to a radio.
-        ///
-        /// # Errors
-        ///
-        /// Returns [`TransportError::BluetoothHelper`] if the path or helper
-        /// lifecycle is invalid, discovery exceeds its bound, or the helper's
-        /// device framing is malformed.
-        pub fn paired_devices_with_helper_executable(
-            helper_executable: impl AsRef<Path>,
-        ) -> Result<Vec<PairedBluetoothDevice>, TransportError> {
-            Self::paired_devices_with_helper_executable_cancellable(
-                helper_executable,
-                &BluetoothOpenCancellation::default(),
-            )
-        }
-
-        /// Enumerate paired devices with synchronous cancellation.
-        ///
-        /// This has the same bounds and identity semantics as
-        /// [`Self::paired_devices_with_helper_executable`]. A sticky
-        /// cancellation request terminates an active helper and returns
-        /// [`TransportError::BluetoothOpenInterrupted`].
-        ///
-        /// # Errors
-        ///
-        /// Returns the ordinary discovery errors or
-        /// [`TransportError::BluetoothOpenInterrupted`] when cancelled.
-        pub fn paired_devices_with_helper_executable_cancellable(
-            helper_executable: impl AsRef<Path>,
-            cancellation: &BluetoothOpenCancellation,
-        ) -> Result<Vec<PairedBluetoothDevice>, TransportError> {
-            let helper_executable = validate_helper_executable(helper_executable.as_ref())?;
-            cancellation.check()?;
-            enumerate_paired_devices(&helper_executable, cancellation)
-        }
-
-        /// Probe one enumerated device by its exact address.
-        ///
-        /// A probe performs one bounded open. Callers scanning an unqualified
-        /// paired-device set must apply CAT identity checks before treating an
-        /// opened endpoint as a radio.
-        ///
-        /// # Errors
-        ///
-        /// Returns [`TransportError::BluetoothHelper`] if the signed helper
-        /// cannot be launched or prepared, and [`TransportError::NotFound`] if
-        /// this exact device does not expose the TH-D75 SPP channel.
-        pub fn probe_paired_device_with_helper_executable(
-            device: &PairedBluetoothDevice,
-            helper_executable: impl AsRef<Path>,
-        ) -> Result<Self, TransportError> {
-            Self::probe_paired_device_with_helper_executable_cancellable(
-                device,
-                helper_executable,
-                &BluetoothOpenCancellation::default(),
-            )
-        }
-
-        /// Probe one exact paired device with synchronous cancellation.
-        ///
-        /// # Errors
-        ///
-        /// Returns the ordinary probe errors or
-        /// [`TransportError::BluetoothOpenInterrupted`] when cancelled.
-        pub fn probe_paired_device_with_helper_executable_cancellable(
-            device: &PairedBluetoothDevice,
-            helper_executable: impl AsRef<Path>,
-            cancellation: &BluetoothOpenCancellation,
-        ) -> Result<Self, TransportError> {
-            let helper_executable = validate_helper_executable(helper_executable.as_ref())?;
-            cancellation.check()?;
-            Self::open_exact_paired_device(
-                device,
-                &helper_executable,
-                PairedDeviceOpenPurpose::Probe,
-                cancellation,
-            )
-        }
-
-        /// Open one selected paired device by its exact address.
-        ///
-        /// This uses the same single transient [`TransportError::NotFound`]
-        /// retry as [`Self::open_with_helper_executable`]. Callers that are
-        /// still scanning an unqualified device set should use
-        /// [`Self::probe_paired_device_with_helper_executable`] instead.
-        ///
-        /// # Errors
-        ///
-        /// Returns [`TransportError::BluetoothHelper`] if the signed helper
-        /// cannot be launched or prepared, and [`TransportError::NotFound`] if
-        /// this exact device cannot be opened in either bounded attempt.
-        pub fn open_paired_device_with_helper_executable(
-            device: &PairedBluetoothDevice,
-            helper_executable: impl AsRef<Path>,
-        ) -> Result<Self, TransportError> {
-            Self::open_paired_device_with_helper_executable_cancellable(
-                device,
-                helper_executable,
-                &BluetoothOpenCancellation::default(),
-            )
-        }
-
-        /// Open one selected exact device with synchronous cancellation.
-        ///
-        /// # Errors
-        ///
-        /// Returns the ordinary selected-device errors or
-        /// [`TransportError::BluetoothOpenInterrupted`] when cancelled.
-        pub fn open_paired_device_with_helper_executable_cancellable(
-            device: &PairedBluetoothDevice,
-            helper_executable: impl AsRef<Path>,
-            cancellation: &BluetoothOpenCancellation,
-        ) -> Result<Self, TransportError> {
-            let helper_executable = validate_helper_executable(helper_executable.as_ref())?;
-            cancellation.check()?;
-            Self::open_exact_paired_device(
-                device,
-                &helper_executable,
-                PairedDeviceOpenPurpose::Selected,
-                cancellation,
-            )
-        }
-
-        fn open_exact_paired_device(
-            device: &PairedBluetoothDevice,
-            helper_executable: &Path,
-            purpose: PairedDeviceOpenPurpose,
-            cancellation: &BluetoothOpenCancellation,
-        ) -> Result<Self, TransportError> {
-            let retry_not_found = purpose.retries_transient_not_found();
-            let max_attempts = if retry_not_found {
-                HELPER_OPEN_MAX_ATTEMPTS
-            } else {
-                1
-            };
-            open_with_not_found_retry_policy(
-                retry_not_found,
-                |attempt| {
-                    Self::open_once(
-                        Some(device.address()),
-                        helper_executable,
-                        attempt,
-                        max_attempts,
-                        cancellation,
-                    )
-                },
-                |delay| {
-                    tracing::warn!(
-                        device = %device.address(),
-                        failed_attempt = 1,
-                        next_attempt = 2,
-                        delay_ms = delay.as_millis(),
-                        "exact-address Bluetooth RFCOMM helper open returned NotFound; retrying once"
-                    );
-                    cancellation.wait(delay)
-                },
-            )
-        }
-
-        /// Connect to a TH-D75 radio through a killable Bluetooth helper.
-        ///
-        /// The helper is the current signed executable re-launched with a
-        /// private environment sentinel. An Objective-C constructor takes over
-        /// before Rust `main`, opens RFCOMM on its own main run loop, emits a
-        /// fixed readiness prefix, and then treats stdin/stdout as raw serial
-        /// byte streams. If that native attempt reports
-        /// [`TransportError::NotFound`], construction waits one second and
-        /// tries once more in a new helper. Other errors are returned without
-        /// retry. Each attempt is bounded independently, so the two-attempt
-        /// path can take about 45 seconds.
-        ///
-        /// `device_name` can be either a paired device's exact display name or
-        /// its exact Bluetooth address. An address is a strict selector and
-        /// never falls back to name matching. A display name shared by
-        /// multiple paired devices fails closed; pass the exact address to
-        /// select one of those radios.
-        ///
-        /// # Errors
-        ///
-        /// Returns [`TransportError::BluetoothHelper`] when the current
-        /// executable cannot be located or launched as a compatible helper,
-        /// [`TransportError::BluetoothDeviceNameAmbiguous`] when multiple
-        /// paired devices share the requested name, or
-        /// [`TransportError::NotFound`] when the paired device or RFCOMM
-        /// channel cannot be opened in either bounded helper attempt.
-        pub fn open(device_name: Option<&str>) -> Result<Self, TransportError> {
-            let executable = std::env::current_exe().map_err(|source| {
-                bluetooth_helper_error("locating the current executable", source)
-            })?;
-            Self::open_with_helper_executable(device_name, executable)
-        }
-
-        /// Connect using a compatible executable as the native helper.
-        ///
-        /// Sandboxed applications cannot safely re-execute their main app as
-        /// a child because the child must carry the sandbox-inheritance
-        /// entitlement and no other App Sandbox capabilities. They should
-        /// embed a minimal signed helper tool with those entitlements.
-        ///
-        /// This method does not turn an arbitrary executable into a Bluetooth
-        /// helper. The selected executable must link this crate's native
-        /// macOS helper implementation and reference `bt_helper_link_anchor`.
-        /// That reference retains the Objective-C constructor that recognizes
-        /// the private parent launch sentinel and takes control before the
-        /// helper's ordinary `main`. The executable must also support the
-        /// host's architecture and remain runnable at the same location for
-        /// the transport's lifetime.
-        ///
-        /// `helper_executable` must be absolute. Reopen operations preserve
-        /// and reuse the validated path.
-        /// Device selection follows [`Self::open`]: an exact Bluetooth address
-        /// never falls back to a display name, and a non-unique display name
-        /// is rejected.
-        ///
-        /// # Errors
-        ///
-        /// Returns [`TransportError::BluetoothHelper`] when the path is
-        /// relative, the helper cannot be started, or its readiness handshake
-        /// fails. Returns [`TransportError::BluetoothDeviceNameAmbiguous`]
-        /// when multiple paired devices share the requested name, or
-        /// [`TransportError::NotFound`] when the paired device or RFCOMM
-        /// channel cannot be opened in either bounded helper attempt.
-        pub fn open_with_helper_executable(
-            device_name: Option<&str>,
-            helper_executable: impl AsRef<Path>,
-        ) -> Result<Self, TransportError> {
-            Self::open_with_helper_executable_cancellable(
-                device_name,
-                helper_executable,
-                &BluetoothOpenCancellation::default(),
-            )
-        }
-
-        /// Connect through a specific helper with synchronous cancellation.
-        ///
-        /// The sticky cancellation signal is checked before launch, during
-        /// readiness polling, and during the transient `NotFound` retry delay.
-        /// Cancelling an active attempt terminates its helper before returning.
-        ///
-        /// # Errors
-        ///
-        /// Returns the ordinary open errors or
-        /// [`TransportError::BluetoothOpenInterrupted`] when cancelled.
-        pub fn open_with_helper_executable_cancellable(
-            device_name: Option<&str>,
-            helper_executable: impl AsRef<Path>,
-            cancellation: &BluetoothOpenCancellation,
-        ) -> Result<Self, TransportError> {
-            let name = device_name.unwrap_or(DEFAULT_DEVICE_NAME);
-            let helper_executable = validate_helper_executable(helper_executable.as_ref())?;
-            cancellation.check()?;
-            open_with_not_found_retry_policy(
-                true,
-                |attempt| {
-                    Self::open_once(
-                        device_name,
-                        &helper_executable,
-                        attempt,
-                        HELPER_OPEN_MAX_ATTEMPTS,
-                        cancellation,
-                    )
-                },
-                |delay| {
-                    tracing::warn!(
-                        device = %name,
-                        failed_attempt = 1,
-                        next_attempt = 2,
-                        delay_ms = delay.as_millis(),
-                        "Bluetooth RFCOMM helper open returned NotFound; retrying once"
-                    );
-                    cancellation.wait(delay)
-                },
-            )
-        }
-
-        /// Perform one independently bounded helper/RFCOMM open attempt.
-        fn open_once(
-            device_name: Option<&str>,
-            helper_executable: &Path,
-            attempt: u8,
-            max_attempts: u8,
-            cancellation: &BluetoothOpenCancellation,
-        ) -> Result<Self, TransportError> {
-            cancellation.check()?;
-            let name = device_name.unwrap_or(DEFAULT_DEVICE_NAME);
-            tracing::info!(
-                device = %name,
-                channel = SPP_CHANNEL,
-                attempt,
-                max_attempts,
-                "spawning Bluetooth RFCOMM helper"
-            );
-            let mut process_slot = Some(HelperProcessSlot::reserve()?);
-
-            // SAFETY: This no-argument/no-result function has no runtime side
-            // effects. The reference forces the Objective-C object containing
-            // the early helper constructor out of its static archive.
-            unsafe { bt_helper_link_anchor() };
-
-            let (helper_liveness, parent_liveness) = create_liveness_pipe()
-                .map_err(|source| bluetooth_helper_error("creating the liveness pipe", source))?;
-            let mut command = new_helper_command(helper_executable, name);
-            prepare_liveness_fd(&mut command, helper_liveness.as_raw_fd());
-            let mut child = command.spawn().map_err(|source| {
-                bluetooth_helper_error(format!("launching {}", helper_executable.display()), source)
-            })?;
-            // The child has duplicated this endpoint onto its fixed inherited
-            // descriptor. Keeping another parent-side read end would prevent
-            // EOF from proving parent death.
-            drop(helper_liveness);
-
-            let Some(helper_stdin) = child.stdin.take() else {
-                terminate_child(child, process_slot.take(), Some(parent_liveness), false);
-                return Err(helper_readiness_error(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "spawned Bluetooth helper has no stdin pipe",
-                )));
-            };
-            let Some(mut helper_stdout) = child.stdout.take() else {
-                drop(helper_stdin);
-                terminate_child(child, process_slot.take(), Some(parent_liveness), false);
-                return Err(helper_readiness_error(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "spawned Bluetooth helper has no stdout pipe",
-                )));
-            };
-
-            if let Err(source) = set_nonblocking(helper_stdin.as_raw_fd())
-                .and_then(|()| set_nonblocking(helper_stdout.as_raw_fd()))
-            {
-                tracing::warn!(
-                    device = %name,
-                    attempt,
-                    max_attempts,
-                    error = %source,
-                    "Bluetooth helper pipe setup failed"
-                );
-                drop(helper_stdin);
-                drop(helper_stdout);
-                terminate_child(child, process_slot.take(), Some(parent_liveness), false);
-                return Err(helper_readiness_error(source));
-            }
-            if let Err(error) =
-                await_helper_ready_cancellable(&mut child, &mut helper_stdout, cancellation)
-            {
-                tracing::warn!(
-                    device = %name,
-                    attempt,
-                    max_attempts,
-                    error = %error,
-                    "Bluetooth helper failed to become ready"
-                );
-                drop(helper_stdin);
-                drop(helper_stdout);
-                terminate_child(child, process_slot.take(), Some(parent_liveness), false);
-                return Err(error);
-            }
-
-            tracing::info!(
-                device = %name,
-                pid = child.id(),
-                attempt,
-                max_attempts,
-                "Bluetooth RFCOMM helper ready"
-            );
-            Ok(Self {
-                child: Some(child),
-                helper_stdin: Some(helper_stdin),
-                helper_stdout: Some(helper_stdout),
-                parent_liveness: Some(parent_liveness),
-                helper_healthy: true,
-                process_slot,
-                device_name: device_name.map(str::to_owned),
-                helper_executable: helper_executable.to_owned(),
-            })
-        }
-
-        fn terminate_helper(&mut self, graceful: bool) {
-            self.helper_healthy = false;
-            // Closing the pipes first tells a healthy helper to exit; SIGKILL
-            // below is what bounds cleanup if it is stuck inside IOBluetooth.
-            drop(self.helper_stdin.take());
-            drop(self.helper_stdout.take());
-            if let Some(child) = self.child.take() {
-                terminate_child(
-                    child,
-                    self.process_slot.take(),
-                    self.parent_liveness.take(),
-                    graceful,
-                );
-            } else {
-                drop(self.process_slot.take());
-                drop(self.parent_liveness.take());
-            }
-        }
-    }
-
-    fn validate_helper_launch(
-        helper_executable: &Path,
-        timeout: Duration,
-    ) -> Result<(), TransportError> {
-        let mut process_slot = Some(HelperProcessSlot::reserve()?);
-
-        // SAFETY: This no-argument/no-result function has no runtime side
-        // effects. The reference retains the native constructor in the signed
-        // helper executable selected by the caller.
-        unsafe { bt_helper_link_anchor() };
-
-        let (helper_liveness, parent_liveness) = create_liveness_pipe()
-            .map_err(|source| bluetooth_helper_error("creating the liveness pipe", source))?;
-        let mut command = new_helper_test_command(helper_executable, HELPER_ECHO_TEST_MODE);
-        prepare_liveness_fd(&mut command, helper_liveness.as_raw_fd());
-        let mut child = command.spawn().map_err(|source| {
-            bluetooth_helper_error(format!("launching {}", helper_executable.display()), source)
-        })?;
-        drop(helper_liveness);
-
-        let Some(helper_stdin) = child.stdin.take() else {
-            terminate_child(child, process_slot.take(), Some(parent_liveness), false);
-            return Err(helper_readiness_error(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "spawned Bluetooth helper has no stdin pipe",
-            )));
-        };
-        let Some(mut helper_stdout) = child.stdout.take() else {
-            drop(helper_stdin);
-            terminate_child(child, process_slot.take(), Some(parent_liveness), false);
-            return Err(helper_readiness_error(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "spawned Bluetooth helper has no stdout pipe",
-            )));
-        };
-        if let Err(source) = set_nonblocking(helper_stdout.as_raw_fd()) {
-            drop(helper_stdin);
-            drop(helper_stdout);
-            terminate_child(child, process_slot.take(), Some(parent_liveness), false);
-            return Err(helper_readiness_error(source));
-        }
-
-        let result = validate_helper_echo_until(
-            &mut child,
-            helper_stdin,
-            &mut helper_stdout,
-            Instant::now() + timeout,
-        );
-        drop(helper_stdout);
-        match result {
-            Ok(()) => {
-                drop(parent_liveness);
-                drop(process_slot.take());
-                Ok(())
-            }
-            Err(error) => {
-                terminate_child(child, process_slot.take(), Some(parent_liveness), false);
-                Err(error)
-            }
-        }
-    }
-
-    fn validate_helper_echo_until(
-        child: &mut Child,
-        mut stdin: ChildStdin,
-        stdout: &mut ChildStdout,
-        deadline: Instant,
-    ) -> Result<(), TransportError> {
-        let cancellation = BluetoothOpenCancellation::default();
-        await_helper_ready_until(child, stdout, deadline, &cancellation)?;
-        stdin
-            .write_all(HELPER_VALIDATION_CHALLENGE)
-            .map_err(|source| {
-                bluetooth_helper_error("writing the helper validation echo", source)
-            })?;
-        drop(stdin);
-
-        let mut echoed = Vec::with_capacity(HELPER_VALIDATION_CHALLENGE.len());
-        let mut buffer = [0_u8; 64];
-        loop {
-            match stdout.read(&mut buffer) {
-                Ok(0) => {
-                    let status = await_helper_exit_after_stdout_eof(child, &cancellation)?;
-                    if !status.success() {
-                        return Err(bluetooth_helper_error(
-                            "validating the Bluetooth helper launch",
-                            io::Error::new(
-                                io::ErrorKind::BrokenPipe,
-                                format!("Bluetooth helper exited with {status}"),
-                            ),
-                        ));
-                    }
-                    if echoed == HELPER_VALIDATION_CHALLENGE {
-                        return Ok(());
-                    }
-                    return Err(bluetooth_helper_error(
-                        "validating the Bluetooth helper echo",
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "Bluetooth helper returned an incomplete validation echo",
-                        ),
-                    ));
-                }
-                Ok(count) => {
-                    let bytes = buffer.get(..count).ok_or_else(|| {
-                        bluetooth_helper_error(
-                            "validating the Bluetooth helper echo",
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "Bluetooth helper returned an invalid echo length",
-                            ),
-                        )
-                    })?;
-                    echoed.extend_from_slice(bytes);
-                    if echoed.len() > HELPER_VALIDATION_CHALLENGE.len()
-                        || HELPER_VALIDATION_CHALLENGE.get(..echoed.len())
-                            != Some(echoed.as_slice())
-                    {
-                        return Err(bluetooth_helper_error(
-                            "validating the Bluetooth helper echo",
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "Bluetooth helper returned the wrong validation echo",
-                            ),
-                        ));
-                    }
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    if Instant::now() >= deadline {
-                        return Err(bluetooth_helper_error(
-                            "validating the Bluetooth helper launch",
-                            io::Error::new(
-                                io::ErrorKind::TimedOut,
-                                "Bluetooth helper validation timed out",
-                            ),
-                        ));
-                    }
-                    std::thread::sleep(PIPE_POLL_INTERVAL);
-                }
-                Err(source) => {
-                    return Err(bluetooth_helper_error(
-                        "reading the helper validation echo",
-                        source,
-                    ));
-                }
-            }
-        }
-    }
-
-    fn enumerate_paired_devices(
-        helper_executable: &Path,
-        cancellation: &BluetoothOpenCancellation,
-    ) -> Result<Vec<PairedBluetoothDevice>, TransportError> {
-        cancellation.check()?;
-        let mut process_slot = Some(HelperProcessSlot::reserve()?);
-
-        // SAFETY: This no-argument/no-result function has no runtime side
-        // effects. The reference retains the native constructor in the signed
-        // helper executable selected by the caller.
-        unsafe { bt_helper_link_anchor() };
-
-        let (helper_liveness, parent_liveness) = create_liveness_pipe()
-            .map_err(|source| bluetooth_helper_error("creating the liveness pipe", source))?;
-        let mut command = new_helper_control_command(helper_executable, HELPER_PAIRED_CONTROL_MODE);
-        prepare_liveness_fd(&mut command, helper_liveness.as_raw_fd());
-        let mut child = command.spawn().map_err(|source| {
-            bluetooth_helper_error(format!("launching {}", helper_executable.display()), source)
-        })?;
-        drop(helper_liveness);
-
-        let Some(mut helper_stdout) = child.stdout.take() else {
-            terminate_child(child, process_slot.take(), Some(parent_liveness), false);
-            return Err(bluetooth_helper_error(
-                "enumerating paired Bluetooth devices",
-                io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "spawned Bluetooth helper has no stdout pipe",
-                ),
-            ));
-        };
-        if let Err(source) = set_nonblocking(helper_stdout.as_raw_fd()) {
-            drop(helper_stdout);
-            terminate_child(child, process_slot.take(), Some(parent_liveness), false);
-            return Err(bluetooth_helper_error(
-                "preparing paired-device enumeration",
-                source,
-            ));
-        }
-
-        let deadline = Instant::now() + HELPER_ENUMERATION_TIMEOUT;
-        let result =
-            await_helper_ready_until(&mut child, &mut helper_stdout, deadline, cancellation)
-                .and_then(|()| {
-                    collect_paired_device_payload(
-                        &mut child,
-                        &mut helper_stdout,
-                        deadline,
-                        cancellation,
-                    )
-                })
-                .and_then(|payload| {
-                    parse_paired_device_payload(&payload).map_err(|source| {
-                        bluetooth_helper_error("parsing paired Bluetooth devices", source)
-                    })
-                });
-        drop(helper_stdout);
-
-        match result {
-            Ok(devices) => {
-                drop(parent_liveness);
-                drop(process_slot.take());
-                Ok(devices)
-            }
-            Err(error) => {
-                terminate_child(child, process_slot.take(), Some(parent_liveness), false);
-                Err(error)
-            }
-        }
-    }
-
-    fn collect_paired_device_payload(
-        child: &mut Child,
-        stdout: &mut ChildStdout,
-        deadline: Instant,
-        cancellation: &BluetoothOpenCancellation,
-    ) -> Result<Vec<u8>, TransportError> {
-        let mut payload = Vec::new();
-        let mut buffer = [0_u8; 4096];
-        loop {
-            cancellation.check()?;
-            match stdout.read(&mut buffer) {
-                Ok(0) => {
-                    let status = await_helper_exit_after_stdout_eof(child, cancellation)?;
-                    if status.success() {
-                        return Ok(payload);
-                    }
-                    let detail = match status.code() {
-                        Some(HELPER_EXIT_TOO_MANY_PAIRED_DEVICES) => format!(
-                            "paired-device enumeration exceeded the {MAX_PAIRED_DEVICES}-device safety bound"
-                        ),
-                        _ => format!("paired-device helper exited with {status}"),
-                    };
-                    return Err(bluetooth_helper_error(
-                        "enumerating paired Bluetooth devices",
-                        io::Error::new(io::ErrorKind::InvalidData, detail),
-                    ));
-                }
-                Ok(count) => {
-                    let next_length = payload.len().checked_add(count).ok_or_else(|| {
-                        bluetooth_helper_error(
-                            "enumerating paired Bluetooth devices",
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "paired-device helper payload length overflow",
-                            ),
-                        )
-                    })?;
-                    if next_length > MAX_PAIRED_PAYLOAD_BYTES {
-                        return Err(bluetooth_helper_error(
-                            "enumerating paired Bluetooth devices",
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!(
-                                    "paired-device helper payload exceeded {MAX_PAIRED_PAYLOAD_BYTES} bytes"
-                                ),
-                            ),
-                        ));
-                    }
-                    let bytes = buffer.get(..count).ok_or_else(|| {
-                        bluetooth_helper_error(
-                            "enumerating paired Bluetooth devices",
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "paired-device helper returned an invalid read length",
-                            ),
-                        )
-                    })?;
-                    payload.extend_from_slice(bytes);
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    if Instant::now() >= deadline {
-                        return Err(bluetooth_helper_error(
-                            "enumerating paired Bluetooth devices",
-                            io::Error::new(
-                                io::ErrorKind::TimedOut,
-                                format!(
-                                    "paired-device helper exceeded its {}-second deadline; macOS may be waiting for the responsible foreground app to resolve Bluetooth access",
-                                    HELPER_ENUMERATION_TIMEOUT.as_secs()
-                                ),
-                            ),
-                        ));
-                    }
-                    std::thread::sleep(PIPE_POLL_INTERVAL);
-                }
-                Err(source) => {
-                    return Err(bluetooth_helper_error(
-                        "reading paired Bluetooth devices",
-                        source,
-                    ));
-                }
-            }
-        }
-    }
-
-    fn parse_paired_device_payload(payload: &[u8]) -> io::Result<Vec<PairedBluetoothDevice>> {
-        let mut devices: Vec<PairedBluetoothDevice> = Vec::new();
-        let mut offset = 0_usize;
-        loop {
-            let (address_length, name_length, record_offset) =
-                paired_device_record_lengths(payload, offset)?;
-            offset = record_offset;
-            if address_length == 0 && name_length == 0 {
-                if offset != payload.len() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "paired-device payload contains bytes after its terminator",
-                    ));
-                }
-                return Ok(devices);
-            }
-            if address_length == 0 || name_length == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "paired-device record contains an empty field",
-                ));
-            }
-            if devices.len() >= MAX_PAIRED_DEVICES {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("paired-device payload exceeded {MAX_PAIRED_DEVICES} devices"),
-                ));
-            }
-            if address_length != 17 || name_length > MAX_PAIRED_DISPLAY_NAME_BYTES {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "paired-device record exceeds its field bounds",
-                ));
-            }
-            let record_length = address_length.checked_add(name_length).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "paired-device record length overflow",
-                )
-            })?;
-            let record_end = offset.checked_add(record_length).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "paired-device payload offset overflow",
-                )
-            })?;
-            let record = payload.get(offset..record_end).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "paired-device payload ended inside a record",
-                )
-            })?;
-            let (address_bytes, name_bytes) = record.split_at(address_length);
-            let raw_address = std::str::from_utf8(address_bytes).map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("paired-device address is not UTF-8: {error}"),
-                )
-            })?;
-            let Some(address) = canonicalize_bluetooth_address(raw_address) else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("paired-device address is not exact: {raw_address:?}"),
-                ));
-            };
-            if devices.iter().any(|device| device.address == address) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("paired-device address is duplicated: {address}"),
-                ));
-            }
-            let display_name = std::str::from_utf8(name_bytes).map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("paired-device name is not UTF-8: {error}"),
-                )
-            })?;
-            devices.push(PairedBluetoothDevice {
-                address,
-                display_name: display_name.to_owned(),
-            });
-            offset = record_end;
-        }
-    }
-
-    fn paired_device_record_lengths(
-        payload: &[u8],
-        offset: usize,
-    ) -> io::Result<(usize, usize, usize)> {
-        let header_end = offset.checked_add(4).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "paired-device record header length overflow",
-            )
-        })?;
-        let header = payload.get(offset..header_end).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "paired-device payload ended before its terminator",
-            )
-        })?;
-        let &[address_high, address_low, name_high, name_low] = header else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "paired-device record header has the wrong size",
-            ));
-        };
-        Ok((
-            usize::from(u16::from_be_bytes([address_high, address_low])),
-            usize::from(u16::from_be_bytes([name_high, name_low])),
-            header_end,
-        ))
-    }
-
-    fn is_exact_bluetooth_address(address: &str) -> bool {
-        let bytes = address.as_bytes();
-        if bytes.len() != 17 {
-            return false;
-        }
-        let mut separator = None;
-        for (index, byte) in bytes.iter().copied().enumerate() {
-            if matches!(index, 2 | 5 | 8 | 11 | 14) {
-                if !matches!(byte, b'-' | b':') {
-                    return false;
-                }
-                if let Some(expected) = separator {
-                    if byte != expected {
-                        return false;
-                    }
-                } else {
-                    separator = Some(byte);
-                }
-            } else if !byte.is_ascii_hexdigit() {
-                return false;
-            }
-        }
-        true
-    }
-
-    fn canonicalize_bluetooth_address(address: &str) -> Option<String> {
-        if !is_exact_bluetooth_address(address) {
-            return None;
-        }
-        Some(
-            address
-                .bytes()
-                .map(|byte| match byte {
-                    b':' | b'-' => '-',
-                    hexadecimal => char::from(hexadecimal.to_ascii_uppercase()),
-                })
-                .collect(),
+    /// Open through an explicit absolute signed helper executable.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors described by [`Self::open`], including invalid paths.
+    pub fn open_with_helper_executable(
+        device_name: Option<&str>,
+        helper_executable: impl AsRef<Path>,
+    ) -> Result<Self, TransportError> {
+        Self::open_with_helper_executable_cancellable(
+            device_name,
+            helper_executable,
+            &BluetoothOpenCancellation::default(),
         )
     }
 
-    impl Transport for BluetoothTransport {
-        async fn write(&mut self, data: &[u8]) -> Result<(), TransportError> {
-            if data.is_empty() {
-                return Ok(());
-            }
-            tracing::debug!(bytes = data.len(), "BT helper pipe write");
-
-            if !self.helper_healthy {
-                return Err(not_connected_write_error());
-            }
-            let Self {
-                child,
-                helper_stdin,
-                parent_liveness,
-                helper_healthy,
-                process_slot,
-                ..
-            } = self;
-            if child.is_none() || helper_stdin.is_none() {
-                return Err(not_connected_write_error());
-            }
-            let mut cancellation =
-                HelperWriteCancellation::new(child, process_slot, parent_liveness, helper_healthy);
-            let Some(helper_stdin) = helper_stdin.as_mut() else {
-                return Err(not_connected_write_error());
-            };
-            let deadline = tokio::time::Instant::now() + PIPE_WRITE_TIMEOUT;
-
-            for chunk in data.chunks(MACOS_PIPE_BUF) {
-                loop {
-                    match helper_stdin.write(chunk) {
-                        Ok(count) if count == chunk.len() => break,
-                        Ok(0) => {
-                            return Err(TransportError::Write(io::Error::new(
-                                io::ErrorKind::WriteZero,
-                                "Bluetooth helper stdin closed",
-                            )));
-                        }
-                        Ok(count) => {
-                            return Err(TransportError::Write(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!(
-                                    "non-atomic Bluetooth helper pipe write: {count}/{} bytes",
-                                    chunk.len()
-                                ),
-                            )));
-                        }
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                            if tokio::time::Instant::now() >= deadline {
-                                return Err(TransportError::Write(io::Error::new(
-                                    io::ErrorKind::TimedOut,
-                                    "Bluetooth helper stdin remained backpressured",
-                                )));
-                            }
-                            tokio::time::sleep(PIPE_POLL_INTERVAL).await;
-                        }
-                        Err(error) => return Err(TransportError::Write(error)),
-                    }
-                }
-            }
-
-            cancellation.disarm();
-            Ok(())
-        }
-
-        async fn read(&mut self, buffer: &mut [u8]) -> Result<usize, TransportError> {
-            if buffer.is_empty() {
-                return Ok(0);
-            }
-            if !self.helper_healthy {
-                return Err(not_connected_read_error());
-            }
-            loop {
-                let result = {
-                    let Some(helper_stdout) = self.helper_stdout.as_mut() else {
-                        return Err(not_connected_read_error());
-                    };
-                    helper_stdout.read(buffer)
-                };
-                match result {
-                    Ok(0) => {
-                        self.terminate_helper(false);
-                        return Err(TransportError::Read(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "Bluetooth helper exited",
-                        )));
-                    }
-                    Ok(count) => {
-                        tracing::debug!(bytes = count, "BT helper pipe read");
-                        return Ok(count);
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        tokio::time::sleep(PIPE_POLL_INTERVAL).await;
-                    }
-                    Err(error) => {
-                        self.terminate_helper(false);
-                        return Err(TransportError::Read(error));
-                    }
-                }
-            }
-        }
-
-        async fn close(&mut self) -> Result<(), TransportError> {
-            tracing::info!(pid = ?self.child.as_ref().map(Child::id), "closing Bluetooth RFCOMM helper");
-            self.terminate_helper(true);
-            Ok(())
-        }
-
-        async fn reopen(&mut self) -> Result<(), TransportError> {
-            let name = self.device_name.clone();
-            let helper_executable = self.helper_executable.clone();
-            tracing::info!(
-                device = ?name,
-                max_open_attempts = HELPER_OPEN_MAX_ATTEMPTS,
-                "reopening Bluetooth RFCOMM helper"
-            );
-            self.close().await?;
-            // Public `open` owns the one-retry policy. Calling it once here
-            // gives reopen the same two-attempt ceiling without nesting loops.
-            *self = Self::open_with_helper_executable(name.as_deref(), helper_executable)?;
-            Ok(())
-        }
-    }
-
-    impl Drop for BluetoothTransport {
-        fn drop(&mut self) {
-            self.terminate_helper(true);
-        }
-    }
-
-    /// Run one open attempt and optionally retry exactly one `NotFound` result.
+    /// Open the selected TH-D75 with sticky synchronous cancellation.
     ///
-    /// The attempt callback owns all helper cleanup before it returns. Keeping
-    /// the retry policy outside `open_once` ensures a reopen invokes the same
-    /// two-attempt bound without recursively multiplying attempts.
-    fn open_with_not_found_retry_policy<T>(
-        retry_not_found: bool,
-        mut open_attempt: impl FnMut(u8) -> Result<T, TransportError>,
-        mut wait: impl FnMut(Duration) -> Result<(), TransportError>,
-    ) -> Result<T, TransportError> {
-        match open_attempt(1) {
-            Err(TransportError::NotFound) if retry_not_found => {
-                wait(HELPER_OPEN_RETRY_DELAY)?;
-                open_attempt(HELPER_OPEN_MAX_ATTEMPTS)
-            }
-            result => result,
-        }
-    }
-
-    /// Exclusive lease for the one live RFCOMM helper this process permits.
+    /// # Errors
     ///
-    /// When synchronous reap exceeds its bound, this value moves to the
-    /// detached waiter so the slot is not released until the old process is
-    /// actually gone.
-    struct HelperProcessSlot;
-
-    impl HelperProcessSlot {
-        fn reserve() -> Result<Self, TransportError> {
-            let _previously_reserved = HELPER_PROCESS_SLOT_RESERVED
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .map_err(|_already_reserved| {
-                    tracing::warn!("refusing second Bluetooth helper while one is still live");
-                    bluetooth_helper_error(
-                        "reserving the process slot",
-                        io::Error::new(
-                            io::ErrorKind::WouldBlock,
-                            "another Bluetooth helper is still live",
-                        ),
-                    )
-                })?;
-            Ok(Self)
-        }
-    }
-
-    impl Drop for HelperProcessSlot {
-        fn drop(&mut self) {
-            HELPER_PROCESS_SLOT_RESERVED.store(false, Ordering::Release);
-        }
-    }
-
-    /// Kill-on-cancel guard for a potentially partial logical pipe write.
-    ///
-    /// Tokio timeouts cancel by dropping the transport future. If that occurs
-    /// between 512-byte chunks, leaving the helper alive could let it consume
-    /// a truncated radio command. Killing the process closes both byte streams
-    /// and makes the transport fail closed until `reopen` installs a new one.
-    struct HelperWriteCancellation<'transport> {
-        child: &'transport mut Option<Child>,
-        process_slot: &'transport mut Option<HelperProcessSlot>,
-        parent_liveness: &'transport mut Option<OwnedFd>,
-        helper_healthy: &'transport mut bool,
-        armed: bool,
-    }
-
-    impl<'transport> HelperWriteCancellation<'transport> {
-        const fn new(
-            child: &'transport mut Option<Child>,
-            process_slot: &'transport mut Option<HelperProcessSlot>,
-            parent_liveness: &'transport mut Option<OwnedFd>,
-            helper_healthy: &'transport mut bool,
-        ) -> Self {
-            Self {
-                child,
-                process_slot,
-                parent_liveness,
-                helper_healthy,
-                armed: true,
-            }
-        }
-
-        const fn disarm(&mut self) {
-            self.armed = false;
-        }
-    }
-
-    impl Drop for HelperWriteCancellation<'_> {
-        fn drop(&mut self) {
-            if self.armed {
-                *self.helper_healthy = false;
-                if let Some(child) = self.child.take() {
-                    let pid = child.id();
-                    tracing::warn!(
-                        pid,
-                        "terminating Bluetooth helper after cancelled/failed pipe write"
-                    );
-                    terminate_child(
-                        child,
-                        self.process_slot.take(),
-                        self.parent_liveness.take(),
-                        false,
-                    );
-                } else {
-                    drop(self.process_slot.take());
-                    drop(self.parent_liveness.take());
-                }
-            }
-        }
-    }
-
-    fn create_liveness_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
-        let mut read_fd = -1_i32;
-        let mut write_fd = -1_i32;
-        // SAFETY: Both pointers refer to initialized writable `i32`s. On
-        // success the native function returns two new, uniquely owned file
-        // descriptors; on failure it closes any descriptor it created.
-        if unsafe { bt_liveness_pipe_create(&raw mut read_fd, &raw mut write_fd) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if read_fd < 0 || write_fd < 0 {
-            return Err(io::Error::other(
-                "Bluetooth helper liveness pipe returned invalid descriptors",
-            ));
-        }
-        // SAFETY: Successful `bt_liveness_pipe_create` transfers one unique
-        // ownership unit for each new descriptor to this caller.
-        Ok(unsafe {
-            (
-                OwnedFd::from_raw_fd(read_fd),
-                OwnedFd::from_raw_fd(write_fd),
-            )
-        })
-    }
-
-    fn prepare_liveness_fd(command: &mut Command, source_fd: i32) {
-        // SAFETY: The closure runs after fork and before exec, and calls only
-        // the native async-signal-safe `dup2`/`fcntl` shim. `source_fd` stays
-        // open in the parent until `Command::spawn` returns. Returning an OS
-        // error aborts exec without entering Rust code in the child.
-        unsafe {
-            let _command = command.pre_exec(move || {
-                if bt_helper_prepare_liveness_fd(source_fd, HELPER_LIVENESS_FD) == 0 {
-                    Ok(())
-                } else {
-                    Err(io::Error::last_os_error())
-                }
-            });
-        }
-    }
-
-    fn set_nonblocking(fd: i32) -> io::Result<()> {
-        // SAFETY: `fd` comes directly from a live `ChildStdin` or
-        // `ChildStdout`. The native function only performs F_GETFL/F_SETFL and
-        // neither closes nor retains the descriptor.
-        if unsafe { bt_fd_set_nonblocking(fd) } == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
-    }
-
-    fn helper_readiness_error(source: io::Error) -> TransportError {
-        bluetooth_helper_error("the readiness handshake", source)
-    }
-
-    fn helper_exit_error(status: ExitStatus) -> TransportError {
-        match status.code() {
-            Some(71) => TransportError::NotFound,
-            Some(HELPER_EXIT_AMBIGUOUS_DEVICE_NAME) => TransportError::BluetoothDeviceNameAmbiguous,
-            _ => helper_readiness_error(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                format!("Bluetooth helper exited with {status}"),
-            )),
-        }
-    }
-
-    fn await_helper_exit_after_stdout_eof(
-        child: &mut Child,
+    /// Returns ordinary open failures or an explicit cancellation error.
+    pub fn open_with_helper_executable_cancellable(
+        device_name: Option<&str>,
+        helper_executable: impl AsRef<Path>,
         cancellation: &BluetoothOpenCancellation,
-    ) -> Result<ExitStatus, TransportError> {
-        let deadline = Instant::now() + HELPER_EOF_EXIT_BUDGET;
-        loop {
-            cancellation.check()?;
-            if let Some(status) = child.try_wait().map_err(helper_readiness_error)? {
-                return Ok(status);
-            }
-            if Instant::now() >= deadline {
-                return Err(helper_readiness_error(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "Bluetooth helper closed stdout but did not exit within the bounded reap window",
-                )));
-            }
-            std::thread::sleep(PIPE_POLL_INTERVAL);
-        }
+    ) -> Result<Self, TransportError> {
+        let name = device_name.unwrap_or("TH-D75");
+        let selector = match name.parse::<BluetoothAddress>() {
+            Ok(address) => BluetoothDeviceSelector::Address(address),
+            Err(_) => BluetoothDeviceSelector::Name(BluetoothDeviceName::new(name)?),
+        };
+        Self::open_selected(&selector, helper_executable.as_ref(), cancellation, true)
     }
 
-    #[cfg(test)]
-    fn await_helper_ready(
-        child: &mut Child,
-        stdout: &mut ChildStdout,
-    ) -> Result<(), TransportError> {
-        await_helper_ready_cancellable(child, stdout, &BluetoothOpenCancellation::default())
+    /// Open an exact previously enumerated device with the selected-open retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns bounded native/helper errors without substituting another address.
+    pub fn open_paired_device_with_helper_executable(
+        device: &PairedBluetoothDevice,
+        helper_executable: impl AsRef<Path>,
+    ) -> Result<Self, TransportError> {
+        Self::open_paired_device_with_helper_executable_cancellable(
+            device,
+            helper_executable,
+            &BluetoothOpenCancellation::default(),
+        )
     }
 
-    fn await_helper_ready_cancellable(
-        child: &mut Child,
-        stdout: &mut ChildStdout,
+    /// Open one exact enumerated device with cancellation and at most one retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns native/helper errors or a sticky cancellation error.
+    pub fn open_paired_device_with_helper_executable_cancellable(
+        device: &PairedBluetoothDevice,
+        helper_executable: impl AsRef<Path>,
         cancellation: &BluetoothOpenCancellation,
-    ) -> Result<(), TransportError> {
-        await_helper_ready_until(
-            child,
-            stdout,
-            Instant::now() + HELPER_OPEN_TIMEOUT,
+    ) -> Result<Self, TransportError> {
+        Self::open_selected(
+            &BluetoothDeviceSelector::Address(device.address().clone()),
+            helper_executable.as_ref(),
             cancellation,
+            true,
         )
     }
 
-    fn await_helper_ready_until(
-        child: &mut Child,
-        stdout: &mut ChildStdout,
-        deadline: Instant,
+    /// Probe one exact enumerated device with one native-open attempt only.
+    ///
+    /// # Errors
+    ///
+    /// Returns native/helper errors; successful opening is not CAT qualification.
+    pub fn probe_paired_device_with_helper_executable(
+        device: &PairedBluetoothDevice,
+        helper_executable: impl AsRef<Path>,
+    ) -> Result<Self, TransportError> {
+        Self::probe_paired_device_with_helper_executable_cancellable(
+            device,
+            helper_executable,
+            &BluetoothOpenCancellation::default(),
+        )
+    }
+
+    /// Probe one exact enumerated device with cancellation and no retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns bounded open failures or a sticky cancellation error.
+    pub fn probe_paired_device_with_helper_executable_cancellable(
+        device: &PairedBluetoothDevice,
+        helper_executable: impl AsRef<Path>,
         cancellation: &BluetoothOpenCancellation,
-    ) -> Result<(), TransportError> {
-        let mut ready = [0_u8; HELPER_READY_MAGIC.len()];
-        let mut offset = 0_usize;
-        while offset < ready.len() {
-            cancellation.check()?;
-            let remaining = ready.get_mut(offset..).ok_or_else(|| {
-                helper_readiness_error(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid helper readiness offset",
-                ))
-            })?;
-            match stdout.read(remaining) {
-                Ok(0) => {
-                    let status = await_helper_exit_after_stdout_eof(child, cancellation)?;
-                    return Err(helper_exit_error(status));
-                }
-                Ok(count) => {
-                    offset = offset.checked_add(count).ok_or_else(|| {
-                        helper_readiness_error(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "Bluetooth helper readiness length overflow",
-                        ))
-                    })?;
-                    if ready.get(..offset) != HELPER_READY_MAGIC.get(..offset) {
-                        return Err(helper_readiness_error(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "Bluetooth helper emitted an invalid readiness prefix",
-                        )));
-                    }
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    if let Some(status) = child.try_wait().map_err(helper_readiness_error)? {
-                        return Err(helper_exit_error(status));
-                    }
-                    if Instant::now() >= deadline {
-                        return Err(helper_readiness_error(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "Bluetooth helper readiness timed out",
-                        )));
-                    }
-                    std::thread::sleep(PIPE_POLL_INTERVAL);
-                }
-                Err(error) => return Err(helper_readiness_error(error)),
-            }
-        }
-
-        if &ready == HELPER_READY_MAGIC {
-            Ok(())
-        } else {
-            Err(helper_readiness_error(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Bluetooth helper emitted an invalid readiness prefix",
-            )))
-        }
+    ) -> Result<Self, TransportError> {
+        Self::open_selected(
+            &BluetoothDeviceSelector::Address(device.address().clone()),
+            helper_executable.as_ref(),
+            cancellation,
+            false,
+        )
     }
 
-    fn terminate_child(
-        mut child: Child,
-        process_slot: Option<HelperProcessSlot>,
-        mut parent_liveness: Option<OwnedFd>,
-        graceful: bool,
-    ) {
-        let pid = child.id();
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                tracing::debug!(pid, %status, "Bluetooth helper already exited");
-                return;
-            }
-            Ok(None) => {}
-            Err(error) => {
-                tracing::debug!(pid, error = %error, "Bluetooth helper initial reap failed");
-            }
-        }
-
-        if graceful {
-            let graceful_deadline = Instant::now() + GRACEFUL_EXIT_BUDGET;
-            loop {
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        tracing::debug!(pid, %status, "Bluetooth helper exited gracefully");
-                        return;
-                    }
-                    Ok(None) if Instant::now() < graceful_deadline => {
-                        std::thread::sleep(Duration::from_millis(1));
-                    }
-                    Ok(None) => break,
-                    Err(error) => {
-                        tracing::debug!(pid, error = %error, "Bluetooth helper graceful reap failed");
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Closing this endpoint makes the child's watchdog `_exit` even if
-        // its main thread is wedged in IOBluetooth. SIGKILL below provides an
-        // independent hard stop and covers helpers without a live watchdog.
-        drop(parent_liveness.take());
-        if let Err(error) = child.kill()
-            && error.kind() != io::ErrorKind::InvalidInput
-        {
-            tracing::debug!(pid, error = %error, "Bluetooth helper kill returned an error");
-        }
-
-        let deadline = Instant::now() + SYNC_REAP_BUDGET;
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    tracing::debug!(pid, %status, "Bluetooth helper reaped");
-                    return;
-                }
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                Ok(None) => break,
-                Err(error) => {
-                    tracing::debug!(pid, error = %error, "Bluetooth helper synchronous reap failed");
-                    break;
-                }
-            }
-        }
-
-        // Start the waiter before transferring `Child` into it. A failed
-        // thread spawn therefore cannot silently drop the process handle or
-        // release the one-helper slot while the process may still exist.
-        let (reaper_tx, reaper_rx) = mpsc::sync_channel::<(Child, Option<HelperProcessSlot>)>(1);
-        let reaper = std::thread::Builder::new()
-            .name(format!("thd75-bt-reaper-{pid}"))
-            .spawn(move || {
-                if let Ok((mut child, process_slot)) = reaper_rx.recv() {
-                    if let Err(error) = child.wait() {
-                        tracing::debug!(pid, error = %error, "Bluetooth helper detached reap failed");
-                    }
-                    drop(process_slot);
-                }
-            });
-        match reaper {
-            Ok(_handle) => {
-                if let Err(mpsc::SendError((mut child, process_slot))) =
-                    reaper_tx.send((child, process_slot))
-                {
-                    tracing::warn!(pid, "Bluetooth helper reaper exited before accepting child");
-                    if let Err(error) = child.wait() {
-                        tracing::debug!(pid, error = %error, "Bluetooth helper fallback reap failed");
-                    }
-                    drop(process_slot);
-                }
-            }
-            Err(error) => {
-                tracing::warn!(pid, error = %error, "could not start Bluetooth helper reaper");
-                if let Err(wait_error) = child.wait() {
-                    tracing::debug!(pid, error = %wait_error, "Bluetooth helper fallback reap failed");
-                }
-                drop(process_slot);
-            }
-        }
-    }
-
-    fn not_connected_write_error() -> TransportError {
-        TransportError::Write(io::Error::new(
-            io::ErrorKind::NotConnected,
-            "Bluetooth helper is not running",
-        ))
-    }
-
-    fn not_connected_read_error() -> TransportError {
-        TransportError::Read(io::Error::new(
-            io::ErrorKind::NotConnected,
-            "Bluetooth helper is not running",
-        ))
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use std::error::Error;
-        use std::ffi::CString;
-        use std::io::{self, Read as _, Write as _};
-        use std::os::fd::{AsRawFd as _, OwnedFd};
-        use std::os::unix::process::ExitStatusExt as _;
-        use std::path::Path;
-        use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
-        use std::time::{Duration, Instant};
-
-        use super::{
-            BluetoothOpenCancellation, BluetoothTransport, GRACEFUL_EXIT_BUDGET,
-            HELPER_CONTROL_ENV, HELPER_EOF_EXIT_BUDGET, HELPER_EXIT_AMBIGUOUS_DEVICE_NAME,
-            HELPER_LIVENESS_FD, HELPER_LIVENESS_FD_ENV, HELPER_OPEN_MAX_ATTEMPTS,
-            HELPER_OPEN_RETRY_DELAY, HELPER_READY_MAGIC, HELPER_SENTINEL_ENV,
-            HELPER_SENTINEL_VALUE, HELPER_TEST_ENV, HELPER_VALIDATION_CHALLENGE, HelperProcessSlot,
-            HelperWriteCancellation, PairedDeviceOpenPurpose, SYNC_REAP_BUDGET, TransportError,
-            await_helper_ready, await_helper_ready_cancellable,
-            bt_device_identifier_matches_display_name, bt_helper_link_anchor, create_liveness_pipe,
-            helper_exit_error, new_helper_command, open_with_not_found_retry_policy,
-            parse_paired_device_payload, prepare_liveness_fd, set_nonblocking, terminate_child,
-            validate_helper_echo_until, validate_helper_executable,
-        };
-
-        type TestResult = Result<(), Box<dyn Error>>;
-
-        #[test]
-        fn native_iobluetooth_is_confined_to_process_helper() {
-            let shim = include_str!("bluetooth_mac.m");
-            let rust = include_str!("bluetooth.rs")
-                .split_once("    #[cfg(test)]\n    mod tests")
-                .map_or(include_str!("bluetooth.rs"), |(production, _tests)| {
-                    production
-                });
-            let detached_blocking_task = ["spawn", "_blocking"].concat();
-            let in_process_write_ffi = ["bt_rfcomm", "_write"].concat();
-
-            assert!(shim.contains("__attribute__((constructor))"));
-            assert!(shim.contains("THD75_BT_HELPER_PROCESS_V1"));
-            assert!(shim.contains("THD75_BT_HELPER_TEST_MODE"));
-            assert!(shim.contains("signal(SIGINT, SIG_IGN)"));
-            assert!(shim.contains("signal(SIGQUIT, SIG_IGN)"));
-            assert!(!shim.contains("signal(SIGTERM, SIG_IGN)"));
-            assert!(shim.contains("strcmp(mode, \"paired\")"));
-            assert!(!shim.contains("paired-v"));
-            assert!(shim.contains("parent_liveness_watchdog"));
-            assert!(shim.contains("pre_ready"));
-            assert!(shim.contains("monotonic_seconds() + 20.0"));
-            assert!(shim.contains("[ctx->channel writeSync:bytes"));
-            assert!(!shim.contains("[ctx->channel writeAsync:"));
-            assert!(!shim.contains("sleep:NO]"));
-            assert!(!shim.contains("[device closeConnection]"));
-            assert!(rust.contains("std::env::current_exe()"));
-            assert!(rust.contains("open_with_helper_executable"));
-            assert!(rust.contains("validate_helper_executable"));
-            assert!(!rust.contains(&in_process_write_ffi));
-            assert!(!rust.contains(&detached_blocking_task));
-        }
-
-        #[test]
-        fn native_device_selection_keeps_exact_addresses_strict() {
-            let shim = include_str!("bluetooth_mac.m");
-            let address_match = shim.find("caseInsensitiveCompare:identifier]");
-            let name_match = shim.find("name_match_count++");
-
-            assert!(matches!(
-                (address_match, name_match),
-                (Some(address), Some(name)) if address < name
-            ));
-            assert!(shim.contains("device_identifier_is_exact_address"));
-            assert!(shim.contains("bt_device_identifier_matches_display_name("));
-            assert!(shim.contains("if (!device && exact_address_selector) return NULL;"));
-            assert!(shim.contains("if (!device && name_match_count > 1)"));
-            assert!(shim.contains("BT_HELPER_EXIT_AMBIGUOUS_DEVICE_NAME 87"));
-            assert!(shim.contains("return BT_HELPER_EXIT_AMBIGUOUS_DEVICE_NAME"));
-        }
-
-        #[test]
-        fn absent_exact_address_cannot_match_device_named_like_address() -> TestResult {
-            let exact_address = CString::new("AA-BB-CC-DD-EE-FF")?;
-            let same_display_name = CString::new("AA-BB-CC-DD-EE-FF")?;
-            let ordinary_name = CString::new("Field Radio")?;
-
-            // SAFETY: Every pointer comes from a live `CString` and remains
-            // valid for the duration of each read-only native predicate call.
-            let exact_match = unsafe {
-                bt_device_identifier_matches_display_name(
-                    exact_address.as_ptr(),
-                    same_display_name.as_ptr(),
+    fn open_selected(
+        selector: &BluetoothDeviceSelector,
+        helper_executable: &Path,
+        cancellation: &BluetoothOpenCancellation,
+        selected_retry: bool,
+    ) -> Result<Self, TransportError> {
+        let channel = RfcommChannel::new(2)?;
+        let inner = open_with_retry(
+            selected_retry,
+            || {
+                NativeBluetoothTransport::open_with_helper_executable(
+                    selector,
+                    BluetoothService::FixedChannel(channel),
+                    helper_executable,
+                    cancellation,
                 )
-            };
-            // SAFETY: Both inputs are live, NUL-terminated `CString` values.
-            let ordinary_match = unsafe {
-                bt_device_identifier_matches_display_name(
-                    ordinary_name.as_ptr(),
-                    ordinary_name.as_ptr(),
-                )
-            };
-
-            assert_eq!(exact_match, 0);
-            assert_eq!(ordinary_match, 1);
-            Ok(())
-        }
-
-        #[test]
-        fn paired_device_inventory_uses_only_address_and_name_metadata() {
-            let shim = include_str!("bluetooth_mac.m");
-            let inventory = shim
-                .split_once("static int run_control_helper")
-                .and_then(|(_, remainder)| remainder.split_once("static int run_test_helper"))
-                .map_or("", |(inventory, _)| inventory);
-
-            assert!(inventory.contains("[IOBluetoothDevice pairedDevices]"));
-            assert!(inventory.contains("write_paired_device_record(device)"));
-            assert!(!inventory.contains("device_name_looks_like_d75"));
-            assert!(!inventory.contains("tier"));
-            assert!(!inventory.contains("device_has_cached_spp_channel"));
-            assert!(!inventory.contains("performSDPQuery"));
-            assert!(!inventory.contains("getServiceRecordForUUID"));
-            assert!(!inventory.contains(".services"));
-            assert!(!inventory.contains("[device services]"));
-            assert!(!inventory.contains("getServices"));
-            assert!(!inventory.contains("openConnection"));
-            assert!(!inventory.contains("openRFCOMMChannel"));
-        }
-
-        #[test]
-        fn tui_reconnect_has_no_main_thread_response_bridge() {
-            let main = include_str!("../../../thd75-tui/src/main.rs");
-            let radio_task = include_str!("../../../thd75-tui/src/radio_task.rs");
-
-            assert!(!main.contains("CFRunLoopRunInMode"));
-            assert!(!main.contains("bt_req_rx"));
-            assert!(!radio_task.contains("recv_timeout"));
-            assert!(!radio_task.contains("BT requires main thread"));
-            assert!(radio_task.contains("tokio::task::spawn_blocking"));
-        }
-
-        #[test]
-        fn lodestar_uses_the_same_process_isolation_boundary() {
-            let swift =
-                include_str!("../../../lodestar/Shared/Transport/IOBluetoothTransport.swift");
-            let native = include_str!("../../../lodestar/Shared/Transport/IOBluetoothHelper.m");
-
-            assert!(!swift.contains("closeConnection()"));
-            assert!(!swift.contains("import IOBluetooth"));
-            assert!(!swift.contains("IOBluetoothRFCOMMChannel"));
-            assert!(swift.contains("lodestar_bt_helper_spawn"));
-            assert!(swift.contains("lodestar_bt_helper_terminate"));
-            assert!(swift.contains("BluetoothHelperPipeReader"));
-            assert!(native.contains("#include \"../../../thd75/src/transport/bluetooth_mac.m\""));
-            assert!(native.contains("F_DUPFD_CLOEXEC"));
-            assert!(native.contains("child_liveness_text"));
-            assert!(native.contains("posix_spawn("));
-            assert!(native.contains("waitpid("));
-            assert!(!native.contains("closeConnection"));
-        }
-
-        #[test]
-        fn process_slot_rejects_concurrent_helpers_and_releases_on_drop() -> TestResult {
-            let first = HelperProcessSlot::reserve()?;
-            assert!(matches!(
-                HelperProcessSlot::reserve(),
-                Err(TransportError::BluetoothHelper { .. })
-            ));
-            drop(first);
-            let after_drop = HelperProcessSlot::reserve()?;
-            drop(after_drop);
-            Ok(())
-        }
-
-        #[test]
-        fn relative_custom_helper_path_is_rejected_before_launch() -> TestResult {
-            let relative = Path::new("AzimuthBluetoothHelper");
-            let Err(TransportError::BluetoothHelper { context, source }) =
-                BluetoothTransport::open_with_helper_executable(None, relative)
-            else {
-                return Err("relative Bluetooth helper path was accepted".into());
-            };
-
-            assert!(context.contains("AzimuthBluetoothHelper"));
-            assert_eq!(source.kind(), io::ErrorKind::InvalidInput);
-            assert_eq!(
-                source.to_string(),
-                "Bluetooth helper executable path must be absolute"
-            );
-            Ok(())
-        }
-
-        #[test]
-        fn custom_helper_command_uses_exact_validated_executable() -> TestResult {
-            let helper =
-                Path::new("/Applications/Azimuth.app/Contents/MacOS/AzimuthBluetoothHelper");
-            let validated = validate_helper_executable(helper)?;
-            let command = new_helper_command(&validated, "Custom TH-D75");
-
-            assert_eq!(validated, helper);
-            assert_eq!(command.get_program(), helper.as_os_str());
-            assert!(
-                command
-                    .get_args()
-                    .any(|argument| argument == "--thd75-bluetooth-helper")
-            );
-            Ok(())
-        }
-
-        #[test]
-        fn paired_device_parser_accepts_exact_addresses_and_arbitrary_display_names() -> TestResult
-        {
-            let payload = paired_device_payload(&[
-                ("00-11-22-33-44-55", "TH-D75"),
-                ("AA:BB:CC:DD:EE:FF", "Field Radio One"),
-            ])?;
-
-            let devices = parse_paired_device_payload(&payload)?;
-
-            assert_eq!(devices.len(), 2);
-            assert_eq!(
-                devices.first().map(super::PairedBluetoothDevice::address),
-                Some("00-11-22-33-44-55")
-            );
-            assert_eq!(
-                devices.get(1).map(super::PairedBluetoothDevice::address),
-                Some("AA-BB-CC-DD-EE-FF")
-            );
-            assert_eq!(
-                devices
-                    .get(1)
-                    .map(super::PairedBluetoothDevice::display_name),
-                Some("Field Radio One")
-            );
-            Ok(())
-        }
-
-        #[test]
-        fn paired_device_probe_policy_does_not_use_device_metadata() {
-            assert!(!PairedDeviceOpenPurpose::Probe.retries_transient_not_found());
-            assert!(PairedDeviceOpenPurpose::Selected.retries_transient_not_found());
-        }
-
-        #[test]
-        fn paired_device_parser_rejects_duplicate_exact_addresses() -> TestResult {
-            let payload = paired_device_payload(&[
-                ("00-11-22-33-44-55", "First"),
-                ("00:11:22:33:44:55", "Second"),
-            ])?;
-
-            let Err(error) = parse_paired_device_payload(&payload) else {
-                return Err("duplicate Bluetooth address was accepted".into());
-            };
-
-            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-            assert!(error.to_string().contains("duplicated"));
-            Ok(())
-        }
-
-        #[test]
-        fn paired_device_parser_rejects_name_like_or_truncated_selectors() -> TestResult {
-            for address in ["TH-D75", "00-11-22-33-44", "00-11-22-33-44-GG"] {
-                let payload = paired_device_payload(&[(address, "Radio")])?;
-                let Err(error) = parse_paired_device_payload(&payload) else {
-                    return Err("non-address Bluetooth selector was accepted".into());
-                };
-                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-                assert!(
-                    error.to_string().contains("not exact")
-                        || error.to_string().contains("field bounds")
-                );
-            }
-            Ok(())
-        }
-
-        #[test]
-        fn paired_device_parser_requires_one_final_terminator() -> TestResult {
-            let mut truncated = paired_device_payload(&[("00-11-22-33-44-55", "Radio")])?;
-            truncated.truncate(truncated.len().saturating_sub(2));
-            let Err(truncated_error) = parse_paired_device_payload(&truncated) else {
-                return Err("truncated paired-device payload was accepted".into());
-            };
-            assert_eq!(truncated_error.kind(), io::ErrorKind::UnexpectedEof);
-
-            let mut trailing = paired_device_payload(&[("00-11-22-33-44-55", "Radio")])?;
-            trailing.push(0x41);
-            let Err(trailing_error) = parse_paired_device_payload(&trailing) else {
-                return Err("bytes after paired-device terminator were accepted".into());
-            };
-            assert_eq!(trailing_error.kind(), io::ErrorKind::InvalidData);
-            Ok(())
-        }
-
-        #[test]
-        fn helper_open_success_is_not_retried() -> TestResult {
-            let mut attempts = Vec::new();
-            let mut delays = Vec::new();
-            let opened = open_with_not_found_retry_policy(
-                true,
-                |attempt| {
-                    attempts.push(attempt);
-                    Ok("ready")
-                },
-                |delay| {
-                    delays.push(delay);
-                    Ok(())
-                },
-            )?;
-
-            assert_eq!(opened, "ready");
-            assert_eq!(attempts, [1]);
-            assert!(delays.is_empty());
-            Ok(())
-        }
-
-        #[test]
-        fn pre_cancelled_open_stops_before_helper_launch() {
-            let cancellation = BluetoothOpenCancellation::default();
-            cancellation.cancel();
-
-            let result = BluetoothTransport::open_with_helper_executable_cancellable(
-                None,
-                "/helper-does-not-need-to-exist",
-                &cancellation,
-            );
-
-            assert!(matches!(
-                result,
-                Err(TransportError::BluetoothOpenInterrupted)
-            ));
-        }
-
-        #[test]
-        fn cancellation_interrupts_blocked_helper_readiness() -> TestResult {
-            let mut child = Command::new("/bin/sleep")
-                .arg("30")
-                .stdout(Stdio::piped())
-                .spawn()?;
-            let mut stdout = child.stdout.take().ok_or("blocked helper has no stdout")?;
-            set_nonblocking(stdout.as_raw_fd())?;
-            let cancellation = BluetoothOpenCancellation::default();
-            let cancellation_signal = cancellation.clone();
-            let requester = std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(20));
-                cancellation_signal.cancel();
-            });
-
-            let started = Instant::now();
-            let result = await_helper_ready_cancellable(&mut child, &mut stdout, &cancellation);
-            drop(stdout);
-            terminate_child(child, None, None, false);
-            requester
-                .join()
-                .map_err(|_panic| "cancellation requester panicked")?;
-
-            assert!(matches!(
-                result,
-                Err(TransportError::BluetoothOpenInterrupted)
-            ));
-            assert!(
-                started.elapsed() < Duration::from_secs(1),
-                "blocked helper cancellation was not prompt"
-            );
-            Ok(())
-        }
-
-        #[test]
-        fn helper_validation_accepts_exact_echo_and_clean_exit() -> TestResult {
-            let mut child = Command::new("/bin/sh")
-                .args(["-c", "printf 'THD75BT-READY-v1'; /bin/cat"])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .spawn()?;
-            let stdin = child.stdin.take().ok_or("echo helper has no stdin")?;
-            let mut stdout = child.stdout.take().ok_or("echo helper has no stdout")?;
-            set_nonblocking(stdout.as_raw_fd())?;
-
-            validate_helper_echo_until(
-                &mut child,
-                stdin,
-                &mut stdout,
-                Instant::now() + Duration::from_secs(1),
-            )?;
-            assert_eq!(HELPER_VALIDATION_CHALLENGE, b"AZIMUTH-BT-HELPER-v1");
-            assert!(child.try_wait()?.is_some());
-            Ok(())
-        }
-
-        #[test]
-        fn helper_validation_timeout_is_bounded() -> TestResult {
-            let mut child = Command::new("/bin/sleep")
-                .arg("30")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .spawn()?;
-            let stdin = child.stdin.take().ok_or("blocked helper has no stdin")?;
-            let mut stdout = child.stdout.take().ok_or("blocked helper has no stdout")?;
-            set_nonblocking(stdout.as_raw_fd())?;
-
-            let started = Instant::now();
-            let result = validate_helper_echo_until(
-                &mut child,
-                stdin,
-                &mut stdout,
-                Instant::now() + Duration::from_millis(20),
-            );
-            drop(stdout);
-            terminate_child(child, None, None, false);
-
-            let Err(error) = result else {
-                return Err("blocked validation helper did not time out".into());
-            };
-            assert!(
-                error
-                    .source()
-                    .is_some_and(|source| source.to_string().contains("timed out"))
-            );
-            assert!(
-                started.elapsed() < Duration::from_secs(1),
-                "helper validation timeout exceeded its test bound"
-            );
-            Ok(())
-        }
-
-        #[test]
-        fn cancellation_interrupts_not_found_retry_delay() {
-            let cancellation = BluetoothOpenCancellation::default();
-            let mut attempts = Vec::new();
-            let result = open_with_not_found_retry_policy::<()>(
-                true,
-                |attempt| {
-                    attempts.push(attempt);
-                    Err(TransportError::NotFound)
-                },
-                |_delay| {
-                    cancellation.cancel();
-                    cancellation.wait(HELPER_OPEN_RETRY_DELAY)
-                },
-            );
-
-            assert!(matches!(
-                result,
-                Err(TransportError::BluetoothOpenInterrupted)
-            ));
-            assert_eq!(attempts, [1]);
-        }
-
-        #[test]
-        fn helper_open_retries_not_found_once_after_exact_delay() -> TestResult {
-            assert_eq!(HELPER_OPEN_MAX_ATTEMPTS, 2);
-            let mut attempts = Vec::new();
-            let mut delays = Vec::new();
-            let opened = open_with_not_found_retry_policy(
-                true,
-                |attempt| {
-                    attempts.push(attempt);
-                    if attempt == 1 {
-                        Err(TransportError::NotFound)
-                    } else {
-                        Ok("ready")
-                    }
-                },
-                |delay| {
-                    delays.push(delay);
-                    Ok(())
-                },
-            )?;
-
-            assert_eq!(opened, "ready");
-            assert_eq!(attempts, [1, HELPER_OPEN_MAX_ATTEMPTS]);
-            assert_eq!(delays, [HELPER_OPEN_RETRY_DELAY]);
-            Ok(())
-        }
-
-        #[test]
-        fn selected_exact_address_recovers_from_one_transient_not_found() -> TestResult {
-            let device = parse_paired_device_payload(&paired_device_payload(&[(
-                "00-11-22-33-44-55",
-                "Field Control",
-            )])?)?
-            .into_iter()
-            .next()
-            .ok_or("paired-device payload was unexpectedly empty")?;
-            let retry_not_found = PairedDeviceOpenPurpose::Selected.retries_transient_not_found();
-            let mut attempts = Vec::new();
-            let mut delays = Vec::new();
-
-            let opened = open_with_not_found_retry_policy(
-                retry_not_found,
-                |attempt| {
-                    attempts.push(attempt);
-                    if attempt == 1 {
-                        Err(TransportError::NotFound)
-                    } else {
-                        Ok(device.address())
-                    }
-                },
-                |delay| {
-                    delays.push(delay);
-                    Ok(())
-                },
-            )?;
-
-            assert_eq!(opened, "00-11-22-33-44-55");
-            assert_eq!(attempts, [1, HELPER_OPEN_MAX_ATTEMPTS]);
-            assert_eq!(delays, [HELPER_OPEN_RETRY_DELAY]);
-            Ok(())
-        }
-
-        #[test]
-        fn helper_probe_policy_does_not_retry_an_unqualified_device() {
-            let mut attempts = Vec::new();
-            let mut delays = Vec::new();
-            let result = open_with_not_found_retry_policy::<()>(
-                false,
-                |attempt| {
-                    attempts.push(attempt);
-                    Err(TransportError::NotFound)
-                },
-                |delay| {
-                    delays.push(delay);
-                    Ok(())
-                },
-            );
-
-            assert!(matches!(result, Err(TransportError::NotFound)));
-            assert_eq!(attempts, [1]);
-            assert!(delays.is_empty());
-        }
-
-        #[test]
-        fn helper_open_does_not_retry_non_71_helper_exit() {
-            let mut attempts = Vec::new();
-            let mut delays = Vec::new();
-            let result = open_with_not_found_retry_policy::<()>(
-                true,
-                |attempt| {
-                    attempts.push(attempt);
-                    Err(helper_exit_error(ExitStatus::from_raw(72 << 8)))
-                },
-                |delay| {
-                    delays.push(delay);
-                    Ok(())
-                },
-            );
-
-            assert!(matches!(
-                result,
-                Err(TransportError::BluetoothHelper { .. })
-            ));
-            assert_eq!(attempts, [1]);
-            assert!(delays.is_empty());
-        }
-
-        #[test]
-        fn helper_open_returns_second_not_found_without_a_third_attempt() {
-            let mut attempts = Vec::new();
-            let mut delays = Vec::new();
-            let result = open_with_not_found_retry_policy::<()>(
-                true,
-                |attempt| {
-                    attempts.push(attempt);
-                    Err(TransportError::NotFound)
-                },
-                |delay| {
-                    delays.push(delay);
-                    Ok(())
-                },
-            );
-
-            assert!(matches!(result, Err(TransportError::NotFound)));
-            assert_eq!(attempts, [1, HELPER_OPEN_MAX_ATTEMPTS]);
-            assert_eq!(delays, [HELPER_OPEN_RETRY_DELAY]);
-        }
-
-        #[test]
-        fn only_helper_exit_code_71_is_retryable_not_found() {
-            let retryable = helper_exit_error(ExitStatus::from_raw(71 << 8));
-            assert!(matches!(retryable, TransportError::NotFound));
-
-            for raw_status in [0, 72 << 8, 74 << 8, 9] {
-                let non_retryable = helper_exit_error(ExitStatus::from_raw(raw_status));
-                assert!(
-                    matches!(non_retryable, TransportError::BluetoothHelper { .. }),
-                    "raw wait status {raw_status} was unexpectedly retryable"
-                );
-            }
-        }
-
-        #[test]
-        fn ambiguous_device_name_exit_is_actionable_and_not_retried() {
-            let raw_status = HELPER_EXIT_AMBIGUOUS_DEVICE_NAME << 8;
-            let error = helper_exit_error(ExitStatus::from_raw(raw_status));
-            let message = error.to_string();
-            assert!(matches!(
-                error,
-                TransportError::BluetoothDeviceNameAmbiguous
-            ));
-            assert!(message.contains("exact Bluetooth address"));
-
-            let mut attempts = Vec::new();
-            let mut delays = Vec::new();
-            let result = open_with_not_found_retry_policy::<()>(
-                true,
-                |attempt| {
-                    attempts.push(attempt);
-                    Err(helper_exit_error(ExitStatus::from_raw(raw_status)))
-                },
-                |delay| {
-                    delays.push(delay);
-                    Ok(())
-                },
-            );
-            assert!(matches!(
-                result,
-                Err(TransportError::BluetoothDeviceNameAmbiguous)
-            ));
-            assert_eq!(attempts, [1]);
-            assert!(delays.is_empty());
-        }
-
-        #[test]
-        fn stdout_eof_waits_boundedly_for_delayed_exit_71() -> TestResult {
-            let mut child = Command::new("/bin/sh")
-                .args(["-c", "exec 1>&-; /bin/sleep 0.02; exit 71"])
-                .stdout(Stdio::piped())
-                .spawn()?;
-            let mut stdout = child
-                .stdout
-                .take()
-                .ok_or("delayed-exit helper has no stdout")?;
-            let started = Instant::now();
-            let Err(error) = await_helper_ready(&mut child, &mut stdout) else {
-                return Err("helper unexpectedly reported readiness".into());
-            };
-
-            assert!(matches!(error, TransportError::NotFound));
-            assert!(
-                started.elapsed() < HELPER_EOF_EXIT_BUDGET,
-                "delayed helper exit exceeded EOF reap budget"
-            );
-            Ok(())
-        }
-
-        #[test]
-        fn partial_invalid_readiness_is_open_even_when_helper_exits_71() -> TestResult {
-            let mut child = Command::new("/bin/sh")
-                .args(["-c", "printf BAD; exit 71"])
-                .stdout(Stdio::piped())
-                .spawn()?;
-            let mut stdout = child
-                .stdout
-                .take()
-                .ok_or("invalid-prefix helper has no stdout")?;
-            let Err(error) = await_helper_ready(&mut child, &mut stdout) else {
-                return Err("helper unexpectedly accepted an invalid prefix".into());
-            };
-            let _status = child.wait()?;
-
-            assert!(matches!(error, TransportError::BluetoothHelper { .. }));
-            Ok(())
-        }
-
-        #[test]
-        fn current_executable_helper_constructor_is_raw_echo_stream() -> TestResult {
-            let (mut child, mut stdin, mut stdout, parent_liveness) =
-                spawn_native_test_helper("echo-v1")?;
-            let mut ready = [0_u8; HELPER_READY_MAGIC.len()];
-            stdout.read_exact(&mut ready)?;
-            assert_eq!(&ready, HELPER_READY_MAGIC);
-
-            let payload = b"ID\rW 0000\r\0binary";
-            stdin.write_all(payload)?;
-            drop(stdin);
-            let mut echoed = Vec::new();
-            let _ = stdout.read_to_end(&mut echoed)?;
-            let status = child.wait()?;
-            drop(parent_liveness);
-            assert!(status.success());
-            assert_eq!(&echoed, payload);
-            Ok(())
-        }
-
-        #[test]
-        fn interactive_sigint_does_not_kill_the_radio_helper() -> TestResult {
-            let (mut child, mut stdin, mut stdout, parent_liveness) =
-                spawn_native_test_helper("echo-v1")?;
-            let mut ready = [0_u8; HELPER_READY_MAGIC.len()];
-            stdout.read_exact(&mut ready)?;
-            assert_eq!(&ready, HELPER_READY_MAGIC);
-
-            let signal = Command::new("/bin/kill")
-                .args(["-INT", &child.id().to_string()])
-                .output()?;
-            assert!(
-                signal.status.success(),
-                "failed to signal helper: {signal:?}"
-            );
-            assert!(
-                child.try_wait()?.is_none(),
-                "the helper inherited the terminal's default SIGINT action"
-            );
-
-            let payload = b"still-connected";
-            stdin.write_all(payload)?;
-            drop(stdin);
-            let mut echoed = Vec::new();
-            let _ = stdout.read_to_end(&mut echoed)?;
-            let status = child.wait()?;
-            drop(parent_liveness);
-            assert!(status.success());
-            assert_eq!(echoed, payload);
-            Ok(())
-        }
-
-        #[test]
-        fn wedged_current_executable_helper_is_bounded_and_reaped() -> TestResult {
-            let (child, stdin, mut stdout, parent_liveness) = spawn_native_test_helper("hang-v1")?;
-            let pid = child.id();
-            let mut ready = [0_u8; HELPER_READY_MAGIC.len()];
-            stdout.read_exact(&mut ready)?;
-            assert_eq!(&ready, HELPER_READY_MAGIC);
-            drop(stdin);
-            drop(stdout);
-
-            let started = Instant::now();
-            terminate_child(child, None, Some(parent_liveness), true);
-            let elapsed = started.elapsed();
-            let bounded_teardown =
-                GRACEFUL_EXIT_BUDGET + SYNC_REAP_BUDGET + Duration::from_millis(250);
-            assert!(
-                elapsed < bounded_teardown,
-                "wedged helper teardown took {elapsed:?}, expected less than {bounded_teardown:?}"
-            );
-
-            let probe = Command::new("/bin/kill")
-                .args(["-0", &pid.to_string()])
-                .output()?;
-            assert!(!probe.status.success());
-            Ok(())
-        }
-
-        #[test]
-        fn parent_liveness_eof_exits_even_wedged_helper() -> TestResult {
-            let (mut child, stdin, mut stdout, parent_liveness) =
-                spawn_native_test_helper("hang-v1")?;
-            let mut ready = [0_u8; HELPER_READY_MAGIC.len()];
-            stdout.read_exact(&mut ready)?;
-            assert_eq!(&ready, HELPER_READY_MAGIC);
-
-            drop(parent_liveness);
-            let deadline = Instant::now() + Duration::from_secs(1);
-            loop {
-                if child.try_wait()?.is_some() {
-                    drop(stdin);
-                    drop(stdout);
-                    return Ok(());
-                }
-                if Instant::now() >= deadline {
-                    drop(stdin);
-                    drop(stdout);
-                    drop(child.kill());
-                    drop(child.wait());
-                    return Err("helper watchdog did not observe parent liveness EOF".into());
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        }
-
-        #[test]
-        fn cancelled_write_guard_kills_helper_process() -> TestResult {
-            let child = Command::new("/bin/sleep").arg("30").spawn()?;
-            let pid = child.id();
-            let mut child = Some(child);
-            let mut process_slot = None;
-            let mut parent_liveness = None;
-            let mut helper_healthy = true;
-            {
-                let _guard = HelperWriteCancellation::new(
-                    &mut child,
-                    &mut process_slot,
-                    &mut parent_liveness,
-                    &mut helper_healthy,
-                );
-            }
-            assert!(!helper_healthy);
-            assert!(child.is_none());
-
-            let deadline = Instant::now() + Duration::from_secs(1);
-            loop {
-                let probe = Command::new("/bin/kill")
-                    .args(["-0", &pid.to_string()])
-                    .output()?;
-                if !probe.status.success() {
-                    return Ok(());
-                }
-                if Instant::now() >= deadline {
-                    return Err("cancelled write guard did not kill helper".into());
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        }
-
-        #[test]
-        fn completed_write_guard_leaves_helper_running() -> TestResult {
-            let child = Command::new("/bin/sleep").arg("30").spawn()?;
-            let mut child = Some(child);
-            let mut process_slot = None;
-            let mut parent_liveness = None;
-            let mut helper_healthy = true;
-            {
-                let mut guard = HelperWriteCancellation::new(
-                    &mut child,
-                    &mut process_slot,
-                    &mut parent_liveness,
-                    &mut helper_healthy,
-                );
-                guard.disarm();
-            }
-            assert!(helper_healthy);
-            let mut child = child.ok_or("completed write guard lost helper")?;
-            assert!(child.try_wait()?.is_none());
-            child.kill()?;
-            let _ = child.wait()?;
-            Ok(())
-        }
-
-        fn spawn_native_test_helper(
-            mode: &str,
-        ) -> Result<(Child, ChildStdin, ChildStdout, OwnedFd), Box<dyn Error>> {
-            // SAFETY: No arguments or runtime behavior; this only anchors the
-            // Objective-C constructor's object file in the test executable.
-            unsafe { bt_helper_link_anchor() };
-            let executable = std::env::current_exe()?;
-            let (helper_liveness, parent_liveness) = create_liveness_pipe()?;
-            let mut command = Command::new(executable);
-            let _command = command
-                .arg("--thd75-bluetooth-helper-test")
-                .env(HELPER_SENTINEL_ENV, HELPER_SENTINEL_VALUE)
-                .env(HELPER_TEST_ENV, mode)
-                .env(HELPER_LIVENESS_FD_ENV, HELPER_LIVENESS_FD.to_string())
-                .env_remove(HELPER_CONTROL_ENV)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::inherit());
-            prepare_liveness_fd(&mut command, helper_liveness.as_raw_fd());
-            let mut child = command.spawn()?;
-            drop(helper_liveness);
-            let stdin = child
-                .stdin
-                .take()
-                .ok_or_else(|| io::Error::other("native Bluetooth test helper has no stdin"))?;
-            let stdout = child
-                .stdout
-                .take()
-                .ok_or_else(|| io::Error::other("native Bluetooth test helper has no stdout"))?;
-            Ok((child, stdin, stdout, parent_liveness))
-        }
-
-        fn paired_device_payload(records: &[(&str, &str)]) -> Result<Vec<u8>, Box<dyn Error>> {
-            let mut payload = Vec::new();
-            for (address, name) in records {
-                let address_length = u16::try_from(address.len())?;
-                let name_length = u16::try_from(name.len())?;
-                payload.extend_from_slice(&address_length.to_be_bytes());
-                payload.extend_from_slice(&name_length.to_be_bytes());
-                payload.extend_from_slice(address.as_bytes());
-                payload.extend_from_slice(name.as_bytes());
-            }
-            payload.extend_from_slice(&[0, 0, 0, 0]);
-            Ok(payload)
-        }
+            },
+            || wait_retry(cancellation),
+        )?;
+        Ok(Self {
+            address: inner.address().clone(),
+            inner,
+            helper_executable: helper_executable.to_owned(),
+        })
     }
 }
 
-#[cfg(any(target_os = "macos", all(doc, unix)))]
-pub use inner::{BluetoothOpenCancellation, BluetoothTransport, PairedBluetoothDevice};
+impl Transport for BluetoothTransport {
+    async fn write(&mut self, bytes: &[u8]) -> Result<(), TransportError> {
+        self.inner.write(bytes).await
+    }
+
+    async fn read(&mut self, bytes: &mut [u8]) -> Result<usize, TransportError> {
+        self.inner.read(bytes).await
+    }
+
+    async fn close(&mut self) -> Result<(), TransportError> {
+        self.inner.close().await
+    }
+
+    async fn reopen(&mut self) -> Result<(), TransportError> {
+        let closed = self.close().await;
+        *self = reopen_after_cleanup(
+            &self.address,
+            &self.helper_executable,
+            closed,
+            |selector, helper| {
+                Self::open_selected(
+                    selector,
+                    helper,
+                    &BluetoothOpenCancellation::default(),
+                    true,
+                )
+            },
+        )?;
+        Ok(())
+    }
+}
+
+fn reopen_after_cleanup<T>(
+    address: &BluetoothAddress,
+    helper: &Path,
+    closed: Result<(), TransportError>,
+    open: impl FnOnce(&BluetoothDeviceSelector, &Path) -> Result<T, TransportError>,
+) -> Result<T, TransportError> {
+    // A successful initial name/default selection becomes exact address
+    // ownership. Recovery can never reinterpret a reassigned display name.
+    let selector = BluetoothDeviceSelector::Address(address.clone());
+    if let Err(error) = closed {
+        if !matches!(error, TransportError::BluetoothClose { .. }) {
+            return Err(error);
+        }
+        // Forced termination does not prove native close, but this explicit
+        // model recovery may try again. The shared helper lease still refuses
+        // any fresh launch until the previous helper has actually been reaped.
+        tracing::warn!(error = %error, selector = selector.as_str(),
+            "reopening TH-D75 endpoint after unconfirmed native cleanup");
+    }
+    open(&selector, helper)
+}
+
+fn executable() -> Result<PathBuf, TransportError> {
+    std::env::current_exe().map_err(|source| TransportError::BluetoothHelper {
+        context: "locating the current executable".to_owned(),
+        source,
+    })
+}
+
+fn wait_retry(cancellation: &BluetoothOpenCancellation) -> Result<(), TransportError> {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(TransportError::BluetoothOpenInterrupted);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(5)));
+    }
+}
+
+fn open_with_retry<T>(
+    selected_retry: bool,
+    mut open: impl FnMut() -> Result<T, TransportError>,
+    wait: impl FnOnce() -> Result<(), TransportError>,
+) -> Result<T, TransportError> {
+    match open() {
+        Err(error) if selected_retry && fixed_channel_retry_eligible(&error) => {
+            tracing::warn!(error = %error,
+                "TH-D75 selected Bluetooth open failed; waiting before one fresh-helper retry");
+            wait()?;
+            open()
+        }
+        result => result,
+    }
+}
+
+// Keep the model's established one-retry admission as shared diagnostics gain
+// more precise stages. Service resolution belongs only to fresh-SDP selectors,
+// never this model's fixed-channel opening policy. A combined failure preserves
+// the original stage only after the shared transport has reaped its helper.
+const fn fixed_channel_retry_eligible(error: &TransportError) -> bool {
+    let stage = match error {
+        TransportError::NotFound => return true,
+        TransportError::BluetoothOpen { stage }
+        | TransportError::BluetoothOpenWithCleanup {
+            stage,
+            cleanup: BluetoothCloseFailure::ChannelUnconfirmed,
+        } => stage,
+        _ => return false,
+    };
+    matches!(
+        stage,
+        BluetoothOpenStage::ContextAllocation
+            | BluetoothOpenStage::SdpStart
+            | BluetoothOpenStage::SdpCompletion
+            | BluetoothOpenStage::SdpDeadline
+            | BluetoothOpenStage::RfcommStart
+            | BluetoothOpenStage::RfcommCompletion
+            | BluetoothOpenStage::RfcommDeadline
+            | BluetoothOpenStage::RfcommEndpoint
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[tokio::test]
+    async fn framed_native_cleanup_retries_selected_open_but_not_probe() -> TestResult {
+        use kenwood_transport::error::BluetoothCloseFailure;
+        // This is the only fixture in this test module that reserves the real
+        // process-global helper lease. Its two cases run serially through reap.
+        for selected_retry in [true, false] {
+            let fixture = FailureHelperFixture::new()?;
+            let selector = BluetoothDeviceSelector::Address("00-11-22-33-44-55".parse()?);
+            let result = BluetoothTransport::open_selected(
+                &selector,
+                &fixture.helper,
+                &BluetoothOpenCancellation::default(),
+                selected_retry,
+            );
+            if selected_retry {
+                let mut transport = result?;
+                assert_eq!(transport.address.as_str(), selector.as_str());
+                transport.close().await?;
+                assert_eq!(
+                    std::fs::read_to_string(&fixture.launches)?,
+                    "launch\nlaunch\n"
+                );
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(TransportError::BluetoothOpenWithCleanup {
+                        stage: BluetoothOpenStage::RfcommDeadline,
+                        cleanup: BluetoothCloseFailure::ChannelUnconfirmed,
+                    })
+                ));
+                assert_eq!(std::fs::read_to_string(&fixture.launches)?, "launch\n");
+            }
+        }
+        Ok(())
+    }
+
+    /// Executable protocol fixture; no native or Bluetooth APIs are linked.
+    struct FailureHelperFixture {
+        directory: PathBuf,
+        helper: PathBuf,
+        launches: PathBuf,
+        first: PathBuf,
+    }
+
+    impl FailureHelperFixture {
+        fn new() -> Result<Self, Box<dyn std::error::Error>> {
+            use std::io::Write as _;
+            use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "kenwood-d75-open-failure-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
+            let fixture = Self {
+                helper: directory.join("helper"),
+                launches: directory.join("helper.launches"),
+                first: directory.join("helper.first"),
+                directory,
+            };
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o700)
+                .open(&fixture.helper)?;
+            file.write_all(
+                br#"#!/bin/sh
+[ "$#" -eq 1 ] && [ "$1" = '--kenwood-bluetooth-helper' ] || exit 122
+[ "$KENWOOD_BT_HELPER_PROCESS_V2" = '4d7f29c8b35a' ] || exit 122
+[ "$KENWOOD_BT_HELPER_DEVICE" = '00-11-22-33-44-55' ] || exit 122
+[ "$KENWOOD_BT_HELPER_CHANNEL" = '2' ] || exit 122
+[ "$KENWOOD_BT_HELPER_LIVENESS_FD" = '3' ] || exit 122
+printf 'launch\n' >> "$0.launches"
+if [ ! -f "$0.first" ]; then
+    : > "$0.first"
+    printf 'KENWBT-ERROR-v1!\153\001'
+    exit 89
+fi
+printf 'KENWBT-READY-v2!00-11-22-33-44-55\002'
+if IFS= read -r unexpected; then exit 123; fi
+exit 0
+"#,
+            )?;
+            Ok(fixture)
+        }
+    }
+
+    impl Drop for FailureHelperFixture {
+        fn drop(&mut self) {
+            let _helper = std::fs::remove_file(&self.helper);
+            let _launches = std::fs::remove_file(&self.launches);
+            let _first = std::fs::remove_file(&self.first);
+            let _directory = std::fs::remove_dir(&self.directory);
+        }
+    }
+
+    #[test]
+    fn fixed_channel_native_stages_preserve_selected_retry_but_never_probe_retry() {
+        use kenwood_transport::error::BluetoothOpenStage;
+        for stage in [
+            BluetoothOpenStage::ContextAllocation,
+            BluetoothOpenStage::SdpStart,
+            BluetoothOpenStage::SdpCompletion,
+            BluetoothOpenStage::SdpDeadline,
+            BluetoothOpenStage::RfcommStart,
+            BluetoothOpenStage::RfcommCompletion,
+            BluetoothOpenStage::RfcommDeadline,
+            BluetoothOpenStage::RfcommEndpoint,
+        ] {
+            for retry in [false, true] {
+                let mut attempts = 0;
+                let mut waits = 0;
+                let result = open_with_retry::<()>(
+                    retry,
+                    || {
+                        attempts += 1;
+                        Err(TransportError::BluetoothOpen { stage })
+                    },
+                    || {
+                        waits += 1;
+                        Ok(())
+                    },
+                );
+                assert!(
+                    matches!(result, Err(TransportError::BluetoothOpen { stage: actual }) if actual == stage)
+                );
+                assert_eq!(attempts, if retry { 2 } else { 1 });
+                assert_eq!(waits, usize::from(retry));
+            }
+        }
+    }
+
+    #[test]
+    fn combined_cleanup_does_not_broaden_retry_authority() {
+        for (stage, cleanup) in [
+            (
+                BluetoothOpenStage::StartupDeadline,
+                BluetoothCloseFailure::ChannelUnconfirmed,
+            ),
+            (
+                BluetoothOpenStage::ServiceResolution,
+                BluetoothCloseFailure::ChannelUnconfirmed,
+            ),
+            (
+                BluetoothOpenStage::RfcommDeadline,
+                BluetoothCloseFailure::ForcedTermination,
+            ),
+            (
+                BluetoothOpenStage::RfcommDeadline,
+                BluetoothCloseFailure::ReapPending,
+            ),
+            (
+                BluetoothOpenStage::RfcommDeadline,
+                BluetoothCloseFailure::HelperExited { code: Some(89) },
+            ),
+        ] {
+            let mut attempts = 0;
+            let result = open_with_retry::<()>(
+                true,
+                || {
+                    attempts += 1;
+                    Err(TransportError::BluetoothOpenWithCleanup { stage, cleanup })
+                },
+                || Err(TransportError::NotFound),
+            );
+            assert!(
+                matches!(result, Err(TransportError::BluetoothOpenWithCleanup {
+                stage: actual_stage, cleanup: actual_cleanup,
+            }) if actual_stage == stage && actual_cleanup == cleanup)
+            );
+            assert_eq!(attempts, 1);
+        }
+    }
+
+    #[test]
+    fn recovery_preserves_exact_selector_and_helper_after_unproved_cleanup() -> TestResult {
+        use kenwood_transport::error::BluetoothCloseFailure;
+        let address: BluetoothAddress = "00-11-22-33-44-55".parse()?;
+        let selector = BluetoothDeviceSelector::Address(address.clone());
+        let helper = Path::new("/absolute/qualified-helper");
+        let recovered = reopen_after_cleanup(
+            &address,
+            helper,
+            Err(TransportError::BluetoothClose {
+                failure: BluetoothCloseFailure::ForcedTermination,
+            }),
+            |actual, executable| {
+                assert_eq!(actual, &selector);
+                assert_eq!(executable, helper);
+                Ok(42)
+            },
+        )?;
+        assert_eq!(recovered, 42);
+        let busy = reopen_after_cleanup::<()>(
+            &address,
+            helper,
+            Err(TransportError::BluetoothClose {
+                failure: BluetoothCloseFailure::ReapPending,
+            }),
+            |_, _| {
+                Err(TransportError::BluetoothHelper {
+                    context: "reserving the process slot".to_owned(),
+                    source: std::io::Error::from(std::io::ErrorKind::WouldBlock),
+                })
+            },
+        );
+        assert!(
+            matches!(busy, Err(TransportError::BluetoothHelper { source, .. }) if source.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn selected_open_retries_once_but_probe_and_other_errors_do_not() -> TestResult {
+        for retry in [false, true] {
+            let mut attempts = 0;
+            let mut waits = 0;
+            let result = open_with_retry::<()>(
+                retry,
+                || {
+                    attempts += 1;
+                    Err(TransportError::NotFound)
+                },
+                || {
+                    waits += 1;
+                    Ok(())
+                },
+            );
+            assert!(matches!(result, Err(TransportError::NotFound)));
+            assert_eq!(attempts, if retry { 2 } else { 1 });
+            assert_eq!(waits, usize::from(retry));
+        }
+        for error in [
+            TransportError::BluetoothDeviceNameAmbiguous,
+            TransportError::BluetoothOpenInterrupted,
+            TransportError::BluetoothOpen {
+                stage: BluetoothOpenStage::ServiceResolution,
+            },
+            TransportError::BluetoothClose {
+                failure: BluetoothCloseFailure::ChannelUnconfirmed,
+            },
+        ] {
+            let mut attempts = 0;
+            let mut original = Some(error);
+            let result = open_with_retry::<()>(
+                true,
+                || {
+                    attempts += 1;
+                    Err(original.take().unwrap_or(TransportError::NotFound))
+                },
+                || Err(TransportError::NotFound),
+            );
+            assert!(result.is_err());
+            assert_eq!(attempts, 1);
+        }
+        let mut attempts = 0;
+        let result = open_with_retry(
+            true,
+            || {
+                attempts += 1;
+                if attempts == 1 {
+                    Err(TransportError::NotFound)
+                } else {
+                    Ok(42)
+                }
+            },
+            || Ok(()),
+        )?;
+        assert_eq!(result, 42);
+        assert_eq!(attempts, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn success_never_waits_and_cancellation_during_retry_prevents_second_open() -> TestResult {
+        let mut waits = 0;
+        assert_eq!(
+            open_with_retry(
+                true,
+                || Ok(42),
+                || {
+                    waits += 1;
+                    Ok(())
+                }
+            )?,
+            42
+        );
+        assert_eq!(waits, 0);
+        let cancellation = BluetoothOpenCancellation::default();
+        let mut attempts = 0;
+        let result = open_with_retry::<()>(
+            true,
+            || {
+                attempts += 1;
+                Err(TransportError::NotFound)
+            },
+            || {
+                cancellation.cancel();
+                wait_retry(&cancellation)
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(TransportError::BluetoothOpenInterrupted)
+        ));
+        assert_eq!(attempts, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn default_and_exact_device_opens_remain_cancellable_before_launch() {
+        let cancellation = BluetoothOpenCancellation::default();
+        cancellation.cancel();
+        for selector in [None, Some("00-11-22-33-44-55"), Some("Field Radio")] {
+            let result = BluetoothTransport::open_with_helper_executable_cancellable(
+                selector,
+                "/nonexistent/kenwood-helper",
+                &cancellation,
+            );
+            assert!(matches!(
+                result,
+                Err(TransportError::BluetoothOpenInterrupted)
+            ));
+        }
+    }
+}
