@@ -9,7 +9,7 @@ changes radio routing, or reopens a connection.
 | Feature selection | Entry point | Responsibility |
 | --- | --- | --- |
 | Default (`runtime`) | `AsyncModem::spawn` | Spawned modem loop, raw events, status polling, and bounded TX queues |
-| `default-features = false`, `features = ["probe"]` | `probe::probe_version` | One bounded version exchange; no spawned modem loop |
+| `default-features = false`, `features = ["probe"]` | `probe::probe_version`, `probe::probe_diagnostics` | Bounded version or version/status queries; no spawned modem loop |
 | `features = ["dstar"]` | `dstar::DstarModem::initialize` | D-STAR initialization, voice events, slow data, last-heard state, and echo playback; enables `runtime` |
 
 Enable both `probe` and `dstar` when one application needs identification and
@@ -50,6 +50,24 @@ This proves MMDVM framing only on the borrowed connection. It does not prove
 a particular radio identity, distinguish Terminal from Access Point mode, or
 authorize transmission. The caller decides when a probe is appropriate and
 how to retire or recover a failed or cancelled exchange.
+
+For a diagnostic-only version/status pair, use `probe::probe_diagnostics`.
+One absolute deadline covers both requests and every response read. Status is
+requested only after accepted version evidence on the same borrowed connection;
+a status error remains in `DiagnosticResponse::status` without erasing
+`DiagnosticResponse::version`. The parser rejects unknown status mode bytes
+instead of treating them as Idle. No modem loop or configuration is started.
+Both version probes reject malformed UTF-8 and control characters remaining
+inside the description after trailing NUL/whitespace padding is removed.
+Valid Unicode remains supported; input is never repaired silently for admission.
+
+`probe::probe_diagnostics_until` additionally checks a cancellation callback
+before the version request and after its complete reply, before status. It
+finishes an in-progress exchange or reaches the original deadline; dropping
+the future directly is still not a protocol-safe cancellation boundary.
+The caller owns cleanup. MMDVM has no request correlation identifier, so a
+received status cannot establish when the device generated it. These APIs
+do not establish radio identity, operating-mode selection, or RF-silent routing.
 
 ## Drive and reclaim a modem
 
@@ -100,10 +118,20 @@ Important operating boundaries:
   Closed or failed modem tasks return errors; dropped event-ring entries
   remain explicit discontinuities.
 - An exact inbound URCALL echo command records voice until an observed stream
-  boundary. A clean EOT automatically queues playback. This runtime is not a
-  receive-only interface, and echo recording currently has no frame-count cap.
-- The two-second `poll_status` timeout applies between received events, not
-  to the whole operation. Continuing voice traffic can extend the total wait.
+  boundary, up to `MAX_ECHO_RECORDING_FRAMES` (3,000 frames, 36,000 voice-payload
+  bytes, or 60 seconds at nominal cadence). This is a frame-count bound, not
+  a wall-clock timeout. The next frame discards the entire recording and emits
+  `DstarEvent::EchoRecordingAborted` once, after its normal `VoiceData` event.
+  Reception continues; only a new header can start another recording. A clean
+  EOT within the limit automatically queues playback; an oversized recording
+  never replays a truncated prefix. The recording limit does not reserve TX
+  capacity: playback can fail with a typed queue error after a prefix was
+  submitted. This runtime is not receive-only.
+- One two-second absolute `poll_status` deadline covers request submission,
+  all received events, and dispatch, including automatic echo playback.
+  Continuing voice traffic cannot extend the total wait. Unrelated events
+  remain queued in their original order, including an observed `VoiceEnd`
+  when a timeout interrupts echo submission.
 - Waiting for an event is cancellation-safe. TX submission, initialization,
   and automatic echo playback are not cancellation-atomic: already queued or
   written commands may still take effect. Cancellation is not rollback.

@@ -4956,6 +4956,13 @@ fn trace_dstar_event(event: &DstarEvent) {
         DstarEvent::VoiceLost => {
             tracing::trace!(target: "thd75_repl::dstar", "event: VoiceLost");
         }
+        DstarEvent::EchoRecordingAborted { frame_limit } => {
+            tracing::warn!(
+                target: "thd75_repl::dstar",
+                frame_limit,
+                "event: EchoRecordingAborted"
+            );
+        }
         DstarEvent::EventsDropped { count } => {
             tracing::warn!(
                 target: "thd75_repl::dstar",
@@ -5037,6 +5044,11 @@ fn print_dstar_event(event: &DstarEvent) {
         DstarEvent::EventsDropped { count } => {
             aprintln!("D-STAR modem event stream lost {count} event(s)");
         }
+        DstarEvent::EchoRecordingAborted { frame_limit } => {
+            aprintln!(
+                "D-STAR echo recording exceeded {frame_limit} frames; recording discarded without playback. Reception continues."
+            );
+        }
         DstarEvent::ProtocolViolation(violation) => {
             if thd75_repl::is_verbose() {
                 aprintln!("D-STAR protocol violation: {violation}");
@@ -5077,6 +5089,19 @@ fn print_dstar_event(event: &DstarEvent) {
                 aprintln!("D-STAR modem event: {event:?}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod dstar_event_output_tests {
+    use super::{DstarEvent, print_dstar_event};
+
+    #[test]
+    fn echo_abort_announces_discard_without_playback() {
+        print_dstar_event(&DstarEvent::EchoRecordingAborted { frame_limit: 3000 });
+        assert!(thd75_repl::last_lines(1).iter().any(|line| line ==
+            "D-STAR echo recording exceeded 3000 frames; recording discarded without playback. Reception continues."
+        ));
     }
 }
 

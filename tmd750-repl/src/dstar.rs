@@ -850,6 +850,9 @@ fn print_radio_event(event: &DstarEvent) {
         )),
         DstarEvent::VoiceEnd => output::line(format_args!("Radio voice ended.")),
         DstarEvent::VoiceLost => output::error(format_args!("Warning: radio voice stream lost.")),
+        DstarEvent::EchoRecordingAborted { frame_limit } => output::error(format_args!(
+            "Local echo discarded: recording exceeded {frame_limit} frames. No truncated recording will be replayed."
+        )),
         DstarEvent::EventsDropped { count } => output::error(format_args!(
             "Warning: {count} radio modem events were dropped."
         )),

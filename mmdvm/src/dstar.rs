@@ -5,9 +5,12 @@
 //! underlying [`AsyncModem`] owns periodic status polling and FIFO-based
 //! transmit pacing. Reflector networking is a separate concern.
 //!
-//! An exact inbound URCALL echo command records its voice stream. A clean
-//! end-of-transmission then automatically queues playback through the same
-//! modem TX path. This runtime is therefore not a receive-only interface.
+//! An exact inbound URCALL echo command records at most
+//! [`MAX_ECHO_RECORDING_FRAMES`] voice frames. A clean end-of-transmission
+//! automatically queues playback through the same modem TX path. An oversized
+//! recording is discarded entirely and reported as
+//! [`DstarEvent::EchoRecordingAborted`]; a truncated prefix is never replayed.
+//! This runtime is therefore not a receive-only interface.
 //!
 //! Endpoint selection, protocol diagnosis, radio mode entry, and restoration
 //! belong to the caller. This module never sends CAT commands or reopens a
@@ -51,6 +54,18 @@ use mmdvm_core::{MMDVM_SET_CONFIG, ModemMode, ModemStatus};
 /// Gives the event loop a short ceiling so callers can drive other
 /// work between polls on a quiet channel.
 const EVENT_POLL_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Maximum automatic echo recording length in D-STAR voice frames.
+///
+/// The fixed 3,000-frame resource policy permits 60 seconds at the nominal
+/// 20 ms voice cadence, retaining at most 36,000 bytes of voice payload. This
+/// is a frame-count bound, not an elapsed-time deadline. The next frame
+/// discards the entire recording and emits [`DstarEvent::EchoRecordingAborted`].
+/// Normal receive events continue; only a new header can begin another echo.
+pub const MAX_ECHO_RECORDING_FRAMES: usize = 3000;
+
+/// Whole-operation deadline for explicit status polling, including dispatch.
+const STATUS_POLL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Default maximum entries in the last-heard list.
 const DEFAULT_MAX_LAST_HEARD: usize = 100;
@@ -436,6 +451,16 @@ pub enum DstarEvent {
     VoiceEnd,
     /// Voice transmission lost (no clean EOT, signal lost).
     VoiceLost,
+    /// Automatic echo recording exceeded its fixed frame budget.
+    ///
+    /// The complete recording was discarded, with no playback queued. Normal
+    /// voice reception continues through the current stream's boundary. This
+    /// event follows the [`Self::VoiceData`] that exceeded the budget and is
+    /// emitted only once for that recording.
+    EchoRecordingAborted {
+        /// Maximum retained frames; see [`MAX_ECHO_RECORDING_FRAMES`].
+        frame_limit: usize,
+    },
     /// The modem's bounded event ring overwrote events before this
     /// consumer could receive them.
     EventsDropped {
@@ -448,11 +473,11 @@ pub enum DstarEvent {
     TextMessage(SlowDataTextMessage),
     /// A station was heard (added or updated in the last-heard list).
     StationHeard(LastHeardEntry),
-    /// A URCALL command was detected in the voice header.
+    /// A URCALL command requiring caller policy was detected in the header.
     ///
-    /// The gateway parsed the UR field and identified a special command
-    /// (echo, unlink, info, link). The caller should handle the command
-    /// (e.g. connect/disconnect reflector, start echo recording).
+    /// Unlink, information, and reflector-link requests are passed to the
+    /// caller. Exact echo requests are handled locally by this runtime and
+    /// do not emit this event; ordinary destinations do not emit it either.
     UrCallCommand(UrCallAction),
     /// Modem status update received.
     StatusUpdate(ModemStatus),
@@ -604,8 +629,9 @@ impl<S: Transport + 'static> DstarModem<S> {
     ///
     /// Waiting for input is cancellation-safe. Processing an echo EOT may
     /// submit transmit work before cancellation; receive state and decoded
-    /// text are retained before that first await, but echo playback is not
-    /// cancellation-atomic and must not be automatically retried.
+    /// text and the observed voice-end event are retained before that first
+    /// await, but echo playback is not cancellation-atomic and must not be
+    /// automatically retried.
     pub async fn next_event(&mut self) -> Result<Option<DstarEvent>, DstarError> {
         // Drain buffered events first (e.g. UrCallCommand after VoiceStart).
         if let Some(evt) = self.pending_events.pop_front() {
@@ -798,7 +824,7 @@ impl<S: Transport + 'static> DstarModem<S> {
     /// Handle a received D-STAR EOT, emitting any queued text message
     /// and driving echo playback if the record phase was active.
     async fn on_eot(&mut self) -> Result<Option<DstarEvent>, DstarError> {
-        // Reset ALL reception state and queue the decoded text BEFORE
+        // Reset ALL reception state and queue the boundary and text BEFORE
         // any await: if the caller's future is cancelled mid-echo-
         // playback, the gateway must not be left claiming an RX that
         // already ended (and the text message must not be lost).
@@ -811,13 +837,18 @@ impl<S: Transport + 'static> DstarModem<S> {
             None
         };
         self.reset_receive_state();
+        let end_event_index = self.pending_events.len();
+        self.pending_events.push_back(DstarEvent::VoiceEnd);
         if let Some(text) = text_event {
             self.pending_events.push_back(DstarEvent::TextMessage(text));
         }
         if let Some((header, frames)) = echo_recording {
             self.play_echo(header, frames).await?;
         }
-        Ok(Some(DstarEvent::VoiceEnd))
+        // Preserve the normal primary-before-secondary return order. If
+        // playback failed or was cancelled, the queued boundary remains
+        // available to the next event call instead of disappearing.
+        Ok(self.pending_events.remove(end_event_index))
     }
 
     /// Handle a received D-STAR header (internal).
@@ -851,7 +882,9 @@ impl<S: Transport + 'static> DstarModem<S> {
             UrCallAction::Echo => {
                 self.echo_active = true;
                 self.echo_header = Some(header);
-                self.echo_frames.clear();
+                if self.echo_frames.capacity() < MAX_ECHO_RECORDING_FRAMES {
+                    self.echo_frames = Vec::with_capacity(MAX_ECHO_RECORDING_FRAMES);
+                }
             }
             _ => {
                 self.pending_events
@@ -869,7 +902,21 @@ impl<S: Transport + 'static> DstarModem<S> {
         self.slow_data_frame_index = self.slow_data_frame_index.wrapping_add(1);
 
         if self.echo_active {
-            self.echo_frames.push(frame);
+            if self.echo_frames.len() < MAX_ECHO_RECORDING_FRAMES {
+                self.echo_frames.push(frame);
+            } else {
+                self.echo_active = false;
+                self.echo_header = None;
+                self.echo_frames.clear();
+                self.pending_events
+                    .push_back(DstarEvent::EchoRecordingAborted {
+                        frame_limit: MAX_ECHO_RECORDING_FRAMES,
+                    });
+                tracing::warn!(
+                    frame_limit = MAX_ECHO_RECORDING_FRAMES,
+                    "D-STAR echo recording discarded after exceeding its frame limit"
+                );
+            }
         }
     }
 
@@ -1005,54 +1052,52 @@ impl<S: Transport + 'static> DstarModem<S> {
     /// Requests an immediate `GetStatus` and returns the next status
     /// event delivered by the modem loop. The mmdvm modem loop also
     /// polls status periodically (every 250 ms), so callers rarely
-    /// need this. The two-second timeout applies between received events,
-    /// not to the entire operation; continuing voice traffic can extend it.
+    /// need this. One two-second absolute deadline covers request submission,
+    /// waiting for status, and dispatch of unrelated events, including echo
+    /// playback. Continuing voice traffic cannot restart this deadline.
     ///
     /// # Errors
     ///
     /// Returns an error if the status request fails or the modem loop
-    /// exits before delivering a status event.
+    /// exits before delivering a status event. Returns [`DstarError::Timeout`]
+    /// if any part of the operation exceeds the whole-operation deadline.
     ///
     /// # Cancellation
     ///
     /// The status request may already be queued when cancelled. Received
-    /// voice events are retained in the normal event queue, but automatic
-    /// echo playback follows [`Self::next_event`]'s non-atomic TX contract.
+    /// voice events, including an observed EOT, are retained in the normal
+    /// event queue. Automatic echo playback follows [`Self::next_event`]'s
+    /// non-atomic TX contract: a timeout can interrupt playback after some
+    /// frames have been submitted and must not trigger automatic replay.
     pub async fn poll_status(&mut self) -> Result<ModemStatus, DstarError> {
-        self.modem
-            .request_status()
-            .await
-            .map_err(DstarError::from)?;
+        let deadline = tokio::time::Instant::now() + STATUS_POLL_TIMEOUT;
+        tokio::time::timeout_at(deadline, async {
+            self.modem.request_status().await?;
 
-        // Drain until we see a Status event or the channel closes.
-        loop {
-            let evt =
-                match tokio::time::timeout(Duration::from_secs(2), self.modem.next_event()).await {
-                    Ok(Some(e)) => e,
-                    Ok(None) => {
-                        return Err(DstarError::TransportClosed);
-                    }
-                    Err(_) => {
-                        return Err(DstarError::Timeout(Duration::from_secs(2)));
-                    }
-                };
-            if let Event::Status(status) = evt {
-                return Ok(status);
+            loop {
+                // A ready event burst must not starve the timeout future.
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(DstarError::Timeout(STATUS_POLL_TIMEOUT));
+                }
+                let evt = self
+                    .modem
+                    .next_event()
+                    .await
+                    .ok_or(DstarError::TransportClosed)?;
+                if let Event::Status(status) = evt {
+                    return Ok(status);
+                }
+                // Preserve unrelated events and primary-before-secondary
+                // ordering while leaving older queued events first. The
+                // outer deadline also bounds asynchronous echo dispatch.
+                let insertion_index = self.pending_events.len();
+                if let Some(dstar_event) = self.dispatch_event(evt).await? {
+                    self.pending_events.insert(insertion_index, dstar_event);
+                }
             }
-            // Not a status: run it through the normal pipeline so
-            // voice frames / EOT / terminal events that arrive while
-            // polling are queued for next_event() instead of being
-            // discarded (a discarded EOT would leave rx_active stuck
-            // and lose the slow-data text).
-            let insertion_index = self.pending_events.len();
-            if let Some(dstar_event) = self.dispatch_event(evt).await? {
-                // `dispatch_event` can queue secondary events (for
-                // example StationHeard after VoiceStart). Preserve the
-                // same primary-before-secondary ordering used by
-                // `next_event`, while leaving older queued events first.
-                self.pending_events.insert(insertion_index, dstar_event);
-            }
-        }
+        })
+        .await
+        .map_err(|_| DstarError::Timeout(STATUS_POLL_TIMEOUT))?
     }
 
     /// Check if a voice transmission is currently active (RX from radio).
@@ -1763,6 +1808,238 @@ mod tests {
         assert!(runtime.echo_header.is_none());
         assert!(runtime.echo_frames.is_empty());
         assert_eq!(runtime.slow_data_frame_index, 0);
+        assert!(matches!(
+            runtime.pending_events.front(),
+            Some(DstarEvent::VoiceEnd)
+        ));
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn echo_recording_overflow_discards_the_entire_recording() -> Result<(), BoxTestErr> {
+        assert_eq!(MAX_ECHO_RECORDING_FRAMES, 3000);
+        let mut runtime = started_gateway(&[]).await?;
+        runtime.handle_voice_start(test_header("W1AW", *b"       E")?);
+        runtime.pending_events.clear();
+        let frame = VoiceFrame {
+            ambe: [0x55; 9],
+            slow_data: [0x11; 3],
+        };
+        for _ in 0..MAX_ECHO_RECORDING_FRAMES {
+            runtime.handle_voice_data(frame);
+        }
+        assert!(runtime.echo_active);
+        assert_eq!(runtime.echo_frames.len(), MAX_ECHO_RECORDING_FRAMES);
+
+        runtime.handle_voice_data(frame);
+        assert!(!runtime.echo_active, "overflow must disable this recording");
+        assert!(runtime.echo_header.is_none());
+        assert!(
+            runtime.echo_frames.is_empty(),
+            "no prefix may remain playable"
+        );
+        assert!(
+            runtime.is_receiving(),
+            "recording policy must not discard RX"
+        );
+        assert!(matches!(
+            runtime.pending_events.front(),
+            Some(DstarEvent::EchoRecordingAborted { frame_limit })
+                if *frame_limit == MAX_ECHO_RECORDING_FRAMES
+        ));
+        for _ in 0..MAX_ECHO_RECORDING_FRAMES {
+            runtime.handle_voice_data(frame);
+        }
+        assert!(runtime.echo_frames.is_empty());
+        assert_eq!(runtime.pending_events.len(), 1, "abort is emitted once");
+        assert!(matches!(
+            runtime.on_eot().await?,
+            Some(DstarEvent::VoiceEnd)
+        ));
+
+        let adapter = runtime.into_modem().shutdown().await?;
+        let recovered = adapter.shutdown_and_recover().await?;
+        assert!(
+            recovered
+                .writes()
+                .iter()
+                .all(|bytes| { !matches!(bytes.get(2), Some(0x10 | 0x11 | 0x13)) }),
+            "an oversized echo must submit no header, voice, or EOT"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn echo_overflow_preserves_frame_order_and_allows_a_new_recording()
+    -> Result<(), BoxTestErr> {
+        let mut runtime = started_gateway(&[]).await?;
+        runtime.handle_voice_start(test_header("W1AW", *b"       E")?);
+        runtime.pending_events.clear();
+        let frame = VoiceFrame {
+            ambe: [0x55; 9],
+            slow_data: [0x11; 3],
+        };
+        for _ in 0..MAX_ECHO_RECORDING_FRAMES {
+            runtime.handle_voice_data(frame);
+        }
+        let bytes = [
+            0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x11, 0x11, 0x11,
+        ];
+        assert!(matches!(
+            runtime.dispatch_event(Event::DstarDataRx { bytes }).await?,
+            Some(DstarEvent::VoiceData(actual)) if actual == frame
+        ));
+        assert!(matches!(
+            runtime.next_event().await?,
+            Some(DstarEvent::EchoRecordingAborted { .. })
+        ));
+        assert!(matches!(
+            runtime.on_eot().await?,
+            Some(DstarEvent::VoiceEnd)
+        ));
+        runtime.handle_voice_start(test_header("W1AW", *b"       E")?);
+        runtime.pending_events.clear();
+        runtime.handle_voice_data(frame);
+        assert!(runtime.echo_active);
+        assert_eq!(runtime.echo_frames, vec![frame]);
+        assert!(matches!(
+            runtime.on_eot().await?,
+            Some(DstarEvent::VoiceEnd)
+        ));
+        assert!(
+            runtime.pending_events.is_empty(),
+            "successful EOT is not duplicated"
+        );
+        Ok(())
+    }
+
+    /// A scripted connection whose write side wedges after a fixed allowance.
+    struct LimitedWrites {
+        inner: MockTransport,
+        remaining: usize,
+    }
+
+    impl kenwood_transport::Transport for LimitedWrites {
+        async fn write(&mut self, bytes: &[u8]) -> Result<(), kenwood_transport::TransportError> {
+            if self.remaining == 0 {
+                return std::future::pending().await;
+            }
+            self.remaining -= 1;
+            self.inner.write(bytes).await
+        }
+
+        async fn read(
+            &mut self,
+            bytes: &mut [u8],
+        ) -> Result<usize, kenwood_transport::TransportError> {
+            self.inner.read(bytes).await
+        }
+
+        async fn close(&mut self) -> Result<(), kenwood_transport::TransportError> {
+            self.inner.close().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn poll_status_deadline_includes_a_stalled_request_write() -> Result<(), BoxTestErr> {
+        let mut mock = initialization_transport(&[0xE0, 4, 0x70, 0x02]);
+        mock.expect(&[0xE0, 4, 0x03, 1], &[0xE0, 4, 0x70, 0x03]);
+        let modem = AsyncModem::spawn(StreamAdapter::new(LimitedWrites {
+            inner: mock,
+            remaining: 4,
+        }));
+        let mut runtime = DstarModem::initialize(modem, test_config()?)
+            .await
+            .map_err(|(_, error)| error)?;
+        let started = tokio::time::Instant::now();
+        let result = runtime.poll_status().await;
+        assert!(matches!(
+            result,
+            Err(DstarError::Timeout(STATUS_POLL_TIMEOUT))
+        ));
+        assert_eq!(started.elapsed(), STATUS_POLL_TIMEOUT);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn poll_status_deadline_includes_echo_dispatch_and_retains_voice_end()
+    -> Result<(), BoxTestErr> {
+        let mut mock = initialization_transport(&[0xE0, 4, 0x70, 0x02]);
+        mock.expect(&[0xE0, 4, 0x03, 1], &[0xE0, 4, 0x70, 0x03, 0xE0, 3, 0x13]);
+        mock.expect_any_write();
+        let modem = AsyncModem::spawn(StreamAdapter::new(LimitedWrites {
+            inner: mock,
+            remaining: 5,
+        }));
+        let mut runtime = DstarModem::initialize(modem, test_config()?)
+            .await
+            .map_err(|(_, error)| error)?;
+        runtime.handle_voice_start(test_header("W1AW", *b"       E")?);
+        runtime.pending_events.clear();
+        runtime.handle_voice_data(VoiceFrame {
+            ambe: [0x55; 9],
+            slow_data: [0x11; 3],
+        });
+        let started = tokio::time::Instant::now();
+        {
+            let poll = runtime.poll_status();
+            tokio::pin!(poll);
+            // Queue GetStatus, then let the modem finish the request without
+            // advancing the caller past the queued ACK and EOT yet.
+            tokio::select! {
+                biased;
+                result = &mut poll => return Err(format!("request unexpectedly completed: {result:?}").into()),
+                () = std::future::ready(()) => {}
+            }
+            tokio::task::yield_now().await;
+            // The requested write completed, but the next periodic status
+            // write wedges the modem loop before it can process echo TX.
+            let before_dispatch = Duration::from_millis(250);
+            tokio::time::advance(before_dispatch).await;
+            // Consume ACK and EOT. Echo submission now awaits its own reply.
+            tokio::select! {
+                biased;
+                result = &mut poll => return Err(format!("echo dispatch unexpectedly completed: {result:?}").into()),
+                () = std::future::ready(()) => {}
+            }
+            let remaining = STATUS_POLL_TIMEOUT
+                .checked_sub(before_dispatch)
+                .ok_or("dispatch must begin before the status deadline")?;
+            tokio::time::advance(remaining).await;
+            let result = poll.await;
+            assert!(matches!(
+                result,
+                Err(DstarError::Timeout(STATUS_POLL_TIMEOUT))
+            ));
+        }
+        assert_eq!(started.elapsed(), STATUS_POLL_TIMEOUT);
+        assert!(!runtime.is_receiving());
+        assert!(
+            runtime
+                .pending_events
+                .iter()
+                .any(|event| matches!(event, DstarEvent::VoiceEnd))
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn poll_status_unrelated_traffic_cannot_extend_the_deadline() -> Result<(), BoxTestErr> {
+        let lost = &[0xE0, 3, 0x12][..];
+        let mut runtime = started_gateway(&[(lost, 400); 6]).await?;
+        let started = tokio::time::Instant::now();
+        let result = runtime.poll_status().await;
+        assert!(
+            matches!(result, Err(DstarError::Timeout(duration)) if duration == Duration::from_secs(2))
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+        assert!(
+            runtime.pending_events.iter().any(|event| matches!(
+                event,
+                DstarEvent::ProtocolViolation(DstarProtocolViolation::SignalLostWithoutHeader)
+            )),
+            "unrelated receive events must remain available after timeout"
+        );
         Ok(())
     }
 

@@ -3411,7 +3411,7 @@ impl App {
             .sort_by(|a, b| b.last_heard.cmp(&a.last_heard));
     }
 
-    /// Toggle APRS mode on or off.
+    /// Apply a D-STAR runtime event to receive state and operator feedback.
     fn handle_dstar_event(&mut self, event: mmdvm::dstar::DstarEvent) {
         use mmdvm::dstar::DstarEvent;
         match event {
@@ -3429,6 +3429,11 @@ impl App {
             DstarEvent::VoiceLost => {
                 self.dstar_rx_active = false;
                 self.status_message = Some("D-STAR: voice lost (no clean EOT)".into());
+            }
+            DstarEvent::EchoRecordingAborted { frame_limit } => {
+                self.status_message = Some(format!(
+                    "D-STAR: echo recording exceeded {frame_limit} frames; discarded without playback. Reception continues."
+                ));
             }
             DstarEvent::EventsDropped { count } => {
                 self.dstar_rx_active = false;
@@ -3691,6 +3696,28 @@ mod tests {
     use crate::event::RadioCommand;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn echo_abort_reports_discard_without_ending_reception() {
+        use mmdvm::dstar::DstarEvent;
+
+        let mut app = App::with_cache_path(String::new(), None);
+        app.dstar_rx_active = true;
+        assert!(
+            app.update(Message::DstarEvent(DstarEvent::EchoRecordingAborted {
+                frame_limit: 3000,
+            }))
+        );
+        assert!(app.dstar_rx_active);
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some(
+                "D-STAR: echo recording exceeded 3000 frames; discarded without playback. Reception continues."
+            )
+        );
+        assert!(app.update(Message::DstarEvent(DstarEvent::VoiceEnd)));
+        assert!(!app.dstar_rx_active);
+    }
 
     #[test]
     fn linked_volume_steps_across_link_and_fixed_levels_and_saturates() -> TestResult {
