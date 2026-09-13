@@ -35,6 +35,7 @@ expecting stability.
 
 | Crate | Purpose | Stability |
 |-------|---------|-----------|
+| [`kenwood-schema/`](kenwood-schema/) | Model-neutral field codecs, finite value domains, and atomic masked-byte planning; no radio I/O or memory-layout policy | experimental |
 | [`kenwood-transport/`](kenwood-transport/) | Model-neutral async byte I/O, strict mocks, explicit serial options, and a bounded Tokio stream adapter; no radio-model or TH-D75 helper dependency | experimental |
 | [`thd75/`](thd75/) | TH-D75 library: CAT, MCP programming, SD-card parsing, transports, high-level `AprsClient` | experimental |
 | [`thd75-tui/`](thd75-tui/) | Terminal UI for the TH-D75 | experimental |

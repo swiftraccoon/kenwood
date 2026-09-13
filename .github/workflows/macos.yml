@@ -36,6 +36,10 @@ jobs:
       # steps reuse; clippy's driver fingerprints differently from
       # check, so those passes were pure duplicate work.
       - run: cargo clippy --all-targets -- -D warnings
+        working-directory: kenwood-schema
+      - run: cargo test
+        working-directory: kenwood-schema
+      - run: cargo clippy --all-targets -- -D warnings
         working-directory: kenwood-transport
       - run: cargo clippy --all-targets --no-default-features -- -D warnings
         working-directory: kenwood-transport

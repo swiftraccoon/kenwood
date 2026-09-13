@@ -1,0 +1,19 @@
+[package]
+name = "kenwood-schema"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "Model-neutral field codecs and atomic masked-byte planning"
+license = "GPL-2.0-or-later"
+repository = "https://github.com/swiftraccoon/kenwood"
+keywords = ["kenwood", "schema", "encoding", "memory", "ham-radio"]
+categories = ["encoding", "data-structures"]
+authors = ["swiftraccoon"]
+readme = "README.md"
+publish = false
+
+[dependencies]
+thiserror = "2"
+
+[lints]
+workspace = true
