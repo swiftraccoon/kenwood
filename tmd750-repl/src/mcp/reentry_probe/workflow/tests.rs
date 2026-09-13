@@ -15,7 +15,7 @@ use kenwood_transport::{MockTransport, Transport, TransportError};
 use serde_json::Value;
 
 use super::{Captures, JournalEvent, Workflow, run};
-use crate::mcp::capture::{Recorder, create_private_file};
+use crate::capture::{Recorder, create_private_file};
 use crate::mcp::reconnect::Backend;
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;

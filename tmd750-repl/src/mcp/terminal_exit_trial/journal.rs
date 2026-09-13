@@ -159,7 +159,7 @@ impl Journal<FileSink> {
             ));
         }
         let directory = directory.canonicalize()?;
-        let file = super::super::capture::create_private_file(&directory.join(FILENAME))?;
+        let file = crate::capture::create_private_file(&directory.join(FILENAME))?;
         if file.metadata()?.permissions().mode() & 0o777 != 0o600 {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,

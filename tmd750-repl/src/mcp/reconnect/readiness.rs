@@ -1,11 +1,11 @@
-//! Read-only MCP workflows' CAT reacquisition; never retries programming.
+//! Bounded identity-only CAT reacquisition; never retries programming.
 
 use super::{
     AtomicBool, Backend, CLOSE_TIMEOUT, ConnectionAttempt, Duration, Enumeration,
-    EnumerationWindow, Failure, File, Identity, Ordering, PostExitVerification, Recorder, SETTLE,
-    SerialCandidate, Serialize, SkipReason, TranscriptSummary, VerificationContext,
-    VerificationGoal, VerificationOutcome, VerificationStage, attempt_identity, await_endpoint,
-    finalize_capture, milliseconds, wait_recorded,
+    EnumerationWindow, Failure, File, Identity, OperationOutcome, Ordering, PostExitVerification,
+    Recorder, SETTLE, SerialCandidate, Serialize, SkipReason, TranscriptSummary,
+    VerificationContext, VerificationGoal, VerificationOutcome, VerificationStage,
+    attempt_identity, await_endpoint, finalize_capture, milliseconds, wait_recorded,
 };
 
 /// Explicit per-write and per-reply deadline for the three identity queries.
@@ -37,13 +37,12 @@ struct ReadinessAttempt {
     retry_admission: RetryAdmission,
 }
 
-/// Evidence for the probe and backup's bounded, identity-only readiness policy.
+/// Evidence for explicitly admitted workflows' identity-only readiness policy.
 ///
-/// Guarded writes and qualification experiments retain single-attempt
-/// verification. This policy changes only fresh CAT handling after a completed
-/// read-only MCP session; it cannot repeat entry, reads, exit, or settings writes.
+/// Callers prove acknowledged exit and clean handle release before invoking
+/// this policy. It cannot repeat MCP entry, reads, exit, or settings writes.
 #[derive(Debug, Serialize)]
-pub(in crate::mcp) struct ReadinessVerification {
+pub(crate) struct ReadinessVerification {
     identity_assurance: &'static str,
     settle_milliseconds: u64,
     readiness_budget_milliseconds: u64,
@@ -78,8 +77,28 @@ impl ReadinessVerification {
     }
 
     /// A match counts only with complete, durably synchronized evidence.
-    pub(in crate::mcp) const fn succeeded(&self) -> bool {
+    pub(crate) const fn succeeded(&self) -> bool {
         self.transcript.complete && matches!(self.outcome, VerificationOutcome::Matched)
+    }
+
+    /// Every acquired owner closed successfully with complete capture evidence.
+    ///
+    /// Identity mismatch or query failure does not itself imply a lost owner.
+    /// Failed opening without an acquired owner requires no subsequent close.
+    pub(crate) fn owners_released(&self) -> bool {
+        self.transcript.complete
+            && self.attempts.iter().all(|attempt| {
+                attempt.connection.as_ref().is_none_or(|connection| {
+                    matches!(
+                        (&connection.open, &connection.close),
+                        (OperationOutcome::Failed { .. }, None)
+                            | (
+                                OperationOutcome::Succeeded,
+                                Some(OperationOutcome::Succeeded)
+                            )
+                    )
+                })
+            })
     }
 
     fn fail(&mut self, stage: VerificationStage, message: &str) {
@@ -124,7 +143,7 @@ pub(super) fn budget_exhausted(report: &mut PostExitVerification) {
 /// Every new open requires fresh exact-endpoint enumeration. No MCP, Gateway,
 /// setter, baud change, packet exit, transport reopen or reset is dispatched.
 /// Cancellation finishes the bounded identity attempt and close before stopping.
-pub(in crate::mcp) async fn verify_readiness(
+pub(crate) async fn verify_readiness(
     backend: &mut impl Backend,
     endpoint: &SerialCandidate,
     baud: u32,

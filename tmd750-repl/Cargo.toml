@@ -18,7 +18,9 @@ dstar-gateway = { path = "../dstar-gateway" }
 dstar-gateway-core = { path = "../dstar-gateway-core" }
 dirs-next = "2"
 kenwood-tmd750 = { path = "../tmd750" }
-kenwood-transport = { path = "../kenwood-transport", default-features = false }
+kenwood-transport = { path = "../kenwood-transport", default-features = false, features = [
+  "native-bluetooth",
+] }
 mmdvm = { path = "../mmdvm", features = ["dstar", "probe"] }
 rustyline = "18"
 serde = { version = "1", features = ["derive"] }

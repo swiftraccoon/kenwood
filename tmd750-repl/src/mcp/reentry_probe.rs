@@ -15,9 +15,9 @@ use serde::Serialize;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use super::capture::{Artifacts, Recorder, create_private_file};
 use super::reconnect::SystemBackend;
 use super::{Endpoint, Failure, finish_on_interrupt, write_report};
+use crate::capture::{Artifacts, CaptureKind, Recorder, create_private_file};
 use crate::{AppResult, CommandError, output};
 use workflow::{Captures, Workflow};
 
@@ -131,7 +131,11 @@ impl Reserved {
 pub(super) async fn run(endpoint: &SerialCandidate, baud: u32, request: &Request) -> AppResult<()> {
     request.validate(endpoint, baud)?;
     let cancelled = Arc::new(AtomicBool::new(false));
-    let artifacts = Artifacts::create(request.output.as_deref(), Arc::clone(&cancelled))?;
+    let artifacts = Artifacts::create(
+        CaptureKind::Mcp,
+        request.output.as_deref(),
+        Arc::clone(&cancelled),
+    )?;
     let Artifacts {
         directory,
         report: mut report_file,

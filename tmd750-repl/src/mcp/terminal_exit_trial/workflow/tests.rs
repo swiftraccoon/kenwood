@@ -20,7 +20,7 @@ use kenwood_transport::{MockTransport, Transport, TransportError};
 
 use super::super::journal::Journal;
 use super::{SessionCaptures, WorkflowResult, run};
-use crate::mcp::capture::{Artifacts, Recorder};
+use crate::capture::{Artifacts, CaptureKind, Recorder};
 use crate::mcp::reconnect::Backend;
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;
@@ -553,6 +553,7 @@ impl Harness {
                 });
             }
             let artifacts = Artifacts::create(
+                CaptureKind::Mcp,
                 Some(&directory.path().join(format!("session-{phase}"))),
                 Arc::clone(&failed),
             )?;
@@ -970,7 +971,7 @@ fn assert_failed_entry_evidence(second: &super::SessionEvidence) -> TestResult {
         matches!(
             &core.outcome,
             super::Outcome::Failed { stage: super::Stage::Entry, error }
-                if error.message == "serial read failed" && error.causes.len() == 1
+                if error.message == "transport read failed" && error.causes.len() == 1
         ),
         "retain the entry read error and its underlying OS cause"
     );

@@ -473,7 +473,26 @@ impl<T: Transport> McpSession<'_, T> {
         Ok(())
     }
 
-    pub(crate) async fn read_page(&mut self, page: Page) -> Result<Vec<u8>, Error> {
+    /// Read one complete page and finish its host/radio acknowledgment exchange.
+    ///
+    /// Returns exactly [`Page::len`] bytes, expanding a uniform-fill response
+    /// when present. The caller selects the page and retains its address and
+    /// coverage; this method does not infer canonical configuration regions,
+    /// construct a dense image, or alter the write journal. Use this boundary
+    /// for incremental captures without allocating a whole-image buffer.
+    ///
+    /// Cancellation should be checked between completed calls. Dropping an
+    /// in-flight read or receiving an incomplete exchange leaves the session
+    /// uncertain and prohibits subsequent protocol I/O, including exit. A
+    /// successful call restores MCP readiness but does not leave programming
+    /// mode or imply CAT readiness. No automatic retry occurs.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a session that is not MCP-ready before any page traffic. Returns
+    /// transport, timeout, header-address/length, response-command, or
+    /// acknowledgment errors while preserving the uncertain session state.
+    pub async fn read_page(&mut self, page: Page) -> Result<Vec<u8>, Error> {
         self.radio.require_mcp_ready()?;
         let request = read_request(page);
         self.radio.mark_mcp_uncertain();

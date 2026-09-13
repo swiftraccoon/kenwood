@@ -16,8 +16,7 @@ use serde::Serialize;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-use crate::mcp::Failure;
-use crate::mcp::capture::{Recorder, TranscriptSummary};
+use crate::capture::{Failure, Recorder, TranscriptSummary};
 
 const PROGRAM: &str = "/usr/sbin/ioreg";
 const ARGUMENTS: [&str; 6] = ["-r", "-c", "IOSerialBSDClient", "-l", "-w", "0"];

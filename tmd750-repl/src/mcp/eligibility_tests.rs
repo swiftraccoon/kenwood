@@ -3,6 +3,7 @@
 use super::*;
 use kenwood_tmd750::{Address, FirmwareIdentity, McpProbeSegment, Page, RadioModel, RadioType};
 use reconnect::VerificationOutcome;
+use std::error::Error as StdError;
 
 type TestResult = Result<(), Box<dyn StdError + Send + Sync>>;
 
@@ -32,6 +33,7 @@ fn probe() -> Result<McpProbeReport, Box<dyn StdError + Send + Sync>> {
 fn summary() -> Result<TranscriptSummary, Box<dyn StdError + Send + Sync>> {
     let directory = tempfile::tempdir()?;
     let artifacts = Artifacts::create(
+        CaptureKind::Mcp,
         Some(&directory.path().join("capture")),
         Arc::new(AtomicBool::new(false)),
     )?;

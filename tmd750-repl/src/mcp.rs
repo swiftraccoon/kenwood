@@ -1,20 +1,19 @@
 //! Startup-only MCP workflows and offline configuration inspection.
 
 mod backup;
-mod capture;
+pub(crate) mod fixed;
 mod menu;
 mod menu_apply;
 mod pm1_trial;
-mod reconnect;
+pub(crate) mod reconnect;
 mod reconnect_policy;
 mod reentry_probe;
-mod snapshot;
+pub(crate) mod snapshot;
 mod terminal;
 mod terminal_exit_trial;
 mod text;
 mod text_set;
 
-use std::error::Error as StdError;
 use std::fs::File;
 use std::future::Future;
 use std::io::{self, Write};
@@ -25,16 +24,16 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use kenwood_tmd750::transport::SerialCandidate;
-use kenwood_tmd750::{
-    Identity, McpProbeExit, McpProbeOutcome, McpProbeReport, McpProbeStage, Radio,
-};
+use kenwood_tmd750::{Identity, McpProbeExit, McpProbeOutcome, McpProbeReport, McpProbeStage};
 use kenwood_transport::Transport;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+use crate::capture::{
+    Artifacts, CaptureKind, CaptureTransport, Failure, Recorder, TranscriptSummary,
+};
 use crate::{AppResult, output};
-use capture::{Artifacts, CaptureTransport, Recorder, TranscriptSummary};
 use reconnect::{Backend, ReadinessVerification, SkipReason, SystemBackend};
 
 /// Dedicated MCP workflows; none accept arbitrary requests or write addresses.
@@ -132,41 +131,16 @@ pub(crate) struct ProbeRequest {
     output: Option<PathBuf>,
 }
 
+impl ProbeRequest {
+    /// Selected output location; transport policy does not change its meaning.
+    pub(crate) fn output(&self) -> Option<&std::path::Path> {
+        self.output.as_deref()
+    }
+}
+
 /// Parse original OS arguments without lowercasing paths or splitting spaces.
 pub(crate) fn parse(arguments: &[String]) -> Result<McpCommand, clap::Error> {
     Ok(McpCli::try_parse_from(arguments)?.command)
-}
-
-/// Preserve both the outer error and its source chain in machine-readable form.
-#[derive(Clone, Debug, Serialize)]
-struct Failure {
-    message: String,
-    causes: Vec<String>,
-}
-
-impl Failure {
-    fn from_error(error: &(dyn StdError + 'static)) -> Self {
-        let mut causes = Vec::new();
-        let mut source = error.source();
-        while let Some(cause) = source {
-            causes.push(cause.to_string());
-            source = cause.source();
-        }
-        Self {
-            message: error.to_string(),
-            causes,
-        }
-    }
-}
-
-impl std::fmt::Display for Failure {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.message)?;
-        for cause in &self.causes {
-            write!(formatter, ": {cause}")?;
-        }
-        Ok(())
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -193,12 +167,20 @@ struct ArtifactReport {
 }
 
 #[derive(Debug, Serialize)]
-struct ProbeEvidence {
+pub(crate) struct ProbeEvidence {
     identity: Option<IdentityEvidence>,
     entry_reply: Option<Vec<u8>>,
     segments: Vec<SegmentEvidence>,
     exit: ExitDisposition,
     outcome: Outcome,
+}
+
+impl ProbeEvidence {
+    pub(crate) const fn completed_with_acknowledged_exit(&self) -> bool {
+        self.identity.is_some()
+            && matches!(self.outcome, Outcome::AwaitingCatVerification)
+            && matches!(self.exit, ExitDisposition::Acknowledged)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -339,16 +321,18 @@ pub(crate) async fn run(
 
 async fn run_probe(endpoint: &SerialCandidate, baud: u32, request: &ProbeRequest) -> AppResult<()> {
     let cancelled = Arc::new(AtomicBool::new(false));
-    let artifacts =
-        Artifacts::create(request.output.as_deref(), Arc::clone(&cancelled)).map_err(|source| {
-            ProbeError::Capture {
-                path: request
-                    .output
-                    .clone()
-                    .unwrap_or_else(|| PathBuf::from("captures")),
-                source,
-            }
-        })?;
+    let artifacts = Artifacts::create(
+        CaptureKind::Mcp,
+        request.output.as_deref(),
+        Arc::clone(&cancelled),
+    )
+    .map_err(|source| ProbeError::Capture {
+        path: request
+            .output
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("captures")),
+        source,
+    })?;
     let post_exit = artifacts
         .reserve_post_exit(Arc::clone(&cancelled))
         .map_err(|source| ProbeError::Capture {
@@ -493,11 +477,17 @@ async fn run_workflow(
             return result;
         }
     };
-    let mut radio = Radio::new(CaptureTransport::new(transport, original));
-    let probe = radio.probe_mcp(|| cancelled.load(Ordering::Relaxed)).await;
-    let mut transport = radio.into_transport();
-    result.close_error = close_transport(&mut transport).await;
-    result.transcript = transport.into_recorder().summary();
+    let observed = fixed::observe(
+        CaptureTransport::required(transport, original),
+        fixed::Admission::FixedIdentity,
+        cancelled,
+    )
+    .await;
+    result.close_error = observed.close_error;
+    result.transcript = observed.transcript;
+    let Some(probe) = observed.probe else {
+        return result;
+    };
     result.post_exit = match verification_eligibility(
         &probe,
         result.close_error.as_ref(),
@@ -566,7 +556,7 @@ async fn close_transport(transport: &mut impl Transport) -> Option<Failure> {
 }
 
 /// Only the signal wait is disposable; the same probe is awaited on both paths.
-async fn finish_on_interrupt<F, S>(
+pub(crate) async fn finish_on_interrupt<F, S>(
     probe: F,
     signal: S,
     cancelled: &AtomicBool,
@@ -648,6 +638,7 @@ mod eligibility_tests;
 mod tests {
     use super::*;
     use kenwood_tmd750::{Address, McpProbeSegment, Page};
+    use std::error::Error as StdError;
     use tokio::sync::oneshot;
 
     type TestResult = Result<(), Box<dyn StdError + Send + Sync>>;

@@ -412,15 +412,15 @@ fn read_document(reader: impl Read) -> AppResult<Document> {
 
 /// An internal dense buffer whose synthetic gaps cannot be read as fields.
 #[derive(Debug)]
-pub(super) struct Snapshot {
+pub(crate) struct Snapshot {
     image: MemoryImage,
-    pub(super) identity: Identity,
+    pub(crate) identity: Identity,
     coverage: Vec<Region>,
 }
 
 impl Snapshot {
     /// Copy complete captured standard pages without exposing synthetic image gaps.
-    pub(super) fn menu_snapshot(&self) -> AppResult<MenuFieldSnapshot> {
+    pub(crate) fn menu_snapshot(&self) -> AppResult<MenuFieldSnapshot> {
         let pages = regions::menu_regions()
             .into_iter()
             .flat_map(Region::pages)
@@ -446,7 +446,7 @@ impl Snapshot {
     /// special-file inputs but do not provide race-resistant path opening.
     /// Metadata and the actual bounded read must both fit within 32 MiB, even
     /// if the file grows after its metadata was checked.
-    pub(super) fn load(path: &Path) -> AppResult<Self> {
+    pub(crate) fn load(path: &Path) -> AppResult<Self> {
         validate_metadata(&path.metadata()?)?;
         let file = File::open(path)?;
         validate_metadata(&file.metadata()?)?;

@@ -17,14 +17,15 @@ use serde::Serialize;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use super::capture::{
-    Artifacts, CaptureTransport, Event, Recorder, TranscriptSummary, create_private_file,
-};
 use super::menu::{ApplyRequest, Value};
 use super::reconnect::{self, Backend, PostExitVerification, SkipReason, SystemBackend};
 use super::{
     Endpoint, ExitDisposition, Failure, IdentityEvidence, close_transport, finish_on_interrupt,
     write_report,
+};
+use crate::capture::{
+    Artifacts, CaptureKind, CaptureTransport, Event, Recorder, TranscriptSummary,
+    create_private_file,
 };
 use crate::{AppResult, CommandError, output};
 
@@ -520,7 +521,7 @@ pub(super) async fn run(
     }
     let plan = request.prepare()?;
     let cancelled = Arc::new(AtomicBool::new(false));
-    let artifacts = Artifacts::create(request.output(), Arc::clone(&cancelled))?;
+    let artifacts = Artifacts::create(CaptureKind::Mcp, request.output(), Arc::clone(&cancelled))?;
     let post_exit = artifacts.reserve_post_exit(Arc::clone(&cancelled))?;
     let mut journal = Recorder::named(
         create_private_file(&artifacts.directory.join("menu-journal.jsonl"))?,

@@ -14,11 +14,11 @@ use serde::Serialize;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use super::capture::{Artifacts, CaptureTransport, Recorder, TranscriptSummary};
 use super::reconnect::{self, Backend, ReadinessVerification, SkipReason, SystemBackend};
 use super::{
     Endpoint, Failure, IdentityEvidence, SegmentEvidence, close_transport, finish_on_interrupt,
 };
+use crate::capture::{Artifacts, CaptureKind, CaptureTransport, Recorder, TranscriptSummary};
 use crate::{AppResult, CommandError, output};
 
 /// Standard configuration only; custom startup-screen pixels are excluded.
@@ -156,7 +156,11 @@ pub(super) async fn run(
     request: &BackupRequest,
 ) -> AppResult<()> {
     let cancelled = Arc::new(AtomicBool::new(false));
-    let artifacts = Artifacts::create(request.output.as_deref(), Arc::clone(&cancelled))?;
+    let artifacts = Artifacts::create(
+        CaptureKind::Mcp,
+        request.output.as_deref(),
+        Arc::clone(&cancelled),
+    )?;
     let post_exit = artifacts.reserve_post_exit(Arc::clone(&cancelled))?;
     output::line(format_args!(
         "MCP configuration capture: {}.",

@@ -654,6 +654,54 @@ Unresolved fields remain available for inspection and offline storage previews.
 Binary fields have no scalar keyboard parser; an explicitly selected startup
 bitmap can be read but cannot be patched through the scalar menu planner.
 
+### Persistent Terminal plans
+
+`radio::terminal::TerminalPlan` is the separate, narrow policy for Gateway Off
+and Reflector Terminal. It uses the same registry, canonical snapshots and
+compare/exchange engine without admitting lifecycle fields to ordinary setters:
+
+```rust
+use kenwood_tmd750::{Identity, MenuFieldSnapshot};
+use kenwood_tmd750::radio::terminal::{TerminalPlan, TerminalPlanError, TerminalTarget};
+
+fn prepare_terminal_cycle(
+    identity: &Identity,
+    snapshot: &MenuFieldSnapshot,
+) -> Result<(TerminalPlan, TerminalPlan), TerminalPlanError> {
+    let entry = TerminalPlan::new(identity, snapshot, TerminalTarget::ReflectorTerminal)?;
+    let restoration = entry.restoration()?;
+    Ok((entry, restoration))
+}
+```
+
+The plan requires exact firmware 1.02 / type K,2,1, format zero, valid active PM,
+COM+AF, a known route, and Gateway Off or Reflector Terminal. `new` preserves
+routing and changes only Gateway and, when entering Reflector Terminal, its
+subtype. `TerminalPlan::for_route(identity, snapshot, route)` explicitly selects
+Reflector Terminal with a `TerminalGatewayRoute`, including Bluetooth. Both
+policies preserve PM, MY/RPT fields and all unrelated bytes. Already-satisfied
+requests retain every compare-only guard without writing. `route()` describes
+the captured source; `target_route()` describes the planned destination.
+
+`required_pages()` supplies canonical planning coverage across all PM slots,
+not a complete recovery backup. `McpSession::read_page` exposes one fully
+acknowledged read so callers can build an incremental backup and check
+cancellation between pages without repeating programming entry.
+
+`McpSession::compare_exchange_terminal` requires fresh equality of every complete
+guard and target page before any write, durable intent and immediate complete-page
+readback. `restoration()` swaps the exact original/destination images, including
+the original subtype and route. Its expected bytes are synthetic, not new observations;
+they must pass the same fresh comparisons, without merging or unconditional
+rollback. A direct `TerminalTarget::Off` request instead retains its input subtype.
+
+This API supplies immutable write scope, not an automatic connection lifecycle
+or hardware qualification. The caller must retain an independently usable control
+path, own the modem connection, capture intent, handle cancellation and outstanding
+restoration, acknowledge MCP exit, close/drop retired handles, and verify fresh
+identity and mode. Multi-page comparisons are not a firmware lock or atomic
+transaction. Neither immediate readback nor fresh CAT proves power-cycle persistence.
+
 ## What it does
 
 - Proves the connected radio with `ID` (exact `TM-D750`) and records the exact
@@ -742,8 +790,9 @@ a sixty-second readiness-dispatch budget. They permit at most four freshly
 opened identity attempts, retrying only an entirely silent initial ID timeout
 after clean close and complete capture. Every retry re-enumerates the exact
 selected endpoint; partial replies and other failures stop verification.
-Guarded write workflows retain single-attempt verification. These host bounds
-are not guarantees for operating-system call or radio recovery timing.
+Ordinary guarded setters and fixed write experiments retain single-attempt
+verification. These host bounds are not guarantees for operating-system call
+or radio recovery timing.
 
 Earlier captures remain failures: one tried CAT on the invalidated old USB
 handle, and another exhausted a shorter passive observation window before
@@ -754,9 +803,24 @@ bytes on firmware 1.02 through main-unit USB, followed by clean exit, close,
 fresh matching CAT identity, and fresh close. Raw responses independently
 matched every saved page. First endpoint presence was observed 12.23 seconds
 after exit ACK; the full CAT tuple completed at 12.53 seconds. These are host
-observations, not guaranteed recovery times. General settings writes, compatible
-`.d750` export, and automatic Terminal Mode remain unqualified. Generic
-transport reopening remains unsupported.
+observations, not guaranteed recovery times. General settings writes and
+compatible `.d750` export remain unqualified. Generic transport reopening
+remains unsupported.
+
+The companion REPL completed two automatic Bluetooth Terminal cycles on
+September 13, 2026, on `TM-D750 / 1.02 / K,2,1` in PM Off, with Gateway initially
+routed to panel USB and independent control-panel USB CAT. Both captured every
+standard page, changed only Gateway and routing, completed E/ACK, and reached
+fresh Bluetooth MMDVM identification (`TM-D750 RTM1.00`). Exact original guarded
+settings and fresh USB Gateway Off were verified after EOF in the no-reflector
+run and after `dstar stop` in the `REF030C` run. The latter authenticated,
+connected, and reported incoming reflector voice streams.
+
+These observations cover those caller-managed sequences, not a generic library
+reconnect policy. Other PM slots, initial routes, control connectors, already-active
+Terminal startup, cold-start reliability, cancellation/failure variants,
+acoustic playback, operator PTT, bidirectional voice, and power-cycle persistence
+remain unverified. Earlier failed trials retain their original outcomes.
 
 The generated manifest carries the declared firmware label 1.00, not an
 extracted vendor maximum-version restriction. Legacy raw-page and patch writes

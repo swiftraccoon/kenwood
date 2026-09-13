@@ -20,12 +20,12 @@ use kenwood_tmd750::{
 };
 use serde::Serialize;
 
-use super::super::capture::{CaptureTransport, Recorder, TranscriptSummary};
 use super::super::reconnect::{self, Backend, PostExitVerification, SkipReason};
 use super::super::{ExitDisposition, Failure, IdentityEvidence, SegmentEvidence, close_transport};
 use super::RestorationStatus;
 use super::journal::Journal;
 use super::target::Trial;
+use crate::capture::{CaptureTransport, Recorder, TranscriptSummary};
 use crate::output;
 
 #[derive(Debug)]

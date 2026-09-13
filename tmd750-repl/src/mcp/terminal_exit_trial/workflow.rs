@@ -14,11 +14,11 @@ use kenwood_tmd750::{
 use kenwood_transport::Transport;
 use serde::Serialize;
 
-use super::super::capture::{CaptureTransport, Event, Recorder, TranscriptSummary};
 use super::super::reconnect::{self, Backend, PostExitVerification, SkipReason};
 use super::super::{ExitDisposition, Failure, IdentityEvidence, SegmentEvidence, close_transport};
 use super::Status;
 use super::journal::Journal;
+use crate::capture::{CaptureTransport, Event, Recorder, TranscriptSummary};
 use crate::output;
 
 #[derive(Debug)]

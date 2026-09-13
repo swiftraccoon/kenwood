@@ -221,7 +221,7 @@ async fn either_original_open_failure_retains_its_error_without_protocol_or_retr
 
 #[tokio::test]
 async fn failed_open_completion_record_retires_the_acquired_handle_without_cat() -> TestResult {
-    use crate::mcp::capture::Event as CaptureEvent;
+    use crate::capture::Event as CaptureEvent;
     use crate::mcp::reconnect::{PostExitVerification, SkipReason};
 
     let mut harness = Harness::new()?;

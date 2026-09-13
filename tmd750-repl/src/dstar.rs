@@ -1,38 +1,38 @@
-//! D-STAR reflector startup over a positively identified MMDVM link.
+//! D-STAR runtime with automatic Bluetooth Terminal ownership or manual USB.
 //!
-//! The TM-D750 Terminal Mode wire protocol is not assumed. Startup requires a
-//! completed initial CAT `ID` write with a silent reply timeout before sending
-//! one MMDVM `GET_VERSION` probe. Standard modem setup and reflector traffic
-//! are allowed only after a complete MMDVM version response proves that
-//! protocol on this exact link.
-//! MMDVM framing cannot distinguish Reflector Terminal from Access Point mode,
-//! so the documented Menu 670 and 650 selections remain operator preconditions.
+//! Automatic startup guards and captures persistent mode/routing changes before
+//! bounded exact-endpoint MMDVM acquisition. USB-only startup retains its
+//! manual-mode preconditions. Neither path initializes the runtime or connects
+//! a reflector before complete version framing on the owned modem connection.
 
-use std::net::ToSocketAddrs;
 use std::pin::pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use dstar_gateway::auth::AuthClient;
-use dstar_gateway::tokio_shell::{
-    AnyAsyncSession, AnyEvent, AsyncSession, ShellError, fresh_stream_id,
-};
-use dstar_gateway_core::session::client::{Connected, Connecting, DExtra, DPlus, Dcs, Session};
-use dstar_gateway_core::{Callsign, DstarHeader, Module, ProtocolKind, StreamId, VoiceFrame};
+use dstar_gateway::tokio_shell::{AnyAsyncSession, AnyEvent, fresh_stream_id};
+use dstar_gateway_core::{Callsign, DstarHeader, Module, StreamId, VoiceFrame};
 use kenwood_tmd750::transport::{DEFAULT_BAUD, SerialTransport, open_serial};
+use kenwood_transport::Transport;
 use mmdvm::dstar::{DstarEvent, DstarModemConfig};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
-use crate::{hosts, output, terminal};
+use crate::{output, terminal};
 
+mod endpoints;
 mod lifecycle;
 mod modem;
+mod network;
+pub(crate) mod probe;
+mod startup;
+pub(crate) mod transition;
 
 use lifecycle::{
     RelayMode, StreamLifecycle, complete_cycle_or_input, next_event_before_quiet, settle_streams,
 };
 use modem::{prove_mmdvm_or_explain_cat, start_gateway, stop_gateway};
+use network::{connect_reflector, disconnect_reflector};
 
 const DSTAR_PROMPT: &str = "dstar> ";
 const EVENT_POLL_TIMEOUT: Duration = Duration::from_millis(5);
@@ -41,9 +41,8 @@ const MAX_EVENTS_PER_CYCLE: usize = 24;
 const PAD_INTERVAL: Duration = Duration::from_millis(20);
 const PAD_INITIAL_THRESHOLD: Duration = Duration::from_millis(100);
 const PAD_FRAMES_MAX: u32 = 30;
-const REFLECTOR_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-type Gateway = modem::Gateway<SerialTransport>;
+type Gateway<T> = modem::Gateway<T>;
 
 /// Fully validated arguments for `dstar start`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -148,8 +147,65 @@ pub(super) async fn run(path: &str, baud: u32, request: StartRequest) -> Result<
     session.command_loop(editor).await
 }
 
-struct DstarSession {
-    gateway: Gateway,
+/// Automatic Bluetooth startup, retaining USB recovery until runtime shutdown.
+pub(super) async fn run_bluetooth(
+    endpoint: Option<crate::native::Endpoint>,
+    control_port: Option<&str>,
+    request: StartRequest,
+) -> Result<(), String> {
+    let editor = DefaultEditor::new().map_err(|error| error.to_string())?;
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let workflow = async {
+        let (proof, recovery) =
+            startup::prepare(endpoint, control_port, Arc::clone(&cancelled)).await?;
+        DstarSession::from_proof(proof, request, Some(recovery), &cancelled).await
+    };
+    let mut session = Box::pin(finish_startup(
+        workflow,
+        tokio::signal::ctrl_c(),
+        &cancelled,
+    ))
+    .await?;
+    if session.reflector.is_some() {
+        session.monitor().await;
+    }
+    session.command_loop(editor).await
+}
+
+/// Retain startup through interruption, then retire any late successful owner.
+async fn finish_startup<T, F, S>(
+    workflow: F,
+    signal: S,
+    cancelled: &AtomicBool,
+) -> Result<DstarSession<T>, String>
+where
+    T: Transport + Unpin + 'static,
+    F: Future<Output = Result<DstarSession<T>, String>>,
+    S: Future<Output = std::io::Result<()>>,
+{
+    let (result, signal_error) = startup::finish_on_interrupt(workflow, signal, cancelled).await;
+    let interrupt = signal_error.map_or_else(
+        || "D-STAR startup cancelled".to_owned(),
+        |error| format!("D-STAR startup interrupt listener failed: {error}"),
+    );
+    match result {
+        Ok(mut session) if cancelled.load(Ordering::SeqCst) => {
+            if let Some(recovery) = &mut session.recovery {
+                recovery.record_runtime_failure(&interrupt);
+            }
+            match session.shutdown().await {
+                Ok(()) => Err(interrupt),
+                Err(cleanup) => Err(format!("{interrupt}; {cleanup}")),
+            }
+        }
+        Err(error) if cancelled.load(Ordering::SeqCst) => Err(format!("{interrupt}; {error}")),
+        result => result,
+    }
+}
+
+struct DstarSession<T: Transport + Unpin + 'static> {
+    gateway: Gateway<T>,
+    recovery: Option<startup::Recovery>,
     reflector: Option<AnyAsyncSession>,
     callsign: Callsign,
     link: Option<LinkArg>,
@@ -162,7 +218,7 @@ struct DstarSession {
     radio_link_lost: bool,
 }
 
-impl DstarSession {
+impl DstarSession<SerialTransport> {
     async fn start(path: &str, baud: u32, request: StartRequest) -> Result<Self, String> {
         if baud != DEFAULT_BAUD {
             tracing::warn!(
@@ -173,34 +229,91 @@ impl DstarSession {
         let connection = terminal::connection_for_path(path);
         let transport = open_serial(path, baud).map_err(|error| error.to_string())?;
         let proof = prove_mmdvm_or_explain_cat(transport, connection).await?;
-        let callsign = request.network_callsign();
-
         output::line(format_args!(
             "MMDVM framing proved on {path}; it cannot distinguish Reflector Terminal from Access Point mode. Continuing on the operator precondition that Menus 670 and 650 are set to Reflector TERM Mode and Terminal Mode."
         ));
-        let gateway = start_gateway(proof, request.modem_config).await?;
+        Self::from_proof(proof, request, None, &AtomicBool::new(false)).await
+    }
+}
+
+impl<T: Transport + Unpin + 'static> DstarSession<T> {
+    async fn from_proof(
+        proof: modem::ProvenModem<T>,
+        request: StartRequest,
+        recovery: Option<startup::Recovery>,
+        cancelled: &AtomicBool,
+    ) -> Result<Self, String> {
+        Self::from_proof_with_link(
+            proof,
+            request,
+            recovery,
+            cancelled,
+            async |callsign, link| connect_reflector(callsign, &link, cancelled).await,
+        )
+        .await
+    }
+
+    async fn from_proof_with_link<F>(
+        proof: modem::ProvenModem<T>,
+        request: StartRequest,
+        recovery: Option<startup::Recovery>,
+        cancelled: &AtomicBool,
+        connect: F,
+    ) -> Result<Self, String>
+    where
+        F: AsyncFnOnce(Callsign, LinkArg) -> Result<AnyAsyncSession, String>,
+    {
+        if cancelled.load(Ordering::SeqCst) {
+            let closed = modem::close_transport(proof.into_transport()).await;
+            let message = closed.as_ref().err().map_or_else(
+                || "D-STAR startup cancelled before modem initialization".to_owned(),
+                |error| format!("D-STAR startup cancelled before modem initialization; {error}"),
+            );
+            return Err(failure_with_recovery(recovery, closed.is_ok(), message).await);
+        }
+        let callsign = request.network_callsign();
+        let gateway = match start_gateway(proof, request.modem_config).await {
+            Ok(gateway) => gateway,
+            Err(error) => {
+                return Err(failure_with_recovery(
+                    recovery,
+                    error.owner_released(),
+                    error.to_string(),
+                )
+                .await);
+            }
+        };
         output::line(format_args!("MMDVM modem initialized for D-STAR."));
 
+        if cancelled.load(Ordering::SeqCst) {
+            return Err(failed_runtime(
+                gateway,
+                recovery,
+                "D-STAR startup cancelled after modem initialization".to_owned(),
+            )
+            .await);
+        }
+
         let reflector = if let Some(link) = request.reflector.as_ref() {
-            match connect_reflector(callsign, link).await {
+            match connect(callsign, link.clone()).await {
                 Ok(reflector) => Some(reflector),
                 Err(error) => {
-                    let cleanup_error = stop_gateway(gateway).await.err();
-                    return Err(cleanup_error.map_or_else(
-                        || format!("reflector connection failed: {error}"),
-                        |cleanup| format!("reflector connection failed: {error}; {cleanup}"),
-                    ));
+                    return Err(failed_runtime(
+                        gateway,
+                        recovery,
+                        format!("reflector connection failed: {error}"),
+                    )
+                    .await);
                 }
             }
         } else {
-            output::line(format_args!(
-                "D-STAR modem is active without a reflector; link startup is not yet exposed."
-            ));
+            output::line(format_args!("D-STAR modem is active without a reflector."));
             None
         };
 
         Ok(Self {
             gateway,
+            recovery,
             reflector,
             callsign,
             link: request.reflector,
@@ -241,20 +354,18 @@ impl DstarSession {
         ));
     }
 
-    async fn command_loop(mut self, editor: DefaultEditor) -> Result<(), String> {
+    async fn command_loop(self, editor: DefaultEditor) -> Result<(), String> {
         let mut editor = Some(editor);
-        loop {
-            let Some(owned_editor) = editor.take() else {
-                output::error(format_args!(
-                    "Error: D-STAR prompt editor ownership was lost."
-                ));
-                break;
-            };
-            let prompt = tokio::task::spawn_blocking(move || {
-                let mut editor = owned_editor;
-                let input = editor.readline(DSTAR_PROMPT);
-                (editor, input)
-            });
+        self.command_loop_with_input(async || read_command(&mut editor).await)
+            .await
+    }
+
+    async fn command_loop_with_input<F>(mut self, mut read: F) -> Result<(), String>
+    where
+        F: AsyncFnMut() -> Result<String, ReadlineError>,
+    {
+        let failure = loop {
+            let prompt = read();
             let mut prompt = pin!(prompt);
             let prompt_result = loop {
                 if let Some(result) =
@@ -264,34 +375,17 @@ impl DstarSession {
                     break result;
                 }
             };
-            let (returned_editor, input) = match prompt_result {
-                Ok(result) => result,
-                Err(error) => {
-                    output::error(format_args!("Error: D-STAR prompt task failed: {error}"));
-                    break;
-                }
-            };
-            editor = Some(returned_editor);
-            let line = match input {
+            let line = match prompt_result {
                 Ok(line) => line,
                 Err(ReadlineError::Interrupted) => {
                     output::line(format_args!("Use dstar stop or quit to close the gateway."));
                     continue;
                 }
-                Err(ReadlineError::Eof) => break,
+                Err(ReadlineError::Eof) => break None,
                 Err(error) => {
-                    output::error(format_args!("Error: D-STAR prompt failed: {error}"));
-                    break;
+                    break Some(format!("D-STAR prompt failed: {error}"));
                 }
             };
-            if !line.trim().is_empty()
-                && let Some(editor) = editor.as_mut()
-                && let Err(error) = editor.add_history_entry(line.as_str())
-            {
-                output::error(format_args!(
-                    "Warning: history entry was not recorded: {error}"
-                ));
-            }
             match line.trim().to_ascii_lowercase().as_str() {
                 "monitor" | "listen" => {
                     self.discard_pending_events().await;
@@ -305,14 +399,23 @@ impl DstarSession {
                 }
                 "status" => self.print_status(),
                 "help" | "?" => print_dstar_help(),
-                "dstar stop" | "stop" | "quit" | "exit" => break,
+                "dstar stop" | "stop" | "quit" | "exit" => break None,
                 "" => {}
                 other => output::error(format_args!(
                     "Command error: unknown D-STAR command {other:?}; enter help for syntax"
                 )),
             }
+        };
+        if let Some(message) = &failure
+            && let Some(recovery) = &mut self.recovery
+        {
+            recovery.record_runtime_failure(message);
         }
-        self.shutdown().await
+        match (failure, self.shutdown().await) {
+            (None, result) => result,
+            (Some(error), Ok(())) => Err(error),
+            (Some(error), Err(cleanup)) => Err(format!("{error}; {cleanup}")),
+        }
     }
 
     fn print_status(&self) {
@@ -338,11 +441,23 @@ impl DstarSession {
             disconnect_reflector(reflector).await;
         }
         output::line(format_args!("Stopping the D-STAR modem session."));
-        stop_gateway(self.gateway).await?;
-        output::line(format_args!(
-            "D-STAR session stopped. No Gateway setting was changed; set Menu 650 to Off before using CAT on this port."
-        ));
-        Ok(())
+        let stopped = stop_gateway(self.gateway).await;
+        let restored = if let Some(mut recovery) = self.recovery {
+            if let Err(error) = &stopped {
+                recovery.record_runtime_failure(error);
+            }
+            recovery.finish(stopped.is_ok()).await
+        } else {
+            output::line(format_args!(
+                "D-STAR session stopped. No Gateway setting was changed; set Menu 650 to Off before using CAT on this port."
+            ));
+            Ok(())
+        };
+        match (stopped, restored) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(error), Err(restoration)) => Err(format!("{error}; {restoration}")),
+        }
     }
 
     async fn poll_cycle(&mut self, mode: RelayMode) {
@@ -652,7 +767,7 @@ impl DstarSession {
     }
 }
 
-impl StreamLifecycle for DstarSession {
+impl<T: Transport + Unpin + 'static> StreamLifecycle for DstarSession<T> {
     async fn discard_queued_events(&mut self) {
         self.discard_pending_events().await;
     }
@@ -670,6 +785,60 @@ impl StreamLifecycle for DstarSession {
     }
 }
 
+async fn failure_with_recovery(
+    recovery: Option<startup::Recovery>,
+    released: bool,
+    message: String,
+) -> String {
+    match recovery {
+        Some(mut recovery) => {
+            recovery.record_runtime_failure(&message);
+            match recovery.finish(released).await {
+                Ok(()) => message,
+                Err(cleanup) => format!("{message}; {cleanup}"),
+            }
+        }
+        None => message,
+    }
+}
+
+/// Join the prompt worker before returning its editor or reporting failure.
+async fn read_command(editor: &mut Option<DefaultEditor>) -> Result<String, ReadlineError> {
+    let mut owned_editor = editor
+        .take()
+        .ok_or_else(|| std::io::Error::other("D-STAR prompt editor ownership was lost"))?;
+    let (returned_editor, input) = tokio::task::spawn_blocking(move || {
+        let input = owned_editor.readline(DSTAR_PROMPT);
+        if let Ok(line) = &input
+            && !line.trim().is_empty()
+            && let Err(error) = owned_editor.add_history_entry(line.as_str())
+        {
+            output::error(format_args!(
+                "Warning: history entry was not recorded: {error}"
+            ));
+        }
+        (owned_editor, input)
+    })
+    .await
+    .map_err(|error| std::io::Error::other(format!("D-STAR prompt task failed: {error}")))?;
+    *editor = Some(returned_editor);
+    input
+}
+
+async fn failed_runtime<T: Transport + Unpin + 'static>(
+    gateway: Gateway<T>,
+    recovery: Option<startup::Recovery>,
+    message: String,
+) -> String {
+    let stopped = stop_gateway(gateway).await;
+    let released = stopped.is_ok();
+    let message = match stopped {
+        Ok(()) => message,
+        Err(cleanup) => format!("{message}; {cleanup}"),
+    };
+    failure_with_recovery(recovery, released, message).await
+}
+
 fn print_reflector_event(event: &AnyEvent) {
     match event {
         AnyEvent::VoiceStart { header, .. } => output::line(format_args!(
@@ -683,150 +852,6 @@ fn print_reflector_event(event: &AnyEvent) {
             output::error(format_args!("Error: reflector disconnected: {reason:?}."));
         }
         _ => {}
-    }
-}
-
-async fn connect_reflector(callsign: Callsign, link: &LinkArg) -> Result<AnyAsyncSession, String> {
-    let entry = hosts::resolve(link.reflector_name).map_err(|error| error.to_string())?;
-    let protocol = ProtocolKind::from_reflector_prefix(&link.reflector_name.as_str())
-        .or_else(|| ProtocolKind::from_port(entry.port))
-        .unwrap_or(ProtocolKind::DExtra);
-    let address = format!("{}:{}", entry.address, entry.port)
-        .to_socket_addrs()
-        .map_err(|error| format!("address resolution failed for {}: {error}", entry.address))?
-        .next()
-        .ok_or_else(|| format!("no address resolved for {}", entry.address))?;
-    let reflector_callsign = link.reflector_name;
-
-    output::line(format_args!(
-        "Connecting to {} module {} at {address} using {protocol:?}.",
-        link.reflector_name, link.reflector_module
-    ));
-    let session = match protocol {
-        ProtocolKind::DPlus => connect_dplus(callsign, address, link, reflector_callsign)
-            .await
-            .map(AnyAsyncSession::DPlus)?,
-        ProtocolKind::DExtra => connect_dextra(callsign, address, link, reflector_callsign)
-            .await
-            .map(AnyAsyncSession::DExtra)?,
-        ProtocolKind::Dcs => connect_dcs(callsign, address, link, reflector_callsign)
-            .await
-            .map(AnyAsyncSession::Dcs)?,
-        _ => return Err(format!("unsupported reflector protocol {protocol:?}")),
-    };
-    output::line(format_args!(
-        "Connected to {} module {}.",
-        link.reflector_name, link.reflector_module
-    ));
-    Ok(session)
-}
-
-async fn bind_socket() -> Result<Arc<tokio::net::UdpSocket>, String> {
-    tokio::net::UdpSocket::bind("0.0.0.0:0")
-        .await
-        .map(Arc::new)
-        .map_err(|error| format!("UDP bind failed: {error}"))
-}
-
-async fn drive_handshake<P>(
-    session: Session<P, Connecting>,
-    socket: &tokio::net::UdpSocket,
-) -> Result<Session<P, Connected>, String>
-where
-    P: dstar_gateway_core::session::client::Protocol,
-{
-    dstar_gateway::tokio_shell::drive_connecting(session, socket, REFLECTOR_CONNECT_TIMEOUT)
-        .await
-        .map_err(|error| error.to_string())
-}
-
-async fn connect_dextra(
-    callsign: Callsign,
-    peer: std::net::SocketAddr,
-    link: &LinkArg,
-    reflector_callsign: Callsign,
-) -> Result<AsyncSession<DExtra>, String> {
-    let socket = bind_socket().await?;
-    let connecting = Session::<DExtra, _>::builder()
-        .callsign(callsign)
-        .local_module(link.local_module)
-        .reflector_module(link.reflector_module)
-        .reflector_callsign(reflector_callsign)
-        .peer(peer)
-        .build()
-        .connect(Instant::now())
-        .map_err(|failure| format!("DExtra link request failed: {}", failure.error))?;
-    let connected = drive_handshake(connecting, &socket).await?;
-    Ok(AsyncSession::spawn(connected, socket))
-}
-
-async fn connect_dplus(
-    callsign: Callsign,
-    peer: std::net::SocketAddr,
-    link: &LinkArg,
-    reflector_callsign: Callsign,
-) -> Result<AsyncSession<DPlus>, String> {
-    output::line(format_args!(
-        "Authenticating with the DPlus gateway server."
-    ));
-    let hosts = match AuthClient::new().authenticate(callsign).await {
-        Ok(hosts) => hosts,
-        Err(error) => {
-            output::error(format_args!(
-                "Warning: DPlus authentication failed: {error}; trying the UDP link anyway."
-            ));
-            dstar_gateway_core::codec::dplus::HostList::new()
-        }
-    };
-    let socket = bind_socket().await?;
-    let authenticated = Session::<DPlus, _>::builder()
-        .callsign(callsign)
-        .local_module(link.local_module)
-        .reflector_module(link.reflector_module)
-        .reflector_callsign(reflector_callsign)
-        .peer(peer)
-        .build()
-        .authenticate(hosts)
-        .map_err(|failure| format!("DPlus host-list setup failed: {}", failure.error))?;
-    let connecting = authenticated
-        .connect(Instant::now())
-        .map_err(|failure| format!("DPlus link request failed: {}", failure.error))?;
-    let connected = drive_handshake(connecting, &socket).await?;
-    Ok(AsyncSession::spawn(connected, socket))
-}
-
-async fn connect_dcs(
-    callsign: Callsign,
-    peer: std::net::SocketAddr,
-    link: &LinkArg,
-    reflector_callsign: Callsign,
-) -> Result<AsyncSession<Dcs>, String> {
-    let socket = bind_socket().await?;
-    let connecting = Session::<Dcs, _>::builder()
-        .callsign(callsign)
-        .local_module(link.local_module)
-        .reflector_module(link.reflector_module)
-        .reflector_callsign(reflector_callsign)
-        .peer(peer)
-        .build()
-        .connect(Instant::now())
-        .map_err(|failure| format!("DCS link request failed: {}", failure.error))?;
-    let connected = drive_handshake(connecting, &socket).await?;
-    Ok(AsyncSession::spawn(connected, socket))
-}
-
-async fn disconnect_reflector(reflector: &mut AnyAsyncSession) {
-    match reflector.disconnect().await {
-        Ok(()) => output::line(format_args!("Disconnected from reflector.")),
-        Err(ShellError::DisconnectUnacknowledged) => output::error(format_args!(
-            "Warning: reflector did not acknowledge unlink; its protocol timeout closed the local session."
-        )),
-        Err(ShellError::DisconnectedBeforeUnlink { reason }) => output::line(format_args!(
-            "Reflector session had already closed: {reason:?}."
-        )),
-        Err(error) => output::error(format_args!(
-            "Warning: reflector disconnect did not complete: {error}; continuing radio shutdown."
-        )),
     }
 }
 
@@ -894,7 +919,7 @@ mod tests {
     use kenwood_transport::{MockTransport, Transport, TransportError};
     use modem::prove_mmdvm_or_explain_cat_with_timeout;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::sync::Mutex;
+    use tokio::sync::{Mutex, Notify};
 
     const MMDVM_VERSION_PROBE: [u8; 3] = [0xE0, 0x03, 0x00];
 
@@ -905,12 +930,19 @@ mod tests {
         Hang,
     }
 
+    #[derive(Clone, Debug, Default)]
+    struct InitializationGate {
+        started: Arc<Notify>,
+        resume: Arc<Notify>,
+    }
+
     #[derive(Clone, Debug)]
     struct SharedMock {
         inner: Arc<Mutex<MockTransport>>,
         closes: Arc<AtomicUsize>,
         fail_close: bool,
         write_behavior: WriteBehavior,
+        initialization: Option<InitializationGate>,
     }
 
     impl SharedMock {
@@ -920,6 +952,7 @@ mod tests {
                 closes: Arc::new(AtomicUsize::new(0)),
                 fail_close: false,
                 write_behavior: WriteBehavior::Normal,
+                initialization: None,
             }
         }
 
@@ -936,6 +969,12 @@ mod tests {
                 "no requests may follow a close attempt"
             );
             self.inner.lock().await.write(data).await?;
+            if data.get(2) == Some(&0x03)
+                && let Some(gate) = &self.initialization
+            {
+                gate.started.notify_one();
+                gate.resume.notified().await;
+            }
             match self.write_behavior {
                 WriteBehavior::Normal => Ok(()),
                 WriteBehavior::Fail => Err(TransportError::Write(std::io::Error::other(
@@ -1341,7 +1380,9 @@ mod tests {
             shared.fail_close = fail_close;
             let proof = prove_test_modem(&shared).await?;
             let config = DstarModemConfig::new("KQ4NIT").map_err(|error| error.to_string())?;
-            let gateway = start_gateway(proof, config).await?;
+            let gateway = start_gateway(proof, config)
+                .await
+                .map_err(|error| error.to_string())?;
             let result = stop_gateway(gateway).await;
             if fail_close {
                 assert!(result.is_err_and(|error| {
@@ -1386,8 +1427,13 @@ mod tests {
             let Err(error) = result else {
                 return Err("SetConfig rejection must fail startup".to_owned());
             };
-            assert!(error.contains("MMDVM D-STAR initialization failed"));
-            assert_eq!(error.contains("injected serial close failure"), fail_close);
+            assert!(error.message.contains("MMDVM D-STAR initialization failed"));
+            assert_eq!(error.owner_released(), !fail_close);
+            assert_eq!(error.cleanup_error.is_some(), fail_close);
+            assert_eq!(
+                error.to_string().contains("injected serial close failure"),
+                fail_close
+            );
             assert_eq!(shared.closes.load(Ordering::SeqCst), 1);
             let writes = shared.writes().await;
             assert!(
@@ -1401,6 +1447,213 @@ mod tests {
                 !writes.iter().any(|bytes| bytes.get(2) == Some(&0x03)),
                 "rejected setup cannot continue to SetMode or send a mode-exit command"
             );
+            shared.inner.lock().await.assert_complete();
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_initialization_finishes_and_closes_before_recovery() -> crate::AppResult<()>
+    {
+        let temporary = tempfile::tempdir()?;
+        let recovery = startup::tests::runtime_recovery(temporary.path())?;
+        let gate = InitializationGate::default();
+        let mut shared = modem_startup_mock(b"\xE0\x04\x70\x02", Some(b"\xE0\x04\x70\x03"));
+        shared.initialization = Some(gate.clone());
+        let proof = prove_test_modem(&shared).await?;
+        let request = StartRequest::parse(&["KQ4NIT", "REF030C"])?;
+        let cancelled = AtomicBool::new(false);
+        let network_calls = AtomicUsize::new(0);
+        let workflow = DstarSession::from_proof_with_link(
+            proof,
+            request,
+            Some(recovery),
+            &cancelled,
+            async |_, _| {
+                let _previous = network_calls.fetch_add(1, Ordering::SeqCst);
+                Err("network must not be reached".to_owned())
+            },
+        );
+        let signal = async {
+            gate.started.notified().await;
+            gate.resume.notify_one();
+            Ok(())
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            Box::pin(finish_startup(workflow, signal, &cancelled)),
+        )
+        .await?;
+        assert!(result.is_err_and(|error| error.contains("cancelled after modem initialization")));
+        assert_eq!(network_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(shared.closes.load(Ordering::SeqCst), 1);
+        let report = runtime_report(temporary.path())?;
+        assert_eq!(report.owner_released, Some(true));
+        assert!(report.contains_error("cancelled after modem initialization"));
+        shared.inner.lock().await.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn simultaneous_success_and_interrupt_retire_the_completed_session()
+    -> crate::AppResult<()> {
+        for signal_failure in [false, true] {
+            let temporary = tempfile::tempdir()?;
+            let recovery = startup::tests::runtime_recovery(temporary.path())?;
+            let shared = modem_startup_mock(b"\xE0\x04\x70\x02", Some(b"\xE0\x04\x70\x03"));
+            let proof = prove_test_modem(&shared).await?;
+            let cancelled = AtomicBool::new(false);
+            let session = DstarSession::from_proof(
+                proof,
+                StartRequest::parse(&["KQ4NIT"])?,
+                Some(recovery),
+                &cancelled,
+            )
+            .await?;
+            let signal = std::future::ready(if signal_failure {
+                Err(std::io::Error::other("injected listener failure"))
+            } else {
+                Ok(())
+            });
+            let result = finish_startup(std::future::ready(Ok(session)), signal, &cancelled).await;
+            assert!(result.is_err_and(|error| {
+                error.contains(if signal_failure {
+                    "injected listener failure"
+                } else {
+                    "cancelled"
+                })
+            }));
+            assert_eq!(shared.closes.load(Ordering::SeqCst), 1);
+            let report = runtime_report(temporary.path())?;
+            assert_eq!(report.owner_released, Some(true));
+            assert!(!report.errors.is_empty());
+            shared.inner.lock().await.assert_complete();
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reflector_failure_closes_runtime_and_retains_independent_failures()
+    -> crate::AppResult<()> {
+        for fail_close in [false, true] {
+            let temporary = tempfile::tempdir()?;
+            let recovery = startup::tests::runtime_recovery(temporary.path())?;
+            let mut shared = modem_startup_mock(b"\xE0\x04\x70\x02", Some(b"\xE0\x04\x70\x03"));
+            shared.fail_close = fail_close;
+            let proof = prove_test_modem(&shared).await?;
+            let network_calls = AtomicUsize::new(0);
+            let result = DstarSession::from_proof_with_link(
+                proof,
+                StartRequest::parse(&["KQ4NIT", "REF030C"])?,
+                Some(recovery),
+                &AtomicBool::new(false),
+                async |_, _| {
+                    let _previous = network_calls.fetch_add(1, Ordering::SeqCst);
+                    Err("injected reflector failure".to_owned())
+                },
+            )
+            .await;
+            assert!(result.is_err_and(|error| {
+                error.contains("injected reflector failure")
+                    && error.contains("injected serial close failure") == fail_close
+            }));
+            assert_eq!(network_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(shared.closes.load(Ordering::SeqCst), 1);
+            let report = runtime_report(temporary.path())?;
+            assert_eq!(report.owner_released, Some(!fail_close));
+            assert!(report.contains_error("injected reflector failure"));
+            shared.inner.lock().await.assert_complete();
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_initialization_closes_without_configuration()
+    -> crate::AppResult<()> {
+        let temporary = tempfile::tempdir()?;
+        let recovery = startup::tests::runtime_recovery(temporary.path())?;
+        let mut mock = MockTransport::new();
+        mock.expect_hang(b"ID\r");
+        mock.expect(&MMDVM_VERSION_PROBE, b"\xE0\x0E\x00\x01MMDVM 2018");
+        let shared = SharedMock::new(mock);
+        let proof = prove_test_modem(&shared).await?;
+        let result = DstarSession::from_proof(
+            proof,
+            StartRequest::parse(&["KQ4NIT", "REF030C"])?,
+            Some(recovery),
+            &AtomicBool::new(true),
+        )
+        .await;
+        assert!(result.is_err_and(|error| error.contains("cancelled before modem initialization")));
+        assert_eq!(shared.closes.load(Ordering::SeqCst), 1);
+        assert_eq!(shared.writes().await.len(), 2);
+        assert_eq!(runtime_report(temporary.path())?.owner_released, Some(true));
+        shared.inner.lock().await.assert_complete();
+        Ok(())
+    }
+
+    #[derive(serde::Deserialize)]
+    struct RuntimeReport {
+        owner_released: Option<bool>,
+        errors: Vec<RuntimeFailure>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct RuntimeFailure {
+        message: String,
+    }
+
+    impl RuntimeReport {
+        fn contains_error(&self, expected: &str) -> bool {
+            self.errors
+                .iter()
+                .any(|error| error.message.contains(expected))
+        }
+    }
+
+    fn runtime_report(directory: &std::path::Path) -> crate::AppResult<RuntimeReport> {
+        Ok(serde_json::from_reader(std::fs::File::open(
+            directory.join("runtime-recovery/report.json"),
+        )?)?)
+    }
+
+    #[tokio::test]
+    async fn prompt_exit_and_failure_close_once_and_publish_recovery() -> crate::AppResult<()> {
+        for input in [
+            Ok("dstar stop".to_owned()),
+            Err(ReadlineError::Eof),
+            Err(ReadlineError::Io(std::io::Error::other(
+                "injected prompt failure",
+            ))),
+        ] {
+            let failed = matches!(&input, Err(ReadlineError::Io(_)));
+            let temporary = tempfile::tempdir()?;
+            let recovery = startup::tests::runtime_recovery(temporary.path())?;
+            let shared = modem_startup_mock(b"\xE0\x04\x70\x02", Some(b"\xE0\x04\x70\x03"));
+            let proof = prove_test_modem(&shared).await?;
+            let session = DstarSession::from_proof(
+                proof,
+                StartRequest::parse(&["KQ4NIT"])?,
+                Some(recovery),
+                &AtomicBool::new(false),
+            )
+            .await?;
+            let mut input = Some(input);
+            let result = session
+                .command_loop_with_input(async || {
+                    input
+                        .take()
+                        .ok_or_else(|| std::io::Error::other("prompt read twice"))?
+                })
+                .await;
+            assert_eq!(result.is_err(), failed);
+            if let Err(error) = result {
+                assert!(error.contains("injected prompt failure"));
+            }
+            assert_eq!(shared.closes.load(Ordering::SeqCst), 1);
+            let report = runtime_report(temporary.path())?;
+            assert_eq!(report.owner_released, Some(true));
+            assert_eq!(report.contains_error("injected prompt failure"), failed);
             shared.inner.lock().await.assert_complete();
         }
         Ok(())

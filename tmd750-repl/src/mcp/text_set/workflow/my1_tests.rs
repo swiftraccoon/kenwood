@@ -19,7 +19,7 @@ use kenwood_tmd750::{
 use kenwood_transport::{MockTransport, Transport, TransportError};
 
 use super::*;
-use crate::mcp::capture::{Artifacts, Event as CaptureEvent};
+use crate::capture::{Artifacts, CaptureKind, Event as CaptureEvent};
 use crate::mcp::reconnect::{VerificationOutcome, VerificationStage};
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;
@@ -569,6 +569,7 @@ impl Harness {
                 });
             }
             let artifacts = Artifacts::create(
+                CaptureKind::Mcp,
                 Some(&directory.path().join(format!("session-{phase}"))),
                 Arc::clone(&capture_failed),
             )?;

@@ -6,6 +6,7 @@ use super::{McpSession, Progress};
 use crate::error::{Error, McpError};
 use crate::protocol::mcp::regions;
 use crate::radio::menu::{MenuUpdateError, MenuUpdatePlan};
+use crate::radio::terminal::{TerminalPlan, TerminalPlanError};
 use crate::types::Page;
 use kenwood_transport::Transport;
 
@@ -211,6 +212,46 @@ impl<T: Transport> McpSession<'_, T> {
         before_write: impl FnMut(&PageReplacement) -> io::Result<()>,
         progress: impl FnMut(Progress),
     ) -> Result<McpCompareExchangeReport, MenuUpdateError> {
+        self.radio.require_mcp_ready()?;
+        let identity = self
+            .radio
+            .identity()
+            .ok_or(McpError::RecoveryRequired)
+            .map_err(Error::from)?;
+        plan.validate_identity(identity)?;
+        Ok(self
+            .compare_exchange_admitted(plan.replacements(), before_write, progress)
+            .await?)
+    }
+
+    /// Apply one immutable Terminal plan through the shared guarded page engine.
+    ///
+    /// The session identity must match the exact plan identity before page I/O.
+    /// Every complete expected page, including unchanged format, active-PM, and
+    /// routing guards, is freshly compared before any W. Changed pages alone
+    /// invoke the durable `before_write` callback, then receive one W/ACK and
+    /// immediate whole-page readback. Reversal has exactly the same comparisons;
+    /// its synthetic expected images are not accepted as prior observations.
+    ///
+    /// This separately bounded lifecycle policy does not widen ordinary-menu or
+    /// legacy raw-page admission. It performs no rollback, retry, automatic exit,
+    /// reconnect, CAT query, or modem operation. The caller owns authorization,
+    /// active-mode programming admission, evidence durability, connection roles,
+    /// and final verification. Retain the journal, await safe [`Self::exit`],
+    /// then close/drop the original handle before any fresh connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns session-state or identity errors before page traffic. Comparison,
+    /// callback, transport, and readback failures preserve the shared engine's
+    /// typed cause and conservative journal. Incomplete exchanges prohibit further
+    /// protocol I/O; cancellation or failure never establishes restoration.
+    pub async fn compare_exchange_terminal(
+        &mut self,
+        plan: &TerminalPlan,
+        before_write: impl FnMut(&PageReplacement) -> io::Result<()>,
+        progress: impl FnMut(Progress),
+    ) -> Result<McpCompareExchangeReport, TerminalPlanError> {
         self.radio.require_mcp_ready()?;
         let identity = self
             .radio

@@ -14,7 +14,7 @@ use kenwood_tmd750::{Address, FirmwareIdentity, Identity, Page, RadioModel, Radi
 use kenwood_transport::{MockTransport, Transport, TransportError};
 
 use super::*;
-use crate::mcp::capture::{Artifacts, create_private_file};
+use crate::capture::{Artifacts, CaptureKind, create_private_file};
 use crate::mcp::reconnect::{VerificationOutcome, VerificationStage};
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;
@@ -408,6 +408,7 @@ impl Harness {
                 });
             }
             let artifacts = Artifacts::create(
+                CaptureKind::Mcp,
                 Some(&directory.path().join(format!("session-{phase}"))),
                 Arc::clone(&capture_failed),
             )?;

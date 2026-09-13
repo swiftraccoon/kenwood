@@ -143,7 +143,7 @@ impl Journal<FileSink> {
             ));
         }
         let directory = directory.canonicalize()?;
-        let file = super::super::capture::create_private_file(&directory.join(FILENAME))?;
+        let file = crate::capture::create_private_file(&directory.join(FILENAME))?;
         Ok(Self::new(FileSink { file, directory }))
     }
 

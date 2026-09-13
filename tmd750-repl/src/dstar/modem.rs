@@ -1,9 +1,11 @@
 //! TM-D750 admission and ownership around the model-neutral D-STAR runtime.
 //!
-//! CAT remains a model policy: only one completed initial `ID` write with no
-//! received bytes admits a binary probe. A successful probe retains ownership
-//! of that exact transport until modem startup consumes it. Shutdown recovers
-//! and closes the transport without changing persistent Gateway state.
+//! CAT remains a model policy. Ordinary diagnosis requires one completed
+//! initial `ID` write with no received bytes before probing. A separately
+//! verified Terminal transition may instead probe its retained connection
+//! directly. Successful framing retains that exact transport until modem
+//! startup consumes it. Shutdown closes without changing persistent Gateway
+//! state.
 
 use std::time::Duration;
 
@@ -16,6 +18,8 @@ use crate::terminal;
 
 /// One absolute budget for the version request and complete response.
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Independent teardown allowance after protocol work has stopped.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Model-neutral runtime over the selected transport adapter.
 pub(super) type Gateway<T> = DstarModem<StreamAdapter<T>>;
@@ -26,6 +30,59 @@ pub(super) type Gateway<T> = DstarModem<StreamAdapter<T>>;
 /// or manufacture proof from CAT silence alone.
 #[derive(Debug)]
 pub(super) struct ProvenModem<T>(T);
+
+/// Initialization and independent cleanup evidence retained for restoration.
+#[derive(Debug)]
+pub(super) struct StartFailure {
+    pub(super) message: String,
+    pub(super) cleanup_error: Option<String>,
+}
+
+impl StartFailure {
+    /// Restore through another endpoint only after both pumps and close finish.
+    pub(super) const fn owner_released(&self) -> bool {
+        self.cleanup_error.is_none()
+    }
+}
+
+impl std::fmt::Display for StartFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)?;
+        if let Some(cleanup) = &self.cleanup_error {
+            write!(formatter, "; {cleanup}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for StartFailure {}
+
+impl<T: Transport> ProvenModem<T> {
+    /// Prove a caller-owned transition connection without issuing CAT.
+    ///
+    /// The caller must independently establish the selected Terminal route and
+    /// an acknowledged MCP exit before using this operation. Failure returns
+    /// the same owner for explicit close; silence alone never creates proof.
+    pub(super) async fn probe(
+        mut transport: T,
+        timeout: Duration,
+    ) -> Result<Self, (T, mmdvm::probe::ProbeError)> {
+        match mmdvm::probe::probe_version(&mut transport, timeout).await {
+            Ok(_) => Ok(Self(transport)),
+            Err(error) => Err((transport, error)),
+        }
+    }
+
+    /// Consume proof when its owner must be closed instead of admitted.
+    pub(super) fn into_transport(self) -> T {
+        self.0
+    }
+
+    /// Inspect owner metadata without changing or replacing the proved transport.
+    pub(super) const fn transport(&self) -> &T {
+        &self.0
+    }
+}
 
 /// What the observer saw while dispatching the initial CAT request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,15 +216,15 @@ pub(super) async fn prove_mmdvm_or_explain_cat_with_timeout<T: Transport>(
 pub(super) async fn start_gateway<T: Transport + Unpin + 'static>(
     proof: ProvenModem<T>,
     config: DstarModemConfig,
-) -> Result<Gateway<T>, String> {
+) -> Result<Gateway<T>, StartFailure> {
     let modem = AsyncModem::spawn(StreamAdapter::new(proof.0));
     match DstarModem::initialize(modem, config).await {
         Ok(gateway) => Ok(gateway),
         Err((modem, error)) => {
             let message = format!("MMDVM D-STAR initialization failed: {error}");
-            Err(match stop_modem(modem).await {
-                Ok(()) => message,
-                Err(cleanup) => format!("{message}; {cleanup}"),
+            Err(StartFailure {
+                message,
+                cleanup_error: stop_modem(modem).await.err(),
             })
         }
     }
@@ -191,10 +248,9 @@ async fn stop_modem<T: Transport + Unpin + 'static>(
         .await
         .map_err(|error| format!("MMDVM shutdown failed; serial ownership was lost: {error}"))?;
     match adapter.shutdown_and_recover().await {
-        Ok(mut transport) => transport
-            .close()
+        Ok(transport) => close_transport(transport)
             .await
-            .map_err(|error| format!("Serial close failed: {}", transport_error(&error))),
+            .map_err(|error| format!("Serial close failed: {error}")),
         Err(error) => {
             let (transport, error) = error.into_parts();
             let message = format!("Serial adapter shutdown failed: {error}");
@@ -207,14 +263,19 @@ async fn stop_modem<T: Transport + Unpin + 'static>(
 }
 
 /// Preserve the operation diagnostic and any independent close failure.
-async fn close_after_failure<T: Transport>(mut transport: T, message: String) -> String {
-    match transport.close().await {
+async fn close_after_failure<T: Transport>(transport: T, message: String) -> String {
+    match close_transport(transport).await {
         Ok(()) => message,
-        Err(error) => format!(
-            "{message}\nSerial close also failed: {}.",
-            transport_error(&error)
-        ),
+        Err(error) => format!("{message}\nSerial close also failed: {error}."),
     }
+}
+
+/// Bound close without dropping the only transport owner before the attempt.
+pub(super) async fn close_transport<T: Transport>(mut transport: T) -> Result<(), String> {
+    tokio::time::timeout(CLOSE_TIMEOUT, transport.close())
+        .await
+        .map_err(|_| "connection close exceeded its two-second budget".to_owned())?
+        .map_err(|error| transport_error(&error))
 }
 
 /// Include the backend cause when the transport category has a terse display.
@@ -222,4 +283,64 @@ fn transport_error(error: &TransportError) -> String {
     let cause =
         std::error::Error::source(error).map_or_else(String::new, |cause| format!(": {cause}"));
     format!("{error}{cause}")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    struct PendingClose {
+        closes: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Transport for PendingClose {
+        async fn write(&mut self, _bytes: &[u8]) -> Result<(), TransportError> {
+            Err(TransportError::Write(io::Error::other(
+                "cleanup must not write protocol data",
+            )))
+        }
+
+        async fn read(&mut self, _bytes: &mut [u8]) -> Result<usize, TransportError> {
+            Err(TransportError::Read(io::Error::other(
+                "cleanup must not read protocol data",
+            )))
+        }
+
+        async fn close(&mut self) -> Result<(), TransportError> {
+            let _previous = self.closes.fetch_add(1, Ordering::AcqRel);
+            std::future::pending().await
+        }
+    }
+
+    impl Drop for PendingClose {
+        fn drop(&mut self) {
+            let _previous = self.drops.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    #[tokio::test]
+    async fn failure_cleanup_bounds_close_and_preserves_original_diagnostic()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let closes = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let owner = PendingClose {
+            closes: closes.clone(),
+            drops: drops.clone(),
+        };
+        let message = tokio::time::timeout(
+            Duration::from_secs(3),
+            close_after_failure(owner, "original protocol failure".to_owned()),
+        )
+        .await?;
+        assert!(message.starts_with("original protocol failure"));
+        assert!(message.contains("connection close exceeded its two-second budget"));
+        assert_eq!(closes.load(Ordering::Acquire), 1);
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+        Ok(())
+    }
 }

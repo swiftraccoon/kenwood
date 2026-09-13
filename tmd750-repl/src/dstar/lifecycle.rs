@@ -53,9 +53,8 @@ pub(super) async fn complete_cycle_or_input<C, I>(
     mut input: Pin<&mut I>,
 ) -> Option<I::Output>
 where
-    C: Future<Output = ()> + Send,
-    I: Future + Send,
-    I::Output: Send,
+    C: Future<Output = ()>,
+    I: Future,
 {
     let started = AtomicBool::new(false);
     let mut cycle = pin!(async {

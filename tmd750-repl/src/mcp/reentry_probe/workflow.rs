@@ -8,9 +8,9 @@ use kenwood_tmd750::{DvGatewayMode, McpGatewayOffProbeReport, Radio};
 use kenwood_transport::Transport;
 use serde::Serialize;
 
-use super::super::capture::{CaptureTransport, Event, Recorder, TranscriptSummary};
 use super::super::reconnect::{self, Backend, PostExitVerification, SkipReason};
 use super::super::{Failure, ProbeEvidence, close_transport, verification_eligibility};
+use crate::capture::{CaptureTransport, Event, Recorder, TranscriptSummary};
 use crate::output;
 
 /// The two exclusive transcripts reserved for one original/fresh-handle pair.

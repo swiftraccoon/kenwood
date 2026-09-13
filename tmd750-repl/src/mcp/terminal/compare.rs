@@ -14,9 +14,9 @@ use kenwood_tmd750::memory::{
 use serde::Serialize;
 
 use self::catalog::{Catalog, FieldLocation};
-use super::super::{IdentityEvidence, capture, write_report};
+use super::super::{IdentityEvidence, write_report};
 use super::{Snapshot, UsbInterface, assess_snapshot, parse_slot};
-use crate::{AppResult, CommandError, output};
+use crate::{AppResult, CommandError, capture, output};
 
 /// Compare complete configuration captures without selecting or opening a radio.
 #[derive(Debug, Args)]

@@ -1,5 +1,6 @@
 //! Exclusive capture files with observational or required transport recording.
 
+use std::error::Error as StdError;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -11,7 +12,69 @@ use kenwood_transport::{Transport, TransportError};
 use serde::Serialize;
 use time::OffsetDateTime;
 
-use super::Failure;
+/// Preserve the outer error and its complete source chain in capture evidence.
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct Failure {
+    /// Display text of the failed operation.
+    pub(super) message: String,
+    /// Backend causes ordered from the immediate source to the root cause.
+    pub(super) causes: Vec<String>,
+}
+
+impl Failure {
+    /// Record every available cause without replacing the outer diagnostic.
+    pub(super) fn from_error(error: &(dyn StdError + 'static)) -> Self {
+        let mut causes = Vec::new();
+        let mut source = error.source();
+        while let Some(cause) = source {
+            causes.push(cause.to_string());
+            source = cause.source();
+        }
+        Self {
+            message: error.to_string(),
+            causes,
+        }
+    }
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)?;
+        for cause in &self.causes {
+            write!(formatter, ": {cause}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Workflow namespace used only when selecting a default capture directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CaptureKind {
+    /// MCP programming, configuration, or recovery evidence.
+    Mcp,
+    /// Diagnostic-only CAT and D-STAR protocol identification evidence.
+    DstarProbe,
+    /// Automatic Terminal entry, modem startup, and exact settings restoration.
+    DstarStart,
+    /// Exact-address native Bluetooth control and read-only qualification.
+    NativeBluetooth,
+}
+
+impl CaptureKind {
+    fn directory_name(self) -> String {
+        let prefix = match self {
+            Self::Mcp => "tmd750-mcp",
+            Self::DstarProbe => "tmd750-dstar-probe",
+            Self::DstarStart => "tmd750-dstar-start",
+            Self::NativeBluetooth => "tmd750-native-bluetooth",
+        };
+        format!(
+            "{prefix}-{}-{}",
+            OffsetDateTime::now_utc().unix_timestamp_nanos(),
+            std::process::id()
+        )
+    }
+}
 
 /// A newly reserved directory and its two exclusive output files.
 #[derive(Debug)]
@@ -26,18 +89,17 @@ pub(super) struct Artifacts {
 
 impl Artifacts {
     /// Reserve every output before the radio is opened.
-    pub(super) fn create(requested: Option<&Path>, cancelled: Arc<AtomicBool>) -> io::Result<Self> {
+    pub(super) fn create(
+        kind: CaptureKind,
+        requested: Option<&Path>,
+        cancelled: Arc<AtomicBool>,
+    ) -> io::Result<Self> {
         let directory = if let Some(path) = requested {
             create_private_directory(path)?;
             path.to_owned()
         } else {
             fs::create_dir_all("captures")?;
-            let name = format!(
-                "tmd750-mcp-{}-{}",
-                OffsetDateTime::now_utc().unix_timestamp_nanos(),
-                std::process::id()
-            );
-            reserve_default_directory(&name)?
+            reserve_default_directory(&kind.directory_name())?
         };
         let report = create_private_file(&directory.join("report.json"))?;
         let transcript = Recorder::new(
@@ -76,7 +138,7 @@ fn reserve_default_directory(name: &str) -> io::Result<PathBuf> {
     }
     Err(io::Error::new(
         io::ErrorKind::AlreadyExists,
-        "could not reserve a unique MCP capture directory",
+        "could not reserve a unique capture directory",
     ))
 }
 
@@ -200,8 +262,11 @@ impl<W: Write> Recorder<W> {
     }
 
     fn write_record(&mut self, record: &impl Serialize) -> io::Result<()> {
-        serde_json::to_writer(&mut self.writer, record)?;
-        self.writer.write_all(b"\n")?;
+        // Keep serializer fragments in memory without buffering across records.
+        // Short writes still require completion; durability remains explicit.
+        let mut bytes = serde_json::to_vec(record)?;
+        bytes.push(b'\n');
+        self.writer.write_all(&bytes)?;
         self.writer.flush()
     }
 
@@ -258,7 +323,7 @@ impl Recorder<File> {
 }
 
 /// Completeness of the transcript, independent of the radio protocol outcome.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub(super) struct TranscriptSummary {
     file: &'static str,
     /// Whether all completed transport observations were written and flushed.
@@ -357,6 +422,33 @@ impl<T, W> CaptureTransport<T, W> {
     }
 }
 
+impl<T, W: Write> CaptureTransport<T, W> {
+    /// Inspect capture completeness without releasing its connection owner.
+    pub(super) fn transcript_summary(&self) -> TranscriptSummary {
+        self.recorder.summary()
+    }
+}
+
+impl<T> CaptureTransport<T, File> {
+    /// Clone a synchronization-only handle while retaining this transport owner.
+    ///
+    /// The returned handle must never write or seek. Call `sync_all` explicitly
+    /// before admitting a write whose intent depends on already flushed wire
+    /// evidence; a failure must prevent that write and remain in its outcome.
+    pub(super) fn synchronization_handle(&self) -> io::Result<File> {
+        self.recorder.synchronization_handle()
+    }
+
+    /// Synchronize captured observations before admitting another exchange.
+    ///
+    /// A synchronization failure marks the recorder incomplete and requests
+    /// cancellation. Required recording then refuses further protocol traffic,
+    /// while connection release remains available.
+    pub(super) fn synchronize(&mut self) -> io::Result<()> {
+        self.recorder.synchronize()
+    }
+}
+
 impl<T: Transport, W: Write + Send + Sync> Transport for CaptureTransport<T, W> {
     async fn write(&mut self, data: &[u8]) -> Result<(), TransportError> {
         self.recorder.record(Event::WriteRequested { bytes: data });
@@ -452,6 +544,9 @@ fn capture_baud_error(source: io::Error) -> TransportError {
 }
 
 #[cfg(test)]
+mod recording_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use kenwood_transport::MockTransport;
@@ -463,10 +558,11 @@ mod tests {
         let root = tempfile::tempdir()?;
         let path = root.path().join("Probe Case");
         let cancelled = Arc::new(AtomicBool::new(false));
-        let mut original = Artifacts::create(Some(&path), Arc::clone(&cancelled))?;
+        let mut original =
+            Artifacts::create(CaptureKind::Mcp, Some(&path), Arc::clone(&cancelled))?;
         original.report.write_all(b"original report")?;
         assert!(
-            Artifacts::create(Some(&path), cancelled).is_err(),
+            Artifacts::create(CaptureKind::Mcp, Some(&path), cancelled).is_err(),
             "an existing capture must never be reused"
         );
         assert_eq!(fs::read(path.join("report.json"))?, b"original report");
@@ -477,7 +573,12 @@ mod tests {
     fn an_existing_empty_directory_is_also_rejected() -> TestResult {
         let root = tempfile::tempdir()?;
         assert!(
-            Artifacts::create(Some(root.path()), Arc::new(AtomicBool::new(false))).is_err(),
+            Artifacts::create(
+                CaptureKind::Mcp,
+                Some(root.path()),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .is_err(),
             "even an empty output directory belongs to its existing owner"
         );
         assert_eq!(fs::read_dir(root.path())?.count(), 0);
@@ -498,11 +599,57 @@ mod tests {
     }
 
     #[test]
+    fn default_names_preserve_distinct_workflow_namespaces() -> TestResult {
+        for (kind, prefix) in [
+            (CaptureKind::Mcp, "tmd750-mcp-"),
+            (CaptureKind::DstarProbe, "tmd750-dstar-probe-"),
+            (CaptureKind::DstarStart, "tmd750-dstar-start-"),
+            (CaptureKind::NativeBluetooth, "tmd750-native-bluetooth-"),
+        ] {
+            let name = kind.directory_name();
+            let suffix = name.strip_prefix(prefix).ok_or("wrong capture namespace")?;
+            let (timestamp, process) = suffix.rsplit_once('-').ok_or("missing process suffix")?;
+            assert!(timestamp.parse::<i128>()? > 0);
+            assert_eq!(process.parse::<u32>()?, std::process::id());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn changing_workflow_kind_cannot_reuse_an_explicit_capture() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("Selected Diagnostic");
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut original =
+            Artifacts::create(CaptureKind::DstarProbe, Some(&path), Arc::clone(&cancelled))?;
+        assert_eq!(original.directory, path);
+        original.report.write_all(b"diagnostic evidence")?;
+        original.report.sync_all()?;
+        original.transcript.record(Event::OpenCompleted);
+        original.transcript.synchronize()?;
+        let transcript = fs::read(path.join("transcript.jsonl"))?;
+        for kind in [
+            CaptureKind::Mcp,
+            CaptureKind::DstarProbe,
+            CaptureKind::DstarStart,
+            CaptureKind::NativeBluetooth,
+        ] {
+            assert!(Artifacts::create(kind, Some(&path), Arc::clone(&cancelled)).is_err());
+        }
+        assert_eq!(fs::read(path.join("report.json"))?, b"diagnostic evidence");
+        assert_eq!(fs::read(path.join("transcript.jsonl"))?, transcript);
+        Ok(())
+    }
+
+    #[test]
     fn post_exit_capture_is_separate_private_and_exclusive() -> TestResult {
         let root = tempfile::tempdir()?;
         let cancelled = Arc::new(AtomicBool::new(false));
-        let artifacts =
-            Artifacts::create(Some(&root.path().join("capture")), Arc::clone(&cancelled))?;
+        let artifacts = Artifacts::create(
+            CaptureKind::Mcp,
+            Some(&root.path().join("capture")),
+            Arc::clone(&cancelled),
+        )?;
         let mut post_exit = artifacts.reserve_post_exit(Arc::clone(&cancelled))?;
         post_exit.record(Event::WriteRequested { bytes: b"ID\r" });
         assert_eq!(artifacts.transcript.summary().file, "transcript.jsonl");
@@ -531,6 +678,7 @@ mod tests {
 
         let root = tempfile::tempdir()?;
         let capture = Artifacts::create(
+            CaptureKind::Mcp,
             Some(&root.path().join("private")),
             Arc::new(AtomicBool::new(false)),
         )?;
@@ -885,6 +1033,62 @@ mod tests {
             self.operations.push("baud");
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn transport_synchronization_keeps_the_handle_without_protocol_traffic() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("transcript.jsonl");
+        let recorder = Recorder::new(
+            create_private_file(&path)?,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let mut transport = CaptureTransport::required(OperationWitness::default(), recorder);
+        transport.write(b"ID\r").await?;
+        transport.synchronize()?;
+        assert_eq!(transport.inner.operations, ["write"]);
+        assert_eq!(transport.recorder.summary().events, 2);
+        assert!(transport.recorder.summary().complete);
+        assert_eq!(transport.read(&mut [0; 1]).await?, 0);
+        transport.close().await?;
+        transport.synchronize()?;
+        assert_eq!(transport.inner.operations, ["write", "read", "close"]);
+        assert_eq!(transport.recorder.summary().events, 5);
+        let events: Vec<serde_json::Value> = fs::read_to_string(path)?
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()?;
+        assert_eq!(events.len(), 5);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn transport_synchronization_retains_failure_and_still_permits_close() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut recorder = Recorder::new(
+            create_private_file(&root.path().join("transcript.jsonl"))?,
+            Arc::clone(&cancelled),
+        );
+        recorder.fail(&io::Error::other("capture failure before protocol handoff"));
+        let mut transport = CaptureTransport::required(OperationWitness::default(), recorder);
+        assert!(transport.synchronize().is_err());
+        assert!(cancelled.load(Ordering::Relaxed));
+        assert!(!transport.recorder.summary().complete);
+        assert!(transport.write(b"\xE0\x03\x00").await.is_err());
+        assert!(transport.read(&mut [0; 1]).await.is_err());
+        assert!(transport.close().await.is_err());
+        assert_eq!(transport.inner.operations, ["close"]);
+        assert_eq!(
+            transport
+                .recorder
+                .summary()
+                .error
+                .ok_or("capture failure lost")?
+                .message,
+            "capture failure before protocol handoff"
+        );
+        Ok(())
     }
 
     #[tokio::test]

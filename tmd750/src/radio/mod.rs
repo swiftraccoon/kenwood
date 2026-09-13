@@ -8,6 +8,7 @@ mod pm1_page;
 pub mod pm_name_trial;
 pub mod programming;
 pub mod qualification;
+pub mod terminal;
 pub mod terminal_exit_trial;
 
 use std::collections::VecDeque;

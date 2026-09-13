@@ -1,28 +1,32 @@
-//! Accessible USB CAT REPL for the Kenwood TM-D750 transceiver.
+//! Accessible TM-D750 CAT, Bluetooth D-STAR startup, and captured diagnostics.
 //!
 //! Output is plain text, with no cursor-oriented interface. Commands can be
 //! entered interactively or supplied once on the command line for scripting.
 
+mod capture;
+mod connection;
 mod dstar;
 mod hosts;
 mod logging;
 mod mcp;
+mod native;
 mod output;
 mod terminal;
 
 use std::error::Error as StdError;
 use std::fmt;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use kenwood_tmd750::transport::{
-    DEFAULT_BAUD, SerialCandidate, SerialTransport, discover_serial, open_serial,
-};
+use kenwood_tmd750::transport::{DEFAULT_BAUD, SerialCandidate, discover_serial, open_serial};
 use kenwood_tmd750::{Band, Identity, OperatingMode, Radio, SelectableMode};
 use kenwood_transport::Transport;
+use kenwood_transport::bluetooth::BluetoothAddress;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
+use connection::Connection;
 use logging::LogLevel;
 
 const PROMPT: &str = "tmd750> ";
@@ -40,18 +44,30 @@ const HELP_LINES: &[&str] = &[
 ];
 
 type AppResult<T> = Result<T, Box<dyn StdError + Send + Sync>>;
-type ConnectedRadio = (Radio<SerialTransport>, Identity, String);
+type ConnectedRadio = (Radio<Connection>, Identity, String);
 
-/// Accessible USB CAT REPL for the Kenwood TM-D750.
+/// Accessible TM-D750 CAT, automatic Bluetooth D-STAR, and captured diagnostics.
 #[derive(Debug, Parser)]
 #[command(version, about, color = clap::ColorChoice::Never)]
 struct Cli {
     /// Serial endpoint to use instead of USB auto-discovery.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "bluetooth")]
     port: Option<String>,
 
+    /// Exact paired Bluetooth address for native macOS control or D-STAR startup.
+    #[arg(long, value_name = "ADDRESS")]
+    bluetooth: Option<BluetoothAddress>,
+
+    /// Trusted native helper executable; otherwise use the built-in helper.
+    #[arg(long, requires = "bluetooth", value_name = "EXECUTABLE")]
+    bluetooth_helper: Option<PathBuf>,
+
+    /// Independent USB CAT endpoint for automatic Bluetooth dstar start.
+    #[arg(long, conflicts_with = "port", value_name = "PATH")]
+    control_port: Option<String>,
+
     /// CAT baud rate.
-    #[arg(long, default_value_t = DEFAULT_BAUD)]
+    #[arg(long, default_value_t = DEFAULT_BAUD, conflicts_with = "bluetooth")]
     baud: u32,
 
     /// Prepend UTC timestamps to terminal output.
@@ -129,8 +145,22 @@ async fn run() -> AppResult<()> {
         )));
     }
 
-    if cli.command.first().is_some_and(|word| word == "mcp") {
-        let request = match mcp::parse(&cli.command) {
+    // Structured diagnostic parsers retain their original argument boundaries.
+    // Ordinary commands share one parser and one transport dispatch policy,
+    // including command lines supplied as a single shell-quoted argument.
+    if !dstar::probe::matches_arguments(&cli.command)
+        && cli.command.first().is_none_or(|word| word != "mcp")
+    {
+        let command = parse_command(&cli.command.join(" "))?;
+        return run_command(&cli, command).await;
+    }
+    require_no_control_port(&cli)?;
+    if let Some(address) = &cli.bluetooth {
+        return run_native(&cli, address.clone(), None).await;
+    }
+
+    if dstar::probe::matches_arguments(&cli.command) {
+        let request = match dstar::probe::parse(&cli.command) {
             Ok(request) => request,
             Err(error) if error.exit_code() == 0 => {
                 output::line(format_args!("{error}"));
@@ -138,19 +168,47 @@ async fn run() -> AppResult<()> {
             }
             Err(error) => return Err(Box::new(error)),
         };
-        if let Some(result) = mcp::run_offline(&request) {
-            return result;
-        }
-        request.validate_endpoint_selection(cli.port.is_some())?;
-        let endpoint = select_probe_endpoint(cli.port.as_deref(), discover_serial()?)?;
-        return mcp::run(&endpoint, cli.baud, &request).await;
+        let path = request.validate(cli.port.as_deref(), cli.baud)?;
+        let endpoint = dstar::probe::select_endpoint(path, discover_serial()?)?;
+        return dstar::probe::run(&endpoint, &request).await;
     }
 
-    let one_shot = if cli.command.is_empty() {
-        None
-    } else {
-        parse_command(&cli.command.join(" "))?
+    let request = match mcp::parse(&cli.command) {
+        Ok(request) => request,
+        Err(error) if error.exit_code() == 0 => {
+            output::line(format_args!("{error}"));
+            return Ok(());
+        }
+        Err(error) => return Err(Box::new(error)),
     };
+    if let Some(result) = mcp::run_offline(&request) {
+        return result;
+    }
+    request.validate_endpoint_selection(cli.port.is_some())?;
+    let endpoint = select_probe_endpoint(cli.port.as_deref(), discover_serial()?)?;
+    mcp::run(&endpoint, cli.baud, &request).await
+}
+
+fn require_no_control_port(cli: &Cli) -> Result<(), CommandError> {
+    if cli.control_port.is_some() {
+        Err(CommandError(
+            "--control-port is only used by automatic Bluetooth dstar start".to_owned(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Dispatch the parsed command once, before selecting or opening its transport.
+async fn run_command(cli: &Cli, one_shot: Option<Command>) -> AppResult<()> {
+    let one_shot = match one_shot {
+        Some(Command::DstarStart(request)) => return run_dstar_start(cli, request).await,
+        other => other,
+    };
+    require_no_control_port(cli)?;
+    if let Some(address) = &cli.bluetooth {
+        return run_native(cli, address.clone(), one_shot).await;
+    }
     if let Some(command) = one_shot.as_ref() {
         match command {
             Command::Help => {
@@ -168,22 +226,94 @@ async fn run() -> AppResult<()> {
             | Command::Dv(_)
             | Command::Fm(_)
             | Command::Gateway => {}
-            Command::DstarStart(request) => {
-                let path = selected_path(&cli)?;
-                return match dstar::run(&path, cli.baud, request.clone()).await {
-                    Ok(()) => Ok(()),
-                    Err(error) => Err(Box::new(CommandError(error))),
-                };
-            }
+            Command::DstarStart(_) => unreachable!("D-STAR startup was dispatched above"),
         }
     }
 
-    let (radio, identity, path) = connect(&cli).await?;
+    let (radio, identity, path) = connect(cli).await?;
     output::line(format_args!(
         "Connected to {} firmware {} on {} (type {}).",
         identity.model, identity.firmware, path, identity.radio_type
     ));
     run_connected(radio, one_shot).await
+}
+
+async fn run_dstar_start(cli: &Cli, request: dstar::StartRequest) -> AppResult<()> {
+    let outcome = if let Some(path) = &cli.port {
+        Box::pin(dstar::run(path, cli.baud, request)).await
+    } else {
+        if cli.baud != DEFAULT_BAUD {
+            return Err(CommandError("custom --baud requires an explicit USB --port; Bluetooth has no serial baud selection".to_owned()).into());
+        }
+        let endpoint = cli.bluetooth.as_ref().map(|address| native::Endpoint {
+            address: address.clone(),
+            helper: cli.bluetooth_helper.clone(),
+        });
+        Box::pin(dstar::run_bluetooth(
+            endpoint,
+            cli.control_port.as_deref(),
+            request,
+        ))
+        .await
+    };
+    outcome.map_err(|error| -> Box<dyn StdError + Send + Sync> { Box::new(CommandError(error)) })
+}
+
+/// Reject unsupported native operations before creating artifacts or opening I/O.
+async fn run_native(
+    cli: &Cli,
+    address: BluetoothAddress,
+    command: Option<Command>,
+) -> AppResult<()> {
+    use native::workflow::{CatScope, Operation};
+
+    let endpoint = native::Endpoint {
+        address,
+        helper: cli.bluetooth_helper.clone(),
+    };
+    if cli.command.first().is_some_and(|word| word == "mcp") {
+        let request = match mcp::parse(&cli.command) {
+            Ok(request) => request,
+            Err(error) if error.exit_code() == 0 => {
+                output::line(format_args!("{error}"));
+                return Ok(());
+            }
+            Err(error) => return Err(Box::new(error)),
+        };
+        if let Some(result) = mcp::run_offline(&request) {
+            return result;
+        }
+        return match request {
+            mcp::McpCommand::Probe(request) => {
+                native::workflow::run(&endpoint, &Operation::FixedMcp, request.output()).await
+            }
+            _ => Err(Box::new(CommandError(
+                "native Bluetooth supports only mcp probe; backups and settings writes require USB"
+                    .to_owned(),
+            ))),
+        };
+    }
+    let operation = match command {
+        Some(Command::Identity) => Operation::Cat(CatScope::Identity),
+        Some(Command::Status) => Operation::Cat(CatScope::Status),
+        Some(Command::Gateway) => Operation::Cat(CatScope::Gateway),
+        Some(Command::Help) => {
+            print_help();
+            return Ok(());
+        }
+        Some(Command::Terminal) => {
+            print_terminal_information();
+            return Ok(());
+        }
+        Some(Command::Quit) => return Ok(()),
+        _ => {
+            return Err(Box::new(CommandError(
+                "native Bluetooth requires identity, status, gateway, mcp probe, or dstar start; interactive CAT sessions and direct mode writes are not supported"
+                    .to_owned(),
+            )));
+        }
+    };
+    native::workflow::run(&endpoint, &operation, None).await
 }
 
 async fn connect(cli: &Cli) -> AppResult<ConnectedRadio> {
@@ -292,9 +422,9 @@ fn unique_candidate(candidates: &[SerialCandidate]) -> Result<&SerialCandidate, 
     }
 }
 
-async fn probe_path(path: &str, baud: u32) -> Result<(Radio<SerialTransport>, Identity), String> {
+async fn probe_path(path: &str, baud: u32) -> Result<(Radio<Connection>, Identity), String> {
     let transport = open_serial(path, baud).map_err(|error| error.to_string())?;
-    let mut radio = Radio::new(transport);
+    let mut radio = Radio::new(Connection::Serial(transport));
     match radio.identify().await {
         Ok(identity) => Ok((radio, identity)),
         Err(error) => {
@@ -310,10 +440,7 @@ async fn probe_path(path: &str, baud: u32) -> Result<(Radio<SerialTransport>, Id
     }
 }
 
-async fn run_connected(
-    mut radio: Radio<SerialTransport>,
-    one_shot: Option<Command>,
-) -> AppResult<()> {
+async fn run_connected(mut radio: Radio<Connection>, one_shot: Option<Command>) -> AppResult<()> {
     let session_result: AppResult<()> = if let Some(command) = one_shot {
         execute_command(&mut radio, command)
             .await
@@ -444,7 +571,10 @@ fn print_help() {
     }
     output::line(format_args!("Startup only: dstar start CALL [REFLECTOR]"));
     output::line(format_args!(
-        "Starts an experimental Terminal Mode session, not a one-shot command."
+        "Defaults to automatic Bluetooth Terminal startup with independent USB recovery. Explicit --port retains manual USB modem startup."
+    ));
+    output::line(format_args!(
+        "Startup only: dstar probe --help (captured diagnostics; no modem setup)."
     ));
     output::line(format_args!(
         "Press Ctrl-C for the D-STAR prompt, then dstar stop to close it."
@@ -462,7 +592,7 @@ fn print_help() {
         "PM1 trial is a separately approved fixed rename-and-restore experiment, not general settings control."
     ));
     output::line(format_args!(
-        "Terminal exit trial is separately approved and experimental; ordinary dstar stop does not invoke it."
+        "Automatic Bluetooth dstar stop restores its owned settings through guarded USB recovery; the separate Terminal exit trial is not invoked."
     ));
 }
 
@@ -501,6 +631,12 @@ fn parse_command(line: &str) -> Result<Option<Command>, CommandError> {
         },
         ["dstar" | "d-star", "start", arguments @ ..] => {
             Command::DstarStart(dstar::StartRequest::parse(arguments).map_err(CommandError)?)
+        }
+        ["dstar" | "d-star", "probe", ..] => {
+            return Err(CommandError(
+                "dstar probe is startup-only; quit this prompt and run tmd750-repl dstar probe --help"
+                    .to_owned(),
+            ));
         }
         ["dstar" | "d-star", "terminal"] | ["terminal"] => Command::Terminal,
         ["dv"] => Command::Dv(Band::A),
@@ -750,11 +886,49 @@ mod tests {
         assert!(cli.timestamps);
         assert_eq!(cli.command, ["dstar", "start", "KQ4NIT", "REF030C"]);
         assert_eq!(cli.baud, DEFAULT_BAUD);
+        assert!(cli.port.is_none());
+        assert!(cli.bluetooth.is_none());
+        assert!(cli.control_port.is_none());
         assert!(matches!(
             parse_command(&cli.command.join(" "))?,
             Some(Command::DstarStart(_))
         ));
         Ok(())
+    }
+
+    #[test]
+    fn native_endpoint_preserves_typed_address_and_helper_path() -> TestResult {
+        let cli = Cli::try_parse_from([
+            "tmd750-repl",
+            "--bluetooth",
+            "01:23:45:67:89:AB",
+            "--bluetooth-helper",
+            "/Applications/Radio Tools/Native Helper",
+            "status",
+        ])?;
+        assert_eq!(
+            cli.bluetooth.as_ref().map(BluetoothAddress::as_str),
+            Some("01-23-45-67-89-AB")
+        );
+        assert_eq!(
+            cli.bluetooth_helper,
+            Some(PathBuf::from("/Applications/Radio Tools/Native Helper"))
+        );
+        assert_eq!(cli.command, ["status"]);
+        assert_eq!(cli.baud, DEFAULT_BAUD);
+        Ok(())
+    }
+
+    #[test]
+    fn native_endpoint_rejects_serial_options_and_orphaned_helper() {
+        for arguments in [
+            vec!["--bluetooth-helper", "/not/a/helper"],
+            vec!["--bluetooth", "not-an-address"],
+            vec!["--bluetooth", "01:23:45:67:89:AB", "--port", "/not/a/port"],
+            vec!["--bluetooth", "01:23:45:67:89:AB", "--baud", "9600"],
+        ] {
+            assert!(Cli::try_parse_from(std::iter::once("tmd750-repl").chain(arguments)).is_err());
+        }
     }
 
     #[test]

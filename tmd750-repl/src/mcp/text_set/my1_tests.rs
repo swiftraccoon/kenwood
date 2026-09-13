@@ -553,7 +553,7 @@ fn all_my1_output_artifacts_are_private_and_conflicts_preserve_existing_evidence
     };
     let output = directory.path().join("private evidence");
     let failed = Arc::new(AtomicBool::new(false));
-    let artifacts = Artifacts::create(Some(&output), Arc::clone(&failed))?;
+    let artifacts = Artifacts::create(CaptureKind::Mcp, Some(&output), Arc::clone(&failed))?;
     let _post_exit = artifacts.reserve_post_exit(Arc::clone(&failed))?;
     let _verification = verification_captures(&output, &failed)?;
     let mut journal = UpdateJournal::create(&output, Arc::clone(&failed))?;
@@ -580,7 +580,7 @@ fn all_my1_output_artifacts_are_private_and_conflicts_preserve_existing_evidence
     }
     let prefix = std::fs::read(output.join("update-journal.jsonl"))?;
     assert!(
-        Artifacts::create(Some(&output), failed).is_err(),
+        Artifacts::create(CaptureKind::Mcp, Some(&output), failed).is_err(),
         "explicit output conflicts must never reuse existing evidence"
     );
     assert_eq!(

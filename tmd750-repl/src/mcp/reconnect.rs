@@ -2,7 +2,7 @@
 
 mod readiness;
 
-pub(super) use readiness::{ReadinessVerification, verify_readiness};
+pub(crate) use readiness::{ReadinessVerification, verify_readiness};
 
 use std::fs::File;
 use std::future::Future;
@@ -15,9 +15,9 @@ use kenwood_transport::{Transport, TransportError};
 use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
 
-use super::capture::{CaptureTransport, Recorder, TranscriptSummary};
 use super::reconnect_policy::{ReconnectDecision, classify};
 use super::{CLOSE_TIMEOUT, Failure, IdentityEvidence, close_transport};
+use crate::capture::{CaptureTransport, Recorder, TranscriptSummary};
 
 const SETTLE: Duration = Duration::from_secs(2);
 // The earlier ten-second observation never saw the endpoint return.
@@ -25,8 +25,16 @@ const SETTLE: Duration = Duration::from_secs(2);
 const ENUMERATION_BUDGET: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+/// Reuse exact-service selection, including recognized macOS alias pairs.
+pub(crate) fn endpoint_is_unambiguous(
+    endpoint: &SerialCandidate,
+    candidates: &[SerialCandidate],
+) -> bool {
+    matches!(classify(endpoint, candidates), ReconnectDecision::Ready(selected) if selected == *endpoint)
+}
+
 /// Fixed workflow dependencies, replaceable by an entirely local test backend.
-pub(super) trait Backend {
+pub(crate) trait Backend {
     /// One owned connection; reopening this value is never requested.
     type Connection: Transport;
     /// Open exactly the supplied endpoint.
@@ -45,13 +53,13 @@ pub(super) trait Backend {
 
 /// Host implementation; never scans ports with CAT or invokes transport reopen.
 #[derive(Debug)]
-pub(super) struct SystemBackend {
+pub(crate) struct SystemBackend {
     started: Instant,
 }
 
 impl SystemBackend {
     /// Begin the monotonic host-policy clock.
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             started: Instant::now(),
         }
@@ -903,7 +911,7 @@ mod tests {
         let root = tempfile::tempdir()?;
         let path = root.path().join("fresh-cat.jsonl");
         let recorder = Recorder::named(
-            super::super::capture::create_private_file(&path)?,
+            crate::capture::create_private_file(&path)?,
             Arc::new(AtomicBool::new(false)),
             "fresh-cat.jsonl",
         );

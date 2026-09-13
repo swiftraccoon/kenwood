@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicBool;
 use kenwood_tmd750::transport::{KENWOOD_VID, SerialCandidate, TMD750_MAIN_PID, TMD750_PANEL_PID};
 
 use super::{Request, Reserved};
-use crate::mcp::capture::Artifacts;
+use crate::capture::{Artifacts, CaptureKind};
 use crate::mcp::{McpCommand, parse};
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
@@ -77,7 +77,11 @@ fn wrong_endpoint_baud_and_missing_approval_refuse_preparation() {
 fn all_evidence_is_exclusively_reserved_with_no_extra_transcript() -> TestResult {
     let root = tempfile::tempdir()?;
     let cancelled = Arc::new(AtomicBool::new(false));
-    let artifacts = Artifacts::create(Some(&root.path().join("probe")), Arc::clone(&cancelled))?;
+    let artifacts = Artifacts::create(
+        CaptureKind::Mcp,
+        Some(&root.path().join("probe")),
+        Arc::clone(&cancelled),
+    )?;
     let directory = artifacts.directory;
     let reserved = Reserved::create(&directory, artifacts.transcript, &cancelled)?;
     let mut filenames = std::fs::read_dir(&directory)?
@@ -111,7 +115,7 @@ fn all_evidence_is_exclusively_reserved_with_no_extra_transcript() -> TestResult
         Some("prepared")
     );
     assert!(
-        Artifacts::create(Some(&directory), cancelled).is_err(),
+        Artifacts::create(CaptureKind::Mcp, Some(&directory), cancelled).is_err(),
         "existing captures must not be overwritten"
     );
     #[cfg(unix)]

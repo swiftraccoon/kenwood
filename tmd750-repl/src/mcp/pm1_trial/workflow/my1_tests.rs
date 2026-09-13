@@ -1,7 +1,7 @@
 //! Whole MY1 workflow, including durable pre-dispatch scope and fresh guards.
 
 use super::*;
-use crate::mcp::capture::Artifacts;
+use crate::capture::{Artifacts, CaptureKind};
 use crate::mcp::pm1_trial::my1_tests::trial;
 use kenwood_tmd750::memory::MyCallsignTrial;
 use kenwood_tmd750::protocol::mcp::{ACK, read_request, write_request};
@@ -336,6 +336,7 @@ impl Harness {
                 });
             }
             let artifacts = Artifacts::create(
+                CaptureKind::Mcp,
                 Some(&directory.path().join(format!("session-{phase}"))),
                 Arc::clone(&failed),
             )?;

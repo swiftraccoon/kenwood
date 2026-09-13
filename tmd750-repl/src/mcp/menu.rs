@@ -15,8 +15,8 @@ use kenwood_tmd750::{
 use serde::Serialize;
 
 use super::snapshot::Snapshot;
-use super::{IdentityEvidence, capture, write_report};
-use crate::{AppResult, CommandError, output};
+use super::{IdentityEvidence, write_report};
+use crate::{AppResult, CommandError, capture, output};
 
 /// Discover menu fields offline or explicitly select a guarded live update.
 #[derive(Debug, Parser)]

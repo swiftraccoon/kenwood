@@ -1,7 +1,9 @@
 //! Deterministic reconnect workflow tests with observable handle ownership.
 
 use super::*;
+use crate::capture;
 use std::collections::VecDeque;
+use std::error::Error as StdError;
 use std::sync::Mutex;
 
 use kenwood_tmd750::protocol::mcp::{ACK, read_request, write_request};
@@ -308,6 +310,7 @@ impl Harness {
         let directory = tempfile::tempdir()?;
         let cancelled = Arc::new(AtomicBool::new(false));
         let artifacts = Artifacts::create(
+            CaptureKind::Mcp,
             Some(&directory.path().join("capture")),
             Arc::clone(&cancelled),
         )?;

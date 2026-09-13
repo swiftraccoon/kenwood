@@ -12,8 +12,8 @@ use kenwood_tmd750::{Identity, MemoryImage, SlotIndex};
 use serde::Serialize;
 
 use super::snapshot::Snapshot;
-use super::{IdentityEvidence, capture, write_report};
-use crate::{AppResult, CommandError, output};
+use super::{IdentityEvidence, write_report};
+use crate::{AppResult, CommandError, capture, output};
 
 /// Inspect text offline or select a separately bounded typed text setter.
 #[derive(Debug, Parser)]

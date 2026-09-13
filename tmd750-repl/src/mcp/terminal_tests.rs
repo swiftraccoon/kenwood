@@ -41,7 +41,7 @@ pub(super) fn write_fixture(path: &Path, image: &MemoryImage) -> TestResult {
             .ok_or("fixture segment outside image")?;
         *segment.get_mut("data").ok_or("fixture lacks data")? = serde_json::to_value(bytes)?;
     }
-    let mut writer = std::io::BufWriter::new(super::super::capture::create_private_file(path)?);
+    let mut writer = std::io::BufWriter::new(crate::capture::create_private_file(path)?);
     super::super::write_report(&mut writer, &document)?;
     Ok(())
 }

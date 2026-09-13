@@ -11,9 +11,9 @@ use kenwood_tmd750::types::{PAGE_SIZE, Page};
 use serde::Serialize;
 
 use super::super::IdentityEvidence;
-use super::super::capture::Recorder;
 use super::UpdateStatus;
 use super::target::{Update, UpdateKind};
+use crate::capture::Recorder;
 
 #[cfg(unix)]
 const FILENAME: &str = "update-journal.jsonl";
@@ -92,7 +92,7 @@ impl UpdateJournal {
             ));
         }
         let directory = directory.canonicalize()?;
-        let file = super::super::capture::create_private_file(&directory.join(FILENAME))?;
+        let file = crate::capture::create_private_file(&directory.join(FILENAME))?;
         Ok(Self {
             recorder: Recorder::named(file, Arc::clone(&capture_failed), FILENAME),
             directory,

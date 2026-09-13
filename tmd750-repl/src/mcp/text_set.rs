@@ -19,10 +19,10 @@ use serde::Serialize;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use super::capture::{Artifacts, Recorder, create_private_file};
 use super::reconnect::SystemBackend;
 use super::snapshot::Snapshot;
 use super::{Endpoint, Failure, finish_on_interrupt};
+use crate::capture::{Artifacts, CaptureKind, Recorder, create_private_file};
 use crate::{AppResult, CommandError, output};
 use journal::UpdateJournal;
 use target::{PreparedUpdate, Update, UpdateKind};
@@ -277,7 +277,11 @@ async fn run_prepared(
     let kind = update.kind();
     let cancelled = AtomicBool::new(false);
     let capture_failed = Arc::new(AtomicBool::new(false));
-    let artifacts = Artifacts::create(request.output.as_deref(), Arc::clone(&capture_failed))?;
+    let artifacts = Artifacts::create(
+        CaptureKind::Mcp,
+        request.output.as_deref(),
+        Arc::clone(&capture_failed),
+    )?;
     let post_exit = artifacts.reserve_post_exit(Arc::clone(&capture_failed))?;
     let verification = verification_captures(&artifacts.directory, &capture_failed)?;
     let mut journal = UpdateJournal::create(&artifacts.directory, capture_failed)?;
