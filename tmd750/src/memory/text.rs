@@ -574,15 +574,15 @@ fn decode(setting: TextSetting, metadata: TextMetadata, bytes: &[u8]) -> Result<
         .map_or(0, |index| index + 1);
     let meaningful = bytes.get(..end).unwrap_or_default();
     if metadata.encoding == StringEncoding::MemoryMap
-        && let Some(value) = meaningful
+        && let Some((offset, value)) = meaningful
             .iter()
             .copied()
-            .find(|byte| !byte.is_ascii_graphic() && *byte != b' ')
+            .enumerate()
+            .find(|(_, byte)| !byte.is_ascii_graphic() && *byte != b' ')
     {
-        return Err(SchemaError::TextByte {
+        return Err(SchemaError::Codec {
             field: metadata.field_name,
-            encoding: "MemoryMap",
-            value,
+            source: kenwood_schema::CodecError::InvalidMemoryMapTextByte { offset, value },
         }
         .into());
     }

@@ -453,13 +453,13 @@ fn encode_name(
         return Err(Pm1NameUpdateError::UnsupportedDescriptor);
     }
     let mut bytes = [0; FIELD_LENGTH];
-    for (index, (offset, mask, value)) in encoded.into_iter().enumerate() {
-        if index != offset || mask != u8::MAX {
+    for (index, patch) in encoded.into_iter().enumerate() {
+        if index != patch.offset() || patch.mask() != u8::MAX {
             return Err(Pm1NameUpdateError::UnsupportedDescriptor);
         }
         *bytes
-            .get_mut(offset)
-            .ok_or(Pm1NameUpdateError::UnsupportedDescriptor)? = value;
+            .get_mut(patch.offset())
+            .ok_or(Pm1NameUpdateError::UnsupportedDescriptor)? = patch.value();
     }
     Ok(bytes)
 }

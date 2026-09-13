@@ -4,6 +4,7 @@
 //! or power-cycle persistence. External finalization is explicitly attested by
 //! the test; the live driver may not attest it on behalf of its caller.
 
+use kenwood_schema as _;
 use mcp_d75_extract as _;
 use thiserror as _;
 use tokio_serial as _;

@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::memory::{Endian, FieldDescriptor, MenuOption, StringEncoding, menu_field};
+use kenwood_schema::CodecError;
 
 type TestError = Box<dyn std::error::Error>;
 type TestResult = Result<(), TestError>;
@@ -138,9 +139,10 @@ fn real_unsigned_codecs_parse_decimal_and_hex_with_storage_bounds() -> TestResul
         assert!(
             matches!(
                 field(name)?.parse_value(value),
-                Err(MenuValueError::Schema(
-                    SchemaError::UnsignedOutOfRange { .. }
-                ))
+                Err(MenuValueError::Schema(SchemaError::Codec {
+                    source: CodecError::UnsignedOutOfRange { .. },
+                    ..
+                }))
             ),
             "{name} must retain codec bounds after numeric parsing"
         );
@@ -195,7 +197,10 @@ fn unsigned_syntax_overflow_and_signed_decimal_are_not_guessed() -> TestResult {
         assert!(
             matches!(
                 signed.parse_value(input),
-                Err(MenuValueError::Schema(SchemaError::SignedOutOfRange { .. }))
+                Err(MenuValueError::Schema(SchemaError::Codec {
+                    source: CodecError::SignedOutOfRange { .. },
+                    ..
+                }))
             ),
             "signed storage bounds must reject {input}"
         );
@@ -386,8 +391,8 @@ fn choice_domains_and_codec_bounds_are_both_required_after_parsing() -> TestResu
     assert!(
         matches!(
             codec_bound.parse_value("Other"),
-            Err(MenuValueError::Schema(SchemaError::UnsignedOutOfRange {
-                value: 3,
+            Err(MenuValueError::Schema(SchemaError::Codec {
+                source: CodecError::UnsignedOutOfRange { value: 3, .. },
                 ..
             }))
         ),
@@ -429,7 +434,10 @@ fn strings_preserve_exact_text_and_use_encoded_byte_limits() -> TestResult {
         assert!(
             matches!(
                 utf8.parse_value(text),
-                Err(MenuValueError::Schema(SchemaError::TextTooLong { .. }))
+                Err(MenuValueError::Schema(SchemaError::Codec {
+                    source: CodecError::TextTooLong { .. },
+                    ..
+                }))
             ),
             "UTF-8 byte length, not character count or truncation, must enforce storage limits"
         );
@@ -444,7 +452,10 @@ fn strings_preserve_exact_text_and_use_encoded_byte_limits() -> TestResult {
         assert!(
             matches!(
                 ascii.parse_value(text),
-                Err(MenuValueError::Schema(SchemaError::TextByte { .. }))
+                Err(MenuValueError::Schema(SchemaError::Codec {
+                    source: CodecError::InvalidMemoryMapTextByte { .. },
+                    ..
+                }))
             ),
             "the actual memory-map encoding must reject unsupported text bytes"
         );

@@ -367,45 +367,23 @@ pub enum McpError {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum SchemaError {
+    /// A shared scalar codec rejected this model-bound field.
+    #[error("field {field}: {source}")]
+    Codec {
+        /// Model descriptor whose storage or value was rejected.
+        field: &'static str,
+        /// Scalar failure with offsets relative to the field.
+        #[source]
+        source: kenwood_schema::CodecError,
+    },
+    /// Masked assignments conflict or contain an invalid bit claim.
+    #[error(transparent)]
+    Patch(#[from] kenwood_schema::PatchError),
     /// A named registry descriptor differs from the immutable compiled entry.
     #[error("field {field} descriptor does not match the compiled registry")]
     CatalogDescriptorMismatch {
         /// Registered field name whose metadata was changed.
         field: &'static str,
-    },
-    /// The codec has a reversed range or an invalid encoded length.
-    #[error("field {field} has an invalid {property}")]
-    InvalidCodec {
-        /// Field containing the invalid codec.
-        field: &'static str,
-        /// Invalid structural property, without caller data.
-        property: &'static str,
-    },
-    /// An integer width is zero or exceeds eight bytes.
-    #[error("field {field} integer width {width} is outside 1..=8")]
-    InvalidIntegerWidth {
-        /// Field containing the invalid width.
-        field: &'static str,
-        /// Rejected byte width.
-        width: u8,
-    },
-    /// An integer domain cannot be represented by the encoded width.
-    #[error("field {field} domain does not fit its {width}-byte encoding")]
-    DomainExceedsWidth {
-        /// Field whose domain exceeds its storage capacity.
-        field: &'static str,
-        /// Declared byte width.
-        width: u8,
-    },
-    /// A bit codec has an invalid mask, shift, or domain.
-    #[error("field {field} has invalid bit codec mask 0x{mask:02X}, shift {shift}")]
-    InvalidBitField {
-        /// Field containing the invalid codec.
-        field: &'static str,
-        /// Declared owned bits.
-        mask: u8,
-        /// Declared shift.
-        shift: u8,
     },
     /// A byte patch is empty or contains bits outside its declared mask.
     #[error("byte patch at offset {offset} has invalid mask 0x{mask:02X} or unmasked value")]
@@ -448,12 +426,6 @@ pub enum SchemaError {
         expected: usize,
         /// Supplied buffer length.
         actual: usize,
-    },
-    /// Input text contains the codec's terminator or padding byte.
-    #[error("field {field} text contains a storage terminator")]
-    TextTerminator {
-        /// Field requiring exact round-trippable input.
-        field: &'static str,
     },
     /// A global field was given an unrelated Programmable-Memory slot.
     #[error("field {field} is global; omit the PM slot")]
@@ -521,30 +493,6 @@ pub enum SchemaError {
         /// Actual kind.
         actual: &'static str,
     },
-    /// An unsigned value is outside its bounds.
-    #[error("field {field} value {value} outside {min}..={max}")]
-    UnsignedOutOfRange {
-        /// Field name.
-        field: &'static str,
-        /// Rejected value.
-        value: u64,
-        /// Minimum.
-        min: u64,
-        /// Maximum.
-        max: u64,
-    },
-    /// A signed value is outside its bounds.
-    #[error("field {field} value {value} outside {min}..={max}")]
-    SignedOutOfRange {
-        /// Field name.
-        field: &'static str,
-        /// Rejected value.
-        value: i64,
-        /// Minimum.
-        min: i64,
-        /// Maximum.
-        max: i64,
-    },
     /// A value is not one of the field's allowed choices or enum members.
     #[error("field {field} value {value} is not an allowed choice")]
     DisallowedValue {
@@ -552,38 +500,6 @@ pub enum SchemaError {
         field: &'static str,
         /// Rejected value.
         value: u64,
-    },
-    /// Text does not fit the fixed string.
-    #[error("field {field} text of {len} bytes exceeds {max}")]
-    TextTooLong {
-        /// Field name.
-        field: &'static str,
-        /// Text length.
-        len: usize,
-        /// Capacity.
-        max: usize,
-    },
-    /// Text holds a byte the encoding cannot store.
-    #[error(
-        "field {field} text contains a byte the {encoding} encoding cannot store: 0x{value:02X}"
-    )]
-    TextByte {
-        /// Field name.
-        field: &'static str,
-        /// Encoding name.
-        encoding: &'static str,
-        /// The byte.
-        value: u8,
-    },
-    /// A byte value has the wrong length.
-    #[error("field {field} bytes of {len} do not match codec length {expected}")]
-    BytesLength {
-        /// Field name.
-        field: &'static str,
-        /// Given length.
-        len: usize,
-        /// Codec length.
-        expected: usize,
     },
     /// A field's storage exceeds the image.
     #[error("field {field} at {address} (len {len}) exceeds the image ({image_length})")]
@@ -596,16 +512,6 @@ pub enum SchemaError {
         len: usize,
         /// Image length.
         image_length: usize,
-    },
-    /// Two patches claim the same bits.
-    #[error("fields {first} and {second} both claim bits of byte {address}")]
-    ByteConflict {
-        /// First claimant.
-        first: &'static str,
-        /// Second claimant.
-        second: &'static str,
-        /// Byte address.
-        address: u32,
     },
     /// A patch lands outside every writable region.
     #[error("field {field} byte {address} lies outside the writable regions")]

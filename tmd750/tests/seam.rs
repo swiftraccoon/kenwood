@@ -1,5 +1,6 @@
 //! Model code must not depend on the TH-D75 library for shared transport I/O.
 
+use kenwood_schema as _;
 use kenwood_tmd750 as _;
 use kenwood_transport as _;
 use mcp_d75_extract as _;

@@ -1,6 +1,7 @@
 //! Deterministic text-layout and offline patch tests; no radio access.
 
 use super::*;
+use kenwood_schema::CodecError;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -203,9 +204,11 @@ fn unicode_capacity_is_checked_in_bytes_without_truncation() -> TestResult {
     assert_eq!(patched.get(0x4F00A..0x4F01A), Some(exact.as_bytes()));
     assert!(matches!(
         view.preview(TextSetting::PmName1, TextScope::Global, &"é".repeat(9)),
-        Err(TextError::Schema(SchemaError::TextTooLong {
-            len: 18,
-            max: 16,
+        Err(TextError::Schema(SchemaError::Codec {
+            source: CodecError::TextTooLong {
+                actual: 18,
+                max: 16
+            },
             ..
         }))
     ));
@@ -224,11 +227,17 @@ fn memory_map_strings_reject_non_ascii_and_keep_exact_capacity() -> TestResult {
         assert_eq!(view.preview(setting, scope, &exact)?.after(), exact);
         assert!(matches!(
             view.preview(setting, scope, "café"),
-            Err(TextError::Schema(SchemaError::TextByte { .. }))
+            Err(TextError::Schema(SchemaError::Codec {
+                source: CodecError::InvalidMemoryMapTextByte { .. },
+                ..
+            }))
         ));
         assert!(matches!(
             view.preview(setting, scope, &(exact + "X")),
-            Err(TextError::Schema(SchemaError::TextTooLong { .. }))
+            Err(TextError::Schema(SchemaError::Codec {
+                source: CodecError::TextTooLong { .. },
+                ..
+            }))
         ));
     }
     Ok(())
@@ -342,7 +351,10 @@ fn corrupt_stored_text_is_not_silently_truncated_or_replacement_decoded() -> Tes
     let image = MemoryImage::from_bytes(bytes)?;
     assert!(matches!(
         TextImage::new(&image, &firmware)?.read(setting, scope),
-        Err(TextError::Schema(SchemaError::TextByte { value: 0, .. }))
+        Err(TextError::Schema(SchemaError::Codec {
+            source: CodecError::InvalidMemoryMapTextByte { value: 0, .. },
+            ..
+        }))
     ));
     Ok(())
 }

@@ -6,6 +6,60 @@ use crate::memory::menu_field;
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 #[test]
+fn model_decoding_keeps_stored_domains_nonzero_booleans_and_first_terminators() -> TestResult {
+    let number = FieldDescriptor::new("test.Number", 8, FieldCodec::Byte { min: 0, max: 2 });
+    let flag = FieldDescriptor::new("test.Flag", 9, FieldCodec::Bool);
+    let text = FieldDescriptor::new(
+        "test.Text",
+        10,
+        FieldCodec::FixedString {
+            len: 5,
+            encoding: StringEncoding::Utf8,
+            padding: b' ',
+        },
+    );
+    let mut image = [0; 16];
+    *image.get_mut(8).ok_or("number byte")? = 255;
+    *image.get_mut(9).ok_or("boolean byte")? = 7;
+    image
+        .get_mut(10..15)
+        .ok_or("text span")?
+        .copy_from_slice(b"A \xFFBC");
+    assert_eq!(number.read(&image, None)?, DecodedFieldValue::Unsigned(255));
+    assert_eq!(flag.read(&image, None)?, DecodedFieldValue::Bool(true));
+    assert_eq!(
+        text.read(&image, None)?,
+        DecodedFieldValue::Text("A".to_owned())
+    );
+    image
+        .get_mut(10..15)
+        .ok_or("text span")?
+        .copy_from_slice(b"B\0\xFFCD");
+    assert_eq!(
+        text.read(&image, None)?,
+        DecodedFieldValue::Text("B".to_owned())
+    );
+    assert!(number.encode(FieldValue::Unsigned(255)).is_err());
+    assert!(text.encode(FieldValue::Text("A B")).is_err());
+    assert!(text.encode(FieldValue::Text("A\0B")).is_err());
+    Ok(())
+}
+
+#[test]
+fn scalar_types_are_shared_without_converting_or_weakening_model_metadata() -> TestResult {
+    use kenwood_schema::{
+        FieldCodec as SharedCodec, FieldValue as SharedValue, MaskedByte as SharedMaskedByte,
+    };
+
+    let codec: SharedCodec = FieldCodec::Byte { min: 0, max: 2 };
+    let field = FieldDescriptor::new("test.Shared", 8, codec);
+    let value: SharedValue<'_> = FieldValue::Unsigned(2);
+    let encoded: Vec<SharedMaskedByte> = field.encode(value)?;
+    assert_eq!(encoded, vec![MaskedByte::new(0, 0xFF, 2)?]);
+    Ok(())
+}
+
+#[test]
 fn registered_bitmap_round_trips_offline_in_the_last_pm_slot() -> TestResult {
     let field = menu_field("radio.PoweronBitmap").ok_or("registered bitmap")?;
     let slot = Some(SlotIndex::new(5)?);
@@ -252,9 +306,9 @@ fn every_contiguous_bitfield_shape_preserves_neighbor_bits() -> TestResult {
             );
             for value in [0, u64::from(maximum)] {
                 let mut image = [0xA5; 16];
-                for (offset, owned, bits) in field.encode(FieldValue::Unsigned(value))? {
-                    let byte = image.get_mut(8 + offset).ok_or("bitfield byte")?;
-                    *byte = (*byte & !owned) | bits;
+                for patch in field.encode(FieldValue::Unsigned(value))? {
+                    let byte = image.get_mut(8 + patch.offset()).ok_or("bitfield byte")?;
+                    *byte = patch.apply(*byte);
                 }
                 assert_eq!(
                     field.read(&image, None)?,
@@ -280,7 +334,7 @@ fn every_contiguous_bitfield_shape_preserves_neighbor_bits() -> TestResult {
             let encoded = flag.encode(FieldValue::Bool(enabled))?;
             assert_eq!(
                 encoded,
-                vec![(0, mask, if enabled { mask } else { 0 })],
+                vec![MaskedByte::new(0, mask, if enabled { mask } else { 0 })?],
                 "every single-bit boolean mask must encode without rejecting valid shapes"
             );
         }
@@ -363,6 +417,28 @@ fn rejected_assignment_never_retains_a_writable_prefix() -> TestResult {
     assert!(
         planner.finish()?.is_empty(),
         "rejected field prefix must not remain planned"
+    );
+    Ok(())
+}
+
+#[test]
+fn identical_repeated_assignments_are_idempotent() -> TestResult {
+    let flag = FieldDescriptor::new("test.Flag", 8, FieldCodec::BitBool { mask: 0x01 });
+    let alias = FieldDescriptor::new("test.Alias", 8, FieldCodec::BitBool { mask: 0x01 });
+    let neighboring = FieldDescriptor::new("test.Neighbor", 8, FieldCodec::BitBool { mask: 0x02 });
+    let mut planner = PatchPlanner::new();
+    let _planned = planner.set(&flag, None, FieldValue::Bool(true))?;
+    let _planned = planner.set(&flag, None, FieldValue::Bool(true))?;
+    let _planned = planner.set(&alias, None, FieldValue::Bool(true))?;
+    let _planned = planner.set(&neighboring, None, FieldValue::Bool(false))?;
+    let patches = planner.finish()?;
+    let mut image = vec![0xFE; 48];
+    patches.apply_to_image(&mut image)?;
+    assert_eq!(image.get(8), Some(&0xFD));
+    assert_eq!(patches.len(), 1);
+    assert_eq!(
+        patches.pages().first().ok_or("planned page")?.bytes().len(),
+        1
     );
     Ok(())
 }

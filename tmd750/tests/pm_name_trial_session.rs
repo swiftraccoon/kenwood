@@ -3,6 +3,7 @@
 //! Persistence cases model separate MCP sessions after exit and fresh identity
 //! verification. They do not simulate or independently prove a physical reboot.
 
+use kenwood_schema as _;
 use mcp_d75_extract as _;
 use thiserror as _;
 use tokio_serial as _;

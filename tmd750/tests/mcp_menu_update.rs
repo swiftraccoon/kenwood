@@ -1,5 +1,6 @@
 //! Public format-checked menu updates on simulated firmware 1.02.
 
+use kenwood_schema as _;
 use mcp_d75_extract as _;
 use thiserror as _;
 use tokio_serial as _;

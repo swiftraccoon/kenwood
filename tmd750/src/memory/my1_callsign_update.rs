@@ -651,8 +651,11 @@ fn encode_callsign(
         .get_mut(..callsign.as_str().len())
         .ok_or(My1CallsignUpdateError::UnsupportedDescriptor)?
         .copy_from_slice(callsign.as_str().as_bytes());
-    for (index, (offset, mask, value)) in encoded.into_iter().enumerate() {
-        if index != offset || mask != u8::MAX || bytes.get(offset) != Some(&value) {
+    for (index, patch) in encoded.into_iter().enumerate() {
+        if index != patch.offset()
+            || patch.mask() != u8::MAX
+            || bytes.get(patch.offset()) != Some(&patch.value())
+        {
             return Err(My1CallsignUpdateError::UnsupportedDescriptor);
         }
     }

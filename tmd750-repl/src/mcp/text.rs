@@ -527,10 +527,14 @@ mod tests {
     fn schema_error_names_are_replaced_with_stable_setting_keys() -> TestResult {
         let setting = TextSetting::PmName1;
         let metadata = setting.metadata()?;
-        let error = kenwood_tmd750::error::SchemaError::TextTooLong {
-            field: metadata.field_name,
-            len: 17,
-            max: 16,
+        let field = menu_field(metadata.field_name).ok_or("missing text field")?;
+        let result = field
+            .descriptor
+            .encode(kenwood_tmd750::memory::FieldValue::Text(
+                "12345678901234567",
+            ));
+        let Err(error) = result else {
+            return Err("oversized text must fail codec validation".into());
         };
         let message = setting_error(setting, metadata, &error).to_string();
         assert!(message.contains("pm-name-1"));

@@ -1,5 +1,6 @@
 //! Fixed-region backup coverage, partial evidence, and detached lifecycle safety.
 
+use kenwood_schema as _;
 use mcp_d75_extract as _;
 use thiserror as _;
 use tokio_serial as _;

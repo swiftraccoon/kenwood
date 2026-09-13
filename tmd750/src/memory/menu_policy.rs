@@ -572,10 +572,12 @@ mod tests {
         );
         assert_eq!(
             name.validate_ordinary_value(FieldValue::Text("12345678901234567")),
-            Err(MenuWritePolicyError::Schema(SchemaError::TextTooLong {
+            Err(MenuWritePolicyError::Schema(SchemaError::Codec {
                 field: "pm.PmName1",
-                len: 17,
-                max: 16,
+                source: kenwood_schema::CodecError::TextTooLong {
+                    actual: 17,
+                    max: 16
+                },
             })),
             "ordinary text must retain its byte-length bound"
         );

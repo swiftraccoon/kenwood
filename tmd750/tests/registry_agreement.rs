@@ -2,6 +2,7 @@
 //!
 //! This is software-artifact agreement, not live-radio field qualification.
 
+use kenwood_schema as _;
 use kenwood_transport as _;
 use thiserror as _;
 use tokio as _;

@@ -1,5 +1,6 @@
 //! Serial candidates are ordered TM-D750, JVCKENWOOD, then others.
 
+use kenwood_schema as _;
 use kenwood_transport as _;
 use mcp_d75_extract as _;
 use thiserror as _;

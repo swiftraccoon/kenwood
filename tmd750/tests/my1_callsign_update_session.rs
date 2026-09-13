@@ -3,6 +3,7 @@
 //! All transports are scripted. Explicit test finalization is a caller
 //! attestation, not hardware, capture-durability, or power-cycle evidence.
 
+use kenwood_schema as _;
 use mcp_d75_extract as _;
 use thiserror as _;
 use tokio_serial as _;

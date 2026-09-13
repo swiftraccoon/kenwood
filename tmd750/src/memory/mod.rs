@@ -149,17 +149,16 @@ impl MemoryImage {
         value: FieldValue<'_>,
     ) -> Result<(), SchemaError> {
         let start = field.address(slot)?.as_usize();
-        for (offset, mask, bits) in field.encode(value)? {
-            let byte =
-                self.bytes
-                    .get_mut(start + offset)
-                    .ok_or_else(|| SchemaError::OutOfBounds {
-                        field: field.name,
-                        address: u64::try_from(start + offset).unwrap_or(u64::MAX),
-                        len: 1,
-                        image_length: IMAGE_LENGTH,
-                    })?;
-            *byte = (*byte & !mask) | (bits & mask);
+        for patch in field.encode(value)? {
+            let byte = self.bytes.get_mut(start + patch.offset()).ok_or_else(|| {
+                SchemaError::OutOfBounds {
+                    field: field.name,
+                    address: u64::try_from(start + patch.offset()).unwrap_or(u64::MAX),
+                    len: 1,
+                    image_length: IMAGE_LENGTH,
+                }
+            })?;
+            *byte = patch.apply(*byte);
         }
         Ok(())
     }

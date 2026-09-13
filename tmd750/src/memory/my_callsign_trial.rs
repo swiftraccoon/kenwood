@@ -452,13 +452,13 @@ fn encode_callsign(field: &MenuField) -> Result<[u8; FIELD_LENGTH], PmNameTrialE
         return Err(PmNameTrialError::UnsupportedDescriptor);
     }
     let mut bytes = [0; FIELD_LENGTH];
-    for (index, (offset, mask, value)) in encoded.into_iter().enumerate() {
-        if index != offset || mask != u8::MAX {
+    for (index, patch) in encoded.into_iter().enumerate() {
+        if index != patch.offset() || patch.mask() != u8::MAX {
             return Err(PmNameTrialError::UnsupportedDescriptor);
         }
         *bytes
-            .get_mut(offset)
-            .ok_or(PmNameTrialError::UnsupportedDescriptor)? = value;
+            .get_mut(patch.offset())
+            .ok_or(PmNameTrialError::UnsupportedDescriptor)? = patch.value();
     }
     if bytes != *b"KQ4NIT\0\0" {
         return Err(PmNameTrialError::UnsupportedDescriptor);

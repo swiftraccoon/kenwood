@@ -5,6 +5,7 @@ use super::menu_fields::MenuField;
 use super::schema::{DecodedFieldValue, FieldCodec, FieldValue, PatchPlanner};
 use crate::error::SchemaError;
 use crate::types::SlotIndex;
+use kenwood_schema::{ChoiceError, validate_choices};
 
 /// Failure to parse or validate one scalar menu value.
 ///
@@ -59,23 +60,6 @@ pub enum MenuValueError {
     /// The parsed scalar violated the field's enum, choice, or storage domain.
     #[error(transparent)]
     Schema(#[from] SchemaError),
-}
-
-impl DecodedFieldValue {
-    /// Borrow this owned value as input to field validation or patch planning.
-    ///
-    /// This conversion neither normalizes the value nor validates its writable
-    /// domain. Stored values can be unknown to a menu's current option list.
-    #[must_use]
-    pub const fn as_field_value(&self) -> FieldValue<'_> {
-        match self {
-            Self::Unsigned(value) => FieldValue::Unsigned(*value),
-            Self::Signed(value) => FieldValue::Signed(*value),
-            Self::Bool(value) => FieldValue::Bool(*value),
-            Self::Text(value) => FieldValue::Text(value.as_str()),
-            Self::Bytes(value) => FieldValue::Bytes(value.as_slice()),
-        }
-    }
 }
 
 impl MenuField {
@@ -196,25 +180,22 @@ impl MenuField {
     /// Pure image encoding also uses this check. A registered binary field may
     /// be encoded offline even when scalar page planning does not admit it.
     pub(crate) fn validate_value_domain(&self, value: FieldValue<'_>) -> Result<(), SchemaError> {
-        if self.options.is_empty() && self.allowed_values.is_empty() {
-            return Ok(());
-        }
-        let FieldValue::Unsigned(raw) = value else {
-            return Err(SchemaError::TypeMismatch {
+        validate_choices(
+            value,
+            self.options.iter().map(|option| option.raw),
+            self.allowed_values,
+        )
+        .map_err(|error| match error {
+            ChoiceError::TypeMismatch { actual } => SchemaError::TypeMismatch {
                 field: self.descriptor.name,
                 expected: "unsigned",
-                actual: value.kind_name(),
-            });
-        };
-        let missing_option = !self.options.is_empty() && self.option(raw).is_none();
-        let missing_choice = !self.allowed_values.is_empty() && !self.allowed_values.contains(&raw);
-        if missing_option || missing_choice {
-            return Err(SchemaError::DisallowedValue {
+                actual,
+            },
+            ChoiceError::DisallowedValue { value } => SchemaError::DisallowedValue {
                 field: self.descriptor.name,
-                value: raw,
-            });
-        }
-        Ok(())
+                value,
+            },
+        })
     }
 
     /// Decode this field through `access`.

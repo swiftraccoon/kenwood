@@ -573,6 +573,20 @@ booleans, raw integers, exact strings, and unique public enum labels. It checks
 the recorded domain and storage codec; it does not infer display units or turn
 unmapped raw values into qualified settings.
 
+Scalar codecs, finite-choice validation, and masked-byte conflict handling come
+from `kenwood-schema`. This model retains its registry identity, PM-slot address
+resolution, image limits, and writable-region policy. Stored reads preserve
+off-menu numeric values, treat nonzero boolean bytes as true, and stop text at
+the first NUL or configured padding byte. Desired values remain strictly checked.
+
+`FieldDescriptor::encode` returns validated `kenwood_schema::MaskedByte` values
+relative to the field start. Codec failures retain the descriptor name in
+`SchemaError::Codec` and expose the typed shared cause. Repeating an identical
+field assignment is idempotent; conflicting overlapping bits fail atomically
+through `SchemaError::Patch`. A rejected assignment leaves prior claims intact.
+Low-level `PagePatch` construction still rejects overlapping entries, and page
+application still requires an exact complete buffer.
+
 `McpSession::read_menu_snapshot` reads each required canonical page once,
 including short and non-aligned fragments. A `MenuFieldSnapshot` can also be
 constructed from previously captured complete pages. Decoding requires full

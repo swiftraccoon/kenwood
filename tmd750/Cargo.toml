@@ -13,6 +13,7 @@ readme = "README.md"
 publish = false
 
 [dependencies]
+kenwood-schema = { path = "../kenwood-schema" }
 kenwood-transport = { path = "../kenwood-transport", default-features = false, features = [
   "serial",
 ] }

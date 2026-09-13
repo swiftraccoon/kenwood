@@ -1,5 +1,6 @@
 //! Fixed Gateway-Off probe admission, wire scope, cancellation, and retirement.
 
+use kenwood_schema as _;
 use mcp_d75_extract as _;
 use thiserror as _;
 use tokio_serial as _;

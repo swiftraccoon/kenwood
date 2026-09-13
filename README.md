@@ -24,7 +24,7 @@ Rust workspace for Kenwood amateur-radio transceivers: core TH-D75 library, TUI,
 | Radio | Core | TUI | REPL | Status |
 |-------|------|-----|------|--------|
 | TH-D75A/E | [`thd75/`](thd75/) | [`thd75-tui/`](thd75-tui/) | [`thd75-repl/`](thd75-repl/) | experimental |
-| TM-D750 | [`tmd750/`](tmd750/) | Planned | [`tmd750-repl/`](tmd750-repl/) | USB CAT, standard-region backup, and fixed PM1 rename/restore bench-validated; narrow PM1 setter implemented; other text fields remain offline-only and automatic Terminal Mode remains unqualified |
+| TM-D750 | [`tmd750/`](tmd750/) | Planned | [`tmd750-repl/`](tmd750-repl/) | USB CAT/MCP and Bluetooth automatic Terminal startup/restoration bench-validated on firmware 1.02 / K,2,1, PM Off; see the REPL documentation for the qualified scope and remaining limits |
 
 ## Crates
 
@@ -44,7 +44,7 @@ expecting stability.
 | [`if-dsp/`](if-dsp/) | Sans-io DSP for a 12 kHz low-IF stream: channelizer, USB/LSB/CW/AM demodulation, AGC | experimental |
 | [`mcp-d75-extract/`](mcp-d75-extract/) | Extracts the TH-D75 and TM-D750 MCP memory-map manifests (plus both Rust field registries) from the official programming software and diffs them across firmware releases | experimental |
 | [`tmd750/`](tmd750/) | TM-D750 library: CAT identity, MCP region programming with read-back verification, manifest-driven menu fields per Programmable-Memory slot, `.d750` files | experimental |
-| [`tmd750-repl/`](tmd750-repl/) | Screen-reader-friendly TM-D750 USB REPL with typed CAT control and a strict MMDVM-probed D-STAR reflector path | experimental |
+| [`tmd750-repl/`](tmd750-repl/) | Screen-reader-friendly TM-D750 REPL with USB/native Bluetooth CAT, guarded MCP settings, and automatic Bluetooth D-STAR startup with independent USB restoration | experimental |
 | [`kiss-tnc/`](kiss-tnc/) | KISS TNC wire framing (`no_std` + `alloc`, sans-io) | experimental |
 | [`ax25-codec/`](ax25-codec/) | AX.25 v2.2 frame codec (`no_std` + `alloc`, sans-io) | experimental |
 | [`aprs/`](aprs/) | APRS parser, digipeater, SmartBeaconing, messaging, station list (std, sans-io) | experimental |

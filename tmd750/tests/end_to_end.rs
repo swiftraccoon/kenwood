@@ -1,6 +1,7 @@
 //! Identify, read the slot menus, decode a PM name, patch it, write it back
 //! verified, exit: the whole slice over the mock transport.
 
+use kenwood_schema as _;
 use mcp_d75_extract as _;
 use thiserror as _;
 use tokio_serial as _;
