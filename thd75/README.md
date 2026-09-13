@@ -211,6 +211,19 @@ strings accept text. Raw bitmap fields accept `hex:...` or `@FILE`. The
 command reads only pages referenced by the patch, writes only pages that
 actually change, and verifies each write by read-back.
 
+Scalar codecs and atomic masked-bit claims come from
+[`kenwood-schema`](https://github.com/swiftraccoon/kenwood/tree/main/kenwood-schema).
+The memory API exposes those same scalar types. TH-D75 retains generated
+descriptor identity, finite menu domains, page geometry, factory-calibration
+protection, and all radio I/O. Stored-value reads preserve off-menu numeric
+values but still reject noncanonical booleans and malformed text. NUL-padded
+text rejects non-NUL data after a terminator; full-width text needs no
+terminator. Unrelated bits remain unchanged when a patch is applied.
+
+`SchemaError::Codec` retains the field name and typed shared codec cause;
+`SchemaError::Patch` retains conflicting field ownership and byte positions.
+Neither offline validation nor a patch plan grants permission to write a radio.
+
 ## V1.03.AZM closed-loop automation
 
 `Radio::qualify_automation()` is available only for the exact hash-pinned

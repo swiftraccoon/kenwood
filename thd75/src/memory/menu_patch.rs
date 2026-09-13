@@ -1,28 +1,26 @@
 //! Safe value planning for generated MCP-D75 menu metadata.
 
 use super::{DecodedFieldValue, FieldValue, MenuField, PatchPlanner, SchemaError};
+use kenwood_schema::{ChoiceError, validate_choices};
 
 impl MenuField {
     pub(super) fn validate_patch_value(&self, value: FieldValue<'_>) -> Result<(), SchemaError> {
-        if !self.options.is_empty() || !self.allowed_values.is_empty() {
-            let FieldValue::Unsigned(raw) = value else {
-                return Err(SchemaError::TypeMismatch {
-                    field: self.descriptor.name,
-                    expected: "unsigned",
-                    actual: value.kind_name(),
-                });
-            };
-            let missing_enum = !self.options.is_empty() && self.option(raw).is_none();
-            let missing_choice =
-                !self.allowed_values.is_empty() && !self.allowed_values.contains(&raw);
-            if missing_enum || missing_choice {
-                return Err(SchemaError::DisallowedValue {
-                    field: self.descriptor.name,
-                    value: raw,
-                });
-            }
-        }
-        Ok(())
+        validate_choices(
+            value,
+            self.options.iter().map(|option| option.raw),
+            self.allowed_values,
+        )
+        .map_err(|error| match error {
+            ChoiceError::TypeMismatch { actual } => SchemaError::TypeMismatch {
+                field: self.descriptor.name,
+                expected: "unsigned",
+                actual,
+            },
+            ChoiceError::DisallowedValue { value } => SchemaError::DisallowedValue {
+                field: self.descriptor.name,
+                value,
+            },
+        })
     }
 
     /// Decode and validate this field from a complete MCP memory image.
@@ -168,11 +166,13 @@ mod tests {
         assert!(
             matches!(
                 field.read(&image),
-                Err(SchemaError::UnsignedOutOfRange {
+                Err(SchemaError::Codec {
                     field: "radio.Pf1PfKey",
-                    value: 31,
-                    max: 30,
-                    ..
+                    source: kenwood_schema::CodecError::UnsignedOutOfRange {
+                        value: 31,
+                        max: 30,
+                        ..
+                    },
                 })
             ),
             "strict setting reads must continue to enforce the writable domain"
@@ -191,11 +191,13 @@ mod tests {
         assert!(
             matches!(
                 field.validate_stored_value(FieldValue::Unsigned(256)),
-                Err(SchemaError::UnsignedOutOfRange {
+                Err(SchemaError::Codec {
                     field: "radio.Pf1PfKey",
-                    value: 256,
-                    min: 0,
-                    max: 255,
+                    source: kenwood_schema::CodecError::UnsignedOutOfRange {
+                        value: 256,
+                        min: 0,
+                        max: 255,
+                    },
                 })
             ),
             "expected values still have to fit the physical storage byte"

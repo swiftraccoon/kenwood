@@ -45,6 +45,7 @@ use aprs_is as _;
 use ax25_codec as _;
 use dstar_gateway_core as _;
 use encoding_rs as _;
+use kenwood_schema as _;
 use kenwood_transport as _;
 use kiss_tnc as _;
 use mmdvm as _;

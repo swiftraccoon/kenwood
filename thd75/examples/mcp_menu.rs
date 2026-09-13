@@ -50,6 +50,7 @@ use std::fmt::Write as _;
 use std::future::Future;
 use std::io;
 
+use kenwood_schema::CodecError;
 use kenwood_thd75::memory::{
     DecodedFieldValue, FieldCodec, FieldValue, MCP_D75_MENU_FIELDS, MCP_D75_SCHEMA_FIRMWARE,
     MCP_D75_SCHEMA_FIRMWARE_IDENTITIES, MCP_D75_SCHEMA_MODEL, MCP_D75_SCHEMA_VERSION,
@@ -438,17 +439,28 @@ const fn observed_scalar_after_validation_error(
     error: &SchemaError,
 ) -> Option<DecodedFieldValue> {
     match (codec, error) {
-        (FieldCodec::Bool, SchemaError::UnsignedOutOfRange { value, .. }) => {
-            Some(DecodedFieldValue::Bool(*value != 0))
-        }
+        (
+            FieldCodec::Bool,
+            SchemaError::Codec {
+                source: CodecError::NonCanonicalBoolean { value },
+                ..
+            },
+        ) => Some(DecodedFieldValue::Bool(*value != 0)),
         (
             FieldCodec::Byte { .. } | FieldCodec::BitField { .. } | FieldCodec::Unsigned { .. },
-            SchemaError::UnsignedOutOfRange { value, .. }
+            SchemaError::Codec {
+                source: CodecError::UnsignedOutOfRange { value, .. },
+                ..
+            }
             | SchemaError::DisallowedValue { value, .. },
         ) => Some(DecodedFieldValue::Unsigned(*value)),
-        (FieldCodec::Signed { .. }, SchemaError::SignedOutOfRange { value, .. }) => {
-            Some(DecodedFieldValue::Signed(*value))
-        }
+        (
+            FieldCodec::Signed { .. },
+            SchemaError::Codec {
+                source: CodecError::SignedOutOfRange { value, .. },
+                ..
+            },
+        ) => Some(DecodedFieldValue::Signed(*value)),
         _ => None,
     }
 }
@@ -1517,7 +1529,9 @@ mod tests {
         assert!(
             json_at(boolean_decoded, &["validation_error"])?
                 .as_str()
-                .is_some_and(|error| error.contains("outside 0..=1")),
+                .is_some_and(|error| {
+                    error == "field test.b_bool: boolean byte 2 is not canonical zero or one"
+                }),
             "noncanonical JSON lost the strict schema error: {boolean_decoded}"
         );
 

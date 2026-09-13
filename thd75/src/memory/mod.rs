@@ -144,8 +144,8 @@ pub use menu_fields::{
     StorageTransform, menu_field,
 };
 pub use schema::{
-    BytePatch, DecodedFieldValue, Endian, FieldCodec, FieldDescriptor, FieldValue, PagePatch,
-    PatchPlanner, PatchSet, SchemaError, StringEncoding,
+    DecodedFieldValue, Endian, FieldCodec, FieldDescriptor, FieldValue, PagePatch, PatchPlanner,
+    PatchSet, SchemaError, StringEncoding,
 };
 pub use settings::{SettingsAccess, SettingsValueError, SettingsWriter};
 

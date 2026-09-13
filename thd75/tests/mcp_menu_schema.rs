@@ -9,6 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use kenwood_schema::CodecError;
 use kenwood_thd75::memory::{
     Endian, FieldCodec, FieldValue, MCP_D75_MENU_FIELDS, MCP_D75_SCHEMA_VERSION,
     MCP_D75_SOURCE_SHA256, MenuField, PatchPlanner, SchemaError, StringEncoding, menu_field,
@@ -730,10 +731,12 @@ fn aprs_distance_limits_include_off_and_reject_reserved_high_values() -> TestRes
         assert!(
             matches!(
                 field.plan_value(&mut planner, FieldValue::Unsigned(251)),
-                Err(SchemaError::UnsignedOutOfRange {
-                    value: 251,
-                    min: 0,
-                    max: 250,
+                Err(SchemaError::Codec {
+                    source: CodecError::UnsignedOutOfRange {
+                        value: 251,
+                        min: 0,
+                        max: 250,
+                    },
                     ..
                 })
             ),

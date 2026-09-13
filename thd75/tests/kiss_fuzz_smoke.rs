@@ -22,6 +22,7 @@ use ax25_codec::parse_ax25;
 use aprs_is as _;
 use dstar_gateway_core as _;
 use encoding_rs as _;
+use kenwood_schema as _;
 use kenwood_thd75 as _;
 use kenwood_transport as _;
 use kiss_tnc as _;

@@ -5,133 +5,22 @@
 //! while [`PatchPlanner`] converts requested values into byte masks that can
 //! be applied to freshly-read radio pages.  Bit fields therefore preserve
 //! unrelated bits even when the caller does not hold a current full image.
+//!
+//! Scalar codecs and atomic bit ownership belong to `kenwood-schema`.
+//! This facade selects canonical booleans and exact text padding, validates
+//! catalog identity and menu domains, and maps claims onto writable TH-D75
+//! pages. It performs no protocol I/O or connection recovery.
 
 use std::collections::BTreeMap;
 use std::fmt;
 
+use kenwood_schema::{
+    BooleanDecoding, ByteClaims, CodecError, DecodeOptions, MaskedByte, PatchError, TextPolicy,
+    ValueDomain,
+};
+pub use kenwood_schema::{DecodedFieldValue, Endian, FieldCodec, FieldValue, StringEncoding};
+
 use crate::protocol::programming::{self, McpPage, WritableMcpPage};
-
-/// Byte order for a multi-byte integer field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Endian {
-    /// Least-significant byte first.
-    Little,
-    /// Most-significant byte first.
-    Big,
-}
-
-/// Encoding for a fixed-width string field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StringEncoding {
-    /// UTF-8 bytes.
-    Utf8,
-    /// MCP-D75's model-dependent memory-map encoding.
-    ///
-    /// The patch engine accepts only printable ASCII (`0x20`-`0x7E`) for this
-    /// encoding. Other bytes are rejected because control bytes are not
-    /// display text and the official application switches between Windows-
-    /// 1252 and Shift-JIS for extended characters according to radio model.
-    MemoryMap,
-}
-
-/// On-image encoding and validation domain for one menu field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FieldCodec {
-    /// One unsigned byte.
-    Byte {
-        /// Smallest accepted raw value.
-        min: u8,
-        /// Largest accepted raw value.
-        max: u8,
-    },
-    /// One byte containing `0` or `1`.
-    Bool,
-    /// One boolean bit within a byte shared by other fields.
-    BitBool {
-        /// The single bit owned by this field.
-        mask: u8,
-    },
-    /// A masked unsigned value within one byte.
-    BitField {
-        /// Bits owned by this field.
-        mask: u8,
-        /// Right shift between the masked bits and the raw value.
-        shift: u8,
-        /// Smallest accepted raw value.
-        min: u8,
-        /// Largest accepted raw value.
-        max: u8,
-    },
-    /// A fixed-width padded string.
-    ///
-    /// NUL padding is terminator-based: decoded bytes after the first NUL
-    /// must also be NUL. Other padding bytes are removed only from the end.
-    /// Semantic text containing a NUL for NUL padding, or ending in any
-    /// non-NUL padding byte, is rejected so encoding and decoding are exact
-    /// inverses for every accepted value.
-    FixedString {
-        /// Number of bytes reserved in the image.
-        len: usize,
-        /// Character encoding used by the field.
-        encoding: StringEncoding,
-        /// Byte used to fill unused trailing space.
-        padding: u8,
-    },
-    /// An unsigned integer occupying one to eight bytes.
-    Unsigned {
-        /// Encoded width in bytes.
-        width: u8,
-        /// Byte order.
-        endian: Endian,
-        /// Smallest accepted value.
-        min: u64,
-        /// Largest accepted value.
-        max: u64,
-    },
-    /// A signed integer occupying one to eight bytes.
-    Signed {
-        /// Encoded width in bytes.
-        width: u8,
-        /// Byte order.
-        endian: Endian,
-        /// Smallest accepted value.
-        min: i64,
-        /// Largest accepted value.
-        max: i64,
-    },
-    /// An exact-length raw byte sequence.
-    Bytes {
-        /// Required byte count.
-        len: usize,
-    },
-}
-
-impl FieldCodec {
-    /// Number of image bytes this codec occupies.
-    ///
-    /// Bit-level codecs share their byte with other fields but still occupy
-    /// exactly one image byte for span purposes.
-    #[must_use]
-    pub const fn encoded_len(self) -> usize {
-        match self {
-            Self::Byte { .. } | Self::Bool | Self::BitBool { .. } | Self::BitField { .. } => 1,
-            Self::FixedString { len, .. } | Self::Bytes { len } => len,
-            Self::Unsigned { width, .. } | Self::Signed { width, .. } => width as usize,
-        }
-    }
-
-    /// Short human-readable name for the expected value kind.
-    #[must_use]
-    pub const fn value_kind(self) -> &'static str {
-        match self {
-            Self::Byte { .. } | Self::BitField { .. } | Self::Unsigned { .. } => "unsigned",
-            Self::Bool | Self::BitBool { .. } => "boolean",
-            Self::FixedString { .. } => "text",
-            Self::Signed { .. } => "signed",
-            Self::Bytes { .. } => "bytes",
-        }
-    }
-}
 
 /// One persistent MCP-D75 menu field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,12 +31,6 @@ pub struct FieldDescriptor {
     pub offset: usize,
     /// Storage encoding and validation domain.
     pub codec: FieldCodec,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ValueDomain {
-    Stored,
-    Writable,
 }
 
 impl FieldDescriptor {
@@ -190,11 +73,15 @@ impl FieldDescriptor {
     ///
     /// # Errors
     ///
-    /// Returns [`SchemaError::OffsetTooLarge`] when a spanned page cannot be
-    /// represented by the 16-bit page address, or
+    /// Returns [`SchemaError::OffsetTooLarge`] when the span overflows the
+    /// host's address space, or
     /// [`SchemaError::OutOfBounds`] when the span leaves the physical image.
+    /// Malformed storage metadata returns [`SchemaError::Codec`] before allocation.
     pub fn pages(self) -> Result<Vec<McpPage>, SchemaError> {
-        let len = self.codec.encoded_len().max(1);
+        self.codec
+            .validate()
+            .map_err(|source| self.codec_error(source))?;
+        let len = self.codec.encoded_len();
         let last_offset = self
             .offset
             .checked_add(len - 1)
@@ -202,6 +89,14 @@ impl FieldDescriptor {
                 field: self.name,
                 offset: self.offset,
             })?;
+        if last_offset >= programming::TOTAL_SIZE {
+            return Err(SchemaError::OutOfBounds {
+                field: self.name,
+                offset: self.offset,
+                len,
+                image_len: programming::TOTAL_SIZE,
+            });
+        }
         let first_page = self.offset / programming::PAGE_SIZE;
         let last_page = last_offset / programming::PAGE_SIZE;
         let mut pages = Vec::with_capacity(last_page - first_page + 1);
@@ -227,7 +122,7 @@ impl FieldDescriptor {
     ///
     /// Returns an error for an out-of-bounds field, malformed codec, invalid
     /// encoded value, or a value outside the field's declared domain.
-    /// [`SchemaError::FixedStringDataAfterNul`] identifies an ambiguous
+    /// [`CodecError::FixedStringDataAfterNul`] identifies an ambiguous
     /// NUL-padded field instead of discarding bytes after its terminator. If
     /// this descriptor names a generated menu field, its finite enum or
     /// UI-choice domain is enforced as well.
@@ -286,96 +181,21 @@ impl FieldDescriptor {
 
     fn decode(self, image: &[u8], domain: ValueDomain) -> Result<DecodedFieldValue, SchemaError> {
         let menu_field = self.validate_catalog_descriptor()?;
-
-        let decoded = match self.codec {
-            FieldCodec::Byte { min, max } => {
-                let value = u64::from(read_byte(image, self.name, self.offset)?);
-                if domain == ValueDomain::Writable {
-                    validate_unsigned(self.name, value, u64::from(min), u64::from(max))?;
-                }
-                DecodedFieldValue::Unsigned(value)
-            }
-            FieldCodec::Bool => {
-                let value = read_byte(image, self.name, self.offset)?;
-                validate_unsigned(self.name, u64::from(value), 0, 1)?;
-                DecodedFieldValue::Bool(value == 1)
-            }
-            FieldCodec::BitBool { mask } => {
-                validate_bool_mask(self.name, mask)?;
-                DecodedFieldValue::Bool(read_byte(image, self.name, self.offset)? & mask != 0)
-            }
-            FieldCodec::BitField {
-                mask,
-                shift,
-                min,
-                max,
-            } => {
-                validate_bit_codec(self.name, mask, shift, min, max)?;
-                let byte = read_byte(image, self.name, self.offset)?;
-                let value = u64::from((byte & mask) >> shift);
-                if domain == ValueDomain::Writable {
-                    validate_unsigned(self.name, value, u64::from(min), u64::from(max))?;
-                }
-                DecodedFieldValue::Unsigned(value)
-            }
-            FieldCodec::FixedString {
-                len,
-                encoding,
-                padding,
-            } => {
-                let bytes = read_range(image, self.name, self.offset, len)?;
-                let semantic =
-                    decode_fixed_string_bytes(self.name, self.offset, image.len(), bytes, padding)?;
-                if encoding == StringEncoding::MemoryMap
-                    && let Some((offset, &value)) = semantic
-                        .iter()
-                        .enumerate()
-                        .find(|(_, value)| !is_printable_ascii(**value))
-                {
-                    return Err(SchemaError::InvalidMemoryMapTextByte {
-                        field: self.name,
-                        offset,
-                        value,
-                    });
-                }
-                let text = std::str::from_utf8(semantic)
-                    .map_err(|_| SchemaError::InvalidText { field: self.name })?;
-                DecodedFieldValue::Text(text.to_owned())
-            }
-            FieldCodec::Unsigned {
-                width,
-                endian,
-                min,
-                max,
-            } => {
-                let width = validate_width(self.name, width)?;
-                validate_unsigned_capacity(self.name, width, max)?;
-                let bytes = read_range(image, self.name, self.offset, width.bytes())?;
-                let value = decode_unsigned(bytes, endian);
-                if domain == ValueDomain::Writable {
-                    validate_unsigned(self.name, value, min, max)?;
-                }
-                DecodedFieldValue::Unsigned(value)
-            }
-            FieldCodec::Signed {
-                width,
-                endian,
-                min,
-                max,
-            } => {
-                let width = validate_width(self.name, width)?;
-                validate_signed_capacity(self.name, width, min, max)?;
-                let bytes = read_range(image, self.name, self.offset, width.bytes())?;
-                let value = decode_signed(bytes, width, endian);
-                if domain == ValueDomain::Writable {
-                    validate_signed(self.name, value, min, max)?;
-                }
-                DecodedFieldValue::Signed(value)
-            }
-            FieldCodec::Bytes { len } => {
-                DecodedFieldValue::Bytes(read_range(image, self.name, self.offset, len)?.to_vec())
-            }
-        };
+        self.codec
+            .validate()
+            .map_err(|source| self.codec_error(source))?;
+        let bytes = read_range(image, self.name, self.offset, self.codec.encoded_len())?;
+        let decoded = self
+            .codec
+            .decode(
+                bytes,
+                DecodeOptions {
+                    domain,
+                    boolean: BooleanDecoding::Canonical,
+                    text: TextPolicy::ExactPadding,
+                },
+            )
+            .map_err(|source| self.codec_error(source))?;
 
         if domain == ValueDomain::Writable
             && let Some(field) = menu_field
@@ -385,59 +205,11 @@ impl FieldDescriptor {
 
         Ok(decoded)
     }
-}
 
-/// Caller-supplied value for a schema field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FieldValue<'a> {
-    /// Unsigned byte, enum, bit-field, or multi-byte value.
-    Unsigned(u64),
-    /// Signed multi-byte value.
-    Signed(i64),
-    /// Boolean value.
-    Bool(bool),
-    /// Text value.
-    Text(&'a str),
-    /// Raw byte sequence.
-    Bytes(&'a [u8]),
-}
-
-impl FieldValue<'_> {
-    /// Short human-readable name for this value variant.
-    pub(crate) const fn kind_name(self) -> &'static str {
-        match self {
-            Self::Unsigned(_) => "unsigned",
-            Self::Signed(_) => "signed",
-            Self::Bool(_) => "boolean",
-            Self::Text(_) => "text",
-            Self::Bytes(_) => "bytes",
-        }
-    }
-}
-
-/// Owned value decoded from an MCP image.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DecodedFieldValue {
-    /// Unsigned byte, enum, bit-field, or multi-byte value.
-    Unsigned(u64),
-    /// Signed multi-byte value.
-    Signed(i64),
-    /// Boolean value.
-    Bool(bool),
-    /// Decoded text.
-    Text(String),
-    /// Raw bytes.
-    Bytes(Vec<u8>),
-}
-
-impl DecodedFieldValue {
-    const fn as_field_value(&self) -> FieldValue<'_> {
-        match self {
-            Self::Unsigned(value) => FieldValue::Unsigned(*value),
-            Self::Signed(value) => FieldValue::Signed(*value),
-            Self::Bool(value) => FieldValue::Bool(*value),
-            Self::Text(value) => FieldValue::Text(value.as_str()),
-            Self::Bytes(value) => FieldValue::Bytes(value.as_slice()),
+    const fn codec_error(self, source: CodecError) -> SchemaError {
+        SchemaError::Codec {
+            field: self.name,
+            source,
         }
     }
 }
@@ -446,7 +218,16 @@ impl DecodedFieldValue {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SchemaError {
-    /// The supplied value variant does not match the field codec.
+    /// Scalar storage validation failed, retaining the shared typed cause.
+    Codec {
+        /// Field whose storage representation was rejected.
+        field: &'static str,
+        /// Model-neutral codec failure with field-relative byte positions.
+        source: CodecError,
+    },
+    /// Bit ownership validation failed before the plan was changed.
+    Patch(PatchError),
+    /// A finite menu domain requires a different value kind.
     TypeMismatch {
         /// Field name.
         field: &'static str,
@@ -454,28 +235,6 @@ pub enum SchemaError {
         expected: &'static str,
         /// Supplied value kind.
         actual: &'static str,
-    },
-    /// An unsigned value is outside the descriptor's accepted domain.
-    UnsignedOutOfRange {
-        /// Field name.
-        field: &'static str,
-        /// Supplied value.
-        value: u64,
-        /// Smallest accepted value.
-        min: u64,
-        /// Largest accepted value.
-        max: u64,
-    },
-    /// A signed value is outside the descriptor's accepted domain.
-    SignedOutOfRange {
-        /// Field name.
-        field: &'static str,
-        /// Supplied value.
-        value: i64,
-        /// Smallest accepted value.
-        min: i64,
-        /// Largest accepted value.
-        max: i64,
     },
     /// An unsigned raw value is not a member of the field's finite domain.
     DisallowedValue {
@@ -492,66 +251,6 @@ pub enum SchemaError {
         offset: usize,
         /// Offset declared by the generated catalog.
         expected_offset: usize,
-    },
-    /// Text is too long for a fixed-width field.
-    TextTooLong {
-        /// Field name.
-        field: &'static str,
-        /// Encoded byte count.
-        actual: usize,
-        /// Maximum byte count.
-        max: usize,
-    },
-    /// Semantic text for a NUL-padded field contains its terminator byte.
-    TextContainsNul {
-        /// Field name.
-        field: &'static str,
-        /// Zero-based byte offset of the NUL within the supplied text.
-        offset: usize,
-    },
-    /// Semantic text ends with the field's padding byte and would be shortened
-    /// when decoded.
-    TextEndsWithPadding {
-        /// Field name.
-        field: &'static str,
-        /// Zero-based byte offset of the trailing padding byte.
-        offset: usize,
-        /// Padding byte declared by the field codec.
-        padding: u8,
-    },
-    /// A NUL-padded image contains data after its first NUL terminator.
-    FixedStringDataAfterNul {
-        /// Field name.
-        field: &'static str,
-        /// Zero-based byte offset of the first NUL terminator.
-        terminator_offset: usize,
-        /// Zero-based byte offset of the unexpected later byte.
-        offset: usize,
-        /// Unexpected non-NUL byte.
-        value: u8,
-    },
-    /// A model-dependent memory-map field contains a non-display byte.
-    InvalidMemoryMapTextByte {
-        /// Field name.
-        field: &'static str,
-        /// Zero-based byte offset within the semantic text.
-        offset: usize,
-        /// Invalid byte.
-        value: u8,
-    },
-    /// Existing bytes are not valid text for the descriptor.
-    InvalidText {
-        /// Field name.
-        field: &'static str,
-    },
-    /// A byte sequence has the wrong length.
-    ByteLength {
-        /// Field name.
-        field: &'static str,
-        /// Supplied byte count.
-        actual: usize,
-        /// Required byte count.
-        expected: usize,
     },
     /// A field extends beyond the target image.
     OutOfBounds {
@@ -586,62 +285,18 @@ pub enum SchemaError {
         /// Protected MCP page.
         page: McpPage,
     },
-    /// Integer width is zero or greater than eight bytes.
-    InvalidIntegerWidth {
-        /// Field name.
-        field: &'static str,
-        /// Invalid width.
-        width: u8,
-    },
-    /// An integer domain does not fit within the codec's encoded width.
-    DomainExceedsWidth {
-        /// Field name.
-        field: &'static str,
-        /// Encoded width in bytes.
-        width: u8,
-    },
-    /// A bit-field mask and shift do not describe usable bits.
-    InvalidBitField {
-        /// Field name.
-        field: &'static str,
-        /// Declared mask.
-        mask: u8,
-        /// Declared shift.
-        shift: u8,
-    },
-    /// Two requested fields assign different values to the same owned bit.
-    PatchConflict {
-        /// Field whose requested bits conflict with an earlier assignment.
-        field: &'static str,
-        /// Field that first claimed bits at the conflicting byte.
-        existing: &'static str,
-        /// Absolute byte offset containing the conflict.
-        offset: usize,
-        /// Conflicting bits.
-        mask: u8,
-    },
 }
 
 impl fmt::Display for SchemaError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Codec { field, source } => write!(f, "field {field}: {source}"),
+            Self::Patch(source) => source.fmt(f),
             Self::TypeMismatch {
                 field,
                 expected,
                 actual,
             } => write!(f, "field {field} expects {expected}, received {actual}"),
-            Self::UnsignedOutOfRange {
-                field,
-                value,
-                min,
-                max,
-            } => write!(f, "field {field} value {value} is outside {min}..={max}"),
-            Self::SignedOutOfRange {
-                field,
-                value,
-                min,
-                max,
-            } => write!(f, "field {field} value {value} is outside {min}..={max}"),
             Self::DisallowedValue { field, value } => {
                 write!(f, "field {field} does not allow raw value {value}")
             }
@@ -650,42 +305,6 @@ impl fmt::Display for SchemaError {
                 offset,
                 expected_offset,
             } => fmt_catalog_descriptor_mismatch(f, field, *offset, *expected_offset),
-            Self::TextTooLong { field, actual, max } => {
-                write!(f, "field {field} text is {actual} bytes (maximum {max})")
-            }
-            Self::TextContainsNul { field, offset } => write!(
-                f,
-                "field {field} text contains a NUL terminator at byte {offset}"
-            ),
-            Self::TextEndsWithPadding {
-                field,
-                offset,
-                padding,
-            } => fmt_text_ends_with_padding(f, field, *offset, *padding),
-            Self::FixedStringDataAfterNul {
-                field,
-                terminator_offset,
-                offset,
-                value,
-            } => fmt_fixed_string_data_after_nul(f, field, *terminator_offset, *offset, *value),
-            Self::InvalidMemoryMapTextByte {
-                field,
-                offset,
-                value,
-            } => write!(
-                f,
-                "field {field} text byte at offset {offset} is 0x{value:02X} \
-                 (expected printable ASCII 0x20-0x7E)"
-            ),
-            Self::InvalidText { field } => write!(f, "field {field} contains invalid text"),
-            Self::ByteLength {
-                field,
-                actual,
-                expected,
-            } => write!(
-                f,
-                "field {field} received {actual} bytes (expected {expected})"
-            ),
             Self::OutOfBounds {
                 field,
                 offset,
@@ -701,25 +320,6 @@ impl fmt::Display for SchemaError {
                 f,
                 "field {field} touches write-protected factory calibration page 0x{page:04X}"
             ),
-            Self::InvalidIntegerWidth { field, width } => {
-                write!(f, "field {field} has invalid integer width {width}")
-            }
-            Self::DomainExceedsWidth { field, width } => {
-                write!(
-                    f,
-                    "field {field} integer domain does not fit in {width} byte(s)"
-                )
-            }
-            Self::InvalidBitField { field, mask, shift } => write!(
-                f,
-                "field {field} has invalid bit field mask 0x{mask:02X}, shift {shift}"
-            ),
-            Self::PatchConflict {
-                field,
-                existing,
-                offset,
-                mask,
-            } => fmt_patch_conflict(f, field, existing, *offset, *mask),
         }
     }
 }
@@ -748,32 +348,6 @@ fn fmt_catalog_descriptor_mismatch(
     )
 }
 
-fn fmt_text_ends_with_padding(
-    formatter: &mut fmt::Formatter<'_>,
-    field: &str,
-    offset: usize,
-    padding: u8,
-) -> fmt::Result {
-    write!(
-        formatter,
-        "field {field} text ends with padding byte 0x{padding:02X} at byte {offset}"
-    )
-}
-
-fn fmt_fixed_string_data_after_nul(
-    formatter: &mut fmt::Formatter<'_>,
-    field: &str,
-    terminator_offset: usize,
-    offset: usize,
-    value: u8,
-) -> fmt::Result {
-    write!(
-        formatter,
-        "field {field} contains byte 0x{value:02X} at byte {offset} after its NUL terminator at \
-         byte {terminator_offset}"
-    )
-}
-
 fn fmt_out_of_bounds(
     formatter: &mut fmt::Formatter<'_>,
     field: &str,
@@ -787,47 +361,13 @@ fn fmt_out_of_bounds(
     )
 }
 
-fn fmt_patch_conflict(
-    formatter: &mut fmt::Formatter<'_>,
-    field: &str,
-    existing: &str,
-    offset: usize,
-    mask: u8,
-) -> fmt::Result {
-    write!(
-        formatter,
-        "field {field} conflicts with bits planned by {existing} at MCP offset 0x{offset:X}, \
-         mask 0x{mask:02X}"
-    )
-}
-
-impl std::error::Error for SchemaError {}
-
-/// One masked byte update within an MCP page.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BytePatch {
-    offset: u8,
-    mask: u8,
-    value: u8,
-}
-
-impl BytePatch {
-    /// Byte offset within the page.
-    #[must_use]
-    pub const fn offset(self) -> u8 {
-        self.offset
-    }
-
-    /// Bits owned by the patch.
-    #[must_use]
-    pub const fn mask(self) -> u8 {
-        self.mask
-    }
-
-    /// Desired raw bits already positioned under [`mask`](Self::mask).
-    #[must_use]
-    pub const fn as_raw(self) -> u8 {
-        self.value
+impl std::error::Error for SchemaError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Codec { source, .. } => Some(source),
+            Self::Patch(source) => Some(source),
+            _ => None,
+        }
     }
 }
 
@@ -835,7 +375,7 @@ impl BytePatch {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PagePatch {
     page: WritableMcpPage,
-    bytes: Vec<BytePatch>,
+    bytes: Vec<MaskedByte>,
 }
 
 impl PagePatch {
@@ -847,7 +387,7 @@ impl PagePatch {
 
     /// Sorted byte patches within this page.
     #[must_use]
-    pub fn bytes(&self) -> &[BytePatch] {
+    pub fn bytes(&self) -> &[MaskedByte] {
         &self.bytes
     }
 
@@ -856,8 +396,8 @@ impl PagePatch {
     /// Every byte update is masked so unrelated bits remain unchanged.
     pub fn apply_to_page(&self, page: &mut [u8; programming::PAGE_SIZE]) {
         for patch in &self.bytes {
-            if let Some(byte) = page.get_mut(usize::from(patch.offset)) {
-                *byte = (*byte & !patch.mask) | (patch.as_raw() & patch.mask);
+            if let Some(byte) = page.get_mut(patch.offset()) {
+                *byte = patch.apply(*byte);
             }
         }
     }
@@ -913,7 +453,7 @@ impl PatchSet {
         for page_patch in &self.pages {
             let page_start = usize::from(page_patch.page.as_raw()) * programming::PAGE_SIZE;
             for patch in &page_patch.bytes {
-                let absolute = page_start + usize::from(patch.offset);
+                let absolute = page_start + patch.offset();
                 if absolute >= image.len() {
                     return Err(SchemaError::OutOfBounds {
                         field: "patch set",
@@ -927,9 +467,9 @@ impl PatchSet {
         for page_patch in &self.pages {
             let page_start = usize::from(page_patch.page.as_raw()) * programming::PAGE_SIZE;
             for patch in &page_patch.bytes {
-                let absolute = page_start + usize::from(patch.offset);
+                let absolute = page_start + patch.offset();
                 if let Some(byte) = image.get_mut(absolute) {
-                    *byte = (*byte & !patch.mask) | (patch.as_raw() & patch.mask);
+                    *byte = patch.apply(*byte);
                 }
             }
         }
@@ -937,18 +477,10 @@ impl PatchSet {
     }
 }
 
-/// One planned byte: claimed bits, their values, and the claiming field.
-#[derive(Debug)]
-struct ByteClaim {
-    mask: u8,
-    value: u8,
-    owner: &'static str,
-}
-
 /// Builds a [`PatchSet`] without requiring a cached memory image.
 #[derive(Debug, Default)]
 pub struct PatchPlanner {
-    bytes: BTreeMap<usize, ByteClaim>,
+    bytes: ByteClaims,
 }
 
 impl PatchPlanner {
@@ -956,7 +488,7 @@ impl PatchPlanner {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            bytes: BTreeMap::new(),
+            bytes: ByteClaims::new(),
         }
     }
 
@@ -965,7 +497,7 @@ impl PatchPlanner {
     /// Non-overlapping bits at the same byte are coalesced.  Overlapping bits
     /// may be repeated only when both assignments request the same value;
     /// assigning a different value to already-claimed bits is a
-    /// [`SchemaError::PatchConflict`].  A later assignment therefore never
+    /// [`PatchError::Conflict`]. A later assignment therefore never
     /// silently replaces an earlier one. Every assignment is checked in full
     /// before merging; an error leaves all previously planned bytes and bit
     /// claims unchanged, and the planner remains usable.
@@ -993,33 +525,13 @@ impl PatchPlanner {
         field: &FieldDescriptor,
         value: FieldValue<'_>,
     ) -> Result<&mut Self, SchemaError> {
-        if let Some(menu_field) = super::menu_field(field.name) {
-            if menu_field.descriptor != *field {
-                return Err(SchemaError::CatalogDescriptorMismatch {
-                    field: field.name,
-                    offset: field.offset,
-                    expected_offset: menu_field.descriptor.offset,
-                });
-            }
+        if let Some(menu_field) = field.validate_catalog_descriptor()? {
             menu_field.validate_patch_value(value)?;
         }
         let encoded = encode_field(field, value, ValueDomain::Writable)?;
-        for &(absolute, mask, bits) in &encoded {
-            if let Some(claim) = self.bytes.get(&absolute) {
-                let overlap = claim.mask & mask;
-                if ((claim.value ^ bits) & overlap) != 0 {
-                    return Err(SchemaError::PatchConflict {
-                        field: field.name,
-                        existing: claim.owner,
-                        offset: absolute,
-                        mask: overlap,
-                    });
-                }
-            }
-        }
-        for (absolute, mask, bits) in encoded {
-            self.merge_byte(field.name, absolute, mask, bits);
-        }
+        self.bytes
+            .merge_atomic(field.name, &encoded)
+            .map_err(SchemaError::Patch)?;
         Ok(self)
     }
 
@@ -1036,11 +548,12 @@ impl PatchPlanner {
     /// memory image, and [`SchemaError::WriteProtected`] for a patch inside
     /// the factory-calibration region.
     pub fn finish(self) -> Result<PatchSet, SchemaError> {
-        let mut pages: BTreeMap<WritableMcpPage, Vec<BytePatch>> = BTreeMap::new();
-        for (absolute, claim) in self.bytes {
+        let mut pages: BTreeMap<WritableMcpPage, Vec<MaskedByte>> = BTreeMap::new();
+        for (owner, claim) in self.bytes.into_claims() {
+            let absolute = claim.offset();
             if absolute >= programming::TOTAL_SIZE {
                 return Err(SchemaError::OutOfBounds {
-                    field: claim.owner,
+                    field: owner,
                     offset: absolute,
                     len: 1,
                     image_len: programming::TOTAL_SIZE,
@@ -1048,31 +561,26 @@ impl PatchPlanner {
             }
             let page_number = absolute / programming::PAGE_SIZE;
             let page = u16::try_from(page_number).map_err(|_| SchemaError::OffsetTooLarge {
-                field: claim.owner,
+                field: owner,
                 offset: absolute,
             })?;
             let physical_page = McpPage::new(page).map_err(|_| SchemaError::OutOfBounds {
-                field: claim.owner,
+                field: owner,
                 offset: absolute,
                 len: 1,
                 image_len: programming::TOTAL_SIZE,
             })?;
             let writable_page = WritableMcpPage::from_page(physical_page).map_err(|_| {
                 SchemaError::WriteProtected {
-                    field: claim.owner,
+                    field: owner,
                     page: physical_page,
                 }
             })?;
             let in_page = absolute % programming::PAGE_SIZE;
-            let offset = u8::try_from(in_page).map_err(|_| SchemaError::OffsetTooLarge {
-                field: claim.owner,
-                offset: absolute,
-            })?;
-            pages.entry(writable_page).or_default().push(BytePatch {
-                offset,
-                mask: claim.mask,
-                value: claim.value,
-            });
+            pages
+                .entry(writable_page)
+                .or_default()
+                .push(claim.with_offset(in_page));
         }
         Ok(PatchSet {
             pages: pages
@@ -1081,270 +589,33 @@ impl PatchPlanner {
                 .collect(),
         })
     }
-
-    fn merge_byte(&mut self, owner: &'static str, offset: usize, mask: u8, value: u8) {
-        if let Some(claim) = self.bytes.get_mut(&offset) {
-            claim.value = (claim.value & !mask) | (value & mask);
-            claim.mask |= mask;
-        } else {
-            let _previous = self.bytes.insert(
-                offset,
-                ByteClaim {
-                    mask,
-                    value: value & mask,
-                    owner,
-                },
-            );
-        }
-    }
 }
 
-const fn type_mismatch(field: &FieldDescriptor, value: FieldValue<'_>) -> SchemaError {
-    SchemaError::TypeMismatch {
-        field: field.name,
-        expected: field.codec.value_kind(),
-        actual: value.kind_name(),
-    }
-}
-
-#[expect(
-    clippy::too_many_lines,
-    reason = "The match is intentionally exhaustive over every FieldCodec/FieldValue pairing; \
-              keeping validation beside each encoding makes unsupported pairings explicit."
-)]
 fn encode_field(
     field: &FieldDescriptor,
     value: FieldValue<'_>,
     domain: ValueDomain,
-) -> Result<Vec<(usize, u8, u8)>, SchemaError> {
-    match (field.codec, value) {
-        (FieldCodec::Byte { min, max }, FieldValue::Unsigned(value)) => {
-            let (accepted_min, accepted_max) = if domain == ValueDomain::Writable {
-                (u64::from(min), u64::from(max))
-            } else {
-                (0, u64::from(u8::MAX))
-            };
-            validate_unsigned(field.name, value, accepted_min, accepted_max)?;
-            let byte = u8::try_from(value).map_err(|_| SchemaError::UnsignedOutOfRange {
-                field: field.name,
-                value,
-                min: accepted_min,
-                max: accepted_max,
-            })?;
-            Ok(vec![(field.offset, u8::MAX, byte)])
-        }
-        (FieldCodec::Bool, FieldValue::Bool(value)) => {
-            Ok(vec![(field.offset, u8::MAX, u8::from(value))])
-        }
-        (FieldCodec::BitBool { mask }, FieldValue::Bool(value)) => {
-            validate_bool_mask(field.name, mask)?;
-            Ok(vec![(field.offset, mask, if value { mask } else { 0 })])
-        }
-        (
-            FieldCodec::BitField {
-                mask,
-                shift,
-                min,
-                max,
-            },
-            FieldValue::Unsigned(value),
-        ) => {
-            validate_bit_codec(field.name, mask, shift, min, max)?;
-            let (accepted_min, accepted_max) = if domain == ValueDomain::Writable {
-                (u64::from(min), u64::from(max))
-            } else {
-                (0, u64::from(mask >> shift))
-            };
-            validate_unsigned(field.name, value, accepted_min, accepted_max)?;
-            let byte = u8::try_from(value).map_err(|_| SchemaError::UnsignedOutOfRange {
-                field: field.name,
-                value,
-                min: accepted_min,
-                max: accepted_max,
-            })?;
-            let shifted = (byte << shift) & mask;
-            Ok(vec![(field.offset, mask, shifted)])
-        }
-        (
-            FieldCodec::FixedString {
-                len,
-                encoding,
-                padding,
-            },
-            FieldValue::Text(text),
-        ) => {
-            let bytes = text.as_bytes();
-            if bytes.len() > len {
-                return Err(SchemaError::TextTooLong {
-                    field: field.name,
-                    actual: bytes.len(),
-                    max: len,
-                });
-            }
-            if padding == 0 {
-                if let Some(offset) = bytes.iter().position(|&byte| byte == 0) {
-                    return Err(SchemaError::TextContainsNul {
-                        field: field.name,
-                        offset,
-                    });
-                }
-            } else if let Some((offset, &last_byte)) = bytes.iter().enumerate().next_back()
-                && last_byte == padding
-            {
-                return Err(SchemaError::TextEndsWithPadding {
-                    field: field.name,
-                    offset,
-                    padding,
-                });
-            }
-            if encoding == StringEncoding::MemoryMap
-                && let Some((offset, &value)) = bytes
-                    .iter()
-                    .enumerate()
-                    .find(|(_, value)| !is_printable_ascii(**value))
-            {
-                return Err(SchemaError::InvalidMemoryMapTextByte {
-                    field: field.name,
-                    offset,
-                    value,
-                });
-            }
-            let mut result = Vec::with_capacity(len);
-            for index in 0..len {
-                let byte = bytes.get(index).copied().unwrap_or(padding);
-                let offset = checked_offset(field, index)?;
-                result.push((offset, u8::MAX, byte));
-            }
-            Ok(result)
-        }
-        (
-            FieldCodec::Unsigned {
-                width,
-                endian,
-                min,
-                max,
-            },
-            FieldValue::Unsigned(value),
-        ) => {
-            let width = validate_width(field.name, width)?;
-            validate_unsigned_capacity(field.name, width, max)?;
-            let (accepted_min, accepted_max) = if domain == ValueDomain::Writable {
-                (min, max)
-            } else {
-                (0, unsigned_storage_max(width))
-            };
-            validate_unsigned(field.name, value, accepted_min, accepted_max)?;
-            let bytes = match endian {
-                Endian::Little => value.to_le_bytes(),
-                Endian::Big => value.to_be_bytes(),
-            };
-            encode_integer_bytes(field, bytes, width, endian)
-        }
-        (
-            FieldCodec::Signed {
-                width,
-                endian,
-                min,
-                max,
-            },
-            FieldValue::Signed(value),
-        ) => {
-            let width = validate_width(field.name, width)?;
-            validate_signed_capacity(field.name, width, min, max)?;
-            let (accepted_min, accepted_max) = if domain == ValueDomain::Writable {
-                (min, max)
-            } else {
-                signed_storage_bounds(width)
-            };
-            validate_signed(field.name, value, accepted_min, accepted_max)?;
-            let bytes = match endian {
-                Endian::Little => value.to_le_bytes(),
-                Endian::Big => value.to_be_bytes(),
-            };
-            encode_integer_bytes(field, bytes, width, endian)
-        }
-        (FieldCodec::Bytes { len }, FieldValue::Bytes(bytes)) => {
-            if bytes.len() != len {
-                return Err(SchemaError::ByteLength {
-                    field: field.name,
-                    actual: bytes.len(),
-                    expected: len,
-                });
-            }
-            bytes
-                .iter()
-                .copied()
-                .enumerate()
-                .map(|(index, byte)| Ok((checked_offset(field, index)?, u8::MAX, byte)))
-                .collect()
-        }
-        (_, other) => Err(type_mismatch(field, other)),
+) -> Result<Vec<MaskedByte>, SchemaError> {
+    field
+        .codec
+        .validate()
+        .map_err(|source| field.codec_error(source))?;
+    let len = field.codec.encoded_len();
+    if len > programming::TOTAL_SIZE {
+        return Err(SchemaError::OutOfBounds {
+            field: field.name,
+            offset: field.offset,
+            len,
+            image_len: programming::TOTAL_SIZE,
+        });
     }
-}
-
-fn decode_fixed_string_bytes<'a>(
-    field: &'static str,
-    field_offset: usize,
-    image_len: usize,
-    bytes: &'a [u8],
-    padding: u8,
-) -> Result<&'a [u8], SchemaError> {
-    let end = if padding == 0 {
-        let Some(terminator_offset) = bytes.iter().position(|&byte| byte == 0) else {
-            return Ok(bytes);
-        };
-        if let Some((offset, &value)) = bytes
-            .iter()
-            .enumerate()
-            .skip(terminator_offset + 1)
-            .find(|(_, byte)| **byte != 0)
-        {
-            return Err(SchemaError::FixedStringDataAfterNul {
-                field,
-                terminator_offset,
-                offset,
-                value,
-            });
-        }
-        terminator_offset
-    } else {
-        bytes
-            .iter()
-            .rposition(|&byte| byte != padding)
-            .map_or(0, |index| index + 1)
-    };
-
-    bytes.get(..end).ok_or(SchemaError::OutOfBounds {
-        field,
-        offset: field_offset,
-        len: bytes.len(),
-        image_len,
-    })
-}
-
-const fn is_printable_ascii(value: u8) -> bool {
-    value == b' ' || value.is_ascii_graphic()
-}
-
-fn encode_integer_bytes(
-    field: &FieldDescriptor,
-    bytes: [u8; 8],
-    width: IntegerWidth,
-    endian: Endian,
-) -> Result<Vec<(usize, u8, u8)>, SchemaError> {
-    let selected = match endian {
-        Endian::Little => bytes.get(..width.bytes()),
-        Endian::Big => bytes.get(width.start_in_full_width()..),
-    }
-    .ok_or(SchemaError::InvalidIntegerWidth {
-        field: field.name,
-        width: width.0,
-    })?;
-    selected
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(index, byte)| Ok((checked_offset(field, index)?, u8::MAX, byte)))
+    let _last_offset = checked_offset(field, len - 1)?;
+    field
+        .codec
+        .encode(value, domain, TextPolicy::ExactPadding)
+        .map_err(|source| field.codec_error(source))?
+        .into_iter()
+        .map(|byte| Ok(byte.with_offset(checked_offset(field, byte.offset())?)))
         .collect()
 }
 
@@ -1356,169 +627,6 @@ fn checked_offset(field: &FieldDescriptor, relative: usize) -> Result<usize, Sch
             field: field.name,
             offset: field.offset,
         })
-}
-
-const fn validate_unsigned(
-    field: &'static str,
-    value: u64,
-    min: u64,
-    max: u64,
-) -> Result<(), SchemaError> {
-    if value < min || value > max {
-        return Err(SchemaError::UnsignedOutOfRange {
-            field,
-            value,
-            min,
-            max,
-        });
-    }
-    Ok(())
-}
-
-const fn validate_signed(
-    field: &'static str,
-    value: i64,
-    min: i64,
-    max: i64,
-) -> Result<(), SchemaError> {
-    if value < min || value > max {
-        return Err(SchemaError::SignedOutOfRange {
-            field,
-            value,
-            min,
-            max,
-        });
-    }
-    Ok(())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct IntegerWidth(u8);
-
-impl IntegerWidth {
-    fn new(field: &'static str, width: u8) -> Result<Self, SchemaError> {
-        if !(1..=8).contains(&width) {
-            return Err(SchemaError::InvalidIntegerWidth { field, width });
-        }
-        Ok(Self(width))
-    }
-
-    fn bytes(self) -> usize {
-        usize::from(self.0)
-    }
-
-    fn bits(self) -> u32 {
-        u32::from(self.0) * 8
-    }
-
-    fn start_in_full_width(self) -> usize {
-        8 - self.bytes()
-    }
-}
-
-fn validate_width(field: &'static str, width: u8) -> Result<IntegerWidth, SchemaError> {
-    IntegerWidth::new(field, width)
-}
-
-fn unsigned_storage_max(width: IntegerWidth) -> u64 {
-    if width.0 == 8 {
-        u64::MAX
-    } else {
-        (1_u64 << width.bits()) - 1
-    }
-}
-
-fn signed_storage_bounds(width: IntegerWidth) -> (i64, i64) {
-    if width.0 == 8 {
-        (i64::MIN, i64::MAX)
-    } else {
-        let half = 1_i64 << (width.bits() - 1);
-        (-half, half - 1)
-    }
-}
-
-/// Reject an unsigned domain wider than the encoded byte width, which would
-/// otherwise truncate silently.
-fn validate_unsigned_capacity(
-    field: &'static str,
-    width: IntegerWidth,
-    max: u64,
-) -> Result<(), SchemaError> {
-    if width.0 < 8 {
-        let capacity = (1_u64 << width.bits()) - 1;
-        if max > capacity {
-            return Err(SchemaError::DomainExceedsWidth {
-                field,
-                width: width.0,
-            });
-        }
-    }
-    Ok(())
-}
-
-/// Reject a signed domain wider than the encoded byte width, which would
-/// otherwise truncate silently.
-fn validate_signed_capacity(
-    field: &'static str,
-    width: IntegerWidth,
-    min: i64,
-    max: i64,
-) -> Result<(), SchemaError> {
-    if width.0 < 8 {
-        let half = 1_i64 << (width.bits() - 1);
-        if min < -half || max > half - 1 {
-            return Err(SchemaError::DomainExceedsWidth {
-                field,
-                width: width.0,
-            });
-        }
-    }
-    Ok(())
-}
-
-const fn validate_bit_codec(
-    field: &'static str,
-    mask: u8,
-    shift: u8,
-    min: u8,
-    max: u8,
-) -> Result<(), SchemaError> {
-    let shifted = if shift < 8 { mask >> shift } else { 0 };
-    let lower_mask = if shift == 0 || shift >= 8 {
-        0
-    } else {
-        u8::MAX >> (8 - shift)
-    };
-    if mask == 0
-        || shift >= 8
-        || mask & lower_mask != 0
-        || shifted & shifted.wrapping_add(1) != 0
-        || min > max
-        || max > shifted
-    {
-        return Err(SchemaError::InvalidBitField { field, mask, shift });
-    }
-    Ok(())
-}
-
-const fn validate_bool_mask(field: &'static str, mask: u8) -> Result<(), SchemaError> {
-    if mask.count_ones() != 1 {
-        return Err(SchemaError::InvalidBitField {
-            field,
-            mask,
-            shift: 0,
-        });
-    }
-    Ok(())
-}
-
-fn read_byte(image: &[u8], field: &'static str, offset: usize) -> Result<u8, SchemaError> {
-    image.get(offset).copied().ok_or(SchemaError::OutOfBounds {
-        field,
-        offset,
-        len: 1,
-        image_len: image.len(),
-    })
 }
 
 fn read_range<'a>(
@@ -1536,33 +644,6 @@ fn read_range<'a>(
         len,
         image_len: image.len(),
     })
-}
-
-fn decode_unsigned(bytes: &[u8], endian: Endian) -> u64 {
-    match endian {
-        Endian::Little => bytes
-            .iter()
-            .rev()
-            .fold(0_u64, |value, &byte| (value << 8) | u64::from(byte)),
-        Endian::Big => bytes
-            .iter()
-            .fold(0_u64, |value, &byte| (value << 8) | u64::from(byte)),
-    }
-}
-
-fn decode_signed(bytes: &[u8], width: IntegerWidth, endian: Endian) -> i64 {
-    let unsigned = decode_unsigned(bytes, endian);
-    let bit_count = width.bits();
-    if bit_count == 64 {
-        return i64::from_ne_bytes(unsigned.to_ne_bytes());
-    }
-    let sign_bit = 1_u64 << (bit_count - 1);
-    let extended = if unsigned & sign_bit == 0 {
-        unsigned
-    } else {
-        unsigned | (u64::MAX << bit_count)
-    };
-    i64::from_ne_bytes(extended.to_ne_bytes())
 }
 
 impl super::menu_fields::StorageTransform {
@@ -1622,6 +703,8 @@ impl super::menu_fields::StorageTransform {
 
 #[cfg(test)]
 mod tests {
+    use kenwood_schema::FieldCodec as SharedFieldCodec;
+
     use super::*;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -1636,6 +719,60 @@ mod tests {
             max: 1,
         },
     );
+
+    #[test]
+    fn stored_boolean_stays_canonical_with_a_typed_shared_error() -> TestResult {
+        let codec: SharedFieldCodec = FieldCodec::Bool;
+        let field = FieldDescriptor::new("test.bool", 0, codec);
+        let Err(error) = field.read_stored(&[2]) else {
+            return Err("stored decoding must not normalize an invalid boolean".into());
+        };
+        assert_eq!(
+            error,
+            SchemaError::Codec {
+                field: "test.bool",
+                source: CodecError::NonCanonicalBoolean { value: 2 },
+            }
+        );
+        assert!(
+            std::error::Error::source(&error)
+                .and_then(|source| source.downcast_ref::<CodecError>())
+                .is_some_and(|source| *source == CodecError::NonCanonicalBoolean { value: 2 })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_spans_are_rejected_before_allocation_or_plan_mutation() -> TestResult {
+        let mut planner = PatchPlanner::new();
+        let _planner = planner.set(&ENABLE, FieldValue::Unsigned(1))?;
+        let empty = FieldDescriptor::new("test.empty", 1, FieldCodec::Bytes { len: 0 });
+        assert!(matches!(empty.pages(), Err(SchemaError::Codec { .. })));
+        assert!(matches!(
+            planner.set(&empty, FieldValue::Bytes(&[])),
+            Err(SchemaError::Codec { .. })
+        ));
+        for len in [programming::TOTAL_SIZE + 1, usize::MAX] {
+            let huge = FieldDescriptor::new(
+                "test.huge",
+                0,
+                FieldCodec::FixedString {
+                    len,
+                    encoding: StringEncoding::Utf8,
+                    padding: 0,
+                },
+            );
+            assert!(matches!(huge.pages(), Err(SchemaError::OutOfBounds { .. })));
+            assert!(matches!(
+                planner.set(&huge, FieldValue::Text("")),
+                Err(SchemaError::OutOfBounds { .. })
+            ));
+        }
+        let mut expected = PatchPlanner::new();
+        let _expected = expected.set(&ENABLE, FieldValue::Unsigned(1))?;
+        assert_eq!(planner.finish()?, expected.finish()?);
+        Ok(())
+    }
 
     #[test]
     fn field_page_is_physical_and_bounds_checked() -> TestResult {
@@ -1717,7 +854,7 @@ mod tests {
             .bytes();
         assert_eq!(bytes.len(), 1);
         assert_eq!(bytes.first().map(|patch| patch.mask()), Some(0x0C));
-        assert_eq!(bytes.first().map(|patch| patch.as_raw()), Some(0x0C));
+        assert_eq!(bytes.first().map(|patch| patch.value()), Some(0x0C));
 
         let contradictory = FieldDescriptor::new(
             "test.contradictory",
@@ -1735,11 +872,11 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(SchemaError::PatchConflict {
-                    field: "test.contradictory",
+                Err(SchemaError::Patch(PatchError::Conflict {
+                    owner: "test.contradictory",
                     existing: "test.enable",
                     ..
-                })
+                }))
             ),
             "conflict must name both fields: {result:?}"
         );
@@ -1765,12 +902,12 @@ mod tests {
             assert!(
                 matches!(
                     result,
-                    Err(SchemaError::PatchConflict {
-                        field: "test.crossing",
+                    Err(SchemaError::Patch(PatchError::Conflict {
+                        owner: "test.crossing",
                         existing: "test.anchor",
                         offset: 0x1011,
                         ..
-                    })
+                    }))
                 ),
                 "the later byte must reject the entire assignment: {result:?}"
             );
@@ -1828,9 +965,9 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(SchemaError::TextContainsNul {
+                Err(SchemaError::Codec {
                     field: "test.nul_text",
-                    offset: 1,
+                    source: CodecError::TextContainsNul { offset: 1 },
                 })
             ),
             "embedded NUL must not be accepted as semantic text: {result:?}"
@@ -1854,11 +991,13 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(SchemaError::FixedStringDataAfterNul {
+                Err(SchemaError::Codec {
                     field: "test.nul_image",
-                    terminator_offset: 1,
-                    offset: 2,
-                    value: b'B',
+                    source: CodecError::FixedStringDataAfterNul {
+                        terminator_offset: 1,
+                        offset: 2,
+                        value: b'B',
+                    },
                 })
             ),
             "non-NUL data after the terminator must be rejected: {result:?}"
@@ -1882,10 +1021,12 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(SchemaError::TextEndsWithPadding {
+                Err(SchemaError::Codec {
                     field: "test.space_text",
-                    offset: 2,
-                    padding: b' ',
+                    source: CodecError::TextEndsWithPadding {
+                        offset: 2,
+                        padding: b' '
+                    },
                 })
             ),
             "semantic trailing space would be lost on read: {result:?}"
@@ -1977,10 +1118,12 @@ mod tests {
             let result = planner.set(&text, FieldValue::Text(value));
             assert!(matches!(
                 result,
-                Err(SchemaError::InvalidMemoryMapTextByte {
+                Err(SchemaError::Codec {
                     field: "test.memory_map_text",
-                    offset: actual_offset,
-                    value: actual_value,
+                    source: CodecError::InvalidMemoryMapTextByte {
+                        offset: actual_offset,
+                        value: actual_value,
+                    },
                 }) if actual_offset == offset && actual_value == byte
             ));
         }
@@ -2008,10 +1151,12 @@ mod tests {
 
         assert!(matches!(
             field.read(&image),
-            Err(SchemaError::InvalidMemoryMapTextByte {
+            Err(SchemaError::Codec {
                 field: "test.memory_map_text",
-                offset: 1,
-                value: 0x1F,
+                source: CodecError::InvalidMemoryMapTextByte {
+                    offset: 1,
+                    value: 0x1F
+                },
             })
         ));
     }
@@ -2033,10 +1178,12 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(SchemaError::TextEndsWithPadding {
+                Err(SchemaError::Codec {
                     field: "test.other_padding",
-                    offset: 3,
-                    padding: b'~',
+                    source: CodecError::TextEndsWithPadding {
+                        offset: 3,
+                        padding: b'~'
+                    },
                 })
             ),
             "semantic trailing padding would be lost on read: {result:?}"
@@ -2109,9 +1256,9 @@ mod tests {
             assert!(
                 matches!(
                     read,
-                    Err(SchemaError::InvalidIntegerWidth {
+                    Err(SchemaError::Codec {
                         field: error_field,
-                        width,
+                        source: CodecError::InvalidIntegerWidth { width },
                     }) if error_field == field.name && width == expected_width
                 ),
                 "invalid width must be rejected before reading the image: {read:?}"
@@ -2122,9 +1269,9 @@ mod tests {
             assert!(
                 matches!(
                     write,
-                    Err(SchemaError::InvalidIntegerWidth {
+                    Err(SchemaError::Codec {
                         field: error_field,
-                        width,
+                        source: CodecError::InvalidIntegerWidth { width },
                     }) if error_field == field.name && width == expected_width
                 ),
                 "invalid width must be rejected before encoding: {write:?}"
@@ -2139,15 +1286,24 @@ mod tests {
         let mut planner = PatchPlanner::new();
         assert!(matches!(
             planner.set(&byte, FieldValue::Unsigned(4)),
-            Err(SchemaError::UnsignedOutOfRange { .. })
+            Err(SchemaError::Codec {
+                source: CodecError::UnsignedOutOfRange { .. },
+                ..
+            })
         ));
         assert!(matches!(
             planner.set(&byte, FieldValue::Bool(true)),
-            Err(SchemaError::TypeMismatch { .. })
+            Err(SchemaError::Codec {
+                source: CodecError::TypeMismatch { .. },
+                ..
+            })
         ));
         assert!(matches!(
             planner.set(&bytes, FieldValue::Bytes(&[1])),
-            Err(SchemaError::ByteLength { .. })
+            Err(SchemaError::Codec {
+                source: CodecError::ByteLength { .. },
+                ..
+            })
         ));
     }
 
@@ -2187,15 +1343,28 @@ mod tests {
         );
         let image = [4, 2, 0, 9, 0, 3];
 
-        for field in [byte, boolean, bit_field, unsigned] {
+        for field in [byte, bit_field, unsigned] {
             assert!(matches!(
                 field.read(&image),
-                Err(SchemaError::UnsignedOutOfRange { .. })
+                Err(SchemaError::Codec {
+                    source: CodecError::UnsignedOutOfRange { .. },
+                    ..
+                })
             ));
         }
         assert!(matches!(
+            boolean.read(&image),
+            Err(SchemaError::Codec {
+                source: CodecError::NonCanonicalBoolean { value: 2 },
+                ..
+            })
+        ));
+        assert!(matches!(
             signed.read(&image),
-            Err(SchemaError::SignedOutOfRange { .. })
+            Err(SchemaError::Codec {
+                source: CodecError::SignedOutOfRange { .. },
+                ..
+            })
         ));
     }
 
@@ -2298,9 +1467,9 @@ mod tests {
         assert!(
             matches!(
                 unsigned_result,
-                Err(SchemaError::DomainExceedsWidth {
+                Err(SchemaError::Codec {
                     field: "test.wide_unsigned",
-                    width: 1,
+                    source: CodecError::DomainExceedsWidth { width: 1 },
                 })
             ),
             "an over-wide unsigned domain must not truncate: {unsigned_result:?}"
@@ -2309,9 +1478,9 @@ mod tests {
         assert!(
             matches!(
                 signed_result,
-                Err(SchemaError::DomainExceedsWidth {
+                Err(SchemaError::Codec {
                     field: "test.wide_signed",
-                    width: 2,
+                    source: CodecError::DomainExceedsWidth { width: 2 },
                 })
             ),
             "an over-wide signed domain must not truncate: {signed_result:?}"

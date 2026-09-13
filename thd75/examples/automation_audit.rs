@@ -96,6 +96,7 @@ use aprs_is as _;
 use ax25_codec as _;
 use dstar_gateway_core as _;
 use encoding_rs as _;
+use kenwood_schema as _;
 #[cfg(not(target_os = "macos"))]
 use kenwood_transport as _;
 use kiss_tnc as _;
