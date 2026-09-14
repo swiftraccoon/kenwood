@@ -126,7 +126,7 @@ impl SetRequest {
                 "text updates require the pinned main-unit USB endpoint at 9600 baud".to_owned(),
             )));
         }
-        let snapshot = Snapshot::load(&self.backup)?;
+        let snapshot = Snapshot::load_for_usb_write(&self.backup)?;
         match change {
             RequestedChange::Pm1 { expected, desired } => {
                 let page = Pm1NameUpdate::required_page()?;

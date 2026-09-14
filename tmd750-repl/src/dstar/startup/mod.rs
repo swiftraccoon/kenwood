@@ -484,7 +484,7 @@ fn reserve_at(
 
 /// Prepare using the cancellation state owned by the complete startup workflow.
 pub(super) async fn prepare(
-    bluetooth: Option<native::Endpoint>,
+    bluetooth: native::discovery::Request,
     control_port: Option<&str>,
     cancelled: Arc<AtomicBool>,
 ) -> Result<(ProvenModem<ModemConnection>, Recovery), String> {
@@ -523,11 +523,11 @@ where
 }
 
 async fn prepare_system(
-    bluetooth: Option<native::Endpoint>,
+    bluetooth: native::discovery::Request,
     control_port: Option<&str>,
     cancelled: Arc<AtomicBool>,
 ) -> Result<(ProvenModem<ModemConnection>, Recovery), String> {
-    let endpoints = super::endpoints::resolve(bluetooth, control_port, &cancelled)
+    let endpoints = super::endpoints::resolve(&bluetooth, control_port, &cancelled)
         .await
         .map_err(|error| Failure::from_error(error.as_ref()).to_string())?;
     let (mut recovery, original) =

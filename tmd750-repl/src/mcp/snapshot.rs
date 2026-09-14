@@ -11,6 +11,7 @@ use kenwood_tmd750::{
     FirmwareIdentity, Identity, MemoryImage, MenuFieldSnapshot, RadioModel, RadioType, Region,
     SlotIndex,
 };
+use kenwood_transport::bluetooth::{BluetoothAddress, RfcommChannel};
 use serde::Deserialize;
 
 use super::reconnect_policy::{ReconnectDecision, classify};
@@ -18,6 +19,8 @@ use super::{IdentityEvidence, SegmentEvidence};
 use crate::{AppResult, CommandError};
 
 const MAX_REPORT_BYTES: u64 = 32 * 1024 * 1024;
+
+mod native;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
@@ -324,10 +327,46 @@ struct Backup {
     complete_configuration: bool,
 }
 
+impl Backup {
+    fn completed(&self) -> bool {
+        self.complete_configuration
+            && self.entry_reply == b"0M"
+            && matches!(self.exit, Exit::Acknowledged)
+            && matches!(self.outcome, BackupOutcome::AwaitingCatVerification)
+    }
+
+    fn validate_pages(&self) -> AppResult<()> {
+        let pages: Vec<_> = regions::menu_regions()
+            .into_iter()
+            .flat_map(Region::pages)
+            .collect();
+        if pages.len() != self.segments.len()
+            || !pages.iter().zip(&self.segments).all(|(page, segment)| {
+                page.address().as_u32() == segment.address
+                    && page.len() == segment.length
+                    && segment.data.len() == segment.length
+            })
+        {
+            return invalid(
+                "configuration pages are missing, duplicated, reordered, or incorrectly sized",
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct Document {
     format_version: u8,
     operation: String,
+    // Historical USB producers do not emit a transport tag. Reject it here as
+    // well as in source dispatch so direct decoding cannot invent provenance.
+    #[serde(
+        default,
+        rename = "transport",
+        deserialize_with = "reject_transport_tag"
+    )]
+    _transport: (),
     endpoint: Endpoint,
     transcript: Transcript,
     backup: Backup,
@@ -338,6 +377,14 @@ struct Document {
     #[serde(rename = "signal_error")]
     _signal_error: (),
     post_exit_verification: Verification,
+}
+
+fn reject_transport_tag<'de, D: serde::Deserializer<'de>>(
+    _deserializer: D,
+) -> Result<(), D::Error> {
+    Err(serde::de::Error::custom(
+        "USB format-3/4 reports cannot carry native transport evidence",
+    ))
 }
 
 impl Document {
@@ -353,35 +400,68 @@ impl Document {
         };
         if self.operation != "configuration_backup"
             || !self.transcript.succeeded()
-            || !self.backup.complete_configuration
-            || self.backup.entry_reply != b"0M"
-            || !matches!(self.backup.exit, Exit::Acknowledged)
-            || !matches!(self.backup.outcome, BackupOutcome::AwaitingCatVerification)
+            || !self.backup.completed()
             || !fresh_identity_proved
         {
             return invalid(
                 "requires a successful configuration backup with matching format-3 or format-4 CAT evidence and complete captures",
             );
         }
-        let pages: Vec<_> = regions::menu_regions()
-            .into_iter()
-            .flat_map(Region::pages)
-            .collect();
-        if pages.len() != self.backup.segments.len()
-            || !pages
-                .iter()
-                .zip(&self.backup.segments)
-                .all(|(page, segment)| {
-                    page.address().as_u32() == segment.address
-                        && page.len() == segment.length
-                        && segment.data.len() == segment.length
-                })
-        {
-            return invalid(
-                "configuration pages are missing, duplicated, reordered, or incorrectly sized",
-            );
+        self.backup.validate_pages()
+    }
+}
+
+/// Native and USB formats retain separate transport-specific admission rules.
+#[derive(Debug)]
+enum SourceDocument {
+    Native(Box<native::Document>),
+    Usb(Box<Document>),
+}
+
+/// Inspect only tag presence; decode the selected schema from the original
+/// bytes so neither duplicate fields nor its precise errors are discarded.
+#[derive(Deserialize)]
+struct SourceHeader {
+    #[serde(
+        default,
+        rename = "transport",
+        deserialize_with = "transport_tag_present"
+    )]
+    native: bool,
+}
+
+fn transport_tag_present<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<bool, D::Error> {
+    let _tag = serde::de::IgnoredAny::deserialize(deserializer)?;
+    Ok(true)
+}
+
+impl SourceDocument {
+    fn decode(bytes: &[u8]) -> AppResult<Self> {
+        let header: SourceHeader = serde_json::from_slice(bytes).map_err(|error| {
+            CommandError(format!(
+                "Invalid configuration backup: malformed JSON or transport header: {error}"
+            ))
+        })?;
+        if header.native {
+            let document = serde_json::from_slice(bytes).map_err(|error| {
+                CommandError(format!("Invalid configuration backup: native backup is incomplete or malformed: {error}"))
+            })?;
+            Ok(Self::Native(document))
+        } else {
+            let document = serde_json::from_slice(bytes).map_err(|error| {
+                CommandError(format!("Invalid configuration backup: untagged report requires USB format-3/4 evidence: {error}"))
+            })?;
+            Ok(Self::Usb(document))
         }
-        Ok(())
+    }
+
+    fn into_snapshot(self) -> AppResult<Snapshot> {
+        match self {
+            Self::Native(document) => (*document).into_snapshot(),
+            Self::Usb(document) => Snapshot::from_document(*document),
+        }
     }
 }
 
@@ -401,13 +481,13 @@ fn validate_metadata(metadata: &Metadata) -> AppResult<()> {
     Ok(())
 }
 
-fn read_document(reader: impl Read) -> AppResult<Document> {
+fn read_document(reader: impl Read) -> AppResult<SourceDocument> {
     let mut bytes = Vec::new();
     let _read = reader.take(MAX_REPORT_BYTES + 1).read_to_end(&mut bytes)?;
     if u64::try_from(bytes.len())? > MAX_REPORT_BYTES {
         return invalid("report exceeds 32 MiB");
     }
-    Ok(serde_json::from_slice(&bytes)?)
+    SourceDocument::decode(&bytes)
 }
 
 /// An internal dense buffer whose synthetic gaps cannot be read as fields.
@@ -416,6 +496,17 @@ pub(crate) struct Snapshot {
     image: MemoryImage,
     pub(crate) identity: Identity,
     coverage: Vec<Region>,
+    provenance: Provenance,
+}
+
+/// Historical acquisition evidence never substitutes for another transport.
+#[derive(Debug)]
+enum Provenance {
+    Usb,
+    NativeBluetooth {
+        address: BluetoothAddress,
+        channel: RfcommChannel,
+    },
 }
 
 impl Snapshot {
@@ -450,18 +541,36 @@ impl Snapshot {
         validate_metadata(&path.metadata()?)?;
         let file = File::open(path)?;
         validate_metadata(&file.metadata()?)?;
-        Self::from_document(read_document(file)?)
+        read_document(file)?.into_snapshot()
+    }
+
+    /// Preserve the established USB-write source policy while accepting native
+    /// reports for offline inspection through [`Self::load`]. Neither path is
+    /// current radio-state proof; live page guards remain mandatory.
+    pub(crate) fn load_for_usb_write(path: &Path) -> AppResult<Self> {
+        let snapshot = Self::load(path)?;
+        match &snapshot.provenance {
+            Provenance::Usb => Ok(snapshot),
+            Provenance::NativeBluetooth { address, channel } => invalid(&format!(
+                "native Bluetooth backup from {address}, RFCOMM channel {} is for offline inspection; this USB write workflow requires a USB backup",
+                channel.get()
+            )),
+        }
     }
 
     fn from_document(document: Document) -> AppResult<Self> {
         document.validate()?;
+        Self::from_backup(document.backup, Provenance::Usb)
+    }
+
+    fn from_backup(backup: Backup, provenance: Provenance) -> AppResult<Self> {
         let identity = Identity {
-            model: RadioModel::try_from(document.backup.identity.model.as_str())?,
-            firmware: FirmwareIdentity::new(&document.backup.identity.firmware)?,
-            radio_type: RadioType::new(&document.backup.identity.radio_type)?,
+            model: RadioModel::try_from(backup.identity.model.as_str())?,
+            firmware: FirmwareIdentity::new(&backup.identity.firmware)?,
+            radio_type: RadioType::new(&backup.identity.radio_type)?,
         };
         let mut bytes = MemoryImage::blank().into_bytes();
-        for segment in document.backup.segments {
+        for segment in backup.segments {
             let start = usize::try_from(segment.address)?;
             bytes
                 .get_mut(start..start + segment.length)
@@ -472,6 +581,7 @@ impl Snapshot {
             image: MemoryImage::from_bytes(bytes)?,
             identity,
             coverage: regions::menu_regions(),
+            provenance,
         })
     }
 
@@ -696,7 +806,7 @@ pub(super) mod tests {
             .ok_or("fixture unexpectedly exceeds the report limit")?;
         let reader = bytes.as_slice().chain(std::io::repeat(b' ').take(padding));
         let document = read_document(reader)?;
-        document.validate()?;
+        let _snapshot = document.into_snapshot()?;
         Ok(())
     }
 

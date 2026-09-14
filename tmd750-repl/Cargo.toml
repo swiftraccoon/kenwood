@@ -44,6 +44,13 @@ tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", default-features = false, features = [
+  "pthread",
+  "signal",
+] }
+rustix = { version = "1", features = ["fs"] }
+
 [dev-dependencies]
 tempfile = "3"
 

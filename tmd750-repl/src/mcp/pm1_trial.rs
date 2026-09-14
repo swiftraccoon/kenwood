@@ -55,7 +55,7 @@ impl TrialRequest {
                     .to_owned(),
             )));
         }
-        let snapshot = Snapshot::load(&self.backup)?;
+        let snapshot = Snapshot::load_for_usb_write(&self.backup)?;
         let page = PmNameTrial::required_page()?;
         Ok(PmNameTrial::prepare_unqualified_offline(
             &snapshot.identity,
@@ -91,7 +91,7 @@ impl My1TrialRequest {
             )
             .into());
         }
-        let snapshot = Snapshot::load(&self.backup)?;
+        let snapshot = Snapshot::load_for_usb_write(&self.backup)?;
         if snapshot.captured_bytes(kenwood_tmd750::Region::new(10, 11)?)? != [0] {
             return Err(
                 CommandError("MY1 trial requires captured memory format zero".to_owned()).into(),

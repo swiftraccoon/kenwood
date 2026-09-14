@@ -17,10 +17,11 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::Parser;
 use kenwood_tmd750::transport::{DEFAULT_BAUD, SerialCandidate, discover_serial, open_serial};
-use kenwood_tmd750::{Band, Identity, OperatingMode, Radio, SelectableMode};
+use kenwood_tmd750::{Band, DvGatewayMode, Identity, OperatingMode, Radio, SelectableMode};
 use kenwood_transport::Transport;
 use kenwood_transport::bluetooth::BluetoothAddress;
 use rustyline::DefaultEditor;
@@ -40,7 +41,7 @@ const HELP_LINES: &[&str] = &[
     "fm [a|b] | normal [a|b]: Select FM and verify readback.",
     "gateway: Read the persistent DV Gateway state; no change.",
     "terminal: Explain manual Terminal Mode setup; no change.",
-    "quit | exit: Close the serial connection and exit.",
+    "quit | exit: Close the radio connection and exit.",
 ];
 
 type AppResult<T> = Result<T, Box<dyn StdError + Send + Sync>>;
@@ -49,17 +50,23 @@ type ConnectedRadio = (Radio<Connection>, Identity, String);
 /// Accessible TM-D750 CAT, automatic Bluetooth D-STAR, and captured diagnostics.
 #[derive(Debug, Parser)]
 #[command(version, about, color = clap::ColorChoice::Never)]
+#[command(group(clap::ArgGroup::new("native_selection")
+    .args(["bluetooth", "bluetooth_address"]).multiple(true)))]
 struct Cli {
-    /// Serial endpoint to use instead of USB auto-discovery.
-    #[arg(long, conflicts_with = "bluetooth")]
+    /// Use this serial endpoint instead of automatic USB/Bluetooth selection.
+    #[arg(long, conflicts_with = "native_selection")]
     port: Option<String>,
 
-    /// Exact paired Bluetooth address for native macOS control or D-STAR startup.
+    /// Use the paired Bluetooth radio even when USB is connected (macOS).
+    #[arg(long)]
+    bluetooth: bool,
+
+    /// Use this exact paired Bluetooth address instead of automatic selection.
     #[arg(long, value_name = "ADDRESS")]
-    bluetooth: Option<BluetoothAddress>,
+    bluetooth_address: Option<BluetoothAddress>,
 
     /// Trusted native helper executable; otherwise use the built-in helper.
-    #[arg(long, requires = "bluetooth", value_name = "EXECUTABLE")]
+    #[arg(long, requires = "native_selection", value_name = "EXECUTABLE")]
     bluetooth_helper: Option<PathBuf>,
 
     /// Independent USB CAT endpoint for automatic Bluetooth dstar start.
@@ -67,7 +74,7 @@ struct Cli {
     control_port: Option<String>,
 
     /// CAT baud rate.
-    #[arg(long, default_value_t = DEFAULT_BAUD, conflicts_with = "bluetooth")]
+    #[arg(long, default_value_t = DEFAULT_BAUD, conflicts_with = "native_selection")]
     baud: u32,
 
     /// Prepend UTC timestamps to terminal output.
@@ -85,6 +92,19 @@ struct Cli {
     /// Startup command; runs once, except dstar start opens a gateway session.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<String>,
+}
+
+impl Cli {
+    const fn requests_bluetooth(&self) -> bool {
+        self.bluetooth || self.bluetooth_address.is_some()
+    }
+
+    fn bluetooth_request(&self) -> native::discovery::Request {
+        native::discovery::Request {
+            address: self.bluetooth_address.clone(),
+            helper: self.bluetooth_helper.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -123,7 +143,10 @@ enum LoopAction {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
-    match run().await {
+    let result = run().await.and_then(|()| {
+        output::check().map_err(|error| -> Box<dyn StdError + Send + Sync> { Box::new(error) })
+    });
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             output::error(format_args!("Error: {error}"));
@@ -155,9 +178,6 @@ async fn run() -> AppResult<()> {
         return run_command(&cli, command).await;
     }
     require_no_control_port(&cli)?;
-    if let Some(address) = &cli.bluetooth {
-        return run_native(&cli, address.clone(), None).await;
-    }
 
     if dstar::probe::matches_arguments(&cli.command) {
         let request = match dstar::probe::parse(&cli.command) {
@@ -168,9 +188,19 @@ async fn run() -> AppResult<()> {
             }
             Err(error) => return Err(Box::new(error)),
         };
+        if cli.requests_bluetooth() {
+            return Err(CommandError(
+                "dstar probe requires USB; native Bluetooth diagnostics use identity, status, or gateway"
+                    .to_owned(),
+            )
+            .into());
+        }
         let path = request.validate(cli.port.as_deref(), cli.baud)?;
         let endpoint = dstar::probe::select_endpoint(path, discover_serial()?)?;
         return dstar::probe::run(&endpoint, &request).await;
+    }
+    if cli.requests_bluetooth() {
+        return run_native(&cli, None).await;
     }
 
     let request = match mcp::parse(&cli.command) {
@@ -206,9 +236,6 @@ async fn run_command(cli: &Cli, one_shot: Option<Command>) -> AppResult<()> {
         other => other,
     };
     require_no_control_port(cli)?;
-    if let Some(address) = &cli.bluetooth {
-        return run_native(cli, address.clone(), one_shot).await;
-    }
     if let Some(command) = one_shot.as_ref() {
         match command {
             Command::Help => {
@@ -230,7 +257,11 @@ async fn run_command(cli: &Cli, one_shot: Option<Command>) -> AppResult<()> {
         }
     }
 
-    let (radio, identity, path) = connect(cli).await?;
+    let selection = select_connection(cli, discover_serial)?;
+    let ConnectionSelection::Serial(path) = selection else {
+        return run_native(cli, one_shot).await;
+    };
+    let (radio, identity, path) = connect_serial(cli, path).await?;
     output::line(format_args!(
         "Connected to {} firmware {} on {} (type {}).",
         identity.model, identity.firmware, path, identity.radio_type
@@ -245,12 +276,8 @@ async fn run_dstar_start(cli: &Cli, request: dstar::StartRequest) -> AppResult<(
         if cli.baud != DEFAULT_BAUD {
             return Err(CommandError("custom --baud requires an explicit USB --port; Bluetooth has no serial baud selection".to_owned()).into());
         }
-        let endpoint = cli.bluetooth.as_ref().map(|address| native::Endpoint {
-            address: address.clone(),
-            helper: cli.bluetooth_helper.clone(),
-        });
         Box::pin(dstar::run_bluetooth(
-            endpoint,
+            cli.bluetooth_request(),
             cli.control_port.as_deref(),
             request,
         ))
@@ -260,17 +287,9 @@ async fn run_dstar_start(cli: &Cli, request: dstar::StartRequest) -> AppResult<(
 }
 
 /// Reject unsupported native operations before creating artifacts or opening I/O.
-async fn run_native(
-    cli: &Cli,
-    address: BluetoothAddress,
-    command: Option<Command>,
-) -> AppResult<()> {
+async fn run_native(cli: &Cli, command: Option<Command>) -> AppResult<()> {
     use native::workflow::{CatScope, Operation};
 
-    let endpoint = native::Endpoint {
-        address,
-        helper: cli.bluetooth_helper.clone(),
-    };
     if cli.command.first().is_some_and(|word| word == "mcp") {
         let request = match mcp::parse(&cli.command) {
             Ok(request) => request,
@@ -283,15 +302,18 @@ async fn run_native(
         if let Some(result) = mcp::run_offline(&request) {
             return result;
         }
-        return match request {
-            mcp::McpCommand::Probe(request) => {
-                native::workflow::run(&endpoint, &Operation::FixedMcp, request.output()).await
+        let (operation, output_path) = match &request {
+            mcp::McpCommand::Probe(request) => (Operation::FixedMcp, request.output()),
+            mcp::McpCommand::Backup(request) => {
+                (Operation::ConfigurationBackup, request.output())
             }
-            _ => Err(Box::new(CommandError(
-                "native Bluetooth supports only mcp probe; backups and settings writes require USB"
+            _ => return Err(Box::new(CommandError(
+                "native Bluetooth supports mcp probe and backup; live MCP settings writes and trials require USB"
                     .to_owned(),
             ))),
         };
+        let endpoint = resolve_native(cli).await?;
+        return native::workflow::run(&endpoint, &operation, output_path).await;
     }
     let operation = match command {
         Some(Command::Identity) => Operation::Cat(CatScope::Identity),
@@ -306,18 +328,49 @@ async fn run_native(
             return Ok(());
         }
         Some(Command::Quit) => return Ok(()),
-        _ => {
+        Some(command @ (Command::Mode { .. } | Command::Dv(_) | Command::Fm(_))) => {
+            let endpoint = resolve_native(cli).await?;
+            return native::repl::run(&endpoint, Some(command)).await;
+        }
+        None if cli.command.is_empty() => {
+            let endpoint = resolve_native(cli).await?;
+            return native::repl::run(&endpoint, None).await;
+        }
+        Some(Command::DstarStart(_)) | None => {
             return Err(Box::new(CommandError(
-                "native Bluetooth requires identity, status, gateway, mcp probe, or dstar start; interactive CAT sessions and direct mode writes are not supported"
+                "this diagnostic is not supported over native Bluetooth; dstar probe requires USB"
                     .to_owned(),
             )));
         }
     };
+    let endpoint = resolve_native(cli).await?;
     native::workflow::run(&endpoint, &operation, None).await
 }
 
-async fn connect(cli: &Cli) -> AppResult<ConnectedRadio> {
-    let path = selected_path(cli)?;
+/// Discovery has no radio owner, but its helper still must be joined on Ctrl-C.
+async fn resolve_native(cli: &Cli) -> AppResult<native::Endpoint> {
+    let cancelled = AtomicBool::new(false);
+    let request = cli.bluetooth_request();
+    let (selected, signal_error) = mcp::finish_on_interrupt(
+        native::discovery::resolve(&request, &cancelled),
+        tokio::signal::ctrl_c(),
+        &cancelled,
+    )
+    .await;
+    if let Some(error) = signal_error {
+        let detail = selected.err().map_or_else(
+            || "no radio connection was opened".to_owned(),
+            |error| error.to_string(),
+        );
+        return Err(CommandError(format!(
+            "Bluetooth selection signal listener failed: {error}; selection: {detail}"
+        ))
+        .into());
+    }
+    selected
+}
+
+async fn connect_serial(cli: &Cli, path: String) -> AppResult<ConnectedRadio> {
     if cli.port.is_some() {
         return match probe_path(&path, cli.baud).await {
             Ok((radio, identity)) => Ok((radio, identity, path)),
@@ -334,16 +387,38 @@ async fn connect(cli: &Cli) -> AppResult<ConnectedRadio> {
     }
 }
 
-fn selected_path(cli: &Cli) -> AppResult<String> {
+/// Automatic selection never changes radios after an attempted connection.
+#[derive(Debug, PartialEq, Eq)]
+enum ConnectionSelection {
+    Serial(String),
+    Bluetooth,
+}
+
+fn select_connection(
+    cli: &Cli,
+    discover: impl FnOnce() -> Result<Vec<SerialCandidate>, kenwood_transport::TransportError>,
+) -> AppResult<ConnectionSelection> {
     if let Some(path) = &cli.port {
-        return Ok(path.clone());
+        return Ok(ConnectionSelection::Serial(path.clone()));
     }
-    let candidates = deduplicate_serial_aliases(
-        discover_serial()?
-            .into_iter()
-            .filter(SerialCandidate::is_tmd750),
-    );
-    Ok(unique_candidate(&candidates)?.path.clone())
+    if cli.requests_bluetooth() {
+        return Ok(ConnectionSelection::Bluetooth);
+    }
+    let candidates =
+        deduplicate_serial_aliases(discover()?.into_iter().filter(SerialCandidate::is_tmd750));
+    if candidates.is_empty() {
+        if cli.baud != DEFAULT_BAUD {
+            return Err(CommandError(
+                "no TM-D750 USB endpoint found; custom --baud cannot be used with Bluetooth"
+                    .to_owned(),
+            )
+            .into());
+        }
+        return Ok(ConnectionSelection::Bluetooth);
+    }
+    Ok(ConnectionSelection::Serial(
+        unique_candidate(&candidates)?.path.clone(),
+    ))
 }
 
 fn select_probe_endpoint(
@@ -442,10 +517,9 @@ async fn probe_path(path: &str, baud: u32) -> Result<(Radio<Connection>, Identit
 
 async fn run_connected(mut radio: Radio<Connection>, one_shot: Option<Command>) -> AppResult<()> {
     let session_result: AppResult<()> = if let Some(command) = one_shot {
-        execute_command(&mut radio, command)
+        execute_command(&mut radio, command, CommandPolicy::Direct)
             .await
             .map(|_action| ())
-            .map_err(Into::into)
     } else {
         interactive(&mut radio).await
     };
@@ -488,7 +562,7 @@ async fn interactive<T: Transport>(radio: &mut Radio<T>) -> AppResult<()> {
                 continue;
             }
         };
-        match execute_command(radio, command).await {
+        match execute_command(radio, command, CommandPolicy::Direct).await {
             Ok(LoopAction::Continue) => {}
             Ok(LoopAction::Quit) => return Ok(()),
             Err(error) => output::error(format_args!("Radio command failed: {error}")),
@@ -496,10 +570,53 @@ async fn interactive<T: Transport>(radio: &mut Radio<T>) -> AppResult<()> {
     }
 }
 
+/// Native prompts retire on cancellation and require fresh Gateway Off before
+/// each mode write. Direct serial execution retains its existing wire schedule.
+#[derive(Clone, Copy)]
+enum CommandPolicy<'a> {
+    Direct,
+    GatewayOff(&'a AtomicBool),
+}
+
+impl CommandPolicy<'_> {
+    fn boundary(self) -> AppResult<()> {
+        output::check()?;
+        if let Self::GatewayOff(cancelled) = self
+            && cancelled.load(Ordering::Relaxed)
+        {
+            return Err(
+                CommandError("CAT command cancelled at a command boundary".to_owned()).into(),
+            );
+        }
+        Ok(())
+    }
+
+    async fn admit_mode_write(self, radio: &mut Radio<impl Transport>) -> AppResult<()> {
+        self.boundary()?;
+        if matches!(self, Self::GatewayOff(_)) {
+            let gateway = radio.get_dv_gateway_mode().await?;
+            if gateway != DvGatewayMode::Off {
+                return Err(CommandError(format!(
+                    "native CAT mode writes require Gateway Off; observed {gateway}"
+                ))
+                .into());
+            }
+            self.boundary()?;
+        }
+        Ok(())
+    }
+}
+
+/// Execute the same typed command vocabulary on either transport.
+///
+/// Cancellation is checked between complete library operations. In particular,
+/// a started mode write finishes its echo/readback before ownership is retired.
 async fn execute_command<T: Transport>(
     radio: &mut Radio<T>,
     command: Command,
-) -> Result<LoopAction, kenwood_tmd750::Error> {
+    policy: CommandPolicy<'_>,
+) -> AppResult<LoopAction> {
+    policy.boundary()?;
     match command {
         Command::Help => print_help(),
         Command::Identity => {
@@ -508,8 +625,11 @@ async fn execute_command<T: Transport>(
         }
         Command::Status => {
             let identity = radio.identify().await?;
+            policy.boundary()?;
             let band_a = radio.get_operating_mode(Band::A).await?;
+            policy.boundary()?;
             let band_b = radio.get_operating_mode(Band::B).await?;
+            policy.boundary()?;
             let gateway = radio.get_dv_gateway_mode().await?;
             print_identity(&identity);
             output::line(format_args!("Band A mode: {band_a}."));
@@ -524,6 +644,7 @@ async fn execute_command<T: Transport>(
             band,
             set_to: Some(mode),
         } => {
+            policy.admit_mode_write(radio).await?;
             radio.set_operating_mode(band, mode).await?;
             let selected = OperatingMode::from(mode);
             output::line(format_args!(
@@ -531,6 +652,7 @@ async fn execute_command<T: Transport>(
             ));
         }
         Command::Dv(band) => {
+            policy.admit_mode_write(radio).await?;
             radio.enter_dstar(band).await?;
             output::line(format_args!(
                 "Band {band} D-STAR DV mode: active (write and readback verified). Terminal Mode was not changed."
@@ -538,10 +660,11 @@ async fn execute_command<T: Transport>(
         }
         Command::DstarStart(_) => {
             output::error(format_args!(
-                "Command error: dstar start consumes the serial connection; close this prompt and supply it as the startup command."
+                "Command error: dstar start consumes the radio connection; close this prompt and supply it as the startup command."
             ));
         }
         Command::Fm(band) => {
+            policy.admit_mode_write(radio).await?;
             radio.set_operating_mode(band, SelectableMode::Fm).await?;
             output::line(format_args!(
                 "Band {band} mode: FM (write and readback verified)."
@@ -887,7 +1010,8 @@ mod tests {
         assert_eq!(cli.command, ["dstar", "start", "KQ4NIT", "REF030C"]);
         assert_eq!(cli.baud, DEFAULT_BAUD);
         assert!(cli.port.is_none());
-        assert!(cli.bluetooth.is_none());
+        assert!(!cli.bluetooth);
+        assert!(cli.bluetooth_address.is_none());
         assert!(cli.control_port.is_none());
         assert!(matches!(
             parse_command(&cli.command.join(" "))?,
@@ -900,14 +1024,14 @@ mod tests {
     fn native_endpoint_preserves_typed_address_and_helper_path() -> TestResult {
         let cli = Cli::try_parse_from([
             "tmd750-repl",
-            "--bluetooth",
+            "--bluetooth-address",
             "01:23:45:67:89:AB",
             "--bluetooth-helper",
             "/Applications/Radio Tools/Native Helper",
             "status",
         ])?;
         assert_eq!(
-            cli.bluetooth.as_ref().map(BluetoothAddress::as_str),
+            cli.bluetooth_address.as_ref().map(BluetoothAddress::as_str),
             Some("01-23-45-67-89-AB")
         );
         assert_eq!(
@@ -923,12 +1047,124 @@ mod tests {
     fn native_endpoint_rejects_serial_options_and_orphaned_helper() {
         for arguments in [
             vec!["--bluetooth-helper", "/not/a/helper"],
-            vec!["--bluetooth", "not-an-address"],
-            vec!["--bluetooth", "01:23:45:67:89:AB", "--port", "/not/a/port"],
-            vec!["--bluetooth", "01:23:45:67:89:AB", "--baud", "9600"],
+            vec!["--bluetooth-address", "not-an-address"],
+            vec!["--bluetooth", "--port", "/not/a/port"],
+            vec!["--bluetooth", "--baud", "9600"],
+            vec![
+                "--bluetooth-address",
+                "01:23:45:67:89:AB",
+                "--port",
+                "/not/a/port",
+            ],
+            vec!["--bluetooth-address", "01:23:45:67:89:AB", "--baud", "9600"],
         ] {
             assert!(Cli::try_parse_from(std::iter::once("tmd750-repl").chain(arguments)).is_err());
         }
+    }
+
+    #[test]
+    fn bluetooth_flag_needs_no_address_and_never_consumes_the_command() -> TestResult {
+        for command in [
+            vec![],
+            vec!["status"],
+            vec!["mode", "b"],
+            vec!["mcp", "backup"],
+        ] {
+            let cli = Cli::try_parse_from(
+                [
+                    "tmd750-repl",
+                    "--bluetooth",
+                    "--bluetooth-helper",
+                    "/absolute/helper",
+                ]
+                .into_iter()
+                .chain(command.iter().copied()),
+            )?;
+            assert!(cli.requests_bluetooth(), "flag forces Bluetooth selection");
+            assert!(cli.bluetooth_address.is_none(), "no address is required");
+            assert_eq!(cli.command, command, "startup command remains intact");
+            assert_eq!(
+                cli.bluetooth_request().helper,
+                Some(PathBuf::from("/absolute/helper")),
+                "a helper override does not require an address"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ordinary_auto_selection_prefers_usb_then_paired_bluetooth() -> TestResult {
+        let cli = Cli::try_parse_from(["tmd750-repl"])?;
+        let usb = SerialCandidate {
+            path: "/dev/cu.radio".to_owned(),
+            vid: Some(0x2166),
+            pid: Some(0x9032),
+        };
+        assert_eq!(
+            select_connection(&cli, || Ok(vec![usb.clone()]))?,
+            ConnectionSelection::Serial(usb.path.clone()),
+            "USB remains the first automatic choice"
+        );
+        assert_eq!(
+            select_connection(&cli, || Ok(vec![]))?,
+            ConnectionSelection::Bluetooth,
+            "a paired radio can be selected without any CLI address"
+        );
+        let other = SerialCandidate {
+            path: "/dev/cu.other".to_owned(),
+            vid: None,
+            pid: None,
+        };
+        assert_eq!(
+            select_connection(&cli, || Ok(vec![other]))?,
+            ConnectionSelection::Bluetooth,
+            "unrelated serial devices cannot suppress Bluetooth discovery"
+        );
+        let second = SerialCandidate {
+            path: "/dev/cu.second".to_owned(),
+            ..usb
+        };
+        let error = select_connection(&cli, || Ok(vec![usb, second]));
+        assert!(
+            error.is_err(),
+            "ambiguous USB selection must not choose another radio"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_transport_selection_does_not_enumerate_other_devices() -> TestResult {
+        for arguments in [
+            vec!["--bluetooth"],
+            vec!["--bluetooth-address", "01:23:45:67:89:AB"],
+            vec!["--port", "/dev/cu.chosen"],
+        ] {
+            let cli = Cli::try_parse_from(std::iter::once("tmd750-repl").chain(arguments))?;
+            let enumerated = std::cell::Cell::new(false);
+            let selected = select_connection(&cli, || {
+                enumerated.set(true);
+                Ok(vec![])
+            })?;
+            assert!(!enumerated.get(), "explicit choices bypass USB discovery");
+            assert_eq!(
+                selected,
+                cli.port
+                    .map_or(ConnectionSelection::Bluetooth, ConnectionSelection::Serial),
+                "the selected transport matches the explicit override"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn custom_serial_baud_cannot_silently_turn_into_bluetooth() -> TestResult {
+        let cli = Cli::try_parse_from(["tmd750-repl", "--baud", "19200"])?;
+        let error = select_connection(&cli, || Ok(vec![]));
+        assert!(
+            error.is_err_and(|error| error.to_string().contains("--baud")),
+            "serial-only settings must not be ignored during fallback"
+        );
+        Ok(())
     }
 
     #[test]
@@ -977,7 +1213,8 @@ mod tests {
         mock.expect(b"MD 1\r", b"MD 1,1\r");
         let mut radio = Radio::new(mock);
 
-        let action = execute_command(&mut radio, Command::Dv(Band::B)).await?;
+        let action =
+            execute_command(&mut radio, Command::Dv(Band::B), CommandPolicy::Direct).await?;
 
         assert_eq!(action, LoopAction::Continue);
         radio.into_transport().assert_complete();
@@ -994,7 +1231,8 @@ mod tests {
         mock.expect(b"MD 0\r", b"MD 0,0\r");
         let mut radio = Radio::new(mock);
 
-        let action = execute_command(&mut radio, Command::Fm(Band::A)).await?;
+        let action =
+            execute_command(&mut radio, Command::Fm(Band::A), CommandPolicy::Direct).await?;
 
         assert_eq!(action, LoopAction::Continue);
         radio.into_transport().assert_complete();
@@ -1007,7 +1245,7 @@ mod tests {
         mock.expect(b"GW\r", b"GW 0\r");
         let mut radio = Radio::new(mock);
 
-        let action = execute_command(&mut radio, Command::Gateway).await?;
+        let action = execute_command(&mut radio, Command::Gateway, CommandPolicy::Direct).await?;
 
         assert_eq!(action, LoopAction::Continue);
         radio.into_transport().assert_complete();
@@ -1019,7 +1257,7 @@ mod tests {
         let mock = MockTransport::new();
         let mut radio = Radio::new(mock);
 
-        let action = execute_command(&mut radio, Command::Terminal).await?;
+        let action = execute_command(&mut radio, Command::Terminal, CommandPolicy::Direct).await?;
 
         assert_eq!(action, LoopAction::Continue);
         radio.into_transport().assert_complete();

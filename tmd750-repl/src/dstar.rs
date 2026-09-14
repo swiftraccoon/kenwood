@@ -149,7 +149,7 @@ pub(super) async fn run(path: &str, baud: u32, request: StartRequest) -> Result<
 
 /// Automatic Bluetooth startup, retaining USB recovery until runtime shutdown.
 pub(super) async fn run_bluetooth(
-    endpoint: Option<crate::native::Endpoint>,
+    endpoint: crate::native::discovery::Request,
     control_port: Option<&str>,
     request: StartRequest,
 ) -> Result<(), String> {

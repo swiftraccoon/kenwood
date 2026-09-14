@@ -1,9 +1,9 @@
 //! Endpoint policy tests use only local metadata, never discovery or helpers.
 
-use std::cell::Cell;
 use std::path::PathBuf;
 
 use kenwood_tmd750::transport::{KENWOOD_VID, TMD750_PANEL_PID};
+use kenwood_transport::bluetooth::BluetoothAddress;
 
 use super::*;
 
@@ -15,70 +15,6 @@ fn usb(path: &str, pid: u16) -> SerialCandidate {
         vid: Some(KENWOOD_VID),
         pid: Some(pid),
     }
-}
-
-#[test]
-fn default_requires_one_exact_paired_model_name() -> TestResult {
-    let expected: BluetoothAddress = "01:23:45:67:89:AB".parse()?;
-    let other: BluetoothAddress = "01:23:45:67:89:AC".parse()?;
-    let selected = select_bluetooth(None, [(&other, "TH-D75"), (&expected, "TM-D750")])?;
-    assert_eq!(selected.address, expected);
-    assert!(selected.helper.is_none());
-    for name in ["TH-D75", "tm-d750", "TM-D750 ", "TM-D750-2", ""] {
-        assert!(select_bluetooth(None, [(&expected, name)]).is_err());
-    }
-    assert!(select_bluetooth(None, std::iter::empty()).is_err());
-    Ok(())
-}
-
-#[test]
-fn observed_remote_board_name_is_a_candidate_not_a_model_or_address_override() -> TestResult {
-    let radio: BluetoothAddress = "01:23:45:67:89:AB".parse()?;
-    let other: BluetoothAddress = "01:23:45:67:89:AC".parse()?;
-    let selected = select_bluetooth(None, [(&radio, "stm32mp1-ex5240"), (&other, "TH-D75")])?;
-    assert_eq!(selected.address, radio);
-    assert!(select_bluetooth(None, [(&radio, "stm32mp1-ex5240"), (&other, "TM-D750")]).is_err());
-    for name in [
-        "stm32mp1",
-        "stm32mp1-ex5241",
-        "STM32MP1-EX5240",
-        "stm32mp1-ex5240 ",
-    ] {
-        assert!(select_bluetooth(None, [(&radio, name)]).is_err());
-    }
-    Ok(())
-}
-
-#[test]
-fn duplicate_names_or_conflicting_address_records_are_not_selected() -> TestResult {
-    let first: BluetoothAddress = "01:23:45:67:89:AB".parse()?;
-    let second: BluetoothAddress = "01:23:45:67:89:AC".parse()?;
-    for records in [
-        [(&first, "TM-D750"), (&second, "TM-D750")],
-        [(&first, "TM-D750"), (&first, "TM-D750")],
-        [(&first, "TM-D750"), (&first, "other name")],
-    ] {
-        assert!(select_bluetooth(None, records).is_err());
-    }
-    Ok(())
-}
-
-#[test]
-fn explicit_bluetooth_preserves_helper_and_does_not_consume_inventory() -> TestResult {
-    let address: BluetoothAddress = "01:23:45:67:89:AB".parse()?;
-    let supplied = Endpoint {
-        address: address.clone(),
-        helper: Some(PathBuf::from("/absolute/helper with spaces")),
-    };
-    let inspected = Cell::new(0);
-    let records = std::iter::once((&address, "unrelated")).inspect(|_| {
-        inspected.set(inspected.get() + 1);
-    });
-    let selected = select_bluetooth(Some(supplied.clone()), records)?;
-    assert_eq!(selected.address, supplied.address);
-    assert_eq!(selected.helper, supplied.helper);
-    assert_eq!(inspected.get(), 0);
-    Ok(())
 }
 
 #[test]
@@ -202,4 +138,75 @@ fn sticky_cancellation_refuses_endpoint_admission() {
     cancelled.store(true, Ordering::Relaxed);
     let error = check_cancelled(&cancelled);
     assert!(matches!(error, Err(error) if error.kind() == io::ErrorKind::Interrupted));
+}
+
+#[tokio::test]
+async fn usb_refusal_prevents_any_bluetooth_inventory() -> TestResult {
+    let called = AtomicBool::new(false);
+    let result = resolve_with(
+        &discovery::Request::default(),
+        None,
+        &AtomicBool::new(false),
+        &[],
+        async |_, _| {
+            called.store(true, Ordering::Relaxed);
+            Err(CommandError("inventory must not start".to_owned()).into())
+        },
+    )
+    .await;
+    assert!(result.is_err());
+    assert!(!called.load(Ordering::Relaxed));
+    Ok(())
+}
+
+#[tokio::test]
+async fn admitted_usb_passes_exact_selection_request_to_shared_resolver() -> TestResult {
+    let address: BluetoothAddress = "01:23:45:67:89:AB".parse()?;
+    let request = discovery::Request {
+        address: Some(address.clone()),
+        helper: Some(PathBuf::from("/absolute/helper with spaces")),
+    };
+    let control = usb("/dev/cu.usbmodem1", TMD750_PANEL_PID);
+    let selected = resolve_with(
+        &request,
+        None,
+        &AtomicBool::new(false),
+        std::slice::from_ref(&control),
+        async |observed, cancelled| {
+            assert_eq!(observed.address, request.address);
+            assert_eq!(observed.helper, request.helper);
+            assert!(!cancelled.load(Ordering::Relaxed));
+            Ok(Endpoint {
+                address: address.clone(),
+                helper: observed.helper.clone(),
+            })
+        },
+    )
+    .await?;
+    assert_eq!(selected.control, control);
+    assert_eq!(selected.bluetooth.address, address);
+    assert_eq!(selected.bluetooth.helper, request.helper);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancellation_during_bluetooth_selection_blocks_endpoint_admission() -> TestResult {
+    let address: BluetoothAddress = "01:23:45:67:89:AB".parse()?;
+    let cancelled = AtomicBool::new(false);
+    let result = resolve_with(
+        &discovery::Request::default(),
+        None,
+        &cancelled,
+        &[usb("/dev/cu.usbmodem1", TMD750_PANEL_PID)],
+        async |_, cancelled| {
+            cancelled.store(true, Ordering::Relaxed);
+            Ok(Endpoint {
+                address,
+                helper: None,
+            })
+        },
+    )
+    .await;
+    assert!(matches!(result, Err(error) if error.to_string().contains("cancelled")));
+    Ok(())
 }

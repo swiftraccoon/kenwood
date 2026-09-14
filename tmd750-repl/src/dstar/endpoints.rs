@@ -12,20 +12,14 @@ use std::sync::atomic::Ordering;
 use kenwood_tmd750::transport::SerialCandidate;
 #[cfg(any(target_os = "macos", test))]
 use kenwood_tmd750::transport::TMD750_MAIN_PID;
-#[cfg(any(target_os = "macos", test))]
-use kenwood_transport::bluetooth::BluetoothAddress;
 
 use crate::AppResult;
 #[cfg(any(target_os = "macos", test))]
 use crate::CommandError;
-use crate::native::Endpoint;
+use crate::native::{Endpoint, discovery};
 
 #[cfg(test)]
 mod tests;
-
-/// Observed remote names, not proof of the radio model or physical continuity.
-#[cfg(any(target_os = "macos", test))]
-const CANDIDATE_NAMES: [&str; 2] = ["TM-D750", "stm32mp1-ex5240"];
 
 /// Selected roles remain distinct transport types throughout the lifecycle.
 #[derive(Debug)]
@@ -44,47 +38,54 @@ pub(crate) struct Endpoints {
 /// through cancellation; cancellation prevents admission after the worker ends.
 #[cfg(target_os = "macos")]
 pub(crate) async fn resolve(
-    bluetooth: Option<Endpoint>,
+    bluetooth: &discovery::Request,
     control_port: Option<&str>,
     cancelled: &AtomicBool,
 ) -> AppResult<Endpoints> {
     use kenwood_tmd750::transport::discover_serial;
-    use kenwood_transport::bluetooth::BluetoothTransport;
-
     check_cancelled(cancelled)?;
-    let control = select_control(control_port, &discover_serial()?)?;
-    check_cancelled(cancelled)?;
-    let bluetooth = if bluetooth.is_some() {
-        select_bluetooth(bluetooth, std::iter::empty())?
-    } else {
-        let observed = tokio::task::spawn_blocking(BluetoothTransport::paired_devices).await;
-        // Joining takes precedence over returning cancellation, including a
-        // concurrently completed worker. No helper owner is detached here.
-        check_cancelled(cancelled)?;
-        let devices = observed??;
-        select_bluetooth(
-            None,
-            devices
-                .iter()
-                .map(|device| (device.address(), device.display_name())),
-        )?
-    };
-    check_cancelled(cancelled)?;
-    Ok(Endpoints { bluetooth, control })
+    resolve_with(
+        bluetooth,
+        control_port,
+        cancelled,
+        &discover_serial()?,
+        discovery::resolve,
+    )
+    .await
 }
 
 /// Refuse unsupported platforms before discovery or connection opening.
 #[cfg(not(target_os = "macos"))]
-pub(crate) async fn resolve(
-    _bluetooth: Option<Endpoint>,
+pub(crate) fn resolve(
+    _bluetooth: &discovery::Request,
     _control_port: Option<&str>,
     _cancelled: &AtomicBool,
-) -> AppResult<Endpoints> {
-    Err(io::Error::new(
+) -> std::future::Ready<AppResult<Endpoints>> {
+    std::future::ready(Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "automatic TM-D750 D-STAR startup currently requires native Bluetooth on macOS",
     )
-    .into())
+    .into()))
+}
+
+/// Admit independent USB metadata before consulting Bluetooth inventory.
+#[cfg(any(target_os = "macos", test))]
+async fn resolve_with<F>(
+    bluetooth: &discovery::Request,
+    control_port: Option<&str>,
+    cancelled: &AtomicBool,
+    candidates: &[SerialCandidate],
+    resolve_bluetooth: F,
+) -> AppResult<Endpoints>
+where
+    F: AsyncFnOnce(&discovery::Request, &AtomicBool) -> AppResult<Endpoint>,
+{
+    check_cancelled(cancelled)?;
+    let control = select_control(control_port, candidates)?;
+    check_cancelled(cancelled)?;
+    let bluetooth = resolve_bluetooth(bluetooth, cancelled).await?;
+    check_cancelled(cancelled)?;
+    Ok(Endpoints { bluetooth, control })
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -97,43 +98,6 @@ fn check_cancelled(cancelled: &AtomicBool) -> io::Result<()> {
     } else {
         Ok(())
     }
-}
-
-/// Resolve one recognized remote name, then retain its exact candidate address.
-#[cfg(any(target_os = "macos", test))]
-fn select_bluetooth<'a>(
-    supplied: Option<Endpoint>,
-    devices: impl IntoIterator<Item = (&'a BluetoothAddress, &'a str)>,
-) -> Result<Endpoint, CommandError> {
-    if let Some(endpoint) = supplied {
-        return Ok(endpoint);
-    }
-    let devices: Vec<_> = devices.into_iter().collect();
-    let mut matching = devices
-        .iter()
-        .copied()
-        .filter(|(_, name)| CANDIDATE_NAMES.contains(name));
-    let Some((address, _)) = matching.next() else {
-        return Err(CommandError(
-            "no paired TM-D750 candidate named TM-D750 or stm32mp1-ex5240; pair the radio or select its exact address with --bluetooth".to_owned(),
-        ));
-    };
-    if matching.next().is_some()
-        || devices
-            .iter()
-            .filter(|(candidate, _)| *candidate == address)
-            .count()
-            != 1
-    {
-        return Err(CommandError(
-            "paired TM-D750 selection is ambiguous; select one exact address with --bluetooth"
-                .to_owned(),
-        ));
-    }
-    Ok(Endpoint {
-        address: address.clone(),
-        helper: None,
-    })
 }
 
 /// Preserve explicit paths; automatic selection considers only macOS callout ports.

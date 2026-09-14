@@ -332,6 +332,13 @@ pub(super) struct TranscriptSummary {
     error: Option<Failure>,
 }
 
+impl TranscriptSummary {
+    /// The first recording or synchronization failure, independent of cleanup.
+    pub(super) const fn error(&self) -> Option<&Failure> {
+        self.error.as_ref()
+    }
+}
+
 /// Whether capture failure may interrupt subsequent protocol operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CapturePolicy {

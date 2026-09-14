@@ -13,6 +13,157 @@ use crate::native::{OpenFailure, Opened};
 
 type TestResult = AppResult<()>;
 
+fn failure(message: &str) -> Failure {
+    Failure::from_error(&io::Error::other(message.to_owned()))
+}
+
+fn failed_transcript() -> TranscriptSummary {
+    let mut storage = [];
+    let mut recorder = Recorder::named(
+        io::Cursor::new(storage.as_mut_slice()),
+        Arc::new(AtomicBool::new(false)),
+        "transcript.jsonl",
+    );
+    recorder.record("cannot fit in the fixed empty buffer");
+    recorder.summary()
+}
+
+fn failed_cat() -> cat::Observation {
+    cat::Observation {
+        scope: CatScope::Gateway,
+        identity: None,
+        gateway: None,
+        band_a: None,
+        band_b: None,
+        operation_error: Some(failure("ID timed out after 1500ms")),
+        close_error: Some(failure("close detail")),
+        capture_error: Some(failure("capture detail")),
+        cancelled: false,
+        transcript: failed_transcript(),
+    }
+}
+
+fn failed_fixed_probe() -> crate::mcp::ProbeEvidence {
+    (&kenwood_tmd750::McpProbeReport {
+        identity: None,
+        entry_reply: None,
+        segments: Vec::new(),
+        exit: kenwood_tmd750::McpProbeExit::NotEntered,
+        outcome: kenwood_tmd750::McpProbeOutcome::Failed {
+            stage: kenwood_tmd750::McpProbeStage::Identity,
+            error: TransportError::Read(io::Error::other("probe detail")).into(),
+        },
+    })
+        .into()
+}
+
+fn failed_backup() -> BackupEvidence {
+    (&kenwood_tmd750::McpBackupReport {
+        identity: None,
+        gateway_mode: None,
+        entry_reply: None,
+        segments: Vec::new(),
+        exit: kenwood_tmd750::McpProbeExit::NotEntered,
+        outcome: kenwood_tmd750::McpBackupOutcome::Failed {
+            stage: kenwood_tmd750::McpBackupStage::Identity,
+            error: TransportError::Read(io::Error::other("backup detail")).into(),
+        },
+    })
+        .into()
+}
+
+#[test]
+fn failure_presentation_covers_cat_fixed_and_backup_without_changing_evidence() -> TestResult {
+    let selected = endpoint()?;
+    for (operation, original, expected) in [
+        (
+            Operation::Cat(CatScope::Status),
+            Observation::Cat {
+                evidence: failed_cat(),
+            },
+            "Original CAT failed: ID timed out after 1500ms.",
+        ),
+        (
+            Operation::FixedMcp,
+            Observation::FixedMcp {
+                probe: Some(failed_fixed_probe()),
+                gateway_before: None,
+                close_error: Some(failure("close detail")),
+                transcript: failed_transcript(),
+            },
+            "Fixed MCP read failed: transport read failed: probe detail.",
+        ),
+        (
+            Operation::ConfigurationBackup,
+            Observation::ConfigurationBackup {
+                backup: Some(failed_backup()),
+                gateway_before: None,
+                close_error: Some(failure("close detail")),
+                transcript: failed_transcript(),
+            },
+            "Configuration read failed: transport read failed: backup detail.",
+        ),
+    ] {
+        let report = Report::new(
+            &selected,
+            operation,
+            String::new(),
+            String::new(),
+            WorkflowResult {
+                original: Some(original),
+                fresh_cat: Some(failed_cat()),
+                settle_error: Some(failure("settle detail")),
+                settle_transcript: Some(failed_transcript()),
+                ..WorkflowResult::default()
+            },
+            Some(failure("signal detail")),
+            false,
+        );
+        let before = serde_json::to_vec(&report)?;
+        let lines = report.failure_lines();
+        assert!(
+            lines.iter().any(|line| line == expected),
+            "{operation:?}: {lines:?}"
+        );
+        for expected in [
+            "Original close failed: close detail.",
+            "Original capture failed:",
+            "Fresh CAT failed: ID timed out after 1500ms.",
+            "Fresh close failed: close detail.",
+            "Fresh capture failed: capture detail.",
+            "Post-exit settle failed: settle detail.",
+            "Post-exit settle capture failed:",
+            "Signal listener failed: signal detail.",
+        ] {
+            assert!(
+                lines.iter().any(|line| line.starts_with(expected)),
+                "{operation:?} omitted {expected:?}: {lines:?}"
+            );
+        }
+        assert_eq!(serde_json::to_vec(&report)?, before);
+    }
+    Ok(())
+}
+
+#[test]
+fn failure_presentation_keeps_signal_failure_before_any_observation() -> TestResult {
+    let selected = endpoint()?;
+    let report = Report::new(
+        &selected,
+        Operation::Cat(CatScope::Identity),
+        String::new(),
+        String::new(),
+        WorkflowResult::default(),
+        Some(failure("listener unavailable")),
+        true,
+    );
+    assert_eq!(
+        report.failure_lines(),
+        ["Signal listener failed: listener unavailable."]
+    );
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Seen {
     Open(usize, String),
@@ -37,6 +188,7 @@ struct Fixture {
     script: MockTransport,
     close_fails: bool,
     cancel_on_close: bool,
+    cancel_on_ack: bool,
     address: Option<String>,
     channel: u8,
     open_error: Option<TransportError>,
@@ -48,6 +200,7 @@ impl Fixture {
             script,
             close_fails: false,
             cancel_on_close: false,
+            cancel_on_ack: false,
             address: None,
             channel: 27,
             open_error: None,
@@ -81,6 +234,9 @@ impl Transport for Connection {
             &self.log,
             Seen::Read(self.id, bytes.get(..count).unwrap_or_default().to_vec()),
         )?;
+        if self.fixture.cancel_on_ack && bytes.get(..count) == Some([ACK].as_slice()) {
+            self.cancelled.store(true, Ordering::Relaxed);
+        }
         Ok(count)
     }
 
@@ -182,13 +338,39 @@ fn fixed(exit_reply: &[u8]) -> AppResult<MockTransport> {
         Page::new(Address::new(8)?, 40)?,
         Page::new(Address::new(327_681)?, 255)?,
     ] {
-        let mut response = write_request(page).to_vec();
-        response.extend(vec![0x42; page.len()]);
-        script.expect(&read_request(page), &response);
-        script.expect(&[ACK], &[ACK]);
+        page_read(&mut script, page);
     }
     script.expect(b"E", exit_reply);
     Ok(script)
+}
+
+fn page_read(script: &mut MockTransport, page: Page) {
+    let mut response = write_request(page).to_vec();
+    response.extend(vec![0x42; page.len()]);
+    script.expect(&read_request(page), &response);
+    script.expect(&[ACK], &[ACK]);
+}
+
+fn configuration_pages() -> Vec<Page> {
+    kenwood_tmd750::protocol::mcp::regions::menu_regions()
+        .into_iter()
+        .flat_map(kenwood_tmd750::Region::pages)
+        .collect()
+}
+
+fn configuration_entry() -> MockTransport {
+    let mut script = fresh_gateway(b"GW 0\r");
+    script.expect(b"0M PROGRAM\r", b"0M\r");
+    script
+}
+
+fn configuration(exit_reply: &[u8]) -> MockTransport {
+    let mut script = configuration_entry();
+    for page in configuration_pages() {
+        page_read(&mut script, page);
+    }
+    script.expect(b"E", exit_reply);
+    script
 }
 
 fn fresh_gateway(reply: &[u8]) -> MockTransport {
@@ -678,5 +860,279 @@ async fn failed_settle_capture_still_retires_the_original_owner_without_reopenin
     assert_eq!(opens(&events), 1);
     assert!(!events.iter().any(|event| matches!(event, Seen::Wait(_))));
     assert!(position(&events, &Seen::Close(0))? < position(&events, &Seen::Drop(0))?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn configuration_backup_recovers_on_the_discovered_channel_and_loads_offline() -> TestResult {
+    let mut original = Fixture::new(configuration(&[ACK]));
+    original.channel = 19;
+    let mut fresh = Fixture::new(fresh_gateway(b"GW 0\r"));
+    fresh.channel = 19;
+    let (result, events) = execute(
+        [original, Fixture::failed(TransportError::NotFound), fresh],
+        Operation::ConfigurationBackup,
+    )
+    .await?;
+    assert!(result.succeeded(), "{result:?}");
+    assert_eq!(opens(&events), 3);
+    let pages = configuration_pages();
+    assert_eq!(pages.len(), 1138);
+    assert_eq!(pages.iter().map(|page| page.len()).sum::<usize>(), 289_962);
+    let original_writes = writes(&events, 0);
+    assert_eq!(original_writes.len(), 6 + pages.len() * 2);
+    assert_eq!(
+        original_writes.last().map(Vec::as_slice),
+        Some(b"E".as_slice())
+    );
+    assert!(
+        original_writes
+            .iter()
+            .all(|write| !matches!(write.first(), Some(b'W' | b'Z')))
+    );
+    assert_eq!(
+        original_writes
+            .iter()
+            .filter(|write| write.as_slice() == b"ID\r")
+            .count(),
+        1
+    );
+    assert!(writes(&events, 1).is_empty());
+    assert_eq!(
+        writes(&events, 2),
+        [b"ID\r".as_slice(), b"FV\r", b"TY\r", b"GW\r"]
+    );
+    let exit = position(&events, &Seen::Write(0, b"E".to_vec()))?;
+    let settle = position(&events, &Seen::Wait(POST_EXIT_SETTLE))?;
+    let close = position(&events, &Seen::Close(0))?;
+    let drop = position(&events, &Seen::Drop(0))?;
+    let retry = position(&events, &Seen::Open(1, endpoint()?.address.to_string()))?;
+    assert!(exit < settle && settle < close && close < drop && drop < retry);
+    let channel = kenwood_transport::bluetooth::RfcommChannel::new(19)?;
+    for index in [1, 2] {
+        assert!(events.contains(&Seen::Service(
+            index,
+            BluetoothService::FixedChannel(channel)
+        )));
+    }
+
+    let temporary = tempfile::tempdir()?;
+    let path = temporary.path().join("report.json");
+    let selected = endpoint()?;
+    let report = Report::new(
+        &selected,
+        Operation::ConfigurationBackup,
+        "2026-09-13T20:00:00Z".to_owned(),
+        "2026-09-13T20:01:00Z".to_owned(),
+        result,
+        None,
+        false,
+    );
+    report.publish(&mut File::create_new(&path)?)?;
+    let snapshot = crate::mcp::snapshot::Snapshot::load(&path)?;
+    assert_eq!(snapshot.identity.firmware.as_str(), "1.02");
+    let memory = snapshot.menu_snapshot()?;
+    assert_eq!(memory.pages().len(), 1138);
+    let name = kenwood_tmd750::memory::menu_field("pm.PmName1").ok_or("PM1 registry field")?;
+    let selection = kenwood_tmd750::ScopedMenuField::new(name, None)?;
+    assert_eq!(
+        memory.value(selection)?,
+        kenwood_tmd750::memory::DecodedFieldValue::Text("B".repeat(16))
+    );
+    assert!(crate::mcp::snapshot::Snapshot::load_for_usb_write(&path).is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn configuration_failure_keeps_prior_pages_and_cleanup_without_exit_or_recovery() -> TestResult
+{
+    let pages = configuration_pages();
+    let mut script = configuration_entry();
+    page_read(&mut script, *pages.first().ok_or("first page")?);
+    script.expect(
+        &read_request(*pages.get(1).ok_or("second page")?),
+        &[b'W', 0, 0, 0, 0],
+    );
+    let mut fixture = Fixture::new(script);
+    fixture.close_fails = true;
+    let (result, events) = execute([fixture], Operation::ConfigurationBackup).await?;
+    assert!(!result.succeeded());
+    assert_eq!(opens(&events), 1);
+    assert!(!writes(&events, 0).iter().any(|write| write == b"E"));
+    assert!(result.fresh_opening.is_none());
+    assert!(result.settle_transcript.is_none());
+    let Some(Observation::ConfigurationBackup {
+        backup,
+        close_error,
+        transcript,
+        ..
+    }) = result.original
+    else {
+        return Err("missing configuration evidence".into());
+    };
+    assert!(close_error.is_some());
+    assert!(transcript.complete);
+    let evidence = serde_json::to_value(backup.ok_or("missing backup")?)?;
+    assert_eq!(
+        evidence
+            .pointer("/segments")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        evidence
+            .pointer("/outcome/stage/kind")
+            .and_then(serde_json::Value::as_str),
+        Some("read")
+    );
+    assert_eq!(
+        evidence.get("exit").and_then(serde_json::Value::as_str),
+        Some("recovery_required")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn configuration_cancellation_after_a_page_ack_exits_once_without_reopening() -> TestResult {
+    let mut script = configuration_entry();
+    page_read(
+        &mut script,
+        *configuration_pages().first().ok_or("first page")?,
+    );
+    script.expect(b"E", &[ACK]);
+    let mut fixture = Fixture::new(script);
+    fixture.cancel_on_ack = true;
+    let (result, events) = execute([fixture], Operation::ConfigurationBackup).await?;
+    assert!(!result.succeeded());
+    assert_eq!(opens(&events), 1);
+    assert_eq!(
+        writes(&events, 0).last().map(Vec::as_slice),
+        Some(b"E".as_slice())
+    );
+    assert!(!events.iter().any(|event| matches!(event, Seen::Wait(_))));
+    let Some(Observation::ConfigurationBackup {
+        backup,
+        close_error,
+        ..
+    }) = result.original
+    else {
+        return Err("missing configuration evidence".into());
+    };
+    assert!(close_error.is_none());
+    let evidence = serde_json::to_value(backup.ok_or("missing backup")?)?;
+    assert_eq!(
+        evidence
+            .pointer("/outcome/status")
+            .and_then(serde_json::Value::as_str),
+        Some("cancelled")
+    );
+    assert_eq!(
+        evidence.get("exit").and_then(serde_json::Value::as_str),
+        Some("acknowledged")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn configuration_cannot_recover_after_failed_exit_close_or_settle_capture() -> TestResult {
+    enum FailurePoint {
+        Exit,
+        OriginalClose,
+        SettleCapture,
+    }
+
+    for failure in [
+        FailurePoint::Exit,
+        FailurePoint::OriginalClose,
+        FailurePoint::SettleCapture,
+    ] {
+        let mut fixture = Fixture::new(configuration(if matches!(failure, FailurePoint::Exit) {
+            &[0x15]
+        } else {
+            &[ACK]
+        }));
+        fixture.close_fails = matches!(failure, FailurePoint::OriginalClose);
+        let (result, events) = execute_with_faults(
+            [fixture],
+            Operation::ConfigurationBackup,
+            Faults {
+                readonly_settle: matches!(failure, FailurePoint::SettleCapture),
+                ..Faults::default()
+            },
+        )
+        .await?;
+        assert!(!result.succeeded());
+        assert_eq!(opens(&events), 1);
+        assert!(result.fresh_opening.is_none());
+        assert!(position(&events, &Seen::Close(0))? < position(&events, &Seen::Drop(0))?);
+        if matches!(failure, FailurePoint::SettleCapture) {
+            assert!(result.settle_error.is_some());
+            assert!(
+                result
+                    .settle_transcript
+                    .is_some_and(|transcript| !transcript.complete)
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn configuration_preserves_failed_fresh_gateway_and_does_not_repeat_programming() -> TestResult
+{
+    let (result, events) = execute(
+        [
+            Fixture::new(configuration(&[ACK])),
+            Fixture::new(fresh_gateway(b"GW 2\r")),
+        ],
+        Operation::ConfigurationBackup,
+    )
+    .await?;
+    assert!(!result.succeeded());
+    assert_eq!(opens(&events), 2);
+    assert_eq!(
+        writes(&events, 0)
+            .iter()
+            .filter(|write| write.as_slice() == b"0M PROGRAM\r")
+            .count(),
+        1
+    );
+    let fresh = result.fresh_cat.ok_or("missing fresh CAT")?;
+    assert_eq!(fresh.gateway, Some(2));
+    assert!(fresh.operation_error.is_some());
+    assert!(fresh.close_error.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn configuration_pages_cannot_override_a_failed_fresh_owner_retirement() -> TestResult {
+    let mut fresh = Fixture::new(fresh_gateway(b"GW 0\r"));
+    fresh.close_fails = true;
+    let (result, events) = execute(
+        [Fixture::new(configuration(&[ACK])), fresh],
+        Operation::ConfigurationBackup,
+    )
+    .await?;
+    assert!(!result.succeeded());
+    assert_eq!(opens(&events), 2);
+    let fresh = result.fresh_cat.as_ref().ok_or("fresh observation")?;
+    assert!(fresh.operation_error.is_none());
+    assert!(fresh.close_error.is_some());
+    assert!(fresh.transcript.complete);
+    let temporary = tempfile::tempdir()?;
+    let path = temporary.path().join("report.json");
+    let selected = endpoint()?;
+    let report = Report::new(
+        &selected,
+        Operation::ConfigurationBackup,
+        "2026-09-13T20:00:00Z".to_owned(),
+        "2026-09-13T20:01:00Z".to_owned(),
+        result,
+        None,
+        false,
+    );
+    report.publish(&mut File::create_new(&path)?)?;
+    assert!(crate::mcp::snapshot::Snapshot::load(&path).is_err());
     Ok(())
 }

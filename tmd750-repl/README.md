@@ -1,6 +1,6 @@
 # TM-D750 REPL
 
-`tmd750-repl` is a plain-text USB shell with native macOS Bluetooth D-STAR and diagnostics
+`tmd750-repl` is a plain-text USB and native macOS Bluetooth shell
 for the Kenwood TM-D750. It is designed
 to work well with a screen reader. It supports normal CAT control plus an
 experimental, protocol-gated D-STAR Reflector Terminal Mode path.
@@ -29,18 +29,28 @@ not an extracted vendor maximum-version restriction.
 
 ## Run
 
-Connect USB to the radio, leave it on its normal screen, and run:
+Connect USB or pair the radio with your Mac, leave Gateway Off, and run:
 
 ```bash
 cargo run -p tmd750-repl
 ```
 
-Auto-discovery recognizes the main-unit and control-panel USB serial
-endpoints. If more than one is connected, the REPL refuses to guess and
-requires an explicit endpoint:
+Ordinary CAT commands prefer an available TM-D750 USB endpoint. When no USB
+endpoint is present, macOS automatically selects the single recognized paired
+Bluetooth radio. No address is required. Selection verifies the radio's CAT
+identity before control; a connection failure does not switch to another radio.
+
+USB discovery recognizes main-unit and control-panel endpoints. Multiple USB
+endpoints require an explicit choice:
 
 ```bash
 cargo run -p tmd750-repl -- --port /dev/cu.usbmodem101
+```
+
+To use Bluetooth while USB is connected:
+
+```bash
+cargo run -p tmd750-repl -- --bluetooth
 ```
 
 The default baud rate is the hardware-validated 9600 baud. Use `--baud` only
@@ -51,7 +61,7 @@ The TM-D750 library owns USB discovery and the RTS/CTS, DTR, and RTS preset;
 Endpoint selection and post-MCP readiness remain explicit REPL policies, not
 automatic behavior in the shared transport. The experimental D-STAR runtime
 comes directly from `mmdvm::dstar`, with no TH-D75 library dependency. The REPL
-owns TM-D750 protocol admission, the selected connection, and final serial
+owns TM-D750 protocol admission, the selected connection, and final transport
 close; the shared runtime owns MMDVM D-STAR processing. This separation does
 not qualify additional TM-D750 protocols or lifecycle operations.
 
@@ -62,29 +72,64 @@ The transport does not automatically reopen after a USB disconnect: serial
 pathnames can be reassigned. Reconnect the intended radio and select its current
 endpoint for a new session.
 
-### Native Bluetooth diagnostics on macOS
+### Native Bluetooth control and backups on macOS
 
-Select the radio's exact paired Bluetooth address, not its display name or
-`/dev/cu.*` alias. Replace the example address with your radio's address:
+The shell, CAT diagnostics, MCP reads, and D-STAR startup share paired-radio
+selection. Force Bluetooth with a flag; no MAC address is needed:
 
 ```bash
-cargo run -p tmd750-repl -- --bluetooth 01:23:45:67:89:AB status
-cargo run -p tmd750-repl -- --bluetooth 01:23:45:67:89:AB \
+cargo run -p tmd750-repl -- --bluetooth
+cargo run -p tmd750-repl -- --bluetooth status
+cargo run -p tmd750-repl -- --bluetooth mode b
+cargo run -p tmd750-repl -- --bluetooth \
   mcp probe --output bluetooth-probe-01
+cargo run -p tmd750-repl -- --bluetooth \
+  mcp backup --output bluetooth-backup-01
 ```
 
-Native startup commands currently support `identity` (or `id`), `status`,
-`gateway`, and the fixed read-only `mcp probe`. Each captures its observations
-and cleanup. Omitting the probe's `--output` creates a new private directory
-under `captures`; CAT diagnostics use that default destination. Programming
-temporarily interrupts normal radio operation, even without settings writes.
-General native backup/settings commands and interactive CAT are not supported
-by this diagnostic path. Automatic `dstar start` has its own narrowly guarded
-Bluetooth lifecycle, described below. Offline MCP inspection remains available.
+Automatic selection recognizes paired names `TM-D750` and the observed
+`stm32mp1-ex5240`. Names only select a candidate; CAT proves its identity.
+Multiple candidates are listed without opening any of them. Use
+`--bluetooth-address 01:23:45:67:89:AB` to select an exact address instead,
+replacing the example with your radio's address. This override implies
+Bluetooth and bypasses inventory; a separate `--bluetooth` flag is unnecessary.
+The selected address is retained internally for the whole workflow.
 
-The native MCP probe requires `TM-D750 / 1.02 / K,2,1` and a fresh Gateway Off
-reply. It reads exactly two fixed fragments, totaling 295 bytes, then requires
-the exit acknowledgment. The original connection is retained without further
+Without a startup command, the native shell uses the same CAT vocabulary as
+USB. It identifies the radio and requires Gateway Off before accepting input.
+FM/DV selections additionally require a fresh Gateway Off reply before every
+write, plus the library's firmware/type gate and immediate echo/readback.
+These commands select ordinary RF modes; they do not enable Terminal Mode or
+request a transmission. Invalid input stays local. A failed CAT operation
+closes the captured owner without retrying a command or reopening the session.
+
+Rich terminals retain line editing and session history. Plain terminals,
+including `TERM=dumb`, and pipes use cancellable input. EOF, `quit`, and Ctrl-C
+retire the radio and input independently. A started mode write finishes its
+echo/readback before cancellation is handled. Redirected regular-file scripts
+are loaded and size-checked before opening the radio, with a 1 MiB limit; commands
+are limited to 4 KiB before the newline. Pipes and files are batch sessions:
+invalid commands stop the script with a nonzero exit status, and cancellation
+does not count as successful completion. Interactive typos leave the prompt
+available. Startup CAT commands do not read stdin.
+Enter one command per rich-terminal prompt; use a pipe or file for multi-command
+scripts.
+
+Read-only startup `identity` (or `id`), `status`, and `gateway` retain their
+diagnostic report path. Shell sessions, fixed MCP probes, and standard backups
+also capture observations and cleanup in private directories. Omitting
+`--output` for a probe or backup creates a directory under `captures`; CAT
+uses that default destination. Programming temporarily interrupts normal radio
+operation, even without settings writes. General native MCP settings writes
+and trials remain disabled. Automatic `dstar start` has its own narrowly
+guarded Bluetooth lifecycle, described below; it cannot run inside the CAT
+prompt. Offline MCP inspection remains available.
+
+Native MCP probe and backup require `TM-D750 / 1.02 / K,2,1` and a fresh Gateway
+Off reply. The probe reads two fixed fragments totaling 295 bytes. Backup uses
+the library's complete standard schedule: 1,138 pages and 289,962 bytes, with
+no settings writes. Both require the exit acknowledgment. The original
+connection is retained without further
 protocol traffic for five seconds, then closed and dropped. Only complete
 read/exit evidence, a clean original close and complete captures admit recovery.
 Recovery reopens the exact address and the RFCOMM channel from that original
@@ -100,11 +145,24 @@ endpoint, incomplete capture, and a late successful owner's failed cleanup
 prevent another attempt. Neither MCP nor a CAT exchange is retried. In
 particular, a changed identity or Gateway reply stops recovery.
 
-Format-2 native reports retain every opening attempt, including a failed attempt
+Format-2 native diagnostic reports retain every opening attempt, including a failed attempt
 before eventual success, and distinguish initial SDP discovery from fixed-channel
 recovery. Earlier format-1 captures retain their original single-attempt policy;
 they are not reinterpreted as evidence for the new workflow. This is ordinary
 MCP-to-CAT recovery, not the separate Terminal-to-MMDVM transition lifecycle.
+
+Native standard backups use a distinct format-3 report tagged
+`transport = "native_bluetooth"`; pages are in `workflow.original.backup.segments`.
+Successful reports require complete original and fresh opening histories,
+acknowledged pages and exit, the captured retained-owner wait, clean closes,
+and matching fresh identity/Gateway Off. Offline show, preview, preflight, and
+comparison accept these captures. They preserve native provenance and cannot
+serve as the USB backup required by existing live settings writers or managed
+diagnostics. A native capture never supplies invented USB endpoint or readiness
+evidence. Interactive, batch, and one-shot mode sessions instead publish
+`operation = "cat_session"`, format 1, with their actual input mode and
+independent input, output, protocol, capture, and cleanup errors; these are not
+configuration backups.
 
 Opening failures identify the observed host stage, such as an SDP completion
 deadline or an RFCOMM opening deadline. The command prints each failed attempt
@@ -116,19 +174,40 @@ The initial opening performs a fresh Serial Port Profile service query and
 records the selected address and RFCOMM channel from that same open. Recovery
 pins that channel for this workflow, using the fixed-channel baseband wakeup
 before RFCOMM opening. The channel is not a permanent model constant. It does not
-guess a channel from another radio model, auto-select by display name, or fall
-back to the operating system's serial alias. Do not combine `--bluetooth` with
-`--port` or `--baud`. Packaged installations can supply a trusted executable
-with `--bluetooth-helper /absolute/path/to/helper`; ordinary builds include it.
+guess a channel from another radio model or fall back to the operating system's
+serial alias. Paired-name discovery happens before opening and pins one exact
+address; it does not substitute for protocol identity or authorize recovery on
+another candidate. Neither `--bluetooth` nor `--bluetooth-address` can be combined
+with `--port` or `--baud`. Packaged installations can supply a trusted executable
+with `--bluetooth-helper /absolute/path/to/helper` alongside either Bluetooth
+option; the same helper performs inventory and opening. Ordinary builds include
+the helper. Help and offline inspection do not launch it or discover devices.
 
 Normal SDP-selected native CAT and fixed MCP read/exit have responded on a
 firmware 1.02 radio while the OS serial alias timed out. This does not establish the
 cause of the serial timeout, a requirement for manual connection, or cold-start
 connection reliability. One native MCP trial completed both reads and
 acknowledged exit with a clean original close, but the fresh SPP opening timed
-out. The five-second retained-owner wait and selected-channel retry lifecycle
-are software-tested, not a completed hardware qualification of ordinary
-MCP-to-CAT recovery. The separately observed
+out.
+
+On September 13, 2026, the interactive native shell completed read-only `status`
+and `mode b` commands entered as whole lines, then closed cleanly on Ctrl-C.
+A preceding input stall was reproduced with a real terminal test and corrected
+before this successful run. Native mode writes and long-running shell use
+remain untested on hardware.
+
+The subsequent standalone Bluetooth backup read all 1,138 standard pages;
+every byte and ACK matched the capture. Exit, the five-second retained-owner
+wait, both closes and same-address/channel reopening completed. Fresh CAT did
+not: the single `ID` received no bytes within its 1,500 ms timeout. The command
+correctly failed, and offline snapshot admission rejects that report despite
+its complete page data. Separate later USB and Bluetooth status checks both
+returned FM/FM and Gateway Off without an explicit link reset, re-pairing or
+host-issued radio reset. Those later checks establish neither a recovery time
+nor the cause of the earlier silence. Ordinary MCP-to-CAT recovery remains
+unqualified; general native MCP settings writes remain disabled.
+
+The separately observed
 [automatic Terminal-to-MMDVM cycle](#reflector-terminal-mode) does not establish
 cold-start reliability. A separate cold attempt changed the Mac's reported
 connection state to connected without receiving SDP completion; an SDP-only
@@ -138,7 +217,7 @@ connection while running diagnostics.
 
 ## Configuration backup and PC text entry
 
-Read the standard configuration through a dedicated connection:
+Read the standard configuration through a dedicated USB connection:
 
 ```bash
 cargo run -p tmd750-repl -- --port /dev/cu.usbmodem101 \
@@ -162,7 +241,7 @@ silent and closed cleanly; the next handle returned matching ID/FV/TY. All
 qualify those backup sequences, not a universal readiness bound or settings
 writes.
 
-The command closes and drops the original handle after the exit ACK, waits two
+The USB command closes and drops the original handle after the exit ACK, waits two
 seconds, then uses [bounded CAT reacquisition](#bounded-cat-reacquisition).
 One sixty-second dispatch window covers passive enumeration, up to four fresh
 connections, and two-second retry waits. Every open requires the original path
@@ -173,7 +252,7 @@ post-exit identity checks, never MCP entry, configuration reads, or exit. An
 explicit `--port` is mandatory. Cancellation finishes the current exchange;
 incomplete framing prohibits speculative exit or recovery commands.
 
-`report.json` uses format version 4 with `operation = "configuration_backup"`.
+The USB `report.json` uses format version 4 with `operation = "configuration_backup"`.
 Its `backup.segments` retain every fully acknowledged page even if a later page,
 cleanup, or fresh verification fails. Addresses and lengths are explicit; unread
 gaps are absent. Original and fresh transcripts remain separate.
@@ -184,12 +263,14 @@ A successful exit requires the entire page schedule, acknowledged MCP exit,
 clean closes and complete captures for every connection, matching fresh identity,
 and a written, flushed, synchronized report.
 
-Offline inspection and update planning accept complete successful format-4
-backups and historical format-3 backups with their original single-attempt
+Offline inspection and update planning accept complete successful USB format-4
+backups and historical USB format-3 backups with their original single-attempt
 evidence. The loader checks the evidence shape for the declared format; it does
 not upgrade reports, reinterpret failed captures as successful, or establish
 the radio's current state. Reports must be regular files no larger than 32 MiB
 and contain every standard page in order with exact addresses and lengths.
+Native Bluetooth backups use their separate schema described above. They are
+accepted for offline inspection and previews, not by USB write workflows.
 
 This is a standard-region backup, not a full memory dump or a restorable `.d750`
 file. The official application seeds omitted bytes from its current model;
@@ -614,8 +695,8 @@ captured configuration before a separately controlled setup or qualification.
 
 ## Compare configuration captures
 
-Compare two successful configuration-backup reports, current format 4 or
-historical format 3:
+Compare two successful configuration-backup reports: USB format 4, historical
+USB format 3, or native Bluetooth format 3:
 
 ```bash
 cargo run -p tmd750-repl -- mcp terminal compare \
@@ -1086,7 +1167,7 @@ serial alias. Explicit selection is available when needed:
 
 ```bash
 cargo run -p tmd750-repl -- \
-  --bluetooth 01:23:45:67:89:AB --control-port /dev/cu.usbmodem101 \
+  --bluetooth-address 01:23:45:67:89:AB --control-port /dev/cu.usbmodem101 \
   --trace --timestamps dstar start KQ4NIT REF030C
 ```
 
@@ -1349,9 +1430,9 @@ Startup-only workflows are described above:
 - `mcp text list|show|preview` and `mcp terminal preflight` work offline without
   enumerating or opening a radio endpoint.
 - `mcp menu list|describe|show|preview` discovers and inspects registered fields
-  offline. `mcp menu apply` uses the ordinary scalar policy, explicit endpoint,
-  current backup, and `--apply`; it requires immediate readback and fresh CAT.
-- `mcp text set` requires an explicit endpoint, current backup, expected text,
+  offline. `mcp menu apply` uses the ordinary scalar policy, explicit USB endpoint,
+  current USB backup, and `--apply`; it requires immediate readback and fresh CAT.
+- `mcp text set` requires an explicit USB endpoint, current USB backup, expected text,
   and `--apply`; it changes PM1's name or PM Off MY1 through dedicated connections.
 - `mcp pm1-trial` is the separately approved fixed rename-and-restore experiment.
 - `mcp my1-trial` temporarily writes the fixed MY1 callsign and restores it.

@@ -7,6 +7,10 @@ use dstar_gateway_core as _;
 use kenwood_tmd750 as _;
 use kenwood_transport as _;
 use mmdvm as _;
+#[cfg(unix)]
+use nix as _;
+#[cfg(unix)]
+use rustix as _;
 use rustyline as _;
 use serde as _;
 use serde_json as _;

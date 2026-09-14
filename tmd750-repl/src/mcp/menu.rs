@@ -125,7 +125,7 @@ impl ApplyRequest {
     /// Bind a typed request to the strict source backup before capture or USB work.
     pub(super) fn prepare(&self) -> AppResult<MenuUpdatePlan> {
         let assignment = self.assignment()?;
-        let snapshot = Snapshot::load(self.source_backup())?;
+        let snapshot = Snapshot::load_for_usb_write(self.source_backup())?;
         Ok(MenuUpdatePlan::new(
             &snapshot.identity,
             &snapshot.menu_snapshot()?,

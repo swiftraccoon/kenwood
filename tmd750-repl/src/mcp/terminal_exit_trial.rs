@@ -51,7 +51,7 @@ impl Request {
                 "Terminal exit trial requires the pinned TM-D750 main-unit USB endpoint at 9600 baud".to_owned(),
             ).into());
         }
-        let snapshot = Snapshot::load(&self.backup)?;
+        let snapshot = Snapshot::load_for_usb_write(&self.backup)?;
         if snapshot.captured_bytes(Region::new(10, 11)?)? != [0] {
             return Err(CommandError(
                 "Terminal exit trial requires captured memory format zero".to_owned(),

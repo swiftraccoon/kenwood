@@ -1,4 +1,4 @@
-//! Exact-address native Bluetooth ownership and captured read-only observations.
+//! Exact-address native Bluetooth ownership and captured control workflows.
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -18,7 +18,10 @@ use crate::capture::Failure;
 use crate::connection::Connection;
 
 pub(crate) mod cat;
+pub(crate) mod discovery;
+mod input;
 pub(crate) mod opening;
+pub(crate) mod repl;
 #[cfg(test)]
 mod tests;
 pub(crate) mod workflow;
@@ -347,14 +350,14 @@ async fn open(
 }
 
 #[cfg(not(target_os = "macos"))]
-async fn open(
+fn open(
     _endpoint: &Endpoint,
     _service: BluetoothService,
     _cancelled: &AtomicBool,
     _budget: Duration,
-) -> Result<Opened<Connection>, OpenFailure> {
-    Err(OpenFailure::before_open(&std::io::Error::new(
+) -> std::future::Ready<Result<Opened<Connection>, OpenFailure>> {
+    std::future::ready(Err(OpenFailure::before_open(&std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "native Bluetooth is currently available only on macOS",
-    )))
+    ))))
 }

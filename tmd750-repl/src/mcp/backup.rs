@@ -1,7 +1,7 @@
 //! Standard configuration backup, with independent post-exit verification.
 
 use std::fs::File;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -29,14 +29,42 @@ pub(crate) struct BackupRequest {
     output: Option<PathBuf>,
 }
 
+impl BackupRequest {
+    /// Optional new artifact directory for the selected transport workflow.
+    pub(crate) fn output(&self) -> Option<&Path> {
+        self.output.as_deref()
+    }
+}
+
+/// Standard-page evidence shared by transport-specific captured workflows.
 #[derive(Debug, Serialize)]
-struct Evidence {
+pub(crate) struct BackupEvidence {
     identity: Option<IdentityEvidence>,
     entry_reply: Option<Vec<u8>>,
     segments: Vec<SegmentEvidence>,
     exit: super::ExitDisposition,
     complete_configuration: bool,
     outcome: BackupOutcome,
+}
+
+impl BackupEvidence {
+    /// Result of the library's exact page-order, length, entry, and exit checks.
+    pub(crate) const fn has_complete_configuration(&self) -> bool {
+        self.complete_configuration
+    }
+
+    /// Number of fully acknowledged pages retained, including partial backups.
+    pub(crate) const fn page_count(&self) -> usize {
+        self.segments.len()
+    }
+
+    /// Original protocol failure, without conflating capture or owner cleanup.
+    pub(crate) const fn error(&self) -> Option<&Failure> {
+        match &self.outcome {
+            BackupOutcome::Failed { error, .. } => Some(error),
+            BackupOutcome::AwaitingCatVerification | BackupOutcome::Cancelled => None,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -72,7 +100,7 @@ impl From<McpBackupStage> for BackupStage {
     }
 }
 
-impl From<&McpBackupReport> for Evidence {
+impl From<&McpBackupReport> for BackupEvidence {
     fn from(report: &McpBackupReport) -> Self {
         Self {
             identity: report.identity.as_ref().map(IdentityEvidence::from),
@@ -111,7 +139,7 @@ pub(super) struct ArtifactReport {
     endpoint: Endpoint,
     scope: &'static str,
     transcript: TranscriptSummary,
-    backup: Option<Evidence>,
+    backup: Option<BackupEvidence>,
     open_error: Option<Failure>,
     close_error: Option<Failure>,
     signal_error: Option<Failure>,
@@ -142,7 +170,7 @@ impl ArtifactReport {
             },
             scope: "standard_configuration_without_startup_screen; unread gaps are absent, not zero-filled",
             transcript: result.transcript,
-            backup: result.backup.as_ref().map(Evidence::from),
+            backup: result.backup.as_ref().map(BackupEvidence::from),
             open_error: result.open_error,
             close_error: result.close_error,
             signal_error,

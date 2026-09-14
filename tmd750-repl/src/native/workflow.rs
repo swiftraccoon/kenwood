@@ -1,4 +1,4 @@
-//! Captured native CAT and fixed MCP lifecycle with same-endpoint recovery.
+//! Captured native CAT and read-only MCP with same-endpoint recovery.
 
 use std::fs::File;
 use std::io::{self, Write};
@@ -7,19 +7,23 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use kenwood_tmd750::DvGatewayMode;
+use kenwood_tmd750::{DvGatewayMode, Identity};
+use kenwood_transport::Transport;
 use kenwood_transport::bluetooth::BluetoothService;
 use serde::Serialize;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use crate::capture::{Artifacts, CaptureKind, Failure, Recorder, TranscriptSummary};
+use crate::mcp::backup::BackupEvidence;
 use crate::{AppResult, CommandError, output};
 
 use super::opening::{self, Captured, History};
 use super::{Backend, Endpoint, Resolved, SystemBackend, cat};
 
 pub(crate) use cat::Scope as CatScope;
+
+mod backup;
 
 #[cfg(test)]
 mod tests;
@@ -32,6 +36,13 @@ const POST_EXIT_SETTLE: Duration = Duration::from_secs(5);
 pub(crate) enum Operation {
     Cat(CatScope),
     FixedMcp,
+    ConfigurationBackup,
+}
+
+impl Operation {
+    const fn needs_recovery(self) -> bool {
+        matches!(self, Self::FixedMcp | Self::ConfigurationBackup)
+    }
 }
 
 #[derive(Serialize)]
@@ -56,6 +67,65 @@ enum Observation {
         close_error: Option<Failure>,
         transcript: TranscriptSummary,
     },
+    ConfigurationBackup {
+        backup: Option<BackupEvidence>,
+        gateway_before: Option<u8>,
+        close_error: Option<Failure>,
+        transcript: TranscriptSummary,
+    },
+}
+
+impl Observation {
+    fn append_failures(&self, lines: &mut Vec<String>) {
+        match self {
+            Self::Cat { evidence } => append_cat_failures(lines, "Original", evidence),
+            Self::FixedMcp {
+                probe,
+                close_error,
+                transcript,
+                ..
+            } => {
+                append_failure(
+                    lines,
+                    "Fixed MCP read",
+                    probe.as_ref().and_then(crate::mcp::ProbeEvidence::error),
+                );
+                append_failure(lines, "Original close", close_error.as_ref());
+                append_failure(lines, "Original capture", transcript.error());
+            }
+            Self::ConfigurationBackup {
+                backup,
+                close_error,
+                transcript,
+                ..
+            } => {
+                append_failure(
+                    lines,
+                    "Configuration read",
+                    backup.as_ref().and_then(BackupEvidence::error),
+                );
+                append_failure(lines, "Original close", close_error.as_ref());
+                append_failure(lines, "Original capture", transcript.error());
+            }
+        }
+    }
+}
+
+fn append_failure(lines: &mut Vec<String>, phase: &str, error: Option<&Failure>) {
+    if let Some(error) = error {
+        lines.push(format!("{phase} failed: {error}."));
+    }
+}
+
+fn append_cat_failures(lines: &mut Vec<String>, phase: &str, evidence: &cat::Observation) {
+    for (operation, error) in [
+        ("CAT", evidence.operation_error.as_ref()),
+        ("close", evidence.close_error.as_ref()),
+        ("capture", evidence.capture_error.as_ref()),
+        ("transcript", evidence.transcript.error()),
+    ] {
+        append_failure(lines, &format!("{phase} {operation}"), error);
+    }
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -71,6 +141,17 @@ struct WorkflowResult {
 }
 
 impl WorkflowResult {
+    fn recovered(&self) -> bool {
+        self.settle_transcript
+            .as_ref()
+            .is_some_and(|transcript| transcript.complete)
+            && self.fresh_opening.as_ref().is_some_and(History::succeeded)
+            && self
+                .fresh_cat
+                .as_ref()
+                .is_some_and(cat::Observation::succeeded)
+    }
+
     fn succeeded(&self) -> bool {
         if !self
             .original_opening
@@ -94,13 +175,73 @@ impl WorkflowResult {
                     && *gateway_before == Some(DvGatewayMode::Off.into())
                     && close_error.is_none()
                     && transcript.complete
-                    && self.fresh_opening.as_ref().is_some_and(History::succeeded)
-                    && self
-                        .fresh_cat
-                        .as_ref()
-                        .is_some_and(cat::Observation::succeeded)
+                    && self.recovered()
+            }
+            Some(Observation::ConfigurationBackup {
+                backup,
+                gateway_before,
+                close_error,
+                transcript,
+                ..
+            }) => {
+                backup
+                    .as_ref()
+                    .is_some_and(BackupEvidence::has_complete_configuration)
+                    && *gateway_before == Some(DvGatewayMode::Off.into())
+                    && close_error.is_none()
+                    && transcript.complete
+                    && self.recovered()
             }
             None => false,
+        }
+    }
+}
+
+enum PendingRead<T> {
+    Fixed(crate::mcp::fixed::PendingClose<T>),
+    Configuration(backup::PendingClose<T>),
+}
+
+impl<T: Transport> PendingRead<T> {
+    fn ready_to_settle(&mut self, cancelled: &AtomicBool) -> bool {
+        match self {
+            Self::Fixed(pending) => pending.ready_to_settle(cancelled),
+            Self::Configuration(pending) => pending.ready_to_settle(cancelled),
+        }
+    }
+
+    async fn finish(self, cancelled: &AtomicBool) -> (Observation, Option<Identity>) {
+        match self {
+            Self::Fixed(pending) => {
+                let observed = pending.finish().await;
+                let identity = observed.verified_identity(cancelled).cloned();
+                (
+                    Observation::FixedMcp {
+                        probe: observed.probe.as_ref().map(Into::into),
+                        gateway_before: observed.gateway_mode.map(Into::into),
+                        close_error: observed.close_error,
+                        transcript: observed.transcript,
+                    },
+                    identity,
+                )
+            }
+            Self::Configuration(pending) => {
+                let observed = pending.finish().await;
+                let identity = observed.verified_identity(cancelled).cloned();
+                (
+                    Observation::ConfigurationBackup {
+                        backup: observed.backup.as_ref().map(Into::into),
+                        gateway_before: observed
+                            .backup
+                            .as_ref()
+                            .and_then(|backup| backup.gateway_mode)
+                            .map(Into::into),
+                        close_error: observed.close_error,
+                        transcript: observed.transcript,
+                    },
+                    identity,
+                )
+            }
         }
     }
 }
@@ -132,7 +273,7 @@ async fn run_workflow(
         return result;
     };
     result.original_endpoint = Some(resolved);
-    match operation {
+    let mut pending = match operation {
         Operation::Cat(scope) => {
             result.original = Some(Observation::Cat {
                 evidence: cat::observe(
@@ -146,57 +287,55 @@ async fn run_workflow(
                 )
                 .await,
             });
+            return result;
         }
-        Operation::FixedMcp => {
-            let mut pending = crate::mcp::fixed::read(
+        Operation::FixedMcp => PendingRead::Fixed(
+            crate::mcp::fixed::read(
                 transport,
                 crate::mcp::fixed::Admission::GatewayOff,
                 cancelled,
             )
-            .await;
-            if pending.ready_to_settle(cancelled)
-                && let Err(error) = settle(backend, &mut fresh, cancelled).await
-            {
-                result.settle_error = Some(Failure::from_error(&error));
-                result.settle_transcript = Some(fresh.summary());
-            }
-            // Even a cancelled or uncaptured wait must retire the original owner.
-            let observed = pending.finish().await;
-            let identity = observed.verified_identity(cancelled).cloned();
-            result.original = Some(Observation::FixedMcp {
-                probe: observed.probe.as_ref().map(Into::into),
-                gateway_before: observed.gateway_mode.map(Into::into),
-                close_error: observed.close_error,
-                transcript: observed.transcript,
-            });
-            if let Some(identity) = identity
-                && result.settle_error.is_none()
-            {
-                let selected = opening::open_selected(
-                    backend,
-                    endpoint,
-                    BluetoothService::FixedChannel(channel),
-                    fresh,
+            .await,
+        ),
+        Operation::ConfigurationBackup => {
+            PendingRead::Configuration(backup::read(transport, cancelled).await)
+        }
+    };
+    if pending.ready_to_settle(cancelled) {
+        if let Err(error) = settle(backend, &mut fresh, cancelled).await {
+            result.settle_error = Some(Failure::from_error(&error));
+        }
+        result.settle_transcript = Some(fresh.summary());
+    }
+    // Even a cancelled or uncaptured wait must retire the original owner.
+    let (observed, identity) = pending.finish(cancelled).await;
+    result.original = Some(observed);
+    if let Some(identity) = identity
+        && result.settle_error.is_none()
+    {
+        let selected = opening::open_selected(
+            backend,
+            endpoint,
+            BluetoothService::FixedChannel(channel),
+            fresh,
+            cancelled,
+        )
+        .await;
+        result.fresh_opening = Some(selected.history);
+        if let Some(opened) = selected.opened {
+            result.fresh_endpoint = Some(opened.resolved);
+            result.fresh_cat = Some(
+                cat::observe(
+                    opened.transport,
+                    cat::Request {
+                        scope: CatScope::Gateway,
+                        expected_identity: Some(&identity),
+                        expected_gateway: Some(DvGatewayMode::Off),
+                    },
                     cancelled,
                 )
-                .await;
-                result.fresh_opening = Some(selected.history);
-                if let Some(opened) = selected.opened {
-                    result.fresh_endpoint = Some(opened.resolved);
-                    result.fresh_cat = Some(
-                        cat::observe(
-                            opened.transport,
-                            cat::Request {
-                                scope: CatScope::Gateway,
-                                expected_identity: Some(&identity),
-                                expected_gateway: Some(DvGatewayMode::Off),
-                            },
-                            cancelled,
-                        )
-                        .await,
-                    );
-                }
-            }
+                .await,
+            );
         }
     }
     result
@@ -249,7 +388,54 @@ struct Report<'a> {
     cancelled: bool,
 }
 
-impl Report<'_> {
+impl<'a> Report<'a> {
+    fn new(
+        endpoint: &'a Endpoint,
+        operation: Operation,
+        started_at_utc: String,
+        finished_at_utc: String,
+        workflow: WorkflowResult,
+        signal_error: Option<Failure>,
+        cancelled: bool,
+    ) -> Self {
+        Self {
+            format_version: if matches!(operation, Operation::ConfigurationBackup) {
+                3
+            } else {
+                2
+            },
+            operation,
+            transport: "native_bluetooth",
+            requested_address: endpoint.address.as_str(),
+            helper_executable: endpoint.helper.as_deref(),
+            service: "serial_port_0x1101",
+            post_exit_service: operation
+                .needs_recovery()
+                .then_some("fixed_previously_opened_channel"),
+            maximum_original_open_attempts: opening::MAX_ATTEMPTS,
+            maximum_post_exit_open_attempts: if operation.needs_recovery() {
+                opening::MAX_ATTEMPTS
+            } else {
+                0
+            },
+            post_exit_settle_milliseconds: if operation.needs_recovery() {
+                POST_EXIT_SETTLE.as_millis()
+            } else {
+                0
+            },
+            open_retry_delay_milliseconds: opening::RETRY_DELAY.as_millis(),
+            open_budget_milliseconds: super::OPEN_BUDGET.as_millis(),
+            cat_exchange_timeout_milliseconds: cat::EXCHANGE_TIMEOUT.as_millis(),
+            close_budget_milliseconds: super::CLOSE_BUDGET.as_millis(),
+            identity_assurance: "exact_bluetooth_address_and_cat_tuple_not_physical_unit_continuity",
+            started_at_utc,
+            finished_at_utc,
+            workflow,
+            signal_error,
+            cancelled,
+        }
+    }
+
     fn publish(&self, file: &mut File) -> io::Result<()> {
         serde_json::to_writer_pretty(&mut *file, self)?;
         file.write_all(b"\n")?;
@@ -257,7 +443,8 @@ impl Report<'_> {
         file.sync_all()
     }
 
-    fn print(&self) {
+    fn failure_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
         for (phase, history) in [
             ("Original", self.workflow.original_opening.as_ref()),
             ("Post-exit", self.workflow.fresh_opening.as_ref()),
@@ -265,13 +452,13 @@ impl Report<'_> {
             if let Some(history) = history {
                 for attempt in &history.attempts {
                     if let Some(error) = &attempt.error {
-                        output::line(format_args!(
+                        lines.push(format!(
                             "{phase} native opening attempt {} failed: {error}.",
                             attempt.number
                         ));
                     }
                     if let Some(error) = &attempt.interruption {
-                        output::line(format_args!(
+                        lines.push(format!(
                             "{phase} native opening attempt {} interrupted: {error}.",
                             attempt.number
                         ));
@@ -281,9 +468,35 @@ impl Report<'_> {
                     .into_iter()
                     .flatten()
                 {
-                    output::line(format_args!("{phase} native opening stopped: {error}."));
+                    lines.push(format!("{phase} native opening stopped: {error}."));
                 }
             }
+        }
+        if let Some(original) = &self.workflow.original {
+            original.append_failures(&mut lines);
+        }
+        if let Some(fresh) = &self.workflow.fresh_cat {
+            append_cat_failures(&mut lines, "Fresh", fresh);
+        }
+        for (phase, error) in [
+            ("Post-exit settle", self.workflow.settle_error.as_ref()),
+            (
+                "Post-exit settle capture",
+                self.workflow
+                    .settle_transcript
+                    .as_ref()
+                    .and_then(TranscriptSummary::error),
+            ),
+            ("Signal listener", self.signal_error.as_ref()),
+        ] {
+            append_failure(&mut lines, phase, error);
+        }
+        lines
+    }
+
+    fn print(&self) {
+        for failure in self.failure_lines() {
+            output::error(format_args!("{failure}"));
         }
         if let Some(endpoint) = &self.workflow.original_endpoint {
             output::line(format_args!(
@@ -291,6 +504,7 @@ impl Report<'_> {
                 endpoint.address, endpoint.rfcomm_channel
             ));
         }
+        self.print_configuration();
         if let Some(Observation::Cat { evidence }) = &self.workflow.original {
             if let Some(identity) = &evidence.identity {
                 crate::print_identity(&identity.0);
@@ -306,9 +520,22 @@ impl Report<'_> {
             }
         }
     }
+
+    fn print_configuration(&self) {
+        if let Some(Observation::ConfigurationBackup {
+            backup: Some(backup),
+            ..
+        }) = &self.workflow.original
+        {
+            output::line(format_args!(
+                "Captured {} acknowledged standard configuration pages.",
+                backup.page_count()
+            ));
+        }
+    }
 }
 
-/// Publish native evidence without changing USB backup or readiness schemas.
+/// Publish transport-specific native evidence without inventing USB readiness.
 pub(crate) async fn run(
     endpoint: &Endpoint,
     operation: &Operation,
@@ -320,6 +547,7 @@ pub(crate) async fn run(
         )
         .into());
     }
+    output::check()?;
     let cancelled = Arc::new(AtomicBool::new(false));
     let artifacts = Artifacts::create(
         CaptureKind::NativeBluetooth,
@@ -345,6 +573,9 @@ pub(crate) async fn run(
         "Native Bluetooth capture: {}. At most two exact-address opening attempts per phase; no serial fallback, CAT retry or MCP retry.",
         directory.display()
     ));
+    // No owner exists yet. Once opening starts, output failure must not skip
+    // protocol retirement, capture synchronization, or report publication.
+    output::check()?;
     let started_at_utc = OffsetDateTime::now_utc().format(&Rfc3339)?;
     let (workflow, signal_error) = crate::mcp::finish_on_interrupt(
         run_workflow(
@@ -359,37 +590,15 @@ pub(crate) async fn run(
         &cancelled,
     )
     .await;
-    let report = Report {
-        format_version: 2,
-        operation: *operation,
-        transport: "native_bluetooth",
-        requested_address: endpoint.address.as_str(),
-        helper_executable: endpoint.helper.as_deref(),
-        service: "serial_port_0x1101",
-        post_exit_service: matches!(operation, Operation::FixedMcp)
-            .then_some("fixed_previously_opened_channel"),
-        maximum_original_open_attempts: opening::MAX_ATTEMPTS,
-        maximum_post_exit_open_attempts: if matches!(operation, Operation::FixedMcp) {
-            opening::MAX_ATTEMPTS
-        } else {
-            0
-        },
-        post_exit_settle_milliseconds: if matches!(operation, Operation::FixedMcp) {
-            POST_EXIT_SETTLE.as_millis()
-        } else {
-            0
-        },
-        open_retry_delay_milliseconds: opening::RETRY_DELAY.as_millis(),
-        open_budget_milliseconds: super::OPEN_BUDGET.as_millis(),
-        cat_exchange_timeout_milliseconds: cat::EXCHANGE_TIMEOUT.as_millis(),
-        close_budget_milliseconds: super::CLOSE_BUDGET.as_millis(),
-        identity_assurance: "exact_bluetooth_address_and_cat_tuple_not_physical_unit_continuity",
+    let report = Report::new(
+        endpoint,
+        *operation,
         started_at_utc,
-        finished_at_utc: OffsetDateTime::now_utc().format(&Rfc3339)?,
+        OffsetDateTime::now_utc().format(&Rfc3339)?,
         workflow,
         signal_error,
-        cancelled: cancelled.load(Ordering::Relaxed),
-    };
+        cancelled.load(Ordering::Relaxed),
+    );
     let report_path = directory.join("report.json");
     report.publish(&mut report_file).map_err(|error| {
         CommandError(format!(
@@ -403,6 +612,12 @@ pub(crate) async fn run(
         report_path.display()
     ));
     if report.workflow.succeeded() && !report.cancelled && report.signal_error.is_none() {
+        if matches!(operation, Operation::ConfigurationBackup) {
+            output::line(format_args!(
+                "Standard configuration backup and fresh native CAT verification complete. No settings were written."
+            ));
+        }
+        output::check()?;
         Ok(())
     } else {
         Err(CommandError(format!(

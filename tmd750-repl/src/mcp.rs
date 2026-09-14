@@ -1,6 +1,6 @@
 //! Startup-only MCP workflows and offline configuration inspection.
 
-mod backup;
+pub(crate) mod backup;
 pub(crate) mod fixed;
 mod menu;
 mod menu_apply;
@@ -176,6 +176,14 @@ pub(crate) struct ProbeEvidence {
 }
 
 impl ProbeEvidence {
+    /// Original protocol failure, independent of capture and owner cleanup.
+    pub(crate) const fn error(&self) -> Option<&Failure> {
+        match &self.outcome {
+            Outcome::Failed { error, .. } => Some(error),
+            Outcome::AwaitingCatVerification | Outcome::Cancelled => None,
+        }
+    }
+
     pub(crate) const fn completed_with_acknowledged_exit(&self) -> bool {
         self.identity.is_some()
             && matches!(self.outcome, Outcome::AwaitingCatVerification)
