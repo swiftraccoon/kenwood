@@ -38,13 +38,13 @@
 //! bypasses that device node and talks directly to RFCOMM in an isolated
 //! helper process.
 
-#[cfg(any(target_os = "macos", all(doc, unix)))]
+#[cfg(target_os = "macos")]
 pub mod bluetooth;
 pub mod broker;
 pub mod either;
 pub mod serial;
 
-#[cfg(any(target_os = "macos", all(doc, unix)))]
+#[cfg(target_os = "macos")]
 pub use bluetooth::BluetoothTransport;
 pub use broker::{BrokerHandle, MainThreadBroker};
 pub use either::EitherTransport;

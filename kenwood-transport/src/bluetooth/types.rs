@@ -10,6 +10,12 @@ use std::sync::{
 use crate::TransportError;
 
 /// Sticky thread-safe cancellation for one bounded native helper operation.
+///
+/// Available on every platform with `native-bluetooth`. All clones share one
+/// flag, initially clear. A canceled token cannot be reset or reused for a new
+/// successful operation. It cancels discovery/opening, not an already returned
+/// connection; explicitly close that transport. Canceling a token does not join
+/// a blocking worker or prove helper retirement. Retain and join the worker.
 #[derive(Debug, Clone, Default)]
 pub struct BluetoothOpenCancellation {
     requested: Arc<AtomicBool>,
@@ -27,7 +33,7 @@ impl BluetoothOpenCancellation {
         self.requested.load(Ordering::Acquire)
     }
 
-    #[cfg(any(target_os = "macos", all(doc, unix)))]
+    #[cfg(target_os = "macos")]
     pub(super) fn check(&self) -> Result<(), TransportError> {
         if self.is_cancelled() {
             Err(TransportError::BluetoothOpenInterrupted)
@@ -38,6 +44,34 @@ impl BluetoothOpenCancellation {
 }
 
 /// Exact Bluetooth address, stored in uppercase hyphen-separated form.
+///
+/// Available on every platform with `native-bluetooth`. Parsing accepts exactly
+/// six two-digit ASCII hexadecimal octets, separated consistently by either
+/// colons or hyphens. Hexadecimal letters may have either case. Mixed separators,
+/// whitespace, omitted zeroes and non-ASCII digits are rejected. Parsing checks
+/// syntax only, not pairing, device presence, identity or reachability.
+///
+/// # Examples
+///
+/// Validation and normalization are entirely offline, including on non-macOS
+/// hosts. No native helper is started:
+///
+/// ```rust
+/// use kenwood_transport::TransportError;
+/// use kenwood_transport::bluetooth::{BluetoothAddress, BluetoothDeviceName, RfcommChannel};
+///
+/// fn main() -> Result<(), TransportError> {
+///     let address: BluetoothAddress = "aa:bb:cc:dd:ee:ff".parse()?;
+///     assert_eq!(address.as_str(), "AA-BB-CC-DD-EE-FF");
+///     assert!("AA:BB-CC-DD-EE-FF".parse::<BluetoothAddress>().is_err());
+///     assert!(BluetoothDeviceName::new(address.as_str()).is_err());
+///     let name = BluetoothDeviceName::new("Bench radio")?;
+///     assert_eq!(name.as_str(), "Bench radio");
+///     assert_eq!(RfcommChannel::new(1)?.get(), 1);
+///     assert!(RfcommChannel::new(31).is_err());
+///     Ok(())
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BluetoothAddress(String);
 
@@ -52,6 +86,11 @@ impl BluetoothAddress {
 impl FromStr for BluetoothAddress {
     type Err = TransportError;
 
+    /// Parse the complete address grammar documented on [`BluetoothAddress`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::BluetoothParameter`] for any invalid address.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let separator = value.as_bytes().get(2).copied();
         if value.len() != 17
@@ -85,6 +124,12 @@ impl fmt::Display for BluetoothAddress {
 }
 
 /// Nonempty Bluetooth display name; ambiguity is refused during native selection.
+///
+/// Available on every platform with `native-bluetooth`. Names contain 1 through
+/// 1,024 UTF-8 bytes and no Unicode control characters. Text that parses as a
+/// [`BluetoothAddress`] is rejected. Case, spaces and other non-control Unicode
+/// characters are retained exactly; there is no trimming or normalization.
+/// A valid name is only a selector, not evidence of a paired or reachable radio.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BluetoothDeviceName(String);
 
@@ -93,8 +138,9 @@ impl BluetoothDeviceName {
     ///
     /// # Errors
     ///
-    /// Rejects empty, oversized, control-containing, or address-shaped text.
-    /// Address-shaped input must use an explicit exact-address selector.
+    /// Returns [`TransportError::BluetoothParameter`] for an empty name, more
+    /// than 1,024 UTF-8 bytes, a Unicode control character, or text accepted by
+    /// [`BluetoothAddress`]. An address must use an exact-address selector.
     pub fn new(value: &str) -> Result<Self, TransportError> {
         if value.is_empty()
             || value.len() > 1024
@@ -115,6 +161,9 @@ impl BluetoothDeviceName {
 }
 
 /// Explicit exact-address or display-name selection for one paired device.
+///
+/// Available on every platform with `native-bluetooth`. Construction performs
+/// no enumeration. Native opening applies the selection without fallback.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BluetoothDeviceSelector {
     /// An exact address never falls back to name matching.
@@ -135,6 +184,9 @@ impl BluetoothDeviceSelector {
 }
 
 /// Validated RFCOMM server channel in the Bluetooth domain 1 through 30.
+///
+/// Available on every platform with `native-bluetooth`. A valid number is not
+/// evidence that a device offers a service on that channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RfcommChannel(u8);
 
@@ -160,6 +212,9 @@ impl RfcommChannel {
 }
 
 /// Service resolution policy for a single bounded native open.
+///
+/// Available on every platform with `native-bluetooth`; the native backend
+/// that applies this policy is macOS-only. Neither policy retries an open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BluetoothService {
     /// Use an explicitly selected channel and retain the baseband wakeup.
@@ -173,6 +228,11 @@ pub enum BluetoothService {
 }
 
 /// One paired device, identified by its exact address rather than its name.
+///
+/// Available on every platform with `native-bluetooth`. Inventory is cached
+/// host pairing metadata, not evidence of current connection or protocol
+/// readiness. Display names are observations and need not satisfy the grammar
+/// of a caller-created [`BluetoothDeviceName`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairedBluetoothDevice {
     pub(super) address: BluetoothAddress,

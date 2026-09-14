@@ -27,11 +27,15 @@
 //! [`AsyncWrite::poll_write`] reserves bounded channel capacity before it
 //! accepts bytes. [`AsyncWrite::poll_flush`] waits for every accepted
 //! request's acknowledgement, so `Ok(())` means the underlying
-//! [`crate::Transport::write`] calls have completed. Shutdown flushes first,
+//! [`crate::Transport::write`] calls have completed. For native Bluetooth this
+//! means helper-pipe acceptance, not RFCOMM completion; for serial it means the
+//! backend's write and flush, not independent hardware-drain or peer receipt.
+//! The adapter adds no stronger delivery guarantee. Shutdown flushes first,
 //! closes the request channel, and waits for the pump to return. The same pump
 //! result lets [`StreamAdapter::shutdown_and_recover`] recover `T`
 //! after a clean exit without dummy replacement channels; terminal transport
 //! errors remain errors rather than being discarded during recovery.
+//! Neither stream shutdown nor recovery calls [`crate::Transport::close`].
 //!
 //! # Task ownership
 //!
@@ -39,6 +43,13 @@
 //! adapter does not require a [`tokio::task::LocalSet`]. Platform-specific
 //! transports must keep any thread-affine resources behind their own safe
 //! ownership boundary.
+//!
+//! Dropping an adapter closes its channels but does not join the pump. An
+//! accepted transport write is not canceled by channel closure and can remain
+//! pending indefinitely. Retain and await the consuming recovery future when
+//! ownership matters; see its [cancellation contract](StreamAdapter::shutdown_and_recover).
+//! Recovery discards unread adapter buffers rather than returning them with
+//! the transport. It is not a lossless transfer of protocol parser state.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -184,10 +195,49 @@ struct PumpExit<T> {
 /// Failure returned while recovering a transport from a stream adapter.
 ///
 /// A transport-level pump failure still leaves ownership of the transport in
-/// [`Self::transport`], allowing a caller to reopen the physical link while
-/// retaining the original failure. A pump-task panic cannot preserve `T`
+/// [`Self::transport`], allowing caller-selected cleanup or recovery while
+/// retaining the failure's [`io::ErrorKind`] and display text. The returned
+/// [`io::Error`] is reconstructed; its original typed source and downcast
+/// identity are not preserved. A pump-task panic cannot preserve `T`
 /// because unwinding has already dropped it, so `transport` is `None` on that
-/// path.
+/// path. Retaining `T` does not establish that reopening or a protocol retry is
+/// supported or safe.
+///
+/// # Examples
+///
+/// A failed read and successful cleanup are separate outcomes. This executable
+/// example uses only a mock, including the EOF that causes pump failure:
+///
+/// ```rust
+/// use std::io;
+/// use kenwood_transport::{MockTransport, StreamAdapter, Transport};
+/// use tokio::io::{AsyncReadExt, AsyncWriteExt};
+///
+/// #[tokio::main(flavor = "current_thread")]
+/// async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+///     let mut mock = MockTransport::new();
+///     mock.expect_eof(b"PING\r");
+///     mock.pend_when_empty();
+///     let mut stream = StreamAdapter::new(mock);
+///     stream.write_all(b"PING\r").await?;
+///     let mut reply = [0_u8; 1];
+///     let operation_error = stream.read_exact(&mut reply).await.err()
+///         .ok_or("scripted EOF must fail the read")?;
+///     assert_eq!(operation_error.kind(), io::ErrorKind::UnexpectedEof);
+///
+///     let recovery_error = stream.shutdown_and_recover().await.err()
+///         .ok_or("pump failure must remain a recovery error")?;
+///     let (transport, pump_error) = recovery_error.into_parts();
+///     assert_eq!(pump_error.kind(), io::ErrorKind::UnexpectedEof);
+///     let mut transport = transport.ok_or("EOF must preserve the mock owner")?;
+///     transport.assert_complete();
+///     let close_result = transport.close().await;
+///     assert!(close_result.is_ok(), "independent mock close: {close_result:?}");
+///     // A successful close did not turn the preceding read into success.
+///     assert_eq!(operation_error.kind(), io::ErrorKind::UnexpectedEof);
+///     Ok(())
+/// }
+/// ```
 pub struct StreamRecoveryError<T> {
     transport: Option<T>,
     source: io::Error,
@@ -200,7 +250,11 @@ impl<T> StreamRecoveryError<T> {
         self.transport.as_ref()
     }
 
-    /// Separate the recoverable transport from the original I/O failure.
+    /// Separate the recoverable transport from the reconstructed I/O failure.
+    ///
+    /// The error retains its kind and display text, not its original typed
+    /// source chain. `None` means the pump did not return a transport owner;
+    /// it is not a successful-close observation.
     #[must_use]
     pub fn into_parts(self) -> (Option<T>, io::Error) {
         (self.transport, self.source)
@@ -273,10 +327,9 @@ pub struct StreamAdapter<T: Transport + 'static> {
     terminal_failure: TerminalFailure,
     /// Whether shutdown has closed the outbound channel.
     shutdown_started: bool,
-    /// Join handle for the pump task. Dropping the adapter without
-    /// [`Self::shutdown_and_recover`] still cleanly terminates the pump via the
-    /// channel close; the join handle is retained only so
-    /// [`Self::shutdown_and_recover`] can await the pump and recover `T`.
+    /// Join handle for the pump task. Dropping the adapter closes channels but
+    /// detaches this task; a pending accepted write can keep it alive. Retaining
+    /// and awaiting [`Self::shutdown_and_recover`] is required to recover `T`.
     pump: Option<JoinHandle<PumpExit<T>>>,
     /// Pump result retained when `poll_shutdown` joins it before
     /// [`Self::shutdown_and_recover`] consumes the adapter.
@@ -334,12 +387,55 @@ impl<T: Transport + 'static> StreamAdapter<T> {
     /// are completed before a successful return. The transport is returned
     /// without calling [`Transport::close`] or [`Transport::reopen`]; the caller
     /// owns any subsequent connection or protocol transition.
+    /// All unread adapter data, including queued chunks and a partially
+    /// consumed chunk, is discarded. Bytes still in `T` are not drained.
+    ///
+    /// # Cancellation safety
+    ///
+    /// This consuming future is **not cancellation-safe**. Dropping it while
+    /// awaiting the pump detaches that task and loses access to its transport.
+    /// It has no intrinsic deadline; an accepted, stalled transport write can
+    /// prevent completion indefinitely. Do not pass the owned future directly
+    /// to a timeout or discard it as a losing `select!` branch. Retain the
+    /// future, observe a deadline through a mutable borrow, and continue awaiting
+    /// it before claiming ownership was recovered. A caller deadline alone
+    /// cannot safely force an arbitrary transport write to finish.
     ///
     /// # Errors
     ///
     /// Returns [`StreamRecoveryError`] if the pump task panicked or
     /// exited because of a transport error. A transport-level failure retains
     /// `T` for recovery; a task panic cannot.
+    ///
+    /// # Examples
+    ///
+    /// Retain recovery even if the caller's observation window expires. No
+    /// hardware is used here. Real applications must also define what to do
+    /// when their transport cannot make progress; dropping this future is not
+    /// a substitute for that policy.
+    ///
+    /// ```rust
+    /// use std::time::Duration;
+    /// use kenwood_transport::{MockTransport, StreamAdapter, Transport};
+    ///
+    /// #[tokio::main(flavor = "current_thread")]
+    /// async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ///     let mut mock = MockTransport::new();
+    ///     mock.pend_when_empty();
+    ///     let stream = StreamAdapter::new(mock);
+    ///     let recovery = stream.shutdown_and_recover();
+    ///     tokio::pin!(recovery);
+    ///     let mut transport = match tokio::time::timeout(
+    ///         Duration::from_secs(1), &mut recovery,
+    ///     ).await {
+    ///         Ok(result) => result?,
+    ///         Err(_elapsed) => recovery.await?, // Still own and join the future.
+    ///     };
+    ///     transport.assert_complete();
+    ///     transport.close().await?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub async fn shutdown_and_recover(mut self) -> Result<T, StreamRecoveryError<T>> {
         self.begin_shutdown();
         drop(self.read_rx.take());

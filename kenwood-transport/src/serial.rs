@@ -5,6 +5,10 @@
 //! exclusive by the platform API. Callers supply every variable setting.
 //! This module does not enumerate devices, recognize names, choose a radio,
 //! retry opens, or infer that an open endpoint is ready for a protocol.
+//!
+//! Available on supported host platforms with the `serial` feature, enabled
+//! by default. Start with [`SerialOptions`] and [`SerialTransport::open`];
+//! see [`SerialTransport`] for completion, cancellation and close semantics.
 
 use std::num::NonZeroU32;
 
@@ -102,6 +106,8 @@ impl SerialOptions {
 
 /// An exclusively owned asynchronous serial descriptor.
 ///
+/// Available with the `serial` feature, enabled by default.
+///
 /// Writes complete only after all supplied bytes and the stream flush
 /// complete according to the serial backend. This is not independent
 /// hardware-drain or peer-receipt evidence; only errors surfaced by the
@@ -110,6 +116,15 @@ impl SerialOptions {
 /// interpretation.
 /// Closing takes ownership of the descriptor before awaiting shutdown, so
 /// cancellation still drops it and leaves this transport closed.
+/// Read, write and asynchronous shutdown have no intrinsic deadline. An
+/// ordinary async timeout can cancel their pending futures, but does not
+/// preempt the synchronous host work performed by open or a baud change.
+///
+/// A short read is normal. An open descriptor forwards zero-length reads and
+/// EOF according to its stream backend; a closed descriptor returns
+/// [`TransportError::Disconnected`] even for an empty buffer. An empty write
+/// still performs the stream flush. Reads and writes after close starts fail;
+/// a repeated close succeeds without replacing an earlier close error.
 ///
 /// [`Transport::reopen`] is unsupported. Reopening and re-establishing protocol
 /// identity are responsibilities of the model-specific owner.
@@ -167,6 +182,10 @@ impl SerialTransport {
 }
 
 impl Transport for SerialTransport {
+    /// Write all bytes, then flush the serial stream backend.
+    ///
+    /// Success is not independent hardware-drain or peer-receipt evidence.
+    /// See the [type contract](Self) for cancellation and deadline behavior.
     async fn write(&mut self, data: &[u8]) -> Result<(), TransportError> {
         tracing::trace!(path = %self.path, raw = ?data, "serial write requested");
         write_flushed(self.port_mut()?, data).await?;
@@ -174,6 +193,11 @@ impl Transport for SerialTransport {
         Ok(())
     }
 
+    /// Read a stream prefix without an intrinsic deadline or protocol framing.
+    ///
+    /// This follows [`Transport::read`]'s cancellation contract. Backend read
+    /// errors use [`TransportError::Read`]; closed access uses
+    /// [`TransportError::Disconnected`].
     async fn read(&mut self, buffer: &mut [u8]) -> Result<usize, TransportError> {
         let count = self
             .port_mut()?
@@ -187,6 +211,11 @@ impl Transport for SerialTransport {
         Ok(count)
     }
 
+    /// Take the descriptor, optionally request shutdown, and then drop it.
+    ///
+    /// Pending-future cancellation still drops the taken descriptor. A
+    /// shutdown error is [`TransportError::Disconnected`]; this owner remains
+    /// closed even on that error. There is no intrinsic shutdown deadline.
     async fn close(&mut self) -> Result<(), TransportError> {
         tracing::info!(path = %self.path, "serial close requested");
         close_port(&mut self.port, self.close_mode).await?;
@@ -194,6 +223,11 @@ impl Transport for SerialTransport {
         Ok(())
     }
 
+    /// Apply a nonzero baud rate without changing the endpoint identity.
+    ///
+    /// Closed access returns [`TransportError::Disconnected`]. Zero or an OS
+    /// failure returns [`TransportError::Open`], retaining the last successful
+    /// rate. This synchronous host call has no intrinsic deadline.
     fn set_baud_rate(&mut self, baud: u32) -> Result<(), TransportError> {
         let path = self.path.clone();
         let previous_baud = self.baud;

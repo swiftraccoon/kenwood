@@ -1,4 +1,10 @@
-//! Mock transport for testing without real hardware.
+//! FIFO byte-exchange fixtures for testing without hardware or a native helper.
+//!
+//! [`MockTransport`] is available with every feature configuration. Use
+//! [`MockTransport::expect`] for exact writes, partial or delayed read scripts
+//! for framing/deadline tests, and [`MockTransport::expect_reopen`] for
+//! caller-owned recovery policy. This mock does not reproduce a descriptor's
+//! lifecycle or prove real transport retirement.
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -22,7 +28,25 @@ enum MockRead {
     Hang,
 }
 
-/// Mock transport for testing. Programs expected command/response exchanges.
+/// Scripted writes, read outcomes, and reopen results without hardware.
+///
+/// Each write is checked as one complete FIFO expectation unless
+/// [`Self::expect_any_write`] enables unscripted writes. A mismatched write
+/// returns an error and consumes the mismatched expectation; always check the
+/// write result rather than relying only on [`Self::assert_complete`]. Small
+/// read buffers preserve the response tail for subsequent reads.
+///
+/// With no queued response, reads return [`std::io::ErrorKind::WouldBlock`]
+/// unless [`Self::pend_when_empty`] requests a pending future. Empty-buffer
+/// reads still follow the script; they are not connection-health checks.
+/// A scripted hang has no intrinsic deadline. Use caller-owned timeouts for
+/// hangs and delayed data, while preserving the read cancellation contract.
+///
+/// Close clears queued read outcomes and succeeds, but retains future expected
+/// exchanges and reopen results. It does not track a closed/open descriptor
+/// state: later writes need no preceding reopen. Reopen consumes its separate
+/// result script and otherwise succeeds. This is a protocol-policy fixture,
+/// not independent evidence that production code released physical resources.
 #[derive(Debug)]
 pub struct MockTransport {
     exchanges: VecDeque<(Vec<u8>, Vec<MockRead>)>,
@@ -66,7 +90,8 @@ impl MockTransport {
     /// Queue an expected command/response exchange.
     ///
     /// When `write()` is called with `command`, the corresponding `response`
-    /// will be returned by the next `read()`. An empty `response` means
+    /// is queued for subsequent `read()` calls, split when the caller's buffer
+    /// is smaller than the response. An empty `response` means
     /// "expect the write, queue nothing" (use [`Self::expect_eof`] to
     /// model a disconnect instead).
     pub fn expect(&mut self, command: &[u8], response: &[u8]) {
@@ -79,7 +104,8 @@ impl MockTransport {
     }
 
     /// Queue an expected command followed by several read chunks,
-    /// delivered one per `read()` call.
+    /// delivered at most one chunk per `read()` call. A small caller buffer
+    /// splits a chunk across reads without dropping its suffix.
     ///
     /// Models unsolicited traffic arriving on the stream before the expected
     /// response.
@@ -141,10 +167,20 @@ impl MockTransport {
     ///
     /// The file format uses `> ` prefixed lines for commands and `< ` prefixed
     /// lines for responses. Literal `\r` sequences are converted to `0x0D`.
+    /// Text is otherwise retained as UTF-8; no other escape sequence is decoded.
+    ///
+    /// Parsing is deliberately lenient, not fixture validation. Unrecognized
+    /// lines and responses without a pending command are ignored. A new
+    /// command replaces an unmatched earlier command, and an unmatched final
+    /// command is discarded. Only the first response consumes each pending
+    /// command. Consequently malformed or empty input can produce an empty
+    /// script that passes [`Self::assert_complete`]. Tests must establish their
+    /// expected writes and response contents independently.
     ///
     /// # Errors
     ///
-    /// Returns an error if the file cannot be read.
+    /// Returns an error if the file cannot be read as UTF-8. Malformed fixture
+    /// records do not return an error.
     pub fn from_fixture(path: &Path) -> Result<Self, std::io::Error> {
         let content = std::fs::read_to_string(path)?;
         let mut mock = Self::new();
@@ -169,8 +205,8 @@ impl MockTransport {
     /// requiring a preceding `write()`.
     ///
     /// Useful for unsolicited incoming data and stale late responses.
-    /// Multiple calls queue multiple chunks, delivered one per `read()` in
-    /// call order.
+    /// Multiple calls queue multiple chunks in call order. A small read buffer
+    /// splits a chunk across calls while retaining its suffix.
     pub fn queue_read(&mut self, data: &[u8]) {
         self.pending.push_back(MockRead::Data(data.to_vec()));
     }
@@ -213,7 +249,12 @@ impl MockTransport {
         &self.writes
     }
 
-    /// Panic if any expected exchanges remain unconsumed.
+    /// Panic if any expected write exchanges remain unconsumed.
+    ///
+    /// This checks only the FIFO of expected writes. It does not check unread
+    /// response bytes, prior write errors, close calls, or the separate reopen
+    /// script. Assert response contents and operation results explicitly, and
+    /// use [`Self::assert_reopen_script_complete`] when scripting reopen.
     ///
     /// # Panics
     ///
