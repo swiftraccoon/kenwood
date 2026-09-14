@@ -134,7 +134,7 @@ impl McpProbeReport {
 }
 
 impl<T: Transport> Radio<T> {
-    /// Read the two fixed MCP fragments and acknowledge exit without sending CAT.
+    /// Read two fixed MCP fragments and acknowledge exit without post-exit CAT.
     ///
     /// Reads exactly `8..48` and `327681..327936`, using the official transfer
     /// boundaries. Sends identity, entry, read requests, protocol ACKs, and exit;

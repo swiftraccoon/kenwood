@@ -10,6 +10,40 @@ transport errors, and scripted mocks come from
 This crate owns TM-D750 endpoint discovery, serial line settings, and all
 radio protocol and recovery policy. It does not depend on the TH-D75 library.
 
+## Start here
+
+| Task | Public entry point | Ownership and scope |
+| --- | --- | --- |
+| Read identity and ordinary state | [`Radio`], [`Radio::identify`] | Owns one selected transport; no implicit discovery or retry |
+| Capture configuration | [`Radio::backup_mcp_until_exit`] | Preserves acknowledged pages; caller owns close and fresh verification |
+| Inspect sparse settings | [`MenuFieldSnapshot`], [`ScopedMenuField`] | Decodes only covered fields; no I/O when using an existing snapshot |
+| Prepare ordinary changes | [`MenuAssignment`], [`MenuUpdatePlan`] | Exact identity, format, PM and Gateway guards; not an executed write |
+| Prepare a Gateway transition | [`radio::terminal::TerminalPlan`] | Separate route/mode policy; caller owns the modem and restoration lifecycle |
+| Parse a configuration file | [`parse_d750`], [`RadioConfig`] | Exact stored-byte coverage; no radio or firmware qualification |
+
+[`memory`] explains offline storage and previews; [`memory::schema`] explains
+field addressing and masked patches; [`radio::programming`] documents borrowed
+MCP ownership and contains a complete executable mock lifecycle. Fixed PM1,
+MY1, and Terminal trials below describe particular evidence-driven experiments,
+not steps required to use the ordinary menu API.
+
+This unpublished crate is used from the workspace or as a local path dependency.
+Applications implementing transports or captures also import `Transport`,
+`TransportError`, and `MockTransport` directly from `kenwood_transport`.
+
+```toml
+[dependencies]
+kenwood-tmd750 = { path = "../kenwood/tmd750" }
+kenwood-transport = { path = "../kenwood/kenwood-transport", default-features = false }
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+thiserror = "2"
+```
+
+Adjust paths for your checkout. The model enables the shared serial backend;
+there is no model feature flag that adds automatic Bluetooth or D-STAR
+orchestration. Those application workflows live in
+[`tmd750-repl`](https://github.com/swiftraccoon/kenwood/tree/main/tmd750-repl).
+
 ## Read radio status
 
 Choose an endpoint returned by `transport::discover_serial`; discovery lists
@@ -20,23 +54,68 @@ the radio before using it:
 ```rust,no_run
 use kenwood_tmd750::{Band, Error, Radio};
 use kenwood_tmd750::transport::{DEFAULT_BAUD, open_serial};
-use kenwood_transport::Transport;
+use kenwood_transport::{Transport, TransportError};
+
+#[derive(Debug, thiserror::Error)]
+#[error("status failed: operation={operation:?}; close={close:?}")]
+struct StatusFailure {
+    operation: Option<Error>,
+    close: Option<TransportError>,
+}
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Error> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Replace with the explicitly selected path or Windows COM port.
     let transport = open_serial("/dev/cu.usbmodem101", DEFAULT_BAUD)?;
     let mut radio = Radio::new(transport);
-    let identity = radio.identify().await?;
-    println!("{} firmware {}", identity.model, identity.firmware);
-    println!("Band A: {}", radio.get_operating_mode(Band::A).await?);
-    println!("DV Gateway: {}", radio.get_dv_gateway_mode().await?);
-
+    // Keep the owner even if a query fails; close must still be attempted.
+    let operation = async {
+        let identity = radio.identify().await?;
+        let mode = radio.get_operating_mode(Band::A).await?;
+        let gateway = radio.get_dv_gateway_mode().await?;
+        Ok::<_, Error>((identity, mode, gateway))
+    }.await;
     let mut transport = radio.into_transport();
-    transport.close().await?;
+    let close = transport.close().await;
+    drop(transport);
+    match (operation, close) {
+        (Ok((identity, mode, gateway)), Ok(())) => {
+            println!("{} firmware {}", identity.model, identity.firmware);
+            println!("Band A: {mode}; DV Gateway: {gateway}");
+        }
+        (operation, close) => {
+            return Err(StatusFailure {
+                operation: operation.err(),
+                close: close.err(),
+            }.into());
+        }
+    }
     Ok(())
 }
 ```
+
+Each write and reply-reading step has its own timeout, not one shared budget
+for `identify` or a complete workflow. Await CAT operations to completion.
+Dropping an in-flight future, a transport failure, timeout, or malformed reply
+can leave subsequent calls blocked by `McpError::RecoveryRequired`, even when
+the failed operation was CAT. A cached identity does not establish readiness.
+Retain operation and close failures separately, release the owner, and establish
+the radio's protocol boundary before explicitly selecting a fresh connection.
+The library never repairs an uncertain stream merely by rewrapping its handle.
+See [`Radio`] for the complete contract.
+
+For an executable demonstration with no device, file, or network access:
+
+```text
+cargo run -p kenwood-tmd750 --example owned_lifecycle
+```
+
+The [example source](https://github.com/swiftraccoon/kenwood/blob/main/tmd750/examples/owned_lifecycle.rs)
+is also executed by the [`radio::programming`] doctest. It checks CAT cleanup,
+successful MCP exit followed by close/drop and a separate fresh identity/Gateway
+check, independent operation/exit/close failures, and refusal of speculative
+exit after an incomplete read. These mocks prove host behavior, not radio
+recovery timing or physical-device continuity.
 
 ## Select a qualified mode
 
@@ -127,6 +206,22 @@ excludes the custom startup bitmap and unclassified regions. Its
 failure and identifies the exact failed page. `has_complete_configuration()`
 checks the entire ordered schedule, lengths, identity, entry reply, exit ACK,
 and outcome; it does not establish firmware-layout compatibility or return to CAT.
+
+`Radio::backup_mcp_gateway_off_until_exit(cancel, progress)` uses the same
+reader with stricter admission: exact firmware `1.02`, radio type `K,2,1`, and
+a fresh Gateway Off observation before programming entry. Its report retains
+`gateway_mode`; a failed Gateway exchange is identified by
+`McpBackupStage::Gateway`. Ordinary `backup_mcp_until_exit` keeps its existing
+identity/read/exit schedule and leaves that optional observation absent. The
+guarded method does not imply transport-recovery or settings-write qualification.
+
+On September 13, 2026, this guarded reader completed all standard pages and
+acknowledged exit over native macOS Bluetooth on the exact admitted tuple.
+An independent audit matched every page byte and ACK. The companion workflow's
+fresh Bluetooth opening succeeded, but its first CAT query received no reply
+within 1,500 ms. This qualifies the observed read/exit, not complete Bluetooth
+backup/recovery; the workflow correctly retained failure and rejected the
+capture as a successful offline snapshot.
 
 Await the operation to completion. Cancellation is cooperative at exchange
 boundaries. Successful exit retires protocol access to the original handle
@@ -555,8 +650,10 @@ fn full_file(radio_type: &RadioType, image: Vec<u8>) -> Result<RadioConfig, File
 `header()` and `layout()` are read-only views. `image_bytes_mut()` permits
 fixed-length payload edits without changing coverage, while `into_parts()`
 returns the validated header and exact payload for explicit reconstruction.
-Construction, parsing, and serialization report typed `FileError` failures;
-none validates settings values, firmware compatibility, or radio-type semantics.
+Construction and parsing return typed `FileError` failures. `to_bytes()` returns
+the serialized `Vec<u8>` directly because the container already owns a validated
+header and matching payload length. None of these operations validates settings
+values, firmware compatibility, or radio-type semantics.
 
 An unmodified container round-trips byte for byte. Serialization does not
 perform the official writer's image normalization or qualify an export for

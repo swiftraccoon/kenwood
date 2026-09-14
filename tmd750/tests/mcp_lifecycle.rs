@@ -11,7 +11,7 @@ use std::pin::pin;
 use std::task::Poll;
 
 use kenwood_tmd750::protocol::mcp::{
-    ACK, BytePatch, ENTER, EXIT, PagePatch, read_request, write_request,
+    ACK, BytePatch, ENTER, EXIT, HeaderCommand, PagePatch, read_request, write_request,
 };
 use kenwood_tmd750::radio::Radio;
 use kenwood_tmd750::{Address, Error, McpError, Page, ProtocolError, Region};
@@ -290,6 +290,49 @@ async fn rejected_read_header_and_ack_refuse_exit_and_cat() -> TestResult {
         assert_eq!(mock.writes().len(), if bad_ack { 6 } else { 5 });
         mock.assert_complete();
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn read_request_echo_is_not_a_data_response() -> TestResult {
+    let page = Page::new(Address::new(8)?, 40)?;
+    let request = read_request(page);
+    let mut mock = ready_mock("1.02");
+    mock.expect(&request, &request);
+    let mut radio = Radio::new(mock);
+    let mut session = radio.enter_mcp().await?;
+    let result = session.read_page(page).await;
+    assert_eq!(
+        result.as_ref().err().map(ToString::to_string),
+        Some("MCP page response command Read is not Write or Fill".to_owned()),
+        "the diagnostic must distinguish supported framing from an invalid response role"
+    );
+    assert!(
+        matches!(
+            result,
+            Err(Error::Protocol(ProtocolError::UnexpectedPageResponse {
+                command: HeaderCommand::Read
+            }))
+        ),
+        "valid request framing must be rejected before reading a response payload: {result:?}"
+    );
+    assert!(
+        !session.is_ready(),
+        "a request echo does not complete a read"
+    );
+    let exit = session.exit().await;
+    assert!(
+        matches!(exit, Err(Error::Mcp(McpError::RecoveryRequired))),
+        "exit must be refused locally after an invalid response role: {exit:?}"
+    );
+    assert_cat_blocked(&mut radio).await;
+    let mock = radio.into_transport();
+    assert_eq!(
+        mock.writes().len(),
+        5,
+        "no payload ACK, exit, or CAT may follow"
+    );
+    mock.assert_complete();
     Ok(())
 }
 

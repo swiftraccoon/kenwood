@@ -51,6 +51,7 @@ enum BackupOutcome {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum BackupStage {
     Identity,
+    Gateway,
     Entry,
     Read { address: u32, length: usize },
     Exit,
@@ -60,6 +61,7 @@ impl From<McpBackupStage> for BackupStage {
     fn from(stage: McpBackupStage) -> Self {
         match stage {
             McpBackupStage::Identity => Self::Identity,
+            McpBackupStage::Gateway => Self::Gateway,
             McpBackupStage::Entry => Self::Entry,
             McpBackupStage::Read { page } => Self::Read {
                 address: page.address().as_u32(),

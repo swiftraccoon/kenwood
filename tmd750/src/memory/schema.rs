@@ -1,4 +1,33 @@
 //! Model-bound descriptors and region planning over shared scalar codecs.
+//!
+//! [`FieldDescriptor`] combines a storage codec with an address of the form
+//! `base + sum(stride * slot)`. A [`SlotIndex`] of zero denotes PM Off;
+//! slots one through five denote PM1 through PM5. Global descriptors need no
+//! slot. Use [`super::menu_field`] to select compiled metadata, and
+//! [`crate::radio::menu::ScopedMenuField`] when an explicit global/per-PM scope
+//! must be validated without silently accepting an irrelevant slot.
+//!
+//! # Reading and planning
+//!
+//! [`FieldDescriptor::read`] preserves stored numeric values outside the menu's
+//! writable domain, interprets nonzero boolean bytes as true, and stops text
+//! at its first NUL or configured padding byte. It checks the supplied span,
+//! not whether those bytes were actually captured. For sparse evidence, use
+//! [`crate::radio::menu::MenuFieldSnapshot::value`].
+//!
+//! [`FieldDescriptor::encode`] instead checks the desired writable domain and
+//! returns field-relative [`kenwood_schema::MaskedByte`] assignments.
+//! [`PatchPlanner`] resolves absolute addresses, validates writable regions, and
+//! merges equal overlapping assignments idempotently. A conflicting assignment
+//! fails atomically; earlier accepted claims remain intact. [`PatchSet`] groups
+//! the result into complete transfer-page scopes without reading or writing them.
+//!
+//! These storage checks do not establish firmware compatibility, current state,
+//! or an ordinary setting's lifecycle policy. Live registered updates require
+//! [`crate::radio::menu::MenuUpdatePlan`] and its fresh-page session comparison.
+//! Persistent Gateway changes use [`crate::radio::terminal::TerminalPlan`].
+//! The shared `kenwood-schema` crate owns scalar encoding and bit claims; this
+//! facade owns catalog integrity, PM addressing, image bounds, and page geometry.
 
 use std::collections::BTreeMap;
 

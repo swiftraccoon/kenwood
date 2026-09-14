@@ -83,7 +83,7 @@ pub enum Response {
         /// The firmware identity.
         version: FirmwareIdentity,
     },
-    /// `TY <opaque printable payload>`.
+    /// `TY <opaque graphic-ASCII payload>`; spaces are not accepted in the payload.
     RadioType(RadioType),
     /// `MD <band>,<mode>`.
     OperatingMode {

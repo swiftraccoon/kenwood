@@ -1,4 +1,4 @@
-//! Rendering of the manifest's writable fields as crate-native Rust descriptors.
+//! Rendering of the manifest's serializer fields as crate-native Rust descriptors.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -21,6 +21,10 @@ struct Target {
     product: &'static str,
     menus_doc: &'static str,
     terms: bool,
+    module_docs: &'static [&'static str],
+    field_docs: &'static [&'static str],
+    descriptor_doc: &'static str,
+    registry_docs: &'static [&'static str],
 }
 
 const THD75_TARGET: Target = Target {
@@ -29,6 +33,12 @@ const THD75_TARGET: Target = Target {
     product: "MCP-D75",
     menus_doc: "(`radio`, `gps`, `aprs`, or `dv`)",
     terms: false,
+    module_docs: &[],
+    field_docs: &["/// One writable public MCP-D75 menu or repeated-record field."],
+    descriptor_doc: "Absolute memory offset and on-image codec.",
+    registry_docs: &[
+        "/// All safely writable public fields from the reviewed MCP-D75 serializers.",
+    ],
 };
 
 const TMD750_TARGET: Target = Target {
@@ -37,6 +47,35 @@ const TMD750_TARGET: Target = Target {
     product: "MCP-D750",
     menus_doc: "(`radio`, `gps`, `aprs`, `dv`, `ipnet`, or `pm`)",
     terms: true,
+    module_docs: &[
+        "//!",
+        "//! This catalog describes storage, enum labels and slot-relative addressing.",
+        "//! Entry presence does not authorize a live write. Inspect",
+        "//! [`MenuField::write_policy`] and prepare a",
+        "//! [`MenuUpdatePlan`](crate::radio::menu::MenuUpdatePlan) for ordinary settings.",
+        "//! Lifecycle-restricted, unresolved and binary entries remain discoverable",
+        "//! without being admitted by that setter. Generated metadata is not evidence",
+        "//! of firmware compatibility or hardware qualification.",
+    ],
+    field_docs: &[
+        "/// Storage metadata for one public MCP-D750 menu or repeated-record field.",
+        "///",
+        "/// The descriptor and domains support inspection and offline planning.",
+        "/// Check [`MenuField::write_policy`] before preparing a",
+        "/// [`MenuUpdatePlan`](crate::radio::menu::MenuUpdatePlan); that plan also",
+        "/// requires supported identity, operating state and captured-page evidence.",
+        "/// A listed field is not necessarily writable by an ordinary live setter.",
+    ],
+    descriptor_doc: "Base offset, optional PM-slot address terms, and on-image codec.",
+    registry_docs: &[
+        "/// Public storage fields represented by the reviewed MCP-D750 serializers.",
+        "///",
+        "/// Presence in this registry does not establish hardware qualification",
+        "/// or authorize writing. [`MenuField::write_policy`] distinguishes ordinary",
+        "/// settings from lifecycle-restricted, unresolved and binary fields.",
+        "/// Use [`MenuUpdatePlan`](crate::radio::menu::MenuUpdatePlan) for guarded",
+        "/// ordinary changes rather than interpreting this list as an allowlist.",
+    ],
 };
 
 /// Render a decimal literal, grouping digits with `_` once it has six or
@@ -500,6 +539,9 @@ fn registry_header_lines(manifest: &Manifest, target: &Target) -> Result<Vec<Str
         format!(
             "//! {product} menu field registry generated from the reviewed serializer manifest."
         ),
+    ];
+    lines.extend(target.module_docs.iter().map(ToString::to_string));
+    lines.extend([
         String::new(),
         schema_use.to_owned(),
         String::new(),
@@ -514,7 +556,7 @@ fn registry_header_lines(manifest: &Manifest, target: &Target) -> Result<Vec<Str
             "    {};",
             rust_string(&manifest.source.normalized_source_sha256)
         ),
-    ];
+    ]);
     lines.extend(slot_constant_lines(manifest, target)?);
     lines.extend([
         String::new(),
@@ -542,14 +584,16 @@ fn registry_header_lines(manifest: &Manifest, target: &Target) -> Result<Vec<Str
         "    pub denominator: i64,".to_owned(),
         "}".to_owned(),
         String::new(),
-        format!("/// One writable public {product} menu or repeated-record field."),
+    ]);
+    lines.extend(target.field_docs.iter().map(ToString::to_string));
+    lines.extend([
         "#[derive(Debug, Clone, Copy, PartialEq, Eq)]".to_owned(),
         "pub struct MenuField {".to_owned(),
         format!("    /// Top-level MCP menu group {}.", target.menus_doc),
         "    pub menu: &'static str,".to_owned(),
         "    /// Qualified decompiled enum type, when this field is enum-valued.".to_owned(),
         "    pub enum_type: Option<&'static str>,".to_owned(),
-        "    /// Absolute memory offset and on-image codec.".to_owned(),
+        format!("    /// {}", target.descriptor_doc),
         "    pub descriptor: FieldDescriptor,".to_owned(),
         "    /// Raw enum domain; empty for non-enum fields.".to_owned(),
         "    pub options: &'static [MenuOption],".to_owned(),
@@ -726,10 +770,11 @@ fn menu_field_entry_lines(
 ///
 /// # Errors
 ///
-/// Returns an error when the manifest is not the TH-D75's, when a field
-/// carries dimension terms, when a codec references a missing enum catalog
-/// or option domain, when a domain exceeds its storage capacity, or when the
-/// rendered field count disagrees with the manifest's summary.
+/// Returns an error for an unsupported model, dimension terms on a TH-D75
+/// field, or missing TM-D750 slot metadata. Also rejects missing enum catalogs
+/// or option domains, unrepresentable codec domains, and a rendered field count
+/// that disagrees with the manifest's summary. Rendering describes storage;
+/// it does not grant permission to write a radio.
 pub fn rust_text(manifest: &Manifest) -> Result<String> {
     let target = match manifest.model.radio.as_str() {
         "thd75" => &THD75_TARGET,
@@ -751,11 +796,8 @@ pub fn rust_text(manifest: &Manifest) -> Result<String> {
         &mut choice_value_names,
     )?);
     let statics = format!("{}_MENU_FIELDS", target.prefix);
+    lines.extend(target.registry_docs.iter().map(ToString::to_string));
     lines.extend([
-        format!(
-            "/// All safely writable public fields from the reviewed {} serializers.",
-            target.product
-        ),
         "#[rustfmt::skip]".to_owned(),
         format!("pub static {statics}: &[MenuField] = &["),
     ]);

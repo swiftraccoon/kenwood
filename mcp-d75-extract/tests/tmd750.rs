@@ -384,6 +384,31 @@ fn manifest_round_trips_and_rustgen_emits_slot_terms() -> TestResult {
 }
 
 #[test]
+fn registry_documents_metadata_without_granting_write_authority() -> TestResult {
+    let registry = rust_text(&manifest()?)?;
+    assert!(
+        registry
+            .contains("Storage metadata for one public MCP-D750 menu or repeated-record field."),
+        "a serializer descriptor is not an admitted live operation"
+    );
+    assert!(
+        registry.contains("[`MenuField::write_policy`]")
+            && registry.contains("[`MenuUpdatePlan`](crate::radio::menu::MenuUpdatePlan)"),
+        "generated docs must lead readers to actual policy and plan admission"
+    );
+    assert!(
+        registry.contains("Presence in this registry does not establish hardware qualification"),
+        "enumeration cannot become hardware evidence"
+    );
+    assert!(
+        !registry.contains("All safely writable public fields")
+            && !registry.contains("One writable public MCP-D750"),
+        "obsolete safety claims must not survive regeneration"
+    );
+    Ok(())
+}
+
+#[test]
 fn strict_known_layout_rejects_fixture() -> TestResult {
     let result = build_manifest(&fixtures_dir(), &options(true));
     let Err(error) = result else {

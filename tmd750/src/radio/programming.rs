@@ -1,4 +1,44 @@
-//! The MCP session: region reads, verified page writes, exit, recovery.
+//! Explicit MCP ownership: sparse reads, guarded writes, exit, and journal inspection.
+//!
+//! # Choose a level
+//!
+//! [`Radio::backup_mcp_until_exit`] retains acknowledged standard configuration
+//! pages even on failure. [`Radio::enter_mcp`] instead gives the caller a
+//! borrowed [`McpSession`] for composing [`McpSession::read_page`],
+//! [`McpSession::read_regions`], or sparse menu operations within one entry.
+//! [`RegionImage`] retains read coverage; [`crate::memory::MemoryImage`] retains
+//! only a full-sized byte buffer. Neither storage shape proves firmware layout.
+//!
+//! For ordinary registered changes, prepare a
+//! [`MenuUpdatePlan`](super::menu::MenuUpdatePlan). Persistent Gateway changes
+//! use [`TerminalPlan`](super::terminal::TerminalPlan). The lower-level
+//! [`McpSession::write_pages_verified`] retains a different schema gate and is
+//! not a substitute for either plan's operating-state admission.
+//!
+//! # Lifecycle and cleanup
+//!
+//! Entry interrupts normal radio operation. Keep the session and any write
+//! journal until complete exchanges permit explicit [`McpSession::exit`].
+//! A synchronized comparison failure can permit exit; an incomplete frame
+//! cannot. Dropping a future or session performs no asynchronous protocol cleanup.
+//!
+//! E/ACK retires the original connection without proving CAT readiness. Close
+//! and drop that owner before separately selecting, opening, and identifying
+//! a fresh connection. Retain operation, exit, close, and fresh-verification
+//! failures independently. [`Radio::recover`] reads journaled patch bits only
+//! after the caller has established a usable connection; it is not link repair.
+//!
+//! The executable example below uses strict mocks only. It demonstrates these
+//! ownership boundaries, sparse coverage, and failure handling without opening
+//! a device, writing settings, or claiming hardware qualification.
+
+#![doc = concat!(
+    "\n\n# Executable offline lifecycle\n\n",
+    "Run the same source with `cargo run -p kenwood-tmd750 --example owned_lifecycle`.\n\n",
+    "```rust\n",
+    include_str!("../../examples/owned_lifecycle.rs"),
+    "\n```\n"
+)]
 
 mod compare_exchange;
 
@@ -11,7 +51,7 @@ use crate::memory::{
     is_supported_schema_target,
 };
 use crate::protocol::mcp::{
-    ACK, BAUD, ENTER, ENTER_RESPONSE, EXIT, FILL, HEADER_LEN, Header, PagePatch, WRITE,
+    ACK, BAUD, ENTER, ENTER_RESPONSE, EXIT, HEADER_LEN, Header, HeaderCommand, PagePatch,
     read_request, regions, write_request,
 };
 use crate::types::{IMAGE_LENGTH, Page, Region};
@@ -44,7 +84,11 @@ pub struct RecoveryReport {
     pub pending: Vec<Page>,
 }
 
-/// Bytes read so far, with the regions they cover.
+/// A full-sized storage buffer plus the regions actually read into it.
+///
+/// Unread bytes are synthetic zeroes, not observations. Prefer [`Self::bytes`]
+/// for coverage-checked inspection and retain [`Self::covered`] with exported
+/// data. Conversion to [`crate::memory::MemoryImage`] loses this coverage map.
 #[derive(Debug, Clone)]
 pub struct RegionImage {
     bytes: Vec<u8>,
@@ -86,7 +130,11 @@ impl RegionImage {
         self.bytes.get(start..end)
     }
 
-    /// The whole buffer (unread bytes are zero).
+    /// The full-sized buffer, including synthetic zeroes for unread bytes.
+    ///
+    /// Its length is not a completeness test. Use [`Self::bytes`] to inspect a
+    /// covered region; do not serialize this buffer as a complete radio backup
+    /// or decode a field until its actual read coverage is established.
     #[must_use]
     pub fn raw(&self) -> &[u8] {
         &self.bytes
@@ -98,7 +146,32 @@ impl RegionImage {
         &self.covered
     }
 
-    /// Convert into a full image once every `required` region was read.
+    /// Consume the buffer after checking only the caller's required regions.
+    ///
+    /// This returns full-sized storage, not proof of a fully observed image.
+    /// Coverage metadata is discarded and every unread byte remains synthetic
+    /// zero. An empty `required` list checks no coverage, even on a new image.
+    /// Retain the coverage map separately if later readers need provenance;
+    /// prefer [`Self::bytes`] or [`super::menu::MenuFieldSnapshot`] for sparse
+    /// inspection. This conversion does not qualify a `.d750` export or a write.
+    ///
+    /// ```
+    /// use kenwood_tmd750::{IMAGE_LENGTH, Region};
+    /// use kenwood_tmd750::radio::RegionImage;
+    ///
+    /// let unread = RegionImage::new();
+    /// let required = Region::new(8, 48)?;
+    /// assert!(!unread.covers(required), "new storage has no read coverage");
+    /// assert!(unread.bytes(required).is_none(), "unread bytes are not observations");
+    /// // An empty requirement explicitly waives coverage, not just an error.
+    /// let storage = unread.into_memory_image(&[])?;
+    /// assert_eq!(storage.as_bytes().len(), IMAGE_LENGTH, "storage is full-sized");
+    /// assert!(
+    ///     storage.as_bytes().iter().all(|byte| *byte == 0),
+    ///     "the unread buffer contains only synthetic zeroes"
+    /// );
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     ///
     /// # Errors
     ///
@@ -492,6 +565,9 @@ impl<T: Transport> McpSession<'_, T> {
     /// Rejects a session that is not MCP-ready before any page traffic. Returns
     /// transport, timeout, header-address/length, response-command, or
     /// acknowledgment errors while preserving the uncertain session state.
+    /// A matching read-request echo returns
+    /// [`ProtocolError::UnexpectedPageResponse`] before payload or ACK I/O;
+    /// valid header framing does not make it a data response.
     pub async fn read_page(&mut self, page: Page) -> Result<Vec<u8>, Error> {
         self.radio.require_mcp_ready()?;
         let request = read_request(page);
@@ -505,21 +581,23 @@ impl<T: Transport> McpSession<'_, T> {
             })
         })?;
         let header = Header::decode(&reply)?;
-        if header.address != page.address() || header.len != page.len() {
+        if header.page() != page {
             return Err(ProtocolError::HeaderEcho {
                 expected: request,
                 actual: reply,
             }
             .into());
         }
-        let data = match header.command {
-            WRITE => self.radio.read_exact(page.len(), "MCP page data").await?,
-            FILL => {
+        let data = match header.command() {
+            HeaderCommand::Write => self.radio.read_exact(page.len(), "MCP page data").await?,
+            HeaderCommand::Fill => {
                 let fill = self.radio.read_exact(1, "MCP fill byte").await?;
                 let byte = fill.first().copied().unwrap_or_default();
                 vec![byte; page.len()]
             }
-            other => return Err(ProtocolError::UnknownHeaderCommand { command: other }.into()),
+            other @ HeaderCommand::Read => {
+                return Err(ProtocolError::UnexpectedPageResponse { command: other }.into());
+            }
         };
         self.radio.write_all(&[ACK]).await?;
         expect_ack(self.radio, "MCP page read").await?;

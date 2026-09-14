@@ -2,9 +2,9 @@
 
 use super::qualification::{McpProbeExit, McpProbeSegment};
 use super::{Identity, Progress, Radio};
-use crate::error::Error;
+use crate::error::{Error, ProtocolError};
 use crate::protocol::mcp::{ENTER_RESPONSE, regions};
-use crate::types::{Page, Region};
+use crate::types::{DvGatewayMode, Page, RadioModel, Region};
 use kenwood_transport::Transport;
 
 /// A step in the fixed configuration backup sequence.
@@ -12,6 +12,8 @@ use kenwood_transport::Transport;
 pub enum McpBackupStage {
     /// Fresh CAT model, firmware, and radio-type proof before entry.
     Identity,
+    /// The guarded backup's fresh Gateway-Off observation before entry.
+    Gateway,
     /// Programming-mode entry and its exact expected response.
     Entry,
     /// One configuration page and its complete acknowledgment exchange.
@@ -56,6 +58,9 @@ pub enum McpBackupOutcome {
 pub struct McpBackupReport {
     /// Identity proven immediately before programming-mode entry, if reached.
     pub identity: Option<Identity>,
+    /// Fresh Gateway state when the selected backup admission requires it.
+    /// Unguarded standard backups leave this observation absent.
+    pub gateway_mode: Option<DvGatewayMode>,
     /// Accepted programming-entry reply without its carriage return.
     pub entry_reply: Option<Vec<u8>>,
     /// Fully acknowledged pages, in the official configuration-transfer order.
@@ -70,6 +75,7 @@ impl McpBackupReport {
     const fn pending() -> Self {
         Self {
             identity: None,
+            gateway_mode: None,
             entry_reply: None,
             segments: Vec::new(),
             exit: McpProbeExit::NotEntered,
@@ -115,6 +121,66 @@ fn configuration_pages() -> Vec<Page> {
 }
 
 impl<T: Transport> Radio<T> {
+    /// Read the standard configuration only after exact identity and Gateway Off.
+    ///
+    /// Requires `TM-D750 / 1.02 / K,2,1` and a fresh `GW 0` on this owner.
+    /// Uses the same read and detached-exit engine as
+    /// [`Self::backup_mcp_until_exit`], with the same cancellation boundaries.
+    /// It never sends memory-write, RF, recovery, or post-exit CAT commands.
+    ///
+    /// Await completion; dropping an active exchange cannot preserve its report
+    /// or establish a safe protocol boundary for subsequent access.
+    pub async fn backup_mcp_gateway_off_until_exit(
+        &mut self,
+        mut should_cancel: impl FnMut() -> bool,
+        mut progress: impl FnMut(Progress),
+    ) -> McpBackupReport {
+        let mut report = McpBackupReport::pending();
+        if !self.identify_backup(&mut should_cancel, &mut report).await {
+            return report;
+        }
+        if !report.identity.as_ref().is_some_and(|identity| {
+            identity.model == RadioModel::TmD750
+                && identity.firmware.as_str() == "1.02"
+                && identity.radio_type.as_str() == "K,2,1"
+        }) {
+            report.fail(
+                McpBackupStage::Identity,
+                ProtocolError::UnexpectedResponse {
+                    expected: "TM-D750 / firmware 1.02 / radio type K,2,1 for the Gateway-Off backup",
+                    actual: format!("{:?}", report.identity),
+                }
+                .into(),
+            );
+            return report;
+        }
+        if should_cancel() {
+            report.outcome = McpBackupOutcome::Cancelled;
+            return report;
+        }
+        match self.get_dv_gateway_mode().await {
+            Ok(mode) => report.gateway_mode = Some(mode),
+            Err(error) => {
+                report.fail(McpBackupStage::Gateway, error);
+                return report;
+            }
+        }
+        if report.gateway_mode != Some(DvGatewayMode::Off) {
+            report.fail(
+                McpBackupStage::Gateway,
+                ProtocolError::UnexpectedResponse {
+                    expected: "Gateway Off before the standard configuration backup",
+                    actual: format!("{:?}", report.gateway_mode),
+                }
+                .into(),
+            );
+            return report;
+        }
+        self.finish_backup(&mut should_cancel, &mut progress, &mut report)
+            .await;
+        report
+    }
+
     /// Read every official configuration region, then acknowledge MCP exit.
     ///
     /// Reads the fixed global regions followed by the six Programmable-Memory
@@ -147,27 +213,50 @@ impl<T: Transport> Radio<T> {
         mut progress: impl FnMut(Progress),
     ) -> McpBackupReport {
         let mut report = McpBackupReport::pending();
+        if self.identify_backup(&mut should_cancel, &mut report).await {
+            self.finish_backup(&mut should_cancel, &mut progress, &mut report)
+                .await;
+        }
+        report
+    }
+
+    async fn identify_backup(
+        &mut self,
+        should_cancel: &mut impl FnMut() -> bool,
+        report: &mut McpBackupReport,
+    ) -> bool {
         if should_cancel() {
             report.outcome = McpBackupOutcome::Cancelled;
-            return report;
+            return false;
         }
         match self.identify().await {
-            Ok(identity) => report.identity = Some(identity),
+            Ok(identity) => {
+                report.identity = Some(identity);
+                true
+            }
             Err(error) => {
                 report.fail(McpBackupStage::Identity, error);
-                return report;
+                false
             }
         }
+    }
+
+    async fn finish_backup(
+        &mut self,
+        should_cancel: &mut impl FnMut() -> bool,
+        progress: &mut impl FnMut(Progress),
+        report: &mut McpBackupReport,
+    ) {
         if should_cancel() {
             report.outcome = McpBackupOutcome::Cancelled;
-            return report;
+            return;
         }
         let mut session = match self.enter_mcp().await {
             Ok(session) => session,
             Err(error) => {
                 report.exit = McpProbeExit::RecoveryRequired;
                 report.fail(McpBackupStage::Entry, error);
-                return report;
+                return;
             }
         };
         report.entry_reply = Some(session.entry_reply().to_vec());
@@ -183,7 +272,7 @@ impl<T: Transport> Radio<T> {
                 Ok(data) => report.segments.push(McpProbeSegment { page, data }),
                 Err(error) => {
                     report.fail(McpBackupStage::Read { page }, error);
-                    return report;
+                    return;
                 }
             }
             progress(Progress {
@@ -197,9 +286,8 @@ impl<T: Transport> Radio<T> {
         if let Err(error) = session.exit().await {
             report.exit = McpProbeExit::NotAcknowledged;
             report.fail(McpBackupStage::Exit, error);
-            return report;
+            return;
         }
         report.exit = McpProbeExit::Acknowledged;
-        report
     }
 }

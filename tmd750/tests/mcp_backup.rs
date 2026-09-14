@@ -207,6 +207,145 @@ fn assert_data(report: &McpBackupReport, pages: &[Page]) {
 }
 
 #[tokio::test]
+async fn guarded_backup_refuses_unqualified_identity_before_gateway_or_entry() -> TestResult {
+    for (firmware, radio_type) in [
+        (b"FV 1.03\r".as_slice(), b"TY K,2,1\r".as_slice()),
+        (b"FV 1.02\r".as_slice(), b"TY K,2,2\r".as_slice()),
+    ] {
+        let mut mock = MockTransport::new();
+        mock.expect(b"ID\r", b"ID TM-D750\r");
+        mock.expect(b"FV\r", firmware);
+        mock.expect(b"TY\r", radio_type);
+        let mut radio = Radio::new(mock);
+        let report = radio
+            .backup_mcp_gateway_off_until_exit(|| false, |_| {})
+            .await;
+        assert!(
+            matches!(
+                report.outcome,
+                McpBackupOutcome::Failed {
+                    stage: McpBackupStage::Identity,
+                    ..
+                }
+            ),
+            "an unqualified tuple must fail before querying Gateway or entering MCP: {report:?}"
+        );
+        assert_eq!(radio.into_transport().writes().len(), 3);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn guarded_backup_requires_gateway_off_without_a_second_identity() -> TestResult {
+    for reply in [
+        b"GW 2\r".as_slice(),
+        b"GW 3\r".as_slice(),
+        b"?\r".as_slice(),
+    ] {
+        let mut mock = MockTransport::new();
+        identity(&mut mock);
+        mock.expect(b"GW\r", reply);
+        let mut radio = Radio::new(mock);
+        let report = radio
+            .backup_mcp_gateway_off_until_exit(|| false, |_| {})
+            .await;
+        assert!(matches!(
+            report.outcome,
+            McpBackupOutcome::Failed {
+                stage: McpBackupStage::Gateway,
+                ..
+            }
+        ));
+        assert_eq!(report.exit, McpProbeExit::NotEntered);
+        assert!(report.segments.is_empty());
+        let mock = radio.into_transport();
+        assert_eq!(mock.writes().len(), 4);
+        mock.assert_complete();
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn guarded_backup_reads_the_same_standard_pages_and_detaches_after_exit() -> TestResult {
+    let pages = expected_pages()?;
+    let mut mock = MockTransport::new();
+    identity(&mut mock);
+    mock.expect(b"GW\r", b"GW 0\r");
+    mock.expect(b"0M PROGRAM\r", b"0M\r");
+    for page in &pages {
+        read(&mut mock, *page, 0x42);
+    }
+    mock.expect(b"E", &[ACK]);
+    let mut radio = Radio::new(DepartingEndpoint::new(mock));
+    let report = radio
+        .backup_mcp_gateway_off_until_exit(|| false, |_| {})
+        .await;
+    assert!(report.has_complete_configuration());
+    assert_eq!(
+        report.gateway_mode,
+        Some(kenwood_tmd750::DvGatewayMode::Off)
+    );
+    assert_data(&report, &pages);
+    assert_protocol_is_blocked(&mut radio).await;
+    let transport = radio.into_transport();
+    assert_eq!(transport.mock.writes().len(), 6 + 2 * pages.len());
+    assert_eq!(transport.post_exit_baud_changes, 0);
+    assert!(
+        transport
+            .mock
+            .writes()
+            .iter()
+            .all(|write| { !matches!(write.first(), Some(b'W' | b'Z')) })
+    );
+    transport.mock.assert_complete();
+    Ok(())
+}
+
+#[tokio::test]
+async fn guarded_backup_cancels_at_complete_admission_and_page_boundaries() -> TestResult {
+    let page = expected_pages()?.into_iter().next().ok_or("first page")?;
+    for cancel_at in 1..=5 {
+        let mut mock = MockTransport::new();
+        if cancel_at > 1 {
+            identity(&mut mock);
+        }
+        if cancel_at > 2 {
+            mock.expect(b"GW\r", b"GW 0\r");
+        }
+        if cancel_at > 3 {
+            mock.expect(b"0M PROGRAM\r", b"0M\r");
+            if cancel_at > 4 {
+                read(&mut mock, page, 0x42);
+            }
+            mock.expect(b"E", &[ACK]);
+        }
+        let calls = Cell::new(0);
+        let mut radio = Radio::new(mock);
+        let report = radio
+            .backup_mcp_gateway_off_until_exit(
+                || {
+                    calls.set(calls.get() + 1);
+                    calls.get() >= cancel_at
+                },
+                |_| {},
+            )
+            .await;
+        assert!(matches!(report.outcome, McpBackupOutcome::Cancelled));
+        assert_eq!(report.segments.len(), usize::from(cancel_at > 4));
+        assert_eq!(
+            report.exit,
+            if cancel_at > 3 {
+                McpProbeExit::Acknowledged
+            } else {
+                McpProbeExit::NotEntered
+            }
+        );
+        radio.into_transport().assert_complete();
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn complete_backup_reads_exact_official_regions_and_retires_the_handle() -> TestResult {
     let pages = expected_pages()?;
     assert_eq!(pages.len(), 1138);

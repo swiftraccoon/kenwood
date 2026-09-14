@@ -1,4 +1,32 @@
-//! The async radio: typed CAT control and entry into MCP.
+//! Async CAT control and explicitly owned MCP programming sessions.
+//!
+//! Start with [`Radio::new`] around an already selected transport, then
+//! [`Radio::identify`] to obtain the complete model, firmware, and type tuple.
+//! Opening a transport or constructing a [`Radio`] does not prove identity.
+//!
+//! # Choose an operation
+//!
+//! - Read ordinary state with [`Radio::get_operating_mode`] and
+//!   [`Radio::get_dv_gateway_mode`]. [`Radio::set_operating_mode`] supports only
+//!   the exact hardware-qualified target and verifies the requested mode.
+//! - Capture standard configuration with [`Radio::backup_mcp_until_exit`], or
+//!   use [`Radio::probe_mcp`] for a smaller, explicit bench qualification.
+//!   Neither operation writes settings; both interrupt ordinary radio operation.
+//! - Inspect selected menu fields through [`McpSession::read_menu_snapshot`].
+//!   Prepare ordinary changes with [`menu::MenuUpdatePlan`] and persistent
+//!   Gateway changes with [`terminal::TerminalPlan`]. Plans are local data,
+//!   not executed changes or proof that a connection is ready.
+//! - The PM1/MY1 update and fixed-trial modules expose separate evidence-driven
+//!   workflows. They are not prerequisites for the ordinary menu API.
+//!
+//! # Ownership and failure
+//!
+//! [`Radio`] owns its transport; [`McpSession`] borrows it exclusively. Await
+//! active operations to completion, retain operation and cleanup failures
+//! independently, and explicitly close/drop the extracted transport. See
+//! [`Radio`]'s CAT contract and [`programming`]'s executable offline example.
+//! MCP exit retires the original connection; fresh connection selection and
+//! identity verification belong to the caller, not an automatic library retry.
 
 pub mod backup;
 pub mod menu;
@@ -63,7 +91,40 @@ pub struct Identity {
     pub radio_type: RadioType,
 }
 
-/// A TM-D750 behind a transport.
+/// Typed CAT access to one caller-selected transport, owning its connection.
+///
+/// Construction sends no bytes. [`Self::identify`] obtains and caches the full
+/// identity; ordinary getters do not implicitly identify. Qualified setters
+/// identify when needed and apply their own target checks. A cached identity
+/// is historical evidence, not a current readiness or physical-unit guarantee.
+///
+/// # Deadlines and cancellation
+///
+/// [`Self::set_timeout`] sets a separate deadline for each transport write and
+/// reply-reading step, not one deadline for an entire multi-command method.
+/// Await a polled CAT operation to completion. Dropping its future during I/O,
+/// a write/read failure, a timeout, or an undecodable reply leaves the managed
+/// connection recovery-required. A timeout does not prove that no bytes arrived
+/// or that a requested change did not occur.
+///
+/// Subsequent CAT and MCP operations then return
+/// [`McpError::RecoveryRequired`] before I/O, even when CAT caused the failure.
+/// A complete, parsed rejection or unexpected response can instead leave a
+/// synchronized boundary; an operation error alone is not a readiness test.
+/// No command is automatically replayed, and no setting is rolled back.
+///
+/// # Releasing and recovering ownership
+///
+/// [`Self::into_transport`] permits explicit close and drop after success or
+/// failure; retain a close error independently of the operation error. Dropping
+/// a `Radio` cannot await asynchronous cleanup. This crate provides no generic
+/// reset or CAT-resynchronization procedure: the caller must establish the
+/// radio's protocol boundary and explicitly select a fresh connection before
+/// further traffic. Rewrapping the old transport is not recovery.
+///
+/// MCP has additional borrowed-session and exit rules in [`McpSession`].
+/// [`Self::recover`] only inspects journaled patch bits on a usable connection;
+/// it does not repair an uncertain protocol stream.
 #[derive(Debug)]
 pub struct Radio<T: Transport> {
     transport: T,
@@ -101,6 +162,9 @@ impl<T: Transport> Radio<T> {
     }
 
     /// The identity proven by the last [`Radio::identify`].
+    ///
+    /// Returns cached evidence without I/O. It remains available after a later
+    /// exchange fails and therefore does not establish current CAT readiness.
     #[must_use]
     pub const fn identity(&self) -> Option<&Identity> {
         self.identity.as_ref()
@@ -119,10 +183,15 @@ impl<T: Transport> Radio<T> {
 
     /// Prove the radio is a TM-D750 and record its firmware and type.
     ///
+    /// Sends `ID`, `FV`, and `TY` in that order, replacing the cached identity
+    /// only after all three succeed. A failed refresh retains the earlier
+    /// cache. Follow [`Radio`]'s deadline, cancellation, and ownership contract.
+    ///
     /// # Errors
     ///
     /// Returns [`ProtocolError::UnexpectedIdentity`] for any other model,
-    /// [`Error::Timeout`] on silence, and transport or parse errors otherwise.
+    /// [`Error::Timeout`] when a write or reply step expires, and transport,
+    /// parse, unexpected-response, or session-state errors otherwise.
     pub async fn identify(&mut self) -> Result<Identity, Error> {
         tracing::info!("identifying radio");
         let model = match self.command(Command::Identify).await? {
@@ -153,9 +222,15 @@ impl<T: Transport> Radio<T> {
 
     /// Read the current operating mode for one band.
     ///
+    /// Sends one band-indexed `MD` query without an implicit identity check.
+    /// Unknown reported values remain [`OperatingMode::Unqualified`]. Follow
+    /// [`Radio`]'s deadline, cancellation, and post-error ownership contract.
+    ///
     /// # Errors
     ///
-    /// Returns a transport, timeout, parse, rejection, or unexpected-response error.
+    /// Returns transport, timeout, parse, unexpected-response (including a
+    /// parsed rejection), or session-state errors. An error does not authorize
+    /// another command on an uncertain connection.
     pub async fn get_operating_mode(&mut self, band: Band) -> Result<OperatingMode, Error> {
         match self.command(Command::GetOperatingMode { band }).await? {
             Response::OperatingMode {
@@ -171,6 +246,9 @@ impl<T: Transport> Radio<T> {
     /// Only FM and DV are exposed because both were accepted and read back on
     /// live Band A and Band B hardware. A DR write was rejected, and its read
     /// value has not yet been observed; it is not CAT-selectable through this API.
+    /// The admitted target is firmware `1.02` with exact type `K,2,1`. A failed
+    /// echo or readback can follow an applied change; no rollback occurs. Follow
+    /// [`Radio`]'s deadline, cancellation, and post-error ownership contract.
     ///
     /// # Errors
     ///
@@ -223,6 +301,8 @@ impl<T: Transport> Radio<T> {
     ///
     /// This changes the ordinary RF demodulation mode. It does not enable the
     /// separate persistent DV Gateway or Terminal Mode setting.
+    /// It has the same qualification and cancellation contract as
+    /// [`Self::set_operating_mode`].
     ///
     /// # Errors
     ///
@@ -233,9 +313,14 @@ impl<T: Transport> Radio<T> {
 
     /// Read the persistent DV Gateway state through the read-only `GW` command.
     ///
+    /// Sends one query without an implicit identity check. A Terminal value
+    /// does not prove its subtype, selected route, or modem readiness. Follow
+    /// [`Radio`]'s deadline, cancellation, and post-error ownership contract.
+    ///
     /// # Errors
     ///
-    /// Returns a transport, timeout, parse, rejection, or unexpected-response error.
+    /// Returns transport, timeout, parse, unexpected-response (including a
+    /// parsed rejection), or session-state errors.
     pub async fn get_dv_gateway_mode(&mut self) -> Result<DvGatewayMode, Error> {
         match self.command(Command::GetGatewayMode).await? {
             Response::GatewayMode(mode) => Ok(mode),

@@ -1,4 +1,32 @@
-//! Typed access to the TM-D750 memory image.
+//! Offline storage, sparse configuration evidence, and immutable update plans.
+//!
+//! This module performs no radio I/O. A decoded value describes supplied bytes;
+//! it is not a fresh observation or permission to write those bytes.
+//!
+//! # Choose a task
+//!
+//! - Use [`MemoryImage`] for a full-sized buffer and [`FieldAccess`] for
+//!   global or PM-relative decoding. Establish field coverage separately when
+//!   the bytes came from a sparse radio read.
+//! - Prefer [`crate::radio::menu::MenuFieldSnapshot`] when retaining complete
+//!   captured pages: it refuses decoding a field whose coverage is missing.
+//!   [`StandardConfiguration`] validates the full standard transfer schedule;
+//!   [`StandardConfigurationDiff`] compares two such captures byte-for-byte.
+//! - Discover storage metadata with [`menu_field`] and [`MenuField`].
+//!   [`schema`] explains addressing, scalar interpretation, and masked planning.
+//!   Parsing or encoding a value does not establish live write admission.
+//! - Use [`TextImage`] for typed offline text previews and
+//!   [`ReflectorTerminalPreflight`] for captured Terminal-setting inspection.
+//! - Prepare ordinary registered changes with
+//!   [`crate::radio::menu::MenuUpdatePlan`], or persistent Gateway changes with
+//!   [`crate::radio::terminal::TerminalPlan`]. Their session drivers separately
+//!   require identity, fresh complete-page comparisons, and caller-owned cleanup.
+//!
+//! [`Pm1NameUpdate`] and [`My1CallsignUpdate`] implement narrower two-session
+//! evidence policies. Fixed [`PmNameTrial`], [`MyCallsignTrial`], and
+//! [`TerminalExitTrial`] types model specific bench experiments, not the normal
+//! menu entry point. Caller-supplied events are attestations, not durable storage
+//! or independent radio observations. File containers live in [`crate::file`].
 
 mod configuration;
 pub(crate) mod fixed_text_trial;
@@ -77,7 +105,17 @@ pub fn is_supported_schema_target(model: RadioModel, firmware: &FirmwareIdentity
     model == RadioModel::TmD750 && MCP_D750_SCHEMA_FIRMWARE_IDENTITIES.contains(&firmware.as_str())
 }
 
-/// The full 1,929,472-byte memory image.
+/// Full-sized 1,929,472-byte storage without coverage or firmware provenance.
+///
+/// [`Self::from_bytes`] checks length only; it does not prove that every byte
+/// was read from a radio, that the layout matches its firmware, or that settings
+/// are valid. [`Self::blank`] is explicitly synthetic storage, not a factory
+/// configuration. A sparse [`crate::radio::RegionImage`] conversion retains
+/// synthetic gap bytes but discards its coverage map.
+///
+/// Callers must establish coverage before decoding each field. Prefer
+/// [`crate::radio::menu::MenuFieldSnapshot`] for coverage-checked sparse access.
+/// Local mutation and serialization of these bytes grant no radio-write authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryImage {
     bytes: Vec<u8>,
@@ -99,7 +137,10 @@ impl MemoryImage {
         Ok(Self { bytes })
     }
 
-    /// An image of `0xFF` bytes (erased flash).
+    /// Synthetic storage filled with `0xFF`, the erased-byte representation.
+    ///
+    /// This is not a radio read, a valid factory configuration, or proof of the
+    /// value of any omitted byte in a sparse capture.
     #[must_use]
     pub fn blank() -> Self {
         Self {

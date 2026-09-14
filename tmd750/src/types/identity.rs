@@ -49,17 +49,20 @@ impl fmt::Display for RadioModel {
 ///
 /// A stock North American TM-D750 running firmware 1.02 returns `K,2,1`.
 /// Its components remain opaque until their semantics are qualified. Other
-/// hardware variants may use a different printable shape, which is retained.
+/// hardware variants may use a different graphic-ASCII shape, which is retained.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RadioType(String);
 
 impl RadioType {
-    /// Retain a non-empty printable ASCII payload exactly.
+    /// Retain a non-empty graphic-ASCII payload (`0x21..=0x7E`) exactly.
+    ///
+    /// Spaces, other whitespace, controls, and non-ASCII bytes are rejected;
+    /// no trimming, normalization, or component interpretation occurs.
     ///
     /// # Errors
     ///
     /// Returns [`ValidationError::InvalidRadioTypePayload`] for an empty value
-    /// or one containing a non-printable byte.
+    /// or one containing a byte outside that range.
     pub fn new(payload: &str) -> Result<Self, ValidationError> {
         if payload.is_empty() || !payload.bytes().all(|byte| byte.is_ascii_graphic()) {
             Err(ValidationError::InvalidRadioTypePayload {
@@ -93,11 +96,14 @@ impl FirmwareIdentity {
 
     /// Validate and copy an exact `FV` payload.
     ///
+    /// Requires one through [`Self::MAX_LEN`] graphic-ASCII bytes
+    /// (`0x21..=0x7E`). Spaces and all other whitespace are rejected, not trimmed.
+    ///
     /// # Errors
     ///
     /// Returns [`ValidationError::FirmwareIdentityLength`] for an empty or
     /// overlong token and [`ValidationError::InvalidFirmwareIdentityByte`]
-    /// for a byte that is not printable ASCII.
+    /// for a byte outside graphic ASCII.
     pub fn new(value: &str) -> Result<Self, ValidationError> {
         if !(1..=Self::MAX_LEN).contains(&value.len()) {
             return Err(ValidationError::FirmwareIdentityLength {

@@ -24,7 +24,10 @@ pub enum Error {
     /// A `.d750` file was malformed.
     #[error(transparent)]
     File(#[from] FileError),
-    /// The radio did not answer in time.
+    /// A transport write or reply-reading step exceeded its configured deadline.
+    ///
+    /// `operation` names the timed-out step. This does not establish radio
+    /// silence, zero delivered bytes, or that a requested change did not occur.
     #[error("{operation} timed out after {millis} ms")]
     Timeout {
         /// What was waited for.
@@ -85,16 +88,16 @@ pub enum ValidationError {
         /// Maximum accepted length.
         max: usize,
     },
-    /// The `FV` payload has a non-printable byte.
-    #[error("firmware identity byte 0x{value:02X} at offset {offset} is not printable ASCII")]
+    /// The `FV` payload contains a byte outside graphic ASCII (`0x21..=0x7E`).
+    #[error("firmware identity byte 0x{value:02X} at offset {offset} is not graphic ASCII")]
     InvalidFirmwareIdentityByte {
         /// Offset of the byte.
         offset: usize,
         /// The byte.
         value: u8,
     },
-    /// The `TY` payload is empty or contains a non-printable byte.
-    #[error("invalid TY radio-type payload {payload:?}; expected non-empty printable ASCII")]
+    /// The `TY` payload is empty or contains a byte outside graphic ASCII.
+    #[error("invalid TY radio-type payload {payload:?}; expected non-empty graphic ASCII")]
     InvalidRadioTypePayload {
         /// The rejected payload.
         payload: String,
@@ -198,6 +201,16 @@ pub enum ProtocolError {
     UnknownHeaderCommand {
         /// The byte.
         command: u8,
+    },
+    /// A supported MCP command appeared where a data or fill response was required.
+    ///
+    /// A read-request echo is valid header framing but not a completed page
+    /// response. The session remains recovery-required; no payload ACK or exit
+    /// is authorized by this error.
+    #[error("MCP page response command {command:?} is not Write or Fill")]
+    UnexpectedPageResponse {
+        /// The supported command found in the wrong response role.
+        command: crate::protocol::mcp::HeaderCommand,
     },
     /// The reply header did not echo the request.
     #[error("MCP reply header {actual:?} does not echo request {expected:?}")]

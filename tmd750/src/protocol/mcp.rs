@@ -36,42 +36,116 @@ pub const FILL: u8 = b'Z';
 /// Header length in bytes.
 pub const HEADER_LEN: usize = 5;
 
-/// A five-byte page header.
+/// One command supported by the five-byte MCP page header.
+///
+/// This identifies framing, not permission to issue an operation. The radio
+/// programming layer admits only its documented operations and regions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderCommand {
+    /// Host read request (`R`).
+    Read,
+    /// Host write request or radio data response (`W`).
+    Write,
+    /// Uniform-fill header (`Z`); high-level host fill is not exposed.
+    Fill,
+}
+
+impl HeaderCommand {
+    /// Exact command byte, without any terminator or payload.
+    #[must_use]
+    pub const fn as_byte(self) -> u8 {
+        match self {
+            Self::Read => READ,
+            Self::Write => WRITE,
+            Self::Fill => FILL,
+        }
+    }
+}
+
+impl TryFrom<u8> for HeaderCommand {
+    type Error = ProtocolError;
+
+    fn try_from(command: u8) -> Result<Self, Self::Error> {
+        match command {
+            READ => Ok(Self::Read),
+            WRITE => Ok(Self::Write),
+            FILL => Ok(Self::Fill),
+            _ => Err(ProtocolError::UnknownHeaderCommand { command }),
+        }
+    }
+}
+
+/// A supported command and one validated, in-image transfer page.
+///
+/// Private fields prevent constructing an unchecked length or command.
+/// [`Page::new`] admits only lengths `1..=256` whose complete address span is
+/// inside the image. Neither constructing nor decoding a header establishes
+/// writable-region policy, firmware qualification or a ready MCP session.
+///
+/// ```rust
+/// use kenwood_tmd750::protocol::mcp::{Header, HeaderCommand};
+/// use kenwood_tmd750::{Address, Page};
+///
+/// let address = Address::new(8)?;
+/// assert!(Page::new(address, 0).is_err());
+/// assert!(Page::new(address, 257).is_err());
+/// let page = Page::new(address, 256)?;
+/// let header = Header::new(HeaderCommand::Read, page);
+/// assert_eq!(header.encode(), [b'R', 0, 0, 8, 0]);
+/// assert_eq!(Header::decode(&header.encode())?, header);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
-    /// Command byte.
-    pub command: u8,
-    /// Page address.
-    pub address: Address,
-    /// Page length, 1..=256.
-    pub len: usize,
+    command: HeaderCommand,
+    page: Page,
 }
 
 impl Header {
-    /// Encode as `command, address[23:16], address[15:8], address[7:0], len (256 as 0)`.
+    /// Construct a header from validated framing components, without I/O.
     #[must_use]
-    pub fn encode(self) -> [u8; HEADER_LEN] {
-        let [_, high, middle, low] = self.address.as_u32().to_be_bytes();
-        let len = if self.len == PAGE_SIZE {
-            0
-        } else {
-            u8::try_from(self.len).unwrap_or(0)
-        };
-        [self.command, high, middle, low, len]
+    pub const fn new(command: HeaderCommand, page: Page) -> Self {
+        Self { command, page }
     }
 
-    /// Decode a header the radio sent.
+    /// The supported command carried by this header.
+    #[must_use]
+    pub const fn command(self) -> HeaderCommand {
+        self.command
+    }
+
+    /// Complete validated address span and byte count.
+    #[must_use]
+    pub const fn page(self) -> Page {
+        self.page
+    }
+
+    /// Encode as `command, address[23:16], address[15:8], address[7:0], len (256 as 0)`.
+    ///
+    /// Validation is retained by construction, so encoding cannot truncate an
+    /// out-of-domain address or silently reinterpret an invalid length.
+    #[must_use]
+    pub const fn encode(self) -> [u8; HEADER_LEN] {
+        let [_, high, middle, low] = self.page.address().as_u32().to_be_bytes();
+        // The validated 1..=256 domain uses its low byte: only 256 becomes 0.
+        let [len, ..] = self.page.len().to_le_bytes();
+        [self.command.as_byte(), high, middle, low, len]
+    }
+
+    /// Decode and validate an exact header, interpreting length byte zero as 256.
+    ///
+    /// Both host-request and radio-response command forms are accepted here.
+    /// The session checks the expected response command, address and length
+    /// separately before reading its payload.
     ///
     /// # Errors
     ///
     /// Returns [`ProtocolError::UnknownHeaderCommand`] for a command byte other
     /// than `R`, `W`, or `Z`, and [`ProtocolError::FieldParse`] when the
-    /// address leaves the image.
+    /// start address or complete page extends outside the image.
     pub fn decode(bytes: &[u8; HEADER_LEN]) -> Result<Self, ProtocolError> {
         let [command, high, middle, low, len] = *bytes;
-        if !matches!(command, READ | WRITE | FILL) {
-            return Err(ProtocolError::UnknownHeaderCommand { command });
-        }
+        let command = HeaderCommand::try_from(command)?;
         let raw = u32::from_be_bytes([0, high, middle, low]);
         let address = Address::new(raw).map_err(|error| ProtocolError::FieldParse {
             command: "MCP header",
@@ -83,34 +157,25 @@ impl Header {
         } else {
             usize::from(len)
         };
-        Ok(Self {
-            command,
-            address,
-            len,
-        })
+        let page = Page::new(address, len).map_err(|error| ProtocolError::FieldParse {
+            command: "MCP header",
+            field: "page",
+            detail: error.to_string(),
+        })?;
+        Ok(Self::new(command, page))
     }
 }
 
 /// The header for reading `page`.
 #[must_use]
-pub fn read_request(page: Page) -> [u8; HEADER_LEN] {
-    Header {
-        command: READ,
-        address: page.address(),
-        len: page.len(),
-    }
-    .encode()
+pub const fn read_request(page: Page) -> [u8; HEADER_LEN] {
+    Header::new(HeaderCommand::Read, page).encode()
 }
 
 /// The header for writing `page`; the data follows it on the wire.
 #[must_use]
-pub fn write_request(page: Page) -> [u8; HEADER_LEN] {
-    Header {
-        command: WRITE,
-        address: page.address(),
-        len: page.len(),
-    }
-    .encode()
+pub const fn write_request(page: Page) -> [u8; HEADER_LEN] {
+    Header::new(HeaderCommand::Write, page).encode()
 }
 
 /// One masked byte update inside a page.
@@ -367,14 +432,85 @@ mod tests {
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     #[test]
+    fn decoded_header_rejects_a_page_crossing_the_image_end() {
+        let [_, high, middle, low] = (crate::types::IMAGE_LENGTH_U32 - 1).to_be_bytes();
+        for command in [READ, WRITE, FILL] {
+            let result = Header::decode(&[command, high, middle, low, 2]);
+            assert!(
+                matches!(result, Err(ProtocolError::FieldParse { .. })),
+                "a valid start address cannot admit an out-of-image page: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn header_command_domain_and_image_boundary_are_exact() -> TestResult {
+        let last_address = Address::new(crate::types::IMAGE_LENGTH_U32 - 1)?;
+        let last_page = Page::new(last_address, 1)?;
+        for raw in u8::MIN..=u8::MAX {
+            let command = HeaderCommand::try_from(raw);
+            if matches!(raw, READ | WRITE | FILL) {
+                let command = command?;
+                assert_eq!(command.as_byte(), raw);
+                let header = Header::new(command, last_page);
+                assert_eq!(Header::decode(&header.encode())?, header);
+            } else {
+                assert!(
+                    matches!(command, Err(ProtocolError::UnknownHeaderCommand { command }) if command == raw),
+                    "unsupported command {raw} must preserve its diagnostic byte"
+                );
+            }
+        }
+        let [_, high, middle, low] = crate::types::IMAGE_LENGTH_U32.to_be_bytes();
+        assert!(matches!(
+            Header::decode(&[READ, high, middle, low, 1]),
+            Err(ProtocolError::FieldParse {
+                field: "address",
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn every_wire_length_preserves_the_complete_validated_page() -> TestResult {
+        let address = Address::new(8)?;
+        for len in 1..=PAGE_SIZE {
+            let page = Page::new(address, len)?;
+            for command in [
+                HeaderCommand::Read,
+                HeaderCommand::Write,
+                HeaderCommand::Fill,
+            ] {
+                let wire = Header::new(command, page).encode();
+                let decoded = Header::decode(&wire)?;
+                assert_eq!(decoded.command(), command);
+                assert_eq!(decoded.page(), page);
+                assert_eq!(decoded.encode(), wire);
+                assert_eq!(
+                    wire.last().copied() == Some(0),
+                    len == PAGE_SIZE,
+                    "only a full page uses the zero length byte"
+                );
+            }
+        }
+        for len in [0, PAGE_SIZE + 1, usize::MAX] {
+            assert!(
+                Page::new(address, len).is_err(),
+                "invalid length {len} cannot become a transfer page"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn headers_round_trip_with_256_as_zero() -> TestResult {
         let page = Page::new(Address::new(0x05_00_01)?, 256)?;
         let request = read_request(page);
         assert_eq!(request, [b'R', 0x05, 0x00, 0x01, 0x00]);
         let decoded = Header::decode(&request)?;
-        assert_eq!(decoded.command, READ);
-        assert_eq!(decoded.address.as_u32(), 0x05_00_01);
-        assert_eq!(decoded.len, 256);
+        assert_eq!(decoded.command(), HeaderCommand::Read);
+        assert_eq!(decoded.page(), page);
         let short = write_request(Page::new(Address::new(8)?, 40)?);
         assert_eq!(short, [b'W', 0x00, 0x00, 0x08, 40]);
         let unknown = Header::decode(&[b'Q', 0, 0, 0, 0]);
