@@ -164,6 +164,35 @@ impl ByteClaims {
     /// in this same batch. Empty batches are no-ops. A rejected batch leaves
     /// existing claims and their diagnostic ownership unchanged.
     ///
+    /// # Examples
+    ///
+    /// The first byte of a rejected batch must not survive its later conflict.
+    /// A subsequent valid request can claim that byte with another value.
+    ///
+    /// ```
+    /// use kenwood_schema::{ByteClaims, MaskedByte, PatchError};
+    ///
+    /// let mut claims = ByteClaims::new();
+    /// let lower = MaskedByte::new(8, 0x0F, 0x05)?;
+    /// claims.merge_atomic("lower", &[lower])?;
+    /// claims.merge_atomic("same request", &[lower])?;
+    /// let rejected = [
+    ///     MaskedByte::new(9, 0xFF, 0xAA)?,
+    ///     MaskedByte::new(8, 0x0F, 0x06)?,
+    /// ];
+    /// assert_eq!(claims.merge_atomic("rejected", &rejected), Err(PatchError::Conflict {
+    ///     owner: "rejected", existing: "lower", offset: 8, mask: 0x03,
+    /// }));
+    /// claims.merge_atomic("upper", &[MaskedByte::new(8, 0xF0, 0xA0)?])?;
+    /// claims.merge_atomic("replacement", &[MaskedByte::new(9, 0xFF, 0x55)?])?;
+    /// let merged: Vec<_> = claims.into_claims().collect();
+    /// assert_eq!(merged, [
+    ///     ("lower", MaskedByte::new(8, 0xFF, 0xA5)?),
+    ///     ("replacement", MaskedByte::new(9, 0xFF, 0x55)?),
+    /// ]);
+    /// # Ok::<(), PatchError>(())
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns [`PatchError::Conflict`] for differing overlapping bits.

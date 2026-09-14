@@ -115,6 +115,43 @@ pub enum BooleanDecoding {
 }
 
 /// Semantic boundary of a fixed-width padded string.
+///
+/// # Examples
+///
+/// A NUL followed by semantic data is malformed under exact padding. The
+/// first-terminator policy deliberately ignores that suffix, so decoding and
+/// re-encoding need not preserve the original stored bytes.
+///
+/// ```
+/// use kenwood_schema::{
+///     BooleanDecoding, CodecError, DecodeOptions, DecodedFieldValue, FieldCodec,
+///     StringEncoding, TextPolicy, ValueDomain,
+/// };
+///
+/// let codec = FieldCodec::FixedString {
+///     len: 4, encoding: StringEncoding::MemoryMap, padding: 0,
+/// };
+/// let stored = b"A\0B\0";
+/// let exact = DecodeOptions {
+///     domain: ValueDomain::Stored,
+///     boolean: BooleanDecoding::Canonical,
+///     text: TextPolicy::ExactPadding,
+/// };
+/// assert_eq!(codec.decode(stored, exact), Err(CodecError::FixedStringDataAfterNul {
+///     terminator_offset: 1, offset: 2, value: b'B',
+/// }));
+/// let decoded = codec.decode(stored, DecodeOptions {
+///     text: TextPolicy::FirstTerminator, ..exact
+/// })?;
+/// assert_eq!(decoded, DecodedFieldValue::Text("A".to_owned()));
+/// let encoded = codec.encode(
+///     decoded.as_field_value(), ValueDomain::Stored, TextPolicy::FirstTerminator,
+/// )?;
+/// let rewritten: Vec<_> = encoded.into_iter().map(|byte| byte.apply(0)).collect();
+/// assert_eq!(rewritten, b"A\0\0\0");
+/// assert_ne!(rewritten, stored);
+/// # Ok::<(), CodecError>(())
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextPolicy {
     /// Require exact round trips for accepted semantic text.
@@ -383,6 +420,9 @@ impl FieldCodec {
     ///
     /// No model-specific memory size is imposed. Declared numeric ranges must
     /// be ordered and representable even when interpreting stored values.
+    /// Any positive [`Self::FixedString`] or [`Self::Bytes`] length is valid
+    /// metadata; callers must separately bound [`Self::encoded_len`] for their
+    /// address space and allocation budget before encoding or decoding.
     ///
     /// # Errors
     ///
@@ -445,6 +485,9 @@ impl FieldCodec {
     /// This method neither searches an image nor ignores trailing bytes beyond
     /// the field span. Stored numeric values may exceed the writable range;
     /// metadata validity, exact length, and text validity are always enforced.
+    /// Text and raw-byte results allocate owned copies. Metadata validation
+    /// does not impose a resource cap; admit runtime-supplied lengths against
+    /// an application budget before calling this method.
     ///
     /// # Errors
     ///
@@ -527,6 +570,14 @@ impl FieldCodec {
     /// Writable encoding additionally enforces the declared numeric range.
     /// Booleans always encode canonically, and unowned bits are always zero.
     /// Every validation completes before any result is returned.
+    ///
+    /// # Allocation
+    ///
+    /// The result contains one [`MaskedByte`] per storage byte, including
+    /// string padding. [`Self::validate`] accepts any positive text or raw-byte
+    /// length, without an image-size or allocation limit. Callers must cap
+    /// runtime-supplied [`Self::encoded_len`] before encoding. These are ordinary
+    /// vector allocations; allocation failure is not a [`CodecError`].
     ///
     /// # Errors
     ///

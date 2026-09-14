@@ -26,6 +26,26 @@ pub enum ChoiceError {
 /// unsigned value must belong to every nonempty domain. Input order and
 /// duplicate entries do not change membership. No allocation is required.
 ///
+/// # Examples
+///
+/// A value accepted by only one domain is still rejected. Codec range checks
+/// remain separate from these finite catalog constraints.
+///
+/// ```
+/// use kenwood_schema::{ChoiceError, FieldValue, validate_choices};
+///
+/// let enumerated = [1, 3];
+/// let allowed = [3, 7];
+/// validate_choices(FieldValue::Unsigned(3), enumerated, &allowed)?;
+/// for value in [1, 7] {
+///     assert_eq!(
+///         validate_choices(FieldValue::Unsigned(value), enumerated, &allowed),
+///         Err(ChoiceError::DisallowedValue { value }),
+///     );
+/// }
+/// # Ok::<(), ChoiceError>(())
+/// ```
+///
 /// # Errors
 ///
 /// Returns [`ChoiceError::TypeMismatch`] for a non-unsigned constrained value,
