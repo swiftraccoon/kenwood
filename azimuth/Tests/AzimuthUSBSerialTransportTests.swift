@@ -7,6 +7,7 @@ import XCTest
 
 private final class AzimuthMockUSBLink: AzimuthUSBSerialLink, @unchecked Sendable {
     private let lock = NSLock()
+    private let onServicePresenceCheck: (@Sendable (Int) -> Void)?
     private var opened = false
     private var buffered: [UInt8] = []
     private var doorbell: (@Sendable (Bool) -> Void)?
@@ -35,6 +36,10 @@ private final class AzimuthMockUSBLink: AzimuthUSBSerialLink, @unchecked Sendabl
 
     var failArm = false
     var saveDoorbellOnClose = false
+
+    init(onServicePresenceCheck: (@Sendable (Int) -> Void)? = nil) {
+        self.onServicePresenceCheck = onServicePresenceCheck
+    }
 
     var backpressureResponses: Int {
         get { lock.withLock { remainingBackpressureResponses } }
@@ -132,10 +137,13 @@ private final class AzimuthMockUSBLink: AzimuthUSBSerialLink, @unchecked Sendabl
     }
 
     func servicePresent() -> Bool {
-        lock.withLock {
+        let (count, present) = lock.withLock {
             presenceChecks += 1
-            return serviceAvailable
+            return (presenceChecks, serviceAvailable)
         }
+        // Notify outside the lock so observers can safely inspect the mock.
+        onServicePresenceCheck?(count)
+        return present
     }
 
     func commServicePresent() -> Bool? {
@@ -447,16 +455,18 @@ final class AzimuthUSBSerialTransportTests: XCTestCase {
     }
 
     func testClosedServiceWaitCannotReopenOrClobberNewerConnection() async throws {
-        let link = AzimuthMockUSBLink()
+        let registrationWaitStarted = expectation(description: "registration wait started")
+        let link = AzimuthMockUSBLink { count in
+            if count == 2 { registrationWaitStarted.fulfill() }
+        }
         link.present = false
-        link.serviceRegistrationWaitNanoseconds = 400_000_000
+        link.serviceRegistrationWaitNanoseconds = 5_000_000_000
         let transport = AzimuthUSBSerialTransport(link: link)
         let staleOpen = Task { try await transport.open() }
 
-        for _ in 0..<1_000 {
-            if link.servicePresenceCheckCount >= 2 { break }
-            await Task.yield()
-        }
+        // The second check enters the registration loop. Actor isolation keeps
+        // close() queued until that open reaches its first suspension point.
+        await fulfillment(of: [registrationWaitStarted], timeout: 2)
         XCTAssertGreaterThanOrEqual(link.servicePresenceCheckCount, 2)
 
         await transport.close()
