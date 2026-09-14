@@ -9,7 +9,10 @@ concurrency:
   cancel-in-progress: false
 jobs:
   docs:
-    runs-on: ubuntu-latest
+    # Publish the real macOS Bluetooth API alongside portable APIs. A dependency
+    # is compiled without cfg(doc), so synthetic Linux-only documentation gates
+    # cannot make a macOS transport available across a crate boundary.
+    runs-on: macos-latest
     permissions:
       contents: read
       pages: write
@@ -19,16 +22,14 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.94.0
-      # sextant (our GUI D-STAR client) pulls in cpal → alsa-sys on
-      # Linux, which requires the ALSA development headers at build
-      # time. `--workspace` docs exercise the full dep graph, unlike
-      # the other workflows which build crates individually.
-      - name: Install Linux audio headers (alsa for cpal/sextant)
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       # Cargo.lock is intentionally gitignored; resolve it first so
       # rust-cache gets a stable, content-addressed key.
       - run: cargo generate-lockfile
       - uses: Swatinem/rust-cache@v2
+      # Keep library pages for packages whose binary shares the same rustdoc
+      # name. Explicit --lib --bins is useful for validation but makes those
+      # targets overwrite each other's published pages. Binary-only packages
+      # are still included by this workspace command.
       - name: cargo doc
         run: cargo doc --workspace --no-deps
         env:
@@ -54,6 +55,8 @@ jobs:
             <p>Other crates in this workspace:
               <a href="kenwood_schema/">kenwood-schema</a>,
               <a href="kenwood_transport/">kenwood-transport</a>,
+              <a href="kenwood_tmd750/">kenwood-tmd750</a>,
+              <a href="tmd750_repl/">tmd750-repl</a>,
               <a href="thd75_tui/">thd75-tui</a>,
               <a href="thd75_repl/">thd75-repl</a>,
               <a href="thd75_listen/">thd75-listen</a>,

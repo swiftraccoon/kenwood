@@ -47,6 +47,21 @@ jobs:
         working-directory: kenwood-transport
       - run: cargo test --no-default-features
         working-directory: kenwood-transport
+      # Native helper tests use local process and NSObject fixtures; they do
+      # not enumerate paired devices or open a radio. Consumer tests compile
+      # this dependency but do not execute its own native unit tests.
+      - name: Lint native Bluetooth without serial support
+        run: cargo clippy --all-targets --no-default-features --features native-bluetooth -- -D warnings
+        working-directory: kenwood-transport
+      - name: Test native Bluetooth without serial support
+        run: cargo test --no-default-features --features native-bluetooth
+        working-directory: kenwood-transport
+      - name: Lint transport with serial and native Bluetooth
+        run: cargo clippy --all-targets --all-features -- -D warnings
+        working-directory: kenwood-transport
+      - name: Test transport with serial and native Bluetooth
+        run: cargo test --all-features
+        working-directory: kenwood-transport
       - run: cargo clippy --all-targets -- -D warnings
         working-directory: thd75
       - run: cargo clippy --all-targets --no-default-features -- -D warnings
@@ -120,3 +135,25 @@ jobs:
         working-directory: dmr-rewind
       - run: cargo test
         working-directory: pulsar
+      # Render the actual native APIs on macOS. Private items expose internal
+      # links, and separate output trees keep feature variants independent.
+      - name: Check native-only transport documentation
+        run: cargo doc --no-deps --document-private-items --no-default-features --features native-bluetooth --lib
+        working-directory: kenwood-transport
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+          CARGO_TARGET_DIR: ../target/doc-transport-native
+      - name: Check combined serial and native transport documentation
+        run: cargo doc --no-deps --document-private-items --all-features --lib
+        working-directory: kenwood-transport
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+          CARGO_TARGET_DIR: ../target/doc-transport-all
+      # The REPL has no optional Cargo features. One explicit binary pass
+      # covers its macOS-native modules, which Linux cannot render.
+      - name: Check native TM-D750 REPL documentation
+        run: cargo doc --no-deps --document-private-items --bins
+        working-directory: tmd750-repl
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+          CARGO_TARGET_DIR: ../target/doc-tmd750-repl-native

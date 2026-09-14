@@ -126,6 +126,24 @@ jobs:
           RUSTDOCFLAGS: "-D warnings"
       # Check both public and private links before merge. Separate output
       # directories prevent feature variants from reusing rendered docs.
+      - name: Check isolated schema documentation
+        run: cargo doc --no-deps --document-private-items --lib
+        working-directory: kenwood-schema
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+          CARGO_TARGET_DIR: ../target/doc-schema
+      - name: Check transport documentation with serial support
+        run: cargo doc --no-deps --document-private-items --lib
+        working-directory: kenwood-transport
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+          CARGO_TARGET_DIR: ../target/doc-transport-default
+      - name: Check transport core documentation without optional backends
+        run: cargo doc --no-deps --document-private-items --no-default-features --lib
+        working-directory: kenwood-transport
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+          CARGO_TARGET_DIR: ../target/doc-transport-core
       - run: cargo doc --no-deps --document-private-items --lib
         working-directory: tmd750
         env:
@@ -146,25 +164,5 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D warnings"
           CARGO_TARGET_DIR: ../target/doc-tmd750-repl-all
-      - run: cargo fmt -- --check
-        working-directory: thd75
-      - run: cargo fmt -- --check
-        working-directory: thd75-tui
-      - run: cargo fmt -- --check
-        working-directory: dstar-gateway
-      - run: cargo fmt -- --check
-        working-directory: thd75-repl
-      - run: cargo fmt -- --check
-        working-directory: mbelib-rs
-      - run: cargo fmt -- --check
-        working-directory: stargazer
-      - run: cargo fmt -- --check
-        working-directory: dmr-rewind-core
-      - run: cargo fmt -- --check
-        working-directory: dmr-rewind
-      - run: cargo fmt -- --check
-        working-directory: pulsar
-      - run: cargo fmt -- --check
-        working-directory: tmd750
-      - run: cargo fmt -- --check
-        working-directory: tmd750-repl
+      - name: Check formatting across all workspace crates
+        run: cargo fmt --all -- --check

@@ -202,10 +202,13 @@ ci_pod() {
         done
         step "test +encoder"         cargo test -p mbelib-rs --features encoder
         step "test +kenwood"         cargo test -p mbelib-rs --features kenwood-tables
-        step "doc workspace"         env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+        # Render private items and explicitly select libraries and binaries,
+        # including same-name binaries Cargo otherwise omits. Distinct target
+        # directories keep default and all-feature rustdoc artifacts separate.
+        step "doc workspace"         env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --lib --bins --no-deps --document-private-items --target-dir target/doc-gate/default
         # Feature-gated modules carry doc comments the default pass never
         # renders, so their intra-doc links go unchecked without this.
-        step "doc all-features"      env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
+        step "doc all-features"      env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --lib --bins --no-deps --document-private-items --all-features --target-dir target/doc-gate/all-features
         step "audit"                 cargo audit --file Cargo.lock
         step "deny"                  cargo deny check
         # `--skip-target-dir`: the trybuild compile-fail suites (now that
