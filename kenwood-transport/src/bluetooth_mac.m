@@ -215,8 +215,9 @@ static double monotonic_seconds(void) {
 }
 
 // The selected-device opening policy uses the same clock and event processor
-// throughout its absolute budget. Tests substitute a deterministic runtime
-// without enumerating devices or initializing the Bluetooth framework.
+// throughout its absolute budget, and carries that event processor through
+// failure cleanup. Tests substitute a deterministic runtime without
+// enumerating devices or initializing the Bluetooth framework.
 typedef struct {
     double (*now)(void);
     SInt32 (*pump)(double seconds);
@@ -337,7 +338,8 @@ static int start_parent_liveness_watchdog(int fd) {
 }
 @end
 
-static BOOL destroy_rfcomm_context(RfcommContext *ctx) {
+static BOOL destroy_rfcomm_context_with_pump(RfcommContext *ctx,
+                                            SInt32 (*pump)(double seconds)) {
     if (!ctx) return YES;
 
     // A healthy helper owns the channel until close completion. Pumping the
@@ -353,7 +355,7 @@ static BOOL destroy_rfcomm_context(RfcommContext *ctx) {
         bt_trace("RFCOMM close begin");
         [ctx->channel closeChannel];
         for (int attempt = 0; attempt < 50 && !ctx->close_observed; attempt++) {
-            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.01, false);
+            pump(0.01);
         }
         close_completed = ctx->close_observed;
         bt_trace("RFCOMM close end state=%d confirmed=%d", ctx->state, close_completed);
@@ -383,9 +385,16 @@ static BOOL destroy_rfcomm_context(RfcommContext *ctx) {
     return close_completed;
 }
 
-static RfcommContext *fail_open(RfcommContext *ctx, int stage, int *failure) {
+static BOOL destroy_rfcomm_context(RfcommContext *ctx) {
+    // Live owners retain the identical real run-loop cleanup policy; only
+    // no-radio fixtures substitute a counted, nonblocking event processor.
+    return destroy_rfcomm_context_with_pump(ctx, pump_open_events);
+}
+
+static RfcommContext *fail_open(RfcommContext *ctx, int stage, int *failure,
+                               const NativeOpenRuntime *runtime) {
     *failure = stage;
-    destroy_rfcomm_context(ctx);
+    destroy_rfcomm_context_with_pump(ctx, runtime->pump);
     return NULL;
 }
 
@@ -448,8 +457,18 @@ static IOReturn begin_rfcomm_channel(id device, RfcommContext *ctx,
 static BOOL g_cleanup_test_may_deallocate = NO;
 static unsigned g_cleanup_test_deallocations = 0;
 static unsigned g_cleanup_test_closes = 0;
+static unsigned g_cleanup_test_pumps = 0;
+static BOOL g_cleanup_test_invalid_pump = NO;
 static BOOL g_cleanup_test_deliver_close = YES;
 static BOOL g_cleanup_test_detach_delegate = YES;
+
+// Ownership assertions must not depend on real run-loop scheduling. Exercise
+// the same cleanup loop, counting its exact requested slices without waiting.
+static SInt32 cleanup_test_pump(double seconds) {
+    g_cleanup_test_pumps++;
+    g_cleanup_test_invalid_pump |= seconds != 0.01 || g_cleanup_test_closes != 1;
+    return kCFRunLoopRunTimedOut;
+}
 
 @interface CleanupTestChannel : NSObject {
     __weak id _delegate;
@@ -499,6 +518,8 @@ static int test_pending_open_cleanup(BOOL deliver_close, BOOL detach_delegate) {
     g_cleanup_test_may_deallocate = NO;
     g_cleanup_test_deallocations = 0;
     g_cleanup_test_closes = 0;
+    g_cleanup_test_pumps = 0;
+    g_cleanup_test_invalid_pump = NO;
     g_cleanup_test_deliver_close = deliver_close;
     g_cleanup_test_detach_delegate = detach_delegate;
     BOOL closed = NO;
@@ -514,9 +535,11 @@ static int test_pending_open_cleanup(BOOL deliver_close, BOOL detach_delegate) {
         if (begin_rfcomm_channel(device, ctx, 2) != kIOReturnSuccess) return 95;
         observed_channel = ctx->channel;
         observed_delegate = ctx->delegate;
-        closed = destroy_rfcomm_context(ctx);
+        closed = destroy_rfcomm_context_with_pump(ctx, cleanup_test_pump);
         g_cleanup_test_may_deallocate = YES;
     }
+    if (g_cleanup_test_invalid_pump ||
+        g_cleanup_test_pumps != (deliver_close ? 0 : 50)) return 98;
     if (!deliver_close || !detach_delegate) {
         if (g_unconfirmed_close) {
             // A queued late callback still targets a live delegate, but its
@@ -596,7 +619,10 @@ static RfcommContext *open_rfcomm(const char *device_identifier,
         *failure = 71;
         NSString *identifier = [NSString
             stringWithUTF8String:device_identifier];
-        if (!identifier) return fail_open(NULL, BT_HELPER_EXIT_CONTEXT_ALLOCATION, failure);
+        if (!identifier) {
+            return fail_open(NULL, BT_HELPER_EXIT_CONTEXT_ALLOCATION,
+                             failure, &kNativeOpenRuntime);
+        }
         int exact_address_selector =
             device_identifier_is_exact_address(device_identifier);
         IOBluetoothDevice *device = nil;
@@ -645,15 +671,15 @@ static RfcommContext *open_selected_device(IOBluetoothDevice *device,
                                            const NativeOpenRuntime *runtime) {
     @autoreleasepool {
         if (!process_startup_events(open_deadline, runtime)) {
-            return fail_open(NULL, BT_HELPER_EXIT_STARTUP_DEADLINE, failure);
+            return fail_open(NULL, BT_HELPER_EXIT_STARTUP_DEADLINE, failure, runtime);
         }
         RfcommContext *ctx = calloc(1, sizeof(RfcommContext));
-        if (!ctx) return fail_open(NULL, BT_HELPER_EXIT_CONTEXT_ALLOCATION, failure);
+        if (!ctx) return fail_open(NULL, BT_HELPER_EXIT_CONTEXT_ALLOCATION, failure, runtime);
         ctx->state = 0;
         ctx->output_fd = -1;
         ctx->device = device;
         ctx->delegate = [[RfcommDelegate alloc] init];
-        if (!ctx->delegate) return fail_open(ctx, BT_HELPER_EXIT_CONTEXT_ALLOCATION, failure);
+        if (!ctx->delegate) return fail_open(ctx, BT_HELPER_EXIT_CONTEXT_ALLOCATION, failure, runtime);
         ctx->delegate.ctx = ctx;
 
         // A connected baseband is valid and may be shared by other Bluetooth
@@ -666,7 +692,7 @@ static RfcommContext *open_selected_device(IOBluetoothDevice *device,
         // proves that the framework will accept the next operation.
         SdpQueryDelegate *sdp = resolve_serial_port ? [[SdpQueryDelegate alloc] init] : nil;
         if (resolve_serial_port && !sdp) {
-            return fail_open(ctx, BT_HELPER_EXIT_CONTEXT_ALLOCATION, failure);
+            return fail_open(ctx, BT_HELPER_EXIT_CONTEXT_ALLOCATION, failure, runtime);
         }
         if (sdp) {
             sdp->device = device;
@@ -674,13 +700,13 @@ static RfcommContext *open_selected_device(IOBluetoothDevice *device,
             g_pending_sdp = sdp;
         }
         if (runtime->now() >= open_deadline) {
-            return fail_open(ctx, BT_HELPER_EXIT_STARTUP_DEADLINE, failure);
+            return fail_open(ctx, BT_HELPER_EXIT_STARTUP_DEADLINE, failure, runtime);
         }
         IOReturn query_result = [device performSDPQuery:sdp];
         bt_trace("SDP start status=0x%08x connected=%d",
                  (unsigned)query_result, [device isConnected]);
         if (query_result != kIOReturnSuccess) {
-            return fail_open(ctx, BT_HELPER_EXIT_SDP_START, failure);
+            return fail_open(ctx, BT_HELPER_EXIT_SDP_START, failure, runtime);
         }
         while (resolve_serial_port ? sdp->state == 0 : ![device isConnected]) {
             double remaining = open_deadline - runtime->now();
@@ -691,7 +717,7 @@ static RfcommContext *open_selected_device(IOBluetoothDevice *device,
             sdp ? sdp->state : 0, runtime->now() >= open_deadline);
         if (sdp_failure != 0) {
             bt_trace("SDP failed stage=%d connected=%d", sdp_failure, [device isConnected]);
-            return fail_open(ctx, sdp_failure, failure);
+            return fail_open(ctx, sdp_failure, failure, runtime);
         }
 
         if (resolve_serial_port) {
@@ -701,30 +727,30 @@ static RfcommContext *open_selected_device(IOBluetoothDevice *device,
                 BluetoothRFCOMMChannelID resolved = 0;
                 if ([record getRFCOMMChannelID:&resolved] != kIOReturnSuccess ||
                     resolved < 1 || resolved > 30) {
-                    return fail_open(ctx, BT_HELPER_EXIT_SERVICE_RESOLUTION, failure);
+                    return fail_open(ctx, BT_HELPER_EXIT_SERVICE_RESOLUTION, failure, runtime);
                 }
                 rfcomm_channel = resolved;
                 matches++;
             }
             if (matches != 1) {
                 bt_trace("Serial Port SDP requires one record, got %lu", (unsigned long)matches);
-                return fail_open(ctx, BT_HELPER_EXIT_SERVICE_RESOLUTION, failure);
+                return fail_open(ctx, BT_HELPER_EXIT_SERVICE_RESOLUTION, failure, runtime);
             }
         }
         if (runtime->now() >= open_deadline) {
-            return fail_open(ctx, BT_HELPER_EXIT_SDP_DEADLINE, failure);
+            return fail_open(ctx, BT_HELPER_EXIT_SDP_DEADLINE, failure, runtime);
         }
 
         bt_trace("RFCOMM open requested device=%s channel=%u",
                  device.addressString.UTF8String, rfcomm_channel);
         if (runtime->now() >= open_deadline) {
-            return fail_open(ctx, BT_HELPER_EXIT_SDP_DEADLINE, failure);
+            return fail_open(ctx, BT_HELPER_EXIT_SDP_DEADLINE, failure, runtime);
         }
         IOReturn result = begin_rfcomm_channel(device, ctx, rfcomm_channel);
         if (result != kIOReturnSuccess) {
             bt_trace("RFCOMM open start failed status=0x%08x",
                      (unsigned)result);
-            return fail_open(ctx, BT_HELPER_EXIT_RFCOMM_START, failure);
+            return fail_open(ctx, BT_HELPER_EXIT_RFCOMM_START, failure, runtime);
         }
 
         while (ctx->state == 0) {
@@ -737,7 +763,7 @@ static RfcommContext *open_selected_device(IOBluetoothDevice *device,
             ctx->channel && [ctx->channel getChannelID] == rfcomm_channel);
         if (rfcomm_failure != 0) {
             bt_trace("RFCOMM open failed stage=%d state=%d", rfcomm_failure, ctx->state);
-            return fail_open(ctx, rfcomm_failure, failure);
+            return fail_open(ctx, rfcomm_failure, failure, runtime);
         }
 
         return ctx;

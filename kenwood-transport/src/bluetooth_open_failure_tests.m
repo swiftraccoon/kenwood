@@ -5,10 +5,16 @@ static double g_failure_fixture_time;
 static BOOL g_failure_fixture_confirm_close;
 static unsigned g_failure_fixture_opens;
 static unsigned g_failure_fixture_closes;
+static unsigned g_failure_fixture_cleanup_pumps;
+static BOOL g_failure_fixture_invalid_cleanup_slice;
 
 static double failure_fixture_now(void) { return g_failure_fixture_time; }
 static SInt32 failure_fixture_pump(double seconds) {
-    (void)seconds;
+    if (g_failure_fixture_closes != 0) {
+        g_failure_fixture_cleanup_pumps++;
+        g_failure_fixture_invalid_cleanup_slice |= seconds != 0.01;
+        return kCFRunLoopRunTimedOut;
+    }
     g_failure_fixture_time = g_failure_fixture_opens ? 1.0 : 0.05;
     return kCFRunLoopRunTimedOut;
 }
@@ -64,6 +70,8 @@ static int test_open_failure_cleanup(BOOL confirm_close) {
     g_failure_fixture_confirm_close = confirm_close;
     g_failure_fixture_opens = 0;
     g_failure_fixture_closes = 0;
+    g_failure_fixture_cleanup_pumps = 0;
+    g_failure_fixture_invalid_cleanup_slice = NO;
     const NativeOpenRuntime runtime = {
         .now = failure_fixture_now,
         .pump = failure_fixture_pump,
@@ -77,6 +85,8 @@ static int test_open_failure_cleanup(BOOL confirm_close) {
         if (ctx) { destroy_rfcomm_context(ctx); return 120; }
         if (failure != BT_HELPER_EXIT_RFCOMM_DEADLINE ||
             g_failure_fixture_opens != 1 || g_failure_fixture_closes != 1 ||
+            g_failure_fixture_invalid_cleanup_slice ||
+            g_failure_fixture_cleanup_pumps != (confirm_close ? 0 : 50) ||
             (g_unconfirmed_close != NULL) == confirm_close) return 121;
     }
     return report_failed_open(failure);
