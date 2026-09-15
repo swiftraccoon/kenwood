@@ -182,6 +182,8 @@ pub(crate) fn runtime_recovery(parent: &Path) -> AppResult<Recovery> {
         &endpoints()?,
         Arc::new(AtomicBool::new(false)),
         Some(&parent.join("runtime-recovery")),
+        // Only directory durability is synthetic; recovery file I/O stays real.
+        |_| Ok(()),
     )?;
     Ok(recovery)
 }
@@ -207,6 +209,8 @@ impl Harness {
             &endpoints,
             Arc::clone(&cancelled),
             Some(&directory.path().join("startup")),
+            // Only directory durability is synthetic; recovery file I/O stays real.
+            |_| Ok(()),
         )?;
         Ok(Self {
             _directory: directory,
@@ -287,6 +291,152 @@ impl Harness {
             .owners
             .push_back(self.connection("verify-restore", cat(gateway)));
     }
+}
+
+#[test]
+fn reservation_synchronizes_created_entries_before_the_parent() -> TestResult {
+    let temporary = tempfile::tempdir()?;
+    let directory = temporary.path().join("startup");
+    let mut synchronized = Vec::new();
+    let (mut recovery, mut transcript) = reserve_at(
+        &endpoints()?,
+        Arc::new(AtomicBool::new(false)),
+        Some(&directory),
+        |path| {
+            assert!(path.is_dir());
+            for name in [
+                "report.json",
+                "transcript.jsonl",
+                "journal.jsonl",
+                "restore-transcript.jsonl",
+                "before-restore-readiness.jsonl",
+                "restore-readiness.jsonl",
+                "restore-verification.jsonl",
+            ] {
+                assert!(
+                    directory.join(name).is_file(),
+                    "{name} must exist before sync"
+                );
+            }
+            synchronized.push(path.to_path_buf());
+            Ok(())
+        },
+    )?;
+    assert_eq!(synchronized, [directory, temporary.path().to_path_buf()]);
+    // The injected directory boundary does not replace real file synchronization.
+    transcript.synchronize()?;
+    recovery.publish()?;
+    Ok(())
+}
+
+#[test]
+fn directory_synchronization_normalizes_an_empty_relative_parent() -> TestResult {
+    for (directory, parent) in [("startup", "."), ("captures/startup", "captures")] {
+        let mut synchronized = Vec::new();
+        synchronize_directories(Path::new(directory), |path| {
+            synchronized.push(path.to_path_buf());
+            Ok(())
+        })?;
+        assert_eq!(
+            synchronized,
+            [PathBuf::from(directory), PathBuf::from(parent)]
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("fixture directory synchronization failed for {path:?}")]
+struct DirectorySyncFailure {
+    path: PathBuf,
+}
+
+#[test]
+fn reservation_stops_at_each_directory_sync_failure_and_preserves_its_cause() -> TestResult {
+    for failed_boundary in 0..2 {
+        let temporary = tempfile::tempdir()?;
+        let directory = temporary.path().join("startup");
+        let expected = [directory.clone(), temporary.path().to_path_buf()];
+        let mut synchronized = Vec::new();
+        let error = reserve_at(
+            &endpoints()?,
+            Arc::new(AtomicBool::new(false)),
+            Some(&directory),
+            |path| {
+                synchronized.push(path.to_path_buf());
+                if synchronized.len() == failed_boundary + 1 {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        DirectorySyncFailure {
+                            path: path.to_path_buf(),
+                        },
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .err()
+        .ok_or("failed directory synchronization admitted startup")?;
+        assert_eq!(
+            Some(synchronized.as_slice()),
+            expected.get(..=failed_boundary)
+        );
+        let error = error
+            .downcast_ref::<io::Error>()
+            .ok_or("directory synchronization lost the I/O error")?;
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        let cause = error
+            .get_ref()
+            .and_then(|cause| cause.downcast_ref::<DirectorySyncFailure>())
+            .ok_or("directory synchronization lost the original cause")?;
+        assert_eq!(Some(&cause.path), expected.get(failed_boundary));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_reservation_uses_real_directory_synchronization() -> TestResult {
+    let temporary = tempfile::tempdir()?;
+    let directory = temporary.path().join("startup");
+    let (mut recovery, mut transcript) = reserve_at(
+        &endpoints()?,
+        Arc::new(AtomicBool::new(false)),
+        Some(&directory),
+        synchronize_directory,
+    )?;
+    transcript.synchronize()?;
+    recovery.publish()?;
+    assert_eq!(recovery.directory, directory);
+    let error = synchronize_directory(&temporary.path().join("missing"))
+        .err()
+        .ok_or("real directory synchronization accepted a missing path")?;
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    Ok(())
+}
+
+#[cfg(not(unix))]
+#[test]
+fn unsupported_directory_provider_cannot_admit_a_real_reservation() -> TestResult {
+    let temporary = tempfile::tempdir()?;
+    let error = synchronize_directory(temporary.path())
+        .err()
+        .ok_or("unsupported directory synchronization succeeded")?;
+    assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    let error = reserve_at(
+        &endpoints()?,
+        Arc::new(AtomicBool::new(false)),
+        Some(&temporary.path().join("startup")),
+        synchronize_directory,
+    )
+    .err()
+    .ok_or("unsupported directory synchronization admitted startup")?;
+    assert_eq!(
+        error.downcast_ref::<io::Error>().map(io::Error::kind),
+        Some(io::ErrorKind::Unsupported)
+    );
+    Ok(())
 }
 
 fn identity_script() -> MockTransport {

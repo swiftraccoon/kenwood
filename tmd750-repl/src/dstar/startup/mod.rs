@@ -10,7 +10,7 @@ pub(super) mod tests;
 
 use std::fs::File;
 use std::future::Future;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -412,13 +412,46 @@ fn reserve(
     endpoints: &Endpoints,
     cancelled: Arc<AtomicBool>,
 ) -> AppResult<(Recovery, Recorder<File>)> {
-    reserve_at(endpoints, cancelled, None)
+    reserve_at(endpoints, cancelled, None, synchronize_directory)
 }
 
+/// Synchronize an actual directory entry, never a synthetic success fallback.
+#[cfg(unix)]
+fn synchronize_directory(directory: &Path) -> io::Result<()> {
+    File::open(directory)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn synchronize_directory(_directory: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "automatic Terminal startup requires Unix directory synchronization",
+    ))
+}
+
+/// Persist child entries before their containing directory's parent entry.
+fn synchronize_directories(
+    directory: &Path,
+    mut synchronize: impl FnMut(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    synchronize(directory)?;
+    synchronize(
+        directory
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new(".")),
+    )
+}
+
+/// Reserve real capture files with an explicit directory-durability boundary.
+///
+/// Production supplies the platform provider. Offline workflow fixtures may
+/// supply synthetic directory synchronization without replacing file I/O.
 fn reserve_at(
     endpoints: &Endpoints,
     cancelled: Arc<AtomicBool>,
     requested: Option<&Path>,
+    synchronize: impl FnMut(&Path) -> io::Result<()>,
 ) -> AppResult<(Recovery, Recorder<File>)> {
     let Artifacts {
         directory,
@@ -466,15 +499,7 @@ fn reserve_at(
     recovery.before_restore_readiness = Some(recovery.recorder("before-restore-readiness.jsonl")?);
     recovery.restore_readiness = Some(recovery.recorder("restore-readiness.jsonl")?);
     recovery.restore_verification = Some(recovery.recorder("restore-verification.jsonl")?);
-    File::open(&recovery.directory)?.sync_all()?;
-    File::open(
-        recovery
-            .directory
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new(".")),
-    )?
-    .sync_all()?;
+    synchronize_directories(&recovery.directory, synchronize)?;
     output::line(format_args!(
         "D-STAR startup and recovery capture: {}.",
         recovery.directory.display()
@@ -503,7 +528,7 @@ pub(super) async fn finish_on_interrupt<F, S>(
 ) -> (F::Output, Option<Failure>)
 where
     F: Future,
-    S: Future<Output = std::io::Result<()>>,
+    S: Future<Output = io::Result<()>>,
 {
     tokio::pin!(operation);
     let (result, interrupt) = tokio::select! {
