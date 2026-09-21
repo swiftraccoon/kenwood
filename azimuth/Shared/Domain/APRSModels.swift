@@ -188,8 +188,8 @@ struct APRSOperationalState: Equatable, Sendable {
 protocol APRSControlling: AnyObject {
     var currentAPRSState: APRSOperationalState { get }
     var aprsUpdates: AsyncStream<APRSOperationalState> { get }
-    /// Whether the current authenticated CAT owner can perform the explicitly
-    /// approved Menu 983/Menu 506/Menu 650 recovery retained by a refused start.
+    /// Whether the current authenticated CAT owner can perform the Menu 983,
+    /// Menu 506 and Menu 650 recovery retained by a refused start.
     var automaticAPRSDVGatewayRecoveryAvailable: Bool { get }
 
     func startAPRS(_ configuration: APRSSessionConfiguration) async throws

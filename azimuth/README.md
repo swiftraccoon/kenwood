@@ -65,7 +65,7 @@ Kenwood TH-D75.
   route every virtual key through the firmware's one-use full-frame guard.
 - **APRS operations.** Own the KISS session, configure packet parameters,
   continuously drain and decode received AX.25, and retain counters, a packet
-  journal, heard stations, a map, and raw-frame evidence. A blank callsign keeps
+  journal, heard stations, a map, and the raw frames. A blank callsign keeps
   the session receive-only. Message and manual-position transmission are
   explicit, confirmed, one-shot operations; periodic SmartBeaconing and message
   acknowledgement retry/correlation are not implemented.
@@ -141,8 +141,9 @@ Starting APRS consumes one reviewed settings snapshot that proves Menu 983
 routes KISS to the selected USB-C or Bluetooth control link and that Menu 506
 contains a valid Band A or Band B selection. Packet speed remains a separate
 KISS setting. A route mismatch or invalid TNC band stops before packet-mode
-entry. If the radio then refuses KISS in its current mode, Azimuth can offer a
-separately approved, same-radio inspection of Menu 983, Menu 506, and Menu 650;
+entry. If the radio then refuses KISS in its current mode, Azimuth can offer,
+behind a second confirmation, a same-radio inspection of Menu 983, Menu 506,
+and Menu 650;
 it changes Menu 650 only when needed and retries once with the freshly verified
 band.
 

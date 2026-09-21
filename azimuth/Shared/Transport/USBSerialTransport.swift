@@ -548,9 +548,9 @@ public actor AzimuthUSBSerialTransport: AzimuthRadioTransport {
         updateState(.disconnected)
     }
 
-    /// Emits the diagnostics that previously lived only in
-    /// `diagnosticsReport()` into unified logging, where an attached Xcode can
-    /// display them during a real iPad connection attempt.
+    /// Emits the `diagnosticsReport()` diagnostics into unified logging,
+    /// where an attached Xcode can display them during a real iPad
+    /// connection attempt.
     private func emitDiagnosticSnapshot(context: String, includeDriverDetails: Bool) {
         let dataPresent = link.servicePresent()
         let controlPresent = link.commServicePresent()
