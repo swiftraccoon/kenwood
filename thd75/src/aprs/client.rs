@@ -485,7 +485,7 @@ pub struct AprsClientConfig {
     /// `None` is fail-closed: RF-to-IS remains available, but Internet
     /// packets are never transmitted on RF.
     igate_to_rf: Option<IGateToRfConfig>,
-    /// Automatically acknowledge incoming messages addressed to us.
+    /// Automatically acknowledge incoming messages addressed to the local station.
     /// Default: `true`.
     auto_ack: bool,
     /// Digipeater path for outgoing packets.
@@ -494,7 +494,7 @@ pub struct AprsClientConfig {
     /// path for direct transmission with no digipeating. Parse from
     /// a string with [`crate::aprs::parse_digipeater_path`].
     digipeater_path: DigipeaterPath,
-    /// Automatically respond to `?APRSP` position queries addressed to us.
+    /// Automatically respond to `?APRSP` position queries addressed to the local station.
     ///
     /// When set and an incoming message contains `?APRSP`, the client
     /// sends a position beacon in response. Requires
@@ -842,7 +842,7 @@ impl AprsClientConfigBuilder {
         self
     }
 
-    /// Whether to auto-ack incoming messages addressed to us.
+    /// Whether to auto-ack incoming messages addressed to the local station.
     #[must_use]
     pub const fn auto_ack(mut self, on: bool) -> Self {
         self.auto_ack = on;
@@ -960,7 +960,7 @@ pub enum AprsEvent {
     /// A new or updated station was heard. Contains the station's
     /// current state after applying the received packet.
     StationHeard(StationEntry),
-    /// An APRS message addressed to us was received.
+    /// An APRS message addressed to the local station was received.
     MessageReceived(AprsMessage),
     /// A previously sent message was acknowledged by the remote station.
     MessageDelivered(MessageId),
@@ -983,7 +983,7 @@ pub enum AprsEvent {
         /// Full report, including its mandatory UTC timestamp.
         report: AprsPositionlessWeatherReport,
     },
-    /// A packet was digipeated (relayed) by our station.
+    /// A packet was digipeated (relayed) by the local station.
     PacketDigipeated {
         /// Original source callsign.
         source: String,
@@ -1204,8 +1204,8 @@ impl<T: Transport> AprsClient<T> {
     /// 2. Expire messages that have exhausted all retries.
     /// 3. Attempt to receive a KISS frame (short timeout).
     /// 4. If received: parse AX.25, parse APRS data, update station list.
-    /// 5. If it is a message addressed to us and `auto_ack` is on, send ack.
-    /// 6. If digipeater is configured, check whether we should relay.
+    /// 5. If it is a message addressed to the local station and `auto_ack` is on, send ack.
+    /// 6. If digipeater is configured, check whether to relay.
     /// 7. Return the appropriate [`AprsEvent`].
     ///
     /// Returns `Ok(None)` when no activity occurs within the poll
@@ -2210,7 +2210,7 @@ impl<T: Transport> AprsClient<T> {
     // Internal helpers
     // -----------------------------------------------------------------------
 
-    /// Handle an incoming APRS message addressed to us.
+    /// Handle an incoming APRS message addressed to the local station.
     async fn handle_incoming_message(
         &mut self,
         msg: &AprsMessage,

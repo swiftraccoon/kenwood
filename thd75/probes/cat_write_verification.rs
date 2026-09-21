@@ -1,4 +1,4 @@
-//! Verify CAT WRITE commands work by sending through our library's serialize().
+//! Verify CAT WRITE commands work by sending through the library's serialize().
 //! Tests: set value → read back → verify change → restore original.
 //!
 //! Run: cargo test --test cat_write_verification -- --ignored --nocapture --test-threads=1

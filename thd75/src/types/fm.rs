@@ -32,9 +32,9 @@
 //! - When FM Radio mode is on, Menu No. 105, 134, 200, 203, 204, 210,
 //!   and 220 cannot be accessed.
 //!
-//! The FM radio state is readable through the FR CAT command. Retained
-//! hardware evidence rejects FR writes, so changes use Menu 700's exact MCP
-//! cell through `Radio::set_fm_radio_via_mcp`. FM memory channels are managed
+//! The FM radio state is readable through the FR CAT command. The radio
+//! answers `N` to FR writes, so changes use Menu 700's exact MCP cell through
+//! `Radio::set_fm_radio_via_mcp`. FM memory channels are managed
 //! through the radio's menu system or MCP software; no CAT command programs
 //! an individual FM memory channel.
 //!

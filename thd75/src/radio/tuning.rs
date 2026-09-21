@@ -1,8 +1,8 @@
 //! High-level memory-recall APIs.
 //!
 //! Memory recall handles tuning-mode switching automatically. The crate
-//! deliberately exposes no arbitrary-frequency writer: retained evidence does
-//! not qualify the complete FO record's write and read-back behavior.
+//! deliberately exposes no arbitrary-frequency writer: the complete FO
+//! record's write and read-back behavior is not verified on hardware.
 
 use crate::error::{Error, ProtocolError};
 use crate::types::{Band, ChannelDisplayName, Frequency, RegularChannel, StepSize, TuningMode};
@@ -54,8 +54,8 @@ impl<T: Transport> Radio<T> {
     /// be in VFO tuning mode (so a selected memory, call, or weather channel
     /// is never changed), and then walks to the target one step at a time.
     /// Every step is verified by a frequency readback before the next step
-    /// is sent. Hardware-observed (live radio, 2026-08-09): the radio
-    /// acknowledges rapid consecutive step commands but can swallow all
+    /// is sent. On hardware, the radio acknowledges rapid consecutive step
+    /// commands but can swallow all
     /// except the last, so a fire-and-forget burst lands short; the verified
     /// walk retries a swallowed step and fails closed after
     /// [`MAX_RETUNE_STALLS`] consecutive steps with no movement.

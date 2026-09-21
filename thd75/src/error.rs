@@ -123,20 +123,20 @@ pub enum Error {
         mnemonic: String,
     },
 
-    /// A same-session MCP precondition proved that Menu 983 routes KISS to a
-    /// different host interface. The guarded operation performed zero writes.
+    /// A same-session MCP read found Menu 983 routing KISS to a host interface
+    /// other than the requested one. The guarded operation performed zero writes.
     #[error(
-        "Menu 983 routes KISS to raw interface {actual}, not the approved {expected} interface; no setting was changed"
+        "Menu 983 routes KISS to raw interface {actual}, not the requested {expected} interface; no setting was changed"
     )]
     KissInterfaceMismatch {
-        /// Host interface approved by the caller.
+        /// Host interface the caller requested.
         expected: crate::types::PcOutputInterface,
         /// Live raw Menu 983 value read in the guarded MCP transaction.
         actual: u8,
     },
 
-    /// A same-session MCP read proved that Menu 506 is outside the strict A/B
-    /// domain. The guarded operation performed zero writes.
+    /// A same-session MCP read found Menu 506 outside the strict A/B domain.
+    /// The guarded operation performed zero writes.
     #[error("Menu 506 has invalid raw TNC data band {actual}; no setting was changed")]
     InvalidTncDataBand {
         /// Live raw Menu 506 value read in the guarded MCP transaction.
@@ -144,7 +144,7 @@ pub enum Error {
     },
 
     /// A mode write returned a semantic rejection and its required readback
-    /// also failed, so the resulting radio state could not be proved.
+    /// also failed, so the resulting radio state is unknown.
     #[error(
         "operating-mode write for band {band} requested {requested} and returned {rejection}; \
          immediate readback also failed: {readback}"
@@ -188,10 +188,10 @@ pub enum Error {
     CatRecoveryRequired,
 
     /// A caller attempted to wrap a CAT-ready transport as a binary session
-    /// without first proving or completing the corresponding mode transition.
+    /// before a mode transition or a binary link diagnosis completed on it.
     #[error(
-        "binary mode has not been proved on this link; complete an owned mode transition or a \
-         successful binary link diagnosis first"
+        "no complete binary-mode exchange has succeeded on this link; complete a mode transition \
+         or a binary link diagnosis first"
     )]
     BinaryModeNotProven,
 
@@ -298,22 +298,22 @@ pub enum Error {
 
     /// The radio answered an MCP exit command with a byte other than ACK.
     ///
-    /// The exit was not confirmed, so the programming session remains in
-    /// an unknown state until CAT operation is independently proved or the
-    /// radio is recovered.
+    /// The exit was not confirmed, so the programming session remains in an
+    /// unknown state until a CAT exchange succeeds on a fresh connection or
+    /// the radio is recovered.
     #[error("MCP exit not acknowledged (expected ACK 0x06, got 0x{got:02X})")]
     McpExitNotAcknowledged {
         /// The byte received instead of ACK.
         got: u8,
     },
 
-    /// MCP cleanup failed and normal CAT operation was not proved.
+    /// MCP cleanup failed and normal CAT operation is unconfirmed.
     ///
     /// The radio may still be in programming mode, or its USB reset may not
     /// have completed. Retrying MCP or sending CAT commands is unsafe until
     /// the radio has been fully power-cycled.
     #[error(
-        "MCP cleanup failed: {cleanup}; normal CAT restoration was not proved; \
+        "MCP cleanup failed: {cleanup}; normal CAT restoration is unconfirmed; \
          fully power-cycle the radio before retrying"
     )]
     McpCleanupNotProved {
@@ -371,7 +371,7 @@ pub enum Error {
     )]
     McpInterrupted,
 
-    /// An MCP command or ACK handshake ended without a proved byte boundary.
+    /// An MCP command or ACK handshake ended without a confirmed byte boundary.
     ///
     /// Sending the raw exit byte could complete a partial frame or consume a
     /// stale acknowledgement. The transport is closed and the radio must be
@@ -517,7 +517,7 @@ pub enum Error {
         page: WritableMcpPage,
     },
 
-    /// The link never proved MMDVM after a verified route-and-mode update.
+    /// The link never answered an MMDVM probe after a verified route-and-mode update.
     #[error(
         "the radio did not answer MMDVM probes within {window:?} after Menu 985 and Menu 650 \
          were read-back verified for this connection; do not repeat the memory update, because \

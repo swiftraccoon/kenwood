@@ -59,8 +59,8 @@ types belong to
 [`kenwood-transport`](https://github.com/swiftraccoon/kenwood/tree/main/kenwood-transport).
 Import them directly from `kenwood_transport`. This crate owns TH-D75 serial
 presets, USB discovery and identity-based reopening, native Bluetooth access,
-and the model-specific `EitherTransport` choice. An opened transport alone does
-not establish CAT readiness or permission to change radio settings.
+and the model-specific `EitherTransport` choice. Opening a transport does not
+establish CAT readiness; identify the radio first.
 
 D-STAR framing, configuration, events, and voice processing live in
 [`mmdvm::dstar`](https://github.com/swiftraccoon/kenwood/tree/main/mmdvm).
@@ -162,8 +162,8 @@ Runnable examples live in [`examples/`](https://github.com/swiftraccoon/kenwood/
 | `pf_screen_capture` | Assign the front-panel PF1 key to Screen Capture via an MCP memory write. |
 | `kiss_monitor` | Decode KISS frames, AX.25 packets, and APRS position reports from the TNC. |
 | `automation_probe` | Qualify V1.03.AZM, retain authenticated screen BMPs, exercise MENU/navigation, restore the UI, and require exact OCR text (macOS only). |
-| `automation_tap` | Execute one exact guarded key tap and retain before/after pixel and optional OCR evidence (macOS only). |
-| `automation_audit` | Audit all 217 reviewed menu leaves, or an explicitly scoped subset, using guarded-input and screen evidence (macOS only). |
+| `automation_tap` | Execute one exact guarded key tap and retain before/after framebuffer captures and optional OCR output (macOS only). |
+| `automation_audit` | Audit all 217 reviewed menu leaves, or an explicitly scoped subset, using guarded input and screen captures (macOS only). |
 | `hardware_audit` | Run a fixed, read-only CAT capability audit; the automation profile exact-attests CAT identity `1.03.AZM` and excludes its `GM`/`GW` command collisions. |
 
 ## Batch MCP menu writes
@@ -222,7 +222,8 @@ terminator. Unrelated bits remain unchanged when a patch is applied.
 
 `SchemaError::Codec` retains the field name and typed shared codec cause;
 `SchemaError::Patch` retains conflicting field ownership and byte positions.
-Neither offline validation nor a patch plan grants permission to write a radio.
+Offline validation and patch planning perform no I/O; the radio-side guards run
+when the plan is applied.
 
 ## V1.03.AZM closed-loop automation
 
@@ -300,9 +301,9 @@ a concurrent writer changes an already-compared framebuffer word. An
 authenticated refusal is always before the first digit and leaves the session
 usable; ABI 3 rejects every partial-refusal receipt. Recovery never assumes an
 undocumented numeric-entry timeout.
-Zero-hold behavior is not treated as hardware-qualified until the live runner
-opens harmless information page 991, proves the exact Version / V1.03.AZM
-screen, and restores the exact baseline frame.
+Zero-hold behavior counts as verified only after the live runner opens harmless
+information page 991, matches the exact Version / V1.03.AZM screen, and
+restores the exact baseline frame.
 
 After independently validating the snapshot's screen semantics, the core host
 sequence is:
@@ -341,7 +342,7 @@ cover all 217 menu rows
 without overlap. Startup canaries and home-profile checks use three captures;
 ordinary menu checks use one firmware-authenticated stable capture after the
 settle delay. Exact menu titles, numbered-row or singleton-submenu locators,
-typed values, BMP/OCR/metadata evidence, and restoration to the reviewed
+typed values, BMP, OCR and metadata captures, and restoration to the reviewed
 dual-band home profile are recorded in JSONL. Every capture owned by one of
 four explicitly recognized high-risk
 menu audits reduces body and selected OCR text to SHA-256: 516 (APRS Object),
@@ -382,9 +383,10 @@ controls, and one-leaf manifest relationship as the terminal non-entry locator.
 It does not send the activation key.
 
 Before and after the screen audit, the runner byte-compares the 350 complete
-MCP pages spanned by all 400 generated menu-field descriptors. That final-state
-equality does not prove that no intermediate write occurred, and explicitly
-excludes the other 1,605 MCP pages and non-MCP transient or volatile state.
+MCP pages spanned by all 400 generated menu-field descriptors. That comparison
+covers final state only: an intermediate write followed by a restoring write is
+invisible to it, and it excludes the other 1,605 MCP pages and non-MCP
+transient or volatile state.
 
 Menu 134 has one stock V1.03 prerequisite: its Priority Scan page refuses to
 open when the Pri special-memory record is empty. The runner requires Priority
@@ -422,8 +424,8 @@ endpoint options are mutually exclusive; omitting both preserves the existing
 Use `--menu 991` for one leaf, or `--start NUMBER --limit COUNT` for a bounded
 slice. Only complete 217-leaf coverage can report `FULL_PASS`; explicit subsets
 report `SCOPED_PASS`. The runner requires macOS Vision; radio transport may be
-an explicit USB CDC path or native Bluetooth. It writes its private evidence
-bundle only beneath the requested owner-private output directory.
+an explicit USB CDC path or native Bluetooth. It writes its captures only
+beneath the requested owner-private output directory.
 
 The V1.03.AZM firmware package has been physically flashed: CAT `FV` returns
 the exact stored identity `1.03.AZM`, ABI 3 qualification succeeds, and the
@@ -471,17 +473,14 @@ also exits an orphaned helper if its parent disappears. Native startup uses one
 buffers radio ingress until the readiness prefix is complete. One helper owns
 the TH-D75 SPP channel per process.
 
-The TH-D75 wrapper retains one selected-open retry for an absent device or a
-failed native stage on its fixed-channel path. `BluetoothTransport::open()`
-waits one second before that single fresh-helper retry; `reopen()` has the same
-two-attempt maximum. A matching typed opening stage accompanied by
-`ChannelUnconfirmed` may receive that same single retry only after the helper
-has been reaped; both failures remain available to diagnostics. This is not
-proof that the OS cancelled its pending operation. Probes never retry.
-Cancellation, helper launch/framing errors, and cleanup failures without that
-opening-stage/reaped-helper evidence return immediately. The shared transport does
-not retry. A reported opening stage is a host observation, not proof of a
-firmware cause or that another attempt will succeed. Recovery leaves the shared
+The TH-D75 wrapper allows at most two open attempts, one second apart, on its
+fixed-channel path. `BluetoothTransport::open()` and `reopen()` retry only for
+an absent device or a failed native opening stage other than `StartupDeadline`
+and `ServiceResolution`, including such a stage paired with `ChannelUnconfirmed`
+after the helper has been reaped; both failures stay available to diagnostics. Cancellation, helper launch or framing errors,
+and cleanup failures without that pairing return immediately. Probes and the
+shared transport never retry. A reported opening stage records what the host
+observed, not a cause in the radio's firmware. Recovery leaves the shared
 baseband and macOS system Bluetooth services alone.
 
 ## Radio compatibility

@@ -3,8 +3,8 @@
 //! A caller constructs [`MainThreadBroker`] on the required thread and calls
 //! [`MainThreadBroker::pump`] from that thread's loop; any thread holding a
 //! [`BrokerHandle`] can submit a synchronous job and await its result. Native
-//! macOS Bluetooth no longer uses this broker because all `IOBluetooth` and
-//! `CFRunLoop` work lives in its private helper process.
+//! macOS Bluetooth does not use this broker: all `IOBluetooth` and `CFRunLoop`
+//! work lives in its private helper process.
 
 use std::sync::mpsc;
 

@@ -308,9 +308,8 @@ async fn set_vox_via_mcp_enables() -> TestResult {
     Ok(())
 }
 
-// NOTE: `set_lock_via_mcp` no longer exists. MCP offset 0x1060 and CAT LC
-// both control `radio.BacklightControl`; no key-lock state operation is
-// currently verified.
+// MCP offset 0x1060 and CAT LC both control `radio.BacklightControl`; no
+// key-lock operation is verified, so none is exposed.
 
 #[tokio::test(start_paused = true)]
 async fn set_bluetooth_via_mcp_enables() -> TestResult {

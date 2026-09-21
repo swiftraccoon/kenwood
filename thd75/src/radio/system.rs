@@ -259,9 +259,9 @@ impl<T: Transport> Radio<T> {
     ///
     /// When enabled (`AI 1`), firmware notification wrappers can push AG, BC,
     /// BY, FS, FT, IO, MD, SF, SM, VM, DL, FR, and FQ updates for the current
-    /// serial interface. The trigger conditions for each wrapper still require
-    /// hardware qualification. SQ is not in that statically proven wrapper
-    /// set and has no committed raw push capture.
+    /// serial interface. The trigger conditions for each wrapper are not
+    /// verified on hardware. SQ is not in that wrapper set and has no
+    /// committed raw push capture.
     ///
     /// `execute` routes unsolicited frames it encounters to
     /// the broadcast channel returned by [`subscribe`](Self::subscribe).
@@ -310,9 +310,9 @@ impl<T: Transport> Radio<T> {
     ///
     /// For example, `TY K,2` becomes a [`RadioType`] containing
     /// [`RadioRegion::UnitedStates`](crate::types::RadioRegion::UnitedStates)
-    /// and hardware variant `2`. The variant remains opaque because retained
-    /// evidence establishes its one-nibble wire domain but not semantic names
-    /// for all sixteen values.
+    /// and hardware variant `2`. The variant remains opaque: its one-nibble
+    /// wire domain is known, but no semantic names exist for all sixteen
+    /// values.
     ///
     /// # Errors
     ///

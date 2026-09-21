@@ -2,8 +2,8 @@
 //!
 //! Scalar types reject values outside their established wire or menu domains
 //! at construction time. Composite record types use those scalars for known
-//! fields and preserve unidentified storage bits when retained evidence does
-//! not support a semantic interpretation. Broader operating constraints that
+//! fields and preserve unidentified storage bits that have no established
+//! semantic interpretation. Broader operating constraints that
 //! depend on radio state remain explicit fallible operations rather than
 //! being hidden by lossy normalization.
 //!
@@ -11,7 +11,7 @@
 //! in their semantic name. When byte position is the only established fact,
 //! the identifier states that exact byte and bit range instead (for example,
 //! `ChannelByte0eBits3To2`). These forms preserve wire data without assigning
-//! meaning that the available evidence does not establish.
+//! an unestablished meaning.
 //!
 //! Menu numbers referenced throughout this module correspond to the
 //! TH-D75 menu system as documented in User Manual Chapter 6 (Menu Mode).

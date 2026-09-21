@@ -829,7 +829,7 @@ async fn recover_interrupted_mcp<T: Transport>(
                 info.model
             )),
             Err(probe_error) => invalid_input(format!(
-                "{interruption} and recovery was not proved: {recovery_error}; \
+                "{interruption} and recovery is unconfirmed: {recovery_error}; \
                  CAT probe also failed: {probe_error}; fully power-cycle the radio"
             )),
         },

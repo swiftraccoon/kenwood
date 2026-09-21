@@ -14,8 +14,8 @@
 //! image in `tests/fixtures/memory_dump.bin`.
 //!
 //! The My Position records at `0x1120..0x11C0` and selector at `0x11C0`
-//! remain opaque because the retained evidence does not yet prove their
-//! hemisphere polarity or selector semantics. No GPS waypoint-storage offset
+//! remain opaque because the retained image does not settle their hemisphere
+//! polarity or selector semantics. No GPS waypoint-storage offset
 //! has been verified; the retained image identifies `0x4D000` as paired-device
 //! data, not a waypoint index.
 

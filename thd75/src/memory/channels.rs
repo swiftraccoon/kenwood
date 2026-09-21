@@ -13,7 +13,7 @@
 //! consistent with the memory map documentation. Note that some tools use
 //! file-based addressing (offset by +0x100 for the `.d75` file header),
 //! so addresses `0x2100`, `0x0100`, `0x10100` correspond to MCP byte
-//! addresses `0x2000`, `0x0000`, `0x10000` respectively. Our offsets are
+//! addresses `0x2000`, `0x0000`, `0x10000` respectively. These offsets are
 //! MCP byte addresses (no file header offset).
 //!
 //! The [`ChannelAccess`] struct borrows the raw image and provides methods

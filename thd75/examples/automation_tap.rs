@@ -1,4 +1,4 @@
-//! Execute one exact guarded key tap and retain before/after screen evidence.
+//! Execute one exact guarded key tap and retain before/after screen captures.
 //!
 //! This is the minimal recovery and experimentation companion to
 //! `automation_probe`: it does not infer a prior UI state and does not attempt

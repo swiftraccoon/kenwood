@@ -15,8 +15,8 @@
 //! ## How to reintroduce typed accessors
 //!
 //! A typed field accessor requires an exact TH-D75 offset, an encoded domain,
-//! and controlled radio write/readback evidence that the field tracks the
-//! named setting. Until all three are available, callers should use the
+//! and a controlled radio write with readback showing that the field tracks
+//! the named setting. Until all three are available, callers should use the
 //! generated menu-field registry for known settings or treat these bytes as
 //! opaque.
 //!
@@ -48,8 +48,8 @@ pub const APRS_END_OFFSET: usize =
 // Intentionally empty. See the module-level "Verification status"
 // section: typed field accessors were removed when their offsets could
 // not be confirmed by controlled memory-image diffs and radio readback. Add
-// `const` offsets back here only with reproducible evidence for both the
-// address and its encoded domain.
+// `const` offsets back here only with a reproducible image diff and readback
+// for both the address and its encoded domain.
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
@@ -126,8 +126,6 @@ impl<'a> AprsAccess<'a> {
 
     // -----------------------------------------------------------------------
     // Typed sub-page field accessors remain unavailable pending verification.
-    //
-    // Typed setting and packet-path accessors previously lived here.
     // See the module-level "Verification status" section for the criteria to
     // introduce any of them.
     //

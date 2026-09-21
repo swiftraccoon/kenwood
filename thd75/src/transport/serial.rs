@@ -21,7 +21,7 @@
 //! MAIN MPU UART2. Requires 9600 baud with RTS/CTS hardware flow
 //! control. The D75 supports Bluetooth 3.0 Class 2 with HSP + SPP
 //! profiles only (no BLE, no HFP). Per §5.12, "configuration of the
-//! baud rate is not necessary" for BT serial either, but we set 9600
+//! baud rate is not necessary" for BT serial either, but 9600 is set
 //! explicitly for compatibility.
 //!
 //! The same VID/PID (2166:9023) is used in both normal operation and

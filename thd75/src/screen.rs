@@ -4,7 +4,7 @@
 //! RGB565 framebuffer.  This module keeps that native byte representation so
 //! host-side validation can hash and compare exactly what the radio displayed,
 //! then offers deterministic RGB and stock-compatible BMP conversions for
-//! recognition and evidence artifacts.
+//! recognition and retained captures.
 
 use thiserror::Error;
 

@@ -3,8 +3,9 @@
 //! [`DstarGateway`] retains CAT state and model entry/exit policy. Framing,
 //! initialization, event processing, voice and slow data live in
 //! [`mmdvm::dstar`]. Voice operations delegate to that runtime while keeping
-//! its transport paired with this owner's restoration state. Stop this owner
-//! to reclaim the radio with the correct lifecycle evidence.
+//! its transport paired with the CAT state needed to restore the radio. Call
+//! `stop` to reclaim the radio; a transient gateway then requires
+//! [`DesyncedRadio::restore`] before any further CAT command.
 
 use std::marker::PhantomData;
 use std::time::Duration;
@@ -24,10 +25,9 @@ use crate::types::TncDataBand;
 
 /// A shared D-STAR modem plus the TH-D75 state needed to stop it safely.
 ///
-/// Transient owners enter and exit through the selected TNC data band.
-/// Persistent owners require an already-proved binary link and never send
-/// the transient ASCII exit. Stopping host processing alone does not prove
-/// that CAT is ready.
+/// A transient gateway enters and exits through the selected TNC data band.
+/// A persistent gateway requires a connection that already carries binary-mode
+/// proof and never sends the transient ASCII exit.
 ///
 /// ```rust,no_run
 /// use kenwood_thd75::{DstarGateway, Radio};
@@ -64,8 +64,8 @@ impl<T: Transport + Unpin + 'static, Lifecycle> std::fmt::Debug for DstarGateway
 impl<T: Transport + Unpin + 'static> DstarGateway<T> {
     /// Enter transient MMDVM on `data_band`, then initialize D-STAR.
     ///
-    /// The shared configuration contains no radio-band policy. This owner
-    /// performs `TN 3,x` and retains the same band for `TN 0,x` cleanup.
+    /// The shared configuration carries no radio band. `data_band` selects the
+    /// band sent in `TN 3,x` and is retained for the matching `TN 0,x` exit.
     ///
     /// # Errors
     ///
@@ -97,7 +97,6 @@ impl<T: Transport + Unpin + 'static> DstarGateway<T> {
     /// # Errors
     ///
     /// Fails on modem shutdown, transport recovery, or the matching TNC exit.
-    /// No successful CAT restoration is implied.
     pub async fn stop(self) -> Result<DesyncedRadio<T>, Error> {
         self.restore.exit_and_rebuild(self.modem.into_modem()).await
     }
@@ -143,8 +142,8 @@ impl<T: Transport + Unpin + 'static> DstarGateway<T, PersistentMmdvm> {
     ///
     /// # Errors
     ///
-    /// Fails if either pump cannot be reclaimed cleanly. A failed pump cannot
-    /// manufacture a CAT-ready or binary-proved replacement radio.
+    /// Fails if either pump cannot be reclaimed cleanly. On failure no `Radio`
+    /// is returned and the connection must be reopened and re-proved.
     pub async fn stop(self) -> Result<Radio<T>, Error> {
         self.restore
             .shutdown_and_rebuild_binary(self.modem.into_modem())
@@ -155,8 +154,8 @@ impl<T: Transport + Unpin + 'static> DstarGateway<T, PersistentMmdvm> {
 impl<T: Transport + Unpin + 'static, Lifecycle> DstarGateway<T, Lifecycle> {
     /// Inspect shared modem configuration and receive state.
     ///
-    /// The runtime must remain paired with this owner's radio restore state.
-    /// Inspection therefore cannot provide a mutable runtime reference:
+    /// The runtime stays paired with the CAT state this gateway restores, so
+    /// the borrow is shared and the runtime cannot be swapped out:
     ///
     /// ```compile_fail
     /// use kenwood_thd75::DstarGateway;
@@ -170,7 +169,7 @@ impl<T: Transport + Unpin + 'static, Lifecycle> DstarGateway<T, Lifecycle> {
     /// }
     /// ```
     ///
-    /// No separate mutable-owner accessor exists:
+    /// There is no `modem_mut` accessor either:
     ///
     /// ```compile_fail
     /// use kenwood_thd75::DstarGateway;
@@ -188,7 +187,8 @@ impl<T: Transport + Unpin + 'static, Lifecycle> DstarGateway<T, Lifecycle> {
         &self.modem
     }
 
-    /// Receive a shared D-STAR event without releasing model lifecycle ownership.
+    /// Receive one shared D-STAR event while retaining the radio and its
+    /// restore state.
     ///
     /// `Ok(None)` is a quiet poll interval, not a closed modem. Event decoding,
     /// automatic echo, and pending-event ordering belong to [`DstarModem`].
@@ -274,8 +274,9 @@ impl<T: Transport + Unpin + 'static, Lifecycle> DstarGateway<T, Lifecycle> {
 
     /// Request status while retaining intervening shared-runtime voice events.
     ///
-    /// The two-second timeout is between received events, not an absolute
-    /// operation deadline; see [`DstarModem::poll_status`].
+    /// One two-second absolute deadline covers request submission, waiting for
+    /// status, and dispatch of unrelated events; see
+    /// [`DstarModem::poll_status`].
     ///
     /// # Errors
     ///

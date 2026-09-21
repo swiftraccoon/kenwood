@@ -488,8 +488,7 @@ impl<'a> SettingsAccess<'a> {
 
     /// Read the CW filter width (`radio.CwWidth`).
     ///
-    /// MCP offset `0x1009`. The D75 menu calls this "CW Width" (it was
-    /// previously misnamed "CW high cut" here).
+    /// MCP offset `0x1009`. The D75 menu calls this "CW Width".
     ///
     /// # Errors
     ///

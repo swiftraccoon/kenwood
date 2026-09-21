@@ -1,10 +1,11 @@
 //! TH-D75 ownership and mode restoration around a shared D-STAR modem.
 //!
-//! [`DstarGateway`] enters the qualified transient mode or consumes existing
-//! persistent binary-link proof. Its voice operations delegate to
-//! [`mmdvm::dstar`] without exposing the owned runtime for replacement.
-//! [`DstarGateway::modem`] provides read-only inspection. Stop the model owner
-//! to apply the proper exit policy and recover radio state. Shared
+//! [`DstarGateway`] either enters MMDVM transiently over CAT (`TN 3,x`, exited
+//! with the matching `TN 0,x`) or takes over a connection that already carries
+//! persistent binary-mode proof, which it never exits with an ASCII command.
+//! Voice operations delegate to [`mmdvm::dstar`]; `DstarGateway::modem` borrows
+//! the runtime read-only, so it cannot be swapped away from the CAT state
+//! needed to restore the radio. Call `stop` to release the radio. Shared
 //! configuration, events, headers and slow-data types come directly from
 //! `mmdvm::dstar` and `dstar_gateway_core`.
 

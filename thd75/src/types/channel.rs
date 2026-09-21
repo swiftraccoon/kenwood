@@ -613,9 +613,9 @@ impl fmt::Display for CurrentMemorySelector {
 ///
 /// Firmware copies and formats the complete CTCSS, DCS, and digital-squelch
 /// code bytes. Their established indices occupy `0x0C[5:0]`, `0x0D[6:0]`,
-/// and `0x27[6:0]`; retained evidence does not establish meanings for the
-/// remaining high bits. This type preserves those bits without inventing
-/// semantic labels or weakening validation of the known indices.
+/// and `0x27[6:0]`; the remaining high bits have no established meaning. This
+/// type preserves those bits without inventing semantic labels or weakening
+/// validation of the known indices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ChannelCodeUnidentifiedBits {
     ctcss_code_bits_7_to_6: u8,

@@ -117,7 +117,6 @@ async fn deep_probe_all_reads() {
     let mut alive = true;
 
     output.push("TH-D75 Deep Probe: CONFIRMED SAFE READS ONLY".into());
-    output.push("Date: 2026-03-25".into());
     output.push(format!("Port: {}", ports[0].port_name));
     output.push("Contract: established TH-D75 read forms only".into());
 

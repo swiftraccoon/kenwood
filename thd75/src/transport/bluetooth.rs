@@ -1,9 +1,10 @@
 //! TH-D75 Bluetooth selection, fixed-channel opening, and retry policy.
 //!
 //! The shared transport owns every native object, helper, pipe, and teardown.
-//! This wrapper supplies the TH-D75 default name and qualified channel two,
-//! one transient selected-open retry, and reopening pinned to the actual address.
-//! Reopening is endpoint recovery, not evidence of CAT or operating-mode readiness.
+//! This wrapper supplies the default device name `TH-D75`, RFCOMM channel 2,
+//! one retry on a selected open, and reopening pinned to the address resolved
+//! by the first successful selection. Reopening restores the endpoint only; the
+//! radio has answered no CAT command until the caller identifies it.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -27,13 +28,15 @@ pub struct BluetoothTransport {
 impl BluetoothTransport {
     /// Open the default TH-D75 name or an explicit name/address selector.
     ///
-    /// An absent device or eligible fixed-channel native opening stage receives
-    /// one fresh-helper retry after one second. That stage remains eligible
-    /// when a matched failure record independently reports unconfirmed channel
-    /// cleanup and the shared transport has reaped the helper. Cleanup alone,
-    /// forced termination, launch and cancellation failures never grant a retry.
-    /// Each attempt is bounded; this does not prove CAT or radio readiness, or
-    /// cancellation of an operation still owned by the operating system.
+    /// Retries once, after a one-second wait and with a fresh helper process,
+    /// when the first attempt returns [`TransportError::NotFound`], or returns
+    /// [`TransportError::BluetoothOpen`] or a
+    /// [`TransportError::BluetoothOpenWithCleanup`] whose cleanup is
+    /// [`BluetoothCloseFailure::ChannelUnconfirmed`], and whose stage is
+    /// neither [`BluetoothOpenStage::ServiceResolution`] nor
+    /// [`BluetoothOpenStage::StartupDeadline`]. Any other close failure, helper
+    /// launch failure or cancellation returns immediately. Each attempt is
+    /// bounded by the shared transport's opening deadline.
     ///
     /// # Errors
     ///
@@ -114,7 +117,7 @@ impl BluetoothTransport {
     ///
     /// # Errors
     ///
-    /// Returns native/helper errors; successful opening is not CAT qualification.
+    /// Returns native-open or helper errors; this method never retries.
     pub fn probe_paired_device_with_helper_executable(
         device: &PairedBluetoothDevice,
         helper_executable: impl AsRef<Path>,
@@ -209,16 +212,16 @@ fn reopen_after_cleanup<T>(
     closed: Result<(), TransportError>,
     open: impl FnOnce(&BluetoothDeviceSelector, &Path) -> Result<T, TransportError>,
 ) -> Result<T, TransportError> {
-    // A successful initial name/default selection becomes exact address
-    // ownership. Recovery can never reinterpret a reassigned display name.
+    // Reopen always selects the exact address resolved by the first successful
+    // open, so a display name reassigned to another device is never followed.
     let selector = BluetoothDeviceSelector::Address(address.clone());
     if let Err(error) = closed {
         if !matches!(error, TransportError::BluetoothClose { .. }) {
             return Err(error);
         }
-        // Forced termination does not prove native close, but this explicit
-        // model recovery may try again. The shared helper lease still refuses
-        // any fresh launch until the previous helper has actually been reaped.
+        // The previous helper was killed, so the RFCOMM channel may not have
+        // closed cleanly. Reopening is still safe: the shared helper lease
+        // refuses a new launch until the old helper has been reaped.
         tracing::warn!(error = %error, selector = selector.as_str(),
             "reopening TH-D75 endpoint after unconfirmed native cleanup");
     }
@@ -262,10 +265,11 @@ fn open_with_retry<T>(
     }
 }
 
-// Keep the model's established one-retry admission as shared diagnostics gain
-// more precise stages. Service resolution belongs only to fresh-SDP selectors,
-// never this model's fixed-channel opening policy. A combined failure preserves
-// the original stage only after the shared transport has reaped its helper.
+// Retry-eligible failures: device not found, and every opening stage except
+// `StartupDeadline` and `ServiceResolution`, provided any reported channel
+// cleanup is `ChannelUnconfirmed` (the helper has already been reaped, so a
+// fresh launch is safe). `ServiceResolution` is reported only by fresh-SDP
+// selectors, never by this fixed-channel path.
 const fn fixed_channel_retry_eligible(error: &TransportError) -> bool {
     let stage = match error {
         TransportError::NotFound => return true,

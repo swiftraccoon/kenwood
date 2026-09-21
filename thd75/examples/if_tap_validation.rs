@@ -39,7 +39,7 @@ use kenwood_thd75::types::{
 };
 use kenwood_thd75::{IfTapConfig, IfTapSavedState, Radio};
 
-/// One line of evidence; failures flip the process exit code.
+/// One CHECK line; a failure flips the process exit code.
 fn check(passed: &mut bool, label: &str, ok: bool, detail: &str) {
     let verdict = if ok { "PASS" } else { "FAIL" };
     println!("CHECK {verdict}: {label} ({detail})");

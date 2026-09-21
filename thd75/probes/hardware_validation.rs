@@ -4,7 +4,7 @@
 //! corresponding offline wire encoding for capture.
 //!
 //! This archival probe source is not registered as a Cargo target. Before a
-//! hardware run, review it against `docs/audit/probe_queue.md`, promote the
+//! hardware run, review it against the CAT mnemonic contracts in `thd75/AGENTS.md`, promote the
 //! reviewed copy to an explicit test target, and run that target serially.
 
 mod firmware_guard;

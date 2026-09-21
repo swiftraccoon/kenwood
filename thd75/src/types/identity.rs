@@ -242,9 +242,9 @@ impl AsRef<str> for SerialNumber {
 
 /// Exact three-byte model code returned alongside [`SerialNumber`] by `AE`.
 ///
-/// Hardware observations include `K01`, but no retained evidence proves that
-/// every model code follows that example's letter-plus-digits shape. The value
-/// therefore remains an opaque, fixed-width printable-ASCII CAT field.
+/// Hardware observations include `K01`, but nothing shows that every model
+/// code follows that example's letter-plus-digits shape. The value therefore
+/// remains an opaque, fixed-width printable-ASCII CAT field.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ModelCode(String);
 

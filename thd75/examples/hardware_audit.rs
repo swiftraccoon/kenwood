@@ -1,4 +1,4 @@
-//! Allowlisted raw-CAT hardware qualification for the TH-D75.
+//! Allowlisted raw-CAT hardware verification for the TH-D75.
 //!
 //! This runner deliberately bypasses the typed command serializers and
 //! parsers being audited. It has no arbitrary-command mode.
@@ -1780,7 +1780,7 @@ async fn recover_containment<T: Transport>(
         Ok(())
     } else {
         Err(invalid_input(format!(
-            "containment recovery evidence incomplete: failed targets [{}], evidence failures \
+            "containment recovery incomplete: failed targets [{}], record failures \
              {evidence_failures}",
             failed.join(", ")
         )))

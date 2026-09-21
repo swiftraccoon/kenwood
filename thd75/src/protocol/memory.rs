@@ -1,7 +1,8 @@
 //! Memory commands: ME and MR.
 //!
 //! Provides serialization of ME reads and MR actions, plus parsing of ME/MR
-//! responses. ME writes remain unavailable until hardware qualification.
+//! responses. ME writes are unavailable until write and readback are verified
+//! on hardware.
 
 use crate::error::ProtocolError;
 use crate::types::{Band, CatMemoryChannelRecord, CurrentMemorySelector, MemoryChannelAddress};
@@ -42,7 +43,7 @@ const ME_FIELD_COUNT: usize = 23;
 ///   [22]      scan lockout
 /// ```
 ///
-/// We remap these into the 20-field FO order and delegate to
+/// These are remapped into the 20-field FO order and delegated to
 /// [`parse_channel_fields`].
 fn parse_me(payload: &str) -> Result<Response, ProtocolError> {
     let fields = split_exact::<ME_FIELD_COUNT>(payload, "ME")?;

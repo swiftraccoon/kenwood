@@ -163,7 +163,7 @@ async fn connect_with_tnc_exit_preamble_includes_kiss_exit_frame() -> TestResult
     // FEND-framed Return command (C0 FF C0), the same bytes
     // AprsClient::stop() sends. The preamble must include it ahead of
     // the ASCII TNC exits, or a stuck-KISS radio stays unreachable
-    // even though the transport connects. Hardware-observed 2026-07-18.
+    // even though the transport connects. Observed on hardware.
     let mut mock = MockTransport::new();
     expect_tnc_recovery_fallback(&mut mock);
 

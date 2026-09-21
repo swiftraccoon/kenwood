@@ -1,7 +1,7 @@
 //! Validated parameter types for radio CAT command methods.
 //!
 //! These newtypes and enums enforce valid ranges at construction time
-//! for parameters that the radio methods previously accepted as raw `u8`.
+//! for the parameters of the radio methods.
 
 use std::fmt;
 
@@ -1348,8 +1348,8 @@ pub enum MemoryReadTarget {
     DdrV103,
     /// `normal-gm-nor-read`: offsets address NOR at `0x60000000`.
     ///
-    /// Only the low 2 MiB were hardware-qualified. The patched handler's wider
-    /// grammar does not authorize reads beyond that proven window.
+    /// Only the low 2 MiB were verified on hardware; reads beyond that window
+    /// are refused even though the patched handler's grammar accepts them.
     LowNorV103,
 }
 

@@ -778,8 +778,8 @@ impl<T: Transport> Radio<T> {
     /// Set FM Radio mode through Menu 700's MCP cell.
     ///
     /// This changes `radio.FmRadioMode` at exact MCP offset `0x1040`. It does
-    /// not emit an `FR` write: retained hardware evidence reports `N` for
-    /// that CAT form. The MCP page write is verified by read-back.
+    /// not emit an `FR` write: the radio answers `N` to that CAT form. The MCP
+    /// page write is verified by read-back.
     ///
     /// # Connection lifetime
     ///

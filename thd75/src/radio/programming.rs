@@ -8,9 +8,9 @@
 //! # Protocol
 //!
 //! The entire programming session runs at 9600 baud with no transfer-phase
-//! baud-rate switch. This is the only hardware-qualified path. Switching to
-//! 57600 baud after entry crashes the radio into MCP error mode, and faster
-//! transfer modes are not exposed without equivalent qualification.
+//! baud-rate switch. This is the only path verified on hardware. Switching to
+//! 57600 baud after entry crashes the radio into MCP error mode; faster
+//! transfer modes are not exposed.
 //!
 //! # Warning
 //!
@@ -570,7 +570,7 @@ impl<T: Transport> Radio<T> {
 
     /// Combine an MCP operation with the cleanup that followed it.
     ///
-    /// When CAT restoration was not proved, cleanup takes safety precedence
+    /// When CAT restoration is unconfirmed, cleanup takes safety precedence
     /// and both errors are retained. A cleanup anomaly after an independently
     /// successful CAT reconnect remains visible, but does not mislabel the
     /// radio as stranded in MCP mode.
@@ -622,8 +622,10 @@ impl<T: Transport> Radio<T> {
 
     /// Read the entire radio memory image (500,480 bytes).
     ///
-    /// Enters programming mode, reads all 1,955 pages, and exits.
-    /// This takes approximately 55 seconds at 9600 baud.
+    /// Enters programming mode, reads all 1,955 pages, and exits. Over USB
+    /// the complete read, exit and reconnect take about 55 seconds; over
+    /// Bluetooth SPP the 9600 baud link alone bounds the 500,480 payload
+    /// bytes to at least 521 seconds.
     ///
     /// # Errors
     ///
@@ -637,7 +639,8 @@ impl<T: Transport> Radio<T> {
     /// Read the entire radio memory image with a progress callback.
     ///
     /// The callback receives `(current_page, total_pages)` after each
-    /// page is read, allowing progress display for the ~55-second dump.
+    /// page is read, allowing progress display for the dump (about 55
+    /// seconds over USB).
     ///
     /// # Errors
     ///
@@ -2089,9 +2092,9 @@ impl<T: Transport> Radio<T> {
         self.send_programming_exit().await?;
         self.settle_after_programming_exit().await;
 
-        // Detached mode deliberately does not prove CAT because the
-        // caller expects the link to disappear. The exact ACK is its
-        // terminal proof that MCP accepted the one exit byte.
+        // Detached mode sends no CAT afterwards because the caller expects
+        // the link to disappear. The exact ACK is the only confirmation
+        // that MCP accepted the one exit byte.
         self.mcp_phase = McpPhase::Inactive;
         self.mcp_wire_boundary = McpWireBoundary::Quiescent;
         Ok(())
@@ -2261,10 +2264,9 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Errors
     ///
-    /// Returns the original exit-ACK anomaly even if reconnect/ID
-    /// independently proves CAT recovery. If CAT recovery is not proved,
-    /// the MCP poison remains set and the error instructs the caller to
-    /// fully power-cycle the radio.
+    /// Returns the original exit-ACK anomaly even if the reconnect and `ID`
+    /// exchange succeed. If that exchange fails, the MCP poison remains set
+    /// and the error instructs the caller to fully power-cycle the radio.
     pub async fn recover_from_interrupted_mcp(&mut self) -> Result<(), Error> {
         if self.mcp_phase == McpPhase::Inactive {
             // A full-image future can be cancelled while draining stale
@@ -4167,7 +4169,7 @@ mod tests {
 
         // The second write reaches the transport but receives no ACK. The
         // operation must close without writing raw E because the W-frame
-        // boundary is not proved.
+        // boundary is unconfirmed.
         let high_write = programming::build_write_command(high_page, &high_modified);
         mock.expect(&high_write, &[]);
 
@@ -4879,7 +4881,7 @@ mod tests {
         let second_write = programming::build_write_command(second_page, &second_replacement);
         mock.expect(&second_write, &[0x15]);
 
-        // A NAK does not prove the W exchange boundary. No raw exit or CAT
+        // A NAK leaves the W exchange boundary unconfirmed. No raw exit or CAT
         // reconnect is scripted; cleanup must fail closed by closing.
 
         let exchanges = [

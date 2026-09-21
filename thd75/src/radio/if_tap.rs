@@ -273,7 +273,7 @@ impl<T: Transport> IfTapSession<'_, T> {
     /// verified-walk limit. Neither preflight failure changes radio state.
     /// Returns [`Error::RetuneNotVerified`] when the stepped result reads
     /// back different from `target`, and [`Error::IfTapNotEngaged`] when
-    /// re-engaging the tap does not prove out. After any error past the
+    /// re-engaging the tap fails. After any error past the
     /// preflight checks the USB audio output may be left on the audio path;
     /// the session remains valid, and [`exit`](Self::exit) still restores
     /// every saved setting.
@@ -447,9 +447,9 @@ impl<T: Transport> Radio<T> {
     /// readback proof.
     ///
     /// Every step is individually verified by a frequency readback before
-    /// the next step is sent. Hardware-observed (live radio, 2026-08-09):
-    /// the radio acknowledges rapid consecutive step commands but can
-    /// swallow all except the last, so a fire-and-forget burst lands short.
+    /// the next step is sent. On hardware, the radio acknowledges rapid
+    /// consecutive step commands but can swallow all except the last, so a
+    /// fire-and-forget burst lands short.
     /// The verified walk retries a swallowed step and fails closed after
     /// [`MAX_RETUNE_STALLS`] consecutive steps that produce no movement.
     ///
@@ -465,8 +465,8 @@ impl<T: Transport> Radio<T> {
     /// exceeding the restore walk's bound.
     /// Returns [`Error::RetuneNotVerified`] when the walk cannot make
     /// verified progress, and [`Error::IfTapNotEngaged`] when re-engaging the
-    /// tap does not prove out. After any error past the preflight checks the
-    /// USB audio output may be left on the audio path.
+    /// tap fails. After any error past the preflight checks the USB audio
+    /// output may be left on the audio path.
     pub async fn retune_if_tap(
         &mut self,
         saved: &IfTapSavedState,

@@ -39,9 +39,8 @@
 //! and normal APRS audio.
 //!
 //! These types describe the documented menu domains and the corresponding
-//! fields identified in the generated MCP schema. They do not imply that a
-//! live MCP writer exists for every field or that every write has been
-//! qualified on hardware.
+//! fields identified in the generated MCP schema. A live MCP writer exists
+//! only for the fields that have a verified write and readback on hardware.
 
 use std::{collections::HashSet, fmt};
 

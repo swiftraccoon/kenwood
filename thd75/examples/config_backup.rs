@@ -527,7 +527,7 @@ async fn main() -> BackupResult<()> {
             let error = with_close_result(error, close_result);
             if cleanup_unproved {
                 return Err(invalid_input(format!(
-                    "{error}; MCP cleanup was not proved, so fully power-cycle the radio before \
+                    "{error}; MCP cleanup is unconfirmed, so fully power-cycle the radio before \
                      sending any more commands"
                 )));
             }
@@ -1290,7 +1290,7 @@ async fn read_image_with_interrupt_recovery<T: Transport>(
              no backup was written"
         ))),
         Err(_) => Err(invalid_input(format!(
-            "{interruption}; MCP recovery timed out and cleanup was not proved; fully power-cycle \
+            "{interruption}; MCP recovery timed out and cleanup is unconfirmed; fully power-cycle \
              the radio before sending any more commands"
         ))),
     }

@@ -1,5 +1,4 @@
-//! Fail-closed control-and-screen evidence probe for a TH-D75 over macOS
-//! Bluetooth.
+//! Fail-closed control-and-screen probe for a TH-D75 over macOS Bluetooth.
 //!
 //! The default run proves the exact firmware/runtime ABI and captures one
 //! CRC-authenticated LCD frame. `--exercise-menu` additionally performs a
