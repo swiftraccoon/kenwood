@@ -39,6 +39,11 @@ pub(crate) const OK: Color32 = Color32::from_rgb(0x34, 0xC7, 0x59);
 pub(crate) const TX: Color32 = Color32::from_rgb(0xFF, 0x45, 0x3A);
 /// Error red: log errors and the error strip.
 pub(crate) const ERR: Color32 = Color32::from_rgb(0xFF, 0x5F, 0x57);
+/// Error strip background: [`ERR`] at alpha 0x22. A function rather than a
+/// const because egui's unmultiplied constructor is not `const`.
+pub(crate) fn err_strip_bg() -> Color32 {
+    Color32::from_rgba_unmultiplied(ERR.r(), ERR.g(), ERR.b(), 0x22)
+}
 /// Event blue: log event lines.
 pub(crate) const INFO: Color32 = Color32::from_rgb(0x64, 0xA7, 0xFF);
 

@@ -54,11 +54,11 @@ pub(crate) struct ConnectConfig {
     pub(crate) protocol: ProtocolKind,
     /// Operator callsign (max 8 ASCII, uppercase).
     pub(crate) callsign: Callsign,
-    /// Module letter we claim locally.
+    /// Module letter claimed locally.
     pub(crate) local_module: Module,
     /// Reflector callsign (embedded in DCS wire packets).
     pub(crate) reflector_callsign: Callsign,
-    /// Module letter on the reflector we're linking into.
+    /// Module letter on the reflector being linked.
     pub(crate) reflector_module: Module,
     /// Reflector UDP peer address.
     pub(crate) peer: SocketAddr,
@@ -219,7 +219,7 @@ type RuntimeSession = AnyAsyncSession;
 /// reserved as the EOT flag.  Any value `>= 0x40` would set that bit
 /// mid-stream and the reflector would treat it as EOT, silently
 /// ending the stream.  Wrapping at the superframe length (21) is
-/// both spec-correct and keeps us well clear of the EOT bit.
+/// both spec-correct and keeps the stream well clear of the EOT bit.
 #[derive(Debug)]
 struct TxStream {
     sid: StreamId,
@@ -288,7 +288,7 @@ enum RuntimeEvent {
         frame: VoiceFrame,
     },
     /// Reflector-side disconnect: keepalive timeout, link rejection,
-    /// or an unlink ACK after our own disconnect. Surfaced explicitly
+    /// or an unlink ACK after the local disconnect. Surfaced explicitly
     /// (not folded into `Other`) so the run loop can clear `session`
     /// and tell the GUI the link is dead, instead of leaving a stale
     /// `Connected` indicator while every TX silently fails.
@@ -386,7 +386,7 @@ impl GpsSlowData {
 /// Mutable state carried across `decide_runtime_event` calls.
 ///
 /// Pulled out of the `run` loop so the decision logic is a pure
-/// function we can unit-test without spinning up a real reflector or
+/// function that unit tests exercise without a real reflector or
 /// audio device.
 #[derive(Debug, Default)]
 struct EventState {
@@ -433,7 +433,7 @@ enum EventDecision {
     /// The RX stream ended: tell the audio worker to fade out and
     /// flush its held-back tail frame.
     AudioRxEnd,
-    /// Clear the active session, because the reflector booted us or the
+    /// Clear the active session, because the reflector dropped it or the
     /// underlying transport died. The run loop sets `session = None`.
     ClearSession,
 }

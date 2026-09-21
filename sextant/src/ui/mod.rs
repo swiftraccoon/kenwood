@@ -196,9 +196,7 @@ pub(crate) fn error_strip(app: &mut App, ui: &mut egui::Ui) {
         return;
     };
     egui::Frame::none()
-        .fill(egui::Color32::from_rgba_unmultiplied(
-            0xFF, 0x5F, 0x57, 0x22,
-        ))
+        .fill(crate::theme::err_strip_bg())
         .inner_margin(egui::Margin::symmetric(12.0, 6.0))
         .show(ui, |ui| {
             ui.horizontal(|ui| {

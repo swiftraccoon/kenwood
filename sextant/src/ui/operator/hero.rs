@@ -23,7 +23,7 @@ pub(crate) enum HeroState {
     Listening,
     /// An RX voice stream is playing.
     Receiving,
-    /// We are transmitting.
+    /// The local station is transmitting.
     OnAir,
 }
 
@@ -221,7 +221,7 @@ fn position_line(app: &App, ui: &mut egui::Ui) {
     );
 }
 
-/// Transmitting: our own callsign in primary on a red-tinted panel.
+/// Transmitting: the local callsign in primary on a red-tinted panel.
 fn on_air(app: &App, ui: &mut egui::Ui) {
     ui.label(
         egui::RichText::new("● ON AIR")

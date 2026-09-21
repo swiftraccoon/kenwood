@@ -702,7 +702,7 @@ fn run_audio_worker(
     session_tx: tokio_mpsc::Sender<SessionCommand>,
     status_tx: std_mpsc::Sender<AudioStatus>,
 ) {
-    // Init failure is no longer fatal: the worker keeps running with
+    // Init failure is not fatal: the worker keeps running with
     // no device so the operator can pick a working one from the audio
     // panel. The error is still surfaced to the GUI.
     let audio = match AudioIo::init() {
@@ -806,8 +806,8 @@ struct AudioWorker {
     /// state to the GUI.
     status_tx: std_mpsc::Sender<AudioStatus>,
     /// Mic-level statistics for the current TX session, reset on
-    /// `StartTx` and logged on `StopTx`.  A summary at TX end tells
-    /// us unambiguously whether the mic is producing meaningful
+    /// `StartTx` and logged on `StopTx`.  A summary at TX end shows
+    /// unambiguously whether the mic is producing meaningful
     /// audio (`peak_max` ≥ ~0.1, roughly -20 dBFS, typical for spoken
     /// voice) or just floor noise / zeros (common when macOS denies
     /// permission without prompting).
