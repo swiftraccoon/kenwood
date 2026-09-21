@@ -35,8 +35,8 @@ use tracing::debug;
 
 use crate::reflector::{Reflector, ReflectorProtocol};
 
-/// Handshake timeout: how long we wait for the reflector to ACK the LINK
-/// before giving up.
+/// Handshake timeout: how long the session waits for the reflector to
+/// ACK the LINK before giving up.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Opaque [`UniFFI`](https://mozilla.github.io/uniffi-rs/) handle to a
@@ -131,9 +131,9 @@ enum TxCommand {
 /// Fields decoded from a 41-byte on-wire D-STAR header.
 ///
 /// Used by the Swift side to surface "who am I transmitting as" when
-/// a local TX is relayed to the reflector. Reflectors typically don't
-/// echo our own packets back, so we synthesise a recently-heard entry
-/// for our own relayed stream instead.
+/// a local TX is relayed to the reflector. Reflectors typically do not
+/// echo the sender's packets back, so a recently-heard entry is
+/// synthesised for the relayed stream instead.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct DecodedRadioHeader {
     /// Trimmed operator callsign (`MY`).
@@ -196,13 +196,13 @@ pub struct GpsPosition {
 /// instead of string-matching.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum DisconnectCause {
-    /// Reflector rejected our LINK request.
+    /// Reflector rejected the LINK request.
     Rejected,
-    /// Reflector acknowledged our unlink (expected after `disconnect`).
+    /// Reflector acknowledged the unlink (expected after `disconnect`).
     UnlinkAcked,
     /// No keepalive traffic inside the timeout window.
     KeepaliveTimeout,
-    /// Reflector did not acknowledge our disconnect in time.
+    /// Reflector did not acknowledge the disconnect in time.
     DisconnectTimeout,
     /// A cause added upstream that this build doesn't know yet.
     Unknown,
@@ -222,7 +222,7 @@ pub enum VoiceEndCause {
 /// Translated reflector event surfaced to the Swift observer.
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum ReflectorEvent {
-    /// The reflector acknowledged our LINK/CONNECT and we are live.
+    /// The reflector acknowledged the LINK/CONNECT and the session is live.
     Connected,
     /// Connection ended. `reason` is a typed [`DisconnectCause`]
     /// (rejected, unlink-acked, keepalive-timeout, disconnect-timeout,
@@ -381,7 +381,7 @@ impl ReflectorSession {
         self.callsign.clone()
     }
 
-    /// Name of the reflector we're connected to.
+    /// Name of the connected reflector.
     #[must_use]
     pub fn reflector_name(self: Arc<Self>) -> String {
         self.reflector_name.clone()
@@ -712,10 +712,10 @@ pub async fn fetch_dplus_directory(callsign: String) -> Result<Vec<Reflector>, R
 /// Outbound `slow_data` bytes are SCRAMBLED (wire format) because the
 /// radio emits them that way in MMDVM D-STAR data frames. The Kenwood
 /// D-STAR sync frame carries `[0x55, 0x55, 0x55]` plain, which lines
-/// up with the collector's `frame_index == 0` resync trigger, so we
-/// detect sync frames by matching the wire bytes directly rather
-/// than relying on our ad-hoc outbound seq counter (which is monotonic
-/// and doesn't wrap on superframe boundaries).
+/// up with the collector's `frame_index == 0` resync trigger, so sync
+/// frames are detected by matching the wire bytes directly rather
+/// than by the outbound seq counter (which is monotonic and does not
+/// wrap on superframe boundaries).
 #[derive(Default)]
 struct TxTextState {
     collector: SlowDataTextCollector,
@@ -776,7 +776,7 @@ struct StreamSlowDataState {
     /// Which half the next frame completes.
     block_phase: BlockPhase,
 
-    /// Kenwood 4-block text accumulator. We still feed every frame
+    /// Kenwood 4-block text accumulator. Every frame is still fed
     /// into it so it can commit complete 20-char messages; it
     /// self-filters non-text type bytes internally.
     text_collector: SlowDataTextCollector,
@@ -1168,7 +1168,7 @@ fn ingest_gps_chunk(state: &mut StreamSlowDataState, chunk: &str) -> bool {
 }
 
 /// Parse a complete GPS sentence into a [`GpsPosition`]. The prefix
-/// has already been identified by the ingest loop so we dispatch
+/// has already been identified by the ingest loop, so this dispatches
 /// directly.
 fn parse_gps_sentence(sentence: &str, prefix: &str) -> Option<GpsPosition> {
     match prefix {
@@ -1462,10 +1462,10 @@ async fn connect_dcs(
 
 /// Build, authenticate, and drive a full `DPlus` (REF) connect handshake.
 ///
-/// If auth fails we still attempt the UDP handshake (matching the
-/// repl's best-effort behaviour), but if the handshake ALSO fails,
-/// we prefix the error with the auth failure so users hunting the
-/// real cause don't have to guess.
+/// If auth fails the UDP handshake is still attempted (the same
+/// best-effort behaviour as `thd75-repl`); if the handshake also
+/// fails, the returned error is prefixed with the auth failure so the
+/// real cause is visible.
 async fn connect_dplus(
     station: Callsign,
     peer: std::net::SocketAddr,
@@ -1668,7 +1668,7 @@ mod slow_data_gps_tests {
         Ok(())
     }
 
-    /// Exercise the block-phase alignment: if we "join mid-stream"
+    /// Exercise the block-phase alignment: when joining mid-stream
     /// by skipping the first frame, every downstream block read is
     /// shifted by 3 bytes: the type nibble will be whatever byte 4
     /// of the original block was, never 0x3X. No GPS should decode.

@@ -13,7 +13,7 @@ bindings ship as `LodestarKit.xcframework`, produced by
 - `version()`: crate semver.
 - Audio: `RxAudioPipeline`, which AMBE-decodes reflector voice frames into 8 kHz
   mono PCM for on-device monitoring.
-- CAT: `encode_cat`, `parse_cat_line` covering the `ID` identify command.
+- CAT: `encode_cat`, `parse_cat_line` covering the `ID` and `FV` identity commands.
 - MCP: page read/write primitives for flipping menu 650 (DV Gateway) into
   Reflector Terminal Mode.
 - MMDVM: frame codec and `mmdvm_get_version_probe` for radio-mode detection.

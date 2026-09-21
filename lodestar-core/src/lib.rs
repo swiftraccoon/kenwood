@@ -91,8 +91,8 @@ pub enum LogLevel {
 /// Foreign-implemented sink that receives one call per Rust `tracing`
 /// event. Swift writes a concrete implementation that forwards each
 /// event to `os_log` with subsystem `org.swiftraccoon.lodestar.rust`
-/// so our `tracing::debug!` / `tracing::trace!` calls end up in
-/// Apple's Unified Log and our in-app Log Viewer.
+/// so the crate's `tracing::debug!` / `tracing::trace!` calls end up in
+/// Apple's Unified Log and the app's Log Viewer.
 #[uniffi::export(with_foreign)]
 pub trait LogSink: Send + Sync + std::fmt::Debug {
     /// Called once per tracing event. `target` is the
