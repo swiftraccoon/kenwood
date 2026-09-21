@@ -94,7 +94,7 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
-    /// The file is not valid TOML for our schema.
+    /// The file is not valid TOML for the stargazer schema.
     #[error("parse: {0}")]
     Parse(#[from] toml::de::Error),
     /// The file parsed but a value is invalid.

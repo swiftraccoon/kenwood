@@ -8,10 +8,10 @@
 //! server-side decoded `.mp3`, and a `.txt` sidecar under
 //! `https://<reflector>.dstargateway.org:8443/streams/<Y>/<M>/<D>/`
 //! with directory listing enabled. The MP3 is decoded by a different
-//! (higher-quality) vocoder implementation than ours, which makes it
-//! a per-transmission reference signal for audio-quality work: our
-//! `.ambe` capture of the same stream carries byte-identical frames,
-//! so `(our frames, their audio)` forms a matched pair.
+//! (higher-quality) vocoder implementation than mbelib-rs, which makes
+//! it a per-transmission reference signal for audio-quality work: the
+//! local `.ambe` capture of the same stream carries byte-identical
+//! frames, so `(local frames, published audio)` forms a matched pair.
 //!
 //! The harvester walks a recordings directory as written by the
 //! recorder, matches each published transmission to a local recording
@@ -19,7 +19,7 @@
 //! downloads the published files into `<date dir>/published/` under
 //! their original names. Matched transmissions fetch the `.mp3` and
 //! `.txt`; the bulkier `.dvrec` is fetched only where it adds frames
-//! we lack (our capture has gaps, or we missed the transmission
+//! the local capture lacks (gaps, or a transmission missed
 //! entirely). Every download and every run appends a provenance
 //! record to `<date dir>/published/harvest.jsonl`.
 //!
@@ -59,8 +59,8 @@ fn build_user_agent(operator: Option<&str>) -> String {
     ua
 }
 
-/// Decide whether a robots.txt body forbids us from `path`, checked
-/// for both the wildcard agent and our own product token. We honor it
+/// Decide whether a robots.txt body forbids `path`, checked for both
+/// the wildcard agent and this tool's product token. It is honored
 /// even though the files are operator-published links, because the
 /// politest interpretation always wins.
 fn robots_disallows(robots: &str, path: &str) -> bool {
@@ -143,7 +143,7 @@ pub struct LocalRecording {
     pub callsign: String,
     /// Stream id, uppercase hex.
     pub stream_id: String,
-    /// Transmission start per our clock (UTC).
+    /// Transmission start per the local clock (UTC).
     pub started_at: DateTime<Utc>,
     /// Sequence gaps observed during capture.
     pub gaps: u64,
@@ -162,13 +162,13 @@ pub struct LoadedLocal {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum FetchReason {
-    /// Reference audio for a transmission we captured.
+    /// Reference audio for a locally captured transmission.
     PairedAudio,
     /// Publisher's metadata sidecar for a paired transmission.
     PairedSidecar,
     /// Packet log to repair a gapped local capture.
     GapFillDvrec,
-    /// Transmission we missed entirely: take everything published.
+    /// Transmission missed entirely: take everything published.
     Salvage,
 }
 
@@ -960,7 +960,7 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    /// Real rows sampled from the live REF030 listing (2026-07-11):
+    /// Real rows sampled from the live REF030 listing:
     /// Apache autoindex, every file linked twice (icon + name), plus
     /// the parent-directory row that must be ignored.
     const LISTING_FIXTURE: &str = concat!(

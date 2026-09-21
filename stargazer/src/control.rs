@@ -4,10 +4,10 @@
 //! Runtime target control for the recorder.
 //!
 //! One callsign gets one session per reflector, so testing a client
-//! (sextant) against a busy reflector used to mean restarting the
-//! whole recorder with an edited config, dropping and relinking
-//! every target. This module gives the running recorder a local
-//! control socket instead: `stargazer ctl disable REF030-C` unlinks
+//! (sextant) against a busy reflector needs that target released
+//! without restarting the whole recorder with an edited config. This
+//! module gives the running recorder a local control socket for
+//! that: `stargazer ctl disable REF030-C` unlinks
 //! exactly one target (politely, finalizing open captures), `enable`
 //! reclaims it, `reload` applies config target additions/removals,
 //! and `status` reports the live picture. Disables persist across
@@ -33,7 +33,7 @@ pub const SOCKET_FILE: &str = ".stargazer-ctl.sock";
 /// Persisted disabled-target list (inside the recordings directory).
 pub const DISABLED_FILE: &str = ".disabled-targets";
 
-/// Longest we wait for one target's graceful unlink before reporting
+/// Longest wait for one target's graceful unlink before reporting
 /// it as slow (the task keeps draining in the background).
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(6);
 

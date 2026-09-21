@@ -6,11 +6,11 @@
 //! The publishing daemon logs every packet of a transmission as one
 //! timestamped text line; the voice lines carry the 9 AMBE bytes and
 //! 3 slow-data bytes as hex, and a header line carries the full
-//! D-STAR routing header. A capture from our own client session of
+//! D-STAR routing header. A capture from a local client session of
 //! the same stream is byte-identical (verified against a live
-//! transmission frame for frame), so a transmission we never
-//! captured (recorder offline, target disabled, or a reflector we
-//! do not link) can be reconstructed from its published dvrec into
+//! transmission frame for frame), so a transmission never captured
+//! locally (recorder offline, target disabled, or a reflector not
+//! linked) can be reconstructed from its published dvrec into
 //! the same `.ambe`/`.wav`/`.json` recording layout the live
 //! recorder writes, and from there paired with its published
 //! reference MP3 like any other recording.
@@ -452,9 +452,9 @@ mod tests {
     #[test]
     fn gap_accounting_matches_capture_core_on_dup_and_wild_seq() -> TestResult {
         // A duplicate seq (01, 01) and an out-of-alphabet seq (2A = 42,
-        // e.g. a corrupted byte) must both contribute ZERO gaps: the
-        // divergent local formula previously reported 20 for a repeat
-        // and ran unguarded on wild bytes. Seqs here: 0,1,1,42,2. The
+        // e.g. a corrupted byte) must both contribute ZERO gaps; a
+        // repeat is not a 20-frame gap and a wild byte must not be
+        // counted. Seqs here: 0,1,1,42,2. The
         // only genuine discontinuity (1 -> 2 across the noise) is none,
         // since 2 follows 1 in the alphabet once the wild value is
         // ignored... but the wild value resets prev, so 42 -> 2 is also

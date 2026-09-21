@@ -31,7 +31,7 @@ const USER_AGENT: &str = concat!(
 );
 
 /// Minimum allowed poll interval. The feed's own web UI polls every
-/// 15 s per viewer; we never go below twice that.
+/// 15 s per viewer; the poller never goes below twice that.
 pub const MIN_INTERVAL_SECS: u64 = 30;
 
 /// One transmission event parsed from the feed.
@@ -53,7 +53,7 @@ pub struct ActivityEvent {
     pub rpt1: String,
     /// RPT2 as displayed.
     pub rpt2: String,
-    /// When our poll first observed this event.
+    /// When the poll first observed this event.
     pub polled_at: DateTime<Utc>,
 }
 
@@ -532,7 +532,7 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    /// Three real rows sampled from the live feed (2026-07-11):
+    /// Three real rows sampled from the live feed:
     /// a reflector transmission, a local-gateway transmission with an
     /// empty Reflector cell, and a mycall with a note suffix.
     const FIXTURE: &str = concat!(

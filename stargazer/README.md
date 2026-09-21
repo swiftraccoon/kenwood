@@ -60,7 +60,7 @@ exponential backoff. `--verbose` enables per-frame debug logging.
 
 `DPlus` targets attempt authentication against the D-STAR gateway auth
 service first; if that fails, stargazer logs a warning and connects
-unauthenticated (most reflectors accept the link anyway).
+unauthenticated.
 
 The two capture limits are operator policy, not protocol limits. On the first
 frame beyond `max_capture_seconds`, Stargazer writes the retained prefix with
@@ -221,13 +221,12 @@ survey runs, the more meaningful the ranking.
 
 ## Why archive raw AMBE?
 
-Decoded audio is a one-way door: MP3/WAV destroys the codec
-parameters. The raw 9-byte frames preserve everything the RF channel
-delivered: they can be re-decoded forever with improving decoders,
-and they are exactly the input that vocoder-parameter speech
-recognition consumes (models that read AMBE/IMBE codec parameters
-directly instead of reconstructed audio). The WAV exists for humans;
-the `.ambe` exists for the future.
+Decoded audio discards the codec parameters. The raw 9-byte frames
+preserve everything the RF channel delivered: they can be re-decoded
+with later decoders, and they are the input that vocoder-parameter
+speech recognition consumes (models that read AMBE/IMBE codec
+parameters directly instead of reconstructed audio). The WAV is for
+listening; the `.ambe` is the archive.
 
 ## Legal & community notes
 
