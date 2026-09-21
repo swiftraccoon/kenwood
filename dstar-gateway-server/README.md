@@ -28,10 +28,9 @@ The crate also ships a `polaris` binary: a minimal standalone
 DExtra reflector that binds `0.0.0.0:30001` (override with the
 `POLARIS_BIND` env var, e.g. `127.0.0.1:30001` to restrict it to
 loopback) with callsign `POLARIS` and the default
-`AllowAllAuthorizer`. It's the
-counterpart we pair with the `sextant` GUI and `thd75-repl`'s
-D-STAR mode for end-to-end voice-pipeline testing with no
-external reflector in the loop:
+`AllowAllAuthorizer`. It is the local counterpart for the `sextant`
+GUI and `thd75-repl`'s D-STAR mode in end-to-end voice-pipeline
+tests with no external reflector in the loop:
 
 ```text
 cargo run -p dstar-gateway-server --bin polaris

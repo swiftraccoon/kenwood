@@ -70,7 +70,7 @@ pub struct EndpointOutcome<P: Protocol> {
 impl<P: Protocol> EndpointOutcome<P> {
     /// Construct an empty outcome (no txs, no events, no retransmit).
     ///
-    /// We cannot derive `Default` because it would require
+    /// `Default` cannot be derived because it would require
     /// `P: Default`, which the sealed `Protocol` trait intentionally
     /// doesn't bound. Every protocol marker is a ZST so constructing
     /// an empty outcome has no data-dependent initialization anyway.
@@ -551,7 +551,7 @@ impl<P: Protocol> ProtocolEndpoint<P> {
     /// (pass-through to the core, which transitions to a transitional
     /// `Link1Received` state and enqueues the 5-byte ACK echo), then
     /// `Link2` carries the client's callsign and fires the authorizer.
-    /// On a rejected `Link2` we emit an 8-byte `BUSY` reply and a
+    /// A rejected `Link2` emits an 8-byte `BUSY` reply and a
     /// [`ServerEvent::ClientRejected`] event but do NOT create a
     /// pool handle.
     async fn handle_inbound_dplus(
@@ -1555,9 +1555,9 @@ impl<P: Protocol> ProtocolEndpoint<P> {
     /// drain its outbox + events.
     ///
     /// Held as a private helper so the lock-protected mutation of the
-    /// per-peer `ServerSessionCore` stays in one place. We take the pool's
-    /// mutex, borrow the handle mutably, feed the core, drain everything into
-    /// owned `Vec`s, and apply `pending_access` only when that outcome proves
+    /// per-peer `ServerSessionCore` stays in one place. It takes the pool's
+    /// mutex, borrows the handle mutably, feeds the core, drains everything into
+    /// owned `Vec`s, and applies `pending_access` only when that outcome proves
     /// the link was accepted. The state transition and authorization update
     /// therefore become visible together when the lock is released.
     async fn drive_core(

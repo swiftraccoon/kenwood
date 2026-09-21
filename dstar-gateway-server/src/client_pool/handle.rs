@@ -144,7 +144,7 @@ impl TokenBucket {
 /// One entry in [`super::ClientPool`].
 ///
 /// Tracks the per-peer server session, its module membership (if
-/// any), the last time we heard from the client, the access policy
+/// any), the last time a datagram arrived from the client, the access policy
 /// the authorizer granted, a running count of send failures so the
 /// fan-out engine can evict unhealthy peers, and a per-client TX
 /// token bucket used to rate-limit how many fan-out voice frames
@@ -155,7 +155,7 @@ pub struct ClientHandle<P: Protocol> {
     pub session: ServerSessionCore,
     /// Module the client has linked to, if any.
     pub module: Option<Module>,
-    /// Last time we received a datagram from this client.
+    /// Last time a datagram arrived from this client.
     pub last_heard: Instant,
     /// Access policy granted by the authorizer.
     pub access: AccessPolicy,

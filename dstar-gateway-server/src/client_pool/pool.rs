@@ -2,8 +2,8 @@
 //!
 //! Keyed by `SocketAddr` (the only stable identifier for a UDP
 //! client). Wrapped in [`tokio::sync::Mutex`] so multiple tokio tasks
-//! can update concurrently. This is intentionally simple for Batch
-//! 2; we can swap to a sharded map if contention is observed.
+//! can update concurrently. A sharded map is the fallback if
+//! contention is observed.
 
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
@@ -261,7 +261,7 @@ impl<P: Protocol> ClientPool<P> {
         }
     }
 
-    /// Record that we just received a datagram from the given peer.
+    /// Record that a datagram just arrived from the given peer.
     ///
     /// # Cancellation safety
     ///

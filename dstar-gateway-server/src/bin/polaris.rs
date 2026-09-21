@@ -42,7 +42,7 @@ use thiserror as _;
 use trybuild as _;
 
 /// Default tracing filter if `RUST_LOG` is not set. Aimed at
-/// post-mortem debugging: `debug` for our own crates, `info` for
+/// post-mortem debugging: `debug` for the workspace crates, `info` for
 /// everything else. Override via `RUST_LOG=…` to crank up noise
 /// during a specific diagnosis.
 const DEFAULT_FILTER: &str = "dstar_gateway=debug,dstar_gateway_server=debug,polaris=debug,info";
