@@ -1,4 +1,4 @@
-//! Read-only CAT observations with explicit ownership, identity, and cleanup.
+//! Read-only CAT queries over an owned connection, closed when they finish.
 
 use std::fs::File;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,7 +22,7 @@ pub(crate) enum Scope {
     Status,
 }
 
-/// Keep the actual typed tuple while publishing readable evidence.
+/// An `Identity` that serializes as model, firmware and radio-type strings.
 #[derive(Debug)]
 pub(crate) struct IdentityEvidence(pub(crate) Identity);
 
@@ -124,7 +124,7 @@ async fn query(
     Ok(())
 }
 
-/// Consume and retire this captured owner before returning protocol evidence.
+/// Run the requested queries, then close the connection before returning.
 pub(crate) async fn observe(
     mut transport: CaptureTransport<impl Transport, File>,
     request: Request<'_>,

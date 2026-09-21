@@ -1,9 +1,10 @@
-//! D-STAR runtime with automatic Bluetooth Terminal ownership or manual USB.
+//! D-STAR runtime over automatic Bluetooth Terminal setup or manual USB.
 //!
-//! Automatic startup guards and captures persistent mode/routing changes before
-//! bounded exact-endpoint MMDVM acquisition. USB-only startup retains its
-//! manual-mode preconditions. Neither path initializes the runtime or connects
-//! a reflector before complete version framing on the owned modem connection.
+//! Automatic startup compares and captures each persistent mode and routing
+//! page before writing it, then acquires MMDVM framing on the same endpoint
+//! within a bounded window. USB-only startup requires the modes to be set by
+//! hand first. Neither path initializes the runtime or connects a reflector
+//! before a complete version exchange on the modem connection.
 
 use std::pin::pin;
 use std::sync::Arc;
@@ -147,7 +148,7 @@ pub(super) async fn run(path: &str, baud: u32, request: StartRequest) -> Result<
     session.command_loop(editor).await
 }
 
-/// Automatic Bluetooth startup, retaining USB recovery until runtime shutdown.
+/// Start over Bluetooth, keeping the USB restoration data until shutdown.
 pub(super) async fn run_bluetooth(
     endpoint: crate::native::discovery::Request,
     control_port: Option<&str>,
@@ -172,7 +173,8 @@ pub(super) async fn run_bluetooth(
     session.command_loop(editor).await
 }
 
-/// Retain startup through interruption, then retire any late successful owner.
+/// Await startup to completion, shutting down a session that finishes after
+/// Ctrl-C.
 async fn finish_startup<T, F, S>(
     workflow: F,
     signal: S,
@@ -230,7 +232,7 @@ impl DstarSession<SerialTransport> {
         let transport = open_serial(path, baud).map_err(|error| error.to_string())?;
         let proof = prove_mmdvm_or_explain_cat(transport, connection).await?;
         output::line(format_args!(
-            "MMDVM framing proved on {path}; it cannot distinguish Reflector Terminal from Access Point mode. Continuing on the operator precondition that Menus 670 and 650 are set to Reflector TERM Mode and Terminal Mode."
+            "MMDVM answered on {path}. The reply does not say whether the radio is in Reflector Terminal or Access Point mode; continuing, so check that Menu 670 is Reflector TERM Mode and Menu 650 is Terminal Mode."
         ));
         Self::from_proof(proof, request, None, &AtomicBool::new(false)).await
     }
@@ -802,7 +804,7 @@ async fn failure_with_recovery(
     }
 }
 
-/// Join the prompt worker before returning its editor or reporting failure.
+/// Read one prompt line on a blocking worker, joining it before returning.
 async fn read_command(editor: &mut Option<DefaultEditor>) -> Result<String, ReadlineError> {
     let mut owned_editor = editor
         .take()
@@ -1111,11 +1113,9 @@ mod tests {
             for expected in [
                 "DV Gateway state: Terminal",
                 "Terminal Mode is already selected (GW 2)",
-                "This endpoint answered CAT; MMDVM is not proved",
-                "may be routed to another endpoint",
-                "GW does not identify its route or pair USB endpoints to one radio",
+                "This endpoint answered CAT, so it is not the active gateway",
                 "select it with --port",
-                "No automatic setup was attempted",
+                "No other endpoint was opened and no setting was changed",
             ] {
                 assert!(
                     guidance.contains(expected),
@@ -1151,8 +1151,8 @@ mod tests {
                 "missing {expected}: {guidance}"
             );
             assert!(
-                guidance.contains("Gateway state is not confirmed as Off or Terminal"),
-                "an unnamed value or query error does not establish either named state"
+                guidance.contains("The GW query failed or returned an unrecognized value"),
+                "an unnamed value or query error must not be reported as Off or Terminal"
             );
             for forbidden in [
                 "DV Gateway state: Off.",

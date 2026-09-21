@@ -1,8 +1,9 @@
-//! Explicit USB Terminal ownership around one diagnostic-only modem lease.
+//! Guarded Terminal entry on the USB control endpoint around one probe.
 //!
-//! Full-page intent precedes writes. Every MCP owner is closed and dropped before
-//! bounded identity-only reacquisition. Restoration uses inverse exact images on
-//! a fresh control owner, never a blind write or an uncertain previous handle.
+//! Every page write is preceded by a journal record naming that page, written
+//! and synced first. Each MCP connection is closed and dropped before the
+//! bounded identity-only reconnect. Restoration compares each page again on a
+//! freshly opened control connection, then writes the captured before-image.
 
 use std::fs::File;
 use std::io::{self, Write};
@@ -107,7 +108,10 @@ impl Captures {
     }
 }
 
-/// Adapt the existing diagnostic owner without introducing another probe driver.
+/// Adapts the managed backend to the probe's `Backend`.
+///
+/// Every open re-enumerates first and fails unless the modem endpoint still
+/// matches the selected candidate and is still unambiguous.
 struct ProbeBackend<'a, B>(&'a mut B);
 
 impl<B: Backend> super::Backend for ProbeBackend<'_, B> {
@@ -217,9 +221,9 @@ async fn run_workflow(
                 .problems
                 .push(Problem::new(FailureStage::Operation, &error)),
             Ok(restore) => {
-                // Cancellation suppresses new diagnostic work, not an already
-                // owned restoration. All evidence and fresh comparison gates
-                // still apply, with one attempt and no blind retry.
+                // Restoration still runs under Ctrl-C: pass a never-set flag in
+                // place of `cancelled`. The page comparison before each write
+                // is unchanged, and the write is attempted once.
                 let finish_required = AtomicBool::new(false);
                 let restored = phase::run(
                     backend,
@@ -278,7 +282,12 @@ impl Report<'_> {
     }
 }
 
-/// Admit all offline guards before reserving evidence or opening either endpoint.
+/// Run Terminal entry, the probe, and restoration over the two endpoints.
+///
+/// The backup, the Terminal plan and both endpoint roles are validated before
+/// any capture file is created or either endpoint is opened. Returns an error
+/// on a non-Unix host, on any validation failure, and when the workflow ends
+/// cancelled, incomplete, or with restoration still owed.
 pub(super) async fn run(endpoint: &SerialCandidate, request: &Request) -> AppResult<()> {
     let _path = request.validate(Some(&endpoint.path), DEFAULT_BAUD)?;
     if !cfg!(unix) {
@@ -329,7 +338,7 @@ pub(super) async fn run(endpoint: &SerialCandidate, request: &Request) -> AppRes
     )?
     .sync_all()?;
     output::line(format_args!(
-        "Managed Terminal diagnostic evidence: {}. Ctrl-C suppresses diagnostics but preserves owed restoration.",
+        "Managed Terminal diagnostic capture: {}. Ctrl-C stops new diagnostics; a restoration already owed still runs.",
         directory.display()
     ));
     let started_at_utc = OffsetDateTime::now_utc().format(&Rfc3339)?;
@@ -373,6 +382,6 @@ pub(super) async fn run(endpoint: &SerialCandidate, request: &Request) -> AppRes
     if report.workflow.succeeded() && !report.cancelled && report.signal_error.is_none() {
         Ok(())
     } else {
-        Err(CommandError(format!("managed diagnostic incomplete; retain {} and its recovery journal; do not retry or restore blindly", directory.display())).into())
+        Err(CommandError(format!("managed diagnostic incomplete; keep {} and read its recovery journal, which names any page left changed", directory.display())).into())
     }
 }

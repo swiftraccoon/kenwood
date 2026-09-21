@@ -1,4 +1,8 @@
-//! Private, synchronized evidence for one fixed Terminal-to-Off experiment.
+//! Append-only, fsynced record of one Terminal-to-Off write.
+//!
+//! One private JSON-lines file per run holds the trial scope, the single write
+//! intent and both sessions' diagnostics. The first append or synchronization
+//! failure blocks every later append.
 
 use std::fs::File;
 use std::io::{self, Write};
@@ -17,7 +21,9 @@ use super::super::IdentityEvidence;
 #[cfg(unix)]
 const FILENAME: &str = "terminal-exit-journal.jsonl";
 
-/// Injectable durability boundary; success includes content and metadata sync.
+/// Sink whose `Ok` means the bytes and the directory entry reached storage.
+///
+/// Tests substitute a sink that fails on demand.
 pub(super) trait DurableWrite: Write {
     /// Synchronize the complete file contents and metadata.
     fn synchronize(&mut self) -> io::Result<()>;
@@ -25,7 +31,7 @@ pub(super) trait DurableWrite: Write {
     fn synchronize_directory(&mut self) -> io::Result<()>;
 }
 
-/// Exclusive file and canonical private directory retained for synchronization.
+/// The journal file and the canonical directory holding its entry.
 #[derive(Debug)]
 pub(super) struct FileSink {
     file: File,
@@ -131,8 +137,9 @@ impl BoundTrial {
     }
 }
 
-/// One append-only fixed-scope journal, permanently poisoned by its first error.
-/// No operation rewrites a record, changes a bound plan, or authorizes RF.
+/// One append-only journal; its first failure blocks all later appends.
+///
+/// No method rewrites a record or changes the trial bound at `prepare`.
 #[derive(Debug)]
 pub(super) struct Journal<S: DurableWrite = FileSink> {
     sink: S,
@@ -144,9 +151,11 @@ pub(super) struct Journal<S: DurableWrite = FileSink> {
 }
 
 impl Journal<FileSink> {
-    /// Reserve a new mode-0600 file inside an existing mode-0700 real directory.
-    /// Reject a final-component directory symlink when checked; existing files
-    /// are never overwritten. This does not establish a race-free path lookup.
+    /// Create a mode-0600 journal file in an existing mode-0700 directory.
+    ///
+    /// A symlink as the final path component is rejected and an existing file
+    /// is never overwritten; the checks run before and after the open, so the
+    /// lookup is not race-free.
     #[cfg(unix)]
     pub(super) fn create(directory: &Path) -> io::Result<Self> {
         use std::os::unix::fs::PermissionsExt;
@@ -169,7 +178,8 @@ impl Journal<FileSink> {
         Ok(Self::new(FileSink { file, directory }))
     }
 
-    /// Refuse platforms without the required private-file durability contract.
+    /// Return an error: non-Unix hosts lack the private-file and directory
+    /// synchronization this journal requires.
     #[cfg(not(unix))]
     pub(super) fn create(_directory: &Path) -> io::Result<Self> {
         Err(unsupported_platform())
@@ -189,9 +199,13 @@ impl<S: DurableWrite> Journal<S> {
         }
     }
 
-    /// Bind all immutable captured bytes and the synthetic active expectation.
-    /// The caller establishes baseline provenance and exact-scope approval;
-    /// preparation is neither an observed active page nor hardware permission.
+    /// Record the trial scope, the source backup path and the expected page.
+    ///
+    /// The expected active page is derived from the captured Off page, not read
+    /// from the radio. Requires an untouched trial whose next session is
+    /// `Apply`. The file and its directory are synchronized before this returns
+    /// `Ok`; it returns an `io::Error` when the journal is already prepared, the
+    /// trial is not untouched, or any append or synchronization fails.
     pub(super) fn prepare(&mut self, trial: &TerminalExitTrial, backup: &Path) -> io::Result<()> {
         self.require(
             self.stage == Stage::Unprepared,
@@ -206,7 +220,7 @@ impl<S: DurableWrite> Journal<S> {
             scope: Scope::new(trial),
             backup,
             active_page_provenance: "synthetic expectation derived from the complete captured Off page; not an observed active-state baseline",
-            approval_provenance: "caller must separately establish approval for this exact single Terminal-to-Off trial",
+            approval_provenance: "--approve-live-test on the command line for this exact single Terminal-to-Off trial",
             layout_qualification: "unqualified",
         })?;
         self.bound = Some(BoundTrial::new(trial));
@@ -214,15 +228,18 @@ impl<S: DurableWrite> Journal<S> {
         Ok(())
     }
 
-    /// Synchronize the sole intent after accepted fresh format and exact target,
-    /// control, and routing comparisons, before pure intent acceptance or W.
-    /// Raw read evidence remains in the separate session capture; this callback
-    /// attests that comparison rather than independently authenticating it.
+    /// Append and fsync the single write intent, before the W frame is sent.
+    ///
+    /// The engine calls this after it has matched memory format zero and the
+    /// exact target, control and routing pages; the raw bytes behind those
+    /// comparisons stay in the session capture. At most one intent is accepted,
+    /// and only while no session diagnostics have been recorded; any other call
+    /// returns an `io::Error`.
     pub(super) fn intent(&mut self, trial: &TerminalExitTrial) -> io::Result<()> {
         self.check_bound(trial)?;
         self.require(
             self.stage == Stage::Prepared && self.attempts == 0,
-            "journal permits one intent before any session evidence",
+            "journal permits one intent before any session record",
         )?;
         self.require(
             trial.status() == TerminalExitTrialStatus::NotWritten
@@ -244,15 +261,16 @@ impl<S: DurableWrite> Journal<S> {
         Ok(())
     }
 
-    /// Synchronize one completed or failed attempt's diagnostics. The ordinal
-    /// records append order, not independently proven session or device identity.
-    /// At most two attempts are retained; without an intent only the first
-    /// failed attempt is permitted, and no later intent may follow it.
+    /// Append one session's diagnostics, successful or failed.
+    ///
+    /// The recorded ordinal is the append order. At most two sessions are
+    /// recorded; without a write intent only the first is accepted, and no
+    /// intent may follow it.
     pub(super) fn evidence(&mut self, evidence: &impl Serialize) -> io::Result<()> {
         self.require(
             (self.stage == Stage::Prepared && self.attempts == 0)
                 || (self.stage == Stage::Intent && self.attempts < 2),
-            "journal session evidence is out of order or exceeds the two-session bound",
+            "journal session record is out of order or exceeds the two-session bound",
         )?;
         let attempt = self.attempts + 1;
         self.append(
@@ -266,9 +284,10 @@ impl<S: DurableWrite> Journal<S> {
         Ok(())
     }
 
-    /// Record the bound engine's terminal outcome without inferring success
-    /// from process exit or immediate readback. Failures must first halt the
-    /// engine. Verified Off requires the intent and both evidence records.
+    /// Append the trial's final outcome and close the journal.
+    ///
+    /// The engine must be halted or complete. `OffVerifiedAcrossSessions`
+    /// requires the write intent and both session records.
     pub(super) fn finish(&mut self, trial: &TerminalExitTrial) -> io::Result<()> {
         self.check_bound(trial)?;
         self.require(self.stage != Stage::Finished, "journal is already finished")?;
@@ -289,7 +308,7 @@ impl<S: DurableWrite> Journal<S> {
         };
         self.require(
             consistent,
-            "final engine status disagrees with durable intent or attempt evidence",
+            "final trial status disagrees with the journal's write-intent and session records",
         )?;
         self.append(
             Kind::Finished,

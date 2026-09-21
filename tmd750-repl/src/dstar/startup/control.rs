@@ -1,4 +1,4 @@
-//! Exact USB control ownership with shared CAT observation and bounded retirement.
+//! Open, query and close the USB control endpoint, with capture throughout.
 
 use std::fs::File;
 use std::io;
@@ -14,7 +14,9 @@ use crate::mcp::reconnect::{Backend, endpoint_is_unambiguous};
 use crate::native::cat;
 use crate::{AppResult, CommandError};
 
-/// Cleanup and required capture are independent of protocol success.
+/// Result of closing one control connection: the close error, the capture
+/// error, and the transcript summary, each recorded whether or not the CAT
+/// exchange succeeded.
 #[derive(Clone, Debug, Serialize)]
 pub(super) struct Retirement {
     pub(super) close_error: Option<Failure>,
@@ -23,22 +25,29 @@ pub(super) struct Retirement {
 }
 
 impl Retirement {
-    /// A dropped owner alone cannot satisfy either cleanup or capture.
+    /// True only when the close succeeded, the capture succeeded, and the
+    /// transcript is complete. Dropping the transport alone never sets this.
     pub(super) const fn succeeded(&self) -> bool {
         self.close_error.is_none() && self.capture_error.is_none() && self.transcript.complete
     }
 }
 
-/// Failed opening admission retains its primary cause and independent cleanup.
+/// A control endpoint that could not be opened or accepted.
 #[derive(Debug, Serialize)]
 pub(super) struct OpenFailure {
+    /// Why the open or the post-open check failed.
     pub(super) primary: Failure,
+    /// How the connection, if one was acquired, was closed.
     pub(super) retirement: Retirement,
 }
 
 impl std::fmt::Display for OpenFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "USB control admission failed: {}", self.primary)?;
+        write!(
+            formatter,
+            "the USB control endpoint could not be opened: {}",
+            self.primary
+        )?;
         for (stage, error) in [
             ("close", &self.retirement.close_error),
             ("capture", &self.retirement.capture_error),
@@ -70,7 +79,7 @@ fn check_cancelled(cancelled: &AtomicBool) -> io::Result<()> {
     if cancelled.load(Ordering::Relaxed) {
         Err(io::Error::new(
             io::ErrorKind::Interrupted,
-            "USB control admission cancelled",
+            "opening the USB control endpoint was cancelled",
         ))
     } else {
         Ok(())
@@ -132,7 +141,7 @@ fn finish_capture(mut recorder: Recorder<File>, close_error: Option<Failure>) ->
     }
 }
 
-/// Always close once within the shared two-second bound, then drop and sync.
+/// Close once within the shared two-second bound, then drop and sync capture.
 pub(super) async fn retire<T: Transport>(mut transport: CaptureTransport<T, File>) -> Retirement {
     let close_error = crate::native::close(&mut transport).await;
     finish_capture(transport.into_recorder(), close_error)
@@ -155,10 +164,10 @@ async fn admit<T: Transport>(
     Ok(transport)
 }
 
-/// Open only fresh, unambiguous metadata for the exact selected USB endpoint.
+/// Open the exact selected USB endpoint after re-reading its metadata.
 ///
-/// Acquired owners that fail cancellation or capture admission are closed and
-/// dropped before the error returns. This function sends no radio commands.
+/// A connection acquired but then refused by cancellation or a capture failure
+/// is closed and dropped before the error returns. No radio command is sent.
 pub(super) async fn open<B: Backend>(
     backend: &mut B,
     endpoint: &SerialCandidate,
@@ -179,7 +188,7 @@ pub(super) async fn open<B: Backend>(
     }
 }
 
-/// Observe Gateway CAT through the shared query and independent cleanup logic.
+/// Open the endpoint, run the identity and Gateway queries, then close it.
 pub(super) async fn observe<B: Backend>(
     backend: &mut B,
     endpoint: &SerialCandidate,

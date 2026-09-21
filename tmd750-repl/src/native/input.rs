@@ -1,17 +1,19 @@
-//! Owned command input without an uncancellable background stdin reader.
+//! Cancellable command input, with no detached background stdin reader.
 //!
-//! Rich terminals retain Rustyline editing and history on a joined worker.
-//! Rustyline's Unix signal handlers are process-global: this adapter assumes
-//! exclusive terminal ownership. A retained Tokio SIGINT registration covers
-//! Rustyline's handler-installation and retirement windows. Once cancellation
-//! is requested, thread-directed SIGINT wakes only the owned reader. The thread
-//! stays joinable until completion is observed and its owner joins it.
-//! Pipes and plain terminals use nonblocking readiness on Unix; cancellation
-//! never needs their writer to close or supply a newline. Descriptor flags are
-//! restored explicitly before this adapter is retired. Regular-file scripts
-//! are bounded and loaded before the caller opens a radio connection.
-//! Source mode remains explicit so redirected batches cannot inherit successful
-//! interactive interruption or typo-recovery semantics.
+//! A rich terminal keeps Rustyline editing and history on a worker thread that
+//! is always joined. Rustyline's Unix signal handlers are process-global, so
+//! this adapter assumes exclusive use of the terminal; a Tokio SIGINT
+//! registration is held across the windows where Rustyline installs and
+//! removes its own handler. After cancellation is requested, a thread-directed
+//! SIGINT wakes only that reader, and the thread stays joinable until its
+//! completion is observed and it is joined.
+//!
+//! Pipes and plain terminals use nonblocking readiness on Unix, so cancelling
+//! needs neither a closed writer nor a newline, and descriptor flags are
+//! restored before the adapter is dropped. Regular-file scripts are read, up
+//! to `MAX_SCRIPT_BYTES`, before the caller opens a radio connection. The
+//! source mode is explicit, so a redirected batch does not get the interactive
+//! interrupt and typo-recovery behavior.
 
 use std::io::{self, IsTerminal};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -60,10 +62,12 @@ pub(super) enum Event {
     Interrupted,
 }
 
-/// Terminal sessions recover from typos; redirected commands form a batch.
+/// Where commands come from, which selects the error behavior.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum InputMode {
+    /// A terminal session, where a rejected line is reported and retried.
     Interactive,
+    /// Redirected input, where the batch stops at the first rejected line.
     Batch,
 }
 
@@ -77,15 +81,15 @@ impl InputMode {
     }
 }
 
-/// Input ownership remains separate from the radio and its protocol state.
+/// A source of command lines, independent of the radio connection.
 pub(super) trait CommandInput {
-    /// Keep completion policy tied to the original source, including after close.
+    /// The mode of the original source, unchanged by `close`.
     fn mode(&self) -> InputMode;
 
-    /// Await one command, retaining any started terminal worker until it ends.
+    /// Await one line, joining any terminal worker it starts before returning.
     async fn next(&mut self, cancelled: &AtomicBool) -> AppResult<Event>;
 
-    /// Retire input and report an independent descriptor-restoration failure.
+    /// Shut input down, returning any descriptor-restoration failure.
     fn close(&mut self) -> AppResult<()> {
         Ok(())
     }
@@ -107,7 +111,10 @@ enum Source {
 }
 
 impl SystemInput {
-    /// Prepare input inside the I/O runtime, before opening a radio connection.
+    /// Select and prepare the input source for this stdin.
+    ///
+    /// Must run inside the Tokio I/O runtime, and before a radio connection is
+    /// opened, because it changes descriptor flags and may read a script file.
     pub(super) fn new() -> AppResult<Self> {
         let stdin = io::stdin();
         let mode = InputMode::from_terminal(stdin.is_terminal());
@@ -259,17 +266,20 @@ fn read_terminal(mut editor: DefaultEditor) -> (DefaultEditor, Result<String, Re
     (editor, result)
 }
 
-/// POSIX keeps a thread ID valid until termination and loss of joinability.
-/// Borrow the still-owned handle, never cache its ID or signal after joining.
+/// Send SIGINT to the reader thread to wake it.
+///
+/// A POSIX thread ID stays valid until the thread terminates and stops being
+/// joinable, so this takes a borrow of the live handle; the ID must not be
+/// cached or signalled after the join.
 ///
 /// <https://pubs.opengroup.org/onlinepubs/9799919799/functions/V2_chap02.html#tag_16_09_02>
 #[cfg(unix)]
 fn interrupt_terminal<T>(worker: &JoinHandle<T>) -> io::Result<()> {
-    // Nix 0.31 decodes pthread_kill using a -1/errno convention, so positive
-    // POSIX error returns, including ESRCH, may not be exposed. Retain errors
-    // the wrapper does expose, but never infer delivery or cancellation from
-    // Ok(()). Only is_finished() followed by a successful join proves normal
-    // worker completion. No signal attempt grants protocol or cleanup authority.
+    // Nix 0.31 decodes pthread_kill with a -1/errno convention, so positive
+    // POSIX error returns, ESRCH included, may not surface. Errors the wrapper
+    // does expose are kept, but `Ok(())` implies neither delivery nor
+    // cancellation: only is_finished() plus a successful join shows the worker
+    // finished normally.
     nix::sys::pthread::pthread_kill(worker.as_pthread_t(), nix::sys::signal::Signal::SIGINT)
         .map_err(Into::into)
 }
@@ -290,7 +300,10 @@ struct TerminalWakeFailure {
     reader_error: Option<ReadlineError>,
 }
 
-/// Do not abandon a started reader, even if an independent wake attempt fails.
+/// Wake and join the reader thread, returning its value and any wake error.
+///
+/// A failed wake attempt does not abandon the thread; the loop keeps waiting
+/// for it to finish.
 #[cfg(unix)]
 async fn join_terminal<T>(
     worker: JoinHandle<T>,
@@ -299,7 +312,7 @@ async fn join_terminal<T>(
 ) -> Result<(T, Option<io::Error>), TerminalJoinFailure> {
     let mut wake_error = None;
     loop {
-        // is_finished() is the completion proof. A successful signal is not.
+        // is_finished() shows completion; a successful signal does not.
         if worker.is_finished() {
             return match worker.join() {
                 Ok(value) => Ok((value, wake_error)),
@@ -503,7 +516,7 @@ struct ReadyInput {
 #[cfg(unix)]
 impl ReadyInput {
     fn new(file: File) -> AppResult<Self> {
-        // Refuse missing runtime context before changing the descriptor flags.
+        // Fail on a missing runtime before the descriptor flags are changed.
         let _runtime = tokio::runtime::Handle::try_current()?;
         let terminal = file.is_terminal();
         let file = FlaggedFile::new(file)?;

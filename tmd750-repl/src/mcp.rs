@@ -36,7 +36,7 @@ use crate::capture::{
 use crate::{AppResult, output};
 use reconnect::{Backend, ReadinessVerification, SkipReason, SystemBackend};
 
-/// Dedicated MCP workflows; none accept arbitrary requests or write addresses.
+/// MCP workflows; no subcommand accepts an arbitrary address or request.
 #[derive(Debug, Parser)]
 #[command(name = "mcp", about, color = clap::ColorChoice::Never)]
 struct McpCli {
@@ -48,7 +48,7 @@ struct McpCli {
 pub(crate) enum McpCommand {
     /// Capture two fixed memory fragments, MCP exit, and return to CAT.
     Probe(ProbeRequest),
-    /// Run one approved pair of read-only MCP sessions with Gateway Off.
+    /// Read the two fixed fragments twice, in successive MCP sessions.
     ReentryProbe(reentry_probe::Request),
     /// Back up every standard configuration region, then verify fresh CAT.
     Backup(backup::BackupRequest),
@@ -58,16 +58,19 @@ pub(crate) enum McpCommand {
     Text(text::TextRequest),
     /// Inspect captured Terminal settings offline; never activates the gateway.
     Terminal(terminal::TerminalRequest),
-    /// Run the separately approved, fixed PM1 rename-and-restore experiment.
+    /// Rename PM1 to PC TEXT TEST, then restore the original name.
     Pm1Trial(pm1_trial::TrialRequest),
-    /// Run the separately approved PM Off MY1 KQ4NIT-and-restore experiment.
+    /// Set PM Off MY1 to KQ4NIT, then restore the empty value.
     My1Trial(pm1_trial::My1TrialRequest),
-    /// Run one separately approved, guarded Terminal-to-Off experiment.
+    /// Write DV Gateway Off from Terminal on one page, then verify over CAT.
     TerminalExitTrial(terminal_exit_trial::Request),
 }
 
 impl McpCommand {
-    /// Require a pinned endpoint for every workflow that reconnects.
+    /// Check that `--port` pinned an endpoint before a workflow that reopens it.
+    ///
+    /// Returns `CommandError` naming the subcommand when `explicit_port` is
+    /// false and the subcommand reconnects after the MCP exit.
     pub(crate) fn validate_endpoint_selection(&self, explicit_port: bool) -> AppResult<()> {
         match self {
             Self::Text(request) => request.validate_endpoint_selection(explicit_port),
@@ -106,7 +109,10 @@ impl McpCommand {
     }
 }
 
-/// Execute commands that must not enumerate or open radio endpoints.
+/// Run a subcommand that works from captured files alone.
+///
+/// Returns `None` for subcommands that need an open radio connection, without
+/// enumerating or opening any endpoint.
 pub(crate) fn run_offline(request: &McpCommand) -> Option<AppResult<()>> {
     match request {
         McpCommand::Text(request) => text::run_offline(request),
@@ -121,7 +127,7 @@ pub(crate) fn run_offline(request: &McpCommand) -> Option<AppResult<()>> {
     }
 }
 
-/// Capture destination, independent of radio settings or memory addresses.
+/// Capture destination for `mcp probe`.
 #[derive(Debug, Parser)]
 pub(crate) struct ProbeRequest {
     /// New capture directory; its parent must exist. Never overwrite a capture.
@@ -132,7 +138,7 @@ pub(crate) struct ProbeRequest {
 }
 
 impl ProbeRequest {
-    /// Selected output location; transport policy does not change its meaning.
+    /// Capture directory given on the command line, if any.
     pub(crate) fn output(&self) -> Option<&std::path::Path> {
         self.output.as_deref()
     }
@@ -176,7 +182,10 @@ pub(crate) struct ProbeEvidence {
 }
 
 impl ProbeEvidence {
-    /// Original protocol failure, independent of capture and owner cleanup.
+    /// Protocol failure recorded by the MCP exchange, if it failed.
+    ///
+    /// Capture and close failures are reported by their own fields, so `None`
+    /// here does not mean the whole workflow succeeded.
     pub(crate) const fn error(&self) -> Option<&Failure> {
         match &self.outcome {
             Outcome::Failed { error, .. } => Some(error),
@@ -300,9 +309,7 @@ enum ProbeError {
     Capture { path: PathBuf, source: io::Error },
     #[error("MCP probe did not complete successfully; inspect {report}")]
     Incomplete { report: PathBuf },
-    #[error(
-        "could not finish MCP report {path}: {source}; transcript may contain partial evidence"
-    )]
+    #[error("could not finish MCP report {path}: {source}; the transcript may be partial")]
     Report { path: PathBuf, source: io::Error },
 }
 
@@ -552,7 +559,10 @@ fn write_report(writer: &mut impl Write, report: &impl Serialize) -> io::Result<
     writer.flush()
 }
 
-/// Host cleanup bound, also reserved by read-only MCP readiness checks.
+/// Deadline for closing one connection (2 s).
+///
+/// On expiry the close is recorded as a failure and the handle is dropped. The
+/// readiness attempt allowance includes this bound.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 async fn close_transport(transport: &mut impl Transport) -> Option<Failure> {
@@ -563,7 +573,11 @@ async fn close_transport(transport: &mut impl Transport) -> Option<Failure> {
     }
 }
 
-/// Only the signal wait is disposable; the same probe is awaited on both paths.
+/// Await `probe` to completion, setting `cancelled` if `signal` fires first.
+///
+/// Only the signal future is dropped; `probe` is awaited on both paths, so no
+/// in-flight exchange is cancelled. A signal-registration error is returned
+/// alongside the probe's output.
 pub(crate) async fn finish_on_interrupt<F, S>(
     probe: F,
     signal: S,
@@ -604,7 +618,7 @@ fn print_workflow_result(result: &WorkflowResult) {
     }
     if result.post_exit.succeeded() {
         output::line(format_args!(
-            "Fresh CAT connection verified: selected USB endpoint and identity tuple match. Physical-unit continuity is not proved."
+            "Fresh CAT connection verified: selected USB endpoint and identity tuple match."
         ));
     } else {
         output::error(format_args!(
@@ -617,7 +631,7 @@ fn print_workflow_result(result: &WorkflowResult) {
 fn print_probe_result(report: &McpProbeReport) {
     match &report.outcome {
         McpProbeOutcome::AwaitingCatVerification => output::line(format_args!(
-            "MCP fragments and exit ACK captured. Original handle retirement was attempted without post-exit CAT; fresh-connection evidence is reported separately."
+            "MCP fragments and exit ACK captured. The original connection is closed without further CAT; the fresh connection is reported separately."
         )),
         McpProbeOutcome::Cancelled => output::line(format_args!(
             "MCP probe cancelled at a complete exchange boundary."

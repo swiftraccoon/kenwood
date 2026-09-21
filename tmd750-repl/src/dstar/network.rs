@@ -1,9 +1,10 @@
-//! Reflector setup with joined DNS work and bounded authentication/handshake.
+//! Reflector setup: DNS on a joined worker, then a bounded authentication and
+//! handshake.
 //!
-//! Resolving host files and DNS never blocks the radio's current-thread runtime.
-//! The resolver is always joined, including after cancellation or deadline
-//! expiry. No network session task is spawned until setup has completed within
-//! its original deadline and the caller still admits it.
+//! Host-file and DNS lookups run off the radio's current-thread runtime, and
+//! their worker is always joined, including after cancellation or deadline
+//! expiry. No session task is spawned unless setup finished inside its original
+//! deadline and the caller is still running.
 
 use std::future::Future;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -36,7 +37,7 @@ struct Resolved {
     address: SocketAddr,
 }
 
-/// A completed wire handshake that has not started background session tasks.
+/// A completed wire handshake whose background session tasks are not spawned.
 struct Prepared<P: Protocol> {
     session: Session<P, Connected>,
     socket: Arc<UdpSocket>,
@@ -48,12 +49,12 @@ impl<P: Protocol + Send + 'static> Prepared<P> {
     }
 }
 
-/// Resolve and connect without abandoning a resolver or a spawned session.
+/// Resolve the reflector address, authenticate, and complete the handshake.
 ///
-/// One absolute setup budget covers resolver admission, authentication, and
-/// the UDP handshake. Joining an outstanding system resolver may extend return
-/// time, but cancellation or expiry then prevents any handshake from starting.
-/// Existing authentication and handshake timeouts remain additional limits.
+/// One absolute `SETUP_BUDGET` covers the resolver, authentication and the UDP
+/// handshake. Joining an outstanding system resolver can delay the return past
+/// that budget; cancellation or expiry then stops the handshake from starting.
+/// The authentication and handshake timeouts apply in addition.
 pub(super) async fn connect_reflector(
     callsign: Callsign,
     link: &LinkArg,
@@ -136,7 +137,7 @@ async fn resolve_joined<T: Send + 'static>(
     result
 }
 
-/// Bound work that owns only transient sockets and unspawned session state.
+/// Run `operation` until `deadline`, failing early once `cancelled` is set.
 async fn bounded<T>(
     operation: impl Future<Output = Result<T, String>>,
     deadline: Deadline,
@@ -270,7 +271,7 @@ async fn connect_dcs(
     Ok(Prepared { session, socket })
 }
 
-/// Finish the existing protocol unlink before radio shutdown proceeds.
+/// Send the protocol unlink and report its outcome, before radio shutdown.
 pub(super) async fn disconnect_reflector(reflector: &mut AnyAsyncSession) {
     match reflector.disconnect().await {
         Ok(()) => output::line(format_args!("Disconnected from reflector.")),

@@ -1,4 +1,5 @@
-//! Fake native openings verify deadline, cleanup evidence, and retry admission.
+//! Fake native opens covering the deadline, cleanup failures, and whether a
+//! further attempt is allowed.
 
 use std::collections::VecDeque;
 use std::io;

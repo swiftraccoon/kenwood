@@ -1,4 +1,6 @@
-//! Endpoint policy tests use only local metadata, never discovery or helpers.
+//! Endpoint selection from enumeration metadata: callout ports and their
+//! dial-in aliases, the main-unit preference, the ambiguity rejections, and
+//! cancellation before either endpoint is accepted.
 
 use std::path::PathBuf;
 

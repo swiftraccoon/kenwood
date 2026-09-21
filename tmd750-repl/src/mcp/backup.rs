@@ -1,4 +1,7 @@
-//! Standard configuration backup, with independent post-exit verification.
+//! Reads every standard configuration region in one MCP session.
+//!
+//! After the acknowledged MCP exit the original connection is closed and the
+//! CAT identity tuple is re-read on a fresh connection.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -21,7 +24,10 @@ use super::{
 use crate::capture::{Artifacts, CaptureKind, CaptureTransport, Recorder, TranscriptSummary};
 use crate::{AppResult, CommandError, output};
 
-/// Standard configuration only; custom startup-screen pixels are excluded.
+/// Capture destination for the standard configuration backup.
+///
+/// The captured regions cover the standard configuration only; custom
+/// startup-screen pixels are outside them.
 #[derive(Debug, Parser)]
 pub(crate) struct BackupRequest {
     /// New private capture directory; its parent must exist.
@@ -30,13 +36,16 @@ pub(crate) struct BackupRequest {
 }
 
 impl BackupRequest {
-    /// Optional new artifact directory for the selected transport workflow.
+    /// Capture directory given on the command line, if any.
     pub(crate) fn output(&self) -> Option<&Path> {
         self.output.as_deref()
     }
 }
 
-/// Standard-page evidence shared by transport-specific captured workflows.
+/// Serialized standard-page read result, shared by the transport workflows.
+///
+/// Holds the identity tuple, the entry reply, every acknowledged page, the MCP
+/// exit disposition and the outcome.
 #[derive(Debug, Serialize)]
 pub(crate) struct BackupEvidence {
     identity: Option<IdentityEvidence>,
@@ -48,7 +57,7 @@ pub(crate) struct BackupEvidence {
 }
 
 impl BackupEvidence {
-    /// Result of the library's exact page-order, length, entry, and exit checks.
+    /// True when the library's page-order, length, entry and exit checks passed.
     pub(crate) const fn has_complete_configuration(&self) -> bool {
         self.complete_configuration
     }
@@ -58,7 +67,9 @@ impl BackupEvidence {
         self.segments.len()
     }
 
-    /// Original protocol failure, without conflating capture or owner cleanup.
+    /// Protocol failure recorded by the backup exchange, if it failed.
+    ///
+    /// Capture and close failures are reported by their own fields.
     pub(crate) const fn error(&self) -> Option<&Failure> {
         match &self.outcome {
             BackupOutcome::Failed { error, .. } => Some(error),
@@ -128,7 +139,7 @@ impl From<&McpBackupReport> for BackupEvidence {
     }
 }
 
-/// Serialized evidence from a complete or interrupted standard-region backup.
+/// Format-4 report of a complete or interrupted standard-region backup.
 #[derive(Debug, Serialize)]
 pub(super) struct ArtifactReport {
     format_version: u8,
@@ -147,7 +158,7 @@ pub(super) struct ArtifactReport {
 }
 
 impl ArtifactReport {
-    /// Preserve original read evidence and the complete fresh-CAT result.
+    /// Build the report from the workflow result and any signal failure.
     pub(super) fn new(
         endpoint: &SerialCandidate,
         baud: u32,
@@ -179,7 +190,10 @@ impl ArtifactReport {
     }
 }
 
-/// Capture every acknowledged page even when cleanup or later reads fail.
+/// Back up the standard regions, then verify CAT on a fresh connection.
+///
+/// Every acknowledged page is written to the capture even when a later read,
+/// the MCP exit or the close fails.
 pub(super) async fn run(
     endpoint: &SerialCandidate,
     baud: u32,
@@ -238,13 +252,11 @@ pub(super) async fn run(
         directory.join("report.json").display()
     ));
     if succeeded {
-        output::line(format_args!(
-            "Standard configuration backup complete. Firmware schema compatibility and physical-unit continuity are not proved."
-        ));
+        output::line(format_args!("Standard configuration backup complete."));
         Ok(())
     } else {
         Err(Box::new(CommandError(format!(
-            "MCP backup incomplete; retained evidence in {}",
+            "MCP backup incomplete; capture retained in {}",
             directory.display()
         ))))
     }

@@ -1,4 +1,9 @@
-//! Read-only CAT qualification with explicitly scoped fresh-handle policies.
+//! Read-only CAT verification on a fresh connection after an MCP exit.
+//!
+//! A verification waits out the settle delay, polls enumeration for the
+//! selected endpoint, opens it, reads the ID/FV/TY tuple and optionally one
+//! `GW` query, then closes. Nothing here re-enters MCP, writes a setting, or
+//! reopens a transport.
 
 mod readiness;
 
@@ -19,13 +24,19 @@ use super::reconnect_policy::{ReconnectDecision, classify};
 use super::{CLOSE_TIMEOUT, Failure, IdentityEvidence, close_transport};
 use crate::capture::{CaptureTransport, Recorder, TranscriptSummary};
 
+/// Silent wait after the MCP exit ACK, before polling for the endpoint.
 const SETTLE: Duration = Duration::from_secs(2);
-// The earlier ten-second observation never saw the endpoint return.
-// This longer passive budget is a host policy, not a firmware timing guarantee.
+/// Passive budget for the selected USB endpoint to re-enumerate (60 s).
+///
+/// Host policy, not a firmware timing guarantee: the endpoint has been observed
+/// returning later than 10 s after the MCP exit ACK.
 const ENUMERATION_BUDGET: Duration = Duration::from_secs(60);
+/// Interval between enumeration snapshots inside `ENUMERATION_BUDGET`.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-/// Reuse exact-service selection, including recognized macOS alias pairs.
+/// True when `candidates` selects exactly `endpoint` without ambiguity.
+///
+/// A macOS dial-in/callout alias pair counts as one service.
 pub(crate) fn endpoint_is_unambiguous(
     endpoint: &SerialCandidate,
     candidates: &[SerialCandidate],
@@ -33,9 +44,11 @@ pub(crate) fn endpoint_is_unambiguous(
     matches!(classify(endpoint, candidates), ReconnectDecision::Ready(selected) if selected == *endpoint)
 }
 
-/// Fixed workflow dependencies, replaceable by an entirely local test backend.
+/// Host operations a verification needs: open, enumerate, clock and wait.
+///
+/// Tests supply a backend that touches no serial port.
 pub(crate) trait Backend {
-    /// One owned connection; reopening this value is never requested.
+    /// Connection returned by `open`; it is never reopened.
     type Connection: Transport;
     /// Open exactly the supplied endpoint.
     fn open(
@@ -51,14 +64,14 @@ pub(crate) trait Backend {
     fn wait(&mut self, duration: Duration) -> impl Future<Output = ()>;
 }
 
-/// Host implementation; never scans ports with CAT or invokes transport reopen.
+/// [`Backend`] over the host serial layer and the Tokio clock.
 #[derive(Debug)]
 pub(crate) struct SystemBackend {
     started: Instant,
 }
 
 impl SystemBackend {
-    /// Begin the monotonic host-policy clock.
+    /// Start the monotonic clock that `now` measures elapsed time from.
     pub(crate) fn new() -> Self {
         Self {
             started: Instant::now(),
@@ -100,11 +113,11 @@ pub(super) enum SkipReason {
     OriginalProbeIncomplete,
     /// Standard configuration pages or the acknowledged MCP exit are incomplete.
     OriginalBackupIncomplete,
-    /// The bounded qualification session did not complete its required exchange.
+    /// A trial session did not finish its exchange and acknowledged MCP exit.
     OriginalTrialIncomplete,
     /// A bounded settings update did not acknowledge its MCP exit.
     OriginalUpdateIncomplete,
-    /// The update's durable recovery journal failed before fresh verification.
+    /// The update's recovery journal failed an append or a synchronization.
     OriginalUpdateJournalIncomplete,
     /// Original connection release did not succeed.
     OriginalCloseFailed,
@@ -134,13 +147,13 @@ pub(super) enum VerificationStage {
     GatewayMismatch,
     /// The fresh connection could not be closed successfully.
     Close,
-    /// Required transcript recording or durable synchronization failed.
+    /// Writing the transcript, or synchronizing it to storage, failed.
     Capture,
     /// The bounded identity-readiness dispatch window or attempt cap expired.
     Readiness,
 }
 
-/// Outcome independent of the original MCP report.
+/// Final result of one post-exit verification.
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub(super) enum VerificationOutcome {
@@ -150,7 +163,7 @@ pub(super) enum VerificationOutcome {
     Skipped { reason: SkipReason },
     /// Current work finished and no subsequent attempt was started.
     Cancelled,
-    /// First failed stage; later close errors remain in the attempt evidence.
+    /// First failed stage; later close errors stay in the attempt record.
     Failed {
         stage: VerificationStage,
         error: Failure,
@@ -222,7 +235,7 @@ enum OperationOutcome {
     Failed { error: Failure },
 }
 
-/// Retain the actual typed identity while preserving the existing JSON shape.
+/// Typed identity serialized in the report's model/firmware/type shape.
 #[derive(Debug)]
 struct ObservedIdentity(Identity);
 
@@ -232,7 +245,9 @@ impl Serialize for ObservedIdentity {
     }
 }
 
-/// Lossless typed Gateway evidence, including unnamed wire values.
+/// Observed DV Gateway mode, serialized as a name plus the raw wire byte.
+///
+/// A value with no name serializes as `unqualified` with its byte preserved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct GatewayEvidence(DvGatewayMode);
 
@@ -260,7 +275,12 @@ struct ConnectionAttempt {
     close: Option<OperationOutcome>,
 }
 
-/// Separate evidence; matching public identity is not physical-unit continuity.
+/// Serialized record of the post-exit CAT check.
+///
+/// Holds the settle delay and enumeration budget in milliseconds, the open
+/// attempt cap, every enumeration snapshot, the single open attempt, the
+/// transcript summary and the final outcome. A matching ID/FV/TY tuple
+/// identifies the model and firmware, not the physical unit.
 #[derive(Debug, Serialize)]
 pub(super) struct PostExitVerification {
     identity_assurance: &'static str,
@@ -271,14 +291,16 @@ pub(super) struct PostExitVerification {
     required_gateway_mode: Option<GatewayEvidence>,
     enumerations: Vec<Enumeration>,
     attempt: Option<ConnectionAttempt>,
-    /// Completeness of the independently reserved verification transcript.
+    /// Summary of the transcript reserved for this verification.
     pub(super) transcript: TranscriptSummary,
-    /// Result of the explicitly requested additional workflow.
+    /// Final outcome of this verification.
     pub(super) outcome: VerificationOutcome,
 }
 
 impl PostExitVerification {
-    /// Record ineligibility without opening another connection.
+    /// Report that verification never started, naming `reason`.
+    ///
+    /// No connection is opened and no enumeration snapshot is taken.
     pub(super) fn skipped(reason: SkipReason, transcript: TranscriptSummary) -> Self {
         Self {
             identity_assurance: "endpoint_and_cat_tuple_only",
@@ -293,16 +315,16 @@ impl PostExitVerification {
         }
     }
 
-    /// A successful observation also requires its complete capture.
+    /// True when the outcome is `Matched` and the transcript is complete.
     pub(super) const fn succeeded(&self) -> bool {
         self.transcript.complete && matches!(self.outcome, VerificationOutcome::Matched)
     }
 
-    /// Return the actual fresh observations only after required Off verification.
+    /// Identity and Gateway mode read by a check that required Gateway Off.
     ///
-    /// Identity-only verification, incomplete capture, failed close or durable
-    /// synchronization, cancellation, and mismatching Gateway states return
-    /// `None`. Matching identity does not establish physical-unit continuity.
+    /// Returns `None` when the check read the identity only, the transcript is
+    /// incomplete, the close or synchronization failed, cancellation
+    /// intervened, or the observed Gateway mode is not Off.
     pub(super) fn gateway_off_evidence(&self) -> Option<(&Identity, DvGatewayMode)> {
         if !self.succeeded()
             || self.required_gateway_mode != Some(GatewayEvidence(DvGatewayMode::Off))
@@ -379,12 +401,13 @@ async fn wait_recorded(
     recorder.record(LifecycleEvent::WaitCompleted);
 }
 
-/// Verify one fresh CAT connection with fail-closed, synchronized evidence.
+/// Verify that one fresh connection reads back the original identity tuple.
 ///
-/// The capture recorder's failure flag need not be the caller's cancellation
-/// flag. Completeness is checked independently before opening and before every
-/// protocol operation. The connection is always released after an open, and
-/// capture synchronization cannot replace an earlier verification failure.
+/// Waits the settle delay, polls for the endpoint within the enumeration
+/// budget, opens it once and reads ID/FV/TY, then closes. The transcript must
+/// be complete before the open and before every protocol operation; a
+/// successful open is always closed, and a later synchronization failure never
+/// replaces an earlier failure in the report.
 pub(super) async fn verify_required(
     backend: &mut impl Backend,
     endpoint: &SerialCandidate,
@@ -408,14 +431,14 @@ pub(super) async fn verify_required(
     .await
 }
 
-/// Require fresh matching identity followed by Gateway Off on the same handle.
+/// Verify a matching identity followed by Gateway Off on the same connection.
 ///
-/// This makes exactly one eligible open and at most one `GW` query, after the
-/// complete identity matches. It adds no setter, MCP entry, retry, or recovery
-/// traffic. The required transcript, fresh close, and durable synchronization
-/// must all succeed before [`PostExitVerification::gateway_off_evidence`] can
-/// return the actual observations. Cancellation is checked before the Gateway
-/// query, never by dropping an in-flight CAT exchange.
+/// Makes exactly one open and at most one `GW` query, issued only after the
+/// complete identity matches. The transcript, the close and the final
+/// synchronization must all succeed before
+/// [`PostExitVerification::gateway_off_evidence`] returns the observations.
+/// Cancellation is checked before the Gateway query, never by dropping an
+/// in-flight CAT exchange.
 pub(super) async fn verify_required_gateway_off(
     backend: &mut impl Backend,
     endpoint: &SerialCandidate,
@@ -439,16 +462,19 @@ pub(super) async fn verify_required_gateway_off(
     .await
 }
 
-/// Fixed read scope; every query requires complete recording.
+/// How much the post-exit check reads on the fresh connection.
 #[derive(Clone, Copy)]
 enum VerificationGoal {
-    /// Preserve the original three-query reconnect workflow.
+    /// Read the ID/FV/TY tuple only.
     IdentityOnly,
-    /// Additionally require a fresh read-only Gateway Off observation.
+    /// Follow the tuple with one read-only `GW` query and require Off.
     GatewayOff,
 }
 
-/// Stop new operations on capture failure without replacing an earlier failure.
+/// True when the transcript is still complete, so another operation may run.
+///
+/// A failed check records a `Capture` failure unless the report already holds
+/// one.
 fn capture_ready(recorder: &Recorder<File>, report: &mut PostExitVerification) -> bool {
     if let Err(error) = recorder.ensure_complete() {
         if !matches!(report.outcome, VerificationOutcome::Failed { .. }) {
@@ -459,7 +485,7 @@ fn capture_ready(recorder: &Recorder<File>, report: &mut PostExitVerification) -
     true
 }
 
-/// Synchronize final evidence while preserving the first verification failure.
+/// Synchronize the recorder and store its summary, keeping the first failure.
 fn finalize_capture(recorder: &mut Recorder<File>, report: &mut PostExitVerification) {
     if let Err(error) = recorder.synchronize()
         && !matches!(report.outcome, VerificationOutcome::Failed { .. })
@@ -475,11 +501,11 @@ struct VerificationContext<'a> {
     original_identity: &'a Identity,
     cancelled: &'a AtomicBool,
     goal: VerificationGoal,
-    /// Only bounded read-only reacquisition has a shared dispatch deadline.
+    /// Shared dispatch deadline, set only by the bounded readiness policy.
     dispatch_deadline: Option<Duration>,
 }
 
-/// One passive polling clock, shared across attempts when reacquiring CAT.
+/// Start time and budget for enumeration polling, shared across attempts.
 #[derive(Clone, Copy)]
 struct EnumerationWindow {
     started: Duration,
@@ -596,7 +622,10 @@ async fn await_endpoint(
     }
 }
 
-/// Retry admission is decided from typed failure and actual handle activity.
+/// One completed open attempt.
+///
+/// Carries its recorder and whether the identity query timed out without the
+/// connection receiving a byte.
 struct IdentityAttempt {
     recorder: Recorder<File>,
     silent_identity_timeout: bool,
@@ -662,8 +691,8 @@ async fn attempt_identity(
     let observation = observe_identity(&mut radio, context, report, backend.now()).await;
     let gateway_mode = observe_gateway_off(&mut radio, context, report).await;
     let mut transport = radio.into_transport();
-    // identify() begins with ID. No later command can qualify: its dispatch
-    // raises the write count, even if that later write times out.
+    // identify() sends ID first, so a silent first exchange can only be that ID:
+    // any later command raises the write count, even when it times out.
     let silent_identity_timeout = matches!(observation, IdentityObservation::TimedOut)
         && transport.activity().silent_first_exchange();
     let close_error = close_transport(&mut transport).await;
@@ -707,17 +736,17 @@ async fn attempt_identity(
     }
 }
 
-/// Typed query result; timeout alone does not establish retry eligibility.
+/// Result of the fresh identity query.
 enum IdentityObservation {
     /// The complete tuple, whether or not it matches the original identity.
     Complete(Identity),
-    /// A typed query timeout, still requiring dispatch and input evidence.
+    /// The query timed out; the caller still checks write and input counts.
     TimedOut,
     /// Cancellation, transport, parsing, or another terminal query failure.
     Failed,
 }
 
-/// Finish one complete identity tuple, retaining mismatches as actual evidence.
+/// Read the ID/FV/TY tuple once, recording a match or a mismatch.
 async fn observe_identity(
     radio: &mut Radio<impl Transport>,
     context: VerificationContext<'_>,
@@ -758,7 +787,7 @@ async fn observe_identity(
     }
 }
 
-/// Run the sole additional query only after a matching identity and safe boundary.
+/// Issue the single `GW` query when the goal requires Off and identity matched.
 async fn observe_gateway_off(
     radio: &mut Radio<impl Transport>,
     context: VerificationContext<'_>,

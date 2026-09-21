@@ -1,4 +1,5 @@
-//! One reusable compare/exchange, detached exit, readiness, and CAT phase.
+//! One phase: compare and write pages, exit MCP, wait for the endpoint to
+//! re-enumerate, then reread the pages over a fresh CAT connection.
 
 use std::fs::File;
 use std::io;
@@ -66,7 +67,10 @@ struct Context<'a> {
     limits: Limits,
 }
 
-/// Never abandons an MCP exchange; cancellation only gates the first intent.
+/// Check identity and Gateway, then run the planned page exchange.
+///
+/// Cancellation is checked only up to the first journal record; once one page
+/// write has been recorded, the exchange and its `E` exit run to completion.
 async fn operate(
     radio: &mut Radio<impl Transport>,
     context: &Context<'_>,
@@ -153,7 +157,10 @@ async fn operate(
     Ok(())
 }
 
-/// Retire the owner even after open, protocol, capture, or close failures.
+/// Open the endpoint, run `operate` on it, then close it once.
+///
+/// Open, protocol, capture and close failures are each appended to the
+/// returned result's problems; the close is attempted in every path.
 async fn connection(
     backend: &mut impl Backend,
     context: Context<'_>,
@@ -289,8 +296,9 @@ pub(super) async fn run(
     {
         return result;
     }
-    // Once intent is durable, verification is owed even after Ctrl-C. Capture
-    // errors still stop traffic independently of this cancellation choice.
+    // A journal record was written and synced before the first page write, so
+    // the readback runs even under Ctrl-C: swap in a never-set cancellation
+    // flag. A capture error still stops further traffic regardless.
     let finish_required = AtomicBool::new(false);
     let cancelled = if result.exchange.intent_recorded {
         &finish_required

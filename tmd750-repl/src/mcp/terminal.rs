@@ -1,4 +1,6 @@
-//! Historical Terminal-settings assessment, with no endpoint or write access.
+//! Reads Terminal settings out of a captured backup.
+//!
+//! Nothing here opens an endpoint or writes a setting.
 
 mod compare;
 
@@ -13,7 +15,7 @@ use kenwood_tmd750::memory::{
 use super::snapshot::Snapshot;
 use crate::{AppResult, CommandError, output};
 
-/// Inspect Terminal configuration from a completed local backup only.
+/// Terminal subcommand: preflight or compare, both from captured backups.
 #[derive(Debug, Parser)]
 pub(crate) struct TerminalRequest {
     #[command(subcommand)]
@@ -22,7 +24,7 @@ pub(crate) struct TerminalRequest {
 
 #[derive(Debug, Subcommand)]
 enum TerminalCommand {
-    /// Assess historical Reflector Terminal settings; never test live readiness.
+    /// Report the Reflector Terminal settings stored in a captured backup.
     Preflight(PreflightRequest),
     /// Compare all captured bytes and annotate candidate Terminal settings.
     Compare(compare::CompareRequest),
@@ -38,13 +40,11 @@ struct PreflightRequest {
     #[arg(long, value_parser = parse_slot, value_name = "0..5")]
     slot: SlotIndex,
 
-    /// Intended USB connection; this does not discover or select a live endpoint.
+    /// USB interface the settings are read for; no endpoint is opened.
     #[arg(long, value_enum)]
     interface: UsbInterface,
 
-    /// Explicitly interpret firmware outside the registry label, without writes.
-    ///
-    /// Required for firmware 1.02; successful decoding does not qualify the layout.
+    /// Decode firmware outside the registry label. Required for firmware 1.02.
     #[arg(long)]
     interpret_unqualified: bool,
 }
@@ -89,8 +89,8 @@ fn assess_snapshot(
     route: TerminalUsbRoute,
     interpret_unqualified: bool,
 ) -> AppResult<ReflectorTerminalPreflight> {
-    // Check every dependency before exposing the internal buffer to the view.
-    // Unread gaps in that buffer are placeholders, not captured settings.
+    // Check every required field is covered before handing the image to the
+    // reader; uncovered bytes in that image are padding, not settings.
     let mut covered_image = None;
     for field in ReflectorTerminalPreflight::required_fields()? {
         covered_image = Some(snapshot.image_for(field, Some(slot))?);
@@ -109,7 +109,9 @@ fn assess_snapshot(
     })
 }
 
-/// Run before endpoint enumeration; accepts no transport or connected radio.
+/// Run the selected Terminal subcommand against its captured backups.
+///
+/// Called before endpoint enumeration; it takes no transport.
 pub(super) fn run(request: &TerminalRequest) -> AppResult<()> {
     match &request.command {
         TerminalCommand::Preflight(request) => {
@@ -130,10 +132,10 @@ fn describe(
 ) -> AppResult<Vec<String>> {
     let qualification = match assessment.qualification {
         TextLayoutQualification::RegistryTargetMatched => {
-            "Registry firmware label matched; hardware layout compatibility is not proved."
+            "Registry firmware label matched this backup's firmware."
         }
         TextLayoutQualification::UnqualifiedInterpretation => {
-            "Unqualified software-layout interpretation; these are not validated radio settings."
+            "Firmware outside the registry label; decoded with --interpret-unqualified."
         }
     };
     let mut lines = vec![
@@ -169,10 +171,7 @@ fn describe(
         ),
     ];
     if assessment.findings.is_empty() {
-        lines.push(
-            "No conflicts found by these offline checks. This is not a live-readiness result."
-                .to_owned(),
-        );
+        lines.push("No conflicts found by these offline checks.".to_owned());
     } else {
         for finding in &assessment.findings {
             lines.push(format!("Finding: {finding}"));
@@ -182,14 +181,12 @@ fn describe(
         concat!(
             "Active DV Gateway rejects CAT on its assigned interface. ",
             "Main-unit ID/FV/TY/GW queries were observed on firmware 1.02 ",
-            "with Terminal selected and the Gateway routed to panel USB. ",
-            "This does not establish current routing, general CAT access, ",
-            "MCP readiness, or qualified automatic exit."
+            "with Terminal selected and the Gateway routed to panel USB."
         )
         .to_owned(),
     );
     lines.push(
-        "No radio endpoints enumerated or opened. No PM recalled, text normalized, patch generated, or settings changed. Live activation and restoration remain unqualified."
+        "No radio endpoints enumerated or opened. No PM recalled, text normalized, patch generated, or settings changed."
             .to_owned(),
     );
     Ok(lines)

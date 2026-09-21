@@ -1,9 +1,12 @@
-//! Owned physical connections without pretending Bluetooth is a serial port.
+//! One owned transport, either a serial port or, on macOS, a native Bluetooth
+//! RFCOMM connection.
 
 use kenwood_tmd750::transport::SerialTransport;
 use kenwood_transport::{Transport, TransportError};
 
-/// One physical owner; model workflows retain endpoint and reopening policy.
+/// One open connection, dispatching `Transport` to the backend it holds.
+///
+/// Endpoint choice and reopen policy stay with the model workflows.
 pub(crate) enum Connection {
     Serial(SerialTransport),
     #[cfg(target_os = "macos")]

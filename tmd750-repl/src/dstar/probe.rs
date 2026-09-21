@@ -1,11 +1,11 @@
-//! Captured diagnostic queries with optional separately controlled mode handling.
+//! Captured diagnostic queries, optionally with guarded Terminal entry.
 //!
 //! A normal CAT reply stops protocol fallback. Only a completely silent initial
-//! ID timeout after its completed write admits binary queries on that same
-//! handle. This workflow never instantiates a modem runtime or opens a network
-//! connection. Current routing must be established before an approved live run.
-//! Managed operation retains a distinct control interface for guarded entry and
-//! exact restoration; the diagnostic connection never sends an escape command.
+//! `ID` timeout after its completed write admits MMDVM binary queries on that
+//! same handle. This workflow never instantiates a modem runtime and never
+//! opens a network connection. With `--manage-terminal`, entry and restoration
+//! run over a second, independently selected USB control endpoint; the
+//! diagnostic connection itself never sends a mode-escape command.
 
 use std::fs::File;
 use std::future::Future;
@@ -34,11 +34,14 @@ mod tests;
 
 use report::{Endpoint, Outcome, Report, Stage, WorkflowResult};
 
-/// Diagnostic dispatch bounds, not firmware readiness guarantees.
+/// Timeouts applied to one probe run.
 #[derive(Clone, Copy, Debug, Serialize)]
 struct Limits {
+    /// Deadline for each individual CAT line exchange.
     cat_io_step: Duration,
+    /// Single absolute budget covering the `GET_VERSION` and `GET_STATUS` pair.
     binary_total: Duration,
+    /// Budget for the one explicit close.
     close: Duration,
 }
 
@@ -59,10 +62,10 @@ pub(crate) struct Request {
     #[arg(long, value_name = "NEW_DIRECTORY")]
     output: Option<PathBuf>,
 
-    /// Confirm the selected radio route and explicitly scoped live test.
+    /// Required acknowledgement that the radio's current route is known.
     ///
-    /// Without --manage-terminal this authorizes no mode changes. Host bytes
-    /// on another DV route may transmit RF; establish routing before this probe.
+    /// Without --manage-terminal the probe changes no radio setting. Probe
+    /// bytes on a DV or DR route can key the transmitter; check the route first.
     #[arg(long)]
     approve_live_test: bool,
 
@@ -77,13 +80,19 @@ pub(crate) struct Request {
     #[arg(long, value_name = "CONTROL_PORT", requires = "manage_terminal")]
     control_port: Option<String>,
 
-    /// Complete successful configuration backup used for fresh page comparisons.
+    /// Successful backup report whose pages are compared before each write.
     #[arg(long, value_name = "REPORT_JSON", requires = "manage_terminal")]
     backup: Option<PathBuf>,
 }
 
 impl Request {
-    /// Reject missing authority, implicit endpoints, and unqualified baud rates.
+    /// Validate the probe arguments against the selected endpoint and baud rate.
+    ///
+    /// Returns the endpoint path on success, and `CommandError` when
+    /// `--approve-live-test` is absent, when `baud` is not `DEFAULT_BAUD` (no
+    /// baud fallback is tried), or when `path` is `None` or empty. With
+    /// `--manage-terminal`, `--control-port` must also be nonempty and
+    /// different from `path`, and `--backup` must be nonempty.
     pub(crate) fn validate<'a>(
         &self,
         path: Option<&'a str>,
@@ -91,12 +100,12 @@ impl Request {
     ) -> Result<&'a str, CommandError> {
         if !self.approve_live_test {
             return Err(CommandError(
-                "dstar probe requires --approve-live-test after establishing the selected radio route; only --manage-terminal permits guarded mode changes".to_owned(),
+                "dstar probe requires --approve-live-test; check the radio's current route first, because probe bytes on a DV or DR route can key the transmitter".to_owned(),
             ));
         }
         if baud != DEFAULT_BAUD {
             return Err(CommandError(format!(
-                "dstar probe requires the qualified CAT rate {DEFAULT_BAUD}; no baud fallback is attempted"
+                "dstar probe runs only at {DEFAULT_BAUD} baud; no baud fallback is attempted"
             )));
         }
         let path = path.filter(|path| !path.is_empty()).ok_or_else(|| {
@@ -153,14 +162,16 @@ pub(crate) fn select_endpoint(
     }
 }
 
-/// Open only the selected endpoint; mock implementations pin every operation.
+/// Opens the one selected endpoint and yields its transport.
 trait Backend {
     type Connection: Transport;
 
     fn open(&mut self, endpoint: &SerialCandidate) -> Result<Self::Connection, TransportError>;
 }
 
-/// Report publication is independent of the preceding radio observations.
+/// Writing the diagnostic report to its file failed.
+///
+/// Raised after the radio observations are complete; it never discards them.
 #[derive(Debug, thiserror::Error)]
 #[error("diagnostic report publication failed at {path}: {source}")]
 struct PublicationError {
@@ -178,7 +189,10 @@ impl Backend for SystemBackend {
     }
 }
 
-/// Run the explicitly selected diagnostic lifecycle and finish durable reporting.
+/// Run the diagnostic on `endpoint` and publish its report.
+///
+/// Returns an error when the report cannot be written, or when the run ended
+/// without a complete observation; the capture directory is kept either way.
 pub(crate) async fn run(endpoint: &SerialCandidate, request: &Request) -> AppResult<()> {
     let _path = request.validate(Some(&endpoint.path), DEFAULT_BAUD)?;
     if request.manage_terminal {
@@ -246,7 +260,7 @@ pub(crate) async fn run(endpoint: &SerialCandidate, request: &Request) -> AppRes
     }
 }
 
-/// Synchronize the report after connection release; failed publication is failure.
+/// Write the report as JSON, then flush and `sync_all` its file.
 fn publish_report(file: &mut File, report: &Report) -> io::Result<()> {
     serde_json::to_writer_pretty(&mut *file, report)?;
     file.write_all(b"\n")?;
@@ -254,7 +268,10 @@ fn publish_report(file: &mut File, report: &Report) -> io::Result<()> {
     file.sync_all()
 }
 
-/// Preserve the owner future when a signal arrives; only the signal is disposable.
+/// Await `workflow`, setting `cancelled` if `signal` completes first.
+///
+/// `workflow` is always awaited to completion; only `signal` is dropped. Any
+/// signal-listener error is returned alongside the workflow output.
 async fn finish_on_interrupt<F, S>(
     workflow: F,
     signal: S,
@@ -279,7 +296,10 @@ where
     }
 }
 
-/// Keep every failure independent of protocol evidence and always retire the handle.
+/// Open the endpoint, observe it, then close it once within `limits.close`.
+///
+/// Open, protocol, capture and close failures are recorded as separate fields
+/// of the returned `WorkflowResult`; the connection is closed in every path.
 async fn run_workflow(
     backend: &mut impl Backend,
     endpoint: &SerialCandidate,
@@ -317,7 +337,7 @@ async fn run_workflow(
         Ok(Err(error)) => Some(Failure::from_error(&error)),
         Err(error) => Some(Failure::from_error(&error)),
     };
-    // Consuming the wrapper drops its connection before evidence is accepted.
+    // Consuming the wrapper drops the connection before the summary is taken.
     finish_capture(transport.into_recorder(), outcome, close_error)
 }
 
@@ -339,7 +359,11 @@ fn finish_capture(
     }
 }
 
-/// Borrow only this connection for CAT admission and optional binary observations.
+/// Query CAT on the borrowed connection, falling back to MMDVM on silence.
+///
+/// A successful `ID` is followed by the Gateway query. A completed `ID` write
+/// with no received bytes and an `ID` timeout instead admits `GET_VERSION` and
+/// `GET_STATUS` within `limits.binary_total` on the same connection.
 async fn observe<T: Transport>(
     transport: &mut CaptureTransport<T, File>,
     cancelled: &AtomicBool,
@@ -419,7 +443,7 @@ async fn observe<T: Transport>(
     }
 }
 
-/// Lend the captured connection to CAT without transferring its cleanup owner.
+/// A `Transport` over a mutable borrow, so `Radio` need not take ownership.
 struct Borrowed<'a, T>(&'a mut T);
 
 impl<T: Transport> Transport for Borrowed<'_, T> {

@@ -1,4 +1,6 @@
-//! Offline startup parsing never requires a radio or changes capture files.
+//! `dstar probe` argument parsing: help output, the checks that reject a
+//! request before any capture directory is created, and the extra arguments
+//! `--manage-terminal` requires.
 
 use clap as _;
 use dirs_next as _;

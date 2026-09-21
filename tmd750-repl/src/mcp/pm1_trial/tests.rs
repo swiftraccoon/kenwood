@@ -1,4 +1,5 @@
-//! Offline parsing and preflight tests; no host serial discovery or radio I/O.
+//! Tests for argument parsing and the pre-open checks; no enumeration and no
+//! radio I/O.
 
 use super::*;
 

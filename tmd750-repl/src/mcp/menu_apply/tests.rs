@@ -1,6 +1,8 @@
-//! Two-handle ordinary updates with exact page intent and observable ownership.
+//! Tests for the two-connection apply path over mock connections: page
+//! comparison, journaled write intent, readback, and the post-exit CAT check.
 //!
-//! Reading capture files proves recorded ordering, not independent fsync execution.
+//! Ordering assertions read the capture files; fsync itself is exercised
+//! through the injected synchronization-failure seams.
 
 use std::collections::VecDeque;
 use std::fs::File;

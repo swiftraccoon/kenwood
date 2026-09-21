@@ -1,4 +1,5 @@
-//! External Terminal-exit lifecycle and durable evidence using only mock handles.
+//! Tests for the two-session lifecycle and its journal records, over mock
+//! connections.
 
 mod observations;
 mod open_lifecycle;

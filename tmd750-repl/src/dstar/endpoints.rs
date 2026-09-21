@@ -1,8 +1,8 @@
-//! Select a native modem and independent USB control without protocol traffic.
+//! Select a native Bluetooth modem endpoint and a separate USB control
+//! endpoint, from enumeration metadata only, sending no protocol traffic.
 //!
-//! Recognized paired-device names resolve only a candidate exact address. USB
-//! selection admits observed connector metadata, not physical radio continuity;
-//! the lifecycle must independently verify both selected interfaces before use.
+//! A paired-device name and a USB connector's VID/PID yield candidates; the
+//! lifecycle confirms both interfaces with live CAT before using them.
 
 use std::io;
 use std::sync::atomic::AtomicBool;
@@ -21,21 +21,21 @@ use crate::native::{Endpoint, discovery};
 #[cfg(test)]
 mod tests;
 
-/// Selected roles remain distinct transport types throughout the lifecycle.
+/// The two endpoints automatic startup uses, one per transport type.
 #[derive(Debug)]
 pub(crate) struct Endpoints {
-    /// Exact native Bluetooth device; no serial-port alias or name fallback.
+    /// Exact native Bluetooth address; never a serial-port alias.
     pub(crate) bluetooth: Endpoint,
-    /// Independently selected, unambiguous TM-D750 USB control connector.
+    /// Separately selected, unambiguous TM-D750 USB connector.
     pub(crate) control: SerialCandidate,
 }
 
-/// Resolve metadata before opening either selected radio interface.
+/// Resolve both endpoints from metadata, opening neither.
 ///
-/// Explicit Bluetooth selection bypasses paired-device enumeration. Default
-/// discovery runs once in the shared bounded helper, on a blocking worker that
-/// is always joined before this future returns. Callers must retain this future
-/// through cancellation; cancellation prevents admission after the worker ends.
+/// An explicit Bluetooth address skips paired-device enumeration. Otherwise
+/// discovery runs once in the bounded helper, on a blocking worker that is
+/// always joined before this future returns, so the future must be polled to
+/// completion; after cancellation a late result is discarded.
 #[cfg(target_os = "macos")]
 pub(crate) async fn resolve(
     bluetooth: &discovery::Request,
@@ -54,7 +54,7 @@ pub(crate) async fn resolve(
     .await
 }
 
-/// Refuse unsupported platforms before discovery or connection opening.
+/// Return a ready `Unsupported` error: this path needs macOS Bluetooth.
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn resolve(
     _bluetooth: &discovery::Request,
@@ -68,7 +68,7 @@ pub(crate) fn resolve(
     .into()))
 }
 
-/// Admit independent USB metadata before consulting Bluetooth inventory.
+/// Select the USB control endpoint first, then resolve the Bluetooth address.
 #[cfg(any(target_os = "macos", test))]
 async fn resolve_with<F>(
     bluetooth: &discovery::Request,
@@ -100,7 +100,11 @@ fn check_cancelled(cancelled: &AtomicBool) -> io::Result<()> {
     }
 }
 
-/// Preserve explicit paths; automatic selection considers only macOS callout ports.
+/// Return the requested path unchanged, or select one automatically.
+///
+/// Automatic selection considers only TM-D750 callout ports (`/dev/cu.*`),
+/// preferring the main unit when both connectors are present, and returns
+/// `CommandError` when the enumeration metadata is ambiguous.
 #[cfg(any(target_os = "macos", test))]
 fn select_control(
     requested: Option<&str>,

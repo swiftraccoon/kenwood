@@ -1,4 +1,6 @@
-//! Negative lifecycle boundaries through the same fake backend as success.
+//! Failure paths through the same fake backend: changed identity or Gateway,
+//! an uncertain MCP entry, a changed before-image, and journal or capture
+//! failures that must stop the run before any open.
 
 use super::*;
 

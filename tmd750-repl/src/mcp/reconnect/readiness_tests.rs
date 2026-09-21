@@ -1,4 +1,5 @@
-//! Synthetic readiness retries with explicit wire and handle-ownership evidence.
+//! Tests for the bounded reacquisition loop over mock connections: which
+//! attempts are followed by another open, and how each connection is closed.
 
 use super::*;
 use std::collections::VecDeque;

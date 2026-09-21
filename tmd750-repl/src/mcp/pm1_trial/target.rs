@@ -1,4 +1,6 @@
-//! Closed adapter for the two separately approved, reversible text experiments.
+//! Private trait with exactly two implementations: the PM1 name engine and the
+//! PM-Off MY1 engine, so no caller can point the write engine at another field,
+//! address or value.
 
 use std::future::Future;
 use std::num::NonZeroU64;
@@ -20,7 +22,11 @@ pub(super) enum TrialKind {
     PmOffMy1,
 }
 
-/// This private trait cannot create a target or bypass either library driver.
+/// The per-field write engine the shared workflow drives.
+///
+/// Exposes the target page, its original and expected bytes, an optional
+/// control page, the restoration status and the session driver. No method
+/// builds a write frame or takes an address from a caller.
 pub(super) trait Trial: Send + Sync {
     fn kind(&self) -> TrialKind;
     fn label(&self) -> &'static str;

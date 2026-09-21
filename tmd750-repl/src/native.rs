@@ -1,4 +1,5 @@
-//! Exact-address native Bluetooth ownership and captured control workflows.
+//! Native Bluetooth opening by exact address, and the captured CAT and MCP
+//! workflows that run over it.
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -26,27 +27,28 @@ pub(crate) mod repl;
 mod tests;
 pub(crate) mod workflow;
 
-/// A selected physical address, never a paired display-name match or USB alias.
+/// One Bluetooth device to open, selected by address rather than by name.
 #[derive(Clone, Debug)]
 pub(crate) struct Endpoint {
     pub(crate) address: BluetoothAddress,
     pub(crate) helper: Option<PathBuf>,
 }
 
-/// The exact endpoint returned by one native opening operation.
+/// The address and RFCOMM channel one open actually used.
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct Resolved {
     pub(crate) address: String,
     pub(crate) rfcomm_channel: u8,
 }
 
-/// Return endpoint evidence with the owner, not in a later disconnected query.
+/// A native connection paired with the address and channel it opened on.
 pub(crate) struct Opened<T> {
     pub(crate) connection: T,
     pub(crate) resolved: Resolved,
 }
 
-/// Native opening failures retain cleanup from any late successful open.
+/// A failed native open, including the close of any connection that arrived
+/// after the failure was decided.
 #[derive(Debug)]
 pub(crate) struct OpenFailure {
     pub(crate) error: Failure,
@@ -69,11 +71,14 @@ impl Serialize for OpenFailure {
     }
 }
 
-/// Retry admission is derived from typed transport evidence, never error text.
+/// Whether a failure may be retried, decided from `TransportError` variants
+/// rather than from error text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum RetryAdmission {
+    /// Not retryable.
     Refused,
+    /// A native opening stage that may be attempted once more.
     NativeOpening,
 }
 
@@ -121,29 +126,30 @@ impl OpenFailure {
         }
     }
 
-    /// Whether application ownership ended, not whether the OS cancelled RFCOMM.
+    /// Whether this process no longer holds the connection.
     ///
-    /// Known native opening stages require an already reaped helper. Unknown or
-    /// unframed failures do not carry that proof, even when no owner was returned.
-    /// A failed explicit close also prevents this stronger handoff assurance.
+    /// True only for the typed opening failures whose helper was reaped, and
+    /// only when no close error was recorded. It says nothing about the RFCOMM
+    /// channel's state in the operating system.
     pub(crate) const fn host_retirement_confirmed(&self) -> bool {
         self.host_retirement_confirmed && self.close_error.is_none()
     }
 
-    /// Record a refusal at a boundary that has not dispatched native opening.
+    /// Build a failure for a refusal made before any open was dispatched.
     pub(crate) fn before_open(error: &(dyn std::error::Error + 'static)) -> Self {
         let mut failure = Self::from_error(error);
         failure.host_retirement_confirmed = true;
         failure
     }
 
-    /// Preserve the actual retirement of an acquired but inadmissible owner.
+    /// Record the close of a connection that arrived after this failure.
     pub(crate) fn record_close(&mut self, error: Option<Failure>) {
         self.host_retirement_confirmed = error.is_none();
         self.close_error = error;
     }
 
-    /// An outer deadline cannot manufacture or erase inner retirement evidence.
+    /// Fold an inner open failure into this outer deadline or cancellation
+    /// failure: adopt its close state and append its message and causes.
     pub(crate) fn retain_open_failure(&mut self, cause: Self) {
         self.host_retirement_confirmed = cause.host_retirement_confirmed();
         self.close_error = cause.close_error;
@@ -151,8 +157,11 @@ impl OpenFailure {
         self.error.causes.extend(cause.error.causes);
     }
 
-    /// Only a completed native opening failure may receive one selected retry.
-    /// A late successful owner's cleanup failure never creates retry authority.
+    /// Whether this failure is eligible for one retry.
+    ///
+    /// True only when it came from a retryable native opening stage (see
+    /// `retryable_open_stage`) or `TransportError::NotFound`, and no close
+    /// error was recorded for a connection that arrived late.
     pub(crate) const fn retry_allowed(&self) -> bool {
         matches!(self.retry_admission, RetryAdmission::NativeOpening) && self.close_error.is_none()
     }
@@ -172,13 +181,18 @@ const fn retryable_open_stage(stage: BluetoothOpenStage) -> bool {
     )
 }
 
-/// Host dispatch policy, not a firmware-readiness or scheduling guarantee.
+/// Wall-clock budget for one native open, from dispatching the helper worker
+/// until it returns a connection or a typed failure. Host policy, not a
+/// firmware timing bound.
 pub(crate) const OPEN_BUDGET: Duration = Duration::from_secs(25);
+/// Interval between cancellation and deadline checks while the worker runs.
 #[cfg(any(target_os = "macos", test))]
 const CANCELLATION_POLL: Duration = Duration::from_millis(10);
+/// Wall-clock budget for the single close of a native connection.
 pub(crate) const CLOSE_BUDGET: Duration = Duration::from_secs(2);
 
-/// Replaceable native dependency; fake tests cannot open a real endpoint.
+/// Opens native connections; tests substitute an implementation that never
+/// touches a real device.
 pub(crate) trait Backend {
     type Connection: Transport;
     async fn open(
@@ -187,8 +201,10 @@ pub(crate) trait Backend {
         service: BluetoothService,
         cancelled: &AtomicBool,
     ) -> Result<Opened<Self::Connection>, OpenFailure>;
-    /// Join opening under a caller's absolute lifecycle deadline. The default
-    /// retains ownership; callers must still reject and retire late returns.
+    /// Open under the caller's absolute deadline as well as `OPEN_BUDGET`.
+    ///
+    /// The default implementation ignores `_deadline`, so a caller that has one
+    /// must still reject and close a connection returned after it.
     async fn open_until(
         &mut self,
         endpoint: &Endpoint,
@@ -235,7 +251,8 @@ impl Backend for SystemBackend {
     }
 }
 
-/// Finish a started helper worker even after cancellation; do not detach its owner.
+/// Run `worker` on a blocking task, joining it even after cancellation or the
+/// budget expires; a connection it returns late is closed, never leaked.
 #[cfg(any(target_os = "macos", test))]
 async fn open_worker<T, F>(
     cancelled: &AtomicBool,
@@ -305,7 +322,7 @@ async fn cancelled_or_deadline(cancelled: &AtomicBool, deadline: tokio::time::In
     }
 }
 
-/// Close is always attempted once and retains failure independently of observations.
+/// Close `transport` once within `CLOSE_BUDGET`, returning any failure.
 pub(crate) async fn close(transport: &mut impl Transport) -> Option<Failure> {
     match tokio::time::timeout(CLOSE_BUDGET, transport.close()).await {
         Ok(Ok(())) => None,

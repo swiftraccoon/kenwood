@@ -1,4 +1,5 @@
-//! Offline admission and exact command-scope contracts; no radio is opened.
+//! Tests for which arguments, endpoints and backups the command accepts, and
+//! for the fixed pages it targets. No port is opened.
 
 use super::*;
 use kenwood_tmd750::{FirmwareIdentity, Identity, RadioModel, RadioType};
@@ -134,8 +135,8 @@ fn endpoint_baud_and_constructed_approval_fail_before_reading_backup() {
     assert!(
         request
             .prepare(&endpoint(), DEFAULT_BAUD)
-            .is_err_and(|error| error.to_string().contains("approval")),
-        "constructed requests must also require approval"
+            .is_err_and(|error| error.to_string().contains("--approve-live-test")),
+        "constructed requests must also require --approve-live-test"
     );
     request.approve_live_test = true;
     for candidate in [

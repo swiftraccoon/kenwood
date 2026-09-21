@@ -1,4 +1,5 @@
-//! Durable MY1 records bind the exact target, control page, and typed operation.
+//! Tests that the MY1 journal records name the exact target page, control page
+//! and operation, and that they are fsynced in order.
 
 #![cfg(unix)]
 

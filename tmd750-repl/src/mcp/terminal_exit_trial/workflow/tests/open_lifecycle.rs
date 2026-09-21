@@ -1,4 +1,5 @@
-//! On-disk original-connection evidence without opening real radio interfaces.
+//! Tests for the transcript records written around each connection open, read
+//! back from disk; no real interface is opened.
 
 use super::*;
 

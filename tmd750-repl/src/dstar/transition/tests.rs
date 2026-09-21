@@ -1,4 +1,6 @@
-//! Ownership and negative controls using only in-memory transport fixtures.
+//! MMDVM acquisition over in-memory transports: reusing the original
+//! connection, closing before each reopen, the window and close budgets, and
+//! the cancellation and truncated-reply paths.
 
 use std::collections::VecDeque;
 use std::io;

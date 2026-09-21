@@ -1,4 +1,5 @@
-//! Local-only verification of the additional required Gateway Off observation.
+//! Tests for the identity-plus-Gateway-Off check over mock connections that
+//! record every write, close and drop.
 
 use super::*;
 use std::io;

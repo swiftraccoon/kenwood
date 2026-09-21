@@ -1,4 +1,8 @@
-//! Approved, fixed read-only re-entry control with continuous passive evidence.
+//! Two fixed read-only MCP sessions on one endpoint, watched by a passive
+//! macOS registry observer that samples throughout.
+//!
+//! Requires `--approve-live-test`. Each session reads addresses 8..48 and
+//! 327681..327936 only and writes no setting.
 
 mod observer;
 mod workflow;
@@ -21,14 +25,16 @@ use crate::capture::{Artifacts, CaptureKind, Recorder, create_private_file};
 use crate::{AppResult, CommandError, output};
 use workflow::{Captures, Workflow};
 
-const SCOPE: &str = "exactly two fixed read-only MCP sessions; TM-D750 / 1.02 / K,2,1; main USB at 9600; fresh Gateway Off before entry and after each exit; reads 8..48 and 327681..327936 only; no settings writes, fill, RF, retry, restoration, or inferred physical continuity";
-// Observation after failure adds no protocol traffic and cannot authorize retry.
+const SCOPE: &str = "exactly two fixed read-only MCP sessions; TM-D750 / 1.02 / K,2,1; main USB at 9600; fresh Gateway Off before entry and after each exit; reads 8..48 and 327681..327936 only; no settings writes, fill, RF, retry, or restoration";
+// After a failed session the passive observer keeps sampling for this long; no
+// protocol traffic is sent and no further session is started.
 const FAILURE_OBSERVATION: Duration = Duration::from_secs(20);
 
-/// Explicit approval for two programming interruptions, never a settings edit.
+/// Arguments of `mcp reentry-probe`: the required flag and the capture path.
 #[derive(Debug, Parser)]
 pub(crate) struct Request {
-    /// Approve one fixed pair of read-only programming sessions.
+    /// Required. Enters programming mode twice, reading two fixed fragments
+    /// each time; normal radio operation pauses during each session.
     #[arg(long, required = true)]
     approve_live_test: bool,
     /// New private capture directory; its parent must exist.
@@ -40,7 +46,7 @@ impl Request {
     fn validate(&self, endpoint: &SerialCandidate, baud: u32) -> AppResult<()> {
         if !self.approve_live_test {
             return Err(
-                CommandError("explicit re-entry probe approval is required".to_owned()).into(),
+                CommandError("mcp reentry-probe requires --approve-live-test".to_owned()).into(),
             );
         }
         if !endpoint.is_tmd750() || endpoint.pid != Some(TMD750_MAIN_PID) || baud != DEFAULT_BAUD {
@@ -76,7 +82,9 @@ struct Report {
     cancelled: bool,
 }
 
-/// Files for all possible sessions exist before the first radio open.
+/// Capture files for both sessions, the journal and the observer.
+///
+/// All of them exist before the first radio open.
 struct Reserved {
     sessions: [Captures; 2],
     journal: Recorder<File>,
@@ -127,7 +135,11 @@ impl Reserved {
     }
 }
 
-/// Reserve evidence, observe passively, and run only the approved fixed pair.
+/// Reserve the capture files, start the observer, then run the two sessions.
+///
+/// Returns `CommandError` without opening anything when `--approve-live-test`
+/// is absent, the endpoint is not the pinned main-unit USB endpoint at 9600
+/// baud, or the host is not macOS.
 pub(super) async fn run(endpoint: &SerialCandidate, baud: u32, request: &Request) -> AppResult<()> {
     request.validate(endpoint, baud)?;
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -144,7 +156,7 @@ pub(super) async fn run(endpoint: &SerialCandidate, baud: u32, request: &Request
     let reserved = Reserved::create(&directory, transcript, &cancelled)?;
     let started_at_utc = OffsetDateTime::now_utc().format(&Rfc3339)?;
     output::line(format_args!(
-        "Read-only re-entry evidence: {}.",
+        "Read-only re-entry capture: {}.",
         directory.display()
     ));
     output::line(format_args!(
@@ -190,7 +202,7 @@ pub(super) async fn run(endpoint: &SerialCandidate, baud: u32, request: &Request
         && !report.cancelled
     {
         output::line(format_args!(
-            "Both fixed read sessions and fresh CAT Off checks completed. This is one measured sequence, not a readiness deadline or qualification of automatic Terminal switching."
+            "Both fixed read sessions and fresh CAT Off checks completed."
         ));
         Ok(())
     } else {
@@ -227,7 +239,7 @@ async fn run_observed(
     .await;
     if !result.succeeded() && !cancelled.load(Ordering::Relaxed) {
         output::line(format_args!(
-            "Active commands stopped. Recording passive serial registration for 20 more seconds; this does not establish recovery or authorize another attempt."
+            "Active commands stopped. Recording passive serial registration for 20 more seconds; no further session will start."
         ));
         tokio::time::sleep(FAILURE_OBSERVATION).await;
     }

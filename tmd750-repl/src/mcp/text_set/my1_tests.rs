@@ -1,4 +1,5 @@
-//! MY1 command admission uses only local arguments and synthetic backup files.
+//! Tests for which MY1 arguments and backup files the command accepts, using
+//! synthetic report fixtures.
 
 use clap::Parser;
 use serde_json::Value;

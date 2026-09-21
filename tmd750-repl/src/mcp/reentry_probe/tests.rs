@@ -1,4 +1,5 @@
-//! Offline CLI admission and exclusive capture reservation.
+//! Tests for which arguments and endpoints the command accepts, and for the
+//! capture files it reserves before opening a port.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;

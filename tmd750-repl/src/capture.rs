@@ -1,4 +1,5 @@
-//! Exclusive capture files with observational or required transport recording.
+//! Exclusively created capture files, and the transport wrapper that records
+//! into them either observationally or as a precondition for each operation.
 
 use std::error::Error as StdError;
 use std::fs::{self, File, OpenOptions};
@@ -12,7 +13,7 @@ use kenwood_transport::{Transport, TransportError};
 use serde::Serialize;
 use time::OffsetDateTime;
 
-/// Preserve the outer error and its complete source chain in capture evidence.
+/// A recorded error: its display text plus its complete source chain.
 #[derive(Clone, Debug, Serialize)]
 pub(super) struct Failure {
     /// Display text of the failed operation.
@@ -22,7 +23,7 @@ pub(super) struct Failure {
 }
 
 impl Failure {
-    /// Record every available cause without replacing the outer diagnostic.
+    /// Build a `Failure` from `error`, walking `source()` to the root cause.
     pub(super) fn from_error(error: &(dyn StdError + 'static)) -> Self {
         let mut causes = Vec::new();
         let mut source = error.source();
@@ -47,16 +48,16 @@ impl std::fmt::Display for Failure {
     }
 }
 
-/// Workflow namespace used only when selecting a default capture directory.
+/// Which workflow a capture belongs to; selects the default directory prefix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CaptureKind {
-    /// MCP programming, configuration, or recovery evidence.
+    /// MCP programming, configuration reads, and recovery.
     Mcp,
-    /// Diagnostic-only CAT and D-STAR protocol identification evidence.
+    /// CAT and MMDVM diagnostic queries.
     DstarProbe,
-    /// Automatic Terminal entry, modem startup, and exact settings restoration.
+    /// Terminal entry, modem startup, and settings restoration.
     DstarStart,
-    /// Exact-address native Bluetooth control and read-only qualification.
+    /// Native Bluetooth CAT sessions and read-only MCP reads.
     NativeBluetooth,
 }
 
@@ -88,7 +89,10 @@ pub(super) struct Artifacts {
 }
 
 impl Artifacts {
-    /// Reserve every output before the radio is opened.
+    /// Create the directory and both files before the radio is opened.
+    ///
+    /// `requested` must name a directory that does not exist yet; without it a
+    /// timestamped directory is reserved under `captures/`.
     pub(super) fn create(
         kind: CaptureKind,
         requested: Option<&Path>,
@@ -113,7 +117,8 @@ impl Artifacts {
         })
     }
 
-    /// Reserve the fresh-verification transcript before opening any connection.
+    /// Create `post-exit-transcript.jsonl` for the connection opened after the
+    /// MCP exit, before that connection exists.
     pub(super) fn reserve_post_exit(
         &self,
         cancelled: Arc<AtomicBool>,
@@ -165,15 +170,18 @@ pub(super) fn create_private_file(path: &Path) -> io::Result<File> {
     options.open(path)
 }
 
-/// One exact transport observation; requested writes are not proof of delivery.
+/// One recorded transport operation.
+///
+/// `Requested` variants are written before the operation is dispatched, so
+/// they record what was attempted, not what the radio received.
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(super) enum Event<'a> {
-    /// Opening the selected endpoint was requested; this is not protocol proof.
+    /// An open of this endpoint was dispatched at this baud.
     OpenRequested { path: &'a str, baud: u32 },
-    /// A new host handle was obtained; firmware readiness is not established.
+    /// The open returned a host handle.
     OpenCompleted,
-    /// No handle was obtained from the requested opening operation.
+    /// The open returned no handle.
     OpenFailed { error: Failure },
     /// Bytes supplied to the transport, recorded before dispatch.
     WriteRequested { bytes: &'a [u8] },
@@ -193,11 +201,11 @@ pub(super) enum Event<'a> {
     BaudCompleted,
     /// The serial baud change failed.
     BaudFailed { error: Failure },
-    /// Connection release started; this sends no radio protocol request.
+    /// A close was dispatched; it sends no radio protocol request.
     CloseRequested,
-    /// Connection release finished.
+    /// The close completed.
     CloseCompleted,
-    /// Connection release failed.
+    /// The close failed.
     CloseFailed { error: Failure },
 }
 
@@ -209,7 +217,11 @@ struct Record<E> {
     event: E,
 }
 
-/// Recorder errors request cooperative cancellation, never interrupt cleanup.
+/// Writes one JSON line per event to `writer`.
+///
+/// The first recording failure is retained, later records are dropped, and the
+/// shared cancellation flag is set so callers stop issuing protocol traffic;
+/// closing a connection is still allowed.
 #[derive(Debug)]
 pub(super) struct Recorder<W> {
     writer: W,
@@ -225,7 +237,7 @@ impl<W: Write> Recorder<W> {
         Self::named(writer, cancelled, "transcript.jsonl")
     }
 
-    /// Create a recorder for one predefined, separately reserved transcript.
+    /// Create a recorder for an already reserved transcript named `filename`.
     pub(super) fn named(writer: W, cancelled: Arc<AtomicBool>, filename: &'static str) -> Self {
         Self {
             writer,
@@ -237,7 +249,7 @@ impl<W: Write> Recorder<W> {
         }
     }
 
-    /// Flush one typed transport or connection-lifecycle observation.
+    /// Serialize `event` as one JSON line and flush it.
     pub(super) fn record(&mut self, event: impl Serialize) {
         if self.error.is_some() {
             return;
@@ -262,15 +274,15 @@ impl<W: Write> Recorder<W> {
     }
 
     fn write_record(&mut self, record: &impl Serialize) -> io::Result<()> {
-        // Keep serializer fragments in memory without buffering across records.
-        // Short writes still require completion; durability remains explicit.
+        // Serialize into memory so one record reaches the file in a single
+        // write_all; flush completes short writes, and sync_all is separate.
         let mut bytes = serde_json::to_vec(record)?;
         bytes.push(b'\n');
         self.writer.write_all(&bytes)?;
         self.writer.flush()
     }
 
-    /// Describe whether the entire attempted transport transcript was captured.
+    /// Summarize the transcript: its file, event count, and first failure.
     pub(super) fn summary(&self) -> TranscriptSummary {
         TranscriptSummary {
             file: self.filename,
@@ -280,7 +292,7 @@ impl<W: Write> Recorder<W> {
         }
     }
 
-    /// Refuse a subsequent operation when any preceding capture failed.
+    /// Return an error when any earlier record or synchronization failed.
     pub(super) fn ensure_complete(&self) -> io::Result<()> {
         self.error.as_ref().map_or(Ok(()), |error| {
             Err(io::Error::other(format!(
@@ -293,19 +305,19 @@ impl<W: Write> Recorder<W> {
 impl Recorder<File> {
     /// Clone this file descriptor solely for synchronizing already flushed events.
     ///
-    /// The handle must never write or seek. Cloning does not synchronize content;
-    /// the caller must explicitly call `sync_all` at the intended boundary and
-    /// retain any failure before permitting further protocol work.
+    /// The handle must never write or seek. Cloning synchronizes nothing; the
+    /// caller calls `sync_all` at the intended boundary, and a failure there
+    /// blocks further protocol work.
     pub(super) fn synchronization_handle(&self) -> io::Result<File> {
         self.ensure_complete()?;
         self.writer.try_clone()
     }
 
-    /// Flush and synchronize transcript evidence before accepting a session.
+    /// Flush the writer, then `sync_all` its file.
     ///
-    /// A prior recording failure still makes this fail even if synchronization
-    /// succeeds. A synchronization failure marks the transcript incomplete and
-    /// requests cancellation without replacing the first recorded error.
+    /// An earlier recording failure still fails this call even when the
+    /// synchronization succeeds. A synchronization failure marks the transcript
+    /// incomplete and sets cancellation, without replacing the first error.
     pub(super) fn synchronize(&mut self) -> io::Result<()> {
         self.synchronize_with(File::sync_all)
     }
@@ -322,7 +334,7 @@ impl Recorder<File> {
     }
 }
 
-/// Completeness of the transcript, independent of the radio protocol outcome.
+/// One transcript's file, event count, completeness and first failure.
 #[derive(Clone, Debug, Serialize)]
 pub(super) struct TranscriptSummary {
     file: &'static str,
@@ -333,7 +345,7 @@ pub(super) struct TranscriptSummary {
 }
 
 impl TranscriptSummary {
-    /// The first recording or synchronization failure, independent of cleanup.
+    /// The first recording or synchronization failure, if there was one.
     pub(super) const fn error(&self) -> Option<&Failure> {
         self.error.as_ref()
     }
@@ -342,13 +354,13 @@ impl TranscriptSummary {
 /// Whether capture failure may interrupt subsequent protocol operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CapturePolicy {
-    /// Preserve transport results and allow cleanup after capture failure.
+    /// A capture failure never changes a transport result.
     Observational,
-    /// Require capture for protocol traffic; always attempt connection release.
+    /// Each operation requires its record first; the close is still attempted.
     Required,
 }
 
-/// Records the original transport without adding radio commands or retries.
+/// A `Transport` that records every operation, adding no command or retry.
 #[derive(Debug)]
 pub(super) struct CaptureTransport<T, W> {
     inner: T,
@@ -357,7 +369,8 @@ pub(super) struct CaptureTransport<T, W> {
     activity: TransportActivity,
 }
 
-/// Per-handle dispatch evidence, independent of parsing and capture success.
+/// Write and read counters for one handle, incremented whether or not the
+/// bytes parsed and whether or not the capture succeeded.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct TransportActivity {
     writes_started: u64,
@@ -372,16 +385,17 @@ impl TransportActivity {
         received_bytes: 0,
     };
 
-    /// Exactly one completed write and no input, not even a partial reply.
+    /// Whether exactly one write completed and no byte at all was received.
     ///
-    /// The caller must separately prove the command and typed timeout result.
+    /// The bytes written are not inspected; the caller matches the command and
+    /// its timeout result.
     pub(super) const fn silent_first_exchange(self) -> bool {
         self.writes_started == 1 && self.writes_completed == 1 && self.received_bytes == 0
     }
 }
 
 impl<T, W> CaptureTransport<T, W> {
-    /// Begin observational recording without changing transport results.
+    /// Wrap `inner` with observational recording, which never changes a result.
     pub(super) const fn new(inner: T, recorder: Recorder<W>) -> Self {
         Self {
             inner,
@@ -391,13 +405,12 @@ impl<T, W> CaptureTransport<T, W> {
         }
     }
 
-    /// Require complete recording before further protocol traffic is allowed.
+    /// Wrap `inner` so each operation requires its record to be written first.
     ///
-    /// Failure to record a request prevents its dispatch. Failure to record an
-    /// operation's result returns an error after dispatch, so delivery or read
-    /// state must be treated as uncertain. Connection release is always tried,
-    /// even after capture failure; no later protocol read, write, or baud change
-    /// is dispatched. This policy does not add retries or protocol cleanup.
+    /// A failure to record a request stops that request from being dispatched.
+    /// A failure to record a result returns an error after dispatch, so the
+    /// delivery or read state is then unknown. Close is still attempted after a
+    /// capture failure, while no further read, write or baud change is.
     pub(super) const fn required(inner: T, recorder: Recorder<W>) -> Self {
         Self {
             inner,
@@ -407,7 +420,7 @@ impl<T, W> CaptureTransport<T, W> {
         }
     }
 
-    /// Inspect actual dispatch activity on this handle, never a prior handle.
+    /// The write and read counters accumulated on this handle.
     pub(super) const fn activity(&self) -> TransportActivity {
         self.activity
     }
@@ -423,34 +436,34 @@ impl<T, W> CaptureTransport<T, W> {
         Ok(())
     }
 
-    /// Recover the recorder after closing and dropping the underlying transport.
+    /// Take the recorder back, dropping the wrapped transport.
     pub(super) fn into_recorder(self) -> Recorder<W> {
         self.recorder
     }
 }
 
 impl<T, W: Write> CaptureTransport<T, W> {
-    /// Inspect capture completeness without releasing its connection owner.
+    /// Summarize the transcript without consuming this wrapper.
     pub(super) fn transcript_summary(&self) -> TranscriptSummary {
         self.recorder.summary()
     }
 }
 
 impl<T> CaptureTransport<T, File> {
-    /// Clone a synchronization-only handle while retaining this transport owner.
+    /// Clone a synchronization-only handle, keeping this transport open.
     ///
-    /// The returned handle must never write or seek. Call `sync_all` explicitly
-    /// before admitting a write whose intent depends on already flushed wire
-    /// evidence; a failure must prevent that write and remain in its outcome.
+    /// The returned handle must never write or seek. Call `sync_all` before a
+    /// write that requires the preceding transcript to be on disk; a failure
+    /// there stops that write and is retained in its outcome.
     pub(super) fn synchronization_handle(&self) -> io::Result<File> {
         self.recorder.synchronization_handle()
     }
 
-    /// Synchronize captured observations before admitting another exchange.
+    /// Flush and `sync_all` the transcript before the next exchange.
     ///
-    /// A synchronization failure marks the recorder incomplete and requests
+    /// A synchronization failure marks the recorder incomplete and sets
     /// cancellation. Required recording then refuses further protocol traffic,
-    /// while connection release remains available.
+    /// while the close remains available.
     pub(super) fn synchronize(&mut self) -> io::Result<()> {
         self.recorder.synchronize()
     }
@@ -473,7 +486,7 @@ impl<T: Transport, W: Write + Send + Sync> Transport for CaptureTransport<T, W> 
             },
         });
         result?;
-        self.require_capture("after write dispatch; delivery cannot be qualified")
+        self.require_capture("after write dispatch; delivery was not recorded")
             .map_err(TransportError::Write)
     }
 
@@ -507,7 +520,7 @@ impl<T: Transport, W: Write + Send + Sync> Transport for CaptureTransport<T, W> 
             }),
         }
         let count = result?;
-        self.require_capture("after read dispatch; received bytes cannot be qualified")
+        self.require_capture("after read dispatch; the received bytes were not recorded")
             .map_err(TransportError::Read)?;
         Ok(count)
     }
@@ -538,7 +551,7 @@ impl<T: Transport, W: Write + Send + Sync> Transport for CaptureTransport<T, W> 
             },
         });
         result?;
-        self.require_capture("after baud dispatch; baud change cannot be qualified")
+        self.require_capture("after baud dispatch; the baud change was not recorded")
             .map_err(capture_baud_error)
     }
 }
@@ -1007,8 +1020,8 @@ mod tests {
         let mut transport = CaptureTransport::required(mock, recorder);
         let write = transport.write(request).await;
         assert!(
-            matches!(write, Err(TransportError::Write(ref source)) if source.to_string().contains("after write dispatch; delivery cannot be qualified")),
-            "post-dispatch evidence failure must not imply that no write occurred: {write:?}"
+            matches!(write, Err(TransportError::Write(ref source)) if source.to_string().contains("after write dispatch; delivery was not recorded")),
+            "a recording failure after dispatch must not imply that no write occurred: {write:?}"
         );
         assert!(transport.write(request).await.is_err());
         assert_eq!(transport.inner.writes(), [request.to_vec()]);

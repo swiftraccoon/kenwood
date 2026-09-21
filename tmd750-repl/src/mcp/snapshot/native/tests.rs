@@ -1,4 +1,5 @@
-//! Completed native evidence is necessary but never USB-write provenance.
+//! Tests for decoding format-3 native backup reports and for their rejection
+//! by `Snapshot::load_for_usb_write`.
 
 use serde_json::{Value, json};
 
@@ -110,7 +111,7 @@ fn absent_fresh_identity_or_gateway_is_explained_and_never_inferred() -> TestRes
         remove(&mut absent, &path)?;
         let missing = load(&absent)
             .err()
-            .ok_or("absent fresh evidence was inferred")?;
+            .ok_or("absent fresh reads were inferred")?;
         assert!(
             missing
                 .to_string()
@@ -121,11 +122,11 @@ fn absent_fresh_identity_or_gateway_is_explained_and_never_inferred() -> TestRes
         replace(&mut unobserved, &path, Value::Null)?;
         let error = load(&unobserved)
             .err()
-            .ok_or("null fresh evidence was inferred")?;
+            .ok_or("null fresh reads were inferred")?;
         assert!(
             error
                 .to_string()
-                .contains("fresh CAT identity and Gateway Off evidence"),
+                .contains("fresh CAT identity and Gateway Off reads"),
             "unobserved {field} must identify the failed verification: {error}"
         );
     }

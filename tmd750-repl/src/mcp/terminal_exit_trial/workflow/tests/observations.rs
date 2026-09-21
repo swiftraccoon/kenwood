@@ -1,4 +1,5 @@
-//! Historical success facts must not hide incomplete exit verification.
+//! Tests that the printed session lines report each session separately, so one
+//! session's success never stands in for a failed later verification.
 
 use super::{Harness, Scenario, TestResult, fresh_script, mcp_script};
 

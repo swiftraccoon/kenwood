@@ -1,4 +1,6 @@
-//! Exact native workflow traffic and owner retirement, without Bluetooth I/O.
+//! Native workflow wire schedules over a mock transport: the exact CAT, fixed
+//! and backup traffic, the close performed in each path, and how failures are
+//! reported.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;

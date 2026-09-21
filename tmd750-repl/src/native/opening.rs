@@ -1,4 +1,4 @@
-//! Captured, bounded native selection with an append-only attempt history.
+//! Bounded native opening, recorded as an append-only history of attempts.
 
 use std::fs::File;
 use std::io;
@@ -20,23 +20,27 @@ mod tests;
 pub(crate) const MAX_ATTEMPTS: u8 = 2;
 pub(crate) const RETRY_DELAY: Duration = Duration::from_secs(1);
 
-/// A validated endpoint and its exclusively owned, required capture.
+/// An opened connection wrapped in its own required capture recorder.
 pub(crate) struct Captured<T> {
     pub(crate) transport: CaptureTransport<T, File>,
     pub(crate) resolved: Resolved,
     pub(crate) channel: RfcommChannel,
 }
 
-/// An intent is distinct from a backend dispatch that actually started.
+/// One open attempt and what it observed.
 #[derive(Debug, Serialize)]
 pub(crate) struct Attempt {
+    /// Attempt number, starting at 1.
     pub(crate) number: u8,
-    /// False when capture or cancellation refused the recorded intent.
+    /// Whether the backend open was dispatched; false when capture or
+    /// cancellation stopped the attempt beforehand.
     pub(crate) started: bool,
-    /// Returned metadata, including a rejected endpoint when one was observed.
+    /// Address and channel returned, including for a rejected connection.
     pub(crate) resolved: Option<Resolved>,
+    /// The open failure, if any.
     pub(crate) error: Option<OpenFailure>,
-    /// An outer deadline or cancellation cannot erase a native opening error.
+    /// Cancellation or deadline seen at this attempt, recorded in addition to
+    /// `error`, never in place of it.
     pub(crate) interruption: Option<Failure>,
 }
 
@@ -59,19 +63,20 @@ impl Attempt {
     }
 }
 
-/// Earlier failures remain visible even when a later selected open succeeds.
+/// Every attempt of one opening, including those before a later success.
 #[derive(Debug, Serialize)]
 pub(crate) struct History {
     pub(crate) attempts: Vec<Attempt>,
     pub(crate) retry_error: Option<Failure>,
     pub(crate) capture_error: Option<Failure>,
-    /// Opening-phase prefix at failure or successful owner handoff. Subsequent
-    /// protocol observations continue in the same file under the admitted owner.
+    /// The transcript as of the failure or the handoff of the connection.
+    /// Later protocol traffic continues in the same file.
     pub(crate) transcript: TranscriptSummary,
 }
 
 impl History {
-    /// Opening acceptance is independent of any later CAT observation.
+    /// Whether the last attempt opened a connection with a complete transcript
+    /// and no retry or capture error. Later CAT results do not affect this.
     pub(crate) fn succeeded(&self) -> bool {
         self.retry_error.is_none()
             && self.capture_error.is_none()
@@ -85,7 +90,8 @@ impl History {
     }
 }
 
-/// Failed selection has no transport owner; its evidence is still retained.
+/// The result of one opening: the connection when an attempt succeeded, plus
+/// the attempt history, which is present either way.
 pub(crate) struct Selection<T> {
     pub(crate) opened: Option<Captured<T>>,
     pub(crate) history: History,
@@ -225,7 +231,7 @@ async fn attempt<B: Backend>(
         return (Owner::Retired(recorder), evidence);
     }
     evidence.started = true;
-    // The backend joins every started worker, including interrupted opens.
+    // The backend joins every worker it starts, interrupted opens included.
     match backend.open(endpoint, service, cancelled).await {
         Ok(opened) => {
             evidence.resolved = Some(opened.resolved.clone());
@@ -273,11 +279,12 @@ async fn retry_wait(
     recorder.synchronize()
 }
 
-/// Open one exact selection, with at most one explicitly eligible retry.
+/// Open `endpoint`, with at most `MAX_ATTEMPTS` attempts `RETRY_DELAY` apart.
 ///
-/// No CAT, MCP, or mode command is sent here. The same recorder survives every
-/// failed attempt. An acquired but inadmissible owner is closed and dropped;
-/// capture failure, cancellation, or independent cleanup failure forbids retry.
+/// No CAT, MCP or mode command is sent. One recorder spans every attempt. A
+/// connection that resolves to another address or channel is closed and
+/// dropped, and a capture failure, cancellation, or a failed close of such a
+/// connection stops any further attempt.
 pub(crate) async fn open_selected<B: Backend>(
     backend: &mut B,
     endpoint: &Endpoint,

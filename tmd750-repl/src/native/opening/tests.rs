@@ -1,4 +1,6 @@
-//! Fake selected opens exercise capture and ownership without native I/O.
+//! Opening over a fake backend: the attempt history, the retry limit and its
+//! conditions, rejected addresses and channels, cancellation and deadlines,
+//! and capture failures that stop dispatch.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};

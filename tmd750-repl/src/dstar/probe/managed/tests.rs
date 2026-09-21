@@ -1,4 +1,5 @@
-//! Fake-backend lifecycle tests; no radio, reflector, or audio operations.
+//! Managed lifecycle coverage over a fake backend: Terminal entry, the probe,
+//! and restoration.
 
 mod failures;
 

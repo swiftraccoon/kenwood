@@ -1,4 +1,6 @@
-//! Native command admission is exercised without opening any radio endpoint.
+//! Native command-line behavior against a fake helper: argument validation,
+//! paired-device inventory and selection, capture directories and reports, and
+//! the exit status of each failure path.
 
 use clap as _;
 use dirs_next as _;

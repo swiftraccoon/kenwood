@@ -1,4 +1,5 @@
-//! Fixed re-entry ordering and retained evidence using only scripted handles.
+//! Tests for session ordering and the records kept on each path, over scripted
+//! mock connections.
 
 use std::collections::VecDeque;
 use std::fs::File;

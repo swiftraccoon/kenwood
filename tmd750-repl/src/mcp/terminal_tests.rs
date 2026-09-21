@@ -1,4 +1,4 @@
-//! Offline CLI contract tests; fixtures never represent live radio evidence.
+//! Tests for the offline Terminal commands over synthetic backup fixtures.
 
 use super::*;
 use kenwood_tmd750::MemoryImage;
@@ -150,13 +150,12 @@ fn firmware_policy_is_explicit_and_output_never_claims_live_readiness() -> TestR
         "Historical backup only",
         "current radio state is unknown",
         "firmware 1.02",
-        "Unqualified software-layout interpretation",
+        "Firmware outside the registry label",
         "No radio endpoints enumerated or opened",
-        "Live activation and restoration remain unqualified",
+        "No PM recalled, text normalized, patch generated, or settings changed",
+        "Active DV Gateway rejects CAT on its assigned interface",
         "Main-unit ID/FV/TY/GW queries were observed on firmware 1.02",
         "with Terminal selected and the Gateway routed to panel USB",
-        "does not establish current routing, general CAT access",
-        "MCP readiness, or qualified automatic exit",
     ] {
         assert!(output.contains(expected), "missing {expected}: {output}");
     }
@@ -262,14 +261,14 @@ fn even_conflict_free_output_does_not_claim_a_radio_is_ready() -> TestResult {
     assert!(report.findings.is_empty());
     let output = describe(&snapshot, &report)?.join("\n");
     assert!(output.contains("No conflicts found by these offline checks"));
-    assert!(output.contains("This is not a live-readiness result"));
+    assert!(output.contains("current radio state is unknown"));
     assert!(
         output.contains("Main-unit ID/FV/TY/GW queries were observed on firmware 1.02"),
         "the bounded alternate-port CAT finding must remain explicit"
     );
     assert!(
-        output.contains("MCP readiness, or qualified automatic exit"),
-        "historical CAT success does not establish automatic exit readiness"
+        output.contains("Active DV Gateway rejects CAT on its assigned interface"),
+        "the interface conflict must stay in conflict-free output"
     );
     Ok(())
 }

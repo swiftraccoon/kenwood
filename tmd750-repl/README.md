@@ -15,17 +15,17 @@ The diagnostic's explicit `--manage-terminal` option remains a separate
 diagnostic-only entry/restoration workflow.
 It does not expose arbitrary CAT commands or arbitrary MCP memory writes.
 The schema-driven `mcp menu` commands discover, inspect, and preview registered
-settings. Ordinary scalar updates are software-admitted on firmware 1.02 with
-complete captured-page guards, immediate full-page readback, and fresh CAT
-verification. This is not hardware qualification of every setting.
-Gateway, transport, and automatic-transmission changes need separate lifecycle
-support and cannot be applied through the ordinary menu setter. Managed
-diagnostics remain software-tested. Automatic Bluetooth startup and restoration
-have been observed on the firmware-1.02 configuration described under
-[Reflector Terminal Mode](#reflector-terminal-mode). The older PM1 and MY1
-setters and fixed qualification experiments remain separate workflows.
-The manifest's declared firmware label 1.00 is a project compatibility gate,
-not an extracted vendor maximum-version restriction.
+settings. Ordinary scalar updates are guarded on firmware 1.02 by complete
+captured-page comparison, immediate full-page readback, and fresh CAT
+verification, and are tested against mock transports rather than per field on
+hardware. Gateway, transport, and automatic-transmission fields require the
+dedicated lifecycles below and are rejected by the ordinary menu setter.
+Automatic Bluetooth startup and restoration have been exercised on the
+firmware-1.02 configuration described under
+[Reflector Terminal Mode](#reflector-terminal-mode). The PM1 and MY1 setters
+and the fixed experiments are separate workflows. The generated manifest
+declares firmware 1.00 as this crate's compatibility gate; firmware 1.02
+therefore needs `--interpret-unqualified` for offline interpretation.
 
 ## Run
 
@@ -61,13 +61,12 @@ The TM-D750 library owns USB discovery and the RTS/CTS, DTR, and RTS preset;
 Endpoint selection and post-MCP readiness remain explicit REPL policies, not
 automatic behavior in the shared transport. The experimental D-STAR runtime
 comes directly from `mmdvm::dstar`, with no TH-D75 library dependency. The REPL
-owns TM-D750 protocol admission, the selected connection, and final transport
-close; the shared runtime owns MMDVM D-STAR processing. This separation does
-not qualify additional TM-D750 protocols or lifecycle operations.
+owns the TM-D750 identity check, the selected connection, and final transport
+close; the shared runtime owns MMDVM D-STAR processing.
 
-Read-only CAT status has been hardware-validated on both main-unit and
-control-panel USB with firmware 1.02. USB identity alone remains a candidate
-filter, not protocol qualification or proof that a radio is currently ready.
+Read-only CAT status is exercised on hardware over both main-unit and
+control-panel USB with firmware 1.02. A USB identity only selects a candidate
+endpoint; the CAT identity exchange is what proves the radio.
 The transport does not automatically reopen after a USB disconnect: serial
 pathnames can be reassigned. Reconnect the intended radio and select its current
 endpoint for a new session.
@@ -101,7 +100,7 @@ FM/DV selections additionally require a fresh Gateway Off reply before every
 write, plus the library's firmware/type gate and immediate echo/readback.
 These commands select ordinary RF modes; they do not enable Terminal Mode or
 request a transmission. Invalid input stays local. A failed CAT operation
-closes the captured owner without retrying a command or reopening the session.
+closes the captured connection without retrying a command or reopening it.
 
 Rich terminals retain line editing and session history. Plain terminals,
 including `TERM=dumb`, and pipes use cancellable input. EOF, `quit`, and Ctrl-C
@@ -130,36 +129,37 @@ Off reply. The probe reads two fixed fragments totaling 295 bytes. Backup uses
 the library's complete standard schedule: 1,138 pages and 289,962 bytes, with
 no settings writes. Both require the exit acknowledgment. The original
 connection is retained without further
-protocol traffic for five seconds, then closed and dropped. Only complete
-read/exit evidence, a clean original close and complete captures admit recovery.
-Recovery reopens the exact address and the RFCOMM channel from that original
-successful connection, then verifies the original CAT identity and Gateway Off.
-The wait is host scheduling policy, not proof that firmware is ready.
+protocol traffic for five seconds, then closed and dropped. Recovery is
+attempted only after complete read/exit results, a clean original close, and
+complete captures. Recovery reopens the exact address and the RFCOMM channel
+from that original successful connection, then verifies the original CAT
+identity and Gateway Off. The five-second wait is host scheduling policy, not a
+firmware readiness signal.
 
 Each opening phase permits at most two attempts, separated by one second, for
 eligible native opening failures. A retry uses a new helper after the previous
-helper has been reaped. A typed opening failure may retain unconfirmed native
-cleanup independently; retrying it does not establish cancellation of an OS
-operation. Cancellation, helper launch/framing errors, an invalid or changed
-endpoint, incomplete capture, and a late successful owner's failed cleanup
-prevent another attempt. Neither MCP nor a CAT exchange is retried. In
+helper has been reaped. A typed opening failure can leave the native channel
+close unconfirmed; a retry does not cancel an operation the operating system
+still owns. Cancellation, helper launch/framing errors, an invalid or changed
+endpoint, incomplete capture, and a failed cleanup on a late successful
+connection prevent another attempt. Neither MCP nor a CAT exchange is retried. In
 particular, a changed identity or Gateway reply stops recovery.
 
 Format-2 native diagnostic reports retain every opening attempt, including a failed attempt
 before eventual success, and distinguish initial SDP discovery from fixed-channel
-recovery. Earlier format-1 captures retain their original single-attempt policy;
-they are not reinterpreted as evidence for the new workflow. This is ordinary
+recovery. Earlier format-1 captures retain their original single-attempt policy
+and are read under it. This is ordinary
 MCP-to-CAT recovery, not the separate Terminal-to-MMDVM transition lifecycle.
 
 Native standard backups use a distinct format-3 report tagged
 `transport = "native_bluetooth"`; pages are in `workflow.original.backup.segments`.
 Successful reports require complete original and fresh opening histories,
-acknowledged pages and exit, the captured retained-owner wait, clean closes,
-and matching fresh identity/Gateway Off. Offline show, preview, preflight, and
-comparison accept these captures. They preserve native provenance and cannot
+acknowledged pages and exit, the captured five-second retention wait, clean
+closes, and matching fresh identity/Gateway Off. Offline show, preview,
+preflight, and comparison accept these captures. They record the native
+transport and cannot
 serve as the USB backup required by existing live settings writers or managed
-diagnostics. A native capture never supplies invented USB endpoint or readiness
-evidence. Interactive, batch, and one-shot mode sessions instead publish
+diagnostics. Interactive, batch, and one-shot mode sessions instead publish
 `operation = "cat_session"`, format 1, with their actual input mode and
 independent input, output, protocol, capture, and cleanup errors; these are not
 configuration backups.
@@ -176,44 +176,28 @@ pins that channel for this workflow, using the fixed-channel baseband wakeup
 before RFCOMM opening. The channel is not a permanent model constant. It does not
 guess a channel from another radio model or fall back to the operating system's
 serial alias. Paired-name discovery happens before opening and pins one exact
-address; it does not substitute for protocol identity or authorize recovery on
-another candidate. Neither `--bluetooth` nor `--bluetooth-address` can be combined
+address; the CAT identity exchange still proves the radio, and recovery reopens
+only that address. Neither `--bluetooth` nor `--bluetooth-address` can be combined
 with `--port` or `--baud`. Packaged installations can supply a trusted executable
 with `--bluetooth-helper /absolute/path/to/helper` alongside either Bluetooth
 option; the same helper performs inventory and opening. Ordinary builds include
 the helper. Help and offline inspection do not launch it or discover devices.
 
-Normal SDP-selected native CAT and fixed MCP read/exit have responded on a
-firmware 1.02 radio while the OS serial alias timed out. This does not establish the
-cause of the serial timeout, a requirement for manual connection, or cold-start
-connection reliability. One native MCP trial completed both reads and
-acknowledged exit with a clean original close, but the fresh SPP opening timed
-out.
+On firmware 1.02 the native SPP path has carried CAT and fixed MCP read/exit
+while the OS serial alias for the same radio timed out; prefer the native path
+over the alias. Read-only `status` and `mode` reads are exercised on hardware;
+native mode writes and long-running shell sessions are not.
 
-On September 13, 2026, the interactive native shell completed read-only `status`
-and `mode b` commands entered as whole lines, then closed cleanly on Ctrl-C.
-A preceding input stall was reproduced with a real terminal test and corrected
-before this successful run. Native mode writes and long-running shell use
-remain untested on hardware.
+A Bluetooth backup whose pages and exit ACK all succeed still fails if the fresh
+`ID` after reopening receives no bytes within its 1,500 ms timeout; offline
+inspection rejects such a report despite its complete page data. A macOS
+connected flag or a cached SDP service record does not imply a usable SPP
+session, so the
+[automatic Terminal-to-MMDVM cycle](#reflector-terminal-mode) says nothing about
+a cold start. Keep other applications off the selected radio connection while
+running diagnostics.
 
-The subsequent standalone Bluetooth backup read all 1,138 standard pages;
-every byte and ACK matched the capture. Exit, the five-second retained-owner
-wait, both closes and same-address/channel reopening completed. Fresh CAT did
-not: the single `ID` received no bytes within its 1,500 ms timeout. The command
-correctly failed, and offline snapshot admission rejects that report despite
-its complete page data. Separate later USB and Bluetooth status checks both
-returned FM/FM and Gateway Off without an explicit link reset, re-pairing or
-host-issued radio reset. Those later checks establish neither a recovery time
-nor the cause of the earlier silence. Ordinary MCP-to-CAT recovery remains
-unqualified; general native MCP settings writes remain disabled.
-
-The separately observed
-[automatic Terminal-to-MMDVM cycle](#reflector-terminal-mode) does not establish
-cold-start reliability. A separate cold attempt changed the Mac's reported
-connection state to connected without receiving SDP completion; an SDP-only
-query also timed out. Neither a connected flag nor a cached service record
-proves a usable SPP session. Keep other applications off the selected radio
-connection while running diagnostics.
+Bluetooth MCP-to-CAT recovery is not validated on hardware.
 
 ## Configuration backup and PC text entry
 
@@ -230,16 +214,6 @@ official standard configuration schedule: 1,138 pages containing 289,962 bytes,
 including all six Programmable-Memory slots. It excludes the custom startup
 bitmap and unclassified regions. It sends no settings writes or RF requests.
 Programming temporarily interrupts normal radio operation.
-
-The earlier single-attempt read/exit/reconnect sequence was bench-validated on
-main-unit USB with firmware 1.02 on September 7, 2026. Every captured page matched
-its raw wire response, both connections closed cleanly, and fresh CAT identity
-matched. Two panel-USB backups on September 12, 2026 also completed bounded CAT
-reacquisition. Their first two and three fresh ID attempts, respectively, were
-silent and closed cleanly; the next handle returned matching ID/FV/TY. All
-1,138 saved pages in each capture matched the raw responses. These observations
-qualify those backup sequences, not a universal readiness bound or settings
-writes.
 
 The USB command closes and drops the original handle after the exit ACK, waits two
 seconds, then uses [bounded CAT reacquisition](#bounded-cat-reacquisition).
@@ -264,10 +238,11 @@ clean closes and complete captures for every connection, matching fresh identity
 and a written, flushed, synchronized report.
 
 Offline inspection and update planning accept complete successful USB format-4
-backups and historical USB format-3 backups with their original single-attempt
-evidence. The loader checks the evidence shape for the declared format; it does
-not upgrade reports, reinterpret failed captures as successful, or establish
-the radio's current state. Reports must be regular files no larger than 32 MiB
+backups and historical USB format-3 backups under their original single-attempt
+policy. The loader checks the report shape declared by its format version; it
+never upgrades a report or accepts a failed capture, and it describes the stored
+pages rather than the radio's current state. Reports must be regular files no
+larger than 32 MiB
 and contain every standard page in order with exact addresses and lengths.
 Native Bluetooth backups use their separate schema described above. They are
 accepted for offline inspection and previews, not by USB write workflows.
@@ -296,9 +271,8 @@ cargo run -p tmd750-repl -- mcp menu preview \
 Keys come from `list`. `describe` lists storage bounds, public choice labels,
 raw choice values, and write policy. The registry currently has 431 fields:
 350 ordinary, 60 lifecycle-required, 15 with unresolved value domains, and six
-binary fields. These are software-policy classifications, not bench-test counts
-or a claim of complete MCP application parity. Binary fields have no scalar
-preview or setter. Unknown stored numeric values remain visible when read.
+binary fields, as classified by the generated registry. Binary fields have no
+scalar preview or setter. Unknown stored numeric values remain visible when read.
 `describe` emits JSON without prose wrapping or timestamp prefixes so its output
 can be consumed directly by other tools.
 
@@ -332,7 +306,7 @@ This validates the requested representation, not callsign ownership or Terminal
 acceptance. Setting MY1 does not itself enter Terminal Mode.
 
 To leave an ordinary value configured, select the main-unit USB endpoint,
-provide a successful current backup from that radio, and explicitly apply:
+provide a successful current backup from that radio, and pass `--apply`:
 
 ```bash
 cargo run -p tmd750-repl -- --port /dev/cu.usbmodem101 \
@@ -341,8 +315,8 @@ cargo run -p tmd750-repl -- --port /dev/cu.usbmodem101 \
 ```
 
 The live command currently accepts one assignment. The library plan supports
-multiple assignments across global and per-slot fields in one session. Live
-admission requires `TM-D750 / 1.02 / K,2,1`, main-unit USB at 9600 baud, memory
+multiple assignments across global and per-slot fields in one session. A live
+run requires `TM-D750 / 1.02 / K,2,1`, main-unit USB at 9600 baud, memory
 format zero, a valid active PM selection, and Gateway Off. Complete format,
 PM-control, active-Gateway, and target pages must all match fresh reads before
 the first write. A mismatch aborts; the command does not silently merge newer
@@ -354,18 +328,17 @@ containing both complete images before dispatch. There is one W/ACK and one
 immediate complete-page readback per changed page. After acknowledged MCP exit,
 the original connection closes and drops; one fresh connection must confirm the
 same CAT identity and Gateway Off, then close cleanly. This is **two handles and
-one MCP session**, not a persistence test across MCP re-entry or power cycling.
-It does not qualify a fixed wait as firmware readiness or prove physical-unit
-identity from a reused USB pathname.
+one MCP session**, so it does not check that the change survives MCP re-entry or
+a power cycle. A reused USB pathname does not identify the physical unit.
 
 Keep the same radio connected and close other radio applications. Ctrl-C can
-cancel before the first write intent. Afterward, the approved batch and safe
+cancel before the first write intent. Afterward, the planned batch and its
 verification finish unless a protocol, capture, journal, or cleanup failure
 prevents them. Multi-page updates are not firmware-atomic. Incomplete exchanges
 prohibit speculative exit, retry, reconnect, or automatic rollback. Earlier
-verified writes remain reported if a later page fails. No RF command is sent;
-this is not a guarantee that independently configured radio functions are RF
-silent. Programming interrupts normal operation.
+verified writes remain reported if a later page fails. The command sends no RF
+request; separately configured radio functions can still transmit.
+Programming interrupts normal operation.
 
 The new private directory contains a format-1 `report.json` with
 `operation = "menu_update"`, `menu-journal.jsonl`, `transcript.jsonl`, and
@@ -373,21 +346,25 @@ The new private directory contains a format-1 `report.json` with
 blindly. Journal preparation retains every complete before/after image, including
 unchanged guards. Report `compared_pages` describes a successful whole batch;
 partial comparisons remain in the raw transcript. `possible_pages` includes
-verified writes as well as uncertain dispatches. Successful output requires
-durable final evidence too. Live updates require Unix private-file and directory
-synchronization support. An update report is not a new configuration backup;
+verified writes as well as uncertain dispatches. Success additionally requires
+the final report to be written, flushed, and synchronized. Live updates require
+Unix private-file and directory synchronization support. An update report is
+not a new configuration backup;
 refresh the backup before the next edit.
 
 The generic workflow is tested with mock transports, not yet run on hardware.
-The narrow experiments below remain the available field-level bench evidence.
-The ordinary policy is separate from the unchanged legacy raw-page schema gate;
-it does not enable arbitrary addresses or firmware overrides.
+The write paths with hardware coverage are the fixed `mcp pm1-trial` and
+`mcp my1-trial` experiments below, the Bluetooth `dstar start` entry and
+restoration under [Reflector Terminal Mode](#reflector-terminal-mode), and the
+single write of the Terminal exit trial. The ordinary policy is separate from the
+unchanged legacy raw-page schema gate; it accepts neither arbitrary addresses
+nor firmware overrides.
 
 ### Dedicated PM1 setter with re-entry verification
 
 The `pm-name-1` form of `mcp text set` changes the global PM1 label. Start with a successful
 configuration backup from the connected radio, then supply the expected current
-name, the replacement name, and explicit write approval:
+name, the replacement name, and `--apply`:
 
 ```bash
 cargo run -p tmd750-repl -- --port /dev/cu.usbmodem101 \
@@ -413,16 +390,16 @@ exit/re-entry. Each session requires exit ACK, a clean original close/drop,
 and a separate fresh CAT identity check with a clean close. This is four
 connections in total. It requests no other setting change or RF transmission.
 
-Keep the same radio connected and close other radio applications. A pathname
-and public identity tuple cannot prove physical-unit continuity. Ctrl-C can
-cancel before write intent; afterward the command finishes the remaining safe
-verification steps. A real failure stops the workflow. Uncertain framing does
-not permit speculative exit, retries, or automatic rollback. Retain the journal
-if a write may have occurred; do not blindly restore an old page. If programming
-exit is unconfirmed, fully power-cycle before reconnecting. This instruction
-concerns an uncertain MCP state, not silence after an acknowledged exit. A power
-cycle does not establish which name is stored. This workflow requires Unix
-private-file and directory synchronization support.
+Keep the same radio connected and close other radio applications; a pathname and
+the public identity tuple do not identify the physical unit. Ctrl-C can cancel
+before write intent; afterward the command finishes the remaining verification
+steps. A failure stops the workflow. Uncertain framing permits no speculative
+exit, retry, or automatic rollback. Retain the journal if a write may have
+occurred; do not blindly restore an old page. If programming exit is unconfirmed,
+fully power-cycle before reconnecting; that applies to an uncertain MCP state,
+not to silence after an acknowledged exit, and the power cycle does not report
+which name is stored. This workflow requires Unix private-file and directory
+synchronization support.
 
 The output directory must be new. It contains a format-5 `report.json` with
 `operation = "pm1_name_update"`, `update-journal.jsonl`, and separate transcripts
@@ -431,11 +408,11 @@ for both MCP sessions and both fresh CAT checks. The final status distinguishes
 contain private settings. An update report is not a configuration backup:
 **take a new full backup before the next edit**, since the old PM1 page is stale.
 
-The underlying fixed PM1 rename/restore mechanism was live-tested on September
-11, 2026, as recorded below. This configurable, leave-in-place command has been
-tested with mock transports, not run on hardware. Neither result establishes
-general keyboard/HID input, other writable text fields, independent display
-rendering, power-cycle persistence, or automatic Terminal Mode.
+This configurable leave-in-place command is tested with mock transports only;
+the fixed `mcp pm1-trial` below is the form of the underlying write mechanism
+that has run on hardware. Neither covers general keyboard/HID input, other
+writable text fields, independent display rendering, power-cycle persistence,
+or automatic Terminal Mode.
 
 ### Dedicated PM Off MY1 setter with re-entry verification
 
@@ -466,9 +443,9 @@ routing change, Gateway activation, RF command, or automatic rollback is allowed
 
 The two-session lifecycle shares PM1's capture and journal protections. MY1
 additionally requires fresh CAT Gateway Off before both MCP entries and after
-both exits. Original and fresh connections must close cleanly, and complete
-evidence must be synchronized before the next session. Cancellation before
-intent prevents new connections; after possible dispatch, safe verification
+both exits. Original and fresh connections must close cleanly, and the journal
+and transcripts must be synchronized before the next session. Cancellation
+before intent prevents new connections; after possible dispatch, verification
 finishes, while any failed requirement stops without retry or stale restoration.
 
 The new private directory contains a format-6 report with
@@ -478,17 +455,18 @@ Take a new full configuration backup before another edit; an update report is
 not a backup. The same Unix private-file and directory-sync requirements apply.
 
 This configurable leave-in-place workflow is software-tested, not yet run on
-hardware. The fixed empty-to-`KQ4NIT`-and-restoration experiment below is its
-bounded field-layout evidence. Neither operation enables automatic Terminal
-switching or establishes power-cycle persistence or complete reflector operation.
+hardware; the fixed empty-to-`KQ4NIT`-and-restore experiment below covers the
+field layout on hardware. Neither operation enables automatic Terminal switching
+or establishes power-cycle persistence or complete reflector operation.
 
-### Fixed PM1 qualification experiment
+### Fixed PM1 experiment
 
-`mcp pm1-trial` is a separately approved bench experiment, not a general text
-editor or a firmware-wide compatibility override. It is limited to main-unit
-USB at 9600 baud and the TM-D750 / firmware 1.02 / type K,2,1 tuple. Independently
-read PM1's name on the radio without recalling a profile, then explicitly
-approve a temporary rename to `PC TEXT TEST` and restoration of the original:
+`mcp pm1-trial` is a fixed rename-and-restore bench experiment, not a general
+text editor or a firmware-wide compatibility override. It requires
+`--approve-live-test`, a current backup, main-unit USB at 9600 baud, and the
+TM-D750 / firmware 1.02 / type K,2,1 tuple. Independently read PM1's name on the
+radio without recalling a profile, pass it as `--confirmed-name`, and the runner
+renames PM1 to `PC TEXT TEST` and restores the original:
 
 ```bash
 cargo run -p tmd750-repl -- --port /dev/cu.usbmodem101 \
@@ -496,21 +474,20 @@ cargo run -p tmd750-repl -- --port /dev/cu.usbmodem101 \
   --approve-live-test --output pm1-trial-01
 ```
 
-The runner reserves private evidence files before opening USB. It requires
+The runner reserves its private capture files before opening USB. It requires
 exact agreement with the backup's complete PM1 page, synchronizes a recovery
 journal before each write, compares full immediate readbacks, and checks both
 the temporary name and restored page across exit/re-entry in three separate MCP
 sessions. Each exit requires a clean old-handle close and one independently
 captured fresh CAT identity check. No other field or RF command is requested.
 
-Keep the same radio connected throughout. A path and public identity tuple
-cannot prove physical-unit continuity. Ctrl-C can cancel before a write intent;
+Keep the same radio connected throughout; a path and the public identity tuple
+do not identify the physical unit. Ctrl-C can cancel before a write intent;
 afterward it does not abandon restoration. Incomplete framing, capture failure,
 page drift, or failed identity/close verification stops further commands and
-retains the recovery evidence. Do not retry or restore a stale page blindly.
-Only the complete three-session proof reports restoration verified across MCP
-exit/re-entry. It does not independently prove a full-radio reboot or
-persistence across a power cycle. This
+retains the recovery journal. Do not retry or restore a stale page blindly.
+Only the complete three-session run reports restoration verified across MCP
+exit/re-entry, which is not a full-radio reboot or a power cycle. This
 experimental runner requires Unix private-file and directory synchronization
 support; it fails closed on unsupported platforms.
 
@@ -519,21 +496,17 @@ support; it fails closed on unsupported platforms.
 each MCP session and fresh CAT verification has a separate transcript. These
 artifacts can contain private settings.
 
-This fixed experiment succeeded on main-unit USB with firmware 1.02 and type
-K,2,1 on September 11, 2026. The original `PM1` label changed to `PC TEXT TEST`,
-then the complete original page was restored and verified in a third MCP
-session. Both writes were acknowledged and read back exactly; all six
-connections closed cleanly with matching identities. This demonstrates PC
-text-setting access through MCP for this PM1 operation, not a general keyboard
-interface, other text fields, power-cycle persistence, or automatic Terminal
-Mode. General firmware-1.02 settings writes remain gated.
+The fixed rename-and-restore sequence has run once on hardware in the
+configuration listed above, proving MCP text writes for this PM1 page only. It
+says nothing about other text fields, power-cycle persistence, or Terminal Mode,
+and general firmware-1.02 settings writes stay gated.
 
-### Fixed MY1 qualification experiment
+### Fixed MY1 experiment
 
-`mcp my1-trial` is a separate, explicitly approved keyboard-entry experiment.
-It replaces an empty DV Gateway MY1 with `KQ4NIT` in PM Off, verifies the complete
-page, then restores the exact original page. The command does not retain the
-callsign or activate Terminal Mode:
+`mcp my1-trial` is a fixed keyboard-entry experiment gated on
+`--approve-live-test`. It replaces an empty DV Gateway MY1 with `KQ4NIT` in
+PM Off, verifies the complete page, then restores the exact original page. The
+command does not retain the callsign or activate Terminal Mode:
 
 ```bash
 cargo run -p tmd750-repl -- --port /dev/cu.usbmodem101 \
@@ -556,27 +529,20 @@ read-only MCP session. Every write requires a synchronized private recovery
 journal containing both target pages and the unchanged control-page baseline.
 The existing cancellation and uncertain-exchange rules above also apply.
 The format-4 report has operation `my1_callsign_trial`; it is not a full backup.
-An empty captured MY1 is not claimed as independently observed display text.
+An empty captured MY1 describes the stored bytes, not the radio's display.
 
-This fixed experiment was bench-validated on main-unit USB, firmware 1.02,
-type K,2,1 on September 11, 2026. Independent raw-transcript auditing verified
-both writes and all 11 read segments, including the temporary callsign in the
-second session and exact restoration in the third. Gateway was observed Off
-before every entry, all six closes succeeded, and no Gateway setter, PM recall,
-or RF command was sent. A fresh full backup matched the pre-trial backup across
-all 1,138 captured pages / 289,962 bytes; final CAT status reported Gateway Off.
-MY1 was restored to empty.
-
-The runner remains experimental. This result does not independently prove
-display rendering, power-cycle persistence, callsign acceptance for Terminal
-operation, or automatic entry/exit. Keep the evidence private and take a new
-complete backup after any separately approved trial to compare every covered
+The empty-to-`KQ4NIT`-and-restore sequence has run once on hardware in the exact
+configuration listed above; MY1 was restored to empty and a post-trial backup matched
+the pre-trial backup byte for byte across all 1,138 pages / 289,962 bytes. It
+establishes neither display rendering, power-cycle persistence, callsign
+acceptance for Terminal operation, nor automatic entry/exit. Keep the captures
+private and take a new complete backup after a trial to compare every covered
 byte. Generic firmware-1.02 schema writes remain disabled.
 
 ### Experimental Terminal exit
 
-`mcp terminal-exit-trial` is a separately approved, fixed Terminal-to-Off
-experiment, not automatic D-STAR setup or a generally qualified Gateway setter:
+`mcp terminal-exit-trial` is a fixed Terminal-to-Off experiment, not automatic
+D-STAR setup or a general Gateway setter:
 
 ```bash
 cargo run -p tmd750-repl -- mcp terminal-exit-trial --help
@@ -584,7 +550,7 @@ cargo run -p tmd750-repl -- mcp terminal-exit-trial --help
 
 Execution requires an explicit main-unit `--port` before `mcp`, 9600 baud,
 `--backup REPORT` from a complete successful Gateway-Off backup, and
-`--approve-live-test`. The admitted configuration is TM-D750 / firmware 1.02 /
+`--approve-live-test`. The accepted configuration is TM-D750 / firmware 1.02 /
 type `K,2,1`, PM Off, Reflector subtype, COM+AF USB, and panel USB Gateway routing.
 No independent display confirmation is required: fresh CAT verifies the state.
 
@@ -597,33 +563,29 @@ preserved. Immediate full-page readback and a second read-only MCP session
 must match; after both exits, newly opened connections must return matching
 identity and Gateway Off, close, and synchronize their captures.
 
-`--output NEW_DIRECTORY` reserves private evidence without overwriting an
-existing capture; otherwise a unique directory is created under `captures/`.
-The format-1 report uses operation `terminal_to_off_trial` and the separate
-`terminal-exit-journal.jsonl` retains scope, intent, session evidence, and final
-status. Neither file is a full backup. Keep them private and compare a fresh
-full configuration backup after any approved live trial.
+`--output NEW_DIRECTORY` reserves a private capture directory without
+overwriting an existing one; otherwise a unique directory is created under
+`captures/`. The format-1 report uses operation `terminal_to_off_trial` and the
+separate `terminal-exit-journal.jsonl` retains the scope, the write intents, the
+per-session results, and the final status. Neither file is a full backup. Keep
+them private and compare a fresh full configuration backup after a live trial.
 
 Original MCP transcripts also timestamp the requested open and its outcome.
 The request is synchronized before opening; a successful opening must be
 recorded and synchronized before CAT traffic. Recording failure after opening
-permits only close/drop. These boundaries improve evidence retention; they are
-not a qualified delay or readiness check. Console summaries separate historical
+permits only close/drop. Console summaries separate the recorded
 write/readback/Off observations from the trial's overall completion status.
 
 Ctrl-C can cancel before intent; afterward it cannot abandon owed verification.
 Failures stop without retry or speculative rollback and retain possible-change
-status. Hardware qualification remains incomplete: one firmware-1.02 trial
-completed the sole write, exact immediate readback, and fresh CAT Off, then
-lost USB while entering the second MCP session. A later separate full backup
-matched all three guarded pages; ten bytes elsewhere differed from the
-historical baseline, with cause unestablished. The failed trial was not retried
-or reclassified as complete. Fresh CAT Off alone does not establish immediate
-MCP re-entry readiness.
-It sends no RF, reflector, PM-recall, routing, or callsign commands and does not
-widen the general firmware write gate. Manual USB `dstar stop` leaves Terminal
-Mode unchanged. Automatic Bluetooth startup separately restores changes made
-by that session through its independent USB control path.
+status. Hardware coverage is incomplete: the one hardware trial wrote and
+read back the Gateway byte and saw fresh CAT Off, then lost USB before its
+second MCP session. Fresh CAT reporting Gateway Off does not imply the radio
+will accept immediate MCP re-entry.
+The command sends no RF, reflector, PM-recall, routing, or callsign commands and
+does not widen the general firmware write gate. Manual USB `dstar stop` leaves
+Terminal Mode unchanged. Automatic Bluetooth startup separately restores changes
+made by that session through its independent USB control path.
 
 ### Offline text inspection
 
@@ -646,22 +608,19 @@ explicit `--slot 0` through `--slot 5`; global PM names reject `--slot`.
 Input is never silently truncated or case-folded, and control characters are
 rejected. Field encoding is not a claim of radio-side callsign syntax validation.
 
-The generated manifest carries the declared firmware label 1.00. This label
-is our compatibility gate, not an extracted vendor maximum-version rule.
-Firmware 1.02 therefore requires
-`--interpret-unqualified` for offline interpretation. This opt-in is retained
-in the preview alongside the original firmware identity; it does not enable
-radio writes or establish that the layout is correct. The reader requires a
+The generated manifest carries the declared firmware label 1.00, this crate's
+compatibility gate. Firmware 1.02 therefore requires `--interpret-unqualified`
+for offline interpretation. The preview records that opt-in alongside the
+original firmware identity; it enables no radio write. The reader requires a
 complete successful configuration capture and verifies every requested field
 byte was captured before decoding it.
 
 Preview prints the existing and proposed text without changing the source.
-An optional new private JSON file records provenance, qualification, before/after
-text, and exact masked page changes. It explicitly records `radio_applied: false`.
-Existing files are never overwritten. A preview does not authorize or apply
-an update. The dedicated PM1 and MY1 setters provide live text writes; ordinary
-scalar settings use the separate menu apply workflow. There is no generic
-keyboard injection or automatic Terminal Mode settings write.
+An optional new private JSON file records the source capture, the firmware
+opt-in, before/after text, and exact masked page changes. It records
+`radio_applied: false`. Existing files are never overwritten. Preview writes
+nothing to the radio; the dedicated PM1 and MY1 setters provide live text
+writes, and ordinary scalar settings use the separate menu apply workflow.
 
 ## Offline Terminal settings preflight
 
@@ -681,17 +640,16 @@ and the requested interface from the captured DV Gateway route. It also
 reports the selected MY callsign and whether it is empty, USB function,
 Terminal subtype, DV Gateway mode, and the stored RPT1/RPT2 text.
 
-All observations describe the historical capture, not the radio's current
-state. Firmware 1.02 requires `--interpret-unqualified`; the interpretation
-does not validate the schema. The command neither normalizes values nor
-guesses missing callsigns or identification suffixes. A suffix finding requests
-operator review; it is not a radio-side acceptance test. Findings are not proof
-of activation readiness, MMDVM availability, Internet access, or a working
-reflector connection, even when the captured settings agree with the request.
+All observations describe the stored capture, not the radio's current state.
+Firmware 1.02 requires `--interpret-unqualified`. The command neither normalizes
+values nor guesses missing callsigns or identification suffixes; a suffix finding
+asks for operator review rather than testing radio-side acceptance. Captured
+settings that agree with the request say nothing about MMDVM availability,
+Internet access, or a working reflector connection.
 
 This command does not enumerate or open radio interfaces, activate Terminal
-Mode, generate write patches, or change the backup or radio. Use it to review
-captured configuration before a separately controlled setup or qualification.
+Mode, generate write patches, or change the backup or radio. Use it to review a
+captured configuration before setup.
 
 ## Compare configuration captures
 
@@ -713,15 +671,14 @@ Firmware 1.02 requires `--interpret-unqualified`.
 The finite software-layout catalog labels candidate changes in 116 fields
 covering 560 bytes: the global format and active-PM selectors, plus menus 980,
 986, 650, 651, 670, 671, and 672 in every PM slot, including all six MY callsigns
-and their memos. Changes outside that catalog remain in the comparison and
-are counted explicitly; absence from the catalog does not prove a setting is
-unrelated to Terminal operation. Unknown or invalid values encountered by either
+and their memos. Changes outside that catalog remain in the comparison and are
+counted explicitly; the catalog is finite, so such a change can still affect
+Terminal operation. Unknown or invalid values encountered by either
 selected-slot preflight are recorded as failures without discarding the raw
 differences. Memos, unselected MY entries, and other slots receive raw-byte
 attribution, not semantic validation.
 An otherwise successful comparison exits successfully even if either preflight
-fails; the console and private report explicitly retain that failure. Successful
-comparison does not mean either configuration is valid or activation-ready.
+fails; the console and private report explicitly retain that failure.
 
 Console output shows counts, page addresses, and candidate field keys, but no
 captured text or byte values, including when a preflight fails. Add
@@ -734,23 +691,22 @@ Choose a private directory and keep the report private. Its operation is
 `terminal_configuration_comparison`; it is not a backup or a write plan.
 
 Both inputs must pass coverage and completion checks and have identical model,
-firmware, and full radio-type identities. These are structural checks, not
-report authentication or an independent audit of the raw transcripts. Matching
-identities do not prove the same physical radio, and before/after order is
-caller supplied, not verified chronology. A difference establishes neither
-causality nor hardware-layout compatibility. No USB enumeration, radio or RF
-access, source-file changes, setting writes, or write-gate changes occur.
+firmware, and full radio-type identities. These are structural checks on the
+report contents, not authentication of the capture, and matching identities do
+not identify one physical radio. Before/after order is taken from the arguments
+and is not verified. No USB enumeration, radio or RF access, source-file
+changes, setting writes, or write-gate changes occur.
 
-For subsequent controlled hardware qualification, compare one intentional
+When validating settings on hardware, compare one intentional
 preparation-field change at a time with DV Gateway Off initially. PM recall is
 a separate state-changing operation, not a read-only check. Enabling Menu 650
 may remove CAT/MCP access on the selected interface, so do not assume that
 activation can be followed by another backup on that port. Protocol handoff,
-return to CAT, and restoration need separate qualification.
+return to CAT, and restoration are not validated on hardware.
 
 ## Read-only MCP re-entry control
 
-`mcp reentry-probe` is a separately approved diagnostic, not a Terminal Mode
+`mcp reentry-probe` is a read-only MCP re-entry diagnostic, not a Terminal Mode
 setter. It requires macOS, an explicit main-unit USB endpoint at 9600 baud,
 and `--approve-live-test` for two programming-mode interruptions:
 
@@ -762,8 +718,8 @@ cargo run -p tmd750-repl -- --port /dev/cu.usbmodem101 \
 Each session requires exact identity `TM-D750 / 1.02 / K,2,1` and fresh `GW 0`
 before entry. It reads only `8..48` and `327681..327936`, acknowledges exit,
 closes and drops the old handle, then uses the existing passive rediscovery
-policy for one fresh identity/Gateway-Off check and close. Session 1's complete,
-synchronized evidence is required before session 2 opens. There are no settings
+policy for one fresh identity/Gateway-Off check and close. Session 1's captures
+must be complete and synchronized before session 2 opens. There are no settings
 writes, fill commands, RF commands, retries, or arbitrary memory addresses.
 
 Private captures include separate original/fresh transcripts for both sessions,
@@ -783,21 +739,8 @@ cancelled. No speculative exit or recovery request is sent.
 
 Success requires both read sessions, both fresh CAT-Off checks, every close,
 complete synchronized captures, and a joined successful observer. A successful
-pair is one measured sequence, not a universal readiness bound or qualification
-of automatic Terminal switching. Reading 295 distinct bytes twice is not a full
-configuration backup or proof that all settings are unchanged.
-
-One approved firmware 1.02 main-unit USB pair completed on 2026-09-12 UTC.
-Both MCP read/exit sequences and fresh CAT checks succeeded, with four observed
-`GW 0` replies and four clean closes. Each session's 295 captured bytes matched
-the other session and the corresponding bytes in the preceding full backup.
-Raw-traffic audits found no settings writes, fill commands, retries, or RF commands.
-
-The successful second entry was requested 28.111 ms after fresh CAT close and
-12.549759 s after the first exit ACK. The earlier failed Terminal-to-Off trial
-measured 17.595 ms and 11.428353 s, respectively. Different preceding operations and
-timing prevent attributing success to a delay. This result does not repair or
-reclassify that failed trial, or qualify automatic Terminal exit/restoration.
+pair is not a readiness bound. Reading 295 distinct bytes twice is not a
+configuration backup and does not show that other settings are unchanged.
 
 ## Fixed MCP probe
 
@@ -806,17 +749,13 @@ reads CAT identity, enters MCP programming mode, reads 40 bytes at address 8
 and 255 bytes at address 327681, then requires MCP exit, releases the original
 handle, and uses bounded, identity-only CAT reacquisition. It sends
 no settings writes, fill commands, arbitrary memory requests,
-or RF transmission requests. This is not a backup and does not qualify the
-firmware 1.02 settings layout or enable automatic Terminal Mode entry.
-Programming mode temporarily interrupts normal radio operation even though
-no settings are written.
+or RF transmission requests. The 295 bytes it reads are a protocol check, not a
+backup. Programming mode temporarily interrupts normal radio operation even
+though no settings are written.
 
-On the first firmware 1.02 main-unit USB bench run, entry and both reads
-succeeded and exit was acknowledged. USB then disconnected and re-enumerated,
-so that earlier implementation's old-handle CAT verification failed. That
-capture remains a failed probe. The current command never reuses the old
-handle after exit and requires a separate fresh identity proof. A returned USB
-device path alone does not prove CAT service or radio identity.
+USB disconnects and re-enumerates after MCP exit, so the command never reuses
+the original handle; it requires a fresh identity exchange on a new connection,
+because a returned USB device path is only an endpoint.
 
 Leave the radio on its normal screen and close other radio applications first:
 
@@ -834,7 +773,8 @@ the serial connection opens. On Unix the directory is created with permissions
 An explicit `--port` before `mcp` is required. Only enumerated TM-D750 USB
 identities are accepted; no unrelated serial ports are opened or probed and
 no endpoint is automatically substituted. Recognition of the panel's USB
-identity is not proof that its MCP protocol works. The command cannot run
+identity selects the endpoint; the MCP exchange itself decides whether the
+protocol works. The command cannot run
 inside the CAT prompt; quit that prompt and start a dedicated process.
 
 Each capture contains:
@@ -879,9 +819,9 @@ condition and does not itself establish that a power cycle is needed. Do not
 kill the process to shorten a pending exchange or close.
 
 An abrupt process termination can leave `report.json` empty, and a filesystem
-failure can leave a partial final transcript line. These files are evidence,
-not a guarantee of recovery. Captures may contain private radio settings;
-review them before sharing. Nothing uploads or deletes them automatically.
+failure can leave a partial final transcript line. Captures may contain private
+radio settings; review them before sharing. Nothing uploads or deletes them
+automatically.
 
 ### Bounded CAT reacquisition
 
@@ -921,23 +861,19 @@ identity attempt and close, then prevents another connection.
 
 Reacquisition sends no MCP entry or exit, reset, setting, Gateway, packet-exit,
 or baud-change commands. These limits are conservative host policy, not
-measured firmware timing requirements or a guarantee of recovery. One panel-USB
-firmware-1.02 run exercised two silent-ID retries before successful identity
-verification, as recorded below. Two later panel backups also completed the
-policy, with two and three silent predecessors. These are measured sequences,
-not guaranteed recovery bounds. Ordinary guarded setters and the fixed
-qualification experiments retain their single-attempt policies and report
-shapes. The opt-in managed diagnostic separately reuses bounded identity-only
-reacquisition after its guarded exchanges; that complete lifecycle remains
-hardware-unqualified. Ordinary CAT and gateway sessions do not acquire
-automatic reconnect behavior.
+measured firmware timing requirements or a guarantee of recovery. On panel USB,
+silent `ID` replies before a successful one are expected on this firmware.
+Ordinary guarded setters and the fixed experiments retain their single-attempt
+policies and report shapes. The opt-in managed diagnostic separately reuses bounded
+identity-only reacquisition after its guarded exchanges. Ordinary CAT and
+gateway sessions do not acquire automatic reconnect behavior.
 
 Original-session fields remain separate: a successful read-and-exit phase has
 `probe.outcome.status` or `backup.outcome.status` equal to
 `"awaiting_cat_verification"`. The required `post_exit_verification` object
 records the policy limits, elapsed readiness time, an `attempts` array, one
 aggregate `transcript` summary, and the final `outcome`. Each array entry retains
-its `enumerations`, optional `connection` with open/identity/close evidence, `outcome`, and
+its `enumerations`, optional `connection` with open/identity/close results, `outcome`, and
 `retry_admission`. A later match does not erase an earlier timeout; exhausting
 the budget or attempt cap is a final readiness failure. The single
 `post-exit-transcript.jsonl` is reserved before the initial radio open and
@@ -956,80 +892,43 @@ firmware-ready timestamps.
 Exit status is zero only when the original fragments, exit ACK, original
 close/capture, matching fresh CAT tuple, and fresh close/capture all succeed.
 
-The first historical fresh-verification bench run on firmware 1.02 completed both reads and the exit
-ACK, then closed the original connection successfully. The serial endpoint
-was absent from all forty passive enumeration snapshots, so the workflow
-timed out without opening a fresh connection. The port was present at a later
-OS-only check. After the operator reported the normal frequency screen, a
-separate fresh identity command returned the same model, firmware, and type,
-then closed successfully. That observation is separate from the original
-failed probe. The exact return time remained unknown; that run's twelve-second
-host window was not a qualified recovery bound. A subsequent implementation
-extended passive polling from ten to sixty seconds without active retries.
-That failed capture is retained unchanged.
+On firmware 1.02 the complete CAT identity tuple becomes available roughly 10
+to 13 s after the MCP exit ACK. The main-unit USB endpoint re-enumerates at
+about that time; the panel USB endpoint can reappear within a few seconds and
+then leave `ID` unanswered until the tuple is ready, so several silent `ID`
+attempts can precede a matching one, which is why the cap is four. The endpoint
+can also stay absent for the
+whole enumeration window, in which case the workflow fails without opening a
+fresh connection. The 295 bytes read by the fixed fragments are byte-identical
+across runs.
 
-Two subsequent main-unit USB runs on firmware 1.02 completed that single-attempt
-workflow: both fixed reads, exit ACK, original close, one fresh matching CAT
-tuple, and fresh close. USB was first detected at approximately 11.4 and
-11.7 seconds after the ACK; CAT identity completed at 11.8 and 12.0 seconds.
-The 295 captured bytes matched earlier runs. Both successful samples detected
-the endpoint within the old window too, so the increased limit alone does
-not explain their success. These bench observations validate the fixed
-read/reconnect workflow on this unit, not a universal recovery deadline,
-full configuration backup, settings-write compatibility, or the newer retry
-policy.
-
-A later firmware 1.02 panel-USB probe completed both fixed reads, acknowledged
-exit, and closed the original handle. The endpoint returned, but its sole fresh
-`ID` attempt received no bytes before timing out. A later, separate panel CAT
-status check succeeded without a host-sent reset or repeated MCP entry. The
-original probe remains failed. These observations motivate bounded readiness
-handling; they establish neither the exact readiness delay nor the new policy's
-live success.
-
-A subsequent, separately approved panel-USB run on September 12, 2026 completed
-the fixed reads and acknowledged exit, then exercised the bounded retry path.
-The first two fresh connections received no bytes after their ID writes and
-closed after the reply timeouts. Following each close, the runner waited two
-seconds and re-enumerated the exact endpoint. The third connection returned
-matching ID/FV/TY, completing identity 11.72 seconds after the exit ACK, then
-closed cleanly. All 295 bytes matched earlier captures; both transcripts were
-complete and the process exited successfully. A separate status check reported
-both bands FM and Gateway Off. No host reset, repeated MCP entry, settings
-write, or RF request was sent. This validates the observed recovery sequence on
-that unit, not a universal readiness deadline or other MCP workflows.
-
-`post_exit_verification.outcome.status = "matched"` never rewrites the original
-probe outcome. Matching the selected endpoint and CAT tuple is not proof of
-physical-unit continuity: paths can be reassigned and this workflow has no USB
-serial identity. It does not qualify a settings schema or enable automatic
-reopening in ordinary CAT or gateway sessions. Fresh verification is mandatory
-for this command; no same-handle or capture-only success path is exposed.
+`post_exit_verification.outcome.status = "matched"` is reported separately from
+the original probe outcome and never overwrites it. The selected endpoint and
+CAT tuple identify a model and firmware, not the physical unit: paths can be
+reassigned and this workflow has no USB serial identity. Fresh verification is
+mandatory: there is no same-handle or capture-only success path.
 
 ## Diagnostic-only D-STAR probe
 
 By default, `dstar probe` inspects a selected connection without initializing a modem,
 connecting a reflector, or requesting mode, routing, configuration, or voice
-changes. One panel-USB trial on 2026-09-12, following operator-reported Terminal
-selection on a radio previously identified as firmware 1.02, returned MMDVM
-protocol 1 with description `TM-D750 RTM1.00`, D-STAR mode, flags zero, and
-D-STAR space 127. The connection closed cleanly without modem setup or voice
-traffic. This validates that diagnostic exchange once, not initialization,
-voice relay, automatic mode changes, or restoration. The modem description
-is not the CAT firmware version. Read the help without opening a port:
+changes. In Reflector Terminal on firmware 1.02, the probe returns MMDVM
+protocol 1 with description `TM-D750 RTM1.00`, and a status reply in D-STAR
+mode whose flags and buffer space are live modem state. That description is the
+modem build string, not the CAT firmware version. Read the help without opening
+a port:
 
 ```bash
 cargo run -p tmd750-repl -- dstar probe --help
 ```
 
-Before a separately approved live trial, establish the actual radio routing
-and plan any external mode changes and restoration. Host bytes on other DV/DR
-routes can cause automatic RF transmission; diagnostic intent is not an RF
-silence guarantee for arbitrary routing. The approval flag acknowledges that
-precondition; it does not change or verify routing and does not authorize the
-command to enter or leave Terminal Mode.
+`--approve-live-test` is required before the probe opens any port; it performs
+no routing check. Establish the radio's actual DV Gateway routing first and plan
+any external mode changes and restoration: host bytes on a DV or DR route other
+than Terminal can key the transmitter. This command neither reads nor changes
+routing, and never enters or leaves Terminal Mode.
 
-For that approved trial, select the exact enumerated TM-D750 USB endpoint:
+To run it, select the exact enumerated TM-D750 USB endpoint:
 
 ```bash
 cargo run -p tmd750-repl -- --port /dev/cu.usbmodem101 \
@@ -1042,7 +941,7 @@ used. `--output` must name a new directory whose parent exists. Omit it to
 reserve a unique `captures/tmd750-dstar-probe-*` directory. Paths containing
 spaces retain their original case and argument boundaries. On Unix, directories
 are created with mode 0700 and files with 0600; other systems inherit permissions.
-Capture files are reserved before opening and existing evidence is never reused.
+Capture files are reserved before opening; an existing capture is never reused.
 
 The diagnostic follows these boundaries:
 
@@ -1056,7 +955,7 @@ The diagnostic follows these boundaries:
    protocol-2 reply by one `GET_STATUS`. No runtime is started, and no periodic
    polling, modem configuration, mode command, retry, or reopen follows.
 4. Close and drop the connection, synchronize its transcript, then write,
-   flush, and synchronize the final report. Cleanup and evidence failures remain
+   flush, and synchronize the final report. Cleanup and capture failures remain
    separate from the protocol observations and prevent successful completion.
 
 CAT has separate 1,500 ms write and reply budgets per query. The identity phase
@@ -1075,31 +974,31 @@ recovery or persistent-mode exit is attempted on the gateway connection.
 
 The format-1 `report.json` has `operation = "dstar_probe"`. Its typed `outcome`
 distinguishes `cat_observed`, `mmdvm_observed`, cancellation, and failures.
-Status failure preserves accepted version evidence; Gateway-query failure
+Status failure preserves an accepted version reply; Gateway-query failure
 preserves CAT identity. Endpoint metadata, duration limits (`secs`/`nanos`),
 timestamps, cancellation, signal/close/synchronization failures, and transcript
 completeness are explicit. `transcript.jsonl` records exact requested and
 completed I/O separately, with timestamps. Required recording blocks further
 protocol traffic after capture failure, but connection release is still tried.
 Report-publication failure is returned to the caller, not recorded as success.
-Malformed UTF-8 or embedded control characters in a version description fail
-admission, as do unknown status mode bytes. Valid Unicode descriptions and
+Malformed UTF-8 or embedded control characters in a version description are
+rejected, as are unknown status mode bytes. Valid Unicode descriptions and
 the codec's trailing padding remain supported; the raw transcript preserves
 the original wire representation, including any reserved flag bits.
 
-Exit zero means complete CAT or complete MMDVM diagnostic evidence, with clean
-close and synchronized file contents. Inspect `outcome.kind` to distinguish them;
-CAT success is not MMDVM proof. Version/status observations establish neither physical radio
-identity nor Reflector Terminal versus Access Point mode. MMDVM has no request
-correlation identifier, so a received status also does not prove when the radio
-generated it. Neither outcome qualifies automatic Terminal setup or a working
-voice relay. Keep the captures private and retain failed attempts unchanged.
+Exit zero means a complete CAT or a complete MMDVM diagnostic observation, with
+clean close and synchronized file contents. Inspect `outcome.kind` to
+distinguish them; CAT success is not MMDVM proof. A version or status reply
+identifies neither the physical radio nor Reflector Terminal versus Access Point
+mode, and MMDVM has no request correlation identifier, so a received status does
+not say when the radio generated it. Keep the captures private and retain failed
+attempts unchanged.
 
 ### Host-managed diagnostic lifecycle
 
 Add `--manage-terminal` to enter Reflector Terminal for the diagnostic and
 restore the captured settings afterward. This path is software-tested; the
-complete automatic cycle is not yet hardware-qualified. It does not initialize
+complete automatic cycle is not validated on hardware. It does not initialize
 a modem runtime, connect a reflector, relay voice, or change `dstar start`.
 
 Both USB connectors must remain connected to the same intended radio: one for
@@ -1124,8 +1023,8 @@ retains the exact original page images, including the prior subtype.
 
 Entry and restoration share one guarded exchange implementation. Each requires
 fresh control identity/Gateway and equality of every complete format, PM,
-routing and target page before any write. Changed pages receive durable intent,
-one write and immediate complete-page readback. Equal pages are compare-only.
+routing and target page before any write. A changed page is journaled and
+synchronized, then written once and read back whole. Equal pages are compare-only.
 Acknowledged exit, clean close/drop, bounded identity-only CAT reacquisition
 and fresh Gateway verification precede the next phase. A changed before-image
 stops writes; there is no merge, blind rollback or retry of MCP programming.
@@ -1138,12 +1037,11 @@ Unix private-file permissions and directory synchronization. Ctrl-C suppresses n
 does not discard an existing restoration obligation. Uncertain programming or
 failed cleanup/capture can prevent safe restoration; the report and journal
 retain that obligation. Abrupt process termination cannot restore automatically.
-Keep failed evidence and do not rerun against stale images.
+Keep the captures of a failed run and do not rerun against stale images.
 
 Success requires the MMDVM diagnostic, clean cleanup, and any owed restoration.
-Restoration verification means immediate whole-page readback followed by fresh
-CAT identity/Gateway, not another post-exit memory read or power-cycle persistence.
-Matching USB paths and CAT tuples does not prove physical-radio continuity.
+Restoration is verified by immediate whole-page readback followed by fresh CAT
+identity/Gateway, not by another post-exit memory read or across a power cycle.
 
 ## Reflector Terminal Mode
 
@@ -1173,9 +1071,9 @@ cargo run -p tmd750-repl -- \
 
 Replace the address and USB path with your radio's. `--control-port` belongs
 only to automatic Bluetooth startup; it is not a modem route or a fallback
-that receives speculative binary traffic. No new confirmation flags are needed
-to request this workflow. Running the command authorizes its documented
-Terminal/routing changes and the requested reflector session.
+that receives speculative binary traffic. No confirmation flag gates this
+workflow: invoking `dstar start` writes the Terminal and routing changes
+described below and opens the reflector session.
 Omit the reflector argument to exercise modem startup and shutdown without
 opening a reflector connection.
 
@@ -1189,26 +1087,27 @@ CAT is not injected into a possibly active Bluetooth modem link. Unknown modes,
 unsupported subtype/USB function, and identities outside `TM-D750 / 1.02 / K,2,1`
 are refused. PM, MY/RPT fields, and unrelated bytes are preserved.
 
-After acknowledged exit, startup retains the Bluetooth owner for the D75-style
+After acknowledged exit, startup retains the Bluetooth connection for a
 two-second settle, then uses a nominal 90-second window of three-second waits,
 bounded MMDVM version probes, and same-address/channel reopening. The channel
 comes from the successful original opening, not a model constant. Neither MCP
-nor its settings transaction is repeated. A complete MMDVM reply must prove the
-actual owned connection before modem configuration or reflector traffic begins.
-Fatal admission, capture, or cleanup errors stop the loop. Deadlines bound host
-admission; joining native work and cleanup may extend wall-clock completion.
+nor its settings transaction is repeated. A complete MMDVM reply on the newly
+opened connection is required before modem configuration or reflector traffic
+begins. Fatal identity-check, capture, or cleanup errors stop the loop. These
+deadlines bound host dispatch; joining native work and cleanup may extend
+wall-clock completion.
 
 Startup creates a private `captures/tmd750-dstar-start-*` directory. Its journal
 contains the complete standard configuration snapshot and exact expected and
-replacement pages, synchronized before writes. Each JSON record is serialized
-in memory before file I/O, avoiding per-token file writes without postponing
-its flush or required synchronization. The report retains opening,
-transition, cleanup, and restoration failures independently. These files contain
+replacement pages, synchronized before writes. Each journal record is written
+and flushed as one line. The report retains opening, transition, cleanup, and
+restoration failures independently. These files contain
 radio configuration and received traffic; treat them as private. Cancellation
 remains active through preparation, modem initialization, and reflector setup.
 It finishes a started exchange and closes any late successful modem session
-before restoring owned settings. An uncertain write, lost owner, or restoration
-conflict leaves explicit recovery debt and captured images, never a blind write.
+before restoring the settings this run changed. An uncertain write, a lost
+connection, or a restoration conflict leaves the outstanding restoration and the
+captured page images in the report, never a blind write.
 
 `dstar stop`, EOF, and cleanly retired startup failures restore the exact original
 Gateway mode, subtype, and route through fresh USB control, followed by fresh
@@ -1216,26 +1115,12 @@ CAT verification. A session that changed nothing does not claim or undo the
 operator's existing Terminal selection. If the modem cannot be safely released,
 restoration is withheld and reported.
 
-Two macOS runs on September 13, 2026 completed automatic entry and restoration
-on `TM-D750 / 1.02 / K,2,1`, in PM Off, with Gateway initially routed to panel
-USB and independent control-panel USB CAT. Each read all 1,138 standard pages,
-changed only the Gateway and route bytes, completed E/ACK, reached fresh
-Bluetooth MMDVM (`TM-D750 RTM1.00`), and restored the exact original guarded
-settings with fresh USB `GW 0` verification. The no-reflector run shut down on
-EOF. The default command above authenticated and connected to `REF030C`,
-reported incoming reflector voice streams, and restored after `dstar stop`.
-
-These observations cover that configuration, not PM1 through PM5, already-active
-Terminal entry, other initial routes or control connectors, cold-start
-reliability, or every cancellation and recovery-failure path. Acoustic playback,
-operator PTT, bidirectional voice, and power-cycle persistence remain unverified.
-
-The earlier firmware-1.02 Bluetooth bench attempt read all 1,138 standard pages,
-then timed out on the first guard reread before any settings write. Startup
-refused a speculative MCP exit and never reached modem or reflector setup.
-A subsequent independent panel USB CAT check was also silent. That attempt
-did not prove MCP exit or restored control access. The later successful cycles
-do not reclassify the failure or establish its cause.
+Tested configuration: `TM-D750 / 1.02 / K,2,1` in PM Off, Gateway initially
+routed to panel USB, Bluetooth modem link, independent control-panel USB CAT,
+reflector `REF030C`. Untested: PM1 through PM5, entry when Terminal is already
+active, other initial routes or control connectors, cold start, acoustic
+playback, operator PTT, bidirectional voice, power-cycle persistence, and most
+cancellation and recovery-failure paths.
 
 ### Explicit USB modem startup
 
@@ -1249,7 +1134,7 @@ cargo run -p tmd750-repl -- --port /dev/cu.usbmodem101 \
 When that selected port answers CAT, startup reads identity and Gateway state,
 closes the connection, and makes no setting change. An observed `GW 2` reports
 that Terminal is already selected without repeating setup or requesting display
-confirmation. That CAT connection is not proved to carry modem traffic. If the
+confirmation. Whether that CAT connection carries modem traffic is unknown. If the
 Gateway is routed elsewhere, select that endpoint explicitly with `--port`;
 the REPL does not infer routing or pair ports to one physical radio. Unknown
 values and query errors do not imply Off or trigger manual setup instructions.
@@ -1286,15 +1171,13 @@ mode; the Menu 670 and 650 selections above remain operator preconditions.
 Once MMDVM is proved, either workflow initializes D-STAR, resolves `REF030` from the
 local host files described below, and connects module C over DPlus. The runtime
 implements forwarding of D-STAR headers, AMBE voice, slow data, and
-end-of-transmission markers in both directions. The Bluetooth bench run observed
-reflector connection and incoming voice-stream events; it did not establish
-acoustic playback or operator-PTT transmission. The manual USB modem workflow
-requires separate live validation.
-Reflector setup uses a 30-second admission window across host lookup,
+end-of-transmission markers in both directions. The manual USB modem workflow
+is not validated on hardware.
+Reflector setup uses one 30-second window covering host lookup,
 authentication, and the handshake. Reflector host-file and DNS lookup runs on
 a joined worker without blocking the radio runtime; a slow resolver can extend
 return time, but cannot start a late handshake. The shared authentication
-client retains its own DNS handling. Modem ownership remains available for
+client retains its own DNS handling. The modem connection remains available for
 cleanup throughout.
 Press Ctrl-C to leave monitoring and reach the `dstar>` prompt; enter
 `dstar stop` to disconnect cleanly. Ctrl-C lets any in-flight send finish before
@@ -1304,26 +1187,24 @@ the radio and reflector or saved for later playback. Radio-originated local
 echo requests are still handled by the modem gateway. `monitor` resumes live
 relay; `status` reports the connection state, and `help` lists commands.
 The manual USB workflow leaves Menu 650 persistent. Automatic Bluetooth startup
-instead restores changes it owns using the independent USB control path.
+instead restores the settings it changed through the independent USB control
+path.
 
 Normal shutdown finishes the modem task, recovers the selected transport from
 its stream adapter, and closes it. Startup failures follow the same cleanup
 path once a modem task exists. Cleanup errors remain visible alongside the
-original failure; lost ownership is never reported as a successful close.
+original failure; a lost connection is never reported as a successful close.
 Runtime shutdown does not send CAT through the modem connection. Guarded
-restoration, when owned, is a separate USB lifecycle after modem release.
+restoration of settings this run changed is a separate USB lifecycle after
+modem release.
 
-The manual states that the interface assigned to DV Gateway does not accept
-PC commands while gateway mode is active. The read-only MCP backup's fresh-CAT
-reconnect check therefore cannot be reused as the success condition for
-enabling Terminal Mode on that same interface. Automatic transition therefore
-proves the expected gateway protocol separately; the manual's restriction
-also does not prove that another interface remains available for disabling it.
-With Gateway routed to panel USB, a firmware-1.02 bench observation did find
-main-unit CAT identity and Gateway reads available after manual Terminal entry.
-A bounded MCP read and fresh CAT reconnect also succeeded; Gateway still
-reported Terminal afterward. This supports the separate guarded exit experiment
-above, not an assumption that the voice interface accepts CAT commands.
+The interface assigned to DV Gateway stops accepting PC commands while gateway
+mode is active, so it is not its own recovery path; the automatic transition
+proves the expected gateway protocol on that interface instead. With Gateway
+routed to panel USB, main-unit CAT identity, Gateway reads, a bounded MCP read
+and a fresh CAT reconnect have all worked on firmware 1.02 after manual Terminal
+entry, and Gateway still reported Terminal after that MCP exit. Do not assume
+the same holds for other routings.
 
 `dstar start` is a startup-only, long-running command. It cannot be invoked
 inside the normal `tmd750>` CAT prompt; quit that prompt first. Omit the
@@ -1425,7 +1306,7 @@ Startup-only workflows are described above:
   adds guarded entry/restoration through an independent USB control endpoint.
 - `mcp probe` and `mcp backup` use dedicated radio connections and private
   capture directories.
-- `mcp reentry-probe` runs one approved read-only pair with Gateway Off and
+- `mcp reentry-probe` runs one read-only MCP session pair with Gateway Off and
   passive macOS serial-registry observation.
 - `mcp text list|show|preview` and `mcp terminal preflight` work offline without
   enumerating or opening a radio endpoint.
@@ -1434,10 +1315,10 @@ Startup-only workflows are described above:
   current USB backup, and `--apply`; it requires immediate readback and fresh CAT.
 - `mcp text set` requires an explicit USB endpoint, current USB backup, expected text,
   and `--apply`; it changes PM1's name or PM Off MY1 through dedicated connections.
-- `mcp pm1-trial` is the separately approved fixed rename-and-restore experiment.
+- `mcp pm1-trial` is the fixed rename-and-restore experiment.
 - `mcp my1-trial` temporarily writes the fixed MY1 callsign and restores it.
-- `mcp terminal-exit-trial` is the separately approved guarded Terminal-to-Off
-  experiment; it is not invoked by ordinary D-STAR commands.
+- `mcp terminal-exit-trial` is the fixed guarded Terminal-to-Off experiment;
+  it is not invoked by ordinary D-STAR commands.
 
 These workflows cannot run inside the interactive CAT prompt. Quit the prompt
 and invoke the desired workflow in a new process; use its `--help` for options.

@@ -65,11 +65,11 @@ struct Cli {
     #[arg(long, value_name = "ADDRESS")]
     bluetooth_address: Option<BluetoothAddress>,
 
-    /// Trusted native helper executable; otherwise use the built-in helper.
+    /// Native Bluetooth helper to run instead of the built-in one.
     #[arg(long, requires = "native_selection", value_name = "EXECUTABLE")]
     bluetooth_helper: Option<PathBuf>,
 
-    /// Independent USB CAT endpoint for automatic Bluetooth dstar start.
+    /// USB CAT endpoint used by automatic Bluetooth dstar start.
     #[arg(long, conflicts_with = "port", value_name = "PATH")]
     control_port: Option<String>,
 
@@ -168,9 +168,9 @@ async fn run() -> AppResult<()> {
         )));
     }
 
-    // Structured diagnostic parsers retain their original argument boundaries.
-    // Ordinary commands share one parser and one transport dispatch policy,
-    // including command lines supplied as a single shell-quoted argument.
+    // The diagnostic parsers keep the original argument boundaries. Every other
+    // command joins its words and goes through one parser and one transport
+    // dispatch, including a command line given as a single quoted argument.
     if !dstar::probe::matches_arguments(&cli.command)
         && cli.command.first().is_none_or(|word| word != "mcp")
     {
@@ -286,7 +286,10 @@ async fn run_dstar_start(cli: &Cli, request: dstar::StartRequest) -> AppResult<(
     outcome.map_err(|error| -> Box<dyn StdError + Send + Sync> { Box::new(CommandError(error)) })
 }
 
-/// Reject unsupported native operations before creating artifacts or opening I/O.
+/// Run one command over the native Bluetooth transport.
+///
+/// A command this transport does not support is rejected before any capture
+/// file is created and before the endpoint is opened.
 async fn run_native(cli: &Cli, command: Option<Command>) -> AppResult<()> {
     use native::workflow::{CatScope, Operation};
 
@@ -347,7 +350,9 @@ async fn run_native(cli: &Cli, command: Option<Command>) -> AppResult<()> {
     native::workflow::run(&endpoint, &operation, None).await
 }
 
-/// Discovery has no radio owner, but its helper still must be joined on Ctrl-C.
+/// Resolve the native endpoint, opening no radio.
+///
+/// The discovery helper is joined before this returns, including after Ctrl-C.
 async fn resolve_native(cli: &Cli) -> AppResult<native::Endpoint> {
     let cancelled = AtomicBool::new(false);
     let request = cli.bluetooth_request();
@@ -387,7 +392,10 @@ async fn connect_serial(cli: &Cli, path: String) -> AppResult<ConnectedRadio> {
     }
 }
 
-/// Automatic selection never changes radios after an attempted connection.
+/// Which transport automatic selection chose: an enumerated serial path, or
+/// the paired Bluetooth radio.
+///
+/// Once chosen, a failed open is not retried on the other transport.
 #[derive(Debug, PartialEq, Eq)]
 enum ConnectionSelection {
     Serial(String),
@@ -570,8 +578,11 @@ async fn interactive<T: Transport>(radio: &mut Radio<T>) -> AppResult<()> {
     }
 }
 
-/// Native prompts retire on cancellation and require fresh Gateway Off before
-/// each mode write. Direct serial execution retains its existing wire schedule.
+/// The checks applied at each command boundary.
+///
+/// `Direct` adds none, keeping the existing serial wire schedule. `GatewayOff`
+/// fails the command once the shared flag is set, and reads `GW` again before
+/// every mode write, requiring Off.
 #[derive(Clone, Copy)]
 enum CommandPolicy<'a> {
     Direct,
@@ -610,7 +621,7 @@ impl CommandPolicy<'_> {
 /// Execute the same typed command vocabulary on either transport.
 ///
 /// Cancellation is checked between complete library operations. In particular,
-/// a started mode write finishes its echo/readback before ownership is retired.
+/// a started mode write finishes its echo and readback before the close.
 async fn execute_command<T: Transport>(
     radio: &mut Radio<T>,
     command: Command,
@@ -694,7 +705,7 @@ fn print_help() {
     }
     output::line(format_args!("Startup only: dstar start CALL [REFLECTOR]"));
     output::line(format_args!(
-        "Defaults to automatic Bluetooth Terminal startup with independent USB recovery. Explicit --port retains manual USB modem startup."
+        "Defaults to automatic Bluetooth Terminal startup, restoring over a separate USB endpoint. Explicit --port retains manual USB modem startup."
     ));
     output::line(format_args!(
         "Startup only: dstar probe --help (captured diagnostics; no modem setup)."
@@ -712,10 +723,10 @@ fn print_help() {
         "Text set changes PM1's name or PM-Off MY1, with an explicit port, current backup, expected text, and --apply. Configurable MY1 remains untested on hardware."
     ));
     output::line(format_args!(
-        "PM1 trial is a separately approved fixed rename-and-restore experiment, not general settings control."
+        "PM1 trial performs one fixed PM1 rename and restores the original name; no other field is writable."
     ));
     output::line(format_args!(
-        "Automatic Bluetooth dstar stop restores its owned settings through guarded USB recovery; the separate Terminal exit trial is not invoked."
+        "Automatic Bluetooth dstar stop rewrites the Terminal and routing pages it changed, over USB; the separate Terminal exit trial is not invoked."
     ));
 }
 
@@ -1178,11 +1189,9 @@ mod tests {
                     "schema label is {}",
                     kenwood_tmd750::memory::MCP_D750_SCHEMA_FIRMWARE
                 ))
-                && guidance.contains("Terminal mode and routing writes remain unqualified")
-                && guidance
-                    .contains("Bounded PM1/MY1 storage trials do not qualify automatic setup")
-                && guidance.contains("not a vendor firmware-version limit"),
-            "terminal guidance must explain the qualification gate without inventing a live identity or vendor version restriction"
+                && guidance.contains("this build writes no")
+                && guidance.contains("not a vendor version limit"),
+            "terminal guidance must state that no Terminal or routing setting is written, without inventing a live identity or vendor version restriction"
         );
     }
 

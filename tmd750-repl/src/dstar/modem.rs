@@ -1,11 +1,11 @@
-//! TM-D750 admission and ownership around the model-neutral D-STAR runtime.
+//! TM-D750 preflight and ownership around the model-neutral D-STAR runtime.
 //!
-//! CAT remains a model policy. Ordinary diagnosis requires one completed
-//! initial `ID` write with no received bytes before probing. A separately
-//! verified Terminal transition may instead probe its retained connection
-//! directly. Successful framing retains that exact transport until modem
-//! startup consumes it. Shutdown closes without changing persistent Gateway
-//! state.
+//! `prove_mmdvm_or_explain_cat` probes MMDVM only after the initial `ID\r`
+//! write completed and no bytes were received. A caller that has already
+//! completed the Terminal update and the acknowledged MCP exit may instead
+//! call `ProvenModem::probe` on the connection it still holds. A proved
+//! connection is held until modem startup consumes it. Shutdown closes it
+//! without changing the persistent Gateway setting.
 
 use std::time::Duration;
 
@@ -16,22 +16,22 @@ use mmdvm::dstar::{DstarModem, DstarModemConfig};
 
 use crate::terminal;
 
-/// One absolute budget for the version request and complete response.
+/// Absolute budget covering the `GET_VERSION` request and its complete reply.
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-/// Independent teardown allowance after protocol work has stopped.
+/// Budget for one close, applied after all protocol work has stopped.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Model-neutral runtime over the selected transport adapter.
 pub(super) type Gateway<T> = DstarModem<StreamAdapter<T>>;
 
-/// An owned connection whose latest complete exchange proved MMDVM framing.
+/// A connection on which a complete MMDVM `GET_VERSION` exchange succeeded.
 ///
-/// The field is private so startup cannot substitute a different connection
-/// or manufacture proof from CAT silence alone.
+/// Only `ProvenModem::probe` and the CAT preflight construct this type, so the
+/// wrapped transport is always the connection that answered.
 #[derive(Debug)]
 pub(super) struct ProvenModem<T>(T);
 
-/// Initialization and independent cleanup evidence retained for restoration.
+/// A failed modem start: why it failed, plus any failure closing the connection.
 #[derive(Debug)]
 pub(super) struct StartFailure {
     pub(super) message: String,
@@ -39,7 +39,9 @@ pub(super) struct StartFailure {
 }
 
 impl StartFailure {
-    /// Restore through another endpoint only after both pumps and close finish.
+    /// Whether both pumps stopped and the connection closed without error.
+    ///
+    /// Restoration over another endpoint runs only when this is true.
     pub(super) const fn owner_released(&self) -> bool {
         self.cleanup_error.is_none()
     }
@@ -58,11 +60,11 @@ impl std::fmt::Display for StartFailure {
 impl std::error::Error for StartFailure {}
 
 impl<T: Transport> ProvenModem<T> {
-    /// Prove a caller-owned transition connection without issuing CAT.
+    /// Send one `GET_VERSION` on `transport` and require a complete reply.
     ///
-    /// The caller must independently establish the selected Terminal route and
-    /// an acknowledged MCP exit before using this operation. Failure returns
-    /// the same owner for explicit close; silence alone never creates proof.
+    /// No CAT is sent, so the caller is responsible for having completed the
+    /// Terminal update and the acknowledged MCP exit first. On failure the same
+    /// transport is returned with the error, for the caller to close.
     pub(super) async fn probe(
         mut transport: T,
         timeout: Duration,
@@ -73,12 +75,12 @@ impl<T: Transport> ProvenModem<T> {
         }
     }
 
-    /// Consume proof when its owner must be closed instead of admitted.
+    /// Take back the transport, for example to close it instead of using it.
     pub(super) fn into_transport(self) -> T {
         self.0
     }
 
-    /// Inspect owner metadata without changing or replacing the proved transport.
+    /// Borrow the proved transport, for example to read its metadata.
     pub(super) const fn transport(&self) -> &T {
         &self.0
     }
@@ -93,11 +95,12 @@ enum InitialWrite {
     Pending,
     /// The exact initial `ID` write completed successfully.
     Completed,
-    /// Another request was attempted; this is no longer an initial ID trial.
+    /// Another request was written, so this is no longer an initial `ID`.
     Other,
 }
 
-/// Observe CAT admission without consuming, buffering, or rewriting bytes.
+/// Records what CAT wrote and whether anything was received, passing bytes
+/// through unchanged and unbuffered.
 #[derive(Debug)]
 struct CatObservation<T> {
     inner: T,
@@ -114,7 +117,10 @@ impl<T> CatObservation<T> {
         }
     }
 
-    /// Partial input is not silence, even when CAT's line deadline expires.
+    /// Whether the initial `ID\r` write completed and no byte was received.
+    ///
+    /// Any received byte, including an incomplete line that later times out,
+    /// makes this false.
     fn is_silent_completed_id(&self) -> bool {
         self.initial_write == InitialWrite::Completed && !self.received_input
     }
@@ -145,7 +151,11 @@ impl<T: Transport> Transport for CatObservation<T> {
     }
 }
 
-/// Diagnose normal CAT or retain the exact connection with binary proof.
+/// Prove MMDVM framing on `transport`, or explain the CAT reply instead.
+///
+/// Returns `Err` with operator guidance when CAT answers, when the initial
+/// `ID\r` exchange was not completely silent, or when the version probe fails;
+/// the transport is closed in each of those paths.
 pub(super) async fn prove_mmdvm_or_explain_cat<T: Transport>(
     transport: T,
     connection: terminal::UsbConnection,
@@ -158,7 +168,7 @@ pub(super) async fn prove_mmdvm_or_explain_cat<T: Transport>(
     .await
 }
 
-/// Apply the ordinary preflight with an injectable CAT deadline for tests.
+/// Run the preflight with an explicit CAT line timeout.
 pub(super) async fn prove_mmdvm_or_explain_cat_with_timeout<T: Transport>(
     transport: T,
     cat_timeout: Duration,
@@ -197,7 +207,7 @@ pub(super) async fn prove_mmdvm_or_explain_cat_with_timeout<T: Transport>(
                     Ok(_) => Ok(ProvenModem(transport)),
                     Err(error) => {
                         let message = format!(
-                            "CAT was silent, but the endpoint did not answer a complete MMDVM GET_VERSION probe ({error}). No gateway frames were sent. Check Menu 986 routing and Menu 650, or capture the third-party Terminal Mode protocol before trying another transport."
+                            "CAT was silent, but the endpoint did not answer a complete MMDVM GET_VERSION probe ({error}). No gateway frames were sent. Check Menu 986 routing and Menu 650, then try again."
                         );
                         Err(close_after_failure(transport, message).await)
                     }
@@ -212,7 +222,10 @@ pub(super) async fn prove_mmdvm_or_explain_cat_with_timeout<T: Transport>(
     }
 }
 
-/// Start protocol processing only on the connection that passed preflight.
+/// Start the D-STAR runtime on the proved connection.
+///
+/// On failure the modem is stopped and the connection closed; any cleanup
+/// failure is returned in `StartFailure::cleanup_error`.
 pub(super) async fn start_gateway<T: Transport + Unpin + 'static>(
     proof: ProvenModem<T>,
     config: DstarModemConfig,
@@ -239,14 +252,13 @@ pub(super) async fn stop_gateway<T: Transport + Unpin + 'static>(
     stop_modem(gateway.into_modem()).await
 }
 
-/// Complete both asynchronous owners before touching the physical connection.
+/// Shut down the modem task and the stream adapter, then close the transport.
 async fn stop_modem<T: Transport + Unpin + 'static>(
     modem: AsyncModem<StreamAdapter<T>>,
 ) -> Result<(), String> {
-    let adapter = modem
-        .shutdown()
-        .await
-        .map_err(|error| format!("MMDVM shutdown failed; serial ownership was lost: {error}"))?;
+    let adapter = modem.shutdown().await.map_err(|error| {
+        format!("MMDVM shutdown failed; the connection could not be closed: {error}")
+    })?;
     match adapter.shutdown_and_recover().await {
         Ok(transport) => close_transport(transport)
             .await
@@ -256,13 +268,13 @@ async fn stop_modem<T: Transport + Unpin + 'static>(
             let message = format!("Serial adapter shutdown failed: {error}");
             Err(match transport {
                 Some(transport) => close_after_failure(transport, message).await,
-                None => format!("{message}; serial ownership was lost"),
+                None => format!("{message}; the connection could not be closed"),
             })
         }
     }
 }
 
-/// Preserve the operation diagnostic and any independent close failure.
+/// Close `transport` and append any close failure to `message`.
 async fn close_after_failure<T: Transport>(transport: T, message: String) -> String {
     match close_transport(transport).await {
         Ok(()) => message,
@@ -270,7 +282,7 @@ async fn close_after_failure<T: Transport>(transport: T, message: String) -> Str
     }
 }
 
-/// Bound close without dropping the only transport owner before the attempt.
+/// Close `transport` within `CLOSE_TIMEOUT`, then drop it.
 pub(super) async fn close_transport<T: Transport>(mut transport: T) -> Result<(), String> {
     tokio::time::timeout(CLOSE_TIMEOUT, transport.close())
         .await
@@ -278,7 +290,7 @@ pub(super) async fn close_transport<T: Transport>(mut transport: T) -> Result<()
         .map_err(|error| transport_error(&error))
 }
 
-/// Include the backend cause when the transport category has a terse display.
+/// Format a transport error with its source, whose text the category omits.
 fn transport_error(error: &TransportError) -> String {
     let cause =
         std::error::Error::source(error).map_or_else(String::new, |cause| format!(": {cause}"));

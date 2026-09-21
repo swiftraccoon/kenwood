@@ -1,9 +1,10 @@
-//! Captured CAT sessions with one native owner and explicit input retirement.
+//! Captured CAT sessions over one native connection, with explicit input
+//! shutdown.
 //!
-//! Opening may use the shared bounded retry policy. Once admitted, a session
-//! never retries CAT or reopens its transport. A failed command retires the
-//! owner, preserving command, input, capture, signal, and close failures
-//! independently. MCP and D-STAR remain separate startup workflows.
+//! Opening uses the shared bounded retry policy. Once the session starts it
+//! never retries a CAT command or reopens its transport. A failed command
+//! closes the connection, and the command, input, capture, signal and close
+//! failures are reported separately. MCP and D-STAR are separate workflows.
 
 use std::fs::File;
 use std::io::{self, Write};
@@ -29,7 +30,9 @@ use crate::{AppResult, Command, CommandError, CommandPolicy, LoopAction, output}
 #[cfg(test)]
 mod tests;
 
-/// A startup command never constructs or reads stdin.
+/// The command source: a prompt or script reader, or one startup command.
+///
+/// The startup variant never constructs or reads stdin.
 enum Commands<I> {
     Prompt(I),
     Startup(Option<Command>),
@@ -64,8 +67,8 @@ impl<I: CommandInput> Commands<I> {
             }
         };
         loop {
-            // Buffered scripts and local-only commands otherwise need not yield.
-            // Give the retained signal listener a turn before the next line.
+            // Give the signal listener a turn before the next line: buffered
+            // scripts and local-only commands would otherwise never yield.
             tokio::task::yield_now().await;
             if cancelled.load(Ordering::Relaxed) {
                 return Ok(Next::End(Termination::Interrupted));
@@ -126,7 +129,8 @@ enum Termination {
     Failed,
 }
 
-/// An orderly prompt interrupt is not a successfully completed startup command.
+/// How commands reach this session: a terminal prompt, a redirected batch, or
+/// one command supplied on the command line.
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Mode {
@@ -255,7 +259,7 @@ async fn execute(
     }
 }
 
-/// Close once even when admission, input, command execution, or capture fails.
+/// Run the command loop, closing the connection once in every outcome.
 async fn session(
     transport: CaptureTransport<impl Transport, File>,
     commands: &mut Commands<impl CommandInput>,
@@ -443,7 +447,8 @@ pub(crate) async fn run(endpoint: &Endpoint, command: Option<Command>) -> AppRes
     )?
     .sync_all()?;
     let started_at_utc = OffsetDateTime::now_utc().format(&Rfc3339)?;
-    // Every fallible setup step precedes input acquisition and native opening.
+    // Every fallible setup step runs before input is acquired and before the
+    // native connection is opened.
     let mut commands = match command {
         Some(command) => Commands::Startup(Some(command)),
         None => Commands::Prompt(SystemInput::new()?),
@@ -494,7 +499,8 @@ pub(crate) async fn run(endpoint: &Endpoint, command: Option<Command>) -> AppRes
         "Native CAT report: {}.",
         directory.join("report.json").display()
     ));
-    // Include failures from final diagnostics before synchronizing the report.
+    // Record output failures from the lines printed above before the report is
+    // written and synchronized.
     report.output_error = output_failure();
     report.publish(&mut report_file).map_err(|error| {
         CommandError(format!(

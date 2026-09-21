@@ -32,7 +32,8 @@ pub(super) struct OutputFailure {
     source: io::Error,
 }
 
-/// Output failures are sticky, without preventing independent stderr diagnostics.
+/// Holds the first output failure for the process; later writes still run, so
+/// a stdout failure does not stop stderr diagnostics.
 struct OutputState {
     failure: Mutex<Option<Arc<OutputFailure>>>,
 }
@@ -62,10 +63,10 @@ impl OutputState {
     }
 }
 
-/// Fail an operation boundary or final success check after any output error.
+/// Return the first output failure recorded so far, if there was one.
 ///
-/// Callers must finish already-started protocol exchanges and explicit cleanup
-/// before returning this failure. The original cause is retained for the process.
+/// Callers finish any started protocol exchange and close their connection
+/// before returning this failure; the cause is retained for the process.
 pub(super) fn check() -> Result<(), Arc<OutputFailure>> {
     OUTPUT.check()
 }

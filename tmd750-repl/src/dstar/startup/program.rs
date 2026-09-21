@@ -1,4 +1,5 @@
-//! One captured MCP entry: complete backup, guarded update, detached exit.
+//! One captured MCP session: read the backup pages, compare and write the
+//! planned pages, then exit.
 
 use std::fs::File;
 use std::io;
@@ -95,8 +96,11 @@ async fn snapshot<T: Transport>(
     Ok(MenuFieldSnapshot::from_pages(pages)?)
 }
 
-/// Fresh comparisons and complete readback precede exit, even after cancellation
-/// once a durable write intent has admitted the bounded page transaction.
+/// Compare and write the planned pages in one MCP session, then exit it.
+///
+/// Each page is compared against its captured image and read back in full
+/// before the exit. Cancellation stops the session only until the first
+/// journal record is synced; after that the page transaction runs to its end.
 pub(super) async fn apply<T: Transport>(
     transport: &mut CaptureTransport<T, File>,
     expected: &Identity,
@@ -109,7 +113,8 @@ pub(super) async fn apply<T: Transport>(
     check_cancelled(cancelled)?;
     if restore.is_some_and(|plan| plan.identity() != expected || plan.before() != gateway) {
         return Err(CommandError(
-            "restoration plan identity or Gateway differs from its requested admission".to_owned(),
+            "restoration plan identity or Gateway differs from the requested restoration"
+                .to_owned(),
         )
         .into());
     }
@@ -173,7 +178,8 @@ pub(super) async fn apply<T: Transport>(
     finish(outcome, exit, checkpoint)
 }
 
-/// Wire synchronization and fresh durable intent both precede write admission.
+/// Sync the wire transcript and record this page in the journal before it is
+/// written. Cancellation is checked only before the first such record.
 fn admit_write(
     phase: Phase,
     page: &PageReplacement,
@@ -191,7 +197,8 @@ fn admit_write(
     Ok(())
 }
 
-/// Retain independent causes; failed journal publication cannot replace a radio error.
+/// The operation, exit and journal-checkpoint failures of one `apply`, kept
+/// separately so a journal failure never hides the radio error.
 #[derive(Debug)]
 struct ApplyFailure {
     operation: Option<Box<dyn std::error::Error + Send + Sync>>,

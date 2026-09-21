@@ -1,4 +1,5 @@
-//! Deterministic passive-command fixtures; no registry or radio queries.
+//! Tests for the sampler loop over scripted sample fixtures; no `ioreg` call
+//! and no radio access.
 
 use std::collections::VecDeque;
 use std::sync::atomic::AtomicUsize;

@@ -1,4 +1,6 @@
-//! Metadata and joined-worker tests never enumerate or open a real device.
+//! Paired-device selection and the joined inventory worker: name matching,
+//! ambiguous and conflicting records, an explicit address override, and
+//! cancellation before, during and after the worker completes.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -162,7 +164,7 @@ async fn cancellation_reaches_active_worker_and_waits_for_its_completion() -> Te
         }
         worker_completed.store(true, Ordering::Release);
         // A native result can race with cancellation. Even successful metadata
-        // must not become a newly admitted endpoint after the worker is joined.
+        // must not be returned as the selected endpoint once the worker joins.
         Ok(vec![(address, "TM-D750".to_owned())])
     });
     let interrupt = async {

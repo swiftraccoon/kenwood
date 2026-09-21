@@ -1,8 +1,7 @@
-//! Finite software-layout attribution for historical configuration differences.
+//! Fixed catalog mapping changed addresses to candidate field locations.
 //!
-//! A match is a candidate field location, not hardware qualification or proof
-//! that the field caused a change. Addresses outside this catalog stay visible
-//! to the caller as unclassified changes.
+//! A match names the field whose registry range covers the address; addresses
+//! outside the catalog reach the caller as unclassified changes.
 
 use kenwood_tmd750::memory::{
     FieldCodec, FieldDescriptor, ReflectorTerminalPreflight, SLOT_TERM, StringEncoding,
@@ -32,14 +31,14 @@ const MEMOS: [TextSetting; 6] = [
     TextSetting::DstarMemo6,
 ];
 
-/// One complete candidate field in the generated software layout.
+/// One field's location in the generated registry layout.
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct FieldLocation {
     /// Stable public menu or text-setting key, not a generated member name.
     pub(super) key: &'static str,
     /// Zero-based PM slot; globals have no slot and zero means PM Off.
     pub(super) slot: Option<u8>,
-    /// First captured byte belonging to the candidate field.
+    /// Address of the field's first byte.
     pub(super) start: u32,
     /// Full encoded width, including text padding.
     pub(super) length: usize,
@@ -63,7 +62,7 @@ impl FieldLocation {
     }
 }
 
-/// All candidate fields across every PM slot, sorted by absolute address.
+/// Every catalogued field across all PM slots, sorted by absolute address.
 #[derive(Debug)]
 pub(super) struct Catalog {
     fields: Vec<FieldLocation>,
@@ -83,7 +82,9 @@ struct Specification {
 }
 
 impl Catalog {
-    /// Resolve and validate the finite catalog without interpreting any capture.
+    /// Build the catalog from the registry, checking its ranges do not overlap.
+    ///
+    /// Reads no capture.
     pub(super) fn new() -> AppResult<Self> {
         let mut catalog = Self { fields: Vec::new() };
         for descriptor in ReflectorTerminalPreflight::required_fields()? {
@@ -106,7 +107,7 @@ impl Catalog {
         catalog.validate()
     }
 
-    /// Return the candidate field or leave the address explicitly unclassified.
+    /// The catalogued field covering `address`, or `None` when it is unclassified.
     pub(super) fn classify(&self, address: Address) -> Option<&FieldLocation> {
         self.fields.iter().find(|field| field.contains(address))
     }

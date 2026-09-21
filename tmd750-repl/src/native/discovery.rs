@@ -1,8 +1,8 @@
-//! One paired-device selection policy for native CAT and D-STAR startup.
+//! Paired-device selection shared by native CAT and D-STAR startup.
 //!
-//! Remote names identify candidates, not radio models. Selection retains one
-//! exact address and the helper used for its inventory; live CAT identity and
-//! workflow-specific admission remain mandatory before protocol operations.
+//! Selection returns one exact address and the helper that listed it. A remote
+//! name only nominates a candidate; the CAT identity exchange confirms the
+//! model before any workflow uses the connection.
 
 use std::io;
 use std::path::PathBuf;
@@ -23,22 +23,21 @@ use super::Endpoint;
 #[cfg(test)]
 mod tests;
 
-/// Optional exact device selection and a trusted native helper executable.
+/// What to resolve: an optional exact address and an optional helper binary.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Request {
-    /// Bypass name-based inventory when an exact address was supplied.
+    /// An exact address, which skips the paired-device inventory.
     pub(crate) address: Option<BluetoothAddress>,
     /// Use this executable for both paired-device inventory and later opening.
     pub(crate) helper: Option<PathBuf>,
 }
 
-/// Resolve metadata without opening a radio or sending protocol traffic.
+/// Resolve one endpoint address, opening no radio and sending no traffic.
 ///
-/// Automatic selection requires one unique recognized paired device. The
-/// bounded native inventory runs on a blocking worker that is always joined,
-/// including after cancellation. Callers must retain this future until it
-/// completes; dropping it would abandon its worker's ownership. Sticky
-/// cancellation is forwarded to the helper and blocks late endpoint admission.
+/// Automatic selection requires exactly one paired device with a recognized
+/// name. The inventory runs on a blocking worker that is always joined, so this
+/// future must be polled to completion; dropping it would abandon that worker.
+/// Cancellation is forwarded to the helper and discards a late result.
 #[cfg(target_os = "macos")]
 pub(crate) async fn resolve(request: &Request, cancelled: &AtomicBool) -> AppResult<Endpoint> {
     use kenwood_transport::bluetooth::BluetoothTransport;
@@ -57,7 +56,7 @@ pub(crate) async fn resolve(request: &Request, cancelled: &AtomicBool) -> AppRes
     .await
 }
 
-/// Refuse unsupported platforms before discovery or connection opening.
+/// Return a ready `Unsupported` error: discovery needs macOS Bluetooth.
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn resolve(
     request: &Request,
@@ -143,10 +142,18 @@ where
     })
 }
 
-/// Observed remote names, never proof of the radio model or physical continuity.
+/// Bluetooth remote names accepted for automatic TM-D750 selection.
+///
+/// A TM-D750 on firmware 1.02 advertises `stm32mp1-ex5240`, the name of its
+/// system-on-chip, rather than `TM-D750`. A name selects a candidate address
+/// only; the model is confirmed by the CAT identity exchange.
 #[cfg(any(target_os = "macos", test))]
 const CANDIDATE_NAMES: [&str; 2] = ["TM-D750", "stm32mp1-ex5240"];
 
+/// Select the one paired device whose name is in `CANDIDATE_NAMES`.
+///
+/// Returns `CommandError` when no name matches, when several do, or when the
+/// chosen address appears more than once in the inventory.
 #[cfg(any(target_os = "macos", test))]
 fn select<'a>(
     devices: impl IntoIterator<Item = (&'a BluetoothAddress, &'a str)>,

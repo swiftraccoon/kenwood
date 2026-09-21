@@ -1,4 +1,5 @@
-//! Offline comparison contracts; synthetic fixtures are not hardware evidence.
+//! Tests for the comparison command over synthetic backup fixtures: argument
+//! grammar, changed-byte reporting and field labelling.
 
 use super::*;
 use crate::mcp::terminal::tests::{blank_fixture, set, write_fixture};
@@ -287,12 +288,12 @@ fn registry_label_match_is_preserved_without_claiming_live_qualification() -> Te
     );
     let console = describe(&report).join("\n");
     assert!(
-        console.contains("This does not qualify live settings"),
-        "a registry match must not become a hardware claim: {console}"
+        console.contains("Layout interpretation: registry_target_matched"),
+        "the console must name the layout the values were decoded with: {console}"
     );
     assert!(
-        console.contains("do not prove physical-unit continuity"),
-        "matching identities must retain their evidence limit: {console}"
+        console.contains("names the model and firmware, not the physical unit"),
+        "matching identities must retain their stated limit: {console}"
     );
     Ok(())
 }

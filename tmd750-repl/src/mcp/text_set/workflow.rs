@@ -1,4 +1,7 @@
-//! One typed text update followed by independent fresh-session verification.
+//! Runs the write session, then the confirmation session.
+//!
+//! The first session compares the page, writes it and reads it back; the second
+//! reopens on a fresh connection and re-reads the page.
 
 use std::fs::File;
 use std::num::NonZeroU64;
@@ -27,8 +30,9 @@ pub(super) struct SessionCaptures {
     pub(super) post_exit: Recorder<File>,
 }
 
-/// A cloned descriptor used only to synchronize raw evidence before write intent.
-/// The first failure remains material even if later cleanup synchronization works.
+/// Second descriptor on the transcript file, fsynced before a write intent.
+///
+/// The first failure is retained even when a later synchronization succeeds.
 pub(super) struct CaptureSynchronization {
     file: File,
     error: Option<Failure>,
@@ -154,7 +158,9 @@ impl From<My1CallsignUpdateWriteDisposition> for WriteDisposition {
     }
 }
 
-/// Preserve the observed raw Gateway value without serializing a guessed label.
+/// Observed DV Gateway mode, serialized as a state name plus the raw wire byte.
+///
+/// A value with no name serializes as `unqualified` with its byte preserved.
 #[derive(Debug, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 enum GatewayEvidence {
@@ -282,7 +288,8 @@ struct SessionEvidence {
 }
 
 impl SessionEvidence {
-    /// Retain the first synchronization failure through later successful cleanup.
+    /// Synchronize the transcript and store its summary, keeping the first
+    /// synchronization failure.
     fn synchronize_original(&mut self, recorder: &mut Recorder<File>) {
         if let Err(error) = recorder.synchronize()
             && self.synchronization_error.is_none()
@@ -298,7 +305,8 @@ impl SessionEvidence {
         self.synchronize_original(&mut recorder);
     }
 
-    /// An opened handle with failed admission evidence may only be closed.
+    /// Wrap the open connection for protocol use, or close it and return `None`
+    /// when its opening record failed to synchronize.
     async fn admit_original<T: Transport>(
         &mut self,
         connection: T,
@@ -391,7 +399,7 @@ impl WorkflowResult {
 const fn exit_guidance(exit: &ExitDisposition) -> Option<&'static str> {
     match exit {
         ExitDisposition::RecoveryRequired | ExitDisposition::NotAcknowledged => Some(
-            "Programming exit is unconfirmed. Retain the journal and transcripts, and fully power-cycle the radio before reconnecting. A power cycle does not establish which text is stored; do not retry or restore blindly.",
+            "Programming exit is unconfirmed. Retain the journal and transcripts, and fully power-cycle the radio before reconnecting. A power cycle does not report which text is stored; do not retry or restore blindly.",
         ),
         ExitDisposition::NotEntered | ExitDisposition::Acknowledged => None,
     }
@@ -523,8 +531,8 @@ async fn run_session(
     result.synchronization_error = capture.error;
     result.close_original(radio.into_transport()).await;
     let eligibility = verification_identity(&result, journal, &report);
-    // After any possible write, user cancellation cannot abandon verification.
-    // Required capture independently stops protocol traffic after capture loss.
+    // Once the page may have been written, a cancellation signal no longer
+    // skips the check; a capture failure still stops all protocol traffic.
     let verification_cancelled = if update.status() == UpdateStatus::NotWritten {
         cancelled
     } else {
@@ -581,7 +589,10 @@ fn verification_identity<'a>(
     }
 }
 
-/// Synchronize requested open and its outcome before admitting any protocol work.
+/// Record and fsync the requested open and its result, then return the connection.
+///
+/// Returns `None` when the record made before the open failed to synchronize,
+/// when cancellation was requested, or when the open itself failed.
 fn open_original<B: Backend>(
     backend: &mut B,
     endpoint: &SerialCandidate,

@@ -1,4 +1,5 @@
-//! Four mock connections, one durable-intent-bound PM1 write, and no rollback.
+//! Tests for the PM1 write across four mock connections: the journaled write
+//! intent precedes the W frame, and nothing is rolled back.
 
 use std::collections::VecDeque;
 use std::io;
@@ -891,7 +892,7 @@ fn only_unconfirmed_exit_requests_recovery_without_claiming_restoration() -> Tes
             "uncertain exit must require an explicit recovery boundary"
         );
         assert!(
-            guidance.contains("does not establish which text is stored"),
+            guidance.contains("does not report which text is stored"),
             "a power cycle must not be described as proof of restoration"
         );
         assert!(

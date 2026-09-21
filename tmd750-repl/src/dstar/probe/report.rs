@@ -1,4 +1,8 @@
-//! Stable diagnostic evidence, distinct from mode or connection qualification.
+//! Serialized probe report: endpoint, limits, stage, outcome and transcript.
+//!
+//! Field names and the `kind` tags are the stable on-disk format. A recorded
+//! CAT or MMDVM observation describes the one connection that answered, not
+//! the radio's mode.
 
 use kenwood_tmd750::Identity;
 use kenwood_tmd750::transport::{DEFAULT_BAUD, SerialCandidate};
@@ -43,7 +47,9 @@ impl Report {
                 version.protocol, version.description, status.mode,
             )),
             Outcome::Cancelled { .. } => {
-                output::line(format_args!("Diagnostic cancelled; connection retired."));
+                output::line(format_args!(
+                    "Diagnostic cancelled; the connection was closed."
+                ));
             }
             Outcome::CatGatewayFailed { error, .. }
             | Outcome::VersionFailed { error, .. }
@@ -54,7 +60,7 @@ impl Report {
         }
         if self.cancelled {
             output::line(format_args!(
-                "Cancellation was requested; retained observations do not make this run successful."
+                "Cancellation was requested; this run is incomplete."
             ));
         }
         for (stage, error) in [
@@ -69,9 +75,7 @@ impl Report {
                 output::error(format_args!("Diagnostic {stage} failed: {error}"));
             }
         }
-        output::line(format_args!(
-            "No mode or routing changes were requested. These observations do not qualify automatic Terminal operation."
-        ));
+        output::line(format_args!("No mode or routing change was requested."));
     }
 }
 

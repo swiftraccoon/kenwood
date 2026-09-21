@@ -1,4 +1,8 @@
-//! Separately approved fixed text experiments, with durable recovery evidence.
+//! Two fixed text round trips: PM1 rename-and-restore, PM-Off MY1 set-and-restore.
+//!
+//! Each writes and fsyncs the original page bytes to a recovery journal before
+//! any W frame, so the original text can be restored by hand if the run dies
+//! mid-write. No other field is writable here.
 
 mod journal;
 mod target;
@@ -25,7 +29,7 @@ use journal::Journal;
 use target::Trial;
 use workflow::{SessionCaptures, WorkflowResult};
 
-/// One explicitly approved experiment; no arbitrary field, value, or address.
+/// Arguments of `mcp pm1-trial`: source backup, displayed name, capture path.
 #[derive(Debug, Parser)]
 pub(crate) struct TrialRequest {
     /// Successful standard configuration report belonging to this radio.
@@ -34,7 +38,8 @@ pub(crate) struct TrialRequest {
     /// PM1 name independently observed on the radio, without recalling a PM.
     #[arg(long, value_name = "DISPLAYED_NAME")]
     confirmed_name: String,
-    /// Approve PM1 -> PC TEXT TEST -> original name across MCP exit/re-entry.
+    /// Required. Writes PM1 as PC TEXT TEST, then restores the original name
+    /// across an MCP exit and re-entry.
     #[arg(long, required = true)]
     approve_live_test: bool,
     /// New private capture directory; its parent must exist.
@@ -46,7 +51,7 @@ impl TrialRequest {
     fn prepare(&self, endpoint: &SerialCandidate, baud: u32) -> AppResult<PmNameTrial> {
         if !self.approve_live_test {
             return Err(Box::new(CommandError(
-                "explicit PM1 trial approval is required".to_owned(),
+                "mcp pm1-trial requires --approve-live-test".to_owned(),
             )));
         }
         if !endpoint.is_tmd750() || endpoint.pid != Some(TMD750_MAIN_PID) || baud != DEFAULT_BAUD {
@@ -65,13 +70,14 @@ impl TrialRequest {
     }
 }
 
-/// Empty MY1 to KQ4NIT and exact restoration; no configurable field or slot.
+/// Arguments of `mcp my1-trial`: source backup and capture path.
 #[derive(Debug, Parser)]
 pub(crate) struct My1TrialRequest {
     /// Successful, complete configuration report from this radio.
     #[arg(long, value_name = "REPORT")]
     backup: PathBuf,
-    /// Approve empty MY1 -> KQ4NIT -> empty in PM Off with Gateway Off.
+    /// Required. Writes PM-Off MY1 as KQ4NIT, then restores the empty value;
+    /// the radio must be in PM Off with DV Gateway Off.
     #[arg(long, required = true)]
     approve_live_test: bool,
     /// New private capture directory; its parent must exist.
@@ -82,7 +88,9 @@ pub(crate) struct My1TrialRequest {
 impl My1TrialRequest {
     fn prepare(&self, endpoint: &SerialCandidate, baud: u32) -> AppResult<MyCallsignTrial> {
         if !self.approve_live_test {
-            return Err(CommandError("explicit MY1 trial approval is required".to_owned()).into());
+            return Err(
+                CommandError("mcp my1-trial requires --approve-live-test".to_owned()).into(),
+            );
         }
         if !endpoint.is_tmd750() || endpoint.pid != Some(TMD750_MAIN_PID) || baud != DEFAULT_BAUD {
             return Err(CommandError(
@@ -105,7 +113,11 @@ impl My1TrialRequest {
     }
 }
 
-/// Run only the separately approved MY1 replacement and restoration experiment.
+/// Set PM-Off MY1 to KQ4NIT, confirm it after an MCP exit and re-entry, then
+/// restore the empty value.
+///
+/// Requires `--approve-live-test`, captured memory format zero, PM Off and
+/// Gateway Off. A failure leaves the journal's recovery bytes on disk.
 pub(super) async fn run_my1(
     endpoint: &SerialCandidate,
     baud: u32,
@@ -124,7 +136,7 @@ pub(super) async fn run_my1(
             confirmed_name: "",
             output: request.output.as_deref(),
             operation: "my1_callsign_trial",
-            scope: "fixed PM Off MY1 only, empty to KQ4NIT and exact restoration; immutable control-page guard and fresh CAT Gateway Off; no Terminal activation or firmware-wide schema qualification; endpoint and CAT tuple do not prove physical continuity",
+            scope: "fixed PM Off MY1 only, empty to KQ4NIT and exact restoration; immutable control-page guard and fresh CAT Gateway Off; no Terminal activation and no other field; the endpoint and CAT tuple name the model and firmware, not the physical unit",
         },
     )
     .await
@@ -220,7 +232,11 @@ fn additional_captures(
     .collect()
 }
 
-/// Reserve all evidence, run exactly the approved trial, and retain failures.
+/// Run the PM1 rename-and-restore round trip.
+///
+/// Every capture file and the recovery journal are reserved before the port is
+/// opened, and both are kept on every failure path. Requires
+/// `--approve-live-test` and the pinned main-unit USB endpoint at 9600 baud.
 pub(super) async fn run(
     endpoint: &SerialCandidate,
     baud: u32,
@@ -236,7 +252,7 @@ pub(super) async fn run(
             confirmed_name: &request.confirmed_name,
             output: request.output.as_deref(),
             operation: "pm1_name_trial",
-            scope: "fixed PM1 page only; not firmware-wide schema qualification; endpoint and CAT tuple do not prove physical continuity",
+            scope: "fixed PM1 page only, and no other field; the endpoint and CAT tuple name the model and firmware, not the physical unit",
         },
     )
     .await
@@ -274,12 +290,12 @@ async fn run_trial(
     }];
     captures.extend(extra);
     output::line(format_args!(
-        "{} trial evidence: {}.",
+        "{} trial capture: {}.",
         trial.label(),
         directory.display()
     ));
     output::line(format_args!(
-        "Approved fixed {} test: temporary text {} followed by exact original-page restoration. Three MCP sessions with fresh-connection checks; no RF commands.",
+        "{} trial: temporary text {}, then exact original-page restoration. Three MCP sessions with fresh-connection checks between them; no RF commands.",
         trial.label(),
         trial.temporary_text(),
     ));
@@ -341,13 +357,13 @@ async fn run_trial(
     ));
     if succeeded {
         output::line(format_args!(
-            "{} temporary text and exact whole-page restoration verified across MCP exit/re-entry. Full-radio reboot or power-cycle persistence is not proved. This fixed text trial does not qualify other fields or automatic Terminal activation.",
+            "{} temporary text and exact whole-page restoration verified across MCP exit/re-entry. Persistence across a power cycle was not checked.",
             trial.label()
         ));
         Ok(())
     } else {
         Err(Box::new(CommandError(format!(
-            "Text trial incomplete; restoration status {:?}. Do not retry or restore blindly. Inspect retained evidence in {} before further radio commands.",
+            "Text trial incomplete; restoration status {:?}. Do not retry or restore blindly. Inspect the retained capture and recovery journal in {} before further radio commands.",
             report.restoration,
             directory.display(),
         ))))

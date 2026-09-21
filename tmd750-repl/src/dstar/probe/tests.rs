@@ -1,4 +1,4 @@
-//! Wire-boundary, ownership, and evidence checks without a live radio.
+//! Wire boundaries, connection cleanup, and report contents, over mocks.
 
 use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
@@ -13,8 +13,8 @@ type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 const FAST: Limits = Limits {
     cat_io_step: Duration::from_millis(30),
-    // Required capture synchronizes real files. Leave bounded headroom for
-    // concurrently running backup fixtures without changing device policy.
+    // Required capture synchronizes real files, so this budget leaves headroom
+    // for backup fixtures running concurrently.
     binary_total: Duration::from_secs(1),
     close: Duration::from_millis(20),
 };

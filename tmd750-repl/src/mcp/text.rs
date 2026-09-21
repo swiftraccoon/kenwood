@@ -1,4 +1,7 @@
-//! Offline text inspection and explicitly approved, field-scoped updates.
+//! Text inspection from captured backups, plus the two writable text settings.
+//!
+//! `list`, `show` and `preview` read captured files only; `set` opens the radio
+//! and can change PM1's name or PM-Off MY1, and no other field.
 
 use std::path::{Path, PathBuf};
 
@@ -15,7 +18,7 @@ use super::snapshot::Snapshot;
 use super::{IdentityEvidence, write_report};
 use crate::{AppResult, CommandError, capture, output};
 
-/// Inspect text offline or select a separately bounded typed text setter.
+/// Text subcommand: offline inspection, or one typed text update.
 #[derive(Debug, Parser)]
 pub(crate) struct TextRequest {
     #[command(subcommand)]
@@ -26,7 +29,7 @@ pub(crate) struct TextRequest {
 enum TextCommand {
     /// List supported setting keys, scopes, and storage limits without a backup.
     List,
-    /// Show captured text using an explicitly selected software-layout policy.
+    /// Decode one text setting from a captured backup.
     Show(Selection),
     /// Preview a text change without altering the backup or applying it to a radio.
     Preview(PreviewRequest),
@@ -48,7 +51,9 @@ impl TextRequest {
     }
 }
 
-/// Execute offline commands without enumerating or opening any endpoint.
+/// Run a text subcommand that works from captured files alone.
+///
+/// Returns `None` for `set`, which needs an open connection.
 pub(super) fn run_offline(request: &TextRequest) -> Option<AppResult<()>> {
     match request.command {
         TextCommand::Set(_) => None,
@@ -56,7 +61,9 @@ pub(super) fn run_offline(request: &TextRequest) -> Option<AppResult<()>> {
     }
 }
 
-/// Dispatch an explicitly selected connection only to the bounded setter.
+/// Run a text subcommand once an endpoint has been selected.
+///
+/// Only `set` uses the connection; the other subcommands read captured files.
 pub(super) async fn run_selected(
     endpoint: &SerialCandidate,
     baud: u32,
@@ -74,9 +81,7 @@ struct Selection {
     #[arg(long, value_name = "REPORT")]
     backup: PathBuf,
 
-    /// Explicitly interpret unqualified firmware using the software layout.
-    ///
-    /// Required for firmware 1.02. This does not enable any radio writes.
+    /// Decode firmware outside the registry label. Required for firmware 1.02.
     #[arg(long)]
     interpret_unqualified: bool,
 
@@ -142,7 +147,8 @@ impl Selection {
     }
 }
 
-/// The offline implementation never opens a radio, even if misrouted.
+/// Run one offline text subcommand; `set` returns an error here instead of
+/// opening a connection.
 fn run(request: &TextRequest) -> AppResult<()> {
     match &request.command {
         TextCommand::List => list(),
@@ -272,10 +278,10 @@ impl Qualification {
     const fn description(&self) -> &'static str {
         match self {
             Self::RegistryTargetMatched => {
-                "Registry firmware label matched; hardware schema compatibility is not proved."
+                "Registry firmware label matched this backup's firmware."
             }
             Self::UnqualifiedInterpretation => {
-                "Unqualified software-layout interpretation; decoded text and patches are hypotheses, not validated radio settings."
+                "Firmware outside the registry label; decoded with --interpret-unqualified."
             }
         }
     }

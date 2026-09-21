@@ -1,4 +1,5 @@
-//! Deterministic reconnect workflow tests with observable handle ownership.
+//! Tests for the probe and backup workflows over mock connections that record
+//! every open, write, close and drop.
 
 use super::*;
 use crate::capture;

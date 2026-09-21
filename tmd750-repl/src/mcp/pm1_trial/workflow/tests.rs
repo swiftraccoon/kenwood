@@ -1,7 +1,7 @@
-//! Entire fixed PM1 transaction with six observable, entirely mock handles.
+//! Tests for the whole PM1 round trip over six recording mock connections.
 //!
-//! Persistence means equality after MCP exit and re-entry on a fresh connection;
-//! the mock does not supply independent evidence of a full-radio reboot.
+//! Persistence here means the page compares equal after an MCP exit and
+//! re-entry on a fresh connection; the mocks model no power cycle.
 
 use std::collections::VecDeque;
 use std::io;

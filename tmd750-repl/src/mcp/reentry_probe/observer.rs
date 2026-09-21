@@ -1,9 +1,9 @@
-//! Passive, timestamped macOS registry observations, never radio protocol I/O.
+//! Passive, timestamped samples of the macOS serial registry through `ioreg`.
 //!
-//! The output describes host registry objects, not physical radio identity or
-//! firmware readiness. Sampling can miss short detachments. Each command has
-//! its own deadline; a timed-out child is killed on drop, but its termination
-//! and reaping are not independently established by that observation.
+//! The observer sends no radio protocol traffic. Each sample has its own
+//! deadline and a timed-out child is killed on drop, without waiting for it to
+//! be reaped; a detachment shorter than the sampling interval can go unseen.
+//! Records describe host registry objects, not the radio.
 
 use std::fs::File;
 use std::future::Future;
@@ -32,7 +32,10 @@ const TIMING: Timing = Timing {
     command_timeout: Duration::from_secs(2),
 };
 
-/// Exact command output; nonzero or missing exit codes never mean absence.
+/// One sample's exit code, stdout and stderr, recorded verbatim.
+///
+/// A nonzero or missing exit code is recorded as observed, never read as the
+/// endpoint being absent.
 #[derive(Debug, Serialize)]
 struct CommandOutput {
     exit_code: Option<i32>,
@@ -40,7 +43,7 @@ struct CommandOutput {
     stderr: Vec<u8>,
 }
 
-/// Replace only the passive command when testing; there is no radio dependency.
+/// Source of one registry sample; tests substitute one that runs no subprocess.
 trait Source: Send + 'static {
     fn sample(&mut self) -> impl Future<Output = io::Result<CommandOutput>> + Send;
 }
@@ -94,7 +97,7 @@ enum FailureStage {
 #[derive(Debug, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum Outcome {
-    /// Initial evidence only, retained if the worker cannot return its summary.
+    /// Still sampling; also kept when the worker cannot return its summary.
     Running,
     /// The stop request was consumed and the final transcript synchronized.
     Stopped,
@@ -129,7 +132,10 @@ enum Event<'a> {
     StopRequested,
 }
 
-/// Completion evidence for the passive observer, separate from radio success.
+/// Final state of the passive observer.
+///
+/// Holds the transcript summary, the requested and successful sample counts,
+/// the outcome and any synchronization failure.
 #[derive(Debug, Serialize)]
 pub(super) struct Summary {
     transcript: Box<TranscriptSummary>,
@@ -144,7 +150,7 @@ pub(super) struct Summary {
 }
 
 impl Summary {
-    /// A stopped observer must retain at least one successful durable sample.
+    /// True when the observer stopped with at least one synchronized sample.
     pub(super) fn succeeded(&self) -> bool {
         self.final_capture
             && self.transcript.complete
@@ -312,7 +318,8 @@ impl State {
     }
 }
 
-/// Fail closed on worker loss, including an abort before its first poll.
+/// Sets the cancellation flag if the worker ends without stopping, including an
+/// abort before its first poll.
 struct WorkerGuard {
     cancelled: Arc<AtomicBool>,
     armed: bool,
@@ -326,7 +333,9 @@ impl Drop for WorkerGuard {
     }
 }
 
-/// One independent observer; stopping it never cancels a radio exchange.
+/// Handle to the running sampler task.
+///
+/// Stopping it cancels no radio exchange.
 #[derive(Debug)]
 pub(super) struct Observer {
     stop: oneshot::Sender<()>,
@@ -336,8 +345,11 @@ pub(super) struct Observer {
 }
 
 impl Observer {
-    /// Require a complete synchronized first observation before returning.
-    /// Non-macOS hosts are rejected without starting a worker or a subprocess.
+    /// Take one synchronized sample, then spawn the sampler task.
+    ///
+    /// Returns `Err(Summary)` without starting a worker or a subprocess on a
+    /// non-macOS host, after cancellation, or when the first sample or its
+    /// synchronization fails.
     pub(super) async fn start(
         recorder: Recorder<File>,
         cancelled: Arc<AtomicBool>,
@@ -382,7 +394,7 @@ impl Observer {
         })
     }
 
-    /// Finish the current bounded passive sample, join, and synchronize evidence.
+    /// Request a stop, let the current sample finish, then join and synchronize.
     pub(super) async fn stop(self) -> Summary {
         let _requested = self.stop.send(());
         match self.worker.await {

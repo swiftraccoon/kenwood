@@ -1,4 +1,8 @@
-//! Exclusive, synchronized recovery records for fixed text experiments.
+//! Append-only, fsynced recovery records for the two fixed text round trips.
+//!
+//! One private JSON-lines file per run holds the trial scope and the original
+//! page bytes needed to restore the text by hand. The first append or
+//! synchronization failure blocks every later append.
 
 use std::fs::File;
 use std::io::{self, Write};
@@ -18,13 +22,17 @@ use super::target::{Trial, TrialKind};
 #[cfg(unix)]
 const FILENAME: &str = "trial-journal.jsonl";
 
-/// Injected storage boundary; success must mean both content and metadata sync.
+/// Sink whose `Ok` means the bytes and the directory entry reached storage.
+///
+/// Tests substitute a sink that fails on demand.
 pub(super) trait DurableWrite: Write {
+    /// Synchronize the file's contents and metadata.
     fn synchronize(&mut self) -> io::Result<()>;
+    /// Synchronize the containing directory and its parent entry.
     fn synchronize_directory(&mut self) -> io::Result<()>;
 }
 
-/// Exclusive file plus the directory whose entry must survive before any W.
+/// The journal file and the directory holding its entry.
 #[derive(Debug)]
 pub(super) struct FileSink {
     file: File,
@@ -118,7 +126,7 @@ impl BoundTrial {
     }
 }
 
-/// A single append-only journal; the first failure poisons all later appends.
+/// One append-only journal; its first failure blocks all later appends.
 #[derive(Debug)]
 pub(super) struct Journal<S: DurableWrite = FileSink> {
     sink: S,
@@ -129,8 +137,11 @@ pub(super) struct Journal<S: DurableWrite = FileSink> {
 }
 
 impl Journal<FileSink> {
-    /// Reserve the fixed private filename in a newly reserved private directory.
-    /// Existing files are never opened for modification or truncated.
+    /// Create the journal file in an existing private directory.
+    ///
+    /// The directory must be a real directory with no group or other
+    /// permissions. An existing file is never opened for modification or
+    /// truncated; the call fails instead.
     #[cfg(unix)]
     pub(super) fn create(directory: &Path) -> io::Result<Self> {
         use std::os::unix::fs::PermissionsExt;
@@ -147,7 +158,8 @@ impl Journal<FileSink> {
         Ok(Self::new(FileSink { file, directory }))
     }
 
-    /// Refuse platforms without this runner's private-file durability contract.
+    /// Return an error: non-Unix hosts lack the private-file and directory
+    /// synchronization this journal requires.
     #[cfg(not(unix))]
     pub(super) fn create(_directory: &Path) -> io::Result<Self> {
         Err(unsupported_platform())
@@ -166,11 +178,14 @@ impl<S: DurableWrite> Journal<S> {
         }
     }
 
-    /// Bind recovery bytes and the target's explicit baseline precondition before
-    /// opening the radio. Only PM1 requires independent display-name confirmation;
-    /// MY1 requires an empty captured baseline, never a fabricated display claim.
-    /// The caller must have separately obtained operator approval.
-    /// Both file and directory entries are synchronized before success.
+    /// Record the recovery bytes and the baseline check, before the port opens.
+    ///
+    /// PM1 requires `confirmed_name` to match the name read off the radio
+    /// display; MY1 requires an empty captured baseline. The file and its
+    /// directory are synchronized before this returns `Ok`. Returns an
+    /// `io::Error` when the journal is already prepared, the trial already has
+    /// a write obligation, the confirmation does not match, or any append or
+    /// synchronization fails.
     pub(super) fn prepare(
         &mut self,
         trial: &impl Trial,
@@ -221,10 +236,14 @@ impl<S: DurableWrite> Journal<S> {
         Ok(())
     }
 
-    /// Record the fixed backend intent and complete recovery bytes, then flush
-    /// and synchronize before the backend may represent or dispatch any W.
-    /// The callback follows the engine's fresh format and full-page validation;
-    /// raw observations belong to the separately retained session capture.
+    /// Append the write intent and recovery bytes, then flush and fsync them.
+    ///
+    /// The engine calls this after its fresh-format and whole-page checks and
+    /// before it sends the W frame; the raw bytes behind those checks stay in
+    /// the session capture. A rename intent must follow `prepare` and a restore
+    /// intent must follow the rename intent. Returns an `io::Error` on an
+    /// out-of-order call, a trial mismatch, or a failed append or
+    /// synchronization.
     pub(super) fn intent(&mut self, trial: &impl Trial, write: PmNameTrialWrite) -> io::Result<()> {
         self.check_bound(trial)?;
         let (required, next, session_id, write) = match write {
@@ -252,18 +271,23 @@ impl<S: DurableWrite> Journal<S> {
         Ok(())
     }
 
-    /// Synchronize complete successful or failed session diagnostics. Evidence
-    /// never clears an earlier journal failure or changes restoration status.
+    /// Append one session's diagnostics, successful or failed.
+    ///
+    /// The record never clears an earlier journal failure or changes the
+    /// restoration status. Rejected before `prepare` and after `finish`.
     pub(super) fn evidence(&mut self, evidence: &impl Serialize) -> io::Result<()> {
         self.require(
             !matches!(self.stage, Stage::Unprepared | Stage::Finished),
-            "journal does not accept session evidence at this stage",
+            "journal does not accept a session record at this stage",
         )?;
         self.append(Kind::SessionEvidence, evidence)
     }
 
-    /// Record the engine's final conservative status without inferring success
-    /// from CAT, process completion, or an immediate original-page readback.
+    /// Append the trial's final status and close the journal.
+    ///
+    /// The status must match the recorded stage: `NotWritten` only after
+    /// `prepare`, `PossiblyChanged` after either write intent, and
+    /// `RestorationVerified` only after the restore intent.
     pub(super) fn finish(&mut self, trial: &impl Trial) -> io::Result<()> {
         self.check_bound(trial)?;
         self.require(self.stage != Stage::Finished, "journal is already finished")?;

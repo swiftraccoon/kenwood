@@ -1,4 +1,4 @@
-//! Pure endpoint-role admission before any radio connection is opened.
+//! Endpoint-role checks over enumeration metadata, before any connection.
 
 use kenwood_tmd750::memory::TerminalGatewayRoute;
 use kenwood_tmd750::transport::{SerialCandidate, TMD750_MAIN_PID, TMD750_PANEL_PID};
@@ -6,7 +6,10 @@ use kenwood_tmd750::transport::{SerialCandidate, TMD750_MAIN_PID, TMD750_PANEL_P
 use crate::CommandError;
 use crate::mcp::reconnect::endpoint_is_unambiguous;
 
-/// Distinct exact USB roles, not proof of physical-unit continuity.
+/// The two USB endpoints a managed probe uses.
+///
+/// `control` carries CAT and MCP; `modem` carries the diagnostic connection.
+/// Matching metadata can still come from two radios.
 #[derive(Debug)]
 pub(super) struct Endpoints {
     pub(super) control: SerialCandidate,
@@ -14,6 +17,11 @@ pub(super) struct Endpoints {
 }
 
 impl Endpoints {
+    /// Select both roles from `candidates`.
+    ///
+    /// Returns `CommandError` unless both paths enumerate unambiguously as
+    /// TM-D750 connectors, the two paths and PIDs differ, and the modem PID
+    /// matches `route`; a Bluetooth route is rejected outright.
     pub(super) fn admit(
         modem: &SerialCandidate,
         control_path: &str,

@@ -1,4 +1,8 @@
-//! Typed text updates with full-page evidence and a separate verifier.
+//! Updates PM1's name or PM-Off MY1, and no other field.
+//!
+//! One MCP session compares the whole page, writes it and reads it back; a
+//! second CAT session then verifies the identity tuple and Gateway Off. Nothing
+//! is rolled back automatically.
 
 mod journal;
 mod target;
@@ -28,7 +32,8 @@ use journal::UpdateJournal;
 use target::{PreparedUpdate, Update, UpdateKind};
 use workflow::{SessionCaptures, WorkflowResult};
 
-/// Leave a PM1 name or PM-Off MY1 callsign in place; no arbitrary fields.
+/// Arguments of `mcp text set`: the setting, its expected and new text, and
+/// the capture path.
 #[derive(Debug, Args)]
 pub(super) struct SetRequest {
     /// Successful, current standard configuration-backup report for this radio.
@@ -37,10 +42,10 @@ pub(super) struct SetRequest {
     /// Exact current text; MY1 alone accepts "" for eight captured NUL bytes.
     #[arg(long = "expect", value_parser = parse_expected, value_name = "CURRENT_TEXT")]
     expected: String,
-    /// Approve leaving the requested text in place, without automatic rollback.
+    /// Required. The new text stays on the radio; nothing is rolled back.
     #[arg(long, required = true)]
     apply: bool,
-    /// New private evidence directory; its parent must exist.
+    /// New private capture directory; its parent must exist.
     #[arg(long, value_name = "NEW_DIRECTORY")]
     output: Option<PathBuf>,
     /// Only pm-name-1 or dstar-my-callsign-1; MY1 is fixed to PM Off/Gateway Off.
@@ -64,7 +69,8 @@ fn parse_expected(value: &str) -> Result<String, String> {
     }
 }
 
-/// All untyped CLI text is converted before enumeration or capture creation.
+/// The validated change, built from the CLI text before any enumeration,
+/// capture reservation or open.
 enum RequestedChange {
     Pm1 {
         expected: Pm1Name,
@@ -156,7 +162,7 @@ impl SetRequest {
 
     fn print_start(&self, directory: &Path, kind: UpdateKind) {
         output::line(format_args!(
-            "{} update evidence: {}.",
+            "{} update capture: {}.",
             kind.label(),
             directory.display()
         ));
@@ -167,11 +173,11 @@ impl SetRequest {
             self.value.as_str()
         ));
         output::line(format_args!(
-            "Keep this radio connected. Ctrl-C cancels before write intent; afterward, safe verification finishes before stopping."
+            "Keep this radio connected. Ctrl-C cancels before the write is journaled; afterward the verification finishes before stopping."
         ));
         if kind == UpdateKind::PmOffMy1 {
             output::line(format_args!(
-                "Configurable MY1 updates are mock-tested, not hardware-qualified. This does not enable Terminal Mode or establish callsign acceptance."
+                "This writes PM-Off MY1 only, with Gateway Off; Terminal Mode and routing are left unchanged."
             ));
         }
     }
@@ -251,7 +257,10 @@ fn verification_captures(directory: &Path, failed: &Arc<AtomicBool>) -> AppResul
     })
 }
 
-/// Prepare a closed typed target before reserving any captures or opening USB.
+/// Validate the request and run the update for the selected setting.
+///
+/// The typed update is built before any capture file is reserved or any port is
+/// opened.
 pub(super) async fn run(
     endpoint: &SerialCandidate,
     baud: u32,
@@ -267,7 +276,11 @@ pub(super) async fn run(
     }
 }
 
-/// Share lifecycle and persistence without sharing the target's admission policy.
+/// Run the shared write/readback session and post-exit CAT check for an already
+/// validated update.
+///
+/// Field-specific validation happened in `SetRequest::prepare`; this reserves
+/// the capture files and journal, runs both sessions and writes the report.
 async fn run_prepared(
     update: &mut impl Update,
     endpoint: &SerialCandidate,
@@ -357,14 +370,14 @@ async fn run_prepared(
     ));
     if succeeded {
         output::line(format_args!(
-            "{} is now {:?}; the entire desired page was verified across MCP exit/re-entry. Refresh the configuration backup before another edit.",
+            "{} is now {:?}; the whole page was verified across MCP exit and re-entry. Refresh the configuration backup before another edit.",
             kind.label(),
             request.value.as_str()
         ));
         Ok(())
     } else {
         Err(Box::new(CommandError(format!(
-            "{} update incomplete; status {:?}. Do not retry or restore blindly. Inspect retained evidence in {}.",
+            "{} update incomplete; status {:?}. Do not retry or restore blindly. Inspect the retained capture and journal in {}.",
             kind.label(),
             report.status,
             directory.display()

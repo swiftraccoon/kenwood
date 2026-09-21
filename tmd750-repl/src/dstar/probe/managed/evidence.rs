@@ -1,4 +1,5 @@
-//! Independent outcomes and complete-page recovery evidence.
+//! Serialized results of a managed run: per-connection outcomes, the pages
+//! compared, possibly written and verified, and the restoration state.
 
 use kenwood_tmd750::{Page, PageReplacement};
 use serde::Serialize;

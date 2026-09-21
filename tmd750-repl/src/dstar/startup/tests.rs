@@ -1,4 +1,5 @@
-//! Fake-native and USB coverage for end-to-end ownership and guarded recovery.
+//! End-to-end startup coverage over fake native and USB backends: Terminal
+//! entry, the MMDVM transition, and restoration.
 
 use std::collections::VecDeque;
 use std::io;
@@ -176,7 +177,8 @@ fn endpoints() -> AppResult<Endpoints> {
     })
 }
 
-/// Reserve a no-debt recovery for runtime tests without permitting USB traffic.
+/// Reserve a `Recovery` with nothing owed, for runtime tests that send no USB
+/// traffic.
 pub(crate) fn runtime_recovery(parent: &Path) -> AppResult<Recovery> {
     let (recovery, _transcript) = reserve_at(
         &endpoints()?,
@@ -323,7 +325,7 @@ fn reservation_synchronizes_created_entries_before_the_parent() -> TestResult {
         },
     )?;
     assert_eq!(synchronized, [directory, temporary.path().to_path_buf()]);
-    // The injected directory boundary does not replace real file synchronization.
+    // Only the directory sync is stubbed; file synchronization is still real.
     transcript.synchronize()?;
     recovery.publish()?;
     Ok(())
@@ -967,7 +969,7 @@ fn failed_admission_is_retained(recovery: &Recovery) -> TestResult {
         .control_admission_errors
         .first()
         .ok_or("admission failure missing")?;
-    assert!(primary.message.contains("admission cancelled"));
+    assert!(primary.message.contains("was cancelled"));
     let retired = recovery
         .report
         .retirements

@@ -1,4 +1,5 @@
-//! Exact original Bluetooth channel reopening within the Terminal window.
+//! Reopen the same Bluetooth address on its original RFCOMM channel, inside
+//! the Terminal transition window.
 
 use std::fs::File;
 use std::path::Path;
@@ -137,7 +138,7 @@ impl<B: native::Backend> transition::Backend for Reopen<'_, B> {
             Ok(())
         } else {
             Err(Failure {
-                message: "Bluetooth retirement failed; independent close and capture evidence is retained in the startup report"
+                message: "closing the Bluetooth connection failed; its close and capture errors are in the startup report"
                     .to_owned(),
                 causes: [
                     retirement.close_error.as_ref(),

@@ -1,4 +1,5 @@
-//! Offline command grammar, backup admission, and exact scalar previews.
+//! Tests for the offline menu commands: argument grammar, which backups the
+//! loader accepts, and the exact bytes a preview produces.
 
 use std::fs::File;
 

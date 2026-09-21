@@ -1,4 +1,5 @@
-//! Parser and preflight checks never enumerate or open a radio connection.
+//! Tests for argument parsing and the pre-open checks; no enumeration and no
+//! connection.
 
 use super::*;
 use clap::Parser;

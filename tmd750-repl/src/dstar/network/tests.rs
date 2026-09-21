@@ -1,4 +1,6 @@
-//! Offline setup policy tests; no system DNS lookup, UDP socket, or radio is used.
+//! Reflector setup with a stub resolver: joining the resolver worker on
+//! cancellation and expiry, the absolute setup budget, and dropping handshake
+//! state that is never spawned.
 
 use std::sync::atomic::AtomicUsize;
 

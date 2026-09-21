@@ -1,4 +1,7 @@
-//! Bounded identity-only CAT reacquisition; never retries programming.
+//! Bounded identity-only CAT reacquisition after an acknowledged MCP exit.
+//!
+//! Attempts re-enumerate the selected endpoint, open it and read the ID/FV/TY
+//! tuple. Nothing here re-enters MCP, re-reads memory, or writes a setting.
 
 use super::{
     AtomicBool, Backend, CLOSE_TIMEOUT, ConnectionAttempt, Duration, Enumeration,
@@ -8,17 +11,22 @@ use super::{
     attempt_identity, await_endpoint, finalize_capture, milliseconds, wait_recorded,
 };
 
-/// Explicit per-write and per-reply deadline for the three identity queries.
+/// Deadline for each write and each reply of the three identity queries (1.5 s).
 pub(super) const EXCHANGE_TIMEOUT: Duration = Duration::from_millis(1_500);
+/// Window covering enumeration polling, opens, queries and closes (60 s),
+/// measured from the end of the settle wait.
 const READINESS_BUDGET: Duration = Duration::from_secs(60);
+/// Wait between one attempt's close and the next open (2 s).
 const RETRY_INTERVAL: Duration = Duration::from_secs(2);
+/// Opens permitted within one reacquisition.
 const MAXIMUM_OPEN_ATTEMPTS: usize = 4;
-// ID/FV/TY each have a write and reply deadline, followed by bounded close.
+/// Budget one attempt may still need: a write and a reply deadline for each of
+/// ID, FV and TY, followed by the bounded close.
 const ATTEMPT_ALLOWANCE: Duration = EXCHANGE_TIMEOUT
     .saturating_mul(6)
     .saturating_add(CLOSE_TIMEOUT);
 
-/// Classification of one completed fresh-handle check, not a recovery command.
+/// Whether this completed check permits one more open attempt.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum RetryAdmission {
@@ -28,7 +36,11 @@ enum RetryAdmission {
     Terminal,
 }
 
-/// Preserve every failed observation even if a later check succeeds.
+/// Record of one open attempt.
+///
+/// Holds its enumeration snapshots, the connection attempt, the outcome and
+/// the retry decision. Failed attempts stay in the report when a later attempt
+/// succeeds.
 #[derive(Debug, Serialize)]
 struct ReadinessAttempt {
     enumerations: Vec<Enumeration>,
@@ -37,10 +49,11 @@ struct ReadinessAttempt {
     retry_admission: RetryAdmission,
 }
 
-/// Evidence for explicitly admitted workflows' identity-only readiness policy.
+/// Serialized report of one bounded identity-only CAT reacquisition.
 ///
-/// Callers prove acknowledged exit and clean handle release before invoking
-/// this policy. It cannot repeat MCP entry, reads, exit, or settings writes.
+/// Holds the settle delay, budgets, retry interval and per-attempt allowance in
+/// milliseconds, the open-attempt cap, one record per attempt, the shared
+/// transcript summary and the final outcome.
 #[derive(Debug, Serialize)]
 pub(crate) struct ReadinessVerification {
     identity_assurance: &'static str,
@@ -52,14 +65,16 @@ pub(crate) struct ReadinessVerification {
     maximum_open_attempts: usize,
     elapsed_milliseconds: u64,
     attempts: Vec<ReadinessAttempt>,
-    /// Completeness of the one transcript spanning all readiness attempts.
+    /// Summary of the one transcript spanning all readiness attempts.
     pub(in crate::mcp) transcript: TranscriptSummary,
-    /// Final policy outcome; failed checks remain in `attempts` on success.
+    /// Final outcome; failed attempts remain in `attempts` on success.
     pub(in crate::mcp) outcome: VerificationOutcome,
 }
 
 impl ReadinessVerification {
-    /// Record ineligibility without opening or querying a fresh connection.
+    /// Report that reacquisition never started, naming `reason`.
+    ///
+    /// No connection is opened and no query is sent.
     pub(in crate::mcp) fn skipped(reason: SkipReason, transcript: TranscriptSummary) -> Self {
         Self {
             identity_assurance: "endpoint_and_cat_tuple_only",
@@ -76,15 +91,16 @@ impl ReadinessVerification {
         }
     }
 
-    /// A match counts only with complete, durably synchronized evidence.
+    /// True when the outcome is `Matched` and the transcript is complete.
     pub(crate) const fn succeeded(&self) -> bool {
         self.transcript.complete && matches!(self.outcome, VerificationOutcome::Matched)
     }
 
-    /// Every acquired owner closed successfully with complete capture evidence.
+    /// True when every connection that opened was also closed successfully.
     ///
-    /// Identity mismatch or query failure does not itself imply a lost owner.
-    /// Failed opening without an acquired owner requires no subsequent close.
+    /// Requires a complete transcript. An attempt whose open failed has no
+    /// close to make, and an identity mismatch or query failure does not by
+    /// itself leave a connection open.
     pub(crate) fn owners_released(&self) -> bool {
         self.transcript.complete
             && self.attempts.iter().all(|attempt| {
@@ -121,11 +137,14 @@ impl ReadinessVerification {
     }
 }
 
-/// Reserve complete identity exchanges and cleanup without cancelling either.
+/// True when `deadline - now` still covers `ATTEMPT_ALLOWANCE`.
+///
+/// Both arguments are elapsed times from the backend's clock origin.
 pub(super) fn can_dispatch(now: Duration, deadline: Duration) -> bool {
     deadline.saturating_sub(now) >= ATTEMPT_ALLOWANCE
 }
 
+/// Record a `Readiness` failure: too little budget remains for one attempt.
 pub(super) fn budget_exhausted(report: &mut PostExitVerification) {
     report.fail(
         VerificationStage::Readiness,
@@ -136,13 +155,17 @@ pub(super) fn budget_exhausted(report: &mut PostExitVerification) {
     );
 }
 
-/// Reacquire only after the caller has proved MCP exit, capture and handle release.
+/// Reacquire the CAT identity tuple on fresh connections within 60 s.
 ///
-/// Retry admission requires a typed timeout, one completed initial ID write,
-/// no input bytes, successful close/drop, and complete synchronized capture.
-/// Every new open requires fresh exact-endpoint enumeration. No MCP, Gateway,
-/// setter, baud change, packet exit, transport reopen or reset is dispatched.
-/// Cancellation finishes the bounded identity attempt and close before stopping.
+/// Call this only after an acknowledged MCP exit with the original connection
+/// closed and its transcript complete. Each attempt re-enumerates the exact
+/// endpoint, opens it once and reads ID/FV/TY with `EXCHANGE_TIMEOUT` per write
+/// and per reply. Another open follows only when the identity query timed out
+/// after the ID write with no bytes received, the close succeeded and the
+/// transcript synchronized; at most `MAXIMUM_OPEN_ATTEMPTS` opens run,
+/// `RETRY_INTERVAL` apart. No MCP entry, Gateway query, setter, baud change,
+/// packet exit, transport reopen or reset is sent. Cancellation finishes the
+/// current identity attempt and its close before stopping.
 pub(crate) async fn verify_readiness(
     backend: &mut impl Backend,
     endpoint: &SerialCandidate,
@@ -195,8 +218,8 @@ pub(crate) async fn verify_readiness(
                 budget_exhausted(&mut check);
             }
         }
-        // A retry is new protocol traffic, so its predecessor's evidence must
-        // already be durable. Synchronization failure never opens another port.
+        // Another open requires the previous attempt's transcript to be
+        // synchronized; a synchronization failure ends the loop.
         finalize_capture(&mut recorder, &mut check);
         retry &= check.transcript.complete;
         result.outcome = check.outcome.clone();

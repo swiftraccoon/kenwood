@@ -1,4 +1,6 @@
-//! Complete-session orchestration; no live future is dropped for cancellation.
+//! Session sequencing for the text round trips.
+//!
+//! Cancellation is checked between exchanges; no in-flight future is dropped.
 
 #[cfg(all(test, unix))]
 mod tests;
@@ -362,8 +364,8 @@ async fn run_session(
             .as_ref()
             .ok_or(SkipReason::OriginalTrialIncomplete)
     };
-    // Signal cancellation must not strand a possible rename; capture failures
-    // remain independently fatal in the required recorder and transport.
+    // A cancellation signal never skips the check after a possible rename; a
+    // capture failure still stops the recorder and the transport.
     result.post_exit = match eligibility {
         Ok(identity) => {
             reconnect::verify_required(

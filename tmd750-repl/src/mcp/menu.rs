@@ -1,4 +1,7 @@
-//! Generic keyboard menu inspection, preview, and guarded live dispatch.
+//! Menu-field discovery, decoding and preview, plus one guarded live write.
+//!
+//! `list`, `describe`, `show` and `preview` read the registry and captured
+//! backups only; `apply` opens the radio and writes one registered field.
 
 use std::path::{Path, PathBuf};
 
@@ -18,7 +21,7 @@ use super::snapshot::Snapshot;
 use super::{IdentityEvidence, write_report};
 use crate::{AppResult, CommandError, capture, output};
 
-/// Discover menu fields offline or explicitly select a guarded live update.
+/// Menu subcommand: offline inspection, or one guarded live write.
 #[derive(Debug, Parser)]
 pub(crate) struct MenuRequest {
     #[command(subcommand)]
@@ -39,7 +42,7 @@ enum MenuCommand {
     Show(Selection),
     /// Preview exact scalar changes locally; never apply them to a radio.
     Preview(PreviewRequest),
-    /// Apply an explicitly approved ordinary menu change with complete-page guards.
+    /// Write one registered field, comparing and reading back its whole page.
     Apply(ApplyRequest),
 }
 
@@ -67,18 +70,18 @@ struct PreviewRequest {
     output: Option<PathBuf>,
 }
 
-/// One CLI assignment adapted to the library's reusable batch plan.
+/// Arguments of `mcp menu apply`: one field assignment plus its capture path.
 #[derive(Debug, Args)]
 pub(super) struct ApplyRequest {
     #[command(flatten)]
     selection: Selection,
-    /// Approve leaving the requested setting in place without automatic rollback.
+    /// Required. The new value stays on the radio; nothing is rolled back.
     #[arg(long, required = true)]
     apply: bool,
     /// Exact scalar value, interpreted through the selected field's storage codec.
     #[arg(allow_hyphen_values = true)]
     value: String,
-    /// New private evidence directory; existing directories are never overwritten.
+    /// New private capture directory; existing directories are never overwritten.
     #[arg(long, value_name = "NEW_DIR")]
     output: Option<PathBuf>,
 }
@@ -122,7 +125,10 @@ impl ApplyRequest {
         )?)
     }
 
-    /// Bind a typed request to the strict source backup before capture or USB work.
+    /// Build the update plan from the source backup, before any capture or USB work.
+    ///
+    /// Returns an error when `--apply` is absent, the field or value is
+    /// unknown, or the backup was not produced over USB.
     pub(super) fn prepare(&self) -> AppResult<MenuUpdatePlan> {
         let assignment = self.assignment()?;
         let snapshot = Snapshot::load_for_usb_write(self.source_backup())?;
@@ -177,7 +183,10 @@ fn run(request: &MenuRequest) -> AppResult<()> {
     }
 }
 
-/// Structured output must not pass through prose wrapping or timestamp prefixes.
+/// Write one field's JSON description straight to `writer`.
+///
+/// The JSON bypasses the prose output layer, so it carries no wrapping or
+/// timestamp prefix.
 fn describe(field: &str, writer: &mut impl std::io::Write) -> AppResult<()> {
     Ok(write_report(writer, &Description::new(resolve(field)?))?)
 }
@@ -244,7 +253,7 @@ fn list(group: Option<&str>) -> AppResult<()> {
         ));
     }
     output::line(format_args!(
-        "Values are stored representations, not inferred display units. Policy is software admission, not hardware qualification; apply checks identity and complete state guards separately."
+        "Values are stored representations, not display units. The policy shown is what apply accepts; apply also checks the identity and the whole-page guards."
     ));
     Ok(())
 }
@@ -288,7 +297,7 @@ impl Description {
                 .collect(),
             allowed_values: field.allowed_values,
             write_policy: policy_label(field.write_policy()),
-            interpretation: "Raw storage, not inferred display units or hardware qualification. Supplemental ordinary-value domains also apply.",
+            interpretation: "Raw stored values, not display units. Supplemental ordinary-value domains also apply.",
         }
     }
 }
@@ -369,7 +378,7 @@ fn scope_label(slot: Option<SlotIndex>) -> String {
 
 fn print_source(snapshot: &Snapshot) {
     output::line(format_args!(
-        "Captured identity: {} firmware {}, type {}; format-zero software layout, not current radio state or hardware qualification.",
+        "Captured identity: {} firmware {}, type {}; decoded with the format-zero layout from this backup, not from the radio.",
         snapshot.identity.model, snapshot.identity.firmware, snapshot.identity.radio_type
     ));
 }
@@ -505,7 +514,7 @@ fn preview(request: &PreviewRequest) -> AppResult<()> {
         prepared.changed_bytes
     ));
     output::line(format_args!(
-        "Offline preview only. Backup unchanged; nothing applied to a radio. Field policy does not establish live guards or authorize apply."
+        "Offline preview only. Backup unchanged; nothing applied to a radio. Use mcp menu apply --apply to write this value."
     ));
     Ok(())
 }

@@ -1,4 +1,4 @@
-//! Captured native CAT and read-only MCP with same-endpoint recovery.
+//! Captured native CAT and read-only MCP, reconnecting on the same endpoint.
 
 use std::fs::File;
 use std::io::{self, Write};
@@ -28,7 +28,9 @@ mod backup;
 #[cfg(test)]
 mod tests;
 
-/// Host scheduling policy after the acknowledged exit, not a readiness claim.
+/// Silent hold on the original connection after the MCP exit is acknowledged,
+/// before that connection is closed and the same endpoint is reopened for
+/// fresh CAT. Host policy, not a firmware timing bound.
 const POST_EXIT_SETTLE: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -307,7 +309,8 @@ async fn run_workflow(
         }
         result.settle_transcript = Some(fresh.summary());
     }
-    // Even a cancelled or uncaptured wait must retire the original owner.
+    // The original connection is closed even after a cancelled or uncaptured
+    // settle wait.
     let (observed, identity) = pending.finish(cancelled).await;
     result.original = Some(observed);
     if let Some(identity) = identity
@@ -516,7 +519,10 @@ impl<'a> Report<'a> {
                 output::line(format_args!("Band B mode: {mode}."));
             }
             if let Some(gateway) = evidence.gateway {
-                output::line(format_args!("DV Gateway raw state: {gateway}."));
+                output::line(format_args!(
+                    "DV Gateway state: {}.",
+                    DvGatewayMode::from(gateway)
+                ));
             }
         }
     }
@@ -535,7 +541,12 @@ impl<'a> Report<'a> {
     }
 }
 
-/// Publish transport-specific native evidence without inventing USB readiness.
+/// Run `operation` against `endpoint` and write the capture directory.
+///
+/// `output_path` overrides the default capture directory; its parent must
+/// exist and the directory itself must not. Returns an error on a non-macOS
+/// host, and on open, protocol, capture, close or report-publication failure,
+/// each of which is also recorded separately in the report.
 pub(crate) async fn run(
     endpoint: &Endpoint,
     operation: &Operation,
@@ -573,8 +584,8 @@ pub(crate) async fn run(
         "Native Bluetooth capture: {}. At most two exact-address opening attempts per phase; no serial fallback, CAT retry or MCP retry.",
         directory.display()
     ));
-    // No owner exists yet. Once opening starts, output failure must not skip
-    // protocol retirement, capture synchronization, or report publication.
+    // Last point where no connection exists yet. After opening starts, an
+    // output failure must not skip the close, the capture sync or the report.
     output::check()?;
     let started_at_utc = OffsetDateTime::now_utc().format(&Rfc3339)?;
     let (workflow, signal_error) = crate::mcp::finish_on_interrupt(

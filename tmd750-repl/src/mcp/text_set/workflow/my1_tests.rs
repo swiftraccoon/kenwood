@@ -1,7 +1,8 @@
-//! Four simulated handles, one durable MY1 intent, and complete lifecycle evidence.
+//! Tests for the MY1 update across four mock connections: the journaled write
+//! intent precedes the W frame, and both sessions record their whole exchange.
 //!
-//! File reads establish recorded ordering, not independent proof of an fsync.
-//! Synchronization failures are exercised separately through scoped failure seams.
+//! Ordering assertions read the capture files; synchronization failures are
+//! exercised through the injected failure seams.
 
 use std::collections::VecDeque;
 use std::io;

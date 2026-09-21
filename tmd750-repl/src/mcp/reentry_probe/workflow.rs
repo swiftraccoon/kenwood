@@ -1,4 +1,7 @@
-//! Two fixed read sessions; a failed boundary never admits another session.
+//! Runs the two fixed read sessions in order.
+//!
+//! The second session starts only after the first one's exit, close and
+//! transcript synchronization all succeeded.
 
 use std::fs::File;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,7 +16,7 @@ use super::super::{Failure, ProbeEvidence, close_transport, verification_eligibi
 use crate::capture::{CaptureTransport, Event, Recorder, TranscriptSummary};
 use crate::output;
 
-/// The two exclusive transcripts reserved for one original/fresh-handle pair.
+/// The two transcripts reserved for one session: its MCP read and its CAT check.
 pub(super) struct Captures {
     pub(super) original: Recorder<File>,
     pub(super) post_exit: Recorder<File>,
@@ -106,7 +109,7 @@ impl Session {
     }
 }
 
-/// Append-only session evidence; synchronization precedes the next opening.
+/// Records appended to the session journal, each fsynced before the next open.
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(super) enum JournalEvent<'a> {
@@ -119,7 +122,10 @@ pub(super) enum JournalEvent<'a> {
     },
 }
 
-/// Historical observations, never a current-state or firmware-readiness claim.
+/// Serialized result of the two read-only sessions.
+///
+/// Holds one `Session` record per attempt in order, the journal summary and
+/// any synchronization failure.
 #[derive(Debug, Serialize)]
 pub(super) struct Workflow {
     sessions: Vec<Session>,

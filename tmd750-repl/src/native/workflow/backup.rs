@@ -1,4 +1,5 @@
-//! Guarded standard-page reads retaining the original native owner until close.
+//! Read the standard configuration pages, holding the original connection
+//! open until the read phase finishes.
 
 use std::fs::File;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,7 +10,9 @@ use kenwood_transport::Transport;
 use crate::capture::{CaptureTransport, Failure, TranscriptSummary};
 use crate::output;
 
-/// Read evidence and final cleanup remain independent after owner retirement.
+/// Result of a standard-page read: the backup report when the read ran, any
+/// close error, and the transcript summary. A close or capture failure never
+/// discards the pages already read.
 pub(super) struct Observation {
     pub(super) backup: Option<McpBackupReport>,
     pub(super) close_error: Option<Failure>,
@@ -36,21 +39,24 @@ fn completed(report: &McpBackupReport) -> bool {
     report.has_complete_configuration() && report.gateway_mode == Some(DvGatewayMode::Off)
 }
 
-/// A completed or interrupted read phase, with no exposed protocol access.
+/// A finished or interrupted read phase whose connection is not yet closed.
+///
+/// The transport is private, so no further protocol traffic can be sent.
 pub(super) struct PendingClose<T> {
     transport: CaptureTransport<T, File>,
     backup: Option<McpBackupReport>,
 }
 
 impl<T: Transport> PendingClose<T> {
-    /// A successful flush and exit permit a silent retained-owner wait only.
+    /// Whether the settle wait may run: the transcript flushed, no
+    /// cancellation, and a complete backup that reached the MCP exit.
     pub(super) fn ready_to_settle(&mut self, cancelled: &AtomicBool) -> bool {
         self.transport.synchronize().is_ok()
             && !cancelled.load(Ordering::Relaxed)
             && self.backup.as_ref().is_some_and(completed)
     }
 
-    /// Retire the original owner even after cancellation or failed framing.
+    /// Close the connection and return the observation, in every path.
     pub(super) async fn finish(self) -> Observation {
         let Self {
             mut transport,
@@ -58,7 +64,8 @@ impl<T: Transport> PendingClose<T> {
         } = self;
         let close_error = crate::native::close(&mut transport).await;
         let mut recorder = transport.into_recorder();
-        // Synchronization failure is sticky in the summary and never replaces cleanup.
+        // A synchronization failure stays in the summary; it never replaces
+        // the close result.
         let _synchronized = recorder.synchronize();
         Observation {
             backup,
@@ -68,7 +75,10 @@ impl<T: Transport> PendingClose<T> {
     }
 }
 
-/// Use the library's read-only standard engine with exact Gateway-Off admission.
+/// Read every standard configuration page, requiring Gateway Off.
+///
+/// The read is skipped, leaving `backup` as `None`, when the transcript cannot
+/// be flushed or `cancelled` is already set.
 pub(super) async fn read<T: Transport>(
     mut transport: CaptureTransport<T, File>,
     cancelled: &AtomicBool,

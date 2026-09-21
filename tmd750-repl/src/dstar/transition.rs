@@ -1,9 +1,9 @@
-//! Bounded MMDVM acquisition after one independently verified Terminal update.
+//! Bounded MMDVM acquisition after the Terminal update has been written.
 //!
 //! This module never enters MCP, issues CAT, changes modem configuration, or
-//! selects an endpoint. The backend retains the exact endpoint chosen by its
-//! caller. Complete version framing proves only the current connection's wire
-//! protocol, not the radio identity or persistent Gateway settings.
+//! selects an endpoint; the backend reopens the exact endpoint its caller
+//! chose. Complete version framing proves the current connection's wire
+//! protocol, not the radio identity or the persistent Gateway setting.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -19,45 +19,52 @@ use super::modem::ProvenModem;
 #[cfg(test)]
 mod tests;
 
-/// Host transition policy, not a demonstrated firmware readiness bound.
+/// Total window for acquiring MMDVM framing after the Terminal update. Host
+/// policy, not a measured firmware bound.
 const WINDOW: Duration = Duration::from_secs(90);
+/// Silent wait between successive reopen and probe attempts inside `WINDOW`.
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
+/// Budget for one `GET_VERSION` request and its complete reply.
 const VERSION_BUDGET: Duration = Duration::from_secs(2);
+/// Budget for the single close performed when retiring a connection.
 const CLOSE_BUDGET: Duration = Duration::from_secs(2);
 
 /// An opening implementation pinned to one previously selected endpoint.
 pub(crate) trait Backend {
     type Connection: Transport;
 
-    /// Reopen only the caller's exact endpoint within the remaining window.
+    /// Reopen the caller's exact endpoint before `deadline`.
     ///
-    /// Never abandon an in-flight native owner when cancellation or expiry
-    /// occurs. Join its completion and cleanup before returning. The transition
-    /// rejects and retires any successful owner returned after the deadline.
+    /// An in-flight native open is joined, with its cleanup, before returning,
+    /// including on cancellation or expiry. A connection returned after
+    /// `deadline` is rejected and closed by the transition.
     async fn reopen(
         &mut self,
         deadline: Instant,
         cancelled: &AtomicBool,
     ) -> Result<Self::Connection, ReopenFailure>;
 
-    /// Wait silently; cancellation must not perform endpoint operations.
+    /// Wait `duration` without sending anything on the endpoint.
     async fn wait(&mut self, duration: Duration, cancelled: &AtomicBool) -> Result<(), Failure>;
 
-    /// Release the owner and retain any backend-specific completion evidence.
+    /// Close and drop `owner`, returning any close or capture failure.
     ///
-    /// Capture backends must synchronize the final transcript and preserve
-    /// independent close and capture failures. Retirement is never cancelled;
-    /// either failure prevents another opening. Plain transports use a bounded
-    /// close followed by dropping the owner.
+    /// Capture backends synchronize the final transcript here and return close
+    /// and capture failures separately. This call is never cancelled, and any
+    /// failure prevents a further reopen. The default closes within
+    /// `CLOSE_BUDGET`, then drops the connection.
     async fn retire(&mut self, owner: Self::Connection) -> Result<(), Failure> {
         close(owner).await
     }
 }
 
-/// Readiness failures may be retried; failed admission or cleanup may not.
+/// A failed reopen attempt.
 #[derive(Debug)]
 pub(crate) struct ReopenFailure {
+    /// Why the reopen failed; per-attempt detail stays in the backend's report.
     pub(crate) error: Failure,
+    /// Whether another attempt may run inside the window. False after a capture
+    /// or cleanup failure, an interruption, or a non-retryable opening stage.
     pub(crate) retry_allowed: bool,
 }
 
@@ -70,7 +77,7 @@ pub(crate) enum Step {
     Reopen,
 }
 
-/// Independent observations from one probe or owner-opening step.
+/// What one probe or reopen step observed, recorded whether or not it failed.
 #[derive(Debug, Default, Serialize)]
 pub(crate) struct Attempt {
     pub(crate) number: usize,
@@ -92,7 +99,7 @@ impl Attempt {
     }
 }
 
-/// Preserve the only proved owner together with every unsuccessful attempt.
+/// The proved connection, if one was obtained, plus every attempt made.
 pub(crate) struct Outcome<T> {
     pub(super) proof: Option<ProvenModem<T>>,
     pub(crate) attempts: Vec<Attempt>,
@@ -111,15 +118,15 @@ impl<T> Default for Outcome<T> {
     }
 }
 
-/// Wait for complete MMDVM framing without repeating the Terminal update.
+/// Probe for complete MMDVM framing within `WINDOW`, reopening as needed.
 ///
-/// The caller supplies the original owner after the acknowledged exit and
-/// its two-second silent settle, or `None` if that owner was already closed.
-/// Negative probes retire their owner before reopening the pinned endpoint.
-/// Cancellation and window expiry always retire an owner still held here.
-/// The window bounds new acquisition work; joined opening cleanup and the
-/// independent two-second close budget can extend total completion time.
-/// Capture backends also complete and retain their final synchronization.
+/// `initial` is the connection retained after the acknowledged MCP exit and its
+/// two-second silent settle, or `None` when it was already closed. A failed
+/// probe closes its connection before the pinned endpoint is reopened, and any
+/// connection still held at cancellation or expiry is closed too. `WINDOW`
+/// bounds new acquisition work only: joined opening cleanup and the two-second
+/// close budget, plus a capture backend's final synchronization, can extend the
+/// total time before this returns.
 pub(crate) async fn run<B: Backend>(
     backend: &mut B,
     initial: Option<B::Connection>,
@@ -198,7 +205,7 @@ async fn run_with_window<B: Backend>(
                 outcome.attempts.push(attempt);
                 if retirement_failed {
                     outcome.error = Some(failure(
-                        "MMDVM transition stopped because the previous connection did not retire cleanly",
+                        "MMDVM transition stopped because the previous connection did not close cleanly",
                     ));
                     break;
                 }

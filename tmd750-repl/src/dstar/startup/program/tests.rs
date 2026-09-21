@@ -1,4 +1,4 @@
-//! Exact single-entry wire schedules and independent recovery evidence.
+//! Exact MCP wire schedules for one entry, and the journal records written.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

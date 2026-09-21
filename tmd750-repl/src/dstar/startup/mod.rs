@@ -1,4 +1,4 @@
-//! Automatic Bluetooth Terminal ownership and guarded independent USB recovery.
+//! Automatic Bluetooth Terminal startup, with restoration over USB.
 
 mod control;
 
@@ -66,15 +66,19 @@ struct Report {
     readiness: Vec<reconnect::ReadinessVerification>,
     restore_errors: Vec<Failure>,
     runtime_capture_error: Option<Failure>,
-    /// Application command owners retired with complete capture evidence.
-    /// This does not assert OS-level Bluetooth cancellation or remote link closure.
+    /// Whether every command connection was closed with a complete transcript.
+    /// `None` until the startup workflow finishes. Covers host handles only;
+    /// the RFCOMM link state is not observed.
     owner_released: Option<bool>,
     entry_plan_retained: bool,
     entry_exit_acknowledged: bool,
     errors: Vec<Failure>,
 }
 
-/// Recovery images outlive the modem, including failed runtime initialization.
+/// The captured page images and open capture files used to restore the radio.
+///
+/// It outlives the modem session, so restoration is still possible after a
+/// failed runtime initialization.
 pub(super) struct Recovery {
     directory: PathBuf,
     report_file: File,
@@ -140,7 +144,9 @@ impl Recovery {
         self.report.errors.push(Failure::from_error(error));
     }
 
-    /// Preserve admission cleanup independently without replacing the typed error.
+    /// Record the cause and the close result of a failed control open.
+    ///
+    /// The original error is returned unchanged.
     fn retain_control_result<T>(&mut self, outcome: AppResult<T>) -> AppResult<T> {
         if let Err(error) = &outcome
             && let Some(admission) = error.downcast_ref::<control::OpenFailure>()
@@ -153,7 +159,7 @@ impl Recovery {
         outcome
     }
 
-    /// Retain runtime initialization, link, or shutdown failure before recovery.
+    /// Add a runtime initialization, link, or shutdown failure to the report.
     pub(super) fn record_runtime_failure(&mut self, message: &str) {
         self.report.errors.push(Failure {
             message: message.to_owned(),
@@ -208,8 +214,12 @@ impl Recovery {
                 })
     }
 
-    /// Only a released modem owner admits independent USB restoration. An
-    /// uncertain write or lost owner leaves durable debt, never blind rollback.
+    /// Restore the pre-startup Terminal settings over USB and write the report.
+    ///
+    /// `owner_released` must be true only when the modem connection was closed
+    /// and dropped. When it is false, or when a page write's outcome is
+    /// unknown, restoration is skipped and the report records it as still
+    /// owed; no page is rewritten without comparing it again first.
     pub(super) async fn finish(mut self, owner_released: bool) -> Result<(), String> {
         let mut backend = reconnect::SystemBackend::new();
         Box::pin(self.finish_and_publish(&mut backend, owner_released)).await
@@ -261,7 +271,7 @@ impl Recovery {
             if self.report.restoration == RestorationState::Owed {
                 self.report.restoration = RestorationState::Blocked;
             }
-            return Err(CommandError("connection release or capture completion was not proved; no restoration traffic was sent".to_owned()).into());
+            return Err(CommandError("the modem connection was not confirmed closed with a complete transcript; no restoration traffic was sent".to_owned()).into());
         }
         if let Some(capture) = self.runtime_capture.take()
             && let Err(error) = capture.sync_all()
@@ -277,7 +287,7 @@ impl Recovery {
         }
         if self.plan.is_none() {
             self.report.restoration = RestorationState::Blocked;
-            return Err(CommandError("Terminal restoration remains owed: the completed update or modem release was not proved; no speculative MCP write was attempted".to_owned()).into());
+            return Err(CommandError("Terminal restoration is still owed: the entry write or the modem close was not confirmed, so no MCP write was attempted".to_owned()).into());
         }
         let plan = self
             .plan
@@ -415,7 +425,7 @@ fn reserve(
     reserve_at(endpoints, cancelled, None, synchronize_directory)
 }
 
-/// Synchronize an actual directory entry, never a synthetic success fallback.
+/// Open the directory and `sync_all` it, so its new entries are durable.
 #[cfg(unix)]
 fn synchronize_directory(directory: &Path) -> io::Result<()> {
     File::open(directory)?.sync_all()
@@ -429,7 +439,7 @@ fn synchronize_directory(_directory: &Path) -> io::Result<()> {
     ))
 }
 
-/// Persist child entries before their containing directory's parent entry.
+/// Synchronize `directory`, then its parent, in that order.
 fn synchronize_directories(
     directory: &Path,
     mut synchronize: impl FnMut(&Path) -> io::Result<()>,
@@ -443,10 +453,11 @@ fn synchronize_directories(
     )
 }
 
-/// Reserve real capture files with an explicit directory-durability boundary.
+/// Create the capture directory, report file, journal and recorders.
 ///
-/// Production supplies the platform provider. Offline workflow fixtures may
-/// supply synthetic directory synchronization without replacing file I/O.
+/// `synchronize` makes the new directory entries durable: production passes
+/// `synchronize_directory`, and offline fixtures pass a stub that skips only
+/// that step, leaving file I/O real.
 fn reserve_at(
     endpoints: &Endpoints,
     cancelled: Arc<AtomicBool>,
@@ -507,7 +518,11 @@ fn reserve_at(
     Ok((recovery, transcript))
 }
 
-/// Prepare using the cancellation state owned by the complete startup workflow.
+/// Open both endpoints, write the Terminal pages, and acquire MMDVM framing.
+///
+/// Returns the proved modem connection and the `Recovery` that restores the
+/// original settings. `cancelled` is shared with the caller and is checked
+/// before each new stage.
 pub(super) async fn prepare(
     bluetooth: native::discovery::Request,
     control_port: Option<&str>,
@@ -516,11 +531,11 @@ pub(super) async fn prepare(
     Box::pin(prepare_system(bluetooth, control_port, cancelled)).await
 }
 
-/// Keep the complete startup owner through a signal or listener failure.
+/// Await `operation` to completion, setting `cancelled` when `signal` fires.
 ///
-/// The workflow must check cancellation before each new stage and retire any
-/// late successful owner itself. Its output is returned intact, never dropped
-/// as a side effect of signal handling. Listener failure remains independent.
+/// `operation` is never dropped, so it closes any connection it opened; its
+/// output is returned unchanged. A signal-listener error is returned beside
+/// that output rather than replacing it.
 pub(super) async fn finish_on_interrupt<F, S>(
     operation: F,
     signal: S,
@@ -535,7 +550,7 @@ where
         biased;
         signal = signal => {
             cancelled.store(true, Ordering::Relaxed);
-            output::line(format_args!("Stopping startup; finishing the current exchange and releasing its owner."));
+            output::line(format_args!("Stopping startup; finishing the current exchange, then closing the connection."));
             (operation.await, Some(signal))
         }
         result = &mut operation => (result, None),
@@ -584,7 +599,8 @@ async fn finish_preparation<T: Transport>(
                 .retirements
                 .push(control::retire(proof.into_transport()).await);
             Err(CommandError(
-                "D-STAR preparation cancelled after modem proof; the owner was retired".to_owned(),
+                "D-STAR preparation cancelled after the modem answered; its connection was closed"
+                    .to_owned(),
             )
             .into())
         }
@@ -696,7 +712,7 @@ async fn observe_control(
     recovery.report.control.push(observation);
     let (identity, gateway) = state.ok_or_else(|| {
         CommandError(
-            "independent USB CAT recovery path did not verify; no Terminal change attempted"
+            "the USB CAT endpoint did not answer identity and Gateway queries; no Terminal change was attempted"
                 .to_owned(),
         )
     })?;
@@ -734,7 +750,7 @@ async fn prove_transition<B: native::Backend>(
     }
     recovery.report.transition_cleanup = outcome.cleanup_error;
     let Some(proof) = outcome.proof else {
-        return Err(CommandError("Bluetooth did not prove MMDVM before startup stopped; see retained transition evidence".to_owned()).into());
+        return Err(CommandError("Bluetooth did not answer a complete MMDVM version exchange before startup stopped; every attempt is in the startup report".to_owned()).into());
     };
     recovery.report.modem_proved = true;
     let synchronized = proof
@@ -771,8 +787,8 @@ async fn enter_from_active(
     recovery: &mut Recovery,
     cancelled: &AtomicBool,
 ) -> AppResult<TerminalPlan> {
-    // An active Bluetooth route may carry MMDVM already. Use the independently
-    // observed USB CAT path for configuration; never inject CAT into that link.
+    // An active Bluetooth route may already carry MMDVM, so the Terminal pages
+    // are written over the separate USB endpoint; no CAT goes to that link.
     let capture = recovery.recorder("active-terminal-control.jsonl")?;
     let opened = control::open(usb, &endpoints.control, capture, cancelled).await;
     let mut control = recovery.retain_control_result(opened)?;

@@ -1,4 +1,6 @@
-//! Session commands and retirement use fake input and transport only.
+//! Session behavior over fake input and a mock transport: prompt, batch and
+//! one-shot command sources, the Gateway guard before each mode write, and the
+//! close performed on every termination.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;

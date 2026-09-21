@@ -1,4 +1,5 @@
-//! Whole MY1 workflow, including durable pre-dispatch scope and fresh guards.
+//! Tests for the whole MY1 workflow: the journal record written before the W
+//! frame, and the page guards re-read on each fresh connection.
 
 use super::*;
 use crate::capture::{Artifacts, CaptureKind};

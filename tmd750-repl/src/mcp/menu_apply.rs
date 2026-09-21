@@ -1,8 +1,8 @@
-//! Ordinary menu updates using the library's immutable complete-page plan.
+//! Menu updates over one MCP connection followed by one CAT connection.
 //!
-//! One MCP handle performs comparison, writes, immediate readback, and detached
-//! exit. A second handle verifies CAT identity and Gateway Off. This is not
-//! persistence verification across another MCP session or a power cycle.
+//! The first connection compares the whole page, writes it, reads it back and
+//! exits MCP; the second reads the identity tuple and Gateway Off. Persistence
+//! across a later MCP session or a power cycle is not checked.
 
 use std::fs::File;
 use std::io;
@@ -49,13 +49,20 @@ impl From<Page> for PageEvidence {
     }
 }
 
-/// Possible pages include verified writes; a failure never implies rollback.
+/// Serialized outcome of one apply session.
+///
+/// Holds the identity tuple, the observed Gateway mode, the MCP exit
+/// disposition, the pages compared before the write, the pages that may have
+/// been written and the pages whose readback matched. A page stays in
+/// `possible_pages` whether or not its readback matched, and nothing is rolled
+/// back.
 #[derive(Debug, Serialize)]
 struct WorkflowResult {
     identity: Option<IdentityEvidence>,
     gateway_mode: Option<u8>,
     exit: ExitDisposition,
-    /// Whole-batch success only; partial comparison evidence stays in the transcript.
+    /// Pages compared before the write, filled only when the whole batch
+    /// succeeded; partial comparisons stay in the transcript.
     compared_pages: Vec<PageEvidence>,
     possible_pages: Vec<PageEvidence>,
     verified_pages: Vec<PageEvidence>,
@@ -206,7 +213,9 @@ fn prepare_journal(journal: &mut Recorder<File>, plan: &MenuUpdatePlan) -> io::R
     )
 }
 
-/// Synchronization failures through a cloned descriptor must remain sticky too.
+/// Second descriptor on the transcript file, fsynced before a write intent.
+///
+/// The first failure is retained and returned by every later call.
 struct RawSynchronization {
     file: File,
     error: Option<Failure>,
@@ -262,7 +271,11 @@ fn check_cancellation(cancelled: &AtomicBool) -> io::Result<()> {
     }
 }
 
-/// Cancellation cannot drop an exchange or interrupt an already approved batch.
+/// Run the identity, Gateway and MCP write sequence on one open connection.
+///
+/// Cancellation is checked between exchanges only: an in-flight exchange is
+/// always awaited, and a batch whose first write intent is journaled runs to
+/// its MCP exit.
 async fn operate(
     radio: &mut Radio<impl Transport>,
     plan: &MenuUpdatePlan,
@@ -345,7 +358,7 @@ async fn operate(
     Ok(())
 }
 
-/// Own, release, and drop the original handle before returning its recorder.
+/// Open the endpoint, run the update, close the connection, and return its recorder.
 async fn original(
     backend: &mut impl Backend,
     endpoint: &SerialCandidate,
@@ -461,8 +474,8 @@ async fn run_workflow(
         }
         PostExitVerification::skipped(reason, post_exit.summary())
     } else {
-        // An accepted write owes verification even when the user pressed Ctrl-C.
-        // Required capture failures still independently prohibit protocol I/O.
+        // Once a page may have been written, the post-exit check runs even after
+        // Ctrl-C; a capture failure still stops all protocol I/O.
         let finish_required = AtomicBool::new(false);
         let cancellation = if result.possible_pages.is_empty() {
             cancelled
@@ -501,7 +514,11 @@ struct Report {
     signal_error: Option<Failure>,
 }
 
-/// Reserve private durable evidence before obtaining any radio handle.
+/// Reserve the capture files and journal, then run the update and its CAT check.
+///
+/// Returns `CommandError` on a non-Unix host, or when the endpoint is not the
+/// pinned main-unit USB endpoint at 9600 baud. Nothing is opened until every
+/// capture file and the journal exist and their directories are synchronized.
 pub(super) async fn run(
     endpoint: &SerialCandidate,
     baud: u32,
@@ -543,11 +560,11 @@ pub(super) async fn run(
         transcript,
     } = artifacts;
     output::line(format_args!(
-        "Menu update evidence: {}. The requested setting remains in place; no automatic rollback.",
+        "Menu update capture: {}. The requested setting remains in place; no automatic rollback.",
         directory.display()
     ));
     output::line(format_args!(
-        "Ctrl-C cancels before write intent. Afterward the approved batch and safe verification finish unless a protocol or evidence failure prevents them."
+        "Ctrl-C cancels before the write is journaled. After that the batch and its verification finish unless a protocol or capture failure stops them."
     ));
     let started_at_utc = OffsetDateTime::now_utc().format(&Rfc3339)?;
     let (workflow, signal_error) = finish_on_interrupt(
@@ -594,7 +611,7 @@ pub(super) async fn run(
     ));
     if succeeded {
         output::line(format_args!(
-            "Fresh CAT identity and Gateway Off verified. Persistence across MCP re-entry or power cycling was not tested. Refresh the backup before another edit."
+            "Fresh CAT identity and Gateway Off verified. Refresh the backup before another edit."
         ));
         Ok(())
     } else {

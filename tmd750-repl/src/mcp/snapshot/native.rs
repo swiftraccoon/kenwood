@@ -1,4 +1,7 @@
-//! Native standard-backup admission without fabricated USB readiness evidence.
+//! Decodes format-3 native Bluetooth backup reports.
+//!
+//! Native reports carry no USB re-enumeration fields, and none are synthesized
+//! here; `Snapshot::load_for_usb_write` rejects these backups.
 
 use std::path::PathBuf;
 
@@ -36,7 +39,7 @@ struct Transcript {
     file: String,
     complete: bool,
     events: u64,
-    // Explicit null is mandatory. Missing error evidence cannot mean success.
+    // An explicit JSON null is mandatory; a missing field is rejected.
     #[serde(rename = "error")]
     _error: (),
 }
@@ -177,7 +180,7 @@ impl CatObservation {
             || self.cancelled
         {
             return invalid(
-                "native backup is incomplete: fresh CAT identity and Gateway Off evidence must be complete, matching, and uncancelled",
+                "native backup is incomplete: the fresh CAT identity and Gateway Off reads must be complete, matching, and uncancelled",
             );
         }
         Ok(())
@@ -198,7 +201,9 @@ struct Workflow {
     settle_transcript: Transcript,
 }
 
-/// The complete format-3 native backup report, not a native fixed-read report.
+/// A complete format-3 native backup report.
+///
+/// A native fixed-read report has a different shape and fails to decode here.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Document {
@@ -282,7 +287,7 @@ impl Document {
             || workflow.settle_transcript.events >= workflow.fresh_opening.transcript.events
         {
             return invalid(
-                "native backup requires complete opening histories, exit, closes, captures, and matching exact-address CAT/Gateway Off evidence",
+                "native backup requires complete opening histories, exit, closes, captures, and matching exact-address CAT identity and Gateway Off reads",
             );
         }
         original.backup.validate_pages()?;

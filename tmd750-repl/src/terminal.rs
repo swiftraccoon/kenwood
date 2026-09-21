@@ -38,7 +38,10 @@ impl UsbConnection {
     }
 }
 
-/// Inspect enumeration metadata only; never opens or probes a serial port.
+/// Identify the USB connector behind `path` from enumeration metadata.
+///
+/// Returns `UsbConnection::Unknown` when enumeration fails or reports no
+/// matching path. No serial port is opened or probed.
 pub(super) fn connection_for_path(path: &str) -> UsbConnection {
     match discover_serial() {
         Ok(candidates) => candidates
@@ -52,14 +55,13 @@ pub(super) fn connection_for_path(path: &str) -> UsbConnection {
     }
 }
 
-/// Return the complete setup sequence without changing a radio setting.
+/// Return the manual Terminal Mode setup sequence for this USB connection.
 pub(super) fn instructions(connection: UsbConnection) -> String {
     format!(
-        "Automatic Terminal Mode entry is disabled.\n\
-         The current MCP schema label is {MCP_D750_SCHEMA_FIRMWARE}.\n\
-         That label is not a vendor firmware-version limit.\n\
-         Terminal mode and routing writes remain unqualified.\n\
-         Bounded PM1/MY1 storage trials do not qualify automatic setup.\n\
+        "Automatic Terminal Mode entry is disabled: this build writes no\n\
+         Terminal or routing setting.\n\
+         The current MCP schema label is {MCP_D750_SCHEMA_FIRMWARE}, the label\n\
+         the registry was extracted against, not a vendor version limit.\n\
          Configure the radio manually, in this order:\n\
          Menu 980: COM+AF In/Out.\n\
          {}\n\
@@ -70,16 +72,15 @@ pub(super) fn instructions(connection: UsbConnection) -> String {
          Menu 650: Terminal Mode last. Wait for the TERM indicator.\n\
          The assigned gateway interface does not accept CAT while active.\n\
          Then rerun the same dstar start command.\n\
-         A complete MMDVM GET_VERSION reply is required before gateway setup.\n\
-         MMDVM framing alone does not prove Reflector Terminal Mode.",
+         A complete MMDVM GET_VERSION reply is required before gateway setup.",
         connection.routing()
     )
 }
 
-/// Explain a CAT startup result without assuming its endpoint carries the modem.
+/// Build startup guidance for the Gateway state observed over CAT.
 ///
-/// `None` means the Gateway query failed. A successful CAT connection does not
-/// identify the Gateway route or prove MMDVM framing on any other endpoint.
+/// `gateway` is `None` when the GW query failed. The text describes only the
+/// endpoint that answered CAT; no other endpoint is opened or probed.
 pub(super) fn cat_startup_guidance(
     connection: UsbConnection,
     gateway: Option<DvGatewayMode>,
@@ -88,20 +89,15 @@ pub(super) fn cat_startup_guidance(
         Some(DvGatewayMode::Off) => instructions(connection),
         Some(DvGatewayMode::Terminal) => concat!(
             "Terminal Mode is already selected (GW 2).\n",
-            "This endpoint answered CAT; MMDVM is not proved on this connection.\n",
-            "The DV Gateway may be routed to another endpoint.\n",
-            "GW does not identify its route or pair USB endpoints to one radio.\n",
-            "If another endpoint carries the gateway, select it with --port.\n",
-            "No other endpoint was opened or probed.\n",
-            "No automatic setup was attempted."
+            "This endpoint answered CAT, so it is not the active gateway.\n",
+            "If another endpoint carries the DV Gateway, select it with --port.\n",
+            "No other endpoint was opened and no setting was changed."
         )
         .to_owned(),
         Some(DvGatewayMode::Unqualified(_)) | None => concat!(
-            "Gateway state is not confirmed as Off or Terminal.\n",
-            "This endpoint answered CAT; MMDVM is not proved on this connection.\n",
-            "No setup sequence or routing change follows from this response.\n",
-            "No other endpoint was opened or probed.\n",
-            "No automatic setup was attempted."
+            "The GW query failed or returned an unrecognized value.\n",
+            "Check the DV Gateway setting on the radio, then rerun this command.\n",
+            "No other endpoint was opened and no setting was changed."
         )
         .to_owned(),
     }
@@ -150,16 +146,12 @@ mod tests {
     fn gateway_guidance_distinguishes_schema_label_from_vendor_limit_and_cat_recovery() {
         let guidance = instructions(UsbConnection::MainUnit);
         assert!(
-            guidance.contains("not a vendor firmware-version limit"),
+            guidance.contains("not a vendor version limit"),
             "declared schema provenance must not become a vendor restriction"
         );
         assert!(
-            guidance.contains("Terminal mode and routing writes remain unqualified."),
-            "the missing qualification concerns Terminal setup, not all storage writes"
-        );
-        assert!(
-            guidance.contains("Bounded PM1/MY1 storage trials do not qualify automatic setup."),
-            "successful storage trials must not imply automatic Terminal support"
+            guidance.contains("this build writes no"),
+            "operators must be told that no Terminal or routing setting is written"
         );
         assert!(
             guidance.contains("does not accept CAT while active"),

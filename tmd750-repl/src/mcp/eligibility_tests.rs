@@ -1,4 +1,5 @@
-//! Pure qualification prerequisites and independent artifact success checks.
+//! Tests for `verification_eligibility` and `ArtifactReport::succeeded`: which
+//! probe, close and transcript states let a post-exit verification start.
 
 use super::*;
 use kenwood_tmd750::{Address, FirmwareIdentity, McpProbeSegment, Page, RadioModel, RadioType};

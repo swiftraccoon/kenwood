@@ -1,4 +1,5 @@
-//! Fixed MY1 approval, capture coverage, and immutable recovery-scope contracts.
+//! Tests for the MY1 round trip: required flags, reserved capture files, and
+//! the journal scope that stays fixed once prepared.
 
 use super::*;
 #[cfg(unix)]
@@ -149,8 +150,8 @@ fn my1_endpoint_baud_and_constructed_approval_fail_before_backup_access() {
     assert!(
         request
             .prepare(&endpoint(), DEFAULT_BAUD)
-            .is_err_and(|error| error.to_string().contains("approval")),
-        "constructed requests cannot bypass approval"
+            .is_err_and(|error| error.to_string().contains("--approve-live-test")),
+        "constructed requests cannot bypass --approve-live-test"
     );
     request.approve_live_test = true;
     for candidate in [

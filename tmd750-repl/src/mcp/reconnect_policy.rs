@@ -1,15 +1,14 @@
-//! Pure endpoint selection for an explicitly requested reconnect qualification.
+//! Endpoint selection for a post-exit reconnect, from enumeration alone.
 //!
-//! Matching a path and USB IDs permits a read-only qualification attempt; it
-//! does not prove that the same physical radio owns the endpoint. The caller
-//! retains the original and current enumeration snapshots for its report.
+//! Nothing here opens a port or mutates a snapshot. A matching path and USB
+//! VID/PID identify the serial service, not the physical radio behind it.
 
 use std::collections::BTreeMap;
 
 use kenwood_tmd750::transport::SerialCandidate;
 use thiserror::Error;
 
-/// Whether the explicitly selected endpoint may be qualified on a fresh handle.
+/// Whether the pinned endpoint may be reopened from this enumeration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ReconnectDecision {
     /// The exact original path and USB IDs are present without ambiguity.
@@ -54,12 +53,12 @@ pub(super) enum ReconnectRejection {
     },
 }
 
-/// Classify one fresh enumeration without opening ports or changing snapshots.
+/// Classify one fresh enumeration against the pinned endpoint.
 ///
-/// Only temporary absence permits polling. Changed USB metadata, conflicting
-/// aliases, extra same-role services, and replacement paths fail closed. An
-/// existing macOS dial-in/callout pair counts as one service, but neither alias
-/// may replace the exact path selected by the operator.
+/// Only temporary absence returns `AwaitingEndpoint`, so only it permits
+/// further polling. Changed USB metadata, conflicting aliases, extra same-role
+/// services and replacement paths are rejected. A macOS dial-in/callout pair
+/// counts as one service, but neither alias may stand in for the pinned path.
 ///
 /// Conflict checks cover the selected service and services carrying its USB
 /// IDs. Inconsistent metadata on unrelated serial services is out of scope.
@@ -119,7 +118,10 @@ enum ServiceName<'a> {
     Other(&'a str),
 }
 
-/// Retain the first metadata even when later duplicate observations agree.
+/// One serial service as first observed in an enumeration.
+///
+/// Later duplicate observations never replace `first`; a disagreeing one is
+/// recorded in `conflicting_path`.
 struct ObservedService<'a> {
     first: &'a SerialCandidate,
     conflicting_path: Option<&'a str>,

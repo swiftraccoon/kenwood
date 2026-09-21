@@ -1,4 +1,7 @@
-//! Complete historical byte comparison with finite, explicitly qualified labels.
+//! Compares two captured backups byte by byte and labels the changes.
+//!
+//! Labels come from a fixed catalog of field locations; an address outside it
+//! stays in the report as an unclassified change.
 
 mod catalog;
 
@@ -18,7 +21,7 @@ use super::super::{IdentityEvidence, write_report};
 use super::{Snapshot, UsbInterface, assess_snapshot, parse_slot};
 use crate::{AppResult, CommandError, capture, output};
 
-/// Compare complete configuration captures without selecting or opening a radio.
+/// Arguments of `mcp terminal compare`: the two backups and the report path.
 #[derive(Debug, Args)]
 pub(super) struct CompareRequest {
     /// Complete successful configuration backup to treat as the earlier state.
@@ -33,11 +36,11 @@ pub(super) struct CompareRequest {
     #[arg(long, value_parser = parse_slot, value_name = "0..5")]
     slot: SlotIndex,
 
-    /// Intended USB route for assessment only, not endpoint selection.
+    /// USB interface the preflights are read for; no endpoint is opened.
     #[arg(long, value_enum)]
     interface: UsbInterface,
 
-    /// Explicitly annotate unqualified firmware layouts; required for 1.02.
+    /// Decode firmware outside the registry label. Required for firmware 1.02.
     #[arg(long)]
     interpret_unqualified: bool,
 
@@ -155,7 +158,8 @@ fn snapshot_evidence(
     }
 }
 
-/// Reject bad sources without displaying strings taken from their contents.
+/// Load one side of the comparison, reporting failures without echoing the
+/// file's contents.
 fn load_snapshot(path: &Path, side: &str) -> AppResult<Snapshot> {
     Snapshot::load(path).map_err(|error| {
         let detail = match (
@@ -245,10 +249,10 @@ fn build_report(request: &CompareRequest) -> AppResult<ComparisonReport> {
         radio_accessed: false,
         radio_applied: false,
         limitations: [
-            "Historical reports only; before/after order is caller supplied, not proof of chronology.",
-            "Matching public identities do not prove physical-unit continuity or report authenticity.",
-            "Structural report validation does not independently authenticate raw transcripts.",
-            "Catalog labels and successful decoding do not qualify live settings, PM isolation, activation, or restoration.",
+            "Historical reports only; the before/after order is the one given on the command line.",
+            "A matching identity tuple names the model and firmware, not the physical unit.",
+            "Report structure is validated; the transcript files the reports name are not read.",
+            "Catalog labels come from the generated registry layout, and values are decoded from the backups rather than read from a radio.",
         ],
     })
 }
@@ -256,14 +260,14 @@ fn build_report(request: &CompareRequest) -> AppResult<ComparisonReport> {
 fn describe(report: &ComparisonReport) -> Vec<String> {
     let mut lines = vec![
         "Offline configuration comparison. Historical reports only; no radio access or settings changes.".to_owned(),
-        format!("Layout interpretation: {}. This does not qualify live settings.", report.qualification),
+        format!("Layout interpretation: {}.", report.qualification),
         format!("Compared {} pages / {} captured bytes across every PM slot; {} bytes differ in {} pages.", report.compared_pages, report.compared_bytes, report.changed_bytes, report.pages.len()),
         format!("{} changed bytes are outside the finite Terminal catalog; they remain in the exact comparison.", report.outside_terminal_catalog_bytes),
     ];
     for (label, snapshot) in [("Before", &report.before), ("After", &report.after)] {
         let status = match &snapshot.assessment {
             AssessmentEvidence::Decoded { findings, .. } => {
-                format!("decoded with {} findings; not a live-readiness result", findings.len())
+                format!("decoded with {} findings", findings.len())
             }
             AssessmentEvidence::Failed { .. } => {
                 "interpretation failed; raw differences retained, details require private JSON output".to_owned()

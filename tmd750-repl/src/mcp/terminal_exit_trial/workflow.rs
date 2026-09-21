@@ -1,4 +1,7 @@
-//! Fixed two-session workflow with required captures and fresh Gateway evidence.
+//! Runs the write session and the confirmation session in order.
+//!
+//! Each session records its whole exchange and ends with a fresh CAT check for
+//! the identity tuple and Gateway Off.
 
 use std::fs::File;
 use std::num::NonZeroU64;
@@ -154,7 +157,8 @@ impl From<&TerminalExitTrialSessionReport> for CoreEvidence {
 }
 
 impl CoreEvidence {
-    /// The Apply driver's second complete target read follows its sole W/ACK.
+    /// True when the Apply session's second read of the target page, taken after
+    /// its acknowledged write, matched the exact Off page.
     fn immediate_off_readback(&self, trial: &TerminalExitTrial) -> bool {
         self.session_id == Some(NonZeroU64::MIN)
             && matches!(self.write, WriteDisposition::Acknowledged)
@@ -181,7 +185,8 @@ struct SessionEvidence {
 }
 
 impl SessionEvidence {
-    /// Retain the first durability failure and the current capture summary.
+    /// Synchronize the transcript and store its summary, keeping the first
+    /// synchronization failure.
     fn synchronize_original(&mut self, original: &mut Recorder<File>) {
         if let Err(error) = original.synchronize()
             && self.synchronization_error.is_none()
@@ -191,14 +196,17 @@ impl SessionEvidence {
         self.transcript = original.summary();
     }
 
-    /// Release even an unproven handle before retaining its final transcript.
+    /// Close the connection, then synchronize and summarize its transcript.
     async fn close_original(&mut self, mut transport: CaptureTransport<impl Transport, File>) {
         self.close_error = close_transport(&mut transport).await;
         let mut original = transport.into_recorder();
         self.synchronize_original(&mut original);
     }
 
-    /// Admit CAT only after durable opening evidence; otherwise only retire.
+    /// Wrap the open connection for CAT use, or close it and return `None`.
+    ///
+    /// `None` means the opening record failed to synchronize; no protocol
+    /// command is sent on that path.
     async fn admit_original<T: Transport>(
         &mut self,
         connection: T,
@@ -240,7 +248,7 @@ impl WorkflowResult {
             && self.finalization_error.is_none()
     }
 
-    /// Explain retained observations without upgrading the trial's final status.
+    /// Print what each session recorded; the trial status is printed separately.
     pub(super) fn print_observations(&self, trial: &TerminalExitTrial) {
         for line in self.observation_lines(trial) {
             output::line(format_args!("{line}"));
@@ -249,7 +257,7 @@ impl WorkflowResult {
 
     fn observation_lines(&self, trial: &TerminalExitTrial) -> Vec<String> {
         let mut lines = vec![
-            "Recorded session observations are historical, not a current-state check or proof that the whole trial completed.".to_owned(),
+            "The lines below report what each session recorded; they are historical, not a current-state check.".to_owned(),
         ];
         for (index, session) in self.sessions.iter().enumerate() {
             let number = index + 1;
@@ -336,7 +344,7 @@ pub(super) async fn run(
         let finalization = durable.and_then(|()| {
             if !session.succeeded() {
                 return Err(std::io::Error::other(
-                    "Terminal exit session evidence is incomplete",
+                    "Terminal exit session record is incomplete",
                 ));
             }
             let id = session
@@ -432,8 +440,9 @@ async fn run_session(
             .as_ref()
             .ok_or(SkipReason::OriginalTrialIncomplete)
     };
-    // Required cleanup must not be abandoned after the sole possible write.
-    // Capture failures remain independently fatal; no write is retried here.
+    // The post-exit check runs even after a cancellation signal, because the
+    // single write may have landed; a capture failure still stops it, and no
+    // write is retried here.
     result.post_exit = match eligibility {
         Ok(identity) => {
             reconnect::verify_required_gateway_off(
@@ -452,8 +461,12 @@ async fn run_session(
     result
 }
 
-/// Capture and synchronize both opening boundaries before any protocol traffic.
-/// A returned handle still needs closing when recording its opening failed.
+/// Record and fsync the requested open and its result, then return the connection.
+///
+/// Returns `None` when the record made before the open failed to synchronize,
+/// or when the open itself failed. A connection whose completion record failed
+/// to synchronize is still returned, and the caller closes it without sending
+/// a command.
 fn open_original<B: Backend>(
     backend: &mut B,
     endpoint: &SerialCandidate,

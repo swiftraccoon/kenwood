@@ -1,4 +1,8 @@
-//! Durable, immutable-scope evidence for one operator-approved typed text update.
+//! Append-only, fsynced JSON-lines record of one text update.
+//!
+//! Holds the update scope, the source backup path and the original page bytes
+//! needed to restore the text by hand. The first append or synchronization
+//! failure blocks every later append, including the success marker.
 
 use std::fs::File;
 use std::io;
@@ -59,10 +63,11 @@ impl StickyError {
     }
 }
 
-/// One exclusive journal using the same durable recorder as session captures.
+/// One journal file, written through the recorder the session captures use.
 ///
-/// Scope and original recovery bytes never change. A failed append, sync, or
-/// consistency check prevents every later append, including a success marker.
+/// The scope and the original recovery bytes never change after `prepare`. A
+/// failed append, synchronization or consistency check blocks every later
+/// append, including the success marker.
 #[derive(Debug)]
 pub(super) struct UpdateJournal {
     recorder: Recorder<File>,
@@ -78,8 +83,10 @@ pub(super) struct UpdateJournal {
 }
 
 impl UpdateJournal {
-    /// Reserve a private file without following a directory symlink or opening
-    /// any pre-existing journal. Preparation must succeed before opening USB.
+    /// Create the journal file in an existing private directory.
+    ///
+    /// A symlinked directory is rejected and a pre-existing journal is never
+    /// opened. `prepare` must succeed before the port is opened.
     #[cfg(unix)]
     pub(super) fn create(directory: &Path, capture_failed: Arc<AtomicBool>) -> io::Result<Self> {
         use std::os::unix::fs::PermissionsExt;
@@ -107,16 +114,20 @@ impl UpdateJournal {
         })
     }
 
-    /// Refuse hosts without this command's private-file durability contract.
+    /// Return an error: non-Unix hosts lack the private-file and directory
+    /// synchronization this journal requires.
     #[cfg(not(unix))]
     pub(super) fn create(_directory: &Path, _capture_failed: Arc<AtomicBool>) -> io::Result<Self> {
         Err(unsupported_platform())
     }
 
-    /// Preserve the approved update, both complete pages, and backup provenance.
+    /// Append the update scope, both complete pages and the backup path.
     ///
-    /// The caller must require explicit `--apply` approval before calling this
-    /// method. Success includes file, directory, and parent-directory sync.
+    /// Callers reach this only behind the required `--apply` flag. The file,
+    /// its directory and the parent directory are synchronized before this
+    /// returns `Ok`. Returns an `io::Error` when the journal is already
+    /// prepared, the update is not `NotWritten`, or any append or
+    /// synchronization fails.
     pub(super) fn prepare(&mut self, update: &impl Update, backup: &Path) -> io::Result<()> {
         self.require(
             self.stage == Stage::Unprepared,
@@ -150,11 +161,12 @@ impl UpdateJournal {
         Ok(())
     }
 
-    /// Synchronize the sole write intent before the backend may dispatch W.
+    /// Append and fsync the single write intent, before the W frame is sent.
     ///
-    /// The backend calls this only after the engine has accepted a fresh
-    /// identity, format byte zero, and exact whole-page before-image. That
-    /// validation is attributed explicitly; its raw bytes remain in capture.
+    /// The engine calls this after it has matched a fresh identity, memory
+    /// format zero and the exact whole-page before-image; the raw bytes behind
+    /// those checks stay in the session capture. A second intent returns an
+    /// `io::Error`.
     pub(super) fn intent(&mut self, update: &impl Update) -> io::Result<()> {
         self.intent_with_sync(update, Recorder::synchronize)
     }
@@ -192,28 +204,28 @@ impl UpdateJournal {
         Ok(())
     }
 
-    /// Retain and synchronize session diagnostics without changing write risk.
+    /// Append one session's diagnostics; the update status is left unchanged.
     pub(super) fn evidence(&mut self, evidence: &impl Serialize) -> io::Result<()> {
         self.require(
             matches!(self.stage, Stage::Prepared | Stage::WriteIntent),
-            "journal does not accept session evidence at this stage",
+            "journal does not accept a session record at this stage",
         )?;
         #[cfg(all(test, unix))]
         if self.fail_evidence {
             return self.remember(Err(io::Error::other(
-                "injected session evidence synchronization failure",
+                "injected session record synchronization failure",
             )));
         }
         self.append(Kind::SessionEvidence, evidence)
     }
 
-    /// Inject failure at the workflow's first post-session evidence boundary.
+    /// Make the next `evidence` call fail, to exercise the sticky-failure path.
     #[cfg(all(test, unix))]
     pub(super) const fn fail_evidence_for_test(&mut self) {
         self.fail_evidence = true;
     }
 
-    /// Inject one failure at the next session's actual pre-write raw sync boundary.
+    /// Make the next pre-write transcript synchronization fail once.
     #[cfg(all(test, unix))]
     pub(super) const fn fail_raw_sync_for_test(&mut self) {
         self.fail_raw_sync = true;
@@ -224,8 +236,12 @@ impl UpdateJournal {
         std::mem::take(&mut self.fail_raw_sync)
     }
 
-    /// Record the engine's conservative result without automatically restoring
-    /// or treating immediate readback as verification across separate sessions.
+    /// Append the update's final status and close the journal.
+    ///
+    /// The status must match the recorded stage: `NotWritten` only after
+    /// `prepare`, the other two only after the write intent. Nothing is
+    /// restored automatically, and an immediate readback alone never yields
+    /// `VerifiedAcrossSessions`.
     pub(super) fn finish(&mut self, update: &impl Update) -> io::Result<()> {
         self.check_bound(update)?;
         let consistent = match update.status() {
@@ -260,7 +276,8 @@ impl UpdateJournal {
         )
     }
 
-    /// Refuse new connections after any failed journal append or synchronization.
+    /// `Ok` while the journal is usable; an error after any failed append or
+    /// synchronization, which stops the workflow from opening a connection.
     pub(super) fn ensure_complete(&self) -> io::Result<()> {
         self.healthy()
     }

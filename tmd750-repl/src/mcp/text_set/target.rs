@@ -1,4 +1,7 @@
-//! Closed adapters for the two typed, independently guarded text updates.
+//! Adapters for the two write engines: PM1 name and PM-Off MY1.
+//!
+//! The trait and its two implementations are private, so no caller can point
+//! the shared workflow at another field, address or value.
 
 use std::future::Future;
 use std::num::NonZeroU64;
@@ -21,18 +24,20 @@ use super::journal::UpdateJournal;
 use super::workflow::CaptureSynchronization;
 use crate::AppResult;
 
-/// Preparation retains the concrete engine; neither variant can widen its scope.
+/// A validated update, holding the concrete engine for its field.
 #[derive(Debug)]
 pub(super) enum PreparedUpdate {
     Pm1(Box<Pm1NameUpdate>),
     My1(Box<My1CallsignUpdate>),
 }
 
-/// A closed policy choice, never an arbitrary field or address supplied by a caller.
+/// Which of the two writable text fields an update targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum UpdateKind {
+    /// PM1's display name.
     Pm1Name,
+    /// The MY1 callsign in PM Off.
     PmOffMy1,
 }
 
@@ -61,10 +66,10 @@ impl UpdateKind {
     pub(super) const fn scope(self) -> &'static str {
         match self {
             Self::Pm1Name => {
-                "global PM1 only; verification targets MCP exit/re-entry, not a power cycle; endpoint and CAT tuple do not prove physical continuity"
+                "global PM1 only; verification targets MCP exit/re-entry, not a power cycle; the endpoint and CAT tuple name the model and firmware, not the physical unit"
             }
             Self::PmOffMy1 => {
-                "MY1 in PM Off with Gateway Off only; configurable leave-in-place workflow is not hardware-qualified; verification targets MCP exit/re-entry, not a power cycle or Terminal acceptance"
+                "MY1 in PM Off with Gateway Off only; configurable leave-in-place workflow not run on hardware; verification targets MCP exit/re-entry, not a power cycle or Terminal acceptance"
             }
         }
     }
@@ -73,7 +78,7 @@ impl UpdateKind {
         match self {
             Self::Pm1Name => "PM1 name only; TM-D750 firmware 1.02 and type K,2,1",
             Self::PmOffMy1 => {
-                "MY1 in PM Off with Gateway Off; TM-D750 firmware 1.02 and type K,2,1; configurable update is mock-tested, not hardware-qualified"
+                "MY1 in PM Off with Gateway Off; TM-D750 firmware 1.02 and type K,2,1; configurable update is mock-tested, not run on hardware"
             }
         }
     }
@@ -86,7 +91,7 @@ impl UpdateKind {
     }
 }
 
-/// Keep the original library reports and typed identity until capture conversion.
+/// One session's library report, kept in its typed form until serialization.
 #[derive(Debug)]
 pub(super) enum SessionReport {
     Pm1(Pm1NameUpdateSessionReport),
@@ -109,8 +114,12 @@ impl SessionReport {
     }
 }
 
-/// Only the two typed library engines implement this private orchestration seam.
-/// No implementation constructs a write frame or admits an arbitrary field.
+/// The per-field write engine the shared workflow drives.
+///
+/// Exposes the target page, its original and desired bytes, an optional control
+/// page, the current and desired text, the status and the halt switch.
+/// Implemented only by the PM1-name and MY1 engines; no implementation builds a
+/// write frame or takes an address from a caller.
 pub(super) trait Update: Send + Sync {
     fn kind(&self) -> UpdateKind;
     fn field(&self) -> &'static str;
@@ -188,7 +197,7 @@ impl Update for Pm1NameUpdate {
         evidence: &PostExitVerification,
     ) -> AppResult<()> {
         if !evidence.succeeded() {
-            return Err("PM1 finalization requires complete fresh identity evidence".into());
+            return Err("PM1 finalization requires a complete fresh identity read".into());
         }
         Ok(self.record(Pm1NameUpdateEvent::SessionFinalized { id })?)
     }
@@ -267,7 +276,7 @@ impl Update for My1CallsignUpdate {
     ) -> AppResult<()> {
         let (identity, gateway_mode) = evidence
             .gateway_off_evidence()
-            .ok_or("MY1 finalization requires complete fresh Gateway-Off evidence")?;
+            .ok_or("MY1 finalization requires a complete fresh Gateway Off read")?;
         Ok(self.record(My1CallsignUpdateEvent::SessionFinalized {
             id,
             identity,

@@ -1,4 +1,9 @@
-//! Separately approved, fixed Terminal-to-Off experiment with durable evidence.
+//! Writes DV Gateway from Terminal (2) to Off (0) on one page, then verifies it.
+//!
+//! One guarded MCP session compares the target, control and routing pages,
+//! writes the single page and reads the whole page back; a second session then
+//! confirms the identity tuple and Gateway Off over CAT. The write intent is
+//! journaled and fsynced before the W frame.
 
 mod journal;
 mod workflow;
@@ -24,13 +29,14 @@ use crate::{AppResult, CommandError, output};
 use journal::Journal;
 use workflow::{SessionCaptures, WorkflowResult};
 
-/// One fixed experiment, not a general Gateway setter or a D-STAR session.
+/// Arguments of `mcp terminal-exit-trial`: source backup and capture path.
 #[derive(Debug, Parser)]
 pub(crate) struct Request {
     /// Complete successful configuration report captured with Gateway Off.
     #[arg(long, value_name = "REPORT")]
     backup: PathBuf,
-    /// Approve one guarded Terminal-to-Off write and independent verification.
+    /// Required. Writes DV Gateway Off on one page, then verifies it over a
+    /// second connection.
     #[arg(long, required = true)]
     approve_live_test: bool,
     /// New private capture directory; its parent must exist.
@@ -42,7 +48,7 @@ impl Request {
     fn prepare(&self, endpoint: &SerialCandidate, baud: u32) -> AppResult<TerminalExitTrial> {
         if !self.approve_live_test {
             return Err(CommandError(
-                "explicit Terminal exit trial approval is required".to_owned(),
+                "mcp terminal-exit-trial requires --approve-live-test".to_owned(),
             )
             .into());
         }
@@ -138,7 +144,12 @@ fn verification_captures(directory: &Path, failed: &Arc<AtomicBool>) -> AppResul
     })
 }
 
-/// Reserve evidence before opening, then execute only the approved fixed scope.
+/// Reserve the capture files and journal, then run the single write and its
+/// post-exit CAT check.
+///
+/// Requires `--approve-live-test`, the pinned main-unit USB endpoint at 9600
+/// baud, and a complete backup captured with Gateway Off and memory format
+/// zero; otherwise it returns `CommandError` before opening anything.
 pub(super) async fn run(endpoint: &SerialCandidate, baud: u32, request: &Request) -> AppResult<()> {
     let mut trial = request.prepare(endpoint, baud)?;
     let cancelled = AtomicBool::new(false);
@@ -165,11 +176,11 @@ pub(super) async fn run(endpoint: &SerialCandidate, baud: u32, request: &Request
         verification,
     ];
     output::line(format_args!(
-        "Terminal exit trial evidence: {}.",
+        "Terminal exit trial capture: {}.",
         directory.display()
     ));
     output::line(format_args!(
-        "Approved experimental Terminal-to-Off trial: one fixed page write after complete guards, then independent readback and fresh CAT Off. No callsign, PM, routing, reflector, or RF commands."
+        "Terminal-to-Off trial: one page write after the whole-page guards, then readback and a fresh CAT Off check. No callsign, PM, routing, reflector, or RF commands."
     ));
     output::line(format_args!(
         "Keep this radio connected. After intent, Ctrl-C cannot abandon verification; uncertain exchanges stop further commands."
@@ -215,7 +226,7 @@ pub(super) async fn run(endpoint: &SerialCandidate, baud: u32, request: &Request
             cat_baud: baud,
         },
         source_backup: request.backup.clone(),
-        scope: "fixed PM Off Reflector Terminal-to-Off only; exact target/control/routing pages, panel Gateway route and COM+AF USB; no retry, rollback, RF commands, or generic firmware qualification; endpoint and CAT tuple do not prove physical continuity",
+        scope: "fixed PM Off Reflector Terminal-to-Off only; exact target/control/routing pages, panel Gateway route and COM+AF USB; no retry, rollback, or RF commands; the endpoint and CAT tuple name the model and firmware, not the physical unit",
         gateway_exit: trial.status().into(),
         workflow,
         signal_error,
@@ -228,12 +239,12 @@ pub(super) async fn run(endpoint: &SerialCandidate, baud: u32, request: &Request
     ));
     if succeeded {
         output::line(format_args!(
-            "Gateway Off and all three guarded pages verified across two MCP sessions and fresh CAT connections. This does not prove a full power cycle or enable general Terminal control."
+            "Gateway Off and all three guarded pages verified across two MCP sessions and fresh CAT connections. Persistence across a power cycle was not checked."
         ));
         Ok(())
     } else {
         Err(CommandError(format!(
-            "Terminal exit trial incomplete; status {:?}. Do not retry or restore blindly. Inspect retained evidence in {} before further radio commands.",
+            "Terminal exit trial incomplete; status {:?}. Do not retry or restore blindly. Inspect the retained capture and journal in {} before further radio commands.",
             report.gateway_exit, directory.display(),
         )).into())
     }

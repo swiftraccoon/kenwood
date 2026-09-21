@@ -1,4 +1,6 @@
-//! Durable startup intent and exact page images, separate from runtime traffic.
+//! Startup recovery journal: the backup, the planned pages, and a synced
+//! record written before each page write, in a file separate from the
+//! runtime transcript.
 
 use std::fs::File;
 use std::io;
@@ -67,9 +69,11 @@ enum Event<'a> {
 
 pub(super) struct Journal {
     recorder: Recorder<File>,
-    /// A durable before-write intent exists; radio delivery remains independent.
+    /// A record naming the page about to be written was written and synced.
+    /// True means a `W` frame may have reached the radio.
     pub(super) write_started: bool,
-    /// Entry returned E/ACK; later publication failure never erases that outcome.
+    /// The entry `E` exit was acknowledged by the radio. Never cleared by a
+    /// later journal or report failure.
     pub(super) entry_exit_acknowledged: bool,
     entry_plan: Option<TerminalPlan>,
 }
@@ -92,7 +96,7 @@ impl Journal {
         }
     }
 
-    /// Keep the exact entry images even if later protocol or journal work fails.
+    /// The entry plan and its page images, retained after any later failure.
     pub(super) const fn entry_plan(&self) -> Option<&TerminalPlan> {
         self.entry_plan.as_ref()
     }

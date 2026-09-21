@@ -1,4 +1,7 @@
-//! Strict coverage reconstruction from a completed local configuration report.
+//! Decodes a completed configuration backup report into a memory image.
+//!
+//! Only the regions the report actually captured are readable; the remaining
+//! bytes of the dense image are padding and are never returned as field data.
 
 use std::fs::{File, Metadata};
 use std::io::Read;
@@ -43,7 +46,7 @@ enum BackupOutcome {
 #[derive(Debug, Deserialize)]
 struct Transcript {
     complete: bool,
-    // Unit requires an explicit JSON null; absent evidence is not success.
+    // The unit type requires an explicit JSON null; a missing field is rejected.
     #[serde(rename = "error")]
     _error: (),
 }
@@ -81,7 +84,7 @@ struct Attempt {
     close: SuccessfulOperation,
 }
 
-/// Nullable evidence still has to be present in the source document.
+/// Deserialize a field that may be JSON null but must be present.
 fn required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -105,7 +108,11 @@ struct Enumeration {
     candidates: Vec<Endpoint>,
 }
 
-/// Recheck the recorded selection policy without making any host observations.
+/// Replay the recorded enumeration snapshots through `classify`.
+///
+/// Makes no host observation. Every snapshot but the last must classify as
+/// `AwaitingEndpoint`, the last as `Ready`, and elapsed times must not
+/// decrease.
 fn validate_enumerations(
     enumerations: &[Enumeration],
     original: &Endpoint,
@@ -146,7 +153,10 @@ enum IdentityAssurance {
     EndpointAndCatTupleOnly,
 }
 
-/// Historical evidence has one attempt; it is never rewritten as a retry chain.
+/// The format-3 post-exit verification section of a backup report.
+///
+/// It records a single open attempt and is decoded as-is; it is never upgraded
+/// into the multi-attempt readiness shape.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HistoricalVerification {
@@ -303,7 +313,10 @@ impl ReadinessVerification {
     }
 }
 
-/// The disjoint schemas reject mixed evidence instead of guessing its meaning.
+/// The post-exit verification section, in one of its two shapes.
+///
+/// The two schemas are disjoint, so a document mixing their fields fails to
+/// decode rather than matching either.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum Verification {
@@ -359,8 +372,8 @@ impl Backup {
 struct Document {
     format_version: u8,
     operation: String,
-    // Historical USB producers do not emit a transport tag. Reject it here as
-    // well as in source dispatch so direct decoding cannot invent provenance.
+    // USB producers emit no transport tag. Reject one here as well as in source
+    // dispatch, so decoding this document directly cannot invent a transport.
     #[serde(
         default,
         rename = "transport",
@@ -383,7 +396,7 @@ fn reject_transport_tag<'de, D: serde::Deserializer<'de>>(
     _deserializer: D,
 ) -> Result<(), D::Error> {
     Err(serde::de::Error::custom(
-        "USB format-3/4 reports cannot carry native transport evidence",
+        "USB format-3/4 reports cannot carry native transport records",
     ))
 }
 
@@ -404,22 +417,24 @@ impl Document {
             || !fresh_identity_proved
         {
             return invalid(
-                "requires a successful configuration backup with matching format-3 or format-4 CAT evidence and complete captures",
+                "requires a successful configuration backup with matching format-3 or format-4 CAT records and complete captures",
             );
         }
         self.backup.validate_pages()
     }
 }
 
-/// Native and USB formats retain separate transport-specific admission rules.
+/// A decoded backup report: a native Bluetooth or a USB document.
 #[derive(Debug)]
 enum SourceDocument {
     Native(Box<native::Document>),
     Usb(Box<Document>),
 }
 
-/// Inspect only tag presence; decode the selected schema from the original
-/// bytes so neither duplicate fields nor its precise errors are discarded.
+/// Presence of the `transport` tag, read before the full decode.
+///
+/// The selected schema is then decoded from the original bytes, so duplicate
+/// fields and the schema's own errors are preserved.
 #[derive(Deserialize)]
 struct SourceHeader {
     #[serde(
@@ -451,7 +466,7 @@ impl SourceDocument {
             Ok(Self::Native(document))
         } else {
             let document = serde_json::from_slice(bytes).map_err(|error| {
-                CommandError(format!("Invalid configuration backup: untagged report requires USB format-3/4 evidence: {error}"))
+                CommandError(format!("Invalid configuration backup: untagged report requires USB format-3/4 records: {error}"))
             })?;
             Ok(Self::Usb(document))
         }
@@ -490,7 +505,12 @@ fn read_document(reader: impl Read) -> AppResult<SourceDocument> {
     SourceDocument::decode(&bytes)
 }
 
-/// An internal dense buffer whose synthetic gaps cannot be read as fields.
+/// A configuration backup loaded from a report.json.
+///
+/// Holds the decoded memory image, the identity captured with it, the regions
+/// the report actually captured, and the transport that produced it. Bytes
+/// outside `coverage` are padding in the dense image and are never returned as
+/// field data.
 #[derive(Debug)]
 pub(crate) struct Snapshot {
     image: MemoryImage,
@@ -499,10 +519,15 @@ pub(crate) struct Snapshot {
     provenance: Provenance,
 }
 
-/// Historical acquisition evidence never substitutes for another transport.
+/// Transport that produced a backup.
+///
+/// USB backups drive the USB write workflows; native Bluetooth backups load
+/// for offline inspection only, through [`Snapshot::load`].
 #[derive(Debug)]
 enum Provenance {
+    /// Captured over the main-unit USB endpoint.
     Usb,
+    /// Captured over native Bluetooth from this address and RFCOMM channel.
     NativeBluetooth {
         address: BluetoothAddress,
         channel: RfcommChannel,
@@ -510,7 +535,9 @@ enum Provenance {
 }
 
 impl Snapshot {
-    /// Copy complete captured standard pages without exposing synthetic image gaps.
+    /// Copy the captured standard pages into a `MenuFieldSnapshot`.
+    ///
+    /// Errors when any standard page lies outside the captured coverage.
     pub(crate) fn menu_snapshot(&self) -> AppResult<MenuFieldSnapshot> {
         let pages = regions::menu_regions()
             .into_iter()
@@ -520,7 +547,7 @@ impl Snapshot {
         Ok(MenuFieldSnapshot::from_pages(pages)?)
     }
 
-    /// Borrow only the complete, actual standard-page coverage for comparison.
+    /// Borrow the captured standard pages for comparison.
     pub(super) fn standard_configuration(&self) -> AppResult<StandardConfiguration<'_>> {
         let pages = regions::menu_regions()
             .into_iter()
@@ -544,9 +571,12 @@ impl Snapshot {
         read_document(file)?.into_snapshot()
     }
 
-    /// Preserve the established USB-write source policy while accepting native
-    /// reports for offline inspection through [`Self::load`]. Neither path is
-    /// current radio-state proof; live page guards remain mandatory.
+    /// Load a backup that a USB write workflow may use as its source.
+    ///
+    /// Returns an error naming the address and RFCOMM channel for a native
+    /// Bluetooth backup; load those through [`Self::load`] for offline
+    /// inspection. A backup is never current radio state, so the live page
+    /// guards still run before any write.
     pub(crate) fn load_for_usb_write(path: &Path) -> AppResult<Self> {
         let snapshot = Self::load(path)?;
         match &snapshot.provenance {
@@ -585,7 +615,9 @@ impl Snapshot {
         })
     }
 
-    /// Permit interpretation only when every byte of this field was captured.
+    /// Borrow the image for one field, after checking it was fully captured.
+    ///
+    /// Errors when any byte of the field lies outside the captured coverage.
     pub(super) fn image_for(
         &self,
         descriptor: &FieldDescriptor,
@@ -599,7 +631,9 @@ impl Snapshot {
         Ok(&self.image)
     }
 
-    /// Return actual captured bytes only, never synthetic dense-image gaps.
+    /// Borrow bytes from a region the report captured.
+    ///
+    /// Errors when the requested range includes a byte that was never read.
     pub(super) fn captured_bytes(&self, requested: Region) -> AppResult<&[u8]> {
         if !(requested.start()..requested.end()).all(|address| {
             self.coverage
@@ -1134,7 +1168,7 @@ pub(super) mod tests {
                 .ok_or("enumerations missing")?;
             match corruption {
                 0 => {
-                    // A rejected predecessor does not authorize another poll.
+                    // A snapshot that classifies as Rejected must end the run.
                     let mut changed = endpoint;
                     replace(&mut changed, "/usb_product_id", serde_json::json!(0x9032))?;
                     enumerations.insert(
@@ -1145,7 +1179,7 @@ pub(super) mod tests {
                     );
                 }
                 1 => {
-                    // A ready predecessor already authorizes an attempt.
+                    // A snapshot that classifies as Ready must be the last one.
                     enumerations.insert(
                         0,
                         enumerations.first().ok_or("enumeration missing")?.clone(),
@@ -1160,7 +1194,7 @@ pub(super) mod tests {
                     );
                 }
                 _ => {
-                    // The second attempt shares the same clock origin.
+                    // Elapsed times share one clock origin, so they never decrease.
                     replace(
                         enumerations.first_mut().ok_or("enumeration missing")?,
                         "/elapsed_milliseconds",

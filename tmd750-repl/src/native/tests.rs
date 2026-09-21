@@ -1,4 +1,6 @@
-//! Fake worker lifecycle checks; no test can construct a native radio owner.
+//! Open-worker lifecycle over a fake backend: cancellation and deadline
+//! handling, joining a worker that finishes late, closing a connection that
+//! arrives after the failure, and which failures allow one retry.
 
 use std::future::Future;
 use std::io;
@@ -226,7 +228,8 @@ fn delayed_worker(lifecycle: Arc<Lifecycle>, close: CloseBehavior) -> (Worker, W
     (worker, WorkerControl { started, release })
 }
 
-/// A completion wake can be observed without repolling the admission future.
+/// A `Wake` that sends on a channel, so a test sees the wake without
+/// repolling the future.
 #[derive(Debug)]
 struct CompletionWake(mpsc::Sender<()>);
 
@@ -450,7 +453,7 @@ async fn already_completed_worker_cannot_win_after_absolute_deadline() -> TestRe
     control.release.send(())?;
     completed.recv_timeout(TEST_BOUND)?;
     // Model a busy host executor: native completion is ready, but it cannot
-    // be admitted until after the already-started budget has expired.
+    // be accepted until after the already-started budget has expired.
     std::thread::sleep(budget * 2);
     let failure = opening
         .await
