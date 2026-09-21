@@ -1,7 +1,8 @@
 //! Model-neutral native Bluetooth endpoints and isolated macOS RFCOMM transport.
 //!
 //! Opens `IOBluetoothRFCOMMChannel` directly, without the OS serial-device
-//! layer. Protocol and model qualification remain the caller's responsibility.
+//! layer. This module selects and opens an endpoint; identifying the radio and
+//! framing its protocol are the caller's job.
 //!
 //! `IOBluetooth` writes can block forever when RFCOMM flow-control credit
 //! stalls, including its nominally asynchronous API (which blocks the main
@@ -9,9 +10,9 @@
 //! process. The parent communicates with it through non-blocking raw byte
 //! pipes and never calls an `IOBluetooth` write or close routine itself.
 //!
-//! Each construction makes one bounded attempt. Model-specific retry and
-//! recovery admission belongs to the caller. Neither the device's baseband
-//! nor any system Bluetooth process is torn down as part of open or cleanup.
+//! Each construction makes one bounded attempt and never retries; retry and
+//! recovery policy belong to the caller. Neither the device's baseband nor any
+//! system Bluetooth process is torn down as part of open or cleanup.
 //!
 //! This module requires `native-bluetooth`. Its validated selectors are
 //! portable; `BluetoothTransport` exists only on macOS. Start with
@@ -133,8 +134,8 @@ mod inner {
     const HELPER_EOF_EXIT_BUDGET: Duration = Duration::from_millis(250);
 
     /// Deadline checked when a direct transport write encounters pipe
-    /// backpressure. Successful non-blocking chunks do not yield or recheck
-    /// this clock; this is not a preemptive whole-call wall-clock ceiling.
+    /// backpressure. Successful non-blocking chunks neither yield nor recheck
+    /// this clock, so one call can run longer than this bound.
     const PIPE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
     /// POSIX guarantees atomic non-blocking pipe writes through `PIPE_BUF`;
@@ -150,8 +151,8 @@ mod inner {
     const SYNC_REAP_BUDGET: Duration = Duration::from_millis(100);
 
     /// Preserve one native helper owner per process, independent of the
-    /// selected address. This host policy also covers inventory and validation;
-    /// it is not a claim about every device's SPP capacity.
+    /// selected address. Opening, paired-device inventory and launch validation
+    /// all take this one lease.
     static HELPER_PROCESS_SLOT_RESERVED: AtomicBool = AtomicBool::new(false);
 
     /// Native macOS Bluetooth transport using an isolated `IOBluetooth` helper.
@@ -175,37 +176,36 @@ mod inner {
     /// A successful write means all bytes entered the helper's stdin pipe.
     /// It does not acknowledge an RFCOMM completion, peer receipt or a radio
     /// command. [`crate::StreamAdapter`] flush retains exactly this boundary.
-    /// Protocol responses/readback are separate caller obligations. Pipe
-    /// backpressure is checked against a five-second write deadline; this is
-    /// not a preemptive bound on uninterrupted synchronous progress.
-    /// Canceling a pending write invalidates and retires the helper because an
-    /// uncertain prefix may have been sent. A fresh owner and model-specific
-    /// recovery policy are needed before another exchange, not a blind retry.
+    /// Reading protocol responses back is the caller's job. Pipe backpressure
+    /// is checked against a five-second write deadline, which does not preempt
+    /// uninterrupted synchronous progress. Canceling a pending write retires
+    /// the helper because an unknown prefix may already have been sent; open a
+    /// fresh transport before the next exchange.
     ///
     /// Reads have no intrinsic deadline and honor [`Transport::read`]'s
     /// cancellation contract. EOF is a read error with `UnexpectedEof`, not
     /// `Ok(0)` for a nonempty buffer. Empty reads return zero and empty writes
-    /// succeed even after close; neither is a connection-health probe.
+    /// succeed even after close.
     ///
     /// # Execution and cleanup
     ///
     /// Open and inventory are synchronous. Async callers must use a retained,
     /// joined blocking worker and keep its cancellation token. A returned
-    /// owner must still be closed if the caller no longer wants its result.
-    /// Canceling or dropping a worker's join handle is not native retirement.
+    /// transport must still be closed if the caller no longer wants it;
+    /// dropping the worker's join handle does not retire the helper.
     ///
     /// [`Transport::close`] is async-shaped but performs synchronous helper
     /// teardown without yielding: a 600 ms graceful wait, then up to 100 ms
-    /// of synchronous reap checking when necessary. OS calls and scheduling
-    /// are not a real-time guarantee. An async timeout cannot interrupt that
-    /// poll. Drop can perform the same work, so do not rely on another task on
-    /// a single-thread executor to remain responsive during cleanup.
+    /// of synchronous reap checking when necessary. An async timeout cannot
+    /// interrupt that poll. Drop can perform the same work, so do not rely on
+    /// another task on a single-thread executor to remain responsive during
+    /// cleanup.
     ///
     /// Explicit close retains its first outcome, including failure, for later
-    /// calls. Preserve it separately from I/O errors. `ChannelUnconfirmed`,
-    /// forced termination and pending reaping are not clean native closure;
-    /// reaping alone is not proof that the OS canceled its Bluetooth operation.
-    /// Drop is best-effort and supplies no successful-close observation.
+    /// calls. Preserve it separately from I/O errors. Only a successful close
+    /// result confirms native closure: `ChannelUnconfirmed`, forced termination
+    /// and pending reaping all leave the RFCOMM channel possibly open in the
+    /// operating system. Drop returns no result at all.
     pub struct BluetoothTransport {
         child: Option<Child>,
         helper_stdin: Option<ChildStdin>,
@@ -223,7 +223,7 @@ mod inner {
         /// Exact address and channel reported by the successful native open.
         address: BluetoothAddress,
         channel: RfcommChannel,
-        /// Retain failed cleanup evidence after the child leaves this owner.
+        /// Cleanup result retained after the child leaves this transport.
         close_outcome: Option<Result<(), BluetoothCloseFailure>>,
         /// Signed executable that hosts the killable native helper. Apps in
         /// App Sandbox use a separately signed inheriting helper; command-line
@@ -337,7 +337,7 @@ mod inner {
         /// EOF can be followed by a separate 250 ms exit-observation wait;
         /// failure cleanup also has its own bounds. Process launch and the
         /// short blocking challenge write are not preempted by this deadline,
-        /// so it is not a five-second whole-call wall-clock guarantee.
+        /// so the whole call can run longer than five seconds.
         ///
         /// # Errors
         ///
@@ -353,7 +353,7 @@ mod inner {
             validate_helper_launch(&helper_executable, HELPER_VALIDATION_TIMEOUT)
         }
 
-        /// Enumerate paired Bluetooth devices for later exact qualification.
+        /// Enumerate paired Bluetooth devices for later exact-address selection.
         ///
         /// Discovery runs in the same isolated native helper used for RFCOMM,
         /// but it performs no radio I/O. Each returned device carries the
@@ -411,8 +411,8 @@ mod inner {
         /// [`Self::paired_devices_with_helper_executable`]. A sticky
         /// cancellation request terminates an active helper and returns
         /// [`TransportError::BluetoothOpenInterrupted`].
-        /// The blocking worker must still be joined. Cancellation requests do
-        /// not themselves prove helper release or free its process-wide lease.
+        /// The blocking worker must still be joined. A cancellation request by
+        /// itself neither releases the helper nor frees its process-wide lease.
         ///
         /// # Errors
         ///
@@ -441,13 +441,18 @@ mod inner {
         ///
         /// # Errors
         ///
-        /// Rejects ambiguous or absent devices, failed service resolution,
-        /// invalid helper evidence, cancellation, and bounded startup failure.
-        /// [`TransportError::BluetoothOpen`] retains the host-observed opening
-        /// stage, not a firmware cause. A complete failure record and matching
-        /// reaped helper preserve independent cleanup uncertainty as
-        /// [`TransportError::BluetoothOpenWithCleanup`]. An unframed cleanup
-        /// exit remains [`TransportError::BluetoothClose`]. No failure is retried.
+        /// Returns [`TransportError::NotFound`] for an absent device,
+        /// [`TransportError::BluetoothDeviceNameAmbiguous`] when a display name
+        /// matches more than one paired device,
+        /// [`TransportError::BluetoothOpen`] carrying the
+        /// [`BluetoothOpenStage`] that failed, and
+        /// [`TransportError::BluetoothOpenInterrupted`] on cancellation. A
+        /// malformed helper handshake or a launch failure is
+        /// [`TransportError::BluetoothHelper`]. When the helper also writes a
+        /// framed cleanup failure and is reaped with the exit status that
+        /// record names, the error is
+        /// [`TransportError::BluetoothOpenWithCleanup`]; an unframed cleanup
+        /// exit is [`TransportError::BluetoothClose`]. No failure is retried.
         /// A busy process-wide lease is a helper error with source kind
         /// [`io::ErrorKind::WouldBlock`].
         pub fn open(
@@ -465,8 +470,8 @@ mod inner {
         ///
         /// The absolute executable must link this native constructor and remain
         /// available for the operation. No model default or retry is inferred.
-        /// Exact address selection is checked against the helper's successful
-        /// endpoint evidence before any radio bytes are exposed.
+        /// An exact-address selection is compared with the address and channel
+        /// the helper reports before any radio bytes are exposed.
         /// Cancellation and the original deadline are checked again before
         /// ownership is returned; late helpers undergo bounded retirement.
         /// This is the same synchronous, process-exclusive operation as
@@ -555,7 +560,7 @@ mod inner {
             .admit_open(deadline, cancellation)
         }
 
-        /// Check handoff after all endpoint reads, preparation and tracing.
+        /// Re-check cancellation and the deadline before returning ownership.
         fn admit_open(
             mut self,
             deadline: Instant,
@@ -572,8 +577,6 @@ mod inner {
         }
 
         /// Exact paired address reported by the successful native open.
-        ///
-        /// This is endpoint-selection evidence, not a radio model identity.
         #[must_use]
         pub const fn address(&self) -> &BluetoothAddress {
             &self.address
@@ -623,20 +626,20 @@ mod inner {
             if Instant::now() >= deadline {
                 return Err(helper_readiness_error(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "Bluetooth endpoint evidence timed out",
+                    "Bluetooth endpoint record timed out",
                 )));
             }
             let destination = endpoint.get_mut(read..).ok_or_else(|| {
                 helper_readiness_error(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "invalid endpoint evidence cursor",
+                    "invalid endpoint record cursor",
                 ))
             })?;
             match stdout.read(destination) {
                 Ok(0) => {
                     return Err(helper_readiness_error(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
-                        "Bluetooth endpoint evidence was truncated",
+                        "Bluetooth endpoint record was truncated",
                     )));
                 }
                 Ok(count) => read += count,
@@ -651,7 +654,10 @@ mod inner {
         Ok(parsed)
     }
 
-    /// Valid complete evidence cannot outlive its original admission window.
+    /// Re-check cancellation and the absolute deadline after a completed step.
+    ///
+    /// Returns the cancellation error, or a helper error with
+    /// [`io::ErrorKind::TimedOut`] once `deadline` has passed.
     fn check_open_completion(
         deadline: Instant,
         cancellation: &BluetoothOpenCancellation,
@@ -1118,7 +1124,7 @@ mod inner {
     }
 
     impl Transport for BluetoothTransport {
-        /// Submit the complete byte slice to helper stdin, not to a peer ACK.
+        /// Submit the complete byte slice to the helper's stdin pipe.
         ///
         /// See the [type's I/O contract](BluetoothTransport#io-completion-and-cancellation)
         /// for pipe backpressure, partial writes, empty input and cancellation.
@@ -1238,7 +1244,7 @@ mod inner {
         ///
         /// This future does not yield, so a Tokio timeout cannot preempt its
         /// poll. See the [execution and cleanup contract](BluetoothTransport#execution-and-cleanup)
-        /// for wait budgets, deferred reaping and independent failure evidence.
+        /// for wait budgets, deferred reaping and independent cleanup failures.
         async fn close(&mut self) -> Result<(), TransportError> {
             tracing::info!(pid = ?self.child.as_ref().map(Child::id), "closing Bluetooth RFCOMM helper");
             self.terminate_helper(true);
@@ -1464,7 +1470,11 @@ mod inner {
         }
     }
 
-    /// Admit failure evidence only after EOF and a matching, reaped child.
+    /// Read the helper's two-byte failed-open record: stage code and cleanup flag.
+    ///
+    /// The record is accepted only when stdout reaches EOF with no trailing
+    /// bytes and the reaped child's exit status matches the code the record
+    /// names (or 89 when the cleanup flag is set).
     fn await_helper_open_failure_until(
         child: &mut Child,
         stdout: &mut ChildStdout,
@@ -1484,7 +1494,7 @@ mod inner {
                 Ok(count) => {
                     offset += count;
                     if offset > 2 {
-                        return Err(invalid_open_failure("trailing failed-open evidence"));
+                        return Err(invalid_open_failure("trailing failed-open record bytes"));
                     }
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -1494,7 +1504,7 @@ mod inner {
             }
         }
         if offset != 2 {
-            return Err(invalid_open_failure("truncated failed-open evidence"));
+            return Err(invalid_open_failure("truncated failed-open record"));
         }
         let [stage_code, cleanup, _] = record;
         let stage = helper_open_stage(i32::from(stage_code))
@@ -1502,14 +1512,14 @@ mod inner {
         let expected_exit = match cleanup {
             0 => i32::from(stage_code),
             1 => 89,
-            _ => return Err(invalid_open_failure("unknown failed-open cleanup evidence")),
+            _ => return Err(invalid_open_failure("unknown failed-open cleanup code")),
         };
         let reap_deadline = deadline.min(Instant::now() + HELPER_EOF_EXIT_BUDGET);
         let status = await_helper_exit_until(child, reap_deadline, cancellation)?;
         check_open_completion(deadline, cancellation)?;
         if status.code() != Some(expected_exit) {
             return Err(invalid_open_failure(
-                "failed-open evidence differs from helper exit",
+                "failed-open record differs from helper exit status",
             ));
         }
         Ok(if cleanup == 1 {
@@ -1665,7 +1675,13 @@ mod inner {
         let _outcome = terminate_child_checked(child, process_slot, parent_liveness, graceful);
     }
 
-    /// Bounded caller-side cleanup; only a detached owner may block in wait.
+    /// Retire the helper without ever blocking the caller in `wait`.
+    ///
+    /// Polls `try_wait` through the graceful budget when `graceful` is set, then
+    /// kills the child and polls again through the reap budget. A child that
+    /// exits after the kill is [`BluetoothCloseFailure::ForcedTermination`]; one
+    /// still running afterwards is handed to a detached reaper thread and the
+    /// result is [`BluetoothCloseFailure::ReapPending`].
     fn terminate_child_checked(
         mut child: Child,
         process_slot: Option<HelperProcessSlot>,
@@ -2161,7 +2177,8 @@ mod inner {
             Ok(())
         }
 
-        /// Deliver complete valid evidence, then change admission before read returns.
+        /// Deliver a complete endpoint record, then cancel or expire the
+        /// deadline before the final read returns.
         struct CompletingEndpointReader<F> {
             completion: F,
             reads: usize,
@@ -2268,7 +2285,7 @@ mod inner {
             Ok(())
         }
 
-        /// The caller holds `PROCESS_SLOT_TEST_LOCK` through admission and reap.
+        /// The caller holds `PROCESS_SLOT_TEST_LOCK` until the helper is reaped.
         fn owned_pending_test_transport() -> Result<BluetoothTransport, Box<dyn Error>> {
             let address = "00-11-22-33-44-55".parse()?;
             let channel = RfcommChannel::new(27)?;
@@ -2960,7 +2977,8 @@ mod inner {
                 return Err("legacy deadline fixture has no stdin".into());
             };
             // Observe EOF before starting the deadline, independent of child
-            // startup scheduling. Keep its exit blocked on our owned stdin.
+            // startup scheduling. The child's exit stays blocked on the stdin
+            // this test holds.
             let eof = stdout.read(&mut [0_u8; 1]);
             if !matches!(eof, Ok(0)) {
                 terminate_child(child, None, None, false);

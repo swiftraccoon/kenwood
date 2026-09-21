@@ -8,15 +8,16 @@ clients. The crate owns byte I/O, not radio identity or operating-mode policy.
 - `MockTransport`: exact FIFO writes, partial reads, hangs, and scripted
   reopen outcomes for hardware-free tests.
 - `StreamAdapter`: a `Transport` exposed as Tokio `AsyncRead` and `AsyncWrite`,
-  with bounded write admission, completion-aware flush, and typed recovery.
+  with a bounded outbound write channel, completion-aware flush, and typed
+  recovery.
 - `serial::SerialTransport`: explicit serial settings and resource ownership;
   available with the default `serial` feature.
 - `bluetooth::BluetoothTransport`: opt-in macOS native RFCOMM through a
   bounded, isolated helper; portable validated selectors accompany it.
 
 Device libraries choose endpoints, line presets, framing, retries, readiness
-checks, and mode transitions. Opening a byte connection does not prove which
-device is attached or whether its protocol is ready. This crate never sends a
+checks, and mode transitions. Opening a byte connection identifies neither the
+attached device nor its protocol state. This crate never sends a
 reset, mode-switch, or protocol-recovery command on its own.
 
 Choose the surface that owns your task: `MockTransport` for protocol tests,
@@ -31,7 +32,7 @@ must not be run without a deliberately selected endpoint.
 Transport success is a host-side observation, not command acceptance by a
 device. The backend determines the precise write-completion boundary:
 
-| Backend | What a successful write establishes | What it does not establish |
+| Backend | Completion boundary of a successful write | Not covered by success |
 | --- | --- | --- |
 | Mock | One matching expected write was consumed and its response queued | Response consumption or physical I/O |
 | Serial | All bytes and the serial backend's stream flush completed | Independent hardware drain or peer receipt |
@@ -40,8 +41,9 @@ device. The backend determines the precise write-completion boundary:
 `StreamAdapter::flush` waits for those underlying calls; it does not strengthen
 their guarantees. Protocol framing, response validation and readback belong to
 the caller. Preserve operation failures separately from cleanup failures. An
-I/O error or timeout does not prove that zero bytes reached the peer, so it
-does not grant retry authority.
+I/O error or timeout does not mean zero bytes reached the peer, so resending the
+same command can duplicate a partial transmission; re-establish the protocol
+boundary before retrying.
 
 ## Script an exchange
 
@@ -49,10 +51,10 @@ Every expected write is checked in order. `assert_complete` checks only the
 remaining expected-write queue. Check each write result and response explicitly;
 unread bytes and a separate reopen script are not covered. Use
 `assert_reopen_script_complete` when you script reopen outcomes.
-`from_fixture` accepts a lenient text format, not a validated transcript:
-unrecognized lines and unmatched commands/responses can be ignored. Its rustdoc
-defines the complete grammar. A successfully loaded, empty script is not
-evidence that an intended exchange was exercised.
+`from_fixture` parses leniently: unrecognized lines and unmatched commands or
+responses are ignored, so a fixture can load into an empty script, on which
+`assert_complete` passes. Its rustdoc defines the complete grammar; check
+`writes()` for the commands the fixture was meant to script.
 
 ```rust
 use kenwood_transport::{MockTransport, Transport};
@@ -191,13 +193,17 @@ join its worker. Close an unwanted late owner as well as the successful owner
 you intend to use. Helper validation is a separate five-second no-radio
 exchange and uses the same lease.
 
-Before SDP, the helper offers pending startup events one default-mode run-loop
-slice, even when the selected device already reports connected. Its 50 ms
-timeout request shares the existing 20-second native opening budget. This is
-a scheduling mitigation, not a framework-readiness guarantee: the run loop may
-finish early, and callbacks can overrun the requested interval. The helper
-rechecks the deadline afterward; the parent process still enforces cancellation
-and timeout. This adds no service query, channel retry, or baseband reset.
+Before SDP, the helper gives pending startup events one default-mode run-loop
+slice with a 50 ms timeout request, even when the selected device already
+reports connected. That slice is drawn from the 20-second native opening budget
+and may return early or overrun the request. The helper rechecks the deadline
+afterward; the parent process still enforces cancellation and timeout. The slice
+performs no service query, channel retry, or baseband reset.
+
+Set `KENWOOD_BT_TRACE=1` in the parent process to enable the helper's shim
+tracing. The helper inherits stderr, so each trace line carries the helper PID
+and can be correlated with the Rust transport log without touching the raw
+stdout byte stream.
 
 ```rust,no_run
 # #[cfg(all(feature = "native-bluetooth", target_os = "macos"))]
@@ -236,27 +242,27 @@ signature: a 600 ms graceful window plus, when needed, 100 ms of synchronous
 reap checking. OS calls and scheduling are not a real-time guarantee. A Tokio
 timeout cannot interrupt that poll, and another task on the same single-thread
 executor cannot run during it. Drop can perform the same work. Close retains
-its first outcome, including errors; repeated calls cannot turn uncertain
-cleanup into verified closure. Unconfirmed native closure, unsuccessful helper
-exit, forced termination and pending reaping are not clean-release proof.
-Explicitly await close and retain its independent result; Drop is best-effort
-and reports no successful-close observation.
+its first outcome, including errors; repeated calls cannot turn an uncertain
+cleanup into a confirmed close. Unconfirmed native closure, an unsuccessful
+helper exit, forced termination and pending reaping all leave the channel
+possibly open. Await close explicitly and retain its independent result;
+Drop is best-effort and reports no outcome.
 
 Native startup distinguishes an absent paired device (`TransportError::NotFound`)
 from `TransportError::BluetoothOpen` with a typed `error::BluetoothOpenStage`.
 Stages identify startup event-processing expiry, service-discovery dispatch,
-completion, deadline or resolution,
-and RFCOMM dispatch, completion, deadline or endpoint validation. They describe
-the host's observation, not the cause in the radio's firmware or evidence that
-a retry would succeed. When an opening stage also has an independent native
-cleanup failure, `TransportError::BluetoothOpenWithCleanup` preserves both.
-This requires a complete private failure record, a matching helper exit status
-and actual process reaping. It does not prove cancellation of an OS operation.
-Malformed or mismatched records remain helper failures; neither failure text nor
-unconfirmed cleanup alone grants retry authority.
+completion, deadline or resolution, and RFCOMM dispatch, completion, deadline or
+endpoint validation. A stage records what the host observed, not a cause in the
+radio's firmware. When an opening stage coincides with an independent native
+cleanup failure, `TransportError::BluetoothOpenWithCleanup` preserves both; it
+is produced only from a complete private failure record, a matching helper exit
+status and actual process reaping, and the channel may still be open in the OS.
+Malformed or mismatched records are reported as helper failures. This crate
+never retries after either error; retry policy belongs to the model wrapper.
 
 The reported address and channel describe the successfully opened endpoint,
 not a radio identity, protocol readiness, or operating mode. Native transport
-does not automatically retry or reopen. Sandboxed applications may supply an
-absolute separately signed helper executable and validate its no-radio echo
-lifecycle before use. Pairing and model-specific recovery remain caller policy.
+never reopens a closed connection on its own. Sandboxed applications may
+supply an absolute separately signed helper executable and validate its
+no-radio echo lifecycle before use. Pairing and model-specific recovery remain
+caller policy.

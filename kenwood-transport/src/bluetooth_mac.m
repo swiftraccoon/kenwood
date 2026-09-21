@@ -51,10 +51,11 @@ static const uint8_t kOpenFailureMagic[] = "KENWBT-ERROR-v1!";
 #define BT_HELPER_EXIT_TOO_MANY_PAIRED_DEVICES 88
 #define BT_HELPER_EXIT_CLOSE_UNCONFIRMED 89
 
-// Private process statuses identify the host-observed failing stage. They do
-// not diagnose peer firmware or imply retry permission. Keep these aligned
-// with the Rust helper-exit decoder. A framed record preserves the original
-// stage independently when close uncertainty selects the process exit status.
+// Private exit statuses name the stage at which the helper failed on this
+// host, not a cause in the peer. Keep them aligned with the Rust helper-exit
+// decoder; a value it does not recognize is decoded as a helper failure. When
+// close uncertainty selects the process exit status, the framed record still
+// carries the original stage.
 enum {
     BT_HELPER_EXIT_CONTEXT_ALLOCATION = 100,
     BT_HELPER_EXIT_SDP_START = 101,
@@ -239,9 +240,8 @@ static BOOL process_startup_events(double deadline,
     // Paired-device lookup can initialize asynchronous framework work even
     // when the remote device already reports connected. Always offer that
     // work a default-mode processing slice before issuing SDP or RFCOMM.
-    // This is a scheduling mitigation, not a manager-readiness signal. The
-    // run loop may finish early, and a callback may overrun the requested
-    // timeout; the post-check and parent process deadline remain authoritative.
+    // The run loop may return early, and a callback may overrun the requested
+    // timeout; the post-check and the parent's deadline remain authoritative.
     double requested = remaining < 0.05 ? remaining : 0.05;
     SInt32 result = runtime->pump(requested);
     bt_trace("startup event processing result=%d", (int)result);
@@ -342,11 +342,10 @@ static BOOL destroy_rfcomm_context_with_pump(RfcommContext *ctx,
                                             SInt32 (*pump)(double seconds)) {
     if (!ctx) return YES;
 
-    // A healthy helper owns the channel until close completion. Pumping the
-    // helper run loop here mirrors the REPL's ownership lifecycle: release
-    // this SPP session before another process attempts to open it. The Rust
-    // parent bounds the whole helper and can still SIGKILL a framework call
-    // that does not return.
+    // A healthy helper owns the channel until close completion. Pump the
+    // helper run loop here so the SPP session is released before another
+    // process attempts to open it. The Rust parent bounds the whole helper and
+    // can still SIGKILL a framework call that does not return.
     pthread_mutex_lock(&g_context_mutex);
     ctx->output_fd = -1;
     pthread_mutex_unlock(&g_context_mutex);
@@ -386,8 +385,8 @@ static BOOL destroy_rfcomm_context_with_pump(RfcommContext *ctx,
 }
 
 static BOOL destroy_rfcomm_context(RfcommContext *ctx) {
-    // Live owners retain the identical real run-loop cleanup policy; only
-    // no-radio fixtures substitute a counted, nonblocking event processor.
+    // Production cleanup always uses the real run-loop pump; only no-radio
+    // fixtures substitute a counted, nonblocking event processor.
     return destroy_rfcomm_context_with_pump(ctx, pump_open_events);
 }
 
@@ -418,7 +417,8 @@ static int rfcomm_phase_failure(int state, BOOL closed, BOOL expired,
 }
 
 static int test_open_stage_classification(void) {
-    // A connected host/cache alone never admits a callback-required query.
+    // A connected device or cached service list alone does not complete a
+    // callback-required query.
     if (sdp_phase_failure(YES, YES, 0, YES) != BT_HELPER_EXIT_SDP_DEADLINE) return 99;
     if (sdp_phase_failure(NO, NO, 0, YES) != BT_HELPER_EXIT_SDP_DEADLINE) return 99;
     if (sdp_phase_failure(YES, YES, -1, NO) != BT_HELPER_EXIT_SDP_COMPLETION) return 99;
@@ -433,8 +433,8 @@ static int test_open_stage_classification(void) {
     return 0;
 }
 
-// Keep the Objective-C out-parameter and context handoff in one place so
-// no failed-open branch can leave a pending channel outside its owner.
+// Keep the Objective-C out-parameter and context handoff in one place so no
+// failed-open branch can leave a pending channel outside `ctx`, which closes it.
 static IOReturn begin_rfcomm_channel(id device, RfcommContext *ctx,
                                     BluetoothRFCOMMChannelID channel_id) {
     IOBluetoothRFCOMMChannel *channel = nil;
@@ -450,7 +450,7 @@ static IOReturn begin_rfcomm_channel(id device, RfcommContext *ctx,
     return result;
 }
 
-// No-radio ownership fixture. The fake uses the SDK's imported autoreleasing
+// No-radio cleanup fixture. The fake uses the SDK's imported autoreleasing
 // out-parameter convention, with ordinary Objective-C objects and no device
 // discovery, SDP request or RFCOMM operation. An early deallocation exits
 // before a stale autorelease entry could be consumed by the test process.
@@ -543,7 +543,7 @@ static int test_pending_open_cleanup(BOOL deliver_close, BOOL detach_delegate) {
     if (!deliver_close || !detach_delegate) {
         if (g_unconfirmed_close) {
             // A queued late callback still targets a live delegate, but its
-            // raw context link is detached and cannot resurrect the owner.
+            // `ctx` link is NULL, so it cannot reach the retired context.
             [g_unconfirmed_close->delegate
                 rfcommChannelOpenComplete:g_unconfirmed_close->channel
                 status:kIOReturnSuccess];
@@ -688,8 +688,7 @@ static RfcommContext *open_selected_device(IOBluetoothDevice *device,
         // wakeup. SerialPort callers instead require successful completion of
         // this helper's fresh SDP query before using any service record.
         // Startup processing, both branches and RFCOMM opening share one
-        // native deadline. Neither startup processing nor connected state
-        // proves that the framework will accept the next operation.
+        // native deadline.
         SdpQueryDelegate *sdp = resolve_serial_port ? [[SdpQueryDelegate alloc] init] : nil;
         if (resolve_serial_port && !sdp) {
             return fail_open(ctx, BT_HELPER_EXIT_CONTEXT_ALLOCATION, failure, runtime);

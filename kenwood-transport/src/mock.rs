@@ -3,8 +3,8 @@
 //! [`MockTransport`] is available with every feature configuration. Use
 //! [`MockTransport::expect`] for exact writes, partial or delayed read scripts
 //! for framing/deadline tests, and [`MockTransport::expect_reopen`] for
-//! caller-owned recovery policy. This mock does not reproduce a descriptor's
-//! lifecycle or prove real transport retirement.
+//! caller-owned recovery policy. The mock models no descriptor lifecycle:
+//! close and reopen change only the script.
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -38,15 +38,14 @@ enum MockRead {
 ///
 /// With no queued response, reads return [`std::io::ErrorKind::WouldBlock`]
 /// unless [`Self::pend_when_empty`] requests a pending future. Empty-buffer
-/// reads still follow the script; they are not connection-health checks.
+/// reads still follow the script.
 /// A scripted hang has no intrinsic deadline. Use caller-owned timeouts for
 /// hangs and delayed data, while preserving the read cancellation contract.
 ///
 /// Close clears queued read outcomes and succeeds, but retains future expected
 /// exchanges and reopen results. It does not track a closed/open descriptor
 /// state: later writes need no preceding reopen. Reopen consumes its separate
-/// result script and otherwise succeeds. This is a protocol-policy fixture,
-/// not independent evidence that production code released physical resources.
+/// result script and otherwise succeeds.
 #[derive(Debug)]
 pub struct MockTransport {
     exchanges: VecDeque<(Vec<u8>, Vec<MockRead>)>,

@@ -1,33 +1,39 @@
-//! Errors reported by byte transports and their platform connection owners.
+//! Errors reported by byte transports and their platform backends.
 
 use thiserror::Error;
 
 /// Host-observed stage at which one native Bluetooth opening attempt failed.
 ///
-/// A stage identifies the helper's boundary, not a cause in the peer's firmware
-/// or evidence that another attempt would succeed. Timeout stages use the
-/// shared opening deadline. Retry policy belongs to the model or caller.
+/// A stage names the helper operation that failed on this host, not a cause in
+/// the peer's firmware. Every deadline stage refers to the one absolute opening
+/// deadline shared by startup processing, service discovery and RFCOMM opening.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BluetoothOpenStage {
-    /// The opening deadline expired before startup event processing admitted SDP.
+    /// The opening deadline expired during the startup run-loop slice, before
+    /// the service-discovery query was issued.
     StartupDeadline,
-    /// The helper could not allocate its native opening context.
+    /// The helper could not allocate its native opening context or delegates.
     ContextAllocation,
-    /// The framework rejected dispatch of service discovery.
+    /// The framework rejected dispatch of the service-discovery query.
     SdpStart,
-    /// Service discovery or its required baseband state failed to complete.
+    /// The service-discovery callback reported failure, or the device never
+    /// reported a connected baseband.
     SdpCompletion,
-    /// The opening deadline expired before service discovery was admitted.
+    /// The opening deadline expired while waiting for the service-discovery
+    /// callback, or before the RFCOMM opening request was dispatched.
     SdpDeadline,
-    /// Service records did not resolve to exactly one valid Serial Port channel.
+    /// Service records did not resolve to exactly one Serial Port channel in
+    /// the range 1 to 30.
     ServiceResolution,
     /// The framework rejected dispatch of the RFCOMM opening request.
     RfcommStart,
-    /// RFCOMM completion failed or the channel closed before admission.
+    /// The RFCOMM open callback reported failure, or the channel closed before
+    /// that callback fired.
     RfcommCompletion,
-    /// The opening deadline expired before RFCOMM admission.
+    /// The opening deadline expired before the RFCOMM open callback fired.
     RfcommDeadline,
-    /// The opened channel was absent or did not match its requested channel.
+    /// The opened channel was absent or carried a channel number other than
+    /// the requested one.
     RfcommEndpoint,
 }
 
@@ -48,10 +54,11 @@ impl std::fmt::Display for BluetoothOpenStage {
     }
 }
 
-/// Why native channel release could not be proved within its cleanup bound.
+/// Why native channel release could not be confirmed within its cleanup bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BluetoothCloseFailure {
-    /// Native close confirmation or callback-delegate detachment was not proved.
+    /// The channel-closed callback did not arrive, or detaching the callback
+    /// delegate failed.
     ChannelUnconfirmed,
     /// The helper exited with an unsuccessful code or signal.
     HelperExited {
@@ -60,7 +67,7 @@ pub enum BluetoothCloseFailure {
     },
     /// Cleanup had to terminate the helper instead of confirming native close.
     ForcedTermination,
-    /// The helper remains owned by deferred cleanup; release is not yet proved.
+    /// The helper has not been reaped yet, so its channel release is unconfirmed.
     ReapPending,
 }
 
@@ -71,23 +78,24 @@ pub enum TransportError {
     /// A native opening attempt failed at a known host-observed stage.
     #[error("Bluetooth open failed during {stage}")]
     BluetoothOpen {
-        /// Host-observed failure boundary, not an inferred firmware cause.
+        /// Helper operation at which the attempt failed.
         stage: BluetoothOpenStage,
     },
-    /// An opening failure and independent native cleanup uncertainty.
+    /// An opening failure plus an unconfirmed native channel close.
     ///
-    /// The shared transport produces this variant only after receiving a
-    /// complete failure record and reaping the helper with its matching exit
-    /// status. Reaping proves process retirement, not channel closure or
-    /// cancellation of any operation still owned by the operating system.
-    /// Retry permission remains an explicit model or caller policy.
+    /// Produced only after the helper writes a complete failure record and is
+    /// reaped with the exit status that record names. The helper process is
+    /// gone, but the RFCOMM channel may still be open in the operating system
+    /// and any operation the OS still owns is not cancelled. This crate never
+    /// retries after this error.
     #[error(
-        "Bluetooth open failed during {stage}; native cleanup was not proved: {cleanup:?} (helper reaped)"
+        "Bluetooth open failed during {stage}; native cleanup unconfirmed: {cleanup:?} (helper reaped)"
     )]
     BluetoothOpenWithCleanup {
-        /// The original host-observed opening failure, retained without replacement.
+        /// Helper operation at which the attempt failed, unchanged by cleanup.
         stage: BluetoothOpenStage,
-        /// Independent native cleanup failure, not the cause of the opening failure.
+        /// Cleanup failure recorded while abandoning the attempt; it has its
+        /// own cause and did not produce `stage`.
         cleanup: BluetoothCloseFailure,
     },
     /// A typed Bluetooth selector or channel could not be constructed.
@@ -99,10 +107,10 @@ pub enum TransportError {
         value: String,
     },
 
-    /// Native Bluetooth release failed or could not be proved.
-    #[error("Bluetooth channel closure was not proved: {failure:?}")]
+    /// Native Bluetooth release failed or could not be confirmed.
+    #[error("Bluetooth channel closure unconfirmed: {failure:?}")]
     BluetoothClose {
-        /// Conservative outcome of bounded cleanup.
+        /// Why bounded cleanup could not confirm the close.
         failure: BluetoothCloseFailure,
     },
     /// Failed to open the serial port at the given path.

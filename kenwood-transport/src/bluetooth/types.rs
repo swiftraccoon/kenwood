@@ -1,4 +1,7 @@
 //! Platform-independent validated Bluetooth selection and service values.
+//!
+//! Every constructor in this module validates syntax only. None consults the
+//! host pairing list, and none reports device presence or reachability.
 
 use std::fmt;
 use std::str::FromStr;
@@ -13,9 +16,9 @@ use crate::TransportError;
 ///
 /// Available on every platform with `native-bluetooth`. All clones share one
 /// flag, initially clear. A canceled token cannot be reset or reused for a new
-/// successful operation. It cancels discovery/opening, not an already returned
-/// connection; explicitly close that transport. Canceling a token does not join
-/// a blocking worker or prove helper retirement. Retain and join the worker.
+/// successful operation. It cancels discovery and opening only; close an
+/// already returned connection explicitly. Canceling does not join the blocking
+/// worker, so the caller retains that worker and joins it.
 #[derive(Debug, Clone, Default)]
 pub struct BluetoothOpenCancellation {
     requested: Arc<AtomicBool>,
@@ -48,8 +51,7 @@ impl BluetoothOpenCancellation {
 /// Available on every platform with `native-bluetooth`. Parsing accepts exactly
 /// six two-digit ASCII hexadecimal octets, separated consistently by either
 /// colons or hyphens. Hexadecimal letters may have either case. Mixed separators,
-/// whitespace, omitted zeroes and non-ASCII digits are rejected. Parsing checks
-/// syntax only, not pairing, device presence, identity or reachability.
+/// whitespace, omitted zeroes and non-ASCII digits are rejected.
 ///
 /// # Examples
 ///
@@ -76,7 +78,7 @@ impl BluetoothOpenCancellation {
 pub struct BluetoothAddress(String);
 
 impl BluetoothAddress {
-    /// Canonical address text; this never names a display-name selector.
+    /// Canonical uppercase hyphen-separated address text.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -129,7 +131,6 @@ impl fmt::Display for BluetoothAddress {
 /// 1,024 UTF-8 bytes and no Unicode control characters. Text that parses as a
 /// [`BluetoothAddress`] is rejected. Case, spaces and other non-control Unicode
 /// characters are retained exactly; there is no trimming or normalization.
-/// A valid name is only a selector, not evidence of a paired or reachable radio.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BluetoothDeviceName(String);
 
@@ -153,7 +154,7 @@ impl BluetoothDeviceName {
         }
     }
 
-    /// Validated display-name text, not physical identity evidence.
+    /// The exact validated name text, with case and spacing unchanged.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -185,8 +186,7 @@ impl BluetoothDeviceSelector {
 
 /// Validated RFCOMM server channel in the Bluetooth domain 1 through 30.
 ///
-/// Available on every platform with `native-bluetooth`. A valid number is not
-/// evidence that a device offers a service on that channel.
+/// Available on every platform with `native-bluetooth`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RfcommChannel(u8);
 
@@ -219,9 +219,9 @@ impl RfcommChannel {
 pub enum BluetoothService {
     /// Use an explicitly selected channel and retain the baseband wakeup.
     ///
-    /// The caller supplies channel provenance, such as a model-qualified value
-    /// or a channel returned by its previous successful opening of this device.
-    /// This policy does not rediscover or substitute a channel.
+    /// The caller supplies the channel number, typically one returned by a
+    /// previous successful open of the same device. No service discovery runs
+    /// and the channel is never substituted.
     FixedChannel(RfcommChannel),
     /// Await a fresh SDP callback and resolve the Serial Port service UUID 0x1101.
     SerialPort,
@@ -229,10 +229,10 @@ pub enum BluetoothService {
 
 /// One paired device, identified by its exact address rather than its name.
 ///
-/// Available on every platform with `native-bluetooth`. Inventory is cached
-/// host pairing metadata, not evidence of current connection or protocol
-/// readiness. Display names are observations and need not satisfy the grammar
-/// of a caller-created [`BluetoothDeviceName`].
+/// Available on every platform with `native-bluetooth`. Both fields come from
+/// the host pairing cache, so the device need not be connected or reachable.
+/// Display names are reported as the host holds them and need not satisfy the
+/// grammar of a caller-created [`BluetoothDeviceName`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairedBluetoothDevice {
     pub(super) address: BluetoothAddress,

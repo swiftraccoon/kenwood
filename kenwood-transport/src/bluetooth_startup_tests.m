@@ -1,6 +1,6 @@
 // Included after the selected-device pipeline. These NSObject fixtures never
 // enumerate devices or invoke an IOBluetooth implementation. They exercise
-// production ordering, deadline admission, callbacks, and normal cleanup.
+// production ordering, deadline checks, callbacks, and normal cleanup.
 typedef struct {
     double now;
     double pump_advance;
@@ -143,8 +143,8 @@ static int test_startup_progress(void) {
     if (!startup_fixture_case(0.0, 1.5, 0.0, kCFRunLoopRunTimedOut,
             kIOReturnSuccess, BT_HELPER_EXIT_STARTUP_DEADLINE, 1, 0, 0)) return 114;
 
-    // A run loop can finish early. Its return is an ordering opportunity,
-    // not proof of readiness: acceptance still requires the channel callback.
+    // A run loop can finish early; the open still succeeds only when the
+    // channel open-complete callback reports success.
     if (!startup_fixture_case(0.0, 0.0, 0.0, kCFRunLoopRunFinished,
             kIOReturnSuccess, 0, 1, 1, 1)) return 115;
     if (!startup_fixture_case(0.0, 0.0, 0.0, kCFRunLoopRunFinished,
@@ -156,8 +156,8 @@ static int test_startup_progress(void) {
             kIOReturnSuccess, BT_HELPER_EXIT_STARTUP_DEADLINE, 1, 0, 0)) return 117;
     if (g_startup_fixture.requested_slice != 0.03125) return 118;
 
-    // Dispatching SDP does not grant permission to open a channel after the
-    // shared absolute deadline expires during that operation.
+    // The shared absolute deadline is re-checked after SDP returns, so an SDP
+    // call that consumes the whole budget prevents the RFCOMM open.
     if (!startup_fixture_case(0.0, 0.0, 1.0, kCFRunLoopRunFinished,
             kIOReturnSuccess, BT_HELPER_EXIT_SDP_DEADLINE, 1, 1, 0)) return 119;
     return 0;

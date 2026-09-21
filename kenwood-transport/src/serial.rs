@@ -42,7 +42,7 @@ impl FlowControl {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineState {
     /// Do not request a line change. The operating system may still change
-    /// the line during open; this is not a guarantee of electrical continuity.
+    /// the line during open.
     Preserve,
     /// Request the asserted state.
     Assert,
@@ -60,7 +60,7 @@ impl LineState {
     }
 }
 
-/// Descriptor-release policy selected by the endpoint owner.
+/// How [`Transport::close`] releases the serial descriptor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseMode {
     /// Request asynchronous stream shutdown before dropping the descriptor.
@@ -109,11 +109,10 @@ impl SerialOptions {
 /// Available with the `serial` feature, enabled by default.
 ///
 /// Writes complete only after all supplied bytes and the stream flush
-/// complete according to the serial backend. This is not independent
-/// hardware-drain or peer-receipt evidence; only errors surfaced by the
-/// backend can be preserved. Canceling a write may leave a transmitted prefix;
-/// no retry is performed. Reads expose received bytes without protocol
-/// interpretation.
+/// complete according to the serial backend. That boundary is the backend's
+/// flush, not line drain or peer receipt; only errors the backend surfaces can
+/// be reported. Canceling a write may leave a transmitted prefix; no retry is
+/// performed. Reads expose received bytes without protocol interpretation.
 /// Closing takes ownership of the descriptor before awaiting shutdown, so
 /// cancellation still drops it and leaves this transport closed.
 /// Read, write and asynchronous shutdown have no intrinsic deadline. An
@@ -126,8 +125,9 @@ impl SerialOptions {
 /// still performs the stream flush. Reads and writes after close starts fail;
 /// a repeated close succeeds without replacing an earlier close error.
 ///
-/// [`Transport::reopen`] is unsupported. Reopening and re-establishing protocol
-/// identity are responsibilities of the model-specific owner.
+/// [`Transport::reopen`] is unsupported: it returns
+/// [`TransportError::ReopenUnsupported`], so the caller opens a fresh transport
+/// and re-establishes protocol identity itself.
 #[derive(Debug)]
 pub struct SerialTransport {
     /// `None` after close starts, including while shutdown is pending.
@@ -184,8 +184,8 @@ impl SerialTransport {
 impl Transport for SerialTransport {
     /// Write all bytes, then flush the serial stream backend.
     ///
-    /// Success is not independent hardware-drain or peer-receipt evidence.
-    /// See the [type contract](Self) for cancellation and deadline behavior.
+    /// See the [type contract](Self) for the completion boundary, cancellation
+    /// and deadline behavior.
     async fn write(&mut self, data: &[u8]) -> Result<(), TransportError> {
         tracing::trace!(path = %self.path, raw = ?data, "serial write requested");
         write_flushed(self.port_mut()?, data).await?;
@@ -214,7 +214,7 @@ impl Transport for SerialTransport {
     /// Take the descriptor, optionally request shutdown, and then drop it.
     ///
     /// Pending-future cancellation still drops the taken descriptor. A
-    /// shutdown error is [`TransportError::Disconnected`]; this owner remains
+    /// shutdown error is [`TransportError::Disconnected`]; this transport stays
     /// closed even on that error. There is no intrinsic shutdown deadline.
     async fn close(&mut self) -> Result<(), TransportError> {
         tracing::info!(path = %self.path, "serial close requested");

@@ -49,7 +49,7 @@
 //! pending indefinitely. Retain and await the consuming recovery future when
 //! ownership matters; see its [cancellation contract](StreamAdapter::shutdown_and_recover).
 //! Recovery discards unread adapter buffers rather than returning them with
-//! the transport. It is not a lossless transfer of protocol parser state.
+//! the transport.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -200,8 +200,7 @@ struct PumpExit<T> {
 /// [`io::Error`] is reconstructed; its original typed source and downcast
 /// identity are not preserved. A pump-task panic cannot preserve `T`
 /// because unwinding has already dropped it, so `transport` is `None` on that
-/// path. Retaining `T` does not establish that reopening or a protocol retry is
-/// supported or safe.
+/// path.
 ///
 /// # Examples
 ///
@@ -253,8 +252,8 @@ impl<T> StreamRecoveryError<T> {
     /// Separate the recoverable transport from the reconstructed I/O failure.
     ///
     /// The error retains its kind and display text, not its original typed
-    /// source chain. `None` means the pump did not return a transport owner;
-    /// it is not a successful-close observation.
+    /// source chain. `None` means the pump task panicked and `T` was dropped
+    /// during unwinding.
     #[must_use]
     pub fn into_parts(self) -> (Option<T>, io::Error) {
         (self.transport, self.source)
@@ -409,10 +408,8 @@ impl<T: Transport + 'static> StreamAdapter<T> {
     ///
     /// # Examples
     ///
-    /// Retain recovery even if the caller's observation window expires. No
-    /// hardware is used here. Real applications must also define what to do
-    /// when their transport cannot make progress; dropping this future is not
-    /// a substitute for that policy.
+    /// Retain the recovery future even when the caller's observation window
+    /// expires; this example uses only a mock.
     ///
     /// ```rust
     /// use std::time::Duration;
