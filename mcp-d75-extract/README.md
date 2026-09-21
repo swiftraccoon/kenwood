@@ -2,9 +2,9 @@
 
 Extracts the MCP memory-map layout of Kenwood's TH-D75 and TM-D750 from the
 official Memory Control Programs (MCP-D75, MCP-D750) into a deterministic JSON
-manifest, and diffs manifests across firmware releases. For the TH-D75 it
-also generates the Rust menu-field registry that powers the verified menu
-patching in [`kenwood-thd75`](../thd75/).
+manifest, and diffs manifests across firmware releases. It also generates the
+Rust menu-field registries that power the verified menu patching in
+[`kenwood-thd75`](../thd75/) and [`kenwood-tmd750`](../tmd750/).
 
 The programs are .NET applications. `ilspycmd` decompiles them; the extractor
 reads the serializer write methods and records every write as a name, an
@@ -34,7 +34,8 @@ mcp-d75-extract extract --model thd75 \
 mcp-d75-extract extract --model tmd750 \
   --assembly /path/to/mcp_d750.exe --mcp-version 1.00 --firmware 1.00 \
   --language-file /path/to/english.lng \
-  --output tmd750/data/mcp_d750_menu_schema.json --strict-known-layout
+  --output tmd750/data/mcp_d750_menu_schema.json \
+  --rust-output tmd750/src/memory/menu_fields.rs --strict-known-layout
 
 mcp-d75-extract diff old.json new.json
 ```
@@ -67,8 +68,10 @@ expose no public properties are cataloged, not extracted. Enum-valued codecs
 name their enum's declaring class, and each menu carries the catalogs of the
 enums it uses, joined to the combo-box labels of the language file.
 
-The generated Rust registry is produced for the TH-D75 only; it requires
-absolute addresses and refuses manifests with dimension terms.
+The generated Rust registries differ per radio: the TH-D75 registry requires
+absolute addresses and refuses a manifest with dimension terms, while the
+TM-D750 registry carries each field's `pm_slot` term together with the image
+length and slot constants read from the manifest's dimension anchor.
 
 ## Failure policy
 

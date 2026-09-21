@@ -49,32 +49,31 @@ const TMD750_TARGET: Target = Target {
     terms: true,
     module_docs: &[
         "//!",
-        "//! This catalog describes storage, enum labels and slot-relative addressing.",
-        "//! Entry presence does not authorize a live write. Inspect",
-        "//! [`MenuField::write_policy`] and prepare a",
-        "//! [`MenuUpdatePlan`](crate::radio::menu::MenuUpdatePlan) for ordinary settings.",
-        "//! Lifecycle-restricted, unresolved and binary entries remain discoverable",
-        "//! without being admitted by that setter. Generated metadata is not evidence",
-        "//! of firmware compatibility or hardware qualification.",
+        "//! This catalog describes storage, enum labels and slot-relative addressing",
+        "//! extracted from the official program's serializers, not from radio",
+        "//! captures. [`MenuField::write_policy`] classifies each entry as ordinary,",
+        "//! lifecycle-restricted, unresolved or binary; a",
+        "//! [`MenuUpdatePlan`](crate::radio::menu::MenuUpdatePlan) accepts only",
+        "//! ordinary entries.",
     ],
     field_docs: &[
         "/// Storage metadata for one public MCP-D750 menu or repeated-record field.",
         "///",
         "/// The descriptor and domains support inspection and offline planning.",
-        "/// Check [`MenuField::write_policy`] before preparing a",
-        "/// [`MenuUpdatePlan`](crate::radio::menu::MenuUpdatePlan); that plan also",
-        "/// requires supported identity, operating state and captured-page evidence.",
-        "/// A listed field is not necessarily writable by an ordinary live setter.",
+        "/// [`MenuField::write_policy`] states whether an ordinary",
+        "/// [`MenuUpdatePlan`](crate::radio::menu::MenuUpdatePlan) accepts the field;",
+        "/// that plan also requires the supported identity, Gateway Off, a valid",
+        "/// active PM and complete captured before-image pages.",
     ],
     descriptor_doc: "Base offset, optional PM-slot address terms, and on-image codec.",
     registry_docs: &[
         "/// Public storage fields represented by the reviewed MCP-D750 serializers.",
         "///",
-        "/// Presence in this registry does not establish hardware qualification",
-        "/// or authorize writing. [`MenuField::write_policy`] distinguishes ordinary",
-        "/// settings from lifecycle-restricted, unresolved and binary fields.",
-        "/// Use [`MenuUpdatePlan`](crate::radio::menu::MenuUpdatePlan) for guarded",
-        "/// ordinary changes rather than interpreting this list as an allowlist.",
+        "/// [`MenuField::write_policy`] distinguishes ordinary settings from",
+        "/// lifecycle-restricted, unresolved and binary fields; this list is a",
+        "/// catalog, not an allowlist. Use",
+        "/// [`MenuUpdatePlan`](crate::radio::menu::MenuUpdatePlan) for guarded",
+        "/// ordinary changes.",
     ],
 };
 
@@ -773,8 +772,7 @@ fn menu_field_entry_lines(
 /// Returns an error for an unsupported model, dimension terms on a TH-D75
 /// field, or missing TM-D750 slot metadata. Also rejects missing enum catalogs
 /// or option domains, unrepresentable codec domains, and a rendered field count
-/// that disagrees with the manifest's summary. Rendering describes storage;
-/// it does not grant permission to write a radio.
+/// that disagrees with the manifest's summary.
 pub fn rust_text(manifest: &Manifest) -> Result<String> {
     let target = match manifest.model.radio.as_str() {
         "thd75" => &THD75_TARGET,

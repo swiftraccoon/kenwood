@@ -384,21 +384,21 @@ fn manifest_round_trips_and_rustgen_emits_slot_terms() -> TestResult {
 }
 
 #[test]
-fn registry_documents_metadata_without_granting_write_authority() -> TestResult {
+fn registry_documents_metadata_as_a_catalog() -> TestResult {
     let registry = rust_text(&manifest()?)?;
     assert!(
         registry
             .contains("Storage metadata for one public MCP-D750 menu or repeated-record field."),
-        "a serializer descriptor is not an admitted live operation"
+        "a serializer descriptor is documented as storage metadata"
     );
     assert!(
         registry.contains("[`MenuField::write_policy`]")
             && registry.contains("[`MenuUpdatePlan`](crate::radio::menu::MenuUpdatePlan)"),
-        "generated docs must lead readers to actual policy and plan admission"
+        "generated docs must point readers at the write policy and the update plan"
     );
     assert!(
-        registry.contains("Presence in this registry does not establish hardware qualification"),
-        "enumeration cannot become hardware evidence"
+        registry.contains("catalog, not an allowlist"),
+        "the registry is documented as a catalog, not an allowlist"
     );
     assert!(
         !registry.contains("All safely writable public fields")
