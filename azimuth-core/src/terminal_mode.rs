@@ -246,10 +246,13 @@ fn map_transport_failure(error: &TransportError) -> DvGatewayRecoveryError {
     }
 }
 
-/// Classify one completed fixed-channel open without retrying or replacing its owner.
+/// Classify one completed fixed-channel open attempt.
 ///
-/// Only absence and fixed-channel startup failures allow another candidate.
-/// Cleanup, cancellation, helper and SDP service-resolution failures remain terminal.
+/// `Ok(Some(transport))` on success; `Ok(None)` when the caller should try the
+/// next paired candidate, namely an absent device or an open failure at any
+/// stage except `StartupDeadline` and `ServiceResolution`; and `Err` for those
+/// two stages and for unconfirmed cleanup, cancellation and helper failures,
+/// which end the whole discovery pass.
 #[cfg(any(target_os = "macos", test))]
 fn fixed_channel_open_result<T>(
     result: Result<T, TransportError>,
@@ -786,14 +789,14 @@ pub enum AprsCurrentModeRecoveryError {
         /// Exact actor/channel failure.
         detail: String,
     },
-    /// The approved CAT identity was malformed.
-    #[error("the approved CAT radio serial is invalid: {detail}")]
+    /// The expected CAT serial supplied by the caller was malformed.
+    #[error("the expected CAT radio serial is invalid: {detail}")]
     InvalidExpectedRadioSerial {
         /// Exact validation failure.
         detail: String,
     },
     /// The caller supplied a Menu 983 value outside its closed 0/1 domain.
-    #[error("approved Menu 983 route {value} is invalid; expected 0 (USB-C) or 1 (Bluetooth)")]
+    #[error("expected Menu 983 route {value} is invalid; expected 0 (USB-C) or 1 (Bluetooth)")]
     InvalidExpectedKissInterface {
         /// Invalid raw value.
         value: u8,
@@ -804,12 +807,12 @@ pub enum AprsCurrentModeRecoveryError {
         /// CAT query detail.
         detail: String,
     },
-    /// Fresh CAT identity did not match the approved actor identity.
+    /// Fresh CAT identity did not match the expected serial.
     #[error(
-        "selected CAT radio serial {actual} does not match approved radio serial {expected}; no setting was changed"
+        "selected CAT radio serial {actual} does not match the expected radio serial {expected}; no setting was changed"
     )]
     RadioIdentityMismatch {
-        /// Approved identity.
+        /// Expected serial supplied by the caller.
         expected: String,
         /// Fresh identity.
         actual: String,
@@ -820,12 +823,12 @@ pub enum AprsCurrentModeRecoveryError {
         /// Qualification detail.
         detail: String,
     },
-    /// Live Menu 983 no longer matched the route the caller approved.
+    /// Live Menu 983 did not match the route the caller requested.
     #[error(
-        "Menu 983 now routes KISS to raw interface {actual}, not approved interface {expected}; no setting was changed"
+        "Menu 983 now routes KISS to raw interface {actual}, not the requested interface {expected}; no setting was changed"
     )]
     KissInterfaceMismatch {
-        /// Approved raw route.
+        /// Expected raw route supplied by the caller.
         expected: u8,
         /// Fresh raw route read inside MCP.
         actual: u8,
@@ -833,10 +836,10 @@ pub enum AprsCurrentModeRecoveryError {
     /// Menu 983 mismatch proved zero writes, but MCP/CAT cleanup could not be
     /// completed and the endpoint must be reopened explicitly.
     #[error(
-        "Menu 983 routes KISS to raw interface {actual}, not approved interface {expected}; no setting was changed, but MCP cleanup failed: {detail}"
+        "Menu 983 routes KISS to raw interface {actual}, not the requested interface {expected}; no setting was changed, but MCP cleanup failed: {detail}"
     )]
     KissInterfaceMismatchAndCleanupFailed {
-        /// Approved raw route.
+        /// Expected raw route supplied by the caller.
         expected: u8,
         /// Fresh raw route read inside MCP.
         actual: u8,
@@ -904,9 +907,9 @@ pub enum DvGatewayCatDisableError {
         /// Exact actor/channel failure.
         detail: String,
     },
-    /// The serial retained from the approved CAT session is not a valid exact
+    /// The serial retained from the connected CAT session is not a valid exact
     /// CAT `AE` identity.
-    #[error("the approved CAT radio serial is invalid: {detail}")]
+    #[error("the expected CAT radio serial is invalid: {detail}")]
     InvalidExpectedRadioSerial {
         /// Exact validation failure.
         detail: String,
@@ -918,12 +921,12 @@ pub enum DvGatewayCatDisableError {
         detail: String,
     },
     /// The selected CAT endpoint now answers as a different physical radio
-    /// than the one proved before the user approved the operation.
+    /// than the one identified when the session was connected.
     #[error(
-        "selected CAT radio serial {actual} does not match the approved radio serial {expected}; no setting was changed"
+        "selected CAT radio serial {actual} does not match the expected radio serial {expected}; no setting was changed"
     )]
     RadioIdentityMismatch {
-        /// CAT serial retained from the approved connected session.
+        /// CAT serial retained from the connected session.
         expected: String,
         /// Fresh CAT `AE` serial read immediately before the mutation gate.
         actual: String,
@@ -2410,7 +2413,7 @@ mod tests {
         assert_ne!(
             cancellation.state.load(Ordering::Acquire) & MCP_OPERATION_STARTED,
             0,
-            "the fresh Menu 983 proof belongs inside the approved MCP gate"
+            "the fresh Menu 983 read belongs inside the MCP gate"
         );
         Ok(())
     }

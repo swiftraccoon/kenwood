@@ -75,11 +75,11 @@ pub enum AprsStartAuthority {
         /// Selected endpoint's expected Menu 983 raw value (0=USB-C, 1=Bluetooth).
         expected_kiss_interface_raw_value: u8,
     },
-    /// One retry after the approved same-MCP Menu 983/Menu 506/Menu 650 operation.
+    /// One retry after a completed same-MCP Menu 983/Menu 506/Menu 650 recovery operation.
     CurrentModeRecovery {
-        /// Exact CAT `AE` serial returned by the approved recovery operation.
+        /// Exact CAT `AE` serial returned by that recovery operation.
         expected_radio_serial_number: String,
-        /// Menu 506 band proved by the approved recovery operation.
+        /// Menu 506 band read by that recovery operation.
         expected_data_band: TncDataBand,
     },
 }

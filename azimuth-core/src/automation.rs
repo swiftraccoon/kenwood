@@ -235,9 +235,10 @@ pub struct SettingReadResult {
 /// Result for one accepted change after post-exit live verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum SettingChangeOutcome {
-    /// The approved value differed and its containing page was verified.
+    /// The desired value differed from the reviewed value and its containing
+    /// page was written and verified.
     Applied,
-    /// The approved value already matched the reviewed value.
+    /// The desired value already matched the reviewed value.
     AlreadyCurrent,
 }
 
@@ -246,7 +247,7 @@ pub enum SettingChangeOutcome {
 pub struct SettingChangeResult {
     /// Stable catalog identifier.
     pub setting_id: String,
-    /// Whether execution changed the approved value.
+    /// Whether execution wrote the desired value.
     pub outcome: SettingChangeOutcome,
     /// Verified final typed value.
     pub value: SettingValue,
@@ -733,14 +734,14 @@ impl AutomationController {
             })?
     }
 
-    /// Synchronously cancel approved APRS current-mode recovery before its
-    /// atomic MCP gate.
+    /// Synchronously cancel APRS current-mode recovery before its atomic MCP
+    /// gate.
     pub fn cancel_aprs_current_mode_recovery(self: Arc<Self>) {
         self.aprs_current_mode_recovery_cancellation.request();
     }
 
-    /// Re-prove the approved radio, live Menu 983 route, and strict Menu 506
-    /// TNC band, then set Menu 650 to Off only when needed.
+    /// Re-read the expected radio serial, the live Menu 983 route, and the
+    /// strict Menu 506 TNC band, then set Menu 650 to Off only when needed.
     ///
     /// Menu 983, Menu 506, and Menu 650 are read in the same MCP transaction.
     /// A live route mismatch or invalid Menu 506 value performs zero writes.
@@ -2600,7 +2601,7 @@ fn verify_refreshed_changes(
             if *actual != &change.desired_value {
                 return Err(AutomationError::SettingsApply {
                     detail: format!(
-                        "post-exit live read-back for {} was {actual:?}, not the approved value {:?}; pages {pages_written:?} were written and the cached snapshot now reflects the radio",
+                        "post-exit live read-back for {} was {actual:?}, not the requested value {:?}; pages {pages_written:?} were written and the cached snapshot now reflects the radio",
                         change.setting_id, change.desired_value
                     ),
                 });

@@ -22,7 +22,7 @@ proved USB serial identity. Rust owns the protocol stream and exposes:
   choice values;
 - explicit specialized presentation for the bitmap and scaled GPS coordinate
   fields, with checked raw-storage and display-seconds conversion helpers;
-- automatic user-approved batch execution for ordinary settings with typed
+- batch execution of reviewed changes for ordinary settings with typed
   preconditions, an exact full-page compare before any write, and a fresh
   post-exit radio read before final values are reported; Menu 650 and Menu 980
   remain behind dedicated disruptive lifecycles;
@@ -42,15 +42,15 @@ operation with no retry or acknowledgement correlation. IF-DSP retuning and
 frequency restoration use a bounded sequence of individually read-back-
 verified UP/DW steps; direct FO/FQ frequency writes remain quarantined.
 
-## Setting approval safety
+## Setting change safety
 
 `read_setting_values` retains the complete MCP pages behind an opaque snapshot
 identifier. Every accepted `SettingChange` repeats that identifier, the value
 shown during review, and the desired value. `apply_setting_changes` validates
 the complete batch before I/O, checks the typed preconditions, and uses the
 TH-D75 compare-and-exchange page primitive. That primitive reads every affected
-live page and compares every byte before starting the first write. A changed
-radio setting therefore invalidates the approval and causes zero writes.
+live page and compares every byte before starting the first write. A radio
+setting that changed after the snapshot therefore causes zero writes.
 
 All typed values read from or written to the controller are the exact raw
 storage values, including storage-representable off-menu snapshot values that

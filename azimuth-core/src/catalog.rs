@@ -259,9 +259,9 @@ pub struct SettingChange {
     pub setting_id: String,
     /// Snapshot that supplied `expected_value`.
     pub snapshot_id: u64,
-    /// Value shown to the user before approval.
+    /// Value shown to the user during review.
     pub expected_value: SettingValue,
-    /// Approved value to apply automatically.
+    /// Value to write.
     pub desired_value: SettingValue,
 }
 
