@@ -941,7 +941,7 @@ pub(crate) enum AprsMessageState {
 /// Cached APRS station for the TUI display.
 ///
 /// The library's `StationEntry` uses `Instant` for timestamps which is
-/// not useful for display. This caches the fields we need plus a
+/// not useful for display. This caches the fields needed plus a
 /// wall-clock time for "ago" display.
 #[derive(Debug, Clone)]
 pub(crate) struct AprsStationCache {
@@ -2202,7 +2202,7 @@ impl App {
                 }
                 SettingRow::FmRadio => {
                     self.status_message = Some(
-                        "FM Radio is read-only: retained hardware evidence rejects FR writes"
+                        "FM Radio is read-only here: the radio answers N to FR writes; change it in Menu 700"
                             .into(),
                     );
                     return;
@@ -3366,7 +3366,7 @@ impl App {
                 self.status_message = Some(format!("Responded to query from {to}"));
             }
             AprsEvent::RawPacket(_) => {
-                // Silently ignore raw packets for now.
+                // Raw packets have no panel; they are not displayed.
             }
         }
     }
@@ -3557,8 +3557,10 @@ impl App {
     }
 
     fn toggle_fm_radio(&mut self) {
-        self.status_message =
-            Some("FM Radio is read-only: retained hardware evidence rejects FR writes".into());
+        self.status_message = Some(
+            "FM Radio is read-only here: the radio answers N to FR writes; change it in Menu 700"
+                .into(),
+        );
     }
 
     /// Apply a channel edit from the edit buffer.
@@ -3623,8 +3625,8 @@ impl App {
             | ChannelEditField::ToneFreq
             | ChannelEditField::Duplex
             | ChannelEditField::Offset => {
-                // These fields are stored in the ME channel record. No
-                // hardware-qualified ME writer is exposed; permanent memory
+                // These fields are stored in the ME channel record. No ME
+                // writer with verified readback is exposed; permanent memory
                 // storage would instead require a verified MCP editor.
                 self.status_message = Some(format!(
                     "Ch {ch_num}: {} editing not yet implemented; requires ME write",
@@ -3865,7 +3867,7 @@ mod tests {
     }
 
     /// A poll that carries empty static fields must not erase what the
-    /// radio told us once at connect. Firmware version and radio type
+    /// radio reported once at connect. Firmware version and radio type
     /// are read a single time; the periodic poll leaves them blank, so
     /// a naive `self.state = state` blanks the header on every tick.
     #[test]

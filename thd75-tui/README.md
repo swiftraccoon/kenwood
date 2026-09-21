@@ -13,9 +13,9 @@ Terminal UI for the Kenwood TH-D75. Built on [`kenwood-thd75`](../thd75/), [rata
 - APRS monitor panel: decoded position (including Mic-E), message, and weather reports, plus digipeated packets, query responses, and a last-heard station list. Status, telemetry, object, and item packets are received but not yet decoded into their own display.
 - D-STAR modem monitor (via [`mmdvm`](../mmdvm/)): heard stations, voice events,
   slow-data text, and gateway-command observations. TH-D75 mode entry and
-  restoration remain with the radio library; this panel does not establish a
-  reflector network connection.
-- MCP programming: full memory dump (~55 s at 9600 baud), memory-image
+  restoration remain with the radio library; this panel opens no reflector
+  network connection.
+- MCP programming: full memory dump (about 55 s over USB), memory-image
   inspection, and settings patches. Cached at
   `~/Library/Caches/thd75-tui/mcp.bin` on macOS for offline correlation.
 - Reflector Terminal Mode: detects a radio booted into terminal mode and, with `--exit-terminal-mode`, guides an exit and reconnects instead of just reporting it.
@@ -35,9 +35,9 @@ and restores CAT before normal polling resumes.
 
 ## Status
 
-Direct arbitrary-frequency and precision-down controls are unavailable while
-the library's FO writer is quarantined; qualified frequency reads, one-step
-UP, and populated memory recall remain available.
+Direct arbitrary-frequency entry is unavailable while the library's FO writer
+is quarantined; frequency reads, single UP and DW steps, and populated memory
+recall remain available.
 
 Pre-release. The TUI follows library-side API churn closely; layout,
 keybindings, and panel organization change without notice between commits.

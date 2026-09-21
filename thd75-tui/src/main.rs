@@ -93,7 +93,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     'retry: loop {
         // Open the initial transport before terminal setup so connection
         // errors can be rendered cleanly. Native macOS Bluetooth runs in its
-        // own helper process and no longer requires this thread's CFRunLoop.
+        // own helper process and does not use this thread's CFRunLoop.
         let transport = radio_task::discover_and_open_transport(cli.port.as_deref(), cli.baud);
 
         // Terminal setup on main thread before spawning

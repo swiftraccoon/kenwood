@@ -1156,8 +1156,9 @@ async fn enter_dstar_session(
     tx: &mpsc::UnboundedSender<Message>,
     cmd_rx: &mut mpsc::UnboundedReceiver<crate::event::RadioCommand>,
 ) -> Result<Radio<EitherTransport>, EnterDstarError> {
-    // Preserve the firmware-qualified transient gateway choice `TN 3,1`.
-    // TNC band selection belongs to the radio lifecycle, not the shared modem.
+    // Band B is the TNC data band this session enters with (`TN 3,1`) and
+    // exits with (`TN 0,1`). Band selection belongs to the radio lifecycle,
+    // not the shared modem.
     let mut gateway = match kenwood_thd75::DstarGateway::start(radio, TncDataBand::B, config).await
     {
         Ok(g) => g,
