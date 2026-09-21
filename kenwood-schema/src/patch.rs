@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 
 /// A validated assignment to selected bits of one byte.
 ///
-/// An offset is relative to the caller's buffer or address space. Constructing
-/// an assignment does not establish that its address exists or is writable.
+/// An offset is relative to the caller's buffer or address space; this type
+/// checks no address and reads no memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MaskedByte {
     pub(crate) offset: usize,
@@ -54,7 +54,7 @@ impl MaskedByte {
 
     /// Relocate an assignment after the caller resolves its address.
     ///
-    /// No arithmetic, address validation, or write admission is performed.
+    /// The offset is replaced outright: no arithmetic and no address check.
     #[must_use]
     pub const fn with_offset(self, offset: usize) -> Self {
         Self { offset, ..self }

@@ -486,8 +486,8 @@ impl FieldCodec {
     /// the field span. Stored numeric values may exceed the writable range;
     /// metadata validity, exact length, and text validity are always enforced.
     /// Text and raw-byte results allocate owned copies. Metadata validation
-    /// does not impose a resource cap; admit runtime-supplied lengths against
-    /// an application budget before calling this method.
+    /// imposes no length cap, so check a runtime-supplied length against an
+    /// application budget before calling this method.
     ///
     /// # Errors
     ///

@@ -14,9 +14,9 @@ For radio configuration, start with the
 [TH-D75 schema facade](https://swiftraccoon.github.io/kenwood/kenwood_thd75/memory/schema/index.html)
 in `kenwood-thd75` or the
 [TM-D750 schema facade](https://swiftraccoon.github.io/kenwood/kenwood_tmd750/memory/schema/index.html)
-in `kenwood-tmd750`. They expose these same scalar types while retaining model
-catalog and planning checks. Calling this crate directly does not perform
-those checks or establish permission to write a radio.
+in `kenwood-tmd750`. They expose these same scalar types while adding the
+model's catalog identity, address resolution, and writable-region checks.
+Calling this crate directly performs none of them.
 
 Use this crate directly when implementing a model-neutral codec consumer or a
 new model facade. It is an unpublished workspace package, not a crates.io
@@ -101,7 +101,8 @@ Both text policies require valid UTF-8 in the semantic text they select.
 `StringEncoding::MemoryMap` is the printable-ASCII subset only, without
 guessing a model's extended character encoding. The `TextPolicy` example
 shows the same stored bytes being rejected or truncated by the two policies.
-These policies describe interpretation, not firmware qualification.
+A policy selects how stored bytes are interpreted; it does not state which
+values a given firmware accepts.
 
 ```rust
 use kenwood_schema::{
@@ -136,9 +137,9 @@ The `ByteClaims::merge_atomic` API example demonstrates rejection followed by
 reuse of the unchanged planner.
 
 This synthetic eight-byte image has one caller-defined writable region. Each
-field span is admitted before its encoding allocates output. Each encoded byte
-is then relocated with checked arithmetic before entering the shared planner.
-No image byte changes until every assignment has been admitted and merged.
+field span is checked against that region before its encoding allocates output.
+Each encoded byte is then relocated with checked arithmetic before entering the
+shared planner. No image byte changes until every assignment has merged.
 
 ```rust
 use kenwood_schema::{ByteClaims, Endian, FieldCodec, FieldValue, TextPolicy, ValueDomain};
@@ -184,13 +185,13 @@ assert_eq!(image, [0xE3, 0xE3, 0xF7, 0xE3, 0xE3, 0x34, 0x12, 0xE3]);
 The model resolves relative field offsets before merging. Address-space,
 image-bound, and writable-region checks belong to the model's planner; they
 must all pass before it produces a usable page plan. Finished claims are sorted
-by offset and grouped into model-specific page types. A merged plan is not
-permission to write a device: fresh-page guards, durable intent, readback,
-protocol deadlines, cancellation, and restoration remain outside this crate.
+by offset and grouped into model-specific page types. Everything between a
+merged plan and a device write stays in the model crate: fresh-page guards,
+recovery journaling, readback, protocol deadlines, cancellation, and restoration.
 
 Errors are typed as `CodecError`, `ChoiceError`, and `PatchError`. Codec offsets
 are field-relative; patch offsets use the caller's resolved address space.
-Models attach field names and their own addressing or admission errors.
+Models attach field names and their own addressing or validation errors.
 
 Experimental API; breaking changes prioritize correctness and clarity.
 License: GPL-2.0-or-later.
