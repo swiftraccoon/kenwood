@@ -28,8 +28,8 @@ password. Open Terminal normally uses port **54006/UDP**.
 
 ## Configuration
 
-Copy the checked-in starter file, then replace the placeholder DMR ID and
-review the selected master and destinations:
+From the repository root, copy the checked-in starter file, then replace
+the placeholder DMR ID and review the selected master and destinations:
 
 ```bash
 cp pulsar.example.toml pulsar.toml

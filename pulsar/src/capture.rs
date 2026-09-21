@@ -433,8 +433,8 @@ impl CaptureManager {
 
     /// Enrich the current call from terminator Full Link Control.
     ///
-    /// A terminator is evidence about the call already in progress, not an
-    /// announcement of a new call. It may fill a missing header or missing
+    /// A terminator describes the call already in progress, not a new call.
+    /// It may fill a missing header or missing
     /// IDs on a compatible header, but a conflicting identity is ignored and
     /// no call is opened or replaced.
     pub(crate) fn enrich_from_terminator(&mut self, header: SuperHeader) {
