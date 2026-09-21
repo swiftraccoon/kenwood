@@ -37,7 +37,7 @@ pub struct SpectralAmplitudes {
 /// produced flat Gm vectors that the PRBA codebook search always
 /// resolved to near-origin entries (flat envelope → no formants).
 ///
-/// We use sum-of-squares then `sqrt` so the window accumulates power
+/// Sum-of-squares then `sqrt` is used so the window accumulates power
 /// rather than raw magnitudes; this is the canonical way to pool
 /// nearby bins without the magnitude-vs-phase ambiguity.
 ///

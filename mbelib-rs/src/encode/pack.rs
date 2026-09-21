@@ -9,7 +9,7 @@
 //!
 //! 1. **Modulates C1** by XOR-ing its bits with an LFSR sequence
 //!    seeded from the C0 data bits. The XOR operation is self-inverse,
-//!    so we call [`crate::unpack::demodulate_c1`] directly: "modulate"
+//!    so the packer calls [`crate::unpack::demodulate_c1`] directly: "modulate"
 //!    and "demodulate" are the same byte-level op; only the pipeline
 //!    direction differs. Applied after the caller has already encoded
 //!    FEC into C0 and C1 (or, for P1 round-trip testing, the caller

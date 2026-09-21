@@ -13,7 +13,7 @@
 //! of the AMBE codec family.  **This is not compatible with the AMBE+2 /
 //! 2450-bit layout used by DMR / YSF / NXDN**: those are different codecs
 //! with different bit positions, different codebooks, and different gain
-//! quantization, and mbelib-rs no longer claims support for them.
+//! quantization, and mbelib-rs does not implement them.
 //!
 //! # Decode Pipeline
 //!

@@ -25,7 +25,7 @@
 /// (8×8 to 17×17 element passes), the speedup on the cosine work alone
 /// is 3-8×.
 ///
-/// Numerical drift accumulates as roughly `n * f32_epsilon`. For our
+/// Numerical drift accumulates as roughly `n * f32_epsilon`. For the
 /// largest inner-loop count (160 samples in voiced synthesis) the
 /// absolute error is ~2e-5, well below audio perception thresholds and
 /// well within the 1e-4 tolerances used in the unit tests.

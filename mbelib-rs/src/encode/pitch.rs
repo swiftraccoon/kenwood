@@ -71,7 +71,7 @@ use crate::encode::window::WI;
 /// is `[min_index, max_index]` inclusive, in the same index space.
 ///
 /// Reference: `pitch_est.cc:37` in OP25. Values were fit empirically
-/// to the speech-pitch dynamics the IMBE encoder sees; we carry them
+/// to the speech-pitch dynamics the IMBE encoder sees; they are carried
 /// over verbatim.
 #[rustfmt::skip]
 const MIN_MAX_TBL: [u16; 203] = [
@@ -112,7 +112,7 @@ pub(crate) const PITCH_CANDIDATES: usize = 203;
 /// Default pitch index used on a fresh tracker.
 ///
 /// OP25 initializes `prev_pitch = 158` (Q15.1 format = 2 × period +
-/// 42). In our 0-based index space that's `158 − 42 = 116`, which
+/// 42). In this crate's 0-based index space that is `158 − 42 = 116`, which
 /// corresponds to a period of `21 + 116 × 0.5 = 79` samples (≈100 Hz),
 /// a reasonable baseline for unvoiced speech onset.
 const PITCH_DEFAULT_IDX: usize = 116;
@@ -694,7 +694,7 @@ mod tests {
     /// 150 Hz pure sine has period 53.33 samples. The OP25 look-back
     /// tracker's default window starts at `pitch_idx` 116 (period 79)
     /// and converges inward: each frame narrows the allowed window
-    /// around `prev_pitch_idx`, so within a handful of frames we should
+    /// around `prev_pitch_idx`, so within a handful of frames it should
     /// land on `pitch_idx` 64 or 65 (period 53.0 or 53.5).
     ///
     /// Pure tones have octave-symmetric E(p) minima (the signal is

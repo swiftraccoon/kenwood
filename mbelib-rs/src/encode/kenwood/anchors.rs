@@ -21,7 +21,7 @@
 //! Decoding a Kenwood 210 Hz raw dominant frame through
 //! [`crate::decode_trace`] produces `b0=126` (the AMBE erasure code),
 //! `L=0`, NOT a sensible 210 Hz pitch index. The same `decode_trace`
-//! recovers `b0=86, L=34` correctly when fed our own encoder's output.
+//! recovers `b0=86, L=34` correctly when fed this encoder's output.
 //! Conclusion: **TH-D75 does not use the DSD/mbelib wire format**.
 //!
 //! Bit-mask comparison via [`STABLE_BIT_MASK`] is therefore a NECESSARY

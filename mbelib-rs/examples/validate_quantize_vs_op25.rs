@@ -123,7 +123,7 @@ fn parse_trace(path: &str) -> Result<Vec<Op25Frame>, std::io::Error> {
     Ok(frames)
 }
 
-/// Build our [`PitchEstimate`] from OP25's `ref_pitch` (Q8.8 period).
+/// Build a [`PitchEstimate`] from OP25's `ref_pitch` (Q8.8 period).
 fn pitch_from_op25(ref_pitch_q88: u16, confidence: f32) -> PitchEstimate {
     let period = f32::from(ref_pitch_q88) / 256.0;
     PitchEstimate {
@@ -133,12 +133,12 @@ fn pitch_from_op25(ref_pitch_q88: u16, confidence: f32) -> PitchEstimate {
     }
 }
 
-/// Convert OP25's per-harmonic `v_uv_dsn` to our per-band `VuvDecisions`.
+/// Convert OP25's per-harmonic `v_uv_dsn` to this crate's per-band `VuvDecisions`.
 ///
 /// IMBE groups harmonics into bands of 3: `band = (l + 2) / 3` for
 /// l=1..=36, then single-harmonic bands. OP25's `v_uv_dsn` is already
-/// expanded to per-harmonic (each group of 3 shares a value). We
-/// reverse: pick `v_uv_dsn[band * 3]` as the band's voiced flag.
+/// expanded to per-harmonic (each group of 3 shares a value). This
+/// reverses that: `v_uv_dsn[band * 3]` becomes the band's voiced flag.
 fn vuv_from_op25(v_uv_dsn: &[bool], num_harms: usize, num_bands: usize) -> VuvDecisions {
     let mut voiced = [false; MAX_BANDS];
     for (b_idx, slot) in voiced.iter_mut().enumerate().take(num_bands.min(MAX_BANDS)) {
@@ -156,8 +156,8 @@ fn vuv_from_op25(v_uv_dsn: &[bool], num_harms: usize, num_bands: usize) -> VuvDe
 
 /// Build [`SpectralAmplitudes`] from OP25's int16-scaled `sa[]`.
 ///
-/// Our `quantize` multiplies each magnitude by `SA_SCALE = 32768.0`
-/// before `log2` to match OP25's lsa scale, so we divide by 32768 here
+/// `quantize` multiplies each magnitude by `SA_SCALE = 32768.0`
+/// before `log2` to match OP25's lsa scale, so this divides by 32768
 /// to reverse the scaling and end up with the same value OP25 uses.
 fn amps_from_op25(sa: &[i32], num_harms: usize) -> SpectralAmplitudes {
     let mut magnitudes = [0.0_f32; MAX_HARMONICS];

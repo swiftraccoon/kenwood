@@ -89,11 +89,11 @@ pub struct AmbeEncoder {
     /// prediction residual `T[l] = lsa[l] - 0.65 * interp_prev[l]`
     /// before matching against the PRBA / HOC codebooks. Without
     /// this the receiver sees `lsa + 0.65*prev_interp` instead of
-    /// `lsa`, which drifts unbounded and produces the "generative,
-    /// not-voice" sound we observed before this field existed.
+    /// `lsa`, which drifts unbounded and produces a "generative,
+    /// not-voice" sound.
     ///
     /// Updated at the end of every `encode_frame` to track what the
-    /// decoder will have after parsing the frame we just emitted.
+    /// decoder will have after parsing the frame just emitted.
     prev_log2_ml: [f32; 57],
     /// Previous frame's harmonic count. Used by the band-ratio
     /// mapping `kl = (prev_l / cur_l) * l` that drives the prev-frame
@@ -108,7 +108,7 @@ pub struct AmbeEncoder {
     /// drifts to saturation over a few frames.
     prev_gamma: f32,
     /// 2-slot ring buffer holding analysis output for frames `N-2`
-    /// and `N-1`. On `encode_frame(N)` we compute `E(p)_N`, run the
+    /// and `N-1`. `encode_frame(N)` computes `E(p)_N`, runs the
     /// DP on `(E(p)_{N-2}, E(p)_{N-1}, E(p)_N)` to commit pitch for
     /// frame `N-2`, quantize its saved FFT against that pitch, emit
     /// bytes, then shift the ring.
@@ -204,7 +204,7 @@ impl AmbeEncoder {
     /// `big_gamma - INTERP_WEIGHT * prev_sum`, which without a
     /// full closed-loop decoder simulation is approximated by zero.
     /// Zeroing the state is not perfect, but it is the same
-    /// approximation we use at construction and on `reset()`, so at
+    /// approximation used at construction and on `reset()`, so at
     /// least encoder and decoder both observe the same null baseline
     /// across any silence-to-voice transition.
     const fn reset_prev_state_after_silence(&mut self) {

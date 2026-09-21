@@ -72,7 +72,7 @@ const C1_OFFSET: usize = 24;
 /// `ambe_fr` index where that bit belongs.
 ///
 /// The DSD tables use `ambe_fr[dW[i]][dX[i]]` with a `char[4][24]`
-/// layout. We convert to flat indices using the codeword offsets:
+/// layout. Flat indices are computed using the codeword offsets:
 /// - `dW=0` (C0): flat index = `dX[i]`
 /// - `dW=1` (C1): flat index = `24 + dX[i]`
 /// - `dW=2` (C2): flat index = `47 + dX[i]`

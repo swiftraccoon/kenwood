@@ -4,7 +4,7 @@
 //! Inverse D-STAR bit-interleave table for AMBE frame packing.
 //!
 //! The decoder's interleave table in [`crate::unpack`] maps
-//! `input_bit → ambe_fr_index`. For packing we need the inverse:
+//! `input_bit → ambe_fr_index`. Packing needs the inverse:
 //! `ambe_fr_index → input_bit`. Both tables describe the same
 //! permutation; the inverse is built at compile time from the forward
 //! table so the two can never drift out of sync.

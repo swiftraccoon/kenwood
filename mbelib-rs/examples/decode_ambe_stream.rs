@@ -4,7 +4,7 @@
 //! argv[1], decode each frame with `AmbeDecoder`, and write 160
 //! s16le PCM samples per frame to argv[2].
 //!
-//! Used by the validation harness that compares our decoder output
+//! Used by the validation harness that compares this decoder's output
 //! against mbelib's for identical AMBE input, and by the synthesis
 //! tuning sweep, which sets the `MBELIB_TUNING` environment variable
 //! to a comma-separated `key=value` list (keys: `alpha`, `exp`, `lo`,

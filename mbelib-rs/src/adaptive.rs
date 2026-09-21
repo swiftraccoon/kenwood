@@ -183,7 +183,7 @@ pub(crate) fn apply_adaptive_smoothing(
 ///
 /// JMBE specifies a uniform white-noise model with gain 0.003 (relative
 /// to the [-1, +1] range, before the float→i16 ×7 scaling). Translated
-/// to our float-domain scale, this yields very low-level noise that
+/// to this crate's float-domain scale, this yields very low-level noise that
 /// fills the gap during frame muting without producing audible
 /// artifacts that would distract the listener.
 pub(crate) fn synthesize_comfort_noise(output: &mut [f32; 160], rng_state: &mut u64) {

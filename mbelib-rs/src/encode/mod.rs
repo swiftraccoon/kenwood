@@ -10,7 +10,7 @@
 //! Rust port of Max H. Parke's (KA1RBI) `ambe_encoder.cc` from OP25,
 //! which chains Pavel Yazev's IMBE analyzer (OP25 `imbe_vocoder`, 2009,
 //! GPLv3) with AMBE-specific parameter requantization against the
-//! szechyjs mbelib codebooks we already ship in [`crate::tables`].
+//! szechyjs mbelib codebooks shipped in [`crate::tables`].
 //!
 //! # Phase status
 //!

@@ -138,9 +138,9 @@ pub struct QuantizeOutcome {
 /// stderr, line-prefixed so the output can be diffed frame-by-frame
 /// against the matching dump from OP25's `ambe_encode_dump`.
 ///
-/// This is the validation approach the April 2026 quantize-stage
-/// investigation established: find the first stage where our values
-/// diverge from OP25's reference, fix the divergence, repeat.
+/// This is the validation approach for the quantize stage: find the
+/// first stage where this crate's values diverge from OP25's reference,
+/// fix the divergence, repeat.
 fn dump_enabled() -> bool {
     std::env::var_os("MBELIB_DUMP_QUANTIZE").is_some()
 }
@@ -563,7 +563,7 @@ fn compute_spectral_residuals(lsa: &[f32; 57], n: usize, prev: &PrevFrameState) 
 ///
 /// - The silence short-circuit (low-confidence inputs emit `124`, the
 ///   D-STAR silence code).
-/// - Conversion from our `PitchEstimate` (float period in samples) to
+/// - Conversion from this crate's `PitchEstimate` (float period in samples) to
 ///   OP25's Q8.8 `ref_pitch` format.
 fn quantize_pitch(pitch: PitchEstimate, target_l: usize) -> u8 {
     if pitch.confidence < 0.05 {
@@ -597,7 +597,7 @@ fn quantize_pitch(pitch: PitchEstimate, target_l: usize) -> u8 {
 /// across harmonic bands via the `jl = floor(l * 16 * f0)` slot
 /// mapping the decoder uses.
 ///
-/// Following OP25's `ambe_encoder.cc:200-227`, we minimize the
+/// Following OP25's `ambe_encoder.cc:200-227`, the search minimizes the
 /// energy of disagreements between the candidate row and each
 /// harmonic's own voicing decision:
 ///
@@ -708,7 +708,7 @@ fn write_bit(dst: &mut [u8; AMBE_DATA_BITS], idx: usize, value: u8) {
 /// OP25's `imbe_param->sa[]` within ~10% on the same input).
 ///
 /// OP25 reads those int16 sa values straight into `log2()` with no
-/// further scaling (`ambe_encoder.cc:241-248`). Mirroring that, our
+/// further scaling (`ambe_encoder.cc:241-248`). Mirroring that, this crate's
 /// `SA_SCALE` is **1.0**: `compute_lsa` and `compute_gain_from_amps`
 /// take `sa.max(1.0).log2()` directly.
 ///
@@ -732,18 +732,11 @@ const SA_SCALE: f32 = 1.0;
 /// `op25/op25/gr-op25_repeater/apps/tx/dv_tx.py:49-53`:
 /// `gain_adjust = {'dmr': 3.0, 'dstar': 7.5, 'ysf': 4.0}`).
 ///
-/// **Calibration history.** April 2026: temporarily lowered to 3.0
-/// after a synthetic-only sweep showed 7.5 producing decoded RMS far
-/// below the input. **Reverted to 7.5** when real-voice testing
-/// showed 3.0 caused continuous hard-clip at the synthesis ceiling
-/// (peak = `SOFT_CLIP_FLOAT × 7 = 31129`), generating square-wave
-/// distortion in production, exactly the "garble noise" symptom.
-///
-/// **May 2026 attempt at 0.0:** synthetic sweep against TH-D75 anchors
-/// suggested 0.0 minimized Hamming distance and took the sine
-/// roundtrip correlation from 0.04 to 0.20, but real-voice
-/// sextant-to-sextant testing confirmed garbled output, exactly the
-/// hard-clip symptom described above. Reverted to 7.5.
+/// The value stays at 7.5. Lower values (3.0 and 0.0 were both tried)
+/// look better on synthetic sweeps, including the TH-D75 anchors and
+/// the sine round-trip correlation, but on real voice they drive
+/// continuous hard clipping at the synthesis ceiling (peak =
+/// `SOFT_CLIP_FLOAT × 7 = 31129`) and square-wave distortion.
 ///
 /// The synthetic-vs-real-voice difference: synthetic test signals
 /// (clean harmonic stacks at exact frequencies) have near-zero
@@ -1410,20 +1403,19 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Regression tests: each pins a specific bug we fixed during the
-    // stage-by-stage OP25 validation pass. A failure on any of these
-    // indicates a regression in the quantize pipeline.
+    // Regression tests: each pins one quantize-pipeline behavior that the
+    // stage-by-stage OP25 comparison established. A failure on any of these
+    // is a regression in the quantize pipeline.
     // -------------------------------------------------------------------
 
     /// Encoder writes `b3` then immediately decoder-reads via the
     /// public `decode_trace`; the read-back value must match exactly
     /// for the bit-pack/ECC/unpack chain to be symmetric.
     ///
-    /// **2026-04 finding:** for some frames the read-back differs
-    /// from the written value (e.g. encoded b3=368 reads back as 304).
-    /// This indicates an asymmetry in `pack_frame` / `unpack_frame` /
-    /// `demodulate_c1` / ECC chain; encoder and decoder are not
-    /// inverses for arbitrary `ambe_d` bit patterns.
+    /// For some frames the read-back differs from the written value
+    /// (e.g. encoded b3=368 reads back as 304): `pack_frame` /
+    /// `unpack_frame` / `demodulate_c1` / ECC are not inverses for
+    /// arbitrary `ambe_d` bit patterns.
     #[test]
     fn encoder_b3_round_trips_via_decode_trace() {
         use crate::ecc::ecc_encode;
@@ -1654,12 +1646,12 @@ mod tests {
 
     /// Fix #2 (closed-loop prev): encoder must emit `prev_log2_ml`
     /// that a fresh decoder would reconstruct from the same
-    /// emitted bytes. If we stored raw `lsa` instead of running
-    /// `decode_params` internally, the prediction residual drifts
+    /// emitted bytes. Storing raw `lsa` instead of running
+    /// `decode_params` internally would drift the prediction residual
     /// every frame.
     ///
     /// This test encodes a voiced frame, then independently runs
-    /// our decoder on the emitted `ambe_d` and asserts the decoder's
+    /// the decoder on the emitted `ambe_d` and asserts the decoder's
     /// `log2_ml` matches what `quantize()` returned as
     /// `prev_log2_ml`.
     #[test]

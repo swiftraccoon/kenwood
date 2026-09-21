@@ -207,7 +207,7 @@ pub(crate) fn spectral_amp_enhance(params: &mut MbeParams, tuning: &SynthesisTun
 /// sample rate the AMBE codec works at); each index covers
 /// `4000 / 103 ≈ 38.8 Hz`. Harmonic `l` lands at frequency
 /// `f_l = w0 · 8000 · l / (2π)` Hz; the index is
-/// `round(f_l / (4000 / 103))`. We clamp to `[0, 102]` for
+/// `round(f_l / (4000 / 103))`, clamped to `[0, 102]` for
 /// numerical safety; harmonics above 4 kHz get the
 /// last-bin weight (0.83).
 ///

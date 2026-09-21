@@ -10,7 +10,7 @@
 //! estimation sees undistorted waveform periodicity.
 //!
 //! The original uses ETSI Q1.15 fixed-point (`mac` into a Q1.31
-//! accumulator, then `round()` back to Q1.15). We keep the same
+//! accumulator, then `round()` back to Q1.15). This port keeps the same
 //! coefficient values scaled by 1/32768 to match the filter's
 //! frequency response exactly.
 
@@ -113,8 +113,8 @@ mod tests {
     }
 
     /// Impulse response is just the coefficients themselves, in
-    /// order, delayed by the filter's settling. We pass a single 1.0
-    /// followed by zeros and verify the output equals the (reversed
+    /// order, delayed by the filter's settling. A single 1.0 followed
+    /// by zeros is passed and the output must equal the (reversed
     /// because of the right-shift appending) coefficient set.
     #[test]
     fn impulse_response_matches_coefficients() {

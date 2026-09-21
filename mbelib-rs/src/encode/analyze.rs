@@ -29,7 +29,7 @@ use crate::encode::window::WR_HALF;
 
 /// Per-stream FFT planning cache.
 ///
-/// Plans are thread-bound in `realfft`; we keep one plan per
+/// Plans are thread-bound in `realfft`; one plan is kept per
 /// encoder instance rather than re-planning every frame. Each call
 /// to [`analyze_frame`] borrows the planner through a `&mut`.
 pub struct FftPlan {
@@ -218,7 +218,7 @@ mod tests {
 
     /// A pure sine at 500 Hz sampled at 8 kHz (bin 16 in a 256-pt FFT
     /// at 8 kHz SR) should show a peak near bin 16 after the front-end
-    /// stabilizes. We feed the sine for several frames to let both
+    /// stabilizes. The sine is fed for several frames to let both
     /// the DC-remover and the LPF settle.
     #[test]
     fn sine_input_peaks_near_expected_bin() {

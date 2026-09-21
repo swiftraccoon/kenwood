@@ -28,7 +28,7 @@ const ALPHA: f32 = 0.990_05;
 /// state across calls: zero at stream start, updated on return.
 ///
 /// Panics if `sigin.len()` and `sigout.len()` are both less than the
-/// advertised frame size (we iterate over `min(sigin.len(), sigout.len())`).
+/// advertised frame size (the loop runs over `min(sigin.len(), sigout.len())`).
 pub(crate) fn dc_rmv(sigin: &[f32], sigout: &mut [f32], mem: &mut f32) {
     let mut state = *mem;
     for (&x, y) in sigin.iter().zip(sigout.iter_mut()) {

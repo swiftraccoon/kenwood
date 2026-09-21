@@ -131,9 +131,9 @@ mod tests {
 
     /// After one shift, content at position `p >= FRAME` moves to
     /// position `p - FRAME`. Verifies the buffer slides correctly.
-    /// Note that `2 * FRAME > PITCH_EST_BUF_SIZE` so we can't verify
-    /// "the last frame lands in the second-to-last frame position"
-    /// directly; instead we check the sliding identity.
+    /// Note that `2 * FRAME > PITCH_EST_BUF_SIZE`, so "the last frame
+    /// lands in the second-to-last frame position" cannot be verified
+    /// directly; the sliding identity is checked instead.
     #[test]
     fn shift_moves_content_by_frame() {
         let mut b = EncoderBuffers::new();

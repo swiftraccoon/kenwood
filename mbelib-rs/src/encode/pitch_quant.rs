@@ -88,7 +88,7 @@ pub(crate) const B0_LOOKUP: [u8; 827] = [
 /// `ref_pitch_q8_8` is the pitch period in Q8.8 format (samples × 256).
 /// `target_l` is the desired `AmbePlusLtable[b0]` value, usually
 /// `num_harms` from the V/UV + SA stage.
-/// `ltable` is the L-table we look up against. For D-STAR / AMBE+
+/// `ltable` is the L-table to look up against. For D-STAR / AMBE+
 /// this is `AmbePlusLtable` (126 entries; codes 120–127 are
 /// reserved for silence / tone / erasure and are not visited by the
 /// walk). Only `ltable[0..120]` matters here.

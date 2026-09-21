@@ -308,7 +308,7 @@ fn synth_voiced_overlap(
 /// Voiced contribution from previous frame only (current is unvoiced).
 ///
 /// The current-frame unvoiced contribution is added separately by the
-/// FFT path. Here we only emit the previous voiced oscillator with the
+/// FFT path. This emits only the previous voiced oscillator with the
 /// ramp-down window.
 fn synth_voiced_only_prev(pcm: &mut [f32; FRAME_SAMPLES], prev_ml: f32, prev_phi: f32, pw0l: f32) {
     let mut prev_osc = CosOscillator::new(prev_phi, pw0l);

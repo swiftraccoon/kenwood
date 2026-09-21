@@ -18,7 +18,7 @@
 //! extraction: the same sinusoidal-fit pass that produces the
 //! per-bin fitted amplitude feeds into both the `Dk` ratio (V/UV
 //! output) and the per-harmonic SA output. Re-running extraction in
-//! a separate pass using centre-bin integration (our old
+//! a separate pass using centre-bin integration (the separate
 //! [`extract_spectral_amplitudes`](crate::encode::extract_spectral_amplitudes))
 //! produces different numerical SAs because the 3-bin-power
 //! integration doesn't account for the Hamming spectral lobe the
@@ -423,7 +423,7 @@ fn wr_sp_sample(bin: usize, harmonic_center: f32) -> f32 {
 /// inflates strong AND weak harmonics non-uniformly relative to
 /// OP25's M_den-dependent scaling. Direct frame-by-frame diff against
 /// OP25's `imbe_param->sa[]` (via the standalone `op25_dump` harness)
-/// showed our voiced-harmonic values trail OP25's by exactly the
+/// showed this crate's voiced-harmonic values trail OP25's by exactly the
 /// factor `512 * sqrt(2) / M_den`, the magnitude of OP25's
 /// `voiced_sa_calc(num, den) = (Word16)(2*256*sqrt(2*num/den))`
 /// formula. Restoring that factor here aligns voiced sa with OP25

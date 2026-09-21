@@ -24,7 +24,7 @@ use wide as _;
 /// constant `AMBE_SILENCE`, sourced from `g4klx/MMDVMHost/DStarDefines.h:44`.
 const AMBE_SILENCE: [u8; 9] = [0x9E, 0x8D, 0x32, 0x88, 0x26, 0x1A, 0x3F, 0x61, 0xE8];
 
-/// Steady-state tone frame from a 2026-07-05 TH-D75 wire capture
+/// Steady-state tone frame from a TH-D75 wire capture
 /// (LSB-first byte order, zero FEC corrections): a 440 Hz mic tone
 /// encoded by the DVSI hardware as AMBE tone index 14 (437.5 Hz).
 const TONE_FRAME: [u8; 9] = [0xD2, 0x4B, 0x28, 0xB2, 0x57, 0x44, 0xE4, 0x08, 0x1C];

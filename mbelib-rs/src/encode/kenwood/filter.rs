@@ -118,7 +118,7 @@ mod tests {
     }
 
     /// A 1 kHz tone passes through the 345 Hz HPF essentially
-    /// intact (at 1 kHz we're well above the corner, gain should be
+    /// intact (1 kHz is well above the corner, so the gain should be
     /// close to unity).
     #[test]
     fn hpf_345hz_passes_1khz_tone() {
