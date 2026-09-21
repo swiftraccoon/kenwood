@@ -1,8 +1,6 @@
 //! Tokio async shell driving the sans-io `dstar-gateway-core`.
 //!
-//! This module provides the async API consumers will use once the
-//! legacy `ReflectorClient` is retired. For now it lives alongside
-//! the legacy code.
+//! This module is the async API over the sans-io core.
 //!
 //! Entry points:
 //! - [`Command`]: messages sent from the [`AsyncSession`] handle

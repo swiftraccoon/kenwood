@@ -179,10 +179,9 @@ impl<P: Protocol> SessionLoop<P> {
     /// Flush every datagram currently queued by the core to the peer socket.
     async fn flush_transmit(&mut self) -> Result<(), ShellError> {
         while let Some(tx) = self.session.poll_transmit(Instant::now()) {
-            // Trace every outbound datagram so a KeepaliveInactivity
-            // post-mortem can confirm whether POLLs continued through the
-            // silent window. The first byte distinguishes keepalives from
-            // voice packets without dumping the whole payload.
+            // Trace every outbound datagram: destination, length, and the
+            // first payload byte, which distinguishes keepalive POLLs from
+            // voice packets without dumping the payload.
             let first_byte = tx.payload.first().copied().unwrap_or(0);
             tracing::trace!(
                 target: "dstar_gateway::tokio_shell",

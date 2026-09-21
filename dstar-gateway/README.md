@@ -23,16 +23,16 @@ forwarding is off by default.
 This crate lives in the [kenwood monorepo](https://github.com/swiftraccoon/kenwood)
 and is not yet published to crates.io. Consume it via a path or
 git dependency until the first published release lands. See
-[CHANGELOG.md](CHANGELOG.md) for the work-in-progress feature
-list.
+[CHANGELOG.md](https://github.com/swiftraccoon/kenwood/blob/main/dstar-gateway/CHANGELOG.md)
+for the work-in-progress feature list.
 
 ## The three crates
 
 | Crate | What it does |
 |-------|--------------|
-| [`dstar-gateway-core`](../dstar-gateway-core) | Sans-io codec + typestate `Session<P, S>` state machines. No tokio, no I/O. |
-| [`dstar-gateway`](.) (this crate) | Tokio `AsyncSession<P>` shell, `DPlus` TCP `AuthClient`, optional explicitly insecure plaintext-HTTP XLX directory fetcher. |
-| [`dstar-gateway-server`](../dstar-gateway-server) | Multi-client `Reflector` server. Supports `DExtra`, `DPlus`, and DCS, all enabled by default. |
+| [`dstar-gateway-core`](https://github.com/swiftraccoon/kenwood/tree/main/dstar-gateway-core) | Sans-io codec + typestate `Session<P, S>` state machines. No tokio, no I/O. |
+| [`dstar-gateway`](https://github.com/swiftraccoon/kenwood/tree/main/dstar-gateway) (this crate) | Tokio `AsyncSession<P>` shell, `DPlus` TCP `AuthClient`, optional explicitly insecure plaintext-HTTP XLX directory fetcher. |
+| [`dstar-gateway-server`](https://github.com/swiftraccoon/kenwood/tree/main/dstar-gateway-server) | Multi-client `Reflector` server. Supports `DExtra`, `DPlus`, and DCS, all enabled by default. |
 
 ## Quickstart
 
@@ -102,13 +102,13 @@ session.disconnect().await?;
 # Ok(()) }
 ```
 
-For `DPlus`, fetch a host list with
-[`AuthClient::authenticate`](src/auth/client.rs), build the configured
-session, and call `Session::authenticate` before `connect`; `DCS` uses
-the same shape as `DExtra`.
+For `DPlus`, fetch a host list with `AuthClient::authenticate`, build the
+configured session, and call `Session::authenticate` before `connect`;
+`DCS` uses the same shape as `DExtra`.
 
-See the `dstar-gateway/examples/` directory for standalone runnable
-versions of each.
+See the
+[`dstar-gateway/examples/`](https://github.com/swiftraccoon/kenwood/tree/main/dstar-gateway/examples)
+directory for standalone runnable versions of each.
 
 `AsyncSession` delivers incoming events through a bounded FIFO queue.
 Outbound commands and their UDP writes continue when that queue fills.
@@ -156,12 +156,12 @@ dstar-gateway = { path = "../dstar-gateway", features = ["insecure-plaintext-xlx
 ## Documentation
 
 - [API reference](https://swiftraccoon.github.io/kenwood/dstar_gateway/)
-- [`book/`](book/): mdBook source; currently covers the introduction and Getting Started. Build with `mdbook serve book`
-- [ARCHITECTURE.md](ARCHITECTURE.md): 5000-foot design overview
-- [REFERENCES.md](REFERENCES.md): line-numbered references into
+- [`book/`](https://github.com/swiftraccoon/kenwood/tree/main/dstar-gateway/book): mdBook source; currently covers the introduction and Getting Started. Build with `mdbook serve book`
+- [ARCHITECTURE.md](https://github.com/swiftraccoon/kenwood/blob/main/dstar-gateway/ARCHITECTURE.md): design overview
+- [REFERENCES.md](https://github.com/swiftraccoon/kenwood/blob/main/dstar-gateway/REFERENCES.md): line-numbered references into
   `ircDDBGateway` and `xlxd`
-- [CHANGELOG.md](CHANGELOG.md): per-release notes
-- `adr/`: architectural decision records
+- [CHANGELOG.md](https://github.com/swiftraccoon/kenwood/blob/main/dstar-gateway/CHANGELOG.md): per-release notes
+- [`adr/`](https://github.com/swiftraccoon/kenwood/tree/main/dstar-gateway/adr): architectural decision records
 
 ## License
 

@@ -1,15 +1,15 @@
 # External References
 
-Every wire format that `dstar-gateway` implements was derived from
-reading (and, in places, stealing constants directly from) the two
-canonical GPL-licensed reference implementations: **`g4klx/ircDDBGateway`**
-and **`LX3JL/xlxd`**. This file pins the exact commit hashes we
-consulted and lists every file/line-range reference that made it into
-the dstar-gateway source tree.
+Every wire format that `dstar-gateway` implements was derived from the
+two canonical GPL-licensed reference implementations,
+**`g4klx/ircDDBGateway`** and **`LX3JL/xlxd`**, including constants
+taken directly from them. This file pins the exact commit hashes
+consulted and lists every file/line-range reference cited in the
+dstar-gateway source tree.
 
-If you find a discrepancy between our implementation and the upstream
-C++ reference, it is almost certainly a bug on our side. Please open
-an issue with the line number you inspected.
+A discrepancy between this implementation and the upstream C++
+reference is a bug here until shown otherwise; report it with the line
+number inspected.
 
 ## Pinned versions
 
@@ -30,7 +30,7 @@ All paths below are relative to the root of the upstream
 
 #### DPlus (REF port 20001)
 
-| File | Lines | What we use | Consumed in |
+| File | Lines | Use | Consumed in |
 |------|-------|-------------|------------|
 | `Common/DPlusProtocolHandler.cpp` | (all) | Inbound packet length-table dispatch (the 13 / 15 / 17 / 29 / 32 / 56 / 58 byte table); this is the foundation of `dstar-gateway-core::codec::dplus::decode` | `dstar-gateway-core/src/codec/dplus/decode.rs` |
 | `Common/DPlusProtocolHandler.cpp` | 64-68 | NAK packet layout | `dstar-gateway-core/src/codec/dplus/consts.rs:45-48` |
@@ -65,7 +65,7 @@ All paths below are relative to the root of the upstream
 
 #### DExtra (XRF/XLX port 30001)
 
-| File | Lines | What we use | Consumed in |
+| File | Lines | Use | Consumed in |
 |------|-------|-------------|------------|
 | `Common/DExtraProtocolHandler.cpp` | (all) | Inbound packet length-table dispatch | `dstar-gateway-core/src/codec/dextra/decode.rs` (mirror reference) |
 | `Common/DExtraHandler.cpp` | 51 | `DEXTRA_POLL_INTERVAL` | `dstar-gateway-core/src/codec/dextra/consts.rs:15-17` |
@@ -79,7 +79,7 @@ All paths below are relative to the root of the upstream
 
 #### DCS (port 30051)
 
-| File | Lines | What we use | Consumed in |
+| File | Lines | Use | Consumed in |
 |------|-------|-------------|------------|
 | `Common/DCSHandler.cpp` | 54 | `DCS_POLL_INTERVAL` | `dstar-gateway-core/src/codec/dcs/consts.rs:15-17` |
 | `Common/DCSHandler.cpp` | 55 | `DCS_INACTIVITY_TIMEOUT` | `dstar-gateway-core/src/codec/dcs/consts.rs:21-23` |
@@ -100,12 +100,12 @@ All paths below are relative to the root of the upstream
 
 ### LX3JL/xlxd
 
-Used as the "mirror" reference: we cross-check every ircDDBGateway
-finding against xlxd to catch places where the two agree (confirming
-it's on the wire) and places where they diverge (where we have to
-pick the more widely deployed behavior).
+Used as the "mirror" reference: every ircDDBGateway finding is
+cross-checked against xlxd to find where the two agree (confirming the
+wire behavior) and where they diverge (where the more widely deployed
+behavior is chosen).
 
-| File | Lines | What we use | Consumed in |
+| File | Lines | Use | Consumed in |
 |------|-------|-------------|------------|
 | `src/main.h` | 93 | `#define DPLUS_PORT 20001` cross-check | `dstar-gateway-core/src/codec/dplus/consts.rs:11` |
 | `src/main.h` | 94 | `DPLUS_KEEPALIVE_PERIOD = 1` cross-check | `dstar-gateway-core/src/codec/dplus/consts.rs:18` |
@@ -130,6 +130,6 @@ pick the more widely deployed behavior).
    ```bash
    rg -n 'ircDDBGateway|xlxd' dstar-gateway-core/src dstar-gateway/src dstar-gateway-server/src
    ```
-4. Open a PR that touches only this file. The changelog CI check
-   will **not** require a CHANGELOG entry (`.md` files don't match
-   the Rust-code glob).
+4. Open a PR that touches only this file. The changelog workflow
+   triggers only on Rust source paths, so a references-only change
+   needs no CHANGELOG entry.

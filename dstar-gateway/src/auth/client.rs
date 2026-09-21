@@ -253,7 +253,7 @@ impl AuthClient {
     /// means if the OS resolver hands back a dead address first,
     /// the macOS TCP stack's per-address retry budget (~75 s of SYN
     /// retransmit before giving up and moving to the next address)
-    /// blows through our 10 s budget before any live address is
+    /// exhausts the 10 s budget before any live address is
     /// reached; the auth flow then times out deterministically on
     /// every run that happens to draw a dead address first.
     ///
@@ -353,8 +353,7 @@ impl AuthClient {
     ///
     /// Each `read` call is wrapped in [`Self::read_timeout`]. A
     /// timeout is treated as a fatal read error (no data arrived
-    /// within the configured window), matching the behavior of the
-    /// legacy `DPlusClient::authenticate` loop.
+    /// within the configured window).
     async fn read_response(&self, stream: &mut TcpStream) -> Result<Vec<u8>, AuthError> {
         let mut response = Vec::new();
         let mut buf = [0u8; 4096];

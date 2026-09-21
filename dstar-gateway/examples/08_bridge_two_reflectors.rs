@@ -190,7 +190,7 @@ async fn forward(
             }
         }
         Event::VoiceEnd { stream_id, .. } => {
-            // If we had a matching header cached, emit an EOT on the
+            // If a matching header is cached, emit an EOT on the
             // TX side. Seq on EOT is advisory: MMDVMHost uses 0 in
             // the common case, which the core codec accepts.
             if *tx_stream == Some(*stream_id) {

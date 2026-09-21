@@ -81,7 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .peer("127.0.0.1:30001".parse()?)
         .build();
 
-    // We don't actually connect; this just verifies the types resolve.
+    // No connection is made; this only verifies that the types resolve.
     let _ = session;
     // AsyncSession is needed to satisfy the `use` above.
     let _: Option<AsyncSession<DExtra>> = None;
@@ -105,8 +105,8 @@ the complete workspace lint runs several test/doc configurations:
 cargo test --workspace
 ```
 
-Fuzz targets live under `dstar-gateway-core/fuzz/` and run nightly
-in CI. You can run one locally with:
+Fuzz targets live under `dstar-gateway-core/fuzz/` and run in CI on
+pull requests that touch the core crate. You can run one locally with:
 
 ```bash
 cd dstar-gateway-core/fuzz

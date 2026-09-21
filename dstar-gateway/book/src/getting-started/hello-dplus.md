@@ -99,9 +99,9 @@ session.disconnect().await?;
    `dstar_gateway::auth::AuthClient::authenticate`. In a test you
    can attach an empty list.
 4. **Drive the handshake.** DPlus is a two-round-trip handshake:
-   LINK1 out → LINK1\_ACK in → LINK2 out → OKRW in. We poll the
-   outbox and feed it into the socket, wait for a reply, and
-   feed that back into the session. The session core detects
+   LINK1 out → LINK1\_ACK in → LINK2 out → OKRW in. The loop polls the
+   outbox and feeds it into the socket, waits for a reply, and
+   feeds that back into the session. The session core detects
    the ACK sequence and transitions the state machine forward.
 5. **Promote** `Connecting` to `Connected`. This is infallible
    once `state_kind()` reports `Connected`.

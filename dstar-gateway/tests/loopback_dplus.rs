@@ -131,7 +131,7 @@ async fn dplus_connect_via_loopback_and_send_voice() -> Result<(), Box<dyn std::
     //    - 1 voice EOT (32 bytes)
     //
     // The DPlus voice packet layout is documented in
-    // `dstar_gateway_core/src/codec/dplus/encode.rs` (58-header,
+    // `dstar-gateway-core/src/codec/dplus/encode.rs` (58-header,
     // 29-data, 32-eot) and differs from DExtra (56/27/27).
     let received = fake.received_packets().await;
     let link1_count = received

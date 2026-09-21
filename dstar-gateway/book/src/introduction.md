@@ -96,6 +96,6 @@ Three ideas drive every design decision in the library:
   and [ADR 0002](https://github.com/swiftraccoon/kenwood/blob/main/dstar-gateway/adr/0002-typestate.md).
 - **I want to run a reflector.** See the `dstar-gateway-server`
   crate and its `polaris` binary.
-- **I want to know what version of ircDDBGateway we copied from.**
+- **I want to know which ircDDBGateway and xlxd commits the wire formats were derived from.**
   See [REFERENCES.md](https://github.com/swiftraccoon/kenwood/blob/main/dstar-gateway/REFERENCES.md)
   for the pinned commit hashes and the file/line-range table.

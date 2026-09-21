@@ -91,8 +91,8 @@ ircDDBGateway implements only the client half, xlxd implements only
 the server half. `dstar-gateway` reuses the same codec and the same
 state machines on both sides. The benefit is that a bug fix in the
 codec immediately benefits both the client and the server, and that
-the fuzz corpus we maintain against the wire formats exercises both
-the encoder and the decoder on every target.
+the fuzz corpus for the wire formats exercises both the encoder and
+the decoder on every target.
 
 This symmetry is the reason ADR 0003 exists: it is worth the extra
 design friction to get codec reuse, because the codec is where the
@@ -105,10 +105,10 @@ and higher layers wrap lower-layer errors with context:
 
 - `dstar-gateway-core::Error`: codec, validator, and state-machine
   errors. No variant ever holds a tokio type or an `io::Error`.
-- `dstar-gateway::ShellError`: wraps the core error (`Core`) and
-  channel/task closure (`SessionClosed`). The legacy
-  `DisconnectTimeout` variant is retained but not returned by the
-  current shell; timeout outcomes arrive as disconnect events.
+- `dstar-gateway::ShellError`: wraps the core error (`Core`), channel
+  or task closure (`SessionClosed`), and the three disconnect outcomes
+  `DisconnectStalled`, `DisconnectUnacknowledged` and
+  `DisconnectedBeforeUnlink`.
 - `dstar-gateway::AuthError` covers the TCP-auth-specific cases: `Io` (tagged
   with the connect/write/read operation), `Timeout` (tagged with the
   phase), and `Parse`, which wraps a `DPlusError` from the auth
@@ -156,8 +156,8 @@ that owns the `UdpSocket` and the `Session<P, Connected>`.
 
 The driver loop is a `select!` that reads from the socket, advances
 the state machine, drains the outbox back to the socket, and pumps
-events into the event channel. It is intentionally small (~100
-lines) so the complexity budget stays in the core crate.
+events into the event channel. It is intentionally small so the
+complexity budget stays in the core crate.
 
 `AuthClient` is a separate async helper that
 owns a transient TCP connection. It has no relationship to the UDP
@@ -219,7 +219,7 @@ compile-fail cases. Full runtime varies by host and feature matrix.
 
 ## Further reading
 
-- [`REFERENCES.md`](REFERENCES.md): every reference we made to
+- [`REFERENCES.md`](REFERENCES.md): every reference to
   ircDDBGateway or xlxd, pinned to a commit hash.
 - [`adr/`](adr/): architectural decision records. Read
   `0001-sans-io.md` and `0002-typestate.md` first if you want to

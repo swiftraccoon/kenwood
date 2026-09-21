@@ -17,15 +17,15 @@ use crate::tokio_shell::ShellError;
 
 /// Fallback wait window when the session has no pending timer.
 ///
-/// With no deadline in sight the session is idle; we still want to
-/// yield to the OS periodically so the caller's loop doesn't spin.
+/// With no deadline in sight the session is idle; the wait still
+/// yields to the OS periodically so the caller's loop does not spin.
 const IDLE_WAIT: Duration = Duration::from_millis(100);
 
 /// Minimum read timeout clamp.
 ///
 /// `UdpSocket::set_read_timeout` rejects a zero `Duration`, so when
-/// the next deadline has already elapsed we still set a 1 ms
-/// timeout to keep the call legal.
+/// the next deadline has already elapsed a 1 ms timeout is set
+/// to keep the call legal.
 const MIN_WAIT: Duration = Duration::from_millis(1);
 
 /// Synchronous wrapper over a `Session<P, Connected>` + `UdpSocket`.
