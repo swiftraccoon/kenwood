@@ -61,7 +61,7 @@ public final class ReflectorAudioPlayer {
     }
 
     /// Route changes (headphones in/out) and media-services resets stop
-    /// the engine out from under us. Drop the latch so the next enqueue
+    /// the engine out from under the player. Drop the latch so the next enqueue
     /// rebuilds the graph and restarts; re-attaching an already
     /// attached node and re-connecting are documented no-ops/replacements.
     private func handleEngineConfigurationChange() {

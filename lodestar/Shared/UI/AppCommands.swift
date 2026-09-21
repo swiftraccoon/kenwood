@@ -106,7 +106,7 @@ private extension TransportCoordinator {
 #if os(macOS)
 import AppKit
 
-/// Render the standard NSApplication about panel with our credits.
+/// Render the standard NSApplication about panel with the app's credits.
 /// Matches the exact presentation style used by every Apple-shipped
 /// app: bundle icon, app name, short version, copyright, and a
 /// "Credits" roll that opens as a secondary sheet.

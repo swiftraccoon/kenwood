@@ -1,8 +1,8 @@
 import Foundation
 
 /// Attempts the raw-USB control paths that documentation says are closed to
-/// iPhone apps, and records exactly how iOS refuses, providing empirical
-/// evidence to replace quoted verdicts. Every attempt is read-only and failure-tolerant:
+/// iPhone apps, and records exactly how iOS refuses, so the observed refusal
+/// replaces quoted verdicts. Every attempt is read-only and failure-tolerant:
 /// the point is to observe denials, so nothing here must ever crash the app.
 ///
 /// Three probes:
@@ -140,7 +140,7 @@ enum ControlProbe {
     /// interface would get an `IOSerialBSDClient` and therefore a `/dev`
     /// node. A POSIX `open()` is gated by the filesystem sandbox, which is
     /// a completely separate mechanism from the IOKit user-client gate that
-    /// denied us above, so it is worth attempting independently.
+    /// denied the earlier attempt, so it is worth attempting independently.
     private static func probeSerialDeviceNodes() -> [String] {
         var lines = ["[POSIX] /dev nodes (did iOS create a tty for the CDC interface?):"]
         guard let dir = opendir("/dev") else {

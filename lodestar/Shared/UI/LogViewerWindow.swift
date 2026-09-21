@@ -47,10 +47,9 @@ public struct LogViewerWindow: View {
         }
         .frame(minWidth: 640, minHeight: 420)
         .task {
-            // `.task` runs at first-appear but on a detached priority.
-            // `.onAppear { Task { ... } }` previously scheduled the
-            // async work on MainActor which blocked the window from
-            // painting until the OSLogStore scan returned.
+            // `.task` runs at first-appear on a detached priority, so the
+            // OSLogStore scan never blocks the window from painting; an
+            // `.onAppear { Task { ... } }` would run it on MainActor.
             await reload()
         }
     }

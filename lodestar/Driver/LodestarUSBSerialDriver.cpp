@@ -42,9 +42,9 @@ constexpr uint32_t kOutBufferSize = 4096;
 // Kenwood documents the line-coding VALUE as ignored, but every real
 // host OS sends SET_LINE_CODING on port open and the radio's CDC stack
 // may not bring up its TX path until it has seen one; send both, in
-// the standard host order (line coding, then DTR|RTS). Hardware
-// evidence 2026-07-19: with only SET_CONTROL_LINE_STATE the radio ACKs
-// our bulk-OUT bytes yet never answers CAT.
+// the standard host order (line coding, then DTR|RTS). On hardware,
+// with only SET_CONTROL_LINE_STATE the radio ACKs the bulk-OUT bytes yet
+// never answers CAT.
 constexpr uint8_t kCdcReqTypeClassInterfaceOut = 0x21;
 constexpr uint8_t kCdcSetLineCoding = 0x20;
 constexpr uint8_t kCdcSetControlLineState = 0x22;

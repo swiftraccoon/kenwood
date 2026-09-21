@@ -24,7 +24,7 @@ public final class ReflectorCoordinator: ReflectorObserver {
         didSet { UserDefaults.standard.set(callsign, forKey: Self.callsignKey) }
     }
 
-    /// Local module letter presented to the reflector as our source module.
+    /// Local module letter presented to the reflector as the source module.
     public var localModule: String {
         didSet { UserDefaults.standard.set(localModule, forKey: Self.localModuleKey) }
     }
@@ -147,7 +147,7 @@ public final class ReflectorCoordinator: ReflectorObserver {
     /// event is applied.
     private var userInitiatedDisconnect: Bool = false
 
-    /// Scheduled auto-reconnect task, held so we can cancel it on
+    /// Scheduled auto-reconnect task, held so it can be cancelled on
     /// manual user actions (e.g. picking a different reflector).
     private var reconnectTask: Task<Void, Never>?
 
@@ -262,7 +262,7 @@ public final class ReflectorCoordinator: ReflectorObserver {
     /// terminated without a graceful `disconnect()`, reflectors hold
     /// the previous UDP session in memory for 30–60 s until keepalive
     /// timeout and reject fresh LINK attempts during that window.
-    /// The backoff schedule gives the reflector time to clear us.
+    /// The backoff schedule gives the reflector time to clear the stale session.
     public func tryAutoConnect() async {
         guard autoConnectReflector, session == nil else { return }
         guard case .disconnected = state else { return }
@@ -350,7 +350,7 @@ public final class ReflectorCoordinator: ReflectorObserver {
     }
 
     /// Insert a recently-heard entry for a transmission that originated
-    /// on *our* radio and was relayed to the reflector. Reflectors
+    /// on the local radio and was relayed to the reflector. Reflectors
     /// typically don't echo the sender's own stream back, so without
     /// this the operator's own transmissions never show up in the
     /// local history even though they're visible on the reflector's
@@ -536,7 +536,7 @@ public final class ReflectorCoordinator: ReflectorObserver {
     // MARK: - Heard-history persistence
 
     /// Codable projection of `HeardEntry` for UserDefaults archival.
-    /// We can't directly encode `HeardEntry` because it embeds
+    /// `HeardEntry` cannot be encoded directly because it embeds
     /// `GpsPosition` (a UniFFI-generated type without Codable).
     /// `id` is optional so archives written before it existed still
     /// decode (they get fresh UUIDs on load, once).
@@ -616,13 +616,13 @@ public final class ReflectorCoordinator: ReflectorObserver {
         return archive.map { $0.toEntry() }
     }
 
-    /// Schedule a best-effort reconnect after the reflector drops us
-    /// unexpectedly (network blip, reflector restart, keepalive
+    /// Schedule a best-effort reconnect after the reflector drops the
+    /// session unexpectedly (network blip, reflector restart, keepalive
     /// timeout). Backoff: 5s / 15s / 45s, mirroring the pattern
     /// `tryAutoConnect` uses for launch-time stale-session recovery.
     ///
     /// Only fires when the previous link was a user-picked reflector
-    /// (so we know where to reconnect to). Cancels any prior pending
+    /// (the reconnect target). Cancels any prior pending
     /// reconnect task before scheduling, preventing stacked retries
     /// during a rapid flap.
     private func scheduleUnexpectedReconnect() {

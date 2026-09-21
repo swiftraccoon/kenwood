@@ -13,19 +13,19 @@ private let log = Logger(subsystem: "org.swiftraccoon.lodestar", category: "noti
 ///
 /// Per Apple HIG: notifications should be infrequent, actionable,
 /// and mirror something the user could already see in the window
-/// they're not looking at. We do **not** notify on every heard
+/// they're not looking at. It does **not** notify on every heard
 /// station: that would become spam for any active reflector.
 @MainActor
 public final class NotificationManager {
     public static let shared = NotificationManager()
 
-    /// Tracks whether we've already asked for permission this session,
+    /// Tracks whether permission was already requested this session,
     /// so repeated authorization prompts don't stack up.
     private var askedThisSession = false
 
     private init() {}
 
-    /// Request notification authorization if we haven't already.
+    /// Request notification authorization once per session.
     /// Safe to call repeatedly: the system coalesces and the
     /// `askedThisSession` flag short-circuits further prompts.
     public func requestAuthorizationIfNeeded() {

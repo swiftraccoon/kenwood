@@ -820,10 +820,10 @@ extension McpOrchestratorError: LocalizedError {
                 + " returned \(actual) bytes; expected \(expected)."
         case .badExitAck(let actual):
             return "MCP exit returned 0x" + String(format: "%02X", actual)
-                + " instead of ACK. Exit is not proved; close the link and power-cycle "
+                + " instead of ACK. Exit is unconfirmed; close the link and power-cycle "
                 + "the radio before retrying."
         case .exitNotProved(let detail):
-            return "MCP exit is not proved (\(detail)). The link was closed; power-cycle "
+            return "MCP exit is unconfirmed (\(detail)). The link was closed; power-cycle "
                 + "the radio before retrying."
         case .operationAndCleanupFailed(let operation, let cleanup):
             return "MCP operation failed: \(operation) Cleanup also failed: \(cleanup) "

@@ -142,8 +142,8 @@ final class TransportCoordinatorTests: XCTestCase {
     func testConnectUsesInjectedTransportFactory() async throws {
         let coordinator = TransportCoordinator()
         let mock = MockRadioTransport()
-        // connect() runs the MMDVM GetVersion probe. The mock no longer
-        // echoes writes, and the prober's timeout can't cancel a blocked
+        // connect() runs the MMDVM GetVersion probe. The mock does not
+        // echo writes, and the prober's timeout can't cancel a blocked
         // read (CheckedContinuation isn't cancellation-aware), so an
         // unanswered probe hangs connect(). Script any non-empty reply so
         // the probe read resumes and connect() finishes.

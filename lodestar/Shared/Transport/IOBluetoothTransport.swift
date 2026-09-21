@@ -54,10 +54,9 @@ public actor IOBluetoothTransport: RadioTransport {
 
     /// Enumerate every bounded paired device in a short-lived helper.
     ///
-    /// Discovery is metadata-only and does not guess radio identity from a
-    /// display name. The user chooses one exact address; the app's connection
-    /// coordinator separately proves the wire protocol before admitting the
-    /// radio session. Transport readiness alone does not establish CAT or MMDVM.
+    /// Returns at most 64 paired devices, each with its exact address and a
+    /// display name of at most 1,024 bytes. Names are metadata only: pass the
+    /// exact address to `open`, which checks it in the radio-open ready frame.
     public nonisolated static func pairedDevices() -> [BluetoothDevice] {
         #if os(macOS)
         return BluetoothHelperProcess.pairedDevices()
@@ -597,7 +596,7 @@ private func lodestar_bt_helper_environment_protocol_probe() -> Int32
 private let bluetoothHelperReadyMagic = Array("KENWBT-READY-v2!".utf8)
 /// Radio-open metadata: 17 ASCII address bytes followed by one raw channel byte.
 private let bluetoothHelperEndpointByteCount = 18
-/// Lodestar's TH-D75 policy, not a default for the shared native backend.
+/// RFCOMM server channel Lodestar opens for the TH-D75 SPP connection.
 private let bluetoothD75SPPChannel: UInt8 = 2
 private let bluetoothMaxPairedDevices = 64
 private let bluetoothMaxPairedDisplayNameBytes = 1_024
@@ -623,8 +622,10 @@ private struct BluetoothHelperProcess {
     var generation: UInt64 = 0
     var reader: BluetoothHelperPipeReader?
 
-    /// Control and no-radio test operations have no endpoint metadata.
-    /// Radio mode must prove this exact address and the model-owned channel.
+    /// Non-radio modes carry only the ready magic. In radio mode the frame
+    /// must also carry 17 ASCII address bytes matching `device`, ignoring case
+    /// and `:` versus `-` separators, plus a channel byte equal to
+    /// `bluetoothD75SPPChannel` (2).
     static func validReadyFrame(
         _ bytes: [UInt8],
         device: String,

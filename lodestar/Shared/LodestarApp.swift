@@ -3,8 +3,8 @@
 
 import SwiftUI
 
-/// App entry point. On macOS we additionally register:
-///   * a `Settings` scene (⌘, opens our tabbed preferences window),
+/// App entry point. On macOS the app additionally registers:
+///   * a `Settings` scene (⌘, opens the tabbed preferences window),
 ///   * a `MenuBarExtra` status item (menu-bar link state + quick access),
 ///   * `AppCommands` that replace the default New-Item menu with
 ///     radio / reflector shortcuts and add a dedicated Reflector menu.

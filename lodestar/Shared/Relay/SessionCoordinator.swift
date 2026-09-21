@@ -68,7 +68,7 @@ public final class SessionCoordinator {
     }
 
     /// Graceful shutdown: send the reflector unlink packet and close
-    /// the radio transport so the reflector clears our session
+    /// the radio transport so the reflector clears the session
     /// immediately instead of waiting ~30–60 s for keepalive timeout.
     /// Called on `scenePhase` transitions to `.background` / `.inactive`
     /// so the next launch's auto-connect lands cleanly.

@@ -8,11 +8,11 @@ import OSLog
 /// Unified Log under subsystem `org.swiftraccoon.lodestar.rust`, with
 /// the event `target` as the category. That puts Rust-side diagnostics
 /// alongside Swift-side `Logger` calls in `Console.app` /
-/// `OSLogStore` / our in-app Log Viewer.
+/// `OSLogStore` / the in-app Log Viewer.
 ///
 /// Implements the UniFFI callback trait [`LogSink`] exported from
 /// `lodestar-core/src/lib.rs`. Must be `@unchecked Sendable` because
-/// UniFFI requires the trait impl to be `Send + Sync`, but our
+/// UniFFI requires the trait impl to be `Send + Sync`, and the
 /// `cachedLoggers` dictionary mutation already serialises on the
 /// concurrent queue.
 final class RustLogBridge: LogSink, @unchecked Sendable {
@@ -20,7 +20,7 @@ final class RustLogBridge: LogSink, @unchecked Sendable {
 
     private static let subsystem = "org.swiftraccoon.lodestar.rust"
 
-    /// Cache one `Logger` per category so we don't pay the
+    /// Cache one `Logger` per category to avoid paying the
     /// `os_log_create` cost on every event. Accessed from whichever
     /// tokio thread fires the event; protected by the concurrent
     /// queue's barrier pattern.

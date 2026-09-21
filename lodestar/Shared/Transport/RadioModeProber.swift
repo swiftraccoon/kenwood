@@ -17,7 +17,7 @@ public enum RadioMode: Equatable, Sendable {
     /// Menu 650 is `Reflector Terminal` (or `Access Point`), and Menu 985
     /// routes DV Gateway to this attached interface instead of the other one.
     case mmdvm
-    /// The probe got a response we can't classify.
+    /// The probe got a response that cannot be classified.
     case unrecognized(firstByte: UInt8)
 }
 
@@ -62,8 +62,8 @@ public struct RadioModeProber {
             // Flush the radio's CAT line parser before returning: the
             // probe bytes carry no CR, so they linger in the radio's
             // line buffer and corrupt the NEXT CAT command ("ID\r"
-            // right after a probe answers "?\r"; hardware-verified
-            // 2026-07-19). A bare CR terminates the junk line; the
+            // right after a probe answers "?\r"; verified on
+            // hardware). A bare CR terminates the junk line; the
             // radio's "?\r" reply to it is drained and discarded here
             // so it can't poison the next reader either.
             log.info("radio-mode probe: no response → classifying as .cat (flushing line buffer)")

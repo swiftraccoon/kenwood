@@ -60,8 +60,8 @@ public final class RelayCoordinator {
     private var outboundSeq: UInt8 = 0
 
     /// Summary of the current local TX, captured on header and flushed
-    /// on EOT so we can insert a recently-heard entry for our own
-    /// relayed stream (the reflector won't echo it back to us).
+    /// on EOT so a recently-heard entry can be inserted for the
+    /// relayed stream (the reflector does not echo it back).
     private struct LocalTxTracker {
         let mycall: String
         let suffix: String
@@ -275,7 +275,7 @@ public final class RelayCoordinator {
         relayEventPump?.cancel()
         relayEventPump = nil
         reflectorCoordinator.relayHook = nil
-        // Relay no longer owns the audio path; let the on-device
+        // The relay has released the audio path; let the on-device
         // monitor resume (subject to the user's monitor toggle).
         reflectorCoordinator.suppressMonitorForRelay = false
         readerTask?.cancel()
@@ -302,9 +302,8 @@ public final class RelayCoordinator {
         log.error("Relay: \(msg)")
     }
 
-    /// Generate a non-zero `StreamId` for an outbound stream. We use a
-    /// random u16 and ensure it's not zero (Rust-side `StreamId::new`
-    /// rejects zero).
+    /// Generate a non-zero `StreamId` for an outbound stream from a
+    /// random u16, never zero (Rust-side `StreamId::new` rejects zero).
     private static func freshStreamId() -> UInt16 {
         var sid: UInt16
         repeat {

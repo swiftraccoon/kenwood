@@ -146,7 +146,7 @@ struct StationMapPane: View {
         // acquisition under load (camera pan + pulsing annotation +
         // material blur above it) and its fallback path trips a Metal
         // API Validation assertion that aborts debug builds
-        // (observed on-device, iPad, 2026-07-19).
+        // (observed on an iPad).
         .mapStyle(.hybrid(elevation: .flat))
         .onAppear { refit(animated: false) }
         .onChange(of: callsignKey) { _, _ in
