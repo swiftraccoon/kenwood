@@ -29,7 +29,7 @@ pub const DEFAULT_MAX_FRAME_LEN: usize = 1024;
 pub struct KissDecoder {
     /// Accumulated bytes since the last complete frame.
     buffer: Vec<u8>,
-    /// `true` once we've seen a leading FEND and are inside a frame.
+    /// `true` once a leading FEND has been seen and a frame is open.
     in_frame: bool,
     /// Maximum complete-frame length (both FENDs included) the decoder
     /// accepts; longer frames are discarded as [`KissError::FrameTooLong`].

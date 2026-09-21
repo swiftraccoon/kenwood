@@ -9,11 +9,11 @@ KISS TNC wire-framing codec per Chepponis/Karn (1987). `no_std` + `alloc`, sans-
 - `KissCommand` (Data, TxDelay, Persistence, SlotTime, TxTail, FullDuplex, SetHardware, Return) and `KissPort` newtype with `TH_D75` constant.
 - FEND / FESC / TFEND / TFESC byte-stuffing constants.
 
-Non-goals: AX.25 parsing (see [`ax25-codec`](../ax25-codec/)), APRS parsing (see [`aprs`](../aprs/)), transport I/O, radio-specific firmware quirks (e.g. the TH-D75's CMD_RETURN nibble encoding, handled in [`kenwood-thd75`](../thd75/)).
+Non-goals: AX.25 parsing (see [`ax25-codec`](../ax25-codec/)), APRS parsing (see [`aprs`](../aprs/)), transport I/O, and radio-specific behavior. The reported TH-D75 CMD_RETURN nibble split is implemented nowhere; `KissSession::exit` in [`kenwood-thd75`](../thd75/) sends this crate's spec-correct whole-byte Return frame.
 
 ## Status
 
-Extracted from `kenwood-thd75` April 2026. Pre-release. Public API is unstable and will change without notice as additional consumers (TM-D750, standalone TNC host) are integrated. Pin to a specific git SHA if you need stability.
+Pre-release. Public API is unstable and will change without notice as additional consumers (TM-D750, standalone TNC host) are integrated. Pin to a specific git SHA if you need stability.
 
 ## Reference
 
