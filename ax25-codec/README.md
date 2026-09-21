@@ -7,7 +7,7 @@ AX.25 v2.2 frame encode/decode. `no_std` + `alloc`, sans-io.
 - `Ax25Packet`: source, destination, up to 8 digipeaters, control field, PID, info payload.
 - `parse_ax25(&[u8]) -> Result<Ax25Packet, Ax25Error>` and `build_ax25(&Ax25Packet) -> Vec<u8>`.
 - `Ax25Control` classification: Information / Supervisory{RR, RNR, REJ, SREJ} / Unnumbered{UI, SABM, DISC, DM, UA, FRMR, XID, TEST, ...}.
-- `Ax25Pid` enum with 14 canonical values (NoLayer3, NetRom, Ip, Arp, Appletalk, TexNet, LinkQuality, FlexNet, ...).
+- `Ax25Pid` enum with 13 canonical values (NoLayer3, NetRom, Ip, Arp, Appletalk, TexNet, LinkQuality, FlexNet, ...) plus the `Escape` extension form and `Other` for unassigned bytes.
 - Lossless `CommandResponse` classification per AX.25 v2.2 §6.1.2,
   including both pre-v2.0 equal-C-bit wire forms.
 - `ax25_fcs(&[u8]) -> u16` CRC-16-CCITT.
@@ -17,7 +17,7 @@ This is the AX.25 layer only. KISS framing is in [`kiss-tnc`](../kiss-tnc/); APR
 
 ## Status
 
-Extracted from `kenwood-thd75` April 2026. Pre-release. Public API is unstable. `Callsign`/`Ssid` error paths currently thread through `Ax25Error`; that boundary may shift as additional consumers land.
+Pre-release. Public API is unstable. `Callsign`/`Ssid` error paths currently thread through `Ax25Error`; that boundary may shift as additional consumers land.
 
 ## Reference
 

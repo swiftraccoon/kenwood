@@ -86,7 +86,7 @@ const fn is_known_unnumbered_kind(value: u8) -> bool {
 ///   used by APRS
 ///
 /// The APRS protocol uses the `UI` subtype with control byte `0x03`.
-/// Only UI is commonly seen in practice, but we parse the full family.
+/// Only UI is commonly seen in practice, but the full family is parsed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Ax25Control {
     /// Information frame (I).

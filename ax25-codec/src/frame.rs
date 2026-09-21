@@ -875,7 +875,7 @@ mod tests {
 
     /// Absolute wire pin for the encoder, hand-derived from AX.25
     /// v2.2 §3.12. Every other encode check in this crate round-trips
-    /// through our own parser, which MASKS the reserved SSID bits the
+    /// through this crate's parser, which masks the reserved SSID bits the
     /// encoder writes (`(ssid_byte >> 1) & 0x0F`), so an encoder
     /// emitting `0x00`-base SSID bytes would pass the entire suite
     /// while producing frames other TNCs may reject. Layout per SSID
