@@ -68,7 +68,7 @@ struct PendingMessage {
     /// Station this message was sent to. An acknowledgement is only
     /// honoured when it arrives FROM this station: over open RF, a
     /// message number alone is not proof of delivery, and matching on
-    /// it lets any third party cancel our retries.
+    /// it lets any third party cancel the pending retries.
     addressee: MessageAddressee,
     /// Pre-built KISS wire frame for retransmission.
     wire_frame: Vec<u8>,
@@ -323,8 +323,8 @@ impl AprsMessenger {
         }
     }
 
-    /// Process an incoming APRS message for acknowledgements of our own
-    /// outbound traffic.
+    /// Process an incoming APRS message for acknowledgements of this
+    /// station's outbound traffic.
     ///
     /// Two acknowledgement carriers are recognised, and both clear the
     /// matching pending message:
@@ -332,8 +332,8 @@ impl AprsMessenger {
     /// 1. A standalone ack/rej control frame (per [`classify_ack_rej`]):
     ///    text of the exact form `ack<id>` / `rej<id>`.
     /// 2. An APRS 1.1/1.2 reply-ack (`msg.reply_ack`): an ordinary
-    ///    message whose trailer was `{MM}AA`, where `AA` acknowledges our
-    ///    previously-sent message number. Modern clients (`APRSdroid`,
+    ///    message whose trailer was `{MM}AA`, where `AA` acknowledges one
+    ///    of this station's sent message numbers. Modern clients (`APRSdroid`,
     ///    `YAAC`, `aprs.fi`) bundle the ack this way instead of sending a
     ///    separate `ackNN` frame.
     ///
@@ -352,7 +352,7 @@ impl AprsMessenger {
     /// frame. An acknowledgement is honoured ONLY when it arrives from
     /// the station the pending message was addressed to: over open RF a
     /// message number is not a secret, so matching on it alone would let
-    /// any third party silently cancel our delivery retries. Comparison
+    /// any third party silently cancel the delivery retries. Comparison
     /// is ASCII-case-insensitive, matching APRS callsign conventions.
     pub fn process_incoming(&mut self, source: &str, msg: &AprsMessage) -> bool {
         let before = self.pending_messages.len();
@@ -594,7 +594,7 @@ mod tests {
 
     /// An ack only counts when it comes from the station the message
     /// was addressed to. Matching on the message number alone lets ANY
-    /// station on the air cancel our delivery retries; over RF that is
+    /// station on the air cancel the delivery retries; over RF that is
     /// a trivially spoofable denial of delivery (the retries stop and
     /// the message later reports "expired" instead of being resent).
     #[test]
@@ -833,7 +833,7 @@ mod tests {
         let mut m = test_messenger();
         let _id = queue_test_message(&mut m, "W1AW", "Hello", t0);
 
-        // Regression: this used to be treated as an ack for msg "nowle".
+        // Message text that merely resembles an ack must not clear a pending message.
         let false_ack = AprsMessage {
             addressee: "N0CALL".to_owned(),
             text: "acknowledge receipt".to_owned(),

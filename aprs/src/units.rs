@@ -1003,8 +1003,8 @@ mod tests {
 
     #[test]
     fn ddmm_latitude_carry_boundary_33_999999() -> TestResult {
-        // 33.999999° used to print "3360.00" (minutes rounded to 60.00
-        // with no carry). The carry-correct helper must roll to 34° 00.00'.
+        // 33.999999° rounds its minutes to 60.00; the helper must carry
+        // to 34° 00.00' instead of printing "3360.00".
         let core = format_ddmm_hundredths(33.999_999, 2);
         let (deg, min, hun) = split_ddmm(&core, 2)?;
         assert!(min < 60, "minutes must stay < 60, got {min} in {core}");
@@ -1046,7 +1046,7 @@ mod tests {
 
     #[test]
     fn ddmm_longitude_carry_boundary_97_999983() -> TestResult {
-        // 97.999983° used to print "09760.00"; it must carry to 98° 00.00'.
+        // 97.999983° must carry to 98° 00.00', never print "09760.00".
         let core = format_ddmm_hundredths(97.999_983, 3);
         let (deg, min, hun) = split_ddmm(&core, 3)?;
         assert!(min < 60, "minutes must stay < 60, got {min} in {core}");

@@ -22,7 +22,7 @@
 //! seven `SmartBeaconing` parameters via Menu 530-535. Low/high speed share
 //! Menu 530:
 //!
-//! | Menu | Name        | V1.03 default             | Our field         |
+//! | Menu | Name        | V1.03 default             | Field             |
 //! |-----:|-------------|---------------------------|-------------------|
 //! | 530  | Low Speed   | 5 in Menu 970 speed unit  | `low_speed()`     |
 //! | 530  | High Speed  | 70 in Menu 970 speed unit | `high_speed()`    |

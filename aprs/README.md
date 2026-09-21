@@ -12,7 +12,7 @@ APRS (Automatic Packet Reporting System) protocol stack. std-only, sans-io.
 
 - `DigipeaterConfig`: path handling, 30 s dup cache keyed on `(source, dest, info)` hash, own-callsign loop detection, optional viscous delay queue.
 - `SmartBeaconing`: HamHUD (Tony Arnerich KD7TA / Steve Bragg KA9MVA) formula with low/high speeds, turn slope, turn minimum, turn time.
-- `AprsMessenger`: ack/rej classification via strict `^(ack|rej)[A-Za-z0-9]{1,5}$`, per-message retry backoff, incoming dedup window.
+- `AprsMessenger`: ack/rej classification (an `ack` or `rej` prefix followed by one to five alphanumeric ID characters, with trailing CR, LF and spaces ignored), per-message retry backoff, incoming dedup window.
 - `StationList`: heard-station database with expiry and bounded capacity.
 
 **Validated newtypes.** Numeric and symbolic fields include `Latitude`, `Longitude`, `Speed`, `Course`, `MessageId`, `SymbolTable`, `AprsSymbol`, `Fahrenheit`, and `Tocall`. Text builders use lossless printable-ASCII values rather than truncating strings: `MessageText` keeps `{` reserved for directed-message IDs, `BulletinText` permits it as ordinary bulletin text, `PositionReportText` allows 43 bytes for uncompressed positions/objects/items, `CompressedPositionText` allows 40 bytes after compressed `csT`, and `MiceStatusText` allows the remaining 247 bytes while reserving all telemetry prefixes. Mic-E parsing exposes printable and legacy binary telemetry through `MiceTelemetry`.
@@ -29,7 +29,7 @@ Every stateful method accepts `now: Instant` as a parameter. The crate never cal
 
 ## Status
 
-Extracted from `kenwood-thd75` April 2026. Pre-release. Public API is unstable: `StationList::update` currently takes `&str` / `&[String]` pending planned tightening to `&Callsign` / `&[Ax25Address]`. Error-variant names may change. The `aprs` → `kiss-tnc` dependency (for `ax25_to_kiss_wire`) may be removed in a future reorganization that pushes KISS wrapping back up to the consumer.
+Pre-release. Public API is unstable: `StationList::update` currently takes `&str` / `&[String]` pending planned tightening to `&Callsign` / `&[Ax25Address]`. Error-variant names may change. The `aprs` → `kiss-tnc` dependency (for `ax25_to_kiss_wire`) may be removed in a future reorganization that pushes KISS wrapping back up to the consumer.
 
 ## References
 

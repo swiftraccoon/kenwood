@@ -53,8 +53,8 @@ impl AprsMessage {
     /// 4. **`GroupBulletin { group }`**: addressee is `BLN` + 1-5
     ///    alnum chars not matched by (2) or (3), per APRS 1.0.1 §14
     ///    p.74 (the spec's canonical form is `BLN<digit><group>` but
-    ///    in-the-wild traffic uses many variations, so we accept any
-    ///    multi-char tail).
+    ///    in-the-wild traffic uses many variations, so any multi-char
+    ///    tail is accepted).
     /// 5. **`AckRej`**: for a regular station addressee, text begins with
     ///    `ack`/`rej` + 1-5 alnum.
     /// 6. **`Direct`**: anything else.

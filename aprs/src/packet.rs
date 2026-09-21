@@ -638,7 +638,7 @@ const PHG_POWER: [u32; 10] = [0, 1, 4, 9, 16, 25, 36, 49, 64, 81];
 ///
 /// In practice values above ~20 are unphysical (10 × 2²⁰ ≈ 3 200 km
 /// AGL, well beyond LEO). The spec deliberately leaves the upper bound
-/// open; we cap at the u32 boundary to keep the cast safe.
+/// open; the value is capped at the u32 boundary to keep the cast safe.
 const PHG_HEIGHT_MAX_DIGIT: u32 = 28;
 
 /// Decode a PHG height code into feet above average terrain.
@@ -1000,23 +1000,23 @@ pub enum AprsData {
     ///
     /// APRS 1.0.1 §5.2: anything starting with `$GP`, `$GN`, `$GL`,
     /// `$GA` (GPS/GNSS NMEA) or other `$`-prefixed instrument data.
-    /// We store the full NMEA sentence minus the leading `$`.
+    /// Holds the full NMEA sentence minus the leading `$`.
     RawGps(String),
     /// Station capabilities report (data type `<`).
     ///
     /// APRS 1.0.1 §15.2: comma-separated `TOKEN=value` tuples
     /// describing what the station supports (`IGATE`, `MSG_CNT`,
-    /// `LOC_CNT`, etc.). We store them as a map.
+    /// `LOC_CNT`, etc.), stored as a list of pairs.
     StationCapabilities(Vec<(String, String)>),
     /// Agrelo `DFjr` (direction-finding) data (data type `%`).
     ///
-    /// The library doesn't interpret the binary format; we preserve
+    /// The library does not interpret the binary format; it preserves
     /// the raw payload bytes for callers that do.
     AgreloDfJr(Vec<u8>),
     /// User-defined APRS data (data type `{`).
     ///
     /// APRS 1.0.1 §18: format is `{<experiment_id><type><data>` where
-    /// the experiment ID is one character. We split it out for
+    /// the experiment ID is one character. It is split out for
     /// convenience; callers that understand the experiment can parse
     /// the rest.
     UserDefined {
@@ -1028,7 +1028,7 @@ pub enum AprsData {
     /// Invalid/test frame (data type `,`).
     ///
     /// Used for test beacons and frames that should be ignored by
-    /// normal receivers. We preserve the payload for diagnostics.
+    /// normal receivers. The payload is preserved for diagnostics.
     InvalidOrTest(Vec<u8>),
     /// Raw weather data from legacy commercial weather stations
     /// (data types `#` Peet Bros U-II, `*` Peet Bros U-II under a
@@ -1221,7 +1221,7 @@ fn parse_aprs_grid(info: &[u8]) -> Result<AprsData, AprsError> {
 /// Parse an APRS raw GPS / NMEA frame (data type `$`).
 ///
 /// Per APRS 1.0.1 §5.2, the frame is a full NMEA sentence including the
-/// leading `$`. We preserve the body without the leading `$` (so the
+/// leading `$`. The body is preserved without the leading `$` (so the
 /// caller still sees `GPRMC,...` etc.).
 fn parse_aprs_raw_gps(info: &[u8]) -> Result<AprsData, AprsError> {
     if info.first() != Some(&b'$') {
@@ -1238,7 +1238,7 @@ fn parse_aprs_raw_gps(info: &[u8]) -> Result<AprsData, AprsError> {
 ///
 /// Per APRS 1.0.1 §15.2, the body is a comma-separated list of tokens,
 /// each of the form `KEY` (flag) or `KEY=value`. Whitespace around the
-/// delimiters is not permitted in the spec but we trim it anyway for
+/// delimiters is not permitted in the spec but is trimmed anyway for
 /// tolerance.
 fn parse_aprs_capabilities(info: &[u8]) -> Result<AprsData, AprsError> {
     if info.first() != Some(&b'<') {
@@ -2009,8 +2009,7 @@ mod tests {
 
     #[test]
     fn telemetry_definition_bits_rejects_empty_mask() {
-        // Verified bug: a bare "BITS." previously yielded a zero-length
-        // active-bit mask. It must now be rejected.
+        // A bare "BITS." has no active-bit mask and must be rejected.
         assert!(TelemetryDefinition::from_text("BITS.").is_none());
     }
 

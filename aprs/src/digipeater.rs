@@ -4,10 +4,10 @@
 //! (per Operating Tips section 2.4):
 //!
 //! - **`UIdigipeat`**: Simple alias replacement. When a path entry matches
-//!   a configured alias, replace it with our callsign and mark as used.
+//!   a configured alias, replace it with the local callsign and mark it used.
 //! - **`UIflood`**: Decrement the hop count on a flooding alias (e.g., `CA3-3`).
 //!   Drop when the count reaches zero.
-//! - **`UItrace`**: Like `UIflood`, but also inserts our callsign into the
+//! - **`UItrace`**: Like `UIflood`, but also inserts the local callsign into the
 //!   path before the decremented hop entry.
 //!
 //! In addition, the [`DigipeaterConfig`] carries a rolling dedup cache so
@@ -46,8 +46,8 @@ pub const DEFAULT_DEDUP_TTL: Duration = Duration::from_secs(30);
 ///
 /// When nonzero, relay candidates are held for up to this duration to
 /// let other digipeaters (with clearer paths) go first; if any digi
-/// actually relays the packet within the window, we cancel our own
-/// pending relay. Disabled (0) by default.
+/// actually relays the packet within the window, the local pending
+/// relay is cancelled. Disabled (0) by default.
 pub const DEFAULT_VISCOUS_DELAY: Duration = Duration::from_secs(0);
 
 /// A typed digipeater alias.
@@ -118,16 +118,16 @@ impl std::fmt::Display for DigipeaterAlias {
 /// packets seen more than once within [`DigipeaterConfig::dedup_ttl`].
 #[derive(Debug, Clone)]
 pub struct DigipeaterConfig {
-    /// Our callsign (used for `UIdigipeat` and `UItrace` path insertion).
+    /// Local callsign (used for `UIdigipeat` and `UItrace` path insertion).
     callsign: Ax25Address,
     /// Exact `UIdigipeat` addresses (e.g., `WIDE1-1`). Relay if the path
-    /// contains one, then replace it with our callsign + completion flag.
+    /// contains one, then replace it with the local callsign + completion flag.
     uidigipeat_aliases: Vec<Ax25Address>,
     /// `UIflood` alias base (e.g., `"CA"`). Relay and decrement hop count.
     /// The SSID encodes the remaining hop count.
     uiflood_alias: Option<DigipeaterAlias>,
     /// `UItrace` alias base (e.g., `"WIDE"`). Relay, decrement hop count,
-    /// and insert our callsign in the path.
+    /// and insert the local callsign in the path.
     uitrace_alias: Option<DigipeaterAlias>,
     /// How long a recently-seen packet is remembered in the dedup cache.
     /// Defaults to [`DEFAULT_DEDUP_TTL`] (30 s). Zero disables deduplication.
@@ -155,8 +155,8 @@ pub struct DigipeaterConfig {
     /// because the duplicate check is timestamp-aware.
     last_prune: Option<Instant>,
     /// Pending viscous relays, keyed on the packet hash. Each entry is
-    /// the time we first saw the packet; when the delay elapses and
-    /// we haven't seen anyone else relay it, we transmit ourselves.
+    /// the time the packet was first seen; when the delay elapses and
+    /// no other station has relayed it, the local station transmits.
     pending_viscous: HashMap<u64, (Instant, Ax25Packet)>,
 }
 
@@ -308,9 +308,9 @@ pub enum DigiAction {
     /// `0x03` and `0x13` are UI) or PID != 0xF0). APRS uses only UI
     /// frames, so this is effectively a pass-through.
     NotUiFrame,
-    /// Loop detected: our own callsign is already in the used path.
+    /// Loop detected: the local callsign is already in the used path.
     LoopDetected,
-    /// Duplicate packet: we already relayed this one within the TTL
+    /// Duplicate packet: this one was already relayed within the TTL
     /// window.
     Duplicate,
     /// Relay with modified digipeater path.
@@ -332,11 +332,11 @@ impl DigipeaterConfig {
     ///    Unnumbered Information via [`Ax25Packet::is_ui`] (which
     ///    accepts the P/F bit, so `0x13` counts as UI alongside the
     ///    plain `0x03`) and the PID must be `0xF0`.
-    /// 2. Own-callsign loop detection: if our callsign appears anywhere
+    /// 2. Own-callsign loop detection: if the local callsign appears anywhere
     ///    in the digipeater path with the H-bit set, the packet has already
-    ///    been through us and we must drop it to prevent routing loops.
-    /// 3. Dedup cache lookup: if we've relayed a packet with the same
-    ///    source/destination/info hash within [`Self::dedup_ttl`], drop.
+    ///    been through this station and is dropped to prevent routing loops.
+    /// 3. Dedup cache lookup: if a packet with the same
+    ///    source/destination/info hash was relayed within [`Self::dedup_ttl`], drop.
     /// 4. First-unused entry alias matching (`UIdigipeat`, `UIflood`,
     ///    `UItrace`).
     /// 5. On successful relay, the packet hash is recorded in the dedup
@@ -501,7 +501,7 @@ fn hash_packet_identity(packet: &Ax25Packet) -> u64 {
     h.finish()
 }
 
-/// Check whether our callsign appears in the digipeater path with the
+/// Check whether the local callsign appears in the digipeater path with the
 /// has-been-repeated bit set. If so, the packet has already passed through
 /// this station and relaying it again would create a routing loop.
 fn own_callsign_already_relayed(own: &Ax25Address, path: &DigipeaterPath) -> bool {
@@ -515,7 +515,7 @@ fn own_callsign_already_relayed(own: &Ax25Address, path: &DigipeaterPath) -> boo
     })
 }
 
-/// `UIdigipeat`: replace the alias entry with our callsign, marked as used.
+/// `UIdigipeat`: replace the alias entry with the local callsign, marked as used.
 fn apply_uidigipeat(callsign: &Ax25Address, packet: &Ax25Packet, idx: usize) -> DigiAction {
     let mut modified = packet.clone();
     if let Some(slot) = modified.digipeaters.get_mut(idx) {
@@ -563,7 +563,7 @@ fn apply_uiflood(packet: &Ax25Packet, idx: usize) -> DigiAction {
     }
 }
 
-/// `UItrace`: like `UIflood` but also inserts our callsign before the hop entry.
+/// `UItrace`: like `UIflood` but also inserts the local callsign before the hop entry.
 fn apply_uitrace(callsign: &Ax25Address, packet: &Ax25Packet, idx: usize) -> DigiAction {
     // `UItrace` inserts a new digipeater slot; if the path is already at
     // the codec-level maximum (see `ax25_codec::MAX_DIGIPEATERS`, currently
@@ -846,7 +846,7 @@ mod tests {
     /// path is built from genuine on-wire bytes, then assert the decoded
     /// path matches the expected `(callsign, ssid, has_repeated)` tuples.
     ///
-    /// This proves the New-N wire encoding our matcher must handle: an
+    /// This pins the New-N wire encoding the matcher must handle: an
     /// on-wire `WIDE2-2` entry decodes to `callsign == "WIDE2"`, `ssid == 2`
     /// (the requested-hops digit is part of the callsign field; the
     /// remaining hops live in the SSID).
