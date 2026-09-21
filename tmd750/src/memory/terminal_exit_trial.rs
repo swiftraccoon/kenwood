@@ -1,7 +1,8 @@
-//! Pure preparation and fail-closed evidence sequencing for one Terminal exit.
+//! Offline preparation and fail-closed event sequencing for one Terminal exit.
 //!
-//! Caller events are attestations, not independent proof of hardware state,
-//! connection freshness, operator approval, or durable evidence.
+//! This module performs no I/O. Each event carries facts the caller reports;
+//! this module checks their order and compares page bytes, but cannot confirm
+//! that a capture completed or that a journal record reached disk.
 
 use std::num::NonZeroU64;
 
@@ -123,33 +124,32 @@ pub enum TerminalExitTrialSession {
     Verify,
 }
 
-/// Conservative outcome modeled from accepted caller evidence.
+/// Trial status derived from the events recorded so far.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalExitTrialStatus {
-    /// No durable write intent has been accepted by this instance.
+    /// No write intent has been recorded.
     NotWritten,
-    /// The sole intent was accepted; the write may have reached the radio.
+    /// The sole intent was recorded; the write may have reached the radio.
     PossiblyChanged,
     /// Complete Off pages matched immediately and in a distinct session, and
     /// both finalized lifecycles included fresh matching CAT identity and Off.
-    /// This does not establish a power cycle or hardware qualification.
     OffVerifiedAcrossSessions,
 }
 
-/// Evidence accepted only in the fixed apply-then-verify sequence.
+/// Events for the fixed apply-then-verify sequence, accepted only in order.
 ///
-/// Callers must independently establish every attested fact. This pure API
-/// cannot authenticate a capture, synchronize a journal, or authorize hardware.
+/// Each variant carries facts the caller reports; this type checks their order
+/// and compares the page bytes.
 #[derive(Debug)]
 pub enum TerminalExitTrialEvent<'a> {
-    /// Attest one fresh identified connection, a pre-entry Gateway query, and
+    /// Report one fresh identified connection, a pre-entry Gateway query, and
     /// complete acknowledged reads of format, control, routing, and target.
     FreshSession {
         /// Connection identifier, distinct from the other session's identifier.
         id: NonZeroU64,
         /// Complete CAT identity freshly read before this session's MCP entry.
         identity: &'a Identity,
-        /// Fresh byte at address 10; only zero is admitted.
+        /// Fresh byte at address 10; only zero is accepted.
         memory_format: u8,
         /// Fresh pre-entry query: Terminal for apply, Off for verification.
         gateway_mode: DvGatewayMode,
@@ -160,24 +160,27 @@ pub enum TerminalExitTrialEvent<'a> {
         /// Complete fresh immutable interface-routing page.
         routing_page: &'a [u8],
     },
-    /// Attest separately obtained exact-scope approval and a private journal
-    /// containing identity, all immutable pages, the complete freshly observed
-    /// active page, and the sole intent, synchronized before any write dispatch.
-    /// Acceptance conservatively records possible change even if dispatch fails.
+    /// Report that a private journal record holding the identity, every
+    /// immutable page, the complete freshly observed active page, and this sole
+    /// intent has been written and synchronized before the `W` frame is sent.
+    ///
+    /// Accepting this event sets [`TerminalExitTrialStatus::PossiblyChanged`]
+    /// permanently, even if the write is never dispatched.
     DurableWriteIntent {
-        /// Nonzero identifier of the sole durable intent, not a connection ID.
+        /// Nonzero identifier of the sole journal write-intent record, not a connection ID.
         id: NonZeroU64,
     },
-    /// Attest a complete acknowledged target-page read immediately after writing.
+    /// Report a complete acknowledged target-page read taken immediately after
+    /// writing.
     ImmediateReadback {
         /// Fresh full page, required to match the immutable Off page exactly.
         whole_page: &'a [u8],
     },
-    /// Attest E/ACK, original close/drop, a new matching CAT identification and
-    /// read-only Gateway Off query, fresh close, complete captures, and durable
-    /// session evidence. No command may follow E/ACK on the original handle.
+    /// Report E/ACK, original close and drop, a new matching CAT identification
+    /// and read-only Gateway Off query, fresh close, complete captures, and a
+    /// synchronized record of this session.
     ///
-    /// Neither this event nor a matching identity proves physical continuity.
+    /// No command may follow E/ACK on the original handle.
     SessionFinalized {
         /// Identifier from the current session's accepted fresh observation.
         id: NonZeroU64,
@@ -200,21 +203,20 @@ enum Phase {
     Halted,
 }
 
-/// One explicitly unqualified Terminal-to-Off experiment with immutable scope.
+/// Offline state machine for one Terminal-to-Off write with a fixed scope.
 ///
-/// Preparation admits only TM-D750 / firmware 1.02 / type `K,2,1`, PM Off,
+/// Preparation accepts only TM-D750 / firmware 1.02 / type `K,2,1`, PM Off,
 /// Reflector subtype, COM+AF USB, and panel USB Gateway routing. The complete
 /// captured Off page is immutable. The active expectation changes only that
 /// page's Gateway byte from zero to two; it is synthetic until a complete fresh
 /// active-state read matches. Callsigns, routing, PM selection, and every other
 /// byte are preserved; no text value, slot, page, or replacement is selectable.
 ///
-/// The sole allowed modeled write installs the exact Off page. Immediate
-/// readback and a separate read-only session must each match every byte. Both
-/// finalized lifecycles require new matching CAT identity and Gateway Off.
-/// Errors permanently halt progress without erasing possible change. There is
-/// no automatic rollback, retry, rebase, RF operation, or generic schema-gate
-/// override. The caller must separately establish approval and hardware safety.
+/// The sole modeled write installs the exact Off page. Immediate readback and a
+/// separate read-only session must each match every byte. Both finalized
+/// lifecycles require new matching CAT identity and Gateway Off. Any error
+/// permanently halts the instance and keeps its status, including
+/// [`TerminalExitTrialStatus::PossiblyChanged`]; there is no rollback or retry.
 #[derive(Debug)]
 pub struct TerminalExitTrial {
     identity: Identity,
@@ -261,8 +263,9 @@ impl TerminalExitTrial {
 
     /// Prepare from three complete captured canonical pages with Gateway Off.
     ///
-    /// Pages must come from validated capture coverage, never filled gaps. This
-    /// method does not qualify an active-state page or establish write approval.
+    /// Pages must come from validated capture coverage, never filled gaps. The
+    /// resulting active-page expectation is synthesized from the Off page and is
+    /// confirmed only when a fresh active-state read matches it.
     ///
     /// # Errors
     ///
@@ -354,7 +357,7 @@ impl TerminalExitTrial {
         &self.off
     }
 
-    /// Synthetic active expectation, not an observed active-state before-image.
+    /// Active-state expectation synthesized from the Off page's Gateway byte.
     #[must_use]
     pub const fn expected_active_page(&self) -> &[u8; PAGE_SIZE] {
         &self.expected_active
@@ -384,7 +387,7 @@ impl TerminalExitTrial {
         self.routing_spec
     }
 
-    /// Conservative modeled outcome, not independent hardware-state evidence.
+    /// Trial status derived from the events recorded so far.
     #[must_use]
     pub const fn status(&self) -> TerminalExitTrialStatus {
         self.status
@@ -397,7 +400,8 @@ impl TerminalExitTrial {
     }
 
     /// Compare a newly obtained complete identity with the immutable baseline.
-    /// This read-only check does not advance or halt the evidence sequence.
+    ///
+    /// This check neither advances nor halts the sequence.
     ///
     /// # Errors
     ///
@@ -410,7 +414,8 @@ impl TerminalExitTrial {
         }
     }
 
-    /// Next fixed session only while waiting for fresh connection evidence.
+    /// The session expected next, available only while awaiting a
+    /// [`TerminalExitTrialEvent::FreshSession`].
     ///
     /// # Errors
     ///
@@ -424,21 +429,24 @@ impl TerminalExitTrial {
         }
     }
 
-    /// Permanently stop without clearing possible change or doing any cleanup.
-    /// Completed evidence remains complete; no new event is accepted afterward.
+    /// Permanently stop accepting events.
+    ///
+    /// Performs no cleanup, rollback, or I/O cancellation. A recorded intent
+    /// keeps [`TerminalExitTrialStatus::PossiblyChanged`]; a completed sequence
+    /// stays [`TerminalExitTrialStatus::OffVerifiedAcrossSessions`].
     pub const fn halt(&mut self) {
         if !matches!(self.phase, Phase::Complete) {
             self.phase = Phase::Halted;
         }
     }
 
-    /// Validate one caller attestation in the fixed sequence.
+    /// Validate the exact next event in the fixed sequence.
     ///
     /// # Errors
     ///
     /// Rejects any guard mismatch, repeated identifier, wrong event order, or
-    /// terminal instance. Every failure halts further progress without clearing
-    /// conservative state. Events after completion cannot revoke prior evidence.
+    /// terminal instance. Every failure permanently halts further acceptance
+    /// and keeps the current status.
     pub fn record(
         &mut self,
         event: TerminalExitTrialEvent<'_>,
@@ -672,13 +680,13 @@ fn supported_page(field: &MenuField, pin: FieldPin) -> Result<Page, TerminalExit
     Ok(page)
 }
 
-/// A rejected fixed guard or caller-evidence transition.
+/// A rejected fixed guard or event transition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum TerminalExitTrialError {
     /// A generated field or canonical page differs from its pinned shape.
     #[error("Terminal exit descriptor or canonical page is unsupported")]
     UnsupportedDescriptor,
-    /// Complete identity does not exactly match the admitted baseline.
+    /// Complete identity does not exactly match the accepted baseline.
     #[error("Terminal exit requires the exact TM-D750 / 1.02 / K,2,1 identity")]
     IdentityMismatch,
     /// Target page is incomplete or oversized.
@@ -729,7 +737,7 @@ pub enum TerminalExitTrialError {
         /// Observed stored route.
         actual: u8,
     },
-    /// Fresh CAT Gateway evidence differs from the required state.
+    /// The freshly observed CAT Gateway state differs from the required one.
     #[error("Terminal exit requires Gateway {expected}; observed {actual}")]
     GatewayModeMismatch {
         /// Required Gateway state.
@@ -761,10 +769,10 @@ pub enum TerminalExitTrialError {
     /// Finalization names a different session from the accepted observation.
     #[error("Terminal exit finalization session identifier does not match")]
     SessionMismatch,
-    /// Evidence arrived before or after its only permitted phase.
-    #[error("Terminal exit evidence is out of order")]
+    /// An event arrived before or after its only permitted phase.
+    #[error("Terminal exit events are out of order")]
     UnexpectedEvent,
-    /// No further evidence is accepted after completion or halt.
+    /// No further event is accepted after completion or halt.
     #[error("Terminal exit trial has completed or halted")]
     TerminalState,
 }

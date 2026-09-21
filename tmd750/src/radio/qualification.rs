@@ -1,11 +1,14 @@
-//! Fixed-scope, non-writing qualification of the MCP transport lifecycle.
+//! Fixed-scope, read-only probes of the MCP transport lifecycle.
+//!
+//! A probe reads only the two fixed fragments named below and acknowledges
+//! exit; it sends no memory-write, fill, or RF command.
 
 use super::{Identity, Radio};
 use crate::error::{Error, ProtocolError};
 use crate::types::{DvGatewayMode, Page, RadioModel, Region};
 use kenwood_transport::Transport;
 
-/// A step in the fixed MCP qualification sequence.
+/// A step in the fixed MCP probe sequence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum McpProbeStage {
     /// Fresh CAT model, firmware, and radio-type proof before entry.
@@ -38,13 +41,12 @@ pub enum McpProbeExit {
     NotAcknowledged,
     /// The radio acknowledged exit.
     ///
-    /// This alone does not prove CAT service returned. The old handle is
-    /// retired without further I/O; the caller must close and drop it before
-    /// independently verifying identity on a fresh connection.
+    /// The old handle is retired without further I/O: the caller closes and
+    /// drops it, then verifies identity on a fresh connection.
     Acknowledged,
 }
 
-/// A successfully acknowledged fragment, without invented bytes for gaps.
+/// One acknowledged fragment: the exact page requested and the bytes returned.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpProbeSegment {
     /// Exact address and length requested.
@@ -58,15 +60,14 @@ pub struct McpProbeSegment {
 pub enum McpProbeOutcome {
     /// Both fragments were read and exit succeeded; CAT was not attempted.
     ///
-    /// Returned by [`Radio::probe_mcp`]. The caller must close this
-    /// transport before explicitly qualifying a fresh connection. This outcome
-    /// does not establish that CAT returned or that the radio's identity matched.
+    /// Returned by [`Radio::probe_mcp`]. The caller closes this transport before
+    /// verifying identity on a fresh connection.
     AwaitingCatVerification,
     /// The caller requested cancellation at a complete exchange boundary.
     ///
     /// If programming mode had been entered, exit still completed. The caller
-    /// must release the original handle; any further CAT verification needs a
-    /// fresh connection. A cleanup failure is [`Self::Failed`] instead.
+    /// releases the original handle; any further CAT verification needs a fresh
+    /// connection. A cleanup failure is [`Self::Failed`] instead.
     Cancelled,
     /// The probe stopped at a failed step, retaining earlier observations.
     Failed {
@@ -77,12 +78,11 @@ pub enum McpProbeOutcome {
     },
 }
 
-/// Evidence from a fixed-scope MCP probe, including incomplete runs.
+/// The wire exchanges of a fixed-scope MCP probe, including incomplete runs.
 ///
-/// This is not a configuration backup and does not qualify the menu schema
-/// for this firmware. Only the listed fragments were read. Raw wire capture
-/// belongs in a transport wrapper so even rejected or incomplete replies can
-/// be preserved before this report is returned.
+/// It contains only the two fragments listed below, so it is not a configuration
+/// backup. Raw wire capture belongs in a transport wrapper, so that rejected or
+/// incomplete replies are preserved even when this report is not returned.
 #[derive(Debug)]
 pub struct McpProbeReport {
     /// Identity proven immediately before programming-mode entry, if reached.
@@ -100,12 +100,11 @@ pub struct McpProbeReport {
     pub outcome: McpProbeOutcome,
 }
 
-/// Fixed read-only MCP evidence with an additional Gateway-Off entry guard.
+/// A fixed read-only MCP probe guarded by an additional Gateway-Off check.
 ///
-/// The observed Gateway value belongs to this session's pre-entry CAT query.
-/// It does not establish Gateway state after exit or readiness for another MCP
-/// session. The caller must retire this transport and independently verify a
-/// fresh connection after an acknowledged detached exit.
+/// The Gateway value comes from this session's pre-entry CAT query, so it
+/// describes the radio before entry, not after exit. After an acknowledged
+/// exit the caller retires this transport and verifies a fresh connection.
 #[derive(Debug)]
 pub struct McpGatewayOffProbeReport {
     /// The fixed fragments, original identity, entry, exit, and first failure.
@@ -141,18 +140,17 @@ impl<T: Transport> Radio<T> {
     /// never sends memory-write, fill, or RF-transmit commands. Every failure
     /// preserves earlier completed observations without inventing gap bytes.
     ///
-    /// The official program closes its transfer handle after the exit ACK.
-    /// The first main-unit USB bench run likewise re-enumerated after that ACK,
-    /// invalidating the old handle. This method leaves handle release and any
-    /// explicitly selected fresh-connection identity proof to the caller.
-    /// It does not close, reopen, enumerate, or select a transport itself.
-    /// After the ACK it performs no baud-rate change and keeps further protocol
-    /// access blocked on this handle, which the caller must close and drop.
+    /// The exit ACK retires this handle. The official program closes its
+    /// transfer handle at that point, and on firmware 1.02 over main-unit USB
+    /// the serial endpoint re-enumerates shortly afterwards, invalidating the
+    /// old handle. This method leaves handle release and fresh-connection
+    /// identity proof to the caller: it never closes, reopens, enumerates, or
+    /// selects a transport, performs no baud-rate change after the ACK, and
+    /// blocks further protocol access on this handle.
     ///
-    /// Success returns [`McpProbeOutcome::AwaitingCatVerification`], not proof of
-    /// CAT readiness. The report preserves the original identity,
-    /// both acknowledged fragments, and the exit disposition. No settings schema
-    /// is qualified and no memory-write or fill commands are sent.
+    /// Success returns [`McpProbeOutcome::AwaitingCatVerification`]: the report
+    /// holds the original identity, both acknowledged fragments, and the exit
+    /// disposition. CAT readiness on this handle is not tested.
     ///
     /// # Cancellation
     ///
@@ -180,17 +178,16 @@ impl<T: Transport> Radio<T> {
 
     /// Guard a fixed detached MCP read with exact identity and Gateway Off.
     ///
-    /// Proves TM-D750, firmware `1.02`, and opaque type `K,2,1` exactly once,
-    /// then requires a fresh `GW 0` before entering MCP. Reads only `8..48` and
-    /// `327681..327936`; no settings write, fill, or RF request is sent. These
-    /// narrow guards do not qualify a settings schema or prove firmware-ready
-    /// timing. Other identities and Gateway values refuse entry.
+    /// Reads TM-D750, firmware `1.02`, and opaque type `K,2,1` exactly once,
+    /// then requires a fresh `GW 0` before entering MCP. Any other identity or
+    /// Gateway value refuses entry. Reads only `8..48` and `327681..327936`;
+    /// no settings write, fill, or RF request is sent.
     ///
     /// An acknowledged exit leaves the old handle blocked. Close and drop its
-    /// transport before any explicitly authorized fresh CAT verification. This
-    /// method never opens, closes, reopens, retries, or selects a transport.
-    /// Success is [`McpProbeOutcome::AwaitingCatVerification`], not proof that
-    /// Gateway is still Off or a subsequent programming session is ready.
+    /// transport before any fresh CAT verification. This method never opens,
+    /// closes, reopens, retries, or selects a transport. Success is
+    /// [`McpProbeOutcome::AwaitingCatVerification`]; the Gateway value in the
+    /// report is the pre-entry observation.
     ///
     /// # Cancellation
     ///

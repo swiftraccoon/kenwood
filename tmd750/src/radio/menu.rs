@@ -92,9 +92,8 @@ impl<'a> ScopedMenuField<'a> {
 
 /// Sparse, complete canonical pages used for typed decoding and stale checks.
 ///
-/// Constructing or decoding this snapshot does not establish firmware
-/// compatibility. Stored numeric values are preserved even when absent from
-/// the writable menu domain; planning new values remains domain-checked.
+/// Stored numeric values are preserved even when absent from the writable menu
+/// domain; planning new values remains domain-checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MenuFieldSnapshot {
     image: Vec<u8>,
@@ -162,8 +161,7 @@ impl MenuFieldSnapshot {
 
     /// Decode a selected field only when all of its pages are present.
     ///
-    /// Unknown stored numeric values remain numeric. This does not silently
-    /// replace them with defaults or authorize writing them back as menu choices.
+    /// Unknown stored numeric values remain numeric; no default is substituted.
     ///
     /// # Errors
     ///
@@ -181,7 +179,8 @@ impl MenuFieldSnapshot {
     ///
     /// Every touched page must have been captured. All unrelated bits and bytes
     /// retain their exact before-image; the source snapshot is never changed.
-    /// The result alone is not write authority or proof of current radio state.
+    /// The result is derived from the snapshot, so it can be stale: every page
+    /// is compared against a fresh read before it is written.
     ///
     /// # Errors
     ///
@@ -203,7 +202,7 @@ impl MenuFieldSnapshot {
 
     /// Produce a local preview while preserving the original snapshot.
     ///
-    /// This does not read a radio, write a file, or qualify the new settings.
+    /// The preview is in memory only: no radio is read and no file is written.
     ///
     /// # Errors
     ///
@@ -226,7 +225,6 @@ impl<T: Transport> McpSession<'_, T> {
     /// Repeated fields and shared pages are read once, in address order. All
     /// field spans are validated before the first read. Empty input sends no
     /// traffic. No memory write, automatic exit, close, or reopen is performed.
-    /// Raw reads do not establish firmware-layout qualification.
     ///
     /// # Errors
     ///
@@ -268,7 +266,7 @@ impl<T: Transport> McpSession<'_, T> {
     ///
     /// # Errors
     ///
-    /// Returns incomplete snapshot coverage, schema-admission, stale-page,
+    /// Returns incomplete snapshot coverage, schema-target, stale-page,
     /// durable-intent, or MCP exchange/readback errors. No automatic rollback,
     /// retry, exit, or reconnection occurs.
     pub async fn compare_exchange_menu_patches(

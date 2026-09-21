@@ -1,4 +1,4 @@
-//! Qualified CAT identity, operating-mode, and gateway queries.
+//! CAT identity, operating-mode, and gateway queries.
 //!
 //! Requests are the mnemonic plus a carriage return; replies are the
 //! mnemonic, a space, and the payload, terminated the same way. A lone `?`
@@ -31,7 +31,7 @@ pub enum Command {
     SetOperatingMode {
         /// Band to change.
         band: Band,
-        /// Qualified CAT-selectable mode.
+        /// Mode to select: FM or DV.
         mode: SelectableMode,
     },
     /// `GW`: read the persistent DV Gateway mode.

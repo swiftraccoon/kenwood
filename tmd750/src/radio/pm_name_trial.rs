@@ -1,4 +1,9 @@
-//! Fixed, separately approved text experiments with conservative write evidence.
+//! Fixed-scope PM1 name and MY1 callsign write trials: one page, one W frame.
+//!
+//! Each trial replaces a single fixed field, restores the exact original page,
+//! and reads that page back on a fresh session. Verification spans MCP exit and
+//! re-entry, not a power cycle, and these drivers leave the generic
+//! verified-write firmware gate unchanged.
 
 use std::num::NonZeroU64;
 
@@ -19,7 +24,7 @@ use kenwood_transport::Transport;
 /// The step at which a fixed text-trial session stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PmNameTrialSessionStage {
-    /// Obtain the next fixed session from the evidence engine before any I/O.
+    /// Obtain the next fixed session from the trial before any I/O.
     Preparation,
     /// Obtain and compare a new complete CAT identity before MCP entry.
     Identity,
@@ -36,7 +41,7 @@ pub enum PmNameTrialSessionStage {
     },
     /// Compare the new format byte and whole page with the required baseline.
     FreshComparison,
-    /// Synchronize the exact intent and recovery bytes before permitting W.
+    /// Durably record the exact intent and recovery bytes before W.
     DurableIntent,
     /// Dispatch the sole fixed page and receive its acknowledgment.
     Write,
@@ -53,20 +58,21 @@ pub enum PmNameTrialSessionError {
     /// CAT, MCP, transport, or individual exchange timeout failure.
     #[error(transparent)]
     Io(#[from] Error),
-    /// The fixed trial's scope or evidence sequence rejected the operation.
+    /// The fixed trial's scope or session sequence rejected the operation.
     #[error(transparent)]
     Evidence(#[from] PmNameTrialError),
-    /// The caller could not durably synchronize the intent before dispatch.
-    #[error("fixed text trial durable intent failed: {0}")]
+    /// The `before_write` callback failed to record the intent before dispatch.
+    #[error("fixed text trial journal record failed: {0}")]
     DurableIntent(#[source] std::io::Error),
 }
 
-/// Wire-write evidence, distinct from the conservative restoration obligation.
+/// How far the sole fixed W frame reached on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PmNameTrialWriteDisposition {
     /// No W dispatch was attempted during this session.
     NotAttempted,
-    /// Dispatch began; failure or silence cannot establish that no bytes arrived.
+    /// Dispatch began; a failure or timeout leaves it unknown whether the radio
+    /// received the frame, so the restoration obligation still stands.
     PossiblyDispatched {
         /// The sole fixed intent being dispatched.
         write: PmNameTrialWrite,
@@ -84,15 +90,16 @@ pub enum PmNameTrialWriteDisposition {
 pub enum PmNameTrialSessionOutcome {
     /// Required reads, any fixed write/readback, and E/ACK completed.
     ///
-    /// The caller must close/drop, verify fresh CAT, close the fresh transport,
-    /// synchronize complete evidence, and only then record `SessionFinalized`.
+    /// The caller closes and drops the transport, verifies a fresh CAT identity,
+    /// closes that connection, durably records the report, and only then records
+    /// `SessionFinalized`.
     AwaitingCatVerification,
     /// Cancellation was honored before any trial write intent was accepted.
     ///
-    /// If entered, the synchronized session exited successfully. Cancellation
-    /// after a rename intent is never reported as this harmless disposition.
+    /// If MCP was entered, that session exited successfully. Cancellation after
+    /// a rename intent is never reported here.
     Cancelled,
-    /// The first failed requirement, retaining all earlier complete evidence.
+    /// The first failed requirement, retaining every earlier completed exchange.
     Failed {
         /// Exact failed step.
         stage: PmNameTrialSessionStage,
@@ -101,15 +108,14 @@ pub enum PmNameTrialSessionOutcome {
     },
 }
 
-/// Evidence from one session of a separately approved fixed text experiment.
+/// The wire exchanges of one session of a fixed text trial.
 ///
-/// This is not firmware-wide qualification, a complete transaction result, or
-/// independent proof of durable capture and physical-unit continuity. The raw
-/// transport capture must also retain incomplete/rejected exchanges. Callers
-/// must preserve both the initial failure and any additional exit failure.
+/// The raw transport capture must retain incomplete and rejected exchanges;
+/// preserve both the first failure and any additional exit failure. This report
+/// covers one session, not the whole multi-session trial.
 #[derive(Debug)]
 pub struct PmNameTrialSessionReport {
-    /// Fixed session selected from the engine, absent if preparation failed.
+    /// Fixed session selected by the trial, absent if preparation failed.
     pub session: Option<PmNameTrialSession>,
     /// Freshly obtained full identity, including a mismatching tuple if read.
     pub identity: Option<Identity>,
@@ -125,7 +131,7 @@ pub struct PmNameTrialSessionReport {
     pub exit: McpProbeExit,
     /// Whether this session attempted or acknowledged the fixed W command.
     pub write: PmNameTrialWriteDisposition,
-    /// Conservative engine status on return; finalization remains external.
+    /// Trial status on return; the caller performs finalization.
     pub status: PmNameTrialStatus,
     /// First failure, safe pre-write cancellation, or pending CAT verification.
     pub outcome: PmNameTrialSessionOutcome,
@@ -149,9 +155,7 @@ impl PmNameTrialSessionReport {
         }
     }
 
-    /// Fixed engine connection ID: rename 1, restore 2, fresh-session readback 3.
-    ///
-    /// The number does not establish a fresh connection or its physical owner.
+    /// Fixed session number: rename 1, restore 2, fresh-session readback 3.
     #[must_use]
     pub const fn session_id(&self) -> Option<NonZeroU64> {
         match self.session {
@@ -201,33 +205,28 @@ fn cancelled(trial: &impl FixedTextTrial, should_cancel: &mut impl FnMut() -> bo
 }
 
 impl<T: Transport> Radio<T> {
-    /// Run one session of the separately owner-approved fixed PM1 experiment.
+    /// Run one session of the fixed PM1 rename-and-restore sequence.
     ///
-    /// The engine chooses rename, restore, or read-only fresh-session proof; the
-    /// caller cannot supply addresses, pages, replacement text, or phase. This
-    /// narrowly scoped experimental driver is not schema support for firmware
-    /// 1.02 and does not change the generic verified-write compatibility gate.
-    /// The caller must independently obtain approval for the temporary label
-    /// and exact restoration, establish physical continuity and the approved
-    /// captured baseline, and wrap the transport with fail-closed capture.
+    /// The trial selects the phase (rename, restore, or read-only readback on a
+    /// fresh session); the caller supplies no address, page, replacement text, or
+    /// phase. Caller preconditions: a complete captured baseline page for the
+    /// target, and a transport wrapped in fail-closed capture. The identity tuple
+    /// identifies model, firmware, and type, not the physical unit.
     ///
     /// Each invocation obtains a new CAT identity before entry, reads format
     /// byte 10 and the complete canonical PM1 page, and requires exact equality
     /// with the immutable appropriate before-image. No merge or rebase occurs.
-    /// Before W, `before_write` must durably synchronize identity, both complete
+    /// Before W, `before_write` must durably record the identity, both complete
     /// pages, and the exact intent. Only its successful return permits recording
-    /// the conservative write obligation and then dispatching the fixed frame.
-    /// Immediate readback compares every byte. No RF command is sent.
+    /// the write obligation and then dispatching the fixed frame. Immediate
+    /// readback compares every byte. No RF command is sent.
     ///
-    /// Every completed exchange is retained in the report. Known-boundary
-    /// comparison or journal failures permit detached exit; uncertain exchanges
-    /// permit no speculative E. After E/ACK the old handle receives no CAT, baud,
-    /// or close operation here. The caller must close/drop and establish all
-    /// fresh-connection, capture, and durable-evidence requirements before
-    /// recording [`PmNameTrialEvent::SessionFinalized`].
-    /// These observations establish persistence across MCP exit and re-entry
-    /// through fresh connections, not an independently witnessed full-radio
-    /// reboot or power cycle.
+    /// Every completed exchange is retained in the report. A comparison or
+    /// journal failure at a known exchange boundary still exits; an uncertain
+    /// exchange sends no E. After E/ACK the old handle receives no CAT, baud, or
+    /// close operation here: the caller closes and drops it, verifies a fresh
+    /// connection, durably records the report, and only then records
+    /// [`PmNameTrialEvent::SessionFinalized`].
     ///
     /// # Cancellation
     ///
@@ -246,34 +245,33 @@ impl<T: Transport> Radio<T> {
             .await
     }
 
-    /// Run one session of the separately approved, fixed PM-Off MY1 trial.
+    /// Run one session of the fixed PM-Off MY1 callsign trial.
     ///
-    /// Only the empty MY1 field can be temporarily replaced with
-    /// [`MyCallsignTrial::TEMPORARY_CALLSIGN`], then exactly restored. The engine
+    /// Only an empty MY1 field can be temporarily replaced with
+    /// [`MyCallsignTrial::TEMPORARY_CALLSIGN`], then exactly restored. The trial
     /// selects the three-session sequence; no caller-supplied address, slot,
-    /// callsign, or phase is accepted. This does not qualify general callsign
-    /// editing, Terminal Mode, or the firmware-wide schema write gate.
+    /// callsign, or phase is accepted. It covers neither general callsign
+    /// editing nor Terminal Mode.
     ///
     /// Each fresh connection must identify the exact captured radio tuple and
     /// report Gateway Off through CAT before MCP entry. The driver reads format
     /// byte 10, the complete immutable PM-control page, and the complete target
     /// page. PM Off, MY1 selection, and Gateway Off must remain unchanged.
     /// Every target byte outside MY1, including its memo, is preserved. The
-    /// callback must durably synchronize the exact immutable scope and write
-    /// intent before dispatch. Both writes require complete immediate readback.
+    /// callback must durably record the exact immutable scope and write intent
+    /// before dispatch. Both writes require complete immediate readback.
     /// No gateway-setting, fill, or RF command is sent.
     ///
-    /// The caller must separately establish approval, physical continuity,
-    /// fail-closed capture, old close/drop after E/ACK, fresh matching CAT and
-    /// clean close, and durable complete evidence before calling
-    /// [`MyCallsignTrial::finalize_session`]. The post-exit CAT requirements do
-    /// not independently establish a power cycle or on-screen text rendering.
+    /// Caller ordering after each E/ACK: close and drop the original transport,
+    /// verify a matching CAT identity on a fresh connection, close it, durably
+    /// record the report, then call [`MyCallsignTrial::finalize_session`].
+    /// Caller preconditions: fail-closed transport capture on every connection.
     ///
     /// # Cancellation
     ///
     /// Await completion; do not drop a live exchange. Cooperative cancellation
-    /// applies only before the first durable intent. Once a change is possible,
-    /// the current phase and subsequent exact restore/verification remain owed.
+    /// applies only before the first `before_write` call. Once a change is
+    /// possible, the current phase and the exact restore/verification remain owed.
     /// Any failed comparison or uncertain exchange halts without a stale retry.
     pub async fn run_approved_my1_trial_session_until_exit(
         &mut self,

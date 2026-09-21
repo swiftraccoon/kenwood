@@ -1,9 +1,10 @@
 //! Offline, typed editing of explicitly supported configuration strings.
 //!
-//! This module interprets memory images using the generated software layout.
-//! It does not emulate a keyboard, open a connection, or write a radio. An
-//! exact firmware-label match is distinct from hardware qualification; an
-//! explicitly unqualified interpretation never enables the radio write gate.
+//! This module interprets memory images using the generated software layout and
+//! plans offline patches; it performs no I/O. [`TextImage::new`] requires a
+//! firmware label listed in [`MCP_D750_SCHEMA_FIRMWARE_IDENTITIES`];
+//! [`TextImage::interpret_unqualified`] skips that check and marks every result
+//! [`TextLayoutQualification::UnqualifiedInterpretation`].
 
 use std::{fmt, str::FromStr};
 
@@ -260,7 +261,7 @@ impl TextScope {
     }
 }
 
-/// Storage facts resolved from the generated descriptor, not UI assumptions.
+/// Storage facts resolved from the generated descriptor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TextMetadata {
     /// Exact generated registry field name.
@@ -279,23 +280,21 @@ pub struct TextMetadata {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextLayoutQualification {
     /// The supplied identity exactly matches a registry target label.
-    ///
-    /// This is not evidence of hardware-tested interpretation or writes.
     RegistryTargetMatched,
-    /// The caller explicitly requested offline interpretation without qualification.
+    /// The caller requested interpretation without the firmware-label check.
     ///
-    /// Decoded labels, offsets, and previews are software-layout hypotheses.
+    /// Offsets, decoded labels, and previews come from the registry layout,
+    /// which was not checked against the supplied firmware.
     UnqualifiedInterpretation,
 }
 
 /// Immutable, firmware-labeled view of supported configuration strings.
 ///
 /// Firmware provenance is supplied by the caller; image size does not identify
-/// firmware. Neither constructor establishes live-radio compatibility.
+/// firmware. The image is borrowed immutably, so applying a preview is an
+/// explicit operation on a separate byte buffer.
 ///
 /// The following zero-filled image is a synthetic example, not a radio backup.
-/// The original image is borrowed immutably; applying the preview is an explicit
-/// operation on a separate byte buffer.
 ///
 /// ```
 /// use kenwood_tmd750::{FirmwareIdentity, MemoryImage};
@@ -347,11 +346,12 @@ impl<'a> TextImage<'a> {
         })
     }
 
-    /// Explicitly interpret an image using an unqualified software layout.
+    /// Interpret an image without the firmware check applied by [`Self::new`].
     ///
-    /// Read results and previews remain unqualified even if `firmware` happens
-    /// to match a registry target. Callers should display this status and the
-    /// original firmware identity. This does not enable live writes.
+    /// Every read and preview from this view reports
+    /// [`TextLayoutQualification::UnqualifiedInterpretation`], even when
+    /// `firmware` would have satisfied [`Self::new`]. Display that status
+    /// alongside the original firmware identity.
     #[must_use]
     pub fn interpret_unqualified(image: &'a MemoryImage, firmware: &FirmwareIdentity) -> Self {
         Self {
@@ -403,8 +403,7 @@ impl<'a> TextImage<'a> {
     /// Byte limits and encoding come from the registry. No case folding,
     /// truncation, callsign syntax validation, or radio-side UI behavior is
     /// implied. The preview's `after` value omits trailing storage padding;
-    /// meaningful interior spaces remain intact. The existing live-write
-    /// firmware gate is independent and unchanged.
+    /// meaningful interior spaces remain intact.
     ///
     /// # Errors
     ///
@@ -434,9 +433,9 @@ impl<'a> TextImage<'a> {
 
 /// An offline, single-setting patch with its provenance and decoded comparison.
 ///
-/// Applying the patch to another image does not establish that image's origin
-/// or firmware compatibility. Preserve the associated firmware and
-/// qualification when displaying or exporting the preview.
+/// Carry [`Self::firmware`] and [`Self::qualification`] with the preview
+/// whenever it is displayed or exported: they describe the view the patch was
+/// planned against, not the image it is applied to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextPreview {
     setting: TextSetting,
@@ -479,7 +478,7 @@ impl TextPreview {
         &self.patches
     }
 
-    /// Original firmware provenance, not a claim about a connected radio.
+    /// Firmware identity of the view that created this preview.
     #[must_use]
     pub const fn firmware(&self) -> &FirmwareIdentity {
         &self.firmware

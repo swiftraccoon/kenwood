@@ -20,8 +20,7 @@ pub const BAUD: u32 = 9600;
 pub const ENTER: &[u8] = b"0M PROGRAM\r";
 /// Exact reply line the official program requires after [`ENTER`].
 ///
-/// This excludes the carriage-return terminator. The exchange still requires
-/// qualification against the connected radio's firmware.
+/// This excludes the carriage-return terminator. Any other reply fails entry.
 pub const ENTER_RESPONSE: &[u8] = b"0M";
 /// Exit byte.
 pub const EXIT: u8 = b'E';
@@ -38,8 +37,8 @@ pub const HEADER_LEN: usize = 5;
 
 /// One command supported by the five-byte MCP page header.
 ///
-/// This identifies framing, not permission to issue an operation. The radio
-/// programming layer admits only its documented operations and regions.
+/// Framing only. Which operations and regions a session accepts is decided by
+/// the radio programming layer, not by this enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeaderCommand {
     /// Host read request (`R`).
@@ -79,8 +78,8 @@ impl TryFrom<u8> for HeaderCommand {
 ///
 /// Private fields prevent constructing an unchecked length or command.
 /// [`Page::new`] admits only lengths `1..=256` whose complete address span is
-/// inside the image. Neither constructing nor decoding a header establishes
-/// writable-region policy, firmware qualification or a ready MCP session.
+/// inside the image. Writable-region policy and session readiness are enforced
+/// elsewhere, in the radio programming layer.
 ///
 /// ```rust
 /// use kenwood_tmd750::protocol::mcp::{Header, HeaderCommand};
@@ -190,7 +189,7 @@ impl BytePatch {
     /// Construct one nonempty, already-masked bit assignment.
     ///
     /// The containing [`PagePatch`] additionally checks the offset against its
-    /// page length. Construction performs no I/O and grants no write authority.
+    /// page length. Construction is pure and performs no I/O.
     ///
     /// # Errors
     ///

@@ -1,8 +1,7 @@
 //! PM1 update wire scope, immutable before-images, and fail-closed lifecycle.
 //!
-//! These scripted sessions do not establish physical-radio identity continuity
-//! or power-cycle persistence. External finalization is explicitly attested by
-//! the test; the live driver may not attest it on behalf of its caller.
+//! Transports are scripted. The test calls the finalize hook itself, because
+//! the driver never finalizes a session on its caller's behalf.
 
 use kenwood_schema as _;
 use mcp_d75_extract as _;

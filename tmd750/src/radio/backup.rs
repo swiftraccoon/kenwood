@@ -1,4 +1,6 @@
-//! Fixed configuration-region reads with page-granular evidence preservation.
+//! Fixed configuration-region reads, retained page by page.
+//!
+//! Every operation here reads: none sends a memory-write, fill, or RF command.
 
 use super::qualification::{McpProbeExit, McpProbeSegment};
 use super::{Identity, Progress, Radio};
@@ -30,8 +32,8 @@ pub enum McpBackupStage {
 pub enum McpBackupOutcome {
     /// Every configuration page and exit ACK were captured; CAT is unverified.
     ///
-    /// The caller must close and drop this transport before any explicitly
-    /// selected fresh-connection identity verification.
+    /// The caller closes and drops this transport before verifying identity on
+    /// a fresh connection.
     AwaitingCatVerification,
     /// Cancellation was requested at a complete exchange boundary.
     ///
@@ -47,19 +49,18 @@ pub enum McpBackupOutcome {
     },
 }
 
-/// Evidence from reading the official configuration regions without the bitmap.
+/// The pages read from the official configuration regions, without the bitmap.
 ///
-/// Each segment contains one fully acknowledged page. Unread gaps are absent,
-/// not invented as zero bytes. This is not a complete memory-image dump or a
-/// validated `.d750` file, and it does not establish settings-schema compatibility.
-/// A transport wrapper should preserve raw wire traffic, including partial or
-/// rejected replies that cannot be included as acknowledged segments.
+/// Each segment contains one fully acknowledged page; unread gaps are absent,
+/// not zero-filled. This is a sparse page set, not a complete memory image or a
+/// `.d750` file. Wrap the transport to preserve raw wire traffic, including
+/// partial or rejected replies that never become acknowledged segments.
 #[derive(Debug)]
 pub struct McpBackupReport {
     /// Identity proven immediately before programming-mode entry, if reached.
     pub identity: Option<Identity>,
-    /// Fresh Gateway state when the selected backup admission requires it.
-    /// Unguarded standard backups leave this observation absent.
+    /// Fresh Gateway state, present only for the Gateway-Off guarded backup.
+    /// [`Radio::backup_mcp_until_exit`] leaves it absent.
     pub gateway_mode: Option<DvGatewayMode>,
     /// Accepted programming-entry reply without its carriage return.
     pub entry_reply: Option<Vec<u8>>,
@@ -92,8 +93,8 @@ impl McpBackupReport {
     /// Requires the non-cancelled outcome, identity, exact entry reply, exit
     /// ACK, and every expected page in order with the exact payload length.
     /// Extra, duplicate, reordered, missing, or truncated pages are rejected.
-    /// This does not verify transport capture completeness, return to CAT,
-    /// physical-unit continuity, or firmware compatibility with a schema.
+    /// It inspects this report only: it reads nothing and says nothing about the
+    /// connection's state afterwards.
     #[must_use]
     pub fn has_complete_configuration(&self) -> bool {
         if !matches!(self.outcome, McpBackupOutcome::AwaitingCatVerification)
@@ -123,7 +124,7 @@ fn configuration_pages() -> Vec<Page> {
 impl<T: Transport> Radio<T> {
     /// Read the standard configuration only after exact identity and Gateway Off.
     ///
-    /// Requires `TM-D750 / 1.02 / K,2,1` and a fresh `GW 0` on this owner.
+    /// Requires `TM-D750 / 1.02 / K,2,1` and a fresh `GW 0` on this connection.
     /// Uses the same read and detached-exit engine as
     /// [`Self::backup_mcp_until_exit`], with the same cancellation boundaries.
     /// It never sends memory-write, RF, recovery, or post-exit CAT commands.
@@ -187,15 +188,15 @@ impl<T: Transport> Radio<T> {
     /// slots, with the official page boundaries. The startup bitmap and unnamed
     /// region group are excluded. Sends identity queries, programming entry,
     /// read requests, protocol ACKs, and exit; never sends memory-write, fill,
-    /// or RF-transmit commands. Reading does not qualify a firmware schema.
+    /// or RF-transmit commands.
     ///
     /// `progress` receives the completed and total page counts after each
     /// fully acknowledged page. Every return preserves all such pages. A read
     /// failure records its exact page and sends no speculative exit or CAT.
     ///
     /// After the exit ACK, no baud change or CAT command touches the old handle.
-    /// Further protocol access remains blocked. The caller must close and drop
-    /// the transport before any explicitly selected fresh-connection verification.
+    /// Further protocol access remains blocked. The caller closes and drops the
+    /// transport before verifying identity on a fresh connection.
     /// This method never closes, reopens, enumerates, or selects a transport.
     ///
     /// # Cancellation

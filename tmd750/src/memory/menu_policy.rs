@@ -1,17 +1,14 @@
-//! Semantic admission for ordinary, registered menu updates.
+//! Ordinary-update classification and value validation for registered fields.
 //!
-//! This policy is separate from serializer layout support and hardware
-//! qualification. It does not authorize an address, establish radio identity,
-//! or promise that applying configuration leaves every operating mode unchanged.
+//! Classification covers the compiled menu registry only. Address resolution,
+//! radio identity, captured-page coverage, and operating-state guards belong to
+//! [`crate::radio::menu::MenuUpdatePlan`], which applies them regardless of a
+//! field's classification here.
 
 use super::{FieldCodec, FieldValue, MenuField, My1Callsign};
 use crate::error::SchemaError;
 
 /// Whether a menu field belongs in an ordinary configuration update.
-///
-/// Classification applies to the compiled menu registry. A caller must still
-/// prove registry membership, layout compatibility, complete captured pages,
-/// and the current session's identity before writing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum MenuWritePolicy {
@@ -25,7 +22,7 @@ pub enum MenuWritePolicy {
     Binary,
 }
 
-/// Failure to admit or validate an ordinary menu assignment.
+/// Failure to classify or validate an ordinary menu assignment.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum MenuWritePolicyError {
@@ -34,7 +31,7 @@ pub enum MenuWritePolicyError {
     NotOrdinary {
         /// Registry field whose policy prevents the update.
         field: &'static str,
-        /// Required admission category.
+        /// The field's classification, which is not `Ordinary`.
         policy: MenuWritePolicy,
     },
     /// Text contains a terminator and would not round-trip exactly.
@@ -60,9 +57,6 @@ impl MenuField {
     /// Binary fields take precedence over lifecycle restrictions. Numeric
     /// storage capacity alone is not a supported semantic domain. Supplemental
     /// selector domains are enforced by [`Self::validate_ordinary_value`].
-    ///
-    /// `Ordinary` is software admission, not per-field hardware qualification,
-    /// a guarantee of RF silence, or authorization to bypass session guards.
     #[must_use]
     pub fn write_policy(&self) -> MenuWritePolicy {
         if self.is_blob || matches!(self.descriptor.codec, FieldCodec::Bytes { .. }) {
@@ -76,7 +70,7 @@ impl MenuField {
         }
     }
 
-    /// Admit an ordinary field and validate one exact stored value.
+    /// Validate one exact stored value for a field classified `Ordinary`.
     ///
     /// Group links accept group indices `0..=29` or `255` for not linked.
     /// Gateway MY selection accepts `0..=5`. DV message selection accepts `0`
@@ -89,13 +83,14 @@ impl MenuField {
     /// Text is not trimmed, padded by the caller, or normalized; embedded
     /// storage terminators are rejected.
     ///
-    /// This method neither establishes registry membership nor checks radio
-    /// identity, page coverage, current bytes, or post-exit readiness.
-    ///
     /// # Errors
     ///
-    /// Returns [`MenuWritePolicyError`] when the policy excludes the field or
-    /// its value violates the supported domain, text rules, or storage codec.
+    /// Returns [`MenuWritePolicyError::NotOrdinary`] when [`Self::write_policy`]
+    /// is not `Ordinary`, [`MenuWritePolicyError::EmbeddedTerminator`] for text
+    /// holding NUL or the field's padding byte,
+    /// [`MenuWritePolicyError::InvalidMyCallsign`] for rejected MY text, and
+    /// [`MenuWritePolicyError::Schema`] for a supplemental-domain, registry-domain,
+    /// or codec failure.
     pub fn validate_ordinary_value(
         &self,
         value: FieldValue<'_>,

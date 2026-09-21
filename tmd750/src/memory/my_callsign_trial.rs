@@ -105,22 +105,18 @@ impl Descriptors<'_> {
     }
 }
 
-/// An explicitly unqualified, fixed MY1 change-and-restoration experiment.
+/// Offline state machine for a fixed MY1 change followed by restoration.
 ///
-/// The sole scope is TM-D750 / firmware 1.02 / type `K,2,1`, PM Off, Gateway
+/// Scope is fixed: TM-D750 / firmware 1.02 / type `K,2,1`, PM Off, Gateway
 /// Off, MY selector zero, and an exactly eight-NUL MY1 baseline. The temporary
 /// value is [`Self::TEMPORARY_CALLSIGN`], encoded as `KQ4NIT\0\0`. No caller
 /// can choose a callsign, PM slot, page address, or other setting. Every other
 /// target-page byte and the complete control page remain immutable.
 ///
-/// This pure object does not open a connection, transmit RF, persist evidence,
-/// establish operator approval, or qualify the general firmware layout. Its
-/// private live-driver interface requires fresh Gateway Off and complete
-/// control-page evidence for each of three distinct MCP sessions. The sequence
-/// temporarily changes MY1, restores the exact original page, then verifies
-/// restoration in a third read-only session. Physical-unit continuity, durable
-/// evidence, cleanup, and any independently observed power cycle remain caller
-/// responsibilities. The generic schema-target write gate is unchanged.
+/// This type performs no I/O. Its three-session sequence applies the temporary
+/// MY1 value, writes the exact original page back, then rereads it in a
+/// read-only third session. Each session must supply a fresh Gateway Off
+/// observation and the complete control page, both taken on trust.
 #[derive(Debug)]
 pub struct MyCallsignTrial {
     sequence: TrialSequence,
@@ -143,8 +139,8 @@ impl MyCallsignTrial {
     }
 
     /// Resolve the sole complete control page, including the PM Off selector.
-    /// This validates all target and control descriptor shapes, not firmware
-    /// compatibility or the completeness of an external capture.
+    ///
+    /// This validates every target and control descriptor's shape.
     ///
     /// # Errors
     ///
@@ -156,9 +152,9 @@ impl MyCallsignTrial {
     /// Prepare both immutable pages from complete, validated sparse captures.
     ///
     /// `target_page` and `control_page` must be actual captured pages, never
-    /// synthesized unread gaps. Empty MY1 is a captured-byte precondition, not
-    /// an independent display observation. Separate explicit operator approval
-    /// for this exact temporary change and restoration is still required.
+    /// synthesized unread gaps. The MY1 field in `target_page` must be exactly
+    /// eight NUL bytes; that is a check on the captured bytes, not on the
+    /// radio's display.
     ///
     /// # Errors
     ///
@@ -251,13 +247,13 @@ impl MyCallsignTrial {
         self.control_spec
     }
 
-    /// Conservative modeled restoration obligation, not proof of radio state.
+    /// Status derived from the events recorded so far.
     #[must_use]
     pub const fn status(&self) -> PmNameTrialStatus {
         self.sequence.status()
     }
 
-    /// Next fixed session only while the engine awaits a fresh connection.
+    /// The session expected next, available only while awaiting a fresh session.
     ///
     /// # Errors
     ///
@@ -267,24 +263,24 @@ impl MyCallsignTrial {
         self.sequence.next_session()
     }
 
-    /// Permanently halt without clearing a pending restoration obligation.
-    /// This neither performs cleanup nor restores any byte on the radio.
+    /// Permanently stop accepting events, keeping the current status.
+    ///
+    /// Performs no cleanup, cancellation, or restoration.
     pub const fn halt(&mut self) {
         self.sequence.halt();
     }
 
-    /// Attest completed E/ACK, original close/drop, matching fresh CAT identity,
-    /// fresh close, complete captures, and synchronized session evidence.
+    /// Report completed E/ACK, original close and drop, matching fresh CAT
+    /// identity, fresh close, complete captures, and a synchronized record of
+    /// this session.
     ///
-    /// Call only after independently establishing every fact. This method
-    /// cannot check filesystem durability, connection freshness, or physical
-    /// continuity. Restoration becomes verified only after all three complete
-    /// sessions and their required whole-page comparisons have been accepted.
+    /// Status becomes [`PmNameTrialStatus::RestorationVerified`] only after all
+    /// three sessions and their whole-page comparisons have been accepted.
     ///
     /// # Errors
     ///
     /// Rejects wrong order, a mismatching session ID, or a terminal instance.
-    /// Any failure halts future progress without erasing an existing obligation.
+    /// Any failure permanently halts further acceptance and keeps the status.
     pub fn finalize_session(&mut self, id: NonZeroU64) -> Result<(), PmNameTrialError> {
         self.sequence
             .record(PmNameTrialEvent::SessionFinalized { id })

@@ -1,7 +1,7 @@
-//! Offline storage, sparse configuration evidence, and immutable update plans.
+//! Offline storage, captured-configuration comparison, and immutable update plans.
 //!
-//! This module performs no radio I/O. A decoded value describes supplied bytes;
-//! it is not a fresh observation or permission to write those bytes.
+//! This module performs no radio I/O. A decoded value describes the supplied
+//! bytes, not the radio's current state.
 //!
 //! # Choose a task
 //!
@@ -14,7 +14,6 @@
 //!   [`StandardConfigurationDiff`] compares two such captures byte-for-byte.
 //! - Discover storage metadata with [`menu_field`] and [`MenuField`].
 //!   [`schema`] explains addressing, scalar interpretation, and masked planning.
-//!   Parsing or encoding a value does not establish live write admission.
 //! - Use [`TextImage`] for typed offline text previews and
 //!   [`ReflectorTerminalPreflight`] for captured Terminal-setting inspection.
 //! - Prepare ordinary registered changes with
@@ -22,11 +21,13 @@
 //!   [`crate::radio::terminal::TerminalPlan`]. Their session drivers separately
 //!   require identity, fresh complete-page comparisons, and caller-owned cleanup.
 //!
-//! [`Pm1NameUpdate`] and [`My1CallsignUpdate`] implement narrower two-session
-//! evidence policies. Fixed [`PmNameTrial`], [`MyCallsignTrial`], and
-//! [`TerminalExitTrial`] types model specific bench experiments, not the normal
-//! menu entry point. Caller-supplied events are attestations, not durable storage
-//! or independent radio observations. File containers live in [`crate::file`].
+//! [`Pm1NameUpdate`] and [`My1CallsignUpdate`] sequence a two-session
+//! compare-write-verify update for one field. [`PmNameTrial`],
+//! [`MyCallsignTrial`], and [`TerminalExitTrial`] are fixed-scope variants with
+//! no caller-selectable value. All of them check event order and page equality;
+//! the facts a caller reports (fresh connection, synchronized journal record,
+//! completed capture) are taken on trust. File containers live in
+//! [`crate::file`].
 
 mod configuration;
 pub(crate) mod fixed_text_trial;
@@ -88,18 +89,16 @@ pub use text::{
 
 /// Model whose layout the generated registry describes.
 pub const MCP_D750_SCHEMA_MODEL: &str = "TM-D750";
-/// Caller-declared firmware provenance label of the generated registry.
+/// Firmware label declared to the extractor that generated the registry.
 ///
-/// This is not a vendor maximum version or proof of hardware compatibility.
+/// It records that declared provenance, not a vendor version range.
 pub const MCP_D750_SCHEMA_FIRMWARE: &str = "1.00";
-/// Exact firmware labels accepted by the conservative schema-target gate.
+/// Firmware labels accepted by [`is_supported_schema_target`].
 ///
-/// These labels are declared extraction provenance, not hardware qualification
-/// or a vendor firmware compatibility range. Changes require a reviewed
-/// manifest release and separate qualification.
+/// Each is compared against [`FirmwareIdentity::as_str`] by exact string match.
 pub const MCP_D750_SCHEMA_FIRMWARE_IDENTITIES: &[&str] = &["1.00"];
 
-/// Whether a proven identity matches the registry's target.
+/// Whether `model` and `firmware` match the registry's extraction target.
 #[must_use]
 pub fn is_supported_schema_target(model: RadioModel, firmware: &FirmwareIdentity) -> bool {
     model == RadioModel::TmD750 && MCP_D750_SCHEMA_FIRMWARE_IDENTITIES.contains(&firmware.as_str())
@@ -107,15 +106,12 @@ pub fn is_supported_schema_target(model: RadioModel, firmware: &FirmwareIdentity
 
 /// Full-sized 1,929,472-byte storage without coverage or firmware provenance.
 ///
-/// [`Self::from_bytes`] checks length only; it does not prove that every byte
-/// was read from a radio, that the layout matches its firmware, or that settings
-/// are valid. [`Self::blank`] is explicitly synthetic storage, not a factory
-/// configuration. A sparse [`crate::radio::RegionImage`] conversion retains
-/// synthetic gap bytes but discards its coverage map.
+/// [`Self::from_bytes`] checks length only. [`Self::blank`] fills the buffer
+/// with `0xFF`. Converting from a sparse [`crate::radio::RegionImage`] keeps
+/// its synthetic gap bytes and drops its coverage map.
 ///
 /// Callers must establish coverage before decoding each field. Prefer
 /// [`crate::radio::menu::MenuFieldSnapshot`] for coverage-checked sparse access.
-/// Local mutation and serialization of these bytes grant no radio-write authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryImage {
     bytes: Vec<u8>,
@@ -138,9 +134,6 @@ impl MemoryImage {
     }
 
     /// Synthetic storage filled with `0xFF`, the erased-byte representation.
-    ///
-    /// This is not a radio read, a valid factory configuration, or proof of the
-    /// value of any omitted byte in a sparse capture.
     #[must_use]
     pub fn blank() -> Self {
         Self {

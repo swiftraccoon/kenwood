@@ -47,7 +47,7 @@ pub enum OperatingMode {
     Fm,
     /// D-STAR Digital Voice (`1`).
     Dv,
-    /// A wire value not yet assigned a qualified meaning.
+    /// Any other reported value, retained exactly as received.
     Unqualified(u8),
 }
 
@@ -83,8 +83,9 @@ impl From<OperatingMode> for u8 {
 
 /// Operating modes proven selectable through `MD` writes.
 ///
-/// A live Band A `MD 0,7` write was rejected. Enter DR from the radio's
-/// digital controls; its read value has not yet been observed and qualified.
+/// On firmware 1.02 an `MD 0,7` write (the provisional DR value) is rejected,
+/// so DR is selected from the radio's own digital controls and its read value
+/// is unobserved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SelectableMode {
     /// Analog FM.
@@ -104,16 +105,16 @@ impl From<SelectableMode> for OperatingMode {
 
 /// Persistent DV Gateway mode reported by the read-only `GW` command.
 ///
-/// Off and Terminal were observed on firmware 1.02 through main-unit USB,
-/// with the DV Gateway routed to panel USB. A named read value does not
-/// qualify a command to select that mode or prove a reflector connection.
+/// Off and Terminal were observed on firmware 1.02 through main-unit USB, with
+/// the DV Gateway routed to panel USB. `GW` is read-only: this crate exposes no
+/// CAT command that selects a Gateway mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DvGatewayMode {
     /// DV Gateway is off (`0`).
     Off,
     /// Terminal Mode is selected (`2`).
     Terminal,
-    /// A wire value not yet assigned a qualified meaning.
+    /// Any other reported value, retained exactly as received.
     Unqualified(u8),
 }
 

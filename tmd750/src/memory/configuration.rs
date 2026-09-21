@@ -1,4 +1,7 @@
 //! Byte-level comparison of complete, explicitly covered standard configurations.
+//!
+//! These types borrow captured page payloads. They perform no I/O, allocate no
+//! dense image, and interpret no setting; capture provenance is the caller's.
 
 use crate::error::ValidationError;
 use crate::protocol::mcp::regions::menu_regions;
@@ -61,11 +64,8 @@ pub enum ConfigurationError {
 /// Borrowed bytes covering exactly the standard global and per-slot schedule.
 ///
 /// Construction validates every page's order, address, declared length, and
-/// complete payload. It does not allocate a dense image, invent bytes in gaps,
-/// accept startup-screen pages, or interpret settings through a firmware schema.
-/// The caller remains responsible for capture provenance, exchange completion,
-/// and connection lifecycle evidence; a structurally valid input is not proof
-/// that these bytes came from a radio or that its firmware layout is supported.
+/// complete payload. The startup-screen region is outside that schedule, so its
+/// pages are rejected.
 #[derive(Debug)]
 pub struct StandardConfiguration<'a> {
     identity: &'a Identity,
@@ -79,8 +79,8 @@ impl<'a> StandardConfiguration<'a> {
     /// sequence. No sorting, deduplication, partial coverage, or gap filling is
     /// performed. At most the complete schedule and one extra item are consumed,
     /// so an excessive iterator cannot make this method retain unbounded input.
-    /// Identity is retained exactly, without admitting or rejecting a firmware
-    /// version through the settings-write compatibility gate.
+    /// Identity is retained exactly and is not checked against
+    /// [`super::MCP_D750_SCHEMA_FIRMWARE_IDENTITIES`].
     ///
     /// # Errors
     ///
@@ -136,7 +136,7 @@ impl<'a> StandardConfiguration<'a> {
     }
 }
 
-/// One observed byte difference, without an inferred setting name or meaning.
+/// One byte address whose value differs between the two configurations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChangedByte {
     address: Address,
@@ -204,10 +204,9 @@ impl ChangedPage {
 /// Deterministic byte differences between two complete standard configurations.
 ///
 /// Only changed pages and bytes are retained; unchanged bytes and gaps are not
-/// copied into the result. Equality covers the standard schedule only, not the
-/// entire memory image. A matching identity tuple does not prove physical-unit
-/// continuity, and neither equality nor a difference qualifies a firmware
-/// schema, identifies a setting's meaning, or authorizes a write.
+/// copied into the result. Comparison covers the standard transfer schedule
+/// only, not the entire memory image, and reports byte addresses without naming
+/// the settings they belong to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StandardConfigurationDiff {
     compared_pages: usize,
@@ -221,8 +220,7 @@ impl StandardConfigurationDiff {
     ///
     /// Pages follow the canonical transfer order; changes within each page are
     /// ordered by absolute address. The result owns its small change records,
-    /// not the borrowed source payloads. No settings interpretation, mutation,
-    /// or I/O occurs.
+    /// not the borrowed source payloads.
     ///
     /// # Errors
     ///

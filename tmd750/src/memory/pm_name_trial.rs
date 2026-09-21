@@ -1,8 +1,8 @@
-//! Pure evidence sequencing for an explicitly unqualified, fixed PM1 trial.
+//! Offline sequencing for the fixed PM1 rename and restore trial.
 //!
-//! Nothing here opens a radio, persists a journal, authorizes a live write, or
-//! changes the independent schema-target gate. Events are caller attestations,
-//! not independently verified hardware or filesystem facts.
+//! This module performs no I/O and writes no journal. Each event carries facts
+//! the caller reports; this module checks their order and compares page bytes,
+//! but cannot confirm that a connection was fresh or that a record reached disk.
 
 use std::num::NonZeroU64;
 
@@ -19,19 +19,16 @@ const FIELD_ADDRESS: u32 = 323_594;
 const FIELD_LENGTH: usize = 16;
 const PAGE_ADDRESS: u32 = 323_584;
 
-/// Conservative restoration obligation represented by the recorded evidence.
-///
-/// This is modeled state, not an independent observation of the radio.
+/// Whether the original page still needs restoring, per the recorded events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PmNameTrialStatus {
-    /// No write intent has been recorded; this engine has not permitted a
-    /// transition representing a possibly dispatched write.
+    /// No write intent has been recorded.
     NotWritten,
-    /// A write intent was recorded. Original-page persistence and final
-    /// session cleanup have not both been attested; restoration remains owed.
+    /// A write intent was recorded and the original page has not been shown
+    /// back in place, so restoration remains owed.
     PossiblyChanged,
-    /// Three distinct sessions supplied every required comparison and cleanup
-    /// attestation, including original-page persistence in the third session.
+    /// Three distinct sessions supplied every required comparison and cleanup,
+    /// including the third session's reread of the original page.
     RestorationVerified,
 }
 
@@ -44,17 +41,17 @@ pub enum PmNameTrialWrite {
     Restore,
 }
 
-/// Caller-supplied evidence, accepted only in the fixed three-session order.
+/// Events for the fixed three-session sequence, accepted only in order.
 ///
-/// IDs catch accidental reuse within this instance; they cannot establish that
-/// connections are fresh, storage is durable, or the physical unit is unchanged.
+/// Each `id` is checked for reuse within this instance and carries no other
+/// meaning.
 #[derive(Debug)]
 pub enum PmNameTrialEvent<'a> {
-    /// Attest a newly opened, independently identified MCP session and its
-    /// completed reads of memory-format byte 10 and the entire target page.
+    /// Report a newly opened MCP session and its completed reads of
+    /// memory-format byte 10 and the entire target page.
     ///
-    /// For sessions two and three, the caller must have established the prior
-    /// exit/re-entry boundary and obtained new reads, not replayed a capture.
+    /// Sessions two and three must follow an MCP exit and re-entry and supply
+    /// new reads, not a replayed capture.
     FreshSession {
         /// Caller-assigned connection identity, never reused within the trial.
         id: NonZeroU64,
@@ -65,39 +62,34 @@ pub enum PmNameTrialEvent<'a> {
         /// Complete, acknowledged bytes at [`PmNameTrial::page`].
         whole_page: &'a [u8],
     },
-    /// Attest that separate operator approval applies and a private journal
-    /// containing identity, original and expected bytes, and this exact intent
-    /// has been successfully synchronized to durable storage before any W.
+    /// Report that a private journal record holding the identity, the original
+    /// and expected page bytes, and this intent has been written and
+    /// synchronized to durable storage before the `W` frame is sent.
     ///
-    /// Acceptance immediately records a possible change, even if dispatch
-    /// subsequently fails or never occurs. This is not write authorization.
+    /// Accepting this event sets [`PmNameTrialStatus::PossiblyChanged`], which
+    /// no later error or halt clears, even if the write is never dispatched.
     DurableWriteIntent {
         /// Distinct durable journal record identity for this write intent.
         id: NonZeroU64,
         /// The exact next intent: rename in session one, restore in session two.
         write: PmNameTrialWrite,
     },
-    /// Attest a complete, acknowledged immediate readback after the intended
-    /// write. The full page must match, including every unrelated byte.
+    /// Report a complete, acknowledged readback taken immediately after the
+    /// intended write; every byte of the page must match, related or not.
     ImmediateReadback {
         /// Newly read bytes at [`PmNameTrial::page`].
         whole_page: &'a [u8],
     },
-    /// Attest successful E/ACK, original close/drop, a bounded fresh CAT proof
-    /// matching the entire identity, fresh close, complete captures, and durable
-    /// recording of this session's evidence and current restoration obligation.
-    ///
-    /// The caller establishes each fact. A matching tuple or session ID alone
-    /// proves none of them and does not establish physical-unit continuity.
+    /// Report successful E/ACK, original close and drop, a bounded fresh CAT
+    /// exchange matching the entire identity, fresh close, complete captures,
+    /// and a synchronized record of this session and the restoration still owed.
     SessionFinalized {
         /// The session ID supplied by the corresponding `FreshSession` event.
         id: NonZeroU64,
     },
 }
 
-/// The next fixed session of the three-session persistence experiment.
-///
-/// A session value describes sequence only, never permission to write.
+/// Which of the three fixed sessions the sequence expects next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PmNameTrialSession {
     /// Compare the original page, then perform the fixed temporary rename.
@@ -108,16 +100,12 @@ pub enum PmNameTrialSession {
     VerifyRestoration,
 }
 
-/// An offline, unqualified PM1 rename/restore evidence state machine.
+/// Offline state machine for a PM1 rename followed by restoration.
 ///
-/// The fixed scope is global PM1 on TM-D750 / firmware 1.02 / type `K,2,1`.
-/// Successful construction or event recording never qualifies that firmware or
-/// supplies a live writer. The generic exact schema-target gate is independent
-/// and unchanged. The caller must separately establish operator approval,
-/// physical continuity, fresh connections, protocol framing, capture completion,
-/// durable storage, and MCP exit/re-entry boundaries before reporting hardware
-/// success. The model does not establish an independently observed full-radio
-/// reboot or persistence across a power cycle.
+/// Scope is fixed: global PM1 on TM-D750 / firmware 1.02 / type `K,2,1`. This
+/// type checks event order and page equality; the caller supplies fresh
+/// connections, MCP exit and re-entry boundaries, complete captures, and
+/// synchronized journal records, all taken on trust.
 ///
 /// Sequence: fresh original-page comparison, durable rename intent, immediate
 /// changed-page readback, finalized session; a distinct re-entered session with
@@ -134,8 +122,9 @@ impl PmNameTrial {
     pub const TEMPORARY_NAME: &str = "PC TEXT TEST";
 
     /// Resolve the sole canonical page before extracting it from a sparse
-    /// capture. This performs the same generated-descriptor shape checks as
-    /// preparation and does not qualify that layout for live writes.
+    /// capture.
+    ///
+    /// This applies the same generated-descriptor shape checks as preparation.
     ///
     /// # Errors
     ///
@@ -146,14 +135,13 @@ impl PmNameTrial {
         supported_page(field)
     }
 
-    /// Prepare immutable pages for an explicitly unqualified offline trial.
+    /// Prepare the immutable original and temporary page images.
     ///
     /// `baseline` must be the exact complete canonical target page from a
-    /// validated capture, never an erased-gap reconstruction. The independent
-    /// `operator_confirmed_pm1_name` must come from the display, not be copied
-    /// from that capture. This method cannot verify those sources or obtain
-    /// approval. It accepts nonempty printable ASCII up to sixteen bytes and
-    /// requires an exact NUL-padded match to the captured name.
+    /// validated capture, never an erased-gap reconstruction.
+    /// `operator_confirmed_pm1_name` must be read from the radio display rather
+    /// than decoded from `baseline`. It accepts nonempty printable ASCII up to
+    /// sixteen bytes and must match the captured field after NUL padding.
     ///
     /// # Errors
     ///
@@ -231,10 +219,8 @@ impl PmNameTrial {
         self.sequence.identity()
     }
 
-    /// Describe the next session only while awaiting a fresh-session event.
-    ///
-    /// This is sequencing information, not a live-write authorization or proof
-    /// that a connection is available, fresh, or safe to use.
+    /// The session the sequence expects next, available only while awaiting a
+    /// [`PmNameTrialEvent::FreshSession`].
     ///
     /// # Errors
     ///
@@ -256,18 +242,17 @@ impl PmNameTrial {
         self.sequence.expected_page()
     }
 
-    /// Conservative modeled restoration obligation, not a write-ready predicate.
+    /// Status derived from the events recorded so far.
     #[must_use]
     pub const fn status(&self) -> PmNameTrialStatus {
         self.sequence.status()
     }
 
-    /// Validate and record the exact next caller-attested evidence.
+    /// Validate and record the exact next event.
     ///
-    /// An accepted durable intent changes status to `PossiblyChanged` before
-    /// dispatch could occur. No error can erase that obligation. Any error
-    /// permanently halts further event acceptance; mismatches must never be
-    /// rebased into this transaction or used to justify a stale restore.
+    /// An accepted [`PmNameTrialEvent::DurableWriteIntent`] sets status to
+    /// [`PmNameTrialStatus::PossiblyChanged`] before dispatch could occur, and
+    /// no error clears it. Any error permanently halts further acceptance.
     ///
     /// # Errors
     ///
@@ -277,13 +262,11 @@ impl PmNameTrial {
         self.sequence.record(event)
     }
 
-    /// Permanently stop evidence acceptance after uncertain framing, failed
-    /// capture/storage, lost continuity, or another unrecoverable evidence gap.
+    /// Permanently stop accepting events.
     ///
-    /// This does not send cleanup, cancel I/O, or restore anything. A pending
-    /// cancellation alone is not a reason to abandon safe cleanup when framing
-    /// remains known. Once an intent was recorded, `PossiblyChanged` survives
-    /// halt. A previously completed restoration proof remains completed.
+    /// Performs no cleanup, cancellation, or restoration. A recorded write
+    /// intent keeps [`PmNameTrialStatus::PossiblyChanged`]; a completed
+    /// sequence stays [`PmNameTrialStatus::RestorationVerified`].
     pub const fn halt(&mut self) {
         self.sequence.halt();
     }
@@ -399,7 +382,7 @@ fn encode_name(field: &MenuField, name: &str) -> Result<[u8; FIELD_LENGTH], PmNa
     Ok(bytes)
 }
 
-/// A failed offline precondition or evidence transition; never a rollback proof.
+/// A rejected offline precondition or event transition.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum PmNameTrialError {
@@ -421,7 +404,7 @@ pub enum PmNameTrialError {
     /// Display text, encoded exactly, does not match the captured field.
     #[error("independently confirmed PM1 name does not match the captured page")]
     DisplayNameMismatch,
-    /// A no-op rename cannot establish the proposed change's persistence.
+    /// PM1 already holds the fixed temporary label, so the rename is a no-op.
     #[error("PM1 already has the fixed trial name")]
     AlreadyTemporaryName,
     /// A fresh session supplied an unsupported memory-format byte.
@@ -431,22 +414,22 @@ pub enum PmNameTrialError {
         actual: u8,
     },
     /// Any byte differs from the exact page required at this stage.
-    #[error("fixed text trial whole-page comparison failed; stale restoration is forbidden")]
+    #[error("fixed text trial whole-page comparison failed")]
     PageMismatch,
-    /// The evidence is not the exact next event in the three-session sequence.
-    #[error("fixed text trial evidence is out of order")]
+    /// The event is not the exact next one in the three-session sequence.
+    #[error("fixed text trial events are out of order")]
     UnexpectedEvent,
     /// A supposed fresh session reused a previously supplied connection ID.
     #[error("fixed text trial session ID was reused")]
     ReusedSession,
-    /// The second intent reused the first intent's durable journal record ID.
-    #[error("fixed text trial durable intent ID was reused")]
+    /// The second intent reused the first intent's journal record ID.
+    #[error("fixed text trial write-intent record ID was reused")]
     ReusedWriteIntent,
     /// Finalization does not identify the current session.
     #[error("fixed text trial finalization does not match the current session")]
     SessionMismatch,
     /// The instance is completed or permanently halted; no more events apply.
-    #[error("fixed text trial is terminal and accepts no further evidence")]
+    #[error("fixed text trial is terminal and accepts no further events")]
     TerminalState,
     /// MY1 requires a complete immutable control page in addition to its target.
     #[error("MY1 trial requires a complete 256-byte control page, got {actual} bytes")]
@@ -475,11 +458,11 @@ pub enum PmNameTrialError {
         /// Captured selector byte.
         actual: u8,
     },
-    /// Only an exactly NUL-filled MY1 baseline is admitted by this fixed trial.
+    /// This fixed trial accepts only an exactly NUL-filled MY1 baseline.
     #[error("MY1 trial requires exactly eight zero bytes in the original MY1 field")]
     MyCallsignNotEmpty,
     /// Fresh MY1 sessions cannot bypass the gateway and full control-page guards.
-    #[error("MY1 trial requires fresh Gateway Off and complete control-page evidence")]
+    #[error("MY1 trial requires fresh Gateway Off and a complete control page")]
     FreshGuardsMissing,
 }
 

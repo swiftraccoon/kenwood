@@ -1,4 +1,4 @@
-//! Fixed-region backup coverage, partial evidence, and detached lifecycle safety.
+//! Fixed-region backup coverage, partial captures, and detached lifecycle safety.
 
 use kenwood_schema as _;
 use mcp_d75_extract as _;

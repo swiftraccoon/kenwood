@@ -48,8 +48,8 @@ impl fmt::Display for RadioModel {
 /// Exact opaque payload returned by the CAT `TY` query.
 ///
 /// A stock North American TM-D750 running firmware 1.02 returns `K,2,1`.
-/// Its components remain opaque until their semantics are qualified. Other
-/// hardware variants may use a different graphic-ASCII shape, which is retained.
+/// The meanings of its components are unknown. Other hardware variants may use
+/// a different graphic-ASCII shape, which is retained unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RadioType(String);
 

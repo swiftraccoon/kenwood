@@ -1,6 +1,6 @@
 //! Complete registry metadata agrees with the committed serializer manifest.
 //!
-//! This is software-artifact agreement, not live-radio field qualification.
+//! This compares two committed artifacts; no radio is involved.
 
 use kenwood_schema as _;
 use kenwood_transport as _;

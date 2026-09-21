@@ -12,7 +12,7 @@
 //! [`FieldDescriptor::read`] preserves stored numeric values outside the menu's
 //! writable domain, interprets nonzero boolean bytes as true, and stops text
 //! at its first NUL or configured padding byte. It checks the supplied span,
-//! not whether those bytes were actually captured. For sparse evidence, use
+//! not whether those bytes were actually captured. For sparse captures, use
 //! [`crate::radio::menu::MenuFieldSnapshot::value`].
 //!
 //! [`FieldDescriptor::encode`] instead checks the desired writable domain and
@@ -22,9 +22,9 @@
 //! fails atomically; earlier accepted claims remain intact. [`PatchSet`] groups
 //! the result into complete transfer-page scopes without reading or writing them.
 //!
-//! These storage checks do not establish firmware compatibility, current state,
-//! or an ordinary setting's lifecycle policy. Live registered updates require
-//! [`crate::radio::menu::MenuUpdatePlan`] and its fresh-page session comparison.
+//! These checks cover storage shape and writable regions only. Live registered
+//! updates require [`crate::radio::menu::MenuUpdatePlan`], which adds identity,
+//! operating-state, and fresh-page session comparisons.
 //! Persistent Gateway changes use [`crate::radio::terminal::TerminalPlan`].
 //! The shared `kenwood-schema` crate owns scalar encoding and bit claims; this
 //! facade owns catalog integrity, PM addressing, image bounds, and page geometry.
@@ -179,7 +179,7 @@ impl FieldDescriptor {
     ///
     /// Boolean bytes retain the model's nonzero interpretation. Text ends at
     /// the first NUL or configured padding byte; trailing bytes are not treated
-    /// as selectable text. Neither policy authorizes a corresponding write.
+    /// as selectable text.
     ///
     /// # Errors
     ///
@@ -221,9 +221,10 @@ impl FieldDescriptor {
     ///
     /// Returns malformed-codec, registry-integrity, type, range, and text errors.
     /// Registered finite writable domains apply even to direct descriptors.
-    /// Registered blobs remain available for offline encoding; the planner
-    /// separately enforces radio-write admission. Text containing NUL or the
-    /// configured padding byte is rejected before any byte is returned.
+    /// Registered blobs remain available for offline encoding;
+    /// [`PatchPlanner::set`] rejects them with [`SchemaError::BlobNotPatchable`].
+    /// Text containing NUL or the configured padding byte is rejected before any
+    /// byte is returned.
     pub fn encode(&self, value: FieldValue<'_>) -> Result<Vec<MaskedByte>, SchemaError> {
         self.validate()?;
         if let Some(registered) = super::menu_field(self.name) {
@@ -262,8 +263,9 @@ impl PatchPlanner {
     ///
     /// # Errors
     ///
-    /// Returns encode errors, [`SchemaError::NotWritable`] outside the model's
-    /// writable regions, and [`SchemaError::Patch`] for conflicting assignments.
+    /// Returns encode errors, [`SchemaError::BlobNotPatchable`] for a registered
+    /// blob, [`SchemaError::NotWritable`] outside the model's writable regions,
+    /// and [`SchemaError::Patch`] for conflicting assignments.
     pub fn set(
         &mut self,
         field: &FieldDescriptor,

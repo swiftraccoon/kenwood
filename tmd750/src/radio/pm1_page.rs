@@ -6,7 +6,7 @@ use crate::protocol::mcp::{ACK, write_request};
 use crate::types::{Address, PAGE_SIZE, Page};
 use kenwood_transport::Transport;
 
-/// No caller-supplied address can reach this experimental frame writer.
+/// The two fixed page addresses this private frame writer can reach.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FixedTextTarget {
     Pm1,
@@ -26,9 +26,9 @@ impl FixedTextTarget {
 impl<T: Transport> Radio<T> {
     /// Complete the frame/ACK exchange after the caller's fixed-scope checks.
     ///
-    /// Each bounded caller validates identity, canonical page, the complete observed
-    /// before-image, and durable intent before invoking this private helper.
-    /// Any interrupted write or missing ACK keeps the handle uncertain.
+    /// Each caller validates identity, the canonical page, the complete observed
+    /// before-image, and the recorded intent before invoking this private helper.
+    /// An interrupted write or a missing ACK leaves the handle uncertain.
     pub(super) async fn write_pm1_frame(
         &mut self,
         after: &[u8; PAGE_SIZE],
@@ -38,8 +38,8 @@ impl<T: Transport> Radio<T> {
             .await
     }
 
-    /// Complete one fixed target's frame only after its driver checked the
-    /// exact identity, immutable whole-page baseline, guards, and durable intent.
+    /// Send one fixed target's frame after its driver has checked the exact
+    /// identity, whole-page baseline, guards, and recorded intent.
     pub(super) async fn write_fixed_text_frame(
         &mut self,
         target: FixedTextTarget,

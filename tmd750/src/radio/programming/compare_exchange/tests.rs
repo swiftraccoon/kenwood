@@ -1,4 +1,4 @@
-//! Pure replacement validation and fail-closed batch admission.
+//! Pure replacement validation and fail-closed batch checks.
 
 use crate::Radio;
 use crate::types::Address;

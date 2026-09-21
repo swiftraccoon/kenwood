@@ -1,4 +1,4 @@
-//! Fixed-scope MCP qualification, including partial evidence and cancellation.
+//! Fixed-scope MCP probe behavior, including partial captures and cancellation.
 
 use kenwood_schema as _;
 use mcp_d75_extract as _;

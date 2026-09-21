@@ -24,7 +24,7 @@ pub(crate) enum FixedTextTrialScope {
     My1,
 }
 
-/// Complete fresh-session evidence before the shared sequence may advance.
+/// Fresh-session facts the shared sequence requires before it advances.
 pub(crate) struct FixedTextTrialObservation<'a> {
     /// Never-reused connection identity within this trial.
     pub(crate) id: NonZeroU64,
@@ -52,15 +52,15 @@ pub(crate) trait FixedTextTrial: sealed::Sealed + Send + Sync {
     fn original_page(&self) -> &[u8; PAGE_SIZE];
     /// Complete immutable temporary image.
     fn expected_page(&self) -> &[u8; PAGE_SIZE];
-    /// Conservative restoration obligation.
+    /// Current status; `PossiblyChanged` once a write intent is recorded.
     fn status(&self) -> PmNameTrialStatus;
-    /// Next required session, not write authorization.
+    /// The session expected next, or an error mid-session or when terminal.
     fn next_session(&self) -> Result<PmNameTrialSession, PmNameTrialError>;
-    /// Permanently stop without erasing any restoration obligation.
+    /// Permanently stop accepting events, keeping the current status.
     fn halt(&mut self);
-    /// Validate non-fresh sequence evidence; MY1 rejects unguarded fresh events.
+    /// Validate a non-fresh event; MY1 rejects unguarded fresh events.
     fn record(&mut self, event: PmNameTrialEvent<'_>) -> Result<(), PmNameTrialError>;
-    /// Immutable guard-page specification, absent for the existing PM1 trial.
+    /// Immutable guard-page specification, absent for the PM1 trial.
     fn guard_page(&self) -> Option<Page>;
     /// Validate every scope-specific guard before recording a fresh session.
     fn fresh_session(
@@ -81,7 +81,7 @@ enum Phase {
     Halted,
 }
 
-/// Evidence sequence only; fixed wrappers own all field-specific admission.
+/// Event sequencing only; the fixed wrappers own every field-specific check.
 #[derive(Debug)]
 pub(super) struct TrialSequence {
     identity: Identity,

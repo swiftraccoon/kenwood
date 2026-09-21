@@ -1,4 +1,8 @@
-//! Narrow PM1 name updates with complete-page and lifecycle evidence.
+//! Narrowly scoped PM1 name updates over one complete page.
+//!
+//! An update writes the new name in one session and re-reads the page in a
+//! separate read-only session, so it verifies persistence across MCP exit and
+//! re-entry, not across a power cycle.
 
 use std::num::NonZeroU64;
 
@@ -15,7 +19,7 @@ use kenwood_transport::Transport;
 /// The step at which a bounded PM1 name-update session stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pm1NameUpdateSessionStage {
-    /// Obtain the engine-selected session before any I/O.
+    /// Obtain the update-selected session before any I/O.
     Preparation,
     /// Obtain and compare a complete, new CAT identity before MCP entry.
     Identity,
@@ -28,7 +32,7 @@ pub enum Pm1NameUpdateSessionStage {
     },
     /// Compare the format byte and complete page with the required before-image.
     FreshComparison,
-    /// Synchronize the caller's intent before permitting the only W command.
+    /// Durably record the caller's intent before the only W command.
     DurableIntent,
     /// Dispatch the single complete page and require its acknowledgment.
     Write,
@@ -45,20 +49,21 @@ pub enum Pm1NameUpdateSessionError {
     /// CAT, MCP, transport, or individual exchange timeout failure.
     #[error(transparent)]
     Io(#[from] Error),
-    /// The update's narrow scope or evidence sequence rejected the operation.
+    /// The update's narrow scope or session sequence rejected the operation.
     #[error(transparent)]
     Evidence(#[from] Pm1NameUpdateError),
-    /// The caller could not durably synchronize the intent before dispatch.
-    #[error("PM1 name update durable intent failed: {0}")]
+    /// The `before_write` callback failed to record the intent before dispatch.
+    #[error("PM1 name update journal record failed: {0}")]
     DurableIntent(#[source] std::io::Error),
 }
 
-/// Evidence about the only possible memory write, separate from verification.
+/// How far the sole W frame reached on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pm1NameUpdateWriteDisposition {
     /// No W dispatch was attempted during this session.
     NotAttempted,
-    /// Dispatch began; an error or silence cannot prove that no bytes arrived.
+    /// Dispatch began; an error or timeout leaves it unknown whether the radio
+    /// received the frame.
     PossiblyDispatched,
     /// The radio acknowledged W; whole-page readback and external finalization
     /// remain separate requirements.
@@ -70,15 +75,16 @@ pub enum Pm1NameUpdateWriteDisposition {
 pub enum Pm1NameUpdateSessionOutcome {
     /// Required reads, any write/readback, and E/ACK completed.
     ///
-    /// The caller must close/drop, verify fresh CAT, close the fresh transport,
-    /// and durably synchronize complete evidence before `SessionFinalized`.
+    /// The caller closes and drops the transport, verifies a fresh CAT identity,
+    /// closes that connection, and durably records the report before
+    /// `SessionFinalized`.
     AwaitingCatVerification,
     /// Cancellation was honored before accepting the only write intent.
     ///
-    /// If entered, the synchronized MCP session exited successfully. This
-    /// disposition never represents cancellation after a possible write.
+    /// If MCP was entered, that session exited successfully. Cancellation after
+    /// a possible write is never reported here.
     Cancelled,
-    /// The first failed requirement, retaining all earlier complete evidence.
+    /// The first failed requirement, retaining every earlier completed exchange.
     Failed {
         /// Exact failed step.
         stage: Pm1NameUpdateSessionStage,
@@ -87,15 +93,13 @@ pub enum Pm1NameUpdateSessionOutcome {
     },
 }
 
-/// Evidence from one bounded PM1 name-update session.
+/// The wire exchanges of one bounded PM1 name-update session.
 ///
-/// This report does not attest physical-unit continuity, durable capture,
-/// external cleanup, a full power cycle, or general firmware schema support.
-/// Preserve the raw transcript as well as these complete read segments; failed
-/// exchanges and any secondary exit error remain material evidence.
+/// Preserve the raw transcript alongside these complete read segments: failed
+/// exchanges and any secondary exit error appear only there.
 #[derive(Debug)]
 pub struct Pm1NameUpdateSessionReport {
-    /// Engine-selected session, absent when preparation failed.
+    /// Session selected by the update, absent when preparation failed.
     pub session: Option<Pm1NameUpdateSession>,
     /// New full CAT identity, including a mismatching tuple if obtained.
     pub identity: Option<Identity>,
@@ -107,7 +111,7 @@ pub struct Pm1NameUpdateSessionReport {
     pub exit: McpProbeExit,
     /// Whether this session attempted or acknowledged the sole W command.
     pub write: Pm1NameUpdateWriteDisposition,
-    /// Conservative engine status; external finalization is still required.
+    /// Update status on return; the caller performs finalization.
     pub status: Pm1NameUpdateStatus,
     /// First failure, safe cancellation, or outstanding fresh CAT verification.
     pub outcome: Pm1NameUpdateSessionOutcome,
@@ -130,9 +134,7 @@ impl Pm1NameUpdateSessionReport {
         }
     }
 
-    /// Fixed engine session ID: apply 1, separate-session verification 2.
-    ///
-    /// This number alone proves neither a fresh connection nor physical owner.
+    /// Fixed session number: apply 1, separate-session verification 2.
     #[must_use]
     pub const fn session_id(&self) -> Option<NonZeroU64> {
         match self.session {
@@ -180,38 +182,37 @@ impl<T: Transport> Radio<T> {
     ///
     /// The immutable update chooses apply or read-only verification. It exposes
     /// no caller-selected address, alternate field, force-write option, or
-    /// automatic rollback. This driver does not relax the generic schema-write
-    /// gate. Callers must establish approval for the requested name, physical
-    /// unit continuity, and a fully captured baseline, and use fail-closed raw
-    /// transport capture. The tested connection is main-unit USB at 9600 baud
-    /// with RTS/CTS and DTR/RTS asserted. This generic transport API cannot
-    /// establish the USB connector identity; the caller must enforce that scope.
+    /// automatic rollback, and leaves the generic schema-write gate unchanged.
+    /// Caller preconditions: a fully captured baseline for the target page and a
+    /// transport wrapped in fail-closed raw capture. The tested connection is
+    /// main-unit USB at 9600 baud with RTS/CTS and DTR/RTS asserted; this generic
+    /// transport API cannot check the USB connector identity, so the caller
+    /// selects the endpoint.
     ///
     /// Each invocation obtains a fresh complete identity before MCP entry,
     /// reads format byte 10 and the complete canonical PM1 page, and requires
     /// exact equality with the appropriate immutable page. No merge or rebase
-    /// occurs. In the apply session, `before_write` must durably synchronize the
+    /// occurs. In the apply session, `before_write` must durably record the
     /// identity, both pages, and exact intent. Its successful return permits
-    /// recording the conservative possible-write status and dispatching one W
-    /// frame. The immediate readback compares all 256 bytes. Verification is a
-    /// separate read-only session; no RF command is sent in either session.
+    /// recording the possible-write status and dispatching one W frame. The
+    /// immediate readback compares all 256 bytes. Verification is a separate
+    /// read-only session; no RF command is sent in either session.
     ///
-    /// Known-boundary comparison or journal errors permit detached E/ACK;
-    /// uncertain exchanges permit no speculative exit. After E/ACK, this method
-    /// performs no CAT, baud, or close operation on the retired handle. The
-    /// caller must close/drop, verify a matching identity on a fresh connection,
-    /// close that connection, and synchronize complete evidence before recording
+    /// A comparison or journal error at a known exchange boundary still exits;
+    /// an uncertain exchange sends no E. After E/ACK, this method performs no
+    /// CAT, baud, or close operation on the retired handle. The caller closes
+    /// and drops it, verifies a matching identity on a fresh connection, closes
+    /// that connection, and durably records the report before recording
     /// [`Pm1NameUpdateEvent::SessionFinalized`]. Only then may the caller open
-    /// the next session. This establishes observations across MCP exit/re-entry,
-    /// not independently observed power-cycle persistence.
+    /// the next session.
     ///
     /// # Cancellation
     ///
     /// Await this future to completion; never drop it to cancel live I/O.
     /// Cooperative cancellation is honored only at complete exchange boundaries
     /// before the write intent. After intent, finish the safe current phase and
-    /// subsequent verification. On failure the engine halts, preserves possible
-    /// change, and sends no speculative rollback or retry.
+    /// subsequent verification. On failure the update halts, keeps the
+    /// possibly-changed status, and sends no rollback or retry.
     pub async fn set_pm1_name_session_until_exit(
         &mut self,
         update: &mut Pm1NameUpdate,

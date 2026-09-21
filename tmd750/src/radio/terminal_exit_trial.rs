@@ -1,4 +1,8 @@
-//! Bounded, explicitly experimental Terminal exit with immutable page guards.
+//! Bounded Terminal exit: one full-page write under immutable page guards.
+//!
+//! Hardware coverage on firmware 1.02: one write with immediate readback and a
+//! fresh CAT Off reply. The read-only verification session and the recovery
+//! path have not run on hardware.
 
 use std::num::NonZeroU64;
 
@@ -31,7 +35,7 @@ pub enum TerminalExitTrialSessionStage {
     },
     /// Compare the full target and both immutable guard pages.
     FreshComparison,
-    /// Synchronize the exact intent before permitting the only write.
+    /// Durably record the exact intent before the only write.
     DurableIntent,
     /// Dispatch one complete page frame and require its acknowledgment.
     Write,
@@ -48,30 +52,31 @@ pub enum TerminalExitTrialSessionError {
     /// CAT, MCP, transport, or individual exchange timeout failure.
     #[error(transparent)]
     Io(#[from] Error),
-    /// Fixed scope or ordered evidence failed validation.
+    /// Fixed scope or session order failed validation.
     #[error(transparent)]
     Evidence(#[from] TerminalExitTrialError),
-    /// The caller could not synchronize the required intent before dispatch.
-    #[error("Terminal exit durable intent failed: {0}")]
+    /// The `before_write` callback failed to record the intent before dispatch.
+    #[error("Terminal exit journal record failed: {0}")]
     DurableIntent(#[source] std::io::Error),
 }
 
-/// Actual dispatch evidence, separate from the conservative engine status.
+/// How far the sole memory-write frame reached on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalExitTrialWriteDisposition {
     /// No memory-write dispatch was attempted in this session.
     NotAttempted,
-    /// Dispatch began; failure cannot establish that no bytes arrived.
+    /// Dispatch began; a failure leaves it unknown whether the radio received
+    /// the frame.
     PossiblyDispatched,
     /// The write was acknowledged; readback and lifecycle verification remain.
     Acknowledged,
 }
 
-/// Result of one session, before external close and fresh CAT verification.
+/// Result of one session, before the caller's close and fresh CAT verification.
 #[derive(Debug)]
 pub enum TerminalExitTrialSessionOutcome {
-    /// Required exchanges completed; the caller still owes fresh identity and
-    /// Gateway Off, both closes, and complete durable evidence.
+    /// Required exchanges completed; the caller still owes a fresh identity and
+    /// Gateway Off, both closes, and a durably recorded report.
     AwaitingCatVerification,
     /// Cancellation was honored before any write intent was accepted.
     Cancelled,
@@ -84,13 +89,11 @@ pub enum TerminalExitTrialSessionOutcome {
     },
 }
 
-/// Evidence from one fixed Terminal-exit session, including incomplete runs.
-///
-/// This is not proof of durable capture, physical-unit continuity, operator
-/// approval, automatic-exit qualification, or completed external finalization.
+/// The wire exchanges of one fixed Terminal-exit session, including incomplete
+/// runs.
 #[derive(Debug)]
 pub struct TerminalExitTrialSessionReport {
-    /// Engine-selected session, absent if preparation failed.
+    /// Session selected by the trial, absent if preparation failed.
     pub session: Option<TerminalExitTrialSession>,
     /// Complete freshly read identity, including a mismatch if obtained.
     pub identity: Option<Identity>,
@@ -100,13 +103,13 @@ pub struct TerminalExitTrialSessionReport {
     pub entry_reply: Option<Vec<u8>>,
     /// Acknowledged reads: format, control, routing, target, and any readback.
     pub segments: Vec<McpProbeSegment>,
-    /// Exit evidence, separate from the first session failure.
+    /// Exit disposition, separate from the first session failure.
     pub exit: McpProbeExit,
     /// Whether the sole fixed memory write was attempted or acknowledged.
     pub write: TerminalExitTrialWriteDisposition,
-    /// Conservative state; finalization is the caller's responsibility.
+    /// Trial status on return; the caller performs finalization.
     pub status: TerminalExitTrialStatus,
-    /// First failure, safe cancellation, or outstanding external verification.
+    /// First failure, safe cancellation, or verification still owed by the caller.
     pub outcome: TerminalExitTrialSessionOutcome,
     /// Additional exit error when another failure was already recorded.
     pub cleanup_error: Option<Error>,
@@ -128,8 +131,7 @@ impl TerminalExitTrialSessionReport {
         }
     }
 
-    /// Fixed session ID: apply 1, separate-session verification 2.
-    /// This number alone does not prove a fresh connection or physical owner.
+    /// Fixed session number: apply 1, separate-session verification 2.
     #[must_use]
     pub const fn session_id(&self) -> Option<NonZeroU64> {
         match self.session {
@@ -180,14 +182,14 @@ fn cancelled(trial: &TerminalExitTrial, should_cancel: &mut impl FnMut() -> bool
 }
 
 impl<T: Transport> Radio<T> {
-    /// Run one session of a separately approved, fixed Terminal-exit experiment.
+    /// Run one session of the fixed Terminal-exit trial.
     ///
-    /// This is not a generally qualified Terminal setter. The immutable trial
-    /// pins firmware/type, PM Off, panel routing, and the exact captured Off
-    /// target and guard pages. The caller must separately establish approval,
-    /// main-unit USB at 9600 baud, baseline provenance, and physical continuity,
-    /// and wrap the transport with fail-closed raw capture. The generic schema
-    /// write gate is unchanged. No callsign, PM, route, or RF command is sent.
+    /// This is not a general Terminal setter: the immutable trial pins
+    /// firmware/type, PM Off, panel routing, and the exact captured Off target
+    /// and guard pages. Caller preconditions: main-unit USB at 9600 baud, the
+    /// captured baseline for those pages, and a transport wrapped in fail-closed
+    /// raw capture. The generic schema write gate is unchanged. No callsign, PM,
+    /// route, or RF command is sent.
     ///
     /// A fresh complete identity and the required Gateway state are checked
     /// before entry. Every session reads format, control, routing, and target,
@@ -196,25 +198,25 @@ impl<T: Transport> Radio<T> {
     /// expectation is not treated as an observed before-image until it matches
     /// that complete fresh read. No changed byte is merged or ignored.
     ///
-    /// Only successful durable synchronization by `before_write` permits the
-    /// single full-page write restoring Gateway Off. Immediate readback covers
-    /// every byte. A separate session verifies the Off page without writing.
-    /// After each E/ACK, the caller must close/drop, obtain fresh matching CAT
-    /// identity and Gateway Off, close, and synchronize complete evidence before
-    /// recording [`TerminalExitTrialEvent::SessionFinalized`]. This method does
-    /// not perform those external steps or claim that they succeeded.
+    /// Only a successful `before_write` return permits the single full-page
+    /// write restoring Gateway Off. Immediate readback covers every byte. A
+    /// separate session verifies the Off page without writing. After each
+    /// E/ACK, the caller closes and drops the transport, obtains a matching
+    /// fresh CAT identity and Gateway Off, closes, and durably records the
+    /// report before recording
+    /// [`TerminalExitTrialEvent::SessionFinalized`]; this method performs none
+    /// of those steps.
     ///
-    /// Known-boundary comparison or journal failures permit detached exit;
-    /// incomplete exchanges permit no speculative E, CAT, or rollback. No old
-    /// handle operation follows exit ACK here. Hardware qualification of this
-    /// write and recovery path remains separate from these software checks.
+    /// A comparison or journal failure at a known exchange boundary still exits;
+    /// an incomplete exchange sends no E, CAT, or rollback. No operation follows
+    /// the exit ACK on the original handle here.
     ///
     /// # Cancellation
     ///
     /// Await to completion, never drop an in-flight future. Cooperative
     /// cancellation applies before the write intent at complete boundaries.
-    /// After intent, safe completion and verification remain owed; failures
-    /// halt the engine without erasing possible change or retrying a write.
+    /// After intent, safe completion and verification remain owed; a failure
+    /// halts the trial, keeps the possibly-changed status, and retries no write.
     pub async fn run_approved_terminal_exit_trial_session_until_exit(
         &mut self,
         trial: &mut TerminalExitTrial,

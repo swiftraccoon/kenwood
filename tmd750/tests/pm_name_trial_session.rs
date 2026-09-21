@@ -1,7 +1,7 @@
 //! Fixed PM1 wire scope, durable-intent ordering, and fail-closed lifecycle.
 //!
-//! Persistence cases model separate MCP sessions after exit and fresh identity
-//! verification. They do not simulate or independently prove a physical reboot.
+//! Persistence cases model separate scripted MCP sessions after exit and fresh
+//! identity verification; no power cycle is simulated.
 
 use kenwood_schema as _;
 use mcp_d75_extract as _;
@@ -274,7 +274,7 @@ async fn all_three_sessions_have_exact_wire_scope_and_require_external_finalizat
             usize::from(expected_write.is_some())
         );
         transport.mock.assert_complete();
-        // The test attests external cleanup; the driver must never do so itself.
+        // The test records finalization; the driver never records it itself.
         trial.record(PmNameTrialEvent::SessionFinalized {
             id: report.session_id().ok_or("session ID missing")?,
         })?;

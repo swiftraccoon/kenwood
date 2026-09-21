@@ -1,7 +1,7 @@
 //! Execute read-only CAT/MCP ownership examples using strict mocks only.
 //!
-//! No device, file, network, or settings write is used. Fixture bytes and
-//! fresh connections are scripted observations, not hardware qualification.
+//! No device, file, network, or settings write is used; every byte and every
+//! fresh connection here is scripted.
 
 use kenwood_schema as _;
 use mcp_d75_extract as _;
@@ -241,9 +241,8 @@ async fn complete_mcp_lifecycle() -> ExampleResult {
     );
     // Full-sized storage retained synthetic zeroes, not a complete backup.
 
-    // Only now create a separate fixture owner. A live caller instead uses its
-    // explicitly selected endpoint and qualified readiness policy, never a
-    // guessed delay or reopening an uncertain protocol stream.
+    // A fresh connection is a separate transport: the retired handle is never
+    // rewrapped or reopened. A live caller selects the endpoint explicitly.
     let mut fresh = identity_script();
     fresh.expect(b"GW\r", b"GW 0\r");
     let mut radio = Radio::new(Fixture::new(fresh, CloseResult::Success));
@@ -292,7 +291,7 @@ async fn mcp_failure_retains_exit_and_close_failures() -> ExampleResult {
         closed.operation.journal.possibly_written.is_empty(),
         "a failed read-only session must not invent possibly written pages"
     );
-    // Failed exit/close grants no fresh-connection or retry authority.
+    // The library never reconnects or retries after a failed exit or close.
     Ok(())
 }
 

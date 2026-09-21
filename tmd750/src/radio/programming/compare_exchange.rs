@@ -13,8 +13,8 @@ use kenwood_transport::Transport;
 /// Immutable expected and desired bytes for one canonical writable page.
 ///
 /// A canonical page is one complete unit in the existing writable-region walk,
-/// including its short fragments. Construction proves shape and scope only;
-/// it does not qualify a radio's firmware or authorize a settings write.
+/// including its short fragments. Construction checks shape and scope only; the
+/// firmware gate is enforced by the session that writes the page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageReplacement {
     page: Page,
@@ -58,7 +58,8 @@ impl PageReplacement {
         &self.replacement
     }
 
-    /// Whether fresh equality is sufficient without a write or durable intent.
+    /// Whether the replacement equals the expected bytes, so the page is
+    /// compared but never written and `before_write` is not called.
     #[must_use]
     pub fn is_noop(&self) -> bool {
         self.expected == self.replacement
@@ -67,9 +68,8 @@ impl PageReplacement {
 
 /// Successful results for this invocation, not the session's earlier writes.
 ///
-/// All vectors preserve the caller's order. This report establishes complete
-/// preflight comparisons and immediate readback, not atomicity, durability
-/// across exit/re-entry, or persistence across a power cycle.
+/// All vectors preserve the caller's order and cover only this invocation;
+/// [`McpSession::journal`] holds the whole session's write state.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct McpCompareExchangeReport {
     /// Every page whose fresh bytes matched its complete before-image.
@@ -146,18 +146,18 @@ impl<T: Transport> McpSession<'_, T> {
     /// merge is performed. This is a host-side optimistic check, not a
     /// firmware-atomic multi-page transaction or a lock against other actors.
     ///
-    /// Immediately before each changed page, `before_write` must synchronize
-    /// the caller's required raw evidence and durable intent, including both
-    /// complete images. The callback is not called for no-ops. Its successful
-    /// return precedes marking the session journal possibly written, a single
-    /// complete W frame/ACK, and whole-page immediate readback. A new dispatch
-    /// invalidates any earlier verification entry for that same page.
+    /// Immediately before each changed page, `before_write` must durably record
+    /// the intent, including both complete images. The callback is not called
+    /// for no-ops. Its successful return precedes marking the session journal
+    /// possibly written, a single complete W frame/ACK, and whole-page immediate
+    /// readback. A new dispatch invalidates any earlier verification entry for
+    /// that same page.
     ///
     /// Progress counts completed replacements (verified writes or compared
     /// no-ops), in input order, after the entire preflight has succeeded. Empty
     /// batches emit no progress or page traffic but still enforce the schema
     /// gate. The returned report contains only this batch's successful work;
-    /// [`Self::journal`] retains the entire session's conservative write state.
+    /// [`Self::journal`] retains the entire session's write state.
     ///
     /// No rollback, retry, exit, fresh connection, or CAT query is performed.
     /// Complete comparison/callback failures leave an exit-safe boundary;
@@ -172,7 +172,7 @@ impl<T: Transport> McpSession<'_, T> {
     /// any page traffic. Comparison, callback, write, and readback failures are
     /// wrapped in [`McpError::Interrupted`] with the current session journal
     /// counts and original typed cause. A later failure may follow earlier
-    /// successful writes; an error never establishes automatic restoration.
+    /// successful writes; no error path restores them.
     pub async fn compare_exchange_pages(
         &mut self,
         replacements: &[PageReplacement],
@@ -194,11 +194,11 @@ impl<T: Transport> McpSession<'_, T> {
     /// every guarded page must still match before the first W. Only changed
     /// pages invoke `before_write` and require immediate whole-page readback.
     ///
-    /// This separate software-layout policy does not widen the legacy raw-page
-    /// schema gate. It is not hardware qualification of every menu setting,
-    /// firmware-atomic execution, or permission to change Gateway mode, routing,
-    /// or automatic-transmission settings. The caller owns capture durability,
-    /// detached exit, transport release, fresh verification, and recovery.
+    /// Scope: registered scalar fields with an ordinary lifecycle only. This
+    /// path cannot change Gateway mode, routing, or automatic-transmission
+    /// settings, does not widen the legacy raw-page schema gate, and is not
+    /// firmware-atomic. Capture durability, detached exit, transport release,
+    /// fresh verification, and recovery remain the caller's.
     ///
     /// # Errors
     ///
@@ -233,19 +233,19 @@ impl<T: Transport> McpSession<'_, T> {
     /// immediate whole-page readback. Reversal has exactly the same comparisons;
     /// its synthetic expected images are not accepted as prior observations.
     ///
-    /// This separately bounded lifecycle policy does not widen ordinary-menu or
-    /// legacy raw-page admission. It performs no rollback, retry, automatic exit,
-    /// reconnect, CAT query, or modem operation. The caller owns authorization,
-    /// active-mode programming admission, evidence durability, connection roles,
-    /// and final verification. Retain the journal, await safe [`Self::exit`],
-    /// then close/drop the original handle before any fresh connection.
+    /// Performs no rollback, retry, automatic exit, reconnect, CAT query, or
+    /// modem operation, and widens neither the ordinary-menu nor the legacy
+    /// raw-page schema gate. Entering MCP while Gateway is active, journal
+    /// durability, connection roles, and final verification remain the caller's:
+    /// retain the journal, await a safe [`Self::exit`], then close and drop the
+    /// original handle before opening a fresh connection.
     ///
     /// # Errors
     ///
     /// Returns session-state or identity errors before page traffic. Comparison,
     /// callback, transport, and readback failures preserve the shared engine's
-    /// typed cause and conservative journal. Incomplete exchanges prohibit further
-    /// protocol I/O; cancellation or failure never establishes restoration.
+    /// typed cause and its journal. An incomplete exchange blocks further
+    /// protocol I/O, and no failure path restores earlier pages.
     pub async fn compare_exchange_terminal(
         &mut self,
         plan: &TerminalPlan,
@@ -264,7 +264,8 @@ impl<T: Transport> McpSession<'_, T> {
             .await?)
     }
 
-    /// Share shape, comparison, dispatch, and journal semantics after admission.
+    /// Share shape, comparison, dispatch, and journal semantics after the
+    /// caller's session and identity checks.
     async fn compare_exchange_admitted(
         &mut self,
         replacements: &[PageReplacement],

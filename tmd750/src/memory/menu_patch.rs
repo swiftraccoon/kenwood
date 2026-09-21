@@ -72,9 +72,8 @@ impl MenuField {
     /// Boolean aliases are `true`/`false`, `on`/`off`, `yes`/`no`, and `1`/`0`,
     /// with ASCII case ignored. Strings preserve their exact text and spacing.
     ///
-    /// Numeric inputs are raw stored integers, not display units. This method
-    /// does not apply scaling metadata, guess units, truncate text, establish
-    /// firmware compatibility, or authorize a radio write. Blobs and byte arrays
+    /// Numeric inputs are raw stored integers, not display units; no scaling
+    /// metadata is applied and text is never truncated. Blobs and byte arrays
     /// are not scalar input. A string containing NUL or its configured padding
     /// byte is rejected because decoding would stop at that byte.
     ///
@@ -175,10 +174,11 @@ impl MenuField {
         self.validate_value_domain(value)
     }
 
-    /// Validate finite enum and choice domains without deciding radio-write policy.
+    /// Validate a value against the field's finite enum and choice domains.
     ///
-    /// Pure image encoding also uses this check. A registered binary field may
-    /// be encoded offline even when scalar page planning does not admit it.
+    /// Offline image encoding also uses this check. Blob exclusion belongs to
+    /// [`Self::validate_patch_value`], which returns
+    /// [`SchemaError::BlobNotPatchable`].
     pub(crate) fn validate_value_domain(&self, value: FieldValue<'_>) -> Result<(), SchemaError> {
         validate_choices(
             value,

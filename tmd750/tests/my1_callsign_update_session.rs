@@ -1,7 +1,6 @@
 //! Bounded MY1 update wire scope, fresh guards, and fail-closed lifecycle.
 //!
-//! All transports are scripted. Explicit test finalization is a caller
-//! attestation, not hardware, capture-durability, or power-cycle evidence.
+//! All transports are scripted; the test performs finalization itself.
 
 use kenwood_schema as _;
 use mcp_d75_extract as _;

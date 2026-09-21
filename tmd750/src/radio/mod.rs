@@ -2,22 +2,24 @@
 //!
 //! Start with [`Radio::new`] around an already selected transport, then
 //! [`Radio::identify`] to obtain the complete model, firmware, and type tuple.
-//! Opening a transport or constructing a [`Radio`] does not prove identity.
+//! Opening a transport or constructing a [`Radio`] sends nothing; identity
+//! comes only from [`Radio::identify`].
 //!
 //! # Choose an operation
 //!
 //! - Read ordinary state with [`Radio::get_operating_mode`] and
-//!   [`Radio::get_dv_gateway_mode`]. [`Radio::set_operating_mode`] supports only
-//!   the exact hardware-qualified target and verifies the requested mode.
+//!   [`Radio::get_dv_gateway_mode`]. [`Radio::set_operating_mode`] admits only
+//!   firmware `1.02` with type `K,2,1` and verifies the requested mode.
 //! - Capture standard configuration with [`Radio::backup_mcp_until_exit`], or
-//!   use [`Radio::probe_mcp`] for a smaller, explicit bench qualification.
+//!   use [`Radio::probe_mcp`] for a smaller, fixed two-fragment read.
 //!   Neither operation writes settings; both interrupt ordinary radio operation.
 //! - Inspect selected menu fields through [`McpSession::read_menu_snapshot`].
 //!   Prepare ordinary changes with [`menu::MenuUpdatePlan`] and persistent
-//!   Gateway changes with [`terminal::TerminalPlan`]. Plans are local data,
-//!   not executed changes or proof that a connection is ready.
-//! - The PM1/MY1 update and fixed-trial modules expose separate evidence-driven
-//!   workflows. They are not prerequisites for the ordinary menu API.
+//!   Gateway changes with [`terminal::TerminalPlan`]. A plan is local data;
+//!   applying it is a separate session.
+//! - The PM1/MY1 update and fixed-trial modules perform single-page writes to
+//!   fixed targets under stricter guards. They are not prerequisites for the
+//!   ordinary menu API.
 //!
 //! # Ownership and failure
 //!
@@ -56,8 +58,9 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// Maximum accepted CAT reply length, excluding its carriage return.
 ///
-/// This host-side resource limit bounds malformed or unterminated replies;
-/// it does not describe a measured radio firmware limit.
+/// A longer line returns [`ProtocolError::CatLineTooLong`]. This is a host-side
+/// resource bound on malformed or unterminated replies; the radio's own limit
+/// is unknown.
 pub const MAX_CAT_LINE_BYTES: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,8 +98,9 @@ pub struct Identity {
 ///
 /// Construction sends no bytes. [`Self::identify`] obtains and caches the full
 /// identity; ordinary getters do not implicitly identify. Qualified setters
-/// identify when needed and apply their own target checks. A cached identity
-/// is historical evidence, not a current readiness or physical-unit guarantee.
+/// identify when needed and apply their own target checks. The cache holds the
+/// last successful identify result and is not invalidated by later failures, so
+/// it can be stale.
 ///
 /// # Deadlines and cancellation
 ///
@@ -104,14 +108,14 @@ pub struct Identity {
 /// reply-reading step, not one deadline for an entire multi-command method.
 /// Await a polled CAT operation to completion. Dropping its future during I/O,
 /// a write/read failure, a timeout, or an undecodable reply leaves the managed
-/// connection recovery-required. A timeout does not prove that no bytes arrived
-/// or that a requested change did not occur.
+/// connection recovery-required. After a timeout it is unknown whether the
+/// bytes arrived or the requested change took effect.
 ///
 /// Subsequent CAT and MCP operations then return
 /// [`McpError::RecoveryRequired`] before I/O, even when CAT caused the failure.
-/// A complete, parsed rejection or unexpected response can instead leave a
-/// synchronized boundary; an operation error alone is not a readiness test.
-/// No command is automatically replayed, and no setting is rolled back.
+/// A complete, parsed rejection or unexpected response instead leaves a
+/// synchronized boundary. No command is automatically replayed, and no setting
+/// is rolled back.
 ///
 /// # Releasing and recovering ownership
 ///
@@ -154,8 +158,8 @@ impl<T: Transport> Radio<T> {
 
     /// Change the deadline for each serial write and each reply-reading step.
     ///
-    /// A write timeout does not prove that no bytes reached the radio. A CAT
-    /// or MCP exchange that is interrupted remains unavailable for further
+    /// After a write timeout, whether any bytes reached the radio is unknown. A
+    /// CAT or MCP exchange that is interrupted remains unavailable for further
     /// commands until the connection and radio protocol boundary are recovered.
     pub const fn set_timeout(&mut self, timeout: Duration) {
         self.timeout = timeout;
@@ -163,8 +167,8 @@ impl<T: Transport> Radio<T> {
 
     /// The identity proven by the last [`Radio::identify`].
     ///
-    /// Returns cached evidence without I/O. It remains available after a later
-    /// exchange fails and therefore does not establish current CAT readiness.
+    /// Returns the cached value without I/O; a later failed exchange does not
+    /// clear it.
     #[must_use]
     pub const fn identity(&self) -> Option<&Identity> {
         self.identity.as_ref()
@@ -229,8 +233,8 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns transport, timeout, parse, unexpected-response (including a
-    /// parsed rejection), or session-state errors. An error does not authorize
-    /// another command on an uncertain connection.
+    /// parsed rejection), or session-state errors. After an error the
+    /// connection may be uncertain; see [`Radio`]'s ownership contract.
     pub async fn get_operating_mode(&mut self, band: Band) -> Result<OperatingMode, Error> {
         match self.command(Command::GetOperatingMode { band }).await? {
             Response::OperatingMode {
@@ -252,8 +256,8 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Errors
     ///
-    /// Proves the radio identity first when needed and refuses targets other
-    /// than the exact firmware and radio type qualified on live hardware.
+    /// Proves the radio identity first when needed and refuses any other
+    /// firmware or radio type with [`Error::UnsupportedCatWriteTarget`].
     /// Returns an error when that gate fails, the write is rejected, its reply
     /// does not match, or the immediate readback differs from the request.
     pub async fn set_operating_mode(
@@ -301,7 +305,7 @@ impl<T: Transport> Radio<T> {
     ///
     /// This changes the ordinary RF demodulation mode. It does not enable the
     /// separate persistent DV Gateway or Terminal Mode setting.
-    /// It has the same qualification and cancellation contract as
+    /// It has the same identity gate and cancellation contract as
     /// [`Self::set_operating_mode`].
     ///
     /// # Errors
@@ -313,8 +317,9 @@ impl<T: Transport> Radio<T> {
 
     /// Read the persistent DV Gateway state through the read-only `GW` command.
     ///
-    /// Sends one query without an implicit identity check. A Terminal value
-    /// does not prove its subtype, selected route, or modem readiness. Follow
+    /// Sends one query without an implicit identity check. `GW` reports the
+    /// Gateway mode alone; the subtype and route are stored settings read
+    /// through MCP, and the modem is a separate connection. Follow
     /// [`Radio`]'s deadline, cancellation, and post-error ownership contract.
     ///
     /// # Errors

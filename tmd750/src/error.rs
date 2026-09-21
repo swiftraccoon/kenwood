@@ -26,8 +26,8 @@ pub enum Error {
     File(#[from] FileError),
     /// A transport write or reply-reading step exceeded its configured deadline.
     ///
-    /// `operation` names the timed-out step. This does not establish radio
-    /// silence, zero delivered bytes, or that a requested change did not occur.
+    /// `operation` names the timed-out step. After it, whether the radio
+    /// received any bytes or applied a requested change is unknown.
     #[error("{operation} timed out after {millis} ms")]
     Timeout {
         /// What was waited for.
@@ -35,7 +35,7 @@ pub enum Error {
         /// The timeout that elapsed.
         millis: u64,
     },
-    /// The connected radio does not match the conservative schema-target gate.
+    /// The connected radio does not match the schema-target gate.
     #[error(
         "MCP-D750 schema patches support only {expected_model} firmware {expected_firmware} \
          (accepted exact FV identities: {accepted:?}); connected target is model \
@@ -53,15 +53,15 @@ pub enum Error {
         /// Firmware the radio reported.
         actual_firmware: String,
     },
-    /// The connected target has not been qualified for CAT operating-mode writes.
+    /// The connected radio is outside the CAT operating-mode write gate.
     #[error(
         "CAT mode writes support only firmware {expected_firmware} with TY {expected_radio_type}; \
          connected target reports firmware {actual_firmware} with TY {actual_radio_type}"
     )]
     UnsupportedCatWriteTarget {
-        /// Exact qualified `FV` identity.
+        /// The only `FV` identity the gate accepts.
         expected_firmware: &'static str,
-        /// Exact qualified `TY` payload.
+        /// The only `TY` payload the gate accepts.
         expected_radio_type: &'static str,
         /// Connected radio's `FV` identity.
         actual_firmware: String,
@@ -205,8 +205,8 @@ pub enum ProtocolError {
     /// A supported MCP command appeared where a data or fill response was required.
     ///
     /// A read-request echo is valid header framing but not a completed page
-    /// response. The session remains recovery-required; no payload ACK or exit
-    /// is authorized by this error.
+    /// response. The session remains recovery-required, and no payload ACK or
+    /// exit is sent.
     #[error("MCP page response command {command:?} is not Write or Fill")]
     UnexpectedPageResponse {
         /// The supported command found in the wrong response role.
@@ -334,7 +334,7 @@ pub enum McpError {
         offset: usize,
     },
     /// The caller could not durably record a page's intent before dispatch.
-    #[error("durable intent for page at {address} failed: {source}")]
+    #[error("journal record for page at {address} failed: {source}")]
     DurableIntent {
         /// Page whose write was not dispatched.
         address: u32,

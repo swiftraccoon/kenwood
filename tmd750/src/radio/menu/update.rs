@@ -19,7 +19,7 @@ const GATEWAY_FIELD: &str = "dv.DvGatewayModeDvGateway";
 ///
 /// Names resolve through the compiled registry. Scope and input values are
 /// validated without normalization; no arbitrary descriptor or raw patch can
-/// be substituted. Construction performs no I/O and grants no write authority.
+/// be substituted. Construction is pure and performs no I/O.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MenuAssignment {
     selection: ScopedMenuField<'static>,
@@ -85,11 +85,11 @@ impl MenuAssignment {
 /// must be Off. Complete format, PM-control, and active-Gateway pages are kept
 /// alongside every assigned page, even when they are compare-only no-ops.
 ///
-/// This does not widen arbitrary-page programming admission or establish
-/// hardware qualification. Callers must independently obtain authorization,
-/// match the current identity, compare every expected page before writing,
-/// retain durable intent, and verify the full exit/reconnection lifecycle.
-/// The plan is neither an atomic transaction nor a rollback instruction.
+/// Scope: this plan admits only registered scalar fields and does not widen
+/// arbitrary-page programming. Applying it still requires a matching session
+/// identity, a fresh comparison of every expected page before the first write,
+/// durably recorded intent, and caller-driven exit and reconnection. The plan
+/// is neither an atomic transaction nor a rollback instruction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MenuUpdatePlan {
     identity: Identity,

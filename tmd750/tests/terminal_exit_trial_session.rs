@@ -1,7 +1,7 @@
 //! Fixed Terminal-exit wire scope, immutable guards, and fail-closed lifecycle.
 //!
-//! Separate mocked connections model caller-finalized evidence, not hardware
-//! qualification, physical continuity, or an independently observed power cycle.
+//! Separate mocked connections model the caller-finalized sequence; the tests
+//! use no hardware.
 
 use kenwood_schema as _;
 use mcp_d75_extract as _;

@@ -1,4 +1,8 @@
 //! Closed-scope MY1 updates with fresh Gateway and whole-page guards.
+//!
+//! An update writes the callsign in one session and re-reads the page in a
+//! separate verification session, so it verifies persistence across MCP exit
+//! and re-entry, not across a power cycle.
 
 use std::num::NonZeroU64;
 
@@ -31,7 +35,7 @@ pub enum My1CallsignUpdateSessionStage {
     },
     /// Compare memory format, Gateway, control page, and target page.
     FreshComparison,
-    /// Synchronize the immutable scope and sole write intent before dispatch.
+    /// Durably record the immutable scope and sole write intent before dispatch.
     DurableIntent,
     /// Send the complete desired page in one frame and require its ACK.
     Write,
@@ -48,36 +52,38 @@ pub enum My1CallsignUpdateSessionError {
     /// CAT, MCP, transport, or exchange-timeout failure.
     #[error(transparent)]
     Io(#[from] Error),
-    /// Immutable scope or evidence order did not match.
+    /// Immutable scope or session order did not match.
     #[error(transparent)]
     Evidence(#[from] My1CallsignUpdateError),
-    /// The caller could not synchronize recovery bytes and intent before W.
-    #[error("MY1 update durable intent failed: {0}")]
+    /// The `before_write` callback failed to record recovery bytes and intent.
+    #[error("MY1 update journal record failed: {0}")]
     DurableIntent(#[source] std::io::Error),
 }
 
-/// Dispatch evidence, independent of full-page verification and finalization.
+/// How far the sole W frame reached on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum My1CallsignUpdateWriteDisposition {
     /// No W dispatch was attempted in this session.
     NotAttempted,
-    /// Dispatch started; an error does not prove that the radio received nothing.
+    /// Dispatch started; an error leaves it unknown whether the radio received
+    /// the frame.
     PossiblyDispatched,
     /// W was acknowledged; immediate and independent readback remain distinct.
     Acknowledged,
 }
 
-/// Original-session outcome, not the complete two-session transaction result.
+/// Outcome of one session, not of the whole two-session update.
 #[derive(Debug)]
 pub enum My1CallsignUpdateSessionOutcome {
-    /// Required exchanges and E/ACK completed. External original close/drop,
-    /// fresh matching CAT identity/Gateway Off, fresh close, and synchronized
-    /// complete evidence are still required before finalizing this session.
+    /// Required exchanges and E/ACK completed. The caller closes and drops the
+    /// original transport, verifies a matching CAT identity and Gateway Off on a
+    /// fresh connection, closes it, and durably records the report before
+    /// finalizing this session.
     AwaitingCatVerification,
-    /// Cancellation was honored before the sole intent. Any entered,
-    /// synchronized MCP session exited successfully; no write was permitted.
+    /// Cancellation was honored before the sole intent. Any MCP session that was
+    /// entered exited successfully; no write was permitted.
     Cancelled,
-    /// The first failure, retaining complete earlier observations.
+    /// The first failure, retaining every earlier completed exchange.
     Failed {
         /// First rejected requirement.
         stage: My1CallsignUpdateSessionStage,
@@ -86,14 +92,13 @@ pub enum My1CallsignUpdateSessionOutcome {
     },
 }
 
-/// Evidence from one narrowly scoped MY1 apply or verification session.
+/// The wire exchanges of one narrowly scoped MY1 apply or verification session.
 ///
-/// Keep the raw transport capture, including incomplete exchanges. This report
-/// does not prove caller authorization, capture durability, physical continuity,
-/// external cleanup, power-cycle persistence, or Terminal acceptance.
+/// Keep the raw transport capture alongside it: this report records only the
+/// exchanges that completed in this session.
 #[derive(Debug)]
 pub struct My1CallsignUpdateSessionReport {
-    /// Engine-selected phase; absent when preparation failed.
+    /// Phase selected by the update; absent when preparation failed.
     pub session: Option<My1CallsignUpdateSession>,
     /// Complete fresh identity, including a mismatching tuple when obtained.
     pub identity: Option<Identity>,
@@ -103,13 +108,13 @@ pub struct My1CallsignUpdateSessionReport {
     pub entry_reply: Option<Vec<u8>>,
     /// Acknowledged reads in order: format, control, target, any readback.
     pub segments: Vec<McpProbeSegment>,
-    /// Exit evidence, independent of an earlier operation failure.
+    /// Exit disposition, independent of an earlier operation failure.
     pub exit: McpProbeExit,
     /// Whether dispatch of the sole W command began or was acknowledged.
     pub write: My1CallsignUpdateWriteDisposition,
-    /// Conservative model status; finalization still belongs to the caller.
+    /// Update status on return; the caller performs finalization.
     pub status: My1CallsignUpdateStatus,
-    /// First failure, pre-intent cancellation, or pending external finalization.
+    /// First failure, pre-intent cancellation, or pending caller finalization.
     pub outcome: My1CallsignUpdateSessionOutcome,
     /// Secondary exit failure when the operation already had a primary failure.
     pub cleanup_error: Option<Error>,
@@ -131,9 +136,7 @@ impl My1CallsignUpdateSessionReport {
         }
     }
 
-    /// Fixed model ID: apply 1, independent verification 2.
-    ///
-    /// This ID alone establishes neither a fresh connection nor physical owner.
+    /// Fixed session number: apply 1, independent verification 2.
     #[must_use]
     pub const fn session_id(&self) -> Option<NonZeroU64> {
         match self.session {
@@ -186,30 +189,31 @@ impl<T: Transport> Radio<T> {
     /// control, and target bytes. Apply requires exact original-page agreement;
     /// Verify requires exact desired-page agreement. No rebase occurs.
     ///
-    /// Before the sole W, `before_write` must synchronize the operator-approved
-    /// intent, identity, complete immutable pages, and recovery evidence. Its
-    /// success marks the model possibly changed before one full-page dispatch.
-    /// The immediate readback compares every byte. This generic transport method
-    /// cannot establish connector identity: callers must enforce the main-unit
-    /// USB endpoint at 9600 baud with RTS/CTS and asserted DTR/RTS, complete raw
-    /// capture, baseline provenance, and separately obtained write authority.
+    /// Before the sole W, `before_write` must durably record the intent, the
+    /// identity, both complete immutable pages, and the recovery bytes. Its
+    /// successful return marks the update possibly changed, then one full-page
+    /// frame is dispatched and the immediate readback compares every byte. This
+    /// generic transport method cannot check connector identity: the caller
+    /// selects the main-unit USB endpoint at 9600 baud with RTS/CTS and asserted
+    /// DTR/RTS, supplies the captured baseline, and wraps the transport in
+    /// complete raw capture.
     ///
-    /// Known-boundary comparison or journal failures permit detached E/ACK;
-    /// uncertain exchanges permit only external close/drop, never speculative
-    /// exit. After E/ACK, no CAT, baud, or close command is issued here. The
-    /// caller must close/drop, verify exact fresh CAT identity and Gateway Off,
-    /// close the fresh handle, and synchronize complete evidence before recording
-    /// [`My1CallsignUpdateEvent::SessionFinalized`] or opening the next session.
-    /// No arbitrary address, Gateway change, RF command, rollback, or retry is
-    /// exposed. Generic schema admission remains unchanged.
+    /// A comparison or journal failure at a known exchange boundary still exits;
+    /// an uncertain exchange permits only close and drop, never a speculative E.
+    /// After E/ACK, no CAT, baud, or close command is issued here. The caller
+    /// closes and drops the transport, verifies the exact fresh CAT identity and
+    /// Gateway Off, closes the fresh handle, and durably records the report
+    /// before recording [`My1CallsignUpdateEvent::SessionFinalized`] or opening
+    /// the next session. No arbitrary address, Gateway change, RF command,
+    /// rollback, or retry is exposed, and the generic schema gate is unchanged.
     ///
     /// # Cancellation
     ///
     /// Await the future to completion; never drop it to cancel live I/O.
     /// Cancellation is checked at complete exchange boundaries before intent.
     /// After intent, finish known-safe verification despite cancellation, but
-    /// halt on failed scope, framing, or evidence. A failure retains possible
-    /// change and never triggers an automatic restore of a stale page.
+    /// halt on a failed scope, framing, or comparison check. A failure keeps the
+    /// possibly-changed status and never restores a stale page automatically.
     pub async fn set_my1_callsign_session_until_exit(
         &mut self,
         update: &mut My1CallsignUpdate,

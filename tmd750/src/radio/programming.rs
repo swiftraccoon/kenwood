@@ -7,13 +7,13 @@
 //! borrowed [`McpSession`] for composing [`McpSession::read_page`],
 //! [`McpSession::read_regions`], or sparse menu operations within one entry.
 //! [`RegionImage`] retains read coverage; [`crate::memory::MemoryImage`] retains
-//! only a full-sized byte buffer. Neither storage shape proves firmware layout.
+//! only a full-sized byte buffer.
 //!
 //! For ordinary registered changes, prepare a
 //! [`MenuUpdatePlan`](super::menu::MenuUpdatePlan). Persistent Gateway changes
 //! use [`TerminalPlan`](super::terminal::TerminalPlan). The lower-level
-//! [`McpSession::write_pages_verified`] retains a different schema gate and is
-//! not a substitute for either plan's operating-state admission.
+//! [`McpSession::write_pages_verified`] uses a different schema gate and applies
+//! none of either plan's operating-state guards.
 //!
 //! # Lifecycle and cleanup
 //!
@@ -23,14 +23,13 @@
 //! cannot. Dropping a future or session performs no asynchronous protocol cleanup.
 //!
 //! E/ACK retires the original connection without proving CAT readiness. Close
-//! and drop that owner before separately selecting, opening, and identifying
+//! and drop that transport before separately selecting, opening, and identifying
 //! a fresh connection. Retain operation, exit, close, and fresh-verification
 //! failures independently. [`Radio::recover`] reads journaled patch bits only
 //! after the caller has established a usable connection; it is not link repair.
 //!
-//! The executable example below uses strict mocks only. It demonstrates these
-//! ownership boundaries, sparse coverage, and failure handling without opening
-//! a device, writing settings, or claiming hardware qualification.
+//! The executable example below runs entirely on strict mocks. It demonstrates
+//! these ownership boundaries, sparse coverage, and failure handling.
 
 #![doc = concat!(
     "\n\n# Executable offline lifecycle\n\n",
@@ -148,12 +147,12 @@ impl RegionImage {
 
     /// Consume the buffer after checking only the caller's required regions.
     ///
-    /// This returns full-sized storage, not proof of a fully observed image.
-    /// Coverage metadata is discarded and every unread byte remains synthetic
-    /// zero. An empty `required` list checks no coverage, even on a new image.
-    /// Retain the coverage map separately if later readers need provenance;
-    /// prefer [`Self::bytes`] or [`super::menu::MenuFieldSnapshot`] for sparse
-    /// inspection. This conversion does not qualify a `.d750` export or a write.
+    /// The coverage map is discarded and every unread byte remains a synthetic
+    /// zero, so the returned image is full-sized regardless of what was read.
+    /// An empty `required` list checks no coverage, even on a new image. Retain
+    /// the coverage map separately if later readers need provenance; prefer
+    /// [`Self::bytes`] or [`super::menu::MenuFieldSnapshot`] for sparse
+    /// inspection.
     ///
     /// ```
     /// use kenwood_tmd750::{IMAGE_LENGTH, Region};
@@ -284,8 +283,8 @@ impl<T: Transport> Radio<T> {
     ///
     /// Successful exit retires this connection. Close and drop its transport,
     /// then independently identify a fresh connection before further operation.
-    /// This report establishes observed patch bits, not unchanged unrelated
-    /// bytes, persistence across a power cycle, or recovered CAT access.
+    /// The report covers the journaled patch bits only; bytes outside those
+    /// patches are never read or compared.
     ///
     /// # Errors
     ///
@@ -477,7 +476,6 @@ impl<T: Transport> McpSession<'_, T> {
     /// The caller must close and drop the transport. Its protocol state remains
     /// blocked so no CAT or second programming session can reuse this handle.
     /// This method performs no baud change, reconnect, retry, or CAT query.
-    /// Acknowledgment does not establish a reboot or readiness on another handle.
     /// Retain any journal before consuming this session.
     ///
     /// # Errors
@@ -557,8 +555,8 @@ impl<T: Transport> McpSession<'_, T> {
     /// Cancellation should be checked between completed calls. Dropping an
     /// in-flight read or receiving an incomplete exchange leaves the session
     /// uncertain and prohibits subsequent protocol I/O, including exit. A
-    /// successful call restores MCP readiness but does not leave programming
-    /// mode or imply CAT readiness. No automatic retry occurs.
+    /// successful call restores MCP readiness and stays in programming mode.
+    /// No automatic retry occurs.
     ///
     /// # Errors
     ///

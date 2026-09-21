@@ -1,4 +1,4 @@
-//! Pure scalar input tests; no radio access or firmware qualification.
+//! Pure scalar input tests, with no radio access.
 
 use super::*;
 use crate::memory::{Endian, FieldDescriptor, MenuOption, StringEncoding, menu_field};

@@ -1,8 +1,9 @@
 //! Immutable, narrowly scoped plans for the persistent Reflector Terminal setting.
 //!
-//! Planning performs no I/O and grants no operating authority. Connection roles,
-//! active-mode MCP admission, durable evidence, shutdown, and fresh verification
-//! remain the caller's responsibility. A stored setting is not modem readiness.
+//! Planning performs no I/O: a [`TerminalPlan`] is local data. A stored Gateway
+//! setting is not modem readiness; connection roles, entering MCP while Gateway
+//! is active, the recovery journal, shutdown, and fresh verification remain the
+//! caller's.
 
 use std::collections::BTreeMap;
 
@@ -49,13 +50,15 @@ impl TerminalTarget {
 /// the active PM's Gateway route. MY/RPT fields, PM selection, USB function, and
 /// every unrelated byte are preserved exactly; no station identity is installed.
 ///
-/// This is software-layout admission, not hardware qualification or a complete
-/// connection lifecycle. The caller must independently authorize the operation,
-/// compare all pages freshly through
+/// These checks cover the captured layout only. Hardware coverage is the
+/// configuration in the crate README: firmware 1.02 in PM Off, Gateway routed
+/// to panel USB, Bluetooth modem link; other slots, routes and targets are
+/// untested. Apply the plan with
 /// [`McpSession::compare_exchange_terminal`](super::programming::McpSession::compare_exchange_terminal),
-/// record durable intent, and verify exit, handle release, and the required
-/// fresh CAT or modem observations. Multi-page comparison is not a radio lock
-/// or firmware-atomic transaction.
+/// which freshly compares every page before the first write. Multi-page
+/// comparison is optimistic, not a radio lock or a firmware-atomic transaction:
+/// the `before_write` record, exit, handle release, and the fresh CAT or modem
+/// check remain the caller's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalPlan {
     identity: Identity,
@@ -163,10 +166,9 @@ impl TerminalPlan {
     /// its complete compare-only guards. Selecting a different route while
     /// already in Reflector Terminal creates the same explicit route intent.
     ///
-    /// Multiple page writes are not firmware-atomic. The caller must retain a
-    /// separate usable control path, stop any modem owner before changing its
-    /// route, and preserve exact recovery images. The route selection is not
-    /// evidence that the destination is connected or that entry is qualified.
+    /// The caller retains a separate usable control path, closes any modem
+    /// connection before changing that connection's route, and preserves the
+    /// exact recovery images.
     ///
     /// # Errors
     ///
@@ -188,9 +190,9 @@ impl TerminalPlan {
     ///
     /// Includes complete format and PM-control guards, plus USB function,
     /// Gateway route, Gateway mode, and Terminal subtype coverage for all six
-    /// PM slots. Pages are unique and sorted by address. This is a capture
-    /// recipe, not observed bytes, an active-PM lock, or a complete configuration
-    /// recovery backup. Planning still validates the captured PM and all guards.
+    /// PM slots. Pages are unique and sorted by address. These are addresses to
+    /// capture, not observed bytes, and they are not a complete configuration
+    /// backup. Planning still validates the captured PM and all guards.
     ///
     /// # Errors
     ///
@@ -223,25 +225,25 @@ impl TerminalPlan {
         self.slot
     }
 
-    /// Gateway route represented by the captured before-images.
+    /// Gateway route in the captured before-images.
     #[must_use]
     pub const fn route(&self) -> TerminalGatewayRoute {
         self.route
     }
 
-    /// Gateway route represented by replacement pages, not current radio state.
+    /// Gateway route in this plan's replacement pages.
     #[must_use]
     pub const fn target_route(&self) -> TerminalGatewayRoute {
         self.target_route
     }
 
-    /// Gateway value represented by this plan's expected pages, not current state.
+    /// Gateway value in this plan's expected pages.
     #[must_use]
     pub const fn before(&self) -> DvGatewayMode {
         self.before
     }
 
-    /// Requested Gateway selection, not proof that a write or transition occurred.
+    /// Gateway selection this plan requests.
     #[must_use]
     pub const fn target(&self) -> TerminalTarget {
         self.target
@@ -257,16 +259,16 @@ impl TerminalPlan {
     ///
     /// Reverse expected pages are synthetic copies of the forward destination,
     /// not newly observed bytes. Every reverse page must match a fresh whole-page
-    /// read before any write. A conflict never authorizes rebasing, partial merge,
-    /// retry, or unconditional rollback. Retain the originals and recovery journal
-    /// independently if either direction is interrupted.
+    /// read before any write; a conflict causes no rebase, partial merge, retry,
+    /// or unconditional rollback. Retain the originals and recovery journal
+    /// separately if either direction is interrupted.
     ///
     /// Reversal restores every original byte, including the original Gateway
     /// route and an original subtype of Repeater while Gateway was Off. This
     /// differs from direct [`TerminalTarget::Off`], which preserves its input
     /// route and subtype.
-    /// Guards remain present in both directions; deriving a reverse plan sends
-    /// no commands and grants no active-mode MCP or restoration authority.
+    /// Guards remain present in both directions. Deriving a reverse plan is
+    /// pure: it sends no commands and performs no restoration.
     ///
     /// # Errors
     ///

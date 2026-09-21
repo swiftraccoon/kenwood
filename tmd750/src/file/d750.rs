@@ -6,9 +6,8 @@
 //! All other header bytes and every stored image byte are preserved exactly.
 //! Short files retain only their actual bytes; no erased tail is invented.
 //!
-//! These are container checks, not firmware, radio-type, or settings validation.
-//! Parsing and serialization neither normalize the image nor establish radio
-//! read coverage, application acceptance, or permission to write any bytes.
+//! Scope: container structure only. Firmware layout, radio-type compatibility
+//! and settings values are neither validated nor normalized.
 
 use crate::error::FileError;
 use crate::types::{IMAGE_LENGTH, RadioType};
@@ -58,7 +57,6 @@ impl FileLayout {
 /// and zero reserved byte at offset 32. The short signature occupies seven
 /// bytes; its eighth byte remains opaque. Version, radio-type, comment, and
 /// other metadata bytes are retained without interpreting their semantics.
-/// Header validation does not qualify a firmware layout or a particular radio.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigHeader {
     raw: [u8; HEADER_SIZE],
@@ -75,14 +73,12 @@ impl ConfigHeader {
     /// The application marker describes the reproduced file format, not this
     /// library's version or the radio's firmware.
     ///
-    /// No component meanings are inferred. For example, `K,2,1` is stored as
-    /// the three ASCII bytes `K21`. Construction neither qualifies a memory
-    /// schema for that radio nor proves that the official application can open
-    /// the eventual file. It does not alter or validate an image, establish read
-    /// coverage, or perform the official writer's image-byte normalization.
-    /// A radio-backed export still requires complete intended-region coverage
-    /// and a matching, validated template for bytes the radio read omits.
-    /// Filling every unread byte with `0xFF` is not an established substitute.
+    /// Radio-type components are stored without their separators, so `K,2,1`
+    /// becomes the three ASCII bytes `K21`; no component meaning is inferred.
+    /// Construction does not touch, validate, or normalize an image. A
+    /// radio-backed export additionally needs complete coverage of the intended
+    /// regions and a validated template for bytes the radio read omits; `0xFF`
+    /// fill for unread bytes is not a validated substitute.
     ///
     /// # Errors
     ///
@@ -189,9 +185,8 @@ pub struct RadioConfig {
 impl RadioConfig {
     /// Combine a validated header with its complete, exact-length image payload.
     ///
-    /// This performs no settings interpretation, radio-type compatibility
-    /// check, gap filling, or image normalization. The caller must establish
-    /// the provenance and suitability of every supplied byte.
+    /// The payload is stored verbatim: no gap filling or image normalization
+    /// occurs, so the caller owns the provenance of every supplied byte.
     ///
     /// # Errors
     ///
@@ -232,9 +227,9 @@ impl RadioConfig {
 
     /// Mutably borrow the fixed-length stored payload without changing coverage.
     ///
-    /// Mutation does not validate setting values or qualify radio writes.
-    /// Header bytes and payload length remain immutable, and serialization
-    /// retains every supplied payload byte without normalization.
+    /// Setting values are not validated. Header bytes and payload length remain
+    /// immutable, and serialization retains every supplied payload byte without
+    /// normalization.
     #[must_use]
     pub fn image_bytes_mut(&mut self) -> &mut [u8] {
         &mut self.image
@@ -264,8 +259,6 @@ impl RadioConfig {
 /// The header signature selects the required payload length; total length
 /// alone is not a format discriminator. All opaque header metadata and image
 /// bytes are retained. No bytes beyond a short file's coverage are invented.
-/// Settings contents, radio-type compatibility, and firmware layout are not
-/// validated or normalized.
 ///
 /// # Errors
 ///

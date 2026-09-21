@@ -1,7 +1,8 @@
-//! Typed, single-field PM1 updates with conservative evidence sequencing.
+//! Typed, single-field PM1 updates with fail-closed event sequencing.
 //!
-//! This module performs no I/O. Session and journal events are caller
-//! attestations, not independent proof of durable storage or physical continuity.
+//! This module performs no I/O. Each event carries facts the caller reports;
+//! this module checks their order and compares page bytes, but cannot confirm
+//! that a connection was fresh or that a journal record reached disk.
 
 use std::num::NonZeroU64;
 
@@ -17,9 +18,8 @@ const PAGE_ADDRESS: u32 = 323_584;
 
 /// A nonempty PM1 name containing at most sixteen printable ASCII bytes.
 ///
-/// Spaces are preserved exactly, including leading and trailing spaces. This
-/// intentionally bounded character set does not qualify arbitrary Unicode
-/// display rendering or other text settings.
+/// Spaces are preserved exactly, including leading and trailing spaces. The
+/// accepted bytes are ASCII graphic characters and the space.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pm1Name(String);
 
@@ -49,16 +49,16 @@ impl Pm1Name {
     }
 }
 
-/// Conservative outcome represented by the accepted caller evidence.
+/// Update status derived from the events recorded so far.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pm1NameUpdateStatus {
-    /// No durable intent has been accepted; this model has not permitted a write.
+    /// No write intent has been recorded.
     NotWritten,
-    /// An intent was accepted, but independent-session verification and complete
-    /// finalization have not both been attested. The radio may have changed.
+    /// A write intent was recorded, and independent-session verification and
+    /// finalization have not both completed, so the page may have changed.
     PossiblyChanged,
     /// The desired full page matched immediately and in a distinct MCP session,
-    /// and both session lifecycles were finalized. This is not power-cycle proof.
+    /// and both session lifecycles were finalized.
     VerifiedAcrossSessions,
 }
 
@@ -71,14 +71,14 @@ pub enum Pm1NameUpdateSession {
     Verify,
 }
 
-/// Caller-attested evidence, accepted only in the documented two-session order.
+/// Events for the two-session update, accepted only in order.
 ///
-/// IDs detect accidental reuse within this instance. They cannot establish
-/// fresh connections, durable storage, or an unchanged physical unit.
+/// Each `id` is checked for reuse within this instance and carries no other
+/// meaning.
 #[derive(Debug)]
 pub enum Pm1NameUpdateEvent<'a> {
-    /// Attest a new, independently identified MCP connection and completed reads
-    /// of the memory-format byte and entire target page.
+    /// Report a newly opened MCP connection and its completed reads of the
+    /// memory-format byte and the entire target page.
     FreshSession {
         /// Connection identifier, distinct from every previous session ID.
         id: NonZeroU64,
@@ -89,26 +89,25 @@ pub enum Pm1NameUpdateEvent<'a> {
         /// Complete acknowledged page at [`Pm1NameUpdate::page`].
         whole_page: &'a [u8],
     },
-    /// Attest separately obtained operator authorization and a private journal
-    /// containing the identity, exact original and desired pages, and this
-    /// intent, successfully synchronized to durable storage before any W.
+    /// Report that a private journal record holding the identity, the exact
+    /// original and desired pages, and this intent has been written and
+    /// synchronized to durable storage before the `W` frame is sent.
     ///
-    /// Acceptance records a possible change even if dispatch subsequently fails
-    /// or never occurs. Recording this event does not itself authorize hardware.
+    /// Accepting this event sets [`Pm1NameUpdateStatus::PossiblyChanged`],
+    /// which no later error clears, even if the write is never dispatched.
     DurableWriteIntent {
-        /// Identifier of the sole durable intent record, not a session ID.
+        /// Identifier of the sole journal write-intent record, not a session ID.
         id: NonZeroU64,
     },
-    /// Attest a complete, acknowledged immediate full-page read after the write.
+    /// Report a complete, acknowledged full-page read taken immediately after
+    /// the write.
     ImmediateReadback {
         /// Newly read page, including every unrelated byte.
         whole_page: &'a [u8],
     },
-    /// Attest E/ACK, original close/drop, bounded fresh CAT identity matching,
-    /// fresh close, complete captures, and durable session evidence.
-    ///
-    /// The caller must establish each fact before recording this event. Neither
-    /// a matching tuple nor USB re-enumeration proves a full-radio power cycle.
+    /// Report E/ACK, original close and drop, a bounded fresh CAT exchange
+    /// matching the entire identity, fresh close, complete captures, and a
+    /// synchronized record of this session.
     SessionFinalized {
         /// Identifier supplied in the current session's `FreshSession` event.
         id: NonZeroU64,
@@ -129,16 +128,15 @@ enum Phase {
 
 /// Immutable page preparation and fail-closed sequencing for a PM1 name update.
 ///
-/// The sole scope is global PM1 on TM-D750 / firmware 1.02 / type `K,2,1`.
-/// The generated descriptor must retain its pinned shape. This API does not
-/// widen the generic schema-target gate, select other addresses or fields, or
-/// establish persistence across a power cycle.
+/// Scope is fixed: global PM1 on TM-D750 / firmware 1.02 / type `K,2,1`, and
+/// the generated descriptor must retain its pinned shape. No other address or
+/// field can be selected.
 ///
-/// The sequence is: fresh original-page comparison, durable intent, immediate
+/// The sequence is: fresh original-page comparison, journal write-intent record, immediate
 /// desired-page readback, finalized session; then a distinct fresh session with
 /// a desired-page comparison and finalized cleanup. An error permanently halts
-/// the transaction while preserving its conservative status. It never rebases
-/// a changed page or automatically writes a stale original page back.
+/// the transaction and keeps its current status. A changed page is never
+/// rebased and a stale original page is never written back automatically.
 #[derive(Debug)]
 pub struct Pm1NameUpdate {
     identity: Identity,
@@ -169,8 +167,7 @@ impl Pm1NameUpdate {
     ///
     /// `baseline` must contain the complete observed canonical page from a
     /// validated capture, not synthesized gap bytes. `expected_current` must
-    /// match its exact NUL-padded PM1 field. The caller separately establishes
-    /// authorization, capture provenance, and freshness before dispatch.
+    /// match its exact NUL-padded PM1 field.
     ///
     /// # Errors
     ///
@@ -251,7 +248,7 @@ impl Pm1NameUpdate {
         &self.identity
     }
 
-    /// Exact captured page for compare-before-write and recovery evidence.
+    /// Exact captured page, for compare-before-write and the recovery record.
     #[must_use]
     pub const fn original_page(&self) -> &[u8; PAGE_SIZE] {
         &self.original
@@ -275,13 +272,14 @@ impl Pm1NameUpdate {
         &self.desired_name
     }
 
-    /// Conservative evidence status, not an independently measured radio state.
+    /// Update status derived from the events recorded so far.
     #[must_use]
     pub const fn status(&self) -> Pm1NameUpdateStatus {
         self.status
     }
 
-    /// Describe the next session only while awaiting fresh-session evidence.
+    /// The session expected next, available only while awaiting a
+    /// [`Pm1NameUpdateEvent::FreshSession`].
     ///
     /// # Errors
     ///
@@ -295,10 +293,11 @@ impl Pm1NameUpdate {
         }
     }
 
-    /// Validate the exact next caller-attested evidence and advance the model.
+    /// Validate the exact next event and advance the sequence.
     ///
-    /// A durable intent marks the update possibly changed before dispatch. Any
-    /// error permanently halts further acceptance without clearing that status.
+    /// An accepted [`Pm1NameUpdateEvent::DurableWriteIntent`] sets status to
+    /// [`Pm1NameUpdateStatus::PossiblyChanged`] before dispatch could occur.
+    /// Any error permanently halts further acceptance without clearing it.
     ///
     /// # Errors
     ///
@@ -312,12 +311,11 @@ impl Pm1NameUpdate {
         result
     }
 
-    /// Permanently halt after uncertain framing or incomplete evidence.
+    /// Permanently halt the transaction.
     ///
-    /// This performs no cleanup, rollback, or I/O cancellation. Once an intent
-    /// has been accepted, `PossiblyChanged` survives halt. Completed verification
-    /// remains completed; callers must not abandon known-safe cleanup merely
-    /// because an interrupt is pending.
+    /// Performs no cleanup, rollback, or I/O cancellation. A previously
+    /// accepted intent keeps [`Pm1NameUpdateStatus::PossiblyChanged`]; a
+    /// completed update stays [`Pm1NameUpdateStatus::VerifiedAcrossSessions`].
     pub const fn halt(&mut self) {
         if !matches!(self.phase, Phase::Complete) {
             self.phase = Phase::Halted;
@@ -464,7 +462,7 @@ fn encode_name(
     Ok(bytes)
 }
 
-/// A rejected name, preparation precondition, or evidence transition.
+/// A rejected name, preparation precondition, or event transition.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum Pm1NameUpdateError {
@@ -486,7 +484,7 @@ pub enum Pm1NameUpdateError {
     /// The supplied expected name does not exactly match the captured field.
     #[error("expected PM1 name does not match the captured page")]
     CurrentNameMismatch,
-    /// Current and desired names are identical; no write is needed or permitted.
+    /// Current and desired names are identical, so no write is needed.
     #[error("PM1 already has the requested name; no change is needed")]
     NoChange,
     /// A fresh session supplied an unsupported memory-format byte.
@@ -496,10 +494,10 @@ pub enum Pm1NameUpdateError {
         actual: u8,
     },
     /// At least one byte differs from the exact page required at this stage.
-    #[error("PM1 whole-page comparison failed; rebasing and stale rollback are forbidden")]
+    #[error("PM1 whole-page comparison failed")]
     PageMismatch,
     /// The event is not the exact next step of the two-session sequence.
-    #[error("PM1 name-update evidence is out of order")]
+    #[error("PM1 name-update events are out of order")]
     UnexpectedEvent,
     /// A supposed fresh session reused an earlier connection identifier.
     #[error("PM1 name-update session ID was reused")]
@@ -507,8 +505,8 @@ pub enum Pm1NameUpdateError {
     /// Finalization does not identify the current session.
     #[error("PM1 name-update finalization does not match the current session")]
     SessionMismatch,
-    /// The completed or permanently halted instance accepts no more evidence.
-    #[error("PM1 name update is terminal and accepts no further evidence")]
+    /// The completed or permanently halted instance accepts no more events.
+    #[error("PM1 name update is terminal and accepts no further events")]
     TerminalState,
 }
 

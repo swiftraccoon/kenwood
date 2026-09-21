@@ -1,7 +1,8 @@
-//! Bounded PM-off MY1 storage updates with explicit, fail-closed evidence.
+//! Bounded PM-off MY1 storage updates with fail-closed event sequencing.
 //!
-//! This module performs no I/O. Events attest observations and durable storage;
-//! they cannot independently prove connection freshness or physical continuity.
+//! This module performs no I/O. Each event carries facts the caller reports;
+//! this module checks their order and compares page bytes, but cannot confirm
+//! that a connection was fresh or that a journal record reached disk.
 
 use std::num::NonZeroU64;
 
@@ -20,8 +21,7 @@ const CONTROL_ADDRESS: u32 = 323_584;
 /// Exact MY1 storage text: one to eight uppercase ASCII letters, digits, or spaces.
 ///
 /// At least one letter or digit is required. Leading, trailing, and interior
-/// spaces are preserved. This validates storage syntax only, not callsign
-/// ownership, licensing, reflector authentication, or Terminal acceptance.
+/// spaces are preserved. This validates storage syntax only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct My1Callsign(String);
 
@@ -53,15 +53,14 @@ impl My1Callsign {
     }
 }
 
-/// Conservative result of accepted evidence, not a current-state observation.
+/// Update status derived from the events recorded so far.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum My1CallsignUpdateStatus {
-    /// No intent was accepted; this model has not permitted a write.
+    /// No write intent has been recorded.
     NotWritten,
-    /// The sole intent was accepted, but complete independent verification is owed.
+    /// The sole intent was recorded and independent verification is still owed.
     PossiblyChanged,
     /// The desired page matched in both sessions and both lifecycles finalized.
-    /// This is not an independently observed power cycle or radio display.
     VerifiedAcrossSessions,
 }
 
@@ -74,13 +73,14 @@ pub enum My1CallsignUpdateSession {
     Verify,
 }
 
-/// Caller-attested evidence for one exact MY1 update, with no unchecked fresh path.
+/// Events for one exact MY1 update, each checked against its exact phase.
 ///
-/// IDs prevent accidental reuse inside this instance; they do not prove new
-/// connections or persistence. Every event is checked against its exact phase.
+/// Each `id` is checked for reuse within this instance and carries no other
+/// meaning.
 #[derive(Debug)]
 pub enum My1CallsignUpdateEvent<'a> {
-    /// Attest a freshly identified MCP session and both complete acknowledged pages.
+    /// Report a newly identified MCP session and both complete acknowledged
+    /// pages.
     FreshSession {
         /// Unique connection identifier, different from every prior session.
         id: NonZeroU64,
@@ -95,23 +95,25 @@ pub enum My1CallsignUpdateEvent<'a> {
         /// Complete target page expected at this phase, including all other fields.
         whole_page: &'a [u8],
     },
-    /// Attest separately obtained authorization and a private, synchronized
-    /// journal containing exact identity, original/desired/control pages, and
-    /// the sole intent before dispatch. This event does not authorize hardware.
-    /// Acceptance marks possible change even if dispatch never occurs.
+    /// Report that a private journal record holding the exact identity, the
+    /// original, desired and control pages, and this sole intent has been
+    /// written and synchronized to durable storage before the `W` frame.
+    ///
+    /// Accepting this event sets [`My1CallsignUpdateStatus::PossiblyChanged`]
+    /// permanently, even if the write is never dispatched.
     DurableWriteIntent {
         /// Identifier of the single synchronized intent, not the connection ID.
         id: NonZeroU64,
     },
-    /// Attest a complete acknowledged target-page read immediately after the write.
+    /// Report a complete acknowledged target-page read taken immediately after
+    /// the write.
     ImmediateReadback {
         /// Actual readback, including every byte outside the MY1 text field.
         whole_page: &'a [u8],
     },
-    /// Attest E/ACK, original close/drop, a new CAT connection with the supplied
-    /// exact identity and Gateway Off, fresh close, complete captures, and
-    /// synchronized session evidence. Establish every fact before recording.
-    /// Neither a matching tuple nor USB re-enumeration proves a power cycle.
+    /// Report E/ACK, original close and drop, a new CAT connection carrying the
+    /// supplied exact identity and Gateway Off, fresh close, complete captures,
+    /// and a synchronized record of this session.
     SessionFinalized {
         /// Identifier accepted for the current fresh MCP session.
         id: NonZeroU64,
@@ -136,14 +138,13 @@ enum Phase {
 
 /// An immutable, compare-before-write MY1 update with two-session verification.
 ///
-/// Only TM-D750 / firmware 1.02 / type `K,2,1`, PM Off, stored and freshly
-/// observed Gateway Off, and MY1 selected are admitted. The target and control
-/// pages remain immutable except for MY1's eight bytes in the desired image.
-/// This API neither changes the generic schema gate nor configures Terminal.
+/// Scope is fixed: TM-D750 / firmware 1.02 / type `K,2,1`, PM Off, stored and
+/// freshly observed Gateway Off, and MY1 selected. The target and control pages
+/// remain immutable except for MY1's eight bytes in the desired image.
 ///
-/// A normal update leaves the requested text installed after verification.
-/// It does not automatically restore, retry, merge, rebase, or repair a page.
-/// Failure permanently halts further events while preserving possible change.
+/// A completed update leaves the requested text installed. There is no
+/// automatic restore, retry, merge, rebase, or page repair; a failure
+/// permanently halts further events and keeps the current status.
 #[derive(Debug)]
 pub struct My1CallsignUpdate {
     identity: Identity,
@@ -183,8 +184,7 @@ impl My1CallsignUpdate {
     ///
     /// `expected_current: None` requires exactly eight NUL bytes, not spaces or
     /// erased bytes. A supplied current value requires its exact NUL-padded
-    /// encoding. Desired text is always nonempty; a no-op is rejected. The
-    /// caller separately establishes capture provenance and write permission.
+    /// encoding. Desired text is always nonempty; a no-op is rejected.
     ///
     /// # Errors
     ///
@@ -284,7 +284,7 @@ impl My1CallsignUpdate {
         self.control_spec
     }
 
-    /// Exact captured target page, retained as evidence, not an automatic rollback.
+    /// Exact captured target page, retained for the journal record.
     #[must_use]
     pub const fn original_page(&self) -> &[u8; PAGE_SIZE] {
         &self.original
@@ -314,13 +314,14 @@ impl My1CallsignUpdate {
         &self.requested
     }
 
-    /// Conservative accepted-evidence status, not an independent radio measurement.
+    /// Update status derived from the events recorded so far.
     #[must_use]
     pub const fn status(&self) -> My1CallsignUpdateStatus {
         self.status
     }
 
-    /// Return the next session only while awaiting fresh-session evidence.
+    /// The session expected next, available only while awaiting a
+    /// [`My1CallsignUpdateEvent::FreshSession`].
     ///
     /// # Errors
     ///
@@ -334,7 +335,10 @@ impl My1CallsignUpdate {
         }
     }
 
-    /// Accept only the exact next evidence and preserve risk on every failure.
+    /// Validate the exact next event and advance the sequence.
+    ///
+    /// Any error permanently halts further acceptance and keeps the current
+    /// status, including [`My1CallsignUpdateStatus::PossiblyChanged`].
     ///
     /// # Errors
     ///
@@ -351,8 +355,12 @@ impl My1CallsignUpdate {
         result
     }
 
-    /// Permanently halt without cleanup, automatic rollback, or status erasure.
-    /// A completed verification remains complete after subsequent misuse.
+    /// Permanently halt the transaction.
+    ///
+    /// Performs no cleanup, rollback, or I/O cancellation. A previously
+    /// accepted intent keeps [`My1CallsignUpdateStatus::PossiblyChanged`]; a
+    /// completed update stays
+    /// [`My1CallsignUpdateStatus::VerifiedAcrossSessions`].
     pub const fn halt(&mut self) {
         if !matches!(self.phase, Phase::Complete) {
             self.phase = Phase::Halted;
@@ -662,7 +670,7 @@ fn encode_callsign(
     Ok(bytes)
 }
 
-/// Rejected storage syntax, immutable preparation, or evidence sequence.
+/// Rejected storage syntax, preparation precondition, or event transition.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum My1CallsignUpdateError {
@@ -674,7 +682,7 @@ pub enum My1CallsignUpdateError {
     /// A generated field or canonical page no longer matches the fixed scope.
     #[error("generated MY1 or guard descriptor is outside the bounded update scope")]
     UnsupportedDescriptor,
-    /// Complete identity differs from the qualified target or captured baseline.
+    /// Complete identity differs from the fixed target or captured baseline.
     #[error("MY1 update requires the exact target and captured baseline identity")]
     IdentityMismatch,
     /// The target page is incomplete or oversized.
@@ -692,10 +700,10 @@ pub enum My1CallsignUpdateError {
     /// Captured current text does not exactly match the expected NUL-padded field.
     #[error("expected MY1 callsign does not exactly match the captured page")]
     CurrentCallsignMismatch,
-    /// Current and desired values are identical; no write is permitted.
+    /// Current and desired values are identical, so no write is needed.
     #[error("MY1 already contains the requested callsign; no change is needed")]
     NoChange,
-    /// Only PM Off is admitted; other slots are never selected by this update.
+    /// Only PM Off is accepted; this update never selects another slot.
     #[error("MY1 update requires PM Off, got stored selector {actual}")]
     PmSelection {
         /// Observed PM selector.
@@ -720,13 +728,13 @@ pub enum My1CallsignUpdateError {
         actual: u8,
     },
     /// The complete target page differs from the exact expected image.
-    #[error("MY1 whole-page comparison failed; rebase and stale rollback are forbidden")]
+    #[error("MY1 whole-page comparison failed")]
     PageMismatch,
     /// Any byte of the immutable control page differs.
     #[error("MY1 immutable control-page comparison failed")]
     ControlPageMismatch,
-    /// An event arrived outside its permitted evidence phase.
-    #[error("MY1 update evidence is out of order")]
+    /// An event arrived outside its permitted phase.
+    #[error("MY1 update events are out of order")]
     UnexpectedEvent,
     /// A claimed fresh session reused a prior connection identifier.
     #[error("MY1 update session ID was reused")]
@@ -734,8 +742,8 @@ pub enum My1CallsignUpdateError {
     /// Finalization does not name the current session.
     #[error("MY1 update finalization does not match the current session")]
     SessionMismatch,
-    /// A halted or completed transaction accepts no further evidence.
-    #[error("MY1 update is terminal and accepts no further evidence")]
+    /// A halted or completed transaction accepts no further events.
+    #[error("MY1 update is terminal and accepts no further events")]
     TerminalState,
 }
 

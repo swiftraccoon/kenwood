@@ -1,8 +1,8 @@
 //! Offline interpretation of the settings relevant to Reflector Terminal mode.
 //!
-//! This adapter never opens a connection, creates a patch, or activates a mode.
-//! An empty finding list only describes the supplied bytes; it does not establish
-//! radio readiness, field-write compatibility, or an operator-approved identity.
+//! This adapter performs no I/O and produces no patch. Every value and finding
+//! describes the supplied image bytes; the radio's current state is never
+//! consulted.
 
 use std::fmt;
 
@@ -84,7 +84,7 @@ impl fmt::Display for TerminalGatewayRoute {
     }
 }
 
-/// Captured Menu 650 DV Gateway mode, not a live mode observation.
+/// Captured Menu 650 DV Gateway mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalGatewayMode {
     /// DV Gateway was stored as Off.
@@ -141,17 +141,12 @@ impl fmt::Display for TerminalMyCallsignIndex {
     }
 }
 
-/// A historical setting needing attention in an offline comparison.
-///
-/// These are not activation instructions. Absence of findings does not qualify
-/// live writes, a network connection, a callsign, or the current radio state.
+/// A stored setting that blocks Reflector Terminal use or warrants review.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalFinding {
     /// The selected MY entry is empty or contains only spaces.
     MissingMyCallsign,
     /// The MY entry lacks the manual's recommended eighth-position letter.
-    ///
-    /// This is an operator-review warning, not a firmware acceptance test.
     MyCallsignSuffixNeedsReview,
     /// The stored gateway route differs from the requested USB connector.
     RouteMismatch,
@@ -170,7 +165,7 @@ impl fmt::Display for TerminalFinding {
         formatter.write_str(match self {
             Self::MissingMyCallsign => "selected Menu 651 MY callsign is empty",
             Self::MyCallsignSuffixNeedsReview => {
-                "MY callsign suffix needs operator review; no Terminal acceptance claim"
+                "Menu 651 MY callsign suffix needs operator review"
             }
             Self::RouteMismatch => "Menu 986 differs from the requested USB connector",
             Self::MassStorage => "Menu 980 selects Mass Storage, not serial communication",
@@ -186,9 +181,9 @@ impl fmt::Display for TerminalFinding {
 /// Typed interpretation of historical Reflector Terminal settings.
 ///
 /// The caller supplies image coverage and firmware provenance. For sparse
-/// captures, prove coverage of every [`Self::required_fields`] descriptor before
-/// constructing a dense image; synthetic fill is not captured evidence.
-/// Neither constructor establishes live readiness or enables radio writes.
+/// captures, cover every [`Self::required_fields`] descriptor with actual
+/// captured bytes before constructing a dense image; a filled gap decodes as
+/// though it had been read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReflectorTerminalPreflight {
     /// Caller-supplied firmware identity, retained without rewriting.
@@ -197,7 +192,7 @@ pub struct ReflectorTerminalPreflight {
     pub qualification: TextLayoutQualification,
     /// Requested zero-based PM slot: 0 is PM Off; 1–5 are PM 1–5.
     pub slot: SlotIndex,
-    /// Historical active PM selection read from the image, not the current radio.
+    /// Active PM selection read from the image.
     pub captured_active_slot: SlotIndex,
     /// Requested connector used only for the offline comparison.
     pub desired_route: TerminalUsbRoute,
@@ -207,21 +202,19 @@ pub struct ReflectorTerminalPreflight {
     pub usb_function: TerminalUsbFunction,
     /// Captured Menu 986 value in the requested PM slot.
     pub gateway_route: TerminalGatewayRoute,
-    /// Captured Menu 650 value, not a live mode query.
+    /// Captured Menu 650 value.
     pub gateway_mode: TerminalGatewayMode,
     /// Captured Menu 670 value in the requested PM slot.
     pub terminal_mode: TerminalMode,
     /// Index within the requested PM slot's six MY entries, not a PM slot index.
     pub selected_my_callsign: TerminalMyCallsignIndex,
     /// Selected MY text, preserving spaces and removing trailing NUL padding only.
-    ///
-    /// Safe spelling is not proof of callsign ownership or firmware acceptance.
     pub my_callsign: String,
     /// Captured Menu 671 text; no route value is substituted automatically.
     pub rpt1: String,
     /// Captured Menu 672 text; no route value is substituted automatically.
     pub rpt2: String,
-    /// Stable-order observations, never a radio-readiness verdict.
+    /// Findings in the fixed order of the checks that produce them.
     pub findings: Vec<TerminalFinding>,
 }
 
@@ -248,10 +241,10 @@ impl ReflectorTerminalPreflight {
         Ok(result)
     }
 
-    /// Interpret settings only when firmware provenance matches a registry label.
+    /// Interpret settings, requiring `firmware` to match a registry target label.
     ///
-    /// A match is not hardware qualification. No status returned by this method
-    /// means a connected radio is ready to activate.
+    /// Accepted labels are [`super::MCP_D750_SCHEMA_FIRMWARE_IDENTITIES`]; the
+    /// result carries [`TextLayoutQualification::RegistryTargetMatched`].
     ///
     /// # Errors
     ///
@@ -277,10 +270,10 @@ impl ReflectorTerminalPreflight {
         )
     }
 
-    /// Explicitly interpret historical bytes without firmware-layout qualification.
+    /// Interpret the image without the firmware check applied by [`Self::read`].
     ///
-    /// This status is retained even if the supplied firmware label happens to
-    /// match the registry. The radio write gate is independent and unchanged.
+    /// The result carries [`TextLayoutQualification::UnqualifiedInterpretation`]
+    /// even when the supplied label matches a registry target.
     ///
     /// # Errors
     ///
@@ -396,10 +389,10 @@ impl ReflectorTerminalPreflight {
     }
 }
 
-/// Failure to interpret historical Terminal settings safely.
+/// Failure to interpret historical Terminal settings.
 ///
-/// Display uses menu labels; lower-level schema details remain available through
-/// the error source. No error instructs a radio operation or enables live writes.
+/// [`fmt::Display`] uses menu labels; the underlying schema error stays
+/// available through [`std::error::Error::source`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum TerminalPreflightError {

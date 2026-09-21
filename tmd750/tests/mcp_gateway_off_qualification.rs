@@ -1,4 +1,4 @@
-//! Fixed Gateway-Off probe admission, wire scope, cancellation, and retirement.
+//! Fixed Gateway-Off probe guards, wire scope, cancellation, and retirement.
 
 use kenwood_schema as _;
 use mcp_d75_extract as _;

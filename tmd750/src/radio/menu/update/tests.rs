@@ -1,4 +1,4 @@
-//! Pure assignment, whole-page binding, and active-state admission tests.
+//! Pure assignment, whole-page binding, and active-state guard tests.
 
 use super::*;
 use crate::types::{FirmwareIdentity, RadioType};
