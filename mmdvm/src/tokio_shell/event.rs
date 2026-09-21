@@ -52,7 +52,7 @@ pub enum Event {
     SerialData(Vec<u8>),
     /// Transparent data from the modem.
     TransparentData(Vec<u8>),
-    /// The modem sent a mode we don't fully model yet
+    /// The modem sent a mode without a typed event
     /// (DMR/YSF/P25/NXDN/POCSAG/FM), but the raw frame was accepted
     /// with the payload preserved verbatim.
     UnhandledResponse {

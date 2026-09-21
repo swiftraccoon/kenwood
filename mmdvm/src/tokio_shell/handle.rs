@@ -250,8 +250,8 @@ impl<T: Transport + 'static> AsyncModem<T> {
         rx.await.map_err(|_| ShellError::SessionClosed)?
     }
 
-    /// Send a raw frame: an escape hatch for protocols we don't model
-    /// yet.
+    /// Send a raw frame: the escape hatch for protocols without a typed
+    /// command.
     ///
     /// # Errors
     ///

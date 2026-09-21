@@ -34,7 +34,7 @@
 //!     }
 //! };
 //! let _stream = runtime.into_modem().shutdown().await?;
-//! // Restore a radio mode only through that model's qualified lifecycle.
+//! // The stream is free again; mode restoration belongs to the model crate.
 //! # Ok(())
 //! # }
 //! ```
@@ -507,7 +507,7 @@ pub enum DstarEvent {
 ///
 /// Dropping this value signals its modem task to stop but does not await
 /// completion. Use [`Self::into_modem`] and [`AsyncModem::shutdown`] when the
-/// underlying stream must be recovered before another owner can proceed.
+/// underlying stream must be recovered before another consumer takes it.
 pub struct DstarModem<S: Transport + 'static> {
     /// The underlying MMDVM async modem.
     modem: AsyncModem<S>,
@@ -570,9 +570,9 @@ impl<S: Transport + 'static> DstarModem<S> {
     /// # Cancellation
     ///
     /// Consumes the modem. Cancelling this future drops its handle; submitted
-    /// commands may already have reached the device. Await completion to retain
-    /// explicit ownership on failure, and never assume cancellation rolled back
-    /// the modem configuration.
+    /// commands may already have reached the device. Await completion to get
+    /// the modem handle back on failure; cancellation rolls back no part of the
+    /// modem configuration.
     pub async fn initialize(
         mut modem: AsyncModem<S>,
         config: DstarModemConfig,
@@ -602,8 +602,8 @@ impl<S: Transport + 'static> DstarModem<S> {
     /// Return the running modem without writing, shutting down, or reopening.
     ///
     /// Use [`AsyncModem::shutdown`] to stop the modem task and reclaim its
-    /// stream, then apply the caller's model-specific policy. Queued frames
-    /// may be dropped; clean shutdown is not proof of completed transmission.
+    /// stream, then apply the caller's model-specific policy. Shutdown may
+    /// drop queued transmit frames.
     #[must_use]
     pub fn into_modem(self) -> AsyncModem<S> {
         self.modem
@@ -685,11 +685,10 @@ impl<S: Transport + 'static> DstarModem<S> {
                 let followup_start = self.pending_events.len();
                 self.handle_voice_start(header);
                 if preempted {
-                    // A second header is an observed stream boundary, not
-                    // permission to silently replace the active stream.
-                    // `handle_voice_start` has already reset the old stream
-                    // and queued the new stream's secondary events; insert
-                    // its VoiceStart before those secondaries.
+                    // A second header ends the active stream rather than
+                    // silently replacing it. `handle_voice_start` has already
+                    // reset the old stream and queued the new stream's
+                    // secondary events; insert its VoiceStart before those.
                     self.pending_events
                         .insert(followup_start, DstarEvent::VoiceStart(header));
                     Ok(Some(DstarEvent::VoiceLost))
@@ -742,11 +741,9 @@ impl<S: Transport + 'static> DstarModem<S> {
                 }
                 Ok(Some(DstarEvent::EventsDropped { count }))
             }
-            // Queued TX frames were discarded because the modem
-            // session is ending; the operator's last over was
-            // truncated on air even though every send reported
-            // success. The terminal event follows immediately;
-            // this is the audit trail for what it took with it.
+            // The modem session discarded queued TX frames, so a transmission
+            // whose sends all reported success was truncated on air. A
+            // terminal event always follows this one.
             event @ Event::TxDropped { frames } => {
                 tracing::warn!(
                     target: "mmdvm::dstar",
@@ -770,15 +767,9 @@ impl<S: Transport + 'static> DstarModem<S> {
                     detail,
                 })))
             }
-            // Status events are 4 Hz noise, but the TX flag inside
-            // them is the single most useful diagnostic for the
-            // network → radio voice path: did the radio actually key
-            // the transmitter after we sent it a header + voice
-            // frames? We swallow the steady stream as before, but
-            // surface a `StatusUpdate` event whenever the TX flag
-            // *changes* state. That keeps the channel from flooding
-            // while still telling the operator (and any UI) the
-            // exact moment the radio enters / leaves TX.
+            // Periodic status arrives at 4 Hz. Emit a `StatusUpdate` only on a
+            // TX-flag edge, so the event channel is not flooded while callers
+            // still see the exact moment the radio keys or unkeys.
             Event::Status(status) => {
                 let event = self.handle_status(status);
                 Ok(event)
@@ -1298,17 +1289,18 @@ fn terminal_event_error(event: &Event) -> Option<DstarError> {
     }
 }
 
-/// Log a non-fatal MMDVM event (status update, init handshake
-/// artefact, debug frame, etc.) at the appropriate tracing level so
-/// consumers that dump trace output can see what's happening.
+/// Log a non-fatal MMDVM event at its matching tracing level.
+///
+/// Covers status updates, initialization handshake artefacts, debug frames and
+/// unhandled responses. This helper only logs; the caller decides which event,
+/// if any, reaches the public stream.
 fn log_noise_event(event: &Event) {
     match event {
         Event::Status(status) => {
-            // Buffer-slot gating happens inside mmdvm's TxQueue; no
-            // consumer-side action needed. Log all status fields at
-            // trace so operators can audit modem state over time,
-            // particularly the `dstar_space` FIFO depth and the
-            // overflow / lockout / CD bits that signal trouble.
+            // Buffer-slot gating happens inside mmdvm's TxQueue, so no
+            // consumer-side action is needed. Every status field is logged at
+            // trace level, including the `dstar_space` FIFO depth and the
+            // overflow, lockout and CD bits.
             tracing::trace!(
                 target: "mmdvm::dstar",
                 mode = ?status.mode,

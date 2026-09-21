@@ -46,28 +46,29 @@ async fn identify<T: kenwood_transport::Transport>(
 }
 ```
 
-This proves MMDVM framing only on the borrowed connection. It does not prove
-a particular radio identity, distinguish Terminal from Access Point mode, or
-authorize transmission. The caller decides when a probe is appropriate and
-how to retire or recover a failed or cancelled exchange.
+A successful response confirms MMDVM framing on the borrowed connection only;
+it does not identify the radio or distinguish Terminal from Access Point mode.
+The caller decides when a probe is appropriate and how to retire or recover a
+failed or cancelled exchange.
 
 For a diagnostic-only version/status pair, use `probe::probe_diagnostics`.
 One absolute deadline covers both requests and every response read. Status is
-requested only after accepted version evidence on the same borrowed connection;
-a status error remains in `DiagnosticResponse::status` without erasing
-`DiagnosticResponse::version`. The parser rejects unknown status mode bytes
-instead of treating them as Idle. No modem loop or configuration is started.
+requested only after an accepted version response on the same borrowed
+connection; a status error remains in `DiagnosticResponse::status` without
+erasing `DiagnosticResponse::version`. The parser rejects unknown status mode
+bytes instead of treating them as Idle. No modem loop or configuration is
+started.
 Both version probes reject malformed UTF-8 and control characters remaining
 inside the description after trailing NUL/whitespace padding is removed.
-Valid Unicode remains supported; input is never repaired silently for admission.
+Valid Unicode remains supported; a rejected description is never silently
+repaired to make it pass.
 
 `probe::probe_diagnostics_until` additionally checks a cancellation callback
 before the version request and after its complete reply, before status. It
 finishes an in-progress exchange or reaches the original deadline; dropping
 the future directly is still not a protocol-safe cancellation boundary.
 The caller owns cleanup. MMDVM has no request correlation identifier, so a
-received status cannot establish when the device generated it. These APIs
-do not establish radio identity, operating-mode selection, or RF-silent routing.
+received status cannot establish when the device generated it.
 
 ## Drive and reclaim a modem
 

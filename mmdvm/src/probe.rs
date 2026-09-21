@@ -1,8 +1,9 @@
 //! Bounded identification and diagnostics on a caller-selected byte transport.
 //!
-//! This probe establishes MMDVM framing on the connection it borrows, not a
-//! radio identity or operating-mode selection. The caller owns admission,
-//! connection continuity, and cleanup after failure or cancellation.
+//! This probe reads MMDVM framing on a connection it borrows; it identifies no
+//! radio and selects no operating mode. It never opens, closes, reopens or
+//! retries: the caller owns the connection's lifetime, its cleanup after a
+//! failure or cancellation, and any retry policy.
 
 use std::time::Duration;
 
@@ -72,10 +73,10 @@ pub enum ProbeError {
     IncompleteFrame,
 }
 
-/// Validated version evidence and the outcome of its following status query.
+/// Validated version reply and the outcome of its following status query.
 ///
-/// A failed status exchange does not erase the version already observed on
-/// this connection. Neither field proves a radio identity or Terminal mode.
+/// A failed status exchange leaves the version already read on this connection
+/// intact.
 #[derive(Debug)]
 pub struct DiagnosticResponse {
     /// Complete protocol-1 or protocol-2 version response.
@@ -100,9 +101,6 @@ pub struct DiagnosticResponse {
 /// The protocol has no request correlation identifier, so a received status
 /// cannot prove that the device generated it after the status request.
 ///
-/// The caller owns endpoint admission and cleanup. Success proves neither
-/// Terminal mode nor permission to transmit, and performs no close or reopen.
-///
 /// # Cancellation safety
 ///
 /// Dropping the future can leave a partial exchange; retire or explicitly
@@ -112,7 +110,7 @@ pub struct DiagnosticResponse {
 /// # Errors
 ///
 /// Returns an error if version identification fails. Status failures remain
-/// inside [`DiagnosticResponse`] alongside the successful version evidence.
+/// inside [`DiagnosticResponse`] alongside the accepted version reply.
 pub async fn probe_diagnostics<T: Transport>(
     transport: &mut T,
     timeout: Duration,
@@ -139,7 +137,7 @@ pub async fn probe_diagnostics<T: Transport>(
 /// # Errors
 ///
 /// Returns an error if version identification fails. Status failures remain
-/// inside [`DiagnosticResponse`] alongside the successful version evidence.
+/// inside [`DiagnosticResponse`] alongside the accepted version reply.
 pub async fn probe_diagnostics_until<T: Transport>(
     transport: &mut T,
     timeout: Duration,
@@ -162,29 +160,28 @@ pub async fn probe_diagnostics_until<T: Transport>(
 ///
 /// One absolute deadline covers the write and every subsequent read. Other
 /// complete frames and non-frame bytes are skipped within that same budget.
-/// The response must include a nonempty version description; an echoed
-/// request is not proof. Original description bytes must be valid UTF-8.
+/// The response must include a nonempty version description, so a bare echo of
+/// the request is rejected. Original description bytes must be valid UTF-8.
 /// Trailing NUL bytes are removed first, then trailing Unicode whitespace,
 /// matching the core codec's padding semantics. Any remaining control
 /// character is rejected rather than repaired or silently discarded.
 /// Reads stop at each advertised frame boundary, leaving
 /// any following bytes for the consumer that takes over this same connection.
-/// No configuration, mode-switch, retry, close, or reopen operation is sent.
-///
-/// A success does not distinguish a radio's Terminal and Access Point modes
-/// or authorize transmission. Those decisions remain with the caller.
+/// No configuration or mode-switch command is sent, and a version reply
+/// describes the MMDVM firmware without distinguishing a radio's Terminal and
+/// Access Point modes.
 ///
 /// # Cancellation safety
 ///
 /// Cancellation can leave a transmitted request or a partially consumed
-/// reply. It never establishes a usable protocol boundary. The caller must
-/// retire or explicitly recover the connection before another workflow.
+/// reply, so the caller must retire or explicitly recover the connection
+/// before another workflow.
 ///
 /// # Errors
 ///
 /// Returns [`ProbeError`] for an invalid budget, expiration, transport/codec
 /// failure, or incomplete input. Only a complete accepted version returns
-/// success; a timeout alone conveys no protocol identity.
+/// success.
 pub async fn probe_version<T: Transport>(
     transport: &mut T,
     timeout: Duration,

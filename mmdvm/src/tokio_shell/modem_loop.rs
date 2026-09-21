@@ -73,8 +73,8 @@ const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Maximum retained RX buffer capacity, guarding against a malformed
 /// stream endlessly appending without producing frames. If the buffer
-/// exceeds this size with no decode progress we drop the contents and
-/// resync.
+/// exceeds this size with no decode progress the contents are dropped
+/// and the loop resyncs.
 const RX_BUFFER_HARD_CAP: usize = 8 * 1024;
 
 /// Main tokio task driving a single MMDVM modem.

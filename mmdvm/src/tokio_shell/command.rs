@@ -53,8 +53,8 @@ pub(crate) enum Command {
         /// Reply channel.
         reply: oneshot::Sender<Result<(), ShellError>>,
     },
-    /// Send a raw frame: escape hatch for modes we haven't modelled
-    /// yet.
+    /// Send a raw frame: the escape hatch for modes without a typed
+    /// command.
     SendRaw {
         /// The command byte.
         command: u8,
