@@ -12,10 +12,7 @@
 //! every optional mode.
 //!
 //! This module exposes the configuration type so downstream crates can
-//! construct it, but does **not** yet implement wire encoding.
-//
-// TODO: full SetConfig encoding. Multi-mode config is complex, will
-// be done when needed.
+//! construct it; it implements no `SET_CONFIG` wire encoding.
 
 use crate::mode::ModemMode;
 
