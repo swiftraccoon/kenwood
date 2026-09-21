@@ -28,15 +28,15 @@ before AGC.
 
 ## Consumers
 
-[`thd75-listen`](../thd75-listen/) is the command-line audio-shell consumer,
-but its live path is currently blocked before DSP startup by the library's
-direct-frequency write quarantine. [`azimuth-core`](../azimuth-core/) wraps the
+[`thd75-listen`](../thd75-listen/) is the command-line audio-shell consumer;
+it lands the radio on the target frequency with verified UP/DW steps and then
+runs this channelizer. [`azimuth-core`](../azimuth-core/) wraps the
 same channelizer and `SpectrumEstimator` for Azimuth's live iPadOS spectrum,
 waterfall, passband, level, clipping, and capture-loss views. Sound-card,
 serial, UI, and playback policy remain entirely in those consumers.
 
 ## Status
 
-New in July 2026. Pre-release; public API is unstable.
+Pre-release; public API is unstable.
 
 Part of the [kenwood](..) workspace. License: GPL-2.0-or-later.
