@@ -93,7 +93,7 @@ pub fn decode_server_to_client(
 /// (space from `memset`) and byte `[8]` (outside the 8-byte
 /// window) holds the module letter per
 /// `ircDDBGateway/Common/ConnectData.cpp:278-300` (`getDExtraData`).
-/// Our API exposes the module as a separate `Module` field on
+/// This API exposes the module as a separate `Module` field on
 /// [`ClientPacket::Link`]/[`ServerPacket::ConnectAck`], so this
 /// reader deliberately does NOT splice byte `[8]` into the
 /// callsign. Keeping byte `[7]` as the plain space from the wire

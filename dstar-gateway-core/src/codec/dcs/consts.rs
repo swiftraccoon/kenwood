@@ -85,7 +85,7 @@ pub const VOICE_EOT_MARKER: [u8; 3] = [0x55, 0x55, 0x55];
 ///
 /// Reference: `ircDDBGateway/Common/ConnectData.cpp:344-358` shows the
 /// reference populating a template via `wxString::Printf(HTML, ...)`.
-/// We emit a static short banner instead of the full template: the
+/// A static short banner is emitted instead of the full template: the
 /// receiving reflector logs the HTML but does not parse it, so any
 /// short identification string that fits in 500 bytes satisfies the
 /// protocol. This mirrors `xlxd`, which accepts LINK packets regardless

@@ -58,7 +58,7 @@ enum HalfPhase {
 pub struct SlowDataTextCollector {
     /// Current 6-byte block being assembled (half1 in [0..3], half2 in [3..6]).
     block_buffer: [u8; 6],
-    /// Which half of the block we expect next.
+    /// Which half of the block is expected next.
     phase: HalfPhase,
     /// Four 5-char text slots, one per block index (0..=3).
     slots: [[u8; TEXT_CHARS_PER_BLOCK]; 4],

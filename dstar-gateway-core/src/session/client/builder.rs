@@ -95,7 +95,7 @@ impl<P: Protocol, Cs, Lm, Rm, Pe> SessionBuilder<P, Cs, Lm, Rm, Pe> {
         }
     }
 
-    /// Set the reflector module letter (the module we want to link to).
+    /// Set the reflector module letter (the module to link to).
     #[must_use]
     pub const fn reflector_module(self, module: Module) -> SessionBuilder<P, Cs, Lm, Provided, Pe> {
         SessionBuilder {
@@ -162,8 +162,8 @@ impl<P: Protocol> SessionBuilder<P, Provided, Provided, Provided, Provided> {
     ///
     /// The [`Provided`] type parameters are the typestate proof that
     /// every field was set; the `Option` unwrapping below is
-    /// therefore infallible at the type level, and we use
-    /// [`unreachable!`] in the impossible branches rather than
+    /// therefore infallible at the type level, so the impossible
+    /// branches use [`unreachable!`] rather than
     /// [`Option::expect`] (which is lint-denied in lib code).
     #[must_use]
     pub fn build(self) -> Session<P, Configured> {

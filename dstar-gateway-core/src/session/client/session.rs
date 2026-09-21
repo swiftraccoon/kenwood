@@ -225,8 +225,8 @@ impl Session<DPlus, Authenticated> {
     /// The [`Authenticated`] state is entered only after
     /// [`SessionCore::attach_host_list`] succeeds, so the host list is
     /// always present here. A `None` would indicate a bug in
-    /// [`SessionCore`]; we fall back to a module-level empty
-    /// sentinel rather than panic so lib code stays
+    /// [`SessionCore`]; the fallback is a module-level empty
+    /// sentinel rather than a panic so lib code stays
     /// `expect_used`-clean.
     #[must_use]
     pub fn host_list(&self) -> &HostList {

@@ -87,7 +87,7 @@ pub fn decode_server_to_client(
 /// prefix at `[0..8]`. The wire format has byte `[7]` as the
 /// `memset` pad slot and byte `[8]` outside the 8-byte window
 /// holding the module letter (for LINK/ACK/NAK) or `0x00` (for
-/// poll). Our Rust API exposes the module as a separate `Module`
+/// poll). This API exposes the module as a separate `Module`
 /// field, so this reader deliberately does NOT splice byte `[8]`
 /// into the callsign. Keeping byte `[7]` as the plain space from
 /// the wire matches what the 17-byte poll decoder sees and lets

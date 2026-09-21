@@ -46,7 +46,7 @@ use super::state::ServerStateKind;
 /// Internal state for the server session machine.
 ///
 /// Kept as a private enum rather than reusing [`ServerStateKind`]
-/// so we can add private-only transitional states without leaking
+/// so private-only transitional states can be added without leaking
 /// them through the public runtime discriminator. [`Link1Received`]
 /// is a DPlus-specific transient state between LINK1 and LINK2 that
 /// the public view collapses into `Unknown` via [`Self::kind`].
@@ -136,14 +136,14 @@ pub struct ServerSessionCore {
     client_callsign: Option<Callsign>,
     /// Local module letter of the linked client.
     client_module: Option<Module>,
-    /// Last stream id we surfaced as a `StreamStarted` event.
+    /// Last stream id surfaced as a `StreamStarted` event.
     ///
     /// DCS voice packets carry the D-STAR header embedded in every
     /// 100-byte frame, so the server can't distinguish "start of
     /// stream" by packet type alone; it must track whether the
     /// incoming `stream_id` is the same as the last frame's or a
-    /// fresh one. On a fresh id we emit `StreamStarted` first, then
-    /// the `StreamFrame`. On the same id we emit only `StreamFrame`.
+    /// fresh one. A fresh id emits `StreamStarted` first, then the
+    /// `StreamFrame`; the same id emits only `StreamFrame`.
     last_stream_id: Option<StreamId>,
     /// Outbound packet queue.
     outbox: Outbox,

@@ -17,8 +17,8 @@ pub const DEFAULT_PORT: u16 = 20001;
 /// (`m_pollTimer(1000U, 1U)` = 1 second).
 /// Reference: `xlxd/src/main.h:94` (`DPLUS_KEEPALIVE_PERIOD = 1`).
 ///
-/// **The legacy `dstar-gateway` crate ships 5s; that is the bug
-/// the audit found.** This rewrite uses 1s to match both references.
+/// Both references send every second; a longer interval is dropped by
+/// the reflector's inactivity timer.
 pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// `DPlus` outgoing keepalive inactivity timeout.
@@ -49,7 +49,7 @@ pub const HEADER_RETX: u8 = 5;
 /// Number of times the unlink packet is retransmitted.
 ///
 /// Reference: `ircDDBGateway/Common/DPlusHandler.cpp:481-482` sends
-/// unlink twice; we send three times for an extra margin on lossy links.
+/// unlink twice; this crate sends three times for an extra margin on lossy links.
 pub const DISCONNECT_RETX: u8 = 3;
 
 /// Inter-copy delay for retransmission bursts.

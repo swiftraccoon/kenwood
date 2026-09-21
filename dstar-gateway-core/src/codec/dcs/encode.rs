@@ -349,7 +349,7 @@ pub fn encode_voice(
     } else if let Some(dst) = out.get_mut(55..58) {
         dst.copy_from_slice(&frame.slow_data);
     }
-    // [58..61] rpt seq counter, zero for now.
+    // [58..61] rpt seq counter, always zero.
     // [61] = 0x01, [62] = 0x00, [63] = 0x21 per AMBEData.cpp:420-423.
     if let Some(b) = out.get_mut(61) {
         *b = 0x01;

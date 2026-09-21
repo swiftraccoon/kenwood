@@ -15,7 +15,7 @@ use super::state::{
 /// Note: [`AnySession<P>`] is generic over the protocol. The
 /// [`Self::Authenticated`] variant is hard-coded to [`DPlus`] because
 /// the typestate guarantees only `DPlus` reaches that state. This is
-/// a known wart of full typestate that we accept.
+/// a known cost of full typestate.
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum AnySession<P: Protocol> {

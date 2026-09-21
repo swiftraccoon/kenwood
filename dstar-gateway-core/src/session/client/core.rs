@@ -76,7 +76,7 @@ const STREAM_TAKEOVER_THRESHOLD: Duration = Duration::from_millis(500);
 enum RawEvent {
     /// Transitioned to `Connected`.
     Connected {
-        /// Peer that accepted us.
+        /// Peer that accepted the link.
         peer: SocketAddr,
     },
     /// Transitioned to `Closed`.
@@ -127,7 +127,7 @@ pub struct SessionCore {
     callsign: Callsign,
     /// Client local module letter.
     local_module: Module,
-    /// Reflector module letter we are linked (or linking) to.
+    /// Reflector module letter linked (or linking) to.
     reflector_module: Module,
     /// Reflector's own callsign (e.g. `REF030`, `XLX307`, `DCS030`).
     ///
@@ -276,11 +276,11 @@ impl SessionCore {
                     stream_id = format_args!("{:#06X}", stream_id.get()),
                     "suppressing retransmitted voice header for active stream"
                 );
-                // Header retransmits by themselves are NOT evidence
-                // that voice data is still flowing (the reflector
-                // keeps re-sending the header for late joiners even
-                // after the source has stopped). Only the VoiceFrame
-                // dispatch re-arms the inactivity timer.
+                // Header retransmits alone do not show that voice data
+                // is still flowing (the reflector keeps re-sending the
+                // header for late joiners even after the source has
+                // stopped). Only the VoiceFrame dispatch re-arms the
+                // inactivity timer.
             }
             Some(old_sid) => {
                 // Different stream_id arrived while another is
@@ -662,8 +662,7 @@ impl SessionCore {
     /// For DCS, the protocol does NOT have a separate header packet:
     /// the first frame (seq=0) carries the embedded header. This
     /// method emits a synthetic silence frame at seq=0 to start the
-    /// stream and matches the legacy
-    /// [`crate`]-internal behavior.
+    /// stream.
     ///
     /// # Errors
     ///
@@ -869,10 +868,9 @@ impl SessionCore {
         // Lenient decode: unknown-length, magic-missing, or otherwise
         // unparseable datagrams must NOT tear down an active session.
         // Real DPlus reflectors emit unrecognized traffic (status
-        // heartbeats, variable-length control, legacy framing) and
-        // any of those would previously propagate through `?` and
-        // kill the tokio shell's run loop. Record a diagnostic and
-        // keep going.
+        // heartbeats, variable-length control, legacy framing); a
+        // propagated decode error would kill the tokio shell's run
+        // loop. Record a diagnostic and keep going.
         let pkt = match dplus::decode_server_to_client(bytes, &mut self.diagnostics) {
             Ok(pkt) => pkt,
             Err(e) => {
@@ -1206,14 +1204,10 @@ impl SessionCore {
         // of M6JBE audio relayed cleanly, then silence with no
         // EOT, stream stuck "active" indefinitely).
         //
-        // This branch was previously disabled because the
-        // mmdvm-event-channel backpressure (now fixed by the
-        // next_event noise drain) would stall the session loop
-        // long enough that any wall-clock deadline fired as a
-        // false positive mid-transmission. With the deadlock
-        // fixed the loop reliably drains, and the timer is armed
-        // on each voice frame so the deadline always sits
-        // `VOICE_INACTIVITY_TIMEOUT` past the latest real activity.
+        // The timer is armed on each voice frame, so the deadline
+        // always sits `VOICE_INACTIVITY_TIMEOUT` past the latest real
+        // activity; the event loop must keep draining `next_event` or
+        // a stalled loop fires this deadline mid-transmission.
         if self.state == ClientStateKind::Connected
             && self.timers.is_expired(TIMER_VOICE_INACTIVITY, now)
         {
