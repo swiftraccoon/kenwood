@@ -284,8 +284,8 @@ fn check_r8_label_colon(line: &str, violations: &mut Vec<Violation>) {
     const DIRECT_VERBS: &[&str] = &["tuned", "stepped", "recalled"];
     /// Phrases that follow a label noun to form a verb phrase:
     /// `Band A mode set to FM`, `Band A squelch set to 5`. If the
-    /// substring after the prefix contains " set to " we treat the
-    /// whole line as a verb phrase.
+    /// substring after the prefix contains " set to " the whole line
+    /// counts as a verb phrase.
     const VERB_PHRASES: &[&str] = &[" set to "];
     for prefix in ["Band A ", "Band B "] {
         if !line.starts_with(prefix) || line.contains(": ") {

@@ -90,8 +90,8 @@ impl From<PortInterface> for PcOutputInterface {
 /// The default is [`Self::Off`]: no file is created and no tracing
 /// output is written. File logging is enabled only when the user
 /// explicitly passes `--log-level` or `--trace`; this prevents the
-/// rotating log file from accumulating hundreds of megabytes on
-/// every normal session (D-STAR voice at trace level is ~1 MB/s).
+/// log files from accumulating on every normal session: trace level
+/// records every D-STAR voice packet.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum LogLevel {
     /// No file logging (default).
@@ -201,9 +201,8 @@ struct Cli {
     ///
     /// Every `thd75-repl` invocation creates its own log file; old
     /// files accumulate until you clean them up manually. **File
-    /// logging is opt-in** because trace-level capture during D-STAR
-    /// voice flow generates large files fast (~1 MB/s of trace output
-    /// per active reflector link). Pass `--log-level=trace` or
+    /// logging is opt-in** because trace-level capture records every
+    /// D-STAR voice packet and grows quickly. Pass `--log-level=trace` or
     /// `--trace` when you want to capture a bug report; leave it off
     /// for normal operation.
     #[arg(long, value_enum, default_value_t = LogLevel::Off)]
@@ -809,11 +808,11 @@ struct DstarSession {
     tx_stream_id: Option<StreamId>,
     /// TX sequence counter (0-20 cycle).
     tx_seq: u8,
-    /// Local module letter (what we present to the reflector as our
+    /// Local module letter (presented to the reflector as the
     /// originating module). Cross-module linking uses this to differ
     /// from `reflector_module`.
     local_module: Module,
-    /// Reflector module letter we are linked to.
+    /// Reflector module letter linked to.
     reflector_module: Module,
     /// Reflector callsign (e.g. `REF030  `, `XLX307  `, `DCS001  `).
     ///
@@ -3285,9 +3284,9 @@ fn parse_reflector_arg(s: &str) -> Option<(String, char)> {
 /// Parsed form of the `link` command argument.
 ///
 /// Supports two forms:
-/// - `XRF030C`: link to `XRF030` module `C`, with our local module
+/// - `XRF030C`: link to `XRF030` module `C`, with the local module
 ///   matching the reflector module (`C`).
-/// - `B:XRF030C`: link to `XRF030` module `C`, but present our local
+/// - `B:XRF030C`: link to `XRF030` module `C`, but present the local
 ///   module as `B` for cross-module routing.
 struct LinkArg {
     reflector_name: String,
@@ -3534,7 +3533,7 @@ async fn connect_dextra(
 /// attaches the returned host list to the sans-io session to satisfy
 /// the `Authenticated` typestate. If the TCP auth fails, the function
 /// falls back to an empty host list so the caller can still attempt
-/// the UDP handshake (matching the legacy best-effort behavior).
+/// the UDP handshake.
 async fn connect_dplus(
     callsign: Callsign,
     peer: std::net::SocketAddr,
@@ -3627,7 +3626,7 @@ async fn connect_dcs(
 /// remembered link parameters.
 ///
 /// Triggered automatically when a `Disconnected(KeepaliveInactivity)`
-/// event arrives; those mean we lost contact with the reflector for
+/// event arrives; those mean contact with the reflector was lost for
 /// 30 s but neither side intentionally closed the link, so a fresh
 /// `LINK1` handshake usually restores service. On success
 /// `session.reflector` is replaced with the newly-spawned client; on
@@ -3837,14 +3836,14 @@ async fn run_dstar_monitor(session: &mut DstarSession) {
 /// 1. The tick interval for the silence-padding timer in
 ///    [`dstar_poll_cycle`].
 /// 2. The cadence check for *subsequent* pads inside a single
-///    silence gap (see [`emit_silence_pad_if_needed`]). Once we've
-///    decided a gap is real and started padding, each additional
+///    silence gap (see [`emit_silence_pad_if_needed`]). Once a gap
+///    has been declared real and padding has started, each additional
 ///    pad fires on modem consumption rhythm so the FIFO stays
 ///    fed without over-production.
 const PAD_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
 
-/// How long the reflector must be silent before we decide a gap
-/// is real and start padding.
+/// How long the reflector must be silent before a gap is declared
+/// real and padding starts.
 ///
 /// The modem's D-STAR FIFO averages ~100-140 ms of buffered audio
 /// per the `dstar_space_before` telemetry (mean 120/125 slots
@@ -3867,7 +3866,7 @@ const PAD_INITIAL_THRESHOLD: std::time::Duration = std::time::Duration::from_mil
 /// reflector has been silent long enough that continuing to stuff
 /// stale audio is counter-productive: the FIFO reaches steady
 /// state at full, the BT/radio buffers accumulate, and by the time
-/// real frames arrive we've added seconds of latency that never
+/// real frames arrive seconds of latency have accumulated that never
 /// drain. Better to let the modem underrun cleanly and the radio
 /// squelch, which gives the operator an accurate signal that the
 /// reflector is having real trouble.
@@ -3882,7 +3881,7 @@ const PAD_FRAMES_MAX: u32 = 30;
 /// the last received voice frame through the same unpaced relay
 /// path the real frames take, then updates the relay timestamp so
 /// the next tick re-evaluates against the moment of padding (not
-/// the moment of the last real frame). This keeps us emitting at
+/// the moment of the last real frame). This keeps the output at
 /// a steady 20 ms cadence until either a real frame arrives or the
 /// cap hits.
 async fn emit_silence_pad_if_needed(session: &mut DstarSession) {
@@ -3989,8 +3988,8 @@ const MAX_EVENTS_PER_CYCLE: usize = 24;
 /// timestamps. Inline processing hands each frame to `send_voice` immediately;
 /// the modem runtime schedules queued writes against its reported buffer space.
 async fn dstar_poll_cycle(session: &mut DstarSession) {
-    // Matches the legacy `ReflectorClient::poll` 100 ms inner recv
-    // timeout, which gives the reflector session task a short window to
+    // A 100 ms inner recv timeout gives the reflector session task a
+    // short window to
     // deliver a frame before we yield control back to the outer
     // `select!` for radio polling and ctrl_c.
     const EVENT_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
@@ -4354,7 +4353,7 @@ fn finish_echo_recording(session: &mut DstarSession) {
 /// `rpt1` / `rpt2` both set to the literal string `"DIRECT  "` as
 /// placeholders: the radio knows it's talking to a local gateway
 /// but doesn't know the gateway's callsign. This function is the
-/// gateway half of that contract: we rewrite those placeholders into
+/// gateway half of that contract: it rewrites those placeholders into
 /// the canonical relay header via [`DstarHeader::for_relay`], then
 /// preserve the source flag bytes (the radio may set repeater flag
 /// bits the reflector cares about).
@@ -5166,7 +5165,7 @@ mod offset_tests {
     #[test]
     fn rejects_non_ascii_without_panicking() {
         // A multi-byte character where the HHMM split lands mid-char
-        // used to panic on the byte slice; it must be a plain error.
+        // must be a plain error, never a byte-slice panic.
         assert!(parse_utc_offset("\u{e9}5").is_err());
         assert!(parse_utc_offset("+\u{e9}\u{e9}").is_err());
     }

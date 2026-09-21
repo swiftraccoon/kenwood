@@ -3,14 +3,13 @@
 //! `for_command(cmd)` returns a multi-line detailed help block for a
 //! specific command, or `None` if the command name is unknown.
 //!
-//! `ALL_COMMANDS` lists every command we have detailed help for. The
-//! lint test in this module iterates the list and runs the
-//! accessibility lint over every entry.
+//! `ALL_COMMANDS` lists every command with detailed help. The lint
+//! test in this module iterates the list and runs the accessibility
+//! lint over every entry.
 //!
 //! This module also holds the three multi-line help blobs that list
-//! commands for each REPL mode: CAT, APRS, and D-STAR. These were
-//! previously `println!`-driven functions in `commands.rs`; moving
-//! them here lets the lint test exercise them uniformly with the
+//! commands for each REPL mode: CAT, APRS, and D-STAR. Keeping them
+//! here lets the lint test exercise them uniformly with the
 //! per-command entries.
 
 /// The names of every command that has a detailed help entry. Used by

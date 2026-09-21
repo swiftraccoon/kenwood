@@ -4,7 +4,7 @@ Accessible command-line REPL for the Kenwood TH-D75 transceiver. Its screen-read
 
 ## Features
 
-- CAT radio inspection and qualified controls, including frequency reads and
+- CAT radio inspection and verified controls, including frequency reads and
   stepping, memory recall, mode, squelch, power, and VOX
 - D-STAR reflector gateway (DPlus/DExtra/DCS, REF/XRF/XLX/DCS reflectors)
 - APRS KISS mode (packet radio)
@@ -66,8 +66,8 @@ At the `d75>` prompt, the most useful commands are:
 Standard commands cover frequency reads and stepping, mode, power, squelch,
 attenuator, VOX, dual band, Bluetooth, FM radio, memory recall, GPS, URCALL, and
 reflector linking. Arbitrary direct frequency tuning currently reports a
-fail-closed safety error before radio I/O because FO/FQ writes are not
-qualified. The `lock` command reports that no verified CAT key-lock operation
+fail-closed safety error before radio I/O because direct FO/FQ writes are not
+verified on hardware. The `lock` command reports that no verified CAT key-lock operation
 is available; it does not change the radio.
 
 ## Script mode
@@ -98,6 +98,7 @@ Transmit commands in script mode require `--yes` on the command line to run unat
 d75> dstar start KQ4NIT
 dstar> link REF030C
 dstar> monitor
+dstar> echo
 dstar> unlink
 dstar> dstar stop
 ```
@@ -105,14 +106,16 @@ dstar> dstar stop
 Startup validates the station identity and reflector before changing radio mode.
 TH-D75 mode entry and restoration remain in `kenwood-thd75`; the shared
 `mmdvm::dstar` runtime handles modem initialization, frame queues, and events.
-Voice remains raw AMBE throughout the relay. The command syntax is unchanged.
+Voice remains raw AMBE throughout the relay. `echo` records your own
+transmission and plays it back through the same modem path the reflector relay
+uses, so a working echo confirms the radio-side playback path only.
 
 ## Logging
 
 By default no log file is created and no tracing output is written;
 the terminal only shows normal REPL output. File logging is opt-in
-because trace-level capture during D-STAR voice flow generates large
-files fast (~1 MB/s per active reflector link).
+because trace-level capture records every D-STAR voice packet and grows
+quickly.
 
 To enable a log file, pass `--log-level` or `--trace`:
 

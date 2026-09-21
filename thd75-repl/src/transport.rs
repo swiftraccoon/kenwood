@@ -267,8 +267,8 @@ fn open_bluetooth(_baud: u32) -> Result<OpenedTransport, Box<dyn std::error::Err
 
 /// Open a Bluetooth connection via serial BT SPP port discovery.
 ///
-/// On Linux/Windows there is no native `IOBluetooth` equivalent, so we
-/// enumerate serial ports that look like Bluetooth TH-D75 pairings and
+/// On Linux/Windows there is no native `IOBluetooth` equivalent, so this
+/// enumerates serial ports that look like Bluetooth TH-D75 pairings and
 /// open the first one at the requested baud rate.
 #[cfg(not(target_os = "macos"))]
 fn open_bluetooth(_baud: u32) -> Result<OpenedTransport, Box<dyn std::error::Error>> {

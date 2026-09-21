@@ -1070,8 +1070,8 @@ pub(crate) async fn ifout<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
 /// S-meter polls are defensive: the D75 firmware occasionally
 /// returns spurious values on Band B while squelch is open (the
 /// hardware-correct pattern is to gate SM reads on AI-pushed BY
-/// events, not to poll them directly), so we accept whatever the
-/// radio gives us and only fall through to `"not available"` on
+/// events, not to poll them directly), so the REPL accepts whatever the
+/// radio returns and only falls through to `"not available"` on
 /// an actual transport error. This keeps the command useful as a
 /// one-shot snapshot.
 #[expect(
