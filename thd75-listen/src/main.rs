@@ -3,7 +3,7 @@
 //! Contains the CAT setup, 12 kHz `ADC stream IN` capture, `if-dsp`
 //! demodulation, playback, and accessible prompt pipeline. Startup and the
 //! `tune` command land Band B on the requested frequency through the
-//! library's qualified UP/DW stepping retune; off-step or distant targets
+//! library's verified UP/DW stepping retune; off-step or distant targets
 //! are refused with guidance.
 //!
 //! Design notes:
@@ -306,7 +306,7 @@ fn run_session(
 ) -> Result<(), String> {
     // Land Band B on the requested frequency. When it already matches this
     // is a pure verification; otherwise the library steps there with the
-    // qualified UP/DW commands, dropping the IF output during the walk
+    // verified UP/DW commands, dropping the IF output during the walk
     // (frequency writes are rejected while the tap is engaged) and
     // re-engaging it afterwards with a readback proof.
     rt.block_on(retune(radio, saved, Frequency::new(freq_hz)))?;
@@ -530,7 +530,7 @@ fn run_session(
 
 /// Land Band B on `target` under the engaged IF tap.
 ///
-/// Delegates to the library's qualified UP/DW stepping retune: an equal
+/// Delegates to the library's verified UP/DW stepping retune: an equal
 /// frequency verifies without touching the radio; otherwise the walk is
 /// bounded, verified by readback, and the IF output is re-engaged with a
 /// readback proof.

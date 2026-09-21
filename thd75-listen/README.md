@@ -3,8 +3,8 @@
 Experimental accessible SSB/CW/AM demodulator for the Kenwood TH-D75's
 IF-over-USB-audio stream. The TH-D75 can present its 12 kHz IF as a USB
 sound-card input, and this tool contains the capture, demodulation, playback,
-prompt, and state-restoration pipeline. Tuning uses the radio's qualified UP/DW
-commands with a frequency readback after every step; unqualified FO/FQ writes
+prompt, and state-restoration pipeline. Tuning uses the radio's UP/DW commands
+with a frequency readback after every step; direct FO/FQ frequency writes
 remain unavailable in [`kenwood-thd75`](../thd75/).
 
 ## How it works
@@ -45,6 +45,6 @@ serial CAT, the terminal).
 
 ## Status
 
-New in July 2026. Pre-release; command surface is unstable.
+Pre-release; command surface is unstable.
 
 Part of the [kenwood](..) workspace. License: GPL-2.0-or-later.
