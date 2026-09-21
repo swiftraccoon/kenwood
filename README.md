@@ -24,7 +24,7 @@ Rust workspace for Kenwood amateur-radio transceivers: core TH-D75 library, TUI,
 | Radio | Core | TUI | REPL | Status |
 |-------|------|-----|------|--------|
 | TH-D75A/E | [`thd75/`](thd75/) | [`thd75-tui/`](thd75-tui/) | [`thd75-repl/`](thd75-repl/) | experimental |
-| TM-D750 | [`tmd750/`](tmd750/) | Planned | [`tmd750-repl/`](tmd750-repl/) | USB CAT/MCP and Bluetooth automatic Terminal startup/restoration bench-validated on firmware 1.02 / K,2,1, PM Off; see the REPL documentation for the qualified scope and remaining limits |
+| TM-D750 | [`tmd750/`](tmd750/) | Planned | [`tmd750-repl/`](tmd750-repl/) | experimental; USB CAT/MCP and Bluetooth Terminal startup exercised on firmware 1.02 / K,2,1 |
 
 ## Crates
 

@@ -37,6 +37,14 @@ thd75_re/
 !azimuth/README.md
 !azimuth-core/README.md
 
+# Agent instructions are tracked: AGENTS.md is the tool-neutral file and the
+# CLAUDE.md beside it holds only the `@AGENTS.md` import that Claude Code reads.
+# Operator-local context (dated ledgers, capture paths, local tool setup) lives
+# in CLAUDE.local.md, which is never committed.
+!AGENTS.md
+!CLAUDE.md
+CLAUDE.local.md
+
 # dstar-gateway: public docs and ADRs are committed
 !dstar-gateway/README.md
 !dstar-gateway/ARCHITECTURE.md
