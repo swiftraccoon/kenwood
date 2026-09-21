@@ -222,7 +222,7 @@ pub struct AprsIsClient {
     config: AprsIsConfig,
     reader: BufReader<OwnedReadHalf>,
     writer: OwnedWriteHalf,
-    /// Persistent byte buffer for `read_until`. We deliberately read
+    /// Persistent byte buffer for `read_until`. The client reads raw
     /// bytes (not `String` via `read_line`) so non-UTF-8 sequences in
     /// APRS info fields (Mic-E, raw weather, Latin-1 comments) do not
     /// surface as `io::ErrorKind::InvalidData` and tear down the

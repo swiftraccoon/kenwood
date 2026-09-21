@@ -22,8 +22,8 @@ use crate::error::AprsIsError;
 pub enum Passcode {
     /// A verified 15-bit passcode computed from the station callsign.
     Verified(u16),
-    /// Receive-only connection: the server will accept incoming packets
-    /// from us but will not forward any packets we transmit to RF.
+    /// Receive-only connection: the server accepts incoming packets
+    /// from this client but does not forward its packets to RF.
     ReceiveOnly,
 }
 
@@ -96,7 +96,7 @@ impl AprsIsConfig {
     }
 
     /// Create a receive-only APRS-IS configuration for the given
-    /// callsign. The server will not forward our transmissions to RF.
+    /// callsign. The server does not forward this client's transmissions to RF.
     #[must_use]
     pub fn receive_only(callsign: &str) -> Self {
         Self {
@@ -225,7 +225,7 @@ fn validate_login_word(field: &'static str, value: &str) -> Result<(), AprsIsErr
 ///
 /// Per <https://www.aprs-is.net/Connecting.aspx> the `servercommand`
 /// (e.g. `filter r/33/-96/25`) allows spaces, so unlike the software
-/// name/version we only reject the line terminators: a `\r`/`\n` inside
+/// name/version only the line terminators are rejected: a `\r`/`\n` inside
 /// the filter would inject a second handshake line.
 fn validate_filter(value: &str) -> Result<(), AprsIsError> {
     if value.contains('\r') || value.contains('\n') {

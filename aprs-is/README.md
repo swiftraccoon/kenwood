@@ -29,7 +29,7 @@ caller can pass them to `aprs` or construct a byte-exact third-party RF frame.
 
 ## Status
 
-Extracted from `kenwood-thd75` April 2026. Pre-release. Public API is unstable. There is no *automatic* reconnect: on an idle disconnect the client surfaces an `AprsIsEvent::Disconnected` event, and callers reconnect explicitly via `AprsIsClient::reconnect()` or by establishing a fresh connection with `connect_with_retry()`. The default `software_name` is `"aprs-is"` and should be overridden per integration (e.g. `kenwood-thd75` sets it explicitly).
+Pre-release. Public API is unstable. There is no *automatic* reconnect: on an idle disconnect the client surfaces an `AprsIsEvent::Disconnected` event, and callers reconnect explicitly via `AprsIsClient::reconnect()` or by establishing a fresh connection with `connect_with_retry()`. The default `software_name` is `"aprs-is"` and should be overridden per integration (e.g. `kenwood-thd75` sets it explicitly).
 
 ## References
 
