@@ -17,6 +17,8 @@ kenwood-schema = { path = "../kenwood-schema" }
 kenwood-transport = { path = "../kenwood-transport", default-features = false, features = [
   "serial",
 ] }
+# Bounded MMDVM GET_VERSION probing on the modem link after Terminal entry.
+mmdvm = { path = "../mmdvm", default-features = false, features = ["probe"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "macros", "time"] }
 tokio-serial = "5"

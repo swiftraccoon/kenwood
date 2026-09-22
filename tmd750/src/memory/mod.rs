@@ -29,6 +29,7 @@
 //! completed capture) are taken on trust. File containers live in
 //! [`crate::file`].
 
+pub mod channels;
 mod configuration;
 pub(crate) mod fixed_text_trial;
 pub mod menu_fields;
@@ -46,6 +47,7 @@ mod text;
 use crate::error::{SchemaError, ValidationError};
 use crate::types::{FirmwareIdentity, IMAGE_LENGTH, RadioModel, SlotIndex};
 
+pub use channels::ChannelAccess;
 pub use configuration::{
     ChangedByte, ChangedPage, ConfigurationError, StandardConfiguration, StandardConfigurationDiff,
 };

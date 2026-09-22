@@ -5,6 +5,10 @@
 //! discovery prioritizes the observed TM-D750 USB identities.
 //! Automatic reopening is unsupported:
 //! a device path alone cannot prove which radio owns a re-enumerated endpoint.
+//! [`reenumeration`] classifies a fresh enumeration against a pinned endpoint
+//! so a caller can decide when the same endpoint may be opened again.
+
+pub mod reenumeration;
 
 use std::num::NonZeroU32;
 

@@ -18,7 +18,8 @@ radio protocol and recovery policy. It does not depend on the TH-D75 library.
 | Capture configuration | [`Radio::backup_mcp_until_exit`] | Preserves acknowledged pages; caller owns close and fresh verification |
 | Inspect sparse settings | [`MenuFieldSnapshot`], [`ScopedMenuField`] | Decodes only covered fields; no I/O when using an existing snapshot |
 | Prepare ordinary changes | [`MenuAssignment`], [`MenuUpdatePlan`] | Exact identity, format, PM and Gateway guards; not an executed write |
-| Prepare a Gateway transition | [`radio::terminal::TerminalPlan`] | Separate route/mode policy; caller owns the modem and restoration lifecycle |
+| Prepare a Gateway transition | [`radio::terminal::TerminalPlan`] | Separate route/mode policy; the immutable page plan alone |
+| Run Reflector Terminal startup | [`TerminalLifecycle`], [`TerminalRecovery`] | Owns entry, MMDVM handoff and restoration over caller `ControlHost`/`ModemHost`/`TerminalJournal` |
 | Parse a configuration file | [`parse_d750`], [`RadioConfig`] | Exact stored-byte coverage; no radio I/O or settings interpretation |
 
 [`memory`] explains offline storage and previews; [`memory::schema`] explains
@@ -139,6 +140,92 @@ be passed to the write API. Failures use the typed `Error` hierarchy, including
 `UnsupportedCatWriteTarget` and transport errors with their I/O kind retained.
 After a failed echo or readback the setting's state is unknown; inspect the
 radio before retrying. No automatic rollback is attempted.
+
+## Read and change ordinary settings
+
+The same shape covers the rest of the CAT state: every value is a validated
+type, every read is one query, and every write runs the firmware/type gate,
+an exact echo check and a readback. A `?` reply is `ProtocolError::Rejected`
+and an `N` reply is `ProtocolError::NotAvailable`:
+
+```rust,no_run
+use kenwood_tmd750::types::{Frequency, PowerLevel, SquelchLevel, StepSize, TuningMode};
+use kenwood_tmd750::{Band, Error, Radio};
+use kenwood_transport::Transport;
+
+async fn tune<T: Transport>(radio: &mut Radio<T>) -> Result<(), Error> {
+    radio.set_tuning_mode(Band::A, TuningMode::Vfo).await?;
+    radio.set_step_size(Band::A, StepSize::Hz5000).await?;
+    radio.set_frequency(Band::A, Frequency::from_mhz_str("146.520")?).await?;
+    radio.set_power_level(Band::A, PowerLevel::Low).await?;
+    radio.set_squelch(Band::A, SquelchLevel::new(8)?).await?;
+    let record = radio.get_channel_record(Band::A).await?;
+    println!("{record}");
+    let stepped = radio.frequency_up(Band::A).await?;
+    println!("{stepped}");
+    Ok(())
+}
+```
+
+Frequency, channel record, power, tuning mode, squelch, S-meter, busy,
+attenuator, tuning step, AM high cut, memory selection, D-STAR callsign
+slots, band roles, band display, panel lighting, APRS position source, packet
+data rate, beacon method, VOX delay and gain, GPS settings and sentences,
+Bluetooth, the clock and the serial number are covered. TNC mode and VOX state
+are read only, and there is no transmit, beacon, memory write or power-off
+command. `frequency_up` and `frequency_down` act on the control band, refuse
+any other band with `Error::NotControlBand`, and read the frequency back
+until the step is applied, because the radio acknowledges `UP` and `DW`
+before applying them.
+
+## Stored memory channels
+
+`ME` reads, writes and clears stored channels, and `MR` recalls one on a band
+in Memory tuning mode. The record type carries the 18 shared channel fields
+plus the split and scan-lockout flags:
+
+```rust,no_run
+use kenwood_tmd750::types::{Band, MemoryChannelAddress, TuningMode};
+use kenwood_tmd750::{Error, Radio};
+use kenwood_transport::Transport;
+
+async fn copy_channel<T: Transport>(radio: &mut Radio<T>) -> Result<(), Error> {
+    let source = MemoryChannelAddress::regular(21)?;
+    let target = MemoryChannelAddress::regular(22)?;
+    if let Some(record) = radio.get_memory_channel(source).await? {
+        let stored = radio.write_memory_channel(target, record).await?;
+        println!("stored {}", stored.channel);
+        radio.set_tuning_mode(Band::A, TuningMode::Memory).await?;
+        radio.recall_memory_channel(Band::A, target).await?;
+        radio.clear_memory_channel(target).await?;
+    }
+    Ok(())
+}
+```
+
+A write is echoed exactly and read back; an empty URCALL reads back as
+`CQCQCQ`. `ME address,` clears a channel, after which it answers `N`. The
+priority channel refuses writes. Names are not part of the CAT record.
+
+The same channels are decoded offline from a standard backup with
+`ChannelAccess`: flags at image address `0x2000` (four bytes each), 40-byte
+records at `0x4000` (six per 256-byte page) and 16-byte names at `0x10000`,
+indexed by `PhysicalChannel` (regular 0 through 999, program scan pairs
+`L0, U0, L1, U1, ...` from 1000, priority 1100, APRS 1101). On firmware 1.02,
+channels written over CAT with every tone mode, both shift directions,
+split, reverse and lockout set decoded from the image to the same records
+`ME` returned, and the radio's own APRS channel decoded to the record `FO`
+reports for it. The flag byte holding the band code and the tone table
+index basis are retained as observed, not interpreted.
+
+Each command reads until a line answers it, and after a `?` reply the next
+two commands discard whatever follows their own reply, because firmware 1.02
+repeats the reply to the command that follows certain rejected commands. Type
+docs state which value
+labels the radio confirmed (tuning steps, through measured `UP`/`DW`
+changes) and which follow the User Manual's list order without a panel
+readout (power levels, the band display, panel lighting values, the tone and
+DCS table index basis).
 
 ## Qualify MCP without changing settings
 
@@ -789,15 +876,47 @@ restoration, acknowledge MCP exit, close and drop retired handles, and verify
 fresh identity and mode. Multi-page comparisons are an optimistic host-side
 check, not a firmware lock or atomic transaction.
 
+### Reflector Terminal startup
+
+`radio::terminal::lifecycle::TerminalLifecycle` owns the whole Reflector
+Terminal startup and its restoration, over two caller-supplied hosts and a
+journal sink:
+
+- `radio::readiness::ControlHost` enumerates, opens and closes the independent
+  serial control endpoint for CAT and MCP. `radio::terminal::transition::ModemHost`
+  opens and reopens the modem link. `radio::terminal::session::TerminalJournal`
+  records the backup, the plan, each pre-write intent, and each checkpoint; the
+  sink owns its own durability.
+- `TerminalLifecycle::prepare` observes the control endpoint, opens the modem
+  link, writes the Terminal and routing pages with `program_terminal`, and
+  acquires MMDVM framing with `acquire_modem`. When the stored Gateway is Off
+  the pages are written over the modem link itself; when a Terminal route is
+  already active the pages are written over the control endpoint and the modem
+  link is never sent CAT. It returns the proved `ProvenModem` connection and a
+  `TerminalRecovery`.
+- `TerminalRecovery::finish` waits for the control endpoint's CAT to return
+  with `verify_readiness`, rewrites exactly the pages startup changed, and
+  verifies the identity and Gateway on a fresh connection. It rewrites nothing
+  unless the modem connection was confirmed closed.
+
+The library sends CAT, MCP and MMDVM frames and enforces the safety order; it
+opens no endpoint and writes no file. The caller implements the host traits to
+wire endpoint discovery, the native modem backend, capture transcripts and the
+recovery journal, and owns cancellation. The two model MCP engines stay
+separate: this is the TM-D750 lifecycle only.
+
 ## What it does
 
 - Proves the connected radio with `ID` (exact `TM-D750`) and records the exact
   `FV` firmware string and the complete opaque three-component `TY` payload.
 - Reads each band's `MD` operating mode and the persistent `GW` state. It can
-  select FM or D-STAR DV on the exact firmware 1.02 / `TY K,2,1` target, with
-  an exact command echo plus immediate readback. Other targets remain
-  read-only. There is no DR write: firmware 1.02 rejects that CAT value. Any
-  other reported mode value is preserved without being named.
+  select FM, DV, AM or NFM on the exact firmware 1.02 / `TY K,2,1` target,
+  with an exact command echo plus immediate readback. Other targets remain
+  read-only. DR is a tuning mode (`VM band,3`), not an `MD` write. Any other
+  reported mode value is preserved without being named.
+- Reads and writes the ordinary per-band and global settings listed under
+  "Read and change ordinary settings" with the same gate, echo and readback,
+  and steps the control band with `UP`/`DW`.
 - Enters programming mode and transfers the address regions the official
   program transfers: global settings and the four per-slot menu blocks of
   each of the six Programmable-Memory slots. Pages move under five-byte
@@ -845,6 +964,15 @@ and DV writes with matching readback. `GW` is exposed read-only, with observed
 values `0` and `2` represented as `DvGatewayMode::Off` and
 `DvGatewayMode::Terminal`. Unobserved values retain their raw bytes.
 
+The typed reads and verified writes of the ordinary settings were exercised
+on the same firmware over the control-panel USB endpoint: every value of every
+bounded domain was written and read back, the next value's rejection was
+observed, each tuning step was measured with `UP` and `DW`, and the stale
+reply that follows a rejected command was provoked and discarded. Memory
+channels were written, read back, recalled, decoded from MCP page reads and
+cleared on the same firmware. `AG`, `AI`, `BL`, `FS`, `FT` and `IO` are
+rejected by this radio and have no accessor.
+
 With Gateway routed to panel USB on firmware 1.02, main-unit USB continues to
 answer identity and Gateway queries while the radio is in Terminal mode, and a
 bounded MCP probe can complete its two fixed reads, programming exit, and fresh
@@ -879,12 +1007,14 @@ Every retry re-enumerates the exact selected endpoint; a partial reply stops
 verification. Ordinary guarded setters and fixed write experiments verify once.
 These are host bounds sized from observation, not firmware timing guarantees.
 
-Bluetooth Terminal entry and restoration are driven by `tmd750-repl`, not by
-this library: the crate supplies `TerminalPlan` and the compare/exchange
-engine, while the caller owns the connection lifecycle, modem ownership, and
-restoration. Hardware coverage is `TM-D750 / 1.02 / K,2,1` in PM Off with the
-Gateway initially routed to panel USB and an independent control-panel USB CAT
-path; the modem identified itself as `TM-D750 RTM1.00`.
+Bluetooth Terminal entry and restoration are owned by this library's
+`TerminalLifecycle` over the caller-supplied `ControlHost`, `ModemHost` and
+`TerminalJournal`; `tmd750-repl` wires the native Bluetooth backend, the USB
+control endpoint, the capture transcripts and the recovery journal to those
+traits. The lifecycle's steps are covered by in-memory host tests. End-to-end
+hardware coverage is `TM-D750 / 1.02 / K,2,1` in PM Off with the Gateway
+initially routed to panel USB and an independent control-panel USB CAT path;
+the modem identified itself as `TM-D750 RTM1.00`.
 
 The generated manifest carries the declared firmware label 1.00, not an
 extracted vendor maximum-version restriction. Legacy raw-page and patch writes

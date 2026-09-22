@@ -40,13 +40,26 @@ impl From<Band> for u8 {
     }
 }
 
-/// Operating mode reported by the TM-D750 `MD` command.
+/// Demodulation mode reported by `MD` and carried in channel records.
+///
+/// The panel's mode set is FM/NFM, DV (DR) and AM (User Manual, Basic
+/// Operations). On firmware 1.02, `0`, `1`, `2` and `3` were each written and
+/// read back on Band A; `2` also appeared by itself after tuning Band B into
+/// the 118 MHz air band, and `4` is reported while a band is in the DR
+/// tuning mode. `3` is the value the other four names leave for NFM; its
+/// panel label was not read. Values `5` through `9` are answered `N`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OperatingMode {
-    /// Analog FM (`0`).
+    /// FM (`0`).
     Fm,
-    /// D-STAR Digital Voice (`1`).
+    /// D-STAR digital voice (`1`).
     Dv,
+    /// AM (`2`).
+    Am,
+    /// Narrow FM (`3`).
+    Nfm,
+    /// DR, D-STAR through the repeater list (`4`); reported, not writable.
+    Dr,
     /// Any other reported value, retained exactly as received.
     Unqualified(u8),
 }
@@ -56,6 +69,9 @@ impl fmt::Display for OperatingMode {
         match self {
             Self::Fm => formatter.write_str("FM"),
             Self::Dv => formatter.write_str("DV"),
+            Self::Am => formatter.write_str("AM"),
+            Self::Nfm => formatter.write_str("NFM"),
+            Self::Dr => formatter.write_str("DR"),
             Self::Unqualified(value) => write!(formatter, "unqualified value {value}"),
         }
     }
@@ -66,6 +82,9 @@ impl From<u8> for OperatingMode {
         match value {
             0 => Self::Fm,
             1 => Self::Dv,
+            2 => Self::Am,
+            3 => Self::Nfm,
+            4 => Self::Dr,
             other => Self::Unqualified(other),
         }
     }
@@ -76,22 +95,28 @@ impl From<OperatingMode> for u8 {
         match value {
             OperatingMode::Fm => 0,
             OperatingMode::Dv => 1,
+            OperatingMode::Am => 2,
+            OperatingMode::Nfm => 3,
+            OperatingMode::Dr => 4,
             OperatingMode::Unqualified(raw) => raw,
         }
     }
 }
 
-/// Operating modes proven selectable through `MD` writes.
+/// Modes an `MD` write selects.
 ///
-/// On firmware 1.02 an `MD 0,7` write (the provisional DR value) is rejected,
-/// so DR is selected from the radio's own digital controls and its read value
-/// is unobserved.
+/// DR is excluded: an `MD band,4` write is answered `N`, and the DR tuning
+/// mode is selected with `VM band,3` instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SelectableMode {
-    /// Analog FM.
+    /// FM.
     Fm,
-    /// D-STAR Digital Voice.
+    /// D-STAR digital voice.
     Dv,
+    /// AM.
+    Am,
+    /// Narrow FM.
+    Nfm,
 }
 
 impl From<SelectableMode> for OperatingMode {
@@ -99,6 +124,8 @@ impl From<SelectableMode> for OperatingMode {
         match value {
             SelectableMode::Fm => Self::Fm,
             SelectableMode::Dv => Self::Dv,
+            SelectableMode::Am => Self::Am,
+            SelectableMode::Nfm => Self::Nfm,
         }
     }
 }
@@ -163,6 +190,9 @@ mod tests {
         for (raw, mode) in [
             (0, OperatingMode::Fm),
             (1, OperatingMode::Dv),
+            (2, OperatingMode::Am),
+            (3, OperatingMode::Nfm),
+            (4, OperatingMode::Dr),
             (7, OperatingMode::Unqualified(7)),
         ] {
             assert_eq!(OperatingMode::from(raw), mode);
@@ -189,11 +219,11 @@ mod tests {
                 mode,
                 "only observed GW meanings receive named variants"
             );
-            assert_eq!(u8::from(mode), raw, "GW evidence must retain its raw value");
+            assert_eq!(u8::from(mode), raw, "GW values must survive conversion");
             assert_eq!(
                 mode.to_string(),
                 label,
-                "GW labels must match qualification"
+                "GW labels must match the observed values"
             );
         }
     }
@@ -216,7 +246,7 @@ mod tests {
     #[test]
     fn unqualified_wire_values_are_preserved() {
         assert!(Band::try_from(2).is_err());
-        assert_eq!(OperatingMode::from(2), OperatingMode::Unqualified(2));
+        assert_eq!(OperatingMode::from(5), OperatingMode::Unqualified(5));
         assert_eq!(DvGatewayMode::from(3), DvGatewayMode::Unqualified(3));
     }
 }

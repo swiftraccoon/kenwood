@@ -2,6 +2,7 @@
 
 use kenwood_schema as _;
 use mcp_d75_extract as _;
+use mmdvm as _;
 use thiserror as _;
 use tokio_serial as _;
 use tracing as _;
@@ -149,37 +150,18 @@ async fn mode_selection_refuses_an_unqualified_radio_type_before_writing() -> Te
 
 #[tokio::test]
 async fn mode_selection_refuses_a_mismatched_write_echo_before_readback() -> TestResult {
-    for reply in [b"MD 1,1\r".as_slice(), b"MD 0,0\r", b"N\r", b"?\r"] {
-        let mut mock = MockTransport::new();
-        scripted_live_identity(&mut mock);
-        mock.expect(b"MD 0,1\r", reply);
-        let mut radio = Radio::new(mock);
-        let result = radio.set_operating_mode(Band::A, SelectableMode::Dv).await;
-        assert!(
-            matches!(
-                result,
-                Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                    expected: "matching OperatingMode write echo",
-                    ..
-                }))
-            ),
-            "reply {reply:?}: {result:?}"
-        );
-        radio.into_transport().assert_complete();
-    }
-    Ok(())
-}
-
-#[tokio::test]
-async fn operating_mode_reads_refuse_the_other_bands_reply() -> TestResult {
     let mut mock = MockTransport::new();
-    mock.expect(b"MD 0\r", b"MD 1,1\r");
+    scripted_live_identity(&mut mock);
+    mock.expect(b"MD 0,1\r", b"MD 0,0\r");
     let mut radio = Radio::new(mock);
-    let result = radio.get_operating_mode(Band::A).await;
+    let result = radio.set_operating_mode(Band::A, SelectableMode::Dv).await;
     assert!(
         matches!(
             result,
-            Err(Error::Protocol(ProtocolError::UnexpectedResponse { .. }))
+            Err(Error::Protocol(ProtocolError::UnexpectedResponse {
+                expected: "write echo equal to the request",
+                ..
+            }))
         ),
         "{result:?}"
     );
@@ -188,20 +170,248 @@ async fn operating_mode_reads_refuse_the_other_bands_reply() -> TestResult {
 }
 
 #[tokio::test]
-async fn mode_selection_refuses_a_readback_from_the_other_band() -> TestResult {
+async fn mode_selection_reports_a_rejected_or_unavailable_write() -> TestResult {
     let mut mock = MockTransport::new();
     scripted_live_identity(&mut mock);
-    mock.expect(b"MD 0,1\r", b"MD 0,1\r");
-    mock.expect(b"MD 0\r", b"MD 1,1\r");
+    mock.expect(b"MD 0,1\r", b"N\r");
     let mut radio = Radio::new(mock);
     let result = radio.set_operating_mode(Band::A, SelectableMode::Dv).await;
     assert!(
         matches!(
             result,
-            Err(Error::Protocol(ProtocolError::UnexpectedResponse { .. }))
+            Err(Error::Protocol(ProtocolError::NotAvailable {
+                command: "MD"
+            }))
         ),
         "{result:?}"
     );
+    radio.into_transport().assert_complete();
+
+    let mut mock = MockTransport::new();
+    scripted_live_identity(&mut mock);
+    mock.expect(b"MD 0,1\r", b"?\r");
+    let mut radio = Radio::new(mock);
+    let result = radio.set_operating_mode(Band::A, SelectableMode::Dv).await;
+    assert!(
+        matches!(
+            result,
+            Err(Error::Protocol(ProtocolError::Rejected { command: "MD" }))
+        ),
+        "{result:?}"
+    );
+    radio.into_transport().assert_complete();
+    Ok(())
+}
+
+#[tokio::test]
+async fn operating_mode_reads_discard_the_other_bands_reply() -> TestResult {
+    let mut mock = MockTransport::new();
+    mock.expect(b"MD 0\r", b"MD 1,1\rMD 0,0\r");
+    let mut radio = Radio::new(mock);
+    assert_eq!(radio.get_operating_mode(Band::A).await?, OperatingMode::Fm);
+    radio.into_transport().assert_complete();
+
+    let mut mock = MockTransport::new();
+    mock.expect(b"MD 0\r", b"MD 1,1\r");
+    mock.pend_when_empty();
+    let mut radio = Radio::new(mock);
+    radio.set_timeout(std::time::Duration::from_millis(20));
+    let result = radio.get_operating_mode(Band::A).await;
+    assert!(matches!(result, Err(Error::Timeout { .. })), "{result:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn mode_selection_discards_a_stale_readback_from_the_other_band() -> TestResult {
+    let mut mock = MockTransport::new();
+    scripted_live_identity(&mut mock);
+    mock.expect(b"MD 0,1\r", b"MD 0,1\r");
+    mock.expect(b"MD 0\r", b"MD 1,1\rMD 0,1\r");
+    let mut radio = Radio::new(mock);
+    radio
+        .set_operating_mode(Band::A, SelectableMode::Dv)
+        .await?;
+    radio.into_transport().assert_complete();
+    Ok(())
+}
+
+#[tokio::test]
+async fn verified_setters_apply_the_gate_then_echo_then_readback() -> TestResult {
+    use kenwood_tmd750::types::{
+        BandControl, BandDisplay, Frequency, PowerLevel, SquelchLevel, StepSize, TuningMode,
+    };
+
+    let mut mock = MockTransport::new();
+    scripted_live_identity(&mut mock);
+    mock.expect(b"FQ 0,0145200000\r", b"FQ 0,0145200000\r");
+    mock.expect(b"FQ 0\r", b"FQ 0,0145200000\r");
+    mock.expect(b"PC 1,2\r", b"PC 1,2\r");
+    mock.expect(b"PC 1\r", b"PC 1,2\r");
+    mock.expect(b"VM 0,3\r", b"VM 0,3\r");
+    mock.expect(b"VM 0\r", b"VM 0,3\r");
+    mock.expect(b"SQ 0,31\r", b"SQ 0,31\r");
+    mock.expect(b"SQ 0\r", b"SQ 0,31\r");
+    mock.expect(b"SF 0,C\r", b"SF 0,C\r");
+    mock.expect(b"SF 0\r", b"SF 0,C\r");
+    mock.expect(b"BC 1,0\r", b"BC 1,0\r");
+    mock.expect(b"BC\r", b"BC 1,0\r");
+    mock.expect(b"DL 1\r", b"DL 1\r");
+    mock.expect(b"DL\r", b"DL 1\r");
+    mock.expect(b"BT 0\r", b"BT 0\r");
+    mock.expect(b"BT\r", b"BT 0\r");
+    let mut radio = Radio::new(mock);
+    radio
+        .set_frequency(Band::A, Frequency::new(145_200_000)?)
+        .await?;
+    radio.set_power_level(Band::B, PowerLevel::Low).await?;
+    radio
+        .set_tuning_mode(Band::A, TuningMode::DStarRepeater)
+        .await?;
+    radio.set_squelch(Band::A, SquelchLevel::new(31)?).await?;
+    radio.set_step_size(Band::A, StepSize::Hz100000).await?;
+    radio
+        .set_band_control(BandControl {
+            control: Band::B,
+            ptt: Band::A,
+        })
+        .await?;
+    radio.set_band_display(BandDisplay::Single).await?;
+    radio.set_bluetooth(false).await?;
+    radio.into_transport().assert_complete();
+    Ok(())
+}
+
+#[tokio::test]
+async fn frequency_stepping_requires_the_control_band() -> TestResult {
+    use kenwood_tmd750::types::Frequency;
+
+    let mut mock = MockTransport::new();
+    scripted_live_identity(&mut mock);
+    mock.expect(b"BC\r", b"BC 0,0\r");
+    mock.expect(b"FQ 0\r", b"FQ 0,0145190000\r");
+    mock.expect(b"UP\r", b"UP\r");
+    mock.expect(b"FQ 0\r", b"FQ 0,0145190000\r");
+    mock.expect(b"FQ 0\r", b"FQ 0,0145195000\r");
+    mock.expect(b"BC\r", b"BC 0,0\r");
+    let mut radio = Radio::new(mock);
+    assert_eq!(
+        radio.frequency_up(Band::A).await?,
+        Frequency::new(145_195_000)?,
+        "a readback that still shows the old frequency is retried"
+    );
+    let refused = radio.frequency_down(Band::B).await;
+    assert!(
+        matches!(
+            refused,
+            Err(Error::NotControlBand {
+                band: Band::B,
+                control: Band::A
+            })
+        ),
+        "{refused:?}"
+    );
+    radio.into_transport().assert_complete();
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_acknowledged_step_that_never_applies_is_an_error() -> TestResult {
+    use kenwood_tmd750::radio::STEP_READBACK_ATTEMPTS;
+
+    let mut mock = MockTransport::new();
+    scripted_live_identity(&mut mock);
+    mock.expect(b"BC\r", b"BC 0,0\r");
+    mock.expect(b"FQ 0\r", b"FQ 0,0145190000\r");
+    mock.expect(b"DW\r", b"DW\r");
+    for _ in 0..STEP_READBACK_ATTEMPTS {
+        mock.expect(b"FQ 0\r", b"FQ 0,0145190000\r");
+    }
+    let mut radio = Radio::new(mock);
+    let result = radio.frequency_down(Band::A).await;
+    assert!(
+        matches!(
+            result,
+            Err(Error::StepNotApplied {
+                band: Band::A,
+                step: "DW",
+                ..
+            })
+        ),
+        "{result:?}"
+    );
+    radio.into_transport().assert_complete();
+    Ok(())
+}
+
+#[tokio::test]
+async fn typed_reads_cover_the_remaining_state() -> TestResult {
+    use kenwood_tmd750::types::{
+        BeaconMethod, CurrentMemorySelector, DstarSlot, MemoryChannelAddress, PacketDataRate,
+        TncMode, TuningMode, VoxMode,
+    };
+
+    let mut mock = MockTransport::new();
+    mock.expect(b"AE\r", b"AE C6210439,K01\r");
+    mock.expect(b"PS\r", b"PS 1\r");
+    mock.expect(b"RT\r", b"RT 260921003607\r");
+    mock.expect(
+        b"FO 0\r",
+        b"FO 0,0145190000,0000600000,2,2,0,0,0,0,0,0,2,08,08,000,0,CQCQCQ,0,00\r",
+    );
+    mock.expect(b"VM 0\r", b"VM 0,1\r");
+    mock.expect(b"MR 0\r", b"MR AP \r");
+    mock.expect(b"ME 000\r", b"N\r");
+    mock.expect(b"DC 1\r", b"DC 1,,\r");
+    mock.expect(b"DS\r", b"DS 1\r");
+    mock.expect(b"AS\r", b"AS 0\r");
+    mock.expect(b"PT\r", b"PT 2\r");
+    mock.expect(b"TN\r", b"TN 0,0\r");
+    mock.expect(b"VX\r", b"VX 0\r");
+    mock.expect(b"SM 1\r", b"SM 1,9\r");
+    mock.expect(b"BY 1\r", b"BY 1,1\r");
+    let mut radio = Radio::new(mock);
+    assert_eq!(
+        radio.get_serial_information().await?.serial_number(),
+        "C6210439"
+    );
+    assert!(radio.get_power_status().await?);
+    assert_eq!(
+        radio.get_real_time_clock().await?.to_string(),
+        "2026-09-21 00:36:07"
+    );
+    assert_eq!(
+        radio
+            .get_channel_record(Band::A)
+            .await?
+            .receive_frequency
+            .as_hz(),
+        145_190_000
+    );
+    assert_eq!(radio.get_tuning_mode(Band::A).await?, TuningMode::Memory);
+    assert_eq!(
+        radio.get_current_channel(Band::A).await?,
+        CurrentMemorySelector::Aprs
+    );
+    assert_eq!(
+        radio
+            .get_memory_channel(MemoryChannelAddress::regular(0)?)
+            .await?,
+        None
+    );
+    assert_eq!(
+        radio
+            .get_dstar_callsign(DstarSlot::new(1)?)
+            .await?
+            .to_string(),
+        "MY1 unset"
+    );
+    assert_eq!(radio.get_dstar_slot().await?, DstarSlot::new(1)?);
+    assert_eq!(radio.get_packet_data_rate().await?, PacketDataRate::Bps1200);
+    assert_eq!(radio.get_beacon_method().await?, BeaconMethod::Auto);
+    assert_eq!(radio.get_tnc_mode().await?, (TncMode::Off, Band::A));
+    assert_eq!(radio.get_vox().await?, VoxMode::Off);
+    assert_eq!(radio.get_smeter(Band::B).await?.as_raw(), 9);
+    assert!(radio.get_busy(Band::B).await?);
     radio.into_transport().assert_complete();
     Ok(())
 }

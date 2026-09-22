@@ -1,4 +1,5 @@
-//! Deterministic tests of reply buffering, write deadlines, and cancellation.
+//! Deterministic tests of reply buffering, stale-line handling, write
+//! deadlines, and cancellation.
 
 use super::*;
 
@@ -10,12 +11,16 @@ enum WriteBehavior {
     Pending,
 }
 
+/// A transport whose chunks either are readable immediately (`released`
+/// unset) or become readable one per write, as a radio's replies do.
 #[derive(Debug)]
 struct TestTransport {
     chunks: VecDeque<Vec<u8>>,
     writes: Vec<Vec<u8>>,
     reads: usize,
     write_behavior: WriteBehavior,
+    release_per_write: bool,
+    released: usize,
 }
 
 impl TestTransport {
@@ -25,7 +30,16 @@ impl TestTransport {
             writes: Vec::new(),
             reads: 0,
             write_behavior: WriteBehavior::Complete,
+            release_per_write: false,
+            released: 0,
         }
+    }
+
+    /// One chunk becomes readable per completed write.
+    fn replying(chunks: impl IntoIterator<Item = Vec<u8>>) -> Self {
+        let mut transport = Self::new(chunks);
+        transport.release_per_write = true;
+        transport
     }
 }
 
@@ -33,12 +47,18 @@ impl Transport for TestTransport {
     async fn write(&mut self, bytes: &[u8]) -> Result<(), TransportError> {
         self.writes.push(bytes.to_vec());
         match self.write_behavior {
-            WriteBehavior::Complete => Ok(()),
+            WriteBehavior::Complete => {
+                self.released += 1;
+                Ok(())
+            }
             WriteBehavior::Pending => std::future::pending().await,
         }
     }
 
     async fn read(&mut self, buffer: &mut [u8]) -> Result<usize, TransportError> {
+        if self.release_per_write && self.released == 0 {
+            return std::future::pending().await;
+        }
         let Some(mut chunk) = self.chunks.pop_front() else {
             return std::future::pending().await;
         };
@@ -49,6 +69,8 @@ impl Transport for TestTransport {
         }
         if chunk.len() > count {
             self.chunks.push_front(chunk.split_off(count));
+        } else if self.release_per_write {
+            self.released -= 1;
         }
         Ok(count)
     }
@@ -59,21 +81,122 @@ impl Transport for TestTransport {
 }
 
 #[tokio::test]
-async fn coalesced_cat_lines_survive_subsequent_commands() -> TestResult {
-    let transport = TestTransport::new([b"ID TM-D750\rFV 1.02\rTY K,2,1\r".to_vec()]);
+async fn a_repeated_reply_line_never_stands_in_for_the_next_command() -> TestResult {
+    let transport = TestTransport::replying([
+        b"ID TM-D750\rID TM-D750\r".to_vec(),
+        b"FV 1.02\r".to_vec(),
+        b"TY K,2,1\r".to_vec(),
+    ]);
     let mut radio = Radio::new(transport);
     let identity = radio.identify().await?;
     assert_eq!(identity.firmware.as_str(), "1.02");
     assert_eq!(identity.radio_type.as_str(), "K,2,1");
     let transport = radio.into_transport();
     assert_eq!(
-        transport.reads, 1,
-        "later lines must come from buffered input"
+        transport.reads, 3,
+        "the repeated ID line must not stand in for the FV reply"
     );
     assert_eq!(
         transport.writes,
         [b"ID\r".to_vec(), b"FV\r".to_vec(), b"TY\r".to_vec()]
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn commands_after_a_rejection_discard_the_repeated_reply() -> TestResult {
+    let transport = TestTransport::replying([
+        b"?\r".to_vec(),
+        b"FQ 0,0145190000\rFQ 0,0145190000\r".to_vec(),
+        b"FQ 0,0145195000\rFQ 0,0145195000\r".to_vec(),
+        b"FQ 0,0145200000\r".to_vec(),
+    ]);
+    let mut radio = Radio::new(transport);
+    let rejected = radio.get_frequency(Band::A).await;
+    assert!(
+        matches!(
+            rejected,
+            Err(Error::Protocol(ProtocolError::Rejected { command: "FQ" }))
+        ),
+        "{rejected:?}"
+    );
+    assert_eq!(radio.get_frequency(Band::A).await?.as_hz(), 145_190_000);
+    assert_eq!(radio.get_frequency(Band::A).await?.as_hz(), 145_195_000);
+    assert_eq!(radio.get_frequency(Band::A).await?.as_hz(), 145_200_000);
+    assert_eq!(radio.transport.writes.len(), 4);
+    assert_eq!(
+        radio.settle_commands, 0,
+        "settling ends after REJECTION_SETTLE_COMMANDS commands"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_stale_line_of_another_command_is_skipped_within_one_reply() -> TestResult {
+    let transport = TestTransport::replying([b"GP 1,0\rFQ 0,0145190000\r".to_vec()]);
+    let mut radio = Radio::new(transport);
+    let frequency = radio.get_frequency(Band::A).await?;
+    assert_eq!(frequency.as_hz(), 145_190_000);
+    assert_eq!(radio.transport.writes, [b"FQ 0\r".to_vec()]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn leftover_bytes_from_an_earlier_connection_user_are_skipped() -> TestResult {
+    let transport = TestTransport::replying([b"\r0145190000\rFQ 0,0145190000\r".to_vec()]);
+    let mut radio = Radio::new(transport);
+    let frequency = radio.get_frequency(Band::A).await?;
+    assert_eq!(frequency.as_hz(), 145_190_000);
+    let transport = TestTransport::replying([b"\r\r\r\r".to_vec()]);
+    let mut radio = Radio::new(transport);
+    let result = radio.get_frequency(Band::A).await;
+    assert!(
+        matches!(
+            result,
+            Err(Error::Protocol(ProtocolError::EmptyLine { .. }))
+        ),
+        "{result:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_reply_for_the_other_band_is_stale_and_the_command_times_out() -> TestResult {
+    let transport = TestTransport::replying([b"MD 1,1\r".to_vec()]);
+    let mut radio = Radio::new(transport);
+    radio.set_timeout(Duration::from_millis(20));
+    let result = radio.get_operating_mode(Band::A).await;
+    assert!(
+        matches!(
+            result,
+            Err(Error::Timeout {
+                operation: "MD",
+                millis: 20
+            })
+        ),
+        "{result:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn too_many_stale_lines_fail_the_command() -> TestResult {
+    let transport =
+        TestTransport::replying([b"XX 1\rXX 2\rXX 3\rXX 4\rFQ 0,0145190000\r".to_vec()]);
+    let mut radio = Radio::new(transport);
+    let result = radio.get_frequency(Band::A).await;
+    assert!(
+        matches!(
+            result,
+            Err(Error::Protocol(ProtocolError::UnexpectedResponse {
+                expected: "FQ",
+                ..
+            }))
+        ),
+        "{result:?}"
+    );
+    let retry = radio.get_frequency(Band::A).await;
+    assert!(matches!(retry, Err(Error::Mcp(McpError::RecoveryRequired))));
     Ok(())
 }
 
@@ -175,7 +298,7 @@ async fn cancelled_write_retains_the_uncertain_protocol_state() {
     transport.write_behavior = WriteBehavior::Pending;
     let mut radio = Radio::new(transport);
     let result =
-        tokio::time::timeout(Duration::from_millis(1), radio.get_operating_mode(Band::A)).await;
+        tokio::time::timeout(Duration::from_millis(50), radio.get_operating_mode(Band::A)).await;
     assert!(result.is_err());
     let retry = radio.get_dv_gateway_mode().await;
     assert!(matches!(retry, Err(Error::Mcp(McpError::RecoveryRequired))));
@@ -184,16 +307,47 @@ async fn cancelled_write_retains_the_uncertain_protocol_state() {
 
 #[tokio::test]
 async fn complete_rejection_replies_leave_the_cat_boundary_ready() -> TestResult {
-    for rejection in [b'N', b'?'] {
-        let transport = TestTransport::new([vec![rejection, b'\r', b'G', b'W', b' ', b'0', b'\r']]);
-        let mut radio = Radio::new(transport);
-        let rejected = radio.get_operating_mode(Band::A).await;
-        assert!(matches!(
+    let transport = TestTransport::replying([b"N\r".to_vec(), b"GW 0\r".to_vec()]);
+    let mut radio = Radio::new(transport);
+    let rejected = radio.get_operating_mode(Band::A).await;
+    assert!(
+        matches!(
             rejected,
-            Err(Error::Protocol(ProtocolError::UnexpectedResponse { .. }))
-        ));
-        assert_eq!(radio.get_dv_gateway_mode().await?, DvGatewayMode::Off);
-        assert_eq!(radio.transport.writes.len(), 2);
-    }
+            Err(Error::Protocol(ProtocolError::NotAvailable {
+                command: "MD"
+            }))
+        ),
+        "{rejected:?}"
+    );
+    assert_eq!(radio.get_dv_gateway_mode().await?, DvGatewayMode::Off);
+    assert_eq!(radio.transport.writes.len(), 2);
+
+    let transport = TestTransport::replying([b"?\r".to_vec(), b"GW 0\r".to_vec()]);
+    let mut radio = Radio::new(transport);
+    let rejected = radio.get_operating_mode(Band::A).await;
+    assert!(
+        matches!(
+            rejected,
+            Err(Error::Protocol(ProtocolError::Rejected { command: "MD" }))
+        ),
+        "{rejected:?}"
+    );
+    assert_eq!(radio.get_dv_gateway_mode().await?, DvGatewayMode::Off);
+    assert_eq!(radio.transport.writes.len(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn bluetooth_writes_wait_longer_than_the_ordinary_deadline() -> TestResult {
+    let mut radio = Radio::new(TestTransport::new([]));
+    radio.set_timeout(Duration::from_millis(10));
+    assert_eq!(
+        radio.reply_timeout(&Command::SetBluetooth { enabled: true }),
+        BLUETOOTH_WRITE_TIMEOUT
+    );
+    assert_eq!(
+        radio.reply_timeout(&Command::GetBluetooth),
+        Duration::from_millis(10)
+    );
     Ok(())
 }

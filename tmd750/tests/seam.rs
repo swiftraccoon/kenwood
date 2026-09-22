@@ -4,6 +4,7 @@ use kenwood_schema as _;
 use kenwood_tmd750 as _;
 use kenwood_transport as _;
 use mcp_d75_extract as _;
+use mmdvm as _;
 use thiserror as _;
 use tokio as _;
 use tokio_serial as _;

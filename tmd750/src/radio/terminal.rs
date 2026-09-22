@@ -5,6 +5,10 @@
 //! is active, the recovery journal, shutdown, and fresh verification remain the
 //! caller's.
 
+pub mod lifecycle;
+pub mod session;
+pub mod transition;
+
 use std::collections::BTreeMap;
 
 use super::Identity;

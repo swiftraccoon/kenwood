@@ -35,6 +35,24 @@ pub enum Error {
         /// The timeout that elapsed.
         millis: u64,
     },
+    /// `UP` and `DW` act on the control band, and the requested band is not it.
+    #[error("band {band} is not the control band (band {control}); select it with BC first")]
+    NotControlBand {
+        /// Band the caller asked to step.
+        band: crate::types::Band,
+        /// Band the radio reports as its control band.
+        control: crate::types::Band,
+    },
+    /// The radio acknowledged `UP` or `DW` but kept reporting the same frequency.
+    #[error("band {band} still reports {frequency} after an acknowledged {step} step")]
+    StepNotApplied {
+        /// Band that was stepped.
+        band: crate::types::Band,
+        /// Frequency read before the step and after every readback attempt.
+        frequency: crate::types::Frequency,
+        /// The step command mnemonic, `UP` or `DW`.
+        step: &'static str,
+    },
     /// The connected radio does not match the schema-target gate.
     #[error(
         "MCP-D750 schema patches support only {expected_model} firmware {expected_firmware} \
@@ -148,6 +166,110 @@ pub enum ValidationError {
         /// Expected length.
         expected: usize,
     },
+    /// A frequency lies outside the receiver range.
+    #[error("frequency {hz} Hz is outside 108-524 MHz")]
+    FrequencyOutOfRange {
+        /// Rejected frequency in hertz.
+        hz: u32,
+    },
+    /// A repeater offset exceeds 29.95 MHz.
+    #[error("offset {hz} Hz exceeds 29.95 MHz")]
+    OffsetOutOfRange {
+        /// Rejected offset in hertz.
+        hz: u32,
+    },
+    /// A channel transmit field is neither an offset nor a receivable frequency.
+    #[error(
+        "transmit field {hz} Hz is neither an offset up to 29.95 MHz nor a 108-524 MHz frequency"
+    )]
+    TransmitFieldOutOfRange {
+        /// Rejected value in hertz.
+        hz: u32,
+    },
+    /// A fixed-width decimal wire field has the wrong shape.
+    #[error("wire field {text:?} is not exactly {digits} ASCII digits")]
+    InvalidWireDigits {
+        /// The rejected text.
+        text: String,
+        /// Required digit count.
+        digits: usize,
+    },
+    /// A megahertz value is not an unsigned decimal with at most six fractional digits.
+    #[error("{text:?} is not a decimal megahertz value with at most six fractional digits")]
+    InvalidMegahertzText {
+        /// The rejected text.
+        text: String,
+    },
+    /// A step-size field is not one hexadecimal digit from `0` to `C`.
+    #[error("step size {value:?} is not one hexadecimal digit from 0 to C")]
+    InvalidStepSize {
+        /// The rejected text or index.
+        value: String,
+    },
+    /// A setting value lies outside its wire domain.
+    #[error("{setting} {value} is outside its domain (maximum {max})")]
+    SettingOutOfRange {
+        /// The setting.
+        setting: &'static str,
+        /// Rejected value.
+        value: u64,
+        /// Largest accepted value.
+        max: u64,
+    },
+    /// A memory address is not `000`-`999`, `L00`-`L49`, `U00`-`U49` or `Pri`.
+    #[error("memory address {text:?} is not 000-999, L00-L49, U00-U49 or Pri")]
+    InvalidMemoryAddress {
+        /// The rejected text.
+        text: String,
+    },
+    /// More than one tone-signaling enable digit is set in a channel record.
+    #[error(
+        "channel record enables more than one tone function: tone={tone}, CTCSS={ctcss}, DCS={dcs}, cross tone={cross_tone}"
+    )]
+    MultipleToneModes {
+        /// Tone enable digit.
+        tone: bool,
+        /// CTCSS enable digit.
+        ctcss: bool,
+        /// DCS enable digit.
+        dcs: bool,
+        /// Cross tone enable digit.
+        cross_tone: bool,
+    },
+    /// A field is not one uppercase hexadecimal digit.
+    #[error("{text:?} is not one uppercase hexadecimal digit")]
+    InvalidHexDigit {
+        /// The rejected text.
+        text: String,
+    },
+    /// A callsign or memo field is too long or holds a byte outside its alphabet.
+    #[error("callsign text {text:?} is too long or holds a byte outside its alphabet")]
+    InvalidCallsignText {
+        /// The rejected text.
+        text: String,
+    },
+    /// A serial-information field has the wrong length or a non-graphic byte.
+    #[error("serial information field {text:?} has the wrong length or a non-graphic byte")]
+    InvalidSerialText {
+        /// The rejected text.
+        text: String,
+    },
+    /// A stored channel record, flag or name slice has the wrong length.
+    #[error(
+        "stored channel slice is {actual} bytes; expected 40 for a record, 4 for a flag or 16 for a name"
+    )]
+    StoredChannelLength {
+        /// The rejected length.
+        actual: usize,
+    },
+    /// An image is too short to hold the channel tables.
+    #[error("image is {actual} bytes; the channel tables end at byte {required}")]
+    ImageTooShortForChannels {
+        /// The image length.
+        actual: usize,
+        /// The first length that holds every table.
+        required: usize,
+    },
 }
 
 /// Bytes from the radio that did not follow the protocol.
@@ -182,6 +304,16 @@ pub enum ProtocolError {
         /// What was wrong.
         detail: String,
     },
+    /// A CAT reply had the wrong number of comma-separated fields.
+    #[error("{command} reply has {actual} fields, expected {expected}")]
+    FieldCount {
+        /// Command mnemonic.
+        command: &'static str,
+        /// Expected field count.
+        expected: usize,
+        /// Actual field count.
+        actual: usize,
+    },
     /// A reply was not the one the command expects.
     #[error("expected {expected} reply, got {actual}")]
     UnexpectedResponse {
@@ -189,6 +321,18 @@ pub enum ProtocolError {
         expected: &'static str,
         /// What arrived.
         actual: String,
+    },
+    /// The radio answered `?`: the command or its argument was rejected.
+    #[error("{command} was rejected with ?")]
+    Rejected {
+        /// Command mnemonic.
+        command: &'static str,
+    },
+    /// The radio answered `N`: the command is unavailable in the current state.
+    #[error("{command} answered N; it is unavailable in the radio's current state")]
+    NotAvailable {
+        /// Command mnemonic.
+        command: &'static str,
     },
     /// The `ID` reply named another radio.
     #[error("connected radio identified as {reply:?}, not TM-D750")]
