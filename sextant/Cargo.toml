@@ -48,7 +48,7 @@ egui = "0.29"
 
 # Audio I/O.
 cpal = "0.15"
-ringbuf = "0.4"
+ringbuf = "0.5"
 rubato = "0.16"
 hound = "3"
 
