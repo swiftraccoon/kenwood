@@ -51,8 +51,9 @@ impl<T: Transport> Radio<T> {
     ///
     /// This is an ACTION composite: it selects `band` as the active band
     /// when necessary (UP/DW act on the active band), requires that band to
-    /// be in VFO tuning mode (so a selected memory, call, or weather channel
-    /// is never changed), and then walks to the target one step at a time.
+    /// be in VFO tuning mode (so a selected memory, call, or DR repeater
+    /// channel is never changed), and then walks to the target one step at a
+    /// time.
     /// Every step is verified by a frequency readback before the next step
     /// is sent. On hardware, the radio acknowledges rapid consecutive step
     /// commands but can swallow all

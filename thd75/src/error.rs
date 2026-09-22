@@ -436,7 +436,7 @@ pub enum Error {
     /// A stepped-tuning operation requires the band in VFO tuning mode.
     #[error(
         "stepped tuning requires band {band} in VFO tuning mode so the selected memory, call, \
-         or weather channel is never changed; current tuning mode is {current:?}"
+         or DR repeater channel is never changed; current tuning mode is {current:?}"
     )]
     VfoTuningRequired {
         /// Band whose tuning mode was checked.

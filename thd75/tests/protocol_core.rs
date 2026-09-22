@@ -212,10 +212,10 @@ fn serialize_vm_call_mode() {
 }
 
 #[test]
-fn serialize_vm_wx_mode() {
+fn serialize_vm_dr_mode() {
     let bytes = protocol::serialize(&Command::SetTuningMode {
         band: Band::A,
-        mode: TuningMode::Weather,
+        mode: TuningMode::DStarRepeater,
     });
     assert_eq!(bytes, b"VM 0,3\r");
 }
@@ -535,13 +535,13 @@ fn parse_vm_response_call() -> TestResult {
 }
 
 #[test]
-fn parse_vm_response_wx() -> TestResult {
+fn parse_vm_response_dr() -> TestResult {
     let r = protocol::parse(b"VM 0,3")?;
     let Response::TuningMode { band, mode } = r else {
         return Err(format!("expected TuningMode, got {r:?}").into());
     };
     assert_eq!(band, Band::A);
-    assert_eq!(mode, TuningMode::Weather);
+    assert_eq!(mode, TuningMode::DStarRepeater);
     Ok(())
 }
 

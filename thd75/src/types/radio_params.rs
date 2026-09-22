@@ -247,8 +247,9 @@ impl fmt::Display for SMeterReading {
 /// - **Call mode** (`[CALL]`): quick-access channel for emergency/group
 ///   use. Default call channels: TH-D75A 146.520 FM (VHF), 446.000 FM
 ///   (UHF); TH-D75E 145.500 FM (VHF), 433.500 FM (UHF).
-/// - **Weather mode**: NOAA weather channels (TH-D75A only, 10 channels
-///   A1-A10 at 161.650-163.275 MHz).
+/// - **DR mode**: the D-STAR repeater list. On firmware 1.03.AZM a band
+///   reporting `VM 0,3` also reported `MD 0,7` (DR) and the listed repeater's
+///   frequency. The weather channels have no `VM` value of their own here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TuningMode {
     /// VFO mode: frequency entered directly (index 0).
@@ -257,8 +258,8 @@ pub enum TuningMode {
     Memory = 1,
     /// Call channel mode: quick-access channel (index 2).
     Call = 2,
-    /// Weather channel mode: NOAA weather frequencies (index 3).
-    Weather = 3,
+    /// DR mode: the D-STAR repeater list (index 3).
+    DStarRepeater = 3,
 }
 
 impl TuningMode {
@@ -267,7 +268,7 @@ impl TuningMode {
 
     /// Every tuning mode, in `VM` wire-value order.
     pub const ALL: [Self; Self::COUNT as usize] =
-        [Self::Vfo, Self::Memory, Self::Call, Self::Weather];
+        [Self::Vfo, Self::Memory, Self::Call, Self::DStarRepeater];
 }
 
 impl fmt::Display for TuningMode {
@@ -276,7 +277,7 @@ impl fmt::Display for TuningMode {
             Self::Vfo => f.write_str("VFO"),
             Self::Memory => f.write_str("Memory"),
             Self::Call => f.write_str("Call"),
-            Self::Weather => f.write_str("Weather"),
+            Self::DStarRepeater => f.write_str("DR"),
         }
     }
 }
@@ -289,7 +290,7 @@ impl TryFrom<u8> for TuningMode {
             0 => Ok(Self::Vfo),
             1 => Ok(Self::Memory),
             2 => Ok(Self::Call),
-            3 => Ok(Self::Weather),
+            3 => Ok(Self::DStarRepeater),
             _ => Err(ValidationError::SettingOutOfRange {
                 name: "tuning mode",
                 value,
