@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use dstar_gateway::tokio_shell::{AnyAsyncSession, AnyEvent, fresh_stream_id};
 use dstar_gateway_core::{Callsign, DstarHeader, Module, StreamId, VoiceFrame};
+use kenwood_tmd750::ProvenModem;
 use kenwood_tmd750::transport::{DEFAULT_BAUD, SerialTransport, open_serial};
 use kenwood_transport::Transport;
 use mmdvm::dstar::{DstarEvent, DstarModemConfig};
@@ -22,12 +23,12 @@ use rustyline::error::ReadlineError;
 use crate::{output, terminal};
 
 mod endpoints;
+mod hosts;
 mod lifecycle;
 mod modem;
 mod network;
 pub(crate) mod probe;
 mod startup;
-pub(crate) mod transition;
 
 use lifecycle::{
     RelayMode, StreamLifecycle, complete_cycle_or_input, next_event_before_quiet, settle_streams,
@@ -240,7 +241,7 @@ impl DstarSession<SerialTransport> {
 
 impl<T: Transport + Unpin + 'static> DstarSession<T> {
     async fn from_proof(
-        proof: modem::ProvenModem<T>,
+        proof: ProvenModem<T>,
         request: StartRequest,
         recovery: Option<startup::Recovery>,
         cancelled: &AtomicBool,
@@ -256,7 +257,7 @@ impl<T: Transport + Unpin + 'static> DstarSession<T> {
     }
 
     async fn from_proof_with_link<F>(
-        proof: modem::ProvenModem<T>,
+        proof: ProvenModem<T>,
         request: StartRequest,
         recovery: Option<startup::Recovery>,
         cancelled: &AtomicBool,
@@ -1361,9 +1362,7 @@ mod tests {
         SharedMock::new(mock)
     }
 
-    async fn prove_test_modem(
-        shared: &SharedMock,
-    ) -> Result<modem::ProvenModem<SharedMock>, String> {
+    async fn prove_test_modem(shared: &SharedMock) -> Result<ProvenModem<SharedMock>, String> {
         prove_mmdvm_or_explain_cat_with_timeout(
             shared.clone(),
             Duration::from_millis(1),

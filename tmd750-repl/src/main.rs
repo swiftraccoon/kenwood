@@ -4,6 +4,7 @@
 //! entered interactively or supplied once on the command line for scripting.
 
 mod capture;
+mod cat;
 mod connection;
 mod dstar;
 mod hosts;
@@ -36,7 +37,7 @@ const HELP_LINES: &[&str] = &[
     "identity | id: Read model, firmware, and radio type.",
     "status: Read identity, both band modes, and DV Gateway state.",
     "mode [a|b]: Read one band's mode; Band A is the default.",
-    "mode [a|b] fm|dv: Select FM or RF DV; verify echo and readback.",
+    "mode [a|b] fm|dv|am|nfm: Select a mode; verify echo and readback.",
     "dv [a|b]: Select ordinary RF D-STAR DV, not Terminal Mode.",
     "fm [a|b] | normal [a|b]: Select FM and verify readback.",
     "gateway: Read the persistent DV Gateway state; no change.",
@@ -121,6 +122,8 @@ enum Command {
     Fm(Band),
     Gateway,
     Terminal,
+    Read(cat::Read),
+    Write(cat::Write),
     Quit,
 }
 
@@ -252,7 +255,9 @@ async fn run_command(cli: &Cli, one_shot: Option<Command>) -> AppResult<()> {
             | Command::Mode { .. }
             | Command::Dv(_)
             | Command::Fm(_)
-            | Command::Gateway => {}
+            | Command::Gateway
+            | Command::Read(_)
+            | Command::Write(_) => {}
             Command::DstarStart(_) => unreachable!("D-STAR startup was dispatched above"),
         }
     }
@@ -331,7 +336,13 @@ async fn run_native(cli: &Cli, command: Option<Command>) -> AppResult<()> {
             return Ok(());
         }
         Some(Command::Quit) => return Ok(()),
-        Some(command @ (Command::Mode { .. } | Command::Dv(_) | Command::Fm(_))) => {
+        Some(
+            command @ (Command::Mode { .. }
+            | Command::Dv(_)
+            | Command::Fm(_)
+            | Command::Read(_)
+            | Command::Write(_)),
+        ) => {
             let endpoint = resolve_native(cli).await?;
             return native::repl::run(&endpoint, Some(command)).await;
         }
@@ -686,6 +697,11 @@ async fn execute_command<T: Transport>(
             output::line(format_args!("DV Gateway state: {gateway} (read only)."));
         }
         Command::Terminal => print_terminal_information(),
+        Command::Read(read) => cat::execute_read(radio, read).await?,
+        Command::Write(write) => {
+            policy.admit_mode_write(radio).await?;
+            cat::execute_write(radio, write).await?;
+        }
         Command::Quit => return Ok(LoopAction::Quit),
     }
     Ok(LoopAction::Continue)
@@ -700,7 +716,7 @@ fn print_identity(identity: &Identity) {
 
 fn print_help() {
     output::line(format_args!("CAT commands (interactive or startup):"));
-    for line in HELP_LINES {
+    for line in HELP_LINES.iter().chain(cat::HELP_LINES) {
         output::line(format_args!("{line}"));
     }
     output::line(format_args!("Startup only: dstar start CALL [REFLECTOR]"));
@@ -743,6 +759,12 @@ fn parse_command(line: &str) -> Result<Option<Command>, CommandError> {
         .map(str::to_ascii_lowercase)
         .collect();
     let words: Vec<&str> = lowercase.iter().map(String::as_str).collect();
+    if let Some(parsed) = cat::parse(&words) {
+        return match parsed.map_err(|error| CommandError(error.0))? {
+            cat::Parsed::Read(read) => Ok(Some(Command::Read(read))),
+            cat::Parsed::Write(write) => Ok(Some(Command::Write(write))),
+        };
+    }
     let command = match words.as_slice() {
         [] => return Ok(None),
         ["help" | "?"] => Command::Help,
@@ -812,12 +834,13 @@ fn parse_selectable_mode(word: &str) -> Result<SelectableMode, CommandError> {
     match word {
         "fm" => Ok(SelectableMode::Fm),
         "dv" | "dstar" | "d-star" => Ok(SelectableMode::Dv),
+        "am" => Ok(SelectableMode::Am),
+        "nfm" | "narrow" => Ok(SelectableMode::Nfm),
         "dr" => Err(CommandError(
-            "DR CAT selection was rejected by the live radio; use the radio's DV/DR control"
-                .to_owned(),
+            "DR is a tuning mode, not an MD value: use tuning [a|b] dr".to_owned(),
         )),
         _ => Err(CommandError(format!(
-            "selectable mode must be fm or dv, not {word:?}"
+            "selectable mode must be fm, dv, am or nfm, not {word:?}"
         ))),
     }
 }
@@ -836,7 +859,7 @@ mod tests {
 
     #[test]
     fn command_help_fits_on_one_line_with_a_timestamp() {
-        for line in HELP_LINES {
+        for line in HELP_LINES.iter().chain(cat::HELP_LINES) {
             assert!(line.chars().count() + "[00:00:00] ".len() <= 80, "{line}");
         }
     }
@@ -1199,8 +1222,26 @@ mod tests {
     fn unqualified_writes_are_rejected() {
         let dr = parse_command("mode a dr");
         assert!(
-            matches!(dr, Err(CommandError(ref message)) if message.contains("rejected by the live radio")),
-            "DR must remain outside the write surface: {dr:?}"
+            matches!(dr, Err(CommandError(ref message)) if message.contains("tuning [a|b] dr")),
+            "DR is selected as a tuning mode, never as an MD write: {dr:?}"
+        );
+        assert_eq!(
+            parse_command("mode b nfm"),
+            Ok(Some(Command::Mode {
+                band: Band::B,
+                set_to: Some(SelectableMode::Nfm),
+            }))
+        );
+        assert_eq!(
+            parse_command("tuning b dr"),
+            Ok(Some(Command::Write(cat::Write::Tuning(
+                Band::B,
+                kenwood_tmd750::types::TuningMode::DStarRepeater
+            ))))
+        );
+        assert_eq!(
+            parse_command("freq"),
+            Ok(Some(Command::Read(cat::Read::Frequency(Band::A))))
         );
         assert!(
             parse_command("raw MD 0,1").is_err(),

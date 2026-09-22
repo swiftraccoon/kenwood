@@ -157,7 +157,11 @@ impl Connection {
             .first()
             .and_then(|record| record.get("event"))
             .ok_or("baseline event absent")?;
-        assert_eq!(prepared.get("kind"), Some(&json!("prepared")));
+        assert_eq!(
+            prepared.get("kind"),
+            Some(&json!("prepared")),
+            "the first journal event records the prepared plan"
+        );
         let forward = plan(0)?;
         let page_value = |page: &kenwood_tmd750::PageReplacement| {
             json!({
@@ -166,8 +170,12 @@ impl Connection {
             })
         };
         let guards: Vec<_> = forward.replacements().iter().map(page_value).collect();
-        assert_eq!(guards.len(), 4);
-        assert_eq!(prepared.get("pages"), Some(&json!(guards)));
+        assert_eq!(guards.len(), 4, "the plan covers four guard pages");
+        assert_eq!(
+            prepared.get("pages"),
+            Some(&json!(guards)),
+            "the prepared record holds every guard page image"
+        );
         let writes = self
             .observed
             .lock()
@@ -177,7 +185,11 @@ impl Connection {
             .last()
             .and_then(|record| record.get("event"))
             .ok_or("write intent absent")?;
-        assert_eq!(intended.get("kind"), Some(&json!("before_write")));
+        assert_eq!(
+            intended.get("kind"),
+            Some(&json!("before_write")),
+            "the last journal event before a write records the intent"
+        );
         assert_eq!(
             records
                 .iter()
@@ -191,13 +203,21 @@ impl Connection {
         } else {
             ("restore", forward.restoration()?)
         };
-        assert_eq!(intended.get("phase"), Some(&json!(phase)));
+        assert_eq!(
+            intended.get("phase"),
+            Some(&json!(phase)),
+            "the intent names the entry or restore phase"
+        );
         let replacement = expected_plan
             .replacements()
             .iter()
             .find(|page| frame(page.page(), page.replacement()) == bytes)
             .ok_or("dispatch differs from exact planned page image")?;
-        assert_eq!(intended.get("page"), Some(&page_value(replacement)));
+        assert_eq!(
+            intended.get("page"),
+            Some(&page_value(replacement)),
+            "the intent records the exact planned page image"
+        );
         Ok(())
     }
 }
@@ -267,7 +287,7 @@ impl Backend for TestBackend {
         endpoint: &SerialCandidate,
         baud: u32,
     ) -> Result<Connection, TransportError> {
-        assert_eq!(baud, DEFAULT_BAUD);
+        assert_eq!(baud, DEFAULT_BAUD, "every open uses the CAT baud");
         self.observed
             .lock()
             .map_err(|error| TransportError::Write(io::Error::other(error.to_string())))?
@@ -285,7 +305,8 @@ impl Backend for TestBackend {
                 endpoints().modem
             } else {
                 endpoints().control
-            }
+            },
+            "each open targets the scripted endpoint role"
         );
         let mut observed = self
             .observed
@@ -396,16 +417,17 @@ impl Harness {
             .observed
             .lock()
             .map_err(|error| io::Error::other(error.to_string()))?;
-        assert_eq!(observed.live, 0);
+        assert_eq!(observed.live, 0, "no connection may remain live");
         assert_eq!(observed.opens, owners, "no unplanned open may be attempted");
-        assert_eq!(observed.writes, writes);
+        assert_eq!(observed.writes, writes, "exactly the expected page writes");
         assert_eq!(
             observed
                 .events
                 .iter()
                 .filter(|event| *event == "close")
                 .count(),
-            owners
+            owners,
+            "every opened connection is closed"
         );
         assert_eq!(
             observed
@@ -413,7 +435,8 @@ impl Harness {
                 .iter()
                 .filter(|event| *event == "drop")
                 .count(),
-            owners
+            owners,
+            "every opened connection is dropped"
         );
         drop(observed);
         assert!(

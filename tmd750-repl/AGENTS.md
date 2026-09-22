@@ -6,10 +6,17 @@
   `tests/dependency_seam.rs` rejects another model's source imports and
   manifest ownership.
 - D-STAR configuration, events and modem processing come from `mmdvm::dstar`;
-  strict version identification comes from `mmdvm::probe`. The TM-D750 CAT
-  identity check, the exact selected connection, and shutdown/close stay local
-  policy here. Shared protocol success must not imply Terminal selection, CAT
-  readiness, automatic Gateway entry/exit, or verification on hardware.
+  strict version identification comes from `mmdvm::probe`. The exact selected
+  connection stays local policy here.
+- The `dstar start` Bluetooth Terminal lifecycle (preflight, entry, MMDVM
+  handoff and restoration) is owned by `kenwood_tmd750::TerminalLifecycle`.
+  `dstar/hosts.rs` implements the library `ControlHost`, `ModemHost` and
+  `TerminalJournal` over this crate's capture transcripts, native Bluetooth
+  backend and recovery journal; `dstar/startup` reserves the capture directory
+  and serializes the run. This crate no longer owns the entry, transition or
+  readiness state machines. `mcp::reconnect` remains the readiness engine for
+  the other MCP commands (backup, menu apply, the trials and `dstar probe
+  --manage-terminal`), which are unchanged.
 - Every capture directory is created exclusively, mode 0700, with 0600 files;
   an existing path is refused rather than overwritten. `--output` names a new
   directory whose parent must exist.
@@ -51,7 +58,12 @@ cargo run -p tmd750-repl -- dstar start CALL [REFLECTOR]     # --control-port pi
   `--backup`, and the control endpoint must be the other USB role of the same
   radio.
 - Interactive vocabulary: `help`, `identity` (`id`), `status`, `mode [a|b]
-  [fm|dv]`, `dv [a|b]`, `fm [a|b]` (`normal`), `gateway`, `terminal`, `quit`
-  (`exit`). `dstar start` consumes the connection and is startup-only.
+  [fm|dv|am|nfm]`, `dv [a|b]`, `fm [a|b]` (`normal`), `gateway`, `terminal`,
+  `quit` (`exit`), plus the typed reads and verified writes in `src/cat.rs`
+  (`freq`, `power`, `tuning`, `squelch`, `step`, `up`/`down`, `bands`, GPS,
+  VOX, Bluetooth and the rest listed by `help`). `dstar start` consumes the
+  connection and is startup-only. Every write goes through
+  `CommandPolicy::admit_mode_write`, so native Bluetooth writes require a fresh
+  Gateway Off reply.
 - In a `dstar start` session, Ctrl-C returns to the D-STAR prompt and
   `dstar stop` closes the link and rewrites exactly the pages startup changed.

@@ -128,10 +128,10 @@ fn assert_never_opened(harness: &Harness) -> TestResult {
         .observed
         .lock()
         .map_err(|error| io::Error::other(error.to_string()))?;
-    assert!(observed.events.is_empty());
-    assert_eq!(observed.opens, 0);
-    assert_eq!(observed.live, 0);
-    assert_eq!(observed.writes, 0);
+    assert!(observed.events.is_empty(), "no endpoint may be opened");
+    assert_eq!(observed.opens, 0, "no endpoint may be opened");
+    assert_eq!(observed.live, 0, "no connection may remain live");
+    assert_eq!(observed.writes, 0, "no page may be written");
     drop(observed);
     assert_eq!(
         harness.backend.scripts.len(),

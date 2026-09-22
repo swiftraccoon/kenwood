@@ -29,7 +29,11 @@ use super::{Limits, Request, finish_on_interrupt};
 mod admission;
 mod evidence;
 mod phase;
-#[cfg(test)]
+// The managed diagnostic runs only on Unix (`run` refuses other hosts because
+// it requires private Unix files and directory synchronization), so its
+// workflow tests, which drive that path over real capture and journal files,
+// run on Unix only.
+#[cfg(all(test, unix))]
 mod tests;
 
 use admission::Endpoints;

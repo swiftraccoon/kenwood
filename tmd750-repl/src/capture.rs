@@ -450,15 +450,6 @@ impl<T, W: Write> CaptureTransport<T, W> {
 }
 
 impl<T> CaptureTransport<T, File> {
-    /// Clone a synchronization-only handle, keeping this transport open.
-    ///
-    /// The returned handle must never write or seek. Call `sync_all` before a
-    /// write that requires the preceding transcript to be on disk; a failure
-    /// there stops that write and is retained in its outcome.
-    pub(super) fn synchronization_handle(&self) -> io::Result<File> {
-        self.recorder.synchronization_handle()
-    }
-
     /// Flush and `sync_all` the transcript before the next exchange.
     ///
     /// A synchronization failure marks the recorder incomplete and sets

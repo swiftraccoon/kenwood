@@ -1,15 +1,14 @@
 //! TM-D750 preflight and ownership around the model-neutral D-STAR runtime.
 //!
 //! `prove_mmdvm_or_explain_cat` probes MMDVM only after the initial `ID\r`
-//! write completed and no bytes were received. A caller that has already
-//! completed the Terminal update and the acknowledged MCP exit may instead
-//! call `ProvenModem::probe` on the connection it still holds. A proved
-//! connection is held until modem startup consumes it. Shutdown closes it
-//! without changing the persistent Gateway setting.
+//! write completed and no bytes were received, for the USB-only `dstar start
+//! --port` path. The library's `TerminalLifecycle` proves the modem itself on
+//! the Bluetooth path. A proved connection is held until modem startup consumes
+//! it. Shutdown closes it without changing the persistent Gateway setting.
 
 use std::time::Duration;
 
-use kenwood_tmd750::{Error as Tmd750Error, Radio as CatRadio};
+use kenwood_tmd750::{Error as Tmd750Error, ProvenModem, Radio as CatRadio};
 use kenwood_transport::{StreamAdapter, Transport, TransportError};
 use mmdvm::AsyncModem;
 use mmdvm::dstar::{DstarModem, DstarModemConfig};
@@ -23,13 +22,6 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Model-neutral runtime over the selected transport adapter.
 pub(super) type Gateway<T> = DstarModem<StreamAdapter<T>>;
-
-/// A connection on which a complete MMDVM `GET_VERSION` exchange succeeded.
-///
-/// Only `ProvenModem::probe` and the CAT preflight construct this type, so the
-/// wrapped transport is always the connection that answered.
-#[derive(Debug)]
-pub(super) struct ProvenModem<T>(T);
 
 /// A failed modem start: why it failed, plus any failure closing the connection.
 #[derive(Debug)]
@@ -58,33 +50,6 @@ impl std::fmt::Display for StartFailure {
 }
 
 impl std::error::Error for StartFailure {}
-
-impl<T: Transport> ProvenModem<T> {
-    /// Send one `GET_VERSION` on `transport` and require a complete reply.
-    ///
-    /// No CAT is sent, so the caller is responsible for having completed the
-    /// Terminal update and the acknowledged MCP exit first. On failure the same
-    /// transport is returned with the error, for the caller to close.
-    pub(super) async fn probe(
-        mut transport: T,
-        timeout: Duration,
-    ) -> Result<Self, (T, mmdvm::probe::ProbeError)> {
-        match mmdvm::probe::probe_version(&mut transport, timeout).await {
-            Ok(_) => Ok(Self(transport)),
-            Err(error) => Err((transport, error)),
-        }
-    }
-
-    /// Take back the transport, for example to close it instead of using it.
-    pub(super) fn into_transport(self) -> T {
-        self.0
-    }
-
-    /// Borrow the proved transport, for example to read its metadata.
-    pub(super) const fn transport(&self) -> &T {
-        &self.0
-    }
-}
 
 /// What the observer saw while dispatching the initial CAT request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -202,10 +167,9 @@ pub(super) async fn prove_mmdvm_or_explain_cat_with_timeout<T: Transport>(
             ) && observation.is_silent_completed_id()
             {
                 tracing::debug!(%error, "CAT ID was silent; attempting a bounded MMDVM version probe");
-                let mut transport = observation.inner;
-                match mmdvm::probe::probe_version(&mut transport, VERSION_PROBE_TIMEOUT).await {
-                    Ok(_) => Ok(ProvenModem(transport)),
-                    Err(error) => {
+                match ProvenModem::probe(observation.inner, VERSION_PROBE_TIMEOUT).await {
+                    Ok(proof) => Ok(proof),
+                    Err((transport, error)) => {
                         let message = format!(
                             "CAT was silent, but the endpoint did not answer a complete MMDVM GET_VERSION probe ({error}). No gateway frames were sent. Check Menu 986 routing and Menu 650, then try again."
                         );
@@ -230,7 +194,7 @@ pub(super) async fn start_gateway<T: Transport + Unpin + 'static>(
     proof: ProvenModem<T>,
     config: DstarModemConfig,
 ) -> Result<Gateway<T>, StartFailure> {
-    let modem = AsyncModem::spawn(StreamAdapter::new(proof.0));
+    let modem = AsyncModem::spawn(StreamAdapter::new(proof.into_transport()));
     match DstarModem::initialize(modem, config).await {
         Ok(gateway) => Ok(gateway),
         Err((modem, error)) => {

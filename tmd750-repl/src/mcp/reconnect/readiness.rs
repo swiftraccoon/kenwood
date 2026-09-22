@@ -5,10 +5,10 @@
 
 use super::{
     AtomicBool, Backend, CLOSE_TIMEOUT, ConnectionAttempt, Duration, Enumeration,
-    EnumerationWindow, Failure, File, Identity, OperationOutcome, Ordering, PostExitVerification,
-    Recorder, SETTLE, SerialCandidate, Serialize, SkipReason, TranscriptSummary,
-    VerificationContext, VerificationGoal, VerificationOutcome, VerificationStage,
-    attempt_identity, await_endpoint, finalize_capture, milliseconds, wait_recorded,
+    EnumerationWindow, Failure, File, Identity, Ordering, PostExitVerification, Recorder, SETTLE,
+    SerialCandidate, Serialize, SkipReason, TranscriptSummary, VerificationContext,
+    VerificationGoal, VerificationOutcome, VerificationStage, attempt_identity, await_endpoint,
+    finalize_capture, milliseconds, wait_recorded,
 };
 
 /// Deadline for each write and each reply of the three identity queries (1.5 s).
@@ -94,27 +94,6 @@ impl ReadinessVerification {
     /// True when the outcome is `Matched` and the transcript is complete.
     pub(crate) const fn succeeded(&self) -> bool {
         self.transcript.complete && matches!(self.outcome, VerificationOutcome::Matched)
-    }
-
-    /// True when every connection that opened was also closed successfully.
-    ///
-    /// Requires a complete transcript. An attempt whose open failed has no
-    /// close to make, and an identity mismatch or query failure does not by
-    /// itself leave a connection open.
-    pub(crate) fn owners_released(&self) -> bool {
-        self.transcript.complete
-            && self.attempts.iter().all(|attempt| {
-                attempt.connection.as_ref().is_none_or(|connection| {
-                    matches!(
-                        (&connection.open, &connection.close),
-                        (OperationOutcome::Failed { .. }, None)
-                            | (
-                                OperationOutcome::Succeeded,
-                                Some(OperationOutcome::Succeeded)
-                            )
-                    )
-                })
-            })
     }
 
     fn fail(&mut self, stage: VerificationStage, message: &str) {

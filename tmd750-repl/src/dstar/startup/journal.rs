@@ -17,7 +17,7 @@ use crate::capture::{Recorder, create_private_file};
 
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum Phase {
+pub(crate) enum Phase {
     Entry,
     Restore,
 }
@@ -67,19 +67,19 @@ enum Event<'a> {
     },
 }
 
-pub(super) struct Journal {
+pub(crate) struct Journal {
     recorder: Recorder<File>,
     /// A record naming the page about to be written was written and synced.
     /// True means a `W` frame may have reached the radio.
-    pub(super) write_started: bool,
+    pub(crate) write_started: bool,
     /// The entry `E` exit was acknowledged by the radio. Never cleared by a
     /// later journal or report failure.
-    pub(super) entry_exit_acknowledged: bool,
+    pub(crate) entry_exit_acknowledged: bool,
     entry_plan: Option<TerminalPlan>,
 }
 
 impl Journal {
-    pub(super) fn create(directory: &Path, cancelled: Arc<AtomicBool>) -> io::Result<Self> {
+    pub(crate) fn create(directory: &Path, cancelled: Arc<AtomicBool>) -> io::Result<Self> {
         Ok(Self::new(Recorder::named(
             create_private_file(&directory.join("journal.jsonl"))?,
             cancelled,
@@ -87,7 +87,7 @@ impl Journal {
         )))
     }
 
-    pub(super) const fn new(recorder: Recorder<File>) -> Self {
+    pub(crate) const fn new(recorder: Recorder<File>) -> Self {
         Self {
             recorder,
             write_started: false,
@@ -96,12 +96,7 @@ impl Journal {
         }
     }
 
-    /// The entry plan and its page images, retained after any later failure.
-    pub(super) const fn entry_plan(&self) -> Option<&TerminalPlan> {
-        self.entry_plan.as_ref()
-    }
-
-    pub(super) fn backup(
+    pub(crate) fn record_backup(
         &mut self,
         identity: &Identity,
         snapshot: &MenuFieldSnapshot,
@@ -119,7 +114,7 @@ impl Journal {
         self.recorder.synchronize()
     }
 
-    pub(super) fn planned(&mut self, plan: &TerminalPlan) -> io::Result<()> {
+    pub(crate) fn record_planned(&mut self, plan: &TerminalPlan) -> io::Result<()> {
         if self.entry_plan.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -137,7 +132,11 @@ impl Journal {
         self.recorder.synchronize()
     }
 
-    pub(super) fn before_write(&mut self, phase: Phase, page: &PageReplacement) -> io::Result<()> {
+    pub(crate) fn record_before_write(
+        &mut self,
+        phase: Phase,
+        page: &PageReplacement,
+    ) -> io::Result<()> {
         self.recorder.record(Event::BeforeWrite {
             phase,
             page: page.into(),
@@ -147,7 +146,7 @@ impl Journal {
         Ok(())
     }
 
-    pub(super) fn checkpoint(
+    pub(crate) fn record_checkpoint(
         &mut self,
         phase: Phase,
         acknowledged_exit: bool,
@@ -171,7 +170,7 @@ impl Journal {
         self.recorder.synchronize()
     }
 
-    pub(super) fn synchronize(&mut self) -> io::Result<()> {
+    pub(crate) fn synchronize(&mut self) -> io::Result<()> {
         self.recorder.synchronize()
     }
 }

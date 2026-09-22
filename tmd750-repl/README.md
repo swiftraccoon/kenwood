@@ -9,10 +9,12 @@ The REPL can select FM or
 D-STAR DV on either band, and every selection requires an immediate readback
 from the radio. It reads persistent DV Gateway state, naming the observed
 values Off and Terminal. Ordinary CAT does not change that setting. Automatic
-Bluetooth `dstar start` captures and verifies its Terminal/routing changes,
-then restores its original settings through independent USB control on shutdown.
-The diagnostic's explicit `--manage-terminal` option remains a separate
-diagnostic-only entry/restoration workflow.
+Bluetooth `dstar start` drives the library's `kenwood_tmd750::TerminalLifecycle`,
+which captures and verifies its Terminal/routing changes and restores the
+original settings through independent USB control on shutdown; this crate wires
+the capture transcripts, native Bluetooth backend and recovery journal to that
+lifecycle. The diagnostic's explicit `--manage-terminal` option remains a
+separate diagnostic-only entry/restoration workflow.
 It does not expose arbitrary CAT commands or arbitrary MCP memory writes.
 The schema-driven `mcp menu` commands discover, inspect, and preview registered
 settings. Ordinary scalar updates are guarded on firmware 1.02 by complete
@@ -1285,19 +1287,49 @@ help
 identity
 status
 mode [a|b]
-mode [a|b] fm|dv
+mode [a|b] fm|dv|am|nfm
 dv [a|b]
 fm [a|b]
 normal [a|b]
 gateway
 terminal
+serial | clock
+freq [a|b] [MHz]
+channel [a|b]
+power [a|b] [high|medium|low]
+tuning [a|b] [vfo|memory|call|dr]
+squelch [a|b] [0-31]
+smeter [a|b] | busy [a|b]
+att [a|b] [on|off]
+step [a|b] [kHz]
+up [a|b] | down [a|b]
+am-cut [3.0|4.5|6.0|7.5]
+current [a|b] | recall [a|b] ADDRESS | memory ADDRESS
+clear ADDRESS
+bands [CTRL PTT]
+display [dual|single]
+slot [1-6] | callsign 1-6
+backlight [0-3]
+position [gps|1-5]
+data-rate [1200|9600] | beacon [manual|ptt|auto|smart]
+tnc | vox
+vox-delay [ms] | vox-gain [0-9]
+gps [on|off on|off]
+sentences [gga,gll,gsa,gsv,rmc,vtg|none]
+bluetooth [on|off]
 quit
 ```
 
-Band A is the default when a band is omitted. `dv` selects the ordinary
+Band A is the default when a band is omitted. A word without a value reads
+the setting; a word with a value writes it with the library's echo and
+readback and prints the confirmed value. `dv` selects the ordinary
 D-STAR RF operating mode; it does not turn on the separate persistent Terminal
-Mode. The `terminal` command explains the manual radio-menu sequence without
-writing it.
+Mode. `tuning dr` selects the D-STAR repeater list. `up` and `down` step the
+control band by its tuning step and refuse the other band. `clear` empties a
+stored memory channel and requires the readback to answer `N`; storing a
+channel is a library call, not a prompt word. `tnc` and `vox` are read only:
+the library exposes no TNC or VOX write. The `terminal` command explains the
+manual radio-menu sequence without writing it.
 
 Startup-only workflows are described above:
 

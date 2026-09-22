@@ -150,6 +150,10 @@ impl OpenFailure {
 
     /// Fold an inner open failure into this outer deadline or cancellation
     /// failure: adopt its close state and append its message and causes.
+    ///
+    /// Only the bounded native opener folds a late failure, so this is compiled
+    /// where that opener is.
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) fn retain_open_failure(&mut self, cause: Self) {
         self.host_retirement_confirmed = cause.host_retirement_confirmed();
         self.close_error = cause.close_error;
