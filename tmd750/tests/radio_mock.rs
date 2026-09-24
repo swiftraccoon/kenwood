@@ -282,6 +282,99 @@ async fn verified_setters_apply_the_gate_then_echo_then_readback() -> TestResult
 }
 
 #[tokio::test]
+async fn dstar_callsign_write_echoes_reads_back_and_clears() -> TestResult {
+    use kenwood_tmd750::types::{DstarCallsignEntry, DstarSlot};
+
+    let mut mock = MockTransport::new();
+    scripted_live_identity(&mut mock);
+    mock.expect(b"DC 6,KQ4NIT,RIG\r", b"DC 6,KQ4NIT,RIG\r");
+    mock.expect(b"DC 6\r", b"DC 6,KQ4NIT,RIG\r");
+    mock.expect(b"DC 6,,\r", b"DC 6,,\r");
+    mock.expect(b"DC 6\r", b"DC 6,,\r");
+    let mut radio = Radio::new(mock);
+    let slot = DstarSlot::new(6)?;
+    radio
+        .set_dstar_callsign(&DstarCallsignEntry::new(slot, "KQ4NIT", "RIG")?)
+        .await?;
+    radio.clear_dstar_callsign(slot).await?;
+    radio.into_transport().assert_complete();
+    Ok(())
+}
+
+#[tokio::test]
+async fn dstar_callsign_write_refuses_a_mismatched_echo() -> TestResult {
+    use kenwood_tmd750::types::{DstarCallsignEntry, DstarSlot};
+
+    let mut mock = MockTransport::new();
+    scripted_live_identity(&mut mock);
+    // A truncated memo echo is not the requested entry, so the write is a
+    // protocol error and no readback follows.
+    mock.expect(b"DC 6,KQ4NIT,RIG\r", b"DC 6,KQ4NIT,RI\r");
+    let mut radio = Radio::new(mock);
+    let result = radio
+        .set_dstar_callsign(&DstarCallsignEntry::new(
+            DstarSlot::new(6)?,
+            "KQ4NIT",
+            "RIG",
+        )?)
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(Error::Protocol(ProtocolError::UnexpectedResponse { .. }))
+        ),
+        "{result:?}"
+    );
+    radio.into_transport().assert_complete();
+    Ok(())
+}
+
+#[tokio::test]
+async fn aprs_callsign_reads_writes_and_reads_back() -> TestResult {
+    use kenwood_tmd750::types::AprsCallsign;
+
+    let mut mock = MockTransport::new();
+    mock.expect(b"CS\r", b"CS NOCALL\r");
+    scripted_live_identity(&mut mock);
+    mock.expect(b"CS KQ4NIT-9\r", b"CS KQ4NIT-9\r");
+    mock.expect(b"CS\r", b"CS KQ4NIT-9\r");
+    let mut radio = Radio::new(mock);
+    assert_eq!(
+        radio.get_aprs_callsign().await?,
+        AprsCallsign::new("NOCALL")?
+    );
+    radio
+        .set_aprs_callsign(&AprsCallsign::new("KQ4NIT-9")?)
+        .await?;
+    radio.into_transport().assert_complete();
+    Ok(())
+}
+
+#[tokio::test]
+async fn aprs_callsign_write_refuses_a_mismatched_echo() -> TestResult {
+    use kenwood_tmd750::types::AprsCallsign;
+
+    let mut mock = MockTransport::new();
+    scripted_live_identity(&mut mock);
+    // The radio echoes the callsign without the SSID, so the write is not the
+    // requested identity and no readback follows.
+    mock.expect(b"CS KQ4NIT-9\r", b"CS KQ4NIT\r");
+    let mut radio = Radio::new(mock);
+    let result = radio
+        .set_aprs_callsign(&AprsCallsign::new("KQ4NIT-9")?)
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(Error::Protocol(ProtocolError::UnexpectedResponse { .. }))
+        ),
+        "{result:?}"
+    );
+    radio.into_transport().assert_complete();
+    Ok(())
+}
+
+#[tokio::test]
 async fn frequency_stepping_requires_the_control_band() -> TestResult {
     use kenwood_tmd750::types::Frequency;
 

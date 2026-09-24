@@ -170,13 +170,13 @@ async fn tune<T: Transport>(radio: &mut Radio<T>) -> Result<(), Error> {
 Frequency, channel record, power, tuning mode, squelch, S-meter, busy,
 attenuator, tuning step, AM high cut, memory selection, D-STAR callsign
 slots, band roles, band display, panel lighting, APRS position source, packet
-data rate, beacon method, VOX delay and gain, GPS settings and sentences,
-Bluetooth, the clock and the serial number are covered. TNC mode and VOX state
-are read only, and there is no transmit, beacon, memory write or power-off
-command. `frequency_up` and `frequency_down` act on the control band, refuse
-any other band with `Error::NotControlBand`, and read the frequency back
-until the step is applied, because the radio acknowledges `UP` and `DW`
-before applying them.
+data rate, beacon method, APRS My Callsign, VOX delay and gain, GPS settings
+and sentences, Bluetooth, the clock and the serial number are covered. TNC
+mode and VOX state are read only, and there is no transmit, beacon, memory
+write or power-off command. `frequency_up` and `frequency_down` act on the
+control band, refuse any other band with `Error::NotControlBand`, and read
+the frequency back until the step is applied, because the radio acknowledges
+`UP` and `DW` before applying them.
 
 ## Stored memory channels
 

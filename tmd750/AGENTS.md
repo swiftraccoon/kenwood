@@ -54,6 +54,12 @@
   except an empty URCALL becomes `CQCQCQ`); `ME addr,` clears it (reply
   `ME addr`, then `N`); 19- and 20-field forms are `?`/`N`; `ME Pri,...` is
   `N`. A zero-frequency record is accepted, so never send one.
+- `DC slot,callsign,memo` and `CS callsign` store their text verbatim and
+  unpadded; `DC slot,,` is an unset or cleared MY slot, and an unconfigured
+  `CS` reads `NOCALL` (`N` for a lowercase base or `-0`, `?` for an
+  over-length base). On this radio `DC` is the six-slot MY callsign list
+  selected by `DS`, not the D75's URCALL/RPT1/RPT2 fields; never copy the
+  D75's `DC` names or its space padding.
 
 ## Memory channel storage (image layout, verified on firmware 1.02)
 

@@ -545,6 +545,27 @@ impl DstarCallsignEntry {
             memo: memo.to_owned(),
         })
     }
+
+    /// An unset slot: empty callsign and memo.
+    ///
+    /// Writing this entry sends `DC <slot>,,`, which clears the slot; reading
+    /// an unset slot returns the same empty callsign and memo.
+    #[must_use]
+    pub const fn empty(slot: DstarSlot) -> Self {
+        Self {
+            slot,
+            callsign: String::new(),
+            memo: String::new(),
+        }
+    }
+
+    /// Whether the slot holds a callsign.
+    ///
+    /// True exactly when the callsign is nonempty; the memo is not consulted.
+    #[must_use]
+    pub const fn is_set(&self) -> bool {
+        !self.callsign.is_empty()
+    }
 }
 
 impl fmt::Display for DstarCallsignEntry {
@@ -556,6 +577,67 @@ impl fmt::Display for DstarCallsignEntry {
         } else {
             write!(formatter, "{} {} ({})", self.slot, self.callsign, self.memo)
         }
+    }
+}
+
+/// APRS My Callsign as `CS` reports and accepts it.
+///
+/// A base callsign of one to six uppercase ASCII letters and digits, with an
+/// optional SSID of 1 to 15 written `-N`. SSID 0 is the bare callsign; the
+/// radio rejects `-0`, a lowercase base, a base over six characters, and an
+/// SSID over 15. An unconfigured slot reads back as the literal `NOCALL`,
+/// which is itself a valid value.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AprsCallsign(String);
+
+impl AprsCallsign {
+    /// Maximum encoded length: a six-character base plus `-15`.
+    pub const MAX_LEN: usize = 9;
+
+    /// Validate an APRS My Callsign.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::InvalidCallsignText`] unless `text` is a base
+    /// of one to six uppercase ASCII letters and digits, optionally followed by
+    /// `-` and a canonical SSID of 1 to 15.
+    pub fn new(text: &str) -> Result<Self, ValidationError> {
+        if Self::is_canonical(text) {
+            Ok(Self(text.to_owned()))
+        } else {
+            Err(ValidationError::InvalidCallsignText {
+                text: text.to_owned(),
+            })
+        }
+    }
+
+    fn is_canonical(text: &str) -> bool {
+        let (base, ssid) = match text.split_once('-') {
+            Some((base, ssid)) => (base, Some(ssid)),
+            None => (text, None),
+        };
+        let base_ok = (1..=6).contains(&base.len())
+            && base
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit());
+        let ssid_ok = ssid.is_none_or(|digits| {
+            digits
+                .parse::<u8>()
+                .is_ok_and(|value| (1..=15).contains(&value) && digits == value.to_string())
+        });
+        base_ok && ssid_ok
+    }
+
+    /// The callsign exactly as carried on the wire.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for AprsCallsign {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
     }
 }
 
@@ -1102,6 +1184,37 @@ mod tests {
         assert!(DstarCallsignEntry::new(DstarSlot::new(1)?, "W1AWW1AWW", "").is_err());
         assert!(DstarCallsignEntry::new(DstarSlot::new(1)?, "W1AW", "D750A").is_err());
         assert!(DstarCallsignEntry::new(DstarSlot::new(1)?, "W1\rAW", "").is_err());
+        let unset = DstarCallsignEntry::empty(DstarSlot::new(3)?);
+        assert_eq!(unset, DstarCallsignEntry::new(DstarSlot::new(3)?, "", "")?);
+        assert!(!unset.is_set());
+        assert!(DstarCallsignEntry::new(DstarSlot::new(3)?, "W1AW", "")?.is_set());
+        assert!(!DstarCallsignEntry::new(DstarSlot::new(3)?, "", "MEMO")?.is_set());
+        Ok(())
+    }
+
+    #[test]
+    fn aprs_callsign_accepts_the_radio_domain_and_rejects_the_rest() -> TestResult {
+        for text in ["NOCALL", "KQ4NIT", "A", "AB1CD", "KQ4NIT-1", "KQ4NIT-15"] {
+            let callsign = AprsCallsign::new(text)?;
+            assert_eq!(callsign.as_str(), text);
+            assert_eq!(callsign.to_string(), text);
+        }
+        assert_eq!(
+            AprsCallsign::new("KQ4NIT-15")?.as_str().len(),
+            AprsCallsign::MAX_LEN
+        );
+        for text in [
+            "",
+            "kq4nit",
+            "ABCDEFG",
+            "KQ4NIT-0",
+            "KQ4NIT-16",
+            "KQ4NIT-",
+            "KQ4NIT-05",
+            "KQ4-NIT",
+        ] {
+            assert!(AprsCallsign::new(text).is_err(), "{text} must be rejected");
+        }
         Ok(())
     }
 

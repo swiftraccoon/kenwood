@@ -9,12 +9,12 @@
 
 use crate::error::ProtocolError;
 use crate::types::{
-    AmHighCut, BacklightControl, Band, BandControl, BandDisplay, BeaconMethod, CHANNEL_FIELD_COUNT,
-    CatChannelRecord, CatMemoryChannelRecord, CurrentMemorySelector, DstarCallsignEntry, DstarSlot,
-    DvGatewayMode, FirmwareIdentity, Frequency, GpsSettings, MemoryChannelAddress,
-    MyPositionSelection, NmeaSentences, OperatingMode, PacketDataRate, PowerLevel, RadioModel,
-    RadioType, RealTimeClock, SMeterReading, SelectableMode, SerialInformation, SquelchLevel,
-    StepSize, TncMode, TuningMode, VoxDelay, VoxGain, VoxMode,
+    AmHighCut, AprsCallsign, BacklightControl, Band, BandControl, BandDisplay, BeaconMethod,
+    CHANNEL_FIELD_COUNT, CatChannelRecord, CatMemoryChannelRecord, CurrentMemorySelector,
+    DstarCallsignEntry, DstarSlot, DvGatewayMode, FirmwareIdentity, Frequency, GpsSettings,
+    MemoryChannelAddress, MyPositionSelection, NmeaSentences, OperatingMode, PacketDataRate,
+    PowerLevel, RadioModel, RadioType, RealTimeClock, SMeterReading, SelectableMode,
+    SerialInformation, SquelchLevel, StepSize, TncMode, TuningMode, VoxDelay, VoxGain, VoxMode,
 };
 
 use super::channel::{parse_channel_fields, parse_memory_channel};
@@ -184,6 +184,13 @@ pub enum Command {
         /// Slot to read.
         slot: DstarSlot,
     },
+    /// `DC <slot>,<callsign>,<memo>`: store a D-STAR MY callsign slot.
+    ///
+    /// Empty callsign and memo clear the slot.
+    SetDstarCallsign {
+        /// Slot to store and the callsign and memo to write into it.
+        entry: DstarCallsignEntry,
+    },
     /// `BC`: read the control and PTT bands.
     GetBandControl,
     /// `BC <control>,<ptt>`: select the control and PTT bands.
@@ -272,6 +279,13 @@ pub enum Command {
         /// Whether Bluetooth is on.
         enabled: bool,
     },
+    /// `CS`: read the APRS My Callsign.
+    GetAprsCallsign,
+    /// `CS <callsign>`: set the APRS My Callsign.
+    SetAprsCallsign {
+        /// Callsign to write.
+        callsign: AprsCallsign,
+    },
 }
 
 impl Command {
@@ -303,7 +317,7 @@ impl Command {
             Self::GetMemoryChannel { .. }
             | Self::WriteMemoryChannel { .. }
             | Self::ClearMemoryChannel { .. } => "ME",
-            Self::GetDstarCallsign { .. } => "DC",
+            Self::GetDstarCallsign { .. } | Self::SetDstarCallsign { .. } => "DC",
             Self::GetBandControl | Self::SetBandControl { .. } => "BC",
             Self::GetBandDisplay | Self::SetBandDisplay { .. } => "DL",
             Self::GetDstarSlot | Self::SetDstarSlot { .. } => "DS",
@@ -318,6 +332,7 @@ impl Command {
             Self::GetGpsSettings | Self::SetGpsSettings { .. } => "GP",
             Self::GetGpsSentences | Self::SetGpsSentences { .. } => "GS",
             Self::GetBluetooth | Self::SetBluetooth { .. } => "BT",
+            Self::GetAprsCallsign | Self::SetAprsCallsign { .. } => "CS",
         }
     }
 
@@ -341,6 +356,7 @@ impl Command {
                 | Self::ClearMemoryChannel { .. }
                 | Self::SetBandControl { .. }
                 | Self::SetBandDisplay { .. }
+                | Self::SetDstarCallsign { .. }
                 | Self::SetDstarSlot { .. }
                 | Self::SetBacklightControl { .. }
                 | Self::SetMyPositionSelection { .. }
@@ -351,6 +367,7 @@ impl Command {
                 | Self::SetGpsSettings { .. }
                 | Self::SetGpsSentences { .. }
                 | Self::SetBluetooth { .. }
+                | Self::SetAprsCallsign { .. }
         )
     }
 
@@ -381,7 +398,8 @@ impl Command {
             | Self::GetVox
             | Self::GetGpsSettings
             | Self::GetGpsSentences
-            | Self::GetBluetooth => None,
+            | Self::GetBluetooth
+            | Self::GetAprsCallsign => None,
             Self::GetOperatingMode { band }
             | Self::GetFrequency { band }
             | Self::GetChannelRecord { band }
@@ -423,6 +441,7 @@ impl Command {
             | Self::WriteMemoryChannel { .. }
             | Self::ClearMemoryChannel { .. }
             | Self::GetDstarCallsign { .. }
+            | Self::SetDstarCallsign { .. }
             | Self::SetDstarSlot { .. }
             | Self::SetBandControl { .. }
             | Self::SetBandDisplay { .. }
@@ -434,7 +453,8 @@ impl Command {
             | Self::SetVoxGain { .. }
             | Self::SetGpsSettings { .. }
             | Self::SetGpsSentences { .. }
-            | Self::SetBluetooth { .. } => self.memory_and_global_argument(),
+            | Self::SetBluetooth { .. }
+            | Self::SetAprsCallsign { .. } => self.memory_and_global_argument(),
         };
         let mut bytes = argument.map_or_else(
             || mnemonic.as_bytes().to_vec(),
@@ -465,6 +485,12 @@ impl Command {
             Self::GetDstarCallsign { slot } | Self::SetDstarSlot { slot } => {
                 Some(slot.as_raw().to_string())
             }
+            Self::SetDstarCallsign { ref entry } => Some(format!(
+                "{},{},{}",
+                entry.slot.as_raw(),
+                entry.callsign,
+                entry.memo
+            )),
             Self::SetBandControl { roles } => Some(format!(
                 "{},{}",
                 u8::from(roles.control),
@@ -489,6 +515,7 @@ impl Command {
                     .join(","),
             ),
             Self::SetBluetooth { enabled } => Some(u8::from(enabled).to_string()),
+            Self::SetAprsCallsign { ref callsign } => Some(callsign.as_str().to_owned()),
             _ => None,
         }
     }
@@ -564,6 +591,7 @@ impl Command {
                 Response::MemoryChannelCleared { address: reply } if *reply == address
             ),
             Self::GetDstarCallsign { .. }
+            | Self::SetDstarCallsign { .. }
             | Self::GetBandControl
             | Self::SetBandControl { .. }
             | Self::GetBandDisplay
@@ -589,7 +617,9 @@ impl Command {
             | Self::GetGpsSentences
             | Self::SetGpsSentences { .. }
             | Self::GetBluetooth
-            | Self::SetBluetooth { .. } => self.correlates_global(response),
+            | Self::SetBluetooth { .. }
+            | Self::GetAprsCallsign
+            | Self::SetAprsCallsign { .. } => self.correlates_global(response),
         }
     }
 
@@ -598,6 +628,9 @@ impl Command {
         match *self {
             Self::GetDstarCallsign { slot } => {
                 matches!(response, Response::DstarCallsign(entry) if entry.slot == slot)
+            }
+            Self::SetDstarCallsign { ref entry } => {
+                matches!(response, Response::DstarCallsign(reply) if reply.slot == entry.slot)
             }
             Self::GetBandControl | Self::SetBandControl { .. } => {
                 matches!(response, Response::BandControl(_))
@@ -634,6 +667,9 @@ impl Command {
             }
             Self::GetBluetooth | Self::SetBluetooth { .. } => {
                 matches!(response, Response::Bluetooth { .. })
+            }
+            Self::GetAprsCallsign | Self::SetAprsCallsign { .. } => {
+                matches!(response, Response::AprsCallsign(_))
             }
             _ => false,
         }
@@ -801,6 +837,8 @@ pub enum Response {
         /// Whether Bluetooth is on.
         enabled: bool,
     },
+    /// `CS <callsign>`.
+    AprsCallsign(AprsCallsign),
     /// `?`: the radio rejected the command.
     Rejected,
     /// `N`: the command is unavailable in the current state.
@@ -1129,6 +1167,10 @@ fn parse_global(mnemonic: &str, payload: &str) -> Result<Option<Response>, Proto
         "BT" => Response::Bluetooth {
             enabled: boolean(payload, "BT", "enabled")?,
         },
+        "CS" => Response::AprsCallsign(
+            AprsCallsign::new(payload)
+                .map_err(|error| field_error("CS", "callsign", error.to_string()))?,
+        ),
         _ => return Ok(None),
     };
     Ok(Some(response))
@@ -1351,6 +1393,70 @@ mod tests {
             (Command::SetBluetooth { enabled: false }, b"BT 0\r"),
         ]);
         assert!(Command::SetBluetooth { enabled: true }.is_write());
+        Ok(())
+    }
+
+    #[test]
+    fn dstar_callsign_writes_encode_and_report_as_writes() -> TestResult {
+        assert_encodings(vec![
+            (
+                Command::SetDstarCallsign {
+                    entry: DstarCallsignEntry::new(DstarSlot::new(6)?, "KQ4NIT", "RIG")?,
+                },
+                b"DC 6,KQ4NIT,RIG\r",
+            ),
+            (
+                Command::SetDstarCallsign {
+                    entry: DstarCallsignEntry::empty(DstarSlot::new(6)?),
+                },
+                b"DC 6,,\r",
+            ),
+        ]);
+        assert!(
+            Command::SetDstarCallsign {
+                entry: DstarCallsignEntry::empty(DstarSlot::new(6)?),
+            }
+            .is_write()
+        );
+        assert!(
+            !Command::GetDstarCallsign {
+                slot: DstarSlot::new(6)?,
+            }
+            .is_write()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn aprs_callsign_encodes_parses_and_correlates() -> TestResult {
+        assert_encodings(vec![
+            (Command::GetAprsCallsign, b"CS\r"),
+            (
+                Command::SetAprsCallsign {
+                    callsign: AprsCallsign::new("KQ4NIT-9")?,
+                },
+                b"CS KQ4NIT-9\r",
+            ),
+        ]);
+        assert!(
+            Command::SetAprsCallsign {
+                callsign: AprsCallsign::new("KQ4NIT")?,
+            }
+            .is_write()
+        );
+        assert!(!Command::GetAprsCallsign.is_write());
+        assert_eq!(
+            parse_line(b"CS NOCALL\r")?,
+            Response::AprsCallsign(AprsCallsign::new("NOCALL")?)
+        );
+        let get = Command::GetAprsCallsign;
+        assert!(get.correlates(&Response::AprsCallsign(AprsCallsign::new("NOCALL")?)));
+        assert!(!get.correlates(&Response::Bluetooth { enabled: true }));
+        let set = Command::SetAprsCallsign {
+            callsign: AprsCallsign::new("KQ4NIT-9")?,
+        };
+        assert!(set.correlates(&Response::AprsCallsign(AprsCallsign::new("KQ4NIT-9")?)));
+        assert!(!set.correlates(&Response::Bluetooth { enabled: true }));
         Ok(())
     }
 
@@ -1750,6 +1856,23 @@ mod tests {
                 DstarSlot::new(3)?,
                 "",
                 ""
+            )?))
+        );
+        let write = Command::SetDstarCallsign {
+            entry: DstarCallsignEntry::new(DstarSlot::new(6)?, "KQ4NIT", "RIG")?,
+        };
+        assert!(
+            write.correlates(&Response::DstarCallsign(DstarCallsignEntry::new(
+                DstarSlot::new(6)?,
+                "KQ4NIT",
+                "RIG"
+            )?))
+        );
+        assert!(
+            !write.correlates(&Response::DstarCallsign(DstarCallsignEntry::new(
+                DstarSlot::new(1)?,
+                "KQ4NIT",
+                "RIG"
             )?))
         );
         assert!(

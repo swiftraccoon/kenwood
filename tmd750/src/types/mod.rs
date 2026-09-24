@@ -19,10 +19,10 @@ pub use frequency::{Frequency, OffsetFrequency, StepSize, TransmitSetting, WIRE_
 pub use identity::{FirmwareIdentity, RadioModel, RadioType};
 pub use mode::{Band, DvGatewayMode, OperatingMode, SelectableMode};
 pub use settings::{
-    AmHighCut, BacklightControl, BandDisplay, BeaconMethod, DstarCallsignEntry, DstarSlot,
-    GpsSettings, MyPositionSelection, NmeaSentence, NmeaSentences, PacketDataRate, PowerLevel,
-    RealTimeClock, SMeterReading, SerialInformation, SquelchLevel, TncMode, VoxDelay, VoxGain,
-    VoxMode,
+    AmHighCut, AprsCallsign, BacklightControl, BandDisplay, BeaconMethod, DstarCallsignEntry,
+    DstarSlot, GpsSettings, MyPositionSelection, NmeaSentence, NmeaSentences, PacketDataRate,
+    PowerLevel, RealTimeClock, SMeterReading, SerialInformation, SquelchLevel, TncMode, VoxDelay,
+    VoxGain, VoxMode,
 };
 pub use signaling::{
     CrossToneField, DCS_CODES, DcsCode, DigitalCode, DigitalSquelch, TONE_FREQUENCIES_DECIHERTZ,

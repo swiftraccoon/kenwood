@@ -14,11 +14,11 @@ use std::time::Duration;
 use crate::error::{Error, ProtocolError};
 use crate::protocol::cat::{Command, Response};
 use crate::types::{
-    AmHighCut, BacklightControl, Band, BandControl, BandDisplay, BeaconMethod, CatChannelRecord,
-    CatMemoryChannelRecord, CurrentMemorySelector, DstarCallsignEntry, DstarSlot, Frequency,
-    GpsSettings, MemoryChannelAddress, MyPositionSelection, NmeaSentences, PacketDataRate,
-    PowerLevel, RealTimeClock, SMeterReading, SerialInformation, SquelchLevel, StepSize, TncMode,
-    TuningMode, UrCallsign, VoxDelay, VoxGain, VoxMode,
+    AmHighCut, AprsCallsign, BacklightControl, Band, BandControl, BandDisplay, BeaconMethod,
+    CatChannelRecord, CatMemoryChannelRecord, CurrentMemorySelector, DstarCallsignEntry, DstarSlot,
+    Frequency, GpsSettings, MemoryChannelAddress, MyPositionSelection, NmeaSentences,
+    PacketDataRate, PowerLevel, RealTimeClock, SMeterReading, SerialInformation, SquelchLevel,
+    StepSize, TncMode, TuningMode, UrCallsign, VoxDelay, VoxGain, VoxMode,
 };
 use kenwood_transport::Transport;
 
@@ -686,6 +686,45 @@ impl<T: Transport> Radio<T> {
         .await
     }
 
+    /// Store one D-STAR MY callsign slot (`DC slot,callsign,memo`) with echo
+    /// and readback.
+    ///
+    /// The callsign and memo are sent exactly as validated, up to eight and
+    /// four bytes with no padding; an entry with an empty callsign and memo
+    /// clears the slot.
+    ///
+    /// # Errors
+    ///
+    /// See the module contract.
+    pub async fn set_dstar_callsign(&mut self, entry: &DstarCallsignEntry) -> Result<(), Error> {
+        self.apply(
+            Command::SetDstarCallsign {
+                entry: entry.clone(),
+            },
+            Command::GetDstarCallsign { slot: entry.slot },
+            "DstarCallsign",
+            entry.clone(),
+            |response| match response {
+                Response::DstarCallsign(entry) => Some(entry.clone()),
+                _ => None,
+            },
+        )
+        .await
+    }
+
+    /// Clear one D-STAR MY callsign slot (`DC slot,,`).
+    ///
+    /// Writes an empty callsign and memo, then confirms the slot reads back
+    /// unset.
+    ///
+    /// # Errors
+    ///
+    /// See the module contract.
+    pub async fn clear_dstar_callsign(&mut self, slot: DstarSlot) -> Result<(), Error> {
+        self.set_dstar_callsign(&DstarCallsignEntry::empty(slot))
+            .await
+    }
+
     /// Read the control and PTT bands (`BC`).
     ///
     /// # Errors
@@ -940,6 +979,50 @@ impl<T: Transport> Radio<T> {
             method,
             |response| match response {
                 Response::BeaconMethod(method) => Some(*method),
+                _ => None,
+            },
+        )
+        .await
+    }
+
+    /// Read the APRS My Callsign (`CS`).
+    ///
+    /// Firmware 1.02 reports the literal `NOCALL` for an unconfigured slot.
+    ///
+    /// # Errors
+    ///
+    /// See the module contract.
+    pub async fn get_aprs_callsign(&mut self) -> Result<AprsCallsign, Error> {
+        self.query(
+            Command::GetAprsCallsign,
+            "AprsCallsign",
+            |response| match response {
+                Response::AprsCallsign(callsign) => Some(callsign.clone()),
+                _ => None,
+            },
+        )
+        .await
+    }
+
+    /// Set the APRS My Callsign (`CS callsign`) with echo and readback.
+    ///
+    /// Sends the callsign exactly as validated; the radio stores and echoes it
+    /// unchanged. This is the transmitted APRS identity, though setting it does
+    /// not transmit.
+    ///
+    /// # Errors
+    ///
+    /// See the module contract.
+    pub async fn set_aprs_callsign(&mut self, callsign: &AprsCallsign) -> Result<(), Error> {
+        self.apply(
+            Command::SetAprsCallsign {
+                callsign: callsign.clone(),
+            },
+            Command::GetAprsCallsign,
+            "AprsCallsign",
+            callsign.clone(),
+            |response| match response {
+                Response::AprsCallsign(callsign) => Some(callsign.clone()),
                 _ => None,
             },
         )

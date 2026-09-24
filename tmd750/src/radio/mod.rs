@@ -485,7 +485,7 @@ impl<T: Transport> Radio<T> {
         extract: fn(&Response) -> Option<V>,
     ) -> Result<(), Error>
     where
-        V: PartialEq + fmt::Debug + Copy,
+        V: PartialEq + fmt::Debug,
     {
         self.require_qualified_write_target().await?;
         let echoed = self.query(write, expected, extract).await?;
