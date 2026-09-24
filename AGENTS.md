@@ -61,6 +61,7 @@ cargo test -p <package> --doc                            # doctests; nextest nev
 
 - Shared crates (`kenwood-transport`, `kenwood-schema`, `mmdvm`) are imported canonically; model crates never re-export their types and there are no compatibility adapters.
 - The two MCP live-session engines (TH-D75 and TM-D750) stay separate: framing, retry, entry/exit timing and recovery differ. Do not merge them.
+- The two model libraries share many type names, but the types diverged by design (different `Frequency` domains, tone tables in f64 Hz vs u16 decihertz, field-parser semantics, per-crate `ProtocolError`); only the standard `DCS_CODES` array is byte-identical. Do not fold them into a shared CAT crate; the shared layer is `kenwood-schema`, `kenwood-transport` and `mmdvm`.
 - `kenwood-tmd750` and `tmd750-repl` never depend on `kenwood-thd75`; seam tests in both crates enforce it.
 - The packet-radio crates form a strict DAG: `aprs-is` depends on `aprs`; `aprs` depends on `ax25-codec` and `kiss-tnc`; those two are leaf crates with no workspace path dependencies. `kiss-tnc`, `ax25-codec` and `aprs` are sans-io and never read the clock; `aprs-is` is the tokio shell and the clock source.
 - `unsafe_code = "forbid"` is workspace-wide. Hand-written unsafe is confined to `kenwood-transport/src/bluetooth.rs` and `thd75/src/screen/vision.rs`; `lodestar-core` and `azimuth-core` omit the Cargo lint only for generated UniFFI scaffolding. `lint.sh` audits this exact path list.
@@ -80,6 +81,7 @@ cargo test -p <package> --doc                            # doctests; nextest nev
 - All platforms pin Rust 1.94.0; `rust-toolchain.toml` matches. Symptom of drift: dozens of new clippy lints and trybuild stderr mismatches that CI never sees.
 - A new RUSTSEC advisory fails the gate: try `cargo update <crate>` first. With no semver-compatible fix, add paired documented ignores in both `.cargo/audit.toml` and `deny.toml`; duplicate-version `skip` entries pin exact versions and go stale on bumps.
 - CI resolves a fresh lockfile, so a green local gate proves nothing about it. Reproduce cargo-deny duplicates with `cargo generate-lockfile` (back up `Cargo.lock` first) and `cargo deny check bans`.
+- The persistent `target/clippy-gate` dir and CI's rust-cache reuse clippy fingerprints, so a pre-existing `-D warnings` violation (e.g. `missing_assert_message`) stays hidden until an edit to that module or its dependencies invalidates the fingerprint; a green gate is not proof the whole tree is clippy-clean.
 - `gh run list --commit <sha>` returns nothing here; list unfiltered with `--json headSha` and filter. A scratch `git worktree` with CRLF-converted files stands in for the Windows runner.
 - nextest flags tests `slow` when the first run after a source change includes the rebuild; rerun before diagnosing.
 - Platform CI runs per-crate `cargo test` with a `working-directory` per crate so each crate compiles with only its own features; there are no separate `cargo check` steps. Docs publishing runs on macOS so native transport API pages exist; the publisher keeps implicit library-over-binary target selection. A successful local render is not a Pages deployment.
@@ -87,6 +89,8 @@ cargo test -p <package> --doc                            # doctests; nextest nev
 - `lint.sh` requires `cargo-audit`, `cargo-deny`, `cargo-machete`, `shellcheck`, `taplo` and `mdbook`; a missing tool fails the gate.
 - Windows: D-STAR fixtures that touch directory durability go through the explicit durability seam, never a Unix directory open plus sync.
 - `ci-local.sh` runs macOS locally plus Ubuntu and Fedora on k8s pods. Stuck `ci-ubuntu`/`ci-fedora` pods from a killed run must be force-deleted first; the script silences kubectl errors, so "no pod output" is the symptom. macOS `ar` warnings starting `warning: kenwood-thd75@` are harmless. zsh: `$pipestatus` is lowercase and unquoted variables do not word-split (use `xargs` or `${=var}`).
+- `ci-local.sh` catches Linux-only `dead_code` the macOS `lint.sh` cannot: an item used only under `#[cfg(any(target_os = "macos", test))]` is dead in a Linux non-test build and fails `-D warnings`. Gate such helpers with the same `cfg`.
+- `ci-local.sh` snapshots the tree with `git ls-files --cached`; stage tracked-file deletions (`git rm`) before running it, or its tar fails with `Cannot stat` on the removed paths.
 
 ## File naming
 
