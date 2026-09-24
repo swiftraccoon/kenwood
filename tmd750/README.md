@@ -543,6 +543,58 @@ gate is unchanged.
 Software-tested only; not run on hardware. The fixed empty-to-`KQ4NIT`-and-back
 experiment below covers the field layout, not arbitrary values.
 
+### Typed channel name update
+
+`ChannelNameUpdate` prepares a single-field update of one physical channel's
+sixteen-byte name on the exact TM-D750 / firmware 1.02 / type K,2,1 target.
+The complete captured name page is immutable; only that channel's sixteen
+bytes can differ in the proposed page, so the other fifteen names on the page,
+including the weather-channel names that share the last page, are compared in
+full before and after the write. `ChannelNameText` accepts 1 through 16
+printable ASCII bytes, preserving case and spaces without truncation; the
+stored field is NUL padded, and `None` stands for an unnamed channel (sixteen
+NUL bytes), so a name can also be cleared. Preparation performs no I/O:
+
+```rust
+use kenwood_tmd750::memory::{ChannelNameText, ChannelNameUpdate, ChannelNameUpdateError};
+use kenwood_tmd750::{Identity, PhysicalChannel};
+
+fn prepare_channel_name(
+    identity: &Identity,
+    captured_page: &[u8],
+    channel: PhysicalChannel,
+    desired: &str,
+) -> Result<ChannelNameUpdate, ChannelNameUpdateError> {
+    ChannelNameUpdate::prepare(
+        identity,
+        captured_page,
+        channel,
+        None,
+        Some(&ChannelNameText::new(desired)?),
+    )
+}
+```
+
+`ChannelNameUpdate::required_page` names the page the caller must have
+captured, complete, from the intended radio; every name page is part of the
+standard backup. The expected current name must match the capture (an unnamed
+channel is `None`), and an unchanged request returns
+`ChannelNameUpdateError::NoChange` before I/O. Page drift, an unsupported
+identity, and out-of-order events halt the update without rebasing or
+automatic rollback.
+
+`Radio::set_channel_name_session_until_exit` runs the same two sessions as the
+PM1 update: apply once with immediate full-page readback, then a separate
+read-only session comparing the entire desired page. The caller's durable
+intent callback must persist both complete pages before the sole write, and
+the caller owns fail-closed capture and the lifecycle between sessions (exit
+ACK, old-handle close, one fresh matching CAT identity, a complete capture and
+a synchronized session record) before recording
+`ChannelNameUpdateEvent::SessionFinalized`. Names are not part of the CAT
+channel record, so this is the only way this crate writes a channel name.
+
+Software-tested only; not run on hardware.
+
 ### Fixed PM1 rename-and-restore trial
 
 `PmNameTrial` models a bounded rename-and-restore experiment for the observed

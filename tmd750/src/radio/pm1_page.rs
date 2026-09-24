@@ -1,23 +1,43 @@
-//! Private single-frame writes for the two closed, bounded text targets.
+//! Private single-frame writes for the closed, bounded text targets: the PM1
+//! name page, the PM Off MY1 page, and the channel name-table pages.
 
 use super::Radio;
 use crate::error::{Error, ProtocolError};
 use crate::protocol::mcp::{ACK, write_request};
-use crate::types::{Address, PAGE_SIZE, Page};
+use crate::types::{
+    Address, CHANNEL_NAME_SIZE, CHANNEL_NAMES_OFFSET, PAGE_SIZE, PHYSICAL_CHANNEL_COUNT, Page,
+};
 use kenwood_transport::Transport;
 
-/// The two fixed page addresses this private frame writer can reach.
+/// The pages this private frame writer can reach.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FixedTextTarget {
     Pm1,
     My1,
+    /// One complete page of the channel name table, admitted by
+    /// [`Self::channel_names`].
+    ChannelNames(Page),
 }
 
 impl FixedTextTarget {
+    /// Admit one complete 256-byte page on the channel name-table grid, from
+    /// the page holding channel 0 through the page holding the last physical
+    /// channel; any other page is refused.
+    pub(super) fn channel_names(page: Page) -> Option<Self> {
+        let start = page.address().as_usize();
+        let table_len = CHANNEL_NAME_SIZE * usize::from(PHYSICAL_CHANNEL_COUNT);
+        let last_page_start = CHANNEL_NAMES_OFFSET + (table_len - 1) / PAGE_SIZE * PAGE_SIZE;
+        let on_grid = start >= CHANNEL_NAMES_OFFSET
+            && start <= last_page_start
+            && (start - CHANNEL_NAMES_OFFSET).is_multiple_of(PAGE_SIZE);
+        (on_grid && page.len() == PAGE_SIZE).then_some(Self::ChannelNames(page))
+    }
+
     pub(super) fn page(self) -> Result<Page, Error> {
         let address = match self {
             Self::Pm1 => 323_584,
             Self::My1 => 331_776,
+            Self::ChannelNames(page) => return Ok(page),
         };
         Ok(Page::new(Address::new(address)?, PAGE_SIZE)?)
     }

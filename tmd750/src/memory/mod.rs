@@ -21,14 +21,15 @@
 //!   [`crate::radio::terminal::TerminalPlan`]. Their session drivers separately
 //!   require identity, fresh complete-page comparisons, and caller-owned cleanup.
 //!
-//! [`Pm1NameUpdate`] and [`My1CallsignUpdate`] sequence a two-session
-//! compare-write-verify update for one field. [`PmNameTrial`],
+//! [`Pm1NameUpdate`], [`My1CallsignUpdate`] and [`ChannelNameUpdate`] sequence
+//! a two-session compare-write-verify update for one field. [`PmNameTrial`],
 //! [`MyCallsignTrial`], and [`TerminalExitTrial`] are fixed-scope variants with
 //! no caller-selectable value. All of them check event order and page equality;
 //! the facts a caller reports (fresh connection, synchronized journal record,
 //! completed capture) are taken on trust. File containers live in
 //! [`crate::file`].
 
+mod channel_name_update;
 pub mod channels;
 mod configuration;
 pub(crate) mod fixed_text_trial;
@@ -47,6 +48,10 @@ mod text;
 use crate::error::{SchemaError, ValidationError};
 use crate::types::{FirmwareIdentity, IMAGE_LENGTH, RadioModel, SlotIndex};
 
+pub use channel_name_update::{
+    ChannelNameText, ChannelNameUpdate, ChannelNameUpdateError, ChannelNameUpdateEvent,
+    ChannelNameUpdateSession, ChannelNameUpdateStatus,
+};
 pub use channels::ChannelAccess;
 pub use configuration::{
     ChangedByte, ChangedPage, ConfigurationError, StandardConfiguration, StandardConfigurationDiff,

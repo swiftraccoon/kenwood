@@ -17,6 +17,10 @@ pub use error::{Error, FileError, McpError, ProtocolError, SchemaError, Validati
 pub use file::{FileLayout, RadioConfig, parse_d750};
 pub use memory::{ChannelAccess, MemoryImage, PatchPlanner, PatchSet, TerminalGatewayRoute};
 pub use radio::backup::{McpBackupOutcome, McpBackupReport, McpBackupStage};
+pub use radio::channel_name_update::{
+    ChannelNameUpdateSessionError, ChannelNameUpdateSessionOutcome, ChannelNameUpdateSessionReport,
+    ChannelNameUpdateSessionStage, ChannelNameUpdateWriteDisposition,
+};
 pub use radio::menu::{
     MenuAssignment, MenuFieldSnapshot, MenuUpdateError, MenuUpdatePlan, ScopedMenuField,
 };

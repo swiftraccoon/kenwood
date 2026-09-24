@@ -525,6 +525,7 @@ impl<T: Transport> Radio<T> {
         let operation = match target {
             FixedTextTarget::Pm1 => "PM1 trial page write",
             FixedTextTarget::My1 => "MY1 trial page write",
+            FixedTextTarget::ChannelNames(_) => "channel name page write",
         };
         self.write_fixed_text_frame(target, after, operation)
             .await?;

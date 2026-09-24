@@ -38,6 +38,7 @@
 
 pub mod backup;
 mod cat;
+pub mod channel_name_update;
 pub mod menu;
 pub mod my1_callsign_update;
 pub mod pm1_name_update;

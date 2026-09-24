@@ -109,6 +109,11 @@
 - `PatchPlanner::set` validates the whole assignment before any claim changes,
   so a rejected field leaves the previous plan intact and never retains a
   prefix.
+- The private fixed-text frame writer admits exactly the PM1 page, the PM Off
+  MY1 page and the 69 channel name-table pages (256-byte grid from `0x10000`,
+  inside the writable global region); every other page is refused before a
+  frame is built. `ChannelNameUpdate` writes one channel's sixteen name bytes
+  through it with a whole-page guard; an unnamed channel is sixteen NUL bytes.
 
 ## Reflector Terminal lifecycle
 
