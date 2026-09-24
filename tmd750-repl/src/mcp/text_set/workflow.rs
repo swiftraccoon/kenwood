@@ -9,14 +9,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use kenwood_tmd750::transport::SerialCandidate;
 use kenwood_tmd750::{
-    DvGatewayMode, McpProbeExit, My1CallsignUpdateSessionOutcome, My1CallsignUpdateSessionReport,
-    My1CallsignUpdateSessionStage, My1CallsignUpdateWriteDisposition, Pm1NameUpdateSessionOutcome,
-    Pm1NameUpdateSessionReport, Pm1NameUpdateSessionStage, Pm1NameUpdateWriteDisposition, Radio,
+    ChannelNameUpdateSessionOutcome, ChannelNameUpdateSessionReport, ChannelNameUpdateSessionStage,
+    ChannelNameUpdateWriteDisposition, DvGatewayMode, McpProbeExit,
+    My1CallsignUpdateSessionOutcome, My1CallsignUpdateSessionReport, My1CallsignUpdateSessionStage,
+    My1CallsignUpdateWriteDisposition, Pm1NameUpdateSessionOutcome, Pm1NameUpdateSessionReport,
+    Pm1NameUpdateSessionStage, Pm1NameUpdateWriteDisposition, Radio,
 };
 use kenwood_transport::Transport;
 use serde::Serialize;
 
-use super::super::reconnect::{self, Backend, PostExitVerification, SkipReason};
+use super::super::reconnect::{
+    self, Backend, PostExitVerification, ReadinessVerification, SkipReason,
+};
 use super::super::{ExitDisposition, Failure, IdentityEvidence, SegmentEvidence, close_transport};
 use super::UpdateStatus;
 use super::journal::UpdateJournal;
@@ -122,6 +126,25 @@ impl From<Pm1NameUpdateSessionStage> for Stage {
     }
 }
 
+impl From<ChannelNameUpdateSessionStage> for Stage {
+    fn from(stage: ChannelNameUpdateSessionStage) -> Self {
+        match stage {
+            ChannelNameUpdateSessionStage::Preparation => Self::Preparation,
+            ChannelNameUpdateSessionStage::Identity => Self::Identity,
+            ChannelNameUpdateSessionStage::Entry => Self::Entry,
+            ChannelNameUpdateSessionStage::Read { page } => Self::Read {
+                address: page.address().as_u32(),
+                length: page.len(),
+            },
+            ChannelNameUpdateSessionStage::FreshComparison => Self::FreshComparison,
+            ChannelNameUpdateSessionStage::DurableIntent => Self::DurableIntent,
+            ChannelNameUpdateSessionStage::Write => Self::Write,
+            ChannelNameUpdateSessionStage::ImmediateReadback => Self::ImmediateReadback,
+            ChannelNameUpdateSessionStage::Exit => Self::Exit,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum Outcome {
@@ -154,6 +177,16 @@ impl From<My1CallsignUpdateWriteDisposition> for WriteDisposition {
             My1CallsignUpdateWriteDisposition::NotAttempted => Self::NotAttempted,
             My1CallsignUpdateWriteDisposition::PossiblyDispatched => Self::PossiblyDispatched,
             My1CallsignUpdateWriteDisposition::Acknowledged => Self::Acknowledged,
+        }
+    }
+}
+
+impl From<ChannelNameUpdateWriteDisposition> for WriteDisposition {
+    fn from(write: ChannelNameUpdateWriteDisposition) -> Self {
+        match write {
+            ChannelNameUpdateWriteDisposition::NotAttempted => Self::NotAttempted,
+            ChannelNameUpdateWriteDisposition::PossiblyDispatched => Self::PossiblyDispatched,
+            ChannelNameUpdateWriteDisposition::Acknowledged => Self::Acknowledged,
         }
     }
 }
@@ -268,11 +301,107 @@ impl From<&My1CallsignUpdateSessionReport> for CoreEvidence {
     }
 }
 
+impl From<&ChannelNameUpdateSessionReport> for CoreEvidence {
+    fn from(report: &ChannelNameUpdateSessionReport) -> Self {
+        Self {
+            session_id: report.session_id(),
+            identity: report.identity.as_ref().map(IdentityEvidence::from),
+            gateway_mode: None,
+            entry_reply: report.entry_reply.clone(),
+            segments: report
+                .segments
+                .iter()
+                .map(|segment| SegmentEvidence {
+                    address: segment.page.address().as_u32(),
+                    length: segment.page.len(),
+                    data: segment.data.clone(),
+                })
+                .collect(),
+            exit: report.exit.into(),
+            write: report.write.into(),
+            status: report.status.into(),
+            outcome: match &report.outcome {
+                ChannelNameUpdateSessionOutcome::AwaitingCatVerification => {
+                    Outcome::AwaitingCatVerification
+                }
+                ChannelNameUpdateSessionOutcome::Cancelled => Outcome::Cancelled,
+                ChannelNameUpdateSessionOutcome::Failed { stage, error } => Outcome::Failed {
+                    stage: (*stage).into(),
+                    error: Failure::from_error(error),
+                },
+            },
+            cleanup_error: report
+                .cleanup_error
+                .as_ref()
+                .map(|error| Failure::from_error(error)),
+        }
+    }
+}
+
 impl From<&SessionReport> for CoreEvidence {
     fn from(report: &SessionReport) -> Self {
         match report {
             SessionReport::Pm1(report) => Self::from(report),
             SessionReport::My1(report) => Self::from(report),
+            SessionReport::ChannelName(report) => Self::from(report),
+        }
+    }
+}
+
+/// The post-exit CAT check of one session: one open and identity read for the
+/// main-unit forms, or the bounded silent-ID retry the channel-name form
+/// shares with backups.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub(super) enum PostExit {
+    Single(PostExitVerification),
+    Readiness(ReadinessVerification),
+}
+
+impl PostExit {
+    fn skipped(reason: SkipReason, transcript: TranscriptSummary) -> Self {
+        Self::Single(PostExitVerification::skipped(reason, transcript))
+    }
+
+    fn skip(&mut self, reason: SkipReason) {
+        match self {
+            Self::Single(verification) => {
+                verification.outcome = reconnect::VerificationOutcome::Skipped { reason };
+            }
+            Self::Readiness(verification) => {
+                verification.outcome = reconnect::VerificationOutcome::Skipped { reason };
+            }
+        }
+    }
+
+    pub(super) const fn succeeded(&self) -> bool {
+        match self {
+            Self::Single(verification) => verification.succeeded(),
+            Self::Readiness(verification) => verification.succeeded(),
+        }
+    }
+
+    pub(super) fn gateway_off_evidence(
+        &self,
+    ) -> Option<(&kenwood_tmd750::Identity, DvGatewayMode)> {
+        match self {
+            Self::Single(verification) => verification.gateway_off_evidence(),
+            Self::Readiness(_) => None,
+        }
+    }
+
+    pub(super) const fn outcome(&self) -> &reconnect::VerificationOutcome {
+        match self {
+            Self::Single(verification) => &verification.outcome,
+            Self::Readiness(verification) => &verification.outcome,
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    pub(super) const fn transcript(&self) -> &TranscriptSummary {
+        match self {
+            Self::Single(verification) => &verification.transcript,
+            Self::Readiness(verification) => &verification.transcript,
         }
     }
 }
@@ -284,7 +413,7 @@ struct SessionEvidence {
     open_error: Option<Failure>,
     close_error: Option<Failure>,
     synchronization_error: Option<Failure>,
-    post_exit: PostExitVerification,
+    post_exit: PostExit,
 }
 
 impl SessionEvidence {
@@ -383,7 +512,7 @@ impl WorkflowResult {
                 output::error(format_args!(
                     "{} update post-exit verification: {}.",
                     kind.label(),
-                    session.post_exit.outcome
+                    session.post_exit.outcome()
                 ));
             }
         }
@@ -479,14 +608,10 @@ async fn run_session(
         open_error: None,
         close_error: None,
         synchronization_error: None,
-        post_exit: PostExitVerification::skipped(
-            SkipReason::OriginalOpenFailed,
-            post_exit.summary(),
-        ),
+        post_exit: PostExit::skipped(SkipReason::OriginalOpenFailed, post_exit.summary()),
     };
     if cancelled.load(Ordering::Relaxed) && update.status() == UpdateStatus::NotWritten {
-        result.post_exit =
-            PostExitVerification::skipped(SkipReason::Cancelled, post_exit.summary());
+        result.post_exit = PostExit::skipped(SkipReason::Cancelled, post_exit.summary());
         return result;
     }
     let synchronization_handle = match original.synchronization_handle() {
@@ -519,10 +644,8 @@ async fn run_session(
         return result;
     };
     let Some(mut radio) = result.admit_original(connection, original).await else {
-        result.post_exit = PostExitVerification::skipped(
-            SkipReason::OriginalCaptureIncomplete,
-            post_exit.summary(),
-        );
+        result.post_exit =
+            PostExit::skipped(SkipReason::OriginalCaptureIncomplete, post_exit.summary());
         return result;
     };
     let report = update
@@ -539,34 +662,53 @@ async fn run_session(
         &finish_verification
     };
     result.post_exit = match eligibility {
-        Ok(identity) => match update.kind() {
-            UpdateKind::Pm1Name => {
-                reconnect::verify_required(
-                    backend,
-                    endpoint,
-                    baud,
-                    identity,
-                    post_exit,
-                    verification_cancelled,
-                )
-                .await
-            }
-            UpdateKind::PmOffMy1 => {
-                reconnect::verify_required_gateway_off(
-                    backend,
-                    endpoint,
-                    baud,
-                    identity,
-                    post_exit,
-                    verification_cancelled,
-                )
-                .await
-            }
-        },
-        Err(reason) => PostExitVerification::skipped(reason, post_exit.summary()),
+        Ok(identity) => {
+            verify_post_exit(
+                update.kind(),
+                backend,
+                endpoint,
+                baud,
+                identity,
+                post_exit,
+                verification_cancelled,
+            )
+            .await
+        }
+        Err(reason) => PostExit::skipped(reason, post_exit.summary()),
     };
     result.core = Some(CoreEvidence::from(&report));
     result
+}
+
+/// The post-exit CAT check for `kind`: one open and identity read for the
+/// main-unit forms, or the bounded silent-ID retry the channel-name form
+/// shares with backups, because the operation-panel endpoint it admits
+/// answers ID only once its tuple is ready.
+async fn verify_post_exit(
+    kind: UpdateKind,
+    backend: &mut impl Backend,
+    endpoint: &SerialCandidate,
+    baud: u32,
+    identity: &kenwood_tmd750::Identity,
+    post_exit: Recorder<File>,
+    cancelled: &AtomicBool,
+) -> PostExit {
+    match kind {
+        UpdateKind::Pm1Name => PostExit::Single(
+            reconnect::verify_required(backend, endpoint, baud, identity, post_exit, cancelled)
+                .await,
+        ),
+        UpdateKind::ChannelName => PostExit::Readiness(
+            reconnect::verify_readiness(backend, endpoint, baud, identity, post_exit, cancelled)
+                .await,
+        ),
+        UpdateKind::PmOffMy1 => PostExit::Single(
+            reconnect::verify_required_gateway_off(
+                backend, endpoint, baud, identity, post_exit, cancelled,
+            )
+            .await,
+        ),
+    }
 }
 
 fn verification_identity<'a>(
@@ -610,9 +752,7 @@ fn open_original<B: Backend>(
         return None;
     }
     if cancelled.load(Ordering::Relaxed) {
-        result.post_exit.outcome = reconnect::VerificationOutcome::Skipped {
-            reason: SkipReason::Cancelled,
-        };
+        result.post_exit.skip(SkipReason::Cancelled);
         return None;
     }
     match backend.open(endpoint, baud) {

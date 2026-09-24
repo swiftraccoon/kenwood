@@ -163,7 +163,8 @@ fn exact_spaces_and_backup_paths_survive_argument_parsing() -> TestResult {
         "expected spaces are storage bytes"
     );
     assert_eq!(
-        candidate.value, " KQ4NIT ",
+        candidate.value.as_deref(),
+        Some(" KQ4NIT "),
         "desired spaces must not be trimmed"
     );
     assert_eq!(
@@ -211,6 +212,7 @@ fn explicit_approval_and_endpoint_are_required_for_my1_dispatch() -> TestResult 
 
 #[test]
 fn slot_address_force_and_unrelated_settings_cannot_expand_my1_scope() -> TestResult {
+    let _baseline = super::super::parse(&arguments())?;
     for flag in [
         "--slot",
         "--pm",
@@ -225,16 +227,16 @@ fn slot_address_force_and_unrelated_settings_cannot_expand_my1_scope() -> TestRe
             "{flag} must not expand the fixed MY1 scope"
         );
     }
-    for setting in TextSetting::all().iter().copied().filter(|setting| {
-        !matches!(
-            setting.to_string().as_str(),
-            "pm-name-1" | "dstar-my-callsign-1"
-        )
-    }) {
-        let mut candidate = request(Path::new("missing.json"), "", "KQ4NIT")?;
-        candidate.setting = setting;
+    for setting in ["dstar-my-callsign-2", "dstar-memo-1", "pm-name-2"] {
+        let mut candidate = arguments();
+        if let Some(word) = candidate
+            .iter_mut()
+            .find(|word| *word == "dstar-my-callsign-1")
+        {
+            *word = setting.to_owned();
+        }
         assert!(
-            candidate.validate_options().is_err(),
+            super::super::parse(&candidate).is_err(),
             "{setting} must remain outside the live setters"
         );
     }

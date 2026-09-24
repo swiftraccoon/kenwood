@@ -461,6 +461,43 @@ hardware; the fixed empty-to-`KQ4NIT`-and-restore experiment below covers the
 field layout on hardware. Neither operation enables automatic Terminal switching
 or establishes power-cycle persistence or complete reflector operation.
 
+### Dedicated channel name setter with re-entry verification
+
+The `channel-name` form of `mcp text set` writes one memory channel's
+sixteen-byte name and leaves it in place. Select the channel with `--channel`
+using the CAT selector (`000` to `999`, `L00` to `U49`, `Pri`), give the
+expected current name (`--expect ""` for an unnamed channel), and either the
+replacement name or `--clear`:
+
+```bash
+cargo run -p tmd750-repl -- --port /dev/cu.usbmodem101 \
+  mcp text set --backup backup-01/report.json --expect "" --apply \
+  --channel 999 --output channel-name-01 channel-name "Repeater 1"
+```
+
+Names must be 1 through 16 printable ASCII bytes; case and spaces are
+preserved and nothing is truncated. The stored field is NUL padded, and
+`--clear` writes sixteen NUL bytes, which is how an unnamed channel is stored.
+Either TM-D750 USB role, main unit or operation panel, at 9600 baud is
+accepted, with the exact TM-D750 / firmware 1.02 / type K,2,1 identity. Because
+the operation-panel endpoint answers `ID` only once its tuple is ready after
+programming exit, this form's post-exit CAT check uses the bounded silent-`ID`
+retry that backups use, re-enumerating the pinned endpoint between attempts;
+the PM1 and MY1 forms keep their single attempt on main-unit USB. Names are not
+part of the CAT channel record, so this is the only way this program writes
+one.
+
+The whole 256-byte name page holding the channel must match the backup before
+the single write, so the other fifteen names on that page, including the
+weather-channel names that share the last page, are carried unchanged and
+compared in full. The lifecycle, journal, captures and report are those of the
+PM1 form: a format-7 `report.json` with `operation = "channel_name_update"`
+and a `channel` field, `update-journal.jsonl`, and transcripts for both
+sessions and both fresh CAT checks. Take a new full backup before the next
+edit.
+
+Software-tested only; not yet run on hardware.
+
 ### Fixed PM1 experiment
 
 `mcp pm1-trial` is a fixed rename-and-restore bench experiment, not a general
@@ -1346,7 +1383,8 @@ Startup-only workflows are described above:
   offline. `mcp menu apply` uses the ordinary scalar policy, explicit USB endpoint,
   current USB backup, and `--apply`; it requires immediate readback and fresh CAT.
 - `mcp text set` requires an explicit USB endpoint, current USB backup, expected text,
-  and `--apply`; it changes PM1's name or PM Off MY1 through dedicated connections.
+  and `--apply`; it changes PM1's name, PM Off MY1 or one channel's name
+  (`--channel`) through dedicated connections.
 - `mcp pm1-trial` is the fixed rename-and-restore experiment.
 - `mcp my1-trial` temporarily writes the fixed MY1 callsign and restores it.
 - `mcp terminal-exit-trial` is the fixed guarded Terminal-to-Off experiment;

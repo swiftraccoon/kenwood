@@ -604,7 +604,7 @@ async fn either_original_or_fresh_close_failure_prevents_the_next_session() -> T
             assert!(first.close_error.is_some(), "retain original close failure");
             assert!(
                 matches!(
-                    first.post_exit.outcome,
+                    first.post_exit.outcome(),
                     VerificationOutcome::Skipped {
                         reason: SkipReason::OriginalCloseFailed
                     }
@@ -618,7 +618,7 @@ async fn either_original_or_fresh_close_failure_prevents_the_next_session() -> T
         } else {
             assert!(
                 matches!(
-                    first.post_exit.outcome,
+                    first.post_exit.outcome(),
                     VerificationOutcome::Failed {
                         stage: VerificationStage::Close,
                         ..
@@ -656,7 +656,7 @@ async fn fresh_identity_mismatch_closes_without_retry_or_following_update_sessio
                 .first()
                 .ok_or("session missing")?
                 .post_exit
-                .outcome,
+                .outcome(),
             VerificationOutcome::Failed {
                 stage: VerificationStage::IdentityMismatch,
                 ..
@@ -735,7 +735,7 @@ async fn uncertain_ack_prevents_exit_reconnect_retry_and_rollback() -> TestResul
                 .first()
                 .ok_or("session missing")?
                 .post_exit
-                .outcome,
+                .outcome(),
             VerificationOutcome::Skipped {
                 reason: SkipReason::OriginalUpdateIncomplete
             }
@@ -863,12 +863,12 @@ async fn incomplete_fresh_cat_capture_prevents_new_handle_and_preserves_possible
     );
     let post_exit = &result.sessions.first().ok_or("session missing")?.post_exit;
     assert!(
-        !post_exit.transcript.complete,
+        !post_exit.transcript().complete,
         "fresh capture must remain explicitly incomplete"
     );
     assert!(
         matches!(
-            post_exit.outcome,
+            post_exit.outcome(),
             VerificationOutcome::Failed {
                 stage: VerificationStage::Capture,
                 ..

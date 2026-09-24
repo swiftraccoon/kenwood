@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use kenwood_tmd750::Identity;
-use kenwood_tmd750::types::{PAGE_SIZE, Page};
+use kenwood_tmd750::types::{PAGE_SIZE, Page, PhysicalChannel};
 use serde::Serialize;
 
 use super::super::IdentityEvidence;
@@ -195,6 +195,7 @@ impl UpdateJournal {
                 validation_provenance: match update.kind() {
                     UpdateKind::Pm1Name => "accepted engine FreshSession; raw format fragment and whole page in session capture",
                     UpdateKind::PmOffMy1 => "accepted guarded engine FreshSession; raw Gateway, format, full control and target pages synchronized in session capture before this intent",
+                    UpdateKind::ChannelName => "accepted engine FreshSession; raw format fragment and whole name-table page in session capture",
                 },
                 status: UpdateStatus::PossiblyChanged,
             },
@@ -379,6 +380,8 @@ struct Scope<'a> {
     target_kind: Option<UpdateKind>,
     identity: IdentityEvidence,
     field: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channel: Option<u16>,
     page_address: u32,
     page_length: usize,
     original_page: &'a [u8],
@@ -399,9 +402,10 @@ struct ControlPage<'a> {
 impl<'a, U: Update> From<&'a U> for Scope<'a> {
     fn from(update: &'a U) -> Self {
         Self {
-            target_kind: (update.kind() == UpdateKind::PmOffMy1).then_some(update.kind()),
+            target_kind: (update.kind() != UpdateKind::Pm1Name).then_some(update.kind()),
             identity: IdentityEvidence::from(update.identity()),
             field: update.field(),
+            channel: update.channel().map(PhysicalChannel::index),
             page_address: update.page().address().as_u32(),
             page_length: update.page().len(),
             original_page: update.original_page(),

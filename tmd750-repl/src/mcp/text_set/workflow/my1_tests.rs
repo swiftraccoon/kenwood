@@ -796,7 +796,7 @@ fn assert_my1_session(
         "fresh Gateway Off is mandatory"
     );
     assert!(
-        session.transcript.complete && session.post_exit.transcript.complete,
+        session.transcript.complete && session.post_exit.transcript().complete,
         "both captures must be complete"
     );
     Ok(())
@@ -949,10 +949,7 @@ fn synchronized_open_request_rechecks_cancellation_before_handle_acquisition() -
         open_error: None,
         close_error: None,
         synchronization_error: None,
-        post_exit: PostExitVerification::skipped(
-            SkipReason::OriginalOpenFailed,
-            post_exit.summary(),
-        ),
+        post_exit: PostExit::skipped(SkipReason::OriginalOpenFailed, post_exit.summary()),
     };
     harness.cancelled.store(true, Ordering::Relaxed);
     let acquired = open_original(
@@ -992,7 +989,7 @@ fn synchronized_open_request_rechecks_cancellation_before_handle_acquisition() -
     );
     assert!(
         matches!(
-            session.post_exit.outcome,
+            session.post_exit.outcome(),
             VerificationOutcome::Skipped {
                 reason: SkipReason::Cancelled
             }
@@ -1058,7 +1055,7 @@ async fn each_original_or_fresh_close_failure_blocks_the_next_open() -> TestResu
             );
             assert!(
                 matches!(
-                    session.post_exit.outcome,
+                    session.post_exit.outcome(),
                     VerificationOutcome::Skipped {
                         reason: SkipReason::OriginalCloseFailed
                     }
@@ -1068,7 +1065,7 @@ async fn each_original_or_fresh_close_failure_blocks_the_next_open() -> TestResu
         } else {
             assert!(
                 matches!(
-                    session.post_exit.outcome,
+                    session.post_exit.outcome(),
                     VerificationOutcome::Failed {
                         stage: VerificationStage::Close,
                         ..
@@ -1114,7 +1111,7 @@ async fn fresh_identity_or_gateway_failure_is_never_retried_or_finalized() -> Te
                 _ => VerificationStage::Gateway,
             };
             assert!(
-                matches!(&last.post_exit.outcome, VerificationOutcome::Failed { stage, .. } if std::mem::discriminant(stage) == std::mem::discriminant(&expected)),
+                matches!(last.post_exit.outcome(), VerificationOutcome::Failed { stage, .. } if std::mem::discriminant(stage) == std::mem::discriminant(&expected)),
                 "retain the exact fresh-verification boundary: {last:?}"
             );
             assert!(
@@ -1146,7 +1143,8 @@ async fn identity_only_verification_cannot_satisfy_an_otherwise_complete_my1_res
         result.succeeded(&harness.update),
         "establish the complete MY1 positive control first"
     );
-    let verification = independent_verification(VerificationFixture::IdentityOnly).await?;
+    let verification =
+        PostExit::Single(independent_verification(VerificationFixture::IdentityOnly).await?);
     assert!(
         verification.succeeded(),
         "the identity-only positive control must genuinely complete"
@@ -1256,7 +1254,7 @@ async fn adapter_finalization_never_substitutes_gateway_or_identity_observations
             .as_ref()
             .and_then(|core| core.session_id)
             .ok_or("apply session ID missing")?;
-        let verification = independent_verification(fixture).await?;
+        let verification = PostExit::Single(independent_verification(fixture).await?);
         assert!(
             verification.succeeded(),
             "the alternative verifier must succeed within its own requested scope"
@@ -1393,7 +1391,7 @@ async fn each_failed_capture_prevents_its_handle_from_opening() -> TestResult {
         } else {
             assert!(
                 matches!(
-                    session.post_exit.outcome,
+                    session.post_exit.outcome(),
                     VerificationOutcome::Failed {
                         stage: VerificationStage::Capture,
                         ..
@@ -1438,10 +1436,7 @@ async fn failed_post_open_capture_admission_only_closes_and_drops_the_handle() -
         open_error: None,
         close_error: None,
         synchronization_error: None,
-        post_exit: PostExitVerification::skipped(
-            SkipReason::OriginalCaptureIncomplete,
-            post_exit.summary(),
-        ),
+        post_exit: PostExit::skipped(SkipReason::OriginalCaptureIncomplete, post_exit.summary()),
     };
     session.synchronize_original(&mut original);
     let first_error = serde_json::to_value(
@@ -1533,7 +1528,7 @@ async fn failed_pre_write_raw_sync_survives_successful_cleanup_and_blocks_fresh_
     );
     assert!(
         matches!(
-            session.post_exit.outcome,
+            session.post_exit.outcome(),
             VerificationOutcome::Skipped {
                 reason: SkipReason::OriginalCaptureIncomplete
             }

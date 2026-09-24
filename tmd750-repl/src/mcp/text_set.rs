@@ -1,4 +1,4 @@
-//! Updates PM1's name or PM-Off MY1, and no other field.
+//! Updates PM1's name, PM-Off MY1 or one channel's name, and no other field.
 //!
 //! One MCP session compares the whole page, writes it and reads it back; a
 //! second CAT session then verifies the identity tuple and Gateway Off. Nothing
@@ -16,9 +16,11 @@ use std::sync::atomic::AtomicBool;
 use clap::Args;
 use kenwood_tmd750::Region;
 use kenwood_tmd750::memory::{
-    My1Callsign, My1CallsignUpdate, Pm1Name, Pm1NameUpdate, Pm1NameUpdateStatus, TextSetting,
+    ChannelNameText, ChannelNameUpdate, My1Callsign, My1CallsignUpdate, Pm1Name, Pm1NameUpdate,
+    Pm1NameUpdateStatus, TextSetting,
 };
-use kenwood_tmd750::transport::{DEFAULT_BAUD, SerialCandidate, TMD750_MAIN_PID};
+use kenwood_tmd750::transport::{DEFAULT_BAUD, SerialCandidate, TMD750_MAIN_PID, TMD750_PANEL_PID};
+use kenwood_tmd750::types::PhysicalChannel;
 use serde::Serialize;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -39,7 +41,7 @@ pub(super) struct SetRequest {
     /// Successful, current standard configuration-backup report for this radio.
     #[arg(long, value_name = "REPORT")]
     backup: PathBuf,
-    /// Exact current text; MY1 alone accepts "" for eight captured NUL bytes.
+    /// Exact current text; MY1 and channel-name accept "" for a captured all-NUL field.
     #[arg(long = "expect", value_parser = parse_expected, value_name = "CURRENT_TEXT")]
     expected: String,
     /// Required. The new text stays on the radio; nothing is rolled back.
@@ -48,11 +50,46 @@ pub(super) struct SetRequest {
     /// New private capture directory; its parent must exist.
     #[arg(long, value_name = "NEW_DIRECTORY")]
     output: Option<PathBuf>,
-    /// Only pm-name-1 or dstar-my-callsign-1; MY1 is fixed to PM Off/Gateway Off.
-    setting: TextSetting,
-    /// PM1: 1–16 printable ASCII bytes. MY1: 1–8 uppercase letters/digits/spaces.
-    #[arg(value_parser = parse_value, value_name = "NEW_TEXT")]
-    value: String,
+    /// The memory channel whose name changes; channel-name only (000-999, L00-U49, Pri).
+    #[arg(long, value_parser = parse_channel, value_name = "CHANNEL")]
+    channel: Option<PhysicalChannel>,
+    /// Clear the channel name instead of giving new text; channel-name only.
+    #[arg(long, conflicts_with = "value", requires = "channel")]
+    clear: bool,
+    /// pm-name-1, dstar-my-callsign-1 (fixed to PM Off/Gateway Off) or channel-name.
+    setting: SetTarget,
+    /// PM1 and channel names: 1 to 16 printable ASCII bytes. MY1: 1 to 8 uppercase letters, digits or spaces.
+    #[arg(value_parser = parse_value, value_name = "NEW_TEXT", required_unless_present = "clear")]
+    value: Option<String>,
+}
+
+/// The fields `set` can write; the parser refuses every other text setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum SetTarget {
+    /// PM1's display name.
+    #[value(name = "pm-name-1")]
+    PmName1,
+    /// The MY1 callsign in PM Off.
+    #[value(name = "dstar-my-callsign-1")]
+    DstarMyCallsign1,
+    /// One memory channel's sixteen-byte name, selected with `--channel`.
+    #[value(name = "channel-name")]
+    ChannelName,
+}
+
+impl SetTarget {
+    /// Stable, case-sensitive command-line spelling.
+    const fn key(self) -> &'static str {
+        match self {
+            Self::PmName1 => TextSetting::PmName1.key(),
+            Self::DstarMyCallsign1 => TextSetting::DstarMyCallsign1.key(),
+            Self::ChannelName => "channel-name",
+        }
+    }
+}
+
+fn parse_channel(value: &str) -> Result<PhysicalChannel, String> {
+    crate::cat::parse_address(value).map(PhysicalChannel::from_address)
 }
 
 fn parse_value(value: &str) -> Result<String, String> {
@@ -80,6 +117,11 @@ enum RequestedChange {
         expected: Option<My1Callsign>,
         desired: My1Callsign,
     },
+    ChannelName {
+        channel: PhysicalChannel,
+        expected: Option<ChannelNameText>,
+        desired: Option<ChannelNameText>,
+    },
 }
 
 impl SetRequest {
@@ -93,10 +135,16 @@ impl SetRequest {
                 "mcp text set requires explicit --apply".to_owned(),
             )));
         }
+        if self.setting != SetTarget::ChannelName && (self.channel.is_some() || self.clear) {
+            return Err(Box::new(CommandError(
+                "--channel and --clear apply to channel-name only".to_owned(),
+            )));
+        }
+        let value = self.value.as_deref().unwrap_or_default();
         match self.setting {
-            TextSetting::PmName1 => {
+            SetTarget::PmName1 => {
                 let expected = Pm1Name::new(&self.expected)?;
-                let desired = Pm1Name::new(&self.value)?;
+                let desired = Pm1Name::new(value)?;
                 if expected == desired {
                     return Err(Box::new(CommandError(
                         "no name change requested; the radio was not opened or checked".to_owned(),
@@ -104,13 +152,13 @@ impl SetRequest {
                 }
                 Ok(RequestedChange::Pm1 { expected, desired })
             }
-            TextSetting::DstarMyCallsign1 => {
+            SetTarget::DstarMyCallsign1 => {
                 let expected = if self.expected.is_empty() {
                     None
                 } else {
                     Some(My1Callsign::new(&self.expected)?)
                 };
-                let desired = My1Callsign::new(&self.value)?;
+                let desired = My1Callsign::new(value)?;
                 if expected.as_ref() == Some(&desired) {
                     return Err(Box::new(CommandError(
                         "no MY1 change requested; the radio was not opened or checked".to_owned(),
@@ -118,19 +166,58 @@ impl SetRequest {
                 }
                 Ok(RequestedChange::My1 { expected, desired })
             }
-            _ => Err(Box::new(CommandError(format!(
-                "{} has no dedicated text setter; this command supports only pm-name-1 and the experimental PM-Off dstar-my-callsign-1 update. Use mcp menu for general field discovery, preview, and ordinary-update policy.",
-                self.setting,
-            )))),
+            SetTarget::ChannelName => {
+                let Some(channel) = self.channel else {
+                    return Err(Box::new(CommandError(
+                        "channel-name requires --channel".to_owned(),
+                    )));
+                };
+                let expected = if self.expected.is_empty() {
+                    None
+                } else {
+                    Some(ChannelNameText::new(&self.expected)?)
+                };
+                let desired = self
+                    .value
+                    .as_deref()
+                    .map(ChannelNameText::new)
+                    .transpose()?;
+                if expected == desired {
+                    return Err(Box::new(CommandError(
+                        "no channel name change requested; the radio was not opened or checked"
+                            .to_owned(),
+                    )));
+                }
+                Ok(RequestedChange::ChannelName {
+                    channel,
+                    expected,
+                    desired,
+                })
+            }
         }
+    }
+
+    /// The requested text as printed: the quoted name, or `cleared`.
+    fn requested_text(&self) -> String {
+        self.value
+            .as_deref()
+            .map_or_else(|| "cleared".to_owned(), |value| format!("{value:?}"))
     }
 
     fn prepare(&self, endpoint: &SerialCandidate, baud: u32) -> AppResult<PreparedUpdate> {
         let change = self.requested_change()?;
-        if !endpoint.is_tmd750() || endpoint.pid != Some(TMD750_MAIN_PID) || baud != DEFAULT_BAUD {
-            return Err(Box::new(CommandError(
-                "text updates require the pinned main-unit USB endpoint at 9600 baud".to_owned(),
-            )));
+        let (usb_role_accepted, requirement) = match &change {
+            RequestedChange::ChannelName { .. } => (
+                matches!(endpoint.pid, Some(TMD750_MAIN_PID | TMD750_PANEL_PID)),
+                "channel name updates require a TM-D750 USB endpoint, main unit or operation panel, at 9600 baud",
+            ),
+            RequestedChange::Pm1 { .. } | RequestedChange::My1 { .. } => (
+                endpoint.pid == Some(TMD750_MAIN_PID),
+                "text updates require the pinned main-unit USB endpoint at 9600 baud",
+            ),
+        };
+        if !endpoint.is_tmd750() || !usb_role_accepted || baud != DEFAULT_BAUD {
+            return Err(Box::new(CommandError(requirement.to_owned())));
         }
         let snapshot = Snapshot::load_for_usb_write(&self.backup)?;
         match change {
@@ -157,6 +244,27 @@ impl SetRequest {
                     &desired,
                 )?)))
             }
+            RequestedChange::ChannelName {
+                channel,
+                expected,
+                desired,
+            } => {
+                if snapshot.captured_bytes(Region::new(10, 11)?)? != [0] {
+                    return Err(
+                        "channel name update requires captured memory-format byte zero".into(),
+                    );
+                }
+                let page = ChannelNameUpdate::required_page(channel)?;
+                Ok(PreparedUpdate::ChannelName(Box::new(
+                    ChannelNameUpdate::prepare(
+                        &snapshot.identity,
+                        snapshot.captured_bytes(page.region())?,
+                        channel,
+                        expected.as_ref(),
+                        desired.as_ref(),
+                    )?,
+                )))
+            }
         }
     }
 
@@ -167,10 +275,10 @@ impl SetRequest {
             directory.display()
         ));
         output::line(format_args!(
-            "Requested {} text: {:?} -> {:?}. The requested text will remain in place; no RF commands or automatic rollback.",
+            "Requested {} text: {:?} -> {}. The requested text will remain in place; no RF commands or automatic rollback.",
             kind.label(),
             self.expected.as_str(),
-            self.value.as_str()
+            self.requested_text()
         ));
         output::line(format_args!(
             "Keep this radio connected. Ctrl-C cancels before the write is journaled; afterward the verification finishes before stopping."
@@ -178,6 +286,11 @@ impl SetRequest {
         if kind == UpdateKind::PmOffMy1 {
             output::line(format_args!(
                 "This writes PM-Off MY1 only, with Gateway Off; Terminal Mode and routing are left unchanged."
+            ));
+        }
+        if let Some(channel) = self.channel {
+            output::line(format_args!(
+                "This writes the sixteen name bytes of channel {channel} only; the other names on its page are compared in full before and after the write."
             ));
         }
     }
@@ -211,6 +324,8 @@ struct Report {
     endpoint: Endpoint,
     source_backup: PathBuf,
     setting: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channel: Option<u16>,
     expected_name: String,
     requested_name: String,
     scope: &'static str,
@@ -271,6 +386,9 @@ pub(super) async fn run(
             run_prepared(update.as_mut(), endpoint, baud, request).await
         }
         PreparedUpdate::My1(mut update) => {
+            run_prepared(update.as_mut(), endpoint, baud, request).await
+        }
+        PreparedUpdate::ChannelName(mut update) => {
             run_prepared(update.as_mut(), endpoint, baud, request).await
         }
     }
@@ -354,8 +472,9 @@ async fn run_prepared(
         },
         source_backup: request.backup.clone(),
         setting: request.setting.key(),
+        channel: request.channel.map(PhysicalChannel::index),
         expected_name: request.expected.as_str().to_owned(),
-        requested_name: request.value.as_str().to_owned(),
+        requested_name: request.value.clone().unwrap_or_default(),
         scope: kind.scope(),
         status: update.status(),
         workflow,
@@ -370,9 +489,9 @@ async fn run_prepared(
     ));
     if succeeded {
         output::line(format_args!(
-            "{} is now {:?}; the whole page was verified across MCP exit and re-entry. Refresh the configuration backup before another edit.",
+            "{} is now {}; the whole page was verified across MCP exit and re-entry. Refresh the configuration backup before another edit.",
             kind.label(),
-            request.value.as_str()
+            request.requested_text()
         ));
         Ok(())
     } else {

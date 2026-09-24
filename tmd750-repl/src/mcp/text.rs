@@ -1,7 +1,8 @@
 //! Text inspection from captured backups, plus the two writable text settings.
 //!
 //! `list`, `show` and `preview` read captured files only; `set` opens the radio
-//! and can change PM1's name or PM-Off MY1, and no other field.
+//! and can change PM1's name, PM-Off MY1 or one channel's name, and no other
+//! field.
 
 use std::path::{Path, PathBuf};
 
@@ -33,7 +34,7 @@ enum TextCommand {
     Show(Selection),
     /// Preview a text change without altering the backup or applying it to a radio.
     Preview(PreviewRequest),
-    /// Set PM1's name or PM-Off MY1, then verify across MCP exit/re-entry.
+    /// Set PM1's name, PM-Off MY1 or one channel's name, then verify across MCP exit/re-entry.
     Set(super::text_set::SetRequest),
 }
 
@@ -195,7 +196,7 @@ fn list() -> AppResult<()> {
         ));
     }
     output::line(format_args!(
-        "This legacy text view requires --interpret-unqualified on firmware 1.02. Dedicated pm-name-1 and PM-Off MY1 setters: mcp text set --help. General menu discovery, preview, and ordinary updates: mcp menu --help."
+        "This legacy text view requires --interpret-unqualified on firmware 1.02. Dedicated pm-name-1, PM-Off MY1 and channel-name setters: mcp text set --help. General menu discovery, preview, and ordinary updates: mcp menu --help."
     ));
     Ok(())
 }

@@ -29,6 +29,13 @@
 - Native Bluetooth admits only `mcp probe` and `mcp backup`; general MCP
   settings writes and the fixed trials are USB-only and are refused before the
   helper launches.
+- `mcp text set` forms differ by USB role: `pm-name-1` and
+  `dstar-my-callsign-1` pin main-unit USB and verify post-exit CAT once;
+  `channel-name` admits either USB role and verifies with
+  `reconnect::verify_readiness`, the bounded silent-`ID` retry backups use,
+  because the operation-panel endpoint returns within seconds but answers `ID`
+  only once its tuple is ready. A single-attempt check on that endpoint ends
+  the update at `possibly_changed` even after an acknowledged write.
 - The CLI tests must not open a radio endpoint.
 - Committed prose states contracts only: no dated bench narrative, no approval
   vocabulary, no capture paths. `README.md` is the crate's published front page.

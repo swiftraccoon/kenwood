@@ -440,7 +440,7 @@ fn parse_step(value: &str) -> Result<StepSize, String> {
 
 /// Accept the wire spelling in any letter case: `l05`, `u05` and `pri` name
 /// the same channels as `L05`, `U05` and `Pri`.
-fn parse_address(value: &str) -> Result<MemoryChannelAddress, String> {
+pub(crate) fn parse_address(value: &str) -> Result<MemoryChannelAddress, String> {
     let normalized = match value.as_bytes() {
         [b'l' | b'L', ..] => format!("L{}", value.get(1..).unwrap_or_default()),
         [b'u' | b'U', ..] => format!("U{}", value.get(1..).unwrap_or_default()),

@@ -736,7 +736,7 @@ fn print_help() {
         "Probe/backup capture MCP reads and verify exit; text list/show/preview and terminal preflight inspect local backups."
     ));
     output::line(format_args!(
-        "Text set changes PM1's name or PM-Off MY1, with an explicit port, current backup, expected text, and --apply. Configurable MY1 remains untested on hardware."
+        "Text set changes PM1's name, PM-Off MY1 or one channel's name (--channel), with an explicit port, current backup, expected text, and --apply. Configurable MY1 remains untested on hardware."
     ));
     output::line(format_args!(
         "PM1 trial performs one fixed PM1 rename and restores the original name; no other field is writable."
