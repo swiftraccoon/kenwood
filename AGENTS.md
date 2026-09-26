@@ -21,6 +21,7 @@ Rust workspace for the Kenwood TH-D75 and TM-D750, a D-STAR reflector stack, pac
 - Run `./lint.sh` before every commit and `./ci-local.sh` before every push.
 - Do not reflexively pipe output through `head` or `tail`; `grep` for what you need or redirect to a file.
 - Commit messages describe behavior and policy, not the cleanup job: no line or test counts, no file paths, no "squash/consolidated" framing.
+- Every commit subject starts with a scope prefix: the package name (`kenwood-tmd750:`, `tmd750-repl:`) or `docs:`, `ci:`, `build:`, `lint:`, `workspace:`, `README:` for workspace-level changes, followed by a lowercase description.
 - Never reference gitignored or internal-only context from committed content (README, source comments, commit messages, PR descriptions): `CLAUDE.local.md`, `docs/`, `specs/`, `phases/`, `ref/`, internal ticket IDs, and local reverse-engineering tools or their endpoints. A gitignored directory that a shipped program creates as its default output (the REPL capture directory) may be documented as that program's output. Cite public upstreams de-pathed (see Reference hierarchy); the two carve-outs are listed there.
 - A superseded finding must be corrected wherever it was written: the instruction file, the doc comment on the constant it produced, and anything that reasoned from it. Grep for the constant, not the prose.
 - TM-D750 operator state: verify CAT state directly instead of asking for menu or screen confirmations. Require an independent control path (the control-panel USB endpoint) before any Terminal activation; never a same-interface escape or a power cycle. Never repeat an MCP session or bypass the uncertain-framing safeguards to work around a silent radio; a consumed one-shot approval does not cover another attempt.
@@ -56,6 +57,8 @@ cargo test -p <package> --doc                            # doctests; nextest nev
 - A background gate wrapper must `exit $rc` with the gate's status, and any commit chain must test that status, never merely print it.
 - On failure `./lint.sh` writes `.lint-failures/<step>.log`; read that instead of rerunning. Old logs are never cleaned up, so only the steps marked ✗ in the current run are live.
 - Two crates ship `examples/monitor.rs` (thd75, aprs-is) and collide in the shared target directory: always `cargo run -p <crate> --example monitor`, never `./target/debug/examples/monitor`.
+- `-E 'test(<substring>)'` matches test names (module path included), never binary names: an integration binary whose tests lack the substring is skipped silently, so check the `N tests run` count or use `binary(<target>)`.
+- Run `cargo fmt --all` once at the end of an edit batch: a mid-batch format rewrites anchors and forces every later edit to re-read its file.
 
 ## Workspace boundaries
 
@@ -121,6 +124,7 @@ cargo test -p <package> --doc                            # doctests; nextest nev
 - Same discipline for platform APIs: read the primary Apple doc page before asserting that something is impossible on iOS or macOS.
 - `#![expect(lint)]` is stable since 1.81; use it instead of `#![allow(lint)]` so a stale suppression fails.
 - `fancy_regex` patterns must not open with `(?m)^\s*`; over long whitespace runs `\s*` backtracks until the limit trips. Anchor with `^[ \t]*`; the `regex` crate is unaffected.
+- clap `ValueEnum` renders `PmName1` as `pm-name1` (no hyphen before a trailing digit); a variant that must match a library key such as `pm-name-1` needs `#[value(name = "...")]`.
 
 ## Clippy policy
 
@@ -146,3 +150,4 @@ cargo test -p <package> --doc                            # doctests; nextest nev
 - Proptest: `fn to_test_err<E: Debug>(e: E) -> TestCaseError` with `.map_err(to_test_err)?`, and `.prop_filter_map("reason", |x| T::new(x).ok())` for validated types.
 - When tests and implementation land together, prove the critical tests can fail: mutate the load-bearing behavior, watch the exact tests go red, restore byte-identically, rerun green.
 - Const: `Option::unwrap` is const since 1.83; `Result::unwrap` is not (match with `unreachable!`). `const fn` cannot deref a `Vec` or call `try_from`; make such functions non-const rather than `as`-narrowing.
+- A test whose only `?` is removed trips `unnecessary_wraps`; keep one real fallible step and bind its value (`let _baseline = parse(&arguments())?;`) so `unused_results` stays satisfied.
