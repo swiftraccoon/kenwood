@@ -237,6 +237,17 @@ skip = [
   # windows-core 0.54 from older winit path; 0.62 from newer.
   { crate = "windows-core@0.54.0" },
   { crate = "windows-result@0.1.2" },
+
+  # ─────────────────────────────────────────────────────────────────────
+  # reqwest HTTP stack (reqwest → hyper-util)
+  # ─────────────────────────────────────────────────────────────────────
+
+  # reqwest 0.12 uses base64 0.22 directly while hyper-util 0.1.21, which
+  # reqwest also depends on, moved to base64 0.23. Both copies sit under
+  # reqwest, reached from dstar-gateway and stargazer. Skip the whole 0.22
+  # line so patch bumps in a fresh lockfile stay covered; dropable when
+  # reqwest moves to base64 0.23.
+  { crate = "base64@0.22" },
 ]
 
 [sources]
