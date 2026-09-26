@@ -4,27 +4,13 @@ use std::fs::File;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use kenwood_tmd750::radio::BLUETOOTH_FIRST_REPLY_TIMEOUT;
-use kenwood_tmd750::{Band, DvGatewayMode, Identity, Radio};
+use kenwood_tmd750::{Band, DvGatewayMode, Identity, OperatingMode, Radio};
 use kenwood_transport::Transport;
 use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
 
 use crate::capture::{CaptureTransport, Failure, TranscriptSummary};
 use crate::{AppResult, CommandError};
-
-/// Reply deadline for every exchange after the first on a native connection.
-pub(crate) const EXCHANGE_TIMEOUT: Duration = Duration::from_millis(1_500);
-
-/// Wrap a newly opened native connection: the first command's reply may take
-/// up to [`BLUETOOTH_FIRST_REPLY_TIMEOUT`], every later exchange
-/// [`EXCHANGE_TIMEOUT`].
-pub(crate) const fn wrap<T: Transport>(transport: T) -> Radio<T> {
-    let mut radio = Radio::new(transport);
-    radio.set_timeout(EXCHANGE_TIMEOUT);
-    radio.set_next_reply_timeout(BLUETOOTH_FIRST_REPLY_TIMEOUT);
-    radio
-}
 
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -45,6 +31,19 @@ impl Serialize for IdentityEvidence {
         fields.serialize_field("firmware", self.0.firmware.as_str())?;
         fields.serialize_field("radio_type", self.0.radio_type.as_str())?;
         fields.end()
+    }
+}
+
+/// A band's operating mode as `band_a` and `band_b` record it: the mode's
+/// name, or `unqualified value N` for a value the library leaves unnamed.
+pub(crate) fn mode_label(mode: OperatingMode) -> String {
+    match mode {
+        OperatingMode::Fm => "FM".to_owned(),
+        OperatingMode::Dv => "DV".to_owned(),
+        OperatingMode::Am => "AM".to_owned(),
+        OperatingMode::Nfm => "NFM".to_owned(),
+        OperatingMode::Dr => "DR".to_owned(),
+        OperatingMode::Unnamed(value) => format!("unqualified value {value}"),
     }
 }
 
@@ -84,7 +83,8 @@ pub(crate) struct Request<'a> {
     pub(crate) scope: Scope,
     pub(crate) expected_identity: Option<&'a Identity>,
     pub(crate) expected_gateway: Option<DvGatewayMode>,
-    /// Reply deadline of the first command: [`BLUETOOTH_FIRST_REPLY_TIMEOUT`],
+    /// Reply deadline of the first command:
+    /// [`BLUETOOTH_FIRST_REPLY_TIMEOUT`](kenwood_tmd750::radio::BLUETOOTH_FIRST_REPLY_TIMEOUT),
     /// or after a programming exit the deadline measured from that exit.
     pub(crate) first_reply_timeout: Duration,
 }
@@ -120,9 +120,9 @@ async fn query(
     }
     if matches!(request.scope, Scope::Status) {
         check_cancellation(cancelled)?;
-        result.band_a = Some(radio.get_operating_mode(Band::A).await?.to_string());
+        result.band_a = Some(mode_label(radio.get_operating_mode(Band::A).await?));
         check_cancellation(cancelled)?;
-        result.band_b = Some(radio.get_operating_mode(Band::B).await?.to_string());
+        result.band_b = Some(mode_label(radio.get_operating_mode(Band::B).await?));
     }
     check_cancellation(cancelled)?;
     let gateway = radio.get_dv_gateway_mode().await?;
@@ -158,7 +158,7 @@ pub(crate) async fn observe(
         transcript: transport.transcript_summary(),
     };
     let ready = transport.synchronize();
-    let mut radio = wrap(transport);
+    let mut radio = Radio::new(transport);
     radio.set_next_reply_timeout(request.first_reply_timeout);
     match ready {
         Ok(()) => {

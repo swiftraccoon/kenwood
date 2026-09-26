@@ -4,7 +4,7 @@
 use std::fs::File;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use kenwood_tmd750::{DvGatewayMode, Identity, McpBackupReport};
+use kenwood_tmd750::{DvGatewayMode, Identity, McpBackupReport, Radio};
 use kenwood_transport::Transport;
 
 use crate::capture::{CaptureTransport, Failure, TranscriptSummary};
@@ -84,7 +84,7 @@ pub(super) async fn read<T: Transport>(
     cancelled: &AtomicBool,
 ) -> PendingClose<T> {
     let ready = transport.synchronize().is_ok() && !cancelled.load(Ordering::Relaxed);
-    let mut radio = crate::native::cat::wrap(transport);
+    let mut radio = Radio::new_bluetooth(transport);
     let backup = if ready {
         Some(
             radio

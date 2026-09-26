@@ -7,7 +7,6 @@ mod menu;
 mod menu_apply;
 mod pm1_trial;
 pub(crate) mod reconnect;
-mod reconnect_policy;
 mod reentry_probe;
 pub(crate) mod snapshot;
 mod terminal;

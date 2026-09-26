@@ -22,8 +22,9 @@ Rust workspace for the Kenwood TH-D75 and TM-D750, a D-STAR reflector stack, pac
 - Do not reflexively pipe output through `head` or `tail`; `grep` for what you need or redirect to a file.
 - Commit messages describe behavior and policy, not the cleanup job: no line or test counts, no file paths, no "squash/consolidated" framing.
 - Every commit subject starts with a scope prefix: the package name (`kenwood-tmd750:`, `tmd750-repl:`) or `docs:`, `ci:`, `build:`, `lint:`, `workspace:`, `README:` for workspace-level changes, followed by a lowercase description.
+- Fold a fix into an unpushed commit with `git commit --fixup=<sha>` then `git rebase --autosquash origin/main`; git 2.55 needs no `-i`.
 - Never reference gitignored or internal-only context from committed content (README, source comments, commit messages, PR descriptions): `CLAUDE.local.md`, `docs/`, `specs/`, `phases/`, `ref/`, internal ticket IDs, and local reverse-engineering tools or their endpoints. A gitignored directory that a shipped program creates as its default output (the REPL capture directory) may be documented as that program's output. Cite public upstreams de-pathed (see Reference hierarchy); the two carve-outs are listed there.
-- A superseded finding must be corrected wherever it was written: the instruction file, the doc comment on the constant it produced, and anything that reasoned from it. Grep for the constant, not the prose.
+- A superseded finding must be corrected wherever it was written: the instruction file, the doc comment on the constant it produced, and anything that reasoned from it. Grep for the constant, not the prose; a corrected limit also changes the constant's value and its boundary test.
 - TM-D750 operator state: verify CAT state directly instead of asking for menu or screen confirmations. Require an independent control path (the control-panel USB endpoint) before any Terminal activation; never a same-interface escape or a power cycle. Never repeat an MCP session or bypass the uncertain-framing safeguards to work around a silent radio; a consumed one-shot approval does not cover another attempt.
 
 ## Documentation and comment register
@@ -55,6 +56,8 @@ cargo test -p <package> --doc                            # doctests; nextest nev
 - Scoped clippy must match the gate: `cargo clippy -p <pkg> --all-targets -- -D warnings`. Without `-D warnings`, warn-level rustc lints pass locally and fail `lint.sh`.
 - Never pipe `./lint.sh` before acting on its status: `lint.sh | tail -1 && git commit` commits on failure. Run it bare or with `set -o pipefail`.
 - A background gate wrapper must `exit $rc` with the gate's status, and any commit chain must test that status, never merely print it.
+- Make no edits while a background `./lint.sh` runs; its result then covers a mixed tree, so rerun it after the edit.
+- `git grep` skips untracked files: after a plain `mv` rename, check leftovers with `grep -r` or the compiler.
 - On failure `./lint.sh` writes `.lint-failures/<step>.log`; read that instead of rerunning. Old logs are never cleaned up, so only the steps marked ✗ in the current run are live.
 - Two crates ship `examples/monitor.rs` (thd75, aprs-is) and collide in the shared target directory: always `cargo run -p <crate> --example monitor`, never `./target/debug/examples/monitor`.
 - `-E 'test(<substring>)'` matches test names (module path included), never binary names: an integration binary whose tests lack the substring is skipped silently, so check the `N tests run` count or use `binary(<target>)`.
@@ -82,7 +85,7 @@ cargo test -p <package> --doc                            # doctests; nextest nev
 ## CI
 
 - All platforms pin Rust 1.94.0; `rust-toolchain.toml` matches. Symptom of drift: dozens of new clippy lints and trybuild stderr mismatches that CI never sees.
-- A new RUSTSEC advisory fails the gate: try `cargo update <crate>` first. With no semver-compatible fix, add paired documented ignores in both `.cargo/audit.toml` and `deny.toml`; duplicate-version `skip` entries pin exact versions and go stale on bumps.
+- A new RUSTSEC advisory fails the gate: try `cargo update <crate>` first. With no semver-compatible fix, add paired documented ignores in both `.cargo/audit.toml` and `deny.toml`. A duplicate-version `skip` names a whole release line (`crate@0.5`, never `crate@0.5.2`), since a pinned patch goes stale when a fresh lockfile picks up the next release; drop entries a fresh lockfile reports as unmatched or unnecessary.
 - CI resolves a fresh lockfile, so a green local gate proves nothing about it. Reproduce cargo-deny duplicates with `cargo generate-lockfile` (back up `Cargo.lock` first) and `cargo deny check bans`.
 - The persistent `target/clippy-gate` dir and CI's rust-cache reuse clippy fingerprints, so a pre-existing `-D warnings` violation (e.g. `missing_assert_message`) stays hidden until an edit to that module or its dependencies invalidates the fingerprint; a green gate is not proof the whole tree is clippy-clean.
 - `gh run list --commit <sha>` returns nothing here; list unfiltered with `--json headSha` and filter. A scratch `git worktree` with CRLF-converted files stands in for the Windows runner.
@@ -93,6 +96,7 @@ cargo test -p <package> --doc                            # doctests; nextest nev
 - Windows: D-STAR fixtures that touch directory durability go through the explicit durability seam, never a Unix directory open plus sync.
 - `ci-local.sh` runs macOS locally plus Ubuntu and Fedora on k8s pods. Stuck `ci-ubuntu`/`ci-fedora` pods from a killed run must be force-deleted first; the script silences kubectl errors, so "no pod output" is the symptom. macOS `ar` warnings starting `warning: kenwood-thd75@` are harmless. zsh: `$pipestatus` is lowercase and unquoted variables do not word-split (use `xargs` or `${=var}`).
 - `ci-local.sh` catches Linux-only `dead_code` the macOS `lint.sh` cannot: an item used only under `#[cfg(any(target_os = "macos", test))]` is dead in a Linux non-test build and fails `-D warnings`. Gate such helpers with the same `cfg`.
+- A test through a `cfg!(target_os = "macos")` early return passes `lint.sh` and fails Linux and Windows CI: assert each platform's outcome, or gate the test with `#[cfg(target_os = "macos")]`.
 - `ci-local.sh` snapshots the tree with `git ls-files --cached`; stage tracked-file deletions (`git rm`) before running it, or its tar fails with `Cannot stat` on the removed paths.
 
 ## File naming
@@ -112,6 +116,7 @@ cargo test -p <package> --doc                            # doctests; nextest nev
 ## Documentation gates
 
 - `cargo doc` resolves intra-doc links only on items it renders, so `lint.sh` runs `--document-private-items`.
+- Removing a `use` can break an intra-doc link that resolved through it; clippy still passes. Link by full path instead.
 - Implicit `cargo doc` selection prefers a library over its same-name binary (`thd75-repl` is the trap); the full gate selects `--lib --bins`. Do not add `--lib` to a bin-only package such as `sextant`.
 - `cargo test --doc` never sees ```` ```text ```` or ```` ```ignore ```` fences, binary crates, or README prose. `thd75`, `tmd750`, `kenwood-transport`, `kenwood-schema`, `mmdvm`, `mbelib-rs`, `dstar-gateway` and `azimuth-core` include their README through `#![doc = include_str!]`, so README identifiers need backticks (`clippy::doc_markdown`), a fence that opens a port is ```` ```rust,no_run ````, and relative links must be absolute GitHub URLs. Those READMEs are the published API front pages.
 - The only mdBook is `dstar-gateway/book`; its `book.toml` sets `create-missing = false`. mdbook does not validate inline `[text](page.md)` links; check them by hand when deleting a page.
@@ -151,3 +156,5 @@ cargo test -p <package> --doc                            # doctests; nextest nev
 - When tests and implementation land together, prove the critical tests can fail: mutate the load-bearing behavior, watch the exact tests go red, restore byte-identically, rerun green.
 - Const: `Option::unwrap` is const since 1.83; `Result::unwrap` is not (match with `unreachable!`). `const fn` cannot deref a `Vec` or call `try_from`; make such functions non-const rather than `as`-narrowing.
 - A test whose only `?` is removed trips `unnecessary_wraps`; keep one real fallible step and bind its value (`let _baseline = parse(&arguments())?;`) so `unused_results` stays satisfied.
+- `MockTransport` never fails on unconsumed expectations: end tests that own the mock with `assert_complete()`; where a host consumes it, assert a value only the script's last replies produce.
+- Script a held reply with `expect_reads(command, &[])` then `queue_read_delayed(reply, ms)`; the delay is real time, so keep it just past the deadline under test.

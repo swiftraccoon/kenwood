@@ -9,7 +9,9 @@ use std::path::Path;
 
 use kenwood_tmd750::memory::{FieldDescriptor, StandardConfiguration};
 use kenwood_tmd750::protocol::mcp::regions;
+use kenwood_tmd750::radio::readiness::MAXIMUM_OPEN_ATTEMPTS;
 use kenwood_tmd750::transport::SerialCandidate;
+use kenwood_tmd750::transport::reenumeration::{Reenumeration, select_pinned};
 use kenwood_tmd750::{
     FirmwareIdentity, Identity, MemoryImage, MenuFieldSnapshot, RadioModel, RadioType, Region,
     SlotIndex,
@@ -17,8 +19,6 @@ use kenwood_tmd750::{
 use kenwood_transport::bluetooth::{BluetoothAddress, RfcommChannel};
 use serde::Deserialize;
 
-use super::reconnect::MAXIMUM_OPEN_ATTEMPTS;
-use super::reconnect_policy::{ReconnectDecision, classify};
 use super::{IdentityEvidence, SegmentEvidence};
 use crate::{AppResult, CommandError};
 
@@ -137,10 +137,10 @@ fn validate_enumerations(
             .iter()
             .map(Endpoint::candidate)
             .collect();
-        let decision = classify(&original, &candidates);
+        let decision = select_pinned(&original, &candidates);
         if !matches!(
             (must_be_ready, decision),
-            (true, ReconnectDecision::Ready(_)) | (false, ReconnectDecision::AwaitingEndpoint)
+            (true, Reenumeration::Ready(_)) | (false, Reenumeration::Absent)
         ) {
             return false;
         }

@@ -61,6 +61,7 @@ pub(crate) fn runtime_recovery(parent: &Path) -> AppResult<Recovery> {
         transition: TransitionSummary::default(),
         modem_openings: Value::Null,
         readiness: Vec::new(),
+        settle: Vec::new(),
         owner_released: None,
         errors: Vec::new(),
     })
@@ -151,4 +152,14 @@ fn restoration_labels_cover_every_state() {
     assert_eq!(restoration_label(RestorationState::Owed), "owed");
     assert_eq!(restoration_label(RestorationState::Verified), "verified");
     assert_eq!(restoration_label(RestorationState::Blocked), "blocked");
+}
+
+#[test]
+fn gateway_labels_keep_the_report_vocabulary() {
+    assert_eq!(gateway_label(DvGatewayMode::Off), "Off");
+    assert_eq!(gateway_label(DvGatewayMode::Terminal), "Terminal");
+    assert_eq!(
+        gateway_label(DvGatewayMode::Unnamed(1)),
+        "unqualified value 1"
+    );
 }

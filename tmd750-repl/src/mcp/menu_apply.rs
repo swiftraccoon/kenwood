@@ -315,7 +315,7 @@ async fn operate(
     result.gateway_mode = Some(match gateway {
         DvGatewayMode::Off => 0,
         DvGatewayMode::Terminal => 2,
-        DvGatewayMode::Unqualified(raw) => raw,
+        DvGatewayMode::Unnamed(raw) => raw,
     });
     if gateway != DvGatewayMode::Off {
         return Err(

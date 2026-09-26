@@ -94,7 +94,7 @@ pub(super) fn cat_startup_guidance(
             "No other endpoint was opened and no setting was changed."
         )
         .to_owned(),
-        Some(DvGatewayMode::Unqualified(_)) | None => concat!(
+        Some(DvGatewayMode::Unnamed(_)) | None => concat!(
             "The GW query failed or returned an unrecognized value.\n",
             "Check the DV Gateway setting on the radio, then rerun this command.\n",
             "No other endpoint was opened and no setting was changed."
@@ -172,7 +172,7 @@ mod tests {
         ] {
             for gateway in [
                 Some(DvGatewayMode::Terminal),
-                Some(DvGatewayMode::Unqualified(1)),
+                Some(DvGatewayMode::Unnamed(1)),
                 None,
             ] {
                 let guidance = cat_startup_guidance(connection, gateway);

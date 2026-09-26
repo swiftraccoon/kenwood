@@ -113,7 +113,7 @@ fn fresh(trial: &mut TerminalExitTrial, session: u64) -> TestResult {
 }
 
 fn intent_and_readback(trial: &mut TerminalExitTrial) -> TestResult {
-    trial.record(TerminalExitTrialEvent::DurableWriteIntent { id: id(1)? })?;
+    trial.record(TerminalExitTrialEvent::IntentJournaled { id: id(1)? })?;
     let off = *trial.off_page();
     trial.record(TerminalExitTrialEvent::ImmediateReadback { whole_page: &off })?;
     Ok(())
@@ -541,7 +541,7 @@ fn failed_attempts_finish_with_explicit_conservative_status() -> TestResult {
         if changed {
             fresh(&mut trial, 1)?;
             journal.intent(&trial)?;
-            trial.record(TerminalExitTrialEvent::DurableWriteIntent { id: id(1)? })?;
+            trial.record(TerminalExitTrialEvent::IntentJournaled { id: id(1)? })?;
         }
         trial.halt();
         journal.evidence(&serde_json::json!({ "complete": false }))?;

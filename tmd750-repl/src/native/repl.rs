@@ -279,7 +279,7 @@ async fn session_with_output(
 ) -> SessionEvidence {
     let mut evidence = SessionEvidence::new(transport.transcript_summary());
     let ready = transport.synchronize();
-    let mut radio = cat::wrap(transport);
+    let mut radio = Radio::new_bluetooth(transport);
     match ready {
         Ok(()) => {
             if let Err(error) =

@@ -32,18 +32,6 @@ ignore = [
   #
   # Recheck when egui/ab_glyph migrate to skrifa.
   { id = "RUSTSEC-2026-0192", reason = "ttf-parser is an unmaintained font parser pulled transitively by egui/eframe for the sextant GUI; no known vulnerability, no safe upgrade; the fix requires egui migrating to skrifa upstream" },
-
-  # RUSTSEC-2026-0194 / RUSTSEC-2026-0195: quick-xml < 0.41 DoS.
-  #
-  # The only quick-xml copy in the tree (0.39.x) is pinned by
-  # wayland-scanner, a Linux-only BUILD-TIME proc-macro (winit →
-  # smithay → eframe → sextant) that parses only the local, trusted
-  # Wayland protocol XML shipped in the crate; no attacker-controlled
-  # XML can reach it and no runtime code ships. Recheck when
-  # winit/smithay bump
-  # wayland-scanner onto quick-xml 0.41.
-  { id = "RUSTSEC-2026-0194", reason = "vulnerable quick-xml copy is only reachable from wayland-scanner, a Linux build-time proc-macro parsing trusted local protocol XML; no runtime exposure" },
-  { id = "RUSTSEC-2026-0195", reason = "vulnerable quick-xml copy is only reachable from wayland-scanner, a Linux build-time proc-macro parsing trusted local protocol XML; no runtime exposure" },
 ]
 
 [licenses]
@@ -96,6 +84,8 @@ multiple-versions = "deny"
 # narrows the ban to non-path wildcards (e.g. `serde = "*"`).
 wildcards = "deny"
 allow-wildcard-paths = true
+# Each entry names a whole release line (`crate@0.5`, `crate@1`), so a patch
+# release that a fresh lockfile picks up stays covered.
 skip = [
   # ─────────────────────────────────────────────────────────────────────
   # thd75 serial stack (serialport → mio-serial → tokio-serial)
@@ -133,15 +123,6 @@ skip = [
   { crate = "syn@2" },
 
   # ─────────────────────────────────────────────────────────────────────
-  # thd75-tui layout engine (ratatui → kasuari)
-  # ─────────────────────────────────────────────────────────────────────
-
-  # kasuari 0.4 (ratatui's Cassowary constraint solver) uses hashbrown
-  # 0.16, separate from the workspace default 0.17. Dropable when
-  # ratatui/kasuari updates.
-  { crate = "hashbrown@0.16" },
-
-  # ─────────────────────────────────────────────────────────────────────
   # sextant image stack (eframe → image → png → flate2)
   # ─────────────────────────────────────────────────────────────────────
 
@@ -152,21 +133,15 @@ skip = [
   { crate = "miniz_oxide@0.8" },
 
   # ─────────────────────────────────────────────────────────────────────
-  # Windows platform shim family 0.52 (serialport + ring on Windows)
+  # Windows platform crates 0.52 (serialport + ring on Windows)
   # ─────────────────────────────────────────────────────────────────────
   #
   # serialport 4.x uses windows-sys 0.52 for Windows serial APIs.
   # ring (rustls crypto) also pulls windows-sys 0.52 on Windows.
-  # Newer crates use windows-sys 0.60+ which use the unified
-  # `windows-link` crate instead of per-target shims. Only the shims
-  # reachable for the evaluated Windows target (x86_64-pc-windows-msvc;
-  # see [graph].targets above) appear as duplicates. Dropable when
-  # serialport/ring upgrade.
+  # Newer crates use windows-sys 0.61, built on the unified
+  # `windows-link` crate. Dropable when serialport/ring upgrade.
 
   { crate = "windows-sys@0.52" },
-  { crate = "windows-targets@0.52" },
-  { crate = "windows_x86_64_gnu@0.52" },
-  { crate = "windows_x86_64_msvc@0.52" },
 
   # ─────────────────────────────────────────────────────────────────────
   # sextant egui + cpal + winit transitive graph
@@ -183,26 +158,27 @@ skip = [
   # winit 0.30 uses calloop 0.13 on wayland/X11; smithay-client-
   # toolkit 0.19 (wayland toolkit) uses calloop 0.14 through a
   # different path. Drop when winit bumps.
-  { crate = "calloop@0.13.0" },
-  { crate = "calloop-wayland-source@0.3.0" },
-  { crate = "smithay-client-toolkit@0.19.2" },
+  { crate = "calloop@0.13" },
+  { crate = "calloop-wayland-source@0.3" },
+  { crate = "smithay-client-toolkit@0.19" },
 
   # cpal on macOS uses core-foundation 0.9; winit 0.30 uses 0.10.
   # Drop when cpal updates to objc2-based path.
-  { crate = "core-foundation@0.9.4" },
+  { crate = "core-foundation@0.9" },
 
-  # cpal on macOS uses objc2 0.5; winit 0.30 uses 0.6. Drop when
-  # cpal bumps its objc2 pin.
-  { crate = "objc2@0.5.2" },
-  { crate = "objc2-app-kit@0.2.2" },
-  { crate = "objc2-foundation@0.2.2" },
+  # winit 0.30 and eframe 0.29 use objc2 0.5 with its 0.2 app-kit and
+  # foundation bindings; arboard, glutin and webbrowser use objc2 0.6.
+  # Drop when winit and eframe move to 0.6.
+  { crate = "objc2@0.5" },
+  { crate = "objc2-app-kit@0.2" },
+  { crate = "objc2-foundation@0.2" },
 
   # rand_core 0.6 chain uses getrandom 0.2; newer deps use 0.3.
-  { crate = "getrandom@0.2.17" },
+  { crate = "getrandom@0.2" },
 
   # UniFFI 0.31 (lodestar-core Rust↔Swift FFI) pulls getrandom 0.4;
   # older workspace crates still use 0.3. Drop when those upgrade.
-  { crate = "getrandom@0.3.4" },
+  { crate = "getrandom@0.3" },
 
   # toml 0.8 chain (stargazer direct + the toml_edit / toml_datetime
   # / winnow that 0.8 pulls); UniFFI 0.31's uniffi_bindgen / trybuild
@@ -210,19 +186,19 @@ skip = [
   # toml_datetime 0.7, winnow 1.0. Drop whichever entries resolve
   # when stargazer bumps toml or uniffi converges on one toml
   # major.
-  { crate = "serde_spanned@0.6.9" },
-  { crate = "toml@0.8.23" },
-  { crate = "toml_datetime@0.6.11" },
-  { crate = "winnow@0.7.15" },
+  { crate = "serde_spanned@0.6" },
+  { crate = "toml@0.8" },
+  { crate = "toml_datetime@0.6" },
+  { crate = "winnow@0.7" },
 
   # scraper 0.22 uses itertools 0.13; multiple newer deps (including
   # egui_extras) use 0.14. Drop when scraper updates.
-  { crate = "itertools@0.13.0" },
+  { crate = "itertools@0.13" },
 
   # rustix 0.38 chain from tokio-uring / mio-serial; rustix 1.x is
   # pulled by winit. Drop when mio-serial updates.
-  { crate = "rustix@0.38.44" },
-  { crate = "linux-raw-sys@0.4.15" },
+  { crate = "rustix@0.38" },
+  { crate = "linux-raw-sys@0.4" },
 
   # shlex two-major duplicate, both BUILD-TIME only: bindgen pulls
   # shlex 1.x, cc pulls shlex 2.x. No runtime code. Skip the older
@@ -230,13 +206,12 @@ skip = [
   # whole major so patch bumps in a fresh lockfile stay covered.
   { crate = "shlex@1" },
 
-  # windows-sys family 0.59 / 0.60 coexist with 0.61 from newer deps.
-  # 0.59 from accesskit/winit, 0.60 from other winit-adjacent crates.
-  { crate = "windows-sys@0.59.0" },
-  { crate = "windows-sys@0.60.2" },
+  # windows-sys 0.59 from accesskit/winit coexists with 0.61 from newer
+  # deps.
+  { crate = "windows-sys@0.59" },
   # windows-core 0.54 from older winit path; 0.62 from newer.
-  { crate = "windows-core@0.54.0" },
-  { crate = "windows-result@0.1.2" },
+  { crate = "windows-core@0.54" },
+  { crate = "windows-result@0.1" },
 
   # ─────────────────────────────────────────────────────────────────────
   # reqwest HTTP stack (reqwest → hyper-util)

@@ -1,10 +1,10 @@
 //! Endpoint-role checks over enumeration metadata, before any connection.
 
 use kenwood_tmd750::memory::TerminalGatewayRoute;
+use kenwood_tmd750::transport::reenumeration::is_unambiguous;
 use kenwood_tmd750::transport::{SerialCandidate, TMD750_MAIN_PID, TMD750_PANEL_PID};
 
 use crate::CommandError;
-use crate::mcp::reconnect::endpoint_is_unambiguous;
 
 /// The two USB endpoints a managed probe uses.
 ///
@@ -45,7 +45,7 @@ impl Endpoints {
             || selected.pid != Some(route_pid)
             || [&selected, &control]
                 .iter()
-                .any(|endpoint| !endpoint_is_unambiguous(endpoint, candidates))
+                .any(|endpoint| !is_unambiguous(endpoint, candidates))
         {
             return Err(CommandError(
                 "managed diagnostics require two distinct, unambiguous USB connectors with the modem matching the captured gateway route; no alias or substitute is accepted".to_owned(),

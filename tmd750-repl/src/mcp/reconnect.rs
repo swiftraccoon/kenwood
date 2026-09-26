@@ -7,15 +7,20 @@
 
 mod readiness;
 
-pub(crate) use readiness::{
-    MAXIMUM_OPEN_ATTEMPTS, ReadinessVerification, verify_readiness, verify_readiness_gateway_off,
-};
+pub(crate) use readiness::{ReadinessVerification, verify_readiness, verify_readiness_gateway_off};
 
 use std::fs::File;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use kenwood_tmd750::radio::readiness::{
+    ENUMERATION_INTERVAL, EXCHANGE_TIMEOUT, SETTLE, SETTLE_BUDGET, SETTLE_POLL_INTERVAL,
+    SETTLE_QUIET,
+};
+use kenwood_tmd750::transport::reenumeration::{
+    Reenumeration, ReenumerationRejection, macos_service_name, select_pinned,
+};
 use kenwood_tmd750::transport::{SerialCandidate, SerialTransport, discover_serial, open_serial};
 use kenwood_tmd750::{DvGatewayMode, Identity, Radio};
 use kenwood_transport::{Transport, TransportError};
@@ -23,31 +28,14 @@ use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
 
 use super::link::NativeVerification;
-use super::reconnect_policy::{ReconnectDecision, ReconnectRejection, classify};
 use super::{CLOSE_TIMEOUT, Failure, IdentityEvidence, close_transport};
 use crate::capture::{CaptureTransport, Recorder, TranscriptSummary};
 
-/// Silent wait after the MCP exit ACK, before polling for the endpoint.
-const SETTLE: Duration = Duration::from_secs(2);
 /// Passive budget for the selected USB endpoint to re-enumerate (60 s).
 ///
 /// Host policy, not a firmware timing guarantee: the endpoint has been observed
 /// returning later than 10 s after the MCP exit ACK.
 const ENUMERATION_BUDGET: Duration = Duration::from_secs(60);
-/// Interval between enumeration snapshots inside `ENUMERATION_BUDGET`.
-const POLL_INTERVAL: Duration = Duration::from_millis(250);
-/// Continuous presence an endpoint must show before a further programming
-/// session opens on it (10 s).
-///
-/// Host policy sized from observation: on firmware 1.02 the operation-panel
-/// endpoint has re-enumerated once more within a few seconds of first
-/// answering `ID` after an MCP exit, and a handle opened before that drop
-/// failed with `ENXIO`.
-pub(super) const SETTLE_QUIET: Duration = Duration::from_secs(10);
-/// Interval between the enumeration snapshots of a settle wait (1 s).
-const SETTLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
-/// Passive budget for a settle wait, measured from its start (60 s).
-const SETTLE_BUDGET: Duration = Duration::from_secs(60);
 
 /// Why an endpoint did not settle within the budget.
 #[derive(Debug)]
@@ -58,7 +46,7 @@ pub(super) enum SettleFailure {
     /// `SETTLE_BUDGET`.
     BudgetExhausted,
     /// Fresh metadata no longer uniquely selects the endpoint.
-    EndpointRejected(ReconnectRejection),
+    EndpointRejected(ReenumerationRejection),
     /// Port enumeration failed.
     Enumeration(TransportError),
     /// The transcript could not record the wait.
@@ -85,16 +73,6 @@ impl std::fmt::Display for SettleFailure {
 }
 
 impl std::error::Error for SettleFailure {}
-
-/// True when `candidates` selects exactly `endpoint` without ambiguity.
-///
-/// A macOS dial-in/callout alias pair counts as one service.
-pub(crate) fn endpoint_is_unambiguous(
-    endpoint: &SerialCandidate,
-    candidates: &[SerialCandidate],
-) -> bool {
-    matches!(classify(endpoint, candidates), ReconnectDecision::Ready(selected) if selected == *endpoint)
-}
 
 /// Host operations a verification needs: open, enumerate, clock and wait.
 ///
@@ -317,7 +295,7 @@ impl Serialize for GatewayEvidence {
         let name = match self.0 {
             DvGatewayMode::Off => "off",
             DvGatewayMode::Terminal => "terminal",
-            DvGatewayMode::Unqualified(_) => "unqualified",
+            DvGatewayMode::Unnamed(_) => "unqualified",
         };
         let mut state = serializer.serialize_struct("GatewayEvidence", 2)?;
         state.serialize_field("state", name)?;
@@ -499,8 +477,8 @@ fn milliseconds(duration: Duration) -> u64 {
 
 fn same_service(first: &SerialCandidate, second: &SerialCandidate) -> bool {
     first.path == second.path
-        || crate::macos_serial_service(&first.path)
-            .zip(crate::macos_serial_service(&second.path))
+        || macos_service_name(&first.path)
+            .zip(macos_service_name(&second.path))
             .is_some_and(|(first, second)| first == second)
 }
 
@@ -737,13 +715,13 @@ async fn await_endpoint(
         if cancelled.load(Ordering::Relaxed) || backend.now().saturating_sub(started) >= budget {
             continue;
         }
-        match classify(original, &candidates) {
-            ReconnectDecision::Ready(selected) => return Some(selected),
-            ReconnectDecision::AwaitingEndpoint => {
+        match select_pinned(original, &candidates) {
+            Reenumeration::Ready(selected) => return Some(selected),
+            Reenumeration::Absent => {
                 let remaining = budget.saturating_sub(backend.now().saturating_sub(started));
-                wait_recorded(backend, recorder, POLL_INTERVAL.min(remaining)).await;
+                wait_recorded(backend, recorder, ENUMERATION_INTERVAL.min(remaining)).await;
             }
-            ReconnectDecision::Rejected(error) => {
+            Reenumeration::Rejected(error) => {
                 recorder.record(LifecycleEvent::EndpointRejected {
                     error: Failure::from_error(&error),
                 });
@@ -818,8 +796,8 @@ pub(super) async fn await_settled_endpoint(
             candidates: &observed,
         });
         recorder.ensure_complete().map_err(SettleFailure::Capture)?;
-        match classify(endpoint, &candidates) {
-            ReconnectDecision::Ready(_) => {
+        match select_pinned(endpoint, &candidates) {
+            Reenumeration::Ready(_) => {
                 let since = *present_since.get_or_insert(now);
                 if now.saturating_sub(since) >= SETTLE_QUIET {
                     recorder.record(LifecycleEvent::EndpointSettled {
@@ -829,8 +807,8 @@ pub(super) async fn await_settled_endpoint(
                     return Ok(());
                 }
             }
-            ReconnectDecision::AwaitingEndpoint => present_since = None,
-            ReconnectDecision::Rejected(error) => {
+            Reenumeration::Absent => present_since = None,
+            Reenumeration::Rejected(error) => {
                 recorder.record(LifecycleEvent::EndpointRejected {
                     error: Failure::from_error(&error),
                 });
@@ -977,7 +955,7 @@ async fn observe_identity(
             readiness::budget_exhausted(report);
             return IdentityObservation::Failed;
         }
-        radio.set_timeout(readiness::EXCHANGE_TIMEOUT);
+        radio.set_timeout(EXCHANGE_TIMEOUT);
     }
     if context.cancelled.load(Ordering::Relaxed) {
         report.outcome = VerificationOutcome::Cancelled;

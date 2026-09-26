@@ -78,7 +78,6 @@ const fn stage_label(stage: ControlStage) -> &'static str {
         ControlStage::ReadinessBeforeRestore => "control-readiness-before",
         ControlStage::Restore => "control-restore",
         ControlStage::ReadinessAfterRestore => "control-readiness-after",
-        ControlStage::Verification => "control-verification",
         _ => "control",
     }
 }

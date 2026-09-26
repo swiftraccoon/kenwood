@@ -57,7 +57,7 @@ impl From<TerminalExitTrialSessionStage> for Stage {
                 length: page.len(),
             },
             TerminalExitTrialSessionStage::FreshComparison => Self::FreshComparison,
-            TerminalExitTrialSessionStage::DurableIntent => Self::DurableIntent,
+            TerminalExitTrialSessionStage::IntentJournal => Self::DurableIntent,
             TerminalExitTrialSessionStage::Write => Self::Write,
             TerminalExitTrialSessionStage::ImmediateReadback => Self::ImmediateReadback,
             TerminalExitTrialSessionStage::Exit => Self::Exit,
@@ -94,7 +94,7 @@ impl From<DvGatewayMode> for GatewayEvidence {
         match mode {
             DvGatewayMode::Off => Self::Off { raw: 0 },
             DvGatewayMode::Terminal => Self::Terminal { raw: 2 },
-            DvGatewayMode::Unqualified(raw) => Self::Unqualified { raw },
+            DvGatewayMode::Unnamed(raw) => Self::Unqualified { raw },
         }
     }
 }

@@ -365,7 +365,7 @@ impl<B: native::Backend> WriteLink for NativeLink<'_, B> {
         &self,
         transport: CaptureTransport<Self::Connection, File>,
     ) -> Radio<CaptureTransport<Self::Connection, File>> {
-        native_cat::wrap(transport)
+        Radio::new_bluetooth(transport)
     }
 
     /// Require Gateway Off before programming entry, as native probes and

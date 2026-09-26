@@ -63,7 +63,7 @@ impl From<PmNameTrialSessionStage> for Stage {
                 length: page.len(),
             },
             PmNameTrialSessionStage::FreshComparison => Self::FreshComparison,
-            PmNameTrialSessionStage::DurableIntent => Self::DurableIntent,
+            PmNameTrialSessionStage::IntentJournal => Self::DurableIntent,
             PmNameTrialSessionStage::Write => Self::Write,
             PmNameTrialSessionStage::ImmediateReadback => Self::ImmediateReadback,
             PmNameTrialSessionStage::Exit => Self::Exit,
@@ -116,7 +116,7 @@ impl From<DvGatewayMode> for GatewayEvidence {
         match mode {
             DvGatewayMode::Off => Self::Off { raw: 0 },
             DvGatewayMode::Terminal => Self::Terminal { raw: 2 },
-            DvGatewayMode::Unqualified(raw) => Self::Unqualified { raw },
+            DvGatewayMode::Unnamed(raw) => Self::Unqualified { raw },
         }
     }
 }

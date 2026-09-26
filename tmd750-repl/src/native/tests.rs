@@ -22,6 +22,21 @@ type Worker = Box<
 const TEST_BOUND: Duration = Duration::from_secs(2);
 
 #[test]
+fn mode_labels_keep_the_report_vocabulary() {
+    use kenwood_tmd750::OperatingMode;
+    for (mode, label) in [
+        (OperatingMode::Fm, "FM"),
+        (OperatingMode::Dv, "DV"),
+        (OperatingMode::Am, "AM"),
+        (OperatingMode::Nfm, "NFM"),
+        (OperatingMode::Dr, "DR"),
+        (OperatingMode::Unnamed(7), "unqualified value 7"),
+    ] {
+        assert_eq!(cat::mode_label(mode), label, "{mode:?}");
+    }
+}
+
+#[test]
 fn host_retirement_requires_positive_native_evidence() -> TestResult {
     for cleanup in [
         BluetoothCloseFailure::ChannelUnconfirmed,

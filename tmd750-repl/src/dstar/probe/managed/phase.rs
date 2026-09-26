@@ -6,12 +6,13 @@ use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use kenwood_tmd750::radio::terminal::{TerminalPlan, TerminalTarget};
+use kenwood_tmd750::transport::reenumeration::is_unambiguous;
 use kenwood_tmd750::transport::{DEFAULT_BAUD, SerialCandidate};
 use kenwood_tmd750::{DvGatewayMode, Radio};
 use kenwood_transport::Transport;
 
 use crate::capture::{CaptureTransport, Event, Recorder};
-use crate::mcp::reconnect::{Backend, endpoint_is_unambiguous, verify_readiness};
+use crate::mcp::reconnect::{Backend, verify_readiness};
 use crate::{AppResult, CommandError};
 
 use super::super::{Borrowed, Limits, select_endpoint};
@@ -220,7 +221,7 @@ fn prepare_open<B: Backend>(
     check_cancellation(context.cancelled)?;
     let candidates = backend.enumerate()?;
     let selected = select_endpoint(&context.endpoint.path, candidates.clone())?;
-    if selected != *context.endpoint || !endpoint_is_unambiguous(&selected, &candidates) {
+    if selected != *context.endpoint || !is_unambiguous(&selected, &candidates) {
         return Err(CommandError(
             "control endpoint metadata changed or became ambiguous".to_owned(),
         )

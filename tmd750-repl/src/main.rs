@@ -21,6 +21,7 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::Parser;
+use kenwood_tmd750::transport::reenumeration::deduplicate_aliases;
 use kenwood_tmd750::transport::{DEFAULT_BAUD, SerialCandidate, discover_serial, open_serial};
 use kenwood_tmd750::{Band, DvGatewayMode, Identity, OperatingMode, Radio, SelectableMode};
 use kenwood_transport::Transport;
@@ -429,7 +430,7 @@ fn select_connection(
         return Ok(ConnectionSelection::Bluetooth);
     }
     let candidates =
-        deduplicate_serial_aliases(discover()?.into_iter().filter(SerialCandidate::is_tmd750));
+        deduplicate_aliases(discover()?.into_iter().filter(SerialCandidate::is_tmd750));
     if candidates.is_empty() {
         if cli.baud != DEFAULT_BAUD {
             return Err(CommandError(
@@ -460,47 +461,8 @@ fn select_probe_endpoint(
                 ))
             });
     }
-    let unique = deduplicate_serial_aliases(known);
+    let unique = deduplicate_aliases(known);
     unique_candidate(&unique).cloned()
-}
-
-fn deduplicate_serial_aliases(
-    candidates: impl IntoIterator<Item = SerialCandidate>,
-) -> Vec<SerialCandidate> {
-    let mut unique: Vec<SerialCandidate> = Vec::new();
-    for candidate in candidates {
-        if let Some(existing) = unique
-            .iter_mut()
-            .find(|existing| are_serial_aliases(existing, &candidate))
-        {
-            if is_macos_callout(&candidate.path) && !is_macos_callout(&existing.path) {
-                *existing = candidate;
-            }
-        } else {
-            unique.push(candidate);
-        }
-    }
-    unique
-}
-
-fn are_serial_aliases(first: &SerialCandidate, second: &SerialCandidate) -> bool {
-    if first.path == second.path {
-        return true;
-    }
-    first.vid == second.vid
-        && first.pid == second.pid
-        && macos_serial_service(&first.path)
-            .zip(macos_serial_service(&second.path))
-            .is_some_and(|(first_service, second_service)| first_service == second_service)
-}
-
-fn macos_serial_service(path: &str) -> Option<&str> {
-    path.strip_prefix("/dev/cu.")
-        .or_else(|| path.strip_prefix("/dev/tty."))
-}
-
-fn is_macos_callout(path: &str) -> bool {
-    path.starts_with("/dev/cu.")
 }
 
 fn unique_candidate(candidates: &[SerialCandidate]) -> Result<&SerialCandidate, CommandError> {
@@ -937,44 +899,6 @@ mod tests {
             matches!(parse_command("mcp probe"), Err(CommandError(message)) if message.contains("dedicated connection")),
             "interactive MCP probes require an explicit startup-only diagnostic"
         );
-    }
-
-    #[test]
-    fn macos_callout_and_dialin_paths_are_one_endpoint() {
-        let aliases = [
-            SerialCandidate {
-                path: "/dev/tty.usbmodem101".to_owned(),
-                vid: Some(0x2166),
-                pid: Some(0x9030),
-            },
-            SerialCandidate {
-                path: "/dev/cu.usbmodem101".to_owned(),
-                vid: Some(0x2166),
-                pid: Some(0x9030),
-            },
-        ];
-        let deduplicated = deduplicate_serial_aliases(aliases);
-        assert_eq!(deduplicated.len(), 1);
-        assert_eq!(
-            deduplicated
-                .first()
-                .map(|candidate| candidate.path.as_str()),
-            Some("/dev/cu.usbmodem101")
-        );
-
-        let distinct = deduplicate_serial_aliases([
-            SerialCandidate {
-                path: "/dev/cu.usbmodem101".to_owned(),
-                vid: Some(0x2166),
-                pid: Some(0x9030),
-            },
-            SerialCandidate {
-                path: "/dev/cu.usbmodem201".to_owned(),
-                vid: Some(0x2166),
-                pid: Some(0x9030),
-            },
-        ]);
-        assert_eq!(distinct.len(), 2);
     }
 
     #[test]

@@ -107,7 +107,7 @@ fn finalize(update: &mut My1CallsignUpdate, session: u64) -> TestResult {
 }
 
 fn apply(update: &mut My1CallsignUpdate) -> TestResult {
-    update.record(TextFieldUpdateEvent::DurableWriteIntent { id: id(1)? })?;
+    update.record(TextFieldUpdateEvent::IntentJournaled { id: id(1)? })?;
     let desired = *update.desired_page();
     update.record(TextFieldUpdateEvent::ImmediateReadback {
         whole_page: &desired,
@@ -670,7 +670,7 @@ fn failed_my1_session_retains_possible_change_and_never_promises_rollback() -> T
     fixture.prepare(&update)?;
     fresh(&mut update, 1)?;
     fixture.journal.intent(&update)?;
-    update.record(TextFieldUpdateEvent::DurableWriteIntent { id: id(1)? })?;
+    update.record(TextFieldUpdateEvent::IntentJournaled { id: id(1)? })?;
     update.halt();
     fixture
         .journal

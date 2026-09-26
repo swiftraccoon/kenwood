@@ -85,7 +85,7 @@ mod unix {
     }
 
     fn write_and_finalize(update: &mut Pm1NameUpdate) -> TestResult {
-        update.record(TextFieldUpdateEvent::DurableWriteIntent { id: id(1)? })?;
+        update.record(TextFieldUpdateEvent::IntentJournaled { id: id(1)? })?;
         let bytes = *update.desired_page();
         update.record(TextFieldUpdateEvent::ImmediateReadback { whole_page: &bytes })?;
         update.record(TextFieldUpdateEvent::SessionFinalized {
@@ -311,7 +311,7 @@ mod unix {
         fixture.prepare(&update)?;
         fresh(&mut update, 1)?;
         fixture.journal.intent(&update)?;
-        update.record(TextFieldUpdateEvent::DurableWriteIntent { id: id(1)? })?;
+        update.record(TextFieldUpdateEvent::IntentJournaled { id: id(1)? })?;
         update.halt();
         fixture
             .journal

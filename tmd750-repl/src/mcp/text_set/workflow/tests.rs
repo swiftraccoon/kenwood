@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use kenwood_tmd750::memory::{Pm1Name, Pm1NameUpdate, TextFieldUpdateStatus};
 use kenwood_tmd750::protocol::mcp::{ACK, read_request, write_request};
+use kenwood_tmd750::radio::readiness::SETTLE_QUIET;
 use kenwood_tmd750::transport::{KENWOOD_VID, SerialCandidate, TMD750_MAIN_PID, TMD750_PANEL_PID};
 use kenwood_tmd750::{Address, FirmwareIdentity, Identity, Page, RadioModel, RadioType};
 use kenwood_transport::bluetooth::{BluetoothService, RfcommChannel};
@@ -18,7 +19,7 @@ use kenwood_transport::{MockTransport, Transport, TransportError};
 use super::*;
 use crate::capture::{Artifacts, CaptureKind, create_private_file};
 use crate::mcp::link::{NativeLink, UsbLink};
-use crate::mcp::reconnect::{Backend, SETTLE_QUIET, VerificationOutcome, VerificationStage};
+use crate::mcp::reconnect::{Backend, VerificationOutcome, VerificationStage};
 use crate::native;
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;

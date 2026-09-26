@@ -18,12 +18,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use kenwood_tmd750::radio::readiness::{ReadinessEnding, ReadinessReport};
+use kenwood_tmd750::radio::readiness::{
+    ReadinessEnding, ReadinessReport, SettleOutcome, SettleReport,
+};
 use kenwood_tmd750::radio::terminal::lifecycle::{RestorationReport, RestorationState};
 use kenwood_tmd750::transport::DEFAULT_BAUD;
 use kenwood_tmd750::{
-    Identity, ObservationReport, ProvenModem, TerminalGatewayRoute, TerminalLifecycle,
-    TerminalRecovery,
+    DvGatewayMode, Identity, ObservationReport, ProvenModem, TerminalGatewayRoute,
+    TerminalLifecycle, TerminalRecovery,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -55,6 +57,7 @@ pub(super) struct Recovery {
     transition: TransitionSummary,
     modem_openings: Value,
     readiness: Vec<ReadinessSummary>,
+    settle: Vec<SettleSummary>,
     owner_released: Option<bool>,
     errors: Vec<Failure>,
 }
@@ -88,8 +91,18 @@ impl ObservationSummary {
         Self {
             succeeded: report.succeeded(),
             identity: observed.map(|(identity, _)| IdentitySummary::from(identity)),
-            gateway: observed.map(|(_, gateway)| gateway.to_string()),
+            gateway: observed.map(|(_, gateway)| gateway_label(gateway)),
         }
+    }
+}
+
+/// A Gateway state as this report records it: `Off`, `Terminal`, or
+/// `unqualified value N` for a value the library leaves unnamed.
+fn gateway_label(mode: DvGatewayMode) -> String {
+    match mode {
+        DvGatewayMode::Off => "Off".to_owned(),
+        DvGatewayMode::Terminal => "Terminal".to_owned(),
+        DvGatewayMode::Unnamed(value) => format!("unqualified value {value}"),
     }
 }
 
@@ -117,18 +130,57 @@ struct TransitionSummary {
     version_proved: bool,
 }
 
-/// One readiness verification result during restoration.
+/// One readiness verification during restoration: `before_restore` or
+/// `after_restore`, and after the reverse write the Gateway state read on
+/// the connection whose identity matched.
 #[derive(Debug, Serialize)]
 struct ReadinessSummary {
+    stage: &'static str,
     succeeded: bool,
     ending: &'static str,
+    gateway: Option<String>,
 }
 
 impl ReadinessSummary {
-    fn from_report(report: &ReadinessReport) -> Self {
+    fn from_report(stage: &'static str, report: &ReadinessReport) -> Self {
         Self {
+            stage,
             succeeded: report.succeeded(),
             ending: readiness_ending(report.ending),
+            gateway: report
+                .attempts
+                .last()
+                .and_then(|attempt| attempt.connection.as_ref())
+                .and_then(|connection| connection.gateway)
+                .map(gateway_label),
+        }
+    }
+}
+
+/// One wait for the control endpoint to stay enumerated before programming
+/// entry over it: `active_entry` or `before_restore`.
+#[derive(Debug, Serialize)]
+struct SettleSummary {
+    stage: &'static str,
+    settled: bool,
+    outcome: String,
+    enumerations: usize,
+    elapsed_milliseconds: u64,
+}
+
+impl SettleSummary {
+    fn from_report(stage: &'static str, report: &SettleReport) -> Self {
+        Self {
+            stage,
+            settled: report.settled(),
+            outcome: match &report.outcome {
+                SettleOutcome::Settled => "settled".to_owned(),
+                SettleOutcome::NotRequired => "not_required".to_owned(),
+                SettleOutcome::Cancelled => "cancelled".to_owned(),
+                SettleOutcome::Failed(error) => error.to_string(),
+            },
+            enumerations: report.enumerations.len(),
+            elapsed_milliseconds: u64::try_from(report.elapsed.as_millis()).unwrap_or(u64::MAX),
         }
     }
 }
@@ -167,6 +219,7 @@ struct ReportView<'a> {
     entry: &'a Option<EntrySummary>,
     transition: &'a TransitionSummary,
     readiness: &'a [ReadinessSummary],
+    settle: &'a [SettleSummary],
     control_opens: &'a [ControlOpen],
     modem_openings: &'a Value,
     errors: &'a [Failure],
@@ -175,7 +228,7 @@ struct ReportView<'a> {
 impl Recovery {
     fn view(&self) -> ReportView<'_> {
         ReportView {
-            format_version: 2,
+            format_version: 3,
             operation: "dstar_start",
             identity_assurance: "exact_endpoint_and_cat_tuple_only",
             bluetooth_address: &self.bluetooth_address,
@@ -187,6 +240,7 @@ impl Recovery {
             entry: &self.entry,
             transition: &self.transition,
             readiness: &self.readiness,
+            settle: &self.settle,
             control_opens: self.control.records(),
             modem_openings: &self.modem_openings,
             errors: &self.errors,
@@ -256,15 +310,18 @@ impl Recovery {
 
     fn absorb_restoration(&mut self, released: bool, report: &RestorationReport) {
         self.owner_released = Some(released && self.control.released());
-        for readiness in [&report.readiness_before, &report.readiness_after]
-            .into_iter()
-            .flatten()
-        {
-            self.readiness
-                .push(ReadinessSummary::from_report(readiness));
+        for (stage, readiness) in [
+            ("before_restore", &report.readiness_before),
+            ("after_restore", &report.readiness_after),
+        ] {
+            if let Some(readiness) = readiness {
+                self.readiness
+                    .push(ReadinessSummary::from_report(stage, readiness));
+            }
         }
-        if let Some(verification) = &report.verification {
-            self.preflight = Some(ObservationSummary::from_report(verification));
+        if let Some(settle) = &report.settle {
+            self.settle
+                .push(SettleSummary::from_report("before_restore", settle));
         }
         // The library owns the state; mirror any residual failure into errors.
         if let Some(error) = &report.error {
@@ -360,6 +417,11 @@ async fn prepare_in(
         },
         modem_openings,
         readiness: Vec::new(),
+        settle: startup
+            .settle
+            .iter()
+            .map(|settle| SettleSummary::from_report("active_entry", settle))
+            .collect(),
         owner_released: None,
         errors: startup
             .error

@@ -1140,7 +1140,7 @@ mod tests {
     #[tokio::test]
     async fn unnamed_and_unreadable_gateway_never_infer_mode_or_route() -> Result<(), String> {
         for (reply, expected) in [
-            (&b"GW 1\r"[..], "DV Gateway state: unqualified value 1"),
+            (&b"GW 1\r"[..], "DV Gateway state: unnamed value 1"),
             (&b"N\r"[..], "DV Gateway state: unreadable ("),
             (&b"GW invalid\r"[..], "DV Gateway state: unreadable ("),
         ] {

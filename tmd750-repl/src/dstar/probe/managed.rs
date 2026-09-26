@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use kenwood_tmd750::radio::terminal::{TerminalPlan, TerminalTarget};
+use kenwood_tmd750::transport::reenumeration::is_unambiguous;
 use kenwood_tmd750::transport::{DEFAULT_BAUD, SerialCandidate};
 use kenwood_transport::TransportError;
 use serde::Serialize;
@@ -19,7 +20,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use crate::capture::{Artifacts, CaptureKind, Failure, Recorder, create_private_file};
-use crate::mcp::reconnect::{Backend, SystemBackend, endpoint_is_unambiguous};
+use crate::mcp::reconnect::{Backend, SystemBackend};
 use crate::mcp::snapshot::Snapshot;
 use crate::{AppResult, CommandError, output};
 
@@ -130,7 +131,7 @@ impl<B: Backend> super::Backend for ProbeBackend<'_, B> {
                     source: io::Error::other(error),
                 }
             })?;
-        if selected != *endpoint || !endpoint_is_unambiguous(endpoint, &candidates) {
+        if selected != *endpoint || !is_unambiguous(endpoint, &candidates) {
             return Err(TransportError::Open {
                 path: endpoint.path.clone(),
                 source: io::Error::other("modem endpoint metadata changed or became ambiguous"),

@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use kenwood_tmd750::radio::{
-    BLUETOOTH_EXIT_REPLY_BOUND, BLUETOOTH_FIRST_REPLY_TIMEOUT,
+    BLUETOOTH_EXIT_REPLY_BOUND, BLUETOOTH_FIRST_REPLY_TIMEOUT, DEFAULT_TIMEOUT,
     bluetooth_first_reply_timeout_after_exit,
 };
 use kenwood_tmd750::{DvGatewayMode, Identity};
@@ -448,7 +448,7 @@ impl<'a> Report<'a> {
             open_retry_delay_milliseconds: opening::RETRY_DELAY.as_millis(),
             open_budget_milliseconds: super::OPEN_BUDGET.as_millis(),
             first_reply_timeout_milliseconds: BLUETOOTH_FIRST_REPLY_TIMEOUT.as_millis(),
-            cat_exchange_timeout_milliseconds: cat::EXCHANGE_TIMEOUT.as_millis(),
+            cat_exchange_timeout_milliseconds: DEFAULT_TIMEOUT.as_millis(),
             close_budget_milliseconds: super::CLOSE_BUDGET.as_millis(),
             identity_assurance: "exact_bluetooth_address_and_cat_tuple_not_physical_unit_continuity",
             started_at_utc,

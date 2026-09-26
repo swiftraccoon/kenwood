@@ -274,7 +274,7 @@ Programming temporarily interrupts normal radio operation.
 
 The USB command closes and drops the original handle after the exit ACK, waits two
 seconds, then uses [bounded CAT reacquisition](#bounded-cat-reacquisition).
-One sixty-second dispatch window covers passive enumeration, up to four fresh
+One sixty-second dispatch window covers passive enumeration, up to six fresh
 connections, and two-second retry waits. Every open requires the original path
 and unchanged recognized VID/PID. Only a completely silent initial `ID` reply
 timeout permits another connection; partial replies, identity mismatches, and
@@ -434,7 +434,8 @@ boolean `radio.Beep`, the two-byte `gps.Interval` and the four-byte signed
 `gps.MyPositionList[0].Altitude`, each written to a new value and back, with
 each run confirmed by a fresh backup compared through `mcp terminal compare`:
 the field's bytes only changed, then no byte. `radio.Beep` was also written
-in PM1 (`--slot 1`) while PM Off was active, changing only that slot's byte;
+off and back on in each of PM1 through PM5 (`--slot 1` to `--slot 5`) while
+PM Off was active, each write changing only that slot's byte;
 `--slot 0 "dv.MyCallsignDvGatewayList[0].MyCallsignDvGateway" ""` cleared a
 written MY1, after which a fresh backup matched the one taken before the
 write; and `pm.PmName2 ... --and radio.Beep ...` wrote and then restored both
@@ -1059,8 +1060,8 @@ close/capture, matching fresh CAT tuple, and fresh close/capture all succeed.
 On firmware 1.02 the complete CAT identity tuple becomes available roughly 10
 to 13 s after the MCP exit ACK. The main-unit USB endpoint re-enumerates at
 about that time; the panel USB endpoint can reappear within a few seconds and
-then leave `ID` unanswered until the tuple is ready, so several silent `ID`
-attempts can precede a matching one, which is why the cap is four. The endpoint
+then leave `ID` unanswered until the tuple is ready. It has answered on the
+third or fourth open after an exit, and the cap is six. The endpoint
 can also stay absent for the
 whole enumeration window, in which case the workflow fails without opening a
 fresh connection. The 295 bytes read by the fixed fragments are byte-identical
@@ -1274,10 +1275,18 @@ connection, or a restoration conflict leaves the outstanding restoration and the
 captured page images in the report, never a blind write.
 
 `dstar stop`, EOF, and cleanly retired startup failures restore the exact original
-Gateway mode, subtype, and route through fresh USB control, followed by fresh
-CAT verification. A session that changed nothing does not claim or undo the
+Gateway mode, subtype, and route through fresh USB control. Restoration waits
+for the control endpoint's CAT identity, then, on the operation-panel endpoint,
+for ten seconds of continuous enumeration before programming entry, because
+that endpoint can re-enumerate once more after first answering `ID`. After the
+reverse write it reads the identity and the restored Gateway on one fresh
+connection. A session that changed nothing does not claim or undo the
 operator's existing Terminal selection. If the modem cannot be safely released,
-restoration is withheld and reported.
+restoration is withheld and reported. The format-3 `report.json` records the
+startup `preflight` observation, each restoration `readiness` check with its
+`stage` and, after the reverse write, the `gateway` it read, and each `settle`
+wait before programming over the control endpoint (`active_entry` when a
+Terminal route was already active, `before_restore`).
 
 Tested configuration: `TM-D750 / 1.02 / K,2,1` in PM Off, Gateway initially
 routed to panel USB, Bluetooth modem link, independent control-panel USB CAT,
@@ -1467,7 +1476,7 @@ step [a|b] [kHz]
 up [a|b] | down [a|b]
 am-cut [3.0|4.5|6.0|7.5]
 current [a|b] | recall [a|b] ADDRESS | memory ADDRESS
-clear ADDRESS
+store [a|b] ADDRESS | clear ADDRESS
 bands [CTRL PTT]
 display [dual|single]
 slot [1-6]
@@ -1503,9 +1512,16 @@ endpoint, `callsign 1 KQ4NIT TEST`, `callsign 6 N0CALL SIX`, `slot 2` and
 restored every byte. `dv` selects the ordinary
 D-STAR RF operating mode; it does not turn on the separate persistent Terminal
 Mode. `tuning dr` selects the D-STAR repeater list. `up` and `down` step the
-control band by its tuning step and refuse the other band. `clear` empties a
-stored memory channel and requires the readback to answer `N`; storing a
-channel is a library call, not a prompt word. `tnc` and `vox` are read only:
+control band by its tuning step and refuse the other band. `store` writes the
+band's current channel record, the one `channel` reads, to a stored memory
+channel without scan lockout and requires the echo and readback to match it;
+the stored channel has no name, which `mcp text set --channel` writes. `clear`
+empties a stored memory channel and requires the readback to answer `N`. On
+firmware 1.02 over the operation-panel USB endpoint, `store` wrote twenty
+channels from both bands between 108 and 523 MHz, each verified by echo and
+readback and then cleared. `freq` outside a band's ranges is not refused: the
+radio tunes a nearby in-range frequency and the command reports the differing
+echo. `tnc` and `vox` are read only:
 the library exposes no TNC or VOX write. The `terminal` command explains the
 manual radio-menu sequence without writing it.
 

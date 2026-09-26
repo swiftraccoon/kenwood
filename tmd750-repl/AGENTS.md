@@ -36,13 +36,13 @@
   (`UsbLink` or `NativeLink`): open, reply deadlines, pre-entry check, hold
   after the exit, post-exit check. Never branch on the transport inside a
   workflow.
-- Every new native connection gets its `Radio` from `native::cat::wrap` (or,
-  in the shared fixed read, `Some(BLUETOOTH_FIRST_REPLY_TIMEOUT)`), so the
+- Every new native connection gets its `Radio` from `Radio::new_bluetooth`
+  (or, in the shared fixed read, `Some(BLUETOOTH_FIRST_REPLY_TIMEOUT)`), so the
   first reply may take ten seconds and every later exchange 1.5. The fresh
   post-exit connection's first reply instead gets
   `bluetooth_first_reply_timeout_after_exit` of the time since the exiting read
-  returned, never a deadline counted from the reopen. Never raise
-  `EXCHANGE_TIMEOUT` instead, and never give USB the first-reply deadline: the
+  returned, never a deadline counted from the reopen. Never raise the regular
+  reply deadline instead, and never give USB the first-reply deadline: the
   silent-`ID` readiness retry depends on the 1.5 s timeout.
 - `mcp text set` admits either USB role for every form, and the role selects
   the post-exit check: one open on the main-unit endpoint
@@ -80,6 +80,16 @@
   `length` and must keep standard order; removing or appending a segment fails
   the parser or the order check) and zero byte 2 of the address-8 fragment,
   the memory-format byte every write path requires.
+- Hardware-derived policy is imported from the library, never copied:
+  `radio::readiness` constants (`SETTLE`, `READINESS_BUDGET`,
+  `RETRY_INTERVAL`, `MAXIMUM_OPEN_ATTEMPTS`, `EXCHANGE_TIMEOUT`,
+  `SETTLE_QUIET`, ...) and `transport::reenumeration` (`select_pinned`,
+  `is_unambiguous`, `deduplicate_aliases`).
+- Report JSON strings are a contract apart from library names: a library
+  rename maps onto the existing string (`durable_intent`, `unqualified`);
+  changing a string bumps that report's `format_version`, and loaders keep
+  reading older backup formats. Build report strings with a local exhaustive
+  `match` (`mode_label`, `gateway_label`), never a library `Display`.
 - Committed prose states contracts only: no dated bench narrative, no approval
   vocabulary, no capture paths. `README.md` is the crate's published front page.
 

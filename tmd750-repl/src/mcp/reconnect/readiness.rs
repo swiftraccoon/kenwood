@@ -11,21 +11,10 @@ use super::{
     VerificationContext, VerificationGoal, VerificationOutcome, VerificationStage,
     attempt_identity, await_endpoint, finalize_capture, milliseconds, wait_recorded,
 };
+use kenwood_tmd750::radio::readiness::{
+    EXCHANGE_TIMEOUT, MAXIMUM_OPEN_ATTEMPTS, READINESS_BUDGET, RETRY_INTERVAL,
+};
 
-/// Deadline for each write and each reply of the three identity queries (1.5 s).
-pub(super) const EXCHANGE_TIMEOUT: Duration = Duration::from_millis(1_500);
-/// Window covering enumeration polling, opens, queries and closes (60 s),
-/// measured from the end of the settle wait.
-const READINESS_BUDGET: Duration = Duration::from_secs(60);
-/// Wait between one attempt's close and the next open (2 s).
-const RETRY_INTERVAL: Duration = Duration::from_secs(2);
-/// Opens permitted within one reacquisition.
-///
-/// Attempts run about 3.5 s apart, so six cover roughly the first 25 s of
-/// the budget. On firmware 1.02 the operation-panel endpoint has answered
-/// `ID` on the third or fourth open after an MCP exit; the main-unit endpoint
-/// answers on the first open once it re-enumerates.
-pub(crate) const MAXIMUM_OPEN_ATTEMPTS: usize = 6;
 /// Budget one identity-only attempt may still need: a write and a reply
 /// deadline for each of ID, FV and TY, followed by the bounded close.
 const ATTEMPT_ALLOWANCE: Duration = EXCHANGE_TIMEOUT

@@ -9,9 +9,9 @@ use std::fmt;
 
 use kenwood_tmd750::types::{
     AmHighCut, AprsCallsign, BacklightControl, BandControl, BandDisplay, BeaconMethod,
-    DstarCallsignEntry, DstarSlot, Frequency, GpsSettings, MemoryChannelAddress,
-    MyPositionSelection, NmeaSentence, NmeaSentences, PacketDataRate, PowerLevel, SquelchLevel,
-    StepSize, TuningMode, VoxDelay, VoxGain,
+    CatMemoryChannelRecord, DstarCallsignEntry, DstarSlot, Frequency, GpsSettings,
+    MemoryChannelAddress, MyPositionSelection, NmeaSentence, NmeaSentences, PacketDataRate,
+    PowerLevel, SquelchLevel, StepSize, TuningMode, VoxDelay, VoxGain,
 };
 use kenwood_tmd750::{Band, Error, Radio};
 use kenwood_transport::Transport;
@@ -33,6 +33,7 @@ pub(crate) const HELP_LINES: &[&str] = &[
     "am-cut [3.0|4.5|6.0|7.5]: Read or select the AM high-cut filter.",
     "current [a|b] | recall [a|b] ADDRESS: Memory channel selection.",
     "memory ADDRESS: Read a stored channel (000-999, L00-U49, Pri).",
+    "store [a|b] ADDRESS: Store a band's current channel record there.",
     "clear ADDRESS: Empty a stored channel; readback must answer N.",
     "bands [CTRL PTT]: Read or select the band roles (bands b a).",
     "display [dual|single]: Read or select the band display.",
@@ -96,6 +97,7 @@ pub(crate) enum Write {
     Up(Band),
     Down(Band),
     Recall(Band, MemoryChannelAddress),
+    StoreMemory(Band, MemoryChannelAddress),
     ClearMemory(MemoryChannelAddress),
     Bands(BandControl),
     Display(BandDisplay),
@@ -259,6 +261,14 @@ fn parse_band_word(word: &str, rest: &[&str]) -> WordResult {
                 Err("memory takes exactly one address: 000-999, L00-L49, U00-U49 or Pri".to_owned())
             }
         },
+        "store" => {
+            let (band, rest) = split_band(rest);
+            match rest {
+                [address] => parse_address(address)
+                    .map(|address| Parsed::Write(Write::StoreMemory(band, address))),
+                _ => Err("store takes an optional band and one memory address".to_owned()),
+            }
+        }
         "clear" => match rest {
             [address] => {
                 parse_address(address).map(|address| Parsed::Write(Write::ClearMemory(address)))
@@ -656,6 +666,7 @@ pub(crate) async fn execute_write<T: Transport>(
             radio.recall_memory_channel(band, address).await?;
             format!("Band {band} memory channel: {address} {VERIFIED}.")
         }
+        Write::StoreMemory(band, address) => store_memory(radio, band, address).await?,
         Write::ClearMemory(address) => {
             radio.clear_memory_channel(address).await?;
             format!("Memory {address}: empty (clear acknowledged, readback N).")
@@ -708,6 +719,27 @@ pub(crate) async fn execute_write<T: Transport>(
     };
     output::line(format_args!("{text}"));
     Ok(())
+}
+
+/// Store `band`'s current channel record (`FO`) in `address` without scan
+/// lockout, verify the `ME` echo and readback, and return the confirmed text.
+async fn store_memory<T: Transport>(
+    radio: &mut Radio<T>,
+    band: Band,
+    address: MemoryChannelAddress,
+) -> Result<String, Error> {
+    let channel = radio.get_channel_record(band).await?;
+    let stored = radio
+        .write_memory_channel(
+            address,
+            CatMemoryChannelRecord::from_channel(channel, false),
+        )
+        .await?;
+    Ok(format!(
+        "Memory {address}: {}{} from band {band} {VERIFIED}.",
+        stored.channel,
+        if stored.split { " split" } else { "" }
+    ))
 }
 
 /// Run one verified MY slot or APRS callsign write and return the confirmed text.
@@ -826,6 +858,20 @@ mod tests {
         assert_eq!(
             parsed("recall b 021")?,
             Parsed::Write(Write::Recall(Band::B, MemoryChannelAddress::regular(21)?))
+        );
+        assert_eq!(
+            parsed("store 995")?,
+            Parsed::Write(Write::StoreMemory(
+                Band::A,
+                MemoryChannelAddress::regular(995)?
+            ))
+        );
+        assert_eq!(
+            parsed("store b l05")?,
+            Parsed::Write(Write::StoreMemory(
+                Band::B,
+                MemoryChannelAddress::program_scan_lower(5)?
+            ))
         );
         assert_eq!(
             parsed("clear u49")?,
@@ -992,11 +1038,16 @@ mod tests {
             "bands c a",
             "memory 1000",
             "memory",
+            "store",
+            "store b",
+            "store 1000",
+            "store 995 996",
             "clear",
             "clear 1000",
             "callsign 0",
             "recall",
             "freq 600",
+            "freq b 524",
             "tnc a",
             "clock now",
         ] {
@@ -1034,6 +1085,30 @@ mod tests {
         let mut radio = Radio::new(mock);
         execute_write(&mut radio, Write::Step(Band::A, StepSize::Hz10000)).await?;
         execute_write(&mut radio, Write::Up(Band::A)).await?;
+        radio.into_transport().assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn store_writes_the_band_record_to_the_channel_and_verifies_it() -> TestResult {
+        const STORED: &[u8] =
+            b"ME 995,0145190000,0000600000,2,2,0,0,0,0,0,0,0,2,08,08,000,0,CQCQCQ,0,00,0\r";
+        let mut mock = MockTransport::new();
+        mock.expect(
+            b"FO 1\r",
+            b"FO 1,0145190000,0000600000,2,2,0,0,0,0,0,0,2,08,08,000,0,CQCQCQ,0,00\r",
+        );
+        mock.expect(b"ID\r", b"ID TM-D750\r");
+        mock.expect(b"FV\r", b"FV 1.02\r");
+        mock.expect(b"TY\r", b"TY K,2,1\r");
+        mock.expect(STORED, STORED);
+        mock.expect(b"ME 995\r", STORED);
+        let mut radio = Radio::new(mock);
+        execute_write(
+            &mut radio,
+            Write::StoreMemory(Band::B, MemoryChannelAddress::regular(995)?),
+        )
+        .await?;
         radio.into_transport().assert_complete();
         Ok(())
     }

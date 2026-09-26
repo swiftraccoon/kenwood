@@ -110,16 +110,13 @@ fn select_control(
     requested: Option<&str>,
     candidates: &[SerialCandidate],
 ) -> Result<SerialCandidate, CommandError> {
-    use crate::mcp::reconnect::endpoint_is_unambiguous;
+    use kenwood_tmd750::transport::reenumeration::is_unambiguous;
 
     let path = if let Some(path) = requested {
         path
     } else {
         let known: Vec<_> = candidates.iter().filter(|port| port.is_tmd750()).collect();
-        if known
-            .iter()
-            .any(|port| !endpoint_is_unambiguous(port, candidates))
-        {
+        if known.iter().any(|port| !is_unambiguous(port, candidates)) {
             return Err(CommandError(
                 "TM-D750 USB metadata is ambiguous; no automatic control endpoint was selected"
                     .to_owned(),
@@ -150,7 +147,7 @@ fn select_control(
         }
     };
     let selected = super::probe::select_endpoint(path, candidates.to_vec())?;
-    if !endpoint_is_unambiguous(&selected, candidates) {
+    if !is_unambiguous(&selected, candidates) {
         return Err(CommandError(format!(
             "USB control endpoint {path} has ambiguous or conflicting metadata; no substitute was selected"
         )));

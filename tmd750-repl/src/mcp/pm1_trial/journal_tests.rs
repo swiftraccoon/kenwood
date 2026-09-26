@@ -105,7 +105,7 @@ fn intent_and_readback(trial: &mut PmNameTrial, session: u64) -> TestResult {
     } else {
         PmNameTrialWrite::Restore
     };
-    trial.record(PmNameTrialEvent::DurableWriteIntent {
+    trial.record(PmNameTrialEvent::IntentJournaled {
         id: id(session)?,
         write,
     })?;
@@ -361,7 +361,7 @@ fn possible_changes_remain_explicit_after_failed_session_evidence() -> TestResul
     prepare(&mut journal, &trial)?;
     fresh(&mut trial, 1)?;
     journal.intent(&trial, PmNameTrialWrite::Rename)?;
-    trial.record(PmNameTrialEvent::DurableWriteIntent {
+    trial.record(PmNameTrialEvent::IntentJournaled {
         id: id(1)?,
         write: PmNameTrialWrite::Rename,
     })?;
