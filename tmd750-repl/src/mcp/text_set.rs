@@ -17,7 +17,7 @@ use clap::Args;
 use kenwood_tmd750::Region;
 use kenwood_tmd750::memory::{
     ChannelNameText, ChannelNameUpdate, My1Callsign, My1CallsignUpdate, Pm1Name, Pm1NameUpdate,
-    Pm1NameUpdateStatus, TextSetting,
+    TextFieldUpdateStatus, TextSetting,
 };
 use kenwood_tmd750::transport::{DEFAULT_BAUD, SerialCandidate, TMD750_MAIN_PID, TMD750_PANEL_PID};
 use kenwood_tmd750::types::PhysicalChannel;
@@ -53,8 +53,8 @@ pub(super) struct SetRequest {
     /// The memory channel whose name changes; channel-name only (000-999, L00-U49, Pri).
     #[arg(long, value_parser = parse_channel, value_name = "CHANNEL")]
     channel: Option<PhysicalChannel>,
-    /// Clear the channel name instead of giving new text; channel-name only.
-    #[arg(long, conflicts_with = "value", requires = "channel")]
+    /// Clear the field instead of giving new text: dstar-my-callsign-1 and channel-name only.
+    #[arg(long, conflicts_with = "value")]
     clear: bool,
     /// pm-name-1, dstar-my-callsign-1 (fixed to PM Off/Gateway Off) or channel-name.
     setting: SetTarget,
@@ -115,7 +115,7 @@ enum RequestedChange {
     },
     My1 {
         expected: Option<My1Callsign>,
-        desired: My1Callsign,
+        desired: Option<My1Callsign>,
     },
     ChannelName {
         channel: PhysicalChannel,
@@ -135,16 +135,20 @@ impl SetRequest {
                 "mcp text set requires explicit --apply".to_owned(),
             )));
         }
-        if self.setting != SetTarget::ChannelName && (self.channel.is_some() || self.clear) {
+        if self.setting != SetTarget::ChannelName && self.channel.is_some() {
             return Err(Box::new(CommandError(
-                "--channel and --clear apply to channel-name only".to_owned(),
+                "--channel applies to channel-name only".to_owned(),
             )));
         }
-        let value = self.value.as_deref().unwrap_or_default();
+        if self.setting == SetTarget::PmName1 && self.clear {
+            return Err(Box::new(CommandError(
+                "--clear applies to dstar-my-callsign-1 and channel-name only".to_owned(),
+            )));
+        }
         match self.setting {
             SetTarget::PmName1 => {
                 let expected = Pm1Name::new(&self.expected)?;
-                let desired = Pm1Name::new(value)?;
+                let desired = Pm1Name::new(self.value.as_deref().unwrap_or_default())?;
                 if expected == desired {
                     return Err(Box::new(CommandError(
                         "no name change requested; the radio was not opened or checked".to_owned(),
@@ -158,8 +162,8 @@ impl SetRequest {
                 } else {
                     Some(My1Callsign::new(&self.expected)?)
                 };
-                let desired = My1Callsign::new(value)?;
-                if expected.as_ref() == Some(&desired) {
+                let desired = self.value.as_deref().map(My1Callsign::new).transpose()?;
+                if expected == desired {
                     return Err(Box::new(CommandError(
                         "no MY1 change requested; the radio was not opened or checked".to_owned(),
                     )));
@@ -206,18 +210,13 @@ impl SetRequest {
 
     fn prepare(&self, endpoint: &SerialCandidate, baud: u32) -> AppResult<PreparedUpdate> {
         let change = self.requested_change()?;
-        let (usb_role_accepted, requirement) = match &change {
-            RequestedChange::ChannelName { .. } => (
-                matches!(endpoint.pid, Some(TMD750_MAIN_PID | TMD750_PANEL_PID)),
-                "channel name updates require a TM-D750 USB endpoint, main unit or operation panel, at 9600 baud",
-            ),
-            RequestedChange::Pm1 { .. } | RequestedChange::My1 { .. } => (
-                endpoint.pid == Some(TMD750_MAIN_PID),
-                "text updates require the pinned main-unit USB endpoint at 9600 baud",
-            ),
-        };
-        if !endpoint.is_tmd750() || !usb_role_accepted || baud != DEFAULT_BAUD {
-            return Err(Box::new(CommandError(requirement.to_owned())));
+        if !endpoint.is_tmd750()
+            || !matches!(endpoint.pid, Some(TMD750_MAIN_PID | TMD750_PANEL_PID))
+            || baud != DEFAULT_BAUD
+        {
+            return Err(Box::new(CommandError(
+                "text updates require a TM-D750 USB endpoint, main unit or operation panel, at 9600 baud".to_owned(),
+            )));
         }
         let snapshot = Snapshot::load_for_usb_write(&self.backup)?;
         match change {
@@ -241,7 +240,7 @@ impl SetRequest {
                     snapshot.captured_bytes(target.region())?,
                     snapshot.captured_bytes(control.region())?,
                     expected.as_ref(),
-                    &desired,
+                    desired.as_ref(),
                 )?)))
             }
             RequestedChange::ChannelName {
@@ -304,12 +303,12 @@ pub(super) enum UpdateStatus {
     VerifiedAcrossSessions,
 }
 
-impl From<Pm1NameUpdateStatus> for UpdateStatus {
-    fn from(status: Pm1NameUpdateStatus) -> Self {
+impl From<TextFieldUpdateStatus> for UpdateStatus {
+    fn from(status: TextFieldUpdateStatus) -> Self {
         match status {
-            Pm1NameUpdateStatus::NotWritten => Self::NotWritten,
-            Pm1NameUpdateStatus::PossiblyChanged => Self::PossiblyChanged,
-            Pm1NameUpdateStatus::VerifiedAcrossSessions => Self::VerifiedAcrossSessions,
+            TextFieldUpdateStatus::NotWritten => Self::NotWritten,
+            TextFieldUpdateStatus::PossiblyChanged => Self::PossiblyChanged,
+            TextFieldUpdateStatus::VerifiedAcrossSessions => Self::VerifiedAcrossSessions,
         }
     }
 }

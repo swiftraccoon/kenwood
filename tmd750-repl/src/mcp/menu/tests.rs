@@ -193,6 +193,7 @@ fn ordinary_admission_rejects_scope_lifecycle_and_unknown_fields_before_backup_i
             selection: selection(Path::new("missing.json"), field, slot)?,
             apply: true,
             value: value.to_owned(),
+            and: Vec::new(),
             output: None,
         };
         let error = request
@@ -263,6 +264,7 @@ fn preview_and_apply_share_exact_text_and_complete_page_preservation() -> TestRe
         selection: selection(&path, "pm.PmName2", None)?,
         apply: true,
         value: request.value,
+        and: Vec::new(),
         output: None,
     };
     let plan = apply.prepare()?;
@@ -293,6 +295,130 @@ fn preview_and_apply_share_exact_text_and_complete_page_preservation() -> TestRe
         std::fs::read(&path)?,
         original,
         "neither preview nor planning may edit the backup"
+    );
+    Ok(())
+}
+
+/// Parse `mcp menu apply --backup <backup> <words...>` into its request.
+fn apply_request(backup: &str, words: &[&str]) -> Result<ApplyRequest, TestError> {
+    let mut command_words = vec!["mcp", "menu", "apply", "--backup", backup];
+    command_words.extend(words);
+    let McpCommand::Menu(request) = command(&command_words)? else {
+        return Err("wrong top-level command".into());
+    };
+    let MenuCommand::Apply(apply) = request.command else {
+        return Err("wrong menu command".into());
+    };
+    Ok(apply)
+}
+
+#[test]
+fn apply_writes_every_and_pair_in_one_plan_and_binds_slot_to_per_slot_fields() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("backup.json");
+    save(&path, &fixture()?)?;
+    let backup = path.to_string_lossy().into_owned();
+    let apply = apply_request(
+        &backup,
+        &[
+            "--slot",
+            "0",
+            "--apply",
+            "pm.PmName2",
+            "BASE2",
+            "--and",
+            "radio.Beep",
+            "off",
+            "--and",
+            "gps.MyPositionList[0].Altitude",
+            "-123",
+        ],
+    )?;
+    let plan = apply.prepare()?;
+    assert_eq!(
+        plan.assignments().len(),
+        3,
+        "the positional pair and both --and pairs are one plan"
+    );
+    assert_eq!(
+        plan.assignments()
+            .iter()
+            .map(|assignment| assignment.slot().map(SlotIndex::index))
+            .collect::<Vec<_>>(),
+        [None, Some(0), Some(0)],
+        "--slot binds the per-slot fields only"
+    );
+    let written: Vec<u32> = plan
+        .replacements()
+        .iter()
+        .filter(|page| !page.is_noop())
+        .map(|page| page.page().address().as_u32())
+        .collect();
+    assert_eq!(
+        written,
+        [323_584, 328_960, 329_216],
+        "three fields on three pages are written in address order"
+    );
+    Ok(())
+}
+
+#[test]
+fn apply_rejects_half_pairs_a_slot_without_per_slot_fields_and_a_repeated_field() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("backup.json");
+    save(&path, &fixture()?)?;
+    let backup = path.to_string_lossy().into_owned();
+    for field in ["radio.Beep", "pm.PmName3"] {
+        assert!(
+            apply_request(
+                &backup,
+                &[
+                    "--slot",
+                    "0",
+                    "--apply",
+                    "pm.PmName2",
+                    "BASE2",
+                    "--and",
+                    field
+                ]
+            )
+            .is_err(),
+            "an --and pair needs exactly a field and a value: {field}"
+        );
+    }
+    let global_only = apply_request(
+        &backup,
+        &[
+            "--slot",
+            "0",
+            "--apply",
+            "pm.PmName2",
+            "BASE2",
+            "--and",
+            "pm.PmName3",
+            "BASE3",
+        ],
+    )?;
+    assert!(
+        global_only.validate_options().is_err_and(|error| error
+            .to_string()
+            .contains("every field of this run is global")),
+        "--slot without a per-slot field is refused before backup access"
+    );
+    let duplicate = apply_request(
+        &backup,
+        &[
+            "--apply",
+            "pm.PmName2",
+            "BASE2",
+            "--and",
+            "pm.PmName2",
+            "BASE3",
+        ],
+    )?;
+    assert!(
+        duplicate.prepare().is_err(),
+        "a repeated field is rejected by the plan"
     );
     Ok(())
 }
@@ -339,6 +465,7 @@ fn apply_rejects_invalid_format_gateway_and_identity_without_output_creation() -
             selection: selection(&path, "pm.PmName2", None)?,
             apply: true,
             value: "BASE".to_owned(),
+            and: Vec::new(),
             output: Some(output.clone()),
         };
         assert!(

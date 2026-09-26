@@ -179,20 +179,24 @@ fn endpoint_and_baud_policy_precede_backup_access() -> TestResult {
     let candidate = request(PathBuf::from("missing.json"))?;
     for selected in [
         SerialCandidate {
-            pid: Some(0x9032),
+            vid: None,
+            pid: None,
             ..endpoint()
         },
         SerialCandidate {
-            vid: None,
-            pid: None,
+            vid: Some(0xFFFF),
+            ..endpoint()
+        },
+        SerialCandidate {
+            pid: Some(0x0001),
             ..endpoint()
         },
     ] {
         assert!(
             candidate
                 .prepare(&selected, DEFAULT_BAUD)
-                .is_err_and(|error| error.to_string().contains("main-unit USB")),
-            "wrong USB interface must be refused before file access"
+                .is_err_and(|error| error.to_string().contains("TM-D750 USB")),
+            "an unidentified or foreign USB interface must be refused before file access"
         );
     }
     assert!(
@@ -231,22 +235,28 @@ fn complete_backup_retains_all_unrelated_bytes_and_binds_expected_name() -> Test
     let path = directory.path().join("report.json");
     backup_fixture(&path)?;
     let mut candidate = request(path)?;
-    let PreparedUpdate::Pm1(update) = candidate.prepare(&endpoint(), DEFAULT_BAUD)? else {
-        return Err("PM1 request selected a different target".into());
-    };
-    assert_eq!(update.original_page().first(), Some(&0x42));
-    assert_eq!(update.current_name().as_str(), "PM1");
-    assert_eq!(update.desired_name().as_str(), "Home");
-    for (index, (before, after)) in update
-        .original_page()
-        .iter()
-        .zip(update.desired_page())
-        .enumerate()
-    {
-        assert!(
-            before == after || (10..26).contains(&index),
-            "unrelated byte {index} must not change"
-        );
+    for pid in [TMD750_MAIN_PID, TMD750_PANEL_PID] {
+        let selected = SerialCandidate {
+            pid: Some(pid),
+            ..endpoint()
+        };
+        let PreparedUpdate::Pm1(update) = candidate.prepare(&selected, DEFAULT_BAUD)? else {
+            return Err("PM1 request selected a different target".into());
+        };
+        assert_eq!(update.original_page().first(), Some(&0x42));
+        assert_eq!(update.current().map(Pm1Name::as_str), Some("PM1"));
+        assert_eq!(update.requested().map(Pm1Name::as_str), Some("Home"));
+        for (index, (before, after)) in update
+            .original_page()
+            .iter()
+            .zip(update.desired_page())
+            .enumerate()
+        {
+            assert!(
+                before == after || (10..26).contains(&index),
+                "unrelated byte {index} must not change"
+            );
+        }
     }
     candidate.expected = "Other".to_owned();
     assert!(
@@ -282,8 +292,18 @@ fn channel_name_selector_clear_and_scope_are_enforced_before_any_io() -> TestRes
     );
 
     assert!(
-        channel_request(&["--apply", "--clear", "channel-name"]).is_err(),
-        "--clear requires --channel"
+        channel_request(&["--apply", "--clear", "channel-name"])?
+            .validate_options()
+            .is_err_and(|error| error.to_string().contains("requires --channel")),
+        "clearing a channel name requires --channel"
+    );
+    assert!(
+        channel_request(&["--apply", "--clear", "pm-name-1"])?
+            .validate_options()
+            .is_err_and(|error| error
+                .to_string()
+                .contains("dstar-my-callsign-1 and channel-name only")),
+        "PM1 has no empty form"
     );
     assert!(
         channel_request(&[
@@ -363,7 +383,7 @@ fn channel_name_prepare_binds_the_captured_name_page_on_either_usb_role() -> Tes
         assert_eq!(update.channel().index(), 999);
         assert_eq!(update.page().address().as_u32(), 81_408);
         assert_eq!(update.original_page().first(), Some(&0x42));
-        assert_eq!(update.current_name(), None);
+        assert_eq!(update.current(), None);
         assert_eq!(
             update.desired_page().get(112..128),
             Some(b"Repeater 1\0\0\0\0\0\0".as_slice())

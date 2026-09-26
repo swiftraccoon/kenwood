@@ -272,6 +272,8 @@ struct FakeBackend {
     cancelled: Arc<AtomicBool>,
     opens: usize,
     cancel_during_wait: bool,
+    /// Sleep through each wait, so a paused-clock test sees the settle pass.
+    wait_advances_clock: bool,
 }
 
 impl Backend for FakeBackend {
@@ -320,6 +322,9 @@ impl Backend for FakeBackend {
         }
         if self.cancel_during_wait {
             self.cancelled.store(true, Ordering::Relaxed);
+        }
+        if self.wait_advances_clock {
+            tokio::time::sleep(duration).await;
         }
     }
 }
@@ -381,6 +386,24 @@ fn fresh_gateway(reply: &[u8]) -> MockTransport {
     script
 }
 
+/// A fresh connection whose radio holds the `ID` reply for `hold` after the
+/// read for it begins, as it does until about 20 s after a programming exit.
+fn held_identity(hold: Duration) -> AppResult<MockTransport> {
+    let mut script = MockTransport::new();
+    script.queue_read_delayed(b"ID TM-D750\r", u64::try_from(hold.as_millis())?);
+    script.expect_reads(b"ID\r", &[]);
+    Ok(script)
+}
+
+/// [`held_identity`] followed by the rest of the fresh Gateway Off check.
+fn held_fresh_gateway(hold: Duration) -> AppResult<MockTransport> {
+    let mut script = held_identity(hold)?;
+    script.expect(b"FV\r", b"FV 1.02\r");
+    script.expect(b"TY\r", b"TY K,2,1\r");
+    script.expect(b"GW\r", b"GW 0\r");
+    Ok(script)
+}
+
 fn endpoint() -> AppResult<Endpoint> {
     Ok(Endpoint {
         address: "01:23:45:67:89:AB".parse()?,
@@ -399,6 +422,7 @@ async fn execute(
 struct Faults {
     cancel_during_wait: bool,
     readonly_settle: bool,
+    settle_advances_clock: bool,
 }
 
 async fn execute_with_faults(
@@ -429,6 +453,7 @@ async fn execute_with_faults(
         cancelled: Arc::clone(&cancelled),
         opens: 0,
         cancel_during_wait: faults.cancel_during_wait,
+        wait_advances_clock: faults.settle_advances_clock,
     };
     let result = run_workflow(
         &mut backend,
@@ -545,6 +570,59 @@ async fn fixed_probe_retains_owner_during_settle_before_fresh_gateway_check() ->
         !result.succeeded(),
         "fresh CAT must not hide an incomplete original capture"
     );
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn fresh_check_waits_for_a_reply_held_until_twenty_seconds_after_exit() -> TestResult {
+    // The five-second settle passes and the reopen takes no time, so the
+    // radio holds the fresh `ID` for 15 s: its reply comes 20 s after the
+    // exit, past a deadline counted from the send alone.
+    let (result, events) = execute_with_faults(
+        [
+            Fixture::new(fixed(&[ACK])?),
+            Fixture::new(held_fresh_gateway(Duration::from_secs(15))?),
+        ],
+        Operation::FixedMcp,
+        Faults {
+            settle_advances_clock: true,
+            ..Faults::default()
+        },
+    )
+    .await?;
+    assert!(result.succeeded(), "{result:?}");
+    assert_eq!(
+        writes(&events, 1),
+        [b"ID\r".as_slice(), b"FV\r", b"TY\r", b"GW\r"]
+    );
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn fresh_check_gives_up_at_the_exit_reply_bound() -> TestResult {
+    // Sent five seconds after the exit, the fresh `ID` may wait 25 s, to the
+    // 30 s bound; a reply held 26 s is past it.
+    let (result, events) = execute_with_faults(
+        [
+            Fixture::new(fixed(&[ACK])?),
+            Fixture::new(held_identity(Duration::from_secs(26))?),
+        ],
+        Operation::FixedMcp,
+        Faults {
+            settle_advances_clock: true,
+            ..Faults::default()
+        },
+    )
+    .await?;
+    assert!(!result.succeeded(), "{result:?}");
+    let error = result
+        .fresh_cat
+        .as_ref()
+        .and_then(|fresh| fresh.operation_error.as_ref())
+        .ok_or("fresh check recorded no error")?
+        .to_string();
+    assert!(error.contains("25000"), "{error}");
+    assert_eq!(writes(&events, 1), [b"ID\r".as_slice()]);
     Ok(())
 }
 
@@ -701,6 +779,7 @@ async fn unsynchronized_open_intent_prevents_backend_access() -> TestResult {
         cancelled: Arc::clone(&cancelled),
         opens: 0,
         cancel_during_wait: false,
+        wait_advances_clock: false,
     };
     let result = run_workflow(
         &mut backend,

@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kenwood_tmd750::protocol::mcp::{ACK, read_request, write_request};
-use kenwood_tmd750::transport::{KENWOOD_VID, SerialCandidate, TMD750_MAIN_PID};
+use kenwood_tmd750::transport::{KENWOOD_VID, SerialCandidate, TMD750_MAIN_PID, TMD750_PANEL_PID};
 use kenwood_tmd750::{
     Address, FirmwareIdentity, Identity, MenuAssignment, MenuFieldSnapshot, MenuUpdatePlan, Page,
     PageReplacement, RadioModel, RadioType, SlotIndex,
@@ -24,7 +24,7 @@ use serde_json::Value;
 use super::{Captures, WorkflowResult, run_workflow};
 use crate::capture::{Recorder, create_private_file};
 use crate::mcp::ExitDisposition;
-use crate::mcp::reconnect::{Backend, VerificationOutcome, VerificationStage};
+use crate::mcp::reconnect::{Backend, PostExit, VerificationOutcome, VerificationStage};
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;
 type TestResult = Result<(), TestError>;
@@ -104,6 +104,7 @@ impl From<&PageReplacement> for RecordedPage {
 struct Proof {
     directory: PathBuf,
     plan: MenuUpdatePlan,
+    endpoint: SerialCandidate,
 }
 
 impl Proof {
@@ -129,7 +130,7 @@ impl Proof {
         );
         assert_eq!(
             request.pointer("/event/path"),
-            Some(&serde_json::json!(endpoint().path)),
+            Some(&serde_json::json!(self.endpoint.path)),
             "opening evidence must bind the selected endpoint"
         );
         assert_eq!(
@@ -324,6 +325,7 @@ struct TestBackend {
     log: Log,
     opens: usize,
     elapsed: Duration,
+    endpoint: SerialCandidate,
 }
 
 impl Backend for TestBackend {
@@ -335,9 +337,8 @@ impl Backend for TestBackend {
         baud: u32,
     ) -> Result<Connection, TransportError> {
         assert_eq!(
-            selected,
-            &endpoint(),
-            "only the selected main-unit endpoint may open"
+            selected, &self.endpoint,
+            "only the selected endpoint may open"
         );
         assert_eq!(baud, 9600, "the ordinary workflow has one fixed CAT baud");
         self.proof
@@ -358,7 +359,7 @@ impl Backend for TestBackend {
 
     fn enumerate(&mut self) -> Result<Vec<SerialCandidate>, TransportError> {
         append(&self.log, Event::Enumerate)?;
-        Ok(vec![endpoint()])
+        Ok(vec![self.endpoint.clone()])
     }
 
     fn now(&self) -> Duration {
@@ -375,6 +376,14 @@ fn endpoint() -> SerialCandidate {
         path: "/dev/cu.menu-apply-test".to_owned(),
         vid: Some(KENWOOD_VID),
         pid: Some(TMD750_MAIN_PID),
+    }
+}
+
+fn panel_endpoint() -> SerialCandidate {
+    SerialCandidate {
+        path: "/dev/cu.menu-apply-panel".to_owned(),
+        vid: Some(KENWOOD_VID),
+        pid: Some(TMD750_PANEL_PID),
     }
 }
 
@@ -486,7 +495,22 @@ struct Harness {
 }
 
 impl Harness {
+    /// The main-unit endpoint with one fresh connection answering the identity
+    /// tuple and Gateway Off.
     fn new(noop: bool) -> Result<Self, TestError> {
+        Self::build(
+            noop,
+            endpoint(),
+            vec![fresh_script(b"FV 1.02\r", b"GW 0\r")],
+        )
+    }
+
+    /// `endpoint` with the complete apply script first, then `fresh` in order.
+    fn build(
+        noop: bool,
+        endpoint: SerialCandidate,
+        fresh: Vec<MockTransport>,
+    ) -> Result<Self, TestError> {
         let directory = tempfile::tempdir()?;
         let plan = plan(noop)?;
         let capture_failed = Arc::new(AtomicBool::new(false));
@@ -505,24 +529,22 @@ impl Harness {
         let proof = Arc::new(Proof {
             directory: directory.path().to_owned(),
             plan: plan.clone(),
+            endpoint: endpoint.clone(),
         });
         let log = Arc::new(Mutex::new(Vec::new()));
-        let connections = [
-            complete_script(&plan),
-            fresh_script(b"FV 1.02\r", b"GW 0\r"),
-        ]
-        .into_iter()
-        .enumerate()
-        .map(|(id, mock)| Connection {
-            id,
-            mock,
-            proof: Arc::clone(&proof),
-            log: Arc::clone(&log),
-            fail_close: false,
-            error_after: None,
-            cancellation: None,
-        })
-        .collect();
+        let connections = std::iter::once(complete_script(&plan))
+            .chain(fresh)
+            .enumerate()
+            .map(|(id, mock)| Connection {
+                id,
+                mock,
+                proof: Arc::clone(&proof),
+                log: Arc::clone(&log),
+                fail_close: false,
+                error_after: None,
+                cancellation: None,
+            })
+            .collect();
         Ok(Self {
             _directory: directory,
             plan,
@@ -532,6 +554,7 @@ impl Harness {
                 log,
                 opens: 0,
                 elapsed: Duration::ZERO,
+                endpoint,
             },
             captures: Some(captures),
             journal,
@@ -541,9 +564,10 @@ impl Harness {
     }
 
     async fn run(&mut self) -> Result<WorkflowResult, TestError> {
+        let endpoint = self.backend.endpoint.clone();
         Ok(run_workflow(
             &mut self.backend,
-            &endpoint(),
+            &endpoint,
             &self.plan,
             self.captures
                 .take()
@@ -871,7 +895,7 @@ async fn fresh_gateway_mismatch_prevents_success_without_rollback() -> TestResul
     );
     assert!(
         matches!(
-            result.post_exit.outcome,
+            result.post_exit.outcome(),
             VerificationOutcome::Failed {
                 stage: VerificationStage::GatewayMismatch,
                 ..
@@ -927,5 +951,99 @@ async fn failed_journal_blocks_the_first_open_independently_of_user_cancellation
         harness.events()?.is_empty(),
         "journal failure must precede every hardware operation"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn panel_endpoint_retries_a_silent_identity_then_requires_gateway_off() -> TestResult {
+    let mut silent = MockTransport::new();
+    silent.expect_hang(b"ID\r");
+    let mut harness = Harness::build(
+        false,
+        panel_endpoint(),
+        vec![silent, fresh_script(b"FV 1.02\r", b"GW 0\r")],
+    )?;
+    let result = harness.run().await?;
+    assert!(
+        result.succeeded(),
+        "the panel endpoint's bounded readiness check must succeed: {result:?}"
+    );
+    assert!(
+        matches!(result.post_exit, PostExit::Readiness(_)),
+        "the panel endpoint must use the bounded readiness check"
+    );
+    let (identity, mode) = result
+        .post_exit
+        .gateway_off_evidence()
+        .ok_or("Gateway Off evidence missing")?;
+    assert_eq!(
+        identity,
+        harness.plan.identity(),
+        "evidence carries the fresh tuple"
+    );
+    assert_eq!(
+        mode,
+        kenwood_tmd750::DvGatewayMode::Off,
+        "evidence carries Gateway Off"
+    );
+    assert_eq!(
+        harness.backend.opens, 3,
+        "one apply handle plus two readiness attempts"
+    );
+    let events = harness.events()?;
+    assert_released(&events, 3);
+    assert_eq!(
+        writes(&events, 1),
+        [b"ID\r".as_slice()],
+        "the silent attempt sends ID only"
+    );
+    assert_eq!(
+        writes(&events, 2),
+        [b"ID\r".as_slice(), b"FV\r", b"TY\r", b"GW\r"],
+        "the matching attempt reads the tuple, then Gateway"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn panel_endpoint_gateway_mismatch_is_terminal_after_a_matched_tuple() -> TestResult {
+    let mut harness = Harness::build(
+        false,
+        panel_endpoint(),
+        vec![
+            fresh_script(b"FV 1.02\r", b"GW 2\r"),
+            fresh_script(b"FV 1.02\r", b"GW 0\r"),
+        ],
+    )?;
+    let result = harness.run().await?;
+    assert!(
+        !result.succeeded(),
+        "a Terminal Gateway after the write must not be reported as success"
+    );
+    assert!(
+        matches!(
+            result.post_exit.outcome(),
+            VerificationOutcome::Failed {
+                stage: VerificationStage::GatewayMismatch,
+                ..
+            }
+        ),
+        "the readiness check retains the Gateway stage: {:?}",
+        result.post_exit.outcome()
+    );
+    assert!(
+        result.post_exit.gateway_off_evidence().is_none(),
+        "a mismatch yields no evidence"
+    );
+    assert_eq!(
+        harness.backend.opens, 2,
+        "a Gateway mismatch admits no further open"
+    );
+    assert_eq!(
+        result.verified_pages.len(),
+        3,
+        "Gateway mismatch does not imply written pages were restored"
+    );
+    assert_released(&harness.events()?, 2);
     Ok(())
 }

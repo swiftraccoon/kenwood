@@ -29,14 +29,50 @@
 - Native Bluetooth admits only `mcp probe` and `mcp backup`; general MCP
   settings writes and the fixed trials are USB-only and are refused before the
   helper launches.
-- `mcp text set` forms differ by USB role: `pm-name-1` and
-  `dstar-my-callsign-1` pin main-unit USB and verify post-exit CAT once;
-  `channel-name` admits either USB role and verifies with
-  `reconnect::verify_readiness`, the bounded silent-`ID` retry backups use,
-  because the operation-panel endpoint returns within seconds but answers `ID`
-  only once its tuple is ready. A single-attempt check on that endpoint ends
-  the update at `possibly_changed` even after an acknowledged write.
+- Every new native connection gets its `Radio` from `native::cat::wrap` (or,
+  in the shared fixed read, `Some(BLUETOOTH_FIRST_REPLY_TIMEOUT)`), so the
+  first reply may take ten seconds and every later exchange 1.5. The fresh
+  post-exit connection's first reply instead gets
+  `bluetooth_first_reply_timeout_after_exit` of the time since the exiting read
+  returned, never a deadline counted from the reopen. Never raise
+  `EXCHANGE_TIMEOUT` instead, and never give USB the first-reply deadline: the
+  silent-`ID` readiness retry depends on the 1.5 s timeout.
+- `mcp text set` admits either USB role for every form, and the role selects
+  the post-exit check: one open on the main-unit endpoint
+  (`reconnect::verify_required`, or `verify_required_gateway_off` for
+  `dstar-my-callsign-1`), and on the operation-panel endpoint the bounded
+  silent-`ID` retry backups use (`reconnect::verify_readiness`, or
+  `verify_readiness_gateway_off`), because that endpoint returns within
+  seconds but answers `ID` only once its tuple is ready. A single-attempt check
+  on that endpoint ends the update at `possibly_changed` even after an
+  acknowledged write.
+- Every MCP entry on the operation-panel endpoint (`mcp probe`, `mcp backup`,
+  `mcp menu apply`, both `mcp text set` sessions) goes through
+  `reconnect::settle_before_entry`, which waits until the endpoint has been
+  enumerated for `SETTLE_QUIET` without a gap, because the panel endpoint
+  re-enumerates once more after first answering `ID` and an entry sent at that
+  moment fails with `ENXIO`; the main-unit endpoint opens at once. A text
+  update's second session settles on either role.
+- `mcp menu apply` writes one positional `FIELD VALUE` pair plus any number of
+  `--and FIELD VALUE` pairs in one session; `--slot` binds every per-slot field
+  of the run and is refused when every field is global, and a repeated field
+  is rejected by the plan.
+- `mcp menu apply` admits either USB role: the main-unit endpoint verifies
+  post-exit with one open (`reconnect::verify_required_gateway_off`), the
+  operation-panel endpoint with `reconnect::verify_readiness_gateway_off`, the
+  bounded silent-`ID` retry followed by one `GW` query per matched attempt.
+- New library MCP writes are qualified on hardware through this crate's
+  journaled `mcp text set` workflow, never through an ad-hoc driver, so every
+  run leaves a journal, captures and a report. A new text field adds a
+  `SetTarget` value, an `UpdateKind` and a `PreparedUpdate` variant;
+  `target::Update` is implemented once for every `TextFieldUpdate`, never per
+  field.
 - The CLI tests must not open a radio endpoint.
+- Backup fixtures for `mcp text set` tests come from
+  `snapshot::tests::fixture()`: patch a page's `data` in place (records carry
+  `length` and must keep standard order; removing or appending a segment fails
+  the parser or the order check) and zero byte 2 of the address-8 fragment,
+  the memory-format byte every write path requires.
 - Committed prose states contracts only: no dated bench narrative, no approval
   vocabulary, no capture paths. `README.md` is the crate's published front page.
 

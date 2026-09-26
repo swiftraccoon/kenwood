@@ -4,6 +4,7 @@ use std::fs::File;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use kenwood_tmd750::radio::BLUETOOTH_FIRST_REPLY_TIMEOUT;
 use kenwood_tmd750::{Band, DvGatewayMode, Identity, Radio};
 use kenwood_transport::Transport;
 use serde::ser::SerializeStruct;
@@ -12,7 +13,18 @@ use serde::{Serialize, Serializer};
 use crate::capture::{CaptureTransport, Failure, TranscriptSummary};
 use crate::{AppResult, CommandError};
 
+/// Reply deadline for every exchange after the first on a native connection.
 pub(crate) const EXCHANGE_TIMEOUT: Duration = Duration::from_millis(1_500);
+
+/// Wrap a newly opened native connection: the first command's reply may take
+/// up to [`BLUETOOTH_FIRST_REPLY_TIMEOUT`], every later exchange
+/// [`EXCHANGE_TIMEOUT`].
+pub(crate) const fn wrap<T: Transport>(transport: T) -> Radio<T> {
+    let mut radio = Radio::new(transport);
+    radio.set_timeout(EXCHANGE_TIMEOUT);
+    radio.set_next_reply_timeout(BLUETOOTH_FIRST_REPLY_TIMEOUT);
+    radio
+}
 
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -72,6 +84,9 @@ pub(crate) struct Request<'a> {
     pub(crate) scope: Scope,
     pub(crate) expected_identity: Option<&'a Identity>,
     pub(crate) expected_gateway: Option<DvGatewayMode>,
+    /// Reply deadline of the first command: [`BLUETOOTH_FIRST_REPLY_TIMEOUT`],
+    /// or after a programming exit the deadline measured from that exit.
+    pub(crate) first_reply_timeout: Duration,
 }
 
 fn check_cancellation(cancelled: &AtomicBool) -> AppResult<()> {
@@ -143,8 +158,8 @@ pub(crate) async fn observe(
         transcript: transport.transcript_summary(),
     };
     let ready = transport.synchronize();
-    let mut radio = Radio::new(transport);
-    radio.set_timeout(EXCHANGE_TIMEOUT);
+    let mut radio = wrap(transport);
+    radio.set_next_reply_timeout(request.first_reply_timeout);
     match ready {
         Ok(()) => {
             if let Err(error) = query(&mut radio, &request, cancelled, &mut result).await {

@@ -2,14 +2,16 @@
 //!
 //! Each word maps to one library accessor. Band-indexed words take an
 //! optional `a` or `b` (Band A is the default) before the value; a word
-//! without a value reads the setting.
+//! without a value reads the setting. Words and values match in any letter
+//! case, except callsign and memo text, which is sent exactly as typed.
 
 use std::fmt;
 
 use kenwood_tmd750::types::{
-    AmHighCut, BacklightControl, BandControl, BandDisplay, BeaconMethod, DstarSlot, Frequency,
-    GpsSettings, MemoryChannelAddress, MyPositionSelection, NmeaSentence, NmeaSentences,
-    PacketDataRate, PowerLevel, SquelchLevel, StepSize, TuningMode, VoxDelay, VoxGain,
+    AmHighCut, AprsCallsign, BacklightControl, BandControl, BandDisplay, BeaconMethod,
+    DstarCallsignEntry, DstarSlot, Frequency, GpsSettings, MemoryChannelAddress,
+    MyPositionSelection, NmeaSentence, NmeaSentences, PacketDataRate, PowerLevel, SquelchLevel,
+    StepSize, TuningMode, VoxDelay, VoxGain,
 };
 use kenwood_tmd750::{Band, Error, Radio};
 use kenwood_transport::Transport;
@@ -34,7 +36,9 @@ pub(crate) const HELP_LINES: &[&str] = &[
     "clear ADDRESS: Empty a stored channel; readback must answer N.",
     "bands [CTRL PTT]: Read or select the band roles (bands b a).",
     "display [dual|single]: Read or select the band display.",
-    "slot [1-6] | callsign 1-6: Select the MY slot; read one slot.",
+    "slot [1-6]: Read or select the MY callsign slot.",
+    "callsign 1-6 [CALL [MEMO]|none]: Read, store or clear one MY slot.",
+    "aprs-callsign [CALL[-SSID]]: Read or store the APRS My Callsign.",
     "backlight [0-3]: Read or select the panel lighting value.",
     "position [gps|1-5]: Read or select the APRS position source.",
     "data-rate [1200|9600]: Read or select the packet data speed.",
@@ -64,6 +68,7 @@ pub(crate) enum Read {
     CurrentChannel(Band),
     Memory(MemoryChannelAddress),
     Callsign(DstarSlot),
+    AprsCallsign,
     Bands,
     Display,
     Slot,
@@ -79,7 +84,7 @@ pub(crate) enum Read {
 }
 
 /// A setting change verified by echo and readback.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Write {
     Frequency(Band, Frequency),
     Power(Band, PowerLevel),
@@ -94,7 +99,7 @@ pub(crate) enum Write {
     ClearMemory(MemoryChannelAddress),
     Bands(BandControl),
     Display(BandDisplay),
-    Slot(DstarSlot),
+    Callsign(CallsignWrite),
     Backlight(BacklightControl),
     Position(MyPositionSelection),
     DataRate(PacketDataRate),
@@ -106,8 +111,21 @@ pub(crate) enum Write {
     Bluetooth(bool),
 }
 
+/// A MY callsign slot or APRS callsign change verified by echo and readback.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CallsignWrite {
+    /// Select the transmitted MY slot (`DS`).
+    SelectSlot(DstarSlot),
+    /// Store one MY slot's callsign and memo (`DC`).
+    Store(DstarCallsignEntry),
+    /// Clear one MY slot (`DC slot,,`).
+    Clear(DstarSlot),
+    /// Store the APRS My Callsign (`CS`).
+    Aprs(AprsCallsign),
+}
+
 /// A parsed word of this vocabulary.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Parsed {
     Read(Read),
     Write(Write),
@@ -127,15 +145,54 @@ impl std::error::Error for ParseError {}
 
 type WordResult = Option<Result<Parsed, String>>;
 
-/// Parse lowercase words; `None` when the first word is not in this vocabulary.
+/// Parse words as typed; `None` when the first word is not in this vocabulary.
+///
+/// Keywords and setting values match in any letter case. Callsign and memo
+/// text reach the library exactly as typed, so the radio's own validation and
+/// echo decide what it stores.
 pub(crate) fn parse(words: &[&str]) -> Option<Result<Parsed, ParseError>> {
     let [word, rest @ ..] = words else {
         return None;
     };
-    let result = parse_band_word(word, rest)
-        .or_else(|| parse_setting_word(word, rest))
-        .or_else(|| parse_auxiliary_word(word, rest))?;
+    let word = word.to_ascii_lowercase();
+    let lowercase: Vec<String> = rest
+        .iter()
+        .map(|value| value.to_ascii_lowercase())
+        .collect();
+    let lowercase: Vec<&str> = lowercase.iter().map(String::as_str).collect();
+    let result = parse_callsign_word(&word, rest)
+        .or_else(|| parse_band_word(&word, &lowercase))
+        .or_else(|| parse_setting_word(&word, &lowercase))
+        .or_else(|| parse_auxiliary_word(&word, &lowercase))?;
     Some(result.map_err(ParseError))
+}
+
+/// Words whose values are callsign text, taken in the exact case typed.
+fn parse_callsign_word(word: &str, rest: &[&str]) -> WordResult {
+    let result = match word {
+        "callsign" => match rest {
+            [slot] => parse_slot(slot).map(|slot| Parsed::Read(Read::Callsign(slot))),
+            [slot, value] if value.eq_ignore_ascii_case("none") => parse_slot(slot)
+                .map(|slot| Parsed::Write(Write::Callsign(CallsignWrite::Clear(slot)))),
+            [slot, callsign, memo @ ..] if memo.len() <= 1 => parse_slot(slot).and_then(|slot| {
+                DstarCallsignEntry::new(slot, callsign, memo.first().copied().unwrap_or_default())
+                    .map(|entry| Parsed::Write(Write::Callsign(CallsignWrite::Store(entry))))
+                    .map_err(|error| error.to_string())
+            }),
+            _ => Err(
+                "callsign takes a slot 1 through 6, then optionally CALL [MEMO] or none".to_owned(),
+            ),
+        },
+        "aprs-callsign" => match rest {
+            [] => Ok(Parsed::Read(Read::AprsCallsign)),
+            [callsign] => AprsCallsign::new(callsign)
+                .map(|callsign| Parsed::Write(Write::Callsign(CallsignWrite::Aprs(callsign))))
+                .map_err(|error| error.to_string()),
+            _ => Err("aprs-callsign takes no argument or one CALL[-SSID]".to_owned()),
+        },
+        _ => return None,
+    };
+    Some(result)
 }
 
 /// Words whose setting is indexed by a band.
@@ -230,10 +287,6 @@ fn parse_setting_word(word: &str, rest: &[&str]) -> WordResult {
             };
             Ok(Write::AmHighCut(cut))
         }),
-        "callsign" => match rest {
-            [slot] => parse_slot(slot).map(|slot| Parsed::Read(Read::Callsign(slot))),
-            _ => Err("callsign takes exactly one slot number, 1 through 6".to_owned()),
-        },
         "bands" => match rest {
             [] => Ok(Parsed::Read(Read::Bands)),
             [control, ptt] => match (parse_band(control), parse_band(ptt)) {
@@ -249,7 +302,9 @@ fn parse_setting_word(word: &str, rest: &[&str]) -> WordResult {
             "single" => Ok(Write::Display(BandDisplay::Single)),
             other => Err(format!("display must be dual or single, not {other:?}")),
         }),
-        "slot" => global(rest, Read::Slot, |value| parse_slot(value).map(Write::Slot)),
+        "slot" => global(rest, Read::Slot, |value| {
+            parse_slot(value).map(|slot| Write::Callsign(CallsignWrite::SelectSlot(slot)))
+        }),
         "backlight" => global(rest, Read::Backlight, |value| {
             parse_u8(value, "backlight value")
                 .and_then(|raw| BacklightControl::new(raw).map_err(|error| error.to_string()))
@@ -522,6 +577,7 @@ pub(crate) async fn execute_read<T: Transport>(
             None => format!("Memory {address}: empty."),
         },
         Read::Callsign(slot) => format!("Callsign {}.", radio.get_dstar_callsign(slot).await?),
+        Read::AprsCallsign => format!("APRS callsign: {}.", radio.get_aprs_callsign().await?),
         Read::Bands => format!("Band roles: {}.", radio.get_band_control().await?),
         Read::Display => format!("Display: {}.", radio.get_band_display().await?),
         Read::Slot => format!("Selected callsign slot: {}.", radio.get_dstar_slot().await?),
@@ -550,12 +606,14 @@ pub(crate) async fn execute_read<T: Transport>(
     Ok(())
 }
 
+/// Suffix of every printed setting whose echo and readback matched.
+const VERIFIED: &str = "(write and readback verified)";
+
 /// Run one verified write and print the confirmed setting.
 pub(crate) async fn execute_write<T: Transport>(
     radio: &mut Radio<T>,
     write: Write,
 ) -> Result<(), Error> {
-    const VERIFIED: &str = "(write and readback verified)";
     let text = match write {
         Write::Frequency(band, frequency) => {
             radio.set_frequency(band, frequency).await?;
@@ -610,10 +668,7 @@ pub(crate) async fn execute_write<T: Transport>(
             radio.set_band_display(display).await?;
             format!("Display: {display} {VERIFIED}.")
         }
-        Write::Slot(slot) => {
-            radio.set_dstar_slot(slot).await?;
-            format!("Selected callsign slot: {slot} {VERIFIED}.")
-        }
+        Write::Callsign(write) => execute_callsign_write(radio, write).await?,
         Write::Backlight(control) => {
             radio.set_backlight_control(control).await?;
             format!("Backlight value: {control} {VERIFIED}.")
@@ -653,6 +708,31 @@ pub(crate) async fn execute_write<T: Transport>(
     };
     output::line(format_args!("{text}"));
     Ok(())
+}
+
+/// Run one verified MY slot or APRS callsign write and return the confirmed text.
+async fn execute_callsign_write<T: Transport>(
+    radio: &mut Radio<T>,
+    write: CallsignWrite,
+) -> Result<String, Error> {
+    Ok(match write {
+        CallsignWrite::SelectSlot(slot) => {
+            radio.set_dstar_slot(slot).await?;
+            format!("Selected callsign slot: {slot} {VERIFIED}.")
+        }
+        CallsignWrite::Store(entry) => {
+            radio.set_dstar_callsign(&entry).await?;
+            format!("Callsign {entry} {VERIFIED}.")
+        }
+        CallsignWrite::Clear(slot) => {
+            radio.clear_dstar_callsign(slot).await?;
+            format!("Callsign {slot} unset {VERIFIED}.")
+        }
+        CallsignWrite::Aprs(callsign) => {
+            radio.set_aprs_callsign(&callsign).await?;
+            format!("APRS callsign: {callsign} {VERIFIED}.")
+        }
+    })
 }
 
 const fn switch(enabled: bool) -> &'static str {
@@ -766,7 +846,9 @@ mod tests {
         );
         assert_eq!(
             parsed("slot 2")?,
-            Parsed::Write(Write::Slot(DstarSlot::new(2)?))
+            Parsed::Write(Write::Callsign(CallsignWrite::SelectSlot(DstarSlot::new(
+                2
+            )?)))
         );
         assert_eq!(
             parsed("backlight 0")?,
@@ -817,8 +899,82 @@ mod tests {
     }
 
     #[test]
+    fn callsign_text_keeps_its_typed_case_while_keywords_match_in_any_case() -> TestResult {
+        let slot = DstarSlot::new(1)?;
+        assert_eq!(
+            parsed("callsign 1 KQ4NIT TEST")?,
+            Parsed::Write(Write::Callsign(CallsignWrite::Store(
+                DstarCallsignEntry::new(slot, "KQ4NIT", "TEST")?
+            )))
+        );
+        assert_eq!(
+            parsed("CALLSIGN 1 kq4nit")?,
+            Parsed::Write(Write::Callsign(CallsignWrite::Store(
+                DstarCallsignEntry::new(slot, "kq4nit", "")?
+            ))),
+            "the keyword matches in any case and the callsign keeps its case"
+        );
+        assert_eq!(
+            parsed("callsign 1 None")?,
+            Parsed::Write(Write::Callsign(CallsignWrite::Clear(slot)))
+        );
+        assert_eq!(
+            parsed("Callsign 6")?,
+            Parsed::Read(Read::Callsign(DstarSlot::new(6)?))
+        );
+        assert_eq!(parsed("aprs-callsign")?, Parsed::Read(Read::AprsCallsign));
+        assert_eq!(
+            parsed("APRS-CALLSIGN KQ4NIT-9")?,
+            Parsed::Write(Write::Callsign(CallsignWrite::Aprs(AprsCallsign::new(
+                "KQ4NIT-9"
+            )?)))
+        );
+        assert_eq!(
+            parsed("POWER B LOW")?,
+            Parsed::Write(Write::Power(Band::B, PowerLevel::Low)),
+            "setting values still match in any case"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn callsign_writes_send_the_typed_text_and_verify_the_readback() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"ID\r", b"ID TM-D750\r");
+        mock.expect(b"FV\r", b"FV 1.02\r");
+        mock.expect(b"TY\r", b"TY K,2,1\r");
+        mock.expect(b"DC 1,KQ4NIT,TEST\r", b"DC 1,KQ4NIT,TEST\r");
+        mock.expect(b"DC 1\r", b"DC 1,KQ4NIT,TEST\r");
+        mock.expect(b"DC 1,,\r", b"DC 1,,\r");
+        mock.expect(b"DC 1\r", b"DC 1,,\r");
+        mock.expect(b"CS KQ4NIT-9\r", b"CS KQ4NIT-9\r");
+        mock.expect(b"CS\r", b"CS KQ4NIT-9\r");
+        let mut radio = Radio::new(mock);
+        for line in [
+            "callsign 1 KQ4NIT TEST",
+            "callsign 1 none",
+            "aprs-callsign KQ4NIT-9",
+        ] {
+            let Parsed::Write(write) = parsed(line)? else {
+                return Err(format!("{line:?} is not a write").into());
+            };
+            execute_write(&mut radio, write).await?;
+        }
+        radio.into_transport().assert_complete();
+        Ok(())
+    }
+
+    #[test]
     fn out_of_domain_values_are_refused_before_any_io() {
         for line in [
+            "callsign 1 KQ4NIT TEST EXTRA",
+            "callsign 1 KQ4NIT1234",
+            "callsign 1 KQ4NIT TOOLONG",
+            "callsign 1 KQ4,NIT",
+            "callsign 7 KQ4NIT",
+            "aprs-callsign kq4nit",
+            "aprs-callsign KQ4NIT-16",
+            "aprs-callsign KQ4NIT A",
             "squelch 32",
             "power extra",
             "step 9",

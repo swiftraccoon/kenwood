@@ -253,7 +253,7 @@ fn no_op_and_unqualified_endpoint_fail_before_backup_access() -> TestResult {
     let candidate = request(Path::new("missing.json"), "", "KQ4NIT")?;
     for selected in [
         SerialCandidate {
-            pid: Some(0x9032),
+            pid: Some(0x0001),
             ..endpoint()
         },
         SerialCandidate {
@@ -269,7 +269,7 @@ fn no_op_and_unqualified_endpoint_fail_before_backup_access() -> TestResult {
         assert!(
             candidate
                 .prepare(&selected, DEFAULT_BAUD)
-                .is_err_and(|error| error.to_string().contains("main-unit USB")),
+                .is_err_and(|error| error.to_string().contains("TM-D750 USB")),
             "MY1 must reject an unqualified endpoint before opening the backup"
         );
     }
@@ -290,51 +290,57 @@ fn complete_backup_binds_both_pages_and_changes_only_the_eight_my1_bytes() -> Te
     save(&path, &document)?;
     let before = std::fs::read(&path)?;
     let candidate = request(&path, "", " KQ4NIT ")?;
-    let PreparedUpdate::My1(update) = candidate.prepare(&endpoint(), DEFAULT_BAUD)? else {
-        return Err("MY1 request prepared a different update kind".into());
-    };
-    assert_eq!(
-        update.page().address().as_u32(),
-        331_776,
-        "MY1 target page must remain fixed"
-    );
-    assert_eq!(
-        update.control_page_spec().address().as_u32(),
-        323_584,
-        "PM control page must remain fixed"
-    );
-    assert_eq!(
-        update.current_callsign(),
-        None,
-        "eight captured NUL bytes mean no current callsign"
-    );
-    assert_eq!(
-        update.desired_callsign().as_str(),
-        " KQ4NIT ",
-        "all eight desired bytes must survive preparation"
-    );
-    assert_eq!(
-        update.desired_page().get(8..16),
-        Some(b" KQ4NIT ".as_slice()),
-        "MY1 must contain exact requested storage bytes"
-    );
-    for (offset, (original, desired)) in update
-        .original_page()
-        .iter()
-        .zip(update.desired_page())
-        .enumerate()
-    {
-        assert!(
-            original == desired || (8..16).contains(&offset),
-            "unrelated target byte {offset} must not change"
-        );
-    }
-    for (offset, byte) in update.control_page().iter().copied().enumerate() {
+    for pid in [TMD750_MAIN_PID, TMD750_PANEL_PID] {
+        let selected = SerialCandidate {
+            pid: Some(pid),
+            ..endpoint()
+        };
+        let PreparedUpdate::My1(update) = candidate.prepare(&selected, DEFAULT_BAUD)? else {
+            return Err("MY1 request prepared a different update kind".into());
+        };
         assert_eq!(
-            byte,
-            if offset == 9 { 0 } else { 0x42 },
-            "control byte {offset} must be retained exactly"
+            update.page().address().as_u32(),
+            331_776,
+            "MY1 target page must remain fixed"
         );
+        assert_eq!(
+            update.control_page_spec().address().as_u32(),
+            323_584,
+            "PM control page must remain fixed"
+        );
+        assert_eq!(
+            update.current(),
+            None,
+            "eight captured NUL bytes mean no current callsign"
+        );
+        assert_eq!(
+            update.requested().map(My1Callsign::as_str),
+            Some(" KQ4NIT "),
+            "all eight desired bytes must survive preparation"
+        );
+        assert_eq!(
+            update.desired_page().get(8..16),
+            Some(b" KQ4NIT ".as_slice()),
+            "MY1 must contain exact requested storage bytes"
+        );
+        for (offset, (original, desired)) in update
+            .original_page()
+            .iter()
+            .zip(update.desired_page())
+            .enumerate()
+        {
+            assert!(
+                original == desired || (8..16).contains(&offset),
+                "unrelated target byte {offset} must not change"
+            );
+        }
+        for (offset, byte) in update.control_page().iter().copied().enumerate() {
+            assert_eq!(
+                byte,
+                if offset == 9 { 0 } else { 0x42 },
+                "control byte {offset} must be retained exactly"
+            );
+        }
     }
     assert_eq!(
         std::fs::read(&path)?,
@@ -364,7 +370,7 @@ fn existing_callsign_comparison_preserves_spaces_and_requires_exact_nul_padding(
         return Err("MY1 replacement prepared a different update kind".into());
     };
     assert_eq!(
-        update.current_callsign().map(My1Callsign::as_str),
+        update.current().map(My1Callsign::as_str),
         Some(" N0CALL "),
         "current spacing must not be normalized"
     );
@@ -380,6 +386,82 @@ fn existing_callsign_comparison_preserves_spaces_and_requires_exact_nul_padding(
             "expected {expected:?} must not match differently spaced storage"
         );
     }
+    Ok(())
+}
+
+fn clear_request(backup: &Path, expected: &str) -> Result<SetRequest, TestError> {
+    Ok(Arguments::try_parse_from([
+        "text-set".as_ref(),
+        "--backup".as_ref(),
+        backup.as_os_str(),
+        "--expect".as_ref(),
+        expected.as_ref(),
+        "--apply".as_ref(),
+        "--clear".as_ref(),
+        "dstar-my-callsign-1".as_ref(),
+    ])?
+    .request)
+}
+
+#[test]
+fn clear_writes_eight_nul_bytes_and_is_a_no_op_against_an_empty_field() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("backup.json");
+    let mut document = fixture()?;
+    let target = page_mut(&mut document, 331_776)?;
+    for (destination, byte) in target
+        .get_mut(8..16)
+        .ok_or("MY1 field")?
+        .iter_mut()
+        .zip(*b"KQ4NIT\0\0")
+    {
+        *destination = Value::from(byte);
+    }
+    save(&path, &document)?;
+    let cleared = clear_request(&path, "KQ4NIT")?;
+    assert!(
+        cleared.clear && cleared.value.is_none(),
+        "--clear replaces the new text"
+    );
+    let PreparedUpdate::My1(update) = cleared.prepare(&endpoint(), DEFAULT_BAUD)? else {
+        return Err("MY1 clear prepared a different update kind".into());
+    };
+    assert_eq!(
+        update.current().map(My1Callsign::as_str),
+        Some("KQ4NIT"),
+        "the expected text binds the captured field"
+    );
+    assert_eq!(
+        update.requested(),
+        None,
+        "a clear carries no requested callsign"
+    );
+    assert_eq!(
+        update.desired_page().get(8..16),
+        Some([0; 8].as_slice()),
+        "a clear stores eight NUL bytes"
+    );
+    assert!(
+        clear_request(&path, "")?
+            .validate_options()
+            .is_err_and(|error| error.to_string().contains("no MY1 change")),
+        "clearing an empty field is a no-op"
+    );
+    assert!(
+        Arguments::try_parse_from([
+            "text-set",
+            "--backup",
+            "missing.json",
+            "--expect",
+            "KQ4NIT",
+            "--apply",
+            "--clear",
+            "dstar-my-callsign-1",
+            "N0CALL",
+        ])
+        .is_err(),
+        "--clear and NEW_TEXT conflict"
+    );
     Ok(())
 }
 

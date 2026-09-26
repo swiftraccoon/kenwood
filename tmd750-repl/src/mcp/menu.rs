@@ -70,17 +70,27 @@ struct PreviewRequest {
     output: Option<PathBuf>,
 }
 
-/// Arguments of `mcp menu apply`: one field assignment plus its capture path.
+/// Arguments of `mcp menu apply`: one or more field assignments written in one
+/// session, plus the capture path.
 #[derive(Debug, Args)]
 pub(super) struct ApplyRequest {
     #[command(flatten)]
     selection: Selection,
-    /// Required. The new value stays on the radio; nothing is rolled back.
+    /// Required. The new values stay on the radio; nothing is rolled back.
     #[arg(long, required = true)]
     apply: bool,
     /// Exact scalar value, interpreted through the selected field's storage codec.
     #[arg(allow_hyphen_values = true)]
     value: String,
+    /// A further FIELD VALUE pair written in the same session; repeatable. Per-slot fields share --slot.
+    #[arg(
+        long,
+        num_args = 2,
+        value_names = ["FIELD", "VALUE"],
+        action = clap::ArgAction::Append,
+        allow_hyphen_values = true
+    )]
+    and: Vec<String>,
     /// New private capture directory; existing directories are never overwritten.
     #[arg(long, value_name = "NEW_DIR")]
     output: Option<PathBuf>,
@@ -111,31 +121,53 @@ impl ApplyRequest {
     }
 
     pub(super) fn validate_options(&self) -> AppResult<()> {
-        self.assignment().map(|_assignment| ())
+        self.assignments().map(|_assignments| ())
     }
 
-    fn assignment(&self) -> AppResult<MenuAssignment> {
+    /// Every assignment of the run: the positional pair, then each `--and`
+    /// pair. `--slot` binds every per-slot field and must be absent when no
+    /// field is per-slot; a global field never takes a slot.
+    fn assignments(&self) -> AppResult<Vec<MenuAssignment>> {
         if !self.apply {
             return Err(CommandError("mcp menu apply requires explicit --apply".to_owned()).into());
         }
-        Ok(MenuAssignment::new(
-            &self.selection.field,
-            self.selection.slot,
-            &self.value,
-        )?)
+        let pairs = std::iter::once((self.selection.field.as_str(), self.value.as_str())).chain(
+            self.and
+                .chunks_exact(2)
+                .filter_map(|pair| Some((pair.first()?.as_str(), pair.get(1)?.as_str()))),
+        );
+        let mut assignments = Vec::new();
+        let mut per_slot = false;
+        for (field, value) in pairs {
+            let slot = match menu_field(field) {
+                Some(registered) if registered.descriptor.is_per_slot() => {
+                    per_slot = true;
+                    self.selection.slot
+                }
+                _ => None,
+            };
+            assignments.push(MenuAssignment::new(field, slot, value)?);
+        }
+        if self.selection.slot.is_some() && !per_slot {
+            return Err(CommandError(
+                "--slot applies to per-slot fields; every field of this run is global".to_owned(),
+            )
+            .into());
+        }
+        Ok(assignments)
     }
 
     /// Build the update plan from the source backup, before any capture or USB work.
     ///
-    /// Returns an error when `--apply` is absent, the field or value is
-    /// unknown, or the backup was not produced over USB.
+    /// Returns an error when `--apply` is absent, a field or value is unknown,
+    /// a field repeats, or the backup was not produced over USB.
     pub(super) fn prepare(&self) -> AppResult<MenuUpdatePlan> {
-        let assignment = self.assignment()?;
+        let assignments = self.assignments()?;
         let snapshot = Snapshot::load_for_usb_write(self.source_backup())?;
         Ok(MenuUpdatePlan::new(
             &snapshot.identity,
             &snapshot.menu_snapshot()?,
-            vec![assignment],
+            assignments,
         )?)
     }
 }

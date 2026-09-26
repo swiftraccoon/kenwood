@@ -7,6 +7,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use kenwood_tmd750::radio::{
+    BLUETOOTH_EXIT_REPLY_BOUND, BLUETOOTH_FIRST_REPLY_TIMEOUT,
+    bluetooth_first_reply_timeout_after_exit,
+};
 use kenwood_tmd750::{DvGatewayMode, Identity};
 use kenwood_transport::Transport;
 use kenwood_transport::bluetooth::BluetoothService;
@@ -284,6 +288,7 @@ async fn run_workflow(
                         scope,
                         expected_identity: None,
                         expected_gateway: None,
+                        first_reply_timeout: BLUETOOTH_FIRST_REPLY_TIMEOUT,
                     },
                     cancelled,
                 )
@@ -295,6 +300,7 @@ async fn run_workflow(
             crate::mcp::fixed::read(
                 transport,
                 crate::mcp::fixed::Admission::GatewayOff,
+                Some(BLUETOOTH_FIRST_REPLY_TIMEOUT),
                 cancelled,
             )
             .await,
@@ -303,6 +309,9 @@ async fn run_workflow(
             PendingRead::Configuration(backup::read(transport, cancelled).await)
         }
     };
+    // The read returns right after any exit acknowledgment, so the time since
+    // this point never overstates the time since the exit.
+    let read_finished = tokio::time::Instant::now();
     if pending.ready_to_settle(cancelled) {
         if let Err(error) = settle(backend, &mut fresh, cancelled).await {
             result.settle_error = Some(Failure::from_error(&error));
@@ -334,6 +343,9 @@ async fn run_workflow(
                         scope: CatScope::Gateway,
                         expected_identity: Some(&identity),
                         expected_gateway: Some(DvGatewayMode::Off),
+                        first_reply_timeout: bluetooth_first_reply_timeout_after_exit(
+                            read_finished.elapsed(),
+                        ),
                     },
                     cancelled,
                 )
@@ -379,8 +391,10 @@ struct Report<'a> {
     maximum_original_open_attempts: u8,
     maximum_post_exit_open_attempts: u8,
     post_exit_settle_milliseconds: u128,
+    post_exit_reply_bound_milliseconds: u128,
     open_retry_delay_milliseconds: u128,
     open_budget_milliseconds: u128,
+    first_reply_timeout_milliseconds: u128,
     cat_exchange_timeout_milliseconds: u128,
     close_budget_milliseconds: u128,
     identity_assurance: &'static str,
@@ -403,9 +417,9 @@ impl<'a> Report<'a> {
     ) -> Self {
         Self {
             format_version: if matches!(operation, Operation::ConfigurationBackup) {
-                3
+                4
             } else {
-                2
+                3
             },
             operation,
             transport: "native_bluetooth",
@@ -426,8 +440,14 @@ impl<'a> Report<'a> {
             } else {
                 0
             },
+            post_exit_reply_bound_milliseconds: if operation.needs_recovery() {
+                BLUETOOTH_EXIT_REPLY_BOUND.as_millis()
+            } else {
+                0
+            },
             open_retry_delay_milliseconds: opening::RETRY_DELAY.as_millis(),
             open_budget_milliseconds: super::OPEN_BUDGET.as_millis(),
+            first_reply_timeout_milliseconds: BLUETOOTH_FIRST_REPLY_TIMEOUT.as_millis(),
             cat_exchange_timeout_milliseconds: cat::EXCHANGE_TIMEOUT.as_millis(),
             close_budget_milliseconds: super::CLOSE_BUDGET.as_millis(),
             identity_assurance: "exact_bluetooth_address_and_cat_tuple_not_physical_unit_continuity",

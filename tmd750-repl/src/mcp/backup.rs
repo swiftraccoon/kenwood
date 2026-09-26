@@ -288,7 +288,7 @@ pub(super) async fn run_workflow(
     backend: &mut impl Backend,
     endpoint: &SerialCandidate,
     baud: u32,
-    original: Recorder<File>,
+    mut original: Recorder<File>,
     post_exit: Recorder<File>,
     cancelled: &AtomicBool,
 ) -> WorkflowResult {
@@ -300,6 +300,15 @@ pub(super) async fn run_workflow(
         post_exit: ReadinessVerification::skipped(SkipReason::Cancelled, post_exit.summary()),
     };
     if cancelled.load(Ordering::Relaxed) {
+        return result;
+    }
+    if let Err(error) =
+        reconnect::settle_before_entry(backend, endpoint, &mut original, cancelled).await
+    {
+        result.open_error = Some(Failure::from_error(&error));
+        result.transcript = original.summary();
+        result.post_exit =
+            ReadinessVerification::skipped(SkipReason::OriginalOpenFailed, post_exit.summary());
         return result;
     }
     let transport = match backend.open(endpoint, baud) {

@@ -7,7 +7,9 @@
 
 mod readiness;
 
-pub(crate) use readiness::{ReadinessVerification, verify_readiness};
+pub(crate) use readiness::{
+    MAXIMUM_OPEN_ATTEMPTS, ReadinessVerification, verify_readiness, verify_readiness_gateway_off,
+};
 
 use std::fs::File;
 use std::future::Future;
@@ -20,7 +22,7 @@ use kenwood_transport::{Transport, TransportError};
 use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
 
-use super::reconnect_policy::{ReconnectDecision, classify};
+use super::reconnect_policy::{ReconnectDecision, ReconnectRejection, classify};
 use super::{CLOSE_TIMEOUT, Failure, IdentityEvidence, close_transport};
 use crate::capture::{CaptureTransport, Recorder, TranscriptSummary};
 
@@ -33,6 +35,55 @@ const SETTLE: Duration = Duration::from_secs(2);
 const ENUMERATION_BUDGET: Duration = Duration::from_secs(60);
 /// Interval between enumeration snapshots inside `ENUMERATION_BUDGET`.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// Continuous presence an endpoint must show before a further programming
+/// session opens on it (10 s).
+///
+/// Host policy sized from observation: on firmware 1.02 the operation-panel
+/// endpoint has re-enumerated once more within a few seconds of first
+/// answering `ID` after an MCP exit, and a handle opened before that drop
+/// failed with `ENXIO`.
+pub(super) const SETTLE_QUIET: Duration = Duration::from_secs(10);
+/// Interval between the enumeration snapshots of a settle wait (1 s).
+const SETTLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// Passive budget for a settle wait, measured from its start (60 s).
+const SETTLE_BUDGET: Duration = Duration::from_secs(60);
+
+/// Why an endpoint did not settle within the budget.
+#[derive(Debug)]
+pub(super) enum SettleFailure {
+    /// Cancellation was requested before the endpoint settled.
+    Cancelled,
+    /// The endpoint was not continuously present for `SETTLE_QUIET` within
+    /// `SETTLE_BUDGET`.
+    BudgetExhausted,
+    /// Fresh metadata no longer uniquely selects the endpoint.
+    EndpointRejected(ReconnectRejection),
+    /// Port enumeration failed.
+    Enumeration(TransportError),
+    /// The transcript could not record the wait.
+    Capture(std::io::Error),
+}
+
+impl std::fmt::Display for SettleFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => formatter.write_str("cancelled before the endpoint settled"),
+            Self::BudgetExhausted => write!(
+                formatter,
+                "endpoint was not continuously present for {} s within the {} s settle budget",
+                SETTLE_QUIET.as_secs(),
+                SETTLE_BUDGET.as_secs()
+            ),
+            Self::EndpointRejected(error) => {
+                write!(formatter, "endpoint selection failed: {error}")
+            }
+            Self::Enumeration(error) => write!(formatter, "port enumeration failed: {error}"),
+            Self::Capture(error) => write!(formatter, "transcript capture failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for SettleFailure {}
 
 /// True when `candidates` selects exactly `endpoint` without ambiguity.
 ///
@@ -347,6 +398,71 @@ impl PostExitVerification {
     }
 }
 
+/// The post-exit CAT check of one session: a single open within the
+/// enumeration budget, or the bounded silent-`ID` retry that the
+/// operation-panel endpoint needs because it answers `ID` only once its
+/// tuple is ready.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub(super) enum PostExit {
+    /// One open and one identity read, optionally followed by `GW`.
+    Single(PostExitVerification),
+    /// Up to six opens within the readiness budget.
+    Readiness(ReadinessVerification),
+}
+
+impl PostExit {
+    /// A single-open check that never started, naming `reason`.
+    pub(super) fn skipped(reason: SkipReason, transcript: TranscriptSummary) -> Self {
+        Self::Single(PostExitVerification::skipped(reason, transcript))
+    }
+
+    /// Replace the outcome with `Skipped { reason }`, keeping the variant.
+    pub(super) fn skip(&mut self, reason: SkipReason) {
+        match self {
+            Self::Single(verification) => {
+                verification.outcome = VerificationOutcome::Skipped { reason };
+            }
+            Self::Readiness(verification) => {
+                verification.outcome = VerificationOutcome::Skipped { reason };
+            }
+        }
+    }
+
+    /// True when the outcome is `Matched` and the transcript is complete.
+    pub(super) const fn succeeded(&self) -> bool {
+        match self {
+            Self::Single(verification) => verification.succeeded(),
+            Self::Readiness(verification) => verification.succeeded(),
+        }
+    }
+
+    /// Identity and Gateway mode read by a check that required Gateway Off.
+    pub(super) fn gateway_off_evidence(&self) -> Option<(&Identity, DvGatewayMode)> {
+        match self {
+            Self::Single(verification) => verification.gateway_off_evidence(),
+            Self::Readiness(verification) => verification.gateway_off_evidence(),
+        }
+    }
+
+    /// Final outcome of the check.
+    pub(super) const fn outcome(&self) -> &VerificationOutcome {
+        match self {
+            Self::Single(verification) => &verification.outcome,
+            Self::Readiness(verification) => &verification.outcome,
+        }
+    }
+
+    /// Summary of the transcript reserved for the check.
+    #[cfg(all(test, unix))]
+    pub(super) const fn transcript(&self) -> &TranscriptSummary {
+        match self {
+            Self::Single(verification) => &verification.transcript,
+            Self::Readiness(verification) => &verification.transcript,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum LifecycleEvent<'a> {
@@ -359,6 +475,7 @@ enum LifecycleEvent<'a> {
     OpenRequested { path: &'a str, baud: u32 },
     OpenCompleted,
     OpenFailed { error: Failure },
+    EndpointSettled { quiet_milliseconds: u64 },
 }
 
 fn milliseconds(duration: Duration) -> u64 {
@@ -622,6 +739,93 @@ async fn await_endpoint(
     }
 }
 
+/// Wait for the operation-panel endpoint to settle before an MCP entry.
+///
+/// About ten seconds after a programming exit, once it first answers `ID`,
+/// the operation-panel endpoint re-enumerates once more, and an entry command
+/// sent at that moment fails with `ENXIO`. This waits through
+/// [`await_settled_endpoint`] on that endpoint and returns at once on the
+/// main-unit endpoint, which re-enumerates before it answers.
+///
+/// # Errors
+///
+/// The failures of [`await_settled_endpoint`].
+pub(super) async fn settle_before_entry(
+    backend: &mut impl Backend,
+    endpoint: &SerialCandidate,
+    recorder: &mut Recorder<File>,
+    cancelled: &AtomicBool,
+) -> Result<(), SettleFailure> {
+    if endpoint.pid == Some(kenwood_tmd750::transport::TMD750_PANEL_PID) {
+        await_settled_endpoint(backend, endpoint, recorder, cancelled).await
+    } else {
+        Ok(())
+    }
+}
+
+/// Wait until `endpoint` has been enumerated continuously for `SETTLE_QUIET`.
+///
+/// Polls enumeration every `SETTLE_POLL_INTERVAL` and records every snapshot
+/// and wait in `recorder`. An absent endpoint restarts the quiet period; a
+/// snapshot that no longer uniquely selects the endpoint, an enumeration
+/// failure, cancellation, an incomplete transcript or the `SETTLE_BUDGET`
+/// expiring ends the wait with the corresponding [`SettleFailure`]. Nothing
+/// is opened.
+pub(super) async fn await_settled_endpoint(
+    backend: &mut impl Backend,
+    endpoint: &SerialCandidate,
+    recorder: &mut Recorder<File>,
+    cancelled: &AtomicBool,
+) -> Result<(), SettleFailure> {
+    let started = backend.now();
+    let mut present_since = None;
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(SettleFailure::Cancelled);
+        }
+        let now = backend.now();
+        if now.saturating_sub(started) >= SETTLE_BUDGET {
+            return Err(SettleFailure::BudgetExhausted);
+        }
+        recorder.record(LifecycleEvent::EnumerationRequested);
+        recorder.ensure_complete().map_err(SettleFailure::Capture)?;
+        let candidates = match backend.enumerate() {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                recorder.record(LifecycleEvent::EnumerationFailed {
+                    error: Failure::from_error(&error),
+                });
+                return Err(SettleFailure::Enumeration(error));
+            }
+        };
+        let observed = observed_candidates(endpoint, &candidates);
+        recorder.record(LifecycleEvent::EnumerationCompleted {
+            candidates: &observed,
+        });
+        recorder.ensure_complete().map_err(SettleFailure::Capture)?;
+        match classify(endpoint, &candidates) {
+            ReconnectDecision::Ready(_) => {
+                let since = *present_since.get_or_insert(now);
+                if now.saturating_sub(since) >= SETTLE_QUIET {
+                    recorder.record(LifecycleEvent::EndpointSettled {
+                        quiet_milliseconds: milliseconds(SETTLE_QUIET),
+                    });
+                    recorder.ensure_complete().map_err(SettleFailure::Capture)?;
+                    return Ok(());
+                }
+            }
+            ReconnectDecision::AwaitingEndpoint => present_since = None,
+            ReconnectDecision::Rejected(error) => {
+                recorder.record(LifecycleEvent::EndpointRejected {
+                    error: Failure::from_error(&error),
+                });
+                return Err(SettleFailure::EndpointRejected(error));
+            }
+        }
+        wait_recorded(backend, recorder, SETTLE_POLL_INTERVAL).await;
+    }
+}
+
 /// One completed open attempt.
 ///
 /// Carries its recorder and whether the identity query timed out without the
@@ -754,7 +958,7 @@ async fn observe_identity(
     now: Duration,
 ) -> IdentityObservation {
     if let Some(deadline) = context.dispatch_deadline {
-        if !readiness::can_dispatch(now, deadline) {
+        if !readiness::can_dispatch(now, deadline, context.goal) {
             readiness::budget_exhausted(report);
             return IdentityObservation::Failed;
         }

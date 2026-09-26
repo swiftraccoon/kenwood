@@ -17,6 +17,7 @@ use kenwood_tmd750::{
 use kenwood_transport::bluetooth::{BluetoothAddress, RfcommChannel};
 use serde::Deserialize;
 
+use super::reconnect::MAXIMUM_OPEN_ATTEMPTS;
 use super::reconnect_policy::{ReconnectDecision, classify};
 use super::{IdentityEvidence, SegmentEvidence};
 use crate::{AppResult, CommandError};
@@ -282,7 +283,8 @@ impl ReadinessVerification {
                 < u128::from(self.exchange_timeout_milliseconds) * 6
                     + super::CLOSE_TIMEOUT.as_millis()
             || self.attempt_allowance_milliseconds > self.readiness_budget_milliseconds
-            || self.maximum_open_attempts != 4
+            || self.maximum_open_attempts == 0
+            || self.maximum_open_attempts > MAXIMUM_OPEN_ATTEMPTS
             || self.attempts.len() > self.maximum_open_attempts
             || !self.transcript.succeeded()
             || !matches!(self.outcome, MatchedOutcome::Matched)
@@ -1235,16 +1237,18 @@ pub(super) mod tests {
         Ok(())
     }
 
-    #[test]
-    fn attempt_cap_and_required_fields_are_not_inferred_from_a_match() -> TestResult {
-        let mut document = retry_fixture()?;
+    /// Prepend `count` copies of the fixture's silent attempt, space every
+    /// attempt 3,500 ms apart and set the total elapsed time to match.
+    fn prepend_silent_attempts(document: &mut serde_json::Value, count: usize) -> TestResult {
         let attempts = document
             .pointer_mut("/post_exit_verification/attempts")
             .and_then(serde_json::Value::as_array_mut)
             .ok_or("attempts missing")?;
         let silent = attempts.first().ok_or("silent attempt missing")?.clone();
-        attempts.insert(0, silent.clone());
-        attempts.insert(0, silent.clone());
+        for _ in 0..count {
+            attempts.insert(0, silent.clone());
+        }
+        let last = attempts.len().saturating_sub(1);
         for (index, attempt) in attempts.iter_mut().enumerate() {
             replace(
                 attempt,
@@ -1253,28 +1257,47 @@ pub(super) mod tests {
             )?;
         }
         replace(
-            &mut document,
+            document,
             "/post_exit_verification/elapsed_milliseconds",
-            serde_json::json!(14_000),
-        )?;
+            serde_json::json!(last * 3500),
+        )
+    }
+
+    #[test]
+    fn attempt_count_is_bounded_by_the_reported_cap_within_the_policy() -> TestResult {
+        let mut document = retry_fixture()?;
+        prepend_silent_attempts(&mut document, 2)?;
         assert!(
             from_json(document.clone()).is_ok(),
-            "four attempts are admitted"
+            "four attempts are admitted under a cap of four"
         );
-        document
-            .pointer_mut("/post_exit_verification/attempts")
-            .and_then(serde_json::Value::as_array_mut)
-            .ok_or("attempts missing")?
-            .insert(0, silent);
+        prepend_silent_attempts(&mut document, 1)?;
         assert!(
-            from_json(document).is_err(),
-            "a fifth attempt is not admitted"
+            from_json(document.clone()).is_err(),
+            "a fifth attempt is not admitted under a cap of four"
         );
+        replace(
+            &mut document,
+            "/post_exit_verification/maximum_open_attempts",
+            serde_json::json!(MAXIMUM_OPEN_ATTEMPTS),
+        )?;
+        assert!(
+            from_json(document).is_ok(),
+            "a fifth attempt is admitted under the current cap"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn required_policy_fields_are_not_inferred_from_a_match() -> TestResult {
         for (pointer, value) in [
             ("/attempts", serde_json::json!([])),
             ("/attempts", serde_json::Value::Null),
             ("/attempts/0", serde_json::Value::Null),
-            ("/maximum_open_attempts", serde_json::json!(5)),
+            (
+                "/maximum_open_attempts",
+                serde_json::json!(MAXIMUM_OPEN_ATTEMPTS + 1),
+            ),
             ("/maximum_open_attempts", serde_json::json!(0)),
             ("/attempt_allowance_milliseconds", serde_json::json!(10_000)),
             ("/attempt_allowance_milliseconds", serde_json::json!(60_001)),

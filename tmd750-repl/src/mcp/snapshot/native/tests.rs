@@ -1,5 +1,5 @@
-//! Tests for decoding format-3 native backup reports and for their rejection
-//! by `Snapshot::load_for_usb_write`.
+//! Tests for decoding format-3 and format-4 native backup reports and for
+//! their rejection by `Snapshot::load_for_usb_write`.
 
 use serde_json::{Value, json};
 
@@ -77,6 +77,58 @@ fn remove(document: &mut Value, path: &str) -> TestResult {
 
 fn load(document: &Value) -> AppResult<Snapshot> {
     read_document(serde_json::to_vec(document)?.as_slice())?.into_snapshot()
+}
+
+/// The fixture as a report of `format` carrying `exit_bound` as its post-exit
+/// reply bound and `first_reply` as its first-reply deadline.
+fn with_reply_deadlines(format: u8, exit_bound: Value, first_reply: Value) -> AppResult<Value> {
+    let mut document = fixture()?;
+    replace(&mut document, "/format_version", json!(format))?;
+    let fields = document.as_object_mut().ok_or("fixture is not an object")?;
+    let _previous = fields.insert("post_exit_reply_bound_milliseconds".to_owned(), exit_bound);
+    let _previous = fields.insert("first_reply_timeout_milliseconds".to_owned(), first_reply);
+    Ok(document)
+}
+
+#[test]
+fn format_four_requires_both_reply_deadlines_and_format_three_has_neither() -> TestResult {
+    let snapshot = load(&with_reply_deadlines(4, json!(30_000), json!(10_000))?)?;
+    assert_eq!(snapshot.identity.firmware.as_str(), "1.02");
+    for (exit_bound, first_reply) in [
+        (json!(29_999), json!(10_000)),
+        (json!(30_001), json!(10_000)),
+        (Value::Null, json!(10_000)),
+        (json!(30_000), json!(9_999)),
+        (json!(30_000), json!(10_001)),
+        (json!(30_000), Value::Null),
+    ] {
+        assert!(
+            load(&with_reply_deadlines(
+                4,
+                exit_bound.clone(),
+                first_reply.clone()
+            )?)
+            .is_err(),
+            "admitted format 4 with exit bound {exit_bound} and first reply {first_reply}"
+        );
+    }
+    for (exit_bound, first_reply) in [
+        (json!(30_000), json!(10_000)),
+        (json!(30_000), Value::Null),
+        (Value::Null, json!(10_000)),
+    ] {
+        assert!(
+            load(&with_reply_deadlines(
+                3,
+                exit_bound.clone(),
+                first_reply.clone()
+            )?)
+            .is_err(),
+            "admitted format 3 with exit bound {exit_bound} and first reply {first_reply}"
+        );
+    }
+    let _format_three = load(&fixture()?)?;
+    Ok(())
 }
 
 #[test]

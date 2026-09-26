@@ -8,7 +8,7 @@ use std::error::Error as StdError;
 use std::sync::Mutex;
 
 use kenwood_tmd750::protocol::mcp::{ACK, read_request, write_request};
-use kenwood_tmd750::transport::{KENWOOD_VID, TMD750_MAIN_PID};
+use kenwood_tmd750::transport::{KENWOOD_VID, TMD750_MAIN_PID, TMD750_PANEL_PID};
 use kenwood_tmd750::{Address, McpBackupReport, Page};
 use kenwood_transport::{MockTransport, TransportError};
 use reconnect::{VerificationOutcome, VerificationStage};
@@ -182,6 +182,14 @@ fn endpoint() -> SerialCandidate {
     }
 }
 
+fn panel_endpoint() -> SerialCandidate {
+    SerialCandidate {
+        path: "/dev/cu.selected-panel".to_owned(),
+        vid: Some(KENWOOD_VID),
+        pid: Some(TMD750_PANEL_PID),
+    }
+}
+
 fn identity(mock: &mut MockTransport, firmware: &[u8]) {
     mock.expect(b"ID\r", b"ID TM-D750\r");
     mock.expect(b"FV\r", firmware);
@@ -289,13 +297,20 @@ impl Harness {
     async fn run_backup(
         &mut self,
     ) -> Result<backup::WorkflowResult, Box<dyn StdError + Send + Sync>> {
+        self.run_backup_on(&endpoint()).await
+    }
+
+    async fn run_backup_on(
+        &mut self,
+        selected: &SerialCandidate,
+    ) -> Result<backup::WorkflowResult, Box<dyn StdError + Send + Sync>> {
         let captures = self
             .captures
             .take()
             .ok_or("workflow capture already consumed")?;
         Ok(backup::run_workflow(
             &mut self.backend,
-            &endpoint(),
+            selected,
             9_600,
             captures.original,
             captures.post_exit,
@@ -341,13 +356,20 @@ impl Harness {
     }
 
     async fn run(&mut self) -> Result<WorkflowResult, Box<dyn StdError + Send + Sync>> {
+        self.run_on(&endpoint()).await
+    }
+
+    async fn run_on(
+        &mut self,
+        selected: &SerialCandidate,
+    ) -> Result<WorkflowResult, Box<dyn StdError + Send + Sync>> {
         let captures = self
             .captures
             .take()
             .ok_or("workflow capture already consumed")?;
         Ok(run_workflow(
             &mut self.backend,
-            &endpoint(),
+            selected,
             9_600,
             captures,
             &self.cancelled,
@@ -400,6 +422,46 @@ async fn backup_reads_complete_scope_then_retires_handle_before_fresh_cat() -> T
             .iter()
             .all(|bytes| !matches!(bytes.first(), Some(b'W' | b'Z'))),
         "backup must never write or fill memory"
+    );
+    assert_eq!(
+        position(&observed, &Observation::Open(0, endpoint().path, 9_600))?,
+        0,
+        "the main-unit endpoint opens without a settle wait"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn panel_endpoint_backup_enters_only_after_the_endpoint_settled() -> TestResult {
+    let mut harness = Harness::new(backup_script(), fresh_script(b"FV 1.02\r"))?;
+    harness.backend.last_snapshot = vec![panel_endpoint()];
+    let result = harness.run_backup_on(&panel_endpoint()).await?;
+    assert!(result.succeeded(), "{result:?}");
+    let observed = observations(&harness.log)?;
+    let opened = position(
+        &observed,
+        &Observation::Open(0, panel_endpoint().path, 9_600),
+    )?;
+    let before = observed.get(..opened).ok_or("open position")?;
+    assert_eq!(
+        before
+            .iter()
+            .filter(|observation| **observation == Observation::Wait(Duration::from_secs(1)))
+            .count(),
+        10,
+        "the entry waits ten one-second polls of continuous enumeration"
+    );
+    assert!(
+        before
+            .iter()
+            .filter(|observation| **observation == Observation::Enumerate)
+            .count()
+            > 10,
+        "every poll enumerates the endpoint"
+    );
+    assert!(
+        result.transcript.complete,
+        "the settle wait is recorded in the session transcript"
     );
     Ok(())
 }
@@ -586,7 +648,7 @@ async fn backup_silent_id_exhaustion_retains_complete_reads_without_reentering_m
     let mut first = MockTransport::new();
     first.expect_hang(b"ID\r");
     let mut harness = Harness::new(backup_script(), first)?;
-    for id in 2..=4 {
+    for id in 2..=6 {
         let mut silent = MockTransport::new();
         silent.expect_hang(b"ID\r");
         harness
@@ -613,9 +675,9 @@ async fn backup_silent_id_exhaustion_retains_complete_reads_without_reentering_m
             ..
         }
     ));
-    assert_eq!(harness.backend.opens, 5, "one MCP and four CAT handles");
+    assert_eq!(harness.backend.opens, 7, "one MCP and six CAT handles");
     let observed = observations(&harness.log)?;
-    for id in 1..=4 {
+    for id in 1..=6 {
         assert_eq!(writes(&observed, id), vec![b"ID\r".to_vec()]);
         assert!(
             position(&observed, &Observation::Close(id))?
@@ -693,6 +755,37 @@ async fn success_retires_original_before_one_fresh_identity_and_close() -> TestR
             < position(&observed, &Observation::Dropped(1))?
     );
     assert!(succeeded(result));
+    Ok(())
+}
+
+#[tokio::test]
+async fn panel_endpoint_probe_enters_only_after_the_endpoint_settled() -> TestResult {
+    let mut harness = Harness::new(original_script()?, fresh_script(b"FV 1.02\r"))?;
+    harness.backend.last_snapshot = vec![panel_endpoint()];
+    let result = harness.run_on(&panel_endpoint()).await?;
+    assert!(
+        result.post_exit.succeeded(),
+        "the probe and its fresh identity check complete after the settle wait"
+    );
+    let observed = observations(&harness.log)?;
+    let opened = position(
+        &observed,
+        &Observation::Open(0, panel_endpoint().path, 9_600),
+    )?;
+    let before = observed.get(..opened).ok_or("open position")?;
+    assert_eq!(
+        before
+            .iter()
+            .filter(|observation| **observation == Observation::Wait(Duration::from_secs(1)))
+            .count(),
+        10,
+        "the entry waits ten one-second polls of continuous enumeration"
+    );
+    assert_eq!(writes(&observed, 0), expected_original_writes());
+    assert!(
+        result.transcript.complete,
+        "the settle wait is recorded in the session transcript"
+    );
     Ok(())
 }
 

@@ -53,6 +53,8 @@ rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 tempfile = "3"
+# Paused-clock tests of the Bluetooth post-exit reply deadline.
+tokio = { version = "1", features = ["test-util"] }
 
 [lints]
 workspace = true

@@ -736,7 +736,7 @@ fn print_help() {
         "Probe/backup capture MCP reads and verify exit; text list/show/preview and terminal preflight inspect local backups."
     ));
     output::line(format_args!(
-        "Text set changes PM1's name, PM-Off MY1 or one channel's name (--channel), with an explicit port, current backup, expected text, and --apply. Configurable MY1 remains untested on hardware."
+        "Text set changes PM1's name, PM-Off MY1 or one channel's name (--channel), with an explicit port, current backup, expected text, and --apply."
     ));
     output::line(format_args!(
         "PM1 trial performs one fixed PM1 rename and restores the original name; no other field is writable."
@@ -754,17 +754,15 @@ fn print_terminal_information() {
 }
 
 fn parse_command(line: &str) -> Result<Option<Command>, CommandError> {
-    let lowercase: Vec<String> = line
-        .split_ascii_whitespace()
-        .map(str::to_ascii_lowercase)
-        .collect();
-    let words: Vec<&str> = lowercase.iter().map(String::as_str).collect();
-    if let Some(parsed) = cat::parse(&words) {
+    let typed: Vec<&str> = line.split_ascii_whitespace().collect();
+    if let Some(parsed) = cat::parse(&typed) {
         return match parsed.map_err(|error| CommandError(error.0))? {
             cat::Parsed::Read(read) => Ok(Some(Command::Read(read))),
             cat::Parsed::Write(write) => Ok(Some(Command::Write(write))),
         };
     }
+    let lowercase: Vec<String> = typed.iter().map(|word| word.to_ascii_lowercase()).collect();
+    let words: Vec<&str> = lowercase.iter().map(String::as_str).collect();
     let command = match words.as_slice() {
         [] => return Ok(None),
         ["help" | "?"] => Command::Help,

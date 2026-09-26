@@ -8,8 +8,8 @@ use std::num::NonZeroU64;
 use std::os::unix::fs::PermissionsExt;
 
 use kenwood_tmd750::memory::{
-    My1Callsign, My1CallsignUpdate, My1CallsignUpdateEvent, My1CallsignUpdateStatus, Pm1Name,
-    Pm1NameUpdate,
+    My1Callsign, My1CallsignUpdate, Pm1Name, Pm1NameUpdate, PmOffGatewayFinal, PmOffGatewayFresh,
+    TextFieldUpdateEvent, TextFieldUpdateStatus,
 };
 use kenwood_tmd750::types::{DvGatewayMode, FirmwareIdentity, RadioModel, RadioType};
 use serde_json::Value;
@@ -65,7 +65,7 @@ fn update() -> Result<My1CallsignUpdate, Box<dyn std::error::Error>> {
         &page,
         &control,
         None,
-        &My1Callsign::new("KQ4NIT")?,
+        Some(&My1Callsign::new("KQ4NIT")?),
     )?)
 }
 
@@ -81,31 +81,35 @@ fn fresh(update: &mut My1CallsignUpdate, session: u64) -> TestResult {
     } else {
         *update.desired_page()
     };
-    update.record(My1CallsignUpdateEvent::FreshSession {
+    update.record(TextFieldUpdateEvent::FreshSession {
         id: id(session)?,
         identity: &identity,
         memory_format: 0,
-        gateway_mode: DvGatewayMode::Off,
-        control_page: &control,
         whole_page: &bytes,
+        guards: PmOffGatewayFresh {
+            gateway_mode: DvGatewayMode::Off,
+            control_page: &control,
+        },
     })?;
     Ok(())
 }
 
 fn finalize(update: &mut My1CallsignUpdate, session: u64) -> TestResult {
     let identity = update.identity().clone();
-    update.record(My1CallsignUpdateEvent::SessionFinalized {
+    update.record(TextFieldUpdateEvent::SessionFinalized {
         id: id(session)?,
-        identity: &identity,
-        gateway_mode: DvGatewayMode::Off,
+        guards: PmOffGatewayFinal {
+            identity: &identity,
+            gateway_mode: DvGatewayMode::Off,
+        },
     })?;
     Ok(())
 }
 
 fn apply(update: &mut My1CallsignUpdate) -> TestResult {
-    update.record(My1CallsignUpdateEvent::DurableWriteIntent { id: id(1)? })?;
+    update.record(TextFieldUpdateEvent::DurableWriteIntent { id: id(1)? })?;
     let desired = *update.desired_page();
-    update.record(My1CallsignUpdateEvent::ImmediateReadback {
+    update.record(TextFieldUpdateEvent::ImmediateReadback {
         whole_page: &desired,
     })?;
     finalize(update, 1)
@@ -170,7 +174,7 @@ fn complete_my1_history_retains_target_control_identity_and_the_sole_intent() ->
     fixture.journal.intent(&update)?;
     assert_eq!(
         update.status(),
-        My1CallsignUpdateStatus::NotWritten,
+        TextFieldUpdateStatus::NotWritten,
         "journal synchronization precedes the engine intent"
     );
     apply(&mut update)?;
@@ -263,7 +267,7 @@ fn every_immutable_control_byte_is_part_of_the_journal_binding() -> TestResult {
             update.original_page(),
             &control,
             None,
-            update.desired_callsign(),
+            update.requested(),
         )?;
         assert!(
             !bound.matches(&changed),
@@ -375,7 +379,7 @@ fn changed_control_target_or_desired_text_cannot_replace_bound_recovery_bytes() 
         }
         let desired = My1Callsign::new(if fault == 2 { "N0CALL" } else { "KQ4NIT" })?;
         let changed =
-            My1CallsignUpdate::prepare(update.identity(), &target, &control, None, &desired)?;
+            My1CallsignUpdate::prepare(update.identity(), &target, &control, None, Some(&desired))?;
         let prefix = fixture.bytes()?;
         let first = fixture
             .journal
@@ -472,7 +476,7 @@ fn write_intent_synchronization_failure_never_advances_the_journal_or_engine() -
     );
     assert_eq!(
         update.status(),
-        My1CallsignUpdateStatus::NotWritten,
+        TextFieldUpdateStatus::NotWritten,
         "the engine cannot infer accepted intent from a failed journal sync"
     );
     let prefix = fixture.bytes()?;
@@ -547,7 +551,7 @@ fn durable_intent_record_is_complete_before_sync_success_is_accepted() -> TestRe
     );
     assert_eq!(
         update.status(),
-        My1CallsignUpdateStatus::NotWritten,
+        TextFieldUpdateStatus::NotWritten,
         "the caller must still record engine intent before dispatch"
     );
     Ok(())
@@ -600,7 +604,7 @@ fn verified_model_cannot_finish_without_a_durable_intent_and_failure_is_sticky()
     verify(&mut update)?;
     assert_eq!(
         update.status(),
-        My1CallsignUpdateStatus::VerifiedAcrossSessions,
+        TextFieldUpdateStatus::VerifiedAcrossSessions,
         "fixture must reach model verification independently of the missing journal intent"
     );
     let prefix = fixture.bytes()?;
@@ -666,7 +670,7 @@ fn failed_my1_session_retains_possible_change_and_never_promises_rollback() -> T
     fixture.prepare(&update)?;
     fresh(&mut update, 1)?;
     fixture.journal.intent(&update)?;
-    update.record(My1CallsignUpdateEvent::DurableWriteIntent { id: id(1)? })?;
+    update.record(TextFieldUpdateEvent::DurableWriteIntent { id: id(1)? })?;
     update.halt();
     fixture
         .journal

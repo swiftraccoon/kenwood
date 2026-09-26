@@ -1,4 +1,6 @@
-//! Decodes format-3 native Bluetooth backup reports.
+//! Decodes format-3 and format-4 native Bluetooth backup reports; format 4
+//! adds the post-exit reply bound and the first-reply deadline, and each
+//! format is read under its own policy.
 //!
 //! Native reports carry no USB re-enumeration fields, and none are synthesized
 //! here; `Snapshot::load_for_usb_write` rejects these backups.
@@ -201,7 +203,7 @@ struct Workflow {
     settle_transcript: Transcript,
 }
 
-/// A complete format-3 native backup report.
+/// A complete format-3 or format-4 native backup report.
 ///
 /// A native fixed-read report has a different shape and fails to decode here.
 #[derive(Debug, Deserialize)]
@@ -221,8 +223,14 @@ pub(super) struct Document {
     maximum_original_open_attempts: u8,
     maximum_post_exit_open_attempts: u8,
     post_exit_settle_milliseconds: u64,
+    // Format 4 records the post-exit reply bound and the first-reply deadline;
+    // format 3 has neither field.
+    #[serde(default)]
+    post_exit_reply_bound_milliseconds: Option<u64>,
     open_retry_delay_milliseconds: u64,
     open_budget_milliseconds: u64,
+    #[serde(default)]
+    first_reply_timeout_milliseconds: Option<u64>,
     cat_exchange_timeout_milliseconds: u64,
     close_budget_milliseconds: u64,
     identity_assurance: String,
@@ -238,7 +246,15 @@ pub(super) struct Document {
 
 impl Document {
     fn validate(&self) -> AppResult<Provenance> {
-        if self.format_version != 3
+        let first_reply_policy = matches!(
+            (
+                self.format_version,
+                self.post_exit_reply_bound_milliseconds,
+                self.first_reply_timeout_milliseconds
+            ),
+            (3, None, None) | (4, Some(30_000), Some(10_000))
+        );
+        if !first_reply_policy
             || !matches!(self.operation.kind, OperationKind::ConfigurationBackup)
             || self.transport != "native_bluetooth"
             || self.service != "serial_port_0x1101"
@@ -254,7 +270,9 @@ impl Document {
                 != "exact_bluetooth_address_and_cat_tuple_not_physical_unit_continuity"
             || self.cancelled
         {
-            return invalid("native backup requires its exact format-3 bounded lifecycle policy");
+            return invalid(
+                "native backup requires the exact bounded lifecycle policy of format 3 or 4",
+            );
         }
         let workflow = &self.workflow;
         let original = &workflow.original;

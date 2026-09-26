@@ -7,6 +7,7 @@
 
 use std::fs::File;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use kenwood_tmd750::{DvGatewayMode, McpProbeReport, Radio};
 use kenwood_transport::Transport;
@@ -62,13 +63,17 @@ impl Observation {
     }
 }
 
-/// Run the fixed read on an already open connection, then close it.
+/// Run the fixed read on an already open connection with the regular reply
+/// deadline on every command, then close it.
 pub(crate) async fn observe(
     transport: CaptureTransport<impl Transport, File>,
     admission: Admission,
     cancelled: &AtomicBool,
 ) -> Observation {
-    read(transport, admission, cancelled).await.finish().await
+    read(transport, admission, None, cancelled)
+        .await
+        .finish()
+        .await
 }
 
 /// A completed fixed read whose connection is still open.
@@ -129,13 +134,20 @@ impl<T: Transport> PendingClose<T> {
 }
 
 /// Run the fixed read up to the MCP exit, leaving the connection open.
+///
+/// `first_reply_timeout` extends the reply deadline of the first command
+/// only, for a connection whose first reply the radio can hold.
 pub(crate) async fn read<T: Transport>(
     mut transport: CaptureTransport<T, File>,
     admission: Admission,
+    first_reply_timeout: Option<Duration>,
     cancelled: &AtomicBool,
 ) -> PendingClose<T> {
     let ready = transport.synchronize().is_ok() && !cancelled.load(Ordering::Relaxed);
     let mut radio = Radio::new(transport);
+    if let Some(timeout) = first_reply_timeout {
+        radio.set_next_reply_timeout(timeout);
+    }
     let (probe, gateway_mode) = if ready {
         match admission {
             Admission::FixedIdentity => (

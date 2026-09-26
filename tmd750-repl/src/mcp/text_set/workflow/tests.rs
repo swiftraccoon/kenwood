@@ -8,15 +8,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use kenwood_tmd750::memory::{Pm1Name, Pm1NameUpdate, Pm1NameUpdateStatus};
+use kenwood_tmd750::memory::{Pm1Name, Pm1NameUpdate, TextFieldUpdateStatus};
 use kenwood_tmd750::protocol::mcp::{ACK, read_request, write_request};
-use kenwood_tmd750::transport::{KENWOOD_VID, TMD750_MAIN_PID};
+use kenwood_tmd750::transport::{KENWOOD_VID, TMD750_MAIN_PID, TMD750_PANEL_PID};
 use kenwood_tmd750::{Address, FirmwareIdentity, Identity, Page, RadioModel, RadioType};
 use kenwood_transport::{MockTransport, Transport, TransportError};
 
 use super::*;
 use crate::capture::{Artifacts, CaptureKind, create_private_file};
-use crate::mcp::reconnect::{VerificationOutcome, VerificationStage};
+use crate::mcp::reconnect::{SETTLE_QUIET, VerificationOutcome, VerificationStage};
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;
 type TestResult = Result<(), TestError>;
@@ -244,8 +244,13 @@ impl Drop for Connection {
 struct TestBackend {
     connections: VecDeque<Connection>,
     log: Log,
+    /// The one endpoint this backend enumerates and opens.
+    endpoint: SerialCandidate,
     opens: usize,
     elapsed: Duration,
+    /// Once `opens` reaches the first value, the next `count` enumerations
+    /// report the endpoint absent.
+    absent_after_open: Option<(usize, usize)>,
 }
 
 impl Backend for TestBackend {
@@ -257,9 +262,8 @@ impl Backend for TestBackend {
         baud: u32,
     ) -> Result<Connection, TransportError> {
         assert_eq!(
-            selected,
-            &endpoint(),
-            "only the selected main-unit endpoint may open"
+            selected, &self.endpoint,
+            "only the selected endpoint may open"
         );
         assert_eq!(
             baud, 9600,
@@ -277,7 +281,14 @@ impl Backend for TestBackend {
 
     fn enumerate(&mut self) -> Result<Vec<SerialCandidate>, TransportError> {
         append(&self.log, Event::Enumerate)?;
-        Ok(vec![endpoint()])
+        if let Some((after, count)) = self.absent_after_open
+            && self.opens >= after
+            && count > 0
+        {
+            self.absent_after_open = Some((after, count - 1));
+            return Ok(Vec::new());
+        }
+        Ok(vec![self.endpoint.clone()])
     }
 
     fn now(&self) -> Duration {
@@ -295,6 +306,22 @@ fn endpoint() -> SerialCandidate {
         vid: Some(KENWOOD_VID),
         pid: Some(TMD750_MAIN_PID),
     }
+}
+
+fn panel_endpoint() -> SerialCandidate {
+    SerialCandidate {
+        path: "/dev/cu.pm1-name-update-panel".to_owned(),
+        vid: Some(KENWOOD_VID),
+        pid: Some(TMD750_PANEL_PID),
+    }
+}
+
+/// A fresh handle that never answers `ID`, as the operation-panel endpoint
+/// does before its tuple is ready.
+fn silent_script() -> MockTransport {
+    let mut mock = MockTransport::new();
+    mock.expect_hang(b"ID\r");
+    mock
 }
 
 fn update() -> Result<Pm1NameUpdate, TestError> {
@@ -381,7 +408,15 @@ struct Harness {
 }
 
 impl Harness {
+    /// The main-unit endpoint with two handles per session: the MCP session,
+    /// then the fresh identity check.
     fn new() -> Result<Self, TestError> {
+        Self::build(endpoint(), false)
+    }
+
+    /// `endpoint` with, per session, the MCP session, a silent identity
+    /// attempt when `silent_identity`, then the fresh identity check.
+    fn build(endpoint: SerialCandidate, silent_identity: bool) -> Result<Self, TestError> {
         let directory = tempfile::tempdir()?;
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
         let update = update()?;
@@ -395,10 +430,12 @@ impl Harness {
         let mut connections = VecDeque::new();
         let mut captures = Vec::new();
         for phase in 0..2 {
-            for mock in [
-                mcp_script(&update, phase == 0, false)?,
-                identity_script("1.02"),
-            ] {
+            let mut mocks = vec![mcp_script(&update, phase == 0, false)?];
+            if silent_identity {
+                mocks.push(silent_script());
+            }
+            mocks.push(identity_script("1.02"));
+            for mock in mocks {
                 connections.push_back(Connection {
                     id: connections.len(),
                     mock,
@@ -427,8 +464,10 @@ impl Harness {
             backend: TestBackend {
                 connections,
                 log,
+                endpoint,
                 opens: 0,
                 elapsed: Duration::ZERO,
+                absent_after_open: None,
             },
             journal,
             captures: Some(
@@ -442,9 +481,10 @@ impl Harness {
     }
 
     async fn run(&mut self) -> Result<WorkflowResult, TestError> {
+        let endpoint = self.backend.endpoint.clone();
         Ok(run(
             &mut self.backend,
-            &endpoint(),
+            &endpoint,
             9600,
             &mut self.update,
             &mut self.journal,
@@ -522,6 +562,80 @@ fn memory_writes(events: &[Event]) -> usize {
         .count()
 }
 
+/// Enumeration snapshots taken after handle `after` was released and before
+/// handle `before` opened.
+fn enumerations_between(events: &[Event], after: usize, before: usize) -> Result<usize, TestError> {
+    let start = position(events, &Event::Dropped(after))?;
+    let end = position(events, &Event::Open(before))?;
+    Ok(events
+        .get(start..end)
+        .ok_or("event window out of order")?
+        .iter()
+        .filter(|event| **event == Event::Enumerate)
+        .count())
+}
+
+#[tokio::test]
+async fn second_session_opens_only_after_the_endpoint_stayed_enumerated_for_the_quiet_period()
+-> TestResult {
+    let mut harness = Harness::new()?;
+    // The three snapshots after the first session's fresh handle report the
+    // endpoint absent, which restarts the quiet period.
+    harness.backend.absent_after_open = Some((2, 3));
+    let result = harness.run().await?;
+    assert!(result.succeeded(&harness.update), "{result:?}");
+    let events = harness.events()?;
+    let polls = usize::try_from(SETTLE_QUIET.as_secs())?;
+    assert_eq!(
+        enumerations_between(&events, 1, 2)?,
+        3 + polls + 1,
+        "three absent snapshots, then the quiet period observed once per second plus the first sighting"
+    );
+    assert!(
+        harness.backend.elapsed >= SETTLE_QUIET,
+        "the settle wait must consume the quiet period on the clock"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn second_session_is_not_opened_when_the_endpoint_never_settles() -> TestResult {
+    let mut harness = Harness::new()?;
+    harness.backend.absent_after_open = Some((2, usize::MAX));
+    let result = harness.run().await?;
+    assert!(!result.succeeded(&harness.update), "{result:?}");
+    assert_eq!(
+        harness.backend.opens, 2,
+        "the second programming session must not open on an unsettled endpoint"
+    );
+    assert_eq!(
+        harness.update.status(),
+        TextFieldUpdateStatus::PossiblyChanged
+    );
+    let second = result
+        .sessions
+        .get(1)
+        .ok_or("second session evidence missing")?;
+    let error = second
+        .open_error
+        .as_ref()
+        .ok_or("settle failure must be recorded as the open error")?;
+    assert!(
+        error.to_string().contains("settle budget"),
+        "the open error names the exhausted settle budget: {error}"
+    );
+    assert!(
+        matches!(
+            second.post_exit.outcome(),
+            VerificationOutcome::Skipped {
+                reason: SkipReason::OriginalOpenFailed
+            }
+        ),
+        "no fresh verification follows a session that never opened: {second:?}"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn success_uses_four_ordered_handles_and_one_prejournaled_memory_write() -> TestResult {
     let mut harness = Harness::new()?;
@@ -529,7 +643,7 @@ async fn success_uses_four_ordered_handles_and_one_prejournaled_memory_write() -
     assert!(result.succeeded(&harness.update), "{result:?}");
     assert_eq!(
         harness.update.status(),
-        Pm1NameUpdateStatus::VerifiedAcrossSessions
+        TextFieldUpdateStatus::VerifiedAcrossSessions
     );
     assert_eq!(harness.backend.opens, 4);
     let events = harness.events()?;
@@ -558,6 +672,12 @@ async fn success_uses_four_ordered_handles_and_one_prejournaled_memory_write() -
             .all(|bytes| bytes.first() != Some(&b'W')),
         "the second MCP session must be read-only"
     );
+    for session in &result.sessions {
+        assert!(
+            matches!(session.post_exit, PostExit::Single(_)),
+            "the main-unit endpoint verifies with one open"
+        );
+    }
     harness.journal.finish(&harness.update)?;
     let records = read_records(&harness.directory.path().join("update-journal.jsonl"))?;
     assert_eq!(
@@ -584,6 +704,49 @@ async fn success_uses_four_ordered_handles_and_one_prejournaled_memory_write() -
 }
 
 #[tokio::test]
+async fn panel_endpoint_retries_a_silent_identity_before_each_fresh_check() -> TestResult {
+    let mut harness = Harness::build(panel_endpoint(), true)?;
+    let result = harness.run().await?;
+    assert!(result.succeeded(&harness.update), "{result:?}");
+    assert_eq!(
+        harness.update.status(),
+        TextFieldUpdateStatus::VerifiedAcrossSessions
+    );
+    assert_eq!(
+        harness.backend.opens, 6,
+        "each session opens the MCP handle, a silent attempt and the matching attempt"
+    );
+    for session in &result.sessions {
+        assert!(
+            matches!(session.post_exit, PostExit::Readiness(_)),
+            "the operation-panel endpoint uses the bounded readiness check"
+        );
+        assert!(session.post_exit.succeeded(), "{session:?}");
+    }
+    let events = harness.events()?;
+    assert_eq!(memory_writes(&events), 1);
+    for id in [1, 4] {
+        assert_eq!(
+            writes(&events, id),
+            [b"ID\r".as_slice()],
+            "the silent attempt sends ID only"
+        );
+        assert!(
+            position(&events, &Event::Dropped(id))? < position(&events, &Event::Open(id + 1))?,
+            "the silent handle is released before the retry opens"
+        );
+    }
+    for id in [2, 5] {
+        assert_eq!(
+            writes(&events, id),
+            [b"ID\r".as_slice(), b"FV\r", b"TY\r"],
+            "the matching attempt reads the whole tuple"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn either_original_or_fresh_close_failure_prevents_the_next_session() -> TestResult {
     for connection in 0..2 {
         let mut harness = Harness::new()?;
@@ -596,7 +759,7 @@ async fn either_original_or_fresh_close_failure_prevents_the_next_session() -> T
         assert_eq!(harness.backend.opens, connection + 1);
         assert_eq!(
             harness.update.status(),
-            Pm1NameUpdateStatus::PossiblyChanged
+            TextFieldUpdateStatus::PossiblyChanged
         );
         assert_eq!(result.sessions.len(), 1);
         let first = result.sessions.first().ok_or("session missing")?;
@@ -647,7 +810,7 @@ async fn fresh_identity_mismatch_closes_without_retry_or_following_update_sessio
     assert_eq!(harness.backend.opens, 2);
     assert_eq!(
         harness.update.status(),
-        Pm1NameUpdateStatus::PossiblyChanged
+        TextFieldUpdateStatus::PossiblyChanged
     );
     assert!(
         matches!(
@@ -708,7 +871,7 @@ async fn uncertain_ack_prevents_exit_reconnect_retry_and_rollback() -> TestResul
     assert_eq!(harness.backend.opens, 1);
     assert_eq!(
         harness.update.status(),
-        Pm1NameUpdateStatus::PossiblyChanged
+        TextFieldUpdateStatus::PossiblyChanged
     );
     let events = harness.events()?;
     assert!(
@@ -758,7 +921,7 @@ async fn stale_first_page_exits_without_journaling_or_dispatching_a_write() -> T
         !result.succeeded(&harness.update),
         "stale baseline must prevent update success: {result:?}"
     );
-    assert_eq!(harness.update.status(), Pm1NameUpdateStatus::NotWritten);
+    assert_eq!(harness.update.status(), TextFieldUpdateStatus::NotWritten);
     assert_eq!(harness.backend.opens, 2);
     assert_eq!(memory_writes(&harness.events()?), 0);
     let records = read_records(&harness.directory.path().join("update-journal.jsonl"))?;
@@ -785,7 +948,7 @@ async fn separate_session_page_drift_never_claims_success_or_writes_again() -> T
     assert_eq!(harness.backend.opens, 4);
     assert_eq!(
         harness.update.status(),
-        Pm1NameUpdateStatus::PossiblyChanged
+        TextFieldUpdateStatus::PossiblyChanged
     );
     let last = result.sessions.last().ok_or("session missing")?;
     assert!(
@@ -827,9 +990,9 @@ async fn incomplete_original_capture_prevents_open_at_either_session() -> TestRe
         assert_eq!(
             harness.update.status(),
             if session == 0 {
-                Pm1NameUpdateStatus::NotWritten
+                TextFieldUpdateStatus::NotWritten
             } else {
-                Pm1NameUpdateStatus::PossiblyChanged
+                TextFieldUpdateStatus::PossiblyChanged
             }
         );
         let last = result.sessions.last().ok_or("session missing")?;
@@ -859,7 +1022,7 @@ async fn incomplete_fresh_cat_capture_prevents_new_handle_and_preserves_possible
     assert_eq!(harness.backend.opens, 1);
     assert_eq!(
         harness.update.status(),
-        Pm1NameUpdateStatus::PossiblyChanged
+        TextFieldUpdateStatus::PossiblyChanged
     );
     let post_exit = &result.sessions.first().ok_or("session missing")?.post_exit;
     assert!(
@@ -922,7 +1085,7 @@ async fn failed_durable_session_evidence_blocks_finalization_and_following_sessi
     assert_eq!(harness.backend.opens, 2);
     assert_eq!(
         harness.update.status(),
-        Pm1NameUpdateStatus::PossiblyChanged
+        TextFieldUpdateStatus::PossiblyChanged
     );
     assert!(
         result.finalization_error.is_some(),

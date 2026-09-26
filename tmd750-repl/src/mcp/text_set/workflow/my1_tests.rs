@@ -11,9 +11,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use kenwood_tmd750::memory::{My1Callsign, My1CallsignUpdate, My1CallsignUpdateStatus};
+use kenwood_tmd750::memory::{My1Callsign, My1CallsignUpdate, TextFieldUpdateStatus};
 use kenwood_tmd750::protocol::mcp::{ACK, read_request, write_request};
-use kenwood_tmd750::transport::{KENWOOD_VID, TMD750_MAIN_PID};
+use kenwood_tmd750::transport::{KENWOOD_VID, TMD750_MAIN_PID, TMD750_PANEL_PID};
 use kenwood_tmd750::{
     Address, DvGatewayMode, FirmwareIdentity, Identity, Page, RadioModel, RadioType,
 };
@@ -21,7 +21,7 @@ use kenwood_transport::{MockTransport, Transport, TransportError};
 
 use super::*;
 use crate::capture::{Artifacts, CaptureKind, Event as CaptureEvent};
-use crate::mcp::reconnect::{VerificationOutcome, VerificationStage};
+use crate::mcp::reconnect::{PostExitVerification, VerificationOutcome, VerificationStage};
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;
 type TestResult = Result<(), TestError>;
@@ -117,6 +117,10 @@ struct IntentRecord {
 #[derive(Debug)]
 struct Proof {
     directory: PathBuf,
+    /// The one endpoint the backend enumerates and opens.
+    endpoint: SerialCandidate,
+    /// Handles per session: the MCP handle, then every fresh CAT attempt.
+    per_session: usize,
     original: Vec<u8>,
     desired: Vec<u8>,
     control: Vec<u8>,
@@ -125,8 +129,8 @@ struct Proof {
 impl Proof {
     fn transcript(&self, id: usize) -> PathBuf {
         self.directory
-            .join(format!("session-{}", id / 2))
-            .join(if id.is_multiple_of(2) {
+            .join(format!("session-{}", id / self.per_session))
+            .join(if id.is_multiple_of(self.per_session) {
                 "transcript.jsonl"
             } else {
                 "post-exit-transcript.jsonl"
@@ -149,7 +153,7 @@ impl Proof {
         );
         assert_eq!(
             request.event.get("path"),
-            Some(&serde_json::json!(endpoint().path)),
+            Some(&serde_json::json!(self.endpoint.path)),
             "opening evidence must bind the selected endpoint"
         );
         assert_eq!(
@@ -157,7 +161,7 @@ impl Proof {
             Some(&serde_json::json!(9600)),
             "opening evidence must bind serial settings"
         );
-        if id == 2 {
+        if id == self.per_session {
             let journal = records(&self.journal())?;
             assert_eq!(
                 journal.len(),
@@ -412,9 +416,8 @@ impl Backend for TestBackend {
         baud: u32,
     ) -> Result<Connection, TransportError> {
         assert_eq!(
-            selected,
-            &endpoint(),
-            "only the selected main-unit endpoint may open"
+            selected, &self.proof.endpoint,
+            "only the selected endpoint may open"
         );
         assert_eq!(baud, 9600, "only the selected line settings may be used");
         self.proof
@@ -435,7 +438,7 @@ impl Backend for TestBackend {
 
     fn enumerate(&mut self) -> Result<Vec<SerialCandidate>, TransportError> {
         append(&self.log, Event::Enumerate)?;
-        Ok(vec![endpoint()])
+        Ok(vec![self.proof.endpoint.clone()])
     }
 
     fn now(&self) -> Duration {
@@ -455,6 +458,22 @@ fn endpoint() -> SerialCandidate {
     }
 }
 
+fn panel_endpoint() -> SerialCandidate {
+    SerialCandidate {
+        path: "/dev/cu.my1-workflow-panel".to_owned(),
+        vid: Some(KENWOOD_VID),
+        pid: Some(TMD750_PANEL_PID),
+    }
+}
+
+/// A fresh handle that never answers `ID`, as the operation-panel endpoint
+/// does before its tuple is ready.
+fn silent_script() -> MockTransport {
+    let mut mock = MockTransport::new();
+    mock.expect_hang(b"ID\r");
+    mock
+}
+
 fn update() -> Result<My1CallsignUpdate, TestError> {
     let identity = Identity {
         model: RadioModel::TmD750,
@@ -471,7 +490,7 @@ fn update() -> Result<My1CallsignUpdate, TestError> {
         &target,
         &control,
         None,
-        &My1Callsign::new("KQ4NIT")?,
+        Some(&My1Callsign::new("KQ4NIT")?),
     )?)
 }
 
@@ -542,7 +561,16 @@ struct Harness {
 }
 
 impl Harness {
+    /// The main-unit endpoint with two handles per session: the MCP session,
+    /// then the fresh identity and Gateway check.
     fn new() -> Result<Self, TestError> {
+        Self::build(endpoint(), false)
+    }
+
+    /// `endpoint` with, per session, the MCP session, a silent identity
+    /// attempt when `silent_identity`, then the fresh identity and Gateway
+    /// check.
+    fn build(endpoint: SerialCandidate, silent_identity: bool) -> Result<Self, TestError> {
         let directory = tempfile::tempdir()?;
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
         let update = update()?;
@@ -550,6 +578,8 @@ impl Harness {
         let log = Arc::new(Mutex::new(Vec::new()));
         let proof = Arc::new(Proof {
             directory: directory.path().to_owned(),
+            endpoint,
+            per_session: if silent_identity { 3 } else { 2 },
             original: update.original_page().to_vec(),
             desired: update.desired_page().to_vec(),
             control: update.control_page().to_vec(),
@@ -557,7 +587,12 @@ impl Harness {
         let mut connections = VecDeque::new();
         let mut captures = Vec::new();
         for phase in 0..2 {
-            for mock in [mcp_script(&update, phase == 0)?, fresh_script(b"GW 0\r")] {
+            let mut mocks = vec![mcp_script(&update, phase == 0)?];
+            if silent_identity {
+                mocks.push(silent_script());
+            }
+            mocks.push(fresh_script(b"GW 0\r"));
+            for mock in mocks {
                 connections.push_back(Connection {
                     id: connections.len(),
                     mock,
@@ -604,9 +639,10 @@ impl Harness {
     }
 
     async fn run(&mut self) -> Result<WorkflowResult, TestError> {
+        let endpoint = self.backend.proof.endpoint.clone();
         Ok(run(
             &mut self.backend,
-            &endpoint(),
+            &endpoint,
             9600,
             &mut self.update,
             &mut self.journal,
@@ -639,13 +675,14 @@ impl Harness {
             Arc::clone(&self.capture_failed),
             "read-only-transcript.jsonl",
         );
+        let per_session = self.backend.proof.per_session;
         let captures = self
             .captures
             .as_mut()
             .ok_or("captures consumed")?
-            .get_mut(id / 2)
+            .get_mut(id / per_session)
             .ok_or("session missing")?;
-        if id.is_multiple_of(2) {
+        if id.is_multiple_of(per_session) {
             captures.original = recorder;
         } else {
             captures.post_exit = recorder;
@@ -812,7 +849,7 @@ async fn four_handles_pin_the_full_wire_scope_and_durable_session_order() -> Tes
     );
     assert_eq!(
         harness.update.status(),
-        My1CallsignUpdateStatus::VerifiedAcrossSessions,
+        TextFieldUpdateStatus::VerifiedAcrossSessions,
         "both finalized sessions are required"
     );
     assert_eq!(
@@ -845,6 +882,10 @@ async fn four_handles_pin_the_full_wire_scope_and_durable_session_order() -> Tes
         );
     }
     for (index, session) in result.sessions.iter().enumerate() {
+        assert!(
+            matches!(session.post_exit, PostExit::Single(_)),
+            "the main-unit endpoint verifies with one open"
+        );
         assert_my1_session(session, &harness.update, index == 0)?;
     }
     harness.journal.finish(&harness.update)?;
@@ -870,6 +911,55 @@ async fn four_handles_pin_the_full_wire_scope_and_durable_session_order() -> Tes
         Some(&serde_json::json!("verified_across_sessions")),
         "only complete external evidence permits verified status"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn panel_endpoint_retries_a_silent_identity_then_requires_gateway_off_each_session()
+-> TestResult {
+    let mut harness = Harness::build(panel_endpoint(), true)?;
+    let result = harness.run().await?;
+    assert!(
+        result.succeeded(&harness.update),
+        "the bounded readiness check with Gateway Off must qualify the update: {result:?}"
+    );
+    assert_eq!(
+        harness.update.status(),
+        TextFieldUpdateStatus::VerifiedAcrossSessions,
+        "both finalized sessions are required"
+    );
+    assert_eq!(
+        harness.backend.opens, 6,
+        "each session opens the MCP handle, a silent attempt and the matching attempt"
+    );
+    let events = harness.events()?;
+    assert_released(&events, 6)?;
+    assert_eq!(
+        memory_writes(&events),
+        1,
+        "MY1 must be written once without restoration"
+    );
+    for (index, session) in result.sessions.iter().enumerate() {
+        assert!(
+            matches!(session.post_exit, PostExit::Readiness(_)),
+            "the operation-panel endpoint uses the bounded readiness check"
+        );
+        assert_my1_session(session, &harness.update, index == 0)?;
+    }
+    for id in [1, 4] {
+        assert_eq!(
+            writes(&events, id),
+            [b"ID\r".as_slice()],
+            "the silent attempt sends ID only"
+        );
+    }
+    for id in [2, 5] {
+        assert_eq!(
+            writes(&events, id),
+            [b"ID\r".as_slice(), b"FV\r", b"TY\r", b"GW\r"],
+            "the matching attempt reads the tuple, then Gateway"
+        );
+    }
     Ok(())
 }
 
@@ -903,7 +993,7 @@ async fn pre_intent_cancellation_opens_nothing_new_and_never_writes() -> TestRes
         );
         assert_eq!(
             harness.update.status(),
-            My1CallsignUpdateStatus::NotWritten,
+            TextFieldUpdateStatus::NotWritten,
             "no write obligation was created"
         );
         let events = harness.events()?;
@@ -1044,7 +1134,7 @@ async fn each_original_or_fresh_close_failure_blocks_the_next_open() -> TestResu
         );
         assert_eq!(
             harness.update.status(),
-            My1CallsignUpdateStatus::PossiblyChanged,
+            TextFieldUpdateStatus::PossiblyChanged,
             "failed close cannot finalize a possible change"
         );
         let session = result.sessions.last().ok_or("session evidence missing")?;
@@ -1120,7 +1210,7 @@ async fn fresh_identity_or_gateway_failure_is_never_retried_or_finalized() -> Te
             );
             assert_eq!(
                 harness.update.status(),
-                My1CallsignUpdateStatus::PossiblyChanged,
+                TextFieldUpdateStatus::PossiblyChanged,
                 "retain possible change when fresh qualification fails"
             );
             assert_released(&harness.events()?, fresh + 1)?;
@@ -1242,6 +1332,7 @@ async fn adapter_finalization_never_substitutes_gateway_or_identity_observations
             &mut harness.journal,
             captures,
             &harness.cancelled,
+            false,
         )
         .await;
         assert_my1_session(&session, &harness.update, true)?;
@@ -1289,7 +1380,7 @@ async fn adapter_finalization_never_substitutes_gateway_or_identity_observations
         );
         assert_eq!(
             harness.update.status(),
-            My1CallsignUpdateStatus::PossiblyChanged,
+            TextFieldUpdateStatus::PossiblyChanged,
             "unacceptable external evidence cannot clear possible change"
         );
         assert!(
@@ -1352,9 +1443,9 @@ async fn complete_control_or_target_tail_drift_never_rebases_or_repairs() -> Tes
             assert_eq!(
                 harness.update.status(),
                 if session == 0 {
-                    My1CallsignUpdateStatus::NotWritten
+                    TextFieldUpdateStatus::NotWritten
                 } else {
-                    My1CallsignUpdateStatus::PossiblyChanged
+                    TextFieldUpdateStatus::PossiblyChanged
                 },
                 "preserve prior write evidence without rebasing"
             );
@@ -1504,7 +1595,7 @@ async fn failed_pre_write_raw_sync_survives_successful_cleanup_and_blocks_fresh_
     );
     assert_eq!(
         harness.update.status(),
-        My1CallsignUpdateStatus::NotWritten,
+        TextFieldUpdateStatus::NotWritten,
         "no write intent may be accepted"
     );
     let session = result.sessions.first().ok_or("session missing")?;
@@ -1560,7 +1651,7 @@ async fn failed_session_journal_sync_prevents_second_open_and_finalization() -> 
     );
     assert_eq!(
         harness.update.status(),
-        My1CallsignUpdateStatus::PossiblyChanged,
+        TextFieldUpdateStatus::PossiblyChanged,
         "failed finalization preserves possible change"
     );
     assert!(
@@ -1603,7 +1694,7 @@ async fn journal_control_binding_failure_prevents_intent_write_and_fresh_open() 
         harness.update.original_page(),
         &control,
         None,
-        &My1Callsign::new("KQ4NIT")?,
+        Some(&My1Callsign::new("KQ4NIT")?),
     )?;
     let mut mock = read_script(&harness.update, &control, harness.update.original_page())?;
     mock.expect(b"E", &[ACK]);
@@ -1624,7 +1715,7 @@ async fn journal_control_binding_failure_prevents_intent_write_and_fresh_open() 
     );
     assert_eq!(
         harness.update.status(),
-        My1CallsignUpdateStatus::NotWritten,
+        TextFieldUpdateStatus::NotWritten,
         "failed bound intent must precede possible dispatch"
     );
     let session = result.sessions.first().ok_or("session evidence missing")?;
@@ -1687,7 +1778,7 @@ async fn second_entry_enxio_retains_first_off_evidence_without_retry_or_speculat
     );
     assert_eq!(
         harness.update.status(),
-        My1CallsignUpdateStatus::PossiblyChanged,
+        TextFieldUpdateStatus::PossiblyChanged,
         "earlier write remains possible despite failed later entry"
     );
     assert_my1_session(

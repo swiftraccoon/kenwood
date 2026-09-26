@@ -460,7 +460,7 @@ async fn run_workflow(
     cancelled: &AtomicBool,
 ) -> WorkflowResult {
     let WorkflowCaptures {
-        original,
+        mut original,
         post_exit,
     } = captures;
     let mut result = WorkflowResult {
@@ -483,6 +483,13 @@ async fn run_workflow(
         });
         result.post_exit =
             ReadinessVerification::skipped(SkipReason::Cancelled, post_exit.summary());
+        return result;
+    }
+    if let Err(error) =
+        reconnect::settle_before_entry(backend, endpoint, &mut original, cancelled).await
+    {
+        result.open_error = Some(Failure::from_error(&error));
+        result.transcript = original.summary();
         return result;
     }
     let transport = match backend.open(endpoint, baud) {

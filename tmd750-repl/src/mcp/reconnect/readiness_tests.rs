@@ -419,8 +419,8 @@ async fn silent_id_then_matching_identity_retries_only_after_release_and_reselec
 }
 
 #[tokio::test]
-async fn repeated_silence_stops_at_four_opens() -> TestResult {
-    let mut backend = ReadinessBackend::new((0..5).map(|_| silent_script()));
+async fn repeated_silence_stops_at_six_opens() -> TestResult {
+    let mut backend = ReadinessBackend::new((0..7).map(|_| silent_script()));
     let report = run(&mut backend, &AtomicBool::new(false)).await?;
     assert!(!report.succeeded(), "silence cannot qualify identity");
     assert!(
@@ -433,10 +433,17 @@ async fn repeated_silence_stops_at_four_opens() -> TestResult {
         ),
         "the final outcome names exhausted readiness policy, not a rewritten CAT attempt"
     );
-    backend.assert_wire(&[&[b"ID\r"], &[b"ID\r"], &[b"ID\r"], &[b"ID\r"]])?;
+    backend.assert_wire(&[
+        &[b"ID\r"],
+        &[b"ID\r"],
+        &[b"ID\r"],
+        &[b"ID\r"],
+        &[b"ID\r"],
+        &[b"ID\r"],
+    ])?;
     assert_eq!(
         attempts(&report)?.len(),
-        4,
+        6,
         "all bounded attempts remain visible"
     );
     Ok(())
@@ -698,5 +705,128 @@ async fn synchronization_failure_after_silent_identity_prevents_retry() -> TestR
         "synchronization failure is capture failure"
     );
     backend.assert_wire(&[&[b"ID\r"]])?;
+    Ok(())
+}
+
+async fn run_gateway_off(
+    backend: &mut ReadinessBackend,
+    cancelled: &AtomicBool,
+) -> Result<ReadinessVerification, Box<dyn std::error::Error + Send + Sync>> {
+    let recorder = Recorder::named(
+        tempfile::tempfile()?,
+        Arc::new(AtomicBool::new(false)),
+        "post-exit-transcript.jsonl",
+    );
+    Ok(verify_readiness_gateway_off(
+        backend,
+        &endpoint(),
+        9600,
+        &identity()?,
+        recorder,
+        cancelled,
+    )
+    .await)
+}
+
+fn gateway_script(gateway: &[u8]) -> MockTransport {
+    let mut script = ready_script();
+    script.expect(b"GW\r", gateway);
+    script
+}
+
+#[tokio::test]
+async fn gateway_off_goal_queries_gw_after_a_silent_retry_and_reports_evidence() -> TestResult {
+    let mut backend = ReadinessBackend::new([silent_script(), gateway_script(b"GW 0\r")]);
+    let report = run_gateway_off(&mut backend, &AtomicBool::new(false)).await?;
+    assert!(
+        report.succeeded(),
+        "matched tuple then Gateway Off qualifies: {report:?}"
+    );
+    backend.assert_wire(&[&[b"ID\r"], &[b"ID\r", b"FV\r", b"TY\r", b"GW\r"]])?;
+    let (observed, mode) = report
+        .gateway_off_evidence()
+        .ok_or("Gateway Off evidence missing")?;
+    assert_eq!(observed, &identity()?, "evidence carries the fresh tuple");
+    assert_eq!(mode, DvGatewayMode::Off, "evidence carries Gateway Off");
+    let value = serde_json::to_value(&report)?;
+    assert_eq!(
+        value
+            .pointer("/required_gateway_mode/state")
+            .and_then(Value::as_str),
+        Some("off"),
+        "the report names the required Gateway state"
+    );
+    assert_eq!(
+        value
+            .get("attempt_allowance_milliseconds")
+            .and_then(Value::as_u64),
+        Some(milliseconds(readiness::attempt_allowance(
+            VerificationGoal::GatewayOff
+        ))),
+        "the allowance covers the GW exchange"
+    );
+    assert!(
+        readiness::attempt_allowance(VerificationGoal::GatewayOff)
+            > readiness::attempt_allowance(VerificationGoal::IdentityOnly),
+        "the GW exchange extends the per-attempt allowance"
+    );
+    let attempts = attempts(&report)?;
+    assert_eq!(
+        attempts
+            .last()
+            .and_then(|attempt| attempt.pointer("/connection/gateway_mode/state"))
+            .and_then(Value::as_str),
+        Some("off"),
+        "the matching attempt records the Gateway read"
+    );
+    assert!(
+        attempts
+            .first()
+            .and_then(|attempt| attempt.pointer("/connection/gateway_mode"))
+            .is_none(),
+        "the silent attempt sends no GW"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn gateway_mismatch_after_a_matched_tuple_never_retries() -> TestResult {
+    let mut backend = ReadinessBackend::new([gateway_script(b"GW 2\r"), gateway_script(b"GW 0\r")]);
+    let report = run_gateway_off(&mut backend, &AtomicBool::new(false)).await?;
+    assert!(!report.succeeded(), "Terminal after exit must not qualify");
+    assert!(
+        matches!(
+            report.outcome,
+            VerificationOutcome::Failed {
+                stage: VerificationStage::GatewayMismatch,
+                ..
+            }
+        ),
+        "{:?}",
+        report.outcome
+    );
+    assert!(
+        report.gateway_off_evidence().is_none(),
+        "a mismatch yields no evidence"
+    );
+    backend.assert_wire(&[&[b"ID\r", b"FV\r", b"TY\r", b"GW\r"]])?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn identity_only_reacquisition_reports_no_gateway_requirement() -> TestResult {
+    let mut backend = ReadinessBackend::new([ready_script()]);
+    let report = run(&mut backend, &AtomicBool::new(false)).await?;
+    assert!(report.succeeded(), "{report:?}");
+    assert!(
+        report.gateway_off_evidence().is_none(),
+        "identity-only checks carry no Gateway evidence"
+    );
+    assert!(
+        serde_json::to_value(&report)?
+            .get("required_gateway_mode")
+            .is_none(),
+        "identity-only reports omit the Gateway requirement"
+    );
     Ok(())
 }

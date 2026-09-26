@@ -279,8 +279,7 @@ async fn session_with_output(
 ) -> SessionEvidence {
     let mut evidence = SessionEvidence::new(transport.transcript_summary());
     let ready = transport.synchronize();
-    let mut radio = Radio::new(transport);
-    radio.set_timeout(cat::EXCHANGE_TIMEOUT);
+    let mut radio = cat::wrap(transport);
     match ready {
         Ok(()) => {
             if let Err(error) =

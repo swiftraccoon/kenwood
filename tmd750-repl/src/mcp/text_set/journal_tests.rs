@@ -4,7 +4,9 @@ mod unix {
     use std::num::NonZeroU64;
     use std::os::unix::fs::{PermissionsExt, symlink};
 
-    use kenwood_tmd750::memory::{Pm1Name, Pm1NameUpdate, Pm1NameUpdateEvent, Pm1NameUpdateStatus};
+    use kenwood_tmd750::memory::{
+        Pm1Name, Pm1NameUpdate, TextFieldUpdateEvent, TextFieldUpdateStatus,
+    };
     use kenwood_tmd750::types::{FirmwareIdentity, RadioModel, RadioType};
     use serde::Serializer;
     use serde_json::Value;
@@ -72,26 +74,33 @@ mod unix {
         } else {
             *update.desired_page()
         };
-        update.record(Pm1NameUpdateEvent::FreshSession {
+        update.record(TextFieldUpdateEvent::FreshSession {
             id: id(session)?,
             identity: &identity,
             memory_format: 0,
             whole_page: &bytes,
+            guards: (),
         })?;
         Ok(())
     }
 
     fn write_and_finalize(update: &mut Pm1NameUpdate) -> TestResult {
-        update.record(Pm1NameUpdateEvent::DurableWriteIntent { id: id(1)? })?;
+        update.record(TextFieldUpdateEvent::DurableWriteIntent { id: id(1)? })?;
         let bytes = *update.desired_page();
-        update.record(Pm1NameUpdateEvent::ImmediateReadback { whole_page: &bytes })?;
-        update.record(Pm1NameUpdateEvent::SessionFinalized { id: id(1)? })?;
+        update.record(TextFieldUpdateEvent::ImmediateReadback { whole_page: &bytes })?;
+        update.record(TextFieldUpdateEvent::SessionFinalized {
+            id: id(1)?,
+            guards: (),
+        })?;
         Ok(())
     }
 
     fn finish_engine(update: &mut Pm1NameUpdate) -> TestResult {
         fresh(update, 2)?;
-        update.record(Pm1NameUpdateEvent::SessionFinalized { id: id(2)? })?;
+        update.record(TextFieldUpdateEvent::SessionFinalized {
+            id: id(2)?,
+            guards: (),
+        })?;
         Ok(())
     }
 
@@ -285,7 +294,7 @@ mod unix {
         fixture.prepare(&update)?;
         fresh(&mut update, 1)?;
         fixture.journal.intent(&update)?;
-        assert_eq!(update.status(), Pm1NameUpdateStatus::NotWritten);
+        assert_eq!(update.status(), TextFieldUpdateStatus::NotWritten);
         let prefix = fixture.bytes()?;
         assert!(
             fixture.journal.finish(&update).is_err(),
@@ -302,7 +311,7 @@ mod unix {
         fixture.prepare(&update)?;
         fresh(&mut update, 1)?;
         fixture.journal.intent(&update)?;
-        update.record(Pm1NameUpdateEvent::DurableWriteIntent { id: id(1)? })?;
+        update.record(TextFieldUpdateEvent::DurableWriteIntent { id: id(1)? })?;
         update.halt();
         fixture
             .journal
@@ -341,7 +350,7 @@ mod unix {
             let changed = Pm1NameUpdate::prepare(
                 update.identity(),
                 &page,
-                update.current_name(),
+                update.current().ok_or("current PM1 name")?,
                 &Pm1Name::new(desired)?,
             )?;
             let prefix = fixture.bytes()?;
@@ -368,7 +377,7 @@ mod unix {
         let mut changed = Pm1NameUpdate::prepare(
             original.identity(),
             original.original_page(),
-            original.current_name(),
+            original.current().ok_or("current PM1 name")?,
             &Pm1Name::new("REMOTE")?,
         )?;
         fresh(&mut changed, 1)?;
@@ -376,7 +385,7 @@ mod unix {
         finish_engine(&mut changed)?;
         assert_eq!(
             changed.status(),
-            Pm1NameUpdateStatus::VerifiedAcrossSessions
+            TextFieldUpdateStatus::VerifiedAcrossSessions
         );
         let prefix = fixture.bytes()?;
         assert!(
@@ -483,7 +492,7 @@ mod unix {
                 fixture.failed.load(Ordering::Relaxed),
                 "storage failure must signal capture failure; sync_failure={sync_failure}"
             );
-            assert_eq!(update.status(), Pm1NameUpdateStatus::NotWritten);
+            assert_eq!(update.status(), TextFieldUpdateStatus::NotWritten);
         }
         Ok(())
     }

@@ -450,7 +450,15 @@ fn native_backup_startup_reaches_its_distinct_configuration_report() -> TestResu
         report.get("operation"),
         Some(&serde_json::json!({"kind":"configuration_backup"}))
     );
-    assert_eq!(report.get("format_version"), Some(&serde_json::json!(3)));
+    assert_eq!(report.get("format_version"), Some(&serde_json::json!(4)));
+    assert_eq!(
+        report.get("first_reply_timeout_milliseconds"),
+        Some(&serde_json::json!(10_000))
+    );
+    assert_eq!(
+        report.get("post_exit_reply_bound_milliseconds"),
+        Some(&serde_json::json!(30_000))
+    );
     for field in [
         "original",
         "original_endpoint",
@@ -676,7 +684,15 @@ fn failed_sdp_deadline_is_visible_and_captured_without_radio_traffic() -> TestRe
     let capture = directory.path().join("observation");
     let report: serde_json::Value =
         serde_json::from_slice(&std::fs::read(capture.join("report.json"))?)?;
-    assert_eq!(report.get("format_version"), Some(&serde_json::json!(2)));
+    assert_eq!(report.get("format_version"), Some(&serde_json::json!(3)));
+    assert_eq!(
+        report.get("first_reply_timeout_milliseconds"),
+        Some(&serde_json::json!(10_000))
+    );
+    assert_eq!(
+        report.get("post_exit_reply_bound_milliseconds"),
+        Some(&serde_json::json!(30_000))
+    );
     assert_eq!(
         report.get("maximum_original_open_attempts"),
         Some(&serde_json::json!(2))

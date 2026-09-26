@@ -1,8 +1,10 @@
-//! Menu updates over one MCP connection followed by one CAT connection.
+//! Menu updates over one MCP connection followed by a fresh CAT check.
 //!
 //! The first connection compares the whole page, writes it, reads it back and
-//! exits MCP; the second reads the identity tuple and Gateway Off. Persistence
-//! across a later MCP session or a power cycle is not checked.
+//! exits MCP; the fresh check reads the identity tuple and Gateway Off, with
+//! one open on the main-unit endpoint or the bounded silent-`ID` retry on the
+//! operation-panel endpoint. Persistence across a later MCP session or a power
+//! cycle is not checked.
 
 use std::fs::File;
 use std::io;
@@ -10,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use kenwood_tmd750::transport::{DEFAULT_BAUD, SerialCandidate, TMD750_MAIN_PID};
+use kenwood_tmd750::transport::{DEFAULT_BAUD, SerialCandidate, TMD750_MAIN_PID, TMD750_PANEL_PID};
 use kenwood_tmd750::{DvGatewayMode, MenuUpdatePlan, Page, PageReplacement, Radio};
 use kenwood_transport::Transport;
 use serde::Serialize;
@@ -18,7 +20,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use super::menu::{ApplyRequest, Value};
-use super::reconnect::{self, Backend, PostExitVerification, SkipReason, SystemBackend};
+use super::reconnect::{self, Backend, PostExit, SkipReason, SystemBackend};
 use super::{
     Endpoint, ExitDisposition, Failure, IdentityEvidence, close_transport, finish_on_interrupt,
     write_report,
@@ -53,9 +55,9 @@ impl From<Page> for PageEvidence {
 ///
 /// Holds the identity tuple, the observed Gateway mode, the MCP exit
 /// disposition, the pages compared before the write, the pages that may have
-/// been written and the pages whose readback matched. A page stays in
-/// `possible_pages` whether or not its readback matched, and nothing is rolled
-/// back.
+/// been written, the pages whose readback matched and the fresh CAT check. A
+/// page stays in `possible_pages` whether or not its readback matched, and
+/// nothing is rolled back.
 #[derive(Debug, Serialize)]
 struct WorkflowResult {
     identity: Option<IdentityEvidence>,
@@ -73,7 +75,7 @@ struct WorkflowResult {
     capture_error: Option<Failure>,
     journal_error: Option<Failure>,
     transcript: TranscriptSummary,
-    post_exit: PostExitVerification,
+    post_exit: PostExit,
 }
 
 impl WorkflowResult {
@@ -92,7 +94,7 @@ impl WorkflowResult {
             capture_error: None,
             journal_error: None,
             transcript: captures.original.summary(),
-            post_exit: PostExitVerification::skipped(
+            post_exit: PostExit::skipped(
                 SkipReason::OriginalUpdateIncomplete,
                 captures.post_exit.summary(),
             ),
@@ -138,7 +140,7 @@ impl WorkflowResult {
         if !self.post_exit.succeeded() {
             output::error(format_args!(
                 "Fresh verification: {}.",
-                self.post_exit.outcome
+                self.post_exit.outcome()
             ));
         }
     }
@@ -375,6 +377,16 @@ async fn original(
             return recorder;
         }
     };
+    if let Err(error) =
+        reconnect::settle_before_entry(backend, endpoint, &mut recorder, cancelled).await
+    {
+        let error = Failure::from_error(&error);
+        recorder.record(Event::OpenFailed {
+            error: error.clone(),
+        });
+        result.open_error = Some(error);
+        return recorder;
+    }
     recorder.record(Event::OpenRequested {
         path: &endpoint.path,
         baud: DEFAULT_BAUD,
@@ -472,7 +484,7 @@ async fn run_workflow(
                 .capture_error
                 .get_or_insert_with(|| Failure::from_error(&error));
         }
-        PostExitVerification::skipped(reason, post_exit.summary())
+        PostExit::skipped(reason, post_exit.summary())
     } else {
         // Once a page may have been written, the post-exit check runs even after
         // Ctrl-C; a capture failure still stops all protocol I/O.
@@ -482,15 +494,7 @@ async fn run_workflow(
         } else {
             &finish_required
         };
-        reconnect::verify_required_gateway_off(
-            backend,
-            endpoint,
-            DEFAULT_BAUD,
-            plan.identity(),
-            post_exit,
-            cancellation,
-        )
-        .await
+        verify_post_exit(backend, endpoint, plan.identity(), post_exit, cancellation).await
     };
     if let Err(error) = record_journal(journal, JournalEvent::Finished { evidence: &result }) {
         let _first = result
@@ -498,6 +502,44 @@ async fn run_workflow(
             .get_or_insert_with(|| Failure::from_error(&error));
     }
     result
+}
+
+/// The fresh CAT check after the acknowledged exit: identity then Gateway Off,
+/// with one open on the main-unit endpoint and the bounded silent-`ID` retry
+/// on the operation-panel endpoint, which answers `ID` only once its tuple is
+/// ready.
+async fn verify_post_exit(
+    backend: &mut impl Backend,
+    endpoint: &SerialCandidate,
+    identity: &kenwood_tmd750::Identity,
+    post_exit: Recorder<File>,
+    cancelled: &AtomicBool,
+) -> PostExit {
+    if endpoint.pid == Some(TMD750_PANEL_PID) {
+        PostExit::Readiness(
+            reconnect::verify_readiness_gateway_off(
+                backend,
+                endpoint,
+                DEFAULT_BAUD,
+                identity,
+                post_exit,
+                cancelled,
+            )
+            .await,
+        )
+    } else {
+        PostExit::Single(
+            reconnect::verify_required_gateway_off(
+                backend,
+                endpoint,
+                DEFAULT_BAUD,
+                identity,
+                post_exit,
+                cancelled,
+            )
+            .await,
+        )
+    }
 }
 
 #[derive(Serialize)]
@@ -516,9 +558,10 @@ struct Report {
 
 /// Reserve the capture files and journal, then run the update and its CAT check.
 ///
-/// Returns `CommandError` on a non-Unix host, or when the endpoint is not the
-/// pinned main-unit USB endpoint at 9600 baud. Nothing is opened until every
-/// capture file and the journal exist and their directories are synchronized.
+/// Returns `CommandError` on a non-Unix host, or when the endpoint is not a
+/// TM-D750 main-unit or operation-panel USB endpoint at 9600 baud. Nothing is
+/// opened until every capture file and the journal exist and their directories
+/// are synchronized.
 pub(super) async fn run(
     endpoint: &SerialCandidate,
     baud: u32,
@@ -530,9 +573,13 @@ pub(super) async fn run(
         )
         .into());
     }
-    if !endpoint.is_tmd750() || endpoint.pid != Some(TMD750_MAIN_PID) || baud != DEFAULT_BAUD {
+    if !endpoint.is_tmd750()
+        || !matches!(endpoint.pid, Some(TMD750_MAIN_PID | TMD750_PANEL_PID))
+        || baud != DEFAULT_BAUD
+    {
         return Err(CommandError(
-            "menu updates require the pinned main-unit USB endpoint at 9600 baud".to_owned(),
+            "menu updates require a TM-D750 main-unit or operation-panel USB endpoint at 9600 baud"
+                .to_owned(),
         )
         .into());
     }

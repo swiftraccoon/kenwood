@@ -1,14 +1,15 @@
-//! Bounded identity-only CAT reacquisition after an acknowledged MCP exit.
+//! Bounded CAT reacquisition after an acknowledged MCP exit.
 //!
 //! Attempts re-enumerate the selected endpoint, open it and read the ID/FV/TY
-//! tuple. Nothing here re-enters MCP, re-reads memory, or writes a setting.
+//! tuple, optionally followed by one `GW` query once the tuple matches.
+//! Nothing here re-enters MCP, re-reads memory, or writes a setting.
 
 use super::{
-    AtomicBool, Backend, CLOSE_TIMEOUT, ConnectionAttempt, Duration, Enumeration,
-    EnumerationWindow, Failure, File, Identity, Ordering, PostExitVerification, Recorder, SETTLE,
-    SerialCandidate, Serialize, SkipReason, TranscriptSummary, VerificationContext,
-    VerificationGoal, VerificationOutcome, VerificationStage, attempt_identity, await_endpoint,
-    finalize_capture, milliseconds, wait_recorded,
+    AtomicBool, Backend, CLOSE_TIMEOUT, ConnectionAttempt, Duration, DvGatewayMode, Enumeration,
+    EnumerationWindow, Failure, File, GatewayEvidence, Identity, Ordering, PostExitVerification,
+    Recorder, SETTLE, SerialCandidate, Serialize, SkipReason, TranscriptSummary,
+    VerificationContext, VerificationGoal, VerificationOutcome, VerificationStage,
+    attempt_identity, await_endpoint, finalize_capture, milliseconds, wait_recorded,
 };
 
 /// Deadline for each write and each reply of the three identity queries (1.5 s).
@@ -19,12 +20,29 @@ const READINESS_BUDGET: Duration = Duration::from_secs(60);
 /// Wait between one attempt's close and the next open (2 s).
 const RETRY_INTERVAL: Duration = Duration::from_secs(2);
 /// Opens permitted within one reacquisition.
-const MAXIMUM_OPEN_ATTEMPTS: usize = 4;
-/// Budget one attempt may still need: a write and a reply deadline for each of
-/// ID, FV and TY, followed by the bounded close.
+///
+/// Attempts run about 3.5 s apart, so six cover roughly the first 25 s of
+/// the budget. On firmware 1.02 the operation-panel endpoint has answered
+/// `ID` on the third or fourth open after an MCP exit; the main-unit endpoint
+/// answers on the first open once it re-enumerates.
+pub(crate) const MAXIMUM_OPEN_ATTEMPTS: usize = 6;
+/// Budget one identity-only attempt may still need: a write and a reply
+/// deadline for each of ID, FV and TY, followed by the bounded close.
 const ATTEMPT_ALLOWANCE: Duration = EXCHANGE_TIMEOUT
     .saturating_mul(6)
     .saturating_add(CLOSE_TIMEOUT);
+/// `ATTEMPT_ALLOWANCE` plus the write and reply deadlines of the one `GW` query.
+const GATEWAY_ATTEMPT_ALLOWANCE: Duration = EXCHANGE_TIMEOUT
+    .saturating_mul(8)
+    .saturating_add(CLOSE_TIMEOUT);
+
+/// Budget one attempt of `goal` may still need before its close completes.
+pub(super) const fn attempt_allowance(goal: VerificationGoal) -> Duration {
+    match goal {
+        VerificationGoal::IdentityOnly => ATTEMPT_ALLOWANCE,
+        VerificationGoal::GatewayOff => GATEWAY_ATTEMPT_ALLOWANCE,
+    }
+}
 
 /// Whether this completed check permits one more open attempt.
 #[derive(Debug, Serialize)]
@@ -49,10 +67,11 @@ struct ReadinessAttempt {
     retry_admission: RetryAdmission,
 }
 
-/// Serialized report of one bounded identity-only CAT reacquisition.
+/// Serialized report of one bounded CAT reacquisition.
 ///
 /// Holds the settle delay, budgets, retry interval and per-attempt allowance in
-/// milliseconds, the open-attempt cap, one record per attempt, the shared
+/// milliseconds, the open-attempt cap, the Gateway state one `GW` query had to
+/// report when the caller required it, one record per attempt, the shared
 /// transcript summary and the final outcome.
 #[derive(Debug, Serialize)]
 pub(crate) struct ReadinessVerification {
@@ -63,6 +82,8 @@ pub(crate) struct ReadinessVerification {
     exchange_timeout_milliseconds: u64,
     attempt_allowance_milliseconds: u64,
     maximum_open_attempts: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    required_gateway_mode: Option<GatewayEvidence>,
     elapsed_milliseconds: u64,
     attempts: Vec<ReadinessAttempt>,
     /// Summary of the one transcript spanning all readiness attempts.
@@ -84,6 +105,7 @@ impl ReadinessVerification {
             exchange_timeout_milliseconds: milliseconds(EXCHANGE_TIMEOUT),
             attempt_allowance_milliseconds: milliseconds(ATTEMPT_ALLOWANCE),
             maximum_open_attempts: MAXIMUM_OPEN_ATTEMPTS,
+            required_gateway_mode: None,
             elapsed_milliseconds: 0,
             attempts: Vec::new(),
             transcript,
@@ -94,6 +116,24 @@ impl ReadinessVerification {
     /// True when the outcome is `Matched` and the transcript is complete.
     pub(crate) const fn succeeded(&self) -> bool {
         self.transcript.complete && matches!(self.outcome, VerificationOutcome::Matched)
+    }
+
+    /// Identity and Gateway mode read by a reacquisition that required Gateway Off.
+    ///
+    /// Returns `None` when the reacquisition read the identity only, did not
+    /// succeed, or its final attempt did not observe Gateway Off.
+    pub(in crate::mcp) fn gateway_off_evidence(&self) -> Option<(&Identity, DvGatewayMode)> {
+        if !self.succeeded()
+            || self.required_gateway_mode != Some(GatewayEvidence(DvGatewayMode::Off))
+        {
+            return None;
+        }
+        let connection = self.attempts.last()?.connection.as_ref()?;
+        let mode = connection.gateway_mode?.0;
+        if mode != DvGatewayMode::Off {
+            return None;
+        }
+        Some((&connection.identity.as_ref()?.0, mode))
     }
 
     fn fail(&mut self, stage: VerificationStage, message: &str) {
@@ -116,11 +156,11 @@ impl ReadinessVerification {
     }
 }
 
-/// True when `deadline - now` still covers `ATTEMPT_ALLOWANCE`.
+/// True when `deadline - now` still covers one attempt of `goal`.
 ///
-/// Both arguments are elapsed times from the backend's clock origin.
-pub(super) fn can_dispatch(now: Duration, deadline: Duration) -> bool {
-    deadline.saturating_sub(now) >= ATTEMPT_ALLOWANCE
+/// Both durations are elapsed times from the backend's clock origin.
+pub(super) fn can_dispatch(now: Duration, deadline: Duration, goal: VerificationGoal) -> bool {
+    deadline.saturating_sub(now) >= attempt_allowance(goal)
 }
 
 /// Record a `Readiness` failure: too little budget remains for one attempt.
@@ -150,10 +190,65 @@ pub(crate) async fn verify_readiness(
     endpoint: &SerialCandidate,
     baud: u32,
     original_identity: &Identity,
-    mut recorder: Recorder<File>,
+    recorder: Recorder<File>,
     cancelled: &AtomicBool,
 ) -> ReadinessVerification {
+    verify_readiness_with(
+        backend,
+        endpoint,
+        baud,
+        original_identity,
+        recorder,
+        cancelled,
+        VerificationGoal::IdentityOnly,
+    )
+    .await
+}
+
+/// Reacquire the CAT identity tuple, then require one `GW` query to report Off.
+///
+/// The open, retry and budget rules are those of [`verify_readiness`], with
+/// each attempt's allowance extended by the `GW` exchange. The query is sent
+/// once per attempt, only after that attempt's complete tuple matched; a
+/// Gateway state other than Off or a failed `GW` read ends the reacquisition
+/// on that attempt, since only a silent identity timeout admits another open.
+/// [`ReadinessVerification::gateway_off_evidence`] returns the observations
+/// after success.
+pub(crate) async fn verify_readiness_gateway_off(
+    backend: &mut impl Backend,
+    endpoint: &SerialCandidate,
+    baud: u32,
+    original_identity: &Identity,
+    recorder: Recorder<File>,
+    cancelled: &AtomicBool,
+) -> ReadinessVerification {
+    verify_readiness_with(
+        backend,
+        endpoint,
+        baud,
+        original_identity,
+        recorder,
+        cancelled,
+        VerificationGoal::GatewayOff,
+    )
+    .await
+}
+
+async fn verify_readiness_with(
+    backend: &mut impl Backend,
+    endpoint: &SerialCandidate,
+    baud: u32,
+    original_identity: &Identity,
+    mut recorder: Recorder<File>,
+    cancelled: &AtomicBool,
+    goal: VerificationGoal,
+) -> ReadinessVerification {
+    let allowance = attempt_allowance(goal);
     let mut result = ReadinessVerification::skipped(SkipReason::Cancelled, recorder.summary());
+    result.attempt_allowance_milliseconds = milliseconds(allowance);
+    if matches!(goal, VerificationGoal::GatewayOff) {
+        result.required_gateway_mode = Some(GatewayEvidence(DvGatewayMode::Off));
+    }
     if cancelled.load(Ordering::Relaxed) || recorder.ensure_complete().is_err() {
         result.finalize(&mut recorder);
         return result;
@@ -168,7 +263,7 @@ pub(crate) async fn verify_readiness(
         baud,
         original_identity,
         cancelled,
-        goal: VerificationGoal::IdentityOnly,
+        goal,
         dispatch_deadline: Some(deadline),
     };
     loop {
@@ -188,7 +283,7 @@ pub(crate) async fn verify_readiness(
         .await;
         let mut retry = false;
         if let Some(selected) = selected {
-            if can_dispatch(backend.now(), deadline) {
+            if can_dispatch(backend.now(), deadline, goal) {
                 let attempt =
                     attempt_identity(backend, &selected, context, recorder, &mut check).await;
                 recorder = attempt.recorder;
@@ -226,7 +321,7 @@ pub(crate) async fn verify_readiness(
             );
             break;
         }
-        if deadline.saturating_sub(backend.now()) < RETRY_INTERVAL + ATTEMPT_ALLOWANCE {
+        if deadline.saturating_sub(backend.now()) < RETRY_INTERVAL + allowance {
             result.fail(
                 VerificationStage::Readiness,
                 "CAT readiness budget exhausted before retry",
