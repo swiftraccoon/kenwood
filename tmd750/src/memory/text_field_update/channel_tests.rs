@@ -1,5 +1,11 @@
+use std::num::NonZeroU64;
+
+use super::super::{
+    ChannelNameUpdate, TextFieldUpdateError, TextFieldUpdateEvent,
+    TextFieldUpdateSession as Session, TextFieldUpdateStatus,
+};
 use super::*;
-use crate::types::{FirmwareIdentity, RadioType};
+use crate::types::{FirmwareIdentity, RadioModel, RadioType};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -57,32 +63,31 @@ fn fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
 }
 
 fn fresh(fixture: &mut Fixture, session: u64) -> TestResult {
-    fixture
-        .update
-        .record(ChannelNameUpdateEvent::FreshSession {
-            id: id(session)?,
-            identity: &fixture.identity,
-            memory_format: 0,
-            whole_page: if session == 1 {
-                &fixture.original
-            } else {
-                &fixture.desired
-            },
-        })?;
+    fixture.update.record(TextFieldUpdateEvent::FreshSession {
+        id: id(session)?,
+        identity: &fixture.identity,
+        memory_format: 0,
+        whole_page: if session == 1 {
+            &fixture.original
+        } else {
+            &fixture.desired
+        },
+        guards: (),
+    })?;
     Ok(())
 }
 
 fn intent(fixture: &mut Fixture) -> TestResult {
     fixture
         .update
-        .record(ChannelNameUpdateEvent::DurableWriteIntent { id: id(1)? })?;
+        .record(TextFieldUpdateEvent::DurableWriteIntent { id: id(1)? })?;
     Ok(())
 }
 
 fn readback(fixture: &mut Fixture) -> TestResult {
     fixture
         .update
-        .record(ChannelNameUpdateEvent::ImmediateReadback {
+        .record(TextFieldUpdateEvent::ImmediateReadback {
             whole_page: &fixture.desired,
         })?;
     Ok(())
@@ -91,16 +96,25 @@ fn readback(fixture: &mut Fixture) -> TestResult {
 fn finalize(fixture: &mut Fixture, session: u64) -> TestResult {
     fixture
         .update
-        .record(ChannelNameUpdateEvent::SessionFinalized { id: id(session)? })?;
+        .record(TextFieldUpdateEvent::SessionFinalized {
+            id: id(session)?,
+            guards: (),
+        })?;
     Ok(())
 }
 
 #[test]
 fn names_reject_every_nonprintable_byte_and_pad_the_field_with_nul() -> TestResult {
     for text in ["", "12345678901234567", "CH\n1", "CH\0", "C\u{7f}H", "CHé"] {
-        assert_eq!(
-            ChannelNameText::new(text),
-            Err(ChannelNameUpdateError::InvalidName)
+        assert!(
+            matches!(
+                ChannelNameText::new(text),
+                Err(TextFieldUpdateError::InvalidText {
+                    field: "channel name",
+                    ..
+                })
+            ),
+            "{text:?}"
         );
     }
     for byte in 0..=u8::MAX {
@@ -163,14 +177,15 @@ fn preparation_changes_only_the_channel_field_and_keeps_the_shared_names() -> Te
         Some(&name("Home APRS")?),
     )?;
     assert_eq!(update.channel(), channel(1101)?);
+    assert_eq!(update.field(), TextField::ChannelName(channel(1101)?));
     assert_eq!(update.page().address().as_usize(), 82_944);
     assert_eq!(update.original_page(), &original);
     assert_eq!(
-        update.current_name().map(ChannelNameText::as_str),
+        update.current().map(ChannelNameText::as_str),
         Some("APRS Channel")
     );
     assert_eq!(
-        update.desired_name().map(ChannelNameText::as_str),
+        update.requested().map(ChannelNameText::as_str),
         Some("Home APRS")
     );
     assert_eq!(
@@ -182,7 +197,7 @@ fn preparation_changes_only_the_channel_field_and_keeps_the_shared_names() -> Te
             assert_eq!(before, after, "unrelated byte {index}");
         }
     }
-    assert_eq!(update.status(), ChannelNameUpdateStatus::NotWritten);
+    assert_eq!(update.status(), TextFieldUpdateStatus::NotWritten);
     assert_eq!(update.next_session()?, Session::Apply);
     Ok(())
 }
@@ -193,11 +208,8 @@ fn unnamed_is_sixteen_nuls_clearing_is_a_change_and_noops_are_rejected() -> Test
     let unnamed = unnamed_999_page()?;
     let update =
         ChannelNameUpdate::prepare(&identity, &unnamed, channel(999)?, None, Some(&name("X")?))?;
-    assert_eq!(update.current_name(), None);
-    assert_eq!(
-        update.desired_name().map(ChannelNameText::as_str),
-        Some("X")
-    );
+    assert_eq!(update.current(), None);
+    assert_eq!(update.requested().map(ChannelNameText::as_str), Some("X"));
     assert_eq!(
         ChannelNameUpdate::prepare(
             &identity,
@@ -207,11 +219,11 @@ fn unnamed_is_sixteen_nuls_clearing_is_a_change_and_noops_are_rejected() -> Test
             Some(&name("Y")?)
         )
         .err(),
-        Some(ChannelNameUpdateError::CurrentNameMismatch)
+        Some(TextFieldUpdateError::CurrentValueMismatch)
     );
     assert_eq!(
         ChannelNameUpdate::prepare(&identity, &unnamed, channel(999)?, None, None).err(),
-        Some(ChannelNameUpdateError::NoChange)
+        Some(TextFieldUpdateError::NoChange)
     );
     let mut named = unnamed;
     named
@@ -227,11 +239,11 @@ fn unnamed_is_sixteen_nuls_clearing_is_a_change_and_noops_are_rejected() -> Test
             Some(&name("Y")?)
         )
         .err(),
-        Some(ChannelNameUpdateError::NoChange)
+        Some(TextFieldUpdateError::NoChange)
     );
     let cleared =
         ChannelNameUpdate::prepare(&identity, &named, channel(999)?, Some(&name("Y")?), None)?;
-    assert_eq!(cleared.desired_name(), None);
+    assert_eq!(cleared.requested(), None);
     assert_eq!(
         cleared.desired_page().get(112..128),
         Some([0; 16].as_slice())
@@ -240,7 +252,7 @@ fn unnamed_is_sixteen_nuls_clearing_is_a_change_and_noops_are_rejected() -> Test
     *stray.get_mut(113).ok_or("padding byte")? = b'A';
     assert_eq!(
         ChannelNameUpdate::prepare(&identity, &stray, channel(999)?, Some(&name("Y")?), None).err(),
-        Some(ChannelNameUpdateError::CurrentNameMismatch),
+        Some(TextFieldUpdateError::CurrentValueMismatch),
         "padding must be exact"
     );
     Ok(())
@@ -258,7 +270,7 @@ fn preparation_rejects_other_identities_and_partial_pages() -> TestResult {
         assert_eq!(
             ChannelNameUpdate::prepare(&identity, &unnamed, channel(999)?, None, Some(&name("X")?))
                 .err(),
-            Some(ChannelNameUpdateError::IdentityMismatch)
+            Some(TextFieldUpdateError::IdentityMismatch)
         );
     }
     for length in [0, 255, 257] {
@@ -272,7 +284,7 @@ fn preparation_rejects_other_identities_and_partial_pages() -> TestResult {
                 Some(&name("X")?)
             )
             .err(),
-            Some(ChannelNameUpdateError::PageLength { actual: length })
+            Some(TextFieldUpdateError::PageLength { actual: length })
         );
     }
     Ok(())
@@ -282,42 +294,45 @@ fn preparation_rejects_other_identities_and_partial_pages() -> TestResult {
 fn two_sessions_verify_across_sessions_and_intent_marks_a_possible_change() -> TestResult {
     let mut fixture = fixture()?;
     fresh(&mut fixture, 1)?;
-    assert_eq!(fixture.update.status(), ChannelNameUpdateStatus::NotWritten);
+    assert_eq!(fixture.update.status(), TextFieldUpdateStatus::NotWritten);
     assert_eq!(
         fixture.update.next_session(),
-        Err(ChannelNameUpdateError::UnexpectedEvent)
+        Err(TextFieldUpdateError::UnexpectedEvent)
     );
     intent(&mut fixture)?;
     assert_eq!(
         fixture.update.status(),
-        ChannelNameUpdateStatus::PossiblyChanged
+        TextFieldUpdateStatus::PossiblyChanged
     );
     readback(&mut fixture)?;
     finalize(&mut fixture, 1)?;
     assert_eq!(fixture.update.next_session()?, Session::Verify);
     assert_eq!(
         fixture.update.status(),
-        ChannelNameUpdateStatus::PossiblyChanged
+        TextFieldUpdateStatus::PossiblyChanged
     );
     fresh(&mut fixture, 2)?;
     finalize(&mut fixture, 2)?;
     assert_eq!(
         fixture.update.status(),
-        ChannelNameUpdateStatus::VerifiedAcrossSessions
+        TextFieldUpdateStatus::VerifiedAcrossSessions
     );
     assert_eq!(
         fixture.update.next_session(),
-        Err(ChannelNameUpdateError::TerminalState)
+        Err(TextFieldUpdateError::TerminalState)
     );
     assert_eq!(
         fixture
             .update
-            .record(ChannelNameUpdateEvent::SessionFinalized { id: id(2)? }),
-        Err(ChannelNameUpdateError::TerminalState)
+            .record(TextFieldUpdateEvent::SessionFinalized {
+                id: id(2)?,
+                guards: (),
+            }),
+        Err(TextFieldUpdateError::TerminalState)
     );
     assert_eq!(
         fixture.update.status(),
-        ChannelNameUpdateStatus::VerifiedAcrossSessions
+        TextFieldUpdateStatus::VerifiedAcrossSessions
     );
     Ok(())
 }
@@ -328,40 +343,43 @@ fn every_comparison_requires_the_exact_page_and_a_failure_keeps_the_status() -> 
     let mut page = drifted.original;
     *page.get_mut(0).ok_or("first byte")? ^= 1;
     assert_eq!(
-        drifted.update.record(ChannelNameUpdateEvent::FreshSession {
+        drifted.update.record(TextFieldUpdateEvent::FreshSession {
             id: id(1)?,
             identity: &drifted.identity,
             memory_format: 0,
             whole_page: &page,
+            guards: (),
         }),
-        Err(ChannelNameUpdateError::PageMismatch)
+        Err(TextFieldUpdateError::PageMismatch)
     );
-    assert_eq!(drifted.update.status(), ChannelNameUpdateStatus::NotWritten);
+    assert_eq!(drifted.update.status(), TextFieldUpdateStatus::NotWritten);
     assert_eq!(
         drifted.update.next_session(),
-        Err(ChannelNameUpdateError::TerminalState)
+        Err(TextFieldUpdateError::TerminalState)
     );
 
     let mut partial = fixture()?;
     assert_eq!(
-        partial.update.record(ChannelNameUpdateEvent::FreshSession {
+        partial.update.record(TextFieldUpdateEvent::FreshSession {
             id: id(1)?,
             identity: &partial.identity,
             memory_format: 0,
             whole_page: partial.original.get(..255).ok_or("partial page")?,
+            guards: (),
         }),
-        Err(ChannelNameUpdateError::PageLength { actual: 255 })
+        Err(TextFieldUpdateError::PageLength { actual: 255 })
     );
 
     let mut format = fixture()?;
     assert_eq!(
-        format.update.record(ChannelNameUpdateEvent::FreshSession {
+        format.update.record(TextFieldUpdateEvent::FreshSession {
             id: id(1)?,
             identity: &format.identity,
             memory_format: 1,
             whole_page: &format.original,
+            guards: (),
         }),
-        Err(ChannelNameUpdateError::MemoryFormat { actual: 1 })
+        Err(TextFieldUpdateError::MemoryFormat { actual: 1 })
     );
 
     let mut other = fixture()?;
@@ -371,13 +389,14 @@ fn every_comparison_requires_the_exact_page_and_a_failure_keeps_the_status() -> 
         radio_type: RadioType::new("K,2,1")?,
     };
     assert_eq!(
-        other.update.record(ChannelNameUpdateEvent::FreshSession {
+        other.update.record(TextFieldUpdateEvent::FreshSession {
             id: id(1)?,
             identity: &stranger,
             memory_format: 0,
             whole_page: &other.original,
+            guards: (),
         }),
-        Err(ChannelNameUpdateError::IdentityMismatch)
+        Err(TextFieldUpdateError::IdentityMismatch)
     );
 
     let mut wrong_readback = fixture()?;
@@ -388,17 +407,17 @@ fn every_comparison_requires_the_exact_page_and_a_failure_keeps_the_status() -> 
     assert_eq!(
         wrong_readback
             .update
-            .record(ChannelNameUpdateEvent::ImmediateReadback { whole_page: &page }),
-        Err(ChannelNameUpdateError::PageMismatch)
+            .record(TextFieldUpdateEvent::ImmediateReadback { whole_page: &page }),
+        Err(TextFieldUpdateError::PageMismatch)
     );
     assert_eq!(
         wrong_readback.update.status(),
-        ChannelNameUpdateStatus::PossiblyChanged,
+        TextFieldUpdateStatus::PossiblyChanged,
         "a failed readback never clears the write risk"
     );
     assert_eq!(
         wrong_readback.update.next_session(),
-        Err(ChannelNameUpdateError::TerminalState)
+        Err(TextFieldUpdateError::TerminalState)
     );
 
     let mut stale_verify = fixture()?;
@@ -409,18 +428,19 @@ fn every_comparison_requires_the_exact_page_and_a_failure_keeps_the_status() -> 
     assert_eq!(
         stale_verify
             .update
-            .record(ChannelNameUpdateEvent::FreshSession {
+            .record(TextFieldUpdateEvent::FreshSession {
                 id: id(2)?,
                 identity: &stale_verify.identity,
                 memory_format: 0,
                 whole_page: &stale_verify.original,
+                guards: (),
             }),
-        Err(ChannelNameUpdateError::PageMismatch),
+        Err(TextFieldUpdateError::PageMismatch),
         "verification compares the desired page, not the original"
     );
     assert_eq!(
         stale_verify.update.status(),
-        ChannelNameUpdateStatus::PossiblyChanged
+        TextFieldUpdateStatus::PossiblyChanged
     );
     Ok(())
 }
@@ -432,11 +452,11 @@ fn reused_sessions_out_of_order_events_and_wrong_finalization_ids_halt() -> Test
         intent(&mut early_intent)
             .err()
             .map(|error| error.to_string()),
-        Some(ChannelNameUpdateError::UnexpectedEvent.to_string())
+        Some(TextFieldUpdateError::UnexpectedEvent.to_string())
     );
     assert_eq!(
         early_intent.update.status(),
-        ChannelNameUpdateStatus::NotWritten
+        TextFieldUpdateStatus::NotWritten
     );
 
     let mut repeated_intent = fixture()?;
@@ -446,11 +466,11 @@ fn reused_sessions_out_of_order_events_and_wrong_finalization_ids_halt() -> Test
         intent(&mut repeated_intent)
             .err()
             .map(|error| error.to_string()),
-        Some(ChannelNameUpdateError::UnexpectedEvent.to_string())
+        Some(TextFieldUpdateError::UnexpectedEvent.to_string())
     );
     assert_eq!(
         repeated_intent.update.status(),
-        ChannelNameUpdateStatus::PossiblyChanged
+        TextFieldUpdateStatus::PossiblyChanged
     );
 
     let mut wrong_id = fixture()?;
@@ -461,11 +481,11 @@ fn reused_sessions_out_of_order_events_and_wrong_finalization_ids_halt() -> Test
         finalize(&mut wrong_id, 2)
             .err()
             .map(|error| error.to_string()),
-        Some(ChannelNameUpdateError::SessionMismatch.to_string())
+        Some(TextFieldUpdateError::SessionMismatch.to_string())
     );
     assert_eq!(
         wrong_id.update.next_session(),
-        Err(ChannelNameUpdateError::TerminalState)
+        Err(TextFieldUpdateError::TerminalState)
     );
 
     let mut reused = fixture()?;
@@ -474,13 +494,14 @@ fn reused_sessions_out_of_order_events_and_wrong_finalization_ids_halt() -> Test
     readback(&mut reused)?;
     finalize(&mut reused, 1)?;
     assert_eq!(
-        reused.update.record(ChannelNameUpdateEvent::FreshSession {
+        reused.update.record(TextFieldUpdateEvent::FreshSession {
             id: id(1)?,
             identity: &reused.identity,
             memory_format: 0,
             whole_page: &reused.desired,
+            guards: (),
         }),
-        Err(ChannelNameUpdateError::ReusedSession)
+        Err(TextFieldUpdateError::ReusedSession)
     );
 
     let mut skipped_readback = fixture()?;
@@ -490,7 +511,7 @@ fn reused_sessions_out_of_order_events_and_wrong_finalization_ids_halt() -> Test
         finalize(&mut skipped_readback, 1)
             .err()
             .map(|error| error.to_string()),
-        Some(ChannelNameUpdateError::UnexpectedEvent.to_string())
+        Some(TextFieldUpdateError::UnexpectedEvent.to_string())
     );
     Ok(())
 }
@@ -501,17 +522,17 @@ fn explicit_halt_is_irreversible_at_every_nonterminal_stage() -> TestResult {
     before_any.update.halt();
     assert_eq!(
         before_any.update.next_session(),
-        Err(ChannelNameUpdateError::TerminalState)
+        Err(TextFieldUpdateError::TerminalState)
     );
     assert_eq!(
         fresh(&mut before_any, 1)
             .err()
             .map(|error| error.to_string()),
-        Some(ChannelNameUpdateError::TerminalState.to_string())
+        Some(TextFieldUpdateError::TerminalState.to_string())
     );
     assert_eq!(
         before_any.update.status(),
-        ChannelNameUpdateStatus::NotWritten
+        TextFieldUpdateStatus::NotWritten
     );
 
     let mut after_intent = fixture()?;
@@ -520,14 +541,14 @@ fn explicit_halt_is_irreversible_at_every_nonterminal_stage() -> TestResult {
     after_intent.update.halt();
     assert_eq!(
         after_intent.update.status(),
-        ChannelNameUpdateStatus::PossiblyChanged,
+        TextFieldUpdateStatus::PossiblyChanged,
         "halting never clears an accepted intent"
     );
     assert_eq!(
         readback(&mut after_intent)
             .err()
             .map(|error| error.to_string()),
-        Some(ChannelNameUpdateError::TerminalState.to_string())
+        Some(TextFieldUpdateError::TerminalState.to_string())
     );
 
     let mut complete = fixture()?;
@@ -540,7 +561,7 @@ fn explicit_halt_is_irreversible_at_every_nonterminal_stage() -> TestResult {
     complete.update.halt();
     assert_eq!(
         complete.update.status(),
-        ChannelNameUpdateStatus::VerifiedAcrossSessions,
+        TextFieldUpdateStatus::VerifiedAcrossSessions,
         "a completed update keeps its verified status"
     );
     Ok(())

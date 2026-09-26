@@ -23,9 +23,9 @@
 //!   Prepare ordinary changes with [`menu::MenuUpdatePlan`] and persistent
 //!   Gateway changes with [`terminal::TerminalPlan`]. A plan is local data;
 //!   applying it is a separate session.
-//! - The PM1/MY1 update and fixed-trial modules perform single-page writes to
-//!   fixed targets under stricter guards. They are not prerequisites for the
-//!   ordinary menu API.
+//! - The text field update and fixed-trial modules perform single-page writes
+//!   to fixed targets under stricter guards. They are not prerequisites for
+//!   the ordinary menu API.
 //!
 //! # Ownership and failure
 //!
@@ -38,10 +38,7 @@
 
 pub mod backup;
 mod cat;
-pub mod channel_name_update;
 pub mod menu;
-pub mod my1_callsign_update;
-pub mod pm1_name_update;
 mod pm1_page;
 pub mod pm_name_trial;
 pub mod programming;
@@ -49,6 +46,7 @@ pub mod qualification;
 pub mod readiness;
 pub mod terminal;
 pub mod terminal_exit_trial;
+pub mod text_field_update;
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -72,6 +70,44 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(1500);
 /// Switching Bluetooth on restarts the radio's Bluetooth stack, and on
 /// firmware 1.02 the echo arrived about 1.6 s after the command.
 pub const BLUETOOTH_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Reply deadline for the first command on a new Bluetooth connection.
+///
+/// On firmware 1.02 the radio holds the reply to the first command of a
+/// Bluetooth connection opened within about five seconds of the previous
+/// connection's close until about five seconds after that close; the command
+/// is answered late, not dropped. Pass it to [`Radio::set_next_reply_timeout`]
+/// before the first command, or for the first connection after a programming
+/// exit pass [`bluetooth_first_reply_timeout_after_exit`], which never returns
+/// less. A host bound sized from observation, not a firmware guarantee.
+pub const BLUETOOTH_FIRST_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Time after a programming-exit acknowledgment by which the first reply on a
+/// fresh Bluetooth connection arrives.
+///
+/// On firmware 1.02 that reply arrived 20 to 22 seconds after the exit
+/// acknowledgment however soon the command was sent: a command sent earlier
+/// was held, not dropped. A host bound sized from observation, not a firmware
+/// guarantee.
+pub const BLUETOOTH_EXIT_REPLY_BOUND: Duration = Duration::from_secs(30);
+
+/// Reply deadline for the first command on a fresh Bluetooth connection sent
+/// `since_exit` after a programming-exit acknowledgment.
+///
+/// Returns the time left until [`BLUETOOTH_EXIT_REPLY_BOUND`], or
+/// [`BLUETOOTH_FIRST_REPLY_TIMEOUT`] when that is longer, so the deadline
+/// covers the post-exit hold however quickly the connection reopened. An
+/// overestimate of `since_exit` shortens the deadline; measure it from a
+/// point no earlier than the acknowledgment.
+#[must_use]
+pub const fn bluetooth_first_reply_timeout_after_exit(since_exit: Duration) -> Duration {
+    let remaining = BLUETOOTH_EXIT_REPLY_BOUND.saturating_sub(since_exit);
+    if remaining.as_nanos() > BLUETOOTH_FIRST_REPLY_TIMEOUT.as_nanos() {
+        remaining
+    } else {
+        BLUETOOTH_FIRST_REPLY_TIMEOUT
+    }
+}
 
 /// Time [`Radio`] keeps reading and discarding after a reply that follows a
 /// `?` rejection.
@@ -202,6 +238,7 @@ impl fmt::Display for Identity {
 pub struct Radio<T: Transport> {
     transport: T,
     timeout: Duration,
+    next_reply_timeout: Option<Duration>,
     identity: Option<Identity>,
     receive_buffer: VecDeque<u8>,
     protocol_state: ProtocolState,
@@ -220,6 +257,7 @@ impl<T: Transport> Radio<T> {
         Self {
             transport,
             timeout: DEFAULT_TIMEOUT,
+            next_reply_timeout: None,
             identity: None,
             receive_buffer: VecDeque::new(),
             protocol_state: ProtocolState::CatReady,
@@ -237,6 +275,17 @@ impl<T: Transport> Radio<T> {
     /// A `BT` write keeps at least [`BLUETOOTH_WRITE_TIMEOUT`].
     pub const fn set_timeout(&mut self, timeout: Duration) {
         self.timeout = timeout;
+    }
+
+    /// Give the reply to the next CAT command up to `timeout`, once.
+    ///
+    /// The longer of `timeout` and the regular reply deadline applies to that
+    /// one command, which consumes the setting when it is sent, whatever its
+    /// outcome; later commands use the regular deadline, and MCP exchanges
+    /// never use it. Use [`BLUETOOTH_FIRST_REPLY_TIMEOUT`] before the first
+    /// command on a new Bluetooth connection.
+    pub const fn set_next_reply_timeout(&mut self, timeout: Duration) {
+        self.next_reply_timeout = Some(timeout);
     }
 
     /// The identity proven by the last [`Radio::identify`].
@@ -405,8 +454,8 @@ impl<T: Transport> Radio<T> {
     pub(crate) async fn command(&mut self, command: &Command) -> Result<Response, Error> {
         self.require_cat()?;
         self.protocol_state = ProtocolState::RecoveryRequired;
-        self.write_all(&command.encode()).await?;
         let timeout = self.reply_timeout(command);
+        self.write_all(&command.encode()).await?;
         let mut stale = 0;
         loop {
             let line = self.read_line_with(timeout, command.mnemonic()).await?;
@@ -526,12 +575,17 @@ impl<T: Transport> Radio<T> {
         Ok(())
     }
 
-    fn reply_timeout(&self, command: &Command) -> Duration {
-        if matches!(command, Command::SetBluetooth { .. }) {
+    /// The reply deadline for `command`, consuming a pending
+    /// [`Self::set_next_reply_timeout`].
+    fn reply_timeout(&mut self, command: &Command) -> Duration {
+        let regular = if matches!(command, Command::SetBluetooth { .. }) {
             self.timeout.max(BLUETOOTH_WRITE_TIMEOUT)
         } else {
             self.timeout
-        }
+        };
+        self.next_reply_timeout
+            .take()
+            .map_or(regular, |next| next.max(regular))
     }
 
     /// Discard buffered bytes and anything that arrives within

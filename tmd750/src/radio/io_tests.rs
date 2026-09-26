@@ -337,6 +337,112 @@ async fn complete_rejection_replies_leave_the_cat_boundary_ready() -> TestResult
     Ok(())
 }
 
+/// Replies released one per write, each only after its own hold, as the
+/// radio holds the first reply on a Bluetooth connection.
+#[derive(Debug)]
+struct HeldTransport {
+    replies: VecDeque<(Duration, Vec<u8>)>,
+    pending: Option<(Duration, Vec<u8>)>,
+}
+
+impl HeldTransport {
+    fn new(replies: impl IntoIterator<Item = (Duration, Vec<u8>)>) -> Self {
+        Self {
+            replies: replies.into_iter().collect(),
+            pending: None,
+        }
+    }
+}
+
+impl Transport for HeldTransport {
+    async fn write(&mut self, _bytes: &[u8]) -> Result<(), TransportError> {
+        self.pending = self.replies.pop_front();
+        Ok(())
+    }
+
+    async fn read(&mut self, buffer: &mut [u8]) -> Result<usize, TransportError> {
+        let Some((hold, reply)) = self.pending.take() else {
+            return std::future::pending().await;
+        };
+        tokio::time::sleep(hold).await;
+        let count = reply.len().min(buffer.len());
+        for (target, source) in buffer.iter_mut().zip(&reply) {
+            *target = *source;
+        }
+        Ok(count)
+    }
+
+    async fn close(&mut self) -> Result<(), TransportError> {
+        Ok(())
+    }
+}
+
+/// Regular reply deadline of the held-reply tests; every hold is several times
+/// longer, and the next-reply deadline several times longer again.
+const SHORT_DEADLINE: Duration = Duration::from_millis(50);
+const HOLD: Duration = Duration::from_millis(300);
+
+#[tokio::test]
+async fn a_first_reply_held_past_the_regular_deadline_times_out() -> TestResult {
+    let mut radio = Radio::new(HeldTransport::new([(HOLD, b"ID TM-D750\r".to_vec())]));
+    radio.set_timeout(SHORT_DEADLINE);
+    let identity = radio.identify().await;
+    assert!(
+        matches!(
+            identity,
+            Err(Error::Timeout {
+                operation: "ID",
+                ..
+            })
+        ),
+        "{identity:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_next_reply_deadline_covers_one_held_reply_only() -> TestResult {
+    let mut radio = Radio::new(HeldTransport::new([
+        (HOLD, b"ID TM-D750\r".to_vec()),
+        (Duration::ZERO, b"FV 1.02\r".to_vec()),
+        (Duration::ZERO, b"TY K,2,1\r".to_vec()),
+        (HOLD, b"GW 0\r".to_vec()),
+    ]));
+    radio.set_timeout(SHORT_DEADLINE);
+    radio.set_next_reply_timeout(HOLD * 6);
+    let identity = radio.identify().await?;
+    assert_eq!(identity.firmware.as_str(), "1.02");
+    let gateway = radio.get_dv_gateway_mode().await;
+    assert!(
+        matches!(
+            gateway,
+            Err(Error::Timeout {
+                operation: "GW",
+                ..
+            })
+        ),
+        "{gateway:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_next_reply_deadline_is_consumed_once_and_never_shortens() -> TestResult {
+    let mut radio = Radio::new(TestTransport::new([]));
+    radio.set_next_reply_timeout(Duration::from_secs(10));
+    assert_eq!(
+        radio.reply_timeout(&Command::GetBluetooth),
+        Duration::from_secs(10)
+    );
+    assert_eq!(radio.reply_timeout(&Command::GetBluetooth), DEFAULT_TIMEOUT);
+    radio.set_next_reply_timeout(Duration::from_millis(10));
+    assert_eq!(
+        radio.reply_timeout(&Command::SetBluetooth { enabled: true }),
+        BLUETOOTH_WRITE_TIMEOUT
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn bluetooth_writes_wait_longer_than_the_ordinary_deadline() -> TestResult {
     let mut radio = Radio::new(TestTransport::new([]));
@@ -349,5 +455,27 @@ async fn bluetooth_writes_wait_longer_than_the_ordinary_deadline() -> TestResult
         radio.reply_timeout(&Command::GetBluetooth),
         Duration::from_millis(10)
     );
+    Ok(())
+}
+
+#[test]
+fn the_post_exit_first_reply_deadline_reaches_the_exit_bound_but_never_the_floor() -> TestResult {
+    let after_settle = BLUETOOTH_EXIT_REPLY_BOUND
+        .checked_sub(Duration::from_secs(5))
+        .ok_or("the exit bound must outlast a five-second settle")?;
+    for (since_exit, expected) in [
+        (Duration::ZERO, BLUETOOTH_EXIT_REPLY_BOUND),
+        (Duration::from_secs(5), after_settle),
+        (Duration::from_secs(19), Duration::from_secs(11)),
+        (Duration::from_secs(20), BLUETOOTH_FIRST_REPLY_TIMEOUT),
+        (Duration::from_secs(22), BLUETOOTH_FIRST_REPLY_TIMEOUT),
+        (Duration::from_secs(600), BLUETOOTH_FIRST_REPLY_TIMEOUT),
+    ] {
+        assert_eq!(
+            bluetooth_first_reply_timeout_after_exit(since_exit),
+            expected,
+            "{since_exit:?} after the exit acknowledgment"
+        );
+    }
     Ok(())
 }

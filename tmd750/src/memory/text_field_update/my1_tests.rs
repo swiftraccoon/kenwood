@@ -1,8 +1,14 @@
 //! Pure storage and lifecycle invariants; these fixtures are not radio captures.
 
+use std::num::NonZeroU64;
+
+use super::super::{
+    My1CallsignUpdate, PmOffGatewayFinal, PmOffGatewayFresh, TextFieldUpdateError,
+    TextFieldUpdateEvent, TextFieldUpdateSession as Session, TextFieldUpdateStatus,
+};
 use super::*;
 use crate::memory::{MenuOption, StorageTransform, is_supported_schema_target};
-use crate::types::{FirmwareIdentity, RadioType};
+use crate::types::{FirmwareIdentity, RadioModel, RadioType};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -32,7 +38,7 @@ fn fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
     original.get_mut(8..16).ok_or("MY1 range")?.fill(0);
     let mut control = [0x5A; PAGE_SIZE];
     *control.get_mut(9).ok_or("PM selector")? = 0;
-    let update = My1CallsignUpdate::prepare(
+    let update = prepare(
         &identity,
         &original,
         &control,
@@ -49,31 +55,118 @@ fn fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
     })
 }
 
-fn fresh(fixture: &mut Fixture, verify: bool) -> TestResult {
+fn requested(fixture: &Fixture) -> Result<&My1Callsign, Box<dyn std::error::Error>> {
     fixture
         .update
-        .record(My1CallsignUpdateEvent::FreshSession {
-            id: id(if verify { 2 } else { 1 })?,
-            identity: &fixture.identity,
-            memory_format: 0,
+        .requested()
+        .ok_or_else(|| "the fixture requests a nonempty callsign".into())
+}
+
+/// Prepare an update that writes `desired`; clearing uses `prepare` directly.
+fn prepare(
+    identity: &Identity,
+    target_page: &[u8],
+    control_page: &[u8],
+    expected_current: Option<&My1Callsign>,
+    desired: &My1Callsign,
+) -> Result<My1CallsignUpdate, TextFieldUpdateError> {
+    My1CallsignUpdate::prepare(
+        identity,
+        target_page,
+        control_page,
+        expected_current,
+        Some(desired),
+    )
+}
+
+#[test]
+fn clearing_writes_eight_nul_bytes_and_clearing_an_empty_field_is_a_no_op() -> TestResult {
+    let fixture = fixture()?;
+    let current = My1Callsign::new("KQ4NIT")?;
+    let mut original = fixture.original;
+    original
+        .get_mut(8..16)
+        .ok_or("MY1 field")?
+        .copy_from_slice(b"KQ4NIT\0\0");
+    let update = My1CallsignUpdate::prepare(
+        &fixture.identity,
+        &original,
+        &fixture.control,
+        Some(&current),
+        None,
+    )?;
+    assert_eq!(
+        update.requested(),
+        None,
+        "a clear carries no requested callsign"
+    );
+    assert_eq!(
+        update.desired_page().get(8..16),
+        Some([0; 8].as_slice()),
+        "a clear stores eight NUL bytes"
+    );
+    for (offset, (before, after)) in original.iter().zip(update.desired_page()).enumerate() {
+        assert!(
+            before == after || (8..16).contains(&offset),
+            "clearing must change no byte outside the field, byte {offset}"
+        );
+    }
+    assert!(
+        matches!(
+            My1CallsignUpdate::prepare(
+                &fixture.identity,
+                &fixture.original,
+                &fixture.control,
+                None,
+                None
+            ),
+            Err(TextFieldUpdateError::NoChange)
+        ),
+        "clearing an empty field is a no-op"
+    );
+    assert!(
+        matches!(
+            My1CallsignUpdate::prepare(
+                &fixture.identity,
+                &fixture.original,
+                &fixture.control,
+                Some(&current),
+                None
+            ),
+            Err(TextFieldUpdateError::CurrentValueMismatch)
+        ),
+        "clearing requires the expected current text to match the capture"
+    );
+    Ok(())
+}
+
+fn fresh(fixture: &mut Fixture, verify: bool) -> TestResult {
+    fixture.update.record(TextFieldUpdateEvent::FreshSession {
+        id: id(if verify { 2 } else { 1 })?,
+        identity: &fixture.identity,
+        memory_format: 0,
+        whole_page: if verify {
+            &fixture.desired
+        } else {
+            &fixture.original
+        },
+        guards: PmOffGatewayFresh {
             gateway_mode: DvGatewayMode::Off,
             control_page: &fixture.control,
-            whole_page: if verify {
-                &fixture.desired
-            } else {
-                &fixture.original
-            },
-        })?;
+        },
+    })?;
     Ok(())
 }
 
 fn finalize(fixture: &mut Fixture, verify: bool) -> TestResult {
     fixture
         .update
-        .record(My1CallsignUpdateEvent::SessionFinalized {
+        .record(TextFieldUpdateEvent::SessionFinalized {
             id: id(if verify { 2 } else { 1 })?,
-            identity: &fixture.identity,
-            gateway_mode: DvGatewayMode::Off,
+            guards: PmOffGatewayFinal {
+                identity: &fixture.identity,
+                gateway_mode: DvGatewayMode::Off,
+            },
         })?;
     Ok(())
 }
@@ -84,10 +177,10 @@ fn advance(fixture: &mut Fixture, count: usize) -> TestResult {
             0 => fresh(fixture, false)?,
             1 => fixture
                 .update
-                .record(My1CallsignUpdateEvent::DurableWriteIntent { id: id(7)? })?,
+                .record(TextFieldUpdateEvent::DurableWriteIntent { id: id(7)? })?,
             2 => fixture
                 .update
-                .record(My1CallsignUpdateEvent::ImmediateReadback {
+                .record(TextFieldUpdateEvent::ImmediateReadback {
                     whole_page: &fixture.desired,
                 })?,
             3 => finalize(fixture, false)?,
@@ -99,11 +192,11 @@ fn advance(fixture: &mut Fixture, count: usize) -> TestResult {
     Ok(())
 }
 
-const fn status_at(phase: usize) -> My1CallsignUpdateStatus {
+const fn status_at(phase: usize) -> TextFieldUpdateStatus {
     match phase {
-        0 | 1 => My1CallsignUpdateStatus::NotWritten,
-        6 => My1CallsignUpdateStatus::VerifiedAcrossSessions,
-        _ => My1CallsignUpdateStatus::PossiblyChanged,
+        0 | 1 => TextFieldUpdateStatus::NotWritten,
+        6 => TextFieldUpdateStatus::VerifiedAcrossSessions,
+        _ => TextFieldUpdateStatus::PossiblyChanged,
     }
 }
 
@@ -121,9 +214,14 @@ fn callsign_syntax_is_exact_uppercase_ascii_with_alphanumeric_content() -> TestR
         "N0\t",
         "N0é",
     ] {
-        assert_eq!(
-            My1Callsign::new(text),
-            Err(My1CallsignUpdateError::InvalidCallsign),
+        assert!(
+            matches!(
+                My1Callsign::new(text),
+                Err(TextFieldUpdateError::InvalidText {
+                    field: "MY1 callsign",
+                    ..
+                })
+            ),
             "reject {text:?} without normalization"
         );
     }
@@ -160,6 +258,7 @@ fn preparation_changes_only_my1_and_never_relaxes_the_generic_firmware_gate() ->
         fixture.update.control_page_spec(),
         "prepared control page must retain the canonical address and length"
     );
+    assert_eq!(fixture.update.field(), TextField::PmOffMy1Callsign);
     assert_eq!(
         (
             fixture.update.page().address().as_u32(),
@@ -192,12 +291,12 @@ fn preparation_changes_only_my1_and_never_relaxes_the_generic_firmware_gate() ->
         "control-page preparation must not modify any byte"
     );
     assert_eq!(
-        fixture.update.current_callsign(),
+        fixture.update.current(),
         None,
         "an eight-NUL field is represented as empty"
     );
     assert_eq!(
-        fixture.update.desired_callsign().as_str(),
+        requested(&fixture)?.as_str(),
         "N0CALL",
         "retain the caller's exact requested text"
     );
@@ -213,7 +312,7 @@ fn preparation_changes_only_my1_and_never_relaxes_the_generic_firmware_gate() ->
     }
     assert_eq!(
         fixture.update.status(),
-        My1CallsignUpdateStatus::NotWritten,
+        TextFieldUpdateStatus::NotWritten,
         "offline preparation creates no write obligation"
     );
     assert_eq!(
@@ -237,14 +336,14 @@ fn empty_current_requires_eight_nuls_not_spaces_erased_bytes_or_partial_text() -
             *original.get_mut(offset).ok_or("MY1 byte")? = fill;
             assert!(
                 matches!(
-                    My1CallsignUpdate::prepare(
+                    prepare(
                         &fixture.identity,
                         &original,
                         &fixture.control,
                         None,
-                        fixture.update.desired_callsign()
+                        requested(&fixture)?
                     ),
-                    Err(My1CallsignUpdateError::CurrentCallsignMismatch)
+                    Err(TextFieldUpdateError::CurrentValueMismatch)
                 ),
                 "None must reject changed byte {offset}={fill}"
             );
@@ -263,7 +362,7 @@ fn current_and_desired_text_use_exact_nul_padding_without_trimming() -> TestResu
         .get_mut(8..16)
         .ok_or("MY1 field")?
         .copy_from_slice(b" N0CALL ");
-    let update = My1CallsignUpdate::prepare(
+    let update = prepare(
         &fixture.identity,
         &original,
         &fixture.control,
@@ -271,7 +370,7 @@ fn current_and_desired_text_use_exact_nul_padding_without_trimming() -> TestResu
         &desired,
     )?;
     assert_eq!(
-        update.current_callsign(),
+        update.current(),
         Some(&current),
         "matched current text retains both edge spaces"
     );
@@ -282,28 +381,28 @@ fn current_and_desired_text_use_exact_nul_padding_without_trimming() -> TestResu
     );
     assert!(
         matches!(
-            My1CallsignUpdate::prepare(
+            prepare(
                 &fixture.identity,
                 &original,
                 &fixture.control,
                 Some(&current),
                 &current
             ),
-            Err(My1CallsignUpdateError::NoChange)
+            Err(TextFieldUpdateError::NoChange)
         ),
         "a no-op never authorizes a write"
     );
     let shortened = My1Callsign::new("N0CALL")?;
     assert!(
         matches!(
-            My1CallsignUpdate::prepare(
+            prepare(
                 &fixture.identity,
                 &original,
                 &fixture.control,
                 Some(&shortened),
                 &desired
             ),
-            Err(My1CallsignUpdateError::CurrentCallsignMismatch)
+            Err(TextFieldUpdateError::CurrentValueMismatch)
         ),
         "spaces are part of the expected value"
     );
@@ -312,7 +411,7 @@ fn current_and_desired_text_use_exact_nul_padding_without_trimming() -> TestResu
         .ok_or("MY1 field")?
         .copy_from_slice(b"N0CALL\0\0");
     assert!(
-        My1CallsignUpdate::prepare(
+        prepare(
             &fixture.identity,
             &original,
             &fixture.control,
@@ -325,14 +424,14 @@ fn current_and_desired_text_use_exact_nul_padding_without_trimming() -> TestResu
     *original.get_mut(15).ok_or("padding byte")? = b' ';
     assert!(
         matches!(
-            My1CallsignUpdate::prepare(
+            prepare(
                 &fixture.identity,
                 &original,
                 &fixture.control,
                 Some(&shortened),
                 &desired
             ),
-            Err(My1CallsignUpdateError::CurrentCallsignMismatch)
+            Err(TextFieldUpdateError::CurrentValueMismatch)
         ),
         "space padding is not NUL padding"
     );
@@ -345,11 +444,11 @@ fn preparation_rejects_incomplete_pages_and_every_changed_identity_component() -
     for length in [0, 8, 255, 257, 512] {
         let bytes = vec![0; length];
         assert!(
-            matches!(My1CallsignUpdate::prepare(&fixture.identity, &bytes, &fixture.control, None, fixture.update.desired_callsign()), Err(My1CallsignUpdateError::PageLength { actual }) if actual == length),
+            matches!(prepare(&fixture.identity, &bytes, &fixture.control, None, requested(&fixture)?), Err(TextFieldUpdateError::PageLength { actual }) if actual == length),
             "target length {length}"
         );
         assert!(
-            matches!(My1CallsignUpdate::prepare(&fixture.identity, &fixture.original, &bytes, None, fixture.update.desired_callsign()), Err(My1CallsignUpdateError::ControlPageLength { actual }) if actual == length),
+            matches!(prepare(&fixture.identity, &fixture.original, &bytes, None, requested(&fixture)?), Err(TextFieldUpdateError::ControlPageLength { actual }) if actual == length),
             "control length {length}"
         );
     }
@@ -358,14 +457,14 @@ fn preparation_rejects_incomplete_pages_and_every_changed_identity_component() -
         identity.firmware = FirmwareIdentity::new(firmware)?;
         assert!(
             matches!(
-                My1CallsignUpdate::prepare(
+                prepare(
                     &identity,
                     &fixture.original,
                     &fixture.control,
                     None,
-                    fixture.update.desired_callsign()
+                    requested(&fixture)?
                 ),
-                Err(My1CallsignUpdateError::IdentityMismatch)
+                Err(TextFieldUpdateError::IdentityMismatch)
             ),
             "exact firmware {firmware} is not admitted"
         );
@@ -375,14 +474,14 @@ fn preparation_rejects_incomplete_pages_and_every_changed_identity_component() -
         identity.radio_type = RadioType::new(radio_type)?;
         assert!(
             matches!(
-                My1CallsignUpdate::prepare(
+                prepare(
                     &identity,
                     &fixture.original,
                     &fixture.control,
                     None,
-                    fixture.update.desired_callsign()
+                    requested(&fixture)?
                 ),
-                Err(My1CallsignUpdateError::IdentityMismatch)
+                Err(TextFieldUpdateError::IdentityMismatch)
             ),
             "exact type {radio_type} is not admitted"
         );
@@ -398,18 +497,18 @@ fn every_nonzero_stored_selector_or_gateway_is_refused_without_changing_capture(
         let mut control = fixture.control;
         *control.get_mut(9).ok_or("PM selector")? = value;
         assert!(
-            matches!(My1CallsignUpdate::prepare(&fixture.identity, &target, &control, None, fixture.update.desired_callsign()), Err(My1CallsignUpdateError::PmSelection { actual }) if actual == value),
+            matches!(prepare(&fixture.identity, &target, &control, None, requested(&fixture)?), Err(TextFieldUpdateError::PmSelection { actual }) if actual == value),
             "PM selector {value}"
         );
         *target.get_mut(0).ok_or("Gateway selector")? = value;
         assert!(
-            matches!(My1CallsignUpdate::prepare(&fixture.identity, &target, &fixture.control, None, fixture.update.desired_callsign()), Err(My1CallsignUpdateError::GatewayMode { actual }) if actual == DvGatewayMode::from(value)),
+            matches!(prepare(&fixture.identity, &target, &fixture.control, None, requested(&fixture)?), Err(TextFieldUpdateError::GatewayMode { actual }) if actual == DvGatewayMode::from(value)),
             "Gateway {value}"
         );
         target = fixture.original;
         *target.get_mut(1).ok_or("MY selector")? = value;
         assert!(
-            matches!(My1CallsignUpdate::prepare(&fixture.identity, &target, &fixture.control, None, fixture.update.desired_callsign()), Err(My1CallsignUpdateError::MySelection { actual }) if actual == value),
+            matches!(prepare(&fixture.identity, &target, &fixture.control, None, requested(&fixture)?), Err(TextFieldUpdateError::MySelection { actual }) if actual == value),
             "MY selector {value}"
         );
     }
@@ -521,10 +620,10 @@ fn every_descriptor_and_guard_shape_is_pinned_before_preparation() -> TestResult
                         &fixture.original,
                         &fixture.control,
                         None,
-                        fixture.update.desired_callsign(),
+                        Some(requested(&fixture)?),
                         &fields
                     ),
-                    Err(My1CallsignUpdateError::UnsupportedDescriptor)
+                    Err(TextFieldUpdateError::UnsupportedDescriptor)
                 ),
                 "descriptor {selected} mutation must refuse preparation"
             );
@@ -557,7 +656,7 @@ fn every_descriptor_and_guard_shape_is_pinned_before_preparation() -> TestResult
         };
         assert_eq!(
             supported_page(&changed, CALLSIGN),
-            Err(My1CallsignUpdateError::UnsupportedDescriptor),
+            Err(TextFieldUpdateError::UnsupportedDescriptor),
             "exact width, codec, and padding are required"
         );
     }
@@ -584,10 +683,10 @@ fn all_six_events_are_required_before_verified_status() -> TestResult {
             }
             1 => fixture
                 .update
-                .record(My1CallsignUpdateEvent::DurableWriteIntent { id: id(7)? })?,
+                .record(TextFieldUpdateEvent::DurableWriteIntent { id: id(7)? })?,
             2 => fixture
                 .update
-                .record(My1CallsignUpdateEvent::ImmediateReadback {
+                .record(TextFieldUpdateEvent::ImmediateReadback {
                     whole_page: &fixture.desired,
                 })?,
             3 => finalize(&mut fixture, false)?,
@@ -602,7 +701,7 @@ fn all_six_events_are_required_before_verified_status() -> TestResult {
             5 => finalize(&mut fixture, true)?,
             _ => assert_eq!(
                 fixture.update.next_session(),
-                Err(My1CallsignUpdateError::TerminalState),
+                Err(TextFieldUpdateError::TerminalState),
                 "completed verification cannot request a third session"
             ),
         }
@@ -648,25 +747,27 @@ fn each_byte_of_both_fresh_pages_and_immediate_readback_is_compared() -> TestRes
                 };
                 *changed.get_mut(offset).ok_or("comparison byte")? ^= 1;
                 let event = if phase == 2 {
-                    My1CallsignUpdateEvent::ImmediateReadback {
+                    TextFieldUpdateEvent::ImmediateReadback {
                         whole_page: &target,
                     }
                 } else {
-                    My1CallsignUpdateEvent::FreshSession {
+                    TextFieldUpdateEvent::FreshSession {
                         id: id(if phase == 0 { 1 } else { 2 })?,
                         identity: &fixture.identity,
                         memory_format: 0,
-                        gateway_mode: DvGatewayMode::Off,
-                        control_page: &control,
                         whole_page: &target,
+                        guards: PmOffGatewayFresh {
+                            gateway_mode: DvGatewayMode::Off,
+                            control_page: &control,
+                        },
                     }
                 };
                 assert_eq!(
                     fixture.update.record(event),
                     Err(if control_changed {
-                        My1CallsignUpdateError::ControlPageMismatch
+                        TextFieldUpdateError::ControlPageMismatch
                     } else {
-                        My1CallsignUpdateError::PageMismatch
+                        TextFieldUpdateError::PageMismatch
                     }),
                     "phase {phase}, control={control_changed}, byte {offset}"
                 );
@@ -677,7 +778,7 @@ fn each_byte_of_both_fresh_pages_and_immediate_readback_is_compared() -> TestRes
                 );
                 assert_eq!(
                     fixture.update.next_session(),
-                    Err(My1CallsignUpdateError::TerminalState),
+                    Err(TextFieldUpdateError::TerminalState),
                     "any byte mismatch permanently halts the transaction"
                 );
                 assert_eq!(
@@ -717,24 +818,26 @@ fn fresh_guards_are_mandatory_in_both_apply_and_verify() -> TestResult {
             } else {
                 &fixture.desired
             };
-            let result = fixture.update.record(My1CallsignUpdateEvent::FreshSession {
+            let result = fixture.update.record(TextFieldUpdateEvent::FreshSession {
                 id: id(if phase == 0 { 1 } else { 2 })?,
                 identity: &identity,
                 memory_format: u8::from(fault == 3),
-                gateway_mode,
-                control_page: if fault == 4 { &[] } else { &fixture.control },
                 whole_page: if fault == 5 { &[] } else { page },
+                guards: PmOffGatewayFresh {
+                    gateway_mode,
+                    control_page: if fault == 4 { &[] } else { &fixture.control },
+                },
             });
             assert_eq!(
                 result,
                 Err(match fault {
-                    0 => My1CallsignUpdateError::IdentityMismatch,
-                    1 | 2 | 6 => My1CallsignUpdateError::GatewayMode {
+                    0 => TextFieldUpdateError::IdentityMismatch,
+                    1 | 2 | 6 => TextFieldUpdateError::GatewayMode {
                         actual: gateway_mode
                     },
-                    3 => My1CallsignUpdateError::MemoryFormat { actual: 1 },
-                    4 => My1CallsignUpdateError::ControlPageLength { actual: 0 },
-                    _ => My1CallsignUpdateError::PageLength { actual: 0 },
+                    3 => TextFieldUpdateError::MemoryFormat { actual: 1 },
+                    4 => TextFieldUpdateError::ControlPageLength { actual: 0 },
+                    _ => TextFieldUpdateError::PageLength { actual: 0 },
                 }),
                 "fresh guard fault {fault} must be retained at phase {phase}"
             );
@@ -745,7 +848,7 @@ fn fresh_guards_are_mandatory_in_both_apply_and_verify() -> TestResult {
             );
             assert_eq!(
                 fixture.update.next_session(),
-                Err(My1CallsignUpdateError::TerminalState),
+                Err(TextFieldUpdateError::TerminalState),
                 "a failed fresh guard forbids subsequent evidence"
             );
         }
@@ -778,17 +881,19 @@ fn both_finalizations_require_the_current_id_exact_fresh_identity_and_gateway_of
             };
             let result = fixture
                 .update
-                .record(My1CallsignUpdateEvent::SessionFinalized {
+                .record(TextFieldUpdateEvent::SessionFinalized {
                     id: id(session)?,
-                    identity: &identity,
-                    gateway_mode,
+                    guards: PmOffGatewayFinal {
+                        identity: &identity,
+                        gateway_mode,
+                    },
                 });
             assert_eq!(
                 result,
                 Err(match fault {
-                    0 => My1CallsignUpdateError::SessionMismatch,
-                    1 => My1CallsignUpdateError::IdentityMismatch,
-                    _ => My1CallsignUpdateError::GatewayMode {
+                    0 => TextFieldUpdateError::SessionMismatch,
+                    1 => TextFieldUpdateError::IdentityMismatch,
+                    _ => TextFieldUpdateError::GatewayMode {
                         actual: gateway_mode
                     },
                 }),
@@ -796,12 +901,12 @@ fn both_finalizations_require_the_current_id_exact_fresh_identity_and_gateway_of
             );
             assert_eq!(
                 fixture.update.status(),
-                My1CallsignUpdateStatus::PossiblyChanged,
+                TextFieldUpdateStatus::PossiblyChanged,
                 "failed cleanup evidence cannot clear the intent"
             );
             assert_eq!(
                 fixture.update.next_session(),
-                Err(My1CallsignUpdateError::TerminalState),
+                Err(TextFieldUpdateError::TerminalState),
                 "failed fresh cleanup evidence must permanently halt completion"
             );
         }
@@ -814,25 +919,27 @@ fn a_reused_verification_session_id_permanently_halts_with_possible_change() -> 
     let mut fixture = fixture()?;
     advance(&mut fixture, 4)?;
     assert_eq!(
-        fixture.update.record(My1CallsignUpdateEvent::FreshSession {
+        fixture.update.record(TextFieldUpdateEvent::FreshSession {
             id: id(1)?,
             identity: &fixture.identity,
             memory_format: 0,
-            gateway_mode: DvGatewayMode::Off,
-            control_page: &fixture.control,
             whole_page: &fixture.desired,
+            guards: PmOffGatewayFresh {
+                gateway_mode: DvGatewayMode::Off,
+                control_page: &fixture.control,
+            },
         }),
-        Err(My1CallsignUpdateError::ReusedSession),
+        Err(TextFieldUpdateError::ReusedSession),
         "Verify must not reuse Apply's connection identifier"
     );
     assert_eq!(
         fixture.update.status(),
-        My1CallsignUpdateStatus::PossiblyChanged,
+        TextFieldUpdateStatus::PossiblyChanged,
         "a reused session cannot discharge the accepted write"
     );
     assert_eq!(
         fixture.update.next_session(),
-        Err(My1CallsignUpdateError::TerminalState),
+        Err(TextFieldUpdateError::TerminalState),
         "session reuse irreversibly halts this instance"
     );
     Ok(())
@@ -856,30 +963,34 @@ fn every_out_of_order_event_halts_without_resetting_status_or_images() -> TestRe
             advance(&mut fixture, phase)?;
             let session = id(if phase < 4 { 1 } else { 2 })?;
             let event = match event_kind {
-                0 => My1CallsignUpdateEvent::FreshSession {
+                0 => TextFieldUpdateEvent::FreshSession {
                     id: session,
                     identity: &fixture.identity,
                     memory_format: 0,
-                    gateway_mode: DvGatewayMode::Off,
-                    control_page: &fixture.control,
+                    whole_page: &fixture.desired,
+                    guards: PmOffGatewayFresh {
+                        gateway_mode: DvGatewayMode::Off,
+                        control_page: &fixture.control,
+                    },
+                },
+                1 => TextFieldUpdateEvent::DurableWriteIntent { id: id(7)? },
+                2 => TextFieldUpdateEvent::ImmediateReadback {
                     whole_page: &fixture.desired,
                 },
-                1 => My1CallsignUpdateEvent::DurableWriteIntent { id: id(7)? },
-                2 => My1CallsignUpdateEvent::ImmediateReadback {
-                    whole_page: &fixture.desired,
-                },
-                _ => My1CallsignUpdateEvent::SessionFinalized {
+                _ => TextFieldUpdateEvent::SessionFinalized {
                     id: session,
-                    identity: &fixture.identity,
-                    gateway_mode: DvGatewayMode::Off,
+                    guards: PmOffGatewayFinal {
+                        identity: &fixture.identity,
+                        gateway_mode: DvGatewayMode::Off,
+                    },
                 },
             };
             assert_eq!(
                 fixture.update.record(event),
                 Err(if phase == 6 {
-                    My1CallsignUpdateError::TerminalState
+                    TextFieldUpdateError::TerminalState
                 } else {
-                    My1CallsignUpdateError::UnexpectedEvent
+                    TextFieldUpdateError::UnexpectedEvent
                 }),
                 "phase {phase}, event {event_kind}"
             );
@@ -890,7 +1001,7 @@ fn every_out_of_order_event_halts_without_resetting_status_or_images() -> TestRe
             );
             assert_eq!(
                 fixture.update.next_session(),
-                Err(My1CallsignUpdateError::TerminalState),
+                Err(TextFieldUpdateError::TerminalState),
                 "out-of-order evidence prevents further sessions"
             );
             assert_eq!(
@@ -922,14 +1033,14 @@ fn halt_is_sticky_at_every_phase_and_cannot_erase_completed_verification() -> Te
         );
         assert_eq!(
             fixture.update.next_session(),
-            Err(My1CallsignUpdateError::TerminalState),
+            Err(TextFieldUpdateError::TerminalState),
             "halt is terminal at every lifecycle phase"
         );
         assert_eq!(
             fixture
                 .update
-                .record(My1CallsignUpdateEvent::DurableWriteIntent { id: id(8)? }),
-            Err(My1CallsignUpdateError::TerminalState),
+                .record(TextFieldUpdateEvent::DurableWriteIntent { id: id(8)? }),
+            Err(TextFieldUpdateError::TerminalState),
             "a new intent cannot revive a halted or completed update"
         );
         assert_eq!(

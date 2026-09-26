@@ -1,9 +1,11 @@
 #![doc = include_str!("../README.md")]
 
-// The extractor is a dev-dependency for the registry agreement test; the
-// library's own unit-test target sees it too and must name it.
+// The extractor and proptest are dev-dependencies of the integration tests;
+// the library's own unit-test target sees them too and must name them.
 #[cfg(test)]
 use mcp_d75_extract as _;
+#[cfg(test)]
+use proptest as _;
 
 pub mod error;
 pub mod file;
@@ -17,24 +19,12 @@ pub use error::{Error, FileError, McpError, ProtocolError, SchemaError, Validati
 pub use file::{FileLayout, RadioConfig, parse_d750};
 pub use memory::{ChannelAccess, MemoryImage, PatchPlanner, PatchSet, TerminalGatewayRoute};
 pub use radio::backup::{McpBackupOutcome, McpBackupReport, McpBackupStage};
-pub use radio::channel_name_update::{
-    ChannelNameUpdateSessionError, ChannelNameUpdateSessionOutcome, ChannelNameUpdateSessionReport,
-    ChannelNameUpdateSessionStage, ChannelNameUpdateWriteDisposition,
-};
 pub use radio::menu::{
     MenuAssignment, MenuFieldSnapshot, MenuUpdateError, MenuUpdatePlan, ScopedMenuField,
-};
-pub use radio::my1_callsign_update::{
-    My1CallsignUpdateSessionError, My1CallsignUpdateSessionOutcome, My1CallsignUpdateSessionReport,
-    My1CallsignUpdateSessionStage, My1CallsignUpdateWriteDisposition,
 };
 pub use radio::pm_name_trial::{
     PmNameTrialSessionError, PmNameTrialSessionOutcome, PmNameTrialSessionReport,
     PmNameTrialSessionStage, PmNameTrialWriteDisposition,
-};
-pub use radio::pm1_name_update::{
-    Pm1NameUpdateSessionError, Pm1NameUpdateSessionOutcome, Pm1NameUpdateSessionReport,
-    Pm1NameUpdateSessionStage, Pm1NameUpdateWriteDisposition,
 };
 pub use radio::programming::{McpCompareExchangeReport, PageReplacement};
 pub use radio::qualification::{
@@ -60,6 +50,10 @@ pub use radio::terminal::{TerminalPlan, TerminalPlanError, TerminalTarget};
 pub use radio::terminal_exit_trial::{
     TerminalExitTrialSessionError, TerminalExitTrialSessionOutcome, TerminalExitTrialSessionReport,
     TerminalExitTrialSessionStage, TerminalExitTrialWriteDisposition,
+};
+pub use radio::text_field_update::{
+    SessionGuards, TextFieldUpdateSessionError, TextFieldUpdateSessionOutcome,
+    TextFieldUpdateSessionReport, TextFieldUpdateSessionStage, TextFieldUpdateWriteDisposition,
 };
 pub use radio::{Identity, Progress, Radio};
 pub use types::{

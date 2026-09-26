@@ -44,22 +44,10 @@ impl FixedTextTarget {
 }
 
 impl<T: Transport> Radio<T> {
-    /// Complete the frame/ACK exchange after the caller's fixed-scope checks.
-    ///
-    /// Each caller validates identity, the canonical page, the complete observed
-    /// before-image, and the recorded intent before invoking this private helper.
-    /// An interrupted write or a missing ACK leaves the handle uncertain.
-    pub(super) async fn write_pm1_frame(
-        &mut self,
-        after: &[u8; PAGE_SIZE],
-        stage: &'static str,
-    ) -> Result<(), Error> {
-        self.write_fixed_text_frame(FixedTextTarget::Pm1, after, stage)
-            .await
-    }
-
     /// Send one fixed target's frame after its driver has checked the exact
     /// identity, whole-page baseline, guards, and recorded intent.
+    ///
+    /// An interrupted write or a missing ACK leaves the handle uncertain.
     pub(super) async fn write_fixed_text_frame(
         &mut self,
         target: FixedTextTarget,

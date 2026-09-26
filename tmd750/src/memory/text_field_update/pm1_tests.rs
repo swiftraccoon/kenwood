@@ -1,6 +1,12 @@
+use std::num::NonZeroU64;
+
+use super::super::{
+    Pm1NameUpdate, TextFieldUpdateError, TextFieldUpdateEvent, TextFieldUpdateSession as Session,
+    TextFieldUpdateStatus,
+};
 use super::*;
 use crate::memory::{FieldDescriptor, SLOT_TERM, StorageTransform, is_supported_schema_target};
-use crate::types::{FirmwareIdentity, RadioType};
+use crate::types::{FirmwareIdentity, RadioModel, RadioType};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -43,7 +49,7 @@ fn fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
 }
 
 fn fresh(fixture: &mut Fixture, session: u64) -> TestResult {
-    fixture.update.record(Pm1NameUpdateEvent::FreshSession {
+    fixture.update.record(TextFieldUpdateEvent::FreshSession {
         id: id(session)?,
         identity: &fixture.identity,
         memory_format: 0,
@@ -52,6 +58,7 @@ fn fresh(fixture: &mut Fixture, session: u64) -> TestResult {
         } else {
             &fixture.desired
         },
+        guards: (),
     })?;
     Ok(())
 }
@@ -59,14 +66,14 @@ fn fresh(fixture: &mut Fixture, session: u64) -> TestResult {
 fn intent(fixture: &mut Fixture) -> TestResult {
     fixture
         .update
-        .record(Pm1NameUpdateEvent::DurableWriteIntent { id: id(1)? })?;
+        .record(TextFieldUpdateEvent::DurableWriteIntent { id: id(1)? })?;
     Ok(())
 }
 
 fn readback(fixture: &mut Fixture) -> TestResult {
     fixture
         .update
-        .record(Pm1NameUpdateEvent::ImmediateReadback {
+        .record(TextFieldUpdateEvent::ImmediateReadback {
             whole_page: &fixture.desired,
         })?;
     Ok(())
@@ -75,7 +82,10 @@ fn readback(fixture: &mut Fixture) -> TestResult {
 fn finalize(fixture: &mut Fixture, session: u64) -> TestResult {
     fixture
         .update
-        .record(Pm1NameUpdateEvent::SessionFinalized { id: id(session)? })?;
+        .record(TextFieldUpdateEvent::SessionFinalized {
+            id: id(session)?,
+            guards: (),
+        })?;
     Ok(())
 }
 
@@ -86,10 +96,33 @@ fn applied(fixture: &mut Fixture) -> TestResult {
     finalize(fixture, 1)
 }
 
+fn current(fixture: &Fixture) -> Result<&Pm1Name, Box<dyn std::error::Error>> {
+    fixture
+        .update
+        .current()
+        .ok_or_else(|| "PM1 updates always carry the current name".into())
+}
+
+fn requested(fixture: &Fixture) -> Result<&Pm1Name, Box<dyn std::error::Error>> {
+    fixture
+        .update
+        .requested()
+        .ok_or_else(|| "PM1 updates always carry the requested name".into())
+}
+
 #[test]
 fn names_reject_every_nonprintable_byte_without_trimming_or_truncation() -> TestResult {
     for name in ["", "12345678901234567", "PM\n1", "PM\0", "P\u{7f}M", "PMé"] {
-        assert_eq!(Pm1Name::new(name), Err(Pm1NameUpdateError::InvalidName));
+        assert!(
+            matches!(
+                Pm1Name::new(name),
+                Err(TextFieldUpdateError::InvalidText {
+                    field: "PM1 name",
+                    ..
+                })
+            ),
+            "{name:?}"
+        );
     }
     for byte in 0..=u8::MAX {
         let bytes = [byte];
@@ -107,12 +140,13 @@ fn names_reject_every_nonprintable_byte_without_trimming_or_truncation() -> Test
 fn preparation_preserves_all_unrelated_bytes_and_keeps_generic_gate_closed() -> TestResult {
     let fixture = fixture()?;
     assert_eq!(Pm1NameUpdate::required_page()?, fixture.update.page());
+    assert_eq!(fixture.update.field(), TextField::Pm1Name);
     assert_eq!(fixture.update.page().address().as_u32(), PAGE_ADDRESS);
     assert_eq!(fixture.update.page().len(), PAGE_SIZE);
     assert_eq!(fixture.update.identity(), &fixture.identity);
     assert_eq!(fixture.update.original_page(), &fixture.original);
-    assert_eq!(fixture.update.current_name().as_str(), "PM1");
-    assert_eq!(fixture.update.desired_name().as_str(), "My station");
+    assert_eq!(current(&fixture)?.as_str(), "PM1");
+    assert_eq!(requested(&fixture)?.as_str(), "My station");
     assert_eq!(
         fixture.desired.get(10..26),
         Some(b"My station\0\0\0\0\0\0".as_slice())
@@ -122,7 +156,7 @@ fn preparation_preserves_all_unrelated_bytes_and_keeps_generic_gate_closed() -> 
             assert_eq!(original, desired, "unrelated byte {index}");
         }
     }
-    assert_eq!(fixture.update.status(), Pm1NameUpdateStatus::NotWritten);
+    assert_eq!(fixture.update.status(), TextFieldUpdateStatus::NotWritten);
     assert_eq!(fixture.update.next_session()?, Session::Apply);
     assert!(
         !is_supported_schema_target(fixture.identity.model, &fixture.identity.firmware),
@@ -139,7 +173,7 @@ fn current_name_requires_exact_padding_and_noop_is_explicitly_rejected() -> Test
     assert!(
         matches!(
             Pm1NameUpdate::prepare(&fixture.identity, &fixture.original, &current, &current),
-            Err(Pm1NameUpdateError::NoChange)
+            Err(TextFieldUpdateError::NoChange)
         ),
         "equal expected and requested names must refuse a write"
     );
@@ -152,7 +186,7 @@ fn current_name_requires_exact_padding_and_noop_is_explicitly_rejected() -> Test
                     &Pm1Name::new(name)?,
                     &desired
                 ),
-                Err(Pm1NameUpdateError::CurrentNameMismatch)
+                Err(TextFieldUpdateError::CurrentValueMismatch)
             ),
             "expected name {name:?} must match the captured field exactly"
         );
@@ -163,7 +197,7 @@ fn current_name_requires_exact_padding_and_noop_is_explicitly_rejected() -> Test
         assert!(
             matches!(
                 Pm1NameUpdate::prepare(&fixture.identity, &changed, &current, &desired),
-                Err(Pm1NameUpdateError::CurrentNameMismatch)
+                Err(TextFieldUpdateError::CurrentValueMismatch)
             ),
             "nonzero padding at page byte {index} must be refused"
         );
@@ -188,13 +222,13 @@ fn current_name_requires_exact_padding_and_noop_is_explicitly_rejected() -> Test
 #[test]
 fn preparation_rejects_partial_pages_and_every_other_exact_target() -> TestResult {
     let fixture = fixture()?;
-    let current = fixture.update.current_name();
-    let desired = fixture.update.desired_name();
+    let current = current(&fixture)?;
+    let desired = requested(&fixture)?;
     for len in [0, 16, 255, 257, 512] {
         assert!(
             matches!(
                 Pm1NameUpdate::prepare(&fixture.identity, &vec![0; len], current, desired),
-                Err(Pm1NameUpdateError::PageLength { actual }) if actual == len
+                Err(TextFieldUpdateError::PageLength { actual }) if actual == len
             ),
             "a {len}-byte input is not a complete canonical page"
         );
@@ -205,7 +239,7 @@ fn preparation_rejects_partial_pages_and_every_other_exact_target() -> TestResul
         assert!(
             matches!(
                 Pm1NameUpdate::prepare(&identity, &fixture.original, current, desired),
-                Err(Pm1NameUpdateError::IdentityMismatch)
+                Err(TextFieldUpdateError::IdentityMismatch)
             ),
             "firmware {firmware} must not inherit the PM1 exception"
         );
@@ -216,7 +250,7 @@ fn preparation_rejects_partial_pages_and_every_other_exact_target() -> TestResul
         assert!(
             matches!(
                 Pm1NameUpdate::prepare(&identity, &fixture.original, current, desired),
-                Err(Pm1NameUpdateError::IdentityMismatch)
+                Err(TextFieldUpdateError::IdentityMismatch)
             ),
             "radio type {radio_type} must not inherit the PM1 exception"
         );
@@ -324,11 +358,11 @@ fn changed_generated_descriptor_cannot_expand_the_single_field_scope() -> TestRe
                 Pm1NameUpdate::prepare_with_field(
                     &fixture.identity,
                     &fixture.original,
-                    fixture.update.current_name(),
-                    fixture.update.desired_name(),
+                    current(&fixture)?,
+                    requested(&fixture)?,
                     field
                 ),
-                Err(Pm1NameUpdateError::UnsupportedDescriptor)
+                Err(TextFieldUpdateError::UnsupportedDescriptor)
             ),
             "changed descriptor must not alter the allowed field: {field:?}"
         );
@@ -341,51 +375,51 @@ fn verification_requires_intent_readback_two_distinct_sessions_and_both_finaliza
 {
     let mut fixture = fixture()?;
     fresh(&mut fixture, 1)?;
-    assert_eq!(fixture.update.status(), Pm1NameUpdateStatus::NotWritten);
+    assert_eq!(fixture.update.status(), TextFieldUpdateStatus::NotWritten);
     assert_eq!(
         fixture.update.next_session(),
-        Err(Pm1NameUpdateError::UnexpectedEvent)
+        Err(TextFieldUpdateError::UnexpectedEvent)
     );
     intent(&mut fixture)?;
     assert_eq!(
         fixture.update.status(),
-        Pm1NameUpdateStatus::PossiblyChanged
+        TextFieldUpdateStatus::PossiblyChanged
     );
     readback(&mut fixture)?;
     assert_eq!(
         fixture.update.status(),
-        Pm1NameUpdateStatus::PossiblyChanged
+        TextFieldUpdateStatus::PossiblyChanged
     );
     finalize(&mut fixture, 1)?;
     assert_eq!(fixture.update.next_session()?, Session::Verify);
     assert_eq!(
         fixture.update.status(),
-        Pm1NameUpdateStatus::PossiblyChanged
+        TextFieldUpdateStatus::PossiblyChanged
     );
     fresh(&mut fixture, 2)?;
     assert_eq!(
         fixture.update.status(),
-        Pm1NameUpdateStatus::PossiblyChanged
+        TextFieldUpdateStatus::PossiblyChanged
     );
     finalize(&mut fixture, 2)?;
     assert_eq!(
         fixture.update.status(),
-        Pm1NameUpdateStatus::VerifiedAcrossSessions
+        TextFieldUpdateStatus::VerifiedAcrossSessions
     );
     assert_eq!(
         fixture.update.next_session(),
-        Err(Pm1NameUpdateError::TerminalState)
+        Err(TextFieldUpdateError::TerminalState)
     );
     assert_eq!(
         fixture
             .update
-            .record(Pm1NameUpdateEvent::DurableWriteIntent { id: id(2)? }),
-        Err(Pm1NameUpdateError::TerminalState)
+            .record(TextFieldUpdateEvent::DurableWriteIntent { id: id(2)? }),
+        Err(TextFieldUpdateError::TerminalState)
     );
     fixture.update.halt();
     assert_eq!(
         fixture.update.status(),
-        Pm1NameUpdateStatus::VerifiedAcrossSessions
+        TextFieldUpdateStatus::VerifiedAcrossSessions
     );
     Ok(())
 }
@@ -404,34 +438,35 @@ fn every_byte_of_fresh_immediate_and_verification_pages_must_match() -> TestResu
             let event = if stage == 1 {
                 fresh(&mut fixture, 1)?;
                 intent(&mut fixture)?;
-                Pm1NameUpdateEvent::ImmediateReadback { whole_page: &page }
+                TextFieldUpdateEvent::ImmediateReadback { whole_page: &page }
             } else {
                 if stage == 2 {
                     applied(&mut fixture)?;
                 }
-                Pm1NameUpdateEvent::FreshSession {
+                TextFieldUpdateEvent::FreshSession {
                     id: id(if stage == 0 { 1 } else { 2 })?,
                     identity: &fixture.identity,
                     memory_format: 0,
                     whole_page: &page,
+                    guards: (),
                 }
             };
             assert_eq!(
                 fixture.update.record(event),
-                Err(Pm1NameUpdateError::PageMismatch),
+                Err(TextFieldUpdateError::PageMismatch),
                 "stage {stage}, offset {offset}"
             );
             assert_eq!(
                 fixture.update.status(),
                 if stage == 0 {
-                    Pm1NameUpdateStatus::NotWritten
+                    TextFieldUpdateStatus::NotWritten
                 } else {
-                    Pm1NameUpdateStatus::PossiblyChanged
+                    TextFieldUpdateStatus::PossiblyChanged
                 }
             );
             assert_eq!(
                 fixture.update.next_session(),
-                Err(Pm1NameUpdateError::TerminalState)
+                Err(TextFieldUpdateError::TerminalState)
             );
         }
     }
@@ -447,21 +482,22 @@ fn partial_evidence_is_rejected_at_every_comparison() -> TestResult {
             let event = if stage == 1 {
                 fresh(&mut fixture, 1)?;
                 intent(&mut fixture)?;
-                Pm1NameUpdateEvent::ImmediateReadback { whole_page: &bytes }
+                TextFieldUpdateEvent::ImmediateReadback { whole_page: &bytes }
             } else {
                 if stage == 2 {
                     applied(&mut fixture)?;
                 }
-                Pm1NameUpdateEvent::FreshSession {
+                TextFieldUpdateEvent::FreshSession {
                     id: id(if stage == 0 { 1 } else { 2 })?,
                     identity: &fixture.identity,
                     memory_format: 0,
                     whole_page: &bytes,
+                    guards: (),
                 }
             };
             assert_eq!(
                 fixture.update.record(event),
-                Err(Pm1NameUpdateError::PageLength { actual: len })
+                Err(TextFieldUpdateError::PageLength { actual: len })
             );
         }
     }
@@ -483,7 +519,7 @@ fn fresh_identity_and_format_are_checked_again_in_the_verification_session() -> 
                 _ => {}
             }
             assert_eq!(
-                fixture.update.record(Pm1NameUpdateEvent::FreshSession {
+                fixture.update.record(TextFieldUpdateEvent::FreshSession {
                     id: id(session)?,
                     identity: &identity,
                     memory_format: u8::from(changed == 2),
@@ -492,19 +528,20 @@ fn fresh_identity_and_format_are_checked_again_in_the_verification_session() -> 
                     } else {
                         &fixture.desired
                     },
+                    guards: (),
                 }),
                 Err(if changed == 2 {
-                    Pm1NameUpdateError::MemoryFormat { actual: 1 }
+                    TextFieldUpdateError::MemoryFormat { actual: 1 }
                 } else {
-                    Pm1NameUpdateError::IdentityMismatch
+                    TextFieldUpdateError::IdentityMismatch
                 })
             );
             assert_eq!(
                 fixture.update.status(),
                 if session == 1 {
-                    Pm1NameUpdateStatus::NotWritten
+                    TextFieldUpdateStatus::NotWritten
                 } else {
-                    Pm1NameUpdateStatus::PossiblyChanged
+                    TextFieldUpdateStatus::PossiblyChanged
                 }
             );
         }
@@ -517,15 +554,19 @@ fn reused_sessions_and_wrong_finalization_ids_halt_without_clearing_write_risk()
     let mut reused = fixture()?;
     applied(&mut reused)?;
     assert_eq!(
-        reused.update.record(Pm1NameUpdateEvent::FreshSession {
+        reused.update.record(TextFieldUpdateEvent::FreshSession {
             id: id(1)?,
             identity: &reused.identity,
             memory_format: 0,
             whole_page: &reused.desired,
+            guards: (),
         }),
-        Err(Pm1NameUpdateError::ReusedSession)
+        Err(TextFieldUpdateError::ReusedSession)
     );
-    assert_eq!(reused.update.status(), Pm1NameUpdateStatus::PossiblyChanged);
+    assert_eq!(
+        reused.update.status(),
+        TextFieldUpdateStatus::PossiblyChanged
+    );
     for session in 1..=2 {
         let mut fixture = fixture()?;
         if session == 2 {
@@ -539,12 +580,15 @@ fn reused_sessions_and_wrong_finalization_ids_halt_without_clearing_write_risk()
         assert_eq!(
             fixture
                 .update
-                .record(Pm1NameUpdateEvent::SessionFinalized { id: id(99)? }),
-            Err(Pm1NameUpdateError::SessionMismatch)
+                .record(TextFieldUpdateEvent::SessionFinalized {
+                    id: id(99)?,
+                    guards: (),
+                }),
+            Err(TextFieldUpdateError::SessionMismatch)
         );
         assert_eq!(
             fixture.update.status(),
-            Pm1NameUpdateStatus::PossiblyChanged
+            TextFieldUpdateStatus::PossiblyChanged
         );
     }
     Ok(())
@@ -556,21 +600,21 @@ fn skipped_intent_and_repeated_intent_never_advance_the_update() -> TestResult {
     assert_eq!(
         early
             .update
-            .record(Pm1NameUpdateEvent::DurableWriteIntent { id: id(1)? }),
-        Err(Pm1NameUpdateError::UnexpectedEvent)
+            .record(TextFieldUpdateEvent::DurableWriteIntent { id: id(1)? }),
+        Err(TextFieldUpdateError::UnexpectedEvent)
     );
-    assert_eq!(early.update.status(), Pm1NameUpdateStatus::NotWritten);
+    assert_eq!(early.update.status(), TextFieldUpdateStatus::NotWritten);
     let mut skipped = fixture()?;
     fresh(&mut skipped, 1)?;
     assert_eq!(
         skipped
             .update
-            .record(Pm1NameUpdateEvent::ImmediateReadback {
+            .record(TextFieldUpdateEvent::ImmediateReadback {
                 whole_page: &skipped.desired,
             }),
-        Err(Pm1NameUpdateError::UnexpectedEvent)
+        Err(TextFieldUpdateError::UnexpectedEvent)
     );
-    assert_eq!(skipped.update.status(), Pm1NameUpdateStatus::NotWritten);
+    assert_eq!(skipped.update.status(), TextFieldUpdateStatus::NotWritten);
     for second_id in [1, 2] {
         let mut repeated = fixture()?;
         fresh(&mut repeated, 1)?;
@@ -578,12 +622,12 @@ fn skipped_intent_and_repeated_intent_never_advance_the_update() -> TestResult {
         assert_eq!(
             repeated
                 .update
-                .record(Pm1NameUpdateEvent::DurableWriteIntent { id: id(second_id)? }),
-            Err(Pm1NameUpdateError::UnexpectedEvent)
+                .record(TextFieldUpdateEvent::DurableWriteIntent { id: id(second_id)? }),
+            Err(TextFieldUpdateError::UnexpectedEvent)
         );
         assert_eq!(
             repeated.update.status(),
-            Pm1NameUpdateStatus::PossiblyChanged
+            TextFieldUpdateStatus::PossiblyChanged
         );
     }
     Ok(())
@@ -597,8 +641,11 @@ fn neither_readback_nor_fresh_verification_can_skip_a_finalization() -> TestResu
     assert_eq!(
         missing_readback
             .update
-            .record(Pm1NameUpdateEvent::SessionFinalized { id: id(1)? }),
-        Err(Pm1NameUpdateError::UnexpectedEvent)
+            .record(TextFieldUpdateEvent::SessionFinalized {
+                id: id(1)?,
+                guards: (),
+            }),
+        Err(TextFieldUpdateError::UnexpectedEvent)
     );
     let mut missing_finalize = fixture()?;
     fresh(&mut missing_finalize, 1)?;
@@ -607,21 +654,25 @@ fn neither_readback_nor_fresh_verification_can_skip_a_finalization() -> TestResu
     assert_eq!(
         missing_finalize
             .update
-            .record(Pm1NameUpdateEvent::FreshSession {
+            .record(TextFieldUpdateEvent::FreshSession {
                 id: id(2)?,
                 identity: &missing_finalize.identity,
                 memory_format: 0,
                 whole_page: &missing_finalize.desired,
+                guards: (),
             }),
-        Err(Pm1NameUpdateError::UnexpectedEvent)
+        Err(TextFieldUpdateError::UnexpectedEvent)
     );
     let mut missing_verification = fixture()?;
     applied(&mut missing_verification)?;
     assert_eq!(
         missing_verification
             .update
-            .record(Pm1NameUpdateEvent::SessionFinalized { id: id(2)? }),
-        Err(Pm1NameUpdateError::UnexpectedEvent)
+            .record(TextFieldUpdateEvent::SessionFinalized {
+                id: id(2)?,
+                guards: (),
+            }),
+        Err(TextFieldUpdateError::UnexpectedEvent)
     );
     Ok(())
 }
@@ -649,20 +700,23 @@ fn explicit_halt_and_errors_are_irreversible_at_each_nonterminal_stage() -> Test
         assert_eq!(
             fixture.update.status(),
             if stage < 2 {
-                Pm1NameUpdateStatus::NotWritten
+                TextFieldUpdateStatus::NotWritten
             } else {
-                Pm1NameUpdateStatus::PossiblyChanged
+                TextFieldUpdateStatus::PossiblyChanged
             }
         );
         assert_eq!(
             fixture.update.next_session(),
-            Err(Pm1NameUpdateError::TerminalState)
+            Err(TextFieldUpdateError::TerminalState)
         );
         assert_eq!(
             fixture
                 .update
-                .record(Pm1NameUpdateEvent::SessionFinalized { id: id(1)? }),
-            Err(Pm1NameUpdateError::TerminalState)
+                .record(TextFieldUpdateEvent::SessionFinalized {
+                    id: id(1)?,
+                    guards: (),
+                }),
+            Err(TextFieldUpdateError::TerminalState)
         );
     }
     Ok(())

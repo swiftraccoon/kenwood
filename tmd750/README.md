@@ -118,6 +118,20 @@ check, independent operation/exit/close failures, and refusal of speculative
 exit after an incomplete read. These mocks prove host behavior, not radio
 recovery timing or physical-device continuity.
 
+Three further examples read a radio or a file and write nothing:
+
+```text
+cargo run -p kenwood-tmd750 --example identify -- /dev/cu.usbmodem101
+cargo run -p kenwood-tmd750 --example status -- /dev/cu.usbmodem101
+cargo run -p kenwood-tmd750 --example d750_channels -- radio.d750
+```
+
+`identify` selects the first recognized TM-D750 endpoint when no port is
+given and prints the identity, power status, serial information, clock, DV
+Gateway state and both band modes. `status` prints every typed read of both
+bands and of the global settings. `d750_channels` lists the programmed memory
+channels of a `.d750` file without opening a radio.
+
 ## Select a qualified mode
 
 Writes take `Band` and `SelectableMode`, not unchecked numbers. The library
@@ -177,6 +191,19 @@ write or power-off command. `frequency_up` and `frequency_down` act on the
 control band, refuse any other band with `Error::NotControlBand`, and read
 the frequency back until the step is applied, because the radio acknowledges
 `UP` and `DW` before applying them.
+
+The D-STAR callsign slots of `get_dstar_callsign` and `set_dstar_callsign`
+(`DC`) are the six-entry MY list of ordinary DV operation, and
+`set_dstar_slot` (`DS`) selects the transmitted entry. On firmware 1.02 with
+PM Off active, slot N is stored at image address `0x50004 + 12 × (N − 1)`,
+eight NUL-padded callsign bytes followed by four NUL-padded memo bytes, and
+the selection at `0x50003` as a zero-based index; the generated registry has
+no field for either. The DV Gateway MY list that Terminal mode transmits,
+`dv.MyCallsignDvGatewayList` in the registry and the target of
+`My1CallsignUpdate`, is a separate list: writing its first entry over MCP
+left `DC 1` reading unset. The APRS My Callsign of `set_aprs_callsign` (`CS`)
+is the registry field `aprs.MyCallsign`: with PM Off active, a CAT write
+changed exactly its NUL-padded bytes at `0x50700`.
 
 ## Stored memory channels
 
@@ -304,6 +331,9 @@ Either reader runs over any transport, including native macOS Bluetooth. A
 completed page schedule and exit ACK say nothing about reacquiring CAT
 afterwards: `has_complete_configuration()` covers the read and exit schedule
 only, so the caller must open and identify a fresh connection to verify it.
+Over Bluetooth, that fresh connection's first command needs the deadline
+`bluetooth_first_reply_timeout_after_exit` returns for the time since the exit
+acknowledgment, described under Status.
 
 Await the operation to completion. Cancellation is cooperative at exchange
 boundaries. Successful exit retires protocol access to the original handle
@@ -424,24 +454,41 @@ unsupported image formats, and invalid text are errors, not guessed defaults.
 Findings never normalize a callsign or supply a missing suffix. The adapter
 performs no I/O and creates no write patch.
 
-### Typed PM1 name update
+### Typed text field updates
 
-`Pm1NameUpdate` prepares a single-field update for global PM1 on the exact
-TM-D750 / firmware 1.02 / type K,2,1 target. The complete captured page is
-immutable; only the sixteen PM1 name bytes can differ in the proposed page.
-`Pm1Name` accepts 1 through 16 printable ASCII bytes, preserving case and
-spaces without truncation. Preparation performs no I/O:
+`TextFieldUpdate<V, G>` prepares a single-field update of one NUL-padded text
+field inside one complete 256-byte page on the exact TM-D750 / firmware 1.02 /
+type K,2,1 target, and sequences its verification across two MCP sessions.
+The complete captured page is immutable; only the field's bytes can differ in
+the proposed page, so every other byte is compared in full before and after
+the write. The value type `V` validates the field's syntax and the sealed
+guard policy `G` fixes the facts every session must supply beyond the
+identity, the memory-format byte and the whole target page:
+
+| Alias | Field | Value | Guards |
+|-------|-------|-------|--------|
+| `Pm1NameUpdate` | the global PM1 name, sixteen bytes in the PM control page | `Pm1Name`: 1 to 16 printable ASCII bytes | `NoGuards` |
+| `My1CallsignUpdate` | DV Gateway MY1 of PM Off, eight bytes | `My1Callsign`: 1 to 8 uppercase letters, digits or spaces, at least one of them a letter or digit | `PmOffGatewayGuards`: PM Off selected and MY1 selected in the captured pages, Gateway Off stored and observed fresh before entry, the complete PM control page unchanged in every session, and Gateway Off on the fresh post-exit connection |
+| `ChannelNameUpdate` | one physical channel's sixteen name bytes in the name table | `ChannelNameText`: 1 to 16 printable ASCII bytes; `None` is an unnamed channel | `NoGuards` |
+
+Values preserve case and spaces without truncation, trimming, case folding or
+replacement encoding, and the stored fields are NUL padded, not space padded.
+`My1Callsign` validates storage syntax only, not callsign ownership, on-air
+validity or Terminal acceptance. Preparation performs no I/O:
 
 ```rust
-use kenwood_tmd750::Identity;
-use kenwood_tmd750::memory::{Pm1Name, Pm1NameUpdate, Pm1NameUpdateError};
+use kenwood_tmd750::memory::{
+    ChannelNameText, ChannelNameUpdate, My1Callsign, My1CallsignUpdate, Pm1Name, Pm1NameUpdate,
+    TextFieldUpdateError,
+};
+use kenwood_tmd750::{Identity, PhysicalChannel};
 
 fn prepare_pm1_name(
     identity: &Identity,
     captured_page: &[u8],
     expected_current: &str,
     desired: &str,
-) -> Result<Pm1NameUpdate, Pm1NameUpdateError> {
+) -> Result<Pm1NameUpdate, TextFieldUpdateError> {
     Pm1NameUpdate::prepare(
         identity,
         captured_page,
@@ -449,122 +496,28 @@ fn prepare_pm1_name(
         &Pm1Name::new(desired)?,
     )
 }
-```
-
-The caller must establish that every byte of `Pm1NameUpdate::required_page()`
-was captured from the intended radio. The expected name must match the backup;
-the driver later requires a fresh, complete page equal to that same backup.
-An unchanged requested name returns `Pm1NameUpdateError::NoChange` before I/O.
-Page drift, an unsupported identity or descriptor, and out-of-order events halt
-the update without rebasing or automatic rollback.
-
-`Radio::set_pm1_name_session_until_exit` runs one of two sessions: apply once
-with immediate full-page readback, then a separate read-only session comparing
-the entire desired page. The caller must select main-unit USB at 9600 baud
-with RTS/CTS and DTR/RTS asserted; the generic transport trait cannot prove the
-USB connector identity. Before the sole write, the caller's durable-intent
-callback must persist both complete pages. The caller owns fail-closed capture
-and the lifecycle between sessions: exit ACK, old-handle close/drop, one fresh
-matching CAT identity check and clean close, then a complete capture and a
-synchronized session record before recording
-`Pm1NameUpdateEvent::SessionFinalized`. That event records values the caller
-supplies; the library does not verify that the connection, unit, or storage
-behind them is the same one.
-
-The requested name remains in place. After a possible write, cancellation
-must finish the remaining safe verification steps; actual failures stop
-further commands. Uncertain framing permits neither speculative exit nor a
-retry. The state distinguishes no permitted write, a possible change, and a
-desired page verified across MCP exit/re-entry. None establishes power-cycle
-persistence. The companion REPL supplies this lifecycle through
-`mcp text set --help`, with a current full backup and explicit `--apply`.
-
-Software-tested only; not run on hardware. This API admits no other text field,
-no generic keyboard injection, and no automatic Terminal Mode settings write,
-and it leaves the generic schema gate unchanged.
-
-### Typed MY1 callsign updates
-
-`My1Callsign` is a storage value for DV Gateway MY1, not a D-STAR wire address.
-It accepts one to eight uppercase ASCII letters, digits, or spaces, including
-at least one letter or digit. Spacing is preserved exactly; no case folding,
-trimming, truncation, suffix insertion, or replacement encoding occurs. The
-stored eight-byte field is NUL-padded, not space-padded. This validates storage
-syntax only, not callsign ownership, on-air validity, or Terminal acceptance.
-
-`My1CallsignUpdate` prepares one leave-in-place change on the pinned firmware
-1.02 / type `K,2,1` target, with PM Off, Gateway Off, and MY1 selected:
-
-```rust
-use kenwood_tmd750::Identity;
-use kenwood_tmd750::memory::{My1Callsign, My1CallsignUpdate, My1CallsignUpdateError};
 
 fn prepare_empty_my1(
     identity: &Identity,
     captured_target: &[u8],
     captured_control: &[u8],
     desired: &str,
-) -> Result<My1CallsignUpdate, My1CallsignUpdateError> {
+) -> Result<My1CallsignUpdate, TextFieldUpdateError> {
     My1CallsignUpdate::prepare(
         identity,
         captured_target,
         captured_control,
         None,
-        &My1Callsign::new(desired)?,
+        Some(&My1Callsign::new(desired)?),
     )
 }
-```
-
-`None` requires an exactly eight-NUL current field. To replace existing text,
-pass `Some(&expected_callsign)`; its complete encoded field must match the
-captured bytes. The desired value cannot be empty, and no-op requests fail
-before I/O. Both pages must be complete observed pages, not synthetic gap data.
-Only the eight MY1 bytes may change; the memo, other MY entries, Gateway mode,
-selection, and every other byte of both pages are retained unchanged.
-
-`Radio::set_my1_callsign_session_until_exit` runs the apply session or the
-subsequent independent read-only verification. Both require fresh ID/FV/TY and
-Gateway Off before MCP entry, followed by format, full control-page, and full
-target-page comparisons. The apply session requires a synchronized intent
-before one complete-page write and immediate whole-page readback. Each session
-must finish E/ACK, original close/drop, one fresh matching CAT identity and
-Gateway-Off check, fresh close, and a complete capture and synchronized session
-record before the caller records `My1CallsignUpdateEvent::SessionFinalized`. Finalization accepts
-the actual fresh identity and typed Gateway observation, not an inferred state.
-
-The caller owns the private raw capture and journal, main-unit USB selection at
-9600 baud, and both connection lifecycles. Cancelling before the intent callback
-stops at a known boundary. Once the write may have been dispatched, the update
-stays in its possible-change state until the read-only verification session
-completes; any failed exchange or missing session record stops further sessions
-and preserves that state. No rollback or retry is performed, and the generic schema
-gate is unchanged.
-
-Software-tested only; not run on hardware. The fixed empty-to-`KQ4NIT`-and-back
-experiment below covers the field layout, not arbitrary values.
-
-### Typed channel name update
-
-`ChannelNameUpdate` prepares a single-field update of one physical channel's
-sixteen-byte name on the exact TM-D750 / firmware 1.02 / type K,2,1 target.
-The complete captured name page is immutable; only that channel's sixteen
-bytes can differ in the proposed page, so the other fifteen names on the page,
-including the weather-channel names that share the last page, are compared in
-full before and after the write. `ChannelNameText` accepts 1 through 16
-printable ASCII bytes, preserving case and spaces without truncation; the
-stored field is NUL padded, and `None` stands for an unnamed channel (sixteen
-NUL bytes), so a name can also be cleared. Preparation performs no I/O:
-
-```rust
-use kenwood_tmd750::memory::{ChannelNameText, ChannelNameUpdate, ChannelNameUpdateError};
-use kenwood_tmd750::{Identity, PhysicalChannel};
 
 fn prepare_channel_name(
     identity: &Identity,
     captured_page: &[u8],
     channel: PhysicalChannel,
     desired: &str,
-) -> Result<ChannelNameUpdate, ChannelNameUpdateError> {
+) -> Result<ChannelNameUpdate, TextFieldUpdateError> {
     ChannelNameUpdate::prepare(
         identity,
         captured_page,
@@ -575,25 +528,72 @@ fn prepare_channel_name(
 }
 ```
 
-`ChannelNameUpdate::required_page` names the page the caller must have
-captured, complete, from the intended radio; every name page is part of the
-standard backup. The expected current name must match the capture (an unnamed
-channel is `None`), and an unchanged request returns
-`ChannelNameUpdateError::NoChange` before I/O. Page drift, an unsupported
-identity, and out-of-order events halt the update without rebasing or
-automatic rollback.
+The caller must establish that every byte of the page named by
+`required_page` (and, for MY1, `required_control_page`) was captured,
+complete, from the intended radio; every such page is part of the standard
+backup. The expected current value must match the capture: the PM1 form takes
+the current name, the MY1 form takes `None` for an exactly eight-NUL field or
+`Some(&expected)` for its exact encoded field, and the channel form takes
+`None` for an unnamed channel; a desired `None` clears the MY1 field or the
+channel name to NUL bytes, so both can also be cleared. An unchanged
+request returns `TextFieldUpdateError::NoChange` before I/O. Page drift, an
+unsupported identity or descriptor, and out-of-order events halt the update
+without rebasing or automatic rollback. Only the field's bytes may change; the
+MY1 memo, the other MY entries, the Gateway mode and selection bytes, the
+other fifteen names on a name page (including the weather-channel names that
+share the last page) and every other byte are carried unchanged.
 
-`Radio::set_channel_name_session_until_exit` runs the same two sessions as the
-PM1 update: apply once with immediate full-page readback, then a separate
-read-only session comparing the entire desired page. The caller's durable
-intent callback must persist both complete pages before the sole write, and
-the caller owns fail-closed capture and the lifecycle between sessions (exit
-ACK, old-handle close, one fresh matching CAT identity, a complete capture and
-a synchronized session record) before recording
-`ChannelNameUpdateEvent::SessionFinalized`. Names are not part of the CAT
-channel record, so this is the only way this crate writes a channel name.
+`Radio::set_text_field_session_until_exit` runs one of the two sessions:
+apply once with immediate full-page readback, then a separate read-only
+session comparing the entire desired page. Both sessions obtain a fresh
+ID/FV/TY identity before MCP entry, then compare the format byte and the full
+target page; `PmOffGatewayGuards` additionally requires Gateway Off before
+entry and reads the full control page after the format byte. The apply
+session requires a synchronized intent before its one complete-page write and
+immediate whole-page readback: the caller's durable-intent callback must
+persist both complete pages first. The caller selects a TM-D750 USB endpoint,
+main unit or operation panel, at 9600 baud with RTS/CTS and DTR/RTS asserted;
+the generic transport trait cannot prove the USB connector identity. The caller owns fail-closed capture and the
+lifecycle between sessions: exit ACK, old-handle close/drop, one fresh matching
+CAT identity check (with a Gateway Off check for MY1) and clean close, then a
+complete capture and a synchronized session record before recording
+`TextFieldUpdateEvent::SessionFinalized` with the policy's post-exit facts
+(`()` for `NoGuards`, `PmOffGatewayFinal` for `PmOffGatewayGuards`). That
+event records values the caller supplies; the library does not verify that
+the connection, unit, or storage behind them is the same one.
 
-Software-tested only; not run on hardware.
+The requested value remains in place. After a possible write, cancellation
+must finish the remaining safe verification steps; actual failures stop
+further commands. Uncertain framing permits neither speculative exit nor a
+retry, no rollback or retry is performed, and the generic schema gate is
+unchanged. `TextFieldUpdateStatus` distinguishes no permitted write, a
+possible change, and a desired page verified across MCP exit/re-entry; none
+establishes power-cycle persistence. Names are not part of the CAT channel
+record, so this is the only way this crate writes a channel name. The
+companion REPL supplies this lifecycle through `mcp text set --help`, with a
+current full backup and explicit `--apply`.
+
+On the operation-panel endpoint the caller opens each session only after the
+endpoint has stayed enumerated for about ten seconds, because it can
+re-enumerate once more after `ID` first answers and a session opened at that
+moment fails to enter programming mode with `ENXIO`. An update left at
+`TextFieldUpdateStatus::PossiblyChanged` is resolved by a fresh backup
+compared page by page against the pre-write backup with
+`StandardConfigurationDiff`, never by repeating the session.
+
+Hardware coverage on firmware 1.02 / type K,2,1 over the operation-panel USB
+endpoint, with every session driven by
+`Radio::set_text_field_session_until_exit`: PM1 renamed and renamed back, MY1
+written from empty to `KQ4NIT` and cleared, and a regular channel named and
+cleared. Each update had its write and both exits acknowledged and its
+immediate readback equal to the desired page, reached
+`TextFieldUpdateStatus::VerifiedAcrossSessions`, and was confirmed by a fresh
+complete standard backup: each write differed from the pre-write backup in
+that field's bytes only, and each rename back or clear returned every page
+byte-identical to the pre-write backup. The MY1 updates observed Gateway Off
+before each entry and on each fresh post-exit connection. CAT `DC 1` read MY
+slot 1 as unset while this field held `KQ4NIT`, because `DC` addresses the
+separate MY list of ordinary DV operation.
 
 ### Fixed PM1 rename-and-restore trial
 
@@ -726,8 +726,9 @@ orchestration through `mcp terminal-exit-trial --help`; ordinary D-STAR
 commands do not invoke it.
 
 Known limitation: a fresh CAT Gateway-Off reply does not imply the radio will
-accept immediate MCP re-entry. A second entry can fail with `ENXIO`, leaving
-the trial incomplete and its write in the possible-change state.
+accept immediate MCP re-entry. A second entry opened before the endpoint has
+stayed enumerated for about ten seconds can fail with `ENXIO`, leaving the
+trial incomplete and its write in the possible-change state.
 
 ### Configuration files
 
@@ -873,9 +874,31 @@ selector bounds where the registry contains only a storage-width constraint.
 `McpSession::compare_exchange_menu_update` compares the plan's identity with
 the session and freshly compares every complete guard and target page before
 writing. It uses the same intent, write, readback, and journal implementation
-as the raw-page API. The value policy follows the official program's layout;
-individual fields are not tested on hardware. It does not activate Gateway mode,
-change connection routing, enable automatic transmission, or recall a PM.
+as the raw-page API. The value policy follows the official program's layout.
+Hardware coverage on firmware 1.02 / type K,2,1 over the operation-panel USB
+endpoint, in PM Off, for one field of every storage kind that ordinary
+updates admit. The byte fields `radio.VoxGain`, `radio.VoxDelay`,
+`gps.MyPositionSelect` and `radio.AmHighCut` were each written through the
+plan with immediate readback, read back over CAT (`VG`, `VD`, `MS`, `SH`),
+restored through the CAT setter and confirmed by a fresh standard backup
+byte-identical to the pre-write backup. The sixteen-byte text field
+`pm.PmName2`, the single-bit fields `gps.Sentence_Gpgll` (also read back over
+CAT `GS`) and `gps.MyPositionList[0].NorthSouth`, the boolean byte
+`radio.Beep`, the two-byte little-endian `gps.Interval` and the four-byte
+signed `gps.MyPositionList[0].Altitude` (written as a negative value) were
+each written to a new value and back through two plans, and each run was
+confirmed by a fresh standard backup that differed from the pre-write backup
+in that field's bytes only and, after the restoring write, in no byte.
+`radio.Beep` was also written in PM1 (slot 1) while PM Off was active,
+changing only that slot's byte, so per-slot addressing has the same coverage;
+and `pm.PmName2` and `radio.Beep` were written together in one plan and
+restored together in another, each session writing and reading back both
+pages, with the backups differing in those six bytes only and then in none.
+`gps.MyPositionSelect` stores My
+Position 1 through 5 as 0 through 4 and the GPS receiver as 5, whereas `MS`
+on the wire uses 0 for GPS and 1 through 5 for the positions. Other fields
+are untested on hardware. The session does not activate Gateway mode, change
+connection routing, enable automatic transmission, or recall a PM.
 Unresolved fields remain available for inspection and offline storage previews.
 Binary fields have no scalar keyboard parser; an explicitly selected startup
 bitmap can be read but cannot be patched through the scalar menu planner.
@@ -986,11 +1009,12 @@ separate: this is the TM-D750 lifecycle only.
 - Provides the fixed PM1 rename/restore session described above, without
   admitting arbitrary firmware-1.02 settings writes. The caller owns the
   durable journal, fail-closed capture, and per-session finalization.
-- Provides a typed, leave-in-place PM1 name update with the same narrow target,
-  whole-page drift checks, durable-intent contract, and separate-session
-  verification. Other text settings remain outside this write API.
-- Provides the separate typed PM Off MY1 callsign update described above,
-  with complete control-page guards and fresh Gateway-Off verification.
+- Provides typed, leave-in-place updates of three text fields, each with a
+  fixed target, whole-page drift checks, a durable-intent contract and
+  separate-session verification: the PM1 name, one channel's name, and the PM
+  Off MY1 callsign, which adds complete control-page guards and fresh
+  Gateway-Off verification. Other registered text fields are written through
+  `MenuUpdatePlan`.
 - Decodes and plans menu fields through the generated registry
   (`memory::menu_fields`), resolving each field's recorded slot stride:
   8192 bytes for ordinary menu blocks and 256000 for startup bitmaps.
@@ -1000,8 +1024,9 @@ separate: this is the TM-D750 lifecycle only.
   and domains as the patch planner.
 - Separately admits ordinary firmware-1.02 registry assignments through
   `MenuUpdatePlan`, with exact identity, format, active-PM, Gateway-Off, full-page,
-  and value-policy guards. This does not widen the legacy raw-page gate, and
-  the fields are not individually verified on hardware.
+  and value-policy guards; one field of every storage kind it admits has
+  hardware coverage, listed under General menu snapshots and batch changes.
+  This does not widen the legacy raw-page gate.
 - Validates and round-trips `.d750` containers, binding the header signature
   to its exact full or short payload length and retaining only stored bytes.
   Opaque metadata is preserved; settings and firmware compatibility are not
@@ -1022,8 +1047,19 @@ bounded domain was written and read back, the next value's rejection was
 observed, each tuning step was measured with `UP` and `DW`, and the stale
 reply that follows a rejected command was provoked and discarded. Memory
 channels were written, read back, recalled, decoded from MCP page reads and
-cleared on the same firmware. `AG`, `AI`, `BL`, `FS`, `FT` and `IO` are
-rejected by this radio and have no accessor.
+cleared on the same firmware. `AG`, `AI`, `BL`, `BS`, `FR`, `FS`, `FT`, `GM`,
+`IO` and `SD` are rejected by this radio and have no accessor. Every typed read
+also answered over native Bluetooth, and mode and setting writes verified their
+echo and readback there. The radio holds the reply to the first command of a
+Bluetooth connection opened within about five seconds of the previous
+connection's close until about five seconds after that close, and after a
+programming exit it answers no earlier than about 20 seconds after the exit
+acknowledgment; the held command is answered, not dropped. Before the first
+command of a Bluetooth connection, `Radio::set_next_reply_timeout` takes
+`BLUETOOTH_FIRST_REPLY_TIMEOUT`, or after a programming exit
+`bluetooth_first_reply_timeout_after_exit` with the time elapsed since the
+acknowledgment, which extends the deadline to `BLUETOOTH_EXIT_REPLY_BOUND`
+after the exit however quickly the connection reopened.
 
 With Gateway routed to panel USB on firmware 1.02, main-unit USB continues to
 answer identity and Gateway queries while the radio is in Terminal mode, and a
@@ -1038,26 +1074,38 @@ device paths can change or be reassigned. After a disconnect, explicitly
 select and open the endpoint again and establish its radio identity before
 calling `Radio::recover`. Custom transports may implement safe reopening.
 
-`Radio::probe_mcp` has hardware coverage on firmware 1.02 over main-unit USB
-for the fixed fragments `8..48` and `327681..327936`, followed by exit ACK,
-close of the original handle, and a fresh identified connection.
+`Radio::probe_mcp` has hardware coverage on firmware 1.02 over both USB
+endpoints, main unit and operation panel, for the fixed fragments `8..48` and
+`327681..327936`, followed by exit ACK, close of the original handle, and a
+fresh identified connection.
 
 `Radio::backup_mcp_until_exit` has hardware coverage for the complete standard
 schedule (1,138 pages, 289,962 bytes) on that same target, followed by exit,
-close, and fresh identity on a separately opened connection. General settings
-writes and a compatible `.d750` export have not run on hardware.
+close, and fresh identity on a separately opened connection. Ordinary settings
+writes have hardware coverage for one field of every storage kind
+`MenuUpdatePlan` admits, listed under General menu snapshots and batch
+changes; a compatible `.d750` export has not run on hardware. The typed PM1
+name, PM Off MY1 callsign and channel name updates have hardware coverage over
+the operation-panel USB endpoint, each ending verified across sessions and
+confirmed by fresh standard backups, as described under Typed text field
+updates.
 
 After the MCP exit ACK on firmware 1.02, the full CAT identity tuple becomes
 available roughly 10 to 13 seconds later. The main-unit USB serial endpoint
 re-enumerates at about that time; the panel USB endpoint can reappear within a
-few seconds and then leave `ID` unanswered until the tuple is ready. The
-companion fixed-probe and backup commands therefore
-wait a two-second settle and poll within a sixty-second readiness budget,
-allowing at most four freshly opened identity attempts and retrying only an
-entirely silent initial ID timeout after a clean close and complete capture.
-Every retry re-enumerates the exact selected endpoint; a partial reply stops
-verification. Ordinary guarded setters and fixed write experiments verify once.
-These are host bounds sized from observation, not firmware timing guarantees.
+few seconds, leave `ID` unanswered until the tuple is ready, and re-enumerate
+once more after `ID` first answers, so a handle opened on it at that moment can
+fail with `ENXIO`. The companion probe and backup commands, and the menu and
+text-update commands on the operation-panel endpoint, therefore wait a
+two-second settle and poll within a sixty-second readiness budget, allowing
+at most six freshly opened identity attempts and retrying only an entirely
+silent initial ID timeout after a clean close and complete capture. Every
+retry re-enumerates the exact selected endpoint; a partial reply stops
+verification. On the main-unit endpoint the guarded setters and the fixed
+write experiments verify with one open. Before every programming entry on
+the operation-panel endpoint, those commands also wait until the endpoint has
+stayed enumerated for ten seconds within a sixty-second budget. These are host
+bounds sized from observation, not firmware timing guarantees.
 
 Bluetooth Terminal entry and restoration are owned by this library's
 `TerminalLifecycle` over the caller-supplied `ControlHost`, `ModemHost` and
@@ -1073,7 +1121,7 @@ extracted vendor maximum-version restriction. Legacy raw-page and patch writes
 reject firmware 1.02 before page I/O or journal changes. The separate immutable
 `MenuUpdatePlan` admits ordinary registered-field updates through format and
 full-page guards on the exact observed identity; it does not change that legacy
-gate, and its individual fields have no hardware coverage. The meaning of the
+gate, and one field of every storage kind it admits has hardware coverage. The meaning of the
 three `TY` components remains unknown. The registry is generated from the
 committed manifest and must never be edited by hand:
 

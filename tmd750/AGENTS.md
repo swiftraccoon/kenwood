@@ -36,7 +36,8 @@
   `REJECTION_SETTLE_COMMANDS` commands discard what follows their reply within
   `REJECTION_SETTLE_WINDOW`. Needed because the radio repeats the reply to the
   command that follows certain rejected bare commands (`AI`, `BL`, `FS`, `FT`
-  did; `AG`, `IO`, unknown mnemonics did not). No unconditional pre-write
+  did; `AG`, `IO`, unknown mnemonics did not; after rejected `FR` and `GM` the
+  next reply was followed by a repeated `?`). No unconditional pre-write
   drain: every transport read is a capture-transcript record in the REPL.
 - Every setter runs the firmware/type gate, requires an exact echo, then reads
   back. Wire domains were established by writing every value and observing
@@ -55,11 +56,21 @@
   `ME addr`, then `N`); 19- and 20-field forms are `?`/`N`; `ME Pri,...` is
   `N`. A zero-frequency record is accepted, so never send one.
 - `DC slot,callsign,memo` and `CS callsign` store their text verbatim and
-  unpadded; `DC slot,,` is an unset or cleared MY slot, and an unconfigured
+  unpadded (a comma cannot be carried, so `DstarCallsignEntry` rejects it);
+  `DC slot,,` is an unset or cleared MY slot, and an unconfigured
   `CS` reads `NOCALL` (`N` for a lowercase base or `-0`, `?` for an
   over-length base). On this radio `DC` is the six-slot MY callsign list
   selected by `DS`, not the D75's URCALL/RPT1/RPT2 fields; never copy the
   D75's `DC` names or its space padding.
+- With PM Off active, `DC` slot N is image `0x50004 + 12 × (N − 1)` (8 callsign
+  + 4 memo bytes, NUL padded) and `DS` is `0x50003` (zero-based), outside the
+  registry. The DV Gateway MY list (`dv.MyCallsignDvGatewayList`, written by
+  `My1CallsignUpdate`) is separate: an MCP write to it left `DC 1` unset.
+  `CS` is the registry field `aprs.MyCallsign` (`0x50700`, NUL padded).
+- Native Bluetooth holds a connection's first reply until about 5 s after the
+  previous close, or 20 to 22 s after an MCP exit ACK, and never drops it. Via
+  `Radio::set_next_reply_timeout`: `BLUETOOTH_FIRST_REPLY_TIMEOUT`, or after an
+  exit `bluetooth_first_reply_timeout_after_exit`; never a longer regular one.
 
 ## Memory channel storage (image layout, verified on firmware 1.02)
 
@@ -114,6 +125,27 @@
   inside the writable global region); every other page is refused before a
   frame is built. `ChannelNameUpdate` writes one channel's sixteen name bytes
   through it with a whole-page guard; an unnamed channel is sixteen NUL bytes.
+- An MCP write ending `possibly_changed` after an acknowledged exit is resolved
+  by a fresh read-only standard backup compared page by page against the
+  pre-write backup (`StandardConfigurationDiff`; the REPL's `mcp terminal
+  compare`), never by re-running the session: on the panel USB role the
+  endpoint can re-enumerate again once `ID` first answers (about 10 to 13 s
+  after the exit ACK), so an MCP session opened at that moment fails to enter
+  with `ENXIO`; a backup started 0.3 s after a matched readiness check did. A
+  caller opens any MCP session on that endpoint only after it has stayed
+  enumerated for about 10 s; every REPL MCP entry on that endpoint does.
+- `MenuUpdatePlan` has hardware coverage in PM Off over panel USB for one field
+  of every storage kind it admits, a slot-1 write and a two-page plan (field
+  list in the README). The image stores `gps.MyPositionSelect` as 0 to 4 for
+  My Position 1 to 5 and 5 for GPS; CAT `MS` uses 0 for GPS and 1 to 5. A
+  field with a CAT mirror is qualified that way; one without needs a backup
+  comparison that changed the field's bytes only, then none.
+- `memory::TextFieldUpdate<V, G>` is the one text-field engine and
+  `Radio::set_text_field_session_until_exit` its one driver. A new field adds
+  a `TextField` variant, a sealed `TextValue` and a `prepare` constructor in
+  its own submodule; a new guard requirement adds a sealed `GuardPolicy` plus
+  its `SessionGuards` exchanges. Never add a parallel per-field engine, event
+  enum, error enum or driver.
 
 ## Reflector Terminal lifecycle
 

@@ -668,6 +668,12 @@ impl<T: Transport> Radio<T> {
 
     /// Read one D-STAR MY callsign slot (`DC slot`).
     ///
+    /// The six slots are the MY list of ordinary DV operation. On firmware
+    /// 1.02 with PM Off active, slot N is stored at image address
+    /// `0x50004 + 12 × (N − 1)`: eight NUL-padded callsign bytes, then four
+    /// NUL-padded memo bytes. The DV Gateway MY list that
+    /// [`crate::memory::My1CallsignUpdate`] writes is a separate list.
+    ///
     /// # Errors
     ///
     /// See the module contract.
@@ -798,6 +804,9 @@ impl<T: Transport> Radio<T> {
     }
 
     /// Read the selected D-STAR MY callsign slot (`DS`).
+    ///
+    /// On firmware 1.02 with PM Off active, the selection is stored at image
+    /// address `0x50003` as a zero-based index.
     ///
     /// # Errors
     ///
@@ -1008,7 +1017,8 @@ impl<T: Transport> Radio<T> {
     ///
     /// Sends the callsign exactly as validated; the radio stores and echoes it
     /// unchanged. This is the transmitted APRS identity, though setting it does
-    /// not transmit.
+    /// not transmit. On firmware 1.02 with PM Off active it is stored in the
+    /// registry field `aprs.MyCallsign` at image address `0x50700`.
     ///
     /// # Errors
     ///

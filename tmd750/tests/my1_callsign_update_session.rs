@@ -5,6 +5,7 @@
 use kenwood_schema as _;
 use mcp_d75_extract as _;
 use mmdvm as _;
+use proptest as _;
 use thiserror as _;
 use tokio_serial as _;
 use tracing as _;
@@ -19,15 +20,15 @@ use std::task::Poll;
 use std::time::Duration;
 
 use kenwood_tmd750::memory::{
-    My1Callsign, My1CallsignUpdate, My1CallsignUpdateError, My1CallsignUpdateEvent,
-    My1CallsignUpdateSession as Session, My1CallsignUpdateStatus as Status,
+    My1Callsign, My1CallsignUpdate, PmOffGatewayFinal, TextFieldUpdateError, TextFieldUpdateEvent,
+    TextFieldUpdateSession as Session, TextFieldUpdateStatus as Status,
 };
 use kenwood_tmd750::protocol::mcp::{ACK, read_request, write_request};
 use kenwood_tmd750::{
-    Address, DvGatewayMode, Error, FirmwareIdentity, Identity, McpError, McpProbeExit,
-    My1CallsignUpdateSessionError as SessionError, My1CallsignUpdateSessionOutcome as Outcome,
-    My1CallsignUpdateSessionReport as Report, My1CallsignUpdateSessionStage as Stage,
-    My1CallsignUpdateWriteDisposition as WriteDisposition, Page, Radio, RadioModel, RadioType,
+    Address, DvGatewayMode, Error, FirmwareIdentity, Identity, McpError, McpProbeExit, Page, Radio,
+    RadioModel, RadioType, TextFieldUpdateSessionError as SessionError,
+    TextFieldUpdateSessionOutcome as Outcome, TextFieldUpdateSessionReport as Report,
+    TextFieldUpdateSessionStage as Stage, TextFieldUpdateWriteDisposition as WriteDisposition,
 };
 use kenwood_transport::{MockTransport, Transport, TransportError};
 
@@ -50,7 +51,7 @@ fn fixture() -> Result<My1CallsignUpdate, TestError> {
         &target,
         &control,
         None,
-        &My1Callsign::new("KQ4NIT")?,
+        Some(&My1Callsign::new("KQ4NIT")?),
     )?)
 }
 
@@ -283,10 +284,12 @@ fn assert_success(report: &Report, update: &My1CallsignUpdate) {
 
 fn finalize(update: &mut My1CallsignUpdate, report: &Report) -> TestResult {
     let identity = update.identity().clone();
-    update.record(My1CallsignUpdateEvent::SessionFinalized {
+    update.record(TextFieldUpdateEvent::SessionFinalized {
         id: report.session_id().ok_or("session ID missing")?,
-        identity: &identity,
-        gateway_mode: DvGatewayMode::Off,
+        guards: PmOffGatewayFinal {
+            identity: &identity,
+            gateway_mode: DvGatewayMode::Off,
+        },
     })?;
     Ok(())
 }
@@ -294,7 +297,7 @@ fn finalize(update: &mut My1CallsignUpdate, report: &Report) -> TestResult {
 async fn apply_and_finalize(update: &mut My1CallsignUpdate) -> TestResult {
     let mut radio = Radio::new(session_script(update)?);
     let report = radio
-        .set_my1_callsign_session_until_exit(update, || false, |_| Ok(()))
+        .set_text_field_session_until_exit(update, || false, |_| Ok(()))
         .await;
     assert_success(&report, update);
     assert_blocked(&mut radio).await;
@@ -389,7 +392,7 @@ async fn two_sessions_pin_every_command_and_preserve_non_callsign_bytes() -> Tes
         let intents = Arc::new(AtomicUsize::new(0));
         let mut radio = Radio::new(AuditedTransport::new(session_script(&update)?, &intents));
         let report = radio
-            .set_my1_callsign_session_until_exit(
+            .set_text_field_session_until_exit(
                 &mut update,
                 || false,
                 |state| {
@@ -458,7 +461,7 @@ async fn mismatching_fresh_identity_blocks_gateway_entry_and_intent() -> TestRes
         let mut radio = Radio::new(mock);
         let called = Cell::new(false);
         let report = radio
-            .set_my1_callsign_session_until_exit(
+            .set_text_field_session_until_exit(
                 &mut update,
                 || false,
                 |_| {
@@ -472,7 +475,7 @@ async fn mismatching_fresh_identity_blocks_gateway_entry_and_intent() -> TestRes
             matches!(
                 report.outcome,
                 Outcome::Failed {
-                    error: SessionError::Evidence(My1CallsignUpdateError::IdentityMismatch),
+                    error: SessionError::Evidence(TextFieldUpdateError::IdentityMismatch),
                     ..
                 }
             ),
@@ -531,7 +534,7 @@ async fn active_unknown_rejected_and_partial_gateway_replies_prevent_entry() -> 
         radio.set_timeout(Duration::from_millis(1));
         let called = Cell::new(false);
         let report = radio
-            .set_my1_callsign_session_until_exit(
+            .set_text_field_session_until_exit(
                 &mut update,
                 || false,
                 |_| {
@@ -552,7 +555,7 @@ async fn active_unknown_rejected_and_partial_gateway_replies_prevent_entry() -> 
         );
         if let Some(expected) = expected {
             assert!(
-                matches!(report.outcome, Outcome::Failed { error: SessionError::Evidence(My1CallsignUpdateError::GatewayMode { actual }), .. } if actual == expected),
+                matches!(report.outcome, Outcome::Failed { error: SessionError::Evidence(TextFieldUpdateError::GatewayMode { actual }), .. } if actual == expected),
                 "retain the exact refused typed Gateway mode"
             );
         } else {
@@ -622,7 +625,7 @@ async fn format_control_and_target_drift_prevent_intent_without_rebasing() -> Te
         let mut radio = Radio::new(mock);
         let called = Cell::new(false);
         let report = radio
-            .set_my1_callsign_session_until_exit(
+            .set_text_field_session_until_exit(
                 &mut update,
                 || false,
                 |_| {
@@ -675,7 +678,7 @@ async fn failed_durable_intent_preserves_the_first_error_and_any_exit_error() ->
         mock.expect(b"E", &[exit_ack]);
         let mut radio = Radio::new(mock);
         let report = radio
-            .set_my1_callsign_session_until_exit(
+            .set_text_field_session_until_exit(
                 &mut update,
                 || false,
                 |_| Err(io::Error::other("durable intent synchronization failed")),
@@ -754,7 +757,7 @@ async fn every_pre_intent_cancellation_boundary_stops_at_complete_exchanges() ->
         let mut checks = 0;
         let called = Cell::new(false);
         let report = radio
-            .set_my1_callsign_session_until_exit(
+            .set_text_field_session_until_exit(
                 &mut update,
                 || {
                     let cancelled = checks == boundary;
@@ -811,7 +814,7 @@ async fn cancellation_after_intent_finishes_both_sessions_without_another_write(
     for phase in [Session::Apply, Session::Verify] {
         let mut radio = Radio::new(session_script(&update)?);
         let report = radio
-            .set_my1_callsign_session_until_exit(
+            .set_text_field_session_until_exit(
                 &mut update,
                 || cancel.get(),
                 |_| {
@@ -878,7 +881,7 @@ async fn failed_dispatch_or_ack_never_sends_readback_exit_retry_or_rollback() ->
         let mut radio = Radio::new(transport);
         radio.set_timeout(Duration::from_millis(1));
         let report = radio
-            .set_my1_callsign_session_until_exit(
+            .set_text_field_session_until_exit(
                 &mut update,
                 || false,
                 |_| {
@@ -952,14 +955,14 @@ async fn complete_last_byte_readback_mismatch_exits_without_rollback_or_verifica
     mock.expect(b"E", &[ACK]);
     let mut radio = Radio::new(mock);
     let report = radio
-        .set_my1_callsign_session_until_exit(&mut update, || false, |_| Ok(()))
+        .set_text_field_session_until_exit(&mut update, || false, |_| Ok(()))
         .await;
     assert_failed(&report, Stage::ImmediateReadback);
     assert!(
         matches!(
             report.outcome,
             Outcome::Failed {
-                error: SessionError::Evidence(My1CallsignUpdateError::PageMismatch),
+                error: SessionError::Evidence(TextFieldUpdateError::PageMismatch),
                 ..
             }
         ),
@@ -1031,7 +1034,7 @@ async fn uncertain_entry_or_guard_reads_prohibit_intent_exit_and_handle_reuse() 
         radio.set_timeout(Duration::from_millis(1));
         let called = Cell::new(false);
         let report = radio
-            .set_my1_callsign_session_until_exit(
+            .set_text_field_session_until_exit(
                 &mut update,
                 || false,
                 |_| {
@@ -1091,7 +1094,7 @@ async fn readback_and_exit_uncertainty_preserve_distinct_completed_evidence() ->
         let mut radio = Radio::new(mock);
         radio.set_timeout(Duration::from_millis(1));
         let report = radio
-            .set_my1_callsign_session_until_exit(&mut update, || false, |_| Ok(()))
+            .set_text_field_session_until_exit(&mut update, || false, |_| Ok(()))
             .await;
         assert_failed(
             &report,
@@ -1161,7 +1164,7 @@ async fn separate_session_final_byte_drift_never_rewrites_despite_late_cancellat
         let mut radio = Radio::new(mock);
         let called = Cell::new(false);
         let report = radio
-            .set_my1_callsign_session_until_exit(
+            .set_text_field_session_until_exit(
                 &mut update,
                 || true,
                 |_| {
@@ -1212,7 +1215,7 @@ async fn halted_or_unfinalized_updates_refuse_even_a_fresh_transport() -> TestRe
         if unfinalized {
             let mut first = Radio::new(session_script(&update)?);
             let report = first
-                .set_my1_callsign_session_until_exit(&mut update, || false, |_| Ok(()))
+                .set_text_field_session_until_exit(&mut update, || false, |_| Ok(()))
                 .await;
             assert_success(&report, &update);
             first.into_transport().assert_complete();
@@ -1222,7 +1225,7 @@ async fn halted_or_unfinalized_updates_refuse_even_a_fresh_transport() -> TestRe
         let mut radio = Radio::new(MockTransport::new());
         let called = Cell::new(false);
         let report = radio
-            .set_my1_callsign_session_until_exit(
+            .set_text_field_session_until_exit(
                 &mut update,
                 || false,
                 |_| {
@@ -1270,13 +1273,13 @@ async fn a_finalized_apply_still_cannot_reuse_its_retired_handle_for_verificatio
     let mut update = fixture()?;
     let mut radio = Radio::new(session_script(&update)?);
     let first = radio
-        .set_my1_callsign_session_until_exit(&mut update, || false, |_| Ok(()))
+        .set_text_field_session_until_exit(&mut update, || false, |_| Ok(()))
         .await;
     assert_success(&first, &update);
     finalize(&mut update, &first)?;
     let called = Cell::new(false);
     let report = radio
-        .set_my1_callsign_session_until_exit(
+        .set_text_field_session_until_exit(
             &mut update,
             || true,
             |_| {
@@ -1350,7 +1353,7 @@ async fn dropped_entry_write_or_exit_cannot_reuse_the_protocol_handle() -> TestR
             }
         }
         let mut radio = Radio::new(mock);
-        drop_pending(radio.set_my1_callsign_session_until_exit(&mut update, || false, |_| Ok(())))
+        drop_pending(radio.set_text_field_session_until_exit(&mut update, || false, |_| Ok(())))
             .await;
         assert_eq!(
             update.status(),

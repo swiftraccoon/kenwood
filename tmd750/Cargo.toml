@@ -27,6 +27,8 @@ tracing = "0.1"
 [dev-dependencies]
 # Typed access to the committed manifest for the registry agreement test.
 mcp-d75-extract = { path = "../mcp-d75-extract" }
+# Property-based round trips of the value types, CAT echoes and codecs.
+proptest = "1"
 
 [lints]
 workspace = true

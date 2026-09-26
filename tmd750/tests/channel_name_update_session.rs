@@ -7,6 +7,7 @@
 use kenwood_schema as _;
 use mcp_d75_extract as _;
 use mmdvm as _;
+use proptest as _;
 use thiserror as _;
 use tokio_serial as _;
 use tracing as _;
@@ -17,16 +18,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use kenwood_tmd750::memory::{
-    ChannelNameText, ChannelNameUpdate, ChannelNameUpdateError, ChannelNameUpdateEvent,
-    ChannelNameUpdateSession, ChannelNameUpdateStatus,
+    ChannelNameText, ChannelNameUpdate, TextFieldUpdateError, TextFieldUpdateEvent,
+    TextFieldUpdateSession, TextFieldUpdateStatus,
 };
 use kenwood_tmd750::protocol::mcp::{ACK, read_request, write_request};
 use kenwood_tmd750::types::PhysicalChannel;
 use kenwood_tmd750::{
-    Address, ChannelNameUpdateSessionError, ChannelNameUpdateSessionOutcome,
-    ChannelNameUpdateSessionReport, ChannelNameUpdateSessionStage,
-    ChannelNameUpdateWriteDisposition, Error, FirmwareIdentity, Identity, McpError, McpProbeExit,
-    Page, Radio, RadioModel, RadioType,
+    Address, Error, FirmwareIdentity, Identity, McpError, McpProbeExit, Page, Radio, RadioModel,
+    RadioType, TextFieldUpdateSessionError, TextFieldUpdateSessionOutcome,
+    TextFieldUpdateSessionReport, TextFieldUpdateSessionStage, TextFieldUpdateWriteDisposition,
 };
 use kenwood_transport::{MockTransport, Transport, TransportError};
 
@@ -96,12 +96,12 @@ fn preflight(mock: &mut MockTransport, update: &ChannelNameUpdate, before: &[u8]
 fn session_script(update: &ChannelNameUpdate) -> Result<MockTransport, Box<dyn std::error::Error>> {
     let mut mock = MockTransport::new();
     match update.next_session()? {
-        ChannelNameUpdateSession::Apply => {
+        TextFieldUpdateSession::Apply => {
             preflight(&mut mock, update, update.original_page())?;
             mock.expect(&frame(update.page(), update.desired_page()), &[ACK]);
             read(&mut mock, update.page(), update.desired_page());
         }
-        ChannelNameUpdateSession::Verify => {
+        TextFieldUpdateSession::Verify => {
             preflight(&mut mock, update, update.desired_page())?;
         }
     }
@@ -201,11 +201,11 @@ async fn assert_blocked<T: Transport>(radio: &mut Radio<T>) {
     );
 }
 
-fn assert_session_success(report: &ChannelNameUpdateSessionReport, update: &ChannelNameUpdate) {
+fn assert_session_success(report: &TextFieldUpdateSessionReport, update: &ChannelNameUpdate) {
     assert!(
         matches!(
             report.outcome,
-            ChannelNameUpdateSessionOutcome::AwaitingCatVerification
+            TextFieldUpdateSessionOutcome::AwaitingCatVerification
         ),
         "only external CAT and lifecycle proof may remain"
     );
@@ -230,8 +230,12 @@ fn assert_session_success(report: &ChannelNameUpdateSessionReport, update: &Chan
     );
     assert_eq!(
         report.status,
-        ChannelNameUpdateStatus::PossiblyChanged,
+        TextFieldUpdateStatus::PossiblyChanged,
         "external finalization is still required"
+    );
+    assert!(
+        report.gateway_mode.is_none(),
+        "the channel name field reads no Gateway state"
     );
 }
 
@@ -241,18 +245,18 @@ async fn exact_two_session_scope_writes_the_name_page_once_and_requires_external
     let mut update = fixture()?;
     assert_eq!(update.page().address().as_u32(), NAME_PAGE_ADDRESS);
     for phase in [
-        ChannelNameUpdateSession::Apply,
-        ChannelNameUpdateSession::Verify,
+        TextFieldUpdateSession::Apply,
+        TextFieldUpdateSession::Verify,
     ] {
         let intents = Arc::new(AtomicUsize::new(0));
         let mut radio = Radio::new(AuditedTransport::new(session_script(&update)?, &intents));
         let report = radio
-            .set_channel_name_session_until_exit(
+            .set_text_field_session_until_exit(
                 &mut update,
                 || false,
                 |state| {
-                    assert_eq!(phase, ChannelNameUpdateSession::Apply);
-                    assert_eq!(state.status(), ChannelNameUpdateStatus::NotWritten);
+                    assert_eq!(phase, TextFieldUpdateSession::Apply);
+                    assert_eq!(state.status(), TextFieldUpdateStatus::NotWritten);
                     let _previous = intents.fetch_add(1, Ordering::SeqCst);
                     Ok(())
                 },
@@ -260,7 +264,7 @@ async fn exact_two_session_scope_writes_the_name_page_once_and_requires_external
             .await;
         assert_session_success(&report, &update);
         assert_eq!(report.session, Some(phase));
-        let apply = phase == ChannelNameUpdateSession::Apply;
+        let apply = phase == TextFieldUpdateSession::Apply;
         assert_eq!(report.segments.len(), if apply { 3 } else { 2 });
         assert_eq!(
             report.segments.first().map(|segment| segment.page),
@@ -273,9 +277,9 @@ async fn exact_two_session_scope_writes_the_name_page_once_and_requires_external
         assert_eq!(
             report.write,
             if apply {
-                ChannelNameUpdateWriteDisposition::Acknowledged
+                TextFieldUpdateWriteDisposition::Acknowledged
             } else {
-                ChannelNameUpdateWriteDisposition::NotAttempted
+                TextFieldUpdateWriteDisposition::NotAttempted
             }
         );
         assert_blocked(&mut radio).await;
@@ -289,13 +293,14 @@ async fn exact_two_session_scope_writes_the_name_page_once_and_requires_external
             "the sole W frame must address the channel's name page"
         );
         transport.mock.assert_complete();
-        update.record(ChannelNameUpdateEvent::SessionFinalized {
+        update.record(TextFieldUpdateEvent::SessionFinalized {
             id: report.session_id().ok_or("missing session ID")?,
+            guards: (),
         })?;
     }
     assert_eq!(
         update.status(),
-        ChannelNameUpdateStatus::VerifiedAcrossSessions
+        TextFieldUpdateStatus::VerifiedAcrossSessions
     );
     Ok(())
 }
@@ -309,7 +314,7 @@ async fn firmware_or_type_mismatch_prevents_entry_and_durable_intent() -> TestRe
         let mut radio = Radio::new(mock);
         let intents = Cell::new(0);
         let report = radio
-            .set_channel_name_session_until_exit(
+            .set_text_field_session_until_exit(
                 &mut update,
                 || false,
                 |_state| {
@@ -321,10 +326,10 @@ async fn firmware_or_type_mismatch_prevents_entry_and_durable_intent() -> TestRe
         assert!(
             matches!(
                 report.outcome,
-                ChannelNameUpdateSessionOutcome::Failed {
-                    stage: ChannelNameUpdateSessionStage::Identity,
-                    error: ChannelNameUpdateSessionError::Evidence(
-                        ChannelNameUpdateError::IdentityMismatch
+                TextFieldUpdateSessionOutcome::Failed {
+                    stage: TextFieldUpdateSessionStage::Identity,
+                    error: TextFieldUpdateSessionError::Evidence(
+                        TextFieldUpdateError::IdentityMismatch
                     ),
                 }
             ),
@@ -333,11 +338,8 @@ async fn firmware_or_type_mismatch_prevents_entry_and_durable_intent() -> TestRe
         );
         assert!(report.entry_reply.is_none(), "MCP must not be entered");
         assert_eq!(report.exit, McpProbeExit::NotEntered);
-        assert_eq!(
-            report.write,
-            ChannelNameUpdateWriteDisposition::NotAttempted
-        );
-        assert_eq!(report.status, ChannelNameUpdateStatus::NotWritten);
+        assert_eq!(report.write, TextFieldUpdateWriteDisposition::NotAttempted);
+        assert_eq!(report.status, TextFieldUpdateStatus::NotWritten);
         assert_eq!(intents.get(), 0, "no intent may be recorded");
         assert!(update.next_session().is_err(), "the update must halt");
         radio.into_transport().assert_complete();
@@ -356,7 +358,7 @@ async fn whole_page_drift_refuses_w_without_merging_and_still_exits() -> TestRes
     let mut radio = Radio::new(mock);
     let intents = Cell::new(0);
     let report = radio
-        .set_channel_name_session_until_exit(
+        .set_text_field_session_until_exit(
             &mut update,
             || false,
             |_state| {
@@ -368,22 +370,17 @@ async fn whole_page_drift_refuses_w_without_merging_and_still_exits() -> TestRes
     assert!(
         matches!(
             report.outcome,
-            ChannelNameUpdateSessionOutcome::Failed {
-                stage: ChannelNameUpdateSessionStage::FreshComparison,
-                error: ChannelNameUpdateSessionError::Evidence(
-                    ChannelNameUpdateError::PageMismatch
-                ),
+            TextFieldUpdateSessionOutcome::Failed {
+                stage: TextFieldUpdateSessionStage::FreshComparison,
+                error: TextFieldUpdateSessionError::Evidence(TextFieldUpdateError::PageMismatch),
             }
         ),
         "{:?}",
         report.outcome
     );
-    assert_eq!(
-        report.write,
-        ChannelNameUpdateWriteDisposition::NotAttempted
-    );
+    assert_eq!(report.write, TextFieldUpdateWriteDisposition::NotAttempted);
     assert_eq!(report.exit, McpProbeExit::Acknowledged);
-    assert_eq!(report.status, ChannelNameUpdateStatus::NotWritten);
+    assert_eq!(report.status, TextFieldUpdateStatus::NotWritten);
     assert_eq!(intents.get(), 0, "no intent may be recorded");
     assert_eq!(report.segments.len(), 2);
     radio.into_transport().assert_complete();
@@ -398,7 +395,7 @@ async fn failed_durable_intent_prevents_w_and_exits() -> TestResult {
     mock.expect(b"E", &[ACK]);
     let mut radio = Radio::new(mock);
     let report = radio
-        .set_channel_name_session_until_exit(
+        .set_text_field_session_until_exit(
             &mut update,
             || false,
             |_state| Err(io::Error::other("journal disk full")),
@@ -407,21 +404,18 @@ async fn failed_durable_intent_prevents_w_and_exits() -> TestResult {
     assert!(
         matches!(
             report.outcome,
-            ChannelNameUpdateSessionOutcome::Failed {
-                stage: ChannelNameUpdateSessionStage::DurableIntent,
-                error: ChannelNameUpdateSessionError::DurableIntent(_),
+            TextFieldUpdateSessionOutcome::Failed {
+                stage: TextFieldUpdateSessionStage::DurableIntent,
+                error: TextFieldUpdateSessionError::DurableIntent(_),
             }
         ),
         "{:?}",
         report.outcome
     );
-    assert_eq!(
-        report.write,
-        ChannelNameUpdateWriteDisposition::NotAttempted
-    );
+    assert_eq!(report.write, TextFieldUpdateWriteDisposition::NotAttempted);
     assert_eq!(
         report.status,
-        ChannelNameUpdateStatus::NotWritten,
+        TextFieldUpdateStatus::NotWritten,
         "an unrecorded intent leaves no write risk"
     );
     assert_eq!(report.exit, McpProbeExit::Acknowledged);
@@ -439,7 +433,7 @@ async fn missing_write_ack_sends_no_readback_exit_retry_or_rollback() -> TestRes
     let intents = Arc::new(AtomicUsize::new(0));
     let mut radio = Radio::new(AuditedTransport::new(mock, &intents));
     let report = radio
-        .set_channel_name_session_until_exit(
+        .set_text_field_session_until_exit(
             &mut update,
             || false,
             |_state| {
@@ -451,9 +445,9 @@ async fn missing_write_ack_sends_no_readback_exit_retry_or_rollback() -> TestRes
     assert!(
         matches!(
             report.outcome,
-            ChannelNameUpdateSessionOutcome::Failed {
-                stage: ChannelNameUpdateSessionStage::Write,
-                error: ChannelNameUpdateSessionError::Io(_),
+            TextFieldUpdateSessionOutcome::Failed {
+                stage: TextFieldUpdateSessionStage::Write,
+                error: TextFieldUpdateSessionError::Io(_),
             }
         ),
         "{:?}",
@@ -461,11 +455,11 @@ async fn missing_write_ack_sends_no_readback_exit_retry_or_rollback() -> TestRes
     );
     assert_eq!(
         report.write,
-        ChannelNameUpdateWriteDisposition::PossiblyDispatched
+        TextFieldUpdateWriteDisposition::PossiblyDispatched
     );
     assert_eq!(
         report.status,
-        ChannelNameUpdateStatus::PossiblyChanged,
+        TextFieldUpdateStatus::PossiblyChanged,
         "a dispatched frame keeps the write risk"
     );
     assert_eq!(
@@ -492,15 +486,15 @@ async fn pre_write_cancellation_prevents_intent_at_the_first_and_last_boundary()
     let mut update = fixture()?;
     let mut radio = Radio::new(MockTransport::new());
     let report = radio
-        .set_channel_name_session_until_exit(&mut update, || true, |_state| Ok(()))
+        .set_text_field_session_until_exit(&mut update, || true, |_state| Ok(()))
         .await;
     assert!(
-        matches!(report.outcome, ChannelNameUpdateSessionOutcome::Cancelled),
+        matches!(report.outcome, TextFieldUpdateSessionOutcome::Cancelled),
         "{:?}",
         report.outcome
     );
     assert!(report.identity.is_none(), "no identity exchange");
-    assert_eq!(report.status, ChannelNameUpdateStatus::NotWritten);
+    assert_eq!(report.status, TextFieldUpdateStatus::NotWritten);
     radio.into_transport().assert_complete();
 
     // After the fresh comparison, the last boundary before intent: the
@@ -513,7 +507,7 @@ async fn pre_write_cancellation_prevents_intent_at_the_first_and_last_boundary()
     let checks = Cell::new(0);
     let intents = Cell::new(0);
     let report = radio
-        .set_channel_name_session_until_exit(
+        .set_text_field_session_until_exit(
             &mut update,
             || {
                 checks.set(checks.get() + 1);
@@ -526,17 +520,14 @@ async fn pre_write_cancellation_prevents_intent_at_the_first_and_last_boundary()
         )
         .await;
     assert!(
-        matches!(report.outcome, ChannelNameUpdateSessionOutcome::Cancelled),
+        matches!(report.outcome, TextFieldUpdateSessionOutcome::Cancelled),
         "{:?}",
         report.outcome
     );
     assert_eq!(intents.get(), 0, "no intent may be recorded");
-    assert_eq!(
-        report.write,
-        ChannelNameUpdateWriteDisposition::NotAttempted
-    );
+    assert_eq!(report.write, TextFieldUpdateWriteDisposition::NotAttempted);
     assert_eq!(report.exit, McpProbeExit::Acknowledged);
-    assert_eq!(report.status, ChannelNameUpdateStatus::NotWritten);
+    assert_eq!(report.status, TextFieldUpdateStatus::NotWritten);
     assert!(update.next_session().is_err(), "a cancelled update halts");
     radio.into_transport().assert_complete();
     Ok(())
@@ -548,16 +539,14 @@ async fn halted_update_is_rejected_before_any_radio_traffic() -> TestResult {
     update.halt();
     let mut radio = Radio::new(MockTransport::new());
     let report = radio
-        .set_channel_name_session_until_exit(&mut update, || false, |_state| Ok(()))
+        .set_text_field_session_until_exit(&mut update, || false, |_state| Ok(()))
         .await;
     assert!(
         matches!(
             report.outcome,
-            ChannelNameUpdateSessionOutcome::Failed {
-                stage: ChannelNameUpdateSessionStage::Preparation,
-                error: ChannelNameUpdateSessionError::Evidence(
-                    ChannelNameUpdateError::TerminalState
-                ),
+            TextFieldUpdateSessionOutcome::Failed {
+                stage: TextFieldUpdateSessionStage::Preparation,
+                error: TextFieldUpdateSessionError::Evidence(TextFieldUpdateError::TerminalState),
             }
         ),
         "{:?}",

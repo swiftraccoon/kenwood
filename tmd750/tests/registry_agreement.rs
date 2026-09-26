@@ -5,6 +5,7 @@
 use kenwood_schema as _;
 use kenwood_transport as _;
 use mmdvm as _;
+use proptest as _;
 use thiserror as _;
 use tokio as _;
 use tokio_serial as _;

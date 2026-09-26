@@ -6,6 +6,7 @@
 use kenwood_schema as _;
 use mcp_d75_extract as _;
 use mmdvm as _;
+use proptest as _;
 use thiserror as _;
 use tokio_serial as _;
 use tracing as _;
@@ -20,14 +21,14 @@ use std::task::Poll;
 use std::time::Duration;
 
 use kenwood_tmd750::memory::{
-    Pm1Name, Pm1NameUpdate, Pm1NameUpdateError, Pm1NameUpdateEvent, Pm1NameUpdateSession,
-    Pm1NameUpdateStatus,
+    Pm1Name, Pm1NameUpdate, TextFieldUpdateError, TextFieldUpdateEvent, TextFieldUpdateSession,
+    TextFieldUpdateStatus,
 };
 use kenwood_tmd750::protocol::mcp::{ACK, read_request, write_request};
 use kenwood_tmd750::{
-    Address, Error, FirmwareIdentity, Identity, McpError, McpProbeExit, Page,
-    Pm1NameUpdateSessionError, Pm1NameUpdateSessionOutcome, Pm1NameUpdateSessionReport,
-    Pm1NameUpdateSessionStage, Pm1NameUpdateWriteDisposition, Radio, RadioModel, RadioType,
+    Address, Error, FirmwareIdentity, Identity, McpError, McpProbeExit, Page, Radio, RadioModel,
+    RadioType, TextFieldUpdateSessionError, TextFieldUpdateSessionOutcome,
+    TextFieldUpdateSessionReport, TextFieldUpdateSessionStage, TextFieldUpdateWriteDisposition,
 };
 use kenwood_transport::{MockTransport, Transport, TransportError};
 
@@ -89,12 +90,12 @@ fn preflight(mock: &mut MockTransport, update: &Pm1NameUpdate, before: &[u8]) ->
 fn session_script(update: &Pm1NameUpdate) -> Result<MockTransport, Box<dyn std::error::Error>> {
     let mut mock = MockTransport::new();
     match update.next_session()? {
-        Pm1NameUpdateSession::Apply => {
+        TextFieldUpdateSession::Apply => {
             preflight(&mut mock, update, update.original_page())?;
             mock.expect(&frame(update.page(), update.desired_page()), &[ACK]);
             read(&mut mock, update.page(), update.desired_page());
         }
-        Pm1NameUpdateSession::Verify => {
+        TextFieldUpdateSession::Verify => {
             preflight(&mut mock, update, update.desired_page())?;
         }
     }
@@ -204,11 +205,11 @@ async fn assert_blocked<T: Transport>(radio: &mut Radio<T>) {
     );
 }
 
-fn assert_session_success(report: &Pm1NameUpdateSessionReport, update: &Pm1NameUpdate) {
+fn assert_session_success(report: &TextFieldUpdateSessionReport, update: &Pm1NameUpdate) {
     assert!(
         matches!(
             report.outcome,
-            Pm1NameUpdateSessionOutcome::AwaitingCatVerification
+            TextFieldUpdateSessionOutcome::AwaitingCatVerification
         ),
         "only external CAT and lifecycle proof may remain"
     );
@@ -233,24 +234,31 @@ fn assert_session_success(report: &Pm1NameUpdateSessionReport, update: &Pm1NameU
     );
     assert_eq!(
         report.status,
-        Pm1NameUpdateStatus::PossiblyChanged,
+        TextFieldUpdateStatus::PossiblyChanged,
         "external finalization is still required"
+    );
+    assert!(
+        report.gateway_mode.is_none(),
+        "the PM1 field reads no Gateway state"
     );
 }
 
 #[tokio::test]
 async fn exact_two_session_scope_writes_once_and_requires_external_finalization() -> TestResult {
     let mut update = fixture()?;
-    for phase in [Pm1NameUpdateSession::Apply, Pm1NameUpdateSession::Verify] {
+    for phase in [
+        TextFieldUpdateSession::Apply,
+        TextFieldUpdateSession::Verify,
+    ] {
         let intents = Arc::new(AtomicUsize::new(0));
         let mut radio = Radio::new(AuditedTransport::new(session_script(&update)?, &intents));
         let report = radio
-            .set_pm1_name_session_until_exit(
+            .set_text_field_session_until_exit(
                 &mut update,
                 || false,
                 |state| {
-                    assert_eq!(phase, Pm1NameUpdateSession::Apply);
-                    assert_eq!(state.status(), Pm1NameUpdateStatus::NotWritten);
+                    assert_eq!(phase, TextFieldUpdateSession::Apply);
+                    assert_eq!(state.status(), TextFieldUpdateStatus::NotWritten);
                     let _previous = intents.fetch_add(1, Ordering::SeqCst);
                     Ok(())
                 },
@@ -258,7 +266,7 @@ async fn exact_two_session_scope_writes_once_and_requires_external_finalization(
             .await;
         assert_session_success(&report, &update);
         assert_eq!(report.session, Some(phase));
-        let apply = phase == Pm1NameUpdateSession::Apply;
+        let apply = phase == TextFieldUpdateSession::Apply;
         assert_eq!(report.segments.len(), if apply { 3 } else { 2 });
         assert_eq!(
             report.segments.first().map(|segment| segment.page),
@@ -271,9 +279,9 @@ async fn exact_two_session_scope_writes_once_and_requires_external_finalization(
         assert_eq!(
             report.write,
             if apply {
-                Pm1NameUpdateWriteDisposition::Acknowledged
+                TextFieldUpdateWriteDisposition::Acknowledged
             } else {
-                Pm1NameUpdateWriteDisposition::NotAttempted
+                TextFieldUpdateWriteDisposition::NotAttempted
             }
         );
         assert_blocked(&mut radio).await;
@@ -282,11 +290,15 @@ async fn exact_two_session_scope_writes_once_and_requires_external_finalization(
         assert_eq!(transport.baud_changes, [9600]);
         assert_eq!(transport.memory_writes, usize::from(apply));
         transport.mock.assert_complete();
-        update.record(Pm1NameUpdateEvent::SessionFinalized {
+        update.record(TextFieldUpdateEvent::SessionFinalized {
             id: report.session_id().ok_or("missing session ID")?,
+            guards: (),
         })?;
     }
-    assert_eq!(update.status(), Pm1NameUpdateStatus::VerifiedAcrossSessions);
+    assert_eq!(
+        update.status(),
+        TextFieldUpdateStatus::VerifiedAcrossSessions
+    );
     Ok(())
 }
 
@@ -299,7 +311,7 @@ async fn firmware_or_type_mismatch_prevents_entry_and_durable_intent() -> TestRe
         let mut radio = Radio::new(mock);
         let mut called = false;
         let report = radio
-            .set_pm1_name_session_until_exit(
+            .set_text_field_session_until_exit(
                 &mut update,
                 || false,
                 |_| {
@@ -311,17 +323,17 @@ async fn firmware_or_type_mismatch_prevents_entry_and_durable_intent() -> TestRe
         assert!(
             matches!(
                 report.outcome,
-                Pm1NameUpdateSessionOutcome::Failed {
-                    stage: Pm1NameUpdateSessionStage::Identity,
-                    error: Pm1NameUpdateSessionError::Evidence(
-                        Pm1NameUpdateError::IdentityMismatch
+                TextFieldUpdateSessionOutcome::Failed {
+                    stage: TextFieldUpdateSessionStage::Identity,
+                    error: TextFieldUpdateSessionError::Evidence(
+                        TextFieldUpdateError::IdentityMismatch
                     ),
                 }
             ),
             "identity mismatch must stop at identity: {report:?}"
         );
         assert_eq!(report.exit, McpProbeExit::NotEntered);
-        assert_eq!(report.status, Pm1NameUpdateStatus::NotWritten);
+        assert_eq!(report.status, TextFieldUpdateStatus::NotWritten);
         assert!(!called, "identity mismatch must prevent intent");
         assert!(
             report.identity.is_some(),
@@ -353,7 +365,7 @@ async fn whole_page_drift_or_unsupported_format_refuses_w_without_merging() -> T
         let mut radio = Radio::new(mock);
         let mut called = false;
         let report = radio
-            .set_pm1_name_session_until_exit(
+            .set_text_field_session_until_exit(
                 &mut update,
                 || false,
                 |_| {
@@ -365,16 +377,16 @@ async fn whole_page_drift_or_unsupported_format_refuses_w_without_merging() -> T
         assert!(
             matches!(
                 report.outcome,
-                Pm1NameUpdateSessionOutcome::Failed {
-                    stage: Pm1NameUpdateSessionStage::FreshComparison,
-                    error: Pm1NameUpdateSessionError::Evidence(_),
+                TextFieldUpdateSessionOutcome::Failed {
+                    stage: TextFieldUpdateSessionStage::FreshComparison,
+                    error: TextFieldUpdateSessionError::Evidence(_),
                 }
             ),
             "fresh evidence must reject drift before intent: {report:?}"
         );
         assert_eq!(report.exit, McpProbeExit::Acknowledged);
-        assert_eq!(report.write, Pm1NameUpdateWriteDisposition::NotAttempted);
-        assert_eq!(report.status, Pm1NameUpdateStatus::NotWritten);
+        assert_eq!(report.write, TextFieldUpdateWriteDisposition::NotAttempted);
+        assert_eq!(report.status, TextFieldUpdateStatus::NotWritten);
         assert_eq!(report.segments.len(), 2);
         assert!(!called, "page drift must prevent intent");
         assert_blocked(&mut radio).await;
@@ -392,7 +404,7 @@ async fn failed_durable_intent_prevents_w_and_retains_an_additional_exit_error()
         mock.expect(b"E", &[exit_ack]);
         let mut radio = Radio::new(mock);
         let report = radio
-            .set_pm1_name_session_until_exit(
+            .set_text_field_session_until_exit(
                 &mut update,
                 || false,
                 |_| Err(io::Error::other("durable synchronization failed")),
@@ -401,9 +413,9 @@ async fn failed_durable_intent_prevents_w_and_retains_an_additional_exit_error()
         assert!(
             matches!(
                 report.outcome,
-                Pm1NameUpdateSessionOutcome::Failed {
-                    stage: Pm1NameUpdateSessionStage::DurableIntent,
-                    error: Pm1NameUpdateSessionError::DurableIntent(_),
+                TextFieldUpdateSessionOutcome::Failed {
+                    stage: TextFieldUpdateSessionStage::DurableIntent,
+                    error: TextFieldUpdateSessionError::DurableIntent(_),
                 }
             ),
             "preserve the original durable-intent failure: {report:?}"
@@ -417,8 +429,8 @@ async fn failed_durable_intent_prevents_w_and_retains_an_additional_exit_error()
                 McpProbeExit::NotAcknowledged
             }
         );
-        assert_eq!(report.write, Pm1NameUpdateWriteDisposition::NotAttempted);
-        assert_eq!(report.status, Pm1NameUpdateStatus::NotWritten);
+        assert_eq!(report.write, TextFieldUpdateWriteDisposition::NotAttempted);
+        assert_eq!(report.status, TextFieldUpdateStatus::NotWritten);
         assert_blocked(&mut radio).await;
         radio.into_transport().assert_complete();
     }
@@ -449,7 +461,7 @@ async fn every_pre_write_cancellation_boundary_prevents_intent() -> TestResult {
         let mut checks = 0;
         let mut called = false;
         let report = radio
-            .set_pm1_name_session_until_exit(
+            .set_text_field_session_until_exit(
                 &mut update,
                 || {
                     let cancel = checks == boundary;
@@ -463,10 +475,10 @@ async fn every_pre_write_cancellation_boundary_prevents_intent() -> TestResult {
             )
             .await;
         assert!(
-            matches!(report.outcome, Pm1NameUpdateSessionOutcome::Cancelled),
+            matches!(report.outcome, TextFieldUpdateSessionOutcome::Cancelled),
             "boundary {boundary} must honor safe cancellation: {report:?}"
         );
-        assert_eq!(report.status, Pm1NameUpdateStatus::NotWritten);
+        assert_eq!(report.status, TextFieldUpdateStatus::NotWritten);
         assert_eq!(
             report.exit,
             if boundary > 1 {
@@ -492,7 +504,7 @@ async fn cancellation_after_intent_cannot_abandon_apply_or_verification() -> Tes
     for _ in 0..2 {
         let mut radio = Radio::new(session_script(&update)?);
         let report = radio
-            .set_pm1_name_session_until_exit(
+            .set_text_field_session_until_exit(
                 &mut update,
                 || cancel.get(),
                 |_| {
@@ -502,8 +514,9 @@ async fn cancellation_after_intent_cannot_abandon_apply_or_verification() -> Tes
             )
             .await;
         assert_session_success(&report, &update);
-        update.record(Pm1NameUpdateEvent::SessionFinalized {
+        update.record(TextFieldUpdateEvent::SessionFinalized {
             id: report.session_id().ok_or("missing session ID")?,
+            guards: (),
         })?;
         radio.into_transport().assert_complete();
     }
@@ -511,7 +524,10 @@ async fn cancellation_after_intent_cannot_abandon_apply_or_verification() -> Tes
         cancel.get(),
         "the intent callback must have requested cancellation"
     );
-    assert_eq!(update.status(), Pm1NameUpdateStatus::VerifiedAcrossSessions);
+    assert_eq!(
+        update.status(),
+        TextFieldUpdateStatus::VerifiedAcrossSessions
+    );
     Ok(())
 }
 
@@ -530,23 +546,23 @@ async fn missing_write_ack_sends_no_readback_exit_retry_or_rollback() -> TestRes
         let mut radio = Radio::new(mock);
         radio.set_timeout(Duration::from_millis(1));
         let report = radio
-            .set_pm1_name_session_until_exit(&mut update, || false, |_| Ok(()))
+            .set_text_field_session_until_exit(&mut update, || false, |_| Ok(()))
             .await;
         assert!(
             matches!(
                 report.outcome,
-                Pm1NameUpdateSessionOutcome::Failed {
-                    stage: Pm1NameUpdateSessionStage::Write,
+                TextFieldUpdateSessionOutcome::Failed {
+                    stage: TextFieldUpdateSessionStage::Write,
                     ..
                 }
             ),
             "missing ACK must fail the write exchange: {report:?}"
         );
         assert_eq!(report.exit, McpProbeExit::RecoveryRequired);
-        assert_eq!(report.status, Pm1NameUpdateStatus::PossiblyChanged);
+        assert_eq!(report.status, TextFieldUpdateStatus::PossiblyChanged);
         assert_eq!(
             report.write,
-            Pm1NameUpdateWriteDisposition::PossiblyDispatched
+            TextFieldUpdateWriteDisposition::PossiblyDispatched
         );
         assert_eq!(report.segments.len(), 2);
         assert!(
@@ -576,7 +592,7 @@ async fn failed_or_timed_out_dispatch_preserves_uncertainty_without_followup_tra
         let mut radio = Radio::new(transport);
         radio.set_timeout(Duration::from_millis(1));
         let report = radio
-            .set_pm1_name_session_until_exit(
+            .set_text_field_session_until_exit(
                 &mut update,
                 || false,
                 |_| {
@@ -588,18 +604,18 @@ async fn failed_or_timed_out_dispatch_preserves_uncertainty_without_followup_tra
         assert!(
             matches!(
                 report.outcome,
-                Pm1NameUpdateSessionOutcome::Failed {
-                    stage: Pm1NameUpdateSessionStage::Write,
-                    error: Pm1NameUpdateSessionError::Io(_),
+                TextFieldUpdateSessionOutcome::Failed {
+                    stage: TextFieldUpdateSessionStage::Write,
+                    error: TextFieldUpdateSessionError::Io(_),
                 }
             ),
             "dispatch failure must remain a write I/O error: {report:?}"
         );
         assert_eq!(
             report.write,
-            Pm1NameUpdateWriteDisposition::PossiblyDispatched
+            TextFieldUpdateWriteDisposition::PossiblyDispatched
         );
-        assert_eq!(report.status, Pm1NameUpdateStatus::PossiblyChanged);
+        assert_eq!(report.status, TextFieldUpdateStatus::PossiblyChanged);
         assert_eq!(report.exit, McpProbeExit::RecoveryRequired);
         assert_blocked(&mut radio).await;
         let transport = radio.into_transport();
@@ -617,7 +633,7 @@ async fn halted_update_is_rejected_before_any_radio_traffic() -> TestResult {
     let mut radio = Radio::new(MockTransport::new());
     let mut called = false;
     let report = radio
-        .set_pm1_name_session_until_exit(
+        .set_text_field_session_until_exit(
             &mut update,
             || false,
             |_| {
@@ -629,8 +645,8 @@ async fn halted_update_is_rejected_before_any_radio_traffic() -> TestResult {
     assert!(
         matches!(
             report.outcome,
-            Pm1NameUpdateSessionOutcome::Failed {
-                stage: Pm1NameUpdateSessionStage::Preparation,
+            TextFieldUpdateSessionOutcome::Failed {
+                stage: TextFieldUpdateSessionStage::Preparation,
                 ..
             }
         ),
@@ -638,7 +654,7 @@ async fn halted_update_is_rejected_before_any_radio_traffic() -> TestResult {
     );
     assert_eq!(report.session_id(), None);
     assert_eq!(report.exit, McpProbeExit::NotEntered);
-    assert_eq!(report.status, Pm1NameUpdateStatus::NotWritten);
+    assert_eq!(report.status, TextFieldUpdateStatus::NotWritten);
     assert!(!called, "halted updates must not journal an intent");
     let mock = radio.into_transport();
     assert!(
@@ -662,20 +678,20 @@ async fn complete_wrong_readback_exits_without_claiming_verification_or_rolling_
     mock.expect(b"E", &[ACK]);
     let mut radio = Radio::new(mock);
     let report = radio
-        .set_pm1_name_session_until_exit(&mut update, || false, |_| Ok(()))
+        .set_text_field_session_until_exit(&mut update, || false, |_| Ok(()))
         .await;
     assert!(
         matches!(
             report.outcome,
-            Pm1NameUpdateSessionOutcome::Failed {
-                stage: Pm1NameUpdateSessionStage::ImmediateReadback,
-                error: Pm1NameUpdateSessionError::Evidence(Pm1NameUpdateError::PageMismatch),
+            TextFieldUpdateSessionOutcome::Failed {
+                stage: TextFieldUpdateSessionStage::ImmediateReadback,
+                error: TextFieldUpdateSessionError::Evidence(TextFieldUpdateError::PageMismatch),
             }
         ),
         "wrong immediate bytes must remain a readback mismatch: {report:?}"
     );
     assert_eq!(report.exit, McpProbeExit::Acknowledged);
-    assert_eq!(report.status, Pm1NameUpdateStatus::PossiblyChanged);
+    assert_eq!(report.status, TextFieldUpdateStatus::PossiblyChanged);
     assert_eq!(
         report
             .segments
@@ -712,14 +728,14 @@ async fn incomplete_entry_or_preflight_sends_no_exit() -> TestResult {
         }
         let mut radio = Radio::new(mock);
         let report = radio
-            .set_pm1_name_session_until_exit(&mut update, || false, |_| Ok(()))
+            .set_text_field_session_until_exit(&mut update, || false, |_| Ok(()))
             .await;
         assert!(
-            matches!(report.outcome, Pm1NameUpdateSessionOutcome::Failed { .. }),
+            matches!(report.outcome, TextFieldUpdateSessionOutcome::Failed { .. }),
             "incomplete preflight must fail without speculative cleanup: {report:?}"
         );
         assert_eq!(report.exit, McpProbeExit::RecoveryRequired);
-        assert_eq!(report.status, Pm1NameUpdateStatus::NotWritten);
+        assert_eq!(report.status, TextFieldUpdateStatus::NotWritten);
         assert_eq!(report.segments.len(), usize::from(stage == 2));
         assert_blocked(&mut radio).await;
         radio.into_transport().assert_complete();
@@ -737,22 +753,22 @@ async fn partial_post_write_readback_preserves_possible_change_and_refuses_exit(
     let mut radio = Radio::new(mock);
     radio.set_timeout(Duration::from_millis(1));
     let report = radio
-        .set_pm1_name_session_until_exit(&mut update, || false, |_| Ok(()))
+        .set_text_field_session_until_exit(&mut update, || false, |_| Ok(()))
         .await;
     assert!(
         matches!(
             report.outcome,
-            Pm1NameUpdateSessionOutcome::Failed {
-                stage: Pm1NameUpdateSessionStage::ImmediateReadback,
+            TextFieldUpdateSessionOutcome::Failed {
+                stage: TextFieldUpdateSessionStage::ImmediateReadback,
                 ..
             }
         ),
         "partial readback must fail at the readback stage: {report:?}"
     );
     assert_eq!(report.exit, McpProbeExit::RecoveryRequired);
-    assert_eq!(report.status, Pm1NameUpdateStatus::PossiblyChanged);
+    assert_eq!(report.status, TextFieldUpdateStatus::PossiblyChanged);
     assert_eq!(report.segments.len(), 2);
-    assert_eq!(report.write, Pm1NameUpdateWriteDisposition::Acknowledged);
+    assert_eq!(report.write, TextFieldUpdateWriteDisposition::Acknowledged);
     assert_blocked(&mut radio).await;
     radio.into_transport().assert_complete();
     Ok(())
@@ -787,14 +803,14 @@ async fn dropped_entry_write_or_exit_prevents_protocol_reuse() -> TestResult {
             }
         }
         let mut radio = Radio::new(mock);
-        drop_pending(radio.set_pm1_name_session_until_exit(&mut update, || false, |_| Ok(())))
+        drop_pending(radio.set_text_field_session_until_exit(&mut update, || false, |_| Ok(())))
             .await;
         assert_eq!(
             update.status(),
             if phase == 0 {
-                Pm1NameUpdateStatus::NotWritten
+                TextFieldUpdateStatus::NotWritten
             } else {
-                Pm1NameUpdateStatus::PossiblyChanged
+                TextFieldUpdateStatus::PossiblyChanged
             }
         );
         assert_blocked(&mut radio).await;
@@ -808,11 +824,12 @@ async fn separate_session_drift_never_rewrites_or_attests_verification() -> Test
     let mut update = fixture()?;
     let mut first = Radio::new(session_script(&update)?);
     let report = first
-        .set_pm1_name_session_until_exit(&mut update, || false, |_| Ok(()))
+        .set_text_field_session_until_exit(&mut update, || false, |_| Ok(()))
         .await;
     assert_session_success(&report, &update);
-    update.record(Pm1NameUpdateEvent::SessionFinalized {
+    update.record(TextFieldUpdateEvent::SessionFinalized {
         id: report.session_id().ok_or("missing session ID")?,
+        guards: (),
     })?;
     first.into_transport().assert_complete();
     let mut mock = MockTransport::new();
@@ -823,7 +840,7 @@ async fn separate_session_drift_never_rewrites_or_attests_verification() -> Test
     let mut radio = Radio::new(mock);
     let mut called = false;
     let report = radio
-        .set_pm1_name_session_until_exit(
+        .set_text_field_session_until_exit(
             &mut update,
             || true,
             |_| {
@@ -835,16 +852,16 @@ async fn separate_session_drift_never_rewrites_or_attests_verification() -> Test
     assert!(
         matches!(
             report.outcome,
-            Pm1NameUpdateSessionOutcome::Failed {
-                stage: Pm1NameUpdateSessionStage::FreshComparison,
-                error: Pm1NameUpdateSessionError::Evidence(Pm1NameUpdateError::PageMismatch),
+            TextFieldUpdateSessionOutcome::Failed {
+                stage: TextFieldUpdateSessionStage::FreshComparison,
+                error: TextFieldUpdateSessionError::Evidence(TextFieldUpdateError::PageMismatch),
             }
         ),
         "fresh-session drift must remain a full-page mismatch: {report:?}"
     );
     assert!(!called, "verification cannot journal a second intent");
-    assert_eq!(report.write, Pm1NameUpdateWriteDisposition::NotAttempted);
-    assert_eq!(report.status, Pm1NameUpdateStatus::PossiblyChanged);
+    assert_eq!(report.write, TextFieldUpdateWriteDisposition::NotAttempted);
+    assert_eq!(report.status, TextFieldUpdateStatus::PossiblyChanged);
     assert_eq!(report.exit, McpProbeExit::Acknowledged);
     assert_blocked(&mut radio).await;
     radio.into_transport().assert_complete();

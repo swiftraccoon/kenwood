@@ -414,6 +414,11 @@ impl fmt::Display for BandDisplay {
 
 /// APRS position source selected and reported by `MS`: `0` for the GPS, `1`
 /// through `5` for the five stored positions (User Manual, Menu 401).
+///
+/// The programming image stores the same setting in `gps.MyPositionSelect`
+/// with a different encoding: `0` through `4` for positions 1 through 5 and
+/// `5` for the GPS (firmware 1.02, verified by writing the field over MCP and
+/// reading `MS` back).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MyPositionSelection(u8);
 
@@ -520,14 +525,15 @@ impl DstarCallsignEntry {
     ///
     /// # Errors
     ///
-    /// Returns [`ValidationError::InvalidCallsignText`] for an overlong field
-    /// or a byte outside graphic ASCII and space.
+    /// Returns [`ValidationError::InvalidCallsignText`] for an overlong field,
+    /// a byte outside graphic ASCII and space, or a comma, which the `DC`
+    /// field separator cannot carry.
     pub fn new(slot: DstarSlot, callsign: &str, memo: &str) -> Result<Self, ValidationError> {
         let valid = |text: &str, max: usize| {
             text.len() <= max
                 && text
                     .bytes()
-                    .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+                    .all(|byte| (byte.is_ascii_graphic() && byte != b',') || byte == b' ')
         };
         if !valid(callsign, Self::MAX_CALLSIGN_LEN) {
             return Err(ValidationError::InvalidCallsignText {

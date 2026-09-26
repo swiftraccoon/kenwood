@@ -21,37 +21,32 @@
 //!   [`crate::radio::terminal::TerminalPlan`]. Their session drivers separately
 //!   require identity, fresh complete-page comparisons, and caller-owned cleanup.
 //!
-//! [`Pm1NameUpdate`], [`My1CallsignUpdate`] and [`ChannelNameUpdate`] sequence
-//! a two-session compare-write-verify update for one field. [`PmNameTrial`],
+//! [`TextFieldUpdate`], prepared as [`Pm1NameUpdate`], [`My1CallsignUpdate`]
+//! or [`ChannelNameUpdate`], sequences a two-session compare-write-verify
+//! update for one text field under its sealed guard policy. [`PmNameTrial`],
 //! [`MyCallsignTrial`], and [`TerminalExitTrial`] are fixed-scope variants with
 //! no caller-selectable value. All of them check event order and page equality;
 //! the facts a caller reports (fresh connection, synchronized journal record,
 //! completed capture) are taken on trust. File containers live in
 //! [`crate::file`].
 
-mod channel_name_update;
 pub mod channels;
 mod configuration;
 pub(crate) mod fixed_text_trial;
 pub mod menu_fields;
 mod menu_patch;
 mod menu_policy;
-mod my1_callsign_update;
 mod my_callsign_trial;
-mod pm1_name_update;
 mod pm_name_trial;
 pub mod schema;
 mod terminal;
 mod terminal_exit_trial;
 mod text;
+mod text_field_update;
 
 use crate::error::{SchemaError, ValidationError};
 use crate::types::{FirmwareIdentity, IMAGE_LENGTH, RadioModel, SlotIndex};
 
-pub use channel_name_update::{
-    ChannelNameText, ChannelNameUpdate, ChannelNameUpdateError, ChannelNameUpdateEvent,
-    ChannelNameUpdateSession, ChannelNameUpdateStatus,
-};
 pub use channels::ChannelAccess;
 pub use configuration::{
     ChangedByte, ChangedPage, ConfigurationError, StandardConfiguration, StandardConfigurationDiff,
@@ -64,17 +59,9 @@ pub use menu_fields::{
 pub use menu_patch::MenuValueError;
 pub use menu_policy::{MenuWritePolicy, MenuWritePolicyError};
 pub use my_callsign_trial::MyCallsignTrial;
-pub use my1_callsign_update::{
-    My1Callsign, My1CallsignUpdate, My1CallsignUpdateError, My1CallsignUpdateEvent,
-    My1CallsignUpdateSession, My1CallsignUpdateStatus,
-};
 pub use pm_name_trial::{
     PmNameTrial, PmNameTrialError, PmNameTrialEvent, PmNameTrialSession, PmNameTrialStatus,
     PmNameTrialWrite,
-};
-pub use pm1_name_update::{
-    Pm1Name, Pm1NameUpdate, Pm1NameUpdateError, Pm1NameUpdateEvent, Pm1NameUpdateSession,
-    Pm1NameUpdateStatus,
 };
 pub use schema::{
     DecodedFieldValue, Endian, FieldCodec, FieldDescriptor, FieldValue, PatchPlanner, PatchSet,
@@ -92,6 +79,12 @@ pub use terminal_exit_trial::{
 pub use text::{
     TextError, TextImage, TextLayoutQualification, TextMetadata, TextPreview, TextScope,
     TextScopeKind, TextSetting,
+};
+pub use text_field_update::{
+    ChannelNameText, ChannelNameUpdate, ControlPage, GuardKind, GuardPolicy, My1Callsign,
+    My1CallsignUpdate, NoGuards, Pm1Name, Pm1NameUpdate, PmOffGatewayFinal, PmOffGatewayFresh,
+    PmOffGatewayGuards, TextField, TextFieldUpdate, TextFieldUpdateError, TextFieldUpdateEvent,
+    TextFieldUpdateSession, TextFieldUpdateStatus, TextValue,
 };
 
 /// Model whose layout the generated registry describes.
