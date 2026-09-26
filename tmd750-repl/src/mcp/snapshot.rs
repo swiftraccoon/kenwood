@@ -567,9 +567,15 @@ impl Snapshot {
     /// Metadata and the actual bounded read must both fit within 32 MiB, even
     /// if the file grows after its metadata was checked.
     pub(crate) fn load(path: &Path) -> AppResult<Self> {
-        validate_metadata(&path.metadata()?)?;
-        let file = File::open(path)?;
-        validate_metadata(&file.metadata()?)?;
+        let unreadable = |error: std::io::Error| {
+            CommandError(format!(
+                "backup report {} could not be read: {error}",
+                path.display()
+            ))
+        };
+        validate_metadata(&path.metadata().map_err(unreadable)?)?;
+        let file = File::open(path).map_err(unreadable)?;
+        validate_metadata(&file.metadata().map_err(unreadable)?)?;
         read_document(file)?.into_snapshot()
     }
 
@@ -577,16 +583,36 @@ impl Snapshot {
     ///
     /// Returns an error naming the address and RFCOMM channel for a native
     /// Bluetooth backup; load those through [`Self::load`] for offline
-    /// inspection. A backup is never current radio state, so the live page
-    /// guards still run before any write.
+    /// inspection or [`Self::load_for_native_write`] for a native Bluetooth
+    /// write. A backup is never current radio state, so the live page guards
+    /// still run before any write.
     pub(crate) fn load_for_usb_write(path: &Path) -> AppResult<Self> {
         let snapshot = Self::load(path)?;
         match &snapshot.provenance {
             Provenance::Usb => Ok(snapshot),
             Provenance::NativeBluetooth { address, channel } => invalid(&format!(
-                "native Bluetooth backup from {address}, RFCOMM channel {} is for offline inspection; this USB write workflow requires a USB backup",
+                "native Bluetooth backup from {address}, RFCOMM channel {} sources offline inspection and native Bluetooth writes; this USB write workflow requires a USB backup",
                 channel.get()
             )),
+        }
+    }
+
+    /// Load the source backup of a write over native Bluetooth, with the
+    /// address of the radio it was captured from.
+    ///
+    /// Only a native Bluetooth backup is accepted: its address names the
+    /// paired radio the write must reach, which a USB backup's identity tuple
+    /// cannot.
+    pub(crate) fn load_for_native_write(path: &Path) -> AppResult<(Self, BluetoothAddress)> {
+        let snapshot = Self::load(path)?;
+        match &snapshot.provenance {
+            Provenance::NativeBluetooth { address, .. } => {
+                let address = address.clone();
+                Ok((snapshot, address))
+            }
+            Provenance::Usb => invalid(
+                "a native Bluetooth write requires a native Bluetooth backup of the same radio; a USB backup does not name its Bluetooth address",
+            ),
         }
     }
 

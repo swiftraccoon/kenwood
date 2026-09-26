@@ -22,6 +22,7 @@ use kenwood_transport::{Transport, TransportError};
 use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
 
+use super::link::NativeVerification;
 use super::reconnect_policy::{ReconnectDecision, ReconnectRejection, classify};
 use super::{CLOSE_TIMEOUT, Failure, IdentityEvidence, close_transport};
 use crate::capture::{CaptureTransport, Recorder, TranscriptSummary};
@@ -174,6 +175,11 @@ pub(super) enum SkipReason {
     OriginalCloseFailed,
     /// Original capture was incomplete.
     OriginalCaptureIncomplete,
+    /// The link's check before programming entry failed on the original
+    /// connection, so programming was never entered.
+    OriginalAdmissionFailed,
+    /// The hold of the original connection after the exit failed to record.
+    PostExitHoldFailed,
     /// Cancellation was requested before verification began.
     Cancelled,
 }
@@ -235,6 +241,10 @@ impl std::fmt::Display for VerificationOutcome {
                 SkipReason::OriginalUpdateJournalIncomplete => "text update journal was incomplete",
                 SkipReason::OriginalCloseFailed => "original connection close failed",
                 SkipReason::OriginalCaptureIncomplete => "original capture was incomplete",
+                SkipReason::OriginalAdmissionFailed => {
+                    "original connection failed its check before programming entry"
+                }
+                SkipReason::PostExitHoldFailed => "post-exit hold failed to record",
                 SkipReason::Cancelled => "cancelled before verification",
             }),
             Self::Failed { stage, error } => {
@@ -399,9 +409,10 @@ impl PostExitVerification {
 }
 
 /// The post-exit CAT check of one session: a single open within the
-/// enumeration budget, or the bounded silent-`ID` retry that the
+/// enumeration budget, the bounded silent-`ID` retry that the
 /// operation-panel endpoint needs because it answers `ID` only once its
-/// tuple is ready.
+/// tuple is ready, or a fresh native Bluetooth connection on the pinned
+/// channel.
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 pub(super) enum PostExit {
@@ -409,6 +420,8 @@ pub(super) enum PostExit {
     Single(PostExitVerification),
     /// Up to six opens within the readiness budget.
     Readiness(ReadinessVerification),
+    /// One native reopen with the identity tuple and Gateway Off.
+    Native(Box<NativeVerification>),
 }
 
 impl PostExit {
@@ -419,14 +432,12 @@ impl PostExit {
 
     /// Replace the outcome with `Skipped { reason }`, keeping the variant.
     pub(super) fn skip(&mut self, reason: SkipReason) {
-        match self {
-            Self::Single(verification) => {
-                verification.outcome = VerificationOutcome::Skipped { reason };
-            }
-            Self::Readiness(verification) => {
-                verification.outcome = VerificationOutcome::Skipped { reason };
-            }
-        }
+        let outcome = match self {
+            Self::Single(verification) => &mut verification.outcome,
+            Self::Readiness(verification) => &mut verification.outcome,
+            Self::Native(verification) => &mut verification.outcome,
+        };
+        *outcome = VerificationOutcome::Skipped { reason };
     }
 
     /// True when the outcome is `Matched` and the transcript is complete.
@@ -434,6 +445,7 @@ impl PostExit {
         match self {
             Self::Single(verification) => verification.succeeded(),
             Self::Readiness(verification) => verification.succeeded(),
+            Self::Native(verification) => verification.succeeded(),
         }
     }
 
@@ -442,6 +454,7 @@ impl PostExit {
         match self {
             Self::Single(verification) => verification.gateway_off_evidence(),
             Self::Readiness(verification) => verification.gateway_off_evidence(),
+            Self::Native(verification) => verification.gateway_off_evidence(),
         }
     }
 
@@ -450,6 +463,7 @@ impl PostExit {
         match self {
             Self::Single(verification) => &verification.outcome,
             Self::Readiness(verification) => &verification.outcome,
+            Self::Native(verification) => &verification.outcome,
         }
     }
 
@@ -459,6 +473,7 @@ impl PostExit {
         match self {
             Self::Single(verification) => &verification.transcript,
             Self::Readiness(verification) => &verification.transcript,
+            Self::Native(verification) => &verification.transcript,
         }
     }
 }

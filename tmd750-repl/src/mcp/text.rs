@@ -50,6 +50,25 @@ impl TextRequest {
         }
         Ok(())
     }
+
+    /// Validate `set` and prepare it from its native Bluetooth backup before
+    /// any radio is selected.
+    pub(super) fn prepare_native(
+        &self,
+    ) -> AppResult<(
+        &super::text_set::SetRequest,
+        super::text_set::NativePrepared,
+    )> {
+        match &self.command {
+            TextCommand::Set(request) => {
+                request.validate_options()?;
+                Ok((request, request.prepare_native()?))
+            }
+            _ => Err(Box::new(CommandError(
+                "only mcp text set writes text over native Bluetooth".to_owned(),
+            ))),
+        }
+    }
 }
 
 /// Run a text subcommand that works from captured files alone.

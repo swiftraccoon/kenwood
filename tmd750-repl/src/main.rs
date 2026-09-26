@@ -315,8 +315,13 @@ async fn run_native(cli: &Cli, command: Option<Command>) -> AppResult<()> {
             mcp::McpCommand::Backup(request) => {
                 (Operation::ConfigurationBackup, request.output())
             }
+            mcp::McpCommand::Text(_) | mcp::McpCommand::Menu(_) => {
+                let write = request.prepare_native_write()?;
+                let endpoint = resolve_native(cli).await?;
+                return mcp::run_native_write(&endpoint, write).await;
+            }
             _ => return Err(Box::new(CommandError(
-                "native Bluetooth supports mcp probe and backup; live MCP settings writes and trials require USB"
+                "native Bluetooth supports mcp probe, backup, text set and menu apply; the fixed trials and the reentry probe require USB"
                     .to_owned(),
             ))),
         };

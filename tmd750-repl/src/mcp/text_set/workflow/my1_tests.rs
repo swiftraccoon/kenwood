@@ -13,15 +13,18 @@ use std::time::Duration;
 
 use kenwood_tmd750::memory::{My1Callsign, My1CallsignUpdate, TextFieldUpdateStatus};
 use kenwood_tmd750::protocol::mcp::{ACK, read_request, write_request};
-use kenwood_tmd750::transport::{KENWOOD_VID, TMD750_MAIN_PID, TMD750_PANEL_PID};
+use kenwood_tmd750::transport::{KENWOOD_VID, SerialCandidate, TMD750_MAIN_PID, TMD750_PANEL_PID};
 use kenwood_tmd750::{
-    Address, DvGatewayMode, FirmwareIdentity, Identity, Page, RadioModel, RadioType,
+    Address, DvGatewayMode, FirmwareIdentity, Identity, Page, Radio, RadioModel, RadioType,
 };
 use kenwood_transport::{MockTransport, Transport, TransportError};
 
 use super::*;
 use crate::capture::{Artifacts, CaptureKind, Event as CaptureEvent};
-use crate::mcp::reconnect::{PostExitVerification, VerificationOutcome, VerificationStage};
+use crate::mcp::link::{Admission, ReportEndpoint, UsbLink};
+use crate::mcp::reconnect::{
+    self, Backend, PostExitVerification, VerificationOutcome, VerificationStage,
+};
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;
 type TestResult = Result<(), TestError>;
@@ -641,9 +644,7 @@ impl Harness {
     async fn run(&mut self) -> Result<WorkflowResult, TestError> {
         let endpoint = self.backend.proof.endpoint.clone();
         Ok(run(
-            &mut self.backend,
-            &endpoint,
-            9600,
+            &mut UsbLink::new(&mut self.backend, &endpoint, 9600),
             &mut self.update,
             &mut self.journal,
             self.captures.take().ok_or("workflow already run")?,
@@ -1023,36 +1024,22 @@ async fn pre_intent_cancellation_opens_nothing_new_and_never_writes() -> TestRes
     Ok(())
 }
 
-#[test]
-fn synchronized_open_request_rechecks_cancellation_before_handle_acquisition() -> TestResult {
+#[tokio::test]
+async fn synchronized_open_request_rechecks_cancellation_before_handle_acquisition() -> TestResult {
     let mut harness = Harness::new()?;
-    let [
-        SessionCaptures {
-            mut original,
-            post_exit,
-        },
-        _unused,
-    ] = harness.captures.take().ok_or("captures missing")?;
-    let mut session = SessionEvidence {
-        core: None,
-        transcript: original.summary(),
-        open_error: None,
-        close_error: None,
-        synchronization_error: None,
-        post_exit: PostExit::skipped(SkipReason::OriginalOpenFailed, post_exit.summary()),
-    };
+    let [SessionCaptures { original, .. }, _unused] =
+        harness.captures.take().ok_or("captures missing")?;
     harness.cancelled.store(true, Ordering::Relaxed);
-    let acquired = open_original(
-        &mut harness.backend,
-        &endpoint(),
-        9600,
-        &mut original,
-        &mut session,
-        &harness.cancelled,
-    );
+    let endpoint = endpoint();
+    let opening = UsbLink::new(&mut harness.backend, &endpoint, 9600)
+        .open_session(original, false, &harness.cancelled)
+        .await;
+    let Opening::Refused { recorder, refusal } = opening else {
+        return Err("the final pre-open cancellation check must prevent acquisition".into());
+    };
     assert!(
-        acquired.is_none(),
-        "the final pre-open cancellation check must prevent acquisition"
+        matches!(refusal, Refusal::Cancelled),
+        "retain the exact reason acquisition was refused: {refusal:?}"
     );
     assert_eq!(
         harness.backend.opens, 0,
@@ -1074,17 +1061,8 @@ fn synchronized_open_request_rechecks_cancellation_before_handle_acquisition() -
         "retain the requested action without inventing acquisition"
     );
     assert!(
-        session.transcript.complete && session.synchronization_error.is_none(),
+        recorder.summary().complete,
         "clean synchronized request capture is distinct from cancellation"
-    );
-    assert!(
-        matches!(
-            session.post_exit.outcome(),
-            VerificationOutcome::Skipped {
-                reason: SkipReason::Cancelled
-            }
-        ),
-        "retain the exact reason acquisition was refused"
     );
     Ok(())
 }
@@ -1324,10 +1302,9 @@ async fn adapter_finalization_never_substitutes_gateway_or_identity_observations
     ] {
         let mut harness = Harness::new()?;
         let [captures, _unused] = harness.captures.take().ok_or("capture pairs missing")?;
+        let endpoint = endpoint();
         let session = run_session(
-            &mut harness.backend,
-            &endpoint(),
-            9600,
+            &mut UsbLink::new(&mut harness.backend, &endpoint, 9600),
             &mut harness.update,
             &mut harness.journal,
             captures,
@@ -1496,51 +1473,136 @@ async fn each_failed_capture_prevents_its_handle_from_opening() -> TestResult {
     Ok(())
 }
 
+/// A USB link whose opened connection records its completion in a read-only
+/// transcript, so the capture check after the open fails; it keeps the first
+/// synchronization failure it observed.
+struct ReadOnlyCompletionLink<'a> {
+    backend: &'a mut TestBackend,
+    endpoint: SerialCandidate,
+    transcript: PathBuf,
+    capture_failed: Arc<AtomicBool>,
+    first_error: Option<serde_json::Value>,
+}
+
+impl WriteLink for ReadOnlyCompletionLink<'_> {
+    type Connection = <TestBackend as Backend>::Connection;
+
+    async fn open_session(
+        &mut self,
+        mut recorder: Recorder<File>,
+        _later: bool,
+        _cancelled: &AtomicBool,
+    ) -> Opening<Self::Connection> {
+        recorder.record(CaptureEvent::OpenRequested {
+            path: &self.endpoint.path,
+            baud: 9600,
+        });
+        let opened = recorder.synchronize().and_then(|()| {
+            let connection = self
+                .backend
+                .open(&self.endpoint, 9600)
+                .map_err(io::Error::other)?;
+            Ok((connection, File::open(&self.transcript)?))
+        });
+        match opened {
+            Ok((connection, file)) => {
+                drop(recorder);
+                let mut completion = Recorder::named(
+                    file,
+                    Arc::clone(&self.capture_failed),
+                    "read-only-open-completion.jsonl",
+                );
+                completion.record(CaptureEvent::OpenCompleted);
+                self.first_error = completion
+                    .synchronize()
+                    .err()
+                    .map(|error| serde_json::to_value(Failure::from_error(&error)))
+                    .transpose()
+                    .ok()
+                    .flatten();
+                Opening::Opened(CaptureTransport::required(connection, completion))
+            }
+            Err(error) => Opening::Refused {
+                recorder,
+                refusal: Refusal::Open(Failure::from_error(&error)),
+            },
+        }
+    }
+
+    fn take_opening_history(&mut self) -> Option<History> {
+        None
+    }
+
+    fn radio(
+        &self,
+        transport: CaptureTransport<Self::Connection, File>,
+    ) -> Radio<CaptureTransport<Self::Connection, File>> {
+        Radio::new(transport)
+    }
+
+    async fn admit(
+        &mut self,
+        _radio: &mut Radio<CaptureTransport<Self::Connection, File>>,
+    ) -> Admission {
+        Admission::default()
+    }
+
+    async fn hold_after_exit(
+        &mut self,
+        _post_exit: &mut Recorder<File>,
+        _cancelled: &AtomicBool,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
+    async fn verify_post_exit(
+        &mut self,
+        _identity: &Identity,
+        _gateway_off: bool,
+        post_exit: Recorder<File>,
+        _cancelled: &AtomicBool,
+    ) -> PostExit {
+        PostExit::skipped(SkipReason::OriginalCaptureIncomplete, post_exit.summary())
+    }
+
+    fn skipped(&self, reason: SkipReason, transcript: TranscriptSummary) -> PostExit {
+        PostExit::skipped(reason, transcript)
+    }
+
+    fn report_endpoint(&self) -> ReportEndpoint {
+        ReportEndpoint::NativeBluetooth {
+            address: String::new(),
+            rfcomm_channel: None,
+        }
+    }
+
+    fn native(&self) -> bool {
+        false
+    }
+}
+
 #[tokio::test]
 async fn failed_post_open_capture_admission_only_closes_and_drops_the_handle() -> TestResult {
     let mut harness = Harness::new()?;
     harness.connection(0)?.mock = MockTransport::new();
-    let [
-        SessionCaptures {
-            mut original,
-            post_exit,
-        },
-        _unused,
-    ] = harness.captures.take().ok_or("captures missing")?;
-    let selected = endpoint();
-    original.record(CaptureEvent::OpenRequested {
-        path: &selected.path,
-        baud: 9600,
-    });
-    original.synchronize()?;
-    let connection = harness.backend.open(&selected, 9600)?;
-    drop(original);
-    let mut original = Recorder::named(
-        File::open(harness.backend.proof.transcript(0))?,
-        Arc::clone(&harness.capture_failed),
-        "read-only-open-completion.jsonl",
-    );
-    original.record(CaptureEvent::OpenCompleted);
-    let mut session = SessionEvidence {
-        core: None,
-        transcript: original.summary(),
-        open_error: None,
-        close_error: None,
-        synchronization_error: None,
-        post_exit: PostExit::skipped(SkipReason::OriginalCaptureIncomplete, post_exit.summary()),
+    let [captures, _unused] = harness.captures.take().ok_or("captures missing")?;
+    let mut link = ReadOnlyCompletionLink {
+        transcript: harness.backend.proof.transcript(0),
+        backend: &mut harness.backend,
+        endpoint: endpoint(),
+        capture_failed: Arc::clone(&harness.capture_failed),
+        first_error: None,
     };
-    session.synchronize_original(&mut original);
-    let first_error = serde_json::to_value(
-        session
-            .synchronization_error
-            .as_ref()
-            .ok_or("capture failure missing")?,
-    )?;
-    let admitted = session.admit_original(connection, original).await;
-    assert!(
-        admitted.is_none(),
-        "failed open-completion evidence cannot admit CAT"
-    );
+    let session = run_session(
+        &mut link,
+        &mut harness.update,
+        &mut harness.journal,
+        captures,
+        &harness.cancelled,
+        false,
+    )
+    .await;
+    let first_error = link.first_error.take().ok_or("capture failure missing")?;
     assert_eq!(
         harness.events()?,
         [Event::Open(0), Event::Close(0), Event::Dropped(0)],

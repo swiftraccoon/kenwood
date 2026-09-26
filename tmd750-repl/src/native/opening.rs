@@ -289,9 +289,26 @@ pub(crate) async fn open_selected<B: Backend>(
     backend: &mut B,
     endpoint: &Endpoint,
     service: BluetoothService,
-    mut recorder: Recorder<File>,
+    recorder: Recorder<File>,
     cancelled: &AtomicBool,
 ) -> Selection<B::Connection> {
+    let (history, opened) = open_recorded(backend, endpoint, service, recorder, cancelled).await;
+    Selection {
+        opened: opened.ok(),
+        history,
+    }
+}
+
+/// [`open_selected`], returning the recorder when no attempt opened a
+/// connection so the caller can finish that transcript; an opened connection
+/// carries it.
+pub(crate) async fn open_recorded<B: Backend>(
+    backend: &mut B,
+    endpoint: &Endpoint,
+    service: BluetoothService,
+    mut recorder: Recorder<File>,
+    cancelled: &AtomicBool,
+) -> (History, Result<Captured<B::Connection>, Recorder<File>>) {
     let mut history = History {
         attempts: Vec::new(),
         retry_error: None,
@@ -306,10 +323,7 @@ pub(crate) async fn open_selected<B: Backend>(
             Owner::Admitted(opened) => {
                 history.transcript = opened.transport.transcript_summary();
                 history.attempts.push(evidence);
-                return Selection {
-                    opened: Some(opened),
-                    history,
-                };
+                return (history, Ok(opened));
             }
             Owner::Retired(mut recovered) => {
                 if let Some(error) = &evidence.error {
@@ -345,8 +359,5 @@ pub(crate) async fn open_selected<B: Backend>(
         }
     }
     history.transcript = recorder.summary();
-    Selection {
-        opened: None,
-        history,
-    }
+    (history, Err(recorder))
 }

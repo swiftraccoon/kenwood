@@ -35,7 +35,7 @@ mod tests;
 /// Silent hold on the original connection after the MCP exit is acknowledged,
 /// before that connection is closed and the same endpoint is reopened for
 /// fresh CAT. Host policy, not a firmware timing bound.
-const POST_EXIT_SETTLE: Duration = Duration::from_secs(5);
+pub(crate) const POST_EXIT_SETTLE: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(tag = "kind", content = "scope", rename_all = "snake_case")]

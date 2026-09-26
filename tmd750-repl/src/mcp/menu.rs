@@ -15,6 +15,7 @@ use kenwood_tmd750::{
     MenuAssignment, MenuFieldSnapshot, MenuUpdatePlan, RadioModel, Region, ScopedMenuField,
     SlotIndex,
 };
+use kenwood_transport::bluetooth::BluetoothAddress;
 use serde::Serialize;
 
 use super::snapshot::Snapshot;
@@ -109,6 +110,24 @@ impl MenuRequest {
         }
         Ok(())
     }
+
+    /// Validate `apply` and plan it from its native Bluetooth backup before
+    /// any radio is selected, returning the backup's radio address.
+    pub(super) fn prepare_native(
+        &self,
+    ) -> AppResult<(&ApplyRequest, MenuUpdatePlan, BluetoothAddress)> {
+        match &self.command {
+            MenuCommand::Apply(request) => {
+                request.validate_options()?;
+                let (plan, address) = request.prepare_native()?;
+                Ok((request, plan, address))
+            }
+            _ => Err(CommandError(
+                "only mcp menu apply writes settings over native Bluetooth".to_owned(),
+            )
+            .into()),
+        }
+    }
 }
 
 impl ApplyRequest {
@@ -163,7 +182,21 @@ impl ApplyRequest {
     /// a field repeats, or the backup was not produced over USB.
     pub(super) fn prepare(&self) -> AppResult<MenuUpdatePlan> {
         let assignments = self.assignments()?;
-        let snapshot = Snapshot::load_for_usb_write(self.source_backup())?;
+        Self::plan(
+            &Snapshot::load_for_usb_write(self.source_backup())?,
+            assignments,
+        )
+    }
+
+    /// Plan the run from a native Bluetooth backup before any radio is
+    /// selected, with the address of the radio the backup came from.
+    pub(super) fn prepare_native(&self) -> AppResult<(MenuUpdatePlan, BluetoothAddress)> {
+        let assignments = self.assignments()?;
+        let (snapshot, address) = Snapshot::load_for_native_write(self.source_backup())?;
+        Ok((Self::plan(&snapshot, assignments)?, address))
+    }
+
+    fn plan(snapshot: &Snapshot, assignments: Vec<MenuAssignment>) -> AppResult<MenuUpdatePlan> {
         Ok(MenuUpdatePlan::new(
             &snapshot.identity,
             &snapshot.menu_snapshot()?,

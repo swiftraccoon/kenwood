@@ -121,10 +121,12 @@ diagnostic report path. Shell sessions, fixed MCP probes, and standard backups
 also capture observations and cleanup in private directories. Omitting
 `--output` for a probe or backup creates a directory under `captures`; CAT
 uses that default destination. Programming temporarily interrupts normal radio
-operation, even without settings writes. General native MCP settings writes
-and trials remain disabled. Automatic `dstar start` has its own narrowly
-guarded Bluetooth lifecycle, described below; it cannot run inside the CAT
-prompt. Offline MCP inspection remains available.
+operation, even without settings writes. `mcp text set` and `mcp menu apply`
+also run over native Bluetooth, as described under
+[Settings writes over native Bluetooth](#settings-writes-over-native-bluetooth);
+the fixed trials and the reentry probe remain USB-only. Automatic `dstar start`
+has its own narrowly guarded Bluetooth lifecycle, described below; it cannot
+run inside the CAT prompt. Offline MCP inspection remains available.
 
 Native MCP probe and backup require `TM-D750 / 1.02 / K,2,1` and a fresh Gateway
 Off reply. The probe reads two fixed fragments totaling 295 bytes. Backup uses
@@ -218,6 +220,41 @@ K,2,1: fixed MCP probes and a standard backup each reacquired the CAT identity
 and Gateway Off on the pinned channel, including runs in which the radio held
 the fresh `ID` for about four seconds, and that backup matched a USB backup of
 the same configuration byte for byte.
+
+### Settings writes over native Bluetooth
+
+`mcp text set` and `mcp menu apply` run over native Bluetooth with the same
+journal, captures, compare-write-verify sessions and reports as over USB.
+Select the radio with `--bluetooth` or `--bluetooth-address` instead of
+`--port`, and give a native Bluetooth backup of that radio as the source:
+
+```bash
+cargo run -p tmd750-repl -- --bluetooth mcp backup --output bluetooth-backup-01
+cargo run -p tmd750-repl -- --bluetooth \
+  mcp text set --backup bluetooth-backup-01/report.json --expect PM1 --apply \
+  --output bluetooth-pm1-01 pm-name-1 BASE
+```
+
+The backup's address names the radio the write reaches, so a USB backup is
+refused. The command validates its options, the backup and the requested value
+before it selects a radio, and refuses before opening anything when the
+selected radio is not the backup's. Each programming session opens the exact
+address, with a Serial Port service query the first time and the pinned
+RFCOMM channel afterwards, and requires Gateway Off before programming entry.
+After the acknowledged exit it holds the connection without traffic for five
+seconds, closes it, reopens the pinned channel, and reads the identity tuple
+and Gateway Off, the first reply allowed until 30 seconds after the exit.
+Reports carry `transport = "native_bluetooth"` and the address and channel as
+their endpoint; text updates use format 8 for every setting and menu updates
+format 2.
+
+Hardware coverage on firmware 1.02 / type K,2,1 over native Bluetooth: PM1
+renamed and restored, a channel named and cleared, and MY1 written and cleared
+through `mcp text set`, each ending `verified_across_sessions`, and
+`radio.VoxGain` written and restored in PM Off through `mcp menu apply`. Each
+run was confirmed by a native backup compared with the one before it: every
+write changed only its field's bytes, and every restore or clear returned
+every page byte-identical to the backup taken before the first write.
 
 ## Configuration backup and PC text entry
 

@@ -7,7 +7,6 @@ use std::fs::File;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use kenwood_tmd750::transport::{SerialCandidate, TMD750_PANEL_PID};
 use kenwood_tmd750::{
     DvGatewayMode, McpProbeExit, Radio, TextFieldUpdateSessionOutcome,
     TextFieldUpdateSessionReport, TextFieldUpdateSessionStage, TextFieldUpdateWriteDisposition,
@@ -15,13 +14,15 @@ use kenwood_tmd750::{
 use kenwood_transport::Transport;
 use serde::Serialize;
 
+use super::super::link::{Opening, Refusal, WriteLink};
 pub(super) use super::super::reconnect::PostExit;
-use super::super::reconnect::{self, Backend, SkipReason};
+use super::super::reconnect::SkipReason;
 use super::super::{ExitDisposition, Failure, IdentityEvidence, SegmentEvidence, close_transport};
 use super::UpdateStatus;
 use super::journal::UpdateJournal;
 use super::target::{Update, UpdateKind};
-use crate::capture::{CaptureTransport, Event, Recorder, TranscriptSummary};
+use crate::capture::{CaptureTransport, Recorder, TranscriptSummary};
+use crate::native::opening::History;
 use crate::output;
 
 #[derive(Debug)]
@@ -206,9 +207,22 @@ impl From<&TextFieldUpdateSessionReport> for CoreEvidence {
 struct SessionEvidence {
     core: Option<CoreEvidence>,
     transcript: TranscriptSummary,
+    /// Native Bluetooth opening attempts; absent over USB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    opening: Option<History>,
+    /// Gateway mode read before programming entry; absent over USB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gateway_before: Option<GatewayEvidence>,
     open_error: Option<Failure>,
+    /// The failed pre-entry check of the link; absent over USB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    admission_error: Option<Failure>,
     close_error: Option<Failure>,
     synchronization_error: Option<Failure>,
+    /// The failed hold of the original connection after the exit; absent over
+    /// USB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hold_error: Option<Failure>,
     post_exit: PostExit,
 }
 
@@ -230,26 +244,12 @@ impl SessionEvidence {
         self.synchronize_original(&mut recorder);
     }
 
-    /// Wrap the open connection for protocol use, or close it and return `None`
-    /// when its opening record failed to synchronize.
-    async fn admit_original<T: Transport>(
-        &mut self,
-        connection: T,
-        original: Recorder<File>,
-    ) -> Option<Radio<CaptureTransport<T, File>>> {
-        let transport = CaptureTransport::required(connection, original);
-        if self.synchronization_error.is_some() {
-            self.close_original(transport).await;
-            None
-        } else {
-            Some(Radio::new(transport))
-        }
-    }
-
     fn succeeded(&self) -> bool {
         self.open_error.is_none()
+            && self.admission_error.is_none()
             && self.close_error.is_none()
             && self.synchronization_error.is_none()
+            && self.hold_error.is_none()
             && self.transcript.complete
             && self.post_exit.succeeded()
             && self.core.as_ref().is_some_and(|core| {
@@ -294,8 +294,10 @@ impl WorkflowResult {
             }
             for (label, error) in [
                 ("connection open", &session.open_error),
+                ("pre-entry check", &session.admission_error),
                 ("connection close", &session.close_error),
                 ("capture synchronization", &session.synchronization_error),
+                ("post-exit hold", &session.hold_error),
             ] {
                 if let Some(error) = error {
                     output::error(format_args!(
@@ -331,9 +333,7 @@ const fn exit_guidance(exit: &ExitDisposition) -> Option<&'static str> {
 }
 
 pub(super) async fn run(
-    backend: &mut impl Backend,
-    endpoint: &SerialCandidate,
-    baud: u32,
+    link: &mut impl WriteLink,
     update: &mut impl Update,
     journal: &mut UpdateJournal,
     captures: [SessionCaptures; 2],
@@ -349,13 +349,9 @@ pub(super) async fn run(
             update.kind().label(),
             result.sessions.len() + 1
         ));
-        // The second session opens only after the endpoint has stayed
-        // enumerated for the settle period that follows the first exit.
-        let settle = !result.sessions.is_empty();
-        let session = run_session(
-            backend, endpoint, baud, update, journal, captures, cancelled, settle,
-        )
-        .await;
+        // The second session follows the first exit, which the link settles.
+        let later = !result.sessions.is_empty();
+        let session = run_session(link, update, journal, captures, cancelled, later).await;
         let succeeded =
             session.succeeded() && update.kind().verification_succeeded(&session.post_exit);
         let id = session.core.as_ref().and_then(|core| core.session_id);
@@ -388,34 +384,35 @@ pub(super) async fn run(
     result
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one session takes its backend, endpoint, baud, update, journal, captures, cancellation flag and settle policy"
-)]
+/// Run one programming session over `link`: open, admit, run the update's
+/// session, hold after an acknowledged exit, close, and check a fresh
+/// connection. `later` marks the session after the first exit.
 async fn run_session(
-    backend: &mut impl Backend,
-    endpoint: &SerialCandidate,
-    baud: u32,
+    link: &mut impl WriteLink,
     update: &mut impl Update,
     journal: &mut UpdateJournal,
     captures: SessionCaptures,
     cancelled: &AtomicBool,
-    settle: bool,
+    later: bool,
 ) -> SessionEvidence {
     let SessionCaptures {
-        mut original,
-        post_exit,
+        original,
+        mut post_exit,
     } = captures;
     let mut result = SessionEvidence {
         core: None,
         transcript: original.summary(),
+        opening: None,
+        gateway_before: None,
         open_error: None,
+        admission_error: None,
         close_error: None,
         synchronization_error: None,
-        post_exit: PostExit::skipped(SkipReason::OriginalOpenFailed, post_exit.summary()),
+        hold_error: None,
+        post_exit: link.skipped(SkipReason::OriginalOpenFailed, post_exit.summary()),
     };
     if cancelled.load(Ordering::Relaxed) && update.status() == UpdateStatus::NotWritten {
-        result.post_exit = PostExit::skipped(SkipReason::Cancelled, post_exit.summary());
+        result.post_exit = link.skipped(SkipReason::Cancelled, post_exit.summary());
         return result;
     }
     let synchronization_handle = match original.synchronization_handle() {
@@ -431,108 +428,100 @@ async fn run_session(
         #[cfg(all(test, unix))]
         fail_next: journal.take_raw_sync_failure_for_test(),
     };
+    // Once the page may have been written, a cancellation signal no longer
+    // stops the session's remaining verification; a capture failure still
+    // stops all protocol traffic.
     let finish_verification = AtomicBool::new(false);
-    let opening_cancelled = if update.status() == UpdateStatus::NotWritten {
+    let continuing = if update.status() == UpdateStatus::NotWritten {
         cancelled
     } else {
         &finish_verification
     };
-    if (settle || endpoint.pid == Some(TMD750_PANEL_PID))
-        && let Err(error) =
-            reconnect::await_settled_endpoint(backend, endpoint, &mut original, opening_cancelled)
-                .await
-    {
-        let failure = Failure::from_error(&error);
-        original.record(Event::OpenFailed {
-            error: failure.clone(),
-        });
-        result.open_error = Some(failure);
-        result.synchronize_original(&mut original);
-        return result;
-    }
-    let Some(connection) = open_original(
-        backend,
-        endpoint,
-        baud,
-        &mut original,
-        &mut result,
-        opening_cancelled,
-    ) else {
-        return result;
-    };
-    let Some(mut radio) = result.admit_original(connection, original).await else {
-        result.post_exit =
-            PostExit::skipped(SkipReason::OriginalCaptureIncomplete, post_exit.summary());
+    let Some(mut radio) =
+        open_admitted(link, original, later, continuing, &post_exit, &mut result).await
+    else {
         return result;
     };
     let report = update
         .run_session(&mut radio, cancelled, journal, &mut capture)
         .await;
     result.synchronization_error = capture.error;
-    result.close_original(radio.into_transport()).await;
-    let eligibility = verification_identity(&result, journal, &report);
-    // Once the page may have been written, a cancellation signal no longer
-    // skips the check; a capture failure still stops all protocol traffic.
-    let verification_cancelled = if update.status() == UpdateStatus::NotWritten {
+    let continuing = if update.status() == UpdateStatus::NotWritten {
         cancelled
     } else {
         &finish_verification
     };
-    result.post_exit = match eligibility {
-        Ok(identity) => {
-            verify_post_exit(
-                update.kind(),
-                backend,
-                endpoint,
-                baud,
-                identity,
-                post_exit,
-                verification_cancelled,
-            )
-            .await
+    let hold = if report.exit == McpProbeExit::Acknowledged {
+        link.hold_after_exit(&mut post_exit, continuing).await
+    } else {
+        Ok(())
+    };
+    result.close_original(radio.into_transport()).await;
+    result.post_exit = match (verification_identity(&result, journal, &report), hold) {
+        (Err(reason), _) => link.skipped(reason, post_exit.summary()),
+        (Ok(_), Err(error)) => {
+            let reason = if error.kind() == std::io::ErrorKind::Interrupted {
+                SkipReason::Cancelled
+            } else {
+                SkipReason::PostExitHoldFailed
+            };
+            result.hold_error = Some(Failure::from_error(&error));
+            link.skipped(reason, post_exit.summary())
         }
-        Err(reason) => PostExit::skipped(reason, post_exit.summary()),
+        (Ok(identity), Ok(())) => {
+            let gateway_off = update.kind() == UpdateKind::PmOffMy1;
+            link.verify_post_exit(identity, gateway_off, post_exit, continuing)
+                .await
+        }
     };
     result.core = Some(CoreEvidence::from(&report));
     result
 }
 
-/// The post-exit CAT check: one open and identity read on the main-unit
-/// endpoint, or on the operation-panel endpoint the bounded silent-`ID` retry
-/// that backups use, because that endpoint answers `ID` only once its tuple
-/// is ready. The PM Off MY1 form additionally requires one `GW` query to
-/// report Off on the matched attempt.
-async fn verify_post_exit(
-    kind: UpdateKind,
-    backend: &mut impl Backend,
-    endpoint: &SerialCandidate,
-    baud: u32,
-    identity: &kenwood_tmd750::Identity,
-    post_exit: Recorder<File>,
-    cancelled: &AtomicBool,
-) -> PostExit {
-    let gateway_off = kind == UpdateKind::PmOffMy1;
-    if endpoint.pid == Some(TMD750_PANEL_PID) {
-        PostExit::Readiness(if gateway_off {
-            reconnect::verify_readiness_gateway_off(
-                backend, endpoint, baud, identity, post_exit, cancelled,
-            )
-            .await
-        } else {
-            reconnect::verify_readiness(backend, endpoint, baud, identity, post_exit, cancelled)
-                .await
-        })
-    } else {
-        PostExit::Single(if gateway_off {
-            reconnect::verify_required_gateway_off(
-                backend, endpoint, baud, identity, post_exit, cancelled,
-            )
-            .await
-        } else {
-            reconnect::verify_required(backend, endpoint, baud, identity, post_exit, cancelled)
-                .await
-        })
+/// Open the session's connection and pass the link's pre-entry check,
+/// recording every refusal in `result`; `None` when no programming session
+/// may start.
+async fn open_admitted<L: WriteLink>(
+    link: &mut L,
+    original: Recorder<File>,
+    later: bool,
+    continuing: &AtomicBool,
+    post_exit: &Recorder<File>,
+    result: &mut SessionEvidence,
+) -> Option<Radio<CaptureTransport<L::Connection, File>>> {
+    let opened = link.open_session(original, later, continuing).await;
+    result.opening = link.take_opening_history();
+    let mut transport = match opened {
+        Opening::Opened(transport) => transport,
+        Opening::Refused {
+            mut recorder,
+            refusal,
+        } => {
+            match refusal {
+                Refusal::Capture(failure) => result.synchronization_error = Some(failure),
+                Refusal::Cancelled => result.post_exit.skip(SkipReason::Cancelled),
+                Refusal::Open(failure) => result.open_error = Some(failure),
+            }
+            result.synchronize_original(&mut recorder);
+            return None;
+        }
+    };
+    if let Err(error) = transport.synchronize() {
+        result.synchronization_error = Some(Failure::from_error(&error));
+        result.close_original(transport).await;
+        result.post_exit = link.skipped(SkipReason::OriginalCaptureIncomplete, post_exit.summary());
+        return None;
     }
+    let mut radio = link.radio(transport);
+    let admission = link.admit(&mut radio).await;
+    result.gateway_before = admission.gateway.map(GatewayEvidence::from);
+    if let Some(error) = admission.error {
+        result.admission_error = Some(error);
+        result.close_original(radio.into_transport()).await;
+        result.post_exit = link.skipped(SkipReason::OriginalAdmissionFailed, post_exit.summary());
+        return None;
+    }
+    Some(radio)
 }
 
 fn verification_identity<'a>(
@@ -553,48 +542,6 @@ fn verification_identity<'a>(
             .identity
             .as_ref()
             .ok_or(SkipReason::OriginalUpdateIncomplete)
-    }
-}
-
-/// Record and fsync the requested open and its result, then return the connection.
-///
-/// Returns `None` when the record made before the open failed to synchronize,
-/// when cancellation was requested, or when the open itself failed.
-fn open_original<B: Backend>(
-    backend: &mut B,
-    endpoint: &SerialCandidate,
-    baud: u32,
-    original: &mut Recorder<File>,
-    result: &mut SessionEvidence,
-    cancelled: &AtomicBool,
-) -> Option<B::Connection> {
-    original.record(Event::OpenRequested {
-        path: &endpoint.path,
-        baud,
-    });
-    result.synchronize_original(original);
-    if result.synchronization_error.is_some() {
-        return None;
-    }
-    if cancelled.load(Ordering::Relaxed) {
-        result.post_exit.skip(SkipReason::Cancelled);
-        return None;
-    }
-    match backend.open(endpoint, baud) {
-        Ok(connection) => {
-            original.record(Event::OpenCompleted);
-            result.synchronize_original(original);
-            Some(connection)
-        }
-        Err(error) => {
-            let failure = Failure::from_error(&error);
-            original.record(Event::OpenFailed {
-                error: failure.clone(),
-            });
-            result.open_error = Some(failure);
-            result.synchronize_original(original);
-            None
-        }
     }
 }
 

@@ -20,15 +20,22 @@
 - Every capture directory is created exclusively, mode 0700, with 0600 files;
   an existing path is refused rather than overwritten. `--output` names a new
   directory whose parent must exist.
-- Gates: `mcp menu apply` and `mcp text set` require `--port` and `--apply`;
-  `dstar probe` and the one-shot trials listed under Commands require `--port`
-  and `--approve-live-test`; `dstar start` is the one radio-writing workflow
-  without a flag, since invoking it is the request to write the Terminal and
-  routing pages and open the modem link. Do not add a workflow that reaches the
-  radio outside these gates.
-- Native Bluetooth admits only `mcp probe` and `mcp backup`; general MCP
-  settings writes and the fixed trials are USB-only and are refused before the
-  helper launches.
+- Gates: `mcp menu apply` and `mcp text set` require `--apply` and an
+  explicit endpoint: `--port`, or `--bluetooth`/`--bluetooth-address` with a
+  native backup of that radio; `dstar probe` and the one-shot trials listed
+  under Commands require `--port` and `--approve-live-test`; `dstar start` is
+  the one radio-writing workflow without a flag, since invoking it is the
+  request to write the Terminal and routing pages and open the modem link. Do
+  not add a workflow that reaches the radio outside these gates.
+- Native Bluetooth admits `mcp probe`, `mcp backup`, `mcp text set` and
+  `mcp menu apply`; the fixed trials and the reentry probe are USB-only and are
+  refused before the helper launches. A native write validates its options,
+  native backup and value before selecting a radio, and refuses one whose
+  address differs from the backup's.
+- Write workflows reach their endpoint only through `mcp::link::WriteLink`
+  (`UsbLink` or `NativeLink`): open, reply deadlines, pre-entry check, hold
+  after the exit, post-exit check. Never branch on the transport inside a
+  workflow.
 - Every new native connection gets its `Radio` from `native::cat::wrap` (or,
   in the shared fixed read, `Some(BLUETOOTH_FIRST_REPLY_TIMEOUT)`), so the
   first reply may take ten seconds and every later exchange 1.5. The fresh
@@ -85,7 +92,8 @@ cargo run -p tmd750-repl -- --port PATH status              # one-shot command; 
 cargo run -p tmd750-repl -- --port PATH mcp backup|probe --output NEW_DIRECTORY
 cargo run -p tmd750-repl -- mcp menu list|describe|show|preview
 cargo run -p tmd750-repl -- --port PATH mcp menu apply --backup REPORT --apply FIELD VALUE
-cargo run -p tmd750-repl -- mcp text list|show|preview       # set needs --port and --apply
+cargo run -p tmd750-repl -- --bluetooth mcp menu apply --backup NATIVE_REPORT --apply FIELD VALUE
+cargo run -p tmd750-repl -- mcp text list|show|preview       # set needs --apply and --port or --bluetooth
 cargo run -p tmd750-repl -- mcp terminal preflight|compare
 cargo run -p tmd750-repl -- --port PATH dstar probe --approve-live-test [--output NEW_DIRECTORY]
 cargo run -p tmd750-repl -- dstar start CALL [REFLECTOR]     # --control-port pins the independent USB CAT connector

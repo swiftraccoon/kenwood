@@ -520,6 +520,13 @@ impl ReadyInput {
         let _runtime = tokio::runtime::Handle::try_current()?;
         let terminal = file.is_terminal();
         let file = FlaggedFile::new(file)?;
+        #[expect(
+            deprecated,
+            reason = "tokio registers an AsyncFd otherwise only through the unsafe \
+                      register_with_interest, and this crate forbids unsafe code; FlaggedFile \
+                      owns its File for the AsyncFd's whole lifetime, so the descriptor stays \
+                      open and unchanged, which is that function's safety contract"
+        )]
         let descriptor = match AsyncFd::try_with_interest(file, Interest::READABLE) {
             Ok(descriptor) => descriptor,
             Err(error) => {

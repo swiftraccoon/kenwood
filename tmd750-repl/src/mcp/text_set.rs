@@ -25,11 +25,14 @@ use serde::Serialize;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+use kenwood_transport::bluetooth::BluetoothAddress;
+
+use super::link::{NativeLink, ReportEndpoint, UsbLink, WriteLink};
 use super::reconnect::SystemBackend;
 use super::snapshot::Snapshot;
-use super::{Endpoint, Failure, finish_on_interrupt};
+use super::{Failure, finish_on_interrupt};
 use crate::capture::{Artifacts, CaptureKind, Recorder, create_private_file};
-use crate::{AppResult, CommandError, output};
+use crate::{AppResult, CommandError, native, output};
 use journal::UpdateJournal;
 use target::{PreparedUpdate, Update, UpdateKind};
 use workflow::{SessionCaptures, WorkflowResult};
@@ -218,7 +221,23 @@ impl SetRequest {
                 "text updates require a TM-D750 USB endpoint, main unit or operation panel, at 9600 baud".to_owned(),
             )));
         }
-        let snapshot = Snapshot::load_for_usb_write(&self.backup)?;
+        Self::build(change, &Snapshot::load_for_usb_write(&self.backup)?)
+    }
+
+    /// Build the update from a native Bluetooth backup before any radio is
+    /// selected; it runs only against the radio the backup came from.
+    pub(super) fn prepare_native(&self) -> AppResult<NativePrepared> {
+        let change = self.requested_change()?;
+        let (snapshot, address) = Snapshot::load_for_native_write(&self.backup)?;
+        Ok(NativePrepared {
+            update: Self::build(change, &snapshot)?,
+            address,
+        })
+    }
+
+    /// Build the typed update for `change` from the captured pages of
+    /// `snapshot`.
+    fn build(change: RequestedChange, snapshot: &Snapshot) -> AppResult<PreparedUpdate> {
         match change {
             RequestedChange::Pm1 { expected, desired } => {
                 let page = Pm1NameUpdate::required_page()?;
@@ -317,10 +336,13 @@ impl From<TextFieldUpdateStatus> for UpdateStatus {
 struct Report {
     format_version: u8,
     operation: &'static str,
+    /// `native_bluetooth` over native Bluetooth; absent over USB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transport: Option<&'static str>,
     software_version: &'static str,
     started_at_utc: String,
     finished_at_utc: String,
-    endpoint: Endpoint,
+    endpoint: ReportEndpoint,
     source_backup: PathBuf,
     setting: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -371,7 +393,10 @@ fn verification_captures(directory: &Path, failed: &Arc<AtomicBool>) -> AppResul
     })
 }
 
-/// Validate the request and run the update for the selected setting.
+/// Report format of a text update over native Bluetooth, for every setting.
+const NATIVE_REPORT_FORMAT: u8 = 8;
+
+/// Validate the request and run the update over the selected USB endpoint.
 ///
 /// The typed update is built before any capture file is reserved or any port is
 /// opened.
@@ -380,15 +405,59 @@ pub(super) async fn run(
     baud: u32,
     request: &SetRequest,
 ) -> AppResult<()> {
-    match request.prepare(endpoint, baud)? {
-        PreparedUpdate::Pm1(mut update) => {
-            run_prepared(update.as_mut(), endpoint, baud, request).await
-        }
-        PreparedUpdate::My1(mut update) => {
-            run_prepared(update.as_mut(), endpoint, baud, request).await
-        }
+    let prepared = request.prepare(endpoint, baud)?;
+    let mut backend = SystemBackend::new();
+    run_update(
+        prepared,
+        &mut UsbLink::new(&mut backend, endpoint, baud),
+        request,
+    )
+    .await
+}
+
+/// A text update prepared from a native Bluetooth backup; it runs only
+/// against the radio at the backup's address.
+pub(super) struct NativePrepared {
+    update: PreparedUpdate,
+    address: BluetoothAddress,
+}
+
+/// Run an update prepared from a native Bluetooth backup over the native
+/// link to `endpoint`.
+///
+/// Returns `CommandError`, before any capture file is reserved or any
+/// connection is opened, when `endpoint` is not the radio the backup came
+/// from.
+pub(super) async fn run_native(
+    endpoint: &native::Endpoint,
+    prepared: NativePrepared,
+    request: &SetRequest,
+) -> AppResult<()> {
+    if endpoint.address != prepared.address {
+        return Err(Box::new(CommandError(format!(
+            "the selected radio {} is not {}, the radio of the source backup; nothing was opened",
+            endpoint.address, prepared.address
+        ))));
+    }
+    let mut backend = native::SystemBackend;
+    run_update(
+        prepared.update,
+        &mut NativeLink::new(&mut backend, endpoint),
+        request,
+    )
+    .await
+}
+
+async fn run_update(
+    prepared: PreparedUpdate,
+    link: &mut impl WriteLink,
+    request: &SetRequest,
+) -> AppResult<()> {
+    match prepared {
+        PreparedUpdate::Pm1(mut update) => run_prepared(update.as_mut(), link, request).await,
+        PreparedUpdate::My1(mut update) => run_prepared(update.as_mut(), link, request).await,
         PreparedUpdate::ChannelName(mut update) => {
-            run_prepared(update.as_mut(), endpoint, baud, request).await
+            run_prepared(update.as_mut(), link, request).await
         }
     }
 }
@@ -400,8 +469,7 @@ pub(super) async fn run(
 /// the capture files and journal, runs both sessions and writes the report.
 async fn run_prepared(
     update: &mut impl Update,
-    endpoint: &SerialCandidate,
-    baud: u32,
+    link: &mut impl WriteLink,
     request: &SetRequest,
 ) -> AppResult<()> {
     let kind = update.kind();
@@ -431,15 +499,13 @@ async fn run_prepared(
     request.print_start(&directory, kind);
     let started_at_utc = OffsetDateTime::now_utc().format(&Rfc3339)?;
     let (workflow, signal_error) = finish_on_interrupt(
-        workflow::run(
-            &mut SystemBackend::new(),
-            endpoint,
-            baud,
+        Box::pin(workflow::run(
+            link,
             update,
             &mut journal,
             captures,
             &cancelled,
-        ),
+        )),
         tokio::signal::ctrl_c(),
         &cancelled,
     )
@@ -458,17 +524,17 @@ async fn run_prepared(
     }
     let succeeded = workflow.succeeded(update) && journal_error.is_none() && signal_error.is_none();
     let report = Report {
-        format_version: kind.format_version(),
+        format_version: if link.native() {
+            NATIVE_REPORT_FORMAT
+        } else {
+            kind.format_version()
+        },
         operation: kind.operation(),
+        transport: link.native().then_some("native_bluetooth"),
         software_version: env!("CARGO_PKG_VERSION"),
         started_at_utc,
         finished_at_utc: OffsetDateTime::now_utc().format(&Rfc3339)?,
-        endpoint: Endpoint {
-            path: endpoint.path.clone(),
-            usb_vendor_id: endpoint.vid,
-            usb_product_id: endpoint.pid,
-            cat_baud: baud,
-        },
+        endpoint: link.report_endpoint(),
         source_backup: request.backup.clone(),
         setting: request.setting.key(),
         channel: request.channel.map(PhysicalChannel::index),

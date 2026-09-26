@@ -2,6 +2,7 @@
 
 pub(crate) mod backup;
 pub(crate) mod fixed;
+mod link;
 mod menu;
 mod menu_apply;
 mod pm1_trial;
@@ -311,6 +312,63 @@ enum ProbeError {
     Incomplete { report: PathBuf },
     #[error("could not finish MCP report {path}: {source}; the transcript may be partial")]
     Report { path: PathBuf, source: io::Error },
+}
+
+/// A native Bluetooth write validated and prepared from its native backup,
+/// before any radio is selected; it runs only against the backup's radio.
+pub(crate) struct NativeWrite<'a>(NativeWriteKind<'a>);
+
+enum NativeWriteKind<'a> {
+    Text(&'a text_set::SetRequest, text_set::NativePrepared),
+    Menu(
+        &'a menu::ApplyRequest,
+        kenwood_tmd750::MenuUpdatePlan,
+        kenwood_transport::bluetooth::BluetoothAddress,
+    ),
+}
+
+impl McpCommand {
+    /// Validate `mcp text set` or `mcp menu apply` and prepare it from its
+    /// native Bluetooth backup, without selecting or opening a radio.
+    ///
+    /// Returns `CommandError` on a host without native Bluetooth, for every
+    /// other command, and for any option, backup or field the write rejects.
+    pub(crate) fn prepare_native_write(&self) -> AppResult<NativeWrite<'_>> {
+        if !cfg!(target_os = "macos") {
+            return Err(Box::new(crate::CommandError(
+                "native Bluetooth is currently available only on macOS".to_owned(),
+            )));
+        }
+        match self {
+            Self::Text(request) => {
+                let (request, prepared) = request.prepare_native()?;
+                Ok(NativeWrite(NativeWriteKind::Text(request, prepared)))
+            }
+            Self::Menu(request) => {
+                let (request, plan, address) = request.prepare_native()?;
+                Ok(NativeWrite(NativeWriteKind::Menu(request, plan, address)))
+            }
+            _ => Err(Box::new(crate::CommandError(
+                "native Bluetooth writes are mcp text set and mcp menu apply".to_owned(),
+            ))),
+        }
+    }
+}
+
+/// Run a prepared native Bluetooth write over the link to `endpoint`, which
+/// must be the radio of its source backup.
+pub(crate) async fn run_native_write(
+    endpoint: &crate::native::Endpoint,
+    write: NativeWrite<'_>,
+) -> AppResult<()> {
+    match write.0 {
+        NativeWriteKind::Text(request, prepared) => {
+            text_set::run_native(endpoint, prepared, request).await
+        }
+        NativeWriteKind::Menu(request, plan, address) => {
+            menu_apply::run_native(endpoint, &plan, &address, request).await
+        }
+    }
 }
 
 /// Open only the selected USB connection, capture, close, and publish the report.

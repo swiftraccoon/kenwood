@@ -244,7 +244,10 @@ fn native_snapshot_preserves_bytes_and_cannot_supply_usb_write_provenance() -> T
     let error = Snapshot::load_for_usb_write(&path)
         .err()
         .ok_or("native evidence incorrectly authorized a USB write source")?;
-    assert!(error.to_string().contains("offline inspection"), "{error}");
+    assert!(
+        error.to_string().contains("requires a USB backup"),
+        "{error}"
+    );
     assert_eq!(std::fs::read(&path)?, bytes);
 
     let usb = directory.path().join("usb.json");
@@ -253,6 +256,26 @@ fn native_snapshot_preserves_bytes_and_cannot_supply_usb_write_provenance() -> T
         Snapshot::load_for_usb_write(&usb)?.provenance,
         Provenance::Usb
     ));
+    Ok(())
+}
+
+#[test]
+fn native_writes_load_only_native_backups_and_learn_their_address() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let native = directory.path().join("native.json");
+    std::fs::write(&native, serde_json::to_vec(&fixture()?)?)?;
+    let (snapshot, address) = Snapshot::load_for_native_write(&native)?;
+    assert_eq!(address.as_str(), "01-23-45-67-89-AB");
+    assert_eq!(snapshot.identity.firmware.as_str(), "1.02");
+    let usb = directory.path().join("usb.json");
+    std::fs::write(&usb, serde_json::to_vec(&super::super::tests::fixture())?)?;
+    let error = Snapshot::load_for_native_write(&usb)
+        .err()
+        .ok_or("a USB backup names no Bluetooth address to write to")?;
+    assert!(
+        error.to_string().contains("native Bluetooth backup"),
+        "{error}"
+    );
     Ok(())
 }
 

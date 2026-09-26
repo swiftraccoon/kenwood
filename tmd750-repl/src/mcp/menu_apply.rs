@@ -2,9 +2,10 @@
 //!
 //! The first connection compares the whole page, writes it, reads it back and
 //! exits MCP; the fresh check reads the identity tuple and Gateway Off, with
-//! one open on the main-unit endpoint or the bounded silent-`ID` retry on the
-//! operation-panel endpoint. Persistence across a later MCP session or a power
-//! cycle is not checked.
+//! one open on the main-unit endpoint, the bounded silent-`ID` retry on the
+//! operation-panel endpoint, or one reopen of the pinned channel over native
+//! Bluetooth. Persistence across a later MCP session or a power cycle is not
+//! checked.
 
 use std::fs::File;
 use std::io;
@@ -15,21 +16,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use kenwood_tmd750::transport::{DEFAULT_BAUD, SerialCandidate, TMD750_MAIN_PID, TMD750_PANEL_PID};
 use kenwood_tmd750::{DvGatewayMode, MenuUpdatePlan, Page, PageReplacement, Radio};
 use kenwood_transport::Transport;
+use kenwood_transport::bluetooth::BluetoothAddress;
 use serde::Serialize;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+use super::link::{NativeLink, Opening, Refusal, ReportEndpoint, UsbLink, WriteLink};
 use super::menu::{ApplyRequest, Value};
-use super::reconnect::{self, Backend, PostExit, SkipReason, SystemBackend};
+use super::reconnect::{PostExit, SkipReason, SystemBackend};
 use super::{
-    Endpoint, ExitDisposition, Failure, IdentityEvidence, close_transport, finish_on_interrupt,
-    write_report,
+    ExitDisposition, Failure, IdentityEvidence, close_transport, finish_on_interrupt, write_report,
 };
-use crate::capture::{
-    Artifacts, CaptureKind, CaptureTransport, Event, Recorder, TranscriptSummary,
-    create_private_file,
-};
-use crate::{AppResult, CommandError, output};
+use crate::capture::{Artifacts, CaptureKind, Recorder, TranscriptSummary, create_private_file};
+use crate::native::opening::History;
+use crate::{AppResult, CommandError, native, output};
 
 struct Captures {
     original: Recorder<File>,
@@ -68,9 +68,15 @@ struct WorkflowResult {
     compared_pages: Vec<PageEvidence>,
     possible_pages: Vec<PageEvidence>,
     verified_pages: Vec<PageEvidence>,
+    /// Native Bluetooth opening attempts; absent over USB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    opening: Option<History>,
     open_error: Option<Failure>,
     operation_error: Option<Failure>,
     cleanup_error: Option<Failure>,
+    /// The failed hold of the connection after the exit; absent over USB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hold_error: Option<Failure>,
     close_error: Option<Failure>,
     capture_error: Option<Failure>,
     journal_error: Option<Failure>,
@@ -79,7 +85,7 @@ struct WorkflowResult {
 }
 
 impl WorkflowResult {
-    fn new(captures: &Captures) -> Self {
+    fn new(captures: &Captures, link: &impl WriteLink) -> Self {
         Self {
             identity: None,
             gateway_mode: None,
@@ -87,14 +93,16 @@ impl WorkflowResult {
             compared_pages: Vec::new(),
             possible_pages: Vec::new(),
             verified_pages: Vec::new(),
+            opening: None,
             open_error: None,
             operation_error: None,
             cleanup_error: None,
+            hold_error: None,
             close_error: None,
             capture_error: None,
             journal_error: None,
             transcript: captures.original.summary(),
-            post_exit: PostExit::skipped(
+            post_exit: link.skipped(
                 SkipReason::OriginalUpdateIncomplete,
                 captures.post_exit.summary(),
             ),
@@ -115,6 +123,8 @@ impl WorkflowResult {
             || !matches!(self.exit, ExitDisposition::Acknowledged)
         {
             Some(SkipReason::OriginalUpdateIncomplete)
+        } else if self.hold_error.is_some() {
+            Some(SkipReason::PostExitHoldFailed)
         } else {
             None
         }
@@ -129,6 +139,7 @@ impl WorkflowResult {
             ("open", &self.open_error),
             ("operation", &self.operation_error),
             ("MCP exit", &self.cleanup_error),
+            ("post-exit hold", &self.hold_error),
             ("close", &self.close_error),
             ("capture", &self.capture_error),
             ("journal", &self.journal_error),
@@ -262,12 +273,16 @@ impl RawSynchronization {
     }
 }
 
+fn cancellation() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Interrupted,
+        "menu update cancelled before write intent",
+    )
+}
+
 fn check_cancellation(cancelled: &AtomicBool) -> io::Result<()> {
     if cancelled.load(Ordering::Relaxed) {
-        Err(io::Error::new(
-            io::ErrorKind::Interrupted,
-            "menu update cancelled before write intent",
-        ))
+        Err(cancellation())
     } else {
         Ok(())
     }
@@ -360,12 +375,13 @@ async fn operate(
     Ok(())
 }
 
-/// Open the endpoint, run the update, close the connection, and return its recorder.
+/// Open the session over `link`, run the update, hold after an acknowledged
+/// exit, close the connection, and return its recorder.
 async fn original(
-    backend: &mut impl Backend,
-    endpoint: &SerialCandidate,
+    link: &mut impl WriteLink,
     plan: &MenuUpdatePlan,
-    mut recorder: Recorder<File>,
+    recorder: Recorder<File>,
+    post_exit: &mut Recorder<File>,
     journal: &mut Recorder<File>,
     cancelled: &AtomicBool,
     result: &mut WorkflowResult,
@@ -377,38 +393,23 @@ async fn original(
             return recorder;
         }
     };
-    if let Err(error) =
-        reconnect::settle_before_entry(backend, endpoint, &mut recorder, cancelled).await
-    {
-        let error = Failure::from_error(&error);
-        recorder.record(Event::OpenFailed {
-            error: error.clone(),
-        });
-        result.open_error = Some(error);
-        return recorder;
-    }
-    recorder.record(Event::OpenRequested {
-        path: &endpoint.path,
-        baud: DEFAULT_BAUD,
-    });
-    if let Err(error) = recorder.synchronize() {
-        result.capture_error = Some(Failure::from_error(&error));
-        return recorder;
-    }
-    let connection = match backend.open(endpoint, DEFAULT_BAUD) {
-        Ok(connection) => connection,
-        Err(error) => {
-            let error = Failure::from_error(&error);
-            recorder.record(Event::OpenFailed {
-                error: error.clone(),
-            });
-            result.open_error = Some(error);
+    let opened = link.open_session(recorder, false, cancelled).await;
+    result.opening = link.take_opening_history();
+    let mut transport = match opened {
+        Opening::Opened(transport) => transport,
+        Opening::Refused { recorder, refusal } => {
+            match refusal {
+                Refusal::Capture(failure) => result.capture_error = Some(failure),
+                Refusal::Cancelled => {
+                    result.operation_error = Some(Failure::from_error(&cancellation()));
+                }
+                Refusal::Open(failure) => result.open_error = Some(failure),
+            }
             return recorder;
         }
     };
-    recorder.record(Event::OpenCompleted);
-    let opening = recorder.synchronize();
-    let mut radio = Radio::new(CaptureTransport::required(connection, recorder));
+    let opening = transport.synchronize();
+    let mut radio = link.radio(transport);
     let mut raw = RawSynchronization::new(synchronization);
     match opening {
         Ok(()) => {
@@ -423,20 +424,34 @@ async fn original(
     if let Some(error) = raw.error {
         result.capture_error = Some(error);
     }
+    if matches!(result.exit, ExitDisposition::Acknowledged) {
+        // Once a page may have been written, a cancellation signal no longer
+        // interrupts the hold.
+        let finish = AtomicBool::new(false);
+        let continuing = if result.possible_pages.is_empty() {
+            cancelled
+        } else {
+            &finish
+        };
+        if let Err(error) = link.hold_after_exit(post_exit, continuing).await
+            && error.kind() != io::ErrorKind::Interrupted
+        {
+            result.hold_error = Some(Failure::from_error(&error));
+        }
+    }
     let mut transport = radio.into_transport();
     result.close_error = close_transport(&mut transport).await;
     transport.into_recorder()
 }
 
 async fn run_workflow(
-    backend: &mut impl Backend,
-    endpoint: &SerialCandidate,
+    link: &mut impl WriteLink,
     plan: &MenuUpdatePlan,
     captures: Captures,
     journal: &mut Recorder<File>,
     cancelled: &AtomicBool,
 ) -> WorkflowResult {
-    let mut result = WorkflowResult::new(&captures);
+    let mut result = WorkflowResult::new(&captures, &*link);
     let Captures {
         mut original,
         mut post_exit,
@@ -447,10 +462,10 @@ async fn run_workflow(
             Err(error) => result.operation_error = Some(Failure::from_error(&error)),
             Ok(()) => {
                 original = self::original(
-                    backend,
-                    endpoint,
+                    link,
                     plan,
                     original,
+                    &mut post_exit,
                     journal,
                     cancelled,
                     &mut result,
@@ -484,7 +499,7 @@ async fn run_workflow(
                 .capture_error
                 .get_or_insert_with(|| Failure::from_error(&error));
         }
-        PostExit::skipped(reason, post_exit.summary())
+        link.skipped(reason, post_exit.summary())
     } else {
         // Once a page may have been written, the post-exit check runs even after
         // Ctrl-C; a capture failure still stops all protocol I/O.
@@ -494,7 +509,8 @@ async fn run_workflow(
         } else {
             &finish_required
         };
-        verify_post_exit(backend, endpoint, plan.identity(), post_exit, cancellation).await
+        link.verify_post_exit(plan.identity(), true, post_exit, cancellation)
+            .await
     };
     if let Err(error) = record_journal(journal, JournalEvent::Finished { evidence: &result }) {
         let _first = result
@@ -504,53 +520,18 @@ async fn run_workflow(
     result
 }
 
-/// The fresh CAT check after the acknowledged exit: identity then Gateway Off,
-/// with one open on the main-unit endpoint and the bounded silent-`ID` retry
-/// on the operation-panel endpoint, which answers `ID` only once its tuple is
-/// ready.
-async fn verify_post_exit(
-    backend: &mut impl Backend,
-    endpoint: &SerialCandidate,
-    identity: &kenwood_tmd750::Identity,
-    post_exit: Recorder<File>,
-    cancelled: &AtomicBool,
-) -> PostExit {
-    if endpoint.pid == Some(TMD750_PANEL_PID) {
-        PostExit::Readiness(
-            reconnect::verify_readiness_gateway_off(
-                backend,
-                endpoint,
-                DEFAULT_BAUD,
-                identity,
-                post_exit,
-                cancelled,
-            )
-            .await,
-        )
-    } else {
-        PostExit::Single(
-            reconnect::verify_required_gateway_off(
-                backend,
-                endpoint,
-                DEFAULT_BAUD,
-                identity,
-                post_exit,
-                cancelled,
-            )
-            .await,
-        )
-    }
-}
-
 #[derive(Serialize)]
 struct Report {
     format_version: u8,
     operation: &'static str,
+    /// `native_bluetooth` over native Bluetooth; absent over USB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transport: Option<&'static str>,
     verification_scope: &'static str,
     software_version: &'static str,
     started_at_utc: String,
     finished_at_utc: String,
-    endpoint: Endpoint,
+    endpoint: ReportEndpoint,
     source_backup: PathBuf,
     workflow: WorkflowResult,
     signal_error: Option<Failure>,
@@ -584,6 +565,44 @@ pub(super) async fn run(
         .into());
     }
     let plan = request.prepare()?;
+    let mut backend = SystemBackend::new();
+    run_prepared(
+        &plan,
+        &mut UsbLink::new(&mut backend, endpoint, baud),
+        request,
+    )
+    .await
+}
+
+/// Apply a plan prepared from a native Bluetooth backup of the radio at
+/// `address` over the native link to `endpoint`.
+///
+/// Returns `CommandError`, before any capture file is reserved or any
+/// connection is opened, when `endpoint` is not that radio.
+pub(super) async fn run_native(
+    endpoint: &native::Endpoint,
+    plan: &MenuUpdatePlan,
+    address: &BluetoothAddress,
+    request: &ApplyRequest,
+) -> AppResult<()> {
+    if endpoint.address != *address {
+        return Err(CommandError(format!(
+            "the selected radio {} is not {address}, the radio of the source backup; nothing was opened",
+            endpoint.address
+        ))
+        .into());
+    }
+    let mut backend = native::SystemBackend;
+    run_prepared(plan, &mut NativeLink::new(&mut backend, endpoint), request).await
+}
+
+/// Reserve the capture files and journal, then run the planned update over
+/// `link` and write its report.
+async fn run_prepared(
+    plan: &MenuUpdatePlan,
+    link: &mut impl WriteLink,
+    request: &ApplyRequest,
+) -> AppResult<()> {
     let cancelled = Arc::new(AtomicBool::new(false));
     let artifacts = Artifacts::create(CaptureKind::Mcp, request.output(), Arc::clone(&cancelled))?;
     let post_exit = artifacts.reserve_post_exit(Arc::clone(&cancelled))?;
@@ -615,17 +634,16 @@ pub(super) async fn run(
     ));
     let started_at_utc = OffsetDateTime::now_utc().format(&Rfc3339)?;
     let (workflow, signal_error) = finish_on_interrupt(
-        run_workflow(
-            &mut SystemBackend::new(),
-            endpoint,
-            &plan,
+        Box::pin(run_workflow(
+            link,
+            plan,
             Captures {
                 original: transcript,
                 post_exit,
             },
             &mut journal,
             &cancelled,
-        ),
+        )),
         tokio::signal::ctrl_c(),
         &cancelled,
     )
@@ -633,18 +651,14 @@ pub(super) async fn run(
     workflow.print_failures();
     let succeeded = workflow.succeeded() && signal_error.is_none();
     let report = Report {
-        format_version: 1,
+        format_version: if link.native() { 2 } else { 1 },
         operation: "menu_update",
+        transport: link.native().then_some("native_bluetooth"),
         verification_scope: "immediate_complete_page_readback_and_fresh_cat_gateway_off",
         software_version: env!("CARGO_PKG_VERSION"),
         started_at_utc,
         finished_at_utc: OffsetDateTime::now_utc().format(&Rfc3339)?,
-        endpoint: Endpoint {
-            path: endpoint.path.clone(),
-            usb_vendor_id: endpoint.vid,
-            usb_product_id: endpoint.pid,
-            cat_baud: baud,
-        },
+        endpoint: link.report_endpoint(),
         source_backup: request.source_backup().to_owned(),
         workflow,
         signal_error,

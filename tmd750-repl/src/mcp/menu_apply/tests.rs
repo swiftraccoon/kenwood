@@ -13,18 +13,23 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kenwood_tmd750::protocol::mcp::{ACK, read_request, write_request};
-use kenwood_tmd750::transport::{KENWOOD_VID, SerialCandidate, TMD750_MAIN_PID, TMD750_PANEL_PID};
+use kenwood_tmd750::transport::{
+    DEFAULT_BAUD, KENWOOD_VID, SerialCandidate, TMD750_MAIN_PID, TMD750_PANEL_PID,
+};
 use kenwood_tmd750::{
     Address, FirmwareIdentity, Identity, MenuAssignment, MenuFieldSnapshot, MenuUpdatePlan, Page,
     PageReplacement, RadioModel, RadioType, SlotIndex,
 };
+use kenwood_transport::bluetooth::{BluetoothService, RfcommChannel};
 use kenwood_transport::{MockTransport, Transport, TransportError};
 use serde_json::Value;
 
 use super::{Captures, WorkflowResult, run_workflow};
 use crate::capture::{Recorder, create_private_file};
 use crate::mcp::ExitDisposition;
+use crate::mcp::link::{NativeLink, UsbLink};
 use crate::mcp::reconnect::{Backend, PostExit, VerificationOutcome, VerificationStage};
+use crate::native;
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;
 type TestResult = Result<(), TestError>;
@@ -37,6 +42,8 @@ enum Event {
     Close(usize),
     Dropped(usize),
     Enumerate,
+    /// A native backend wait, such as the hold after an exit.
+    Wait(Duration),
 }
 
 type Log = Arc<Mutex<Vec<Event>>>;
@@ -191,9 +198,10 @@ impl Proof {
     fn before_protocol(&self, id: usize, bytes: &[u8]) -> TestResult {
         let captured = records(&self.transcript(id))?;
         assert!(
-            captured
-                .iter()
-                .any(|record| kind(record) == Some("open_completed")),
+            captured.iter().any(|record| matches!(
+                kind(record),
+                Some("open_completed" | "native_open_completed")
+            )),
             "opening completion must be captured before protocol dispatch"
         );
         let request = captured.last().ok_or("protocol request not captured")?;
@@ -566,8 +574,7 @@ impl Harness {
     async fn run(&mut self) -> Result<WorkflowResult, TestError> {
         let endpoint = self.backend.endpoint.clone();
         Ok(run_workflow(
-            &mut self.backend,
-            &endpoint,
+            &mut UsbLink::new(&mut self.backend, &endpoint, DEFAULT_BAUD),
             &self.plan,
             self.captures
                 .take()
@@ -1045,5 +1052,120 @@ async fn panel_endpoint_gateway_mismatch_is_terminal_after_a_matched_tuple() -> 
         "Gateway mismatch does not imply written pages were restored"
     );
     assert_released(&harness.events()?, 2);
+    Ok(())
+}
+
+/// A native Bluetooth backend over the harness's scripted connections: every
+/// open is logged with its service, each reports RFCOMM channel 27, and every
+/// wait is logged.
+struct NativeBackend {
+    connections: VecDeque<Connection>,
+    log: Log,
+    opens: usize,
+    services: Vec<BluetoothService>,
+}
+
+impl native::Backend for NativeBackend {
+    type Connection = Connection;
+
+    async fn open(
+        &mut self,
+        endpoint: &native::Endpoint,
+        service: BluetoothService,
+        _cancelled: &AtomicBool,
+    ) -> Result<native::Opened<Connection>, native::OpenFailure> {
+        self.services.push(service);
+        let connection = self.connections.pop_front().ok_or_else(|| {
+            native::OpenFailure::from_error(&io::Error::other("no scripted native connection"))
+        })?;
+        append(&self.log, Event::Open(self.opens))
+            .map_err(|error| native::OpenFailure::from_error(&error))?;
+        self.opens += 1;
+        Ok(native::Opened {
+            connection,
+            resolved: native::Resolved {
+                address: endpoint.address.to_string(),
+                rfcomm_channel: 27,
+            },
+        })
+    }
+
+    async fn wait(&mut self, duration: Duration) {
+        let _logged = append(&self.log, Event::Wait(duration));
+    }
+}
+
+#[tokio::test]
+async fn native_update_holds_after_the_exit_and_reopens_the_pinned_channel() -> TestResult {
+    let mut harness = Harness::new(false)?;
+    let mut backend = NativeBackend {
+        connections: std::mem::take(&mut harness.backend.connections),
+        log: Arc::clone(&harness.backend.log),
+        opens: 0,
+        services: Vec::new(),
+    };
+    let endpoint = native::Endpoint {
+        address: "01:23:45:67:89:AB".parse()?,
+        helper: None,
+    };
+    let result = run_workflow(
+        &mut NativeLink::new(&mut backend, &endpoint),
+        &harness.plan,
+        harness
+            .captures
+            .take()
+            .ok_or("workflow captures already consumed")?,
+        &mut harness.journal,
+        &harness.cancelled,
+    )
+    .await;
+    assert!(result.succeeded(), "{result:?}");
+    let channel = RfcommChannel::new(27)?;
+    assert_eq!(
+        backend.services,
+        [
+            BluetoothService::SerialPort,
+            BluetoothService::FixedChannel(channel),
+        ]
+    );
+    let events = harness.events()?;
+    let exit = events
+        .iter()
+        .position(|event| *event == Event::Write(0, b"E".to_vec()))
+        .ok_or("exit missing")?;
+    let hold = events
+        .iter()
+        .position(|event| *event == Event::Wait(Duration::from_secs(5)))
+        .ok_or("hold missing")?;
+    let closed = events
+        .iter()
+        .position(|event| *event == Event::Close(0))
+        .ok_or("close missing")?;
+    assert!(
+        exit < hold && hold < closed,
+        "the connection is held after the exit and before the close"
+    );
+    assert_eq!(
+        writes(&events, 1),
+        [b"ID\r".as_slice(), b"FV\r", b"TY\r", b"GW\r"]
+    );
+    let evidence = serde_json::to_value(&result)?;
+    assert!(
+        evidence
+            .pointer("/opening/attempts")
+            .is_some_and(Value::is_array),
+        "{evidence}"
+    );
+    assert_eq!(
+        evidence.pointer("/post_exit/service"),
+        Some(&Value::from("fixed_previously_opened_channel")),
+        "{evidence}"
+    );
+    assert_eq!(
+        evidence.pointer("/post_exit/outcome/status"),
+        Some(&Value::from("matched")),
+        "{evidence}"
+    );
+    assert_released(&events, 2);
     Ok(())
 }

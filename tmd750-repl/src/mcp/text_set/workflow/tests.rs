@@ -10,13 +10,16 @@ use std::time::Duration;
 
 use kenwood_tmd750::memory::{Pm1Name, Pm1NameUpdate, TextFieldUpdateStatus};
 use kenwood_tmd750::protocol::mcp::{ACK, read_request, write_request};
-use kenwood_tmd750::transport::{KENWOOD_VID, TMD750_MAIN_PID, TMD750_PANEL_PID};
+use kenwood_tmd750::transport::{KENWOOD_VID, SerialCandidate, TMD750_MAIN_PID, TMD750_PANEL_PID};
 use kenwood_tmd750::{Address, FirmwareIdentity, Identity, Page, RadioModel, RadioType};
+use kenwood_transport::bluetooth::{BluetoothService, RfcommChannel};
 use kenwood_transport::{MockTransport, Transport, TransportError};
 
 use super::*;
 use crate::capture::{Artifacts, CaptureKind, create_private_file};
-use crate::mcp::reconnect::{SETTLE_QUIET, VerificationOutcome, VerificationStage};
+use crate::mcp::link::{NativeLink, UsbLink};
+use crate::mcp::reconnect::{Backend, SETTLE_QUIET, VerificationOutcome, VerificationStage};
+use crate::native;
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;
 type TestResult = Result<(), TestError>;
@@ -28,6 +31,8 @@ enum Event {
     Close(usize),
     Dropped(usize),
     Enumerate,
+    /// A native backend wait, such as the hold after an exit.
+    Wait(Duration),
 }
 
 type Log = Arc<Mutex<Vec<Event>>>;
@@ -483,9 +488,7 @@ impl Harness {
     async fn run(&mut self) -> Result<WorkflowResult, TestError> {
         let endpoint = self.backend.endpoint.clone();
         Ok(run(
-            &mut self.backend,
-            &endpoint,
-            9600,
+            &mut UsbLink::new(&mut self.backend, &endpoint, 9600),
             &mut self.update,
             &mut self.journal,
             self.captures.take().ok_or("workflow already run")?,
@@ -1108,6 +1111,345 @@ async fn failed_durable_session_evidence_blocks_finalization_and_following_sessi
     assert!(
         records.iter().all(|record| record.kind != "finished"),
         "failed session synchronization must never be followed by a finished record"
+    );
+    Ok(())
+}
+
+/// A native Bluetooth backend over scripted connections: every open is
+/// logged with its service, each reports RFCOMM channel 27, and every wait
+/// is logged.
+struct NativeBackend {
+    connections: VecDeque<Connection>,
+    log: Log,
+    opens: usize,
+    services: Vec<BluetoothService>,
+}
+
+impl native::Backend for NativeBackend {
+    type Connection = Connection;
+
+    async fn open(
+        &mut self,
+        endpoint: &native::Endpoint,
+        service: BluetoothService,
+        _cancelled: &AtomicBool,
+    ) -> Result<native::Opened<Connection>, native::OpenFailure> {
+        self.services.push(service);
+        let connection = self.connections.pop_front().ok_or_else(|| {
+            native::OpenFailure::from_error(&io::Error::other("no scripted native connection"))
+        })?;
+        append(&self.log, Event::Open(self.opens))
+            .map_err(|error| native::OpenFailure::from_error(&error))?;
+        self.opens += 1;
+        Ok(native::Opened {
+            connection,
+            resolved: native::Resolved {
+                address: endpoint.address.to_string(),
+                rfcomm_channel: 27,
+            },
+        })
+    }
+
+    async fn wait(&mut self, duration: Duration) {
+        let _logged = append(&self.log, Event::Wait(duration));
+    }
+}
+
+/// One session over native Bluetooth: `gateway` answers the pre-entry `GW`,
+/// and only Gateway Off reaches the MCP session of `mcp_script`.
+fn native_mcp_script(
+    update: &Pm1NameUpdate,
+    apply: bool,
+    gateway: &[u8],
+) -> Result<MockTransport, TestError> {
+    let mut mock = MockTransport::new();
+    mock.expect(b"GW\r", gateway);
+    if gateway != b"GW 0\r" {
+        return Ok(mock);
+    }
+    mock.expect(b"ID\r", b"ID TM-D750\r");
+    mock.expect(b"FV\r", b"FV 1.02\r");
+    mock.expect(b"TY\r", b"TY K,2,1\r");
+    mock.expect(b"0M PROGRAM\r", b"0M\r");
+    read(&mut mock, Page::new(Address::new(8)?, 40)?, &[0; 40]);
+    read(
+        &mut mock,
+        update.page(),
+        if apply {
+            update.original_page()
+        } else {
+            update.desired_page()
+        },
+    );
+    if apply {
+        mock.expect(&frame(update.page(), update.desired_page()), &[ACK]);
+        read(&mut mock, update.page(), update.desired_page());
+    }
+    mock.expect(b"E", &[ACK]);
+    Ok(mock)
+}
+
+/// The native post-exit check: the identity tuple, then Gateway Off.
+fn native_fresh_script() -> MockTransport {
+    let mut mock = identity_script("1.02");
+    mock.expect(b"GW\r", b"GW 0\r");
+    mock
+}
+
+struct NativeHarness {
+    _directory: tempfile::TempDir,
+    update: Pm1NameUpdate,
+    backend: NativeBackend,
+    journal: UpdateJournal,
+    captures: Option<[SessionCaptures; 2]>,
+    cancelled: AtomicBool,
+}
+
+impl NativeHarness {
+    /// Scripted native connections, in open order, from `scripts`.
+    fn new(
+        scripts: impl FnOnce(&Pm1NameUpdate) -> Result<Vec<MockTransport>, TestError>,
+    ) -> Result<Self, TestError> {
+        let directory = tempfile::tempdir()?;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+        let update = update()?;
+        let capture_failed = Arc::new(AtomicBool::new(false));
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let proof = Arc::new(JournalProof {
+            path: directory.path().join("update-journal.jsonl"),
+            original: update.original_page().to_vec(),
+            desired: update.desired_page().to_vec(),
+        });
+        let connections = scripts(&update)?
+            .into_iter()
+            .enumerate()
+            .map(|(id, mock)| Connection {
+                id,
+                mock,
+                log: Arc::clone(&log),
+                journal: Arc::clone(&proof),
+                fail_close: false,
+                cancel_on_memory_write: None,
+            })
+            .collect();
+        let mut captures = Vec::new();
+        for phase in 0..2 {
+            let artifacts = Artifacts::create(
+                CaptureKind::Mcp,
+                Some(&directory.path().join(format!("session-{phase}"))),
+                Arc::clone(&capture_failed),
+            )?;
+            let post_exit = artifacts.reserve_post_exit(Arc::clone(&capture_failed))?;
+            captures.push(SessionCaptures {
+                original: artifacts.transcript,
+                post_exit,
+            });
+        }
+        let mut journal = UpdateJournal::create(directory.path(), Arc::clone(&capture_failed))?;
+        journal.prepare(&update, &directory.path().join("source-backup.json"))?;
+        Ok(Self {
+            _directory: directory,
+            update,
+            backend: NativeBackend {
+                connections,
+                log,
+                opens: 0,
+                services: Vec::new(),
+            },
+            journal,
+            captures: Some(
+                captures
+                    .try_into()
+                    .map_err(|_| "exactly two capture sets required")?,
+            ),
+            cancelled: AtomicBool::new(false),
+        })
+    }
+
+    /// Run both sessions, returning whether the workflow succeeded and its
+    /// serialized evidence.
+    async fn run(&mut self) -> Result<(bool, serde_json::Value), TestError> {
+        let endpoint = native::Endpoint {
+            address: "01:23:45:67:89:AB".parse()?,
+            helper: None,
+        };
+        let result = run(
+            &mut NativeLink::new(&mut self.backend, &endpoint),
+            &mut self.update,
+            &mut self.journal,
+            self.captures.take().ok_or("workflow already run")?,
+            &self.cancelled,
+        )
+        .await;
+        Ok((
+            result.succeeded(&self.update),
+            serde_json::to_value(&result)?,
+        ))
+    }
+
+    fn events(&self) -> Result<Vec<Event>, TestError> {
+        Ok(self
+            .backend
+            .log
+            .lock()
+            .map_err(|_| "test log poisoned")?
+            .clone())
+    }
+}
+
+fn nth_position(events: &[Event], value: &Event, nth: usize) -> Result<usize, TestError> {
+    events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| *event == value)
+        .nth(nth)
+        .map(|(index, _)| index)
+        .ok_or_else(|| format!("{value:?} occurrence {nth} missing").into())
+}
+
+#[tokio::test]
+async fn native_update_pins_the_channel_holds_after_each_exit_and_requires_gateway_off()
+-> TestResult {
+    let mut harness = NativeHarness::new(|update| {
+        Ok(vec![
+            native_mcp_script(update, true, b"GW 0\r")?,
+            native_fresh_script(),
+            native_mcp_script(update, false, b"GW 0\r")?,
+            native_fresh_script(),
+        ])
+    })?;
+    let (succeeded, evidence) = harness.run().await?;
+    assert!(succeeded, "{evidence}");
+    assert_eq!(
+        harness.update.status(),
+        TextFieldUpdateStatus::VerifiedAcrossSessions
+    );
+    let channel = RfcommChannel::new(27)?;
+    assert_eq!(
+        harness.backend.services,
+        [
+            BluetoothService::SerialPort,
+            BluetoothService::FixedChannel(channel),
+            BluetoothService::FixedChannel(channel),
+            BluetoothService::FixedChannel(channel),
+        ],
+        "only the first open queries the service; later opens pin its channel"
+    );
+    let events = harness.events()?;
+    assert_eq!(memory_writes(&events), 1);
+    let hold = Event::Wait(Duration::from_secs(5));
+    for (session, connection) in [(0, 0), (1, 2)] {
+        let exit = position(&events, &Event::Write(connection, b"E".to_vec()))?;
+        let waited = nth_position(&events, &hold, session)?;
+        let closed = position(&events, &Event::Close(connection))?;
+        assert!(
+            exit < waited && waited < closed,
+            "session {session} must hold its connection after the exit and before the close"
+        );
+        assert_eq!(
+            writes(&events, connection).first(),
+            Some(&b"GW\r".as_slice()),
+            "Gateway Off is checked before programming entry"
+        );
+        assert_eq!(
+            writes(&events, connection + 1),
+            [b"ID\r".as_slice(), b"FV\r", b"TY\r", b"GW\r"],
+            "the fresh check reads the identity tuple, then Gateway Off"
+        );
+    }
+    for session in [0, 1] {
+        let recorded = at(&evidence, &format!("/sessions/{session}"))?;
+        assert_eq!(at(recorded, "/gateway_before/state")?, "off", "{recorded}");
+        assert!(at(recorded, "/opening/attempts")?.is_array(), "{recorded}");
+        assert_eq!(
+            at(recorded, "/post_exit/service")?,
+            "fixed_previously_opened_channel"
+        );
+        assert_eq!(at(recorded, "/post_exit/outcome/status")?, "matched");
+        let deadline = at(recorded, "/post_exit/first_reply_timeout_milliseconds")?
+            .as_u64()
+            .ok_or("first-reply deadline is not a count")?;
+        assert!(
+            (29_000..=30_000).contains(&deadline),
+            "an immediate reconnect waits until 30 s after the exit: {deadline}"
+        );
+    }
+    Ok(())
+}
+
+/// The value at JSON `pointer` in `value`.
+fn at<'a>(value: &'a serde_json::Value, pointer: &str) -> Result<&'a serde_json::Value, TestError> {
+    value
+        .pointer(pointer)
+        .ok_or_else(|| format!("{pointer} missing from {value}").into())
+}
+
+#[tokio::test]
+async fn native_update_refuses_programming_entry_unless_gateway_is_off() -> TestResult {
+    let mut harness =
+        NativeHarness::new(|update| Ok(vec![native_mcp_script(update, true, b"GW 2\r")?]))?;
+    let (succeeded, evidence) = harness.run().await?;
+    assert!(!succeeded, "{evidence}");
+    assert_eq!(harness.update.status(), TextFieldUpdateStatus::NotWritten);
+    let events = harness.events()?;
+    assert_eq!(writes(&events, 0), [b"GW\r".as_slice()]);
+    assert_eq!(memory_writes(&events), 0);
+    assert!(
+        !events.iter().any(|event| matches!(event, Event::Wait(_))),
+        "no hold without a programming exit"
+    );
+    let session = at(&evidence, "/sessions/0")?;
+    assert_eq!(
+        at(session, "/gateway_before/state")?,
+        "terminal",
+        "{session}"
+    );
+    assert!(at(session, "/admission_error")?.is_object(), "{session}");
+    assert_eq!(
+        at(session, "/post_exit/outcome/reason")?,
+        "original_admission_failed"
+    );
+    assert_eq!(
+        at(&evidence, "/sessions")?.as_array().map(Vec::len),
+        Some(1),
+        "a refused session is not followed by another"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_reopen_failure_after_the_write_leaves_the_update_possibly_changed() -> TestResult {
+    let mut harness =
+        NativeHarness::new(|update| Ok(vec![native_mcp_script(update, true, b"GW 0\r")?]))?;
+    let (succeeded, evidence) = harness.run().await?;
+    assert!(!succeeded, "{evidence}");
+    assert_eq!(
+        harness.update.status(),
+        TextFieldUpdateStatus::PossiblyChanged
+    );
+    assert_eq!(memory_writes(&harness.events()?), 1);
+    assert_eq!(
+        harness.backend.services.first(),
+        Some(&BluetoothService::SerialPort)
+    );
+    let channel = RfcommChannel::new(27)?;
+    assert!(
+        harness
+            .backend
+            .services
+            .iter()
+            .skip(1)
+            .all(|service| *service == BluetoothService::FixedChannel(channel)),
+        "the reopen uses only the pinned channel: {:?}",
+        harness.backend.services
+    );
+    let post_exit = at(&evidence, "/sessions/0/post_exit")?;
+    assert_eq!(at(post_exit, "/outcome/status")?, "failed", "{post_exit}");
+    assert_eq!(at(post_exit, "/outcome/stage")?, "open", "{post_exit}");
+    assert_eq!(
+        at(&evidence, "/sessions")?.as_array().map(Vec::len),
+        Some(1),
+        "an unverified write is not followed by the confirmation session"
     );
     Ok(())
 }

@@ -130,11 +130,15 @@ fn closed_output_pipe_exits_unsuccessfully_without_panicking_or_discovery() -> T
 }
 
 #[test]
-fn unsupported_native_operations_stop_before_helper_validation_or_capture() -> TestResult {
+fn native_writes_refuse_before_helper_validation_or_capture() -> TestResult {
+    // macOS reads the backup first; every other host refuses native
+    // Bluetooth before reading it.
+    let expected = if cfg!(target_os = "macos") {
+        "/not/a/backup"
+    } else {
+        "native Bluetooth is currently available only on macOS"
+    };
     for command in [
-        vec!["mcp", "reentry-probe", "--approve-live-test"],
-        vec!["dstar", "probe"],
-        vec!["dstar", "probe", "--approve-live-test"],
         vec![
             "mcp",
             "menu",
@@ -142,8 +146,10 @@ fn unsupported_native_operations_stop_before_helper_validation_or_capture() -> T
             "--backup",
             "/not/a/backup",
             "--apply",
-            "beep",
-            "1",
+            "--slot",
+            "0",
+            "radio.Beep",
+            "true",
         ],
         vec![
             "mcp",
@@ -157,6 +163,34 @@ fn unsupported_native_operations_stop_before_helper_validation_or_capture() -> T
             "pm-name-1",
             "NEW",
         ],
+    ] {
+        let directory = tempfile::tempdir()?;
+        let result = Command::new(env!("CARGO_BIN_EXE_tmd750-repl"))
+            .current_dir(directory.path())
+            .args([
+                "--bluetooth-address",
+                "01:23:45:67:89:AB",
+                "--bluetooth-helper",
+                "/not/a/native/helper",
+            ])
+            .args(&command)
+            .output()?;
+        assert!(!result.status.success(), "{command:?}: {result:?}");
+        let stderr = String::from_utf8(result.stderr)?;
+        assert!(stderr.contains(expected), "{stderr}");
+        assert!(!stderr.contains("native Bluetooth supports"), "{stderr}");
+        assert!(!stderr.contains("/not/a/native/helper"), "{stderr}");
+        assert_eq!(std::fs::read_dir(directory.path())?.count(), 0);
+    }
+    Ok(())
+}
+
+#[test]
+fn unsupported_native_operations_stop_before_helper_validation_or_capture() -> TestResult {
+    for command in [
+        vec!["mcp", "reentry-probe", "--approve-live-test"],
+        vec!["dstar", "probe"],
+        vec!["dstar", "probe", "--approve-live-test"],
         vec![
             "mcp",
             "my1-trial",
