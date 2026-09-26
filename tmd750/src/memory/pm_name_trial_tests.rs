@@ -52,7 +52,7 @@ fn fresh(fixture: &mut Fixture, session: u64, changed: bool) -> TestResult {
 }
 
 fn intent(fixture: &mut Fixture, write: PmNameTrialWrite) -> TestResult {
-    fixture.trial.record(PmNameTrialEvent::DurableWriteIntent {
+    fixture.trial.record(PmNameTrialEvent::IntentJournaled {
         id: connection(match write {
             PmNameTrialWrite::Rename => 11,
             PmNameTrialWrite::Restore => 12,
@@ -323,7 +323,7 @@ fn restoration_is_verified_only_after_all_three_independent_finalized_sessions()
         Err(PmNameTrialError::TerminalState)
     );
     assert_eq!(
-        fixture.trial.record(PmNameTrialEvent::DurableWriteIntent {
+        fixture.trial.record(PmNameTrialEvent::IntentJournaled {
             id: connection(13)?,
             write: PmNameTrialWrite::Rename,
         }),
@@ -424,7 +424,7 @@ fn both_persistence_sessions_compare_every_byte_before_advancing() -> TestResult
             );
             assert_eq!(fixture.trial.status(), PmNameTrialStatus::PossiblyChanged);
             assert_eq!(
-                fixture.trial.record(PmNameTrialEvent::DurableWriteIntent {
+                fixture.trial.record(PmNameTrialEvent::IntentJournaled {
                     id: connection(12)?,
                     write: PmNameTrialWrite::Restore,
                 }),
@@ -488,7 +488,7 @@ fn every_session_requires_new_matching_identity_format_and_full_page() -> TestRe
 }
 
 #[test]
-fn readback_requires_a_prior_durable_intent_and_intents_cannot_be_reordered() -> TestResult {
+fn readback_requires_a_prior_journaled_intent_and_intents_cannot_be_reordered() -> TestResult {
     let mut missing_intent = fixture()?;
     fresh(&mut missing_intent, 1, false)?;
     assert_eq!(
@@ -504,7 +504,7 @@ fn readback_requires_a_prior_durable_intent_and_intents_cannot_be_reordered() ->
     assert_eq!(
         early_intent
             .trial
-            .record(PmNameTrialEvent::DurableWriteIntent {
+            .record(PmNameTrialEvent::IntentJournaled {
                 id: connection(11)?,
                 write: PmNameTrialWrite::Rename,
             }),
@@ -515,7 +515,7 @@ fn readback_requires_a_prior_durable_intent_and_intents_cannot_be_reordered() ->
     assert_eq!(
         wrong_intent
             .trial
-            .record(PmNameTrialEvent::DurableWriteIntent {
+            .record(PmNameTrialEvent::IntentJournaled {
                 id: connection(11)?,
                 write: PmNameTrialWrite::Restore,
             }),
@@ -526,7 +526,7 @@ fn readback_requires_a_prior_durable_intent_and_intents_cannot_be_reordered() ->
 }
 
 #[test]
-fn repeated_sessions_and_durable_intents_are_rejected_without_stale_restore() -> TestResult {
+fn repeated_sessions_and_journaled_intents_are_rejected_without_stale_restore() -> TestResult {
     for session in [2, 3] {
         let mut fixture = fixture()?;
         if session == 2 {
@@ -553,7 +553,7 @@ fn repeated_sessions_and_durable_intents_are_rejected_without_stale_restore() ->
     renamed(&mut fixture)?;
     fresh(&mut fixture, 2, true)?;
     assert_eq!(
-        fixture.trial.record(PmNameTrialEvent::DurableWriteIntent {
+        fixture.trial.record(PmNameTrialEvent::IntentJournaled {
             id: connection(11)?,
             write: PmNameTrialWrite::Restore,
         }),

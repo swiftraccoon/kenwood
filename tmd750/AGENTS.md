@@ -43,10 +43,12 @@
   back. Wire domains were established by writing every value and observing
   the rejection of the next; a value label the radio did not confirm is marked
   in the type's doc, not asserted: `PC` High/Medium/Low order, `DL` dual/single,
-  `LC` values, `MD 3` as NFM, tone and DCS table index basis.
+  `LC` values, `MD 3` as NFM, tone and DCS table index basis. `FQ` outside a
+  band's ranges is never `N`: the radio tunes and echoes a nearby in-range
+  frequency, so `set_frequency` errs after the VFO moved.
 - Never send `TX`, `RX`, `BE`, `PS 0`, `TN`, `VX` or `GP 0,x`-style GPS-off
   writes from library code; `VX` and `TN` are read-only types with
-  `Unqualified` variants. A `BT 1` echo takes about 1.6 s, so `SetBluetooth`
+  `Unnamed` variants. A `BT 1` echo takes about 1.6 s, so `SetBluetooth`
   keeps at least `BLUETOOTH_WRITE_TIMEOUT`.
 - `MD` values: 0 FM, 1 DV, 2 AM, 3 NFM, 4 DR (read only; `MD band,4` is `N`).
   `VM band,3` selects DR. `ME` and `MR` take three-character selectors;
@@ -68,9 +70,9 @@
   `My1CallsignUpdate`) is separate: an MCP write to it left `DC 1` unset.
   `CS` is the registry field `aprs.MyCallsign` (`0x50700`, NUL padded).
 - Native Bluetooth holds a connection's first reply until about 5 s after the
-  previous close, or 20 to 22 s after an MCP exit ACK, and never drops it. Via
-  `Radio::set_next_reply_timeout`: `BLUETOOTH_FIRST_REPLY_TIMEOUT`, or after an
-  exit `bluetooth_first_reply_timeout_after_exit`; never a longer regular one.
+  previous close, or 20 to 22 s after an MCP exit ACK, and never drops it.
+  Construct with `Radio::new_bluetooth`, or after an exit
+  `Radio::new_bluetooth_after_exit`; never a longer regular deadline.
 
 ## Memory channel storage (image layout, verified on firmware 1.02)
 
@@ -82,9 +84,9 @@
 - Verified by writing channels over CAT with every tone mode, both shift
   directions, split, reverse and lockout, reading the pages through
   `McpSession::read_page`, and decoding them to the same records; then
-  clearing them. Not established: the band code bits (values 0x01, 0x02,
-  0x04, 0x05, 0x08 observed), the tone/CTCSS index basis, the name charset
-  beyond ASCII, and the CALL channel slots.
+  clearing them. The band code is a receive-frequency segment, not bits
+  (samples in `BandCode`'s doc). Not established: the segment edges, the
+  tone/CTCSS index basis, the name charset beyond ASCII, the CALL slots.
 - `UP`/`DW` act on the control band (first `BC` field) and take no argument;
   selecting a step rounds the VFO down to a multiple of it. The radio
   acknowledges `UP`/`DW` in about 3 ms, shows the new frequency on the next
@@ -99,8 +101,7 @@
 ## API contracts
 
 - `McpSession::exit` is the only exit API: one `E`/ACK, then no baud change,
-  reconnect, retry or CAT on that handle; the caller closes and drops the
-  transport.
+  reconnect, retry or CAT on that handle; the caller closes and drops it.
 - Exit retires the handle's protocol state, so further managed traffic returns
   `McpError::ConnectionRetired`; an incomplete exchange returns
   `McpError::RecoveryRequired` instead and prohibits exit.
@@ -135,8 +136,8 @@
   caller opens any MCP session on that endpoint only after it has stayed
   enumerated for about 10 s; every REPL MCP entry on that endpoint does.
 - `MenuUpdatePlan` has hardware coverage in PM Off over panel USB for one field
-  of every storage kind it admits, a slot-1 write and a two-page plan (field
-  list in the README). The image stores `gps.MyPositionSelect` as 0 to 4 for
+  of every storage kind it admits, a per-slot write in each of slots 1 to 5
+  and a two-page plan (field list in the README). The image stores `gps.MyPositionSelect` as 0 to 4 for
   My Position 1 to 5 and 5 for GPS; CAT `MS` uses 0 for GPS and 1 to 5. A
   field with a CAT mirror is qualified that way; one without needs a backup
   comparison that changed the field's bytes only, then none.
@@ -153,19 +154,20 @@
   and restoration; it sends CAT, MCP and MMDVM frames and enforces the order,
   but opens no endpoint and writes no file. The caller implements three traits:
   `ControlHost` (serial CAT/MCP endpoint), `ModemHost` (modem link open and
-  reopen), and `TerminalJournal` (durable backup, plan, pre-write intent and
-  checkpoint). The two model MCP engines stay separate; this is TM-D750 only.
+  reopen), and `TerminalJournal` (synchronized records of the backup, plan,
+  pre-write intent and checkpoint). The two model MCP engines stay separate;
+  this is TM-D750 only.
 - Gateway Off writes the Terminal pages over the modem link; an active Terminal
   route writes over the control endpoint and never sends the modem link CAT.
-  `program_terminal` refuses any target other than the exact qualified identity,
+  `program_terminal` refuses any identity that fails `Identity::is_write_target`,
   requires the fresh Gateway to equal the observed one, records intent before
   each write, and acknowledges exactly one exit. The checkpoint records only a
   pass that entered MCP.
 - `TerminalRecovery::finish` rewrites the reverse plan only when the modem
   connection was confirmed closed; otherwise the report is `Blocked`. It runs
-  `verify_readiness` before and after the reverse write and verifies the
-  restored identity and Gateway on a fresh connection before reporting
-  `Verified`. `verify_readiness` waits `SETTLE`, re-enumerates the pinned
+  `verify_readiness`, `await_settled` before programming entry, then
+  `verify_readiness` reading the restored `GW` on the connection whose identity
+  matched. `verify_readiness` waits `SETTLE`, re-enumerates the pinned
   endpoint, and retries only an entirely silent `ID` timeout within its budget
   and attempt cap; `observe_control` opens once and sends no reboot wait.
 - `TerminalLifecycle` and `verify_readiness` never reopen a serial endpoint;
@@ -193,6 +195,5 @@ cargo run -p mcp-d75-extract -- extract --model tmd750 \
 - `MockTransport` scripting: one `expect(write, reply)` per `write()` call, in
   order. The session sends a write header and its data as ONE write, so script
   the concatenated frame. A queued reply is delivered in as many `read()`
-  chunks as the caller asks for, with remainders re-queued. `expect_hang`
-  scripts a timeout; `assert_complete()` proves every scripted exchange was
-  consumed.
+  chunks as the caller asks for, remainders re-queued. `expect_hang` scripts a
+  timeout; `assert_complete()` proves every scripted exchange was consumed.

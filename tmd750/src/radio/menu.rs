@@ -260,15 +260,16 @@ impl<T: Transport> McpSession<'_, T> {
     ///
     /// Composes snapshot planning with [`Self::compare_exchange_pages`]. Every
     /// expected page is freshly compared before the first write. The fallible
-    /// callback must durably retain each complete before/after image before W.
-    /// No-op pages are compared but never written. This is not a firmware-atomic
-    /// transaction; partial write risk remains in the session journal.
+    /// callback must write and synchronize a journal record of each complete
+    /// before/after image before W. No-op pages are compared but never written.
+    /// This is not a firmware-atomic transaction; partial write risk remains in
+    /// the session journal.
     ///
     /// # Errors
     ///
     /// Returns incomplete snapshot coverage, schema-target, stale-page,
-    /// durable-intent, or MCP exchange/readback errors. No automatic rollback,
-    /// retry, exit, or reconnection occurs.
+    /// [`McpError::IntentJournal`], or MCP exchange/readback errors. No
+    /// automatic rollback, retry, exit, or reconnection occurs.
     pub async fn compare_exchange_menu_patches(
         &mut self,
         patches: &PatchSet,

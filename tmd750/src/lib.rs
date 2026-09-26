@@ -26,14 +26,14 @@ pub use radio::pm_name_trial::{
     PmNameTrialSessionError, PmNameTrialSessionOutcome, PmNameTrialSessionReport,
     PmNameTrialSessionStage, PmNameTrialWriteDisposition,
 };
-pub use radio::programming::{McpCompareExchangeReport, PageReplacement};
-pub use radio::qualification::{
+pub use radio::probe::{
     McpGatewayOffProbeReport, McpProbeExit, McpProbeOutcome, McpProbeReport, McpProbeSegment,
     McpProbeStage,
 };
+pub use radio::programming::{McpCompareExchangeReport, PageReplacement};
 pub use radio::readiness::{
-    ControlHost, ControlStage, ObservationReport, ReadinessReport, SystemControlHost,
-    observe_control, verify_readiness,
+    ControlHost, ControlStage, ObservationReport, ReadinessReport, SettleReport, SystemControlHost,
+    await_settled, observe_control, verify_readiness,
 };
 pub use radio::terminal::lifecycle::{
     LifecycleError, RestorationError, RestorationReport, RestorationState, TerminalLifecycle,

@@ -87,7 +87,7 @@ fn apply(fixture: &mut Fixture) -> TestResult {
         .record(fixture.captured.fresh(Session::Apply, identifier(1)?))?;
     fixture
         .trial
-        .record(TerminalExitTrialEvent::DurableWriteIntent {
+        .record(TerminalExitTrialEvent::IntentJournaled {
             id: identifier(11)?,
         })?;
     fixture
@@ -528,7 +528,7 @@ fn active_expectation_does_not_accept_the_off_baseline_as_a_fresh_active_page() 
     assert_eq!(
         fixture
             .trial
-            .record(TerminalExitTrialEvent::DurableWriteIntent {
+            .record(TerminalExitTrialEvent::IntentJournaled {
                 id: identifier(11)?
             }),
         Err(TerminalExitTrialError::TerminalState)
@@ -549,7 +549,7 @@ fn completion_requires_one_intent_and_two_finalized_off_verified_sessions() -> T
     );
     fixture
         .trial
-        .record(TerminalExitTrialEvent::DurableWriteIntent {
+        .record(TerminalExitTrialEvent::IntentJournaled {
             id: identifier(11)?,
         })?;
     assert_eq!(
@@ -607,7 +607,7 @@ fn intent_and_readback_cannot_be_recorded_before_a_full_fresh_match() -> TestRes
     for intent in [false, true] {
         let mut fixture = fixture()?;
         let event = if intent {
-            TerminalExitTrialEvent::DurableWriteIntent {
+            TerminalExitTrialEvent::IntentJournaled {
                 id: identifier(11)?,
             }
         } else {
@@ -646,7 +646,7 @@ fn immediate_readback_requires_every_off_byte_and_exact_length() -> TestResult {
             .record(fixture.captured.fresh(Session::Apply, identifier(1)?))?;
         fixture
             .trial
-            .record(TerminalExitTrialEvent::DurableWriteIntent {
+            .record(TerminalExitTrialEvent::IntentJournaled {
                 id: identifier(11)?,
             })?;
         *fixture
@@ -672,7 +672,7 @@ fn immediate_readback_requires_every_off_byte_and_exact_length() -> TestResult {
             .record(fixture.captured.fresh(Session::Apply, identifier(1)?))?;
         fixture
             .trial
-            .record(TerminalExitTrialEvent::DurableWriteIntent {
+            .record(TerminalExitTrialEvent::IntentJournaled {
                 id: identifier(11)?,
             })?;
         assert_eq!(
@@ -701,7 +701,7 @@ fn finalization_requires_matching_session_new_identity_and_gateway_off() -> Test
             if session == Session::Apply {
                 fixture
                     .trial
-                    .record(TerminalExitTrialEvent::DurableWriteIntent {
+                    .record(TerminalExitTrialEvent::IntentJournaled {
                         id: identifier(11)?,
                     })?;
                 fixture
@@ -751,7 +751,7 @@ fn premature_finalization_and_verification_write_are_permanently_refused() -> Te
         if after_intent {
             fixture
                 .trial
-                .record(TerminalExitTrialEvent::DurableWriteIntent {
+                .record(TerminalExitTrialEvent::IntentJournaled {
                     id: identifier(11)?,
                 })?;
         }
@@ -777,7 +777,7 @@ fn premature_finalization_and_verification_write_are_permanently_refused() -> Te
     assert_eq!(
         fixture
             .trial
-            .record(TerminalExitTrialEvent::DurableWriteIntent {
+            .record(TerminalExitTrialEvent::IntentJournaled {
                 id: identifier(12)?
             }),
         Err(TerminalExitTrialError::UnexpectedEvent)
@@ -802,13 +802,13 @@ fn duplicate_session_and_intent_identifiers_are_refused() -> TestResult {
         .record(fixture.captured.fresh(Session::Apply, identifier(1)?))?;
     fixture
         .trial
-        .record(TerminalExitTrialEvent::DurableWriteIntent {
+        .record(TerminalExitTrialEvent::IntentJournaled {
             id: identifier(11)?,
         })?;
     assert_eq!(
         fixture
             .trial
-            .record(TerminalExitTrialEvent::DurableWriteIntent {
+            .record(TerminalExitTrialEvent::IntentJournaled {
                 id: identifier(11)?
             }),
         Err(TerminalExitTrialError::ReusedWriteIntent)
@@ -827,7 +827,7 @@ fn explicit_halt_preserves_conservative_status_and_never_restarts() -> TestResul
                 .record(fixture.captured.fresh(Session::Apply, identifier(1)?))?;
             fixture
                 .trial
-                .record(TerminalExitTrialEvent::DurableWriteIntent {
+                .record(TerminalExitTrialEvent::IntentJournaled {
                     id: identifier(11)?,
                 })?;
         }

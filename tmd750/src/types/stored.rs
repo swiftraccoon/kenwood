@@ -484,10 +484,15 @@ impl StoredChannel {
 
 /// The band code in flag byte zero of a stored channel.
 ///
-/// `0xFF` marks an empty slot. Observed stored values: `0x01` on the radio's
-/// own 144.390 MHz channel, `0x05` on CAT-written 2 m channels, `0x04` at
-/// 121.500 MHz, `0x02` at 223.500 MHz and `0x08` at 446.000 MHz. Their
-/// bit meanings are not established, so the byte is retained exactly.
+/// `0xFF` marks an empty slot. On firmware 1.02 the code names the receive
+/// frequency's segment, whichever band stored the channel, and is not a bit
+/// field: `0x04` at 108.000, 118.000 and 121.500 MHz, `0x05` at 136.000,
+/// 145.200 and 162.550 MHz, `0x06` at 174.000 and 200.000 MHz, `0x02` at
+/// 216.000 and 223.500 MHz, `0x07` at 260.000 and 300.000 MHz, `0x08` at
+/// 410.000 and 446.000 MHz, and `0x09` at 470.000, 500.000 and 523.000 MHz
+/// for channels stored over CAT; the radio's own 144.390 MHz APRS channel
+/// holds `0x01`. The segment edges between those samples are not
+/// established, so the byte is retained exactly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BandCode(u8);
 

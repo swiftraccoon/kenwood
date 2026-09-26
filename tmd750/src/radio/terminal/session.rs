@@ -4,9 +4,10 @@
 //! Entry reads a fresh backup, plans the requested route, and writes the
 //! changed pages; restoration writes an already-derived reverse plan without a
 //! second backup. Both compare every complete page against a fresh read before
-//! the first write, record durable intent before each write, read each written
-//! page back, and then acknowledge one MCP exit. The journal sink owns its own
-//! durability; this session owns the protocol order and the safety checks.
+//! the first write, journal the intent before each write, read each written
+//! page back, and then acknowledge one MCP exit. The journal sink writes and
+//! synchronizes its records; this session enforces the protocol order and the
+//! comparisons.
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,13 +31,14 @@ pub enum TerminalPhase {
     Restore,
 }
 
-/// The durable record one programming pass writes as it proceeds.
+/// The journal one programming pass writes as it proceeds.
 ///
-/// Every method must make its record durable before returning `Ok`; the
-/// session treats a returned error as a failure to record and sends no write
-/// that the record was meant to precede. The sink is free to synchronize a
+/// Every method must write and synchronize its record before returning `Ok`;
+/// the session treats a returned error as a failure to record and sends no
+/// write that the record was meant to precede. The sink may synchronize a
 /// separate wire transcript inside [`Self::before_write`] before recording the
-/// page, so an interrupted write is always preceded by a durable intent.
+/// page, so an interrupted write is always preceded by its synchronized intent
+/// record.
 pub trait TerminalJournal {
     /// Record the complete backup pages read before entry planning.
     ///
@@ -170,9 +172,9 @@ pub enum TerminalOperationError {
     /// Cancellation was honored before any write intent was recorded.
     #[error("Terminal programming cancelled before any write")]
     Cancelled,
-    /// The fresh identity is not the exact qualified target, or differs from
+    /// The fresh identity fails [`Identity::is_write_target`] or differs from
     /// the expected identity.
-    #[error("fresh identity {actual} is not the expected qualified target")]
+    #[error("fresh identity {actual} is not the expected TM-D750 / 1.02 / K,2,1 target")]
     Identity {
         /// The identity the connection reported.
         actual: Identity,
@@ -206,8 +208,8 @@ pub enum TerminalOperationError {
 
 /// Run one MCP programming pass for `request`, recording through `journal`.
 ///
-/// The radio is identified fresh and must be the exact qualified target and
-/// equal to `expected`; its Gateway must equal `gateway` and be Off or
+/// The radio is identified fresh and must pass [`Identity::is_write_target`]
+/// and equal `expected`; its Gateway must equal `gateway` and be Off or
 /// Terminal. Entry reads the canonical backup pages, records them, plans the
 /// route, records the plan, then compares and writes; restoration writes the
 /// supplied reverse plan without a backup. Each changed page's intent is
@@ -356,15 +358,15 @@ async fn read_backup<T: Transport>(
     Ok(MenuFieldSnapshot::from_pages(pages).map_err(Error::from)?)
 }
 
-/// Identify the radio fresh and require the exact qualified expected target
-/// and the expected Gateway.
+/// Identify the radio fresh and require the write target, the expected
+/// identity and the expected Gateway.
 async fn identify_and_check<T: Transport>(
     radio: &mut Radio<T>,
     expected: &Identity,
     gateway: DvGatewayMode,
 ) -> Result<(), TerminalOperationError> {
     let identity = radio.identify().await?;
-    if !identity.is_qualified_write_target() || identity != *expected {
+    if !identity.is_write_target() || identity != *expected {
         return Err(TerminalOperationError::Identity { actual: identity });
     }
     let observed = radio.get_dv_gateway_mode().await?;

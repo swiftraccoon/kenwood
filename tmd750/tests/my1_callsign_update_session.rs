@@ -170,7 +170,7 @@ impl Transport for AuditedTransport {
             assert_eq!(
                 self.intents.load(Ordering::SeqCst),
                 1,
-                "exactly one completed durable callback must precede W"
+                "exactly one completed journal callback must precede W"
             );
             assert_eq!(
                 bytes.len(),
@@ -365,7 +365,7 @@ async fn assert_completed_original(
     assert_eq!(
         intents.load(Ordering::SeqCst),
         usize::from(phase == Session::Apply),
-        "only apply accepts one durable intent"
+        "only apply accepts one journaled intent"
     );
     transport.mock.assert_complete();
     Ok(())
@@ -475,7 +475,7 @@ async fn mismatching_fresh_identity_blocks_gateway_entry_and_intent() -> TestRes
             matches!(
                 report.outcome,
                 Outcome::Failed {
-                    error: SessionError::Evidence(TextFieldUpdateError::IdentityMismatch),
+                    error: SessionError::Rejected(TextFieldUpdateError::IdentityMismatch),
                     ..
                 }
             ),
@@ -501,7 +501,7 @@ async fn mismatching_fresh_identity_blocks_gateway_entry_and_intent() -> TestRes
         );
         assert!(
             !called.get(),
-            "identity mismatch must prevent durable intent"
+            "identity mismatch must prevent the intent journal"
         );
         let mock = radio.into_transport();
         assert_eq!(
@@ -546,7 +546,7 @@ async fn active_unknown_rejected_and_partial_gateway_replies_prevent_entry() -> 
         assert_failed(&report, Stage::GatewayGuard);
         let expected = match response {
             Some(b"GW 2\r") => Some(DvGatewayMode::Terminal),
-            Some(b"GW 255\r") => Some(DvGatewayMode::Unqualified(255)),
+            Some(b"GW 255\r") => Some(DvGatewayMode::Unnamed(255)),
             _ => None,
         };
         assert_eq!(
@@ -555,7 +555,7 @@ async fn active_unknown_rejected_and_partial_gateway_replies_prevent_entry() -> 
         );
         if let Some(expected) = expected {
             assert!(
-                matches!(report.outcome, Outcome::Failed { error: SessionError::Evidence(TextFieldUpdateError::GatewayMode { actual }), .. } if actual == expected),
+                matches!(report.outcome, Outcome::Failed { error: SessionError::Rejected(TextFieldUpdateError::GatewayMode { actual }), .. } if actual == expected),
                 "retain the exact refused typed Gateway mode"
             );
         } else {
@@ -585,7 +585,10 @@ async fn active_unknown_rejected_and_partial_gateway_replies_prevent_entry() -> 
             WriteDisposition::NotAttempted,
             "Gateway refusal prohibits W"
         );
-        assert!(!called.get(), "Gateway refusal must prevent durable intent");
+        assert!(
+            !called.get(),
+            "Gateway refusal must prevent the intent journal"
+        );
         if response.is_none() {
             assert_blocked(&mut radio).await;
         }
@@ -657,7 +660,7 @@ async fn format_control_and_target_drift_prevent_intent_without_rebasing() -> Te
         );
         assert!(
             !called.get(),
-            "fresh drift {mutation} must prevent durable intent"
+            "fresh drift {mutation} must prevent the intent journal"
         );
         assert!(
             update.next_session().is_err(),
@@ -670,7 +673,7 @@ async fn format_control_and_target_drift_prevent_intent_without_rebasing() -> Te
 }
 
 #[tokio::test]
-async fn failed_durable_intent_preserves_the_first_error_and_any_exit_error() -> TestResult {
+async fn failed_intent_journal_preserves_the_first_error_and_any_exit_error() -> TestResult {
     for exit_ack in [ACK, 0x15] {
         let mut update = fixture()?;
         let mut mock = MockTransport::new();
@@ -681,20 +684,20 @@ async fn failed_durable_intent_preserves_the_first_error_and_any_exit_error() ->
             .set_text_field_session_until_exit(
                 &mut update,
                 || false,
-                |_| Err(io::Error::other("durable intent synchronization failed")),
+                |_| Err(io::Error::other("intent journal synchronization failed")),
             )
             .await;
-        assert_failed(&report, Stage::DurableIntent);
+        assert_failed(&report, Stage::IntentJournal);
         let Outcome::Failed {
-            error: SessionError::DurableIntent(error),
+            error: SessionError::IntentJournal(error),
             ..
         } = &report.outcome
         else {
-            return Err("durable intent failure lost its original typed error".into());
+            return Err("intent journal failure lost its original typed error".into());
         };
         assert_eq!(
             error.to_string(),
-            "durable intent synchronization failed",
+            "intent journal synchronization failed",
             "preserve the original callback failure"
         );
         assert_eq!(
@@ -962,7 +965,7 @@ async fn complete_last_byte_readback_mismatch_exits_without_rollback_or_verifica
         matches!(
             report.outcome,
             Outcome::Failed {
-                error: SessionError::Evidence(TextFieldUpdateError::PageMismatch),
+                error: SessionError::Rejected(TextFieldUpdateError::PageMismatch),
                 ..
             }
         ),
@@ -1052,7 +1055,7 @@ async fn uncertain_entry_or_guard_reads_prohibit_intent_exit_and_handle_reuse() 
         assert_eq!(
             report.status,
             Status::NotWritten,
-            "no durable write intent was reached"
+            "no journaled write intent was reached"
         );
         assert_eq!(
             report.write,
@@ -1066,7 +1069,7 @@ async fn uncertain_entry_or_guard_reads_prohibit_intent_exit_and_handle_reuse() 
         );
         assert!(
             !called.get(),
-            "entry/read failure must prevent durable intent"
+            "entry/read failure must prevent the intent journal"
         );
         assert_blocked(&mut radio).await;
         radio.into_transport().assert_complete();
@@ -1256,7 +1259,7 @@ async fn halted_or_unfinalized_updates_refuse_even_a_fresh_transport() -> TestRe
         );
         assert!(
             !called.get(),
-            "stale engine state must prevent durable intent"
+            "stale engine state must prevent the intent journal"
         );
         let mock = radio.into_transport();
         assert!(

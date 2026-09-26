@@ -17,7 +17,7 @@ use crate::memory::{
     MyCallsignTrial, PmNameTrial, PmNameTrialError, PmNameTrialEvent, PmNameTrialSession,
     PmNameTrialStatus, PmNameTrialWrite,
 };
-use crate::radio::qualification::{McpProbeExit, McpProbeSegment};
+use crate::radio::probe::{McpProbeExit, McpProbeSegment};
 use crate::types::{Address, DvGatewayMode, Page, RadioModel};
 use kenwood_transport::Transport;
 
@@ -41,8 +41,9 @@ pub enum PmNameTrialSessionStage {
     },
     /// Compare the new format byte and whole page with the required baseline.
     FreshComparison,
-    /// Durably record the exact intent and recovery bytes before W.
-    DurableIntent,
+    /// Run `before_write`, which writes and synchronizes the exact intent and
+    /// recovery bytes, before W.
+    IntentJournal,
     /// Dispatch the sole fixed page and receive its acknowledgment.
     Write,
     /// Obtain and compare the complete immediate post-write page.
@@ -58,12 +59,13 @@ pub enum PmNameTrialSessionError {
     /// CAT, MCP, transport, or individual exchange timeout failure.
     #[error(transparent)]
     Io(#[from] Error),
-    /// The fixed trial's scope or session sequence rejected the operation.
+    /// The trial rejected an event: wrong order, a scope violation or a failed
+    /// comparison.
     #[error(transparent)]
-    Evidence(#[from] PmNameTrialError),
-    /// The `before_write` callback failed to record the intent before dispatch.
+    Rejected(#[from] PmNameTrialError),
+    /// The `before_write` callback returned an error; no W was sent.
     #[error("fixed text trial journal record failed: {0}")]
-    DurableIntent(#[source] std::io::Error),
+    IntentJournal(#[source] std::io::Error),
 }
 
 /// How far the sole fixed W frame reached on the wire.
@@ -91,8 +93,8 @@ pub enum PmNameTrialSessionOutcome {
     /// Required reads, any fixed write/readback, and E/ACK completed.
     ///
     /// The caller closes and drops the transport, verifies a fresh CAT identity,
-    /// closes that connection, durably records the report, and only then records
-    /// `SessionFinalized`.
+    /// closes that connection, writes and synchronizes the report, and only
+    /// then records `SessionFinalized`.
     AwaitingCatVerification,
     /// Cancellation was honored before any trial write intent was accepted.
     ///
@@ -216,16 +218,17 @@ impl<T: Transport> Radio<T> {
     /// Each invocation obtains a new CAT identity before entry, reads format
     /// byte 10 and the complete canonical PM1 page, and requires exact equality
     /// with the immutable appropriate before-image. No merge or rebase occurs.
-    /// Before W, `before_write` must durably record the identity, both complete
-    /// pages, and the exact intent. Only its successful return permits recording
-    /// the write obligation and then dispatching the fixed frame. Immediate
-    /// readback compares every byte. No RF command is sent.
+    /// Before W, `before_write` must write and synchronize a journal record of
+    /// the identity, both complete pages, and the exact intent. Only its
+    /// successful return permits recording the write obligation and then
+    /// dispatching the fixed frame. Immediate readback compares every byte. No
+    /// RF command is sent.
     ///
     /// Every completed exchange is retained in the report. A comparison or
     /// journal failure at a known exchange boundary still exits; an uncertain
     /// exchange sends no E. After E/ACK the old handle receives no CAT, baud, or
     /// close operation here: the caller closes and drops it, verifies a fresh
-    /// connection, durably records the report, and only then records
+    /// connection, writes and synchronizes the report, and only then records
     /// [`PmNameTrialEvent::SessionFinalized`].
     ///
     /// # Cancellation
@@ -258,13 +261,14 @@ impl<T: Transport> Radio<T> {
     /// byte 10, the complete immutable PM-control page, and the complete target
     /// page. PM Off, MY1 selection, and Gateway Off must remain unchanged.
     /// Every target byte outside MY1, including its memo, is preserved. The
-    /// callback must durably record the exact immutable scope and write intent
-    /// before dispatch. Both writes require complete immediate readback.
+    /// callback must write and synchronize a journal record of the exact
+    /// immutable scope and write intent before dispatch. Both writes require
+    /// complete immediate readback.
     /// No gateway-setting, fill, or RF command is sent.
     ///
     /// Caller ordering after each E/ACK: close and drop the original transport,
-    /// verify a matching CAT identity on a fresh connection, close it, durably
-    /// record the report, then call [`MyCallsignTrial::finalize_session`].
+    /// verify a matching CAT identity on a fresh connection, close it, write and
+    /// synchronize the report, then call [`MyCallsignTrial::finalize_session`].
     /// Caller preconditions: fail-closed transport capture on every connection.
     ///
     /// # Cancellation
@@ -358,16 +362,16 @@ impl<T: Transport> Radio<T> {
         if let Some(write) = write_for(phase) {
             before_write(trial, write).map_err(|error| {
                 failure(
-                    Stage::DurableIntent,
-                    PmNameTrialSessionError::DurableIntent(error),
+                    Stage::IntentJournal,
+                    PmNameTrialSessionError::IntentJournal(error),
                 )
             })?;
             trial
-                .record(PmNameTrialEvent::DurableWriteIntent {
+                .record(PmNameTrialEvent::IntentJournaled {
                     id: session_id(phase),
                     write,
                 })
-                .map_err(|error| failure(Stage::DurableIntent, error))?;
+                .map_err(|error| failure(Stage::IntentJournal, error))?;
             self.write_fixed_trial_page(trial, write, report)
                 .await
                 .map_err(|error| failure(Stage::Write, error))?;

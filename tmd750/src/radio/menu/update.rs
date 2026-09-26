@@ -88,8 +88,9 @@ impl MenuAssignment {
 /// Scope: this plan admits only registered scalar fields and does not widen
 /// arbitrary-page programming. Applying it still requires a matching session
 /// identity, a fresh comparison of every expected page before the first write,
-/// durably recorded intent, and caller-driven exit and reconnection. The plan
-/// is neither an atomic transaction nor a rollback instruction.
+/// a written and synchronized journal record of each page's intent, and
+/// caller-driven exit and reconnection. The plan is neither an atomic
+/// transaction nor a rollback instruction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MenuUpdatePlan {
     identity: Identity,

@@ -111,7 +111,7 @@ async fn registered_batch_on_102_compares_guards_then_writes_complete_pages() ->
             .filter(|item| !item.is_noop())
             .cloned()
             .collect::<Vec<_>>(),
-        "each changed page must have one exact complete durable intent"
+        "each changed page must have one exact complete journaled intent"
     );
     assert_eq!(
         report.verified_pages.len(),
@@ -212,7 +212,7 @@ async fn changed_format_pm_or_gateway_guard_prevents_every_menu_write() -> TestR
         );
         assert_eq!(
             intents, 0,
-            "a guard mismatch must precede every durable write intent"
+            "a guard mismatch must precede every journaled write intent"
         );
         assert!(
             session.journal().possibly_written.is_empty(),

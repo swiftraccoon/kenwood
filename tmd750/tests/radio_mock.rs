@@ -70,7 +70,7 @@ async fn operating_modes_and_gateway_state_are_typed_reads() -> TestResult {
     assert_eq!(radio.get_operating_mode(Band::A).await?, OperatingMode::Fm);
     assert_eq!(
         radio.get_operating_mode(Band::B).await?,
-        OperatingMode::Unqualified(7)
+        OperatingMode::Unnamed(7)
     );
     assert_eq!(
         radio.get_dv_gateway_mode().await?,
@@ -432,6 +432,70 @@ async fn an_acknowledged_step_that_never_applies_is_an_error() -> TestResult {
             })
         ),
         "{result:?}"
+    );
+    radio.into_transport().assert_complete();
+    Ok(())
+}
+
+#[tokio::test]
+async fn memory_channel_writes_verify_the_echo_and_the_readback() -> TestResult {
+    use kenwood_tmd750::types::{CatMemoryChannelRecord, MemoryChannelAddress, UrCallsign};
+
+    const VFO: &str = "0145190000,0000600000,2,2,0,0,0,0,0,0,2,08,08,000,0,CQCQCQ,0,00";
+    const STORED: &str = "995,0145190000,0000600000,2,2,0,0,0,0,0,0,0,2,08,08,000,0,CQCQCQ,0,00,0";
+    const EMPTY_UR: &str = "995,0145190000,0000600000,2,2,0,0,0,0,0,0,0,2,08,08,000,0,,0,00,0";
+    let address = MemoryChannelAddress::regular(995)?;
+
+    let mut mock = MockTransport::new();
+    mock.expect(b"FO 0\r", format!("FO 0,{VFO}\r").as_bytes());
+    scripted_live_identity(&mut mock);
+    mock.expect(
+        format!("ME {STORED}\r").as_bytes(),
+        format!("ME {STORED}\r").as_bytes(),
+    );
+    mock.expect(b"ME 995\r", format!("ME {STORED}\r").as_bytes());
+    mock.expect(
+        format!("ME {EMPTY_UR}\r").as_bytes(),
+        format!("ME {EMPTY_UR}\r").as_bytes(),
+    );
+    mock.expect(b"ME 995\r", format!("ME {STORED}\r").as_bytes());
+    mock.expect(
+        format!("ME {STORED}\r").as_bytes(),
+        format!("ME {STORED}\r").as_bytes(),
+    );
+    mock.expect(
+        b"ME 995\r",
+        format!(
+            "ME {}\r",
+            STORED.replace("0145190000,0000", "0145200000,0000")
+        )
+        .as_bytes(),
+    );
+    let mut radio = Radio::new(mock);
+
+    let channel = radio.get_channel_record(Band::A).await?;
+    let request = CatMemoryChannelRecord::from_channel(channel.clone(), false);
+    assert_eq!(
+        radio.write_memory_channel(address, request.clone()).await?,
+        request
+    );
+
+    let mut empty_ur = request.clone();
+    empty_ur.channel.ur_call = UrCallsign::new("")?;
+    let stored = radio.write_memory_channel(address, empty_ur).await?;
+    assert_eq!(
+        stored.channel.ur_call.as_str(),
+        "CQCQCQ",
+        "an empty URCALL reads back as CQCQCQ"
+    );
+
+    let differing = radio.write_memory_channel(address, request).await;
+    assert!(
+        matches!(
+            differing,
+            Err(Error::Protocol(ProtocolError::UnexpectedResponse { .. }))
+        ),
+        "a readback that differs in another field is refused: {differing:?}"
     );
     radio.into_transport().assert_complete();
     Ok(())

@@ -132,7 +132,7 @@ Gateway state and both band modes. `status` prints every typed read of both
 bands and of the global settings. `d750_channels` lists the programmed memory
 channels of a `.d750` file without opening a radio.
 
-## Select a qualified mode
+## Select an operating mode
 
 Writes take `Band` and `SelectableMode`, not unchecked numbers. The library
 identifies the target when necessary, checks its exact firmware/type, requires
@@ -149,7 +149,7 @@ async fn select_dv<T: Transport>(radio: &mut Radio<T>) -> Result<(), Error> {
 ```
 
 `Radio::enter_dstar` is a convenience for ordinary RF DV, not Reflector
-Terminal Mode. Unknown read values remain `OperatingMode::Unqualified`; they cannot
+Terminal Mode. Unknown read values remain `OperatingMode::Unnamed`; they cannot
 be passed to the write API. Failures use the typed `Error` hierarchy, including
 `UnsupportedCatWriteTarget` and transport errors with their I/O kind retained.
 After a failed echo or readback the setting's state is unknown; inspect the
@@ -242,8 +242,10 @@ indexed by `PhysicalChannel` (regular 0 through 999, program scan pairs
 channels written over CAT with every tone mode, both shift directions,
 split, reverse and lockout set decoded from the image to the same records
 `ME` returned, and the radio's own APRS channel decoded to the record `FO`
-reports for it. The flag byte holding the band code and the tone table
-index basis are retained as observed, not interpreted.
+reports for it. The flag byte's band code follows the receive frequency's
+segment, not the band that stored the channel (`BandCode` lists the observed
+values); it and the tone table index basis are retained exactly, not
+interpreted.
 
 Each command reads until a line answers it, and after a `?` reply the next
 two commands discard whatever follows their own reply, because firmware 1.02
@@ -254,7 +256,7 @@ changes) and which follow the User Manual's list order without a panel
 readout (power levels, the band display, panel lighting values, the tone and
 DCS table index basis).
 
-## Qualify MCP without changing settings
+## Probe MCP without changing settings
 
 `Radio::probe_mcp` proves identity, enters programming mode, reads two fixed
 fragments, and requires the exit ACK. It then retires the original connection;
@@ -267,7 +269,7 @@ a discovery probe.
 use kenwood_tmd750::{Error, McpProbeOutcome, Radio};
 use kenwood_transport::Transport;
 
-async fn qualify<T: Transport>(radio: &mut Radio<T>) -> Result<(), Error> {
+async fn probe<T: Transport>(radio: &mut Radio<T>) -> Result<(), Error> {
     let report = radio.probe_mcp(|| false).await;
     for segment in &report.segments {
         println!("read {} bytes at {}", segment.data.len(), segment.page.address().as_u32());
@@ -331,9 +333,9 @@ Either reader runs over any transport, including native macOS Bluetooth. A
 completed page schedule and exit ACK say nothing about reacquiring CAT
 afterwards: `has_complete_configuration()` covers the read and exit schedule
 only, so the caller must open and identify a fresh connection to verify it.
-Over Bluetooth, that fresh connection's first command needs the deadline
-`bluetooth_first_reply_timeout_after_exit` returns for the time since the exit
-acknowledgment, described under Status.
+Over Bluetooth, wrap that fresh connection with
+`Radio::new_bluetooth_after_exit` and the time since the exit acknowledgment,
+as described under Status.
 
 Await the operation to completion. Cancellation is cooperative at exchange
 boundaries. Successful exit retires protocol access to the original handle
@@ -550,11 +552,14 @@ ID/FV/TY identity before MCP entry, then compare the format byte and the full
 target page; `PmOffGatewayGuards` additionally requires Gateway Off before
 entry and reads the full control page after the format byte. The apply
 session requires a synchronized intent before its one complete-page write and
-immediate whole-page readback: the caller's durable-intent callback must
-persist both complete pages first. The caller selects a TM-D750 USB endpoint,
-main unit or operation panel, at 9600 baud with RTS/CTS and DTR/RTS asserted;
-the generic transport trait cannot prove the USB connector identity. The caller owns fail-closed capture and the
-lifecycle between sessions: exit ACK, old-handle close/drop, one fresh matching
+immediate whole-page readback: the caller's `before_write` callback must
+write and synchronize a journal record of both complete pages first. The
+caller selects the endpoint: a TM-D750 USB role, main unit or operation panel,
+at 9600 baud with RTS/CTS and DTR/RTS asserted, or native Bluetooth, where the
+first command of every new connection needs the deadline described under
+Status. The generic transport trait cannot prove which connector or unit is
+behind the transport. The caller wraps each transport in fail-closed capture
+and runs the lifecycle between sessions: exit ACK, old-handle close/drop, one fresh matching
 CAT identity check (with a Gateway Off check for MY1) and clean close, then a
 complete capture and a synchronized session record before recording
 `TextFieldUpdateEvent::SessionFinalized` with the policy's post-exit facts
@@ -576,7 +581,9 @@ current full backup and explicit `--apply`.
 On the operation-panel endpoint the caller opens each session only after the
 endpoint has stayed enumerated for about ten seconds, because it can
 re-enumerate once more after `ID` first answers and a session opened at that
-moment fails to enter programming mode with `ENXIO`. An update left at
+moment fails to enter programming mode with `ENXIO`;
+`radio::readiness::await_settled` performs that wait over a `ControlHost`
+and returns at once for a main-unit endpoint. An update left at
 `TextFieldUpdateStatus::PossiblyChanged` is resolved by a fresh backup
 compared page by page against the pre-write backup with
 `StandardConfigurationDiff`, never by repeating the session.
@@ -593,7 +600,12 @@ that field's bytes only, and each rename back or clear returned every page
 byte-identical to the pre-write backup. The MY1 updates observed Gateway Off
 before each entry and on each fresh post-exit connection. CAT `DC 1` read MY
 slot 1 as unset while this field held `KQ4NIT`, because `DC` addresses the
-separate MY list of ordinary DV operation.
+separate MY list of ordinary DV operation. The same three updates, each
+written and then renamed back or cleared, reached
+`TextFieldUpdateStatus::VerifiedAcrossSessions` over native Bluetooth as
+well, every session on a new connection, with fresh standard backups read over
+Bluetooth confirming the same field-only changes and the return to the
+pre-write bytes.
 
 ### Fixed PM1 rename-and-restore trial
 
@@ -624,14 +636,15 @@ substitutes guessed bytes.
 
 Events model three separate sessions: temporary rename and immediate readback;
 fresh-session comparison before restoration and its immediate readback; then a
-further fresh-session comparison with the complete original page. A recorded
-durable write intent precedes every possible write. Once a write may have
+further fresh-session comparison with the complete original page. A journaled
+write intent (`PmNameTrialEvent::IntentJournaled`) precedes every possible
+write. Once a write may have
 occurred, a failure cannot downgrade the state to “not written” or permit
 blind restoration from an obsolete page.
 
 `Radio::run_approved_pm1_trial_session_until_exit` performs one fixed session:
-a fresh identity check, complete-page comparisons, the caller-provided
-durable-intent callback, then the write and its immediate readback. It accepts
+a fresh identity check, complete-page comparisons, the caller's `before_write`
+journal callback, then the write and its immediate readback. It accepts
 no replacement address or label. The caller supplies fail-closed capture,
 closes and drops the old connection after exit, verifies fresh CAT and its
 clean close, and records session finalization only from a complete capture and
@@ -686,8 +699,8 @@ The public PM1 driver remains limited to PM1. Both workflows share the
 `PmNameTrial` session, status, and error types; MY1 session reports also retain
 the gateway observation.
 
-The caller supplies durable recovery records binding both target images and the
-control page, fail-closed capture, a fresh matching CAT check after exit, clean
+The caller supplies synchronized recovery journal records binding both target
+images and the control page, fail-closed capture, a fresh matching CAT check after exit, clean
 closes, and a synchronized session record before each `finalize_session`. All
 three sessions must complete. A failure keeps the update in its possible-change
 state; the library performs no restoration from a stale page and no protocol
@@ -711,7 +724,7 @@ unchanged. General schema writes are not enabled by this API.
 
 `Radio::run_approved_terminal_exit_trial_session_until_exit` checks fresh CAT
 identity and Gateway state before MCP entry. It reads all guard pages before
-permitting one durably journaled write back to the complete Off page, followed
+permitting one journaled write back to the complete Off page, followed
 by immediate full-page readback. A distinct session verifies the Off page
 without another write. After each exit, the caller must close/drop the original
 handle, obtain fresh matching identity and Gateway Off, close, and synchronize
@@ -833,8 +846,10 @@ fn prepare_label(
 The underlying `compare_exchange_pages` validates the entire batch and freshly
 compares **all** complete before-images before the first write. Unchanged pages
 are compared but not written. Before each changed page, the caller's fallible
-`before_write` callback must flush its raw capture and durably record both
-complete page images. Each W is acknowledged and immediately read back in full.
+`before_write` callback must flush its raw capture and write and synchronize a
+journal record of both complete page images; an error it returns becomes
+`McpError::IntentJournal` and that page is not sent. Each W is acknowledged and
+immediately read back in full.
 Unrelated bits are preserved by the planner. This is an optimistic host-side
 comparison, not a firmware-atomic transaction or protection against concurrent
 edits; partial failures retain conservative per-page journal state.
@@ -889,12 +904,16 @@ signed `gps.MyPositionList[0].Altitude` (written as a negative value) were
 each written to a new value and back through two plans, and each run was
 confirmed by a fresh standard backup that differed from the pre-write backup
 in that field's bytes only and, after the restoring write, in no byte.
-`radio.Beep` was also written in PM1 (slot 1) while PM Off was active,
-changing only that slot's byte, so per-slot addressing has the same coverage;
+`radio.Beep` was also written off and back on in each of PM1 through PM5
+(slots 1 to 5) while PM Off was active, each write changing only that slot's
+byte, at the same page offset in pages 8192 bytes apart, so per-slot
+addressing has the same coverage;
 and `pm.PmName2` and `radio.Beep` were written together in one plan and
 restored together in another, each session writing and reading back both
 pages, with the backups differing in those six bytes only and then in none.
-`gps.MyPositionSelect` stores My
+Over native Bluetooth, `radio.VoxGain` was written from 4 to 7 and back
+through two plans, with fresh standard backups read over Bluetooth differing
+in that byte only and then in none. `gps.MyPositionSelect` stores My
 Position 1 through 5 as 0 through 4 and the GPS receiver as 5, whereas `MS`
 on the wire uses 0 for GPS and 1 through 5 for the positions. Other fields
 are untested on hardware. The session does not activate Gateway mode, change
@@ -938,8 +957,8 @@ acknowledged read so callers can build an incremental backup and check
 cancellation between pages without repeating programming entry.
 
 `McpSession::compare_exchange_terminal` requires fresh equality of every
-complete guard and target page before any write, a durably recorded intent, and
-immediate complete-page readback. `restoration()` swaps the exact original/destination images, including
+complete guard and target page before any write, a synchronized intent journal
+record, and immediate complete-page readback. `restoration()` swaps the exact original/destination images, including
 the original subtype and route. Its expected bytes are synthetic, not new observations;
 they must pass the same fresh comparisons, without merging or unconditional
 rollback. A direct `TerminalTarget::Off` request instead retains its input subtype.
@@ -960,8 +979,8 @@ journal sink:
 - `radio::readiness::ControlHost` enumerates, opens and closes the independent
   serial control endpoint for CAT and MCP. `radio::terminal::transition::ModemHost`
   opens and reopens the modem link. `radio::terminal::session::TerminalJournal`
-  records the backup, the plan, each pre-write intent, and each checkpoint; the
-  sink owns its own durability.
+  records the backup, the plan, each pre-write intent, and each checkpoint, and
+  writes and synchronizes each record before returning.
 - `TerminalLifecycle::prepare` observes the control endpoint, opens the modem
   link, writes the Terminal and routing pages with `program_terminal`, and
   acquires MMDVM framing with `acquire_modem`. When the stored Gateway is Off
@@ -969,15 +988,20 @@ journal sink:
   already active the pages are written over the control endpoint and the modem
   link is never sent CAT. It returns the proved `ProvenModem` connection and a
   `TerminalRecovery`.
-- `TerminalRecovery::finish` waits for the control endpoint's CAT to return
-  with `verify_readiness`, rewrites exactly the pages startup changed, and
-  verifies the identity and Gateway on a fresh connection. It rewrites nothing
-  unless the modem connection was confirmed closed.
+- `TerminalRecovery::finish` waits for the control endpoint's identity with
+  `verify_readiness`, then, on an operation-panel endpoint, for `await_settled`:
+  ten seconds of continuous enumeration, because that endpoint can re-enumerate
+  once more after first answering `ID` and a programming entry sent then fails
+  with `ENXIO`. It rewrites exactly the pages startup changed, then runs
+  `verify_readiness` again, reading the restored Gateway on the same connection
+  whose identity matched. It rewrites nothing unless the modem connection was
+  confirmed closed. The `RestorationReport` keeps both readiness reports and
+  the settle wait.
 
 The library sends CAT, MCP and MMDVM frames and enforces the safety order; it
 opens no endpoint and writes no file. The caller implements the host traits to
 wire endpoint discovery, the native modem backend, capture transcripts and the
-recovery journal, and owns cancellation. The two model MCP engines stay
+recovery journal, and sets the cancellation flag. The two model MCP engines stay
 separate: this is the TM-D750 lifecycle only.
 
 ## What it does
@@ -1007,11 +1031,12 @@ separate: this is the TM-D750 lifecycle only.
   requires a usable connection and retires that connection after E/ACK; it does
   not reopen the transport or establish fresh CAT readiness.
 - Provides the fixed PM1 rename/restore session described above, without
-  admitting arbitrary firmware-1.02 settings writes. The caller owns the
-  durable journal, fail-closed capture, and per-session finalization.
+  admitting arbitrary firmware-1.02 settings writes. The caller writes and
+  synchronizes the journal, keeps fail-closed capture, and finalizes each
+  session.
 - Provides typed, leave-in-place updates of three text fields, each with a
-  fixed target, whole-page drift checks, a durable-intent contract and
-  separate-session verification: the PM1 name, one channel's name, and the PM
+  fixed target, whole-page drift checks, a journaled intent before the write
+  and separate-session verification: the PM1 name, one channel's name, and the PM
   Off MY1 callsign, which adds complete control-page guards and fresh
   Gateway-Off verification. Other registered text fields are written through
   `MenuUpdatePlan`.
@@ -1019,8 +1044,8 @@ separate: this is the TM-D750 lifecycle only.
   (`memory::menu_fields`), resolving each field's recorded slot stride:
   8192 bytes for ordinary menu blocks and 256000 for startup bitmaps.
 - Reads sparse menu snapshots and applies batch patches through a shared
-  all-page compare-and-exchange path, with complete before-images and durable
-  per-write callback boundaries. Scalar keyboard values use the same codecs
+  all-page compare-and-exchange path, with complete before-images and a
+  journal callback before every write. Scalar keyboard values use the same codecs
   and domains as the patch planner.
 - Separately admits ordinary firmware-1.02 registry assignments through
   `MenuUpdatePlan`, with exact identity, format, active-PM, Gateway-Off, full-page,
@@ -1054,12 +1079,14 @@ echo and readback there. The radio holds the reply to the first command of a
 Bluetooth connection opened within about five seconds of the previous
 connection's close until about five seconds after that close, and after a
 programming exit it answers no earlier than about 20 seconds after the exit
-acknowledgment; the held command is answered, not dropped. Before the first
-command of a Bluetooth connection, `Radio::set_next_reply_timeout` takes
-`BLUETOOTH_FIRST_REPLY_TIMEOUT`, or after a programming exit
-`bluetooth_first_reply_timeout_after_exit` with the time elapsed since the
-acknowledgment, which extends the deadline to `BLUETOOTH_EXIT_REPLY_BOUND`
-after the exit however quickly the connection reopened.
+acknowledgment; the held command is answered, not dropped. `Radio::new_bluetooth`
+wraps a new Bluetooth connection with `BLUETOOTH_FIRST_REPLY_TIMEOUT` for its
+first reply, and `Radio::new_bluetooth_after_exit` wraps one opened after a
+programming exit with `bluetooth_first_reply_timeout_after_exit` of the time
+elapsed since the acknowledgment, which extends the deadline to
+`BLUETOOTH_EXIT_REPLY_BOUND` after the exit however quickly the connection
+reopened. `TerminalLifecycle` uses `Radio::new_bluetooth` for a Bluetooth
+modem link.
 
 With Gateway routed to panel USB on firmware 1.02, main-unit USB continues to
 answer identity and Gateway queries while the radio is in Terminal mode, and a
@@ -1107,7 +1134,7 @@ the operation-panel endpoint, those commands also wait until the endpoint has
 stayed enumerated for ten seconds within a sixty-second budget. These are host
 bounds sized from observation, not firmware timing guarantees.
 
-Bluetooth Terminal entry and restoration are owned by this library's
+Bluetooth Terminal entry and restoration are implemented by this library's
 `TerminalLifecycle` over the caller-supplied `ControlHost`, `ModemHost` and
 `TerminalJournal`; `tmd750-repl` wires the native Bluetooth backend, the USB
 control endpoint, the capture transcripts and the recovery journal to those

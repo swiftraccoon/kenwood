@@ -1,4 +1,4 @@
-//! Fixed PM1 wire scope, durable-intent ordering, and fail-closed lifecycle.
+//! Fixed PM1 wire scope, intent-journal ordering, and fail-closed lifecycle.
 //!
 //! Persistence cases model separate scripted MCP sessions after exit and fresh
 //! identity verification; no power cycle is simulated.
@@ -103,7 +103,7 @@ fn session_script(trial: &PmNameTrial) -> Result<MockTransport, Box<dyn std::err
 #[derive(Debug)]
 struct AuditedTransport {
     mock: MockTransport,
-    durable_intents: Arc<AtomicUsize>,
+    journaled_intents: Arc<AtomicUsize>,
     memory_writes: usize,
     exited: bool,
     baud_changes: Vec<u32>,
@@ -111,10 +111,10 @@ struct AuditedTransport {
 }
 
 impl AuditedTransport {
-    fn new(mock: MockTransport, durable_intents: &Arc<AtomicUsize>) -> Self {
+    fn new(mock: MockTransport, journaled_intents: &Arc<AtomicUsize>) -> Self {
         Self {
             mock,
-            durable_intents: Arc::clone(durable_intents),
+            journaled_intents: Arc::clone(journaled_intents),
             memory_writes: 0,
             exited: false,
             baud_changes: Vec::new(),
@@ -131,7 +131,7 @@ impl Transport for AuditedTransport {
         );
         if bytes.first() == Some(&b'W') {
             assert_eq!(
-                self.durable_intents.load(Ordering::SeqCst),
+                self.journaled_intents.load(Ordering::SeqCst),
                 1,
                 "W requires a successful intent callback"
             );
@@ -306,7 +306,7 @@ async fn wrong_fresh_identity_prevents_entry_and_intent() -> TestResult {
         report.outcome,
         PmNameTrialSessionOutcome::Failed {
             stage: PmNameTrialSessionStage::Identity,
-            error: PmNameTrialSessionError::Evidence(PmNameTrialError::IdentityMismatch),
+            error: PmNameTrialSessionError::Rejected(PmNameTrialError::IdentityMismatch),
         }
     ));
     assert_eq!(report.exit, McpProbeExit::NotEntered);
@@ -357,7 +357,7 @@ async fn stale_page_or_format_refuses_writing_but_exits_at_a_known_boundary() ->
             report.outcome,
             PmNameTrialSessionOutcome::Failed {
                 stage: PmNameTrialSessionStage::FreshComparison,
-                error: PmNameTrialSessionError::Evidence(_),
+                error: PmNameTrialSessionError::Rejected(_),
             }
         ));
         assert_eq!(report.exit, McpProbeExit::Acknowledged);
@@ -372,7 +372,7 @@ async fn stale_page_or_format_refuses_writing_but_exits_at_a_known_boundary() ->
 }
 
 #[tokio::test]
-async fn durable_callback_failure_prevents_w_and_preserves_additional_exit_failure() -> TestResult {
+async fn journal_callback_failure_prevents_w_and_preserves_additional_exit_failure() -> TestResult {
     for exit_ack in [ACK, 0x15] {
         let mut trial = fixture()?;
         let mut mock = MockTransport::new();
@@ -383,14 +383,14 @@ async fn durable_callback_failure_prevents_w_and_preserves_additional_exit_failu
             .run_approved_pm1_trial_session_until_exit(
                 &mut trial,
                 || false,
-                |_, _| Err(io::Error::other("durable sync failed")),
+                |_, _| Err(io::Error::other("journal sync failed")),
             )
             .await;
         assert!(matches!(
             report.outcome,
             PmNameTrialSessionOutcome::Failed {
-                stage: PmNameTrialSessionStage::DurableIntent,
-                error: PmNameTrialSessionError::DurableIntent(_),
+                stage: PmNameTrialSessionStage::IntentJournal,
+                error: PmNameTrialSessionError::IntentJournal(_),
             }
         ));
         assert_eq!(report.cleanup_error.is_some(), exit_ack != ACK);
@@ -554,7 +554,7 @@ async fn complete_wrong_readback_exits_but_never_clears_restoration_obligation()
         report.outcome,
         PmNameTrialSessionOutcome::Failed {
             stage: PmNameTrialSessionStage::ImmediateReadback,
-            error: PmNameTrialSessionError::Evidence(PmNameTrialError::PageMismatch),
+            error: PmNameTrialSessionError::Rejected(PmNameTrialError::PageMismatch),
         }
     ));
     assert_eq!(report.exit, McpProbeExit::Acknowledged);
@@ -742,7 +742,7 @@ async fn unexpected_persisted_page_never_restores_a_stale_baseline() -> TestResu
         report.outcome,
         PmNameTrialSessionOutcome::Failed {
             stage: PmNameTrialSessionStage::FreshComparison,
-            error: PmNameTrialSessionError::Evidence(PmNameTrialError::PageMismatch),
+            error: PmNameTrialSessionError::Rejected(PmNameTrialError::PageMismatch),
         }
     ));
     assert!(!called);

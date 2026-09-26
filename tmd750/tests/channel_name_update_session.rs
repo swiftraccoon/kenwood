@@ -113,7 +113,7 @@ fn session_script(update: &ChannelNameUpdate) -> Result<MockTransport, Box<dyn s
 #[derive(Debug)]
 struct AuditedTransport {
     mock: MockTransport,
-    durable_intents: Arc<AtomicUsize>,
+    journaled_intents: Arc<AtomicUsize>,
     memory_writes: usize,
     written_page: Option<u32>,
     exited: bool,
@@ -122,10 +122,10 @@ struct AuditedTransport {
 }
 
 impl AuditedTransport {
-    fn new(mock: MockTransport, durable_intents: &Arc<AtomicUsize>) -> Self {
+    fn new(mock: MockTransport, journaled_intents: &Arc<AtomicUsize>) -> Self {
         Self {
             mock,
-            durable_intents: Arc::clone(durable_intents),
+            journaled_intents: Arc::clone(journaled_intents),
             memory_writes: 0,
             written_page: None,
             exited: false,
@@ -140,9 +140,9 @@ impl Transport for AuditedTransport {
         assert!(!self.exited, "the original handle must be retired after E");
         if bytes.first() == Some(&b'W') {
             assert_eq!(
-                self.durable_intents.load(Ordering::SeqCst),
+                self.journaled_intents.load(Ordering::SeqCst),
                 1,
-                "the durable callback must precede W"
+                "the journal callback must precede W"
             );
             assert_eq!(
                 bytes.len(),
@@ -306,7 +306,7 @@ async fn exact_two_session_scope_writes_the_name_page_once_and_requires_external
 }
 
 #[tokio::test]
-async fn firmware_or_type_mismatch_prevents_entry_and_durable_intent() -> TestResult {
+async fn firmware_or_type_mismatch_prevents_entry_and_the_intent_journal() -> TestResult {
     for (firmware, radio_type) in [("1.03", "K,2,1"), ("1.02", "J,2,1")] {
         let mut update = fixture()?;
         let mut mock = MockTransport::new();
@@ -328,7 +328,7 @@ async fn firmware_or_type_mismatch_prevents_entry_and_durable_intent() -> TestRe
                 report.outcome,
                 TextFieldUpdateSessionOutcome::Failed {
                     stage: TextFieldUpdateSessionStage::Identity,
-                    error: TextFieldUpdateSessionError::Evidence(
+                    error: TextFieldUpdateSessionError::Rejected(
                         TextFieldUpdateError::IdentityMismatch
                     ),
                 }
@@ -372,7 +372,7 @@ async fn whole_page_drift_refuses_w_without_merging_and_still_exits() -> TestRes
             report.outcome,
             TextFieldUpdateSessionOutcome::Failed {
                 stage: TextFieldUpdateSessionStage::FreshComparison,
-                error: TextFieldUpdateSessionError::Evidence(TextFieldUpdateError::PageMismatch),
+                error: TextFieldUpdateSessionError::Rejected(TextFieldUpdateError::PageMismatch),
             }
         ),
         "{:?}",
@@ -388,7 +388,7 @@ async fn whole_page_drift_refuses_w_without_merging_and_still_exits() -> TestRes
 }
 
 #[tokio::test]
-async fn failed_durable_intent_prevents_w_and_exits() -> TestResult {
+async fn failed_intent_journal_prevents_w_and_exits() -> TestResult {
     let mut update = fixture()?;
     let mut mock = MockTransport::new();
     preflight(&mut mock, &update, update.original_page())?;
@@ -405,8 +405,8 @@ async fn failed_durable_intent_prevents_w_and_exits() -> TestResult {
         matches!(
             report.outcome,
             TextFieldUpdateSessionOutcome::Failed {
-                stage: TextFieldUpdateSessionStage::DurableIntent,
-                error: TextFieldUpdateSessionError::DurableIntent(_),
+                stage: TextFieldUpdateSessionStage::IntentJournal,
+                error: TextFieldUpdateSessionError::IntentJournal(_),
             }
         ),
         "{:?}",
@@ -546,7 +546,7 @@ async fn halted_update_is_rejected_before_any_radio_traffic() -> TestResult {
             report.outcome,
             TextFieldUpdateSessionOutcome::Failed {
                 stage: TextFieldUpdateSessionStage::Preparation,
-                error: TextFieldUpdateSessionError::Evidence(TextFieldUpdateError::TerminalState),
+                error: TextFieldUpdateSessionError::Rejected(TextFieldUpdateError::TerminalState),
             }
         ),
         "{:?}",

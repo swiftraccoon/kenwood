@@ -440,7 +440,7 @@ impl Transport for IntentTransport {
             assert_eq!(
                 self.intents.load(Ordering::Relaxed),
                 self.writes,
-                "durable intent must precede each W"
+                "a journaled intent must precede each W"
             );
         }
         self.mock.write(bytes).await
@@ -593,7 +593,7 @@ async fn identity_and_legacy_gate_fail_before_any_page_traffic() -> TestResult {
 }
 
 #[tokio::test]
-async fn failed_durable_callback_sends_no_write_and_preserves_ready_exit() -> TestResult {
+async fn failed_journal_callback_sends_no_write_and_preserves_ready_exit() -> TestResult {
     let plan = entry_plan()?;
     let mut mock = ready("1.02");
     preflight(&mut mock, &plan);
@@ -608,7 +608,7 @@ async fn failed_durable_callback_sends_no_write_and_preserves_ready_exit() -> Te
         )
         .await;
     assert!(
-        matches!(result, Err(TerminalPlanError::Operation(Error::Mcp(McpError::Interrupted { source, .. }))) if matches!(*source, Error::Mcp(McpError::DurableIntent { .. })))
+        matches!(result, Err(TerminalPlanError::Operation(Error::Mcp(McpError::Interrupted { source, .. }))) if matches!(*source, Error::Mcp(McpError::IntentJournal { .. })))
     );
     assert!(session.journal().possibly_written.is_empty());
     assert!(session.is_ready());

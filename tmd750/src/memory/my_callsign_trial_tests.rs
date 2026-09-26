@@ -57,7 +57,7 @@ fn fresh(fixture: &mut Fixture, session: u64, changed: bool) -> TestResult {
 }
 
 fn intent(fixture: &mut Fixture, write: PmNameTrialWrite) -> TestResult {
-    fixture.trial.record(PmNameTrialEvent::DurableWriteIntent {
+    fixture.trial.record(PmNameTrialEvent::IntentJournaled {
         id: connection(match write {
             PmNameTrialWrite::Rename => 11,
             PmNameTrialWrite::Restore => 12,
@@ -189,7 +189,7 @@ fn every_stored_selector_requires_the_fixed_zero_value() -> TestResult {
         let expected_gateway = if value == 2 {
             DvGatewayMode::Terminal
         } else {
-            DvGatewayMode::Unqualified(value)
+            DvGatewayMode::Unnamed(value)
         };
         let mut control = fixture.control;
         *control.get_mut(9).ok_or("PM selector")? = value;
@@ -385,11 +385,11 @@ fn callsign_codec_length_padding_encoding_and_scalar_domains_are_exact() -> Test
 fn every_fresh_session_requires_both_guards_and_exact_typed_gateway_off() -> TestResult {
     for gateway in [
         None,
-        Some(DvGatewayMode::Unqualified(0)),
-        Some(DvGatewayMode::Unqualified(1)),
+        Some(DvGatewayMode::Unnamed(0)),
+        Some(DvGatewayMode::Unnamed(1)),
         Some(DvGatewayMode::Terminal),
-        Some(DvGatewayMode::Unqualified(2)),
-        Some(DvGatewayMode::Unqualified(255)),
+        Some(DvGatewayMode::Unnamed(2)),
+        Some(DvGatewayMode::Unnamed(255)),
     ] {
         let mut fixture = make_fixture()?;
         let result = fixture.trial.fresh_session(FixedTextTrialObservation {
@@ -611,7 +611,7 @@ fn guard_drift_after_rename_never_authorizes_stale_restoration() -> TestResult {
             Err(PmNameTrialError::TerminalState)
         );
         assert_eq!(
-            fixture.trial.record(PmNameTrialEvent::DurableWriteIntent {
+            fixture.trial.record(PmNameTrialEvent::IntentJournaled {
                 id: connection(12)?,
                 write: PmNameTrialWrite::Restore
             }),

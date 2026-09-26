@@ -114,7 +114,7 @@ impl Transport for AuditedTransport {
             assert_eq!(
                 self.intents.load(Ordering::SeqCst),
                 self.writes,
-                "each W requires its own completed durable callback"
+                "each W requires its own completed journal callback"
             );
         }
         self.wire
@@ -356,7 +356,7 @@ async fn duplicates_and_unsupported_firmware_fail_before_page_traffic() -> TestR
         }
         assert!(
             !called,
-            "up-front rejection must never reach durable intent"
+            "up-front rejection must never reach the journal callback"
         );
         assert_eq!(
             session.journal(),
@@ -428,7 +428,7 @@ async fn noops_and_empty_batches_never_dispatch_but_still_enforce_scope() -> Tes
         }
         assert!(
             !called.get(),
-            "empty and no-op batches must not request durable intent"
+            "empty and no-op batches must not call the journal callback"
         );
         assert_eq!(
             session.journal(),
@@ -466,7 +466,7 @@ async fn callback_failure_prevents_its_write_without_rolling_back_earlier_pages(
                     let reject = intents == failed;
                     intents += 1;
                     if reject {
-                        Err(io::Error::other("durable synchronization failed"))
+                        Err(io::Error::other("journal synchronization failed"))
                     } else {
                         Ok(())
                     }
@@ -478,8 +478,8 @@ async fn callback_failure_prevents_its_write_without_rolling_back_earlier_pages(
             .ok_or("callback failure unexpectedly passed")?;
         let cause = interrupted(&error, failed, failed)?;
         assert!(
-            matches!(cause, Error::Mcp(McpError::DurableIntent { source, .. }) if source.to_string() == "durable synchronization failed"),
-            "retain the original durable-intent error"
+            matches!(cause, Error::Mcp(McpError::IntentJournal { source, .. }) if source.to_string() == "journal synchronization failed"),
+            "retain the original intent journal error"
         );
         assert_eq!(
             intents,

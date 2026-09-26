@@ -542,7 +542,7 @@ async fn menu_batch_compares_every_page_before_writing_and_skips_noops() -> Test
     assert_eq!(
         intents,
         vec![changed.clone()],
-        "the durable-intent callback must receive the exact complete change once"
+        "the journal callback must receive the exact complete change once"
     );
     assert_eq!(
         progress,
@@ -616,7 +616,7 @@ async fn stale_later_page_prevents_every_write_in_the_menu_batch() -> TestResult
     );
     assert!(
         !called,
-        "stale whole-page comparison must precede every durable write intent"
+        "stale whole-page comparison must precede every journaled write intent"
     );
     assert!(
         session.journal().possibly_written.is_empty(),

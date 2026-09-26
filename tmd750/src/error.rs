@@ -477,9 +477,10 @@ pub enum McpError {
         /// First differing offset within the page.
         offset: usize,
     },
-    /// The caller could not durably record a page's intent before dispatch.
+    /// The `before_write` callback returned an error for a page; that page was
+    /// not dispatched.
     #[error("journal record for page at {address} failed: {source}")]
-    DurableIntent {
+    IntentJournal {
         /// Page whose write was not dispatched.
         address: u32,
         /// Original caller error; earlier batch writes may still have completed.

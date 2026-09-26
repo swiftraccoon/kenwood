@@ -66,7 +66,7 @@ fn fresh(fixture: &mut Fixture, session: u64) -> TestResult {
 fn intent(fixture: &mut Fixture) -> TestResult {
     fixture
         .update
-        .record(TextFieldUpdateEvent::DurableWriteIntent { id: id(1)? })?;
+        .record(TextFieldUpdateEvent::IntentJournaled { id: id(1)? })?;
     Ok(())
 }
 
@@ -413,7 +413,7 @@ fn verification_requires_intent_readback_two_distinct_sessions_and_both_finaliza
     assert_eq!(
         fixture
             .update
-            .record(TextFieldUpdateEvent::DurableWriteIntent { id: id(2)? }),
+            .record(TextFieldUpdateEvent::IntentJournaled { id: id(2)? }),
         Err(TextFieldUpdateError::TerminalState)
     );
     fixture.update.halt();
@@ -600,7 +600,7 @@ fn skipped_intent_and_repeated_intent_never_advance_the_update() -> TestResult {
     assert_eq!(
         early
             .update
-            .record(TextFieldUpdateEvent::DurableWriteIntent { id: id(1)? }),
+            .record(TextFieldUpdateEvent::IntentJournaled { id: id(1)? }),
         Err(TextFieldUpdateError::UnexpectedEvent)
     );
     assert_eq!(early.update.status(), TextFieldUpdateStatus::NotWritten);
@@ -622,7 +622,7 @@ fn skipped_intent_and_repeated_intent_never_advance_the_update() -> TestResult {
         assert_eq!(
             repeated
                 .update
-                .record(TextFieldUpdateEvent::DurableWriteIntent { id: id(second_id)? }),
+                .record(TextFieldUpdateEvent::IntentJournaled { id: id(second_id)? }),
             Err(TextFieldUpdateError::UnexpectedEvent)
         );
         assert_eq!(

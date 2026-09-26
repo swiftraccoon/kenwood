@@ -26,7 +26,7 @@ pub enum Reenumeration {
 pub enum ReenumerationRejection {
     /// The pinned endpoint has an empty path or is not a TM-D750 USB endpoint.
     #[error("the pinned endpoint is not a recognized TM-D750 USB endpoint")]
-    UnqualifiedOriginal,
+    UnrecognizedOriginal,
     /// One serial service was enumerated with contradictory USB metadata.
     #[error("USB metadata conflicts for serial service {path}")]
     ConflictingMetadata {
@@ -66,7 +66,7 @@ pub enum ReenumerationRejection {
 #[must_use]
 pub fn select_pinned(original: &SerialCandidate, candidates: &[SerialCandidate]) -> Reenumeration {
     if original.path.is_empty() || !original.is_tmd750() {
-        return Reenumeration::Rejected(ReenumerationRejection::UnqualifiedOriginal);
+        return Reenumeration::Rejected(ReenumerationRejection::UnrecognizedOriginal);
     }
     if let Some(path) = conflicting_metadata(original, candidates) {
         return Reenumeration::Rejected(ReenumerationRejection::ConflictingMetadata {
@@ -455,7 +455,7 @@ mod tests {
     }
 
     #[test]
-    fn unqualified_original_snapshots_are_rejected() {
+    fn unrecognized_original_snapshots_are_rejected() {
         for original in [
             endpoint("", TMD750_MAIN_PID),
             endpoint("/dev/cu.other-radio", 0x9023),
@@ -467,7 +467,7 @@ mod tests {
         ] {
             assert_eq!(
                 select_pinned(&original, std::slice::from_ref(&original)),
-                Reenumeration::Rejected(ReenumerationRejection::UnqualifiedOriginal)
+                Reenumeration::Rejected(ReenumerationRejection::UnrecognizedOriginal)
             );
         }
     }

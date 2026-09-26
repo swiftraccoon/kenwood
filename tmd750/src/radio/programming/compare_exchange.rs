@@ -146,9 +146,9 @@ impl<T: Transport> McpSession<'_, T> {
     /// merge is performed. This is a host-side optimistic check, not a
     /// firmware-atomic multi-page transaction or a lock against other actors.
     ///
-    /// Immediately before each changed page, `before_write` must durably record
-    /// the intent, including both complete images. The callback is not called
-    /// for no-ops. Its successful return precedes marking the session journal
+    /// Immediately before each changed page, `before_write` must write and
+    /// synchronize a journal record of the intent, including both complete
+    /// images. The callback is not called for no-ops. Its successful return precedes marking the session journal
     /// possibly written, a single complete W frame/ACK, and whole-page immediate
     /// readback. A new dispatch invalidates any earlier verification entry for
     /// that same page.
@@ -197,8 +197,8 @@ impl<T: Transport> McpSession<'_, T> {
     /// Scope: registered scalar fields with an ordinary lifecycle only. This
     /// path cannot change Gateway mode, routing, or automatic-transmission
     /// settings, does not widen the legacy raw-page schema gate, and is not
-    /// firmware-atomic. Capture durability, detached exit, transport release,
-    /// fresh verification, and recovery remain the caller's.
+    /// firmware-atomic. The caller synchronizes its captures, exits, closes the
+    /// transport, verifies on a fresh connection and runs any recovery.
     ///
     /// # Errors
     ///
@@ -229,16 +229,17 @@ impl<T: Transport> McpSession<'_, T> {
     /// The session identity must match the exact plan identity before page I/O.
     /// Every complete expected page, including unchanged format, active-PM, and
     /// routing guards, is freshly compared before any W. Changed pages alone
-    /// invoke the durable `before_write` callback, then receive one W/ACK and
+    /// invoke the `before_write` journal callback, then receive one W/ACK and
     /// immediate whole-page readback. Reversal has exactly the same comparisons;
     /// its synthetic expected images are not accepted as prior observations.
     ///
     /// Performs no rollback, retry, automatic exit, reconnect, CAT query, or
     /// modem operation, and widens neither the ordinary-menu nor the legacy
-    /// raw-page schema gate. Entering MCP while Gateway is active, journal
-    /// durability, connection roles, and final verification remain the caller's:
-    /// retain the journal, await a safe [`Self::exit`], then close and drop the
-    /// original handle before opening a fresh connection.
+    /// raw-page schema gate. The caller chooses whether to enter MCP while
+    /// Gateway is active, synchronizes the journal, selects the connection roles
+    /// and runs final verification: retain the journal, await a safe
+    /// [`Self::exit`], then close and drop the original handle before opening a
+    /// fresh connection.
     ///
     /// # Errors
     ///
@@ -313,7 +314,7 @@ impl<T: Transport> McpSession<'_, T> {
             if replacement.is_noop() {
                 report.unchanged_pages.push(replacement.page);
             } else {
-                before_write(replacement).map_err(|source| McpError::DurableIntent {
+                before_write(replacement).map_err(|source| McpError::IntentJournal {
                     address: replacement.page.address().as_u32(),
                     source,
                 })?;

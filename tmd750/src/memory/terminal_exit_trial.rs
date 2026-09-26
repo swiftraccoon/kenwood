@@ -166,7 +166,7 @@ pub enum TerminalExitTrialEvent<'a> {
     ///
     /// Accepting this event sets [`TerminalExitTrialStatus::PossiblyChanged`]
     /// permanently, even if the write is never dispatched.
-    DurableWriteIntent {
+    IntentJournaled {
         /// Nonzero identifier of the sole journal write-intent record, not a connection ID.
         id: NonZeroU64,
     },
@@ -465,7 +465,7 @@ impl TerminalExitTrial {
         if matches!(self.phase, Phase::Halted | Phase::Complete) {
             return Err(TerminalExitTrialError::TerminalState);
         }
-        if matches!(&event, TerminalExitTrialEvent::DurableWriteIntent { id } if self.intent == Some(*id))
+        if matches!(&event, TerminalExitTrialEvent::IntentJournaled { id } if self.intent == Some(*id))
         {
             return Err(TerminalExitTrialError::ReusedWriteIntent);
         }
@@ -500,7 +500,7 @@ impl TerminalExitTrial {
                 };
                 Ok(())
             }
-            (Phase::Intent, TerminalExitTrialEvent::DurableWriteIntent { id }) => {
+            (Phase::Intent, TerminalExitTrialEvent::IntentJournaled { id }) => {
                 self.intent = Some(id);
                 self.status = TerminalExitTrialStatus::PossiblyChanged;
                 self.phase = Phase::Readback;

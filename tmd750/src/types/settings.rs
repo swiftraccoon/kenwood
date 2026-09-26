@@ -295,14 +295,14 @@ pub enum VoxMode {
     /// VOX off (`0`).
     Off,
     /// Any other reported value, retained exactly as received.
-    Unqualified(u8),
+    Unnamed(u8),
 }
 
 impl From<u8> for VoxMode {
     fn from(value: u8) -> Self {
         match value {
             0 => Self::Off,
-            other => Self::Unqualified(other),
+            other => Self::Unnamed(other),
         }
     }
 }
@@ -311,7 +311,7 @@ impl From<VoxMode> for u8 {
     fn from(value: VoxMode) -> Self {
         match value {
             VoxMode::Off => 0,
-            VoxMode::Unqualified(raw) => raw,
+            VoxMode::Unnamed(raw) => raw,
         }
     }
 }
@@ -320,7 +320,7 @@ impl fmt::Display for VoxMode {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Off => formatter.write_str("off"),
-            Self::Unqualified(value) => write!(formatter, "unqualified value {value}"),
+            Self::Unnamed(value) => write!(formatter, "unnamed value {value}"),
         }
     }
 }
@@ -912,14 +912,14 @@ pub enum TncMode {
     /// TNC off (`0`).
     Off,
     /// Any other reported value, retained exactly as received.
-    Unqualified(u8),
+    Unnamed(u8),
 }
 
 impl From<u8> for TncMode {
     fn from(value: u8) -> Self {
         match value {
             0 => Self::Off,
-            other => Self::Unqualified(other),
+            other => Self::Unnamed(other),
         }
     }
 }
@@ -928,7 +928,7 @@ impl From<TncMode> for u8 {
     fn from(value: TncMode) -> Self {
         match value {
             TncMode::Off => 0,
-            TncMode::Unqualified(raw) => raw,
+            TncMode::Unnamed(raw) => raw,
         }
     }
 }
@@ -937,7 +937,7 @@ impl fmt::Display for TncMode {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Off => formatter.write_str("off"),
-            Self::Unqualified(value) => write!(formatter, "unqualified value {value}"),
+            Self::Unnamed(value) => write!(formatter, "unnamed value {value}"),
         }
     }
 }
@@ -1174,9 +1174,9 @@ mod tests {
         assert_eq!(BeaconMethod::try_from(3)?, BeaconMethod::SmartBeaconing);
         assert!(BeaconMethod::try_from(4).is_err());
         assert_eq!(SMeterReading::new(9).to_string(), "S9");
-        assert_eq!(VoxMode::from(2), VoxMode::Unqualified(2));
-        assert_eq!(u8::from(VoxMode::Unqualified(2)), 2);
-        assert_eq!(TncMode::from(1), TncMode::Unqualified(1));
+        assert_eq!(VoxMode::from(2), VoxMode::Unnamed(2));
+        assert_eq!(u8::from(VoxMode::Unnamed(2)), 2);
+        assert_eq!(TncMode::from(1), TncMode::Unnamed(1));
         assert_eq!(u8::from(TncMode::Off), 0);
         Ok(())
     }

@@ -41,8 +41,8 @@ mod cat;
 pub mod menu;
 mod pm1_page;
 pub mod pm_name_trial;
+pub mod probe;
 pub mod programming;
-pub mod qualification;
 pub mod readiness;
 pub mod terminal;
 pub mod terminal_exit_trial;
@@ -76,9 +76,9 @@ pub const BLUETOOTH_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// On firmware 1.02 the radio holds the reply to the first command of a
 /// Bluetooth connection opened within about five seconds of the previous
 /// connection's close until about five seconds after that close; the command
-/// is answered late, not dropped. Pass it to [`Radio::set_next_reply_timeout`]
-/// before the first command, or for the first connection after a programming
-/// exit pass [`bluetooth_first_reply_timeout_after_exit`], which never returns
+/// is answered late, not dropped. [`Radio::new_bluetooth`] applies it to the
+/// first command; after a programming exit [`Radio::new_bluetooth_after_exit`]
+/// applies [`bluetooth_first_reply_timeout_after_exit`], which never returns
 /// less. A host bound sized from observation, not a firmware guarantee.
 pub const BLUETOOTH_FIRST_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -142,8 +142,8 @@ enum ProtocolState {
     Retired,
 }
 
-const QUALIFIED_WRITE_FIRMWARE: &str = "1.02";
-const QUALIFIED_WRITE_RADIO_TYPE: &str = "K,2,1";
+const WRITE_FIRMWARE: &str = "1.02";
+const WRITE_RADIO_TYPE: &str = "K,2,1";
 
 /// Progress of a multi-page transfer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,10 +169,10 @@ impl Identity {
     /// Whether this is the exact identity every write in this crate admits:
     /// a TM-D750 with firmware `1.02` and type `K,2,1`.
     #[must_use]
-    pub fn is_qualified_write_target(&self) -> bool {
+    pub fn is_write_target(&self) -> bool {
         self.model == RadioModel::TmD750
-            && self.firmware.as_str() == QUALIFIED_WRITE_FIRMWARE
-            && self.radio_type.as_str() == QUALIFIED_WRITE_RADIO_TYPE
+            && self.firmware.as_str() == WRITE_FIRMWARE
+            && self.radio_type.as_str() == WRITE_RADIO_TYPE
     }
 }
 
@@ -267,6 +267,32 @@ impl<T: Transport> Radio<T> {
         }
     }
 
+    /// Wrap a newly opened native Bluetooth connection without sending
+    /// commands.
+    ///
+    /// As [`Self::new`], with the first command's reply allowed
+    /// [`BLUETOOTH_FIRST_REPLY_TIMEOUT`]: the radio holds that reply until
+    /// about five seconds after the previous Bluetooth connection closed.
+    /// Every later exchange uses [`DEFAULT_TIMEOUT`].
+    pub const fn new_bluetooth(transport: T) -> Self {
+        let mut radio = Self::new(transport);
+        radio.set_next_reply_timeout(BLUETOOTH_FIRST_REPLY_TIMEOUT);
+        radio
+    }
+
+    /// Wrap a native Bluetooth connection opened `since_exit` after a
+    /// programming-exit acknowledgment, without sending commands.
+    ///
+    /// As [`Self::new`], with the first command's reply allowed
+    /// [`bluetooth_first_reply_timeout_after_exit`] of `since_exit`, so the
+    /// deadline reaches [`BLUETOOTH_EXIT_REPLY_BOUND`] after the exit however
+    /// quickly the connection reopened.
+    pub const fn new_bluetooth_after_exit(transport: T, since_exit: Duration) -> Self {
+        let mut radio = Self::new(transport);
+        radio.set_next_reply_timeout(bluetooth_first_reply_timeout_after_exit(since_exit));
+        radio
+    }
+
     /// Change the deadline for each serial write and each reply-reading step.
     ///
     /// After a write timeout, whether any bytes reached the radio is unknown. A
@@ -282,8 +308,9 @@ impl<T: Transport> Radio<T> {
     /// The longer of `timeout` and the regular reply deadline applies to that
     /// one command, which consumes the setting when it is sent, whatever its
     /// outcome; later commands use the regular deadline, and MCP exchanges
-    /// never use it. Use [`BLUETOOTH_FIRST_REPLY_TIMEOUT`] before the first
-    /// command on a new Bluetooth connection.
+    /// never use it. [`Self::new_bluetooth`] and
+    /// [`Self::new_bluetooth_after_exit`] set it for a new Bluetooth
+    /// connection.
     pub const fn set_next_reply_timeout(&mut self, timeout: Duration) {
         self.next_reply_timeout = Some(timeout);
     }
@@ -360,7 +387,7 @@ impl<T: Transport> Radio<T> {
     /// Read the current demodulation mode for one band.
     ///
     /// Sends one band-indexed `MD` query without an implicit identity check.
-    /// Unknown reported values remain [`OperatingMode::Unqualified`]. Follow
+    /// Unknown reported values remain [`OperatingMode::Unnamed`]. Follow
     /// [`Radio`]'s deadline, cancellation, and post-error ownership contract.
     ///
     /// # Errors
@@ -537,7 +564,7 @@ impl<T: Transport> Radio<T> {
     where
         V: PartialEq + fmt::Debug,
     {
-        self.require_qualified_write_target().await?;
+        self.require_write_target().await?;
         let echoed = self.query(write, expected, extract).await?;
         if echoed != requested {
             return Err(Error::Protocol(ProtocolError::UnexpectedResponse {
@@ -557,17 +584,17 @@ impl<T: Transport> Radio<T> {
 
     /// Prove the identity when it is not cached and refuse every target other
     /// than firmware `1.02` with type `K,2,1`.
-    pub(crate) async fn require_qualified_write_target(&mut self) -> Result<(), Error> {
+    pub(crate) async fn require_write_target(&mut self) -> Result<(), Error> {
         let identity = match self.identity().cloned() {
             Some(identity) => identity,
             None => self.identify().await?,
         };
-        if identity.firmware.as_str() != QUALIFIED_WRITE_FIRMWARE
-            || identity.radio_type.as_str() != QUALIFIED_WRITE_RADIO_TYPE
+        if identity.firmware.as_str() != WRITE_FIRMWARE
+            || identity.radio_type.as_str() != WRITE_RADIO_TYPE
         {
             return Err(Error::UnsupportedCatWriteTarget {
-                expected_firmware: QUALIFIED_WRITE_FIRMWARE,
-                expected_radio_type: QUALIFIED_WRITE_RADIO_TYPE,
+                expected_firmware: WRITE_FIRMWARE,
+                expected_radio_type: WRITE_RADIO_TYPE,
                 actual_firmware: identity.firmware.to_string(),
                 actual_radio_type: identity.radio_type.to_string(),
             });

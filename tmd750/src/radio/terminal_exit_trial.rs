@@ -13,7 +13,7 @@ use crate::memory::{
     TerminalExitTrialStatus,
 };
 use crate::protocol::mcp::{ACK, write_request};
-use crate::radio::qualification::{McpProbeExit, McpProbeSegment};
+use crate::radio::probe::{McpProbeExit, McpProbeSegment};
 use crate::types::{Address, DvGatewayMode, Page};
 use kenwood_transport::Transport;
 
@@ -35,8 +35,9 @@ pub enum TerminalExitTrialSessionStage {
     },
     /// Compare the full target and both immutable guard pages.
     FreshComparison,
-    /// Durably record the exact intent before the only write.
-    DurableIntent,
+    /// Run `before_write`, which writes and synchronizes the exact intent,
+    /// before the only write.
+    IntentJournal,
     /// Dispatch one complete page frame and require its acknowledgment.
     Write,
     /// Read and compare the complete desired page immediately after writing.
@@ -52,12 +53,13 @@ pub enum TerminalExitTrialSessionError {
     /// CAT, MCP, transport, or individual exchange timeout failure.
     #[error(transparent)]
     Io(#[from] Error),
-    /// Fixed scope or session order failed validation.
+    /// The trial rejected an event: wrong order, a scope violation or a failed
+    /// comparison.
     #[error(transparent)]
-    Evidence(#[from] TerminalExitTrialError),
-    /// The `before_write` callback failed to record the intent before dispatch.
+    Rejected(#[from] TerminalExitTrialError),
+    /// The `before_write` callback returned an error; no W was sent.
     #[error("Terminal exit journal record failed: {0}")]
-    DurableIntent(#[source] std::io::Error),
+    IntentJournal(#[source] std::io::Error),
 }
 
 /// How far the sole memory-write frame reached on the wire.
@@ -76,7 +78,7 @@ pub enum TerminalExitTrialWriteDisposition {
 #[derive(Debug)]
 pub enum TerminalExitTrialSessionOutcome {
     /// Required exchanges completed; the caller still owes a fresh identity and
-    /// Gateway Off, both closes, and a durably recorded report.
+    /// Gateway Off, both closes, and a written and synchronized report.
     AwaitingCatVerification,
     /// Cancellation was honored before any write intent was accepted.
     Cancelled,
@@ -202,8 +204,8 @@ impl<T: Transport> Radio<T> {
     /// write restoring Gateway Off. Immediate readback covers every byte. A
     /// separate session verifies the Off page without writing. After each
     /// E/ACK, the caller closes and drops the transport, obtains a matching
-    /// fresh CAT identity and Gateway Off, closes, and durably records the
-    /// report before recording
+    /// fresh CAT identity and Gateway Off, closes, and writes and synchronizes
+    /// the report before recording
     /// [`TerminalExitTrialEvent::SessionFinalized`]; this method performs none
     /// of those steps.
     ///
@@ -309,15 +311,15 @@ impl<T: Transport> Radio<T> {
         if phase == TerminalExitTrialSession::Apply {
             before_write(trial).map_err(|error| {
                 failure(
-                    Stage::DurableIntent,
-                    TerminalExitTrialSessionError::DurableIntent(error),
+                    Stage::IntentJournal,
+                    TerminalExitTrialSessionError::IntentJournal(error),
                 )
             })?;
             trial
-                .record(TerminalExitTrialEvent::DurableWriteIntent {
+                .record(TerminalExitTrialEvent::IntentJournaled {
                     id: NonZeroU64::MIN,
                 })
-                .map_err(|error| failure(Stage::DurableIntent, error))?;
+                .map_err(|error| failure(Stage::IntentJournal, error))?;
             self.write_terminal_exit(trial, report)
                 .await
                 .map_err(|error| failure(Stage::Write, error))?;

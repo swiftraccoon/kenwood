@@ -2,7 +2,7 @@
 //!
 //! Every operation here reads: none sends a memory-write, fill, or RF command.
 
-use super::qualification::{McpProbeExit, McpProbeSegment};
+use super::probe::{McpProbeExit, McpProbeSegment};
 use super::{Identity, Progress, Radio};
 use crate::error::{Error, ProtocolError};
 use crate::protocol::mcp::{ENTER_RESPONSE, regions};

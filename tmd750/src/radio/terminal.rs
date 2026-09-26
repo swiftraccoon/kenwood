@@ -288,7 +288,7 @@ impl TerminalPlan {
         let target = match self.before {
             DvGatewayMode::Off => TerminalTarget::Off,
             DvGatewayMode::Terminal => TerminalTarget::ReflectorTerminal,
-            DvGatewayMode::Unqualified(raw) => {
+            DvGatewayMode::Unnamed(raw) => {
                 return Err(TerminalPlanError::GuardValue {
                     field: GATEWAY_FIELD,
                     actual: u64::from(raw),

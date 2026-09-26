@@ -159,7 +159,10 @@ async fn every_batch_element_is_revalidated_before_any_page_traffic() -> TestRes
             ),
             "malformed later entries must fail before reading an earlier valid entry"
         );
-        assert!(!called, "invalid batches must never reach durable intent");
+        assert!(
+            !called,
+            "invalid batches must never reach the journal callback"
+        );
         assert!(
             session.journal().possibly_written.is_empty(),
             "invalid batches cannot change the journal"

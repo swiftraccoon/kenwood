@@ -64,12 +64,13 @@ pub enum PmNameTrialEvent<'a> {
     },
     /// Report that a private journal record holding the identity, the original
     /// and expected page bytes, and this intent has been written and
-    /// synchronized to durable storage before the `W` frame is sent.
+    /// synchronized to storage before the `W` frame is sent.
     ///
     /// Accepting this event sets [`PmNameTrialStatus::PossiblyChanged`], which
     /// no later error or halt clears, even if the write is never dispatched.
-    DurableWriteIntent {
-        /// Distinct durable journal record identity for this write intent.
+    IntentJournaled {
+        /// Identifier of this write intent's journal record, distinct from
+        /// every earlier one.
         id: NonZeroU64,
         /// The exact next intent: rename in session one, restore in session two.
         write: PmNameTrialWrite,
@@ -107,9 +108,9 @@ pub enum PmNameTrialSession {
 /// connections, MCP exit and re-entry boundaries, complete captures, and
 /// synchronized journal records, all taken on trust.
 ///
-/// Sequence: fresh original-page comparison, durable rename intent, immediate
+/// Sequence: fresh original-page comparison, journaled rename intent, immediate
 /// changed-page readback, finalized session; a distinct re-entered session with
-/// a changed-page comparison, durable restore intent, immediate original-page
+/// a changed-page comparison, journaled restore intent, immediate original-page
 /// readback, finalized session; a third distinct re-entered read-only session
 /// with an original-page comparison and finalized cleanup.
 #[derive(Debug)]
@@ -230,7 +231,7 @@ impl PmNameTrial {
         self.sequence.next_session()
     }
 
-    /// Exact immutable captured page to retain in the durable recovery record.
+    /// Exact immutable captured page to retain in the recovery journal record.
     #[must_use]
     pub const fn original_page(&self) -> &[u8; PAGE_SIZE] {
         self.sequence.original_page()
@@ -250,7 +251,7 @@ impl PmNameTrial {
 
     /// Validate and record the exact next event.
     ///
-    /// An accepted [`PmNameTrialEvent::DurableWriteIntent`] sets status to
+    /// An accepted [`PmNameTrialEvent::IntentJournaled`] sets status to
     /// [`PmNameTrialStatus::PossiblyChanged`] before dispatch could occur, and
     /// no error clears it. Any error permanently halts further acceptance.
     ///

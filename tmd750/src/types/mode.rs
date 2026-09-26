@@ -61,7 +61,7 @@ pub enum OperatingMode {
     /// DR, D-STAR through the repeater list (`4`); reported, not writable.
     Dr,
     /// Any other reported value, retained exactly as received.
-    Unqualified(u8),
+    Unnamed(u8),
 }
 
 impl fmt::Display for OperatingMode {
@@ -72,7 +72,7 @@ impl fmt::Display for OperatingMode {
             Self::Am => formatter.write_str("AM"),
             Self::Nfm => formatter.write_str("NFM"),
             Self::Dr => formatter.write_str("DR"),
-            Self::Unqualified(value) => write!(formatter, "unqualified value {value}"),
+            Self::Unnamed(value) => write!(formatter, "unnamed value {value}"),
         }
     }
 }
@@ -85,7 +85,7 @@ impl From<u8> for OperatingMode {
             2 => Self::Am,
             3 => Self::Nfm,
             4 => Self::Dr,
-            other => Self::Unqualified(other),
+            other => Self::Unnamed(other),
         }
     }
 }
@@ -98,7 +98,7 @@ impl From<OperatingMode> for u8 {
             OperatingMode::Am => 2,
             OperatingMode::Nfm => 3,
             OperatingMode::Dr => 4,
-            OperatingMode::Unqualified(raw) => raw,
+            OperatingMode::Unnamed(raw) => raw,
         }
     }
 }
@@ -142,7 +142,7 @@ pub enum DvGatewayMode {
     /// Terminal Mode is selected (`2`).
     Terminal,
     /// Any other reported value, retained exactly as received.
-    Unqualified(u8),
+    Unnamed(u8),
 }
 
 impl fmt::Display for DvGatewayMode {
@@ -150,7 +150,7 @@ impl fmt::Display for DvGatewayMode {
         match self {
             Self::Off => formatter.write_str("Off"),
             Self::Terminal => formatter.write_str("Terminal"),
-            Self::Unqualified(value) => write!(formatter, "unqualified value {value}"),
+            Self::Unnamed(value) => write!(formatter, "unnamed value {value}"),
         }
     }
 }
@@ -160,7 +160,7 @@ impl From<u8> for DvGatewayMode {
         match value {
             0 => Self::Off,
             2 => Self::Terminal,
-            other => Self::Unqualified(other),
+            other => Self::Unnamed(other),
         }
     }
 }
@@ -170,7 +170,7 @@ impl From<DvGatewayMode> for u8 {
         match value {
             DvGatewayMode::Off => 0,
             DvGatewayMode::Terminal => 2,
-            DvGatewayMode::Unqualified(raw) => raw,
+            DvGatewayMode::Unnamed(raw) => raw,
         }
     }
 }
@@ -193,7 +193,7 @@ mod tests {
             (2, OperatingMode::Am),
             (3, OperatingMode::Nfm),
             (4, OperatingMode::Dr),
-            (7, OperatingMode::Unqualified(7)),
+            (7, OperatingMode::Unnamed(7)),
         ] {
             assert_eq!(OperatingMode::from(raw), mode);
             assert_eq!(u8::from(mode), raw);
@@ -206,12 +206,12 @@ mod tests {
         for (raw, mode, label) in [
             (0, DvGatewayMode::Off, "Off"),
             (2, DvGatewayMode::Terminal, "Terminal"),
-            (1, DvGatewayMode::Unqualified(1), "unqualified value 1"),
-            (3, DvGatewayMode::Unqualified(3), "unqualified value 3"),
+            (1, DvGatewayMode::Unnamed(1), "unnamed value 1"),
+            (3, DvGatewayMode::Unnamed(3), "unnamed value 3"),
             (
                 u8::MAX,
-                DvGatewayMode::Unqualified(u8::MAX),
-                "unqualified value 255",
+                DvGatewayMode::Unnamed(u8::MAX),
+                "unnamed value 255",
             ),
         ] {
             assert_eq!(
@@ -236,7 +236,7 @@ mod tests {
             if raw != 0 && raw != 2 {
                 assert_eq!(
                     mode,
-                    DvGatewayMode::Unqualified(raw),
+                    DvGatewayMode::Unnamed(raw),
                     "unobserved GW {raw} must not acquire a named meaning"
                 );
             }
@@ -244,9 +244,9 @@ mod tests {
     }
 
     #[test]
-    fn unqualified_wire_values_are_preserved() {
+    fn unnamed_wire_values_are_preserved() {
         assert!(Band::try_from(2).is_err());
-        assert_eq!(OperatingMode::from(5), OperatingMode::Unqualified(5));
-        assert_eq!(DvGatewayMode::from(3), DvGatewayMode::Unqualified(3));
+        assert_eq!(OperatingMode::from(5), OperatingMode::Unnamed(5));
+        assert_eq!(DvGatewayMode::from(3), DvGatewayMode::Unnamed(3));
     }
 }

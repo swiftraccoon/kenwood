@@ -126,8 +126,12 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Errors
     ///
-    /// See the module contract; a frequency outside the band's range is
-    /// answered `N`.
+    /// See the module contract. A frequency outside the band's ranges is not
+    /// refused: on firmware 1.02 the radio tunes the next range's lower edge
+    /// from a gap between Band A's ranges (300 MHz became 410 MHz) and 1 MHz
+    /// below the top edge from above it (524 MHz on Band B became 523 MHz),
+    /// and echoes that frequency, so this returns
+    /// [`ProtocolError::UnexpectedResponse`] after the VFO has moved.
     pub async fn set_frequency(&mut self, band: Band, frequency: Frequency) -> Result<(), Error> {
         self.apply(
             Command::SetFrequency { band, frequency },
@@ -455,7 +459,7 @@ impl<T: Transport> Radio<T> {
     }
 
     async fn step_control_band(&mut self, band: Band, step: Command) -> Result<Frequency, Error> {
-        self.require_qualified_write_target().await?;
+        self.require_write_target().await?;
         let roles = self.get_band_control().await?;
         if roles.control != band {
             return Err(Error::NotControlBand {
@@ -528,7 +532,7 @@ impl<T: Transport> Radio<T> {
         band: Band,
         address: MemoryChannelAddress,
     ) -> Result<(), Error> {
-        self.require_qualified_write_target().await?;
+        self.require_write_target().await?;
         self.query(
             Command::RecallMemoryChannel { band, address },
             "MemoryRecallAck",
@@ -589,7 +593,7 @@ impl<T: Transport> Radio<T> {
         address: MemoryChannelAddress,
         record: CatMemoryChannelRecord,
     ) -> Result<CatMemoryChannelRecord, Error> {
-        self.require_qualified_write_target().await?;
+        self.require_write_target().await?;
         let extract = |response: &Response| match response {
             Response::MemoryChannel { record, .. } => Some(record.clone()),
             _ => None,
@@ -645,7 +649,7 @@ impl<T: Transport> Radio<T> {
         &mut self,
         address: MemoryChannelAddress,
     ) -> Result<(), Error> {
-        self.require_qualified_write_target().await?;
+        self.require_write_target().await?;
         self.query(
             Command::ClearMemoryChannel { address },
             "MemoryChannelCleared",

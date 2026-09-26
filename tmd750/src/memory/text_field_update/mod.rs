@@ -195,11 +195,11 @@ pub enum TextFieldUpdateEvent<'a, G: GuardPolicy> {
     },
     /// Report that a private journal record holding the identity, the exact
     /// original and desired pages, and this intent has been written and
-    /// synchronized to durable storage before the `W` frame is sent.
+    /// synchronized to storage before the `W` frame is sent.
     ///
     /// Accepting this event sets [`TextFieldUpdateStatus::PossiblyChanged`],
     /// which no later error clears, even if the write is never dispatched.
-    DurableWriteIntent {
+    IntentJournaled {
         /// Identifier of the sole journal write-intent record, not a session ID.
         id: NonZeroU64,
     },
@@ -417,7 +417,7 @@ impl<V: TextValue, G: GuardPolicy> TextFieldUpdate<V, G> {
 
     /// Validate the exact next event and advance the sequence.
     ///
-    /// An accepted [`TextFieldUpdateEvent::DurableWriteIntent`] sets status to
+    /// An accepted [`TextFieldUpdateEvent::IntentJournaled`] sets status to
     /// [`TextFieldUpdateStatus::PossiblyChanged`] before dispatch could occur.
     /// Any error permanently halts further acceptance without clearing it.
     ///
@@ -463,7 +463,7 @@ impl<V: TextValue, G: GuardPolicy> TextFieldUpdate<V, G> {
                     guards,
                 },
             ) => self.fresh_session(session, id, identity, memory_format, whole_page, &guards),
-            (Phase::Intent, TextFieldUpdateEvent::DurableWriteIntent { id }) => {
+            (Phase::Intent, TextFieldUpdateEvent::IntentJournaled { id }) => {
                 if self.intent.is_some() {
                     return Err(TextFieldUpdateError::UnexpectedEvent);
                 }

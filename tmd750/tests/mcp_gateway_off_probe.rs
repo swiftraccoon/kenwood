@@ -105,7 +105,7 @@ fn assert_no_memory_write(mock: &MockTransport) {
         mock.writes()
             .iter()
             .all(|bytes| !matches!(bytes.first(), Some(b'W' | b'Z'))),
-        "fixed qualification must never dispatch a memory-write or fill frame"
+        "the fixed probe must never dispatch a memory-write or fill frame"
     );
     mock.assert_complete();
 }
@@ -274,8 +274,8 @@ async fn another_radio_model_is_refused_before_any_remaining_preflight() {
 async fn terminal_and_unnamed_gateway_states_are_retained_but_never_enter_mcp() {
     for (reply, expected) in [
         (b"GW 2\r".as_slice(), DvGatewayMode::Terminal),
-        (b"GW 1\r".as_slice(), DvGatewayMode::Unqualified(1)),
-        (b"GW 255\r".as_slice(), DvGatewayMode::Unqualified(255)),
+        (b"GW 1\r".as_slice(), DvGatewayMode::Unnamed(1)),
+        (b"GW 255\r".as_slice(), DvGatewayMode::Unnamed(255)),
     ] {
         let mut mock = MockTransport::new();
         identity(&mut mock, b"FV 1.02\r", b"TY K,2,1\r");

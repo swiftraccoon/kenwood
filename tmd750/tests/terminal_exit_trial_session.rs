@@ -149,7 +149,7 @@ impl Transport for AuditedTransport {
             assert_eq!(
                 self.audit.intents.load(Ordering::SeqCst),
                 1,
-                "the sole W requires exactly one successful durable-intent callback"
+                "the sole W requires exactly one successful journal callback"
             );
             assert_eq!(
                 self.audit.completed_reads.load(Ordering::SeqCst),
@@ -447,7 +447,7 @@ async fn wrong_complete_identity_prevents_gateway_entry_and_intent() -> TestResu
                 report.outcome,
                 TerminalExitTrialSessionOutcome::Failed {
                     stage: TerminalExitTrialSessionStage::Identity,
-                    error: TerminalExitTrialSessionError::Evidence(
+                    error: TerminalExitTrialSessionError::Rejected(
                         TerminalExitTrialError::IdentityMismatch
                     ),
                 }
@@ -515,7 +515,7 @@ async fn wrong_gateway_is_retained_and_refused_in_both_sessions() -> TestResult 
             assert!(
                 matches!(report.outcome, TerminalExitTrialSessionOutcome::Failed {
                 stage: TerminalExitTrialSessionStage::Gateway,
-                error: TerminalExitTrialSessionError::Evidence(TerminalExitTrialError::GatewayModeMismatch { expected: wanted, actual: observed }),
+                error: TerminalExitTrialSessionError::Rejected(TerminalExitTrialError::GatewayModeMismatch { expected: wanted, actual: observed }),
             } if wanted == expected && observed == actual),
                 "each session must reject every wrong Gateway state before MCP"
             );
@@ -602,7 +602,7 @@ async fn unsupported_format_stops_before_control_routing_and_target_reads() -> T
             report.outcome,
             TerminalExitTrialSessionOutcome::Failed {
                 stage: TerminalExitTrialSessionStage::FreshComparison,
-                error: TerminalExitTrialSessionError::Evidence(
+                error: TerminalExitTrialSessionError::Rejected(
                     TerminalExitTrialError::MemoryFormat { actual: 1 }
                 ),
             }
@@ -704,7 +704,7 @@ async fn every_guard_and_unrelated_page_byte_is_immutable_before_intent() -> Tes
             McpProbeExit::Acknowledged,
             "known-boundary refusal should exit safely"
         );
-        assert!(!called, "any drift must prevent durable intent");
+        assert!(!called, "any drift must prevent the intent journal");
         assert_blocked(&mut radio).await;
         radio.into_transport().assert_complete();
     }
@@ -812,8 +812,8 @@ async fn failed_intent_prevents_write_and_preserves_any_independent_exit_error()
             matches!(
                 report.outcome,
                 TerminalExitTrialSessionOutcome::Failed {
-                    stage: TerminalExitTrialSessionStage::DurableIntent,
-                    error: TerminalExitTrialSessionError::DurableIntent(_),
+                    stage: TerminalExitTrialSessionStage::IntentJournal,
+                    error: TerminalExitTrialSessionError::IntentJournal(_),
                 }
             ),
             "the intent failure must remain the first failure"
@@ -1002,7 +1002,7 @@ async fn a_complete_payload_without_the_read_ack_cannot_authorize_intent() -> Te
     );
     assert!(
         !called,
-        "the durable intent cannot precede the target read ACK"
+        "the intent journal cannot precede the target read ACK"
     );
     assert_blocked(&mut radio).await;
     let mock = radio.into_transport();
@@ -1234,7 +1234,7 @@ async fn a_second_connection_cannot_skip_external_finalization() -> TestResult {
             report.outcome,
             TerminalExitTrialSessionOutcome::Failed {
                 stage: TerminalExitTrialSessionStage::Preparation,
-                error: TerminalExitTrialSessionError::Evidence(
+                error: TerminalExitTrialSessionError::Rejected(
                     TerminalExitTrialError::UnexpectedEvent
                 ),
             }

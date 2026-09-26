@@ -80,7 +80,7 @@ fn fresh(fixture: &mut Fixture, session: u64) -> TestResult {
 fn intent(fixture: &mut Fixture) -> TestResult {
     fixture
         .update
-        .record(TextFieldUpdateEvent::DurableWriteIntent { id: id(1)? })?;
+        .record(TextFieldUpdateEvent::IntentJournaled { id: id(1)? })?;
     Ok(())
 }
 

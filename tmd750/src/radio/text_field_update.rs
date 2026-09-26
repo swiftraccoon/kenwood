@@ -15,7 +15,7 @@ use crate::memory::{
     TextFieldUpdate, TextFieldUpdateError, TextFieldUpdateEvent, TextFieldUpdateSession,
     TextFieldUpdateStatus, TextValue,
 };
-use crate::radio::qualification::{McpProbeExit, McpProbeSegment};
+use crate::radio::probe::{McpProbeExit, McpProbeSegment};
 use crate::types::{Address, DvGatewayMode, PAGE_SIZE, Page, RadioModel};
 use kenwood_transport::Transport;
 
@@ -40,8 +40,9 @@ pub enum TextFieldUpdateSessionStage {
     /// Compare the format byte, the guards and the complete page with the
     /// required before-image.
     FreshComparison,
-    /// Durably record the caller's intent before the only W command.
-    DurableIntent,
+    /// Run `before_write`, which writes and synchronizes the caller's journal
+    /// record, before the only W command.
+    IntentJournal,
     /// Dispatch the single complete page and require its acknowledgment.
     Write,
     /// Obtain and compare every byte of the immediate post-write page.
@@ -57,12 +58,13 @@ pub enum TextFieldUpdateSessionError {
     /// CAT, MCP, transport, or individual exchange timeout failure.
     #[error(transparent)]
     Io(#[from] Error),
-    /// The update's narrow scope or session sequence rejected the operation.
+    /// The update rejected an event: wrong order, a scope violation or a
+    /// failed comparison.
     #[error(transparent)]
-    Evidence(#[from] TextFieldUpdateError),
-    /// The `before_write` callback failed to record the intent before dispatch.
+    Rejected(#[from] TextFieldUpdateError),
+    /// The `before_write` callback returned an error; no W was sent.
     #[error("text field update journal record failed: {0}")]
-    DurableIntent(#[source] std::io::Error),
+    IntentJournal(#[source] std::io::Error),
 }
 
 /// How far the sole W frame reached on the wire.
@@ -85,7 +87,8 @@ pub enum TextFieldUpdateSessionOutcome {
     ///
     /// The caller closes and drops the transport, verifies a fresh CAT
     /// identity (and Gateway Off for [`GuardKind::PmOffGateway`]), closes that
-    /// connection, and durably records the report before `SessionFinalized`.
+    /// connection, and writes and synchronizes the report before
+    /// `SessionFinalized`.
     AwaitingCatVerification,
     /// Cancellation was honored before accepting the only write intent.
     ///
@@ -297,9 +300,10 @@ impl<T: Transport> Radio<T> {
     /// the format byte. Every session reads format byte 10 and the complete
     /// target page and requires exact equality with the appropriate immutable
     /// page. No merge or rebase occurs. In the apply session, `before_write`
-    /// must durably record the identity, both pages, and exact intent. Its
-    /// successful return permits recording the possible-write status and
-    /// dispatching one W frame. The immediate readback compares all 256 bytes.
+    /// must write and synchronize a journal record of the identity, both
+    /// pages, and the exact intent. Its successful return permits recording
+    /// the possible-write status and dispatching one W frame. The immediate
+    /// readback compares all 256 bytes.
     /// Verification is a separate read-only session; no RF command is sent in
     /// either session.
     ///
@@ -308,7 +312,7 @@ impl<T: Transport> Radio<T> {
     /// CAT, baud, or close operation on the retired handle. The caller closes
     /// and drops it, verifies a matching identity on a fresh connection (and
     /// Gateway Off for [`GuardKind::PmOffGateway`]), closes that connection,
-    /// and durably records the report before recording
+    /// and writes and synchronizes the report before recording
     /// [`TextFieldUpdateEvent::SessionFinalized`]. Only then may the caller
     /// open the next session.
     ///
@@ -409,15 +413,15 @@ impl<T: Transport> Radio<T> {
         if phase == TextFieldUpdateSession::Apply {
             before_write(update).map_err(|error| {
                 failure(
-                    Stage::DurableIntent,
-                    TextFieldUpdateSessionError::DurableIntent(error),
+                    Stage::IntentJournal,
+                    TextFieldUpdateSessionError::IntentJournal(error),
                 )
             })?;
             update
-                .record(TextFieldUpdateEvent::DurableWriteIntent {
+                .record(TextFieldUpdateEvent::IntentJournaled {
                     id: NonZeroU64::MIN,
                 })
-                .map_err(|error| failure(Stage::DurableIntent, error))?;
+                .map_err(|error| failure(Stage::IntentJournal, error))?;
             self.write_text_field(update, report)
                 .await
                 .map_err(|error| failure(Stage::Write, error))?;

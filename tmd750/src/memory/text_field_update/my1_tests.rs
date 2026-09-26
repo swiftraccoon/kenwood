@@ -177,7 +177,7 @@ fn advance(fixture: &mut Fixture, count: usize) -> TestResult {
             0 => fresh(fixture, false)?,
             1 => fixture
                 .update
-                .record(TextFieldUpdateEvent::DurableWriteIntent { id: id(7)? })?,
+                .record(TextFieldUpdateEvent::IntentJournaled { id: id(7)? })?,
             2 => fixture
                 .update
                 .record(TextFieldUpdateEvent::ImmediateReadback {
@@ -683,7 +683,7 @@ fn all_six_events_are_required_before_verified_status() -> TestResult {
             }
             1 => fixture
                 .update
-                .record(TextFieldUpdateEvent::DurableWriteIntent { id: id(7)? })?,
+                .record(TextFieldUpdateEvent::IntentJournaled { id: id(7)? })?,
             2 => fixture
                 .update
                 .record(TextFieldUpdateEvent::ImmediateReadback {
@@ -809,8 +809,8 @@ fn fresh_guards_are_mandatory_in_both_apply_and_verify() -> TestResult {
             }
             let gateway_mode = match fault {
                 1 => DvGatewayMode::Terminal,
-                2 => DvGatewayMode::Unqualified(255),
-                6 => DvGatewayMode::Unqualified(0),
+                2 => DvGatewayMode::Unnamed(255),
+                6 => DvGatewayMode::Unnamed(0),
                 _ => DvGatewayMode::Off,
             };
             let page = if phase == 0 {
@@ -868,8 +868,8 @@ fn both_finalizations_require_the_current_id_exact_fresh_identity_and_gateway_of
             }
             let gateway_mode = match fault {
                 2 => DvGatewayMode::Terminal,
-                3 => DvGatewayMode::Unqualified(1),
-                4 => DvGatewayMode::Unqualified(0),
+                3 => DvGatewayMode::Unnamed(1),
+                4 => DvGatewayMode::Unnamed(0),
                 _ => DvGatewayMode::Off,
             };
             let session = if fault == 0 {
@@ -973,7 +973,7 @@ fn every_out_of_order_event_halts_without_resetting_status_or_images() -> TestRe
                         control_page: &fixture.control,
                     },
                 },
-                1 => TextFieldUpdateEvent::DurableWriteIntent { id: id(7)? },
+                1 => TextFieldUpdateEvent::IntentJournaled { id: id(7)? },
                 2 => TextFieldUpdateEvent::ImmediateReadback {
                     whole_page: &fixture.desired,
                 },
@@ -1039,7 +1039,7 @@ fn halt_is_sticky_at_every_phase_and_cannot_erase_completed_verification() -> Te
         assert_eq!(
             fixture
                 .update
-                .record(TextFieldUpdateEvent::DurableWriteIntent { id: id(8)? }),
+                .record(TextFieldUpdateEvent::IntentJournaled { id: id(8)? }),
             Err(TextFieldUpdateError::TerminalState),
             "a new intent cannot revive a halted or completed update"
         );

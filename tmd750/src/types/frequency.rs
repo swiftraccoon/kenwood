@@ -13,17 +13,20 @@ pub const WIRE_DIGITS: usize = 10;
 
 /// A frequency in hertz inside the receiver range.
 ///
-/// Band A receives 108-174, 216-260 and 410-470 MHz and Band B 108-524 MHz;
-/// this type bounds their union. A write outside the selected band's range is
-/// answered `N` by the radio.
+/// Band A receives 108-174, 216-260 and 410-470 MHz and Band B 108-524 MHz,
+/// each upper edge excluded on firmware 1.02; this type bounds their union.
+/// The radio does not refuse a write outside the selected band's ranges: it
+/// tunes a nearby in-range frequency and echoes that instead, as
+/// [`Radio::set_frequency`](crate::Radio::set_frequency) describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Frequency(u32);
 
 impl Frequency {
     /// Lowest receivable frequency, 108 MHz.
     pub const MIN_HZ: u32 = 108_000_000;
-    /// Highest receivable frequency, 524 MHz.
-    pub const MAX_HZ: u32 = 524_000_000;
+    /// Highest receivable frequency, the last hertz below 524 MHz: Band B
+    /// excludes 524 MHz itself, whose write firmware 1.02 moved to 523 MHz.
+    pub const MAX_HZ: u32 = 523_999_999;
 
     /// Validate a frequency in hertz.
     ///
@@ -408,8 +411,16 @@ mod tests {
         assert_eq!(frequency.to_wire_string(), "0145190000");
         assert_eq!(frequency.to_string(), "145.190000 MHz");
         assert_eq!(
-            Frequency::from_wire_str("0524000000")?.as_hz(),
+            Frequency::from_wire_str("0523999999")?.as_hz(),
             Frequency::MAX_HZ
+        );
+        let excluded = Frequency::from_wire_str("0524000000");
+        assert!(
+            matches!(
+                excluded,
+                Err(ValidationError::FrequencyOutOfRange { hz: 524_000_000 })
+            ),
+            "Band B's upper edge is excluded: {excluded:?}"
         );
         for text in ["145190000", "01451900000", "0145190O00", "", "-145190000"] {
             let result = Frequency::from_wire_str(text);

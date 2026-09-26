@@ -427,6 +427,36 @@ async fn the_next_reply_deadline_covers_one_held_reply_only() -> TestResult {
 }
 
 #[tokio::test]
+async fn bluetooth_constructors_extend_only_the_first_reply() -> TestResult {
+    let mut fresh = Radio::new_bluetooth(TestTransport::new([]));
+    assert_eq!(
+        fresh.reply_timeout(&Command::GetBluetooth),
+        BLUETOOTH_FIRST_REPLY_TIMEOUT
+    );
+    assert_eq!(fresh.reply_timeout(&Command::GetBluetooth), DEFAULT_TIMEOUT);
+    for (since_exit, first) in [
+        (Duration::ZERO, BLUETOOTH_EXIT_REPLY_BOUND),
+        (
+            Duration::from_secs(4),
+            BLUETOOTH_EXIT_REPLY_BOUND.saturating_sub(Duration::from_secs(4)),
+        ),
+        (Duration::from_secs(25), BLUETOOTH_FIRST_REPLY_TIMEOUT),
+    ] {
+        let mut reopened = Radio::new_bluetooth_after_exit(TestTransport::new([]), since_exit);
+        assert_eq!(
+            reopened.reply_timeout(&Command::GetBluetooth),
+            first,
+            "{since_exit:?}"
+        );
+        assert_eq!(
+            reopened.reply_timeout(&Command::GetBluetooth),
+            DEFAULT_TIMEOUT
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn the_next_reply_deadline_is_consumed_once_and_never_shortens() -> TestResult {
     let mut radio = Radio::new(TestTransport::new([]));
     radio.set_next_reply_timeout(Duration::from_secs(10));

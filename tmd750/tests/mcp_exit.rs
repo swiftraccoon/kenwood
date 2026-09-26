@@ -142,7 +142,7 @@ fn assert_stopped_at_exit(mock: &MockTransport, count: usize) {
         mock.writes()
             .iter()
             .all(|write| !matches!(write.first(), Some(b'W' | b'Z'))),
-        "qualification must never program or fill memory"
+        "the probe must never program or fill memory"
     );
     mock.assert_complete();
 }

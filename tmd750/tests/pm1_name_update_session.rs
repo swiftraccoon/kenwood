@@ -106,7 +106,7 @@ fn session_script(update: &Pm1NameUpdate) -> Result<MockTransport, Box<dyn std::
 #[derive(Debug)]
 struct AuditedTransport {
     mock: MockTransport,
-    durable_intents: Arc<AtomicUsize>,
+    journaled_intents: Arc<AtomicUsize>,
     memory_writes: usize,
     exited: bool,
     baud_changes: Vec<u32>,
@@ -121,10 +121,10 @@ enum WriteFailure {
 }
 
 impl AuditedTransport {
-    fn new(mock: MockTransport, durable_intents: &Arc<AtomicUsize>) -> Self {
+    fn new(mock: MockTransport, journaled_intents: &Arc<AtomicUsize>) -> Self {
         Self {
             mock,
-            durable_intents: Arc::clone(durable_intents),
+            journaled_intents: Arc::clone(journaled_intents),
             memory_writes: 0,
             exited: false,
             baud_changes: Vec::new(),
@@ -139,9 +139,9 @@ impl Transport for AuditedTransport {
         assert!(!self.exited, "the original handle must be retired after E");
         if bytes.first() == Some(&b'W') {
             assert_eq!(
-                self.durable_intents.load(Ordering::SeqCst),
+                self.journaled_intents.load(Ordering::SeqCst),
                 1,
-                "the durable callback must precede W"
+                "the journal callback must precede W"
             );
             assert_eq!(
                 bytes.len(),
@@ -303,7 +303,7 @@ async fn exact_two_session_scope_writes_once_and_requires_external_finalization(
 }
 
 #[tokio::test]
-async fn firmware_or_type_mismatch_prevents_entry_and_durable_intent() -> TestResult {
+async fn firmware_or_type_mismatch_prevents_entry_and_the_intent_journal() -> TestResult {
     for (firmware, radio_type) in [("1.03", "K,2,1"), ("1.02", "J,2,1")] {
         let mut update = fixture()?;
         let mut mock = MockTransport::new();
@@ -325,7 +325,7 @@ async fn firmware_or_type_mismatch_prevents_entry_and_durable_intent() -> TestRe
                 report.outcome,
                 TextFieldUpdateSessionOutcome::Failed {
                     stage: TextFieldUpdateSessionStage::Identity,
-                    error: TextFieldUpdateSessionError::Evidence(
+                    error: TextFieldUpdateSessionError::Rejected(
                         TextFieldUpdateError::IdentityMismatch
                     ),
                 }
@@ -379,10 +379,10 @@ async fn whole_page_drift_or_unsupported_format_refuses_w_without_merging() -> T
                 report.outcome,
                 TextFieldUpdateSessionOutcome::Failed {
                     stage: TextFieldUpdateSessionStage::FreshComparison,
-                    error: TextFieldUpdateSessionError::Evidence(_),
+                    error: TextFieldUpdateSessionError::Rejected(_),
                 }
             ),
-            "fresh evidence must reject drift before intent: {report:?}"
+            "the fresh comparison must reject drift before intent: {report:?}"
         );
         assert_eq!(report.exit, McpProbeExit::Acknowledged);
         assert_eq!(report.write, TextFieldUpdateWriteDisposition::NotAttempted);
@@ -396,7 +396,7 @@ async fn whole_page_drift_or_unsupported_format_refuses_w_without_merging() -> T
 }
 
 #[tokio::test]
-async fn failed_durable_intent_prevents_w_and_retains_an_additional_exit_error() -> TestResult {
+async fn failed_intent_journal_prevents_w_and_retains_an_additional_exit_error() -> TestResult {
     for exit_ack in [ACK, 0x15] {
         let mut update = fixture()?;
         let mut mock = MockTransport::new();
@@ -407,18 +407,18 @@ async fn failed_durable_intent_prevents_w_and_retains_an_additional_exit_error()
             .set_text_field_session_until_exit(
                 &mut update,
                 || false,
-                |_| Err(io::Error::other("durable synchronization failed")),
+                |_| Err(io::Error::other("journal synchronization failed")),
             )
             .await;
         assert!(
             matches!(
                 report.outcome,
                 TextFieldUpdateSessionOutcome::Failed {
-                    stage: TextFieldUpdateSessionStage::DurableIntent,
-                    error: TextFieldUpdateSessionError::DurableIntent(_),
+                    stage: TextFieldUpdateSessionStage::IntentJournal,
+                    error: TextFieldUpdateSessionError::IntentJournal(_),
                 }
             ),
-            "preserve the original durable-intent failure: {report:?}"
+            "preserve the original intent journal failure: {report:?}"
         );
         assert_eq!(report.cleanup_error.is_some(), exit_ack != ACK);
         assert_eq!(
@@ -685,7 +685,7 @@ async fn complete_wrong_readback_exits_without_claiming_verification_or_rolling_
             report.outcome,
             TextFieldUpdateSessionOutcome::Failed {
                 stage: TextFieldUpdateSessionStage::ImmediateReadback,
-                error: TextFieldUpdateSessionError::Evidence(TextFieldUpdateError::PageMismatch),
+                error: TextFieldUpdateSessionError::Rejected(TextFieldUpdateError::PageMismatch),
             }
         ),
         "wrong immediate bytes must remain a readback mismatch: {report:?}"
@@ -854,7 +854,7 @@ async fn separate_session_drift_never_rewrites_or_attests_verification() -> Test
             report.outcome,
             TextFieldUpdateSessionOutcome::Failed {
                 stage: TextFieldUpdateSessionStage::FreshComparison,
-                error: TextFieldUpdateSessionError::Evidence(TextFieldUpdateError::PageMismatch),
+                error: TextFieldUpdateSessionError::Rejected(TextFieldUpdateError::PageMismatch),
             }
         ),
         "fresh-session drift must remain a full-page mismatch: {report:?}"

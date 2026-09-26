@@ -26,6 +26,15 @@ pub const TMD750_PANEL_PID: u16 = 0x9032;
 /// Hardware-validated CAT baud rate, also used by the official MCP program.
 pub const DEFAULT_BAUD: u32 = 9600;
 
+/// The TM-D750's two USB CDC endpoints, identified by product id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsbRole {
+    /// The main unit's endpoint, [`TMD750_MAIN_PID`].
+    MainUnit,
+    /// The operation panel's endpoint, [`TMD750_PANEL_PID`].
+    OperationPanel,
+}
+
 /// A serial port that may be a TM-D750; only an `ID` reply proves it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SerialCandidate {
@@ -44,11 +53,21 @@ impl SerialCandidate {
         self.vid == Some(KENWOOD_VID)
     }
 
+    /// The TM-D750 USB role of this port, from its vendor and product ids;
+    /// `None` for every other port.
+    #[must_use]
+    pub const fn usb_role(&self) -> Option<UsbRole> {
+        match (self.vid, self.pid) {
+            (Some(KENWOOD_VID), Some(TMD750_MAIN_PID)) => Some(UsbRole::MainUnit),
+            (Some(KENWOOD_VID), Some(TMD750_PANEL_PID)) => Some(UsbRole::OperationPanel),
+            _ => None,
+        }
+    }
+
     /// Whether this is one of the TM-D750's two observed USB endpoints.
     #[must_use]
-    pub fn is_tmd750(&self) -> bool {
-        self.vid == Some(KENWOOD_VID)
-            && (self.pid == Some(TMD750_MAIN_PID) || self.pid == Some(TMD750_PANEL_PID))
+    pub const fn is_tmd750(&self) -> bool {
+        self.usb_role().is_some()
     }
 }
 
@@ -207,6 +226,34 @@ mod tests {
             assert_eq!(source.to_string(), "source description");
         }
         Ok(())
+    }
+
+    #[test]
+    fn usb_roles_follow_the_kenwood_product_ids_only() {
+        let candidate = |vid, pid| SerialCandidate {
+            path: "/dev/cu.test".to_owned(),
+            vid,
+            pid,
+        };
+        for (vid, pid, role) in [
+            (
+                Some(KENWOOD_VID),
+                Some(TMD750_MAIN_PID),
+                Some(UsbRole::MainUnit),
+            ),
+            (
+                Some(KENWOOD_VID),
+                Some(TMD750_PANEL_PID),
+                Some(UsbRole::OperationPanel),
+            ),
+            (Some(KENWOOD_VID), Some(0x9023), None),
+            (Some(0x1234), Some(TMD750_PANEL_PID), None),
+            (None, None, None),
+        ] {
+            let candidate = candidate(vid, pid);
+            assert_eq!(candidate.usb_role(), role, "{vid:?}/{pid:?}");
+            assert_eq!(candidate.is_tmd750(), role.is_some(), "{vid:?}/{pid:?}");
+        }
     }
 
     #[test]

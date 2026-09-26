@@ -167,7 +167,7 @@ impl TrialSequence {
                     whole_page,
                 },
             ) => self.fresh_session(session, id, identity, memory_format, whole_page),
-            (Phase::Intent(expected), PmNameTrialEvent::DurableWriteIntent { id, write }) => {
+            (Phase::Intent(expected), PmNameTrialEvent::IntentJournaled { id, write }) => {
                 if write != expected {
                     return Err(PmNameTrialError::UnexpectedEvent);
                 }

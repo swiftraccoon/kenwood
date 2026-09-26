@@ -115,7 +115,7 @@ impl Transport for AuditedTransport {
             assert_eq!(
                 self.intents.load(Ordering::SeqCst),
                 1,
-                "the exact durable intent must precede the only session W"
+                "the exact journaled intent must precede the only session W"
             );
             assert_eq!(
                 bytes.len(),
@@ -179,7 +179,7 @@ fn assert_session_success(report: &PmNameTrialSessionReport, trial: &MyCallsignT
             report.outcome,
             PmNameTrialSessionOutcome::AwaitingCatVerification
         ),
-        "only independent CAT, capture, and durable finalization may remain: {report:?}"
+        "only independent CAT, capture, and synchronized finalization may remain: {report:?}"
     );
     assert_eq!(
         report.identity.as_ref(),
@@ -334,14 +334,14 @@ async fn mismatching_identity_prevents_gateway_query_and_mcp_entry() -> TestResu
             report.outcome,
             PmNameTrialSessionOutcome::Failed {
                 stage: PmNameTrialSessionStage::Identity,
-                error: PmNameTrialSessionError::Evidence(PmNameTrialError::IdentityMismatch),
+                error: PmNameTrialSessionError::Rejected(PmNameTrialError::IdentityMismatch),
             }
         ),
         "the exact firmware identity must be checked before all further commands"
     );
     assert!(
         !called,
-        "identity mismatch must prevent the durable intent callback"
+        "identity mismatch must prevent the intent journal callback"
     );
     assert_eq!(
         report.gateway_mode, None,
@@ -359,10 +359,10 @@ async fn mismatching_identity_prevents_gateway_query_and_mcp_entry() -> TestResu
 #[tokio::test]
 async fn every_nonzero_gateway_value_is_retained_and_refused_before_entry() -> TestResult {
     for (raw, expected) in [
-        (1, DvGatewayMode::Unqualified(1)),
+        (1, DvGatewayMode::Unnamed(1)),
         (2, DvGatewayMode::Terminal),
-        (3, DvGatewayMode::Unqualified(3)),
-        (u8::MAX, DvGatewayMode::Unqualified(u8::MAX)),
+        (3, DvGatewayMode::Unnamed(3)),
+        (u8::MAX, DvGatewayMode::Unnamed(u8::MAX)),
     ] {
         let mut trial = fixture()?;
         let mut mock = MockTransport::new();
@@ -383,7 +383,7 @@ async fn every_nonzero_gateway_value_is_retained_and_refused_before_entry() -> T
         assert!(
             matches!(report.outcome, PmNameTrialSessionOutcome::Failed {
             stage: PmNameTrialSessionStage::GatewayGuard,
-            error: PmNameTrialSessionError::Evidence(PmNameTrialError::GatewayMode { actual }),
+            error: PmNameTrialSessionError::Rejected(PmNameTrialError::GatewayMode { actual }),
         } if actual == expected),
             "only typed Off can pass the CAT guard"
         );
@@ -404,7 +404,7 @@ async fn every_nonzero_gateway_value_is_retained_and_refused_before_entry() -> T
         );
         assert!(
             !called,
-            "nonzero GW must prevent the durable intent callback"
+            "nonzero GW must prevent the intent journal callback"
         );
         radio.into_transport().assert_complete();
     }
@@ -598,7 +598,7 @@ async fn every_pre_intent_cancellation_boundary_retains_safe_cleanup() -> TestRe
         );
         assert!(
             !called,
-            "pre-intent cancellation must not call the durable intent callback"
+            "pre-intent cancellation must not call the intent journal callback"
         );
         assert!(
             trial.next_session().is_err(),
@@ -610,7 +610,7 @@ async fn every_pre_intent_cancellation_boundary_retains_safe_cleanup() -> TestRe
 }
 
 #[tokio::test]
-async fn failed_durable_intent_prevents_write_and_retains_additional_exit_error() -> TestResult {
+async fn failed_intent_journal_prevents_write_and_retains_additional_exit_error() -> TestResult {
     let mut trial = fixture()?;
     let mut mock = MockTransport::new();
     preflight(&mut mock, &trial, trial.original_page())?;
@@ -627,8 +627,8 @@ async fn failed_durable_intent_prevents_write_and_retains_additional_exit_error(
         matches!(
             report.outcome,
             PmNameTrialSessionOutcome::Failed {
-                stage: PmNameTrialSessionStage::DurableIntent,
-                error: PmNameTrialSessionError::DurableIntent(_),
+                stage: PmNameTrialSessionStage::IntentJournal,
+                error: PmNameTrialSessionError::IntentJournal(_),
             }
         ),
         "the first failure must remain the unsynchronized intent"
@@ -750,7 +750,7 @@ async fn incomplete_guard_read_keeps_only_complete_evidence_and_sends_no_exit() 
     assert_eq!(
         report.status,
         PmNameTrialStatus::NotWritten,
-        "no durable intent was reached"
+        "no journaled intent was reached"
     );
     assert_blocked(&mut radio).await;
     radio.into_transport().assert_complete();
@@ -861,14 +861,14 @@ async fn changed_page_drift_in_restore_session_forbids_a_stale_restoration() -> 
             report.outcome,
             PmNameTrialSessionOutcome::Failed {
                 stage: PmNameTrialSessionStage::FreshComparison,
-                error: PmNameTrialSessionError::Evidence(PmNameTrialError::PageMismatch),
+                error: PmNameTrialSessionError::Rejected(PmNameTrialError::PageMismatch),
             }
         ),
         "restoration must compare the entire expected changed page without rebasing"
     );
     assert!(
         !called,
-        "stale restoration must never reach durable intent or W"
+        "stale restoration must never reach the intent journal or W"
     );
     assert_eq!(
         report.write,

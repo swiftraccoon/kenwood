@@ -12,6 +12,7 @@ use super::*;
 use crate::protocol::mcp::{ACK, read_request, regions, write_request};
 use crate::radio::menu::MenuFieldSnapshot;
 use crate::radio::programming::{McpJournal, PageReplacement};
+use crate::radio::readiness::{SETTLE_QUIET, SettleOutcome};
 use crate::radio::terminal::session::TerminalPhase;
 use crate::transport::{KENWOOD_VID, TMD750_PANEL_PID};
 use crate::types::{FirmwareIdentity, Page, RadioModel, RadioType, Region};
@@ -80,6 +81,21 @@ fn identity_only() -> MockTransport {
     mock.expect(b"FV\r", b"FV 1.02\r");
     mock.expect(b"TY\r", b"TY K,2,1\r");
     mock
+}
+
+/// [`cat`] with the `ID` reply held for `hold`, as a Bluetooth connection
+/// opened soon after another one closed holds its first reply.
+fn held_cat(
+    gateway: u8,
+    hold: std::time::Duration,
+) -> Result<MockTransport, Box<dyn std::error::Error>> {
+    let mut mock = MockTransport::new();
+    mock.expect_reads(b"ID\r", &[]);
+    mock.queue_read_delayed(b"ID TM-D750\r", u64::try_from(hold.as_millis())?);
+    mock.expect(b"FV\r", b"FV 1.02\r");
+    mock.expect(b"TY\r", b"TY K,2,1\r");
+    mock.expect(b"GW\r", format!("GW {gateway}\r").as_bytes());
+    Ok(mock)
 }
 
 fn frame(page: Page, bytes: &[u8]) -> Vec<u8> {
@@ -164,12 +180,44 @@ struct FakeControl {
     scripts: VecDeque<(&'static str, MockTransport)>,
     log: Log,
     elapsed: std::time::Duration,
+    enumerations: usize,
+    /// Enumerations after this many omit the endpoint.
+    absent_after: Option<usize>,
+}
+
+impl FakeControl {
+    fn new(scripts: impl IntoIterator<Item = (&'static str, MockTransport)>, log: &Log) -> Self {
+        Self {
+            scripts: scripts.into_iter().collect(),
+            log: Arc::clone(log),
+            elapsed: std::time::Duration::ZERO,
+            enumerations: 0,
+            absent_after: None,
+        }
+    }
+
+    fn control_opens(&self) -> Result<usize, Box<dyn std::error::Error>> {
+        Ok(self
+            .log
+            .lock()
+            .map_err(|_| "log poisoned")?
+            .iter()
+            .filter(|event| **event == Seen::ControlOpen)
+            .count())
+    }
 }
 
 impl ControlHost for FakeControl {
     type Connection = Conn;
 
     fn enumerate(&mut self) -> Result<Vec<SerialCandidate>, TransportError> {
+        self.enumerations += 1;
+        if self
+            .absent_after
+            .is_some_and(|count| self.enumerations > count)
+        {
+            return Ok(Vec::new());
+        }
         Ok(vec![endpoint()])
     }
 
@@ -292,11 +340,7 @@ async fn bluetooth_entry_writes_over_the_modem_then_proves_and_restores() -> Tes
     program_into(&mut bluetooth, &snapshot, &forward, true);
     bluetooth.expect(GET_VERSION, VERSION);
 
-    let mut control = FakeControl {
-        scripts: VecDeque::from([("preflight", cat(0))]),
-        log: Arc::clone(&log),
-        elapsed: std::time::Duration::ZERO,
-    };
+    let mut control = FakeControl::new([("preflight", cat(0))], &log);
     let mut modem = FakeModem {
         opens: VecDeque::from([("bluetooth", bluetooth)]),
         log: Arc::clone(&log),
@@ -330,9 +374,9 @@ async fn bluetooth_entry_writes_over_the_modem_then_proves_and_restores() -> Tes
     control.scripts = VecDeque::from([
         ("readiness-before", identity_only()),
         ("restore", restore_script),
-        ("readiness-after", identity_only()),
-        ("verify", cat(0)),
+        ("readiness-after", cat(0)),
     ]);
+    let opens_before = control.control_opens()?;
 
     let report = startup
         .recovery
@@ -344,17 +388,73 @@ async fn bluetooth_entry_writes_over_the_modem_then_proves_and_restores() -> Tes
         journal.checkpoints,
         [(TerminalPhase::Entry, true), (TerminalPhase::Restore, true)]
     );
+    let restored_gateway = report
+        .readiness_after
+        .as_ref()
+        .and_then(|readiness| readiness.attempts.last())
+        .and_then(|attempt| attempt.connection.as_ref())
+        .and_then(|connection| connection.gateway);
+    assert_eq!(
+        restored_gateway,
+        Some(DvGatewayMode::Off),
+        "the matching post-restoration connection read the restored Gateway"
+    );
+    let settle = report.settle.as_ref().ok_or("settle wait missing")?;
+    assert!(
+        matches!(settle.outcome, SettleOutcome::Settled),
+        "the operation-panel control endpoint settles before programming: {settle:?}"
+    );
+    assert_eq!(settle.elapsed, SETTLE_QUIET);
+    assert_eq!(
+        control.control_opens()? - opens_before,
+        3,
+        "readiness, restoration and readiness with Gateway; no separate verification open"
+    );
     let events = log.lock().map_err(|_| "log poisoned")?;
     let stages_and_drop = [
         events.contains(&Seen::Stage(ControlStage::Preflight)),
-        events.contains(&Seen::Stage(ControlStage::Verification)),
+        events.contains(&Seen::Stage(ControlStage::ReadinessAfterRestore)),
         events.contains(&Seen::Drop("bluetooth")),
     ];
     drop(events);
     assert!(
         stages_and_drop.iter().all(|seen| *seen),
-        "preflight, verification and modem drop are recorded"
+        "preflight, post-restoration readiness and modem drop are recorded"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_bluetooth_modem_link_may_hold_its_first_reply_past_the_regular_deadline() -> TestResult {
+    let snapshot = configuration(0, 1, 1)?;
+    let forward =
+        TerminalPlan::for_route(&identity()?, &snapshot, TerminalGatewayRoute::Bluetooth)?;
+    let log: Log = Arc::default();
+    let hold = crate::radio::DEFAULT_TIMEOUT.saturating_add(std::time::Duration::from_millis(200));
+    let mut bluetooth = held_cat(0, hold)?;
+    program_into(&mut bluetooth, &snapshot, &forward, true);
+    bluetooth.expect(GET_VERSION, VERSION);
+    let mut control = FakeControl::new([("preflight", cat(0))], &log);
+    let mut modem = FakeModem {
+        opens: VecDeque::from([("bluetooth", bluetooth)]),
+        log: Arc::clone(&log),
+    };
+    let mut journal = RecordingJournal::default();
+    let startup = lifecycle()
+        .prepare(
+            &mut control,
+            &mut modem,
+            &mut journal,
+            &AtomicBool::new(false),
+        )
+        .await;
+    assert!(startup.succeeded(), "{:?}", startup.error);
+    let proof = startup.proof.ok_or("missing proof")?;
+    crate::radio::readiness::close_within(
+        proof.into_transport(),
+        std::time::Duration::from_secs(1),
+    )
+    .await?;
     Ok(())
 }
 
@@ -372,11 +472,10 @@ async fn active_route_writes_over_control_and_leaves_the_modem_link_untouched() 
     let mut bluetooth = MockTransport::new();
     bluetooth.expect(GET_VERSION, VERSION);
 
-    let mut control = FakeControl {
-        scripts: VecDeque::from([("preflight", cat(2)), ("active-entry", active_entry)]),
-        log: Arc::clone(&log),
-        elapsed: std::time::Duration::ZERO,
-    };
+    let mut control = FakeControl::new(
+        [("preflight", cat(2)), ("active-entry", active_entry)],
+        &log,
+    );
     let mut modem = FakeModem {
         opens: VecDeque::from([("bluetooth", bluetooth)]),
         log: Arc::clone(&log),
@@ -408,6 +507,14 @@ async fn active_route_writes_over_control_and_leaves_the_modem_link_untouched() 
         "preflight and active entry both open control"
     );
     assert!(active_entry, "programming ran over the control endpoint");
+    let settle = startup
+        .settle
+        .as_ref()
+        .ok_or("active-entry settle missing")?;
+    assert!(
+        matches!(settle.outcome, SettleOutcome::Settled),
+        "the operation-panel control endpoint settles before active entry: {settle:?}"
+    );
     let proof = startup.proof.ok_or("missing proof")?;
     crate::radio::readiness::close_within(
         proof.into_transport(),
@@ -420,14 +527,53 @@ async fn active_route_writes_over_control_and_leaves_the_modem_link_untouched() 
     control.scripts = VecDeque::from([
         ("readiness-before", identity_only()),
         ("restore", restore_script),
-        ("readiness-after", identity_only()),
-        ("verify", cat(2)),
+        ("readiness-after", cat(2)),
     ]);
     let report = startup
         .recovery
         .finish(&mut control, &mut journal, true, &AtomicBool::new(false))
         .await;
     assert!(report.verified(), "{report:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_unsettled_active_route_control_endpoint_is_never_programmed() -> TestResult {
+    let log: Log = Arc::default();
+    let mut control = FakeControl::new([("preflight", cat(2))], &log);
+    control.absent_after = Some(0);
+    let mut modem = FakeModem {
+        opens: VecDeque::from([("bluetooth", MockTransport::new())]),
+        log: Arc::clone(&log),
+    };
+    let mut journal = RecordingJournal::default();
+    let startup = lifecycle()
+        .prepare(
+            &mut control,
+            &mut modem,
+            &mut journal,
+            &AtomicBool::new(false),
+        )
+        .await;
+    assert!(
+        matches!(startup.error, Some(LifecycleError::ControlNotSettled)),
+        "{:?}",
+        startup.error
+    );
+    assert_eq!(startup.recovery.state(), RestorationState::NotRequired);
+    assert_eq!(journal.backups, 0, "no programming session began");
+    assert_eq!(control.control_opens()?, 1, "only the preflight opened");
+    let settle = startup
+        .settle
+        .as_ref()
+        .ok_or("active-entry settle missing")?;
+    assert!(
+        matches!(
+            settle.outcome,
+            SettleOutcome::Failed(ReadinessError::Unsettled { .. })
+        ),
+        "{settle:?}"
+    );
     Ok(())
 }
 
@@ -439,11 +585,7 @@ async fn unsupported_identity_stops_before_opening_the_modem() -> TestResult {
     wrong.expect(b"TY\r", b"TY K,2,1\r");
     wrong.expect(b"GW\r", b"GW 0\r");
     let log: Log = Arc::default();
-    let mut control = FakeControl {
-        scripts: VecDeque::from([("preflight", wrong)]),
-        log: Arc::clone(&log),
-        elapsed: std::time::Duration::ZERO,
-    };
+    let mut control = FakeControl::new([("preflight", wrong)], &log);
     let mut modem = FakeModem {
         opens: VecDeque::new(),
         log: Arc::clone(&log),
@@ -485,11 +627,7 @@ async fn finish_without_release_blocks_restoration_and_sends_no_traffic() -> Tes
         }),
         state: RestorationState::Owed,
     };
-    let mut control = FakeControl {
-        scripts: VecDeque::new(),
-        log: Arc::clone(&log),
-        elapsed: std::time::Duration::ZERO,
-    };
+    let mut control = FakeControl::new([], &log);
     let mut journal = RecordingJournal::default();
     let report = recovery
         .finish(&mut control, &mut journal, false, &AtomicBool::new(false))
@@ -512,16 +650,99 @@ async fn nothing_owed_finishes_verified_without_traffic() -> TestResult {
         owed: None,
         state: RestorationState::NotRequired,
     };
-    let mut control = FakeControl {
-        scripts: VecDeque::new(),
-        log: Arc::clone(&log),
-        elapsed: std::time::Duration::ZERO,
-    };
+    let mut control = FakeControl::new([], &log);
     let mut journal = RecordingJournal::default();
     let report = recovery
         .finish(&mut control, &mut journal, true, &AtomicBool::new(false))
         .await;
     assert!(report.verified());
     assert!(log.lock().map_err(|_| "log poisoned")?.is_empty());
+    Ok(())
+}
+
+/// A recovery owing the reverse of the Bluetooth entry from Gateway Off.
+fn owed_recovery()
+-> Result<(MenuFieldSnapshot, TerminalPlan, TerminalRecovery), Box<dyn std::error::Error>> {
+    let snapshot = configuration(0, 1, 1)?;
+    let forward =
+        TerminalPlan::for_route(&identity()?, &snapshot, TerminalGatewayRoute::Bluetooth)?;
+    let restore = forward.restoration()?;
+    let recovery = TerminalRecovery {
+        control_endpoint: endpoint(),
+        baud: 9600,
+        owed: Some(OwedRestoration {
+            identity: identity()?,
+            plan: restore.clone(),
+        }),
+        state: RestorationState::Owed,
+    };
+    Ok((snapshot, restore, recovery))
+}
+
+#[tokio::test]
+async fn a_restored_gateway_mismatch_leaves_restoration_owed() -> TestResult {
+    let (snapshot, restore, mut recovery) = owed_recovery()?;
+    let log: Log = Arc::default();
+    let mut restore_script = cat(2);
+    program_into(&mut restore_script, &snapshot, &restore, false);
+    let mut control = FakeControl::new(
+        [
+            ("readiness-before", identity_only()),
+            ("restore", restore_script),
+            ("readiness-after", cat(2)),
+        ],
+        &log,
+    );
+    let mut journal = RecordingJournal::default();
+    let report = recovery
+        .finish(&mut control, &mut journal, true, &AtomicBool::new(false))
+        .await;
+    assert_eq!(report.state, RestorationState::Owed);
+    assert!(
+        matches!(report.error, Some(RestorationError::GatewayNotVerified)),
+        "{report:?}"
+    );
+    assert_eq!(report.restore, Some(RestoreOutcome::Written));
+    assert_eq!(
+        control.control_opens()?,
+        3,
+        "a mismatching Gateway ends readiness without another open"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_unsettled_control_endpoint_leaves_restoration_owed_without_programming() -> TestResult {
+    let (_snapshot, _restore, mut recovery) = owed_recovery()?;
+    let log: Log = Arc::default();
+    let mut control = FakeControl::new([("readiness-before", identity_only())], &log);
+    control.absent_after = Some(1);
+    let mut journal = RecordingJournal::default();
+    let report = recovery
+        .finish(&mut control, &mut journal, true, &AtomicBool::new(false))
+        .await;
+    assert_eq!(report.state, RestorationState::Owed);
+    assert!(
+        matches!(report.error, Some(RestorationError::ControlNotSettled)),
+        "{report:?}"
+    );
+    assert!(
+        report.restore.is_none(),
+        "no programming entry was attempted"
+    );
+    assert_eq!(journal.restore_writes, 0);
+    assert_eq!(
+        control.control_opens()?,
+        1,
+        "only the readiness connection opened"
+    );
+    let settle = report.settle.as_ref().ok_or("settle wait missing")?;
+    assert!(
+        matches!(
+            settle.outcome,
+            SettleOutcome::Failed(ReadinessError::Unsettled { .. })
+        ),
+        "{settle:?}"
+    );
     Ok(())
 }

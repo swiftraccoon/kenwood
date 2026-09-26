@@ -344,7 +344,23 @@ async fn readiness(
     cancelled: &AtomicBool,
 ) -> Result<ReadinessReport, Box<dyn std::error::Error>> {
     let expected = identity()?;
-    Ok(verify_readiness(host, &endpoint(), 9600, &expected, cancelled).await)
+    Ok(verify_readiness(host, &endpoint(), 9600, &expected, None, cancelled).await)
+}
+
+async fn gateway_readiness(
+    host: &mut FakeHost,
+    gateway: DvGatewayMode,
+) -> Result<ReadinessReport, Box<dyn std::error::Error>> {
+    let expected = identity()?;
+    Ok(verify_readiness(
+        host,
+        &endpoint(),
+        9600,
+        &expected,
+        Some(gateway),
+        &AtomicBool::new(false),
+    )
+    .await)
 }
 
 const IDENTITY_WRITES: &[&[u8]] = &[b"ID\r", b"FV\r", b"TY\r"];
@@ -386,11 +402,12 @@ async fn silent_id_then_matching_identity_retries_only_after_release_and_reselec
 
 #[tokio::test]
 async fn repeated_silence_stops_at_the_open_attempt_cap() -> TestResult {
-    let mut host = FakeHost::new((0..5).map(|_| silent_script()));
+    let mut host = FakeHost::new((0..=MAXIMUM_OPEN_ATTEMPTS).map(|_| silent_script()));
     let report = readiness(&mut host, &AtomicBool::new(false)).await?;
     assert_eq!(report.ending, ReadinessEnding::AttemptCapExhausted);
     assert!(!report.succeeded());
-    host.assert_wire(&[&[b"ID\r"], &[b"ID\r"], &[b"ID\r"], &[b"ID\r"]])?;
+    let identity_only: &[&[u8]] = &[b"ID\r"];
+    host.assert_wire(&[identity_only; MAXIMUM_OPEN_ATTEMPTS])?;
     assert_eq!(report.attempts.len(), MAXIMUM_OPEN_ATTEMPTS);
     Ok(())
 }
@@ -682,8 +699,8 @@ async fn observation_without_expectations_records_whatever_it_reads() -> TestRes
 async fn other_gateway_states_are_recorded_but_never_accepted_as_the_required_one() -> TestResult {
     for (reply, mode) in [
         (b"GW 2\r".as_slice(), DvGatewayMode::Terminal),
-        (b"GW 1\r", DvGatewayMode::Unqualified(1)),
-        (b"GW 255\r", DvGatewayMode::Unqualified(255)),
+        (b"GW 1\r", DvGatewayMode::Unnamed(1)),
+        (b"GW 255\r", DvGatewayMode::Unnamed(255)),
     ] {
         let mut host = FakeHost::new([gateway_script(reply)]);
         let report = observe_control(
@@ -931,11 +948,196 @@ async fn the_bounded_close_helper_reports_a_timeout_and_drops_the_connection() -
 }
 
 #[test]
-fn the_attempt_allowance_covers_three_exchanges_and_the_close() {
+fn the_attempt_allowances_cover_their_exchanges_and_the_close() {
     assert_eq!(
         ATTEMPT_ALLOWANCE,
         Duration::from_millis(1_500 * 6) + Duration::from_secs(2)
     );
-    assert!(can_dispatch(Duration::ZERO, ATTEMPT_ALLOWANCE));
-    assert!(!can_dispatch(Duration::from_millis(1), ATTEMPT_ALLOWANCE));
+    assert_eq!(
+        GATEWAY_ATTEMPT_ALLOWANCE,
+        Duration::from_millis(1_500 * 8) + Duration::from_secs(2)
+    );
+    for allowance in [ATTEMPT_ALLOWANCE, GATEWAY_ATTEMPT_ALLOWANCE] {
+        assert!(can_dispatch(Duration::ZERO, allowance, allowance));
+        assert!(!can_dispatch(
+            Duration::from_millis(1),
+            allowance,
+            allowance
+        ));
+    }
+}
+
+#[tokio::test]
+async fn a_required_gateway_is_read_on_the_connection_whose_identity_matched() -> TestResult {
+    let mut host = FakeHost::new([silent_script(), gateway_script(b"GW 0\r")]);
+    let report = gateway_readiness(&mut host, DvGatewayMode::Off).await?;
+    assert!(report.succeeded(), "{report:?}");
+    host.assert_wire(&[&[b"ID\r"], GATEWAY_WRITES])?;
+    let matched = report
+        .attempts
+        .last()
+        .and_then(|attempt| attempt.connection.as_ref())
+        .ok_or("matched connection missing")?;
+    assert_eq!(matched.gateway, Some(DvGatewayMode::Off));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_required_gateway_mismatch_ends_readiness_without_another_open() -> TestResult {
+    let mut host = FakeHost::new([gateway_script(b"GW 2\r")]);
+    let report = gateway_readiness(&mut host, DvGatewayMode::Off).await?;
+    assert_eq!(report.ending, ReadinessEnding::Failed);
+    assert!(
+        matches!(
+            report.attempts.last().map(|attempt| &attempt.outcome),
+            Some(ReadinessOutcome::Failed(ReadinessError::GatewayMismatch {
+                required: DvGatewayMode::Off,
+                actual: DvGatewayMode::Terminal,
+            }))
+        ),
+        "{report:?}"
+    );
+    host.assert_wire(&[GATEWAY_WRITES])?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_required_gateway_reserves_its_larger_attempt_allowance() -> TestResult {
+    let cost = READINESS_BUDGET
+        .saturating_sub(GATEWAY_ATTEMPT_ALLOWANCE)
+        .saturating_add(Duration::from_millis(1));
+    assert!(
+        READINESS_BUDGET.saturating_sub(cost) >= ATTEMPT_ALLOWANCE,
+        "the remaining budget still covers an identity-only attempt"
+    );
+    let mut host = FakeHost::new([gateway_script(b"GW 0\r")]);
+    host.enumeration_cost = cost;
+    let report = gateway_readiness(&mut host, DvGatewayMode::Off).await?;
+    assert!(
+        matches!(
+            report.attempts.first().map(|attempt| &attempt.outcome),
+            Some(ReadinessOutcome::Failed(ReadinessError::BudgetExhausted))
+        ),
+        "{report:?}"
+    );
+    host.assert_wire(&[])?;
+    let mut identity_only = FakeHost::new([ready_script()]);
+    identity_only.enumeration_cost = cost;
+    let report = readiness(&mut identity_only, &AtomicBool::new(false)).await?;
+    assert!(report.succeeded(), "{report:?}");
+    identity_only.assert_wire(&[IDENTITY_WRITES])?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn endpoints_other_than_the_operation_panel_need_no_settle_wait() -> TestResult {
+    for pid in [Some(TMD750_MAIN_PID), Some(0x1234), None] {
+        let mut host = FakeHost::new(Vec::new());
+        let other = SerialCandidate { pid, ..endpoint() };
+        let report = await_settled(&mut host, &other, &AtomicBool::new(false)).await;
+        assert!(
+            matches!(report.outcome, SettleOutcome::NotRequired),
+            "{report:?}"
+        );
+        assert!(report.settled());
+        assert!(host.seen()?.is_empty(), "no enumeration, wait or open");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_operation_panel_settles_after_continuous_enumeration() -> TestResult {
+    let mut host = FakeHost::new(Vec::new());
+    let report = await_settled(&mut host, &endpoint(), &AtomicBool::new(false)).await;
+    assert!(
+        matches!(report.outcome, SettleOutcome::Settled),
+        "{report:?}"
+    );
+    assert_eq!(report.elapsed, SETTLE_QUIET);
+    let times: Vec<Duration> = report
+        .enumerations
+        .iter()
+        .map(|enumeration| enumeration.elapsed)
+        .collect();
+    let expected: Vec<Duration> = (0..=SETTLE_QUIET.as_secs())
+        .map(Duration::from_secs)
+        .collect();
+    assert_eq!(times, expected, "one enumeration per poll interval");
+    assert_eq!(host.opens, 0, "the settle wait opens nothing");
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_absence_restarts_the_quiet_period() -> TestResult {
+    let mut host = FakeHost::new(Vec::new());
+    host.snapshots = VecDeque::from([
+        vec![endpoint()],
+        vec![endpoint()],
+        Vec::new(),
+        vec![endpoint()],
+    ]);
+    let report = await_settled(&mut host, &endpoint(), &AtomicBool::new(false)).await;
+    assert!(
+        matches!(report.outcome, SettleOutcome::Settled),
+        "{report:?}"
+    );
+    assert_eq!(
+        report.elapsed,
+        SETTLE_QUIET.saturating_add(SETTLE_POLL_INTERVAL.saturating_mul(3)),
+        "the quiet period restarts at the first enumeration after the absence"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_endpoint_that_never_stays_enumerated_is_unsettled_at_the_budget() -> TestResult {
+    let mut host = FakeHost::new(Vec::new());
+    host.snapshot = Vec::new();
+    let report = await_settled(&mut host, &endpoint(), &AtomicBool::new(false)).await;
+    assert!(
+        matches!(
+            report.outcome,
+            SettleOutcome::Failed(ReadinessError::Unsettled { quiet, budget })
+                if quiet == SETTLE_QUIET && budget == SETTLE_BUDGET
+        ),
+        "{report:?}"
+    );
+    assert!(!report.settled());
+    assert_eq!(report.elapsed, SETTLE_BUDGET);
+    assert_eq!(host.opens, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn changed_endpoint_metadata_ends_the_settle_wait() -> TestResult {
+    let mut changed = endpoint();
+    changed.pid = Some(TMD750_MAIN_PID);
+    let mut host = FakeHost::new(Vec::new());
+    host.snapshots = VecDeque::from([vec![endpoint()], vec![changed]]);
+    let report = await_settled(&mut host, &endpoint(), &AtomicBool::new(false)).await;
+    assert!(
+        matches!(
+            report.outcome,
+            SettleOutcome::Failed(ReadinessError::Reenumeration(
+                ReenumerationRejection::SelectedEndpointChanged { .. }
+            ))
+        ),
+        "{report:?}"
+    );
+    assert_eq!(report.enumerations.len(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancellation_stops_the_settle_wait_before_the_next_enumeration() -> TestResult {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let mut host = FakeHost::new(Vec::new());
+    host.cancel_on_wait = Some((3, Arc::clone(&cancelled)));
+    let report = await_settled(&mut host, &endpoint(), &cancelled).await;
+    assert!(
+        matches!(report.outcome, SettleOutcome::Cancelled),
+        "{report:?}"
+    );
+    assert_eq!(report.enumerations.len(), 3);
+    Ok(())
 }

@@ -9,10 +9,15 @@
 //! pages are written over the modem link itself; when a Terminal route is
 //! already active the modem link may already carry MMDVM, so the pages are
 //! written over the independent control endpoint instead and the modem link is
-//! never sent CAT. The caller owns endpoint selection, the journal sink's
-//! durability, the modem host's open and reopen, and the decision to restore.
+//! never sent CAT. The caller selects both endpoints, supplies a journal sink
+//! that writes and synchronizes its records, opens and reopens the modem link
+//! through its host, and decides when to restore.
 //!
-//! This composes [`observe_control`], [`verify_readiness`],
+//! Every programming entry over the control endpoint, for an active route or
+//! for restoration, first waits for [`await_settled`]. Restoration also waits
+//! for the control endpoint's identity first, and after the reverse write
+//! reads the restored identity and Gateway on the same fresh connection.
+//! This composes [`observe_control`], [`verify_readiness`], [`await_settled`],
 //! [`program_terminal`] and [`acquire_modem`]; it enters no mode on its own
 //! beyond those, sends no RF command, and never reopens a serial endpoint
 //! automatically.
@@ -27,8 +32,9 @@ use super::transition::{
 };
 use super::{TerminalGatewayRoute, TerminalPlan, TerminalPlanError, TerminalTarget};
 use crate::radio::readiness::{
-    CloseFailure, ControlHost, ControlStage, Expectation, ObservationReport, ReadinessReport,
-    observe_control, verify_readiness,
+    CloseFailure, ControlHost, ControlStage, Expectation, ObservationReport, ReadinessError,
+    ReadinessOutcome, ReadinessReport, SettleReport, await_settled, observe_control,
+    verify_readiness,
 };
 use crate::radio::{Identity, Radio};
 use crate::transport::SerialCandidate;
@@ -56,8 +62,9 @@ pub enum LifecycleError {
     /// preflight.
     #[error("the control endpoint did not complete its identity and Gateway preflight")]
     ControlPreflight,
-    /// The observed identity is not the exact qualified target.
-    #[error("control endpoint identity {actual} is not the qualified TM-D750 target")]
+    /// The observed identity fails [`Identity::is_write_target`]: it is not
+    /// TM-D750 firmware 1.02, type `K,2,1`.
+    #[error("control endpoint identity {actual} is not TM-D750 / 1.02 / K,2,1")]
     UnsupportedTarget {
         /// The identity the control endpoint reported.
         actual: Identity,
@@ -71,6 +78,11 @@ pub enum LifecycleError {
     /// The modem link could not be opened.
     #[error("modem link open failed: {0}")]
     ModemOpen(#[source] ModemOpenFailure),
+    /// The control endpoint was not enumerated continuously for
+    /// [`SETTLE_QUIET`](crate::radio::readiness::SETTLE_QUIET) before
+    /// active-route programming; it was not opened for programming.
+    #[error("the control endpoint did not settle before active-route programming")]
+    ControlNotSettled,
     /// The control endpoint could not be opened for active-route programming.
     #[error("control endpoint open failed for active-route programming")]
     ControlOpen,
@@ -163,7 +175,7 @@ impl TerminalLifecycle {
         let Some((identity, gateway)) = observed else {
             return startup.fail(LifecycleError::ControlPreflight);
         };
-        if !identity.is_qualified_write_target() {
+        if !identity.is_write_target() {
             return startup.fail(LifecycleError::UnsupportedTarget { actual: identity });
         }
         if !matches!(gateway, DvGatewayMode::Off | DvGatewayMode::Terminal) {
@@ -251,8 +263,12 @@ impl TerminalLifecycle {
         let request = TerminalRequest::Enter { route: self.route };
         if gateway == DvGatewayMode::Off {
             // The stored route is not the modem link yet, so CAT and MCP run on
-            // the modem link itself.
-            let mut radio = Radio::new(modem_connection);
+            // the modem link itself; a Bluetooth link may hold its first reply.
+            let mut radio = if self.route == TerminalGatewayRoute::Bluetooth {
+                Radio::new_bluetooth(modem_connection)
+            } else {
+                Radio::new(modem_connection)
+            };
             let result =
                 program_terminal(&mut radio, identity, gateway, request, journal, cancelled).await;
             let connection = radio.into_transport();
@@ -268,6 +284,12 @@ impl TerminalLifecycle {
             // A Terminal route is active; the modem link may already carry
             // MMDVM, so program over the independent control endpoint and leave
             // the modem link untouched.
+            let settle = await_settled(control, &self.control_endpoint, cancelled).await;
+            let settled = settle.settled();
+            startup.settle = Some(settle);
+            if !settled {
+                return Err((modem_connection, LifecycleError::ControlNotSettled));
+            }
             control.stage(ControlStage::ActiveEntry);
             let control_connection = match control.open(&self.control_endpoint, self.baud) {
                 Ok(connection) => connection,
@@ -309,6 +331,9 @@ pub struct TerminalStartup<T> {
     pub error: Option<LifecycleError>,
     /// The control-endpoint preflight observation.
     pub preflight: Option<ObservationReport>,
+    /// The settle wait before active-route programming over the control
+    /// endpoint, when that path ran.
+    pub settle: Option<SettleReport>,
     /// The Terminal programming pass, when it ran.
     pub entry: Option<TerminalProgramReport>,
     /// Every MMDVM probe and reopen attempt.
@@ -324,6 +349,7 @@ impl<T> TerminalStartup<T> {
             recovery: TerminalRecovery::none(),
             error: None,
             preflight: None,
+            settle: None,
             entry: None,
             transition_attempts: Vec::new(),
             cleanup_error: None,
@@ -412,9 +438,12 @@ impl TerminalRecovery {
     /// without any traffic, whatever `released` is. Otherwise `released` must be
     /// true (the modem connection was closed and dropped); when it is false the
     /// reverse write is skipped and the report is [`RestorationState::Blocked`].
-    /// A restoration waits for the control endpoint's CAT to return, rewrites
-    /// the reverse plan, and verifies the identity and Gateway on a fresh
-    /// connection.
+    /// A restoration waits for the control endpoint's identity with
+    /// [`verify_readiness`] and for [`await_settled`], rewrites the reverse
+    /// plan, then runs [`verify_readiness`] again, requiring the restored
+    /// Gateway state on the connection whose identity matched. A failure
+    /// leaves the report [`RestorationState::Owed`] with the step in
+    /// [`RestorationReport::error`].
     pub async fn finish<C, J>(
         &mut self,
         control: &mut C,
@@ -468,6 +497,7 @@ impl TerminalRecovery {
             &self.control_endpoint,
             self.baud,
             identity,
+            None,
             cancelled,
         )
         .await;
@@ -476,6 +506,15 @@ impl TerminalRecovery {
         if !ready {
             report.state = RestorationState::Owed;
             report.error = Some(RestorationError::ControlNotReady);
+            self.state = RestorationState::Owed;
+            return;
+        }
+        let settle = await_settled(control, &self.control_endpoint, cancelled).await;
+        let settled = settle.settled();
+        report.settle = Some(settle);
+        if !settled {
+            report.state = RestorationState::Owed;
+            report.error = Some(RestorationError::ControlNotSettled);
             self.state = RestorationState::Owed;
             return;
         }
@@ -526,46 +565,37 @@ impl TerminalRecovery {
         cancelled: &AtomicBool,
         report: &mut RestorationReport,
     ) {
+        let expected_gateway = match plan.target() {
+            TerminalTarget::Off => DvGatewayMode::Off,
+            TerminalTarget::ReflectorTerminal => DvGatewayMode::Terminal,
+        };
         control.stage(ControlStage::ReadinessAfterRestore);
         let after = verify_readiness(
             control,
             &self.control_endpoint,
             self.baud,
             identity,
+            Some(expected_gateway),
             cancelled,
         )
         .await;
-        let ready = after.succeeded();
+        let verified = after.succeeded();
+        let gateway_mismatch = after.attempts.last().is_some_and(|attempt| {
+            matches!(
+                attempt.outcome,
+                ReadinessOutcome::Failed(ReadinessError::GatewayMismatch { .. })
+            )
+        });
         report.readiness_after = Some(after);
-        if !ready {
-            report.state = RestorationState::Owed;
-            report.error = Some(RestorationError::ControlNotReady);
-            self.state = RestorationState::Owed;
-            return;
-        }
-        let expected_gateway = match plan.target() {
-            TerminalTarget::Off => DvGatewayMode::Off,
-            TerminalTarget::ReflectorTerminal => DvGatewayMode::Terminal,
-        };
-        control.stage(ControlStage::Verification);
-        let verification = observe_control(
-            control,
-            &self.control_endpoint,
-            self.baud,
-            Expectation {
-                identity: Some(identity),
-                gateway: Some(expected_gateway),
-            },
-            cancelled,
-        )
-        .await;
-        let verified = verification.succeeded();
-        report.verification = Some(verification);
         if verified {
             self.state = RestorationState::Verified;
         } else {
             self.state = RestorationState::Owed;
-            report.error = Some(RestorationError::GatewayNotVerified);
+            report.error = Some(if gateway_mismatch {
+                RestorationError::GatewayNotVerified
+            } else {
+                RestorationError::ControlNotReady
+            });
         }
         report.state = self.state;
     }
@@ -581,6 +611,11 @@ pub enum RestorationError {
     /// The control endpoint did not regain CAT readiness.
     #[error("the control endpoint did not regain CAT readiness")]
     ControlNotReady,
+    /// The control endpoint was not enumerated continuously for
+    /// [`SETTLE_QUIET`](crate::radio::readiness::SETTLE_QUIET) before
+    /// restoration programming; nothing was opened.
+    #[error("the control endpoint did not settle before restoration programming")]
+    ControlNotSettled,
     /// The control endpoint could not be opened for restoration.
     #[error("the control endpoint could not be opened for restoration")]
     ControlOpen,
@@ -590,7 +625,8 @@ pub enum RestorationError {
     /// The control endpoint was not confirmed closed after restoration.
     #[error("the control endpoint was not confirmed closed after restoration")]
     ControlClose,
-    /// The restored Gateway state did not verify on a fresh connection.
+    /// The fresh connection whose identity matched after the reverse write
+    /// read a Gateway state other than the restored one.
     #[error("the restored Gateway state did not verify on a fresh connection")]
     GatewayNotVerified,
 }
@@ -611,14 +647,15 @@ pub struct RestorationReport {
     pub state: RestorationState,
     /// First failure, when restoration did not verify.
     pub error: Option<RestorationError>,
-    /// Readiness before the reverse write.
+    /// Identity readiness before the reverse write.
     pub readiness_before: Option<ReadinessReport>,
+    /// The settle wait between that readiness and restoration programming.
+    pub settle: Option<SettleReport>,
     /// Whether the reverse plan reached the radio.
     pub restore: Option<RestoreOutcome>,
-    /// Readiness after the reverse write.
+    /// Readiness after the reverse write; its matching connection also read
+    /// the restored Gateway state.
     pub readiness_after: Option<ReadinessReport>,
-    /// Identity and Gateway verification after restoration.
-    pub verification: Option<ObservationReport>,
 }
 
 impl RestorationReport {
@@ -627,9 +664,9 @@ impl RestorationReport {
             state: RestorationState::NotRequired,
             error: None,
             readiness_before: None,
+            settle: None,
             restore: None,
             readiness_after: None,
-            verification: None,
         }
     }
 

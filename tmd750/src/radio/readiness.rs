@@ -12,9 +12,13 @@
 //! reappear within a few seconds and then leave `ID` unanswered until the
 //! tuple is ready. [`verify_readiness`] therefore waits [`SETTLE`], polls the
 //! enumeration for the pinned endpoint, and retries only an entirely silent
-//! `ID` timeout, within [`READINESS_BUDGET`] and [`MAXIMUM_OPEN_ATTEMPTS`].
-//! These bounds are host policy sized from observation, not firmware timing
-//! guarantees.
+//! `ID` timeout, within [`READINESS_BUDGET`] and [`MAXIMUM_OPEN_ATTEMPTS`];
+//! a required Gateway state is read on the same connection whose identity
+//! matched. The operation-panel endpoint can also re-enumerate once more within
+//! a few seconds of first answering `ID`, so [`await_settled`] waits for
+//! [`SETTLE_QUIET`] of continuous enumeration before a programming session
+//! opens on it. These bounds are host policy sized from observation, not
+//! firmware timing guarantees.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,7 +31,7 @@ use crate::error::Error;
 use crate::transport::reenumeration::{
     Reenumeration, ReenumerationRejection, are_aliases, select_pinned,
 };
-use crate::transport::{SerialCandidate, SerialTransport, discover_serial, open_serial};
+use crate::transport::{SerialCandidate, SerialTransport, UsbRole, discover_serial, open_serial};
 use crate::types::DvGatewayMode;
 
 /// Silent wait after an MCP exit acknowledgment, before the first enumeration.
@@ -40,7 +44,13 @@ pub const READINESS_BUDGET: Duration = Duration::from_secs(60);
 /// Wait between one attempt's close and the next open.
 pub const RETRY_INTERVAL: Duration = Duration::from_secs(2);
 /// Opens permitted within one [`verify_readiness`] call.
-pub const MAXIMUM_OPEN_ATTEMPTS: usize = 4;
+///
+/// Attempts whose `ID` stays silent run about 3.5 s apart, so six cover
+/// roughly the first 25 s of [`READINESS_BUDGET`]. On firmware 1.02 the
+/// operation-panel endpoint has answered `ID` on the third or fourth open
+/// after an MCP exit; the main-unit endpoint answers on the first open once it
+/// re-enumerates.
+pub const MAXIMUM_OPEN_ATTEMPTS: usize = 6;
 /// Deadline for each write and each reply of the `ID`, `FV`, `TY` and `GW`
 /// queries.
 pub const EXCHANGE_TIMEOUT: Duration = Duration::from_millis(1_500);
@@ -51,6 +61,21 @@ pub const CLOSE_BUDGET: Duration = Duration::from_secs(2);
 pub const ATTEMPT_ALLOWANCE: Duration = EXCHANGE_TIMEOUT
     .saturating_mul(6)
     .saturating_add(CLOSE_BUDGET);
+/// [`ATTEMPT_ALLOWANCE`] plus a write and a reply deadline for one `GW` query.
+pub const GATEWAY_ATTEMPT_ALLOWANCE: Duration = EXCHANGE_TIMEOUT
+    .saturating_mul(8)
+    .saturating_add(CLOSE_BUDGET);
+/// Continuous enumeration an operation-panel endpoint must show before a
+/// programming session opens on it.
+///
+/// On firmware 1.02 the operation-panel endpoint has re-enumerated once more
+/// within a few seconds of first answering `ID` after an MCP exit, and a
+/// connection opened before that drop failed programming entry with `ENXIO`.
+pub const SETTLE_QUIET: Duration = Duration::from_secs(10);
+/// Interval between the enumerations of [`await_settled`].
+pub const SETTLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// Window for [`await_settled`], measured from its first enumeration.
+pub const SETTLE_BUDGET: Duration = Duration::from_secs(60);
 
 /// The step of the Terminal lifecycle that the next control-endpoint open
 /// serves, announced through [`ControlHost::stage`].
@@ -61,14 +86,13 @@ pub enum ControlStage {
     Preflight,
     /// Terminal programming over the control endpoint while Gateway is active.
     ActiveEntry,
-    /// Identity readiness before restoration.
+    /// Identity readiness before restoration, then the settle wait.
     ReadinessBeforeRestore,
     /// Restoration programming.
     Restore,
-    /// Identity readiness after restoration.
+    /// Identity readiness after restoration, reading the restored Gateway on
+    /// the connection whose identity matched.
     ReadinessAfterRestore,
-    /// Identity and Gateway verification after restoration.
-    Verification,
 }
 
 /// Why a connection was not confirmed closed.
@@ -220,10 +244,11 @@ pub struct Expectation<'a> {
     pub gateway: Option<DvGatewayMode>,
 }
 
-/// One enumeration inside a readiness attempt.
+/// One enumeration inside a readiness attempt or a settle wait.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Enumeration {
-    /// Time since the readiness window opened, per the host clock.
+    /// Time since the readiness window opened or the settle wait began, per
+    /// the host clock.
     pub elapsed: Duration,
     /// The TM-D750 endpoints plus every alias of the pinned endpoint or of a
     /// TM-D750 endpoint, in enumeration order.
@@ -314,6 +339,15 @@ pub enum ReadinessError {
     /// attempt and its close.
     #[error("the readiness budget cannot cover another identity attempt and close")]
     BudgetExhausted,
+    /// The pinned endpoint was not enumerated continuously for `quiet` within
+    /// `budget`.
+    #[error("the pinned endpoint was not enumerated continuously for {quiet:?} within {budget:?}")]
+    Unsettled {
+        /// Continuous enumeration required.
+        quiet: Duration,
+        /// Window that elapsed.
+        budget: Duration,
+    },
 }
 
 /// Result of one observation or one readiness attempt.
@@ -465,6 +499,103 @@ impl ObservationReport {
     }
 }
 
+/// How an [`await_settled`] wait ended.
+#[derive(Debug)]
+pub enum SettleOutcome {
+    /// The pinned endpoint was enumerated continuously for [`SETTLE_QUIET`].
+    Settled,
+    /// The endpoint is not an operation-panel endpoint; nothing was enumerated.
+    NotRequired,
+    /// Cancellation was requested before the endpoint settled.
+    Cancelled,
+    /// [`ReadinessError::Unsettled`], an enumeration failure, or an
+    /// enumeration that no longer selects the pinned endpoint.
+    Failed(ReadinessError),
+}
+
+/// Report of one [`await_settled`] call.
+#[derive(Debug)]
+pub struct SettleReport {
+    /// Every enumeration, in order, timed from the first.
+    pub enumerations: Vec<Enumeration>,
+    /// How the wait ended.
+    pub outcome: SettleOutcome,
+    /// Time from the first enumeration to the return, per the host clock.
+    pub elapsed: Duration,
+}
+
+impl SettleReport {
+    /// Whether a programming session may open: the endpoint settled or needed
+    /// no wait.
+    #[must_use]
+    pub const fn settled(&self) -> bool {
+        matches!(
+            self.outcome,
+            SettleOutcome::Settled | SettleOutcome::NotRequired
+        )
+    }
+}
+
+/// Wait until an operation-panel `endpoint` has been enumerated continuously
+/// for [`SETTLE_QUIET`], before a programming session opens on it.
+///
+/// Returns [`SettleOutcome::NotRequired`] at once for any endpoint whose
+/// [`SerialCandidate::usb_role`] is not [`UsbRole::OperationPanel`].
+/// Otherwise enumerates every [`SETTLE_POLL_INTERVAL`] within
+/// [`SETTLE_BUDGET`]; an enumeration without the endpoint restarts the quiet
+/// period, and one that [`select_pinned`] rejects ends the wait. Opens
+/// nothing. Cancellation is checked before each enumeration.
+pub async fn await_settled<C: ControlHost>(
+    host: &mut C,
+    endpoint: &SerialCandidate,
+    cancelled: &AtomicBool,
+) -> SettleReport {
+    let mut report = SettleReport {
+        enumerations: Vec::new(),
+        outcome: SettleOutcome::NotRequired,
+        elapsed: Duration::ZERO,
+    };
+    if endpoint.usb_role() != Some(UsbRole::OperationPanel) {
+        return report;
+    }
+    let started = host.now();
+    let mut present_since = None;
+    report.outcome = loop {
+        if cancelled.load(Ordering::Relaxed) {
+            break SettleOutcome::Cancelled;
+        }
+        let now = host.now();
+        let elapsed = now.saturating_sub(started);
+        if elapsed >= SETTLE_BUDGET {
+            break SettleOutcome::Failed(ReadinessError::Unsettled {
+                quiet: SETTLE_QUIET,
+                budget: SETTLE_BUDGET,
+            });
+        }
+        let candidates = match host.enumerate() {
+            Ok(candidates) => candidates,
+            Err(error) => break SettleOutcome::Failed(ReadinessError::Enumeration(error)),
+        };
+        report.enumerations.push(Enumeration {
+            elapsed,
+            candidates: relevant_candidates(endpoint, &candidates),
+        });
+        match select_pinned(endpoint, &candidates) {
+            Reenumeration::Ready(_) => {
+                let since = *present_since.get_or_insert(now);
+                if now.saturating_sub(since) >= SETTLE_QUIET {
+                    break SettleOutcome::Settled;
+                }
+            }
+            Reenumeration::Absent => present_since = None,
+            Reenumeration::Rejected(rejection) => break SettleOutcome::Failed(rejection.into()),
+        }
+        host.wait(SETTLE_POLL_INTERVAL).await;
+    };
+    report.elapsed = host.now().saturating_sub(started);
+    report
+}
+
 /// Open `endpoint` once, read `ID`/`FV`/`TY` and `GW`, compare them with
 /// `expected`, and close.
 ///
@@ -512,17 +643,22 @@ pub async fn observe_control<C: ControlHost>(
 /// Call this only after the exit was acknowledged and the original connection
 /// was closed. Each attempt re-enumerates until [`select_pinned`] returns the
 /// exact endpoint, opens it once, and reads `ID`, `FV` and `TY` with
-/// [`EXCHANGE_TIMEOUT`] per write and per reply. Another open follows only
-/// when the `ID` query timed out with no byte received and the close
-/// succeeded; at most [`MAXIMUM_OPEN_ATTEMPTS`] opens run, [`RETRY_INTERVAL`]
-/// apart, and an attempt starts only while [`ATTEMPT_ALLOWANCE`] still fits in
-/// the budget. No `GW` query, setter, programming entry, baud change or reopen
-/// is sent. Cancellation finishes the current queries and close first.
+/// [`EXCHANGE_TIMEOUT`] per write and per reply. When `gateway` is `Some`,
+/// the connection whose identity matched also reads `GW` once and requires
+/// that state; a mismatch is [`ReadinessError::GatewayMismatch`] and no
+/// further open follows. Another open follows only when the `ID` query timed
+/// out with no byte received and the close succeeded; at most
+/// [`MAXIMUM_OPEN_ATTEMPTS`] opens run, [`RETRY_INTERVAL`] apart, and an
+/// attempt starts only while [`ATTEMPT_ALLOWANCE`] (with `gateway`,
+/// [`GATEWAY_ATTEMPT_ALLOWANCE`]) still fits in the budget. No setter,
+/// programming entry, baud change or reopen is sent. Cancellation finishes
+/// the current queries and close first.
 pub async fn verify_readiness<C: ControlHost>(
     host: &mut C,
     endpoint: &SerialCandidate,
     baud: u32,
     expected: &Identity,
+    gateway: Option<DvGatewayMode>,
     cancelled: &AtomicBool,
 ) -> ReadinessReport {
     let mut report = ReadinessReport {
@@ -536,6 +672,15 @@ pub async fn verify_readiness<C: ControlHost>(
     host.wait(SETTLE).await;
     let started = host.now();
     let deadline = started.saturating_add(READINESS_BUDGET);
+    let query = Query {
+        expected: Expectation {
+            identity: Some(expected),
+            gateway,
+        },
+        gateway: gateway.is_some(),
+        dispatch_deadline: Some(deadline),
+    };
+    let allowance = query.allowance();
     loop {
         if cancelled.load(Ordering::Relaxed) {
             report.ending = ReadinessEnding::Cancelled;
@@ -545,15 +690,7 @@ pub async fn verify_readiness<C: ControlHost>(
         if let Some(selected) =
             await_endpoint(host, endpoint, &mut attempt, cancelled, started).await
         {
-            if can_dispatch(host.now(), deadline) {
-                let query = Query {
-                    expected: Expectation {
-                        identity: Some(expected),
-                        gateway: None,
-                    },
-                    gateway: false,
-                    dispatch_deadline: Some(deadline),
-                };
+            if can_dispatch(host.now(), deadline, allowance) {
                 let observed = run_connection(host, &selected, baud, query, cancelled).await;
                 if observed.silent_identity_timeout && observed.connection.released() {
                     attempt.retry = RetryAdmission::SilentIdentityTimeout;
@@ -583,7 +720,7 @@ pub async fn verify_readiness<C: ControlHost>(
             report.ending = ReadinessEnding::AttemptCapExhausted;
             break;
         }
-        if deadline.saturating_sub(host.now()) < RETRY_INTERVAL.saturating_add(ATTEMPT_ALLOWANCE) {
+        if deadline.saturating_sub(host.now()) < RETRY_INTERVAL.saturating_add(allowance) {
             report.ending = ReadinessEnding::BudgetExhausted;
             break;
         }
@@ -593,11 +730,11 @@ pub async fn verify_readiness<C: ControlHost>(
     report
 }
 
-/// True when `deadline - now` still covers [`ATTEMPT_ALLOWANCE`].
+/// True when `deadline - now` still covers `allowance`.
 ///
-/// Both arguments are elapsed times from the host's clock origin.
-const fn can_dispatch(now: Duration, deadline: Duration) -> bool {
-    deadline.saturating_sub(now).as_nanos() >= ATTEMPT_ALLOWANCE.as_nanos()
+/// `now` and `deadline` are elapsed times from the host's clock origin.
+const fn can_dispatch(now: Duration, deadline: Duration, allowance: Duration) -> bool {
+    deadline.saturating_sub(now).as_nanos() >= allowance.as_nanos()
 }
 
 /// Poll the enumeration until the pinned endpoint is selectable.
@@ -674,8 +811,19 @@ struct Query<'a> {
     /// Whether `GW` is read after a matching identity.
     gateway: bool,
     /// Readiness deadline; the identity query is skipped when
-    /// [`ATTEMPT_ALLOWANCE`] no longer fits before it.
+    /// [`Self::allowance`] no longer fits before it.
     dispatch_deadline: Option<Duration>,
+}
+
+impl Query<'_> {
+    /// Time the queries and the close may still need.
+    const fn allowance(&self) -> Duration {
+        if self.gateway {
+            GATEWAY_ATTEMPT_ALLOWANCE
+        } else {
+            ATTEMPT_ALLOWANCE
+        }
+    }
 }
 
 /// One opened connection after its queries and close.
@@ -711,7 +859,7 @@ async fn run_connection<C: ControlHost>(
     radio.set_timeout(EXCHANGE_TIMEOUT);
     let queried = if query
         .dispatch_deadline
-        .is_some_and(|deadline| !can_dispatch(host.now(), deadline))
+        .is_some_and(|deadline| !can_dispatch(host.now(), deadline, query.allowance()))
     {
         Queried {
             outcome: ReadinessOutcome::Failed(ReadinessError::BudgetExhausted),

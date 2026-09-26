@@ -1501,8 +1501,8 @@ mod tests {
         );
         assert_eq!(
             parse_line(b"GW 1")?,
-            Response::GatewayMode(DvGatewayMode::Unqualified(1)),
-            "unobserved GW 1 must remain losslessly unqualified"
+            Response::GatewayMode(DvGatewayMode::Unnamed(1)),
+            "unobserved GW 1 must remain losslessly unnamed"
         );
         assert_eq!(parse_line(b"?")?, Response::Rejected);
         assert_eq!(parse_line(b"N")?, Response::NotAvailable);
@@ -1754,12 +1754,12 @@ mod tests {
             parse_line(b"MD 0,7"),
             Ok(Response::OperatingMode {
                 band: Band::A,
-                mode: OperatingMode::Unqualified(7),
+                mode: OperatingMode::Unnamed(7),
             })
         );
         assert_eq!(
             parse_line(b"GW 3"),
-            Ok(Response::GatewayMode(DvGatewayMode::Unqualified(3)))
+            Ok(Response::GatewayMode(DvGatewayMode::Unnamed(3)))
         );
         let short_record = parse_line(b"FO 0,0145190000");
         assert!(
