@@ -86,14 +86,14 @@
 
 ## Memory channel storage (image layout, verified on firmware 1.02)
 
-- Flags at `0x2000` (4 bytes: band code or `0xFF` empty, lockout, group,
-  raw), records at `0x4000` (40 bytes, six per page, layout in
-  `types/stored.rs`), names at `0x10000` (16 bytes, NUL padded); one physical
-  index for all three: regular 0-999, program scan interleaved `L0,U0,L1,...`
-  from 1000 (`L05` = 1010), priority 1100, APRS 1101.
-- The band code is a receive-frequency segment, not bits (samples in
-  `BandCode`'s doc). Not established: the segment edges, the tone/CTCSS index
-  basis, the name charset beyond ASCII, the CALL slots.
+- Flags at `0x2000` (band code or `0xFF` empty, lockout, group, raw), records
+  at `0x4000` (40 bytes, six per page, layout in `types/stored.rs`), names at
+  `0x10000` (16 bytes, NUL padded), one index for all three: regular 0-999,
+  program scan `L0,U0,L1,...` from 1000 (`L05` = 1010), priority 1100, APRS
+  1101, weather 1102-1111, CALL 1132-1137 (names 1136-1141). CALL mode `FO`
+  reads the CALL record; `MD`/`FO` writes there are `N`, so edits use MCP.
+- The band code is a receive-frequency segment, not bits (`BandCode`'s doc);
+  not established: segment edges, tone/CTCSS index basis, non-ASCII names.
 - `UP`/`DW` act on the control band (first `BC` field) and take no argument;
   selecting a step rounds the VFO down to a multiple of it. The radio drops a
   second step sent within about 15 ms and answers a setting write within

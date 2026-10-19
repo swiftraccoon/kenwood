@@ -369,9 +369,12 @@ pub mod regions {
     /// Standard backups omit it, and scalar menu patches cannot write it.
     pub const STARTUP_BITMAP: Region = Region::const_new(393_216, 1_929_216);
 
-    /// Transferred by another feature of the program; purpose recorded in the
-    /// crate notes, unused here.
-    pub const UNNAMED_GROUP: [Region; 2] = [
+    /// The GPS position memory: 100 records of 32 bytes, then a 256-byte page.
+    ///
+    /// The official program transfers it in a separate position-memory read
+    /// and write, and standard backups omit it. On firmware 1.02 a session
+    /// reading only these regions returned every page and exited normally.
+    pub const POSITION_MEMORY: [Region; 2] = [
         Region::const_new(311_296, 314_624),
         Region::const_new(315_136, 315_392),
     ];

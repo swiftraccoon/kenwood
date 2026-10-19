@@ -240,6 +240,38 @@ async fn program<T: Transport>(
 After the exit, close the transport and verify a fresh identity before any
 further CAT, as for every programming session.
 
+### CALL and weather channels
+
+The six CALL channels, one FM and one DV channel for each band, and the ten
+weather channels follow the APRS channel in the channel tables;
+[`ChannelAccess::call_channels`] and [`ChannelAccess::weather_channels`]
+decode them from a backup. In CALL tuning mode `FO band` reads the stored
+record of the CALL channel for the band's frequency range and the FM or DV
+mode selected before CALL, and `MD` and `FO` writes answer `N`, so
+[`memory::CallChannelPlan`] replaces CALL records with programming-mode page
+writes. Each record keeps its channel's mode and receive range: 136 to 174
+MHz for VHF, 216 to 260 MHz for 220 MHz and 410 to 470 MHz for UHF, the upper
+bound excluded.
+
+```rust
+use kenwood_tmd750::memory::{
+    CallBand, CallChannel, CallChannelPlan, CallMode, ChannelAccess, MemoryImage,
+};
+use kenwood_tmd750::types::Frequency;
+
+fn retune_uhf_call(image: &MemoryImage) -> Result<CallChannelPlan, Box<dyn std::error::Error>> {
+    let channel = CallChannel::new(CallBand::Uhf, CallMode::Fm);
+    let entry = ChannelAccess::from_memory_image(image).call_channel(channel)?;
+    let mut record = entry.record().ok_or("no stored CALL record")?.clone();
+    record.receive_frequency = Frequency::new(446_100_000)?;
+    Ok(CallChannelPlan::new([(channel, record)])?)
+}
+```
+
+Pass its [`memory::CallChannelPlan::page_replacements`] to
+[`radio::McpSession::compare_exchange_pages`] in an open session, or to
+[`radio::session::write_pages`] for the whole session.
+
 ### Transmit
 
 [`Radio::transmit`] keys the PTT band (the second [`types::BandControl`] field)
@@ -410,6 +442,47 @@ fn add_reflector_link(image: &MemoryImage) -> Result<Vec<PageReplacement>, Box<d
         StoredText::new("Link reflector 1 C")?,
     )?);
     Ok(CallsignList::from_entries(entries)?.page_replacements(image)?)
+}
+```
+
+[`memory::mic_e::MicETypeCodeTables`] reads the three user Mic-E type code
+tables, five entries each for Kenwood handheld, Kenwood mobile and Yaesu
+codes, which add radio models for the station list to name Mic-E stations;
+[`memory::mic_e::MicETypeCodeTables::set`] and
+[`memory::mic_e::MicETypeCodeTables::page_replacements`] store an edited set
+in the tables' one page.
+
+```rust
+use kenwood_tmd750::memory::mic_e::{MicEFamily, MicETypeCode, MicETypeCodeTables};
+use kenwood_tmd750::{MemoryImage, PageReplacement};
+
+fn add_model(image: &MemoryImage) -> Result<Vec<PageReplacement>, Box<dyn std::error::Error>> {
+    let mut tables = MicETypeCodeTables::read(image)?;
+    tables.set(MicEFamily::Yaesu, 0, Some(MicETypeCode::new('_', "FT-99")?))?;
+    Ok(tables.page_replacements(image)?)
+}
+```
+
+[`memory::vfo::VfoMemory`] reads a PM slot's VFO memory: each band's current
+VFO record and selected [`memory::vfo::VfoBand`], and the record and
+programmable limits of the ten VFO bands, four on band A and six on band B.
+While PM Off is active, slot 0's current records are the records `FO`
+reports. [`memory::vfo::VfoMemory::tune`] tunes a band as the radio does,
+selecting the VFO band whose limits hold the frequency, and
+[`memory::vfo::VfoMemory::page_replacements`] stores the edit.
+
+```rust
+use kenwood_tmd750::memory::vfo::{VfoBand, VfoMemory};
+use kenwood_tmd750::types::{Band, Frequency, SlotIndex};
+use kenwood_tmd750::{MemoryImage, PageReplacement};
+
+fn retune_band_b(image: &MemoryImage) -> Result<Vec<PageReplacement>, Box<dyn std::error::Error>> {
+    let mut memory = VfoMemory::read(image, SlotIndex::new(0)?)?;
+    let mut record = memory.current(Band::B).clone();
+    record.receive_frequency = Frequency::new(223_040_000)?;
+    let selected: VfoBand = memory.tune(Band::B, record)?;
+    println!("band B now tunes {selected}");
+    Ok(memory.page_replacements(image)?)
 }
 ```
 
@@ -694,6 +767,9 @@ Tested on a TM-D750 reporting `ID TM-D750`, `FV 1.02`, `TY K,2,1`:
 | Repeater list and name tables of a standard backup holding 1,455 repeaters, checked against Kenwood's catalog; an in-place repeater frequency edit, reported by `FO` in DR mode and restored | operation-panel USB |
 | Batch channel programming: two channels stored over CAT and named in one programming session, then cleared, with an unchanged standard backup afterwards | operation-panel USB |
 | D-STAR callsign list: one entry added, read back in place in a fresh session, and removed, with an unchanged standard backup afterwards | operation-panel USB |
+| CALL channels: all six stored records decoded from a standard backup, each equal to the `FO` record CALL mode reports; one CALL frequency changed with a [`memory::CallChannelPlan`] page write, reported by `FO` in CALL mode and restored, with an unchanged standard backup afterwards | operation-panel USB |
+| Mic-E type codes: one entry written, read back from a fresh standard backup and cleared, with an unchanged standard backup afterwards | operation-panel USB |
+| VFO memory: slot 0's current and selected VFO band records equal to each band's `FO` record; one band tuned with a [`memory::vfo::VfoMemory`] page write, reported by `FO` after the session and tuned back, with an unchanged standard backup afterwards | operation-panel USB |
 
 KISS mode over CAT and `PS 0` are not established, a `.d750` export has not
 been opened by the official program, and the meaning of the three `TY`
@@ -710,8 +786,8 @@ TMD750_PORT=/dev/cu.usbmodem0x001 cargo test -p kenwood-tmd750 --test hardware -
 
 The `fuzz/` workspace holds libFuzzer targets for the CAT line parser, the MCP
 header, the `.d750` parser, the stored channel codecs, the repeater-list
-record and text codecs, the callsign-list entry and the NMEA parser
-(`cargo +nightly fuzz run <target>` from `tmd750/`).
+record and text codecs, the callsign-list and Mic-E type code entries and the
+NMEA parser (`cargo +nightly fuzz run <target>` from `tmd750/`).
 
 ## Registry
 

@@ -1,17 +1,27 @@
 //! Offline access to the stored memory channels of a captured image.
 //!
-//! The flag, record and name tables lie inside the standard configuration
-//! schedule (the `2048..86016` region), so a standard backup converted to a
+//! The flag, record and name tables hold the regular, program scan, priority
+//! and APRS channels ([`PhysicalChannel`]), then the [`WeatherChannel`]s and
+//! the [`CallChannel`]s. They lie inside the standard configuration schedule
+//! (the `2048..86016` region), so a standard backup converted to a
 //! [`MemoryImage`] holds every channel. Decoding describes the supplied
 //! bytes only.
+
+mod call;
+mod weather;
+
+pub use call::{CallBand, CallChannel, CallChannelEntry, CallChannelPlan, CallMode};
+pub use weather::{WeatherChannel, WeatherChannelEntry};
 
 use crate::error::ValidationError;
 use crate::memory::MemoryImage;
 use crate::types::{
     CHANNEL_DATA_OFFSET, CHANNEL_FLAGS_OFFSET, CHANNEL_NAME_SIZE, CHANNEL_NAMES_OFFSET,
-    CHANNEL_RECORD_SIZE, FLAG_RECORD_SIZE, PHYSICAL_CHANNEL_COUNT, PhysicalChannel, Region,
-    StoredChannelEntry,
+    CHANNEL_RECORD_SIZE, FLAG_RECORD_SIZE, PhysicalChannel, Region, StoredChannelEntry,
 };
+
+/// The CALL channel stored last in every table.
+const LAST_CALL: CallChannel = CallChannel::new(CallBand::Uhf, CallMode::Dv);
 
 /// One decoded slot, or the reason its bytes did not decode.
 pub type EntryResult = Result<StoredChannelEntry, ValidationError>;
@@ -30,9 +40,9 @@ pub struct ChannelAccess<'a> {
 }
 
 impl<'a> ChannelAccess<'a> {
-    /// First image length that holds every table.
-    pub const REQUIRED_LENGTH: usize =
-        CHANNEL_NAMES_OFFSET + CHANNEL_NAME_SIZE * PHYSICAL_CHANNEL_COUNT as usize;
+    /// First image length that holds every table, through the last CALL
+    /// channel's name.
+    pub const REQUIRED_LENGTH: usize = LAST_CALL.name_address() + CHANNEL_NAME_SIZE;
 
     /// The three table regions, in address order: flags, records, names.
     ///
@@ -41,14 +51,13 @@ impl<'a> ChannelAccess<'a> {
     /// Never fails for the fixed table bounds; the `Result` is the region
     /// constructor's.
     pub fn regions() -> Result<[Region; 3], ValidationError> {
-        let last = PhysicalChannel::new(PHYSICAL_CHANNEL_COUNT - 1)?;
         let flags = Region::new(
             image_address(CHANNEL_FLAGS_OFFSET)?,
-            image_address(last.flag_address() + FLAG_RECORD_SIZE)?,
+            image_address(LAST_CALL.flag_address() + FLAG_RECORD_SIZE)?,
         )?;
         let records = Region::new(
             image_address(CHANNEL_DATA_OFFSET)?,
-            image_address(last.data_address() + CHANNEL_RECORD_SIZE)?,
+            image_address(LAST_CALL.data_address() + CHANNEL_RECORD_SIZE)?,
         )?;
         let names = Region::new(
             image_address(CHANNEL_NAMES_OFFSET)?,
@@ -88,13 +97,11 @@ impl<'a> ChannelAccess<'a> {
     ///
     /// Returns the errors of [`StoredChannelEntry::from_records`].
     pub fn entry(&self, index: PhysicalChannel) -> Result<StoredChannelEntry, ValidationError> {
-        let slice =
-            |start: usize, len: usize| self.image.get(start..start + len).unwrap_or_default();
         StoredChannelEntry::from_records(
             index,
-            slice(index.flag_address(), FLAG_RECORD_SIZE),
-            slice(index.data_address(), CHANNEL_RECORD_SIZE),
-            slice(index.name_address(), CHANNEL_NAME_SIZE),
+            self.slice(index.flag_address(), FLAG_RECORD_SIZE),
+            self.slice(index.data_address(), CHANNEL_RECORD_SIZE),
+            self.slice(index.name_address(), CHANNEL_NAME_SIZE),
         )
     }
 
@@ -113,12 +120,66 @@ impl<'a> ChannelAccess<'a> {
             entry.as_ref().is_ok_and(|entry| entry.channel().is_some()) || entry.is_err()
         })
     }
+
+    /// Decode one CALL channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`CallChannelEntry::from_records`].
+    pub fn call_channel(&self, channel: CallChannel) -> Result<CallChannelEntry, ValidationError> {
+        CallChannelEntry::from_records(
+            channel,
+            self.slice(channel.flag_address(), FLAG_RECORD_SIZE),
+            self.slice(channel.data_address(), CHANNEL_RECORD_SIZE),
+            self.slice(channel.name_address(), CHANNEL_NAME_SIZE),
+        )
+    }
+
+    /// Every CALL channel in [`CallChannel::ALL`] order.
+    pub fn call_channels(
+        &self,
+    ) -> impl Iterator<Item = Result<CallChannelEntry, ValidationError>> + '_ {
+        CallChannel::ALL
+            .into_iter()
+            .map(move |channel| self.call_channel(channel))
+    }
+
+    /// Decode one weather channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`WeatherChannelEntry::from_records`].
+    pub fn weather_channel(
+        &self,
+        channel: WeatherChannel,
+    ) -> Result<WeatherChannelEntry, ValidationError> {
+        WeatherChannelEntry::from_records(
+            channel,
+            self.slice(channel.flag_address(), FLAG_RECORD_SIZE),
+            self.slice(channel.data_address(), CHANNEL_RECORD_SIZE),
+            self.slice(channel.name_address(), CHANNEL_NAME_SIZE),
+        )
+    }
+
+    /// Every weather channel, `WX 1` first.
+    pub fn weather_channels(
+        &self,
+    ) -> impl Iterator<Item = Result<WeatherChannelEntry, ValidationError>> + '_ {
+        WeatherChannel::all().map(move |channel| self.weather_channel(channel))
+    }
+
+    /// `len` bytes from `start`, or an empty slice past the end.
+    fn slice(&self, start: usize, len: usize) -> &'a [u8] {
+        self.image.get(start..start + len).unwrap_or_default()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{CatMemoryChannelRecord, StoredChannel, StoredChannelFlag};
+    use crate::types::{
+        CatMemoryChannelRecord, PHYSICAL_CHANNEL_COUNT, StoredChannel, StoredChannelFlag,
+    };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -201,9 +262,10 @@ mod tests {
         );
         let regions = ChannelAccess::regions()?;
         assert_eq!(regions[0].start(), 0x2000);
-        assert_eq!(regions[0].end(), 0x2000 + 4 * 1102);
+        assert_eq!(regions[0].end(), 0x2000 + 4 * 1138);
         assert_eq!(regions[1].start(), 0x4000);
-        assert_eq!(regions[1].end(), 0xF778 + 40);
+        assert_eq!(regions[1].end(), 0xFD78 + 40);
+        assert_eq!(regions[2].end(), 0x1_0000 + 16 * 1142);
         assert_eq!(regions[2].end() as usize, ChannelAccess::REQUIRED_LENGTH);
         Ok(())
     }

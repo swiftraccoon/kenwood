@@ -64,6 +64,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "mic_e_entry_from_bytes"
+path = "fuzz_targets/mic_e_entry_from_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "nmea_parse"
 path = "fuzz_targets/nmea_parse.rs"
 test = false

@@ -1,9 +1,10 @@
 //! List the programmed memory channels of a `.d750` configuration file.
 //!
 //! Parses the file with `parse_d750`, borrows the channel tables of its image
-//! and prints every slot whose flag marks it programmed: the physical index,
-//! the name and the decoded record. Both file layouts cover the channel
-//! tables. No radio is opened.
+//! and prints every slot whose flag marks it programmed (the physical index,
+//! the name and the decoded record), then the six CALL channels and the ten
+//! weather channels. Both file layouts cover the channel tables. No radio is
+//! opened.
 //!
 //! Run: `cargo run -p kenwood-tmd750 --example d750_channels -- radio.d750`
 
@@ -42,5 +43,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         programmed += 1;
     }
     println!("{programmed} programmed channels");
+    for entry in channels.call_channels() {
+        println!("{}", entry?);
+    }
+    for entry in channels.weather_channels() {
+        println!("{}", entry?);
+    }
     Ok(())
 }

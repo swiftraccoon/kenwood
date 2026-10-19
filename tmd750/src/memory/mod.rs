@@ -22,7 +22,9 @@
 //! - Read the D-STAR repeater and hotspot lists with
 //!   [`repeater_list::RepeaterList`], the destination callsign list with
 //!   [`callsign_list::CallsignList`] and the six-entry MY callsign list with
-//!   [`MyCallsignList`].
+//!   [`MyCallsignList`]; the CALL and weather channels with
+//!   [`ChannelAccess`]; the user Mic-E type codes with
+//!   [`mic_e::MicETypeCodeTables`].
 //! - Prepare ordinary registered changes with
 //!   [`crate::radio::menu::MenuUpdatePlan`], or persistent Gateway changes with
 //!   [`crate::radio::terminal::TerminalPlan`]. Their session drivers separately
@@ -44,6 +46,7 @@ mod configuration;
 pub mod menu_fields;
 mod menu_patch;
 mod menu_policy;
+pub mod mic_e;
 mod my_callsigns;
 pub mod repeater_list;
 pub mod schema;
@@ -51,13 +54,17 @@ mod stored_text;
 mod terminal;
 mod text;
 mod text_field_update;
+pub mod vfo;
 
 use crate::error::{SchemaError, ValidationError};
 use crate::types::{IMAGE_LENGTH, SlotIndex};
 
 pub use captured_configuration::Configuration;
 pub use channel_names::ChannelNamePlan;
-pub use channels::ChannelAccess;
+pub use channels::{
+    CallBand, CallChannel, CallChannelEntry, CallChannelPlan, CallMode, ChannelAccess,
+    WeatherChannel, WeatherChannelEntry,
+};
 pub use configuration::{
     ChangedByte, ChangedPage, ConfigurationError, StandardConfiguration, StandardConfigurationDiff,
 };

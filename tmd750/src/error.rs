@@ -299,6 +299,40 @@ pub enum ValidationError {
         /// The physical channel index.
         index: u16,
     },
+    /// A CALL channel plan names one CALL channel more than once.
+    #[error("{channel} is planned more than once")]
+    DuplicateCallChannel {
+        /// The repeated channel.
+        channel: crate::memory::channels::CallChannel,
+    },
+    /// A CALL record's receive frequency lies outside its channel's band.
+    #[error("{channel}: receive frequency {hz} Hz is outside {minimum_hz}..{end_hz} Hz")]
+    CallFrequencyOutOfRange {
+        /// The channel.
+        channel: crate::memory::channels::CallChannel,
+        /// Rejected receive frequency in hertz.
+        hz: u32,
+        /// Lowest admitted frequency in hertz.
+        minimum_hz: u32,
+        /// First frequency above the band, in hertz.
+        end_hz: u32,
+    },
+    /// A CALL record's mode is not the one its channel holds.
+    #[error("{channel} holds {expected} records, not {actual}")]
+    CallChannelMode {
+        /// The channel.
+        channel: crate::memory::channels::CallChannel,
+        /// The mode the channel holds.
+        expected: crate::types::OperatingMode,
+        /// The record's mode.
+        actual: crate::types::OperatingMode,
+    },
+    /// A CALL plan targets a channel whose flag marks it empty in the image.
+    #[error("{channel} has no stored record to replace")]
+    CallChannelNotStored {
+        /// The channel.
+        channel: crate::memory::channels::CallChannel,
+    },
 }
 
 /// Bytes from the radio that did not follow the protocol.

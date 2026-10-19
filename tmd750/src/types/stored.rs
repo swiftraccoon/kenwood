@@ -34,6 +34,24 @@ pub const CHANNEL_NAME_SIZE: usize = 16;
 /// Physical channels: 1,000 regular, 100 program scan, priority and APRS.
 pub const PHYSICAL_CHANNEL_COUNT: u16 = 1102;
 
+/// Image address of the flag record at table index `index`.
+pub(crate) const fn flag_address_at(index: u16) -> usize {
+    CHANNEL_FLAGS_OFFSET + FLAG_RECORD_SIZE * index as usize
+}
+
+/// Image address of the channel record at table index `index`.
+pub(crate) const fn data_address_at(index: u16) -> usize {
+    let index = index as usize;
+    CHANNEL_DATA_OFFSET
+        + 256 * (index / CHANNELS_PER_PAGE)
+        + CHANNEL_RECORD_SIZE * (index % CHANNELS_PER_PAGE)
+}
+
+/// Image address of the name at name-table index `index`.
+pub(crate) const fn name_address_at(index: u16) -> usize {
+    CHANNEL_NAMES_OFFSET + CHANNEL_NAME_SIZE * index as usize
+}
+
 /// Zero-based position of a channel in the three tables.
 ///
 /// Regular channels occupy 0 through 999. Program scan limits follow in
@@ -111,22 +129,19 @@ impl PhysicalChannel {
     /// Image address of the flag record.
     #[must_use]
     pub const fn flag_address(self) -> usize {
-        CHANNEL_FLAGS_OFFSET + FLAG_RECORD_SIZE * self.0 as usize
+        flag_address_at(self.0)
     }
 
     /// Image address of the channel record.
     #[must_use]
     pub const fn data_address(self) -> usize {
-        let index = self.0 as usize;
-        CHANNEL_DATA_OFFSET
-            + 256 * (index / CHANNELS_PER_PAGE)
-            + CHANNEL_RECORD_SIZE * (index % CHANNELS_PER_PAGE)
+        data_address_at(self.0)
     }
 
     /// Image address of the name.
     #[must_use]
     pub const fn name_address(self) -> usize {
-        CHANNEL_NAMES_OFFSET + CHANNEL_NAME_SIZE * self.0 as usize
+        name_address_at(self.0)
     }
 
     /// Every physical channel in index order.
@@ -274,9 +289,11 @@ pub struct StoredChannel {
     /// Demodulation mode.
     pub mode: OperatingMode,
     /// Byte 9 bit 3, raw: set on the DV and AM records the CAT writer stored,
-    /// clear on FM records and on the radio's APRS channel.
+    /// clear on FM records, on the radio's APRS channel and on the CALL and
+    /// weather records, DV included.
     pub mode_flag: bool,
-    /// Byte 9 bits 2:0, raw; zero in every observed record.
+    /// Byte 9 bits 2:0, raw: zero in the records the CAT writer stored and in
+    /// the APRS channel, one in the CALL and weather records.
     pub mode_low_bits: u8,
     /// The single active tone function.
     pub tone_mode: ToneMode,
@@ -502,9 +519,11 @@ impl StoredChannel {
 /// 145.200 and 162.550 MHz, `0x06` at 174.000 and 200.000 MHz, `0x02` at
 /// 216.000 and 223.500 MHz, `0x07` at 260.000 and 300.000 MHz, `0x08` at
 /// 410.000 and 446.000 MHz, and `0x09` at 470.000, 500.000 and 523.000 MHz
-/// for channels stored over CAT; the radio's own 144.390 MHz APRS channel
-/// holds `0x01`. The segment edges between those samples are not
-/// established, so the byte is retained exactly.
+/// for channels stored over CAT. The radio's own 144.390 MHz APRS channel,
+/// the weather channels and the VHF CALL channels hold `0x01`, the 220 MHz
+/// CALL channels `0x02` and the UHF CALL channels `0x03`. The segment edges
+/// between those samples are not established, so the byte is retained
+/// exactly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BandCode(u8);
 
@@ -540,10 +559,12 @@ impl BandCode {
 ///
 /// Byte 0 is the band code or `0xFF` for an empty slot, byte 1 the scan
 /// lockout, byte 2 the group and byte 3 is raw (`0xFF` on empty slots and
-/// the radio's APRS channel, `0x00` after a CAT write). Groups 0 through 9
-/// follow the hundreds digit of a regular channel; program scan slots read
-/// 30 while empty and 10 after a CAT write; the priority channel reads 31
-/// and the APRS channel 35.
+/// the radio's APRS channel, `0x00` after a CAT write and on the weather
+/// channels). Groups 0 through 9 follow the hundreds digit of a regular
+/// channel; program scan slots read 30 while empty and 10 after a CAT write;
+/// the priority channel reads 31, the weather channels 32 and the APRS
+/// channel 35. A CALL channel's flag holds `0xFF` in the lockout byte, so
+/// [`crate::memory::channels::CallChannelEntry`] keeps it raw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StoredChannelFlag {
     band: Option<BandCode>,

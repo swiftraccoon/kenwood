@@ -40,6 +40,7 @@ jobs:
           - { crate: tmd750, target: stored_channel_from_bytes }
           - { crate: tmd750, target: repeater_record_from_bytes }
           - { crate: tmd750, target: callsign_entry_from_bytes }
+          - { crate: tmd750, target: mic_e_entry_from_bytes }
           - { crate: tmd750, target: nmea_parse }
     steps:
       - uses: actions/checkout@v4
