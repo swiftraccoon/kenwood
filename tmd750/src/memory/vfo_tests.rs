@@ -19,6 +19,30 @@ const CURRENT_B_BYTES: [u8; 40] = [
     0x49, 0x52, 0x45, 0x43, 0x54, 0x00, 0x00, 0x00,
 ];
 
+/// The A 430 MHz VFO band record in the same backup: 446.000 MHz, simplex,
+/// a 5 MHz offset and 25 kHz steps.
+const A430_BYTES: [u8; 40] = [
+    0x80, 0x6B, 0x95, 0x1A, 0x40, 0x4B, 0x4C, 0x00, 0x99, 0x01, 0x00, 0x08, 0x08, 0x00, 0x00, 0x43,
+    0x51, 0x43, 0x51, 0x43, 0x51, 0x00, 0x00, 0x44, 0x49, 0x52, 0x45, 0x43, 0x54, 0x00, 0x00, 0x44,
+    0x49, 0x52, 0x45, 0x43, 0x54, 0x00, 0x00, 0x00,
+];
+
+/// The B 430 MHz VFO band record in the same backup: the A 430 MHz record
+/// at 440.000 MHz.
+const B430_BYTES: [u8; 40] = [
+    0x00, 0xDE, 0x39, 0x1A, 0x40, 0x4B, 0x4C, 0x00, 0x99, 0x01, 0x00, 0x08, 0x08, 0x00, 0x00, 0x43,
+    0x51, 0x43, 0x51, 0x43, 0x51, 0x00, 0x00, 0x44, 0x49, 0x52, 0x45, 0x43, 0x54, 0x00, 0x00, 0x44,
+    0x49, 0x52, 0x45, 0x43, 0x54, 0x00, 0x00, 0x00,
+];
+
+/// The band B step segment table in the same backup: a step and a mode byte
+/// for each of the seventeen segments.
+const SEGMENT_BYTES: [u8; 34] = [
+    0x06, 0x02, 0x02, 0x00, 0x02, 0x00, 0x02, 0x00, 0x0B, 0x00, 0x06, 0x00, 0x08, 0x00, 0x06, 0x00,
+    0x06, 0x00, 0x06, 0x00, 0x06, 0x00, 0x06, 0x00, 0x06, 0x00, 0x06, 0x00, 0x09, 0x00, 0x06, 0x00,
+    0x0B, 0x00,
+];
+
 /// The `FO` record each band reported while those records were stored.
 const FO_A: &str = "0145190000,0000600000,2,2,0,0,0,0,0,0,2,08,08,000,0,CQCQCQ,0,00";
 const FO_B: &str = "0223020000,0001600000,8,8,0,0,0,0,0,0,0,08,08,000,0,CQCQCQ,0,00";
@@ -64,11 +88,7 @@ fn put(image: &mut [u8], offset: usize, bytes: &[u8]) -> TestResult {
 
 /// A record with the current band A bytes and `hz` as its receive frequency.
 fn record_at(hz: u32) -> [u8; 40] {
-    let mut bytes = CURRENT_A_BYTES;
-    for (destination, source) in bytes.iter_mut().zip(hz.to_le_bytes()) {
-        *destination = source;
-    }
-    bytes
+    with_frequency(CURRENT_A_BYTES, hz)
 }
 
 /// A full image of `0x42` holding the bench VFO memory in `slot`.
@@ -82,7 +102,9 @@ fn bench_image(slot: usize) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     for (index, (offset, hz)) in OFFSETS.into_iter().zip(BAND_HZ).enumerate() {
         let record = match index {
             1 => CURRENT_A_BYTES,
+            3 => A430_BYTES,
             7 => CURRENT_B_BYTES,
+            8 => B430_BYTES,
             _ => record_at(hz),
         };
         put(&mut image, base + 0x5_0200 + offset, &record)?;
@@ -93,7 +115,17 @@ fn bench_image(slot: usize) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         put(&mut image, address, &(lower * 1_000_000).to_le_bytes())?;
         put(&mut image, address + 4, &(end * 1_000_000).to_le_bytes())?;
     }
+    put(&mut image, base + 0x5_04DA, &SEGMENT_BYTES)?;
+    put(&mut image, base + 0x5_0513, &[1])?;
     Ok(image)
+}
+
+/// `bytes` with `hz` as the receive frequency.
+fn with_frequency(mut bytes: [u8; 40], hz: u32) -> [u8; 40] {
+    for (destination, source) in bytes.iter_mut().zip(hz.to_le_bytes()) {
+        *destination = source;
+    }
+    bytes
 }
 
 fn slot(index: u8) -> Result<SlotIndex, Box<dyn std::error::Error>> {
@@ -310,5 +342,206 @@ fn another_slot_reads_at_its_stride() -> TestResult {
         146_520_000
     );
     assert!(VfoMemory::read(&image, slot(0)?).is_err());
+    Ok(())
+}
+
+fn frequency(hz: u32) -> Result<Frequency, Box<dyn std::error::Error>> {
+    Ok(Frequency::new(hz)?)
+}
+
+#[test]
+fn band_b_step_segments_follow_the_stored_table() -> TestResult {
+    let ranges: Vec<(u16, u16)> = StepSegment::ALL.map(StepSegment::range_mhz).to_vec();
+    assert_eq!(ranges.len(), 17);
+    assert_eq!(ranges.first(), Some(&(108, 136)));
+    assert_eq!(ranges.get(7..13), Some(&[(225, 410); 6][..]));
+    assert_eq!(ranges.last(), Some(&(470, 524)));
+    let index = |hz| frequency(hz).map(|frequency| StepSegment::of(frequency).index());
+    assert_eq!(index(223_020_000)?, 6);
+    assert_eq!(index(300_000_000)?, 7);
+    assert_eq!(index(Frequency::MAX_HZ)?, 16);
+    assert_eq!(StepSegment::ALL[0].address(slot(0)?), 0x5_04DA);
+    assert_eq!(StepSegment::ALL[16].address(slot(1)?), 0x5_04FA + 8192);
+    let memory = VfoMemory::read(&MemoryImage::from_bytes(bench_image(0)?)?, slot(0)?)?;
+    let steps: Vec<Option<StepSize>> = [0, 6, 7, 14]
+        .map(|index| {
+            StepSegment::ALL
+                .get(index)
+                .and_then(|segment| memory.segment_step(*segment))
+        })
+        .to_vec();
+    assert_eq!(
+        steps,
+        [
+            Some(StepSize::Hz12500),
+            Some(StepSize::Hz20000),
+            Some(StepSize::Hz12500),
+            Some(StepSize::Hz25000)
+        ]
+    );
+    assert!(memory.auto_repeater_offset());
+    Ok(())
+}
+
+/// Each band's current record after `FQ` set the frequency on firmware 1.02,
+/// read from the next standard backup, from the bench memory.
+#[test]
+fn frequency_tuning_reproduces_what_fq_stored() -> TestResult {
+    let memory = VfoMemory::read(&MemoryImage::from_bytes(bench_image(0)?)?, slot(0)?)?;
+    let mut segment_step = with_frequency(CURRENT_B_BYTES, 300_000_000);
+    segment_step[8] = 0x68;
+    let cases = [
+        (Band::B, 300_000_000, VfoBand::B200And300, segment_step),
+        (
+            Band::B,
+            446_000_000,
+            VfoBand::B430,
+            with_frequency(B430_BYTES, 446_000_000),
+        ),
+        (
+            Band::A,
+            445_000_000,
+            VfoBand::A430,
+            with_frequency(A430_BYTES, 445_000_000),
+        ),
+    ];
+    for (band, hz, vfo_band, expected) in cases {
+        let (selected, record) = memory.frequency_record(band, frequency(hz)?)?;
+        assert_eq!(selected, vfo_band, "{band} {hz}");
+        assert_eq!(record.to_bytes(), expected, "{band} {hz}");
+    }
+    for (hz, shift) in [
+        (147_000_000, ShiftDirection::Plus),
+        (146_520_000, ShiftDirection::Simplex),
+        (145_190_000, ShiftDirection::Minus),
+    ] {
+        let (selected, record) = memory.frequency_record(Band::A, frequency(hz)?)?;
+        assert_eq!(selected, VfoBand::A144);
+        assert_eq!(record.shift, shift, "{hz}");
+        assert_eq!(record.transmit, memory.current(Band::A).transmit);
+        assert_eq!(record.tone_mode, memory.current(Band::A).tone_mode);
+    }
+    assert_eq!(
+        memory.frequency_record(Band::A, frequency(180_000_000)?),
+        Err(VfoError::OutsideLimits {
+            band: Band::A,
+            hz: 180_000_000
+        })
+    );
+    Ok(())
+}
+
+#[test]
+fn a_frequency_tune_writes_the_bytes_fq_changed() -> TestResult {
+    let image = MemoryImage::from_bytes(bench_image(0)?)?;
+    let mut memory = VfoMemory::read(&image, slot(0)?)?;
+    assert_eq!(
+        memory.tune_frequency(Band::B, frequency(446_000_000)?)?,
+        VfoBand::B430
+    );
+    assert_eq!(memory.selected(Band::B), VfoBand::B430);
+    assert_eq!(memory.band(VfoBand::B430).record(), memory.current(Band::B));
+    let radio: BTreeSet<usize> = (0x5_0128..=0x5_012E)
+        .chain([0x5_0130, 0x5_0164])
+        .chain(0x5_03C0..=0x5_03C2)
+        .collect();
+    assert_eq!(changed(&memory.page_replacements(&image)?), radio);
+    Ok(())
+}
+
+#[test]
+fn the_type_k_offset_plan_applies_only_where_the_radio_applies_it() -> TestResult {
+    let shift = |hz| frequency(hz).map(type_k_shift);
+    for (hz, expected) in [
+        (145_099_999, ShiftDirection::Simplex),
+        (145_100_000, ShiftDirection::Minus),
+        (145_500_000, ShiftDirection::Simplex),
+        (146_000_000, ShiftDirection::Plus),
+        (146_400_000, ShiftDirection::Simplex),
+        (146_600_000, ShiftDirection::Minus),
+        (147_399_999, ShiftDirection::Plus),
+        (147_600_000, ShiftDirection::Minus),
+        (148_000_000, ShiftDirection::Simplex),
+        (223_920_000, ShiftDirection::Minus),
+        (225_000_000, ShiftDirection::Simplex),
+        (442_000_000, ShiftDirection::Plus),
+        (445_000_000, ShiftDirection::Simplex),
+        (447_000_000, ShiftDirection::Minus),
+        (450_000_000, ShiftDirection::Simplex),
+    ] {
+        assert_eq!(shift(hz)?, expected, "{hz}");
+    }
+    let mut bytes = bench_image(0)?;
+    put(&mut bytes, 0x5_0513, &[0])?;
+    let off = VfoMemory::read(&MemoryImage::from_bytes(bytes)?, slot(0)?)?;
+    assert!(!off.auto_repeater_offset());
+    let (_, kept) = off.frequency_record(Band::A, frequency(147_000_000)?)?;
+    assert_eq!(kept.shift, ShiftDirection::Minus);
+
+    let mut memory = VfoMemory::read(&MemoryImage::from_bytes(bench_image(0)?)?, slot(0)?)?;
+    let mut reversed = memory.current(Band::A).clone();
+    reversed.reverse = true;
+    assert_eq!(memory.tune(Band::A, reversed)?, VfoBand::A144);
+    let (_, kept) = memory.frequency_record(Band::A, frequency(147_000_000)?)?;
+    assert_eq!(kept.shift, ShiftDirection::Minus);
+    let mut digital = memory.current(Band::A).clone();
+    digital.reverse = false;
+    digital.mode = OperatingMode::Dv;
+    assert_eq!(memory.tune(Band::A, digital)?, VfoBand::A144);
+    let (_, kept) = memory.frequency_record(Band::A, frequency(147_000_000)?)?;
+    assert_eq!(kept.shift, ShiftDirection::Minus);
+    Ok(())
+}
+
+#[test]
+fn frequency_entry_rounds_down_to_the_receive_step() -> TestResult {
+    let memory = VfoMemory::read(&MemoryImage::from_bytes(bench_image(0)?)?, slot(0)?)?;
+    for (band, hz, expected) in [
+        (Band::A, 146_521_000, 146_520_000),
+        (Band::B, 300_010_000, 300_000_000),
+        (Band::B, 223_030_000, 223_020_000),
+    ] {
+        let (_, record) = memory.frequency_record(band, frequency(hz)?)?;
+        assert_eq!(record.receive_frequency.as_hz(), expected, "{band} {hz}");
+    }
+    Ok(())
+}
+
+/// The radio's own sequence on firmware 1.02: selecting 12.5 kHz at 223.020
+/// MHz (rounding to 223.0125), then entering 300.000 MHz and 223.020 MHz,
+/// tuned 223.0125 MHz with the 12.5 kHz step.
+#[test]
+fn a_band_b_step_is_remembered_for_its_segment() -> TestResult {
+    let image = MemoryImage::from_bytes(bench_image(0)?)?;
+    let mut memory = VfoMemory::read(&image, slot(0)?)?;
+    let mut selected = memory.current(Band::B).clone();
+    selected.receive_frequency = frequency(223_012_500)?;
+    selected.receive_step = StepSize::Hz12500;
+    assert_eq!(memory.tune(Band::B, selected)?, VfoBand::B200And300);
+    assert_eq!(
+        memory.segment_step(StepSegment::of(frequency(223_020_000)?)),
+        Some(StepSize::Hz12500)
+    );
+    assert!(changed(&memory.page_replacements(&image)?).contains(&0x5_04E6));
+    assert_eq!(
+        memory.tune_frequency(Band::B, frequency(300_000_000)?)?,
+        VfoBand::B200And300
+    );
+    assert_eq!(
+        memory.tune_frequency(Band::B, frequency(223_020_000)?)?,
+        VfoBand::B200And300
+    );
+    let record = memory.current(Band::B);
+    assert_eq!(record.receive_frequency.as_hz(), 223_012_500);
+    assert_eq!(record.receive_step, StepSize::Hz12500);
+
+    let mut band_a = memory.current(Band::A).clone();
+    band_a.receive_step = StepSize::Hz25000;
+    assert_eq!(memory.tune(Band::A, band_a)?, VfoBand::A144);
+    assert_eq!(
+        memory.segment_step(StepSegment::of(frequency(145_190_000)?)),
+        Some(StepSize::Hz5000),
+        "band A keeps no segment steps"
+    );
     Ok(())
 }

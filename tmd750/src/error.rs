@@ -333,6 +333,12 @@ pub enum ValidationError {
         /// The channel.
         channel: crate::memory::channels::CallChannel,
     },
+    /// A group name plan names one memory group more than once.
+    #[error("{group} is named more than once")]
+    DuplicateGroupName {
+        /// The repeated group.
+        group: crate::memory::channels::MemoryGroup,
+    },
 }
 
 /// Bytes from the radio that did not follow the protocol.

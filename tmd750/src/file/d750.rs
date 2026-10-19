@@ -128,6 +128,17 @@ impl ConfigHeader {
     pub const fn layout(&self) -> FileLayout {
         self.layout
     }
+
+    /// The three radio-type bytes at offset 128: the type's components
+    /// without their separators, `K21` for `K,2,1`.
+    #[must_use]
+    pub fn radio_type_bytes(&self) -> [u8; 3] {
+        let mut bytes = [0; 3];
+        for (destination, source) in bytes.iter_mut().zip(self.raw.iter().skip(128)) {
+            *destination = *source;
+        }
+        bytes
+    }
 }
 
 impl TryFrom<[u8; HEADER_SIZE]> for ConfigHeader {

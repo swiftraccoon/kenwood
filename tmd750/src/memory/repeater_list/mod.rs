@@ -7,7 +7,10 @@
 //! are stored little-endian in the four bytes after the three records of the
 //! list's final page. A record names its world region, country and group by
 //! index into three tables of 16-byte names, read with [`RepeaterNames`];
-//! every name is a [`StoredText`]. The lists and the tables lie inside the
+//! every name is a [`StoredText`]. [`RepeaterNames`] also holds the
+//! [`VoiceCode`] tables, one entry per country from
+//! [`REPEATER_COUNTRY_VOICE_ADDRESS`] and one per group from
+//! [`REPEATER_GROUP_VOICE_ADDRESS`]. The lists and the tables lie inside the
 //! standard backup schedule. Edit one
 //! record in place with [`RepeaterRecord::page_replacement`]; store a whole
 //! list, reordered, shortened or extended with records derived from stored
@@ -18,7 +21,12 @@
 //! The layout was established on firmware 1.02, type `K,2,1`, by decoding a
 //! backup that held 1,455 repeaters against Kenwood's published repeater
 //! catalog; re-encoding that backup's lists and tables reproduces every byte
-//! of their pages. An in-place frequency edit of the repeater the DR tuning
+//! of their pages. Its voice tables held codes for 36 countries, such as
+//! `JPN`, and 103 groups, such as `JA1`, each two or three uppercase letters
+//! and digits; every other entry was zero. A voice code written over the
+//! operation-panel USB read back in place in a fresh session, changing only
+//! its own bytes, and clearing it restored every byte of the standard
+//! backup. An in-place frequency edit of the repeater the DR tuning
 //! mode had selected was written over the operation-panel USB, reported by
 //! `FO` in DR mode, and restored. Selecting DR after that edit also rewrote
 //! band A's copy of the selected record in the PM Off settings at `0x50430`
@@ -57,10 +65,109 @@ pub const REPEATER_REGION_NAMES_ADDRESS: u32 = 0x4_A000;
 pub const REPEATER_COUNTRY_NAMES_ADDRESS: u32 = 0x4_A100;
 /// Address of the group name table, [`GroupIndex::COUNT`] names.
 pub const REPEATER_GROUP_NAMES_ADDRESS: u32 = 0x4_AB00;
+/// Address of the country voice code table, one [`VoiceCode`] per country.
+pub const REPEATER_COUNTRY_VOICE_ADDRESS: u32 = 0x3600;
+/// Address of the group voice code table, one [`VoiceCode`] per group.
+pub const REPEATER_GROUP_VOICE_ADDRESS: u32 = 0x3A00;
+/// Bytes per voice code.
+pub const VOICE_CODE_SIZE: usize = 4;
+
+/// One entry of the voice code tables the official program keeps for the
+/// repeater-list countries and groups: up to four uppercase letters and
+/// digits followed by padding, kept exactly as stored.
+///
+/// Padding is NUL; the official program also reads `0xFF` as padding. How
+/// the radio uses a code is not established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VoiceCode([u8; VOICE_CODE_SIZE]);
+
+impl VoiceCode {
+    /// No code: four NUL bytes.
+    pub const EMPTY: Self = Self([0; VOICE_CODE_SIZE]);
+
+    /// A code of up to four uppercase letters and digits, NUL padded; empty
+    /// text is [`Self::EMPTY`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepeaterListError::InvalidVoiceCode`] for longer text or a
+    /// character other than `A` to `Z` and `0` to `9`.
+    pub fn new(code: &str) -> Result<Self, RepeaterListError> {
+        if code.len() > VOICE_CODE_SIZE || !code.bytes().all(is_voice_byte) {
+            return Err(RepeaterListError::InvalidVoiceCode {
+                code: code.to_owned(),
+            });
+        }
+        let mut bytes = [0; VOICE_CODE_SIZE];
+        for (destination, source) in bytes.iter_mut().zip(code.bytes()) {
+            *destination = source;
+        }
+        Ok(Self(bytes))
+    }
+
+    /// Validate stored bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepeaterListError::MalformedVoiceCode`] unless the bytes are
+    /// uppercase letters and digits followed only by NUL or `0xFF`.
+    pub fn from_bytes(bytes: [u8; VOICE_CODE_SIZE]) -> Result<Self, RepeaterListError> {
+        let length = code_length(&bytes);
+        let padded = bytes
+            .get(length..)
+            .is_some_and(|padding| padding.iter().all(|&byte| byte == 0 || byte == 0xFF));
+        if padded {
+            Ok(Self(bytes))
+        } else {
+            Err(RepeaterListError::MalformedVoiceCode { bytes })
+        }
+    }
+
+    /// The code, empty when none is stored.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.0
+            .get(..code_length(&self.0))
+            .and_then(|code| std::str::from_utf8(code).ok())
+            .unwrap_or_default()
+    }
+
+    /// The stored bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; VOICE_CODE_SIZE] {
+        &self.0
+    }
+
+    /// Whether no code is stored.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        code_length(&self.0) == 0
+    }
+}
+
+impl fmt::Display for VoiceCode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+const fn is_voice_byte(byte: u8) -> bool {
+    byte.is_ascii_uppercase() || byte.is_ascii_digit()
+}
+
+/// The number of leading code characters.
+fn code_length(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .position(|&byte| !is_voice_byte(byte))
+        .unwrap_or(bytes.len())
+}
 
 const RECORDS_PER_PAGE: u16 = 3;
 const RECORD_SIZE_U32: u32 = 80;
 const TEXT_SIZE_U32: u32 = 16;
+/// [`VOICE_CODE_SIZE`] as an address offset.
+const VOICE_SIZE_U32: u32 = 4;
 const ENDS_OFFSET: u32 = 240;
 
 /// An empty slot as stored: NUL text and callsigns, an all-ones frequency
@@ -328,21 +435,25 @@ impl RepeaterList {
     }
 }
 
-/// The world-region, country and group name tables.
+/// The world-region, country and group name tables, with the country and
+/// group voice code tables.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepeaterNames {
     regions: Vec<StoredText<REPEATER_TEXT_SIZE>>,
     countries: Vec<StoredText<REPEATER_TEXT_SIZE>>,
     groups: Vec<StoredText<REPEATER_TEXT_SIZE>>,
+    country_voices: Vec<VoiceCode>,
+    group_voices: Vec<VoiceCode>,
 }
 
 impl RepeaterNames {
-    /// Decode the three tables; an unnamed entry is empty text.
+    /// Decode the five tables; an unnamed entry is empty text.
     ///
     /// # Errors
     ///
-    /// Returns [`RepeaterListError::MalformedName`] for an entry that is not
-    /// a stored text form.
+    /// Returns [`RepeaterListError::MalformedName`] for a name that is not a
+    /// stored text form and [`RepeaterListError::MalformedVoiceCode`] for a
+    /// voice code [`VoiceCode::from_bytes`] refuses.
     pub fn read(image: &MemoryImage) -> Result<Self, RepeaterListError> {
         Ok(Self {
             regions: name_table(
@@ -356,6 +467,12 @@ impl RepeaterNames {
                 u16::from(CountryIndex::COUNT),
             )?,
             groups: name_table(image, REPEATER_GROUP_NAMES_ADDRESS, GroupIndex::COUNT)?,
+            country_voices: voice_table(
+                image,
+                REPEATER_COUNTRY_VOICE_ADDRESS,
+                u16::from(CountryIndex::COUNT),
+            )?,
+            group_voices: voice_table(image, REPEATER_GROUP_VOICE_ADDRESS, GroupIndex::COUNT)?,
         })
     }
 
@@ -392,9 +509,39 @@ impl RepeaterNames {
         rename(&mut self.groups, usize::from(index.get()), name);
     }
 
-    /// The page writes that store these tables in place of `image`'s,
-    /// keeping every byte between and after the tables; only pages whose
-    /// bytes change are returned.
+    /// The voice code of country `index`.
+    #[must_use]
+    pub fn country_voice(&self, index: CountryIndex) -> &VoiceCode {
+        self.country_voices
+            .get(usize::from(index.get()))
+            .unwrap_or(&VoiceCode::EMPTY)
+    }
+
+    /// The voice code of group `index`.
+    #[must_use]
+    pub fn group_voice(&self, index: GroupIndex) -> &VoiceCode {
+        self.group_voices
+            .get(usize::from(index.get()))
+            .unwrap_or(&VoiceCode::EMPTY)
+    }
+
+    /// Replace the voice code of country `index`.
+    pub fn set_country_voice(&mut self, index: CountryIndex, code: VoiceCode) {
+        if let Some(entry) = self.country_voices.get_mut(usize::from(index.get())) {
+            *entry = code;
+        }
+    }
+
+    /// Replace the voice code of group `index`.
+    pub fn set_group_voice(&mut self, index: GroupIndex, code: VoiceCode) {
+        if let Some(entry) = self.group_voices.get_mut(usize::from(index.get())) {
+            *entry = code;
+        }
+    }
+
+    /// The page writes that store these tables in place of `image`'s, in
+    /// address order, keeping every byte between and after the tables; only
+    /// pages whose bytes change are returned.
     ///
     /// # Errors
     ///
@@ -403,6 +550,22 @@ impl RepeaterNames {
         &self,
         image: &MemoryImage,
     ) -> Result<Vec<PageReplacement>, crate::Error> {
+        let voice_start = REPEATER_COUNTRY_VOICE_ADDRESS;
+        let voice_end =
+            REPEATER_GROUP_VOICE_ADDRESS + u32::from(GroupIndex::COUNT) * VOICE_SIZE_U32;
+        let mut voices = chain::stored_bytes(
+            image,
+            voice_start,
+            voice_end.next_multiple_of(PAGE_SIZE_U32) - voice_start,
+        );
+        for (address, codes) in [
+            (REPEATER_COUNTRY_VOICE_ADDRESS, &self.country_voices),
+            (REPEATER_GROUP_VOICE_ADDRESS, &self.group_voices),
+        ] {
+            for (offset, code) in (0..).step_by(VOICE_CODE_SIZE).zip(codes) {
+                chain::put(&mut voices, address - voice_start + offset, code.as_bytes());
+            }
+        }
         let start = REPEATER_REGION_NAMES_ADDRESS;
         let end = REPEATER_GROUP_NAMES_ADDRESS + u32::from(GroupIndex::COUNT) * TEXT_SIZE_U32;
         let mut tables =
@@ -416,7 +579,9 @@ impl RepeaterNames {
                 chain::put(&mut tables, address - start + offset, name.as_bytes());
             }
         }
-        chain::changed_pages(image, start, &tables)
+        let mut replacements = chain::changed_pages(image, voice_start, &voices)?;
+        replacements.extend(chain::changed_pages(image, start, &tables)?);
+        Ok(replacements)
     }
 }
 
@@ -482,6 +647,20 @@ pub enum RepeaterListError {
     MalformedName {
         /// The entry's image address.
         address: u32,
+    },
+    /// Voice code text longer than four characters or holding a character
+    /// other than an uppercase letter or a digit.
+    #[error("voice code {code:?} is not up to four uppercase letters and digits")]
+    InvalidVoiceCode {
+        /// The rejected text.
+        code: String,
+    },
+    /// A stored voice code that is not uppercase letters and digits followed
+    /// by NUL or `0xFF` padding.
+    #[error("voice code {bytes:02X?} is not uppercase letters and digits followed by padding")]
+    MalformedVoiceCode {
+        /// The stored bytes.
+        bytes: [u8; VOICE_CODE_SIZE],
     },
     /// A callsign field that is not graphic ASCII or space followed by NUL
     /// padding.
@@ -595,6 +774,18 @@ fn name_table(
                     address: entry_address,
                 },
             )
+        })
+        .collect()
+}
+
+fn voice_table(
+    image: &MemoryImage,
+    address: u32,
+    count: u16,
+) -> Result<Vec<VoiceCode>, RepeaterListError> {
+    (0..u32::from(count))
+        .map(|entry| {
+            VoiceCode::from_bytes(chain::stored_field(image, address + entry * VOICE_SIZE_U32))
         })
         .collect()
 }

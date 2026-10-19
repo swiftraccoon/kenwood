@@ -64,8 +64,22 @@ doc = false
 bench = false
 
 [[bin]]
+name = "dtmf_entry_from_bytes"
+path = "fuzz_targets/dtmf_entry_from_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "mic_e_entry_from_bytes"
 path = "fuzz_targets/mic_e_entry_from_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "voice_code_from_bytes"
+path = "fuzz_targets/voice_code_from_bytes.rs"
 test = false
 doc = false
 bench = false

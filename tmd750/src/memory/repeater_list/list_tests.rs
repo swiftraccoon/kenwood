@@ -502,6 +502,73 @@ fn the_ends_page_keeps_its_other_padding_bytes() -> TestResult {
 }
 
 #[test]
+fn voice_codes_are_read_beside_the_names() -> TestResult {
+    let mut raw = image(RepeaterListKind::Repeater, &[], NO_ENDS)?.into_bytes();
+    for (address, code) in [
+        (0x3600, *b"JPN\0"),
+        (0x3600 + 4 * 149, *b"ZAF\0"),
+        (0x3A00, *b"JA1\0"),
+        (0x3A00 + 4 * 299, *b"HB\0\0"),
+        (0x3A00 + 4 * 7, [0; 4]),
+        (0x3A00 + 4 * 8, *b"AB\xFF\xFF"),
+    ] {
+        place(&mut raw, address, &code)?;
+    }
+    let names = RepeaterNames::read(&MemoryImage::from_bytes(raw)?)?;
+    let country = |index| CountryIndex::new(index).map(|index| names.country_voice(index).as_str());
+    let group = |index| GroupIndex::new(index).map(|index| names.group_voice(index).as_str());
+    assert_eq!(
+        [country(0)?, country(149)?, country(1)?],
+        ["JPN", "ZAF", ""]
+    );
+    assert_eq!(
+        [group(0)?, group(299)?, group(7)?, group(8)?],
+        ["JA1", "HB", "", "AB"]
+    );
+    assert!(names.country_voice(CountryIndex::new(1)?).is_empty());
+    Ok(())
+}
+
+#[test]
+fn voice_codes_are_uppercase_letters_and_digits() -> TestResult {
+    assert_eq!(VoiceCode::new("JPN")?.as_bytes(), b"JPN\0");
+    assert_eq!(VoiceCode::new("KH6L")?.as_bytes(), b"KH6L");
+    assert_eq!(VoiceCode::new("")?, VoiceCode::EMPTY);
+    for code in ["jpn", "ABCDE", "A-1", "É"] {
+        assert_eq!(
+            VoiceCode::new(code),
+            Err(RepeaterListError::InvalidVoiceCode {
+                code: code.to_owned()
+            })
+        );
+    }
+    for bytes in [*b"JP\0N", [0x07, 0, 0, 0], *b"jpn\0", *b"\0\xFFAB"] {
+        assert!(VoiceCode::from_bytes(bytes).is_err(), "{bytes:02X?}");
+    }
+    assert!(VoiceCode::from_bytes([0xFF; 4])?.is_empty());
+    assert_eq!(VoiceCode::from_bytes(*b"AB\xFF\0")?.as_str(), "AB");
+    Ok(())
+}
+
+#[test]
+fn a_voice_code_edit_rewrites_only_its_page() -> TestResult {
+    let captured = image(RepeaterListKind::Repeater, &[], NO_ENDS)?;
+    let mut names = RepeaterNames::read(&captured)?;
+    names.set_country_voice(CountryIndex::new(0)?, VoiceCode::new("USA")?);
+    names.set_group_voice(GroupIndex::new(299)?, VoiceCode::new("SMP")?);
+    let replacements = names.page_replacements(&captured)?;
+    let pages: Vec<u32> = replacements
+        .iter()
+        .map(|replacement| replacement.page().address().as_u32())
+        .collect();
+    assert_eq!(pages, [0x3600, 0x3E00]);
+    let reread = RepeaterNames::read(&applied(&captured, &replacements)?)?;
+    assert_eq!(reread, names);
+    assert_eq!(reread.group_voice(GroupIndex::new(299)?).as_str(), "SMP");
+    Ok(())
+}
+
+#[test]
 fn renamed_table_entries_rewrite_only_their_pages() -> TestResult {
     let captured = image(RepeaterListKind::Repeater, &[], NO_ENDS)?;
     let mut names = RepeaterNames::read(&captured)?;

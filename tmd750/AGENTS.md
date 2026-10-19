@@ -90,8 +90,8 @@
   at `0x4000` (40 bytes, six per page, layout in `types/stored.rs`), names at
   `0x10000` (16 bytes, NUL padded), one index for all three: regular 0-999,
   program scan `L0,U0,L1,...` from 1000 (`L05` = 1010), priority 1100, APRS
-  1101, weather 1102-1111, CALL 1132-1137 (names 1136-1141). CALL mode `FO`
-  reads the CALL record; `MD`/`FO` writes there are `N`, so edits use MCP.
+  1101, weather 1102-1111, CALL 1132-1137 (names 1136-1141), group names
+  1152-1182. CALL mode `FO` reads it; `MD`/`FO` writes are `N`, so use MCP.
 - The band code is a receive-frequency segment, not bits (`BandCode`'s doc);
   not established: segment edges, tone/CTCSS index basis, non-ASCII names.
 - `UP`/`DW` act on the control band (first `BC` field) and take no argument;

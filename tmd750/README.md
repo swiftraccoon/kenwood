@@ -23,6 +23,7 @@ radio protocol and recovery rule. It does not depend on the TH-D75 library.
 | Back up the configuration | [`Radio::backup_mcp_until_exit`] |
 | Decode a capture offline | [`MenuFieldSnapshot`], [`ChannelAccess`], [`memory::TextImage`], [`memory::ReflectorTerminalPreflight`] |
 | Compare two captures | [`memory::StandardConfigurationDiff`] |
+| Restore a captured configuration | [`memory::restore::RestorePlan`] and [`radio::McpSession::compare_exchange_pages`] |
 | Change menu settings | [`MenuUpdatePlan`] and [`radio::McpSession::compare_exchange_menu_update`] |
 | Change a text field (PM1 name, MY1, a channel name) | [`memory::TextFieldUpdate`] and [`Radio::set_text_field_session_until_exit`] |
 | Write arbitrary pages | [`PageReplacement`] and [`radio::McpSession::compare_exchange_pages`] |
@@ -272,6 +273,20 @@ Pass its [`memory::CallChannelPlan::page_replacements`] to
 [`radio::McpSession::compare_exchange_pages`] in an open session, or to
 [`radio::session::write_pages`] for the whole session.
 
+The name table continues with the names of the thirty memory groups and of
+the weather channels' group: [`ChannelAccess::group_names`] reads them and
+[`memory::GroupNamePlan`] renames groups with the same page writes.
+
+```rust
+use kenwood_tmd750::memory::{ChannelNameText, GroupNamePlan, MemoryGroup, MemoryImage};
+use kenwood_tmd750::PageReplacement;
+
+fn name_group(image: &MemoryImage) -> Result<Vec<PageReplacement>, Box<dyn std::error::Error>> {
+    let plan = GroupNamePlan::new([(MemoryGroup::new(3)?, ChannelNameText::new("Repeaters")?)])?;
+    Ok(plan.page_replacements(image)?)
+}
+```
+
 ### Transmit
 
 [`Radio::transmit`] keys the PTT band (the second [`types::BandControl`] field)
@@ -389,12 +404,13 @@ provenance and coverage.
 [`memory::repeater_list::RepeaterList`] reads the D-STAR repeater list (1,500
 slots) or the hotspot list (30) in the radio's chain order, and
 [`memory::repeater_list::RepeaterNames`] the world-region, country and group
-names its records index. [`memory::repeater_list::RepeaterRecord::page_replacement`]
+names its records index, with the country and group
+[`memory::repeater_list::VoiceCode`]s. [`memory::repeater_list::RepeaterRecord::page_replacement`]
 turns an edited record into the one page write that stores it in place;
 [`memory::repeater_list::RepeaterList::from_records`] and
 [`memory::repeater_list::RepeaterList::page_replacements`] store a whole list
 in a new order, and [`memory::repeater_list::RepeaterNames::page_replacements`]
-renamed tables. Each produces page writes for
+renamed tables and changed voice codes. Each produces page writes for
 [`radio::McpSession::compare_exchange_pages`].
 
 ```rust
@@ -464,11 +480,17 @@ fn add_model(image: &MemoryImage) -> Result<Vec<PageReplacement>, Box<dyn std::e
 ```
 
 [`memory::vfo::VfoMemory`] reads a PM slot's VFO memory: each band's current
-VFO record and selected [`memory::vfo::VfoBand`], and the record and
-programmable limits of the ten VFO bands, four on band A and six on band B.
-While PM Off is active, slot 0's current records are the records `FO`
-reports. [`memory::vfo::VfoMemory::tune`] tunes a band as the radio does,
-selecting the VFO band whose limits hold the frequency, and
+VFO record and selected [`memory::vfo::VfoBand`], the record and
+programmable limits of the ten VFO bands, four on band A and six on band B,
+and the receive step of each band B [`memory::vfo::StepSegment`]. While PM
+Off is active, slot 0's current records are the records `FO` reports.
+[`memory::vfo::VfoMemory::tune_frequency`] sets a band's frequency as a
+frequency entry (`FQ`) does: outside the selected VFO band it starts from the
+record of the VFO band holding the frequency, band B takes a new step
+segment's receive step, the frequency rounds down to the receive step, and
+with the slot's Auto Repeater Offset on the shift follows the TM-D750A plan.
+[`memory::vfo::VfoMemory::tune`] stores a whole record as `FO` does, band B's
+receive step becoming its segment's, and
 [`memory::vfo::VfoMemory::page_replacements`] stores the edit.
 
 ```rust
@@ -478,11 +500,28 @@ use kenwood_tmd750::{MemoryImage, PageReplacement};
 
 fn retune_band_b(image: &MemoryImage) -> Result<Vec<PageReplacement>, Box<dyn std::error::Error>> {
     let mut memory = VfoMemory::read(image, SlotIndex::new(0)?)?;
-    let mut record = memory.current(Band::B).clone();
-    record.receive_frequency = Frequency::new(223_040_000)?;
-    let selected: VfoBand = memory.tune(Band::B, record)?;
-    println!("band B now tunes {selected}");
+    let selected: VfoBand = memory.tune_frequency(Band::B, Frequency::new(300_000_000)?)?;
+    println!("band B now tunes {selected} at {}", memory.current(Band::B).receive_step);
     Ok(memory.page_replacements(image)?)
+}
+```
+
+[`memory::dtmf::DtmfMemories`] reads the automatic dialer's two memories,
+ten DTMF channels of a 16-byte name and code and ten `EchoLink` channels of
+an 8-byte name and code; a code holds `0` to `9`, `A` to `D`, `*`, `#` and
+a space for a pause. [`memory::dtmf::DtmfMemories::set_dtmf`],
+[`memory::dtmf::DtmfMemories::set_echolink`] and
+[`memory::dtmf::DtmfMemories::page_replacements`] store an edit.
+
+```rust
+use kenwood_tmd750::memory::dtmf::{DtmfChannel, DtmfMemories, EchoLinkMemoryEntry};
+use kenwood_tmd750::{MemoryImage, PageReplacement};
+
+fn store_node(image: &MemoryImage) -> Result<Vec<PageReplacement>, Box<dyn std::error::Error>> {
+    let mut memories = DtmfMemories::read(image)?;
+    let node = EchoLinkMemoryEntry::new("KX0NODE", "123456")?;
+    memories.set_echolink(DtmfChannel::new(1)?, Some(node));
+    Ok(memories.page_replacements(image)?)
 }
 ```
 
@@ -565,6 +604,33 @@ fn keep(report: &McpBackupReport) -> Result<Vec<u8>, ConfigurationError> {
     let stored = captured.to_bytes();
     assert_eq!(Configuration::from_bytes(&stored)?, captured);
     Ok(stored)
+}
+```
+
+### Restore a configuration
+
+[`memory::restore::RestorePlan`] restores one standard capture onto a radio
+whose current capture has the same identity: it writes every page whose bytes
+differ, except that each lifecycle field (the active PM, the PC and data
+interfaces, Bluetooth, the DV Gateway and Terminal selection and the
+automatic transmissions) keeps its current value, and it lists each one the
+restored capture holds differently. [`memory::restore::RestorePlan::from_d750`]
+restores a `.d750` file for the radio's type the same way:
+
+```rust
+use kenwood_tmd750::memory::Configuration;
+use kenwood_tmd750::memory::restore::RestorePlan;
+use kenwood_tmd750::PageReplacement;
+
+fn restore(
+    current: &Configuration,
+    saved: &Configuration,
+) -> Result<Vec<PageReplacement>, Box<dyn std::error::Error>> {
+    let plan = RestorePlan::new(current, saved)?;
+    for kept in plan.kept() {
+        println!("keeping the current {}", kept.field().name());
+    }
+    Ok(plan.replacements().to_vec())
 }
 ```
 
@@ -769,7 +835,10 @@ Tested on a TM-D750 reporting `ID TM-D750`, `FV 1.02`, `TY K,2,1`:
 | D-STAR callsign list: one entry added, read back in place in a fresh session, and removed, with an unchanged standard backup afterwards | operation-panel USB |
 | CALL channels: all six stored records decoded from a standard backup, each equal to the `FO` record CALL mode reports; one CALL frequency changed with a [`memory::CallChannelPlan`] page write, reported by `FO` in CALL mode and restored, with an unchanged standard backup afterwards | operation-panel USB |
 | Mic-E type codes: one entry written, read back from a fresh standard backup and cleared, with an unchanged standard backup afterwards | operation-panel USB |
-| VFO memory: slot 0's current and selected VFO band records equal to each band's `FO` record; one band tuned with a [`memory::vfo::VfoMemory`] page write, reported by `FO` after the session and tuned back, with an unchanged standard backup afterwards | operation-panel USB |
+| VFO memory: slot 0's current and selected VFO band records equal to each band's `FO` record; one band tuned with a [`memory::vfo::VfoMemory`] page write, reported by `FO` after the session and tuned back, with an unchanged standard backup afterwards; the records `FQ` left after frequency entries across VFO bands, band B step segments and Auto Repeater Offset ranges equal to [`memory::vfo::VfoMemory::frequency_record`]'s, and a [`memory::vfo::VfoMemory::tune_frequency`] page write leaving the same standard backup as the `FQ` entry | operation-panel USB |
+| DTMF and `EchoLink` memories: one channel of each written, the `EchoLink` channel with both fields full, read back from a fresh standard backup and cleared, with an unchanged standard backup afterwards | operation-panel USB |
+| Memory group names: the stored defaults decoded; two groups renamed with a [`memory::GroupNamePlan`] page write, read back from a fresh standard backup and renamed to their defaults, with an unchanged standard backup afterwards | operation-panel USB |
+| Configuration restore: a [`memory::restore::RestorePlan`] of a backup holding a cleared channel, reported by a CAT memory read and equal to that backup in a fresh one except the radio-set byte `0x5016B`; a second restore of the later backup, equal to it byte for byte; a `.d750` file holding a backup's bytes, equal to that backup in a fresh one | operation-panel USB |
 
 KISS mode over CAT and `PS 0` are not established, a `.d750` export has not
 been opened by the official program, and the meaning of the three `TY`
@@ -786,8 +855,9 @@ TMD750_PORT=/dev/cu.usbmodem0x001 cargo test -p kenwood-tmd750 --test hardware -
 
 The `fuzz/` workspace holds libFuzzer targets for the CAT line parser, the MCP
 header, the `.d750` parser, the stored channel codecs, the repeater-list
-record and text codecs, the callsign-list and Mic-E type code entries and the
-NMEA parser (`cargo +nightly fuzz run <target>` from `tmd750/`).
+record, text and voice codecs, the callsign-list, Mic-E type code and DTMF
+memory entries and the NMEA parser (`cargo +nightly fuzz run <target>` from
+`tmd750/`).
 
 ## Registry
 

@@ -2,22 +2,27 @@
 //!
 //! The flag, record and name tables hold the regular, program scan, priority
 //! and APRS channels ([`PhysicalChannel`]), then the [`WeatherChannel`]s and
-//! the [`CallChannel`]s. They lie inside the standard configuration schedule
-//! (the `2048..86016` region), so a standard backup converted to a
+//! the [`CallChannel`]s; the name table continues with the [`MemoryGroup`]
+//! names. They lie inside the standard configuration schedule (the
+//! `2048..86016` region), so a standard backup converted to a
 //! [`MemoryImage`] holds every channel. Decoding describes the supplied
 //! bytes only.
 
 mod call;
+mod group;
 mod weather;
 
 pub use call::{CallBand, CallChannel, CallChannelEntry, CallChannelPlan, CallMode};
+pub use group::{GroupNamePlan, MEMORY_GROUPS, MemoryGroup};
 pub use weather::{WeatherChannel, WeatherChannelEntry};
 
 use crate::error::ValidationError;
 use crate::memory::MemoryImage;
+use crate::types::stored::name_address_at;
 use crate::types::{
     CHANNEL_DATA_OFFSET, CHANNEL_FLAGS_OFFSET, CHANNEL_NAME_SIZE, CHANNEL_NAMES_OFFSET,
-    CHANNEL_RECORD_SIZE, FLAG_RECORD_SIZE, PhysicalChannel, Region, StoredChannelEntry,
+    CHANNEL_RECORD_SIZE, ChannelName, FLAG_RECORD_SIZE, PhysicalChannel, Region,
+    StoredChannelEntry,
 };
 
 /// The CALL channel stored last in every table.
@@ -40,9 +45,10 @@ pub struct ChannelAccess<'a> {
 }
 
 impl<'a> ChannelAccess<'a> {
-    /// First image length that holds every table, through the last CALL
-    /// channel's name.
-    pub const REQUIRED_LENGTH: usize = LAST_CALL.name_address() + CHANNEL_NAME_SIZE;
+    /// First image length that holds every table, through the weather
+    /// channels' group name.
+    pub const REQUIRED_LENGTH: usize =
+        name_address_at(group::WEATHER_GROUP_NAME_INDEX) + CHANNEL_NAME_SIZE;
 
     /// The three table regions, in address order: flags, records, names.
     ///
@@ -168,6 +174,32 @@ impl<'a> ChannelAccess<'a> {
         WeatherChannel::all().map(move |channel| self.weather_channel(channel))
     }
 
+    /// The name of `group`.
+    #[must_use]
+    pub fn group_name(&self, group: MemoryGroup) -> ChannelName {
+        self.name_at(group.name_address())
+    }
+
+    /// Every group with its name, group 0 first.
+    pub fn group_names(&self) -> impl Iterator<Item = (MemoryGroup, ChannelName)> + '_ {
+        MemoryGroup::all().map(move |group| (group, self.group_name(group)))
+    }
+
+    /// The name of the weather channels' group.
+    #[must_use]
+    pub fn weather_group_name(&self) -> ChannelName {
+        self.name_at(name_address_at(group::WEATHER_GROUP_NAME_INDEX))
+    }
+
+    /// The name stored at `address`; bytes past the image read NUL.
+    fn name_at(&self, address: usize) -> ChannelName {
+        let mut bytes = [0; CHANNEL_NAME_SIZE];
+        for (destination, source) in bytes.iter_mut().zip(self.slice(address, CHANNEL_NAME_SIZE)) {
+            *destination = *source;
+        }
+        ChannelName::from_bytes(bytes)
+    }
+
     /// `len` bytes from `start`, or an empty slice past the end.
     fn slice(&self, start: usize, len: usize) -> &'a [u8] {
         self.image.get(start..start + len).unwrap_or_default()
@@ -265,7 +297,7 @@ mod tests {
         assert_eq!(regions[0].end(), 0x2000 + 4 * 1138);
         assert_eq!(regions[1].start(), 0x4000);
         assert_eq!(regions[1].end(), 0xFD78 + 40);
-        assert_eq!(regions[2].end(), 0x1_0000 + 16 * 1142);
+        assert_eq!(regions[2].end(), 0x1_0000 + 16 * 1183);
         assert_eq!(regions[2].end() as usize, ChannelAccess::REQUIRED_LENGTH);
         Ok(())
     }
