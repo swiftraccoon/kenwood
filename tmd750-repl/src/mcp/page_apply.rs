@@ -51,6 +51,12 @@ pub(super) enum PlanKind {
     MicE,
     /// `mcp vfo set`.
     Vfo,
+    /// `mcp dtmf apply`.
+    Dtmf,
+    /// `mcp group-names apply`.
+    GroupNames,
+    /// `mcp restore apply`.
+    Restore,
 }
 
 impl PlanKind {
@@ -64,6 +70,9 @@ impl PlanKind {
             Self::CallChannel => "CALL channel update",
             Self::MicE => "Mic-E type code update",
             Self::Vfo => "VFO memory update",
+            Self::Dtmf => "DTMF memory update",
+            Self::GroupNames => "Group name update",
+            Self::Restore => "Configuration restore",
         }
     }
 
@@ -77,6 +86,9 @@ impl PlanKind {
             Self::CallChannel => "CALL channel update",
             Self::MicE => "Mic-E type code update",
             Self::Vfo => "VFO memory update",
+            Self::Dtmf => "DTMF memory update",
+            Self::GroupNames => "group name update",
+            Self::Restore => "configuration restore",
         }
     }
 
@@ -90,6 +102,9 @@ impl PlanKind {
             Self::CallChannel => "CALL channel report",
             Self::MicE => "Mic-E type code report",
             Self::Vfo => "VFO memory report",
+            Self::Dtmf => "DTMF memory report",
+            Self::GroupNames => "Group name report",
+            Self::Restore => "Configuration restore report",
         }
     }
 
@@ -103,6 +118,9 @@ impl PlanKind {
             Self::CallChannel => "CALL channel report",
             Self::MicE => "Mic-E type code report",
             Self::Vfo => "VFO memory report",
+            Self::Dtmf => "DTMF memory report",
+            Self::GroupNames => "group name report",
+            Self::Restore => "configuration restore report",
         }
     }
 
@@ -116,6 +134,9 @@ impl PlanKind {
             Self::CallChannel => "CALL channel updates require current Gateway Off",
             Self::MicE => "Mic-E type code updates require current Gateway Off",
             Self::Vfo => "VFO memory updates require current Gateway Off",
+            Self::Dtmf => "DTMF memory updates require current Gateway Off",
+            Self::GroupNames => "group name updates require current Gateway Off",
+            Self::Restore => "configuration restores require current Gateway Off",
         }
     }
 
@@ -129,6 +150,9 @@ impl PlanKind {
             Self::CallChannel => "call_channel_update",
             Self::MicE => "mic_e_update",
             Self::Vfo => "vfo_update",
+            Self::Dtmf => "dtmf_memory_update",
+            Self::GroupNames => "group_names_update",
+            Self::Restore => "configuration_restore",
         }
     }
 
@@ -142,6 +166,9 @@ impl PlanKind {
             Self::CallChannel => "call-channel-journal.jsonl",
             Self::MicE => "mic-e-journal.jsonl",
             Self::Vfo => "vfo-journal.jsonl",
+            Self::Dtmf => "dtmf-journal.jsonl",
+            Self::GroupNames => "group-names-journal.jsonl",
+            Self::Restore => "restore-journal.jsonl",
         }
     }
 
@@ -156,7 +183,10 @@ impl PlanKind {
                 | Self::CallsignList
                 | Self::CallChannel
                 | Self::MicE
-                | Self::Vfo,
+                | Self::Vfo
+                | Self::Dtmf
+                | Self::GroupNames
+                | Self::Restore,
                 _,
             ) => 1,
         }

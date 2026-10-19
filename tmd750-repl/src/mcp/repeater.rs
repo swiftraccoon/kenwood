@@ -40,6 +40,11 @@ enum RepeaterCommand {
     Preview(EditRequest),
     /// Edit one stored record in place, comparing and reading back its page.
     Set(SetRequest),
+    /// List the country and group names with their voice codes; never
+    /// writes.
+    Names(voice::NamesRequest),
+    /// Preview or write one country or group voice code.
+    Voice(voice::VoiceRequest),
 }
 
 #[derive(Debug, Args)]
@@ -194,13 +199,16 @@ impl EditRequest {
 
 impl RepeaterRequest {
     pub(super) fn validate_endpoint_selection(&self, explicit_port: bool) -> AppResult<()> {
-        if matches!(self.command, RepeaterCommand::Set(_)) && !explicit_port {
-            return Err(CommandError(
-                "mcp repeater set requires an explicit --port before mcp".to_owned(),
-            )
-            .into());
+        let command = match &self.command {
+            RepeaterCommand::Set(_) => "mcp repeater set",
+            RepeaterCommand::Voice(voice) if voice.writes() => "mcp repeater voice set",
+            _ => return Ok(()),
+        };
+        if explicit_port {
+            Ok(())
+        } else {
+            Err(CommandError(format!("{command} requires an explicit --port before mcp")).into())
         }
-        Ok(())
     }
 }
 
@@ -208,6 +216,8 @@ pub(super) fn run_offline(request: &RepeaterRequest) -> Option<AppResult<()>> {
     match &request.command {
         RepeaterCommand::List(list) => Some(print_list(list)),
         RepeaterCommand::Preview(edit) => Some(preview(edit)),
+        RepeaterCommand::Names(names) => Some(voice::print_names(names)),
+        RepeaterCommand::Voice(voice) => voice.run_offline(),
         RepeaterCommand::Set(_) => None,
     }
 }
@@ -219,8 +229,10 @@ pub(super) async fn run_selected(
 ) -> AppResult<()> {
     match &request.command {
         RepeaterCommand::Set(request) => run_set(endpoint, baud, request).await,
+        RepeaterCommand::Voice(voice) => voice.run_selected(endpoint, baud).await,
         RepeaterCommand::List(list) => print_list(list),
         RepeaterCommand::Preview(edit) => preview(edit),
+        RepeaterCommand::Names(names) => voice::print_names(names),
     }
 }
 
@@ -342,6 +354,8 @@ fn description(prepared: &Prepared) -> Map<String, Value> {
     );
     description
 }
+
+mod voice;
 
 #[cfg(test)]
 mod tests;

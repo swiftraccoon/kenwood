@@ -324,7 +324,7 @@ async fn run_native(cli: &Cli, command: Option<Command>) -> AppResult<()> {
                 return mcp::run_native_write(&endpoint, write).await;
             }
             _ => return Err(Box::new(CommandError(
-                "native Bluetooth supports mcp probe, backup, text set and menu apply; the reentry probe, repeater set, channel-names apply, callsign-list apply, call-channel set, mic-e apply and vfo set require USB"
+                "native Bluetooth supports mcp probe, backup, text set and menu apply; the reentry probe, repeater set, channel-names apply, callsign-list apply, call-channel set, mic-e apply, vfo set, dtmf apply, group-names apply and restore apply require USB"
                     .to_owned(),
             ))),
         };

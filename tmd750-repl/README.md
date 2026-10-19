@@ -636,6 +636,37 @@ a format-1 `report.json` with `operation = "channel_names_update"` and
 `store`: a CAT store keeps a channel's name and a CAT `clear` erases it, so
 names written before a clear do not survive it.
 
+### Memory group names
+
+`mcp group-names list` prints a backup's thirty memory group names and the
+name of the weather channels' group. `mcp group-names preview` and `mcp
+group-names apply` rename any number of groups in one session: each `--set
+GROUP NAME` gives group 0 to 29 a name of 1 to 16 printable ASCII bytes, and a
+group may appear once. The radio's defaults are `GRP-0` to `GRP-29`:
+
+```bash
+cargo run -p tmd750-repl -- mcp group-names list --backup backup-01/report.json
+cargo run -p tmd750-repl -- --port /dev/cu.usbmodem101 \
+  mcp group-names apply --backup backup-01/report.json --apply \
+  --output group-names-01 --set 3 Repeaters --set 20 "Simplex 2m"
+```
+
+Groups 0 to 15 share the name page from `0x14800` and the rest the page from
+`0x14900`; each changed page must match the backup before its write and is
+read back after it. The run uses the shared page-update lifecycle, journal and
+fresh CAT check: a format-1 `report.json` with `operation =
+"group_names_update"` and `group-names-journal.jsonl`, whose prepared entry
+records each group's name before and after. `apply` runs over either TM-D750
+USB role at 9600 baud and requires `--apply` and an explicit `--port`; native
+Bluetooth refuses it.
+
+Hardware coverage on firmware 1.02 / type K,2,1 over the operation-panel USB
+endpoint: one run renamed groups 3 and 20, after which a fresh `mcp backup`
+listed both names and differed from the previous backup only in their bytes;
+a second run wrote the defaults back, after which a fresh backup matched the
+first one byte for byte. Whether the radio displays a written name is
+unverified.
+
 ### D-STAR repeater and hotspot lists
 
 `mcp repeater list` prints a backup's repeater list (1,500 slots) or, with
@@ -660,8 +691,25 @@ journal and fresh CAT check: a format-1 `report.json` with
 entry records both versions of the record. `tuning dr` then shows the edited
 repeater when it is the selected one.
 
-Both commands run over either TM-D750 USB role at 9600 baud and require
-`--apply` and an explicit `--port`; native Bluetooth refuses them.
+`mcp repeater names` prints every named or coded country and group with its
+index, name and voice code, the up to four uppercase letters and digits the
+official program keeps for it. `mcp repeater voice preview` and `mcp repeater
+voice set` change one code: give `--country` (0 to 149) or `--group` (0 to
+299) and `--code` or `--clear`. The code's page must match the backup before
+the write and is read back after it; the run uses the same lifecycle, journal
+and report as a record edit, whose prepared entry records the code before and
+after:
+
+```bash
+cargo run -p tmd750-repl -- mcp repeater names --backup backup-01/report.json
+cargo run -p tmd750-repl -- --port /dev/cu.usbmodem101 \
+  mcp repeater voice set --backup backup-01/report.json --apply \
+  --output voice-01 --country 1 --code IND
+```
+
+`mcp repeater set` and `mcp repeater voice set` run over either TM-D750 USB
+role at 9600 baud and require `--apply` and an explicit `--port`; native
+Bluetooth refuses them.
 
 Hardware coverage on firmware 1.02 / type K,2,1 over the operation-panel USB
 endpoint: `mcp repeater set` moved the repeater the DR tuning mode had
@@ -672,7 +720,10 @@ run compared and verified one page and ended with a fresh identity and
 Gateway Off, and after the restoring runs and CAT `clear` a fresh `mcp backup`
 matched the first one byte for byte. Selecting DR after the repeater edit also
 rewrote band A's copy of the selected record in its settings, so a backup
-taken in between differs in those bytes too.
+taken in between differs in those bytes too. `mcp repeater voice set` stored a
+code for an unnamed country, which a fresh backup listed and held in only its
+three bytes, and a second run cleared it, after which a fresh backup matched
+the first one byte for byte.
 
 ### D-STAR callsign list
 
@@ -775,11 +826,18 @@ received Mic-E report is unverified.
 `mcp vfo list` prints a PM slot's VFO memory from a backup (`--slot`, 0 to 5,
 default 0): each band's current VFO record and selected VFO band, then the
 record and programmable limits of every VFO band, four on band A and six on
-band B. `mcp vfo preview` and `mcp vfo set` make one edit. `--tune BAND MHZ`
-tunes band `a` or `b` to a new receive frequency as the radio does: it
-selects the VFO band whose limits hold the frequency and stores the record as
-both the band's current record and that VFO band's record. `--limits VFO_BAND
-LOWER UPPER` sets one VFO band's programmable limits in whole megahertz:
+band B, the slot's Auto Repeater Offset setting and the receive step band B
+keeps for each step range. `mcp vfo preview` and `mcp vfo set` make one edit.
+`--tune BAND MHZ` sets band `a` or `b` to a new receive frequency as the
+radio's frequency entry does: it selects the VFO band whose limits hold the
+frequency, starts from that VFO band's stored record when it is not the
+selected one, takes a new band B step segment's receive step, rounds the
+frequency down to the receive step, and under the slot's Auto Repeater Offset
+takes the TM-D750A plan's shift; it stores the record as both the band's
+current record and that VFO band's record, and band B's receive step as its
+step segment's.
+`--limits VFO_BAND LOWER UPPER` sets one VFO band's programmable limits in
+whole megahertz:
 
 ```bash
 cargo run -p tmd750-repl -- mcp vfo list --backup backup-01/report.json
@@ -800,8 +858,45 @@ endpoint, PM Off active: one run tuned band B in slot 0 from 223.020 to 223.040
 MHz, after which `channel b` reported 223.040 MHz and a fresh `mcp backup`
 differed only in the frequency bytes of band B's current record and of its VFO
 band's record; a second run tuned it back, after which a fresh backup matched
-the first one byte for byte. Each run compared and verified two pages and
-ended with a fresh identity and Gateway Off.
+the first one byte for byte. A run tuning band B from 223.020 to 300.000 MHz,
+across a step segment, left a backup identical to the one the radio's own
+frequency entry of 300.000 MHz left, 12.5 kHz receive step included. Each run
+compared and verified two pages and ended with a fresh identity and Gateway
+Off.
+
+### DTMF and EchoLink memories
+
+`mcp dtmf list` prints a backup's two automatic-dialer memories, each with
+channels `CH0` to `CH9`. `mcp dtmf preview` and `mcp dtmf apply` replace or
+clear one channel: give its `--memory` (`dtmf` or `echolink`) and `--channel`
+(0 to 9), then `--name`, `--code` or both, or `--clear`. A DTMF name or code
+holds at most 16 characters and an EchoLink one at most 8; a name is printable
+ASCII and a code holds `0` to `9`, `A` to `D`, `*`, `#` and a space for a
+pause. An omitted `--name` or `--code` stores none:
+
+```bash
+cargo run -p tmd750-repl -- mcp dtmf list --backup backup-01/report.json
+cargo run -p tmd750-repl -- --port /dev/cu.usbmodem101 \
+  mcp dtmf apply --backup backup-01/report.json --apply \
+  --output dtmf-01 --memory echolink --channel 1 --name KX0NODE --code 123456
+```
+
+Each changed page must match the backup before its write and is read back
+after it: a DTMF channel changes the code page from `0x38` and the name page
+from `0x100`, and an EchoLink channel the page from `0x200`. The run uses the
+shared page-update lifecycle, journal and fresh CAT check: a format-1
+`report.json` with `operation = "dtmf_memory_update"` and `dtmf-journal.jsonl`,
+whose prepared entry records the channel before and after. `apply` runs over
+either TM-D750 USB role at 9600 baud and requires `--apply` and an explicit
+`--port`; native Bluetooth refuses it.
+
+Hardware coverage on firmware 1.02 / type K,2,1 over the operation-panel USB
+endpoint: one run stored DTMF channel 0 with a code holding a pause, `*`, `#`
+and `D`, and a second stored EchoLink channel 9 with both fields full; after
+each, a fresh `mcp backup` listed the channel and differed from the previous
+backup only in its name and code bytes. Two more runs cleared them, after which
+a fresh backup matched the first one byte for byte. Each run ended with a fresh
+identity and Gateway Off.
 
 ### Offline text inspection
 
@@ -917,6 +1012,44 @@ a separate state-changing operation, not a read-only check. Enabling Menu 650
 may remove CAT/MCP access on the selected interface, so do not assume that
 activation can be followed by another backup on that port. Protocol handoff,
 return to CAT, and restoration are not validated on hardware.
+
+## Restore a configuration backup
+
+`mcp restore preview` and `mcp restore apply` restore one standard backup,
+`--from`, onto the radio whose current standard backup is `--backup`; the two
+must have the same model, firmware and type. `--from-file` restores a `.d750`
+configuration file instead: its header must name the radio's type, and only
+its bytes in the standard configuration schedule are read. Every page whose
+bytes differ is written with the restored bytes, except that the lifecycle
+settings keep their current values: the active PM, the PC and data
+interfaces, Bluetooth, the DV Gateway and Terminal selection, and the
+automatic transmissions. The preview lists the changed pages and each
+lifecycle setting the restored configuration holds differently:
+
+```bash
+cargo run -p tmd750-repl -- mcp restore preview \
+  --backup backup-02/report.json --from backup-01/report.json
+cargo run -p tmd750-repl -- --port /dev/cu.usbmodem101 \
+  mcp restore apply --backup backup-02/report.json --from backup-01/report.json \
+  --apply --output restore-01
+```
+
+Each changed page must match `--backup` before its write and is read back
+after it, so take `--backup` just before the restore. The run uses the shared
+page-update lifecycle, journal and fresh CAT check: a format-1 `report.json`
+with `operation = "configuration_restore"` and `restore-journal.jsonl`, whose
+prepared entry records the source (`backup` or `d750`) and its path, the pages
+and bytes written and the settings kept. `apply` runs over either TM-D750 USB role at 9600 baud
+and requires `--apply` and an explicit `--port`; native Bluetooth refuses it.
+
+Hardware coverage on firmware 1.02 / type K,2,1 over the operation-panel USB
+endpoint: restoring a backup that held a named channel the radio had since
+cleared wrote five pages, after which `memory 995` reported the channel and a
+fresh backup equaled the restored one except byte `0x5016B`, which the radio
+sets itself; restoring the later backup made a fresh backup equal it byte for
+byte. A two-page restore and its reverse matched their backups byte for byte,
+and so did a `--from-file` restore of a `.d750` file holding a backup's bytes;
+files the official program wrote were not tested.
 
 ## Read-only MCP re-entry control
 

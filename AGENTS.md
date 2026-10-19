@@ -15,7 +15,8 @@ Rust workspace for the Kenwood TH-D75 and TM-D750, a D-STAR reflector stack, pac
 
 - Experimental APIs prioritize correctness and clarity over compatibility: make breaking changes when they improve the design, migrate workspace consumers, and add no compatibility shims.
 - No em dashes (U+2014) in committed prose: doc comments, code comments, markdown, shell/TOML/YAML comments, user-facing strings. Choose punctuation per sentence (semicolon, colon, comma pair, parentheses, or reword); never a mechanical hyphen swap. En dashes and box-drawing characters are fine. The generated manifests, generated registries and `mcp-d75-extract/tests/fixtures/` are exempt; `lint.sh` enforces the ban everywhere else.
-- NEVER commit without being asked: stage, show the diff, wait for the word "commit". NEVER push before the user tests and confirms. NEVER `git add -A`; stage explicit paths. NEVER add Co-Authored-By lines.
+- Commit locally as work completes, without asking. NEVER push until the user says to. NEVER `git add -A`; stage explicit paths. NEVER add Co-Authored-By lines.
+- Split staged work into several commits by unstaging the other paths (`git reset -q -- <paths>`) and running `git commit` without a pathspec; `git commit -- <paths>` commits working-tree contents and sweeps in unstaged edits.
 - NEVER use bulk text replacement (sed, perl, awk, python one-liners, shell loops over files) on source or prose. Read each file and edit it individually; every bulk insertion in this codebase has broken a file.
 - Library crates must be compiling, tested and lint-clean before their TUI or REPL consumers are touched.
 - Run `./lint.sh` before every commit and `./ci-local.sh` before every push.
@@ -135,6 +136,7 @@ cargo test -p <package> --doc                            # doctests; nextest nev
 
 - `clippy::all`, `pedantic`, `nursery` and `cargo` are denied in every crate, plus `missing_docs`, `elided_lifetimes_in_paths`, `trivial_casts` and `unused_qualifications`; clippy runs with `--all-targets`.
 - Never add `#![allow(...)]` without explicit approval; `allow_attributes` is denied, so use `#[expect(<lint>, reason = "...")]`. If clippy reports the expectation unfulfilled, the suppression was unnecessary.
+- `clippy::doc_markdown` flags CamelCase proper nouns such as EchoLink: backtick them in rustdoc (no `doc-valid-idents` config exists); in clap help text name the CLI value instead.
 - Fix the code instead of suppressing: `buf.get(..n).expect("n within buf")` not `&buf[..n]`; `unreachable!` not `panic!`; `assert!(expr.is_err())` not `expect_err`; `HashSet<Enum>` instead of `struct_excessive_bools`.
 - `#[cfg_attr(test, expect(...))]` is banned: it checks the build predicate, not that the item is a test.
 - `dead_code` expectations cannot stage a new module: a module-level expect makes everything live, and an item-level expect on a test-only caller is unfulfilled in the test build. Wire a real consumer instead.

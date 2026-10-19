@@ -5,7 +5,9 @@ mod call_channel;
 mod callsign_list;
 mod channel_names;
 mod channels;
+mod dtmf;
 pub(crate) mod fixed;
+mod group_names;
 mod link;
 mod menu;
 mod menu_apply;
@@ -14,6 +16,7 @@ mod page_apply;
 pub(crate) mod reconnect;
 mod reentry_probe;
 mod repeater;
+mod restore;
 pub(crate) mod snapshot;
 mod terminal;
 mod text;
@@ -82,6 +85,14 @@ pub(crate) enum McpCommand {
     /// List or preview a slot's VFO memory offline, or write one edit in one
     /// session.
     Vfo(vfo::VfoRequest),
+    /// List or preview the DTMF and `EchoLink` memories offline, or write one
+    /// channel in one session.
+    Dtmf(dtmf::DtmfRequest),
+    /// List or preview the memory group names offline, or write them in one
+    /// session.
+    GroupNames(group_names::GroupNamesRequest),
+    /// Preview restoring a backup offline, or write it in one session.
+    Restore(restore::RestoreRequest),
 }
 
 impl McpCommand {
@@ -99,6 +110,9 @@ impl McpCommand {
             Self::CallChannel(request) => request.validate_endpoint_selection(explicit_port),
             Self::MicE(request) => request.validate_endpoint_selection(explicit_port),
             Self::Vfo(request) => request.validate_endpoint_selection(explicit_port),
+            Self::Dtmf(request) => request.validate_endpoint_selection(explicit_port),
+            Self::GroupNames(request) => request.validate_endpoint_selection(explicit_port),
+            Self::Restore(request) => request.validate_endpoint_selection(explicit_port),
             Self::Terminal(_) | Self::Channels(_) => Ok(()),
             Self::Probe(_) | Self::Backup(_) | Self::ReentryProbe(_) if explicit_port => Ok(()),
             Self::Probe(_) => Err(Box::new(crate::CommandError(
@@ -129,6 +143,9 @@ pub(crate) fn run_offline(request: &McpCommand) -> Option<AppResult<()>> {
         McpCommand::CallChannel(request) => call_channel::run_offline(request),
         McpCommand::MicE(request) => mic_e::run_offline(request),
         McpCommand::Vfo(request) => vfo::run_offline(request),
+        McpCommand::Dtmf(request) => dtmf::run_offline(request),
+        McpCommand::GroupNames(request) => group_names::run_offline(request),
+        McpCommand::Restore(request) => restore::run_offline(request),
         McpCommand::Channels(request) => Some(channels::run(request)),
         McpCommand::Terminal(request) => Some(terminal::run(request)),
         McpCommand::Probe(_) | McpCommand::ReentryProbe(_) | McpCommand::Backup(_) => None,
@@ -402,6 +419,9 @@ pub(crate) async fn run(
         }
         McpCommand::MicE(request) => mic_e::run_selected(endpoint, baud, request).await,
         McpCommand::Vfo(request) => vfo::run_selected(endpoint, baud, request).await,
+        McpCommand::Dtmf(request) => dtmf::run_selected(endpoint, baud, request).await,
+        McpCommand::GroupNames(request) => group_names::run_selected(endpoint, baud, request).await,
+        McpCommand::Restore(request) => restore::run_selected(endpoint, baud, request).await,
         McpCommand::Channels(request) => channels::run(request),
         McpCommand::Terminal(request) => terminal::run(request),
     }

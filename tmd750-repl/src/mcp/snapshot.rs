@@ -546,6 +546,11 @@ impl Snapshot {
         Ok(self.configuration.menu_snapshot()?)
     }
 
+    /// Borrow the captured configuration.
+    pub(super) const fn configuration(&self) -> &Configuration {
+        &self.configuration
+    }
+
     /// Borrow the captured standard pages for comparison.
     pub(super) fn standard_configuration(&self) -> AppResult<StandardConfiguration<'_>> {
         Ok(self.configuration.standard()?)

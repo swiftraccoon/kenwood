@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::Path;
 
+use kenwood_tmd750::types::{ShiftDirection, StepSize};
+
 use super::*;
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;
@@ -53,6 +55,14 @@ const LIMITS: [(u32, u32); 10] = [
     (470, 524),
 ];
 
+/// The band B step segment table of the same backup: a step and a mode byte
+/// per segment.
+const SEGMENTS: [u8; 34] = [
+    0x06, 0x02, 0x02, 0x00, 0x02, 0x00, 0x02, 0x00, 0x0B, 0x00, 0x06, 0x00, 0x08, 0x00, 0x06, 0x00,
+    0x06, 0x00, 0x06, 0x00, 0x06, 0x00, 0x06, 0x00, 0x06, 0x00, 0x06, 0x00, 0x09, 0x00, 0x06, 0x00,
+    0x0B, 0x00,
+];
+
 fn put(patches: &mut BTreeMap<u32, u8>, address: u32, bytes: &[u8]) {
     for (offset, byte) in (address..).zip(bytes) {
         let _previous = patches.insert(offset, *byte);
@@ -93,6 +103,8 @@ fn backup(directory: &Path) -> Result<PathBuf, TestError> {
             &(end * 1_000_000).to_le_bytes(),
         );
     }
+    put(&mut patches, 0x5_04DA, &SEGMENTS);
+    put(&mut patches, 0x5_0513, &[1]);
     let mut document = crate::mcp::snapshot::tests::fixture();
     let segments = document
         .get_mut("backup")
@@ -169,6 +181,47 @@ fn a_tune_into_another_vfo_band_selects_it() -> TestResult {
     assert_eq!(prepared.change, Change::Tune(Band::A, VfoBand::A430));
     assert_eq!(prepared.after.selected(Band::A), VfoBand::A430);
     assert_eq!(pages(&prepared), [0x5_0100, 0x5_0200]);
+    Ok(())
+}
+
+#[test]
+fn the_listing_shows_auto_offset_and_each_band_b_step_range_once() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let report = backup(directory.path())?;
+    let snapshot = Snapshot::load(&report)?;
+    let slot = SlotIndex::new(0)?;
+    let (memory, _image) = captured(&snapshot, slot)?;
+    let lines = list_lines(&memory);
+    assert!(
+        lines.contains(&"Auto Repeater Offset: on.".to_owned()),
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(
+            &"Band B steps: 108-136 MHz 12.5 kHz, 136-144 MHz 5 kHz, 144-148 MHz 5 kHz, \
+              148-174 MHz 5 kHz, 174-216 MHz 50 kHz, 216-220 MHz 12.5 kHz, \
+              220-225 MHz 20 kHz, 225-410 MHz 12.5 kHz, 410-420 MHz 12.5 kHz, \
+              420-450 MHz 25 kHz, 450-470 MHz 12.5 kHz, 470-524 MHz 50 kHz."
+                .to_owned()
+        ),
+        "{lines:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_tune_takes_the_step_and_shift_the_radio_takes() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let report = backup(directory.path())?;
+    let snapshot = Snapshot::load(&report)?;
+    let segment = edit(report.clone(), Some(["b", "300.000"]), None).prepare(&snapshot)?;
+    let record = segment.after.current(Band::B);
+    assert_eq!(
+        [record.receive_step, record.transmit_step],
+        [StepSize::Hz12500, StepSize::Hz20000]
+    );
+    let repeater = edit(report, Some(["a", "147.000"]), None).prepare(&snapshot)?;
+    assert_eq!(repeater.after.current(Band::A).shift, ShiftDirection::Plus);
     Ok(())
 }
 

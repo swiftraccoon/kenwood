@@ -11,9 +11,10 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
-use kenwood_tmd750::memory::vfo::{VfoBand, VfoMemory};
+use kenwood_tmd750::memory::MenuFieldId;
+use kenwood_tmd750::memory::vfo::{StepSegment, VfoBand, VfoMemory};
 use kenwood_tmd750::transport::SerialCandidate;
-use kenwood_tmd750::types::{Band, Frequency, SlotIndex};
+use kenwood_tmd750::types::{Band, Frequency, SlotIndex, StoredChannel};
 use kenwood_tmd750::{PageReplacement, Region};
 use serde_json::{Map, Value, json};
 
@@ -56,8 +57,8 @@ struct EditRequest {
     /// PM slot, 0 to 5, as `mcp menu --slot` takes it.
     #[arg(long, default_value_t = 0)]
     slot: u8,
-    /// Tune `BAND` (`a` or `b`) to `MHZ`, keeping the rest of its current
-    /// record.
+    /// Set `BAND`'s (`a` or `b`) frequency to `MHZ` as the radio's frequency
+    /// entry does, taking the VFO band, step and shift that entry takes.
     #[arg(long, num_args = 2, value_names = ["BAND", "MHZ"], conflicts_with = "limits")]
     tune: Option<Vec<String>>,
     /// Set the programmable limits of `VFO_BAND` (`a118`, `a144`, `a220`,
@@ -146,13 +147,20 @@ struct Prepared {
     replacements: Vec<PageReplacement>,
 }
 
-/// The slot's memory decoded from a backup that captured its VFO pages.
+/// The slot's memory decoded from a backup that captured its VFO pages and
+/// its Auto Repeater Offset setting.
 fn captured(
     snapshot: &Snapshot,
     slot: SlotIndex,
 ) -> AppResult<(VfoMemory, &kenwood_tmd750::MemoryImage)> {
     let start = 0x5_0100 + slot.offset();
     let image = snapshot.image_covering(Region::new(start, start + 0x400)?)?;
+    let auto_offset = MenuFieldId::RADIO_AUTO_OFFSET
+        .field()
+        .descriptor
+        .address(Some(slot))?
+        .as_u32();
+    let _covered = snapshot.image_covering(Region::new(auto_offset, auto_offset + 1)?)?;
     Ok((VfoMemory::read(image, slot)?, image))
 }
 
@@ -168,9 +176,8 @@ impl EditRequest {
         let change = match (self.tune.as_deref(), self.limits.as_deref()) {
             (Some([band, mhz]), None) => {
                 let band = parse_band(band)?;
-                let mut record = after.current(band).clone();
-                record.receive_frequency = Frequency::from_mhz_str(mhz)?;
-                Change::Tune(band, after.tune(band, record)?)
+                let frequency = Frequency::from_mhz_str(mhz)?;
+                Change::Tune(band, after.tune_frequency(band, frequency)?)
             }
             (None, Some([name, lower, upper])) => {
                 let band = parse_vfo_band(name)?;
@@ -256,11 +263,22 @@ async fn run_set(endpoint: &SerialCandidate, baud: u32, request: &SetRequest) ->
 fn print_list(request: &ListRequest) -> AppResult<()> {
     let slot = SlotIndex::new(request.slot)?;
     let (memory, _image) = captured(&Snapshot::load(&request.backup)?, slot)?;
+    for line in list_lines(&memory) {
+        output::line(format_args!("{line}"));
+    }
+    Ok(())
+}
+
+/// The listing of a slot's VFO memory: each band's current record and VFO
+/// band, every VFO band's record and limits, the Auto Repeater Offset setting
+/// and the receive step of each band B step range, a repeated range once.
+fn list_lines(memory: &VfoMemory) -> Vec<String> {
+    let mut lines = Vec::new();
     for band in [Band::A, Band::B] {
         let current = memory.current(band);
-        output::line(format_args!(
+        lines.push(format!(
             "Slot {} band {band}: {} {}, VFO band {}.",
-            slot.index(),
+            memory.slot().index(),
             current.receive_frequency,
             current.mode,
             memory.selected(band)
@@ -268,7 +286,7 @@ fn print_list(request: &ListRequest) -> AppResult<()> {
     }
     for stored in memory.bands() {
         let limits = stored.limits();
-        output::line(format_args!(
+        lines.push(format!(
             "  {}: {} {}, limits {} to {} MHz.",
             stored.band(),
             stored.record().receive_frequency,
@@ -277,7 +295,29 @@ fn print_list(request: &ListRequest) -> AppResult<()> {
             limits.upper_mhz()
         ));
     }
-    Ok(())
+    lines.push(format!(
+        "Auto Repeater Offset: {}.",
+        if memory.auto_repeater_offset() {
+            "on"
+        } else {
+            "off"
+        }
+    ));
+    let mut listed = Vec::new();
+    let mut steps = Vec::new();
+    for segment in StepSegment::ALL {
+        let (lower, end) = segment.range_mhz();
+        if listed.contains(&(lower, end)) {
+            continue;
+        }
+        listed.push((lower, end));
+        let step = memory
+            .segment_step(segment)
+            .map_or_else(|| "no step".to_owned(), |step| step.to_string());
+        steps.push(format!("{lower}-{end} MHz {step}"));
+    }
+    lines.push(format!("Band B steps: {}.", steps.join(", ")));
+    lines
 }
 
 fn preview(edit: &EditRequest) -> AppResult<()> {
@@ -291,11 +331,17 @@ fn preview(edit: &EditRequest) -> AppResult<()> {
 }
 
 fn print_edit(prepared: &Prepared) {
+    let show = |record: &StoredChannel| {
+        record.cat_record().map_or_else(
+            |_| record.receive_frequency.to_string(),
+            |cat| cat.to_string(),
+        )
+    };
     match prepared.change {
         Change::Tune(band, vfo_band) => output::line(format_args!(
             "Band {band}: {} -> {} in VFO band {vfo_band}.",
-            prepared.before.current(band).receive_frequency,
-            prepared.after.current(band).receive_frequency
+            show(prepared.before.current(band)),
+            show(prepared.after.current(band))
         )),
         Change::Limits(band) => {
             let [before, after] = [&prepared.before, &prepared.after].map(|memory| {
