@@ -1,19 +1,17 @@
 //! Offline, typed editing of explicitly supported configuration strings.
 //!
-//! This module interprets memory images using the generated software layout and
-//! plans offline patches; it performs no I/O. [`TextImage::new`] requires a
-//! firmware label listed in [`MCP_D750_SCHEMA_FIRMWARE_IDENTITIES`];
-//! [`TextImage::interpret_unqualified`] skips that check and marks every result
-//! [`TextLayoutQualification::UnqualifiedInterpretation`].
+//! This module decodes memory images through the generated registry layout and
+//! plans offline patches; it performs no I/O. A decoded value describes the
+//! supplied bytes; establish their provenance and coverage separately.
 
 use std::{fmt, str::FromStr};
 
 use super::{
-    FieldCodec, FieldValue, MCP_D750_SCHEMA_FIRMWARE_IDENTITIES, MemoryImage, MenuField,
-    PatchPlanner, PatchSet, StringEncoding, is_supported_schema_target, menu_field,
+    FieldCodec, FieldValue, MemoryImage, MenuField, PatchPlanner, PatchSet, StringEncoding,
+    menu_field,
 };
 use crate::error::SchemaError;
-use crate::types::{FirmwareIdentity, RadioModel, SlotIndex};
+use crate::types::SlotIndex;
 
 /// A supported configuration string, not an arbitrary menu-field selector.
 ///
@@ -31,30 +29,34 @@ pub enum TextSetting {
     PmName4,
     /// Fifth global programmable-memory name.
     PmName5,
-    /// First D-STAR MY callsign in a programmable-memory slot.
-    DstarMyCallsign1,
-    /// Second D-STAR MY callsign in a programmable-memory slot.
-    DstarMyCallsign2,
-    /// Third D-STAR MY callsign in a programmable-memory slot.
-    DstarMyCallsign3,
-    /// Fourth D-STAR MY callsign in a programmable-memory slot.
-    DstarMyCallsign4,
-    /// Fifth D-STAR MY callsign in a programmable-memory slot.
-    DstarMyCallsign5,
-    /// Sixth D-STAR MY callsign in a programmable-memory slot.
-    DstarMyCallsign6,
-    /// Memo paired with the first D-STAR MY callsign.
-    DstarMemo1,
-    /// Memo paired with the second D-STAR MY callsign.
-    DstarMemo2,
-    /// Memo paired with the third D-STAR MY callsign.
-    DstarMemo3,
-    /// Memo paired with the fourth D-STAR MY callsign.
-    DstarMemo4,
-    /// Memo paired with the fifth D-STAR MY callsign.
-    DstarMemo5,
-    /// Memo paired with the sixth D-STAR MY callsign.
-    DstarMemo6,
+    /// First MY callsign of the DV Gateway list in a programmable-memory slot.
+    ///
+    /// The DV Gateway list is the one Terminal and Direct modes transmit. It
+    /// is separate from the six-entry MY list of ordinary DV operation that
+    /// [`crate::Radio::get_dstar_callsign`] reads.
+    DvGatewayMyCallsign1,
+    /// Second MY callsign of the DV Gateway list in a programmable-memory slot.
+    DvGatewayMyCallsign2,
+    /// Third MY callsign of the DV Gateway list in a programmable-memory slot.
+    DvGatewayMyCallsign3,
+    /// Fourth MY callsign of the DV Gateway list in a programmable-memory slot.
+    DvGatewayMyCallsign4,
+    /// Fifth MY callsign of the DV Gateway list in a programmable-memory slot.
+    DvGatewayMyCallsign5,
+    /// Sixth MY callsign of the DV Gateway list in a programmable-memory slot.
+    DvGatewayMyCallsign6,
+    /// Memo paired with the first DV Gateway MY callsign.
+    DvGatewayMemo1,
+    /// Memo paired with the second DV Gateway MY callsign.
+    DvGatewayMemo2,
+    /// Memo paired with the third DV Gateway MY callsign.
+    DvGatewayMemo3,
+    /// Memo paired with the fourth DV Gateway MY callsign.
+    DvGatewayMemo4,
+    /// Memo paired with the fifth DV Gateway MY callsign.
+    DvGatewayMemo5,
+    /// Memo paired with the sixth DV Gateway MY callsign.
+    DvGatewayMemo6,
     /// First D-STAR transmit message in a programmable-memory slot.
     DstarMessage1,
     /// Second D-STAR transmit message in a programmable-memory slot.
@@ -79,18 +81,18 @@ impl TextSetting {
             Self::PmName3,
             Self::PmName4,
             Self::PmName5,
-            Self::DstarMyCallsign1,
-            Self::DstarMyCallsign2,
-            Self::DstarMyCallsign3,
-            Self::DstarMyCallsign4,
-            Self::DstarMyCallsign5,
-            Self::DstarMyCallsign6,
-            Self::DstarMemo1,
-            Self::DstarMemo2,
-            Self::DstarMemo3,
-            Self::DstarMemo4,
-            Self::DstarMemo5,
-            Self::DstarMemo6,
+            Self::DvGatewayMyCallsign1,
+            Self::DvGatewayMyCallsign2,
+            Self::DvGatewayMyCallsign3,
+            Self::DvGatewayMyCallsign4,
+            Self::DvGatewayMyCallsign5,
+            Self::DvGatewayMyCallsign6,
+            Self::DvGatewayMemo1,
+            Self::DvGatewayMemo2,
+            Self::DvGatewayMemo3,
+            Self::DvGatewayMemo4,
+            Self::DvGatewayMemo5,
+            Self::DvGatewayMemo6,
             Self::DstarMessage1,
             Self::DstarMessage2,
             Self::DstarMessage3,
@@ -149,52 +151,52 @@ impl TextSetting {
             Self::PmName3 => ("pm-name-3", "pm.PmName3"),
             Self::PmName4 => ("pm-name-4", "pm.PmName4"),
             Self::PmName5 => ("pm-name-5", "pm.PmName5"),
-            Self::DstarMyCallsign1 => (
-                "dstar-my-callsign-1",
+            Self::DvGatewayMyCallsign1 => (
+                "dv-gateway-my-callsign-1",
                 "dv.MyCallsignDvGatewayList[0].MyCallsignDvGateway",
             ),
-            Self::DstarMyCallsign2 => (
-                "dstar-my-callsign-2",
+            Self::DvGatewayMyCallsign2 => (
+                "dv-gateway-my-callsign-2",
                 "dv.MyCallsignDvGatewayList[1].MyCallsignDvGateway",
             ),
-            Self::DstarMyCallsign3 => (
-                "dstar-my-callsign-3",
+            Self::DvGatewayMyCallsign3 => (
+                "dv-gateway-my-callsign-3",
                 "dv.MyCallsignDvGatewayList[2].MyCallsignDvGateway",
             ),
-            Self::DstarMyCallsign4 => (
-                "dstar-my-callsign-4",
+            Self::DvGatewayMyCallsign4 => (
+                "dv-gateway-my-callsign-4",
                 "dv.MyCallsignDvGatewayList[3].MyCallsignDvGateway",
             ),
-            Self::DstarMyCallsign5 => (
-                "dstar-my-callsign-5",
+            Self::DvGatewayMyCallsign5 => (
+                "dv-gateway-my-callsign-5",
                 "dv.MyCallsignDvGatewayList[4].MyCallsignDvGateway",
             ),
-            Self::DstarMyCallsign6 => (
-                "dstar-my-callsign-6",
+            Self::DvGatewayMyCallsign6 => (
+                "dv-gateway-my-callsign-6",
                 "dv.MyCallsignDvGatewayList[5].MyCallsignDvGateway",
             ),
-            Self::DstarMemo1 => (
-                "dstar-memo-1",
+            Self::DvGatewayMemo1 => (
+                "dv-gateway-memo-1",
                 "dv.MyCallsignDvGatewayList[0].MemoDvGateway",
             ),
-            Self::DstarMemo2 => (
-                "dstar-memo-2",
+            Self::DvGatewayMemo2 => (
+                "dv-gateway-memo-2",
                 "dv.MyCallsignDvGatewayList[1].MemoDvGateway",
             ),
-            Self::DstarMemo3 => (
-                "dstar-memo-3",
+            Self::DvGatewayMemo3 => (
+                "dv-gateway-memo-3",
                 "dv.MyCallsignDvGatewayList[2].MemoDvGateway",
             ),
-            Self::DstarMemo4 => (
-                "dstar-memo-4",
+            Self::DvGatewayMemo4 => (
+                "dv-gateway-memo-4",
                 "dv.MyCallsignDvGatewayList[3].MemoDvGateway",
             ),
-            Self::DstarMemo5 => (
-                "dstar-memo-5",
+            Self::DvGatewayMemo5 => (
+                "dv-gateway-memo-5",
                 "dv.MyCallsignDvGatewayList[4].MemoDvGateway",
             ),
-            Self::DstarMemo6 => (
-                "dstar-memo-6",
+            Self::DvGatewayMemo6 => (
+                "dv-gateway-memo-6",
                 "dv.MyCallsignDvGatewayList[5].MemoDvGateway",
             ),
             Self::DstarMessage1 => ("dstar-message-1", "dv.MyDvMessageList[0].MyDvMessage"),
@@ -276,35 +278,20 @@ pub struct TextMetadata {
     pub padding: u8,
 }
 
-/// Relationship between supplied firmware provenance and the software layout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TextLayoutQualification {
-    /// The supplied identity exactly matches a registry target label.
-    RegistryTargetMatched,
-    /// The caller requested interpretation without the firmware-label check.
-    ///
-    /// Offsets, decoded labels, and previews come from the registry layout,
-    /// which was not checked against the supplied firmware.
-    UnqualifiedInterpretation,
-}
-
-/// Immutable, firmware-labeled view of supported configuration strings.
+/// Immutable view of the supported configuration strings in one image.
 ///
-/// Firmware provenance is supplied by the caller; image size does not identify
-/// firmware. The image is borrowed immutably, so applying a preview is an
-/// explicit operation on a separate byte buffer.
+/// The image is borrowed immutably, so applying a preview is an explicit
+/// operation on a separate byte buffer.
 ///
 /// The following zero-filled image is a synthetic example, not a radio backup.
 ///
 /// ```
-/// use kenwood_tmd750::{FirmwareIdentity, MemoryImage};
+/// use kenwood_tmd750::MemoryImage;
 /// use kenwood_tmd750::memory::{TextImage, TextScope, TextSetting};
 /// use kenwood_tmd750::types::IMAGE_LENGTH;
 ///
 /// let image = MemoryImage::from_bytes(vec![0; IMAGE_LENGTH])?;
-/// let firmware = FirmwareIdentity::new("1.00")?;
-/// let text = TextImage::new(&image, &firmware)?;
-/// let preview = text.preview(TextSetting::PmName1, TextScope::Global, "FIELD")?;
+/// let preview = TextImage::new(&image).preview(TextSetting::PmName1, TextScope::Global, "FIELD")?;
 /// assert_eq!(preview.before(), "");
 /// assert_eq!(preview.after(), "FIELD");
 ///
@@ -312,65 +299,21 @@ pub enum TextLayoutQualification {
 /// preview.patches().apply_to_image(&mut edited)?;
 /// let edited = MemoryImage::from_bytes(edited)?;
 /// assert_eq!(
-///     TextImage::new(&edited, &firmware)?.read(TextSetting::PmName1, TextScope::Global)?,
+///     TextImage::new(&edited).read(TextSetting::PmName1, TextScope::Global)?,
 ///     "FIELD"
 /// );
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct TextImage<'a> {
     image: &'a MemoryImage,
-    firmware: FirmwareIdentity,
-    qualification: TextLayoutQualification,
 }
 
 impl<'a> TextImage<'a> {
-    /// Require an exact firmware identity accepted by the generated registry.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TextError::UnsupportedFirmware`] for any other identity,
-    /// including firmware 1.02. For explicit offline research only, see
-    /// [`Self::interpret_unqualified`].
-    pub fn new(image: &'a MemoryImage, firmware: &FirmwareIdentity) -> Result<Self, TextError> {
-        if !is_supported_schema_target(RadioModel::TmD750, firmware) {
-            return Err(TextError::UnsupportedFirmware {
-                actual: firmware.clone(),
-                accepted: MCP_D750_SCHEMA_FIRMWARE_IDENTITIES,
-            });
-        }
-        Ok(Self {
-            image,
-            firmware: firmware.clone(),
-            qualification: TextLayoutQualification::RegistryTargetMatched,
-        })
-    }
-
-    /// Interpret an image without the firmware check applied by [`Self::new`].
-    ///
-    /// Every read and preview from this view reports
-    /// [`TextLayoutQualification::UnqualifiedInterpretation`], even when
-    /// `firmware` would have satisfied [`Self::new`]. Display that status
-    /// alongside the original firmware identity.
+    /// View the strings stored in `image`.
     #[must_use]
-    pub fn interpret_unqualified(image: &'a MemoryImage, firmware: &FirmwareIdentity) -> Self {
-        Self {
-            image,
-            firmware: firmware.clone(),
-            qualification: TextLayoutQualification::UnqualifiedInterpretation,
-        }
-    }
-
-    /// Layout qualification attached to every read and preview from this view.
-    #[must_use]
-    pub const fn qualification(&self) -> TextLayoutQualification {
-        self.qualification
-    }
-
-    /// Original, caller-supplied firmware provenance.
-    #[must_use]
-    pub const fn firmware(&self) -> &FirmwareIdentity {
-        &self.firmware
+    pub const fn new(image: &'a MemoryImage) -> Self {
+        Self { image }
     }
 
     /// Decode one string, removing only trailing descriptor padding.
@@ -425,17 +368,11 @@ impl<'a> TextImage<'a> {
             before: self.read(setting, scope)?,
             after: decode(setting, metadata, value.as_bytes())?,
             patches: planner.finish()?,
-            firmware: self.firmware.clone(),
-            qualification: self.qualification,
         })
     }
 }
 
-/// An offline, single-setting patch with its provenance and decoded comparison.
-///
-/// Carry [`Self::firmware`] and [`Self::qualification`] with the preview
-/// whenever it is displayed or exported: they describe the view the patch was
-/// planned against, not the image it is applied to.
+/// An offline, single-setting patch with its decoded before and after values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextPreview {
     setting: TextSetting,
@@ -443,8 +380,6 @@ pub struct TextPreview {
     before: String,
     after: String,
     patches: PatchSet,
-    firmware: FirmwareIdentity,
-    qualification: TextLayoutQualification,
 }
 
 impl TextPreview {
@@ -476,18 +411,6 @@ impl TextPreview {
     #[must_use]
     pub const fn patches(&self) -> &PatchSet {
         &self.patches
-    }
-
-    /// Firmware identity of the view that created this preview.
-    #[must_use]
-    pub const fn firmware(&self) -> &FirmwareIdentity {
-        &self.firmware
-    }
-
-    /// Qualification retained from the view that created this preview.
-    #[must_use]
-    pub const fn qualification(&self) -> TextLayoutQualification {
-        self.qualification
     }
 }
 
@@ -522,16 +445,6 @@ pub enum TextError {
         expected: TextScopeKind,
         /// Scope supplied by the caller.
         actual: TextScopeKind,
-    },
-    /// The firmware provenance does not exactly match the registry target.
-    #[error(
-        "firmware {actual} does not match text-layout targets {accepted:?}; only explicit unqualified offline interpretation is available"
-    )]
-    UnsupportedFirmware {
-        /// Firmware identity supplied by the caller.
-        actual: FirmwareIdentity,
-        /// Exact identities accepted by the registry.
-        accepted: &'static [&'static str],
     },
     /// An embedded control character cannot be used as editable text.
     #[error("{setting} contains control character {character:?}")]

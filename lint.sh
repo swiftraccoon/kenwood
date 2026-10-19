@@ -30,7 +30,7 @@ while [ $# -gt 0 ]; do
 Usage: $(basename "$0") [OPTIONS]
 
 Runs the full-project lint gate: unsafe audit, clippy (including
-the mbelib-rs feature matrix and standalone fuzz workspace), tests
+the mbelib-rs feature matrix and standalone fuzz workspaces), tests
 (cargo-nextest for executable tests, cargo test --doc for doctests,
 the safe dstar-gateway feature matrix, and native macOS app tests),
 docs, fmt, cargo-audit, cargo-deny,
@@ -114,11 +114,14 @@ fi
 
 HOST_KERNEL=$(uname -s 2>/dev/null || true)
 
-# The fuzz targets intentionally form their own Cargo workspace. Include
-# them in the full gate and when dstar-gateway-core is selected directly.
-FUZZ_GATE=0
+# Each crate's fuzz targets intentionally form their own Cargo workspace.
+# Include them in the full gate and when their crate is selected directly.
+FUZZ_MANIFESTS=()
 if [ -z "$PKG" ] || [ "$PKG" = "dstar-gateway-core" ]; then
-    FUZZ_GATE=1
+    FUZZ_MANIFESTS+=(dstar-gateway-core/fuzz/Cargo.toml)
+fi
+if [ -z "$PKG" ] || [ "$PKG" = "kenwood-tmd750" ]; then
+    FUZZ_MANIFESTS+=(tmd750/fuzz/Cargo.toml)
 fi
 
 # Native applications can only be built by Xcode on macOS. A full Darwin
@@ -310,11 +313,11 @@ if [ "$FIX" -eq 1 ]; then
         run cargo clippy --fix --allow-dirty -p mbelib-rs --all-targets \
             --features kenwood-tables --target-dir "$CLIPPY_TARGET_DIR"
     fi
-    if [ "$FUZZ_GATE" -eq 1 ]; then
-        run cargo fmt --manifest-path dstar-gateway-core/fuzz/Cargo.toml --all
+    for manifest in "${FUZZ_MANIFESTS[@]}"; do
+        run cargo fmt --manifest-path "$manifest" --all
         run cargo clippy --fix --allow-dirty \
-            --manifest-path dstar-gateway-core/fuzz/Cargo.toml --all-targets
-    fi
+            --manifest-path "$manifest" --all-targets
+    done
 fi
 
 # ---------- unsafe audit ----------
@@ -454,26 +457,26 @@ check_required_tools() {
 run_inline "required tools present" check_required_tools
 
 # Cargo.lock is intentionally ignored, but the security gates and the
-# standalone fuzz workspace both require one. Materialize missing lockfiles,
+# standalone fuzz workspaces all require one. Materialize missing lockfiles,
 # then resolve each graph before any parallel reader starts. This prevents a
 # later Cargo build from updating a stale lockfile while audit or deny is
 # concurrently inspecting the old graph.
 ensure_lockfiles() {
+    local manifest
     if [ ! -f Cargo.lock ]; then
         cargo generate-lockfile
     fi
-    if [ "$FUZZ_GATE" -eq 1 ] && \
-        [ ! -f dstar-gateway-core/fuzz/Cargo.lock ]; then
-        cargo generate-lockfile \
-            --manifest-path dstar-gateway-core/fuzz/Cargo.toml
-    fi
+    for manifest in "${FUZZ_MANIFESTS[@]}"; do
+        if [ ! -f "$(dirname "$manifest")/Cargo.lock" ]; then
+            cargo generate-lockfile --manifest-path "$manifest"
+        fi
+    done
 
     cargo metadata --format-version 1 --no-deps --all-features >/dev/null
-    if [ "$FUZZ_GATE" -eq 1 ]; then
-        cargo metadata \
-            --manifest-path dstar-gateway-core/fuzz/Cargo.toml \
+    for manifest in "${FUZZ_MANIFESTS[@]}"; do
+        cargo metadata --manifest-path "$manifest" \
             --format-version 1 --no-deps >/dev/null
-    fi
+    done
 }
 
 run_inline "Cargo lockfiles present" ensure_lockfiles
@@ -697,38 +700,39 @@ join_native_group() {
 # `cargo fmt --check` is the verification pass; when --fix was given
 # the apply-mode `cargo fmt --all` already ran before these jobs.
 start_bg static "cargo fmt --all -- --check" cargo fmt --all -- --check
-if [ "$FUZZ_GATE" -eq 1 ]; then
+for manifest in "${FUZZ_MANIFESTS[@]}"; do
     start_bg static \
-        "cargo fmt standalone fuzz workspace" \
-        cargo fmt --manifest-path dstar-gateway-core/fuzz/Cargo.toml \
-        --all -- --check
+        "cargo fmt fuzz workspace $(dirname "$manifest")" \
+        cargo fmt --manifest-path "$manifest" --all -- --check
     start_bg static \
-        "cargo clippy standalone fuzz workspace" \
+        "cargo clippy fuzz workspace $(dirname "$manifest")" \
         env CARGO_PROFILE_DEV_DEBUG=0 CARGO_BUILD_JOBS=2 \
-        cargo clippy --manifest-path dstar-gateway-core/fuzz/Cargo.toml \
+        cargo clippy --manifest-path "$manifest" \
         --all-targets -- -D warnings -D unsafe-code
-fi
+done
 
-# Refresh one persistent advisory database, then inspect both already-resolved
-# lockfiles from the same immutable snapshot. Running two default cargo-audit
-# invocations concurrently would make both mutate ~/.cargo/advisory-db.
+# Refresh one persistent advisory database, then inspect every already-resolved
+# lockfile from the same immutable snapshot. Running several default
+# cargo-audit invocations concurrently would make each mutate
+# ~/.cargo/advisory-db.
 check_cargo_audits() {
     local advisory_db="$PWD/target/lint-advisory-db"
+    local manifest
 
     cargo audit --db "$advisory_db" --file Cargo.lock || return 1
-    if [ "$FUZZ_GATE" -eq 1 ]; then
+    for manifest in "${FUZZ_MANIFESTS[@]}"; do
         cargo audit --db "$advisory_db" --no-fetch \
-            --file dstar-gateway-core/fuzz/Cargo.lock
-    fi
+            --file "$(dirname "$manifest")/Cargo.lock" || return 1
+    done
 }
 
 start_bg static "cargo audit resolved lockfiles" check_cargo_audits
 start_bg static "cargo deny check" cargo deny check
-if [ "$FUZZ_GATE" -eq 1 ]; then
+for manifest in "${FUZZ_MANIFESTS[@]}"; do
     start_bg static \
-        "cargo deny standalone fuzz workspace" \
-        cargo deny --manifest-path dstar-gateway-core/fuzz/Cargo.toml check
-fi
+        "cargo deny fuzz workspace $(dirname "$manifest")" \
+        cargo deny --manifest-path "$manifest" check
+done
 
 # `--skip-target-dir` avoids trybuild scratch manifests and concurrent
 # walks through the Cargo/doc/doctest artifact trees.
@@ -770,7 +774,7 @@ fi
 
 # Cargo processes do not share a jobserver. Divide LINT_JOBS between Clippy
 # and test compilation in phase one, then between both rustdoc lanes in phase
-# two. The small fuzz workspace is capped at two jobs above; native cross-builds
+# two. Each small fuzz workspace is capped at two jobs above; native cross-builds
 # use the separate LINT_XCODE_JOBS cap. LINT_JOBS remains the escape hatch for
 # constrained or larger builders.
 detect_cpu_count() {

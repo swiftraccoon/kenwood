@@ -131,7 +131,7 @@ async fn every_batch_element_is_revalidated_before_any_page_traffic() -> TestRes
         }
         let mut mock = MockTransport::new();
         mock.expect(b"ID\r", b"ID TM-D750\r");
-        mock.expect(b"FV\r", b"FV 1.00\r");
+        mock.expect(b"FV\r", b"FV 1.02\r");
         mock.expect(b"TY\r", b"TY K,2,1\r");
         mock.expect(b"0M PROGRAM\r", b"0M\r");
         mock.expect(b"E", &[crate::protocol::mcp::ACK]);

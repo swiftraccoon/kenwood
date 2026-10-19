@@ -12,10 +12,13 @@
 //!   selection, band roles, GPS, VOX and Bluetooth state, and
 //!   [`Radio::get_dv_gateway_mode`]. The `set_*` methods and
 //!   [`Radio::frequency_up`]/[`Radio::frequency_down`] change the same state
-//!   with an exact echo plus readback; every setter admits only firmware
-//!   `1.02` with type `K,2,1`. Direct frequency writes, `UP`/`DW` and memory
-//!   recall are the only tuning writes; there is no transmit, beacon, TNC or
-//!   power-off command.
+//!   with an exact echo plus readback; every setter admits only an identity
+//!   in [`WRITE_TARGETS`]. Direct frequency writes, `UP`/`DW` and memory
+//!   recall are the tuning writes.
+//! - Transmit with [`Radio::transmit`], [`Radio::receive`] and
+//!   [`Radio::transmit_for`]; send an APRS beacon with
+//!   [`Radio::send_aprs_beacon`]; select the TNC mode, VOX and power with
+//!   [`Radio::set_tnc_mode`], [`Radio::set_vox`] and [`Radio::power_off`].
 //! - Capture standard configuration with [`Radio::backup_mcp_until_exit`], or
 //!   use [`Radio::probe_mcp`] for a smaller, fixed two-fragment read.
 //!   Neither operation writes settings; both interrupt ordinary radio operation.
@@ -23,9 +26,8 @@
 //!   Prepare ordinary changes with [`menu::MenuUpdatePlan`] and persistent
 //!   Gateway changes with [`terminal::TerminalPlan`]. A plan is local data;
 //!   applying it is a separate session.
-//! - The text field update and fixed-trial modules perform single-page writes
-//!   to fixed targets under stricter guards. They are not prerequisites for
-//!   the ordinary menu API.
+//! - [`text_field_update`] writes one text field (the PM1 name, the PM Off MY1
+//!   callsign or a channel name) and verifies it in a second session.
 //!
 //! # Ownership and failure
 //!
@@ -38,15 +40,16 @@
 
 pub mod backup;
 mod cat;
+mod channel_batch;
 pub mod menu;
 mod pm1_page;
-pub mod pm_name_trial;
 pub mod probe;
 pub mod programming;
 pub mod readiness;
+pub mod session;
 pub mod terminal;
-pub mod terminal_exit_trial;
 pub mod text_field_update;
+mod transmit;
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -60,7 +63,9 @@ use crate::types::{
 use kenwood_transport::{Transport, TransportError};
 
 pub use cat::{STEP_READBACK_ATTEMPTS, STEP_READBACK_INTERVAL, STEP_SETTLE, STEP_SPACING};
-pub use programming::{McpJournal, McpSession, McpWriteReport, RecoveryReport, RegionImage};
+pub use channel_batch::{ChannelBatchError, ChannelWrite, ProgrammedChannels};
+pub use programming::{McpJournal, McpSession, RegionImage};
+pub use transmit::VOX_SETTLE;
 
 /// Default timeout for one serial write, CAT line, or MCP exchange step.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -137,13 +142,68 @@ pub const MAX_STALE_LINES: usize = 4;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProtocolState {
     CatReady,
+    /// A CAT exchange did not complete; only `RX` is sent until its reply
+    /// correlates.
+    CatUncertain,
     McpReady,
     RecoveryRequired,
     Retired,
 }
 
-const WRITE_FIRMWARE: &str = "1.02";
-const WRITE_RADIO_TYPE: &str = "K,2,1";
+/// One exact `FV` and `TY` payload pair admitted by every write in this crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WriteTarget {
+    firmware: &'static str,
+    radio_type: &'static str,
+}
+
+impl WriteTarget {
+    /// The exact `FV` payload.
+    #[must_use]
+    pub const fn firmware(self) -> &'static str {
+        self.firmware
+    }
+
+    /// The exact `TY` payload.
+    #[must_use]
+    pub const fn radio_type(self) -> &'static str {
+        self.radio_type
+    }
+
+    /// Whether `identity` is a TM-D750 reporting exactly this pair.
+    #[must_use]
+    pub fn matches(self, identity: &Identity) -> bool {
+        identity.model == RadioModel::TmD750
+            && identity.firmware.as_str() == self.firmware
+            && identity.radio_type.as_str() == self.radio_type
+    }
+}
+
+impl fmt::Display for WriteTarget {
+    /// Model, firmware and type separated by slashes: `TM-D750 / 1.02 / K,2,1`.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} / {} / {}",
+            RadioModel::TmD750,
+            self.firmware,
+            self.radio_type
+        )
+    }
+}
+
+/// Identities whose CAT setters, MCP plans and transmit commands this crate
+/// sends.
+///
+/// The echo, readback and page-layout behavior the write paths depend on was
+/// observed on a radio reporting these payloads. Every write checks the
+/// connected radio against this list through [`Identity::is_write_target`]
+/// before sending a byte and returns [`Error::UnsupportedWriteTarget`]
+/// otherwise.
+pub const WRITE_TARGETS: &[WriteTarget] = &[WriteTarget {
+    firmware: "1.02",
+    radio_type: "K,2,1",
+}];
 
 /// Progress of a multi-page transfer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,7 +214,11 @@ pub struct Progress {
     pub total: usize,
 }
 
-/// A proven radio identity.
+/// The `ID`, `FV` and `TY` payloads of one radio.
+///
+/// [`Radio::identify`] reads them from the connected radio. A plan built from
+/// a captured identity is compared with the session's fresh identity before
+/// any page is written.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Identity {
     /// The model (always TM-D750).
@@ -166,14 +230,20 @@ pub struct Identity {
 }
 
 impl Identity {
-    /// Whether this is the exact identity every write in this crate admits:
-    /// a TM-D750 with firmware `1.02` and type `K,2,1`.
+    /// Whether this identity is one of [`WRITE_TARGETS`].
     #[must_use]
     pub fn is_write_target(&self) -> bool {
-        self.model == RadioModel::TmD750
-            && self.firmware.as_str() == WRITE_FIRMWARE
-            && self.radio_type.as_str() == WRITE_RADIO_TYPE
+        WRITE_TARGETS.iter().any(|target| target.matches(self))
     }
+}
+
+/// [`WRITE_TARGETS`] as `TM-D750 / 1.02 / K,2,1`, comma separated.
+pub(crate) fn write_targets_list() -> String {
+    WRITE_TARGETS
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 impl fmt::Display for Identity {
@@ -213,14 +283,16 @@ impl fmt::Display for Identity {
 /// reply-reading step, not one deadline for an entire multi-command method.
 /// Await a polled CAT operation to completion. Dropping its future during I/O,
 /// a write/read failure, a timeout, or an undecodable reply leaves the managed
-/// connection recovery-required. After a timeout it is unknown whether the
-/// bytes arrived or the requested change took effect.
+/// connection uncertain. After a timeout it is unknown whether the bytes
+/// arrived or the requested change took effect.
 ///
 /// Subsequent CAT and MCP operations then return
-/// [`McpError::RecoveryRequired`] before I/O, even when CAT caused the failure.
-/// A complete, parsed rejection or unexpected response instead leaves a
-/// synchronized boundary. No command is automatically replayed, and no setting
-/// is rolled back.
+/// [`McpError::RecoveryRequired`] before I/O, with one exception: after a CAT
+/// failure (not an MCP one), [`Self::receive`] still sends `RX`, so a
+/// transmitter keyed by an unanswered `TX` can be released, and its correlated
+/// reply makes the connection ready again. A complete, parsed rejection or
+/// unexpected response leaves a synchronized boundary. No command is
+/// automatically replayed, and no setting is rolled back.
 ///
 /// # Releasing and recovering ownership
 ///
@@ -232,8 +304,6 @@ impl fmt::Display for Identity {
 /// further traffic. Rewrapping the old transport is not recovery.
 ///
 /// MCP has additional borrowed-session and exit rules in [`McpSession`].
-/// [`Self::recover`] only inspects journaled patch bits on a usable connection;
-/// it does not repair an uncertain protocol stream.
 #[derive(Debug)]
 pub struct Radio<T: Transport> {
     transport: T,
@@ -347,7 +417,7 @@ impl<T: Transport> Radio<T> {
     /// [`Error::Timeout`] when a write or reply step expires, and transport,
     /// parse, unexpected-response, or session-state errors otherwise.
     pub async fn identify(&mut self) -> Result<Identity, Error> {
-        tracing::info!("identifying radio");
+        tracing::debug!("identifying radio");
         let model = self
             .query(Command::Identify, "Identity", |response| match response {
                 Response::Identity { model } => Some(*model),
@@ -375,7 +445,7 @@ impl<T: Transport> Radio<T> {
             firmware,
             radio_type,
         };
-        tracing::info!(
+        tracing::debug!(
             firmware = %identity.firmware,
             radio_type = %identity.radio_type,
             "radio identified"
@@ -418,8 +488,8 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Errors
     ///
-    /// Proves the radio identity first when needed and refuses any other
-    /// firmware or radio type with [`Error::UnsupportedCatWriteTarget`].
+    /// Identifies the radio first when needed and refuses any identity outside
+    /// [`WRITE_TARGETS`] with [`Error::UnsupportedWriteTarget`].
     /// Returns an error when that gate fails, the write is rejected, its reply
     /// does not match, or the immediate readback differs from the request.
     pub async fn set_operating_mode(
@@ -480,7 +550,25 @@ impl<T: Transport> Radio<T> {
     /// Send one command and return the reply that answers it.
     pub(crate) async fn command(&mut self, command: &Command) -> Result<Response, Error> {
         self.require_cat()?;
-        self.protocol_state = ProtocolState::RecoveryRequired;
+        self.exchange(command).await
+    }
+
+    /// Send `RX` on a ready connection or one whose last CAT exchange did not
+    /// complete, and return the reply that answers it.
+    ///
+    /// A correlated reply leaves the connection ready. Every other state
+    /// returns the error [`Self::require_cat`] reports, so no CAT byte enters
+    /// an uncertain programming session.
+    pub(crate) async fn release_command(&mut self) -> Result<Response, Error> {
+        if self.protocol_state != ProtocolState::CatUncertain {
+            self.require_cat()?;
+        }
+        self.exchange(&Command::Receive).await
+    }
+
+    /// Write `command` and read until a line answers it.
+    async fn exchange(&mut self, command: &Command) -> Result<Response, Error> {
+        self.protocol_state = ProtocolState::CatUncertain;
         let timeout = self.reply_timeout(command);
         self.write_all(&command.encode()).await?;
         let mut stale = 0;
@@ -552,7 +640,9 @@ impl<T: Transport> Radio<T> {
     /// Write a setting, require the echo to equal the request, then read the
     /// setting back and require the same value.
     ///
-    /// The firmware and type gate runs first and sends nothing when it fails.
+    /// The write-target gate runs first and sends nothing when it fails. A
+    /// differing echo is [`ProtocolError::EchoMismatch`] and sends no
+    /// readback; a differing readback is [`ProtocolError::ReadbackMismatch`].
     pub(crate) async fn apply<V>(
         &mut self,
         write: Command,
@@ -562,44 +652,61 @@ impl<T: Transport> Radio<T> {
         extract: fn(&Response) -> Option<V>,
     ) -> Result<(), Error>
     where
-        V: PartialEq + fmt::Debug,
+        V: PartialEq + fmt::Display + Send + Sync,
     {
         self.require_write_target().await?;
+        let command = write.mnemonic();
         let echoed = self.query(write, expected, extract).await?;
         if echoed != requested {
-            return Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "write echo equal to the request",
-                actual: format!("{expected} write echoed {echoed:?}, requested {requested:?}"),
-            }));
+            return Err(ProtocolError::EchoMismatch {
+                command,
+                requested: requested.to_string(),
+                echoed: echoed.to_string(),
+            }
+            .into());
         }
-        let observed = self.query(read, expected, extract).await?;
-        if observed != requested {
-            return Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "readback equal to the request",
-                actual: format!("{expected} read back {observed:?}, requested {requested:?}"),
-            }));
-        }
-        Ok(())
+        self.confirm(read, expected, &requested, extract).await
     }
 
-    /// Prove the identity when it is not cached and refuse every target other
-    /// than firmware `1.02` with type `K,2,1`.
+    /// Read a setting back and require it to equal `requested`.
+    ///
+    /// A differing value is [`ProtocolError::ReadbackMismatch`].
+    pub(crate) async fn confirm<V>(
+        &mut self,
+        read: Command,
+        expected: &'static str,
+        requested: &V,
+        extract: fn(&Response) -> Option<V>,
+    ) -> Result<(), Error>
+    where
+        V: PartialEq + fmt::Display + Send + Sync,
+    {
+        let command = read.mnemonic();
+        let observed = self.query(read, expected, extract).await?;
+        if observed == *requested {
+            Ok(())
+        } else {
+            Err(ProtocolError::ReadbackMismatch {
+                command,
+                requested: requested.to_string(),
+                observed: observed.to_string(),
+            }
+            .into())
+        }
+    }
+
+    /// Identify the radio when no identity is cached and refuse every identity
+    /// outside [`WRITE_TARGETS`].
     pub(crate) async fn require_write_target(&mut self) -> Result<(), Error> {
         let identity = match self.identity().cloned() {
             Some(identity) => identity,
             None => self.identify().await?,
         };
-        if identity.firmware.as_str() != WRITE_FIRMWARE
-            || identity.radio_type.as_str() != WRITE_RADIO_TYPE
-        {
-            return Err(Error::UnsupportedCatWriteTarget {
-                expected_firmware: WRITE_FIRMWARE,
-                expected_radio_type: WRITE_RADIO_TYPE,
-                actual_firmware: identity.firmware.to_string(),
-                actual_radio_type: identity.radio_type.to_string(),
-            });
+        if identity.is_write_target() {
+            Ok(())
+        } else {
+            Err(Error::UnsupportedWriteTarget { actual: identity })
         }
-        Ok(())
     }
 
     /// The reply deadline for `command`, consuming a pending
@@ -646,7 +753,7 @@ impl<T: Transport> Radio<T> {
             .await
             .map_err(|_| Error::Timeout {
                 operation: "serial write",
-                millis: millis(timeout),
+                timeout,
             })?
             .map_err(Error::Transport)
     }
@@ -655,7 +762,9 @@ impl<T: Transport> Radio<T> {
         match self.protocol_state {
             ProtocolState::CatReady => Ok(()),
             ProtocolState::McpReady => Err(McpError::SessionActive.into()),
-            ProtocolState::RecoveryRequired => Err(McpError::RecoveryRequired.into()),
+            ProtocolState::CatUncertain | ProtocolState::RecoveryRequired => {
+                Err(McpError::RecoveryRequired.into())
+            }
             ProtocolState::Retired => Err(McpError::ConnectionRetired.into()),
         }
     }
@@ -664,7 +773,9 @@ impl<T: Transport> Radio<T> {
         match self.protocol_state {
             ProtocolState::McpReady => Ok(()),
             ProtocolState::CatReady => Err(McpError::SessionNotActive.into()),
-            ProtocolState::RecoveryRequired => Err(McpError::RecoveryRequired.into()),
+            ProtocolState::CatUncertain | ProtocolState::RecoveryRequired => {
+                Err(McpError::RecoveryRequired.into())
+            }
             ProtocolState::Retired => Err(McpError::ConnectionRetired.into()),
         }
     }
@@ -743,10 +854,7 @@ impl<T: Transport> Radio<T> {
             }
         })
         .await
-        .map_err(|_| Error::Timeout {
-            operation,
-            millis: millis(timeout),
-        })?
+        .map_err(|_| Error::Timeout { operation, timeout })?
     }
 
     /// Read exactly `len` buffered or incoming bytes, retaining any remainder.
@@ -765,10 +873,7 @@ impl<T: Transport> Radio<T> {
             Ok(self.receive_buffer.drain(..len).collect())
         })
         .await
-        .map_err(|_| Error::Timeout {
-            operation,
-            millis: millis(timeout),
-        })?
+        .map_err(|_| Error::Timeout { operation, timeout })?
     }
 
     async fn receive_more(&mut self) -> Result<(), Error> {
@@ -790,6 +895,8 @@ impl<T: Transport> Radio<T> {
 }
 
 #[cfg(test)]
+mod identity_tests;
+#[cfg(test)]
 mod io_tests;
 
 fn unexpected(expected: &'static str, actual: &Response) -> Error {
@@ -804,8 +911,4 @@ fn closed(detail: &'static str) -> Error {
         std::io::ErrorKind::UnexpectedEof,
         detail,
     )))
-}
-
-fn millis(duration: Duration) -> u64 {
-    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }

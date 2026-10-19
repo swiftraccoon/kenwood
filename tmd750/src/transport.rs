@@ -6,8 +6,10 @@
 //! Automatic reopening is unsupported:
 //! a device path alone cannot prove which radio owns a re-enumerated endpoint.
 //! [`reenumeration`] classifies a fresh enumeration against a pinned endpoint
-//! so a caller can decide when the same endpoint may be opened again.
+//! so a caller can decide when the same endpoint may be opened again, and
+//! [`bluetooth`] picks the radio among the host's paired Bluetooth devices.
 
+pub mod bluetooth;
 pub mod reenumeration;
 
 use std::num::NonZeroU32;

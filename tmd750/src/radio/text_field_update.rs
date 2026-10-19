@@ -16,7 +16,7 @@ use crate::memory::{
     TextFieldUpdateStatus, TextValue,
 };
 use crate::radio::probe::{McpProbeExit, McpProbeSegment};
-use crate::types::{Address, DvGatewayMode, PAGE_SIZE, Page, RadioModel};
+use crate::types::{Address, DvGatewayMode, PAGE_SIZE, Page};
 use kenwood_transport::Transport;
 
 /// The step at which a bounded text field update session stopped.
@@ -525,11 +525,7 @@ impl<T: Transport> Radio<T> {
         report: &mut TextFieldUpdateSessionReport,
     ) -> Result<(), TextFieldUpdateSessionError> {
         self.require_mcp_ready()?;
-        if self.identity() != Some(update.identity())
-            || update.identity().model != RadioModel::TmD750
-            || update.identity().firmware.as_str() != "1.02"
-            || update.identity().radio_type.as_str() != "K,2,1"
-        {
+        if self.identity() != Some(update.identity()) || !update.identity().is_write_target() {
             return Err(TextFieldUpdateError::IdentityMismatch.into());
         }
         if (G::KIND == GuardKind::PmOffGateway && report.gateway_mode != Some(DvGatewayMode::Off))

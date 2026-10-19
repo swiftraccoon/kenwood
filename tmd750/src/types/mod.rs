@@ -21,8 +21,8 @@ pub use mode::{Band, DvGatewayMode, OperatingMode, SelectableMode};
 pub use settings::{
     AmHighCut, AprsCallsign, BacklightControl, BandDisplay, BeaconMethod, DstarCallsignEntry,
     DstarSlot, GpsSettings, MyPositionSelection, NmeaSentence, NmeaSentences, PacketDataRate,
-    PowerLevel, RealTimeClock, SMeterReading, SerialInformation, SquelchLevel, TncMode, VoxDelay,
-    VoxGain, VoxMode,
+    PowerLevel, RealTimeClock, SMeterReading, SelectableTncMode, SerialInformation, SquelchLevel,
+    TncMode, TncState, VoxDelay, VoxGain, VoxMode,
 };
 pub use signaling::{
     CrossToneField, DCS_CODES, DcsCode, DigitalCode, DigitalSquelch, TONE_FREQUENCIES_DECIHERTZ,

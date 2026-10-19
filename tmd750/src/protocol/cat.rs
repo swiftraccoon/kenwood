@@ -4,8 +4,9 @@
 //! carriage return; a reply is the mnemonic, a space and the payload,
 //! terminated the same way. A lone `?` rejects the command and a lone `N`
 //! reports that it is unavailable in the current state. Every command here
-//! was sent to firmware 1.02 over the panel USB connector and its reply read;
-//! a setter's reply echoes the accepted setting in the read form.
+//! except [`Command::PowerOff`] was sent to firmware 1.02 over the panel USB
+//! connector and its reply read; a setter's reply echoes the accepted setting
+//! in the read form.
 
 use crate::error::ProtocolError;
 use crate::types::{
@@ -14,7 +15,8 @@ use crate::types::{
     DstarCallsignEntry, DstarSlot, DvGatewayMode, FirmwareIdentity, Frequency, GpsSettings,
     MemoryChannelAddress, MyPositionSelection, NmeaSentences, OperatingMode, PacketDataRate,
     PowerLevel, RadioModel, RadioType, RealTimeClock, SMeterReading, SelectableMode,
-    SerialInformation, SquelchLevel, StepSize, TncMode, TuningMode, VoxDelay, VoxGain, VoxMode,
+    SelectableTncMode, SerialInformation, SquelchLevel, StepSize, TncMode, TuningMode, VoxDelay,
+    VoxGain, VoxMode,
 };
 
 use super::channel::{parse_channel_fields, parse_memory_channel};
@@ -68,6 +70,13 @@ pub enum Command {
     GetChannelRecord {
         /// Band to query.
         band: Band,
+    },
+    /// `FO <band>,<18 fields>`: replace the band's complete channel record.
+    SetChannelRecord {
+        /// Band to change.
+        band: Band,
+        /// Record to apply.
+        record: CatChannelRecord,
     },
     /// `PC <band>`: read the transmit power.
     GetPowerLevel {
@@ -242,6 +251,13 @@ pub enum Command {
     },
     /// `TN`: read the TNC mode and data band.
     GetTncMode,
+    /// `TN <mode>,<band>`: select the TNC mode and its data band.
+    SetTncMode {
+        /// Mode to select.
+        mode: SelectableTncMode,
+        /// Band the TNC sends and receives on.
+        data_band: Band,
+    },
     /// `VD`: read the VOX delay.
     GetVoxDelay,
     /// `VD <index>`: select the VOX delay.
@@ -258,6 +274,11 @@ pub enum Command {
     },
     /// `VX`: read the VOX state.
     GetVox,
+    /// `VX <0|1>`: switch VOX.
+    SetVox {
+        /// Whether VOX is on.
+        enabled: bool,
+    },
     /// `GP`: read the GPS receiver settings.
     GetGpsSettings,
     /// `GP <gps>,<pc>`: select the GPS receiver settings.
@@ -286,6 +307,14 @@ pub enum Command {
         /// Callsign to write.
         callsign: AprsCallsign,
     },
+    /// `TX`: key the PTT band's transmitter.
+    Transmit,
+    /// `RX`: release the transmitter.
+    Receive,
+    /// `BE`: transmit one APRS beacon.
+    SendAprsBeacon,
+    /// `PS 0`: switch the radio off.
+    PowerOff,
 }
 
 impl Command {
@@ -297,12 +326,12 @@ impl Command {
             Self::FirmwareVersion => "FV",
             Self::RadioType => "TY",
             Self::SerialInformation => "AE",
-            Self::PowerStatus => "PS",
+            Self::PowerStatus | Self::PowerOff => "PS",
             Self::RealTimeClock => "RT",
             Self::GetOperatingMode { .. } | Self::SetOperatingMode { .. } => "MD",
             Self::GetGatewayMode => "GW",
             Self::GetFrequency { .. } | Self::SetFrequency { .. } => "FQ",
-            Self::GetChannelRecord { .. } => "FO",
+            Self::GetChannelRecord { .. } | Self::SetChannelRecord { .. } => "FO",
             Self::GetPowerLevel { .. } | Self::SetPowerLevel { .. } => "PC",
             Self::GetTuningMode { .. } | Self::SetTuningMode { .. } => "VM",
             Self::GetSquelch { .. } | Self::SetSquelch { .. } => "SQ",
@@ -325,14 +354,17 @@ impl Command {
             Self::GetMyPositionSelection | Self::SetMyPositionSelection { .. } => "MS",
             Self::GetPacketDataRate | Self::SetPacketDataRate { .. } => "AS",
             Self::GetBeaconMethod | Self::SetBeaconMethod { .. } => "PT",
-            Self::GetTncMode => "TN",
+            Self::GetTncMode | Self::SetTncMode { .. } => "TN",
             Self::GetVoxDelay | Self::SetVoxDelay { .. } => "VD",
             Self::GetVoxGain | Self::SetVoxGain { .. } => "VG",
-            Self::GetVox => "VX",
+            Self::GetVox | Self::SetVox { .. } => "VX",
             Self::GetGpsSettings | Self::SetGpsSettings { .. } => "GP",
             Self::GetGpsSentences | Self::SetGpsSentences { .. } => "GS",
             Self::GetBluetooth | Self::SetBluetooth { .. } => "BT",
             Self::GetAprsCallsign | Self::SetAprsCallsign { .. } => "CS",
+            Self::Transmit => "TX",
+            Self::Receive => "RX",
+            Self::SendAprsBeacon => "BE",
         }
     }
 
@@ -343,6 +375,7 @@ impl Command {
             self,
             Self::SetOperatingMode { .. }
                 | Self::SetFrequency { .. }
+                | Self::SetChannelRecord { .. }
                 | Self::SetPowerLevel { .. }
                 | Self::SetTuningMode { .. }
                 | Self::SetSquelch { .. }
@@ -368,6 +401,12 @@ impl Command {
                 | Self::SetGpsSentences { .. }
                 | Self::SetBluetooth { .. }
                 | Self::SetAprsCallsign { .. }
+                | Self::SetTncMode { .. }
+                | Self::SetVox { .. }
+                | Self::Transmit
+                | Self::Receive
+                | Self::SendAprsBeacon
+                | Self::PowerOff
         )
     }
 
@@ -399,7 +438,10 @@ impl Command {
             | Self::GetGpsSettings
             | Self::GetGpsSentences
             | Self::GetBluetooth
-            | Self::GetAprsCallsign => None,
+            | Self::GetAprsCallsign
+            | Self::Transmit
+            | Self::Receive
+            | Self::SendAprsBeacon => None,
             Self::GetOperatingMode { band }
             | Self::GetFrequency { band }
             | Self::GetChannelRecord { band }
@@ -418,6 +460,9 @@ impl Command {
             )),
             Self::SetFrequency { band, frequency } => {
                 Some(format!("{},{}", u8::from(band), frequency.to_wire_string()))
+            }
+            Self::SetChannelRecord { band, ref record } => {
+                Some(format!("{},{}", u8::from(band), record.to_wire_fields()))
             }
             Self::SetPowerLevel { band, level } => {
                 Some(format!("{},{}", u8::from(band), level.as_raw()))
@@ -454,7 +499,10 @@ impl Command {
             | Self::SetGpsSettings { .. }
             | Self::SetGpsSentences { .. }
             | Self::SetBluetooth { .. }
-            | Self::SetAprsCallsign { .. } => self.memory_and_global_argument(),
+            | Self::SetAprsCallsign { .. }
+            | Self::SetTncMode { .. }
+            | Self::SetVox { .. }
+            | Self::PowerOff => self.memory_and_global_argument(),
         };
         let mut bytes = argument.map_or_else(
             || mnemonic.as_bytes().to_vec(),
@@ -467,7 +515,7 @@ impl Command {
     /// Argument text of the memory and global commands; `None` for the rest.
     fn memory_and_global_argument(&self) -> Option<String> {
         match *self {
-            Self::GetAmHighCut => Some("0".to_owned()),
+            Self::GetAmHighCut | Self::PowerOff => Some("0".to_owned()),
             Self::SetAmHighCut { cut } => Some(format!("0,{}", cut.as_raw())),
             Self::RecallMemoryChannel { band, address } => {
                 Some(format!("{},{}", u8::from(band), address.to_wire_string()))
@@ -514,8 +562,13 @@ impl Command {
                     .map(|flag| u8::from(flag).to_string())
                     .join(","),
             ),
-            Self::SetBluetooth { enabled } => Some(u8::from(enabled).to_string()),
+            Self::SetBluetooth { enabled } | Self::SetVox { enabled } => {
+                Some(u8::from(enabled).to_string())
+            }
             Self::SetAprsCallsign { ref callsign } => Some(callsign.as_str().to_owned()),
+            Self::SetTncMode { mode, data_band } => {
+                Some(format!("{},{}", mode.as_raw(), u8::from(data_band)))
+            }
             _ => None,
         }
     }
@@ -536,7 +589,12 @@ impl Command {
             Self::FirmwareVersion => matches!(response, Response::FirmwareVersion { .. }),
             Self::RadioType => matches!(response, Response::RadioType(_)),
             Self::SerialInformation => matches!(response, Response::SerialInformation(_)),
-            Self::PowerStatus => matches!(response, Response::PowerStatus { .. }),
+            Self::PowerStatus | Self::PowerOff => {
+                matches!(response, Response::PowerStatus { .. })
+            }
+            Self::Transmit => matches!(response, Response::TransmitAck),
+            Self::Receive => matches!(response, Response::ReceiveAck),
+            Self::SendAprsBeacon => matches!(response, Response::AprsBeaconAck),
             Self::RealTimeClock => matches!(response, Response::RealTimeClock(_)),
             Self::GetOperatingMode { band } | Self::SetOperatingMode { band, .. } => {
                 matches!(response, Response::OperatingMode { band: reply, .. } if *reply == band)
@@ -545,7 +603,7 @@ impl Command {
             Self::GetFrequency { band } | Self::SetFrequency { band, .. } => {
                 matches!(response, Response::Frequency { band: reply, .. } if *reply == band)
             }
-            Self::GetChannelRecord { band } => {
+            Self::GetChannelRecord { band } | Self::SetChannelRecord { band, .. } => {
                 matches!(response, Response::ChannelRecord { band: reply, .. } if *reply == band)
             }
             Self::GetPowerLevel { band } | Self::SetPowerLevel { band, .. } => {
@@ -607,11 +665,13 @@ impl Command {
             | Self::GetBeaconMethod
             | Self::SetBeaconMethod { .. }
             | Self::GetTncMode
+            | Self::SetTncMode { .. }
             | Self::GetVoxDelay
             | Self::SetVoxDelay { .. }
             | Self::GetVoxGain
             | Self::SetVoxGain { .. }
             | Self::GetVox
+            | Self::SetVox { .. }
             | Self::GetGpsSettings
             | Self::SetGpsSettings { .. }
             | Self::GetGpsSentences
@@ -653,12 +713,14 @@ impl Command {
             Self::GetBeaconMethod | Self::SetBeaconMethod { .. } => {
                 matches!(response, Response::BeaconMethod(_))
             }
-            Self::GetTncMode => matches!(response, Response::TncMode { .. }),
+            Self::GetTncMode | Self::SetTncMode { .. } => {
+                matches!(response, Response::TncMode { .. })
+            }
             Self::GetVoxDelay | Self::SetVoxDelay { .. } => {
                 matches!(response, Response::VoxDelay(_))
             }
             Self::GetVoxGain | Self::SetVoxGain { .. } => matches!(response, Response::VoxGain(_)),
-            Self::GetVox => matches!(response, Response::Vox(_)),
+            Self::GetVox | Self::SetVox { .. } => matches!(response, Response::Vox(_)),
             Self::GetGpsSettings | Self::SetGpsSettings { .. } => {
                 matches!(response, Response::GpsSettings(_))
             }
@@ -839,6 +901,13 @@ pub enum Response {
     },
     /// `CS <callsign>`.
     AprsCallsign(AprsCallsign),
+    /// `TX 1`: the radio accepted the transmit request, whichever band is the
+    /// PTT band.
+    TransmitAck,
+    /// `RX`: the radio accepted the receive request.
+    ReceiveAck,
+    /// `BE`: the radio accepted the beacon request.
+    AprsBeaconAck,
     /// `?`: the radio rejected the command.
     Rejected,
     /// `N`: the command is unavailable in the current state.
@@ -894,6 +963,9 @@ pub fn parse_line(line: &[u8]) -> Result<Response, ProtocolError> {
         return Ok(response);
     }
     if let Some(response) = parse_global(mnemonic, payload)? {
+        return Ok(response);
+    }
+    if let Some(response) = parse_transmit(mnemonic, payload)? {
         return Ok(response);
     }
     Ok(Response::Other {
@@ -1174,6 +1246,24 @@ fn parse_global(mnemonic: &str, payload: &str) -> Result<Option<Response>, Proto
         _ => return Ok(None),
     };
     Ok(Some(response))
+}
+
+fn parse_transmit(mnemonic: &str, payload: &str) -> Result<Option<Response>, ProtocolError> {
+    let (command, response, expected) = match mnemonic {
+        "TX" => ("TX", Response::TransmitAck, "1"),
+        "RX" => ("RX", Response::ReceiveAck, ""),
+        "BE" => ("BE", Response::AprsBeaconAck, ""),
+        _ => return Ok(None),
+    };
+    if payload == expected {
+        Ok(Some(response))
+    } else {
+        Err(field_error(
+            command,
+            "payload",
+            format!("expected {expected:?}, got {payload:?}"),
+        ))
+    }
 }
 
 const fn mnemonic_static(mnemonic: &str) -> &'static str {
@@ -1479,8 +1569,8 @@ mod tests {
             Response::RadioType(RadioType::new("K,2,1")?)
         );
         assert_eq!(
-            parse_line(b"AE C6210439,K01")?,
-            Response::SerialInformation(SerialInformation::new("C6210439", "K01")?)
+            parse_line(b"AE A1234567,K01")?,
+            Response::SerialInformation(SerialInformation::new("A1234567", "K01")?)
         );
         assert_eq!(parse_line(b"PS 1")?, Response::PowerStatus { on: true });
         assert_eq!(
@@ -1512,6 +1602,33 @@ mod tests {
                 mnemonic: "XX".to_owned(),
                 payload: "1".to_owned()
             }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_channel_record_write_encodes_its_fields_and_correlates_with_its_band() -> TestResult {
+        const LINE: &str = "FO 1,0223020000,0001600000,8,8,0,0,0,0,0,0,0,08,08,000,0,CQCQCQ,0,00";
+        let Response::ChannelRecord { band, record } = parse_line(LINE.as_bytes())? else {
+            return Err("FO must parse as a channel record".into());
+        };
+        let write = Command::SetChannelRecord {
+            band,
+            record: record.clone(),
+        };
+        assert_eq!(write.encode(), format!("{LINE}\r").into_bytes());
+        assert_eq!(write.mnemonic(), "FO");
+        assert!(write.is_write());
+        assert!(write.correlates(&Response::ChannelRecord {
+            band: Band::B,
+            record: record.clone(),
+        }));
+        assert!(
+            !write.correlates(&Response::ChannelRecord {
+                band: Band::A,
+                record,
+            }),
+            "a reply for the other band is a stale line"
         );
         Ok(())
     }
@@ -1738,7 +1855,7 @@ mod tests {
             b"GS 1,0,0,0,1",
             b"BT 2",
             b"RT 26092100360",
-            b"AE C6210439",
+            b"AE A1234567",
         ] {
             let result = parse_line(line);
             assert!(
@@ -1879,6 +1996,90 @@ mod tests {
             Command::SetBluetooth { enabled: true }
                 .correlates(&Response::Bluetooth { enabled: true })
         );
+        Ok(())
+    }
+
+    #[test]
+    fn transmit_capable_commands_encode_report_as_writes_and_correlate() -> TestResult {
+        assert_encodings(vec![
+            (Command::Transmit, b"TX\r"),
+            (Command::Receive, b"RX\r"),
+            (Command::SendAprsBeacon, b"BE\r"),
+            (
+                Command::SetTncMode {
+                    mode: SelectableTncMode::Kiss,
+                    data_band: Band::B,
+                },
+                b"TN 2,1\r",
+            ),
+            (
+                Command::SetTncMode {
+                    mode: SelectableTncMode::Aprs,
+                    data_band: Band::A,
+                },
+                b"TN 1,0\r",
+            ),
+            (
+                Command::SetTncMode {
+                    mode: SelectableTncMode::Off,
+                    data_band: Band::A,
+                },
+                b"TN 0,0\r",
+            ),
+            (Command::SetVox { enabled: true }, b"VX 1\r"),
+            (Command::SetVox { enabled: false }, b"VX 0\r"),
+            (Command::PowerOff, b"PS 0\r"),
+        ]);
+        for command in [
+            Command::Transmit,
+            Command::Receive,
+            Command::SendAprsBeacon,
+            Command::SetVox { enabled: false },
+            Command::PowerOff,
+        ] {
+            assert!(command.is_write(), "{command:?}");
+        }
+        assert_eq!(parse_line(b"TX 1")?, Response::TransmitAck);
+        assert_eq!(parse_line(b"RX")?, Response::ReceiveAck);
+        assert_eq!(parse_line(b"BE")?, Response::AprsBeaconAck);
+        assert!(Command::Transmit.correlates(&Response::TransmitAck));
+        assert!(!Command::Transmit.correlates(&Response::ReceiveAck));
+        assert!(Command::Receive.correlates(&Response::ReceiveAck));
+        assert!(Command::SendAprsBeacon.correlates(&Response::AprsBeaconAck));
+        assert_eq!(
+            parse_line(b"TN 2,1")?,
+            Response::TncMode {
+                mode: TncMode::Kiss,
+                data_band: Band::B
+            }
+        );
+        assert_eq!(
+            parse_line(b"TN 1,0")?,
+            Response::TncMode {
+                mode: TncMode::Aprs,
+                data_band: Band::A
+            }
+        );
+        assert!(
+            Command::SetTncMode {
+                mode: SelectableTncMode::Kiss,
+                data_band: Band::B
+            }
+            .correlates(&Response::TncMode {
+                mode: TncMode::Kiss,
+                data_band: Band::B
+            })
+        );
+        assert_eq!(parse_line(b"VX 1")?, Response::Vox(VoxMode::On));
+        assert!(Command::SetVox { enabled: true }.correlates(&Response::Vox(VoxMode::On)));
+        assert!(Command::PowerOff.correlates(&Response::PowerStatus { on: false }));
+        for malformed in [b"TX".as_slice(), b"TX 0", b"TX 2", b"RX 0", b"BE 1"] {
+            assert!(
+                parse_line(malformed).is_err(),
+                "{}",
+                String::from_utf8_lossy(malformed)
+            );
+        }
         Ok(())
     }
 }

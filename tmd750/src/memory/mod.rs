@@ -5,6 +5,9 @@
 //!
 //! # Choose a task
 //!
+//! - Keep a capture with [`Configuration`]: its identity, pages and bytes,
+//!   coverage-checked access, the standard and menu views, comparison, and a
+//!   persisted form.
 //! - Use [`MemoryImage`] for a full-sized buffer and [`FieldAccess`] for
 //!   global or PM-relative decoding. Establish field coverage separately when
 //!   the bytes came from a sparse radio read.
@@ -16,6 +19,10 @@
 //!   [`schema`] explains addressing, scalar interpretation, and masked planning.
 //! - Use [`TextImage`] for typed offline text previews and
 //!   [`ReflectorTerminalPreflight`] for captured Terminal-setting inspection.
+//! - Read the D-STAR repeater and hotspot lists with
+//!   [`repeater_list::RepeaterList`], the destination callsign list with
+//!   [`callsign_list::CallsignList`] and the six-entry MY callsign list with
+//!   [`MyCallsignList`].
 //! - Prepare ordinary registered changes with
 //!   [`crate::radio::menu::MenuUpdatePlan`], or persistent Gateway changes with
 //!   [`crate::radio::terminal::TerminalPlan`]. Their session drivers separately
@@ -23,62 +30,59 @@
 //!
 //! [`TextFieldUpdate`], prepared as [`Pm1NameUpdate`], [`My1CallsignUpdate`]
 //! or [`ChannelNameUpdate`], sequences a two-session compare-write-verify
-//! update for one text field under its sealed guard policy. [`PmNameTrial`],
-//! [`MyCallsignTrial`], and [`TerminalExitTrial`] are fixed-scope variants with
-//! no caller-selectable value. All of them check event order and page equality;
-//! the facts a caller reports (fresh connection, synchronized journal record,
-//! completed capture) are taken on trust. File containers live in
-//! [`crate::file`].
+//! update for one text field under its sealed guard policy. It checks event
+//! order and page equality; the facts a caller reports (fresh connection,
+//! synchronized journal record, completed capture) are taken on trust. File
+//! containers live in [`crate::file`].
 
+pub mod callsign_list;
+mod captured_configuration;
+mod chain;
+mod channel_names;
 pub mod channels;
 mod configuration;
-pub(crate) mod fixed_text_trial;
 pub mod menu_fields;
 mod menu_patch;
 mod menu_policy;
-mod my_callsign_trial;
-mod pm_name_trial;
+mod my_callsigns;
+pub mod repeater_list;
 pub mod schema;
+mod stored_text;
 mod terminal;
-mod terminal_exit_trial;
 mod text;
 mod text_field_update;
 
 use crate::error::{SchemaError, ValidationError};
-use crate::types::{FirmwareIdentity, IMAGE_LENGTH, RadioModel, SlotIndex};
+use crate::types::{IMAGE_LENGTH, SlotIndex};
 
+pub use captured_configuration::Configuration;
+pub use channel_names::ChannelNamePlan;
 pub use channels::ChannelAccess;
 pub use configuration::{
     ChangedByte, ChangedPage, ConfigurationError, StandardConfiguration, StandardConfigurationDiff,
 };
 pub use menu_fields::{
     MCP_D750_IMAGE_LENGTH, MCP_D750_MENU_FIELDS, MCP_D750_SCHEMA_VERSION, MCP_D750_SLOT_COUNT,
-    MCP_D750_SLOT_STRIDE, MCP_D750_SOURCE_SHA256, MenuField, MenuOption, StorageTransform,
-    menu_field,
+    MCP_D750_SLOT_STRIDE, MCP_D750_SOURCE_SHA256, MenuField, MenuFieldId, MenuOption,
+    StorageTransform, menu_field,
 };
 pub use menu_patch::MenuValueError;
 pub use menu_policy::{MenuWritePolicy, MenuWritePolicyError};
-pub use my_callsign_trial::MyCallsignTrial;
-pub use pm_name_trial::{
-    PmNameTrial, PmNameTrialError, PmNameTrialEvent, PmNameTrialSession, PmNameTrialStatus,
-    PmNameTrialWrite,
+pub use my_callsigns::{
+    MY_CALLSIGN_ENTRY_SIZE, MY_CALLSIGN_LIST_ADDRESS, MY_CALLSIGN_SELECTION_ADDRESS, MyCallsignList,
 };
 pub use schema::{
     DecodedFieldValue, Endian, FieldCodec, FieldDescriptor, FieldValue, PatchPlanner, PatchSet,
     SLOT_TERM, StringEncoding, Term,
 };
+pub use stored_text::{StoredText, StoredTextError};
 pub use terminal::{
     ReflectorTerminalPreflight, TerminalFinding, TerminalGatewayMode, TerminalGatewayRoute,
     TerminalMode, TerminalMyCallsignIndex, TerminalPreflightError, TerminalUsbFunction,
     TerminalUsbRoute,
 };
-pub use terminal_exit_trial::{
-    TerminalExitTrial, TerminalExitTrialError, TerminalExitTrialEvent, TerminalExitTrialSession,
-    TerminalExitTrialStatus,
-};
 pub use text::{
-    TextError, TextImage, TextLayoutQualification, TextMetadata, TextPreview, TextScope,
-    TextScopeKind, TextSetting,
+    TextError, TextImage, TextMetadata, TextPreview, TextScope, TextScopeKind, TextSetting,
 };
 pub use text_field_update::{
     ChannelNameText, ChannelNameUpdate, ControlPage, GuardKind, GuardPolicy, My1Callsign,
@@ -87,22 +91,12 @@ pub use text_field_update::{
     TextFieldUpdateSession, TextFieldUpdateStatus, TextValue,
 };
 
-/// Model whose layout the generated registry describes.
-pub const MCP_D750_SCHEMA_MODEL: &str = "TM-D750";
-/// Firmware label declared to the extractor that generated the registry.
+/// Version of the official MCP-D750 program whose serializers the generated
+/// registry was extracted from.
 ///
-/// It records that declared provenance, not a vendor version range.
-pub const MCP_D750_SCHEMA_FIRMWARE: &str = "1.00";
-/// Firmware labels accepted by [`is_supported_schema_target`].
-///
-/// Each is compared against [`FirmwareIdentity::as_str`] by exact string match.
-pub const MCP_D750_SCHEMA_FIRMWARE_IDENTITIES: &[&str] = &["1.00"];
-
-/// Whether `model` and `firmware` match the registry's extraction target.
-#[must_use]
-pub fn is_supported_schema_target(model: RadioModel, firmware: &FirmwareIdentity) -> bool {
-    model == RadioModel::TmD750 && MCP_D750_SCHEMA_FIRMWARE_IDENTITIES.contains(&firmware.as_str())
-}
+/// It names the registry's source, not a radio firmware; writes are gated by
+/// [`crate::radio::WRITE_TARGETS`].
+pub const MCP_D750_PROGRAM_VERSION: &str = "1.00";
 
 /// Full-sized 1,929,472-byte storage without coverage or firmware provenance.
 ///
@@ -246,14 +240,6 @@ mod tests {
             image.slot(SlotIndex::new(0)?).read(&meter)?,
             DecodedFieldValue::Unsigned(0xFF)
         );
-        assert!(is_supported_schema_target(
-            RadioModel::TmD750,
-            &FirmwareIdentity::new("1.00")?
-        ));
-        assert!(!is_supported_schema_target(
-            RadioModel::TmD750,
-            &FirmwareIdentity::new("1.01")?
-        ));
         Ok(())
     }
 }

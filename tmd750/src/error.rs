@@ -24,16 +24,34 @@ pub enum Error {
     /// A `.d750` file was malformed.
     #[error(transparent)]
     File(#[from] FileError),
+    /// A stored repeater or hotspot list failed its domain, or an edit of one
+    /// was refused.
+    #[error(transparent)]
+    RepeaterList(#[from] crate::memory::repeater_list::RepeaterListError),
     /// A transport write or reply-reading step exceeded its configured deadline.
     ///
     /// `operation` names the timed-out step. After it, whether the radio
     /// received any bytes or applied a requested change is unknown.
-    #[error("{operation} timed out after {millis} ms")]
+    #[error("{operation} timed out after {timeout:?}")]
     Timeout {
         /// What was waited for.
         operation: &'static str,
-        /// The timeout that elapsed.
-        millis: u64,
+        /// The deadline that elapsed.
+        timeout: std::time::Duration,
+    },
+    /// `FQ` tuned a frequency other than the requested one; the band's VFO now
+    /// reports `tuned`.
+    ///
+    /// The radio answers a frequency outside the band's receive ranges by
+    /// tuning a nearby in-range frequency and echoing it, never with `N`.
+    #[error("band {band} tuned {tuned}, not the requested {requested}")]
+    FrequencyAdjusted {
+        /// Band that was tuned.
+        band: crate::types::Band,
+        /// Frequency the caller requested.
+        requested: crate::types::Frequency,
+        /// Frequency the radio echoed and tuned.
+        tuned: crate::types::Frequency,
     },
     /// `UP` and `DW` act on the control band, and the requested band is not it.
     #[error("band {band} is not the control band (band {control}); select it with BC first")]
@@ -42,6 +60,22 @@ pub enum Error {
         band: crate::types::Band,
         /// Band the radio reports as its control band.
         control: crate::types::Band,
+    },
+    /// An operation that requires DV Gateway Off read another `GW` state; no
+    /// programming entry or write followed.
+    #[error("DV Gateway is {observed}, not Off")]
+    GatewayNotOff {
+        /// The state `GW` reported.
+        observed: crate::types::DvGatewayMode,
+    },
+    /// The radio identified as other than the identity a plan was prepared
+    /// from; no programming entry or write followed.
+    #[error("the radio reports {actual}, not {expected}, the identity the plan was prepared from")]
+    IdentityMismatch {
+        /// The identity the plan was prepared from.
+        expected: crate::radio::Identity,
+        /// The identity the radio reported.
+        actual: crate::radio::Identity,
     },
     /// The radio acknowledged `UP` or `DW` but kept reporting the same frequency.
     #[error("band {band} still reports {frequency} after an acknowledged {step} step")]
@@ -53,38 +87,27 @@ pub enum Error {
         /// The step command mnemonic, `UP` or `DW`.
         step: &'static str,
     },
-    /// The connected radio does not match the schema-target gate.
-    #[error(
-        "MCP-D750 schema patches support only {expected_model} firmware {expected_firmware} \
-         (accepted exact FV identities: {accepted:?}); connected target is model \
-         {actual_model} firmware {actual_firmware}"
-    )]
-    UnsupportedSchemaTarget {
-        /// Model the registry was generated for.
-        expected_model: &'static str,
-        /// Declared firmware provenance label of the generated registry.
-        expected_firmware: &'static str,
-        /// Exact `FV` strings accepted by the schema-target gate.
-        accepted: &'static [&'static str],
-        /// Model the radio reported.
-        actual_model: String,
-        /// Firmware the radio reported.
-        actual_firmware: String,
+    /// The radio did not acknowledge the `RX` that
+    /// [`crate::radio::Radio::transmit_until`] sent after a `TX` that may
+    /// have keyed the transmitter, so the transmitter may still be keyed;
+    /// [`crate::radio::Radio::receive`] sends `RX` again.
+    #[error("the transmitter may still be keyed: {release}")]
+    ReleaseUnconfirmed {
+        /// Why the `TX` exchange failed after the command may have reached
+        /// the radio, or `None` when the radio acknowledged it.
+        transmit: Option<Box<Self>>,
+        /// Why the `RX` exchange failed.
+        release: Box<Self>,
     },
-    /// The connected radio is outside the CAT operating-mode write gate.
+    /// The radio's identity is not one of [`crate::radio::WRITE_TARGETS`];
+    /// nothing was sent.
     #[error(
-        "CAT mode writes support only firmware {expected_firmware} with TY {expected_radio_type}; \
-         connected target reports firmware {actual_firmware} with TY {actual_radio_type}"
+        "writes support only {targets}; the radio reports {actual}",
+        targets = crate::radio::write_targets_list()
     )]
-    UnsupportedCatWriteTarget {
-        /// The only `FV` identity the gate accepts.
-        expected_firmware: &'static str,
-        /// The only `TY` payload the gate accepts.
-        expected_radio_type: &'static str,
-        /// Connected radio's `FV` identity.
-        actual_firmware: String,
-        /// Connected radio's `TY` payload.
-        actual_radio_type: String,
+    UnsupportedWriteTarget {
+        /// The identity the radio reported.
+        actual: crate::radio::Identity,
     },
 }
 
@@ -270,6 +293,12 @@ pub enum ValidationError {
         /// The first length that holds every table.
         required: usize,
     },
+    /// A channel name plan names one physical channel more than once.
+    #[error("physical channel {index} is named more than once")]
+    DuplicateChannelName {
+        /// The physical channel index.
+        index: u16,
+    },
 }
 
 /// Bytes from the radio that did not follow the protocol.
@@ -321,6 +350,27 @@ pub enum ProtocolError {
         expected: &'static str,
         /// What arrived.
         actual: String,
+    },
+    /// A setter's echo carried a value other than the requested one; the
+    /// radio may hold the echoed value. No readback was sent.
+    #[error("{command} write echoed {echoed}, requested {requested}")]
+    EchoMismatch {
+        /// Command mnemonic.
+        command: &'static str,
+        /// The requested value.
+        requested: String,
+        /// The value the echo carried.
+        echoed: String,
+    },
+    /// A setter's echo matched but the readback reports another value.
+    #[error("{command} read back {observed}, requested {requested}")]
+    ReadbackMismatch {
+        /// Command mnemonic.
+        command: &'static str,
+        /// The requested value.
+        requested: String,
+        /// The value the readback reported.
+        observed: String,
     },
     /// The radio answered `?`: the command or its argument was rejected.
     #[error("{command} was rejected with ?")]
@@ -404,26 +454,6 @@ pub enum McpError {
         "MCP exit was acknowledged; close this connection and prove identity on a fresh connection"
     )]
     ConnectionRetired,
-    /// A journaled page does not have exactly one intended patch.
-    #[error(
-        "recovery page at {address} (len {len}) requires exactly one intended patch; found {count}"
-    )]
-    RecoveryIntentCount {
-        /// Journaled page address.
-        address: u32,
-        /// Journaled page length.
-        len: usize,
-        /// Matching intended patches; zero means no intended value is known.
-        count: usize,
-    },
-    /// A recovery journal repeats the same page.
-    #[error("recovery journal repeats page at {address} (len {len})")]
-    DuplicateRecoveryPage {
-        /// Repeated page address.
-        address: u32,
-        /// Repeated page length.
-        len: usize,
-    },
     /// A page lies outside the writable regions.
     #[error("page at {address} (len {len}) lies outside the writable regions")]
     PageNotWritable {

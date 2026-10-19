@@ -7,7 +7,7 @@ use super::super::{
     TextFieldUpdateEvent, TextFieldUpdateSession as Session, TextFieldUpdateStatus,
 };
 use super::*;
-use crate::memory::{MenuOption, StorageTransform, is_supported_schema_target};
+use crate::memory::{MenuOption, StorageTransform};
 use crate::types::{FirmwareIdentity, RadioModel, RadioType};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -321,8 +321,8 @@ fn preparation_changes_only_my1_and_never_relaxes_the_generic_firmware_gate() ->
         "fresh original-page comparison is the first required session"
     );
     assert!(
-        !is_supported_schema_target(fixture.identity.model, &fixture.identity.firmware),
-        "bounded MY1 support is not generic firmware admission"
+        fixture.identity.is_write_target(),
+        "an update is prepared only for a write target"
     );
     Ok(())
 }

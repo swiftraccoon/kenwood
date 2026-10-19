@@ -13,9 +13,10 @@ use tracing as _;
 
 use std::collections::BTreeMap;
 
+use kenwood_tmd750::MenuAssignment;
 use kenwood_tmd750::memory::{
-    Endian, FieldCodec, MCP_D750_MENU_FIELDS, MCP_D750_SCHEMA_VERSION, MCP_D750_SLOT_COUNT,
-    MCP_D750_SOURCE_SHA256, MenuField, StringEncoding,
+    Endian, FieldCodec, MCP_D750_MENU_FIELDS, MCP_D750_PROGRAM_VERSION, MCP_D750_SCHEMA_VERSION,
+    MCP_D750_SLOT_COUNT, MCP_D750_SOURCE_SHA256, MenuField, MenuFieldId, StringEncoding,
 };
 use kenwood_tmd750::types::{IMAGE_LENGTH, SlotIndex};
 use mcp_d75_extract::{
@@ -366,6 +367,10 @@ fn every_manifest_field_matches_its_registry_entry() -> TestResult {
         "registry schema version must match the manifest"
     );
     assert_eq!(
+        MCP_D750_PROGRAM_VERSION, manifest.release.mcp_version,
+        "the registry's program version must match the manifest release"
+    );
+    assert_eq!(
         MCP_D750_SOURCE_SHA256, manifest.source.normalized_source_sha256,
         "registry provenance must match the reviewed source manifest"
     );
@@ -400,5 +405,31 @@ fn every_manifest_field_matches_its_registry_entry() -> TestResult {
             .ok_or_else(|| format!("{name} missing from the registry"))?;
         assert_field(name, field, want)?;
     }
+    Ok(())
+}
+
+#[test]
+fn every_field_id_names_its_own_registry_entry_in_order() -> TestResult {
+    assert_eq!(MenuFieldId::ALL.len(), MCP_D750_MENU_FIELDS.len());
+    for (id, field) in MenuFieldId::ALL.into_iter().zip(MCP_D750_MENU_FIELDS) {
+        assert!(
+            std::ptr::eq(id.field(), field),
+            "{} is not its registry entry",
+            id.name()
+        );
+        assert_eq!(MenuFieldId::from_name(field.descriptor.name), Some(id));
+    }
+    assert_eq!(MenuFieldId::RADIO_BEEP.name(), "radio.Beep");
+    assert_eq!(
+        MenuFieldId::from_name("radio.beep"),
+        None,
+        "keys match exactly"
+    );
+    let assignment =
+        MenuAssignment::for_field(MenuFieldId::RADIO_BEEP, Some(SlotIndex::new(0)?), "off")?;
+    assert_eq!(
+        assignment,
+        MenuAssignment::new("radio.Beep", Some(SlotIndex::new(0)?), "off")?
+    );
     Ok(())
 }

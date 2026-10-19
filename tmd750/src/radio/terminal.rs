@@ -18,7 +18,7 @@ use crate::error::{Error, SchemaError};
 use crate::memory::{
     DecodedFieldValue, FieldValue, PatchPlanner, TerminalGatewayRoute, menu_field,
 };
-use crate::types::{Address, DvGatewayMode, Page, RadioModel, SlotIndex};
+use crate::types::{Address, DvGatewayMode, Page, SlotIndex};
 
 const PM_FIELD: &str = "pm.PmSelect";
 const USB_FIELD: &str = "radio.UsbFunction";
@@ -46,9 +46,9 @@ impl TerminalTarget {
 
 /// Complete-page Terminal changes bound to an exact identity and captured guards.
 ///
-/// Admission requires TM-D750 firmware 1.02, type K,2,1, format zero, valid active
-/// PM, COM+AF USB function, a known Gateway route, and Gateway Off or Reflector
-/// Terminal. Every control/routing/target page remains an immutable full-page
+/// Admission requires an identity in [`super::WRITE_TARGETS`], format zero, a
+/// valid active PM, COM+AF USB function, a known Gateway route, and Gateway Off
+/// or Reflector Terminal. Every control/routing/target page remains an immutable full-page
 /// comparison, including no-ops. The route-preserving constructor changes only
 /// Gateway and subtype; explicit route selection may additionally change only
 /// the active PM's Gateway route. MY/RPT fields, PM selection, USB function, and
@@ -103,10 +103,7 @@ impl TerminalPlan {
         target: TerminalTarget,
         route: RouteRequest,
     ) -> Result<Self, TerminalPlanError> {
-        if identity.model != RadioModel::TmD750
-            || identity.firmware.as_str() != "1.02"
-            || identity.radio_type.as_str() != "K,2,1"
-        {
+        if !identity.is_write_target() {
             return Err(TerminalPlanError::UnsupportedIdentity {
                 actual: identity.clone(),
             });

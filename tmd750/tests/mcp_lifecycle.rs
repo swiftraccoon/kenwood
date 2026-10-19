@@ -16,7 +16,7 @@ use kenwood_tmd750::protocol::mcp::{
     ACK, BytePatch, ENTER, EXIT, HeaderCommand, PagePatch, read_request, write_request,
 };
 use kenwood_tmd750::radio::Radio;
-use kenwood_tmd750::{Address, Error, McpError, Page, ProtocolError, Region};
+use kenwood_tmd750::{Address, Error, McpError, Page, PageReplacement, ProtocolError, Region};
 use kenwood_transport::{MockTransport, Transport, TransportError};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -61,6 +61,14 @@ fn ready_mock(firmware: &str) -> MockTransport {
 
 fn patch(page: Page) -> Result<PagePatch, Box<dyn std::error::Error>> {
     Ok(PagePatch::new(page, vec![BytePatch::new(2, 0xFF, 0x42)?])?)
+}
+
+/// A zero-filled page whose byte 2 becomes `0x42`, with the intended bytes.
+fn replacement(page: Page) -> Result<(PageReplacement, Vec<u8>), Box<dyn std::error::Error>> {
+    let original = vec![0; page.len()];
+    let mut intended = original.clone();
+    patch(page)?.apply(&mut intended)?;
+    Ok((PageReplacement::new(page, &original, &intended)?, intended))
 }
 
 fn data_reply(page: Page, data: &[u8]) -> Vec<u8> {
@@ -205,21 +213,20 @@ async fn cancelling_wire_writes_poison_entry_read_and_exit() -> TestResult {
 }
 
 #[tokio::test]
-async fn mismatched_schema_refuses_all_page_traffic_and_leaves_empty_journal() -> TestResult {
+async fn another_firmware_refuses_all_page_traffic_and_leaves_empty_journal() -> TestResult {
     let page = Page::new(Address::new(8)?, 40)?;
-    let mut mock = ready_mock("1.02");
+    let (replacement, _) = replacement(page)?;
+    let mut mock = ready_mock("1.03");
     mock.expect(&[EXIT], &[ACK]);
     let mut radio = Radio::new(mock);
     let mut session = radio.enter_mcp().await?;
     let mut progress = Vec::new();
     let result = session
-        .write_pages_verified(&[patch(page)?], |value| progress.push(value))
+        .compare_exchange_pages(&[replacement], |_| Ok(()), |value| progress.push(value))
         .await;
     assert!(
-        matches!(result, Err(Error::UnsupportedSchemaTarget {
-        expected_model: "TM-D750", expected_firmware: "1.00", ref actual_model,
-        ref actual_firmware, accepted: &["1.00"],
-    }) if actual_model == "TM-D750" && actual_firmware == "1.02"),
+        matches!(result, Err(Error::UnsupportedWriteTarget { ref actual })
+            if actual.firmware.as_str() == "1.03"),
         "{result:?}"
     );
     assert!(session.journal().possibly_written.is_empty());
@@ -341,16 +348,14 @@ async fn read_request_echo_is_not_a_data_response() -> TestResult {
 #[tokio::test]
 async fn cancelled_memory_write_retains_journal_and_refuses_exit() -> TestResult {
     let page = Page::new(Address::new(8)?, 40)?;
-    let patch = patch(page)?;
-    let mut intended = vec![0; page.len()];
-    patch.apply(&mut intended)?;
-    let mut mock = ready_mock("1.00");
+    let (replacement, intended) = replacement(page)?;
+    let mut mock = ready_mock("1.02");
     mock.expect(&read_request(page), &data_reply(page, &[0; 40]));
     mock.expect(&[ACK], &[ACK]);
     mock.expect_hang(&data_reply(page, &intended));
     let mut radio = Radio::new(mock);
     let mut session = radio.enter_mcp().await?;
-    cancel_pending(session.write_pages_verified(&[patch], |_| {})).await;
+    cancel_pending(session.compare_exchange_pages(&[replacement], |_| Ok(()), |_| {})).await;
     assert_eq!(session.journal().possibly_written, [page]);
     assert!(session.journal().verified.is_empty());
     assert!(!session.is_ready());
@@ -369,10 +374,8 @@ async fn cancelled_memory_write_retains_journal_and_refuses_exit() -> TestResult
 #[tokio::test]
 async fn complete_verify_mismatch_still_permits_safe_exit() -> TestResult {
     let page = Page::new(Address::new(8)?, 40)?;
-    let patch = patch(page)?;
-    let mut intended = vec![0; page.len()];
-    patch.apply(&mut intended)?;
-    let mut mock = ready_mock("1.00");
+    let (replacement, intended) = replacement(page)?;
+    let mut mock = ready_mock("1.02");
     mock.expect(&read_request(page), &data_reply(page, &[0; 40]));
     mock.expect(&[ACK], &[ACK]);
     mock.expect(&data_reply(page, &intended), &[ACK]);
@@ -381,7 +384,9 @@ async fn complete_verify_mismatch_still_permits_safe_exit() -> TestResult {
     mock.expect(&[EXIT], &[ACK]);
     let mut radio = Radio::new(mock);
     let mut session = radio.enter_mcp().await?;
-    let result = session.write_pages_verified(&[patch], |_| {}).await;
+    let result = session
+        .compare_exchange_pages(&[replacement], |_| Ok(()), |_| {})
+        .await;
     assert!(
         matches!(result, Err(Error::Mcp(McpError::Interrupted { ref source, .. }))
         if matches!(**source, Error::Mcp(McpError::VerifyMismatch { offset: 2, .. }))),

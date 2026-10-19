@@ -5,7 +5,7 @@ use super::super::{
     TextFieldUpdateStatus,
 };
 use super::*;
-use crate::memory::{FieldDescriptor, SLOT_TERM, StorageTransform, is_supported_schema_target};
+use crate::memory::{FieldDescriptor, SLOT_TERM, StorageTransform};
 use crate::types::{FirmwareIdentity, RadioModel, RadioType};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -159,8 +159,8 @@ fn preparation_preserves_all_unrelated_bytes_and_keeps_generic_gate_closed() -> 
     assert_eq!(fixture.update.status(), TextFieldUpdateStatus::NotWritten);
     assert_eq!(fixture.update.next_session()?, Session::Apply);
     assert!(
-        !is_supported_schema_target(fixture.identity.model, &fixture.identity.firmware),
-        "the field-specific update must not relax the generic schema gate"
+        fixture.identity.is_write_target(),
+        "an update is prepared only for a write target"
     );
     Ok(())
 }

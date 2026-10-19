@@ -6,35 +6,9 @@ use crate::memory::FieldValue;
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 #[test]
-fn exact_firmware_gate_and_explicit_unqualified_provenance_are_distinct() -> TestResult {
+fn a_ready_capture_reads_with_no_findings() -> TestResult {
     let slot = SlotIndex::new(0)?;
-    let image = fixture(slot)?;
-    for identity in ["1.02", "1.0", "V1.00"] {
-        let firmware = FirmwareIdentity::new(identity)?;
-        assert!(matches!(
-            ReflectorTerminalPreflight::read(&image, &firmware, slot, TerminalUsbRoute::MainUnit),
-            Err(TerminalPreflightError::UnsupportedFirmware { actual }) if actual == firmware
-        ));
-    }
-    for identity in ["1.00", "1.02"] {
-        let firmware = FirmwareIdentity::new(identity)?;
-        let report = ReflectorTerminalPreflight::interpret_unqualified(
-            &image,
-            &firmware,
-            slot,
-            TerminalUsbRoute::MainUnit,
-        )?;
-        assert_eq!(report.firmware, firmware);
-        assert_eq!(
-            report.qualification,
-            TextLayoutQualification::UnqualifiedInterpretation
-        );
-    }
-    let report = read(&image, slot)?;
-    assert_eq!(
-        report.qualification,
-        TextLayoutQualification::RegistryTargetMatched
-    );
+    let report = read(&fixture(slot)?, slot)?;
     assert!(report.findings.is_empty());
     Ok(())
 }
@@ -236,12 +210,7 @@ fn route_and_mode_findings_report_captured_differences_without_changing_them() -
         ]
     );
     raw_byte(&mut image, Field::GatewayRoute.descriptor()?, slot, 1)?;
-    let report = ReflectorTerminalPreflight::read(
-        &image,
-        &FirmwareIdentity::new("1.00")?,
-        slot,
-        TerminalUsbRoute::ControlPanel,
-    )?;
+    let report = ReflectorTerminalPreflight::read(&image, slot, TerminalUsbRoute::ControlPanel)?;
     assert!(!report.findings.contains(&TerminalFinding::RouteMismatch));
     Ok(())
 }
@@ -302,9 +271,5 @@ fn read(
     image: &MemoryImage,
     slot: SlotIndex,
 ) -> Result<ReflectorTerminalPreflight, TerminalPreflightError> {
-    let firmware =
-        FirmwareIdentity::new("1.00").map_err(|_| TerminalPreflightError::RegistryField {
-            field: "test firmware",
-        })?;
-    ReflectorTerminalPreflight::read(image, &firmware, slot, TerminalUsbRoute::MainUnit)
+    ReflectorTerminalPreflight::read(image, slot, TerminalUsbRoute::MainUnit)
 }

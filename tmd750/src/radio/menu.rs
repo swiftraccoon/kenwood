@@ -10,7 +10,6 @@ mod update;
 pub use update::{MenuAssignment, MenuUpdateError, MenuUpdatePlan};
 
 use std::collections::BTreeMap;
-use std::io;
 
 use crate::error::{Error, McpError, SchemaError};
 use crate::memory::{DecodedFieldValue, MenuField, PatchSet};
@@ -19,7 +18,7 @@ use crate::types::{Address, IMAGE_LENGTH, PAGE_SIZE_U32, Page, SlotIndex};
 use kenwood_transport::Transport;
 
 use super::Progress;
-use super::programming::{McpCompareExchangeReport, McpSession, PageReplacement};
+use super::programming::{McpSession, PageReplacement};
 
 /// One menu field with an explicit, validated global or PM-slot scope.
 ///
@@ -254,32 +253,6 @@ impl<T: Transport> McpSession<'_, T> {
             });
         }
         Ok(MenuFieldSnapshot::from_pages(captured)?)
-    }
-
-    /// Apply a batch of menu changes only while all source pages still match.
-    ///
-    /// Composes snapshot planning with [`Self::compare_exchange_pages`]. Every
-    /// expected page is freshly compared before the first write. The fallible
-    /// callback must write and synchronize a journal record of each complete
-    /// before/after image before W. No-op pages are compared but never written.
-    /// This is not a firmware-atomic transaction; partial write risk remains in
-    /// the session journal.
-    ///
-    /// # Errors
-    ///
-    /// Returns incomplete snapshot coverage, schema-target, stale-page,
-    /// [`McpError::IntentJournal`], or MCP exchange/readback errors. No
-    /// automatic rollback, retry, exit, or reconnection occurs.
-    pub async fn compare_exchange_menu_patches(
-        &mut self,
-        patches: &PatchSet,
-        snapshot: &MenuFieldSnapshot,
-        before_write: impl FnMut(&PageReplacement) -> io::Result<()>,
-        progress: impl FnMut(Progress),
-    ) -> Result<McpCompareExchangeReport, Error> {
-        let replacements = snapshot.plan_exchanges(patches)?;
-        self.compare_exchange_pages(&replacements, before_write, progress)
-            .await
     }
 }
 

@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use kenwood_tmd750::protocol::mcp::{ACK, read_request, write_request};
 use kenwood_tmd750::{
-    Error, McpBackupOutcome, McpBackupReport, McpBackupStage, McpError, McpProbeExit, Page,
-    Progress, Radio, Region, ValidationError,
+    DvGatewayMode, Error, McpBackupOutcome, McpBackupReport, McpBackupStage, McpError,
+    McpProbeExit, Page, Progress, Radio, Region, ValidationError,
 };
 use kenwood_transport::{MockTransport, Transport, TransportError};
 
@@ -268,6 +268,32 @@ async fn guarded_backup_requires_gateway_off_without_a_second_identity() -> Test
 }
 
 #[tokio::test]
+async fn an_active_gateway_fails_the_guarded_backup_with_the_observed_state() -> TestResult {
+    let mut mock = MockTransport::new();
+    identity(&mut mock);
+    mock.expect(b"GW\r", b"GW 2\r");
+    let mut radio = Radio::new(mock);
+    let report = radio
+        .backup_mcp_gateway_off_until_exit(|| false, |_| {})
+        .await;
+    assert!(
+        matches!(
+            report.outcome,
+            McpBackupOutcome::Failed {
+                stage: McpBackupStage::Gateway,
+                error: Error::GatewayNotOff {
+                    observed: DvGatewayMode::Terminal
+                },
+            }
+        ),
+        "{:?}",
+        report.outcome
+    );
+    radio.into_transport().assert_complete();
+    Ok(())
+}
+
+#[tokio::test]
 async fn guarded_backup_reads_the_same_standard_pages_and_detaches_after_exit() -> TestResult {
     let pages = expected_pages()?;
     let mut mock = MockTransport::new();
@@ -283,10 +309,7 @@ async fn guarded_backup_reads_the_same_standard_pages_and_detaches_after_exit() 
         .backup_mcp_gateway_off_until_exit(|| false, |_| {})
         .await;
     assert!(report.has_complete_configuration());
-    assert_eq!(
-        report.gateway_mode,
-        Some(kenwood_tmd750::DvGatewayMode::Off)
-    );
+    assert_eq!(report.gateway_mode, Some(DvGatewayMode::Off));
     assert_data(&report, &pages);
     assert_protocol_is_blocked(&mut radio).await;
     let transport = radio.into_transport();

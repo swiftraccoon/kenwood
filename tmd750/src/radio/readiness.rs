@@ -77,11 +77,17 @@ pub const SETTLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// Window for [`await_settled`], measured from its first enumeration.
 pub const SETTLE_BUDGET: Duration = Duration::from_secs(60);
 
-/// The step of the Terminal lifecycle that the next control-endpoint open
-/// serves, announced through [`ControlHost::stage`].
+/// The step of the Terminal lifecycle or of a [`super::session`] run that the
+/// next control-endpoint open serves, announced through
+/// [`ControlHost::stage`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ControlStage {
+    /// A [`super::session`] programming session: the settle wait and its one
+    /// open.
+    Programming,
+    /// Identity readiness after a [`super::session`] programming session.
+    ReadinessAfterProgramming,
     /// Identity and Gateway observation before any change.
     Preflight,
     /// Terminal programming over the control endpoint while Gateway is active.
@@ -540,24 +546,42 @@ impl SettleReport {
 /// for [`SETTLE_QUIET`], before a programming session opens on it.
 ///
 /// Returns [`SettleOutcome::NotRequired`] at once for any endpoint whose
-/// [`SerialCandidate::usb_role`] is not [`UsbRole::OperationPanel`].
-/// Otherwise enumerates every [`SETTLE_POLL_INTERVAL`] within
-/// [`SETTLE_BUDGET`]; an enumeration without the endpoint restarts the quiet
-/// period, and one that [`select_pinned`] rejects ends the wait. Opens
-/// nothing. Cancellation is checked before each enumeration.
+/// [`SerialCandidate::usb_role`] is not [`UsbRole::OperationPanel`], and
+/// otherwise runs [`await_continuous_enumeration`].
 pub async fn await_settled<C: ControlHost>(
+    host: &mut C,
+    endpoint: &SerialCandidate,
+    cancelled: &AtomicBool,
+) -> SettleReport {
+    if endpoint.usb_role() == Some(UsbRole::OperationPanel) {
+        await_continuous_enumeration(host, endpoint, cancelled).await
+    } else {
+        SettleReport {
+            enumerations: Vec::new(),
+            outcome: SettleOutcome::NotRequired,
+            elapsed: Duration::ZERO,
+        }
+    }
+}
+
+/// Wait until `endpoint` has been enumerated continuously for
+/// [`SETTLE_QUIET`], whatever its USB role.
+///
+/// Enumerates every [`SETTLE_POLL_INTERVAL`] within [`SETTLE_BUDGET`]; an
+/// enumeration without the endpoint restarts the quiet period, and one that
+/// [`select_pinned`] rejects ends the wait. Opens nothing. Cancellation is
+/// checked before each enumeration. Never returns
+/// [`SettleOutcome::NotRequired`].
+pub async fn await_continuous_enumeration<C: ControlHost>(
     host: &mut C,
     endpoint: &SerialCandidate,
     cancelled: &AtomicBool,
 ) -> SettleReport {
     let mut report = SettleReport {
         enumerations: Vec::new(),
-        outcome: SettleOutcome::NotRequired,
+        outcome: SettleOutcome::Cancelled,
         elapsed: Duration::ZERO,
     };
-    if endpoint.usb_role() != Some(UsbRole::OperationPanel) {
-        return report;
-    }
     let started = host.now();
     let mut present_since = None;
     report.outcome = loop {

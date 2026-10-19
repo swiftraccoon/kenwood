@@ -8,13 +8,10 @@ use thiserror as _;
 use tokio_serial as _;
 use tracing as _;
 
-use kenwood_tmd750::protocol::mcp::{
-    ACK, BytePatch, ENTER, EXIT, PagePatch, read_request, write_request,
-};
+use kenwood_tmd750::protocol::mcp::{ACK, ENTER, EXIT, read_request, write_request};
 use kenwood_tmd750::radio::Radio;
 use kenwood_tmd750::{
-    Address, Band, DvGatewayMode, Error, McpError, OperatingMode, Page, ProtocolError, Region,
-    SelectableMode,
+    Address, Band, DvGatewayMode, Error, OperatingMode, Page, ProtocolError, Region, SelectableMode,
 };
 use kenwood_transport::MockTransport;
 
@@ -104,7 +101,11 @@ async fn mode_selection_refuses_a_mismatched_readback() -> TestResult {
     assert!(
         matches!(
             result,
-            Err(Error::Protocol(ProtocolError::UnexpectedResponse { .. }))
+            Err(Error::Protocol(ProtocolError::ReadbackMismatch {
+                command: "MD",
+                ref requested,
+                ref observed,
+            })) if requested == "DV" && observed == "FM"
         ),
         "{result:?}"
     );
@@ -119,7 +120,10 @@ async fn mode_selection_refuses_an_unqualified_target_before_writing() -> TestRe
     let mut radio = Radio::new(mock);
     let result = radio.set_operating_mode(Band::A, SelectableMode::Dv).await;
     assert!(
-        matches!(result, Err(Error::UnsupportedCatWriteTarget { .. })),
+        matches!(
+            result,
+            Err(Error::UnsupportedWriteTarget { ref actual }) if !actual.is_write_target()
+        ),
         "{result:?}"
     );
     radio.into_transport().assert_complete();
@@ -137,11 +141,8 @@ async fn mode_selection_refuses_an_unqualified_radio_type_before_writing() -> Te
     assert!(
         matches!(
             result,
-            Err(Error::UnsupportedCatWriteTarget {
-                ref actual_firmware,
-                ref actual_radio_type,
-                ..
-            }) if actual_firmware == "1.02" && actual_radio_type == "K,2,2"
+            Err(Error::UnsupportedWriteTarget { ref actual })
+                if actual.firmware.as_str() == "1.02" && actual.radio_type.as_str() == "K,2,2"
         ),
         "{result:?}"
     );
@@ -159,10 +160,34 @@ async fn mode_selection_refuses_a_mismatched_write_echo_before_readback() -> Tes
     assert!(
         matches!(
             result,
-            Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "write echo equal to the request",
-                ..
-            }))
+            Err(Error::Protocol(ProtocolError::EchoMismatch {
+                command: "MD",
+                ref requested,
+                ref echoed,
+            })) if requested == "DV" && echoed == "FM"
+        ),
+        "{result:?}"
+    );
+    radio.into_transport().assert_complete();
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_out_of_range_frequency_reports_where_the_radio_tuned() -> TestResult {
+    use kenwood_tmd750::types::Frequency;
+
+    let mut mock = MockTransport::new();
+    scripted_live_identity(&mut mock);
+    mock.expect(b"FQ 0,0300000000\r", b"FQ 0,0410000000\r");
+    let mut radio = Radio::new(mock);
+    let requested = Frequency::new(300_000_000)?;
+    let expected_tuned = Frequency::new(410_000_000)?;
+    let result = radio.set_frequency(Band::A, requested).await;
+    assert!(
+        matches!(
+            result,
+            Err(Error::FrequencyAdjusted { band: Band::A, requested: asked, tuned })
+                if asked == requested && tuned == expected_tuned
         ),
         "{result:?}"
     );
@@ -322,7 +347,10 @@ async fn dstar_callsign_write_refuses_a_mismatched_echo() -> TestResult {
     assert!(
         matches!(
             result,
-            Err(Error::Protocol(ProtocolError::UnexpectedResponse { .. }))
+            Err(Error::Protocol(ProtocolError::EchoMismatch {
+                command: "DC",
+                ..
+            }))
         ),
         "{result:?}"
     );
@@ -367,7 +395,11 @@ async fn aprs_callsign_write_refuses_a_mismatched_echo() -> TestResult {
     assert!(
         matches!(
             result,
-            Err(Error::Protocol(ProtocolError::UnexpectedResponse { .. }))
+            Err(Error::Protocol(ProtocolError::EchoMismatch {
+                command: "CS",
+                ref requested,
+                ref echoed,
+            })) if requested == "KQ4NIT-9" && echoed == "KQ4NIT"
         ),
         "{result:?}"
     );
@@ -493,9 +525,71 @@ async fn memory_channel_writes_verify_the_echo_and_the_readback() -> TestResult 
     assert!(
         matches!(
             differing,
-            Err(Error::Protocol(ProtocolError::UnexpectedResponse { .. }))
+            Err(Error::Protocol(ProtocolError::ReadbackMismatch {
+                command: "ME",
+                ref observed,
+                ..
+            })) if observed.starts_with("0145200000,")
         ),
         "a readback that differs in another field is refused: {differing:?}"
+    );
+    radio.into_transport().assert_complete();
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_vfo_record_write_reports_echo_and_readback_differences_as_wire_fields() -> TestResult {
+    use kenwood_tmd750::types::Frequency;
+
+    const BEFORE: &str = "0223020000,0001600000,8,8,0,0,0,0,0,0,0,08,08,000,0,CQCQCQ,0,00";
+    let after = BEFORE.replacen("0223020000", "0223040000", 1);
+    let mut mock = MockTransport::new();
+    mock.expect(b"FO 1\r", format!("FO 1,{BEFORE}\r").as_bytes());
+    scripted_live_identity(&mut mock);
+    mock.expect(
+        format!("FO 1,{after}\r").as_bytes(),
+        format!("FO 1,{after}\r").as_bytes(),
+    );
+    mock.expect(b"FO 1\r", format!("FO 1,{after}\r").as_bytes());
+    mock.expect(
+        format!("FO 1,{BEFORE}\r").as_bytes(),
+        format!("FO 1,{after}\r").as_bytes(),
+    );
+    mock.expect(
+        format!("FO 1,{after}\r").as_bytes(),
+        format!("FO 1,{after}\r").as_bytes(),
+    );
+    mock.expect(b"FO 1\r", format!("FO 1,{BEFORE}\r").as_bytes());
+    let mut radio = Radio::new(mock);
+
+    let original = radio.get_channel_record(Band::B).await?;
+    let mut moved = original.clone();
+    moved.receive_frequency = Frequency::new(223_040_000)?;
+    radio.set_channel_record(Band::B, &moved).await?;
+
+    let echoed = radio.set_channel_record(Band::B, &original).await;
+    assert!(
+        matches!(
+            echoed,
+            Err(Error::Protocol(ProtocolError::EchoMismatch {
+                command: "FO",
+                ref requested,
+                ref echoed,
+            })) if requested == BEFORE && *echoed == after
+        ),
+        "{echoed:?}"
+    );
+    let read_back = radio.set_channel_record(Band::B, &moved).await;
+    assert!(
+        matches!(
+            read_back,
+            Err(Error::Protocol(ProtocolError::ReadbackMismatch {
+                command: "FO",
+                ref requested,
+                ref observed,
+            })) if *requested == after && observed == BEFORE
+        ),
+        "{read_back:?}"
     );
     radio.into_transport().assert_complete();
     Ok(())
@@ -505,11 +599,11 @@ async fn memory_channel_writes_verify_the_echo_and_the_readback() -> TestResult 
 async fn typed_reads_cover_the_remaining_state() -> TestResult {
     use kenwood_tmd750::types::{
         BeaconMethod, CurrentMemorySelector, DstarSlot, MemoryChannelAddress, PacketDataRate,
-        TncMode, TuningMode, VoxMode,
+        TncMode, TncState, TuningMode, VoxMode,
     };
 
     let mut mock = MockTransport::new();
-    mock.expect(b"AE\r", b"AE C6210439,K01\r");
+    mock.expect(b"AE\r", b"AE A1234567,K01\r");
     mock.expect(b"PS\r", b"PS 1\r");
     mock.expect(b"RT\r", b"RT 260921003607\r");
     mock.expect(
@@ -530,7 +624,7 @@ async fn typed_reads_cover_the_remaining_state() -> TestResult {
     let mut radio = Radio::new(mock);
     assert_eq!(
         radio.get_serial_information().await?.serial_number(),
-        "C6210439"
+        "A1234567"
     );
     assert!(radio.get_power_status().await?);
     assert_eq!(
@@ -566,7 +660,13 @@ async fn typed_reads_cover_the_remaining_state() -> TestResult {
     assert_eq!(radio.get_dstar_slot().await?, DstarSlot::new(1)?);
     assert_eq!(radio.get_packet_data_rate().await?, PacketDataRate::Bps1200);
     assert_eq!(radio.get_beacon_method().await?, BeaconMethod::Auto);
-    assert_eq!(radio.get_tnc_mode().await?, (TncMode::Off, Band::A));
+    assert_eq!(
+        radio.get_tnc_mode().await?,
+        TncState {
+            mode: TncMode::Off,
+            data_band: Band::A
+        }
+    );
     assert_eq!(radio.get_vox().await?, VoxMode::Off);
     assert_eq!(radio.get_smeter(Band::B).await?.as_raw(), 9);
     assert!(radio.get_busy(Band::B).await?);
@@ -653,123 +753,321 @@ async fn echo_mismatch_is_a_protocol_error() -> TestResult {
     Ok(())
 }
 
-fn patch_for(page: Page) -> Result<PagePatch, Box<dyn std::error::Error>> {
-    Ok(PagePatch::new(page, vec![BytePatch::new(2, 0xFF, 0x42)?])?)
-}
-
 #[tokio::test]
-async fn verified_write_reads_patches_writes_and_reads_back() -> TestResult {
-    let page = Page::new(Address::new(8)?, 40)?;
-    let patch = patch_for(page)?;
-    let mut written = vec![0x00; 40];
-    patch.apply(&mut written)?;
-    let mut expected_write = write_request(page).to_vec();
-    expected_write.extend_from_slice(&written);
+async fn transmit_keys_and_receive_unkeys_in_that_order() -> TestResult {
     let mut mock = MockTransport::new();
-    scripted_identity(&mut mock);
-    mock.expect(ENTER, b"0M\r");
-    mock.expect(&read_request(page), &read_reply(page, &[0x00; 40]));
-    mock.expect(&[ACK], &[ACK]);
-    mock.expect(&expected_write, &[ACK]);
-    mock.expect(&read_request(page), &read_reply(page, &written));
-    mock.expect(&[ACK], &[ACK]);
-    mock.expect(&[EXIT], &[ACK]);
+    scripted_live_identity(&mut mock);
+    mock.expect(b"TX\r", b"TX 1\r");
+    mock.expect(b"RX\r", b"RX\r");
     let mut radio = Radio::new(mock);
-    let mut session = radio.enter_mcp().await?;
-    let report = session.write_pages_verified(&[patch], |_| {}).await?;
-    assert_eq!(report.verified_pages, vec![page]);
-    assert!(report.possibly_written_pages.is_empty());
-    session.exit().await?;
+    radio.transmit().await?;
+    radio.receive().await?;
     radio.into_transport().assert_complete();
     Ok(())
 }
 
 #[tokio::test]
-async fn a_read_back_mismatch_keeps_the_page_in_the_journal() -> TestResult {
-    let page = Page::new(Address::new(8)?, 40)?;
-    let patch = patch_for(page)?;
-    let mut written = vec![0x00; 40];
-    patch.apply(&mut written)?;
-    let mut expected_write = write_request(page).to_vec();
-    expected_write.extend_from_slice(&written);
+async fn transmit_refuses_an_unqualified_target_before_keying() -> TestResult {
     let mut mock = MockTransport::new();
     scripted_identity(&mut mock);
-    mock.expect(ENTER, b"0M\r");
-    mock.expect(&read_request(page), &read_reply(page, &[0x00; 40]));
-    mock.expect(&[ACK], &[ACK]);
-    mock.expect(&expected_write, &[ACK]);
-    mock.expect(&read_request(page), &read_reply(page, &[0x00; 40]));
-    mock.expect(&[ACK], &[ACK]);
     let mut radio = Radio::new(mock);
-    let mut session = radio.enter_mcp().await?;
-    let result = session.write_pages_verified(&[patch], |_| {}).await;
-    match result {
-        Err(Error::Mcp(McpError::Interrupted {
-            possibly_written,
-            verified,
-            source,
-            ..
-        })) => {
-            assert_eq!((possibly_written, verified), (1, 0));
-            assert!(
-                matches!(
-                    *source,
-                    Error::Mcp(McpError::VerifyMismatch { offset: 2, .. })
-                ),
-                "{source:?}"
-            );
-        }
-        other => return Err(format!("expected an interrupted write, got {other:?}").into()),
-    }
-    assert_eq!(session.journal().possibly_written, vec![page]);
+    let result = radio.transmit().await;
+    assert!(
+        matches!(result, Err(Error::UnsupportedWriteTarget { .. })),
+        "{result:?}"
+    );
+    radio.into_transport().assert_complete();
     Ok(())
 }
 
 #[tokio::test]
-async fn pages_outside_the_writable_regions_are_refused_before_any_write() -> TestResult {
-    let outside = Page::new(Address::new(400_000)?, 256)?;
+async fn transmit_for_keys_waits_at_least_the_duration_then_unkeys() -> TestResult {
     let mut mock = MockTransport::new();
-    scripted_identity(&mut mock);
-    mock.expect(ENTER, b"0M\r");
+    scripted_live_identity(&mut mock);
+    mock.expect(b"TX\r", b"TX 1\r");
+    mock.expect(b"RX\r", b"RX\r");
     let mut radio = Radio::new(mock);
-    let mut session = radio.enter_mcp().await?;
-    let result = session
-        .write_pages_verified(&[patch_for(outside)?], |_| {})
-        .await;
+    let duration = std::time::Duration::from_millis(30);
+    let started = tokio::time::Instant::now();
+    radio.transmit_for(duration).await?;
+    assert!(
+        started.elapsed() >= duration,
+        "the transmitter stays keyed for the requested duration"
+    );
+    radio.into_transport().assert_complete();
+    Ok(())
+}
+
+#[tokio::test]
+async fn transmit_until_keys_before_awaiting_the_stop_and_then_releases() -> TestResult {
+    let mut mock = MockTransport::new();
+    scripted_live_identity(&mut mock);
+    mock.expect(b"TX\r", b"TX 1\r");
+    mock.expect(b"RX\r", b"RX\r");
+    mock.expect(b"TX\r", b"TX 1\r");
+    mock.expect(b"RX\r", b"RX\r");
+    let mut radio = Radio::new(mock);
+    let hold = std::time::Duration::from_millis(30);
+    let started = tokio::time::Instant::now();
+    radio.transmit_until(tokio::time::sleep(hold)).await?;
+    assert!(
+        started.elapsed() >= hold,
+        "the transmitter stays keyed until the stop future resolves"
+    );
+    radio.transmit_until(std::future::ready(())).await?;
+    radio.into_transport().assert_complete();
+    Ok(())
+}
+
+#[tokio::test]
+async fn transmit_until_returns_a_refused_transmit_without_awaiting_the_stop() -> TestResult {
+    let mut mock = MockTransport::new();
+    scripted_live_identity(&mut mock);
+    mock.expect(b"TX\r", b"N\r");
+    let mut radio = Radio::new(mock);
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        radio.transmit_until(std::future::pending::<()>()),
+    )
+    .await?;
     assert!(
         matches!(
             result,
-            Err(Error::Mcp(McpError::PageNotWritable {
-                address: 400_000,
-                ..
+            Err(Error::Protocol(ProtocolError::NotAvailable {
+                command: "TX"
             }))
         ),
         "{result:?}"
     );
-    assert!(session.journal().possibly_written.is_empty());
+    radio.into_transport().assert_complete();
     Ok(())
 }
 
 #[tokio::test]
-async fn recovery_reports_which_journaled_pages_carry_the_patch() -> TestResult {
-    let page = Page::new(Address::new(8)?, 40)?;
-    let patch = patch_for(page)?;
-    let mut applied = vec![0x00; 40];
-    patch.apply(&mut applied)?;
+async fn a_refused_transmit_is_not_available_and_sends_no_receive() -> TestResult {
     let mut mock = MockTransport::new();
-    scripted_identity(&mut mock);
-    mock.expect(ENTER, b"0M\r");
-    mock.expect(&read_request(page), &read_reply(page, &applied));
-    mock.expect(&[ACK], &[ACK]);
-    mock.expect(&[EXIT], &[ACK]);
+    scripted_live_identity(&mut mock);
+    mock.expect(b"TX\r", b"N\r");
     let mut radio = Radio::new(mock);
-    let journal = kenwood_tmd750::radio::programming::McpJournal {
-        possibly_written: vec![page],
-        verified: Vec::new(),
-    };
-    let report = radio.recover(&journal, &[patch]).await?;
-    assert_eq!(report.applied, vec![page]);
-    assert!(report.pending.is_empty());
+    let result = radio
+        .transmit_for(std::time::Duration::from_millis(1))
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(Error::Protocol(ProtocolError::NotAvailable {
+                command: "TX"
+            }))
+        ),
+        "{result:?}"
+    );
+    radio.into_transport().assert_complete();
+    Ok(())
+}
+
+#[tokio::test]
+async fn tnc_mode_writes_echo_and_read_back() -> TestResult {
+    use kenwood_tmd750::types::{SelectableTncMode, TncMode};
+
+    let mut mock = MockTransport::new();
+    scripted_live_identity(&mut mock);
+    mock.expect(b"TN 2,1\r", b"TN 2,1\r");
+    mock.expect(b"TN\r", b"TN 2,1\r");
+    mock.expect(b"TN 0,0\r", b"TN 0,0\r");
+    mock.expect(b"TN\r", b"TN 0,0\r");
+    let mut radio = Radio::new(mock);
+    radio.set_tnc_mode(SelectableTncMode::Kiss, Band::B).await?;
+    radio.set_tnc_mode(SelectableTncMode::Off, Band::A).await?;
+    radio.into_transport().assert_complete();
+    assert_eq!(
+        TncMode::from(SelectableTncMode::Kiss),
+        TncMode::Kiss,
+        "a selectable mode names its reported mode"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn vox_writes_echo_read_back_and_settle_before_returning() -> TestResult {
+    let mut mock = MockTransport::new();
+    scripted_live_identity(&mut mock);
+    mock.expect(b"VX 1\r", b"VX 1\r");
+    mock.expect(b"VX\r", b"VX 1\r");
+    mock.expect(b"VX 0\r", b"VX 0\r");
+    mock.expect(b"VX\r", b"VX 0\r");
+    let mut radio = Radio::new(mock);
+    let started = tokio::time::Instant::now();
+    radio.set_vox(true).await?;
+    assert!(
+        started.elapsed() >= kenwood_tmd750::radio::VOX_SETTLE,
+        "a VX write returns only after the settle time"
+    );
+    radio.set_vox(false).await?;
+    radio.into_transport().assert_complete();
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_aprs_beacon_request_sends_be_and_requires_its_acknowledgement() -> TestResult {
+    let mut mock = MockTransport::new();
+    scripted_live_identity(&mut mock);
+    mock.expect(b"BE\r", b"BE\r");
+    mock.expect(b"BE\r", b"N\r");
+    let mut radio = Radio::new(mock);
+    radio.send_aprs_beacon().await?;
+    let refused = radio.send_aprs_beacon().await;
+    assert!(
+        matches!(
+            refused,
+            Err(Error::Protocol(ProtocolError::NotAvailable {
+                command: "BE"
+            }))
+        ),
+        "{refused:?}"
+    );
+    radio.into_transport().assert_complete();
+    Ok(())
+}
+
+#[tokio::test]
+async fn power_off_sends_ps_0_and_requires_its_echo() -> TestResult {
+    let mut mock = MockTransport::new();
+    scripted_live_identity(&mut mock);
+    mock.expect(b"PS 0\r", b"PS 0\r");
+    let mut radio = Radio::new(mock);
+    radio.power_off().await?;
+    radio.into_transport().assert_complete();
+    Ok(())
+}
+
+#[tokio::test]
+async fn receive_still_releases_the_transmitter_after_an_unanswered_transmit() -> TestResult {
+    let mut mock = MockTransport::new();
+    scripted_live_identity(&mut mock);
+    mock.expect_hang(b"TX\r");
+    mock.expect(b"RX\r", b"RX\r");
+    mock.expect(b"MD 0\r", b"MD 0,0\r");
+    let mut radio = Radio::new(mock);
+    radio.set_timeout(std::time::Duration::from_millis(20));
+    let keyed = radio.transmit().await;
+    assert!(
+        matches!(
+            keyed,
+            Err(Error::Timeout {
+                operation: "TX",
+                ..
+            })
+        ),
+        "{keyed:?}"
+    );
+    let blocked = radio.get_operating_mode(Band::A).await;
+    assert!(
+        matches!(
+            blocked,
+            Err(Error::Mcp(kenwood_tmd750::McpError::RecoveryRequired))
+        ),
+        "an uncertain CAT connection refuses ordinary commands: {blocked:?}"
+    );
+    radio.receive().await?;
+    assert_eq!(
+        radio.get_operating_mode(Band::A).await?,
+        OperatingMode::Fm,
+        "a correlated RX reply resynchronizes the connection"
+    );
+    radio.into_transport().assert_complete();
+    Ok(())
+}
+
+#[tokio::test]
+async fn transmit_until_releases_a_key_up_it_could_not_confirm() -> TestResult {
+    for malformed in [false, true] {
+        let mut mock = MockTransport::new();
+        scripted_live_identity(&mut mock);
+        if malformed {
+            mock.expect(b"TX\r", b"TX 0\r");
+        } else {
+            mock.expect_hang(b"TX\r");
+        }
+        mock.expect(b"RX\r", b"RX\r");
+        let mut radio = Radio::new(mock);
+        radio.set_timeout(std::time::Duration::from_millis(20));
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            radio.transmit_until(std::future::pending::<()>()),
+        )
+        .await?;
+        assert!(
+            matches!(
+                result,
+                Err(Error::Timeout {
+                    operation: "TX",
+                    ..
+                } | Error::Protocol(ProtocolError::FieldParse { .. }))
+            ),
+            "the TX failure returns once RX released the transmitter: {result:?}"
+        );
+        radio.into_transport().assert_complete();
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_unacknowledged_release_is_the_error_that_may_leave_the_transmitter_keyed() -> TestResult
+{
+    for acknowledged in [true, false] {
+        let mut mock = MockTransport::new();
+        scripted_live_identity(&mut mock);
+        if acknowledged {
+            mock.expect(b"TX\r", b"TX 1\r");
+        } else {
+            mock.expect_hang(b"TX\r");
+        }
+        mock.expect_hang(b"RX\r");
+        let mut radio = Radio::new(mock);
+        radio.set_timeout(std::time::Duration::from_millis(20));
+        let result = radio.transmit_until(std::future::ready(())).await;
+        let Err(Error::ReleaseUnconfirmed { transmit, release }) = &result else {
+            return Err(format!("expected ReleaseUnconfirmed, got {result:?}").into());
+        };
+        assert_eq!(
+            transmit.is_none(),
+            acknowledged,
+            "the TX failure is kept when there was one: {result:?}"
+        );
+        assert!(
+            matches!(
+                release.as_ref(),
+                Error::Timeout {
+                    operation: "RX",
+                    ..
+                }
+            ),
+            "{result:?}"
+        );
+        radio.into_transport().assert_complete();
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn receive_is_refused_while_programming_mode_is_uncertain() -> TestResult {
+    let mut mock = MockTransport::new();
+    scripted_live_identity(&mut mock);
+    mock.expect_partial_then_hang(b"0M PROGRAM\r", b"0");
+    let mut radio = Radio::new(mock);
+    radio.set_timeout(std::time::Duration::from_millis(20));
+    assert!(
+        radio.enter_mcp().await.is_err(),
+        "the entry reply never completes"
+    );
+    let released = radio.receive().await;
+    assert!(
+        matches!(
+            released,
+            Err(Error::Mcp(kenwood_tmd750::McpError::RecoveryRequired))
+        ),
+        "no CAT bytes are sent into uncertain MCP framing: {released:?}"
+    );
     radio.into_transport().assert_complete();
     Ok(())
 }

@@ -1,7 +1,7 @@
 //! Pure assignment, whole-page binding, and active-state guard tests.
 
 use super::*;
-use crate::types::{FirmwareIdentity, RadioType};
+use crate::types::{FirmwareIdentity, RadioModel, RadioType};
 
 type TestError = Box<dyn std::error::Error>;
 type TestResult = Result<(), TestError>;

@@ -85,30 +85,9 @@ impl Frequency {
     /// Returns [`ValidationError::InvalidMegahertzText`] for any other shape
     /// and the error of [`Self::new`] for an out-of-range value.
     pub fn from_mhz_str(text: &str) -> Result<Self, ValidationError> {
-        let invalid = || ValidationError::InvalidMegahertzText {
+        let hz = megahertz_text_hz(text).ok_or_else(|| ValidationError::InvalidMegahertzText {
             text: text.to_owned(),
-        };
-        let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
-        if whole.is_empty()
-            || !whole.bytes().all(|byte| byte.is_ascii_digit())
-            || (text.contains('.') && fraction.is_empty())
-            || fraction.len() > 6
-            || !fraction.bytes().all(|byte| byte.is_ascii_digit())
-        {
-            return Err(invalid());
-        }
-        let mhz: u32 = whole.parse().map_err(|_| invalid())?;
-        let mut fraction_hz: u32 = 0;
-        for byte in fraction
-            .bytes()
-            .chain(std::iter::repeat_n(b'0', 6 - fraction.len()))
-        {
-            fraction_hz = fraction_hz * 10 + u32::from(byte - b'0');
-        }
-        let hz = mhz
-            .checked_mul(1_000_000)
-            .and_then(|whole_hz| whole_hz.checked_add(fraction_hz))
-            .ok_or_else(invalid)?;
+        })?;
         Self::new(hz)
     }
 
@@ -382,6 +361,30 @@ impl fmt::Display for StepSize {
             write!(formatter, "{} kHz", text.trim_end_matches('0'))
         }
     }
+}
+
+/// The hertz of an unsigned decimal megahertz value with at most six
+/// fractional digits, by exact integer arithmetic; `None` for any other shape
+/// and for a value beyond `u32::MAX` hertz.
+pub(crate) fn megahertz_text_hz(text: &str) -> Option<u32> {
+    let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || (text.contains('.') && fraction.is_empty())
+        || fraction.len() > 6
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let mhz: u32 = whole.parse().ok()?;
+    let mut fraction_hz: u32 = 0;
+    for byte in fraction
+        .bytes()
+        .chain(std::iter::repeat_n(b'0', 6 - fraction.len()))
+    {
+        fraction_hz = fraction_hz * 10 + u32::from(byte - b'0');
+    }
+    mhz.checked_mul(1_000_000)?.checked_add(fraction_hz)
 }
 
 fn parse_wire_hz(text: &str) -> Result<u32, ValidationError> {

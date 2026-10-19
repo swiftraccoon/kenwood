@@ -11,7 +11,7 @@ use tracing as _;
 use std::io;
 use std::time::Duration;
 
-use kenwood_tmd750::protocol::mcp::{ACK, BytePatch, EXIT, PagePatch, read_request, write_request};
+use kenwood_tmd750::protocol::mcp::{ACK, EXIT, read_request, write_request};
 use kenwood_tmd750::{
     Address, Error, McpError, McpProbeExit, McpProbeOutcome, McpProbeStage, Page, ProtocolError,
     Radio,
@@ -293,43 +293,5 @@ async fn read_failure_preserves_prior_evidence_without_sending_exit() -> TestRes
         Some(read_request(slot_page()?).as_slice())
     );
     mock.assert_complete();
-    Ok(())
-}
-
-#[tokio::test]
-async fn read_success_does_not_unlock_firmware_102_schema_writes() -> TestResult {
-    let mut original = completed_reads()?;
-    original.expect(&[EXIT], &[ACK]);
-    let mut original = Radio::new(original);
-    let report = original.probe_mcp(|| false).await;
-    assert!(
-        matches!(report.outcome, McpProbeOutcome::AwaitingCatVerification),
-        "{report:?}"
-    );
-    assert_stopped_at_exit(&original.into_transport(), 9);
-
-    let mut fresh = MockTransport::new();
-    identity_and_entry(&mut fresh);
-    fresh.expect(&[EXIT], &[ACK]);
-    let mut fresh = Radio::new(fresh);
-    let mut session = fresh.enter_mcp().await?;
-    let patch = PagePatch::new(global_page()?, vec![BytePatch::new(2, 0xFF, 0x42)?])?;
-    let mut progress = Vec::new();
-    let result = session
-        .write_pages_verified(&[patch], |value| progress.push(value))
-        .await;
-    assert!(
-        matches!(result, Err(Error::UnsupportedSchemaTarget {
-        expected_model: "TM-D750", expected_firmware: "1.00",
-        ref actual_firmware, ..
-    }) if actual_firmware == "1.02"),
-        "{result:?}"
-    );
-    assert!(session.journal().possibly_written.is_empty());
-    assert!(session.journal().verified.is_empty());
-    assert!(progress.is_empty());
-    assert!(session.is_ready());
-    session.exit().await?;
-    assert_stopped_at_exit(&fresh.into_transport(), 5);
     Ok(())
 }

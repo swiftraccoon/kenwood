@@ -23,7 +23,7 @@ pub use my1::{ControlPage, My1Callsign, PmOffGatewayFinal, PmOffGatewayFresh, Pm
 pub use pm1::Pm1Name;
 
 use crate::radio::Identity;
-use crate::types::{DvGatewayMode, PAGE_SIZE, Page, PhysicalChannel, RadioModel};
+use crate::types::{DvGatewayMode, PAGE_SIZE, Page, PhysicalChannel};
 
 /// The storage fields a text update can change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,15 +270,13 @@ pub type My1CallsignUpdate = TextFieldUpdate<My1Callsign, PmOffGatewayGuards>;
 /// One channel's name update.
 pub type ChannelNameUpdate = TextFieldUpdate<ChannelNameText, NoGuards>;
 
-/// Require the exact software layout every text update is pinned to.
+/// Require an identity in [`crate::radio::WRITE_TARGETS`].
 fn check_identity(identity: &Identity) -> Result<(), TextFieldUpdateError> {
-    if identity.model != RadioModel::TmD750
-        || identity.firmware.as_str() != "1.02"
-        || identity.radio_type.as_str() != "K,2,1"
-    {
-        return Err(TextFieldUpdateError::IdentityMismatch);
+    if identity.is_write_target() {
+        Ok(())
+    } else {
+        Err(TextFieldUpdateError::IdentityMismatch)
     }
-    Ok(())
 }
 
 /// Require a complete page.

@@ -21,11 +21,15 @@ use tracing as _;
 
 use kenwood_tmd750::error::SchemaError;
 use kenwood_tmd750::file::{ConfigHeader, FileLayout, HEADER_SIZE, RadioConfig, parse_d750};
+use kenwood_tmd750::memory::repeater_list::REPEATER_TEXT_SIZE;
 use kenwood_tmd750::memory::{
     ChannelNameText, ConfigurationError, DecodedFieldValue, FieldCodec, MCP_D750_MENU_FIELDS,
     MemoryImage, MenuField, MenuWritePolicy, PatchPlanner, StandardConfiguration,
-    StandardConfigurationDiff, TextImage, TextScope, TextScopeKind, TextSetting,
+    StandardConfigurationDiff, StoredText, TextImage, TextScope, TextScopeKind, TextSetting,
 };
+
+/// The stored text of one repeater-list name.
+type RepeaterName = StoredText<REPEATER_TEXT_SIZE>;
 use kenwood_tmd750::protocol::cat::{Command, Response, parse_line};
 use kenwood_tmd750::protocol::mcp::regions::{menu_regions, writable_page_for};
 use kenwood_tmd750::protocol::mcp::{
@@ -49,6 +53,45 @@ use kenwood_tmd750::{
 /// inside `proptest!` blocks.
 fn to_test_err<E: std::fmt::Debug>(error: E) -> TestCaseError {
     TestCaseError::fail(format!("{error:?}"))
+}
+
+/// A character with a stored repeater-text form.
+fn arb_repeater_character() -> impl Strategy<Value = char> {
+    prop_oneof![0x20_u32..0x7F, 0xA0_u32..=0xFF, 0x101_u32..=0x1FF]
+        .prop_filter_map("a scalar value", char::from_u32)
+}
+
+/// Text whose stored form fits the sixteen bytes of a repeater-list name.
+fn arb_repeater_text() -> impl Strategy<Value = String> {
+    vec(arb_repeater_character(), 0..=16).prop_map(|characters| {
+        let mut text = String::new();
+        let mut stored = 0;
+        for character in characters {
+            stored += if u32::from(character) > 0xFF { 2 } else { 1 };
+            if stored > REPEATER_TEXT_SIZE {
+                break;
+            }
+            text.push(character);
+        }
+        text
+    })
+}
+
+/// A stored text form, with one byte replaced in half of the cases.
+fn arb_stored_repeater_text() -> impl Strategy<Value = [u8; REPEATER_TEXT_SIZE]> {
+    (
+        arb_repeater_text(),
+        0..REPEATER_TEXT_SIZE,
+        any::<u8>(),
+        any::<bool>(),
+    )
+        .prop_filter_map("a storable text", |(text, offset, byte, replace)| {
+            let mut stored = *RepeaterName::new(&text).ok()?.as_bytes();
+            if replace {
+                *stored.get_mut(offset)? = byte;
+            }
+            Some(stored)
+        })
 }
 
 // ============================================================================
@@ -836,9 +879,8 @@ proptest! {
     fn text_previews_plan_exactly_the_text_that_reads_back(
         (setting, scope, text) in arb_text_setting_write(),
     ) {
-        let firmware = FirmwareIdentity::new("1.02").map_err(to_test_err)?;
         let image = MemoryImage::from_bytes(vec![0; IMAGE_LENGTH]).map_err(to_test_err)?;
-        let view = TextImage::interpret_unqualified(&image, &firmware);
+        let view = TextImage::new(&image);
         prop_assert_eq!(view.read(setting, scope).map_err(to_test_err)?, "");
         let preview = view.preview(setting, scope, &text).map_err(to_test_err)?;
         prop_assert_eq!(preview.setting(), setting);
@@ -857,8 +899,7 @@ proptest! {
         let mut bytes = image.into_bytes();
         preview.patches().apply_to_image(&mut bytes).map_err(to_test_err)?;
         let written = MemoryImage::from_bytes(bytes).map_err(to_test_err)?;
-        let written = TextImage::interpret_unqualified(&written, &firmware);
-        prop_assert_eq!(written.read(setting, scope).map_err(to_test_err)?, text);
+        prop_assert_eq!(TextImage::new(&written).read(setting, scope).map_err(to_test_err)?, text);
     }
 
     #[test]
@@ -1015,6 +1056,11 @@ proptest! {
     #[test]
     fn cat_line_parsing_never_panics(bytes in vec(any::<u8>(), 0..48)) {
         let _response = parse_line(&bytes);
+    }
+
+    #[test]
+    fn configuration_file_parsing_never_panics(bytes in vec(any::<u8>(), 0..2048)) {
+        let _config = parse_d750(&bytes);
     }
 
     #[test]
@@ -1219,5 +1265,22 @@ proptest! {
         let config = RadioConfig::new(header, image).map_err(to_test_err)?;
         let bytes = config.to_bytes();
         prop_assert_eq!(parse_d750(&bytes).map_err(to_test_err)?, config);
+    }
+
+    #[test]
+    fn repeater_text_round_trips_through_its_stored_form(text in arb_repeater_text()) {
+        let stored = RepeaterName::new(&text).map_err(to_test_err)?;
+        let decoded = RepeaterName::from_bytes(*stored.as_bytes()).map_err(to_test_err)?;
+        prop_assert_eq!(decoded.to_string(), text);
+    }
+
+    #[test]
+    fn stored_repeater_text_decodes_only_to_text_that_re_encodes_exactly(
+        stored in arb_stored_repeater_text(),
+    ) {
+        if let Ok(text) = RepeaterName::from_bytes(stored) {
+            let encoded = RepeaterName::new(&text.to_string()).map_err(to_test_err)?;
+            prop_assert_eq!(encoded.as_bytes(), &stored);
+        }
     }
 }

@@ -175,7 +175,7 @@ async fn every_page_is_compared_before_the_first_write_with_exact_wire_and_noop_
         PageReplacement::new(page(8, 40)?, &[0x11; 40], &[0x11; 40])?,
         PageReplacement::new(page(512, 256)?, &[0x22; 256], &[0x33; 256])?,
     ];
-    let mut mock = ready("1.00");
+    let mut mock = ready("1.02");
     for replacement in &replacements {
         read(&mut mock, replacement.page(), replacement.expected());
     }
@@ -270,7 +270,7 @@ async fn stale_final_byte_of_a_later_page_prevents_every_write_and_intent() -> T
     ];
     let mut stale = [2; 256];
     *stale.last_mut().ok_or("tail missing")? = 4;
-    let mut mock = ready("1.00");
+    let mut mock = ready("1.02");
     read(
         &mut mock,
         replacements[0].page(),
@@ -323,7 +323,7 @@ async fn stale_final_byte_of_a_later_page_prevents_every_write_and_intent() -> T
 
 #[tokio::test]
 async fn duplicates_and_unsupported_firmware_fail_before_page_traffic() -> TestResult {
-    for firmware in ["1.00", "1.02"] {
+    for firmware in ["1.02", "1.03"] {
         let replacement = PageReplacement::new(page(512, 256)?, &[0; 256], &[1; 256])?;
         let mut mock = ready(firmware);
         mock.expect(b"E", &[ACK]);
@@ -340,7 +340,7 @@ async fn duplicates_and_unsupported_firmware_fail_before_page_traffic() -> TestR
                 |_| {},
             )
             .await;
-        if firmware == "1.00" {
+        if firmware == "1.02" {
             assert!(
                 matches!(
                     result,
@@ -350,8 +350,12 @@ async fn duplicates_and_unsupported_firmware_fail_before_page_traffic() -> TestR
             );
         } else {
             assert!(
-                matches!(result, Err(Error::UnsupportedSchemaTarget { .. })),
-                "new compare-and-exchange must preserve the exact firmware gate"
+                matches!(
+                    result,
+                    Err(Error::UnsupportedWriteTarget { ref actual })
+                        if actual.firmware.as_str() == "1.03"
+                ),
+                "compare-and-exchange admits only a write target"
             );
         }
         assert!(
@@ -371,10 +375,10 @@ async fn duplicates_and_unsupported_firmware_fail_before_page_traffic() -> TestR
 
 #[tokio::test]
 async fn noops_and_empty_batches_never_dispatch_but_still_enforce_scope() -> TestResult {
-    for firmware in ["1.00", "1.02"] {
+    for firmware in ["1.02", "1.03"] {
         let replacement = PageReplacement::new(page(8, 40)?, &[0xA5; 40], &[0xA5; 40])?;
         let mut mock = ready(firmware);
-        if firmware == "1.00" {
+        if firmware == "1.02" {
             read(&mut mock, replacement.page(), replacement.expected());
         }
         mock.expect(b"E", &[ACK]);
@@ -401,7 +405,7 @@ async fn noops_and_empty_batches_never_dispatch_but_still_enforce_scope() -> Tes
                 |_| {},
             )
             .await;
-        if firmware == "1.00" {
+        if firmware == "1.02" {
             assert!(
                 empty?.compared_pages.is_empty(),
                 "empty batches return empty results without progress"
@@ -418,11 +422,11 @@ async fn noops_and_empty_batches_never_dispatch_but_still_enforce_scope() -> Tes
             );
         } else {
             assert!(
-                matches!(empty, Err(Error::UnsupportedSchemaTarget { .. })),
+                matches!(empty, Err(Error::UnsupportedWriteTarget { .. })),
                 "empty batches do not bypass firmware admission"
             );
             assert!(
-                matches!(noop, Err(Error::UnsupportedSchemaTarget { .. })),
+                matches!(noop, Err(Error::UnsupportedWriteTarget { .. })),
                 "no-op batches do not bypass firmware admission"
             );
         }
@@ -448,7 +452,7 @@ async fn callback_failure_prevents_its_write_without_rolling_back_earlier_pages(
             PageReplacement::new(page(512, 256)?, &[0; 256], &[1; 256])?,
             PageReplacement::new(page(768, 256)?, &[2; 256], &[3; 256])?,
         ];
-        let mut mock = ready("1.00");
+        let mut mock = ready("1.02");
         for replacement in &replacements {
             read(&mut mock, replacement.page(), replacement.expected());
         }
@@ -506,7 +510,7 @@ async fn uncertain_write_ack_preserves_possible_change_and_forbids_speculative_e
 {
     for timeout in [false, true] {
         let replacement = PageReplacement::new(page(512, 256)?, &[0; 256], &[1; 256])?;
-        let mut mock = ready("1.00");
+        let mut mock = ready("1.02");
         read(&mut mock, replacement.page(), replacement.expected());
         let write = frame(replacement.page(), replacement.replacement());
         if timeout {
@@ -551,7 +555,7 @@ async fn complete_last_byte_readback_mismatch_retains_actual_possible_write() ->
     let replacement = PageReplacement::new(page(512, 256)?, &[0; 256], &[1; 256])?;
     let mut wrong = [1; 256];
     *wrong.last_mut().ok_or("tail missing")? = 2;
-    let mut mock = ready("1.00");
+    let mut mock = ready("1.02");
     read(&mut mock, replacement.page(), replacement.expected());
     mock.expect(
         &frame(replacement.page(), replacement.replacement()),
@@ -589,7 +593,7 @@ async fn complete_last_byte_readback_mismatch_retains_actual_possible_write() ->
 async fn incomplete_preflight_or_readback_preserves_distinct_journal_states() -> TestResult {
     for after_write in [false, true] {
         let replacement = PageReplacement::new(page(512, 256)?, &[0; 256], &[1; 256])?;
-        let mut mock = ready("1.00");
+        let mut mock = ready("1.02");
         if after_write {
             read(&mut mock, replacement.page(), replacement.expected());
             mock.expect(
@@ -628,7 +632,7 @@ async fn incomplete_preflight_or_readback_preserves_distinct_journal_states() ->
 async fn failed_rewrite_cannot_inherit_an_earlier_verification_of_the_same_page() -> TestResult {
     let first = PageReplacement::new(page(512, 256)?, &[0; 256], &[1; 256])?;
     let second = PageReplacement::new(first.page(), first.replacement(), &[2; 256])?;
-    let mut mock = ready("1.00");
+    let mut mock = ready("1.02");
     read(&mut mock, first.page(), first.expected());
     write_and_verify(&mut mock, &first);
     read(&mut mock, second.page(), second.expected());
@@ -681,7 +685,7 @@ async fn drop_pending(future: impl Future) {
 #[tokio::test]
 async fn dropped_write_future_retains_possible_dispatch_and_blocks_protocol_reuse() -> TestResult {
     let replacement = PageReplacement::new(page(512, 256)?, &[0; 256], &[1; 256])?;
-    let mut mock = ready("1.00");
+    let mut mock = ready("1.02");
     read(&mut mock, replacement.page(), replacement.expected());
     mock.expect_hang(&frame(replacement.page(), replacement.replacement()));
     let mut radio = Radio::new(mock);

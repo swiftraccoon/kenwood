@@ -7,11 +7,10 @@
 use std::fmt;
 
 use super::{
-    DecodedFieldValue, FieldCodec, FieldDescriptor, MemoryImage, StringEncoding,
-    TextLayoutQualification, is_supported_schema_target, menu_field,
+    DecodedFieldValue, FieldCodec, FieldDescriptor, MemoryImage, StringEncoding, menu_field,
 };
 use crate::error::SchemaError;
-use crate::types::{FirmwareIdentity, RadioModel, SlotIndex};
+use crate::types::SlotIndex;
 
 // The image-format marker is not a menu setting and has no generated menu entry.
 const FORMAT: FieldDescriptor =
@@ -180,16 +179,12 @@ impl fmt::Display for TerminalFinding {
 
 /// Typed interpretation of historical Reflector Terminal settings.
 ///
-/// The caller supplies image coverage and firmware provenance. For sparse
-/// captures, cover every [`Self::required_fields`] descriptor with actual
-/// captured bytes before constructing a dense image; a filled gap decodes as
-/// though it had been read.
+/// The caller supplies image coverage. For sparse captures, cover every
+/// [`Self::required_fields`] descriptor with actual captured bytes before
+/// constructing a dense image; a filled gap decodes as though it had been
+/// read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReflectorTerminalPreflight {
-    /// Caller-supplied firmware identity, retained without rewriting.
-    pub firmware: FirmwareIdentity,
-    /// Exact label match or explicitly unqualified software interpretation.
-    pub qualification: TextLayoutQualification,
     /// Requested zero-based PM slot: 0 is PM Off; 1–5 are PM 1–5.
     pub slot: SlotIndex,
     /// Active PM selection read from the image.
@@ -241,65 +236,17 @@ impl ReflectorTerminalPreflight {
         Ok(result)
     }
 
-    /// Interpret settings, requiring `firmware` to match a registry target label.
-    ///
-    /// Accepted labels are [`super::MCP_D750_SCHEMA_FIRMWARE_IDENTITIES`]; the
-    /// result carries [`TextLayoutQualification::RegistryTargetMatched`].
+    /// Interpret the Terminal settings of `slot` and compare them with
+    /// `desired_route`.
     ///
     /// # Errors
     ///
-    /// Rejects an unsupported firmware label, unknown image format or scalar,
-    /// changed registry shape, invalid UTF-8, or unsupported text spelling.
+    /// Rejects an unknown image format or scalar, a changed registry shape,
+    /// invalid UTF-8, or unsupported text spelling.
     pub fn read(
         image: &MemoryImage,
-        firmware: &FirmwareIdentity,
         slot: SlotIndex,
         desired_route: TerminalUsbRoute,
-    ) -> Result<Self, TerminalPreflightError> {
-        if !is_supported_schema_target(RadioModel::TmD750, firmware) {
-            return Err(TerminalPreflightError::UnsupportedFirmware {
-                actual: firmware.clone(),
-            });
-        }
-        Self::decode(
-            image,
-            firmware,
-            slot,
-            desired_route,
-            TextLayoutQualification::RegistryTargetMatched,
-        )
-    }
-
-    /// Interpret the image without the firmware check applied by [`Self::read`].
-    ///
-    /// The result carries [`TextLayoutQualification::UnqualifiedInterpretation`]
-    /// even when the supplied label matches a registry target.
-    ///
-    /// # Errors
-    ///
-    /// Rejects unknown formats or scalars, changed registry shape, invalid UTF-8,
-    /// and unsupported spelling just as [`Self::read`] does.
-    pub fn interpret_unqualified(
-        image: &MemoryImage,
-        firmware: &FirmwareIdentity,
-        slot: SlotIndex,
-        desired_route: TerminalUsbRoute,
-    ) -> Result<Self, TerminalPreflightError> {
-        Self::decode(
-            image,
-            firmware,
-            slot,
-            desired_route,
-            TextLayoutQualification::UnqualifiedInterpretation,
-        )
-    }
-
-    fn decode(
-        image: &MemoryImage,
-        firmware: &FirmwareIdentity,
-        slot: SlotIndex,
-        desired_route: TerminalUsbRoute,
-        qualification: TextLayoutQualification,
     ) -> Result<Self, TerminalPreflightError> {
         let format_version = read_byte(&FORMAT, "image format", image, slot)?;
         if format_version != 0 {
@@ -341,8 +288,6 @@ impl ReflectorTerminalPreflight {
         let rpt1 = Field::Rpt1.text(image, slot)?;
         let rpt2 = Field::Rpt2.text(image, slot)?;
         let mut result = Self {
-            firmware: firmware.clone(),
-            qualification,
             slot,
             captured_active_slot,
             desired_route,
@@ -396,12 +341,6 @@ impl ReflectorTerminalPreflight {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum TerminalPreflightError {
-    /// Supplied provenance does not match an accepted registry target label.
-    #[error("firmware {actual} requires explicit unqualified offline interpretation")]
-    UnsupportedFirmware {
-        /// Original supplied firmware identity.
-        actual: FirmwareIdentity,
-    },
     /// The image-format marker is not the supported zero value.
     #[error("unsupported captured image format {actual}")]
     UnsupportedFormatVersion {

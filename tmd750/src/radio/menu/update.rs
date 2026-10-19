@@ -5,12 +5,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::{MenuFieldSnapshot, ScopedMenuField};
 use crate::error::{Error, SchemaError};
 use crate::memory::{
-    DecodedFieldValue, MenuField, MenuValueError, MenuWritePolicy, MenuWritePolicyError,
-    PatchPlanner, menu_field,
+    DecodedFieldValue, MenuField, MenuFieldId, MenuValueError, MenuWritePolicy,
+    MenuWritePolicyError, PatchPlanner, menu_field,
 };
 use crate::radio::Identity;
 use crate::radio::programming::PageReplacement;
-use crate::types::{Address, DvGatewayMode, Page, RadioModel, SlotIndex};
+use crate::types::{Address, DvGatewayMode, Page, SlotIndex};
 
 const PM_FIELD: &str = "pm.PmSelect";
 const GATEWAY_FIELD: &str = "dv.DvGatewayModeDvGateway";
@@ -39,7 +39,32 @@ impl MenuAssignment {
     /// outside supported syntax, semantic domains, or storage codecs. Errors
     /// never include the supplied text or an unrecognized input name.
     pub fn new(name: &str, slot: Option<SlotIndex>, text: &str) -> Result<Self, MenuUpdateError> {
-        let field = menu_field(name).ok_or(MenuUpdateError::UnknownField)?;
+        Self::resolved(
+            menu_field(name).ok_or(MenuUpdateError::UnknownField)?,
+            slot,
+            text,
+        )
+    }
+
+    /// [`Self::new`] for a field named by its [`MenuFieldId`], with no name
+    /// lookup.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::new`] other than an unknown name.
+    pub fn for_field(
+        id: MenuFieldId,
+        slot: Option<SlotIndex>,
+        text: &str,
+    ) -> Result<Self, MenuUpdateError> {
+        Self::resolved(id.field(), slot, text)
+    }
+
+    fn resolved(
+        field: &'static MenuField,
+        slot: Option<SlotIndex>,
+        text: &str,
+    ) -> Result<Self, MenuUpdateError> {
         let policy = field.write_policy();
         if policy != MenuWritePolicy::Ordinary {
             return Err(MenuUpdateError::NotOrdinary {
@@ -80,9 +105,9 @@ impl MenuAssignment {
 
 /// Registry-only changes bound to complete captured pages and operating guards.
 ///
-/// The admitted software layout is exactly TM-D750 firmware 1.02, type K,2,1,
-/// memory format zero. The captured active PM must be valid and its Gateway
-/// must be Off. Complete format, PM-control, and active-Gateway pages are kept
+/// The captured identity must be one of [`crate::radio::WRITE_TARGETS`] and
+/// the memory format zero. The captured active PM must be valid and its
+/// Gateway must be Off. Complete format, PM-control, and active-Gateway pages are kept
 /// alongside every assigned page, even when they are compare-only no-ops.
 ///
 /// Scope: this plan admits only registered scalar fields and does not widen
@@ -115,10 +140,7 @@ impl MenuUpdatePlan {
         snapshot: &MenuFieldSnapshot,
         assignments: Vec<MenuAssignment>,
     ) -> Result<Self, MenuUpdateError> {
-        if identity.model != RadioModel::TmD750
-            || identity.firmware.as_str() != "1.02"
-            || identity.radio_type.as_str() != "K,2,1"
-        {
+        if !identity.is_write_target() {
             return Err(MenuUpdateError::UnsupportedIdentity {
                 actual: identity.clone(),
             });

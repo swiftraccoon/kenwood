@@ -287,13 +287,16 @@ impl fmt::Display for VoxGain {
     }
 }
 
-/// VOX state reported by `VX`.
+/// VOX state reported and selected by `VX`.
 ///
-/// Only `0` has been read from the radio; the crate exposes no `VX` write.
+/// With VOX on, microphone audio above the [`VoxGain`] threshold keys the
+/// transmitter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VoxMode {
     /// VOX off (`0`).
     Off,
+    /// VOX on (`1`).
+    On,
     /// Any other reported value, retained exactly as received.
     Unnamed(u8),
 }
@@ -302,8 +305,15 @@ impl From<u8> for VoxMode {
     fn from(value: u8) -> Self {
         match value {
             0 => Self::Off,
+            1 => Self::On,
             other => Self::Unnamed(other),
         }
+    }
+}
+
+impl From<bool> for VoxMode {
+    fn from(enabled: bool) -> Self {
+        if enabled { Self::On } else { Self::Off }
     }
 }
 
@@ -311,6 +321,7 @@ impl From<VoxMode> for u8 {
     fn from(value: VoxMode) -> Self {
         match value {
             VoxMode::Off => 0,
+            VoxMode::On => 1,
             VoxMode::Unnamed(raw) => raw,
         }
     }
@@ -320,6 +331,7 @@ impl fmt::Display for VoxMode {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Off => formatter.write_str("off"),
+            Self::On => formatter.write_str("on"),
             Self::Unnamed(value) => write!(formatter, "unnamed value {value}"),
         }
     }
@@ -906,11 +918,18 @@ impl fmt::Display for GpsSettings {
 
 /// TNC mode reported by `TN`.
 ///
-/// Only `0` has been read from the radio; the crate exposes no `TN` write.
+/// The User Manual (Built-in KISS TNC) enters KISS mode with `TN 2,0` for
+/// Band A and `TN 2,1` for Band B. Any value without a variant is retained as
+/// [`Self::Unnamed`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TncMode {
     /// TNC off (`0`).
     Off,
+    /// APRS mode (`1`): the radio's own APRS application uses the TNC.
+    Aprs,
+    /// KISS mode (`2`): the TNC exchanges KISS frames with the interface
+    /// Menu 984 selects.
+    Kiss,
     /// Any other reported value, retained exactly as received.
     Unnamed(u8),
 }
@@ -919,6 +938,8 @@ impl From<u8> for TncMode {
     fn from(value: u8) -> Self {
         match value {
             0 => Self::Off,
+            1 => Self::Aprs,
+            2 => Self::Kiss,
             other => Self::Unnamed(other),
         }
     }
@@ -928,7 +949,19 @@ impl From<TncMode> for u8 {
     fn from(value: TncMode) -> Self {
         match value {
             TncMode::Off => 0,
+            TncMode::Aprs => 1,
+            TncMode::Kiss => 2,
             TncMode::Unnamed(raw) => raw,
+        }
+    }
+}
+
+impl From<SelectableTncMode> for TncMode {
+    fn from(mode: SelectableTncMode) -> Self {
+        match mode {
+            SelectableTncMode::Off => Self::Off,
+            SelectableTncMode::Aprs => Self::Aprs,
+            SelectableTncMode::Kiss => Self::Kiss,
         }
     }
 }
@@ -937,8 +970,48 @@ impl fmt::Display for TncMode {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Off => formatter.write_str("off"),
+            Self::Aprs => formatter.write_str("APRS"),
+            Self::Kiss => formatter.write_str("KISS"),
             Self::Unnamed(value) => write!(formatter, "unnamed value {value}"),
         }
+    }
+}
+
+/// A TNC mode [`crate::Radio::set_tnc_mode`] selects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SelectableTncMode {
+    /// TNC off (`0`).
+    Off,
+    /// APRS mode (`1`).
+    Aprs,
+    /// KISS mode (`2`).
+    Kiss,
+}
+
+impl SelectableTncMode {
+    /// The wire value.
+    #[must_use]
+    pub const fn as_raw(self) -> u8 {
+        match self {
+            Self::Off => 0,
+            Self::Aprs => 1,
+            Self::Kiss => 2,
+        }
+    }
+}
+
+/// The TNC mode and its data band, as `TN` reports them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TncState {
+    /// The TNC mode.
+    pub mode: TncMode,
+    /// The band the TNC sends and receives on.
+    pub data_band: crate::types::Band,
+}
+
+impl fmt::Display for TncState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{} on band {}", self.mode, self.data_band)
     }
 }
 
@@ -1174,10 +1247,21 @@ mod tests {
         assert_eq!(BeaconMethod::try_from(3)?, BeaconMethod::SmartBeaconing);
         assert!(BeaconMethod::try_from(4).is_err());
         assert_eq!(SMeterReading::new(9).to_string(), "S9");
+        assert_eq!(VoxMode::from(1), VoxMode::On);
         assert_eq!(VoxMode::from(2), VoxMode::Unnamed(2));
         assert_eq!(u8::from(VoxMode::Unnamed(2)), 2);
-        assert_eq!(TncMode::from(1), TncMode::Unnamed(1));
+        assert_eq!(TncMode::from(1), TncMode::Aprs);
+        assert_eq!(TncMode::from(2), TncMode::Kiss);
+        assert_eq!(TncMode::from(3), TncMode::Unnamed(3));
+        assert_eq!(u8::from(TncMode::Kiss), 2);
         assert_eq!(u8::from(TncMode::Off), 0);
+        for mode in [
+            SelectableTncMode::Off,
+            SelectableTncMode::Aprs,
+            SelectableTncMode::Kiss,
+        ] {
+            assert_eq!(u8::from(TncMode::from(mode)), mode.as_raw(), "{mode:?}");
+        }
         Ok(())
     }
 
@@ -1296,13 +1380,13 @@ mod tests {
 
     #[test]
     fn serial_information_requires_exact_lengths() -> TestResult {
-        let info = SerialInformation::new("C6210439", "K01")?;
-        assert_eq!(info.serial_number(), "C6210439");
+        let info = SerialInformation::new("A1234567", "K01")?;
+        assert_eq!(info.serial_number(), "A1234567");
         assert_eq!(info.model_code(), "K01");
-        assert_eq!(info.to_string(), "C6210439 (K01)");
-        assert!(SerialInformation::new("C621043", "K01").is_err());
-        assert!(SerialInformation::new("C6210439", "K1").is_err());
-        assert!(SerialInformation::new("C621 439", "K01").is_err());
+        assert_eq!(info.to_string(), "A1234567 (K01)");
+        assert!(SerialInformation::new("A123456", "K01").is_err());
+        assert!(SerialInformation::new("A1234567", "K1").is_err());
+        assert!(SerialInformation::new("A123 567", "K01").is_err());
         Ok(())
     }
 }

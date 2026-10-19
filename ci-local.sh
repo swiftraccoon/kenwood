@@ -126,6 +126,12 @@ ci_pod() {
         set -eo pipefail
         [ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
         cd /work/kenwood
+        # Same build environment as the GitHub Linux workflows: no
+        # incremental artifacts, line-tables-only debuginfo. The target
+        # directory is ephemeral storage in the container writable
+        # layer; the kubelet evicts the pod using the most of it when
+        # the node falls below its free-space threshold.
+        export CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=line-tables-only
         step() { echo "--- $1 ---"; shift; "$@"; }
 
         # Pod-level system deps. Neither base image ships these out

@@ -171,8 +171,8 @@ async fn a_reply_for_the_other_band_is_stale_and_the_command_times_out() -> Test
             result,
             Err(Error::Timeout {
                 operation: "MD",
-                millis: 20
-            })
+                timeout,
+            }) if timeout == Duration::from_millis(20)
         ),
         "{result:?}"
     );
@@ -282,8 +282,8 @@ async fn hanging_write_times_out_and_blocks_further_cat_commands() -> TestResult
         result,
         Err(Error::Timeout {
             operation: "serial write",
-            millis: 5,
-        })
+            timeout,
+        }) if timeout == Duration::from_millis(5)
     ));
     let retry = radio.get_operating_mode(Band::B).await;
     assert!(matches!(retry, Err(Error::Mcp(McpError::RecoveryRequired))));

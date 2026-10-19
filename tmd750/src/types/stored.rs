@@ -141,9 +141,11 @@ impl fmt::Display for PhysicalChannel {
     }
 }
 
-/// An eight-byte D-STAR callsign field of a stored record, NUL padded.
+/// An eight-byte D-STAR callsign field of a stored channel, repeater record
+/// or callsign list entry, NUL padded.
 ///
-/// Empty records and the CAT writer store `DIRECT` in both repeater fields.
+/// Empty channel records and the CAT writer store `DIRECT` in both repeater
+/// fields of a channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StoredCallsign([u8; 8]);
 
@@ -192,6 +194,16 @@ impl StoredCallsign {
     pub fn text(&self) -> String {
         let end = self.0.iter().position(|&byte| byte == 0).unwrap_or(8);
         String::from_utf8_lossy(self.0.get(..end).unwrap_or_default()).into_owned()
+    }
+
+    /// Whether the bytes are graphic ASCII or space followed only by NUL
+    /// padding, the form [`Self::new`] stores.
+    pub(crate) fn is_padded_text(self) -> bool {
+        let end = self.0.iter().position(|&byte| byte == 0).unwrap_or(8);
+        let (text, padding) = self.0.split_at(end);
+        text.iter()
+            .all(|&byte| byte.is_ascii_graphic() || byte == b' ')
+            && padding.iter().all(|&byte| byte == 0)
     }
 }
 

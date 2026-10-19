@@ -49,7 +49,7 @@ const fn cross_page_field(base: u32, per_slot: bool) -> MenuField {
 fn entry_mock() -> MockTransport {
     let mut mock = MockTransport::new();
     mock.expect(b"ID\r", b"ID TM-D750\r");
-    mock.expect(b"FV\r", b"FV 1.00\r");
+    mock.expect(b"FV\r", b"FV 1.02\r");
     mock.expect(b"TY\r", b"TY K,2,1\r");
     mock.expect(b"0M PROGRAM\r", b"0M\r");
     mock
@@ -412,34 +412,21 @@ async fn missing_snapshot_and_late_invalid_selection_fail_before_page_traffic() 
     let _planned = planner.set_menu(fm, selection.slot(), FieldValue::Bool(true))?;
     let patches = planner.finish()?;
     let empty = MenuFieldSnapshot::from_pages(Vec::new())?;
-    let mut mock = entry_mock();
-    mock.expect(b"E", &[ACK]);
-    let mut radio = Radio::new(mock);
-    let mut session = radio.enter_mcp().await?;
-    let callbacks = Cell::new(0);
-    let result = session
-        .compare_exchange_menu_patches(
-            &patches,
-            &empty,
-            |_| {
-                callbacks.set(callbacks.get() + 1);
-                Ok(())
-            },
-            |_| {
-                callbacks.set(callbacks.get() + 1);
-            },
-        )
-        .await;
     assert!(
         matches!(
-            result,
+            empty.plan_exchanges(&patches),
             Err(Error::Schema(SchemaError::SnapshotPageMissing {
                 field: "menu patch",
                 ..
             }))
         ),
-        "missing patch coverage must fail before live comparison or write intent"
+        "missing patch coverage must fail before any page plan exists"
     );
+    let mut mock = entry_mock();
+    mock.expect(b"E", &[ACK]);
+    let mut radio = Radio::new(mock);
+    let mut session = radio.enter_mcp().await?;
+    let callbacks = Cell::new(0);
     let result = session
         .read_menu_snapshot(&[selection, ScopedMenuField::new(&gap, None)?], |_| {
             callbacks.set(callbacks.get() + 1);
@@ -514,9 +501,8 @@ async fn menu_batch_compares_every_page_before_writing_and_skips_noops() -> Test
     let mut intents = Vec::new();
     let mut progress = Vec::new();
     let report = session
-        .compare_exchange_menu_patches(
-            &patches,
-            &snapshot,
+        .compare_exchange_pages(
+            &snapshot.plan_exchanges(&patches)?,
             |change| {
                 intents.push(change.clone());
                 Ok(())
@@ -586,9 +572,8 @@ async fn stale_later_page_prevents_every_write_in_the_menu_batch() -> TestResult
     let mut session = radio.enter_mcp().await?;
     let mut called = false;
     let result = session
-        .compare_exchange_menu_patches(
-            &patches,
-            &snapshot,
+        .compare_exchange_pages(
+            &snapshot.plan_exchanges(&patches)?,
             |_| {
                 called = true;
                 Ok(())

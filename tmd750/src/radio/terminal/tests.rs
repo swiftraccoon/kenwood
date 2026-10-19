@@ -11,7 +11,7 @@ use super::*;
 use crate::error::McpError;
 use crate::protocol::mcp::{ACK, read_request, write_request};
 use crate::radio::{Progress, Radio};
-use crate::types::{FirmwareIdentity, RadioType};
+use crate::types::{FirmwareIdentity, RadioModel, RadioType};
 
 type TestError = Box<dyn std::error::Error>;
 type TestResult = Result<(), TestError>;
@@ -561,7 +561,7 @@ async fn late_guard_conflict_prevents_writes_including_exact_restoration() -> Te
 }
 
 #[tokio::test]
-async fn identity_and_legacy_gate_fail_before_any_page_traffic() -> TestResult {
+async fn identity_and_write_target_gates_fail_before_any_page_traffic() -> TestResult {
     let plan = entry_plan()?;
     for firmware in ["1.00", "1.03"] {
         let mut mock = ready(firmware);
@@ -577,7 +577,7 @@ async fn identity_and_legacy_gate_fail_before_any_page_traffic() -> TestResult {
         session.exit().await?;
         radio.into_transport().assert_complete();
     }
-    let mut mock = ready("1.02");
+    let mut mock = ready("1.03");
     mock.expect(b"E", &[ACK]);
     let mut radio = Radio::new(mock);
     let mut session = radio.enter_mcp().await?;
@@ -585,7 +585,7 @@ async fn identity_and_legacy_gate_fail_before_any_page_traffic() -> TestResult {
         session
             .compare_exchange_pages(plan.replacements(), |_| Ok(()), |_| {})
             .await,
-        Err(Error::UnsupportedSchemaTarget { .. })
+        Err(Error::UnsupportedWriteTarget { .. })
     ));
     session.exit().await?;
     radio.into_transport().assert_complete();

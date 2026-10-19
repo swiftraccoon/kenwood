@@ -62,9 +62,11 @@ pub enum LifecycleError {
     /// preflight.
     #[error("the control endpoint did not complete its identity and Gateway preflight")]
     ControlPreflight,
-    /// The observed identity fails [`Identity::is_write_target`]: it is not
-    /// TM-D750 firmware 1.02, type `K,2,1`.
-    #[error("control endpoint identity {actual} is not TM-D750 / 1.02 / K,2,1")]
+    /// The observed identity fails [`Identity::is_write_target`].
+    #[error(
+        "control endpoint identity {actual} is not one of {targets}",
+        targets = crate::radio::write_targets_list()
+    )]
     UnsupportedTarget {
         /// The identity the control endpoint reported.
         actual: Identity,

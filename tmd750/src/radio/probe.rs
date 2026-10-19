@@ -4,8 +4,8 @@
 //! exit; it sends no memory-write, fill, or RF command.
 
 use super::{Identity, Radio};
-use crate::error::{Error, ProtocolError};
-use crate::types::{DvGatewayMode, Page, RadioModel, Region};
+use crate::error::Error;
+use crate::types::{DvGatewayMode, Page, Region};
 use kenwood_transport::Transport;
 
 /// A step in the fixed MCP probe sequence.
@@ -178,10 +178,11 @@ impl<T: Transport> Radio<T> {
 
     /// Guard a fixed detached MCP read with exact identity and Gateway Off.
     ///
-    /// Reads TM-D750, firmware `1.02`, and opaque type `K,2,1` exactly once,
-    /// then requires a fresh `GW 0` before entering MCP. Any other identity or
-    /// Gateway value refuses entry. Reads only `8..48` and `327681..327936`;
-    /// no settings write, fill, or RF request is sent.
+    /// Identifies the radio once, requires an identity in
+    /// [`super::WRITE_TARGETS`] ([`Error::UnsupportedWriteTarget`] otherwise),
+    /// then requires a fresh `GW 0` before entering MCP. Any other Gateway
+    /// value refuses entry. Reads only `8..48` and `327681..327936`; no
+    /// settings write, fill, or RF request is sent.
     ///
     /// An acknowledged exit leaves the old handle blocked. Close and drop its
     /// transport before any fresh CAT verification. This method never opens,
@@ -211,18 +212,15 @@ impl<T: Transport> Radio<T> {
         if !self.identify_mcp_probe(&mut report.probe).await {
             return report;
         }
-        if !report.probe.identity.as_ref().is_some_and(|identity| {
-            identity.model == RadioModel::TmD750
-                && identity.firmware.as_str() == "1.02"
-                && identity.radio_type.as_str() == "K,2,1"
-        }) {
+        if let Some(identity) = report
+            .probe
+            .identity
+            .clone()
+            .filter(|identity| !identity.is_write_target())
+        {
             report.probe.fail(
                 McpProbeStage::Identity,
-                ProtocolError::UnexpectedResponse {
-                    expected: "TM-D750 / firmware 1.02 / radio type K,2,1 for the Gateway-Off probe",
-                    actual: format!("{:?}", report.probe.identity),
-                }
-                .into(),
+                Error::UnsupportedWriteTarget { actual: identity },
             );
             return report;
         }
@@ -237,15 +235,13 @@ impl<T: Transport> Radio<T> {
                 return report;
             }
         }
-        if report.gateway_mode != Some(DvGatewayMode::Off) {
-            report.probe.fail(
-                McpProbeStage::Gateway,
-                ProtocolError::UnexpectedResponse {
-                    expected: "Gateway Off before the fixed MCP probe",
-                    actual: format!("{:?}", report.gateway_mode),
-                }
-                .into(),
-            );
+        if let Some(observed) = report
+            .gateway_mode
+            .filter(|mode| *mode != DvGatewayMode::Off)
+        {
+            report
+                .probe
+                .fail(McpProbeStage::Gateway, Error::GatewayNotOff { observed });
             return report;
         }
         if should_cancel() {

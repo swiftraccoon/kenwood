@@ -1,5 +1,5 @@
-//! Identify, read the slot menus, decode a PM name, patch it, write it back
-//! verified, exit: the whole slice over the mock transport.
+//! Identify, read the slot menus, decode a PM name, patch it, compare and
+//! exchange the page, exit: the whole slice over the mock transport.
 
 use kenwood_schema as _;
 use mcp_d75_extract as _;
@@ -10,16 +10,16 @@ use tokio_serial as _;
 use tracing as _;
 
 use kenwood_tmd750::memory::{
-    DecodedFieldValue, FieldValue, MemoryImage, PatchPlanner, is_supported_schema_target,
-    menu_field,
+    DecodedFieldValue, FieldValue, MemoryImage, PatchPlanner, menu_field,
 };
 use kenwood_tmd750::protocol::mcp::regions::{GLOBAL_SETTINGS, slot_menu};
 use kenwood_tmd750::protocol::mcp::{ACK, ENTER, EXIT, read_request, write_request};
 use kenwood_tmd750::radio::Radio;
-use kenwood_tmd750::{Page, Region, SlotIndex};
+use kenwood_tmd750::{Page, PageReplacement, Region, SlotIndex};
 use kenwood_transport::MockTransport;
 
-type TestResult = Result<(), Box<dyn std::error::Error>>;
+type TestError = Box<dyn std::error::Error>;
+type TestResult = Result<(), TestError>;
 
 fn script_read(mock: &mut MockTransport, page: Page, image: &[u8]) -> TestResult {
     let start = page.address().as_usize();
@@ -46,7 +46,7 @@ async fn patch_a_pm_name_end_to_end() -> TestResult {
     regions.extend(slot_menu(slot));
     let mut mock = MockTransport::new();
     mock.expect(b"ID\r", b"ID TM-D750\r");
-    mock.expect(b"FV\r", b"FV 1.00\r");
+    mock.expect(b"FV\r", b"FV 1.02\r");
     mock.expect(b"TY\r", b"TY K,2,1\r");
     mock.expect(ENTER, b"0M\r");
     for region in &regions {
@@ -76,10 +76,10 @@ async fn patch_a_pm_name_end_to_end() -> TestResult {
 
     let mut radio = Radio::new(mock);
     let identity = radio.identify().await?;
-    assert!(is_supported_schema_target(
-        identity.model,
-        &identity.firmware
-    ));
+    assert!(
+        identity.is_write_target(),
+        "the scripted radio is a write target"
+    );
     let mut session = radio.enter_mcp().await?;
     let read = session.read_regions(&regions, |_| {}).await?;
     let before = read.into_memory_image(&regions)?;
@@ -91,8 +91,23 @@ async fn patch_a_pm_name_end_to_end() -> TestResult {
         before.slot(slot).read(&meter.descriptor)?,
         DecodedFieldValue::Unsigned(1)
     );
+    let replacements = patches
+        .pages()
+        .iter()
+        .map(|patch| {
+            let page = patch.page();
+            let start = page.address().as_usize();
+            let expected = before
+                .as_bytes()
+                .get(start..start + page.len())
+                .ok_or("patch page outside image")?;
+            let mut replacement = expected.to_vec();
+            patch.apply(&mut replacement)?;
+            Ok(PageReplacement::new(page, expected, &replacement)?)
+        })
+        .collect::<Result<Vec<_>, TestError>>()?;
     let report = session
-        .write_pages_verified(patches.pages(), |_| {})
+        .compare_exchange_pages(&replacements, |_| Ok(()), |_| {})
         .await?;
     assert_eq!(report.verified_pages.len(), patches.len());
     session.exit().await?;

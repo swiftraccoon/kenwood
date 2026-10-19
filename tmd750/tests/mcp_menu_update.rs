@@ -10,7 +10,7 @@ use tracing as _;
 
 use kenwood_tmd750::protocol::mcp::{ACK, read_request, regions, write_request};
 use kenwood_tmd750::{
-    Error, FirmwareIdentity, Identity, MenuAssignment, MenuFieldSnapshot, MenuUpdatePlan, Page,
+    FirmwareIdentity, Identity, MenuAssignment, MenuFieldSnapshot, MenuUpdatePlan, Page,
     PageReplacement, Radio, RadioModel, RadioType, Region, SlotIndex,
 };
 use kenwood_transport::MockTransport;
@@ -122,29 +122,6 @@ async fn registered_batch_on_102_compares_guards_then_writes_complete_pages() ->
         session.journal().verified,
         report.verified_pages,
         "all acknowledged pages require complete immediate readback"
-    );
-    session.exit().await?;
-    radio.into_transport().assert_complete();
-    Ok(())
-}
-
-#[tokio::test]
-async fn new_menu_admission_does_not_enable_legacy_raw_page_writes() -> TestResult {
-    let plan = plan()?;
-    let mut mock = entry("1.02");
-    mock.expect(b"E", &[ACK]);
-    let mut radio = Radio::new(mock);
-    let mut session = radio.enter_mcp().await?;
-    let result = session
-        .compare_exchange_pages(plan.replacements(), |_| Ok(()), |_| {})
-        .await;
-    assert!(
-        matches!(result, Err(Error::UnsupportedSchemaTarget { .. })),
-        "the evidence-bearing menu API must not widen legacy arbitrary-page admission"
-    );
-    assert!(
-        session.journal().possibly_written.is_empty(),
-        "refusal must precede dispatch"
     );
     session.exit().await?;
     radio.into_transport().assert_complete();

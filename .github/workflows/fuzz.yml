@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - 'dstar-gateway-core/**'
+      - 'tmd750/**'
       - '.github/workflows/fuzz.yml'
   workflow_dispatch:
 
@@ -22,33 +23,40 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - dplus_decode_server_to_client
-          - dplus_decode_client_to_server
-          - dplus_parse_auth_response
-          - dextra_decode_server_to_client
-          - dextra_decode_client_to_server
-          - dcs_decode_server_to_client
-          - dcs_decode_client_to_server
-          - header_decode
-          - slow_data_descramble
-          - dprs_parse
+        include:
+          - { crate: dstar-gateway-core, target: dplus_decode_server_to_client }
+          - { crate: dstar-gateway-core, target: dplus_decode_client_to_server }
+          - { crate: dstar-gateway-core, target: dplus_parse_auth_response }
+          - { crate: dstar-gateway-core, target: dextra_decode_server_to_client }
+          - { crate: dstar-gateway-core, target: dextra_decode_client_to_server }
+          - { crate: dstar-gateway-core, target: dcs_decode_server_to_client }
+          - { crate: dstar-gateway-core, target: dcs_decode_client_to_server }
+          - { crate: dstar-gateway-core, target: header_decode }
+          - { crate: dstar-gateway-core, target: slow_data_descramble }
+          - { crate: dstar-gateway-core, target: dprs_parse }
+          - { crate: tmd750, target: cat_parse_line }
+          - { crate: tmd750, target: mcp_header_decode }
+          - { crate: tmd750, target: d750_parse }
+          - { crate: tmd750, target: stored_channel_from_bytes }
+          - { crate: tmd750, target: repeater_record_from_bytes }
+          - { crate: tmd750, target: callsign_entry_from_bytes }
+          - { crate: tmd750, target: nmea_parse }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: llvm-tools-preview
       # Prebuilt release binary; `cargo install cargo-fuzz` compiled
-      # the tool from source in every one of the ten matrix jobs.
+      # the tool from source in every matrix job.
       - uses: taiki-e/install-action@cargo-fuzz
-      # The fuzz crate is its own workspace with its own lockfile and
+      # Each fuzz crate is its own workspace with its own lockfile and
       # target dir; point rust-cache there. Nightly moves daily so the
       # key rotates with it, but repeat pushes to the same PR reuse it.
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: dstar-gateway-core/fuzz
+          workspaces: ${{ matrix.crate }}/fuzz
       - name: Run fuzz target
         env:
           FUZZ_TARGET: ${{ matrix.target }}
         run: cargo +nightly fuzz run "$FUZZ_TARGET" -- -max_total_time=60
-        working-directory: dstar-gateway-core
+        working-directory: ${{ matrix.crate }}

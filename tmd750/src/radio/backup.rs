@@ -4,9 +4,9 @@
 
 use super::probe::{McpProbeExit, McpProbeSegment};
 use super::{Identity, Progress, Radio};
-use crate::error::{Error, ProtocolError};
+use crate::error::Error;
 use crate::protocol::mcp::{ENTER_RESPONSE, regions};
-use crate::types::{DvGatewayMode, Page, RadioModel, Region};
+use crate::types::{DvGatewayMode, Page, Region};
 use kenwood_transport::Transport;
 
 /// A step in the fixed configuration backup sequence.
@@ -124,7 +124,9 @@ fn configuration_pages() -> Vec<Page> {
 impl<T: Transport> Radio<T> {
     /// Read the standard configuration only after exact identity and Gateway Off.
     ///
-    /// Requires `TM-D750 / 1.02 / K,2,1` and a fresh `GW 0` on this connection.
+    /// Requires an identity in [`super::WRITE_TARGETS`] and a fresh `GW 0` on
+    /// this connection; another identity fails at [`McpBackupStage::Identity`]
+    /// with [`Error::UnsupportedWriteTarget`].
     /// Uses the same read and detached-exit engine as
     /// [`Self::backup_mcp_until_exit`], with the same cancellation boundaries.
     /// It never sends memory-write, RF, recovery, or post-exit CAT commands.
@@ -140,18 +142,14 @@ impl<T: Transport> Radio<T> {
         if !self.identify_backup(&mut should_cancel, &mut report).await {
             return report;
         }
-        if !report.identity.as_ref().is_some_and(|identity| {
-            identity.model == RadioModel::TmD750
-                && identity.firmware.as_str() == "1.02"
-                && identity.radio_type.as_str() == "K,2,1"
-        }) {
+        if let Some(identity) = report
+            .identity
+            .clone()
+            .filter(|identity| !identity.is_write_target())
+        {
             report.fail(
                 McpBackupStage::Identity,
-                ProtocolError::UnexpectedResponse {
-                    expected: "TM-D750 / firmware 1.02 / radio type K,2,1 for the Gateway-Off backup",
-                    actual: format!("{:?}", report.identity),
-                }
-                .into(),
+                Error::UnsupportedWriteTarget { actual: identity },
             );
             return report;
         }
@@ -166,15 +164,11 @@ impl<T: Transport> Radio<T> {
                 return report;
             }
         }
-        if report.gateway_mode != Some(DvGatewayMode::Off) {
-            report.fail(
-                McpBackupStage::Gateway,
-                ProtocolError::UnexpectedResponse {
-                    expected: "Gateway Off before the standard configuration backup",
-                    actual: format!("{:?}", report.gateway_mode),
-                }
-                .into(),
-            );
+        if let Some(observed) = report
+            .gateway_mode
+            .filter(|mode| *mode != DvGatewayMode::Off)
+        {
+            report.fail(McpBackupStage::Gateway, Error::GatewayNotOff { observed });
             return report;
         }
         self.finish_backup(&mut should_cancel, &mut progress, &mut report)

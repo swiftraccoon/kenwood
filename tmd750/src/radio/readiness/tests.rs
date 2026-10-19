@@ -1046,6 +1046,29 @@ async fn endpoints_other_than_the_operation_panel_need_no_settle_wait() -> TestR
 }
 
 #[tokio::test]
+async fn a_continuous_enumeration_wait_applies_to_every_usb_role() -> TestResult {
+    let main_unit = SerialCandidate {
+        pid: Some(TMD750_MAIN_PID),
+        ..endpoint()
+    };
+    let mut host = FakeHost::new(Vec::new());
+    host.snapshot = vec![main_unit.clone()];
+    let report = await_continuous_enumeration(&mut host, &main_unit, &AtomicBool::new(false)).await;
+    assert!(
+        matches!(report.outcome, SettleOutcome::Settled),
+        "{report:?}"
+    );
+    assert_eq!(report.elapsed, SETTLE_QUIET);
+    assert_eq!(
+        report.enumerations.len(),
+        usize::try_from(SETTLE_QUIET.as_secs())? + 1,
+        "one enumeration per poll interval"
+    );
+    assert_eq!(host.opens, 0, "the wait opens nothing");
+    Ok(())
+}
+
+#[tokio::test]
 async fn the_operation_panel_settles_after_continuous_enumeration() -> TestResult {
     let mut host = FakeHost::new(Vec::new());
     let report = await_settled(&mut host, &endpoint(), &AtomicBool::new(false)).await;

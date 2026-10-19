@@ -6,22 +6,10 @@ use kenwood_schema::CodecError;
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 #[test]
-fn strict_constructor_rejects_unmatched_firmware() -> TestResult {
-    let image = MemoryImage::blank();
-    for identity in ["1.02", "1.0", "1.01", "V1.00"] {
-        let firmware = FirmwareIdentity::new(identity)?;
-        assert!(matches!(
-            TextImage::new(&image, &firmware),
-            Err(TextError::UnsupportedFirmware { actual, .. }) if actual == firmware
-        ));
-    }
-    let firmware = FirmwareIdentity::new("1.00")?;
-    let view = TextImage::new(&image, &firmware)?;
-    assert_eq!(view.firmware(), &firmware);
-    assert_eq!(
-        view.qualification(),
-        TextLayoutQualification::RegistryTargetMatched
-    );
+fn a_captured_image_decodes_without_a_firmware_label() -> TestResult {
+    let image = image_with(TextSetting::PmName1, TextScope::Global, "HOME")?;
+    let view = TextImage::new(&image);
+    assert_eq!(view.read(TextSetting::PmName1, TextScope::Global)?, "HOME");
     Ok(())
 }
 
@@ -54,7 +42,9 @@ fn supported_keys_are_finite_unique_and_registry_backed() -> TestResult {
     for rejected in [
         "pm-name-0",
         "pm-name-6",
-        "dstar-my-callsign-7",
+        "dstar-my-callsign-1",
+        "dstar-memo-1",
+        "dv-gateway-my-callsign-7",
         "dstar-message-6",
         "PM-NAME-1",
         "pm.PmName1",
@@ -64,6 +54,31 @@ fn supported_keys_are_finite_unique_and_registry_backed() -> TestResult {
             rejected.parse::<TextSetting>(),
             Err(TextError::UnknownSetting { .. })
         ));
+    }
+    Ok(())
+}
+
+#[test]
+fn dv_gateway_settings_name_the_dv_gateway_list() -> TestResult {
+    for (key, setting, field) in [
+        (
+            "dv-gateway-my-callsign-1",
+            TextSetting::DvGatewayMyCallsign1,
+            "dv.MyCallsignDvGatewayList[0].MyCallsignDvGateway",
+        ),
+        (
+            "dv-gateway-my-callsign-6",
+            TextSetting::DvGatewayMyCallsign6,
+            "dv.MyCallsignDvGatewayList[5].MyCallsignDvGateway",
+        ),
+        (
+            "dv-gateway-memo-1",
+            TextSetting::DvGatewayMemo1,
+            "dv.MyCallsignDvGatewayList[0].MemoDvGateway",
+        ),
+    ] {
+        assert_eq!(key.parse::<TextSetting>()?, setting);
+        assert_eq!(setting.metadata()?.field_name, field);
     }
     Ok(())
 }
@@ -86,21 +101,21 @@ fn generated_storage_constraints_are_exposed_without_ui_assumptions() -> TestRes
             0,
         ),
         (
-            TextSetting::DstarMyCallsign1,
+            TextSetting::DvGatewayMyCallsign1,
             TextScopeKind::PerSlot,
             8,
             StringEncoding::Utf8,
             0,
         ),
         (
-            TextSetting::DstarMyCallsign6,
+            TextSetting::DvGatewayMyCallsign6,
             TextScopeKind::PerSlot,
             8,
             StringEncoding::Utf8,
             0,
         ),
         (
-            TextSetting::DstarMemo6,
+            TextSetting::DvGatewayMemo6,
             TextScopeKind::PerSlot,
             4,
             StringEncoding::Utf8,
@@ -131,37 +146,22 @@ fn generated_storage_constraints_are_exposed_without_ui_assumptions() -> TestRes
 }
 
 #[test]
-fn unqualified_interpretation_preserves_firmware_and_preview_status() -> TestResult {
+fn previews_report_the_setting_scope_and_both_values() -> TestResult {
     let image = image_with(TextSetting::PmName1, TextScope::Global, "HOME")?;
-    for identity in ["1.02", "1.00"] {
-        let firmware = FirmwareIdentity::new(identity)?;
-        let view = TextImage::interpret_unqualified(&image, &firmware);
-        assert_eq!(view.firmware(), &firmware);
-        assert_eq!(
-            view.qualification(),
-            TextLayoutQualification::UnqualifiedInterpretation
-        );
-        assert_eq!(view.read(TextSetting::PmName1, TextScope::Global)?, "HOME");
-        let preview = view.preview(TextSetting::PmName1, TextScope::Global, "FIELD")?;
-        assert_eq!(preview.before(), "HOME");
-        assert_eq!(preview.after(), "FIELD");
-        assert_eq!(preview.firmware(), &firmware);
-        assert_eq!(
-            preview.qualification(),
-            TextLayoutQualification::UnqualifiedInterpretation
-        );
-        assert_eq!(preview.setting(), TextSetting::PmName1);
-        assert_eq!(preview.scope(), TextScope::Global);
-        assert!(!preview.patches().is_empty());
-    }
+    let preview =
+        TextImage::new(&image).preview(TextSetting::PmName1, TextScope::Global, "FIELD")?;
+    assert_eq!(preview.before(), "HOME");
+    assert_eq!(preview.after(), "FIELD");
+    assert_eq!(preview.setting(), TextSetting::PmName1);
+    assert_eq!(preview.scope(), TextScope::Global);
+    assert!(!preview.patches().is_empty());
     Ok(())
 }
 
 #[test]
 fn scope_confusion_is_rejected_for_reads_and_previews() -> TestResult {
     let image = MemoryImage::blank();
-    let firmware = FirmwareIdentity::new("1.00")?;
-    let view = TextImage::new(&image, &firmware)?;
+    let view = TextImage::new(&image);
     for (setting, scope, expected, actual) in [
         (
             TextSetting::PmName1,
@@ -170,7 +170,7 @@ fn scope_confusion_is_rejected_for_reads_and_previews() -> TestResult {
             TextScopeKind::PerSlot,
         ),
         (
-            TextSetting::DstarMyCallsign1,
+            TextSetting::DvGatewayMyCallsign1,
             TextScope::Global,
             TextScopeKind::PerSlot,
             TextScopeKind::Global,
@@ -190,15 +190,10 @@ fn scope_confusion_is_rejected_for_reads_and_previews() -> TestResult {
 #[test]
 fn unicode_capacity_is_checked_in_bytes_without_truncation() -> TestResult {
     let image = image_with(TextSetting::PmName1, TextScope::Global, "OLD")?;
-    let firmware = FirmwareIdentity::new("1.00")?;
-    let view = TextImage::new(&image, &firmware)?;
+    let view = TextImage::new(&image);
     let exact = "é".repeat(8);
     let preview = view.preview(TextSetting::PmName1, TextScope::Global, &exact)?;
     assert_eq!(preview.after(), exact);
-    assert_eq!(
-        preview.qualification(),
-        TextLayoutQualification::RegistryTargetMatched
-    );
     let mut patched = image.as_bytes().to_vec();
     preview.patches().apply_to_image(&mut patched)?;
     assert_eq!(patched.get(0x4F00A..0x4F01A), Some(exact.as_bytes()));
@@ -219,10 +214,9 @@ fn unicode_capacity_is_checked_in_bytes_without_truncation() -> TestResult {
 #[test]
 fn memory_map_strings_reject_non_ascii_and_keep_exact_capacity() -> TestResult {
     let scope = TextScope::Slot(SlotIndex::new(5)?);
-    let firmware = FirmwareIdentity::new("1.00")?;
     for setting in [TextSetting::DstarMessage1, TextSetting::PowerOnMessage] {
         let image = image_with(setting, scope, "OLD")?;
-        let view = TextImage::new(&image, &firmware)?;
+        let view = TextImage::new(&image);
         let exact = "X".repeat(setting.metadata()?.max_bytes);
         assert_eq!(view.preview(setting, scope, &exact)?.after(), exact);
         assert!(matches!(
@@ -247,8 +241,7 @@ fn memory_map_strings_reject_non_ascii_and_keep_exact_capacity() -> TestResult {
 fn input_control_characters_are_refused_before_patch_creation() -> TestResult {
     let setting = TextSetting::PmName1;
     let image = image_with(setting, TextScope::Global, "OLD")?;
-    let firmware = FirmwareIdentity::new("1.00")?;
-    let view = TextImage::new(&image, &firmware)?;
+    let view = TextImage::new(&image);
     for character in ['\0', '\n', '\r', '\t', '\u{1b}', '\u{7f}', '\u{85}'] {
         assert_eq!(
             view.preview(setting, TextScope::Global, &format!("A{character}B")),
@@ -260,11 +253,10 @@ fn input_control_characters_are_refused_before_patch_creation() -> TestResult {
 
 #[test]
 fn decoding_keeps_interior_spaces_and_trims_only_trailing_padding() -> TestResult {
-    let setting = TextSetting::DstarMyCallsign1;
+    let setting = TextSetting::DvGatewayMyCallsign1;
     let scope = TextScope::Slot(SlotIndex::new(0)?);
     let image = image_with(setting, scope, "AB CD")?;
-    let firmware = FirmwareIdentity::new("1.00")?;
-    let view = TextImage::new(&image, &firmware)?;
+    let view = TextImage::new(&image);
     assert_eq!(
         image.as_bytes().get(0x51008..0x51010),
         Some(b"AB CD\0\0\0".as_slice())
@@ -279,51 +271,39 @@ fn decoding_keeps_interior_spaces_and_trims_only_trailing_padding() -> TestResul
         Some(b"EF G  \0\0".as_slice())
     );
     let image = MemoryImage::from_bytes(patched)?;
-    assert_eq!(
-        TextImage::new(&image, &firmware)?.read(setting, scope)?,
-        "EF G  "
-    );
+    assert_eq!(TextImage::new(&image).read(setting, scope)?, "EF G  ");
     Ok(())
 }
 
 #[test]
-fn nul_filled_callsign_is_empty_under_both_explicit_layout_modes() -> TestResult {
+fn a_nul_filled_callsign_reads_empty_and_previews_its_replacement() -> TestResult {
     let image = MemoryImage::from_bytes(vec![0; crate::types::IMAGE_LENGTH])?;
-    let setting = TextSetting::DstarMyCallsign1;
+    let setting = TextSetting::DvGatewayMyCallsign1;
     let scope = TextScope::Slot(SlotIndex::new(0)?);
-    let registry_firmware = FirmwareIdentity::new("1.00")?;
-    let unqualified_firmware = FirmwareIdentity::new("1.02")?;
     assert_eq!(
         image.as_bytes().get(0x51008..0x51010),
         Some([0; 8].as_slice())
     );
-    for view in [
-        TextImage::new(&image, &registry_firmware)?,
-        TextImage::interpret_unqualified(&image, &unqualified_firmware),
-    ] {
-        assert_eq!(view.read(setting, scope)?, "");
-        let preview = view.preview(setting, scope, "KQ4NIT")?;
-        assert_eq!(preview.before(), "");
-        assert_eq!(preview.after(), "KQ4NIT");
-        assert_eq!(preview.firmware(), view.firmware());
-        assert_eq!(preview.qualification(), view.qualification());
-        let mut bytes = image.as_bytes().to_vec();
-        preview.patches().apply_to_image(&mut bytes)?;
-        assert_eq!(bytes.get(0x51008..0x51010), Some(b"KQ4NIT\0\0".as_slice()));
-    }
+    let view = TextImage::new(&image);
+    assert_eq!(view.read(setting, scope)?, "");
+    let preview = view.preview(setting, scope, "KQ4NIT")?;
+    assert_eq!(preview.before(), "");
+    assert_eq!(preview.after(), "KQ4NIT");
+    let mut bytes = image.as_bytes().to_vec();
+    preview.patches().apply_to_image(&mut bytes)?;
+    assert_eq!(bytes.get(0x51008..0x51010), Some(b"KQ4NIT\0\0".as_slice()));
     Ok(())
 }
 
 #[test]
 fn corrupt_stored_text_is_not_silently_truncated_or_replacement_decoded() -> TestResult {
     let setting = TextSetting::PmName1;
-    let firmware = FirmwareIdentity::new("1.00")?;
     let mut bytes = image_with(setting, TextScope::Global, "AB CD")?.into_bytes();
     *bytes
         .get_mut(0x4F00C)
         .ok_or("PM name interior byte missing")? = 0;
     let image = MemoryImage::from_bytes(bytes)?;
-    let view = TextImage::new(&image, &firmware)?;
+    let view = TextImage::new(&image);
     assert_eq!(
         view.read(setting, TextScope::Global),
         Err(TextError::ControlCharacter {
@@ -339,7 +319,7 @@ fn corrupt_stored_text_is_not_silently_truncated_or_replacement_decoded() -> Tes
     *bytes.get_mut(0x4F00A).ok_or("PM name start missing")? = 0xFF;
     let invalid = MemoryImage::from_bytes(bytes)?;
     assert!(matches!(
-        TextImage::new(&invalid, &firmware)?.read(setting, TextScope::Global),
+        TextImage::new(&invalid).read(setting, TextScope::Global),
         Err(TextError::InvalidUtf8 { .. })
     ));
     let setting = TextSetting::PowerOnMessage;
@@ -350,7 +330,7 @@ fn corrupt_stored_text_is_not_silently_truncated_or_replacement_decoded() -> Tes
         .ok_or("power-on message byte missing")? = 0;
     let image = MemoryImage::from_bytes(bytes)?;
     assert!(matches!(
-        TextImage::new(&image, &firmware)?.read(setting, scope),
+        TextImage::new(&image).read(setting, scope),
         Err(TextError::Schema(SchemaError::Codec {
             source: CodecError::InvalidMemoryMapTextByte { value: 0, .. },
             ..
@@ -361,7 +341,6 @@ fn corrupt_stored_text_is_not_silently_truncated_or_replacement_decoded() -> Tes
 
 #[test]
 fn every_setting_round_trips_without_touching_other_image_bytes() -> TestResult {
-    let firmware = FirmwareIdentity::new("1.00")?;
     for &setting in TextSetting::all() {
         let scopes: Vec<_> = match setting.metadata()?.scope {
             TextScopeKind::Global => vec![TextScope::Global],
@@ -370,8 +349,7 @@ fn every_setting_round_trips_without_touching_other_image_bytes() -> TestResult 
         for scope in scopes {
             let image = image_with(setting, scope, "OLD")?;
             let original = image.clone();
-            let view = TextImage::new(&image, &firmware)?;
-            let preview = view.preview(setting, scope, "NEW")?;
+            let preview = TextImage::new(&image).preview(setting, scope, "NEW")?;
             assert_eq!(preview.before(), "OLD");
             assert_eq!(preview.after(), "NEW");
             let mut patched = image.as_bytes().to_vec();
@@ -384,10 +362,7 @@ fn every_setting_round_trips_without_touching_other_image_bytes() -> TestResult 
             )?;
             assert_eq!(patched, expected.as_bytes());
             assert_eq!(image, original);
-            assert_eq!(
-                TextImage::new(&expected, &firmware)?.read(setting, scope)?,
-                "NEW"
-            );
+            assert_eq!(TextImage::new(&expected).read(setting, scope)?, "NEW");
         }
     }
     Ok(())
@@ -395,11 +370,10 @@ fn every_setting_round_trips_without_touching_other_image_bytes() -> TestResult 
 
 #[test]
 fn per_slot_preview_uses_the_selected_slot_and_clears_old_string_tail() -> TestResult {
-    let setting = TextSetting::DstarMyCallsign1;
+    let setting = TextSetting::DvGatewayMyCallsign1;
     let scope = TextScope::Slot(SlotIndex::new(5)?);
     let image = image_with(setting, scope, "ABCDEFGH")?;
-    let firmware = FirmwareIdentity::new("1.00")?;
-    let preview = TextImage::new(&image, &firmware)?.preview(setting, scope, "A")?;
+    let preview = TextImage::new(&image).preview(setting, scope, "A")?;
     let mut bytes = image.as_bytes().to_vec();
     preview.patches().apply_to_image(&mut bytes)?;
     assert_eq!(
@@ -408,7 +382,7 @@ fn per_slot_preview_uses_the_selected_slot_and_clears_old_string_tail() -> TestR
     );
     assert_eq!(bytes.get(0x51008..0x51010), Some([0xFF; 8].as_slice()));
     let image = MemoryImage::from_bytes(bytes)?;
-    let preview = TextImage::new(&image, &firmware)?.preview(setting, scope, "")?;
+    let preview = TextImage::new(&image).preview(setting, scope, "")?;
     assert_eq!(preview.before(), "A");
     assert_eq!(preview.after(), "");
     let mut bytes = image.into_bytes();

@@ -59,6 +59,40 @@ pub enum ConfigurationError {
     /// A computed changed-byte address failed the image's address validation.
     #[error("invalid changed-byte address: {0}")]
     InvalidAddress(#[from] ValidationError),
+    /// A backup report that never identified the radio.
+    #[error("the capture has no identity")]
+    NoIdentity,
+    /// A captured page overlapping another.
+    #[error("captured page {page:?} overlaps another page")]
+    PageOverlap {
+        /// The later of the overlapping pages.
+        page: Page,
+    },
+    /// A requested range includes a byte that was never read.
+    #[error("bytes {start}..{end} were not all read")]
+    Uncovered {
+        /// First byte of the requested range.
+        start: u32,
+        /// End of the requested range.
+        end: u32,
+    },
+    /// Stored configuration bytes that are not the persisted form.
+    #[error("not a stored configuration: {detail}")]
+    Format {
+        /// What is wrong.
+        detail: &'static str,
+    },
+    /// Stored configuration bytes whose CRC-32 differs from the stored one.
+    #[error("stored configuration CRC-32 is {stated:08X}, computed {computed:08X}")]
+    Checksum {
+        /// The CRC-32 in the input.
+        stated: u32,
+        /// The CRC-32 of the bytes before it.
+        computed: u32,
+    },
+    /// The menu snapshot of the standard pages failed.
+    #[error(transparent)]
+    Schema(#[from] crate::error::SchemaError),
 }
 
 /// Borrowed bytes covering exactly the standard global and per-slot schedule.
@@ -79,8 +113,7 @@ impl<'a> StandardConfiguration<'a> {
     /// sequence. No sorting, deduplication, partial coverage, or gap filling is
     /// performed. At most the complete schedule and one extra item are consumed,
     /// so an excessive iterator cannot make this method retain unbounded input.
-    /// Identity is retained exactly and is not checked against
-    /// [`super::MCP_D750_SCHEMA_FIRMWARE_IDENTITIES`].
+    /// Identity is retained exactly; any TM-D750 identity is accepted.
     ///
     /// # Errors
     ///

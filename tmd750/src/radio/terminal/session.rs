@@ -174,7 +174,7 @@ pub enum TerminalOperationError {
     Cancelled,
     /// The fresh identity fails [`Identity::is_write_target`] or differs from
     /// the expected identity.
-    #[error("fresh identity {actual} is not the expected TM-D750 / 1.02 / K,2,1 target")]
+    #[error("fresh identity {actual} is not a write target or differs from the observed identity")]
     Identity {
         /// The identity the connection reported.
         actual: Identity,

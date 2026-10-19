@@ -139,8 +139,10 @@ fn validate_disjoint(pages: &[Page]) -> Result<(), McpError> {
 impl<T: Transport> McpSession<'_, T> {
     /// Compare every complete before-image, then write only changed pages.
     ///
-    /// Session state, the unchanged schema-target gate, all page shapes, and
-    /// duplicate/overlapping ranges are checked before page I/O. Every expected
+    /// Session state, the [`crate::radio::WRITE_TARGETS`] gate, all page
+    /// shapes, and duplicate/overlapping ranges are checked before page I/O.
+    /// No PM, Gateway or format guard is applied: those belong to
+    /// [`MenuUpdatePlan`] and [`TerminalPlan`]. Every expected
     /// page, including no-ops, must then match a fresh acknowledged read before
     /// the first write. Comparison stops at the first mismatch; no rebase or
     /// merge is performed. This is a host-side optimistic check, not a
@@ -155,8 +157,9 @@ impl<T: Transport> McpSession<'_, T> {
     ///
     /// Progress counts completed replacements (verified writes or compared
     /// no-ops), in input order, after the entire preflight has succeeded. Empty
-    /// batches emit no progress or page traffic but still enforce the schema
-    /// gate. The returned report contains only this batch's successful work;
+    /// batches emit no progress or page traffic but still enforce the
+    /// write-target gate. The returned report contains only this batch's
+    /// successful work;
     /// [`Self::journal`] retains the entire session's write state.
     ///
     /// No rollback, retry, exit, fresh connection, or CAT query is performed.
@@ -168,11 +171,12 @@ impl<T: Transport> McpSession<'_, T> {
     ///
     /// # Errors
     ///
-    /// Returns session-state, schema-target, or batch-validation errors before
-    /// any page traffic. Comparison, callback, write, and readback failures are
-    /// wrapped in [`McpError::Interrupted`] with the current session journal
-    /// counts and original typed cause. A later failure may follow earlier
-    /// successful writes; no error path restores them.
+    /// Returns session-state errors, [`Error::UnsupportedWriteTarget`], or
+    /// batch-validation errors before any page traffic. Comparison, callback,
+    /// write, and readback failures are wrapped in [`McpError::Interrupted`]
+    /// with the current session journal counts and original typed cause. A
+    /// later failure may follow earlier successful writes; no error path
+    /// restores them.
     pub async fn compare_exchange_pages(
         &mut self,
         replacements: &[PageReplacement],
@@ -180,12 +184,12 @@ impl<T: Transport> McpSession<'_, T> {
         progress: impl FnMut(Progress),
     ) -> Result<McpCompareExchangeReport, Error> {
         self.radio.require_mcp_ready()?;
-        self.require_schema_target()?;
+        self.require_write_target()?;
         self.compare_exchange_admitted(replacements, before_write, progress)
             .await
     }
 
-    /// Apply one immutable, format-checked ordinary menu update on firmware 1.02.
+    /// Apply one immutable, format-checked ordinary menu update.
     ///
     /// The plan is restricted to registered scalar fields with known value
     /// domains and an ordinary settings lifecycle. It contains complete source
@@ -196,9 +200,9 @@ impl<T: Transport> McpSession<'_, T> {
     ///
     /// Scope: registered scalar fields with an ordinary lifecycle only. This
     /// path cannot change Gateway mode, routing, or automatic-transmission
-    /// settings, does not widen the legacy raw-page schema gate, and is not
-    /// firmware-atomic. The caller synchronizes its captures, exits, closes the
-    /// transport, verifies on a fresh connection and runs any recovery.
+    /// settings, and is not firmware-atomic. The caller synchronizes its
+    /// captures, exits, closes the transport, verifies on a fresh connection
+    /// and runs any recovery.
     ///
     /// # Errors
     ///
@@ -234,8 +238,7 @@ impl<T: Transport> McpSession<'_, T> {
     /// its synthetic expected images are not accepted as prior observations.
     ///
     /// Performs no rollback, retry, automatic exit, reconnect, CAT query, or
-    /// modem operation, and widens neither the ordinary-menu nor the legacy
-    /// raw-page schema gate. The caller chooses whether to enter MCP while
+    /// modem operation. The caller chooses whether to enter MCP while
     /// Gateway is active, synchronizes the journal, selects the connection roles
     /// and runs final verification: retain the journal, await a safe
     /// [`Self::exit`], then close and drop the original handle before opening a

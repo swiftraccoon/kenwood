@@ -86,8 +86,7 @@ async fn print_global<T: Transport>(radio: &mut Radio<T>) -> Result<(), Error> {
         radio.get_packet_data_rate().await?
     );
     println!("  beacon method: {}", radio.get_beacon_method().await?);
-    let (tnc, data_band) = radio.get_tnc_mode().await?;
-    println!("  TNC: {tnc} on band {data_band}");
+    println!("  TNC: {}", radio.get_tnc_mode().await?);
     println!("  MY slot: {}", radio.get_dstar_slot().await?);
     for raw in DstarSlot::MIN..=DstarSlot::MAX {
         let entry = radio.get_dstar_callsign(DstarSlot::new(raw)?).await?;

@@ -1,12 +1,14 @@
 //! Typed CAT reads and verified writes beyond identity and mode.
 //!
 //! Every read sends one query without an implicit identity check. Every write
-//! runs the firmware `1.02` / `K,2,1` gate, requires the echo to equal the
-//! request, and reads the setting back; a failed echo or readback can follow
-//! an applied change, and nothing is rolled back. All methods follow
-//! [`Radio`]'s deadline, cancellation and post-error ownership contract and
-//! return transport, timeout, parse, rejection, unexpected-response or
-//! session-state errors; `?` is [`ProtocolError::Rejected`] and `N` is
+//! runs the [`super::WRITE_TARGETS`] gate, requires the echo to equal the
+//! request, and reads the setting back; a differing echo is
+//! [`ProtocolError::EchoMismatch`] and a differing readback
+//! [`ProtocolError::ReadbackMismatch`]. Either can follow an applied change,
+//! and nothing is rolled back. All methods follow [`Radio`]'s deadline,
+//! cancellation and post-error ownership contract and return transport,
+//! timeout, parse, rejection, unexpected-response or session-state errors;
+//! `?` is [`ProtocolError::Rejected`] and `N` is
 //! [`ProtocolError::NotAvailable`].
 
 use std::time::Duration;
@@ -18,7 +20,7 @@ use crate::types::{
     CatChannelRecord, CatMemoryChannelRecord, CurrentMemorySelector, DstarCallsignEntry, DstarSlot,
     Frequency, GpsSettings, MemoryChannelAddress, MyPositionSelection, NmeaSentences,
     PacketDataRate, PowerLevel, RealTimeClock, SMeterReading, SerialInformation, SquelchLevel,
-    StepSize, TncMode, TuningMode, UrCallsign, VoxDelay, VoxGain, VoxMode,
+    StepSize, TncState, TuningMode, UrCallsign, VoxDelay, VoxGain, VoxMode,
 };
 use kenwood_transport::Transport;
 
@@ -65,7 +67,7 @@ impl<T: Transport> Radio<T> {
 
     /// Read whether the radio reports itself powered on (`PS`).
     ///
-    /// The crate sends no `PS` write.
+    /// [`Self::power_off`] switches it off.
     ///
     /// # Errors
     ///
@@ -108,40 +110,44 @@ impl<T: Transport> Radio<T> {
     ///
     /// See the module contract.
     pub async fn get_frequency(&mut self, band: Band) -> Result<Frequency, Error> {
-        self.query(
-            Command::GetFrequency { band },
-            "Frequency",
-            |response| match response {
-                Response::Frequency { frequency, .. } => Some(*frequency),
-                _ => None,
-            },
-        )
-        .await
+        self.query(Command::GetFrequency { band }, "Frequency", frequency_reply)
+            .await
     }
 
     /// Tune one band's VFO (`FQ band,hz`) with echo and readback.
     ///
-    /// On firmware 1.02, tuning Band B from 223.000 MHz to 121.500 MHz switched
-    /// its mode to AM, and tuning back to 223.000 MHz reported FM again.
+    /// The radio selects the band plan's mode for the new frequency: tuning
+    /// into the 118 MHz air band selects AM, and tuning back out restores FM.
+    /// Read the mode afterwards when it matters.
     ///
     /// # Errors
     ///
-    /// See the module contract. A frequency outside the band's ranges is not
-    /// refused: on firmware 1.02 the radio tunes the next range's lower edge
-    /// from a gap between Band A's ranges (300 MHz became 410 MHz) and 1 MHz
-    /// below the top edge from above it (524 MHz on Band B became 523 MHz),
-    /// and echoes that frequency, so this returns
-    /// [`ProtocolError::UnexpectedResponse`] after the VFO has moved.
+    /// See the module contract. A frequency outside the band's receive ranges
+    /// is not refused: the radio tunes a nearby in-range frequency (the next
+    /// range's lower edge from a gap, or just below the top edge from above
+    /// it) and echoes it, which returns [`Error::FrequencyAdjusted`] with the
+    /// tuned frequency after the VFO has moved.
     pub async fn set_frequency(&mut self, band: Band, frequency: Frequency) -> Result<(), Error> {
-        self.apply(
-            Command::SetFrequency { band, frequency },
+        self.require_write_target().await?;
+        let tuned = self
+            .query(
+                Command::SetFrequency { band, frequency },
+                "Frequency",
+                frequency_reply,
+            )
+            .await?;
+        if tuned != frequency {
+            return Err(Error::FrequencyAdjusted {
+                band,
+                requested: frequency,
+                tuned,
+            });
+        }
+        self.confirm(
             Command::GetFrequency { band },
             "Frequency",
-            frequency,
-            |response| match response {
-                Response::Frequency { frequency, .. } => Some(*frequency),
-                _ => None,
-            },
+            &frequency,
+            frequency_reply,
         )
         .await
     }
@@ -161,6 +167,62 @@ impl<T: Transport> Radio<T> {
             },
         )
         .await
+    }
+
+    /// Replace one band's complete channel record (`FO band,<18 fields>`) with
+    /// echo and readback.
+    ///
+    /// On firmware 1.02 the radio echoes the applied record about 30 ms after
+    /// the command, in the read form; this requires the echo and the readback
+    /// to equal `record` field for field.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnsupportedWriteTarget`] before sending,
+    /// [`ProtocolError::EchoMismatch`] or [`ProtocolError::ReadbackMismatch`]
+    /// carrying both records' wire fields, and the module contract's other
+    /// errors.
+    pub async fn set_channel_record(
+        &mut self,
+        band: Band,
+        record: &CatChannelRecord,
+    ) -> Result<(), Error> {
+        self.require_write_target().await?;
+        let extract = |response: &Response| match response {
+            Response::ChannelRecord { record, .. } => Some(record.clone()),
+            _ => None,
+        };
+        let echoed = self
+            .query(
+                Command::SetChannelRecord {
+                    band,
+                    record: record.clone(),
+                },
+                "ChannelRecord",
+                extract,
+            )
+            .await?;
+        if echoed != *record {
+            return Err(ProtocolError::EchoMismatch {
+                command: "FO",
+                requested: record.to_wire_fields(),
+                echoed: echoed.to_wire_fields(),
+            }
+            .into());
+        }
+        let observed = self
+            .query(Command::GetChannelRecord { band }, "ChannelRecord", extract)
+            .await?;
+        if observed == *record {
+            Ok(())
+        } else {
+            Err(ProtocolError::ReadbackMismatch {
+                command: "FO",
+                requested: record.to_wire_fields(),
+                observed: observed.to_wire_fields(),
+            }
+            .into())
+        }
     }
 
     /// Read one band's transmit power (`PC`).
@@ -546,10 +608,12 @@ impl<T: Transport> Radio<T> {
         if selected.address() == Some(address) {
             Ok(())
         } else {
-            Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "readback equal to the request",
-                actual: format!("band {band} selected {selected}, requested {address}"),
-            }))
+            Err(ProtocolError::ReadbackMismatch {
+                command: "MR",
+                requested: address.to_string(),
+                observed: selected.to_string(),
+            }
+            .into())
         }
     }
 
@@ -580,14 +644,16 @@ impl<T: Transport> Radio<T> {
     /// The radio echoes the request exactly. Its readback equals the request
     /// except that an empty URCALL reads back as `CQCQCQ`; the returned
     /// record is that readback. Regular and program scan channels accept the
-    /// write; the priority channel answers `N`. The stored channel has no
-    /// name, which only an MCP write sets. Writing over a stored channel
-    /// replaces it.
+    /// write; the priority channel answers `N`. Writing over a stored channel
+    /// replaces its record and keeps its name; only an MCP write sets a name
+    /// ([`crate::radio::McpSession::write_channel_names`]).
     ///
     /// # Errors
     ///
-    /// See the module contract; a readback that differs from the request in
-    /// any other field is [`ProtocolError::UnexpectedResponse`].
+    /// See the module contract. A differing echo is
+    /// [`ProtocolError::EchoMismatch`]; a readback that differs from the
+    /// request in any field other than the empty URCALL is
+    /// [`ProtocolError::ReadbackMismatch`]. Both carry the `ME` wire fields.
     pub async fn write_memory_channel(
         &mut self,
         address: MemoryChannelAddress,
@@ -609,10 +675,12 @@ impl<T: Transport> Radio<T> {
             )
             .await?;
         if echoed != record {
-            return Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "write echo equal to the request",
-                actual: format!("ME {address} echoed {echoed:?}, requested {record:?}"),
-            }));
+            return Err(ProtocolError::EchoMismatch {
+                command: "ME",
+                requested: record.to_wire_fields(),
+                echoed: echoed.to_wire_fields(),
+            }
+            .into());
         }
         let observed = self
             .query(
@@ -628,18 +696,21 @@ impl<T: Transport> Radio<T> {
         if observed == expected {
             Ok(observed)
         } else {
-            Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "readback equal to the request",
-                actual: format!("ME {address} read back {observed:?}, requested {expected:?}"),
-            }))
+            Err(ProtocolError::ReadbackMismatch {
+                command: "ME",
+                requested: expected.to_wire_fields(),
+                observed: observed.to_wire_fields(),
+            }
+            .into())
         }
     }
 
     /// Clear a memory channel (`ME address,`) and confirm it reads back empty.
     ///
     /// The radio acknowledges with the bare address and the channel then
-    /// answers `N`. Clearing an empty channel is acknowledged the same way.
-    /// The priority channel answers `N` to the clear itself.
+    /// answers `N`; the clear also erases the channel's name. Clearing an
+    /// empty channel is acknowledged the same way. The priority channel
+    /// answers `N` to the clear itself.
     ///
     /// # Errors
     ///
@@ -1045,17 +1116,12 @@ impl<T: Transport> Radio<T> {
 
     /// Read the TNC mode and its data band (`TN`).
     ///
-    /// The crate sends no `TN` write.
-    ///
     /// # Errors
     ///
     /// See the module contract.
-    pub async fn get_tnc_mode(&mut self) -> Result<(TncMode, Band), Error> {
-        self.query(Command::GetTncMode, "TncMode", |response| match response {
-            Response::TncMode { mode, data_band } => Some((*mode, *data_band)),
-            _ => None,
-        })
-        .await
+    pub async fn get_tnc_mode(&mut self) -> Result<TncState, Error> {
+        self.query(Command::GetTncMode, "TncMode", super::transmit::tnc_reply)
+            .await
     }
 
     /// Read the VOX delay (`VD`).
@@ -1128,8 +1194,7 @@ impl<T: Transport> Radio<T> {
 
     /// Read the VOX state (`VX`).
     ///
-    /// The crate sends no `VX` write: with a microphone connected, VOX can key
-    /// the transmitter.
+    /// [`Self::set_vox`] switches it.
     ///
     /// # Errors
     ///
@@ -1254,5 +1319,13 @@ impl<T: Transport> Radio<T> {
             },
         )
         .await
+    }
+}
+
+/// The frequency an `FQ` reply carries.
+const fn frequency_reply(response: &Response) -> Option<Frequency> {
+    match response {
+        Response::Frequency { frequency, .. } => Some(*frequency),
+        _ => None,
     }
 }

@@ -1,0 +1,71 @@
+[package]
+name = "kenwood-tmd750-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "GPL-2.0-or-later"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.kenwood-tmd750]
+path = ".."
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "cat_parse_line"
+path = "fuzz_targets/cat_parse_line.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mcp_header_decode"
+path = "fuzz_targets/mcp_header_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "d750_parse"
+path = "fuzz_targets/d750_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stored_channel_from_bytes"
+path = "fuzz_targets/stored_channel_from_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "repeater_record_from_bytes"
+path = "fuzz_targets/repeater_record_from_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "callsign_entry_from_bytes"
+path = "fuzz_targets/callsign_entry_from_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "nmea_parse"
+path = "fuzz_targets/nmea_parse.rs"
+test = false
+doc = false
+bench = false
