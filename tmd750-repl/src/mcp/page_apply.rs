@@ -45,6 +45,12 @@ pub(super) enum PlanKind {
     ChannelNames,
     /// `mcp callsign-list apply`.
     CallsignList,
+    /// `mcp call-channel set`.
+    CallChannel,
+    /// `mcp mic-e apply`.
+    MicE,
+    /// `mcp vfo set`.
+    Vfo,
 }
 
 impl PlanKind {
@@ -55,6 +61,9 @@ impl PlanKind {
             Self::Repeater => "Repeater update",
             Self::ChannelNames => "Channel name update",
             Self::CallsignList => "Callsign list update",
+            Self::CallChannel => "CALL channel update",
+            Self::MicE => "Mic-E type code update",
+            Self::Vfo => "VFO memory update",
         }
     }
 
@@ -65,6 +74,9 @@ impl PlanKind {
             Self::Repeater => "repeater update",
             Self::ChannelNames => "channel name update",
             Self::CallsignList => "callsign list update",
+            Self::CallChannel => "CALL channel update",
+            Self::MicE => "Mic-E type code update",
+            Self::Vfo => "VFO memory update",
         }
     }
 
@@ -75,6 +87,9 @@ impl PlanKind {
             Self::Repeater => "Repeater report",
             Self::ChannelNames => "Channel name report",
             Self::CallsignList => "Callsign list report",
+            Self::CallChannel => "CALL channel report",
+            Self::MicE => "Mic-E type code report",
+            Self::Vfo => "VFO memory report",
         }
     }
 
@@ -85,6 +100,9 @@ impl PlanKind {
             Self::Repeater => "repeater report",
             Self::ChannelNames => "channel name report",
             Self::CallsignList => "callsign list report",
+            Self::CallChannel => "CALL channel report",
+            Self::MicE => "Mic-E type code report",
+            Self::Vfo => "VFO memory report",
         }
     }
 
@@ -95,6 +113,9 @@ impl PlanKind {
             Self::Repeater => "repeater updates require current Gateway Off",
             Self::ChannelNames => "channel name updates require current Gateway Off",
             Self::CallsignList => "callsign list updates require current Gateway Off",
+            Self::CallChannel => "CALL channel updates require current Gateway Off",
+            Self::MicE => "Mic-E type code updates require current Gateway Off",
+            Self::Vfo => "VFO memory updates require current Gateway Off",
         }
     }
 
@@ -105,6 +126,9 @@ impl PlanKind {
             Self::Repeater => "repeater_update",
             Self::ChannelNames => "channel_names_update",
             Self::CallsignList => "callsign_list_update",
+            Self::CallChannel => "call_channel_update",
+            Self::MicE => "mic_e_update",
+            Self::Vfo => "vfo_update",
         }
     }
 
@@ -115,6 +139,9 @@ impl PlanKind {
             Self::Repeater => "repeater-journal.jsonl",
             Self::ChannelNames => "channel-names-journal.jsonl",
             Self::CallsignList => "callsign-list-journal.jsonl",
+            Self::CallChannel => "call-channel-journal.jsonl",
+            Self::MicE => "mic-e-journal.jsonl",
+            Self::Vfo => "vfo-journal.jsonl",
         }
     }
 
@@ -123,7 +150,15 @@ impl PlanKind {
         match (self, native) {
             (Self::Menu, true) => 2,
             (Self::Menu, false) => 3,
-            (Self::Repeater | Self::ChannelNames | Self::CallsignList, _) => 1,
+            (
+                Self::Repeater
+                | Self::ChannelNames
+                | Self::CallsignList
+                | Self::CallChannel
+                | Self::MicE
+                | Self::Vfo,
+                _,
+            ) => 1,
         }
     }
 }

@@ -706,6 +706,103 @@ the first one byte for byte. Each run compared and verified two pages and
 ended with a fresh identity and Gateway Off. How the radio displays a written
 entry is unverified.
 
+### Stored, CALL and weather channels
+
+`mcp channels list` prints every stored memory channel of a backup, then the
+six CALL channels and the ten weather channels. `mcp call-channel preview` and
+`mcp call-channel set` give one CALL channel (`--channel vhf-fm`, `vhf-dv`,
+`220-fm`, `220-dv`, `uhf-fm` or `uhf-dv`) a new `--frequency` in MHz and keep
+the rest of its record. The frequency must lie in the channel's band: 136 to
+174 MHz, 216 to 260 MHz or 410 to 470 MHz, the upper bound excluded:
+
+```bash
+cargo run -p tmd750-repl -- mcp channels list --backup backup-01/report.json
+cargo run -p tmd750-repl -- --port /dev/cu.usbmodem101 \
+  mcp call-channel set --backup backup-01/report.json --apply \
+  --output call-01 --channel uhf-fm --frequency 446.100
+```
+
+The page holding the record must match the backup before the write and is
+read back after it. The run uses the shared page-update lifecycle, journal and
+fresh CAT check: a format-1 `report.json` with
+`operation = "call_channel_update"` and `call-channel-journal.jsonl`, whose
+prepared entry records the frequency before and after. On a band tuned to the
+channel's range in the channel's mode, `tuning a call` then `channel a` reads
+the record back. `set` runs over either TM-D750 USB role at 9600 baud and
+requires `--apply` and an explicit `--port`; native Bluetooth refuses it.
+
+Hardware coverage on firmware 1.02 / type K,2,1 over the operation-panel USB
+endpoint: one run moved the 220 MHz FM CALL channel from 223.500 to 223.520
+MHz, which `tuning b call` then `channel b` read back and a fresh `mcp backup`
+showed as the only change; a second run from that backup moved it back, after
+which a fresh backup matched the first one byte for byte. Each run compared
+and verified one page and ended with a fresh identity and Gateway Off.
+
+### Mic-E type codes
+
+`mcp mic-e list` prints a backup's three user Mic-E type code tables
+(`kenwood-handheld`, `kenwood-mobile` and `yaesu`, five entries each), which
+add radio models for the station list to name Mic-E stations. `mcp mic-e
+preview` and `mcp mic-e apply` edit one entry: give its `--family` and
+`--position` (1 to 5) and either `--code` (one printable ASCII character other
+than space) with `--model` (at most 15 printable ASCII characters), or
+`--clear`:
+
+```bash
+cargo run -p tmd750-repl -- mcp mic-e list --backup backup-01/report.json
+cargo run -p tmd750-repl -- --port /dev/cu.usbmodem101 \
+  mcp mic-e apply --backup backup-01/report.json --apply \
+  --output mic-e-01 --family yaesu --position 1 --code _ --model FT-99
+```
+
+The tables' page must match the backup before the write and is read back
+after it. The run uses the shared page-update lifecycle, journal and fresh CAT
+check: a format-1 `report.json` with `operation = "mic_e_update"` and
+`mic-e-journal.jsonl`, whose prepared entry records the entry before and
+after. `apply` runs over either TM-D750 USB role at 9600 baud and requires
+`--apply` and an explicit `--port`; native Bluetooth refuses it.
+
+Hardware coverage on firmware 1.02 / type K,2,1 over the operation-panel USB
+endpoint: one run stored a Yaesu entry in empty tables, a fresh `mcp backup`
+listed it and differed from the first backup only in its five bytes, and a
+second run cleared it, after which a fresh backup matched the first one byte
+for byte. Each run compared and verified one page and ended with a fresh
+identity and Gateway Off. How the radio uses an entry when it decodes a
+received Mic-E report is unverified.
+
+### VFO memory
+
+`mcp vfo list` prints a PM slot's VFO memory from a backup (`--slot`, 0 to 5,
+default 0): each band's current VFO record and selected VFO band, then the
+record and programmable limits of every VFO band, four on band A and six on
+band B. `mcp vfo preview` and `mcp vfo set` make one edit. `--tune BAND MHZ`
+tunes band `a` or `b` to a new receive frequency as the radio does: it
+selects the VFO band whose limits hold the frequency and stores the record as
+both the band's current record and that VFO band's record. `--limits VFO_BAND
+LOWER UPPER` sets one VFO band's programmable limits in whole megahertz:
+
+```bash
+cargo run -p tmd750-repl -- mcp vfo list --backup backup-01/report.json
+cargo run -p tmd750-repl -- --port /dev/cu.usbmodem101 \
+  mcp vfo set --backup backup-01/report.json --apply \
+  --output vfo-01 --tune b 223.040
+```
+
+Each changed page must match the backup before its write and is read back
+after it. The run uses the shared page-update lifecycle, journal and fresh
+CAT check: a format-1 `report.json` with `operation = "vfo_update"` and
+`vfo-journal.jsonl`, whose prepared entry records the change before and
+after. `set` runs over either TM-D750 USB role at 9600 baud and requires
+`--apply` and an explicit `--port`; native Bluetooth refuses it.
+
+Hardware coverage on firmware 1.02 / type K,2,1 over the operation-panel USB
+endpoint, PM Off active: one run tuned band B in slot 0 from 223.020 to 223.040
+MHz, after which `channel b` reported 223.040 MHz and a fresh `mcp backup`
+differed only in the frequency bytes of band B's current record and of its VFO
+band's record; a second run tuned it back, after which a fresh backup matched
+the first one byte for byte. Each run compared and verified two pages and
+ended with a fresh identity and Gateway Off.
+
 ### Offline text inspection
 
 `mcp text list`, `show`, and `preview` work entirely offline, without enumerating

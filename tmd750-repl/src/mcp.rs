@@ -1,12 +1,15 @@
 //! Startup-only MCP workflows and offline configuration inspection.
 
 pub(crate) mod backup;
+mod call_channel;
 mod callsign_list;
 mod channel_names;
+mod channels;
 pub(crate) mod fixed;
 mod link;
 mod menu;
 mod menu_apply;
+mod mic_e;
 mod page_apply;
 pub(crate) mod reconnect;
 mod reentry_probe;
@@ -15,6 +18,7 @@ pub(crate) mod snapshot;
 mod terminal;
 mod text;
 mod text_set;
+mod vfo;
 
 use std::fs::File;
 use std::future::Future;
@@ -67,6 +71,17 @@ pub(crate) enum McpCommand {
     /// List or preview the D-STAR callsign list offline, or write an edited
     /// list in one session.
     CallsignList(callsign_list::CallsignListRequest),
+    /// List every stored channel of a backup offline, CALL and weather
+    /// channels included.
+    Channels(channels::ChannelsRequest),
+    /// Preview a CALL channel frequency offline, or write it in one session.
+    CallChannel(call_channel::CallChannelRequest),
+    /// List or preview the user Mic-E type code tables offline, or write one
+    /// entry in one session.
+    MicE(mic_e::MicERequest),
+    /// List or preview a slot's VFO memory offline, or write one edit in one
+    /// session.
+    Vfo(vfo::VfoRequest),
 }
 
 impl McpCommand {
@@ -81,7 +96,10 @@ impl McpCommand {
             Self::Repeater(request) => request.validate_endpoint_selection(explicit_port),
             Self::ChannelNames(request) => request.validate_endpoint_selection(explicit_port),
             Self::CallsignList(request) => request.validate_endpoint_selection(explicit_port),
-            Self::Terminal(_) => Ok(()),
+            Self::CallChannel(request) => request.validate_endpoint_selection(explicit_port),
+            Self::MicE(request) => request.validate_endpoint_selection(explicit_port),
+            Self::Vfo(request) => request.validate_endpoint_selection(explicit_port),
+            Self::Terminal(_) | Self::Channels(_) => Ok(()),
             Self::Probe(_) | Self::Backup(_) | Self::ReentryProbe(_) if explicit_port => Ok(()),
             Self::Probe(_) => Err(Box::new(crate::CommandError(
                 "mcp probe requires an explicit --port before mcp; USB paths are not physical radio identities"
@@ -108,6 +126,10 @@ pub(crate) fn run_offline(request: &McpCommand) -> Option<AppResult<()>> {
         McpCommand::Repeater(request) => repeater::run_offline(request),
         McpCommand::ChannelNames(request) => channel_names::run_offline(request),
         McpCommand::CallsignList(request) => callsign_list::run_offline(request),
+        McpCommand::CallChannel(request) => call_channel::run_offline(request),
+        McpCommand::MicE(request) => mic_e::run_offline(request),
+        McpCommand::Vfo(request) => vfo::run_offline(request),
+        McpCommand::Channels(request) => Some(channels::run(request)),
         McpCommand::Terminal(request) => Some(terminal::run(request)),
         McpCommand::Probe(_) | McpCommand::ReentryProbe(_) | McpCommand::Backup(_) => None,
     }
@@ -375,6 +397,12 @@ pub(crate) async fn run(
         McpCommand::CallsignList(request) => {
             callsign_list::run_selected(endpoint, baud, request).await
         }
+        McpCommand::CallChannel(request) => {
+            call_channel::run_selected(endpoint, baud, request).await
+        }
+        McpCommand::MicE(request) => mic_e::run_selected(endpoint, baud, request).await,
+        McpCommand::Vfo(request) => vfo::run_selected(endpoint, baud, request).await,
+        McpCommand::Channels(request) => channels::run(request),
         McpCommand::Terminal(request) => terminal::run(request),
     }
 }
