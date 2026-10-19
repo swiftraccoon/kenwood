@@ -270,7 +270,11 @@ reserves a unique private directory under `captures`. The command reads the
 official standard configuration schedule: 1,138 pages containing 289,962 bytes,
 including all six Programmable-Memory slots. It excludes the custom startup
 bitmap and unclassified regions. It sends no settings writes or RF requests.
-Programming temporarily interrupts normal radio operation.
+Programming temporarily interrupts normal radio operation. `--position-memory`
+also reads the GPS position memory's fourteen pages after the standard ones in
+the same session, into `backup.position_memory` with the report `scope`
+`standard_configuration_and_position_memory_without_startup_screen`; it runs
+over USB only.
 
 The USB command closes and drops the original handle after the exit ACK, waits two
 seconds, then uses [bounded CAT reacquisition](#bounded-cat-reacquisition).
@@ -667,6 +671,39 @@ a second run wrote the defaults back, after which a fresh backup matched the
 first one byte for byte. Whether the radio displays a written name is
 unverified.
 
+### Channel groups
+
+`mcp channels list` prints each stored regular channel's memory group. `mcp
+channel-groups preview` and `mcp channel-groups apply` move any number of
+stored regular channels (000 to 999) to other groups in one session: each
+`--set CHANNEL GROUP` names a channel once and a group from 0 to 29. A CAT
+`store` resets a channel's group to its hundreds digit, so assign groups after
+storing:
+
+```bash
+cargo run -p tmd750-repl -- mcp channel-groups preview \
+  --backup backup-01/report.json --set 995 12
+cargo run -p tmd750-repl -- --port /dev/cu.usbmodem101 \
+  mcp channel-groups apply --backup backup-01/report.json --apply \
+  --output channel-groups-01 --set 995 12 --set 996 12
+```
+
+The group is byte 2 of the channel's flag record, in the flag-table pages from
+`0x2000`; each changed page must match the backup before its write and is read
+back after it. The run uses the shared page-update lifecycle, journal and
+fresh CAT check: a format-1 `report.json` with `operation =
+"channel_groups_update"` and `channel-groups-journal.jsonl`, whose prepared
+entry records each channel's group before and after. `apply` runs over either
+TM-D750 USB role at 9600 baud and requires `--apply` and an explicit `--port`;
+native Bluetooth refuses it.
+
+Hardware coverage on firmware 1.02 / type K,2,1 over the operation-panel USB
+endpoint: one run moved a CAT-stored channel from group 9 to 12, after which a
+fresh `mcp backup` differed from the previous one in that byte only and a CAT
+memory read returned the same record; a CAT re-store reset the group to 9.
+Group scan and group selection on the radio with a reassigned channel are
+unverified.
+
 ### D-STAR repeater and hotspot lists
 
 `mcp repeater list` prints a backup's repeater list (1,500 slots) or, with
@@ -789,6 +826,45 @@ showed as the only change; a second run from that backup moved it back, after
 which a fresh backup matched the first one byte for byte. Each run compared
 and verified one page and ended with a fresh identity and Gateway Off.
 
+### Memory channel stores and clears
+
+`mcp channels preview` and `mcp channels apply` store and clear any number of
+regular, program scan and priority channels (`000` to `999`, `L00` to `L49`,
+`U00` to `U49`, `Pri`) in one session. `--store CHANNEL SOURCE` takes band A's
+or B's current VFO record in PM Off (`a` or `b`, the record `FO` reports) or
+another stored channel's record and lockout; `--clear CHANNEL` empties a
+channel and its name. A store writes the band code, lockout and record a CAT
+`store` of the same record writes and keeps the channel's group and name; a
+clear writes what a CAT `clear` leaves. CAT refuses the priority channel; this
+command writes it:
+
+```bash
+cargo run -p tmd750-repl -- mcp channels preview \
+  --backup backup-01/report.json --store Pri a
+cargo run -p tmd750-repl -- --port /dev/cu.usbmodem101 \
+  mcp channels apply --backup backup-01/report.json --apply \
+  --output channels-01 --store Pri a --store 041 040 --clear 040
+```
+
+Each changed flag, record and name page must match the backup before its write
+and is read back after it. The run uses the shared page-update lifecycle,
+journal and fresh CAT check: a format-1 `report.json` with `operation =
+"memory_channels_update"` and `memory-channels-journal.jsonl`, whose prepared
+entry records each channel before and after and the CAT fields of each stored
+record. `apply` runs over either TM-D750 USB role at 9600 baud and requires
+`--apply` and an explicit `--port`; native Bluetooth refuses it.
+
+Hardware coverage on firmware 1.02 / type K,2,1 over the operation-panel USB
+endpoint: one run stored band A's VFO record into channel 991 and the priority
+channel, after which a fresh `mcp backup` held 991 byte for byte as a CAT
+`store a 990` had stored 990, and `memory 991` read it back; a second run
+cleared all three, returning the channel tables of a fresh backup byte for
+byte to their state before the CAT store. A 162.550 MHz priority channel
+stored this way, with `mcp menu apply --slot 0 radio.PriorityScan on`, put
+band B in Memory mode on `Pri` at that frequency with its squelch open
+(`tuning b`, `current b`, `freq b`, `busy b`). `memory Pri` and `recall a Pri`
+answer `N` whether or not the priority channel is stored.
+
 ### Mic-E type codes
 
 `mcp mic-e list` prints a backup's three user Mic-E type code tables
@@ -897,6 +973,44 @@ each, a fresh `mcp backup` listed the channel and differed from the previous
 backup only in its name and code bytes. Two more runs cleared them, after which
 a fresh backup matched the first one byte for byte. Each run ended with a fresh
 identity and Gateway Off.
+
+### GPS position memory
+
+`mcp position list` prints the positions of a backup taken with `mcp backup
+--position-memory`, numbered from 1 in the radio's order. `mcp position
+preview` and `mcp position apply` edit them: `--remove NUMBER` drops a
+position and `--add NAME LATITUDE LONGITUDE` appends one, the name at most
+nine stored bytes and the coordinates in signed decimal degrees (negative
+south and west) rounded to a ten-thousandth of a minute. Added positions take
+the current UTC time, `--altitude` (default 0, stored as given) and
+`--symbol` (an APRS table then code, default `\K`, the official program's
+default):
+
+```bash
+cargo run -p tmd750-repl -- --port /dev/cu.usbmodem101 \
+  mcp backup --position-memory --output backup-01
+cargo run -p tmd750-repl -- mcp position list --backup backup-01/report.json
+cargo run -p tmd750-repl -- --port /dev/cu.usbmodem101 \
+  mcp position apply --backup backup-01/report.json --apply \
+  --output position-01 --add HOME 35.6995 139.7707 --symbol /-
+```
+
+The positions are stored from slot 0 in order and listed in the index page,
+so an edit writes the record pages from `0x4C000` and the index page
+`0x4CF00` that change. Each must match the backup before its write and is read
+back after it. The run uses the shared page-update lifecycle, journal and
+fresh CAT check: a format-1 `report.json` with `operation =
+"position_memory_update"` and `position-memory-journal.jsonl`, whose prepared
+entry records the positions before and after. `apply` runs over either
+TM-D750 USB role at 9600 baud and requires `--apply` and an explicit `--port`;
+native Bluetooth refuses it.
+
+Hardware coverage on firmware 1.02 / type K,2,1 over the operation-panel USB
+endpoint: a backup read the empty memory with the standard configuration in
+one session; one run added a position, after which a fresh backup listed it
+and differed only in its record and index byte, and a second run removed it,
+after which a fresh backup matched the first one byte for byte. How the radio
+displays a written position and the unit of its altitude are unverified.
 
 ### Offline text inspection
 

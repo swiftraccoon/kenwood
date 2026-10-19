@@ -1,4 +1,5 @@
-//! Reads every standard configuration region in one MCP session.
+//! Reads every standard configuration region in one MCP session, then the GPS
+//! position memory when `--position-memory` asks for it.
 //!
 //! After the acknowledged MCP exit the original connection is closed and the
 //! CAT identity tuple is re-read on a fresh connection.
@@ -11,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use clap::Parser;
 use kenwood_tmd750::transport::SerialCandidate;
 use kenwood_tmd750::{
-    Identity, McpBackupOutcome, McpBackupReport, McpBackupStage, McpProbeExit, Radio,
+    Identity, McpBackupOutcome, McpBackupReport, McpBackupStage, McpProbeExit, Progress, Radio,
 };
 use serde::Serialize;
 use time::OffsetDateTime;
@@ -24,21 +25,57 @@ use super::{
 use crate::capture::{Artifacts, CaptureKind, CaptureTransport, Recorder, TranscriptSummary};
 use crate::{AppResult, CommandError, output};
 
-/// Capture destination for the standard configuration backup.
+/// Capture destination and scope of the configuration backup.
 ///
-/// The captured regions cover the standard configuration only; custom
-/// startup-screen pixels are outside them.
+/// The captured regions cover the standard configuration and, on request, the
+/// GPS position memory; custom startup-screen pixels are outside them.
 #[derive(Debug, Parser)]
 pub(crate) struct BackupRequest {
     /// New private capture directory; its parent must exist.
     #[arg(long, value_name = "NEW_DIRECTORY")]
     output: Option<PathBuf>,
+    /// Also read the GPS position memory, after the standard configuration
+    /// in the same session; USB only.
+    #[arg(long)]
+    position_memory: bool,
 }
 
 impl BackupRequest {
     /// Capture directory given on the command line, if any.
     pub(crate) fn output(&self) -> Option<&Path> {
         self.output.as_deref()
+    }
+
+    /// The regions the backup reads.
+    pub(crate) const fn scope(&self) -> Scope {
+        if self.position_memory {
+            Scope::WithPositionMemory
+        } else {
+            Scope::Standard
+        }
+    }
+}
+
+/// The regions a backup reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Scope {
+    /// The standard configuration schedule.
+    Standard,
+    /// The standard schedule, then the GPS position memory.
+    WithPositionMemory,
+}
+
+impl Scope {
+    /// The report's `scope` string.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Standard => {
+                "standard_configuration_without_startup_screen; unread gaps are absent, not zero-filled"
+            }
+            Self::WithPositionMemory => {
+                "standard_configuration_and_position_memory_without_startup_screen; unread gaps are absent, not zero-filled"
+            }
+        }
     }
 }
 
@@ -51,6 +88,8 @@ pub(crate) struct BackupEvidence {
     identity: Option<IdentityEvidence>,
     entry_reply: Option<Vec<u8>>,
     segments: Vec<SegmentEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    position_memory: Option<Vec<SegmentEvidence>>,
     exit: super::ExitDisposition,
     complete_configuration: bool,
     outcome: BackupOutcome,
@@ -116,15 +155,14 @@ impl From<&McpBackupReport> for BackupEvidence {
         Self {
             identity: report.identity.as_ref().map(IdentityEvidence::from),
             entry_reply: report.entry_reply.clone(),
-            segments: report
-                .segments
-                .iter()
-                .map(|segment| SegmentEvidence {
-                    address: segment.page.address().as_u32(),
-                    length: segment.page.len(),
-                    data: segment.data.clone(),
-                })
-                .collect(),
+            segments: report.segments.iter().map(SegmentEvidence::from).collect(),
+            position_memory: (!report.position_memory.is_empty()).then(|| {
+                report
+                    .position_memory
+                    .iter()
+                    .map(SegmentEvidence::from)
+                    .collect()
+            }),
             exit: report.exit.into(),
             complete_configuration: report.has_complete_configuration(),
             outcome: match &report.outcome {
@@ -179,7 +217,7 @@ impl ArtifactReport {
                 usb_product_id: endpoint.pid,
                 cat_baud: baud,
             },
-            scope: "standard_configuration_without_startup_screen; unread gaps are absent, not zero-filled",
+            scope: result.scope.label(),
             transcript: result.transcript,
             backup: result.backup.as_ref().map(BackupEvidence::from),
             open_error: result.open_error,
@@ -211,7 +249,13 @@ pub(super) async fn run(
         artifacts.directory.display()
     ));
     output::line(format_args!(
-        "Reading standard configuration regions only; no settings writes or startup-screen pixels. Normal operation pauses during programming."
+        "Reading {}; no settings writes or startup-screen pixels. Normal operation pauses during programming.",
+        match request.scope() {
+            Scope::Standard => "standard configuration regions only",
+            Scope::WithPositionMemory => {
+                "standard configuration regions, then the GPS position memory"
+            }
+        }
     ));
     output::line(format_args!(
         "Ctrl-C requests cancellation after the current complete exchange."
@@ -227,6 +271,7 @@ pub(super) async fn run(
             &mut SystemBackend::new(),
             endpoint,
             baud,
+            request.scope(),
             transcript,
             post_exit,
             &cancelled,
@@ -252,7 +297,13 @@ pub(super) async fn run(
         directory.join("report.json").display()
     ));
     if succeeded {
-        output::line(format_args!("Standard configuration backup complete."));
+        output::line(format_args!(
+            "{} complete.",
+            match request.scope() {
+                Scope::Standard => "Standard configuration backup",
+                Scope::WithPositionMemory => "Standard configuration and position memory backup",
+            }
+        ));
         Ok(())
     } else {
         Err(Box::new(CommandError(format!(
@@ -264,6 +315,7 @@ pub(super) async fn run(
 
 #[derive(Debug)]
 pub(super) struct WorkflowResult {
+    pub(super) scope: Scope,
     pub(super) backup: Option<McpBackupReport>,
     pub(super) transcript: TranscriptSummary,
     pub(super) open_error: Option<Failure>,
@@ -276,10 +328,10 @@ impl WorkflowResult {
         self.open_error.is_none()
             && self.close_error.is_none()
             && self.transcript.complete
-            && self
-                .backup
-                .as_ref()
-                .is_some_and(McpBackupReport::has_complete_configuration)
+            && self.backup.as_ref().is_some_and(|backup| {
+                backup.has_complete_configuration()
+                    && (self.scope == Scope::Standard || backup.has_complete_position_memory())
+            })
             && self.post_exit.succeeded()
     }
 }
@@ -288,11 +340,13 @@ pub(super) async fn run_workflow(
     backend: &mut impl Backend,
     endpoint: &SerialCandidate,
     baud: u32,
+    scope: Scope,
     mut original: Recorder<File>,
     post_exit: Recorder<File>,
     cancelled: &AtomicBool,
 ) -> WorkflowResult {
     let mut result = WorkflowResult {
+        scope,
         backup: None,
         transcript: original.summary(),
         open_error: None,
@@ -321,20 +375,19 @@ pub(super) async fn run_workflow(
         }
     };
     let mut radio = Radio::new(CaptureTransport::new(transport, original));
-    let backup = radio
-        .backup_mcp_until_exit(
-            || cancelled.load(Ordering::Relaxed),
-            |progress| {
-                if progress.done == 1 || progress.done % 64 == 0 || progress.done == progress.total
-                {
-                    output::line(format_args!(
-                        "Configuration pages: {}/{}.",
-                        progress.done, progress.total
-                    ));
-                }
-            },
-        )
-        .await;
+    let should_cancel = || cancelled.load(Ordering::Relaxed);
+    let backup = match scope {
+        Scope::Standard => {
+            radio
+                .backup_mcp_until_exit(should_cancel, print_progress)
+                .await
+        }
+        Scope::WithPositionMemory => {
+            radio
+                .backup_mcp_with_position_memory_until_exit(should_cancel, print_progress)
+                .await
+        }
+    };
     let mut transport = radio.into_transport();
     result.close_error = close_transport(&mut transport).await;
     result.transcript = transport.into_recorder().summary();
@@ -352,6 +405,16 @@ pub(super) async fn run_workflow(
     };
     result.backup = Some(backup);
     result
+}
+
+/// Print the first, every 64th and the last page count.
+fn print_progress(progress: Progress) {
+    if progress.done == 1 || progress.done.is_multiple_of(64) || progress.done == progress.total {
+        output::line(format_args!(
+            "Configuration pages: {}/{}.",
+            progress.done, progress.total
+        ));
+    }
 }
 
 fn verification_eligibility<'a>(
@@ -385,6 +448,12 @@ fn print_result(result: &WorkflowResult) {
             backup.segments.len(),
             backup.exit
         ));
+        if !backup.position_memory.is_empty() {
+            output::line(format_args!(
+                "Captured {} acknowledged position memory pages.",
+                backup.position_memory.len()
+            ));
+        }
         if let McpBackupOutcome::Failed { stage, error } = &backup.outcome {
             output::error(format_args!(
                 "Configuration read failed at {stage:?}: {error}"

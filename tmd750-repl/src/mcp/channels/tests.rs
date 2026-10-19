@@ -2,10 +2,7 @@
 //! weather channels as firmware 1.02 stores them.
 
 use std::collections::BTreeMap;
-use std::fs::File;
 use std::path::Path;
-
-use serde_json::Value;
 
 use super::*;
 
@@ -84,6 +81,11 @@ fn put(patches: &mut BTreeMap<u32, u8>, address: u32, bytes: &[u8]) {
 /// the VHF FM CALL record), the six CALL channels and ten weather channels
 /// on `WX 1`'s record; every other memory slot is empty.
 pub(crate) fn stored_backup(directory: &Path) -> Result<PathBuf, TestError> {
+    crate::mcp::snapshot::tests::patched_backup(directory, &stored_patches()?)
+}
+
+/// The image bytes of [`stored_backup`]'s channel tables.
+pub(crate) fn stored_patches() -> Result<BTreeMap<u32, u8>, TestError> {
     let mut patches = BTreeMap::new();
     for index in 0..1102 {
         put(&mut patches, 0x2000 + 4 * index, &[0xFF, 0x00, 0x00, 0xFF]);
@@ -108,30 +110,7 @@ pub(crate) fn stored_backup(directory: &Path) -> Result<PathBuf, TestError> {
             &name(&format!("WX {number:>2}")),
         );
     }
-    let mut document = crate::mcp::snapshot::tests::fixture();
-    let segments = document
-        .get_mut("backup")
-        .and_then(|backup| backup.get_mut("segments"))
-        .and_then(Value::as_array_mut)
-        .ok_or("fixture segments")?;
-    for segment in segments {
-        let address = segment
-            .get("address")
-            .and_then(Value::as_u64)
-            .ok_or("segment address")?;
-        let data = segment
-            .get_mut("data")
-            .and_then(Value::as_array_mut)
-            .ok_or("segment data")?;
-        for (offset, byte) in (u32::try_from(address)?..).zip(data.iter_mut()) {
-            if let Some(patch) = patches.get(&offset) {
-                *byte = Value::from(*patch);
-            }
-        }
-    }
-    let path = directory.join("report.json");
-    serde_json::to_writer(File::create_new(&path)?, &document)?;
-    Ok(path)
+    Ok(patches)
 }
 
 #[test]
@@ -139,7 +118,7 @@ fn the_listing_shows_stored_call_and_weather_channels() -> TestResult {
     let directory = tempfile::tempdir()?;
     let snapshot = Snapshot::load(&stored_backup(directory.path())?)?;
     let listing = lines(covered(&snapshot)?);
-    let regular = format!("{}: 146.520000 MHz FM", PhysicalChannel::new(5)?);
+    let regular = format!("{}: 146.520000 MHz FM, group 0", PhysicalChannel::new(5)?);
     let expected_head = [regular.as_str(), "Stored memory channels: 1."];
     assert_eq!(
         listing.get(..2),

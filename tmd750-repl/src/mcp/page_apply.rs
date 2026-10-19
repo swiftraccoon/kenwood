@@ -55,6 +55,12 @@ pub(super) enum PlanKind {
     Dtmf,
     /// `mcp group-names apply`.
     GroupNames,
+    /// `mcp channel-groups apply`.
+    ChannelGroups,
+    /// `mcp channels apply`.
+    MemoryChannels,
+    /// `mcp position apply`.
+    PositionMemory,
     /// `mcp restore apply`.
     Restore,
 }
@@ -72,6 +78,9 @@ impl PlanKind {
             Self::Vfo => "VFO memory update",
             Self::Dtmf => "DTMF memory update",
             Self::GroupNames => "Group name update",
+            Self::ChannelGroups => "Channel group update",
+            Self::MemoryChannels => "Memory channel update",
+            Self::PositionMemory => "Position memory update",
             Self::Restore => "Configuration restore",
         }
     }
@@ -88,6 +97,9 @@ impl PlanKind {
             Self::Vfo => "VFO memory update",
             Self::Dtmf => "DTMF memory update",
             Self::GroupNames => "group name update",
+            Self::ChannelGroups => "channel group update",
+            Self::MemoryChannels => "memory channel update",
+            Self::PositionMemory => "position memory update",
             Self::Restore => "configuration restore",
         }
     }
@@ -104,6 +116,9 @@ impl PlanKind {
             Self::Vfo => "VFO memory report",
             Self::Dtmf => "DTMF memory report",
             Self::GroupNames => "Group name report",
+            Self::ChannelGroups => "Channel group report",
+            Self::MemoryChannels => "Memory channel report",
+            Self::PositionMemory => "Position memory report",
             Self::Restore => "Configuration restore report",
         }
     }
@@ -120,6 +135,9 @@ impl PlanKind {
             Self::Vfo => "VFO memory report",
             Self::Dtmf => "DTMF memory report",
             Self::GroupNames => "group name report",
+            Self::ChannelGroups => "channel group report",
+            Self::MemoryChannels => "memory channel report",
+            Self::PositionMemory => "position memory report",
             Self::Restore => "configuration restore report",
         }
     }
@@ -136,6 +154,9 @@ impl PlanKind {
             Self::Vfo => "VFO memory updates require current Gateway Off",
             Self::Dtmf => "DTMF memory updates require current Gateway Off",
             Self::GroupNames => "group name updates require current Gateway Off",
+            Self::ChannelGroups => "channel group updates require current Gateway Off",
+            Self::MemoryChannels => "memory channel updates require current Gateway Off",
+            Self::PositionMemory => "position memory updates require current Gateway Off",
             Self::Restore => "configuration restores require current Gateway Off",
         }
     }
@@ -152,6 +173,9 @@ impl PlanKind {
             Self::Vfo => "vfo_update",
             Self::Dtmf => "dtmf_memory_update",
             Self::GroupNames => "group_names_update",
+            Self::ChannelGroups => "channel_groups_update",
+            Self::MemoryChannels => "memory_channels_update",
+            Self::PositionMemory => "position_memory_update",
             Self::Restore => "configuration_restore",
         }
     }
@@ -168,6 +192,9 @@ impl PlanKind {
             Self::Vfo => "vfo-journal.jsonl",
             Self::Dtmf => "dtmf-journal.jsonl",
             Self::GroupNames => "group-names-journal.jsonl",
+            Self::ChannelGroups => "channel-groups-journal.jsonl",
+            Self::MemoryChannels => "memory-channels-journal.jsonl",
+            Self::PositionMemory => "position-memory-journal.jsonl",
             Self::Restore => "restore-journal.jsonl",
         }
     }
@@ -186,6 +213,9 @@ impl PlanKind {
                 | Self::Vfo
                 | Self::Dtmf
                 | Self::GroupNames
+                | Self::ChannelGroups
+                | Self::MemoryChannels
+                | Self::PositionMemory
                 | Self::Restore,
                 _,
             ) => 1,

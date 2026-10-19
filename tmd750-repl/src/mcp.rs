@@ -3,6 +3,7 @@
 pub(crate) mod backup;
 mod call_channel;
 mod callsign_list;
+mod channel_groups;
 mod channel_names;
 mod channels;
 mod dtmf;
@@ -13,6 +14,7 @@ mod menu;
 mod menu_apply;
 mod mic_e;
 mod page_apply;
+mod position;
 pub(crate) mod reconnect;
 mod reentry_probe;
 mod repeater;
@@ -33,7 +35,9 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use kenwood_tmd750::transport::SerialCandidate;
-use kenwood_tmd750::{Identity, McpProbeExit, McpProbeOutcome, McpProbeReport, McpProbeStage};
+use kenwood_tmd750::{
+    Identity, McpProbeExit, McpProbeOutcome, McpProbeReport, McpProbeSegment, McpProbeStage,
+};
 use kenwood_transport::Transport;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -71,11 +75,17 @@ pub(crate) enum McpCommand {
     Repeater(repeater::RepeaterRequest),
     /// Preview channel names offline, or write them in one session.
     ChannelNames(channel_names::ChannelNamesRequest),
+    /// Preview channel group assignments offline, or write them in one
+    /// session.
+    ChannelGroups(channel_groups::ChannelGroupsRequest),
+    /// List or preview the GPS position memory offline, or write an edited
+    /// memory in one session.
+    Position(position::PositionRequest),
     /// List or preview the D-STAR callsign list offline, or write an edited
     /// list in one session.
     CallsignList(callsign_list::CallsignListRequest),
     /// List every stored channel of a backup offline, CALL and weather
-    /// channels included.
+    /// channels included, or store and clear memory channels in one session.
     Channels(channels::ChannelsRequest),
     /// Preview a CALL channel frequency offline, or write it in one session.
     CallChannel(call_channel::CallChannelRequest),
@@ -106,6 +116,8 @@ impl McpCommand {
             Self::Menu(request) => request.validate_endpoint_selection(explicit_port),
             Self::Repeater(request) => request.validate_endpoint_selection(explicit_port),
             Self::ChannelNames(request) => request.validate_endpoint_selection(explicit_port),
+            Self::ChannelGroups(request) => request.validate_endpoint_selection(explicit_port),
+            Self::Position(request) => request.validate_endpoint_selection(explicit_port),
             Self::CallsignList(request) => request.validate_endpoint_selection(explicit_port),
             Self::CallChannel(request) => request.validate_endpoint_selection(explicit_port),
             Self::MicE(request) => request.validate_endpoint_selection(explicit_port),
@@ -113,7 +125,8 @@ impl McpCommand {
             Self::Dtmf(request) => request.validate_endpoint_selection(explicit_port),
             Self::GroupNames(request) => request.validate_endpoint_selection(explicit_port),
             Self::Restore(request) => request.validate_endpoint_selection(explicit_port),
-            Self::Terminal(_) | Self::Channels(_) => Ok(()),
+            Self::Channels(request) => request.validate_endpoint_selection(explicit_port),
+            Self::Terminal(_) => Ok(()),
             Self::Probe(_) | Self::Backup(_) | Self::ReentryProbe(_) if explicit_port => Ok(()),
             Self::Probe(_) => Err(Box::new(crate::CommandError(
                 "mcp probe requires an explicit --port before mcp; USB paths are not physical radio identities"
@@ -139,6 +152,8 @@ pub(crate) fn run_offline(request: &McpCommand) -> Option<AppResult<()>> {
         McpCommand::Menu(request) => menu::run_offline(request),
         McpCommand::Repeater(request) => repeater::run_offline(request),
         McpCommand::ChannelNames(request) => channel_names::run_offline(request),
+        McpCommand::ChannelGroups(request) => channel_groups::run_offline(request),
+        McpCommand::Position(request) => position::run_offline(request),
         McpCommand::CallsignList(request) => callsign_list::run_offline(request),
         McpCommand::CallChannel(request) => call_channel::run_offline(request),
         McpCommand::MicE(request) => mic_e::run_offline(request),
@@ -146,7 +161,7 @@ pub(crate) fn run_offline(request: &McpCommand) -> Option<AppResult<()>> {
         McpCommand::Dtmf(request) => dtmf::run_offline(request),
         McpCommand::GroupNames(request) => group_names::run_offline(request),
         McpCommand::Restore(request) => restore::run_offline(request),
-        McpCommand::Channels(request) => Some(channels::run(request)),
+        McpCommand::Channels(request) => channels::run_offline(request),
         McpCommand::Terminal(request) => Some(terminal::run(request)),
         McpCommand::Probe(_) | McpCommand::ReentryProbe(_) | McpCommand::Backup(_) => None,
     }
@@ -249,6 +264,16 @@ struct SegmentEvidence {
     data: Vec<u8>,
 }
 
+impl From<&McpProbeSegment> for SegmentEvidence {
+    fn from(segment: &McpProbeSegment) -> Self {
+        Self {
+            address: segment.page.address().as_u32(),
+            length: segment.page.len(),
+            data: segment.data.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ExitDisposition {
@@ -306,15 +331,7 @@ impl From<&McpProbeReport> for ProbeEvidence {
         Self {
             identity: report.identity.as_ref().map(IdentityEvidence::from),
             entry_reply: report.entry_reply.clone(),
-            segments: report
-                .segments
-                .iter()
-                .map(|segment| SegmentEvidence {
-                    address: segment.page.address().as_u32(),
-                    length: segment.page.len(),
-                    data: segment.data.clone(),
-                })
-                .collect(),
+            segments: report.segments.iter().map(SegmentEvidence::from).collect(),
             exit: report.exit.into(),
             outcome: match &report.outcome {
                 McpProbeOutcome::AwaitingCatVerification => Outcome::AwaitingCatVerification,
@@ -411,6 +428,10 @@ pub(crate) async fn run(
         McpCommand::ChannelNames(request) => {
             channel_names::run_selected(endpoint, baud, request).await
         }
+        McpCommand::ChannelGroups(request) => {
+            channel_groups::run_selected(endpoint, baud, request).await
+        }
+        McpCommand::Position(request) => position::run_selected(endpoint, baud, request).await,
         McpCommand::CallsignList(request) => {
             callsign_list::run_selected(endpoint, baud, request).await
         }
@@ -422,7 +443,7 @@ pub(crate) async fn run(
         McpCommand::Dtmf(request) => dtmf::run_selected(endpoint, baud, request).await,
         McpCommand::GroupNames(request) => group_names::run_selected(endpoint, baud, request).await,
         McpCommand::Restore(request) => restore::run_selected(endpoint, baud, request).await,
-        McpCommand::Channels(request) => channels::run(request),
+        McpCommand::Channels(request) => channels::run_selected(endpoint, baud, request).await,
         McpCommand::Terminal(request) => terminal::run(request),
     }
 }

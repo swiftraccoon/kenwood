@@ -316,6 +316,11 @@ async fn run_native(cli: &Cli, command: Option<Command>) -> AppResult<()> {
         let (operation, output_path) = match &request {
             mcp::McpCommand::Probe(request) => (Operation::FixedMcp, request.output()),
             mcp::McpCommand::Backup(request) => {
+                if request.scope() != mcp::backup::Scope::Standard {
+                    return Err(Box::new(CommandError(
+                        "native Bluetooth backups read the standard configuration only; mcp backup --position-memory requires USB".to_owned(),
+                    )));
+                }
                 (Operation::ConfigurationBackup, request.output())
             }
             mcp::McpCommand::Text(_) | mcp::McpCommand::Menu(_) => {
@@ -324,7 +329,7 @@ async fn run_native(cli: &Cli, command: Option<Command>) -> AppResult<()> {
                 return mcp::run_native_write(&endpoint, write).await;
             }
             _ => return Err(Box::new(CommandError(
-                "native Bluetooth supports mcp probe, backup, text set and menu apply; the reentry probe, repeater set, channel-names apply, callsign-list apply, call-channel set, mic-e apply, vfo set, dtmf apply, group-names apply and restore apply require USB"
+                "native Bluetooth supports mcp probe, backup, text set and menu apply; the reentry probe, repeater set, channel-names apply, callsign-list apply, call-channel set, mic-e apply, vfo set, dtmf apply, group-names apply, channel-groups apply, channels apply, position apply and restore apply require USB"
                     .to_owned(),
             ))),
         };

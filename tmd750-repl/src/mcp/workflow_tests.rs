@@ -312,6 +312,7 @@ impl Harness {
             &mut self.backend,
             selected,
             9_600,
+            backup::Scope::Standard,
             captures.original,
             captures.post_exit,
             &self.cancelled,

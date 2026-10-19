@@ -149,7 +149,7 @@ struct Prepared {
 
 /// The slot's memory decoded from a backup that captured its VFO pages and
 /// its Auto Repeater Offset setting.
-fn captured(
+pub(super) fn captured(
     snapshot: &Snapshot,
     slot: SlotIndex,
 ) -> AppResult<(VfoMemory, &kenwood_tmd750::MemoryImage)> {
@@ -394,4 +394,4 @@ fn description(prepared: &Prepared) -> Map<String, Value> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

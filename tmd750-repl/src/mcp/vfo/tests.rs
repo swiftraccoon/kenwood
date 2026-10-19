@@ -2,7 +2,6 @@
 //! and journal description they produce, the refusals and the endpoint gate.
 
 use std::collections::BTreeMap;
-use std::fs::File;
 use std::path::Path;
 
 use kenwood_tmd750::types::{ShiftDirection, StepSize};
@@ -71,6 +70,12 @@ fn put(patches: &mut BTreeMap<u32, u8>, address: u32, bytes: &[u8]) {
 
 /// A backup whose slot 0 holds the bench VFO memory.
 fn backup(directory: &Path) -> Result<PathBuf, TestError> {
+    crate::mcp::snapshot::tests::patched_backup(directory, &vfo_patches())
+}
+
+/// The image bytes of [`backup`]'s slot 0 VFO memory: band A's current
+/// record at 145.190 MHz FM, band B's at 223.020 MHz FM.
+pub(crate) fn vfo_patches() -> BTreeMap<u32, u8> {
     let mut patches = BTreeMap::new();
     put(&mut patches, 0x5_0100, &CURRENT_A);
     put(&mut patches, 0x5_0128, &CURRENT_B);
@@ -105,30 +110,7 @@ fn backup(directory: &Path) -> Result<PathBuf, TestError> {
     }
     put(&mut patches, 0x5_04DA, &SEGMENTS);
     put(&mut patches, 0x5_0513, &[1]);
-    let mut document = crate::mcp::snapshot::tests::fixture();
-    let segments = document
-        .get_mut("backup")
-        .and_then(|backup| backup.get_mut("segments"))
-        .and_then(Value::as_array_mut)
-        .ok_or("fixture segments")?;
-    for segment in segments {
-        let address = segment
-            .get("address")
-            .and_then(Value::as_u64)
-            .ok_or("segment address")?;
-        let data = segment
-            .get_mut("data")
-            .and_then(Value::as_array_mut)
-            .ok_or("segment data")?;
-        for (offset, byte) in (u32::try_from(address)?..).zip(data.iter_mut()) {
-            if let Some(patch) = patches.get(&offset) {
-                *byte = Value::from(*patch);
-            }
-        }
-    }
-    let path = directory.join("report.json");
-    serde_json::to_writer(File::create_new(&path)?, &document)?;
-    Ok(path)
+    patches
 }
 
 fn edit(backup: PathBuf, tune: Option<[&str; 2]>, limits: Option<[&str; 3]>) -> EditRequest {

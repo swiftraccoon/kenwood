@@ -189,6 +189,7 @@ fn native_writes_refuse_before_helper_validation_or_capture() -> TestResult {
 fn unsupported_native_operations_stop_before_helper_validation_or_capture() -> TestResult {
     for command in [
         vec!["mcp", "reentry-probe", "--approve-live-test"],
+        vec!["mcp", "backup", "--position-memory"],
         vec!["dstar", "probe"],
         vec!["dstar", "probe", "--approve-live-test"],
     ] {

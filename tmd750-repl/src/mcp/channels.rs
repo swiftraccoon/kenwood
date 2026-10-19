@@ -1,17 +1,21 @@
-//! Every stored channel of a backup, listed offline: the programmed memory,
+//! Every stored channel of a backup, listed offline (the programmed memory,
 //! program scan, priority and APRS channels, then the CALL and weather
-//! channels.
+//! channels), and memory channel stores and clears over one MCP session.
+
+mod edit;
 
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 use kenwood_tmd750::memory::{ChannelAccess, MemoryImage};
+use kenwood_tmd750::transport::SerialCandidate;
 use kenwood_tmd750::types::PhysicalChannel;
 
 use super::snapshot::Snapshot;
-use crate::{AppResult, output};
+use crate::{AppResult, CommandError, output};
 
-/// Channels subcommand: an offline listing.
+/// Channels subcommand: an offline listing or preview, or one guarded live
+/// write.
 #[derive(Debug, Parser)]
 pub(crate) struct ChannelsRequest {
     #[command(subcommand)]
@@ -22,6 +26,11 @@ pub(crate) struct ChannelsRequest {
 enum ChannelsCommand {
     /// Print every stored channel of a backup; never writes.
     List(ListRequest),
+    /// Show the channels a set of stores and clears changes; never writes.
+    Preview(edit::EditSelection),
+    /// Write the stores and clears in one session, comparing and reading back
+    /// each page.
+    Apply(edit::ApplyRequest),
 }
 
 #[derive(Debug, Args)]
@@ -31,16 +40,44 @@ struct ListRequest {
     backup: PathBuf,
 }
 
-pub(super) fn run(request: &ChannelsRequest) -> AppResult<()> {
-    match &request.command {
-        ChannelsCommand::List(list) => {
-            let snapshot = Snapshot::load(&list.backup)?;
-            for line in lines(covered(&snapshot)?) {
-                output::line(format_args!("{line}"));
-            }
-            Ok(())
+impl ChannelsRequest {
+    pub(super) fn validate_endpoint_selection(&self, explicit_port: bool) -> AppResult<()> {
+        if matches!(self.command, ChannelsCommand::Apply(_)) && !explicit_port {
+            return Err(CommandError(
+                "mcp channels apply requires an explicit --port before mcp".to_owned(),
+            )
+            .into());
         }
+        Ok(())
     }
+}
+
+pub(super) fn run_offline(request: &ChannelsRequest) -> Option<AppResult<()>> {
+    match &request.command {
+        ChannelsCommand::List(list) => Some(print_list(list)),
+        ChannelsCommand::Preview(edits) => Some(edit::preview(edits)),
+        ChannelsCommand::Apply(_) => None,
+    }
+}
+
+pub(super) async fn run_selected(
+    endpoint: &SerialCandidate,
+    baud: u32,
+    request: &ChannelsRequest,
+) -> AppResult<()> {
+    match &request.command {
+        ChannelsCommand::Apply(apply) => edit::run_apply(endpoint, baud, apply).await,
+        ChannelsCommand::List(list) => print_list(list),
+        ChannelsCommand::Preview(edits) => edit::preview(edits),
+    }
+}
+
+fn print_list(list: &ListRequest) -> AppResult<()> {
+    let snapshot = Snapshot::load(&list.backup)?;
+    for line in lines(covered(&snapshot)?) {
+        output::line(format_args!("{line}"));
+    }
+    Ok(())
 }
 
 /// The backup's image, after checking it captured the flag, record and name
@@ -63,7 +100,11 @@ fn lines(image: &MemoryImage) -> Vec<String> {
             Ok(entry) if entry.channel().is_none() => {}
             Ok(entry) => {
                 stored += 1;
-                lines.push(entry.to_string());
+                if index.index() < PhysicalChannel::FIRST_PROGRAM_SCAN {
+                    lines.push(format!("{entry}, group {}", entry.flag().group()));
+                } else {
+                    lines.push(entry.to_string());
+                }
             }
             Err(error) => lines.push(format!("{index}: undecodable: {error}")),
         }

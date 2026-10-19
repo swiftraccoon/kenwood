@@ -337,6 +337,8 @@ struct Backup {
     identity: IdentityEvidence,
     entry_reply: Vec<u8>,
     segments: Vec<SegmentEvidence>,
+    #[serde(default)]
+    position_memory: Option<Vec<SegmentEvidence>>,
     exit: Exit,
     outcome: BackupOutcome,
     complete_configuration: bool,
@@ -351,23 +353,31 @@ impl Backup {
     }
 
     fn validate_pages(&self) -> AppResult<()> {
-        let pages: Vec<_> = regions::menu_regions()
-            .into_iter()
-            .flat_map(Region::pages)
-            .collect();
-        if pages.len() != self.segments.len()
-            || !pages.iter().zip(&self.segments).all(|(page, segment)| {
-                page.address().as_u32() == segment.address
-                    && page.len() == segment.length
-                    && segment.data.len() == segment.length
-            })
-        {
+        if !exact_pages(&regions::menu_regions(), &self.segments) {
             return invalid(
                 "configuration pages are missing, duplicated, reordered, or incorrectly sized",
             );
         }
+        if let Some(position) = &self.position_memory
+            && !exact_pages(&regions::POSITION_MEMORY, position)
+        {
+            return invalid(
+                "position memory pages are missing, duplicated, reordered, or incorrectly sized",
+            );
+        }
         Ok(())
     }
+}
+
+/// Whether `segments` hold every page of `regions` in order, each filled.
+fn exact_pages(regions: &[Region], segments: &[SegmentEvidence]) -> bool {
+    let pages: Vec<_> = regions.iter().copied().flat_map(Region::pages).collect();
+    pages.len() == segments.len()
+        && pages.iter().zip(segments).all(|(page, segment)| {
+            page.address().as_u32() == segment.address
+                && page.len() == segment.length
+                && segment.data.len() == segment.length
+        })
 }
 
 #[derive(Debug, Deserialize)]
@@ -627,6 +637,7 @@ impl Snapshot {
         let pages = backup
             .segments
             .into_iter()
+            .chain(backup.position_memory.unwrap_or_default())
             .map(|segment| {
                 Ok((
                     Page::new(Address::new(segment.address)?, segment.length)?,
@@ -706,6 +717,37 @@ pub(super) mod tests {
                 }]
             }
         })
+    }
+
+    /// Write [`fixture`] as `report.json` in `directory`, with each image
+    /// address of `patches` holding its byte.
+    pub(crate) fn patched_backup(
+        directory: &Path,
+        patches: &std::collections::BTreeMap<u32, u8>,
+    ) -> Result<std::path::PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+        let mut document = fixture();
+        let segments = document
+            .pointer_mut("/backup/segments")
+            .and_then(serde_json::Value::as_array_mut)
+            .ok_or("fixture segments")?;
+        for segment in segments {
+            let address = segment
+                .get("address")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or("segment address")?;
+            let data = segment
+                .get_mut("data")
+                .and_then(serde_json::Value::as_array_mut)
+                .ok_or("segment data")?;
+            for (offset, byte) in (u32::try_from(address)?..).zip(data.iter_mut()) {
+                if let Some(patch) = patches.get(&offset) {
+                    *byte = serde_json::Value::from(*patch);
+                }
+            }
+        }
+        let path = directory.join("report.json");
+        serde_json::to_writer(File::create_new(&path)?, &document)?;
+        Ok(path)
     }
 
     fn replace(

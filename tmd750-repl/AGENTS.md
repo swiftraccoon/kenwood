@@ -30,15 +30,16 @@
   explicit endpoint: `--port`, or `--bluetooth`/`--bluetooth-address` with a
   native backup of that radio; `mcp repeater set`, `mcp repeater voice set`,
   `mcp channel-names apply`, `mcp callsign-list apply`, `mcp call-channel set`,
-  `mcp mic-e apply`, `mcp vfo set`, `mcp dtmf apply`, `mcp group-names apply`
-  and `mcp restore apply` require `--apply` and `--port`; `dstar probe` and
-  `mcp reentry-probe` require `--port` and `--approve-live-test`; `dstar
-  start` is the one radio-writing workflow without a flag, since invoking it
-  is the request to write the Terminal and routing pages and open the modem
-  link. Do not add a workflow that reaches the radio outside these gates.
-- Native Bluetooth admits `mcp probe`, `mcp backup`, `mcp text set` and
-  `mcp menu apply`; the reentry probe is USB-only and is refused before the
-  helper launches. A native write validates its options, native backup and
+  `mcp mic-e apply`, `mcp vfo set`, `mcp dtmf apply`, `mcp group-names apply`,
+  `mcp channel-groups apply`, `mcp channels apply`, `mcp position apply` and
+  `mcp restore apply` require `--apply` and `--port`; `dstar probe` and `mcp
+  reentry-probe` require `--port` and `--approve-live-test`; `dstar start` is
+  the one radio-writing workflow without a flag, since invoking it is the
+  request to write the Terminal and routing pages and open the modem link. Do
+  not add a workflow that reaches the radio outside these gates.
+- Native Bluetooth admits `mcp probe`, `mcp backup` without
+  `--position-memory`, `mcp text set` and `mcp menu apply`; the reentry probe
+  is USB-only and is refused before the helper launches. A native write validates its options, native backup and
   value before selecting a radio, and refuses one whose address differs from
   the backup's.
 - Write workflows reach their endpoint only through `mcp::link::WriteLink`
@@ -48,11 +49,12 @@
 - Page-plan writes (`mcp menu apply`, `mcp repeater set`, `mcp repeater voice
   set`, `mcp channel-names apply`, `mcp callsign-list apply`, `mcp
   call-channel set`, `mcp mic-e apply`, `mcp vfo set`, `mcp dtmf apply`, `mcp
-  group-names apply`, `mcp restore apply`) share `mcp::page_apply`: journal,
-  raw transcript synchronization before each write intent, one session, fresh
-  CAT check, report. A new page write adds a `PlanKind` with its report
-  vocabulary and a `PagePlan`, never a parallel workflow; the menu report and
-  journal shapes stay unchanged.
+  group-names apply`, `mcp channel-groups apply`, `mcp channels apply`, `mcp
+  position apply`, `mcp restore apply`) share `mcp::page_apply`: journal, raw
+  transcript synchronization before each write intent, one session, fresh CAT
+  check, report. A new page write adds a `PlanKind` with its report vocabulary
+  and a `PagePlan`, never a parallel workflow; the menu report and journal
+  shapes stay unchanged.
 - Every new native connection gets its `Radio` from `Radio::new_bluetooth`
   (or, in the shared fixed read, `Some(BLUETOOTH_FIRST_REPLY_TIMEOUT)`), so the
   first reply may take ten seconds and every later exchange 1.5. The fresh
@@ -124,8 +126,9 @@ cargo run -p tmd750-repl -- dstar start CALL [REFLECTOR]     # --control-port pi
 ```
 
 - `mcp menu list|describe|show|preview`, `mcp text list|show|preview`,
-  `mcp channels list`, `mcp call-channel preview`, `mcp mic-e list|preview`,
-  `mcp vfo list|preview`, `mcp dtmf list|preview`, `mcp group-names
+  `mcp channels list|preview`, `mcp call-channel preview`, `mcp mic-e
+  list|preview`, `mcp vfo list|preview`, `mcp dtmf list|preview`, `mcp
+  group-names list|preview`, `mcp channel-groups preview`, `mcp position
   list|preview`, `mcp repeater list|preview|names`, `mcp repeater voice
   preview`, `mcp restore preview` and `mcp terminal preflight|compare` are
   offline: they read completed backup reports and never enumerate or open an
