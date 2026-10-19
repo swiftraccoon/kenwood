@@ -43,6 +43,7 @@ jobs:
           - { crate: tmd750, target: dtmf_entry_from_bytes }
           - { crate: tmd750, target: mic_e_entry_from_bytes }
           - { crate: tmd750, target: voice_code_from_bytes }
+          - { crate: tmd750, target: position_record_from_bytes }
           - { crate: tmd750, target: nmea_parse }
     steps:
       - uses: actions/checkout@v4

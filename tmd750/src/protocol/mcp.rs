@@ -396,10 +396,13 @@ pub mod regions {
         regions
     }
 
-    /// Every region this slice may write (the menu regions).
+    /// Every region this slice may write: the menu regions, then the position
+    /// memory, which the official program writes in its own transfer.
     #[must_use]
     pub fn writable_regions() -> Vec<Region> {
-        menu_regions()
+        let mut regions = menu_regions();
+        regions.extend(POSITION_MEMORY);
+        regions
     }
 
     /// Whether `page` lies entirely inside one writable region.
@@ -548,6 +551,10 @@ mod tests {
         let straddling = Page::new(Address::new(327_680)?, 256)?;
         assert!(!is_writable_page(straddling));
         assert!(writable_page_for(Address::new(400_000)?).is_none());
+        for (address, start) in [(311_300, 311_296), (314_600, 314_368), (315_200, 315_136)] {
+            let page = writable_page_for(Address::new(address)?).ok_or("position page")?;
+            assert_eq!((page.address().as_u32(), page.len()), (start, 256));
+        }
         Ok(())
     }
 

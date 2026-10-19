@@ -19,13 +19,14 @@ radio protocol and recovery rule. It does not depend on the TH-D75 library.
 | Identify the radio and read its state | [`Radio::identify`], the `Radio::get_*` methods |
 | Change a setting over CAT | the `Radio::set_*` methods |
 | Transmit, beacon, select the TNC mode, VOX or power | [`Radio::transmit`], [`Radio::send_aprs_beacon`], [`Radio::set_tnc_mode`], [`Radio::set_vox`], [`Radio::power_off`] |
-| Store, recall and clear memory channels | [`Radio::write_memory_channel`], [`Radio::recall_memory_channel`], [`Radio::clear_memory_channel`] |
+| Store, recall and clear memory channels | [`Radio::write_memory_channel`], [`Radio::recall_memory_channel`], [`Radio::clear_memory_channel`]; the priority channel with [`memory::MemoryChannelPlan`] |
 | Back up the configuration | [`Radio::backup_mcp_until_exit`] |
 | Decode a capture offline | [`MenuFieldSnapshot`], [`ChannelAccess`], [`memory::TextImage`], [`memory::ReflectorTerminalPreflight`] |
 | Compare two captures | [`memory::StandardConfigurationDiff`] |
 | Restore a captured configuration | [`memory::restore::RestorePlan`] and [`radio::McpSession::compare_exchange_pages`] |
 | Change menu settings | [`MenuUpdatePlan`] and [`radio::McpSession::compare_exchange_menu_update`] |
 | Change a text field (PM1 name, MY1, a channel name) | [`memory::TextFieldUpdate`] and [`Radio::set_text_field_session_until_exit`] |
+| Edit stored memory data against a backup | [`memory::MemoryChannelPlan`], [`memory::ChannelNamePlan`], [`memory::ChannelGroupPlan`], [`memory::GroupNamePlan`], [`memory::CallChannelPlan`], [`memory::vfo::VfoMemory`], [`memory::dtmf::DtmfMemories`], [`memory::mic_e::MicETypeCodeTables`], [`memory::repeater_list::RepeaterList`], [`memory::callsign_list::CallsignList`], [`memory::position::PositionMemory`], each written with [`radio::McpSession::compare_exchange_pages`] |
 | Write arbitrary pages | [`PageReplacement`] and [`radio::McpSession::compare_exchange_pages`] |
 | Run Reflector Terminal | [`TerminalLifecycle`] and [`TerminalRecovery`] |
 | Read or write a `.d750` file | [`parse_d750`], [`RadioConfig`] |
@@ -241,6 +242,30 @@ async fn program<T: Transport>(
 After the exit, close the transport and verify a fresh identity before any
 further CAT, as for every programming session.
 
+[`memory::MemoryChannelPlan`] takes the same writes and plans them as page
+writes against a backup instead: a store writes the band code
+([`types::BandCode::for_frequency`]), scan lockout and record a CAT store
+writes, and a clear writes what a CAT clear leaves, the name included. It
+also stores the priority channel, which `ME` refuses:
+
+```rust
+use kenwood_tmd750::memory::{MemoryChannelPlan, MemoryImage};
+use kenwood_tmd750::radio::ChannelWrite;
+use kenwood_tmd750::types::{CatMemoryChannelRecord, MemoryChannelAddress};
+use kenwood_tmd750::PageReplacement;
+
+fn store_priority(
+    image: &MemoryImage,
+    record: CatMemoryChannelRecord,
+) -> Result<Vec<PageReplacement>, Box<dyn std::error::Error>> {
+    let plan = MemoryChannelPlan::new([
+        (MemoryChannelAddress::Priority, ChannelWrite::Store(record)),
+        (MemoryChannelAddress::regular(40)?, ChannelWrite::Clear),
+    ])?;
+    Ok(plan.page_replacements(image)?)
+}
+```
+
 ### CALL and weather channels
 
 The six CALL channels, one FM and one DV channel for each band, and the ten
@@ -283,6 +308,22 @@ use kenwood_tmd750::PageReplacement;
 
 fn name_group(image: &MemoryImage) -> Result<Vec<PageReplacement>, Box<dyn std::error::Error>> {
     let plan = GroupNamePlan::new([(MemoryGroup::new(3)?, ChannelNameText::new("Repeaters")?)])?;
+    Ok(plan.page_replacements(image)?)
+}
+```
+
+A regular channel's group is byte 2 of its flag record
+([`types::StoredChannelFlag::group`]). A CAT store resets it to the channel
+number's hundreds digit; [`memory::ChannelGroupPlan`] moves stored channels to
+any of the thirty groups afterwards, writing only the flag-table pages:
+
+```rust
+use kenwood_tmd750::memory::{ChannelGroupPlan, MemoryGroup, MemoryImage};
+use kenwood_tmd750::types::PhysicalChannel;
+use kenwood_tmd750::PageReplacement;
+
+fn regroup(image: &MemoryImage) -> Result<Vec<PageReplacement>, Box<dyn std::error::Error>> {
+    let plan = ChannelGroupPlan::new([(PhysicalChannel::new(995)?, MemoryGroup::new(12)?)])?;
     Ok(plan.page_replacements(image)?)
 }
 ```
@@ -367,6 +408,9 @@ The report keeps every acknowledged page on failure or cancellation, and
 [`McpBackupReport::has_complete_configuration`] checks the whole ordered
 schedule. [`Radio::backup_mcp_gateway_off_until_exit`] first requires a write
 target and a fresh `GW 0` ([`Error::GatewayNotOff`] otherwise).
+[`Radio::backup_mcp_with_position_memory_until_exit`] reads the GPS position
+memory's fourteen pages after the standard ones in the same session, into
+[`McpBackupReport::position_memory`].
 
 ```rust,no_run
 use kenwood_tmd750::{Error, McpProbeOutcome, Radio};
@@ -522,6 +566,38 @@ fn store_node(image: &MemoryImage) -> Result<Vec<PageReplacement>, Box<dyn std::
     let node = EchoLinkMemoryEntry::new("KX0NODE", "123456")?;
     memories.set_echolink(DtmfChannel::new(1)?, Some(node));
     Ok(memories.page_replacements(image)?)
+}
+```
+
+[`memory::position::PositionMemory`] reads the GPS position memory from an
+image holding its two regions: up to one hundred positions in the index
+page's order, each a name of up to nine stored bytes, a UTC time, a
+[`types::Latitude`] and [`types::Longitude`], an altitude and an APRS
+symbol. Its `from_entries`, `push`, `remove` and `page_replacements` store
+an edit, with the positions written to slots 0 onward and listed in order, as
+the official program stores them:
+
+```rust
+use kenwood_tmd750::memory::StoredText;
+use kenwood_tmd750::memory::position::{
+    PositionMemory, PositionSymbol, PositionTime, StoredPosition,
+};
+use kenwood_tmd750::types::{
+    Coordinate, Latitude, LatitudeHemisphere, Longitude, LongitudeHemisphere,
+};
+use kenwood_tmd750::{MemoryImage, PageReplacement};
+
+fn store_home(image: &MemoryImage) -> Result<Vec<PageReplacement>, Box<dyn std::error::Error>> {
+    let mut memory = PositionMemory::read(image)?;
+    memory.push(StoredPosition::new(
+        StoredText::new("HOME")?,
+        PositionTime::new(2026, 10, 19, 12, 0, 0)?,
+        Latitude::new(LatitudeHemisphere::North, Coordinate::new(35, 41, 9700)?)?,
+        Longitude::new(LongitudeHemisphere::East, Coordinate::new(139, 46, 2400)?)?,
+        40,
+        PositionSymbol::new(b'/', b'-')?,
+    ))?;
+    Ok(memory.page_replacements(image)?)
 }
 ```
 
@@ -832,17 +908,21 @@ Tested on a TM-D750 reporting `ID TM-D750`, `FV 1.02`, `TY K,2,1`:
 | Reflector Terminal entry and restoration in PM Off | Bluetooth modem link with an operation-panel USB control endpoint |
 | Repeater list and name tables of a standard backup holding 1,455 repeaters, checked against Kenwood's catalog; an in-place repeater frequency edit, reported by `FO` in DR mode and restored | operation-panel USB |
 | Batch channel programming: two channels stored over CAT and named in one programming session, then cleared, with an unchanged standard backup afterwards | operation-panel USB |
+| Memory channel page writes: a [`memory::MemoryChannelPlan`] store of band A's VFO record into a regular channel, byte-identical in a fresh standard backup to the CAT store of that record into its neighbor and read back by `ME`; the same store into the priority channel, which `ME Pri` and `MR band,Pri` answer `N` for stored or not; a clear of all three, returning the channel tables byte for byte to their state before the CAT store. A 162.550 MHz priority channel written this way, with `radio.PriorityScan` on, put band B in Memory mode on `Pri` at that frequency with its squelch open, as `VM`, `MR` and `FQ` reported. Band codes at every segment edge and 5 kHz below it | operation-panel USB |
 | D-STAR callsign list: one entry added, read back in place in a fresh session, and removed, with an unchanged standard backup afterwards | operation-panel USB |
 | CALL channels: all six stored records decoded from a standard backup, each equal to the `FO` record CALL mode reports; one CALL frequency changed with a [`memory::CallChannelPlan`] page write, reported by `FO` in CALL mode and restored, with an unchanged standard backup afterwards | operation-panel USB |
 | Mic-E type codes: one entry written, read back from a fresh standard backup and cleared, with an unchanged standard backup afterwards | operation-panel USB |
 | VFO memory: slot 0's current and selected VFO band records equal to each band's `FO` record; one band tuned with a [`memory::vfo::VfoMemory`] page write, reported by `FO` after the session and tuned back, with an unchanged standard backup afterwards; the records `FQ` left after frequency entries across VFO bands, band B step segments and Auto Repeater Offset ranges equal to [`memory::vfo::VfoMemory::frequency_record`]'s, and a [`memory::vfo::VfoMemory::tune_frequency`] page write leaving the same standard backup as the `FQ` entry | operation-panel USB |
 | DTMF and `EchoLink` memories: one channel of each written, the `EchoLink` channel with both fields full, read back from a fresh standard backup and cleared, with an unchanged standard backup afterwards | operation-panel USB |
+| GPS position memory: the empty memory read with a standard backup in one session; one position written with a [`memory::position::PositionMemory`] page write, read back in a fresh session changing only its record and index byte, and removed, restoring both regions byte for byte | operation-panel USB |
 | Memory group names: the stored defaults decoded; two groups renamed with a [`memory::GroupNamePlan`] page write, read back from a fresh standard backup and renamed to their defaults, with an unchanged standard backup afterwards | operation-panel USB |
+| Channel groups: a CAT-stored channel moved from group 9 to 12 with a [`memory::ChannelGroupPlan`] page write, changing that one byte in a fresh standard backup and leaving the CAT memory read unchanged; a CAT re-store reset it to 9 | operation-panel USB |
 | Configuration restore: a [`memory::restore::RestorePlan`] of a backup holding a cleared channel, reported by a CAT memory read and equal to that backup in a fresh one except the radio-set byte `0x5016B`; a second restore of the later backup, equal to it byte for byte; a `.d750` file holding a backup's bytes, equal to that backup in a fresh one | operation-panel USB |
 
 KISS mode over CAT and `PS 0` are not established, a `.d750` export has not
-been opened by the official program, and the meaning of the three `TY`
-components is unknown.
+been opened by the official program, the radio's display of a written
+position and the unit of its altitude are not established, and the meaning
+of the three `TY` components is unknown.
 
 `tests/hardware.rs` repeats the read-only part against a connected radio: it
 waits for an operation-panel endpoint to settle, reads every CAT getter on

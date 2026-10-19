@@ -560,6 +560,9 @@ impl<T: Transport> Radio<T> {
 
     /// Read the memory channel one band has selected (`MR band`).
     ///
+    /// While priority scan holds band B on a busy priority channel, the band
+    /// is in Memory tuning mode and this reads the priority channel.
+    ///
     /// # Errors
     ///
     /// Returns [`ProtocolError::NotAvailable`] unless the band is in Memory
@@ -583,7 +586,8 @@ impl<T: Transport> Radio<T> {
     /// the selection back.
     ///
     /// The band must be in Memory tuning mode and the channel must be stored;
-    /// an empty channel is answered `N`.
+    /// an empty channel is answered `N`, and so is the priority channel,
+    /// stored or not.
     ///
     /// # Errors
     ///
@@ -619,6 +623,9 @@ impl<T: Transport> Radio<T> {
 
     /// Read a stored memory channel (`ME address`); `None` when it is empty.
     ///
+    /// The priority channel reads `None` even when stored; its bytes are in
+    /// the MCP image ([`crate::memory::ChannelAccess`]).
+    ///
     /// # Errors
     ///
     /// See the module contract.
@@ -644,7 +651,8 @@ impl<T: Transport> Radio<T> {
     /// The radio echoes the request exactly. Its readback equals the request
     /// except that an empty URCALL reads back as `CQCQCQ`; the returned
     /// record is that readback. Regular and program scan channels accept the
-    /// write; the priority channel answers `N`. Writing over a stored channel
+    /// write; the priority channel answers `N`, and
+    /// [`crate::memory::MemoryChannelPlan`] writes it. Writing over a stored channel
     /// replaces its record and keeps its name; only an MCP write sets a name
     /// ([`crate::radio::McpSession::write_channel_names`]).
     ///

@@ -133,3 +133,80 @@ fn a_plan_names_each_group_once() -> TestResult {
     );
     Ok(())
 }
+
+/// A full image of `0x42` whose flag table holds every regular channel
+/// empty as firmware 1.02 stores it (`FF 00`, the hundreds digit, `FF`),
+/// except the stored `channels`.
+fn flags(channels: &[(u16, [u8; 4])]) -> Result<MemoryImage, Box<dyn std::error::Error>> {
+    let mut image = vec![0x42; IMAGE_LENGTH];
+    for index in 0..1000_usize {
+        let hundreds = u8::try_from(index / 100)?;
+        put(
+            &mut image,
+            0x2000 + 4 * index,
+            &[0xFF, 0x00, hundreds, 0xFF],
+        )?;
+    }
+    for (index, flag) in channels {
+        put(&mut image, 0x2000 + 4 * usize::from(*index), flag)?;
+    }
+    Ok(MemoryImage::from_bytes(image)?)
+}
+
+fn channel(index: u16) -> Result<PhysicalChannel, ValidationError> {
+    PhysicalChannel::new(index)
+}
+
+#[test]
+fn a_group_plan_rewrites_the_group_byte_of_stored_channels() -> TestResult {
+    let image = flags(&[
+        (5, [0x05, 0x00, 0x00, 0x00]),
+        (995, [0x08, 0x00, 0x09, 0x00]),
+    ])?;
+    let plan = ChannelGroupPlan::new([(channel(5)?, group(12)?), (channel(995)?, group(29)?)])?;
+    let pages: Vec<u32> = plan
+        .pages()
+        .iter()
+        .map(|page| page.address().as_u32())
+        .collect();
+    assert_eq!(pages, [0x2000, 0x2F00]);
+    let mut changed = Vec::new();
+    for replacement in plan.page_replacements(&image)? {
+        let start = replacement.page().address().as_usize();
+        for (offset, (before, after)) in replacement
+            .expected()
+            .iter()
+            .zip(replacement.replacement())
+            .enumerate()
+        {
+            if before != after {
+                changed.push((start + offset, *after));
+            }
+        }
+    }
+    assert_eq!(changed, [(0x2016, 12), (0x2F8E, 29)]);
+    let unchanged = ChannelGroupPlan::new([(channel(995)?, group(9)?)])?;
+    assert!(unchanged.page_replacements(&image)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn a_group_plan_takes_each_stored_regular_channel_once() -> TestResult {
+    assert_eq!(
+        ChannelGroupPlan::new([(channel(1000)?, group(1)?)]),
+        Err(ValidationError::ChannelGroupFixed { index: 1000 })
+    );
+    assert_eq!(
+        ChannelGroupPlan::new([(channel(3)?, group(1)?), (channel(3)?, group(2)?)]),
+        Err(ValidationError::DuplicateChannelGroup { index: 3 })
+    );
+    let image = flags(&[])?;
+    let empty = ChannelGroupPlan::new([(channel(7)?, group(3)?)])?;
+    assert!(matches!(
+        empty.page_replacements(&image),
+        Err(Error::Validation(ValidationError::ChannelNotStored {
+            index: 7
+        }))
+    ));
+    Ok(())
+}

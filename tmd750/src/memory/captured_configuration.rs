@@ -75,7 +75,8 @@ impl Configuration {
         })
     }
 
-    /// Collect the pages of a backup report.
+    /// Collect the pages of a backup report, its position memory pages
+    /// included.
     ///
     /// # Errors
     ///
@@ -91,6 +92,7 @@ impl Configuration {
             report
                 .segments
                 .iter()
+                .chain(&report.position_memory)
                 .map(|segment| (segment.page, segment.data.clone())),
         )
     }

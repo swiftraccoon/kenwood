@@ -339,6 +339,31 @@ pub enum ValidationError {
         /// The repeated group.
         group: crate::memory::channels::MemoryGroup,
     },
+    /// A channel group plan assigns one channel more than once.
+    #[error("physical channel {index} is assigned a group more than once")]
+    DuplicateChannelGroup {
+        /// The physical channel index.
+        index: u16,
+    },
+    /// A channel group plan names a program scan, priority or APRS channel,
+    /// whose group is fixed.
+    #[error("physical channel {index} is not a regular channel; its group is fixed")]
+    ChannelGroupFixed {
+        /// The physical channel index.
+        index: u16,
+    },
+    /// A memory channel plan writes one channel more than once.
+    #[error("memory channel {address} is planned more than once")]
+    DuplicateMemoryChannel {
+        /// The repeated channel.
+        address: crate::types::MemoryChannelAddress,
+    },
+    /// A plan targets a channel whose flag marks it empty in the image.
+    #[error("physical channel {index} holds no stored record")]
+    ChannelNotStored {
+        /// The physical channel index.
+        index: u16,
+    },
 }
 
 /// Bytes from the radio that did not follow the protocol.

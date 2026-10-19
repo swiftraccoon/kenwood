@@ -44,8 +44,7 @@ mod record;
 use std::fmt;
 
 pub use record::{
-    Coordinate, CountryIndex, GroupIndex, Latitude, LatitudeHemisphere, Longitude,
-    LongitudeHemisphere, PositionAccuracy, RegionIndex, RepeaterFrequency, RepeaterPosition,
+    CountryIndex, GroupIndex, PositionAccuracy, RegionIndex, RepeaterFrequency, RepeaterPosition,
     RepeaterRecord, RepeaterShift, UtcOffset,
 };
 
@@ -679,6 +678,9 @@ pub enum RepeaterListError {
         /// The largest accepted value.
         max: u32,
     },
+    /// A stored position outside its type's domain.
+    #[error(transparent)]
+    Position(#[from] crate::error::ValidationError),
     /// Text that is not a decimal megahertz value with at most six fractional
     /// digits within `u32` hertz.
     #[error("{text:?} is not a decimal megahertz value with at most six fractional digits")]

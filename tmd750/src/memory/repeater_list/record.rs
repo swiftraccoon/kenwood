@@ -4,7 +4,9 @@ use std::fmt;
 
 use super::{REPEATER_RECORD_SIZE, REPEATER_TEXT_SIZE, RepeaterListError};
 use crate::memory::StoredText;
-use crate::types::StoredCallsign;
+use crate::types::{
+    Coordinate, Latitude, LatitudeHemisphere, Longitude, LongitudeHemisphere, StoredCallsign,
+};
 
 const NAME: usize = 0;
 const SUB_NAME: usize = 16;
@@ -176,216 +178,8 @@ impl fmt::Display for PositionAccuracy {
     }
 }
 
-/// An angle as whole degrees, whole minutes and ten-thousandths of a minute,
-/// stored as a degree byte, a minute byte and a little-endian `u16`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Coordinate {
-    degrees: u8,
-    minutes: u8,
-    ten_thousandths: u16,
-}
-
-impl Coordinate {
-    /// Validate the minute fields.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RepeaterListError::FieldOutOfRange`] for minutes above 59 or
-    /// ten-thousandths above 9999.
-    pub const fn new(
-        degrees: u8,
-        minutes: u8,
-        ten_thousandths: u16,
-    ) -> Result<Self, RepeaterListError> {
-        if minutes > 59 {
-            return Err(RepeaterListError::FieldOutOfRange {
-                field: "position minutes",
-                value: minutes as u32,
-                max: 59,
-            });
-        }
-        if ten_thousandths > 9999 {
-            return Err(RepeaterListError::FieldOutOfRange {
-                field: "position minute fraction",
-                value: ten_thousandths as u32,
-                max: 9999,
-            });
-        }
-        Ok(Self {
-            degrees,
-            minutes,
-            ten_thousandths,
-        })
-    }
-
-    /// Whole degrees.
-    #[must_use]
-    pub const fn degrees(self) -> u8 {
-        self.degrees
-    }
-
-    /// Whole minutes, 0 to 59.
-    #[must_use]
-    pub const fn minutes(self) -> u8 {
-        self.minutes
-    }
-
-    /// Ten-thousandths of a minute, 0 to 9999.
-    #[must_use]
-    pub const fn ten_thousandths(self) -> u16 {
-        self.ten_thousandths
-    }
-
-    /// The angle in decimal degrees.
-    fn magnitude(self) -> f64 {
-        let minutes = f64::from(self.minutes) + f64::from(self.ten_thousandths) / 10_000.0;
-        f64::from(self.degrees) + minutes / 60.0
-    }
-
-    /// Whether the angle exceeds `limit` whole degrees.
-    const fn exceeds(self, limit: u8) -> bool {
-        self.degrees > limit
-            || (self.degrees == limit && (self.minutes > 0 || self.ten_thousandths > 0))
-    }
-
-    const fn from_stored(stored: [u8; 4]) -> Self {
-        let [degrees, minutes, low, high] = stored;
-        Self {
-            degrees,
-            minutes,
-            ten_thousandths: u16::from_le_bytes([low, high]),
-        }
-    }
-
-    const fn to_stored(self) -> [u8; 4] {
-        let [low, high] = self.ten_thousandths.to_le_bytes();
-        [self.degrees, self.minutes, low, high]
-    }
-}
-
-/// North or south of the equator: bit `0x04` of record byte 64 is south.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum LatitudeHemisphere {
-    /// North of the equator.
-    North,
-    /// South of the equator.
-    South,
-}
-
-/// East or west of Greenwich: bit `0x08` of record byte 64 is west.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum LongitudeHemisphere {
-    /// East of Greenwich.
-    East,
-    /// West of Greenwich.
-    West,
-}
-
-/// A latitude of at most 90 degrees, record bytes 56 to 59.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Latitude {
-    hemisphere: LatitudeHemisphere,
-    coordinate: Coordinate,
-}
-
-impl Latitude {
-    /// Validate the angle.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RepeaterListError::FieldOutOfRange`] beyond 90 degrees.
-    pub const fn new(
-        hemisphere: LatitudeHemisphere,
-        coordinate: Coordinate,
-    ) -> Result<Self, RepeaterListError> {
-        if coordinate.exceeds(90) {
-            return Err(RepeaterListError::FieldOutOfRange {
-                field: "latitude degrees",
-                value: coordinate.degrees as u32,
-                max: 90,
-            });
-        }
-        Ok(Self {
-            hemisphere,
-            coordinate,
-        })
-    }
-
-    /// North or south.
-    #[must_use]
-    pub const fn hemisphere(self) -> LatitudeHemisphere {
-        self.hemisphere
-    }
-
-    /// The angle from the equator.
-    #[must_use]
-    pub const fn coordinate(self) -> Coordinate {
-        self.coordinate
-    }
-
-    /// Signed decimal degrees, negative to the south.
-    #[must_use]
-    pub fn degrees(self) -> f64 {
-        match self.hemisphere {
-            LatitudeHemisphere::North => self.coordinate.magnitude(),
-            LatitudeHemisphere::South => -self.coordinate.magnitude(),
-        }
-    }
-}
-
-/// A longitude of at most 180 degrees, record bytes 60 to 63.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Longitude {
-    hemisphere: LongitudeHemisphere,
-    coordinate: Coordinate,
-}
-
-impl Longitude {
-    /// Validate the angle.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RepeaterListError::FieldOutOfRange`] beyond 180 degrees.
-    pub const fn new(
-        hemisphere: LongitudeHemisphere,
-        coordinate: Coordinate,
-    ) -> Result<Self, RepeaterListError> {
-        if coordinate.exceeds(180) {
-            return Err(RepeaterListError::FieldOutOfRange {
-                field: "longitude degrees",
-                value: coordinate.degrees as u32,
-                max: 180,
-            });
-        }
-        Ok(Self {
-            hemisphere,
-            coordinate,
-        })
-    }
-
-    /// East or west.
-    #[must_use]
-    pub const fn hemisphere(self) -> LongitudeHemisphere {
-        self.hemisphere
-    }
-
-    /// The angle from Greenwich.
-    #[must_use]
-    pub const fn coordinate(self) -> Coordinate {
-        self.coordinate
-    }
-
-    /// Signed decimal degrees, negative to the west.
-    #[must_use]
-    pub fn degrees(self) -> f64 {
-        match self.hemisphere {
-            LongitudeHemisphere::East => self.coordinate.magnitude(),
-            LongitudeHemisphere::West => -self.coordinate.magnitude(),
-        }
-    }
-}
-
-/// A record's position: record bytes 56 to 65.
+/// A record's position: latitude bytes 56 to 59, longitude bytes 60 to 63,
+/// bit `0x04` (south) and bit `0x08` (west) of byte 64, and accuracy byte 65.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RepeaterPosition {
     /// How exact the position is.
@@ -529,13 +323,21 @@ impl RepeaterRecord {
             let _frequency = RepeaterFrequency::new(record.word(offset))?;
         }
         let position = record.position();
-        for stored in [position.latitude.coordinate, position.longitude.coordinate] {
+        for stored in [
+            position.latitude.coordinate(),
+            position.longitude.coordinate(),
+        ] {
             let _coordinate =
-                Coordinate::new(stored.degrees, stored.minutes, stored.ten_thousandths)?;
+                Coordinate::new(stored.degrees(), stored.minutes(), stored.ten_thousandths())?;
         }
-        let _latitude = Latitude::new(position.latitude.hemisphere, position.latitude.coordinate)?;
-        let _longitude =
-            Longitude::new(position.longitude.hemisphere, position.longitude.coordinate)?;
+        let _latitude = Latitude::new(
+            position.latitude.hemisphere(),
+            position.latitude.coordinate(),
+        )?;
+        let _longitude = Longitude::new(
+            position.longitude.hemisphere(),
+            position.longitude.coordinate(),
+        )?;
         let _offset = UtcOffset::from_stored(record.byte(ZONE))?;
         let _region = index(record.byte(REGION), NO_INDEX, RegionIndex::new)?;
         let _country = index(record.byte(COUNTRY), NO_INDEX, CountryIndex::new)?;
@@ -597,22 +399,8 @@ impl RepeaterRecord {
         let hemispheres = self.byte(HEMISPHERES);
         RepeaterPosition {
             accuracy: PositionAccuracy::from(self.byte(ACCURACY)),
-            latitude: Latitude {
-                hemisphere: if hemispheres & SOUTH == 0 {
-                    LatitudeHemisphere::North
-                } else {
-                    LatitudeHemisphere::South
-                },
-                coordinate: Coordinate::from_stored(self.field(LATITUDE)),
-            },
-            longitude: Longitude {
-                hemisphere: if hemispheres & WEST == 0 {
-                    LongitudeHemisphere::East
-                } else {
-                    LongitudeHemisphere::West
-                },
-                coordinate: Coordinate::from_stored(self.field(LONGITUDE)),
-            },
+            latitude: Latitude::from_stored(hemispheres & SOUTH != 0, self.field(LATITUDE)),
+            longitude: Longitude::from_stored(hemispheres & WEST != 0, self.field(LONGITUDE)),
         }
     }
 
@@ -713,14 +501,14 @@ impl RepeaterRecord {
     /// Replace the position; the other bits of byte 64 are kept.
     pub fn set_position(&mut self, position: RepeaterPosition) {
         let mut hemispheres = self.byte(HEMISPHERES) & !(SOUTH | WEST);
-        if position.latitude.hemisphere == LatitudeHemisphere::South {
+        if position.latitude.hemisphere() == LatitudeHemisphere::South {
             hemispheres |= SOUTH;
         }
-        if position.longitude.hemisphere == LongitudeHemisphere::West {
+        if position.longitude.hemisphere() == LongitudeHemisphere::West {
             hemispheres |= WEST;
         }
-        self.put(LATITUDE, &position.latitude.coordinate.to_stored());
-        self.put(LONGITUDE, &position.longitude.coordinate.to_stored());
+        self.put(LATITUDE, &position.latitude.coordinate().to_stored());
+        self.put(LONGITUDE, &position.longitude.coordinate().to_stored());
         self.put(HEMISPHERES, &[hemispheres, u8::from(position.accuracy)]);
     }
 

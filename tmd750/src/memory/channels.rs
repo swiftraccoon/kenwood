@@ -10,10 +10,12 @@
 
 mod call;
 mod group;
+mod records;
 mod weather;
 
 pub use call::{CallBand, CallChannel, CallChannelEntry, CallChannelPlan, CallMode};
-pub use group::{GroupNamePlan, MEMORY_GROUPS, MemoryGroup};
+pub use group::{ChannelGroupPlan, GroupNamePlan, MEMORY_GROUPS, MemoryGroup};
+pub use records::MemoryChannelPlan;
 pub use weather::{WeatherChannel, WeatherChannelEntry};
 
 use crate::error::ValidationError;

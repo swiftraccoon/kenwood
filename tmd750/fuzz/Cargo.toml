@@ -85,6 +85,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "position_record_from_bytes"
+path = "fuzz_targets/position_record_from_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "nmea_parse"
 path = "fuzz_targets/nmea_parse.rs"
 test = false

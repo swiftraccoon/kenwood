@@ -411,6 +411,48 @@ async fn complete_backup_reads_exact_official_regions_and_retires_the_handle() -
 }
 
 #[tokio::test]
+async fn a_position_memory_backup_reads_its_pages_after_the_standard_ones() -> TestResult {
+    let standard = expected_pages()?;
+    let position: Vec<Page> = [(311_296, 314_624), (315_136, 315_392)]
+        .into_iter()
+        .map(|(start, end)| Region::new(start, end).map(Region::pages))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+    assert_eq!(position.len(), 14);
+    let all: Vec<Page> = standard.iter().chain(&position).copied().collect();
+    let mut radio = Radio::new(DepartingEndpoint::new(script(&all)));
+    let mut progress = Vec::new();
+    let report = radio
+        .backup_mcp_with_position_memory_until_exit(|| false, |value| progress.push(value))
+        .await;
+    assert!(
+        matches!(report.outcome, McpBackupOutcome::AwaitingCatVerification),
+        "unexpected outcome: {:?}",
+        report.outcome
+    );
+    assert!(report.has_complete_configuration());
+    assert!(report.has_complete_position_memory());
+    assert_data(&report, &standard);
+    let read: Vec<Page> = report
+        .position_memory
+        .iter()
+        .map(|segment| segment.page)
+        .collect();
+    assert_eq!(read, position);
+    assert_eq!(
+        progress.last(),
+        Some(&Progress {
+            done: all.len(),
+            total: all.len()
+        })
+    );
+    assert_detached(&radio.into_transport(), all.len());
+    Ok(())
+}
+
+#[tokio::test]
 async fn cancellation_at_a_page_boundary_preserves_progress_and_exits() -> TestResult {
     let pages = expected_pages()?.into_iter().take(2).collect::<Vec<_>>();
     let mut radio = Radio::new(DepartingEndpoint::new(script(&pages)));

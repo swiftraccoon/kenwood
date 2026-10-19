@@ -320,12 +320,6 @@ fn field_values_are_validated_at_construction() -> TestResult {
             );
         }
     }
-    assert!(Coordinate::new(0, 60, 0).is_err());
-    assert!(Coordinate::new(0, 59, 10_000).is_err());
-    assert!(Latitude::new(LatitudeHemisphere::North, Coordinate::new(90, 0, 1)?).is_err());
-    assert!(Latitude::new(LatitudeHemisphere::North, Coordinate::new(90, 0, 0)?).is_ok());
-    assert!(Longitude::new(LongitudeHemisphere::East, Coordinate::new(180, 0, 1)?).is_err());
-    assert!(Longitude::new(LongitudeHemisphere::East, Coordinate::new(180, 0, 0)?).is_ok());
     for minutes in [-840, 0, 345, 840] {
         assert_eq!(UtcOffset::from_minutes(minutes)?.minutes(), minutes);
     }

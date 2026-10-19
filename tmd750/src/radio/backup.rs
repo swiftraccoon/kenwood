@@ -66,6 +66,10 @@ pub struct McpBackupReport {
     pub entry_reply: Option<Vec<u8>>,
     /// Fully acknowledged pages, in the official configuration-transfer order.
     pub segments: Vec<McpProbeSegment>,
+    /// Fully acknowledged GPS position memory pages, read after every
+    /// standard page by [`Radio::backup_mcp_with_position_memory_until_exit`]
+    /// and empty otherwise.
+    pub position_memory: Vec<McpProbeSegment>,
     /// Exit disposition, independent of how many pages were captured.
     pub exit: McpProbeExit,
     /// Overall transfer result; failed cleanup makes the operation fail.
@@ -79,9 +83,23 @@ impl McpBackupReport {
             gateway_mode: None,
             entry_reply: None,
             segments: Vec::new(),
+            position_memory: Vec::new(),
             exit: McpProbeExit::NotEntered,
             outcome: McpBackupOutcome::AwaitingCatVerification,
         }
+    }
+
+    /// Whether [`Self::position_memory`] holds every position memory page in
+    /// transfer order with its exact payload length.
+    #[must_use]
+    pub fn has_complete_position_memory(&self) -> bool {
+        let pages = position_memory_pages();
+        self.position_memory.len() == pages.len()
+            && self
+                .position_memory
+                .iter()
+                .zip(pages)
+                .all(|(segment, page)| segment.page == page && segment.data.len() == page.len())
     }
 
     fn fail(&mut self, stage: McpBackupStage, error: Error) {
@@ -116,6 +134,13 @@ impl McpBackupReport {
 
 fn configuration_pages() -> Vec<Page> {
     regions::menu_regions()
+        .into_iter()
+        .flat_map(Region::pages)
+        .collect()
+}
+
+fn position_memory_pages() -> Vec<Page> {
+    regions::POSITION_MEMORY
         .into_iter()
         .flat_map(Region::pages)
         .collect()
@@ -171,7 +196,7 @@ impl<T: Transport> Radio<T> {
             report.fail(McpBackupStage::Gateway, Error::GatewayNotOff { observed });
             return report;
         }
-        self.finish_backup(&mut should_cancel, &mut progress, &mut report)
+        self.finish_backup(&mut should_cancel, &mut progress, &mut report, &[])
             .await;
         report
     }
@@ -209,8 +234,34 @@ impl<T: Transport> Radio<T> {
     ) -> McpBackupReport {
         let mut report = McpBackupReport::pending();
         if self.identify_backup(&mut should_cancel, &mut report).await {
-            self.finish_backup(&mut should_cancel, &mut progress, &mut report)
+            self.finish_backup(&mut should_cancel, &mut progress, &mut report, &[])
                 .await;
+        }
+        report
+    }
+
+    /// Read the standard configuration, then the GPS position memory
+    /// ([`regions::POSITION_MEMORY`]) in the same programming session, then
+    /// acknowledge MCP exit; otherwise [`Self::backup_mcp_until_exit`].
+    ///
+    /// The position pages go to [`McpBackupReport::position_memory`] after
+    /// every standard page, and `progress` counts both. On firmware 1.02 a
+    /// session reading the position memory returned every page and exited
+    /// normally.
+    pub async fn backup_mcp_with_position_memory_until_exit(
+        &mut self,
+        mut should_cancel: impl FnMut() -> bool,
+        mut progress: impl FnMut(Progress),
+    ) -> McpBackupReport {
+        let mut report = McpBackupReport::pending();
+        if self.identify_backup(&mut should_cancel, &mut report).await {
+            self.finish_backup(
+                &mut should_cancel,
+                &mut progress,
+                &mut report,
+                &position_memory_pages(),
+            )
+            .await;
         }
         report
     }
@@ -236,11 +287,14 @@ impl<T: Transport> Radio<T> {
         }
     }
 
+    /// Enter, read every standard page into `report.segments` and then each
+    /// of `position_pages` into `report.position_memory`, and exit.
     async fn finish_backup(
         &mut self,
         should_cancel: &mut impl FnMut() -> bool,
         progress: &mut impl FnMut(Progress),
         report: &mut McpBackupReport,
+        position_pages: &[Page],
     ) {
         if should_cancel() {
             report.outcome = McpBackupOutcome::Cancelled;
@@ -257,21 +311,29 @@ impl<T: Transport> Radio<T> {
         report.entry_reply = Some(session.entry_reply().to_vec());
         report.exit = McpProbeExit::RecoveryRequired;
         let pages = configuration_pages();
-        let total = pages.len();
-        for page in pages {
+        let standard = pages.len();
+        let total = standard + position_pages.len();
+        for (number, page) in pages
+            .into_iter()
+            .chain(position_pages.iter().copied())
+            .enumerate()
+        {
             if should_cancel() {
                 report.outcome = McpBackupOutcome::Cancelled;
                 break;
             }
             match session.read_page(page).await {
-                Ok(data) => report.segments.push(McpProbeSegment { page, data }),
+                Ok(data) if number < standard => {
+                    report.segments.push(McpProbeSegment { page, data });
+                }
+                Ok(data) => report.position_memory.push(McpProbeSegment { page, data }),
                 Err(error) => {
                     report.fail(McpBackupStage::Read { page }, error);
                     return;
                 }
             }
             progress(Progress {
-                done: report.segments.len(),
+                done: number + 1,
                 total,
             });
         }

@@ -19,7 +19,7 @@ use crate::memory::{ChannelNameText, MemoryImage};
 use crate::protocol::mcp::regions;
 use crate::radio::programming::PageReplacement;
 use crate::types::stored::name_address_at;
-use crate::types::{Address, CHANNEL_NAME_SIZE, Page};
+use crate::types::{Address, CHANNEL_NAME_SIZE, Page, PhysicalChannel};
 
 /// Memory groups.
 pub const MEMORY_GROUPS: u8 = 30;
@@ -153,6 +153,108 @@ impl GroupNamePlan {
 /// The writable page holding `group`'s name.
 fn name_page(group: MemoryGroup) -> Option<Page> {
     let address = Address::new(u32::try_from(group.name_address()).ok()?).ok()?;
+    regions::writable_page_for(address)
+}
+
+/// New memory groups for a set of stored regular channels.
+///
+/// A regular channel's group is byte 2 of its flag record, and the plan
+/// writes any of the thirty groups there. A CAT `ME` store resets the byte to
+/// the channel number's hundreds digit, so apply the plan after storing.
+/// Program scan, priority and APRS channels keep their fixed groups.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelGroupPlan {
+    groups: BTreeMap<PhysicalChannel, MemoryGroup>,
+}
+
+impl ChannelGroupPlan {
+    /// Collect one group per channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::ChannelGroupFixed`] for a channel other
+    /// than regular channels 0 to 999 and
+    /// [`ValidationError::DuplicateChannelGroup`] when a channel appears
+    /// twice.
+    pub fn new(
+        assignments: impl IntoIterator<Item = (PhysicalChannel, MemoryGroup)>,
+    ) -> Result<Self, ValidationError> {
+        let mut plan = BTreeMap::new();
+        for (channel, group) in assignments {
+            if channel.index() >= PhysicalChannel::FIRST_PROGRAM_SCAN {
+                return Err(ValidationError::ChannelGroupFixed {
+                    index: channel.index(),
+                });
+            }
+            if plan.insert(channel, group).is_some() {
+                return Err(ValidationError::DuplicateChannelGroup {
+                    index: channel.index(),
+                });
+            }
+        }
+        Ok(Self { groups: plan })
+    }
+
+    /// The flag-table pages the plan touches, each once, in address order.
+    #[must_use]
+    pub fn pages(&self) -> Vec<Page> {
+        let mut pages: Vec<Page> = Vec::new();
+        for channel in self.groups.keys() {
+            if let Some(page) = flag_page(*channel)
+                && pages.last() != Some(&page)
+            {
+                pages.push(page);
+            }
+        }
+        pages
+    }
+
+    /// The writes of the touched pages whose bytes change, each keeping every
+    /// other byte as `image` holds it.
+    ///
+    /// Apply them with [`crate::radio::McpSession::compare_exchange_pages`],
+    /// which compares each page with a fresh read before writing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::ChannelNotStored`] for a channel whose flag
+    /// marks it empty in `image`, and the [`PageReplacement::new`] errors.
+    pub fn page_replacements(&self, image: &MemoryImage) -> Result<Vec<PageReplacement>, Error> {
+        for channel in self.groups.keys() {
+            let band = image.as_bytes().get(channel.flag_address()).copied();
+            if band.is_none_or(|band| band == 0xFF) {
+                return Err(ValidationError::ChannelNotStored {
+                    index: channel.index(),
+                }
+                .into());
+            }
+        }
+        let mut replacements = Vec::new();
+        for page in self.pages() {
+            let start = page.address().as_usize();
+            let expected = image
+                .as_bytes()
+                .get(start..start + page.len())
+                .unwrap_or_default();
+            let mut replacement = expected.to_vec();
+            for (channel, group) in &self.groups {
+                if let Some(offset) = (channel.flag_address() + 2).checked_sub(start)
+                    && let Some(byte) = replacement.get_mut(offset)
+                {
+                    *byte = group.index();
+                }
+            }
+            if replacement != expected {
+                replacements.push(PageReplacement::new(page, expected, &replacement)?);
+            }
+        }
+        Ok(replacements)
+    }
+}
+
+/// The writable page holding `channel`'s flag record.
+fn flag_page(channel: PhysicalChannel) -> Option<Page> {
+    let address = Address::new(u32::try_from(channel.flag_address()).ok()?).ok()?;
     regions::writable_page_for(address)
 }
 

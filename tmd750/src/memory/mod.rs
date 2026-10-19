@@ -26,7 +26,10 @@
 //!   [`ChannelAccess`]; the user Mic-E type codes with
 //!   [`mic_e::MicETypeCodeTables`]; a PM slot's VFO memory with
 //!   [`vfo::VfoMemory`]; the DTMF and `EchoLink` memories with
-//!   [`dtmf::DtmfMemories`].
+//!   [`dtmf::DtmfMemories`]; the GPS position memory with
+//!   [`position::PositionMemory`].
+//! - Store and clear memory channels, the priority channel included, with
+//!   [`MemoryChannelPlan`]; regroup them with [`ChannelGroupPlan`].
 //! - Restore a whole captured configuration with [`restore::RestorePlan`].
 //! - Prepare ordinary registered changes with
 //!   [`crate::radio::menu::MenuUpdatePlan`], or persistent Gateway changes with
@@ -52,6 +55,7 @@ mod menu_patch;
 mod menu_policy;
 pub mod mic_e;
 mod my_callsigns;
+pub mod position;
 pub mod repeater_list;
 pub mod restore;
 pub mod schema;
@@ -68,7 +72,8 @@ pub use captured_configuration::Configuration;
 pub use channel_names::ChannelNamePlan;
 pub use channels::{
     CallBand, CallChannel, CallChannelEntry, CallChannelPlan, CallMode, ChannelAccess,
-    GroupNamePlan, MEMORY_GROUPS, MemoryGroup, WeatherChannel, WeatherChannelEntry,
+    ChannelGroupPlan, GroupNamePlan, MEMORY_GROUPS, MemoryChannelPlan, MemoryGroup, WeatherChannel,
+    WeatherChannelEntry,
 };
 pub use configuration::{
     ChangedByte, ChangedPage, ConfigurationError, StandardConfiguration, StandardConfigurationDiff,

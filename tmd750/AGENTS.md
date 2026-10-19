@@ -62,11 +62,11 @@
 - `MD` values: 0 FM, 1 DV, 2 AM, 3 NFM, 4 DR (read only; `MD band,4` is `N`).
   `VM band,3` selects DR. `ME` and `MR` take three-character selectors;
   `MR band` reports `AP ` for the APRS channel, which `ME` and `MR` refuse.
-- `ME addr,<20 fields>` stores a channel and keeps its name (echo exact;
-  readback identical except an empty URCALL becomes `CQCQCQ`); `ME addr,`
-  clears it and its name (reply `ME addr`, then `N`); 19- and 20-field forms
-  are `?`/`N`; `ME Pri,...` is `N`. A zero-frequency record is stored, so
-  never send one.
+- `ME addr,<20 fields>` stores a channel, keeps its name and resets a regular
+  channel's group to its hundreds digit (echo exact; readback identical except
+  an empty URCALL becomes `CQCQCQ`); `ME addr,` clears it and its name (reply
+  `ME addr`, then `N`); 19- and 20-field forms are `?`/`N`; `ME Pri` and
+  `MR band,Pri` are `N` stored or not. A 0 Hz record is stored: never send one.
 - `DC slot,callsign,memo` and `CS callsign` store their text verbatim and
   unpadded (a comma cannot be carried, so `DstarCallsignEntry` rejects it);
   `DC slot,,` is an unset or cleared MY slot, and an unconfigured
@@ -93,7 +93,7 @@
   1101, weather 1102-1111, CALL 1132-1137 (names 1136-1141), group names
   1152-1182. CALL mode `FO` reads it; `MD`/`FO` writes are `N`, so use MCP.
 - The band code is a receive-frequency segment, not bits (`BandCode`'s doc);
-  not established: segment edges, tone/CTCSS index basis, non-ASCII names.
+  not established: tone/CTCSS index basis, non-ASCII names.
 - `UP`/`DW` act on the control band (first `BC` field) and take no argument;
   selecting a step rounds the VFO down to a multiple of it. The radio drops a
   second step sent within about 15 ms and answers a setting write within

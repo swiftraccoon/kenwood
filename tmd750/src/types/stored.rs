@@ -25,6 +25,12 @@ pub const CHANNEL_DATA_OFFSET: usize = 0x4000;
 pub const CHANNEL_NAMES_OFFSET: usize = 0x10000;
 /// Bytes in one stored channel record.
 pub const CHANNEL_RECORD_SIZE: usize = 40;
+/// The record bytes of an empty slot on firmware 1.02: fifteen `0xFF` bytes,
+/// URCALL `CQCQCQ`, RPT1 and RPT2 `DIRECT`, and digital code zero.
+///
+/// Every unprogrammed regular, program scan and priority slot of a standard
+/// backup holds them, and a CAT clear writes them.
+pub const EMPTY_CHANNEL_RECORD: [u8; CHANNEL_RECORD_SIZE] = *b"\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFFCQCQCQ\0\0DIRECT\0\0DIRECT\0\0\0";
 /// Channel records in one 256-byte page; the last 16 bytes are unused.
 pub const CHANNELS_PER_PAGE: usize = 6;
 /// Bytes in one flag record.
@@ -513,23 +519,55 @@ impl StoredChannel {
 
 /// The band code in flag byte zero of a stored channel.
 ///
-/// `0xFF` marks an empty slot. On firmware 1.02 the code names the receive
-/// frequency's segment, whichever band stored the channel, and is not a bit
-/// field: `0x04` at 108.000, 118.000 and 121.500 MHz, `0x05` at 136.000,
-/// 145.200 and 162.550 MHz, `0x06` at 174.000 and 200.000 MHz, `0x02` at
-/// 216.000 and 223.500 MHz, `0x07` at 260.000 and 300.000 MHz, `0x08` at
-/// 410.000 and 446.000 MHz, and `0x09` at 470.000, 500.000 and 523.000 MHz
-/// for channels stored over CAT. The radio's own 144.390 MHz APRS channel,
-/// the weather channels and the VHF CALL channels hold `0x01`, the 220 MHz
-/// CALL channels `0x02` and the UHF CALL channels `0x03`. The segment edges
-/// between those samples are not established, so the byte is retained
-/// exactly.
+/// `0xFF` marks an empty slot. On firmware 1.02 a CAT store sets the code of
+/// the receive frequency's segment, whichever band stored the channel; the
+/// code is not a bit field:
+///
+/// | Receive frequency | Code |
+/// | --- | --- |
+/// | 108 to 136 MHz | `0x04` |
+/// | 136 to 174 MHz | `0x05` |
+/// | 174 to 216 MHz | `0x06` |
+/// | 216 to 260 MHz | `0x02` |
+/// | 260 to 410 MHz | `0x07` |
+/// | 410 to 470 MHz | `0x08` |
+/// | 470 to 524 MHz | `0x09` |
+///
+/// Each segment holds its lower edge and ends below its upper one; every
+/// edge was stored at the edge and 5 kHz below it. The radio's own
+/// 144.390 MHz APRS channel, the weather channels and the VHF CALL channels
+/// hold `0x01`, the 220 MHz CALL channels `0x02` and the UHF CALL channels
+/// `0x03`, so a decoded code is retained exactly; [`Self::for_frequency`]
+/// gives the code a CAT store sets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BandCode(u8);
 
 impl BandCode {
     /// The empty-slot marker.
     pub const EMPTY: u8 = 0xFF;
+
+    /// The upper edge of each segment below 470 MHz, in hertz, with its code.
+    const SEGMENT_ENDS: [(u32, u8); 6] = [
+        (136_000_000, 0x04),
+        (174_000_000, 0x05),
+        (216_000_000, 0x06),
+        (260_000_000, 0x02),
+        (410_000_000, 0x07),
+        (470_000_000, 0x08),
+    ];
+
+    /// The code a CAT store sets for a channel receiving on `frequency`,
+    /// from the segment table above; `0x09` from 470 MHz.
+    #[must_use]
+    pub fn for_frequency(frequency: Frequency) -> Self {
+        let hz = frequency.as_hz();
+        Self(
+            Self::SEGMENT_ENDS
+                .iter()
+                .find(|(end, _)| hz < *end)
+                .map_or(0x09, |(_, code)| *code),
+        )
+    }
 
     /// Retain a stored value other than the empty marker.
     ///
@@ -560,8 +598,10 @@ impl BandCode {
 /// Byte 0 is the band code or `0xFF` for an empty slot, byte 1 the scan
 /// lockout, byte 2 the group and byte 3 is raw (`0xFF` on empty slots and
 /// the radio's APRS channel, `0x00` after a CAT write and on the weather
-/// channels). Groups 0 through 9 follow the hundreds digit of a regular
-/// channel; program scan slots read 30 while empty and 10 after a CAT write;
+/// channels). A regular slot holds its number's hundreds digit as its group,
+/// empty or stored, and a CAT write resets it to that digit;
+/// [`crate::memory::channels::ChannelGroupPlan`] assigns any group 0 to 29.
+/// Program scan slots read 30 while empty and 10 after a CAT write;
 /// the priority channel reads 31, the weather channels 32 and the APRS
 /// channel 35. A CALL channel's flag holds `0xFF` in the lockout byte, so
 /// [`crate::memory::channels::CallChannelEntry`] keeps it raw.
@@ -910,10 +950,50 @@ mod tests {
         Ok(())
     }
 
+    /// Receive frequencies stored over CAT on firmware 1.02 and the band code
+    /// the radio set for each: every segment edge and 5 kHz below it.
+    const SURVEYED_BAND_CODES: [(u32, u8); 22] = [
+        (108_000_000, 0x04),
+        (118_000_000, 0x04),
+        (121_500_000, 0x04),
+        (135_995_000, 0x04),
+        (136_000_000, 0x05),
+        (145_200_000, 0x05),
+        (162_550_000, 0x05),
+        (173_995_000, 0x05),
+        (174_000_000, 0x06),
+        (200_000_000, 0x06),
+        (215_995_000, 0x06),
+        (216_000_000, 0x02),
+        (223_500_000, 0x02),
+        (259_995_000, 0x02),
+        (260_000_000, 0x07),
+        (300_000_000, 0x07),
+        (409_995_000, 0x07),
+        (410_000_000, 0x08),
+        (446_000_000, 0x08),
+        (469_995_000, 0x08),
+        (470_000_000, 0x09),
+        (523_995_000, 0x09),
+    ];
+
+    #[test]
+    fn band_codes_follow_the_surveyed_segments() -> TestResult {
+        for (hz, code) in SURVEYED_BAND_CODES {
+            assert_eq!(
+                BandCode::for_frequency(Frequency::new(hz)?).as_raw(),
+                code,
+                "{hz} Hz"
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn empty_slots_keep_their_bytes_undecoded() -> TestResult {
         let mut record = [0xFF; 40];
         record[15..].copy_from_slice(b"CQCQCQ\0\0DIRECT\0\0DIRECT\0\0\0");
+        assert_eq!(record, EMPTY_CHANNEL_RECORD);
         let entry = StoredChannelEntry::from_records(
             PhysicalChannel::new(0)?,
             &[0xFF, 0x00, 0x00, 0xFF],

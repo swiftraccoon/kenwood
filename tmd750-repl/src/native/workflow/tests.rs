@@ -65,6 +65,7 @@ fn failed_backup() -> BackupEvidence {
         gateway_mode: None,
         entry_reply: None,
         segments: Vec::new(),
+        position_memory: Vec::new(),
         exit: kenwood_tmd750::McpProbeExit::NotEntered,
         outcome: kenwood_tmd750::McpBackupOutcome::Failed {
             stage: kenwood_tmd750::McpBackupStage::Identity,
