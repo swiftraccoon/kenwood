@@ -367,7 +367,16 @@ fn manifest_round_trips_and_rustgen_emits_slot_terms() -> TestResult {
     let json = json_text(&manifest)?;
     assert_eq!(parse_manifest(&json)?, manifest);
     let registry = rust_text(&manifest)?;
-    assert!(registry.contains("pub static MCP_D750_MENU_FIELDS: &[MenuField] = &["));
+    assert!(registry.contains("static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; "));
+    assert!(
+        registry.contains(
+            "pub static MCP_D750_MENU_FIELDS: &[MenuField] = &MCP_D750_MENU_FIELD_ENTRIES;"
+        )
+    );
+    assert!(registry.contains("pub struct MenuFieldId(&'static MenuField);"));
+    assert!(registry.contains(
+        "    /// `radio.MeterType`.\n    pub const RADIO_METER_TYPE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES["
+    ));
     assert!(registry.contains("pub const MCP_D750_IMAGE_LENGTH: usize = 1_929_472;"));
     assert!(registry.contains("pub const MCP_D750_SLOT_STRIDE: u32 = 8192;"));
     assert!(registry.contains(

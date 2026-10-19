@@ -21,6 +21,8 @@ struct Target {
     product: &'static str,
     menus_doc: &'static str,
     terms: bool,
+    /// Whether to emit the `MenuFieldId` enum naming every registry entry.
+    catalog: bool,
     module_docs: &'static [&'static str],
     field_docs: &'static [&'static str],
     descriptor_doc: &'static str,
@@ -33,6 +35,7 @@ const THD75_TARGET: Target = Target {
     product: "MCP-D75",
     menus_doc: "(`radio`, `gps`, `aprs`, or `dv`)",
     terms: false,
+    catalog: false,
     module_docs: &[],
     field_docs: &["/// One writable public MCP-D75 menu or repeated-record field."],
     descriptor_doc: "Absolute memory offset and on-image codec.",
@@ -47,6 +50,7 @@ const TMD750_TARGET: Target = Target {
     product: "MCP-D750",
     menus_doc: "(`radio`, `gps`, `aprs`, `dv`, `ipnet`, or `pm`)",
     terms: true,
+    catalog: true,
     module_docs: &[
         "//!",
         "//! This catalog describes storage, enum labels and slot-relative addressing",
@@ -794,14 +798,25 @@ pub fn rust_text(manifest: &Manifest) -> Result<String> {
         &mut choice_value_names,
     )?);
     let statics = format!("{}_MENU_FIELDS", target.prefix);
-    lines.extend(target.registry_docs.iter().map(ToString::to_string));
-    lines.extend([
-        "#[rustfmt::skip]".to_owned(),
-        format!("pub static {statics}: &[MenuField] = &["),
-    ]);
+    let entries = format!("{}_MENU_FIELD_ENTRIES", target.prefix);
+    let fields = writable_manifest_fields(manifest, target)?;
+    if target.catalog {
+        lines.extend([
+            "#[rustfmt::skip]".to_owned(),
+            format!("static {entries}: [MenuField; {}] = [", fields.len()),
+        ]);
+    } else {
+        lines.extend(target.registry_docs.iter().map(ToString::to_string));
+        lines.extend([
+            "#[rustfmt::skip]".to_owned(),
+            format!("pub static {statics}: &[MenuField] = &["),
+        ]);
+    }
     let mut rendered_fields: u64 = 0;
-    for (menu, field) in writable_manifest_fields(manifest, target)? {
+    let mut keys = Vec::new();
+    for (menu, field) in fields {
         rendered_fields += 1;
+        keys.push(format!("{}.{}", menu.menu, field.name()));
         lines.extend(menu_field_entry_lines(
             menu,
             field,
@@ -816,8 +831,13 @@ pub fn rust_text(manifest: &Manifest) -> Result<String> {
             manifest.summary.writable_registry_field_count
         ));
     }
+    lines.push("];".to_owned());
+    if target.catalog {
+        lines.push(String::new());
+        lines.extend(target.registry_docs.iter().map(ToString::to_string));
+        lines.push(format!("pub static {statics}: &[MenuField] = &{entries};"));
+    }
     lines.extend([
-        "];".to_owned(),
         String::new(),
         "/// Look up a field by its `menu.name`, preferring an exact match before".to_owned(),
         "/// accepting ASCII case-insensitive input.".to_owned(),
@@ -835,5 +855,167 @@ pub fn rust_text(manifest: &Manifest) -> Result<String> {
         "}".to_owned(),
         String::new(),
     ]);
+    if target.catalog {
+        lines.extend(catalog_lines(&statics, &entries, &keys)?);
+    }
     Ok(lines.join("\n"))
+}
+
+/// The Rust constant naming `key`: its ASCII letter and digit runs in upper
+/// case, with `_` between runs, before an upper-case letter that follows a
+/// lower-case letter or digit, and before a digit that follows a letter
+/// (`gps.Sentence_Gpgga` becomes `GPS_SENTENCE_GPGGA`, `pm.PmName2` becomes
+/// `PM_PM_NAME_2`).
+fn constant_name(key: &str) -> String {
+    let mut name = String::new();
+    for piece in key
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|piece| !piece.is_empty())
+    {
+        if !name.is_empty() {
+            name.push('_');
+        }
+        let mut previous: Option<char> = None;
+        for character in piece.chars() {
+            if let Some(before) = previous {
+                let hump = character.is_ascii_uppercase()
+                    && (before.is_ascii_lowercase() || before.is_ascii_digit());
+                let digits = character.is_ascii_digit() && before.is_ascii_alphabetic();
+                if hump || digits {
+                    name.push('_');
+                }
+            }
+            name.push(character.to_ascii_uppercase());
+            previous = Some(character);
+        }
+    }
+    name
+}
+
+/// The `MenuFieldId` handle: one associated constant per registry entry, in
+/// registry order, each holding a reference into the `entries` array.
+fn catalog_lines(statics: &str, entries: &str, keys: &[String]) -> Result<Vec<String>> {
+    let mut constants: Vec<String> = Vec::with_capacity(keys.len());
+    for key in keys {
+        let constant = constant_name(key);
+        if !constant.starts_with(|first: char| first.is_ascii_uppercase())
+            || constants.contains(&constant)
+        {
+            return Err(extract_error!(
+                "registry key {key} has no unique Rust constant name; {constant} is invalid or taken"
+            ));
+        }
+        constants.push(constant);
+    }
+    let mut lines = vec![
+        format!("/// A field of [`{statics}`], named by an associated constant so a field"),
+        "/// is chosen without a string lookup; equality and hashing follow the key.".to_owned(),
+        "#[derive(Clone, Copy)]".to_owned(),
+        "pub struct MenuFieldId(&'static MenuField);".to_owned(),
+        String::new(),
+        "#[rustfmt::skip]".to_owned(),
+        "impl MenuFieldId {".to_owned(),
+    ];
+    for (index, (key, constant)) in keys.iter().zip(&constants).enumerate() {
+        lines.push(format!("    /// `{key}`."));
+        lines.push(format!(
+            "    pub const {constant}: Self = Self(&{entries}[{index}]);"
+        ));
+    }
+    lines.extend([
+        String::new(),
+        "    /// Every field, in registry order.".to_owned(),
+        format!("    pub const ALL: [Self; {}] = [", keys.len()),
+    ]);
+    lines.extend(
+        constants
+            .iter()
+            .map(|constant| format!("        Self::{constant},")),
+    );
+    lines.extend([
+        "    ];".to_owned(),
+        String::new(),
+        "    /// The field's registry entry.".to_owned(),
+        "    #[must_use]".to_owned(),
+        "    pub const fn field(self) -> &'static MenuField {".to_owned(),
+        "        self.0".to_owned(),
+        "    }".to_owned(),
+        String::new(),
+        "    /// The field's `menu.name` key.".to_owned(),
+        "    #[must_use]".to_owned(),
+        "    pub const fn name(self) -> &'static str {".to_owned(),
+        "        self.0.descriptor.name".to_owned(),
+        "    }".to_owned(),
+        String::new(),
+        "    /// The field whose key is exactly `name`.".to_owned(),
+        "    #[must_use]".to_owned(),
+        "    pub fn from_name(name: &str) -> Option<Self> {".to_owned(),
+        "        Self::ALL.into_iter().find(|id| id.name() == name)".to_owned(),
+        "    }".to_owned(),
+        "}".to_owned(),
+        String::new(),
+        "impl PartialEq for MenuFieldId {".to_owned(),
+        "    fn eq(&self, other: &Self) -> bool {".to_owned(),
+        "        self.name() == other.name()".to_owned(),
+        "    }".to_owned(),
+        "}".to_owned(),
+        String::new(),
+        "impl Eq for MenuFieldId {}".to_owned(),
+        String::new(),
+        "impl std::hash::Hash for MenuFieldId {".to_owned(),
+        "    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {".to_owned(),
+        "        self.name().hash(state);".to_owned(),
+        "    }".to_owned(),
+        "}".to_owned(),
+        String::new(),
+        "impl std::fmt::Debug for MenuFieldId {".to_owned(),
+        "    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {"
+            .to_owned(),
+        "        formatter".to_owned(),
+        "            .debug_tuple(\"MenuFieldId\")".to_owned(),
+        "            .field(&self.name())".to_owned(),
+        "            .finish()".to_owned(),
+        "    }".to_owned(),
+        "}".to_owned(),
+        String::new(),
+    ]);
+    Ok(lines)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn constant_names_split_runs_humps_and_digits() {
+        for (key, constant) in [
+            ("radio.Beep", "RADIO_BEEP"),
+            ("gps.Sentence_Gpgga", "GPS_SENTENCE_GPGGA"),
+            ("pm.PmName2", "PM_PM_NAME_2"),
+            ("radio.TxEqualizerFmNfm", "RADIO_TX_EQUALIZER_FM_NFM"),
+            (
+                "dv.MyCallsignDvGatewayList[0].MyCallsignDvGateway",
+                "DV_MY_CALLSIGN_DV_GATEWAY_LIST_0_MY_CALLSIGN_DV_GATEWAY",
+            ),
+        ] {
+            assert_eq!(constant_name(key), constant);
+        }
+    }
+
+    #[test]
+    fn colliding_or_unnamed_keys_fail_the_catalog() -> TestResult {
+        let lines = catalog_lines("FIELDS", "ENTRIES", &["a.B".to_owned(), "a.C".to_owned()])?;
+        assert!(lines.contains(&"    pub const A_C: Self = Self(&ENTRIES[1]);".to_owned()));
+        for keys in [["a.bC", "a.b_c"], ["a.b", "A.B"]] {
+            let keys = keys.map(ToOwned::to_owned);
+            assert!(
+                catalog_lines("FIELDS", "ENTRIES", &keys).is_err(),
+                "{keys:?}"
+            );
+        }
+        assert!(catalog_lines("FIELDS", "ENTRIES", &["0.x".to_owned()]).is_err());
+        Ok(())
+    }
 }

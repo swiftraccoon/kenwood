@@ -4377,15 +4377,8 @@ static ALLOWED_DOMAIN_000: &[u64] = &[
     90,
 ];
 
-/// Public storage fields represented by the reviewed MCP-D750 serializers.
-///
-/// [`MenuField::write_policy`] distinguishes ordinary settings from
-/// lifecycle-restricted, unresolved and binary fields; this list is a
-/// catalog, not an allowlist. Use
-/// [`MenuUpdatePlan`](crate::radio::menu::MenuUpdatePlan) for guarded
-/// ordinary changes.
 #[rustfmt::skip]
-pub static MCP_D750_MENU_FIELDS: &[MenuField] = &[
+static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
     MenuField {
         menu: "radio",
         enum_type: Some("oa.o"),
@@ -13764,6 +13757,15 @@ pub static MCP_D750_MENU_FIELDS: &[MenuField] = &[
     },
 ];
 
+/// Public storage fields represented by the reviewed MCP-D750 serializers.
+///
+/// [`MenuField::write_policy`] distinguishes ordinary settings from
+/// lifecycle-restricted, unresolved and binary fields; this list is a
+/// catalog, not an allowlist. Use
+/// [`MenuUpdatePlan`](crate::radio::menu::MenuUpdatePlan) for guarded
+/// ordinary changes.
+pub static MCP_D750_MENU_FIELDS: &[MenuField] = &MCP_D750_MENU_FIELD_ENTRIES;
+
 /// Look up a field by its `menu.name`, preferring an exact match before
 /// accepting ASCII case-insensitive input.
 #[must_use]
@@ -13776,4 +13778,1351 @@ pub fn menu_field(name: &str) -> Option<&'static MenuField> {
                 .iter()
                 .find(|field| field.descriptor.name.eq_ignore_ascii_case(name))
         })
+}
+
+/// A field of [`MCP_D750_MENU_FIELDS`], named by an associated constant so a field
+/// is chosen without a string lookup; equality and hashing follow the key.
+#[derive(Clone, Copy)]
+pub struct MenuFieldId(&'static MenuField);
+
+#[rustfmt::skip]
+impl MenuFieldId {
+    /// `radio.RepeaterMode`.
+    pub const RADIO_REPEATER_MODE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[0]);
+    /// `radio.RepeaterTxHold`.
+    pub const RADIO_REPEATER_TX_HOLD: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[1]);
+    /// `radio.RepeaterId`.
+    pub const RADIO_REPEATER_ID: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[2]);
+    /// `radio.RepeaterIdTx`.
+    pub const RADIO_REPEATER_ID_TX: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[3]);
+    /// `radio.RepeaterIdVoice`.
+    pub const RADIO_REPEATER_ID_VOICE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[4]);
+    /// `radio.RemoteContorolCode`.
+    pub const RADIO_REMOTE_CONTOROL_CODE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[5]);
+    /// `radio.Language`.
+    pub const RADIO_LANGUAGE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[6]);
+    /// `radio.PoweronBitmap`.
+    pub const RADIO_POWERON_BITMAP: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[7]);
+    /// `radio.PowerOnMessage`.
+    pub const RADIO_POWER_ON_MESSAGE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[8]);
+    /// `radio.SingleBandDisplay`.
+    pub const RADIO_SINGLE_BAND_DISPLAY: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[9]);
+    /// `radio.MeterType`.
+    pub const RADIO_METER_TYPE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[10]);
+    /// `radio.BackgroundColor`.
+    pub const RADIO_BACKGROUND_COLOR: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[11]);
+    /// `radio.InfoBacklight`.
+    pub const RADIO_INFO_BACKLIGHT: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[12]);
+    /// `radio.TxEqualizerFmNfm`.
+    pub const RADIO_TX_EQUALIZER_FM_NFM: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[13]);
+    /// `radio.TxEqualizerDv`.
+    pub const RADIO_TX_EQUALIZER_DV: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[14]);
+    /// `radio.RxEqualizer`.
+    pub const RADIO_RX_EQUALIZER: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[15]);
+    /// `radio.TxEqLevel04`.
+    pub const RADIO_TX_EQ_LEVEL_04: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[16]);
+    /// `radio.TxEqLevel08`.
+    pub const RADIO_TX_EQ_LEVEL_08: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[17]);
+    /// `radio.TxEqLevel16`.
+    pub const RADIO_TX_EQ_LEVEL_16: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[18]);
+    /// `radio.TxEqLevel32`.
+    pub const RADIO_TX_EQ_LEVEL_32: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[19]);
+    /// `radio.RxEqLevel04`.
+    pub const RADIO_RX_EQ_LEVEL_04: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[20]);
+    /// `radio.RxEqLevel08`.
+    pub const RADIO_RX_EQ_LEVEL_08: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[21]);
+    /// `radio.RxEqLevel16`.
+    pub const RADIO_RX_EQ_LEVEL_16: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[22]);
+    /// `radio.RxEqLevel32`.
+    pub const RADIO_RX_EQ_LEVEL_32: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[23]);
+    /// `radio.RxEqLevel64`.
+    pub const RADIO_RX_EQ_LEVEL_64: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[24]);
+    /// `radio.UsbAudioOutLevel`.
+    pub const RADIO_USB_AUDIO_OUT_LEVEL: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[25]);
+    /// `radio.ExternalSpeaker`.
+    pub const RADIO_EXTERNAL_SPEAKER: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[26]);
+    /// `radio.Beep`.
+    pub const RADIO_BEEP: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[27]);
+    /// `radio.BeepVolume`.
+    pub const RADIO_BEEP_VOLUME: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[28]);
+    /// `radio.VoiceAnnounce`.
+    pub const RADIO_VOICE_ANNOUNCE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[29]);
+    /// `radio.VoiceAnnounceVolume`.
+    pub const RADIO_VOICE_ANNOUNCE_VOLUME: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[30]);
+    /// `radio.VoiceGuidanceSpeed`.
+    pub const RADIO_VOICE_GUIDANCE_SPEED: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[31]);
+    /// `radio.CallsignReadout`.
+    pub const RADIO_CALLSIGN_READOUT: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[32]);
+    /// `radio.BluetoothOnOff`.
+    pub const RADIO_BLUETOOTH_ON_OFF: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[33]);
+    /// `radio.BluetoothDeviceName`.
+    pub const RADIO_BLUETOOTH_DEVICE_NAME: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[34]);
+    /// `radio.BluetoothAutoConnect`.
+    pub const RADIO_BLUETOOTH_AUTO_CONNECT: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[35]);
+    /// `radio.Pf1PfKey`.
+    pub const RADIO_PF_1_PF_KEY: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[36]);
+    /// `radio.Pf2PfKey`.
+    pub const RADIO_PF_2_PF_KEY: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[37]);
+    /// `radio.PowerKey`.
+    pub const RADIO_POWER_KEY: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[38]);
+    /// `radio.Pf1Mic`.
+    pub const RADIO_PF_1_MIC: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[39]);
+    /// `radio.Pf2Mic`.
+    pub const RADIO_PF_2_MIC: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[40]);
+    /// `radio.Pf3Mic`.
+    pub const RADIO_PF_3_MIC: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[41]);
+    /// `radio.Pf4Mic`.
+    pub const RADIO_PF_4_MIC: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[42]);
+    /// `radio.CursorShift`.
+    pub const RADIO_CURSOR_SHIFT: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[43]);
+    /// `radio.RemoteAnswerBack`.
+    pub const RADIO_REMOTE_ANSWER_BACK: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[44]);
+    /// `radio.TimeZone`.
+    pub const RADIO_TIME_ZONE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[45]);
+    /// `radio.AutoCorrection`.
+    pub const RADIO_AUTO_CORRECTION: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[46]);
+    /// `radio.NtpServerAddress`.
+    pub const RADIO_NTP_SERVER_ADDRESS: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[47]);
+    /// `radio.KeyLockTypeKeyLock`.
+    pub const RADIO_KEY_LOCK_TYPE_KEY_LOCK: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[48]);
+    /// `radio.KeyLockTypeFrequencyLock`.
+    pub const RADIO_KEY_LOCK_TYPE_FREQUENCY_LOCK: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[49]);
+    /// `radio.DtmfKeys`.
+    pub const RADIO_DTMF_KEYS: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[50]);
+    /// `radio.MicKeys`.
+    pub const RADIO_MIC_KEYS: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[51]);
+    /// `radio.SpeedDistance`.
+    pub const RADIO_SPEED_DISTANCE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[52]);
+    /// `radio.AltitudeRain`.
+    pub const RADIO_ALTITUDE_RAIN: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[53]);
+    /// `radio.Temperature`.
+    pub const RADIO_TEMPERATURE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[54]);
+    /// `radio.LatitudeLongitude`.
+    pub const RADIO_LATITUDE_LONGITUDE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[55]);
+    /// `radio.GridSquareFormat`.
+    pub const RADIO_GRID_SQUARE_FORMAT: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[56]);
+    /// `radio.UsbFunction`.
+    pub const RADIO_USB_FUNCTION: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[57]);
+    /// `radio.UsbAudioInOut`.
+    pub const RADIO_USB_AUDIO_IN_OUT: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[58]);
+    /// `radio.PcOutputInterfaceGps`.
+    pub const RADIO_PC_OUTPUT_INTERFACE_GPS: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[59]);
+    /// `radio.PcOutputInterfaceAprs`.
+    pub const RADIO_PC_OUTPUT_INTERFACE_APRS: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[60]);
+    /// `radio.KissModeInterface`.
+    pub const RADIO_KISS_MODE_INTERFACE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[61]);
+    /// `radio.DigitalModeInterface`.
+    pub const RADIO_DIGITAL_MODE_INTERFACE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[62]);
+    /// `radio.DvGatewayInterface`.
+    pub const RADIO_DV_GATEWAY_INTERFACE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[63]);
+    /// `radio.ExternalDataBand`.
+    pub const RADIO_EXTERNAL_DATA_BAND: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[64]);
+    /// `radio.ExternalDataSpeed`.
+    pub const RADIO_EXTERNAL_DATA_SPEED: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[65]);
+    /// `radio.Pr1PinOutputLevel`.
+    pub const RADIO_PR_1_PIN_OUTPUT_LEVEL: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[66]);
+    /// `radio.PkdPinInputSensitivity`.
+    pub const RADIO_PKD_PIN_INPUT_SENSITIVITY: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[67]);
+    /// `radio.SqcOutputSource`.
+    pub const RADIO_SQC_OUTPUT_SOURCE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[68]);
+    /// `radio.SqcOutputLogic`.
+    pub const RADIO_SQC_OUTPUT_LOGIC: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[69]);
+    /// `radio.AutoPowerOff`.
+    pub const RADIO_AUTO_POWER_OFF: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[70]);
+    /// `radio.BeatShift`.
+    pub const RADIO_BEAT_SHIFT: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[71]);
+    /// `radio.SmeterSquelchAband`.
+    pub const RADIO_SMETER_SQUELCH_ABAND: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[72]);
+    /// `radio.SmeterSquelchBband`.
+    pub const RADIO_SMETER_SQUELCH_BBAND: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[73]);
+    /// `radio.SmeterSquelchHangupTime`.
+    pub const RADIO_SMETER_SQUELCH_HANGUP_TIME: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[74]);
+    /// `radio.MuteHangupTime`.
+    pub const RADIO_MUTE_HANGUP_TIME: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[75]);
+    /// `radio.WxAlert`.
+    pub const RADIO_WX_ALERT: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[76]);
+    /// `radio.MonitorType`.
+    pub const RADIO_MONITOR_TYPE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[77]);
+    /// `radio.TxInhibit`.
+    pub const RADIO_TX_INHIBIT: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[78]);
+    /// `radio.TimeOutTimer`.
+    pub const RADIO_TIME_OUT_TIMER: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[79]);
+    /// `radio.MicSensitivity`.
+    pub const RADIO_MIC_SENSITIVITY: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[80]);
+    /// `radio.TxNotification`.
+    pub const RADIO_TX_NOTIFICATION: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[81]);
+    /// `radio.AmHighCut`.
+    pub const RADIO_AM_HIGH_CUT: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[82]);
+    /// `radio.ScanResumeAnalog`.
+    pub const RADIO_SCAN_RESUME_ANALOG: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[83]);
+    /// `radio.ScanResumeDigital`.
+    pub const RADIO_SCAN_RESUME_DIGITAL: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[84]);
+    /// `radio.TimeRestart`.
+    pub const RADIO_TIME_RESTART: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[85]);
+    /// `radio.CarrierRestart`.
+    pub const RADIO_CARRIER_RESTART: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[86]);
+    /// `radio.PriorityScan`.
+    pub const RADIO_PRIORITY_SCAN: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[87]);
+    /// `radio.ScanAutoBacklight`.
+    pub const RADIO_SCAN_AUTO_BACKLIGHT: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[88]);
+    /// `radio.VisualScan`.
+    pub const RADIO_VISUAL_SCAN: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[89]);
+    /// `radio.AutoWeatherScan`.
+    pub const RADIO_AUTO_WEATHER_SCAN: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[90]);
+    /// `radio.AutoOffset`.
+    pub const RADIO_AUTO_OFFSET: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[91]);
+    /// `radio.TxHold1750Hz`.
+    pub const RADIO_TX_HOLD_1750_HZ: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[92]);
+    /// `radio.Vox`.
+    pub const RADIO_VOX: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[93]);
+    /// `radio.VoxGain`.
+    pub const RADIO_VOX_GAIN: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[94]);
+    /// `radio.VoxDelay`.
+    pub const RADIO_VOX_DELAY: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[95]);
+    /// `radio.VoxTxOnBusy`.
+    pub const RADIO_VOX_TX_ON_BUSY: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[96]);
+    /// `radio.DtmfSpeed`.
+    pub const RADIO_DTMF_SPEED: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[97]);
+    /// `radio.DtmfPauseTime`.
+    pub const RADIO_DTMF_PAUSE_TIME: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[98]);
+    /// `radio.DtmfTxHold`.
+    pub const RADIO_DTMF_TX_HOLD: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[99]);
+    /// `radio.QsoLog`.
+    pub const RADIO_QSO_LOG: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[100]);
+    /// `radio.RecallMethod`.
+    pub const RADIO_RECALL_METHOD: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[101]);
+    /// `radio.GroupLink0`.
+    pub const RADIO_GROUP_LINK_0: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[102]);
+    /// `radio.GroupLink1`.
+    pub const RADIO_GROUP_LINK_1: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[103]);
+    /// `radio.GroupLink2`.
+    pub const RADIO_GROUP_LINK_2: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[104]);
+    /// `radio.GroupLink3`.
+    pub const RADIO_GROUP_LINK_3: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[105]);
+    /// `radio.GroupLink4`.
+    pub const RADIO_GROUP_LINK_4: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[106]);
+    /// `radio.GroupLink5`.
+    pub const RADIO_GROUP_LINK_5: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[107]);
+    /// `radio.GroupLink6`.
+    pub const RADIO_GROUP_LINK_6: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[108]);
+    /// `radio.GroupLink7`.
+    pub const RADIO_GROUP_LINK_7: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[109]);
+    /// `radio.GroupLink8`.
+    pub const RADIO_GROUP_LINK_8: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[110]);
+    /// `radio.GroupLink9`.
+    pub const RADIO_GROUP_LINK_9: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[111]);
+    /// `radio.GroupLink10`.
+    pub const RADIO_GROUP_LINK_10: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[112]);
+    /// `radio.GroupLink11`.
+    pub const RADIO_GROUP_LINK_11: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[113]);
+    /// `radio.GroupLink12`.
+    pub const RADIO_GROUP_LINK_12: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[114]);
+    /// `radio.GroupLink13`.
+    pub const RADIO_GROUP_LINK_13: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[115]);
+    /// `radio.GroupLink14`.
+    pub const RADIO_GROUP_LINK_14: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[116]);
+    /// `radio.GroupLink15`.
+    pub const RADIO_GROUP_LINK_15: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[117]);
+    /// `radio.GroupLink16`.
+    pub const RADIO_GROUP_LINK_16: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[118]);
+    /// `radio.GroupLink17`.
+    pub const RADIO_GROUP_LINK_17: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[119]);
+    /// `radio.GroupLink18`.
+    pub const RADIO_GROUP_LINK_18: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[120]);
+    /// `radio.GroupLink19`.
+    pub const RADIO_GROUP_LINK_19: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[121]);
+    /// `radio.GroupLink20`.
+    pub const RADIO_GROUP_LINK_20: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[122]);
+    /// `radio.GroupLink21`.
+    pub const RADIO_GROUP_LINK_21: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[123]);
+    /// `radio.GroupLink22`.
+    pub const RADIO_GROUP_LINK_22: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[124]);
+    /// `radio.GroupLink23`.
+    pub const RADIO_GROUP_LINK_23: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[125]);
+    /// `radio.GroupLink24`.
+    pub const RADIO_GROUP_LINK_24: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[126]);
+    /// `radio.GroupLink25`.
+    pub const RADIO_GROUP_LINK_25: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[127]);
+    /// `radio.GroupLink26`.
+    pub const RADIO_GROUP_LINK_26: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[128]);
+    /// `radio.GroupLink27`.
+    pub const RADIO_GROUP_LINK_27: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[129]);
+    /// `radio.GroupLink28`.
+    pub const RADIO_GROUP_LINK_28: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[130]);
+    /// `radio.GroupLink29`.
+    pub const RADIO_GROUP_LINK_29: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[131]);
+    /// `radio.RecordingBand`.
+    pub const RADIO_RECORDING_BAND: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[132]);
+    /// `radio.RecordingFileStorage`.
+    pub const RADIO_RECORDING_FILE_STORAGE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[133]);
+    /// `radio.TxMonitor`.
+    pub const RADIO_TX_MONITOR: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[134]);
+    /// `radio.DigitalAutoReply`.
+    pub const RADIO_DIGITAL_AUTO_REPLY: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[135]);
+    /// `radio.LcdBrightness`.
+    pub const RADIO_LCD_BRIGHTNESS: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[136]);
+    /// `radio.AutoBrightness`.
+    pub const RADIO_AUTO_BRIGHTNESS: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[137]);
+    /// `gps.MyPositionSelect`.
+    pub const GPS_MY_POSITION_SELECT: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[138]);
+    /// `gps.PositionAmbiguity`.
+    pub const GPS_POSITION_AMBIGUITY: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[139]);
+    /// `gps.PcOutput`.
+    pub const GPS_PC_OUTPUT: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[140]);
+    /// `gps.SatInfoOutput`.
+    pub const GPS_SAT_INFO_OUTPUT: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[141]);
+    /// `gps.Sentence_Gpgga`.
+    pub const GPS_SENTENCE_GPGGA: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[142]);
+    /// `gps.Sentence_Gpgll`.
+    pub const GPS_SENTENCE_GPGLL: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[143]);
+    /// `gps.Sentence_Gprmc`.
+    pub const GPS_SENTENCE_GPRMC: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[144]);
+    /// `gps.Sentence_Gpvtg`.
+    pub const GPS_SENTENCE_GPVTG: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[145]);
+    /// `gps.Sentence_Gpgsa`.
+    pub const GPS_SENTENCE_GPGSA: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[146]);
+    /// `gps.Sentence_Gpgsv`.
+    pub const GPS_SENTENCE_GPGSV: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[147]);
+    /// `gps.Sbas`.
+    pub const GPS_SBAS: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[148]);
+    /// `gps.TrackLog`.
+    pub const GPS_TRACK_LOG: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[149]);
+    /// `gps.RecodeMethod`.
+    pub const GPS_RECODE_METHOD: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[150]);
+    /// `gps.Interval`.
+    pub const GPS_INTERVAL: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[151]);
+    /// `gps.Distance`.
+    pub const GPS_DISTANCE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[152]);
+    /// `gps.GpsPortBaudRate`.
+    pub const GPS_GPS_PORT_BAUD_RATE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[153]);
+    /// `gps.GpsPortInput`.
+    pub const GPS_GPS_PORT_INPUT: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[154]);
+    /// `gps.GpsPortOutput`.
+    pub const GPS_GPS_PORT_OUTPUT: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[155]);
+    /// `gps.BuiltInGps`.
+    pub const GPS_BUILT_IN_GPS: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[156]);
+    /// `gps.MyPositionList[0].Altitude`.
+    pub const GPS_MY_POSITION_LIST_0_ALTITUDE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[157]);
+    /// `gps.MyPositionList[0].NorthSouth`.
+    pub const GPS_MY_POSITION_LIST_0_NORTH_SOUTH: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[158]);
+    /// `gps.MyPositionList[0].LatitudeDegree`.
+    pub const GPS_MY_POSITION_LIST_0_LATITUDE_DEGREE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[159]);
+    /// `gps.MyPositionList[0].LatitudeMinute`.
+    pub const GPS_MY_POSITION_LIST_0_LATITUDE_MINUTE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[160]);
+    /// `gps.MyPositionList[0].LatitudeSecondEncoded`.
+    pub const GPS_MY_POSITION_LIST_0_LATITUDE_SECOND_ENCODED: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[161]);
+    /// `gps.MyPositionList[0].EastWest`.
+    pub const GPS_MY_POSITION_LIST_0_EAST_WEST: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[162]);
+    /// `gps.MyPositionList[0].LongitudeDegree`.
+    pub const GPS_MY_POSITION_LIST_0_LONGITUDE_DEGREE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[163]);
+    /// `gps.MyPositionList[0].LongitudeMinute`.
+    pub const GPS_MY_POSITION_LIST_0_LONGITUDE_MINUTE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[164]);
+    /// `gps.MyPositionList[0].LongitudeSecondEncoded`.
+    pub const GPS_MY_POSITION_LIST_0_LONGITUDE_SECOND_ENCODED: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[165]);
+    /// `gps.MyPositionList[0].Name`.
+    pub const GPS_MY_POSITION_LIST_0_NAME: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[166]);
+    /// `gps.MyPositionList[1].Altitude`.
+    pub const GPS_MY_POSITION_LIST_1_ALTITUDE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[167]);
+    /// `gps.MyPositionList[1].NorthSouth`.
+    pub const GPS_MY_POSITION_LIST_1_NORTH_SOUTH: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[168]);
+    /// `gps.MyPositionList[1].LatitudeDegree`.
+    pub const GPS_MY_POSITION_LIST_1_LATITUDE_DEGREE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[169]);
+    /// `gps.MyPositionList[1].LatitudeMinute`.
+    pub const GPS_MY_POSITION_LIST_1_LATITUDE_MINUTE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[170]);
+    /// `gps.MyPositionList[1].LatitudeSecondEncoded`.
+    pub const GPS_MY_POSITION_LIST_1_LATITUDE_SECOND_ENCODED: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[171]);
+    /// `gps.MyPositionList[1].EastWest`.
+    pub const GPS_MY_POSITION_LIST_1_EAST_WEST: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[172]);
+    /// `gps.MyPositionList[1].LongitudeDegree`.
+    pub const GPS_MY_POSITION_LIST_1_LONGITUDE_DEGREE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[173]);
+    /// `gps.MyPositionList[1].LongitudeMinute`.
+    pub const GPS_MY_POSITION_LIST_1_LONGITUDE_MINUTE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[174]);
+    /// `gps.MyPositionList[1].LongitudeSecondEncoded`.
+    pub const GPS_MY_POSITION_LIST_1_LONGITUDE_SECOND_ENCODED: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[175]);
+    /// `gps.MyPositionList[1].Name`.
+    pub const GPS_MY_POSITION_LIST_1_NAME: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[176]);
+    /// `gps.MyPositionList[2].Altitude`.
+    pub const GPS_MY_POSITION_LIST_2_ALTITUDE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[177]);
+    /// `gps.MyPositionList[2].NorthSouth`.
+    pub const GPS_MY_POSITION_LIST_2_NORTH_SOUTH: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[178]);
+    /// `gps.MyPositionList[2].LatitudeDegree`.
+    pub const GPS_MY_POSITION_LIST_2_LATITUDE_DEGREE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[179]);
+    /// `gps.MyPositionList[2].LatitudeMinute`.
+    pub const GPS_MY_POSITION_LIST_2_LATITUDE_MINUTE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[180]);
+    /// `gps.MyPositionList[2].LatitudeSecondEncoded`.
+    pub const GPS_MY_POSITION_LIST_2_LATITUDE_SECOND_ENCODED: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[181]);
+    /// `gps.MyPositionList[2].EastWest`.
+    pub const GPS_MY_POSITION_LIST_2_EAST_WEST: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[182]);
+    /// `gps.MyPositionList[2].LongitudeDegree`.
+    pub const GPS_MY_POSITION_LIST_2_LONGITUDE_DEGREE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[183]);
+    /// `gps.MyPositionList[2].LongitudeMinute`.
+    pub const GPS_MY_POSITION_LIST_2_LONGITUDE_MINUTE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[184]);
+    /// `gps.MyPositionList[2].LongitudeSecondEncoded`.
+    pub const GPS_MY_POSITION_LIST_2_LONGITUDE_SECOND_ENCODED: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[185]);
+    /// `gps.MyPositionList[2].Name`.
+    pub const GPS_MY_POSITION_LIST_2_NAME: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[186]);
+    /// `gps.MyPositionList[3].Altitude`.
+    pub const GPS_MY_POSITION_LIST_3_ALTITUDE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[187]);
+    /// `gps.MyPositionList[3].NorthSouth`.
+    pub const GPS_MY_POSITION_LIST_3_NORTH_SOUTH: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[188]);
+    /// `gps.MyPositionList[3].LatitudeDegree`.
+    pub const GPS_MY_POSITION_LIST_3_LATITUDE_DEGREE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[189]);
+    /// `gps.MyPositionList[3].LatitudeMinute`.
+    pub const GPS_MY_POSITION_LIST_3_LATITUDE_MINUTE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[190]);
+    /// `gps.MyPositionList[3].LatitudeSecondEncoded`.
+    pub const GPS_MY_POSITION_LIST_3_LATITUDE_SECOND_ENCODED: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[191]);
+    /// `gps.MyPositionList[3].EastWest`.
+    pub const GPS_MY_POSITION_LIST_3_EAST_WEST: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[192]);
+    /// `gps.MyPositionList[3].LongitudeDegree`.
+    pub const GPS_MY_POSITION_LIST_3_LONGITUDE_DEGREE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[193]);
+    /// `gps.MyPositionList[3].LongitudeMinute`.
+    pub const GPS_MY_POSITION_LIST_3_LONGITUDE_MINUTE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[194]);
+    /// `gps.MyPositionList[3].LongitudeSecondEncoded`.
+    pub const GPS_MY_POSITION_LIST_3_LONGITUDE_SECOND_ENCODED: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[195]);
+    /// `gps.MyPositionList[3].Name`.
+    pub const GPS_MY_POSITION_LIST_3_NAME: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[196]);
+    /// `gps.MyPositionList[4].Altitude`.
+    pub const GPS_MY_POSITION_LIST_4_ALTITUDE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[197]);
+    /// `gps.MyPositionList[4].NorthSouth`.
+    pub const GPS_MY_POSITION_LIST_4_NORTH_SOUTH: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[198]);
+    /// `gps.MyPositionList[4].LatitudeDegree`.
+    pub const GPS_MY_POSITION_LIST_4_LATITUDE_DEGREE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[199]);
+    /// `gps.MyPositionList[4].LatitudeMinute`.
+    pub const GPS_MY_POSITION_LIST_4_LATITUDE_MINUTE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[200]);
+    /// `gps.MyPositionList[4].LatitudeSecondEncoded`.
+    pub const GPS_MY_POSITION_LIST_4_LATITUDE_SECOND_ENCODED: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[201]);
+    /// `gps.MyPositionList[4].EastWest`.
+    pub const GPS_MY_POSITION_LIST_4_EAST_WEST: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[202]);
+    /// `gps.MyPositionList[4].LongitudeDegree`.
+    pub const GPS_MY_POSITION_LIST_4_LONGITUDE_DEGREE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[203]);
+    /// `gps.MyPositionList[4].LongitudeMinute`.
+    pub const GPS_MY_POSITION_LIST_4_LONGITUDE_MINUTE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[204]);
+    /// `gps.MyPositionList[4].LongitudeSecondEncoded`.
+    pub const GPS_MY_POSITION_LIST_4_LONGITUDE_SECOND_ENCODED: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[205]);
+    /// `gps.MyPositionList[4].Name`.
+    pub const GPS_MY_POSITION_LIST_4_NAME: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[206]);
+    /// `aprs.WeatherTx`.
+    pub const APRS_WEATHER_TX: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[207]);
+    /// `aprs.WeatherTxInterval`.
+    pub const APRS_WEATHER_TX_INTERVAL: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[208]);
+    /// `aprs.QsyInStatus`.
+    pub const APRS_QSY_IN_STATUS: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[209]);
+    /// `aprs.QsyToneNarrow`.
+    pub const APRS_QSY_TONE_NARROW: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[210]);
+    /// `aprs.QsyShiftOffset`.
+    pub const APRS_QSY_SHIFT_OFFSET: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[211]);
+    /// `aprs.QsyLimit`.
+    pub const APRS_QSY_LIMIT: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[212]);
+    /// `aprs.LowSpeedSpeed`.
+    pub const APRS_LOW_SPEED_SPEED: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[213]);
+    /// `aprs.HiSpeedSpeed`.
+    pub const APRS_HI_SPEED_SPEED: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[214]);
+    /// `aprs.SlowRateTime`.
+    pub const APRS_SLOW_RATE_TIME: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[215]);
+    /// `aprs.FastRateTime`.
+    pub const APRS_FAST_RATE_TIME: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[216]);
+    /// `aprs.TurnAngleDeg`.
+    pub const APRS_TURN_ANGLE_DEG: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[217]);
+    /// `aprs.TurnSlopeDegSpeed`.
+    pub const APRS_TURN_SLOPE_DEG_SPEED: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[218]);
+    /// `aprs.TurnTimeTime`.
+    pub const APRS_TURN_TIME_TIME: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[219]);
+    /// `aprs.WaypointFormat`.
+    pub const APRS_WAYPOINT_FORMAT: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[220]);
+    /// `aprs.WaypointLength`.
+    pub const APRS_WAYPOINT_LENGTH: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[221]);
+    /// `aprs.WaypointOutput`.
+    pub const APRS_WAYPOINT_OUTPUT: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[222]);
+    /// `aprs.FilterPositionLimit`.
+    pub const APRS_FILTER_POSITION_LIMIT: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[223]);
+    /// `aprs.FilterType_Weather`.
+    pub const APRS_FILTER_TYPE_WEATHER: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[224]);
+    /// `aprs.FilterType_Digipeater`.
+    pub const APRS_FILTER_TYPE_DIGIPEATER: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[225]);
+    /// `aprs.FilterType_Mobile`.
+    pub const APRS_FILTER_TYPE_MOBILE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[226]);
+    /// `aprs.FilterType_Object`.
+    pub const APRS_FILTER_TYPE_OBJECT: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[227]);
+    /// `aprs.FilterType_Navitra`.
+    pub const APRS_FILTER_TYPE_NAVITRA: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[228]);
+    /// `aprs.FilterType_1Way`.
+    pub const APRS_FILTER_TYPE_1_WAY: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[229]);
+    /// `aprs.FilterType_Others`.
+    pub const APRS_FILTER_TYPE_OTHERS: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[230]);
+    /// `aprs.PacketPathType`.
+    pub const APRS_PACKET_PATH_TYPE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[231]);
+    /// `aprs.PacketPathNewNWide11`.
+    pub const APRS_PACKET_PATH_NEW_NWIDE_11: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[232]);
+    /// `aprs.PacketPathNewNHops`.
+    pub const APRS_PACKET_PATH_NEW_NHOPS: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[233]);
+    /// `aprs.PacketPathRelayRelay`.
+    pub const APRS_PACKET_PATH_RELAY_RELAY: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[234]);
+    /// `aprs.PacketPathRelayHops`.
+    pub const APRS_PACKET_PATH_RELAY_HOPS: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[235]);
+    /// `aprs.PacketPathAbbr`.
+    pub const APRS_PACKET_PATH_ABBR: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[236]);
+    /// `aprs.PacketPathRegionHops`.
+    pub const APRS_PACKET_PATH_REGION_HOPS: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[237]);
+    /// `aprs.PacketPathOthers`.
+    pub const APRS_PACKET_PATH_OTHERS: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[238]);
+    /// `aprs.PacketPathOthers2`.
+    pub const APRS_PACKET_PATH_OTHERS_2: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[239]);
+    /// `aprs.PacketPathOthers3`.
+    pub const APRS_PACKET_PATH_OTHERS_3: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[240]);
+    /// `aprs.TncDataSpeed`.
+    pub const APRS_TNC_DATA_SPEED: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[241]);
+    /// `aprs.TncDataBand`.
+    pub const APRS_TNC_DATA_BAND: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[242]);
+    /// `aprs.AutoChSetting`.
+    pub const APRS_AUTO_CH_SETTING: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[243]);
+    /// `aprs.TncDcdSense`.
+    pub const APRS_TNC_DCD_SENSE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[244]);
+    /// `aprs.TncTxDelay`.
+    pub const APRS_TNC_TX_DELAY: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[245]);
+    /// `aprs.Frequency`.
+    pub const APRS_FREQUENCY: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[246]);
+    /// `aprs.Ptt`.
+    pub const APRS_PTT: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[247]);
+    /// `aprs.AprsKey`.
+    pub const APRS_APRS_KEY: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[248]);
+    /// `aprs.BeaconTxMethod`.
+    pub const APRS_BEACON_TX_METHOD: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[249]);
+    /// `aprs.BeaconTxInterval`.
+    pub const APRS_BEACON_TX_INTERVAL: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[250]);
+    /// `aprs.BeaconTxDecay`.
+    pub const APRS_BEACON_TX_DECAY: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[251]);
+    /// `aprs.BeaconTxProportion`.
+    pub const APRS_BEACON_TX_PROPORTION: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[252]);
+    /// `aprs.BeaconSpeedOff`.
+    pub const APRS_BEACON_SPEED_OFF: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[253]);
+    /// `aprs.BeaconAltitudeOff`.
+    pub const APRS_BEACON_ALTITUDE_OFF: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[254]);
+    /// `aprs.ObjectUsedNo`.
+    pub const APRS_OBJECT_USED_NO: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[255]);
+    /// `aprs.AutoReplyOnOff`.
+    pub const APRS_AUTO_REPLY_ON_OFF: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[256]);
+    /// `aprs.AutoReplyDelayTime`.
+    pub const APRS_AUTO_REPLY_DELAY_TIME: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[257]);
+    /// `aprs.AutoReplyMessage`.
+    pub const APRS_AUTO_REPLY_MESSAGE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[258]);
+    /// `aprs.AutoReplyTargetCall`.
+    pub const APRS_AUTO_REPLY_TARGET_CALL: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[259]);
+    /// `aprs.RxBeepType`.
+    pub const APRS_RX_BEEP_TYPE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[260]);
+    /// `aprs.TxBeepOnOff`.
+    pub const APRS_TX_BEEP_ON_OFF: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[261]);
+    /// `aprs.SpecialCall`.
+    pub const APRS_SPECIAL_CALL: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[262]);
+    /// `aprs.InterruptDisplayArea`.
+    pub const APRS_INTERRUPT_DISPLAY_AREA: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[263]);
+    /// `aprs.InterruptDisplayTime`.
+    pub const APRS_INTERRUPT_DISPLAY_TIME: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[264]);
+    /// `aprs.AprsVoice`.
+    pub const APRS_APRS_VOICE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[265]);
+    /// `aprs.DigipeatMyCallsign`.
+    pub const APRS_DIGIPEAT_MY_CALLSIGN: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[266]);
+    /// `aprs.UIcheck`.
+    pub const APRS_UICHECK: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[267]);
+    /// `aprs.UIdigipeat`.
+    pub const APRS_UIDIGIPEAT: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[268]);
+    /// `aprs.UIdigiAliases`.
+    pub const APRS_UIDIGI_ALIASES: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[269]);
+    /// `aprs.UItrace`.
+    pub const APRS_UITRACE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[270]);
+    /// `aprs.UItraceAliases`.
+    pub const APRS_UITRACE_ALIASES: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[271]);
+    /// `aprs.UIflood`.
+    pub const APRS_UIFLOOD: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[272]);
+    /// `aprs.UIfloodAliases`.
+    pub const APRS_UIFLOOD_ALIASES: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[273]);
+    /// `aprs.UIfloodSubstitution`.
+    pub const APRS_UIFLOOD_SUBSTITUTION: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[274]);
+    /// `aprs.PcOutput`.
+    pub const APRS_PC_OUTPUT: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[275]);
+    /// `aprs.NetworkType`.
+    pub const APRS_NETWORK_TYPE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[276]);
+    /// `aprs.AltnetAddress`.
+    pub const APRS_ALTNET_ADDRESS: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[277]);
+    /// `aprs.VoiceAlertOnOff`.
+    pub const APRS_VOICE_ALERT_ON_OFF: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[278]);
+    /// `aprs.VoiceAlertToneNo`.
+    pub const APRS_VOICE_ALERT_TONE_NO: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[279]);
+    /// `aprs.MessageGroup`.
+    pub const APRS_MESSAGE_GROUP: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[280]);
+    /// `aprs.BulletinGroup`.
+    pub const APRS_BULLETIN_GROUP: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[281]);
+    /// `aprs.MyCallsign`.
+    pub const APRS_MY_CALLSIGN: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[282]);
+    /// `aprs.IconTableOverlay`.
+    pub const APRS_ICON_TABLE_OVERLAY: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[283]);
+    /// `aprs.IconSymbol`.
+    pub const APRS_ICON_SYMBOL: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[284]);
+    /// `aprs.PositionComment`.
+    pub const APRS_POSITION_COMMENT: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[285]);
+    /// `aprs.StatusTextSelect`.
+    pub const APRS_STATUS_TEXT_SELECT: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[286]);
+    /// `aprs.StatusTextList[0].StatusText`.
+    pub const APRS_STATUS_TEXT_LIST_0_STATUS_TEXT: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[287]);
+    /// `aprs.StatusTextList[0].TxRate`.
+    pub const APRS_STATUS_TEXT_LIST_0_TX_RATE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[288]);
+    /// `aprs.StatusTextList[1].StatusText`.
+    pub const APRS_STATUS_TEXT_LIST_1_STATUS_TEXT: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[289]);
+    /// `aprs.StatusTextList[1].TxRate`.
+    pub const APRS_STATUS_TEXT_LIST_1_TX_RATE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[290]);
+    /// `aprs.StatusTextList[2].StatusText`.
+    pub const APRS_STATUS_TEXT_LIST_2_STATUS_TEXT: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[291]);
+    /// `aprs.StatusTextList[2].TxRate`.
+    pub const APRS_STATUS_TEXT_LIST_2_TX_RATE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[292]);
+    /// `aprs.StatusTextList[3].StatusText`.
+    pub const APRS_STATUS_TEXT_LIST_3_STATUS_TEXT: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[293]);
+    /// `aprs.StatusTextList[3].TxRate`.
+    pub const APRS_STATUS_TEXT_LIST_3_TX_RATE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[294]);
+    /// `aprs.StatusTextList[4].StatusText`.
+    pub const APRS_STATUS_TEXT_LIST_4_STATUS_TEXT: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[295]);
+    /// `aprs.StatusTextList[4].TxRate`.
+    pub const APRS_STATUS_TEXT_LIST_4_TX_RATE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[296]);
+    /// `aprs.ObjectList[0].NorthSouth`.
+    pub const APRS_OBJECT_LIST_0_NORTH_SOUTH: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[297]);
+    /// `aprs.ObjectList[0].LatitudeDegree`.
+    pub const APRS_OBJECT_LIST_0_LATITUDE_DEGREE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[298]);
+    /// `aprs.ObjectList[0].LatitudeMinute`.
+    pub const APRS_OBJECT_LIST_0_LATITUDE_MINUTE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[299]);
+    /// `aprs.ObjectList[0].LatitudeSecondEncoded`.
+    pub const APRS_OBJECT_LIST_0_LATITUDE_SECOND_ENCODED: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[300]);
+    /// `aprs.ObjectList[0].EastWest`.
+    pub const APRS_OBJECT_LIST_0_EAST_WEST: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[301]);
+    /// `aprs.ObjectList[0].LongitudeDegree`.
+    pub const APRS_OBJECT_LIST_0_LONGITUDE_DEGREE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[302]);
+    /// `aprs.ObjectList[0].LongitudeMinute`.
+    pub const APRS_OBJECT_LIST_0_LONGITUDE_MINUTE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[303]);
+    /// `aprs.ObjectList[0].LongitudeSecondEncoded`.
+    pub const APRS_OBJECT_LIST_0_LONGITUDE_SECOND_ENCODED: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[304]);
+    /// `aprs.ObjectList[0].Name`.
+    pub const APRS_OBJECT_LIST_0_NAME: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[305]);
+    /// `aprs.ObjectList[0].ObjectTxFormat`.
+    pub const APRS_OBJECT_LIST_0_OBJECT_TX_FORMAT: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[306]);
+    /// `aprs.ObjectList[0].ObjectTxInterval`.
+    pub const APRS_OBJECT_LIST_0_OBJECT_TX_INTERVAL: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[307]);
+    /// `aprs.ObjectList[0].ObjectTable`.
+    pub const APRS_OBJECT_LIST_0_OBJECT_TABLE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[308]);
+    /// `aprs.ObjectList[0].ObjectSymbol`.
+    pub const APRS_OBJECT_LIST_0_OBJECT_SYMBOL: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[309]);
+    /// `aprs.ObjectList[0].ObjectComment`.
+    pub const APRS_OBJECT_LIST_0_OBJECT_COMMENT: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[310]);
+    /// `aprs.ObjectList[1].NorthSouth`.
+    pub const APRS_OBJECT_LIST_1_NORTH_SOUTH: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[311]);
+    /// `aprs.ObjectList[1].LatitudeDegree`.
+    pub const APRS_OBJECT_LIST_1_LATITUDE_DEGREE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[312]);
+    /// `aprs.ObjectList[1].LatitudeMinute`.
+    pub const APRS_OBJECT_LIST_1_LATITUDE_MINUTE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[313]);
+    /// `aprs.ObjectList[1].LatitudeSecondEncoded`.
+    pub const APRS_OBJECT_LIST_1_LATITUDE_SECOND_ENCODED: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[314]);
+    /// `aprs.ObjectList[1].EastWest`.
+    pub const APRS_OBJECT_LIST_1_EAST_WEST: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[315]);
+    /// `aprs.ObjectList[1].LongitudeDegree`.
+    pub const APRS_OBJECT_LIST_1_LONGITUDE_DEGREE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[316]);
+    /// `aprs.ObjectList[1].LongitudeMinute`.
+    pub const APRS_OBJECT_LIST_1_LONGITUDE_MINUTE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[317]);
+    /// `aprs.ObjectList[1].LongitudeSecondEncoded`.
+    pub const APRS_OBJECT_LIST_1_LONGITUDE_SECOND_ENCODED: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[318]);
+    /// `aprs.ObjectList[1].Name`.
+    pub const APRS_OBJECT_LIST_1_NAME: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[319]);
+    /// `aprs.ObjectList[1].ObjectTxFormat`.
+    pub const APRS_OBJECT_LIST_1_OBJECT_TX_FORMAT: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[320]);
+    /// `aprs.ObjectList[1].ObjectTxInterval`.
+    pub const APRS_OBJECT_LIST_1_OBJECT_TX_INTERVAL: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[321]);
+    /// `aprs.ObjectList[1].ObjectTable`.
+    pub const APRS_OBJECT_LIST_1_OBJECT_TABLE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[322]);
+    /// `aprs.ObjectList[1].ObjectSymbol`.
+    pub const APRS_OBJECT_LIST_1_OBJECT_SYMBOL: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[323]);
+    /// `aprs.ObjectList[1].ObjectComment`.
+    pub const APRS_OBJECT_LIST_1_OBJECT_COMMENT: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[324]);
+    /// `aprs.ObjectList[2].NorthSouth`.
+    pub const APRS_OBJECT_LIST_2_NORTH_SOUTH: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[325]);
+    /// `aprs.ObjectList[2].LatitudeDegree`.
+    pub const APRS_OBJECT_LIST_2_LATITUDE_DEGREE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[326]);
+    /// `aprs.ObjectList[2].LatitudeMinute`.
+    pub const APRS_OBJECT_LIST_2_LATITUDE_MINUTE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[327]);
+    /// `aprs.ObjectList[2].LatitudeSecondEncoded`.
+    pub const APRS_OBJECT_LIST_2_LATITUDE_SECOND_ENCODED: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[328]);
+    /// `aprs.ObjectList[2].EastWest`.
+    pub const APRS_OBJECT_LIST_2_EAST_WEST: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[329]);
+    /// `aprs.ObjectList[2].LongitudeDegree`.
+    pub const APRS_OBJECT_LIST_2_LONGITUDE_DEGREE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[330]);
+    /// `aprs.ObjectList[2].LongitudeMinute`.
+    pub const APRS_OBJECT_LIST_2_LONGITUDE_MINUTE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[331]);
+    /// `aprs.ObjectList[2].LongitudeSecondEncoded`.
+    pub const APRS_OBJECT_LIST_2_LONGITUDE_SECOND_ENCODED: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[332]);
+    /// `aprs.ObjectList[2].Name`.
+    pub const APRS_OBJECT_LIST_2_NAME: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[333]);
+    /// `aprs.ObjectList[2].ObjectTxFormat`.
+    pub const APRS_OBJECT_LIST_2_OBJECT_TX_FORMAT: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[334]);
+    /// `aprs.ObjectList[2].ObjectTxInterval`.
+    pub const APRS_OBJECT_LIST_2_OBJECT_TX_INTERVAL: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[335]);
+    /// `aprs.ObjectList[2].ObjectTable`.
+    pub const APRS_OBJECT_LIST_2_OBJECT_TABLE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[336]);
+    /// `aprs.ObjectList[2].ObjectSymbol`.
+    pub const APRS_OBJECT_LIST_2_OBJECT_SYMBOL: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[337]);
+    /// `aprs.ObjectList[2].ObjectComment`.
+    pub const APRS_OBJECT_LIST_2_OBJECT_COMMENT: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[338]);
+    /// `aprs.UserPhraseList[0].UserPhrase`.
+    pub const APRS_USER_PHRASE_LIST_0_USER_PHRASE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[339]);
+    /// `aprs.UserPhraseList[1].UserPhrase`.
+    pub const APRS_USER_PHRASE_LIST_1_USER_PHRASE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[340]);
+    /// `aprs.UserPhraseList[2].UserPhrase`.
+    pub const APRS_USER_PHRASE_LIST_2_USER_PHRASE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[341]);
+    /// `aprs.UserPhraseList[3].UserPhrase`.
+    pub const APRS_USER_PHRASE_LIST_3_USER_PHRASE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[342]);
+    /// `aprs.UserPhraseList[4].UserPhrase`.
+    pub const APRS_USER_PHRASE_LIST_4_USER_PHRASE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[343]);
+    /// `aprs.UserPhraseList[5].UserPhrase`.
+    pub const APRS_USER_PHRASE_LIST_5_USER_PHRASE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[344]);
+    /// `aprs.UserPhraseList[6].UserPhrase`.
+    pub const APRS_USER_PHRASE_LIST_6_USER_PHRASE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[345]);
+    /// `aprs.UserPhraseList[7].UserPhrase`.
+    pub const APRS_USER_PHRASE_LIST_7_USER_PHRASE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[346]);
+    /// `aprs.UserPhraseList[8].UserPhrase`.
+    pub const APRS_USER_PHRASE_LIST_8_USER_PHRASE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[347]);
+    /// `aprs.UserPhraseList[9].UserPhrase`.
+    pub const APRS_USER_PHRASE_LIST_9_USER_PHRASE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[348]);
+    /// `aprs.UserPhraseList[10].UserPhrase`.
+    pub const APRS_USER_PHRASE_LIST_10_USER_PHRASE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[349]);
+    /// `aprs.UserPhraseList[11].UserPhrase`.
+    pub const APRS_USER_PHRASE_LIST_11_USER_PHRASE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[350]);
+    /// `aprs.UserPhraseList[12].UserPhrase`.
+    pub const APRS_USER_PHRASE_LIST_12_USER_PHRASE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[351]);
+    /// `aprs.UserPhraseList[13].UserPhrase`.
+    pub const APRS_USER_PHRASE_LIST_13_USER_PHRASE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[352]);
+    /// `aprs.UserPhraseList[14].UserPhrase`.
+    pub const APRS_USER_PHRASE_LIST_14_USER_PHRASE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[353]);
+    /// `aprs.UserPhraseList[15].UserPhrase`.
+    pub const APRS_USER_PHRASE_LIST_15_USER_PHRASE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[354]);
+    /// `aprs.UserPhraseList[16].UserPhrase`.
+    pub const APRS_USER_PHRASE_LIST_16_USER_PHRASE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[355]);
+    /// `aprs.UserPhraseList[17].UserPhrase`.
+    pub const APRS_USER_PHRASE_LIST_17_USER_PHRASE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[356]);
+    /// `aprs.UserPhraseList[18].UserPhrase`.
+    pub const APRS_USER_PHRASE_LIST_18_USER_PHRASE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[357]);
+    /// `aprs.UserPhraseList[19].UserPhrase`.
+    pub const APRS_USER_PHRASE_LIST_19_USER_PHRASE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[358]);
+    /// `dv.DirectReplyTxRx`.
+    pub const DV_DIRECT_REPLY_TX_RX: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[359]);
+    /// `dv.AutoReplyTimingTxRx`.
+    pub const DV_AUTO_REPLY_TIMING_TX_RX: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[360]);
+    /// `dv.DataTxEndTimingTxRx`.
+    pub const DV_DATA_TX_END_TIMING_TX_RX: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[361]);
+    /// `dv.EmrVolumeLevelTxRx`.
+    pub const DV_EMR_VOLUME_LEVEL_TX_RX: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[362]);
+    /// `dv.RxAfcTxRx`.
+    pub const DV_RX_AFC_TX_RX: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[363]);
+    /// `dv.FmAutoDetOnDvTxRx`.
+    pub const DV_FM_AUTO_DET_ON_DV_TX_RX: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[364]);
+    /// `dv.DataFrameOutputTxRx`.
+    pub const DV_DATA_FRAME_OUTPUT_TX_RX: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[365]);
+    /// `dv.AutoReply`.
+    pub const DV_AUTO_REPLY: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[366]);
+    /// `dv.GpsInfoInFrameGpsDataTx`.
+    pub const DV_GPS_INFO_IN_FRAME_GPS_DATA_TX: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[367]);
+    /// `dv.SentenceGpsDataTx_Gpgga`.
+    pub const DV_SENTENCE_GPS_DATA_TX_GPGGA: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[368]);
+    /// `dv.SentenceGpsDataTx_Gpgll`.
+    pub const DV_SENTENCE_GPS_DATA_TX_GPGLL: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[369]);
+    /// `dv.SentenceGpsDataTx_Gprmc`.
+    pub const DV_SENTENCE_GPS_DATA_TX_GPRMC: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[370]);
+    /// `dv.SentenceGpsDataTx_Gpvtg`.
+    pub const DV_SENTENCE_GPS_DATA_TX_GPVTG: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[371]);
+    /// `dv.SentenceGpsDataTx_Gpgsa`.
+    pub const DV_SENTENCE_GPS_DATA_TX_GPGSA: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[372]);
+    /// `dv.SentenceGpsDataTx_Gpgsv`.
+    pub const DV_SENTENCE_GPS_DATA_TX_GPGSV: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[373]);
+    /// `dv.SentenceGpsDataTx_Aprs`.
+    pub const DV_SENTENCE_GPS_DATA_TX_APRS: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[374]);
+    /// `dv.AutoTxGpsDataTx`.
+    pub const DV_AUTO_TX_GPS_DATA_TX: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[375]);
+    /// `dv.DisplayMethodRxNotification`.
+    pub const DV_DISPLAY_METHOD_RX_NOTIFICATION: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[376]);
+    /// `dv.SingleDisplaySizeRxNotification`.
+    pub const DV_SINGLE_DISPLAY_SIZE_RX_NOTIFICATION: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[377]);
+    /// `dv.DualDisplaySizeRxNotification`.
+    pub const DV_DUAL_DISPLAY_SIZE_RX_NOTIFICATION: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[378]);
+    /// `dv.DisplayHoldTimeRxNotification`.
+    pub const DV_DISPLAY_HOLD_TIME_RX_NOTIFICATION: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[379]);
+    /// `dv.CallsignAnnounceRxNotification`.
+    pub const DV_CALLSIGN_ANNOUNCE_RX_NOTIFICATION: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[380]);
+    /// `dv.StandbyBeepRxNotification`.
+    pub const DV_STANDBY_BEEP_RX_NOTIFICATION: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[381]);
+    /// `dv.DvGatewayModeDvGateway`.
+    pub const DV_DV_GATEWAY_MODE_DV_GATEWAY: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[382]);
+    /// `dv.MyCallsignSelectDvGateway`.
+    pub const DV_MY_CALLSIGN_SELECT_DV_GATEWAY: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[383]);
+    /// `dv.GatewayCallsign`.
+    pub const DV_GATEWAY_CALLSIGN: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[384]);
+    /// `dv.GatewayRepeaterServer`.
+    pub const DV_GATEWAY_REPEATER_SERVER: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[385]);
+    /// `dv.GatewayType`.
+    pub const DV_GATEWAY_TYPE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[386]);
+    /// `dv.UdpHolePunch`.
+    pub const DV_UDP_HOLE_PUNCH: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[387]);
+    /// `dv.ReflectorHostsUpdateMethod`.
+    pub const DV_REFLECTOR_HOSTS_UPDATE_METHOD: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[388]);
+    /// `dv.ReflectorHostsSelect`.
+    pub const DV_REFLECTOR_HOSTS_SELECT: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[389]);
+    /// `dv.SelectTerminalMode`.
+    pub const DV_SELECT_TERMINAL_MODE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[390]);
+    /// `dv.RPT1DvGateway`.
+    pub const DV_RPT_1_DV_GATEWAY: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[391]);
+    /// `dv.RPT2DvGateway`.
+    pub const DV_RPT_2_DV_GATEWAY: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[392]);
+    /// `dv.DeviceNameDvGateway`.
+    pub const DV_DEVICE_NAME_DV_GATEWAY: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[393]);
+    /// `dv.RepeaterMonitorTimer`.
+    pub const DV_REPEATER_MONITOR_TIMER: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[394]);
+    /// `dv.RepeaterHosts`.
+    pub const DV_REPEATER_HOSTS: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[395]);
+    /// `dv.AutoUpdateUrlSelect`.
+    pub const DV_AUTO_UPDATE_URL_SELECT: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[396]);
+    /// `dv.MyDvMessageSelect`.
+    pub const DV_MY_DV_MESSAGE_SELECT: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[397]);
+    /// `dv.MyDvMessageList[0].MyDvMessage`.
+    pub const DV_MY_DV_MESSAGE_LIST_0_MY_DV_MESSAGE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[398]);
+    /// `dv.MyDvMessageList[1].MyDvMessage`.
+    pub const DV_MY_DV_MESSAGE_LIST_1_MY_DV_MESSAGE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[399]);
+    /// `dv.MyDvMessageList[2].MyDvMessage`.
+    pub const DV_MY_DV_MESSAGE_LIST_2_MY_DV_MESSAGE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[400]);
+    /// `dv.MyDvMessageList[3].MyDvMessage`.
+    pub const DV_MY_DV_MESSAGE_LIST_3_MY_DV_MESSAGE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[401]);
+    /// `dv.MyDvMessageList[4].MyDvMessage`.
+    pub const DV_MY_DV_MESSAGE_LIST_4_MY_DV_MESSAGE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[402]);
+    /// `dv.MyCallsignDvGatewayList[0].MyCallsignDvGateway`.
+    pub const DV_MY_CALLSIGN_DV_GATEWAY_LIST_0_MY_CALLSIGN_DV_GATEWAY: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[403]);
+    /// `dv.MyCallsignDvGatewayList[0].MemoDvGateway`.
+    pub const DV_MY_CALLSIGN_DV_GATEWAY_LIST_0_MEMO_DV_GATEWAY: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[404]);
+    /// `dv.MyCallsignDvGatewayList[1].MyCallsignDvGateway`.
+    pub const DV_MY_CALLSIGN_DV_GATEWAY_LIST_1_MY_CALLSIGN_DV_GATEWAY: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[405]);
+    /// `dv.MyCallsignDvGatewayList[1].MemoDvGateway`.
+    pub const DV_MY_CALLSIGN_DV_GATEWAY_LIST_1_MEMO_DV_GATEWAY: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[406]);
+    /// `dv.MyCallsignDvGatewayList[2].MyCallsignDvGateway`.
+    pub const DV_MY_CALLSIGN_DV_GATEWAY_LIST_2_MY_CALLSIGN_DV_GATEWAY: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[407]);
+    /// `dv.MyCallsignDvGatewayList[2].MemoDvGateway`.
+    pub const DV_MY_CALLSIGN_DV_GATEWAY_LIST_2_MEMO_DV_GATEWAY: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[408]);
+    /// `dv.MyCallsignDvGatewayList[3].MyCallsignDvGateway`.
+    pub const DV_MY_CALLSIGN_DV_GATEWAY_LIST_3_MY_CALLSIGN_DV_GATEWAY: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[409]);
+    /// `dv.MyCallsignDvGatewayList[3].MemoDvGateway`.
+    pub const DV_MY_CALLSIGN_DV_GATEWAY_LIST_3_MEMO_DV_GATEWAY: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[410]);
+    /// `dv.MyCallsignDvGatewayList[4].MyCallsignDvGateway`.
+    pub const DV_MY_CALLSIGN_DV_GATEWAY_LIST_4_MY_CALLSIGN_DV_GATEWAY: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[411]);
+    /// `dv.MyCallsignDvGatewayList[4].MemoDvGateway`.
+    pub const DV_MY_CALLSIGN_DV_GATEWAY_LIST_4_MEMO_DV_GATEWAY: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[412]);
+    /// `dv.MyCallsignDvGatewayList[5].MyCallsignDvGateway`.
+    pub const DV_MY_CALLSIGN_DV_GATEWAY_LIST_5_MY_CALLSIGN_DV_GATEWAY: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[413]);
+    /// `dv.MyCallsignDvGatewayList[5].MemoDvGateway`.
+    pub const DV_MY_CALLSIGN_DV_GATEWAY_LIST_5_MEMO_DV_GATEWAY: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[414]);
+    /// `dv.ReflectorHostsUrlList[0].Url`.
+    pub const DV_REFLECTOR_HOSTS_URL_LIST_0_URL: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[415]);
+    /// `dv.AutoUpdateUrlList[0].Url`.
+    pub const DV_AUTO_UPDATE_URL_LIST_0_URL: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[416]);
+    /// `ipnet.Dhcp`.
+    pub const IPNET_DHCP: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[417]);
+    /// `ipnet.IpAddress`.
+    pub const IPNET_IP_ADDRESS: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[418]);
+    /// `ipnet.SubnetMask`.
+    pub const IPNET_SUBNET_MASK: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[419]);
+    /// `ipnet.DefaultGateway`.
+    pub const IPNET_DEFAULT_GATEWAY: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[420]);
+    /// `ipnet.PrimaryDnsServer`.
+    pub const IPNET_PRIMARY_DNS_SERVER: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[421]);
+    /// `ipnet.SecondaryDnsServer`.
+    pub const IPNET_SECONDARY_DNS_SERVER: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[422]);
+    /// `ipnet.WirelessLan`.
+    pub const IPNET_WIRELESS_LAN: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[423]);
+    /// `pm.PmSelect`.
+    pub const PM_PM_SELECT: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[424]);
+    /// `pm.PmName1`.
+    pub const PM_PM_NAME_1: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[425]);
+    /// `pm.PmName2`.
+    pub const PM_PM_NAME_2: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[426]);
+    /// `pm.PmName3`.
+    pub const PM_PM_NAME_3: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[427]);
+    /// `pm.PmName4`.
+    pub const PM_PM_NAME_4: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[428]);
+    /// `pm.PmName5`.
+    pub const PM_PM_NAME_5: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[429]);
+    /// `pm.PmAutoStore`.
+    pub const PM_PM_AUTO_STORE: Self = Self(&MCP_D750_MENU_FIELD_ENTRIES[430]);
+
+    /// Every field, in registry order.
+    pub const ALL: [Self; 431] = [
+        Self::RADIO_REPEATER_MODE,
+        Self::RADIO_REPEATER_TX_HOLD,
+        Self::RADIO_REPEATER_ID,
+        Self::RADIO_REPEATER_ID_TX,
+        Self::RADIO_REPEATER_ID_VOICE,
+        Self::RADIO_REMOTE_CONTOROL_CODE,
+        Self::RADIO_LANGUAGE,
+        Self::RADIO_POWERON_BITMAP,
+        Self::RADIO_POWER_ON_MESSAGE,
+        Self::RADIO_SINGLE_BAND_DISPLAY,
+        Self::RADIO_METER_TYPE,
+        Self::RADIO_BACKGROUND_COLOR,
+        Self::RADIO_INFO_BACKLIGHT,
+        Self::RADIO_TX_EQUALIZER_FM_NFM,
+        Self::RADIO_TX_EQUALIZER_DV,
+        Self::RADIO_RX_EQUALIZER,
+        Self::RADIO_TX_EQ_LEVEL_04,
+        Self::RADIO_TX_EQ_LEVEL_08,
+        Self::RADIO_TX_EQ_LEVEL_16,
+        Self::RADIO_TX_EQ_LEVEL_32,
+        Self::RADIO_RX_EQ_LEVEL_04,
+        Self::RADIO_RX_EQ_LEVEL_08,
+        Self::RADIO_RX_EQ_LEVEL_16,
+        Self::RADIO_RX_EQ_LEVEL_32,
+        Self::RADIO_RX_EQ_LEVEL_64,
+        Self::RADIO_USB_AUDIO_OUT_LEVEL,
+        Self::RADIO_EXTERNAL_SPEAKER,
+        Self::RADIO_BEEP,
+        Self::RADIO_BEEP_VOLUME,
+        Self::RADIO_VOICE_ANNOUNCE,
+        Self::RADIO_VOICE_ANNOUNCE_VOLUME,
+        Self::RADIO_VOICE_GUIDANCE_SPEED,
+        Self::RADIO_CALLSIGN_READOUT,
+        Self::RADIO_BLUETOOTH_ON_OFF,
+        Self::RADIO_BLUETOOTH_DEVICE_NAME,
+        Self::RADIO_BLUETOOTH_AUTO_CONNECT,
+        Self::RADIO_PF_1_PF_KEY,
+        Self::RADIO_PF_2_PF_KEY,
+        Self::RADIO_POWER_KEY,
+        Self::RADIO_PF_1_MIC,
+        Self::RADIO_PF_2_MIC,
+        Self::RADIO_PF_3_MIC,
+        Self::RADIO_PF_4_MIC,
+        Self::RADIO_CURSOR_SHIFT,
+        Self::RADIO_REMOTE_ANSWER_BACK,
+        Self::RADIO_TIME_ZONE,
+        Self::RADIO_AUTO_CORRECTION,
+        Self::RADIO_NTP_SERVER_ADDRESS,
+        Self::RADIO_KEY_LOCK_TYPE_KEY_LOCK,
+        Self::RADIO_KEY_LOCK_TYPE_FREQUENCY_LOCK,
+        Self::RADIO_DTMF_KEYS,
+        Self::RADIO_MIC_KEYS,
+        Self::RADIO_SPEED_DISTANCE,
+        Self::RADIO_ALTITUDE_RAIN,
+        Self::RADIO_TEMPERATURE,
+        Self::RADIO_LATITUDE_LONGITUDE,
+        Self::RADIO_GRID_SQUARE_FORMAT,
+        Self::RADIO_USB_FUNCTION,
+        Self::RADIO_USB_AUDIO_IN_OUT,
+        Self::RADIO_PC_OUTPUT_INTERFACE_GPS,
+        Self::RADIO_PC_OUTPUT_INTERFACE_APRS,
+        Self::RADIO_KISS_MODE_INTERFACE,
+        Self::RADIO_DIGITAL_MODE_INTERFACE,
+        Self::RADIO_DV_GATEWAY_INTERFACE,
+        Self::RADIO_EXTERNAL_DATA_BAND,
+        Self::RADIO_EXTERNAL_DATA_SPEED,
+        Self::RADIO_PR_1_PIN_OUTPUT_LEVEL,
+        Self::RADIO_PKD_PIN_INPUT_SENSITIVITY,
+        Self::RADIO_SQC_OUTPUT_SOURCE,
+        Self::RADIO_SQC_OUTPUT_LOGIC,
+        Self::RADIO_AUTO_POWER_OFF,
+        Self::RADIO_BEAT_SHIFT,
+        Self::RADIO_SMETER_SQUELCH_ABAND,
+        Self::RADIO_SMETER_SQUELCH_BBAND,
+        Self::RADIO_SMETER_SQUELCH_HANGUP_TIME,
+        Self::RADIO_MUTE_HANGUP_TIME,
+        Self::RADIO_WX_ALERT,
+        Self::RADIO_MONITOR_TYPE,
+        Self::RADIO_TX_INHIBIT,
+        Self::RADIO_TIME_OUT_TIMER,
+        Self::RADIO_MIC_SENSITIVITY,
+        Self::RADIO_TX_NOTIFICATION,
+        Self::RADIO_AM_HIGH_CUT,
+        Self::RADIO_SCAN_RESUME_ANALOG,
+        Self::RADIO_SCAN_RESUME_DIGITAL,
+        Self::RADIO_TIME_RESTART,
+        Self::RADIO_CARRIER_RESTART,
+        Self::RADIO_PRIORITY_SCAN,
+        Self::RADIO_SCAN_AUTO_BACKLIGHT,
+        Self::RADIO_VISUAL_SCAN,
+        Self::RADIO_AUTO_WEATHER_SCAN,
+        Self::RADIO_AUTO_OFFSET,
+        Self::RADIO_TX_HOLD_1750_HZ,
+        Self::RADIO_VOX,
+        Self::RADIO_VOX_GAIN,
+        Self::RADIO_VOX_DELAY,
+        Self::RADIO_VOX_TX_ON_BUSY,
+        Self::RADIO_DTMF_SPEED,
+        Self::RADIO_DTMF_PAUSE_TIME,
+        Self::RADIO_DTMF_TX_HOLD,
+        Self::RADIO_QSO_LOG,
+        Self::RADIO_RECALL_METHOD,
+        Self::RADIO_GROUP_LINK_0,
+        Self::RADIO_GROUP_LINK_1,
+        Self::RADIO_GROUP_LINK_2,
+        Self::RADIO_GROUP_LINK_3,
+        Self::RADIO_GROUP_LINK_4,
+        Self::RADIO_GROUP_LINK_5,
+        Self::RADIO_GROUP_LINK_6,
+        Self::RADIO_GROUP_LINK_7,
+        Self::RADIO_GROUP_LINK_8,
+        Self::RADIO_GROUP_LINK_9,
+        Self::RADIO_GROUP_LINK_10,
+        Self::RADIO_GROUP_LINK_11,
+        Self::RADIO_GROUP_LINK_12,
+        Self::RADIO_GROUP_LINK_13,
+        Self::RADIO_GROUP_LINK_14,
+        Self::RADIO_GROUP_LINK_15,
+        Self::RADIO_GROUP_LINK_16,
+        Self::RADIO_GROUP_LINK_17,
+        Self::RADIO_GROUP_LINK_18,
+        Self::RADIO_GROUP_LINK_19,
+        Self::RADIO_GROUP_LINK_20,
+        Self::RADIO_GROUP_LINK_21,
+        Self::RADIO_GROUP_LINK_22,
+        Self::RADIO_GROUP_LINK_23,
+        Self::RADIO_GROUP_LINK_24,
+        Self::RADIO_GROUP_LINK_25,
+        Self::RADIO_GROUP_LINK_26,
+        Self::RADIO_GROUP_LINK_27,
+        Self::RADIO_GROUP_LINK_28,
+        Self::RADIO_GROUP_LINK_29,
+        Self::RADIO_RECORDING_BAND,
+        Self::RADIO_RECORDING_FILE_STORAGE,
+        Self::RADIO_TX_MONITOR,
+        Self::RADIO_DIGITAL_AUTO_REPLY,
+        Self::RADIO_LCD_BRIGHTNESS,
+        Self::RADIO_AUTO_BRIGHTNESS,
+        Self::GPS_MY_POSITION_SELECT,
+        Self::GPS_POSITION_AMBIGUITY,
+        Self::GPS_PC_OUTPUT,
+        Self::GPS_SAT_INFO_OUTPUT,
+        Self::GPS_SENTENCE_GPGGA,
+        Self::GPS_SENTENCE_GPGLL,
+        Self::GPS_SENTENCE_GPRMC,
+        Self::GPS_SENTENCE_GPVTG,
+        Self::GPS_SENTENCE_GPGSA,
+        Self::GPS_SENTENCE_GPGSV,
+        Self::GPS_SBAS,
+        Self::GPS_TRACK_LOG,
+        Self::GPS_RECODE_METHOD,
+        Self::GPS_INTERVAL,
+        Self::GPS_DISTANCE,
+        Self::GPS_GPS_PORT_BAUD_RATE,
+        Self::GPS_GPS_PORT_INPUT,
+        Self::GPS_GPS_PORT_OUTPUT,
+        Self::GPS_BUILT_IN_GPS,
+        Self::GPS_MY_POSITION_LIST_0_ALTITUDE,
+        Self::GPS_MY_POSITION_LIST_0_NORTH_SOUTH,
+        Self::GPS_MY_POSITION_LIST_0_LATITUDE_DEGREE,
+        Self::GPS_MY_POSITION_LIST_0_LATITUDE_MINUTE,
+        Self::GPS_MY_POSITION_LIST_0_LATITUDE_SECOND_ENCODED,
+        Self::GPS_MY_POSITION_LIST_0_EAST_WEST,
+        Self::GPS_MY_POSITION_LIST_0_LONGITUDE_DEGREE,
+        Self::GPS_MY_POSITION_LIST_0_LONGITUDE_MINUTE,
+        Self::GPS_MY_POSITION_LIST_0_LONGITUDE_SECOND_ENCODED,
+        Self::GPS_MY_POSITION_LIST_0_NAME,
+        Self::GPS_MY_POSITION_LIST_1_ALTITUDE,
+        Self::GPS_MY_POSITION_LIST_1_NORTH_SOUTH,
+        Self::GPS_MY_POSITION_LIST_1_LATITUDE_DEGREE,
+        Self::GPS_MY_POSITION_LIST_1_LATITUDE_MINUTE,
+        Self::GPS_MY_POSITION_LIST_1_LATITUDE_SECOND_ENCODED,
+        Self::GPS_MY_POSITION_LIST_1_EAST_WEST,
+        Self::GPS_MY_POSITION_LIST_1_LONGITUDE_DEGREE,
+        Self::GPS_MY_POSITION_LIST_1_LONGITUDE_MINUTE,
+        Self::GPS_MY_POSITION_LIST_1_LONGITUDE_SECOND_ENCODED,
+        Self::GPS_MY_POSITION_LIST_1_NAME,
+        Self::GPS_MY_POSITION_LIST_2_ALTITUDE,
+        Self::GPS_MY_POSITION_LIST_2_NORTH_SOUTH,
+        Self::GPS_MY_POSITION_LIST_2_LATITUDE_DEGREE,
+        Self::GPS_MY_POSITION_LIST_2_LATITUDE_MINUTE,
+        Self::GPS_MY_POSITION_LIST_2_LATITUDE_SECOND_ENCODED,
+        Self::GPS_MY_POSITION_LIST_2_EAST_WEST,
+        Self::GPS_MY_POSITION_LIST_2_LONGITUDE_DEGREE,
+        Self::GPS_MY_POSITION_LIST_2_LONGITUDE_MINUTE,
+        Self::GPS_MY_POSITION_LIST_2_LONGITUDE_SECOND_ENCODED,
+        Self::GPS_MY_POSITION_LIST_2_NAME,
+        Self::GPS_MY_POSITION_LIST_3_ALTITUDE,
+        Self::GPS_MY_POSITION_LIST_3_NORTH_SOUTH,
+        Self::GPS_MY_POSITION_LIST_3_LATITUDE_DEGREE,
+        Self::GPS_MY_POSITION_LIST_3_LATITUDE_MINUTE,
+        Self::GPS_MY_POSITION_LIST_3_LATITUDE_SECOND_ENCODED,
+        Self::GPS_MY_POSITION_LIST_3_EAST_WEST,
+        Self::GPS_MY_POSITION_LIST_3_LONGITUDE_DEGREE,
+        Self::GPS_MY_POSITION_LIST_3_LONGITUDE_MINUTE,
+        Self::GPS_MY_POSITION_LIST_3_LONGITUDE_SECOND_ENCODED,
+        Self::GPS_MY_POSITION_LIST_3_NAME,
+        Self::GPS_MY_POSITION_LIST_4_ALTITUDE,
+        Self::GPS_MY_POSITION_LIST_4_NORTH_SOUTH,
+        Self::GPS_MY_POSITION_LIST_4_LATITUDE_DEGREE,
+        Self::GPS_MY_POSITION_LIST_4_LATITUDE_MINUTE,
+        Self::GPS_MY_POSITION_LIST_4_LATITUDE_SECOND_ENCODED,
+        Self::GPS_MY_POSITION_LIST_4_EAST_WEST,
+        Self::GPS_MY_POSITION_LIST_4_LONGITUDE_DEGREE,
+        Self::GPS_MY_POSITION_LIST_4_LONGITUDE_MINUTE,
+        Self::GPS_MY_POSITION_LIST_4_LONGITUDE_SECOND_ENCODED,
+        Self::GPS_MY_POSITION_LIST_4_NAME,
+        Self::APRS_WEATHER_TX,
+        Self::APRS_WEATHER_TX_INTERVAL,
+        Self::APRS_QSY_IN_STATUS,
+        Self::APRS_QSY_TONE_NARROW,
+        Self::APRS_QSY_SHIFT_OFFSET,
+        Self::APRS_QSY_LIMIT,
+        Self::APRS_LOW_SPEED_SPEED,
+        Self::APRS_HI_SPEED_SPEED,
+        Self::APRS_SLOW_RATE_TIME,
+        Self::APRS_FAST_RATE_TIME,
+        Self::APRS_TURN_ANGLE_DEG,
+        Self::APRS_TURN_SLOPE_DEG_SPEED,
+        Self::APRS_TURN_TIME_TIME,
+        Self::APRS_WAYPOINT_FORMAT,
+        Self::APRS_WAYPOINT_LENGTH,
+        Self::APRS_WAYPOINT_OUTPUT,
+        Self::APRS_FILTER_POSITION_LIMIT,
+        Self::APRS_FILTER_TYPE_WEATHER,
+        Self::APRS_FILTER_TYPE_DIGIPEATER,
+        Self::APRS_FILTER_TYPE_MOBILE,
+        Self::APRS_FILTER_TYPE_OBJECT,
+        Self::APRS_FILTER_TYPE_NAVITRA,
+        Self::APRS_FILTER_TYPE_1_WAY,
+        Self::APRS_FILTER_TYPE_OTHERS,
+        Self::APRS_PACKET_PATH_TYPE,
+        Self::APRS_PACKET_PATH_NEW_NWIDE_11,
+        Self::APRS_PACKET_PATH_NEW_NHOPS,
+        Self::APRS_PACKET_PATH_RELAY_RELAY,
+        Self::APRS_PACKET_PATH_RELAY_HOPS,
+        Self::APRS_PACKET_PATH_ABBR,
+        Self::APRS_PACKET_PATH_REGION_HOPS,
+        Self::APRS_PACKET_PATH_OTHERS,
+        Self::APRS_PACKET_PATH_OTHERS_2,
+        Self::APRS_PACKET_PATH_OTHERS_3,
+        Self::APRS_TNC_DATA_SPEED,
+        Self::APRS_TNC_DATA_BAND,
+        Self::APRS_AUTO_CH_SETTING,
+        Self::APRS_TNC_DCD_SENSE,
+        Self::APRS_TNC_TX_DELAY,
+        Self::APRS_FREQUENCY,
+        Self::APRS_PTT,
+        Self::APRS_APRS_KEY,
+        Self::APRS_BEACON_TX_METHOD,
+        Self::APRS_BEACON_TX_INTERVAL,
+        Self::APRS_BEACON_TX_DECAY,
+        Self::APRS_BEACON_TX_PROPORTION,
+        Self::APRS_BEACON_SPEED_OFF,
+        Self::APRS_BEACON_ALTITUDE_OFF,
+        Self::APRS_OBJECT_USED_NO,
+        Self::APRS_AUTO_REPLY_ON_OFF,
+        Self::APRS_AUTO_REPLY_DELAY_TIME,
+        Self::APRS_AUTO_REPLY_MESSAGE,
+        Self::APRS_AUTO_REPLY_TARGET_CALL,
+        Self::APRS_RX_BEEP_TYPE,
+        Self::APRS_TX_BEEP_ON_OFF,
+        Self::APRS_SPECIAL_CALL,
+        Self::APRS_INTERRUPT_DISPLAY_AREA,
+        Self::APRS_INTERRUPT_DISPLAY_TIME,
+        Self::APRS_APRS_VOICE,
+        Self::APRS_DIGIPEAT_MY_CALLSIGN,
+        Self::APRS_UICHECK,
+        Self::APRS_UIDIGIPEAT,
+        Self::APRS_UIDIGI_ALIASES,
+        Self::APRS_UITRACE,
+        Self::APRS_UITRACE_ALIASES,
+        Self::APRS_UIFLOOD,
+        Self::APRS_UIFLOOD_ALIASES,
+        Self::APRS_UIFLOOD_SUBSTITUTION,
+        Self::APRS_PC_OUTPUT,
+        Self::APRS_NETWORK_TYPE,
+        Self::APRS_ALTNET_ADDRESS,
+        Self::APRS_VOICE_ALERT_ON_OFF,
+        Self::APRS_VOICE_ALERT_TONE_NO,
+        Self::APRS_MESSAGE_GROUP,
+        Self::APRS_BULLETIN_GROUP,
+        Self::APRS_MY_CALLSIGN,
+        Self::APRS_ICON_TABLE_OVERLAY,
+        Self::APRS_ICON_SYMBOL,
+        Self::APRS_POSITION_COMMENT,
+        Self::APRS_STATUS_TEXT_SELECT,
+        Self::APRS_STATUS_TEXT_LIST_0_STATUS_TEXT,
+        Self::APRS_STATUS_TEXT_LIST_0_TX_RATE,
+        Self::APRS_STATUS_TEXT_LIST_1_STATUS_TEXT,
+        Self::APRS_STATUS_TEXT_LIST_1_TX_RATE,
+        Self::APRS_STATUS_TEXT_LIST_2_STATUS_TEXT,
+        Self::APRS_STATUS_TEXT_LIST_2_TX_RATE,
+        Self::APRS_STATUS_TEXT_LIST_3_STATUS_TEXT,
+        Self::APRS_STATUS_TEXT_LIST_3_TX_RATE,
+        Self::APRS_STATUS_TEXT_LIST_4_STATUS_TEXT,
+        Self::APRS_STATUS_TEXT_LIST_4_TX_RATE,
+        Self::APRS_OBJECT_LIST_0_NORTH_SOUTH,
+        Self::APRS_OBJECT_LIST_0_LATITUDE_DEGREE,
+        Self::APRS_OBJECT_LIST_0_LATITUDE_MINUTE,
+        Self::APRS_OBJECT_LIST_0_LATITUDE_SECOND_ENCODED,
+        Self::APRS_OBJECT_LIST_0_EAST_WEST,
+        Self::APRS_OBJECT_LIST_0_LONGITUDE_DEGREE,
+        Self::APRS_OBJECT_LIST_0_LONGITUDE_MINUTE,
+        Self::APRS_OBJECT_LIST_0_LONGITUDE_SECOND_ENCODED,
+        Self::APRS_OBJECT_LIST_0_NAME,
+        Self::APRS_OBJECT_LIST_0_OBJECT_TX_FORMAT,
+        Self::APRS_OBJECT_LIST_0_OBJECT_TX_INTERVAL,
+        Self::APRS_OBJECT_LIST_0_OBJECT_TABLE,
+        Self::APRS_OBJECT_LIST_0_OBJECT_SYMBOL,
+        Self::APRS_OBJECT_LIST_0_OBJECT_COMMENT,
+        Self::APRS_OBJECT_LIST_1_NORTH_SOUTH,
+        Self::APRS_OBJECT_LIST_1_LATITUDE_DEGREE,
+        Self::APRS_OBJECT_LIST_1_LATITUDE_MINUTE,
+        Self::APRS_OBJECT_LIST_1_LATITUDE_SECOND_ENCODED,
+        Self::APRS_OBJECT_LIST_1_EAST_WEST,
+        Self::APRS_OBJECT_LIST_1_LONGITUDE_DEGREE,
+        Self::APRS_OBJECT_LIST_1_LONGITUDE_MINUTE,
+        Self::APRS_OBJECT_LIST_1_LONGITUDE_SECOND_ENCODED,
+        Self::APRS_OBJECT_LIST_1_NAME,
+        Self::APRS_OBJECT_LIST_1_OBJECT_TX_FORMAT,
+        Self::APRS_OBJECT_LIST_1_OBJECT_TX_INTERVAL,
+        Self::APRS_OBJECT_LIST_1_OBJECT_TABLE,
+        Self::APRS_OBJECT_LIST_1_OBJECT_SYMBOL,
+        Self::APRS_OBJECT_LIST_1_OBJECT_COMMENT,
+        Self::APRS_OBJECT_LIST_2_NORTH_SOUTH,
+        Self::APRS_OBJECT_LIST_2_LATITUDE_DEGREE,
+        Self::APRS_OBJECT_LIST_2_LATITUDE_MINUTE,
+        Self::APRS_OBJECT_LIST_2_LATITUDE_SECOND_ENCODED,
+        Self::APRS_OBJECT_LIST_2_EAST_WEST,
+        Self::APRS_OBJECT_LIST_2_LONGITUDE_DEGREE,
+        Self::APRS_OBJECT_LIST_2_LONGITUDE_MINUTE,
+        Self::APRS_OBJECT_LIST_2_LONGITUDE_SECOND_ENCODED,
+        Self::APRS_OBJECT_LIST_2_NAME,
+        Self::APRS_OBJECT_LIST_2_OBJECT_TX_FORMAT,
+        Self::APRS_OBJECT_LIST_2_OBJECT_TX_INTERVAL,
+        Self::APRS_OBJECT_LIST_2_OBJECT_TABLE,
+        Self::APRS_OBJECT_LIST_2_OBJECT_SYMBOL,
+        Self::APRS_OBJECT_LIST_2_OBJECT_COMMENT,
+        Self::APRS_USER_PHRASE_LIST_0_USER_PHRASE,
+        Self::APRS_USER_PHRASE_LIST_1_USER_PHRASE,
+        Self::APRS_USER_PHRASE_LIST_2_USER_PHRASE,
+        Self::APRS_USER_PHRASE_LIST_3_USER_PHRASE,
+        Self::APRS_USER_PHRASE_LIST_4_USER_PHRASE,
+        Self::APRS_USER_PHRASE_LIST_5_USER_PHRASE,
+        Self::APRS_USER_PHRASE_LIST_6_USER_PHRASE,
+        Self::APRS_USER_PHRASE_LIST_7_USER_PHRASE,
+        Self::APRS_USER_PHRASE_LIST_8_USER_PHRASE,
+        Self::APRS_USER_PHRASE_LIST_9_USER_PHRASE,
+        Self::APRS_USER_PHRASE_LIST_10_USER_PHRASE,
+        Self::APRS_USER_PHRASE_LIST_11_USER_PHRASE,
+        Self::APRS_USER_PHRASE_LIST_12_USER_PHRASE,
+        Self::APRS_USER_PHRASE_LIST_13_USER_PHRASE,
+        Self::APRS_USER_PHRASE_LIST_14_USER_PHRASE,
+        Self::APRS_USER_PHRASE_LIST_15_USER_PHRASE,
+        Self::APRS_USER_PHRASE_LIST_16_USER_PHRASE,
+        Self::APRS_USER_PHRASE_LIST_17_USER_PHRASE,
+        Self::APRS_USER_PHRASE_LIST_18_USER_PHRASE,
+        Self::APRS_USER_PHRASE_LIST_19_USER_PHRASE,
+        Self::DV_DIRECT_REPLY_TX_RX,
+        Self::DV_AUTO_REPLY_TIMING_TX_RX,
+        Self::DV_DATA_TX_END_TIMING_TX_RX,
+        Self::DV_EMR_VOLUME_LEVEL_TX_RX,
+        Self::DV_RX_AFC_TX_RX,
+        Self::DV_FM_AUTO_DET_ON_DV_TX_RX,
+        Self::DV_DATA_FRAME_OUTPUT_TX_RX,
+        Self::DV_AUTO_REPLY,
+        Self::DV_GPS_INFO_IN_FRAME_GPS_DATA_TX,
+        Self::DV_SENTENCE_GPS_DATA_TX_GPGGA,
+        Self::DV_SENTENCE_GPS_DATA_TX_GPGLL,
+        Self::DV_SENTENCE_GPS_DATA_TX_GPRMC,
+        Self::DV_SENTENCE_GPS_DATA_TX_GPVTG,
+        Self::DV_SENTENCE_GPS_DATA_TX_GPGSA,
+        Self::DV_SENTENCE_GPS_DATA_TX_GPGSV,
+        Self::DV_SENTENCE_GPS_DATA_TX_APRS,
+        Self::DV_AUTO_TX_GPS_DATA_TX,
+        Self::DV_DISPLAY_METHOD_RX_NOTIFICATION,
+        Self::DV_SINGLE_DISPLAY_SIZE_RX_NOTIFICATION,
+        Self::DV_DUAL_DISPLAY_SIZE_RX_NOTIFICATION,
+        Self::DV_DISPLAY_HOLD_TIME_RX_NOTIFICATION,
+        Self::DV_CALLSIGN_ANNOUNCE_RX_NOTIFICATION,
+        Self::DV_STANDBY_BEEP_RX_NOTIFICATION,
+        Self::DV_DV_GATEWAY_MODE_DV_GATEWAY,
+        Self::DV_MY_CALLSIGN_SELECT_DV_GATEWAY,
+        Self::DV_GATEWAY_CALLSIGN,
+        Self::DV_GATEWAY_REPEATER_SERVER,
+        Self::DV_GATEWAY_TYPE,
+        Self::DV_UDP_HOLE_PUNCH,
+        Self::DV_REFLECTOR_HOSTS_UPDATE_METHOD,
+        Self::DV_REFLECTOR_HOSTS_SELECT,
+        Self::DV_SELECT_TERMINAL_MODE,
+        Self::DV_RPT_1_DV_GATEWAY,
+        Self::DV_RPT_2_DV_GATEWAY,
+        Self::DV_DEVICE_NAME_DV_GATEWAY,
+        Self::DV_REPEATER_MONITOR_TIMER,
+        Self::DV_REPEATER_HOSTS,
+        Self::DV_AUTO_UPDATE_URL_SELECT,
+        Self::DV_MY_DV_MESSAGE_SELECT,
+        Self::DV_MY_DV_MESSAGE_LIST_0_MY_DV_MESSAGE,
+        Self::DV_MY_DV_MESSAGE_LIST_1_MY_DV_MESSAGE,
+        Self::DV_MY_DV_MESSAGE_LIST_2_MY_DV_MESSAGE,
+        Self::DV_MY_DV_MESSAGE_LIST_3_MY_DV_MESSAGE,
+        Self::DV_MY_DV_MESSAGE_LIST_4_MY_DV_MESSAGE,
+        Self::DV_MY_CALLSIGN_DV_GATEWAY_LIST_0_MY_CALLSIGN_DV_GATEWAY,
+        Self::DV_MY_CALLSIGN_DV_GATEWAY_LIST_0_MEMO_DV_GATEWAY,
+        Self::DV_MY_CALLSIGN_DV_GATEWAY_LIST_1_MY_CALLSIGN_DV_GATEWAY,
+        Self::DV_MY_CALLSIGN_DV_GATEWAY_LIST_1_MEMO_DV_GATEWAY,
+        Self::DV_MY_CALLSIGN_DV_GATEWAY_LIST_2_MY_CALLSIGN_DV_GATEWAY,
+        Self::DV_MY_CALLSIGN_DV_GATEWAY_LIST_2_MEMO_DV_GATEWAY,
+        Self::DV_MY_CALLSIGN_DV_GATEWAY_LIST_3_MY_CALLSIGN_DV_GATEWAY,
+        Self::DV_MY_CALLSIGN_DV_GATEWAY_LIST_3_MEMO_DV_GATEWAY,
+        Self::DV_MY_CALLSIGN_DV_GATEWAY_LIST_4_MY_CALLSIGN_DV_GATEWAY,
+        Self::DV_MY_CALLSIGN_DV_GATEWAY_LIST_4_MEMO_DV_GATEWAY,
+        Self::DV_MY_CALLSIGN_DV_GATEWAY_LIST_5_MY_CALLSIGN_DV_GATEWAY,
+        Self::DV_MY_CALLSIGN_DV_GATEWAY_LIST_5_MEMO_DV_GATEWAY,
+        Self::DV_REFLECTOR_HOSTS_URL_LIST_0_URL,
+        Self::DV_AUTO_UPDATE_URL_LIST_0_URL,
+        Self::IPNET_DHCP,
+        Self::IPNET_IP_ADDRESS,
+        Self::IPNET_SUBNET_MASK,
+        Self::IPNET_DEFAULT_GATEWAY,
+        Self::IPNET_PRIMARY_DNS_SERVER,
+        Self::IPNET_SECONDARY_DNS_SERVER,
+        Self::IPNET_WIRELESS_LAN,
+        Self::PM_PM_SELECT,
+        Self::PM_PM_NAME_1,
+        Self::PM_PM_NAME_2,
+        Self::PM_PM_NAME_3,
+        Self::PM_PM_NAME_4,
+        Self::PM_PM_NAME_5,
+        Self::PM_PM_AUTO_STORE,
+    ];
+
+    /// The field's registry entry.
+    #[must_use]
+    pub const fn field(self) -> &'static MenuField {
+        self.0
+    }
+
+    /// The field's `menu.name` key.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        self.0.descriptor.name
+    }
+
+    /// The field whose key is exactly `name`.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|id| id.name() == name)
+    }
+}
+
+impl PartialEq for MenuFieldId {
+    fn eq(&self, other: &Self) -> bool {
+        self.name() == other.name()
+    }
+}
+
+impl Eq for MenuFieldId {}
+
+impl std::hash::Hash for MenuFieldId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.name().hash(state);
+    }
+}
+
+impl std::fmt::Debug for MenuFieldId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("MenuFieldId")
+            .field(&self.name())
+            .finish()
+    }
 }
