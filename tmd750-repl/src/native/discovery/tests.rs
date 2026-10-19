@@ -6,6 +6,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::{Duration, Instant};
 
+use kenwood_tmd750::transport::bluetooth::BLUETOOTH_NAMES;
+
 use super::*;
 
 type TestResult = AppResult<()>;
@@ -14,7 +16,7 @@ type TestResult = AppResult<()>;
 fn default_requires_one_exact_recognized_name() -> TestResult {
     let expected: BluetoothAddress = "01:23:45:67:89:AB".parse()?;
     let other: BluetoothAddress = "01:23:45:67:89:AC".parse()?;
-    for name in CANDIDATE_NAMES {
+    for name in BLUETOOTH_NAMES {
         assert_eq!(select([(&other, "TH-D75"), (&expected, name)])?, expected);
     }
     for name in [

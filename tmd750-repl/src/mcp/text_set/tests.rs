@@ -92,7 +92,7 @@ fn approval_expected_name_and_supported_scope_are_mandatory() -> TestResult {
         .is_err(),
         "expected current name is required"
     );
-    for setting in ["pm-name-2", "dstar-message-1", "dstar-my-callsign-2"] {
+    for setting in ["pm-name-2", "dstar-message-1", "dv-gateway-my-callsign-2"] {
         let mut candidate = arguments();
         if let Some(word) = candidate.iter_mut().find(|word| *word == "pm-name-1") {
             *word = setting.to_owned();
@@ -302,7 +302,7 @@ fn channel_name_selector_clear_and_scope_are_enforced_before_any_io() -> TestRes
             .validate_options()
             .is_err_and(|error| error
                 .to_string()
-                .contains("dstar-my-callsign-1 and channel-name only")),
+                .contains("dv-gateway-my-callsign-1 and channel-name only")),
         "PM1 has no empty form"
     );
     assert!(

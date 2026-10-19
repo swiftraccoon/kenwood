@@ -1,540 +1,54 @@
 //! Menu updates over one MCP connection followed by a fresh CAT check.
 //!
-//! The first connection compares the whole page, writes it, reads it back and
-//! exits MCP; the fresh check reads the identity tuple and Gateway Off, with
-//! one open on the main-unit endpoint, the bounded silent-`ID` retry on the
-//! operation-panel endpoint, or one reopen of the pinned channel over native
-//! Bluetooth. Persistence across a later MCP session or a power cycle is not
-//! checked.
+//! The update runs as a [`PagePlan`] of the shared page workflow: the first
+//! connection compares the whole page, writes it, reads it back and exits
+//! MCP; the fresh check reads the identity tuple and Gateway Off. Its journal
+//! records the field assignments the plan was prepared from.
 
-use std::fs::File;
-use std::io;
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-
-use kenwood_tmd750::transport::{DEFAULT_BAUD, SerialCandidate, TMD750_MAIN_PID, TMD750_PANEL_PID};
-use kenwood_tmd750::{DvGatewayMode, MenuUpdatePlan, Page, PageReplacement, Radio};
-use kenwood_transport::Transport;
+use kenwood_tmd750::MenuUpdatePlan;
+use kenwood_tmd750::transport::SerialCandidate;
 use kenwood_transport::bluetooth::BluetoothAddress;
 use serde::Serialize;
-use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
+use serde_json::{Map, Value};
 
-use super::link::{NativeLink, Opening, Refusal, ReportEndpoint, UsbLink, WriteLink};
-use super::menu::{ApplyRequest, Value};
-use super::reconnect::{PostExit, SkipReason, SystemBackend};
-use super::{
-    ExitDisposition, Failure, IdentityEvidence, close_transport, finish_on_interrupt, write_report,
-};
-use crate::capture::{Artifacts, CaptureKind, Recorder, TranscriptSummary, create_private_file};
-use crate::native::opening::History;
-use crate::{AppResult, CommandError, native, output};
+use super::link::NativeLink;
+use super::menu::{ApplyRequest, Value as AssignmentValue};
+use super::page_apply::{self, PagePlan, PlanKind};
+use crate::{AppResult, CommandError, native};
 
-struct Captures {
-    original: Recorder<File>,
-    post_exit: Recorder<File>,
-}
-
-#[derive(Debug, PartialEq, Eq, Serialize)]
-struct PageEvidence {
-    address: u32,
-    length: usize,
-}
-
-impl From<Page> for PageEvidence {
-    fn from(page: Page) -> Self {
-        Self {
-            address: page.address().as_u32(),
-            length: page.len(),
-        }
-    }
-}
-
-/// Serialized outcome of one apply session.
-///
-/// Holds the identity tuple, the observed Gateway mode, the MCP exit
-/// disposition, the pages compared before the write, the pages that may have
-/// been written, the pages whose readback matched and the fresh CAT check. A
-/// page stays in `possible_pages` whether or not its readback matched, and
-/// nothing is rolled back.
-#[derive(Debug, Serialize)]
-struct WorkflowResult {
-    identity: Option<IdentityEvidence>,
-    gateway_mode: Option<u8>,
-    exit: ExitDisposition,
-    /// Pages compared before the write, filled only when the whole batch
-    /// succeeded; partial comparisons stay in the transcript.
-    compared_pages: Vec<PageEvidence>,
-    possible_pages: Vec<PageEvidence>,
-    verified_pages: Vec<PageEvidence>,
-    /// Native Bluetooth opening attempts; absent over USB.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    opening: Option<History>,
-    open_error: Option<Failure>,
-    operation_error: Option<Failure>,
-    cleanup_error: Option<Failure>,
-    /// The failed hold of the connection after the exit; absent over USB.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    hold_error: Option<Failure>,
-    close_error: Option<Failure>,
-    capture_error: Option<Failure>,
-    journal_error: Option<Failure>,
-    transcript: TranscriptSummary,
-    post_exit: PostExit,
-}
-
-impl WorkflowResult {
-    fn new(captures: &Captures, link: &impl WriteLink) -> Self {
-        Self {
-            identity: None,
-            gateway_mode: None,
-            exit: ExitDisposition::NotEntered,
-            compared_pages: Vec::new(),
-            possible_pages: Vec::new(),
-            verified_pages: Vec::new(),
-            opening: None,
-            open_error: None,
-            operation_error: None,
-            cleanup_error: None,
-            hold_error: None,
-            close_error: None,
-            capture_error: None,
-            journal_error: None,
-            transcript: captures.original.summary(),
-            post_exit: link.skipped(
-                SkipReason::OriginalUpdateIncomplete,
-                captures.post_exit.summary(),
-            ),
-        }
-    }
-
-    const fn ineligible(&self) -> Option<SkipReason> {
-        if self.journal_error.is_some() {
-            Some(SkipReason::OriginalUpdateJournalIncomplete)
-        } else if self.open_error.is_some() {
-            Some(SkipReason::OriginalOpenFailed)
-        } else if self.capture_error.is_some() || !self.transcript.complete {
-            Some(SkipReason::OriginalCaptureIncomplete)
-        } else if self.close_error.is_some() {
-            Some(SkipReason::OriginalCloseFailed)
-        } else if self.operation_error.is_some()
-            || self.cleanup_error.is_some()
-            || !matches!(self.exit, ExitDisposition::Acknowledged)
-        {
-            Some(SkipReason::OriginalUpdateIncomplete)
-        } else if self.hold_error.is_some() {
-            Some(SkipReason::PostExitHoldFailed)
-        } else {
-            None
-        }
-    }
-
-    const fn succeeded(&self) -> bool {
-        self.ineligible().is_none() && self.post_exit.succeeded()
-    }
-
-    fn print_failures(&self) {
-        for (stage, error) in [
-            ("open", &self.open_error),
-            ("operation", &self.operation_error),
-            ("MCP exit", &self.cleanup_error),
-            ("post-exit hold", &self.hold_error),
-            ("close", &self.close_error),
-            ("capture", &self.capture_error),
-            ("journal", &self.journal_error),
-        ] {
-            if let Some(error) = error {
-                output::error(format_args!("Menu update {stage} failed: {error}"));
-            }
-        }
-        if !self.post_exit.succeeded() {
-            output::error(format_args!(
-                "Fresh verification: {}.",
-                self.post_exit.outcome()
-            ));
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct IntendedPage<'a> {
-    address: u32,
-    length: usize,
-    expected: &'a [u8],
-    replacement: &'a [u8],
-}
-
-impl<'a> From<&'a PageReplacement> for IntendedPage<'a> {
-    fn from(replacement: &'a PageReplacement) -> Self {
-        Self {
-            address: replacement.page().address().as_u32(),
-            length: replacement.page().len(),
-            expected: replacement.expected(),
-            replacement: replacement.replacement(),
-        }
-    }
-}
+#[cfg(test)]
+use super::link::WriteLink;
+#[cfg(test)]
+use super::page_apply::{Captures, WorkflowResult};
+#[cfg(test)]
+use crate::capture::Recorder;
+#[cfg(test)]
+use std::fs::File;
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 
 #[derive(Serialize)]
 struct AssignmentEvidence {
     field: &'static str,
     slot: Option<u8>,
-    value: Value,
+    value: AssignmentValue,
 }
 
-#[derive(Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum JournalEvent<'a> {
-    Prepared {
-        identity: IdentityEvidence,
-        assignments: Vec<AssignmentEvidence>,
-        pages: Vec<IntendedPage<'a>>,
-    },
-    BeforeWrite {
-        page: IntendedPage<'a>,
-    },
-    OriginalFinished {
-        evidence: &'a WorkflowResult,
-    },
-    Finished {
-        evidence: &'a WorkflowResult,
-    },
-}
-
-fn record_journal(journal: &mut Recorder<File>, event: JournalEvent<'_>) -> io::Result<()> {
-    journal.record(event);
-    journal.synchronize()
-}
-
-fn prepare_journal(journal: &mut Recorder<File>, plan: &MenuUpdatePlan) -> io::Result<()> {
-    record_journal(
-        journal,
-        JournalEvent::Prepared {
-            identity: IdentityEvidence::from(plan.identity()),
-            assignments: plan
-                .assignments()
-                .iter()
-                .map(|assignment| AssignmentEvidence {
-                    field: assignment.field().descriptor.name,
-                    slot: assignment.slot().map(kenwood_tmd750::SlotIndex::index),
-                    value: Value::from(assignment.value()),
-                })
-                .collect(),
-            pages: plan.replacements().iter().map(IntendedPage::from).collect(),
-        },
-    )
-}
-
-/// Second descriptor on the transcript file, fsynced before a write intent.
-///
-/// The first failure is retained and returned by every later call.
-struct RawSynchronization {
-    file: File,
-    error: Option<Failure>,
-    #[cfg(test)]
-    fail_next: bool,
-}
-
-impl RawSynchronization {
-    const fn new(file: File) -> Self {
-        Self {
-            file,
-            error: None,
-            #[cfg(test)]
-            fail_next: false,
-        }
-    }
-
-    fn synchronize(&mut self) -> io::Result<()> {
-        if let Some(error) = &self.error {
-            return Err(io::Error::other(error.to_string()));
-        }
-        let result = self.synchronize_file();
-        if let Err(error) = &result {
-            self.error = Some(Failure::from_error(error));
-        }
-        result
-    }
-
-    #[cfg(test)]
-    fn synchronize_file(&mut self) -> io::Result<()> {
-        if std::mem::take(&mut self.fail_next) {
-            return Err(io::Error::other(
-                "injected pre-write capture synchronization failure",
-            ));
-        }
-        self.file.sync_all()
-    }
-
-    #[cfg(not(test))]
-    fn synchronize_file(&self) -> io::Result<()> {
-        self.file.sync_all()
-    }
-}
-
-fn cancellation() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::Interrupted,
-        "menu update cancelled before write intent",
-    )
-}
-
-fn check_cancellation(cancelled: &AtomicBool) -> io::Result<()> {
-    if cancelled.load(Ordering::Relaxed) {
-        Err(cancellation())
-    } else {
-        Ok(())
-    }
-}
-
-/// Run the identity, Gateway and MCP write sequence on one open connection.
-///
-/// Cancellation is checked between exchanges only: an in-flight exchange is
-/// always awaited, and a batch whose first write intent is journaled runs to
-/// its MCP exit.
-async fn operate(
-    radio: &mut Radio<impl Transport>,
-    plan: &MenuUpdatePlan,
-    journal: &mut Recorder<File>,
-    raw: &mut RawSynchronization,
-    cancelled: &AtomicBool,
-    result: &mut WorkflowResult,
-) -> AppResult<()> {
-    check_cancellation(cancelled)?;
-    let identity = radio.identify().await?;
-    result.identity = Some(IdentityEvidence::from(&identity));
-    if &identity != plan.identity() {
-        return Err(CommandError(
-            "current radio identity does not match the source backup".to_owned(),
-        )
-        .into());
-    }
-    check_cancellation(cancelled)?;
-    let gateway = radio.get_dv_gateway_mode().await?;
-    result.gateway_mode = Some(match gateway {
-        DvGatewayMode::Off => 0,
-        DvGatewayMode::Terminal => 2,
-        DvGatewayMode::Unnamed(raw) => raw,
-    });
-    if gateway != DvGatewayMode::Off {
-        return Err(
-            CommandError("ordinary menu updates require current Gateway Off".to_owned()).into(),
-        );
-    }
-    check_cancellation(cancelled)?;
-    result.exit = ExitDisposition::RecoveryRequired;
-    let mut session = radio.enter_mcp().await?;
-    let mut intent_recorded = false;
-    let outcome = session
-        .compare_exchange_menu_update(
-            plan,
-            |replacement| {
-                if !intent_recorded {
-                    check_cancellation(cancelled)?;
-                }
-                raw.synchronize()?;
-                record_journal(
-                    journal,
-                    JournalEvent::BeforeWrite {
-                        page: replacement.into(),
-                    },
-                )?;
-                intent_recorded = true;
-                Ok(())
-            },
-            |_progress| {},
-        )
-        .await;
-    result.possible_pages = session
-        .journal()
-        .possibly_written
+/// The journal description of `plan`: its field assignments.
+fn description(plan: &MenuUpdatePlan) -> AppResult<Map<String, Value>> {
+    let assignments = plan
+        .assignments()
         .iter()
-        .copied()
-        .map(PageEvidence::from)
-        .collect();
-    result.verified_pages = session
-        .journal()
-        .verified
-        .iter()
-        .copied()
-        .map(PageEvidence::from)
-        .collect();
-    if session.is_ready() {
-        result.exit = ExitDisposition::NotAcknowledged;
-        match session.exit().await {
-            Ok(()) => result.exit = ExitDisposition::Acknowledged,
-            Err(error) => result.cleanup_error = Some(Failure::from_error(&error)),
-        }
-    }
-    result.compared_pages = outcome?
-        .compared_pages
-        .into_iter()
-        .map(PageEvidence::from)
-        .collect();
-    Ok(())
-}
-
-/// Open the session over `link`, run the update, hold after an acknowledged
-/// exit, close the connection, and return its recorder.
-async fn original(
-    link: &mut impl WriteLink,
-    plan: &MenuUpdatePlan,
-    recorder: Recorder<File>,
-    post_exit: &mut Recorder<File>,
-    journal: &mut Recorder<File>,
-    cancelled: &AtomicBool,
-    result: &mut WorkflowResult,
-) -> Recorder<File> {
-    let synchronization = match recorder.synchronization_handle() {
-        Ok(file) => file,
-        Err(error) => {
-            result.capture_error = Some(Failure::from_error(&error));
-            return recorder;
-        }
-    };
-    let opened = link.open_session(recorder, false, cancelled).await;
-    result.opening = link.take_opening_history();
-    let mut transport = match opened {
-        Opening::Opened(transport) => transport,
-        Opening::Refused { recorder, refusal } => {
-            match refusal {
-                Refusal::Capture(failure) => result.capture_error = Some(failure),
-                Refusal::Cancelled => {
-                    result.operation_error = Some(Failure::from_error(&cancellation()));
-                }
-                Refusal::Open(failure) => result.open_error = Some(failure),
-            }
-            return recorder;
-        }
-    };
-    let opening = transport.synchronize();
-    let mut radio = link.radio(transport);
-    let mut raw = RawSynchronization::new(synchronization);
-    match opening {
-        Ok(()) => {
-            if let Err(error) =
-                operate(&mut radio, plan, journal, &mut raw, cancelled, result).await
-            {
-                result.operation_error = Some(Failure::from_error(error.as_ref()));
-            }
-        }
-        Err(error) => result.capture_error = Some(Failure::from_error(&error)),
-    }
-    if let Some(error) = raw.error {
-        result.capture_error = Some(error);
-    }
-    if matches!(result.exit, ExitDisposition::Acknowledged) {
-        // Once a page may have been written, a cancellation signal no longer
-        // interrupts the hold.
-        let finish = AtomicBool::new(false);
-        let continuing = if result.possible_pages.is_empty() {
-            cancelled
-        } else {
-            &finish
-        };
-        if let Err(error) = link.hold_after_exit(post_exit, continuing).await
-            && error.kind() != io::ErrorKind::Interrupted
-        {
-            result.hold_error = Some(Failure::from_error(&error));
-        }
-    }
-    let mut transport = radio.into_transport();
-    result.close_error = close_transport(&mut transport).await;
-    transport.into_recorder()
-}
-
-async fn run_workflow(
-    link: &mut impl WriteLink,
-    plan: &MenuUpdatePlan,
-    captures: Captures,
-    journal: &mut Recorder<File>,
-    cancelled: &AtomicBool,
-) -> WorkflowResult {
-    let mut result = WorkflowResult::new(&captures, &*link);
-    let Captures {
-        mut original,
-        mut post_exit,
-    } = captures;
-    match prepare_journal(journal, plan) {
-        Err(error) => result.journal_error = Some(Failure::from_error(&error)),
-        Ok(()) => match check_cancellation(cancelled) {
-            Err(error) => result.operation_error = Some(Failure::from_error(&error)),
-            Ok(()) => {
-                original = self::original(
-                    link,
-                    plan,
-                    original,
-                    &mut post_exit,
-                    journal,
-                    cancelled,
-                    &mut result,
-                )
-                .await;
-            }
-        },
-    }
-    if let Err(error) = original.synchronize() {
-        let _first = result
-            .capture_error
-            .get_or_insert_with(|| Failure::from_error(&error));
-    }
-    result.transcript = original.summary();
-    drop(original);
-    if let Err(error) = record_journal(
-        journal,
-        JournalEvent::OriginalFinished { evidence: &result },
-    ) {
-        let _first = result
-            .journal_error
-            .get_or_insert_with(|| Failure::from_error(&error));
-    }
-    let skip = result.ineligible().or_else(|| {
-        (result.possible_pages.is_empty() && cancelled.load(Ordering::Relaxed))
-            .then_some(SkipReason::Cancelled)
-    });
-    result.post_exit = if let Some(reason) = skip {
-        if let Err(error) = post_exit.synchronize() {
-            let _first = result
-                .capture_error
-                .get_or_insert_with(|| Failure::from_error(&error));
-        }
-        link.skipped(reason, post_exit.summary())
-    } else {
-        // Once a page may have been written, the post-exit check runs even after
-        // Ctrl-C; a capture failure still stops all protocol I/O.
-        let finish_required = AtomicBool::new(false);
-        let cancellation = if result.possible_pages.is_empty() {
-            cancelled
-        } else {
-            &finish_required
-        };
-        link.verify_post_exit(plan.identity(), true, post_exit, cancellation)
-            .await
-    };
-    if let Err(error) = record_journal(journal, JournalEvent::Finished { evidence: &result }) {
-        let _first = result
-            .journal_error
-            .get_or_insert_with(|| Failure::from_error(&error));
-    }
-    result
-}
-
-#[derive(Serialize)]
-struct Report {
-    format_version: u8,
-    operation: &'static str,
-    /// `native_bluetooth` over native Bluetooth; absent over USB.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    transport: Option<&'static str>,
-    verification_scope: &'static str,
-    software_version: &'static str,
-    started_at_utc: String,
-    finished_at_utc: String,
-    endpoint: ReportEndpoint,
-    source_backup: PathBuf,
-    workflow: WorkflowResult,
-    signal_error: Option<Failure>,
+        .map(|assignment| AssignmentEvidence {
+            field: assignment.field().descriptor.name,
+            slot: assignment.slot().map(kenwood_tmd750::SlotIndex::index),
+            value: AssignmentValue::from(assignment.value()),
+        })
+        .collect::<Vec<_>>();
+    let mut description = Map::new();
+    let _previous =
+        description.insert("assignments".to_owned(), serde_json::to_value(assignments)?);
+    Ok(description)
 }
 
 /// Reserve the capture files and journal, then run the update and its CAT check.
@@ -548,28 +62,14 @@ pub(super) async fn run(
     baud: u32,
     request: &ApplyRequest,
 ) -> AppResult<()> {
-    if !cfg!(unix) {
-        return Err(CommandError(
-            "menu updates require Unix private files and directory synchronization".to_owned(),
-        )
-        .into());
-    }
-    if !endpoint.is_tmd750()
-        || !matches!(endpoint.pid, Some(TMD750_MAIN_PID | TMD750_PANEL_PID))
-        || baud != DEFAULT_BAUD
-    {
-        return Err(CommandError(
-            "menu updates require a TM-D750 main-unit or operation-panel USB endpoint at 9600 baud"
-                .to_owned(),
-        )
-        .into());
-    }
+    page_apply::admit_usb(endpoint, baud, PlanKind::Menu)?;
     let plan = request.prepare()?;
-    let mut backend = SystemBackend::new();
-    run_prepared(
-        &plan,
-        &mut UsbLink::new(&mut backend, endpoint, baud),
-        request,
+    page_apply::run_usb(
+        endpoint,
+        baud,
+        &PagePlan::menu(&plan, description(&plan)?),
+        request.output(),
+        request.source_backup(),
     )
     .await
 }
@@ -593,91 +93,33 @@ pub(super) async fn run_native(
         .into());
     }
     let mut backend = native::SystemBackend;
-    run_prepared(plan, &mut NativeLink::new(&mut backend, endpoint), request).await
+    page_apply::run_prepared(
+        &PagePlan::menu(plan, description(plan)?),
+        &mut NativeLink::new(&mut backend, endpoint),
+        request.output(),
+        request.source_backup(),
+    )
+    .await
 }
 
-/// Reserve the capture files and journal, then run the planned update over
-/// `link` and write its report.
-async fn run_prepared(
-    plan: &MenuUpdatePlan,
+/// Run `plan` through the shared workflow, as the live paths do.
+#[cfg(test)]
+async fn run_workflow(
     link: &mut impl WriteLink,
-    request: &ApplyRequest,
-) -> AppResult<()> {
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let artifacts = Artifacts::create(CaptureKind::Mcp, request.output(), Arc::clone(&cancelled))?;
-    let post_exit = artifacts.reserve_post_exit(Arc::clone(&cancelled))?;
-    let mut journal = Recorder::named(
-        create_private_file(&artifacts.directory.join("menu-journal.jsonl"))?,
-        Arc::clone(&cancelled),
-        "menu-journal.jsonl",
-    );
-    File::open(&artifacts.directory)?.sync_all()?;
-    File::open(
-        artifacts
-            .directory
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-            .unwrap_or_else(|| std::path::Path::new(".")),
-    )?
-    .sync_all()?;
-    let Artifacts {
-        directory,
-        report: mut report_file,
-        transcript,
-    } = artifacts;
-    output::line(format_args!(
-        "Menu update capture: {}. The requested setting remains in place; no automatic rollback.",
-        directory.display()
-    ));
-    output::line(format_args!(
-        "Ctrl-C cancels before the write is journaled. After that the batch and its verification finish unless a protocol or capture failure stops them."
-    ));
-    let started_at_utc = OffsetDateTime::now_utc().format(&Rfc3339)?;
-    let (workflow, signal_error) = finish_on_interrupt(
-        Box::pin(run_workflow(
-            link,
-            plan,
-            Captures {
-                original: transcript,
-                post_exit,
-            },
-            &mut journal,
-            &cancelled,
-        )),
-        tokio::signal::ctrl_c(),
-        &cancelled,
+    plan: &MenuUpdatePlan,
+    captures: Captures,
+    journal: &mut Recorder<File>,
+    cancelled: &AtomicBool,
+) -> WorkflowResult {
+    let description = description(plan).unwrap_or_default();
+    page_apply::run_workflow(
+        link,
+        &PagePlan::menu(plan, description),
+        captures,
+        journal,
+        cancelled,
     )
-    .await;
-    workflow.print_failures();
-    let succeeded = workflow.succeeded() && signal_error.is_none();
-    let report = Report {
-        format_version: if link.native() { 2 } else { 1 },
-        operation: "menu_update",
-        transport: link.native().then_some("native_bluetooth"),
-        verification_scope: "immediate_complete_page_readback_and_fresh_cat_gateway_off",
-        software_version: env!("CARGO_PKG_VERSION"),
-        started_at_utc,
-        finished_at_utc: OffsetDateTime::now_utc().format(&Rfc3339)?,
-        endpoint: link.report_endpoint(),
-        source_backup: request.source_backup().to_owned(),
-        workflow,
-        signal_error,
-    };
-    write_report(&mut report_file, &report).and_then(|()| report_file.sync_all()).map_err(|error| CommandError(format!("menu report could not be finalized: {error}; retain {}. Writes may have occurred; do not retry or restore blindly", directory.display())))?;
-    output::line(format_args!(
-        "Menu report: {}. {} complete pages compared; {} written pages immediately verified.",
-        directory.join("report.json").display(),
-        report.workflow.compared_pages.len(),
-        report.workflow.verified_pages.len()
-    ));
-    if succeeded {
-        output::line(format_args!(
-            "Fresh CAT identity and Gateway Off verified. Refresh the backup before another edit."
-        ));
-        Ok(())
-    } else {
-        Err(CommandError(format!("menu update incomplete; {} pages possibly written. Do not retry or restore blindly. Inspect {}", report.workflow.possible_pages.len(), directory.display())).into())
-    }
+    .await
 }
 
 #[cfg(test)]

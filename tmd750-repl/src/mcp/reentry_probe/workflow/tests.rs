@@ -323,7 +323,7 @@ impl TestBackend {
         );
         assert_eq!(
             finished
-                .pointer("/event/evidence/post_exit/attempt/gateway_mode/raw")
+                .pointer("/event/evidence/post_exit/attempts/0/connection/gateway_mode/raw")
                 .and_then(Value::as_u64),
             Some(0),
             "retain the actual fresh Gateway Off reply rather than reusing the pre-entry value"
@@ -649,7 +649,7 @@ async fn fresh_gateway_mismatch_is_retained_and_prevents_the_next_original_open(
     let encoded = serde_json::to_value(session)?;
     assert_eq!(
         encoded
-            .pointer("/post_exit/attempt/gateway_mode/raw")
+            .pointer("/post_exit/attempts/0/connection/gateway_mode/raw")
             .and_then(Value::as_u64),
         Some(2)
     );

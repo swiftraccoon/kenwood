@@ -8,9 +8,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use kenwood_tmd750::SlotIndex;
-use kenwood_tmd750::memory::{
-    ReflectorTerminalPreflight, TerminalUsbRoute, TextLayoutQualification,
-};
+use kenwood_tmd750::memory::{ReflectorTerminalPreflight, TerminalUsbRoute};
 
 use super::snapshot::Snapshot;
 use crate::{AppResult, CommandError, output};
@@ -43,10 +41,6 @@ struct PreflightRequest {
     /// USB interface the settings are read for; no endpoint is opened.
     #[arg(long, value_enum)]
     interface: UsbInterface,
-
-    /// Decode firmware outside the registry label. Required for firmware 1.02.
-    #[arg(long)]
-    interpret_unqualified: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -75,19 +69,13 @@ fn assess(
     request: &PreflightRequest,
     snapshot: &Snapshot,
 ) -> AppResult<ReflectorTerminalPreflight> {
-    assess_snapshot(
-        snapshot,
-        request.slot,
-        request.interface.into(),
-        request.interpret_unqualified,
-    )
+    assess_snapshot(snapshot, request.slot, request.interface.into())
 }
 
 fn assess_snapshot(
     snapshot: &Snapshot,
     slot: SlotIndex,
     route: TerminalUsbRoute,
-    interpret_unqualified: bool,
 ) -> AppResult<ReflectorTerminalPreflight> {
     // Check every required field is covered before handing the image to the
     // reader; uncovered bytes in that image are padding, not settings.
@@ -97,16 +85,7 @@ fn assess_snapshot(
     }
     let image = covered_image
         .ok_or_else(|| CommandError("Terminal preflight has no storage descriptors".to_owned()))?;
-    Ok(if interpret_unqualified {
-        ReflectorTerminalPreflight::interpret_unqualified(
-            image,
-            &snapshot.identity.firmware,
-            slot,
-            route,
-        )?
-    } else {
-        ReflectorTerminalPreflight::read(image, &snapshot.identity.firmware, slot, route)?
-    })
+    Ok(ReflectorTerminalPreflight::read(image, slot, route)?)
 }
 
 /// Run the selected Terminal subcommand against its captured backups.
@@ -130,22 +109,15 @@ fn describe(
     snapshot: &Snapshot,
     assessment: &ReflectorTerminalPreflight,
 ) -> AppResult<Vec<String>> {
-    let qualification = match assessment.qualification {
-        TextLayoutQualification::RegistryTargetMatched => {
-            "Registry firmware label matched this backup's firmware."
-        }
-        TextLayoutQualification::UnqualifiedInterpretation => {
-            "Firmware outside the registry label; decoded with --interpret-unqualified."
-        }
-    };
     let mut lines = vec![
         "Offline Reflector Terminal preflight. Historical backup only; current radio state is unknown."
             .to_owned(),
         format!(
             "Backup identity: {}; firmware {}; type {}.",
-            snapshot.identity.model, snapshot.identity.firmware, snapshot.identity.radio_type
+            snapshot.identity().model,
+            snapshot.identity().firmware,
+            snapshot.identity().radio_type
         ),
-        qualification.to_owned(),
         format!(
             "Requested PM slot: {}; captured active PM slot: {}. Slot 0 means PM Off.",
             assessment.slot.index(),

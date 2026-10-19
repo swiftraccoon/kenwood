@@ -62,9 +62,9 @@ impl UpdateKind {
 
     pub(super) const fn format_version(self) -> u8 {
         match self {
-            Self::Pm1Name => 5,
-            Self::PmOffMy1 => 6,
-            Self::ChannelName => 7,
+            Self::Pm1Name => 9,
+            Self::PmOffMy1 => 10,
+            Self::ChannelName => 11,
         }
     }
 

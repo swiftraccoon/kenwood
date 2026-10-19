@@ -12,7 +12,6 @@ use clap::Args;
 use kenwood_tmd750::SlotIndex;
 use kenwood_tmd750::memory::{
     ReflectorTerminalPreflight, StandardConfigurationDiff, TerminalUsbRoute,
-    TextLayoutQualification, is_supported_schema_target,
 };
 use serde::Serialize;
 
@@ -40,10 +39,6 @@ pub(super) struct CompareRequest {
     #[arg(long, value_enum)]
     interface: UsbInterface,
 
-    /// Decode firmware outside the registry label. Required for firmware 1.02.
-    #[arg(long)]
-    interpret_unqualified: bool,
-
     /// New private JSON report with exact byte changes and interpreted text.
     #[arg(long, value_name = "NEW_REPORT.json")]
     output: Option<PathBuf>,
@@ -54,7 +49,6 @@ struct ComparisonReport {
     format_version: u8,
     operation: &'static str,
     software_version: &'static str,
-    qualification: &'static str,
     requested_slot: u8,
     requested_interface: String,
     before: SnapshotEvidence,
@@ -139,13 +133,7 @@ fn snapshot_evidence(
     snapshot: &Snapshot,
     request: &CompareRequest,
 ) -> SnapshotEvidence {
-    let assessment = assess_snapshot(
-        snapshot,
-        request.slot,
-        request.interface.into(),
-        request.interpret_unqualified,
-    )
-    .map_or_else(
+    let assessment = assess_snapshot(snapshot, request.slot, request.interface.into()).map_or_else(
         |error| AssessmentEvidence::Failed {
             error: error.to_string(),
         },
@@ -153,7 +141,7 @@ fn snapshot_evidence(
     );
     SnapshotEvidence {
         path,
-        identity: (&snapshot.identity).into(),
+        identity: snapshot.identity().into(),
         assessment,
     }
 }
@@ -186,15 +174,6 @@ fn build_report(request: &CompareRequest) -> AppResult<ComparisonReport> {
     ).map_err(|_| CommandError(
         "Configuration comparison requires identical model, exact firmware, and full radio-type identities with canonical coverage; captured values are not displayed.".to_owned()
     ))?;
-    let qualification = if request.interpret_unqualified {
-        TextLayoutQualification::UnqualifiedInterpretation
-    } else if is_supported_schema_target(before.identity.model, &before.identity.firmware) {
-        TextLayoutQualification::RegistryTargetMatched
-    } else {
-        return Err(CommandError(
-            "This firmware requires --interpret-unqualified for offline layout annotations; no radio settings will be changed.".to_owned()
-        ).into());
-    };
     let catalog = Catalog::new()?;
     let mut fields = BTreeMap::<u32, FieldChange>::new();
     let mut outside_terminal_catalog_bytes = 0;
@@ -229,13 +208,9 @@ fn build_report(request: &CompareRequest) -> AppResult<ComparisonReport> {
         })
         .collect();
     Ok(ComparisonReport {
-        format_version: 1,
+        format_version: 2,
         operation: "terminal_configuration_comparison",
         software_version: env!("CARGO_PKG_VERSION"),
-        qualification: match qualification {
-            TextLayoutQualification::RegistryTargetMatched => "registry_target_matched",
-            TextLayoutQualification::UnqualifiedInterpretation => "unqualified_interpretation",
-        },
         requested_slot: request.slot.index(),
         requested_interface: TerminalUsbRoute::from(request.interface).to_string(),
         before: snapshot_evidence(request.before.clone(), &before, request),
@@ -260,7 +235,6 @@ fn build_report(request: &CompareRequest) -> AppResult<ComparisonReport> {
 fn describe(report: &ComparisonReport) -> Vec<String> {
     let mut lines = vec![
         "Offline configuration comparison. Historical reports only; no radio access or settings changes.".to_owned(),
-        format!("Layout interpretation: {}.", report.qualification),
         format!("Compared {} pages / {} captured bytes across every PM slot; {} bytes differ in {} pages.", report.compared_pages, report.compared_bytes, report.changed_bytes, report.pages.len()),
         format!("{} changed bytes are outside the finite Terminal catalog; they remain in the exact comparison.", report.outside_terminal_catalog_bytes),
     ];

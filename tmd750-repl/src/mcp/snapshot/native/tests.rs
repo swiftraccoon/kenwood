@@ -93,7 +93,7 @@ fn with_reply_deadlines(format: u8, exit_bound: Value, first_reply: Value) -> Ap
 #[test]
 fn format_four_requires_both_reply_deadlines_and_format_three_has_neither() -> TestResult {
     let snapshot = load(&with_reply_deadlines(4, json!(30_000), json!(10_000))?)?;
-    assert_eq!(snapshot.identity.firmware.as_str(), "1.02");
+    assert_eq!(snapshot.identity().firmware.as_str(), "1.02");
     for (exit_bound, first_reply) in [
         (json!(29_999), json!(10_000)),
         (json!(30_001), json!(10_000)),
@@ -229,7 +229,7 @@ fn native_snapshot_preserves_bytes_and_cannot_supply_usb_write_provenance() -> T
     let bytes = serde_json::to_vec(&fixture()?)?;
     std::fs::write(&path, &bytes)?;
     let snapshot = Snapshot::load(&path)?;
-    assert_eq!(snapshot.identity.firmware.as_str(), "1.02");
+    assert_eq!(snapshot.identity().firmware.as_str(), "1.02");
     assert!(matches!(
         &snapshot.provenance,
         Provenance::NativeBluetooth { address, channel }
@@ -266,7 +266,7 @@ fn native_writes_load_only_native_backups_and_learn_their_address() -> TestResul
     std::fs::write(&native, serde_json::to_vec(&fixture()?)?)?;
     let (snapshot, address) = Snapshot::load_for_native_write(&native)?;
     assert_eq!(address.as_str(), "01-23-45-67-89-AB");
-    assert_eq!(snapshot.identity.firmware.as_str(), "1.02");
+    assert_eq!(snapshot.identity().firmware.as_str(), "1.02");
     let usb = directory.path().join("usb.json");
     std::fs::write(&usb, serde_json::to_vec(&super::super::tests::fixture())?)?;
     let error = Snapshot::load_for_native_write(&usb)

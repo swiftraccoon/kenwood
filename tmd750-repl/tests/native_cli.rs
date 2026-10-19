@@ -191,13 +191,6 @@ fn unsupported_native_operations_stop_before_helper_validation_or_capture() -> T
         vec!["mcp", "reentry-probe", "--approve-live-test"],
         vec!["dstar", "probe"],
         vec!["dstar", "probe", "--approve-live-test"],
-        vec![
-            "mcp",
-            "my1-trial",
-            "--backup",
-            "/not/a/backup",
-            "--approve-live-test",
-        ],
     ] {
         let directory = tempfile::tempdir()?;
         let result = Command::new(env!("CARGO_BIN_EXE_tmd750-repl"))

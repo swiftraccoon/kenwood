@@ -7,14 +7,14 @@ use std::fs::{File, Metadata};
 use std::io::Read;
 use std::path::Path;
 
-use kenwood_tmd750::memory::{FieldDescriptor, StandardConfiguration};
+use kenwood_tmd750::memory::{Configuration, FieldDescriptor, StandardConfiguration};
 use kenwood_tmd750::protocol::mcp::regions;
 use kenwood_tmd750::radio::readiness::MAXIMUM_OPEN_ATTEMPTS;
 use kenwood_tmd750::transport::SerialCandidate;
 use kenwood_tmd750::transport::reenumeration::{Reenumeration, select_pinned};
 use kenwood_tmd750::{
-    FirmwareIdentity, Identity, MemoryImage, MenuFieldSnapshot, RadioModel, RadioType, Region,
-    SlotIndex,
+    Address, FirmwareIdentity, Identity, MemoryImage, MenuFieldSnapshot, Page, RadioModel,
+    RadioType, Region, SlotIndex,
 };
 use kenwood_transport::bluetooth::{BluetoothAddress, RfcommChannel};
 use serde::Deserialize;
@@ -509,15 +509,12 @@ fn read_document(reader: impl Read) -> AppResult<SourceDocument> {
 
 /// A configuration backup loaded from a report.json.
 ///
-/// Holds the decoded memory image, the identity captured with it, the regions
-/// the report actually captured, and the transport that produced it. Bytes
-/// outside `coverage` are padding in the dense image and are never returned as
-/// field data.
+/// Holds the library [`Configuration`] of the captured pages, which keeps the
+/// identity captured with them and checks coverage before returning any byte,
+/// and the transport that produced it.
 #[derive(Debug)]
 pub(crate) struct Snapshot {
-    image: MemoryImage,
-    pub(crate) identity: Identity,
-    coverage: Vec<Region>,
+    configuration: Configuration,
     provenance: Provenance,
 }
 
@@ -537,26 +534,21 @@ enum Provenance {
 }
 
 impl Snapshot {
+    /// The identity captured with the pages.
+    pub(crate) const fn identity(&self) -> &Identity {
+        self.configuration.identity()
+    }
+
     /// Copy the captured standard pages into a `MenuFieldSnapshot`.
     ///
     /// Errors when any standard page lies outside the captured coverage.
     pub(crate) fn menu_snapshot(&self) -> AppResult<MenuFieldSnapshot> {
-        let pages = regions::menu_regions()
-            .into_iter()
-            .flat_map(Region::pages)
-            .map(|page| Ok((page, self.captured_bytes(page.region())?.to_vec())))
-            .collect::<AppResult<Vec<_>>>()?;
-        Ok(MenuFieldSnapshot::from_pages(pages)?)
+        Ok(self.configuration.menu_snapshot()?)
     }
 
     /// Borrow the captured standard pages for comparison.
     pub(super) fn standard_configuration(&self) -> AppResult<StandardConfiguration<'_>> {
-        let pages = regions::menu_regions()
-            .into_iter()
-            .flat_map(Region::pages)
-            .map(|page| Ok((page, self.captured_bytes(page.region())?)))
-            .collect::<AppResult<Vec<_>>>()?;
-        Ok(StandardConfiguration::new(&self.identity, pages)?)
+        Ok(self.configuration.standard()?)
     }
 
     /// Load only a complete standard configuration capture from a regular file.
@@ -627,18 +619,18 @@ impl Snapshot {
             firmware: FirmwareIdentity::new(&backup.identity.firmware)?,
             radio_type: RadioType::new(&backup.identity.radio_type)?,
         };
-        let mut bytes = MemoryImage::blank().into_bytes();
-        for segment in backup.segments {
-            let start = usize::try_from(segment.address)?;
-            bytes
-                .get_mut(start..start + segment.length)
-                .ok_or("configuration page exceeds image")?
-                .copy_from_slice(&segment.data);
-        }
+        let pages = backup
+            .segments
+            .into_iter()
+            .map(|segment| {
+                Ok((
+                    Page::new(Address::new(segment.address)?, segment.length)?,
+                    segment.data,
+                ))
+            })
+            .collect::<AppResult<Vec<_>>>()?;
         Ok(Self {
-            image: MemoryImage::from_bytes(bytes)?,
-            identity,
-            coverage: regions::menu_regions(),
+            configuration: Configuration::from_pages(identity, pages)?,
             provenance,
         })
     }
@@ -655,27 +647,20 @@ impl Snapshot {
         let end = start
             .checked_add(u32::try_from(descriptor.codec.encoded_len())?)
             .ok_or("field range overflow")?;
-        let _captured = self.captured_bytes(Region::new(start, end)?)?;
-        Ok(&self.image)
+        self.image_covering(Region::new(start, end)?)
+    }
+
+    /// Borrow the image after checking that the report captured every byte of
+    /// `region`.
+    pub(super) fn image_covering(&self, region: Region) -> AppResult<&MemoryImage> {
+        Ok(self.configuration.image_covering(region)?)
     }
 
     /// Borrow bytes from a region the report captured.
     ///
     /// Errors when the requested range includes a byte that was never read.
     pub(super) fn captured_bytes(&self, requested: Region) -> AppResult<&[u8]> {
-        if !(requested.start()..requested.end()).all(|address| {
-            self.coverage
-                .iter()
-                .any(|region| (region.start()..region.end()).contains(&address))
-        }) {
-            return invalid("the requested range includes unread bytes");
-        }
-        let start = usize::try_from(requested.start())?;
-        let end = usize::try_from(requested.end())?;
-        self.image
-            .as_bytes()
-            .get(start..end)
-            .ok_or_else(|| CommandError("captured range exceeds image".to_owned()).into())
+        Ok(self.configuration.bytes(requested)?)
     }
 }
 
@@ -804,7 +789,7 @@ pub(super) mod tests {
             let bytes = serde_json::to_vec(&document)?;
             std::fs::write(&path, &bytes)?;
             let snapshot = Snapshot::load(&path)?;
-            assert_eq!(snapshot.identity.firmware.as_str(), "1.02");
+            assert_eq!(snapshot.identity().firmware.as_str(), "1.02");
             assert_eq!(
                 std::fs::read(&path)?,
                 bytes,
@@ -882,7 +867,7 @@ pub(super) mod tests {
         std::os::unix::fs::symlink(&target, &link)?;
         let snapshot = Snapshot::load(&link)?;
         assert_eq!(
-            snapshot.identity.radio_type.as_str(),
+            snapshot.identity().radio_type.as_str(),
             "K,2,1",
             "regular-file symlinks must retain the same capture identity"
         );
@@ -892,7 +877,7 @@ pub(super) mod tests {
     #[test]
     fn complete_capture_preserves_identity_and_only_exposes_captured_fields() -> TestResult {
         let snapshot = Snapshot::from_document(serde_json::from_value(fixture())?)?;
-        assert_eq!(snapshot.identity.firmware.as_str(), "1.02");
+        assert_eq!(snapshot.identity().firmware.as_str(), "1.02");
         let observed = FieldDescriptor::new("observed", 8, FieldCodec::Byte { min: 0, max: 255 });
         assert_eq!(
             snapshot.image_for(&observed, None)?.as_bytes().get(8),
@@ -909,9 +894,12 @@ pub(super) mod tests {
     #[test]
     fn full_pm1_page_requires_every_byte_of_actual_coverage() -> TestResult {
         let mut snapshot = Snapshot::from_document(serde_json::from_value(fixture())?)?;
-        let page = kenwood_tmd750::memory::PmNameTrial::required_page()?;
+        let page = kenwood_tmd750::memory::Pm1NameUpdate::required_page()?;
         assert_eq!(snapshot.captured_bytes(page.region())?, &[0x42; 256]);
-        snapshot.coverage = vec![Region::new(323_594, 323_610)?];
+        snapshot.configuration = Configuration::from_pages(
+            snapshot.identity().clone(),
+            [(Page::new(Address::new(323_594)?, 16)?, vec![0x42; 16])],
+        )?;
         assert!(
             snapshot.captured_bytes(page.region()).is_err(),
             "field-only coverage cannot supply a whole page"
@@ -930,7 +918,16 @@ pub(super) mod tests {
             snapshot.standard_configuration().is_ok(),
             "a complete successful capture supplies the standard comparison view"
         );
-        let _removed = snapshot.coverage.pop().ok_or("fixture coverage missing")?;
+        let (_last, kept) = snapshot
+            .configuration
+            .pages()
+            .split_last()
+            .ok_or("fixture pages missing")?;
+        let kept = kept
+            .iter()
+            .map(|page| Ok((*page, snapshot.captured_bytes(page.region())?.to_vec())))
+            .collect::<AppResult<Vec<_>>>()?;
+        snapshot.configuration = Configuration::from_pages(snapshot.identity().clone(), kept)?;
         assert!(
             snapshot.standard_configuration().is_err(),
             "dense backing bytes cannot replace missing actual coverage"

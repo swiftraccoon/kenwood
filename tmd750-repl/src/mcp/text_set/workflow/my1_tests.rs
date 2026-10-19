@@ -23,7 +23,7 @@ use super::*;
 use crate::capture::{Artifacts, CaptureKind, Event as CaptureEvent};
 use crate::mcp::link::{Admission, ReportEndpoint, UsbLink};
 use crate::mcp::reconnect::{
-    self, Backend, PostExitVerification, VerificationOutcome, VerificationStage,
+    self, Backend, ReadinessVerification, VerificationOutcome, VerificationStage,
 };
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;
@@ -884,8 +884,8 @@ async fn four_handles_pin_the_full_wire_scope_and_durable_session_order() -> Tes
     }
     for (index, session) in result.sessions.iter().enumerate() {
         assert!(
-            matches!(session.post_exit, PostExit::Single(_)),
-            "the main-unit endpoint verifies with one open"
+            matches!(session.post_exit, PostExit::Readiness(_)),
+            "the main-unit endpoint verifies through the readiness check"
         );
         assert_my1_session(session, &harness.update, index == 0)?;
     }
@@ -1211,8 +1211,9 @@ async fn identity_only_verification_cannot_satisfy_an_otherwise_complete_my1_res
         result.succeeded(&harness.update),
         "establish the complete MY1 positive control first"
     );
-    let verification =
-        PostExit::Single(independent_verification(VerificationFixture::IdentityOnly).await?);
+    let verification = PostExit::Readiness(Box::new(
+        independent_verification(VerificationFixture::IdentityOnly).await?,
+    ));
     assert!(
         verification.succeeded(),
         "the identity-only positive control must genuinely complete"
@@ -1241,7 +1242,7 @@ enum VerificationFixture {
 
 async fn independent_verification(
     fixture: VerificationFixture,
-) -> Result<PostExitVerification, TestError> {
+) -> Result<ReadinessVerification, TestError> {
     let mut harness = Harness::new()?;
     drop(
         harness
@@ -1267,7 +1268,7 @@ async fn independent_verification(
     match fixture {
         VerificationFixture::IdentityOnly => {
             connection.mock = identity_script("1.02");
-            Ok(reconnect::verify_required(
+            Ok(reconnect::verify_readiness(
                 &mut harness.backend,
                 &endpoint(),
                 9600,
@@ -1281,7 +1282,7 @@ async fn independent_verification(
             identity.firmware = FirmwareIdentity::new("1.03")?;
             connection.mock = identity_script("1.03");
             connection.mock.expect(b"GW\r", b"GW 0\r");
-            Ok(reconnect::verify_required_gateway_off(
+            Ok(reconnect::verify_readiness_gateway_off(
                 &mut harness.backend,
                 &endpoint(),
                 9600,
@@ -1322,7 +1323,7 @@ async fn adapter_finalization_never_substitutes_gateway_or_identity_observations
             .as_ref()
             .and_then(|core| core.session_id)
             .ok_or("apply session ID missing")?;
-        let verification = PostExit::Single(independent_verification(fixture).await?);
+        let verification = PostExit::Readiness(Box::new(independent_verification(fixture).await?));
         assert!(
             verification.succeeded(),
             "the alternative verifier must succeed within its own requested scope"

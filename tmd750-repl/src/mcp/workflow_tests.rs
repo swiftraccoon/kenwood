@@ -630,7 +630,7 @@ async fn backup_silent_id_recovery_preserves_pages_and_roundtrips_the_production
     drop(file);
     let original_bytes = std::fs::read(&path)?;
     let snapshot = snapshot::Snapshot::load(&path)?;
-    assert_eq!(snapshot.identity.firmware.as_str(), "1.02");
+    assert_eq!(snapshot.identity().firmware.as_str(), "1.02");
     for region in kenwood_tmd750::protocol::mcp::regions::menu_regions() {
         for page in region.pages() {
             assert_eq!(

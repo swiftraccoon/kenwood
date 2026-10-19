@@ -169,7 +169,7 @@ pub(super) async fn run(endpoint: &SerialCandidate, baud: u32, request: &Request
     )
     .await;
     let report = Report {
-        format_version: 1,
+        format_version: 2,
         operation: "gateway_off_reentry_probe",
         software_version: env!("CARGO_PKG_VERSION"),
         started_at_utc,

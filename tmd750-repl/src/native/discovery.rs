@@ -10,6 +10,8 @@ use std::sync::atomic::AtomicBool;
 #[cfg(any(target_os = "macos", test))]
 use std::sync::atomic::Ordering;
 
+#[cfg(any(target_os = "macos", test))]
+use kenwood_tmd750::transport::bluetooth::{BluetoothSelectionError, select_paired_device};
 use kenwood_transport::bluetooth::BluetoothAddress;
 #[cfg(any(target_os = "macos", test))]
 use kenwood_transport::bluetooth::BluetoothOpenCancellation;
@@ -142,51 +144,24 @@ where
     })
 }
 
-/// Bluetooth remote names accepted for automatic TM-D750 selection.
-///
-/// A TM-D750 on firmware 1.02 advertises `stm32mp1-ex5240`, the name of its
-/// system-on-chip, rather than `TM-D750`. A name selects a candidate address
-/// only; the model is confirmed by the CAT identity exchange.
-#[cfg(any(target_os = "macos", test))]
-const CANDIDATE_NAMES: [&str; 2] = ["TM-D750", "stm32mp1-ex5240"];
-
-/// Select the one paired device whose name is in `CANDIDATE_NAMES`.
+/// Select the one paired device the library's TM-D750 names identify.
 ///
 /// Returns `CommandError` when no name matches, when several do, or when the
-/// chosen address appears more than once in the inventory.
+/// chosen address appears more than once in the inventory, each with the
+/// `--bluetooth-address` next action.
 #[cfg(any(target_os = "macos", test))]
 fn select<'a>(
     devices: impl IntoIterator<Item = (&'a BluetoothAddress, &'a str)>,
 ) -> Result<BluetoothAddress, CommandError> {
-    let devices: Vec<_> = devices.into_iter().collect();
-    let matching: Vec<_> = devices
-        .iter()
-        .copied()
-        .filter(|(_, name)| CANDIDATE_NAMES.contains(name))
-        .collect();
-    let Some((address, _)) = matching.first() else {
-        return Err(CommandError(
-            "no paired TM-D750 candidate named TM-D750 or stm32mp1-ex5240; pair the radio or select its exact address with --bluetooth-address".to_owned(),
-        ));
-    };
-    if matching.len() != 1
-        || devices
-            .iter()
-            .filter(|(candidate, _)| *candidate == *address)
-            .count()
-            != 1
-    {
-        let candidates = devices
-            .iter()
-            .filter(|(candidate, name)| CANDIDATE_NAMES.contains(name) || *candidate == *address)
-            .map(|(address, name)| format!("{name:?} ({address})"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(CommandError(format!(
-            "paired TM-D750 selection is ambiguous: {candidates}; select one exact address with --bluetooth-address"
-        )));
-    }
-    Ok((*address).clone())
+    select_paired_device(devices).cloned().map_err(|error| {
+        let next = match error {
+            BluetoothSelectionError::NoCandidate => {
+                "pair the radio or select its exact address with --bluetooth-address"
+            }
+            _ => "select one exact address with --bluetooth-address",
+        };
+        CommandError(format!("{error}; {next}"))
+    })
 }
 
 #[cfg(any(target_os = "macos", test))]

@@ -621,7 +621,7 @@ async fn fresh_check_gives_up_at_the_exit_reply_bound() -> TestResult {
         .and_then(|fresh| fresh.operation_error.as_ref())
         .ok_or("fresh check recorded no error")?
         .to_string();
-    assert!(error.contains("25000"), "{error}");
+    assert!(error.contains("after 25s"), "{error}");
     assert_eq!(writes(&events, 1), [b"ID\r".as_slice()]);
     Ok(())
 }
@@ -1011,7 +1011,7 @@ async fn configuration_backup_recovers_on_the_discovered_channel_and_loads_offli
     );
     report.publish(&mut File::create_new(&path)?)?;
     let snapshot = crate::mcp::snapshot::Snapshot::load(&path)?;
-    assert_eq!(snapshot.identity.firmware.as_str(), "1.02");
+    assert_eq!(snapshot.identity().firmware.as_str(), "1.02");
     let memory = snapshot.menu_snapshot()?;
     assert_eq!(memory.pages().len(), 1138);
     let name = kenwood_tmd750::memory::menu_field("pm.PmName1").ok_or("PM1 registry field")?;

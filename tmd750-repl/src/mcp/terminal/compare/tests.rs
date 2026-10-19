@@ -21,7 +21,6 @@ fn pair(directory: &Path, before: &MemoryImage, after: &MemoryImage) -> AppResul
         after: after_path,
         slot: SlotIndex::new(0)?,
         interface: UsbInterface::MainUsb,
-        interpret_unqualified: true,
         output: None,
     })
 }
@@ -237,60 +236,54 @@ fn failed_enum_format_and_utf8_interpretations_preserve_the_raw_difference() -> 
 }
 
 #[test]
-fn unqualified_firmware_requires_explicit_opt_in_before_output_creation() -> TestResult {
+fn a_comparison_writes_its_report_once_and_preserves_both_sources() -> TestResult {
     let directory = tempfile::tempdir()?;
     let image = blank_fixture()?;
     let mut request = pair(directory.path(), &image, &image)?;
     let output = directory.path().join("comparison.json");
     request.output = Some(output.clone());
-    request.interpret_unqualified = false;
     let original_before = std::fs::read(&request.before)?;
     let original_after = std::fs::read(&request.after)?;
+    run(&request)?;
+    let report: serde_json::Value = serde_json::from_slice(&std::fs::read(&output)?)?;
+    assert_eq!(report.get("format_version"), Some(&serde_json::json!(2)));
+    assert!(
+        report.get("qualification").is_none(),
+        "format 2 carries no layout qualification"
+    );
+    let written = std::fs::read(&output)?;
     assert!(
         run(&request).is_err(),
-        "firmware 1.02 requires explicit unqualified interpretation"
+        "an existing report must not be overwritten"
     );
-    assert!(
-        !output.exists(),
-        "refused comparisons must not create an output report"
-    );
+    assert_eq!(std::fs::read(&output)?, written);
     assert_eq!(
         std::fs::read(&request.before)?,
         original_before,
-        "refusal must preserve the earlier source"
+        "the earlier source must be unchanged"
     );
     assert_eq!(
         std::fs::read(&request.after)?,
         original_after,
-        "refusal must preserve the later source"
-    );
-    request.interpret_unqualified = true;
-    assert_eq!(
-        build_report(&request)?.qualification,
-        "unqualified_interpretation",
-        "opt-in must retain the unqualified label"
+        "the later source must be unchanged"
     );
     Ok(())
 }
 
 #[test]
-fn registry_label_match_is_preserved_without_claiming_live_qualification() -> TestResult {
+fn every_firmware_is_decoded_with_the_one_registry_layout() -> TestResult {
     let directory = tempfile::tempdir()?;
     let image = blank_fixture()?;
-    let mut request = pair(directory.path(), &image, &image)?;
+    let request = pair(directory.path(), &image, &image)?;
     identity_component(&request.before, "firmware", "1.00")?;
     identity_component(&request.after, "firmware", "1.00")?;
-    request.interpret_unqualified = false;
     let report = build_report(&request)?;
-    assert_eq!(
-        report.qualification, "registry_target_matched",
-        "exact registry identity must be distinguished from an override"
+    assert!(
+        matches!(report.before.assessment, AssessmentEvidence::Decoded { .. }),
+        "{:?}",
+        report.before.assessment
     );
     let console = describe(&report).join("\n");
-    assert!(
-        console.contains("Layout interpretation: registry_target_matched"),
-        "the console must name the layout the values were decoded with: {console}"
-    );
     assert!(
         console.contains("names the model and firmware, not the physical unit"),
         "matching identities must retain their stated limit: {console}"
@@ -522,7 +515,6 @@ fn parser_preserves_explicit_comparison_scope_and_whitespace_paths() -> TestResu
         "5",
         "--interface",
         "panel-usb",
-        "--interpret-unqualified",
         "--output",
         "Private Report.json",
     ])?;
@@ -548,10 +540,6 @@ fn parser_preserves_explicit_comparison_scope_and_whitespace_paths() -> TestResu
         parsed.interface,
         UsbInterface::PanelUsb,
         "the requested connector must be retained"
-    );
-    assert!(
-        parsed.interpret_unqualified,
-        "explicit layout opt-in must survive parsing"
     );
     assert_eq!(
         parsed.output,
@@ -581,6 +569,7 @@ fn parser_requires_complete_scope_and_rejects_live_or_arbitrary_write_options() 
         &["--restore"][..],
         &["--address", "10"][..],
         &["--apply"][..],
+        &["--interpret-unqualified"][..],
     ] {
         let arguments: Vec<_> = valid.iter().chain(extra).copied().collect();
         assert!(

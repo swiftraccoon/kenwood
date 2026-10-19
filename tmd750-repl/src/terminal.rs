@@ -1,7 +1,6 @@
 //! Terminal guidance bound to observed CAT state and the selected USB endpoint.
 
 use kenwood_tmd750::DvGatewayMode;
-use kenwood_tmd750::memory::MCP_D750_SCHEMA_FIRMWARE;
 use kenwood_tmd750::transport::{
     KENWOOD_VID, SerialCandidate, TMD750_MAIN_PID, TMD750_PANEL_PID, discover_serial,
 };
@@ -60,8 +59,6 @@ pub(super) fn instructions(connection: UsbConnection) -> String {
     format!(
         "Automatic Terminal Mode entry is disabled: this build writes no\n\
          Terminal or routing setting.\n\
-         The current MCP schema label is {MCP_D750_SCHEMA_FIRMWARE}, the label\n\
-         the registry was extracted against, not a vendor version limit.\n\
          Configure the radio manually, in this order:\n\
          Menu 980: COM+AF In/Out.\n\
          {}\n\
@@ -143,12 +140,8 @@ mod tests {
     }
 
     #[test]
-    fn gateway_guidance_distinguishes_schema_label_from_vendor_limit_and_cat_recovery() {
+    fn gateway_guidance_states_the_write_scope_and_the_cat_gap() {
         let guidance = instructions(UsbConnection::MainUnit);
-        assert!(
-            guidance.contains("not a vendor version limit"),
-            "declared schema provenance must not become a vendor restriction"
-        );
         assert!(
             guidance.contains("this build writes no"),
             "operators must be told that no Terminal or routing setting is written"

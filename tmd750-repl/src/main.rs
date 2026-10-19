@@ -125,6 +125,7 @@ enum Command {
     Terminal,
     Read(cat::Read),
     Write(cat::Write),
+    Action(cat::Action),
     Quit,
 }
 
@@ -258,7 +259,8 @@ async fn run_command(cli: &Cli, one_shot: Option<Command>) -> AppResult<()> {
             | Command::Fm(_)
             | Command::Gateway
             | Command::Read(_)
-            | Command::Write(_) => {}
+            | Command::Write(_)
+            | Command::Action(_) => {}
             Command::DstarStart(_) => unreachable!("D-STAR startup was dispatched above"),
         }
     }
@@ -322,7 +324,7 @@ async fn run_native(cli: &Cli, command: Option<Command>) -> AppResult<()> {
                 return mcp::run_native_write(&endpoint, write).await;
             }
             _ => return Err(Box::new(CommandError(
-                "native Bluetooth supports mcp probe, backup, text set and menu apply; the fixed trials and the reentry probe require USB"
+                "native Bluetooth supports mcp probe, backup, text set and menu apply; the reentry probe, repeater set, channel-names apply and callsign-list apply require USB"
                     .to_owned(),
             ))),
         };
@@ -347,7 +349,8 @@ async fn run_native(cli: &Cli, command: Option<Command>) -> AppResult<()> {
             | Command::Dv(_)
             | Command::Fm(_)
             | Command::Read(_)
-            | Command::Write(_)),
+            | Command::Write(_)
+            | Command::Action(_)),
         ) => {
             let endpoint = resolve_native(cli).await?;
             return native::repl::run(&endpoint, Some(command)).await;
@@ -669,6 +672,16 @@ async fn execute_command<T: Transport>(
             policy.admit_mode_write(radio).await?;
             cat::execute_write(radio, write).await?;
         }
+        Command::Action(cat::Action::Receive) => {
+            cat::execute_action(radio, cat::Action::Receive).await?;
+        }
+        Command::Action(action) => {
+            policy.admit_mode_write(radio).await?;
+            cat::execute_action(radio, action).await?;
+            if action == cat::Action::PowerOff {
+                return Ok(LoopAction::Quit);
+            }
+        }
         Command::Quit => return Ok(LoopAction::Quit),
     }
     Ok(LoopAction::Continue)
@@ -697,7 +710,7 @@ fn print_help() {
         "Press Ctrl-C for the D-STAR prompt, then dstar stop to close it."
     ));
     output::line(format_args!(
-        "Startup only: mcp probe [--output NEW_DIRECTORY], mcp reentry-probe --help, mcp backup, mcp menu --help, mcp text --help, mcp terminal --help, mcp pm1-trial --help, mcp my1-trial --help, mcp terminal-exit-trial --help"
+        "Startup only: mcp probe [--output NEW_DIRECTORY], mcp reentry-probe --help, mcp backup, mcp menu --help, mcp text --help, mcp terminal --help"
     ));
     output::line(format_args!(
         "Probe/backup capture MCP reads and verify exit; text list/show/preview and terminal preflight inspect local backups."
@@ -706,10 +719,7 @@ fn print_help() {
         "Text set changes PM1's name, PM-Off MY1 or one channel's name (--channel), with an explicit port, current backup, expected text, and --apply."
     ));
     output::line(format_args!(
-        "PM1 trial performs one fixed PM1 rename and restores the original name; no other field is writable."
-    ));
-    output::line(format_args!(
-        "Automatic Bluetooth dstar stop rewrites the Terminal and routing pages it changed, over USB; the separate Terminal exit trial is not invoked."
+        "Automatic Bluetooth dstar stop rewrites the Terminal and routing pages it changed, over USB."
     ));
 }
 
@@ -726,6 +736,7 @@ fn parse_command(line: &str) -> Result<Option<Command>, CommandError> {
         return match parsed.map_err(|error| CommandError(error.0))? {
             cat::Parsed::Read(read) => Ok(Some(Command::Read(read))),
             cat::Parsed::Write(write) => Ok(Some(Command::Write(write))),
+            cat::Parsed::Action(action) => Ok(Some(Command::Action(action))),
         };
     }
     let lowercase: Vec<String> = typed.iter().map(|word| word.to_ascii_lowercase()).collect();
@@ -1134,14 +1145,8 @@ mod tests {
         assert_eq!(parse_command("dstar terminal"), Ok(Some(Command::Terminal)));
         let guidance = terminal::instructions(terminal::UsbConnection::Unknown);
         assert!(
-            guidance.contains("disabled")
-                && guidance.contains(&format!(
-                    "schema label is {}",
-                    kenwood_tmd750::memory::MCP_D750_SCHEMA_FIRMWARE
-                ))
-                && guidance.contains("this build writes no")
-                && guidance.contains("not a vendor version limit"),
-            "terminal guidance must state that no Terminal or routing setting is written, without inventing a live identity or vendor version restriction"
+            guidance.contains("disabled") && guidance.contains("this build writes no"),
+            "terminal guidance must state that no Terminal or routing setting is written"
         );
     }
 
@@ -1225,6 +1230,59 @@ mod tests {
         let action = execute_command(&mut radio, Command::Gateway, CommandPolicy::Direct).await?;
 
         assert_eq!(action, LoopAction::Continue);
+        radio.into_transport().assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn power_off_ends_the_session_once_acknowledged() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"ID\r", b"ID TM-D750\r");
+        mock.expect(b"FV\r", b"FV 1.02\r");
+        mock.expect(b"TY\r", b"TY K,2,1\r");
+        mock.expect(b"PS 0\r", b"PS 0\r");
+        let mut radio = Radio::new(mock);
+
+        let action = execute_command(
+            &mut radio,
+            Command::Action(cat::Action::PowerOff),
+            CommandPolicy::Direct,
+        )
+        .await?;
+
+        assert_eq!(action, LoopAction::Quit);
+        radio.into_transport().assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_receive_skips_the_gateway_read_that_transmit_requires() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"RX\r", b"RX\r");
+        mock.expect(b"GW\r", b"GW 0\r");
+        mock.expect(b"ID\r", b"ID TM-D750\r");
+        mock.expect(b"FV\r", b"FV 1.02\r");
+        mock.expect(b"TY\r", b"TY K,2,1\r");
+        mock.expect(b"TX\r", b"TX 1\r");
+        mock.expect(b"RX\r", b"RX\r");
+        let mut radio = Radio::new(mock);
+        let cancelled = AtomicBool::new(false);
+        let policy = CommandPolicy::GatewayOff(&cancelled);
+
+        let released =
+            execute_command(&mut radio, Command::Action(cat::Action::Receive), policy).await?;
+        let hold = cat::TransmitHold::new(std::time::Duration::from_millis(1))?;
+        let transmitted = execute_command(
+            &mut radio,
+            Command::Action(cat::Action::Transmit(hold)),
+            policy,
+        )
+        .await?;
+
+        assert_eq!(
+            (released, transmitted),
+            (LoopAction::Continue, LoopAction::Continue)
+        );
         radio.into_transport().assert_complete();
         Ok(())
     }

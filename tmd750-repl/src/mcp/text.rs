@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 use kenwood_tmd750::memory::{
-    StringEncoding, TextImage, TextLayoutQualification, TextMetadata, TextPreview, TextScope,
-    TextScopeKind, TextSetting, menu_field,
+    StringEncoding, TextImage, TextMetadata, TextPreview, TextScope, TextScopeKind, TextSetting,
+    menu_field,
 };
 use kenwood_tmd750::transport::SerialCandidate;
 use kenwood_tmd750::{Identity, MemoryImage, SlotIndex};
@@ -101,10 +101,6 @@ struct Selection {
     #[arg(long, value_name = "REPORT")]
     backup: PathBuf,
 
-    /// Decode firmware outside the registry label. Required for firmware 1.02.
-    #[arg(long)]
-    interpret_unqualified: bool,
-
     /// Zero-based programmable-memory slot, required only for per-slot settings.
     #[arg(long, value_parser = parse_slot, value_name = "0..5")]
     slot: Option<SlotIndex>,
@@ -158,12 +154,7 @@ impl Selection {
         let image = snapshot
             .image_for(&field.descriptor, self.slot)
             .map_err(|error| setting_error(self.setting, metadata, error.as_ref()))?;
-        let view = if self.interpret_unqualified {
-            TextImage::interpret_unqualified(image, &snapshot.identity.firmware)
-        } else {
-            TextImage::new(image, &snapshot.identity.firmware)?
-        };
-        Ok((view, scope))
+        Ok((TextImage::new(image), scope))
     }
 }
 
@@ -179,7 +170,7 @@ fn run(request: &TextRequest) -> AppResult<()> {
             let value = view
                 .read(selection.setting, scope)
                 .map_err(|error| setting_error(selection.setting, metadata, &error))?;
-            print_provenance(&snapshot.identity, view.qualification());
+            print_provenance(snapshot.identity());
             output::line(format_args!(
                 "{}{}: {}",
                 selection.setting,
@@ -215,7 +206,7 @@ fn list() -> AppResult<()> {
         ));
     }
     output::line(format_args!(
-        "This legacy text view requires --interpret-unqualified on firmware 1.02. Dedicated pm-name-1, PM-Off MY1 and channel-name setters: mcp text set --help. General menu discovery, preview, and ordinary updates: mcp menu --help."
+        "PM1 name, PM Off MY1 and channel-name setters: mcp text set --help. Menu discovery, preview and updates: mcp menu --help."
     ));
     Ok(())
 }
@@ -237,12 +228,12 @@ fn preview(request: &PreviewRequest) -> AppResult<()> {
     let image = snapshot
         .image_for(&field.descriptor, selection.slot)
         .map_err(|error| setting_error(selection.setting, metadata, error.as_ref()))?;
-    let artifact = PreviewArtifact::new(&selection.backup, &snapshot.identity, image, &preview)?;
+    let artifact = PreviewArtifact::new(&selection.backup, snapshot.identity(), image, &preview)?;
     if let Some(path) = &request.output {
         save_preview(path, &artifact)?;
         output::line(format_args!("Offline patch saved: {}.", path.display()));
     }
-    print_provenance(&snapshot.identity, preview.qualification());
+    print_provenance(snapshot.identity());
     output::line(format_args!(
         "{}{}; before: {}; after: {}.",
         preview.setting(),
@@ -269,14 +260,10 @@ fn setting_error(
     )
 }
 
-fn print_provenance(identity: &Identity, qualification: TextLayoutQualification) {
+fn print_provenance(identity: &Identity) {
     output::line(format_args!(
         "Backup identity: {}; firmware {}; type {}.",
         identity.model, identity.firmware, identity.radio_type
-    ));
-    output::line(format_args!(
-        "{}",
-        Qualification::from(qualification).description()
     ));
 }
 
@@ -288,35 +275,6 @@ fn scope_label(scope: TextScope) -> String {
 }
 
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum Qualification {
-    RegistryTargetMatched,
-    UnqualifiedInterpretation,
-}
-
-impl Qualification {
-    const fn description(&self) -> &'static str {
-        match self {
-            Self::RegistryTargetMatched => {
-                "Registry firmware label matched this backup's firmware."
-            }
-            Self::UnqualifiedInterpretation => {
-                "Firmware outside the registry label; decoded with --interpret-unqualified."
-            }
-        }
-    }
-}
-
-impl From<TextLayoutQualification> for Qualification {
-    fn from(value: TextLayoutQualification) -> Self {
-        match value {
-            TextLayoutQualification::RegistryTargetMatched => Self::RegistryTargetMatched,
-            TextLayoutQualification::UnqualifiedInterpretation => Self::UnqualifiedInterpretation,
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
 struct PreviewArtifact {
     format_version: u8,
     operation: &'static str,
@@ -324,7 +282,6 @@ struct PreviewArtifact {
     radio_applied: bool,
     source_backup: PathBuf,
     identity: IdentityEvidence,
-    qualification: Qualification,
     setting: &'static str,
     slot: Option<u8>,
     before: String,
@@ -386,13 +343,12 @@ impl PreviewArtifact {
             })
             .collect::<AppResult<Vec<_>>>()?;
         Ok(Self {
-            format_version: 1,
+            format_version: 2,
             operation: "offline_text_preview",
             offline_only: true,
             radio_applied: false,
             source_backup: source.to_owned(),
             identity: IdentityEvidence::from(identity),
-            qualification: preview.qualification().into(),
             setting: preview.setting().key(),
             slot: match preview.scope() {
                 TextScope::Global => None,
@@ -433,7 +389,6 @@ mod tests {
             "preview",
             "--backup",
             "Capture Case/report.json",
-            "--interpret-unqualified",
             "--slot",
             "5",
             "dstar-message-1",
@@ -470,7 +425,6 @@ mod tests {
     fn global_and_per_slot_scope_require_explicit_correct_selection() -> TestResult {
         let mut selection = Selection {
             backup: PathBuf::from("capture.json"),
-            interpret_unqualified: true,
             slot: None,
             setting: TextSetting::DstarMessage1,
         };
@@ -486,13 +440,14 @@ mod tests {
     }
 
     #[test]
-    fn preview_artifact_preserves_firmware_hypothesis_and_exact_byte_comparison() -> TestResult {
+    fn preview_artifact_records_identity_and_exact_byte_comparison() -> TestResult {
         let identity = identity()?;
         let image = MemoryImage::from_bytes(vec![0; kenwood_tmd750::types::IMAGE_LENGTH])?;
-        let view = TextImage::interpret_unqualified(&image, &identity.firmware);
-        let preview = view.preview(TextSetting::PmName1, TextScope::Global, "Portable")?;
+        let preview =
+            TextImage::new(&image).preview(TextSetting::PmName1, TextScope::Global, "Portable")?;
         let artifact = PreviewArtifact::new(Path::new("backup.json"), &identity, &image, &preview)?;
         let json = serde_json::to_value(&artifact)?;
+        assert_eq!(json.get("format_version"), Some(&serde_json::json!(2)));
         assert_eq!(
             json.get("source_backup"),
             Some(&serde_json::json!("backup.json"))
@@ -501,9 +456,9 @@ mod tests {
             json.pointer("/identity/firmware"),
             Some(&serde_json::json!("1.02"))
         );
-        assert_eq!(
-            json.get("qualification"),
-            Some(&serde_json::json!("unqualified_interpretation"))
+        assert!(
+            json.get("qualification").is_none(),
+            "format 2 carries no layout qualification"
         );
         assert_eq!(json.get("offline_only"), Some(&serde_json::json!(true)));
         assert_eq!(json.get("radio_applied"), Some(&serde_json::json!(false)));
@@ -528,11 +483,8 @@ mod tests {
         let path = directory.path().join("patch.json");
         let identity = identity()?;
         let image = MemoryImage::from_bytes(vec![0; kenwood_tmd750::types::IMAGE_LENGTH])?;
-        let preview = TextImage::interpret_unqualified(&image, &identity.firmware).preview(
-            TextSetting::PmName1,
-            TextScope::Global,
-            "Portable",
-        )?;
+        let preview =
+            TextImage::new(&image).preview(TextSetting::PmName1, TextScope::Global, "Portable")?;
         let artifact = PreviewArtifact::new(Path::new("backup.json"), &identity, &image, &preview)?;
         save_preview(&path, &artifact)?;
         let original = std::fs::read(&path)?;
@@ -573,7 +525,6 @@ mod tests {
         PreviewRequest {
             selection: Selection {
                 backup: backup.to_owned(),
-                interpret_unqualified: false,
                 slot: None,
                 setting: TextSetting::PmName1,
             },
@@ -583,7 +534,7 @@ mod tests {
     }
 
     #[test]
-    fn firmware_refusal_and_explicit_preview_preserve_source_and_existing_output() -> TestResult {
+    fn a_preview_writes_its_patch_once_and_preserves_the_source() -> TestResult {
         let directory = tempfile::tempdir()?;
         let backup = directory.path().join("source.json");
         let output = directory.path().join("patch.json");
@@ -593,21 +544,10 @@ mod tests {
         )?;
         let original = std::fs::read(&backup)?;
         let mut request = preview_request(&backup, &output);
-        let refusal = preview(&request);
-        assert!(
-            refusal.is_err(),
-            "firmware 1.02 must require explicit interpretation"
-        );
-        assert!(!output.exists(), "refusal must not create a patch file");
-
-        request.selection.interpret_unqualified = true;
         preview(&request)?;
         let patch_bytes = std::fs::read(&output)?;
         let patch: serde_json::Value = serde_json::from_slice(&patch_bytes)?;
-        assert_eq!(
-            patch.get("qualification"),
-            Some(&serde_json::json!("unqualified_interpretation"))
-        );
+        assert_eq!(patch.get("format_version"), Some(&serde_json::json!(2)));
         assert_eq!(
             patch.pointer("/identity/firmware"),
             Some(&serde_json::json!("1.02"))
@@ -651,8 +591,7 @@ mod tests {
             let backup = directory.path().join(format!("source-{byte}.json"));
             let output = directory.path().join(format!("patch-{byte}.json"));
             write_report(&mut capture::create_private_file(&backup)?, &document)?;
-            let mut request = preview_request(&backup, &output);
-            request.selection.interpret_unqualified = true;
+            let request = preview_request(&backup, &output);
             let result = preview(&request);
             assert!(
                 result.is_err(),

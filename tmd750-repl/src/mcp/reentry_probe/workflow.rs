@@ -11,7 +11,7 @@ use kenwood_tmd750::{DvGatewayMode, McpGatewayOffProbeReport, Radio};
 use kenwood_transport::Transport;
 use serde::Serialize;
 
-use super::super::reconnect::{self, Backend, PostExitVerification, SkipReason};
+use super::super::reconnect::{self, Backend, ReadinessVerification, SkipReason};
 use super::super::{Failure, ProbeEvidence, close_transport, verification_eligibility};
 use crate::capture::{CaptureTransport, Event, Recorder, TranscriptSummary};
 use crate::output;
@@ -30,7 +30,7 @@ pub(super) struct Session {
     open_error: Option<Failure>,
     close_error: Option<Failure>,
     synchronization_error: Option<Failure>,
-    post_exit: PostExitVerification,
+    post_exit: ReadinessVerification,
 }
 
 impl Session {
@@ -42,7 +42,7 @@ impl Session {
             open_error: None,
             close_error: None,
             synchronization_error: None,
-            post_exit: PostExitVerification::skipped(
+            post_exit: ReadinessVerification::skipped(
                 SkipReason::OriginalOpenFailed,
                 captures.post_exit.summary(),
             ),
@@ -207,7 +207,7 @@ async fn run_session(
         } else {
             SkipReason::Cancelled
         };
-        result.post_exit = PostExitVerification::skipped(reason, post_exit.summary());
+        result.post_exit = ReadinessVerification::skipped(reason, post_exit.summary());
         return result;
     }
     let connection = match backend.open(endpoint, baud) {
@@ -234,7 +234,7 @@ async fn run_session(
         } else {
             SkipReason::Cancelled
         };
-        result.post_exit = PostExitVerification::skipped(reason, post_exit.summary());
+        result.post_exit = ReadinessVerification::skipped(reason, post_exit.summary());
         return result;
     }
     let core = radio
@@ -258,7 +258,7 @@ async fn verify(
     result: &Session,
     post_exit: Recorder<File>,
     cancelled: &AtomicBool,
-) -> PostExitVerification {
+) -> ReadinessVerification {
     let eligibility = if result.synchronization_error.is_some() {
         Err(SkipReason::OriginalCaptureIncomplete)
     } else if core.gateway_mode != Some(DvGatewayMode::Off) {
@@ -273,12 +273,12 @@ async fn verify(
     };
     match eligibility {
         Ok(identity) => {
-            reconnect::verify_required_gateway_off(
+            reconnect::verify_readiness_gateway_off(
                 backend, endpoint, baud, identity, post_exit, cancelled,
             )
             .await
         }
-        Err(reason) => PostExitVerification::skipped(reason, post_exit.summary()),
+        Err(reason) => ReadinessVerification::skipped(reason, post_exit.summary()),
     }
 }
 

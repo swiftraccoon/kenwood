@@ -1,16 +1,18 @@
 //! Startup-only MCP workflows and offline configuration inspection.
 
 pub(crate) mod backup;
+mod callsign_list;
+mod channel_names;
 pub(crate) mod fixed;
 mod link;
 mod menu;
 mod menu_apply;
-mod pm1_trial;
+mod page_apply;
 pub(crate) mod reconnect;
 mod reentry_probe;
+mod repeater;
 pub(crate) mod snapshot;
 mod terminal;
-mod terminal_exit_trial;
 mod text;
 mod text_set;
 
@@ -58,12 +60,13 @@ pub(crate) enum McpCommand {
     Text(text::TextRequest),
     /// Inspect captured Terminal settings offline; never activates the gateway.
     Terminal(terminal::TerminalRequest),
-    /// Rename PM1 to PC TEXT TEST, then restore the original name.
-    Pm1Trial(pm1_trial::TrialRequest),
-    /// Set PM Off MY1 to KQ4NIT, then restore the empty value.
-    My1Trial(pm1_trial::My1TrialRequest),
-    /// Write DV Gateway Off from Terminal on one page, then verify over CAT.
-    TerminalExitTrial(terminal_exit_trial::Request),
+    /// List or preview the D-STAR repeater lists offline, or edit one record.
+    Repeater(repeater::RepeaterRequest),
+    /// Preview channel names offline, or write them in one session.
+    ChannelNames(channel_names::ChannelNamesRequest),
+    /// List or preview the D-STAR callsign list offline, or write an edited
+    /// list in one session.
+    CallsignList(callsign_list::CallsignListRequest),
 }
 
 impl McpCommand {
@@ -75,17 +78,11 @@ impl McpCommand {
         match self {
             Self::Text(request) => request.validate_endpoint_selection(explicit_port),
             Self::Menu(request) => request.validate_endpoint_selection(explicit_port),
+            Self::Repeater(request) => request.validate_endpoint_selection(explicit_port),
+            Self::ChannelNames(request) => request.validate_endpoint_selection(explicit_port),
+            Self::CallsignList(request) => request.validate_endpoint_selection(explicit_port),
             Self::Terminal(_) => Ok(()),
-            Self::Probe(_)
-            | Self::Backup(_)
-            | Self::ReentryProbe(_)
-            | Self::Pm1Trial(_)
-            | Self::My1Trial(_)
-            | Self::TerminalExitTrial(_)
-                if explicit_port =>
-            {
-                Ok(())
-            }
+            Self::Probe(_) | Self::Backup(_) | Self::ReentryProbe(_) if explicit_port => Ok(()),
             Self::Probe(_) => Err(Box::new(crate::CommandError(
                 "mcp probe requires an explicit --port before mcp; USB paths are not physical radio identities"
                     .to_owned(),
@@ -95,15 +92,6 @@ impl McpCommand {
             ))),
             Self::ReentryProbe(_) => Err(Box::new(crate::CommandError(
                 "mcp reentry-probe requires an explicit --port before mcp".to_owned(),
-            ))),
-            Self::Pm1Trial(_) => Err(Box::new(crate::CommandError(
-                "mcp pm1-trial requires an explicit --port before mcp".to_owned(),
-            ))),
-            Self::My1Trial(_) => Err(Box::new(crate::CommandError(
-                "mcp my1-trial requires an explicit --port before mcp".to_owned(),
-            ))),
-            Self::TerminalExitTrial(_) => Err(Box::new(crate::CommandError(
-                "mcp terminal-exit-trial requires an explicit --port before mcp".to_owned(),
             ))),
         }
     }
@@ -117,13 +105,11 @@ pub(crate) fn run_offline(request: &McpCommand) -> Option<AppResult<()>> {
     match request {
         McpCommand::Text(request) => text::run_offline(request),
         McpCommand::Menu(request) => menu::run_offline(request),
+        McpCommand::Repeater(request) => repeater::run_offline(request),
+        McpCommand::ChannelNames(request) => channel_names::run_offline(request),
+        McpCommand::CallsignList(request) => callsign_list::run_offline(request),
         McpCommand::Terminal(request) => Some(terminal::run(request)),
-        McpCommand::Probe(_)
-        | McpCommand::ReentryProbe(_)
-        | McpCommand::Backup(_)
-        | McpCommand::Pm1Trial(_)
-        | McpCommand::My1Trial(_)
-        | McpCommand::TerminalExitTrial(_) => None,
+        McpCommand::Probe(_) | McpCommand::ReentryProbe(_) | McpCommand::Backup(_) => None,
     }
 }
 
@@ -382,12 +368,14 @@ pub(crate) async fn run(
         McpCommand::Backup(request) => backup::run(endpoint, baud, request).await,
         McpCommand::Text(request) => text::run_selected(endpoint, baud, request).await,
         McpCommand::Menu(request) => menu::run_selected(endpoint, baud, request).await,
-        McpCommand::Terminal(request) => terminal::run(request),
-        McpCommand::Pm1Trial(request) => pm1_trial::run(endpoint, baud, request).await,
-        McpCommand::My1Trial(request) => pm1_trial::run_my1(endpoint, baud, request).await,
-        McpCommand::TerminalExitTrial(request) => {
-            terminal_exit_trial::run(endpoint, baud, request).await
+        McpCommand::Repeater(request) => repeater::run_selected(endpoint, baud, request).await,
+        McpCommand::ChannelNames(request) => {
+            channel_names::run_selected(endpoint, baud, request).await
         }
+        McpCommand::CallsignList(request) => {
+            callsign_list::run_selected(endpoint, baud, request).await
+        }
+        McpCommand::Terminal(request) => terminal::run(request),
     }
 }
 

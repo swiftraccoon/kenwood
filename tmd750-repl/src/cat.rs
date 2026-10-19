@@ -1,4 +1,5 @@
-//! Interactive vocabulary for the typed CAT reads and verified writes.
+//! Interactive vocabulary for the typed CAT reads, verified writes and
+//! transmit actions.
 //!
 //! Each word maps to one library accessor. Band-indexed words take an
 //! optional `a` or `b` (Band A is the default) before the value; a word
@@ -6,17 +7,19 @@
 //! case, except callsign and memo text, which is sent exactly as typed.
 
 use std::fmt;
+use std::time::Duration;
 
 use kenwood_tmd750::types::{
     AmHighCut, AprsCallsign, BacklightControl, BandControl, BandDisplay, BeaconMethod,
     CatMemoryChannelRecord, DstarCallsignEntry, DstarSlot, Frequency, GpsSettings,
     MemoryChannelAddress, MyPositionSelection, NmeaSentence, NmeaSentences, PacketDataRate,
-    PowerLevel, SquelchLevel, StepSize, TuningMode, VoxDelay, VoxGain,
+    PowerLevel, SelectableTncMode, SquelchLevel, StepSize, TncMode, TncState, TuningMode, VoxDelay,
+    VoxGain,
 };
-use kenwood_tmd750::{Band, Error, Radio};
+use kenwood_tmd750::{Band, Error, ProtocolError, Radio};
 use kenwood_transport::Transport;
 
-use crate::output;
+use crate::{AppResult, CommandError, output};
 
 /// Help text for this vocabulary, one line per word.
 pub(crate) const HELP_LINES: &[&str] = &[
@@ -44,12 +47,23 @@ pub(crate) const HELP_LINES: &[&str] = &[
     "position [gps|1-5]: Read or select the APRS position source.",
     "data-rate [1200|9600]: Read or select the packet data speed.",
     "beacon [manual|ptt|auto|smart]: Read or select the beacon method.",
-    "tnc | vox: Read the TNC mode or the VOX state (read only).",
+    "tnc [a|b] [off|aprs|kiss]: Read or select the TNC mode and band.",
+    "vox [on|off]: Read the VOX settings or switch VOX.",
     "vox-delay [ms] | vox-gain [0-9]: Read or select VOX settings.",
     "gps [on|off on|off]: Read or select the GPS and its PC output.",
     "sentences [gga,gll,gsa,gsv,rmc,vtg|none]: Read or select NMEA.",
     "bluetooth [on|off]: Read or switch Bluetooth.",
+    "tx SECONDS: Key the PTT band 0.001 to 300 s; Ctrl-C releases.",
+    "rx: Release the transmitter.",
+    "send-beacon: Transmit one APRS beacon (TNC in APRS mode).",
+    "power-off: Switch the radio off and close the connection.",
 ];
+
+/// Longest hold `tx` accepts.
+pub(crate) const MAX_TRANSMIT_HOLD: Duration = Duration::from_secs(300);
+
+/// Shortest hold `tx` accepts.
+const MIN_TRANSMIT_HOLD: Duration = Duration::from_millis(1);
 
 /// A read-only query.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,6 +125,77 @@ pub(crate) enum Write {
     Gps(GpsSettings),
     Sentences(NmeaSentences),
     Bluetooth(bool),
+    Keying(KeyingWrite),
+}
+
+/// A setting that lets the radio key its transmitter without `tx`, verified by
+/// echo and readback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KeyingWrite {
+    /// Select the TNC mode and its data band (`TN`); APRS mode beacons under
+    /// the `Auto` and `SmartBeaconing` beacon methods.
+    Tnc(SelectableTncMode, Band),
+    /// Switch VOX (`VX`), which lets microphone audio key the transmitter.
+    Vox(bool),
+}
+
+/// A transmit-capable command the radio acknowledges without a readback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Action {
+    /// Key the PTT band (`TX`) for the hold, then release it (`RX`).
+    Transmit(TransmitHold),
+    /// Release the transmitter (`RX`).
+    Receive,
+    /// Transmit one APRS beacon (`BE`).
+    SendBeacon,
+    /// Switch the radio off (`PS 0`).
+    PowerOff,
+}
+
+/// How long `tx` keeps the transmitter keyed: [`MIN_TRANSMIT_HOLD`] through
+/// [`MAX_TRANSMIT_HOLD`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TransmitHold(Duration);
+
+impl TransmitHold {
+    /// Accept `hold` within the bounds.
+    pub(crate) fn new(hold: Duration) -> Result<Self, String> {
+        if (MIN_TRANSMIT_HOLD..=MAX_TRANSMIT_HOLD).contains(&hold) {
+            Ok(Self(hold))
+        } else {
+            Err(format!(
+                "tx holds from 0.001 to {} seconds, not {hold:?}",
+                MAX_TRANSMIT_HOLD.as_secs()
+            ))
+        }
+    }
+
+    /// The hold.
+    pub(crate) const fn duration(self) -> Duration {
+        self.0
+    }
+
+    /// Parse whole seconds with up to three decimals, such as `2` or `0.25`.
+    fn parse(value: &str) -> Result<Self, String> {
+        let invalid = || {
+            format!(
+                "tx takes seconds from 0.001 to {} with up to three decimals, not {value:?}",
+                MAX_TRANSMIT_HOLD.as_secs()
+            )
+        };
+        let (whole, fraction) = value.split_once('.').unwrap_or((value, "000"));
+        let digits =
+            |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+        if !digits(whole) || !digits(fraction) || fraction.len() > 3 {
+            return Err(invalid());
+        }
+        let seconds: u64 = whole.parse().map_err(|_| invalid())?;
+        let milliseconds: u64 = format!("{fraction:0<3}").parse().map_err(|_| invalid())?;
+        Duration::from_secs(seconds)
+            .checked_add(Duration::from_millis(milliseconds))
+            .ok_or_else(invalid)
+            .and_then(Self::new)
+    }
 }
 
 /// A MY callsign slot or APRS callsign change verified by echo and readback.
@@ -131,6 +216,7 @@ pub(crate) enum CallsignWrite {
 pub(crate) enum Parsed {
     Read(Read),
     Write(Write),
+    Action(Action),
 }
 
 /// Why a line of this vocabulary was refused.
@@ -165,7 +251,8 @@ pub(crate) fn parse(words: &[&str]) -> Option<Result<Parsed, ParseError>> {
     let result = parse_callsign_word(&word, rest)
         .or_else(|| parse_band_word(&word, &lowercase))
         .or_else(|| parse_setting_word(&word, &lowercase))
-        .or_else(|| parse_auxiliary_word(&word, &lowercase))?;
+        .or_else(|| parse_auxiliary_word(&word, &lowercase))
+        .or_else(|| parse_action_word(&word, &lowercase))?;
     Some(result.map_err(ParseError))
 }
 
@@ -357,10 +444,19 @@ fn parse_setting_word(word: &str, rest: &[&str]) -> WordResult {
 /// Identity, TNC, VOX, GPS and Bluetooth words.
 fn parse_auxiliary_word(word: &str, rest: &[&str]) -> WordResult {
     let result = match word {
-        "serial" => bare(rest, "serial", Read::Serial),
-        "clock" => bare(rest, "clock", Read::Clock),
-        "tnc" => bare(rest, "tnc", Read::Tnc),
-        "vox" => bare(rest, "vox", Read::Vox),
+        "serial" => bare(rest, "serial", Parsed::Read(Read::Serial)),
+        "clock" => bare(rest, "clock", Parsed::Read(Read::Clock)),
+        "tnc" => match rest {
+            [] => Ok(Parsed::Read(Read::Tnc)),
+            _ => match split_band(rest) {
+                (band, [mode]) => parse_tnc_mode(mode)
+                    .map(|mode| Parsed::Write(Write::Keying(KeyingWrite::Tnc(mode, band)))),
+                _ => Err("tnc takes an optional band letter, then off, aprs or kiss".to_owned()),
+            },
+        },
+        "vox" => global(rest, Read::Vox, |value| {
+            parse_switch(value).map(|enabled| Write::Keying(KeyingWrite::Vox(enabled)))
+        }),
         "vox-delay" => global(rest, Read::Vox, |value| {
             let milliseconds: u16 = value
                 .parse()
@@ -405,9 +501,27 @@ fn parse_auxiliary_word(word: &str, rest: &[&str]) -> WordResult {
     Some(result)
 }
 
-fn bare(rest: &[&str], word: &str, read: Read) -> Result<Parsed, String> {
+/// Transmit, release, beacon and power words.
+fn parse_action_word(word: &str, rest: &[&str]) -> WordResult {
+    let result = match word {
+        "tx" | "transmit" => match rest {
+            [hold] => TransmitHold::parse(hold).map(|hold| Parsed::Action(Action::Transmit(hold))),
+            _ => Err(format!(
+                "{word} takes the hold in seconds, 0.001 to {}",
+                MAX_TRANSMIT_HOLD.as_secs()
+            )),
+        },
+        "rx" | "receive" => bare(rest, word, Parsed::Action(Action::Receive)),
+        "send-beacon" => bare(rest, word, Parsed::Action(Action::SendBeacon)),
+        "power-off" => bare(rest, word, Parsed::Action(Action::PowerOff)),
+        _ => return None,
+    };
+    Some(result)
+}
+
+fn bare(rest: &[&str], word: &str, parsed: Parsed) -> Result<Parsed, String> {
     if rest.is_empty() {
-        Ok(Parsed::Read(read))
+        Ok(parsed)
     } else {
         Err(format!("{word} takes no argument"))
     }
@@ -477,6 +591,15 @@ fn parse_switch(value: &str) -> Result<bool, String> {
         "on" | "1" => Ok(true),
         "off" | "0" => Ok(false),
         other => Err(format!("expected on or off, not {other:?}")),
+    }
+}
+
+fn parse_tnc_mode(value: &str) -> Result<SelectableTncMode, String> {
+    match value {
+        "off" => Ok(SelectableTncMode::Off),
+        "aprs" => Ok(SelectableTncMode::Aprs),
+        "kiss" => Ok(SelectableTncMode::Kiss),
+        other => Err(format!("TNC mode must be off, aprs or kiss, not {other:?}")),
     }
 }
 
@@ -598,12 +721,9 @@ pub(crate) async fn execute_read<T: Transport>(
         ),
         Read::DataRate => format!("Packet data rate: {}.", radio.get_packet_data_rate().await?),
         Read::Beacon => format!("Beacon method: {}.", radio.get_beacon_method().await?),
-        Read::Tnc => {
-            let (mode, data_band) = radio.get_tnc_mode().await?;
-            format!("TNC: {mode}, data band {data_band} (read only).")
-        }
+        Read::Tnc => format!("TNC: {}.", radio.get_tnc_mode().await?),
         Read::Vox => format!(
-            "VOX: {}, delay {}, gain {} (VOX itself is read only).",
+            "VOX: {}, delay {}, gain {}.",
             radio.get_vox().await?,
             radio.get_vox_delay().await?,
             radio.get_vox_gain().await?
@@ -716,9 +836,93 @@ pub(crate) async fn execute_write<T: Transport>(
             radio.set_bluetooth(enabled).await?;
             format!("Bluetooth: {} {VERIFIED}.", switch(enabled))
         }
+        Write::Keying(write) => execute_keying_write(radio, write).await?,
     };
     output::line(format_args!("{text}"));
     Ok(())
+}
+
+/// Run one verified TNC or VOX write and return the confirmed text.
+async fn execute_keying_write<T: Transport>(
+    radio: &mut Radio<T>,
+    write: KeyingWrite,
+) -> Result<String, Error> {
+    Ok(match write {
+        KeyingWrite::Tnc(mode, data_band) => {
+            radio.set_tnc_mode(mode, data_band).await?;
+            let state = TncState {
+                mode: TncMode::from(mode),
+                data_band,
+            };
+            format!("TNC: {state} {VERIFIED}.")
+        }
+        KeyingWrite::Vox(enabled) => {
+            radio.set_vox(enabled).await?;
+            format!("VOX: {} {VERIFIED}.", switch(enabled))
+        }
+    })
+}
+
+/// Run one transmit-capable command and print what the radio acknowledged.
+///
+/// A release the radio did not acknowledge ends with `send rx`; a refused
+/// beacon names the TNC mode it needs.
+pub(crate) async fn execute_action<T: Transport>(
+    radio: &mut Radio<T>,
+    action: Action,
+) -> AppResult<()> {
+    let text = match action {
+        Action::Transmit(hold) => transmit(radio, hold).await?,
+        Action::Receive => {
+            radio.receive().await?;
+            "Transmitter released (RX acknowledged).".to_owned()
+        }
+        Action::SendBeacon => match radio.send_aprs_beacon().await {
+            Ok(()) => "APRS beacon sent (BE acknowledged).".to_owned(),
+            Err(error @ Error::Protocol(ProtocolError::NotAvailable { .. })) => {
+                return Err(
+                    CommandError(format!("{error}; select APRS mode first with tnc aprs")).into(),
+                );
+            }
+            Err(error) => return Err(error.into()),
+        },
+        Action::PowerOff => {
+            radio.power_off().await?;
+            "Power off acknowledged (PS 0); closing the connection.".to_owned()
+        }
+    };
+    output::line(format_args!("{text}"));
+    Ok(())
+}
+
+/// Key for `hold` or until Ctrl-C, release, and describe the transmission.
+///
+/// A Ctrl-C listener that fails to start leaves the full hold in place.
+async fn transmit<T: Transport>(radio: &mut Radio<T>, hold: TransmitHold) -> AppResult<String> {
+    let mut keyed = Duration::ZERO;
+    let mut interrupted = false;
+    let stop = async {
+        let started = tokio::time::Instant::now();
+        tokio::select! {
+            () = tokio::time::sleep(hold.duration()) => {}
+            Ok(()) = tokio::signal::ctrl_c() => interrupted = true,
+        }
+        keyed = started.elapsed();
+    };
+    match radio.transmit_until(stop).await {
+        Ok(()) if interrupted => Ok(format!(
+            "Interrupted after {:.3} s; transmitter released (TX and RX acknowledged).",
+            keyed.as_secs_f64()
+        )),
+        Ok(()) => Ok(format!(
+            "Transmitter keyed for {:.3} s, then released (TX and RX acknowledged).",
+            keyed.as_secs_f64()
+        )),
+        Err(error @ Error::ReleaseUnconfirmed { .. }) => {
+            Err(CommandError(format!("{error}; send rx")).into())
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Store `band`'s current channel record (`FO`) in `address` without scan
@@ -945,6 +1149,177 @@ mod tests {
     }
 
     #[test]
+    fn transmit_capable_words_carry_validated_values() -> TestResult {
+        let tnc = |mode, band| Parsed::Write(Write::Keying(KeyingWrite::Tnc(mode, band)));
+        assert_eq!(parsed("tnc aprs")?, tnc(SelectableTncMode::Aprs, Band::A));
+        assert_eq!(parsed("tnc b kiss")?, tnc(SelectableTncMode::Kiss, Band::B));
+        assert_eq!(parsed("TNC OFF")?, tnc(SelectableTncMode::Off, Band::A));
+        assert_eq!(parsed("tnc")?, Parsed::Read(Read::Tnc));
+        assert_eq!(
+            parsed("vox on")?,
+            Parsed::Write(Write::Keying(KeyingWrite::Vox(true)))
+        );
+        assert_eq!(parsed("vox")?, Parsed::Read(Read::Vox));
+        assert_eq!(
+            parsed("tx 2.5")?,
+            Parsed::Action(Action::Transmit(TransmitHold::new(Duration::from_millis(
+                2500
+            ))?))
+        );
+        assert_eq!(
+            parsed("transmit 0.001")?,
+            Parsed::Action(Action::Transmit(TransmitHold::new(Duration::from_millis(
+                1
+            ))?))
+        );
+        assert_eq!(
+            parsed("tx 300")?,
+            Parsed::Action(Action::Transmit(TransmitHold::new(MAX_TRANSMIT_HOLD)?))
+        );
+        assert_eq!(parsed("rx")?, Parsed::Action(Action::Receive));
+        assert_eq!(parsed("RECEIVE")?, Parsed::Action(Action::Receive));
+        assert_eq!(parsed("send-beacon")?, Parsed::Action(Action::SendBeacon));
+        assert_eq!(parsed("power-off")?, Parsed::Action(Action::PowerOff));
+        Ok(())
+    }
+
+    #[test]
+    fn a_transmit_hold_is_bounded_and_has_millisecond_resolution() {
+        assert!(TransmitHold::new(Duration::ZERO).is_err());
+        assert!(TransmitHold::new(MAX_TRANSMIT_HOLD + Duration::from_millis(1)).is_err());
+        for line in [
+            "tx",
+            "tx 0",
+            "tx 0.0",
+            "tx 300.001",
+            "tx 301",
+            "tx -1",
+            "tx 1e2",
+            "tx inf",
+            "tx 1.2345",
+            "tx .5",
+            "tx 5.",
+            "tx 2 3",
+        ] {
+            assert!(parsed(line).is_err(), "{line:?} must be refused");
+        }
+    }
+
+    #[tokio::test]
+    async fn tnc_and_vox_writes_verify_echo_and_readback() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"ID\r", b"ID TM-D750\r");
+        mock.expect(b"FV\r", b"FV 1.02\r");
+        mock.expect(b"TY\r", b"TY K,2,1\r");
+        mock.expect(b"TN 1,1\r", b"TN 1,1\r");
+        mock.expect(b"TN\r", b"TN 1,1\r");
+        mock.expect(b"VX 1\r", b"VX 1\r");
+        mock.expect(b"VX\r", b"VX 1\r");
+        let mut radio = Radio::new(mock);
+        execute_write(
+            &mut radio,
+            Write::Keying(KeyingWrite::Tnc(SelectableTncMode::Aprs, Band::B)),
+        )
+        .await?;
+        execute_write(&mut radio, Write::Keying(KeyingWrite::Vox(true))).await?;
+        radio.into_transport().assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tx_keys_for_the_hold_and_then_releases() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"ID\r", b"ID TM-D750\r");
+        mock.expect(b"FV\r", b"FV 1.02\r");
+        mock.expect(b"TY\r", b"TY K,2,1\r");
+        mock.expect(b"TX\r", b"TX 1\r");
+        mock.expect(b"RX\r", b"RX\r");
+        mock.expect(b"RX\r", b"RX\r");
+        let mut radio = Radio::new(mock);
+        let hold = Duration::from_millis(30);
+        let started = tokio::time::Instant::now();
+        execute_action(&mut radio, Action::Transmit(TransmitHold::new(hold)?)).await?;
+        assert!(
+            started.elapsed() >= hold,
+            "TX is held for the requested time"
+        );
+        execute_action(&mut radio, Action::Receive).await?;
+        radio.into_transport().assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_release_tells_the_operator_to_send_rx() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"ID\r", b"ID TM-D750\r");
+        mock.expect(b"FV\r", b"FV 1.02\r");
+        mock.expect(b"TY\r", b"TY K,2,1\r");
+        mock.expect(b"TX\r", b"TX 1\r");
+        mock.expect_hang(b"RX\r");
+        let mut radio = Radio::new(mock);
+        let hold = TransmitHold::new(Duration::from_millis(1))?;
+        let result = execute_action(&mut radio, Action::Transmit(hold)).await;
+        assert!(
+            result.as_ref().is_err_and(|error| {
+                let text = error.to_string();
+                text.contains("may still be keyed") && text.ends_with("; send rx")
+            }),
+            "{result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_key_up_the_library_released_reports_the_failure_without_send_rx() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"ID\r", b"ID TM-D750\r");
+        mock.expect(b"FV\r", b"FV 1.02\r");
+        mock.expect(b"TY\r", b"TY K,2,1\r");
+        mock.expect_hang(b"TX\r");
+        mock.expect(b"RX\r", b"RX\r");
+        let mut radio = Radio::new(mock);
+        let hold = TransmitHold::new(Duration::from_millis(1))?;
+        let result = execute_action(&mut radio, Action::Transmit(hold)).await;
+        assert!(
+            result.as_ref().is_err_and(|error| {
+                let text = error.to_string();
+                text.contains("TX timed out") && !text.contains("send rx")
+            }),
+            "an acknowledged RX released the transmitter: {result:?}"
+        );
+        radio.into_transport().assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refused_transmit_and_beacon_report_why_and_what_to_select() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"ID\r", b"ID TM-D750\r");
+        mock.expect(b"FV\r", b"FV 1.02\r");
+        mock.expect(b"TY\r", b"TY K,2,1\r");
+        mock.expect(b"TX\r", b"N\r");
+        mock.expect(b"BE\r", b"N\r");
+        let mut radio = Radio::new(mock);
+        let hold = TransmitHold::new(Duration::from_millis(1))?;
+        let refused = execute_action(&mut radio, Action::Transmit(hold)).await;
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|error| !error.to_string().contains("may still be keyed")),
+            "a refused TX never keyed the transmitter: {refused:?}"
+        );
+        let beacon = execute_action(&mut radio, Action::SendBeacon).await;
+        assert!(
+            beacon
+                .as_ref()
+                .is_err_and(|error| error.to_string().contains("tnc aprs")),
+            "{beacon:?}"
+        );
+        radio.into_transport().assert_complete();
+        Ok(())
+    }
+
+    #[test]
     fn callsign_text_keeps_its_typed_case_while_keywords_match_in_any_case() -> TestResult {
         let slot = DstarSlot::new(1)?;
         assert_eq!(
@@ -1049,6 +1424,14 @@ mod tests {
             "freq 600",
             "freq b 524",
             "tnc a",
+            "tnc aprs b",
+            "tnc c aprs",
+            "tnc a aprs on",
+            "vox maybe",
+            "vox on off",
+            "rx now",
+            "send-beacon now",
+            "power-off now",
             "clock now",
         ] {
             assert!(parsed(line).is_err(), "{line:?} must be refused");

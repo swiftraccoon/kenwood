@@ -537,12 +537,9 @@ async fn unsupported_firmware_reads_but_cannot_change_modes() -> TestResult {
     let mut commands = Commands::Prompt(Input::lines(&["mode", "dv"]));
     let evidence = session(transport, &mut commands, &harness.cancelled).await;
     assert_eq!(evidence.commands_completed, 1);
-    assert!(
-        evidence
-            .operation_error
-            .as_ref()
-            .is_some_and(|error| error.message.contains("CAT mode writes support only"))
-    );
+    assert!(evidence.operation_error.as_ref().is_some_and(|error| {
+        error.message.contains("writes support only") && error.message.contains("1.03")
+    }));
     harness.assert_retired_once()
 }
 

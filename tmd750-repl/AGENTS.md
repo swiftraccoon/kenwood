@@ -13,29 +13,43 @@
   `dstar/hosts.rs` implements the library `ControlHost`, `ModemHost` and
   `TerminalJournal` over this crate's capture transcripts, native Bluetooth
   backend and recovery journal; `dstar/startup` reserves the capture directory
-  and serializes the run. This crate no longer owns the entry, transition or
-  readiness state machines. `mcp::reconnect` remains the readiness engine for
-  the other MCP commands (backup, menu apply, the trials and `dstar probe
-  --manage-terminal`), which are unchanged.
+  and serializes the run. This crate owns no entry, transition or readiness
+  state machine.
+- Post-exit readiness for every other MCP command runs the library
+  `radio::readiness::verify_readiness` through `mcp::reconnect::host`
+  (`RecordingHost` writes each enumeration, wait and open to the one
+  verification transcript and synchronizes it in `close`; `SettleHost` does
+  the same for `await_continuous_enumeration`). `mcp::reconnect::readiness`
+  only serializes the library report into the unchanged `ReadinessVerification`
+  JSON; a failure the transcript caused is the `capture` stage. Never add a
+  loop, retry or budget check to the REPL side.
 - Every capture directory is created exclusively, mode 0700, with 0600 files;
   an existing path is refused rather than overwritten. `--output` names a new
   directory whose parent must exist.
 - Gates: `mcp menu apply` and `mcp text set` require `--apply` and an
   explicit endpoint: `--port`, or `--bluetooth`/`--bluetooth-address` with a
-  native backup of that radio; `dstar probe` and the one-shot trials listed
-  under Commands require `--port` and `--approve-live-test`; `dstar start` is
-  the one radio-writing workflow without a flag, since invoking it is the
-  request to write the Terminal and routing pages and open the modem link. Do
-  not add a workflow that reaches the radio outside these gates.
+  native backup of that radio; `mcp repeater set`, `mcp channel-names apply`
+  and `mcp callsign-list apply` require `--apply` and `--port`; `dstar probe`
+  and `mcp reentry-probe` require
+  `--port` and `--approve-live-test`; `dstar start` is the one radio-writing
+  workflow without a flag, since invoking it is the request to write the
+  Terminal and routing pages and open the modem link. Do not add a workflow
+  that reaches the radio outside these gates.
 - Native Bluetooth admits `mcp probe`, `mcp backup`, `mcp text set` and
-  `mcp menu apply`; the fixed trials and the reentry probe are USB-only and are
-  refused before the helper launches. A native write validates its options,
-  native backup and value before selecting a radio, and refuses one whose
-  address differs from the backup's.
+  `mcp menu apply`; the reentry probe is USB-only and is refused before the
+  helper launches. A native write validates its options, native backup and
+  value before selecting a radio, and refuses one whose address differs from
+  the backup's.
 - Write workflows reach their endpoint only through `mcp::link::WriteLink`
   (`UsbLink` or `NativeLink`): open, reply deadlines, pre-entry check, hold
   after the exit, post-exit check. Never branch on the transport inside a
   workflow.
+- Page-plan writes (`mcp menu apply`, `mcp repeater set`, `mcp channel-names
+  apply`, `mcp callsign-list apply`) share `mcp::page_apply`: journal, raw
+  transcript synchronization
+  before each write intent, one session, fresh CAT check, report. A new page
+  write adds a `PlanKind` with its report vocabulary and a `PagePlan`, never a
+  parallel workflow; the menu report and journal shapes stay unchanged.
 - Every new native connection gets its `Radio` from `Radio::new_bluetooth`
   (or, in the shared fixed read, `Some(BLUETOOTH_FIRST_REPLY_TIMEOUT)`), so the
   first reply may take ten seconds and every later exchange 1.5. The fresh
@@ -44,30 +58,25 @@
   returned, never a deadline counted from the reopen. Never raise the regular
   reply deadline instead, and never give USB the first-reply deadline: the
   silent-`ID` readiness retry depends on the 1.5 s timeout.
-- `mcp text set` admits either USB role for every form, and the role selects
-  the post-exit check: one open on the main-unit endpoint
-  (`reconnect::verify_required`, or `verify_required_gateway_off` for
-  `dstar-my-callsign-1`), and on the operation-panel endpoint the bounded
-  silent-`ID` retry backups use (`reconnect::verify_readiness`, or
-  `verify_readiness_gateway_off`), because that endpoint returns within
-  seconds but answers `ID` only once its tuple is ready. A single-attempt check
-  on that endpoint ends the update at `possibly_changed` even after an
-  acknowledged write.
+- `mcp text set`, `mcp menu apply` and `mcp reentry-probe` admit either USB
+  role and verify post-exit with the bounded silent-`ID` retry backups use
+  (`reconnect::verify_readiness`, or `verify_readiness_gateway_off` with one
+  `GW` query on the matched connection), because the operation-panel endpoint
+  returns within seconds but answers `ID` only once its tuple is ready; a
+  single-attempt check there ends an update at `possibly_changed` even after
+  an acknowledged write.
 - Every MCP entry on the operation-panel endpoint (`mcp probe`, `mcp backup`,
   `mcp menu apply`, both `mcp text set` sessions) goes through
   `reconnect::settle_before_entry`, which waits until the endpoint has been
   enumerated for `SETTLE_QUIET` without a gap, because the panel endpoint
   re-enumerates once more after first answering `ID` and an entry sent at that
   moment fails with `ENXIO`; the main-unit endpoint opens at once. A text
-  update's second session settles on either role.
+  update's second session settles on either role
+  (`reconnect::await_settled_endpoint`).
 - `mcp menu apply` writes one positional `FIELD VALUE` pair plus any number of
   `--and FIELD VALUE` pairs in one session; `--slot` binds every per-slot field
   of the run and is refused when every field is global, and a repeated field
   is rejected by the plan.
-- `mcp menu apply` admits either USB role: the main-unit endpoint verifies
-  post-exit with one open (`reconnect::verify_required_gateway_off`), the
-  operation-panel endpoint with `reconnect::verify_readiness_gateway_off`, the
-  bounded silent-`ID` retry followed by one `GW` query per matched attempt.
 - New library MCP writes are qualified on hardware through this crate's
   journaled `mcp text set` workflow, never through an ad-hoc driver, so every
   run leaves a journal, captures and a report. A new text field adds a
@@ -112,19 +121,25 @@ cargo run -p tmd750-repl -- dstar start CALL [REFLECTOR]     # --control-port pi
 - `mcp menu list|describe|show|preview`, `mcp text list|show|preview` and
   `mcp terminal preflight|compare` are offline: they read a completed backup
   report and never enumerate or open an endpoint.
-- The guarded one-shot trials (`mcp pm1-trial`, `mcp my1-trial`,
-  `mcp reentry-probe`, `mcp terminal-exit-trial`) each require an explicit
-  `--port` before `mcp` plus `--approve-live-test`.
+- `mcp reentry-probe` requires an explicit `--port` before `mcp` plus
+  `--approve-live-test`.
 - `dstar probe --manage-terminal` additionally requires `--control-port` and
   `--backup`, and the control endpoint must be the other USB role of the same
   radio.
 - Interactive vocabulary: `help`, `identity` (`id`), `status`, `mode [a|b]
   [fm|dv|am|nfm]`, `dv [a|b]`, `fm [a|b]` (`normal`), `gateway`, `terminal`,
-  `quit` (`exit`), plus the typed reads and verified writes in `src/cat.rs`
-  (`freq`, `power`, `tuning`, `squelch`, `step`, `up`/`down`, `bands`, GPS,
-  VOX, Bluetooth and the rest listed by `help`). `dstar start` consumes the
-  connection and is startup-only. Every write goes through
-  `CommandPolicy::admit_mode_write`, so native Bluetooth writes require a fresh
-  Gateway Off reply.
+  `quit` (`exit`), plus the typed reads, verified writes and transmit actions
+  in `src/cat.rs` (`freq`, `power`, `tuning`, `squelch`, `step`, `up`/`down`,
+  `bands`, GPS, TNC, VOX, Bluetooth, `tx`, `rx`, `send-beacon`, `power-off`
+  and the rest listed by `help`). `dstar start` consumes the connection and is
+  startup-only. Every write and every action except `rx` goes through
+  `CommandPolicy::admit_mode_write`, so native Bluetooth requires a fresh
+  Gateway Off reply first; `rx` is never gated, so a keyed transmitter can
+  always be released.
+- `tx` holds only through `Radio::transmit_until` with a deadline raced against
+  Ctrl-C (`TransmitHold`, 1 ms to `MAX_TRANSMIT_HOLD`); never add an unbounded
+  key-up. The library sends `RX` itself after an unconfirmed `TX`, so "send
+  rx" is the next action exactly on `Error::ReleaseUnconfirmed`. `power-off`
+  ends the session.
 - In a `dstar start` session, Ctrl-C returns to the D-STAR prompt and
   `dstar stop` closes the link and rewrites exactly the pages startup changed.

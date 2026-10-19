@@ -242,9 +242,7 @@ impl<B: Backend> WriteLink for UsbLink<'_, B> {
         Ok(())
     }
 
-    /// One open on the main-unit endpoint, or on the operation-panel endpoint
-    /// the bounded silent-`ID` retry that backups use, because that endpoint
-    /// answers `ID` only once its tuple is ready.
+    /// The bounded silent-`ID` retry that backups use, on either USB role.
     async fn verify_post_exit(
         &mut self,
         identity: &Identity,
@@ -253,27 +251,15 @@ impl<B: Backend> WriteLink for UsbLink<'_, B> {
         cancelled: &AtomicBool,
     ) -> PostExit {
         let (backend, endpoint, baud) = (&mut *self.backend, self.endpoint, self.baud);
-        if endpoint.pid == Some(TMD750_PANEL_PID) {
-            PostExit::Readiness(if gateway_off {
-                reconnect::verify_readiness_gateway_off(
-                    backend, endpoint, baud, identity, post_exit, cancelled,
-                )
-                .await
-            } else {
-                reconnect::verify_readiness(backend, endpoint, baud, identity, post_exit, cancelled)
-                    .await
-            })
+        PostExit::Readiness(Box::new(if gateway_off {
+            reconnect::verify_readiness_gateway_off(
+                backend, endpoint, baud, identity, post_exit, cancelled,
+            )
+            .await
         } else {
-            PostExit::Single(if gateway_off {
-                reconnect::verify_required_gateway_off(
-                    backend, endpoint, baud, identity, post_exit, cancelled,
-                )
+            reconnect::verify_readiness(backend, endpoint, baud, identity, post_exit, cancelled)
                 .await
-            } else {
-                reconnect::verify_required(backend, endpoint, baud, identity, post_exit, cancelled)
-                    .await
-            })
-        }
+        }))
     }
 
     fn skipped(&self, reason: SkipReason, transcript: TranscriptSummary) -> PostExit {

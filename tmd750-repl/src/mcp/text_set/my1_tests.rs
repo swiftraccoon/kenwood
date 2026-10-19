@@ -23,7 +23,7 @@ fn request(backup: &Path, expected: &str, desired: &str) -> Result<SetRequest, T
         "--expect".as_ref(),
         expected.as_ref(),
         "--apply".as_ref(),
-        "dstar-my-callsign-1".as_ref(),
+        "dv-gateway-my-callsign-1".as_ref(),
         desired.as_ref(),
     ])?
     .request)
@@ -47,7 +47,7 @@ fn arguments() -> Vec<String> {
         "--expect",
         "",
         "--apply",
-        "dstar-my-callsign-1",
+        "dv-gateway-my-callsign-1",
         "KQ4NIT",
     ]
     .map(str::to_owned)
@@ -91,13 +91,13 @@ fn save(path: &Path, document: &Value) -> TestResult {
 }
 
 #[test]
-fn report_discriminants_separate_my1_updates_without_changing_pm1() {
+fn report_discriminants_separate_my1_updates_from_pm1() {
     assert_eq!(
         (
             UpdateKind::PmOffMy1.format_version(),
             UpdateKind::PmOffMy1.operation()
         ),
-        (6, "my1_callsign_update"),
+        (10, "my1_callsign_update"),
         "MY1 reports must identify their distinct scope and Gateway verification contract"
     );
     assert_eq!(
@@ -105,8 +105,8 @@ fn report_discriminants_separate_my1_updates_without_changing_pm1() {
             UpdateKind::Pm1Name.format_version(),
             UpdateKind::Pm1Name.operation()
         ),
-        (5, "pm1_name_update"),
-        "adding MY1 must not change existing PM1 report discriminants"
+        (9, "pm1_name_update"),
+        "PM1 reports keep their own discriminant"
     );
 }
 
@@ -227,11 +227,16 @@ fn slot_address_force_and_unrelated_settings_cannot_expand_my1_scope() -> TestRe
             "{flag} must not expand the fixed MY1 scope"
         );
     }
-    for setting in ["dstar-my-callsign-2", "dstar-memo-1", "pm-name-2"] {
+    for setting in [
+        "dv-gateway-my-callsign-2",
+        "dv-gateway-memo-1",
+        "pm-name-2",
+        "dstar-my-callsign-1",
+    ] {
         let mut candidate = arguments();
         if let Some(word) = candidate
             .iter_mut()
-            .find(|word| *word == "dstar-my-callsign-1")
+            .find(|word| *word == "dv-gateway-my-callsign-1")
         {
             *word = setting.to_owned();
         }
@@ -398,7 +403,7 @@ fn clear_request(backup: &Path, expected: &str) -> Result<SetRequest, TestError>
         expected.as_ref(),
         "--apply".as_ref(),
         "--clear".as_ref(),
-        "dstar-my-callsign-1".as_ref(),
+        "dv-gateway-my-callsign-1".as_ref(),
     ])?
     .request)
 }
@@ -456,7 +461,7 @@ fn clear_writes_eight_nul_bytes_and_is_a_no_op_against_an_empty_field() -> TestR
             "KQ4NIT",
             "--apply",
             "--clear",
-            "dstar-my-callsign-1",
+            "dv-gateway-my-callsign-1",
             "N0CALL",
         ])
         .is_err(),
@@ -471,6 +476,8 @@ fn incomplete_failed_and_update_reports_cannot_be_used_as_backups() -> TestResul
     for (fault, (pointer, value)) in [
         ("/format_version", Value::from(5)),
         ("/format_version", Value::from(6)),
+        ("/format_version", Value::from(9)),
+        ("/format_version", Value::from(10)),
         ("/operation", Value::from("text_update")),
         ("/backup/complete_configuration", Value::Bool(false)),
         ("/transcript/complete", Value::Bool(false)),

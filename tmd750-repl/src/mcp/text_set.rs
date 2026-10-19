@@ -56,10 +56,10 @@ pub(super) struct SetRequest {
     /// The memory channel whose name changes; channel-name only (000-999, L00-U49, Pri).
     #[arg(long, value_parser = parse_channel, value_name = "CHANNEL")]
     channel: Option<PhysicalChannel>,
-    /// Clear the field instead of giving new text: dstar-my-callsign-1 and channel-name only.
+    /// Clear the field instead of giving new text: dv-gateway-my-callsign-1 and channel-name only.
     #[arg(long, conflicts_with = "value")]
     clear: bool,
-    /// pm-name-1, dstar-my-callsign-1 (fixed to PM Off/Gateway Off) or channel-name.
+    /// pm-name-1, dv-gateway-my-callsign-1 (fixed to PM Off/Gateway Off) or channel-name.
     setting: SetTarget,
     /// PM1 and channel names: 1 to 16 printable ASCII bytes. MY1: 1 to 8 uppercase letters, digits or spaces.
     #[arg(value_parser = parse_value, value_name = "NEW_TEXT", required_unless_present = "clear")]
@@ -72,9 +72,9 @@ enum SetTarget {
     /// PM1's display name.
     #[value(name = "pm-name-1")]
     PmName1,
-    /// The MY1 callsign in PM Off.
-    #[value(name = "dstar-my-callsign-1")]
-    DstarMyCallsign1,
+    /// MY1 of the DV Gateway list in PM Off.
+    #[value(name = "dv-gateway-my-callsign-1")]
+    DvGatewayMyCallsign1,
     /// One memory channel's sixteen-byte name, selected with `--channel`.
     #[value(name = "channel-name")]
     ChannelName,
@@ -85,7 +85,7 @@ impl SetTarget {
     const fn key(self) -> &'static str {
         match self {
             Self::PmName1 => TextSetting::PmName1.key(),
-            Self::DstarMyCallsign1 => TextSetting::DstarMyCallsign1.key(),
+            Self::DvGatewayMyCallsign1 => TextSetting::DvGatewayMyCallsign1.key(),
             Self::ChannelName => "channel-name",
         }
     }
@@ -145,7 +145,7 @@ impl SetRequest {
         }
         if self.setting == SetTarget::PmName1 && self.clear {
             return Err(Box::new(CommandError(
-                "--clear applies to dstar-my-callsign-1 and channel-name only".to_owned(),
+                "--clear applies to dv-gateway-my-callsign-1 and channel-name only".to_owned(),
             )));
         }
         match self.setting {
@@ -159,7 +159,7 @@ impl SetRequest {
                 }
                 Ok(RequestedChange::Pm1 { expected, desired })
             }
-            SetTarget::DstarMyCallsign1 => {
+            SetTarget::DvGatewayMyCallsign1 => {
                 let expected = if self.expected.is_empty() {
                     None
                 } else {
@@ -242,7 +242,7 @@ impl SetRequest {
             RequestedChange::Pm1 { expected, desired } => {
                 let page = Pm1NameUpdate::required_page()?;
                 Ok(PreparedUpdate::Pm1(Box::new(Pm1NameUpdate::prepare(
-                    &snapshot.identity,
+                    snapshot.identity(),
                     snapshot.captured_bytes(page.region())?,
                     &expected,
                     &desired,
@@ -255,7 +255,7 @@ impl SetRequest {
                 let target = My1CallsignUpdate::required_page()?;
                 let control = My1CallsignUpdate::required_control_page()?;
                 Ok(PreparedUpdate::My1(Box::new(My1CallsignUpdate::prepare(
-                    &snapshot.identity,
+                    snapshot.identity(),
                     snapshot.captured_bytes(target.region())?,
                     snapshot.captured_bytes(control.region())?,
                     expected.as_ref(),
@@ -275,7 +275,7 @@ impl SetRequest {
                 let page = ChannelNameUpdate::required_page(channel)?;
                 Ok(PreparedUpdate::ChannelName(Box::new(
                     ChannelNameUpdate::prepare(
-                        &snapshot.identity,
+                        snapshot.identity(),
                         snapshot.captured_bytes(page.region())?,
                         channel,
                         expected.as_ref(),
@@ -394,7 +394,7 @@ fn verification_captures(directory: &Path, failed: &Arc<AtomicBool>) -> AppResul
 }
 
 /// Report format of a text update over native Bluetooth, for every setting.
-const NATIVE_REPORT_FORMAT: u8 = 8;
+const NATIVE_REPORT_FORMAT: u8 = 12;
 
 /// Validate the request and run the update over the selected USB endpoint.
 ///

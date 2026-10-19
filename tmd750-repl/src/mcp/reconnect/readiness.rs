@@ -1,37 +1,23 @@
 //! Bounded CAT reacquisition after an acknowledged MCP exit.
 //!
-//! Attempts re-enumerate the selected endpoint, open it and read the ID/FV/TY
-//! tuple, optionally followed by one `GW` query once the tuple matches.
+//! [`readiness::verify_readiness`] re-enumerates the selected endpoint, opens
+//! it and reads the ID/FV/TY tuple, optionally followed by one `GW` query once
+//! the tuple matches, through a [`RecordingHost`] that writes every host call
+//! to the verification transcript. This module serializes the library report.
 //! Nothing here re-enters MCP, re-reads memory, or writes a setting.
 
+use super::host::RecordingHost;
 use super::{
-    AtomicBool, Backend, CLOSE_TIMEOUT, ConnectionAttempt, Duration, DvGatewayMode, Enumeration,
-    EnumerationWindow, Failure, File, GatewayEvidence, Identity, Ordering, PostExitVerification,
-    Recorder, SETTLE, SerialCandidate, Serialize, SkipReason, TranscriptSummary,
-    VerificationContext, VerificationGoal, VerificationOutcome, VerificationStage,
-    attempt_identity, await_endpoint, finalize_capture, milliseconds, wait_recorded,
+    AtomicBool, Backend, ConnectionAttempt, DvGatewayMode, Enumeration, Failure, File,
+    GatewayEvidence, Identity, ObservedIdentity, OperationOutcome, Ordering, Recorder, SETTLE,
+    SerialCandidate, Serialize, SkipReason, TranscriptSummary, VerificationOutcome,
+    VerificationStage, milliseconds,
 };
 use kenwood_tmd750::radio::readiness::{
-    EXCHANGE_TIMEOUT, MAXIMUM_OPEN_ATTEMPTS, READINESS_BUDGET, RETRY_INTERVAL,
+    self, ATTEMPT_ALLOWANCE, CloseFailure, EXCHANGE_TIMEOUT, GATEWAY_ATTEMPT_ALLOWANCE,
+    MAXIMUM_OPEN_ATTEMPTS, READINESS_BUDGET, RETRY_INTERVAL, ReadinessEnding, ReadinessError,
+    ReadinessOutcome, ReadinessReport,
 };
-
-/// Budget one identity-only attempt may still need: a write and a reply
-/// deadline for each of ID, FV and TY, followed by the bounded close.
-const ATTEMPT_ALLOWANCE: Duration = EXCHANGE_TIMEOUT
-    .saturating_mul(6)
-    .saturating_add(CLOSE_TIMEOUT);
-/// `ATTEMPT_ALLOWANCE` plus the write and reply deadlines of the one `GW` query.
-const GATEWAY_ATTEMPT_ALLOWANCE: Duration = EXCHANGE_TIMEOUT
-    .saturating_mul(8)
-    .saturating_add(CLOSE_TIMEOUT);
-
-/// Budget one attempt of `goal` may still need before its close completes.
-pub(super) const fn attempt_allowance(goal: VerificationGoal) -> Duration {
-    match goal {
-        VerificationGoal::IdentityOnly => ATTEMPT_ALLOWANCE,
-        VerificationGoal::GatewayOff => GATEWAY_ATTEMPT_ALLOWANCE,
-    }
-}
 
 /// Whether this completed check permits one more open attempt.
 #[derive(Debug, Serialize)]
@@ -54,6 +40,119 @@ struct ReadinessAttempt {
     connection: Option<ConnectionAttempt>,
     outcome: VerificationOutcome,
     retry_admission: RetryAdmission,
+}
+
+impl ReadinessAttempt {
+    /// Serialize one library attempt; `capture_refused` names the `capture`
+    /// stage for a failure that an incomplete transcript caused.
+    fn from_library(attempt: readiness::ReadinessAttempt, capture_refused: bool) -> Self {
+        let identity_read = attempt
+            .connection
+            .as_ref()
+            .is_some_and(|connection| connection.identity.is_some());
+        // The host's close fails with `CloseFailure::Host` only when the
+        // transcript did not synchronize.
+        let unsynchronized = attempt
+            .connection
+            .as_ref()
+            .is_some_and(|connection| matches!(connection.close, Some(Err(CloseFailure::Host(_)))));
+        let capture_refused = capture_refused
+            || (unsynchronized
+                && matches!(
+                    attempt.outcome,
+                    ReadinessOutcome::Failed(ReadinessError::Close)
+                ));
+        let open_error = match &attempt.outcome {
+            ReadinessOutcome::Failed(ReadinessError::Open(error)) => {
+                Some(Failure::from_error(error))
+            }
+            _ => None,
+        };
+        Self {
+            enumerations: attempt
+                .enumerations
+                .into_iter()
+                .map(|enumeration| Enumeration {
+                    elapsed_milliseconds: milliseconds(enumeration.elapsed),
+                    candidates: enumeration.candidates.iter().map(Into::into).collect(),
+                })
+                .collect(),
+            connection: attempt
+                .connection
+                .map(|connection| connection_evidence(connection, open_error)),
+            outcome: verification_outcome(&attempt.outcome, identity_read, capture_refused),
+            retry_admission: match attempt.retry {
+                readiness::RetryAdmission::SilentIdentityTimeout => {
+                    RetryAdmission::SilentIdentityTimeout
+                }
+                readiness::RetryAdmission::Terminal => RetryAdmission::Terminal,
+            },
+        }
+    }
+}
+
+/// Serialize one library connection; `open_error` is the failure of an
+/// unopened connection.
+fn connection_evidence(
+    connection: readiness::ConnectionAttempt,
+    open_error: Option<Failure>,
+) -> ConnectionAttempt {
+    ConnectionAttempt {
+        endpoint: (&connection.endpoint).into(),
+        open: match (connection.opened, open_error) {
+            (true, _) => OperationOutcome::Succeeded,
+            (false, Some(error)) => OperationOutcome::Failed { error },
+            (false, None) => OperationOutcome::Failed {
+                error: Failure::from_error(&std::io::Error::other("the open failed")),
+            },
+        },
+        identity: connection.identity.map(ObservedIdentity),
+        gateway_mode: connection.gateway.map(GatewayEvidence),
+        close: connection.close.map(|close| match close {
+            Ok(()) => OperationOutcome::Succeeded,
+            Err(error) => OperationOutcome::Failed {
+                error: Failure::from_error(&error),
+            },
+        }),
+    }
+}
+
+/// Serialize one attempt outcome.
+fn verification_outcome(
+    outcome: &ReadinessOutcome,
+    identity_read: bool,
+    capture_refused: bool,
+) -> VerificationOutcome {
+    match outcome {
+        ReadinessOutcome::Matched => VerificationOutcome::Matched,
+        ReadinessOutcome::Cancelled => VerificationOutcome::Cancelled,
+        ReadinessOutcome::Failed(error) => VerificationOutcome::Failed {
+            stage: if capture_refused {
+                VerificationStage::Capture
+            } else {
+                failure_stage(error, identity_read)
+            },
+            error: Failure::from_error(error),
+        },
+    }
+}
+
+/// The report stage of a library failure; a CAT failure after a complete
+/// identity belongs to the `GW` query.
+const fn failure_stage(error: &ReadinessError, identity_read: bool) -> VerificationStage {
+    match error {
+        ReadinessError::Enumeration(_)
+        | ReadinessError::EndpointAbsent { .. }
+        | ReadinessError::Unsettled { .. } => VerificationStage::Enumeration,
+        ReadinessError::Reenumeration(_) => VerificationStage::EndpointSelection,
+        ReadinessError::Open(_) => VerificationStage::Open,
+        ReadinessError::Cat(_) if identity_read => VerificationStage::Gateway,
+        ReadinessError::Cat(_) => VerificationStage::Identity,
+        ReadinessError::IdentityMismatch { .. } => VerificationStage::IdentityMismatch,
+        ReadinessError::GatewayMismatch { .. } => VerificationStage::GatewayMismatch,
+        ReadinessError::Close => VerificationStage::Close,
+        _ => VerificationStage::Readiness,
+    }
 }
 
 /// Serialized report of one bounded CAT reacquisition.
@@ -132,6 +231,43 @@ impl ReadinessVerification {
         };
     }
 
+    /// Take the attempts, elapsed time and final outcome from `report`.
+    ///
+    /// `capture_refused` marks the last attempt's failure as the `capture`
+    /// stage.
+    fn absorb(&mut self, report: ReadinessReport, capture_refused: bool) {
+        let last = report.attempts.len().saturating_sub(1);
+        self.elapsed_milliseconds = milliseconds(report.elapsed);
+        self.attempts = report
+            .attempts
+            .into_iter()
+            .enumerate()
+            .map(|(index, attempt)| {
+                ReadinessAttempt::from_library(attempt, capture_refused && index == last)
+            })
+            .collect();
+        match report.ending {
+            ReadinessEnding::Matched => self.outcome = VerificationOutcome::Matched,
+            ReadinessEnding::Cancelled => self.outcome = VerificationOutcome::Cancelled,
+            ReadinessEnding::Failed => {
+                self.outcome = self
+                    .attempts
+                    .last()
+                    .map_or(VerificationOutcome::Cancelled, |attempt| {
+                        attempt.outcome.clone()
+                    });
+            }
+            ReadinessEnding::AttemptCapExhausted => self.fail(
+                VerificationStage::Readiness,
+                "CAT readiness open-attempt cap exhausted",
+            ),
+            ReadinessEnding::BudgetExhausted => self.fail(
+                VerificationStage::Readiness,
+                "CAT readiness budget exhausted before retry",
+            ),
+        }
+    }
+
     fn finalize(&mut self, recorder: &mut Recorder<File>) {
         if let Err(error) = recorder.synchronize()
             && !matches!(self.outcome, VerificationOutcome::Failed { .. })
@@ -145,35 +281,18 @@ impl ReadinessVerification {
     }
 }
 
-/// True when `deadline - now` still covers one attempt of `goal`.
-///
-/// Both durations are elapsed times from the backend's clock origin.
-pub(super) fn can_dispatch(now: Duration, deadline: Duration, goal: VerificationGoal) -> bool {
-    deadline.saturating_sub(now) >= attempt_allowance(goal)
-}
-
-/// Record a `Readiness` failure: too little budget remains for one attempt.
-pub(super) fn budget_exhausted(report: &mut PostExitVerification) {
-    report.fail(
-        VerificationStage::Readiness,
-        &std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "CAT readiness budget has insufficient time for identity and close",
-        ),
-    );
-}
-
 /// Reacquire the CAT identity tuple on fresh connections within 60 s.
 ///
 /// Call this only after an acknowledged MCP exit with the original connection
-/// closed and its transcript complete. Each attempt re-enumerates the exact
-/// endpoint, opens it once and reads ID/FV/TY with `EXCHANGE_TIMEOUT` per write
-/// and per reply. Another open follows only when the identity query timed out
-/// after the ID write with no bytes received, the close succeeded and the
-/// transcript synchronized; at most `MAXIMUM_OPEN_ATTEMPTS` opens run,
-/// `RETRY_INTERVAL` apart. No MCP entry, Gateway query, setter, baud change,
-/// packet exit, transport reopen or reset is sent. Cancellation finishes the
-/// current identity attempt and its close before stopping.
+/// closed and its transcript complete. Runs [`readiness::verify_readiness`]:
+/// each attempt re-enumerates the exact endpoint, opens it once and reads
+/// ID/FV/TY with `EXCHANGE_TIMEOUT` per write and per reply. Another open
+/// follows only when the identity query timed out after the ID write with no
+/// bytes received, the close succeeded and the transcript synchronized; at
+/// most `MAXIMUM_OPEN_ATTEMPTS` opens run, `RETRY_INTERVAL` apart. No MCP
+/// entry, Gateway query, setter, baud change, packet exit, transport reopen or
+/// reset is sent. Cancellation finishes the current identity attempt and its
+/// close before stopping.
 pub(crate) async fn verify_readiness(
     backend: &mut impl Backend,
     endpoint: &SerialCandidate,
@@ -189,7 +308,7 @@ pub(crate) async fn verify_readiness(
         original_identity,
         recorder,
         cancelled,
-        VerificationGoal::IdentityOnly,
+        None,
     )
     .await
 }
@@ -218,7 +337,7 @@ pub(crate) async fn verify_readiness_gateway_off(
         original_identity,
         recorder,
         cancelled,
-        VerificationGoal::GatewayOff,
+        Some(DvGatewayMode::Off),
     )
     .await
 }
@@ -230,96 +349,37 @@ async fn verify_readiness_with(
     original_identity: &Identity,
     mut recorder: Recorder<File>,
     cancelled: &AtomicBool,
-    goal: VerificationGoal,
+    gateway: Option<DvGatewayMode>,
 ) -> ReadinessVerification {
-    let allowance = attempt_allowance(goal);
     let mut result = ReadinessVerification::skipped(SkipReason::Cancelled, recorder.summary());
-    result.attempt_allowance_milliseconds = milliseconds(allowance);
-    if matches!(goal, VerificationGoal::GatewayOff) {
-        result.required_gateway_mode = Some(GatewayEvidence(DvGatewayMode::Off));
+    if gateway.is_some() {
+        result.attempt_allowance_milliseconds = milliseconds(GATEWAY_ATTEMPT_ALLOWANCE);
     }
+    result.required_gateway_mode = gateway.map(GatewayEvidence);
     if cancelled.load(Ordering::Relaxed) || recorder.ensure_complete().is_err() {
         result.finalize(&mut recorder);
         return result;
     }
-    wait_recorded(backend, &mut recorder, SETTLE).await;
-    let window = EnumerationWindow {
-        started: backend.now(),
-        budget: READINESS_BUDGET,
-    };
-    let deadline = window.started.saturating_add(window.budget);
-    let context = VerificationContext {
+    let mut host = RecordingHost::new(backend, endpoint, recorder);
+    let report = Box::pin(readiness::verify_readiness(
+        &mut host,
+        endpoint,
         baud,
         original_identity,
+        gateway,
         cancelled,
-        goal,
-        dispatch_deadline: Some(deadline),
-    };
-    loop {
-        if cancelled.load(Ordering::Relaxed) {
-            result.outcome = VerificationOutcome::Cancelled;
-            break;
-        }
-        let mut check = PostExitVerification::skipped(SkipReason::Cancelled, recorder.summary());
-        let selected = await_endpoint(
-            backend,
-            endpoint,
-            &mut recorder,
-            &mut check,
-            cancelled,
-            window,
-        )
-        .await;
-        let mut retry = false;
-        if let Some(selected) = selected {
-            if can_dispatch(backend.now(), deadline, goal) {
-                let attempt =
-                    attempt_identity(backend, &selected, context, recorder, &mut check).await;
-                recorder = attempt.recorder;
-                retry = attempt.silent_identity_timeout;
-            } else {
-                budget_exhausted(&mut check);
-            }
-        }
-        // Another open requires the previous attempt's transcript to be
-        // synchronized; a synchronization failure ends the loop.
-        finalize_capture(&mut recorder, &mut check);
-        retry &= check.transcript.complete;
-        result.outcome = check.outcome.clone();
-        result.attempts.push(ReadinessAttempt {
-            enumerations: check.enumerations,
-            connection: check.attempt,
-            outcome: check.outcome,
-            retry_admission: if retry {
-                RetryAdmission::SilentIdentityTimeout
-            } else {
-                RetryAdmission::Terminal
-            },
-        });
-        if !retry {
-            break;
-        }
-        if cancelled.load(Ordering::Relaxed) {
-            result.outcome = VerificationOutcome::Cancelled;
-            break;
-        }
-        if result.attempts.len() >= MAXIMUM_OPEN_ATTEMPTS {
-            result.fail(
-                VerificationStage::Readiness,
-                "CAT readiness open-attempt cap exhausted",
-            );
-            break;
-        }
-        if deadline.saturating_sub(backend.now()) < RETRY_INTERVAL + allowance {
-            result.fail(
-                VerificationStage::Readiness,
-                "CAT readiness budget exhausted before retry",
-            );
-            break;
-        }
-        wait_recorded(backend, &mut recorder, RETRY_INTERVAL).await;
+    ))
+    .await;
+    let capture_refused = host.capture_refused();
+    result.absorb(report, capture_refused);
+    if let Some(mut recorder) = host.into_recorder() {
+        result.finalize(&mut recorder);
+    } else {
+        result.fail(
+            VerificationStage::Capture,
+            "the readiness check did not return the transcript",
+        );
+        result.transcript.complete = false;
     }
-    result.elapsed_milliseconds = milliseconds(backend.now().saturating_sub(window.started));
-    result.finalize(&mut recorder);
     result
 }

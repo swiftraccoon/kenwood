@@ -14,21 +14,21 @@ use serde::Serialize;
 use crate::{AppResult, CommandError};
 
 const CALLSIGNS: [TextSetting; 6] = [
-    TextSetting::DstarMyCallsign1,
-    TextSetting::DstarMyCallsign2,
-    TextSetting::DstarMyCallsign3,
-    TextSetting::DstarMyCallsign4,
-    TextSetting::DstarMyCallsign5,
-    TextSetting::DstarMyCallsign6,
+    TextSetting::DvGatewayMyCallsign1,
+    TextSetting::DvGatewayMyCallsign2,
+    TextSetting::DvGatewayMyCallsign3,
+    TextSetting::DvGatewayMyCallsign4,
+    TextSetting::DvGatewayMyCallsign5,
+    TextSetting::DvGatewayMyCallsign6,
 ];
 
 const MEMOS: [TextSetting; 6] = [
-    TextSetting::DstarMemo1,
-    TextSetting::DstarMemo2,
-    TextSetting::DstarMemo3,
-    TextSetting::DstarMemo4,
-    TextSetting::DstarMemo5,
-    TextSetting::DstarMemo6,
+    TextSetting::DvGatewayMemo1,
+    TextSetting::DvGatewayMemo2,
+    TextSetting::DvGatewayMemo3,
+    TextSetting::DvGatewayMemo4,
+    TextSetting::DvGatewayMemo5,
+    TextSetting::DvGatewayMemo6,
 ];
 
 /// One field's location in the generated registry layout.
@@ -304,9 +304,9 @@ mod tests {
             (10, "image-format", None, 1),
             (323_593, "active-pm", None, 1),
             (329_037, "menu-986-gateway-interface", Some(0), 1),
-            (331_784, "dstar-my-callsign-1", Some(0), 8),
-            (331_792, "dstar-memo-1", Some(0), 4),
-            (331_852 + 5 * 8192, "dstar-memo-6", Some(5), 4),
+            (331_784, "dv-gateway-my-callsign-1", Some(0), 8),
+            (331_792, "dv-gateway-memo-1", Some(0), 4),
+            (331_852 + 5 * 8192, "dv-gateway-memo-6", Some(5), 4),
             (331_864 + 5 * 8192, "menu-672-rpt2", Some(5), 8),
         ] {
             let field = catalog
@@ -366,7 +366,7 @@ mod tests {
             );
         }
         assert!(
-            json.contains("dstar-memo-6"),
+            json.contains("dv-gateway-memo-6"),
             "memo identity must remain explicit"
         );
         Ok(())

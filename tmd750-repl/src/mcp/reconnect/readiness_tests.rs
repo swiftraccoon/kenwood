@@ -6,6 +6,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::sync::{Arc, Mutex};
 
+use kenwood_tmd750::radio::readiness::{ATTEMPT_ALLOWANCE, GATEWAY_ATTEMPT_ALLOWANCE};
 use kenwood_tmd750::transport::{KENWOOD_VID, TMD750_MAIN_PID, TMD750_PANEL_PID};
 use kenwood_tmd750::{FirmwareIdentity, RadioModel, RadioType};
 use kenwood_transport::MockTransport;
@@ -760,14 +761,11 @@ async fn gateway_off_goal_queries_gw_after_a_silent_retry_and_reports_evidence()
         value
             .get("attempt_allowance_milliseconds")
             .and_then(Value::as_u64),
-        Some(milliseconds(readiness::attempt_allowance(
-            VerificationGoal::GatewayOff
-        ))),
+        Some(milliseconds(GATEWAY_ATTEMPT_ALLOWANCE)),
         "the allowance covers the GW exchange"
     );
     assert!(
-        readiness::attempt_allowance(VerificationGoal::GatewayOff)
-            > readiness::attempt_allowance(VerificationGoal::IdentityOnly),
+        GATEWAY_ATTEMPT_ALLOWANCE > ATTEMPT_ALLOWANCE,
         "the GW exchange extends the per-attempt allowance"
     );
     let attempts = attempts(&report)?;

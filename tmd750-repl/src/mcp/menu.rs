@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Parser, Subcommand};
 use kenwood_tmd750::memory::{
     DecodedFieldValue, Endian, FieldCodec, MCP_D750_MENU_FIELDS, MenuField, MenuWritePolicy,
-    PatchPlanner, StringEncoding, is_supported_schema_target, menu_field,
+    PatchPlanner, StringEncoding, menu_field,
 };
 use kenwood_tmd750::transport::SerialCandidate;
 use kenwood_tmd750::{
@@ -198,7 +198,7 @@ impl ApplyRequest {
 
     fn plan(snapshot: &Snapshot, assignments: Vec<MenuAssignment>) -> AppResult<MenuUpdatePlan> {
         Ok(MenuUpdatePlan::new(
-            &snapshot.identity,
+            snapshot.identity(),
             &snapshot.menu_snapshot()?,
             assignments,
         )?)
@@ -279,16 +279,10 @@ impl Selection {
 }
 
 fn validate_layout(snapshot: &Snapshot) -> AppResult<()> {
-    let identity = &snapshot.identity;
-    if !(is_supported_schema_target(identity.model, &identity.firmware)
-        || (identity.model == RadioModel::TmD750
-            && identity.firmware.as_str() == "1.02"
-            && identity.radio_type.as_str() == "K,2,1"))
-    {
-        return Err(CommandError(
-            "backup identity is outside supported menu-layout interpretation".to_owned(),
-        )
-        .into());
+    if snapshot.identity().model != RadioModel::TmD750 {
+        return Err(
+            CommandError("menu interpretation requires a TM-D750 backup".to_owned()).into(),
+        );
     }
     if snapshot.captured_bytes(Region::new(10, 11)?)? != [0] {
         return Err(CommandError(
@@ -444,7 +438,9 @@ fn scope_label(slot: Option<SlotIndex>) -> String {
 fn print_source(snapshot: &Snapshot) {
     output::line(format_args!(
         "Captured identity: {} firmware {}, type {}; decoded with the format-zero layout from this backup, not from the radio.",
-        snapshot.identity.model, snapshot.identity.firmware, snapshot.identity.radio_type
+        snapshot.identity().model,
+        snapshot.identity().firmware,
+        snapshot.identity().radio_type
     ));
 }
 
@@ -547,7 +543,7 @@ impl PreviewRequest {
             offline_only: true,
             radio_applied: false,
             source_backup: self.selection.backup.clone(),
-            identity: IdentityEvidence::from(&snapshot.identity),
+            identity: IdentityEvidence::from(snapshot.identity()),
             field: field.descriptor.name,
             slot: selection.slot().map(SlotIndex::index),
             write_policy: policy_label(field.write_policy()),

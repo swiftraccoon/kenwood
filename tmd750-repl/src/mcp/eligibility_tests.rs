@@ -56,7 +56,7 @@ fn only_complete_detached_evidence_permits_verification() -> TestResult {
             stage: McpProbeStage::Exit,
             error: kenwood_tmd750::Error::Timeout {
                 operation: "test exit",
-                millis: 1,
+                timeout: Duration::from_millis(1),
             },
         },
     ] {

@@ -191,8 +191,8 @@ async fn verify_off(
     backend: &mut FreshBackend,
     file: File,
     cancelled: &AtomicBool,
-) -> Result<PostExitVerification, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(verify_required_gateway_off(
+) -> Result<ReadinessVerification, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(verify_readiness_gateway_off(
         backend,
         &endpoint(),
         9600,
@@ -203,7 +203,15 @@ async fn verify_off(
     .await)
 }
 
-fn assert_failed(report: &PostExitVerification, expected_stage: VerificationStage) -> TestResult {
+/// The serialized connection of the report's only attempt.
+fn connection(report: &ReadinessVerification) -> Result<Value, serde_json::Error> {
+    Ok(serde_json::to_value(report)?
+        .pointer("/attempts/0/connection")
+        .cloned()
+        .unwrap_or(Value::Null))
+}
+
+fn assert_failed(report: &ReadinessVerification, expected_stage: VerificationStage) -> TestResult {
     let VerificationOutcome::Failed { stage, .. } = &report.outcome else {
         return Err(format!("expected failure: {report:?}").into());
     };
@@ -236,7 +244,7 @@ async fn required_off_retains_actual_identity_and_state_after_one_closed_durable
         encoded.get("required_gateway_mode"),
         Some(&json!({"state":"off", "raw":0}))
     );
-    let attempt = encoded.get("attempt").ok_or("attempt evidence")?;
+    let attempt = connection(&report)?;
     assert_eq!(
         attempt.get("gateway_mode"),
         Some(&json!({"state":"off", "raw":0}))
@@ -261,13 +269,12 @@ async fn required_off_retains_actual_identity_and_state_after_one_closed_durable
 }
 
 #[tokio::test]
-async fn required_identity_keeps_three_queries_and_the_single_attempt_serialized_shape()
--> TestResult {
+async fn required_identity_keeps_three_queries_and_the_connection_serialized_shape() -> TestResult {
     let mut backend = FreshBackend::new(identity_script(b"FV 1.02\r", b"TY K,2,1\r"));
     let recorder = recorder(tempfile::tempfile()?);
     let identity = identity()?;
     let cancelled = AtomicBool::new(false);
-    let report = verify_required(
+    let report = verify_readiness(
         &mut backend,
         &endpoint(),
         9600,
@@ -282,13 +289,13 @@ async fn required_identity_keeps_three_queries_and_the_single_attempt_serialized
     let encoded = serde_json::to_value(&report)?;
     assert!(encoded.get("required_gateway_mode").is_none());
     assert_eq!(
-        encoded.get("attempt"),
-        Some(&json!({
+        connection(&report)?,
+        json!({
             "endpoint": {"path":endpoint().path, "usb_vendor_id":KENWOOD_VID, "usb_product_id":TMD750_MAIN_PID},
             "open": {"status":"succeeded"},
             "identity": {"model":"TM-D750", "firmware":"1.02", "radio_type":"K,2,1"},
             "close": {"status":"succeeded"}
-        }))
+        })
     );
     Ok(())
 }
@@ -305,15 +312,7 @@ async fn terminal_and_unnamed_gateway_states_are_retained_but_never_accepted() -
             verify_off(&mut backend, tempfile::tempfile()?, &AtomicBool::new(false)).await?;
         assert_failed(&report, VerificationStage::GatewayMismatch)?;
         assert_eq!(
-            report
-                .attempt
-                .as_ref()
-                .and_then(|attempt| attempt.gateway_mode),
-            Some(GatewayEvidence(mode))
-        );
-        let encoded = serde_json::to_value(&report)?;
-        assert_eq!(
-            encoded.pointer("/attempt/gateway_mode"),
+            connection(&report)?.get("gateway_mode"),
             Some(&json!({"state":state, "raw":u8::from(mode)}))
         );
         backend.assert_operations(OFF_WRITES, true)?;
@@ -328,13 +327,7 @@ async fn failed_gateway_replies_close_without_retry_or_off_evidence() -> TestRes
         let report =
             verify_off(&mut backend, tempfile::tempfile()?, &AtomicBool::new(false)).await?;
         assert_failed(&report, VerificationStage::Gateway)?;
-        assert!(
-            report
-                .attempt
-                .as_ref()
-                .and_then(|attempt| attempt.gateway_mode)
-                .is_none()
-        );
+        assert!(connection(&report)?.get("gateway_mode").is_none());
         backend.assert_operations(OFF_WRITES, true)?;
     }
     Ok(())
@@ -405,11 +398,7 @@ async fn cancellation_before_or_during_cat_never_publishes_finalization_evidence
             true,
         )?;
         assert_eq!(
-            report
-                .attempt
-                .as_ref()
-                .and_then(|attempt| attempt.gateway_mode)
-                .is_some(),
+            connection(&report)?.get("gateway_mode").is_some(),
             query_gateway
         );
     }
@@ -428,13 +417,10 @@ async fn gateway_success_requires_close_and_a_later_close_error_preserves_gatewa
         let report =
             verify_off(&mut backend, tempfile::tempfile()?, &AtomicBool::new(false)).await?;
         assert_failed(&report, expected)?;
-        assert!(matches!(
-            report
-                .attempt
-                .as_ref()
-                .and_then(|attempt| attempt.close.as_ref()),
-            Some(OperationOutcome::Failed { .. })
-        ));
+        assert_eq!(
+            connection(&report)?.pointer("/close/status"),
+            Some(&json!("failed"))
+        );
         backend.assert_operations(OFF_WRITES, true)?;
     }
     Ok(())

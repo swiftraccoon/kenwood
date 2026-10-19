@@ -678,8 +678,8 @@ async fn success_uses_four_ordered_handles_and_one_prejournaled_memory_write() -
     );
     for session in &result.sessions {
         assert!(
-            matches!(session.post_exit, PostExit::Single(_)),
-            "the main-unit endpoint verifies with one open"
+            matches!(session.post_exit, PostExit::Readiness(_)),
+            "the main-unit endpoint verifies through the readiness check"
         );
     }
     harness.journal.finish(&harness.update)?;

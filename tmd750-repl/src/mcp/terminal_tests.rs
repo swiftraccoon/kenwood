@@ -12,7 +12,6 @@ fn request(path: &Path) -> AppResult<PreflightRequest> {
         backup: path.to_owned(),
         slot: SlotIndex::new(0)?,
         interface: UsbInterface::MainUsb,
-        interpret_unqualified: false,
     })
 }
 
@@ -74,7 +73,6 @@ fn parser_requires_explicit_slot_and_interface_and_exposes_no_write_surface() ->
         "5",
         "--interface",
         "panel-usb",
-        "--interpret-unqualified",
     ];
     let parsed = TerminalRequest::try_parse_from(arguments)?;
     let TerminalCommand::Preflight(parsed) = parsed.command else {
@@ -83,11 +81,11 @@ fn parser_requires_explicit_slot_and_interface_and_exposes_no_write_surface() ->
     assert_eq!(parsed.backup, PathBuf::from("Capture Case/report.json"));
     assert_eq!(parsed.slot.index(), 5);
     assert_eq!(parsed.interface, UsbInterface::PanelUsb);
-    assert!(parsed.interpret_unqualified);
     for additional in [
         &["--output", "patch.json"][..],
         &["--write"][..],
         &["--activate"][..],
+        &["--interpret-unqualified"][..],
     ] {
         let args: Vec<_> = arguments.iter().chain(additional).copied().collect();
         assert!(TerminalRequest::try_parse_from(args).is_err());
@@ -129,28 +127,19 @@ fn parser_requires_explicit_slot_and_interface_and_exposes_no_write_surface() ->
 }
 
 #[test]
-fn firmware_policy_is_explicit_and_output_never_claims_live_readiness() -> TestResult {
+fn output_names_the_backup_identity_and_never_claims_live_readiness() -> TestResult {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("backup.json");
     write_fixture(&path, &blank_fixture()?)?;
     let original = std::fs::read(&path)?;
     let snapshot = Snapshot::load(&path)?;
-    let mut request = request(&path)?;
-    assert!(assess(&request, &snapshot).is_err());
-    request.interpret_unqualified = true;
-    let report = assess(&request, &snapshot)?;
-    assert_eq!(report.firmware.as_str(), "1.02");
-    assert_eq!(
-        report.qualification,
-        TextLayoutQualification::UnqualifiedInterpretation
-    );
+    let report = assess(&request(&path)?, &snapshot)?;
     assert_eq!(report.findings, vec![TerminalFinding::MissingMyCallsign]);
     let output = describe(&snapshot, &report)?.join("\n");
     for expected in [
         "Historical backup only",
         "current radio state is unknown",
         "firmware 1.02",
-        "Firmware outside the registry label",
         "No radio endpoints enumerated or opened",
         "No PM recalled, text normalized, patch generated, or settings changed",
         "Active DV Gateway rejects CAT on its assigned interface",
@@ -194,7 +183,6 @@ fn selected_pm_and_my_entry_are_never_substituted_with_populated_defaults() -> T
     write_fixture(&path, &image)?;
     let snapshot = Snapshot::load(&path)?;
     let mut request = request(&path)?;
-    request.interpret_unqualified = true;
     request.slot = slot;
     let report = assess(&request, &snapshot)?;
     assert_eq!(report.slot.index(), 5);
@@ -224,10 +212,7 @@ fn offline_dispatch_handles_both_success_and_missing_backup_without_endpoint_sel
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("backup.json");
     let command = super::super::McpCommand::Terminal(TerminalRequest {
-        command: TerminalCommand::Preflight(PreflightRequest {
-            interpret_unqualified: true,
-            ..request(&path)?
-        }),
+        command: TerminalCommand::Preflight(request(&path)?),
     });
     command.validate_endpoint_selection(false)?;
     let missing =
@@ -255,9 +240,7 @@ fn even_conflict_free_output_does_not_claim_a_radio_is_ready() -> TestResult {
     )?;
     write_fixture(&path, &image)?;
     let snapshot = Snapshot::load(&path)?;
-    let mut request = request(&path)?;
-    request.interpret_unqualified = true;
-    let report = assess(&request, &snapshot)?;
+    let report = assess(&request(&path)?, &snapshot)?;
     assert!(report.findings.is_empty());
     let output = describe(&snapshot, &report)?.join("\n");
     assert!(output.contains("No conflicts found by these offline checks"));

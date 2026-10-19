@@ -919,24 +919,6 @@ async fn fresh_gateway_mismatch_prevents_success_without_rollback() -> TestResul
     Ok(())
 }
 
-#[test]
-fn pre_write_synchronization_failure_is_sticky() -> TestResult {
-    let directory = tempfile::tempdir()?;
-    let mut synchronization =
-        super::RawSynchronization::new(create_private_file(&directory.path().join("raw.jsonl"))?);
-    synchronization.fail_next = true;
-    assert!(
-        synchronization.synchronize().is_err(),
-        "injected synchronization failure must be observable"
-    );
-    synchronization.file.sync_all()?;
-    assert!(
-        synchronization.synchronize().is_err(),
-        "a later successful OS sync must not erase the first failure"
-    );
-    Ok(())
-}
-
 #[tokio::test]
 async fn failed_journal_blocks_the_first_open_independently_of_user_cancellation() -> TestResult {
     let mut harness = Harness::new(false)?;

@@ -312,7 +312,7 @@ pub(super) async fn run(endpoint: &SerialCandidate, request: &Request) -> AppRes
         .ok_or("missing completed configuration backup")?;
     let snapshot = Snapshot::load_for_usb_write(backup)?;
     let plan = TerminalPlan::new(
-        &snapshot.identity,
+        snapshot.identity(),
         &snapshot.menu_snapshot()?,
         TerminalTarget::ReflectorTerminal,
     )?;
