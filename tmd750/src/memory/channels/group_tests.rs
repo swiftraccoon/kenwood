@@ -51,7 +51,7 @@ fn group_names_follow_the_call_names_in_the_name_table() -> TestResult {
     assert_eq!(
         MemoryGroup::new(30),
         Err(ValidationError::SettingOutOfRange {
-            setting: "memory group",
+            setting: SettingName::MemoryGroup,
             value: 30,
             max: 29
         })

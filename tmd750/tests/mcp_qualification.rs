@@ -8,7 +8,7 @@ use thiserror as _;
 use tokio_serial as _;
 use tracing as _;
 
-use kenwood_tmd750::protocol::mcp::{ACK, ENTER, EXIT, read_request, write_request};
+use kenwood_tmd750::protocol::mcp::{ACK, ENTER, EXIT, Header};
 use kenwood_tmd750::{
     Error, McpError, McpProbeExit, McpProbeOutcome, McpProbeStage, Page, Radio, Region,
 };
@@ -39,9 +39,9 @@ fn slot_page() -> Result<Page, Box<dyn std::error::Error>> {
 }
 
 fn read(mock: &mut MockTransport, page: Page, value: u8) {
-    let mut reply = write_request(page).to_vec();
+    let mut reply = Header::write_request(page).to_vec();
     reply.extend(vec![value; page.len()]);
-    mock.expect(&read_request(page), &reply);
+    mock.expect(&Header::read_request(page), &reply);
     mock.expect(&[ACK], &[ACK]);
 }
 
@@ -137,7 +137,7 @@ async fn malformed_second_reply_preserves_first_segment_without_blind_exit() -> 
     identity(&mut mock, b"FV 1.02\r");
     mock.expect(ENTER, b"0M\r");
     read(&mut mock, global_page()?, 0x42);
-    mock.expect(&read_request(slot_page()?), b"W\0\0\0\0");
+    mock.expect(&Header::read_request(slot_page()?), b"W\0\0\0\0");
     let mut radio = Radio::new(mock);
     let report = radio.probe_mcp(|| false).await;
     assert!(
@@ -183,7 +183,7 @@ async fn partial_read_timeout_retains_identity_without_sending_exit() -> TestRes
     let mut mock = MockTransport::new();
     identity(&mut mock, b"FV 1.02\r");
     mock.expect(ENTER, b"0M\r");
-    mock.expect_partial_then_hang(&read_request(global_page()?), b"W\0");
+    mock.expect_partial_then_hang(&Header::read_request(global_page()?), b"W\0");
     let mut radio = Radio::new(mock);
     radio.set_timeout(std::time::Duration::from_millis(5));
     let report = radio.probe_mcp(|| false).await;

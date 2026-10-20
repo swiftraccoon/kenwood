@@ -6,11 +6,11 @@ use std::collections::BTreeSet;
 use super::*;
 use crate::error::McpError;
 use crate::memory::{
-    Endian, FieldCodec, FieldDescriptor, FieldValue, MCP_D750_MENU_FIELDS, MenuValueError,
-    PatchPlanner, SLOT_TERM, menu_field,
+    FieldDescriptor, MCP_D750_MENU_FIELDS, MenuValueError, PatchPlanner, SLOT_TERM, menu_field,
 };
-use crate::protocol::mcp::{ACK, read_request, write_request};
+use crate::protocol::mcp::{ACK, Header};
 use crate::{Radio, Region};
+use kenwood_schema::{CodecSpec, Endian, FieldCodec, FieldValue};
 use kenwood_transport::MockTransport;
 
 type TestError = Box<dyn std::error::Error>;
@@ -32,11 +32,14 @@ const fn cross_page_field(base: u32, per_slot: bool) -> MenuField {
             "test.CrossPage",
             base,
             if per_slot { &[SLOT_TERM] } else { &[] },
-            FieldCodec::Unsigned {
+            match FieldCodec::new(CodecSpec::Unsigned {
                 width: 4,
                 endian: Endian::Little,
                 min: 0,
                 max: 0xFFFF_FFFF,
+            }) {
+                Ok(codec) => codec,
+                Err(_) => unreachable!(),
             },
         ),
         options: &[],
@@ -56,16 +59,16 @@ fn entry_mock() -> MockTransport {
 }
 
 fn queue_read(mock: &mut MockTransport, page: Page, bytes: &[u8]) {
-    let mut reply = write_request(page).to_vec();
+    let mut reply = Header::write_request(page).to_vec();
     reply.extend_from_slice(bytes);
-    mock.expect(&read_request(page), &reply);
+    mock.expect(&Header::read_request(page), reply);
     mock.expect(&[ACK], &[ACK]);
 }
 
 fn queue_verified_write(mock: &mut MockTransport, replacement: &PageReplacement) {
-    let mut frame = write_request(replacement.page()).to_vec();
+    let mut frame = Header::write_request(replacement.page()).to_vec();
     frame.extend_from_slice(replacement.replacement());
-    mock.expect(&frame, &[ACK]);
+    mock.expect(frame, &[ACK]);
     queue_read(mock, replacement.page(), replacement.replacement());
 }
 
@@ -620,7 +623,7 @@ async fn uncertain_read_refuses_even_an_empty_menu_request_without_more_traffic(
         .first()
         .ok_or("repeater mode must occupy a page")?;
     let mut mock = entry_mock();
-    mock.expect(&read_request(target), &[0; 5]);
+    mock.expect(&Header::read_request(target), &[0; 5]);
     let mut radio = Radio::new(mock);
     let mut session = radio.enter_mcp().await?;
     assert!(

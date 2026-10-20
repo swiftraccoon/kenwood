@@ -10,10 +10,6 @@
 //! this module checks their order and compares page bytes, but cannot confirm
 //! that a connection was fresh or that a journal record reached disk.
 
-mod channel;
-mod my1;
-mod pm1;
-
 use std::fmt;
 use std::num::NonZeroU64;
 use std::ops::Range;
@@ -24,6 +20,11 @@ pub use pm1::Pm1Name;
 
 use crate::radio::Identity;
 use crate::types::{DvGatewayMode, PAGE_SIZE, Page, PhysicalChannel};
+use TextFieldUpdateSession as Session;
+
+mod channel;
+mod my1;
+mod pm1;
 
 /// The storage fields a text update can change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,8 +220,6 @@ pub enum TextFieldUpdateEvent<'a, G: GuardPolicy> {
         guards: G::Final<'a>,
     },
 }
-
-use TextFieldUpdateSession as Session;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {

@@ -18,6 +18,9 @@ use tokio::time::Instant;
 
 use crate::radio::readiness::{CLOSE_BUDGET, CloseFailure, close_within};
 
+#[cfg(test)]
+mod tests;
+
 /// Total window for acquiring MMDVM framing after the Terminal update, from
 /// the first silent wait to the last probe. Host policy sized from
 /// observation, not a firmware bound.
@@ -115,6 +118,39 @@ pub struct ProvenModem<T> {
     version: VersionResponse,
 }
 
+/// A failed version probe retaining the exact connection for explicit retirement.
+#[derive(Debug)]
+pub struct ModemProbeFailure<T> {
+    transport: T,
+    error: ProbeError,
+}
+
+impl<T> ModemProbeFailure<T> {
+    /// The version-probe failure.
+    #[must_use]
+    pub const fn error(&self) -> &ProbeError {
+        &self.error
+    }
+
+    /// Recover the connection and its probe failure without additional I/O.
+    #[must_use]
+    pub fn into_parts(self) -> (T, ProbeError) {
+        (self.transport, self.error)
+    }
+}
+
+impl<T> std::fmt::Display for ModemProbeFailure<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl<T: std::fmt::Debug> std::error::Error for ModemProbeFailure<T> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
 impl<T: Transport> ProvenModem<T> {
     /// Send one `GET_VERSION` on `transport` and require a complete reply
     /// within `budget`.
@@ -124,12 +160,12 @@ impl<T: Transport> ProvenModem<T> {
     ///
     /// # Errors
     ///
-    /// Returns the transport and the [`ProbeError`]: an expired budget, a
+    /// Returns [`ModemProbeFailure`] with the transport and [`ProbeError`]: an expired budget, a
     /// transport failure, or a reply that is not a complete version frame.
-    pub async fn probe(mut transport: T, budget: Duration) -> Result<Self, (T, ProbeError)> {
+    pub async fn probe(mut transport: T, budget: Duration) -> Result<Self, ModemProbeFailure<T>> {
         match mmdvm::probe::probe_version(&mut transport, budget).await {
             Ok(version) => Ok(Self { transport, version }),
-            Err(error) => Err((transport, error)),
+            Err(error) => Err(ModemProbeFailure { transport, error }),
         }
     }
 
@@ -197,7 +233,7 @@ impl TransitionAttempt {
     pub fn reopen_refused(&self) -> bool {
         self.reopen_error
             .as_ref()
-            .is_some_and(|error| !error.retry_allowed)
+            .is_some_and(|error| !error.retry_allowed || !error.released)
     }
 }
 
@@ -205,6 +241,9 @@ impl TransitionAttempt {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum TransitionError {
+    /// The supplied acquisition duration cannot form an absolute deadline.
+    #[error("MMDVM transition window cannot be represented as an absolute deadline")]
+    UnrepresentableWindow,
     /// Cancellation was requested at a step boundary.
     #[error("MMDVM transition cancelled")]
     Cancelled,
@@ -247,10 +286,13 @@ impl<T> TransitionReport<T> {
     #[must_use]
     pub fn released(&self) -> bool {
         self.cleanup_error.is_none()
-            && self
-                .attempts
-                .iter()
-                .all(|attempt| attempt.retirement_error.is_none())
+            && self.attempts.iter().all(|attempt| {
+                attempt.retirement_error.is_none()
+                    && attempt
+                        .reopen_error
+                        .as_ref()
+                        .is_none_or(|error| error.released)
+            })
     }
 }
 
@@ -278,8 +320,14 @@ pub async fn acquire_modem_within<M: ModemHost>(
     cancelled: &AtomicBool,
     window: Duration,
 ) -> TransitionReport<M::Connection> {
-    let deadline = Instant::now() + window;
     let mut report = TransitionReport::pending();
+    let Some(deadline) = Instant::now().checked_add(window) else {
+        report.error = Some(TransitionError::UnrepresentableWindow);
+        if let Some(connection) = initial {
+            report.cleanup_error = host.retire(connection).await.err();
+        }
+        return report;
+    };
     let mut owner = initial;
     loop {
         if let Some(error) = stop_reason(deadline, cancelled) {
@@ -360,7 +408,8 @@ async fn probe_step<M: ModemHost>(
             report.attempts.push(attempt);
             ProbeStep::Proved(proof)
         }
-        Err((transport, error)) => {
+        Err(failure) => {
+            let (transport, error) = failure.into_parts();
             attempt.probe_error = Some(error);
             attempt.retirement_error = host.retire(transport).await.err();
             let mut next = None;
@@ -429,6 +478,3 @@ fn stop_reason(deadline: Instant, cancelled: &AtomicBool) -> Option<TransitionEr
         None
     }
 }
-
-#[cfg(test)]
-mod tests;

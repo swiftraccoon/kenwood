@@ -1,4 +1,5 @@
 #![no_main]
+//! Checks byte-preserving decoding and reconstruction of DTMF memories.
 
 use kenwood_tmd750::memory::dtmf::{DTMF_FIELD_SIZE, DtmfMemoryEntry};
 use libfuzzer_sys::fuzz_target;

@@ -4,7 +4,7 @@
 //! degree byte, a minute byte and a little-endian `u16` of ten-thousandths of
 //! a minute, with each hemisphere in a separate flag bit.
 
-use crate::error::ValidationError;
+use crate::error::{SettingName, ValidationError};
 
 /// An angle as whole degrees, whole minutes and ten-thousandths of a minute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -28,14 +28,14 @@ impl Coordinate {
     ) -> Result<Self, ValidationError> {
         if minutes > 59 {
             return Err(ValidationError::SettingOutOfRange {
-                setting: "position minutes",
+                setting: SettingName::PositionMinutes,
                 value: minutes as u64,
                 max: 59,
             });
         }
         if ten_thousandths > 9999 {
             return Err(ValidationError::SettingOutOfRange {
-                setting: "position minute fraction",
+                setting: SettingName::PositionMinuteFraction,
                 value: ten_thousandths as u64,
                 max: 9999,
             });
@@ -131,7 +131,7 @@ impl Latitude {
     ) -> Result<Self, ValidationError> {
         if coordinate.exceeds(90) {
             return Err(ValidationError::SettingOutOfRange {
-                setting: "latitude degrees",
+                setting: SettingName::LatitudeDegrees,
                 value: coordinate.degrees as u64,
                 max: 90,
             });
@@ -195,7 +195,7 @@ impl Longitude {
     ) -> Result<Self, ValidationError> {
         if coordinate.exceeds(180) {
             return Err(ValidationError::SettingOutOfRange {
-                setting: "longitude degrees",
+                setting: SettingName::LongitudeDegrees,
                 value: coordinate.degrees as u64,
                 max: 180,
             });

@@ -2,10 +2,16 @@
 
 use super::FieldAccess;
 use super::menu_fields::MenuField;
-use super::schema::{DecodedFieldValue, FieldCodec, FieldValue, PatchPlanner};
+use super::schema::PatchPlanner;
 use crate::error::SchemaError;
 use crate::types::SlotIndex;
-use kenwood_schema::{ChoiceError, validate_choices};
+use kenwood_schema::{
+    ChoiceError, CodecSpec, DecodedFieldValue, FieldValue, ValueKind, validate_choices,
+};
+
+#[cfg(test)]
+#[path = "menu_patch_tests.rs"]
+mod tests;
 
 /// Failure to parse or validate one scalar menu value.
 ///
@@ -85,11 +91,11 @@ impl MenuField {
     /// diagnostics.
     pub fn parse_value(&self, text: &str) -> Result<DecodedFieldValue, MenuValueError> {
         let field = self.descriptor.name;
-        if self.is_blob || matches!(self.descriptor.codec, FieldCodec::Bytes { .. }) {
+        if self.is_blob || matches!(self.descriptor.codec.spec(), CodecSpec::Bytes { .. }) {
             return Err(MenuValueError::UnsupportedBinaryField { field });
         }
-        let value = match self.descriptor.codec {
-            FieldCodec::Bool | FieldCodec::BitBool { .. } => {
+        let value = match self.descriptor.codec.spec() {
+            CodecSpec::Bool | CodecSpec::BitBool { .. } => {
                 let flag = if ["true", "on", "yes", "1"]
                     .iter()
                     .any(|alias| text.eq_ignore_ascii_case(alias))
@@ -105,14 +111,14 @@ impl MenuField {
                 };
                 DecodedFieldValue::Bool(flag)
             }
-            FieldCodec::Byte { .. } | FieldCodec::BitField { .. } | FieldCodec::Unsigned { .. } => {
+            CodecSpec::Byte { .. } | CodecSpec::BitField { .. } | CodecSpec::Unsigned { .. } => {
                 DecodedFieldValue::Unsigned(self.parse_unsigned(text)?)
             }
-            FieldCodec::Signed { .. } => DecodedFieldValue::Signed(
+            CodecSpec::Signed { .. } => DecodedFieldValue::Signed(
                 text.parse()
                     .map_err(|_| MenuValueError::InvalidSigned { field })?,
             ),
-            FieldCodec::FixedString { padding, .. } => {
+            CodecSpec::FixedString { padding, .. } => {
                 if text
                     .as_bytes()
                     .iter()
@@ -122,7 +128,7 @@ impl MenuField {
                 }
                 DecodedFieldValue::Text(text.to_owned())
             }
-            FieldCodec::Bytes { .. } => {
+            CodecSpec::Bytes { .. } => {
                 return Err(MenuValueError::UnsupportedBinaryField { field });
             }
         };
@@ -188,7 +194,7 @@ impl MenuField {
         .map_err(|error| match error {
             ChoiceError::TypeMismatch { actual } => SchemaError::TypeMismatch {
                 field: self.descriptor.name,
-                expected: "unsigned",
+                expected: ValueKind::Unsigned,
                 actual,
             },
             ChoiceError::DisallowedValue { value } => SchemaError::DisallowedValue {
@@ -225,7 +231,3 @@ impl PatchPlanner {
         self.set(&field.descriptor, slot, value)
     }
 }
-
-#[cfg(test)]
-#[path = "menu_patch_tests.rs"]
-mod tests;

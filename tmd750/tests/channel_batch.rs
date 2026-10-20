@@ -10,10 +10,10 @@ use tokio_serial as _;
 use tracing as _;
 
 use kenwood_tmd750::memory::{ChannelNamePlan, ChannelNameText};
-use kenwood_tmd750::protocol::mcp::{ACK, read_request, write_request};
+use kenwood_tmd750::protocol::mcp::{ACK, Header};
 use kenwood_tmd750::radio::{ChannelBatchError, ChannelWrite, Radio};
 use kenwood_tmd750::types::{CatMemoryChannelRecord, MemoryChannelAddress, PhysicalChannel};
-use kenwood_tmd750::{Address, Band, Error, Page, Progress, ProtocolError};
+use kenwood_tmd750::{Address, Band, CommandName, Error, Page, Progress, ProtocolError};
 use kenwood_transport::MockTransport;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -41,9 +41,9 @@ fn page(address: u32) -> Result<Page, Box<dyn std::error::Error>> {
 }
 
 fn read(mock: &mut MockTransport, page: Page, data: &[u8]) {
-    let mut reply = write_request(page).to_vec();
+    let mut reply = Header::write_request(page).to_vec();
     reply.extend_from_slice(data);
-    mock.expect(&read_request(page), &reply);
+    mock.expect(&Header::read_request(page), &reply);
     mock.expect(&[ACK], &[ACK]);
 }
 
@@ -126,7 +126,9 @@ async fn a_batch_stops_at_its_first_failure_and_reports_what_finished() -> TestR
     assert!(
         matches!(
             source,
-            Error::Protocol(ProtocolError::NotAvailable { command: "ME" })
+            Error::Protocol(ProtocolError::NotAvailable {
+                command: CommandName::Me
+            })
         ),
         "{source:?}"
     );
@@ -148,7 +150,7 @@ async fn channel_names_are_read_fresh_then_compare_exchanged() -> TestResult {
     mock.expect(b"0M PROGRAM\r", b"0M\r");
     read(&mut mock, names_page, &before);
     read(&mut mock, names_page, &before);
-    let mut frame = write_request(names_page).to_vec();
+    let mut frame = Header::write_request(names_page).to_vec();
     frame.extend_from_slice(&after);
     mock.expect(&frame, &[ACK]);
     read(&mut mock, names_page, &after);

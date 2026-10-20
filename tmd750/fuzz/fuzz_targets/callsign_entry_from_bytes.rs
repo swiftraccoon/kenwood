@@ -1,4 +1,5 @@
 #![no_main]
+//! Checks callsign records, memo text, and decoded callsign updates.
 
 use kenwood_tmd750::memory::StoredText;
 use kenwood_tmd750::memory::callsign_list::{CALLSIGN_ENTRY_SIZE, CallsignEntry};

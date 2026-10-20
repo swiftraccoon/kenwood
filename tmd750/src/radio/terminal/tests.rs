@@ -9,7 +9,7 @@ use kenwood_transport::{MockTransport, Transport, TransportError};
 
 use super::*;
 use crate::error::McpError;
-use crate::protocol::mcp::{ACK, read_request, write_request};
+use crate::protocol::mcp::{ACK, Header};
 use crate::radio::{Progress, Radio};
 use crate::types::{FirmwareIdentity, RadioModel, RadioType};
 
@@ -411,13 +411,13 @@ fn ready(firmware: &str) -> MockTransport {
 }
 
 fn frame(page: Page, bytes: &[u8]) -> Vec<u8> {
-    let mut frame = write_request(page).to_vec();
+    let mut frame = Header::write_request(page).to_vec();
     frame.extend_from_slice(bytes);
     frame
 }
 
 fn read(mock: &mut MockTransport, page: Page, bytes: &[u8]) {
-    mock.expect(&read_request(page), &frame(page, bytes));
+    mock.expect(&Header::read_request(page), frame(page, bytes));
     mock.expect(&[ACK], &[ACK]);
 }
 
@@ -470,10 +470,7 @@ async fn exercise_exchange_directions(forward: &TerminalPlan, changed_pages: usi
         let mut mock = ready("1.02");
         preflight(&mut mock, plan);
         for replacement in plan.replacements().iter().filter(|page| !page.is_noop()) {
-            mock.expect(
-                &frame(replacement.page(), replacement.replacement()),
-                &[ACK],
-            );
+            mock.expect(frame(replacement.page(), replacement.replacement()), &[ACK]);
             read(&mut mock, replacement.page(), replacement.replacement());
         }
         mock.expect(b"E", &[ACK]);
@@ -712,7 +709,7 @@ async fn complete_readback_mismatch_retains_debt_but_permits_clean_exit() -> Tes
     *actual.last_mut().ok_or("complete destination required")? ^= 1;
     let mut mock = ready("1.02");
     preflight(&mut mock, &plan);
-    mock.expect(&frame(changed.page(), changed.replacement()), &[ACK]);
+    mock.expect(frame(changed.page(), changed.replacement()), &[ACK]);
     read(&mut mock, changed.page(), &actual);
     mock.expect(b"E", &[ACK]);
     let mut radio = Radio::new(mock);

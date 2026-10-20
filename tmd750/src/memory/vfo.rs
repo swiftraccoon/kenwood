@@ -32,14 +32,19 @@
 
 use std::fmt;
 
-use crate::error::SchemaError;
+use crate::error::{SchemaError, SettingName, ValidationError};
 use crate::memory::chain;
-use crate::memory::{DecodedFieldValue, MemoryImage, MenuFieldId};
+use crate::memory::{MemoryImage, MenuFieldId};
 use crate::radio::programming::PageReplacement;
 use crate::types::{
     Band, CHANNEL_RECORD_SIZE, Frequency, OperatingMode, ShiftDirection, SlotIndex, StepSize,
     StoredChannel,
 };
+use kenwood_schema::DecodedFieldValue;
+
+#[cfg(test)]
+#[path = "vfo_tests.rs"]
+mod tests;
 
 /// Slot 0 address of band A's current VFO record.
 const CURRENT_A: u32 = 0x5_0100;
@@ -116,6 +121,29 @@ fn type_k_shift(frequency: Frequency) -> ShiftDirection {
 /// MHz, and [`StepSegment::of`] takes the first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StepSegment(u8);
+
+integer_formats!(StepSegment, index);
+
+impl TryFrom<u8> for StepSegment {
+    type Error = ValidationError;
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        if value < 17 {
+            Ok(Self(value))
+        } else {
+            Err(ValidationError::SettingOutOfRange {
+                setting: SettingName::StepSegment,
+                value: u64::from(value),
+                max: 16,
+            })
+        }
+    }
+}
+
+impl From<StepSegment> for u8 {
+    fn from(value: StepSegment) -> Self {
+        value.index()
+    }
+}
 
 impl StepSegment {
     /// The segments in stored order.
@@ -605,7 +633,10 @@ impl VfoMemory {
             return Err(outside);
         }
         record.receive_frequency = tuned;
-        if self.auto_offset && !record.reverse && !record.split && record.mode != OperatingMode::Dv
+        if self.auto_offset
+            && !record.reverse
+            && !record.split()
+            && record.mode.mode() != OperatingMode::Dv
         {
             record.shift = type_k_shift(tuned);
         }
@@ -803,7 +834,7 @@ pub enum VfoError {
         /// The record.
         what: VfoRecord,
         /// The decoding error.
-        source: crate::error::ValidationError,
+        source: ValidationError,
     },
     /// A selected index names no VFO band of its band.
     #[error("band {band}'s selected VFO band index {index} names none of its VFO bands")]
@@ -854,7 +885,3 @@ pub enum VfoError {
         source: SchemaError,
     },
 }
-
-#[cfg(test)]
-#[path = "vfo_tests.rs"]
-mod tests;

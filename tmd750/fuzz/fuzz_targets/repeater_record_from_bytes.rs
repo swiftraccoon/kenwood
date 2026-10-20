@@ -1,4 +1,5 @@
 #![no_main]
+//! Checks repeater records and their stored-text round trips.
 
 use kenwood_tmd750::memory::StoredText;
 use kenwood_tmd750::memory::repeater_list::{

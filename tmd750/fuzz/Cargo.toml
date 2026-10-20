@@ -1,9 +1,14 @@
 [package]
 name = "kenwood-tmd750-fuzz"
 version = "0.0.0"
-publish = false
+authors = ["swiftraccoon"]
+categories = ["development-tools::testing"]
 edition = "2024"
+keywords = ["kenwood", "fuzzing"]
 license = "GPL-2.0-or-later"
+publish = false
+repository = "https://github.com/swiftraccoon/kenwood"
+description = "Fuzz targets for the Kenwood TM-D750 protocol library"
 
 [package.metadata]
 cargo-fuzz = true
@@ -18,82 +23,134 @@ path = ".."
 [workspace]
 members = ["."]
 
+[lints]
+workspace = true
+
+[workspace.lints.rust]
+elided_lifetimes_in_paths = "deny"
+let_underscore_drop = "deny"
+missing_debug_implementations = "deny"
+missing_docs = "deny"
+non_ascii_idents = "deny"
+single_use_lifetimes = "deny"
+trivial_casts = "deny"
+trivial_numeric_casts = "deny"
+unreachable_pub = "deny"
+unsafe_code = "forbid"
+unused_crate_dependencies = "deny"
+unused_import_braces = "deny"
+unused_qualifications = "deny"
+unused_results = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+cargo = { level = "deny", priority = -1 }
+dbg_macro = "deny"
+expect_used = "deny"
+format_push_string = "deny"
+indexing_slicing = "deny"
+infinite_loop = "deny"
+mem_forget = "deny"
+missing_assert_message = "deny"
+missing_const_for_fn = "deny"
+module_name_repetitions = "allow"
+multiple_crate_versions = "allow"
+nursery = { level = "deny", priority = -1 }
+panic = "deny"
+pedantic = { level = "deny", priority = -1 }
+redundant_pub_crate = "allow"
+restriction = { level = "allow", priority = -1 }
+todo = "deny"
+undocumented_unsafe_blocks = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"
+
+[workspace.lints.rustdoc]
+bare_urls = "deny"
+broken_intra_doc_links = "deny"
+invalid_codeblock_attributes = "deny"
+missing_crate_level_docs = "deny"
+private_intra_doc_links = "deny"
+unescaped_backticks = "deny"
+
 [profile.release]
 debug = 1
 
 [[bin]]
+bench = false
+doc = false
 name = "cat_parse_line"
 path = "fuzz_targets/cat_parse_line.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "mcp_header_decode"
 path = "fuzz_targets/mcp_header_decode.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "d750_parse"
 path = "fuzz_targets/d750_parse.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "stored_channel_from_bytes"
 path = "fuzz_targets/stored_channel_from_bytes.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "repeater_record_from_bytes"
 path = "fuzz_targets/repeater_record_from_bytes.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "callsign_entry_from_bytes"
 path = "fuzz_targets/callsign_entry_from_bytes.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "dtmf_entry_from_bytes"
 path = "fuzz_targets/dtmf_entry_from_bytes.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "mic_e_entry_from_bytes"
 path = "fuzz_targets/mic_e_entry_from_bytes.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "voice_code_from_bytes"
 path = "fuzz_targets/voice_code_from_bytes.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "position_record_from_bytes"
 path = "fuzz_targets/position_record_from_bytes.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "nmea_parse"
 path = "fuzz_targets/nmea_parse.rs"
 test = false
-doc = false
-bench = false

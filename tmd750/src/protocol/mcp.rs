@@ -11,11 +11,11 @@
 
 use std::collections::BTreeMap;
 
-use crate::error::{ProtocolError, SchemaError};
+use crate::error::{CommandName, ProtocolError, ReplyField, SchemaError};
 use crate::types::{Address, PAGE_SIZE, Page};
 
 /// Baud rate of the whole programming session.
-pub const BAUD: u32 = 9600;
+pub const BAUD: std::num::NonZeroU32 = std::num::NonZeroU32::new(9600).unwrap();
 /// Programming-mode entry sent by the official program, without a leading CR.
 pub const ENTER: &[u8] = b"0M PROGRAM\r";
 /// Exact reply line the official program requires after [`ENTER`].
@@ -71,6 +71,12 @@ impl TryFrom<u8> for HeaderCommand {
             FILL => Ok(Self::Fill),
             _ => Err(ProtocolError::UnknownHeaderCommand { command }),
         }
+    }
+}
+
+impl From<HeaderCommand> for u8 {
+    fn from(value: HeaderCommand) -> Self {
+        value.as_byte()
     }
 }
 
@@ -147,9 +153,9 @@ impl Header {
         let command = HeaderCommand::try_from(command)?;
         let raw = u32::from_be_bytes([0, high, middle, low]);
         let address = Address::new(raw).map_err(|error| ProtocolError::FieldParse {
-            command: "MCP header",
-            field: "address",
-            detail: error.to_string(),
+            command: CommandName::McpHeader,
+            field: ReplyField::Address,
+            source: error.into(),
         })?;
         let len = if len == 0 {
             PAGE_SIZE
@@ -157,24 +163,36 @@ impl Header {
             usize::from(len)
         };
         let page = Page::new(address, len).map_err(|error| ProtocolError::FieldParse {
-            command: "MCP header",
-            field: "page",
-            detail: error.to_string(),
+            command: CommandName::McpHeader,
+            field: ReplyField::Page,
+            source: error.into(),
         })?;
         Ok(Self::new(command, page))
     }
+    /// Encode the header for reading one complete `page`.
+    #[must_use]
+    pub const fn read_request(page: Page) -> [u8; HEADER_LEN] {
+        Self::new(HeaderCommand::Read, page).encode()
+    }
+
+    /// Encode the header for writing `page`; its data follows on the wire.
+    #[must_use]
+    pub const fn write_request(page: Page) -> [u8; HEADER_LEN] {
+        Self::new(HeaderCommand::Write, page).encode()
+    }
 }
 
-/// The header for reading `page`.
-#[must_use]
-pub const fn read_request(page: Page) -> [u8; HEADER_LEN] {
-    Header::new(HeaderCommand::Read, page).encode()
+impl From<Header> for [u8; HEADER_LEN] {
+    fn from(value: Header) -> Self {
+        value.encode()
+    }
 }
 
-/// The header for writing `page`; the data follows it on the wire.
-#[must_use]
-pub const fn write_request(page: Page) -> [u8; HEADER_LEN] {
-    Header::new(HeaderCommand::Write, page).encode()
+impl TryFrom<[u8; HEADER_LEN]> for Header {
+    type Error = ProtocolError;
+    fn try_from(value: [u8; HEADER_LEN]) -> Result<Self, Self::Error> {
+        Self::decode(&value)
+    }
 }
 
 /// One masked byte update inside a page.
@@ -470,7 +488,7 @@ mod tests {
         assert!(matches!(
             Header::decode(&[READ, high, middle, low, 1]),
             Err(ProtocolError::FieldParse {
-                field: "address",
+                field: ReplyField::Address,
                 ..
             })
         ));
@@ -511,12 +529,12 @@ mod tests {
     #[test]
     fn headers_round_trip_with_256_as_zero() -> TestResult {
         let page = Page::new(Address::new(0x05_00_01)?, 256)?;
-        let request = read_request(page);
+        let request = Header::read_request(page);
         assert_eq!(request, [b'R', 0x05, 0x00, 0x01, 0x00]);
         let decoded = Header::decode(&request)?;
         assert_eq!(decoded.command(), HeaderCommand::Read);
         assert_eq!(decoded.page(), page);
-        let short = write_request(Page::new(Address::new(8)?, 40)?);
+        let short = Header::write_request(Page::new(Address::new(8)?, 40)?);
         assert_eq!(short, [b'W', 0x00, 0x00, 0x08, 40]);
         let unknown = Header::decode(&[b'Q', 0, 0, 0, 0]);
         assert!(

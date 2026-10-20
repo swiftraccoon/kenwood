@@ -160,6 +160,17 @@ impl<T: Transport> Radio<T> {
     /// or establish a safe protocol boundary for subsequent access.
     pub async fn backup_mcp_gateway_off_until_exit(
         &mut self,
+        should_cancel: impl FnMut() -> bool,
+        progress: impl FnMut(Progress),
+    ) -> McpBackupReport {
+        self.backup_mcp_checked_until_exit(None, should_cancel, progress)
+            .await
+    }
+
+    /// Back up only after the optional expected identity and Gateway Off match.
+    pub(super) async fn backup_mcp_checked_until_exit(
+        &mut self,
+        expected: Option<&Identity>,
         mut should_cancel: impl FnMut() -> bool,
         mut progress: impl FnMut(Progress),
     ) -> McpBackupReport {
@@ -175,6 +186,18 @@ impl<T: Transport> Radio<T> {
             report.fail(
                 McpBackupStage::Identity,
                 Error::UnsupportedWriteTarget { actual: identity },
+            );
+            return report;
+        }
+        if let (Some(expected), Some(actual)) = (expected, report.identity.as_ref())
+            && expected != actual
+        {
+            report.fail(
+                McpBackupStage::Identity,
+                Error::IdentityMismatch {
+                    expected: expected.clone(),
+                    actual: actual.clone(),
+                },
             );
             return report;
         }

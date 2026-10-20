@@ -38,25 +38,13 @@
 //! MCP exit retires the original connection; fresh connection selection and
 //! identity verification belong to the caller, not an automatic library retry.
 
-pub mod backup;
-mod cat;
-mod channel_batch;
-pub mod menu;
-mod pm1_page;
-pub mod probe;
-pub mod programming;
-pub mod readiness;
-pub mod session;
-pub mod terminal;
-pub mod text_field_update;
-mod transmit;
-
 use std::collections::VecDeque;
 use std::fmt;
+use std::num::NonZeroU32;
 use std::time::Duration;
 
-use crate::error::{Error, McpError, ProtocolError};
-use crate::protocol::cat::{Command, LINE_TERMINATOR, Response, parse_line};
+use crate::error::{CommandName, Error, McpError, ProtocolError, TimeoutOperation};
+use crate::protocol::cat::{Command, LINE_TERMINATOR, Response};
 use crate::types::{
     Band, DvGatewayMode, FirmwareIdentity, OperatingMode, RadioModel, RadioType, SelectableMode,
 };
@@ -66,6 +54,23 @@ pub use cat::{STEP_READBACK_ATTEMPTS, STEP_READBACK_INTERVAL, STEP_SETTLE, STEP_
 pub use channel_batch::{ChannelBatchError, ChannelWrite, ProgrammedChannels};
 pub use programming::{McpJournal, McpSession, RegionImage};
 pub use transmit::VOX_SETTLE;
+
+pub mod backup;
+mod cat;
+mod channel_batch;
+#[cfg(test)]
+mod identity_tests;
+#[cfg(test)]
+mod io_tests;
+pub mod menu;
+mod pm1_page;
+pub mod probe;
+pub mod programming;
+pub mod readiness;
+pub mod session;
+pub mod terminal;
+pub mod text_field_update;
+mod transmit;
 
 /// Default timeout for one serial write, CAT line, or MCP exchange step.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -419,23 +424,19 @@ impl<T: Transport> Radio<T> {
     pub async fn identify(&mut self) -> Result<Identity, Error> {
         tracing::debug!("identifying radio");
         let model = self
-            .query(Command::Identify, "Identity", |response| match response {
+            .query(Command::Identify, |response| match response {
                 Response::Identity { model } => Some(*model),
                 _ => None,
             })
             .await?;
         let firmware = self
-            .query(
-                Command::FirmwareVersion,
-                "FirmwareVersion",
-                |response| match response {
-                    Response::FirmwareVersion { version } => Some(version.clone()),
-                    _ => None,
-                },
-            )
+            .query(Command::FirmwareVersion, |response| match response {
+                Response::FirmwareVersion { version } => Some(version.clone()),
+                _ => None,
+            })
             .await?;
         let radio_type = self
-            .query(Command::RadioType, "RadioType", |response| match response {
+            .query(Command::RadioType, |response| match response {
                 Response::RadioType(radio_type) => Some(radio_type.clone()),
                 _ => None,
             })
@@ -468,7 +469,6 @@ impl<T: Transport> Radio<T> {
     pub async fn get_operating_mode(&mut self, band: Band) -> Result<OperatingMode, Error> {
         self.query(
             Command::GetOperatingMode { band },
-            "OperatingMode",
             |response| match response {
                 Response::OperatingMode { mode, .. } => Some(*mode),
                 _ => None,
@@ -500,7 +500,6 @@ impl<T: Transport> Radio<T> {
         self.apply(
             Command::SetOperatingMode { band, mode },
             Command::GetOperatingMode { band },
-            "OperatingMode",
             OperatingMode::from(mode),
             |response| match response {
                 Response::OperatingMode { mode, .. } => Some(*mode),
@@ -536,14 +535,10 @@ impl<T: Transport> Radio<T> {
     /// Returns transport, timeout, parse, rejection, unexpected-response, or
     /// session-state errors.
     pub async fn get_dv_gateway_mode(&mut self) -> Result<DvGatewayMode, Error> {
-        self.query(
-            Command::GetGatewayMode,
-            "GatewayMode",
-            |response| match response {
-                Response::GatewayMode(mode) => Some(*mode),
-                _ => None,
-            },
-        )
+        self.query(Command::GetGatewayMode, |response| match response {
+            Response::GatewayMode(mode) => Some(*mode),
+            _ => None,
+        })
         .await
     }
 
@@ -571,9 +566,23 @@ impl<T: Transport> Radio<T> {
         self.protocol_state = ProtocolState::CatUncertain;
         let timeout = self.reply_timeout(command);
         self.write_all(&command.encode()).await?;
+        let started = tokio::time::Instant::now();
         let mut stale = 0;
         loop {
-            let line = self.read_line_with(timeout, command.mnemonic()).await?;
+            let remaining = timeout.saturating_sub(started.elapsed());
+            let line = self
+                .read_line_with(remaining, TimeoutOperation::Command(command.name()))
+                .await
+                .map_err(|error| {
+                    if matches!(error, Error::Timeout { .. }) {
+                        Error::Timeout {
+                            operation: TimeoutOperation::Command(command.name()),
+                            timeout,
+                        }
+                    } else {
+                        error
+                    }
+                })?;
             if line.is_empty() {
                 stale += 1;
                 tracing::debug!(
@@ -589,7 +598,7 @@ impl<T: Transport> Radio<T> {
                 }
                 continue;
             }
-            let response = parse_line(&line)?;
+            let response = Response::from_bytes(&line)?;
             if command.correlates(&response) {
                 if matches!(response, Response::Rejected) {
                     self.settle_commands = REJECTION_SETTLE_COMMANDS;
@@ -608,7 +617,7 @@ impl<T: Transport> Radio<T> {
                 "discarded a reply line that does not answer the command"
             );
             if stale >= MAX_STALE_LINES {
-                return Err(unexpected(command.mnemonic(), &response));
+                return Err(unexpected(command.name(), &response));
             }
         }
     }
@@ -621,19 +630,18 @@ impl<T: Transport> Radio<T> {
     pub(crate) async fn query<V>(
         &mut self,
         command: Command,
-        expected: &'static str,
         extract: fn(&Response) -> Option<V>,
     ) -> Result<V, Error> {
         match self.command(&command).await? {
             Response::Rejected => Err(ProtocolError::Rejected {
-                command: command.mnemonic(),
+                command: command.name(),
             }
             .into()),
             Response::NotAvailable => Err(ProtocolError::NotAvailable {
-                command: command.mnemonic(),
+                command: command.name(),
             }
             .into()),
-            other => extract(&other).ok_or_else(|| unexpected(expected, &other)),
+            other => extract(&other).ok_or_else(|| unexpected(command.name(), &other)),
         }
     }
 
@@ -647,7 +655,6 @@ impl<T: Transport> Radio<T> {
         &mut self,
         write: Command,
         read: Command,
-        expected: &'static str,
         requested: V,
         extract: fn(&Response) -> Option<V>,
     ) -> Result<(), Error>
@@ -655,8 +662,8 @@ impl<T: Transport> Radio<T> {
         V: PartialEq + fmt::Display + Send + Sync,
     {
         self.require_write_target().await?;
-        let command = write.mnemonic();
-        let echoed = self.query(write, expected, extract).await?;
+        let command = write.name();
+        let echoed = self.query(write, extract).await?;
         if echoed != requested {
             return Err(ProtocolError::EchoMismatch {
                 command,
@@ -665,7 +672,7 @@ impl<T: Transport> Radio<T> {
             }
             .into());
         }
-        self.confirm(read, expected, &requested, extract).await
+        self.confirm(read, &requested, extract).await
     }
 
     /// Read a setting back and require it to equal `requested`.
@@ -674,15 +681,14 @@ impl<T: Transport> Radio<T> {
     pub(crate) async fn confirm<V>(
         &mut self,
         read: Command,
-        expected: &'static str,
         requested: &V,
         extract: fn(&Response) -> Option<V>,
     ) -> Result<(), Error>
     where
         V: PartialEq + fmt::Display + Send + Sync,
     {
-        let command = read.mnemonic();
-        let observed = self.query(read, expected, extract).await?;
+        let command = read.name();
+        let observed = self.query(read, extract).await?;
         if observed == *requested {
             Ok(())
         } else {
@@ -752,7 +758,7 @@ impl<T: Transport> Radio<T> {
         tokio::time::timeout(timeout, self.transport.write(bytes))
             .await
             .map_err(|_| Error::Timeout {
-                operation: "serial write",
+                operation: TimeoutOperation::SerialWrite,
                 timeout,
             })?
             .map_err(Error::Transport)
@@ -810,14 +816,17 @@ impl<T: Transport> Radio<T> {
         self.mcp_entry_reply.as_deref()
     }
 
-    pub(crate) fn set_baud(&mut self, baud: u32) -> Result<(), Error> {
+    pub(crate) fn set_baud(&mut self, baud: NonZeroU32) -> Result<(), Error> {
         self.transport.set_baud_rate(baud).map_err(Error::Transport)
     }
 
     /// Read one bounded CAT line while retaining all bytes after its terminator.
     ///
     /// Partial input remains owned by the radio if this future is cancelled.
-    pub(crate) async fn read_line(&mut self, operation: &'static str) -> Result<Vec<u8>, Error> {
+    pub(crate) async fn read_line(
+        &mut self,
+        operation: TimeoutOperation,
+    ) -> Result<Vec<u8>, Error> {
         let timeout = self.timeout;
         self.read_line_with(timeout, operation).await
     }
@@ -825,7 +834,7 @@ impl<T: Transport> Radio<T> {
     async fn read_line_with(
         &mut self,
         timeout: Duration,
-        operation: &'static str,
+        operation: TimeoutOperation,
     ) -> Result<Vec<u8>, Error> {
         tokio::time::timeout(timeout, async {
             loop {
@@ -863,7 +872,7 @@ impl<T: Transport> Radio<T> {
     pub(crate) async fn read_exact(
         &mut self,
         len: usize,
-        operation: &'static str,
+        operation: TimeoutOperation,
     ) -> Result<Vec<u8>, Error> {
         let timeout = self.timeout;
         tokio::time::timeout(timeout, async {
@@ -894,12 +903,7 @@ impl<T: Transport> Radio<T> {
     }
 }
 
-#[cfg(test)]
-mod identity_tests;
-#[cfg(test)]
-mod io_tests;
-
-fn unexpected(expected: &'static str, actual: &Response) -> Error {
+fn unexpected(expected: CommandName, actual: &Response) -> Error {
     Error::Protocol(ProtocolError::UnexpectedResponse {
         expected,
         actual: format!("{actual:?}"),

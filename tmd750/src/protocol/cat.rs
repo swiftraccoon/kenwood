@@ -8,15 +8,15 @@
 //! connector and its reply read; a setter's reply echoes the accepted setting
 //! in the read form.
 
-use crate::error::ProtocolError;
+use crate::error::{CommandName, ProtocolError, ReplyField, ReplyFieldError};
 use crate::types::{
     AmHighCut, AprsCallsign, BacklightControl, Band, BandControl, BandDisplay, BeaconMethod,
     CHANNEL_FIELD_COUNT, CatChannelRecord, CatMemoryChannelRecord, CurrentMemorySelector,
-    DstarCallsignEntry, DstarSlot, DvGatewayMode, FirmwareIdentity, Frequency, GpsSettings,
-    MemoryChannelAddress, MyPositionSelection, NmeaSentences, OperatingMode, PacketDataRate,
-    PowerLevel, RadioModel, RadioType, RealTimeClock, SMeterReading, SelectableMode,
-    SelectableTncMode, SerialInformation, SquelchLevel, StepSize, TncMode, TuningMode, VoxDelay,
-    VoxGain, VoxMode,
+    DstarCallsignEntry, DstarCallsignText, DstarSlot, DvGatewayMode, FirmwareIdentity, Frequency,
+    GpsSettings, MemoryChannelAddress, MyPositionSelection, NmeaSentences, OperatingMode,
+    PacketDataRate, PowerLevel, RadioModel, RadioType, RealTimeClock, SMeterReading,
+    SelectableMode, SelectableTncMode, SerialInformation, SquelchLevel, StepSize, TncMode,
+    TuningMode, VoxDelay, VoxGain, VoxMode,
 };
 
 use super::channel::{parse_channel_fields, parse_memory_channel};
@@ -321,50 +321,56 @@ impl Command {
     /// The two-letter mnemonic.
     #[must_use]
     pub const fn mnemonic(&self) -> &'static str {
+        self.name().as_str()
+    }
+
+    /// Typed command label used by reply and exchange failures.
+    #[must_use]
+    pub const fn name(&self) -> CommandName {
         match *self {
-            Self::Identify => "ID",
-            Self::FirmwareVersion => "FV",
-            Self::RadioType => "TY",
-            Self::SerialInformation => "AE",
-            Self::PowerStatus | Self::PowerOff => "PS",
-            Self::RealTimeClock => "RT",
-            Self::GetOperatingMode { .. } | Self::SetOperatingMode { .. } => "MD",
-            Self::GetGatewayMode => "GW",
-            Self::GetFrequency { .. } | Self::SetFrequency { .. } => "FQ",
-            Self::GetChannelRecord { .. } | Self::SetChannelRecord { .. } => "FO",
-            Self::GetPowerLevel { .. } | Self::SetPowerLevel { .. } => "PC",
-            Self::GetTuningMode { .. } | Self::SetTuningMode { .. } => "VM",
-            Self::GetSquelch { .. } | Self::SetSquelch { .. } => "SQ",
-            Self::GetSmeter { .. } => "SM",
-            Self::GetBusy { .. } => "BY",
-            Self::GetAttenuator { .. } | Self::SetAttenuator { .. } => "RA",
-            Self::GetStepSize { .. } | Self::SetStepSize { .. } => "SF",
-            Self::GetAmHighCut | Self::SetAmHighCut { .. } => "SH",
-            Self::FrequencyUp => "UP",
-            Self::FrequencyDown => "DW",
-            Self::GetCurrentChannel { .. } | Self::RecallMemoryChannel { .. } => "MR",
+            Self::Identify => CommandName::Id,
+            Self::FirmwareVersion => CommandName::Fv,
+            Self::RadioType => CommandName::Ty,
+            Self::SerialInformation => CommandName::Ae,
+            Self::PowerStatus | Self::PowerOff => CommandName::Ps,
+            Self::RealTimeClock => CommandName::Rt,
+            Self::GetOperatingMode { .. } | Self::SetOperatingMode { .. } => CommandName::Md,
+            Self::GetGatewayMode => CommandName::Gw,
+            Self::GetFrequency { .. } | Self::SetFrequency { .. } => CommandName::Fq,
+            Self::GetChannelRecord { .. } | Self::SetChannelRecord { .. } => CommandName::Fo,
+            Self::GetPowerLevel { .. } | Self::SetPowerLevel { .. } => CommandName::Pc,
+            Self::GetTuningMode { .. } | Self::SetTuningMode { .. } => CommandName::Vm,
+            Self::GetSquelch { .. } | Self::SetSquelch { .. } => CommandName::Sq,
+            Self::GetSmeter { .. } => CommandName::Sm,
+            Self::GetBusy { .. } => CommandName::By,
+            Self::GetAttenuator { .. } | Self::SetAttenuator { .. } => CommandName::Ra,
+            Self::GetStepSize { .. } | Self::SetStepSize { .. } => CommandName::Sf,
+            Self::GetAmHighCut | Self::SetAmHighCut { .. } => CommandName::Sh,
+            Self::FrequencyUp => CommandName::Up,
+            Self::FrequencyDown => CommandName::Dw,
+            Self::GetCurrentChannel { .. } | Self::RecallMemoryChannel { .. } => CommandName::Mr,
             Self::GetMemoryChannel { .. }
             | Self::WriteMemoryChannel { .. }
-            | Self::ClearMemoryChannel { .. } => "ME",
-            Self::GetDstarCallsign { .. } | Self::SetDstarCallsign { .. } => "DC",
-            Self::GetBandControl | Self::SetBandControl { .. } => "BC",
-            Self::GetBandDisplay | Self::SetBandDisplay { .. } => "DL",
-            Self::GetDstarSlot | Self::SetDstarSlot { .. } => "DS",
-            Self::GetBacklightControl | Self::SetBacklightControl { .. } => "LC",
-            Self::GetMyPositionSelection | Self::SetMyPositionSelection { .. } => "MS",
-            Self::GetPacketDataRate | Self::SetPacketDataRate { .. } => "AS",
-            Self::GetBeaconMethod | Self::SetBeaconMethod { .. } => "PT",
-            Self::GetTncMode | Self::SetTncMode { .. } => "TN",
-            Self::GetVoxDelay | Self::SetVoxDelay { .. } => "VD",
-            Self::GetVoxGain | Self::SetVoxGain { .. } => "VG",
-            Self::GetVox | Self::SetVox { .. } => "VX",
-            Self::GetGpsSettings | Self::SetGpsSettings { .. } => "GP",
-            Self::GetGpsSentences | Self::SetGpsSentences { .. } => "GS",
-            Self::GetBluetooth | Self::SetBluetooth { .. } => "BT",
-            Self::GetAprsCallsign | Self::SetAprsCallsign { .. } => "CS",
-            Self::Transmit => "TX",
-            Self::Receive => "RX",
-            Self::SendAprsBeacon => "BE",
+            | Self::ClearMemoryChannel { .. } => CommandName::Me,
+            Self::GetDstarCallsign { .. } | Self::SetDstarCallsign { .. } => CommandName::Dc,
+            Self::GetBandControl | Self::SetBandControl { .. } => CommandName::Bc,
+            Self::GetBandDisplay | Self::SetBandDisplay { .. } => CommandName::Dl,
+            Self::GetDstarSlot | Self::SetDstarSlot { .. } => CommandName::Ds,
+            Self::GetBacklightControl | Self::SetBacklightControl { .. } => CommandName::Lc,
+            Self::GetMyPositionSelection | Self::SetMyPositionSelection { .. } => CommandName::Ms,
+            Self::GetPacketDataRate | Self::SetPacketDataRate { .. } => CommandName::As,
+            Self::GetBeaconMethod | Self::SetBeaconMethod { .. } => CommandName::Pt,
+            Self::GetTncMode | Self::SetTncMode { .. } => CommandName::Tn,
+            Self::GetVoxDelay | Self::SetVoxDelay { .. } => CommandName::Vd,
+            Self::GetVoxGain | Self::SetVoxGain { .. } => CommandName::Vg,
+            Self::GetVox | Self::SetVox { .. } => CommandName::Vx,
+            Self::GetGpsSettings | Self::SetGpsSettings { .. } => CommandName::Gp,
+            Self::GetGpsSentences | Self::SetGpsSentences { .. } => CommandName::Gs,
+            Self::GetBluetooth | Self::SetBluetooth { .. } => CommandName::Bt,
+            Self::GetAprsCallsign | Self::SetAprsCallsign { .. } => CommandName::Cs,
+            Self::Transmit => CommandName::Tx,
+            Self::Receive => CommandName::Rx,
+            Self::SendAprsBeacon => CommandName::Be,
         }
     }
 
@@ -536,8 +542,8 @@ impl Command {
             Self::SetDstarCallsign { ref entry } => Some(format!(
                 "{},{},{}",
                 entry.slot.as_raw(),
-                entry.callsign,
-                entry.memo
+                entry.callsign(),
+                entry.memo()
             )),
             Self::SetBandControl { roles } => Some(format!(
                 "{},{}",
@@ -921,57 +927,73 @@ pub enum Response {
     },
 }
 
-/// Parse one reply line (with or without its terminator).
-///
-/// # Errors
-///
-/// Returns [`ProtocolError::NonAsciiLine`] for non-ASCII bytes,
-/// [`ProtocolError::EmptyLine`] for an empty line,
-/// [`ProtocolError::UnexpectedIdentity`] for an `ID` payload other than
-/// `TM-D750`, [`ProtocolError::FieldCount`] for the wrong number of fields,
-/// and [`ProtocolError::FieldParse`] for a malformed typed payload.
-pub fn parse_line(line: &[u8]) -> Result<Response, ProtocolError> {
-    let line = line.strip_suffix(&[LINE_TERMINATOR]).unwrap_or(line);
-    if !line.is_ascii() {
-        return Err(ProtocolError::NonAsciiLine {
-            line: line.to_vec(),
-        });
-    }
-    let text = String::from_utf8_lossy(line);
-    let text = text.as_ref();
-    match text {
-        "?" => return Ok(Response::Rejected),
-        "N" => return Ok(Response::NotAvailable),
-        "" => {
-            return Err(ProtocolError::EmptyLine {
-                line: String::new(),
+impl Response {
+    /// Parse one reply line (with or without its terminator).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError::NonAsciiLine`] for non-ASCII bytes,
+    /// [`ProtocolError::EmptyLine`] for an empty line,
+    /// [`ProtocolError::UnexpectedIdentity`] for an `ID` payload other than
+    /// `TM-D750`, [`ProtocolError::FieldCount`] for the wrong number of fields,
+    /// and [`ProtocolError::FieldParse`] for a malformed typed payload.
+    pub fn from_bytes(line: &[u8]) -> Result<Self, ProtocolError> {
+        let line = line.strip_suffix(&[LINE_TERMINATOR]).unwrap_or(line);
+        if !line.is_ascii() {
+            return Err(ProtocolError::NonAsciiLine {
+                line: line.to_vec(),
             });
         }
-        _ => {}
+        let text = String::from_utf8_lossy(line);
+        let text = text.as_ref();
+        match text {
+            "?" => return Ok(Self::Rejected),
+            "N" => return Ok(Self::NotAvailable),
+            "" => {
+                return Err(ProtocolError::EmptyLine {
+                    line: String::new(),
+                });
+            }
+            _ => {}
+        }
+        let (mnemonic, payload) = text.split_once(' ').unwrap_or((text, ""));
+        if let Some(response) = parse_identity(mnemonic, payload)? {
+            return Ok(response);
+        }
+        if let Some(response) = parse_band_indexed(mnemonic, payload)? {
+            return Ok(response);
+        }
+        if let Some(response) = parse_band_levels(mnemonic, payload)? {
+            return Ok(response);
+        }
+        if let Some(response) = parse_memory(mnemonic, payload)? {
+            return Ok(response);
+        }
+        if let Some(response) = parse_global(mnemonic, payload)? {
+            return Ok(response);
+        }
+        if let Some(response) = parse_transmit(mnemonic, payload)? {
+            return Ok(response);
+        }
+        Ok(Self::Other {
+            mnemonic: mnemonic.to_owned(),
+            payload: payload.to_owned(),
+        })
     }
-    let (mnemonic, payload) = text.split_once(' ').unwrap_or((text, ""));
-    if let Some(response) = parse_identity(mnemonic, payload)? {
-        return Ok(response);
+}
+
+impl TryFrom<&[u8]> for Response {
+    type Error = ProtocolError;
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        Self::from_bytes(value)
     }
-    if let Some(response) = parse_band_indexed(mnemonic, payload)? {
-        return Ok(response);
+}
+
+impl std::str::FromStr for Response {
+    type Err = ProtocolError;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::from_bytes(value.as_bytes())
     }
-    if let Some(response) = parse_band_levels(mnemonic, payload)? {
-        return Ok(response);
-    }
-    if let Some(response) = parse_memory(mnemonic, payload)? {
-        return Ok(response);
-    }
-    if let Some(response) = parse_global(mnemonic, payload)? {
-        return Ok(response);
-    }
-    if let Some(response) = parse_transmit(mnemonic, payload)? {
-        return Ok(response);
-    }
-    Ok(Response::Other {
-        mnemonic: mnemonic.to_owned(),
-        payload: payload.to_owned(),
-    })
 }
 
 fn parse_identity(mnemonic: &str, payload: &str) -> Result<Option<Response>, ProtocolError> {
@@ -983,23 +1005,29 @@ fn parse_identity(mnemonic: &str, payload: &str) -> Result<Option<Response>, Pro
             })?,
         "FV" => FirmwareIdentity::new(payload)
             .map(|version| Response::FirmwareVersion { version })
-            .map_err(|error| field_error("FV", "version", error.to_string()))?,
+            .map_err(|error| field_error(CommandName::Fv, ReplyField::Version, error))?,
         "TY" => RadioType::new(payload)
             .map(Response::RadioType)
-            .map_err(|error| field_error("TY", "radio_type", error.to_string()))?,
+            .map_err(|error| field_error(CommandName::Ty, ReplyField::RadioType, error))?,
         "AE" => {
-            let [serial, code] = split_exact::<2>(payload, "AE")?;
+            let [serial, code] = split_exact::<2>(payload, CommandName::Ae)?;
             SerialInformation::new(serial, code)
                 .map(Response::SerialInformation)
-                .map_err(|error| field_error("AE", "serial_information", error.to_string()))?
+                .map_err(|error| {
+                    field_error(CommandName::Ae, ReplyField::SerialInformation, error)
+                })?
         }
         "PS" => Response::PowerStatus {
-            on: boolean(payload, "PS", "power")?,
+            on: boolean(payload, CommandName::Ps, ReplyField::Power)?,
         },
         "RT" => RealTimeClock::from_wire_str(payload)
             .map(Response::RealTimeClock)
-            .map_err(|error| field_error("RT", "clock", error.to_string()))?,
-        "GW" => Response::GatewayMode(DvGatewayMode::from(decimal_u8(payload, "GW", "mode")?)),
+            .map_err(|error| field_error(CommandName::Rt, ReplyField::Clock, error))?,
+        "GW" => Response::GatewayMode(DvGatewayMode::from(decimal_u8(
+            payload,
+            CommandName::Gw,
+            ReplyField::Mode,
+        )?)),
         _ => return Ok(None),
     };
     Ok(Some(response))
@@ -1008,58 +1036,60 @@ fn parse_identity(mnemonic: &str, payload: &str) -> Result<Option<Response>, Pro
 fn parse_band_indexed(mnemonic: &str, payload: &str) -> Result<Option<Response>, ProtocolError> {
     let response = match mnemonic {
         "MD" => {
-            let [band_field, mode] = split_exact::<2>(payload, "MD")?;
+            let [band_field, mode] = split_exact::<2>(payload, CommandName::Md)?;
             Response::OperatingMode {
-                band: band(band_field, "MD")?,
-                mode: OperatingMode::from(decimal_u8(mode, "MD", "mode")?),
+                band: band(band_field, CommandName::Md)?,
+                mode: OperatingMode::from(decimal_u8(mode, CommandName::Md, ReplyField::Mode)?),
             }
         }
         "FQ" => {
-            let [band_field, hz] = split_exact::<2>(payload, "FQ")?;
+            let [band_field, hz] = split_exact::<2>(payload, CommandName::Fq)?;
             Response::Frequency {
-                band: band(band_field, "FQ")?,
+                band: band(band_field, CommandName::Fq)?,
                 frequency: Frequency::from_wire_str(hz)
-                    .map_err(|error| field_error("FQ", "frequency", error.to_string()))?,
+                    .map_err(|error| field_error(CommandName::Fq, ReplyField::Frequency, error))?,
             }
         }
         "FO" => {
             let (band_field, rest) = payload.split_once(',').ok_or(ProtocolError::FieldCount {
-                command: "FO",
+                command: CommandName::Fo,
                 expected: CHANNEL_FIELD_COUNT + 1,
                 actual: 1,
             })?;
             let fields =
-                split_exact::<CHANNEL_FIELD_COUNT>(rest, "FO").map_err(|error| match error {
-                    ProtocolError::FieldCount {
-                        command,
-                        expected,
-                        actual,
-                    } => ProtocolError::FieldCount {
-                        command,
-                        expected: expected + 1,
-                        actual: actual + 1,
-                    },
-                    other => other,
+                split_exact::<CHANNEL_FIELD_COUNT>(rest, CommandName::Fo).map_err(|error| {
+                    match error {
+                        ProtocolError::FieldCount {
+                            command,
+                            expected,
+                            actual,
+                        } => ProtocolError::FieldCount {
+                            command,
+                            expected: expected + 1,
+                            actual: actual + 1,
+                        },
+                        other => other,
+                    }
                 })?;
             Response::ChannelRecord {
-                band: band(band_field, "FO")?,
-                record: parse_channel_fields(&fields, "FO")?,
+                band: band(band_field, CommandName::Fo)?,
+                record: parse_channel_fields(&fields, CommandName::Fo)?,
             }
         }
         "PC" => {
-            let [band_field, level] = split_exact::<2>(payload, "PC")?;
+            let [band_field, level] = split_exact::<2>(payload, CommandName::Pc)?;
             Response::PowerLevel {
-                band: band(band_field, "PC")?,
-                level: PowerLevel::try_from(decimal_u8(level, "PC", "level")?)
-                    .map_err(|error| field_error("PC", "level", error.to_string()))?,
+                band: band(band_field, CommandName::Pc)?,
+                level: PowerLevel::try_from(decimal_u8(level, CommandName::Pc, ReplyField::Level)?)
+                    .map_err(|error| field_error(CommandName::Pc, ReplyField::Level, error))?,
             }
         }
         "VM" => {
-            let [band_field, mode] = split_exact::<2>(payload, "VM")?;
+            let [band_field, mode] = split_exact::<2>(payload, CommandName::Vm)?;
             Response::TuningMode {
-                band: band(band_field, "VM")?,
-                mode: TuningMode::try_from(decimal_u8(mode, "VM", "mode")?)
-                    .map_err(|error| field_error("VM", "mode", error.to_string()))?,
+                band: band(band_field, CommandName::Vm)?,
+                mode: TuningMode::try_from(decimal_u8(mode, CommandName::Vm, ReplyField::Mode)?)
+                    .map_err(|error| field_error(CommandName::Vm, ReplyField::Mode, error))?,
             }
         }
         _ => return Ok(None),
@@ -1070,54 +1100,60 @@ fn parse_band_indexed(mnemonic: &str, payload: &str) -> Result<Option<Response>,
 fn parse_band_levels(mnemonic: &str, payload: &str) -> Result<Option<Response>, ProtocolError> {
     let response = match mnemonic {
         "SQ" => {
-            let [band_field, level] = split_exact::<2>(payload, "SQ")?;
+            let [band_field, level] = split_exact::<2>(payload, CommandName::Sq)?;
             Response::Squelch {
-                band: band(band_field, "SQ")?,
-                level: SquelchLevel::new(decimal_u8(level, "SQ", "level")?)
-                    .map_err(|error| field_error("SQ", "level", error.to_string()))?,
+                band: band(band_field, CommandName::Sq)?,
+                level: SquelchLevel::new(decimal_u8(level, CommandName::Sq, ReplyField::Level)?)
+                    .map_err(|error| field_error(CommandName::Sq, ReplyField::Level, error))?,
             }
         }
         "SM" => {
-            let [band_field, reading] = split_exact::<2>(payload, "SM")?;
+            let [band_field, reading] = split_exact::<2>(payload, CommandName::Sm)?;
             Response::Smeter {
-                band: band(band_field, "SM")?,
-                reading: SMeterReading::new(decimal_u8(reading, "SM", "reading")?),
+                band: band(band_field, CommandName::Sm)?,
+                reading: SMeterReading::new(decimal_u8(
+                    reading,
+                    CommandName::Sm,
+                    ReplyField::Reading,
+                )?),
             }
         }
         "BY" => {
-            let [band_field, busy] = split_exact::<2>(payload, "BY")?;
+            let [band_field, busy] = split_exact::<2>(payload, CommandName::By)?;
             Response::Busy {
-                band: band(band_field, "BY")?,
-                busy: boolean(busy, "BY", "busy")?,
+                band: band(band_field, CommandName::By)?,
+                busy: boolean(busy, CommandName::By, ReplyField::Busy)?,
             }
         }
         "RA" => {
-            let [band_field, enabled] = split_exact::<2>(payload, "RA")?;
+            let [band_field, enabled] = split_exact::<2>(payload, CommandName::Ra)?;
             Response::Attenuator {
-                band: band(band_field, "RA")?,
-                enabled: boolean(enabled, "RA", "enabled")?,
+                band: band(band_field, CommandName::Ra)?,
+                enabled: boolean(enabled, CommandName::Ra, ReplyField::Enabled)?,
             }
         }
         "SF" => {
-            let [band_field, step] = split_exact::<2>(payload, "SF")?;
+            let [band_field, step] = split_exact::<2>(payload, CommandName::Sf)?;
             Response::StepSize {
-                band: band(band_field, "SF")?,
+                band: band(band_field, CommandName::Sf)?,
                 step: StepSize::from_wire_str(step)
-                    .map_err(|error| field_error("SF", "step", error.to_string()))?,
+                    .map_err(|error| field_error(CommandName::Sf, ReplyField::Step, error))?,
             }
         }
         "SH" => {
-            let [filter, cut] = split_exact::<2>(payload, "SH")?;
+            let [filter, cut] = split_exact::<2>(payload, CommandName::Sh)?;
             if filter != "0" {
                 return Err(field_error(
-                    "SH",
-                    "filter",
-                    format!("expected filter index 0, got {filter:?}"),
+                    CommandName::Sh,
+                    ReplyField::Filter,
+                    ReplyFieldError::FilterIndex {
+                        value: filter.to_owned(),
+                    },
                 ));
             }
             Response::AmHighCut(
-                AmHighCut::try_from(decimal_u8(cut, "SH", "cut")?)
-                    .map_err(|error| field_error("SH", "cut", error.to_string()))?,
+                AmHighCut::try_from(decimal_u8(cut, CommandName::Sh, ReplyField::Cut)?)
+                    .map_err(|error| field_error(CommandName::Sh, ReplyField::Cut, error))?,
             )
         }
         _ => return Ok(None),
@@ -1129,39 +1165,51 @@ fn parse_memory(mnemonic: &str, payload: &str) -> Result<Option<Response>, Proto
     let response = match mnemonic {
         "UP" | "DW" if !payload.is_empty() => {
             return Err(field_error(
-                mnemonic_static(mnemonic),
-                "payload",
-                format!("expected a bare acknowledgement, got {payload:?}"),
+                if mnemonic == "UP" {
+                    CommandName::Up
+                } else {
+                    CommandName::Dw
+                },
+                ReplyField::Payload,
+                ReplyFieldError::UnexpectedPayload {
+                    value: payload.to_owned(),
+                },
             ));
         }
         "UP" => Response::FrequencyUpAck,
         "DW" => Response::FrequencyDownAck,
         "MR" => match payload.split_once(',') {
             Some((band_field, address)) => Response::MemoryRecallAck {
-                band: band(band_field, "MR")?,
+                band: band(band_field, CommandName::Mr)?,
                 address: MemoryChannelAddress::from_wire_str(address)
-                    .map_err(|error| field_error("MR", "address", error.to_string()))?,
+                    .map_err(|error| field_error(CommandName::Mr, ReplyField::Address, error))?,
             },
             None => Response::CurrentChannel(
                 CurrentMemorySelector::from_wire_str(payload)
-                    .map_err(|error| field_error("MR", "selector", error.to_string()))?,
+                    .map_err(|error| field_error(CommandName::Mr, ReplyField::Selector, error))?,
             ),
         },
         "ME" if !payload.contains(',') => Response::MemoryChannelCleared {
             address: MemoryChannelAddress::from_wire_str(payload)
-                .map_err(|error| field_error("ME", "address", error.to_string()))?,
+                .map_err(|error| field_error(CommandName::Me, ReplyField::Address, error))?,
         },
         "ME" => {
             let (address, record) = parse_memory_channel(payload)?;
             Response::MemoryChannel { address, record }
         }
         "DC" => {
-            let [slot, callsign, memo] = split_exact::<3>(payload, "DC")?;
-            let slot = DstarSlot::new(decimal_u8(slot, "DC", "slot")?)
-                .map_err(|error| field_error("DC", "slot", error.to_string()))?;
+            let [slot, callsign, memo] = split_exact::<3>(payload, CommandName::Dc)?;
+            let slot = DstarSlot::new(decimal_u8(slot, CommandName::Dc, ReplyField::Slot)?)
+                .map_err(|error| field_error(CommandName::Dc, ReplyField::Slot, error))?;
             Response::DstarCallsign(
-                DstarCallsignEntry::new(slot, callsign, memo)
-                    .map_err(|error| field_error("DC", "callsign", error.to_string()))?,
+                DstarCallsignEntry::new(
+                    slot,
+                    DstarCallsignText {
+                        callsign: callsign.into(),
+                        memo: memo.into(),
+                    },
+                )
+                .map_err(|error| field_error(CommandName::Dc, ReplyField::Callsign, error))?,
             )
         }
         _ => return Ok(None),
@@ -1172,76 +1220,80 @@ fn parse_memory(mnemonic: &str, payload: &str) -> Result<Option<Response>, Proto
 fn parse_global(mnemonic: &str, payload: &str) -> Result<Option<Response>, ProtocolError> {
     let response = match mnemonic {
         "BC" => {
-            let [control, ptt] = split_exact::<2>(payload, "BC")?;
+            let [control, ptt] = split_exact::<2>(payload, CommandName::Bc)?;
             Response::BandControl(BandControl {
-                control: band(control, "BC")?,
-                ptt: band(ptt, "BC")?,
+                control: band(control, CommandName::Bc)?,
+                ptt: band(ptt, CommandName::Bc)?,
             })
         }
         "DL" => Response::BandDisplay(
-            BandDisplay::try_from(decimal_u8(payload, "DL", "display")?)
-                .map_err(|error| field_error("DL", "display", error.to_string()))?,
+            BandDisplay::try_from(decimal_u8(payload, CommandName::Dl, ReplyField::Display)?)
+                .map_err(|error| field_error(CommandName::Dl, ReplyField::Display, error))?,
         ),
         "DS" => Response::DstarSlot(
-            DstarSlot::new(decimal_u8(payload, "DS", "slot")?)
-                .map_err(|error| field_error("DS", "slot", error.to_string()))?,
+            DstarSlot::new(decimal_u8(payload, CommandName::Ds, ReplyField::Slot)?)
+                .map_err(|error| field_error(CommandName::Ds, ReplyField::Slot, error))?,
         ),
         "LC" => Response::BacklightControl(
-            BacklightControl::new(decimal_u8(payload, "LC", "control")?)
-                .map_err(|error| field_error("LC", "control", error.to_string()))?,
+            BacklightControl::new(decimal_u8(payload, CommandName::Lc, ReplyField::Control)?)
+                .map_err(|error| field_error(CommandName::Lc, ReplyField::Control, error))?,
         ),
         "MS" => Response::MyPositionSelection(
-            MyPositionSelection::new(decimal_u8(payload, "MS", "selection")?)
-                .map_err(|error| field_error("MS", "selection", error.to_string()))?,
+            MyPositionSelection::new(decimal_u8(payload, CommandName::Ms, ReplyField::Selection)?)
+                .map_err(|error| field_error(CommandName::Ms, ReplyField::Selection, error))?,
         ),
         "AS" => Response::PacketDataRate(
-            PacketDataRate::try_from(decimal_u8(payload, "AS", "rate")?)
-                .map_err(|error| field_error("AS", "rate", error.to_string()))?,
+            PacketDataRate::try_from(decimal_u8(payload, CommandName::As, ReplyField::Rate)?)
+                .map_err(|error| field_error(CommandName::As, ReplyField::Rate, error))?,
         ),
         "PT" => Response::BeaconMethod(
-            BeaconMethod::try_from(decimal_u8(payload, "PT", "method")?)
-                .map_err(|error| field_error("PT", "method", error.to_string()))?,
+            BeaconMethod::try_from(decimal_u8(payload, CommandName::Pt, ReplyField::Method)?)
+                .map_err(|error| field_error(CommandName::Pt, ReplyField::Method, error))?,
         ),
         "TN" => {
-            let [mode, data_band] = split_exact::<2>(payload, "TN")?;
+            let [mode, data_band] = split_exact::<2>(payload, CommandName::Tn)?;
             Response::TncMode {
-                mode: TncMode::from(decimal_u8(mode, "TN", "mode")?),
-                data_band: band(data_band, "TN")?,
+                mode: TncMode::from(decimal_u8(mode, CommandName::Tn, ReplyField::Mode)?),
+                data_band: band(data_band, CommandName::Tn)?,
             }
         }
         "VD" => Response::VoxDelay(
-            VoxDelay::new(decimal_u8(payload, "VD", "delay")?)
-                .map_err(|error| field_error("VD", "delay", error.to_string()))?,
+            VoxDelay::new(decimal_u8(payload, CommandName::Vd, ReplyField::Delay)?)
+                .map_err(|error| field_error(CommandName::Vd, ReplyField::Delay, error))?,
         ),
         "VG" => Response::VoxGain(
-            VoxGain::new(decimal_u8(payload, "VG", "gain")?)
-                .map_err(|error| field_error("VG", "gain", error.to_string()))?,
+            VoxGain::new(decimal_u8(payload, CommandName::Vg, ReplyField::Gain)?)
+                .map_err(|error| field_error(CommandName::Vg, ReplyField::Gain, error))?,
         ),
-        "VX" => Response::Vox(VoxMode::from(decimal_u8(payload, "VX", "state")?)),
+        "VX" => Response::Vox(VoxMode::from(decimal_u8(
+            payload,
+            CommandName::Vx,
+            ReplyField::State,
+        )?)),
         "GP" => {
-            let [gps, pc] = split_exact::<2>(payload, "GP")?;
+            let [gps, pc] = split_exact::<2>(payload, CommandName::Gp)?;
             Response::GpsSettings(GpsSettings {
-                gps_enabled: boolean(gps, "GP", "gps")?,
-                pc_output: boolean(pc, "GP", "pc_output")?,
+                gps_enabled: boolean(gps, CommandName::Gp, ReplyField::Gps)?,
+                pc_output: boolean(pc, CommandName::Gp, ReplyField::PcOutput)?,
             })
         }
         "GS" => {
-            let [gga, gll, gsa, gsv, rmc, vtg] = split_exact::<6>(payload, "GS")?;
+            let [gga, gll, gsa, gsv, rmc, vtg] = split_exact::<6>(payload, CommandName::Gs)?;
             Response::GpsSentences(NmeaSentences::from_flags([
-                boolean(gga, "GS", "gga")?,
-                boolean(gll, "GS", "gll")?,
-                boolean(gsa, "GS", "gsa")?,
-                boolean(gsv, "GS", "gsv")?,
-                boolean(rmc, "GS", "rmc")?,
-                boolean(vtg, "GS", "vtg")?,
+                boolean(gga, CommandName::Gs, ReplyField::Gga)?,
+                boolean(gll, CommandName::Gs, ReplyField::Gll)?,
+                boolean(gsa, CommandName::Gs, ReplyField::Gsa)?,
+                boolean(gsv, CommandName::Gs, ReplyField::Gsv)?,
+                boolean(rmc, CommandName::Gs, ReplyField::Rmc)?,
+                boolean(vtg, CommandName::Gs, ReplyField::Vtg)?,
             ]))
         }
         "BT" => Response::Bluetooth {
-            enabled: boolean(payload, "BT", "enabled")?,
+            enabled: boolean(payload, CommandName::Bt, ReplyField::Enabled)?,
         },
         "CS" => Response::AprsCallsign(
             AprsCallsign::new(payload)
-                .map_err(|error| field_error("CS", "callsign", error.to_string()))?,
+                .map_err(|error| field_error(CommandName::Cs, ReplyField::Callsign, error))?,
         ),
         _ => return Ok(None),
     };
@@ -1250,9 +1302,9 @@ fn parse_global(mnemonic: &str, payload: &str) -> Result<Option<Response>, Proto
 
 fn parse_transmit(mnemonic: &str, payload: &str) -> Result<Option<Response>, ProtocolError> {
     let (command, response, expected) = match mnemonic {
-        "TX" => ("TX", Response::TransmitAck, "1"),
-        "RX" => ("RX", Response::ReceiveAck, ""),
-        "BE" => ("BE", Response::AprsBeaconAck, ""),
+        "TX" => (CommandName::Tx, Response::TransmitAck, "1"),
+        "RX" => (CommandName::Rx, Response::ReceiveAck, ""),
+        "BE" => (CommandName::Be, Response::AprsBeaconAck, ""),
         _ => return Ok(None),
     };
     if payload == expected {
@@ -1260,16 +1312,17 @@ fn parse_transmit(mnemonic: &str, payload: &str) -> Result<Option<Response>, Pro
     } else {
         Err(field_error(
             command,
-            "payload",
-            format!("expected {expected:?}, got {payload:?}"),
+            ReplyField::Payload,
+            if command == CommandName::Tx {
+                ReplyFieldError::TransmitPayload {
+                    value: payload.to_owned(),
+                }
+            } else {
+                ReplyFieldError::UnexpectedPayload {
+                    value: payload.to_owned(),
+                }
+            },
         ))
-    }
-}
-
-const fn mnemonic_static(mnemonic: &str) -> &'static str {
-    match mnemonic.as_bytes() {
-        b"UP" => "UP",
-        _ => "DW",
     }
 }
 
@@ -1491,7 +1544,13 @@ mod tests {
         assert_encodings(vec![
             (
                 Command::SetDstarCallsign {
-                    entry: DstarCallsignEntry::new(DstarSlot::new(6)?, "KQ4NIT", "RIG")?,
+                    entry: DstarCallsignEntry::new(
+                        DstarSlot::new(6)?,
+                        DstarCallsignText {
+                            callsign: "KQ4NIT".into(),
+                            memo: "RIG".into(),
+                        },
+                    )?,
                 },
                 b"DC 6,KQ4NIT,RIG\r",
             ),
@@ -1536,7 +1595,7 @@ mod tests {
         );
         assert!(!Command::GetAprsCallsign.is_write());
         assert_eq!(
-            parse_line(b"CS NOCALL\r")?,
+            Response::from_bytes(b"CS NOCALL\r")?,
             Response::AprsCallsign(AprsCallsign::new("NOCALL")?)
         );
         let get = Command::GetAprsCallsign;
@@ -1553,51 +1612,54 @@ mod tests {
     #[test]
     fn identity_replies_parse() -> TestResult {
         assert_eq!(
-            parse_line(b"ID TM-D750\r")?,
+            Response::from_bytes(b"ID TM-D750\r")?,
             Response::Identity {
                 model: RadioModel::TmD750
             }
         );
         assert_eq!(
-            parse_line(b"FV 1.00")?,
+            Response::from_bytes(b"FV 1.00")?,
             Response::FirmwareVersion {
                 version: FirmwareIdentity::new("1.00")?
             }
         );
         assert_eq!(
-            parse_line(b"TY K,2,1")?,
+            Response::from_bytes(b"TY K,2,1")?,
             Response::RadioType(RadioType::new("K,2,1")?)
         );
         assert_eq!(
-            parse_line(b"AE A1234567,K01")?,
+            Response::from_bytes(b"AE A1234567,K01")?,
             Response::SerialInformation(SerialInformation::new("A1234567", "K01")?)
         );
-        assert_eq!(parse_line(b"PS 1")?, Response::PowerStatus { on: true });
         assert_eq!(
-            parse_line(b"RT 260921003607")?,
+            Response::from_bytes(b"PS 1")?,
+            Response::PowerStatus { on: true }
+        );
+        assert_eq!(
+            Response::from_bytes(b"RT 260921003607")?,
             Response::RealTimeClock(RealTimeClock::from_wire_str("260921003607")?)
         );
         assert_eq!(
-            parse_line(b"MD 0,1")?,
+            Response::from_bytes(b"MD 0,1")?,
             Response::OperatingMode {
                 band: Band::A,
                 mode: OperatingMode::Dv,
             }
         );
         assert_eq!(
-            parse_line(b"GW 2")?,
+            Response::from_bytes(b"GW 2")?,
             Response::GatewayMode(DvGatewayMode::Terminal),
             "the observed Terminal reply must parse as a named read value"
         );
         assert_eq!(
-            parse_line(b"GW 1")?,
-            Response::GatewayMode(DvGatewayMode::Unnamed(1)),
+            Response::from_bytes(b"GW 1")?,
+            Response::GatewayMode(DvGatewayMode::from(1)),
             "unobserved GW 1 must remain losslessly unnamed"
         );
-        assert_eq!(parse_line(b"?")?, Response::Rejected);
-        assert_eq!(parse_line(b"N")?, Response::NotAvailable);
+        assert_eq!(Response::from_bytes(b"?")?, Response::Rejected);
+        assert_eq!(Response::from_bytes(b"N")?, Response::NotAvailable);
         assert_eq!(
-            parse_line(b"XX 1")?,
+            Response::from_bytes(b"XX 1")?,
             Response::Other {
                 mnemonic: "XX".to_owned(),
                 payload: "1".to_owned()
@@ -1609,7 +1671,8 @@ mod tests {
     #[test]
     fn a_channel_record_write_encodes_its_fields_and_correlates_with_its_band() -> TestResult {
         const LINE: &str = "FO 1,0223020000,0001600000,8,8,0,0,0,0,0,0,0,08,08,000,0,CQCQCQ,0,00";
-        let Response::ChannelRecord { band, record } = parse_line(LINE.as_bytes())? else {
+        let Response::ChannelRecord { band, record } = Response::from_bytes(LINE.as_bytes())?
+        else {
             return Err("FO must parse as a channel record".into());
         };
         let write = Command::SetChannelRecord {
@@ -1636,70 +1699,71 @@ mod tests {
     #[test]
     fn band_indexed_replies_parse() -> TestResult {
         assert_eq!(
-            parse_line(b"FQ 0,0145190000")?,
+            Response::from_bytes(b"FQ 0,0145190000")?,
             Response::Frequency {
                 band: Band::A,
                 frequency: Frequency::new(145_190_000)?
             }
         );
-        let Response::ChannelRecord { band, record } =
-            parse_line(b"FO 1,0121500000,0000000000,6,6,2,0,0,0,0,0,0,08,08,000,0,CQCQCQ,0,00")?
+        let Response::ChannelRecord { band, record } = Response::from_bytes(
+            b"FO 1,0121500000,0000000000,6,6,2,0,0,0,0,0,0,08,08,000,0,CQCQCQ,0,00",
+        )?
         else {
             return Err("FO must parse as a channel record".into());
         };
         assert_eq!(band, Band::B);
         assert_eq!(record.mode, OperatingMode::Am);
         assert_eq!(
-            parse_line(b"PC 1,1")?,
+            Response::from_bytes(b"PC 1,1")?,
             Response::PowerLevel {
                 band: Band::B,
                 level: PowerLevel::Medium
             }
         );
         assert_eq!(
-            parse_line(b"VM 0,3")?,
+            Response::from_bytes(b"VM 0,3")?,
             Response::TuningMode {
                 band: Band::A,
                 mode: TuningMode::DStarRepeater
             }
         );
         assert_eq!(
-            parse_line(b"SQ 1,10")?,
+            Response::from_bytes(b"SQ 1,10")?,
             Response::Squelch {
                 band: Band::B,
                 level: SquelchLevel::new(10)?
             }
         );
         assert_eq!(
-            parse_line(b"SM 0,9")?,
+            Response::from_bytes(b"SM 0,9")?,
             Response::Smeter {
                 band: Band::A,
                 reading: SMeterReading::new(9)
             }
         );
         assert_eq!(
-            parse_line(b"BY 0,1")?,
+            Response::from_bytes(b"BY 0,1")?,
             Response::Busy {
                 band: Band::A,
                 busy: true
             }
         );
         assert_eq!(
-            parse_line(b"RA 0,0")?,
+            Response::from_bytes(b"RA 0,0")?,
             Response::Attenuator {
                 band: Band::A,
                 enabled: false
             }
         );
         assert_eq!(
-            parse_line(b"SF 1,8")?,
+            Response::from_bytes(b"SF 1,8")?,
             Response::StepSize {
                 band: Band::B,
                 step: StepSize::Hz20000
             }
         );
         assert_eq!(
-            parse_line(b"SH 0,2")?,
+            Response::from_bytes(b"SH 0,2")?,
             Response::AmHighCut(AmHighCut::Hz6000)
         );
         Ok(())
@@ -1707,111 +1771,123 @@ mod tests {
 
     #[test]
     fn memory_and_global_replies_parse() -> TestResult {
-        assert_eq!(parse_line(b"UP")?, Response::FrequencyUpAck);
-        assert_eq!(parse_line(b"DW")?, Response::FrequencyDownAck);
+        assert_eq!(Response::from_bytes(b"UP")?, Response::FrequencyUpAck);
+        assert_eq!(Response::from_bytes(b"DW")?, Response::FrequencyDownAck);
         assert_eq!(
-            parse_line(b"MR AP ")?,
+            Response::from_bytes(b"MR AP ")?,
             Response::CurrentChannel(CurrentMemorySelector::Aprs)
         );
         assert_eq!(
-            parse_line(b"MR 0,021")?,
+            Response::from_bytes(b"MR 0,021")?,
             Response::MemoryRecallAck {
                 band: Band::A,
                 address: MemoryChannelAddress::regular(21)?
             }
         );
-        let Response::MemoryChannel { address, record } = parse_line(
+        let Response::MemoryChannel { address, record } = Response::from_bytes(
             b"ME 021,0446000000,0000000000,2,2,0,0,0,0,0,0,0,0,08,08,000,0,CQCQCQ,0,00,0",
         )?
         else {
             return Err("ME must parse as a memory channel".into());
         };
         assert_eq!(address, MemoryChannelAddress::regular(21)?);
-        assert!(!record.split);
+        assert!(!record.split());
         assert_eq!(
-            parse_line(b"DC 1,,")?,
-            Response::DstarCallsign(DstarCallsignEntry::new(DstarSlot::new(1)?, "", "")?)
+            Response::from_bytes(b"DC 1,,")?,
+            Response::DstarCallsign(DstarCallsignEntry::empty(DstarSlot::new(1)?))
         );
         assert_eq!(
-            parse_line(b"BC 1,0")?,
+            Response::from_bytes(b"BC 1,0")?,
             Response::BandControl(BandControl {
                 control: Band::B,
                 ptt: Band::A
             })
         );
         assert_eq!(
-            parse_line(b"DL 0")?,
+            Response::from_bytes(b"DL 0")?,
             Response::BandDisplay(BandDisplay::Dual)
         );
         assert_eq!(
-            parse_line(b"DS 6")?,
+            Response::from_bytes(b"DS 6")?,
             Response::DstarSlot(DstarSlot::new(6)?)
         );
         assert_eq!(
-            parse_line(b"LC 3")?,
+            Response::from_bytes(b"LC 3")?,
             Response::BacklightControl(BacklightControl::new(3)?)
         );
         assert_eq!(
-            parse_line(b"MS 0")?,
+            Response::from_bytes(b"MS 0")?,
             Response::MyPositionSelection(MyPositionSelection::GPS)
         );
         assert_eq!(
-            parse_line(b"AS 0")?,
+            Response::from_bytes(b"AS 0")?,
             Response::PacketDataRate(PacketDataRate::Bps1200)
         );
         assert_eq!(
-            parse_line(b"PT 2")?,
+            Response::from_bytes(b"PT 2")?,
             Response::BeaconMethod(BeaconMethod::Auto)
         );
         assert_eq!(
-            parse_line(b"TN 0,0")?,
+            Response::from_bytes(b"TN 0,0")?,
             Response::TncMode {
                 mode: TncMode::Off,
                 data_band: Band::A
             }
         );
-        assert_eq!(parse_line(b"VD 1")?, Response::VoxDelay(VoxDelay::new(1)?));
-        assert_eq!(parse_line(b"VG 4")?, Response::VoxGain(VoxGain::new(4)?));
-        assert_eq!(parse_line(b"VX 0")?, Response::Vox(VoxMode::Off));
         assert_eq!(
-            parse_line(b"GP 1,0")?,
+            Response::from_bytes(b"VD 1")?,
+            Response::VoxDelay(VoxDelay::new(1)?)
+        );
+        assert_eq!(
+            Response::from_bytes(b"VG 4")?,
+            Response::VoxGain(VoxGain::new(4)?)
+        );
+        assert_eq!(Response::from_bytes(b"VX 0")?, Response::Vox(VoxMode::Off));
+        assert_eq!(
+            Response::from_bytes(b"GP 1,0")?,
             Response::GpsSettings(GpsSettings {
                 gps_enabled: true,
                 pc_output: false
             })
         );
         assert_eq!(
-            parse_line(b"GS 1,0,0,0,1,0")?,
+            Response::from_bytes(b"GS 1,0,0,0,1,0")?,
             Response::GpsSentences(NmeaSentences::from_flags([
                 true, false, false, false, true, false
             ]))
         );
-        assert_eq!(parse_line(b"BT 1")?, Response::Bluetooth { enabled: true });
+        assert_eq!(
+            Response::from_bytes(b"BT 1")?,
+            Response::Bluetooth { enabled: true }
+        );
         Ok(())
     }
 
     #[test]
     fn foreign_identities_and_bad_bytes_are_errors() {
-        let d75 = parse_line(b"ID TH-D75");
+        let d75 = Response::from_bytes(b"ID TH-D75");
         assert!(
             matches!(d75, Err(ProtocolError::UnexpectedIdentity { ref reply }) if reply == "TH-D75"),
             "{d75:?}"
         );
-        let empty = parse_line(b"");
+        let empty = Response::from_bytes(b"");
         assert!(
             matches!(empty, Err(ProtocolError::EmptyLine { .. })),
             "{empty:?}"
         );
-        let non_ascii = parse_line(&[b'I', b'D', b' ', 0xFF]);
+        let non_ascii = Response::from_bytes(&[b'I', b'D', b' ', 0xFF]);
         assert!(
             matches!(non_ascii, Err(ProtocolError::NonAsciiLine { .. })),
             "{non_ascii:?}"
         );
-        let bad_type = parse_line(b"TY ");
+        let bad_type = Response::from_bytes(b"TY ");
         assert!(
             matches!(
                 bad_type,
-                Err(ProtocolError::FieldParse { command: "TY", .. })
+                Err(ProtocolError::FieldParse {
+                    command: CommandName::Ty,
+                    ..
+                })
             ),
             "{bad_type:?}"
         );
@@ -1857,7 +1933,7 @@ mod tests {
             b"RT 26092100360",
             b"AE A1234567",
         ] {
-            let result = parse_line(line);
+            let result = Response::from_bytes(line);
             assert!(
                 matches!(
                     result,
@@ -1868,22 +1944,22 @@ mod tests {
             );
         }
         assert_eq!(
-            parse_line(b"MD 0,7"),
+            Response::from_bytes(b"MD 0,7"),
             Ok(Response::OperatingMode {
                 band: Band::A,
-                mode: OperatingMode::Unnamed(7),
+                mode: OperatingMode::from(7),
             })
         );
         assert_eq!(
-            parse_line(b"GW 3"),
-            Ok(Response::GatewayMode(DvGatewayMode::Unnamed(3)))
+            Response::from_bytes(b"GW 3"),
+            Ok(Response::GatewayMode(DvGatewayMode::from(3)))
         );
-        let short_record = parse_line(b"FO 0,0145190000");
+        let short_record = Response::from_bytes(b"FO 0,0145190000");
         assert!(
             matches!(
                 short_record,
                 Err(ProtocolError::FieldCount {
-                    command: "FO",
+                    command: CommandName::Fo,
                     expected: 19,
                     actual: 2
                 })
@@ -1896,7 +1972,7 @@ mod tests {
     fn memory_channel_writes_encode_parse_and_correlate() -> TestResult {
         let payload = "998,0146520000,0146540000,2,2,0,1,0,0,0,0,1,0,08,08,000,0,CQCQCQ,0,00,1";
         let Response::MemoryChannel { address, record } =
-            parse_line(format!("ME {payload}").as_bytes())?
+            Response::from_bytes(format!("ME {payload}").as_bytes())?
         else {
             return Err("ME must parse as a memory channel".into());
         };
@@ -1913,13 +1989,13 @@ mod tests {
         let clear = Command::ClearMemoryChannel { address };
         assert_eq!(clear.encode(), b"ME 998,\r");
         assert_eq!(
-            parse_line(b"ME 998")?,
+            Response::from_bytes(b"ME 998")?,
             Response::MemoryChannelCleared { address }
         );
         assert!(clear.correlates(&Response::MemoryChannelCleared { address }));
         assert!(!clear.correlates(&Response::MemoryChannel { address, record }));
         assert!(
-            parse_line(b"ME 99").is_err(),
+            Response::from_bytes(b"ME 99").is_err(),
             "a cleared address keeps the three-character form"
         );
         Ok(())
@@ -1962,34 +2038,40 @@ mod tests {
             slot: DstarSlot::new(2)?,
         };
         assert!(
-            slot.correlates(&Response::DstarCallsign(DstarCallsignEntry::new(
-                DstarSlot::new(2)?,
-                "",
-                ""
-            )?))
+            slot.correlates(&Response::DstarCallsign(DstarCallsignEntry::empty(
+                DstarSlot::new(2)?
+            )))
         );
         assert!(
-            !slot.correlates(&Response::DstarCallsign(DstarCallsignEntry::new(
-                DstarSlot::new(3)?,
-                "",
-                ""
-            )?))
+            !slot.correlates(&Response::DstarCallsign(DstarCallsignEntry::empty(
+                DstarSlot::new(3)?
+            )))
         );
         let write = Command::SetDstarCallsign {
-            entry: DstarCallsignEntry::new(DstarSlot::new(6)?, "KQ4NIT", "RIG")?,
+            entry: DstarCallsignEntry::new(
+                DstarSlot::new(6)?,
+                DstarCallsignText {
+                    callsign: "KQ4NIT".into(),
+                    memo: "RIG".into(),
+                },
+            )?,
         };
         assert!(
             write.correlates(&Response::DstarCallsign(DstarCallsignEntry::new(
                 DstarSlot::new(6)?,
-                "KQ4NIT",
-                "RIG"
+                DstarCallsignText {
+                    callsign: "KQ4NIT".into(),
+                    memo: "RIG".into()
+                },
             )?))
         );
         assert!(
             !write.correlates(&Response::DstarCallsign(DstarCallsignEntry::new(
                 DstarSlot::new(1)?,
-                "KQ4NIT",
-                "RIG"
+                DstarCallsignText {
+                    callsign: "KQ4NIT".into(),
+                    memo: "RIG".into()
+                },
             )?))
         );
         assert!(
@@ -2039,22 +2121,22 @@ mod tests {
         ] {
             assert!(command.is_write(), "{command:?}");
         }
-        assert_eq!(parse_line(b"TX 1")?, Response::TransmitAck);
-        assert_eq!(parse_line(b"RX")?, Response::ReceiveAck);
-        assert_eq!(parse_line(b"BE")?, Response::AprsBeaconAck);
+        assert_eq!(Response::from_bytes(b"TX 1")?, Response::TransmitAck);
+        assert_eq!(Response::from_bytes(b"RX")?, Response::ReceiveAck);
+        assert_eq!(Response::from_bytes(b"BE")?, Response::AprsBeaconAck);
         assert!(Command::Transmit.correlates(&Response::TransmitAck));
         assert!(!Command::Transmit.correlates(&Response::ReceiveAck));
         assert!(Command::Receive.correlates(&Response::ReceiveAck));
         assert!(Command::SendAprsBeacon.correlates(&Response::AprsBeaconAck));
         assert_eq!(
-            parse_line(b"TN 2,1")?,
+            Response::from_bytes(b"TN 2,1")?,
             Response::TncMode {
                 mode: TncMode::Kiss,
                 data_band: Band::B
             }
         );
         assert_eq!(
-            parse_line(b"TN 1,0")?,
+            Response::from_bytes(b"TN 1,0")?,
             Response::TncMode {
                 mode: TncMode::Aprs,
                 data_band: Band::A
@@ -2070,12 +2152,12 @@ mod tests {
                 data_band: Band::B
             })
         );
-        assert_eq!(parse_line(b"VX 1")?, Response::Vox(VoxMode::On));
+        assert_eq!(Response::from_bytes(b"VX 1")?, Response::Vox(VoxMode::On));
         assert!(Command::SetVox { enabled: true }.correlates(&Response::Vox(VoxMode::On)));
         assert!(Command::PowerOff.correlates(&Response::PowerStatus { on: false }));
         for malformed in [b"TX".as_slice(), b"TX 0", b"TX 2", b"RX 0", b"BE 1"] {
             assert!(
-                parse_line(malformed).is_err(),
+                Response::from_bytes(malformed).is_err(),
                 "{}",
                 String::from_utf8_lossy(malformed)
             );

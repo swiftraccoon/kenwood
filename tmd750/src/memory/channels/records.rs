@@ -12,6 +12,10 @@ use crate::types::{
     MemoryChannelAddress, Page, PhysicalChannel, StoredChannel,
 };
 
+#[cfg(test)]
+#[path = "records_tests.rs"]
+mod tests;
+
 /// Stores and clears of regular, program scan and priority channels, planned
 /// as whole-page writes.
 ///
@@ -149,7 +153,3 @@ fn writable_page(address: usize) -> Option<Page> {
     let address = Address::new(u32::try_from(address).ok()?).ok()?;
     regions::writable_page_for(address)
 }
-
-#[cfg(test)]
-#[path = "records_tests.rs"]
-mod tests;

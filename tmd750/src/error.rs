@@ -1,6 +1,14 @@
 //! Error hierarchy: one top-level [`Error`] with typed sub-errors.
 
+use kenwood_schema::ValueKind;
 use kenwood_transport::TransportError;
+
+pub use labels::{
+    AckStage, CommandName, McpWriteOperation, ReplyField, ReplyFieldError, SettingName,
+    TimeoutOperation,
+};
+
+mod labels;
 
 /// Any failure of this crate.
 #[derive(Debug, thiserror::Error)]
@@ -35,7 +43,7 @@ pub enum Error {
     #[error("{operation} timed out after {timeout:?}")]
     Timeout {
         /// What was waited for.
-        operation: &'static str,
+        operation: TimeoutOperation,
         /// The deadline that elapsed.
         timeout: std::time::Duration,
     },
@@ -85,7 +93,7 @@ pub enum Error {
         /// Frequency read before the step and after every readback attempt.
         frequency: crate::types::Frequency,
         /// The step command mnemonic, `UP` or `DW`.
-        step: &'static str,
+        step: CommandName,
     },
     /// The radio did not acknowledge the `RX` that
     /// [`crate::radio::Radio::transmit_until`] sent after a `TX` that may
@@ -115,6 +123,20 @@ pub enum Error {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ValidationError {
+    /// A stored packed field cannot retain all bits of the supplied value.
+    #[error("packed field value {value} exceeds its maximum {maximum}")]
+    PackedValueOutOfRange {
+        /// The rejected complete value.
+        value: u8,
+        /// Largest value retained without losing bits.
+        maximum: u8,
+    },
+    /// A byte already has a named receive-enum variant.
+    #[error("wire value {value} has a named variant and cannot be unnamed")]
+    NamedWireValue {
+        /// The byte with an existing named representation.
+        value: u8,
+    },
     /// The `ID` payload is not `TM-D750`.
     #[error("unsupported radio model {model:?}; this crate speaks only TM-D750")]
     UnsupportedRadioModel {
@@ -233,7 +255,7 @@ pub enum ValidationError {
     #[error("{setting} {value} is outside its domain (maximum {max})")]
     SettingOutOfRange {
         /// The setting.
-        setting: &'static str,
+        setting: SettingName,
         /// Rejected value.
         value: u64,
         /// Largest accepted value.
@@ -389,20 +411,21 @@ pub enum ProtocolError {
         line: String,
     },
     /// A CAT reply field failed to parse.
-    #[error("{command} reply field {field} could not be parsed: {detail}")]
+    #[error("{command} reply field {field} could not be parsed: {source}")]
     FieldParse {
         /// Command mnemonic.
-        command: &'static str,
+        command: CommandName,
         /// Field name.
-        field: &'static str,
+        field: ReplyField,
         /// What was wrong.
-        detail: String,
+        #[source]
+        source: ReplyFieldError,
     },
     /// A CAT reply had the wrong number of comma-separated fields.
     #[error("{command} reply has {actual} fields, expected {expected}")]
     FieldCount {
         /// Command mnemonic.
-        command: &'static str,
+        command: CommandName,
         /// Expected field count.
         expected: usize,
         /// Actual field count.
@@ -412,7 +435,7 @@ pub enum ProtocolError {
     #[error("expected {expected} reply, got {actual}")]
     UnexpectedResponse {
         /// Expected reply kind.
-        expected: &'static str,
+        expected: CommandName,
         /// What arrived.
         actual: String,
     },
@@ -421,7 +444,7 @@ pub enum ProtocolError {
     #[error("{command} write echoed {echoed}, requested {requested}")]
     EchoMismatch {
         /// Command mnemonic.
-        command: &'static str,
+        command: CommandName,
         /// The requested value.
         requested: String,
         /// The value the echo carried.
@@ -431,7 +454,7 @@ pub enum ProtocolError {
     #[error("{command} read back {observed}, requested {requested}")]
     ReadbackMismatch {
         /// Command mnemonic.
-        command: &'static str,
+        command: CommandName,
         /// The requested value.
         requested: String,
         /// The value the readback reported.
@@ -441,13 +464,13 @@ pub enum ProtocolError {
     #[error("{command} was rejected with ?")]
     Rejected {
         /// Command mnemonic.
-        command: &'static str,
+        command: CommandName,
     },
     /// The radio answered `N`: the command is unavailable in the current state.
     #[error("{command} answered N; it is unavailable in the radio's current state")]
     NotAvailable {
         /// Command mnemonic.
-        command: &'static str,
+        command: CommandName,
     },
     /// The `ID` reply named another radio.
     #[error("connected radio identified as {reply:?}, not TM-D750")]
@@ -483,7 +506,7 @@ pub enum ProtocolError {
     #[error("expected ACK 0x06 after {stage}, got 0x{byte:02X}")]
     MissingAck {
         /// Exchange stage.
-        stage: &'static str,
+        stage: AckStage,
         /// The byte received instead.
         byte: u8,
     },
@@ -605,7 +628,7 @@ pub enum McpError {
     )]
     Interrupted {
         /// The operation.
-        operation: &'static str,
+        operation: McpWriteOperation,
         /// Pages the radio may have changed.
         possibly_written: usize,
         /// Pages read back and confirmed.
@@ -742,9 +765,9 @@ pub enum SchemaError {
         /// Field name.
         field: &'static str,
         /// Expected kind.
-        expected: &'static str,
+        expected: ValueKind,
         /// Actual kind.
-        actual: &'static str,
+        actual: ValueKind,
     },
     /// A value is not one of the field's allowed choices or enum members.
     #[error("field {field} value {value} is not an allowed choice")]

@@ -3,12 +3,15 @@
 use std::io;
 
 use super::{McpSession, Progress};
-use crate::error::{Error, McpError};
+use crate::error::{Error, McpError, McpWriteOperation};
 use crate::protocol::mcp::regions;
 use crate::radio::menu::{MenuUpdateError, MenuUpdatePlan};
 use crate::radio::terminal::{TerminalPlan, TerminalPlanError};
 use crate::types::Page;
 use kenwood_transport::Transport;
+
+#[cfg(test)]
+mod tests;
 
 /// Immutable expected and desired bytes for one canonical writable page.
 ///
@@ -281,7 +284,7 @@ impl<T: Transport> McpSession<'_, T> {
             .await
             .map_err(|source| {
                 McpError::Interrupted {
-                    operation: "page compare-and-exchange",
+                    operation: McpWriteOperation::CompareExchange,
                     possibly_written: self.journal.possibly_written.len(),
                     verified: self.journal.verified.len(),
                     source: Box::new(source),
@@ -333,6 +336,3 @@ impl<T: Transport> McpSession<'_, T> {
         Ok(report)
     }
 }
-
-#[cfg(test)]
-mod tests;

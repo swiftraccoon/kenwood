@@ -9,8 +9,9 @@ use tokio_serial as _;
 use tracing as _;
 
 use std::io;
+use std::num::NonZeroU32;
 
-use kenwood_tmd750::protocol::mcp::{ACK, ENTER, EXIT, read_request, write_request};
+use kenwood_tmd750::protocol::mcp::{ACK, ENTER, EXIT, Header};
 use kenwood_tmd750::{
     Address, DvGatewayMode, Error, McpError, McpGatewayOffProbeReport, McpProbeExit,
     McpProbeOutcome, McpProbeStage, Page, Radio,
@@ -58,8 +59,8 @@ impl Transport for Witness {
         self.mock.close().await
     }
 
-    fn set_baud_rate(&mut self, baud: u32) -> Result<(), TransportError> {
-        self.baud_changes.push(baud);
+    fn set_baud_rate(&mut self, baud: NonZeroU32) -> Result<(), TransportError> {
+        self.baud_changes.push(baud.get());
         self.mock.set_baud_rate(baud)
     }
 }
@@ -83,9 +84,9 @@ fn preflight(mock: &mut MockTransport) {
 }
 
 fn read(mock: &mut MockTransport, page: Page, fill: u8) {
-    let mut response = write_request(page).to_vec();
+    let mut response = Header::write_request(page).to_vec();
     response.extend(vec![fill; page.len()]);
-    mock.expect(&read_request(page), &response);
+    mock.expect(&Header::read_request(page), &response);
     mock.expect(&[ACK], &[ACK]);
 }
 
@@ -202,9 +203,9 @@ async fn gateway_off_probe_reads_exactly_two_fragments_and_retires_the_handle() 
             b"TY\r".to_vec(),
             b"GW\r".to_vec(),
             ENTER.to_vec(),
-            read_request(global).to_vec(),
+            Header::read_request(global).to_vec(),
             vec![ACK],
-            read_request(slot).to_vec(),
+            Header::read_request(slot).to_vec(),
             vec![ACK],
             vec![EXIT],
         ],
@@ -274,8 +275,8 @@ async fn another_radio_model_is_refused_before_any_remaining_preflight() {
 async fn terminal_and_unnamed_gateway_states_are_retained_but_never_enter_mcp() {
     for (reply, expected) in [
         (b"GW 2\r".as_slice(), DvGatewayMode::Terminal),
-        (b"GW 1\r".as_slice(), DvGatewayMode::Unnamed(1)),
-        (b"GW 255\r".as_slice(), DvGatewayMode::Unnamed(255)),
+        (b"GW 1\r".as_slice(), DvGatewayMode::from(1)),
+        (b"GW 255\r".as_slice(), DvGatewayMode::from(255)),
     ] {
         let mut mock = MockTransport::new();
         identity(&mut mock, b"FV 1.02\r", b"TY K,2,1\r");
@@ -439,9 +440,9 @@ async fn a_complete_payload_with_bad_read_ack_never_joins_the_evidence() -> Test
     preflight(&mut mock);
     mock.expect(ENTER, b"0M\r");
     let [global, _] = pages()?;
-    let mut reply = write_request(global).to_vec();
+    let mut reply = Header::write_request(global).to_vec();
     reply.extend(vec![0x55; global.len()]);
-    mock.expect(&read_request(global), &reply);
+    mock.expect(&Header::read_request(global), &reply);
     mock.expect(&[ACK], &[0x15]);
     let mut radio = Radio::new(Witness::new(mock));
     let report = radio.probe_mcp_gateway_off_until_exit(|| false).await;
@@ -478,7 +479,7 @@ async fn second_fragment_failure_retains_only_the_first_acknowledged_fragment() 
     mock.expect(ENTER, b"0M\r");
     let [global, slot] = pages()?;
     read(&mut mock, global, 0x33);
-    mock.expect(&read_request(slot), b"W\0\0\0\0");
+    mock.expect(&Header::read_request(slot), b"W\0\0\0\0");
     let mut radio = Radio::new(Witness::new(mock));
     let report = radio.probe_mcp_gateway_off_until_exit(|| false).await;
     assert!(
@@ -501,7 +502,7 @@ async fn second_fragment_failure_retains_only_the_first_acknowledged_fragment() 
     let witness = radio.into_transport();
     assert_eq!(
         witness.mock.writes().last().map(Vec::as_slice),
-        Some(read_request(slot).as_slice()),
+        Some(Header::read_request(slot).as_slice()),
         "uncertain second read permits no ACK, exit, or CAT"
     );
     assert_no_memory_write(&witness.mock);

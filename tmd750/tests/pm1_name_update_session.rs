@@ -14,6 +14,7 @@ use tracing as _;
 use std::cell::Cell;
 use std::future::{Future, poll_fn};
 use std::io;
+use std::num::NonZeroU32;
 use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -24,7 +25,7 @@ use kenwood_tmd750::memory::{
     Pm1Name, Pm1NameUpdate, TextFieldUpdateError, TextFieldUpdateEvent, TextFieldUpdateSession,
     TextFieldUpdateStatus,
 };
-use kenwood_tmd750::protocol::mcp::{ACK, read_request, write_request};
+use kenwood_tmd750::protocol::mcp::{ACK, Header};
 use kenwood_tmd750::{
     Address, Error, FirmwareIdentity, Identity, McpError, McpProbeExit, Page, Radio, RadioModel,
     RadioType, TextFieldUpdateSessionError, TextFieldUpdateSessionOutcome,
@@ -70,13 +71,13 @@ fn entry(mock: &mut MockTransport) {
 }
 
 fn frame(page: Page, data: &[u8]) -> Vec<u8> {
-    let mut bytes = write_request(page).to_vec();
+    let mut bytes = Header::write_request(page).to_vec();
     bytes.extend_from_slice(data);
     bytes
 }
 
 fn read(mock: &mut MockTransport, page: Page, data: &[u8]) {
-    mock.expect(&read_request(page), &frame(page, data));
+    mock.expect(&Header::read_request(page), frame(page, data));
     mock.expect(&[ACK], &[ACK]);
 }
 
@@ -92,7 +93,7 @@ fn session_script(update: &Pm1NameUpdate) -> Result<MockTransport, Box<dyn std::
     match update.next_session()? {
         TextFieldUpdateSession::Apply => {
             preflight(&mut mock, update, update.original_page())?;
-            mock.expect(&frame(update.page(), update.desired_page()), &[ACK]);
+            mock.expect(frame(update.page(), update.desired_page()), &[ACK]);
             read(&mut mock, update.page(), update.desired_page());
         }
         TextFieldUpdateSession::Verify => {
@@ -177,9 +178,9 @@ impl Transport for AuditedTransport {
         self.mock.close().await
     }
 
-    fn set_baud_rate(&mut self, baud: u32) -> Result<(), TransportError> {
+    fn set_baud_rate(&mut self, baud: NonZeroU32) -> Result<(), TransportError> {
         assert!(!self.exited, "no baud operation may follow E");
-        self.baud_changes.push(baud);
+        self.baud_changes.push(baud.get());
         self.mock.set_baud_rate(baud)
     }
 }
@@ -671,7 +672,7 @@ async fn complete_wrong_readback_exits_without_claiming_verification_or_rolling_
     let mut update = fixture()?;
     let mut mock = MockTransport::new();
     preflight(&mut mock, &update, update.original_page())?;
-    mock.expect(&frame(update.page(), update.desired_page()), &[ACK]);
+    mock.expect(frame(update.page(), update.desired_page()), &[ACK]);
     let mut wrong = *update.desired_page();
     *wrong.get_mut(200).ok_or("unrelated byte missing")? ^= 1;
     read(&mut mock, update.page(), &wrong);
@@ -724,7 +725,7 @@ async fn incomplete_entry_or_preflight_sends_no_exit() -> TestResult {
                 read(&mut mock, format_page()?, &[0; 40]);
                 update.page()
             };
-            mock.expect(&read_request(page), &[b'X', 0, 0, 8, 40]);
+            mock.expect(&Header::read_request(page), &[b'X', 0, 0, 8, 40]);
         }
         let mut radio = Radio::new(mock);
         let report = radio
@@ -748,8 +749,8 @@ async fn partial_post_write_readback_preserves_possible_change_and_refuses_exit(
     let mut update = fixture()?;
     let mut mock = MockTransport::new();
     preflight(&mut mock, &update, update.original_page())?;
-    mock.expect(&frame(update.page(), update.desired_page()), &[ACK]);
-    mock.expect_partial_then_hang(&read_request(update.page()), b"W\x04");
+    mock.expect(frame(update.page(), update.desired_page()), &[ACK]);
+    mock.expect_partial_then_hang(&Header::read_request(update.page()), b"W\x04");
     let mut radio = Radio::new(mock);
     radio.set_timeout(Duration::from_millis(1));
     let report = radio

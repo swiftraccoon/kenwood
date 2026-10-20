@@ -1,4 +1,5 @@
 #![no_main]
+//! Checks position-record wire preservation and decoded geographic bounds.
 
 use kenwood_tmd750::memory::position::{POSITION_RECORD_SIZE, StoredPosition};
 use libfuzzer_sys::fuzz_target;

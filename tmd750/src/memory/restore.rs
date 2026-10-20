@@ -24,10 +24,15 @@
 
 use crate::error::{McpError, SchemaError};
 use crate::file::RadioConfig;
-use crate::memory::{Configuration, ConfigurationError, FieldCodec, MenuFieldId, MenuWritePolicy};
+use crate::memory::{Configuration, ConfigurationError, MenuFieldId, MenuWritePolicy};
 use crate::protocol::mcp::regions::menu_regions;
 use crate::radio::programming::PageReplacement;
 use crate::types::{Page, Region, SlotIndex};
+use kenwood_schema::{CodecSpec, FieldCodec};
+
+#[cfg(test)]
+#[path = "restore_tests.rs"]
+mod tests;
 
 /// A lifecycle field whose restored value differed from the current one and
 /// was kept.
@@ -173,14 +178,14 @@ impl RestorePlan {
 
 /// The bits of each of a field's bytes the field owns.
 const fn owned_bits(codec: FieldCodec) -> u8 {
-    match codec {
-        FieldCodec::BitBool { mask } | FieldCodec::BitField { mask, .. } => mask,
-        FieldCodec::Byte { .. }
-        | FieldCodec::Bool
-        | FieldCodec::FixedString { .. }
-        | FieldCodec::Unsigned { .. }
-        | FieldCodec::Signed { .. }
-        | FieldCodec::Bytes { .. } => 0xFF,
+    match codec.spec() {
+        CodecSpec::BitBool { mask } | CodecSpec::BitField { mask, .. } => mask,
+        CodecSpec::Byte { .. }
+        | CodecSpec::Bool
+        | CodecSpec::FixedString { .. }
+        | CodecSpec::Unsigned { .. }
+        | CodecSpec::Signed { .. }
+        | CodecSpec::Bytes { .. } => 0xFF,
     }
 }
 
@@ -230,7 +235,3 @@ pub enum RestoreError {
         radio_type: String,
     },
 }
-
-#[cfg(test)]
-#[path = "restore_tests.rs"]
-mod tests;

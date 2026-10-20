@@ -10,13 +10,14 @@ use tracing as _;
 
 use std::future::{Future, poll_fn};
 use std::io;
+use std::num::NonZeroU32;
 use std::pin::pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::Duration;
 
-use kenwood_tmd750::protocol::mcp::{ACK, read_request, write_request};
+use kenwood_tmd750::protocol::mcp::{ACK, Header};
 use kenwood_tmd750::radio::programming::{McpJournal, PageReplacement};
 use kenwood_tmd750::{Address, Error, McpError, Page, Progress, Radio};
 use kenwood_transport::{MockTransport, Transport, TransportError};
@@ -38,21 +39,18 @@ fn ready(firmware: &str) -> MockTransport {
 }
 
 fn frame(page: Page, data: &[u8]) -> Vec<u8> {
-    let mut bytes = write_request(page).to_vec();
+    let mut bytes = Header::write_request(page).to_vec();
     bytes.extend_from_slice(data);
     bytes
 }
 
 fn read(mock: &mut MockTransport, page: Page, data: &[u8]) {
-    mock.expect(&read_request(page), &frame(page, data));
+    mock.expect(&Header::read_request(page), frame(page, data));
     mock.expect(&[ACK], &[ACK]);
 }
 
 fn write_and_verify(mock: &mut MockTransport, replacement: &PageReplacement) {
-    mock.expect(
-        &frame(replacement.page(), replacement.replacement()),
-        &[ACK],
-    );
+    mock.expect(frame(replacement.page(), replacement.replacement()), &[ACK]);
     read(mock, replacement.page(), replacement.replacement());
 }
 
@@ -132,8 +130,8 @@ impl Transport for AuditedTransport {
         self.mock.close().await
     }
 
-    fn set_baud_rate(&mut self, baud: u32) -> Result<(), TransportError> {
-        self.baud_changes.push(baud);
+    fn set_baud_rate(&mut self, baud: NonZeroU32) -> Result<(), TransportError> {
+        self.baud_changes.push(baud.get());
         self.mock.set_baud_rate(baud)
     }
 }
@@ -557,10 +555,7 @@ async fn complete_last_byte_readback_mismatch_retains_actual_possible_write() ->
     *wrong.last_mut().ok_or("tail missing")? = 2;
     let mut mock = ready("1.02");
     read(&mut mock, replacement.page(), replacement.expected());
-    mock.expect(
-        &frame(replacement.page(), replacement.replacement()),
-        &[ACK],
-    );
+    mock.expect(frame(replacement.page(), replacement.replacement()), &[ACK]);
     read(&mut mock, replacement.page(), &wrong);
     mock.expect(b"E", &[ACK]);
     let mut radio = Radio::new(mock);
@@ -596,12 +591,9 @@ async fn incomplete_preflight_or_readback_preserves_distinct_journal_states() ->
         let mut mock = ready("1.02");
         if after_write {
             read(&mut mock, replacement.page(), replacement.expected());
-            mock.expect(
-                &frame(replacement.page(), replacement.replacement()),
-                &[ACK],
-            );
+            mock.expect(frame(replacement.page(), replacement.replacement()), &[ACK]);
         }
-        mock.expect_partial_then_hang(&read_request(replacement.page()), b"W\0");
+        mock.expect_partial_then_hang(&Header::read_request(replacement.page()), b"W\0");
         let mut radio = Radio::new(mock);
         radio.set_timeout(Duration::from_millis(1));
         let mut session = radio.enter_mcp().await?;
@@ -636,7 +628,7 @@ async fn failed_rewrite_cannot_inherit_an_earlier_verification_of_the_same_page(
     read(&mut mock, first.page(), first.expected());
     write_and_verify(&mut mock, &first);
     read(&mut mock, second.page(), second.expected());
-    mock.expect(&frame(second.page(), second.replacement()), &[0x15]);
+    mock.expect(frame(second.page(), second.replacement()), &[0x15]);
     let mut radio = Radio::new(mock);
     let mut session = radio.enter_mcp().await?;
     let report = session
@@ -687,7 +679,7 @@ async fn dropped_write_future_retains_possible_dispatch_and_blocks_protocol_reus
     let replacement = PageReplacement::new(page(512, 256)?, &[0; 256], &[1; 256])?;
     let mut mock = ready("1.02");
     read(&mut mock, replacement.page(), replacement.expected());
-    mock.expect_hang(&frame(replacement.page(), replacement.replacement()));
+    mock.expect_hang(frame(replacement.page(), replacement.replacement()));
     let mut radio = Radio::new(mock);
     let mut session = radio.enter_mcp().await?;
     drop_pending(session.compare_exchange_pages(&[replacement], |_| Ok(()), |_| {})).await;

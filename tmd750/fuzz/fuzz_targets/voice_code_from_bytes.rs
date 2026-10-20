@@ -1,4 +1,5 @@
 #![no_main]
+//! Checks voice-code wire preservation and decoded text reconstruction.
 
 use kenwood_tmd750::memory::repeater_list::{VOICE_CODE_SIZE, VoiceCode};
 use libfuzzer_sys::fuzz_target;

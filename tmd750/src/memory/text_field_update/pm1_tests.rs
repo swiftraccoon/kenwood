@@ -7,6 +7,7 @@ use super::super::{
 use super::*;
 use crate::memory::{FieldDescriptor, SLOT_TERM, StorageTransform};
 use crate::types::{FirmwareIdentity, RadioModel, RadioType};
+use kenwood_schema::FieldCodec;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -258,8 +259,8 @@ fn preparation_rejects_partial_pages_and_every_other_exact_target() -> TestResul
     Ok(())
 }
 
-fn altered_descriptors(field: MenuField) -> [MenuField; 12] {
-    [
+fn altered_descriptors(field: MenuField) -> Result<[MenuField; 12], Box<dyn std::error::Error>> {
+    Ok([
         MenuField {
             descriptor: FieldDescriptor {
                 name: "pm.PmName2",
@@ -283,40 +284,40 @@ fn altered_descriptors(field: MenuField) -> [MenuField; 12] {
         },
         MenuField {
             descriptor: FieldDescriptor {
-                codec: FieldCodec::Bytes { len: 16 },
+                codec: FieldCodec::new(CodecSpec::Bytes { len: 16 })?,
                 ..field.descriptor
             },
             ..field
         },
         MenuField {
             descriptor: FieldDescriptor {
-                codec: FieldCodec::FixedString {
+                codec: FieldCodec::new(CodecSpec::FixedString {
                     len: 17,
                     encoding: StringEncoding::Utf8,
                     padding: 0,
-                },
+                })?,
                 ..field.descriptor
             },
             ..field
         },
         MenuField {
             descriptor: FieldDescriptor {
-                codec: FieldCodec::FixedString {
+                codec: FieldCodec::new(CodecSpec::FixedString {
                     len: 16,
                     encoding: StringEncoding::MemoryMap,
                     padding: 0,
-                },
+                })?,
                 ..field.descriptor
             },
             ..field
         },
         MenuField {
             descriptor: FieldDescriptor {
-                codec: FieldCodec::FixedString {
+                codec: FieldCodec::new(CodecSpec::FixedString {
                     len: 16,
                     encoding: StringEncoding::Utf8,
                     padding: 32,
-                },
+                })?,
                 ..field.descriptor
             },
             ..field
@@ -338,21 +339,19 @@ fn altered_descriptors(field: MenuField) -> [MenuField; 12] {
             ..field
         },
         MenuField {
-            storage_transform: Some(StorageTransform {
-                input_unit: "changed",
-                numerator: 1,
-                denominator: 1,
-            }),
+            storage_transform: Some(
+                StorageTransform::new("changed", 1, 1).ok_or("valid changed ratio")?,
+            ),
             ..field
         },
-    ]
+    ])
 }
 
 #[test]
 fn changed_generated_descriptor_cannot_expand_the_single_field_scope() -> TestResult {
     let fixture = fixture()?;
     let field = *menu_field(FIELD_NAME).ok_or("PM1 field")?;
-    for field in &altered_descriptors(field) {
+    for field in &altered_descriptors(field)? {
         assert!(
             matches!(
                 Pm1NameUpdate::prepare_with_field(

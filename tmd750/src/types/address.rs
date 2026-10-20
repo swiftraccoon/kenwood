@@ -21,6 +21,8 @@ pub const SLOT_STRIDE: u32 = 8192;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Address(u32);
 
+checked_integer_traits!(Address, u32, as_u32);
+
 impl Address {
     /// Validate an address below [`IMAGE_LENGTH`].
     ///
@@ -244,6 +246,8 @@ impl Page {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SlotIndex(u8);
 
+checked_integer_traits!(SlotIndex, u8, index);
+
 impl SlotIndex {
     /// Validate a slot index.
     ///
@@ -302,6 +306,19 @@ mod tests {
             matches!(sum, Err(ValidationError::AddressOutOfRange { .. })),
             "{sum:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn checked_integer_conversions_preserve_standard_formatter_flags() -> TestResult {
+        let address = Address::try_from(42)?;
+        assert_eq!(u32::from(address), 42);
+        assert_eq!(format!("{address:#010b}"), format!("{:#010b}", 42_u32));
+        assert_eq!(format!("{address:#08o}"), format!("{:#08o}", 42_u32));
+        assert_eq!(format!("{address:#08x}"), format!("{:#08x}", 42_u32));
+        assert_eq!(format!("{address:>8X}"), format!("{:>8X}", 42_u32));
+        assert!(Address::try_from(IMAGE_LENGTH_U32).is_err());
+        assert!(SlotIndex::try_from(SLOT_COUNT).is_err());
         Ok(())
     }
 

@@ -10,9 +10,10 @@ use tracing as _;
 
 use std::cell::Cell;
 use std::io;
+use std::num::NonZeroU32;
 use std::time::Duration;
 
-use kenwood_tmd750::protocol::mcp::{ACK, read_request, write_request};
+use kenwood_tmd750::protocol::mcp::{ACK, Header};
 use kenwood_tmd750::{
     DvGatewayMode, Error, McpBackupOutcome, McpBackupReport, McpBackupStage, McpError,
     McpProbeExit, Page, Progress, Radio, Region, ValidationError,
@@ -62,9 +63,9 @@ fn entry(mock: &mut MockTransport) {
 }
 
 fn read(mock: &mut MockTransport, page: Page, fill: u8) {
-    let mut reply = write_request(page).to_vec();
+    let mut reply = Header::write_request(page).to_vec();
     reply.extend(vec![fill; page.len()]);
-    mock.expect(&read_request(page), &reply);
+    mock.expect(&Header::read_request(page), &reply);
     mock.expect(&[ACK], &[ACK]);
 }
 
@@ -114,7 +115,7 @@ impl Transport for DepartingEndpoint {
         self.mock.close().await
     }
 
-    fn set_baud_rate(&mut self, baud: u32) -> Result<(), TransportError> {
+    fn set_baud_rate(&mut self, baud: NonZeroU32) -> Result<(), TransportError> {
         if self.exited {
             self.post_exit_baud_changes += 1;
             return Err(TransportError::Disconnected(io::Error::new(
@@ -122,7 +123,7 @@ impl Transport for DepartingEndpoint {
                 "USB handle departed after E",
             )));
         }
-        self.baud_changes.push(baud);
+        self.baud_changes.push(baud.get());
         self.mock.set_baud_rate(baud)
     }
 }
@@ -511,7 +512,7 @@ async fn read_failure_keeps_completed_pages_and_never_sends_exit() -> TestResult
     for page in &completed {
         read(&mut mock, *page, 0x42);
     }
-    mock.expect(&read_request(failed_page), &[b'W', 0, 0, 8, 40]);
+    mock.expect(&Header::read_request(failed_page), &[b'W', 0, 0, 8, 40]);
     let mut radio = Radio::new(DepartingEndpoint::new(mock));
     let mut progress = Vec::new();
     let report = radio
@@ -529,7 +530,7 @@ async fn read_failure_keeps_completed_pages_and_never_sends_exit() -> TestResult
     assert_eq!(transport.mock.writes().len(), 15);
     assert_eq!(
         transport.mock.writes().last().map(Vec::as_slice),
-        Some(read_request(failed_page).as_slice())
+        Some(Header::read_request(failed_page).as_slice())
     );
     transport.mock.assert_complete();
     Ok(())
@@ -592,7 +593,7 @@ async fn dropping_a_mid_page_backup_blocks_all_subsequent_protocol_traffic() -> 
     let page = *expected_pages()?.first().ok_or("first page missing")?;
     let mut mock = MockTransport::new();
     entry(&mut mock);
-    mock.expect_hang(&read_request(page));
+    mock.expect_hang(&Header::read_request(page));
     let mut radio = Radio::new(DepartingEndpoint::new(mock));
     radio.set_timeout(Duration::from_secs(1));
     let result = tokio::time::timeout(
@@ -609,7 +610,7 @@ async fn dropping_a_mid_page_backup_blocks_all_subsequent_protocol_traffic() -> 
     assert_eq!(transport.mock.writes().len(), 5);
     assert_eq!(
         transport.mock.writes().last().map(Vec::as_slice),
-        Some(read_request(page).as_slice())
+        Some(Header::read_request(page).as_slice())
     );
     transport.mock.assert_complete();
     Ok(())

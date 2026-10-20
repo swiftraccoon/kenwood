@@ -13,6 +13,7 @@ use tracing as _;
 use std::cell::Cell;
 use std::future::{Future, poll_fn};
 use std::io;
+use std::num::NonZeroU32;
 use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -23,7 +24,7 @@ use kenwood_tmd750::memory::{
     My1Callsign, My1CallsignUpdate, PmOffGatewayFinal, TextFieldUpdateError, TextFieldUpdateEvent,
     TextFieldUpdateSession as Session, TextFieldUpdateStatus as Status,
 };
-use kenwood_tmd750::protocol::mcp::{ACK, read_request, write_request};
+use kenwood_tmd750::protocol::mcp::{ACK, Header};
 use kenwood_tmd750::{
     Address, DvGatewayMode, Error, FirmwareIdentity, Identity, McpError, McpProbeExit, Page, Radio,
     RadioModel, RadioType, TextFieldUpdateSessionError as SessionError,
@@ -72,13 +73,13 @@ fn entry(mock: &mut MockTransport) {
 }
 
 fn frame(page: Page, data: &[u8]) -> Vec<u8> {
-    let mut bytes = write_request(page).to_vec();
+    let mut bytes = Header::write_request(page).to_vec();
     bytes.extend_from_slice(data);
     bytes
 }
 
 fn read(mock: &mut MockTransport, page: Page, data: &[u8]) {
-    mock.expect(&read_request(page), &frame(page, data));
+    mock.expect(&Header::read_request(page), frame(page, data));
     mock.expect(&[ACK], &[ACK]);
 }
 
@@ -95,7 +96,7 @@ fn session_script(update: &My1CallsignUpdate) -> Result<MockTransport, TestError
     match update.next_session()? {
         Session::Apply => {
             preflight(&mut mock, update, update.original_page())?;
-            mock.expect(&frame(update.page(), update.desired_page()), &[ACK]);
+            mock.expect(frame(update.page(), update.desired_page()), &[ACK]);
             read(&mut mock, update.page(), update.desired_page());
         }
         Session::Verify => preflight(&mut mock, update, update.desired_page())?,
@@ -208,12 +209,12 @@ impl Transport for AuditedTransport {
         self.mock.close().await
     }
 
-    fn set_baud_rate(&mut self, baud: u32) -> Result<(), TransportError> {
+    fn set_baud_rate(&mut self, baud: NonZeroU32) -> Result<(), TransportError> {
         assert!(
             !self.exited,
             "no baud operation may follow E on the original handle"
         );
-        self.baud_changes.push(baud);
+        self.baud_changes.push(baud.get());
         self.mock.set_baud_rate(baud)
     }
 }
@@ -546,7 +547,7 @@ async fn active_unknown_rejected_and_partial_gateway_replies_prevent_entry() -> 
         assert_failed(&report, Stage::GatewayGuard);
         let expected = match response {
             Some(b"GW 2\r") => Some(DvGatewayMode::Terminal),
-            Some(b"GW 255\r") => Some(DvGatewayMode::Unnamed(255)),
+            Some(b"GW 255\r") => Some(DvGatewayMode::from(255)),
             _ => None,
         };
         assert_eq!(
@@ -951,7 +952,7 @@ async fn complete_last_byte_readback_mismatch_exits_without_rollback_or_verifica
     let mut update = fixture()?;
     let mut mock = MockTransport::new();
     preflight(&mut mock, &update, update.original_page())?;
-    mock.expect(&frame(update.page(), update.desired_page()), &[ACK]);
+    mock.expect(frame(update.page(), update.desired_page()), &[ACK]);
     let mut wrong = *update.desired_page();
     *wrong.last_mut().ok_or("target tail missing")? ^= 1;
     read(&mut mock, update.page(), &wrong);
@@ -1030,7 +1031,7 @@ async fn uncertain_entry_or_guard_reads_prohibit_intent_exit_and_handle_reuse() 
                 3 => update.control_page_spec(),
                 _ => update.page(),
             };
-            mock.expect_partial_then_hang(&read_request(page), b"W");
+            mock.expect_partial_then_hang(&Header::read_request(page), b"W");
             Stage::Read { page }
         };
         let mut radio = Radio::new(mock);
@@ -1083,9 +1084,9 @@ async fn readback_and_exit_uncertainty_preserve_distinct_completed_evidence() ->
         let mut update = fixture()?;
         let mut mock = MockTransport::new();
         preflight(&mut mock, &update, update.original_page())?;
-        mock.expect(&frame(update.page(), update.desired_page()), &[ACK]);
+        mock.expect(frame(update.page(), update.desired_page()), &[ACK]);
         if boundary == 0 {
-            mock.expect_partial_then_hang(&read_request(update.page()), b"W\x05");
+            mock.expect_partial_then_hang(&Header::read_request(update.page()), b"W\x05");
         } else {
             read(&mut mock, update.page(), update.desired_page());
             if boundary == 1 {

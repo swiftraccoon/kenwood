@@ -18,7 +18,7 @@
 
 use std::time::Duration;
 
-use crate::error::{Error, ProtocolError};
+use crate::error::{CommandName, Error, ProtocolError};
 use crate::protocol::cat::{Command, Response};
 use crate::types::{Band, SelectableTncMode, TncMode, TncState, VoxMode};
 use kenwood_transport::Transport;
@@ -69,9 +69,15 @@ impl<T: Transport> Radio<T> {
     pub async fn receive(&mut self) -> Result<(), Error> {
         match self.release_command().await? {
             Response::ReceiveAck => Ok(()),
-            Response::Rejected => Err(ProtocolError::Rejected { command: "RX" }.into()),
-            Response::NotAvailable => Err(ProtocolError::NotAvailable { command: "RX" }.into()),
-            other => Err(unexpected("ReceiveAck", &other)),
+            Response::Rejected => Err(ProtocolError::Rejected {
+                command: CommandName::Rx,
+            }
+            .into()),
+            Response::NotAvailable => Err(ProtocolError::NotAvailable {
+                command: CommandName::Rx,
+            }
+            .into()),
+            other => Err(unexpected(CommandName::Rx, &other)),
         }
     }
 
@@ -132,7 +138,7 @@ impl<T: Transport> Radio<T> {
     /// mode, and transport, timeout, parse or session-state errors.
     pub async fn send_aprs_beacon(&mut self) -> Result<(), Error> {
         self.require_write_target().await?;
-        self.query(Command::SendAprsBeacon, "AprsBeaconAck", |response| {
+        self.query(Command::SendAprsBeacon, |response| {
             matches!(response, Response::AprsBeaconAck).then_some(())
         })
         .await
@@ -164,7 +170,6 @@ impl<T: Transport> Radio<T> {
         self.apply(
             Command::SetTncMode { mode, data_band },
             Command::GetTncMode,
-            "TncMode",
             TncState {
                 mode: TncMode::from(mode),
                 data_band,
@@ -190,7 +195,6 @@ impl<T: Transport> Radio<T> {
         self.apply(
             Command::SetVox { enabled },
             Command::GetVox,
-            "Vox",
             VoxMode::from(enabled),
             |response| match response {
                 Response::Vox(mode) => Some(*mode),
@@ -214,7 +218,7 @@ impl<T: Transport> Radio<T> {
     /// timeout, parse, rejection or session-state errors.
     pub async fn power_off(&mut self) -> Result<(), Error> {
         self.require_write_target().await?;
-        self.query(Command::PowerOff, "PowerStatus", |response| {
+        self.query(Command::PowerOff, |response| {
             matches!(response, Response::PowerStatus { on: false }).then_some(())
         })
         .await
@@ -222,7 +226,7 @@ impl<T: Transport> Radio<T> {
 
     /// Send `TX` and require `TX 1`, without the write-target gate.
     async fn key(&mut self) -> Result<(), Error> {
-        self.query(Command::Transmit, "TransmitAck", |response| {
+        self.query(Command::Transmit, |response| {
             matches!(response, Response::TransmitAck).then_some(())
         })
         .await

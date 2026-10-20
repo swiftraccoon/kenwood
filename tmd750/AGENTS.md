@@ -7,7 +7,9 @@
 - Dependencies stay at the minimum that works, ideally none beyond the shared
   workspace crates; the rule is in the root `AGENTS.md` section `Standard`.
 - Generic transport types are imported directly from `kenwood-transport`,
-  never re-exported from this crate's `transport` or `error` namespace.
+  never re-exported from this crate's `transport` or `error` namespace; the
+  schema scalar types (`FieldCodec`, `FieldValue`, `DecodedFieldValue`,
+  `Endian`, `StringEncoding`) come from `kenwood-schema`, never from `memory`.
   `src/transport.rs` owns model USB discovery and the 9600 baud, RTS/CTS,
   asserted DTR/RTS preset; the shared backend owns only physical I/O.
 - `src/transport.rs` must not implement automatic `Transport::reopen`.

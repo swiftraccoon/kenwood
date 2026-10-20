@@ -13,10 +13,12 @@ use std::pin::pin;
 use std::task::Poll;
 
 use kenwood_tmd750::protocol::mcp::{
-    ACK, BytePatch, ENTER, EXIT, HeaderCommand, PagePatch, read_request, write_request,
+    ACK, BytePatch, ENTER, EXIT, Header, HeaderCommand, PagePatch,
 };
 use kenwood_tmd750::radio::Radio;
-use kenwood_tmd750::{Address, Error, McpError, Page, PageReplacement, ProtocolError, Region};
+use kenwood_tmd750::{
+    AckStage, Address, Error, McpError, Page, PageReplacement, ProtocolError, Region,
+};
 use kenwood_transport::{MockTransport, Transport, TransportError};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -72,7 +74,7 @@ fn replacement(page: Page) -> Result<(PageReplacement, Vec<u8>), Box<dyn std::er
 }
 
 fn data_reply(page: Page, data: &[u8]) -> Vec<u8> {
-    let mut reply = write_request(page).to_vec();
+    let mut reply = Header::write_request(page).to_vec();
     reply.extend_from_slice(data);
     reply
 }
@@ -180,7 +182,11 @@ async fn cancelling_entry_blocks_further_protocol_traffic() -> TestResult {
 async fn cancelling_wire_writes_poison_entry_read_and_exit() -> TestResult {
     let page = Page::new(Address::new(8)?, 40)?;
     let region = Region::new(8, 48)?;
-    for blocked in [ENTER.to_vec(), read_request(page).to_vec(), vec![EXIT]] {
+    for blocked in [
+        ENTER.to_vec(),
+        Header::read_request(page).to_vec(),
+        vec![EXIT],
+    ] {
         let mut mock = ready_mock("1.02");
         if blocked != ENTER {
             mock.expect(&blocked, &[]);
@@ -247,10 +253,13 @@ async fn cancelling_any_read_phase_refuses_exit_and_cat() -> TestResult {
     for phase in 0..3 {
         let mut mock = ready_mock("1.02");
         match phase {
-            0 => mock.expect_partial_then_hang(&read_request(page), b"W\0"),
-            1 => mock.expect_partial_then_hang(&read_request(page), &data_reply(page, &[0x12; 7])),
+            0 => mock.expect_partial_then_hang(&Header::read_request(page), b"W\0"),
+            1 => mock.expect_partial_then_hang(
+                &Header::read_request(page),
+                data_reply(page, &[0x12; 7]),
+            ),
             _ => {
-                mock.expect(&read_request(page), &data_reply(page, &[0x12; 40]));
+                mock.expect(&Header::read_request(page), data_reply(page, &[0x12; 40]));
                 mock.expect_hang(&[ACK]);
             }
         }
@@ -279,10 +288,10 @@ async fn rejected_read_header_and_ack_refuse_exit_and_cat() -> TestResult {
     for bad_ack in [false, true] {
         let mut mock = ready_mock("1.02");
         if bad_ack {
-            mock.expect(&read_request(page), &data_reply(page, &[0; 40]));
+            mock.expect(&Header::read_request(page), data_reply(page, &[0; 40]));
             mock.expect(&[ACK], &[0x15]);
         } else {
-            mock.expect(&read_request(page), &write_request(other));
+            mock.expect(&Header::read_request(page), &Header::write_request(other));
         }
         let mut radio = Radio::new(mock);
         let mut session = radio.enter_mcp().await?;
@@ -305,7 +314,7 @@ async fn rejected_read_header_and_ack_refuse_exit_and_cat() -> TestResult {
 #[tokio::test]
 async fn read_request_echo_is_not_a_data_response() -> TestResult {
     let page = Page::new(Address::new(8)?, 40)?;
-    let request = read_request(page);
+    let request = Header::read_request(page);
     let mut mock = ready_mock("1.02");
     mock.expect(&request, &request);
     let mut radio = Radio::new(mock);
@@ -350,9 +359,9 @@ async fn cancelled_memory_write_retains_journal_and_refuses_exit() -> TestResult
     let page = Page::new(Address::new(8)?, 40)?;
     let (replacement, intended) = replacement(page)?;
     let mut mock = ready_mock("1.02");
-    mock.expect(&read_request(page), &data_reply(page, &[0; 40]));
+    mock.expect(&Header::read_request(page), data_reply(page, &[0; 40]));
     mock.expect(&[ACK], &[ACK]);
-    mock.expect_hang(&data_reply(page, &intended));
+    mock.expect_hang(data_reply(page, &intended));
     let mut radio = Radio::new(mock);
     let mut session = radio.enter_mcp().await?;
     cancel_pending(session.compare_exchange_pages(&[replacement], |_| Ok(()), |_| {})).await;
@@ -376,10 +385,10 @@ async fn complete_verify_mismatch_still_permits_safe_exit() -> TestResult {
     let page = Page::new(Address::new(8)?, 40)?;
     let (replacement, intended) = replacement(page)?;
     let mut mock = ready_mock("1.02");
-    mock.expect(&read_request(page), &data_reply(page, &[0; 40]));
+    mock.expect(&Header::read_request(page), data_reply(page, &[0; 40]));
     mock.expect(&[ACK], &[ACK]);
-    mock.expect(&data_reply(page, &intended), &[ACK]);
-    mock.expect(&read_request(page), &data_reply(page, &[0; 40]));
+    mock.expect(data_reply(page, &intended), &[ACK]);
+    mock.expect(&Header::read_request(page), data_reply(page, &[0; 40]));
     mock.expect(&[ACK], &[ACK]);
     mock.expect(&[EXIT], &[ACK]);
     let mut radio = Radio::new(mock);
@@ -410,7 +419,7 @@ async fn failed_exit_blocks_cat() -> TestResult {
         matches!(
             result,
             Err(Error::Protocol(ProtocolError::MissingAck {
-                stage: "MCP exit",
+                stage: AckStage::Exit,
                 byte: 0x15,
             }))
         ),

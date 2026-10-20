@@ -2,21 +2,26 @@
 
 use super::*;
 use crate::memory::menu_field;
+use kenwood_schema::{CodecSpec, Endian, StringEncoding};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 #[test]
 fn model_decoding_keeps_stored_domains_nonzero_booleans_and_first_terminators() -> TestResult {
-    let number = FieldDescriptor::new("test.Number", 8, FieldCodec::Byte { min: 0, max: 2 });
-    let flag = FieldDescriptor::new("test.Flag", 9, FieldCodec::Bool);
+    let number = FieldDescriptor::new(
+        "test.Number",
+        8,
+        FieldCodec::new(CodecSpec::Byte { min: 0, max: 2 })?,
+    );
+    let flag = FieldDescriptor::new("test.Flag", 9, FieldCodec::BOOL);
     let text = FieldDescriptor::new(
         "test.Text",
         10,
-        FieldCodec::FixedString {
+        FieldCodec::new(CodecSpec::FixedString {
             len: 5,
             encoding: StringEncoding::Utf8,
             padding: b' ',
-        },
+        })?,
     );
     let mut image = [0; 16];
     *image.get_mut(8).ok_or("number byte")? = 255;
@@ -51,7 +56,7 @@ fn scalar_types_are_shared_without_converting_or_weakening_model_metadata() -> T
         FieldCodec as SharedCodec, FieldValue as SharedValue, MaskedByte as SharedMaskedByte,
     };
 
-    let codec: SharedCodec = FieldCodec::Byte { min: 0, max: 2 };
+    let codec: SharedCodec = FieldCodec::new(CodecSpec::Byte { min: 0, max: 2 })?;
     let field = FieldDescriptor::new("test.Shared", 8, codec);
     let value: SharedValue<'_> = FieldValue::Unsigned(2);
     let encoded: Vec<SharedMaskedByte> = field.encode(value)?;
@@ -139,98 +144,12 @@ fn every_planner_entry_retains_registered_blob_rejection() -> TestResult {
 }
 
 #[test]
-fn malformed_codecs_are_rejected_before_reading_or_encoding() {
-    for codec in [
-        FieldCodec::Unsigned {
-            width: 0,
-            endian: Endian::Little,
-            min: 0,
-            max: 0,
-        },
-        FieldCodec::Unsigned {
-            width: 9,
-            endian: Endian::Little,
-            min: 0,
-            max: 1,
-        },
-        FieldCodec::Unsigned {
-            width: 1,
-            endian: Endian::Little,
-            min: 0,
-            max: 1000,
-        },
-        FieldCodec::Signed {
-            width: 0,
-            endian: Endian::Little,
-            min: 0,
-            max: 0,
-        },
-        FieldCodec::Signed {
-            width: 9,
-            endian: Endian::Little,
-            min: 0,
-            max: 1,
-        },
-        FieldCodec::Signed {
-            width: 1,
-            endian: Endian::Little,
-            min: -129,
-            max: 127,
-        },
-        FieldCodec::Byte { min: 5, max: 1 },
-        FieldCodec::BitField {
-            mask: 0xFF,
-            shift: 8,
-            min: 0,
-            max: 1,
-        },
-        FieldCodec::BitField {
-            mask: 0x05,
-            shift: 0,
-            min: 0,
-            max: 5,
-        },
-        FieldCodec::BitField {
-            mask: 0x03,
-            shift: 0,
-            min: 0,
-            max: 4,
-        },
-        FieldCodec::BitBool { mask: 0 },
-        FieldCodec::BitBool { mask: 3 },
-        FieldCodec::FixedString {
-            len: 0,
-            encoding: StringEncoding::Utf8,
-            padding: 0,
-        },
-        FieldCodec::Bytes { len: 0 },
-    ] {
-        let field = FieldDescriptor::new("test.Invalid", 8, codec);
-        assert!(
-            field.address(None).is_err(),
-            "malformed codec must not resolve: {codec:?}"
-        );
-        assert!(
-            field.read(&[0; 32], None).is_err(),
-            "malformed codec must not decode: {codec:?}"
-        );
-        let value = match codec {
-            FieldCodec::Signed { .. } => FieldValue::Signed(0),
-            FieldCodec::Bool | FieldCodec::BitBool { .. } => FieldValue::Bool(false),
-            FieldCodec::FixedString { .. } => FieldValue::Text(""),
-            FieldCodec::Bytes { .. } => FieldValue::Bytes(&[]),
-            _ => FieldValue::Unsigned(0),
-        };
-        assert!(
-            field.encode(value).is_err(),
-            "malformed codec must not encode: {codec:?}"
-        );
-    }
-}
-
-#[test]
-fn oversized_field_lengths_return_an_error_without_overflow() {
-    let field = FieldDescriptor::new("test.Huge", 8, FieldCodec::Bytes { len: usize::MAX });
+fn oversized_field_lengths_return_an_error_without_overflow() -> TestResult {
+    let field = FieldDescriptor::new(
+        "test.Huge",
+        8,
+        FieldCodec::new(CodecSpec::Bytes { len: usize::MAX })?,
+    );
     assert!(
         field.address(None).is_err(),
         "huge byte length must fail before address addition"
@@ -239,6 +158,7 @@ fn oversized_field_lengths_return_an_error_without_overflow() {
         field.read(&[], None).is_err(),
         "huge byte length must not panic while reading"
     );
+    Ok(())
 }
 
 #[test]
@@ -252,22 +172,22 @@ fn every_supported_integer_width_round_trips_its_extreme_values() -> TestResult 
             let unsigned = FieldDescriptor::new(
                 "test.Unsigned",
                 8,
-                FieldCodec::Unsigned {
+                FieldCodec::new(CodecSpec::Unsigned {
                     width,
                     endian,
                     min: 0,
                     max: unsigned_maximum,
-                },
+                })?,
             );
             let signed = FieldDescriptor::new(
                 "test.Signed",
                 8,
-                FieldCodec::Signed {
+                FieldCodec::new(CodecSpec::Signed {
                     width,
                     endian,
                     min: minimum,
                     max: maximum,
-                },
+                })?,
             );
             for (field, value) in [
                 (unsigned, FieldValue::Unsigned(0)),
@@ -297,12 +217,12 @@ fn every_contiguous_bitfield_shape_preserves_neighbor_bits() -> TestResult {
             let field = FieldDescriptor::new(
                 "test.Bits",
                 8,
-                FieldCodec::BitField {
+                FieldCodec::new(CodecSpec::BitField {
                     mask,
                     shift,
                     min: 0,
                     max: maximum,
-                },
+                })?,
             );
             for value in [0, u64::from(maximum)] {
                 let mut image = [0xA5; 16];
@@ -329,7 +249,11 @@ fn every_contiguous_bitfield_shape_preserves_neighbor_bits() -> TestResult {
             );
         }
         let mask = 1 << shift;
-        let flag = FieldDescriptor::new("test.Flag", 8, FieldCodec::BitBool { mask });
+        let flag = FieldDescriptor::new(
+            "test.Flag",
+            8,
+            FieldCodec::new(CodecSpec::BitBool { mask })?,
+        );
         for enabled in [false, true] {
             let encoded = flag.encode(FieldValue::Bool(enabled))?;
             assert_eq!(
@@ -343,22 +267,23 @@ fn every_contiguous_bitfield_shape_preserves_neighbor_bits() -> TestResult {
 }
 
 #[test]
-fn direct_text_encoding_rejects_storage_terminators() {
+fn direct_text_encoding_rejects_storage_terminators() -> TestResult {
     for (padding, text) in [(0, "A\0B"), (b' ', "A B")] {
         let field = FieldDescriptor::new(
             "test.Text",
             8,
-            FieldCodec::FixedString {
+            FieldCodec::new(CodecSpec::FixedString {
                 len: 8,
                 encoding: StringEncoding::Utf8,
                 padding,
-            },
+            })?,
         );
         assert!(
             field.encode(FieldValue::Text(text)).is_err(),
             "descriptor encoding must not accept text that its decoder would shorten"
         );
     }
+    Ok(())
 }
 
 #[test]
@@ -406,7 +331,11 @@ fn direct_descriptor_planning_cannot_bypass_registered_domains() -> TestResult {
 
 #[test]
 fn rejected_assignment_never_retains_a_writable_prefix() -> TestResult {
-    let crossing = FieldDescriptor::new("test.Crossing", 47, FieldCodec::Bytes { len: 2 });
+    let crossing = FieldDescriptor::new(
+        "test.Crossing",
+        47,
+        FieldCodec::new(CodecSpec::Bytes { len: 2 })?,
+    );
     let mut planner = PatchPlanner::new();
     assert!(
         planner
@@ -423,9 +352,21 @@ fn rejected_assignment_never_retains_a_writable_prefix() -> TestResult {
 
 #[test]
 fn identical_repeated_assignments_are_idempotent() -> TestResult {
-    let flag = FieldDescriptor::new("test.Flag", 8, FieldCodec::BitBool { mask: 0x01 });
-    let alias = FieldDescriptor::new("test.Alias", 8, FieldCodec::BitBool { mask: 0x01 });
-    let neighboring = FieldDescriptor::new("test.Neighbor", 8, FieldCodec::BitBool { mask: 0x02 });
+    let flag = FieldDescriptor::new(
+        "test.Flag",
+        8,
+        FieldCodec::new(CodecSpec::BitBool { mask: 0x01 })?,
+    );
+    let alias = FieldDescriptor::new(
+        "test.Alias",
+        8,
+        FieldCodec::new(CodecSpec::BitBool { mask: 0x01 })?,
+    );
+    let neighboring = FieldDescriptor::new(
+        "test.Neighbor",
+        8,
+        FieldCodec::new(CodecSpec::BitBool { mask: 0x02 })?,
+    );
     let mut planner = PatchPlanner::new();
     let _planned = planner.set(&flag, None, FieldValue::Bool(true))?;
     let _planned = planner.set(&flag, None, FieldValue::Bool(true))?;
@@ -445,8 +386,16 @@ fn identical_repeated_assignments_are_idempotent() -> TestResult {
 
 #[test]
 fn a_late_conflict_leaves_exactly_the_prior_plan() -> TestResult {
-    let existing = FieldDescriptor::new("test.Existing", 9, FieldCodec::Byte { min: 0, max: 255 });
-    let conflicting = FieldDescriptor::new("test.Conflict", 8, FieldCodec::Bytes { len: 2 });
+    let existing = FieldDescriptor::new(
+        "test.Existing",
+        9,
+        FieldCodec::new(CodecSpec::Byte { min: 0, max: 255 })?,
+    );
+    let conflicting = FieldDescriptor::new(
+        "test.Conflict",
+        8,
+        FieldCodec::new(CodecSpec::Bytes { len: 2 })?,
+    );
     let mut planner = PatchPlanner::new();
     let _planned = planner.set(&existing, None, FieldValue::Unsigned(7))?;
     assert!(
@@ -469,8 +418,11 @@ fn a_late_conflict_leaves_exactly_the_prior_plan() -> TestResult {
 fn image_application_rejects_missing_pages_before_any_mutation() -> TestResult {
     let mut planner = PatchPlanner::new();
     for address in [8, 56] {
-        let field =
-            FieldDescriptor::new("test.Byte", address, FieldCodec::Byte { min: 0, max: 255 });
+        let field = FieldDescriptor::new(
+            "test.Byte",
+            address,
+            FieldCodec::new(CodecSpec::Byte { min: 0, max: 255 })?,
+        );
         let _planned = planner.set(&field, None, FieldValue::Unsigned(7))?;
     }
     let patches = planner.finish()?;

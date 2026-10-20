@@ -10,7 +10,7 @@
 
 use std::fmt;
 
-use crate::error::ValidationError;
+use crate::error::{SettingName, ValidationError};
 use crate::types::{
     CatChannelRecord, CatMemoryChannelRecord, CrossToneField, CurrentMemorySelector, DcsCode,
     DigitalCode, DigitalSquelch, Frequency, MemoryChannelAddress, OperatingMode, ShiftDirection,
@@ -67,6 +67,8 @@ pub(crate) const fn name_address_at(index: u16) -> usize {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PhysicalChannel(u16);
 
+checked_integer_traits!(PhysicalChannel, u16, index);
+
 impl PhysicalChannel {
     /// First program scan slot, `L0`.
     pub const FIRST_PROGRAM_SCAN: u16 = 1000;
@@ -84,7 +86,7 @@ impl PhysicalChannel {
     pub const fn new(index: u16) -> Result<Self, ValidationError> {
         if index >= PHYSICAL_CHANNEL_COUNT {
             Err(ValidationError::SettingOutOfRange {
-                setting: "physical channel",
+                setting: SettingName::PhysicalChannel,
                 value: index as u64,
                 max: (PHYSICAL_CHANNEL_COUNT - 1) as u64,
             })
@@ -97,12 +99,12 @@ impl PhysicalChannel {
     #[must_use]
     pub const fn from_address(address: MemoryChannelAddress) -> Self {
         match address {
-            MemoryChannelAddress::Regular(channel) => Self(channel),
+            MemoryChannelAddress::Regular(channel) => Self(channel.get()),
             MemoryChannelAddress::ProgramScanLower(pair) => {
-                Self(Self::FIRST_PROGRAM_SCAN + 2 * pair as u16)
+                Self(Self::FIRST_PROGRAM_SCAN + 2 * pair.get() as u16)
             }
             MemoryChannelAddress::ProgramScanUpper(pair) => {
-                Self(Self::FIRST_PROGRAM_SCAN + 2 * pair as u16 + 1)
+                Self(Self::FIRST_PROGRAM_SCAN + 2 * pair.get() as u16 + 1)
             }
             MemoryChannelAddress::Priority => Self::PRIORITY,
         }
@@ -112,15 +114,25 @@ impl PhysicalChannel {
     #[must_use]
     pub fn selector(self) -> CurrentMemorySelector {
         match self.0 {
-            index @ 0..=999 => CurrentMemorySelector::Address(MemoryChannelAddress::Regular(index)),
+            index @ 0..=999 => CurrentMemorySelector::Address(
+                MemoryChannelAddress::regular(index)
+                    .unwrap_or_else(|_| unreachable!("regular physical channel")),
+            ),
             1100 => CurrentMemorySelector::Address(MemoryChannelAddress::Priority),
             1101 => CurrentMemorySelector::Aprs,
             index => {
-                let pair = u8::try_from((index - Self::FIRST_PROGRAM_SCAN) / 2).unwrap_or(u8::MAX);
+                let pair = u8::try_from((index - Self::FIRST_PROGRAM_SCAN) / 2)
+                    .unwrap_or_else(|_| unreachable!("physical program-scan pair fits a byte"));
                 if (index - Self::FIRST_PROGRAM_SCAN) % 2 == 0 {
-                    CurrentMemorySelector::Address(MemoryChannelAddress::ProgramScanLower(pair))
+                    CurrentMemorySelector::Address(
+                        MemoryChannelAddress::program_scan_lower(pair)
+                            .unwrap_or_else(|_| unreachable!("physical program-scan lower index")),
+                    )
                 } else {
-                    CurrentMemorySelector::Address(MemoryChannelAddress::ProgramScanUpper(pair))
+                    CurrentMemorySelector::Address(
+                        MemoryChannelAddress::program_scan_upper(pair)
+                            .unwrap_or_else(|_| unreachable!("physical program-scan upper index")),
+                    )
                 }
             }
         }
@@ -239,6 +251,8 @@ impl fmt::Display for StoredCallsign {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RouteField(u8);
 
+checked_integer_traits!(RouteField, u8, as_raw);
+
 impl RouteField {
     /// Highest value.
     pub const MAX: u8 = 3;
@@ -251,7 +265,7 @@ impl RouteField {
     pub const fn new(value: u8) -> Result<Self, ValidationError> {
         if value > Self::MAX {
             Err(ValidationError::SettingOutOfRange {
-                setting: "route field",
+                setting: SettingName::RouteField,
                 value: value as u64,
                 max: Self::MAX as u64,
             })
@@ -266,6 +280,76 @@ impl RouteField {
         self.0
     }
 }
+
+packed_byte!(
+    /// The three raw low bits of stored channel byte 9 (`0..=7`).
+    ChannelModeBits, 7
+);
+
+/// A demodulation mode retained in the stored channel's four-bit field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StoredMode(OperatingMode);
+
+impl StoredMode {
+    /// Retain a mode whose complete wire value fits `0..=15`.
+    ///
+    /// # Errors
+    /// Returns [`ValidationError::PackedValueOutOfRange`] for a wider value.
+    pub fn new(mode: OperatingMode) -> Result<Self, ValidationError> {
+        let value = u8::from(mode);
+        if value <= 15 {
+            Ok(Self(mode))
+        } else {
+            Err(ValidationError::PackedValueOutOfRange { value, maximum: 15 })
+        }
+    }
+
+    /// The retained named or unnamed demodulation mode.
+    #[must_use]
+    pub const fn mode(self) -> OperatingMode {
+        self.0
+    }
+
+    /// The complete four-bit field.
+    #[must_use]
+    pub fn get(self) -> u8 {
+        u8::from(self.0)
+    }
+}
+
+impl TryFrom<OperatingMode> for StoredMode {
+    type Error = ValidationError;
+    fn try_from(value: OperatingMode) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<u8> for StoredMode {
+    type Error = ValidationError;
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        Self::new(OperatingMode::from(value))
+    }
+}
+
+impl From<StoredMode> for OperatingMode {
+    fn from(value: StoredMode) -> Self {
+        value.mode()
+    }
+}
+
+impl From<StoredMode> for u8 {
+    fn from(value: StoredMode) -> Self {
+        value.get()
+    }
+}
+
+impl fmt::Display for StoredMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, formatter)
+    }
+}
+
+integer_formats!(StoredMode, get);
 
 /// One 40-byte channel record, decoded losslessly.
 ///
@@ -293,20 +377,18 @@ pub struct StoredChannel {
     /// Transmit tuning step.
     pub transmit_step: StepSize,
     /// Demodulation mode.
-    pub mode: OperatingMode,
+    pub mode: StoredMode,
     /// Byte 9 bit 3, raw: set on the DV and AM records the CAT writer stored,
     /// clear on FM records, on the radio's APRS channel and on the CALL and
     /// weather records, DV included.
     pub mode_flag: bool,
     /// Byte 9 bits 2:0, raw: zero in the records the CAT writer stored and in
     /// the APRS channel, one in the CALL and weather records.
-    pub mode_low_bits: u8,
+    pub mode_low_bits: ChannelModeBits,
     /// The single active tone function.
     pub tone_mode: ToneMode,
     /// Reverse.
     pub reverse: bool,
-    /// Whether bytes 4..8 hold an independent transmit frequency.
-    pub split: bool,
     /// Offset direction.
     pub shift: ShiftDirection,
     /// Transmit tone table index.
@@ -332,6 +414,12 @@ pub struct StoredChannel {
 }
 
 impl StoredChannel {
+    /// Whether bytes 4..8 contain an independent transmit frequency.
+    #[must_use]
+    pub const fn split(&self) -> bool {
+        matches!(self.transmit, TransmitSetting::Split(_))
+    }
+
     /// Decode one record.
     ///
     /// # Errors
@@ -375,12 +463,11 @@ impl StoredChannel {
             transmit,
             receive_step: StepSize::try_from(byte(8) >> 4)?,
             transmit_step: StepSize::try_from(byte(8) & 0x0F)?,
-            mode: OperatingMode::from(byte(9) >> 4),
+            mode: StoredMode(OperatingMode::from(byte(9) >> 4)),
             mode_flag: byte(9) & 0x08 != 0,
-            mode_low_bits: byte(9) & 0x07,
+            mode_low_bits: ChannelModeBits(byte(9) & 0x07),
             tone_mode,
             reverse: byte(10) & 0x08 != 0,
-            split,
             shift: ShiftDirection::try_from(byte(10) & 0x03)?,
             tone_code: ToneCode::new(byte(11))?,
             ctcss_code: ToneCode::new(byte(12))?,
@@ -425,15 +512,13 @@ impl StoredChannel {
             ),
             (
                 9,
-                u8::from(self.mode) << 4
-                    | u8::from(self.mode_flag) << 3
-                    | (self.mode_low_bits & 0x07),
+                u8::from(self.mode) << 4 | u8::from(self.mode_flag) << 3 | self.mode_low_bits.get(),
             ),
             (
                 10,
                 tone_nibble << 4
                     | u8::from(self.reverse) << 3
-                    | u8::from(self.split) << 2
+                    | u8::from(self.split()) << 2
                     | self.shift.as_raw(),
             ),
             (11, self.tone_code.as_raw()),
@@ -468,7 +553,7 @@ impl StoredChannel {
             transmit: self.transmit,
             receive_step: self.receive_step,
             transmit_step: self.transmit_step,
-            mode: self.mode,
+            mode: self.mode.mode(),
             tone_mode: self.tone_mode,
             reverse: self.reverse,
             shift: self.shift,
@@ -476,7 +561,7 @@ impl StoredChannel {
             ctcss_code: self.ctcss_code,
             dcs_code: self.dcs_code,
             cross_tone: self.cross_tone,
-            ur_call: UrCallsign::new(&self.ur_call.text())?,
+            ur_call: UrCallsign::try_from(self.ur_call.text())?,
             digital_squelch: self.digital_squelch,
             digital_code: self.digital_code,
         })
@@ -488,7 +573,9 @@ impl StoredChannel {
     ///
     /// # Errors
     ///
-    /// Returns the callsign error of [`StoredCallsign::new`].
+    /// Returns the callsign error of [`StoredCallsign::new`] or
+    /// [`ValidationError::PackedValueOutOfRange`] when a CAT mode exceeds
+    /// the stored four-bit field.
     pub fn from_cat_record(record: &CatMemoryChannelRecord) -> Result<Self, ValidationError> {
         let channel = &record.channel;
         Ok(Self {
@@ -496,12 +583,11 @@ impl StoredChannel {
             transmit: channel.transmit,
             receive_step: channel.receive_step,
             transmit_step: channel.transmit_step,
-            mode: channel.mode,
+            mode: StoredMode::new(channel.mode)?,
             mode_flag: channel.mode != OperatingMode::Fm,
-            mode_low_bits: 0,
+            mode_low_bits: ChannelModeBits::ZERO,
             tone_mode: channel.tone_mode,
             reverse: channel.reverse,
-            split: record.split,
             shift: channel.shift,
             tone_code: channel.tone_code,
             ctcss_code: channel.ctcss_code,
@@ -542,6 +628,8 @@ impl StoredChannel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BandCode(u8);
 
+checked_integer_traits!(BandCode, u8, as_raw);
+
 impl BandCode {
     /// The empty-slot marker.
     pub const EMPTY: u8 = 0xFF;
@@ -577,7 +665,7 @@ impl BandCode {
     pub const fn new(value: u8) -> Result<Self, ValidationError> {
         if value == Self::EMPTY {
             Err(ValidationError::SettingOutOfRange {
-                setting: "band code",
+                setting: SettingName::BandCode,
                 value: value as u64,
                 max: (Self::EMPTY - 1) as u64,
             })
@@ -634,7 +722,7 @@ impl StoredChannelFlag {
             1 => true,
             other => {
                 return Err(ValidationError::SettingOutOfRange {
-                    setting: "scan lockout flag",
+                    setting: SettingName::ScanLockout,
                     value: u64::from(other),
                     max: 1,
                 });
@@ -911,13 +999,42 @@ mod tests {
             let cat = cat_record(payload)?;
             assert_eq!(StoredChannel::from_cat_record(&cat)?, stored, "{payload}");
             assert_eq!(stored.cat_record()?, cat.channel, "{payload}");
-            assert_eq!(stored.split, cat.split, "{payload}");
+            assert_eq!(stored.split(), cat.split(), "{payload}");
             let flag = StoredChannelFlag::from_bytes(&flag_bytes)?;
             assert_eq!(flag.to_bytes(), flag_bytes);
             assert!(flag.is_programmed());
             assert_eq!(flag.scan_lockout(), cat.scan_lockout, "{payload}");
             assert_eq!(flag.group(), 9);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn stored_mode_and_raw_bits_reject_values_the_wire_cannot_retain() -> TestResult {
+        for raw in 0..=u8::MAX {
+            let mode = StoredMode::try_from(raw);
+            let bits = ChannelModeBits::new(raw);
+            assert_eq!(
+                mode.is_ok(),
+                raw <= 15,
+                "complete mode {raw} must fit its nibble"
+            );
+            assert_eq!(
+                bits.is_ok(),
+                raw <= 7,
+                "raw low bits {raw} must fit three bits"
+            );
+            if let Ok(mode) = mode {
+                assert_eq!(u8::from(mode), raw);
+                assert_eq!(mode.mode(), OperatingMode::from(raw));
+            }
+        }
+        let mut channel = StoredChannel::from_bytes(&APRS_RECORD)?;
+        channel.mode = StoredMode::try_from(15)?;
+        channel.mode_low_bits = ChannelModeBits::new(7)?;
+        channel.mode_flag = true;
+        assert_eq!(channel.to_bytes().get(9), Some(&u8::MAX));
+        assert_eq!(StoredChannel::from_bytes(&channel.to_bytes())?, channel);
         Ok(())
     }
 
@@ -933,7 +1050,7 @@ mod tests {
         assert_eq!(channel.receive_frequency.as_hz(), 144_390_000);
         assert_eq!(channel.receive_step, StepSize::Hz12500);
         assert_eq!(channel.transmit_step, StepSize::Hz1000);
-        assert_eq!(channel.mode, OperatingMode::Fm);
+        assert_eq!(channel.mode.mode(), OperatingMode::Fm);
         assert_eq!(channel.tone_mode, ToneMode::Off);
         assert_eq!(channel.ur_call.text(), "");
         assert_eq!(entry.name().text(), "APRS Channel");

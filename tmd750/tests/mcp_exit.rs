@@ -9,12 +9,13 @@ use tokio_serial as _;
 use tracing as _;
 
 use std::io;
+use std::num::NonZeroU32;
 use std::time::Duration;
 
-use kenwood_tmd750::protocol::mcp::{ACK, EXIT, read_request, write_request};
+use kenwood_tmd750::protocol::mcp::{ACK, EXIT, Header};
 use kenwood_tmd750::{
-    Address, Error, McpError, McpProbeExit, McpProbeOutcome, McpProbeStage, Page, ProtocolError,
-    Radio,
+    AckStage, Address, Error, McpError, McpProbeExit, McpProbeOutcome, McpProbeStage, Page,
+    ProtocolError, Radio, TimeoutOperation,
 };
 use kenwood_transport::{MockTransport, Transport, TransportError};
 
@@ -56,7 +57,7 @@ impl Transport for DepartingEndpoint {
         self.mock.close().await
     }
 
-    fn set_baud_rate(&mut self, baud: u32) -> Result<(), TransportError> {
+    fn set_baud_rate(&mut self, baud: NonZeroU32) -> Result<(), TransportError> {
         if self.exited {
             self.post_exit_baud_changes += 1;
             return Err(TransportError::Open {
@@ -64,7 +65,7 @@ impl Transport for DepartingEndpoint {
                 source: io::Error::new(io::ErrorKind::NotConnected, "USB handle departed after E"),
             });
         }
-        self.baud_changes.push(baud);
+        self.baud_changes.push(baud.get());
         self.mock.set_baud_rate(baud)
     }
 }
@@ -117,9 +118,9 @@ fn slot_page() -> Result<Page, Error> {
 }
 
 fn read(mock: &mut MockTransport, page: Page, fill: u8) {
-    let mut reply = write_request(page).to_vec();
+    let mut reply = Header::write_request(page).to_vec();
     reply.extend(vec![fill; page.len()]);
-    mock.expect(&read_request(page), &reply);
+    mock.expect(&Header::read_request(page), &reply);
     mock.expect(&[ACK], &[ACK]);
 }
 
@@ -223,7 +224,7 @@ async fn rejected_exit_ack_does_not_authorize_fresh_cat_verification() -> TestRe
             McpProbeOutcome::Failed {
                 stage: McpProbeStage::Exit,
                 error: Error::Protocol(ProtocolError::MissingAck {
-                    stage: "MCP exit",
+                    stage: AckStage::Exit,
                     byte: 0x15
                 }),
             }
@@ -249,7 +250,7 @@ async fn absent_exit_ack_remains_a_timeout_not_awaiting_verification() -> TestRe
             McpProbeOutcome::Failed {
                 stage: McpProbeStage::Exit,
                 error: Error::Timeout {
-                    operation: "MCP exit",
+                    operation: TimeoutOperation::Acknowledgement(AckStage::Exit),
                     ..
                 },
             }
@@ -267,7 +268,7 @@ async fn read_failure_preserves_prior_evidence_without_sending_exit() -> TestRes
     let mut mock = MockTransport::new();
     identity_and_entry(&mut mock);
     read(&mut mock, global_page()?, 0x12);
-    mock.expect(&read_request(slot_page()?), b"W\x05\x00\x01\x00");
+    mock.expect(&Header::read_request(slot_page()?), b"W\x05\x00\x01\x00");
     let mut radio = Radio::new(mock);
     let report = radio.probe_mcp(|| false).await;
     assert!(
@@ -290,7 +291,7 @@ async fn read_failure_preserves_prior_evidence_without_sending_exit() -> TestRes
     assert_eq!(mock.writes().len(), 7);
     assert_eq!(
         mock.writes().last().map(Vec::as_slice),
-        Some(read_request(slot_page()?).as_slice())
+        Some(Header::read_request(slot_page()?).as_slice())
     );
     mock.assert_complete();
     Ok(())

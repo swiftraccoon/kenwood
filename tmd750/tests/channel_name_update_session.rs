@@ -14,6 +14,7 @@ use tracing as _;
 
 use std::cell::Cell;
 use std::io;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -21,7 +22,7 @@ use kenwood_tmd750::memory::{
     ChannelNameText, ChannelNameUpdate, TextFieldUpdateError, TextFieldUpdateEvent,
     TextFieldUpdateSession, TextFieldUpdateStatus,
 };
-use kenwood_tmd750::protocol::mcp::{ACK, read_request, write_request};
+use kenwood_tmd750::protocol::mcp::{ACK, Header};
 use kenwood_tmd750::types::PhysicalChannel;
 use kenwood_tmd750::{
     Address, Error, FirmwareIdentity, Identity, McpError, McpProbeExit, Page, Radio, RadioModel,
@@ -76,13 +77,13 @@ fn entry(mock: &mut MockTransport) {
 }
 
 fn frame(page: Page, data: &[u8]) -> Vec<u8> {
-    let mut bytes = write_request(page).to_vec();
+    let mut bytes = Header::write_request(page).to_vec();
     bytes.extend_from_slice(data);
     bytes
 }
 
 fn read(mock: &mut MockTransport, page: Page, data: &[u8]) {
-    mock.expect(&read_request(page), &frame(page, data));
+    mock.expect(&Header::read_request(page), frame(page, data));
     mock.expect(&[ACK], &[ACK]);
 }
 
@@ -98,7 +99,7 @@ fn session_script(update: &ChannelNameUpdate) -> Result<MockTransport, Box<dyn s
     match update.next_session()? {
         TextFieldUpdateSession::Apply => {
             preflight(&mut mock, update, update.original_page())?;
-            mock.expect(&frame(update.page(), update.desired_page()), &[ACK]);
+            mock.expect(frame(update.page(), update.desired_page()), &[ACK]);
             read(&mut mock, update.page(), update.desired_page());
         }
         TextFieldUpdateSession::Verify => {
@@ -173,9 +174,9 @@ impl Transport for AuditedTransport {
         self.mock.close().await
     }
 
-    fn set_baud_rate(&mut self, baud: u32) -> Result<(), TransportError> {
+    fn set_baud_rate(&mut self, baud: NonZeroU32) -> Result<(), TransportError> {
         assert!(!self.exited, "no baud operation may follow E");
-        self.baud_changes.push(baud);
+        self.baud_changes.push(baud.get());
         self.mock.set_baud_rate(baud)
     }
 }
@@ -429,7 +430,7 @@ async fn missing_write_ack_sends_no_readback_exit_retry_or_rollback() -> TestRes
     let mut update = fixture()?;
     let mut mock = MockTransport::new();
     preflight(&mut mock, &update, update.original_page())?;
-    mock.expect(&frame(update.page(), update.desired_page()), &[0x15]);
+    mock.expect(frame(update.page(), update.desired_page()), &[0x15]);
     let intents = Arc::new(AtomicUsize::new(0));
     let mut radio = Radio::new(AuditedTransport::new(mock, &intents));
     let report = radio

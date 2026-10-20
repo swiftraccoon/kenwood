@@ -10,12 +10,103 @@
 //! a byte stream that may interleave CAT replies. The decoding follows the
 //! NMEA 0183 sentence formats; no capture of the radio's own output has been
 //! decoded yet.
+//!
+//! Framing and field syntax follow Garmin's public
+//! [GPS 15 specification, sections 4.1, 4.2.1, 4.2.3 and 4.2.6](https://static.garmin.com/pumac/GPS15_TechnicalSpecification.pdf).
+//! Device-specific satellite, altitude and precision limits from that receiver
+//! are not applied to Kenwood observations. Decoded records are immutable;
+//! construct them by parsing a checksum-valid sentence.
 
 use std::fmt::Write as _;
+
+#[cfg(test)]
+#[path = "nmea_tests.rs"]
+mod tests;
 
 /// Longest sentence NMEA 0183 allows: 82 characters from `$` through the
 /// terminator.
 pub const MAX_SENTENCE_LENGTH: usize = 82;
+
+/// A sentence with a decoded field contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SentenceKind {
+    /// Global positioning fix data.
+    Gga,
+    /// Recommended minimum navigation data.
+    Rmc,
+}
+
+impl std::fmt::Display for SentenceKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Gga => "GGA",
+            Self::Rmc => "RMC",
+        })
+    }
+}
+
+/// A typed field rejected by a standard sentence decoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SentenceField {
+    /// UTC time of day.
+    Time,
+    /// UTC Gregorian date.
+    Date,
+    /// Latitude in degrees and minutes.
+    Latitude,
+    /// North or south marker.
+    LatitudeHemisphere,
+    /// Longitude in degrees and minutes.
+    Longitude,
+    /// East or west marker.
+    LongitudeHemisphere,
+    /// Received fix quality.
+    FixQuality,
+    /// Satellite count.
+    Satellites,
+    /// Horizontal dilution of precision.
+    Hdop,
+    /// Antenna altitude.
+    Altitude,
+    /// Metre unit marker for antenna altitude.
+    AltitudeUnit,
+    /// Geoid separation.
+    GeoidSeparation,
+    /// Metre unit marker for geoid separation.
+    GeoidUnit,
+    /// Active or void navigation status.
+    Status,
+    /// Uppercase mode indicator.
+    Mode,
+    /// True course in degrees.
+    Course,
+    /// Speed over ground in knots.
+    Speed,
+}
+
+impl std::fmt::Display for SentenceField {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Time => "time",
+            Self::Date => "date",
+            Self::Latitude => "latitude",
+            Self::LatitudeHemisphere => "latitude hemisphere",
+            Self::Longitude => "longitude",
+            Self::LongitudeHemisphere => "longitude hemisphere",
+            Self::FixQuality => "fix quality",
+            Self::Satellites => "satellites",
+            Self::Hdop => "HDOP",
+            Self::Altitude => "altitude",
+            Self::AltitudeUnit => "altitude unit",
+            Self::GeoidSeparation => "geoid separation",
+            Self::GeoidUnit => "geoid unit",
+            Self::Status => "status",
+            Self::Mode => "mode",
+            Self::Course => "course",
+            Self::Speed => "speed",
+        })
+    }
+}
 
 /// One checksum-valid sentence: its address and comma-separated fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,8 +125,12 @@ impl RawSentence {
     /// or lacks the `$` or the `*HH` suffix, [`NmeaError::Address`] for an
     /// address that is not five uppercase letters or digits (or `P` and a
     /// proprietary code), and [`NmeaError::Checksum`] when the checksum
-    /// differs.
+    /// differs. Returns [`NmeaError::TooLong`] before field allocation when
+    /// the line exceeds 80 bytes, reserving two of the 82 wire bytes for CRLF.
     pub fn parse(line: &str) -> Result<Self, NmeaError> {
+        if line.len() > MAX_SENTENCE_LENGTH - 2 {
+            return Err(NmeaError::TooLong { length: line.len() });
+        }
         let framing = || NmeaError::Framing {
             line: line.to_owned(),
         };
@@ -46,7 +141,7 @@ impl RawSentence {
             return Err(framing());
         }
         let body = line.strip_prefix('$').ok_or_else(framing)?;
-        let (body, checksum) = body.rsplit_once('*').ok_or_else(framing)?;
+        let (body, checksum) = body.split_once('*').ok_or_else(framing)?;
         if checksum.len() != 2 || !checksum.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(framing());
         }
@@ -81,7 +176,7 @@ impl RawSentence {
     /// proprietary sentence.
     #[must_use]
     pub fn talker(&self) -> Option<&str> {
-        (self.address.len() == 5)
+        (!self.address.starts_with('P') && self.address.len() == 5)
             .then(|| self.address.get(..2))
             .flatten()
     }
@@ -90,7 +185,7 @@ impl RawSentence {
     /// after its `P`.
     #[must_use]
     pub fn formatter(&self) -> &str {
-        if self.address.len() == 5 {
+        if !self.address.starts_with('P') && self.address.len() == 5 {
             self.address.get(2..).unwrap_or_default()
         } else {
             self.address.get(1..).unwrap_or_default()
@@ -101,6 +196,13 @@ impl RawSentence {
     #[must_use]
     pub fn fields(&self) -> &[String] {
         &self.fields
+    }
+}
+
+impl std::str::FromStr for RawSentence {
+    type Err = NmeaError;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
     }
 }
 
@@ -133,37 +235,103 @@ impl Sentence {
     }
 }
 
-/// UTC time of day.
+impl std::str::FromStr for Sentence {
+    type Err = NmeaError;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+/// UTC time of day validated by [`Sentence::parse`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct UtcTime {
     /// Hour, 0 to 23.
-    pub hour: u8,
+    hour: u8,
     /// Minute, 0 to 59.
-    pub minute: u8,
+    minute: u8,
     /// Second, 0 to 60 (a leap second).
-    pub second: u8,
+    second: u8,
     /// Millisecond, from at most three fractional digits.
-    pub millisecond: u16,
+    millisecond: u16,
 }
 
-/// UTC calendar date.
+impl UtcTime {
+    /// Hour in `0..=23`.
+    #[must_use]
+    pub const fn hour(self) -> u8 {
+        self.hour
+    }
+    /// Minute in `0..=59`.
+    #[must_use]
+    pub const fn minute(self) -> u8 {
+        self.minute
+    }
+    /// Second in `0..=60`, including a reported leap second.
+    #[must_use]
+    pub const fn second(self) -> u8 {
+        self.second
+    }
+    /// Milliseconds in `0..=999`.
+    #[must_use]
+    pub const fn millisecond(self) -> u16 {
+        self.millisecond
+    }
+}
+
+/// UTC calendar date validated by [`Sentence::parse`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct UtcDate {
     /// Year: a two-digit year below 80 is 20xx, any other 19xx.
-    pub year: u16,
+    year: u16,
     /// Month, 1 to 12.
-    pub month: u8,
+    month: u8,
     /// Day of the month, 1 to that month's length in the Gregorian calendar.
-    pub day: u8,
+    day: u8,
 }
 
-/// A position in signed decimal degrees, negative to the south and west.
+impl UtcDate {
+    /// Four-digit year, `1980..=2079` under the two-digit year interpretation.
+    #[must_use]
+    pub const fn year(self) -> u16 {
+        self.year
+    }
+    /// Month in `1..=12`.
+    #[must_use]
+    pub const fn month(self) -> u8 {
+        self.month
+    }
+    /// A valid Gregorian day of the stored month and year.
+    #[must_use]
+    pub const fn day(self) -> u8 {
+        self.day
+    }
+}
+
+/// A finite parsed position in signed decimal degrees, south and west negative.
+///
+/// ```compile_fail
+/// use kenwood_tmd750::nmea::Position;
+/// fn invalidate(position: &mut Position) { position.latitude = f64::NAN; }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Position {
     /// Latitude, −90 to 90.
-    pub latitude: f64,
+    latitude: f64,
     /// Longitude, −180 to 180.
-    pub longitude: f64,
+    longitude: f64,
+}
+
+impl Position {
+    /// Finite decimal degrees in `-90..=90`, south negative.
+    #[must_use]
+    pub const fn latitude(self) -> f64 {
+        self.latitude
+    }
+    /// Finite decimal degrees in `-180..=180`, west negative.
+    #[must_use]
+    pub const fn longitude(self) -> f64 {
+        self.longitude
+    }
 }
 
 /// GGA field 6: the kind of fix.
@@ -178,8 +346,13 @@ pub enum FixQuality {
     /// `6`: dead reckoning.
     Estimated,
     /// Any other value, retained exactly.
-    Unnamed(u8),
+    Unnamed(UnnamedFixQuality),
 }
+
+unnamed_wire_value!(
+    /// A GGA fix-quality byte outside the named `0`, `1`, `2` and `6` cases.
+    UnnamedFixQuality, [0..=2 | 6]
+);
 
 impl From<u8> for FixQuality {
     fn from(value: u8) -> Self {
@@ -188,7 +361,7 @@ impl From<u8> for FixQuality {
             1 => Self::Gps,
             2 => Self::Differential,
             6 => Self::Estimated,
-            other => Self::Unnamed(other),
+            other => Self::Unnamed(UnnamedFixQuality(other)),
         }
     }
 }
@@ -206,35 +379,80 @@ pub enum RmcStatus {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Gga {
     /// The talker, `GP` or `GN` for example.
-    pub talker: String,
+    talker: String,
     /// Time of the fix.
-    pub time: Option<UtcTime>,
+    time: Option<UtcTime>,
     /// Position of the fix.
-    pub position: Option<Position>,
+    position: Option<Position>,
     /// Kind of fix.
-    pub quality: FixQuality,
+    quality: FixQuality,
     /// Satellites in use.
-    pub satellites: Option<u8>,
+    satellites: Option<u8>,
     /// Horizontal dilution of precision.
-    pub hdop: Option<f64>,
+    hdop: Option<f64>,
     /// Antenna altitude above mean sea level, in metres.
-    pub altitude_m: Option<f64>,
+    altitude_m: Option<f64>,
     /// Height of the geoid above the WGS-84 ellipsoid, in metres.
-    pub geoid_separation_m: Option<f64>,
+    geoid_separation_m: Option<f64>,
 }
 
 impl Gga {
+    /// The validated two-character talker identifier.
+    #[must_use]
+    pub fn talker(&self) -> &str {
+        &self.talker
+    }
+    /// The reported UTC fix time.
+    #[must_use]
+    pub const fn time(&self) -> Option<UtcTime> {
+        self.time
+    }
+    /// The reported finite latitude and longitude.
+    #[must_use]
+    pub const fn position(&self) -> Option<Position> {
+        self.position
+    }
+    /// The canonical received fix-quality byte.
+    #[must_use]
+    pub const fn quality(&self) -> FixQuality {
+        self.quality
+    }
+    /// The reported satellite count, retained as a byte.
+    #[must_use]
+    pub const fn satellites(&self) -> Option<u8> {
+        self.satellites
+    }
+    /// Finite, nonnegative horizontal dilution of precision.
+    #[must_use]
+    pub const fn hdop(&self) -> Option<f64> {
+        self.hdop
+    }
+    /// Finite antenna altitude above mean sea level, in metres.
+    #[must_use]
+    pub const fn altitude_m(&self) -> Option<f64> {
+        self.altitude_m
+    }
+    /// Finite geoid separation in metres, including negative values.
+    #[must_use]
+    pub const fn geoid_separation_m(&self) -> Option<f64> {
+        self.geoid_separation_m
+    }
+
     fn decode(raw: &RawSentence) -> Result<Self, NmeaError> {
-        let fields = Fields::new(raw, "GGA", 14)?;
+        let fields = Fields::new(raw, SentenceKind::Gga, 14)?;
         Ok(Self {
             talker: raw.talker().unwrap_or_default().to_owned(),
             time: fields.time(0)?,
             position: fields.position(1)?,
-            quality: FixQuality::from(fields.integer(5, "fix quality")?.unwrap_or(0)),
-            satellites: fields.integer(6, "satellites")?,
-            hdop: fields.decimal(7, "HDOP")?,
-            altitude_m: fields.decimal(8, "altitude")?,
-            geoid_separation_m: fields.decimal(10, "geoid separation")?,
+            quality: FixQuality::from(fields.integer(5, SentenceField::FixQuality)?.unwrap_or(0)),
+            satellites: fields.integer(6, SentenceField::Satellites)?,
+            hdop: fields.nonnegative_decimal(7, SentenceField::Hdop)?,
+            altitude_m: fields.metres(8, SentenceField::Altitude, SentenceField::AltitudeUnit)?,
+            geoid_separation_m: fields.metres(
+                10,
+                SentenceField::GeoidSeparation,
+                SentenceField::GeoidUnit,
+            )?,
         })
     }
 }
@@ -243,32 +461,73 @@ impl Gga {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Rmc {
     /// The talker, `GP` or `GN` for example.
-    pub talker: String,
+    talker: String,
     /// Time of the fix.
-    pub time: Option<UtcTime>,
+    time: Option<UtcTime>,
     /// Whether the data is valid.
-    pub status: RmcStatus,
+    status: RmcStatus,
     /// Position of the fix.
-    pub position: Option<Position>,
+    position: Option<Position>,
     /// Speed over ground, in knots.
-    pub speed_knots: Option<f64>,
+    speed_knots: Option<f64>,
     /// Course over ground, in degrees true.
-    pub course_degrees: Option<f64>,
+    course_degrees: Option<f64>,
     /// Date of the fix.
-    pub date: Option<UtcDate>,
+    date: Option<UtcDate>,
     /// The mode indicator of NMEA 2.3 and later (`A` autonomous, `D`
     /// differential, `E` estimated, `N` not valid); `None` in the NMEA 2.0
     /// form.
-    pub mode: Option<char>,
+    mode: Option<char>,
 }
 
 impl Rmc {
+    /// The validated two-character talker identifier.
+    #[must_use]
+    pub fn talker(&self) -> &str {
+        &self.talker
+    }
+    /// The reported UTC time.
+    #[must_use]
+    pub const fn time(&self) -> Option<UtcTime> {
+        self.time
+    }
+    /// The reported active or void status.
+    #[must_use]
+    pub const fn status(&self) -> RmcStatus {
+        self.status
+    }
+    /// The reported finite latitude and longitude.
+    #[must_use]
+    pub const fn position(&self) -> Option<Position> {
+        self.position
+    }
+    /// Finite, nonnegative speed over ground in knots.
+    #[must_use]
+    pub const fn speed_knots(&self) -> Option<f64> {
+        self.speed_knots
+    }
+    /// Finite true course in `0..360` degrees.
+    #[must_use]
+    pub const fn course_degrees(&self) -> Option<f64> {
+        self.course_degrees
+    }
+    /// The reported Gregorian date.
+    #[must_use]
+    pub const fn date(&self) -> Option<UtcDate> {
+        self.date
+    }
+    /// An uppercase mode indicator retained without inventing unknown meanings.
+    #[must_use]
+    pub const fn mode(&self) -> Option<char> {
+        self.mode
+    }
+
     fn decode(raw: &RawSentence) -> Result<Self, NmeaError> {
-        let fields = Fields::new(raw, "RMC", 11)?;
+        let fields = Fields::new(raw, SentenceKind::Rmc, 11)?;
         let status = match fields.text(1) {
             "A" => RmcStatus::Active,
             "V" => RmcStatus::Void,
-            _ => return Err(fields.error(1, "status")),
+            _ => return Err(fields.error(1, SentenceField::Status)),
         };
         let mode = match fields.text(11) {
             "" => None,
@@ -276,17 +535,21 @@ impl Rmc {
                 let mut characters = text.chars();
                 match (characters.next(), characters.next()) {
                     (Some(mode), None) if mode.is_ascii_uppercase() => Some(mode),
-                    _ => return Err(fields.error(11, "mode")),
+                    _ => return Err(fields.error(11, SentenceField::Mode)),
                 }
             }
         };
+        let course_degrees = fields.nonnegative_decimal(7, SentenceField::Course)?;
+        if course_degrees.is_some_and(|course| course >= 360.0) {
+            return Err(fields.error(7, SentenceField::Course));
+        }
         Ok(Self {
             talker: raw.talker().unwrap_or_default().to_owned(),
             time: fields.time(0)?,
             status,
             position: fields.position(2)?,
-            speed_knots: fields.decimal(6, "speed")?,
-            course_degrees: fields.decimal(7, "course")?,
+            speed_knots: fields.nonnegative_decimal(6, SentenceField::Speed)?,
+            course_degrees,
             date: fields.date(8)?,
             mode,
         })
@@ -296,13 +559,13 @@ impl Rmc {
 /// The fields of one sentence being decoded.
 struct Fields<'a> {
     raw: &'a RawSentence,
-    sentence: &'static str,
+    sentence: SentenceKind,
 }
 
 impl<'a> Fields<'a> {
     const fn new(
         raw: &'a RawSentence,
-        sentence: &'static str,
+        sentence: SentenceKind,
         minimum: usize,
     ) -> Result<Self, NmeaError> {
         if raw.fields.len() < minimum {
@@ -319,7 +582,7 @@ impl<'a> Fields<'a> {
         self.raw.fields.get(index).map_or("", String::as_str)
     }
 
-    fn error(&self, index: usize, field: &'static str) -> NmeaError {
+    fn error(&self, index: usize, field: SentenceField) -> NmeaError {
         NmeaError::Field {
             sentence: self.sentence,
             field,
@@ -330,7 +593,7 @@ impl<'a> Fields<'a> {
     fn integer<T: std::str::FromStr>(
         &self,
         index: usize,
-        field: &'static str,
+        field: SentenceField,
     ) -> Result<Option<T>, NmeaError> {
         let text = self.text(index);
         if text.is_empty() {
@@ -344,7 +607,7 @@ impl<'a> Fields<'a> {
 
     /// A decimal of digits with an optional sign and fraction; no exponent,
     /// infinity or not-a-number.
-    fn decimal(&self, index: usize, field: &'static str) -> Result<Option<f64>, NmeaError> {
+    fn decimal(&self, index: usize, field: SentenceField) -> Result<Option<f64>, NmeaError> {
         let text = self.text(index);
         if text.is_empty() {
             return Ok(None);
@@ -360,7 +623,37 @@ impl<'a> Fields<'a> {
         {
             return Err(self.error(index, field));
         }
-        text.parse().map(Some).map_err(|_| self.error(index, field))
+        let value: f64 = text.parse().map_err(|_| self.error(index, field))?;
+        if !value.is_finite() {
+            return Err(self.error(index, field));
+        }
+        Ok(Some(value))
+    }
+
+    fn nonnegative_decimal(
+        &self,
+        index: usize,
+        field: SentenceField,
+    ) -> Result<Option<f64>, NmeaError> {
+        let value = self.decimal(index, field)?;
+        if value.is_some_and(|value| value < 0.0) {
+            return Err(self.error(index, field));
+        }
+        Ok(value)
+    }
+
+    fn metres(
+        &self,
+        index: usize,
+        field: SentenceField,
+        unit_field: SentenceField,
+    ) -> Result<Option<f64>, NmeaError> {
+        let value = self.decimal(index, field)?;
+        let unit = self.text(index + 1);
+        if (value.is_some() && unit != "M") || !matches!(unit, "" | "M") {
+            return Err(self.error(index + 1, unit_field));
+        }
+        Ok(value)
     }
 
     fn time(&self, index: usize) -> Result<Option<UtcTime>, NmeaError> {
@@ -368,9 +661,9 @@ impl<'a> Fields<'a> {
         if text.is_empty() {
             return Ok(None);
         }
-        let invalid = || self.error(index, "time");
+        let invalid = || self.error(index, SentenceField::Time);
         let (clock, fraction) = text.split_once('.').unwrap_or((text, ""));
-        if clock.len() != 6 || fraction.len() > 3 {
+        if clock.len() != 6 || fraction.len() > 3 || text.ends_with('.') {
             return Err(invalid());
         }
         let two = |start: usize| -> Result<u8, NmeaError> {
@@ -404,7 +697,7 @@ impl<'a> Fields<'a> {
         if text.is_empty() {
             return Ok(None);
         }
-        let invalid = || self.error(index, "date");
+        let invalid = || self.error(index, SentenceField::Date);
         if text.len() != 6 || !text.bytes().all(|byte| byte.is_ascii_digit()) {
             return Err(invalid());
         }
@@ -428,17 +721,17 @@ impl<'a> Fields<'a> {
         if (index..index + 4).all(|field| self.text(field).is_empty()) {
             return Ok(None);
         }
-        let latitude = self.angle(index, 2, 90, "latitude")?;
-        let longitude = self.angle(index + 2, 3, 180, "longitude")?;
+        let latitude = self.angle(index, 2, 90, SentenceField::Latitude)?;
+        let longitude = self.angle(index + 2, 3, 180, SentenceField::Longitude)?;
         let latitude = match self.text(index + 1) {
             "N" => latitude,
             "S" => -latitude,
-            _ => return Err(self.error(index + 1, "latitude hemisphere")),
+            _ => return Err(self.error(index + 1, SentenceField::LatitudeHemisphere)),
         };
         let longitude = match self.text(index + 3) {
             "E" => longitude,
             "W" => -longitude,
-            _ => return Err(self.error(index + 3, "longitude hemisphere")),
+            _ => return Err(self.error(index + 3, SentenceField::LongitudeHemisphere)),
         };
         Ok(Some(Position {
             latitude,
@@ -453,7 +746,7 @@ impl<'a> Fields<'a> {
         index: usize,
         degree_digits: usize,
         limit: u8,
-        field: &'static str,
+        field: SentenceField,
     ) -> Result<f64, NmeaError> {
         let text = self.text(index);
         let invalid = || self.error(index, field);
@@ -476,7 +769,11 @@ impl<'a> Fields<'a> {
         }
         let degrees: u8 = degrees.parse().map_err(|_| invalid())?;
         let minutes: f64 = minutes.parse().map_err(|_| invalid())?;
-        if minutes >= 60.0 || degrees > limit || (degrees == limit && minutes > 0.0) {
+        if !minutes.is_finite()
+            || minutes >= 60.0
+            || degrees > limit
+            || (degrees == limit && minutes > 0.0)
+        {
             return Err(invalid());
         }
         Ok(f64::from(degrees) + minutes / 60.0)
@@ -500,12 +797,15 @@ const fn days_in_month(year: u16, month: u8) -> u8 {
 /// CR, LF and CRLF all end a line, so CAT replies (CR) and sentences (CRLF)
 /// can share one stream; lines that do not start with `$` are skipped. A
 /// sentence longer than [`MAX_SENTENCE_LENGTH`] is reported once and the
-/// reader resumes at the next terminator.
+/// reader resumes at the next terminator. Every partial line retains at most
+/// 80 bytes; oversized noise is discarded through its terminator without
+/// producing a sentence error.
 #[derive(Debug, Clone, Default)]
 pub struct LineReader {
     line: Vec<u8>,
     length: usize,
     overflowed: bool,
+    sentence: bool,
 }
 
 impl LineReader {
@@ -516,6 +816,7 @@ impl LineReader {
             line: Vec::new(),
             length: 0,
             overflowed: false,
+            sentence: false,
         }
     }
 
@@ -526,7 +827,8 @@ impl LineReader {
             if byte == b'\r' || byte == b'\n' {
                 let line = std::mem::take(&mut self.line);
                 let length = std::mem::take(&mut self.length);
-                if std::mem::take(&mut self.overflowed) {
+                let sentence = std::mem::take(&mut self.sentence);
+                if std::mem::take(&mut self.overflowed) && sentence {
                     sentences.push(Err(NmeaError::TooLong { length }));
                 } else if line.first() == Some(&b'$') {
                     sentences.push(std::str::from_utf8(&line).map_or_else(
@@ -540,12 +842,15 @@ impl LineReader {
                 }
                 continue;
             }
-            self.length += 1;
+            if self.length == 0 {
+                self.sentence = byte == b'$';
+            }
+            self.length = self.length.saturating_add(1);
             if self.overflowed {
                 continue;
             }
             self.line.push(byte);
-            if self.line.first() == Some(&b'$') && self.line.len() > MAX_SENTENCE_LENGTH - 2 {
+            if self.line.len() > MAX_SENTENCE_LENGTH - 2 {
                 self.overflowed = true;
                 self.line.clear();
             }
@@ -593,8 +898,10 @@ pub enum NmeaError {
         /// The checksum of the bytes between `$` and `*`.
         computed: u8,
     },
-    /// A sentence longer than [`MAX_SENTENCE_LENGTH`].
-    #[error("a sentence of {length} bytes exceeds {MAX_SENTENCE_LENGTH}")]
+    /// A sentence longer than 80 bytes before its reserved CRLF terminator.
+    #[error(
+        "a sentence of {length} bytes leaves no room for CRLF within {MAX_SENTENCE_LENGTH} bytes"
+    )]
     TooLong {
         /// The bytes received before the terminator.
         length: usize,
@@ -603,7 +910,7 @@ pub enum NmeaError {
     #[error("{sentence} has {actual} fields, fewer than {minimum}")]
     FieldCount {
         /// The formatter.
-        sentence: &'static str,
+        sentence: SentenceKind,
         /// The fields present.
         actual: usize,
         /// The fields its format requires.
@@ -613,14 +920,10 @@ pub enum NmeaError {
     #[error("{sentence} {field} {text:?} is outside its format")]
     Field {
         /// The formatter.
-        sentence: &'static str,
+        sentence: SentenceKind,
         /// The field.
-        field: &'static str,
+        field: SentenceField,
         /// The field's text.
         text: String,
     },
 }
-
-#[cfg(test)]
-#[path = "nmea_tests.rs"]
-mod tests;

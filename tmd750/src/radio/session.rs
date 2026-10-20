@@ -12,6 +12,7 @@
 //! session got. The host owns every open and close.
 
 use std::io;
+use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::backup::McpBackupReport;
@@ -25,6 +26,9 @@ use super::{Identity, Radio};
 use crate::error::Error;
 use crate::transport::SerialCandidate;
 use crate::types::DvGatewayMode;
+
+#[cfg(test)]
+mod tests;
 
 /// The record a session makes durable before each page write.
 pub trait WriteJournal {
@@ -77,6 +81,8 @@ pub struct SessionReport {
     pub compare_exchange: Option<McpCompareExchangeReport>,
     /// The failure that stopped the session.
     pub error: Option<Error>,
+    /// An exit failure retained independently of the page operation's error.
+    pub exit_error: Option<Error>,
     /// The close of the session connection; `None` when none opened.
     pub close: Option<Result<(), CloseFailure>>,
     /// The fresh identity and Gateway Off check after an acknowledged exit
@@ -95,6 +101,7 @@ impl SessionReport {
             journal: McpJournal::default(),
             compare_exchange: None,
             error: None,
+            exit_error: None,
             close: None,
             readiness: None,
         }
@@ -105,6 +112,7 @@ impl SessionReport {
     #[must_use]
     pub fn succeeded(&self) -> bool {
         self.error.is_none()
+            && self.exit_error.is_none()
             && self.exit == SessionExit::Acknowledged
             && matches!(self.close, Some(Ok(())))
             && self
@@ -149,7 +157,7 @@ impl BackupSession {
 pub async fn write_pages<C: ControlHost>(
     host: &mut C,
     endpoint: &SerialCandidate,
-    baud: u32,
+    baud: NonZeroU32,
     identity: &Identity,
     replacements: &[PageReplacement],
     journal: &mut impl WriteJournal,
@@ -204,7 +212,7 @@ pub async fn write_pages<C: ControlHost>(
 pub async fn backup<C: ControlHost>(
     host: &mut C,
     endpoint: &SerialCandidate,
-    baud: u32,
+    baud: NonZeroU32,
     identity: &Identity,
     cancelled: &AtomicBool,
 ) -> BackupSession {
@@ -230,9 +238,14 @@ pub async fn backup<C: ControlHost>(
     };
     let mut radio = Radio::new(connection);
     let captured = radio
-        .backup_mcp_until_exit(|| cancelled.load(Ordering::Relaxed), |_progress| {})
+        .backup_mcp_checked_until_exit(
+            Some(identity),
+            || cancelled.load(Ordering::Relaxed),
+            |_progress| {},
+        )
         .await;
     report.identity.clone_from(&captured.identity);
+    report.gateway = captured.gateway_mode;
     report.exit = match captured.exit {
         McpProbeExit::Acknowledged => SessionExit::Acknowledged,
         McpProbeExit::NotAcknowledged => SessionExit::NotAcknowledged,
@@ -249,7 +262,16 @@ pub async fn backup<C: ControlHost>(
             actual,
         });
     }
-    finish(host, radio, endpoint, baud, identity, None, &mut report).await;
+    finish(
+        host,
+        radio,
+        endpoint,
+        baud,
+        identity,
+        Some(DvGatewayMode::Off),
+        &mut report,
+    )
+    .await;
     BackupSession {
         session: report,
         backup: Some(captured),
@@ -300,8 +322,9 @@ async fn program<T: kenwood_transport::Transport>(
     } else {
         Ok(())
     };
+    report.exit_error = exited.err();
     report.compare_exchange = Some(outcome?);
-    exited
+    Ok(())
 }
 
 /// Close the session connection and, after an acknowledged exit, verify a
@@ -310,7 +333,7 @@ async fn finish<C: ControlHost>(
     host: &mut C,
     radio: Radio<C::Connection>,
     endpoint: &SerialCandidate,
-    baud: u32,
+    baud: NonZeroU32,
     identity: &Identity,
     gateway: Option<DvGatewayMode>,
     report: &mut SessionReport,
@@ -325,6 +348,3 @@ async fn finish<C: ControlHost>(
             Some(verify_readiness(host, endpoint, baud, identity, gateway, &finish).await);
     }
 }
-
-#[cfg(test)]
-mod tests;

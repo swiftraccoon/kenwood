@@ -1,4 +1,5 @@
 #![no_main]
+//! Checks byte-preserving decoding and reconstruction of Mic-E type codes.
 
 use kenwood_tmd750::memory::mic_e::{MIC_E_ENTRY_SIZE, MicETypeCode};
 use libfuzzer_sys::fuzz_target;

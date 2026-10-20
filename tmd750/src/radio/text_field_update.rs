@@ -106,8 +106,9 @@ pub enum TextFieldUpdateSessionOutcome {
 
 /// The wire exchanges of one bounded text field update session.
 ///
-/// Preserve the raw transcript alongside these complete read segments: failed
-/// exchanges and any secondary exit error appear only there.
+/// Complete read segments accompany the first operation outcome and an
+/// independent [`Self::cleanup_error`]. A raw transcript also retains partial
+/// exchanges that did not produce a complete segment.
 #[derive(Debug)]
 pub struct TextFieldUpdateSessionReport {
     /// The field the update changes.
@@ -550,7 +551,7 @@ impl<T: Transport> Radio<T> {
         }
         let target = frame_target(update.field(), update.page())?;
         report.write = TextFieldUpdateWriteDisposition::PossiblyDispatched;
-        self.write_fixed_text_frame(target, update.desired_page(), "text field page write")
+        self.write_fixed_text_frame(target, update.desired_page())
             .await?;
         report.write = TextFieldUpdateWriteDisposition::Acknowledged;
         Ok(())

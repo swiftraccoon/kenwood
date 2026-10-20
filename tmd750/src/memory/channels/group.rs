@@ -14,12 +14,16 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use crate::error::{Error, ValidationError};
+use crate::error::{Error, SettingName, ValidationError};
 use crate::memory::{ChannelNameText, MemoryImage};
 use crate::protocol::mcp::regions;
 use crate::radio::programming::PageReplacement;
 use crate::types::stored::name_address_at;
 use crate::types::{Address, CHANNEL_NAME_SIZE, Page, PhysicalChannel};
+
+#[cfg(test)]
+#[path = "group_tests.rs"]
+mod tests;
 
 /// Memory groups.
 pub const MEMORY_GROUPS: u8 = 30;
@@ -33,6 +37,8 @@ pub(super) const WEATHER_GROUP_NAME_INDEX: u16 = 1182;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MemoryGroup(u8);
 
+checked_integer_traits!(MemoryGroup, u8, index);
+
 impl MemoryGroup {
     /// Group `index`.
     ///
@@ -43,7 +49,7 @@ impl MemoryGroup {
     pub const fn new(index: u8) -> Result<Self, ValidationError> {
         if index >= MEMORY_GROUPS {
             Err(ValidationError::SettingOutOfRange {
-                setting: "memory group",
+                setting: SettingName::MemoryGroup,
                 value: index as u64,
                 max: (MEMORY_GROUPS - 1) as u64,
             })
@@ -257,7 +263,3 @@ fn flag_page(channel: PhysicalChannel) -> Option<Page> {
     let address = Address::new(u32::try_from(channel.flag_address()).ok()?).ok()?;
     regions::writable_page_for(address)
 }
-
-#[cfg(test)]
-#[path = "group_tests.rs"]
-mod tests;

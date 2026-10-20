@@ -1,4 +1,5 @@
 #![no_main]
+//! Checks that accepted MCP headers preserve their complete wire encoding.
 
 use kenwood_tmd750::protocol::mcp::{HEADER_LEN, Header};
 use libfuzzer_sys::fuzz_target;

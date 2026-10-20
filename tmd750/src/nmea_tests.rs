@@ -121,6 +121,22 @@ fn framed(body: &str) -> String {
     format!("${body}*{checksum:02X}")
 }
 
+#[test]
+fn checksum_delimiter_ends_the_data_even_when_a_later_checksum_matches() -> TestResult {
+    let valid = framed("PGRME,15.0,M,45.0,M,25.0,M");
+    let parsed = RawSentence::parse(&valid)?;
+    assert_eq!(parsed.fields(), ["15.0", "M", "45.0", "M", "25.0", "M"]);
+    for body in ["PGRME,15.0*00,45.0", "GPXYZ,1*00", "PGRME,**"] {
+        let malformed = framed(body);
+        let result = RawSentence::parse(&malformed);
+        assert!(
+            matches!(result, Err(NmeaError::Framing { .. })),
+            "{malformed}: {result:?}"
+        );
+    }
+    Ok(())
+}
+
 /// The reference RMC sentence with `ddmmyy` as its date.
 fn rmc_dated(ddmmyy: &str) -> String {
     framed(&format!(
@@ -228,5 +244,131 @@ fn the_line_reader_yields_sentences_and_skips_cat_replies() -> TestResult {
         matches!(results.get(1), Some(Ok(Sentence::Rmc(_)))),
         "the reader resynchronizes at the next terminator: {results:?}"
     );
+    Ok(())
+}
+
+#[test]
+fn proprietary_addresses_never_dispatch_as_standard_sentences() -> TestResult {
+    for address in ["PGRME", "PGRMC", "PPGGA", "PGRMZ", "PGRMC1"] {
+        let line = framed(&format!("{address},1"));
+        let raw = RawSentence::parse(&line)?;
+        assert_eq!(
+            raw.talker(),
+            None,
+            "{address} is proprietary regardless of length"
+        );
+        assert_eq!(
+            raw.formatter(),
+            address.get(1..).ok_or("manufacturer code")?
+        );
+        assert!(
+            matches!(Sentence::parse(&line)?, Sentence::Other(_)),
+            "{address}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn direct_and_fragmented_sentence_limits_reserve_the_wire_terminator() -> TestResult {
+    let accepted = framed(&format!("GPXXX,{}", "A".repeat(70)));
+    let rejected = framed(&format!("GPXXX,{}", "A".repeat(71)));
+    assert_eq!(accepted.len(), 80);
+    assert_eq!(rejected.len(), 81);
+    let _raw = RawSentence::parse(&accepted)?;
+    assert_eq!(
+        RawSentence::parse(&rejected),
+        Err(NmeaError::TooLong { length: 81 })
+    );
+    let mut reader = LineReader::new();
+    let mut results = Vec::new();
+    for byte in format!("{rejected}\r\n{accepted}\r\n").bytes() {
+        results.extend(reader.push(&[byte]));
+        assert!(
+            reader.line.len() <= 80,
+            "every partial line must stay bounded"
+        );
+    }
+    assert_eq!(results.len(), 2);
+    assert_eq!(
+        results.first(),
+        Some(&Err(NmeaError::TooLong { length: 81 }))
+    );
+    assert!(matches!(results.get(1), Some(Ok(Sentence::Other(_)))));
+    Ok(())
+}
+
+#[test]
+fn unterminated_noise_stays_bounded_and_recovers_at_its_terminator() -> TestResult {
+    let mut reader = LineReader::new();
+    assert!(reader.push(&vec![b'X'; 1_000_000]).is_empty());
+    assert!(
+        reader.line.len() <= 80,
+        "noise cannot grow the partial-line allocation"
+    );
+    assert!(
+        reader.push(b"$GPGGA\r\n").is_empty(),
+        "an embedded dollar is still noise"
+    );
+    let results = reader.push(format!("{REFERENCE_GGA}\r\n").as_bytes());
+    assert_eq!(results.len(), 1);
+    let fix = results
+        .into_iter()
+        .next()
+        .ok_or("one completed sentence")??;
+    assert!(matches!(fix, Sentence::Gga(_)));
+    Ok(())
+}
+
+#[test]
+fn navigation_numbers_reject_invalid_grammar_signs_angles_and_units() -> TestResult {
+    for (speed, course) in [
+        ("-0.1", "84.4"),
+        ("1", "-0.1"),
+        ("1", "360"),
+        ("NaN", "1"),
+        ("1e3", "1"),
+    ] {
+        let line = framed(&format!(
+            "GPRMC,123519,A,4807.038,N,01131.000,E,{speed},{course},230394,003.1,W"
+        ));
+        assert!(
+            matches!(Sentence::parse(&line), Err(NmeaError::Field { .. })),
+            "{line}"
+        );
+    }
+    for (time, latitude, hdop, altitude_unit, geoid_unit) in [
+        ("123519.", "4807.038", "0.9", "M", "M"),
+        ("123519", "9000.001", "0.9", "M", "M"),
+        ("123519", "4807.038", "-0.1", "M", "M"),
+        ("123519", "4807.038", "0.9", "F", "M"),
+        ("123519", "4807.038", "0.9", "M", "F"),
+    ] {
+        let line = framed(&format!(
+            "GPGGA,{time},{latitude},N,01131.000,E,1,08,{hdop},545.4,{altitude_unit},46.9,{geoid_unit},,"
+        ));
+        assert!(
+            matches!(Sentence::parse(&line), Err(NmeaError::Field { .. })),
+            "{line}"
+        );
+    }
+    let line = framed("GPRMC,235960.999,A,9000.000,S,18000.000,W,0,359.999,290200,,,A");
+    let Sentence::Rmc(fix) = Sentence::parse(&line)? else {
+        return Err("RMC".into());
+    };
+    let time = fix.time().ok_or("UTC time")?;
+    assert_eq!(
+        (
+            time.hour(),
+            time.minute(),
+            time.second(),
+            time.millisecond()
+        ),
+        (23, 59, 60, 999)
+    );
+    let date = fix.date().ok_or("date")?;
+    assert_eq!((date.year(), date.month(), date.day()), (2000, 2, 29));
+    let position = fix.position().ok_or("position")?;
+    assert_eq!((position.latitude(), position.longitude()), (-90.0, -180.0));
     Ok(())
 }

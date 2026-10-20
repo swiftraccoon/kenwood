@@ -6,8 +6,114 @@
 
 use std::fmt;
 
-use crate::error::ValidationError;
+use crate::error::{SettingName, ValidationError};
 use crate::types::Band;
+
+/// A regular memory-channel number from 0 through 999.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RegularChannel(u16);
+
+integer_formats!(RegularChannel, get);
+
+impl RegularChannel {
+    /// Highest regular memory-channel number.
+    pub const MAX: u16 = 999;
+
+    /// Check a regular memory-channel number.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::SettingOutOfRange`] above [`Self::MAX`].
+    pub const fn new(value: u16) -> Result<Self, ValidationError> {
+        if value <= Self::MAX {
+            Ok(Self(value))
+        } else {
+            Err(ValidationError::SettingOutOfRange {
+                setting: SettingName::MemoryChannel,
+                value: value as u64,
+                max: Self::MAX as u64,
+            })
+        }
+    }
+
+    /// The zero-based channel number.
+    #[must_use]
+    pub const fn get(self) -> u16 {
+        self.0
+    }
+}
+
+impl TryFrom<u16> for RegularChannel {
+    type Error = ValidationError;
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<RegularChannel> for u16 {
+    fn from(value: RegularChannel) -> Self {
+        value.get()
+    }
+}
+
+impl fmt::Display for RegularChannel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// A program-scan lower/upper pair index from 0 through 49.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ProgramScanIndex(u8);
+
+integer_formats!(ProgramScanIndex, get);
+
+impl ProgramScanIndex {
+    /// Highest program-scan pair index.
+    pub const MAX: u8 = 49;
+
+    /// Check a program-scan pair index.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::SettingOutOfRange`] above [`Self::MAX`].
+    pub const fn new(value: u8) -> Result<Self, ValidationError> {
+        if value <= Self::MAX {
+            Ok(Self(value))
+        } else {
+            Err(ValidationError::SettingOutOfRange {
+                setting: SettingName::ProgramScanIndex,
+                value: value as u64,
+                max: Self::MAX as u64,
+            })
+        }
+    }
+
+    /// The zero-based program-scan pair index.
+    #[must_use]
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+}
+
+impl TryFrom<u8> for ProgramScanIndex {
+    type Error = ValidationError;
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<ProgramScanIndex> for u8 {
+    fn from(value: ProgramScanIndex) -> Self {
+        value.get()
+    }
+}
+
+impl fmt::Display for ProgramScanIndex {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
 
 /// Tuning mode selected and reported by `VM`.
 ///
@@ -43,7 +149,7 @@ impl TryFrom<u8> for TuningMode {
             2 => Ok(Self::Call),
             3 => Ok(Self::DStarRepeater),
             _ => Err(ValidationError::SettingOutOfRange {
-                setting: "tuning mode",
+                setting: SettingName::TuningMode,
                 value: u64::from(value),
                 max: 3,
             }),
@@ -95,7 +201,7 @@ impl TryFrom<u8> for ShiftDirection {
             1 => Ok(Self::Plus),
             2 => Ok(Self::Minus),
             _ => Err(ValidationError::SettingOutOfRange {
-                setting: "shift direction",
+                setting: SettingName::ShiftDirection,
                 value: u64::from(value),
                 max: 2,
             }),
@@ -122,11 +228,11 @@ impl fmt::Display for ShiftDirection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MemoryChannelAddress {
     /// Regular channel 0 through 999.
-    Regular(u16),
+    Regular(RegularChannel),
     /// Program scan lower limit L0 through L49.
-    ProgramScanLower(u8),
+    ProgramScanLower(ProgramScanIndex),
     /// Program scan upper limit U0 through U49.
-    ProgramScanUpper(u8),
+    ProgramScanUpper(ProgramScanIndex),
     /// The priority scan channel.
     Priority,
 }
@@ -143,15 +249,10 @@ impl MemoryChannelAddress {
     ///
     /// Returns [`ValidationError::SettingOutOfRange`] above
     /// [`Self::MAX_REGULAR`].
-    pub const fn regular(channel: u16) -> Result<Self, ValidationError> {
-        if channel > Self::MAX_REGULAR {
-            Err(ValidationError::SettingOutOfRange {
-                setting: "memory channel",
-                value: channel as u64,
-                max: Self::MAX_REGULAR as u64,
-            })
-        } else {
-            Ok(Self::Regular(channel))
+    pub fn regular(channel: u16) -> Result<Self, ValidationError> {
+        match RegularChannel::new(channel) {
+            Ok(channel) => Ok(Self::Regular(channel)),
+            Err(error) => Err(error),
         }
     }
 
@@ -161,11 +262,10 @@ impl MemoryChannelAddress {
     ///
     /// Returns [`ValidationError::SettingOutOfRange`] above
     /// [`Self::MAX_PROGRAM_SCAN`].
-    pub const fn program_scan_lower(index: u8) -> Result<Self, ValidationError> {
-        if index > Self::MAX_PROGRAM_SCAN {
-            Err(Self::program_scan_error(index))
-        } else {
-            Ok(Self::ProgramScanLower(index))
+    pub fn program_scan_lower(index: u8) -> Result<Self, ValidationError> {
+        match ProgramScanIndex::new(index) {
+            Ok(index) => Ok(Self::ProgramScanLower(index)),
+            Err(error) => Err(error),
         }
     }
 
@@ -175,19 +275,10 @@ impl MemoryChannelAddress {
     ///
     /// Returns [`ValidationError::SettingOutOfRange`] above
     /// [`Self::MAX_PROGRAM_SCAN`].
-    pub const fn program_scan_upper(index: u8) -> Result<Self, ValidationError> {
-        if index > Self::MAX_PROGRAM_SCAN {
-            Err(Self::program_scan_error(index))
-        } else {
-            Ok(Self::ProgramScanUpper(index))
-        }
-    }
-
-    const fn program_scan_error(index: u8) -> ValidationError {
-        ValidationError::SettingOutOfRange {
-            setting: "program scan index",
-            value: index as u64,
-            max: Self::MAX_PROGRAM_SCAN as u64,
+    pub fn program_scan_upper(index: u8) -> Result<Self, ValidationError> {
+        match ProgramScanIndex::new(index) {
+            Ok(index) => Ok(Self::ProgramScanUpper(index)),
+            Err(error) => Err(error),
         }
     }
 
@@ -232,7 +323,7 @@ impl MemoryChannelAddress {
             _ if first.is_ascii_digit() => digits(*second, *third)
                 .map(|low| u16::from(*first - b'0') * 100 + u16::from(low))
                 .ok_or_else(invalid)
-                .map(Self::Regular),
+                .and_then(|channel| Self::regular(channel).map_err(|_| invalid())),
             _ => Err(invalid()),
         }
     }
@@ -333,10 +424,10 @@ mod tests {
     #[test]
     fn memory_addresses_have_exactly_three_wire_characters() -> TestResult {
         for (text, address) in [
-            ("000", MemoryChannelAddress::Regular(0)),
-            ("999", MemoryChannelAddress::Regular(999)),
-            ("L00", MemoryChannelAddress::ProgramScanLower(0)),
-            ("U49", MemoryChannelAddress::ProgramScanUpper(49)),
+            ("000", MemoryChannelAddress::regular(0)?),
+            ("999", MemoryChannelAddress::regular(999)?),
+            ("L00", MemoryChannelAddress::program_scan_lower(0)?),
+            ("U49", MemoryChannelAddress::program_scan_upper(49)?),
             ("Pri", MemoryChannelAddress::Priority),
         ] {
             assert_eq!(MemoryChannelAddress::from_wire_str(text)?, address);
@@ -354,6 +445,32 @@ mod tests {
         assert!(MemoryChannelAddress::regular(1000).is_err());
         assert!(MemoryChannelAddress::program_scan_lower(50).is_err());
         assert!(MemoryChannelAddress::program_scan_upper(50).is_err());
+        assert!(RegularChannel::new(1000).is_err());
+        assert!(ProgramScanIndex::new(50).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn checked_address_payloads_preserve_every_physical_channel_boundary() -> TestResult {
+        use crate::types::PhysicalChannel;
+        for raw in 0..=RegularChannel::MAX {
+            let address = MemoryChannelAddress::Regular(RegularChannel::try_from(raw)?);
+            assert_eq!(
+                PhysicalChannel::from_address(address).selector().address(),
+                Some(address)
+            );
+        }
+        for raw in 0..=ProgramScanIndex::MAX {
+            for address in [
+                MemoryChannelAddress::ProgramScanLower(ProgramScanIndex::try_from(raw)?),
+                MemoryChannelAddress::ProgramScanUpper(ProgramScanIndex::try_from(raw)?),
+            ] {
+                assert_eq!(
+                    PhysicalChannel::from_address(address).selector().address(),
+                    Some(address)
+                );
+            }
+        }
         Ok(())
     }
 
@@ -366,7 +483,7 @@ mod tests {
         assert_eq!(CurrentMemorySelector::Aprs.address(), None);
         assert_eq!(
             CurrentMemorySelector::from_wire_str("021")?.address(),
-            Some(MemoryChannelAddress::Regular(21))
+            Some(MemoryChannelAddress::regular(21)?)
         );
         assert!(CurrentMemorySelector::from_wire_str("AP").is_err());
         assert_eq!(CurrentMemorySelector::Aprs.to_string(), "APRS");

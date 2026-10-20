@@ -2,6 +2,7 @@
 //! deadlines, and cancellation.
 
 use super::*;
+use crate::AckStage;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -21,6 +22,7 @@ struct TestTransport {
     write_behavior: WriteBehavior,
     release_per_write: bool,
     released: usize,
+    read_delay: Duration,
 }
 
 impl TestTransport {
@@ -32,6 +34,7 @@ impl TestTransport {
             write_behavior: WriteBehavior::Complete,
             release_per_write: false,
             released: 0,
+            read_delay: Duration::ZERO,
         }
     }
 
@@ -62,6 +65,9 @@ impl Transport for TestTransport {
         let Some(mut chunk) = self.chunks.pop_front() else {
             return std::future::pending().await;
         };
+        if !self.read_delay.is_zero() {
+            tokio::time::sleep(self.read_delay).await;
+        }
         self.reads += 1;
         let count = chunk.len().min(buffer.len());
         for (target, source) in buffer.iter_mut().zip(&chunk) {
@@ -116,7 +122,9 @@ async fn commands_after_a_rejection_discard_the_repeated_reply() -> TestResult {
     assert!(
         matches!(
             rejected,
-            Err(Error::Protocol(ProtocolError::Rejected { command: "FQ" }))
+            Err(Error::Protocol(ProtocolError::Rejected {
+                command: CommandName::Fq
+            }))
         ),
         "{rejected:?}"
     );
@@ -170,12 +178,31 @@ async fn a_reply_for_the_other_band_is_stale_and_the_command_times_out() -> Test
         matches!(
             result,
             Err(Error::Timeout {
-                operation: "MD",
+                operation: TimeoutOperation::Command(CommandName::Md),
                 timeout,
             }) if timeout == Duration::from_millis(20)
         ),
         "{result:?}"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn stale_lines_share_the_commands_original_reply_deadline() -> TestResult {
+    let mut transport = TestTransport::new([b"MD 1,1\r".to_vec(), b"MD 0,0\r".to_vec()]);
+    transport.read_delay = Duration::from_millis(40);
+    let mut radio = Radio::new(transport);
+    radio.set_timeout(Duration::from_millis(60));
+    let result = radio.get_operating_mode(Band::A).await;
+    assert!(
+        matches!(result, Err(Error::Timeout { operation: TimeoutOperation::Command(CommandName::Md), timeout }) if timeout == Duration::from_millis(60)),
+        "a stale line must not grant another full reply timeout: {result:?}"
+    );
+    assert_eq!(
+        radio.transport.reads, 1,
+        "the matching reply must remain outside the command deadline"
+    );
+    assert_eq!(radio.transport.writes, [b"MD 0\r".to_vec()]);
     Ok(())
 }
 
@@ -189,7 +216,7 @@ async fn too_many_stale_lines_fail_the_command() -> TestResult {
         matches!(
             result,
             Err(Error::Protocol(ProtocolError::UnexpectedResponse {
-                expected: "FQ",
+                expected: CommandName::Fq,
                 ..
             }))
         ),
@@ -205,11 +232,30 @@ async fn cat_and_binary_reads_share_one_lossless_receive_buffer() -> TestResult 
     let transport =
         TestTransport::new([b"0M\rW\x00\x00\x38\x04\xAA\xBB\xCC\xDD\x06GW 0\r".to_vec()]);
     let mut radio = Radio::new(transport);
-    assert_eq!(radio.read_line("entry").await?, b"0M");
-    assert_eq!(radio.read_exact(5, "header").await?, b"W\x00\x00\x38\x04");
-    assert_eq!(radio.read_exact(4, "page").await?, b"\xAA\xBB\xCC\xDD");
-    assert_eq!(radio.read_exact(1, "ACK").await?, b"\x06");
-    assert_eq!(radio.read_line("CAT").await?, b"GW 0");
+    assert_eq!(
+        radio.read_line(TimeoutOperation::ProgrammingEntry).await?,
+        b"0M"
+    );
+    assert_eq!(
+        radio.read_exact(5, TimeoutOperation::McpReadHeader).await?,
+        b"W\x00\x00\x38\x04"
+    );
+    assert_eq!(
+        radio.read_exact(4, TimeoutOperation::McpPageData).await?,
+        b"\xAA\xBB\xCC\xDD"
+    );
+    assert_eq!(
+        radio
+            .read_exact(1, TimeoutOperation::Acknowledgement(AckStage::PageRead))
+            .await?,
+        b"\x06"
+    );
+    assert_eq!(
+        radio
+            .read_line(TimeoutOperation::Command(CommandName::Gw))
+            .await?,
+        b"GW 0"
+    );
     assert_eq!(radio.into_transport().reads, 1);
     Ok(())
 }
@@ -217,8 +263,14 @@ async fn cat_and_binary_reads_share_one_lossless_receive_buffer() -> TestResult 
 #[tokio::test]
 async fn binary_read_retains_the_remainder_of_a_larger_transport_chunk() -> TestResult {
     let mut radio = Radio::new(TestTransport::new([b"\x01\x02\x03\x04\x05".to_vec()]));
-    assert_eq!(radio.read_exact(2, "first").await?, [1, 2]);
-    assert_eq!(radio.read_exact(3, "second").await?, [3, 4, 5]);
+    assert_eq!(
+        radio.read_exact(2, TimeoutOperation::McpPageData).await?,
+        [1, 2]
+    );
+    assert_eq!(
+        radio.read_exact(3, TimeoutOperation::McpPageData).await?,
+        [3, 4, 5]
+    );
     assert_eq!(radio.into_transport().reads, 1);
     Ok(())
 }
@@ -226,21 +278,32 @@ async fn binary_read_retains_the_remainder_of_a_larger_transport_chunk() -> Test
 #[tokio::test]
 async fn cancellation_retains_partial_cat_and_binary_input() -> TestResult {
     let mut radio = Radio::new(TestTransport::new([b"ID ".to_vec()]));
-    let interrupted =
-        tokio::time::timeout(Duration::from_millis(1), radio.read_line("partial CAT")).await;
+    let interrupted = tokio::time::timeout(
+        Duration::from_millis(1),
+        radio.read_line(TimeoutOperation::Command(CommandName::Id)),
+    )
+    .await;
     assert!(interrupted.is_err());
     radio.transport.chunks.push_back(b"TM-D750\r".to_vec());
-    assert_eq!(radio.read_line("completed CAT").await?, b"ID TM-D750");
+    assert_eq!(
+        radio
+            .read_line(TimeoutOperation::Command(CommandName::Id))
+            .await?,
+        b"ID TM-D750"
+    );
 
     radio.transport.chunks.push_back(vec![1, 2]);
     let interrupted = tokio::time::timeout(
         Duration::from_millis(1),
-        radio.read_exact(4, "partial binary"),
+        radio.read_exact(4, TimeoutOperation::McpPageData),
     )
     .await;
     assert!(interrupted.is_err());
     radio.transport.chunks.push_back(vec![3, 4]);
-    assert_eq!(radio.read_exact(4, "completed binary").await?, [1, 2, 3, 4]);
+    assert_eq!(
+        radio.read_exact(4, TimeoutOperation::McpPageData).await?,
+        [1, 2, 3, 4]
+    );
     Ok(())
 }
 
@@ -249,7 +312,13 @@ async fn cat_line_limit_accepts_the_boundary_and_rejects_longer_input() -> TestR
     let mut boundary = vec![b'A'; MAX_CAT_LINE_BYTES];
     boundary.push(b'\r');
     let mut radio = Radio::new(TestTransport::new([boundary]));
-    assert_eq!(radio.read_line("boundary").await?.len(), MAX_CAT_LINE_BYTES);
+    assert_eq!(
+        radio
+            .read_line(TimeoutOperation::Command(CommandName::Id))
+            .await?
+            .len(),
+        MAX_CAT_LINE_BYTES
+    );
 
     for terminated in [false, true] {
         let mut oversized = vec![b'A'; MAX_CAT_LINE_BYTES + 1];
@@ -257,7 +326,9 @@ async fn cat_line_limit_accepts_the_boundary_and_rejects_longer_input() -> TestR
             oversized.push(b'\r');
         }
         let mut radio = Radio::new(TestTransport::new([oversized]));
-        let result = radio.read_line("oversized").await;
+        let result = radio
+            .read_line(TimeoutOperation::Command(CommandName::Id))
+            .await;
         assert!(
             matches!(
                 result,
@@ -281,7 +352,7 @@ async fn hanging_write_times_out_and_blocks_further_cat_commands() -> TestResult
     assert!(matches!(
         result,
         Err(Error::Timeout {
-            operation: "serial write",
+            operation: TimeoutOperation::SerialWrite,
             timeout,
         }) if timeout == Duration::from_millis(5)
     ));
@@ -314,7 +385,7 @@ async fn complete_rejection_replies_leave_the_cat_boundary_ready() -> TestResult
         matches!(
             rejected,
             Err(Error::Protocol(ProtocolError::NotAvailable {
-                command: "MD"
+                command: CommandName::Md
             }))
         ),
         "{rejected:?}"
@@ -328,7 +399,9 @@ async fn complete_rejection_replies_leave_the_cat_boundary_ready() -> TestResult
     assert!(
         matches!(
             rejected,
-            Err(Error::Protocol(ProtocolError::Rejected { command: "MD" }))
+            Err(Error::Protocol(ProtocolError::Rejected {
+                command: CommandName::Md
+            }))
         ),
         "{rejected:?}"
     );
@@ -391,7 +464,7 @@ async fn a_first_reply_held_past_the_regular_deadline_times_out() -> TestResult 
         matches!(
             identity,
             Err(Error::Timeout {
-                operation: "ID",
+                operation: TimeoutOperation::Command(CommandName::Id),
                 ..
             })
         ),
@@ -417,7 +490,7 @@ async fn the_next_reply_deadline_covers_one_held_reply_only() -> TestResult {
         matches!(
             gateway,
             Err(Error::Timeout {
-                operation: "GW",
+                operation: TimeoutOperation::Command(CommandName::Gw),
                 ..
             })
         ),

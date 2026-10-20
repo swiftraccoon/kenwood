@@ -119,8 +119,6 @@ impl fmt::Display for CatChannelRecord {
 pub struct CatMemoryChannelRecord {
     /// The shared channel fields.
     pub channel: CatChannelRecord,
-    /// Whether the transmit field is an independent split frequency.
-    pub split: bool,
     /// Whether memory scan skips the channel.
     pub scan_lockout: bool,
 }
@@ -133,12 +131,16 @@ impl CatMemoryChannelRecord {
     /// [`Radio::get_channel_record`]: crate::Radio::get_channel_record
     #[must_use]
     pub const fn from_channel(channel: CatChannelRecord, scan_lockout: bool) -> Self {
-        let split = matches!(channel.transmit, TransmitSetting::Split(_));
         Self {
             channel,
-            split,
             scan_lockout,
         }
+    }
+
+    /// Whether the transmit field is an independent split frequency.
+    #[must_use]
+    pub const fn split(&self) -> bool {
+        matches!(self.channel.transmit, TransmitSetting::Split(_))
     }
 
     /// The 20 fields after the address in `ME` wire order, comma separated.
@@ -147,7 +149,7 @@ impl CatMemoryChannelRecord {
         let shared = self.channel.wire_fields();
         let (before_split, after_split) = shared.split_at(10);
         let mut fields: Vec<&str> = before_split.iter().map(String::as_str).collect();
-        let split = u8::from(self.split).to_string();
+        let split = u8::from(self.split()).to_string();
         let lockout = u8::from(self.scan_lockout).to_string();
         fields.push(&split);
         fields.extend(after_split.iter().map(String::as_str));
@@ -189,14 +191,12 @@ mod tests {
             repeater()?.to_wire_fields(),
             "0145190000,0000600000,2,2,0,0,0,0,0,0,2,08,08,000,0,CQCQCQ,0,00"
         );
-        let memory = CatMemoryChannelRecord {
-            channel: repeater()?,
-            split: true,
-            scan_lockout: true,
-        };
+        let mut channel = repeater()?;
+        channel.transmit = TransmitSetting::Split(Frequency::new(447_000_000)?);
+        let memory = CatMemoryChannelRecord::from_channel(channel, true);
         assert_eq!(
             memory.to_wire_fields(),
-            "0145190000,0000600000,2,2,0,0,0,0,0,0,1,2,08,08,000,0,CQCQCQ,0,00,1"
+            "0145190000,0447000000,2,2,0,0,0,0,0,0,1,2,08,08,000,0,CQCQCQ,0,00,1"
         );
         Ok(())
     }
@@ -204,14 +204,14 @@ mod tests {
     #[test]
     fn a_memory_record_from_a_channel_is_split_exactly_when_its_transmit_field_is() -> TestResult {
         let offset = CatMemoryChannelRecord::from_channel(repeater()?, false);
-        assert!(!offset.split, "an offset channel is not split");
+        assert!(!offset.split(), "an offset channel is not split");
         assert!(!offset.scan_lockout);
         let mut split_channel = repeater()?;
         split_channel.shift = ShiftDirection::Simplex;
         split_channel.transmit = TransmitSetting::Split(Frequency::new(446_000_000)?);
         let split = CatMemoryChannelRecord::from_channel(split_channel.clone(), true);
         assert!(
-            split.split,
+            split.split(),
             "a split transmit frequency sets the split flag"
         );
         assert!(split.scan_lockout);

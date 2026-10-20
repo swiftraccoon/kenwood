@@ -58,6 +58,32 @@ fn order(list: &RepeaterList) -> Vec<u16> {
 }
 
 #[test]
+fn standard_iteration_preserves_list_kind_slots_and_owned_record_bytes() -> TestResult {
+    let kind = RepeaterListKind::Repeater;
+    let image = three_records(kind)?;
+    let list = RepeaterList::read(&image, kind)?;
+    let mut borrowed = (&list).into_iter();
+    assert_eq!(borrowed.len(), 3);
+    let (tail, _) = borrowed.next_back().ok_or("last record")?;
+    let (first, _) = borrowed.next().ok_or("first record")?;
+    assert_eq!((first.kind(), tail.kind()), (kind, kind));
+    assert_eq!(borrowed.len(), 1);
+    let expected: Vec<_> = list
+        .iter()
+        .map(|(slot, record)| (slot, record.to_bytes()))
+        .collect();
+    let owned: Vec<_> = list
+        .into_iter()
+        .map(|(slot, record)| (slot, record.to_bytes()))
+        .collect();
+    assert_eq!(
+        owned, expected,
+        "ownership transfer preserves all unknown record bytes"
+    );
+    Ok(())
+}
+
+#[test]
 fn the_geometry_matches_the_stored_tables() -> TestResult {
     let repeater = RepeaterListKind::Repeater;
     let hotspot = RepeaterListKind::Hotspot;

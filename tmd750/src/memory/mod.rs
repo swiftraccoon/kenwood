@@ -43,6 +43,48 @@
 //! synchronized journal record, completed capture) are taken on trust. File
 //! containers live in [`crate::file`].
 
+use crate::error::{SchemaError, ValidationError};
+use crate::types::{IMAGE_LENGTH, SlotIndex};
+use kenwood_schema::{DecodedFieldValue, FieldValue};
+
+pub use captured_configuration::Configuration;
+pub use channel_names::ChannelNamePlan;
+pub use channels::{
+    CallBand, CallChannel, CallChannelEntry, CallChannelPlan, CallMode, ChannelAccess,
+    ChannelGroupPlan, GroupNamePlan, MEMORY_GROUPS, MemoryChannelPlan, MemoryGroup, WeatherChannel,
+    WeatherChannelEntry,
+};
+pub use configuration::{
+    ChangedByte, ChangedPage, ConfigurationError, ConfigurationFormatError, StandardConfiguration,
+    StandardConfigurationDiff,
+};
+pub use menu_fields::{
+    MCP_D750_IMAGE_LENGTH, MCP_D750_MENU_FIELDS, MCP_D750_SCHEMA_VERSION, MCP_D750_SLOT_COUNT,
+    MCP_D750_SLOT_STRIDE, MCP_D750_SOURCE_SHA256, MenuField, MenuFieldId, MenuOption,
+    StorageTransform, menu_field,
+};
+pub use menu_patch::MenuValueError;
+pub use menu_policy::{MenuWritePolicy, MenuWritePolicyError};
+pub use my_callsigns::{
+    MY_CALLSIGN_ENTRY_SIZE, MY_CALLSIGN_LIST_ADDRESS, MY_CALLSIGN_SELECTION_ADDRESS, MyCallsignList,
+};
+pub use schema::{FieldDescriptor, PatchPlanner, PatchSet, SLOT_TERM, Term};
+pub use stored_text::{StoredText, StoredTextError};
+pub use terminal::{
+    ReflectorTerminalPreflight, TerminalFinding, TerminalGatewayMode, TerminalGatewayRoute,
+    TerminalMode, TerminalMyCallsignIndex, TerminalPreflightError, TerminalUsbFunction,
+    TerminalUsbRoute,
+};
+pub use text::{
+    TextError, TextImage, TextMetadata, TextPreview, TextScope, TextScopeKind, TextSetting,
+};
+pub use text_field_update::{
+    ChannelNameText, ChannelNameUpdate, ControlPage, GuardKind, GuardPolicy, My1Callsign,
+    My1CallsignUpdate, NoGuards, Pm1Name, Pm1NameUpdate, PmOffGatewayFinal, PmOffGatewayFresh,
+    PmOffGatewayGuards, TextField, TextFieldUpdate, TextFieldUpdateError, TextFieldUpdateEvent,
+    TextFieldUpdateSession, TextFieldUpdateStatus, TextValue,
+};
+
 pub mod callsign_list;
 mod captured_configuration;
 mod chain;
@@ -64,49 +106,6 @@ mod terminal;
 mod text;
 mod text_field_update;
 pub mod vfo;
-
-use crate::error::{SchemaError, ValidationError};
-use crate::types::{IMAGE_LENGTH, SlotIndex};
-
-pub use captured_configuration::Configuration;
-pub use channel_names::ChannelNamePlan;
-pub use channels::{
-    CallBand, CallChannel, CallChannelEntry, CallChannelPlan, CallMode, ChannelAccess,
-    ChannelGroupPlan, GroupNamePlan, MEMORY_GROUPS, MemoryChannelPlan, MemoryGroup, WeatherChannel,
-    WeatherChannelEntry,
-};
-pub use configuration::{
-    ChangedByte, ChangedPage, ConfigurationError, StandardConfiguration, StandardConfigurationDiff,
-};
-pub use menu_fields::{
-    MCP_D750_IMAGE_LENGTH, MCP_D750_MENU_FIELDS, MCP_D750_SCHEMA_VERSION, MCP_D750_SLOT_COUNT,
-    MCP_D750_SLOT_STRIDE, MCP_D750_SOURCE_SHA256, MenuField, MenuFieldId, MenuOption,
-    StorageTransform, menu_field,
-};
-pub use menu_patch::MenuValueError;
-pub use menu_policy::{MenuWritePolicy, MenuWritePolicyError};
-pub use my_callsigns::{
-    MY_CALLSIGN_ENTRY_SIZE, MY_CALLSIGN_LIST_ADDRESS, MY_CALLSIGN_SELECTION_ADDRESS, MyCallsignList,
-};
-pub use schema::{
-    DecodedFieldValue, Endian, FieldCodec, FieldDescriptor, FieldValue, PatchPlanner, PatchSet,
-    SLOT_TERM, StringEncoding, Term,
-};
-pub use stored_text::{StoredText, StoredTextError};
-pub use terminal::{
-    ReflectorTerminalPreflight, TerminalFinding, TerminalGatewayMode, TerminalGatewayRoute,
-    TerminalMode, TerminalMyCallsignIndex, TerminalPreflightError, TerminalUsbFunction,
-    TerminalUsbRoute,
-};
-pub use text::{
-    TextError, TextImage, TextMetadata, TextPreview, TextScope, TextScopeKind, TextSetting,
-};
-pub use text_field_update::{
-    ChannelNameText, ChannelNameUpdate, ControlPage, GuardKind, GuardPolicy, My1Callsign,
-    My1CallsignUpdate, NoGuards, Pm1Name, Pm1NameUpdate, PmOffGatewayFinal, PmOffGatewayFresh,
-    PmOffGatewayGuards, TextField, TextFieldUpdate, TextFieldUpdateError, TextFieldUpdateEvent,
-    TextFieldUpdateSession, TextFieldUpdateStatus, TextValue,
-};
 
 /// Version of the official MCP-D750 program whose serializers the generated
 /// registry was extracted from.
@@ -230,6 +229,7 @@ impl FieldAccess<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kenwood_schema::{CodecSpec, FieldCodec};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -245,7 +245,7 @@ mod tests {
             "radio.MeterType",
             328_995,
             &[SLOT_TERM],
-            FieldCodec::Byte { min: 0, max: 2 },
+            FieldCodec::new(CodecSpec::Byte { min: 0, max: 2 })?,
         );
         let slot = SlotIndex::new(4)?;
         image.set(&meter, Some(slot), FieldValue::Unsigned(2))?;

@@ -11,7 +11,7 @@ use tokio_serial as _;
 use tracing as _;
 
 use kenwood_tmd750::file::{
-    FILE_SIZE_FULL, FILE_SIZE_WITHOUT_STARTUP_SCREEN, HEADER_SIZE, parse_d750,
+    FILE_SIZE_FULL, FILE_SIZE_WITHOUT_STARTUP_SCREEN, HEADER_SIZE, RadioConfig,
 };
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -42,13 +42,13 @@ fn invalid_header_markers_are_not_accepted_as_configuration_files() -> TestResul
             let mut bytes = file(full)?;
             *bytes.get_mut(offset).ok_or("header marker missing")? ^= 0x01;
             assert!(
-                parse_d750(&bytes).is_err(),
+                RadioConfig::from_bytes(&bytes).is_err(),
                 "a correctly sized file with an invalid header at {offset} must be rejected"
             );
         }
         let length = file(full)?.len();
         assert!(
-            parse_d750(&vec![0; length]).is_err(),
+            RadioConfig::from_bytes(&vec![0; length]).is_err(),
             "file length alone cannot turn arbitrary bytes into a configuration"
         );
     }
@@ -60,13 +60,13 @@ fn signature_and_payload_length_must_agree() -> TestResult {
     let mut full = file(true)?;
     full.truncate(FILE_SIZE_WITHOUT_STARTUP_SCREEN);
     assert!(
-        parse_d750(&full).is_err(),
+        RadioConfig::from_bytes(&full).is_err(),
         "the full-layout signature must not accept a short payload"
     );
     let mut short = file(false)?;
     short.resize(FILE_SIZE_FULL, 0xA5);
     assert!(
-        parse_d750(&short).is_err(),
+        RadioConfig::from_bytes(&short).is_err(),
         "the short-layout signature must not accept an appended startup-screen payload"
     );
     Ok(())
@@ -76,7 +76,7 @@ fn signature_and_payload_length_must_agree() -> TestResult {
 fn incomplete_headers_and_inexact_payload_lengths_are_rejected() -> TestResult {
     for length in [0, HEADER_SIZE - 1] {
         assert!(
-            parse_d750(&vec![0; length]).is_err(),
+            RadioConfig::from_bytes(&vec![0; length]).is_err(),
             "an incomplete {length}-byte header must be rejected"
         );
     }
@@ -84,13 +84,13 @@ fn incomplete_headers_and_inexact_payload_lengths_are_rejected() -> TestResult {
         let mut truncated = file(full)?;
         let _last_byte = truncated.pop();
         assert!(
-            parse_d750(&truncated).is_err(),
+            RadioConfig::from_bytes(&truncated).is_err(),
             "a truncated payload must not be accepted"
         );
         let mut extended = file(full)?;
         extended.push(0x5A);
         assert!(
-            parse_d750(&extended).is_err(),
+            RadioConfig::from_bytes(&extended).is_err(),
             "trailing bytes beyond the declared layout must not be ignored"
         );
     }

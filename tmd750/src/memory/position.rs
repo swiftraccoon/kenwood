@@ -29,6 +29,10 @@ use crate::types::{
     Address, Coordinate, Latitude, LatitudeHemisphere, Longitude, LongitudeHemisphere, Page,
 };
 
+#[cfg(test)]
+#[path = "position_tests.rs"]
+mod tests;
+
 /// Positions the memory holds.
 pub const POSITION_MEMORY_ENTRIES: usize = 100;
 /// Bytes of one stored position.
@@ -238,6 +242,15 @@ impl fmt::Display for PositionSymbol {
     }
 }
 
+packed_byte!(
+    /// The two raw GPS-fix bits of a stored position (`0..=3`).
+    GpsFixBits, 3
+);
+packed_byte!(
+    /// The raw high nibble of stored position byte 15 (`0..=15`).
+    PositionFlagBits, 15
+);
+
 /// One stored position.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredPosition {
@@ -247,9 +260,9 @@ pub struct StoredPosition {
     pub time: PositionTime,
     /// Record byte 15 bits 0 and 1, raw: the official program's GPS-valid
     /// field, which it sets to 0 for a position entered by hand.
-    pub gps_fix: u8,
+    pub gps_fix: GpsFixBits,
     /// Record byte 15 bits 4 to 7, raw.
-    pub flag_bits: u8,
+    pub flag_bits: PositionFlagBits,
     /// The latitude: bytes 16 to 19, south in byte 15 bit 2.
     pub latitude: Latitude,
     /// The longitude: bytes 20 to 23, west in byte 15 bit 3.
@@ -278,8 +291,8 @@ impl StoredPosition {
         Self {
             name,
             time,
-            gps_fix: 0,
-            flag_bits: PROGRAM_FLAG_BITS,
+            gps_fix: GpsFixBits::ZERO,
+            flag_bits: PositionFlagBits(PROGRAM_FLAG_BITS),
             latitude,
             longitude,
             altitude,
@@ -302,8 +315,8 @@ impl StoredPosition {
         Ok(Self {
             name: StoredText::from_bytes(field(&bytes, 0))?,
             time: PositionTime::from_stored(field(&bytes, 9))?,
-            gps_fix: flags & 0x03,
-            flag_bits: flags >> 4,
+            gps_fix: GpsFixBits(flags & 0x03),
+            flag_bits: PositionFlagBits(flags >> 4),
             latitude: Latitude::new(latitude.hemisphere(), validated(latitude.coordinate())?)?,
             longitude: Longitude::new(longitude.hemisphere(), validated(longitude.coordinate())?)?,
             altitude: i32::from_le_bytes(field(&bytes, 24)),
@@ -312,12 +325,11 @@ impl StoredPosition {
         })
     }
 
-    /// Encode the record; `gps_fix` keeps its two low bits and `flag_bits`
-    /// its four.
+    /// Encode every stored field without truncating its bits.
     #[must_use]
     pub fn to_bytes(&self) -> [u8; POSITION_RECORD_SIZE] {
         let mut bytes = [0; POSITION_RECORD_SIZE];
-        let mut flags = (self.flag_bits << 4) | (self.gps_fix & 0x03);
+        let mut flags = (self.flag_bits.get() << 4) | self.gps_fix.get();
         if self.latitude.hemisphere() == LatitudeHemisphere::South {
             flags |= 0x04;
         }
@@ -588,7 +600,3 @@ pub enum PositionMemoryError {
     #[error(transparent)]
     Coordinate(#[from] ValidationError),
 }
-
-#[cfg(test)]
-#[path = "position_tests.rs"]
-mod tests;

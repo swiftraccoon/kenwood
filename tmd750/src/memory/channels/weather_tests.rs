@@ -119,7 +119,7 @@ fn stored_weather_records_decode_losslessly() -> TestResult {
         )?;
         let decoded = entry.record().ok_or("a stored weather record")?;
         assert_eq!(decoded.receive_frequency.as_hz(), stored.hz);
-        assert_eq!(decoded.mode, OperatingMode::Fm);
+        assert_eq!(decoded.mode.mode(), OperatingMode::Fm);
         assert_eq!(decoded.to_bytes(), record(stored.head));
         assert_eq!(entry.flag().group(), 32);
         assert!(!entry.flag().scan_lockout());

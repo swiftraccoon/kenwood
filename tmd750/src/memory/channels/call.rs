@@ -22,6 +22,10 @@ use crate::types::{
     OperatingMode, PAGE_SIZE, Page, StoredChannel,
 };
 
+#[cfg(test)]
+#[path = "call_tests.rs"]
+mod tests;
+
 /// The band a CALL channel belongs to.
 ///
 /// The receive ranges are the ones the official programming software keeps a
@@ -337,11 +341,11 @@ impl CallChannelPlan {
                 });
             }
             let expected = channel.mode().operating_mode();
-            if record.mode != expected {
+            if record.mode.mode() != expected {
                 return Err(ValidationError::CallChannelMode {
                     channel,
                     expected,
-                    actual: record.mode,
+                    actual: record.mode.mode(),
                 });
             }
             if plan.insert(channel, record).is_some() {
@@ -417,7 +421,3 @@ fn record_page(channel: CallChannel) -> Option<Page> {
     let address = Address::new(u32::try_from(start).ok()?).ok()?;
     Page::new(address, PAGE_SIZE).ok()
 }
-
-#[cfg(test)]
-#[path = "call_tests.rs"]
-mod tests;

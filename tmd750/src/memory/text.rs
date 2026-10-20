@@ -6,12 +6,14 @@
 
 use std::{fmt, str::FromStr};
 
-use super::{
-    FieldCodec, FieldValue, MemoryImage, MenuField, PatchPlanner, PatchSet, StringEncoding,
-    menu_field,
-};
+use super::{MemoryImage, MenuField, PatchPlanner, PatchSet, menu_field};
 use crate::error::SchemaError;
 use crate::types::SlotIndex;
+use kenwood_schema::{CodecSpec, FieldValue, StringEncoding};
+
+#[cfg(test)]
+#[path = "text_tests.rs"]
+mod tests;
 
 /// A supported configuration string, not an arbitrary menu-field selector.
 ///
@@ -116,11 +118,11 @@ impl TextSetting {
     /// [`TextError::RegistryFieldNotText`] if the generated entry changes.
     pub fn metadata(self) -> Result<TextMetadata, TextError> {
         let field = self.field()?;
-        let FieldCodec::FixedString {
+        let CodecSpec::FixedString {
             len,
             encoding,
             padding,
-        } = field.descriptor.codec
+        } = field.descriptor.codec.spec()
         else {
             return Err(TextError::RegistryFieldNotText { setting: self });
         };
@@ -510,7 +512,3 @@ fn validate_characters(setting: TextSetting, value: &str) -> Result<(), TextErro
     }
     Ok(())
 }
-
-#[cfg(test)]
-#[path = "text_tests.rs"]
-mod tests;

@@ -28,6 +28,10 @@ use crate::memory::{MemoryImage, StoredText, StoredTextError};
 use crate::radio::programming::PageReplacement;
 use crate::types::{PAGE_SIZE_U32, StoredCallsign};
 
+#[cfg(test)]
+#[path = "callsign_list_tests.rs"]
+mod tests;
+
 /// Address of slot 0.
 pub const CALLSIGN_LIST_ADDRESS: u32 = 0x2_5000;
 /// Address of the stored slot numbers of the first and last entries, two
@@ -61,6 +65,21 @@ const EMPTY_SLOT: [u8; CALLSIGN_ENTRY_SIZE] = [
 /// A slot of the callsign list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CallsignSlot(u16);
+
+integer_formats!(CallsignSlot, index);
+
+impl TryFrom<u16> for CallsignSlot {
+    type Error = CallsignListError;
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<CallsignSlot> for u16 {
+    fn from(value: CallsignSlot) -> Self {
+        value.index()
+    }
+}
 
 impl CallsignSlot {
     /// Validate a slot number.
@@ -233,12 +252,20 @@ impl Linked for CallsignEntry {
 }
 
 /// The entries of the callsign list in display order.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CallsignList {
     entries: Vec<(CallsignSlot, CallsignEntry)>,
 }
 
 impl CallsignList {
+    /// An empty callsign list.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
     /// Decode every slot and follow the chain from the stored first slot.
     ///
     /// # Errors
@@ -315,8 +342,8 @@ impl CallsignList {
 
     /// The entries in display order with their slots.
     #[must_use]
-    pub fn iter(&self) -> impl ExactSizeIterator<Item = (CallsignSlot, &CallsignEntry)> {
-        self.entries.iter().map(|(slot, entry)| (*slot, entry))
+    pub fn iter(&self) -> CallsignListIter<'_> {
+        CallsignListIter(self.entries.iter())
     }
 
     /// The entry in `slot`, when populated.
@@ -374,6 +401,52 @@ impl CallsignList {
         Ok(replacements)
     }
 }
+
+impl TryFrom<Vec<CallsignEntry>> for CallsignList {
+    type Error = CallsignListError;
+    fn try_from(entries: Vec<CallsignEntry>) -> Result<Self, Self::Error> {
+        Self::from_entries(entries)
+    }
+}
+
+impl IntoIterator for CallsignList {
+    type Item = (CallsignSlot, CallsignEntry);
+    type IntoIter = std::vec::IntoIter<Self::Item>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a CallsignList {
+    type Item = (CallsignSlot, &'a CallsignEntry);
+    type IntoIter = CallsignListIter<'a>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+/// Borrowed callsign-list entries and their slots in display order.
+#[derive(Debug, Clone)]
+pub struct CallsignListIter<'a>(std::slice::Iter<'a, (CallsignSlot, CallsignEntry)>);
+
+impl<'a> Iterator for CallsignListIter<'a> {
+    type Item = (CallsignSlot, &'a CallsignEntry);
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next().map(|(slot, entry)| (*slot, entry))
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
+}
+
+impl DoubleEndedIterator for CallsignListIter<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.0.next_back().map(|(slot, entry)| (*slot, entry))
+    }
+}
+
+impl ExactSizeIterator for CallsignListIter<'_> {}
+impl std::iter::FusedIterator for CallsignListIter<'_> {}
 
 /// A stored callsign list, or an entry or list it refuses.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -445,7 +518,3 @@ fn validate_callsign(field: [u8; 8]) -> Result<(), CallsignListError> {
 fn link(bytes: [u8; 2]) -> Option<u16> {
     Some(u16::from_le_bytes(bytes)).filter(|&raw| raw != chain::NO_LINK)
 }
-
-#[cfg(test)]
-#[path = "callsign_list_tests.rs"]
-mod tests;

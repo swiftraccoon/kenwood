@@ -111,6 +111,7 @@ enum Open {
     Ready(Connection),
     Failed,
     Refused,
+    Retained,
     Late(Connection),
     Cancelled(Connection),
 }
@@ -180,6 +181,11 @@ impl ModemHost for FakeHost {
             }
             Some(Open::Failed) => Err(open_failure("scripted reopen failure", true)),
             Some(Open::Refused) => Err(open_failure("scripted opening refusal", false)),
+            Some(Open::Retained) => {
+                let mut failure = open_failure("scripted retained connection", true);
+                failure.released = false;
+                Err(failure)
+            }
             None => {
                 cancelled.store(true, Ordering::Release);
                 Err(open_failure("no scripted opening remains", false))
@@ -258,8 +264,8 @@ async fn original_version_proof_preserves_that_owner_without_reopening() -> Test
     assert_eq!(attempt.step, TransitionStep::Probe);
     let proof = report.proof.ok_or("missing binary proof")?;
     assert_eq!(proof.transport().id, 1);
-    assert_eq!(proof.version().description, "MMDVM 2018");
-    assert_eq!(proof.version().protocol, 1);
+    assert_eq!(proof.version().description(), "MMDVM 2018");
+    assert_eq!(proof.version().protocol().get(), 1);
     let owner = proof.into_transport();
     assert_eq!(owner.id, 1);
     assert_eq!(
@@ -635,5 +641,58 @@ async fn cancellation_cleanup_retains_the_host_release_failure_independently() -
     assert!(matches!(report.cleanup_error, Some(CloseFailure::Host(_))));
     assert_eq!(host.retirements, [1]);
     assert_eq!(events(&log)?, [Seen::Close(1), Seen::Drop(1)]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_retained_failed_open_prevents_retry_and_reports_unreleased() -> TestResult {
+    let log: Log = Arc::default();
+    let mut host = FakeHost::new(&log, vec![Open::Retained]);
+    let report = acquire_modem_within(
+        &mut host,
+        None,
+        &AtomicBool::new(false),
+        Duration::from_secs(30),
+    )
+    .await;
+    assert!(
+        !report.released(),
+        "a failed open still holding its connection must remain unreleased"
+    );
+    assert_eq!(report.error, Some(TransitionError::ReopenRefused));
+    assert_eq!(
+        report.attempts.len(),
+        1,
+        "retained ownership must prohibit another attempt"
+    );
+    assert_eq!(
+        events(&log)?
+            .iter()
+            .filter(|event| **event == Seen::Open)
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_unrepresentable_window_retires_the_initial_connection_without_acquisition() -> TestResult
+{
+    let log: Log = Arc::default();
+    let initial = Connection::new(0, &log, VERSION);
+    let mut host = FakeHost::new(&log, Vec::new());
+    let report = acquire_modem_within(
+        &mut host,
+        Some(initial),
+        &AtomicBool::new(false),
+        Duration::MAX,
+    )
+    .await;
+    assert_eq!(report.error, Some(TransitionError::UnrepresentableWindow));
+    assert!(
+        report.released(),
+        "the initial connection must still be retired"
+    );
+    assert_eq!(events(&log)?, [Seen::Close(0), Seen::Drop(0)]);
     Ok(())
 }

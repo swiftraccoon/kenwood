@@ -8,6 +8,48 @@ use crate::protocol::mcp::regions::menu_regions;
 use crate::radio::Identity;
 use crate::types::{Address, Page, Region};
 
+#[cfg(test)]
+#[path = "configuration_tests.rs"]
+mod tests;
+
+/// A rejected element of the persisted captured-configuration format.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ConfigurationFormatError {
+    /// Input ended before the next complete field.
+    #[error("the input ends early")]
+    UnexpectedEnd,
+    /// The format signature differs from `TMD750CF`.
+    #[error("the input is not a stored TM-D750 configuration")]
+    WrongMagic,
+    /// The stored format version is unsupported.
+    #[error("the format version is not 1")]
+    UnsupportedVersion,
+    /// A decoded page has an invalid complete image span.
+    #[error("a page lies outside the image: {0}")]
+    InvalidPage(#[source] ValidationError),
+    /// A stored page length is outside 1..=256 bytes.
+    #[error("a page length is outside 1 to 256")]
+    InvalidPageLength,
+    /// Bytes follow the declared final page.
+    #[error("bytes follow the last page")]
+    TrailingBytes,
+    /// A stored identity violates its model-specific text domain.
+    #[error("an identity string is invalid: {0}")]
+    InvalidIdentity(#[source] ValidationError),
+    /// A stored identity is not valid UTF-8.
+    #[error("an identity string is not UTF-8: {0}")]
+    InvalidUtf8(#[source] std::str::Utf8Error),
+    /// Input exceeds the largest possible nonoverlapping captured image.
+    #[error("stored configuration contains {length} bytes; maximum is {maximum}")]
+    TooLong {
+        /// Actual input byte count.
+        length: usize,
+        /// Largest supported container byte count.
+        maximum: usize,
+    },
+}
+
 /// A malformed standard configuration or an incompatible comparison target.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
@@ -65,7 +107,7 @@ pub enum ConfigurationError {
     /// A captured page overlapping another.
     #[error("captured page {page:?} overlaps another page")]
     PageOverlap {
-        /// The later of the overlapping pages.
+        /// Supplied page overlapping an earlier supplied page.
         page: Page,
     },
     /// A requested range includes a byte that was never read.
@@ -77,10 +119,13 @@ pub enum ConfigurationError {
         end: u32,
     },
     /// Stored configuration bytes that are not the persisted form.
-    #[error("not a stored configuration: {detail}")]
-    Format {
-        /// What is wrong.
-        detail: &'static str,
+    #[error(transparent)]
+    Format(#[from] ConfigurationFormatError),
+    /// Radio-type text cannot fit the stored format's one-byte length prefix.
+    #[error("radio-type text is {length} bytes; stored capture maximum is 255")]
+    RadioTypeTooLong {
+        /// Actual radio-type text byte count.
+        length: usize,
     },
     /// Stored configuration bytes whose CRC-32 differs from the stored one.
     #[error("stored configuration CRC-32 is {stated:08X}, computed {computed:08X}")]
@@ -313,7 +358,3 @@ impl StandardConfigurationDiff {
         &self.pages
     }
 }
-
-#[cfg(test)]
-#[path = "configuration_tests.rs"]
-mod tests;

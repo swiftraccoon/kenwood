@@ -40,19 +40,18 @@
     "\n```\n"
 )]
 
-mod channel_names;
-mod compare_exchange;
-
 pub use compare_exchange::{McpCompareExchangeReport, PageReplacement};
 
 use super::{Progress, Radio};
-use crate::error::{Error, McpError, ProtocolError};
+use crate::error::{AckStage, Error, McpError, ProtocolError, TimeoutOperation};
 use crate::protocol::mcp::{
-    ACK, BAUD, ENTER, ENTER_RESPONSE, EXIT, HEADER_LEN, Header, HeaderCommand, read_request,
-    write_request,
+    ACK, BAUD, ENTER, ENTER_RESPONSE, EXIT, HEADER_LEN, Header, HeaderCommand,
 };
 use crate::types::{IMAGE_LENGTH, Page, Region};
 use kenwood_transport::Transport;
+
+mod channel_names;
+mod compare_exchange;
 
 /// Pages the radio may have changed and pages confirmed by read-back.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -207,7 +206,7 @@ impl<T: Transport> Radio<T> {
         self.mark_mcp_uncertain();
         self.set_baud(BAUD)?;
         self.write_all(ENTER).await?;
-        let reply = self.read_line("programming mode entry").await?;
+        let reply = self.read_line(TimeoutOperation::ProgrammingEntry).await?;
         if reply != ENTER_RESPONSE {
             return Err(ProtocolError::EntryReply {
                 expected: String::from_utf8_lossy(ENTER_RESPONSE).into_owned(),
@@ -340,7 +339,7 @@ impl<T: Transport> McpSession<'_, T> {
         self.radio.require_mcp_ready()?;
         self.radio.mark_mcp_uncertain();
         self.radio.write_all(&[EXIT]).await?;
-        expect_ack(self.radio, "MCP exit").await?;
+        expect_ack(self.radio, AckStage::Exit).await?;
         self.radio.mark_retired();
         Ok(())
     }
@@ -351,11 +350,11 @@ impl<T: Transport> McpSession<'_, T> {
         if !self.journal.possibly_written.contains(&page) {
             self.journal.possibly_written.push(page);
         }
-        let mut frame = write_request(page).to_vec();
+        let mut frame = Header::write_request(page).to_vec();
         frame.extend_from_slice(data);
         self.radio.mark_mcp_uncertain();
         self.radio.write_all(&frame).await?;
-        expect_ack(self.radio, "MCP page write").await?;
+        expect_ack(self.radio, AckStage::PageWrite).await?;
         self.radio.mark_mcp_ready();
         let read_back = self.read_page(page).await?;
         if let Some(offset) = data
@@ -397,10 +396,13 @@ impl<T: Transport> McpSession<'_, T> {
     /// valid header framing does not make it a data response.
     pub async fn read_page(&mut self, page: Page) -> Result<Vec<u8>, Error> {
         self.radio.require_mcp_ready()?;
-        let request = read_request(page);
+        let request = Header::read_request(page);
         self.radio.mark_mcp_uncertain();
         self.radio.write_all(&request).await?;
-        let reply = self.radio.read_exact(HEADER_LEN, "MCP read header").await?;
+        let reply = self
+            .radio
+            .read_exact(HEADER_LEN, TimeoutOperation::McpReadHeader)
+            .await?;
         let reply: [u8; HEADER_LEN] = reply.as_slice().try_into().map_err(|_| {
             Error::Protocol(ProtocolError::HeaderEcho {
                 expected: request,
@@ -416,9 +418,16 @@ impl<T: Transport> McpSession<'_, T> {
             .into());
         }
         let data = match header.command() {
-            HeaderCommand::Write => self.radio.read_exact(page.len(), "MCP page data").await?,
+            HeaderCommand::Write => {
+                self.radio
+                    .read_exact(page.len(), TimeoutOperation::McpPageData)
+                    .await?
+            }
             HeaderCommand::Fill => {
-                let fill = self.radio.read_exact(1, "MCP fill byte").await?;
+                let fill = self
+                    .radio
+                    .read_exact(1, TimeoutOperation::McpFillByte)
+                    .await?;
                 let byte = fill.first().copied().unwrap_or_default();
                 vec![byte; page.len()]
             }
@@ -427,14 +436,16 @@ impl<T: Transport> McpSession<'_, T> {
             }
         };
         self.radio.write_all(&[ACK]).await?;
-        expect_ack(self.radio, "MCP page read").await?;
+        expect_ack(self.radio, AckStage::PageRead).await?;
         self.radio.mark_mcp_ready();
         Ok(data)
     }
 }
 
-async fn expect_ack<T: Transport>(radio: &mut Radio<T>, stage: &'static str) -> Result<(), Error> {
-    let reply = radio.read_exact(1, stage).await?;
+async fn expect_ack<T: Transport>(radio: &mut Radio<T>, stage: AckStage) -> Result<(), Error> {
+    let reply = radio
+        .read_exact(1, TimeoutOperation::Acknowledgement(stage))
+        .await?;
     match reply.first() {
         Some(&ACK) => Ok(()),
         Some(&byte) => Err(ProtocolError::MissingAck { stage, byte }.into()),

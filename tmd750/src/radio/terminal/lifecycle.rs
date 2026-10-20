@@ -22,6 +22,7 @@
 //! beyond those, sends no RF command, and never reopens a serial endpoint
 //! automatically.
 
+use std::num::NonZeroU32;
 use std::sync::atomic::AtomicBool;
 
 use super::session::{
@@ -39,6 +40,9 @@ use crate::radio::readiness::{
 use crate::radio::{Identity, Radio};
 use crate::transport::SerialCandidate;
 use crate::types::DvGatewayMode;
+
+#[cfg(test)]
+mod tests;
 
 /// Whether the original Gateway settings still need to be rewritten.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,8 +90,8 @@ pub enum LifecycleError {
     #[error("the control endpoint did not settle before active-route programming")]
     ControlNotSettled,
     /// The control endpoint could not be opened for active-route programming.
-    #[error("control endpoint open failed for active-route programming")]
-    ControlOpen,
+    #[error("control endpoint open failed for active-route programming: {0}")]
+    ControlOpen(#[source] kenwood_transport::TransportError),
     /// The Terminal pages could not be written.
     #[error(transparent)]
     Program(#[from] Box<TerminalProgramError>),
@@ -110,7 +114,7 @@ pub enum LifecycleError {
 #[derive(Debug, Clone)]
 pub struct TerminalLifecycle {
     control_endpoint: SerialCandidate,
-    baud: u32,
+    baud: NonZeroU32,
     route: TerminalGatewayRoute,
 }
 
@@ -123,7 +127,7 @@ impl TerminalLifecycle {
     #[must_use]
     pub const fn new(
         control_endpoint: SerialCandidate,
-        baud: u32,
+        baud: NonZeroU32,
         route: TerminalGatewayRoute,
     ) -> Self {
         Self {
@@ -160,7 +164,7 @@ impl TerminalLifecycle {
         M: ModemHost,
         J: TerminalJournal,
     {
-        let mut startup = TerminalStartup::new();
+        let mut startup = TerminalStartup::new(self.control_endpoint.clone(), self.baud);
         control.stage(ControlStage::Preflight);
         let preflight = observe_control(
             control,
@@ -187,7 +191,7 @@ impl TerminalLifecycle {
             Ok(connection) => connection,
             Err(error) => return startup.fail(LifecycleError::ModemOpen(error)),
         };
-        let (modem_connection, plan) = match self
+        let modem_connection = match self
             .program(
                 control,
                 modem_connection,
@@ -199,33 +203,12 @@ impl TerminalLifecycle {
             )
             .await
         {
-            Ok(prepared) => prepared,
+            Ok(connection) => connection,
             Err((connection, error)) => {
                 startup.cleanup_error = modem.retire(connection).await.err();
                 return startup.fail(error);
             }
         };
-        startup.recovery = TerminalRecovery {
-            control_endpoint: self.control_endpoint.clone(),
-            baud: self.baud,
-            owed: None,
-            state: RestorationState::NotRequired,
-        };
-        if plan.replacements().iter().any(|page| !page.is_noop()) {
-            match plan.restoration() {
-                Ok(reverse) => {
-                    startup.recovery.owed = Some(OwedRestoration {
-                        identity,
-                        plan: reverse,
-                    });
-                    startup.recovery.state = RestorationState::Owed;
-                }
-                Err(error) => {
-                    startup.cleanup_error = modem.retire(modem_connection).await.err();
-                    return startup.fail(LifecycleError::RestorationPlan(error));
-                }
-            }
-        }
         let transition = acquire_modem(modem, Some(modem_connection), cancelled).await;
         startup.transition_attempts = transition.attempts;
         startup.cleanup_error = startup.cleanup_error.or(transition.cleanup_error);
@@ -256,7 +239,7 @@ impl TerminalLifecycle {
         journal: &mut J,
         cancelled: &AtomicBool,
         startup: &mut TerminalStartup<MC>,
-    ) -> Result<(MC, TerminalPlan), (MC, LifecycleError)>
+    ) -> Result<MC, (MC, LifecycleError)>
     where
         C: ControlHost,
         MC: kenwood_transport::Transport,
@@ -274,13 +257,9 @@ impl TerminalLifecycle {
             let result =
                 program_terminal(&mut radio, identity, gateway, request, journal, cancelled).await;
             let connection = radio.into_transport();
-            match result {
-                Ok(report) => {
-                    let plan = report.plan.clone();
-                    startup.entry = Some(report);
-                    Ok((connection, plan))
-                }
-                Err(error) => Err((connection, LifecycleError::Program(error))),
+            match Self::record_program(result, identity, startup) {
+                Ok(()) => Ok(connection),
+                Err(error) => Err((connection, error)),
             }
         } else {
             // A Terminal route is active; the modem link may already carry
@@ -295,24 +274,50 @@ impl TerminalLifecycle {
             control.stage(ControlStage::ActiveEntry);
             let control_connection = match control.open(&self.control_endpoint, self.baud) {
                 Ok(connection) => connection,
-                Err(_error) => return Err((modem_connection, LifecycleError::ControlOpen)),
+                Err(error) => return Err((modem_connection, LifecycleError::ControlOpen(error))),
             };
             let mut radio = Radio::new(control_connection);
             let result =
                 program_terminal(&mut radio, identity, gateway, request, journal, cancelled).await;
+            let result = Self::record_program(result, identity, startup);
             let closed = control.close(radio.into_transport()).await;
             match (result, closed) {
-                (Ok(report), Ok(())) => {
-                    let plan = report.plan.clone();
-                    startup.entry = Some(report);
-                    Ok((modem_connection, plan))
-                }
-                (Ok(report), Err(error)) => {
-                    startup.entry = Some(report);
+                (Ok(()), Ok(())) => Ok(modem_connection),
+                (Ok(()), Err(error)) => {
                     Err((modem_connection, LifecycleError::ControlClose(error)))
                 }
-                (Err(error), _) => Err((modem_connection, LifecycleError::Program(error))),
+                (Err(error), closed) => {
+                    startup.control_cleanup_error = closed.err();
+                    Err((modem_connection, error))
+                }
             }
+        }
+    }
+
+    /// Retain a reverse plan whenever a write may have reached the radio.
+    fn record_program<T>(
+        result: Result<TerminalProgramReport, Box<TerminalProgramError>>,
+        identity: &Identity,
+        startup: &mut TerminalStartup<T>,
+    ) -> Result<(), LifecycleError> {
+        let changed_plan = match &result {
+            Ok(report) if report.write_started => Some(&report.plan),
+            Err(error) if error.write_started => error.plan.as_ref(),
+            _ => None,
+        };
+        if let Some(plan) = changed_plan {
+            startup.recovery.owed = Some(OwedRestoration {
+                identity: identity.clone(),
+                plan: plan.restoration()?,
+            });
+            startup.recovery.state = RestorationState::Owed;
+        }
+        match result {
+            Ok(report) => {
+                startup.entry = Some(report);
+                Ok(())
+            }
+            Err(error) => Err(LifecycleError::Program(error)),
         }
     }
 }
@@ -342,24 +347,31 @@ pub struct TerminalStartup<T> {
     pub transition_attempts: Vec<TransitionAttempt>,
     /// A connection the startup held that was not confirmed closed.
     pub cleanup_error: Option<CloseFailure>,
+    /// A control close failure retained beside a programming failure.
+    pub control_cleanup_error: Option<CloseFailure>,
 }
 
 impl<T> TerminalStartup<T> {
-    const fn new() -> Self {
+    const fn new(control_endpoint: SerialCandidate, baud: NonZeroU32) -> Self {
         Self {
             proof: None,
-            recovery: TerminalRecovery::none(),
+            recovery: TerminalRecovery::nothing_owed(control_endpoint, baud),
             error: None,
             preflight: None,
             settle: None,
             entry: None,
             transition_attempts: Vec::new(),
             cleanup_error: None,
+            control_cleanup_error: None,
         }
     }
 
     fn fail(mut self, error: LifecycleError) -> Self {
-        if self.recovery.state == RestorationState::Owed && self.cleanup_error.is_some() {
+        if self.recovery.state == RestorationState::Owed
+            && (self.cleanup_error.is_some()
+                || self.control_cleanup_error.is_some()
+                || matches!(&error, LifecycleError::ControlClose(_)))
+        {
             self.recovery.state = RestorationState::Blocked;
         }
         self.error = Some(error);
@@ -371,16 +383,32 @@ impl<T> TerminalStartup<T> {
     pub const fn succeeded(&self) -> bool {
         self.proof.is_some() && self.error.is_none()
     }
+
+    /// Whether startup retains no unclosed connection other than `proof`.
+    #[must_use]
+    pub fn released(&self) -> bool {
+        self.cleanup_error.is_none()
+            && self.control_cleanup_error.is_none()
+            && !matches!(&self.error, Some(LifecycleError::ControlClose(_)))
+            && !matches!(&self.error, Some(LifecycleError::ModemOpen(error)) if !error.released)
+            && self.transition_attempts.iter().all(|attempt| {
+                attempt.retirement_error.is_none()
+                    && attempt
+                        .reopen_error
+                        .as_ref()
+                        .is_none_or(|error| error.released)
+            })
+    }
 }
 
 /// Owns the reverse plan and rewrites exactly the pages startup changed.
 ///
 /// It outlives the modem session, so restoration is still possible after the
 /// runtime fails. [`Self::finish`] restores over the control endpoint.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct TerminalRecovery {
     control_endpoint: SerialCandidate,
-    baud: u32,
+    baud: NonZeroU32,
     owed: Option<OwedRestoration>,
     state: RestorationState,
 }
@@ -393,26 +421,13 @@ struct OwedRestoration {
 }
 
 impl TerminalRecovery {
-    const fn none() -> Self {
-        Self {
-            control_endpoint: SerialCandidate {
-                path: String::new(),
-                vid: None,
-                pid: None,
-            },
-            baud: 0,
-            owed: None,
-            state: RestorationState::NotRequired,
-        }
-    }
-
     /// A recovery that owes nothing, for a startup path that changed no page.
     ///
     /// [`Self::finish`] returns [`RestorationState::Verified`] without any
     /// traffic. `control_endpoint` and `baud` are retained only so a report can
     /// name them.
     #[must_use]
-    pub const fn nothing_owed(control_endpoint: SerialCandidate, baud: u32) -> Self {
+    pub const fn nothing_owed(control_endpoint: SerialCandidate, baud: NonZeroU32) -> Self {
         Self {
             control_endpoint,
             baud,
@@ -523,9 +538,9 @@ impl TerminalRecovery {
         control.stage(ControlStage::Restore);
         let control_connection = match control.open(&self.control_endpoint, self.baud) {
             Ok(connection) => connection,
-            Err(_error) => {
+            Err(error) => {
                 report.state = RestorationState::Owed;
-                report.error = Some(RestorationError::ControlOpen);
+                report.error = Some(RestorationError::ControlOpen(error));
                 self.state = RestorationState::Owed;
                 return;
             }
@@ -545,9 +560,13 @@ impl TerminalRecovery {
             Ok(_report) => RestoreOutcome::Written,
             Err(_error) => RestoreOutcome::Failed,
         });
-        if result.is_err() || closed.is_err() {
+        let program_failed = result.is_err();
+        let close_failed = closed.is_err();
+        report.program = Some(result);
+        report.close = Some(closed);
+        if program_failed || close_failed {
             report.state = RestorationState::Owed;
-            report.error = Some(if result.is_err() {
+            report.error = Some(if program_failed {
                 RestorationError::RestoreWrite
             } else {
                 RestorationError::ControlClose
@@ -591,6 +610,7 @@ impl TerminalRecovery {
         report.readiness_after = Some(after);
         if verified {
             self.state = RestorationState::Verified;
+            self.owed = None;
         } else {
             self.state = RestorationState::Owed;
             report.error = Some(if gateway_mismatch {
@@ -604,7 +624,7 @@ impl TerminalRecovery {
 }
 
 /// Which restoration step failed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum RestorationError {
     /// The modem connection was not confirmed closed, so no traffic was sent.
@@ -619,8 +639,8 @@ pub enum RestorationError {
     #[error("the control endpoint did not settle before restoration programming")]
     ControlNotSettled,
     /// The control endpoint could not be opened for restoration.
-    #[error("the control endpoint could not be opened for restoration")]
-    ControlOpen,
+    #[error("the control endpoint could not be opened for restoration: {0}")]
+    ControlOpen(#[source] kenwood_transport::TransportError),
     /// The reverse plan could not be written.
     #[error("the reverse plan could not be written")]
     RestoreWrite,
@@ -655,6 +675,10 @@ pub struct RestorationReport {
     pub settle: Option<SettleReport>,
     /// Whether the reverse plan reached the radio.
     pub restore: Option<RestoreOutcome>,
+    /// Complete programming report or typed failure, when programming ran.
+    pub program: Option<Result<TerminalProgramReport, Box<TerminalProgramError>>>,
+    /// Control-connection close outcome, retained beside a programming failure.
+    pub close: Option<Result<(), CloseFailure>>,
     /// Readiness after the reverse write; its matching connection also read
     /// the restored Gateway state.
     pub readiness_after: Option<ReadinessReport>,
@@ -668,6 +692,8 @@ impl RestorationReport {
             readiness_before: None,
             settle: None,
             restore: None,
+            program: None,
+            close: None,
             readiness_after: None,
         }
     }
@@ -678,6 +704,3 @@ impl RestorationReport {
         matches!(self.state, RestorationState::Verified)
     }
 }
-
-#[cfg(test)]
-mod tests;

@@ -3,18 +3,19 @@
 
 use std::collections::VecDeque;
 use std::io;
+use std::num::NonZeroU32;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use kenwood_transport::{MockTransport, Transport, TransportError};
 
 use super::*;
-use crate::protocol::mcp::{ACK, read_request, regions, write_request};
+use crate::protocol::mcp::{ACK, Header, regions};
 use crate::radio::menu::MenuFieldSnapshot;
 use crate::radio::programming::{McpJournal, PageReplacement};
 use crate::radio::readiness::{SETTLE_QUIET, SettleOutcome};
 use crate::radio::terminal::session::TerminalPhase;
-use crate::transport::{KENWOOD_VID, TMD750_PANEL_PID};
+use crate::transport::{DEFAULT_BAUD, KENWOOD_VID, TMD750_PANEL_PID};
 use crate::types::{FirmwareIdentity, Page, RadioModel, RadioType, Region};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -85,27 +86,24 @@ fn identity_only() -> MockTransport {
 
 /// [`cat`] with the `ID` reply held for `hold`, as a Bluetooth connection
 /// opened soon after another one closed holds its first reply.
-fn held_cat(
-    gateway: u8,
-    hold: std::time::Duration,
-) -> Result<MockTransport, Box<dyn std::error::Error>> {
+fn held_cat(gateway: u8, hold: std::time::Duration) -> MockTransport {
     let mut mock = MockTransport::new();
-    mock.expect_reads(b"ID\r", &[]);
-    mock.queue_read_delayed(b"ID TM-D750\r", u64::try_from(hold.as_millis())?);
+    mock.expect_reads(b"ID\r", []);
+    mock.queue_read_delayed(b"ID TM-D750\r", hold);
     mock.expect(b"FV\r", b"FV 1.02\r");
     mock.expect(b"TY\r", b"TY K,2,1\r");
     mock.expect(b"GW\r", format!("GW {gateway}\r").as_bytes());
-    Ok(mock)
+    mock
 }
 
 fn frame(page: Page, bytes: &[u8]) -> Vec<u8> {
-    let mut frame = write_request(page).to_vec();
+    let mut frame = Header::write_request(page).to_vec();
     frame.extend_from_slice(bytes);
     frame
 }
 
 fn read(mock: &mut MockTransport, page: Page, bytes: &[u8]) {
-    mock.expect(&read_request(page), &frame(page, bytes));
+    mock.expect(&Header::read_request(page), frame(page, bytes));
     mock.expect(&[ACK], &[ACK]);
 }
 
@@ -125,7 +123,7 @@ fn program_into(
         read(mock, page.page(), page.expected());
     }
     for page in plan.replacements().iter().filter(|page| !page.is_noop()) {
-        mock.expect(&frame(page.page(), page.replacement()), &[ACK]);
+        mock.expect(frame(page.page(), page.replacement()), &[ACK]);
         read(mock, page.page(), page.replacement());
     }
     mock.expect(b"E", &[ACK]);
@@ -142,6 +140,7 @@ enum Seen {
 
 type Log = Arc<Mutex<Vec<Seen>>>;
 
+#[derive(Debug)]
 struct Conn {
     tag: &'static str,
     mock: MockTransport,
@@ -159,7 +158,7 @@ impl Transport for Conn {
         push(&self.log, Seen::Close(self.tag));
         self.mock.close().await
     }
-    fn set_baud_rate(&mut self, baud: u32) -> Result<(), TransportError> {
+    fn set_baud_rate(&mut self, baud: NonZeroU32) -> Result<(), TransportError> {
         self.mock.set_baud_rate(baud)
     }
 }
@@ -183,6 +182,7 @@ struct FakeControl {
     enumerations: usize,
     /// Enumerations after this many omit the endpoint.
     absent_after: Option<usize>,
+    fail_close_tag: Option<&'static str>,
 }
 
 impl FakeControl {
@@ -193,6 +193,7 @@ impl FakeControl {
             elapsed: std::time::Duration::ZERO,
             enumerations: 0,
             absent_after: None,
+            fail_close_tag: None,
         }
     }
 
@@ -221,9 +222,13 @@ impl ControlHost for FakeControl {
         Ok(vec![endpoint()])
     }
 
-    fn open(&mut self, selected: &SerialCandidate, baud: u32) -> Result<Conn, TransportError> {
+    fn open(
+        &mut self,
+        selected: &SerialCandidate,
+        baud: NonZeroU32,
+    ) -> Result<Conn, TransportError> {
         assert_eq!(*selected, endpoint());
-        assert_eq!(baud, 9600);
+        assert_eq!(baud.get(), 9600);
         push(&self.log, Seen::ControlOpen);
         let (tag, mock) = self
             .scripts
@@ -249,6 +254,19 @@ impl ControlHost for FakeControl {
 
     fn stage(&mut self, stage: ControlStage) {
         push(&self.log, Seen::Stage(stage));
+    }
+
+    async fn close(&mut self, connection: Conn) -> Result<(), CloseFailure> {
+        let fail = self.fail_close_tag == Some(connection.tag);
+        crate::radio::readiness::close_within(connection, crate::radio::readiness::CLOSE_BUDGET)
+            .await?;
+        if fail {
+            Err(CloseFailure::Host(
+                io::Error::other("scripted control release failure").into(),
+            ))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -295,6 +313,7 @@ struct RecordingJournal {
     entry_writes: usize,
     restore_writes: usize,
     checkpoints: Vec<(TerminalPhase, bool)>,
+    fail_checkpoint: bool,
 }
 
 impl TerminalJournal for RecordingJournal {
@@ -320,12 +339,16 @@ impl TerminalJournal for RecordingJournal {
         _journal: &McpJournal,
     ) -> io::Result<()> {
         self.checkpoints.push((phase, acknowledged));
-        Ok(())
+        if self.fail_checkpoint {
+            Err(io::Error::other("scripted checkpoint failure"))
+        } else {
+            Ok(())
+        }
     }
 }
 
 fn lifecycle() -> TerminalLifecycle {
-    TerminalLifecycle::new(endpoint(), 9600, TerminalGatewayRoute::Bluetooth)
+    TerminalLifecycle::new(endpoint(), DEFAULT_BAUD, TerminalGatewayRoute::Bluetooth)
 }
 
 #[tokio::test]
@@ -362,7 +385,7 @@ async fn bluetooth_entry_writes_over_the_modem_then_proves_and_restores() -> Tes
     assert!(journal.entry_writes >= 1);
     assert_eq!(journal.checkpoints, [(TerminalPhase::Entry, true)]);
     let proof = startup.proof.ok_or("missing proof")?;
-    assert_eq!(proof.version().description, "MMDVM 2018");
+    assert_eq!(proof.version().description(), "MMDVM 2018");
     crate::radio::readiness::close_within(
         proof.into_transport(),
         std::time::Duration::from_secs(1),
@@ -431,7 +454,7 @@ async fn a_bluetooth_modem_link_may_hold_its_first_reply_past_the_regular_deadli
         TerminalPlan::for_route(&identity()?, &snapshot, TerminalGatewayRoute::Bluetooth)?;
     let log: Log = Arc::default();
     let hold = crate::radio::DEFAULT_TIMEOUT.saturating_add(std::time::Duration::from_millis(200));
-    let mut bluetooth = held_cat(0, hold)?;
+    let mut bluetooth = held_cat(0, hold);
     program_into(&mut bluetooth, &snapshot, &forward, true);
     bluetooth.expect(GET_VERSION, VERSION);
     let mut control = FakeControl::new([("preflight", cat(0))], &log);
@@ -620,7 +643,7 @@ async fn finish_without_release_blocks_restoration_and_sends_no_traffic() -> Tes
     let log: Log = Arc::default();
     let mut recovery = TerminalRecovery {
         control_endpoint: endpoint(),
-        baud: 9600,
+        baud: DEFAULT_BAUD,
         owed: Some(OwedRestoration {
             identity: identity()?,
             plan: forward.restoration()?,
@@ -646,7 +669,7 @@ async fn nothing_owed_finishes_verified_without_traffic() -> TestResult {
     let log: Log = Arc::default();
     let mut recovery = TerminalRecovery {
         control_endpoint: endpoint(),
-        baud: 9600,
+        baud: DEFAULT_BAUD,
         owed: None,
         state: RestorationState::NotRequired,
     };
@@ -669,7 +692,7 @@ fn owed_recovery()
     let restore = forward.restoration()?;
     let recovery = TerminalRecovery {
         control_endpoint: endpoint(),
-        baud: 9600,
+        baud: DEFAULT_BAUD,
         owed: Some(OwedRestoration {
             identity: identity()?,
             plan: restore.clone(),
@@ -743,6 +766,149 @@ async fn an_unsettled_control_endpoint_leaves_restoration_owed_without_programmi
             SettleOutcome::Failed(ReadinessError::Unsettled { .. })
         ),
         "{settle:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_failed_entry_checkpoint_keeps_the_reverse_plan_on_both_routes() -> TestResult {
+    for gateway in [0, 2] {
+        let snapshot = configuration(gateway, 1, 0)?;
+        let forward =
+            TerminalPlan::for_route(&identity()?, &snapshot, TerminalGatewayRoute::Bluetooth)?;
+        let reverse = forward.restoration()?;
+        let log: Log = Arc::default();
+        let mut programming = cat(gateway);
+        program_into(&mut programming, &snapshot, &forward, true);
+        let (scripts, modem_script) = if gateway == 0 {
+            (vec![("preflight", cat(0))], programming)
+        } else {
+            (
+                vec![("preflight", cat(2)), ("active-entry", programming)],
+                MockTransport::new(),
+            )
+        };
+        let mut control = FakeControl::new(scripts, &log);
+        let mut modem = FakeModem {
+            opens: VecDeque::from([("modem", modem_script)]),
+            log: Arc::clone(&log),
+        };
+        let mut journal = RecordingJournal {
+            fail_checkpoint: true,
+            ..RecordingJournal::default()
+        };
+        let startup = lifecycle()
+            .prepare(
+                &mut control,
+                &mut modem,
+                &mut journal,
+                &AtomicBool::new(false),
+            )
+            .await;
+        assert_eq!(
+            startup.recovery.state(),
+            RestorationState::Owed,
+            "{startup:?}"
+        );
+        assert_eq!(startup.recovery.restoration(), Some(&reverse));
+        let Some(LifecycleError::Program(error)) = startup.error else {
+            return Err("checkpoint failure did not remain the programming cause".into());
+        };
+        assert!(error.checkpoint.is_some(), "{error:?}");
+        assert!(
+            error.write_started,
+            "the fixture must dispatch changed pages"
+        );
+        assert!(
+            !error.journal.verified.is_empty(),
+            "completed readbacks must remain available"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_failed_active_entry_close_retains_restoration_and_prevents_release() -> TestResult {
+    let snapshot = configuration(2, 1, 0)?;
+    let forward =
+        TerminalPlan::for_route(&identity()?, &snapshot, TerminalGatewayRoute::Bluetooth)?;
+    let log: Log = Arc::default();
+    let mut programming = cat(2);
+    program_into(&mut programming, &snapshot, &forward, true);
+    let mut control =
+        FakeControl::new([("preflight", cat(2)), ("failed-close", programming)], &log);
+    control.fail_close_tag = Some("failed-close");
+    let mut modem = FakeModem {
+        opens: VecDeque::from([("modem", MockTransport::new())]),
+        log,
+    };
+    let mut journal = RecordingJournal::default();
+    let startup = lifecycle()
+        .prepare(
+            &mut control,
+            &mut modem,
+            &mut journal,
+            &AtomicBool::new(false),
+        )
+        .await;
+    assert_eq!(startup.recovery.state(), RestorationState::Blocked);
+    assert_eq!(
+        startup.recovery.restoration(),
+        Some(&forward.restoration()?)
+    );
+    assert!(
+        matches!(startup.error, Some(LifecycleError::ControlClose(_))),
+        "{startup:?}"
+    );
+    assert!(
+        !startup.released(),
+        "a retained control connection must block restoration"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn verified_restoration_is_completed_once_without_repeating_traffic() -> TestResult {
+    let (snapshot, restore, mut recovery) = owed_recovery()?;
+    let log: Log = Arc::default();
+    let mut programming = cat(2);
+    program_into(&mut programming, &snapshot, &restore, false);
+    let mut control = FakeControl::new(
+        [
+            ("readiness-before", identity_only()),
+            ("restore", programming),
+            ("readiness-after", cat(0)),
+        ],
+        &log,
+    );
+    let mut journal = RecordingJournal::default();
+    assert!(
+        recovery
+            .finish(&mut control, &mut journal, true, &AtomicBool::new(false))
+            .await
+            .verified()
+    );
+    let opens = control.control_opens()?;
+    let checkpoints = journal.checkpoints.len();
+    assert!(
+        recovery.restoration().is_none(),
+        "completed recovery must consume its obligation"
+    );
+    assert!(
+        recovery
+            .finish(&mut control, &mut journal, true, &AtomicBool::new(false))
+            .await
+            .verified()
+    );
+    assert_eq!(
+        control.control_opens()?,
+        opens,
+        "a second completion must not open a connection"
+    );
+    assert_eq!(
+        journal.checkpoints.len(),
+        checkpoints,
+        "a second completion must not program"
     );
     Ok(())
 }

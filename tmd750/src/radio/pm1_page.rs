@@ -2,8 +2,8 @@
 //! name page, the PM Off MY1 page, and the channel name-table pages.
 
 use super::Radio;
-use crate::error::{Error, ProtocolError};
-use crate::protocol::mcp::{ACK, write_request};
+use crate::error::{AckStage, Error, ProtocolError, TimeoutOperation};
+use crate::protocol::mcp::{ACK, Header};
 use crate::types::{
     Address, CHANNEL_NAME_SIZE, CHANNEL_NAMES_OFFSET, PAGE_SIZE, PHYSICAL_CHANNEL_COUNT, Page,
 };
@@ -52,15 +52,17 @@ impl<T: Transport> Radio<T> {
         &mut self,
         target: FixedTextTarget,
         after: &[u8; PAGE_SIZE],
-        stage: &'static str,
     ) -> Result<(), Error> {
         self.require_mcp_ready()?;
         let page = target.page()?;
-        let mut frame = write_request(page).to_vec();
+        let mut frame = Header::write_request(page).to_vec();
         frame.extend_from_slice(after);
         self.mark_mcp_uncertain();
         self.write_all(&frame).await?;
-        let reply = self.read_exact(1, stage).await?;
+        let stage = AckStage::TextFieldWrite;
+        let reply = self
+            .read_exact(1, TimeoutOperation::Acknowledgement(stage))
+            .await?;
         if reply.as_slice() != [ACK] {
             return Err(Error::Protocol(ProtocolError::MissingAck {
                 stage,

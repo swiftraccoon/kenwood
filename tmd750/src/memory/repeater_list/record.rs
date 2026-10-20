@@ -8,6 +8,10 @@ use crate::types::{
     Coordinate, Latitude, LatitudeHemisphere, Longitude, LongitudeHemisphere, StoredCallsign,
 };
 
+#[cfg(test)]
+#[path = "record_tests.rs"]
+mod tests;
+
 const NAME: usize = 0;
 const SUB_NAME: usize = 16;
 const CALLSIGN: usize = 32;
@@ -42,6 +46,8 @@ const MAX_QUARTER_HOURS: u8 = 112;
 /// 1.3 GHz were stored), so this is not a [`crate::types::Frequency`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RepeaterFrequency(u32);
+
+checked_integer_traits!(RepeaterFrequency, u32, hertz, RepeaterListError);
 
 impl RepeaterFrequency {
     /// Accept any value below `u32::MAX`, the value of an empty slot.
@@ -104,15 +110,20 @@ pub enum RepeaterShift {
     /// `2`: the input is above the output.
     Plus,
     /// Any other stored value, retained exactly.
-    Unnamed(u8),
+    Unnamed(UnnamedRepeaterShift),
 }
+
+unnamed_wire_value!(
+    /// A repeater shift byte other than Minus (`1`) or Plus (`2`).
+    UnnamedRepeaterShift, [1..=2]
+);
 
 impl From<u8> for RepeaterShift {
     fn from(value: u8) -> Self {
         match value {
             1 => Self::Minus,
             2 => Self::Plus,
-            other => Self::Unnamed(other),
+            other => Self::Unnamed(UnnamedRepeaterShift(other)),
         }
     }
 }
@@ -122,7 +133,7 @@ impl From<RepeaterShift> for u8 {
         match value {
             RepeaterShift::Minus => 1,
             RepeaterShift::Plus => 2,
-            RepeaterShift::Unnamed(raw) => raw,
+            RepeaterShift::Unnamed(raw) => raw.get(),
         }
     }
 }
@@ -145,15 +156,20 @@ pub enum PositionAccuracy {
     /// `2`: the catalog's `Exact` position.
     Exact,
     /// Any other stored value, retained exactly.
-    Unnamed(u8),
+    Unnamed(UnnamedPositionAccuracy),
 }
+
+unnamed_wire_value!(
+    /// A position-accuracy byte other than Approximate (`1`) or Exact (`2`).
+    UnnamedPositionAccuracy, [1..=2]
+);
 
 impl From<u8> for PositionAccuracy {
     fn from(value: u8) -> Self {
         match value {
             1 => Self::Approximate,
             2 => Self::Exact,
-            other => Self::Unnamed(other),
+            other => Self::Unnamed(UnnamedPositionAccuracy(other)),
         }
     }
 }
@@ -163,7 +179,7 @@ impl From<PositionAccuracy> for u8 {
         match value {
             PositionAccuracy::Approximate => 1,
             PositionAccuracy::Exact => 2,
-            PositionAccuracy::Unnamed(raw) => raw,
+            PositionAccuracy::Unnamed(raw) => raw.get(),
         }
     }
 }
@@ -194,6 +210,21 @@ pub struct RepeaterPosition {
 /// UTC−14:00 (`92` is UTC+09:00).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct UtcOffset(u8);
+
+integer_formats!(UtcOffset, minutes);
+
+impl TryFrom<i16> for UtcOffset {
+    type Error = RepeaterListError;
+    fn try_from(value: i16) -> Result<Self, Self::Error> {
+        Self::from_minutes(value)
+    }
+}
+
+impl From<UtcOffset> for i16 {
+    fn from(value: UtcOffset) -> Self {
+        value.minutes()
+    }
+}
 
 impl UtcOffset {
     /// Validate an offset in minutes east of UTC.
@@ -250,6 +281,8 @@ macro_rules! table_index {
         #[doc = concat!("An index into the ", $table, " name table, below ", $count, ".")]
         #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub struct $name($raw);
+
+        checked_integer_traits!($name, $raw, get, RepeaterListError);
 
         impl $name {
             /// Entries in the table.
@@ -597,7 +630,3 @@ fn index<R: PartialEq + Copy, T>(
         new(raw).map(Some)
     }
 }
-
-#[cfg(test)]
-#[path = "record_tests.rs"]
-mod tests;

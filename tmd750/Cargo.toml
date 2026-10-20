@@ -1,21 +1,21 @@
 [package]
 name = "kenwood-tmd750"
 version = "0.1.0"
+authors = ["swiftraccoon"]
+categories = ["hardware-support", "encoding"]
 edition = "2024"
+keywords = ["kenwood", "tmd750", "ham-radio", "amateur-radio"]
+license = "GPL-2.0-or-later"
+publish = false
+readme = "README.md"
+repository = "https://github.com/swiftraccoon/kenwood"
 rust-version = "1.94"
 description = "Async Rust library for the Kenwood TM-D750: identity, MCP region programming, and manifest-driven menu fields per Programmable-Memory slot"
-license = "GPL-2.0-or-later"
-repository = "https://github.com/swiftraccoon/kenwood"
-keywords = ["kenwood", "tmd750", "ham-radio", "amateur-radio"]
-categories = ["hardware-support", "encoding"]
-authors = ["swiftraccoon"]
-readme = "README.md"
-publish = false
 
 [dependencies]
 kenwood-schema = { path = "../kenwood-schema" }
 kenwood-transport = { path = "../kenwood-transport", default-features = false, features = [
-  "serial",
+    "serial",
 ] }
 # Bounded MMDVM GET_VERSION probing on the modem link after Terminal entry.
 mmdvm = { path = "../mmdvm", default-features = false, features = ["probe"] }

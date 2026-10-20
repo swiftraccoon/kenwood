@@ -1,8 +1,8 @@
 //! Pure scalar input tests, with no radio access.
 
 use super::*;
-use crate::memory::{Endian, FieldDescriptor, MenuOption, StringEncoding, menu_field};
-use kenwood_schema::CodecError;
+use crate::memory::{FieldDescriptor, MenuOption, menu_field};
+use kenwood_schema::{CodecError, CodecSpec, Endian, FieldCodec, StringEncoding};
 
 type TestError = Box<dyn std::error::Error>;
 type TestResult = Result<(), TestError>;
@@ -152,12 +152,12 @@ fn real_unsigned_codecs_parse_decimal_and_hex_with_storage_bounds() -> TestResul
 
 #[test]
 fn unsigned_syntax_overflow_and_signed_decimal_are_not_guessed() -> TestResult {
-    let unsigned = scalar(FieldCodec::Unsigned {
+    let unsigned = scalar(FieldCodec::new(CodecSpec::Unsigned {
         width: 8,
         endian: Endian::Big,
         min: 0,
         max: u64::MAX,
-    });
+    })?);
     for input in ["18446744073709551615", "0xFFFFFFFFFFFFFFFF"] {
         assert_eq!(
             unsigned.parse_value(input)?,
@@ -302,7 +302,7 @@ fn ambiguous_labels_are_refused_but_explicit_raw_options_remain_available() -> T
     let field = MenuField {
         options: AMBIGUOUS_OPTIONS,
         enum_type: Some("test.Options"),
-        ..scalar(FieldCodec::Byte { min: 0, max: 7 })
+        ..scalar(FieldCodec::new(CodecSpec::Byte { min: 0, max: 7 })?)
     };
     for input in ["Mode", "mode", "mOdE"] {
         assert!(
@@ -346,7 +346,7 @@ fn ambiguous_labels_are_refused_but_explicit_raw_options_remain_available() -> T
 fn choice_domains_and_codec_bounds_are_both_required_after_parsing() -> TestResult {
     let choices = MenuField {
         allowed_values: &[2, 4],
-        ..scalar(FieldCodec::Byte { min: 0, max: 9 })
+        ..scalar(FieldCodec::new(CodecSpec::Byte { min: 0, max: 9 })?)
     };
     for value in [2, 4] {
         assert_eq!(
@@ -367,7 +367,7 @@ fn choice_domains_and_codec_bounds_are_both_required_after_parsing() -> TestResu
     let intersected = MenuField {
         options: AMBIGUOUS_OPTIONS,
         allowed_values: &[1],
-        ..scalar(FieldCodec::Byte { min: 0, max: 7 })
+        ..scalar(FieldCodec::new(CodecSpec::Byte { min: 0, max: 7 })?)
     };
     assert_eq!(
         intersected.parse_value("1")?,
@@ -386,7 +386,7 @@ fn choice_domains_and_codec_bounds_are_both_required_after_parsing() -> TestResu
     );
     let codec_bound = MenuField {
         options: AMBIGUOUS_OPTIONS,
-        ..scalar(FieldCodec::Byte { min: 0, max: 2 })
+        ..scalar(FieldCodec::new(CodecSpec::Byte { min: 0, max: 2 })?)
     };
     assert!(
         matches!(
@@ -400,7 +400,7 @@ fn choice_domains_and_codec_bounds_are_both_required_after_parsing() -> TestResu
     );
     let incompatible = MenuField {
         allowed_values: &[0, 1],
-        ..scalar(FieldCodec::Bool)
+        ..scalar(FieldCodec::BOOL)
     };
     assert!(
         matches!(
@@ -475,11 +475,11 @@ fn string_terminators_are_rejected_instead_of_silently_shortening_the_value() ->
             "NUL-containing input must not decode to a different shorter string"
         );
     }
-    let padded = scalar(FieldCodec::FixedString {
+    let padded = scalar(FieldCodec::new(CodecSpec::FixedString {
         len: 8,
         encoding: StringEncoding::Utf8,
         padding: b' ',
-    });
+    })?);
     assert_eq!(
         padded.parse_value("TEXT")?,
         DecodedFieldValue::Text("TEXT".to_owned()),
@@ -522,20 +522,20 @@ fn raw_numeric_storage_never_applies_display_unit_transforms() -> TestResult {
 }
 
 #[test]
-fn blobs_and_byte_arrays_have_no_scalar_parser_even_if_the_codec_looks_simple() {
+fn blobs_and_byte_arrays_have_no_scalar_parser_even_if_the_codec_looks_simple() -> TestResult {
     for field in [
         MenuField {
             is_blob: true,
-            ..scalar(FieldCodec::Byte { min: 0, max: 255 })
+            ..scalar(FieldCodec::new(CodecSpec::Byte { min: 0, max: 255 })?)
         },
-        scalar(FieldCodec::Bytes { len: 4 }),
+        scalar(FieldCodec::new(CodecSpec::Bytes { len: 4 })?),
         MenuField {
             is_blob: true,
-            ..scalar(FieldCodec::FixedString {
+            ..scalar(FieldCodec::new(CodecSpec::FixedString {
                 len: 8,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            })
+            })?)
         },
     ] {
         for text in ["0", "0x00", "DEADBEEF", "", "abcd"] {
@@ -548,6 +548,7 @@ fn blobs_and_byte_arrays_have_no_scalar_parser_even_if_the_codec_looks_simple() 
             );
         }
     }
+    Ok(())
 }
 
 #[test]
@@ -568,32 +569,32 @@ fn parser_errors_do_not_echo_input_that_could_be_a_credential() -> TestResult {
                 resource_key: None,
             },
         ],
-        ..scalar(FieldCodec::Byte { min: 0, max: 1 })
+        ..scalar(FieldCodec::new(CodecSpec::Byte { min: 0, max: 1 })?)
     };
     for field in [
-        scalar(FieldCodec::Bool),
-        scalar(FieldCodec::Unsigned {
+        scalar(FieldCodec::BOOL),
+        scalar(FieldCodec::new(CodecSpec::Unsigned {
             width: 8,
             endian: Endian::Little,
             min: 0,
             max: u64::MAX,
-        }),
-        scalar(FieldCodec::Signed {
+        })?),
+        scalar(FieldCodec::new(CodecSpec::Signed {
             width: 8,
             endian: Endian::Little,
             min: i64::MIN,
             max: i64::MAX,
-        }),
+        })?),
         MenuField {
             options: AMBIGUOUS_OPTIONS,
-            ..scalar(FieldCodec::Byte { min: 0, max: 7 })
+            ..scalar(FieldCodec::new(CodecSpec::Byte { min: 0, max: 7 })?)
         },
         ambiguous,
-        scalar(FieldCodec::FixedString {
+        scalar(FieldCodec::new(CodecSpec::FixedString {
             len: 4,
             encoding: StringEncoding::Utf8,
             padding: 0,
-        }),
+        })?),
     ] {
         let error = field
             .parse_value(secret)
@@ -613,11 +614,11 @@ fn parser_errors_do_not_echo_input_that_could_be_a_credential() -> TestResult {
         );
     }
     let terminated = format!("{secret}\0");
-    let field = scalar(FieldCodec::FixedString {
+    let field = scalar(FieldCodec::new(CodecSpec::FixedString {
         len: 64,
         encoding: StringEncoding::Utf8,
         padding: 0,
-    });
+    })?);
     let error = field
         .parse_value(&terminated)
         .err()

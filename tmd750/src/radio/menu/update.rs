@@ -5,12 +5,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::{MenuFieldSnapshot, ScopedMenuField};
 use crate::error::{Error, SchemaError};
 use crate::memory::{
-    DecodedFieldValue, MenuField, MenuFieldId, MenuValueError, MenuWritePolicy,
-    MenuWritePolicyError, PatchPlanner, menu_field,
+    MenuField, MenuFieldId, MenuValueError, MenuWritePolicy, MenuWritePolicyError, PatchPlanner,
+    menu_field,
 };
 use crate::radio::Identity;
 use crate::radio::programming::PageReplacement;
 use crate::types::{Address, DvGatewayMode, Page, SlotIndex};
+use kenwood_schema::DecodedFieldValue;
+
+#[cfg(test)]
+mod tests;
 
 const PM_FIELD: &str = "pm.PmSelect";
 const GATEWAY_FIELD: &str = "dv.DvGatewayModeDvGateway";
@@ -370,6 +374,3 @@ pub enum MenuUpdateError {
     #[error(transparent)]
     Operation(#[from] Error),
 }
-
-#[cfg(test)]
-mod tests;

@@ -8,11 +8,6 @@
 //! [`MemoryImage`] holds every channel. Decoding describes the supplied
 //! bytes only.
 
-mod call;
-mod group;
-mod records;
-mod weather;
-
 pub use call::{CallBand, CallChannel, CallChannelEntry, CallChannelPlan, CallMode};
 pub use group::{ChannelGroupPlan, GroupNamePlan, MEMORY_GROUPS, MemoryGroup};
 pub use records::MemoryChannelPlan;
@@ -26,6 +21,11 @@ use crate::types::{
     CHANNEL_RECORD_SIZE, ChannelName, FLAG_RECORD_SIZE, PhysicalChannel, Region,
     StoredChannelEntry,
 };
+
+mod call;
+mod group;
+mod records;
+mod weather;
 
 /// The CALL channel stored last in every table.
 const LAST_CALL: CallChannel = CallChannel::new(CallBand::Uhf, CallMode::Dv);

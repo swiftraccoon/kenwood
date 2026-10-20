@@ -4,6 +4,15 @@ use std::fmt;
 
 use crate::error::ValidationError;
 
+unnamed_wire_value!(
+    /// An operating-mode byte outside the named `0..=4` cases.
+    UnnamedOperatingMode, [0..=4]
+);
+unnamed_wire_value!(
+    /// A DV Gateway byte other than Off (`0`) or Terminal (`2`).
+    UnnamedDvGatewayMode, [0 | 2]
+);
+
 /// Receiver band used by band-indexed CAT commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Band {
@@ -61,7 +70,7 @@ pub enum OperatingMode {
     /// DR, D-STAR through the repeater list (`4`); reported, not writable.
     Dr,
     /// Any other reported value, retained exactly as received.
-    Unnamed(u8),
+    Unnamed(UnnamedOperatingMode),
 }
 
 impl fmt::Display for OperatingMode {
@@ -85,7 +94,7 @@ impl From<u8> for OperatingMode {
             2 => Self::Am,
             3 => Self::Nfm,
             4 => Self::Dr,
-            other => Self::Unnamed(other),
+            other => Self::Unnamed(UnnamedOperatingMode(other)),
         }
     }
 }
@@ -98,7 +107,7 @@ impl From<OperatingMode> for u8 {
             OperatingMode::Am => 2,
             OperatingMode::Nfm => 3,
             OperatingMode::Dr => 4,
-            OperatingMode::Unnamed(raw) => raw,
+            OperatingMode::Unnamed(raw) => raw.get(),
         }
     }
 }
@@ -142,7 +151,7 @@ pub enum DvGatewayMode {
     /// Terminal Mode is selected (`2`).
     Terminal,
     /// Any other reported value, retained exactly as received.
-    Unnamed(u8),
+    Unnamed(UnnamedDvGatewayMode),
 }
 
 impl fmt::Display for DvGatewayMode {
@@ -160,7 +169,7 @@ impl From<u8> for DvGatewayMode {
         match value {
             0 => Self::Off,
             2 => Self::Terminal,
-            other => Self::Unnamed(other),
+            other => Self::Unnamed(UnnamedDvGatewayMode(other)),
         }
     }
 }
@@ -170,7 +179,7 @@ impl From<DvGatewayMode> for u8 {
         match value {
             DvGatewayMode::Off => 0,
             DvGatewayMode::Terminal => 2,
-            DvGatewayMode::Unnamed(raw) => raw,
+            DvGatewayMode::Unnamed(raw) => raw.get(),
         }
     }
 }
@@ -193,7 +202,7 @@ mod tests {
             (2, OperatingMode::Am),
             (3, OperatingMode::Nfm),
             (4, OperatingMode::Dr),
-            (7, OperatingMode::Unnamed(7)),
+            (7, OperatingMode::from(7)),
         ] {
             assert_eq!(OperatingMode::from(raw), mode);
             assert_eq!(u8::from(mode), raw);
@@ -206,13 +215,9 @@ mod tests {
         for (raw, mode, label) in [
             (0, DvGatewayMode::Off, "Off"),
             (2, DvGatewayMode::Terminal, "Terminal"),
-            (1, DvGatewayMode::Unnamed(1), "unnamed value 1"),
-            (3, DvGatewayMode::Unnamed(3), "unnamed value 3"),
-            (
-                u8::MAX,
-                DvGatewayMode::Unnamed(u8::MAX),
-                "unnamed value 255",
-            ),
+            (1, DvGatewayMode::from(1), "unnamed value 1"),
+            (3, DvGatewayMode::from(3), "unnamed value 3"),
+            (u8::MAX, DvGatewayMode::from(u8::MAX), "unnamed value 255"),
         ] {
             assert_eq!(
                 DvGatewayMode::from(raw),
@@ -236,7 +241,7 @@ mod tests {
             if raw != 0 && raw != 2 {
                 assert_eq!(
                     mode,
-                    DvGatewayMode::Unnamed(raw),
+                    DvGatewayMode::Unnamed(UnnamedDvGatewayMode(raw)),
                     "unobserved GW {raw} must not acquire a named meaning"
                 );
             }
@@ -246,7 +251,42 @@ mod tests {
     #[test]
     fn unnamed_wire_values_are_preserved() {
         assert!(Band::try_from(2).is_err());
-        assert_eq!(OperatingMode::from(5), OperatingMode::Unnamed(5));
-        assert_eq!(DvGatewayMode::from(3), DvGatewayMode::Unnamed(3));
+        assert_eq!(
+            OperatingMode::from(5),
+            OperatingMode::Unnamed(UnnamedOperatingMode(5))
+        );
+        assert_eq!(
+            DvGatewayMode::from(3),
+            DvGatewayMode::Unnamed(UnnamedDvGatewayMode(3))
+        );
+    }
+
+    #[test]
+    fn named_bytes_cannot_be_constructed_as_unnamed() -> TestResult {
+        use crate::memory::repeater_list::{UnnamedPositionAccuracy, UnnamedRepeaterShift};
+        use crate::nmea::UnnamedFixQuality;
+        use crate::types::{UnnamedTncMode, UnnamedVoxMode};
+
+        for raw in 0..=u8::MAX {
+            assert_eq!(UnnamedOperatingMode::new(raw).is_ok(), raw > 4);
+            assert_eq!(UnnamedDvGatewayMode::new(raw).is_ok(), raw != 0 && raw != 2);
+            assert_eq!(UnnamedVoxMode::new(raw).is_ok(), raw > 1);
+            assert_eq!(UnnamedTncMode::new(raw).is_ok(), raw > 2);
+            assert_eq!(UnnamedRepeaterShift::new(raw).is_ok(), raw != 1 && raw != 2);
+            assert_eq!(
+                UnnamedPositionAccuracy::new(raw).is_ok(),
+                raw != 1 && raw != 2
+            );
+            assert_eq!(
+                UnnamedFixQuality::new(raw).is_ok(),
+                ![0, 1, 2, 6].contains(&raw)
+            );
+            assert_eq!(u8::from(OperatingMode::from(raw)), raw);
+            assert_eq!(u8::from(DvGatewayMode::from(raw)), raw);
+        }
+        let unnamed = UnnamedOperatingMode::try_from(255)?;
+        assert_eq!(format!("{unnamed:#06x}"), "0x00ff");
+        assert_eq!(u8::from(unnamed), 255);
+        Ok(())
     }
 }

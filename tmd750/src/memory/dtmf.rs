@@ -24,6 +24,10 @@ use crate::protocol::mcp::regions;
 use crate::radio::programming::PageReplacement;
 use crate::types::Address;
 
+#[cfg(test)]
+#[path = "dtmf_tests.rs"]
+mod tests;
+
 /// Channels in each memory, `CH0` to `CH9`.
 pub const DTMF_MEMORY_CHANNELS: usize = 10;
 /// Bytes of a DTMF memory name or code.
@@ -109,6 +113,8 @@ impl fmt::Display for DtmfMemoryKind {
 /// A channel number of either memory, `CH0` to `CH9`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DtmfChannel(u8);
+
+checked_integer_traits!(DtmfChannel, u8, index, DtmfMemoryError);
 
 impl DtmfChannel {
     /// Every channel in order.
@@ -450,7 +456,3 @@ pub enum DtmfMemoryError {
         source: Box<Self>,
     },
 }
-
-#[cfg(test)]
-#[path = "dtmf_tests.rs"]
-mod tests;

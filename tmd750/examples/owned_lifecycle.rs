@@ -7,14 +7,13 @@ use kenwood_schema as _;
 use mcp_d75_extract as _;
 use mmdvm as _;
 use proptest as _;
-use thiserror as _;
 use tokio_serial as _;
 use tracing as _;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use kenwood_tmd750::protocol::mcp::{ACK, ENTER, EXIT, read_request, write_request};
+use kenwood_tmd750::protocol::mcp::{ACK, ENTER, EXIT, Header};
 use kenwood_tmd750::radio::{McpJournal, RegionImage};
 use kenwood_tmd750::{DvGatewayMode, Error, McpError, ProtocolError, Radio, Region};
 use kenwood_transport::{MockTransport, Transport, TransportError};
@@ -108,9 +107,9 @@ fn page_script(mock: &mut MockTransport, region: Region) -> ExampleResult {
         .first()
         .copied()
         .ok_or("region has no page")?;
-    let mut reply = write_request(page).to_vec();
+    let mut reply = Header::write_request(page).to_vec();
     reply.extend(std::iter::repeat_n(0x2A, page.len()));
-    mock.expect(&read_request(page), &reply);
+    mock.expect(&Header::read_request(page), &reply);
     mock.expect(&[ACK], &[ACK]);
     Ok(())
 }
@@ -124,9 +123,17 @@ enum ExitOutcome {
 
 #[derive(Debug)]
 struct McpRead {
-    operation: Result<RegionImage, Error>,
+    operation: Result<RegionImage, ReadFailure>,
     exit: ExitOutcome,
     journal: McpJournal,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ReadFailure {
+    #[error(transparent)]
+    Radio(#[from] Error),
+    #[error("captured fixture page is not filled with 0x{expected:02X}")]
+    ContentMismatch { expected: u8 },
 }
 
 async fn read_fragment<T: Transport>(
@@ -138,7 +145,7 @@ async fn read_fragment<T: Transport>(
         Ok(session) => session,
         Err(error) => {
             return McpRead {
-                operation: Err(error),
+                operation: Err(error.into()),
                 exit: ExitOutcome::EntryFailed,
                 journal: McpJournal::default(),
             };
@@ -147,6 +154,7 @@ async fn read_fragment<T: Transport>(
     let operation = session
         .read_regions(&[region], |_| {})
         .await
+        .map_err(ReadFailure::from)
         .and_then(|image| {
             if image
                 .bytes(region)
@@ -155,11 +163,7 @@ async fn read_fragment<T: Transport>(
                 Ok(image)
             } else {
                 // A host comparison can fail after a fully acknowledged read.
-                Err(ProtocolError::UnexpectedResponse {
-                    expected: "fixture page containing only the requested byte",
-                    actual: "complete page had different fixture content".to_owned(),
-                }
-                .into())
+                Err(ReadFailure::ContentMismatch { expected })
             }
         });
     // Retain the journal before consuming the session, including on error.
@@ -274,7 +278,7 @@ async fn mcp_failure_retains_exit_and_close_failures() -> ExampleResult {
     assert!(
         matches!(
             closed.operation.operation,
-            Err(Error::Protocol(ProtocolError::UnexpectedResponse { .. }))
+            Err(ReadFailure::ContentMismatch { expected: 0 })
         ),
         "the completed-page comparison failure must survive cleanup"
     );
@@ -306,7 +310,7 @@ async fn incomplete_read_sends_no_speculative_exit() -> ExampleResult {
         .ok_or("region has no page")?;
     let mut mock = identity_script();
     mock.expect(ENTER, b"0M\r");
-    mock.expect_eof(&read_request(page));
+    mock.expect_eof(&Header::read_request(page));
     let mut radio = Radio::new(Fixture::new(mock, CloseResult::Success));
     let operation = read_fragment(&mut radio, region, 0x2A).await;
     let closed = retire(radio, operation).await;
@@ -314,7 +318,9 @@ async fn incomplete_read_sends_no_speculative_exit() -> ExampleResult {
     assert!(
         matches!(
             closed.operation.operation,
-            Err(Error::Transport(TransportError::Disconnected(_)))
+            Err(ReadFailure::Radio(Error::Transport(
+                TransportError::Disconnected(_)
+            )))
         ),
         "the incomplete read must retain its disconnection error"
     );

@@ -5,8 +5,9 @@ use std::time::Duration;
 use kenwood_transport::{MockTransport, TransportError};
 
 use super::*;
-use crate::protocol::mcp::{ACK, read_request, regions, write_request};
-use crate::transport::{KENWOOD_VID, TMD750_MAIN_PID};
+use crate::protocol::mcp::{ACK, Header, regions};
+use crate::radio::backup::{McpBackupOutcome, McpBackupStage};
+use crate::transport::{DEFAULT_BAUD, KENWOOD_VID, TMD750_MAIN_PID};
 use crate::types::{Address, FirmwareIdentity, Page, RadioModel, RadioType, Region};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -50,10 +51,10 @@ impl ControlHost for Host {
     fn open(
         &mut self,
         selected: &SerialCandidate,
-        baud: u32,
+        baud: NonZeroU32,
     ) -> Result<MockTransport, TransportError> {
         assert_eq!(selected, &self.endpoint, "only the selected endpoint opens");
-        assert_eq!(baud, 9600, "the selected baud is kept");
+        assert_eq!(baud.get(), 9600, "the selected baud is kept");
         self.opens += 1;
         if let Some(flag) = &self.cancel_on_open {
             flag.store(true, Ordering::Relaxed);
@@ -109,9 +110,9 @@ fn fresh(gateway: bool) -> MockTransport {
 }
 
 fn read(mock: &mut MockTransport, page: Page, data: &[u8]) {
-    let mut reply = write_request(page).to_vec();
+    let mut reply = Header::write_request(page).to_vec();
     reply.extend_from_slice(data);
-    mock.expect(&read_request(page), &reply);
+    mock.expect(&Header::read_request(page), reply);
     mock.expect(&[ACK], &[ACK]);
 }
 
@@ -133,9 +134,9 @@ async fn a_plan_is_written_then_verified_on_a_fresh_identity() -> TestResult {
     session.expect(b"GW\r", b"GW 0\r");
     session.expect(b"0M PROGRAM\r", b"0M\r");
     read(&mut session, replacement.page(), replacement.expected());
-    let mut frame = write_request(replacement.page()).to_vec();
+    let mut frame = Header::write_request(replacement.page()).to_vec();
     frame.extend_from_slice(replacement.replacement());
-    session.expect(&frame, &[ACK]);
+    session.expect(frame, &[ACK]);
     read(&mut session, replacement.page(), replacement.replacement());
     session.expect(b"E", &[ACK]);
     let mut host = Host::new(vec![session, fresh(true)]);
@@ -144,7 +145,7 @@ async fn a_plan_is_written_then_verified_on_a_fresh_identity() -> TestResult {
     let report = write_pages(
         &mut host,
         &endpoint,
-        9600,
+        DEFAULT_BAUD,
         &identity()?,
         std::slice::from_ref(&replacement),
         &mut |page: &PageReplacement| {
@@ -185,7 +186,7 @@ async fn another_identity_or_an_active_gateway_stops_before_entry() -> TestResul
         let report = write_pages(
             &mut host,
             &endpoint,
-            9600,
+            DEFAULT_BAUD,
             &identity()?,
             &[replacement()?],
             &mut |_page: &PageReplacement| Ok(()),
@@ -217,7 +218,7 @@ async fn cancellation_before_the_open_opens_nothing() -> TestResult {
     let report = write_pages(
         &mut host,
         &endpoint,
-        9600,
+        DEFAULT_BAUD,
         &identity()?,
         &[replacement()?],
         &mut |_page: &PageReplacement| Ok(()),
@@ -243,7 +244,7 @@ async fn cancellation_after_the_open_closes_without_entering() -> TestResult {
     let report = write_pages(
         &mut host,
         &endpoint,
-        9600,
+        DEFAULT_BAUD,
         &identity()?,
         &[replacement()?],
         &mut |_page: &PageReplacement| Ok(()),
@@ -265,6 +266,7 @@ async fn cancellation_after_the_open_closes_without_entering() -> TestResult {
 async fn a_backup_session_reads_every_page_and_verifies_the_identity() -> TestResult {
     let mut session = MockTransport::new();
     identify(&mut session, "1.02");
+    session.expect(b"GW\r", b"GW 0\r");
     session.expect(b"0M PROGRAM\r", b"0M\r");
     let pages: Vec<Page> = regions::menu_regions()
         .into_iter()
@@ -274,12 +276,12 @@ async fn a_backup_session_reads_every_page_and_verifies_the_identity() -> TestRe
         read(&mut session, *page, &vec![0xA5; page.len()]);
     }
     session.expect(b"E", &[ACK]);
-    let mut host = Host::new(vec![session, fresh(false)]);
+    let mut host = Host::new(vec![session, fresh(true)]);
     let endpoint = host.endpoint.clone();
     let backup = backup(
         &mut host,
         &endpoint,
-        9600,
+        DEFAULT_BAUD,
         &identity()?,
         &AtomicBool::new(false),
     )
@@ -290,5 +292,84 @@ async fn a_backup_session_reads_every_page_and_verifies_the_identity() -> TestRe
         Some(pages.len())
     );
     assert_eq!(host.opens, 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn backup_rejects_an_unexpected_identity_before_entry() -> TestResult {
+    let mut session = MockTransport::new();
+    identify(&mut session, "1.02");
+    let mut expected = identity()?;
+    expected.firmware = FirmwareIdentity::new("1.03")?;
+    let mut host = Host::new(vec![session]);
+    let endpoint = host.endpoint.clone();
+    let captured = backup(
+        &mut host,
+        &endpoint,
+        DEFAULT_BAUD,
+        &expected,
+        &AtomicBool::new(false),
+    )
+    .await;
+    let report = captured.backup.as_ref().ok_or("missing backup report")?;
+    assert!(
+        matches!(
+            report.outcome,
+            McpBackupOutcome::Failed {
+                stage: McpBackupStage::Identity,
+                error: Error::IdentityMismatch { .. },
+            }
+        ),
+        "{captured:?}"
+    );
+    assert_eq!(captured.session.exit, SessionExit::NotEntered);
+    assert_eq!(
+        host.opens, 1,
+        "refusal must not open a readiness connection"
+    );
+    assert!(
+        matches!(captured.session.close, Some(Ok(()))),
+        "{captured:?}"
+    );
+    assert!(report.segments.is_empty(), "no MCP page may be read");
+    Ok(())
+}
+
+#[tokio::test]
+async fn backup_rejects_an_active_gateway_before_entry() -> TestResult {
+    let mut session = MockTransport::new();
+    identify(&mut session, "1.02");
+    session.expect(b"GW\r", b"GW 2\r");
+    let mut host = Host::new(vec![session]);
+    let endpoint = host.endpoint.clone();
+    let captured = backup(
+        &mut host,
+        &endpoint,
+        DEFAULT_BAUD,
+        &identity()?,
+        &AtomicBool::new(false),
+    )
+    .await;
+    let report = captured.backup.as_ref().ok_or("missing backup report")?;
+    assert!(
+        matches!(
+            report.outcome,
+            McpBackupOutcome::Failed {
+                stage: McpBackupStage::Gateway,
+                error: Error::GatewayNotOff { .. },
+            }
+        ),
+        "{captured:?}"
+    );
+    assert_eq!(captured.session.exit, SessionExit::NotEntered);
+    assert_eq!(
+        host.opens, 1,
+        "refusal must not open a readiness connection"
+    );
+    assert!(
+        matches!(captured.session.close, Some(Ok(()))),
+        "{captured:?}"
+    );
+    assert!(report.segments.is_empty(), "no MCP page may be read");
     Ok(())
 }

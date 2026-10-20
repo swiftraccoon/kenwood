@@ -1,7 +1,7 @@
 //! Deterministic historical-image preflight tests, with no radio access.
 
 use super::*;
-use crate::memory::FieldValue;
+use kenwood_schema::FieldValue;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 

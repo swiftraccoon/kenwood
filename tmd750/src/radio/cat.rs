@@ -13,7 +13,7 @@
 
 use std::time::Duration;
 
-use crate::error::{Error, ProtocolError};
+use crate::error::{CommandName, Error, ProtocolError};
 use crate::protocol::cat::{Command, Response};
 use crate::types::{
     AmHighCut, AprsCallsign, BacklightControl, Band, BandControl, BandDisplay, BeaconMethod,
@@ -54,14 +54,10 @@ impl<T: Transport> Radio<T> {
     ///
     /// See the module contract.
     pub async fn get_serial_information(&mut self) -> Result<SerialInformation, Error> {
-        self.query(
-            Command::SerialInformation,
-            "SerialInformation",
-            |response| match response {
-                Response::SerialInformation(information) => Some(information.clone()),
-                _ => None,
-            },
-        )
+        self.query(Command::SerialInformation, |response| match response {
+            Response::SerialInformation(information) => Some(information.clone()),
+            _ => None,
+        })
         .await
     }
 
@@ -73,14 +69,10 @@ impl<T: Transport> Radio<T> {
     ///
     /// See the module contract.
     pub async fn get_power_status(&mut self) -> Result<bool, Error> {
-        self.query(
-            Command::PowerStatus,
-            "PowerStatus",
-            |response| match response {
-                Response::PowerStatus { on } => Some(*on),
-                _ => None,
-            },
-        )
+        self.query(Command::PowerStatus, |response| match response {
+            Response::PowerStatus { on } => Some(*on),
+            _ => None,
+        })
         .await
     }
 
@@ -90,14 +82,10 @@ impl<T: Transport> Radio<T> {
     ///
     /// See the module contract.
     pub async fn get_real_time_clock(&mut self) -> Result<RealTimeClock, Error> {
-        self.query(
-            Command::RealTimeClock,
-            "RealTimeClock",
-            |response| match response {
-                Response::RealTimeClock(clock) => Some(*clock),
-                _ => None,
-            },
-        )
+        self.query(Command::RealTimeClock, |response| match response {
+            Response::RealTimeClock(clock) => Some(*clock),
+            _ => None,
+        })
         .await
     }
 
@@ -110,7 +98,7 @@ impl<T: Transport> Radio<T> {
     ///
     /// See the module contract.
     pub async fn get_frequency(&mut self, band: Band) -> Result<Frequency, Error> {
-        self.query(Command::GetFrequency { band }, "Frequency", frequency_reply)
+        self.query(Command::GetFrequency { band }, frequency_reply)
             .await
     }
 
@@ -130,11 +118,7 @@ impl<T: Transport> Radio<T> {
     pub async fn set_frequency(&mut self, band: Band, frequency: Frequency) -> Result<(), Error> {
         self.require_write_target().await?;
         let tuned = self
-            .query(
-                Command::SetFrequency { band, frequency },
-                "Frequency",
-                frequency_reply,
-            )
+            .query(Command::SetFrequency { band, frequency }, frequency_reply)
             .await?;
         if tuned != frequency {
             return Err(Error::FrequencyAdjusted {
@@ -143,13 +127,8 @@ impl<T: Transport> Radio<T> {
                 tuned,
             });
         }
-        self.confirm(
-            Command::GetFrequency { band },
-            "Frequency",
-            &frequency,
-            frequency_reply,
-        )
-        .await
+        self.confirm(Command::GetFrequency { band }, &frequency, frequency_reply)
+            .await
     }
 
     /// Read one band's complete channel record (`FO`).
@@ -160,7 +139,6 @@ impl<T: Transport> Radio<T> {
     pub async fn get_channel_record(&mut self, band: Band) -> Result<CatChannelRecord, Error> {
         self.query(
             Command::GetChannelRecord { band },
-            "ChannelRecord",
             |response| match response {
                 Response::ChannelRecord { record, .. } => Some(record.clone()),
                 _ => None,
@@ -198,26 +176,25 @@ impl<T: Transport> Radio<T> {
                     band,
                     record: record.clone(),
                 },
-                "ChannelRecord",
                 extract,
             )
             .await?;
         if echoed != *record {
             return Err(ProtocolError::EchoMismatch {
-                command: "FO",
+                command: CommandName::Fo,
                 requested: record.to_wire_fields(),
                 echoed: echoed.to_wire_fields(),
             }
             .into());
         }
         let observed = self
-            .query(Command::GetChannelRecord { band }, "ChannelRecord", extract)
+            .query(Command::GetChannelRecord { band }, extract)
             .await?;
         if observed == *record {
             Ok(())
         } else {
             Err(ProtocolError::ReadbackMismatch {
-                command: "FO",
+                command: CommandName::Fo,
                 requested: record.to_wire_fields(),
                 observed: observed.to_wire_fields(),
             }
@@ -231,14 +208,10 @@ impl<T: Transport> Radio<T> {
     ///
     /// See the module contract.
     pub async fn get_power_level(&mut self, band: Band) -> Result<PowerLevel, Error> {
-        self.query(
-            Command::GetPowerLevel { band },
-            "PowerLevel",
-            |response| match response {
-                Response::PowerLevel { level, .. } => Some(*level),
-                _ => None,
-            },
-        )
+        self.query(Command::GetPowerLevel { band }, |response| match response {
+            Response::PowerLevel { level, .. } => Some(*level),
+            _ => None,
+        })
         .await
     }
 
@@ -251,7 +224,6 @@ impl<T: Transport> Radio<T> {
         self.apply(
             Command::SetPowerLevel { band, level },
             Command::GetPowerLevel { band },
-            "PowerLevel",
             level,
             |response| match response {
                 Response::PowerLevel { level, .. } => Some(*level),
@@ -267,14 +239,10 @@ impl<T: Transport> Radio<T> {
     ///
     /// See the module contract.
     pub async fn get_tuning_mode(&mut self, band: Band) -> Result<TuningMode, Error> {
-        self.query(
-            Command::GetTuningMode { band },
-            "TuningMode",
-            |response| match response {
-                Response::TuningMode { mode, .. } => Some(*mode),
-                _ => None,
-            },
-        )
+        self.query(Command::GetTuningMode { band }, |response| match response {
+            Response::TuningMode { mode, .. } => Some(*mode),
+            _ => None,
+        })
         .await
     }
 
@@ -294,7 +262,6 @@ impl<T: Transport> Radio<T> {
         self.apply(
             Command::SetTuningMode { band, mode },
             Command::GetTuningMode { band },
-            "TuningMode",
             mode,
             |response| match response {
                 Response::TuningMode { mode, .. } => Some(*mode),
@@ -310,14 +277,10 @@ impl<T: Transport> Radio<T> {
     ///
     /// See the module contract.
     pub async fn get_squelch(&mut self, band: Band) -> Result<SquelchLevel, Error> {
-        self.query(
-            Command::GetSquelch { band },
-            "Squelch",
-            |response| match response {
-                Response::Squelch { level, .. } => Some(*level),
-                _ => None,
-            },
-        )
+        self.query(Command::GetSquelch { band }, |response| match response {
+            Response::Squelch { level, .. } => Some(*level),
+            _ => None,
+        })
         .await
     }
 
@@ -330,7 +293,6 @@ impl<T: Transport> Radio<T> {
         self.apply(
             Command::SetSquelch { band, level },
             Command::GetSquelch { band },
-            "Squelch",
             level,
             |response| match response {
                 Response::Squelch { level, .. } => Some(*level),
@@ -346,14 +308,10 @@ impl<T: Transport> Radio<T> {
     ///
     /// See the module contract.
     pub async fn get_smeter(&mut self, band: Band) -> Result<SMeterReading, Error> {
-        self.query(
-            Command::GetSmeter { band },
-            "Smeter",
-            |response| match response {
-                Response::Smeter { reading, .. } => Some(*reading),
-                _ => None,
-            },
-        )
+        self.query(Command::GetSmeter { band }, |response| match response {
+            Response::Smeter { reading, .. } => Some(*reading),
+            _ => None,
+        })
         .await
     }
 
@@ -363,14 +321,10 @@ impl<T: Transport> Radio<T> {
     ///
     /// See the module contract.
     pub async fn get_busy(&mut self, band: Band) -> Result<bool, Error> {
-        self.query(
-            Command::GetBusy { band },
-            "Busy",
-            |response| match response {
-                Response::Busy { busy, .. } => Some(*busy),
-                _ => None,
-            },
-        )
+        self.query(Command::GetBusy { band }, |response| match response {
+            Response::Busy { busy, .. } => Some(*busy),
+            _ => None,
+        })
         .await
     }
 
@@ -380,14 +334,10 @@ impl<T: Transport> Radio<T> {
     ///
     /// See the module contract.
     pub async fn get_attenuator(&mut self, band: Band) -> Result<bool, Error> {
-        self.query(
-            Command::GetAttenuator { band },
-            "Attenuator",
-            |response| match response {
-                Response::Attenuator { enabled, .. } => Some(*enabled),
-                _ => None,
-            },
-        )
+        self.query(Command::GetAttenuator { band }, |response| match response {
+            Response::Attenuator { enabled, .. } => Some(*enabled),
+            _ => None,
+        })
         .await
     }
 
@@ -400,7 +350,6 @@ impl<T: Transport> Radio<T> {
         self.apply(
             Command::SetAttenuator { band, enabled },
             Command::GetAttenuator { band },
-            "Attenuator",
             enabled,
             |response| match response {
                 Response::Attenuator { enabled, .. } => Some(*enabled),
@@ -416,14 +365,10 @@ impl<T: Transport> Radio<T> {
     ///
     /// See the module contract.
     pub async fn get_step_size(&mut self, band: Band) -> Result<StepSize, Error> {
-        self.query(
-            Command::GetStepSize { band },
-            "StepSize",
-            |response| match response {
-                Response::StepSize { step, .. } => Some(*step),
-                _ => None,
-            },
-        )
+        self.query(Command::GetStepSize { band }, |response| match response {
+            Response::StepSize { step, .. } => Some(*step),
+            _ => None,
+        })
         .await
     }
 
@@ -439,7 +384,6 @@ impl<T: Transport> Radio<T> {
         self.apply(
             Command::SetStepSize { band, step },
             Command::GetStepSize { band },
-            "StepSize",
             step,
             |response| match response {
                 Response::StepSize { step, .. } => Some(*step),
@@ -455,14 +399,10 @@ impl<T: Transport> Radio<T> {
     ///
     /// See the module contract.
     pub async fn get_am_high_cut(&mut self) -> Result<AmHighCut, Error> {
-        self.query(
-            Command::GetAmHighCut,
-            "AmHighCut",
-            |response| match response {
-                Response::AmHighCut(cut) => Some(*cut),
-                _ => None,
-            },
-        )
+        self.query(Command::GetAmHighCut, |response| match response {
+            Response::AmHighCut(cut) => Some(*cut),
+            _ => None,
+        })
         .await
     }
 
@@ -475,7 +415,6 @@ impl<T: Transport> Radio<T> {
         self.apply(
             Command::SetAmHighCut { cut },
             Command::GetAmHighCut,
-            "AmHighCut",
             cut,
             |response| match response {
                 Response::AmHighCut(cut) => Some(*cut),
@@ -533,8 +472,8 @@ impl<T: Transport> Radio<T> {
         if let Some(previous) = self.last_step {
             tokio::time::sleep_until(previous + STEP_SPACING).await;
         }
-        let mnemonic = step.mnemonic();
-        self.query(step, "step acknowledgement", |response| match response {
+        let mnemonic = step.name();
+        self.query(step, |response| match response {
             Response::FrequencyUpAck | Response::FrequencyDownAck => Some(()),
             _ => None,
         })
@@ -573,7 +512,6 @@ impl<T: Transport> Radio<T> {
     ) -> Result<CurrentMemorySelector, Error> {
         self.query(
             Command::GetCurrentChannel { band },
-            "CurrentChannel",
             |response| match response {
                 Response::CurrentChannel(selector) => Some(*selector),
                 _ => None,
@@ -601,7 +539,6 @@ impl<T: Transport> Radio<T> {
         self.require_write_target().await?;
         self.query(
             Command::RecallMemoryChannel { band, address },
-            "MemoryRecallAck",
             |response| match response {
                 Response::MemoryRecallAck { .. } => Some(()),
                 _ => None,
@@ -613,7 +550,7 @@ impl<T: Transport> Radio<T> {
             Ok(())
         } else {
             Err(ProtocolError::ReadbackMismatch {
-                command: "MR",
+                command: CommandName::Mr,
                 requested: address.to_string(),
                 observed: selected.to_string(),
             }
@@ -637,11 +574,11 @@ impl<T: Transport> Radio<T> {
         match self.command(&command).await? {
             Response::NotAvailable => Ok(None),
             Response::Rejected => Err(ProtocolError::Rejected {
-                command: command.mnemonic(),
+                command: command.name(),
             }
             .into()),
             Response::MemoryChannel { record, .. } => Ok(Some(record)),
-            other => Err(super::unexpected("MemoryChannel", &other)),
+            other => Err(super::unexpected(CommandName::Me, &other)),
         }
     }
 
@@ -678,24 +615,19 @@ impl<T: Transport> Radio<T> {
                     address,
                     record: record.clone(),
                 },
-                "MemoryChannel",
                 extract,
             )
             .await?;
         if echoed != record {
             return Err(ProtocolError::EchoMismatch {
-                command: "ME",
+                command: CommandName::Me,
                 requested: record.to_wire_fields(),
                 echoed: echoed.to_wire_fields(),
             }
             .into());
         }
         let observed = self
-            .query(
-                Command::GetMemoryChannel { address },
-                "MemoryChannel",
-                extract,
-            )
+            .query(Command::GetMemoryChannel { address }, extract)
             .await?;
         let mut expected = record;
         if expected.channel.ur_call.as_str().is_empty() {
@@ -705,7 +637,7 @@ impl<T: Transport> Radio<T> {
             Ok(observed)
         } else {
             Err(ProtocolError::ReadbackMismatch {
-                command: "ME",
+                command: CommandName::Me,
                 requested: expected.to_wire_fields(),
                 observed: observed.to_wire_fields(),
             }
@@ -731,7 +663,6 @@ impl<T: Transport> Radio<T> {
         self.require_write_target().await?;
         self.query(
             Command::ClearMemoryChannel { address },
-            "MemoryChannelCleared",
             |response| match response {
                 Response::MemoryChannelCleared { .. } => Some(()),
                 _ => None,
@@ -742,10 +673,10 @@ impl<T: Transport> Radio<T> {
         match self.command(&readback).await? {
             Response::NotAvailable => Ok(()),
             Response::Rejected => Err(ProtocolError::Rejected {
-                command: readback.mnemonic(),
+                command: readback.name(),
             }
             .into()),
-            other => Err(super::unexpected("empty channel readback", &other)),
+            other => Err(super::unexpected(CommandName::Me, &other)),
         }
     }
 
@@ -766,7 +697,6 @@ impl<T: Transport> Radio<T> {
     ) -> Result<DstarCallsignEntry, Error> {
         self.query(
             Command::GetDstarCallsign { slot },
-            "DstarCallsign",
             |response| match response {
                 Response::DstarCallsign(entry) => Some(entry.clone()),
                 _ => None,
@@ -791,7 +721,6 @@ impl<T: Transport> Radio<T> {
                 entry: entry.clone(),
             },
             Command::GetDstarCallsign { slot: entry.slot },
-            "DstarCallsign",
             entry.clone(),
             |response| match response {
                 Response::DstarCallsign(entry) => Some(entry.clone()),
@@ -820,14 +749,10 @@ impl<T: Transport> Radio<T> {
     ///
     /// See the module contract.
     pub async fn get_band_control(&mut self) -> Result<BandControl, Error> {
-        self.query(
-            Command::GetBandControl,
-            "BandControl",
-            |response| match response {
-                Response::BandControl(roles) => Some(*roles),
-                _ => None,
-            },
-        )
+        self.query(Command::GetBandControl, |response| match response {
+            Response::BandControl(roles) => Some(*roles),
+            _ => None,
+        })
         .await
     }
 
@@ -840,7 +765,6 @@ impl<T: Transport> Radio<T> {
         self.apply(
             Command::SetBandControl { roles },
             Command::GetBandControl,
-            "BandControl",
             roles,
             |response| match response {
                 Response::BandControl(roles) => Some(*roles),
@@ -856,14 +780,10 @@ impl<T: Transport> Radio<T> {
     ///
     /// See the module contract.
     pub async fn get_band_display(&mut self) -> Result<BandDisplay, Error> {
-        self.query(
-            Command::GetBandDisplay,
-            "BandDisplay",
-            |response| match response {
-                Response::BandDisplay(display) => Some(*display),
-                _ => None,
-            },
-        )
+        self.query(Command::GetBandDisplay, |response| match response {
+            Response::BandDisplay(display) => Some(*display),
+            _ => None,
+        })
         .await
     }
 
@@ -876,7 +796,6 @@ impl<T: Transport> Radio<T> {
         self.apply(
             Command::SetBandDisplay { display },
             Command::GetBandDisplay,
-            "BandDisplay",
             display,
             |response| match response {
                 Response::BandDisplay(display) => Some(*display),
@@ -895,14 +814,10 @@ impl<T: Transport> Radio<T> {
     ///
     /// See the module contract.
     pub async fn get_dstar_slot(&mut self) -> Result<DstarSlot, Error> {
-        self.query(
-            Command::GetDstarSlot,
-            "DstarSlot",
-            |response| match response {
-                Response::DstarSlot(slot) => Some(*slot),
-                _ => None,
-            },
-        )
+        self.query(Command::GetDstarSlot, |response| match response {
+            Response::DstarSlot(slot) => Some(*slot),
+            _ => None,
+        })
         .await
     }
 
@@ -917,7 +832,6 @@ impl<T: Transport> Radio<T> {
         self.apply(
             Command::SetDstarSlot { slot },
             Command::GetDstarSlot,
-            "DstarSlot",
             slot,
             |response| match response {
                 Response::DstarSlot(slot) => Some(*slot),
@@ -933,14 +847,10 @@ impl<T: Transport> Radio<T> {
     ///
     /// See the module contract.
     pub async fn get_backlight_control(&mut self) -> Result<BacklightControl, Error> {
-        self.query(
-            Command::GetBacklightControl,
-            "BacklightControl",
-            |response| match response {
-                Response::BacklightControl(control) => Some(*control),
-                _ => None,
-            },
-        )
+        self.query(Command::GetBacklightControl, |response| match response {
+            Response::BacklightControl(control) => Some(*control),
+            _ => None,
+        })
         .await
     }
 
@@ -953,7 +863,6 @@ impl<T: Transport> Radio<T> {
         self.apply(
             Command::SetBacklightControl { control },
             Command::GetBacklightControl,
-            "BacklightControl",
             control,
             |response| match response {
                 Response::BacklightControl(control) => Some(*control),
@@ -969,14 +878,10 @@ impl<T: Transport> Radio<T> {
     ///
     /// See the module contract.
     pub async fn get_my_position_selection(&mut self) -> Result<MyPositionSelection, Error> {
-        self.query(
-            Command::GetMyPositionSelection,
-            "MyPositionSelection",
-            |response| match response {
-                Response::MyPositionSelection(selection) => Some(*selection),
-                _ => None,
-            },
-        )
+        self.query(Command::GetMyPositionSelection, |response| match response {
+            Response::MyPositionSelection(selection) => Some(*selection),
+            _ => None,
+        })
         .await
     }
 
@@ -992,7 +897,6 @@ impl<T: Transport> Radio<T> {
         self.apply(
             Command::SetMyPositionSelection { selection },
             Command::GetMyPositionSelection,
-            "MyPositionSelection",
             selection,
             |response| match response {
                 Response::MyPositionSelection(selection) => Some(*selection),
@@ -1008,14 +912,10 @@ impl<T: Transport> Radio<T> {
     ///
     /// See the module contract.
     pub async fn get_packet_data_rate(&mut self) -> Result<PacketDataRate, Error> {
-        self.query(
-            Command::GetPacketDataRate,
-            "PacketDataRate",
-            |response| match response {
-                Response::PacketDataRate(rate) => Some(*rate),
-                _ => None,
-            },
-        )
+        self.query(Command::GetPacketDataRate, |response| match response {
+            Response::PacketDataRate(rate) => Some(*rate),
+            _ => None,
+        })
         .await
     }
 
@@ -1028,7 +928,6 @@ impl<T: Transport> Radio<T> {
         self.apply(
             Command::SetPacketDataRate { rate },
             Command::GetPacketDataRate,
-            "PacketDataRate",
             rate,
             |response| match response {
                 Response::PacketDataRate(rate) => Some(*rate),
@@ -1044,14 +943,10 @@ impl<T: Transport> Radio<T> {
     ///
     /// See the module contract.
     pub async fn get_beacon_method(&mut self) -> Result<BeaconMethod, Error> {
-        self.query(
-            Command::GetBeaconMethod,
-            "BeaconMethod",
-            |response| match response {
-                Response::BeaconMethod(method) => Some(*method),
-                _ => None,
-            },
-        )
+        self.query(Command::GetBeaconMethod, |response| match response {
+            Response::BeaconMethod(method) => Some(*method),
+            _ => None,
+        })
         .await
     }
 
@@ -1067,7 +962,6 @@ impl<T: Transport> Radio<T> {
         self.apply(
             Command::SetBeaconMethod { method },
             Command::GetBeaconMethod,
-            "BeaconMethod",
             method,
             |response| match response {
                 Response::BeaconMethod(method) => Some(*method),
@@ -1085,14 +979,10 @@ impl<T: Transport> Radio<T> {
     ///
     /// See the module contract.
     pub async fn get_aprs_callsign(&mut self) -> Result<AprsCallsign, Error> {
-        self.query(
-            Command::GetAprsCallsign,
-            "AprsCallsign",
-            |response| match response {
-                Response::AprsCallsign(callsign) => Some(callsign.clone()),
-                _ => None,
-            },
-        )
+        self.query(Command::GetAprsCallsign, |response| match response {
+            Response::AprsCallsign(callsign) => Some(callsign.clone()),
+            _ => None,
+        })
         .await
     }
 
@@ -1112,7 +1002,6 @@ impl<T: Transport> Radio<T> {
                 callsign: callsign.clone(),
             },
             Command::GetAprsCallsign,
-            "AprsCallsign",
             callsign.clone(),
             |response| match response {
                 Response::AprsCallsign(callsign) => Some(callsign.clone()),
@@ -1128,7 +1017,7 @@ impl<T: Transport> Radio<T> {
     ///
     /// See the module contract.
     pub async fn get_tnc_mode(&mut self) -> Result<TncState, Error> {
-        self.query(Command::GetTncMode, "TncMode", super::transmit::tnc_reply)
+        self.query(Command::GetTncMode, super::transmit::tnc_reply)
             .await
     }
 
@@ -1138,14 +1027,10 @@ impl<T: Transport> Radio<T> {
     ///
     /// See the module contract.
     pub async fn get_vox_delay(&mut self) -> Result<VoxDelay, Error> {
-        self.query(
-            Command::GetVoxDelay,
-            "VoxDelay",
-            |response| match response {
-                Response::VoxDelay(delay) => Some(*delay),
-                _ => None,
-            },
-        )
+        self.query(Command::GetVoxDelay, |response| match response {
+            Response::VoxDelay(delay) => Some(*delay),
+            _ => None,
+        })
         .await
     }
 
@@ -1158,7 +1043,6 @@ impl<T: Transport> Radio<T> {
         self.apply(
             Command::SetVoxDelay { delay },
             Command::GetVoxDelay,
-            "VoxDelay",
             delay,
             |response| match response {
                 Response::VoxDelay(delay) => Some(*delay),
@@ -1174,7 +1058,7 @@ impl<T: Transport> Radio<T> {
     ///
     /// See the module contract.
     pub async fn get_vox_gain(&mut self) -> Result<VoxGain, Error> {
-        self.query(Command::GetVoxGain, "VoxGain", |response| match response {
+        self.query(Command::GetVoxGain, |response| match response {
             Response::VoxGain(gain) => Some(*gain),
             _ => None,
         })
@@ -1190,7 +1074,6 @@ impl<T: Transport> Radio<T> {
         self.apply(
             Command::SetVoxGain { gain },
             Command::GetVoxGain,
-            "VoxGain",
             gain,
             |response| match response {
                 Response::VoxGain(gain) => Some(*gain),
@@ -1208,7 +1091,7 @@ impl<T: Transport> Radio<T> {
     ///
     /// See the module contract.
     pub async fn get_vox(&mut self) -> Result<VoxMode, Error> {
-        self.query(Command::GetVox, "Vox", |response| match response {
+        self.query(Command::GetVox, |response| match response {
             Response::Vox(mode) => Some(*mode),
             _ => None,
         })
@@ -1221,14 +1104,10 @@ impl<T: Transport> Radio<T> {
     ///
     /// See the module contract.
     pub async fn get_gps_settings(&mut self) -> Result<GpsSettings, Error> {
-        self.query(
-            Command::GetGpsSettings,
-            "GpsSettings",
-            |response| match response {
-                Response::GpsSettings(settings) => Some(*settings),
-                _ => None,
-            },
-        )
+        self.query(Command::GetGpsSettings, |response| match response {
+            Response::GpsSettings(settings) => Some(*settings),
+            _ => None,
+        })
         .await
     }
 
@@ -1243,7 +1122,6 @@ impl<T: Transport> Radio<T> {
         self.apply(
             Command::SetGpsSettings { settings },
             Command::GetGpsSettings,
-            "GpsSettings",
             settings,
             |response| match response {
                 Response::GpsSettings(settings) => Some(*settings),
@@ -1259,14 +1137,10 @@ impl<T: Transport> Radio<T> {
     ///
     /// See the module contract.
     pub async fn get_gps_sentences(&mut self) -> Result<NmeaSentences, Error> {
-        self.query(
-            Command::GetGpsSentences,
-            "GpsSentences",
-            |response| match response {
-                Response::GpsSentences(sentences) => Some(*sentences),
-                _ => None,
-            },
-        )
+        self.query(Command::GetGpsSentences, |response| match response {
+            Response::GpsSentences(sentences) => Some(*sentences),
+            _ => None,
+        })
         .await
     }
 
@@ -1279,7 +1153,6 @@ impl<T: Transport> Radio<T> {
         self.apply(
             Command::SetGpsSentences { sentences },
             Command::GetGpsSentences,
-            "GpsSentences",
             sentences,
             |response| match response {
                 Response::GpsSentences(sentences) => Some(*sentences),
@@ -1295,14 +1168,10 @@ impl<T: Transport> Radio<T> {
     ///
     /// See the module contract.
     pub async fn get_bluetooth(&mut self) -> Result<bool, Error> {
-        self.query(
-            Command::GetBluetooth,
-            "Bluetooth",
-            |response| match response {
-                Response::Bluetooth { enabled } => Some(*enabled),
-                _ => None,
-            },
-        )
+        self.query(Command::GetBluetooth, |response| match response {
+            Response::Bluetooth { enabled } => Some(*enabled),
+            _ => None,
+        })
         .await
     }
 
@@ -1319,7 +1188,6 @@ impl<T: Transport> Radio<T> {
         self.apply(
             Command::SetBluetooth { enabled },
             Command::GetBluetooth,
-            "Bluetooth",
             enabled,
             |response| match response {
                 Response::Bluetooth { enabled } => Some(*enabled),

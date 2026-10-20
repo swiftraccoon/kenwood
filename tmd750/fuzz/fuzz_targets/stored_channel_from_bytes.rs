@@ -1,4 +1,5 @@
 #![no_main]
+//! Checks byte-preserving decoding of stored channels and their flags.
 
 use kenwood_tmd750::types::{StoredChannel, StoredChannelFlag};
 use libfuzzer_sys::fuzz_target;

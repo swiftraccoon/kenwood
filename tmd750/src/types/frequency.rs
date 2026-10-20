@@ -21,6 +21,8 @@ pub const WIRE_DIGITS: usize = 10;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Frequency(u32);
 
+checked_integer_traits!(Frequency, u32, as_hz);
+
 impl Frequency {
     /// Lowest receivable frequency, 108 MHz.
     pub const MIN_HZ: u32 = 108_000_000;
@@ -131,6 +133,8 @@ impl fmt::Display for Frequency {
 /// A repeater offset in hertz, 0 through 29.95 MHz (User Manual, Menu 140).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct OffsetFrequency(u32);
+
+checked_integer_traits!(OffsetFrequency, u32, as_hz);
 
 impl OffsetFrequency {
     /// Largest configurable offset, 29.95 MHz.

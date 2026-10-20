@@ -2,7 +2,6 @@
 //!
 //! This compares two committed artifacts; no radio is involved.
 
-use kenwood_schema as _;
 use kenwood_transport as _;
 use mmdvm as _;
 use proptest as _;
@@ -13,15 +12,16 @@ use tracing as _;
 
 use std::collections::BTreeMap;
 
+use kenwood_schema::{CodecSpec, Endian, FieldCodec, StringEncoding};
 use kenwood_tmd750::MenuAssignment;
 use kenwood_tmd750::memory::{
-    Endian, FieldCodec, MCP_D750_MENU_FIELDS, MCP_D750_PROGRAM_VERSION, MCP_D750_SCHEMA_VERSION,
-    MCP_D750_SLOT_COUNT, MCP_D750_SOURCE_SHA256, MenuField, MenuFieldId, StringEncoding,
+    MCP_D750_MENU_FIELDS, MCP_D750_PROGRAM_VERSION, MCP_D750_SCHEMA_VERSION, MCP_D750_SLOT_COUNT,
+    MCP_D750_SOURCE_SHA256, MenuField, MenuFieldId,
 };
 use kenwood_tmd750::types::{IMAGE_LENGTH, SlotIndex};
 use mcp_d75_extract::{
-    Address, Codec, Domain, EnumOption, Manifest, Menu, RecordEntry, Role, StorageTransform,
-    parse_manifest,
+    Address, Codec, Domain, EnumOption, FieldCategory, Manifest, Menu, RecordEntry, Role,
+    StorageTransform, TextEncoding, TransformKind, ValueType,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -29,7 +29,7 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 const MANIFEST: &str = include_str!("../data/mcp_d750_menu_schema.json");
 
 fn manifest() -> TestResult<Manifest> {
-    Ok(parse_manifest(MANIFEST)?)
+    Ok(Manifest::from_json(MANIFEST)?)
 }
 
 struct Expected<'a> {
@@ -98,20 +98,20 @@ impl Expected<'_> {
         let width = u8::try_from(width)?;
         if signed {
             let (minimum, maximum) = self.bounds((-capacity / 2, capacity / 2 - 1))?;
-            Ok(FieldCodec::Signed {
+            Ok(FieldCodec::new(CodecSpec::Signed {
                 width,
                 endian: Endian::Little,
                 min: i64::try_from(minimum)?,
                 max: i64::try_from(maximum)?,
-            })
+            })?)
         } else {
             let (minimum, maximum) = self.bounds((0, capacity - 1))?;
-            Ok(FieldCodec::Unsigned {
+            Ok(FieldCodec::new(CodecSpec::Unsigned {
                 width,
                 endian: Endian::Little,
                 min: u64::try_from(minimum)?,
                 max: u64::try_from(maximum)?,
-            })
+            })?)
         }
     }
 
@@ -119,9 +119,9 @@ impl Expected<'_> {
         Ok(match self.codec {
             Codec::Byte { .. } => {
                 let (min, max) = self.byte_bounds(u8::MAX)?;
-                FieldCodec::Byte { min, max }
+                FieldCodec::new(CodecSpec::Byte { min, max })?
             }
-            Codec::Bool { .. } => FieldCodec::Bool,
+            Codec::Bool { .. } => FieldCodec::BOOL,
             Codec::BitField {
                 bit,
                 width,
@@ -134,17 +134,17 @@ impl Expected<'_> {
                 );
                 let capacity = u8::try_from((1_u16 << *width) - 1)?;
                 let mask = capacity << *bit;
-                if value_type == "bool" {
+                if *value_type == ValueType::Bool {
                     assert_eq!(*width, 1, "a bit boolean owns exactly one bit");
-                    FieldCodec::BitBool { mask }
+                    FieldCodec::new(CodecSpec::BitBool { mask })?
                 } else {
                     let (min, max) = self.byte_bounds(capacity)?;
-                    FieldCodec::BitField {
+                    FieldCodec::new(CodecSpec::BitField {
                         mask,
                         shift: u8::try_from(*bit)?,
                         min,
                         max,
-                    }
+                    })?
                 }
             }
             Codec::UnsignedLe { width, .. } => self.integer_codec(*width, false)?,
@@ -155,20 +155,19 @@ impl Expected<'_> {
                 padding,
                 ..
             } => {
-                let encoding = match encoding.as_str() {
-                    "utf8" => StringEncoding::Utf8,
-                    "memory_map" => StringEncoding::MemoryMap,
-                    other => return Err(format!("unsupported text encoding {other}").into()),
+                let encoding = match encoding {
+                    TextEncoding::Utf8 => StringEncoding::Utf8,
+                    TextEncoding::MemoryMap => StringEncoding::MemoryMap,
                 };
-                FieldCodec::FixedString {
+                FieldCodec::new(CodecSpec::FixedString {
                     len: usize::try_from(*length)?,
                     encoding,
                     padding: u8::try_from(*padding)?,
-                }
+                })?
             }
-            Codec::RawBytes { length, .. } => FieldCodec::Bytes {
+            Codec::RawBytes { length, .. } => FieldCodec::new(CodecSpec::Bytes {
                 len: usize::try_from(length.ok_or("raw-byte length missing")?)?,
-            },
+            })?,
             Codec::ClearRange { .. } => {
                 return Err("a clear operation must not become a registry field".into());
             }
@@ -178,7 +177,7 @@ impl Expected<'_> {
 
 fn expected_fields(manifest: &Manifest) -> TestResult<BTreeMap<String, Expected<'_>>> {
     let mut expected = BTreeMap::new();
-    for menu in &manifest.menus {
+    for menu in manifest.menus() {
         for operation in &menu.operations {
             if operation.role != Role::Field || operation.writable == Some(false) {
                 continue;
@@ -193,7 +192,7 @@ fn expected_fields(manifest: &Manifest) -> TestResult<BTreeMap<String, Expected<
                     codec: &operation.codec,
                     domain: operation.domain.as_ref(),
                     transform: None,
-                    blob: operation.category.as_deref() == Some("blob"),
+                    blob: operation.category == Some(FieldCategory::Blob),
                 },
             );
             assert!(previous.is_none(), "duplicate manifest field {name}");
@@ -306,14 +305,15 @@ fn assert_field(name: &str, field: &MenuField, expected: &Expected<'_>) -> TestR
     assert_options(name, field, expected)?;
     let transform = field.storage_transform.map(|transform| {
         (
-            transform.input_unit,
-            transform.numerator,
-            transform.denominator,
+            transform.input_unit(),
+            i64::from(transform.numerator()),
+            i64::from(transform.denominator()),
         )
     });
     let expected_transform = expected.transform.map(|transform| {
         assert_eq!(
-            transform.kind, "scaled_integer",
+            transform.kind,
+            TransformKind::ScaledInteger,
             "{name} storage transform kind"
         );
         (
@@ -363,26 +363,28 @@ fn every_manifest_field_matches_its_registry_entry() -> TestResult {
     let manifest = manifest()?;
     assert_eq!(
         u64::from(MCP_D750_SCHEMA_VERSION),
-        manifest.schema_version,
+        manifest.schema_version(),
         "registry schema version must match the manifest"
     );
     assert_eq!(
-        MCP_D750_PROGRAM_VERSION, manifest.release.mcp_version,
+        MCP_D750_PROGRAM_VERSION,
+        manifest.release().mcp_version,
         "the registry's program version must match the manifest release"
     );
     assert_eq!(
-        MCP_D750_SOURCE_SHA256, manifest.source.normalized_source_sha256,
+        MCP_D750_SOURCE_SHA256,
+        manifest.source().normalized_source_sha256,
         "registry provenance must match the reviewed source manifest"
     );
     assert_eq!(
         u64::try_from(IMAGE_LENGTH)?,
-        manifest.model.image_length,
+        manifest.model().image_length,
         "registry and manifest image lengths must match"
     );
     let expected = expected_fields(&manifest)?;
     assert_eq!(
         u64::try_from(expected.len())?,
-        manifest.summary.writable_registry_field_count,
+        manifest.summary().writable_registry_field_count,
         "all and only writable manifest fields must be represented"
     );
     let registry: BTreeMap<&str, &MenuField> = MCP_D750_MENU_FIELDS

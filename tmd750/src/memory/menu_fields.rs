@@ -8,7 +8,17 @@
 //! [`MenuUpdatePlan`](crate::radio::menu::MenuUpdatePlan) accepts only
 //! ordinary entries.
 
-use super::schema::{Endian, FieldCodec, FieldDescriptor, StringEncoding, Term};
+use kenwood_schema::{CodecSpec, Endian, FieldCodec, StringEncoding};
+
+use super::schema::{FieldDescriptor, Term};
+
+/// Validate a codec specification in a registry initializer.
+const fn field_codec(spec: CodecSpec) -> FieldCodec {
+    match FieldCodec::new(spec) {
+        Ok(codec) => codec,
+        Err(_) => unreachable!(),
+    }
+}
 
 /// Manifest format version used to generate this registry.
 pub const MCP_D750_SCHEMA_VERSION: u32 = 4;
@@ -35,15 +45,47 @@ pub struct MenuOption {
     pub resource_key: Option<&'static str>,
 }
 
-/// Optional scaling between a display value and its stored integer.
+/// Positive scaling between a display value and its stored integer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StorageTransform {
+    input_unit: &'static str,
+    numerator: u32,
+    denominator: u32,
+}
+
+impl StorageTransform {
+    /// Construct positive scaling with a nonempty display unit.
+    ///
+    /// Returns `None` for an empty unit or either zero ratio term.
+    #[must_use]
+    pub const fn new(input_unit: &'static str, numerator: u32, denominator: u32) -> Option<Self> {
+        if input_unit.is_empty() || numerator == 0 || denominator == 0 {
+            return None;
+        }
+        Some(Self {
+            input_unit,
+            numerator,
+            denominator,
+        })
+    }
+
     /// Unit accepted by the documented transform.
-    pub input_unit: &'static str,
-    /// Encoding multiplier before rounding.
-    pub numerator: i64,
-    /// Encoding divisor before rounding.
-    pub denominator: i64,
+    #[must_use]
+    pub const fn input_unit(self) -> &'static str {
+        self.input_unit
+    }
+
+    /// Positive encoding multiplier before rounding.
+    #[must_use]
+    pub const fn numerator(self) -> u32 {
+        self.numerator
+    }
+
+    /// Positive encoding divisor before rounding.
+    #[must_use]
+    pub const fn denominator(self) -> u32 {
+        self.denominator
+    }
 }
 
 /// Storage metadata for one public MCP-D750 menu or repeated-record field.
@@ -4385,10 +4427,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
         descriptor: FieldDescriptor::new(
             "radio.RepeaterMode",
             0x4F001,
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 2,
-            }
+            })
         ),
         options: OPTIONS_RADIO_050,
         allowed_values: &[],
@@ -4401,7 +4443,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
         descriptor: FieldDescriptor::new(
             "radio.RepeaterTxHold",
             0x4F003,
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -4414,11 +4456,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
         descriptor: FieldDescriptor::new(
             "radio.RepeaterId",
             0x4F05A,
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 12,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -4431,10 +4473,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
         descriptor: FieldDescriptor::new(
             "radio.RepeaterIdTx",
             0x4F004,
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 2,
-            }
+            })
         ),
         options: OPTIONS_RADIO_051,
         allowed_values: &[],
@@ -4447,10 +4489,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
         descriptor: FieldDescriptor::new(
             "radio.RepeaterIdVoice",
             0x4F005,
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 3,
-            }
+            })
         ),
         options: OPTIONS_RADIO_011,
         allowed_values: &[],
@@ -4463,11 +4505,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
         descriptor: FieldDescriptor::new(
             "radio.RemoteContorolCode",
             0x1080,
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 3,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -4480,10 +4522,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
         descriptor: FieldDescriptor::new(
             "radio.Language",
             0x1092,
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 1,
-            }
+            })
         ),
         options: OPTIONS_RADIO_037,
         allowed_values: &[],
@@ -4502,9 +4544,9 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 256_000,
                 },
             ],
-            FieldCodec::Bytes {
+            field_codec(CodecSpec::Bytes {
                 len: 256_000,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -4523,11 +4565,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 16,
                 encoding: StringEncoding::MemoryMap,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -4546,10 +4588,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 3,
-            }
+            })
         ),
         options: OPTIONS_RADIO_013,
         allowed_values: &[],
@@ -4568,10 +4610,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 2,
-            }
+            })
         ),
         options: OPTIONS_RADIO_014,
         allowed_values: &[],
@@ -4590,10 +4632,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 1,
-            }
+            })
         ),
         options: OPTIONS_RADIO_015,
         allowed_values: &[],
@@ -4612,10 +4654,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 1,
-            }
+            })
         ),
         options: OPTIONS_RADIO_016,
         allowed_values: &[],
@@ -4634,9 +4676,9 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitBool {
+            field_codec(CodecSpec::BitBool {
                 mask: 0x02,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -4655,9 +4697,9 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitBool {
+            field_codec(CodecSpec::BitBool {
                 mask: 0x04,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -4676,9 +4718,9 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitBool {
+            field_codec(CodecSpec::BitBool {
                 mask: 0x01,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -4697,10 +4739,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 12,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -4719,10 +4761,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 12,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -4741,10 +4783,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 12,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -4763,10 +4805,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 12,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -4785,10 +4827,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 18,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -4807,10 +4849,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 18,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -4829,10 +4871,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 18,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -4851,10 +4893,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 18,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -4873,10 +4915,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 18,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -4895,10 +4937,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 6,
-            }
+            })
         ),
         options: OPTIONS_RADIO_017,
         allowed_values: &[],
@@ -4917,10 +4959,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 1,
-            }
+            })
         ),
         options: OPTIONS_RADIO_018,
         allowed_values: &[],
@@ -4939,7 +4981,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -4958,10 +5000,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 6,
-            }
+            })
         ),
         options: OPTIONS_RADIO_019,
         allowed_values: &[],
@@ -4980,10 +5022,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 3,
-            }
+            })
         ),
         options: OPTIONS_RADIO_020,
         allowed_values: &[],
@@ -5002,10 +5044,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 6,
-            }
+            })
         ),
         options: OPTIONS_RADIO_021,
         allowed_values: &[],
@@ -5024,10 +5066,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 3,
-            }
+            })
         ),
         options: OPTIONS_RADIO_022,
         allowed_values: &[],
@@ -5046,10 +5088,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 2,
-            }
+            })
         ),
         options: OPTIONS_RADIO_023,
         allowed_values: &[],
@@ -5068,7 +5110,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -5087,11 +5129,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 19,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -5110,7 +5152,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -5129,10 +5171,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 32,
-            }
+            })
         ),
         options: OPTIONS_RADIO_024,
         allowed_values: &[],
@@ -5151,10 +5193,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 32,
-            }
+            })
         ),
         options: OPTIONS_RADIO_024,
         allowed_values: &[],
@@ -5173,10 +5215,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 1,
-            }
+            })
         ),
         options: OPTIONS_RADIO_026,
         allowed_values: &[],
@@ -5195,10 +5237,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 53,
-            }
+            })
         ),
         options: OPTIONS_RADIO_025,
         allowed_values: &[],
@@ -5217,10 +5259,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 53,
-            }
+            })
         ),
         options: OPTIONS_RADIO_025,
         allowed_values: &[],
@@ -5239,10 +5281,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 53,
-            }
+            })
         ),
         options: OPTIONS_RADIO_025,
         allowed_values: &[],
@@ -5261,10 +5303,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 53,
-            }
+            })
         ),
         options: OPTIONS_RADIO_025,
         allowed_values: &[],
@@ -5283,10 +5325,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 3,
-            }
+            })
         ),
         options: OPTIONS_RADIO_027,
         allowed_values: &[],
@@ -5305,7 +5347,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -5324,10 +5366,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -5346,7 +5388,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -5365,11 +5407,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 50,
                 encoding: StringEncoding::MemoryMap,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -5388,9 +5430,9 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitBool {
+            field_codec(CodecSpec::BitBool {
                 mask: 0x01,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -5409,9 +5451,9 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitBool {
+            field_codec(CodecSpec::BitBool {
                 mask: 0x02,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -5430,7 +5472,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -5449,7 +5491,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -5468,10 +5510,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 2,
-            }
+            })
         ),
         options: OPTIONS_RADIO_028,
         allowed_values: &[],
@@ -5490,10 +5532,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 1,
-            }
+            })
         ),
         options: OPTIONS_RADIO_029,
         allowed_values: &[],
@@ -5512,10 +5554,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 1,
-            }
+            })
         ),
         options: OPTIONS_RADIO_030,
         allowed_values: &[],
@@ -5534,10 +5576,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 1,
-            }
+            })
         ),
         options: OPTIONS_RADIO_031,
         allowed_values: &[],
@@ -5556,10 +5598,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 2,
-            }
+            })
         ),
         options: OPTIONS_RADIO_032,
         allowed_values: &[],
@@ -5578,10 +5620,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 1,
-            }
+            })
         ),
         options: OPTIONS_RADIO_033,
         allowed_values: &[],
@@ -5600,10 +5642,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 2,
-            }
+            })
         ),
         options: OPTIONS_RADIO_034,
         allowed_values: &[],
@@ -5622,10 +5664,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 2,
-            }
+            })
         ),
         options: OPTIONS_RADIO_001,
         allowed_values: &[],
@@ -5644,10 +5686,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 2,
-            }
+            })
         ),
         options: OPTIONS_RADIO_002,
         allowed_values: &[],
@@ -5666,10 +5708,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 2,
-            }
+            })
         ),
         options: OPTIONS_RADIO_003,
         allowed_values: &[],
@@ -5688,10 +5730,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 2,
-            }
+            })
         ),
         options: OPTIONS_RADIO_004,
         allowed_values: &[],
@@ -5710,10 +5752,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 2,
-            }
+            })
         ),
         options: OPTIONS_RADIO_005,
         allowed_values: &[],
@@ -5732,10 +5774,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 1,
-            }
+            })
         ),
         options: OPTIONS_RADIO_006,
         allowed_values: &[],
@@ -5754,10 +5796,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 1,
-            }
+            })
         ),
         options: OPTIONS_RADIO_007,
         allowed_values: &[],
@@ -5776,10 +5818,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 1,
                 max: 9,
-            }
+            })
         ),
         options: OPTIONS_RADIO_008,
         allowed_values: &[],
@@ -5798,10 +5840,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 1,
                 max: 7,
-            }
+            })
         ),
         options: OPTIONS_RADIO_009,
         allowed_values: &[],
@@ -5820,10 +5862,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 5,
-            }
+            })
         ),
         options: OPTIONS_RADIO_010,
         allowed_values: &[],
@@ -5842,10 +5884,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 1,
-            }
+            })
         ),
         options: OPTIONS_RADIO_036,
         allowed_values: &[],
@@ -5864,10 +5906,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 5,
-            }
+            })
         ),
         options: OPTIONS_RADIO_038,
         allowed_values: &[],
@@ -5886,10 +5928,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 7,
-            }
+            })
         ),
         options: OPTIONS_RADIO_000,
         allowed_values: &[],
@@ -5908,7 +5950,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -5927,7 +5969,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -5946,10 +5988,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 3,
-            }
+            })
         ),
         options: OPTIONS_RADIO_035,
         allowed_values: &[],
@@ -5968,10 +6010,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 5,
-            }
+            })
         ),
         options: OPTIONS_RADIO_039,
         allowed_values: &[],
@@ -5990,7 +6032,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -6009,10 +6051,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 1,
-            }
+            })
         ),
         options: OPTIONS_RADIO_040,
         allowed_values: &[],
@@ -6031,7 +6073,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -6050,10 +6092,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 10,
-            }
+            })
         ),
         options: OPTIONS_RADIO_041,
         allowed_values: &[],
@@ -6072,10 +6114,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 2,
-            }
+            })
         ),
         options: OPTIONS_RADIO_042,
         allowed_values: &[],
@@ -6094,7 +6136,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -6113,10 +6155,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 3,
-            }
+            })
         ),
         options: OPTIONS_RADIO_043,
         allowed_values: &[],
@@ -6135,10 +6177,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 2,
-            }
+            })
         ),
         options: OPTIONS_RADIO_044,
         allowed_values: &[],
@@ -6157,10 +6199,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 2,
-            }
+            })
         ),
         options: OPTIONS_RADIO_045,
         allowed_values: &[],
@@ -6179,10 +6221,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 1,
                 max: 10,
-            }
+            })
         ),
         options: OPTIONS_RADIO_046,
         allowed_values: &[],
@@ -6201,10 +6243,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 1,
                 max: 10,
-            }
+            })
         ),
         options: OPTIONS_RADIO_047,
         allowed_values: &[],
@@ -6223,7 +6265,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -6242,7 +6284,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -6261,10 +6303,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 3,
-            }
+            })
         ),
         options: OPTIONS_RADIO_048,
         allowed_values: &[],
@@ -6283,10 +6325,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 3,
-            }
+            })
         ),
         options: OPTIONS_RADIO_049,
         allowed_values: &[],
@@ -6305,7 +6347,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -6324,7 +6366,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -6343,10 +6385,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 2,
-            }
+            })
         ),
         options: OPTIONS_RADIO_052,
         allowed_values: &[],
@@ -6365,10 +6407,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 9,
-            }
+            })
         ),
         options: OPTIONS_RADIO_053,
         allowed_values: &[],
@@ -6387,10 +6429,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 6,
-            }
+            })
         ),
         options: OPTIONS_RADIO_054,
         allowed_values: &[],
@@ -6409,10 +6451,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 1,
-            }
+            })
         ),
         options: OPTIONS_RADIO_055,
         allowed_values: &[],
@@ -6431,10 +6473,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 2,
-            }
+            })
         ),
         options: OPTIONS_RADIO_056,
         allowed_values: &[],
@@ -6453,10 +6495,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 6,
-            }
+            })
         ),
         options: OPTIONS_RADIO_057,
         allowed_values: &[],
@@ -6475,7 +6517,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -6494,7 +6536,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -6513,10 +6555,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 1,
-            }
+            })
         ),
         options: OPTIONS_RADIO_058,
         allowed_values: &[],
@@ -6535,10 +6577,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -6557,10 +6599,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -6579,10 +6621,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -6601,10 +6643,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -6623,10 +6665,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -6645,10 +6687,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -6667,10 +6709,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -6689,10 +6731,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -6711,10 +6753,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -6733,10 +6775,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -6755,10 +6797,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -6777,10 +6819,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -6799,10 +6841,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -6821,10 +6863,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -6843,10 +6885,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -6865,10 +6907,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -6887,10 +6929,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -6909,10 +6951,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -6931,10 +6973,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -6953,10 +6995,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -6975,10 +7017,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -6997,10 +7039,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -7019,10 +7061,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -7041,10 +7083,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -7063,10 +7105,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -7085,10 +7127,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -7107,10 +7149,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -7129,10 +7171,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -7151,10 +7193,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -7173,10 +7215,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -7195,10 +7237,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 2,
-            }
+            })
         ),
         options: OPTIONS_RADIO_059,
         allowed_values: &[],
@@ -7217,10 +7259,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 1,
-            }
+            })
         ),
         options: OPTIONS_RADIO_060,
         allowed_values: &[],
@@ -7239,7 +7281,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -7258,10 +7300,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 4,
-            }
+            })
         ),
         options: OPTIONS_RADIO_061,
         allowed_values: &[],
@@ -7280,10 +7322,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 7,
-            }
+            })
         ),
         options: OPTIONS_RADIO_012,
         allowed_values: &[],
@@ -7302,7 +7344,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -7321,10 +7363,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 5,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -7343,10 +7385,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 4,
-            }
+            })
         ),
         options: OPTIONS_GPS_000,
         allowed_values: &[],
@@ -7365,7 +7407,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -7384,10 +7426,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 1,
-            }
+            })
         ),
         options: OPTIONS_GPS_001,
         allowed_values: &[],
@@ -7406,9 +7448,9 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitBool {
+            field_codec(CodecSpec::BitBool {
                 mask: 0x01,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -7427,9 +7469,9 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitBool {
+            field_codec(CodecSpec::BitBool {
                 mask: 0x02,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -7448,9 +7490,9 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitBool {
+            field_codec(CodecSpec::BitBool {
                 mask: 0x10,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -7469,9 +7511,9 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitBool {
+            field_codec(CodecSpec::BitBool {
                 mask: 0x20,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -7490,9 +7532,9 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitBool {
+            field_codec(CodecSpec::BitBool {
                 mask: 0x04,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -7511,9 +7553,9 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitBool {
+            field_codec(CodecSpec::BitBool {
                 mask: 0x08,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -7532,7 +7574,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -7551,7 +7593,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -7570,10 +7612,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 2,
-            }
+            })
         ),
         options: OPTIONS_GPS_002,
         allowed_values: &[],
@@ -7592,12 +7634,12 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Unsigned {
+            field_codec(CodecSpec::Unsigned {
                 width: 2,
                 endian: Endian::Little,
                 min: 2,
                 max: 1800,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -7616,12 +7658,12 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Unsigned {
+            field_codec(CodecSpec::Unsigned {
                 width: 2,
                 endian: Endian::Little,
                 min: 0,
                 max: 65535,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -7640,10 +7682,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 2,
-            }
+            })
         ),
         options: OPTIONS_GPS_003,
         allowed_values: &[],
@@ -7662,10 +7704,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 3,
-            }
+            })
         ),
         options: OPTIONS_GPS_004,
         allowed_values: &[],
@@ -7684,10 +7726,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 2,
-            }
+            })
         ),
         options: OPTIONS_GPS_005,
         allowed_values: &[],
@@ -7706,7 +7748,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -7725,12 +7767,12 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Signed {
+            field_codec(CodecSpec::Signed {
                 width: 4,
                 endian: Endian::Little,
                 min: -500,
                 max: 15000,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -7749,12 +7791,12 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitField {
+            field_codec(CodecSpec::BitField {
                 mask: 0x04,
                 shift: 2,
                 min: 0,
                 max: 1,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -7773,10 +7815,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 89,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -7795,10 +7837,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 59,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -7817,16 +7859,16 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Unsigned {
+            field_codec(CodecSpec::Unsigned {
                 width: 2,
                 endian: Endian::Little,
                 min: 0,
                 max: 9999,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
-        storage_transform: Some(StorageTransform { input_unit: "seconds", numerator: 10000, denominator: 60 }),
+        storage_transform: Some(match StorageTransform::new("seconds", 10000, 60) { Some(value) => value, None => unreachable!() }),
         is_blob: false,
     },
     MenuField {
@@ -7841,12 +7883,12 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitField {
+            field_codec(CodecSpec::BitField {
                 mask: 0x08,
                 shift: 3,
                 min: 0,
                 max: 1,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -7865,10 +7907,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 179,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -7887,10 +7929,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 59,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -7909,16 +7951,16 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Unsigned {
+            field_codec(CodecSpec::Unsigned {
                 width: 2,
                 endian: Endian::Little,
                 min: 0,
                 max: 9999,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
-        storage_transform: Some(StorageTransform { input_unit: "seconds", numerator: 10000, denominator: 60 }),
+        storage_transform: Some(match StorageTransform::new("seconds", 10000, 60) { Some(value) => value, None => unreachable!() }),
         is_blob: false,
     },
     MenuField {
@@ -7933,11 +7975,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 8,
                 encoding: StringEncoding::MemoryMap,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -7956,12 +7998,12 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Signed {
+            field_codec(CodecSpec::Signed {
                 width: 4,
                 endian: Endian::Little,
                 min: -500,
                 max: 15000,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -7980,12 +8022,12 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitField {
+            field_codec(CodecSpec::BitField {
                 mask: 0x04,
                 shift: 2,
                 min: 0,
                 max: 1,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -8004,10 +8046,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 89,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -8026,10 +8068,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 59,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -8048,16 +8090,16 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Unsigned {
+            field_codec(CodecSpec::Unsigned {
                 width: 2,
                 endian: Endian::Little,
                 min: 0,
                 max: 9999,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
-        storage_transform: Some(StorageTransform { input_unit: "seconds", numerator: 10000, denominator: 60 }),
+        storage_transform: Some(match StorageTransform::new("seconds", 10000, 60) { Some(value) => value, None => unreachable!() }),
         is_blob: false,
     },
     MenuField {
@@ -8072,12 +8114,12 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitField {
+            field_codec(CodecSpec::BitField {
                 mask: 0x08,
                 shift: 3,
                 min: 0,
                 max: 1,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -8096,10 +8138,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 179,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -8118,10 +8160,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 59,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -8140,16 +8182,16 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Unsigned {
+            field_codec(CodecSpec::Unsigned {
                 width: 2,
                 endian: Endian::Little,
                 min: 0,
                 max: 9999,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
-        storage_transform: Some(StorageTransform { input_unit: "seconds", numerator: 10000, denominator: 60 }),
+        storage_transform: Some(match StorageTransform::new("seconds", 10000, 60) { Some(value) => value, None => unreachable!() }),
         is_blob: false,
     },
     MenuField {
@@ -8164,11 +8206,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 8,
                 encoding: StringEncoding::MemoryMap,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -8187,12 +8229,12 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Signed {
+            field_codec(CodecSpec::Signed {
                 width: 4,
                 endian: Endian::Little,
                 min: -500,
                 max: 15000,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -8211,12 +8253,12 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitField {
+            field_codec(CodecSpec::BitField {
                 mask: 0x04,
                 shift: 2,
                 min: 0,
                 max: 1,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -8235,10 +8277,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 89,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -8257,10 +8299,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 59,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -8279,16 +8321,16 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Unsigned {
+            field_codec(CodecSpec::Unsigned {
                 width: 2,
                 endian: Endian::Little,
                 min: 0,
                 max: 9999,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
-        storage_transform: Some(StorageTransform { input_unit: "seconds", numerator: 10000, denominator: 60 }),
+        storage_transform: Some(match StorageTransform::new("seconds", 10000, 60) { Some(value) => value, None => unreachable!() }),
         is_blob: false,
     },
     MenuField {
@@ -8303,12 +8345,12 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitField {
+            field_codec(CodecSpec::BitField {
                 mask: 0x08,
                 shift: 3,
                 min: 0,
                 max: 1,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -8327,10 +8369,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 179,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -8349,10 +8391,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 59,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -8371,16 +8413,16 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Unsigned {
+            field_codec(CodecSpec::Unsigned {
                 width: 2,
                 endian: Endian::Little,
                 min: 0,
                 max: 9999,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
-        storage_transform: Some(StorageTransform { input_unit: "seconds", numerator: 10000, denominator: 60 }),
+        storage_transform: Some(match StorageTransform::new("seconds", 10000, 60) { Some(value) => value, None => unreachable!() }),
         is_blob: false,
     },
     MenuField {
@@ -8395,11 +8437,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 8,
                 encoding: StringEncoding::MemoryMap,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -8418,12 +8460,12 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Signed {
+            field_codec(CodecSpec::Signed {
                 width: 4,
                 endian: Endian::Little,
                 min: -500,
                 max: 15000,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -8442,12 +8484,12 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitField {
+            field_codec(CodecSpec::BitField {
                 mask: 0x04,
                 shift: 2,
                 min: 0,
                 max: 1,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -8466,10 +8508,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 89,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -8488,10 +8530,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 59,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -8510,16 +8552,16 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Unsigned {
+            field_codec(CodecSpec::Unsigned {
                 width: 2,
                 endian: Endian::Little,
                 min: 0,
                 max: 9999,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
-        storage_transform: Some(StorageTransform { input_unit: "seconds", numerator: 10000, denominator: 60 }),
+        storage_transform: Some(match StorageTransform::new("seconds", 10000, 60) { Some(value) => value, None => unreachable!() }),
         is_blob: false,
     },
     MenuField {
@@ -8534,12 +8576,12 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitField {
+            field_codec(CodecSpec::BitField {
                 mask: 0x08,
                 shift: 3,
                 min: 0,
                 max: 1,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -8558,10 +8600,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 179,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -8580,10 +8622,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 59,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -8602,16 +8644,16 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Unsigned {
+            field_codec(CodecSpec::Unsigned {
                 width: 2,
                 endian: Endian::Little,
                 min: 0,
                 max: 9999,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
-        storage_transform: Some(StorageTransform { input_unit: "seconds", numerator: 10000, denominator: 60 }),
+        storage_transform: Some(match StorageTransform::new("seconds", 10000, 60) { Some(value) => value, None => unreachable!() }),
         is_blob: false,
     },
     MenuField {
@@ -8626,11 +8668,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 8,
                 encoding: StringEncoding::MemoryMap,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -8649,12 +8691,12 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Signed {
+            field_codec(CodecSpec::Signed {
                 width: 4,
                 endian: Endian::Little,
                 min: -500,
                 max: 15000,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -8673,12 +8715,12 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitField {
+            field_codec(CodecSpec::BitField {
                 mask: 0x04,
                 shift: 2,
                 min: 0,
                 max: 1,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -8697,10 +8739,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 89,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -8719,10 +8761,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 59,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -8741,16 +8783,16 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Unsigned {
+            field_codec(CodecSpec::Unsigned {
                 width: 2,
                 endian: Endian::Little,
                 min: 0,
                 max: 9999,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
-        storage_transform: Some(StorageTransform { input_unit: "seconds", numerator: 10000, denominator: 60 }),
+        storage_transform: Some(match StorageTransform::new("seconds", 10000, 60) { Some(value) => value, None => unreachable!() }),
         is_blob: false,
     },
     MenuField {
@@ -8765,12 +8807,12 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitField {
+            field_codec(CodecSpec::BitField {
                 mask: 0x08,
                 shift: 3,
                 min: 0,
                 max: 1,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -8789,10 +8831,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 179,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -8811,10 +8853,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 59,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -8833,16 +8875,16 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Unsigned {
+            field_codec(CodecSpec::Unsigned {
                 width: 2,
                 endian: Endian::Little,
                 min: 0,
                 max: 9999,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
-        storage_transform: Some(StorageTransform { input_unit: "seconds", numerator: 10000, denominator: 60 }),
+        storage_transform: Some(match StorageTransform::new("seconds", 10000, 60) { Some(value) => value, None => unreachable!() }),
         is_blob: false,
     },
     MenuField {
@@ -8857,11 +8899,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 8,
                 encoding: StringEncoding::MemoryMap,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -8880,7 +8922,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -8899,10 +8941,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 3,
-            }
+            })
         ),
         options: OPTIONS_APRS_024,
         allowed_values: &[],
@@ -8921,7 +8963,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -8940,7 +8982,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -8959,7 +9001,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -8978,10 +9020,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 250,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -9000,10 +9042,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 2,
                 max: 30,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -9022,10 +9064,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 2,
                 max: 90,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -9044,10 +9086,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -9066,10 +9108,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -9088,10 +9130,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -9110,10 +9152,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -9132,10 +9174,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -9154,10 +9196,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 2,
-            }
+            })
         ),
         options: OPTIONS_APRS_010,
         allowed_values: &[],
@@ -9176,10 +9218,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 6,
                 max: 9,
-            }
+            })
         ),
         options: OPTIONS_APRS_011,
         allowed_values: &[],
@@ -9198,10 +9240,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 2,
-            }
+            })
         ),
         options: OPTIONS_APRS_012,
         allowed_values: &[],
@@ -9220,10 +9262,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -9242,9 +9284,9 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitBool {
+            field_codec(CodecSpec::BitBool {
                 mask: 0x01,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -9263,9 +9305,9 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitBool {
+            field_codec(CodecSpec::BitBool {
                 mask: 0x02,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -9284,9 +9326,9 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitBool {
+            field_codec(CodecSpec::BitBool {
                 mask: 0x04,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -9305,9 +9347,9 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitBool {
+            field_codec(CodecSpec::BitBool {
                 mask: 0x08,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -9326,9 +9368,9 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitBool {
+            field_codec(CodecSpec::BitBool {
                 mask: 0x10,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -9347,9 +9389,9 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitBool {
+            field_codec(CodecSpec::BitBool {
                 mask: 0x20,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -9368,9 +9410,9 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitBool {
+            field_codec(CodecSpec::BitBool {
                 mask: 0x40,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -9389,10 +9431,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 5,
-            }
+            })
         ),
         options: OPTIONS_APRS_016,
         allowed_values: &[],
@@ -9411,7 +9453,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -9430,10 +9472,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 7,
-            }
+            })
         ),
         options: OPTIONS_APRS_017,
         allowed_values: &[],
@@ -9452,7 +9494,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -9471,10 +9513,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 7,
-            }
+            })
         ),
         options: OPTIONS_APRS_017,
         allowed_values: &[],
@@ -9493,11 +9535,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 5,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -9516,10 +9558,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 7,
-            }
+            })
         ),
         options: OPTIONS_APRS_017,
         allowed_values: &[],
@@ -9538,11 +9580,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 79,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -9561,11 +9603,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 29,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -9584,11 +9626,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 29,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -9607,10 +9649,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 1,
-            }
+            })
         ),
         options: OPTIONS_APRS_004,
         allowed_values: &[],
@@ -9629,10 +9671,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 3,
-            }
+            })
         ),
         options: OPTIONS_APRS_003,
         allowed_values: &[],
@@ -9651,7 +9693,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -9670,10 +9712,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 2,
-            }
+            })
         ),
         options: OPTIONS_APRS_005,
         allowed_values: &[],
@@ -9692,10 +9734,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 7,
-            }
+            })
         ),
         options: OPTIONS_APRS_006,
         allowed_values: &[],
@@ -9714,9 +9756,9 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitBool {
+            field_codec(CodecSpec::BitBool {
                 mask: 0x01,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -9735,9 +9777,9 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitBool {
+            field_codec(CodecSpec::BitBool {
                 mask: 0x02,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -9756,9 +9798,9 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitBool {
+            field_codec(CodecSpec::BitBool {
                 mask: 0x04,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -9777,10 +9819,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 3,
-            }
+            })
         ),
         options: OPTIONS_APRS_014,
         allowed_values: &[],
@@ -9799,10 +9841,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 9,
-            }
+            })
         ),
         options: OPTIONS_APRS_015,
         allowed_values: &[],
@@ -9821,7 +9863,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -9840,7 +9882,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -9859,7 +9901,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -9878,7 +9920,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -9897,10 +9939,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -9919,7 +9961,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -9938,10 +9980,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 4,
-            }
+            })
         ),
         options: OPTIONS_APRS_019,
         allowed_values: &[],
@@ -9960,11 +10002,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 67,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -9983,11 +10025,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 9,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -10006,10 +10048,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 4,
-            }
+            })
         ),
         options: OPTIONS_APRS_021,
         allowed_values: &[],
@@ -10028,7 +10070,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -10047,11 +10089,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 9,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -10070,10 +10112,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 2,
-            }
+            })
         ),
         options: OPTIONS_APRS_022,
         allowed_values: &[],
@@ -10092,10 +10134,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 6,
-            }
+            })
         ),
         options: OPTIONS_APRS_023,
         allowed_values: &[],
@@ -10114,7 +10156,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -10133,7 +10175,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -10152,10 +10194,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -10174,7 +10216,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -10193,11 +10235,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 39,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -10216,7 +10258,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -10235,11 +10277,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 5,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -10258,7 +10300,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -10277,11 +10319,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 5,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -10300,10 +10342,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 2,
-            }
+            })
         ),
         options: OPTIONS_APRS_020,
         allowed_values: &[],
@@ -10322,10 +10364,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 2,
-            }
+            })
         ),
         options: OPTIONS_APRS_007,
         allowed_values: &[],
@@ -10344,10 +10386,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 1,
-            }
+            })
         ),
         options: OPTIONS_APRS_018,
         allowed_values: &[],
@@ -10366,11 +10408,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 6,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -10389,10 +10431,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 2,
-            }
+            })
         ),
         options: OPTIONS_APRS_008,
         allowed_values: &[],
@@ -10411,10 +10453,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 49,
-            }
+            })
         ),
         options: OPTIONS_APRS_009,
         allowed_values: &[],
@@ -10433,11 +10475,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 59,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -10456,11 +10498,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 35,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -10479,11 +10521,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 9,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -10502,10 +10544,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -10524,10 +10566,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -10546,10 +10588,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 14,
-            }
+            })
         ),
         options: OPTIONS_APRS_013,
         allowed_values: &[],
@@ -10568,10 +10610,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -10590,11 +10632,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 42,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -10613,10 +10655,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 8,
-            }
+            })
         ),
         options: OPTIONS_APRS_002,
         allowed_values: &[],
@@ -10635,11 +10677,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 42,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -10658,10 +10700,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 8,
-            }
+            })
         ),
         options: OPTIONS_APRS_002,
         allowed_values: &[],
@@ -10680,11 +10722,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 42,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -10703,10 +10745,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 8,
-            }
+            })
         ),
         options: OPTIONS_APRS_002,
         allowed_values: &[],
@@ -10725,11 +10767,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 42,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -10748,10 +10790,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 8,
-            }
+            })
         ),
         options: OPTIONS_APRS_002,
         allowed_values: &[],
@@ -10770,11 +10812,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 42,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -10793,10 +10835,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 8,
-            }
+            })
         ),
         options: OPTIONS_APRS_002,
         allowed_values: &[],
@@ -10815,12 +10857,12 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitField {
+            field_codec(CodecSpec::BitField {
                 mask: 0x04,
                 shift: 2,
                 min: 0,
                 max: 1,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -10839,10 +10881,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 89,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -10861,10 +10903,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 59,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -10883,16 +10925,16 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Unsigned {
+            field_codec(CodecSpec::Unsigned {
                 width: 2,
                 endian: Endian::Little,
                 min: 0,
                 max: 9999,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
-        storage_transform: Some(StorageTransform { input_unit: "seconds", numerator: 10000, denominator: 60 }),
+        storage_transform: Some(match StorageTransform::new("seconds", 10000, 60) { Some(value) => value, None => unreachable!() }),
         is_blob: false,
     },
     MenuField {
@@ -10907,12 +10949,12 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitField {
+            field_codec(CodecSpec::BitField {
                 mask: 0x08,
                 shift: 3,
                 min: 0,
                 max: 1,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -10931,10 +10973,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 179,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -10953,10 +10995,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 59,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -10975,16 +11017,16 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Unsigned {
+            field_codec(CodecSpec::Unsigned {
                 width: 2,
                 endian: Endian::Little,
                 min: 0,
                 max: 9999,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
-        storage_transform: Some(StorageTransform { input_unit: "seconds", numerator: 10000, denominator: 60 }),
+        storage_transform: Some(match StorageTransform::new("seconds", 10000, 60) { Some(value) => value, None => unreachable!() }),
         is_blob: false,
     },
     MenuField {
@@ -10999,11 +11041,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 9,
                 encoding: StringEncoding::MemoryMap,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -11022,10 +11064,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 3,
-            }
+            })
         ),
         options: OPTIONS_APRS_000,
         allowed_values: &[],
@@ -11044,10 +11086,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 4,
-            }
+            })
         ),
         options: OPTIONS_APRS_001,
         allowed_values: &[],
@@ -11066,10 +11108,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 47,
                 max: 90,
-            }
+            })
         ),
         options: &[],
         allowed_values: ALLOWED_DOMAIN_000,
@@ -11088,10 +11130,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 33,
                 max: 126,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -11110,11 +11152,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 42,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -11133,12 +11175,12 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitField {
+            field_codec(CodecSpec::BitField {
                 mask: 0x04,
                 shift: 2,
                 min: 0,
                 max: 1,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -11157,10 +11199,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 89,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -11179,10 +11221,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 59,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -11201,16 +11243,16 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Unsigned {
+            field_codec(CodecSpec::Unsigned {
                 width: 2,
                 endian: Endian::Little,
                 min: 0,
                 max: 9999,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
-        storage_transform: Some(StorageTransform { input_unit: "seconds", numerator: 10000, denominator: 60 }),
+        storage_transform: Some(match StorageTransform::new("seconds", 10000, 60) { Some(value) => value, None => unreachable!() }),
         is_blob: false,
     },
     MenuField {
@@ -11225,12 +11267,12 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitField {
+            field_codec(CodecSpec::BitField {
                 mask: 0x08,
                 shift: 3,
                 min: 0,
                 max: 1,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -11249,10 +11291,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 179,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -11271,10 +11313,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 59,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -11293,16 +11335,16 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Unsigned {
+            field_codec(CodecSpec::Unsigned {
                 width: 2,
                 endian: Endian::Little,
                 min: 0,
                 max: 9999,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
-        storage_transform: Some(StorageTransform { input_unit: "seconds", numerator: 10000, denominator: 60 }),
+        storage_transform: Some(match StorageTransform::new("seconds", 10000, 60) { Some(value) => value, None => unreachable!() }),
         is_blob: false,
     },
     MenuField {
@@ -11317,11 +11359,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 9,
                 encoding: StringEncoding::MemoryMap,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -11340,10 +11382,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 3,
-            }
+            })
         ),
         options: OPTIONS_APRS_000,
         allowed_values: &[],
@@ -11362,10 +11404,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 4,
-            }
+            })
         ),
         options: OPTIONS_APRS_001,
         allowed_values: &[],
@@ -11384,10 +11426,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 47,
                 max: 90,
-            }
+            })
         ),
         options: &[],
         allowed_values: ALLOWED_DOMAIN_000,
@@ -11406,10 +11448,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 33,
                 max: 126,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -11428,11 +11470,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 42,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -11451,12 +11493,12 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitField {
+            field_codec(CodecSpec::BitField {
                 mask: 0x04,
                 shift: 2,
                 min: 0,
                 max: 1,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -11475,10 +11517,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 89,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -11497,10 +11539,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 59,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -11519,16 +11561,16 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Unsigned {
+            field_codec(CodecSpec::Unsigned {
                 width: 2,
                 endian: Endian::Little,
                 min: 0,
                 max: 9999,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
-        storage_transform: Some(StorageTransform { input_unit: "seconds", numerator: 10000, denominator: 60 }),
+        storage_transform: Some(match StorageTransform::new("seconds", 10000, 60) { Some(value) => value, None => unreachable!() }),
         is_blob: false,
     },
     MenuField {
@@ -11543,12 +11585,12 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitField {
+            field_codec(CodecSpec::BitField {
                 mask: 0x08,
                 shift: 3,
                 min: 0,
                 max: 1,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -11567,10 +11609,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 179,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -11589,10 +11631,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 59,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -11611,16 +11653,16 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Unsigned {
+            field_codec(CodecSpec::Unsigned {
                 width: 2,
                 endian: Endian::Little,
                 min: 0,
                 max: 9999,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
-        storage_transform: Some(StorageTransform { input_unit: "seconds", numerator: 10000, denominator: 60 }),
+        storage_transform: Some(match StorageTransform::new("seconds", 10000, 60) { Some(value) => value, None => unreachable!() }),
         is_blob: false,
     },
     MenuField {
@@ -11635,11 +11677,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 9,
                 encoding: StringEncoding::MemoryMap,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -11658,10 +11700,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 3,
-            }
+            })
         ),
         options: OPTIONS_APRS_000,
         allowed_values: &[],
@@ -11680,10 +11722,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 4,
-            }
+            })
         ),
         options: OPTIONS_APRS_001,
         allowed_values: &[],
@@ -11702,10 +11744,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 47,
                 max: 90,
-            }
+            })
         ),
         options: &[],
         allowed_values: ALLOWED_DOMAIN_000,
@@ -11724,10 +11766,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 33,
                 max: 126,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -11746,11 +11788,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 42,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -11769,11 +11811,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 32,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -11792,11 +11834,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 32,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -11815,11 +11857,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 32,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -11838,11 +11880,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 32,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -11861,11 +11903,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 32,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -11884,11 +11926,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 32,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -11907,11 +11949,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 32,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -11930,11 +11972,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 32,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -11953,11 +11995,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 32,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -11976,11 +12018,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 32,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -11999,11 +12041,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 32,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -12022,11 +12064,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 32,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -12045,11 +12087,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 32,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -12068,11 +12110,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 32,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -12091,11 +12133,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 32,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -12114,11 +12156,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 32,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -12137,11 +12179,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 32,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -12160,11 +12202,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 32,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -12183,11 +12225,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 32,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -12206,11 +12248,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 32,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -12229,7 +12271,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -12248,10 +12290,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 5,
-            }
+            })
         ),
         options: OPTIONS_DV_000,
         allowed_values: &[],
@@ -12270,10 +12312,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 4,
-            }
+            })
         ),
         options: OPTIONS_DV_001,
         allowed_values: &[],
@@ -12292,10 +12334,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 1,
                 max: 50,
-            }
+            })
         ),
         options: OPTIONS_DV_002,
         allowed_values: &[],
@@ -12314,7 +12356,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -12333,7 +12375,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -12352,10 +12394,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 2,
-            }
+            })
         ),
         options: OPTIONS_DV_003,
         allowed_values: &[],
@@ -12374,10 +12416,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 2,
-            }
+            })
         ),
         options: OPTIONS_DV_011,
         allowed_values: &[],
@@ -12396,7 +12438,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -12415,9 +12457,9 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitBool {
+            field_codec(CodecSpec::BitBool {
                 mask: 0x01,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -12436,9 +12478,9 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitBool {
+            field_codec(CodecSpec::BitBool {
                 mask: 0x02,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -12457,9 +12499,9 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitBool {
+            field_codec(CodecSpec::BitBool {
                 mask: 0x10,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -12478,9 +12520,9 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitBool {
+            field_codec(CodecSpec::BitBool {
                 mask: 0x20,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -12499,9 +12541,9 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitBool {
+            field_codec(CodecSpec::BitBool {
                 mask: 0x04,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -12520,9 +12562,9 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitBool {
+            field_codec(CodecSpec::BitBool {
                 mask: 0x08,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -12541,9 +12583,9 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::BitBool {
+            field_codec(CodecSpec::BitBool {
                 mask: 0x40,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -12562,10 +12604,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 10,
-            }
+            })
         ),
         options: OPTIONS_DV_004,
         allowed_values: &[],
@@ -12584,10 +12626,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 3,
-            }
+            })
         ),
         options: OPTIONS_DV_005,
         allowed_values: &[],
@@ -12606,10 +12648,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 1,
-            }
+            })
         ),
         options: OPTIONS_DV_006,
         allowed_values: &[],
@@ -12628,10 +12670,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 1,
-            }
+            })
         ),
         options: OPTIONS_DV_007,
         allowed_values: &[],
@@ -12650,10 +12692,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 7,
-            }
+            })
         ),
         options: OPTIONS_DV_008,
         allowed_values: &[],
@@ -12672,10 +12714,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 4,
-            }
+            })
         ),
         options: OPTIONS_DV_009,
         allowed_values: &[],
@@ -12694,7 +12736,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -12713,10 +12755,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 2,
-            }
+            })
         ),
         options: OPTIONS_DV_010,
         allowed_values: &[],
@@ -12735,10 +12777,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -12757,11 +12799,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 8,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -12780,11 +12822,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 64,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -12803,10 +12845,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 1,
-            }
+            })
         ),
         options: OPTIONS_DV_012,
         allowed_values: &[],
@@ -12825,7 +12867,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -12844,10 +12886,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 1,
-            }
+            })
         ),
         options: OPTIONS_DV_013,
         allowed_values: &[],
@@ -12866,10 +12908,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -12888,10 +12930,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 1,
-            }
+            })
         ),
         options: OPTIONS_DV_014,
         allowed_values: &[],
@@ -12910,11 +12952,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 8,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -12933,11 +12975,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 8,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -12956,11 +12998,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 16,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -12979,10 +13021,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 3,
-            }
+            })
         ),
         options: OPTIONS_DV_015,
         allowed_values: &[],
@@ -13001,10 +13043,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 1,
-            }
+            })
         ),
         options: OPTIONS_DV_016,
         allowed_values: &[],
@@ -13023,10 +13065,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -13045,10 +13087,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 255,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -13067,11 +13109,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 20,
                 encoding: StringEncoding::MemoryMap,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -13090,11 +13132,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 20,
                 encoding: StringEncoding::MemoryMap,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -13113,11 +13155,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 20,
                 encoding: StringEncoding::MemoryMap,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -13136,11 +13178,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 20,
                 encoding: StringEncoding::MemoryMap,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -13159,11 +13201,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 20,
                 encoding: StringEncoding::MemoryMap,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -13182,11 +13224,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 8,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -13205,11 +13247,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 4,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -13228,11 +13270,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 8,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -13251,11 +13293,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 4,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -13274,11 +13316,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 8,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -13297,11 +13339,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 4,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -13320,11 +13362,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 8,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -13343,11 +13385,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 4,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -13366,11 +13408,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 8,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -13389,11 +13431,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 4,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -13412,11 +13454,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 8,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -13435,11 +13477,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 4,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -13458,11 +13500,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 96,
                 encoding: StringEncoding::MemoryMap,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -13481,11 +13523,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 96,
                 encoding: StringEncoding::MemoryMap,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -13504,7 +13546,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -13523,9 +13565,9 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bytes {
+            field_codec(CodecSpec::Bytes {
                 len: 4,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -13544,9 +13586,9 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bytes {
+            field_codec(CodecSpec::Bytes {
                 len: 4,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -13565,9 +13607,9 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bytes {
+            field_codec(CodecSpec::Bytes {
                 len: 4,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -13586,9 +13628,9 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bytes {
+            field_codec(CodecSpec::Bytes {
                 len: 4,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -13607,9 +13649,9 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bytes {
+            field_codec(CodecSpec::Bytes {
                 len: 4,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -13628,7 +13670,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],
@@ -13641,10 +13683,10 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
         descriptor: FieldDescriptor::new(
             "pm.PmSelect",
             0x4F009,
-            FieldCodec::Byte {
+            field_codec(CodecSpec::Byte {
                 min: 0,
                 max: 6,
-            }
+            })
         ),
         options: OPTIONS_PM_000,
         allowed_values: &[],
@@ -13657,11 +13699,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
         descriptor: FieldDescriptor::new(
             "pm.PmName1",
             0x4F00A,
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 16,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -13674,11 +13716,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
         descriptor: FieldDescriptor::new(
             "pm.PmName2",
             0x4F01A,
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 16,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -13691,11 +13733,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
         descriptor: FieldDescriptor::new(
             "pm.PmName3",
             0x4F02A,
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 16,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -13708,11 +13750,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
         descriptor: FieldDescriptor::new(
             "pm.PmName4",
             0x4F03A,
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 16,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -13725,11 +13767,11 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
         descriptor: FieldDescriptor::new(
             "pm.PmName5",
             0x4F04A,
-            FieldCodec::FixedString {
+            field_codec(CodecSpec::FixedString {
                 len: 16,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            }
+            })
         ),
         options: &[],
         allowed_values: &[],
@@ -13748,7 +13790,7 @@ static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; 431] = [
                     stride: 8192,
                 },
             ],
-            FieldCodec::Bool
+            FieldCodec::BOOL
         ),
         options: &[],
         allowed_values: &[],

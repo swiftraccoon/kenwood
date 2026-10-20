@@ -5,20 +5,21 @@
 //! is active, the recovery journal, shutdown, and fresh verification remain the
 //! caller's.
 
-pub mod lifecycle;
-pub mod session;
-pub mod transition;
-
 use std::collections::BTreeMap;
 
 use super::Identity;
 use super::menu::{MenuFieldSnapshot, ScopedMenuField};
 use super::programming::PageReplacement;
 use crate::error::{Error, SchemaError};
-use crate::memory::{
-    DecodedFieldValue, FieldValue, PatchPlanner, TerminalGatewayRoute, menu_field,
-};
+use crate::memory::{PatchPlanner, TerminalGatewayRoute, menu_field};
 use crate::types::{Address, DvGatewayMode, Page, SlotIndex};
+use kenwood_schema::{DecodedFieldValue, FieldValue};
+
+pub mod lifecycle;
+pub mod session;
+#[cfg(test)]
+mod tests;
+pub mod transition;
 
 const PM_FIELD: &str = "pm.PmSelect";
 const USB_FIELD: &str = "radio.UsbFunction";
@@ -288,7 +289,7 @@ impl TerminalPlan {
             DvGatewayMode::Unnamed(raw) => {
                 return Err(TerminalPlanError::GuardValue {
                     field: GATEWAY_FIELD,
-                    actual: u64::from(raw),
+                    actual: u64::from(raw.get()),
                 });
             }
         };
@@ -502,6 +503,3 @@ pub enum TerminalPlanError {
     #[error(transparent)]
     Operation(#[from] Error),
 }
-
-#[cfg(test)]
-mod tests;

@@ -32,7 +32,8 @@
 use std::collections::BTreeMap;
 
 use kenwood_schema::{
-    BooleanDecoding, ByteClaims, DecodeOptions, MaskedByte, TextPolicy, ValueDomain,
+    BooleanDecoding, ByteClaims, DecodeOptions, DecodedFieldValue, FieldCodec, FieldValue,
+    MaskedByte, TextPolicy, ValueDomain,
 };
 
 use crate::error::SchemaError;
@@ -40,7 +41,9 @@ use crate::protocol::mcp::regions::writable_page_for;
 use crate::protocol::mcp::{BytePatch, PagePatch};
 use crate::types::{Address, IMAGE_LENGTH, SLOT_STRIDE, SlotIndex};
 
-pub use kenwood_schema::{DecodedFieldValue, Endian, FieldCodec, FieldValue, StringEncoding};
+#[cfg(test)]
+#[path = "schema_regression_tests.rs"]
+mod regression_tests;
 
 /// One stride-scaled dimension index of a field address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,10 +108,6 @@ impl FieldDescriptor {
     }
 
     fn validate(&self) -> Result<(), SchemaError> {
-        self.codec.validate().map_err(|source| SchemaError::Codec {
-            field: self.name,
-            source,
-        })?;
         if self.codec.encoded_len() > IMAGE_LENGTH {
             return Err(SchemaError::OutOfBounds {
                 field: self.name,
@@ -131,8 +130,8 @@ impl FieldDescriptor {
     ///
     /// Returns [`SchemaError::SlotRequired`] for a per-slot field without a
     /// slot, [`SchemaError::UnknownDimension`] for a term other than
-    /// `pm_slot`, and [`SchemaError::OutOfBounds`] past the image. Malformed
-    /// codec shapes and altered registered descriptors are rejected first.
+    /// `pm_slot`, and [`SchemaError::OutOfBounds`] past the image. Altered
+    /// registered descriptors are rejected first.
     pub fn address(&self, slot: Option<SlotIndex>) -> Result<Address, SchemaError> {
         self.validate()?;
         let mut address = u64::from(self.base);
@@ -219,7 +218,7 @@ impl FieldDescriptor {
     ///
     /// # Errors
     ///
-    /// Returns malformed-codec, registry-integrity, type, range, and text errors.
+    /// Returns image-bound, registry-integrity, type, range, and text errors.
     /// Registered finite writable domains apply even to direct descriptors.
     /// Registered blobs remain available for offline encoding;
     /// [`PatchPlanner::set`] rejects them with [`SchemaError::BlobNotPatchable`].
@@ -406,32 +405,40 @@ impl PatchSet {
 }
 
 #[cfg(test)]
-#[path = "schema_regression_tests.rs"]
-mod regression_tests;
-
-#[cfg(test)]
 mod tests {
     use super::*;
-    use kenwood_schema::{CodecError, PatchError};
+    use kenwood_schema::{CodecError, CodecSpec, Endian, PatchError, StringEncoding};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    const GLOBAL: FieldDescriptor =
-        FieldDescriptor::new("test.Global", 323_593, FieldCodec::Byte { min: 0, max: 5 });
+    const GLOBAL: FieldDescriptor = FieldDescriptor::new(
+        "test.Global",
+        323_593,
+        match FieldCodec::new(CodecSpec::Byte { min: 0, max: 5 }) {
+            Ok(codec) => codec,
+            Err(_) => unreachable!(),
+        },
+    );
     const PER_SLOT: FieldDescriptor = FieldDescriptor::with_terms(
         "test.PerSlot",
         328_995,
         &[SLOT_TERM],
-        FieldCodec::Byte { min: 0, max: 2 },
+        match FieldCodec::new(CodecSpec::Byte { min: 0, max: 2 }) {
+            Ok(codec) => codec,
+            Err(_) => unreachable!(),
+        },
     );
     const NAME: FieldDescriptor = FieldDescriptor::with_terms(
         "gps.MyPositionList[0].Name",
         329_246,
         &[SLOT_TERM],
-        FieldCodec::FixedString {
+        match FieldCodec::new(CodecSpec::FixedString {
             len: 8,
             encoding: StringEncoding::MemoryMap,
             padding: 0,
+        }) {
+            Ok(codec) => codec,
+            Err(_) => unreachable!(),
         },
     );
 
@@ -468,12 +475,12 @@ mod tests {
         let signed = FieldDescriptor::new(
             "test.SignedAltitude",
             329_232,
-            FieldCodec::Signed {
+            FieldCodec::new(CodecSpec::Signed {
                 width: 4,
                 endian: Endian::Little,
                 min: -500,
                 max: 15_000,
-            },
+            })?,
         );
         for patch in signed.encode(FieldValue::Signed(-500))? {
             if let Some(byte) = image.get_mut(329_232 + patch.offset()) {
@@ -516,8 +523,16 @@ mod tests {
         assert_eq!(set.len(), 2);
         let first_page = set.pages().first().ok_or("no page")?;
         assert_eq!(first_page.page().address().as_u32(), 327_936 + 1024);
-        let bit_a = FieldDescriptor::new("radio.A", 8, FieldCodec::BitBool { mask: 0x01 });
-        let bit_b = FieldDescriptor::new("radio.B", 8, FieldCodec::BitBool { mask: 0x01 });
+        let bit_a = FieldDescriptor::new(
+            "radio.A",
+            8,
+            FieldCodec::new(CodecSpec::BitBool { mask: 0x01 })?,
+        );
+        let bit_b = FieldDescriptor::new(
+            "radio.B",
+            8,
+            FieldCodec::new(CodecSpec::BitBool { mask: 0x01 })?,
+        );
         let mut clash = PatchPlanner::new();
         let _claimed = clash.set(&bit_a, None, FieldValue::Bool(true))?;
         let conflict = clash.set(&bit_b, None, FieldValue::Bool(false));
@@ -528,7 +543,11 @@ mod tests {
             ),
             "{conflict:?}"
         );
-        let bitmap = FieldDescriptor::new("test.Bitmap", 393_216, FieldCodec::Bytes { len: 2 });
+        let bitmap = FieldDescriptor::new(
+            "test.Bitmap",
+            393_216,
+            FieldCodec::new(CodecSpec::Bytes { len: 2 })?,
+        );
         let outside = PatchPlanner::new()
             .set(&bitmap, None, FieldValue::Bytes(&[0, 0]))
             .map(|_| ());

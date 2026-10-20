@@ -1,17 +1,21 @@
 //! A captured configuration: the identity it was read from, the pages that
 //! were read and their bytes, with a persisted form.
 //!
-//! A [`Configuration`] returns no unread byte: every accessor and view checks
-//! coverage first. Its persisted form round-trips the identity, the pages and
+//! A [`Configuration`] checks captured coverage before typed reads. Its
+//! explicitly named [`Configuration::image_with_uncaptured_fill`] escape
+//! exposes `0xFF` for unread bytes. Its persisted form round-trips the identity, the pages and
 //! their bytes exactly: the eight bytes `TMD750CF`, the format version `1`,
 //! the model, firmware and radio-type strings (each a length byte then ASCII),
 //! the page count (`u32`), each page's address (`u32`), length (`u16`, 1 to
 //! 256) and bytes, and a CRC-32 (IEEE 802.3, reflected, polynomial
 //! `0xEDB88320`) of every byte before it; integers are little-endian.
 
+use std::collections::BTreeMap;
+
 use crate::error::ValidationError;
 use crate::memory::{
-    ConfigurationError, MemoryImage, StandardConfiguration, StandardConfigurationDiff,
+    ConfigurationError, ConfigurationFormatError, MemoryImage, StandardConfiguration,
+    StandardConfigurationDiff,
 };
 use crate::protocol::mcp::regions::menu_regions;
 use crate::radio::Identity;
@@ -19,8 +23,16 @@ use crate::radio::backup::McpBackupReport;
 use crate::radio::menu::MenuFieldSnapshot;
 use crate::types::{Address, FirmwareIdentity, PAGE_SIZE, Page, RadioModel, RadioType, Region};
 
+#[cfg(test)]
+#[path = "captured_configuration_tests.rs"]
+mod tests;
+
 const MAGIC: &[u8; 8] = b"TMD750CF";
 const FORMAT_VERSION: u8 = 1;
+// At most one nonoverlapping one-byte page per image byte; each header is six
+// bytes, plus bounded model/firmware/type metadata and the trailing checksum.
+const MAX_STORED_BYTES: usize =
+    8 + 1 + (1 + 7) + (1 + 8) + (1 + 255) + 4 + 7 * crate::types::IMAGE_LENGTH + 4;
 
 /// The bytes a backup or probe read, with the identity they were read from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,12 +55,21 @@ impl Configuration {
         identity: Identity,
         pages: impl IntoIterator<Item = (Page, Vec<u8>)>,
     ) -> Result<Self, ConfigurationError> {
-        let mut pages: Vec<(Page, Vec<u8>)> = pages.into_iter().collect();
-        pages.sort_by_key(|(page, _)| page.address().as_u32());
-        let mut bytes = MemoryImage::blank().into_bytes();
-        let mut read = Vec::with_capacity(pages.len());
-        let mut previous_end = 0;
-        for (index, (page, data)) in pages.into_iter().enumerate() {
+        Self::from_page_results(identity, pages.into_iter().map(Ok))
+    }
+
+    fn from_page_results(
+        identity: Identity,
+        pages: impl IntoIterator<Item = Result<(Page, Vec<u8>), ConfigurationError>>,
+    ) -> Result<Self, ConfigurationError> {
+        if identity.radio_type.as_str().len() > usize::from(u8::MAX) {
+            return Err(ConfigurationError::RadioTypeTooLong {
+                length: identity.radio_type.as_str().len(),
+            });
+        }
+        let mut ordered: BTreeMap<u32, (Page, Vec<u8>)> = BTreeMap::new();
+        for (index, candidate) in pages.into_iter().enumerate() {
+            let (page, data) = candidate?;
             if data.len() != page.len() {
                 return Err(ConfigurationError::PageLength {
                     index,
@@ -56,11 +77,24 @@ impl Configuration {
                     actual: data.len(),
                 });
             }
-            let start = page.address().as_usize();
-            if start < previous_end {
+            let start = page.address().as_u32();
+            if ordered
+                .range(..=start)
+                .next_back()
+                .is_some_and(|(_, (previous, _))| previous.end() > start)
+                || ordered
+                    .range(start..)
+                    .next()
+                    .is_some_and(|(&next, _)| next < page.end())
+            {
                 return Err(ConfigurationError::PageOverlap { page });
             }
-            previous_end = start + page.len();
+            let _previous = ordered.insert(start, (page, data));
+        }
+        let mut bytes = MemoryImage::blank().into_bytes();
+        let mut read = Vec::with_capacity(ordered.len());
+        for (page, data) in ordered.into_values() {
+            let start = page.address().as_usize();
             for (destination, source) in bytes.iter_mut().skip(start).zip(data) {
                 *destination = source;
             }
@@ -148,7 +182,10 @@ impl Configuration {
     /// # Errors
     ///
     /// Returns [`ConfigurationError::Uncovered`] when a byte was not read.
-    pub fn image_covering(&self, region: Region) -> Result<&MemoryImage, ConfigurationError> {
+    pub fn image_with_uncaptured_fill(
+        &self,
+        region: Region,
+    ) -> Result<&MemoryImage, ConfigurationError> {
         let _bytes = self.bytes(region)?;
         Ok(&self.image)
     }
@@ -209,18 +246,29 @@ impl Configuration {
             self.identity.firmware.to_string(),
             self.identity.radio_type.to_string(),
         ] {
-            stored.push(u8::try_from(text.len()).unwrap_or(u8::MAX));
+            stored.push(
+                u8::try_from(text.len())
+                    .unwrap_or_else(|_| unreachable!("capture identity length was checked")),
+            );
             stored.extend_from_slice(text.as_bytes());
         }
         stored.extend_from_slice(
             &u32::try_from(self.pages.len())
-                .unwrap_or(u32::MAX)
+                .unwrap_or_else(|_| unreachable!("nonoverlapping image pages fit u32"))
                 .to_le_bytes(),
         );
         for page in &self.pages {
             stored.extend_from_slice(&page.address().as_u32().to_le_bytes());
-            stored.extend_from_slice(&u16::try_from(page.len()).unwrap_or(u16::MAX).to_le_bytes());
-            stored.extend_from_slice(self.bytes(page.region()).unwrap_or_default());
+            stored.extend_from_slice(
+                &u16::try_from(page.len())
+                    .unwrap_or_else(|_| unreachable!("page length is at most 256"))
+                    .to_le_bytes(),
+            );
+            stored.extend_from_slice(
+                self.bytes(page.region()).unwrap_or_else(|_| {
+                    unreachable!("retained page has complete capture coverage")
+                }),
+            );
         }
         let checksum = crc32(&stored);
         stored.extend_from_slice(&checksum.to_le_bytes());
@@ -236,25 +284,25 @@ impl Configuration {
     /// outside the image, [`ConfigurationError::Checksum`] when the CRC
     /// differs, and the [`Self::from_pages`] errors.
     pub fn from_bytes(stored: &[u8]) -> Result<Self, ConfigurationError> {
-        let outside = |_invalid: ValidationError| ConfigurationError::Format {
-            detail: "a page lies outside the image",
+        if stored.len() > MAX_STORED_BYTES {
+            return Err(ConfigurationFormatError::TooLong {
+                length: stored.len(),
+                maximum: MAX_STORED_BYTES,
+            }
+            .into());
+        }
+        let outside = |invalid: ValidationError| {
+            ConfigurationError::from(ConfigurationFormatError::InvalidPage(invalid))
         };
-        let (body, checksum) =
-            stored
-                .split_last_chunk::<4>()
-                .ok_or(ConfigurationError::Format {
-                    detail: "the input ends early",
-                })?;
+        let (body, checksum) = stored
+            .split_last_chunk::<4>()
+            .ok_or(ConfigurationFormatError::UnexpectedEnd)?;
         let mut reader = Reader { rest: body };
         if reader.take(MAGIC.len())? != MAGIC {
-            return Err(ConfigurationError::Format {
-                detail: "the input is not a stored TM-D750 configuration",
-            });
+            return Err(ConfigurationFormatError::WrongMagic.into());
         }
         if reader.take(1)? != [FORMAT_VERSION] {
-            return Err(ConfigurationError::Format {
-                detail: "the format version is not 1",
-            });
+            return Err(ConfigurationFormatError::UnsupportedVersion.into());
         }
         let computed = crc32(body);
         let stated = u32::from_le_bytes(*checksum);
@@ -267,31 +315,27 @@ impl Configuration {
             radio_type: RadioType::new(reader.text()?).map_err(invalid_identity)?,
         };
         let count = u32::from_le_bytes(reader.array()?);
-        let mut pages = Vec::new();
-        for _ in 0..count {
-            let address = Address::new(u32::from_le_bytes(reader.array()?)).map_err(outside)?;
-            let length = usize::from(u16::from_le_bytes(reader.array()?));
-            if length == 0 || length > PAGE_SIZE {
-                return Err(ConfigurationError::Format {
-                    detail: "a page length is outside 1 to 256",
-                });
-            }
-            let page = Page::new(address, length).map_err(outside)?;
-            pages.push((page, reader.take(length)?.to_vec()));
-        }
+        let captured = Self::from_page_results(
+            identity,
+            (0..count).map(|_| {
+                let address = Address::new(u32::from_le_bytes(reader.array()?)).map_err(outside)?;
+                let length = usize::from(u16::from_le_bytes(reader.array()?));
+                if length == 0 || length > PAGE_SIZE {
+                    return Err(ConfigurationFormatError::InvalidPageLength.into());
+                }
+                let page = Page::new(address, length).map_err(outside)?;
+                Ok((page, reader.take(length)?.to_vec()))
+            }),
+        )?;
         if !reader.rest.is_empty() {
-            return Err(ConfigurationError::Format {
-                detail: "bytes follow the last page",
-            });
+            return Err(ConfigurationFormatError::TrailingBytes.into());
         }
-        Self::from_pages(identity, pages)
+        Ok(captured)
     }
 }
 
-fn invalid_identity(_error: ValidationError) -> ConfigurationError {
-    ConfigurationError::Format {
-        detail: "an identity string is invalid",
-    }
+fn invalid_identity(error: ValidationError) -> ConfigurationError {
+    ConfigurationFormatError::InvalidIdentity(error).into()
 }
 
 /// Sequential reads from the persisted form.
@@ -301,12 +345,10 @@ struct Reader<'a> {
 
 impl<'a> Reader<'a> {
     fn take(&mut self, length: usize) -> Result<&'a [u8], ConfigurationError> {
-        let (taken, rest) =
-            self.rest
-                .split_at_checked(length)
-                .ok_or(ConfigurationError::Format {
-                    detail: "the input ends early",
-                })?;
+        let (taken, rest) = self
+            .rest
+            .split_at_checked(length)
+            .ok_or(ConfigurationFormatError::UnexpectedEnd)?;
         self.rest = rest;
         Ok(taken)
     }
@@ -315,18 +357,13 @@ impl<'a> Reader<'a> {
         let taken = self.take(N)?;
         taken
             .try_into()
-            .map_err(|_short| ConfigurationError::Format {
-                detail: "the input ends early",
-            })
+            .map_err(|_short| ConfigurationFormatError::UnexpectedEnd.into())
     }
 
     fn text(&mut self) -> Result<&'a str, ConfigurationError> {
         let [length] = self.array::<1>()?;
-        std::str::from_utf8(self.take(usize::from(length))?).map_err(|_not_ascii| {
-            ConfigurationError::Format {
-                detail: "an identity string is not ASCII",
-            }
-        })
+        std::str::from_utf8(self.take(usize::from(length))?)
+            .map_err(|error| ConfigurationFormatError::InvalidUtf8(error).into())
     }
 }
 
@@ -358,7 +395,3 @@ fn crc32(bytes: &[u8]) -> u32 {
     }
     !crc
 }
-
-#[cfg(test)]
-#[path = "captured_configuration_tests.rs"]
-mod tests;

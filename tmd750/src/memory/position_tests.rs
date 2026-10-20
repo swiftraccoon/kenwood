@@ -71,7 +71,7 @@ fn a_stored_position_decodes_and_reencodes_its_bytes() -> TestResult {
     };
     assert_eq!(entry.name.to_string(), "HOME");
     assert_eq!(entry.time.to_string(), "2026-10-19 12:34:56 UTC");
-    assert_eq!(entry.gps_fix, 1);
+    assert_eq!(entry.gps_fix.get(), 1);
     assert!((entry.latitude.degrees() - 35.6995).abs() < 1e-9);
     assert!((entry.longitude.degrees() - 139.770_666_666_666_7).abs() < 1e-9);
     assert_eq!(entry.altitude, 40);
@@ -86,8 +86,28 @@ fn a_stored_position_decodes_and_reencodes_its_bytes() -> TestResult {
     let decoded = StoredPosition::from_bytes(south_west)?;
     assert_eq!(decoded.latitude.hemisphere(), LatitudeHemisphere::South);
     assert_eq!(decoded.longitude.hemisphere(), LongitudeHemisphere::West);
-    assert_eq!((decoded.gps_fix, decoded.flag_bits), (0, 0xF));
+    assert_eq!((decoded.gps_fix.get(), decoded.flag_bits.get()), (0, 0xF));
     assert_eq!(decoded.to_bytes(), south_west);
+    Ok(())
+}
+
+#[test]
+fn packed_position_fields_reject_truncation_and_preserve_full_stored_altitudes() -> TestResult {
+    for raw in 0..=u8::MAX {
+        assert_eq!(GpsFixBits::new(raw).is_ok(), raw <= 3, "GPS bits {raw}");
+        assert_eq!(
+            PositionFlagBits::new(raw).is_ok(),
+            raw <= 15,
+            "flag bits {raw}"
+        );
+    }
+    for altitude in [i32::MIN, i32::MAX] {
+        let mut position = home()?;
+        position.gps_fix = GpsFixBits::new(3)?;
+        position.flag_bits = PositionFlagBits::new(15)?;
+        position.altitude = altitude;
+        assert_eq!(StoredPosition::from_bytes(position.to_bytes())?, position);
+    }
     Ok(())
 }
 

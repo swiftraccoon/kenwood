@@ -37,21 +37,24 @@
 //! Byte 74, bits 0 to 3 of byte 75 and the bits of byte 64 other than the
 //! hemisphere bits have no established meaning; records carry them unchanged.
 
-#[cfg(test)]
-mod fixtures;
-mod record;
-
 use std::fmt;
 
 pub use record::{
     CountryIndex, GroupIndex, PositionAccuracy, RegionIndex, RepeaterFrequency, RepeaterPosition,
-    RepeaterRecord, RepeaterShift, UtcOffset,
+    RepeaterRecord, RepeaterShift, UnnamedPositionAccuracy, UnnamedRepeaterShift, UtcOffset,
 };
 
 use crate::memory::chain::{self, ChainFault, Linked};
 use crate::memory::{MemoryImage, StoredText, StoredTextError};
 use crate::radio::programming::PageReplacement;
 use crate::types::{Address, PAGE_SIZE, PAGE_SIZE_U32, Page};
+
+#[cfg(test)]
+mod fixtures;
+mod record;
+#[cfg(test)]
+#[path = "list_tests.rs"]
+mod tests;
 
 /// Bytes per record.
 pub const REPEATER_RECORD_SIZE: usize = 80;
@@ -233,6 +236,15 @@ pub struct RepeaterSlot {
     index: u16,
 }
 
+integer_formats!(RepeaterSlot, index);
+
+impl TryFrom<(RepeaterListKind, u16)> for RepeaterSlot {
+    type Error = RepeaterListError;
+    fn try_from((kind, index): (RepeaterListKind, u16)) -> Result<Self, Self::Error> {
+        Self::new(kind, index)
+    }
+}
+
 impl RepeaterSlot {
     /// Validate a slot number.
     ///
@@ -286,6 +298,15 @@ pub struct RepeaterList {
 }
 
 impl RepeaterList {
+    /// An empty list of the selected repeater or hotspot kind.
+    #[must_use]
+    pub const fn new(kind: RepeaterListKind) -> Self {
+        Self {
+            kind,
+            entries: Vec::new(),
+        }
+    }
+
     /// Decode every slot of `kind` and follow the chain from the stored first
     /// slot.
     ///
@@ -349,8 +370,8 @@ impl RepeaterList {
 
     /// The records in chain order with their slots.
     #[must_use]
-    pub fn iter(&self) -> impl ExactSizeIterator<Item = (RepeaterSlot, &RepeaterRecord)> {
-        self.entries.iter().map(|(slot, record)| (*slot, record))
+    pub fn iter(&self) -> RepeaterListIter<'_> {
+        RepeaterListIter(self.entries.iter())
     }
 
     /// The record in `slot`, when populated.
@@ -433,6 +454,54 @@ impl RepeaterList {
         chain::changed_pages(image, start, &table)
     }
 }
+
+impl TryFrom<(RepeaterListKind, Vec<RepeaterRecord>)> for RepeaterList {
+    type Error = RepeaterListError;
+    fn try_from(
+        (kind, records): (RepeaterListKind, Vec<RepeaterRecord>),
+    ) -> Result<Self, Self::Error> {
+        Self::from_records(kind, records)
+    }
+}
+
+impl IntoIterator for RepeaterList {
+    type Item = (RepeaterSlot, RepeaterRecord);
+    type IntoIter = std::vec::IntoIter<Self::Item>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a RepeaterList {
+    type Item = (RepeaterSlot, &'a RepeaterRecord);
+    type IntoIter = RepeaterListIter<'a>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+/// Borrowed repeater or hotspot records and their slots in chain order.
+#[derive(Debug, Clone)]
+pub struct RepeaterListIter<'a>(std::slice::Iter<'a, (RepeaterSlot, RepeaterRecord)>);
+
+impl<'a> Iterator for RepeaterListIter<'a> {
+    type Item = (RepeaterSlot, &'a RepeaterRecord);
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next().map(|(slot, record)| (*slot, record))
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
+}
+
+impl DoubleEndedIterator for RepeaterListIter<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.0.next_back().map(|(slot, record)| (*slot, record))
+    }
+}
+
+impl ExactSizeIterator for RepeaterListIter<'_> {}
+impl std::iter::FusedIterator for RepeaterListIter<'_> {}
 
 /// The world-region, country and group name tables, with the country and
 /// group voice code tables.
@@ -808,7 +877,3 @@ fn rename(
         *entry = name;
     }
 }
-
-#[cfg(test)]
-#[path = "list_tests.rs"]
-mod tests;

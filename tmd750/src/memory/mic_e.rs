@@ -20,6 +20,10 @@ use crate::memory::MemoryImage;
 use crate::radio::programming::PageReplacement;
 use crate::types::{Address, PAGE_SIZE, Page};
 
+#[cfg(test)]
+#[path = "mic_e_tests.rs"]
+mod tests;
+
 /// Entries in each table.
 pub const MIC_E_TABLE_ENTRIES: usize = 5;
 /// Bytes per entry.
@@ -330,7 +334,3 @@ pub enum MicETypeCodeError {
         source: Box<Self>,
     },
 }
-
-#[cfg(test)]
-#[path = "mic_e_tests.rs"]
-mod tests;

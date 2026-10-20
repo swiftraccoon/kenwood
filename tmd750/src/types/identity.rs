@@ -1,7 +1,6 @@
 //! Radio identity: model, opaque radio type, and firmware.
 
 use std::fmt;
-use std::str::FromStr;
 
 use crate::error::ValidationError;
 
@@ -53,6 +52,8 @@ impl fmt::Display for RadioModel {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RadioType(String);
 
+string_traits!(RadioType, ValidationError);
+
 impl RadioType {
     /// Retain a non-empty graphic-ASCII payload (`0x21..=0x7E`) exactly.
     ///
@@ -64,12 +65,17 @@ impl RadioType {
     /// Returns [`ValidationError::InvalidRadioTypePayload`] for an empty value
     /// or one containing a byte outside that range.
     pub fn new(payload: &str) -> Result<Self, ValidationError> {
-        if payload.is_empty() || !payload.bytes().all(|byte| byte.is_ascii_graphic()) {
+        Self::validate(payload)?;
+        Ok(Self(payload.to_owned()))
+    }
+
+    fn validate(text: &str) -> Result<(), ValidationError> {
+        if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_graphic()) {
             Err(ValidationError::InvalidRadioTypePayload {
-                payload: payload.to_owned(),
+                payload: text.to_owned(),
             })
         } else {
-            Ok(Self(payload.to_owned()))
+            Ok(())
         }
     }
 
@@ -90,11 +96,13 @@ impl fmt::Display for RadioType {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FirmwareIdentity(String);
 
+string_traits!(FirmwareIdentity, ValidationError);
+
 impl FirmwareIdentity {
     /// Maximum byte length of the field.
     pub const MAX_LEN: usize = 8;
 
-    /// Validate and copy an exact `FV` payload.
+    /// Validate and retain an exact `FV` payload.
     ///
     /// Requires one through [`Self::MAX_LEN`] graphic-ASCII bytes
     /// (`0x21..=0x7E`). Spaces and all other whitespace are rejected, not trimmed.
@@ -105,13 +113,18 @@ impl FirmwareIdentity {
     /// overlong token and [`ValidationError::InvalidFirmwareIdentityByte`]
     /// for a byte outside graphic ASCII.
     pub fn new(value: &str) -> Result<Self, ValidationError> {
-        if !(1..=Self::MAX_LEN).contains(&value.len()) {
+        Self::validate(value)?;
+        Ok(Self(value.to_owned()))
+    }
+
+    fn validate(text: &str) -> Result<(), ValidationError> {
+        if !(1..=Self::MAX_LEN).contains(&text.len()) {
             return Err(ValidationError::FirmwareIdentityLength {
-                len: value.len(),
+                len: text.len(),
                 max: Self::MAX_LEN,
             });
         }
-        if let Some((offset, byte)) = value
+        if let Some((offset, byte)) = text
             .bytes()
             .enumerate()
             .find(|(_, byte)| !byte.is_ascii_graphic())
@@ -121,21 +134,13 @@ impl FirmwareIdentity {
                 value: byte,
             });
         }
-        Ok(Self(value.to_owned()))
+        Ok(())
     }
 
     /// The exact payload.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
-    }
-}
-
-impl FromStr for FirmwareIdentity {
-    type Err = ValidationError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Self::new(value)
     }
 }
 
@@ -150,6 +155,39 @@ mod tests {
     use super::*;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn assert_owned_transfer<T>(text: &str) -> TestResult
+    where
+        T: TryFrom<String> + AsRef<str> + Into<String>,
+        T::Error: std::error::Error + 'static,
+    {
+        let input = text.to_owned();
+        let allocation = input.as_ptr();
+        let checked = T::try_from(input)?;
+        assert_eq!(checked.as_ref(), text);
+        let output: String = checked.into();
+        assert_eq!(
+            output.as_ptr(),
+            allocation,
+            "checked conversions transfer owned text"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn checked_text_conversions_transfer_the_callers_allocation() -> TestResult {
+        use crate::memory::{ChannelNameText, My1Callsign, Pm1Name};
+        use crate::types::{AprsCallsign, UrCallsign};
+
+        assert_owned_transfer::<RadioType>("K,2,1")?;
+        assert_owned_transfer::<FirmwareIdentity>("1.02")?;
+        assert_owned_transfer::<AprsCallsign>("N0CALL-7")?;
+        assert_owned_transfer::<UrCallsign>("CQCQCQ")?;
+        assert_owned_transfer::<Pm1Name>("TRAVEL")?;
+        assert_owned_transfer::<ChannelNameText>("LOCAL")?;
+        assert_owned_transfer::<My1Callsign>("N0CALL A")?;
+        Ok(())
+    }
 
     #[test]
     fn model_accepts_only_the_exact_string() {

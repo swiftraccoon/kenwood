@@ -6,12 +6,15 @@ use super::{
     GuardKind, GuardPolicy, PmOffGatewayGuards as Guards, TextField, TextFieldUpdate,
     TextFieldUpdateError, TextValue, check_identity, complete_page, replace_field, sealed,
 };
-use crate::memory::{
-    FieldCodec, FieldDescriptor, FieldValue, MenuField, SLOT_TERM, StringEncoding, menu_field,
-};
+use crate::memory::{FieldDescriptor, MenuField, SLOT_TERM, menu_field};
 use crate::protocol::mcp::regions::writable_page_for;
 use crate::radio::Identity;
 use crate::types::{DvGatewayMode, PAGE_SIZE, Page, SlotIndex};
+use kenwood_schema::{CodecSpec, FieldCodec, FieldValue, StringEncoding};
+
+#[cfg(test)]
+#[path = "my1_tests.rs"]
+mod tests;
 
 pub(super) const FIELD_NAME: &str = "dv.MyCallsignDvGatewayList[0].MyCallsignDvGateway";
 const FIELD_LENGTH: usize = 8;
@@ -24,7 +27,7 @@ const RULE: &str = "1 to 8 uppercase ASCII letters, digits, or spaces, including
 ///
 /// At least one letter or digit is required. Leading, trailing, and interior
 /// spaces are preserved. This validates storage syntax only.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct My1Callsign(String);
 
 impl My1Callsign {
@@ -36,25 +39,70 @@ impl My1Callsign {
     /// value, missing alphanumeric content, or any unsupported byte.
     /// Lowercase, slashes, Unicode, controls, and embedded NUL are rejected.
     pub fn new(value: &str) -> Result<Self, TextFieldUpdateError> {
-        if value.is_empty()
-            || value.len() > FIELD_LENGTH
-            || !value
+        Self::validate(value)?;
+        Ok(Self(value.to_owned()))
+    }
+
+    fn validate(text: &str) -> Result<(), TextFieldUpdateError> {
+        if text.is_empty()
+            || text.len() > FIELD_LENGTH
+            || !text
                 .bytes()
                 .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b' ')
-            || !value.bytes().any(|byte| byte.is_ascii_alphanumeric())
+            || !text.bytes().any(|byte| byte.is_ascii_alphanumeric())
         {
             return Err(TextFieldUpdateError::InvalidText {
                 field: "MY1 callsign",
                 rule: RULE,
             });
         }
-        Ok(Self(value.to_owned()))
+        Ok(())
     }
 
     /// The exact validated bytes as text, including every space.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl AsRef<str> for My1Callsign {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::str::FromStr for My1Callsign {
+    type Err = TextFieldUpdateError;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<&str> for My1Callsign {
+    type Error = TextFieldUpdateError;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<String> for My1Callsign {
+    type Error = TextFieldUpdateError;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::validate(&value)?;
+        Ok(Self(value))
+    }
+}
+
+impl From<My1Callsign> for String {
+    fn from(value: My1Callsign) -> Self {
+        value.0
+    }
+}
+
+impl std::fmt::Display for My1Callsign {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
     }
 }
 
@@ -272,10 +320,13 @@ const CALLSIGN: FieldPin = FieldPin {
         FIELD_NAME,
         331_784,
         &[SLOT_TERM],
-        FieldCodec::FixedString {
+        match FieldCodec::new(CodecSpec::FixedString {
             len: FIELD_LENGTH,
             encoding: StringEncoding::Utf8,
             padding: 0,
+        }) {
+            Ok(codec) => codec,
+            Err(_) => unreachable!(),
         },
     ),
     menu: "dv",
@@ -287,7 +338,10 @@ const GATEWAY: FieldPin = FieldPin {
         "dv.DvGatewayModeDvGateway",
         TARGET_ADDRESS,
         &[SLOT_TERM],
-        FieldCodec::Byte { min: 0, max: 2 },
+        match FieldCodec::new(CodecSpec::Byte { min: 0, max: 2 }) {
+            Ok(codec) => codec,
+            Err(_) => unreachable!(),
+        },
     ),
     menu: "dv",
     options: Some(3),
@@ -298,14 +352,24 @@ const MY_SELECTION: FieldPin = FieldPin {
         "dv.MyCallsignSelectDvGateway",
         331_777,
         &[SLOT_TERM],
-        FieldCodec::Byte { min: 0, max: 255 },
+        match FieldCodec::new(CodecSpec::Byte { min: 0, max: 255 }) {
+            Ok(codec) => codec,
+            Err(_) => unreachable!(),
+        },
     ),
     menu: "dv",
     options: None,
     page_address: TARGET_ADDRESS,
 };
 const PM_SELECTION: FieldPin = FieldPin {
-    descriptor: FieldDescriptor::new("pm.PmSelect", 323_593, FieldCodec::Byte { min: 0, max: 6 }),
+    descriptor: FieldDescriptor::new(
+        "pm.PmSelect",
+        323_593,
+        match FieldCodec::new(CodecSpec::Byte { min: 0, max: 6 }) {
+            Ok(codec) => codec,
+            Err(_) => unreachable!(),
+        },
+    ),
     menu: "pm",
     options: Some(7),
     page_address: CONTROL_ADDRESS,
@@ -451,7 +515,3 @@ fn encode_callsign(
     }
     Ok(bytes)
 }
-
-#[cfg(test)]
-#[path = "my1_tests.rs"]
-mod tests;

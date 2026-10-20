@@ -520,8 +520,8 @@ fn every_nonzero_stored_selector_or_gateway_is_refused_without_changing_capture(
     Ok(())
 }
 
-fn descriptor_mutations(field: MenuField) -> Vec<MenuField> {
-    vec![
+fn descriptor_mutations(field: MenuField) -> Result<Vec<MenuField>, Box<dyn std::error::Error>> {
+    Ok(vec![
         MenuField {
             descriptor: FieldDescriptor {
                 name: "changed.field",
@@ -549,7 +549,7 @@ fn descriptor_mutations(field: MenuField) -> Vec<MenuField> {
         },
         MenuField {
             descriptor: FieldDescriptor {
-                codec: FieldCodec::Bytes { len: 9 },
+                codec: FieldCodec::new(CodecSpec::Bytes { len: 9 })?,
                 ..field.descriptor
             },
             ..field
@@ -584,14 +584,12 @@ fn descriptor_mutations(field: MenuField) -> Vec<MenuField> {
             ..field
         },
         MenuField {
-            storage_transform: Some(StorageTransform {
-                input_unit: "changed",
-                numerator: 1,
-                denominator: 1,
-            }),
+            storage_transform: Some(
+                StorageTransform::new("changed", 1, 1).ok_or("valid changed ratio")?,
+            ),
             ..field
         },
-    ]
+    ])
 }
 
 #[test]
@@ -605,7 +603,7 @@ fn every_descriptor_and_guard_shape_is_pinned_before_preparation() -> TestResult
             2 => original.my_selection,
             _ => original.pm_selection,
         };
-        for changed in descriptor_mutations(*field) {
+        for changed in descriptor_mutations(*field)? {
             let mut fields = Descriptors::load()?;
             match selected {
                 0 => fields.callsign = &changed,
@@ -630,17 +628,17 @@ fn every_descriptor_and_guard_shape_is_pinned_before_preparation() -> TestResult
         }
     }
     for codec in [
-        FieldCodec::FixedString {
+        CodecSpec::FixedString {
             len: 7,
             encoding: StringEncoding::Utf8,
             padding: 0,
         },
-        FieldCodec::FixedString {
+        CodecSpec::FixedString {
             len: 8,
             encoding: StringEncoding::Utf8,
             padding: b' ',
         },
-        FieldCodec::FixedString {
+        CodecSpec::FixedString {
             len: 8,
             encoding: StringEncoding::MemoryMap,
             padding: 0,
@@ -649,7 +647,7 @@ fn every_descriptor_and_guard_shape_is_pinned_before_preparation() -> TestResult
         let fields = Descriptors::load()?;
         let changed = MenuField {
             descriptor: FieldDescriptor {
-                codec,
+                codec: FieldCodec::new(codec)?,
                 ..fields.callsign.descriptor
             },
             ..*fields.callsign
@@ -800,7 +798,7 @@ fn each_byte_of_both_fresh_pages_and_immediate_readback_is_compared() -> TestRes
 #[test]
 fn fresh_guards_are_mandatory_in_both_apply_and_verify() -> TestResult {
     for phase in [0, 4] {
-        for fault in 0..7 {
+        for fault in 0..6 {
             let mut fixture = fixture()?;
             advance(&mut fixture, phase)?;
             let mut identity = fixture.identity.clone();
@@ -809,8 +807,7 @@ fn fresh_guards_are_mandatory_in_both_apply_and_verify() -> TestResult {
             }
             let gateway_mode = match fault {
                 1 => DvGatewayMode::Terminal,
-                2 => DvGatewayMode::Unnamed(255),
-                6 => DvGatewayMode::Unnamed(0),
+                2 => DvGatewayMode::from(255),
                 _ => DvGatewayMode::Off,
             };
             let page = if phase == 0 {
@@ -832,7 +829,7 @@ fn fresh_guards_are_mandatory_in_both_apply_and_verify() -> TestResult {
                 result,
                 Err(match fault {
                     0 => TextFieldUpdateError::IdentityMismatch,
-                    1 | 2 | 6 => TextFieldUpdateError::GatewayMode {
+                    1 | 2 => TextFieldUpdateError::GatewayMode {
                         actual: gateway_mode
                     },
                     3 => TextFieldUpdateError::MemoryFormat { actual: 1 },
@@ -859,7 +856,7 @@ fn fresh_guards_are_mandatory_in_both_apply_and_verify() -> TestResult {
 #[test]
 fn both_finalizations_require_the_current_id_exact_fresh_identity_and_gateway_off() -> TestResult {
     for phase in [3, 5] {
-        for fault in 0..5 {
+        for fault in 0..4 {
             let mut fixture = fixture()?;
             advance(&mut fixture, phase)?;
             let mut identity = fixture.identity.clone();
@@ -868,8 +865,7 @@ fn both_finalizations_require_the_current_id_exact_fresh_identity_and_gateway_of
             }
             let gateway_mode = match fault {
                 2 => DvGatewayMode::Terminal,
-                3 => DvGatewayMode::Unnamed(1),
-                4 => DvGatewayMode::Unnamed(0),
+                3 => DvGatewayMode::from(1),
                 _ => DvGatewayMode::Off,
             };
             let session = if fault == 0 {

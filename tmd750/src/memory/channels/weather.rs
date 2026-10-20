@@ -8,15 +8,21 @@
 
 use std::fmt;
 
-use crate::error::ValidationError;
+use crate::error::{SettingName, ValidationError};
 use crate::types::stored::{data_address_at, flag_address_at, name_address_at};
 use crate::types::{
     CHANNEL_NAME_SIZE, CHANNEL_RECORD_SIZE, ChannelName, StoredChannel, StoredChannelFlag,
 };
 
+#[cfg(test)]
+#[path = "weather_tests.rs"]
+mod tests;
+
 /// One of the ten weather channels, numbered 1 to 10.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WeatherChannel(u8);
+
+checked_integer_traits!(WeatherChannel, u8, number);
 
 impl WeatherChannel {
     /// Number of weather channels.
@@ -32,7 +38,7 @@ impl WeatherChannel {
     pub const fn new(number: u8) -> Result<Self, ValidationError> {
         if number == 0 || number > Self::COUNT {
             Err(ValidationError::SettingOutOfRange {
-                setting: "weather channel",
+                setting: SettingName::WeatherChannel,
                 value: number as u64,
                 max: Self::COUNT as u64,
             })
@@ -179,7 +185,3 @@ impl fmt::Display for WeatherChannelEntry {
         }
     }
 }
-
-#[cfg(test)]
-#[path = "weather_tests.rs"]
-mod tests;

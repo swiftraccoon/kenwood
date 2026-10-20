@@ -5,8 +5,9 @@
 //! [`crate::radio::menu::MenuUpdatePlan`], which applies them regardless of a
 //! field's classification here.
 
-use super::{FieldCodec, FieldValue, MenuField, My1Callsign};
+use super::{MenuField, My1Callsign};
 use crate::error::SchemaError;
+use kenwood_schema::{CodecSpec, FieldCodec, FieldValue, ValueKind};
 
 /// Whether a menu field belongs in an ordinary configuration update.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,7 +60,7 @@ impl MenuField {
     /// selector domains are enforced by [`Self::validate_ordinary_value`].
     #[must_use]
     pub fn write_policy(&self) -> MenuWritePolicy {
-        if self.is_blob || matches!(self.descriptor.codec, FieldCodec::Bytes { .. }) {
+        if self.is_blob || matches!(self.descriptor.codec.spec(), CodecSpec::Bytes { .. }) {
             MenuWritePolicy::Binary
         } else if requires_lifecycle(self.descriptor.name) {
             MenuWritePolicy::LifecycleRequired
@@ -104,8 +105,8 @@ impl MenuField {
             let FieldValue::Unsigned(raw) = value else {
                 return Err(SchemaError::TypeMismatch {
                     field,
-                    expected: "unsigned",
-                    actual: value.kind_name(),
+                    expected: ValueKind::Unsigned,
+                    actual: value.kind(),
                 }
                 .into());
             };
@@ -113,8 +114,8 @@ impl MenuField {
                 return Err(SchemaError::DisallowedValue { field, value: raw }.into());
             }
         }
-        if let (FieldCodec::FixedString { padding, .. }, FieldValue::Text(text)) =
-            (self.descriptor.codec, value)
+        if let (CodecSpec::FixedString { padding, .. }, FieldValue::Text(text)) =
+            (self.descriptor.codec.spec(), value)
             && text
                 .as_bytes()
                 .iter()
@@ -146,8 +147,8 @@ fn validate_my_callsign(
     let FieldValue::Text(text) = value else {
         return Err(SchemaError::TypeMismatch {
             field,
-            expected: "text",
-            actual: value.kind_name(),
+            expected: ValueKind::Text,
+            actual: value.kind(),
         }
         .into());
     };
@@ -278,33 +279,27 @@ fn numeric_capacity_only(codec: FieldCodec) -> bool {
     // The generated codec retains semantic bounds but not their provenance.
     // Full storage bounds therefore require choices or a reviewed supplement.
     // Use wider arithmetic so eight-byte limits never overflow or wrap.
-    match codec {
-        FieldCodec::Byte { min, max } => min == 0 && max == u8::MAX,
-        FieldCodec::BitField {
+    match codec.spec() {
+        CodecSpec::Byte { min, max } => min == 0 && max == u8::MAX,
+        CodecSpec::BitField {
             mask,
             shift,
             min,
             max,
-        } => shift >= 8 || mask == 0 || (min == 0 && max >= (mask >> shift)),
-        FieldCodec::Unsigned {
+        } => min == 0 && max == (mask >> shift),
+        CodecSpec::Unsigned {
+            width, min, max, ..
+        } => min == 0 && u128::from(max) == (1_u128 << (u32::from(width) * 8)) - 1,
+        CodecSpec::Signed {
             width, min, max, ..
         } => {
-            !(1..=8).contains(&width)
-                || (min == 0 && u128::from(max) >= (1_u128 << (u32::from(width) * 8)) - 1)
-        }
-        FieldCodec::Signed {
-            width, min, max, ..
-        } => {
-            if !(1..=8).contains(&width) {
-                return true;
-            }
             let magnitude = 1_i128 << (u32::from(width) * 8 - 1);
-            i128::from(min) <= -magnitude && i128::from(max) >= magnitude - 1
+            i128::from(min) == -magnitude && i128::from(max) == magnitude - 1
         }
-        FieldCodec::Bool
-        | FieldCodec::BitBool { .. }
-        | FieldCodec::FixedString { .. }
-        | FieldCodec::Bytes { .. } => false,
+        CodecSpec::Bool
+        | CodecSpec::BitBool { .. }
+        | CodecSpec::FixedString { .. }
+        | CodecSpec::Bytes { .. } => false,
     }
 }
 
@@ -389,7 +384,8 @@ fn supplemental_domain(name: &str) -> Option<SupplementalDomain> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::{Endian, MCP_D750_MENU_FIELDS, menu_field};
+    use crate::memory::{MCP_D750_MENU_FIELDS, menu_field};
+    use kenwood_schema::Endian;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -546,8 +542,8 @@ mod tests {
                 selected.validate_ordinary_value(FieldValue::Bool(false)),
                 Err(MenuWritePolicyError::Schema(SchemaError::TypeMismatch {
                     field: selected.descriptor.name,
-                    expected: "unsigned",
-                    actual: "boolean",
+                    expected: ValueKind::Unsigned,
+                    actual: ValueKind::Boolean,
                 })),
                 "{name} requires an unsigned selector, not a boolean"
             );
@@ -625,47 +621,48 @@ mod tests {
         let mut selected = *field("radio.Beep")?;
         selected.descriptor.name = "radio.FutureNumericField";
         for codec in [
-            FieldCodec::Byte {
+            CodecSpec::Byte {
                 min: 0,
                 max: u8::MAX,
             },
-            FieldCodec::Unsigned {
+            CodecSpec::Unsigned {
                 width: 2,
                 endian: Endian::Little,
                 min: 0,
                 max: 65_535,
             },
-            FieldCodec::Unsigned {
+            CodecSpec::Unsigned {
                 width: 8,
                 endian: Endian::Big,
                 min: 0,
                 max: u64::MAX,
             },
-            FieldCodec::Signed {
+            CodecSpec::Signed {
                 width: 2,
                 endian: Endian::Little,
                 min: -32_768,
                 max: 32_767,
             },
-            FieldCodec::Signed {
+            CodecSpec::Signed {
                 width: 8,
                 endian: Endian::Big,
                 min: i64::MIN,
                 max: i64::MAX,
             },
-            FieldCodec::BitField {
+            CodecSpec::BitField {
                 mask: 0x0C,
                 shift: 2,
                 min: 0,
                 max: 3,
             },
-            FieldCodec::BitField {
+            CodecSpec::BitField {
                 mask: 0x04,
                 shift: 2,
                 min: 0,
                 max: 1,
             },
         ] {
+            let codec = FieldCodec::new(codec)?;
             selected.descriptor.codec = codec;
             assert_eq!(
                 selected.write_policy(),
@@ -681,26 +678,27 @@ mod tests {
             selected.allowed_values = &[];
         }
         for codec in [
-            FieldCodec::Byte { min: 2, max: 12 },
-            FieldCodec::Unsigned {
+            CodecSpec::Byte { min: 2, max: 12 },
+            CodecSpec::Unsigned {
                 width: 2,
                 endian: Endian::Little,
                 min: 2,
                 max: 1800,
             },
-            FieldCodec::Signed {
+            CodecSpec::Signed {
                 width: 4,
                 endian: Endian::Little,
                 min: -500,
                 max: 15_000,
             },
-            FieldCodec::BitField {
+            CodecSpec::BitField {
                 mask: 0x0C,
                 shift: 2,
                 min: 0,
                 max: 2,
             },
         ] {
+            let codec = FieldCodec::new(codec)?;
             selected.descriptor.codec = codec;
             assert_eq!(
                 selected.write_policy(),
@@ -752,7 +750,7 @@ mod tests {
                 )?;
                 assert_eq!(
                     assignment.value(),
-                    &crate::memory::DecodedFieldValue::Text(text.to_owned()),
+                    &kenwood_schema::DecodedFieldValue::Text(text.to_owned()),
                     "MY entry {index} must preserve exact valid text, including clearing and spaces"
                 );
             }
@@ -806,8 +804,8 @@ mod tests {
                 selected.validate_ordinary_value(FieldValue::Unsigned(0)),
                 Err(MenuWritePolicyError::Schema(SchemaError::TypeMismatch {
                     field: selected.descriptor.name,
-                    expected: "text",
-                    actual: "unsigned",
+                    expected: ValueKind::Text,
+                    actual: ValueKind::Unsigned,
                 })),
                 "MY entry {index} requires typed text"
             );

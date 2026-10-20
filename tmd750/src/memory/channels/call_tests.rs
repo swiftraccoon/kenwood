@@ -162,7 +162,7 @@ fn stored_call_records_decode_to_what_call_mode_reports() -> TestResult {
         let stored = entry.record().ok_or("a stored CALL record")?;
         assert_eq!(stored.cat_record()?.to_wire_fields(), reported);
         assert_eq!(stored.to_bytes(), record(head), "decoding is lossless");
-        assert_eq!(stored.mode, entry.channel().mode().operating_mode());
+        assert_eq!(stored.mode.mode(), entry.channel().mode().operating_mode());
         assert_eq!(entry.flag(), flag);
         assert_eq!(entry.name().text(), text);
     }
@@ -306,7 +306,7 @@ fn a_call_record_keeps_its_band_range_and_mode() -> TestResult {
     }
     let dv = CallChannel::new(CallBand::Uhf, CallMode::Dv);
     let mut analog = stored_record(&image, dv)?;
-    analog.mode = OperatingMode::Fm;
+    analog.mode = OperatingMode::Fm.try_into()?;
     assert_eq!(
         CallChannelPlan::new([(dv, analog)]),
         Err(ValidationError::CallChannelMode {

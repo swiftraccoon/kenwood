@@ -8,10 +8,11 @@ use thiserror as _;
 use tokio_serial as _;
 use tracing as _;
 
-use kenwood_tmd750::protocol::mcp::{ACK, ENTER, EXIT, read_request, write_request};
+use kenwood_tmd750::protocol::mcp::{ACK, ENTER, EXIT, Header};
 use kenwood_tmd750::radio::Radio;
 use kenwood_tmd750::{
-    Address, Band, DvGatewayMode, Error, OperatingMode, Page, ProtocolError, Region, SelectableMode,
+    Address, Band, CommandName, DvGatewayMode, Error, OperatingMode, Page, ProtocolError, Region,
+    SelectableMode, TimeoutOperation,
 };
 use kenwood_transport::MockTransport;
 
@@ -30,13 +31,13 @@ fn scripted_live_identity(mock: &mut MockTransport) {
 }
 
 fn read_reply(page: Page, data: &[u8]) -> Vec<u8> {
-    let mut reply = write_request(page).to_vec();
+    let mut reply = Header::write_request(page).to_vec();
     reply.extend_from_slice(data);
     reply
 }
 
 fn fill_reply(page: Page, fill: u8) -> Vec<u8> {
-    let mut reply = write_request(page).to_vec();
+    let mut reply = Header::write_request(page).to_vec();
     if let Some(first) = reply.first_mut() {
         *first = b'Z';
     }
@@ -67,7 +68,7 @@ async fn operating_modes_and_gateway_state_are_typed_reads() -> TestResult {
     assert_eq!(radio.get_operating_mode(Band::A).await?, OperatingMode::Fm);
     assert_eq!(
         radio.get_operating_mode(Band::B).await?,
-        OperatingMode::Unnamed(7)
+        OperatingMode::from(7)
     );
     assert_eq!(
         radio.get_dv_gateway_mode().await?,
@@ -102,7 +103,7 @@ async fn mode_selection_refuses_a_mismatched_readback() -> TestResult {
         matches!(
             result,
             Err(Error::Protocol(ProtocolError::ReadbackMismatch {
-                command: "MD",
+                command: CommandName::Md,
                 ref requested,
                 ref observed,
             })) if requested == "DV" && observed == "FM"
@@ -161,7 +162,7 @@ async fn mode_selection_refuses_a_mismatched_write_echo_before_readback() -> Tes
         matches!(
             result,
             Err(Error::Protocol(ProtocolError::EchoMismatch {
-                command: "MD",
+                command: CommandName::Md,
                 ref requested,
                 ref echoed,
             })) if requested == "DV" && echoed == "FM"
@@ -206,7 +207,7 @@ async fn mode_selection_reports_a_rejected_or_unavailable_write() -> TestResult 
         matches!(
             result,
             Err(Error::Protocol(ProtocolError::NotAvailable {
-                command: "MD"
+                command: CommandName::Md
             }))
         ),
         "{result:?}"
@@ -221,7 +222,9 @@ async fn mode_selection_reports_a_rejected_or_unavailable_write() -> TestResult 
     assert!(
         matches!(
             result,
-            Err(Error::Protocol(ProtocolError::Rejected { command: "MD" }))
+            Err(Error::Protocol(ProtocolError::Rejected {
+                command: CommandName::Md
+            }))
         ),
         "{result:?}"
     );
@@ -309,7 +312,7 @@ async fn verified_setters_apply_the_gate_then_echo_then_readback() -> TestResult
 
 #[tokio::test]
 async fn dstar_callsign_write_echoes_reads_back_and_clears() -> TestResult {
-    use kenwood_tmd750::types::{DstarCallsignEntry, DstarSlot};
+    use kenwood_tmd750::types::{DstarCallsignEntry, DstarCallsignText, DstarSlot};
 
     let mut mock = MockTransport::new();
     scripted_live_identity(&mut mock);
@@ -320,7 +323,13 @@ async fn dstar_callsign_write_echoes_reads_back_and_clears() -> TestResult {
     let mut radio = Radio::new(mock);
     let slot = DstarSlot::new(6)?;
     radio
-        .set_dstar_callsign(&DstarCallsignEntry::new(slot, "KQ4NIT", "RIG")?)
+        .set_dstar_callsign(&DstarCallsignEntry::new(
+            slot,
+            DstarCallsignText {
+                callsign: "KQ4NIT".into(),
+                memo: "RIG".into(),
+            },
+        )?)
         .await?;
     radio.clear_dstar_callsign(slot).await?;
     radio.into_transport().assert_complete();
@@ -329,7 +338,7 @@ async fn dstar_callsign_write_echoes_reads_back_and_clears() -> TestResult {
 
 #[tokio::test]
 async fn dstar_callsign_write_refuses_a_mismatched_echo() -> TestResult {
-    use kenwood_tmd750::types::{DstarCallsignEntry, DstarSlot};
+    use kenwood_tmd750::types::{DstarCallsignEntry, DstarCallsignText, DstarSlot};
 
     let mut mock = MockTransport::new();
     scripted_live_identity(&mut mock);
@@ -340,15 +349,17 @@ async fn dstar_callsign_write_refuses_a_mismatched_echo() -> TestResult {
     let result = radio
         .set_dstar_callsign(&DstarCallsignEntry::new(
             DstarSlot::new(6)?,
-            "KQ4NIT",
-            "RIG",
+            DstarCallsignText {
+                callsign: "KQ4NIT".into(),
+                memo: "RIG".into(),
+            },
         )?)
         .await;
     assert!(
         matches!(
             result,
             Err(Error::Protocol(ProtocolError::EchoMismatch {
-                command: "DC",
+                command: CommandName::Dc,
                 ..
             }))
         ),
@@ -396,7 +407,7 @@ async fn aprs_callsign_write_refuses_a_mismatched_echo() -> TestResult {
         matches!(
             result,
             Err(Error::Protocol(ProtocolError::EchoMismatch {
-                command: "CS",
+                command: CommandName::Cs,
                 ref requested,
                 ref echoed,
             })) if requested == "KQ4NIT-9" && echoed == "KQ4NIT"
@@ -459,7 +470,7 @@ async fn an_acknowledged_step_that_never_applies_is_an_error() -> TestResult {
             result,
             Err(Error::StepNotApplied {
                 band: Band::A,
-                step: "DW",
+                step: CommandName::Dw,
                 ..
             })
         ),
@@ -526,7 +537,7 @@ async fn memory_channel_writes_verify_the_echo_and_the_readback() -> TestResult 
         matches!(
             differing,
             Err(Error::Protocol(ProtocolError::ReadbackMismatch {
-                command: "ME",
+                command: CommandName::Me,
                 ref observed,
                 ..
             })) if observed.starts_with("0145200000,")
@@ -572,7 +583,7 @@ async fn a_vfo_record_write_reports_echo_and_readback_differences_as_wire_fields
         matches!(
             echoed,
             Err(Error::Protocol(ProtocolError::EchoMismatch {
-                command: "FO",
+                command: CommandName::Fo,
                 ref requested,
                 ref echoed,
             })) if requested == BEFORE && *echoed == after
@@ -584,7 +595,7 @@ async fn a_vfo_record_write_reports_echo_and_readback_differences_as_wire_fields
         matches!(
             read_back,
             Err(Error::Protocol(ProtocolError::ReadbackMismatch {
-                command: "FO",
+                command: CommandName::Fo,
                 ref requested,
                 ref observed,
             })) if *requested == after && observed == BEFORE
@@ -710,9 +721,12 @@ async fn read_regions_handles_data_and_fill_replies() -> TestResult {
     let mut mock = MockTransport::new();
     scripted_identity(&mut mock);
     mock.expect(ENTER, b"0M\r");
-    mock.expect(&read_request(first), &read_reply(first, &[0x11; 256]));
+    mock.expect(
+        &Header::read_request(first),
+        read_reply(first, &[0x11; 256]),
+    );
     mock.expect(&[ACK], &[ACK]);
-    mock.expect(&read_request(second), &fill_reply(second, 0xEE));
+    mock.expect(&Header::read_request(second), fill_reply(second, 0xEE));
     mock.expect(&[ACK], &[ACK]);
     mock.expect(&[EXIT], &[ACK]);
     let mut radio = Radio::new(mock);
@@ -739,7 +753,7 @@ async fn echo_mismatch_is_a_protocol_error() -> TestResult {
     let mut mock = MockTransport::new();
     scripted_identity(&mut mock);
     mock.expect(ENTER, b"0M\r");
-    mock.expect(&read_request(page), &read_reply(other, &[0; 40]));
+    mock.expect(&Header::read_request(page), read_reply(other, &[0; 40]));
     let mut radio = Radio::new(mock);
     let mut session = radio.enter_mcp().await?;
     let result = session.read_regions(&[page.region()], |_| {}).await;
@@ -834,7 +848,7 @@ async fn transmit_until_returns_a_refused_transmit_without_awaiting_the_stop() -
         matches!(
             result,
             Err(Error::Protocol(ProtocolError::NotAvailable {
-                command: "TX"
+                command: CommandName::Tx
             }))
         ),
         "{result:?}"
@@ -856,7 +870,7 @@ async fn a_refused_transmit_is_not_available_and_sends_no_receive() -> TestResul
         matches!(
             result,
             Err(Error::Protocol(ProtocolError::NotAvailable {
-                command: "TX"
+                command: CommandName::Tx
             }))
         ),
         "{result:?}"
@@ -920,7 +934,7 @@ async fn an_aprs_beacon_request_sends_be_and_requires_its_acknowledgement() -> T
         matches!(
             refused,
             Err(Error::Protocol(ProtocolError::NotAvailable {
-                command: "BE"
+                command: CommandName::Be
             }))
         ),
         "{refused:?}"
@@ -954,7 +968,7 @@ async fn receive_still_releases_the_transmitter_after_an_unanswered_transmit() -
         matches!(
             keyed,
             Err(Error::Timeout {
-                operation: "TX",
+                operation: TimeoutOperation::Command(CommandName::Tx),
                 ..
             })
         ),
@@ -1000,7 +1014,7 @@ async fn transmit_until_releases_a_key_up_it_could_not_confirm() -> TestResult {
             matches!(
                 result,
                 Err(Error::Timeout {
-                    operation: "TX",
+                    operation: TimeoutOperation::Command(CommandName::Tx),
                     ..
                 } | Error::Protocol(ProtocolError::FieldParse { .. }))
             ),
@@ -1038,7 +1052,7 @@ async fn an_unacknowledged_release_is_the_error_that_may_leave_the_transmitter_k
             matches!(
                 release.as_ref(),
                 Error::Timeout {
-                    operation: "RX",
+                    operation: TimeoutOperation::Command(CommandName::Rx),
                     ..
                 }
             ),

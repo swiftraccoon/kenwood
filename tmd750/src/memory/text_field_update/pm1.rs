@@ -5,10 +5,15 @@ use super::{
     NoGuards, TextField, TextFieldUpdate, TextFieldUpdateError, TextValue, check_identity,
     complete_page, replace_field, sealed,
 };
-use crate::memory::{FieldCodec, FieldValue, MenuField, StringEncoding, menu_field};
+use crate::memory::{MenuField, menu_field};
 use crate::protocol::mcp::regions::writable_page_for;
 use crate::radio::Identity;
 use crate::types::{PAGE_SIZE, Page};
+use kenwood_schema::{CodecSpec, FieldValue, StringEncoding};
+
+#[cfg(test)]
+#[path = "pm1_tests.rs"]
+mod tests;
 
 pub(super) const FIELD_NAME: &str = "pm.PmName1";
 const FIELD_ADDRESS: u32 = 323_594;
@@ -20,7 +25,7 @@ const RULE: &str = "1 to 16 printable ASCII bytes";
 ///
 /// Spaces are preserved exactly, including leading and trailing spaces. The
 /// accepted bytes are ASCII graphic characters and the space.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Pm1Name(String);
 
 impl Pm1Name {
@@ -31,9 +36,14 @@ impl Pm1Name {
     /// Returns [`TextFieldUpdateError::InvalidText`] for empty, oversized,
     /// control, non-ASCII, or embedded-NUL input.
     pub fn new(value: &str) -> Result<Self, TextFieldUpdateError> {
-        if value.is_empty()
-            || value.len() > FIELD_LENGTH
-            || !value
+        Self::validate(value)?;
+        Ok(Self(value.to_owned()))
+    }
+
+    fn validate(text: &str) -> Result<(), TextFieldUpdateError> {
+        if text.is_empty()
+            || text.len() > FIELD_LENGTH
+            || !text
                 .bytes()
                 .all(|byte| byte.is_ascii_graphic() || byte == b' ')
         {
@@ -42,13 +52,53 @@ impl Pm1Name {
                 rule: RULE,
             });
         }
-        Ok(Self(value.to_owned()))
+        Ok(())
     }
 
     /// The exact validated text, with spaces preserved.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl AsRef<str> for Pm1Name {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::str::FromStr for Pm1Name {
+    type Err = TextFieldUpdateError;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<&str> for Pm1Name {
+    type Error = TextFieldUpdateError;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<String> for Pm1Name {
+    type Error = TextFieldUpdateError;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::validate(&value)?;
+        Ok(Self(value))
+    }
+}
+
+impl From<Pm1Name> for String {
+    fn from(value: Pm1Name) -> Self {
+        value.0
+    }
+}
+
+impl std::fmt::Display for Pm1Name {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
     }
 }
 
@@ -133,8 +183,8 @@ fn supported_page(field: &MenuField) -> Result<Page, TextFieldUpdateError> {
     if field.descriptor.name != FIELD_NAME
         || field.descriptor.base != FIELD_ADDRESS
         || !field.descriptor.terms.is_empty()
-        || field.descriptor.codec
-            != (FieldCodec::FixedString {
+        || field.descriptor.codec.spec()
+            != (CodecSpec::FixedString {
                 len: FIELD_LENGTH,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
@@ -179,7 +229,3 @@ fn encode_name(
     }
     Ok(bytes)
 }
-
-#[cfg(test)]
-#[path = "pm1_tests.rs"]
-mod tests;

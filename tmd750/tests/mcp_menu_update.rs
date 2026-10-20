@@ -8,7 +8,7 @@ use thiserror as _;
 use tokio_serial as _;
 use tracing as _;
 
-use kenwood_tmd750::protocol::mcp::{ACK, read_request, regions, write_request};
+use kenwood_tmd750::protocol::mcp::{ACK, Header, regions};
 use kenwood_tmd750::{
     FirmwareIdentity, Identity, MenuAssignment, MenuFieldSnapshot, MenuUpdatePlan, Page,
     PageReplacement, Radio, RadioModel, RadioType, Region, SlotIndex,
@@ -59,14 +59,14 @@ fn entry(firmware: &str) -> MockTransport {
 }
 
 fn read(mock: &mut MockTransport, page: Page, bytes: &[u8]) {
-    let mut reply = write_request(page).to_vec();
+    let mut reply = Header::write_request(page).to_vec();
     reply.extend_from_slice(bytes);
-    mock.expect(&read_request(page), &reply);
+    mock.expect(&Header::read_request(page), &reply);
     mock.expect(&[ACK], &[ACK]);
 }
 
 fn write(mock: &mut MockTransport, replacement: &PageReplacement) {
-    let mut frame = write_request(replacement.page()).to_vec();
+    let mut frame = Header::write_request(replacement.page()).to_vec();
     frame.extend_from_slice(replacement.replacement());
     mock.expect(&frame, &[ACK]);
     read(mock, replacement.page(), replacement.replacement());

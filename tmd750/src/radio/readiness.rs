@@ -21,6 +21,7 @@
 //! firmware timing guarantees.
 
 use std::future::Future;
+use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -33,6 +34,9 @@ use crate::transport::reenumeration::{
 };
 use crate::transport::{SerialCandidate, SerialTransport, UsbRole, discover_serial, open_serial};
 use crate::types::DvGatewayMode;
+
+#[cfg(test)]
+mod tests;
 
 /// Silent wait after an MCP exit acknowledgment, before the first enumeration.
 pub const SETTLE: Duration = Duration::from_secs(2);
@@ -148,7 +152,7 @@ pub trait ControlHost {
     fn open(
         &mut self,
         endpoint: &SerialCandidate,
-        baud: u32,
+        baud: NonZeroU32,
     ) -> Result<Self::Connection, TransportError>;
 
     /// Monotonic elapsed time from this host's origin.
@@ -231,7 +235,7 @@ impl ControlHost for SystemControlHost {
     fn open(
         &mut self,
         endpoint: &SerialCandidate,
-        baud: u32,
+        baud: NonZeroU32,
     ) -> Result<Self::Connection, TransportError> {
         open_serial(&endpoint.path, baud)
     }
@@ -625,13 +629,14 @@ pub async fn await_continuous_enumeration<C: ControlHost>(
 ///
 /// No settle wait and no enumeration precede the open: this is the check for
 /// an endpoint that is already answering CAT. Each query uses
-/// [`EXCHANGE_TIMEOUT`]. Cancellation is checked before each query, never by
-/// dropping an in-flight exchange, and an opened connection is always handed
+/// [`EXCHANGE_TIMEOUT`]. Cancellation is checked before the three-query
+/// identity operation and before `GW`, without dropping an in-flight exchange.
+/// An opened connection is always handed
 /// to the host's close.
 pub async fn observe_control<C: ControlHost>(
     host: &mut C,
     endpoint: &SerialCandidate,
-    baud: u32,
+    baud: NonZeroU32,
     expected: Expectation<'_>,
     cancelled: &AtomicBool,
 ) -> ObservationReport {
@@ -680,7 +685,7 @@ pub async fn observe_control<C: ControlHost>(
 pub async fn verify_readiness<C: ControlHost>(
     host: &mut C,
     endpoint: &SerialCandidate,
-    baud: u32,
+    baud: NonZeroU32,
     expected: &Identity,
     gateway: Option<DvGatewayMode>,
     cancelled: &AtomicBool,
@@ -863,7 +868,7 @@ struct Observed {
 async fn run_connection<C: ControlHost>(
     host: &mut C,
     endpoint: &SerialCandidate,
-    baud: u32,
+    baud: NonZeroU32,
     query: Query<'_>,
     cancelled: &AtomicBool,
 ) -> Observed {
@@ -1033,10 +1038,7 @@ impl<T: Transport> Transport for Counted<T> {
         self.inner.close().await
     }
 
-    fn set_baud_rate(&mut self, baud: u32) -> Result<(), TransportError> {
+    fn set_baud_rate(&mut self, baud: NonZeroU32) -> Result<(), TransportError> {
         self.inner.set_baud_rate(baud)
     }
 }
-
-#[cfg(test)]
-mod tests;

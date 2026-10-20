@@ -263,42 +263,41 @@ impl RadioConfig {
         bytes.extend_from_slice(&self.image);
         bytes
     }
-}
-
-/// Parse a structurally valid full or short `.d750` configuration.
-///
-/// The header signature selects the required payload length; total length
-/// alone is not a format discriminator. All opaque header metadata and image
-/// bytes are retained. No bytes beyond a short file's coverage are invented.
-///
-/// # Errors
-///
-/// Returns [`FileError::HeaderTooShort`] for an incomplete header,
-/// [`FileError::InvalidSignature`], [`FileError::InvalidModel`], or
-/// [`FileError::NonzeroReservedByte`] for an invalid known header field, and
-/// [`FileError::Length`] when the remaining length disagrees with the signature.
-pub fn parse_d750(data: &[u8]) -> Result<RadioConfig, FileError> {
-    let header_length_error = || FileError::HeaderTooShort {
-        actual: data.len(),
-        minimum: HEADER_SIZE,
-    };
-    let header = data
-        .first_chunk::<HEADER_SIZE>()
-        .copied()
-        .ok_or_else(header_length_error)?;
-    let header = ConfigHeader::try_from(header)?;
-    let expected = header.layout().file_size();
-    if data.len() != expected {
-        return Err(FileError::Length {
+    /// Parse a structurally valid full or short `.d750` configuration.
+    ///
+    /// The header signature selects the required payload length; total length
+    /// alone is not a format discriminator. All opaque header metadata and image
+    /// bytes are retained. No bytes beyond a short file's coverage are invented.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FileError::HeaderTooShort`] for an incomplete header,
+    /// [`FileError::InvalidSignature`], [`FileError::InvalidModel`], or
+    /// [`FileError::NonzeroReservedByte`] for an invalid known header field, and
+    /// [`FileError::Length`] when the remaining length disagrees with the signature.
+    pub fn from_bytes(data: &[u8]) -> Result<Self, FileError> {
+        let header_length_error = || FileError::HeaderTooShort {
             actual: data.len(),
-            expected,
-        });
+            minimum: HEADER_SIZE,
+        };
+        let header = data
+            .first_chunk::<HEADER_SIZE>()
+            .copied()
+            .ok_or_else(header_length_error)?;
+        let header = ConfigHeader::try_from(header)?;
+        let expected = header.layout().file_size();
+        if data.len() != expected {
+            return Err(FileError::Length {
+                actual: data.len(),
+                expected,
+            });
+        }
+        let image = data
+            .get(HEADER_SIZE..)
+            .ok_or_else(header_length_error)?
+            .to_vec();
+        Self::new(header, image)
     }
-    let image = data
-        .get(HEADER_SIZE..)
-        .ok_or_else(header_length_error)?
-        .to_vec();
-    RadioConfig::new(header, image)
 }
 
 #[cfg(test)]
@@ -336,7 +335,7 @@ mod tests {
     #[test]
     fn full_files_round_trip() -> TestResult {
         let data = sample(FileLayout::Full)?;
-        let config = parse_d750(&data)?;
+        let config = RadioConfig::from_bytes(&data)?;
         assert_eq!(
             config.layout(),
             FileLayout::Full,
@@ -364,7 +363,7 @@ mod tests {
     #[test]
     fn short_files_preserve_only_their_actual_coverage_and_round_trip() -> TestResult {
         let data = sample(FileLayout::WithoutStartupScreen)?;
-        let config = parse_d750(&data)?;
+        let config = RadioConfig::from_bytes(&data)?;
         assert_eq!(
             config.layout(),
             FileLayout::WithoutStartupScreen,
@@ -394,7 +393,7 @@ mod tests {
             let mut data = sample(layout)?;
             let _removed = data.pop();
             assert_eq!(
-                parse_d750(&data),
+                RadioConfig::from_bytes(&data),
                 Err(FileError::Length {
                     actual: layout.file_size() - 1,
                     expected: layout.file_size(),
@@ -403,7 +402,7 @@ mod tests {
             );
         }
         assert_eq!(
-            parse_d750(&[0; HEADER_SIZE - 1]),
+            RadioConfig::from_bytes(&[0; HEADER_SIZE - 1]),
             Err(FileError::HeaderTooShort {
                 actual: HEADER_SIZE - 1,
                 minimum: HEADER_SIZE
@@ -513,7 +512,7 @@ mod tests {
     fn payload_mutation_preserves_the_header_and_all_other_image_bytes() -> TestResult {
         for layout in [FileLayout::Full, FileLayout::WithoutStartupScreen] {
             let original = sample(layout)?;
-            let mut config = parse_d750(&original)?;
+            let mut config = RadioConfig::from_bytes(&original)?;
             let last = layout.image_bytes() - 1;
             *config
                 .image_bytes_mut()
@@ -541,7 +540,7 @@ mod tests {
                 "payload changes cannot alter header layout"
             );
             assert_eq!(
-                parse_d750(&expected)?,
+                RadioConfig::from_bytes(&expected)?,
                 config,
                 "modified valid containers round-trip exactly"
             );

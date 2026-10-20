@@ -10,7 +10,6 @@ use proptest::test_runner::TestCaseError;
 
 // Dev-dependencies visible to every kenwood-tmd750 test target but unused
 // here, acknowledged so `unused_crate_dependencies` stays silent.
-use kenwood_schema as _;
 use kenwood_transport as _;
 use mcp_d75_extract as _;
 use mmdvm as _;
@@ -19,31 +18,30 @@ use tokio as _;
 use tokio_serial as _;
 use tracing as _;
 
+use kenwood_schema::{CodecSpec, DecodedFieldValue};
 use kenwood_tmd750::error::SchemaError;
-use kenwood_tmd750::file::{ConfigHeader, FileLayout, HEADER_SIZE, RadioConfig, parse_d750};
+use kenwood_tmd750::file::{ConfigHeader, FileLayout, HEADER_SIZE, RadioConfig};
 use kenwood_tmd750::memory::repeater_list::REPEATER_TEXT_SIZE;
 use kenwood_tmd750::memory::{
-    ChannelNameText, ConfigurationError, DecodedFieldValue, FieldCodec, MCP_D750_MENU_FIELDS,
-    MemoryImage, MenuField, MenuWritePolicy, PatchPlanner, StandardConfiguration,
-    StandardConfigurationDiff, StoredText, TextImage, TextScope, TextScopeKind, TextSetting,
+    ChannelNameText, ConfigurationError, MCP_D750_MENU_FIELDS, MemoryImage, MenuField,
+    MenuWritePolicy, PatchPlanner, StandardConfiguration, StandardConfigurationDiff, StoredText,
+    TextImage, TextScope, TextScopeKind, TextSetting,
 };
 
 /// The stored text of one repeater-list name.
 type RepeaterName = StoredText<REPEATER_TEXT_SIZE>;
-use kenwood_tmd750::protocol::cat::{Command, Response, parse_line};
+use kenwood_tmd750::protocol::cat::{Command, Response};
 use kenwood_tmd750::protocol::mcp::regions::{menu_regions, writable_page_for};
-use kenwood_tmd750::protocol::mcp::{
-    BytePatch, Header, HeaderCommand, PagePatch, read_request, write_request,
-};
+use kenwood_tmd750::protocol::mcp::{BytePatch, Header, HeaderCommand, PagePatch};
 use kenwood_tmd750::types::{
     Address, AmHighCut, AprsCallsign, BacklightControl, Band, BandControl, BandDisplay,
-    BeaconMethod, CHANNEL_NAME_SIZE, CrossToneField, DcsCode, DigitalCode, DigitalSquelch,
-    DstarCallsignEntry, DstarSlot, FirmwareIdentity, Frequency, GpsSettings, IMAGE_LENGTH,
-    IMAGE_LENGTH_U32, MemoryChannelAddress, MyPositionSelection, NmeaSentences, OffsetFrequency,
-    OperatingMode, PacketDataRate, Page, PowerLevel, RadioType, Region, RouteField, SLOT_COUNT,
-    SelectableMode, ShiftDirection, SlotIndex, SquelchLevel, StepSize, StoredCallsign,
-    StoredChannel, StoredChannelFlag, ToneCode, ToneMode, TransmitSetting, TuningMode, VoxDelay,
-    VoxGain, WIRE_DIGITS,
+    BeaconMethod, CHANNEL_NAME_SIZE, ChannelModeBits, CrossToneField, DcsCode, DigitalCode,
+    DigitalSquelch, DstarCallsignEntry, DstarCallsignText, DstarSlot, FirmwareIdentity, Frequency,
+    GpsSettings, IMAGE_LENGTH, IMAGE_LENGTH_U32, MemoryChannelAddress, MyPositionSelection,
+    NmeaSentences, OffsetFrequency, OperatingMode, PacketDataRate, Page, PowerLevel, RadioType,
+    Region, RouteField, SLOT_COUNT, SelectableMode, ShiftDirection, SlotIndex, SquelchLevel,
+    StepSize, StoredCallsign, StoredChannel, StoredChannelFlag, StoredMode, ToneCode, ToneMode,
+    TransmitSetting, TuningMode, VoxDelay, VoxGain, WIRE_DIGITS,
 };
 use kenwood_tmd750::{
     Identity, MenuAssignment, MenuFieldSnapshot, MenuUpdateError, MenuUpdatePlan, RadioModel,
@@ -175,9 +173,9 @@ fn arb_stored_channel() -> impl Strategy<Value = StoredChannel> {
         arb_transmit(),
         arb_step(),
         arb_step(),
-        0u8..=15,
+        (0u8..=15).prop_filter_map("stored mode nibble", |raw| StoredMode::try_from(raw).ok()),
         any::<bool>(),
-        0u8..=7,
+        (0u8..=7).prop_filter_map("stored mode low bits", |raw| ChannelModeBits::new(raw).ok()),
         arb_tone_mode(),
         any::<bool>(),
         arb_shift(),
@@ -224,11 +222,10 @@ fn arb_stored_channel() -> impl Strategy<Value = StoredChannel> {
             ),
         )| StoredChannel {
             receive_frequency,
-            split: matches!(transmit, TransmitSetting::Split(_)),
             transmit,
             receive_step,
             transmit_step,
-            mode: OperatingMode::from(mode_nibble),
+            mode: mode_nibble,
             mode_flag,
             mode_low_bits,
             tone_mode,
@@ -266,7 +263,16 @@ fn arb_memory_address() -> impl Strategy<Value = MemoryChannelAddress> {
 fn arb_dstar_entry() -> impl Strategy<Value = DstarCallsignEntry> {
     (arb_dstar_slot(), "[ -~]{0,8}", "[ -~]{0,4}").prop_filter_map(
         "entry inside the accepted text domain",
-        |(slot, callsign, memo)| DstarCallsignEntry::new(slot, &callsign, &memo).ok(),
+        |(slot, callsign, memo)| {
+            DstarCallsignEntry::new(
+                slot,
+                DstarCallsignText {
+                    callsign: callsign.into(),
+                    memo: memo.into(),
+                },
+            )
+            .ok()
+        },
     )
 }
 
@@ -509,21 +515,21 @@ fn arb_field_value(field: &'static MenuField) -> BoxedStrategy<DecodedFieldValue
             .prop_map(DecodedFieldValue::Unsigned)
             .boxed();
     }
-    match field.descriptor.codec {
-        FieldCodec::Byte { min, max } | FieldCodec::BitField { min, max, .. } => (u64::from(min)
+    match field.descriptor.codec.spec() {
+        CodecSpec::Byte { min, max } | CodecSpec::BitField { min, max, .. } => (u64::from(min)
             ..=u64::from(max))
             .prop_map(DecodedFieldValue::Unsigned)
             .boxed(),
-        FieldCodec::Unsigned { min, max, .. } => {
+        CodecSpec::Unsigned { min, max, .. } => {
             (min..=max).prop_map(DecodedFieldValue::Unsigned).boxed()
         }
-        FieldCodec::Signed { min, max, .. } => {
+        CodecSpec::Signed { min, max, .. } => {
             (min..=max).prop_map(DecodedFieldValue::Signed).boxed()
         }
-        FieldCodec::Bool | FieldCodec::BitBool { .. } => {
+        CodecSpec::Bool | CodecSpec::BitBool { .. } => {
             any::<bool>().prop_map(DecodedFieldValue::Bool).boxed()
         }
-        FieldCodec::FixedString { len, .. } => vec(
+        CodecSpec::FixedString { len, .. } => vec(
             prop_oneof![
                 proptest::char::range('A', 'Z'),
                 proptest::char::range('0', '9'),
@@ -533,7 +539,7 @@ fn arb_field_value(field: &'static MenuField) -> BoxedStrategy<DecodedFieldValue
         )
         .prop_map(|text| DecodedFieldValue::Text(text.into_iter().collect()))
         .boxed(),
-        FieldCodec::Bytes { len } => vec(any::<u8>(), len)
+        CodecSpec::Bytes { len } => vec(any::<u8>(), len)
             .prop_map(DecodedFieldValue::Bytes)
             .boxed(),
     }
@@ -703,8 +709,8 @@ proptest! {
         prop_assert_eq!(command_byte, command.as_byte());
         prop_assert_eq!(u32::from_be_bytes([0, high, middle, low]), page.address().as_u32());
         prop_assert_eq!(usize::from(len), page.len() % 256);
-        prop_assert_eq!(read_request(page), Header::new(HeaderCommand::Read, page).encode());
-        prop_assert_eq!(write_request(page), Header::new(HeaderCommand::Write, page).encode());
+        prop_assert_eq!(Header::read_request(page), Header::new(HeaderCommand::Read, page).encode());
+        prop_assert_eq!(Header::write_request(page), Header::new(HeaderCommand::Write, page).encode());
     }
 
     #[test]
@@ -1055,12 +1061,12 @@ proptest! {
 
     #[test]
     fn cat_line_parsing_never_panics(bytes in vec(any::<u8>(), 0..48)) {
-        let _response = parse_line(&bytes);
+        let _response = Response::from_bytes(&bytes);
     }
 
     #[test]
     fn configuration_file_parsing_never_panics(bytes in vec(any::<u8>(), 0..2048)) {
-        let _config = parse_d750(&bytes);
+        let _config = RadioConfig::from_bytes(&bytes);
     }
 
     #[test]
@@ -1135,7 +1141,7 @@ proptest! {
 
     #[test]
     fn setter_echo_parses_to_the_command_values((command, expected) in arb_setter_echo()) {
-        let response = parse_line(&command.encode()).map_err(to_test_err)?;
+        let response = Response::from_bytes(&command.encode()).map_err(to_test_err)?;
         prop_assert!(
             command.correlates(&response),
             "{command:?} must correlate with {response:?}"
@@ -1148,7 +1154,7 @@ proptest! {
         let command = Command::SetDstarCallsign {
             entry: entry.clone(),
         };
-        let response = parse_line(&command.encode()).map_err(to_test_err)?;
+        let response = Response::from_bytes(&command.encode()).map_err(to_test_err)?;
         prop_assert_eq!(response, Response::DstarCallsign(entry));
     }
 
@@ -1158,8 +1164,8 @@ proptest! {
         callsign in "[ -~]{0,3},[ -~]{0,3}",
         memo in "[ -~]{0,1},[ -~]{0,1}",
     ) {
-        prop_assert!(DstarCallsignEntry::new(slot, &callsign, "").is_err(), "{callsign:?}");
-        prop_assert!(DstarCallsignEntry::new(slot, "", &memo).is_err(), "{memo:?}");
+        prop_assert!(DstarCallsignEntry::new(slot, DstarCallsignText { callsign: callsign.as_str().into(), memo: "".into() }).is_err(), "{callsign:?}");
+        prop_assert!(DstarCallsignEntry::new(slot, DstarCallsignText { callsign: "".into(), memo: memo.as_str().into() }).is_err(), "{memo:?}");
     }
 
     #[test]
@@ -1239,7 +1245,7 @@ proptest! {
         let config = RadioConfig::new(header, image).map_err(to_test_err)?;
         let bytes = config.to_bytes();
         prop_assert_eq!(bytes.len(), FileLayout::Full.file_size());
-        prop_assert_eq!(parse_d750(&bytes).map_err(to_test_err)?, config);
+        prop_assert_eq!(RadioConfig::from_bytes(&bytes).map_err(to_test_err)?, config);
     }
 
     #[test]
@@ -1264,7 +1270,7 @@ proptest! {
         let image = vec![seed; FileLayout::WithoutStartupScreen.image_bytes()];
         let config = RadioConfig::new(header, image).map_err(to_test_err)?;
         let bytes = config.to_bytes();
-        prop_assert_eq!(parse_d750(&bytes).map_err(to_test_err)?, config);
+        prop_assert_eq!(RadioConfig::from_bytes(&bytes).map_err(to_test_err)?, config);
     }
 
     #[test]

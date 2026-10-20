@@ -1,7 +1,6 @@
 //! Identify, read the slot menus, decode a PM name, patch it, compare and
 //! exchange the page, exit: the whole slice over the mock transport.
 
-use kenwood_schema as _;
 use mcp_d75_extract as _;
 use mmdvm as _;
 use proptest as _;
@@ -9,11 +8,10 @@ use thiserror as _;
 use tokio_serial as _;
 use tracing as _;
 
-use kenwood_tmd750::memory::{
-    DecodedFieldValue, FieldValue, MemoryImage, PatchPlanner, menu_field,
-};
+use kenwood_schema::{DecodedFieldValue, FieldValue};
+use kenwood_tmd750::memory::{MemoryImage, PatchPlanner, menu_field};
 use kenwood_tmd750::protocol::mcp::regions::{GLOBAL_SETTINGS, slot_menu};
-use kenwood_tmd750::protocol::mcp::{ACK, ENTER, EXIT, read_request, write_request};
+use kenwood_tmd750::protocol::mcp::{ACK, ENTER, EXIT, Header};
 use kenwood_tmd750::radio::Radio;
 use kenwood_tmd750::{Page, PageReplacement, Region, SlotIndex};
 use kenwood_transport::MockTransport;
@@ -26,9 +24,9 @@ fn script_read(mock: &mut MockTransport, page: Page, image: &[u8]) -> TestResult
     let data = image
         .get(start..start + page.len())
         .ok_or("page outside image")?;
-    let mut reply = write_request(page).to_vec();
+    let mut reply = Header::write_request(page).to_vec();
     reply.extend_from_slice(data);
-    mock.expect(&read_request(page), &reply);
+    mock.expect(&Header::read_request(page), &reply);
     mock.expect(&[ACK], &[ACK]);
     Ok(())
 }
@@ -67,7 +65,7 @@ async fn patch_a_pm_name_end_to_end() -> TestResult {
             .as_bytes()
             .get(start..start + patch.page().len())
             .ok_or("patch page outside image")?;
-        let mut frame = write_request(patch.page()).to_vec();
+        let mut frame = Header::write_request(patch.page()).to_vec();
         frame.extend_from_slice(written);
         mock.expect(&frame, &[ACK]);
         script_read(&mut mock, patch.page(), expected_image.as_bytes())?;

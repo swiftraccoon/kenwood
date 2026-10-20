@@ -66,6 +66,33 @@ fn applied(image: &MemoryImage, replacements: &[PageReplacement]) -> Fixture<Mem
 }
 
 #[test]
+fn standard_iteration_preserves_slots_order_and_owned_entry_bytes() -> TestResult {
+    let first = entry("FIRST", "N0CALL", "one")?;
+    let second = entry("SECOND", "N1CALL", "two")?;
+    let list = CallsignList::try_from(vec![first, second])?;
+    let mut borrowed = (&list).into_iter();
+    assert_eq!(borrowed.len(), 2);
+    assert_eq!(borrowed.next_back().map(|(slot, _)| slot.index()), Some(1));
+    assert_eq!(borrowed.next().map(|(slot, _)| slot.index()), Some(0));
+    assert_eq!(borrowed.len(), 0);
+    assert_eq!(borrowed.next(), None);
+    assert_eq!(borrowed.next_back(), None);
+    let expected: Vec<_> = list
+        .iter()
+        .map(|(slot, entry)| (slot, entry.to_bytes()))
+        .collect();
+    let owned: Vec<_> = list
+        .into_iter()
+        .map(|(slot, entry)| (slot, entry.to_bytes()))
+        .collect();
+    assert_eq!(
+        owned, expected,
+        "consuming iteration must preserve checked chain bytes"
+    );
+    Ok(())
+}
+
+#[test]
 fn an_empty_table_reads_as_an_empty_list_and_stores_unchanged() -> TestResult {
     let image = stored(&[], [None, None])?;
     let list = CallsignList::read(&image)?;

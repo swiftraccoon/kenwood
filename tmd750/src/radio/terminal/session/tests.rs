@@ -3,13 +3,14 @@
 //! journal records and outcome each pass produces.
 
 use std::io;
+use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use kenwood_transport::{MockTransport, TransportError};
 
 use super::*;
-use crate::protocol::mcp::{ACK, read_request, write_request};
+use crate::protocol::mcp::{ACK, Header};
 use crate::types::{Address, FirmwareIdentity, Page, RadioModel, RadioType, Region};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -61,13 +62,13 @@ fn cat(gateway: u8) -> MockTransport {
 }
 
 fn frame(page: Page, bytes: &[u8]) -> Vec<u8> {
-    let mut frame = write_request(page).to_vec();
+    let mut frame = Header::write_request(page).to_vec();
     frame.extend_from_slice(bytes);
     frame
 }
 
 fn read(mock: &mut MockTransport, page: Page, bytes: &[u8]) {
-    mock.expect(&read_request(page), &frame(page, bytes));
+    mock.expect(&Header::read_request(page), frame(page, bytes));
     mock.expect(&[ACK], &[ACK]);
 }
 
@@ -85,7 +86,7 @@ fn compare(mock: &mut MockTransport, plan: &TerminalPlan) {
 
 fn changes(mock: &mut MockTransport, plan: &TerminalPlan) {
     for page in plan.replacements().iter().filter(|page| !page.is_noop()) {
-        mock.expect(&frame(page.page(), page.replacement()), &[ACK]);
+        mock.expect(frame(page.page(), page.replacement()), &[ACK]);
         read(mock, page.page(), page.replacement());
     }
 }
@@ -149,7 +150,7 @@ impl Transport for LoggingTransport {
         self.mock.close().await
     }
 
-    fn set_baud_rate(&mut self, baud: u32) -> Result<(), TransportError> {
+    fn set_baud_rate(&mut self, baud: NonZeroU32) -> Result<(), TransportError> {
         self.mock.set_baud_rate(baud)
     }
 }
@@ -293,7 +294,7 @@ fn intents_precede_writes(events: &[Event]) -> Result<usize, Box<dyn std::error:
                 .len()
                 .checked_sub(5)
                 .ok_or("write frame shorter than its header")?;
-            let request = write_request(Page::new(Address::new(*address)?, payload)?);
+            let request = Header::write_request(Page::new(Address::new(*address)?, payload)?);
             assert_eq!(
                 frame.get(..5),
                 Some(request.as_slice()),
@@ -458,7 +459,7 @@ async fn missing_write_ack_retains_intent_and_forbids_exit() -> TestResult {
     mock.expect(b"0M PROGRAM\r", b"0M\r");
     backup(&mut mock, &snapshot);
     compare(&mut mock, &plan);
-    mock.expect_eof(&frame(changed.page(), changed.replacement()));
+    mock.expect_eof(frame(changed.page(), changed.replacement()));
     let (result, events, journal) = run(
         mock,
         DvGatewayMode::Off,

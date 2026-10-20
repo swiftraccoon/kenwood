@@ -29,7 +29,7 @@ radio protocol and recovery rule. It does not depend on the TH-D75 library.
 | Edit stored memory data against a backup | [`memory::MemoryChannelPlan`], [`memory::ChannelNamePlan`], [`memory::ChannelGroupPlan`], [`memory::GroupNamePlan`], [`memory::CallChannelPlan`], [`memory::vfo::VfoMemory`], [`memory::dtmf::DtmfMemories`], [`memory::mic_e::MicETypeCodeTables`], [`memory::repeater_list::RepeaterList`], [`memory::callsign_list::CallsignList`], [`memory::position::PositionMemory`], each written with [`radio::McpSession::compare_exchange_pages`] |
 | Write arbitrary pages | [`PageReplacement`] and [`radio::McpSession::compare_exchange_pages`] |
 | Run Reflector Terminal | [`TerminalLifecycle`] and [`TerminalRecovery`] |
-| Read or write a `.d750` file | [`parse_d750`], [`RadioConfig`] |
+| Read or write a `.d750` file | [`RadioConfig::from_bytes`], [`RadioConfig::to_bytes`] |
 
 The crate is used from the workspace or as a local path dependency:
 
@@ -111,11 +111,13 @@ strict mocks.
   the radio against [`WRITE_TARGETS`] (`TM-D750 / 1.02 / K,2,1`) before
   sending a byte and returns [`Error::UnsupportedWriteTarget`] otherwise.
   Reads work on any TM-D750.
-- **Echo and readback.** A CAT setter requires the echo to equal the request,
+- **Echo and readback.** A setting setter requires the echo to equal the request,
   then reads the setting back: [`ProtocolError::EchoMismatch`] and
   [`ProtocolError::ReadbackMismatch`] report the differing values. `FQ` outside
   a band's receive ranges tunes a nearby frequency instead of refusing, which
-  [`Error::FrequencyAdjusted`] reports with the tuned frequency. Nothing is
+  [`Error::FrequencyAdjusted`] reports with the tuned frequency. Power-off
+  requests and entering panel KISS mode end the CAT exchange without a
+  subsequent setting readback. Nothing is
   rolled back.
 - **One command, one reply.** Each command reads lines until one answers it
   (`?` is [`ProtocolError::Rejected`], `N` is [`ProtocolError::NotAvailable`]),
@@ -138,8 +140,9 @@ strict mocks.
 
 ## Control the radio over CAT
 
-Every value is a validated type, every read is one query, and every write runs
-the write-target gate, the echo check and the readback:
+Ordinary setting setters run the write-target gate, require an exact echo and
+read the setting back. Transmit, stepping, memory clearing, power-off and
+mode-handoff methods state their distinct completion contracts:
 
 ```rust,no_run
 use kenwood_tmd750::types::{Frequency, PowerLevel, SquelchLevel, StepSize, TuningMode};
@@ -385,12 +388,56 @@ NMEA 0183 formats; no capture of the radio's own output has been decoded yet.
 use kenwood_tmd750::nmea::{LineReader, Sentence};
 
 let mut reader = LineReader::new();
-for sentence in reader.push(b"ID TM-D750\r$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47\r\n") {
-    if let Ok(Sentence::Gga(fix)) = sentence {
-        println!("{:?} with {:?} satellites", fix.position, fix.satellites);
-    }
+assert!(reader.push(b"ID TM-D750\r$GPGGA,123519,4807.038,N,").is_empty());
+let complete = reader.push(b"01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47\r\n");
+assert_eq!(complete.len(), 1);
+for sentence in complete {
+    let Sentence::Gga(fix) = sentence? else { continue };
+    let position = fix.position().ok_or("the reference sentence contains a position")?;
+    assert!(position.latitude() > 48.0);
+    assert_eq!(fix.satellites(), Some(8));
+}
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+The first `*` ends the data and is followed by exactly two checksum digits.
+Decoded time, date, coordinate and fix records have immutable checked fields;
+raw proprietary sentences retain their original address and fields.
+
+### Host-managed observation
+
+[`ControlHost`] owns endpoint enumeration, opening, time and closure. A caller
+can use [`SystemControlHost`] or implement that trait for a recorder or mock.
+An observation reads identity and Gateway on one connection and retains the
+read result and close result separately:
+
+```rust,no_run
+use std::sync::atomic::AtomicBool;
+use kenwood_tmd750::{Identity, ObservationReport, SystemControlHost, observe_control};
+use kenwood_tmd750::radio::readiness::Expectation;
+use kenwood_tmd750::transport::{DEFAULT_BAUD, SerialCandidate};
+use kenwood_tmd750::types::DvGatewayMode;
+
+async fn observe(
+    endpoint: &SerialCandidate,
+    expected: &Identity,
+    cancelled: &AtomicBool,
+) -> ObservationReport {
+    let mut host = SystemControlHost::new();
+    observe_control(
+        &mut host,
+        endpoint,
+        DEFAULT_BAUD,
+        Expectation { identity: Some(expected), gateway: Some(DvGatewayMode::Off) },
+        cancelled,
+    ).await
 }
 ```
+
+Await the operation to retain its close result. Dropping an I/O future can
+leave a partially completed exchange; it does not execute asynchronous cleanup.
+The offline `owned_lifecycle` example demonstrates simultaneous operation,
+exit and close failures with scripted transports and no endpoint opening.
 
 ## Programming mode (MCP)
 
@@ -666,8 +713,11 @@ fresh backup compared with the pre-write backup, never by repeating the
 session.
 
 [`memory::Configuration`] keeps a capture whole: the identity it was read
-from, the pages read and their bytes. It returns no unread byte, offers the
-standard and menu views and the same comparison, and has a persisted form
+from, the pages read and their bytes. Coverage-checked reads and the
+standard and menu views require every requested byte to have been captured.
+[`memory::Configuration::image_with_uncaptured_fill`] is the explicit dense
+image conversion: it requires coverage of the supplied regions and fills
+other addresses with `0xFF`. The capture also supports comparison and a persisted form
 with a CRC-32 that [`memory::Configuration::to_bytes`] writes and
 [`memory::Configuration::from_bytes`] reads back exactly:
 
@@ -845,18 +895,18 @@ closed.
 
 ## Configuration files
 
-[`parse_d750`] validates the header signature, the `TM-D750` model marker, the
+[`RadioConfig::from_bytes`] validates the header signature, the `TM-D750` model marker, the
 zero reserved byte at offset 32 and the signature-selected payload length:
 `MCP-D750` requires the full 1,929,472-byte image and `TM-D750` the
 393,216-byte prefix. [`RadioConfig`] keeps exactly the stored bytes, and an
 unmodified file round-trips byte for byte:
 
 ```rust
-use kenwood_tmd750::{FileError, RadioConfig, RadioType, parse_d750};
+use kenwood_tmd750::{FileError, RadioConfig, RadioType};
 use kenwood_tmd750::file::ConfigHeader;
 
 fn round_trip(data: &[u8]) -> Result<Vec<u8>, FileError> {
-    let config = parse_d750(data)?;
+    let config = RadioConfig::from_bytes(data)?;
     assert_eq!(
         config.image_bytes().len(), config.layout().image_bytes(),
         "stored payload coverage must match the validated header",
@@ -938,6 +988,22 @@ header, the `.d750` parser, the stored channel codecs, the repeater-list
 record, text and voice codecs, the callsign-list, Mic-E type code and DTMF
 memory entries and the NMEA parser (`cargo +nightly fuzz run <target>` from
 `tmd750/`).
+
+## API changes and release expectations
+
+This unpublished `0.1.0` API can change before a release. Serial opens and
+control hosts accept `NonZeroU32` baud rates. Checked channel indices, packed
+fields, clock components and callsign text replace unchecked construction;
+`DstarCallsignText` names the callsign and memo and transfers owned strings.
+Use `RadioConfig::from_bytes` and `Response::from_bytes` for complete file and
+CAT decoding. Parsed NMEA records expose immutable getters.
+
+Failures expose typed command, field, setting and exchange-stage labels, with
+the original integer or validation error retained in the source chain.
+Programming and lifecycle reports keep operation, exit, close and checkpoint
+failures independently. A failed startup returns its retained restoration
+obligation, including possible writes; a completed restoration consumes that
+obligation without repeating traffic.
 
 ## Registry
 

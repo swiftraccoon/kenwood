@@ -11,6 +11,10 @@ use crate::types::{
     Address, CHANNEL_NAME_SIZE, CHANNEL_NAMES_OFFSET, PAGE_SIZE, Page, PhysicalChannel,
 };
 
+#[cfg(test)]
+#[path = "channel_tests.rs"]
+mod tests;
+
 pub(super) const FIELD_NAME: &str = "memory.ChannelName";
 const RULE: &str = "1 to 16 printable ASCII bytes";
 
@@ -21,7 +25,7 @@ const RULE: &str = "1 to 16 printable ASCII bytes";
 /// field is the text followed by NUL padding to sixteen bytes; an unnamed
 /// channel stores sixteen NUL bytes and is represented by `None` wherever an
 /// `Option<&ChannelNameText>` is accepted.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ChannelNameText(String);
 
 impl ChannelNameText {
@@ -32,9 +36,14 @@ impl ChannelNameText {
     /// Returns [`TextFieldUpdateError::InvalidText`] for empty, oversized,
     /// control, non-ASCII, or embedded-NUL input.
     pub fn new(value: &str) -> Result<Self, TextFieldUpdateError> {
-        if value.is_empty()
-            || value.len() > CHANNEL_NAME_SIZE
-            || !value
+        Self::validate(value)?;
+        Ok(Self(value.to_owned()))
+    }
+
+    fn validate(text: &str) -> Result<(), TextFieldUpdateError> {
+        if text.is_empty()
+            || text.len() > CHANNEL_NAME_SIZE
+            || !text
                 .bytes()
                 .all(|byte| byte.is_ascii_graphic() || byte == b' ')
         {
@@ -43,7 +52,7 @@ impl ChannelNameText {
                 rule: RULE,
             });
         }
-        Ok(Self(value.to_owned()))
+        Ok(())
     }
 
     /// The exact validated text, with spaces preserved.
@@ -60,6 +69,46 @@ impl ChannelNameText {
             *slot = byte;
         }
         field
+    }
+}
+
+impl AsRef<str> for ChannelNameText {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::str::FromStr for ChannelNameText {
+    type Err = TextFieldUpdateError;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<&str> for ChannelNameText {
+    type Error = TextFieldUpdateError;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<String> for ChannelNameText {
+    type Error = TextFieldUpdateError;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::validate(&value)?;
+        Ok(Self(value))
+    }
+}
+
+impl From<ChannelNameText> for String {
+    fn from(value: ChannelNameText) -> Self {
+        value.0
+    }
+}
+
+impl std::fmt::Display for ChannelNameText {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
     }
 }
 
@@ -158,7 +207,3 @@ impl TextFieldUpdate<ChannelNameText, NoGuards> {
         }
     }
 }
-
-#[cfg(test)]
-#[path = "channel_tests.rs"]
-mod tests;

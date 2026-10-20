@@ -5,20 +5,23 @@
 //! Callers own entry, capture, detached exit, transport release, and fresh
 //! verification. This module neither opens connections nor enables Terminal Mode.
 
-mod update;
-
-pub use update::{MenuAssignment, MenuUpdateError, MenuUpdatePlan};
-
 use std::collections::BTreeMap;
 
 use crate::error::{Error, McpError, SchemaError};
-use crate::memory::{DecodedFieldValue, MenuField, PatchSet};
+use crate::memory::{MenuField, PatchSet};
 use crate::protocol::mcp::regions;
 use crate::types::{Address, IMAGE_LENGTH, PAGE_SIZE_U32, Page, SlotIndex};
+use kenwood_schema::DecodedFieldValue;
 use kenwood_transport::Transport;
 
 use super::Progress;
 use super::programming::{McpSession, PageReplacement};
+
+pub use update::{MenuAssignment, MenuUpdateError, MenuUpdatePlan};
+
+#[cfg(test)]
+mod tests;
+mod update;
 
 /// One menu field with an explicit, validated global or PM-slot scope.
 ///
@@ -277,6 +280,3 @@ fn canonical_read_page(address: Address) -> Option<Page> {
     let len = usize::try_from((region.end() - start.as_u32()).min(PAGE_SIZE_U32)).ok()?;
     Page::new(start, len).ok()
 }
-
-#[cfg(test)]
-mod tests;

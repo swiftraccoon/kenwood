@@ -1,7 +1,7 @@
 //! Deterministic text-layout and offline patch tests; no radio access.
 
 use super::*;
-use kenwood_schema::CodecError;
+use kenwood_schema::{CodecError, CodecSpec};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -27,8 +27,8 @@ fn supported_keys_are_finite_unique_and_registry_backed() -> TestResult {
         let field = menu_field(metadata.field_name).ok_or("generated field missing")?;
         assert!(!field.is_blob);
         assert_eq!(
-            field.descriptor.codec,
-            FieldCodec::FixedString {
+            field.descriptor.codec.spec(),
+            CodecSpec::FixedString {
                 len: metadata.max_bytes,
                 encoding: metadata.encoding,
                 padding: metadata.padding,

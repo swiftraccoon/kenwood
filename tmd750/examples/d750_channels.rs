@@ -1,6 +1,6 @@
 //! List the programmed memory channels of a `.d750` configuration file.
 //!
-//! Parses the file with `parse_d750`, borrows the channel tables of its image
+//! Parses the file with `RadioConfig::from_bytes`, borrows the channel tables of its image
 //! and prints every slot whose flag marks it programmed (the physical index,
 //! the name and the decoded record), then the six CALL channels and the ten
 //! weather channels. Both file layouts cover the channel tables. No radio is
@@ -21,13 +21,13 @@ use tokio_serial as _;
 use tracing as _;
 
 use kenwood_tmd750::memory::ChannelAccess;
-use kenwood_tmd750::{FileLayout, parse_d750};
+use kenwood_tmd750::{FileLayout, RadioConfig};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args()
         .nth(1)
         .ok_or("pass the .d750 file path as the first argument")?;
-    let config = parse_d750(&std::fs::read(&path)?)?;
+    let config = RadioConfig::from_bytes(&std::fs::read(&path)?)?;
     let layout = match config.layout() {
         FileLayout::Full => "full image",
         FileLayout::WithoutStartupScreen => "image without the startup screen",

@@ -13,6 +13,10 @@ use crate::memory::{ChannelNameText, MemoryImage};
 use crate::radio::programming::PageReplacement;
 use crate::types::{Address, CHANNEL_NAME_SIZE, PAGE_SIZE, Page, PhysicalChannel};
 
+#[cfg(test)]
+#[path = "channel_names_tests.rs"]
+mod tests;
+
 /// The names of a set of channels; `None` leaves a channel unnamed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelNamePlan {
@@ -99,7 +103,3 @@ fn name_page(channel: PhysicalChannel) -> Option<Page> {
     let address = Address::new(u32::try_from(start).ok()?).ok()?;
     Page::new(address, PAGE_SIZE).ok()
 }
-
-#[cfg(test)]
-#[path = "channel_names_tests.rs"]
-mod tests;

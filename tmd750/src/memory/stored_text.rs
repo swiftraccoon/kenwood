@@ -12,6 +12,10 @@
 
 use std::fmt;
 
+#[cfg(test)]
+#[path = "stored_text_tests.rs"]
+mod tests;
+
 /// The byte that introduces a character from U+0101 to U+01FF.
 const LEAD_BYTE: u8 = 0x01;
 
@@ -89,6 +93,45 @@ impl<const N: usize> fmt::Display for StoredText<N> {
     }
 }
 
+impl<const N: usize> Default for StoredText<N> {
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
+impl<const N: usize> AsRef<[u8]> for StoredText<N> {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl<const N: usize> std::str::FromStr for StoredText<N> {
+    type Err = StoredTextError;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl<const N: usize> TryFrom<&str> for StoredText<N> {
+    type Error = StoredTextError;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl<const N: usize> TryFrom<[u8; N]> for StoredText<N> {
+    type Error = StoredTextError;
+    fn try_from(value: [u8; N]) -> Result<Self, Self::Error> {
+        Self::from_bytes(value)
+    }
+}
+
+impl<const N: usize> From<StoredText<N>> for [u8; N] {
+    fn from(value: StoredText<N>) -> Self {
+        value.0
+    }
+}
+
 /// Text without a stored form, or stored bytes that are not one.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
@@ -149,7 +192,3 @@ fn decode(bytes: &[u8]) -> Option<String> {
     }
     Some(text)
 }
-
-#[cfg(test)]
-#[path = "stored_text_tests.rs"]
-mod tests;

@@ -6,15 +6,24 @@
 
 use std::fmt;
 
-use super::{
-    DecodedFieldValue, FieldCodec, FieldDescriptor, MemoryImage, StringEncoding, menu_field,
-};
-use crate::error::SchemaError;
+use super::{FieldDescriptor, MemoryImage, menu_field};
+use crate::error::{SchemaError, SettingName};
 use crate::types::SlotIndex;
+use kenwood_schema::{CodecSpec, DecodedFieldValue, FieldCodec, StringEncoding};
+
+#[cfg(test)]
+#[path = "terminal_tests.rs"]
+mod tests;
 
 // The image-format marker is not a menu setting and has no generated menu entry.
-const FORMAT: FieldDescriptor =
-    FieldDescriptor::new("format.Version", 10, FieldCodec::Byte { min: 0, max: 0 });
+const FORMAT: FieldDescriptor = FieldDescriptor::new(
+    "format.Version",
+    10,
+    match FieldCodec::new(CodecSpec::Byte { min: 0, max: 0 }) {
+        Ok(codec) => codec,
+        Err(_) => unreachable!(),
+    },
+);
 
 /// USB connector requested for an offline Reflector Terminal comparison.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,8 +132,31 @@ impl fmt::Display for TerminalMode {
 }
 
 /// Index within one PM slot's six Menu 651 MY entries, not a PM slot index.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TerminalMyCallsignIndex(u8);
+
+integer_formats!(TerminalMyCallsignIndex, index);
+
+impl TryFrom<u8> for TerminalMyCallsignIndex {
+    type Error = crate::ValidationError;
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        if value < 6 {
+            Ok(Self(value))
+        } else {
+            Err(crate::ValidationError::SettingOutOfRange {
+                setting: SettingName::TerminalMyCallsignIndex,
+                value: u64::from(value),
+                max: 5,
+            })
+        }
+    }
+}
+
+impl From<TerminalMyCallsignIndex> for u8 {
+    fn from(value: TerminalMyCallsignIndex) -> Self {
+        value.index()
+    }
+}
 
 impl TerminalMyCallsignIndex {
     /// Zero-based index, always in `0..6`.
@@ -449,14 +481,14 @@ impl Field {
         let expected_slot = !matches!(self, Self::ActivePm);
         let expected_codec = match self {
             Self::MyCallsign(_) | Self::Rpt1 | Self::Rpt2 => matches!(
-                descriptor.codec,
-                FieldCodec::FixedString {
+                descriptor.codec.spec(),
+                CodecSpec::FixedString {
                     len: 8,
                     encoding: StringEncoding::Utf8,
                     padding: 0,
                 }
             ),
-            _ => matches!(descriptor.codec, FieldCodec::Byte { .. }),
+            _ => matches!(descriptor.codec.spec(), CodecSpec::Byte { .. }),
         };
         if field.is_blob || descriptor.is_per_slot() != expected_slot || !expected_codec {
             return Err(self.registry_error());
@@ -542,7 +574,3 @@ fn read_byte(
     };
     u8::try_from(value).map_err(|_| TerminalPreflightError::RegistryField { field: label })
 }
-
-#[cfg(test)]
-#[path = "terminal_tests.rs"]
-mod tests;

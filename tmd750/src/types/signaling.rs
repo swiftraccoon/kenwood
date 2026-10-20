@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-use crate::error::ValidationError;
+use crate::error::{SettingName, ValidationError};
 
 /// The 50 selectable tone and CTCSS frequencies in tenths of a hertz,
 /// in the User Manual's table order (`01` 67.0 Hz through `50` 254.1 Hz).
@@ -34,6 +34,8 @@ pub struct ToneCode {
     decihertz: u16,
 }
 
+checked_integer_traits!(ToneCode, u8, as_raw);
+
 impl ToneCode {
     /// Highest index.
     pub const MAX: u8 = 49;
@@ -48,7 +50,7 @@ impl ToneCode {
             .get(usize::from(index))
             .map(|&decihertz| Self { index, decihertz })
             .ok_or_else(|| ValidationError::SettingOutOfRange {
-                setting: "tone code",
+                setting: SettingName::ToneCode,
                 value: u64::from(index),
                 max: u64::from(Self::MAX),
             })
@@ -82,6 +84,8 @@ pub struct DcsCode {
     code: u16,
 }
 
+checked_integer_traits!(DcsCode, u8, as_raw);
+
 impl DcsCode {
     /// Highest index.
     pub const MAX: u8 = 103;
@@ -96,7 +100,7 @@ impl DcsCode {
             .get(usize::from(index))
             .map(|&code| Self { index, code })
             .ok_or_else(|| ValidationError::SettingOutOfRange {
-                setting: "DCS code",
+                setting: SettingName::DcsCode,
                 value: u64::from(index),
                 max: u64::from(Self::MAX),
             })
@@ -198,6 +202,8 @@ impl fmt::Display for ToneMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CrossToneField(u8);
 
+checked_integer_traits!(CrossToneField, u8, as_raw);
+
 impl CrossToneField {
     /// Highest wire value, `F`.
     pub const MAX: u8 = 15;
@@ -210,7 +216,7 @@ impl CrossToneField {
     pub const fn new(value: u8) -> Result<Self, ValidationError> {
         if value > Self::MAX {
             Err(ValidationError::SettingOutOfRange {
-                setting: "cross tone field",
+                setting: SettingName::CrossTone,
                 value: value as u64,
                 max: Self::MAX as u64,
             })
@@ -291,7 +297,7 @@ impl TryFrom<u8> for DigitalSquelch {
             1 => Ok(Self::Code),
             2 => Ok(Self::Callsign),
             _ => Err(ValidationError::SettingOutOfRange {
-                setting: "digital squelch",
+                setting: SettingName::DigitalSquelch,
                 value: u64::from(value),
                 max: 2,
             }),
@@ -313,6 +319,8 @@ impl fmt::Display for DigitalSquelch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DigitalCode(u8);
 
+checked_integer_traits!(DigitalCode, u8, as_raw);
+
 impl DigitalCode {
     /// Highest code.
     pub const MAX: u8 = 99;
@@ -325,7 +333,7 @@ impl DigitalCode {
     pub const fn new(value: u8) -> Result<Self, ValidationError> {
         if value > Self::MAX {
             Err(ValidationError::SettingOutOfRange {
-                setting: "digital code",
+                setting: SettingName::DigitalCode,
                 value: value as u64,
                 max: Self::MAX as u64,
             })
@@ -355,6 +363,8 @@ impl fmt::Display for DigitalCode {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct UrCallsign(String);
 
+string_traits!(UrCallsign, ValidationError);
+
 impl UrCallsign {
     /// Maximum byte length.
     pub const MAX_LEN: usize = 8;
@@ -366,15 +376,20 @@ impl UrCallsign {
     /// Returns [`ValidationError::InvalidCallsignText`] for more than eight
     /// bytes or a byte outside `A`-`Z`, `0`-`9`, space and `/`.
     pub fn new(text: &str) -> Result<Self, ValidationError> {
+        Self::validate(text)?;
+        Ok(Self(text.to_owned()))
+    }
+
+    fn validate(value: &str) -> Result<(), ValidationError> {
         let valid_byte = |byte: u8| {
             byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b' ' || byte == b'/'
         };
-        if text.len() > Self::MAX_LEN || !text.bytes().all(valid_byte) {
+        if value.len() > Self::MAX_LEN || !value.bytes().all(valid_byte) {
             return Err(ValidationError::InvalidCallsignText {
-                text: text.to_owned(),
+                text: value.to_owned(),
             });
         }
-        Ok(Self(text.to_owned()))
+        Ok(())
     }
 
     /// The field exactly as carried.

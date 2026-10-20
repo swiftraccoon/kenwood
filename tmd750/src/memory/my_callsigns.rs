@@ -14,9 +14,13 @@
 //!
 //! [`SLOT_STRIDE`]: crate::types::SLOT_STRIDE
 
-use crate::error::ValidationError;
+use crate::error::{SettingName, ValidationError};
 use crate::memory::MemoryImage;
-use crate::types::{DstarCallsignEntry, DstarSlot, Region, SlotIndex};
+use crate::types::{DstarCallsignEntry, DstarCallsignText, DstarSlot, Region, SlotIndex};
+
+#[cfg(test)]
+#[path = "my_callsigns_tests.rs"]
+mod tests;
 
 /// Address of PM Off's selection byte.
 pub const MY_CALLSIGN_SELECTION_ADDRESS: u32 = 0x5_0003;
@@ -76,7 +80,7 @@ impl MyCallsignList {
         };
         if selection > SELECTION_MAX {
             return Err(ValidationError::SettingOutOfRange {
-                setting: "MY callsign selection",
+                setting: SettingName::MyCallsignSelection,
                 value: u64::from(selection),
                 max: u64::from(SELECTION_MAX),
             });
@@ -88,8 +92,10 @@ impl MyCallsignList {
             let (callsign, memo) = entry.split_at(CALLSIGN_SIZE);
             decoded.push(DstarCallsignEntry::new(
                 DstarSlot::new(number)?,
-                &padded_text(callsign)?,
-                &padded_text(memo)?,
+                DstarCallsignText {
+                    callsign: padded_text(callsign)?.into(),
+                    memo: padded_text(memo)?.into(),
+                },
             )?);
         }
         let entries = <[DstarCallsignEntry; 6]>::try_from(decoded).map_err(|_decoded| {
@@ -147,7 +153,3 @@ fn padded_text(field: &[u8]) -> Result<String, ValidationError> {
         text: String::from_utf8_lossy(field).into_owned(),
     })
 }
-
-#[cfg(test)]
-#[path = "my_callsigns_tests.rs"]
-mod tests;

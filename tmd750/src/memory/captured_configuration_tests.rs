@@ -59,7 +59,7 @@ fn coverage_is_merged_and_checked_before_bytes_are_returned() -> TestResult {
     }
     assert!(
         configuration
-            .image_covering(Region::new(0x2_0000, 0x2_0010)?)
+            .image_with_uncaptured_fill(Region::new(0x2_0000, 0x2_0010)?)
             .is_ok()
     );
     assert!(!configuration.is_standard());
@@ -122,7 +122,7 @@ fn the_persisted_form_round_trips_and_detects_damage() -> TestResult {
         assert!(
             matches!(
                 result,
-                Err(ConfigurationError::Format { .. } | ConfigurationError::Checksum { .. })
+                Err(ConfigurationError::Format(_) | ConfigurationError::Checksum { .. })
             ),
             "{} bytes: {result:?}",
             damaged.len()
@@ -182,9 +182,9 @@ fn a_stored_page_outside_the_image_is_named_as_such() -> TestResult {
         assert!(
             matches!(
                 result,
-                Err(ConfigurationError::Format {
-                    detail: "a page lies outside the image"
-                })
+                Err(ConfigurationError::Format(
+                    ConfigurationFormatError::InvalidPage(_)
+                ))
             ),
             "{address:#X}: {result:?}"
         );
@@ -200,4 +200,84 @@ fn the_checksum_is_the_ieee_crc32() {
         "the published check value"
     );
     assert_eq!(crc32(b""), 0);
+}
+
+#[test]
+fn stored_identity_lengths_are_checked_before_consuming_pages() -> TestResult {
+    let mut accepted_identity = identity()?;
+    accepted_identity.radio_type = RadioType::try_from("K".repeat(255))?;
+    let captured = Configuration::from_pages(accepted_identity, [])?;
+    assert_eq!(Configuration::from_bytes(&captured.to_bytes())?, captured);
+
+    let mut rejected_identity = identity()?;
+    rejected_identity.radio_type = RadioType::try_from("K".repeat(256))?;
+    let consumed = std::cell::Cell::new(0);
+    let item = page(0x1_0000, 1)?;
+    let input = std::iter::from_fn(|| {
+        consumed.set(consumed.get() + 1);
+        Some((item, vec![1]))
+    });
+    let rejected = Configuration::from_pages(rejected_identity, input);
+    assert!(
+        matches!(
+            rejected,
+            Err(ConfigurationError::RadioTypeTooLong { length: 256 })
+        ),
+        "{rejected:?}"
+    );
+    assert_eq!(
+        consumed.get(),
+        0,
+        "invalid persistence metadata must precede page consumption"
+    );
+    Ok(())
+}
+
+#[test]
+fn an_overlap_stops_input_consumption_at_the_first_conflict() -> TestResult {
+    let consumed = std::cell::Cell::new(0);
+    let item = page(0x1_0000, 1)?;
+    let input = std::iter::from_fn(|| {
+        let count = consumed.get();
+        if count == 4 {
+            return None;
+        }
+        consumed.set(count + 1);
+        Some((item, vec![1]))
+    });
+    let rejected = Configuration::from_pages(identity()?, input);
+    assert!(
+        matches!(rejected, Err(ConfigurationError::PageOverlap { page }) if page == item),
+        "overlap must fail"
+    );
+    assert_eq!(consumed.get(), 2, "later input must remain unconsumed");
+    Ok(())
+}
+
+#[test]
+fn an_incomplete_page_stops_before_consuming_later_payloads() -> TestResult {
+    let consumed = std::cell::Cell::new(0);
+    let item = page(0x1_0000, 2)?;
+    let input = std::iter::from_fn(|| {
+        let count = consumed.get();
+        if count == 4 {
+            return None;
+        }
+        consumed.set(count + 1);
+        Some((item, vec![1]))
+    });
+    let rejected = Configuration::from_pages(identity()?, input);
+    assert!(
+        matches!(
+            rejected,
+            Err(ConfigurationError::PageLength {
+                index: 0,
+                actual: 1,
+                ..
+            })
+        ),
+        "{rejected:?}"
+    );
+    assert_eq!(consumed.get(), 1, "later payloads must remain unconsumed");
+    Ok(())
 }

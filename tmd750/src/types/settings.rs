@@ -1,13 +1,13 @@
 //! Per-band and global settings reachable over CAT.
 //!
-//! Each bounded domain below was established on firmware 1.02 by writing every
-//! value in it, reading it back, and observing the rejection of the next value.
-//! Value labels follow the corresponding menu's list in the User Manual; where
-//! a label was not confirmed by the radio's own behavior the type says so.
+//! Individual contracts identify firmware 1.02 observations and User Manual
+//! domains. Received unnamed values retain their complete wire representation;
+//! selectable values and text sent over CAT are validated before encoding.
 
+use std::borrow::Cow;
 use std::fmt;
 
-use crate::error::ValidationError;
+use crate::error::{SettingName, ValidationError};
 
 /// Transmit power selected and reported by `PC`.
 ///
@@ -41,7 +41,7 @@ impl TryFrom<u8> for PowerLevel {
             1 => Ok(Self::Medium),
             2 => Ok(Self::Low),
             _ => Err(ValidationError::SettingOutOfRange {
-                setting: "power level",
+                setting: SettingName::PowerLevel,
                 value: u64::from(value),
                 max: 2,
             }),
@@ -65,6 +65,8 @@ impl fmt::Display for PowerLevel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SquelchLevel(u8);
 
+checked_integer_traits!(SquelchLevel, u8, as_raw);
+
 impl SquelchLevel {
     /// Open squelch.
     pub const OPEN: Self = Self(0);
@@ -79,7 +81,7 @@ impl SquelchLevel {
     pub const fn new(value: u8) -> Result<Self, ValidationError> {
         if value > Self::MAX {
             Err(ValidationError::SettingOutOfRange {
-                setting: "squelch level",
+                setting: SettingName::SquelchLevel,
                 value: value as u64,
                 max: Self::MAX as u64,
             })
@@ -108,6 +110,20 @@ impl fmt::Display for SquelchLevel {
 /// documented, so any decimal reading is retained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SMeterReading(u8);
+
+integer_formats!(SMeterReading, as_raw);
+
+impl From<u8> for SMeterReading {
+    fn from(value: u8) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<SMeterReading> for u8 {
+    fn from(value: SMeterReading) -> Self {
+        value.as_raw()
+    }
+}
 
 impl SMeterReading {
     /// No signal.
@@ -179,7 +195,7 @@ impl TryFrom<u8> for AmHighCut {
             2 => Ok(Self::Hz6000),
             3 => Ok(Self::Hz7500),
             _ => Err(ValidationError::SettingOutOfRange {
-                setting: "AM high cut",
+                setting: SettingName::AmHighCut,
                 value: u64::from(value),
                 max: 3,
             }),
@@ -198,6 +214,8 @@ impl fmt::Display for AmHighCut {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct VoxDelay(u8);
 
+checked_integer_traits!(VoxDelay, u8, as_raw);
+
 impl VoxDelay {
     /// Highest index.
     pub const MAX: u8 = 6;
@@ -212,7 +230,7 @@ impl VoxDelay {
     pub const fn new(value: u8) -> Result<Self, ValidationError> {
         if value > Self::MAX {
             Err(ValidationError::SettingOutOfRange {
-                setting: "VOX delay",
+                setting: SettingName::VoxDelay,
                 value: value as u64,
                 max: Self::MAX as u64,
             })
@@ -253,6 +271,8 @@ impl fmt::Display for VoxDelay {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct VoxGain(u8);
 
+checked_integer_traits!(VoxGain, u8, as_raw);
+
 impl VoxGain {
     /// Highest gain.
     pub const MAX: u8 = 9;
@@ -265,7 +285,7 @@ impl VoxGain {
     pub const fn new(value: u8) -> Result<Self, ValidationError> {
         if value > Self::MAX {
             Err(ValidationError::SettingOutOfRange {
-                setting: "VOX gain",
+                setting: SettingName::VoxGain,
                 value: value as u64,
                 max: Self::MAX as u64,
             })
@@ -298,15 +318,20 @@ pub enum VoxMode {
     /// VOX on (`1`).
     On,
     /// Any other reported value, retained exactly as received.
-    Unnamed(u8),
+    Unnamed(UnnamedVoxMode),
 }
+
+unnamed_wire_value!(
+    /// A VOX byte other than Off (`0`) or On (`1`).
+    UnnamedVoxMode, [0..=1]
+);
 
 impl From<u8> for VoxMode {
     fn from(value: u8) -> Self {
         match value {
             0 => Self::Off,
             1 => Self::On,
-            other => Self::Unnamed(other),
+            other => Self::Unnamed(UnnamedVoxMode(other)),
         }
     }
 }
@@ -322,7 +347,7 @@ impl From<VoxMode> for u8 {
         match value {
             VoxMode::Off => 0,
             VoxMode::On => 1,
-            VoxMode::Unnamed(raw) => raw,
+            VoxMode::Unnamed(raw) => raw.get(),
         }
     }
 }
@@ -344,6 +369,8 @@ impl fmt::Display for VoxMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BacklightControl(u8);
 
+checked_integer_traits!(BacklightControl, u8, as_raw);
+
 impl BacklightControl {
     /// Highest value.
     pub const MAX: u8 = 3;
@@ -356,7 +383,7 @@ impl BacklightControl {
     pub const fn new(value: u8) -> Result<Self, ValidationError> {
         if value > Self::MAX {
             Err(ValidationError::SettingOutOfRange {
-                setting: "backlight control",
+                setting: SettingName::BacklightControl,
                 value: value as u64,
                 max: Self::MAX as u64,
             })
@@ -407,7 +434,7 @@ impl TryFrom<u8> for BandDisplay {
             0 => Ok(Self::Dual),
             1 => Ok(Self::Single),
             _ => Err(ValidationError::SettingOutOfRange {
-                setting: "band display",
+                setting: SettingName::BandDisplay,
                 value: u64::from(value),
                 max: 1,
             }),
@@ -434,6 +461,8 @@ impl fmt::Display for BandDisplay {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MyPositionSelection(u8);
 
+checked_integer_traits!(MyPositionSelection, u8, as_raw);
+
 impl MyPositionSelection {
     /// The GPS receiver.
     pub const GPS: Self = Self(0);
@@ -448,7 +477,7 @@ impl MyPositionSelection {
     pub const fn new(value: u8) -> Result<Self, ValidationError> {
         if value > Self::MAX {
             Err(ValidationError::SettingOutOfRange {
-                setting: "my position selection",
+                setting: SettingName::MyPositionSelection,
                 value: value as u64,
                 max: Self::MAX as u64,
             })
@@ -478,6 +507,8 @@ impl fmt::Display for MyPositionSelection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DstarSlot(u8);
 
+checked_integer_traits!(DstarSlot, u8, as_raw);
+
 impl DstarSlot {
     /// First slot.
     pub const MIN: u8 = 1;
@@ -493,7 +524,7 @@ impl DstarSlot {
     pub const fn new(value: u8) -> Result<Self, ValidationError> {
         if value < Self::MIN || value > Self::MAX {
             Err(ValidationError::SettingOutOfRange {
-                setting: "D-STAR callsign slot",
+                setting: SettingName::DstarCallsignSlot,
                 value: value as u64,
                 max: Self::MAX as u64,
             })
@@ -515,6 +546,18 @@ impl fmt::Display for DstarSlot {
     }
 }
 
+/// Named candidate text checked by [`DstarCallsignEntry::new`].
+///
+/// Borrowed text is validated before allocation. Owned text transfers its
+/// allocation after validation; no trimming, case conversion or truncation occurs.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DstarCallsignText<'input> {
+    /// Up to eight graphic-ASCII or space bytes, excluding comma.
+    pub callsign: Cow<'input, str>,
+    /// Up to four graphic-ASCII or space bytes, excluding comma.
+    pub memo: Cow<'input, str>,
+}
+
 /// One D-STAR MY callsign slot as `DC` reports it: the callsign and the
 /// four-character memo, both empty on an unset slot.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -522,9 +565,9 @@ pub struct DstarCallsignEntry {
     /// Slot number.
     pub slot: DstarSlot,
     /// Callsign, up to eight characters.
-    pub callsign: String,
+    callsign: String,
     /// Memo, up to four characters.
-    pub memo: String,
+    memo: String,
 }
 
 impl DstarCallsignEntry {
@@ -540,27 +583,28 @@ impl DstarCallsignEntry {
     /// Returns [`ValidationError::InvalidCallsignText`] for an overlong field,
     /// a byte outside graphic ASCII and space, or a comma, which the `DC`
     /// field separator cannot carry.
-    pub fn new(slot: DstarSlot, callsign: &str, memo: &str) -> Result<Self, ValidationError> {
+    pub fn new(slot: DstarSlot, text: DstarCallsignText<'_>) -> Result<Self, ValidationError> {
+        let DstarCallsignText { callsign, memo } = text;
         let valid = |text: &str, max: usize| {
             text.len() <= max
                 && text
                     .bytes()
                     .all(|byte| (byte.is_ascii_graphic() && byte != b',') || byte == b' ')
         };
-        if !valid(callsign, Self::MAX_CALLSIGN_LEN) {
+        if !valid(&callsign, Self::MAX_CALLSIGN_LEN) {
             return Err(ValidationError::InvalidCallsignText {
-                text: callsign.to_owned(),
+                text: callsign.into_owned(),
             });
         }
-        if !valid(memo, Self::MAX_MEMO_LEN) {
+        if !valid(&memo, Self::MAX_MEMO_LEN) {
             return Err(ValidationError::InvalidCallsignText {
-                text: memo.to_owned(),
+                text: memo.into_owned(),
             });
         }
         Ok(Self {
             slot,
-            callsign: callsign.to_owned(),
-            memo: memo.to_owned(),
+            callsign: callsign.into_owned(),
+            memo: memo.into_owned(),
         })
     }
 
@@ -583,6 +627,18 @@ impl DstarCallsignEntry {
     #[must_use]
     pub const fn is_set(&self) -> bool {
         !self.callsign.is_empty()
+    }
+
+    /// The validated callsign text, including any stored spaces.
+    #[must_use]
+    pub fn callsign(&self) -> &str {
+        &self.callsign
+    }
+
+    /// The validated memo text, including any stored spaces.
+    #[must_use]
+    pub fn memo(&self) -> &str {
+        &self.memo
     }
 }
 
@@ -608,6 +664,8 @@ impl fmt::Display for DstarCallsignEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AprsCallsign(String);
 
+string_traits!(AprsCallsign, ValidationError);
+
 impl AprsCallsign {
     /// Maximum encoded length: a six-character base plus `-15`.
     pub const MAX_LEN: usize = 9;
@@ -620,8 +678,13 @@ impl AprsCallsign {
     /// of one to six uppercase ASCII letters and digits, optionally followed by
     /// `-` and a canonical SSID of 1 to 15.
     pub fn new(text: &str) -> Result<Self, ValidationError> {
+        Self::validate(text)?;
+        Ok(Self(text.to_owned()))
+    }
+
+    fn validate(text: &str) -> Result<(), ValidationError> {
         if Self::is_canonical(text) {
-            Ok(Self(text.to_owned()))
+            Ok(())
         } else {
             Err(ValidationError::InvalidCallsignText {
                 text: text.to_owned(),
@@ -684,7 +747,7 @@ impl TryFrom<u8> for PacketDataRate {
             0 => Ok(Self::Bps1200),
             1 => Ok(Self::Bps9600),
             _ => Err(ValidationError::SettingOutOfRange {
-                setting: "packet data rate",
+                setting: SettingName::PacketDataRate,
                 value: u64::from(value),
                 max: 1,
             }),
@@ -736,7 +799,7 @@ impl TryFrom<u8> for BeaconMethod {
             2 => Ok(Self::Auto),
             3 => Ok(Self::SmartBeaconing),
             _ => Err(ValidationError::SettingOutOfRange {
-                setting: "beacon method",
+                setting: SettingName::BeaconMethod,
                 value: u64::from(value),
                 max: 3,
             }),
@@ -817,6 +880,12 @@ impl NmeaSentences {
     /// No sentences.
     pub const NONE: Self = Self(0);
 
+    /// An empty sentence selection, equivalent to [`Self::default`].
+    #[must_use]
+    pub const fn new() -> Self {
+        Self::NONE
+    }
+
     /// Whether `sentence` is selected.
     #[must_use]
     pub const fn contains(self, sentence: NmeaSentence) -> bool {
@@ -871,16 +940,144 @@ impl NmeaSentences {
     }
 
     /// The selected sentences in wire order.
-    pub fn iter(self) -> impl Iterator<Item = NmeaSentence> {
-        NmeaSentence::ALL
+    #[must_use]
+    pub const fn iter(self) -> NmeaSentenceIter {
+        NmeaSentenceIter { remaining: self }
+    }
+}
+
+/// Selected NMEA sentences in wire order, yielding each sentence once.
+#[derive(Debug, Clone)]
+pub struct NmeaSentenceIter {
+    remaining: NmeaSentences,
+}
+
+impl Iterator for NmeaSentenceIter {
+    type Item = NmeaSentence;
+    fn next(&mut self) -> Option<Self::Item> {
+        let sentence = NmeaSentence::ALL
             .into_iter()
-            .filter(move |sentence| self.contains(*sentence))
+            .find(|sentence| self.remaining.contains(*sentence))?;
+        self.remaining = self.remaining.without(sentence);
+        Some(sentence)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.len();
+        (len, Some(len))
+    }
+}
+
+impl DoubleEndedIterator for NmeaSentenceIter {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        let sentence = NmeaSentence::ALL
+            .into_iter()
+            .rev()
+            .find(|sentence| self.remaining.contains(*sentence))?;
+        self.remaining = self.remaining.without(sentence);
+        Some(sentence)
+    }
+}
+
+impl ExactSizeIterator for NmeaSentenceIter {
+    fn len(&self) -> usize {
+        self.remaining
+            .to_flags()
+            .into_iter()
+            .filter(|enabled| *enabled)
+            .count()
+    }
+}
+
+impl std::iter::FusedIterator for NmeaSentenceIter {}
+
+impl IntoIterator for NmeaSentences {
+    type Item = NmeaSentence;
+    type IntoIter = NmeaSentenceIter;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl IntoIterator for &NmeaSentences {
+    type Item = NmeaSentence;
+    type IntoIter = NmeaSentenceIter;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl Extend<NmeaSentence> for NmeaSentences {
+    fn extend<I: IntoIterator<Item = NmeaSentence>>(&mut self, sentences: I) {
+        for sentence in sentences {
+            *self = self.with(sentence);
+        }
+    }
+}
+
+impl From<[bool; 6]> for NmeaSentences {
+    fn from(flags: [bool; 6]) -> Self {
+        Self::from_flags(flags)
+    }
+}
+
+impl From<NmeaSentences> for [bool; 6] {
+    fn from(sentences: NmeaSentences) -> Self {
+        sentences.to_flags()
+    }
+}
+
+impl std::ops::BitOr for NmeaSentences {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl std::ops::BitAnd for NmeaSentences {
+    type Output = Self;
+    fn bitand(self, rhs: Self) -> Self {
+        Self(self.0 & rhs.0)
+    }
+}
+
+impl std::ops::BitXor for NmeaSentences {
+    type Output = Self;
+    fn bitxor(self, rhs: Self) -> Self {
+        Self(self.0 ^ rhs.0)
+    }
+}
+
+impl std::ops::Not for NmeaSentences {
+    type Output = Self;
+    fn not(self) -> Self {
+        Self(!self.0 & 0x3F)
+    }
+}
+
+impl std::ops::BitOrAssign for NmeaSentences {
+    fn bitor_assign(&mut self, rhs: Self) {
+        *self = *self | rhs;
+    }
+}
+
+impl std::ops::BitAndAssign for NmeaSentences {
+    fn bitand_assign(&mut self, rhs: Self) {
+        *self = *self & rhs;
+    }
+}
+
+impl std::ops::BitXorAssign for NmeaSentences {
+    fn bitxor_assign(&mut self, rhs: Self) {
+        *self = *self ^ rhs;
     }
 }
 
 impl FromIterator<NmeaSentence> for NmeaSentences {
     fn from_iter<I: IntoIterator<Item = NmeaSentence>>(sentences: I) -> Self {
-        sentences.into_iter().fold(Self::NONE, Self::with)
+        let mut selected = Self::new();
+        selected.extend(sentences);
+        selected
     }
 }
 
@@ -931,8 +1128,13 @@ pub enum TncMode {
     /// Menu 984 selects.
     Kiss,
     /// Any other reported value, retained exactly as received.
-    Unnamed(u8),
+    Unnamed(UnnamedTncMode),
 }
+
+unnamed_wire_value!(
+    /// A TNC byte outside Off (`0`), APRS (`1`) and KISS (`2`).
+    UnnamedTncMode, [0..=2]
+);
 
 impl From<u8> for TncMode {
     fn from(value: u8) -> Self {
@@ -940,7 +1142,7 @@ impl From<u8> for TncMode {
             0 => Self::Off,
             1 => Self::Aprs,
             2 => Self::Kiss,
-            other => Self::Unnamed(other),
+            other => Self::Unnamed(UnnamedTncMode(other)),
         }
     }
 }
@@ -951,7 +1153,7 @@ impl From<TncMode> for u8 {
             TncMode::Off => 0,
             TncMode::Aprs => 1,
             TncMode::Kiss => 2,
-            TncMode::Unnamed(raw) => raw,
+            TncMode::Unnamed(raw) => raw.get(),
         }
     }
 }
@@ -1018,7 +1220,7 @@ impl fmt::Display for TncState {
 /// The radio's clock as `RT` reports it: twelve digits `YYMMDDHHMMSS` in
 /// the radio's local time, with the year counted from 2000.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RealTimeClock {
+pub struct ClockComponents {
     /// Full year, 2000 through 2099.
     pub year: u16,
     /// Month, 1 through 12.
@@ -1033,6 +1235,10 @@ pub struct RealTimeClock {
     pub second: u8,
 }
 
+/// A checked CAT clock value with an actual Gregorian date in 2000..=2099.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RealTimeClock(ClockComponents);
+
 impl RealTimeClock {
     /// Number of wire digits.
     pub const WIRE_DIGITS: usize = 12;
@@ -1042,65 +1248,65 @@ impl RealTimeClock {
     /// # Errors
     ///
     /// Returns [`ValidationError::SettingOutOfRange`] naming the first field
-    /// outside its range. Days are checked against 31 only.
-    pub const fn new(
-        year: u16,
-        month: u8,
-        day: u8,
-        hour: u8,
-        minute: u8,
-        second: u8,
-    ) -> Result<Self, ValidationError> {
-        if year < 2000 || year > 2099 {
-            return Err(ValidationError::SettingOutOfRange {
-                setting: "clock year",
-                value: year as u64,
-                max: 2099,
-            });
-        }
-        if month < 1 || month > 12 {
-            return Err(ValidationError::SettingOutOfRange {
-                setting: "clock month",
-                value: month as u64,
-                max: 12,
-            });
-        }
-        if day < 1 || day > 31 {
-            return Err(ValidationError::SettingOutOfRange {
-                setting: "clock day",
-                value: day as u64,
-                max: 31,
-            });
-        }
-        if hour > 23 {
-            return Err(ValidationError::SettingOutOfRange {
-                setting: "clock hour",
-                value: hour as u64,
-                max: 23,
-            });
-        }
-        if minute > 59 {
-            return Err(ValidationError::SettingOutOfRange {
-                setting: "clock minute",
-                value: minute as u64,
-                max: 59,
-            });
-        }
-        if second > 59 {
-            return Err(ValidationError::SettingOutOfRange {
-                setting: "clock second",
-                value: second as u64,
-                max: 59,
-            });
-        }
-        Ok(Self {
+    /// outside its range, including days outside the selected calendar month.
+    pub const fn new(components: ClockComponents) -> Result<Self, ValidationError> {
+        let ClockComponents {
             year,
             month,
             day,
             hour,
             minute,
             second,
-        })
+        } = components;
+        if year < 2000 || year > 2099 {
+            return Err(ValidationError::SettingOutOfRange {
+                setting: SettingName::ClockYear,
+                value: year as u64,
+                max: 2099,
+            });
+        }
+        if month < 1 || month > 12 {
+            return Err(ValidationError::SettingOutOfRange {
+                setting: SettingName::ClockMonth,
+                value: month as u64,
+                max: 12,
+            });
+        }
+        let maximum_day = match month {
+            2 if year % 4 == 0 => 29,
+            2 => 28,
+            4 | 6 | 9 | 11 => 30,
+            _ => 31,
+        };
+        if day < 1 || day > maximum_day {
+            return Err(ValidationError::SettingOutOfRange {
+                setting: SettingName::ClockDay,
+                value: day as u64,
+                max: maximum_day as u64,
+            });
+        }
+        if hour > 23 {
+            return Err(ValidationError::SettingOutOfRange {
+                setting: SettingName::ClockHour,
+                value: hour as u64,
+                max: 23,
+            });
+        }
+        if minute > 59 {
+            return Err(ValidationError::SettingOutOfRange {
+                setting: SettingName::ClockMinute,
+                value: minute as u64,
+                max: 59,
+            });
+        }
+        if second > 59 {
+            return Err(ValidationError::SettingOutOfRange {
+                setting: SettingName::ClockSecond,
+                value: second as u64,
+                max: 59,
+            });
+        }
+        Ok(Self(components))
     }
 
     /// Parse the twelve-digit wire field.
@@ -1123,7 +1329,14 @@ impl RealTimeClock {
         let mut next = || pairs.next().unwrap_or_default();
         let year = 2000 + u16::from(next());
         let (month, day, hour, minute, second) = (next(), next(), next(), next(), next());
-        Self::new(year, month, day, hour, minute, second)
+        Self::new(ClockComponents {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+        })
     }
 
     /// The twelve-digit wire field.
@@ -1131,13 +1344,19 @@ impl RealTimeClock {
     pub fn to_wire_string(self) -> String {
         format!(
             "{:02}{:02}{:02}{:02}{:02}{:02}",
-            self.year - 2000,
-            self.month,
-            self.day,
-            self.hour,
-            self.minute,
-            self.second
+            self.0.year - 2000,
+            self.0.month,
+            self.0.day,
+            self.0.hour,
+            self.0.minute,
+            self.0.second
         )
+    }
+
+    /// A copy of the named calendar components; changes require [`Self::new`].
+    #[must_use]
+    pub const fn components(self) -> ClockComponents {
+        self.0
     }
 }
 
@@ -1146,7 +1365,7 @@ impl fmt::Display for RealTimeClock {
         write!(
             formatter,
             "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-            self.year, self.month, self.day, self.hour, self.minute, self.second
+            self.0.year, self.0.month, self.0.day, self.0.hour, self.0.minute, self.0.second
         )
     }
 }
@@ -1248,11 +1467,11 @@ mod tests {
         assert!(BeaconMethod::try_from(4).is_err());
         assert_eq!(SMeterReading::new(9).to_string(), "S9");
         assert_eq!(VoxMode::from(1), VoxMode::On);
-        assert_eq!(VoxMode::from(2), VoxMode::Unnamed(2));
-        assert_eq!(u8::from(VoxMode::Unnamed(2)), 2);
+        assert_eq!(VoxMode::from(2), VoxMode::Unnamed(UnnamedVoxMode(2)));
+        assert_eq!(u8::from(VoxMode::Unnamed(UnnamedVoxMode(2))), 2);
         assert_eq!(TncMode::from(1), TncMode::Aprs);
         assert_eq!(TncMode::from(2), TncMode::Kiss);
-        assert_eq!(TncMode::from(3), TncMode::Unnamed(3));
+        assert_eq!(TncMode::from(3), TncMode::Unnamed(UnnamedTncMode(3)));
         assert_eq!(u8::from(TncMode::Kiss), 2);
         assert_eq!(u8::from(TncMode::Off), 0);
         for mode in [
@@ -1267,18 +1486,115 @@ mod tests {
 
     #[test]
     fn callsign_entries_bound_both_fields() -> TestResult {
-        let entry = DstarCallsignEntry::new(DstarSlot::new(1)?, "", "")?;
+        let entry = DstarCallsignEntry::new(
+            DstarSlot::new(1)?,
+            DstarCallsignText {
+                callsign: "".into(),
+                memo: "".into(),
+            },
+        )?;
         assert_eq!(entry.to_string(), "MY1 unset");
-        let entry = DstarCallsignEntry::new(DstarSlot::new(2)?, "W1AW", "D750")?;
+        let entry = DstarCallsignEntry::new(
+            DstarSlot::new(2)?,
+            DstarCallsignText {
+                callsign: "W1AW".into(),
+                memo: "D750".into(),
+            },
+        )?;
         assert_eq!(entry.to_string(), "MY2 W1AW (D750)");
-        assert!(DstarCallsignEntry::new(DstarSlot::new(1)?, "W1AWW1AWW", "").is_err());
-        assert!(DstarCallsignEntry::new(DstarSlot::new(1)?, "W1AW", "D750A").is_err());
-        assert!(DstarCallsignEntry::new(DstarSlot::new(1)?, "W1\rAW", "").is_err());
+        assert!(
+            DstarCallsignEntry::new(
+                DstarSlot::new(1)?,
+                DstarCallsignText {
+                    callsign: "W1AWW1AWW".into(),
+                    memo: "".into()
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            DstarCallsignEntry::new(
+                DstarSlot::new(1)?,
+                DstarCallsignText {
+                    callsign: "W1AW".into(),
+                    memo: "D750A".into()
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            DstarCallsignEntry::new(
+                DstarSlot::new(1)?,
+                DstarCallsignText {
+                    callsign: "W1\rAW".into(),
+                    memo: "".into()
+                }
+            )
+            .is_err()
+        );
         let unset = DstarCallsignEntry::empty(DstarSlot::new(3)?);
-        assert_eq!(unset, DstarCallsignEntry::new(DstarSlot::new(3)?, "", "")?);
+        assert_eq!(
+            unset,
+            DstarCallsignEntry::new(
+                DstarSlot::new(3)?,
+                DstarCallsignText {
+                    callsign: "".into(),
+                    memo: "".into()
+                }
+            )?
+        );
         assert!(!unset.is_set());
-        assert!(DstarCallsignEntry::new(DstarSlot::new(3)?, "W1AW", "")?.is_set());
-        assert!(!DstarCallsignEntry::new(DstarSlot::new(3)?, "", "MEMO")?.is_set());
+        assert!(
+            DstarCallsignEntry::new(
+                DstarSlot::new(3)?,
+                DstarCallsignText {
+                    callsign: "W1AW".into(),
+                    memo: "".into()
+                }
+            )?
+            .is_set()
+        );
+        assert!(
+            !DstarCallsignEntry::new(
+                DstarSlot::new(3)?,
+                DstarCallsignText {
+                    callsign: "".into(),
+                    memo: "MEMO".into()
+                }
+            )?
+            .is_set()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn named_callsign_fields_transfer_owned_text_and_reject_command_delimiters() -> TestResult {
+        let callsign = String::from("W1AW");
+        let memo = String::from("TEST");
+        let callsign_allocation = callsign.as_ptr();
+        let memo_allocation = memo.as_ptr();
+        let entry = DstarCallsignEntry::new(
+            DstarSlot::new(1)?,
+            DstarCallsignText {
+                callsign: callsign.into(),
+                memo: memo.into(),
+            },
+        )?;
+        assert_eq!(entry.callsign().as_ptr(), callsign_allocation);
+        assert_eq!(entry.memo().as_ptr(), memo_allocation);
+        for (callsign, memo) in [("W1\rAW", ""), ("W1AW", "T,ST"), ("W1AW", "12345")] {
+            let result = DstarCallsignEntry::new(
+                DstarSlot::new(1)?,
+                DstarCallsignText {
+                    callsign: callsign.to_owned().into(),
+                    memo: memo.to_owned().into(),
+                },
+            );
+            assert!(
+                matches!(result, Err(ValidationError::InvalidCallsignText { .. })),
+                "{result:?}"
+            );
+        }
         Ok(())
     }
 
@@ -1349,6 +1665,78 @@ mod tests {
     }
 
     #[test]
+    fn sentence_sets_preserve_selection_through_standard_collection_interfaces() {
+        let mut selected = NmeaSentences::new();
+        selected.extend([NmeaSentence::Rmc, NmeaSentence::Gga, NmeaSentence::Rmc]);
+        let mut iter = (&selected).into_iter();
+        assert_eq!(iter.len(), 2);
+        assert_eq!(iter.next_back(), Some(NmeaSentence::Rmc));
+        assert_eq!(iter.next(), Some(NmeaSentence::Gga));
+        assert_eq!(iter.len(), 0);
+        assert_eq!(iter.next(), None);
+        let complement = !selected;
+        assert_eq!(complement.into_iter().count(), 4);
+        assert_eq!(selected & complement, NmeaSentences::new());
+        assert_eq!(
+            (selected | complement).into_iter().collect::<Vec<_>>(),
+            NmeaSentence::ALL
+        );
+        assert_eq!((selected ^ complement).into_iter().count(), 6);
+        assert_eq!(NmeaSentences::from(<[bool; 6]>::from(selected)), selected);
+    }
+
+    #[test]
+    fn clock_construction_checks_the_full_calendar_and_protects_serialization() -> TestResult {
+        let valid = ClockComponents {
+            year: 2024,
+            month: 2,
+            day: 29,
+            hour: 23,
+            minute: 59,
+            second: 59,
+        };
+        let clock = RealTimeClock::new(valid)?;
+        assert_eq!(clock.to_wire_string(), "240229235959");
+        let mut changed = clock.components();
+        changed.year = 1999;
+        changed.month = 1;
+        changed.day = 1;
+        assert!(matches!(
+            RealTimeClock::new(changed),
+            Err(ValidationError::SettingOutOfRange {
+                setting: SettingName::ClockYear,
+                ..
+            })
+        ));
+        changed.year = 2100;
+        assert!(matches!(
+            RealTimeClock::new(changed),
+            Err(ValidationError::SettingOutOfRange {
+                setting: SettingName::ClockYear,
+                ..
+            })
+        ));
+        assert_eq!(
+            clock.components(),
+            valid,
+            "changing a projection cannot mutate the checked clock"
+        );
+        for text in ["230229000000", "240230000000", "240431000000"] {
+            assert!(
+                matches!(
+                    RealTimeClock::from_wire_str(text),
+                    Err(ValidationError::SettingOutOfRange {
+                        setting: SettingName::ClockDay,
+                        ..
+                    })
+                ),
+                "{text}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn clock_round_trips_the_twelve_digit_field() -> TestResult {
         let clock = RealTimeClock::from_wire_str("260921003607")?;
         assert_eq!(clock.to_string(), "2026-09-21 00:36:07");
@@ -1363,11 +1751,11 @@ mod tests {
             );
         }
         for (text, setting) in [
-            ("261321003607", "clock month"),
-            ("260900003607", "clock day"),
-            ("260921243607", "clock hour"),
-            ("260921006007", "clock minute"),
-            ("260921003660", "clock second"),
+            ("261321003607", SettingName::ClockMonth),
+            ("260900003607", SettingName::ClockDay),
+            ("260921243607", SettingName::ClockHour),
+            ("260921006007", SettingName::ClockMinute),
+            ("260921003660", SettingName::ClockSecond),
         ] {
             let result = RealTimeClock::from_wire_str(text);
             assert!(

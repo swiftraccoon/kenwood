@@ -1,4 +1,5 @@
 #![no_main]
+//! Checks NMEA framing and independence from the input chunk boundary.
 
 use kenwood_tmd750::nmea::{LineReader, RawSentence, Sentence};
 use libfuzzer_sys::fuzz_target;

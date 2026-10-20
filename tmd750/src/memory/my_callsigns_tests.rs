@@ -32,11 +32,23 @@ fn decodes_each_entry_and_the_zero_based_selection() -> TestResult {
     let list = MyCallsignList::read(&image, SlotIndex::new(0)?)?;
     assert_eq!(
         list.entry(DstarSlot::new(1)?),
-        &DstarCallsignEntry::new(DstarSlot::new(1)?, "KQ4NIT", "HOME")?
+        &DstarCallsignEntry::new(
+            DstarSlot::new(1)?,
+            DstarCallsignText {
+                callsign: "KQ4NIT".into(),
+                memo: "HOME".into()
+            }
+        )?
     );
     assert_eq!(
         list.entry(DstarSlot::new(2)?),
-        &DstarCallsignEntry::new(DstarSlot::new(2)?, "N0CALL", "")?
+        &DstarCallsignEntry::new(
+            DstarSlot::new(2)?,
+            DstarCallsignText {
+                callsign: "N0CALL".into(),
+                memo: "".into()
+            }
+        )?
     );
     for slot in 3..=6 {
         let slot = DstarSlot::new(slot)?;
@@ -53,7 +65,7 @@ fn each_pm_slot_reads_its_own_copy_one_stride_further() -> TestResult {
     let offset = 3 * SLOT_STRIDE;
     let image = image(&[(0x5_0003 + offset, &[0]), (0x5_0004 + offset, &entries)])?;
     let list = MyCallsignList::read(&image, SlotIndex::new(3)?)?;
-    assert_eq!(list.entry(DstarSlot::new(1)?).callsign, "W1AW");
+    assert_eq!(list.entry(DstarSlot::new(1)?).callsign(), "W1AW");
     assert!(
         MyCallsignList::read(&image, SlotIndex::new(0)?).is_err(),
         "PM Off's erased list is not decoded from PM3's bytes"

@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use kenwood_transport::MockTransport;
 
 use super::*;
-use crate::transport::{KENWOOD_VID, TMD750_MAIN_PID, TMD750_PANEL_PID};
+use crate::transport::{DEFAULT_BAUD, KENWOOD_VID, TMD750_MAIN_PID, TMD750_PANEL_PID};
 use crate::types::{FirmwareIdentity, RadioModel, RadioType};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -250,10 +250,10 @@ impl ControlHost for FakeHost {
     fn open(
         &mut self,
         selected: &SerialCandidate,
-        baud: u32,
+        baud: NonZeroU32,
     ) -> Result<Self::Connection, TransportError> {
         assert_eq!(selected, &endpoint(), "only the pinned endpoint may open");
-        assert_eq!(baud, 9600, "preserve the selected CAT baud");
+        assert_eq!(baud.get(), 9600, "preserve the selected CAT baud");
         self.shared
             .record(Seen::Open(self.opens))
             .and_then(|()| self.shared.advance(self.open_cost))
@@ -344,7 +344,7 @@ async fn readiness(
     cancelled: &AtomicBool,
 ) -> Result<ReadinessReport, Box<dyn std::error::Error>> {
     let expected = identity()?;
-    Ok(verify_readiness(host, &endpoint(), 9600, &expected, None, cancelled).await)
+    Ok(verify_readiness(host, &endpoint(), DEFAULT_BAUD, &expected, None, cancelled).await)
 }
 
 async fn gateway_readiness(
@@ -355,7 +355,7 @@ async fn gateway_readiness(
     Ok(verify_readiness(
         host,
         &endpoint(),
-        9600,
+        DEFAULT_BAUD,
         &expected,
         Some(gateway),
         &AtomicBool::new(false),
@@ -660,7 +660,7 @@ async fn observation_reads_identity_then_gateway_on_one_closed_connection() -> T
     let report = observe_control(
         &mut host,
         &endpoint(),
-        9600,
+        DEFAULT_BAUD,
         Expectation {
             identity: Some(&expected),
             gateway: Some(DvGatewayMode::Off),
@@ -682,7 +682,7 @@ async fn observation_without_expectations_records_whatever_it_reads() -> TestRes
     let report = observe_control(
         &mut host,
         &endpoint(),
-        9600,
+        DEFAULT_BAUD,
         Expectation::default(),
         &AtomicBool::new(false),
     )
@@ -699,14 +699,14 @@ async fn observation_without_expectations_records_whatever_it_reads() -> TestRes
 async fn other_gateway_states_are_recorded_but_never_accepted_as_the_required_one() -> TestResult {
     for (reply, mode) in [
         (b"GW 2\r".as_slice(), DvGatewayMode::Terminal),
-        (b"GW 1\r", DvGatewayMode::Unnamed(1)),
-        (b"GW 255\r", DvGatewayMode::Unnamed(255)),
+        (b"GW 1\r", DvGatewayMode::from(1)),
+        (b"GW 255\r", DvGatewayMode::from(255)),
     ] {
         let mut host = FakeHost::new([gateway_script(reply)]);
         let report = observe_control(
             &mut host,
             &endpoint(),
-            9600,
+            DEFAULT_BAUD,
             Expectation {
                 identity: None,
                 gateway: Some(DvGatewayMode::Off),
@@ -741,7 +741,7 @@ async fn failed_gateway_replies_close_without_retry() -> TestResult {
         let report = observe_control(
             &mut host,
             &endpoint(),
-            9600,
+            DEFAULT_BAUD,
             Expectation::default(),
             &AtomicBool::new(false),
         )
@@ -764,7 +764,7 @@ async fn failed_gateway_replies_close_without_retry() -> TestResult {
     let report = observe_control(
         &mut host,
         &endpoint(),
-        9600,
+        DEFAULT_BAUD,
         Expectation::default(),
         &AtomicBool::new(false),
     )
@@ -788,7 +788,7 @@ async fn identity_mismatch_or_failure_never_sends_the_gateway_query() -> TestRes
         let report = observe_control(
             &mut host,
             &endpoint(),
-            9600,
+            DEFAULT_BAUD,
             Expectation {
                 identity: Some(&expected),
                 gateway: Some(DvGatewayMode::Off),
@@ -808,7 +808,7 @@ async fn identity_mismatch_or_failure_never_sends_the_gateway_query() -> TestRes
     let report = observe_control(
         &mut host,
         &endpoint(),
-        9600,
+        DEFAULT_BAUD,
         Expectation::default(),
         &AtomicBool::new(false),
     )
@@ -827,7 +827,7 @@ async fn observation_cancellation_stops_at_the_next_query_and_still_closes() -> 
     let report = observe_control(
         &mut unopened,
         &endpoint(),
-        9600,
+        DEFAULT_BAUD,
         Expectation::default(),
         &AtomicBool::new(true),
     )
@@ -846,7 +846,7 @@ async fn observation_cancellation_stops_at_the_next_query_and_still_closes() -> 
         let report = observe_control(
             &mut host,
             &endpoint(),
-            9600,
+            DEFAULT_BAUD,
             Expectation::default(),
             &cancelled,
         )
@@ -870,7 +870,7 @@ async fn a_failed_close_replaces_a_match_but_never_an_earlier_failure() -> TestR
         let report = observe_control(
             &mut host,
             &endpoint(),
-            9600,
+            DEFAULT_BAUD,
             Expectation {
                 identity: None,
                 gateway: Some(DvGatewayMode::Off),

@@ -22,6 +22,9 @@ use crate::radio::programming::{McpJournal, McpSession, PageReplacement};
 use crate::radio::{Identity, Radio};
 use crate::types::DvGatewayMode;
 
+#[cfg(test)]
+mod tests;
+
 /// Which direction one programming pass writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalPhase {
@@ -73,7 +76,9 @@ pub trait TerminalJournal {
     /// Record the pass's outcome: the exit acknowledgment and the session's
     /// possibly-written and verified pages.
     ///
-    /// Called once at the end of every pass, success or failure.
+    /// Called once at the end of each pass that entered programming mode,
+    /// including an operation or exit failure. Pre-entry refusals produce no
+    /// checkpoint.
     ///
     /// # Errors
     ///
@@ -129,6 +134,12 @@ pub struct TerminalProgramReport {
 /// checkpoint failures separate so a later one never hides the radio error.
 #[derive(Debug, thiserror::Error)]
 pub struct TerminalProgramError {
+    /// The complete plan, when preparation finished before the failure.
+    pub plan: Option<TerminalPlan>,
+    /// Whether an accepted intent allowed a write frame to reach the radio.
+    pub write_started: bool,
+    /// Ordered possibly-written and verified pages retained after failure.
+    pub journal: McpJournal,
     /// The failed programming operation, when one failed.
     #[source]
     pub operation: Option<TerminalOperationError>,
@@ -140,8 +151,11 @@ pub struct TerminalProgramError {
 
 impl TerminalProgramError {
     /// A refusal before programming entry: only the operation cause is set.
-    const fn operation(operation: TerminalOperationError) -> Self {
+    fn operation(operation: TerminalOperationError) -> Self {
         Self {
+            plan: None,
+            write_started: false,
+            journal: McpJournal::default(),
             operation: Some(operation),
             exit: None,
             checkpoint: None,
@@ -259,7 +273,7 @@ pub async fn program_terminal<T: Transport>(
             )));
         }
     };
-    let mut write_started = false;
+    let mut progress = ProgrammingProgress::default();
     let operation = run_pages(
         &mut session,
         expected,
@@ -267,7 +281,7 @@ pub async fn program_terminal<T: Transport>(
         request,
         journal,
         cancelled,
-        &mut write_started,
+        &mut progress,
     )
     .await;
     let mcp_journal = session.journal().clone();
@@ -277,7 +291,14 @@ pub async fn program_terminal<T: Transport>(
         Err(Error::from(crate::error::McpError::RecoveryRequired))
     };
     let checkpoint = journal.checkpoint(phase, exit.is_ok(), &mcp_journal);
-    finish(operation, write_started, exit, checkpoint)
+    finish(operation, progress, mcp_journal, exit, checkpoint)
+}
+
+/// Plan and dispatch state retained independently of the operation result.
+#[derive(Default)]
+struct ProgrammingProgress {
+    plan: Option<TerminalPlan>,
+    write_started: bool,
 }
 
 /// Build the plan and write its pages inside an open MCP session.
@@ -288,14 +309,20 @@ async fn run_pages<T: Transport>(
     request: TerminalRequest<'_>,
     journal: &mut impl TerminalJournal,
     cancelled: &AtomicBool,
-    write_started: &mut bool,
+    progress: &mut ProgrammingProgress,
 ) -> Result<TerminalPlan, TerminalOperationError> {
     let phase = request.phase();
     let plan = prepare_plan(session, expected, gateway, request, journal, cancelled).await?;
+    if matches!(request, TerminalRequest::Enter { .. }) {
+        let _restoration = plan.restoration()?;
+    }
+    progress.plan = Some(plan.clone());
     let _report = session
         .compare_exchange_terminal(
             &plan,
-            |page| record_before_write(journal, phase, page, write_started, cancelled),
+            |page| {
+                record_before_write(journal, phase, page, &mut progress.write_started, cancelled)
+            },
             |_progress| {},
         )
         .await
@@ -412,23 +439,24 @@ fn operation_from_plan_error(error: TerminalPlanError) -> TerminalOperationError
 /// Combine the operation, exit and checkpoint results into one report or error.
 fn finish(
     operation: Result<TerminalPlan, TerminalOperationError>,
-    write_started: bool,
+    progress: ProgrammingProgress,
+    journal: McpJournal,
     exit: Result<(), Error>,
     checkpoint: io::Result<()>,
 ) -> Result<TerminalProgramReport, Box<TerminalProgramError>> {
     match (operation, exit, checkpoint) {
         (Ok(plan), Ok(()), Ok(())) => Ok(TerminalProgramReport {
             plan,
-            write_started,
+            write_started: progress.write_started,
             exit_acknowledged: true,
         }),
         (operation, exit, checkpoint) => Err(Box::new(TerminalProgramError {
+            plan: progress.plan,
+            write_started: progress.write_started,
+            journal,
             operation: operation.err(),
             exit: exit.err(),
             checkpoint: checkpoint.err(),
         })),
     }
 }
-
-#[cfg(test)]
-mod tests;

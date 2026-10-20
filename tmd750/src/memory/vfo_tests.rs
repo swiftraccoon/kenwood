@@ -486,7 +486,7 @@ fn the_type_k_offset_plan_applies_only_where_the_radio_applies_it() -> TestResul
     assert_eq!(kept.shift, ShiftDirection::Minus);
     let mut digital = memory.current(Band::A).clone();
     digital.reverse = false;
-    digital.mode = OperatingMode::Dv;
+    digital.mode = OperatingMode::Dv.try_into()?;
     assert_eq!(memory.tune(Band::A, digital)?, VfoBand::A144);
     let (_, kept) = memory.frequency_record(Band::A, frequency(147_000_000)?)?;
     assert_eq!(kept.shift, ShiftDirection::Minus);
