@@ -27,37 +27,28 @@ fn encode(codec: FieldCodec, value: FieldValue<'_>) -> Result<Vec<MaskedByte>, C
     codec.encode(value, ValueDomain::Stored, TextPolicy::ExactPadding)
 }
 
-fn assert_invalid_metadata(codec: FieldCodec, expected: CodecError) {
-    assert_eq!(codec.validate(), Err(expected.clone()), "{codec:?}");
-    assert_eq!(
-        codec.decode(&[], STORED),
-        Err(expected.clone()),
-        "{codec:?}"
-    );
-    assert_eq!(
-        encode(codec, FieldValue::Bool(false)),
-        Err(expected),
-        "metadata precedes even a mismatched value: {codec:?}"
-    );
+fn assert_invalid_metadata(spec: CodecSpec, expected: CodecError) {
+    assert_eq!(FieldCodec::new(spec), Err(expected.clone()), "{spec:?}");
+    assert_eq!(FieldCodec::try_from(spec), Err(expected), "{spec:?}");
 }
 
 #[test]
-fn malformed_metadata_is_rejected_before_every_operation() {
+fn malformed_metadata_is_rejected_at_construction() {
     let invalid = [
         (
-            FieldCodec::Byte { min: 2, max: 1 },
+            CodecSpec::Byte { min: 2, max: 1 },
             CodecError::InvalidUnsignedRange { min: 2, max: 1 },
         ),
         (
-            FieldCodec::BitBool { mask: 0 },
+            CodecSpec::BitBool { mask: 0 },
             CodecError::InvalidBitField { mask: 0, shift: 0 },
         ),
         (
-            FieldCodec::BitBool { mask: 3 },
+            CodecSpec::BitBool { mask: 3 },
             CodecError::InvalidBitField { mask: 3, shift: 0 },
         ),
         (
-            FieldCodec::Unsigned {
+            CodecSpec::Unsigned {
                 width: 0,
                 endian: Endian::Little,
                 min: 0,
@@ -66,7 +57,7 @@ fn malformed_metadata_is_rejected_before_every_operation() {
             CodecError::InvalidIntegerWidth { width: 0 },
         ),
         (
-            FieldCodec::Signed {
+            CodecSpec::Signed {
                 width: 9,
                 endian: Endian::Big,
                 min: 0,
@@ -75,7 +66,7 @@ fn malformed_metadata_is_rejected_before_every_operation() {
             CodecError::InvalidIntegerWidth { width: 9 },
         ),
         (
-            FieldCodec::Unsigned {
+            CodecSpec::Unsigned {
                 width: 8,
                 endian: Endian::Little,
                 min: 2,
@@ -84,7 +75,7 @@ fn malformed_metadata_is_rejected_before_every_operation() {
             CodecError::InvalidUnsignedRange { min: 2, max: 1 },
         ),
         (
-            FieldCodec::Signed {
+            CodecSpec::Signed {
                 width: 8,
                 endian: Endian::Big,
                 min: 2,
@@ -93,7 +84,7 @@ fn malformed_metadata_is_rejected_before_every_operation() {
             CodecError::InvalidSignedRange { min: 2, max: 1 },
         ),
         (
-            FieldCodec::Unsigned {
+            CodecSpec::Unsigned {
                 width: 1,
                 endian: Endian::Little,
                 min: 0,
@@ -102,7 +93,7 @@ fn malformed_metadata_is_rejected_before_every_operation() {
             CodecError::DomainExceedsWidth { width: 1 },
         ),
         (
-            FieldCodec::Signed {
+            CodecSpec::Signed {
                 width: 1,
                 endian: Endian::Big,
                 min: -129,
@@ -111,7 +102,7 @@ fn malformed_metadata_is_rejected_before_every_operation() {
             CodecError::DomainExceedsWidth { width: 1 },
         ),
         (
-            FieldCodec::Signed {
+            CodecSpec::Signed {
                 width: 1,
                 endian: Endian::Big,
                 min: -128,
@@ -120,11 +111,11 @@ fn malformed_metadata_is_rejected_before_every_operation() {
             CodecError::DomainExceedsWidth { width: 1 },
         ),
         (
-            FieldCodec::Bytes { len: 0 },
+            CodecSpec::Bytes { len: 0 },
             CodecError::InvalidEncodedLength { len: 0 },
         ),
         (
-            FieldCodec::FixedString {
+            CodecSpec::FixedString {
                 len: 0,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
@@ -132,8 +123,8 @@ fn malformed_metadata_is_rejected_before_every_operation() {
             CodecError::InvalidEncodedLength { len: 0 },
         ),
     ];
-    for (codec, expected) in invalid {
-        assert_invalid_metadata(codec, expected);
+    for (spec, expected) in invalid {
+        assert_invalid_metadata(spec, expected);
     }
 }
 
@@ -149,61 +140,131 @@ fn bit_metadata_rejects_gaps_misalignment_and_unrepresentable_domains() {
         (0x70, 4, 2, 1),
         (0x70, 4, 0, 8),
     ] {
-        let codec = FieldCodec::BitField {
+        let spec = CodecSpec::BitField {
             mask,
             shift,
             min,
             max,
         };
-        let expected = CodecError::InvalidBitField { mask, shift };
-        assert_eq!(codec.validate(), Err(expected.clone()));
-        assert_eq!(codec.decode(&[0], STORED), Err(expected.clone()));
-        assert_eq!(encode(codec, FieldValue::Unsigned(0)), Err(expected));
+        assert_invalid_metadata(spec, CodecError::InvalidBitField { mask, shift });
     }
 }
 
 #[test]
-fn positive_lengths_are_not_capped_to_any_radio_image() -> TestResult {
-    FieldCodec::Bytes { len: usize::MAX }.validate()?;
-    FieldCodec::FixedString {
-        len: usize::MAX,
-        encoding: StringEncoding::Utf8,
-        padding: 0,
-    }
-    .validate()?;
+fn const_construction_preserves_storage_bounds_and_rejects_invalid_domains() -> TestResult {
+    const SIGNED: FieldCodec = match FieldCodec::new(CodecSpec::Signed {
+        width: 8,
+        endian: Endian::Big,
+        min: i64::MIN,
+        max: i64::MAX,
+    }) {
+        Ok(codec) => codec,
+        Err(_) => unreachable!(),
+    };
+    const SPEC: CodecSpec = SIGNED.spec();
+    const INVALID: Result<FieldCodec, CodecError> = FieldCodec::new(CodecSpec::Unsigned {
+        width: 1,
+        endian: Endian::Little,
+        min: 0,
+        max: 256,
+    });
+
+    assert_eq!(FieldCodec::try_from(SPEC)?, SIGNED);
+    assert_eq!(
+        SIGNED.decode(&i64::MIN.to_be_bytes(), WRITABLE)?,
+        DecodedFieldValue::Signed(i64::MIN)
+    );
+    assert_eq!(
+        bytes(&encode(SIGNED, FieldValue::Signed(-1))?),
+        [u8::MAX; 8]
+    );
+    assert_eq!(INVALID, Err(CodecError::DomainExceedsWidth { width: 1 }));
+    assert_eq!(FieldCodec::new(CodecSpec::Bool)?, FieldCodec::BOOL);
+    assert_eq!(FieldCodec::BOOL.spec(), CodecSpec::Bool);
     Ok(())
 }
 
 #[test]
-fn every_codec_requires_an_exact_supplied_field_slice() {
+fn changing_a_specification_copy_cannot_change_the_validated_codec() -> TestResult {
+    let original = CodecSpec::BitField {
+        mask: 0x70,
+        shift: 4,
+        min: 0,
+        max: 7,
+    };
+    let codec = FieldCodec::try_from(original)?;
+    let mut projected = CodecSpec::from(codec);
+    let CodecSpec::BitField { shift, .. } = &mut projected else {
+        return Err("bit-field codec projected another storage kind".into());
+    };
+    *shift = 8;
+    assert_invalid_metadata(
+        projected,
+        CodecError::InvalidBitField {
+            mask: 0x70,
+            shift: 8,
+        },
+    );
+    assert_eq!(codec.spec(), original);
+    assert_eq!(
+        codec.decode(&[0xF0], WRITABLE)?,
+        DecodedFieldValue::Unsigned(7)
+    );
+    let encoded = codec.encode(
+        FieldValue::Unsigned(3),
+        ValueDomain::Writable,
+        TextPolicy::ExactPadding,
+    )?;
+    assert_eq!(
+        encoded.first().map(|byte| (byte.mask(), byte.value())),
+        Some((0x70, 0x30))
+    );
+    Ok(())
+}
+
+#[test]
+fn positive_lengths_are_not_capped_to_any_radio_image() -> TestResult {
+    let bytes = FieldCodec::new(CodecSpec::Bytes { len: usize::MAX })?;
+    let text = FieldCodec::new(CodecSpec::FixedString {
+        len: usize::MAX,
+        encoding: StringEncoding::Utf8,
+        padding: 0,
+    })?;
+    assert_eq!(bytes.encoded_len(), usize::MAX);
+    assert_eq!(text.encoded_len(), usize::MAX);
+    Ok(())
+}
+
+#[test]
+fn every_codec_requires_an_exact_supplied_field_slice() -> TestResult {
     let codecs = [
-        FieldCodec::Byte { min: 0, max: 255 },
-        FieldCodec::Bool,
-        FieldCodec::BitBool { mask: 0x80 },
-        FieldCodec::BitField {
+        FieldCodec::new(CodecSpec::Byte { min: 0, max: 255 })?,
+        FieldCodec::BOOL,
+        FieldCodec::new(CodecSpec::BitBool { mask: 0x80 })?,
+        FieldCodec::new(CodecSpec::BitField {
             mask: 0x70,
             shift: 4,
             min: 0,
             max: 7,
-        },
-        FieldCodec::Unsigned {
+        })?,
+        FieldCodec::new(CodecSpec::Unsigned {
             width: 3,
             endian: Endian::Little,
             min: 0,
             max: 255,
-        },
-        FieldCodec::Signed {
+        })?,
+        FieldCodec::new(CodecSpec::Signed {
             width: 2,
             endian: Endian::Big,
             min: -1,
             max: 1,
-        },
-        FieldCodec::FixedString {
+        })?,
+        FieldCodec::new(CodecSpec::FixedString {
             len: 3,
             encoding: StringEncoding::Utf8,
             padding: 0,
-        },
-        FieldCodec::Bytes { len: 3 },
+        })?,
+        FieldCodec::new(CodecSpec::Bytes { len: 3 })?,
     ];
     for codec in codecs {
         let expected = codec.encoded_len();
@@ -215,11 +276,12 @@ fn every_codec_requires_an_exact_supplied_field_slice() {
             );
         }
     }
+    Ok(())
 }
 
 #[test]
 fn byte_storage_domain_is_distinct_from_writable_range() -> TestResult {
-    let codec = FieldCodec::Byte { min: 10, max: 20 };
+    let codec = FieldCodec::new(CodecSpec::Byte { min: 10, max: 20 })?;
     for value in 0_u8..=255 {
         let raw = u64::from(value);
         assert_eq!(
@@ -257,13 +319,12 @@ fn all_contiguous_masks_preserve_only_the_owned_bits() -> TestResult {
         for width in 1_u8..=8 - shift {
             let capacity = u8::try_from((1_u16 << width) - 1)?;
             let mask = capacity << shift;
-            let codec = FieldCodec::BitField {
+            let codec = FieldCodec::new(CodecSpec::BitField {
                 mask,
                 shift,
                 min: 0,
                 max: capacity,
-            };
-            codec.validate()?;
+            })?;
             for value in 0..=capacity {
                 let encoded = encode(codec, FieldValue::Unsigned(u64::from(value)))?;
                 assert_eq!(encoded.len(), 1);
@@ -290,12 +351,12 @@ fn all_contiguous_masks_preserve_only_the_owned_bits() -> TestResult {
 
 #[test]
 fn bit_storage_domain_does_not_erase_the_writable_range() -> TestResult {
-    let codec = FieldCodec::BitField {
+    let codec = FieldCodec::new(CodecSpec::BitField {
         mask: 0x70,
         shift: 4,
         min: 1,
         max: 3,
-    };
+    })?;
     assert_eq!(
         codec.decode(&[0xFF], STORED)?,
         DecodedFieldValue::Unsigned(7)
@@ -328,29 +389,29 @@ fn bit_storage_domain_does_not_erase_the_writable_range() -> TestResult {
 fn boolean_read_policy_is_explicit_and_encoding_is_always_canonical() -> TestResult {
     for value in 0_u8..=255 {
         assert_eq!(
-            FieldCodec::Bool.decode(&[value], PERMISSIVE)?,
+            FieldCodec::BOOL.decode(&[value], PERMISSIVE)?,
             DecodedFieldValue::Bool(value != 0)
         );
         if value <= 1 {
             assert_eq!(
-                FieldCodec::Bool.decode(&[value], STORED)?,
+                FieldCodec::BOOL.decode(&[value], STORED)?,
                 DecodedFieldValue::Bool(value != 0)
             );
         } else {
             assert_eq!(
-                FieldCodec::Bool.decode(&[value], STORED),
+                FieldCodec::BOOL.decode(&[value], STORED),
                 Err(CodecError::NonCanonicalBoolean { value })
             );
         }
-        let decoded = FieldCodec::Bool.decode(&[value], PERMISSIVE)?;
+        let decoded = FieldCodec::BOOL.decode(&[value], PERMISSIVE)?;
         assert_eq!(
-            bytes(&encode(FieldCodec::Bool, decoded.as_field_value())?),
+            bytes(&encode(FieldCodec::BOOL, decoded.as_field_value())?),
             [u8::from(value != 0)]
         );
     }
     for shift in 0..8 {
         let mask = 1_u8 << shift;
-        let codec = FieldCodec::BitBool { mask };
+        let codec = FieldCodec::new(CodecSpec::BitBool { mask })?;
         assert_eq!(
             codec.decode(&[!mask], STORED)?,
             DecodedFieldValue::Bool(false)
@@ -380,12 +441,12 @@ fn all_integer_widths_round_trip_boundaries_in_both_orders() -> TestResult {
         let signed_maximum = i64::try_from(maximum >> 1)?;
         let signed_minimum = -signed_maximum - 1;
         for endian in [Endian::Little, Endian::Big] {
-            let unsigned = FieldCodec::Unsigned {
+            let unsigned = FieldCodec::new(CodecSpec::Unsigned {
                 width,
                 endian,
                 min: 0,
                 max: maximum,
-            };
+            })?;
             for value in [0, 1, maximum] {
                 let encoded = encode(unsigned, FieldValue::Unsigned(value))?;
                 assert_eq!(encoded.len(), usize::from(width));
@@ -398,12 +459,12 @@ fn all_integer_widths_round_trip_boundaries_in_both_orders() -> TestResult {
                     assert_eq!(byte.mask(), 255);
                 }
             }
-            let signed = FieldCodec::Signed {
+            let signed = FieldCodec::new(CodecSpec::Signed {
                 width,
                 endian,
                 min: signed_minimum,
                 max: signed_maximum,
-            };
+            })?;
             for value in [signed_minimum, -1, 0, 1, signed_maximum] {
                 let encoded = encode(signed, FieldValue::Signed(value))?;
                 assert_eq!(
@@ -422,12 +483,12 @@ fn integer_wire_order_and_sign_extension_have_independent_vectors() -> TestResul
         (Endian::Little, [0x56, 0x34, 0x12], [0xFE, 0xFF, 0xFF]),
         (Endian::Big, [0x12, 0x34, 0x56], [0xFF, 0xFF, 0xFE]),
     ] {
-        let unsigned = FieldCodec::Unsigned {
+        let unsigned = FieldCodec::new(CodecSpec::Unsigned {
             width: 3,
             endian,
             min: 0,
             max: 0xFF_FFFF,
-        };
+        })?;
         assert_eq!(
             unsigned.decode(&unsigned_bytes, STORED)?,
             DecodedFieldValue::Unsigned(0x12_3456)
@@ -436,12 +497,12 @@ fn integer_wire_order_and_sign_extension_have_independent_vectors() -> TestResul
             bytes(&encode(unsigned, FieldValue::Unsigned(0x12_3456))?),
             unsigned_bytes
         );
-        let signed = FieldCodec::Signed {
+        let signed = FieldCodec::new(CodecSpec::Signed {
             width: 3,
             endian,
             min: -0x80_0000,
             max: 0x7F_FFFF,
-        };
+        })?;
         assert_eq!(
             signed.decode(&signed_bytes, STORED)?,
             DecodedFieldValue::Signed(-2)
@@ -456,12 +517,12 @@ fn integer_wire_order_and_sign_extension_have_independent_vectors() -> TestResul
 
 #[test]
 fn stored_integer_values_must_fit_width_but_not_writable_range() -> TestResult {
-    let unsigned = FieldCodec::Unsigned {
+    let unsigned = FieldCodec::new(CodecSpec::Unsigned {
         width: 1,
         endian: Endian::Little,
         min: 10,
         max: 20,
-    };
+    })?;
     assert_eq!(
         unsigned.decode(&[255], STORED)?,
         DecodedFieldValue::Unsigned(255)
@@ -487,12 +548,12 @@ fn stored_integer_values_must_fit_width_but_not_writable_range() -> TestResult {
         encode(unsigned, FieldValue::Unsigned(256)),
         Err(CodecError::UnsignedOutOfRange { .. })
     ));
-    let signed = FieldCodec::Signed {
+    let signed = FieldCodec::new(CodecSpec::Signed {
         width: 1,
         endian: Endian::Big,
         min: -10,
         max: 10,
-    };
+    })?;
     assert_eq!(
         signed.decode(&[128], STORED)?,
         DecodedFieldValue::Signed(-128)
@@ -527,11 +588,11 @@ fn stored_integer_values_must_fit_width_but_not_writable_range() -> TestResult {
 
 #[test]
 fn exact_nul_padding_rejects_hidden_tail_while_first_terminator_ignores_it() -> TestResult {
-    let codec = FieldCodec::FixedString {
+    let codec = FieldCodec::new(CodecSpec::FixedString {
         len: 5,
         encoding: StringEncoding::Utf8,
         padding: 0,
-    };
+    })?;
     assert_eq!(
         codec.decode(b"AB\0\0\0", STORED)?,
         DecodedFieldValue::Text("AB".to_owned())
@@ -577,11 +638,11 @@ fn exact_nul_padding_rejects_hidden_tail_while_first_terminator_ignores_it() -> 
 
 #[test]
 fn non_nul_padding_policy_preserves_interior_bytes_only_when_requested() -> TestResult {
-    let codec = FieldCodec::FixedString {
+    let codec = FieldCodec::new(CodecSpec::FixedString {
         len: 5,
         encoding: StringEncoding::Utf8,
         padding: b' ',
-    };
+    })?;
     assert_eq!(
         codec.decode(b"A B  ", STORED)?,
         DecodedFieldValue::Text("A B".to_owned())
@@ -624,11 +685,11 @@ fn non_nul_padding_policy_preserves_interior_bytes_only_when_requested() -> Test
 
 #[test]
 fn text_lengths_count_bytes_and_invalid_utf8_is_not_replaced() -> TestResult {
-    let codec = FieldCodec::FixedString {
+    let codec = FieldCodec::new(CodecSpec::FixedString {
         len: 2,
         encoding: StringEncoding::Utf8,
         padding: 0,
-    };
+    })?;
     assert_eq!(bytes(&encode(codec, FieldValue::Text("é"))?), [0xC3, 0xA9]);
     assert_eq!(
         codec.decode(&[0xC3, 0xA9], STORED)?,
@@ -658,11 +719,11 @@ fn text_lengths_count_bytes_and_invalid_utf8_is_not_replaced() -> TestResult {
 
 #[test]
 fn memory_map_encoding_accepts_only_printable_ascii_semantic_bytes() -> TestResult {
-    let codec = FieldCodec::FixedString {
+    let codec = FieldCodec::new(CodecSpec::FixedString {
         len: 1,
         encoding: StringEncoding::MemoryMap,
         padding: 255,
-    };
+    })?;
     for value in b' '..=b'~' {
         let source = [value];
         let text = std::str::from_utf8(&source)?;
@@ -693,10 +754,11 @@ fn memory_map_encoding_accepts_only_printable_ascii_semantic_bytes() -> TestResu
 
 #[test]
 fn raw_bytes_and_value_kinds_remain_exact() -> TestResult {
-    let codec = FieldCodec::Bytes { len: 3 };
+    let codec = FieldCodec::new(CodecSpec::Bytes { len: 3 })?;
     let decoded = codec.decode(&[0, 0x80, 255], STORED)?;
     assert_eq!(decoded.as_field_value(), FieldValue::Bytes(&[0, 0x80, 255]));
-    assert_eq!(decoded.kind_name(), "bytes");
+    assert_eq!(decoded.kind(), ValueKind::Bytes);
+    assert_eq!(codec.value_kind(), ValueKind::Bytes);
     assert_eq!(
         bytes(&encode(codec, decoded.as_field_value())?),
         [0, 0x80, 255]
@@ -717,18 +779,30 @@ fn raw_bytes_and_value_kinds_remain_exact() -> TestResult {
         assert_eq!(
             encode(codec, value),
             Err(CodecError::TypeMismatch {
-                expected: "bytes",
-                actual: value.kind_name()
+                expected: ValueKind::Bytes,
+                actual: value.kind()
             })
         );
     }
-    for decoded in [
-        DecodedFieldValue::Unsigned(1),
-        DecodedFieldValue::Signed(-1),
-        DecodedFieldValue::Bool(true),
-        DecodedFieldValue::Text("ok".to_owned()),
+    for (decoded, kind, name) in [
+        (
+            DecodedFieldValue::Unsigned(1),
+            ValueKind::Unsigned,
+            "unsigned",
+        ),
+        (DecodedFieldValue::Signed(-1), ValueKind::Signed, "signed"),
+        (DecodedFieldValue::Bool(true), ValueKind::Boolean, "boolean"),
+        (
+            DecodedFieldValue::Text("ok".to_owned()),
+            ValueKind::Text,
+            "text",
+        ),
+        (DecodedFieldValue::Bytes(vec![0]), ValueKind::Bytes, "bytes"),
     ] {
-        assert_eq!(decoded.kind_name(), decoded.as_field_value().kind_name());
+        assert_eq!(decoded.kind(), kind);
+        assert_eq!(decoded.as_field_value().kind(), kind);
+        assert_eq!(kind.as_str(), name);
+        assert_eq!(kind.to_string(), name);
     }
     Ok(())
 }

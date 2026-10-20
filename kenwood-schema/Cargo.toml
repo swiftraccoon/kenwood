@@ -1,16 +1,16 @@
 [package]
 name = "kenwood-schema"
 version = "0.1.0"
+authors = ["swiftraccoon"]
+categories = ["encoding", "data-structures"]
 edition = "2024"
+keywords = ["kenwood", "schema", "encoding", "memory", "ham-radio"]
+license = "GPL-2.0-or-later"
+publish = false
+readme = "README.md"
+repository = "https://github.com/swiftraccoon/kenwood"
 rust-version = "1.94"
 description = "Model-neutral field codecs and atomic masked-byte planning"
-license = "GPL-2.0-or-later"
-repository = "https://github.com/swiftraccoon/kenwood"
-keywords = ["kenwood", "schema", "encoding", "memory", "ham-radio"]
-categories = ["encoding", "data-structures"]
-authors = ["swiftraccoon"]
-readme = "README.md"
-publish = false
 
 [dependencies]
 thiserror = "2"

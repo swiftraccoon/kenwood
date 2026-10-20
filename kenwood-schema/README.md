@@ -14,9 +14,10 @@ For radio configuration, start with the
 [TH-D75 schema facade](https://swiftraccoon.github.io/kenwood/kenwood_thd75/memory/schema/index.html)
 in `kenwood-thd75` or the
 [TM-D750 schema facade](https://swiftraccoon.github.io/kenwood/kenwood_tmd750/memory/schema/index.html)
-in `kenwood-tmd750`. They expose these same scalar types while adding the
-model's catalog identity, address resolution, and writable-region checks.
-Calling this crate directly performs none of them.
+in `kenwood-tmd750`. They take and return this crate's scalar types, which
+callers import from `kenwood_schema` itself, and add the model's catalog
+identity, address resolution, and writable-region checks. Calling this crate
+directly performs none of them.
 
 Use this crate directly when implementing a model-neutral codec consumer or a
 new model facade. It is an unpublished workspace package, not a crates.io
@@ -34,34 +35,48 @@ For a local checkout, use a path relative to the consuming `Cargo.toml` instead:
 kenwood-schema = { path = "../kenwood/kenwood-schema" }
 ```
 
-Start with `FieldCodec::encode` or `FieldCodec::decode`, apply finite catalog
-constraints with `validate_choices`, then collect resolved assignments with
-`ByteClaims::merge_atomic`. The connected recipe below shows the boundary
+Start with
+[`FieldCodec::encode`](https://swiftraccoon.github.io/kenwood/kenwood_schema/struct.FieldCodec.html#method.encode)
+or
+[`FieldCodec::decode`](https://swiftraccoon.github.io/kenwood/kenwood_schema/struct.FieldCodec.html#method.decode),
+apply finite catalog constraints with
+[`validate_choices`](https://swiftraccoon.github.io/kenwood/kenwood_schema/fn.validate_choices.html),
+then collect resolved assignments with
+[`ByteClaims::merge_atomic`](https://swiftraccoon.github.io/kenwood/kenwood_schema/struct.ByteClaims.html#method.merge_atomic).
+The connected recipe below shows the boundary
 between field-relative codec bytes and caller-owned image addresses.
 
 ## Encode a field
 
-`FieldCodec` describes storage. Every encode and decode validates its metadata,
-including integer width and representable domains, masks, and nonempty lengths.
+`CodecSpec` declares candidate storage metadata. `FieldCodec::new` validates
+integer widths, representable ranges, masks and nonempty lengths before
+returning a codec. Its private fields preserve those invariants. `new` is a
+`const fn`, so generated catalogs validate their codecs during compilation.
+`FieldCodec::spec()` returns a copy for inspection; modifying that copy requires
+another checked construction before it can encode or decode.
 `FieldValue` is borrowed input; `DecodedFieldValue` owns decoded output.
 Encoded bytes carry offsets relative to the start of the field.
 
-Metadata validity is not a resource limit. `FixedString` and `Bytes` accept
-any positive storage length. Before encoding runtime-supplied metadata, cap
-`FieldCodec::encoded_len()` against your application's memory budget and
-address space: encoding allocates one `MaskedByte` per storage byte, not one
+Metadata validity is not a resource limit. `CodecSpec::FixedString` and
+`CodecSpec::Bytes` accept any positive storage length. Before encoding
+runtime-supplied metadata, cap `FieldCodec::encoded_len()` against your
+application's memory budget and address space: encoding allocates one
+`MaskedByte` per storage byte, not one
 byte of output per byte of input. Text and raw-byte decoding also allocate
 owned output. The codec does not inherit a model facade's image-size limit.
+Allocating output beyond the representable capacity of `Vec<MaskedByte>`
+panics, including when it would exceed `isize::MAX` allocated bytes. Allocator
+exhaustion aborts the process. Neither condition returns a `CodecError`.
 
 ```rust
-use kenwood_schema::{FieldCodec, FieldValue, TextPolicy, ValueDomain};
+use kenwood_schema::{CodecSpec, FieldCodec, FieldValue, TextPolicy, ValueDomain};
 
-let codec = FieldCodec::BitField {
+let codec = FieldCodec::new(CodecSpec::BitField {
     mask: 0x1C,
     shift: 2,
     min: 0,
     max: 7,
-};
+})?;
 let encoded = codec.encode(
     FieldValue::Unsigned(5),
     ValueDomain::Writable,
@@ -81,8 +96,18 @@ for byte in encoded {
 `ValueDomain::Stored` permits any value representable by its storage width;
 it does not make that value writable. Finite enum and choice constraints are
 separate: `validate_choices` requires membership in every nonempty supplied
-domain. Its API example demonstrates rejection by either domain. A model
+domain. Its
+[API example](https://swiftraccoon.github.io/kenwood/kenwood_schema/fn.validate_choices.html)
+demonstrates rejection by either domain. A model
 validates both storage and catalog policy before planning.
+
+[`ValueKind`](https://swiftraccoon.github.io/kenwood/kenwood_schema/enum.ValueKind.html)
+identifies the scalar representation accepted by a codec or carried by a value.
+Compare `FieldCodec::value_kind()` with `FieldValue::kind()` or
+`DecodedFieldValue::kind()` to inspect a type mismatch. `CodecError::TypeMismatch`
+and `ChoiceError::TypeMismatch` carry these typed kinds; presentation uses
+`ValueKind::as_str()` or its `Display` implementation. The `ValueKind` API
+example shows why a numeric one is distinct from a boolean.
 
 ## Decode with an explicit policy
 
@@ -99,23 +124,24 @@ resolve image addresses, fill missing bytes, or establish snapshot coverage.
 
 Both text policies require valid UTF-8 in the semantic text they select.
 `StringEncoding::MemoryMap` is the printable-ASCII subset only, without
-guessing a model's extended character encoding. The `TextPolicy` example
+guessing a model's extended character encoding. The
+[`TextPolicy` example](https://swiftraccoon.github.io/kenwood/kenwood_schema/enum.TextPolicy.html)
 shows the same stored bytes being rejected or truncated by the two policies.
 A policy selects how stored bytes are interpreted; it does not state which
 values a given firmware accepts.
 
 ```rust
 use kenwood_schema::{
-    BooleanDecoding, DecodeOptions, DecodedFieldValue, Endian, FieldCodec,
+    BooleanDecoding, CodecSpec, DecodeOptions, DecodedFieldValue, Endian, FieldCodec,
     TextPolicy, ValueDomain,
 };
 
-let codec = FieldCodec::Unsigned {
+let codec = FieldCodec::new(CodecSpec::Unsigned {
     width: 2,
     endian: Endian::Little,
     min: 0,
     max: 100,
-};
+})?;
 let stored = codec.decode(&[200, 0], DecodeOptions {
     domain: ValueDomain::Stored,
     boolean: BooleanDecoding::Canonical,
@@ -133,8 +159,9 @@ mask. Its offset is meaningful only in the caller's address space.
 assignments. Conflicting values reject the entire batch, including its earlier
 bytes, without changing prior claims. This also applies to conflicts within
 one incoming batch. Diagnostics retain the first owner of each claimed bit.
-The `ByteClaims::merge_atomic` API example demonstrates rejection followed by
-reuse of the unchanged planner.
+The
+[`ByteClaims::merge_atomic` example](https://swiftraccoon.github.io/kenwood/kenwood_schema/struct.ByteClaims.html#method.merge_atomic)
+demonstrates rejection followed by reuse of the unchanged planner.
 
 This synthetic eight-byte image has one caller-defined writable region. Each
 field span is checked against that region before its encoding allocates output.
@@ -142,21 +169,20 @@ Each encoded byte is then relocated with checked arithmetic before entering the
 shared planner. No image byte changes until every assignment has merged.
 
 ```rust
-use kenwood_schema::{ByteClaims, Endian, FieldCodec, FieldValue, TextPolicy, ValueDomain};
+use kenwood_schema::{ByteClaims, CodecSpec, Endian, FieldCodec, FieldValue, TextPolicy, ValueDomain};
 
 let mut image = [0xE3; 8];
 let writable = 2..7;
 let fields = [
-    ("flags", 2_usize, FieldCodec::BitField {
+    ("flags", 2_usize, FieldCodec::new(CodecSpec::BitField {
         mask: 0x1C, shift: 2, min: 0, max: 7,
-    }, FieldValue::Unsigned(5)),
-    ("counter", 5_usize, FieldCodec::Unsigned {
+    })?, FieldValue::Unsigned(5)),
+    ("counter", 5_usize, FieldCodec::new(CodecSpec::Unsigned {
         width: 2, endian: Endian::Little, min: 0, max: u16::MAX.into(),
-    }, FieldValue::Unsigned(0x1234)),
+    })?, FieldValue::Unsigned(0x1234)),
 ];
 let mut claims = ByteClaims::new();
 for (name, base, codec, value) in fields {
-    codec.validate()?;
     let end = base.checked_add(codec.encoded_len()).ok_or("field span overflow")?;
     let span = base..end;
     let _original_field = image.get(span.clone()).ok_or("field outside image")?;
@@ -189,7 +215,12 @@ by offset and grouped into model-specific page types. Everything between a
 merged plan and a device write stays in the model crate: fresh-page guards,
 recovery journaling, readback, protocol deadlines, cancellation, and restoration.
 
-Errors are typed as `CodecError`, `ChoiceError`, and `PatchError`. Codec offsets
+Errors are typed as
+[`CodecError`](https://swiftraccoon.github.io/kenwood/kenwood_schema/enum.CodecError.html),
+[`ChoiceError`](https://swiftraccoon.github.io/kenwood/kenwood_schema/enum.ChoiceError.html),
+and
+[`PatchError`](https://swiftraccoon.github.io/kenwood/kenwood_schema/enum.PatchError.html).
+Codec offsets
 are field-relative; patch offsets use the caller's resolved address space.
 Models attach field names and their own addressing or validation errors.
 

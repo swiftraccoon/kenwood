@@ -1,8 +1,16 @@
 //! Scalar storage codecs with explicit read and text interpretation policies.
 
+use std::fmt;
+
 use crate::MaskedByte;
 
+#[cfg(test)]
+mod tests;
+
 /// Byte order for a multi-byte integer.
+///
+/// See the
+/// [crate-level decoding example](crate#decode-with-an-explicit-policy).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Endian {
     /// Least-significant byte first.
@@ -12,6 +20,8 @@ pub enum Endian {
 }
 
 /// Encoding of the semantic bytes in a fixed-width string.
+///
+/// See the [`TextPolicy`] example for decoding and re-encoding fixed text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StringEncoding {
     /// UTF-8 text, with padding handled separately.
@@ -23,13 +33,15 @@ pub enum StringEncoding {
     MemoryMap,
 }
 
-/// Storage representation and writable numeric range of one scalar field.
+/// Candidate storage representation and writable range of one scalar field.
 ///
-/// Metadata is validated before every encode or decode. Offsets in encoded
-/// [`MaskedByte`] values are relative to the start of this field. Models own
-/// absolute addresses, memory geometry, finite enum domains, and write policy.
+/// [`FieldCodec::new`] checks lengths, masks, integer widths and ranges before
+/// producing an executable codec. [`FieldCodec::spec`] returns a copy for
+/// inspection; changing that copy leaves the validated codec unchanged.
+///
+/// See the [`FieldCodec`] example for rejected and accepted metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FieldCodec {
+pub enum CodecSpec {
     /// One unsigned byte.
     Byte {
         /// Smallest writable value.
@@ -93,7 +105,48 @@ pub enum FieldCodec {
     },
 }
 
-/// Numeric domain to enforce after validating codec metadata.
+/// Validated storage representation and writable range of one scalar field.
+///
+/// Construction rejects invalid lengths, masks, integer widths and ranges.
+/// Positive text and byte lengths have no model-specific size limit; callers
+/// bound [`Self::encoded_len`] for their address space and allocation budget.
+/// Models own absolute addresses, memory geometry, finite domains and write
+/// policy. Encoded [`MaskedByte`] offsets are relative to this field's start.
+///
+/// # Examples
+///
+/// ```
+/// use kenwood_schema::{CodecError, CodecSpec, FieldCodec};
+///
+/// assert_eq!(
+///     FieldCodec::new(CodecSpec::Bytes { len: 0 }),
+///     Err(CodecError::InvalidEncodedLength { len: 0 }),
+/// );
+/// let codec = FieldCodec::new(CodecSpec::Byte { min: 1, max: 7 })?;
+/// let mut candidate = codec.spec();
+/// if let CodecSpec::Byte { max, .. } = &mut candidate {
+///     *max = 0;
+/// }
+/// assert!(FieldCodec::new(candidate).is_err());
+/// assert_eq!(codec.spec(), CodecSpec::Byte { min: 1, max: 7 });
+/// # Ok::<(), CodecError>(())
+/// ```
+///
+/// Private fields prevent constructing a codec without validation.
+///
+/// ```compile_fail
+/// use kenwood_schema::{CodecSpec, FieldCodec};
+/// let codec = FieldCodec { spec: CodecSpec::Bytes { len: 0 } };
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FieldCodec {
+    spec: CodecSpec,
+}
+
+/// Numeric domain to enforce when encoding or decoding a validated codec.
+///
+/// The [decoding example](crate#decode-with-an-explicit-policy) reads a stored
+/// value outside its writable range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueDomain {
     /// Accept every value representable by the codec's storage width or mask.
@@ -103,6 +156,8 @@ pub enum ValueDomain {
 }
 
 /// Interpretation of a stored full-byte boolean.
+///
+/// See the [decoding policy table](crate#decode-with-an-explicit-policy).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BooleanDecoding {
     /// Reject any stored byte other than zero or one.
@@ -124,30 +179,36 @@ pub enum BooleanDecoding {
 ///
 /// ```
 /// use kenwood_schema::{
-///     BooleanDecoding, CodecError, DecodeOptions, DecodedFieldValue, FieldCodec,
+///     BooleanDecoding, CodecError, DecodeOptions, DecodedFieldValue,
+///     CodecSpec, FieldCodec,
 ///     StringEncoding, TextPolicy, ValueDomain,
 /// };
 ///
-/// let codec = FieldCodec::FixedString {
+/// let codec = FieldCodec::new(CodecSpec::FixedString {
 ///     len: 4, encoding: StringEncoding::MemoryMap, padding: 0,
-/// };
+/// })?;
 /// let stored = b"A\0B\0";
 /// let exact = DecodeOptions {
 ///     domain: ValueDomain::Stored,
 ///     boolean: BooleanDecoding::Canonical,
 ///     text: TextPolicy::ExactPadding,
 /// };
-/// assert_eq!(codec.decode(stored, exact), Err(CodecError::FixedStringDataAfterNul {
-///     terminator_offset: 1, offset: 2, value: b'B',
-/// }));
+/// assert_eq!(
+///     codec.decode(stored, exact),
+///     Err(CodecError::FixedStringDataAfterNul {
+///         terminator_offset: 1, offset: 2, value: b'B',
+///     }),
+/// );
 /// let decoded = codec.decode(stored, DecodeOptions {
 ///     text: TextPolicy::FirstTerminator, ..exact
 /// })?;
 /// assert_eq!(decoded, DecodedFieldValue::Text("A".to_owned()));
 /// let encoded = codec.encode(
-///     decoded.as_field_value(), ValueDomain::Stored, TextPolicy::FirstTerminator,
+///     decoded.as_field_value(), ValueDomain::Stored,
+///     TextPolicy::FirstTerminator,
 /// )?;
-/// let rewritten: Vec<_> = encoded.into_iter().map(|byte| byte.apply(0)).collect();
+/// let rewritten: Vec<_> = encoded.into_iter()
+///     .map(|byte| byte.apply(0)).collect();
 /// assert_eq!(rewritten, b"A\0\0\0");
 /// assert_ne!(rewritten, stored);
 /// # Ok::<(), CodecError>(())
@@ -169,6 +230,9 @@ pub enum TextPolicy {
 }
 
 /// Independent policies for decoding one exact field-sized byte slice.
+///
+/// See the [`TextPolicy`] example and the
+/// [crate-level decoding example](crate#decode-with-an-explicit-policy).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodeOptions {
     /// Whether numeric values must also satisfy the writable range.
@@ -179,7 +243,72 @@ pub struct DecodeOptions {
     pub text: TextPolicy,
 }
 
+/// A scalar representation accepted or produced by a field codec.
+///
+/// Compare [`FieldValue::kind`] with [`FieldCodec::value_kind`] to inspect a
+/// type mismatch without parsing an error message.
+///
+/// # Examples
+///
+/// A numeric value cannot substitute for a boolean, even when it is one.
+///
+/// ```
+/// use kenwood_schema::{
+///     CodecError, FieldCodec, FieldValue, TextPolicy, ValueDomain, ValueKind,
+/// };
+///
+/// let codec = FieldCodec::BOOL;
+/// let value = FieldValue::Unsigned(1);
+/// assert_eq!(codec.value_kind(), ValueKind::Boolean);
+/// assert_eq!(value.kind(), ValueKind::Unsigned);
+/// assert_eq!(
+///     codec.encode(value, ValueDomain::Writable, TextPolicy::ExactPadding),
+///     Err(CodecError::TypeMismatch {
+///         expected: ValueKind::Boolean,
+///         actual: ValueKind::Unsigned,
+///     }),
+/// );
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueKind {
+    /// An unsigned integer.
+    Unsigned,
+    /// A signed integer.
+    Signed,
+    /// A boolean value.
+    Boolean,
+    /// Semantic text without storage padding.
+    Text,
+    /// An uninterpreted byte sequence.
+    Bytes,
+}
+
+impl ValueKind {
+    /// Stable lowercase name used when presenting this kind to a person.
+    ///
+    /// Typed comparisons use the enum directly, as in the [`Self`] example.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unsigned => "unsigned",
+            Self::Signed => "signed",
+            Self::Boolean => "boolean",
+            Self::Text => "text",
+            Self::Bytes => "bytes",
+        }
+    }
+}
+
+impl fmt::Display for ValueKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// Borrowed caller-supplied scalar value.
+///
+/// See the [encoding example](crate#encode-a-field) for accepted input and
+/// the [`ValueKind`] example for a type mismatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldValue<'a> {
     /// Unsigned byte, masked field, or multi-byte integer.
@@ -195,20 +324,25 @@ pub enum FieldValue<'a> {
 }
 
 impl FieldValue<'_> {
-    /// Stable human-readable name for this value kind.
+    /// Scalar representation carried by this value.
+    ///
+    /// See the [`ValueKind`] example for checking a codec's expected kind.
     #[must_use]
-    pub const fn kind_name(self) -> &'static str {
+    pub const fn kind(self) -> ValueKind {
         match self {
-            Self::Unsigned(_) => "unsigned",
-            Self::Signed(_) => "signed",
-            Self::Bool(_) => "boolean",
-            Self::Text(_) => "text",
-            Self::Bytes(_) => "bytes",
+            Self::Unsigned(_) => ValueKind::Unsigned,
+            Self::Signed(_) => ValueKind::Signed,
+            Self::Bool(_) => ValueKind::Boolean,
+            Self::Text(_) => ValueKind::Text,
+            Self::Bytes(_) => ValueKind::Bytes,
         }
     }
 }
 
 /// Owned value decoded from a field-sized byte slice.
+///
+/// See the [decoding example](crate#decode-with-an-explicit-policy) for owned
+/// output and the [`TextPolicy`] example for borrowing it for re-encoding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodedFieldValue {
     /// Unsigned byte, masked field, or multi-byte integer.
@@ -225,6 +359,8 @@ pub enum DecodedFieldValue {
 
 impl DecodedFieldValue {
     /// Borrow this value for validation or encoding without copying its data.
+    ///
+    /// See the [`TextPolicy`] example for re-encoding a decoded value.
     #[must_use]
     pub const fn as_field_value(&self) -> FieldValue<'_> {
         match self {
@@ -236,23 +372,29 @@ impl DecodedFieldValue {
         }
     }
 
-    /// Stable human-readable name for this value kind.
+    /// Scalar representation carried by this decoded value.
+    ///
+    /// Kinds match those of [`Self::as_field_value`], as in the [`ValueKind`]
+    /// example.
     #[must_use]
-    pub const fn kind_name(&self) -> &'static str {
-        self.as_field_value().kind_name()
+    pub const fn kind(&self) -> ValueKind {
+        self.as_field_value().kind()
     }
 }
 
-/// Field-relative failure in scalar metadata, representation, or value validation.
+/// Field-relative failure in scalar metadata, representation, or validation.
+///
+/// The [`TextPolicy`] and [`ValueKind`] examples demonstrate text and type
+/// failures with structured diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CodecError {
     /// A value's variant does not match its codec.
     #[error("expected {expected}, received {actual}")]
     TypeMismatch {
         /// Codec's expected kind.
-        expected: &'static str,
+        expected: ValueKind,
         /// Supplied value kind.
-        actual: &'static str,
+        actual: ValueKind,
     },
     /// An unsigned value is outside the selected domain.
     #[error("unsigned value {value} is outside {min}..={max}")]
@@ -391,92 +533,77 @@ pub enum CodecError {
 }
 
 impl FieldCodec {
-    /// Number of bytes occupied, before metadata validation.
+    /// A full-byte boolean with canonical zero-or-one encoding.
     ///
-    /// Bit-level fields occupy one shared byte. Call [`Self::validate`] before
-    /// treating externally supplied codec metadata as a usable storage span.
-    #[must_use]
-    pub const fn encoded_len(self) -> usize {
-        match self {
-            Self::Byte { .. } | Self::Bool | Self::BitBool { .. } | Self::BitField { .. } => 1,
-            Self::FixedString { len, .. } | Self::Bytes { len } => len,
-            Self::Unsigned { width, .. } | Self::Signed { width, .. } => width as usize,
-        }
-    }
+    /// [`DecodeOptions::boolean`] selects its stored-byte interpretation.
+    /// See the [`ValueKind`] example.
+    pub const BOOL: Self = Self {
+        spec: CodecSpec::Bool,
+    };
 
-    /// Stable human-readable kind of the value accepted by this codec.
-    #[must_use]
-    pub const fn value_kind(self) -> &'static str {
-        match self {
-            Self::Byte { .. } | Self::BitField { .. } | Self::Unsigned { .. } => "unsigned",
-            Self::Bool | Self::BitBool { .. } => "boolean",
-            Self::FixedString { .. } => "text",
-            Self::Signed { .. } => "signed",
-            Self::Bytes { .. } => "bytes",
-        }
-    }
-
-    /// Validate representation metadata without reading or allocating a field.
+    /// Construct a codec by validating its scalar storage metadata.
     ///
-    /// No model-specific memory size is imposed. Declared numeric ranges must
-    /// be ordered and representable even when interpreting stored values.
-    /// Any positive [`Self::FixedString`] or [`Self::Bytes`] length is valid
-    /// metadata; callers must separately bound [`Self::encoded_len`] for their
-    /// address space and allocation budget before encoding or decoding.
+    /// Ranges must be ordered and fit the declared storage width or mask.
+    /// Positive text and byte lengths are accepted without an allocation or
+    /// model-size limit. See the [`Self`] example for runtime rejection.
     ///
     /// # Errors
     ///
-    /// Returns an error for zero lengths, invalid integer widths, inverted or
-    /// unrepresentable domains, or unusable bit masks and shifts.
-    pub fn validate(self) -> Result<(), CodecError> {
-        match self {
-            Self::Byte { min, max } => validate_unsigned_range(u64::from(min), u64::from(max)),
-            Self::Bool => Ok(()),
-            Self::BitBool { mask } => {
-                if mask.is_power_of_two() {
-                    Ok(())
-                } else {
-                    Err(CodecError::InvalidBitField { mask, shift: 0 })
-                }
+    /// Returns [`CodecError::InvalidUnsignedRange`] or
+    /// [`CodecError::InvalidSignedRange`] for inverted ranges,
+    /// [`CodecError::InvalidIntegerWidth`] for widths outside `1..=8`,
+    /// [`CodecError::DomainExceedsWidth`] for unrepresentable integer domains,
+    /// [`CodecError::InvalidBitField`] for boolean masks without exactly one
+    /// bit, noncontiguous or misaligned field masks, invalid shifts or
+    /// unrepresentable bit domains, and
+    /// [`CodecError::InvalidEncodedLength`] for zero text or byte lengths.
+    pub const fn new(spec: CodecSpec) -> Result<Self, CodecError> {
+        match validate_spec(spec) {
+            Ok(()) => Ok(Self { spec }),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Return a copy of the validated metadata for inspection.
+    ///
+    /// Changing the returned candidate leaves this codec unchanged. Construct
+    /// another codec with [`Self::new`] to validate modified metadata, as in
+    /// the [`Self`] example.
+    #[must_use]
+    pub const fn spec(self) -> CodecSpec {
+        self.spec
+    }
+
+    /// Positive number of storage bytes occupied by this field.
+    ///
+    /// Bit-level fields occupy one shared byte. Callers check this length
+    /// against their address space and allocation budget before using it.
+    /// See the [planning example](crate#encode-resolve-merge-and-apply).
+    #[must_use]
+    pub const fn encoded_len(self) -> usize {
+        match self.spec {
+            CodecSpec::Byte { .. }
+            | CodecSpec::Bool
+            | CodecSpec::BitBool { .. }
+            | CodecSpec::BitField { .. } => 1,
+            CodecSpec::FixedString { len, .. } | CodecSpec::Bytes { len } => len,
+            CodecSpec::Unsigned { width, .. } | CodecSpec::Signed { width, .. } => width as usize,
+        }
+    }
+
+    /// Scalar representation of the value accepted by this codec.
+    ///
+    /// See the [`ValueKind`] example for detecting a type mismatch.
+    #[must_use]
+    pub const fn value_kind(self) -> ValueKind {
+        match self.spec {
+            CodecSpec::Byte { .. } | CodecSpec::BitField { .. } | CodecSpec::Unsigned { .. } => {
+                ValueKind::Unsigned
             }
-            Self::BitField {
-                mask,
-                shift,
-                min,
-                max,
-            } => validate_bit_field(mask, shift, min, max),
-            Self::FixedString { len, .. } | Self::Bytes { len } => {
-                if len == 0 {
-                    Err(CodecError::InvalidEncodedLength { len })
-                } else {
-                    Ok(())
-                }
-            }
-            Self::Unsigned {
-                width, min, max, ..
-            } => {
-                let storage = IntegerWidth::new(width)?;
-                validate_unsigned_range(min, max)?;
-                if max > storage.unsigned_max() {
-                    Err(CodecError::DomainExceedsWidth { width })
-                } else {
-                    Ok(())
-                }
-            }
-            Self::Signed {
-                width, min, max, ..
-            } => {
-                let storage = IntegerWidth::new(width)?;
-                if min > max {
-                    return Err(CodecError::InvalidSignedRange { min, max });
-                }
-                let (storage_min, storage_max) = storage.signed_bounds();
-                if min < storage_min || max > storage_max {
-                    Err(CodecError::DomainExceedsWidth { width })
-                } else {
-                    Ok(())
-                }
-            }
+            CodecSpec::Bool | CodecSpec::BitBool { .. } => ValueKind::Boolean,
+            CodecSpec::FixedString { .. } => ValueKind::Text,
+            CodecSpec::Signed { .. } => ValueKind::Signed,
+            CodecSpec::Bytes { .. } => ValueKind::Bytes,
         }
     }
 
@@ -484,38 +611,39 @@ impl FieldCodec {
     ///
     /// This method neither searches an image nor ignores trailing bytes beyond
     /// the field span. Stored numeric values may exceed the writable range;
-    /// metadata validity, exact length, and text validity are always enforced.
-    /// Text and raw-byte results allocate owned copies. Metadata validation
+    /// exact length and text validity are always enforced.
+    /// Text and raw-byte results allocate owned copies. Construction
     /// imposes no length cap, so check a runtime-supplied length against an
     /// application budget before calling this method.
+    /// See the [decoding example](crate#decode-with-an-explicit-policy) and
+    /// the [`TextPolicy`] example.
     ///
     /// # Errors
     ///
-    /// Returns metadata, exact-length, selected-domain, boolean, or text errors.
+    /// Returns exact-length, selected-domain, boolean, or text errors.
     pub fn decode(
         self,
         bytes: &[u8],
         options: DecodeOptions,
     ) -> Result<DecodedFieldValue, CodecError> {
-        self.validate()?;
         validate_length(bytes.len(), self.encoded_len())?;
         let first = bytes.first().copied().unwrap_or_default();
-        Ok(match self {
-            Self::Byte { min, max } => {
+        Ok(match self.spec {
+            CodecSpec::Byte { min, max } => {
                 let value = u64::from(first);
                 if options.domain == ValueDomain::Writable {
                     validate_unsigned(value, u64::from(min), u64::from(max))?;
                 }
                 DecodedFieldValue::Unsigned(value)
             }
-            Self::Bool => {
+            CodecSpec::Bool => {
                 if options.boolean == BooleanDecoding::Canonical && first > 1 {
                     return Err(CodecError::NonCanonicalBoolean { value: first });
                 }
                 DecodedFieldValue::Bool(first != 0)
             }
-            Self::BitBool { mask } => DecodedFieldValue::Bool(first & mask != 0),
-            Self::BitField {
+            CodecSpec::BitBool { mask } => DecodedFieldValue::Bool(first & mask != 0),
+            CodecSpec::BitField {
                 mask,
                 shift,
                 min,
@@ -527,7 +655,7 @@ impl FieldCodec {
                 }
                 DecodedFieldValue::Unsigned(value)
             }
-            Self::FixedString {
+            CodecSpec::FixedString {
                 encoding, padding, ..
             } => {
                 let semantic = semantic_text(bytes, padding, options.text)?;
@@ -539,7 +667,7 @@ impl FieldCodec {
                     })?;
                 DecodedFieldValue::Text(text.to_owned())
             }
-            Self::Unsigned {
+            CodecSpec::Unsigned {
                 endian, min, max, ..
             } => {
                 let value = decode_unsigned(bytes, endian);
@@ -548,19 +676,19 @@ impl FieldCodec {
                 }
                 DecodedFieldValue::Unsigned(value)
             }
-            Self::Signed {
+            CodecSpec::Signed {
                 width,
                 endian,
                 min,
                 max,
             } => {
-                let value = decode_signed(bytes, IntegerWidth::new(width)?, endian);
+                let value = decode_signed(bytes, IntegerWidth(width), endian);
                 if options.domain == ValueDomain::Writable {
                     validate_signed(value, min, max)?;
                 }
                 DecodedFieldValue::Signed(value)
             }
-            Self::Bytes { .. } => DecodedFieldValue::Bytes(bytes.to_vec()),
+            CodecSpec::Bytes { .. } => DecodedFieldValue::Bytes(bytes.to_vec()),
         })
     }
 
@@ -570,36 +698,46 @@ impl FieldCodec {
     /// Writable encoding additionally enforces the declared numeric range.
     /// Booleans always encode canonically, and unowned bits are always zero.
     /// Every validation completes before any result is returned.
+    /// See the [encoding example](crate#encode-a-field).
     ///
     /// # Allocation
     ///
     /// The result contains one [`MaskedByte`] per storage byte, including
-    /// string padding. [`Self::validate`] accepts any positive text or raw-byte
+    /// string padding. [`Self::new`] accepts any positive text or raw-byte
     /// length, without an image-size or allocation limit. Callers must cap
     /// runtime-supplied [`Self::encoded_len`] before encoding. These are ordinary
-    /// vector allocations; allocation failure is not a [`CodecError`].
+    /// vector allocations; allocator exhaustion aborts the process rather than
+    /// returning a [`CodecError`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the output length exceeds the representable capacity of a
+    /// [`Vec<MaskedByte>`], including its limit of [`isize::MAX`] allocated
+    /// bytes. Positive metadata lengths can exceed this limit even when the
+    /// semantic text is empty.
     ///
     /// # Errors
     ///
-    /// Returns metadata, type, domain, exact-byte-length, or text errors.
+    /// Returns type, domain, exact-byte-length, or text errors.
     pub fn encode(
         self,
         value: FieldValue<'_>,
         domain: ValueDomain,
         text: TextPolicy,
     ) -> Result<Vec<MaskedByte>, CodecError> {
-        self.validate()?;
-        match (self, value) {
-            (Self::Byte { min, max }, FieldValue::Unsigned(raw)) => {
+        match (self.spec, value) {
+            (CodecSpec::Byte { min, max }, FieldValue::Unsigned(raw)) => {
                 let byte = bounded_byte(raw, min, max, u8::MAX, domain)?;
                 Ok(vec![masked_byte(u8::MAX, byte)])
             }
-            (Self::Bool, FieldValue::Bool(flag)) => Ok(vec![masked_byte(u8::MAX, u8::from(flag))]),
-            (Self::BitBool { mask }, FieldValue::Bool(flag)) => {
+            (CodecSpec::Bool, FieldValue::Bool(flag)) => {
+                Ok(vec![masked_byte(u8::MAX, u8::from(flag))])
+            }
+            (CodecSpec::BitBool { mask }, FieldValue::Bool(flag)) => {
                 Ok(vec![masked_byte(mask, if flag { mask } else { 0 })])
             }
             (
-                Self::BitField {
+                CodecSpec::BitField {
                     mask,
                     shift,
                     min,
@@ -611,7 +749,7 @@ impl FieldCodec {
                 Ok(vec![masked_byte(mask, (byte << shift) & mask)])
             }
             (
-                Self::FixedString {
+                CodecSpec::FixedString {
                     len,
                     encoding,
                     padding,
@@ -619,7 +757,7 @@ impl FieldCodec {
                 FieldValue::Text(value),
             ) => encode_text(value, len, encoding, padding, text),
             (
-                Self::Unsigned {
+                CodecSpec::Unsigned {
                     width,
                     endian,
                     min,
@@ -627,16 +765,16 @@ impl FieldCodec {
                 },
                 FieldValue::Unsigned(raw),
             ) => {
-                let width = IntegerWidth::new(width)?;
+                let width = IntegerWidth(width);
                 let (min, max) = match domain {
                     ValueDomain::Stored => (0, width.unsigned_max()),
                     ValueDomain::Writable => (min, max),
                 };
                 validate_unsigned(raw, min, max)?;
-                encode_integer(raw, width, endian)
+                Ok(encode_integer(raw, width, endian))
             }
             (
-                Self::Signed {
+                CodecSpec::Signed {
                     width,
                     endian,
                     min,
@@ -644,22 +782,108 @@ impl FieldCodec {
                 },
                 FieldValue::Signed(raw),
             ) => {
-                let width = IntegerWidth::new(width)?;
+                let width = IntegerWidth(width);
                 let (min, max) = match domain {
                     ValueDomain::Stored => width.signed_bounds(),
                     ValueDomain::Writable => (min, max),
                 };
                 validate_signed(raw, min, max)?;
-                encode_integer(u64::from_ne_bytes(raw.to_ne_bytes()), width, endian)
+                Ok(encode_integer(
+                    u64::from_ne_bytes(raw.to_ne_bytes()),
+                    width,
+                    endian,
+                ))
             }
-            (Self::Bytes { len }, FieldValue::Bytes(bytes)) => {
+            (CodecSpec::Bytes { len }, FieldValue::Bytes(bytes)) => {
                 validate_length(bytes.len(), len)?;
                 Ok(full_bytes(bytes.iter().copied()))
             }
-            (codec, other) => Err(CodecError::TypeMismatch {
-                expected: codec.value_kind(),
-                actual: other.kind_name(),
+            (_, other) => Err(CodecError::TypeMismatch {
+                expected: self.value_kind(),
+                actual: other.kind(),
             }),
+        }
+    }
+}
+
+impl TryFrom<CodecSpec> for FieldCodec {
+    type Error = CodecError;
+
+    /// Construct a codec by validating candidate metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns the metadata errors documented by [`FieldCodec::new`].
+    fn try_from(spec: CodecSpec) -> Result<Self, Self::Error> {
+        Self::new(spec)
+    }
+}
+
+impl From<FieldCodec> for CodecSpec {
+    /// Return an independent copy of the codec's validated metadata.
+    ///
+    /// See [`FieldCodec::spec`] for modifying a copy and constructing a codec.
+    fn from(codec: FieldCodec) -> Self {
+        codec.spec()
+    }
+}
+
+const fn validate_spec(spec: CodecSpec) -> Result<(), CodecError> {
+    match spec {
+        CodecSpec::Byte { min, max } => validate_unsigned_range(min as u64, max as u64),
+        CodecSpec::Bool => Ok(()),
+        CodecSpec::BitBool { mask } => {
+            if mask.is_power_of_two() {
+                Ok(())
+            } else {
+                Err(CodecError::InvalidBitField { mask, shift: 0 })
+            }
+        }
+        CodecSpec::BitField {
+            mask,
+            shift,
+            min,
+            max,
+        } => validate_bit_field(mask, shift, min, max),
+        CodecSpec::FixedString { len, .. } | CodecSpec::Bytes { len } => {
+            if len == 0 {
+                Err(CodecError::InvalidEncodedLength { len })
+            } else {
+                Ok(())
+            }
+        }
+        CodecSpec::Unsigned {
+            width, min, max, ..
+        } => {
+            let storage = match IntegerWidth::new(width) {
+                Ok(storage) => storage,
+                Err(error) => return Err(error),
+            };
+            if let Err(error) = validate_unsigned_range(min, max) {
+                return Err(error);
+            }
+            if max > storage.unsigned_max() {
+                Err(CodecError::DomainExceedsWidth { width })
+            } else {
+                Ok(())
+            }
+        }
+        CodecSpec::Signed {
+            width, min, max, ..
+        } => {
+            let storage = match IntegerWidth::new(width) {
+                Ok(storage) => storage,
+                Err(error) => return Err(error),
+            };
+            if min > max {
+                return Err(CodecError::InvalidSignedRange { min, max });
+            }
+            let (storage_min, storage_max) = storage.signed_bounds();
+            if min < storage_min || max > storage_max {
+                Err(CodecError::DomainExceedsWidth { width })
+            } else {
+                Ok(())
+            }
         }
     }
 }
@@ -762,19 +986,19 @@ impl IntegerWidth {
         }
     }
 
-    fn unsigned_max(self) -> u64 {
+    const fn unsigned_max(self) -> u64 {
         if self.0 == 8 {
             u64::MAX
         } else {
-            (1_u64 << (u32::from(self.0) * 8)) - 1
+            (1_u64 << (self.0 as u32 * 8)) - 1
         }
     }
 
-    fn signed_bounds(self) -> (i64, i64) {
+    const fn signed_bounds(self) -> (i64, i64) {
         if self.0 == 8 {
             (i64::MIN, i64::MAX)
         } else {
-            let half = 1_i64 << (u32::from(self.0) * 8 - 1);
+            let half = 1_i64 << (self.0 as u32 * 8 - 1);
             (-half, half - 1)
         }
     }
@@ -803,19 +1027,12 @@ fn decode_signed(bytes: &[u8], width: IntegerWidth, endian: Endian) -> i64 {
     i64::from_ne_bytes(extended.to_ne_bytes())
 }
 
-fn encode_integer(
-    raw: u64,
-    width: IntegerWidth,
-    endian: Endian,
-) -> Result<Vec<MaskedByte>, CodecError> {
-    let all = raw.to_le_bytes();
-    let bytes = all
-        .get(..usize::from(width.0))
-        .ok_or(CodecError::InvalidIntegerWidth { width: width.0 })?;
-    Ok(match endian {
-        Endian::Little => full_bytes(bytes.iter().copied()),
-        Endian::Big => full_bytes(bytes.iter().rev().copied()),
-    })
+fn encode_integer(raw: u64, width: IntegerWidth, endian: Endian) -> Vec<MaskedByte> {
+    let bytes = raw.to_le_bytes().into_iter().take(usize::from(width.0));
+    match endian {
+        Endian::Little => full_bytes(bytes),
+        Endian::Big => full_bytes(bytes.rev()),
+    }
 }
 
 fn semantic_text(bytes: &[u8], padding: u8, policy: TextPolicy) -> Result<&[u8], CodecError> {
@@ -911,6 +1128,3 @@ fn encode_text(
         bytes.get(offset).copied().unwrap_or(padding)
     })))
 }
-
-#[cfg(test)]
-mod tests;

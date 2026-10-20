@@ -37,10 +37,10 @@ fn masked_application_preserves_unowned_bits() -> TestResult {
 fn repeated_equal_assignments_are_idempotent_and_disjoint_bits_coalesce() -> TestResult {
     let mut claims = ByteClaims::new();
     let first = MaskedByte::new(8, 0x0F, 0x05)?;
-    claims.merge_atomic("first", &[first])?;
-    claims.merge_atomic("same", &[first, first])?;
-    claims.merge_atomic("upper", &[MaskedByte::new(8, 0xF0, 0xA0)?])?;
-    claims.merge_atomic("earlier", &[MaskedByte::new(1, 0xFF, 0x42)?])?;
+    claims.merge_atomic("first", [first])?;
+    claims.merge_atomic("same", [first, first])?;
+    claims.merge_atomic("upper", [MaskedByte::new(8, 0xF0, 0xA0)?])?;
+    claims.merge_atomic("earlier", [MaskedByte::new(1, 0xFF, 0x42)?])?;
     assert_eq!(
         claims.into_claims().collect::<Vec<_>>(),
         [
@@ -55,10 +55,10 @@ fn repeated_equal_assignments_are_idempotent_and_disjoint_bits_coalesce() -> Tes
 fn a_late_conflict_preserves_all_existing_claims_and_rejects_the_prefix() -> TestResult {
     let mut claims = ByteClaims::new();
     let original = MaskedByte::new(9, 0x03, 0x01)?;
-    claims.merge_atomic("original", &[original])?;
+    claims.merge_atomic("original", [original])?;
     let result = claims.merge_atomic(
         "failed",
-        &[
+        [
             MaskedByte::new(1, 0xFF, 0x77)?,
             MaskedByte::new(9, 0x03, 0x02)?,
         ],
@@ -84,7 +84,7 @@ fn conflicts_within_a_new_batch_leave_no_claims() -> TestResult {
     let mut claims = ByteClaims::new();
     let result = claims.merge_atomic(
         "inconsistent",
-        &[
+        [
             MaskedByte::new(1, 0x01, 0x01)?,
             MaskedByte::new(1, 0x01, 0x00)?,
         ],
@@ -100,9 +100,9 @@ fn conflicts_within_a_new_batch_leave_no_claims() -> TestResult {
 #[test]
 fn conflicts_report_the_owner_of_the_actual_bit() -> TestResult {
     let mut claims = ByteClaims::new();
-    claims.merge_atomic("lower", &[MaskedByte::new(1, 0x01, 0)?])?;
-    claims.merge_atomic("upper", &[MaskedByte::new(1, 0x80, 0x80)?])?;
-    let result = claims.merge_atomic("conflicting", &[MaskedByte::new(1, 0x80, 0)?]);
+    claims.merge_atomic("lower", [MaskedByte::new(1, 0x01, 0)?])?;
+    claims.merge_atomic("upper", [MaskedByte::new(1, 0x80, 0x80)?])?;
+    let result = claims.merge_atomic("conflicting", [MaskedByte::new(1, 0x80, 0)?]);
     assert_eq!(
         result,
         Err(PatchError::Conflict {
@@ -119,11 +119,11 @@ fn conflicts_report_the_owner_of_the_actual_bit() -> TestResult {
 fn failed_batch_can_be_followed_by_a_valid_assignment() -> TestResult {
     let mut claims = ByteClaims::new();
     let original = MaskedByte::new(1, 0x01, 0x01)?;
-    claims.merge_atomic("original", &[original])?;
-    let rejected = claims.merge_atomic("failed", &[MaskedByte::new(1, 0x01, 0)?]);
+    claims.merge_atomic("original", [original])?;
+    let rejected = claims.merge_atomic("failed", [MaskedByte::new(1, 0x01, 0)?]);
     assert!(rejected.is_err());
-    claims.merge_atomic("valid", &[MaskedByte::new(1, 0x02, 0x02)?])?;
-    claims.merge_atomic("empty", &[])?;
+    claims.merge_atomic("valid", [MaskedByte::new(1, 0x02, 0x02)?])?;
+    claims.merge_atomic("empty", std::iter::empty::<MaskedByte>())?;
     assert_eq!(
         claims.into_claims().collect::<Vec<_>>(),
         [("original", MaskedByte::new(1, 0x03, 0x03)?)]

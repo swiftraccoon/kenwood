@@ -1,11 +1,18 @@
 //! Atomic, address-neutral masked-byte ownership.
 
+use std::borrow::Borrow;
 use std::collections::BTreeMap;
+
+#[cfg(test)]
+mod tests;
 
 /// A validated assignment to selected bits of one byte.
 ///
 /// An offset is relative to the caller's buffer or address space; this type
 /// checks no address and reads no memory.
+///
+/// See the [planning example](crate#encode-resolve-merge-and-apply) for
+/// relocating and applying masked assignments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MaskedByte {
     pub(crate) offset: usize,
@@ -15,6 +22,8 @@ pub struct MaskedByte {
 
 impl MaskedByte {
     /// Construct a nonempty assignment whose value contains only owned bits.
+    ///
+    /// See the [`ByteClaims::merge_atomic`] example for combining assignments.
     ///
     /// # Errors
     ///
@@ -35,18 +44,24 @@ impl MaskedByte {
     }
 
     /// Byte offset in the caller's chosen address space.
+    ///
+    /// See the [planning example](crate#encode-resolve-merge-and-apply).
     #[must_use]
     pub const fn offset(self) -> usize {
         self.offset
     }
 
     /// Bits owned by this assignment.
+    ///
+    /// See the [encoding example](crate#encode-a-field).
     #[must_use]
     pub const fn mask(self) -> u8 {
         self.mask
     }
 
     /// Requested values of the owned bits; unowned bits are zero.
+    ///
+    /// See the [encoding example](crate#encode-a-field).
     #[must_use]
     pub const fn value(self) -> u8 {
         self.value
@@ -55,12 +70,16 @@ impl MaskedByte {
     /// Relocate an assignment after the caller resolves its address.
     ///
     /// The offset is replaced outright: no arithmetic and no address check.
+    /// See the [planning example](crate#encode-resolve-merge-and-apply) for
+    /// checked relocation within a caller-validated field span.
     #[must_use]
     pub const fn with_offset(self, offset: usize) -> Self {
         Self { offset, ..self }
     }
 
     /// Apply owned bits to an original byte, preserving every unowned bit.
+    ///
+    /// See the [encoding example](crate#encode-a-field).
     #[must_use]
     pub const fn apply(self, original: u8) -> u8 {
         (original & !self.mask) | self.value
@@ -68,6 +87,8 @@ impl MaskedByte {
 }
 
 /// A malformed assignment or disagreement over previously claimed bits.
+///
+/// The [`ByteClaims::merge_atomic`] example recovers from a conflicting batch.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PatchError {
     /// An assignment is empty or requests values outside its mask.
@@ -144,6 +165,10 @@ impl Claim {
 /// different fields. Disjoint bits coalesce. Differing overlapping bits fail
 /// without modifying any previous assignment. The caller retains descriptor,
 /// address, region, and page validation; this planner knows no radio model.
+///
+/// See [`Self::merge_atomic`] for rejecting a batch without changing earlier
+/// claims, or the [planning example](crate#encode-resolve-merge-and-apply) for
+/// applying completed claims to an image.
 #[derive(Debug, Default)]
 pub struct ByteClaims {
     bytes: BTreeMap<usize, Claim>,
@@ -151,6 +176,8 @@ pub struct ByteClaims {
 
 impl ByteClaims {
     /// Construct an empty set of claims.
+    ///
+    /// See the [`Self::merge_atomic`] example for successive field assignments.
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -163,6 +190,8 @@ impl ByteClaims {
     /// Every input byte is checked against earlier claims and earlier bytes
     /// in this same batch. Empty batches are no-ops. A rejected batch leaves
     /// existing claims and their diagnostic ownership unchanged.
+    /// The iterator is consumed once and may yield owned or borrowed bytes.
+    /// Validation stops at the first conflict, leaving later bytes unconsumed.
     ///
     /// # Examples
     ///
@@ -180,9 +209,12 @@ impl ByteClaims {
     ///     MaskedByte::new(9, 0xFF, 0xAA)?,
     ///     MaskedByte::new(8, 0x0F, 0x06)?,
     /// ];
-    /// assert_eq!(claims.merge_atomic("rejected", &rejected), Err(PatchError::Conflict {
-    ///     owner: "rejected", existing: "lower", offset: 8, mask: 0x03,
-    /// }));
+    /// assert_eq!(
+    ///     claims.merge_atomic("rejected", &rejected),
+    ///     Err(PatchError::Conflict {
+    ///         owner: "rejected", existing: "lower", offset: 8, mask: 0x03,
+    ///     }),
+    /// );
     /// claims.merge_atomic("upper", &[MaskedByte::new(8, 0xF0, 0xA0)?])?;
     /// claims.merge_atomic("replacement", &[MaskedByte::new(9, 0xFF, 0x55)?])?;
     /// let merged: Vec<_> = claims.into_claims().collect();
@@ -199,10 +231,11 @@ impl ByteClaims {
     pub fn merge_atomic(
         &mut self,
         owner: &'static str,
-        bytes: &[MaskedByte],
+        bytes: impl IntoIterator<Item = impl Borrow<MaskedByte>>,
     ) -> Result<(), PatchError> {
         let mut pending = BTreeMap::new();
-        for &byte in bytes {
+        for byte in bytes {
+            let byte = *byte.borrow();
             let claim = pending.entry(byte.offset).or_insert_with(|| {
                 self.bytes
                     .get(&byte.offset)
@@ -220,6 +253,7 @@ impl ByteClaims {
     /// Each tuple names the first field to claim any bit at that byte. Conflict
     /// errors retain more precise per-bit ownership. Page grouping and memory
     /// protection remain the caller's responsibility.
+    /// See the [`Self::merge_atomic`] example for consuming merged assignments.
     pub fn into_claims(self) -> impl Iterator<Item = (&'static str, MaskedByte)> {
         self.bytes.into_iter().map(|(offset, claim)| {
             (
@@ -233,6 +267,3 @@ impl ByteClaims {
         })
     }
 }
-
-#[cfg(test)]
-mod tests;
