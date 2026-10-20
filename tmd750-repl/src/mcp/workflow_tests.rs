@@ -7,8 +7,8 @@ use std::collections::VecDeque;
 use std::error::Error as StdError;
 use std::sync::Mutex;
 
-use kenwood_tmd750::protocol::mcp::{ACK, read_request, write_request};
-use kenwood_tmd750::transport::{KENWOOD_VID, TMD750_MAIN_PID, TMD750_PANEL_PID};
+use kenwood_tmd750::protocol::mcp::{ACK, Header};
+use kenwood_tmd750::transport::{DEFAULT_BAUD, KENWOOD_VID, TMD750_MAIN_PID, TMD750_PANEL_PID};
 use kenwood_tmd750::{Address, McpBackupReport, Page};
 use kenwood_transport::{MockTransport, TransportError};
 use reconnect::{VerificationOutcome, VerificationStage};
@@ -141,9 +141,13 @@ impl Backend for FakeBackend {
     fn open(
         &mut self,
         endpoint: &SerialCandidate,
-        baud: u32,
+        baud: std::num::NonZeroU32,
     ) -> Result<Self::Connection, TransportError> {
-        self.record(Observation::Open(self.opens, endpoint.path.clone(), baud));
+        self.record(Observation::Open(
+            self.opens,
+            endpoint.path.clone(),
+            baud.get(),
+        ));
         self.opens += 1;
         self.connections
             .pop_front()
@@ -197,9 +201,9 @@ fn identity(mock: &mut MockTransport, firmware: &[u8]) {
 }
 
 fn read(mock: &mut MockTransport, page: Page) {
-    let mut reply = write_request(page).to_vec();
+    let mut reply = Header::write_request(page).to_vec();
     reply.extend(vec![0x42; page.len()]);
-    mock.expect(&read_request(page), &reply);
+    mock.expect(&Header::read_request(page), &reply);
     mock.expect(&[ACK], &[ACK]);
 }
 
@@ -311,7 +315,7 @@ impl Harness {
         Ok(backup::run_workflow(
             &mut self.backend,
             selected,
-            9_600,
+            DEFAULT_BAUD,
             backup::Scope::Standard,
             captures.original,
             captures.post_exit,
@@ -371,7 +375,7 @@ impl Harness {
         Ok(run_workflow(
             &mut self.backend,
             selected,
-            9_600,
+            DEFAULT_BAUD,
             captures,
             &self.cancelled,
         )
@@ -611,7 +615,7 @@ async fn backup_silent_id_recovery_preserves_pages_and_roundtrips_the_production
 
     let report = backup::ArtifactReport::new(
         &endpoint(),
-        9_600,
+        DEFAULT_BAUD,
         "2026-09-12T00:00:00Z".to_owned(),
         "2026-09-12T00:00:10Z".to_owned(),
         result,
@@ -712,7 +716,7 @@ fn succeeded(result: WorkflowResult) -> bool {
             path: endpoint().path,
             usb_vendor_id: Some(KENWOOD_VID),
             usb_product_id: Some(TMD750_MAIN_PID),
-            cat_baud: 9_600,
+            cat_baud: DEFAULT_BAUD,
         },
         transcript: result.transcript,
         probe: result.probe.as_ref().map(ProbeEvidence::from),

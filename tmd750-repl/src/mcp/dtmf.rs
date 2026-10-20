@@ -20,6 +20,9 @@ use super::page_apply::{self, PagePlan, PlanKind};
 use super::snapshot::Snapshot;
 use crate::{AppResult, CommandError, output};
 
+#[cfg(test)]
+mod tests;
+
 /// The image spans of the pages holding the memories: the DTMF codes, the
 /// DTMF names, and the `EchoLink` memory.
 const PAGES: [(u32, u32); 3] = [(0x38, 0x100), (0x100, 0x1A0), (0x200, 0x300)];
@@ -224,7 +227,7 @@ pub(super) fn run_offline(request: &DtmfRequest) -> Option<AppResult<()>> {
 
 pub(super) async fn run_selected(
     endpoint: &SerialCandidate,
-    baud: u32,
+    baud: std::num::NonZeroU32,
     request: &DtmfRequest,
 ) -> AppResult<()> {
     match &request.command {
@@ -234,7 +237,11 @@ pub(super) async fn run_selected(
     }
 }
 
-async fn run_apply(endpoint: &SerialCandidate, baud: u32, request: &ApplyRequest) -> AppResult<()> {
+async fn run_apply(
+    endpoint: &SerialCandidate,
+    baud: std::num::NonZeroU32,
+    request: &ApplyRequest,
+) -> AppResult<()> {
     page_apply::admit_usb(endpoint, baud, PlanKind::Dtmf)?;
     let snapshot = Snapshot::load_for_usb_write(&request.edit.backup)?;
     let prepared = request.edit.prepare(&snapshot)?;
@@ -337,6 +344,3 @@ fn description(prepared: &Prepared) -> Map<String, Value> {
     );
     description
 }
-
-#[cfg(test)]
-mod tests;

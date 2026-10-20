@@ -22,6 +22,9 @@ use super::page_apply::{self, PagePlan, PlanKind};
 use super::snapshot::Snapshot;
 use crate::{AppResult, CommandError, output};
 
+#[cfg(test)]
+pub(super) mod tests;
+
 /// VFO subcommand: an offline listing or preview, or one guarded live write.
 #[derive(Debug, Parser)]
 pub(crate) struct VfoRequest {
@@ -223,7 +226,7 @@ pub(super) fn run_offline(request: &VfoRequest) -> Option<AppResult<()>> {
 
 pub(super) async fn run_selected(
     endpoint: &SerialCandidate,
-    baud: u32,
+    baud: std::num::NonZeroU32,
     request: &VfoRequest,
 ) -> AppResult<()> {
     match &request.command {
@@ -233,7 +236,11 @@ pub(super) async fn run_selected(
     }
 }
 
-async fn run_set(endpoint: &SerialCandidate, baud: u32, request: &SetRequest) -> AppResult<()> {
+async fn run_set(
+    endpoint: &SerialCandidate,
+    baud: std::num::NonZeroU32,
+    request: &SetRequest,
+) -> AppResult<()> {
     page_apply::admit_usb(endpoint, baud, PlanKind::Vfo)?;
     let snapshot = Snapshot::load_for_usb_write(&request.edit.backup)?;
     let prepared = request.edit.prepare(&snapshot)?;
@@ -392,6 +399,3 @@ fn description(prepared: &Prepared) -> Map<String, Value> {
     );
     description
 }
-
-#[cfg(test)]
-pub(super) mod tests;

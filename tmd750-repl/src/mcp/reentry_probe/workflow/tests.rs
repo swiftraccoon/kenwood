@@ -4,12 +4,13 @@
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use kenwood_tmd750::protocol::mcp::{ACK, ENTER, EXIT, read_request, write_request};
+use kenwood_tmd750::protocol::mcp::{ACK, ENTER, EXIT, Header};
 use kenwood_tmd750::transport::{KENWOOD_VID, SerialCandidate, TMD750_MAIN_PID};
 use kenwood_tmd750::{Address, Page};
 use kenwood_transport::{MockTransport, Transport, TransportError};
@@ -111,9 +112,9 @@ fn original_script() -> Result<MockTransport, TestError> {
     let mut mock = fresh_script(0);
     mock.expect(ENTER, b"0M\r");
     for (page, fill) in pages()?.into_iter().zip([0x11, 0x22]) {
-        let mut response = write_request(page).to_vec();
+        let mut response = Header::write_request(page).to_vec();
         response.extend(vec![fill; page.len()]);
-        mock.expect(&read_request(page), &response);
+        mock.expect(&Header::read_request(page), &response);
         mock.expect(&[ACK], &[ACK]);
     }
     mock.expect(&[EXIT], &[ACK]);
@@ -214,8 +215,8 @@ impl Transport for Connection {
         self.mock.close().await
     }
 
-    fn set_baud_rate(&mut self, baud: u32) -> Result<(), TransportError> {
-        append(&self.log, Observation::Baud(self.id, baud))?;
+    fn set_baud_rate(&mut self, baud: NonZeroU32) -> Result<(), TransportError> {
+        append(&self.log, Observation::Baud(self.id, baud.get()))?;
         self.mock.set_baud_rate(baud)
     }
 }
@@ -346,14 +347,18 @@ impl Backend for TestBackend {
     fn open(
         &mut self,
         selected: &SerialCandidate,
-        baud: u32,
+        baud: NonZeroU32,
     ) -> Result<Connection, TransportError> {
         assert_eq!(
             selected,
             &endpoint(),
             "every opening must retain the explicit endpoint"
         );
-        assert_eq!(baud, 9600, "every opening must retain the required baud");
+        assert_eq!(
+            baud.get(),
+            9600,
+            "every opening must retain the required baud"
+        );
         self.before_open().map_err(|error| TransportError::Open {
             path: selected.path.clone(),
             source: io::Error::other(error),
@@ -471,7 +476,7 @@ impl Harness {
         Ok(run(
             &mut self.backend,
             &endpoint(),
-            9600,
+            kenwood_tmd750::transport::DEFAULT_BAUD,
             self.captures
                 .take()
                 .ok_or("workflow captures already consumed")?,
@@ -520,9 +525,9 @@ async fn two_fixed_pairs_record_each_open_and_finish_evidence_before_the_next_pa
                 b"TY\r",
                 b"GW\r",
                 ENTER,
-                &read_request(global),
+                &Header::read_request(global),
                 &[ACK],
-                &read_request(slot),
+                &Header::read_request(slot),
                 &[ACK],
                 &[EXIT],
             ],

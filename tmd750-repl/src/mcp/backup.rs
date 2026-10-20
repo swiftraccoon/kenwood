@@ -199,7 +199,7 @@ impl ArtifactReport {
     /// Build the report from the workflow result and any signal failure.
     pub(super) fn new(
         endpoint: &SerialCandidate,
-        baud: u32,
+        baud: std::num::NonZeroU32,
         started_at_utc: String,
         finished_at_utc: String,
         result: WorkflowResult,
@@ -234,7 +234,7 @@ impl ArtifactReport {
 /// the MCP exit or the close fails.
 pub(super) async fn run(
     endpoint: &SerialCandidate,
-    baud: u32,
+    baud: std::num::NonZeroU32,
     request: &BackupRequest,
 ) -> AppResult<()> {
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -339,7 +339,7 @@ impl WorkflowResult {
 pub(super) async fn run_workflow(
     backend: &mut impl Backend,
     endpoint: &SerialCandidate,
-    baud: u32,
+    baud: std::num::NonZeroU32,
     scope: Scope,
     mut original: Recorder<File>,
     post_exit: Recorder<File>,
@@ -464,7 +464,7 @@ fn print_result(result: &WorkflowResult) {
             McpProbeExit::RecoveryRequired | McpProbeExit::NotAcknowledged
         ) {
             output::error(format_args!(
-                "Radio state is uncertain. Fully power-cycle before reconnecting; no recovery commands were sent."
+                "MCP framing is uncertain. Stop using this connection and retain the capture. No recovery commands or automatic retry were sent."
             ));
         }
     }

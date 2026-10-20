@@ -21,6 +21,9 @@ use super::snapshot::Snapshot;
 use crate::cat::parse_address;
 use crate::{AppResult, CommandError, output};
 
+#[cfg(test)]
+mod tests;
+
 /// Channel-group subcommand: an offline preview, or one guarded live write.
 #[derive(Debug, Parser)]
 pub(crate) struct ChannelGroupsRequest {
@@ -98,8 +101,7 @@ impl GroupSelection {
             let [channel, group] = pair else {
                 continue;
             };
-            let channel =
-                PhysicalChannel::from_address(parse_address(channel).map_err(CommandError)?);
+            let channel = PhysicalChannel::from_address(parse_address(channel)?);
             let group = group
                 .parse()
                 .map_err(|_| CommandError(format!("group {group:?} is not 0 to 29")))
@@ -145,7 +147,7 @@ pub(super) fn run_offline(request: &ChannelGroupsRequest) -> Option<AppResult<()
 
 pub(super) async fn run_selected(
     endpoint: &SerialCandidate,
-    baud: u32,
+    baud: std::num::NonZeroU32,
     request: &ChannelGroupsRequest,
 ) -> AppResult<()> {
     match &request.command {
@@ -154,7 +156,11 @@ pub(super) async fn run_selected(
     }
 }
 
-async fn run_apply(endpoint: &SerialCandidate, baud: u32, request: &ApplyRequest) -> AppResult<()> {
+async fn run_apply(
+    endpoint: &SerialCandidate,
+    baud: std::num::NonZeroU32,
+    request: &ApplyRequest,
+) -> AppResult<()> {
     page_apply::admit_usb(endpoint, baud, PlanKind::ChannelGroups)?;
     let snapshot = Snapshot::load_for_usb_write(&request.groups.backup)?;
     let prepared = request.groups.prepare(&snapshot)?;
@@ -231,6 +237,3 @@ fn description(prepared: &Prepared) -> Map<String, Value> {
     let _previous = description.insert("channel_groups".to_owned(), Value::Array(changes));
     description
 }
-
-#[cfg(test)]
-mod tests;

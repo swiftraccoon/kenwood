@@ -2,8 +2,6 @@
 //! program scan, priority and APRS channels, then the CALL and weather
 //! channels), and memory channel stores and clears over one MCP session.
 
-mod edit;
-
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
@@ -13,6 +11,10 @@ use kenwood_tmd750::types::PhysicalChannel;
 
 use super::snapshot::Snapshot;
 use crate::{AppResult, CommandError, output};
+
+mod edit;
+#[cfg(test)]
+pub(super) mod tests;
 
 /// Channels subcommand: an offline listing or preview, or one guarded live
 /// write.
@@ -62,7 +64,7 @@ pub(super) fn run_offline(request: &ChannelsRequest) -> Option<AppResult<()>> {
 
 pub(super) async fn run_selected(
     endpoint: &SerialCandidate,
-    baud: u32,
+    baud: std::num::NonZeroU32,
     request: &ChannelsRequest,
 ) -> AppResult<()> {
     match &request.command {
@@ -129,6 +131,3 @@ fn lines(image: &MemoryImage) -> Vec<String> {
     }
     lines
 }
-
-#[cfg(test)]
-pub(super) mod tests;

@@ -7,12 +7,13 @@
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use kenwood_tmd750::protocol::mcp::{ACK, read_request, write_request};
+use kenwood_tmd750::protocol::mcp::{ACK, Header};
 use kenwood_tmd750::transport::{
     DEFAULT_BAUD, KENWOOD_VID, SerialCandidate, TMD750_MAIN_PID, TMD750_PANEL_PID,
 };
@@ -312,8 +313,8 @@ impl Transport for Connection {
         self.mock.close().await
     }
 
-    fn set_baud_rate(&mut self, baud: u32) -> Result<(), TransportError> {
-        append(&self.log, Event::Baud(self.id, baud))?;
+    fn set_baud_rate(&mut self, baud: NonZeroU32) -> Result<(), TransportError> {
+        append(&self.log, Event::Baud(self.id, baud.get()))?;
         self.mock.set_baud_rate(baud)
     }
 }
@@ -342,13 +343,17 @@ impl Backend for TestBackend {
     fn open(
         &mut self,
         selected: &SerialCandidate,
-        baud: u32,
+        baud: NonZeroU32,
     ) -> Result<Connection, TransportError> {
         assert_eq!(
             selected, &self.endpoint,
             "only the selected endpoint may open"
         );
-        assert_eq!(baud, 9600, "the ordinary workflow has one fixed CAT baud");
+        assert_eq!(
+            baud.get(),
+            9600,
+            "the ordinary workflow has one fixed CAT baud"
+        );
         self.proof
             .before_open(self.opens, &self.log)
             .map_err(|error| TransportError::Open {
@@ -457,13 +462,13 @@ fn entry_script() -> MockTransport {
 }
 
 fn frame(page: Page, bytes: &[u8]) -> Vec<u8> {
-    let mut frame = write_request(page).to_vec();
+    let mut frame = Header::write_request(page).to_vec();
     frame.extend_from_slice(bytes);
     frame
 }
 
 fn read(mock: &mut MockTransport, page: Page, bytes: &[u8]) {
-    mock.expect(&read_request(page), &frame(page, bytes));
+    mock.expect(&Header::read_request(page), frame(page, bytes));
     mock.expect(&[ACK], &[ACK]);
 }
 
@@ -482,10 +487,7 @@ fn complete_script(plan: &MenuUpdatePlan) -> MockTransport {
         .iter()
         .filter(|replacement| !replacement.is_noop())
     {
-        mock.expect(
-            &frame(replacement.page(), replacement.replacement()),
-            &[ACK],
-        );
+        mock.expect(frame(replacement.page(), replacement.replacement()), &[ACK]);
         read(&mut mock, replacement.page(), replacement.replacement());
     }
     mock.expect(b"E", &[ACK]);
@@ -789,7 +791,7 @@ async fn uncertain_write_retains_previous_verification_and_does_not_exit_or_retr
     let second = changed.get(1).ok_or("second changed page missing")?;
     let trigger = frame(second.page(), second.replacement());
     let mut script = compared_script(&harness.plan);
-    script.expect(&frame(first.page(), first.replacement()), &[ACK]);
+    script.expect(frame(first.page(), first.replacement()), &[ACK]);
     read(&mut script, first.page(), first.replacement());
     script.expect(&trigger, b"");
     harness.connection(0)?.mock = script;
@@ -1058,10 +1060,9 @@ impl native::Backend for NativeBackend {
     ) -> Result<native::Opened<Connection>, native::OpenFailure> {
         self.services.push(service);
         let connection = self.connections.pop_front().ok_or_else(|| {
-            native::OpenFailure::from_error(&io::Error::other("no scripted native connection"))
+            native::OpenFailure::from_error(io::Error::other("no scripted native connection"))
         })?;
-        append(&self.log, Event::Open(self.opens))
-            .map_err(|error| native::OpenFailure::from_error(&error))?;
+        append(&self.log, Event::Open(self.opens)).map_err(native::OpenFailure::from_error)?;
         self.opens += 1;
         Ok(native::Opened {
             connection,

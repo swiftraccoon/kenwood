@@ -24,6 +24,9 @@ use super::page_apply::{self, PagePlan, PlanKind};
 use super::snapshot::Snapshot;
 use crate::{AppResult, CommandError, output};
 
+#[cfg(test)]
+mod tests;
+
 /// Callsign-list subcommand: an offline listing or preview, or one guarded
 /// live write.
 #[derive(Debug, Parser)]
@@ -191,7 +194,7 @@ pub(super) fn run_offline(request: &CallsignListRequest) -> Option<AppResult<()>
 
 pub(super) async fn run_selected(
     endpoint: &SerialCandidate,
-    baud: u32,
+    baud: std::num::NonZeroU32,
     request: &CallsignListRequest,
 ) -> AppResult<()> {
     match &request.command {
@@ -201,13 +204,17 @@ pub(super) async fn run_selected(
     }
 }
 
-async fn run_apply(endpoint: &SerialCandidate, baud: u32, request: &ApplyRequest) -> AppResult<()> {
+async fn run_apply(
+    endpoint: &SerialCandidate,
+    baud: std::num::NonZeroU32,
+    request: &ApplyRequest,
+) -> AppResult<()> {
     page_apply::admit_usb(endpoint, baud, PlanKind::CallsignList)?;
     let snapshot = Snapshot::load_for_usb_write(&request.edit.backup)?;
     let prepared = request.edit.prepare(&snapshot)?;
     if prepared.replacements.is_empty() {
         return Err(CommandError(
-            "the radio already holds the edited list; nothing was opened".to_owned(),
+            "the backup already contains the edited list; nothing was opened".to_owned(),
         )
         .into());
     }
@@ -295,6 +302,3 @@ fn description(prepared: &Prepared) -> Map<String, Value> {
     );
     description
 }
-
-#[cfg(test)]
-mod tests;

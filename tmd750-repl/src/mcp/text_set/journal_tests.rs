@@ -175,7 +175,7 @@ mod unix {
             assert_eq!(record.get("sequence"), Some(&Value::from(sequence)));
             assert_eq!(
                 record.pointer("/event/format_version"),
-                Some(&Value::from(1))
+                Some(&Value::from(2))
             );
             assert!(
                 record

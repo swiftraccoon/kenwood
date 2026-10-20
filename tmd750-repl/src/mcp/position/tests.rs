@@ -223,7 +223,7 @@ fn decimal_degrees_round_to_ten_thousandths_of_a_minute() -> TestResult {
         ("35.99999999", false, [36, 0, 0]),
         ("180", false, [180, 0, 0]),
     ] {
-        let (parsed_negative, coordinate) = parse_degrees(text)?;
+        let (parsed_negative, coordinate) = parse_degrees(text, CoordinateKind::Longitude)?;
         assert_eq!(parsed_negative, negative, "{text}");
         assert_eq!(
             coordinate,
@@ -236,7 +236,27 @@ fn decimal_degrees_round_to_ten_thousandths_of_a_minute() -> TestResult {
         );
     }
     for text in ["", "-", "1.2.3", "1e5", "1000", "0.0000000001", " 1"] {
-        assert!(parse_degrees(text).is_err(), "{text:?}");
+        assert!(
+            parse_degrees(text, CoordinateKind::Longitude).is_err(),
+            "{text:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn coordinate_domain_is_checked_before_quantization() -> TestResult {
+    for (kind, endpoint, outside) in [
+        (CoordinateKind::Latitude, "90", "90.000000001"),
+        (CoordinateKind::Latitude, "-90", "-90.000000001"),
+        (CoordinateKind::Longitude, "180", "180.000000001"),
+        (CoordinateKind::Longitude, "-180", "-180.000000001"),
+    ] {
+        let _endpoint = parse_degrees(endpoint, kind)?;
+        assert!(
+            parse_degrees(outside, kind).is_err(),
+            "{outside} must fail before rounding"
+        );
     }
     Ok(())
 }

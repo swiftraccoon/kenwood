@@ -55,7 +55,9 @@ fn only_complete_detached_evidence_permits_verification() -> TestResult {
         McpProbeOutcome::Failed {
             stage: McpProbeStage::Exit,
             error: kenwood_tmd750::Error::Timeout {
-                operation: "test exit",
+                operation: kenwood_tmd750::TimeoutOperation::Acknowledgement(
+                    kenwood_tmd750::AckStage::Exit,
+                ),
                 timeout: Duration::from_millis(1),
             },
         },
@@ -154,7 +156,7 @@ fn artifact() -> Result<ArtifactReport, Box<dyn StdError + Send + Sync>> {
             path: "test-radio".to_owned(),
             usb_vendor_id: Some(0x2166),
             usb_product_id: Some(0x9030),
-            cat_baud: 9600,
+            cat_baud: kenwood_tmd750::transport::DEFAULT_BAUD,
         },
         transcript: summary()?,
         probe: Some(ProbeEvidence::from(&probe()?)),

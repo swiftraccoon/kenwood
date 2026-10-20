@@ -1,21 +1,11 @@
-//! Accessible TM-D750 CAT, Bluetooth D-STAR startup, and captured diagnostics.
+//! Accessible TM-D750 CAT, guarded MCP workflows, and captured diagnostics.
 //!
 //! Output is plain text, with no cursor-oriented interface. Commands can be
 //! entered interactively or supplied once on the command line for scripting.
 
-mod capture;
-mod cat;
-mod connection;
-mod dstar;
-mod hosts;
-mod logging;
-mod mcp;
-mod native;
-mod output;
-mod terminal;
-
 use std::error::Error as StdError;
 use std::fmt;
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,6 +22,17 @@ use rustyline::error::ReadlineError;
 use connection::Connection;
 use logging::LogLevel;
 
+mod capture;
+mod cat;
+mod connection;
+mod dstar;
+mod logging;
+mod mcp;
+mod native;
+mod output;
+mod report_labels;
+mod terminal;
+
 const PROMPT: &str = "tmd750> ";
 const HELP_LINES: &[&str] = &[
     "help: Show this command list.",
@@ -42,14 +43,14 @@ const HELP_LINES: &[&str] = &[
     "dv [a|b]: Select ordinary RF D-STAR DV, not Terminal Mode.",
     "fm [a|b] | normal [a|b]: Select FM and verify readback.",
     "gateway: Read the persistent DV Gateway state; no change.",
-    "terminal: Explain manual Terminal Mode setup; no change.",
+    "terminal: Describe Terminal diagnostics and CAT checks; no change.",
     "quit | exit: Close the radio connection and exit.",
 ];
 
 type AppResult<T> = Result<T, Box<dyn StdError + Send + Sync>>;
 type ConnectedRadio = (Radio<Connection>, Identity, String);
 
-/// Accessible TM-D750 CAT, automatic Bluetooth D-STAR, and captured diagnostics.
+/// Accessible TM-D750 CAT, guarded MCP workflows, and captured diagnostics.
 #[derive(Debug, Parser)]
 #[command(version, about, color = clap::ColorChoice::Never)]
 #[command(group(clap::ArgGroup::new("native_selection")
@@ -71,13 +72,9 @@ struct Cli {
     #[arg(long, requires = "native_selection", value_name = "EXECUTABLE")]
     bluetooth_helper: Option<PathBuf>,
 
-    /// USB CAT endpoint used by automatic Bluetooth dstar start.
-    #[arg(long, conflicts_with = "port", value_name = "PATH")]
-    control_port: Option<String>,
-
     /// CAT baud rate.
     #[arg(long, default_value_t = DEFAULT_BAUD, conflicts_with = "native_selection")]
-    baud: u32,
+    baud: NonZeroU32,
 
     /// Prepend UTC timestamps to terminal output.
     #[arg(short, long)]
@@ -91,7 +88,7 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = LogLevel::Off)]
     log_level: LogLevel,
 
-    /// Startup command; runs once, except dstar start opens a gateway session.
+    /// Startup command; dstar start refuses an unverified Kenwood wire profile.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<String>,
 }
@@ -140,6 +137,33 @@ impl fmt::Display for CommandError {
 
 impl StdError for CommandError {}
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+enum ParseCommandError {
+    #[error("{0}")]
+    Syntax(#[from] CommandError),
+    #[error("{0}")]
+    Cat(#[from] cat::ParseError),
+    #[error("{0}")]
+    Dstar(#[from] dstar::StartParseError),
+}
+
+/// Connection context and independently retained operation/close failures.
+#[derive(Debug, thiserror::Error)]
+enum ConnectionError {
+    #[error("could not identify a TM-D750 at {path}: {source}")]
+    Probe {
+        path: String,
+        #[source]
+        source: Box<dyn StdError + Send + Sync>,
+    },
+    #[error("{operation}; connection close also failed: {close}")]
+    OperationAndClose {
+        #[source]
+        operation: Box<dyn StdError + Send + Sync>,
+        close: kenwood_transport::TransportError,
+    },
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LoopAction {
     Continue,
@@ -167,12 +191,6 @@ async fn run() -> AppResult<()> {
     if let Some(path) = log_path {
         output::line(format_args!("Trace log: {}.", path.display()));
     }
-    if cli.baud == 0 {
-        return Err(Box::new(CommandError(
-            "--baud must be greater than zero".to_owned(),
-        )));
-    }
-
     // The diagnostic parsers keep the original argument boundaries. Every other
     // command joins its words and goes through one parser and one transport
     // dispatch, including a command line given as a single quoted argument.
@@ -182,7 +200,6 @@ async fn run() -> AppResult<()> {
         let command = parse_command(&cli.command.join(" "))?;
         return run_command(&cli, command).await;
     }
-    require_no_control_port(&cli)?;
 
     if dstar::probe::matches_arguments(&cli.command) {
         let request = match dstar::probe::parse(&cli.command) {
@@ -224,23 +241,12 @@ async fn run() -> AppResult<()> {
     mcp::run(&endpoint, cli.baud, &request).await
 }
 
-fn require_no_control_port(cli: &Cli) -> Result<(), CommandError> {
-    if cli.control_port.is_some() {
-        Err(CommandError(
-            "--control-port is only used by automatic Bluetooth dstar start".to_owned(),
-        ))
-    } else {
-        Ok(())
-    }
-}
-
 /// Dispatch the parsed command once, before selecting or opening its transport.
 async fn run_command(cli: &Cli, one_shot: Option<Command>) -> AppResult<()> {
     let one_shot = match one_shot {
-        Some(Command::DstarStart(request)) => return run_dstar_start(cli, request).await,
+        Some(Command::DstarStart(request)) => return run_dstar_start(cli, request),
         other => other,
     };
-    require_no_control_port(cli)?;
     if let Some(command) = one_shot.as_ref() {
         match command {
             Command::Help => {
@@ -277,21 +283,15 @@ async fn run_command(cli: &Cli, one_shot: Option<Command>) -> AppResult<()> {
     run_connected(radio, one_shot).await
 }
 
-async fn run_dstar_start(cli: &Cli, request: dstar::StartRequest) -> AppResult<()> {
-    let outcome = if let Some(path) = &cli.port {
-        Box::pin(dstar::run(path, cli.baud, request)).await
-    } else {
-        if cli.baud != DEFAULT_BAUD {
-            return Err(CommandError("custom --baud requires an explicit USB --port; Bluetooth has no serial baud selection".to_owned()).into());
-        }
-        Box::pin(dstar::run_bluetooth(
-            cli.bluetooth_request(),
-            cli.control_port.as_deref(),
-            request,
-        ))
-        .await
-    };
-    outcome.map_err(|error| -> Box<dyn StdError + Send + Sync> { Box::new(CommandError(error)) })
+fn run_dstar_start(cli: &Cli, request: dstar::StartRequest) -> AppResult<()> {
+    if cli.port.is_none() && cli.baud != DEFAULT_BAUD {
+        return Err(CommandError(
+            "custom --baud requires an explicit USB --port; Bluetooth has no serial baud selection"
+                .to_owned(),
+        )
+        .into());
+    }
+    Err(Box::new(request.refuse()))
 }
 
 /// Run one command over the native Bluetooth transport.
@@ -401,19 +401,9 @@ async fn resolve_native(cli: &Cli) -> AppResult<native::Endpoint> {
 }
 
 async fn connect_serial(cli: &Cli, path: String) -> AppResult<ConnectedRadio> {
-    if cli.port.is_some() {
-        return match probe_path(&path, cli.baud).await {
-            Ok((radio, identity)) => Ok((radio, identity, path)),
-            Err(detail) => Err(Box::new(CommandError(format!(
-                "could not identify a TM-D750 at {path}: {detail}"
-            )))),
-        };
-    }
     match probe_path(&path, cli.baud).await {
         Ok((radio, identity)) => Ok((radio, identity, path)),
-        Err(detail) => Err(Box::new(CommandError(format!(
-            "the TM-D750 USB endpoint did not answer identity: {path}: {detail}"
-        )))),
+        Err(source) => Err(Box::new(ConnectionError::Probe { path, source })),
     }
 }
 
@@ -491,19 +481,19 @@ fn unique_candidate(candidates: &[SerialCandidate]) -> Result<&SerialCandidate, 
     }
 }
 
-async fn probe_path(path: &str, baud: u32) -> Result<(Radio<Connection>, Identity), String> {
-    let transport = open_serial(path, baud).map_err(|error| error.to_string())?;
+async fn probe_path(path: &str, baud: NonZeroU32) -> AppResult<(Radio<Connection>, Identity)> {
+    let transport = open_serial(path, baud)?;
     let mut radio = Radio::new(Connection::Serial(transport));
     match radio.identify().await {
         Ok(identity) => Ok((radio, identity)),
         Err(error) => {
             let mut transport = radio.into_transport();
-            let detail = error.to_string();
             match transport.close().await {
-                Ok(()) => Err(detail),
-                Err(close_error) => Err(format!(
-                    "{detail}; closing the failed probe also failed: {close_error}"
-                )),
+                Ok(()) => Err(Box::new(error)),
+                Err(close) => Err(Box::new(ConnectionError::OperationAndClose {
+                    operation: Box::new(error),
+                    close,
+                })),
             }
         }
     }
@@ -520,9 +510,22 @@ async fn run_connected(mut radio: Radio<Connection>, one_shot: Option<Command>) 
 
     let mut transport = radio.into_transport();
     let close_result = transport.close().await;
-    session_result?;
-    close_result?;
-    Ok(())
+    finish_connection(session_result, close_result)
+}
+
+fn finish_connection(
+    operation: AppResult<()>,
+    close: Result<(), kenwood_transport::TransportError>,
+) -> AppResult<()> {
+    match (operation, close) {
+        (Err(operation), Err(close)) => Err(Box::new(ConnectionError::OperationAndClose {
+            operation,
+            close,
+        })),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(Box::new(error)),
+        (Ok(()), Ok(())) => Ok(()),
+    }
 }
 
 async fn interactive<T: Transport>(radio: &mut Radio<T>) -> AppResult<()> {
@@ -657,7 +660,7 @@ async fn execute_command<T: Transport>(
         }
         Command::DstarStart(_) => {
             output::error(format_args!(
-                "Command error: dstar start consumes the radio connection; close this prompt and supply it as the startup command."
+                "Command error: dstar start is unavailable because the Kenwood modem configuration is unsupported."
             ));
         }
         Command::Fm(band) => {
@@ -672,10 +675,10 @@ async fn execute_command<T: Transport>(
             output::line(format_args!("DV Gateway state: {gateway} (read only)."));
         }
         Command::Terminal => print_terminal_information(),
-        Command::Read(read) => cat::execute_read(radio, read).await?,
+        Command::Read(read) => cat::execute_read(radio, read, policy).await?,
         Command::Write(write) => {
             policy.admit_mode_write(radio).await?;
-            cat::execute_write(radio, write).await?;
+            cat::execute_write(radio, write, policy).await?;
         }
         Command::Action(cat::Action::Receive) => {
             cat::execute_action(radio, cat::Action::Receive).await?;
@@ -706,13 +709,13 @@ fn print_help() {
     }
     output::line(format_args!("Startup only: dstar start CALL [REFLECTOR]"));
     output::line(format_args!(
-        "Defaults to automatic Bluetooth Terminal startup, restoring over a separate USB endpoint. Explicit --port retains manual USB modem startup."
+        "dstar start refuses the unverified Kenwood modem configuration before I/O."
     ));
     output::line(format_args!(
         "Startup only: dstar probe --help (captured diagnostics; no modem setup)."
     ));
     output::line(format_args!(
-        "Press Ctrl-C for the D-STAR prompt, then dstar stop to close it."
+        "Use dstar probe --help for the bounded diagnostic workflow."
     ));
     output::line(format_args!(
         "Startup only: mcp probe [--output NEW_DIRECTORY], mcp reentry-probe --help, mcp backup, mcp menu --help, mcp text --help, mcp terminal --help"
@@ -724,21 +727,18 @@ fn print_help() {
         "Text set changes PM1's name, PM-Off MY1 or one channel's name (--channel), with an explicit port, current backup, expected text, and --apply."
     ));
     output::line(format_args!(
-        "Automatic Bluetooth dstar stop rewrites the Terminal and routing pages it changed, over USB."
+        "Managed diagnostics retain restoration until modem close is confirmed."
     ));
 }
 
 fn print_terminal_information() {
-    output::line(format_args!(
-        "{}",
-        terminal::instructions(terminal::UsbConnection::Unknown)
-    ));
+    output::line(format_args!("{}", terminal::instructions()));
 }
 
-fn parse_command(line: &str) -> Result<Option<Command>, CommandError> {
+fn parse_command(line: &str) -> Result<Option<Command>, ParseCommandError> {
     let typed: Vec<&str> = line.split_ascii_whitespace().collect();
     if let Some(parsed) = cat::parse(&typed) {
-        return match parsed.map_err(|error| CommandError(error.0))? {
+        return match parsed? {
             cat::Parsed::Read(read) => Ok(Some(Command::Read(read))),
             cat::Parsed::Write(write) => Ok(Some(Command::Write(write))),
             cat::Parsed::Action(action) => Ok(Some(Command::Action(action))),
@@ -767,13 +767,13 @@ fn parse_command(line: &str) -> Result<Option<Command>, CommandError> {
             set_to: Some(parse_selectable_mode(mode)?),
         },
         ["dstar" | "d-star", "start", arguments @ ..] => {
-            Command::DstarStart(dstar::StartRequest::parse(arguments).map_err(CommandError)?)
+            Command::DstarStart(dstar::StartRequest::parse(arguments)?)
         }
         ["dstar" | "d-star", "probe", ..] => {
             return Err(CommandError(
                 "dstar probe is startup-only; quit this prompt and run tmd750-repl dstar probe --help"
                     .to_owned(),
-            ));
+            ).into());
         }
         ["dstar" | "d-star", "terminal"] | ["terminal"] => Command::Terminal,
         ["dv"] => Command::Dv(Band::A),
@@ -782,7 +782,7 @@ fn parse_command(line: &str) -> Result<Option<Command>, CommandError> {
             return Err(CommandError(
                 "dstar requires: dstar start <callsign> [reflector]; use dv [a|b] for ordinary RF DV mode"
                     .to_owned(),
-            ));
+            ).into());
         }
         ["fm" | "normal"] => Command::Fm(Band::A),
         ["fm" | "normal", band] => Command::Fm(parse_band(band)?),
@@ -791,13 +791,14 @@ fn parse_command(line: &str) -> Result<Option<Command>, CommandError> {
             return Err(CommandError(
                 "MCP commands are startup-only; live operations require dedicated connections. Quit this prompt and run tmd750-repl mcp --help."
                     .to_owned(),
-            ));
+            ).into());
         }
         ["quit" | "exit"] => Command::Quit,
         [name, ..] => {
             return Err(CommandError(format!(
                 "unknown or malformed command {name:?}; enter help for syntax"
-            )));
+            ))
+            .into());
         }
     };
     Ok(Some(command))
@@ -832,6 +833,127 @@ mod tests {
     use kenwood_transport::MockTransport;
 
     type TestResult = Result<(), Box<dyn StdError + Send + Sync>>;
+
+    #[test]
+    fn operation_and_close_errors_remain_independently_typed() -> TestResult {
+        let operation = std::io::Error::new(std::io::ErrorKind::InvalidData, "operation failed");
+        let close = kenwood_transport::TransportError::Write(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "close refused",
+        ));
+        let error = finish_connection(Err(Box::new(operation)), Err(close))
+            .err()
+            .ok_or("both failures discarded")?;
+        let Some(ConnectionError::OperationAndClose { operation, close }) =
+            error.downcast_ref::<ConnectionError>()
+        else {
+            return Err("independent failure record missing".into());
+        };
+        assert!(
+            operation
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::InvalidData)
+        );
+        assert!(
+            matches!(close, kenwood_transport::TransportError::Write(error) if error.kind() == std::io::ErrorKind::PermissionDenied)
+        );
+        Ok(())
+    }
+
+    struct CancelAfterReply {
+        mock: MockTransport,
+        cancelled: std::sync::Arc<AtomicBool>,
+        reply_prefix: &'static [u8],
+    }
+
+    impl Transport for CancelAfterReply {
+        async fn write(&mut self, bytes: &[u8]) -> Result<(), kenwood_transport::TransportError> {
+            self.mock.write(bytes).await
+        }
+        async fn read(
+            &mut self,
+            buffer: &mut [u8],
+        ) -> Result<usize, kenwood_transport::TransportError> {
+            let count = self.mock.read(buffer).await?;
+            if buffer
+                .get(..count)
+                .is_some_and(|bytes| bytes.starts_with(self.reply_prefix))
+            {
+                self.cancelled.store(true, Ordering::Relaxed);
+            }
+            Ok(count)
+        }
+        async fn close(&mut self) -> Result<(), kenwood_transport::TransportError> {
+            self.mock.close().await
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_channel_read_prevents_a_memory_write() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"GW\r", b"GW 0\r");
+        mock.expect(
+            b"FO 1\r",
+            b"FO 1,0145190000,0000600000,2,2,0,0,0,0,0,0,2,08,08,000,0,CQCQCQ,0,00\r",
+        );
+        let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+        let mut radio = Radio::new(CancelAfterReply {
+            mock,
+            cancelled: std::sync::Arc::clone(&cancelled),
+            reply_prefix: b"FO ",
+        });
+        let result = execute_command(
+            &mut radio,
+            Command::Write(cat::Write::StoreMemory(
+                Band::B,
+                kenwood_tmd750::types::MemoryChannelAddress::regular(995)?,
+            )),
+            CommandPolicy::GatewayOff(&cancelled),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "cancelled command must not begin a memory write"
+        );
+        let transport = radio.into_transport();
+        assert_eq!(
+            transport.mock.writes().len(),
+            2,
+            "no query or write may follow the completed channel read"
+        );
+        transport.mock.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_between_vox_queries_prevents_the_next_query() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"VX\r", b"VX 0\r");
+        let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+        let mut radio = Radio::new(CancelAfterReply {
+            mock,
+            cancelled: std::sync::Arc::clone(&cancelled),
+            reply_prefix: b"VX ",
+        });
+        let result = execute_command(
+            &mut radio,
+            Command::Read(cat::Read::Vox),
+            CommandPolicy::GatewayOff(&cancelled),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "cancellation must stop the multi-query command"
+        );
+        let transport = radio.into_transport();
+        assert_eq!(
+            transport.mock.writes(),
+            [b"VX\r".to_vec()],
+            "no delay or gain query may start"
+        );
+        transport.mock.assert_complete();
+        Ok(())
+    }
 
     #[test]
     fn blank_line_is_ignored() {
@@ -912,7 +1034,7 @@ mod tests {
     #[test]
     fn mcp_probe_is_rejected_inside_the_cat_prompt() {
         assert!(
-            matches!(parse_command("mcp probe"), Err(CommandError(message)) if message.contains("dedicated connection")),
+            matches!(parse_command("mcp probe"), Err(ParseCommandError::Syntax(CommandError(message))) if message.contains("dedicated connection")),
             "interactive MCP probes require an explicit startup-only diagnostic"
         );
     }
@@ -960,8 +1082,8 @@ mod tests {
     }
 
     #[test]
-    fn favorite_dstar_start_command_parses() -> Result<(), CommandError> {
-        let request = dstar::StartRequest::parse(&["KQ4NIT", "REF030C"]).map_err(CommandError)?;
+    fn favorite_dstar_start_command_parses() -> TestResult {
+        let request = dstar::StartRequest::parse(&["KQ4NIT", "REF030C"])?;
         assert_eq!(
             parse_command("dstar start KQ4NIT REF030C"),
             Ok(Some(Command::DstarStart(request)))
@@ -989,7 +1111,6 @@ mod tests {
         assert!(cli.port.is_none());
         assert!(!cli.bluetooth);
         assert!(cli.bluetooth_address.is_none());
-        assert!(cli.control_port.is_none());
         assert!(matches!(
             parse_command(&cli.command.join(" "))?,
             Some(Command::DstarStart(_))
@@ -1148,10 +1269,11 @@ mod tests {
     fn terminal_routes_are_informational() {
         assert_eq!(parse_command("terminal"), Ok(Some(Command::Terminal)));
         assert_eq!(parse_command("dstar terminal"), Ok(Some(Command::Terminal)));
-        let guidance = terminal::instructions(terminal::UsbConnection::Unknown);
+        let guidance = terminal::instructions();
         assert!(
-            guidance.contains("disabled") && guidance.contains("this build writes no"),
-            "terminal guidance must state that no Terminal or routing setting is written"
+            guidance.contains("refuses its unsupported Kenwood modem configuration")
+                && guidance.contains("this command writes no setting"),
+            "terminal guidance must state the current configuration refusal and its own read-only scope"
         );
     }
 
@@ -1159,7 +1281,7 @@ mod tests {
     fn unqualified_writes_are_rejected() {
         let dr = parse_command("mode a dr");
         assert!(
-            matches!(dr, Err(CommandError(ref message)) if message.contains("tuning [a|b] dr")),
+            matches!(dr, Err(ParseCommandError::Syntax(CommandError(ref message))) if message.contains("tuning [a|b] dr")),
             "DR is selected as a tuning mode, never as an MD write: {dr:?}"
         );
         assert_eq!(

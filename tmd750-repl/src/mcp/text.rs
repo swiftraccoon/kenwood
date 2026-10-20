@@ -1,4 +1,4 @@
-//! Text inspection from captured backups, plus the two writable text settings.
+//! Text inspection and guarded updates from captured backups.
 //!
 //! `list`, `show` and `preview` read captured files only; `set` opens the radio
 //! and can change PM1's name, PM-Off MY1 or one channel's name, and no other
@@ -7,9 +7,9 @@
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
+use kenwood_schema::StringEncoding;
 use kenwood_tmd750::memory::{
-    StringEncoding, TextImage, TextMetadata, TextPreview, TextScope, TextScopeKind, TextSetting,
-    menu_field,
+    TextImage, TextMetadata, TextPreview, TextScope, TextScopeKind, TextSetting, menu_field,
 };
 use kenwood_tmd750::transport::SerialCandidate;
 use kenwood_tmd750::{Identity, MemoryImage, SlotIndex};
@@ -86,7 +86,7 @@ pub(super) fn run_offline(request: &TextRequest) -> Option<AppResult<()>> {
 /// Only `set` uses the connection; the other subcommands read captured files.
 pub(super) async fn run_selected(
     endpoint: &SerialCandidate,
-    baud: u32,
+    baud: std::num::NonZeroU32,
     request: &TextRequest,
 ) -> AppResult<()> {
     match &request.command {
@@ -153,7 +153,7 @@ impl Selection {
         })?;
         let image = snapshot
             .image_for(&field.descriptor, self.slot)
-            .map_err(|error| setting_error(self.setting, metadata, error.as_ref()))?;
+            .map_err(|error| setting_error(self.setting, metadata, error))?;
         Ok((TextImage::new(image), scope))
     }
 }
@@ -169,7 +169,7 @@ fn run(request: &TextRequest) -> AppResult<()> {
             let metadata = selection.setting.metadata()?;
             let value = view
                 .read(selection.setting, scope)
-                .map_err(|error| setting_error(selection.setting, metadata, &error))?;
+                .map_err(|error| setting_error(selection.setting, metadata, Box::new(error)))?;
             print_provenance(snapshot.identity());
             output::line(format_args!(
                 "{}{}: {}",
@@ -218,7 +218,7 @@ fn preview(request: &PreviewRequest) -> AppResult<()> {
     let metadata = selection.setting.metadata()?;
     let preview = view
         .preview(selection.setting, scope, &request.text)
-        .map_err(|error| setting_error(selection.setting, metadata, &error))?;
+        .map_err(|error| setting_error(selection.setting, metadata, Box::new(error)))?;
     let field = menu_field(metadata.field_name).ok_or_else(|| {
         CommandError(format!(
             "no text storage descriptor for {}",
@@ -227,7 +227,7 @@ fn preview(request: &PreviewRequest) -> AppResult<()> {
     })?;
     let image = snapshot
         .image_for(&field.descriptor, selection.slot)
-        .map_err(|error| setting_error(selection.setting, metadata, error.as_ref()))?;
+        .map_err(|error| setting_error(selection.setting, metadata, error))?;
     let artifact = PreviewArtifact::new(&selection.backup, snapshot.identity(), image, &preview)?;
     if let Some(path) = &request.output {
         save_preview(path, &artifact)?;
@@ -251,13 +251,37 @@ fn preview(request: &PreviewRequest) -> AppResult<()> {
 fn setting_error(
     setting: TextSetting,
     metadata: TextMetadata,
-    error: &dyn std::error::Error,
-) -> CommandError {
-    CommandError(
-        error
-            .to_string()
-            .replace(metadata.field_name, setting.key()),
-    )
+    source: Box<dyn std::error::Error + Send + Sync>,
+) -> SettingError {
+    SettingError {
+        setting,
+        field_name: metadata.field_name,
+        source,
+    }
+}
+
+#[derive(Debug)]
+struct SettingError {
+    setting: TextSetting,
+    field_name: &'static str,
+    source: Box<dyn std::error::Error + Send + Sync>,
+}
+
+impl std::fmt::Display for SettingError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            &self
+                .source
+                .to_string()
+                .replace(self.field_name, self.setting.key()),
+        )
+    }
+}
+
+impl std::error::Error for SettingError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
 }
 
 fn print_provenance(identity: &Identity) {
@@ -508,13 +532,16 @@ mod tests {
         let field = menu_field(metadata.field_name).ok_or("missing text field")?;
         let result = field
             .descriptor
-            .encode(kenwood_tmd750::memory::FieldValue::Text(
-                "12345678901234567",
-            ));
+            .encode(kenwood_schema::FieldValue::Text("12345678901234567"));
         let Err(error) = result else {
             return Err("oversized text must fail codec validation".into());
         };
-        let message = setting_error(setting, metadata, &error).to_string();
+        let error = setting_error(setting, metadata, Box::new(error));
+        assert!(
+            std::error::Error::source(&error).is_some(),
+            "typed codec cause must remain inspectable"
+        );
+        let message = error.to_string();
         assert!(message.contains("pm-name-1"));
         assert!(!message.contains(metadata.field_name));
         assert!(message.contains("17"));

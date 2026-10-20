@@ -16,6 +16,9 @@ use super::super::{Failure, ProbeEvidence, close_transport, verification_eligibi
 use crate::capture::{CaptureTransport, Event, Recorder, TranscriptSummary};
 use crate::output;
 
+#[cfg(test)]
+mod tests;
+
 /// The two transcripts reserved for one session: its MCP read and its CAT check.
 pub(super) struct Captures {
     pub(super) original: Recorder<File>,
@@ -153,7 +156,7 @@ impl Workflow {
 pub(super) async fn run(
     backend: &mut impl Backend,
     endpoint: &SerialCandidate,
-    baud: u32,
+    baud: std::num::NonZeroU32,
     captures: [Captures; 2],
     journal: &mut Recorder<File>,
     cancelled: &AtomicBool,
@@ -187,7 +190,7 @@ pub(super) async fn run(
 async fn run_session(
     backend: &mut impl Backend,
     endpoint: &SerialCandidate,
-    baud: u32,
+    baud: std::num::NonZeroU32,
     captures: Captures,
     cancelled: &AtomicBool,
 ) -> Session {
@@ -253,7 +256,7 @@ async fn run_session(
 async fn verify(
     backend: &mut impl Backend,
     endpoint: &SerialCandidate,
-    baud: u32,
+    baud: std::num::NonZeroU32,
     core: &McpGatewayOffProbeReport,
     result: &Session,
     post_exit: Recorder<File>,
@@ -281,6 +284,3 @@ async fn verify(
         Err(reason) => ReadinessVerification::skipped(reason, post_exit.summary()),
     }
 }
-
-#[cfg(test)]
-mod tests;

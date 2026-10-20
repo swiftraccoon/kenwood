@@ -1,6 +1,8 @@
 //! One owned transport, either a serial port or, on macOS, a native Bluetooth
 //! RFCOMM connection.
 
+use std::num::NonZeroU32;
+
 use kenwood_tmd750::transport::SerialTransport;
 use kenwood_transport::{Transport, TransportError};
 
@@ -38,7 +40,7 @@ impl Transport for Connection {
         }
     }
 
-    fn set_baud_rate(&mut self, baud: u32) -> Result<(), TransportError> {
+    fn set_baud_rate(&mut self, baud: NonZeroU32) -> Result<(), TransportError> {
         match self {
             Self::Serial(transport) => transport.set_baud_rate(baud),
             #[cfg(target_os = "macos")]

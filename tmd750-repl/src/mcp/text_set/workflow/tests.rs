@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kenwood_tmd750::memory::{Pm1Name, Pm1NameUpdate, TextFieldUpdateStatus};
-use kenwood_tmd750::protocol::mcp::{ACK, read_request, write_request};
+use kenwood_tmd750::protocol::mcp::{ACK, Header};
 use kenwood_tmd750::radio::readiness::SETTLE_QUIET;
 use kenwood_tmd750::transport::{KENWOOD_VID, SerialCandidate, TMD750_MAIN_PID, TMD750_PANEL_PID};
 use kenwood_tmd750::{Address, FirmwareIdentity, Identity, Page, RadioModel, RadioType};
@@ -265,14 +265,15 @@ impl Backend for TestBackend {
     fn open(
         &mut self,
         selected: &SerialCandidate,
-        baud: u32,
+        baud: std::num::NonZeroU32,
     ) -> Result<Connection, TransportError> {
         assert_eq!(
             selected, &self.endpoint,
             "only the selected endpoint may open"
         );
         assert_eq!(
-            baud, 9600,
+            baud.get(),
+            9600,
             "only the qualified transport settings may be used"
         );
         append(&self.log, Event::Open(self.opens))?;
@@ -358,13 +359,13 @@ fn identity_script(firmware: &str) -> MockTransport {
 }
 
 fn frame(page: Page, bytes: &[u8]) -> Vec<u8> {
-    let mut result = write_request(page).to_vec();
+    let mut result = Header::write_request(page).to_vec();
     result.extend_from_slice(bytes);
     result
 }
 
 fn read(mock: &mut MockTransport, page: Page, bytes: &[u8]) {
-    mock.expect(&read_request(page), &frame(page, bytes));
+    mock.expect(&Header::read_request(page), frame(page, bytes));
     mock.expect(&[ACK], &[ACK]);
 }
 
@@ -391,7 +392,7 @@ fn mcp_script(
     )?;
     if apply {
         mock.expect(
-            &frame(update.page(), update.desired_page()),
+            frame(update.page(), update.desired_page()),
             if bad_write_ack { &[0x15] } else { &[ACK] },
         );
         if bad_write_ack {
@@ -489,7 +490,11 @@ impl Harness {
     async fn run(&mut self) -> Result<WorkflowResult, TestError> {
         let endpoint = self.backend.endpoint.clone();
         Ok(run(
-            &mut UsbLink::new(&mut self.backend, &endpoint, 9600),
+            &mut UsbLink::new(
+                &mut self.backend,
+                &endpoint,
+                kenwood_tmd750::transport::DEFAULT_BAUD,
+            ),
             &mut self.update,
             &mut self.journal,
             self.captures.take().ok_or("workflow already run")?,
@@ -1048,23 +1053,19 @@ async fn incomplete_fresh_cat_capture_prevents_new_handle_and_preserves_possible
 }
 
 #[test]
-fn only_unconfirmed_exit_requests_recovery_without_claiming_restoration() -> TestResult {
+fn only_unconfirmed_exit_requires_retirement_without_claiming_restoration() -> TestResult {
     for exit in [
         ExitDisposition::RecoveryRequired,
         ExitDisposition::NotAcknowledged,
     ] {
         let guidance = exit_guidance(&exit).ok_or("uncertain exit recovery guidance missing")?;
         assert!(
-            guidance.contains("fully power-cycle the radio before reconnecting"),
-            "uncertain exit must require an explicit recovery boundary"
+            guidance.contains("Stop using this connection and retain the journal and transcripts"),
+            "uncertain exit must retire the connection"
         );
         assert!(
-            guidance.contains("does not report which text is stored"),
-            "a power cycle must not be described as proof of restoration"
-        );
-        assert!(
-            guidance.contains("do not retry or restore blindly"),
-            "uncertain updates must prohibit speculative recovery writes"
+            guidance.contains("No recovery commands or automatic retry will be sent"),
+            "uncertain framing must not permit a recovery exchange"
         );
     }
     for exit in [ExitDisposition::NotEntered, ExitDisposition::Acknowledged] {
@@ -1137,10 +1138,9 @@ impl native::Backend for NativeBackend {
     ) -> Result<native::Opened<Connection>, native::OpenFailure> {
         self.services.push(service);
         let connection = self.connections.pop_front().ok_or_else(|| {
-            native::OpenFailure::from_error(&io::Error::other("no scripted native connection"))
+            native::OpenFailure::from_error(io::Error::other("no scripted native connection"))
         })?;
-        append(&self.log, Event::Open(self.opens))
-            .map_err(|error| native::OpenFailure::from_error(&error))?;
+        append(&self.log, Event::Open(self.opens)).map_err(native::OpenFailure::from_error)?;
         self.opens += 1;
         Ok(native::Opened {
             connection,
@@ -1183,7 +1183,7 @@ fn native_mcp_script(
         },
     );
     if apply {
-        mock.expect(&frame(update.page(), update.desired_page()), &[ACK]);
+        mock.expect(frame(update.page(), update.desired_page()), &[ACK]);
         read(&mut mock, update.page(), update.desired_page());
     }
     mock.expect(b"E", &[ACK]);

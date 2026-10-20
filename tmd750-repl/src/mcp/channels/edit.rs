@@ -29,6 +29,9 @@ use crate::mcp::snapshot::Snapshot;
 use crate::mcp::vfo;
 use crate::{AppResult, CommandError, output};
 
+#[cfg(test)]
+mod tests;
+
 /// The stores and clears of `mcp channels preview` and `apply`.
 #[derive(Debug, Args)]
 pub(super) struct EditSelection {
@@ -93,12 +96,12 @@ impl EditSelection {
             let [channel, source] = pair else {
                 continue;
             };
-            let address = parse_address(channel).map_err(CommandError)?;
+            let address = parse_address(channel)?;
             let record = source_record(snapshot, &access, source)?;
             writes.push((address, ChannelWrite::Store(record)));
         }
         for channel in &self.clear {
-            let address = parse_address(channel).map_err(CommandError)?;
+            let address = parse_address(channel)?;
             writes.push((address, ChannelWrite::Clear));
         }
         if writes.is_empty() {
@@ -158,7 +161,7 @@ fn source_record(
         let record = memory.current(band).cat_record()?;
         return Ok(CatMemoryChannelRecord::from_channel(record, false));
     }
-    let address = parse_address(source).map_err(CommandError)?;
+    let address = parse_address(source)?;
     let entry = access.entry(PhysicalChannel::from_address(address))?;
     let record = entry
         .channel()
@@ -171,7 +174,7 @@ fn source_record(
 
 pub(super) async fn run_apply(
     endpoint: &SerialCandidate,
-    baud: u32,
+    baud: std::num::NonZeroU32,
     request: &ApplyRequest,
 ) -> AppResult<()> {
     page_apply::admit_usb(endpoint, baud, PlanKind::MemoryChannels)?;
@@ -249,6 +252,3 @@ fn description(prepared: &Prepared) -> Map<String, Value> {
     let _previous = description.insert("memory_channels".to_owned(), Value::Array(changes));
     description
 }
-
-#[cfg(test)]
-mod tests;

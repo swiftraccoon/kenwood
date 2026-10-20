@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use kenwood_tmd750::protocol::mcp::{ACK, read_request, write_request};
+use kenwood_tmd750::protocol::mcp::{ACK, Header};
 use kenwood_tmd750::{Address, Page};
 use kenwood_transport::{MockTransport, Transport, TransportError};
 
@@ -289,15 +289,14 @@ impl Backend for FakeBackend {
         let id = self.opens;
         self.opens += 1;
         record(&self.log, Seen::Open(id, endpoint.address.to_string()))
-            .map_err(|error| OpenFailure::from_error(&error))?;
-        record(&self.log, Seen::Service(id, service))
-            .map_err(|error| OpenFailure::from_error(&error))?;
+            .map_err(OpenFailure::from_error)?;
+        record(&self.log, Seen::Service(id, service)).map_err(OpenFailure::from_error)?;
         let mut fixture = self
             .fixtures
             .pop_front()
-            .ok_or_else(|| OpenFailure::from_error(&io::Error::other("scripted open failure")))?;
+            .ok_or_else(|| OpenFailure::from_error(io::Error::other("scripted open failure")))?;
         if let Some(error) = fixture.open_error.take() {
-            return Err(OpenFailure::from_error(&error));
+            return Err(OpenFailure::from_error(error));
         }
         let resolved = Resolved {
             address: fixture
@@ -353,9 +352,9 @@ fn fixed(exit_reply: &[u8]) -> AppResult<MockTransport> {
 }
 
 fn page_read(script: &mut MockTransport, page: Page) {
-    let mut response = write_request(page).to_vec();
+    let mut response = Header::write_request(page).to_vec();
     response.extend(vec![0x42; page.len()]);
-    script.expect(&read_request(page), &response);
+    script.expect(&Header::read_request(page), &response);
     script.expect(&[ACK], &[ACK]);
 }
 
@@ -389,20 +388,20 @@ fn fresh_gateway(reply: &[u8]) -> MockTransport {
 
 /// A fresh connection whose radio holds the `ID` reply for `hold` after the
 /// read for it begins, as it does until about 20 s after a programming exit.
-fn held_identity(hold: Duration) -> AppResult<MockTransport> {
+fn held_identity(hold: Duration) -> MockTransport {
     let mut script = MockTransport::new();
-    script.queue_read_delayed(b"ID TM-D750\r", u64::try_from(hold.as_millis())?);
-    script.expect_reads(b"ID\r", &[]);
-    Ok(script)
+    script.queue_read_delayed(b"ID TM-D750\r", hold);
+    script.expect_reads(b"ID\r", []);
+    script
 }
 
 /// [`held_identity`] followed by the rest of the fresh Gateway Off check.
-fn held_fresh_gateway(hold: Duration) -> AppResult<MockTransport> {
-    let mut script = held_identity(hold)?;
+fn held_fresh_gateway(hold: Duration) -> MockTransport {
+    let mut script = held_identity(hold);
     script.expect(b"FV\r", b"FV 1.02\r");
     script.expect(b"TY\r", b"TY K,2,1\r");
     script.expect(b"GW\r", b"GW 0\r");
-    Ok(script)
+    script
 }
 
 fn endpoint() -> AppResult<Endpoint> {
@@ -582,7 +581,7 @@ async fn fresh_check_waits_for_a_reply_held_until_twenty_seconds_after_exit() ->
     let (result, events) = execute_with_faults(
         [
             Fixture::new(fixed(&[ACK])?),
-            Fixture::new(held_fresh_gateway(Duration::from_secs(15))?),
+            Fixture::new(held_fresh_gateway(Duration::from_secs(15))),
         ],
         Operation::FixedMcp,
         Faults {
@@ -606,7 +605,7 @@ async fn fresh_check_gives_up_at_the_exit_reply_bound() -> TestResult {
     let (result, events) = execute_with_faults(
         [
             Fixture::new(fixed(&[ACK])?),
-            Fixture::new(held_identity(Duration::from_secs(26))?),
+            Fixture::new(held_identity(Duration::from_secs(26))),
         ],
         Operation::FixedMcp,
         Faults {
@@ -1019,7 +1018,7 @@ async fn configuration_backup_recovers_on_the_discovered_channel_and_loads_offli
     let selection = kenwood_tmd750::ScopedMenuField::new(name, None)?;
     assert_eq!(
         memory.value(selection)?,
-        kenwood_tmd750::memory::DecodedFieldValue::Text("B".repeat(16))
+        kenwood_schema::DecodedFieldValue::Text("B".repeat(16))
     );
     assert!(crate::mcp::snapshot::Snapshot::load_for_usb_write(&path).is_err());
     Ok(())
@@ -1032,7 +1031,7 @@ async fn configuration_failure_keeps_prior_pages_and_cleanup_without_exit_or_rec
     let mut script = configuration_entry();
     page_read(&mut script, *pages.first().ok_or("first page")?);
     script.expect(
-        &read_request(*pages.get(1).ok_or("second page")?),
+        &Header::read_request(*pages.get(1).ok_or("second page")?),
         &[b'W', 0, 0, 0, 0],
     );
     let mut fixture = Fixture::new(script);

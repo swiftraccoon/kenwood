@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kenwood_tmd750::memory::{My1Callsign, My1CallsignUpdate, TextFieldUpdateStatus};
-use kenwood_tmd750::protocol::mcp::{ACK, read_request, write_request};
+use kenwood_tmd750::protocol::mcp::{ACK, Header};
 use kenwood_tmd750::transport::{KENWOOD_VID, SerialCandidate, TMD750_MAIN_PID, TMD750_PANEL_PID};
 use kenwood_tmd750::{
     Address, DvGatewayMode, FirmwareIdentity, Identity, Page, Radio, RadioModel, RadioType,
@@ -416,13 +416,17 @@ impl Backend for TestBackend {
     fn open(
         &mut self,
         selected: &SerialCandidate,
-        baud: u32,
+        baud: std::num::NonZeroU32,
     ) -> Result<Connection, TransportError> {
         assert_eq!(
             selected, &self.proof.endpoint,
             "only the selected endpoint may open"
         );
-        assert_eq!(baud, 9600, "only the selected line settings may be used");
+        assert_eq!(
+            baud.get(),
+            9600,
+            "only the selected line settings may be used"
+        );
         self.proof
             .verify_open(self.opens)
             .map_err(|error| TransportError::Open {
@@ -512,13 +516,13 @@ fn fresh_script(gateway: &[u8]) -> MockTransport {
 }
 
 fn frame(page: Page, data: &[u8]) -> Vec<u8> {
-    let mut result = write_request(page).to_vec();
+    let mut result = Header::write_request(page).to_vec();
     result.extend_from_slice(data);
     result
 }
 
 fn read(mock: &mut MockTransport, page: Page, data: &[u8]) {
-    mock.expect(&read_request(page), &frame(page, data));
+    mock.expect(&Header::read_request(page), frame(page, data));
     mock.expect(&[ACK], &[ACK]);
 }
 
@@ -546,7 +550,7 @@ fn mcp_script(update: &My1CallsignUpdate, apply: bool) -> Result<MockTransport, 
         },
     )?;
     if apply {
-        mock.expect(&frame(update.page(), update.desired_page()), &[ACK]);
+        mock.expect(frame(update.page(), update.desired_page()), &[ACK]);
         read(&mut mock, update.page(), update.desired_page());
     }
     mock.expect(b"E", &[ACK]);
@@ -644,7 +648,11 @@ impl Harness {
     async fn run(&mut self) -> Result<WorkflowResult, TestError> {
         let endpoint = self.backend.proof.endpoint.clone();
         Ok(run(
-            &mut UsbLink::new(&mut self.backend, &endpoint, 9600),
+            &mut UsbLink::new(
+                &mut self.backend,
+                &endpoint,
+                kenwood_tmd750::transport::DEFAULT_BAUD,
+            ),
             &mut self.update,
             &mut self.journal,
             self.captures.take().ok_or("workflow already run")?,
@@ -1031,9 +1039,13 @@ async fn synchronized_open_request_rechecks_cancellation_before_handle_acquisiti
         harness.captures.take().ok_or("captures missing")?;
     harness.cancelled.store(true, Ordering::Relaxed);
     let endpoint = endpoint();
-    let opening = UsbLink::new(&mut harness.backend, &endpoint, 9600)
-        .open_session(original, false, &harness.cancelled)
-        .await;
+    let opening = UsbLink::new(
+        &mut harness.backend,
+        &endpoint,
+        kenwood_tmd750::transport::DEFAULT_BAUD,
+    )
+    .open_session(original, false, &harness.cancelled)
+    .await;
     let Opening::Refused { recorder, refusal } = opening else {
         return Err("the final pre-open cancellation check must prevent acquisition".into());
     };
@@ -1271,7 +1283,7 @@ async fn independent_verification(
             Ok(reconnect::verify_readiness(
                 &mut harness.backend,
                 &endpoint(),
-                9600,
+                kenwood_tmd750::transport::DEFAULT_BAUD,
                 &identity,
                 post_exit,
                 &AtomicBool::new(false),
@@ -1285,7 +1297,7 @@ async fn independent_verification(
             Ok(reconnect::verify_readiness_gateway_off(
                 &mut harness.backend,
                 &endpoint(),
-                9600,
+                kenwood_tmd750::transport::DEFAULT_BAUD,
                 &identity,
                 post_exit,
                 &AtomicBool::new(false),
@@ -1305,7 +1317,11 @@ async fn adapter_finalization_never_substitutes_gateway_or_identity_observations
         let [captures, _unused] = harness.captures.take().ok_or("capture pairs missing")?;
         let endpoint = endpoint();
         let session = run_session(
-            &mut UsbLink::new(&mut harness.backend, &endpoint, 9600),
+            &mut UsbLink::new(
+                &mut harness.backend,
+                &endpoint,
+                kenwood_tmd750::transport::DEFAULT_BAUD,
+            ),
             &mut harness.update,
             &mut harness.journal,
             captures,
@@ -1496,12 +1512,12 @@ impl WriteLink for ReadOnlyCompletionLink<'_> {
     ) -> Opening<Self::Connection> {
         recorder.record(CaptureEvent::OpenRequested {
             path: &self.endpoint.path,
-            baud: 9600,
+            baud: kenwood_tmd750::transport::DEFAULT_BAUD,
         });
         let opened = recorder.synchronize().and_then(|()| {
             let connection = self
                 .backend
-                .open(&self.endpoint, 9600)
+                .open(&self.endpoint, kenwood_tmd750::transport::DEFAULT_BAUD)
                 .map_err(io::Error::other)?;
             Ok((connection, File::open(&self.transcript)?))
         });

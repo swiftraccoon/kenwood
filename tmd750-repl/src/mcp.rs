@@ -1,30 +1,5 @@
 //! Startup-only MCP workflows and offline configuration inspection.
 
-pub(crate) mod backup;
-mod call_channel;
-mod callsign_list;
-mod channel_groups;
-mod channel_names;
-mod channels;
-mod dtmf;
-pub(crate) mod fixed;
-mod group_names;
-mod link;
-mod menu;
-mod menu_apply;
-mod mic_e;
-mod page_apply;
-mod position;
-pub(crate) mod reconnect;
-mod reentry_probe;
-mod repeater;
-mod restore;
-pub(crate) mod snapshot;
-mod terminal;
-mod text;
-mod text_set;
-mod vfo;
-
 use std::fs::File;
 use std::future::Future;
 use std::io::{self, Write};
@@ -48,6 +23,35 @@ use crate::capture::{
 };
 use crate::{AppResult, output};
 use reconnect::{Backend, ReadinessVerification, SkipReason, SystemBackend};
+
+pub(crate) mod backup;
+mod call_channel;
+mod callsign_list;
+mod channel_groups;
+mod channel_names;
+mod channels;
+mod dtmf;
+#[cfg(test)]
+mod eligibility_tests;
+pub(crate) mod fixed;
+mod group_names;
+mod link;
+mod menu;
+mod menu_apply;
+mod mic_e;
+mod page_apply;
+mod position;
+pub(crate) mod reconnect;
+mod reentry_probe;
+mod repeater;
+mod restore;
+pub(crate) mod snapshot;
+mod terminal;
+mod text;
+mod text_set;
+mod vfo;
+#[cfg(test)]
+mod workflow_tests;
 
 /// MCP workflows; no subcommand accepts an arbitrary address or request.
 #[derive(Debug, Parser)]
@@ -194,7 +198,7 @@ struct Endpoint {
     path: String,
     usb_vendor_id: Option<u16>,
     usb_product_id: Option<u16>,
-    cat_baud: u32,
+    cat_baud: std::num::NonZeroU32,
 }
 
 #[derive(Debug, Serialize)]
@@ -250,7 +254,7 @@ struct IdentityEvidence {
 impl From<&Identity> for IdentityEvidence {
     fn from(identity: &Identity) -> Self {
         Self {
-            model: identity.model.to_string(),
+            model: crate::report_labels::model(identity.model).to_owned(),
             firmware: identity.firmware.to_string(),
             radio_type: identity.radio_type.to_string(),
         }
@@ -415,7 +419,7 @@ pub(crate) async fn run_native_write(
 /// Open only the selected USB connection, capture, close, and publish the report.
 pub(crate) async fn run(
     endpoint: &SerialCandidate,
-    baud: u32,
+    baud: std::num::NonZeroU32,
     request: &McpCommand,
 ) -> AppResult<()> {
     match request {
@@ -448,7 +452,11 @@ pub(crate) async fn run(
     }
 }
 
-async fn run_probe(endpoint: &SerialCandidate, baud: u32, request: &ProbeRequest) -> AppResult<()> {
+async fn run_probe(
+    endpoint: &SerialCandidate,
+    baud: std::num::NonZeroU32,
+    request: &ProbeRequest,
+) -> AppResult<()> {
     let cancelled = Arc::new(AtomicBool::new(false));
     let artifacts = Artifacts::create(
         CaptureKind::Mcp,
@@ -569,7 +577,7 @@ struct WorkflowResult {
 async fn run_workflow(
     backend: &mut impl Backend,
     endpoint: &SerialCandidate,
-    baud: u32,
+    baud: std::num::NonZeroU32,
     captures: WorkflowCaptures,
     cancelled: &AtomicBool,
 ) -> WorkflowResult {
@@ -766,16 +774,10 @@ fn print_probe_result(report: &McpProbeReport) {
         McpProbeExit::RecoveryRequired | McpProbeExit::NotAcknowledged
     ) {
         output::error(format_args!(
-            "Radio state is not verified. Stop using this connection and fully power-cycle the radio before reconnecting. No recovery commands will be sent."
+            "MCP framing is uncertain. Stop using this connection. No recovery commands or automatic retry will be sent."
         ));
     }
 }
-
-#[cfg(test)]
-mod workflow_tests;
-
-#[cfg(test)]
-mod eligibility_tests;
 
 #[cfg(test)]
 mod tests {

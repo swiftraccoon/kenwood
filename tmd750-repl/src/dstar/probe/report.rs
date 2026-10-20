@@ -48,7 +48,7 @@ impl Report {
             )),
             Outcome::Cancelled { .. } => {
                 output::line(format_args!(
-                    "Diagnostic cancelled; the connection was closed."
+                    "Diagnostic cancelled; connection close was attempted."
                 ));
             }
             Outcome::CatGatewayFailed { error, .. }
@@ -84,7 +84,7 @@ pub(super) struct Endpoint {
     path: String,
     usb_vendor_id: Option<u16>,
     usb_product_id: Option<u16>,
-    baud: u32,
+    baud: std::num::NonZeroU32,
 }
 
 impl From<&SerialCandidate> for Endpoint {
@@ -187,7 +187,7 @@ pub(super) struct IdentityEvidence {
 impl From<&Identity> for IdentityEvidence {
     fn from(identity: &Identity) -> Self {
         Self {
-            model: identity.model.to_string(),
+            model: crate::report_labels::model(identity.model).to_owned(),
             firmware: identity.firmware.to_string(),
             radio_type: identity.radio_type.to_string(),
         }
@@ -204,9 +204,11 @@ pub(super) struct VersionEvidence {
 impl From<&VersionResponse> for VersionEvidence {
     fn from(version: &VersionResponse) -> Self {
         Self {
-            protocol: version.protocol,
-            description: version.description.clone(),
-            capabilities: version.capabilities.map(|value| [value.cap1, value.cap2]),
+            protocol: version.protocol().get(),
+            description: version.description().to_owned(),
+            capabilities: version
+                .capabilities()
+                .map(mmdvm::core::Capabilities::to_bytes),
         }
     }
 }

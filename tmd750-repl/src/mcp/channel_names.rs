@@ -23,6 +23,9 @@ use super::snapshot::Snapshot;
 use crate::cat::parse_address;
 use crate::{AppResult, CommandError, output};
 
+#[cfg(test)]
+mod tests;
+
 /// Channel-name subcommand: an offline preview, or one guarded live write.
 #[derive(Debug, Parser)]
 pub(crate) struct ChannelNamesRequest {
@@ -97,7 +100,7 @@ impl NamesSelection {
             let [channel, name] = pair else {
                 continue;
             };
-            let address = parse_address(channel).map_err(CommandError)?;
+            let address = parse_address(channel)?;
             names.push((
                 PhysicalChannel::from_address(address),
                 Some(ChannelNameText::new(name)?),
@@ -105,7 +108,7 @@ impl NamesSelection {
             entries.push((address.to_string(), Some(name.clone())));
         }
         for channel in &self.clear {
-            let address = parse_address(channel).map_err(CommandError)?;
+            let address = parse_address(channel)?;
             names.push((PhysicalChannel::from_address(address), None));
             entries.push((address.to_string(), None));
         }
@@ -145,7 +148,7 @@ pub(super) fn run_offline(request: &ChannelNamesRequest) -> Option<AppResult<()>
 
 pub(super) async fn run_selected(
     endpoint: &SerialCandidate,
-    baud: u32,
+    baud: std::num::NonZeroU32,
     request: &ChannelNamesRequest,
 ) -> AppResult<()> {
     match &request.command {
@@ -154,13 +157,18 @@ pub(super) async fn run_selected(
     }
 }
 
-async fn run_apply(endpoint: &SerialCandidate, baud: u32, request: &ApplyRequest) -> AppResult<()> {
+async fn run_apply(
+    endpoint: &SerialCandidate,
+    baud: std::num::NonZeroU32,
+    request: &ApplyRequest,
+) -> AppResult<()> {
     page_apply::admit_usb(endpoint, baud, PlanKind::ChannelNames)?;
     let snapshot = Snapshot::load_for_usb_write(&request.names.backup)?;
     let prepared = request.names.prepare(&snapshot)?;
     if prepared.replacements.is_empty() {
         return Err(CommandError(
-            "every channel already holds the requested name; nothing was opened".to_owned(),
+            "the backup already contains every requested channel name; nothing was opened"
+                .to_owned(),
         )
         .into());
     }
@@ -219,6 +227,3 @@ fn description(prepared: &Prepared) -> Map<String, Value> {
     );
     description
 }
-
-#[cfg(test)]
-mod tests;

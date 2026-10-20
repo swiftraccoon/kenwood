@@ -29,6 +29,9 @@ use super::page_apply::{self, PagePlan, PlanKind};
 use super::snapshot::Snapshot;
 use crate::{AppResult, CommandError, output};
 
+#[cfg(test)]
+mod tests;
+
 /// Position memory subcommand: an offline listing or preview, or one guarded
 /// live write.
 #[derive(Debug, Parser)]
@@ -125,10 +128,26 @@ fn captured(snapshot: &Snapshot) -> AppResult<(PositionMemory, &MemoryImage)> {
     Ok((PositionMemory::read(image)?, image))
 }
 
+/// Geographic role and its original decimal-degree limit.
+#[derive(Clone, Copy, Debug)]
+enum CoordinateKind {
+    Latitude,
+    Longitude,
+}
+
+impl CoordinateKind {
+    const fn limit(self) -> u64 {
+        match self {
+            Self::Latitude => 90,
+            Self::Longitude => 180,
+        }
+    }
+}
+
 /// Signed decimal degrees, with at most three whole and nine fractional
 /// digits, as a negative flag and the magnitude rounded to the nearest
 /// ten-thousandth of a minute.
-fn parse_degrees(text: &str) -> AppResult<(bool, Coordinate)> {
+fn parse_degrees(text: &str, kind: CoordinateKind) -> AppResult<(bool, Coordinate)> {
     let invalid = || {
         CommandError(format!(
             "{text:?} is not decimal degrees with at most three whole and nine fractional digits"
@@ -165,6 +184,15 @@ fn parse_degrees(text: &str) -> AppResult<(bool, Coordinate)> {
         .into_iter(),
     ) {
         nanodegrees += u64::from(digit - b'0') * scale;
+    }
+    if nanodegrees > kind.limit() * 1_000_000_000 {
+        let name = match kind {
+            CoordinateKind::Latitude => "latitude",
+            CoordinateKind::Longitude => "longitude",
+        };
+        return Err(
+            CommandError(format!("{name} degrees {text:?} exceed {}", kind.limit())).into(),
+        );
     }
     let units = (nanodegrees * 6 + 5_000) / 10_000;
     let coordinate = Coordinate::new(
@@ -237,8 +265,8 @@ impl EditRequest {
                 let [name, latitude, longitude] = fields else {
                     continue;
                 };
-                let (south, latitude) = parse_degrees(latitude)?;
-                let (west, longitude) = parse_degrees(longitude)?;
+                let (south, latitude) = parse_degrees(latitude, CoordinateKind::Latitude)?;
+                let (west, longitude) = parse_degrees(longitude, CoordinateKind::Longitude)?;
                 after.push(StoredPosition::new(
                     StoredText::new(name)?,
                     time,
@@ -294,7 +322,7 @@ pub(super) fn run_offline(request: &PositionRequest) -> Option<AppResult<()>> {
 
 pub(super) async fn run_selected(
     endpoint: &SerialCandidate,
-    baud: u32,
+    baud: std::num::NonZeroU32,
     request: &PositionRequest,
 ) -> AppResult<()> {
     match &request.command {
@@ -304,13 +332,17 @@ pub(super) async fn run_selected(
     }
 }
 
-async fn run_apply(endpoint: &SerialCandidate, baud: u32, request: &ApplyRequest) -> AppResult<()> {
+async fn run_apply(
+    endpoint: &SerialCandidate,
+    baud: std::num::NonZeroU32,
+    request: &ApplyRequest,
+) -> AppResult<()> {
     page_apply::admit_usb(endpoint, baud, PlanKind::PositionMemory)?;
     let snapshot = Snapshot::load_for_usb_write(&request.edit.backup)?;
     let prepared = request.edit.prepare(&snapshot)?;
     if prepared.replacements.is_empty() {
         return Err(CommandError(
-            "the radio already holds the edited positions; nothing was opened".to_owned(),
+            "the backup already contains the edited positions; nothing was opened".to_owned(),
         )
         .into());
     }
@@ -404,6 +436,3 @@ fn description(prepared: &Prepared) -> Map<String, Value> {
     );
     description
 }
-
-#[cfg(test)]
-mod tests;

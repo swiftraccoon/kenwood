@@ -109,12 +109,12 @@ impl<I: CommandInput> Commands<I> {
     }
 }
 
-fn parse_input_command(line: &str) -> Result<Option<Command>, CommandError> {
+fn parse_input_command(line: &str) -> Result<Option<Command>, crate::ParseCommandError> {
     match crate::parse_command(line)? {
         Some(Command::DstarStart(_)) => Err(CommandError(
             "dstar start is startup-only; exit this CAT session and supply it as the startup command"
                 .to_owned(),
-        )),
+        ).into()),
         command => Ok(command),
     }
 }

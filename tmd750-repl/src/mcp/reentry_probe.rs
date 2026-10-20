@@ -4,9 +4,6 @@
 //! Requires `--approve-live-test`. Each session reads addresses 8..48 and
 //! 327681..327936 only and writes no setting.
 
-mod observer;
-mod workflow;
-
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -24,6 +21,11 @@ use super::{Endpoint, Failure, finish_on_interrupt, write_report};
 use crate::capture::{Artifacts, CaptureKind, Recorder, create_private_file};
 use crate::{AppResult, CommandError, output};
 use workflow::{Captures, Workflow};
+
+mod observer;
+#[cfg(test)]
+mod tests;
+mod workflow;
 
 const SCOPE: &str = "exactly two fixed read-only MCP sessions; TM-D750 / 1.02 / K,2,1; main USB at 9600; fresh Gateway Off before entry and after each exit; reads 8..48 and 327681..327936 only; no settings writes, fill, RF, retry, or restoration";
 // After a failed session the passive observer keeps sampling for this long; no
@@ -43,7 +45,7 @@ pub(crate) struct Request {
 }
 
 impl Request {
-    fn validate(&self, endpoint: &SerialCandidate, baud: u32) -> AppResult<()> {
+    fn validate(&self, endpoint: &SerialCandidate, baud: std::num::NonZeroU32) -> AppResult<()> {
         if !self.approve_live_test {
             return Err(
                 CommandError("mcp reentry-probe requires --approve-live-test".to_owned()).into(),
@@ -140,7 +142,11 @@ impl Reserved {
 /// Returns `CommandError` without opening anything when `--approve-live-test`
 /// is absent, the endpoint is not the pinned main-unit USB endpoint at 9600
 /// baud, or the host is not macOS.
-pub(super) async fn run(endpoint: &SerialCandidate, baud: u32, request: &Request) -> AppResult<()> {
+pub(super) async fn run(
+    endpoint: &SerialCandidate,
+    baud: std::num::NonZeroU32,
+    request: &Request,
+) -> AppResult<()> {
     request.validate(endpoint, baud)?;
     let cancelled = Arc::new(AtomicBool::new(false));
     let artifacts = Artifacts::create(
@@ -215,7 +221,7 @@ pub(super) async fn run(endpoint: &SerialCandidate, baud: u32, request: &Request
 
 async fn run_observed(
     endpoint: &SerialCandidate,
-    baud: u32,
+    baud: std::num::NonZeroU32,
     reserved: Reserved,
     cancelled: &Arc<AtomicBool>,
 ) -> (Workflow, observer::Summary) {
@@ -245,6 +251,3 @@ async fn run_observed(
     }
     (result, observer.stop().await)
 }
-
-#[cfg(test)]
-mod tests;

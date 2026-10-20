@@ -26,13 +26,12 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::capture::{Artifacts, CaptureKind, CaptureTransport, Event, Failure, Recorder};
 use crate::{AppResult, CommandError, output};
+use report::{Endpoint, Outcome, Report, Stage, WorkflowResult};
 
 mod managed;
 mod report;
 #[cfg(test)]
 mod tests;
-
-use report::{Endpoint, Outcome, Report, Stage, WorkflowResult};
 
 /// Timeouts applied to one probe run.
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -96,7 +95,7 @@ impl Request {
     pub(crate) fn validate<'a>(
         &self,
         path: Option<&'a str>,
-        baud: u32,
+        baud: std::num::NonZeroU32,
     ) -> Result<&'a str, CommandError> {
         if !self.approve_live_test {
             return Err(CommandError(
@@ -400,7 +399,7 @@ async fn observe<T: Transport>(
     if !matches!(
         &error,
         RadioError::Timeout {
-            operation: "ID",
+            operation: kenwood_tmd750::TimeoutOperation::Command(kenwood_tmd750::CommandName::Id),
             ..
         }
     ) || !transport.activity().silent_first_exchange()

@@ -4,8 +4,8 @@
 
 use clap as _;
 use dirs_next as _;
-use dstar_gateway as _;
 use dstar_gateway_core as _;
+use kenwood_schema as _;
 use kenwood_tmd750 as _;
 use kenwood_transport as _;
 use mmdvm as _;
@@ -19,7 +19,6 @@ use serde_json as _;
 use thiserror as _;
 use time as _;
 use tokio as _;
-use tracing as _;
 use tracing_appender as _;
 use tracing_subscriber as _;
 
@@ -537,7 +536,7 @@ fn automatic_start_validates_arguments_before_any_endpoint_or_capture() -> TestR
 
 #[cfg(target_os = "macos")]
 #[test]
-fn automatic_start_requires_exact_usb_control_before_bluetooth_opening() -> TestResult {
+fn startup_refusal_precedes_bluetooth_helper_validation_and_capture() -> TestResult {
     let directory = tempfile::tempdir()?;
     let result = Command::new(env!("CARGO_BIN_EXE_tmd750-repl"))
         .current_dir(directory.path())
@@ -546,8 +545,6 @@ fn automatic_start_requires_exact_usb_control_before_bluetooth_opening() -> Test
             "01:23:45:67:89:AB",
             "--bluetooth-helper",
             "/not/a/native/helper",
-            "--control-port",
-            "/not/a/usb/radio",
             "dstar",
             "start",
             "KQ4NIT",
@@ -570,7 +567,7 @@ fn automatic_start_requires_exact_usb_control_before_bluetooth_opening() -> Test
 
 #[cfg(target_os = "macos")]
 #[test]
-fn automatic_start_routes_aliases_case_and_quoted_commands_identically() -> TestResult {
+fn unsupported_start_refuses_aliases_case_and_quoted_commands_before_io() -> TestResult {
     for explicit_bluetooth in [false, true] {
         for command in [
             vec!["dstar", "start", "KQ4NIT", "REF030C"],
@@ -591,17 +588,12 @@ fn automatic_start_routes_aliases_case_and_quoted_commands_identically() -> Test
                     "/not/a/native/helper",
                 ]);
             }
-            let result = process
-                .args(["--control-port", "/not/a/usb/radio"])
-                .args(&command)
-                .output()?;
+            let result = process.args(&command).output()?;
             assert!(!result.status.success(), "{command:?}: {result:?}");
             let stderr = normalized_text(&result.stderr)?;
             assert!(
-                stderr.contains(
-                    "one unambiguous enumerated TM-D750 USB endpoint at /not/a/usb/radio"
-                ),
-                "parsed startup must reach exact USB admission: {command:?}: {stderr}"
+                stderr.contains("no supported D-STAR configuration layout for KenwoodTerminal"),
+                "parsed startup must refuse an unverified configuration before endpoint discovery: {command:?}: {stderr}"
             );
             assert!(!stderr.contains("/not/a/native/helper"), "{stderr}");
             assert_eq!(std::fs::read_dir(directory.path())?.count(), 0);
@@ -611,7 +603,7 @@ fn automatic_start_routes_aliases_case_and_quoted_commands_identically() -> Test
 }
 
 #[test]
-fn automatic_control_and_manual_port_conflict_before_io() -> TestResult {
+fn removed_startup_control_option_is_rejected_before_io() -> TestResult {
     let directory = tempfile::tempdir()?;
     let result = Command::new(env!("CARGO_BIN_EXE_tmd750-repl"))
         .current_dir(directory.path())
@@ -625,11 +617,8 @@ fn automatic_control_and_manual_port_conflict_before_io() -> TestResult {
         .output()?;
     assert!(!result.status.success(), "{result:?}");
     let stderr = normalized_text(&result.stderr)?;
-    assert!(stderr.contains("cannot be used with"), "{stderr}");
-    assert!(
-        stderr.contains("--control-port") && stderr.contains("--port"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("unknown or malformed command"), "{stderr}");
+    assert!(stderr.contains("--control-port"), "{stderr}");
     assert_eq!(std::fs::read_dir(directory.path())?.count(), 0);
     Ok(())
 }
@@ -643,7 +632,7 @@ fn automatic_start_rejects_custom_baud_before_endpoint_discovery() -> TestResult
         let directory = tempfile::tempdir()?;
         let result = Command::new(env!("CARGO_BIN_EXE_tmd750-repl"))
             .current_dir(directory.path())
-            .args(["--baud", "19200", "--control-port", "/not/a/usb/radio"])
+            .args(["--baud", "19200"])
             .args(&command)
             .output()?;
         assert!(!result.status.success(), "{command:?}: {result:?}");
@@ -659,7 +648,7 @@ fn automatic_start_rejects_custom_baud_before_endpoint_discovery() -> TestResult
 }
 
 #[test]
-fn explicit_port_keeps_manual_policy_for_each_accepted_command_form() -> TestResult {
+fn explicit_port_refuses_unverified_configuration_before_opening() -> TestResult {
     for command in [
         vec!["dstar", "start", "KQ4NIT", "REF030C"],
         vec!["D-STAR START KQ4NIT REF030C"],
@@ -672,7 +661,11 @@ fn explicit_port_keeps_manual_policy_for_each_accepted_command_form() -> TestRes
             .output()?;
         assert!(!result.status.success(), "{command:?}: {result:?}");
         let stderr = normalized_text(&result.stderr)?;
-        assert!(stderr.contains("/not/a/manual/port"), "{stderr}");
+        assert!(
+            stderr.contains("no supported D-STAR configuration layout for KenwoodTerminal"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("/not/a/manual/port"), "{stderr}");
         assert!(!stderr.contains("custom --baud requires"), "{stderr}");
         assert!(
             !stderr.contains("USB endpoint") && !stderr.contains("paired"),

@@ -1,5 +1,6 @@
 //! One phase: compare and write pages, exit MCP, wait for the endpoint to
-//! re-enumerate, then reread the pages over a fresh CAT connection.
+//! re-enumerate, then check identity and Gateway over a fresh CAT connection.
+//! Complete-page readback happens within the earlier MCP exchange.
 
 use std::fs::File;
 use std::io;

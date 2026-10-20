@@ -20,6 +20,9 @@ use super::page_apply::{self, PagePlan, PlanKind};
 use super::snapshot::Snapshot;
 use crate::{AppResult, CommandError, output};
 
+#[cfg(test)]
+mod tests;
+
 /// The image span of the page holding the three tables.
 const TABLES: (u32, u32) = (0x800, 0x900);
 
@@ -190,7 +193,7 @@ pub(super) fn run_offline(request: &MicERequest) -> Option<AppResult<()>> {
 
 pub(super) async fn run_selected(
     endpoint: &SerialCandidate,
-    baud: u32,
+    baud: std::num::NonZeroU32,
     request: &MicERequest,
 ) -> AppResult<()> {
     match &request.command {
@@ -200,7 +203,11 @@ pub(super) async fn run_selected(
     }
 }
 
-async fn run_apply(endpoint: &SerialCandidate, baud: u32, request: &ApplyRequest) -> AppResult<()> {
+async fn run_apply(
+    endpoint: &SerialCandidate,
+    baud: std::num::NonZeroU32,
+    request: &ApplyRequest,
+) -> AppResult<()> {
     page_apply::admit_usb(endpoint, baud, PlanKind::MicE)?;
     let snapshot = Snapshot::load_for_usb_write(&request.edit.backup)?;
     let prepared = request.edit.prepare(&snapshot)?;
@@ -294,6 +301,3 @@ fn description(prepared: &Prepared) -> Map<String, Value> {
     );
     description
 }
-
-#[cfg(test)]
-mod tests;

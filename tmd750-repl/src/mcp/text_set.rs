@@ -1,12 +1,9 @@
 //! Updates PM1's name, PM-Off MY1 or one channel's name, and no other field.
 //!
 //! One MCP session compares the whole page, writes it and reads it back; a
-//! second CAT session then verifies the identity tuple and Gateway Off. Nothing
-//! is rolled back automatically.
-
-mod journal;
-mod target;
-mod workflow;
+//! second CAT session verifies identity. USB MY1 additionally requires Gateway
+//! Off; native Bluetooth requires Gateway Off for every text field. Nothing is
+//! rolled back automatically.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -36,6 +33,14 @@ use crate::{AppResult, CommandError, native, output};
 use journal::UpdateJournal;
 use target::{PreparedUpdate, Update, UpdateKind};
 use workflow::{SessionCaptures, WorkflowResult};
+
+mod journal;
+#[cfg(test)]
+mod my1_tests;
+mod target;
+#[cfg(test)]
+mod tests;
+mod workflow;
 
 /// Arguments of `mcp text set`: the setting, its expected and new text, and
 /// the capture path.
@@ -91,7 +96,7 @@ impl SetTarget {
     }
 }
 
-fn parse_channel(value: &str) -> Result<PhysicalChannel, String> {
+fn parse_channel(value: &str) -> Result<PhysicalChannel, crate::cat::ParseError> {
     crate::cat::parse_address(value).map(PhysicalChannel::from_address)
 }
 
@@ -211,7 +216,11 @@ impl SetRequest {
             .map_or_else(|| "cleared".to_owned(), |value| format!("{value:?}"))
     }
 
-    fn prepare(&self, endpoint: &SerialCandidate, baud: u32) -> AppResult<PreparedUpdate> {
+    fn prepare(
+        &self,
+        endpoint: &SerialCandidate,
+        baud: std::num::NonZeroU32,
+    ) -> AppResult<PreparedUpdate> {
         let change = self.requested_change()?;
         if !endpoint.is_tmd750()
             || !matches!(endpoint.pid, Some(TMD750_MAIN_PID | TMD750_PANEL_PID))
@@ -394,7 +403,7 @@ fn verification_captures(directory: &Path, failed: &Arc<AtomicBool>) -> AppResul
 }
 
 /// Report format of a text update over native Bluetooth, for every setting.
-const NATIVE_REPORT_FORMAT: u8 = 12;
+const NATIVE_REPORT_FORMAT: u8 = 16;
 
 /// Validate the request and run the update over the selected USB endpoint.
 ///
@@ -402,7 +411,7 @@ const NATIVE_REPORT_FORMAT: u8 = 12;
 /// opened.
 pub(super) async fn run(
     endpoint: &SerialCandidate,
-    baud: u32,
+    baud: std::num::NonZeroU32,
     request: &SetRequest,
 ) -> AppResult<()> {
     let prepared = request.prepare(endpoint, baud)?;
@@ -568,9 +577,3 @@ async fn run_prepared(
         ))))
     }
 }
-
-#[cfg(test)]
-mod tests;
-
-#[cfg(test)]
-mod my1_tests;

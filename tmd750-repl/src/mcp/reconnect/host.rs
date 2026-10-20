@@ -118,7 +118,7 @@ impl<B: Backend> ControlHost for SettleHost<'_, B> {
     fn open(
         &mut self,
         endpoint: &SerialCandidate,
-        _baud: u32,
+        _baud: std::num::NonZeroU32,
     ) -> Result<Self::Connection, TransportError> {
         Err(TransportError::Open {
             path: endpoint.path.clone(),
@@ -199,7 +199,7 @@ impl<B: Backend> ControlHost for RecordingHost<'_, B> {
     fn open(
         &mut self,
         endpoint: &SerialCandidate,
-        baud: u32,
+        baud: std::num::NonZeroU32,
     ) -> Result<Self::Connection, TransportError> {
         let recorder = self.recorder.as_mut().ok_or_else(transcript_held)?;
         recorder.record(LifecycleEvent::OpenRequested {

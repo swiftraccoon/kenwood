@@ -27,6 +27,9 @@ use std::fs::File;
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
 
+#[cfg(test)]
+mod tests;
+
 #[derive(Serialize)]
 struct AssignmentEvidence {
     field: &'static str,
@@ -59,7 +62,7 @@ fn description(plan: &MenuUpdatePlan) -> AppResult<Map<String, Value>> {
 /// are synchronized.
 pub(super) async fn run(
     endpoint: &SerialCandidate,
-    baud: u32,
+    baud: std::num::NonZeroU32,
     request: &ApplyRequest,
 ) -> AppResult<()> {
     page_apply::admit_usb(endpoint, baud, PlanKind::Menu)?;
@@ -121,6 +124,3 @@ async fn run_workflow(
     )
     .await
 }
-
-#[cfg(test)]
-mod tests;

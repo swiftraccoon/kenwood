@@ -30,7 +30,7 @@ fn mode_labels_keep_the_report_vocabulary() {
         (OperatingMode::Am, "AM"),
         (OperatingMode::Nfm, "NFM"),
         (OperatingMode::Dr, "DR"),
-        (OperatingMode::Unnamed(7), "unqualified value 7"),
+        (OperatingMode::from(7), "unqualified value 7"),
     ] {
         assert_eq!(cat::mode_label(mode), label, "{mode:?}");
     }
@@ -44,7 +44,7 @@ fn host_retirement_requires_positive_native_evidence() -> TestResult {
         BluetoothCloseFailure::ForcedTermination,
         BluetoothCloseFailure::HelperExited { code: Some(89) },
     ] {
-        let failure = OpenFailure::from_error(&TransportError::BluetoothClose { failure: cleanup });
+        let failure = OpenFailure::from_error(TransportError::BluetoothClose { failure: cleanup });
         assert!(
             !failure.host_retirement_confirmed(),
             "bare cleanup cannot prove application-owner retirement: {cleanup:?}"
@@ -55,7 +55,7 @@ fn host_retirement_requires_positive_native_evidence() -> TestResult {
             Some(&serde_json::Value::Bool(false))
         );
     }
-    let reaped = OpenFailure::from_error(&TransportError::BluetoothOpenWithCleanup {
+    let reaped = OpenFailure::from_error(TransportError::BluetoothOpenWithCleanup {
         stage: BluetoothOpenStage::RfcommDeadline,
         cleanup: BluetoothCloseFailure::ChannelUnconfirmed,
     });
@@ -72,7 +72,7 @@ fn host_retirement_requires_positive_native_evidence() -> TestResult {
         io::Error::other(reaped.to_string()),
         io::Error::other("unframed helper failure"),
     ] {
-        assert!(!OpenFailure::from_error(&error).host_retirement_confirmed());
+        assert!(!OpenFailure::from_error(error).host_retirement_confirmed());
     }
     let mut late = reaped;
     late.close_error = Some(Failure::from_error(&io::Error::other("late close failed")));
@@ -97,9 +97,9 @@ fn selected_retry_uses_native_stage_and_independent_cleanup_evidence() {
         BluetoothOpenStage::RfcommDeadline,
         BluetoothOpenStage::RfcommEndpoint,
     ] {
-        let clean = OpenFailure::from_error(&TransportError::BluetoothOpen { stage });
+        let clean = OpenFailure::from_error(TransportError::BluetoothOpen { stage });
         assert!(clean.retry_allowed(), "eligible opening stage {stage:?}");
-        let combined = OpenFailure::from_error(&TransportError::BluetoothOpenWithCleanup {
+        let combined = OpenFailure::from_error(TransportError::BluetoothOpenWithCleanup {
             stage,
             cleanup: BluetoothCloseFailure::ChannelUnconfirmed,
         });
@@ -112,9 +112,9 @@ fn selected_retry_uses_native_stage_and_independent_cleanup_evidence() {
         BluetoothOpenStage::StartupDeadline,
         BluetoothOpenStage::ServiceResolution,
     ] {
-        let clean = OpenFailure::from_error(&TransportError::BluetoothOpen { stage });
+        let clean = OpenFailure::from_error(TransportError::BluetoothOpen { stage });
         assert!(!clean.retry_allowed(), "ineligible opening stage {stage:?}");
-        let combined = OpenFailure::from_error(&TransportError::BluetoothOpenWithCleanup {
+        let combined = OpenFailure::from_error(TransportError::BluetoothOpenWithCleanup {
             stage,
             cleanup: BluetoothCloseFailure::ChannelUnconfirmed,
         });
@@ -128,7 +128,7 @@ fn selected_retry_uses_native_stage_and_independent_cleanup_evidence() {
         BluetoothCloseFailure::ReapPending,
         BluetoothCloseFailure::HelperExited { code: Some(89) },
     ] {
-        let combined = OpenFailure::from_error(&TransportError::BluetoothOpenWithCleanup {
+        let combined = OpenFailure::from_error(TransportError::BluetoothOpenWithCleanup {
             stage: BluetoothOpenStage::RfcommDeadline,
             cleanup,
         });
@@ -141,14 +141,15 @@ fn selected_retry_cannot_be_authorized_by_text_or_unrelated_cleanup() {
     let bare_cleanup = TransportError::BluetoothClose {
         failure: BluetoothCloseFailure::ChannelUnconfirmed,
     };
-    assert!(!OpenFailure::from_error(&bare_cleanup).retry_allowed());
+    let cleanup_record = Failure::from_error(&bare_cleanup);
+    assert!(!OpenFailure::from_error(bare_cleanup).retry_allowed());
     let eligible = TransportError::BluetoothOpen {
         stage: BluetoothOpenStage::RfcommDeadline,
     };
-    assert!(!OpenFailure::from_error(&io::Error::other(eligible.to_string())).retry_allowed());
-    assert!(!OpenFailure::from_error(&TransportError::BluetoothOpenInterrupted).retry_allowed());
-    let mut late_owner = OpenFailure::from_error(&eligible);
-    late_owner.close_error = Some(Failure::from_error(&bare_cleanup));
+    assert!(!OpenFailure::from_error(io::Error::other(eligible.to_string())).retry_allowed());
+    assert!(!OpenFailure::from_error(TransportError::BluetoothOpenInterrupted).retry_allowed());
+    let mut late_owner = OpenFailure::from_error(eligible);
+    late_owner.close_error = Some(cleanup_record);
     assert!(
         !late_owner.retry_allowed(),
         "late owner cleanup is not opening evidence"
@@ -597,11 +598,15 @@ async fn late_close_timeout_remains_independent_and_still_drops_owner() -> TestR
 
 #[tokio::test]
 async fn worker_error_preserves_its_cause_without_inventing_a_close() -> TestResult {
+    #[derive(Debug, thiserror::Error)]
+    #[error("scripted open failure")]
+    struct WorkerFailure;
+
     let cancelled = AtomicBool::new(false);
     let result = open_worker::<ObservedConnection, _>(&cancelled, TEST_BOUND, |_cancellation| {
         Err(TransportError::Open {
             path: "synthetic native endpoint".to_owned(),
-            source: io::Error::other("scripted open failure"),
+            source: io::Error::other(WorkerFailure),
         })
     })
     .await;
@@ -613,6 +618,24 @@ async fn worker_error_preserves_its_cause_without_inventing_a_close() -> TestRes
             .iter()
             .any(|cause| cause == "scripted open failure"),
         "retain worker cause"
+    );
+    let source = std::error::Error::source(&failure).ok_or("original open source missing")?;
+    let transport = source
+        .downcast_ref::<TransportError>()
+        .ok_or("original transport error flattened")?;
+    assert!(
+        matches!(transport, TransportError::Open { source, .. }
+            if matches!(source.get_ref(), Some(error) if error.is::<WorkerFailure>())),
+        "retain the original typed I/O payload"
+    );
+    let serialized = serde_json::to_value(&failure)?;
+    assert_eq!(
+        serialized
+            .as_object()
+            .ok_or("failure must be an object")?
+            .len(),
+        4,
+        "owned error storage does not change the report shape"
     );
     assert!(failure.close_error.is_none(), "no successful owner exists");
     Ok(())
@@ -716,6 +739,11 @@ async fn worker_join_failure_is_an_open_failure_without_a_fake_close() -> TestRe
     assert!(
         failure.error.message.contains("panicked"),
         "retain the failed join"
+    );
+    assert!(
+        matches!(std::error::Error::source(&failure),
+            Some(source) if source.is::<tokio::task::JoinError>()),
+        "retain the original failed join"
     );
     assert!(failure.close_error.is_none(), "no successful owner exists");
     Ok(())

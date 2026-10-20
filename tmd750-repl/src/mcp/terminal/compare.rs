@@ -3,8 +3,6 @@
 //! Labels come from a fixed catalog of field locations; an address outside it
 //! stays in the report as an unclassified change.
 
-mod catalog;
-
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -19,6 +17,10 @@ use self::catalog::{Catalog, FieldLocation};
 use super::super::{IdentityEvidence, write_report};
 use super::{Snapshot, UsbInterface, assess_snapshot, parse_slot};
 use crate::{AppResult, CommandError, capture, output};
+
+mod catalog;
+#[cfg(test)]
+mod tests;
 
 /// Arguments of `mcp terminal compare`: the two backups and the report path.
 #[derive(Debug, Args)]
@@ -95,10 +97,10 @@ impl From<ReflectorTerminalPreflight> for AssessmentEvidence {
     fn from(value: ReflectorTerminalPreflight) -> Self {
         Self::Decoded {
             captured_active_slot: value.captured_active_slot.index(),
-            usb_function: value.usb_function.to_string(),
-            gateway_route: value.gateway_route.to_string(),
-            gateway_mode: value.gateway_mode.to_string(),
-            terminal_mode: value.terminal_mode.to_string(),
+            usb_function: crate::report_labels::usb_function(value.usb_function).to_owned(),
+            gateway_route: crate::report_labels::gateway_route(value.gateway_route).to_owned(),
+            gateway_mode: crate::report_labels::gateway_mode(value.gateway_mode).to_owned(),
+            terminal_mode: crate::report_labels::terminal_mode(value.terminal_mode).to_owned(),
             selected_my_entry: value.selected_my_callsign.index() + 1,
             my_callsign: value.my_callsign,
             rpt1: value.rpt1,
@@ -150,19 +152,32 @@ fn snapshot_evidence(
 /// file's contents.
 fn load_snapshot(path: &Path, side: &str) -> AppResult<Snapshot> {
     Snapshot::load(path).map_err(|error| {
-        let detail = match (
-            error.downcast_ref::<std::io::Error>(),
-            error.downcast_ref::<serde_json::Error>(),
-        ) {
-            (Some(error), _) => format!("file access failed ({:?})", error.kind()),
-            (_, Some(error)) => format!(
-                "invalid report data at line {}, column {} ({:?})",
-                error.line(), error.column(), error.classify()
-            ),
-            _ => "requires a regular, size-bounded, complete successful backup with valid identity and coverage".to_owned(),
-        };
-        CommandError(format!("{side} report rejected: {detail}. Captured values are not displayed.")).into()
+        let detail = redacted_load_failure(error.as_ref());
+        CommandError(format!(
+            "{side} report rejected: {detail}. Captured values are not displayed."
+        ))
+        .into()
     })
+}
+
+fn redacted_load_failure(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut source = Some(error);
+    while let Some(error) = source {
+        if let Some(error) = error.downcast_ref::<std::io::Error>() {
+            return format!("file access failed ({:?})", error.kind());
+        }
+        if let Some(error) = error.downcast_ref::<serde_json::Error>() {
+            return format!(
+                "invalid report data at line {}, column {} ({:?})",
+                error.line(),
+                error.column(),
+                error.classify()
+            );
+        }
+        source = error.source();
+    }
+    "requires a regular, size-bounded, complete successful backup with valid identity and coverage"
+        .to_owned()
 }
 
 fn build_report(request: &CompareRequest) -> AppResult<ComparisonReport> {
@@ -212,7 +227,10 @@ fn build_report(request: &CompareRequest) -> AppResult<ComparisonReport> {
         operation: "terminal_configuration_comparison",
         software_version: env!("CARGO_PKG_VERSION"),
         requested_slot: request.slot.index(),
-        requested_interface: TerminalUsbRoute::from(request.interface).to_string(),
+        requested_interface: crate::report_labels::usb_route(TerminalUsbRoute::from(
+            request.interface,
+        ))
+        .to_owned(),
         before: snapshot_evidence(request.before.clone(), &before, request),
         after: snapshot_evidence(request.after.clone(), &after, request),
         compared_pages: diff.compared_pages(),
@@ -289,6 +307,3 @@ pub(super) fn run(request: &CompareRequest) -> AppResult<()> {
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod tests;

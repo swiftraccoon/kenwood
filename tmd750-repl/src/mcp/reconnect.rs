@@ -7,9 +7,6 @@
 //! report. Nothing here re-enters MCP, writes a setting, or reopens a
 //! transport.
 
-mod host;
-mod readiness;
-
 pub(crate) use readiness::{ReadinessVerification, verify_readiness, verify_readiness_gateway_off};
 
 use std::fs::File;
@@ -32,6 +29,15 @@ use self::host::SettleHost;
 use super::IdentityEvidence;
 use super::link::NativeVerification;
 use crate::capture::{Failure, Recorder, TranscriptSummary};
+
+#[cfg(test)]
+#[path = "reconnect/gateway_tests.rs"]
+mod gateway_tests;
+mod host;
+mod readiness;
+#[cfg(test)]
+#[path = "reconnect/readiness_tests.rs"]
+mod readiness_tests;
 
 /// Why an endpoint did not settle within the budget.
 #[derive(Debug)]
@@ -71,7 +77,17 @@ impl std::fmt::Display for SettleFailure {
     }
 }
 
-impl std::error::Error for SettleFailure {}
+impl std::error::Error for SettleFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::EndpointRejected(error) => Some(error),
+            Self::Enumeration(error) => Some(error),
+            Self::Capture(error) => Some(error),
+            Self::Readiness(error) => Some(error),
+            Self::Cancelled | Self::BudgetExhausted => None,
+        }
+    }
+}
 
 /// Host operations a verification needs: open, enumerate, clock and wait.
 ///
@@ -84,7 +100,7 @@ pub(crate) trait Backend: Send {
     fn open(
         &mut self,
         endpoint: &SerialCandidate,
-        baud: u32,
+        baud: std::num::NonZeroU32,
     ) -> Result<Self::Connection, TransportError>;
     /// Observe port metadata without opening any port.
     fn enumerate(&mut self) -> Result<Vec<SerialCandidate>, TransportError>;
@@ -115,7 +131,7 @@ impl Backend for SystemBackend {
     fn open(
         &mut self,
         endpoint: &SerialCandidate,
-        baud: u32,
+        baud: std::num::NonZeroU32,
     ) -> Result<Self::Connection, TransportError> {
         open_serial(&endpoint.path, baud)
     }
@@ -375,16 +391,31 @@ impl PostExit {
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum LifecycleEvent<'a> {
-    WaitRequested { milliseconds: u64 },
+    WaitRequested {
+        milliseconds: u64,
+    },
     WaitCompleted,
     EnumerationRequested,
-    EnumerationCompleted { candidates: &'a [ObservedEndpoint] },
-    EnumerationFailed { error: Failure },
-    EndpointRejected { error: Failure },
-    OpenRequested { path: &'a str, baud: u32 },
+    EnumerationCompleted {
+        candidates: &'a [ObservedEndpoint],
+    },
+    EnumerationFailed {
+        error: Failure,
+    },
+    EndpointRejected {
+        error: Failure,
+    },
+    OpenRequested {
+        path: &'a str,
+        baud: std::num::NonZeroU32,
+    },
     OpenCompleted,
-    OpenFailed { error: Failure },
-    EndpointSettled { quiet_milliseconds: u64 },
+    OpenFailed {
+        error: Failure,
+    },
+    EndpointSettled {
+        quiet_milliseconds: u64,
+    },
 }
 
 fn milliseconds(duration: Duration) -> u64 {
@@ -490,14 +521,6 @@ pub(super) async fn await_settled_endpoint(
 }
 
 #[cfg(test)]
-#[path = "reconnect/gateway_tests.rs"]
-mod gateway_tests;
-
-#[cfg(test)]
-#[path = "reconnect/readiness_tests.rs"]
-mod readiness_tests;
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
@@ -559,7 +582,7 @@ mod tests {
         fn open(
             &mut self,
             _endpoint: &SerialCandidate,
-            _baud: u32,
+            _baud: std::num::NonZeroU32,
         ) -> Result<Self::Connection, TransportError> {
             self.opens += 1;
             (self.on_open)();
@@ -617,7 +640,7 @@ mod tests {
         let result = verify_readiness(
             &mut backend,
             &endpoint(),
-            9600,
+            kenwood_tmd750::transport::DEFAULT_BAUD,
             &identity()?,
             recorder,
             &AtomicBool::new(false),
@@ -647,7 +670,7 @@ mod tests {
         let result = verify_readiness(
             &mut backend,
             &endpoint(),
-            9600,
+            kenwood_tmd750::transport::DEFAULT_BAUD,
             &identity()?,
             recorder,
             &user_cancelled,
@@ -691,7 +714,7 @@ mod tests {
         let result = verify_readiness(
             &mut backend,
             &endpoint(),
-            9600,
+            kenwood_tmd750::transport::DEFAULT_BAUD,
             &identity()?,
             recorder,
             &AtomicBool::new(false),
@@ -719,7 +742,7 @@ mod tests {
         let result = verify_readiness(
             &mut backend,
             &endpoint(),
-            9600,
+            kenwood_tmd750::transport::DEFAULT_BAUD,
             &identity()?,
             recorder,
             &AtomicBool::new(false),

@@ -62,9 +62,9 @@ impl UpdateKind {
 
     pub(super) const fn format_version(self) -> u8 {
         match self {
-            Self::Pm1Name => 9,
-            Self::PmOffMy1 => 10,
-            Self::ChannelName => 11,
+            Self::Pm1Name => 13,
+            Self::PmOffMy1 => 14,
+            Self::ChannelName => 15,
         }
     }
 
@@ -79,13 +79,13 @@ impl UpdateKind {
     pub(super) const fn scope(self) -> &'static str {
         match self {
             Self::Pm1Name => {
-                "global PM1 only; verification targets MCP exit/re-entry, not a power cycle; the endpoint and CAT tuple name the model and firmware, not the physical unit"
+                "global PM1 only; full-page comparison and readback, acknowledged MCP exit, fresh identity, and one second MCP verification"
             }
             Self::PmOffMy1 => {
-                "MY1 in PM Off with Gateway Off only; verification targets MCP exit/re-entry, not a power cycle or Terminal acceptance; the endpoint and CAT tuple name the model and firmware, not the physical unit"
+                "MY1 in PM Off with Gateway Off only; full-page comparison and readback, acknowledged MCP exit, fresh identity and Gateway Off, and one second MCP verification"
             }
             Self::ChannelName => {
-                "one channel's sixteen name bytes on its complete name-table page; verification targets MCP exit/re-entry, not a power cycle or display rendering; the endpoint and CAT tuple name the model and firmware, not the physical unit"
+                "one channel's sixteen name bytes on its complete name-table page; full-page comparison and readback, acknowledged MCP exit, fresh identity, and one second MCP verification"
             }
         }
     }

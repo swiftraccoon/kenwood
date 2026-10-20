@@ -1,8 +1,9 @@
 //! Tests for the offline Terminal commands over synthetic backup fixtures.
 
 use super::*;
+use kenwood_schema::FieldValue;
 use kenwood_tmd750::MemoryImage;
-use kenwood_tmd750::memory::{FieldValue, TerminalFinding, menu_field};
+use kenwood_tmd750::memory::{TerminalFinding, menu_field};
 use std::path::Path;
 
 type TestResult = AppResult<()>;

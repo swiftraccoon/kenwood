@@ -97,7 +97,7 @@ fn report_discriminants_separate_my1_updates_from_pm1() {
             UpdateKind::PmOffMy1.format_version(),
             UpdateKind::PmOffMy1.operation()
         ),
-        (10, "my1_callsign_update"),
+        (14, "my1_callsign_update"),
         "MY1 reports must identify their distinct scope and Gateway verification contract"
     );
     assert_eq!(
@@ -105,7 +105,7 @@ fn report_discriminants_separate_my1_updates_from_pm1() {
             UpdateKind::Pm1Name.format_version(),
             UpdateKind::Pm1Name.operation()
         ),
-        (9, "pm1_name_update"),
+        (13, "pm1_name_update"),
         "PM1 reports keep their own discriminant"
     );
 }
@@ -280,7 +280,10 @@ fn no_op_and_unqualified_endpoint_fail_before_backup_access() -> TestResult {
     }
     assert!(
         candidate
-            .prepare(&endpoint(), 115_200)
+            .prepare(
+                &endpoint(),
+                std::num::NonZeroU32::new(115_200).ok_or("nonzero baud")?
+            )
             .is_err_and(|error| error.to_string().contains("9600 baud")),
         "MY1 must reject unqualified baud before opening the backup"
     );
@@ -478,6 +481,10 @@ fn incomplete_failed_and_update_reports_cannot_be_used_as_backups() -> TestResul
         ("/format_version", Value::from(6)),
         ("/format_version", Value::from(9)),
         ("/format_version", Value::from(10)),
+        ("/format_version", Value::from(13)),
+        ("/format_version", Value::from(14)),
+        ("/format_version", Value::from(15)),
+        ("/format_version", Value::from(16)),
         ("/operation", Value::from("text_update")),
         ("/backup/complete_configuration", Value::Bool(false)),
         ("/transcript/complete", Value::Bool(false)),

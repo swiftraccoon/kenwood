@@ -189,7 +189,7 @@ async fn admit<T: Transport>(
             None,
         ),
         Err(error) => {
-            let mut failure = OpenFailure::from_error(&error);
+            let mut failure = OpenFailure::from_error(error);
             failure.record_close(super::close(&mut transport).await);
             (Owner::Retired(transport.into_recorder()), Some(failure))
         }
@@ -227,7 +227,7 @@ async fn attempt<B: Backend>(
         .synchronize()
         .and_then(|()| interrupted(cancelled, deadline))
     {
-        evidence.error = Some(OpenFailure::before_open(&error));
+        evidence.error = Some(OpenFailure::before_open(error));
         return (Owner::Retired(recorder), evidence);
     }
     evidence.started = true;

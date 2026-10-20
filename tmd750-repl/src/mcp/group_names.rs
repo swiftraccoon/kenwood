@@ -17,6 +17,9 @@ use super::page_apply::{self, PagePlan, PlanKind};
 use super::snapshot::Snapshot;
 use crate::{AppResult, CommandError, output};
 
+#[cfg(test)]
+mod tests;
+
 /// Group-name subcommand: an offline listing or preview, or one guarded live
 /// write.
 #[derive(Debug, Parser)]
@@ -153,7 +156,7 @@ pub(super) fn run_offline(request: &GroupNamesRequest) -> Option<AppResult<()>> 
 
 pub(super) async fn run_selected(
     endpoint: &SerialCandidate,
-    baud: u32,
+    baud: std::num::NonZeroU32,
     request: &GroupNamesRequest,
 ) -> AppResult<()> {
     match &request.command {
@@ -163,7 +166,11 @@ pub(super) async fn run_selected(
     }
 }
 
-async fn run_apply(endpoint: &SerialCandidate, baud: u32, request: &ApplyRequest) -> AppResult<()> {
+async fn run_apply(
+    endpoint: &SerialCandidate,
+    baud: std::num::NonZeroU32,
+    request: &ApplyRequest,
+) -> AppResult<()> {
     page_apply::admit_usb(endpoint, baud, PlanKind::GroupNames)?;
     let snapshot = Snapshot::load_for_usb_write(&request.names.backup)?;
     let prepared = request.names.prepare(&snapshot)?;
@@ -252,6 +259,3 @@ fn description(prepared: &Prepared) -> Map<String, Value> {
     let _previous = description.insert("group_names".to_owned(), Value::Array(changes));
     description
 }
-
-#[cfg(test)]
-mod tests;

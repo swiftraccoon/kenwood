@@ -2,8 +2,8 @@
 //!
 //! The first connection compares each complete page, writes the changed ones,
 //! reads each back and exits MCP; the fresh check reads the identity tuple and
-//! Gateway Off, with one open on the main-unit endpoint, the bounded
-//! silent-`ID` retry on the operation-panel endpoint, or one reopen of the
+//! Gateway Off, with the library's bounded silent-`ID` readiness retry on either
+//! USB role, or one new connection on the
 //! pinned channel over native Bluetooth. Persistence across a later MCP
 //! session or a power cycle is not checked. Menu updates, repeater-list edits
 //! and channel-name updates share this workflow; each supplies its
@@ -33,6 +33,9 @@ use super::{
 use crate::capture::{Artifacts, CaptureKind, Recorder, TranscriptSummary, create_private_file};
 use crate::native::opening::History;
 use crate::{AppResult, CommandError, output};
+
+#[cfg(test)]
+mod tests;
 
 /// The operations that run as page plans, with their report vocabulary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -535,7 +538,7 @@ async fn operate(
     result.gateway_mode = Some(match gateway {
         DvGatewayMode::Off => 0,
         DvGatewayMode::Terminal => 2,
-        DvGatewayMode::Unnamed(raw) => raw,
+        DvGatewayMode::Unnamed(raw) => raw.get(),
     });
     if gateway != DvGatewayMode::Off {
         return Err(CommandError(kind.gateway_refusal().to_owned()).into());
@@ -763,7 +766,11 @@ struct Report {
 ///
 /// Returns `CommandError` on a non-Unix host, or when the endpoint is not a
 /// TM-D750 main-unit or operation-panel USB endpoint at 9600 baud.
-pub(super) fn admit_usb(endpoint: &SerialCandidate, baud: u32, kind: PlanKind) -> AppResult<()> {
+pub(super) fn admit_usb(
+    endpoint: &SerialCandidate,
+    baud: std::num::NonZeroU32,
+    kind: PlanKind,
+) -> AppResult<()> {
     if !cfg!(unix) {
         return Err(CommandError(format!(
             "{}s require Unix private files and directory synchronization",
@@ -787,7 +794,7 @@ pub(super) fn admit_usb(endpoint: &SerialCandidate, baud: u32, kind: PlanKind) -
 /// Run `plan` over the USB endpoint that [`admit_usb`] admitted.
 pub(super) async fn run_usb(
     endpoint: &SerialCandidate,
-    baud: u32,
+    baud: std::num::NonZeroU32,
     plan: &PagePlan<'_>,
     output: Option<&Path>,
     source_backup: &Path,
@@ -898,6 +905,3 @@ pub(super) async fn run_prepared(
         .into())
     }
 }
-
-#[cfg(test)]
-mod tests;

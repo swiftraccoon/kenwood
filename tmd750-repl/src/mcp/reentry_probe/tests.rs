@@ -46,32 +46,44 @@ fn approval_and_explicit_endpoint_are_both_required() -> TestResult {
 }
 
 #[test]
-fn wrong_endpoint_baud_and_missing_approval_refuse_preparation() {
+fn wrong_endpoint_baud_and_missing_approval_refuse_preparation() -> TestResult {
     let mut request = Request {
         approve_live_test: true,
         output: None,
     };
     let mut selected = endpoint();
     assert!(
-        request.validate(&selected, 115_200).is_err(),
+        request
+            .validate(
+                &selected,
+                std::num::NonZeroU32::new(115_200).ok_or("nonzero baud")?
+            )
+            .is_err(),
         "the experiment pins 9600 baud"
     );
     selected.pid = Some(TMD750_PANEL_PID);
     assert!(
-        request.validate(&selected, 9600).is_err(),
+        request
+            .validate(&selected, kenwood_tmd750::transport::DEFAULT_BAUD)
+            .is_err(),
         "the panel is outside this control's scope"
     );
     selected = endpoint();
     selected.vid = None;
     assert!(
-        request.validate(&selected, 9600).is_err(),
+        request
+            .validate(&selected, kenwood_tmd750::transport::DEFAULT_BAUD)
+            .is_err(),
         "missing USB metadata must fail closed"
     );
     request.approve_live_test = false;
     assert!(
-        request.validate(&endpoint(), 9600).is_err(),
+        request
+            .validate(&endpoint(), kenwood_tmd750::transport::DEFAULT_BAUD)
+            .is_err(),
         "programmatic construction cannot bypass approval"
     );
+    Ok(())
 }
 
 #[test]

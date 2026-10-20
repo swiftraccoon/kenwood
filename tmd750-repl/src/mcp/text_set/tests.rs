@@ -201,7 +201,10 @@ fn endpoint_and_baud_policy_precede_backup_access() -> TestResult {
     }
     assert!(
         candidate
-            .prepare(&endpoint(), 115_200)
+            .prepare(
+                &endpoint(),
+                std::num::NonZeroU32::new(115_200).ok_or("nonzero baud")?
+            )
             .is_err_and(|error| error.to_string().contains("9600 baud")),
         "wrong baud must be refused before file access"
     );

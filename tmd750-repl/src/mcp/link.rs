@@ -139,12 +139,16 @@ pub(super) trait WriteLink {
 pub(super) struct UsbLink<'a, B> {
     backend: &'a mut B,
     endpoint: &'a SerialCandidate,
-    baud: u32,
+    baud: std::num::NonZeroU32,
 }
 
 impl<'a, B: Backend> UsbLink<'a, B> {
     /// A link over `endpoint` through `backend`.
-    pub(super) const fn new(backend: &'a mut B, endpoint: &'a SerialCandidate, baud: u32) -> Self {
+    pub(super) const fn new(
+        backend: &'a mut B,
+        endpoint: &'a SerialCandidate,
+        baud: std::num::NonZeroU32,
+    ) -> Self {
         Self {
             backend,
             endpoint,

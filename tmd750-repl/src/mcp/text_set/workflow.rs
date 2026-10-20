@@ -1,7 +1,8 @@
 //! Runs the write session, then the confirmation session.
 //!
 //! The first session compares the page, writes it and reads it back; the second
-//! reopens on a fresh connection and re-reads the page.
+//! verifies identity on a fresh CAT connection. USB MY1 and all native text
+//! updates additionally require Gateway Off on that connection.
 
 use std::fs::File;
 use std::num::NonZeroU64;
@@ -24,6 +25,11 @@ use super::target::{Update, UpdateKind};
 use crate::capture::{CaptureTransport, Recorder, TranscriptSummary};
 use crate::native::opening::History;
 use crate::output;
+
+#[cfg(all(test, unix))]
+mod my1_tests;
+#[cfg(all(test, unix))]
+mod tests;
 
 #[derive(Debug)]
 pub(super) struct SessionCaptures {
@@ -146,7 +152,7 @@ impl From<DvGatewayMode> for GatewayEvidence {
         match mode {
             DvGatewayMode::Off => Self::Off { raw: 0 },
             DvGatewayMode::Terminal => Self::Terminal { raw: 2 },
-            DvGatewayMode::Unnamed(raw) => Self::Unqualified { raw },
+            DvGatewayMode::Unnamed(raw) => Self::Unqualified { raw: raw.get() },
         }
     }
 }
@@ -326,7 +332,7 @@ impl WorkflowResult {
 const fn exit_guidance(exit: &ExitDisposition) -> Option<&'static str> {
     match exit {
         ExitDisposition::RecoveryRequired | ExitDisposition::NotAcknowledged => Some(
-            "Programming exit is unconfirmed. Retain the journal and transcripts, and fully power-cycle the radio before reconnecting. A power cycle does not report which text is stored; do not retry or restore blindly.",
+            "Programming exit is unconfirmed. Stop using this connection and retain the journal and transcripts. No recovery commands or automatic retry will be sent.",
         ),
         ExitDisposition::NotEntered | ExitDisposition::Acknowledged => None,
     }
@@ -544,9 +550,3 @@ fn verification_identity<'a>(
             .ok_or(SkipReason::OriginalUpdateIncomplete)
     }
 }
-
-#[cfg(all(test, unix))]
-mod tests;
-
-#[cfg(all(test, unix))]
-mod my1_tests;

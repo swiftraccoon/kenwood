@@ -167,7 +167,7 @@ fn partial_write_and_write_zero_leave_failed_records_uncounted() -> TestResult {
             .ok_or("original write error missing")?
             .message;
         recorder.record(Event::CloseCompleted);
-        recorder.fail(&io::Error::other("later failure"));
+        let _retained = recorder.fail(io::Error::other("later failure"));
         assert_eq!(recorder.writer.writes, calls);
         assert_eq!(recorder.writer.inner.bytes.len(), 7);
         assert_eq!(recorder.writer.flushes, 0);

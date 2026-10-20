@@ -125,10 +125,10 @@ impl Backend for FreshBackend {
     fn open(
         &mut self,
         selected: &SerialCandidate,
-        baud: u32,
+        baud: std::num::NonZeroU32,
     ) -> Result<Self::Connection, TransportError> {
         assert_eq!(selected.path, endpoint().path);
-        assert_eq!(baud, 9600);
+        assert_eq!(baud.get(), 9600);
         self.opens += 1;
         if let Some(hook) = &mut self.on_open {
             hook();
@@ -195,7 +195,7 @@ async fn verify_off(
     Ok(verify_readiness_gateway_off(
         backend,
         &endpoint(),
-        9600,
+        kenwood_tmd750::transport::DEFAULT_BAUD,
         &identity()?,
         recorder(file),
         cancelled,
@@ -277,7 +277,7 @@ async fn required_identity_keeps_three_queries_and_the_connection_serialized_sha
     let report = verify_readiness(
         &mut backend,
         &endpoint(),
-        9600,
+        kenwood_tmd750::transport::DEFAULT_BAUD,
         &identity,
         recorder,
         &cancelled,
@@ -304,8 +304,8 @@ async fn required_identity_keeps_three_queries_and_the_connection_serialized_sha
 async fn terminal_and_unnamed_gateway_states_are_retained_but_never_accepted() -> TestResult {
     for (reply, mode, state) in [
         (b"GW 2\r".as_slice(), DvGatewayMode::Terminal, "terminal"),
-        (b"GW 1\r", DvGatewayMode::Unnamed(1), "unqualified"),
-        (b"GW 255\r", DvGatewayMode::Unnamed(255), "unqualified"),
+        (b"GW 1\r", DvGatewayMode::from(1), "unqualified"),
+        (b"GW 255\r", DvGatewayMode::from(255), "unqualified"),
     ] {
         let mut backend = FreshBackend::new(gateway_script(reply));
         let report =

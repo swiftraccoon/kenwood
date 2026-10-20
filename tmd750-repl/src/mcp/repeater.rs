@@ -22,6 +22,10 @@ use super::page_apply::{self, PagePlan, PlanKind};
 use super::snapshot::Snapshot;
 use crate::{AppResult, CommandError, output};
 
+#[cfg(test)]
+mod tests;
+mod voice;
+
 /// First byte of the repeater list's records.
 const TABLES_START: u32 = 0x2_A000;
 
@@ -224,7 +228,7 @@ pub(super) fn run_offline(request: &RepeaterRequest) -> Option<AppResult<()>> {
 
 pub(super) async fn run_selected(
     endpoint: &SerialCandidate,
-    baud: u32,
+    baud: std::num::NonZeroU32,
     request: &RepeaterRequest,
 ) -> AppResult<()> {
     match &request.command {
@@ -236,7 +240,11 @@ pub(super) async fn run_selected(
     }
 }
 
-async fn run_set(endpoint: &SerialCandidate, baud: u32, request: &SetRequest) -> AppResult<()> {
+async fn run_set(
+    endpoint: &SerialCandidate,
+    baud: std::num::NonZeroU32,
+    request: &SetRequest,
+) -> AppResult<()> {
     page_apply::admit_usb(endpoint, baud, PlanKind::Repeater)?;
     let snapshot = Snapshot::load_for_usb_write(&request.edit.backup)?;
     let prepared = request.edit.prepare(&snapshot)?;
@@ -279,7 +287,7 @@ fn print_list(request: &ListRequest) -> AppResult<()> {
         list.len(),
         kind.capacity()
     ));
-    for (slot, record) in list.iter() {
+    for (slot, record) in &list {
         let place = [
             record.region().map(|index| names.region(index).to_string()),
             record
@@ -346,7 +354,7 @@ fn description(prepared: &Prepared) -> Map<String, Value> {
     let _previous = description.insert(
         "repeater".to_owned(),
         json!({
-            "list": prepared.slot.kind().to_string(),
+            "list": crate::report_labels::repeater_list(prepared.slot.kind()),
             "slot": prepared.slot.index(),
             "before": fields(&prepared.before),
             "after": fields(&prepared.after),
@@ -354,8 +362,3 @@ fn description(prepared: &Prepared) -> Map<String, Value> {
     );
     description
 }
-
-mod voice;
-
-#[cfg(test)]
-mod tests;

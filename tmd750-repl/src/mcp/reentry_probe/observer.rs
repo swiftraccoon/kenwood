@@ -18,6 +18,9 @@ use tokio::task::JoinHandle;
 
 use crate::capture::{Failure, Recorder, TranscriptSummary};
 
+#[cfg(test)]
+mod tests;
+
 const PROGRAM: &str = "/usr/sbin/ioreg";
 const ARGUMENTS: [&str; 6] = ["-r", "-c", "IOSerialBSDClient", "-l", "-w", "0"];
 
@@ -438,6 +441,3 @@ async fn observe(
     guard.armed = false;
     summary
 }
-
-#[cfg(test)]
-mod tests;

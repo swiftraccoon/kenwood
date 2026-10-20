@@ -26,6 +26,10 @@ use crate::{AppResult, CommandError, output};
 
 use super::report::{Endpoint, IdentityEvidence};
 use super::{Limits, Request, finish_on_interrupt};
+use admission::Endpoints;
+use evidence::{
+    ConnectionResult, FailureStage, IntendedPage, Problem, Restoration, WorkflowResult,
+};
 
 mod admission;
 mod evidence;
@@ -36,11 +40,6 @@ mod phase;
 // run on Unix only.
 #[cfg(all(test, unix))]
 mod tests;
-
-use admission::Endpoints;
-use evidence::{
-    ConnectionResult, FailureStage, IntendedPage, Problem, Restoration, WorkflowResult,
-};
 
 #[derive(Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -218,6 +217,13 @@ async fn run_workflow(
         );
     }
     if !checkpoint(journal, &mut result) {
+        return result;
+    }
+    if result
+        .probe
+        .as_ref()
+        .is_some_and(|probe| probe.close_error.is_some())
+    {
         return result;
     }
     if result.restoration == Restoration::Owed {

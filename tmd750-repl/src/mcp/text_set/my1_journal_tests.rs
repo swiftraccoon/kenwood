@@ -200,7 +200,7 @@ fn complete_my1_history_retains_target_control_identity_and_the_sole_intent() ->
         );
         assert_eq!(
             record.pointer("/event/format_version"),
-            Some(&Value::from(1)),
+            Some(&Value::from(2)),
             "journal records retain their versioned envelope"
         );
         assert!(

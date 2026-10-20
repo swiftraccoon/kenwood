@@ -1,4 +1,8 @@
 //! Plain, optionally timestamped terminal output.
+//!
+//! LF separates intentional lines. Other Unicode control characters are escaped
+//! before wrapping; radio replies, paths and errors cannot issue terminal
+//! control sequences, while ordinary Unicode text is preserved.
 
 use std::fmt;
 use std::io::{self, Write};
@@ -107,6 +111,14 @@ fn current_utc_seconds() -> u64 {
 }
 
 fn render_at(body: &str, timestamps: bool, seconds: u64) -> String {
+    let mut escaped = String::with_capacity(body.len());
+    for character in body.chars() {
+        if character.is_control() && character != '\n' {
+            escaped.extend(character.escape_default());
+        } else {
+            escaped.push(character);
+        }
+    }
     let hours = (seconds / 3_600) % 24;
     let minutes = (seconds / 60) % 60;
     let seconds = seconds % 60;
@@ -116,7 +128,8 @@ fn render_at(body: &str, timestamps: bool, seconds: u64) -> String {
         String::new()
     };
     let width = LINE_WIDTH.saturating_sub(prefix.len());
-    body.split('\n')
+    escaped
+        .split('\n')
         .flat_map(|line| wrap_line(line, width))
         .map(|line| format!("{prefix}{line}"))
         .collect::<Vec<_>>()
@@ -233,6 +246,24 @@ mod tests {
     #[test]
     fn disabled_render_is_plain() {
         assert_eq!(render_at("hello 7", false, 0), "hello 7");
+    }
+
+    #[test]
+    fn dynamic_controls_are_escaped_before_timestamping_and_wrapping() {
+        let rendered = render_at("radio\r\u{1b}[2J\0\tΩ\u{85}\nnext", true, 0);
+        assert_eq!(
+            rendered,
+            "[00:00:00] radio\\r\\u{1b}[2J\\u{0}\\tΩ\\u{85}\n[00:00:00] next"
+        );
+        assert!(
+            rendered
+                .chars()
+                .all(|character| !character.is_control() || character == '\n')
+        );
+        let long = render_at(&format!("{}\r end", "word ".repeat(30)), true, 0);
+        assert!(long.lines().all(|line| line.starts_with("[00:00:00] ")));
+        assert!(long.contains("\\r"));
+        assert!(!long.contains('\r'));
     }
 
     #[test]

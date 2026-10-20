@@ -28,14 +28,14 @@ fn backup(directory: &Path, entries: &[CallsignEntry]) -> Result<PathBuf, TestEr
         .flat_map(|_| [vec![0; 56], vec![0xFF; 8]].concat())
         .collect();
     let list = CallsignList::from_entries(entries.to_vec())?;
-    for (slot, stored) in list.iter() {
+    for (slot, stored) in &list {
         let start = usize::from(slot.index()) * CALLSIGN_ENTRY_SIZE;
         table
             .get_mut(start..start + CALLSIGN_ENTRY_SIZE)
             .ok_or("a slot of the table")?
             .copy_from_slice(&stored.to_bytes());
     }
-    let ends: Vec<u8> = [list.iter().next(), list.iter().last()]
+    let ends: Vec<u8> = [list.iter().next(), list.iter().next_back()]
         .into_iter()
         .flat_map(|end| end.map_or(0xFFFF, |(slot, _)| slot.index()).to_le_bytes())
         .collect();

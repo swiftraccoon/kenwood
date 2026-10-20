@@ -53,6 +53,7 @@ pub(crate) struct Opened<T> {
 pub(crate) struct OpenFailure {
     pub(crate) error: Failure,
     pub(crate) close_error: Option<Failure>,
+    sources: Vec<Box<dyn std::error::Error + Send + Sync>>,
     retry_admission: RetryAdmission,
     host_retirement_confirmed: bool,
 }
@@ -92,10 +93,16 @@ impl std::fmt::Display for OpenFailure {
     }
 }
 
-impl std::error::Error for OpenFailure {}
+impl std::error::Error for OpenFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.sources.first()?.as_ref())
+    }
+}
 
 impl OpenFailure {
-    pub(crate) fn from_error(error: &(dyn std::error::Error + 'static)) -> Self {
+    pub(crate) fn from_error(error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
+        let source = error.into();
+        let error = source.as_ref();
         let retry_admission = match error.downcast_ref::<TransportError>() {
             Some(TransportError::NotFound) => RetryAdmission::NativeOpening,
             Some(
@@ -123,20 +130,22 @@ impl OpenFailure {
                         | TransportError::BluetoothParameter { .. }
                 )
             ),
+            sources: vec![source],
         }
     }
 
     /// Whether this process no longer holds the connection.
     ///
-    /// True only for the typed opening failures whose helper was reaped, and
-    /// only when no close error was recorded. It says nothing about the RFCOMM
-    /// channel's state in the operating system.
+    /// True for a refusal before dispatch, a typed opening failure whose
+    /// helper was reaped, or a late connection whose close succeeded. Any
+    /// recorded close failure makes this false; the operating system can
+    /// still retain an unconfirmed RFCOMM channel.
     pub(crate) const fn host_retirement_confirmed(&self) -> bool {
         self.host_retirement_confirmed && self.close_error.is_none()
     }
 
     /// Build a failure for a refusal made before any open was dispatched.
-    pub(crate) fn before_open(error: &(dyn std::error::Error + 'static)) -> Self {
+    pub(crate) fn before_open(error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
         let mut failure = Self::from_error(error);
         failure.host_retirement_confirmed = true;
         failure
@@ -159,6 +168,7 @@ impl OpenFailure {
         self.close_error = cause.close_error;
         self.error.causes.push(cause.error.message);
         self.error.causes.extend(cause.error.causes);
+        self.sources.extend(cause.sources);
     }
 
     /// Whether this failure is eligible for one retry.
@@ -185,9 +195,11 @@ const fn retryable_open_stage(stage: BluetoothOpenStage) -> bool {
     )
 }
 
-/// Wall-clock budget for one native open, from dispatching the helper worker
-/// until it returns a connection or a typed failure. Host policy, not a
-/// firmware timing bound.
+/// Dispatch window for one native open, measured from the helper worker start.
+///
+/// Cancellation or expiry refuses a late connection; the worker is still joined
+/// and any late connection closed before return, which can extend completion
+/// beyond this host-policy interval.
 pub(crate) const OPEN_BUDGET: Duration = Duration::from_secs(25);
 /// Interval between cancellation and deadline checks while the worker runs.
 #[cfg(any(target_os = "macos", test))]
@@ -205,19 +217,6 @@ pub(crate) trait Backend {
         service: BluetoothService,
         cancelled: &AtomicBool,
     ) -> Result<Opened<Self::Connection>, OpenFailure>;
-    /// Open under the caller's absolute deadline as well as `OPEN_BUDGET`.
-    ///
-    /// The default implementation ignores `_deadline`, so a caller that has one
-    /// must still reject and close a connection returned after it.
-    async fn open_until(
-        &mut self,
-        endpoint: &Endpoint,
-        service: BluetoothService,
-        cancelled: &AtomicBool,
-        _deadline: tokio::time::Instant,
-    ) -> Result<Opened<Self::Connection>, OpenFailure> {
-        self.open(endpoint, service, cancelled).await
-    }
     async fn wait(&mut self, duration: Duration) {
         tokio::time::sleep(duration).await;
     }
@@ -236,23 +235,6 @@ impl Backend for SystemBackend {
     ) -> Result<Opened<Connection>, OpenFailure> {
         open(endpoint, service, cancelled, OPEN_BUDGET).await
     }
-
-    async fn open_until(
-        &mut self,
-        endpoint: &Endpoint,
-        service: BluetoothService,
-        cancelled: &AtomicBool,
-        deadline: tokio::time::Instant,
-    ) -> Result<Opened<Connection>, OpenFailure> {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(OpenFailure::before_open(&std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "native lifecycle deadline expired before opening",
-            )));
-        }
-        open(endpoint, service, cancelled, OPEN_BUDGET.min(remaining)).await
-    }
 }
 
 /// Run `worker` on a blocking task, joining it even after cancellation or the
@@ -269,7 +251,7 @@ where
 {
     if cancelled.load(Ordering::Relaxed) {
         return Err(OpenFailure::before_open(
-            &TransportError::BluetoothOpenInterrupted,
+            TransportError::BluetoothOpenInterrupted,
         ));
     }
     let cancellation = BluetoothOpenCancellation::default();
@@ -287,8 +269,8 @@ where
         && let Some(result) = completed
     {
         return result
-            .map_err(|error| OpenFailure::from_error(&error))?
-            .map_err(|error| OpenFailure::from_error(&error));
+            .map_err(OpenFailure::from_error)?
+            .map_err(OpenFailure::from_error);
     }
     cancellation.cancel();
     let reason = if stopped {
@@ -302,7 +284,7 @@ where
             ),
         }
     };
-    let mut failure = OpenFailure::from_error(&reason);
+    let mut failure = OpenFailure::from_error(reason);
     let result = match completed {
         Some(result) => result,
         None => task.await,
@@ -312,8 +294,11 @@ where
             failure.record_close(close(&mut opened.connection).await);
             drop(opened);
         }
-        Ok(Err(error)) => failure.retain_open_failure(OpenFailure::from_error(&error)),
-        Err(error) => failure.error.causes.push(error.to_string()),
+        Ok(Err(error)) => failure.retain_open_failure(OpenFailure::from_error(error)),
+        Err(error) => {
+            failure.error.causes.push(error.to_string());
+            failure.sources.push(Box::new(error));
+        }
     }
     Err(failure)
 }
@@ -377,7 +362,7 @@ fn open(
     _cancelled: &AtomicBool,
     _budget: Duration,
 ) -> std::future::Ready<Result<Opened<Connection>, OpenFailure>> {
-    std::future::ready(Err(OpenFailure::before_open(&std::io::Error::new(
+    std::future::ready(Err(OpenFailure::before_open(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "native Bluetooth is currently available only on macOS",
     ))))

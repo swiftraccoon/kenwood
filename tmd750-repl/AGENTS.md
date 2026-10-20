@@ -5,17 +5,11 @@
 - No direct or transitive `kenwood-thd75` dependency.
   `tests/dependency_seam.rs` rejects another model's source imports and
   manifest ownership.
-- D-STAR configuration, events and modem processing come from `mmdvm::dstar`;
-  strict version identification comes from `mmdvm::probe`. The exact selected
-  connection stays local policy here.
-- The `dstar start` Bluetooth Terminal lifecycle (preflight, entry, MMDVM
-  handoff and restoration) is owned by `kenwood_tmd750::TerminalLifecycle`.
-  `dstar/hosts.rs` implements the library `ControlHost`, `ModemHost` and
-  `TerminalJournal` over this crate's capture transcripts, native Bluetooth
-  backend and recovery journal; `dstar/startup` reserves the capture directory
-  and serializes the run. This crate owns no entry, transition or readiness
-  state machine.
-- Post-exit readiness for every other MCP command runs the library
+- MMDVM diagnostic identification comes from `mmdvm::probe`; this binary
+  implements no relay runtime or automatic Bluetooth Terminal startup.
+  Managed diagnostics use the library's checked Terminal plan and page-write
+  primitives over independent USB connectors, with their own capture journal.
+- Post-exit readiness for MCP commands runs the library
   `radio::readiness::verify_readiness` through `mcp::reconnect::host`
   (`RecordingHost` writes each enumeration, wait and open to the one
   verification transcript and synchronizes it in `close`; `SettleHost` does
@@ -30,10 +24,10 @@
   only with `--apply` and an explicit endpoint: `--port`, or for `mcp menu
   apply` and `mcp text set` alone, `--bluetooth`/`--bluetooth-address` with a
   native backup of that radio. `dstar probe` and `mcp reentry-probe` require
-  `--port` and `--approve-live-test`; `dstar start` is the one radio-writing
-  workflow without a flag, since invoking it is the request to write the
-  Terminal and routing pages and open the modem link. Do not add a workflow
-  that reaches the radio outside these gates.
+  `--port` and `--approve-live-test`. `dstar start` rejects
+  `ConfigurationProfile::KenwoodTerminal` before discovery, captures or writes;
+  never substitute a generic MMDVM layout for an unverified Kenwood profile.
+  Do not add a workflow that reaches the radio outside these gates.
 - Native Bluetooth admits `mcp probe`, `mcp backup` without
   `--position-memory`, `mcp text set` and `mcp menu apply`; the reentry probe
   is USB-only and is refused before the helper launches. A native write
@@ -57,8 +51,9 @@
   returned, never a deadline counted from the reopen. Never raise the regular
   reply deadline instead, and never give USB the first-reply deadline: the
   silent-`ID` readiness retry depends on the 1.5 s timeout.
-- `mcp text set`, `mcp menu apply` and `mcp reentry-probe` admit either USB
-  role and verify post-exit with the bounded silent-`ID` retry backups use
+- `mcp text set` and `mcp menu apply` admit either USB role;
+  `mcp reentry-probe` admits main-unit USB only. They verify post-exit with
+  the bounded silent-`ID` retry backups use
   (`reconnect::verify_readiness`, or `verify_readiness_gateway_off` with one
   `GW` query on the matched connection), because the operation-panel endpoint
   returns within seconds but answers `ID` only once its tuple is ready; a
@@ -116,7 +111,7 @@ cargo run -p tmd750-repl -- --bluetooth mcp menu apply --backup NATIVE_REPORT --
 cargo run -p tmd750-repl -- mcp text list|show|preview       # set needs --apply and --port or --bluetooth
 cargo run -p tmd750-repl -- mcp terminal preflight|compare
 cargo run -p tmd750-repl -- --port PATH dstar probe --approve-live-test [--output NEW_DIRECTORY]
-cargo run -p tmd750-repl -- dstar start CALL [REFLECTOR]     # --control-port pins the independent USB CAT connector
+cargo run -p tmd750-repl -- dstar start CALL [REFLECTOR]     # rejects the unverified Kenwood configuration before I/O
 ```
 
 - Every `mcp` `list`, `describe`, `show`, `names` and `preview` subcommand,
@@ -132,8 +127,8 @@ cargo run -p tmd750-repl -- dstar start CALL [REFLECTOR]     # --control-port pi
   `quit` (`exit`), plus the typed reads, verified writes and transmit actions
   in `src/cat.rs` (`freq`, `power`, `tuning`, `squelch`, `step`, `up`/`down`,
   `bands`, GPS, TNC, VOX, Bluetooth, `tx`, `rx`, `send-beacon`, `power-off`
-  and the rest listed by `help`). `dstar start` consumes the connection and is
-  startup-only. Every write and every action except `rx` goes through
+  and the rest listed by `help`). `dstar start` refuses before connection
+  selection. Every write and every action except `rx` goes through
   `CommandPolicy::admit_mode_write`, so native Bluetooth requires a fresh
   Gateway Off reply first; `rx` is never gated, so a keyed transmitter can
   always be released.
@@ -142,5 +137,3 @@ cargo run -p tmd750-repl -- dstar start CALL [REFLECTOR]     # --control-port pi
   key-up. The library sends `RX` itself after an unconfirmed `TX`, so "send
   rx" is the next action exactly on `Error::ReleaseUnconfirmed`. `power-off`
   ends the session.
-- In a `dstar start` session, Ctrl-C returns to the D-STAR prompt and
-  `dstar stop` closes the link and rewrites exactly the pages startup changed.

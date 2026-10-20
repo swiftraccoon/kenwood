@@ -296,7 +296,7 @@ impl ReadinessVerification {
 pub(crate) async fn verify_readiness(
     backend: &mut impl Backend,
     endpoint: &SerialCandidate,
-    baud: u32,
+    baud: std::num::NonZeroU32,
     original_identity: &Identity,
     recorder: Recorder<File>,
     cancelled: &AtomicBool,
@@ -325,7 +325,7 @@ pub(crate) async fn verify_readiness(
 pub(crate) async fn verify_readiness_gateway_off(
     backend: &mut impl Backend,
     endpoint: &SerialCandidate,
-    baud: u32,
+    baud: std::num::NonZeroU32,
     original_identity: &Identity,
     recorder: Recorder<File>,
     cancelled: &AtomicBool,
@@ -345,7 +345,7 @@ pub(crate) async fn verify_readiness_gateway_off(
 async fn verify_readiness_with(
     backend: &mut impl Backend,
     endpoint: &SerialCandidate,
-    baud: u32,
+    baud: std::num::NonZeroU32,
     original_identity: &Identity,
     mut recorder: Recorder<File>,
     cancelled: &AtomicBool,

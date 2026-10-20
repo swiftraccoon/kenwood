@@ -4,6 +4,7 @@
 use std::error::Error as StdError;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,6 +13,9 @@ use std::time::Instant;
 use kenwood_transport::{Transport, TransportError};
 use serde::Serialize;
 use time::OffsetDateTime;
+
+#[cfg(test)]
+mod recording_tests;
 
 /// A recorded error: its display text plus its complete source chain.
 #[derive(Clone, Debug, Serialize)]
@@ -55,8 +59,6 @@ pub(super) enum CaptureKind {
     Mcp,
     /// CAT and MMDVM diagnostic queries.
     DstarProbe,
-    /// Terminal entry, modem startup, and settings restoration.
-    DstarStart,
     /// Native Bluetooth CAT sessions and read-only MCP reads.
     NativeBluetooth,
 }
@@ -66,7 +68,6 @@ impl CaptureKind {
         let prefix = match self {
             Self::Mcp => "tmd750-mcp",
             Self::DstarProbe => "tmd750-dstar-probe",
-            Self::DstarStart => "tmd750-dstar-start",
             Self::NativeBluetooth => "tmd750-native-bluetooth",
         };
         format!(
@@ -102,7 +103,7 @@ impl Artifacts {
             create_private_directory(path)?;
             path.to_owned()
         } else {
-            fs::create_dir_all("captures")?;
+            prepare_default_base(Path::new("captures"), synchronize_directory)?;
             reserve_default_directory(&kind.directory_name())?
         };
         let report = create_private_file(&directory.join("report.json"))?;
@@ -130,6 +131,39 @@ impl Artifacts {
             filename,
         ))
     }
+}
+
+/// Establish the default base's containing-directory entry before later files.
+///
+/// Synchronizing an existing base also covers a prior call whose synchronization
+/// failed after creation. Only this one directory is created; its parent exists.
+fn prepare_default_base(
+    base: &Path,
+    synchronize: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    match create_private_directory(base) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists && base.is_dir() => {}
+        Err(error) => return Err(error),
+    }
+    synchronize(
+        base.parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new(".")),
+    )
+}
+
+#[cfg(unix)]
+fn synchronize_directory(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn synchronize_directory(_path: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "default capture creation requires directory synchronization; select an existing parent with --output",
+    ))
 }
 
 fn reserve_default_directory(name: &str) -> io::Result<PathBuf> {
@@ -178,7 +212,7 @@ pub(super) fn create_private_file(path: &Path) -> io::Result<File> {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(super) enum Event<'a> {
     /// An open of this endpoint was dispatched at this baud.
-    OpenRequested { path: &'a str, baud: u32 },
+    OpenRequested { path: &'a str, baud: NonZeroU32 },
     /// The open returned a host handle.
     OpenCompleted,
     /// The open returned no handle.
@@ -228,8 +262,32 @@ pub(super) struct Recorder<W> {
     started: Instant,
     events: u64,
     error: Option<Failure>,
+    source: Option<Arc<io::Error>>,
     cancelled: Arc<AtomicBool>,
     filename: &'static str,
+}
+
+/// Original capture failure retained across repeated guarded operations.
+#[derive(Debug)]
+struct CaptureBoundaryError {
+    context: &'static str,
+    source: Arc<io::Error>,
+}
+
+impl std::fmt::Display for CaptureBoundaryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.context, self.source)
+    }
+}
+
+impl StdError for CaptureBoundaryError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        let cause = self
+            .source
+            .get_ref()
+            .unwrap_or_else(|| self.source.as_ref());
+        Some(cause)
+    }
 }
 
 impl<W: Write> Recorder<W> {
@@ -244,6 +302,7 @@ impl<W: Write> Recorder<W> {
             started: Instant::now(),
             events: 0,
             error: None,
+            source: None,
             cancelled,
             filename,
         }
@@ -262,20 +321,32 @@ impl<W: Write> Recorder<W> {
         };
         match self.write_record(&record) {
             Ok(()) => self.events += 1,
-            Err(error) => self.fail(&error),
+            Err(error) => {
+                let _retained = self.fail(error);
+            }
         }
     }
 
-    fn fail(&mut self, error: &io::Error) {
+    pub(super) fn fail(&mut self, error: io::Error) -> io::Error {
+        let kind = error.kind();
+        let source = Arc::new(error);
         if self.error.is_none() {
-            self.error = Some(Failure::from_error(error));
+            self.error = Some(Failure::from_error(source.as_ref()));
+            self.source = Some(Arc::clone(&source));
         }
         self.cancelled.store(true, Ordering::Relaxed);
+        io::Error::new(
+            kind,
+            CaptureBoundaryError {
+                context: "capture operation failed",
+                source,
+            },
+        )
     }
 
     fn write_record(&mut self, record: &impl Serialize) -> io::Result<()> {
-        // Serialize into memory so one record reaches the file in a single
-        // write_all; flush completes short writes, and sync_all is separate.
+        // Serialize one complete record before write_all completes short writes;
+        // flush and sync_all remain separate persistence operations.
         let mut bytes = serde_json::to_vec(record)?;
         bytes.push(b'\n');
         self.writer.write_all(&bytes)?;
@@ -294,10 +365,18 @@ impl<W: Write> Recorder<W> {
 
     /// Return an error when any earlier record or synchronization failed.
     pub(super) fn ensure_complete(&self) -> io::Result<()> {
-        self.error.as_ref().map_or(Ok(()), |error| {
-            Err(io::Error::other(format!(
-                "cannot accept an incomplete transcript: {error}"
-            )))
+        self.require_complete("cannot accept an incomplete transcript")
+    }
+
+    fn require_complete(&self, context: &'static str) -> io::Result<()> {
+        self.source.as_ref().map_or(Ok(()), |source| {
+            Err(io::Error::new(
+                source.kind(),
+                CaptureBoundaryError {
+                    context,
+                    source: Arc::clone(source),
+                },
+            ))
         })
     }
 }
@@ -327,8 +406,7 @@ impl Recorder<File> {
         synchronize: impl FnOnce(&File) -> io::Result<()>,
     ) -> io::Result<()> {
         if let Err(error) = self.writer.flush().and_then(|()| synchronize(&self.writer)) {
-            self.fail(&error);
-            return Err(error);
+            return Err(self.fail(error));
         }
         self.ensure_complete()
     }
@@ -425,13 +503,12 @@ impl<T, W> CaptureTransport<T, W> {
         self.activity
     }
 
-    fn require_capture(&self, context: &str) -> io::Result<()> {
-        if self.policy == CapturePolicy::Required
-            && let Some(error) = &self.recorder.error
-        {
-            return Err(io::Error::other(format!(
-                "required capture failed {context}: {error}"
-            )));
+    fn require_capture(&self, context: &'static str) -> io::Result<()>
+    where
+        W: Write,
+    {
+        if self.policy == CapturePolicy::Required {
+            self.recorder.require_complete(context)?;
         }
         Ok(())
     }
@@ -530,8 +607,9 @@ impl<T: Transport, W: Write + Send + Sync> Transport for CaptureTransport<T, W> 
             .map_err(TransportError::Disconnected)
     }
 
-    fn set_baud_rate(&mut self, baud: u32) -> Result<(), TransportError> {
-        self.recorder.record(Event::BaudRequested { baud });
+    fn set_baud_rate(&mut self, baud: NonZeroU32) -> Result<(), TransportError> {
+        self.recorder
+            .record(Event::BaudRequested { baud: baud.get() });
         self.require_capture("before baud dispatch; baud change was not attempted")
             .map_err(capture_baud_error)?;
         let result = self.inner.set_baud_rate(baud);
@@ -555,14 +633,42 @@ fn capture_baud_error(source: io::Error) -> TransportError {
 }
 
 #[cfg(test)]
-mod recording_tests;
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use kenwood_transport::MockTransport;
 
     type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    const TEST_BAUD: NonZeroU32 = NonZeroU32::new(9600).unwrap();
+
+    #[test]
+    fn default_base_synchronizes_its_parent_before_reserving_a_session() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let base = root.path().join("captures");
+        for _attempt in 0..2 {
+            let mut synchronized = None;
+            let result = prepare_default_base(&base, |parent| {
+                synchronized = Some(parent.to_owned());
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "parent synchronization refused",
+                ))
+            });
+            assert!(
+                matches!(result, Err(error) if error.kind() == io::ErrorKind::PermissionDenied),
+                "parent synchronization failure must refuse capture preparation"
+            );
+            assert_eq!(synchronized.as_deref(), Some(root.path()));
+            assert!(base.is_dir());
+            assert_eq!(
+                fs::read_dir(&base)?.count(),
+                0,
+                "no session is reserved after an ancestor failure"
+            );
+        }
+        prepare_default_base(&base, |_parent| Ok(()))?;
+        Ok(())
+    }
 
     #[test]
     fn exclusive_directory_preserves_existing_capture() -> TestResult {
@@ -614,7 +720,6 @@ mod tests {
         for (kind, prefix) in [
             (CaptureKind::Mcp, "tmd750-mcp-"),
             (CaptureKind::DstarProbe, "tmd750-dstar-probe-"),
-            (CaptureKind::DstarStart, "tmd750-dstar-start-"),
             (CaptureKind::NativeBluetooth, "tmd750-native-bluetooth-"),
         ] {
             let name = kind.directory_name();
@@ -642,7 +747,6 @@ mod tests {
         for kind in [
             CaptureKind::Mcp,
             CaptureKind::DstarProbe,
-            CaptureKind::DstarStart,
             CaptureKind::NativeBluetooth,
         ] {
             assert!(Artifacts::create(kind, Some(&path), Arc::clone(&cancelled)).is_err());
@@ -719,7 +823,7 @@ mod tests {
         let mut bytes = [0; 32];
         let count = transport.read(&mut bytes).await?;
         assert_eq!(bytes.get(..count), Some(b"ID TM-D750\r".as_slice()));
-        transport.set_baud_rate(9600)?;
+        transport.set_baud_rate(TEST_BAUD)?;
         transport.close().await?;
         transport.inner.assert_complete();
         let records = String::from_utf8(transport.into_recorder().writer)?;
@@ -1040,7 +1144,7 @@ mod tests {
             Ok(())
         }
 
-        fn set_baud_rate(&mut self, _baud: u32) -> Result<(), TransportError> {
+        fn set_baud_rate(&mut self, _baud: NonZeroU32) -> Result<(), TransportError> {
             self.operations.push("baud");
             Ok(())
         }
@@ -1073,6 +1177,55 @@ mod tests {
         Ok(())
     }
 
+    #[derive(Debug, thiserror::Error)]
+    #[error("typed capture refusal")]
+    struct TypedCaptureRefusal;
+
+    struct RefusingCapture;
+
+    impl Write for RefusingCapture {
+        fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                TypedCaptureRefusal,
+            ))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn required_capture_preserves_the_original_typed_io_source() -> TestResult {
+        let recorder = Recorder::new(RefusingCapture, Arc::new(AtomicBool::new(false)));
+        let mut transport = CaptureTransport::required(OperationWitness::default(), recorder);
+        let error = transport
+            .write(b"ID\r")
+            .await
+            .err()
+            .ok_or("failed capture dispatched a write")?;
+        assert!(transport.inner.operations.is_empty());
+        assert!(
+            matches!(&error, TransportError::Write(source) if source.kind() == io::ErrorKind::PermissionDenied)
+        );
+        let mut source: &(dyn StdError + 'static) = &error;
+        let mut found = false;
+        loop {
+            found |= source.downcast_ref::<TypedCaptureRefusal>().is_some();
+            let Some(next) = source.source() else {
+                break;
+            };
+            source = next;
+        }
+        assert!(
+            found,
+            "the original typed writer failure must remain inspectable"
+        );
+        assert!(transport.close().await.is_err());
+        assert_eq!(transport.inner.operations, ["close"]);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn transport_synchronization_retains_failure_and_still_permits_close() -> TestResult {
         let root = tempfile::tempdir()?;
@@ -1081,7 +1234,7 @@ mod tests {
             create_private_file(&root.path().join("transcript.jsonl"))?,
             Arc::clone(&cancelled),
         );
-        recorder.fail(&io::Error::other("capture failure before protocol handoff"));
+        let _retained = recorder.fail(io::Error::other("capture failure before protocol handoff"));
         let mut transport = CaptureTransport::required(OperationWitness::default(), recorder);
         assert!(transport.synchronize().is_err());
         assert!(cancelled.load(Ordering::Relaxed));
@@ -1116,7 +1269,7 @@ mod tests {
             Err(TransportError::Write(_))
         ));
         assert!(matches!(
-            transport.set_baud_rate(9600),
+            transport.set_baud_rate(TEST_BAUD),
             Err(TransportError::Open { .. })
         ));
         assert!(transport.inner.operations.is_empty());
@@ -1175,10 +1328,10 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
             );
             let mut transport = CaptureTransport::required(OperationWitness::default(), recorder);
-            let baud = transport.set_baud_rate(9600);
+            let baud = transport.set_baud_rate(TEST_BAUD);
             assert!(matches!(baud, Err(TransportError::Open { .. })));
             assert_eq!(transport.inner.operations.len(), remaining);
-            assert!(transport.set_baud_rate(9600).is_err());
+            assert!(transport.set_baud_rate(TEST_BAUD).is_err());
             assert_eq!(transport.inner.operations.len(), remaining);
         }
     }
@@ -1247,7 +1400,7 @@ mod tests {
             Arc::clone(&cancelled),
             "trial-session.jsonl",
         );
-        recorder.fail(&io::Error::other("original capture failure"));
+        let _retained = recorder.fail(io::Error::other("original capture failure"));
         assert!(recorder.synchronize().is_err());
         assert!(cancelled.load(Ordering::Relaxed));
         let summary = recorder.summary();

@@ -22,9 +22,42 @@ use serde::Deserialize;
 use super::{IdentityEvidence, SegmentEvidence};
 use crate::{AppResult, CommandError};
 
+mod native;
+
 const MAX_REPORT_BYTES: u64 = 32 * 1024 * 1024;
 
-mod native;
+#[derive(Debug, thiserror::Error)]
+enum LoadError {
+    #[error("backup report {} could not be read: {source}", path.display())]
+    Read {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("Invalid configuration backup: {stage}: {source}")]
+    Decode {
+        stage: DecodeStage,
+        #[source]
+        source: serde_json::Error,
+    },
+}
+
+#[derive(Debug)]
+enum DecodeStage {
+    Header,
+    Native,
+    Usb,
+}
+
+impl std::fmt::Display for DecodeStage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Header => "malformed JSON or transport header",
+            Self::Native => "native backup is incomplete or malformed",
+            Self::Usb => "untagged report requires USB format-3/4 records",
+        })
+    }
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
@@ -466,19 +499,21 @@ fn transport_tag_present<'de, D: serde::Deserializer<'de>>(
 
 impl SourceDocument {
     fn decode(bytes: &[u8]) -> AppResult<Self> {
-        let header: SourceHeader = serde_json::from_slice(bytes).map_err(|error| {
-            CommandError(format!(
-                "Invalid configuration backup: malformed JSON or transport header: {error}"
-            ))
-        })?;
+        let header: SourceHeader =
+            serde_json::from_slice(bytes).map_err(|source| LoadError::Decode {
+                stage: DecodeStage::Header,
+                source,
+            })?;
         if header.native {
-            let document = serde_json::from_slice(bytes).map_err(|error| {
-                CommandError(format!("Invalid configuration backup: native backup is incomplete or malformed: {error}"))
+            let document = serde_json::from_slice(bytes).map_err(|source| LoadError::Decode {
+                stage: DecodeStage::Native,
+                source,
             })?;
             Ok(Self::Native(document))
         } else {
-            let document = serde_json::from_slice(bytes).map_err(|error| {
-                CommandError(format!("Invalid configuration backup: untagged report requires USB format-3/4 records: {error}"))
+            let document = serde_json::from_slice(bytes).map_err(|source| LoadError::Decode {
+                stage: DecodeStage::Usb,
+                source,
             })?;
             Ok(Self::Usb(document))
         }
@@ -530,11 +565,11 @@ pub(crate) struct Snapshot {
 
 /// Transport that produced a backup.
 ///
-/// USB backups drive the USB write workflows; native Bluetooth backups load
-/// for offline inspection only, through [`Snapshot::load`].
+/// Each transport's checked backup drives its matching write workflows; both
+/// are available for offline inspection through [`Snapshot::load`].
 #[derive(Debug)]
 enum Provenance {
-    /// Captured over the main-unit USB endpoint.
+    /// Captured over a main-unit or operation-panel USB endpoint.
     Usb,
     /// Captured over native Bluetooth from this address and RFCOMM channel.
     NativeBluetooth {
@@ -574,11 +609,9 @@ impl Snapshot {
     /// Metadata and the actual bounded read must both fit within 32 MiB, even
     /// if the file grows after its metadata was checked.
     pub(crate) fn load(path: &Path) -> AppResult<Self> {
-        let unreadable = |error: std::io::Error| {
-            CommandError(format!(
-                "backup report {} could not be read: {error}",
-                path.display()
-            ))
+        let unreadable = |source: std::io::Error| LoadError::Read {
+            path: path.to_owned(),
+            source,
         };
         validate_metadata(&path.metadata().map_err(unreadable)?)?;
         let file = File::open(path).map_err(unreadable)?;
@@ -669,7 +702,7 @@ impl Snapshot {
     /// Borrow the image after checking that the report captured every byte of
     /// `region`.
     pub(super) fn image_covering(&self, region: Region) -> AppResult<&MemoryImage> {
-        Ok(self.configuration.image_covering(region)?)
+        Ok(self.configuration.image_with_uncaptured_fill(region)?)
     }
 
     /// Borrow bytes from a region the report captured.
@@ -683,7 +716,7 @@ impl Snapshot {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use kenwood_tmd750::memory::FieldCodec;
+    use kenwood_schema::{CodecSpec, FieldCodec};
 
     type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
@@ -893,6 +926,26 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn malformed_and_unreadable_reports_retain_typed_sources() -> TestResult {
+        let malformed = SourceDocument::decode(b"{")
+            .err()
+            .ok_or("malformed JSON accepted")?;
+        let source = malformed.source().ok_or("JSON source discarded")?;
+        assert!(source.downcast_ref::<serde_json::Error>().is_some());
+        let root = tempfile::tempdir()?;
+        let missing = Snapshot::load(&root.path().join("missing.json"))
+            .err()
+            .ok_or("missing report accepted")?;
+        let source = missing.source().ok_or("filesystem source discarded")?;
+        assert!(
+            source
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn valid_report_at_the_exact_read_limit_is_accepted() -> TestResult {
         let bytes = serde_json::to_vec(&fixture())?;
         let padding = MAX_REPORT_BYTES
@@ -925,12 +978,20 @@ pub(super) mod tests {
     fn complete_capture_preserves_identity_and_only_exposes_captured_fields() -> TestResult {
         let snapshot = Snapshot::from_document(serde_json::from_value(fixture())?)?;
         assert_eq!(snapshot.identity().firmware.as_str(), "1.02");
-        let observed = FieldDescriptor::new("observed", 8, FieldCodec::Byte { min: 0, max: 255 });
+        let observed = FieldDescriptor::new(
+            "observed",
+            8,
+            FieldCodec::new(CodecSpec::Byte { min: 0, max: 255 })?,
+        );
         assert_eq!(
             snapshot.image_for(&observed, None)?.as_bytes().get(8),
             Some(&0x42)
         );
-        let unread = FieldDescriptor::new("unread", 0, FieldCodec::Byte { min: 0, max: 255 });
+        let unread = FieldDescriptor::new(
+            "unread",
+            0,
+            FieldCodec::new(CodecSpec::Byte { min: 0, max: 255 })?,
+        );
         assert!(
             snapshot.image_for(&unread, None).is_err(),
             "synthetic gap bytes must remain inaccessible"

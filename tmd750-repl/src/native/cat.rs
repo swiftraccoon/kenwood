@@ -27,7 +27,7 @@ pub(crate) struct IdentityEvidence(pub(crate) Identity);
 impl Serialize for IdentityEvidence {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut fields = serializer.serialize_struct("IdentityEvidence", 3)?;
-        fields.serialize_field("model", &self.0.model.to_string())?;
+        fields.serialize_field("model", crate::report_labels::model(self.0.model))?;
         fields.serialize_field("firmware", self.0.firmware.as_str())?;
         fields.serialize_field("radio_type", self.0.radio_type.as_str())?;
         fields.end()

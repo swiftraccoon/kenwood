@@ -93,7 +93,7 @@ fn success(channel: u8) -> Step {
 }
 
 fn eligible_failure() -> Step {
-    Step::Failure(OpenFailure::from_error(&TransportError::NotFound))
+    Step::Failure(OpenFailure::from_error(TransportError::NotFound))
 }
 
 struct FakeBackend {
@@ -113,9 +113,9 @@ impl Backend for FakeBackend {
         _cancelled: &AtomicBool,
     ) -> Result<Opened<Connection>, OpenFailure> {
         record(&self.log, Seen::Open(endpoint.address.to_string(), service))
-            .map_err(|error| OpenFailure::from_error(&error))?;
+            .map_err(OpenFailure::from_error)?;
         match self.steps.pop_front().ok_or_else(|| {
-            OpenFailure::from_error(&io::Error::other("unexpected additional open"))
+            OpenFailure::from_error(io::Error::other("unexpected additional open"))
         })? {
             Step::Failure(error) => Err(error),
             Step::Success {
@@ -360,11 +360,11 @@ async fn eligible_exhaustion_never_starts_a_third_attempt() -> TestResult {
 
 #[tokio::test]
 async fn nonretryable_or_independent_cleanup_failure_stops_selection() -> TestResult {
-    let mut independent_close = OpenFailure::from_error(&TransportError::NotFound);
+    let mut independent_close = OpenFailure::from_error(TransportError::NotFound);
     independent_close.close_error =
         Some(Failure::from_error(&io::Error::other("late-owner cleanup")));
     for error in [
-        OpenFailure::from_error(&io::Error::other("not a typed native stage")),
+        OpenFailure::from_error(io::Error::other("not a typed native stage")),
         independent_close,
     ] {
         let mut harness = Harness::new([Step::Failure(error), success(27)])?;
@@ -704,7 +704,7 @@ fn eligible_native_error_returned_at_deadline_remains_visible_but_cannot_retry()
         interruption: None,
     };
     evidence.record_failure(
-        OpenFailure::from_error(&TransportError::NotFound),
+        OpenFailure::from_error(TransportError::NotFound),
         &AtomicBool::new(false),
         Instant::now(),
     );

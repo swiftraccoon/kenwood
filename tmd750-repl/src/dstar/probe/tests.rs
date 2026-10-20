@@ -53,7 +53,10 @@ fn cli_preserves_output_path_and_requires_scope() -> TestResult {
     assert!(request.validate(Some(""), DEFAULT_BAUD).is_err());
     assert!(
         request
-            .validate(Some("/dev/cu.TestPanel"), 115_200)
+            .validate(
+                Some("/dev/cu.TestPanel"),
+                std::num::NonZeroU32::new(115_200).ok_or("nonzero baud")?
+            )
             .is_err()
     );
     assert!(

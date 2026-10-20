@@ -20,6 +20,9 @@ use crate::mcp::page_apply::{self, PagePlan, PlanKind};
 use crate::mcp::snapshot::Snapshot;
 use crate::{AppResult, CommandError, output};
 
+#[cfg(test)]
+mod tests;
+
 /// Arguments of `mcp repeater names`.
 #[derive(Debug, Args)]
 pub(super) struct NamesRequest {
@@ -159,7 +162,7 @@ impl VoiceRequest {
     pub(super) async fn run_selected(
         &self,
         endpoint: &SerialCandidate,
-        baud: u32,
+        baud: std::num::NonZeroU32,
     ) -> AppResult<()> {
         match &self.command {
             VoiceCommand::Set(request) => run_set(endpoint, baud, request).await,
@@ -168,7 +171,11 @@ impl VoiceRequest {
     }
 }
 
-async fn run_set(endpoint: &SerialCandidate, baud: u32, request: &VoiceSet) -> AppResult<()> {
+async fn run_set(
+    endpoint: &SerialCandidate,
+    baud: std::num::NonZeroU32,
+    request: &VoiceSet,
+) -> AppResult<()> {
     page_apply::admit_usb(endpoint, baud, PlanKind::Repeater)?;
     let snapshot = Snapshot::load_for_usb_write(&request.edit.backup)?;
     let prepared = request.edit.prepare(&snapshot)?;
@@ -282,6 +289,3 @@ fn description(prepared: &Prepared) -> Map<String, Value> {
     );
     description
 }
-
-#[cfg(test)]
-mod tests;

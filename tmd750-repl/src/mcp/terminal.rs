@@ -2,8 +2,6 @@
 //!
 //! Nothing here opens an endpoint or writes a setting.
 
-mod compare;
-
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -12,6 +10,11 @@ use kenwood_tmd750::memory::{ReflectorTerminalPreflight, TerminalUsbRoute};
 
 use super::snapshot::Snapshot;
 use crate::{AppResult, CommandError, output};
+
+mod compare;
+#[cfg(test)]
+#[path = "terminal_tests.rs"]
+mod tests;
 
 /// Terminal subcommand: preflight or compare, both from captured backups.
 #[derive(Debug, Parser)]
@@ -163,7 +166,3 @@ fn describe(
     );
     Ok(lines)
 }
-
-#[cfg(test)]
-#[path = "terminal_tests.rs"]
-mod tests;

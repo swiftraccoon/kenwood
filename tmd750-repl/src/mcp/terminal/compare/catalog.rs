@@ -3,9 +3,9 @@
 //! A match names the field whose registry range covers the address; addresses
 //! outside the catalog reach the caller as unclassified changes.
 
+use kenwood_schema::{CodecSpec, StringEncoding};
 use kenwood_tmd750::memory::{
-    FieldCodec, FieldDescriptor, ReflectorTerminalPreflight, SLOT_TERM, StringEncoding,
-    TextSetting, menu_field,
+    FieldDescriptor, ReflectorTerminalPreflight, SLOT_TERM, TextSetting, menu_field,
 };
 use kenwood_tmd750::protocol::mcp::regions;
 use kenwood_tmd750::{Address, Region, SlotIndex};
@@ -122,11 +122,11 @@ impl Catalog {
         } else {
             descriptor.terms.is_empty()
         };
-        let shape_matches = match (specification.shape, descriptor.codec) {
-            (Shape::Byte, FieldCodec::Byte { .. }) => true,
+        let shape_matches = match (specification.shape, descriptor.codec.spec()) {
+            (Shape::Byte, CodecSpec::Byte { .. }) => true,
             (
                 Shape::Text(expected),
-                FieldCodec::FixedString {
+                CodecSpec::FixedString {
                     len,
                     encoding: StringEncoding::Utf8,
                     padding: 0,
@@ -225,6 +225,7 @@ fn preflight_specification(descriptor: &FieldDescriptor) -> AppResult<Specificat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kenwood_schema::FieldCodec;
     use kenwood_tmd750::memory::Term;
 
     type TestResult = AppResult<()>;
@@ -373,14 +374,17 @@ mod tests {
     }
 
     #[test]
-    fn masked_wrong_width_wrong_padding_and_wrong_scope_descriptors_are_rejected() {
+    fn masked_wrong_width_wrong_padding_and_wrong_scope_descriptors_are_rejected() -> TestResult {
         let mut catalog = Catalog { fields: Vec::new() };
         let byte = Specification {
             key: "test-scalar",
             shape: Shape::Byte,
             per_slot: false,
         };
-        for codec in [FieldCodec::BitBool { mask: 1 }, FieldCodec::Bool] {
+        for codec in [
+            FieldCodec::new(CodecSpec::BitBool { mask: 1 })?,
+            FieldCodec::BOOL,
+        ] {
             let descriptor = FieldDescriptor::new("fixture", 10, codec);
             assert!(
                 catalog.append(byte, &descriptor).is_err(),
@@ -400,11 +404,11 @@ mod tests {
             let descriptor = FieldDescriptor::new(
                 "fixture",
                 10,
-                FieldCodec::FixedString {
+                FieldCodec::new(CodecSpec::FixedString {
                     len,
                     encoding,
                     padding,
-                },
+                })?,
             );
             assert!(
                 catalog.append(text, &descriptor).is_err(),
@@ -431,7 +435,7 @@ mod tests {
                 "fixture",
                 10,
                 terms,
-                FieldCodec::Byte { min: 0, max: 255 },
+                FieldCodec::new(CodecSpec::Byte { min: 0, max: 255 })?,
             );
             assert!(
                 catalog.append(slotted, &descriptor).is_err(),
@@ -442,7 +446,7 @@ mod tests {
             "fixture",
             10,
             &[SLOT_TERM],
-            FieldCodec::Byte { min: 0, max: 255 },
+            FieldCodec::new(CodecSpec::Byte { min: 0, max: 255 })?,
         );
         assert!(
             catalog.append(byte, &descriptor).is_err(),
@@ -452,6 +456,7 @@ mod tests {
             catalog.fields.is_empty(),
             "rejected shapes must add no locations"
         );
+        Ok(())
     }
 
     #[test]

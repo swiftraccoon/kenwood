@@ -13,15 +13,18 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
+use kenwood_tmd750::RadioConfig;
 use kenwood_tmd750::file::FILE_SIZE_FULL;
 use kenwood_tmd750::memory::restore::RestorePlan;
 use kenwood_tmd750::transport::SerialCandidate;
-use kenwood_tmd750::{RadioConfig, parse_d750};
 use serde_json::{Map, Value, json};
 
 use super::page_apply::{self, PagePlan, PlanKind};
 use super::snapshot::Snapshot;
 use crate::{AppResult, CommandError, output};
+
+#[cfg(test)]
+mod tests;
 
 /// Pages a preview lists by address before summarizing the rest.
 const LISTED_PAGES: usize = 16;
@@ -79,7 +82,7 @@ fn read_d750(path: &Path) -> AppResult<RadioConfig> {
         .take(limit + 1)
         .read_to_end(&mut bytes)
         .map_err(unreadable)?;
-    Ok(parse_d750(&bytes)?)
+    Ok(RadioConfig::from_bytes(&bytes)?)
 }
 
 /// Arguments of `mcp restore apply`.
@@ -149,7 +152,7 @@ pub(super) fn run_offline(request: &RestoreRequest) -> Option<AppResult<()>> {
 
 pub(super) async fn run_selected(
     endpoint: &SerialCandidate,
-    baud: u32,
+    baud: std::num::NonZeroU32,
     request: &RestoreRequest,
 ) -> AppResult<()> {
     match &request.command {
@@ -158,7 +161,11 @@ pub(super) async fn run_selected(
     }
 }
 
-async fn run_apply(endpoint: &SerialCandidate, baud: u32, request: &ApplyRequest) -> AppResult<()> {
+async fn run_apply(
+    endpoint: &SerialCandidate,
+    baud: std::num::NonZeroU32,
+    request: &ApplyRequest,
+) -> AppResult<()> {
     page_apply::admit_usb(endpoint, baud, PlanKind::Restore)?;
     let current = Snapshot::load_for_usb_write(&request.selection.backup)?;
     let plan = request.selection.prepare(&current)?;
@@ -277,6 +284,3 @@ fn description(plan: &RestorePlan, source: &Source<'_>) -> Map<String, Value> {
     );
     description
 }
-
-#[cfg(test)]
-mod tests;

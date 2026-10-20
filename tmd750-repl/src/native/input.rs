@@ -45,6 +45,9 @@ use tokio::io::Interest;
 #[cfg(unix)]
 use tokio::io::unix::AsyncFd;
 
+#[cfg(test)]
+mod tests;
+
 /// Maximum command bytes before the newline, including an optional CR.
 const MAX_LINE_BYTES: usize = 4096;
 #[cfg(unix)]
@@ -599,6 +602,3 @@ async fn cancelled_input(cancelled: &AtomicBool) {
         tokio::time::sleep(CANCELLATION_POLL).await;
     }
 }
-
-#[cfg(test)]
-mod tests;

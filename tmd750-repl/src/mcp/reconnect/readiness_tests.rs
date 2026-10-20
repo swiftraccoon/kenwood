@@ -227,10 +227,10 @@ impl Backend for ReadinessBackend {
     fn open(
         &mut self,
         selected: &SerialCandidate,
-        baud: u32,
+        baud: std::num::NonZeroU32,
     ) -> Result<Self::Connection, TransportError> {
         assert_eq!(selected, &endpoint(), "only the selected endpoint may open");
-        assert_eq!(baud, 9600, "preserve the selected CAT baud");
+        assert_eq!(baud.get(), 9600, "preserve the selected CAT baud");
         self.shared
             .record(Observation::Open(self.opens))
             .and_then(|()| self.shared.advance(self.open_cost))
@@ -335,7 +335,7 @@ async fn run_with_file(
     Ok(verify_readiness(
         backend,
         &endpoint(),
-        9600,
+        kenwood_tmd750::transport::DEFAULT_BAUD,
         &identity()?,
         recorder,
         cancelled,
@@ -721,7 +721,7 @@ async fn run_gateway_off(
     Ok(verify_readiness_gateway_off(
         backend,
         &endpoint(),
-        9600,
+        kenwood_tmd750::transport::DEFAULT_BAUD,
         &identity()?,
         recorder,
         cancelled,

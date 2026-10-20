@@ -1,13 +1,11 @@
 //! Managed lifecycle coverage over a fake backend: Terminal entry, the probe,
 //! and restoration.
 
-mod failures;
-
 use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use kenwood_tmd750::protocol::mcp::{ACK, read_request, write_request};
+use kenwood_tmd750::protocol::mcp::{ACK, Header};
 use kenwood_tmd750::transport::{KENWOOD_VID, TMD750_MAIN_PID, TMD750_PANEL_PID};
 use kenwood_tmd750::{
     Address, FirmwareIdentity, Identity, MenuFieldSnapshot, Page, RadioModel, RadioType,
@@ -16,6 +14,8 @@ use kenwood_transport::{MockTransport, Transport};
 use serde_json::{Value, json};
 
 use super::*;
+
+mod failures;
 
 type TestResult = AppResult<()>;
 
@@ -84,13 +84,13 @@ fn identity_script(gateway: Option<u8>) -> MockTransport {
 }
 
 fn frame(page: Page, bytes: &[u8]) -> Vec<u8> {
-    let mut frame = write_request(page).to_vec();
+    let mut frame = Header::write_request(page).to_vec();
     frame.extend_from_slice(bytes);
     frame
 }
 
 fn read(mock: &mut MockTransport, page: Page, bytes: &[u8]) {
-    mock.expect(&read_request(page), &frame(page, bytes));
+    mock.expect(&Header::read_request(page), frame(page, bytes));
     mock.expect(&[ACK], &[ACK]);
 }
 
@@ -106,7 +106,7 @@ fn comparisons(plan: &TerminalPlan) -> MockTransport {
 fn complete(plan: &TerminalPlan) -> MockTransport {
     let mut mock = comparisons(plan);
     for page in plan.replacements().iter().filter(|page| !page.is_noop()) {
-        mock.expect(&frame(page.page(), page.replacement()), &[ACK]);
+        mock.expect(frame(page.page(), page.replacement()), &[ACK]);
         read(&mut mock, page.page(), page.replacement());
     }
     mock.expect(b"E", &[ACK]);
@@ -285,7 +285,7 @@ impl Backend for TestBackend {
     fn open(
         &mut self,
         endpoint: &SerialCandidate,
-        baud: u32,
+        baud: std::num::NonZeroU32,
     ) -> Result<Connection, TransportError> {
         assert_eq!(baud, DEFAULT_BAUD, "every open uses the CAT baud");
         self.observed
@@ -510,7 +510,7 @@ async fn missing_write_ack_keeps_debt_and_never_sends_exit_or_reopens() -> TestR
         .iter()
         .find(|page| !page.is_noop())
         .ok_or("changed page missing")?;
-    script.expect_hang(&frame(page.page(), page.replacement()));
+    script.expect_hang(frame(page.page(), page.replacement()));
     let mut harness = Harness::new()?;
     harness.add(false, script, Fault::None);
     let result = harness.run(&plan).await?;
@@ -547,8 +547,7 @@ async fn failed_entry_close_keeps_debt_and_blocks_new_owners() -> TestResult {
 }
 
 #[tokio::test]
-async fn diagnostic_failure_and_close_error_are_preserved_while_restoration_finishes() -> TestResult
-{
+async fn diagnostic_close_failure_preserves_debt_and_prevents_restoration() -> TestResult {
     let plan = plan(0)?;
     let mut harness = Harness::new()?;
     harness.phase(&plan, Fault::None);
@@ -556,17 +555,17 @@ async fn diagnostic_failure_and_close_error_are_preserved_while_restoration_fini
     modem.expect_hang(b"ID\r");
     modem.expect_hang(&[0xe0, 3, 0]);
     harness.add(true, modem, Fault::Close);
-    harness.phase(&plan.restoration()?, Fault::None);
     let result = harness.run(&plan).await?;
     assert!(!result.succeeded());
-    assert_eq!(result.restoration, Restoration::Verified);
+    assert_eq!(result.restoration, Restoration::Owed);
+    assert!(result.restore.is_none());
     let probe = result.probe.ok_or("probe missing")?;
     assert!(matches!(
         probe.outcome,
         super::super::Outcome::VersionFailed { .. }
     ));
     assert!(probe.close_error.is_some());
-    harness.assert_retired(7, 2)
+    harness.assert_retired(4, 1)
 }
 
 #[test]

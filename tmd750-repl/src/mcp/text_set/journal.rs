@@ -19,6 +19,13 @@ use super::UpdateStatus;
 use super::target::{Update, UpdateKind};
 use crate::capture::Recorder;
 
+#[cfg(test)]
+#[path = "my1_journal_tests.rs"]
+mod my1_tests;
+#[cfg(test)]
+#[path = "journal_tests.rs"]
+mod tests;
+
 #[cfg(unix)]
 const FILENAME: &str = "update-journal.jsonl";
 
@@ -324,7 +331,7 @@ impl UpdateJournal {
     ) -> io::Result<()> {
         self.healthy()?;
         self.recorder.record(Record {
-            format_version: 1,
+            format_version: 2,
             kind,
             evidence,
         });
@@ -447,11 +454,3 @@ struct Finished<'a> {
     manual_recovery_may_be_required: bool,
     automatic_restore: bool,
 }
-
-#[cfg(test)]
-#[path = "journal_tests.rs"]
-mod tests;
-
-#[cfg(test)]
-#[path = "my1_journal_tests.rs"]
-mod my1_tests;

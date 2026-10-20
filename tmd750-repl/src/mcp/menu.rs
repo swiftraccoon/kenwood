@@ -1,14 +1,15 @@
 //! Menu-field discovery, decoding and preview, plus one guarded live write.
 //!
 //! `list`, `describe`, `show` and `preview` read the registry and captured
-//! backups only; `apply` opens the radio and writes one registered field.
+//! backups only; `apply` writes the selected field and optional --and fields
+//! in one guarded session.
 
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
+use kenwood_schema::{CodecSpec, DecodedFieldValue, Endian, FieldCodec, StringEncoding};
 use kenwood_tmd750::memory::{
-    DecodedFieldValue, Endian, FieldCodec, MCP_D750_MENU_FIELDS, MenuField, MenuWritePolicy,
-    PatchPlanner, StringEncoding, menu_field,
+    MCP_D750_MENU_FIELDS, MenuField, MenuWritePolicy, PatchPlanner, menu_field,
 };
 use kenwood_tmd750::transport::SerialCandidate;
 use kenwood_tmd750::{
@@ -21,6 +22,9 @@ use serde::Serialize;
 use super::snapshot::Snapshot;
 use super::{IdentityEvidence, write_report};
 use crate::{AppResult, CommandError, capture, output};
+
+#[cfg(test)]
+mod tests;
 
 /// Menu subcommand: offline inspection, or one guarded live write.
 #[derive(Debug, Parser)]
@@ -43,7 +47,7 @@ enum MenuCommand {
     Show(Selection),
     /// Preview exact scalar changes locally; never apply them to a radio.
     Preview(PreviewRequest),
-    /// Write one registered field, comparing and reading back its whole page.
+    /// Write selected registered fields, comparing all pages before the first write.
     Apply(ApplyRequest),
 }
 
@@ -214,7 +218,7 @@ pub(super) fn run_offline(request: &MenuRequest) -> Option<AppResult<()>> {
 
 pub(super) async fn run_selected(
     endpoint: &SerialCandidate,
-    baud: u32,
+    baud: std::num::NonZeroU32,
     request: &MenuRequest,
 ) -> AppResult<()> {
     match &request.command {
@@ -362,19 +366,19 @@ impl Description {
 }
 
 fn storage_description(codec: FieldCodec) -> String {
-    match codec {
-        FieldCodec::Byte { min, max } => format!("unsigned byte; stored range {min}..={max}"),
-        FieldCodec::Bool => "boolean byte; true/false, on/off, yes/no, 1/0".to_owned(),
-        FieldCodec::BitBool { mask } => {
+    match codec.spec() {
+        CodecSpec::Byte { min, max } => format!("unsigned byte; stored range {min}..={max}"),
+        CodecSpec::Bool => "boolean byte; true/false, on/off, yes/no, 1/0".to_owned(),
+        CodecSpec::BitBool { mask } => {
             format!("boolean bit; mask 0x{mask:02X}; true/false, on/off, yes/no, 1/0")
         }
-        FieldCodec::BitField {
+        CodecSpec::BitField {
             mask,
             shift,
             min,
             max,
         } => format!("unsigned bits; mask 0x{mask:02X}, shift {shift}; stored range {min}..={max}"),
-        FieldCodec::FixedString {
+        CodecSpec::FixedString {
             len,
             encoding,
             padding,
@@ -385,7 +389,7 @@ fn storage_description(codec: FieldCodec) -> String {
             };
             format!("exact {encoding} text; maximum {len} encoded bytes; padding 0x{padding:02X}")
         }
-        FieldCodec::Unsigned {
+        CodecSpec::Unsigned {
             width,
             endian,
             min,
@@ -394,7 +398,7 @@ fn storage_description(codec: FieldCodec) -> String {
             "unsigned {width}-byte {}; stored range {min}..={max}",
             endian_label(endian)
         ),
-        FieldCodec::Signed {
+        CodecSpec::Signed {
             width,
             endian,
             min,
@@ -403,7 +407,7 @@ fn storage_description(codec: FieldCodec) -> String {
             "signed {width}-byte {}; stored range {min}..={max}",
             endian_label(endian)
         ),
-        FieldCodec::Bytes { len } => format!("binary; {len} bytes; no scalar preview/apply"),
+        CodecSpec::Bytes { len } => format!("binary; {len} bytes; no scalar preview/apply"),
     }
 }
 
@@ -579,6 +583,3 @@ fn preview(request: &PreviewRequest) -> AppResult<()> {
     ));
     Ok(())
 }
-
-#[cfg(test)]
-mod tests;

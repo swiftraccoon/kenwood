@@ -1,54 +1,47 @@
 [package]
 name = "tmd750-repl"
 version = "0.1.0"
+authors = ["swiftraccoon"]
+categories = ["command-line-utilities"]
 edition = "2024"
+keywords = ["ham-radio", "kenwood", "accessibility", "amateur-radio"]
+license = "GPL-2.0-or-later"
+publish = false
+readme = "README.md"
+repository = "https://github.com/swiftraccoon/kenwood"
 rust-version = "1.94"
 description = "Accessible command-line REPL for the Kenwood TM-D750 transceiver"
-license = "GPL-2.0-or-later"
-authors = ["swiftraccoon"]
-repository = "https://github.com/swiftraccoon/kenwood"
-readme = "README.md"
-keywords = ["ham-radio", "kenwood", "accessibility", "amateur-radio"]
-categories = ["command-line-utilities"]
-publish = false
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-dstar-gateway = { path = "../dstar-gateway" }
-dstar-gateway-core = { path = "../dstar-gateway-core" }
 dirs-next = "2"
+dstar-gateway-core = { path = "../dstar-gateway-core" }
+kenwood-schema = { path = "../kenwood-schema" }
 kenwood-tmd750 = { path = "../tmd750" }
 kenwood-transport = { path = "../kenwood-transport", default-features = false, features = [
-  "native-bluetooth",
+    "native-bluetooth",
 ] }
 mmdvm = { path = "../mmdvm", features = ["dstar", "probe"] }
 rustyline = "18"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-time = { version = "0.3", default-features = false, features = [
-  "formatting",
-  "macros",
-] }
+time = { version = "0.3", default-features = false, features = ["formatting", "macros"] }
 tokio = { version = "1.54", features = [
-  "io-util",
-  "macros",
-  "net",
-  "process",
-  "rt",
-  "signal",
-  "sync",
-  "time",
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt",
+    "signal",
+    "sync",
+    "time",
 ] }
-tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", default-features = false, features = [
-  "pthread",
-  "signal",
-] }
+nix = { version = "0.31", default-features = false, features = ["pthread", "signal"] }
 rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]

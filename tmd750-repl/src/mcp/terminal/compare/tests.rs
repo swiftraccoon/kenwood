@@ -5,8 +5,8 @@ use super::*;
 use crate::mcp::terminal::tests::{blank_fixture, set, write_fixture};
 use crate::mcp::terminal::{TerminalCommand, TerminalRequest};
 use clap::Parser;
+use kenwood_schema::FieldValue;
 use kenwood_tmd750::MemoryImage;
-use kenwood_tmd750::memory::FieldValue;
 use std::path::Path;
 
 type TestResult = AppResult<()>;

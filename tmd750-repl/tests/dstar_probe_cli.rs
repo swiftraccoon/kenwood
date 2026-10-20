@@ -4,8 +4,8 @@
 
 use clap as _;
 use dirs_next as _;
-use dstar_gateway as _;
 use dstar_gateway_core as _;
+use kenwood_schema as _;
 use kenwood_tmd750 as _;
 use kenwood_transport as _;
 use mmdvm as _;
@@ -19,7 +19,6 @@ use serde_json as _;
 use thiserror as _;
 use time as _;
 use tokio as _;
-use tracing as _;
 use tracing_appender as _;
 use tracing_subscriber as _;
 
