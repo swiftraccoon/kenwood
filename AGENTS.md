@@ -1,6 +1,6 @@
 # Kenwood radio workspace
 
-Rust workspace for the Kenwood TH-D75 and TM-D750, a D-STAR reflector stack, packet-radio crates, and native iPadOS/macOS apps. Per-crate rules live in each crate's `AGENTS.md` and load only when files in that crate are touched; read a sibling crate's file explicitly when a change crosses crates.
+Rust workspace for the Kenwood TH-D75 and TM-D750, a D-STAR reflector stack, a BrandMeister REWIND DMR receive stack, packet-radio crates, and native iPadOS/macOS apps. Per-crate rules live in each crate's `AGENTS.md` and load only when files in that crate are touched; read a sibling crate's file explicitly when a change crosses crates.
 
 ## Standard
 
@@ -69,11 +69,12 @@ cargo test -p <package> --doc                            # doctests; nextest nev
 
 ## Workspace boundaries
 
-- Shared crates (`kenwood-transport`, `kenwood-schema`, `mmdvm`) are imported canonically; model crates never re-export their types and there are no compatibility adapters.
+- Shared crates (`kenwood-transport`, `kenwood-schema`, `mmdvm`) are imported canonically and there are no compatibility adapters. Model crates never re-export their types, except the five scalar codec types each `memory::schema` facade re-exports for its descriptors and generated registry (`kenwood-schema/AGENTS.md`).
 - The two MCP live-session engines (TH-D75 and TM-D750) stay separate: framing, retry, entry/exit timing and recovery differ. Do not merge them.
 - The two model libraries share many type names, but the types diverged by design (different `Frequency` domains, tone tables in f64 Hz vs u16 decihertz, field-parser semantics, per-crate `ProtocolError`); only the standard `DCS_CODES` array is byte-identical. Do not fold them into a shared CAT crate; the shared layer is `kenwood-schema`, `kenwood-transport` and `mmdvm`.
 - `kenwood-tmd750` and `tmd750-repl` never depend on `kenwood-thd75`; seam tests in both crates enforce it.
 - The packet-radio crates form a strict DAG: `aprs-is` depends on `aprs`; `aprs` depends on `ax25-codec` and `kiss-tnc`; those two are leaf crates with no workspace path dependencies. `kiss-tnc`, `ax25-codec` and `aprs` are sans-io and never read the clock; `aprs-is` is the tokio shell and the clock source.
+- `dstar-gateway-core`, `mmdvm-core` and `dmr-rewind-core` are sans-io and never read the clock; their tokio shells `dstar-gateway`, `mmdvm` and `dmr-rewind` own the I/O and the clock.
 - `unsafe_code = "forbid"` is workspace-wide. Hand-written unsafe is confined to `kenwood-transport/src/bluetooth.rs` and `thd75/src/screen/vision.rs`; `lodestar-core` and `azimuth-core` omit the Cargo lint only for generated UniFFI scaffolding. `lint.sh` audits this exact path list.
 - New dependencies need large community support and many active maintainers.
 - Tracked developer automation is Rust-only; `tools/` is untracked local scratch. Product sources also include the Swift/DriverKit Lodestar and Azimuth apps.
