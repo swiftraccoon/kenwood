@@ -24,6 +24,8 @@ Rust workspace for the Kenwood TH-D75 and TM-D750, a D-STAR reflector stack, pac
 - Commit messages describe behavior and policy, not the cleanup job: no line or test counts, no file paths, no "squash/consolidated" framing.
 - Every commit subject starts with a scope prefix: the package name (`kenwood-tmd750:`, `tmd750-repl:`) or `docs:`, `ci:`, `build:`, `lint:`, `workspace:`, `README:` for workspace-level changes, followed by a lowercase description.
 - Fold a fix into an unpushed commit with `git commit --fixup=<sha>` then `git rebase --autosquash origin/main`; git 2.55 needs no `-i`.
+- Reword while folding with an `amend! <subject>` commit whose body is the full new message; to fold into a commit already on `origin`, rebase onto that commit's parent. Merge non-adjacent commits by rebuilding on a branch from `origin/main` (`git cherry-pick -n <shas>` per group, `git commit --date=<base author date>`), check `git diff --quiet <old> <new>`, then `git checkout -B main`.
+- A rebase stopped by `index.lock: File exists` hit a transient lock from another git process; resume with `git -c core.editor=true rebase --continue`.
 - Never reference gitignored or internal-only context from committed content (README, source comments, commit messages, PR descriptions): `CLAUDE.local.md`, `docs/`, `specs/`, `phases/`, `ref/`, internal ticket IDs, and local reverse-engineering tools or their endpoints. A gitignored directory that a shipped program creates as its default output (the REPL capture directory) may be documented as that program's output. Cite public upstreams de-pathed (see Reference hierarchy); the two carve-outs are listed there.
 - A superseded finding must be corrected wherever it was written: the instruction file, the doc comment on the constant it produced, and anything that reasoned from it. Grep for the constant, not the prose; a corrected limit also changes the constant's value and its boundary test.
 - TM-D750 operator state: verify CAT state directly instead of asking for menu or screen confirmations. Require an independent control path (the control-panel USB endpoint) before any Terminal activation; never a same-interface escape or a power cycle. Never repeat an MCP session or bypass the uncertain-framing safeguards to work around a silent radio; a consumed one-shot approval does not cover another attempt.
@@ -63,6 +65,7 @@ cargo test -p <package> --doc                            # doctests; nextest nev
 - Two crates ship `examples/monitor.rs` (thd75, aprs-is) and collide in the shared target directory: always `cargo run -p <crate> --example monitor`, never `./target/debug/examples/monitor`.
 - `-E 'test(<substring>)'` matches test names (module path included), never binary names: an integration binary whose tests lack the substring is skipped silently, so check the `N tests run` count or use `binary(<target>)`.
 - Run `cargo fmt --all` once at the end of an edit batch: a mid-batch format rewrites anchors and forces every later edit to re-read its file.
+- `cargo fmt --all` does not reach the standalone fuzz workspaces (`tmd750/fuzz`, `dstar-gateway-core/fuzz`): run `cargo fmt` inside one after editing a target.
 
 ## Workspace boundaries
 
@@ -95,7 +98,7 @@ cargo test -p <package> --doc                            # doctests; nextest nev
 - KI4LAX spec comparisons in `thd75/tests/spec_audit.rs` are `#[ignore]`; run them with `THD75_KI4LAX_SPEC=/absolute/path.json cargo test -p kenwood-thd75 --test spec_audit -- --ignored`.
 - `lint.sh` requires `cargo-audit`, `cargo-deny`, `cargo-machete`, `shellcheck`, `taplo` and `mdbook`; a missing tool fails the gate.
 - Windows: D-STAR fixtures that touch directory durability go through the explicit durability seam, never a Unix directory open plus sync.
-- `ci-local.sh` runs macOS locally plus Ubuntu and Fedora on k8s pods. Stuck `ci-ubuntu`/`ci-fedora` pods from a killed run must be force-deleted first; the script silences kubectl errors, so "no pod output" is the symptom. macOS `ar` warnings starting `warning: kenwood-thd75@` are harmless. zsh: `$pipestatus` is lowercase and unquoted variables do not word-split (use `xargs` or `${=var}`).
+- `ci-local.sh` runs Ubuntu and Fedora on k8s pods; its macOS step is commented out, so `./lint.sh` covers macOS. Its snapshot omits the gitignored `Cargo.lock`, so the pods resolve a fresh lockfile like GitHub CI, and a crates.io release after the run can still fail the push. Stuck `ci-ubuntu`/`ci-fedora` pods from a killed run must be force-deleted first; the script silences kubectl errors, so "no pod output" is the symptom. macOS `ar` warnings starting `warning: kenwood-thd75@` are harmless. zsh: `$pipestatus` is lowercase and unquoted variables do not word-split (use `xargs` or `${=var}`).
 - `ci-local.sh` catches Linux-only `dead_code` the macOS `lint.sh` cannot: an item used only under `#[cfg(any(target_os = "macos", test))]` is dead in a Linux non-test build and fails `-D warnings`. Gate such helpers with the same `cfg`.
 - A test through a `cfg!(target_os = "macos")` early return passes `lint.sh` and fails Linux and Windows CI: assert each platform's outcome, or gate the test with `#[cfg(target_os = "macos")]`.
 - `ci-local.sh` snapshots the tree with `git ls-files --cached`; stage tracked-file deletions (`git rm`) before running it, or its tar fails with `Cannot stat` on the removed paths.
@@ -142,6 +145,7 @@ cargo test -p <package> --doc                            # doctests; nextest nev
 - `dead_code` expectations cannot stage a new module: a module-level expect makes everything live, and an item-level expect on a test-only caller is unfulfilled in the test build. Wire a real consumer instead.
 - `#[expect]` is evaluated per target, not per cfg block; split `#[cfg(target_os)]` branches into separate functions. `./lint.sh` runs on macOS only; `./ci-local.sh` catches Linux.
 - `drop(map.insert(..))` on a `Copy` value is `dropping_copy_types`; bind it as `let _previous = ...`.
+- An `#[expect(deprecated)]` for a dependency's deprecation needs that release as the dependency's minimum version (`tokio = "1.54"`); an older lockfile otherwise fails it as unfulfilled.
 
 ## Cargo `[lints]` inheritance
 
