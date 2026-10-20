@@ -1,5 +1,24 @@
 # mcp-d75-extract
 
+## Commands
+
+Both commands read local inputs; drop `--check` to write, and pass
+`--source-dir <ilspy-project>` instead of `--assembly` to reuse one
+decompilation.
+
+```bash
+cargo run -q -p mcp-d75-extract -- extract --model thd75 \
+  --assembly <MCP-D75.exe> --ilspycmd <ilspycmd> --language-file <English.lng> \
+  --mcp-version 1.03 --firmware 1.03 \
+  --output thd75/data/mcp_d75_menu_schema.json \
+  --rust-output thd75/src/memory/menu_fields.rs --strict-known-layout --check
+cargo run -q -p mcp-d75-extract -- extract --model tmd750 \
+  --assembly <mcp_d750.exe> --ilspycmd <ilspycmd> --language-file <english.lng> \
+  --mcp-version 1.00 --firmware 1.00 \
+  --output tmd750/data/mcp_d750_menu_schema.json \
+  --rust-output tmd750/src/memory/menu_fields.rs --strict-known-layout --check
+```
+
 ## Non-negotiables
 
 - **The TH-D75 registry is the regression proof.** Regenerating
@@ -7,10 +26,9 @@
   reproduce the committed file byte for byte; only a deliberate bump changes
   `MCP_D75_SCHEMA_VERSION`. Any other changed byte is an extractor defect, and
   no generated output is ever hand-edited.
-- **Both manifests are gated.** `extract --check --strict-known-layout` must
-  pass for `thd75/data/mcp_d75_menu_schema.json` and
-  `tmd750/data/mcp_d750_menu_schema.json` before any commit touching this
-  crate. Regenerate deliberately and say why in the commit.
+- **Both manifests and both registries are gated.** Both commands above,
+  `--rust-output` included, must pass before any commit touching this crate.
+  Regenerate deliberately and say why in the commit.
 - **Manifests are typed and deterministic.** JSON key order is serde struct
   declaration order; every list is in source or spec order or sorted; no
   timestamps, absolute paths or `HashMap` iteration in an output.
@@ -65,6 +83,6 @@
 4. `cargo run -q -p mcp-d75-extract -- diff <committed> <scratch>` and review
    every line; moved or re-coded fields point at hand-written code to change.
 5. Update the spec's `reviewed` counts, extract strictly to the committed path,
-   regenerate the TH-D75 registry, update the accepted firmware identities in
+   regenerate that radio's registry, update the accepted firmware identities in
    the radio crate, run the full gate, and tag the previous commit
    `thd75-fw-<old>` or `tmd750-fw-<old>` if older firmware support matters.

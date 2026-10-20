@@ -178,17 +178,13 @@
 
 ## Commands
 
-Regenerate the registry and manifest with the command below without `--check`,
-then rerun it with `--check`, which fails on any difference. Its input paths
-are local:
-
 ```bash
-cargo run -p mcp-d75-extract -- extract --model tmd750 \
-  --assembly <mcp_d750.exe> --ilspycmd <ilspycmd> --language-file <english.lng> \
-  --mcp-version 1.00 --firmware 1.00 \
-  --output tmd750/data/mcp_d750_menu_schema.json \
-  --rust-output tmd750/src/memory/menu_fields.rs --strict-known-layout --check
+TMD750_PORT=<usb-path> cargo test -p kenwood-tmd750 --test hardware -- --ignored   # read-only live suite
 ```
+
+The suite writes no setting and sends no transmit command, but its MCP probe
+interrupts normal operation until the exit. Regenerate the registry and
+manifest with the TM-D750 command in `mcp-d75-extract/AGENTS.md`.
 
 ## Testing
 

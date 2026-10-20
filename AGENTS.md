@@ -40,7 +40,7 @@ Committed doc comments, READMEs and comments state the contract: inputs, units, 
 - Prefer the named mechanism over house vocabulary: "the open connection", "the fsynced journal record", "returns `Error::X`", not "owner", "durable intent", "evidence", "admission", "qualification".
 - Comments state current behavior, not how it was reached: no first-person narrative, no superseded implementation, no fix rationale.
 - Operator-facing strings carry state and next action only.
-- Dated bench runs, approvals, capture paths, per-attempt timings and verification history belong in the gitignored `CLAUDE.local.md`; committed prose keeps only the tested configuration tuple and any timing or protocol fact a caller must handle.
+- Dated bench runs, approvals, capture paths, per-attempt timings and verification history belong in the gitignored qualification ledgers under `docs/`; a crate's `CLAUDE.local.md` keeps only the facts and gotchas they established, and committed prose keeps only the tested configuration tuple and any timing or protocol fact a caller must handle.
 - Instruction files (`AGENTS.md`, `CLAUDE.local.md`) hold rules, gotchas and non-generic commands only: no session narrative, no dated ledgers, no directory trees or module maps, and under 200 lines each.
 
 ## Commands
@@ -65,7 +65,7 @@ cargo test -p <package> --doc                            # doctests; nextest nev
 - Two crates ship `examples/monitor.rs` (thd75, aprs-is) and collide in the shared target directory: always `cargo run -p <crate> --example monitor`, never `./target/debug/examples/monitor`.
 - `-E 'test(<substring>)'` matches test names (module path included), never binary names: an integration binary whose tests lack the substring is skipped silently, so check the `N tests run` count or use `binary(<target>)`.
 - Run `cargo fmt --all` once at the end of an edit batch: a mid-batch format rewrites anchors and forces every later edit to re-read its file.
-- `cargo fmt --all` does not reach the standalone fuzz workspaces (`tmd750/fuzz`, `dstar-gateway-core/fuzz`): run `cargo fmt` inside one after editing a target.
+- `cargo fmt --all` does not reach the standalone fuzz workspaces (`tmd750/fuzz`, `dstar-gateway-core/fuzz`): run `cargo fmt` inside one after editing a target. A new target also needs its `[[bin]]` in that `fuzz/Cargo.toml` and a row in `.github/workflows/fuzz.yml`, whose matrix lists every target CI runs.
 
 ## Workspace boundaries
 
