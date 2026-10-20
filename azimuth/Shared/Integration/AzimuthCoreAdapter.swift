@@ -30,6 +30,7 @@ final class AzimuthCoreByteTransport: ByteTransport, @unchecked Sendable {
     }
 
     func write(bytes: Data) async throws {
+        guard !bytes.isEmpty else { return }
         let operation = takeOperationID()
         let started = DispatchTime.now().uptimeNanoseconds
         azimuthCoreIOTrace(
@@ -48,6 +49,7 @@ final class AzimuthCoreByteTransport: ByteTransport, @unchecked Sendable {
     }
 
     func read(maxLength: UInt32) async throws -> Data {
+        guard maxLength > 0 else { return Data() }
         let operation = takeOperationID()
         let started = DispatchTime.now().uptimeNanoseconds
         azimuthCoreIOTrace(
@@ -160,14 +162,15 @@ struct AzimuthCoreSettingSchema: Sendable {
     let productCatalog: RadioSettingCatalog
 
     var deferredBlobCount: Int {
-        records.lazy.filter(\.isBlob).count
+        records.lazy.filter { $0.isBlob() }.count
     }
 
     var scalarSettingCount: Int {
         records.count - deferredBlobCount
     }
 
-    init(records: [SettingRecord] = settingCatalog()) throws {
+    init(records: [SettingRecord]? = nil) throws {
+        let records = try records ?? settingCatalog()
         guard records.count == Self.expectedSettingCount else {
             throw AzimuthCoreIntegrationError.catalogCount(
                 expected: Self.expectedSettingCount,
@@ -180,8 +183,9 @@ struct AzimuthCoreSettingSchema: Sendable {
         indexed.reserveCapacity(records.count)
         definitions.reserveCapacity(records.count)
         for record in records {
-            guard indexed.updateValue(record, forKey: record.id) == nil else {
-                throw AzimuthCoreIntegrationError.duplicateSettingID(record.id)
+            let identifier = record.id()
+            guard indexed.updateValue(record, forKey: identifier) == nil else {
+                throw AzimuthCoreIntegrationError.duplicateSettingID(identifier)
             }
             definitions.append(try Self.definition(for: record))
         }
@@ -196,18 +200,19 @@ struct AzimuthCoreSettingSchema: Sendable {
 
     private static func definition(for record: SettingRecord) throws -> RadioSettingDefinition {
         let mapped = try domain(for: record)
-        let dedicatedLifecycle = record.writePolicy == .dedicatedLifecycle
+        let identifier = record.id()
+        let dedicatedLifecycle = record.writePolicy() == .dedicatedLifecycle
         let specialized = mapped.specialized || dedicatedLifecycle
         return RadioSettingDefinition(
-            id: record.id,
+            id: identifier,
             group: group(for: record),
-            title: record.displayName,
-            summary: record.writeRestriction ?? summary(for: record, specialized: specialized),
+            title: record.displayName(),
+            summary: record.writeRestriction() ?? summary(for: record, specialized: specialized),
             domain: mapped.domain,
-            menuNumbers: THD75MenuNumberIndex.numbers(for: record.id),
-            schemaReference: "MCP-D75 \(menuName(record.menu)) • 0x\(String(record.offset, radix: 16, uppercase: true))",
-            requiresRestart: record.requiresRestart,
-            requiresReconnect: record.requiresReconnect,
+            menuNumbers: THD75MenuNumberIndex.numbers(for: identifier),
+            schemaReference: "MCP-D75 \(menuName(record.menu())) • 0x\(String(record.offset(), radix: 16, uppercase: true))",
+            requiresRestart: record.requiresRestart(),
+            requiresReconnect: record.requiresReconnect(),
             isSpecializedEditor: specialized
         )
     }
@@ -215,63 +220,64 @@ struct AzimuthCoreSettingSchema: Sendable {
     private static func domain(
         for record: SettingRecord
     ) throws -> (domain: RadioSettingDomain, specialized: Bool) {
-        if record.presentation == .scaledInteger {
-            guard record.valueKind == .unsignedInteger else {
+        let identifier = record.id()
+        if record.presentation() == .scaledInteger {
+            guard record.valueKind() == .unsignedInteger else {
                 throw AzimuthCoreIntegrationError.unsupportedSetting(
-                    record.id,
+                    identifier,
                     reason: "a scaled field must use unsigned integer storage"
                 )
             }
-            guard let minimum = record.unsignedMin,
-                  let maximum = record.unsignedMax,
+            guard let minimum = record.unsignedMin(),
+                  let maximum = record.unsignedMax(),
                   let lower = Int(exactly: minimum),
                   let upper = Int(exactly: maximum),
                   lower <= upper else {
                 throw AzimuthCoreIntegrationError.unsupportedSetting(
-                    record.id,
+                    identifier,
                     reason: "its scaled raw range cannot be represented on this platform"
                 )
             }
-            guard let transform = record.storageTransform else {
+            guard let transform = record.storageTransform() else {
                 throw AzimuthCoreIntegrationError.unsupportedSetting(
-                    record.id,
+                    identifier,
                     reason: "scaled presentation is missing its storage transform"
                 )
             }
             let scaled = RadioScaledIntegerDomain(
                 rawRange: lower...upper,
-                inputUnit: transform.inputUnit,
-                numerator: transform.numerator,
-                denominator: transform.denominator,
-                displayDecimalPlaces: Int(transform.displayDecimalPlaces)
+                inputUnit: transform.inputUnit(),
+                numerator: transform.numerator(),
+                denominator: transform.denominator(),
+                displayDecimalPlaces: Int(transform.displayDecimalPlaces())
             )
             guard scaled.isValid else {
                 throw AzimuthCoreIntegrationError.unsupportedSetting(
-                    record.id,
+                    identifier,
                     reason: "its generated display transform is invalid"
                 )
             }
             return (.scaledInteger(scaled), false)
         }
 
-        let presentationNeedsSpecializedEditor = record.presentation == .blob
-        switch record.valueKind {
+        let presentationNeedsSpecializedEditor = record.presentation() == .blob
+        switch record.valueKind() {
         case .boolean:
             return (.boolean, presentationNeedsSpecializedEditor)
         case .choice:
             var choices: [RadioSettingOption] = []
             var seen: Set<UInt64> = []
-            for option in record.options where seen.insert(option.rawValue).inserted {
-                guard let raw = Int(exactly: option.rawValue) else {
+            for option in record.options() where seen.insert(option.rawValue()).inserted {
+                guard let raw = Int(exactly: option.rawValue()) else {
                     return (
                         .data(description: "Choice values exceed this platform's integer range."),
                         true
                     )
                 }
-                let label = option.label ?? humanize(option.member)
+                let label = option.label() ?? humanize(option.member())
                 choices.append(RadioSettingOption(rawValue: raw, label: label))
             }
-            for allowed in record.allowedValues where seen.insert(allowed).inserted {
+            for allowed in record.allowedValues() where seen.insert(allowed).inserted {
                 guard let raw = Int(exactly: allowed) else {
                     return (
                         .data(description: "Choice values exceed this platform's integer range."),
@@ -282,14 +288,14 @@ struct AzimuthCoreSettingSchema: Sendable {
             }
             guard !choices.isEmpty else {
                 throw AzimuthCoreIntegrationError.unsupportedSetting(
-                    record.id,
+                    identifier,
                     reason: "the schema declared a choice without any allowed values"
                 )
             }
             return (.choice(choices), presentationNeedsSpecializedEditor)
         case .unsignedInteger:
-            guard let minimum = record.unsignedMin,
-                  let maximum = record.unsignedMax,
+            guard let minimum = record.unsignedMin(),
+                  let maximum = record.unsignedMax(),
                   let lower = Int(exactly: minimum),
                   let upper = Int(exactly: maximum),
                   lower <= upper else {
@@ -303,8 +309,8 @@ struct AzimuthCoreSettingSchema: Sendable {
                 presentationNeedsSpecializedEditor
             )
         case .signedInteger:
-            guard let minimum = record.signedMin,
-                  let maximum = record.signedMax,
+            guard let minimum = record.signedMin(),
+                  let maximum = record.signedMax(),
                   let lower = Int(exactly: minimum),
                   let upper = Int(exactly: maximum),
                   lower <= upper else {
@@ -318,15 +324,15 @@ struct AzimuthCoreSettingSchema: Sendable {
                 presentationNeedsSpecializedEditor
             )
         case .text:
-            guard let length = Int(exactly: record.byteLength) else {
+            guard let length = Int(exactly: record.byteLength()) else {
                 throw AzimuthCoreIntegrationError.unsupportedSetting(
-                    record.id,
+                    identifier,
                     reason: "text width exceeds this platform's integer range"
                 )
             }
-            guard let textEncoding = record.textEncoding else {
+            guard let textEncoding = record.textEncoding() else {
                 throw AzimuthCoreIntegrationError.unsupportedSetting(
-                    record.id,
+                    identifier,
                     reason: "a text field is missing its generated encoding constraint"
                 )
             }
@@ -340,26 +346,26 @@ struct AzimuthCoreSettingSchema: Sendable {
             )
         case .bytes:
             return (
-                .data(description: "Exact \(record.byteLength)-byte radio data."),
+                .data(description: "Exact \(record.byteLength())-byte radio data."),
                 true
             )
         }
     }
 
     private static func summary(for record: SettingRecord, specialized: Bool) -> String {
-        switch record.presentation {
+        switch record.presentation() {
         case .scaledInteger:
-            if let transform = record.storageTransform {
-                return "Set this authoritative \(menuName(record.menu)) coordinate component in \(transform.inputUnit); Azimuth preserves the exact encoded D75 value."
+            if let transform = record.storageTransform() {
+                return "Set this \(menuName(record.menu())) coordinate component in \(transform.inputUnit()); Azimuth preserves the exact encoded D75 value."
             }
             return "Set this authoritative scaled MCP-D75 value in its declared display unit."
         case .blob:
-            return "Authoritative \(record.byteLength)-byte MCP-D75 content; use its specialized editor."
+            return "\(record.byteLength())-byte MCP-D75 content; use its specialized editor."
         case .direct:
             if specialized {
                 return "Authoritative MCP-D75 value requiring a format-specific editor."
             }
-            switch record.valueKind {
+            switch record.valueKind() {
             case .boolean: return "Enable or disable this authoritative MCP-D75 option."
             case .choice: return "Select an authoritative MCP-D75 value."
             case .unsignedInteger, .signedInteger: return "Set the authoritative MCP-D75 numeric value."
@@ -379,13 +385,14 @@ struct AzimuthCoreSettingSchema: Sendable {
     }
 
     private static func group(for record: SettingRecord) -> RadioSettingGroup {
-        switch record.menu {
+        switch record.menu() {
         case .gps: return .gps
         case .aprs: return .aprs
         case .dv: return .digitalVoice
         case .radio:
-            let local = record.id.split(separator: ".", maxSplits: 1).last
-                .map(String.init)?.lowercased() ?? record.id.lowercased()
+            let identifier = record.id()
+            let local = identifier.split(separator: ".", maxSplits: 1).last
+                .map(String.init)?.lowercased() ?? identifier.lowercased()
             if containsAny(local, [
                 "display", "backlight", "brightness", "background", "lcd", "meter",
             ]) {
@@ -439,7 +446,7 @@ struct AzimuthCoreSettingSchema: Sendable {
 struct AzimuthCoreCatalogProvider: RadioSettingCatalogProviding {
     private let schema: AzimuthCoreSettingSchema
 
-    init(records: [SettingRecord] = settingCatalog()) throws {
+    init(records: [SettingRecord]? = nil) throws {
         schema = try AzimuthCoreSettingSchema(records: records)
     }
 
@@ -459,17 +466,18 @@ enum AzimuthCoreSettingValueBridge {
         _ value: SettingValue,
         record: SettingRecord
     ) throws -> ProposedSettingValue {
-        switch (record.valueKind, value) {
+        let identifier = record.id()
+        switch (record.valueKind(), value) {
         case (.boolean, .boolean(let value)):
             return .boolean(value)
         case (.choice, .unsigned(let value)):
-            guard let value = Int(exactly: value) else { throw overflow(record.id) }
+            guard let value = Int(exactly: value) else { throw overflow(identifier) }
             return .choice(rawValue: value)
         case (.unsignedInteger, .unsigned(let value)):
-            guard let value = Int(exactly: value) else { throw overflow(record.id) }
+            guard let value = Int(exactly: value) else { throw overflow(identifier) }
             return .integer(value)
         case (.signedInteger, .signed(let value)):
-            guard let value = Int(exactly: value) else { throw overflow(record.id) }
+            guard let value = Int(exactly: value) else { throw overflow(identifier) }
             return .integer(value)
         case (.text, .text(let value)):
             return .text(value)
@@ -477,7 +485,7 @@ enum AzimuthCoreSettingValueBridge {
             return .data(value)
         default:
             throw AzimuthCoreIntegrationError.unsupportedSetting(
-                record.id,
+                identifier,
                 reason: "the live value type does not match the generated schema"
             )
         }
@@ -487,14 +495,15 @@ enum AzimuthCoreSettingValueBridge {
         _ value: ProposedSettingValue,
         record: SettingRecord
     ) throws -> SettingValue {
-        switch (record.valueKind, value) {
+        let identifier = record.id()
+        switch (record.valueKind(), value) {
         case (.boolean, .boolean(let value)):
             return .boolean(value: value)
         case (.choice, .choice(let rawValue)):
-            guard rawValue >= 0 else { throw typeMismatch(record.id) }
+            guard rawValue >= 0 else { throw typeMismatch(identifier) }
             return .unsigned(value: UInt64(rawValue))
         case (.unsignedInteger, .integer(let value)):
-            guard value >= 0 else { throw typeMismatch(record.id) }
+            guard value >= 0 else { throw typeMismatch(identifier) }
             return .unsigned(value: UInt64(value))
         case (.signedInteger, .integer(let value)):
             return .signed(value: Int64(value))
@@ -503,7 +512,7 @@ enum AzimuthCoreSettingValueBridge {
         case (.bytes, .data(let value)):
             return .bytes(value: value)
         default:
-            throw typeMismatch(record.id)
+            throw typeMismatch(identifier)
         }
     }
 

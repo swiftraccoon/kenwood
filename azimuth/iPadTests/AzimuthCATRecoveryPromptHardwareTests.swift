@@ -19,7 +19,7 @@ final class AzimuthCATRecoveryPromptHardwareTests: XCTestCase {
         }
 
         let recoveryProbe = IPadHardwareRecoveryFactoryProbe()
-        let records = settingCatalog()
+        let records = try settingCatalog()
         let controller = try AzimuthLiveRadioController(
             transport: AzimuthUSBSerialTransport.platformDefault(),
             records: records,

@@ -1,19 +1,18 @@
 //! Rust-owned qualified automation and stale-safe setting execution.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use ax25_codec::build_ax25;
+use kenwood_schema::DecodedFieldValue;
 use kenwood_thd75::error::Error as RadioError;
-use kenwood_thd75::memory::{
-    DecodedFieldValue, MCP_D75_MENU_FIELDS, MenuField, PatchSet, menu_field,
-};
+use kenwood_thd75::memory::{MCP_D75_MENU_FIELDS, MenuField, PatchSet, menu_field};
 use kenwood_thd75::protocol::programming::PAGE_SIZE;
 use kenwood_thd75::radio::Radio;
 use kenwood_thd75::radio::automation::{
     AutomationAbi, AutomationSession, AutomationSnapshot, FrontPanelKey as RadioFrontPanelKey,
-    GuardedKeyError, GuardedKeyOutcome,
+    GuardedKeyError, GuardedKeyOutcomeKind,
 };
 use kenwood_thd75::radio::kiss_session::KissSession;
 use kenwood_thd75::radio::menu::MenuFieldSnapshot;
@@ -21,19 +20,17 @@ use kenwood_thd75::radio::programming::{
     McpPage, McpPageExchange, McpPageExchangeError, McpPageExchangeOperationError, WritableMcpPage,
 };
 use kenwood_thd75::screen::{SCREEN_HEIGHT, SCREEN_WIDTH};
-use kenwood_thd75::types::{
-    KissDuplex, KissPersistence, KissSlotTime, KissTxDelay, KissTxTail, PacketDataRate,
-    SerialNumber, TncDataBand as RadioTncDataBand, TncMode, TncState,
-};
+use kenwood_thd75::types::{SerialNumber, TncDataBand as RadioTncDataBand, TncMode, TncState};
 use kenwood_transport::{Transport as RadioTransport, TransportError};
 use kiss_tnc::KissCommand;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::aprs::{
-    AprsActivityRecord, AprsActivityStore, AprsOperationalSnapshot, AprsSessionConfig,
-    AprsSessionStatus, AprsStartAuthority,
+    AprsActivityRecord, AprsActivityStore, AprsConfiguration, AprsKissInterface,
+    AprsOperationalSnapshot, AprsSessionConfig, AprsSessionStatus, AprsStartAuthority,
 };
 use crate::catalog::{SettingChange, SettingValue, build_patch_plan, validate_changes};
+use crate::identifiers::{ScreenLeaseId, SettingSnapshotId};
 use crate::if_dsp_radio::{
     EngageIfDspError, IF_CENTER_HZ, SavedIfDspRadioState, engage_if_dsp_session,
     restore_if_dsp_radio, restore_if_dsp_session, retune_if_dsp_session,
@@ -49,24 +46,50 @@ use crate::transport::{ByteTransport, SwiftByteTransport};
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct AutomationAbiRecord {
     /// Firmware automation ABI version. V1.03.AZM reports `3`.
-    pub version: u8,
+    version: u8,
     /// Firmware feature bitmap. V1.03.AZM reports `0x7F`.
-    pub features: u8,
+    features: u8,
     /// Largest accepted front-panel key identifier.
-    pub max_key: u8,
+    max_key: u8,
     /// Largest accepted input phase.
-    pub max_phase: u8,
+    max_phase: u8,
     /// Exact validated CAT `AE` serial for the connected TH-D75.
-    pub radio_serial_number: String,
+    radio_serial_number: String,
 }
 
 impl AutomationAbiRecord {
+    /// Return the qualified firmware ABI revision.
+    #[must_use]
+    pub const fn version(&self) -> u8 {
+        self.version
+    }
+    /// Return the qualified feature bitmap.
+    #[must_use]
+    pub const fn features(&self) -> u8 {
+        self.features
+    }
+    /// Return the largest supported key identifier.
+    #[must_use]
+    pub const fn max_key(&self) -> u8 {
+        self.max_key
+    }
+    /// Return the largest supported input phase.
+    #[must_use]
+    pub const fn max_phase(&self) -> u8 {
+        self.max_phase
+    }
+    /// Borrow the exact CAT identity retained during connection.
+    #[must_use]
+    pub fn radio_serial_number(&self) -> &str {
+        &self.radio_serial_number
+    }
+
     fn qualified(value: AutomationAbi, radio_serial_number: String) -> Self {
         Self {
-            version: value.version,
-            features: value.features,
-            max_key: value.max_key,
-            max_phase: value.max_phase,
+            version: value.version(),
+            features: value.features(),
+            max_key: value.max_key(),
+            max_phase: value.max_phase(),
             radio_serial_number,
         }
     }
@@ -163,25 +186,78 @@ impl From<FrontPanelKey> for RadioFrontPanelKey {
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct RemoteScreenFrame {
     /// One-use host lease. A guarded tap must return this exact value.
-    pub lease_id: u64,
+    lease_id: ScreenLeaseId,
     /// Screen width in pixels. Always 240.
-    pub width: u32,
+    width: u32,
     /// Screen height in pixels. Always 180.
-    pub height: u32,
+    height: u32,
     /// Bytes per row in `rgba8888`. Always 960.
-    pub row_bytes: u32,
+    row_bytes: u32,
     /// Canonical top-down RGB565 little-endian pixels from the firmware.
-    pub rgb565_le: Vec<u8>,
+    rgb565_le: Vec<u8>,
     /// Top-down RGBA8888 pixels for direct app rendering.
-    pub rgba8888: Vec<u8>,
+    rgba8888: Vec<u8>,
     /// Firmware framebuffer generation.
-    pub generation: u32,
+    generation: u32,
     /// Host-verified reflected IEEE CRC-32 of `rgb565_le`.
-    pub crc32: u32,
+    crc32: u32,
     /// Exact cumulative automation command count.
-    pub command_count: u32,
+    command_count: u32,
     /// Exact even firmware seqlock value.
-    pub seqlock: u32,
+    seqlock: u32,
+}
+
+impl RemoteScreenFrame {
+    /// Return the one-use token matched against the actor's retained snapshot.
+    #[must_use]
+    pub const fn lease_id(&self) -> ScreenLeaseId {
+        self.lease_id
+    }
+    /// Return the frame width in pixels.
+    #[must_use]
+    pub const fn width(&self) -> u32 {
+        self.width
+    }
+    /// Return the frame height in pixels.
+    #[must_use]
+    pub const fn height(&self) -> u32 {
+        self.height
+    }
+    /// Return the RGBA byte stride.
+    #[must_use]
+    pub const fn row_bytes(&self) -> u32 {
+        self.row_bytes
+    }
+    /// Borrow canonical top-down RGB565 little-endian bytes.
+    #[must_use]
+    pub fn rgb565_le(&self) -> &[u8] {
+        &self.rgb565_le
+    }
+    /// Borrow top-down RGBA8888 display bytes.
+    #[must_use]
+    pub fn rgba8888(&self) -> &[u8] {
+        &self.rgba8888
+    }
+    /// Return the authenticated framebuffer generation.
+    #[must_use]
+    pub const fn generation(&self) -> u32 {
+        self.generation
+    }
+    /// Return the verified RGB565 checksum.
+    #[must_use]
+    pub const fn crc32(&self) -> u32 {
+        self.crc32
+    }
+    /// Return the firmware's cumulative automation command count.
+    #[must_use]
+    pub const fn command_count(&self) -> u32 {
+        self.command_count
+    }
+    /// Return the authenticated even seqlock.
+    #[must_use]
+    pub const fn seqlock(&self) -> u32 {
+        self.seqlock
+    }
 }
 
 /// Semantic outcome of one guarded tap.
@@ -227,7 +303,7 @@ pub struct SettingValueRecord {
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct SettingReadResult {
     /// Opaque optimistic-concurrency snapshot identifier.
-    pub snapshot_id: u64,
+    pub snapshot_id: SettingSnapshotId,
     /// Typed values keyed by `setting_id`.
     pub values: Vec<SettingValueRecord>,
 }
@@ -257,10 +333,10 @@ pub struct SettingChangeResult {
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct SettingApplyReport {
     /// Reviewed snapshot consumed by this batch.
-    pub previous_snapshot_id: u64,
+    pub previous_snapshot_id: SettingSnapshotId,
     /// MCP pages actually written and immediately read-back verified.
     pub pages_written: Vec<u16>,
-    /// Result for every approved change in caller order.
+    /// Result for every accepted change in caller order.
     pub changes: Vec<SettingChangeResult>,
     /// Values fetched in a second live MCP session after the write session
     /// exited and CAT was restored, plus their new concurrency token.
@@ -316,6 +392,21 @@ impl IfDspRadioStatus {
     }
 }
 
+/// Completion boundary reached before a setting batch failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum SettingApplyPhase {
+    /// Schema or operation preflight; no writes have started.
+    Preflight,
+    /// MCP compare, write, readback or exit; inspect possibly written pages.
+    Exchange,
+    /// Writes and their immediate verification completed; live refresh failed.
+    LiveRefresh,
+    /// Live pages were read but could not be decoded.
+    LiveDecode,
+    /// Live values were decoded and retained but differ from the requested values.
+    LiveVerification,
+}
+
 /// Clear errors surfaced across the Swift boundary.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, uniffi::Error)]
 pub enum AutomationError {
@@ -357,13 +448,16 @@ pub enum AutomationError {
     /// No unused authenticated screen is available for guarded input.
     #[error("guarded input requires a fresh unused screen")]
     ScreenLeaseUnavailable,
+    /// Every nonzero controller identifier was consumed; reconnect to start anew.
+    #[error("controller identifier space is exhausted; close and reconnect")]
+    IdentifierExhausted,
     /// The UI attempted input from an older screen than the controller holds.
     #[error("stale screen lease {received}; current lease is {expected}")]
     ScreenLeaseStale {
         /// Current one-use lease.
-        expected: u64,
+        expected: ScreenLeaseId,
         /// Lease supplied by Swift.
-        received: u64,
+        received: ScreenLeaseId,
     },
     /// Firmware-guarded input failed before a complete semantic result.
     #[error("guarded input failed: {detail}")]
@@ -395,7 +489,7 @@ pub enum AutomationError {
     #[error("setting snapshot {snapshot_id} is unavailable; read the values again")]
     SettingsSnapshotUnavailable {
         /// Requested snapshot identifier.
-        snapshot_id: u64,
+        snapshot_id: SettingSnapshotId,
     },
     /// A typed expected value did not match the reviewed snapshot.
     #[error("setting precondition failed for {setting_id}: expected {expected}, reviewed {actual}")]
@@ -408,14 +502,20 @@ pub enum AutomationError {
         actual: String,
     },
     /// Live bytes changed after review; the compare phase performed zero writes.
-    #[error("approved setting snapshot is stale; no settings were written: {detail}")]
+    #[error("reviewed setting snapshot is stale; no settings were written: {detail}")]
     SettingsSnapshotStale {
         /// First byte mismatch reported by the radio layer.
         detail: String,
     },
-    /// Setting execution failed; the detail states whether writes may have started.
-    #[error("setting apply failed: {detail}")]
+    /// Setting execution failed with explicit progress and independent cleanup.
+    #[error("setting apply failed during {phase:?}: {detail}; cleanup: {cleanup_detail:?}")]
     SettingsApply {
+        /// Last completion boundary reached by this attempt.
+        phase: SettingApplyPhase,
+        /// Pages whose write may have started, in execution order.
+        possibly_written_pages: Vec<u16>,
+        /// Independent MCP-exit or CAT-restoration failure, when reported.
+        cleanup_detail: Option<String>,
         /// Apply, verification, or cleanup detail.
         detail: String,
     },
@@ -441,7 +541,7 @@ pub enum AutomationError {
         /// semantic explanation rather than exposing the `TN` mnemonic.
         detail: String,
     },
-    /// The retained settings proof or approved recovery proof could not
+    /// The retained setting snapshot or completed recovery result could not
     /// authorize this exact APRS transition.
     #[error("APRS start authority is invalid or stale: {detail}")]
     AprsStartAuthority {
@@ -558,12 +658,13 @@ impl AutomationController {
         config: AprsSessionConfig,
         authority: AprsStartAuthority,
     ) -> Result<AprsSessionStatus, AutomationError> {
-        drop(config.validate()?);
-        validate_aprs_start_authority_shape(&authority)?;
+        let checked = config.validate()?;
+        let authority = checked_aprs_start_authority(authority)?;
         let (reply, response) = oneshot::channel();
         self.commands
             .send(ControllerCommand::StartAprs {
                 config,
+                checked,
                 authority,
                 reply,
             })
@@ -668,7 +769,7 @@ impl AutomationController {
         response.await.map_err(response_lost)?
     }
 
-    /// Synchronously request cancellation of an approved DV Gateway disable
+    /// Synchronously request cancellation of DV Gateway disable
     /// before its atomic MCP mutation gate.
     ///
     /// Once the mutation gate has opened, the bounded write, verification,
@@ -685,7 +786,7 @@ impl AutomationController {
     /// ABI and a fresh CAT `AE` read immediately before the mutation gate.
     /// Exact model, firmware, and MCP schema are also requalified before that
     /// gate. The operation always consumes this actor's radio transport; the
-    /// caller owns the subsequent reconnect of the same approved endpoint.
+    /// caller reconnects the same selected endpoint after this result.
     ///
     /// # Errors
     ///
@@ -702,16 +803,16 @@ impl AutomationController {
                 detail: error.to_string(),
             }
         })?;
-        let approved =
+        let retained =
             SerialNumber::try_from(self.abi.radio_serial_number.clone()).map_err(|error| {
                 DvGatewayCatDisableError::ControllerUnavailable {
                     detail: format!("the retained automation ABI serial is invalid: {error}"),
                 }
             })?;
-        if expected != approved {
+        if expected != retained {
             return Err(DvGatewayCatDisableError::RadioIdentityMismatch {
                 expected: expected.to_string(),
-                actual: approved.to_string(),
+                actual: retained.to_string(),
             });
         }
 
@@ -756,28 +857,23 @@ impl AutomationController {
     pub async fn recover_aprs_current_mode(
         self: Arc<Self>,
         expected_radio_serial_number: String,
-        expected_kiss_interface_raw_value: u8,
+        expected_kiss_interface: AprsKissInterface,
     ) -> Result<AprsCurrentModeRecoveryResult, AprsCurrentModeRecoveryError> {
-        if expected_kiss_interface_raw_value > 1 {
-            return Err(AprsCurrentModeRecoveryError::InvalidExpectedKissInterface {
-                value: expected_kiss_interface_raw_value,
-            });
-        }
         let expected = SerialNumber::try_from(expected_radio_serial_number).map_err(|error| {
             AprsCurrentModeRecoveryError::InvalidExpectedRadioSerial {
                 detail: error.to_string(),
             }
         })?;
-        let approved =
+        let retained =
             SerialNumber::try_from(self.abi.radio_serial_number.clone()).map_err(|error| {
                 AprsCurrentModeRecoveryError::ControllerUnavailable {
                     detail: format!("the retained automation ABI serial is invalid: {error}"),
                 }
             })?;
-        if expected != approved {
+        if expected != retained {
             return Err(AprsCurrentModeRecoveryError::RadioIdentityMismatch {
                 expected: expected.to_string(),
-                actual: approved.to_string(),
+                actual: retained.to_string(),
             });
         }
 
@@ -785,7 +881,7 @@ impl AutomationController {
         self.commands
             .send(ControllerCommand::RecoverAprsCurrentMode {
                 expected_radio_serial_number: expected,
-                expected_kiss_interface_raw_value,
+                expected_kiss_interface,
                 cancellation: Arc::clone(&self.aprs_current_mode_recovery_cancellation),
                 reply,
             })
@@ -899,7 +995,7 @@ impl AutomationController {
     /// errors poison the exact automation session and close the controller.
     pub async fn guarded_tap(
         self: Arc<Self>,
-        lease_id: u64,
+        lease_id: ScreenLeaseId,
         key: FrontPanelKey,
     ) -> Result<GuardedTapResult, AutomationError> {
         let (reply, response) = oneshot::channel();
@@ -937,7 +1033,7 @@ impl AutomationController {
         response.await.map_err(response_lost)?
     }
 
-    /// Apply one fully approved setting batch automatically.
+    /// Apply one setting batch against its retained snapshot and expected values.
     ///
     /// Rust reruns complete schema validation, verifies every typed expected
     /// value against its retained snapshot, then enters one MCP session. The
@@ -947,7 +1043,7 @@ impl AutomationController {
     /// pages are changed and immediately read-back verified. After CAT is
     /// restored, the complete retained snapshot is fetched again in a second
     /// MCP session. The report is returned only when those post-exit live
-    /// values match every approved change.
+    /// values match every accepted change.
     ///
     /// # Errors
     ///
@@ -983,41 +1079,42 @@ impl AutomationController {
     }
 }
 
-/// Connect through Swift's USB byte stream and prove the automation extension.
-///
-/// Qualification attests a valid CAT serial response, the exact TH-D75 model,
-/// CAT firmware identity `1.03.AZM`, patched hooks, complete V1.03.AZM runtime,
-/// ABI, aperture bounds, and stable metadata. It then runs the missing-snapshot
-/// refusal canary before returning the controller.
-///
-/// # Errors
-///
-/// Returns [`AutomationError::AutomationQualification`] or
-/// [`AutomationError::UsbTransport`] without a controller if any proof or I/O
-/// step fails.
 #[uniffi::export(async_runtime = "tokio")]
-pub async fn connect_automation(
-    transport: Arc<dyn ByteTransport>,
-) -> Result<Arc<AutomationController>, AutomationError> {
-    let (commands, receiver) = mpsc::channel(8);
-    let (ready, readiness) = oneshot::channel();
-    let aprs = Arc::new(Mutex::new(AprsActivityStore::default()));
-    let adapter = SwiftByteTransport::new(transport);
-    std::mem::drop(tokio::spawn(run_controller(
-        adapter,
-        receiver,
-        ready,
-        aprs.clone(),
-    )));
+impl AutomationController {
+    /// Connect through Swift's USB byte stream and prove the automation extension.
+    ///
+    /// Qualification attests a valid CAT serial response, the exact TH-D75 model,
+    /// CAT firmware identity `1.03.AZM`, patched hooks, complete V1.03.AZM runtime,
+    /// ABI, aperture bounds, and stable metadata. It then runs the missing-snapshot
+    /// refusal canary before returning the controller.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationError::AutomationQualification`] or
+    /// [`AutomationError::UsbTransport`] without a controller if any proof or I/O
+    /// step fails.
+    #[uniffi::constructor]
+    pub async fn connect(transport: Arc<dyn ByteTransport>) -> Result<Arc<Self>, AutomationError> {
+        let (commands, receiver) = mpsc::channel(8);
+        let (ready, readiness) = oneshot::channel();
+        let aprs = Arc::new(Mutex::new(AprsActivityStore::default()));
+        let adapter = SwiftByteTransport::new(transport);
+        std::mem::drop(tokio::spawn(run_controller(
+            adapter,
+            receiver,
+            ready,
+            aprs.clone(),
+        )));
 
-    let abi = readiness.await.map_err(response_lost)??;
-    Ok(Arc::new(AutomationController {
-        commands,
-        abi,
-        aprs,
-        dv_gateway_disable_cancellation: Arc::new(RecoveryCancellation::default()),
-        aprs_current_mode_recovery_cancellation: Arc::new(RecoveryCancellation::default()),
-    }))
+        let abi = readiness.await.map_err(response_lost)??;
+        Ok(Arc::new(Self {
+            commands,
+            abi,
+            aprs,
+            dv_gateway_disable_cancellation: Arc::new(RecoveryCancellation::default()),
+            aprs_current_mode_recovery_cancellation: Arc::new(RecoveryCancellation::default()),
+        }))
+    }
 }
 
 #[derive(Debug)]
@@ -1026,7 +1123,7 @@ enum ControllerCommand {
         reply: oneshot::Sender<Result<RemoteScreenFrame, AutomationError>>,
     },
     GuardedTap {
-        lease_id: u64,
+        lease_id: ScreenLeaseId,
         key: FrontPanelKey,
         reply: oneshot::Sender<Result<GuardedTapResult, AutomationError>>,
     },
@@ -1040,7 +1137,8 @@ enum ControllerCommand {
     },
     StartAprs {
         config: AprsSessionConfig,
-        authority: AprsStartAuthority,
+        checked: AprsConfiguration,
+        authority: CheckedAprsStartAuthority,
         reply: oneshot::Sender<Result<AprsSessionStatus, AutomationError>>,
     },
     StopAprs {
@@ -1078,7 +1176,7 @@ enum ControllerCommand {
     },
     RecoverAprsCurrentMode {
         expected_radio_serial_number: SerialNumber,
-        expected_kiss_interface_raw_value: u8,
+        expected_kiss_interface: AprsKissInterface,
         cancellation: Arc<RecoveryCancellation>,
         reply: oneshot::Sender<Result<AprsCurrentModeRecoveryResult, AprsCurrentModeRecoveryError>>,
     },
@@ -1099,6 +1197,7 @@ enum ActorBreak {
     },
     StartAprs {
         config: AprsSessionConfig,
+        checked: AprsConfiguration,
         reply: oneshot::Sender<Result<AprsSessionStatus, AutomationError>>,
     },
     FailedAprsTransition {
@@ -1113,7 +1212,7 @@ enum ActorBreak {
     },
     RecoverAprsCurrentMode {
         expected_radio_serial_number: SerialNumber,
-        expected_kiss_interface_raw_value: u8,
+        expected_kiss_interface: AprsKissInterface,
         cancellation: Arc<RecoveryCancellation>,
         reply: oneshot::Sender<Result<AprsCurrentModeRecoveryResult, AprsCurrentModeRecoveryError>>,
     },
@@ -1220,7 +1319,7 @@ impl DeferredReply {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ActiveIfDspSession {
     saved: SavedIfDspRadioState,
     current_frequency_hz: u32,
@@ -1228,7 +1327,7 @@ struct ActiveIfDspSession {
 }
 
 impl ActiveIfDspSession {
-    const fn status(self) -> IfDspRadioStatus {
+    const fn status(&self) -> IfDspRadioStatus {
         if self.output_verified {
             IfDspRadioStatus::active(self.current_frequency_hz)
         } else {
@@ -1244,12 +1343,13 @@ async fn prepare_if_dsp_in_session(
     match engage_if_dsp_session(session).await {
         Ok(saved) => {
             let active = ActiveIfDspSession {
-                saved,
                 current_frequency_hz: saved.band_b_frequency_hz(),
+                saved,
                 output_verified: true,
             };
+            let status = active.status();
             *active_session = Some(active);
-            Ok(active.status())
+            Ok(status)
         }
         Err(EngageIfDspError::Clean(detail)) => Err(AutomationError::IfDspOperation { detail }),
         Err(EngageIfDspError::CurrentModeUnavailable(detail)) => {
@@ -1257,8 +1357,8 @@ async fn prepare_if_dsp_in_session(
         }
         Err(EngageIfDspError::Dirty { detail, saved }) => {
             *active_session = Some(ActiveIfDspSession {
-                saved,
                 current_frequency_hz: saved.band_b_frequency_hz(),
+                saved,
                 output_verified: false,
             });
             Err(AutomationError::IfDspRestoration { detail })
@@ -1271,21 +1371,17 @@ async fn retune_if_dsp_in_session(
     active_session: &mut Option<ActiveIfDspSession>,
     frequency_hz: u32,
 ) -> Result<IfDspRadioStatus, AutomationError> {
-    let Some(active) = *active_session else {
+    let Some(active) = active_session.as_mut() else {
         return Err(AutomationError::IfDspModeInactive);
     };
-    match retune_if_dsp_session(session, active.saved, frequency_hz).await {
+    match retune_if_dsp_session(session, &active.saved, frequency_hz).await {
         Ok(()) => {
-            let retuned = ActiveIfDspSession {
-                current_frequency_hz: frequency_hz,
-                output_verified: true,
-                ..active
-            };
-            *active_session = Some(retuned);
-            Ok(retuned.status())
+            active.current_frequency_hz = frequency_hz;
+            active.output_verified = true;
+            Ok(active.status())
         }
         Err(retune_detail) => {
-            let report = restore_if_dsp_session(session, active.saved).await;
+            let report = restore_if_dsp_session(session, active.saved.clone()).await;
             if report.is_exact() {
                 *active_session = None;
                 Err(AutomationError::IfDspOperation {
@@ -1294,10 +1390,7 @@ async fn retune_if_dsp_in_session(
                     ),
                 })
             } else {
-                *active_session = Some(ActiveIfDspSession {
-                    output_verified: false,
-                    ..active
-                });
+                active.output_verified = false;
                 Err(AutomationError::IfDspRestoration {
                     detail: format!("retune failed ({retune_detail}); {}", report.summary()),
                 })
@@ -1310,18 +1403,15 @@ async fn restore_if_dsp_in_session(
     session: &mut AutomationSession<'_, SwiftByteTransport>,
     active_session: &mut Option<ActiveIfDspSession>,
 ) -> Result<IfDspRadioStatus, AutomationError> {
-    let Some(active) = *active_session else {
+    let Some(active) = active_session.as_mut() else {
         return Err(AutomationError::IfDspModeInactive);
     };
-    let report = restore_if_dsp_session(session, active.saved).await;
+    let report = restore_if_dsp_session(session, active.saved.clone()).await;
     if report.is_exact() {
         *active_session = None;
         Ok(IfDspRadioStatus::inactive())
     } else {
-        *active_session = Some(ActiveIfDspSession {
-            output_verified: false,
-            ..active
-        });
+        active.output_verified = false;
         Err(AutomationError::IfDspRestoration {
             detail: report.summary(),
         })
@@ -1330,7 +1420,7 @@ async fn restore_if_dsp_in_session(
 
 #[derive(Debug, Clone)]
 struct SettingsSnapshot {
-    id: u64,
+    id: SettingSnapshotId,
     pages: BTreeMap<u16, [u8; PAGE_SIZE]>,
     field_ids: Vec<String>,
 }
@@ -1344,38 +1434,45 @@ fn invalid_aprs_start_authority(detail: impl Into<String>) -> AutomationError {
     }
 }
 
-fn validate_aprs_start_authority_shape(
-    authority: &AprsStartAuthority,
-) -> Result<(), AutomationError> {
+#[derive(Debug)]
+enum CheckedAprsStartAuthority {
+    SettingsSnapshot {
+        snapshot_id: SettingSnapshotId,
+        expected_kiss_interface: AprsKissInterface,
+    },
+    CurrentModeRecovery {
+        expected_serial: SerialNumber,
+        expected_data_band: RadioTncDataBand,
+    },
+}
+
+fn checked_aprs_start_authority(
+    authority: AprsStartAuthority,
+) -> Result<CheckedAprsStartAuthority, AutomationError> {
     match authority {
         AprsStartAuthority::SettingsSnapshot {
             snapshot_id,
-            expected_kiss_interface_raw_value,
-        } => {
-            if *snapshot_id == 0 {
-                return Err(invalid_aprs_start_authority(
-                    "settings snapshot identifier must be nonzero",
-                ));
-            }
-            if *expected_kiss_interface_raw_value > 1 {
-                return Err(invalid_aprs_start_authority(format!(
-                    "Menu 983 route {expected_kiss_interface_raw_value} is outside the closed 0/1 domain"
-                )));
-            }
-        }
+            expected_kiss_interface,
+        } => Ok(CheckedAprsStartAuthority::SettingsSnapshot {
+            snapshot_id,
+            expected_kiss_interface,
+        }),
         AprsStartAuthority::CurrentModeRecovery {
             expected_radio_serial_number,
-            ..
+            expected_data_band,
         } => {
-            let _validated_serial = SerialNumber::try_from(expected_radio_serial_number.clone())
-                .map_err(|error| {
+            let expected_serial =
+                SerialNumber::try_from(expected_radio_serial_number).map_err(|error| {
                     invalid_aprs_start_authority(format!(
-                        "approved CAT serial identity is invalid: {error}"
+                        "expected CAT serial identity is invalid: {error}"
                     ))
                 })?;
+            Ok(CheckedAprsStartAuthority::CurrentModeRecovery {
+                expected_serial,
+                expected_data_band: expected_data_band.into(),
+            })
         }
     }
-    Ok(())
 }
 
 fn snapshot_unsigned_value(
@@ -1400,8 +1497,8 @@ fn snapshot_unsigned_value(
 
 fn resolve_settings_snapshot_aprs_authority(
     retained_snapshot: Option<&SettingsSnapshot>,
-    snapshot_id: u64,
-    expected_kiss_interface_raw_value: u8,
+    snapshot_id: SettingSnapshotId,
+    expected_kiss_interface: AprsKissInterface,
 ) -> Result<RadioTncDataBand, AutomationError> {
     let snapshot =
         retained_snapshot.ok_or(AutomationError::SettingsSnapshotUnavailable { snapshot_id })?;
@@ -1424,9 +1521,9 @@ fn resolve_settings_snapshot_aprs_authority(
     ];
     let values = decode_values(&required_ids, &snapshot.pages)?;
     let route = snapshot_unsigned_value(&values, APRS_KISS_INTERFACE_SETTING_ID)?;
-    if route != u64::from(expected_kiss_interface_raw_value) {
+    if route != u64::from(expected_kiss_interface.as_raw()) {
         return Err(invalid_aprs_start_authority(format!(
-            "reviewed Menu 983 route was {route}, not selected endpoint route {expected_kiss_interface_raw_value}"
+            "reviewed Menu 983 route was {route}, not selected endpoint route {expected_kiss_interface:?}"
         )));
     }
     let raw_band = snapshot_unsigned_value(&values, APRS_TNC_DATA_BAND_SETTING_ID)?;
@@ -1471,35 +1568,27 @@ fn validate_current_mode_recovery_authority(
 async fn resolve_aprs_start_authority<T: RadioTransport>(
     session: &mut AutomationSession<'_, T>,
     retained_snapshot: Option<&SettingsSnapshot>,
-    authority: AprsStartAuthority,
+    authority: CheckedAprsStartAuthority,
 ) -> Result<RadioTncDataBand, AutomationError> {
-    validate_aprs_start_authority_shape(&authority)?;
     match authority {
-        AprsStartAuthority::SettingsSnapshot {
+        CheckedAprsStartAuthority::SettingsSnapshot {
             snapshot_id,
-            expected_kiss_interface_raw_value,
+            expected_kiss_interface,
         } => resolve_settings_snapshot_aprs_authority(
             retained_snapshot,
             snapshot_id,
-            expected_kiss_interface_raw_value,
+            expected_kiss_interface,
         ),
-        AprsStartAuthority::CurrentModeRecovery {
-            expected_radio_serial_number,
+        CheckedAprsStartAuthority::CurrentModeRecovery {
+            expected_serial,
             expected_data_band,
         } => {
-            let expected_serial =
-                SerialNumber::try_from(expected_radio_serial_number).map_err(|error| {
-                    invalid_aprs_start_authority(format!(
-                        "approved CAT serial identity is invalid: {error}"
-                    ))
-                })?;
             let (actual_serial, actual_tnc_state) =
                 session.aprs_recovery_state().await.map_err(|error| {
                     invalid_aprs_start_authority(format!(
                         "post-reboot CAT identity/TNC-state proof failed: {error}"
                     ))
                 })?;
-            let expected_data_band = RadioTncDataBand::from(expected_data_band);
             validate_current_mode_recovery_authority(
                 &expected_serial,
                 expected_data_band,
@@ -1512,7 +1601,7 @@ async fn resolve_aprs_start_authority<T: RadioTransport>(
 
 #[derive(Debug)]
 struct PendingScreen {
-    lease_id: u64,
+    lease_id: ScreenLeaseId,
     snapshot: AutomationSnapshot,
 }
 
@@ -1640,9 +1729,13 @@ async fn run_controller(
                     Err(error) => drop(reply.send(Err(error))),
                 }
             }
-            ActorBreak::StartAprs { config, reply } => {
+            ActorBreak::StartAprs {
+                config,
+                checked,
+                reply,
+            } => {
                 settings_snapshot = None;
-                lock_aprs_store(&aprs).begin_start(config.clone());
+                let journal_result = lock_aprs_store(&aprs).begin_start(config);
                 let mut kiss = match radio.into_kiss_session() {
                     Ok(kiss) => kiss,
                     Err((returned_radio, error)) => {
@@ -1654,7 +1747,13 @@ async fn run_controller(
                     }
                 };
 
-                if let Err(error) = apply_aprs_kiss_config(&mut kiss, &config).await {
+                let configuration_result = match journal_result {
+                    Ok(()) => apply_aprs_kiss_config(&mut kiss, &checked)
+                        .await
+                        .map_err(|error| error.to_string()),
+                    Err(error) => Err(error.to_string()),
+                };
+                if let Err(error) = configuration_result {
                     let detail = format!("could not apply KISS parameters: {error}");
                     match kiss.exit().await {
                         Ok(returned_radio) => {
@@ -1754,7 +1853,10 @@ async fn run_controller(
                 detail,
             } => {
                 settings_snapshot = None;
-                lock_aprs_store(&aprs).begin_start(config);
+                let journal_result = lock_aprs_store(&aprs).begin_start(config);
+                if let Err(error) = journal_result {
+                    lock_aprs_store(&aprs).mark_failed(error.to_string());
+                }
                 restore_cat_after_kiss_return = true;
                 deferred_reply = Some(DeferredReply::FailedAprsStart { reply, detail });
             }
@@ -1774,14 +1876,14 @@ async fn run_controller(
             }
             ActorBreak::RecoverAprsCurrentMode {
                 expected_radio_serial_number,
-                expected_kiss_interface_raw_value,
+                expected_kiss_interface,
                 cancellation,
                 reply,
             } => {
                 let result = recover_aprs_current_mode_over_cat(
                     radio,
                     &expected_radio_serial_number,
-                    expected_kiss_interface_raw_value,
+                    expected_kiss_interface,
                     &cancellation,
                 )
                 .await;
@@ -1953,6 +2055,7 @@ async fn automation_loop(
             }
             ControllerCommand::StartAprs {
                 config,
+                checked,
                 authority,
                 reply,
             } => {
@@ -1961,6 +2064,11 @@ async fn automation_loop(
                     continue;
                 }
                 if aprs_start_reply_abandoned(&reply) {
+                    continue;
+                }
+                let journal_ready = lock_aprs_store(aprs).ensure_can_start();
+                if let Err(error) = journal_ready {
+                    drop(reply.send(Err(error)));
                     continue;
                 }
                 let data_band = match resolve_aprs_start_authority(
@@ -1987,18 +2095,25 @@ async fn automation_loop(
                 // transport protocol.
                 invalidate_aprs_start_leases(&mut pending_screen, settings_snapshot);
                 match session.transition_to_kiss(data_band).await {
-                    Ok(()) => return ActorBreak::StartAprs { config, reply },
+                    Ok(()) => {
+                        return ActorBreak::StartAprs {
+                            config,
+                            checked,
+                            reply,
+                        };
+                    }
                     Err(error) if is_aligned_tn_current_mode_refusal(&error) => {
                         let detail = error.to_string();
                         let mut store = lock_aprs_store(aprs);
-                        store.record_start_refusal(
+                        let recorded = store.record_start_refusal(
                             config,
                             "APRS KISS is unavailable in the radio's current mode. The existing CAT connection remains active.",
                         );
                         drop(store);
-                        drop(
-                            reply.send(Err(AutomationError::AprsCurrentModeUnavailable { detail })),
-                        );
+                        let error = recorded
+                            .err()
+                            .unwrap_or(AutomationError::AprsCurrentModeUnavailable { detail });
+                        drop(reply.send(Err(error)));
                     }
                     Err(error) if session.is_valid() => {
                         drop(reply.send(Err(AutomationError::AprsOperation {
@@ -2040,7 +2155,6 @@ async fn automation_loop(
             ControllerCommand::IfDspStatus { reply } => {
                 let status = if_dsp_session
                     .as_ref()
-                    .copied()
                     .map_or_else(IfDspRadioStatus::inactive, ActiveIfDspSession::status);
                 let _send_result = reply.send(status);
             }
@@ -2094,7 +2208,7 @@ async fn automation_loop(
             }
             ControllerCommand::RecoverAprsCurrentMode {
                 expected_radio_serial_number,
-                expected_kiss_interface_raw_value,
+                expected_kiss_interface,
                 cancellation,
                 reply,
             } => {
@@ -2108,7 +2222,7 @@ async fn automation_loop(
                 } else {
                     return ActorBreak::RecoverAprsCurrentMode {
                         expected_radio_serial_number,
-                        expected_kiss_interface_raw_value,
+                        expected_kiss_interface,
                         cancellation,
                         reply,
                     };
@@ -2134,31 +2248,15 @@ enum AprsBreak {
 
 async fn apply_aprs_kiss_config(
     kiss: &mut KissSession<SwiftByteTransport>,
-    config: &AprsSessionConfig,
+    config: &AprsConfiguration,
 ) -> Result<(), RadioError> {
     kiss.set_receive_timeout(Duration::from_millis(250));
-    kiss.set_tx_delay(KissTxDelay::from_milliseconds(
-        u16::from(config.tx_delay_10ms) * 10,
-    )?)
-    .await?;
-    kiss.set_persistence(KissPersistence::new(config.persistence))
-        .await?;
-    kiss.set_slot_time(KissSlotTime::from_milliseconds(
-        u16::from(config.slot_time_10ms) * 10,
-    )?)
-    .await?;
-    kiss.set_tx_tail(KissTxTail::from_milliseconds(
-        u16::from(config.tx_tail_10ms) * 10,
-    )?)
-    .await?;
-    kiss.set_duplex(if config.full_duplex {
-        KissDuplex::Full
-    } else {
-        KissDuplex::Half
-    })
-    .await?;
-    kiss.set_hardware_data_rate(PacketDataRate::from(config.data_rate))
-        .await?;
+    kiss.set_tx_delay(config.tx_delay()).await?;
+    kiss.set_persistence(config.persistence()).await?;
+    kiss.set_slot_time(config.slot_time()).await?;
+    kiss.set_tx_tail(config.tx_tail()).await?;
+    kiss.set_duplex(config.duplex()).await?;
+    kiss.set_hardware_data_rate(config.data_rate()).await?;
     Ok(())
 }
 
@@ -2232,7 +2330,7 @@ async fn aprs_loop(
                         );
                         match packet {
                             Ok(packet) => {
-                                let raw_ax25 = build_ax25(&packet);
+                                let raw_ax25 = packet.to_bytes();
                                 match kiss.send_data(&raw_ax25).await {
                                     Ok(()) => {
                                         let record = lock_aprs_store(activity_store)
@@ -2262,7 +2360,7 @@ async fn aprs_loop(
                             .build_position(latitude, longitude, &comment);
                         match packet {
                             Ok(packet) => {
-                                let raw_ax25 = build_ax25(&packet);
+                                let raw_ax25 = packet.to_bytes();
                                 match kiss.send_data(&raw_ax25).await {
                                     Ok(()) => {
                                         let record = lock_aprs_store(activity_store)
@@ -2324,6 +2422,7 @@ async fn capture_screen(
     session: &mut AutomationSession<'_, SwiftByteTransport>,
     next_screen_lease: &mut u64,
 ) -> Result<PendingScreen, AutomationError> {
+    let lease_id = ScreenLeaseId::from_nonzero(take_identifier(next_screen_lease)?);
     let snapshot =
         session
             .capture_screen()
@@ -2331,7 +2430,6 @@ async fn capture_screen(
             .map_err(|error| AutomationError::ScreenCapture {
                 detail: error.to_string(),
             })?;
-    let lease_id = take_identifier(next_screen_lease);
     Ok(PendingScreen { lease_id, snapshot })
 }
 
@@ -2340,7 +2438,7 @@ async fn guarded_tap(
     pending_screen: &mut Option<PendingScreen>,
     settings_snapshot: &mut Option<SettingsSnapshot>,
     next_screen_lease: &mut u64,
-    lease_id: u64,
+    lease_id: ScreenLeaseId,
     key: FrontPanelKey,
 ) -> Result<GuardedTapResult, AutomationError> {
     let Some(pending) = pending_screen.take() else {
@@ -2359,15 +2457,10 @@ async fn guarded_tap(
         .guarded_tap_key(&pending.snapshot, key.into())
         .await
         .map_err(map_guarded_error)?;
-    let disposition = match outcome {
-        GuardedKeyOutcome::Dispatched { .. } => GuardedTapDisposition::Dispatched,
-        GuardedKeyOutcome::ContextChanged { .. } => GuardedTapDisposition::ContextChanged,
-        GuardedKeyOutcome::DeadlineExpired { .. } => GuardedTapDisposition::DispatchedAfterDeadline,
-        _ => {
-            return Err(AutomationError::GuardedInput {
-                detail: "unrecognized guarded-input outcome".to_owned(),
-            });
-        }
+    let disposition = match outcome.kind() {
+        GuardedKeyOutcomeKind::Dispatched => GuardedTapDisposition::Dispatched,
+        GuardedKeyOutcomeKind::ContextChanged => GuardedTapDisposition::ContextChanged,
+        GuardedKeyOutcomeKind::DeadlineExpired => GuardedTapDisposition::DispatchedAfterDeadline,
     };
     if matches!(
         disposition,
@@ -2393,26 +2486,30 @@ async fn guarded_tap(
     })
 }
 
-fn remote_screen(snapshot: &AutomationSnapshot, lease_id: u64) -> RemoteScreenFrame {
-    let rgb888 = snapshot.frame.to_rgb888();
-    let mut rgba8888 = Vec::with_capacity(SCREEN_WIDTH * SCREEN_HEIGHT * 4);
-    for pixel in rgb888.chunks_exact(3) {
-        rgba8888.extend_from_slice(pixel);
-        rgba8888.push(u8::MAX);
-    }
-
+fn remote_screen(snapshot: &AutomationSnapshot, lease_id: ScreenLeaseId) -> RemoteScreenFrame {
     RemoteScreenFrame {
         lease_id,
         width: u32::try_from(SCREEN_WIDTH).unwrap_or(240),
         height: u32::try_from(SCREEN_HEIGHT).unwrap_or(180),
         row_bytes: u32::try_from(SCREEN_WIDTH * 4).unwrap_or(960),
-        rgb565_le: snapshot.frame.rgb565_le().to_vec(),
-        rgba8888,
-        generation: snapshot.metadata.generation,
-        crc32: snapshot.metadata.crc32,
-        command_count: snapshot.metadata.command_count,
-        seqlock: snapshot.metadata.seqlock,
+        rgb565_le: snapshot.frame().rgb565_le().to_vec(),
+        rgba8888: render_rgba8888(snapshot.frame()),
+        generation: snapshot.metadata().generation(),
+        crc32: snapshot.metadata().crc32(),
+        command_count: snapshot.metadata().command_count(),
+        seqlock: snapshot.metadata().seqlock(),
     }
+}
+
+/// Render each checked RGB565 pixel as opaque RGBA in top-down row order.
+fn render_rgba8888(frame: &kenwood_thd75::screen::ScreenFrame) -> Vec<u8> {
+    let rgb888 = frame.to_rgb888();
+    let mut output = Vec::with_capacity(SCREEN_WIDTH * SCREEN_HEIGHT * 4);
+    for pixel in rgb888.chunks_exact(3) {
+        output.extend_from_slice(pixel);
+        output.push(u8::MAX);
+    }
+    output
 }
 
 async fn read_settings(
@@ -2420,6 +2517,7 @@ async fn read_settings(
     requested_ids: Option<&[String]>,
     next_snapshot_id: &mut u64,
 ) -> Result<(SettingReadResult, SettingsSnapshot), AutomationError> {
+    let snapshot_id = SettingSnapshotId::from_nonzero(take_identifier(next_snapshot_id)?);
     ensure_settings_target(radio, false).await?;
     let fields = select_fields(requested_ids)?;
     let pages = pages_for_fields(&fields)?;
@@ -2437,7 +2535,6 @@ async fn read_settings(
         .iter()
         .map(|field| field.descriptor.name.to_owned())
         .collect();
-    let snapshot_id = take_identifier(next_snapshot_id);
     let values = decode_values(&field_ids, &page_map)?;
     let result = SettingReadResult {
         snapshot_id,
@@ -2457,6 +2554,9 @@ async fn apply_settings<T: RadioTransport>(
     next_snapshot_id: &mut u64,
     changes: &[SettingChange],
 ) -> Result<SettingApplyReport, AutomationError> {
+    if *next_snapshot_id == 0 {
+        return Err(AutomationError::IdentifierExhausted);
+    }
     let validation = validate_changes(changes);
     if !validation.accepted {
         return Err(AutomationError::InvalidSettingsPlan {
@@ -2541,6 +2641,9 @@ async fn refresh_settings_after_apply<T: RadioTransport>(
         .copied()
         .map(|page| {
             McpPage::new(page).map_err(|error| AutomationError::SettingsApply {
+                phase: SettingApplyPhase::LiveRefresh,
+                possibly_written_pages: pages_written.to_vec(),
+                cleanup_detail: None,
                 detail: format!(
                     "settings were applied, but cached MCP page 0x{page:04X} could not be selected for live refresh: {error}"
                 ),
@@ -2550,22 +2653,21 @@ async fn refresh_settings_after_apply<T: RadioTransport>(
     let refreshed_pages = radio
         .read_sparse_memory_pages(&refresh_pages)
         .await
-        .map_err(|error| AutomationError::SettingsApply {
-            detail: format!(
-                "settings were applied and verified on pages {pages_written:?}, but the post-exit live refresh failed: {error}; reconnect and read the radio before making another change"
-            ),
-        })?
+        .map_err(|error| map_refresh_error(&error, pages_written))?
         .into_iter()
         .map(|(page, data)| (page.as_raw(), data))
         .collect::<BTreeMap<_, _>>();
     let refreshed_records = decode_values(&consumed.field_ids, &refreshed_pages).map_err(|error| {
         AutomationError::SettingsApply {
+            phase: SettingApplyPhase::LiveDecode,
+            possibly_written_pages: pages_written.to_vec(),
+            cleanup_detail: None,
             detail: format!(
                 "settings were applied and live pages were refreshed, but their stored values could not be decoded: {error}"
             ),
         }
     })?;
-    let refreshed_snapshot_id = take_identifier(next_snapshot_id);
+    let refreshed_snapshot_id = SettingSnapshotId::from_nonzero(take_identifier(next_snapshot_id)?);
     let refreshed_values = SettingReadResult {
         snapshot_id: refreshed_snapshot_id,
         values: refreshed_records,
@@ -2592,14 +2694,20 @@ fn verify_refreshed_changes(
         .map(|change| {
             let actual = live_values.get(change.setting_id.as_str()).ok_or_else(|| {
                 AutomationError::SettingsApply {
+                    phase: SettingApplyPhase::LiveVerification,
+                    possibly_written_pages: pages_written.to_vec(),
+                    cleanup_detail: None,
                     detail: format!(
-                        "post-exit live refresh omitted approved setting {}",
+                        "post-exit live refresh omitted requested setting {}",
                         change.setting_id
                     ),
                 }
             })?;
             if *actual != &change.desired_value {
                 return Err(AutomationError::SettingsApply {
+                    phase: SettingApplyPhase::LiveVerification,
+                    possibly_written_pages: pages_written.to_vec(),
+                    cleanup_detail: None,
                     detail: format!(
                         "post-exit live read-back for {} was {actual:?}, not the requested value {:?}; pages {pages_written:?} were written and the cached snapshot now reflects the radio",
                         change.setting_id, change.desired_value
@@ -2675,7 +2783,12 @@ async fn ensure_settings_target<T: RadioTransport>(
 
 fn settings_operation_error(applying: bool, detail: String) -> AutomationError {
     if applying {
-        AutomationError::SettingsApply { detail }
+        AutomationError::SettingsApply {
+            phase: SettingApplyPhase::Preflight,
+            possibly_written_pages: Vec::new(),
+            cleanup_detail: None,
+            detail,
+        }
     } else {
         AutomationError::SettingsRead { detail }
     }
@@ -2783,10 +2896,13 @@ fn replacement_pages(
     let mut replacements = BTreeMap::new();
     for page in patches.pages() {
         let raw_page = page.as_raw();
-        let mut replacement = expected
-            .get(&raw_page)
-            .copied()
-            .ok_or(AutomationError::SettingsSnapshotUnavailable { snapshot_id: 0 })?;
+        let mut replacement =
+            expected
+                .get(&raw_page)
+                .copied()
+                .ok_or_else(|| AutomationError::Internal {
+                    detail: format!("reviewed MCP page 0x{raw_page:04X} is missing"),
+                })?;
         let patch = patches
             .page(page)
             .ok_or_else(|| AutomationError::Internal {
@@ -2796,6 +2912,22 @@ fn replacement_pages(
         let _previous = replacements.insert(raw_page, replacement);
     }
     Ok(replacements)
+}
+
+fn map_refresh_error(error: &RadioError, pages_written: &[u16]) -> AutomationError {
+    let cleanup_detail = match error {
+        RadioError::McpCleanupNotProved { cleanup }
+        | RadioError::McpOperationAndCleanupFailed { cleanup, .. } => Some(cleanup.to_string()),
+        _ => None,
+    };
+    AutomationError::SettingsApply {
+        phase: SettingApplyPhase::LiveRefresh,
+        possibly_written_pages: pages_written.to_vec(),
+        cleanup_detail,
+        detail: format!(
+            "settings were applied and verified on pages {pages_written:?}, but the post-exit live refresh failed: {error}; reconnect and read the radio before making another change"
+        ),
+    }
 }
 
 fn map_exchange_error(error: &McpPageExchangeError) -> AutomationError {
@@ -2814,7 +2946,17 @@ fn map_exchange_error(error: &McpPageExchangeError) -> AutomationError {
     } else {
         format!("{error}; writes may have started for pages {possibly_written:?}")
     };
-    AutomationError::SettingsApply { detail }
+    let cleanup_detail = match error {
+        McpPageExchangeError::Cleanup { cleanup, .. }
+        | McpPageExchangeError::OperationAndCleanup { cleanup, .. } => Some(cleanup.to_string()),
+        _ => None,
+    };
+    AutomationError::SettingsApply {
+        phase: SettingApplyPhase::Exchange,
+        possibly_written_pages: possibly_written.iter().map(|page| page.as_raw()).collect(),
+        cleanup_detail,
+        detail,
+    }
 }
 
 fn map_guarded_error(error: GuardedKeyError) -> AutomationError {
@@ -2834,10 +2976,13 @@ fn response_lost(_error: oneshot::error::RecvError) -> AutomationError {
     }
 }
 
-const fn take_identifier(next: &mut u64) -> u64 {
+const fn take_identifier(next: &mut u64) -> Result<NonZeroU64, AutomationError> {
     let current = *next;
-    *next = if current == u64::MAX { 1 } else { current + 1 };
-    current
+    let Some(identifier) = NonZeroU64::new(current) else {
+        return Err(AutomationError::IdentifierExhausted);
+    };
+    *next = if current == u64::MAX { 0 } else { current + 1 };
+    Ok(identifier)
 }
 
 #[cfg(test)]
@@ -2850,6 +2995,104 @@ mod tests {
     use kiss_tnc::FEND;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn setting_refresh_retains_write_progress_and_independent_cleanup() {
+        let failure = RadioError::McpOperationAndCleanupFailed {
+            operation: Box::new(RadioError::McpInterrupted),
+            cleanup: Box::new(RadioError::MemoryReadStreamPoisoned),
+        };
+        let mapped = map_refresh_error(&failure, &[0x10, 0x11]);
+        assert!(
+            matches!(mapped, AutomationError::SettingsApply {
+                phase: SettingApplyPhase::LiveRefresh,
+                possibly_written_pages, cleanup_detail: Some(cleanup), detail,
+            } if possibly_written_pages == [0x10, 0x11]
+                && cleanup == RadioError::MemoryReadStreamPoisoned.to_string()
+                && detail.contains("post-exit live refresh failed")),
+            "post-write progress or independent refresh cleanup was lost"
+        );
+    }
+
+    #[test]
+    fn setting_failure_retains_write_progress_and_independent_cleanup() -> TestResult {
+        let page = WritableMcpPage::new(0x10)?;
+        let failure = McpPageExchangeError::OperationAndCleanup {
+            possibly_written_pages: vec![page],
+            operation: Box::new(McpPageExchangeOperationError::Write {
+                page,
+                source: Box::new(RadioError::McpInterrupted),
+            }),
+            cleanup: Box::new(RadioError::MemoryReadStreamPoisoned),
+        };
+        let mapped = map_exchange_error(&failure);
+        assert!(
+            matches!(mapped, AutomationError::SettingsApply {
+            phase: SettingApplyPhase::Exchange,
+            possibly_written_pages, cleanup_detail: Some(cleanup), detail,
+        } if possibly_written_pages == [0x10] && !cleanup.is_empty() && detail.contains("verified write")),
+            "write or cleanup outcome was flattened"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_aprs_candidates_are_rejected_before_entering_the_actor_queue() -> TestResult {
+        let (commands, mut receiver) = mpsc::channel(8);
+        let controller = Arc::new(AutomationController {
+            commands,
+            abi: AutomationAbiRecord::qualified(AutomationAbi::SUPPORTED, "C3C10368".to_owned()),
+            aprs: Arc::new(Mutex::new(AprsActivityStore::default())),
+            dv_gateway_disable_cancellation: Arc::new(RecoveryCancellation::default()),
+            aprs_current_mode_recovery_cancellation: Arc::new(RecoveryCancellation::default()),
+        });
+        let invalid = AprsSessionConfig {
+            tx_delay_10ms: 121,
+            ..Default::default()
+        };
+        let authority = AprsStartAuthority::SettingsSnapshot {
+            snapshot_id: SettingSnapshotId::new(1)?,
+            expected_kiss_interface: AprsKissInterface::Usb,
+        };
+        let result = tokio::select! {
+            result = controller.clone().start_aprs(invalid, authority) => result,
+            queued = receiver.recv() => {
+                assert!(queued.is_none(), "invalid configuration entered the actor queue: {queued:?}");
+                Err(AutomationError::ControllerClosed)
+            }
+        };
+        assert!(
+            matches!(
+                result,
+                Err(AutomationError::InvalidAprsConfiguration { .. })
+            ),
+            "{result:?}"
+        );
+        assert!(
+            matches!(receiver.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "invalid configuration entered the actor queue"
+        );
+        let authority = AprsStartAuthority::CurrentModeRecovery {
+            expected_radio_serial_number: "invalid".to_owned(),
+            expected_data_band: crate::aprs::TncDataBand::A,
+        };
+        let result = tokio::select! {
+            result = controller.clone().start_aprs(AprsSessionConfig::default(), authority) => result,
+            queued = receiver.recv() => {
+                assert!(queued.is_none(), "invalid identity entered the actor queue: {queued:?}");
+                Err(AutomationError::ControllerClosed)
+            }
+        };
+        assert!(
+            matches!(result, Err(AutomationError::AprsStartAuthority { .. })),
+            "{result:?}"
+        );
+        assert!(
+            matches!(receiver.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "invalid identity entered the actor queue"
+        );
+        Ok(())
+    }
 
     fn expect_cat_recovery_preamble(transport: &mut MockTransport) {
         transport.expect(b"\r", b"");
@@ -2869,7 +3112,7 @@ mod tests {
 
     fn expect_mcp_page_read(transport: &mut MockTransport, page: McpPage, data: &[u8; PAGE_SIZE]) {
         let command = programming::build_read_command(page);
-        transport.expect(&command, &mcp_read_response(page.as_raw(), data));
+        transport.expect(&command, mcp_read_response(page.as_raw(), data));
         transport.expect(&[programming::ACK], &[programming::ACK]);
     }
 
@@ -2896,38 +3139,25 @@ mod tests {
     }
 
     #[test]
-    fn screen_record_has_exact_dimensions_and_rendering() -> TestResult {
-        let raw = vec![0_u8; SCREEN_BYTES];
-        let snapshot = AutomationSnapshot {
-            frame: ScreenFrame::from_rgb565_le(raw)?,
-            metadata: kenwood_thd75::radio::automation::AutomationMetadata {
-                seqlock: 2,
-                features: 0x7F,
-                generation: 1,
-                capture_result: 0,
-                crc32: 0,
-                capture_attempts: 1,
-                command_count: 1,
-                last_command: 1,
-                last_host_sequence: 0,
-                last_key: 0,
-                last_phase: 0,
-                last_key_result: 0,
-                rle_encoded_length: 0,
-                route_ascii: 0,
-                route_guard_count: 0,
-                route_completed_taps: 0,
-                route_event_mask: 0,
-            },
-        };
-        let record = remote_screen(&snapshot, 9);
-
-        assert_eq!(record.width, 240);
-        assert_eq!(record.height, 180);
-        assert_eq!(record.row_bytes, 960);
-        assert_eq!(record.rgb565_le.len(), SCREEN_BYTES);
-        assert_eq!(record.rgba8888.len(), SCREEN_WIDTH * SCREEN_HEIGHT * 4);
-        assert_eq!(record.lease_id, 9);
+    fn screen_rendering_preserves_top_down_pixels_and_opaque_alpha() -> TestResult {
+        let mut raw = vec![0_u8; SCREEN_BYTES];
+        raw.get_mut(..6)
+            .ok_or("RGB565 pixel prefix")?
+            .copy_from_slice(&[0x00, 0xf8, 0xe0, 0x07, 0x1f, 0x00]);
+        let frame = ScreenFrame::from_rgb565_le(raw)?;
+        let rgba = render_rgba8888(&frame);
+        assert_eq!(SCREEN_WIDTH, 240);
+        assert_eq!(SCREEN_HEIGHT, 180);
+        assert_eq!(rgba.len(), 240 * 180 * 4);
+        assert_eq!(
+            rgba.get(..12),
+            Some([248, 0, 0, 255, 0, 252, 0, 255, 0, 0, 248, 255].as_slice())
+        );
+        assert_eq!(
+            rgba.get(960..964),
+            Some([0, 0, 0, 255].as_slice()),
+            "the second row did not remain top-down"
+        );
         Ok(())
     }
 
@@ -2981,14 +3211,14 @@ mod tests {
 
         let mut radio = Radio::new(transport);
         let mut cached_snapshot = Some(SettingsSnapshot {
-            id: 41,
+            id: SettingSnapshotId::new(41)?,
             pages: BTreeMap::from([(page.as_raw(), before)]),
             field_ids: vec!["radio.Beep".to_owned()],
         });
         let mut next_snapshot_id = 42;
         let changes = [SettingChange {
             setting_id: "radio.Beep".to_owned(),
-            snapshot_id: 41,
+            snapshot_id: SettingSnapshotId::new(41)?,
             expected_value: SettingValue::Boolean { value: false },
             desired_value: SettingValue::Boolean { value: true },
         }];
@@ -3004,16 +3234,17 @@ mod tests {
         assert!(
             matches!(
                 &result,
-                Err(AutomationError::SettingsApply { detail })
+                Err(AutomationError::SettingsApply { phase: SettingApplyPhase::LiveVerification, possibly_written_pages, detail, .. })
                     if detail.contains("post-exit live read-back")
                         && detail.contains("radio.Beep")
+                        && possibly_written_pages == &[0x10]
             ),
             "a reverted post-exit value must not be reported as verified: {result:?}"
         );
         let refreshed = cached_snapshot
             .as_ref()
             .ok_or("actual post-exit snapshot was not retained")?;
-        assert_eq!(refreshed.id, 42);
+        assert_eq!(refreshed.id.get(), 42);
         let live = decode_values(&refreshed.field_ids, &refreshed.pages)?;
         assert_eq!(
             live.first().map(|record| &record.value),
@@ -3027,13 +3258,13 @@ mod tests {
     fn setting_apply_rejects_an_unreviewed_field_from_a_cached_page() -> TestResult {
         let page = McpPage::new(0x10)?;
         let snapshot = SettingsSnapshot {
-            id: 71,
+            id: SettingSnapshotId::new(71)?,
             pages: BTreeMap::from([(page.as_raw(), [0_u8; PAGE_SIZE])]),
             field_ids: vec!["radio.Beep".to_owned()],
         };
         let changes = [SettingChange {
             setting_id: "radio.BeepVolume".to_owned(),
-            snapshot_id: 71,
+            snapshot_id: SettingSnapshotId::new(71)?,
             expected_value: SettingValue::Unsigned { value: 0 },
             desired_value: SettingValue::Unsigned { value: 1 },
         }];
@@ -3080,14 +3311,14 @@ mod tests {
         let field_ids = vec!["radio.Beep".to_owned(), "radio.BeepVolume".to_owned()];
         let mut radio = Radio::new(transport);
         let mut cached_snapshot = Some(SettingsSnapshot {
-            id: 51,
+            id: SettingSnapshotId::new(51)?,
             pages: BTreeMap::from([(page.as_raw(), before)]),
             field_ids: field_ids.clone(),
         });
         let mut next_snapshot_id = 52;
         let changes = [SettingChange {
             setting_id: "radio.Beep".to_owned(),
-            snapshot_id: 51,
+            snapshot_id: SettingSnapshotId::new(51)?,
             expected_value: SettingValue::Boolean { value: false },
             desired_value: SettingValue::Boolean { value: true },
         }];
@@ -3105,7 +3336,7 @@ mod tests {
             report.changes.first().map(|result| &result.value),
             Some(&SettingValue::Boolean { value: true })
         );
-        assert_eq!(report.refreshed_values.snapshot_id, 52);
+        assert_eq!(report.refreshed_values.snapshot_id.get(), 52);
         assert_eq!(
             report
                 .refreshed_values
@@ -3120,7 +3351,7 @@ mod tests {
         let cached = cached_snapshot
             .as_ref()
             .ok_or("post-exit live snapshot was not cached")?;
-        assert_eq!(cached.id, 52);
+        assert_eq!(cached.id.get(), 52);
         let cached_values = decode_values(&field_ids, &cached.pages)?;
         assert_eq!(cached_values, report.refreshed_values.values);
         Ok(())
@@ -3147,14 +3378,14 @@ mod tests {
 
         let mut radio = Radio::new(transport);
         let mut cached_snapshot = Some(SettingsSnapshot {
-            id: 61,
+            id: SettingSnapshotId::new(61)?,
             pages: BTreeMap::from([(page.as_raw(), before)]),
             field_ids: vec!["radio.Beep".to_owned()],
         });
         let mut next_snapshot_id = 62;
         let changes = [SettingChange {
             setting_id: "radio.Beep".to_owned(),
-            snapshot_id: 61,
+            snapshot_id: SettingSnapshotId::new(61)?,
             expected_value: SettingValue::Boolean { value: false },
             desired_value: SettingValue::Boolean { value: true },
         }];
@@ -3170,9 +3401,8 @@ mod tests {
         assert!(
             matches!(
                 &result,
-                Err(AutomationError::SettingsApply { detail })
-                    if detail.contains("post-exit live refresh failed")
-                        && detail.contains("[16]")
+                Err(AutomationError::SettingsApply { phase: SettingApplyPhase::LiveRefresh, possibly_written_pages, .. })
+                    if possibly_written_pages == &[0x10]
             ),
             "a failed post-write refresh must retain the write outcome: {result:?}"
         );
@@ -3185,11 +3415,15 @@ mod tests {
     }
 
     #[test]
-    fn identifiers_never_return_zero() {
+    fn identifiers_fail_on_exhaustion_without_reusing_a_lease() -> Result<(), AutomationError> {
         let mut next = u64::MAX;
-        assert_eq!(take_identifier(&mut next), u64::MAX);
-        assert_eq!(take_identifier(&mut next), 1);
-        assert_eq!(next, 2);
+        assert_eq!(take_identifier(&mut next)?.get(), u64::MAX);
+        assert!(matches!(
+            take_identifier(&mut next),
+            Err(AutomationError::IdentifierExhausted)
+        ));
+        assert_eq!(next, 0);
+        Ok(())
     }
 
     #[test]
@@ -3226,7 +3460,7 @@ mod tests {
             .get_mut(0x0B)
             .ok_or("Menu 506 byte is outside MCP page")? = raw_band;
         Ok(SettingsSnapshot {
-            id,
+            id: SettingSnapshotId::new(id)?,
             pages: BTreeMap::from([(0x10, interface_page), (0x12, data_band_page)]),
             field_ids,
         })
@@ -3245,19 +3479,19 @@ mod tests {
             let snapshot =
                 aprs_authority_snapshot(77, 1, raw_band, complete_aprs_authority_fields())?;
             assert!(matches!(
-                resolve_settings_snapshot_aprs_authority(Some(&snapshot), 77, 1),
+                resolve_settings_snapshot_aprs_authority(Some(&snapshot), SettingSnapshotId::new(77)?, AprsKissInterface::Bluetooth),
                 Ok(actual) if actual == expected
             ));
         }
 
         let valid = aprs_authority_snapshot(77, 1, 0, complete_aprs_authority_fields())?;
         assert!(matches!(
-            resolve_settings_snapshot_aprs_authority(None, 77, 1),
-            Err(AutomationError::SettingsSnapshotUnavailable { snapshot_id: 77 })
+            resolve_settings_snapshot_aprs_authority(None, SettingSnapshotId::new(77)?, AprsKissInterface::Bluetooth),
+            Err(AutomationError::SettingsSnapshotUnavailable { snapshot_id }) if snapshot_id.get() == 77
         ));
         assert!(matches!(
-            resolve_settings_snapshot_aprs_authority(Some(&valid), 78, 1),
-            Err(AutomationError::SettingsSnapshotUnavailable { snapshot_id: 78 })
+            resolve_settings_snapshot_aprs_authority(Some(&valid), SettingSnapshotId::new(78)?, AprsKissInterface::Bluetooth),
+            Err(AutomationError::SettingsSnapshotUnavailable { snapshot_id }) if snapshot_id.get() == 78
         ));
 
         for missing_fields in [
@@ -3266,13 +3500,17 @@ mod tests {
         ] {
             let snapshot = aprs_authority_snapshot(77, 1, 0, missing_fields)?;
             assert!(matches!(
-                resolve_settings_snapshot_aprs_authority(Some(&snapshot), 77, 1),
+                resolve_settings_snapshot_aprs_authority(
+                    Some(&snapshot),
+                    SettingSnapshotId::new(77)?,
+                    AprsKissInterface::Bluetooth
+                ),
                 Err(AutomationError::AprsStartAuthority { .. })
             ));
         }
 
         assert!(matches!(
-            resolve_settings_snapshot_aprs_authority(Some(&valid), 77, 0),
+            resolve_settings_snapshot_aprs_authority(Some(&valid), SettingSnapshotId::new(77)?, AprsKissInterface::Usb),
             Err(AutomationError::AprsStartAuthority { detail })
                 if detail.contains("Menu 983")
         ));
@@ -3281,7 +3519,7 @@ mod tests {
             let snapshot =
                 aprs_authority_snapshot(77, 1, invalid_band, complete_aprs_authority_fields())?;
             assert!(matches!(
-                resolve_settings_snapshot_aprs_authority(Some(&snapshot), 77, 1),
+                resolve_settings_snapshot_aprs_authority(Some(&snapshot), SettingSnapshotId::new(77)?, AprsKissInterface::Bluetooth),
                 Err(AutomationError::AprsStartAuthority { detail })
                     if detail.contains("Menu 506")
             ));
@@ -3352,10 +3590,10 @@ mod tests {
     }
 
     #[test]
-    fn proved_aprs_start_revokes_core_settings_write_authority_before_tn() {
+    fn proved_aprs_start_revokes_core_settings_write_authority_before_tn() -> TestResult {
         let mut pending_screen = None;
         let mut settings_snapshot = Some(SettingsSnapshot {
-            id: 73,
+            id: SettingSnapshotId::new(73)?,
             pages: BTreeMap::new(),
             field_ids: vec!["radio.KissModeInterface".to_owned()],
         });
@@ -3367,15 +3605,16 @@ mod tests {
             settings_snapshot.is_none(),
             "even aligned TN=N must consume the core-side reviewed settings lease"
         );
+        Ok(())
     }
 
     #[test]
-    fn refused_aprs_status_is_semantic_and_does_not_leak_tn() {
+    fn refused_aprs_status_is_semantic_and_does_not_leak_tn() -> TestResult {
         let store = Mutex::new(AprsActivityStore::default());
         let public_detail = "APRS KISS is unavailable in the radio's current mode. The existing CAT connection remains active.";
         {
             let mut journal = lock_aprs_store(&store);
-            journal.record_start_refusal(AprsSessionConfig::default(), public_detail);
+            journal.record_start_refusal(AprsSessionConfig::default(), public_detail)?;
         }
 
         let snapshot = lock_aprs_store(&store).snapshot(None);
@@ -3398,6 +3637,7 @@ mod tests {
                 .any(|record| record.summary.contains("TN")),
             "the Swift-installed core snapshot must not expose raw CAT mnemonics"
         );
+        Ok(())
     }
 
     #[tokio::test]
@@ -3465,7 +3705,7 @@ mod tests {
         let store = Mutex::new(AprsActivityStore::default());
         {
             let mut journal = lock_aprs_store(&store);
-            journal.begin_start(AprsSessionConfig::default());
+            journal.begin_start(AprsSessionConfig::default())?;
             journal.mark_active();
             journal.mark_restoring();
         }
@@ -3495,7 +3735,7 @@ mod tests {
         let store = Mutex::new(AprsActivityStore::default());
         {
             let mut journal = lock_aprs_store(&store);
-            journal.begin_start(AprsSessionConfig::default());
+            journal.begin_start(AprsSessionConfig::default())?;
             journal.mark_active();
             journal.mark_restoring();
         }
@@ -3525,7 +3765,7 @@ mod tests {
     #[test]
     fn failed_aprs_start_reports_inactive_only_after_automation_cleanup() -> TestResult {
         let store = Mutex::new(AprsActivityStore::default());
-        lock_aprs_store(&store).begin_start(AprsSessionConfig::default());
+        lock_aprs_store(&store).begin_start(AprsSessionConfig::default())?;
         let (reply, mut response) = oneshot::channel();
         let deferred = DeferredReply::FailedAprsStart {
             reply,

@@ -1,5 +1,7 @@
 //! Swift-facing macOS Bluetooth Classic SPP byte transport.
 
+#[cfg(target_os = "macos")]
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StandardMutex};
 
 use kenwood_thd75::types::SerialNumber;
@@ -10,8 +12,6 @@ use kenwood_thd75::{
 };
 #[cfg(target_os = "macos")]
 use kenwood_transport::{Transport, TransportError, bluetooth::PairedBluetoothDevice};
-#[cfg(target_os = "macos")]
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(target_os = "macos")]
 use tokio::sync::{Mutex, Notify};
 
@@ -26,9 +26,7 @@ use crate::terminal_mode::{
 
 /// Largest byte vector accepted by one Swift-facing link operation.
 ///
-/// CAT, MCP, KISS, and MMDVM frames used by Azimuth fit comfortably inside
-/// this bound. Limiting each foreign call also prevents an accidental UI-side
-/// allocation from becoming an unbounded helper-pipe operation.
+/// One foreign call carries at most 4,096 CAT, MCP, KISS or MMDVM bytes.
 const MAXIMUM_BLUETOOTH_TRANSFER_BYTES: u32 = 4_096;
 
 /// A paired macOS Bluetooth Classic device.
@@ -73,7 +71,7 @@ pub enum BluetoothLinkTarget {
     /// Open one already resolved address and re-prove the expected CAT serial.
     ///
     /// This avoids another paired-device scan without weakening the physical
-    /// radio identity gate. It is the durable form of a successful
+    /// radio identity gate. It retains the exact address from a successful
     /// [`Self::ExpectedUsbSerial`] selection.
     ExactAddressExpectedUsbSerial {
         /// Exact 17-character paired Bluetooth address.

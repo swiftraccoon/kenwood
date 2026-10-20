@@ -9,6 +9,41 @@
 //! setting validation, host-owned APRS/KISS sessions, and physical IF-DSP
 //! processing.
 
+pub use aprs::{
+    AprsActivityDirection, AprsActivityKind, AprsActivityRecord, AprsConfiguration,
+    AprsKissInterface, AprsOperationalSnapshot, AprsPacketDataRate, AprsSessionConfig,
+    AprsSessionPhase, AprsSessionStatus, AprsStartAuthority, AprsStationRecord, TncDataBand,
+};
+pub use automation::{
+    AutomationAbiRecord, AutomationController, AutomationError, FrontPanelKey,
+    GuardedTapDisposition, GuardedTapResult, IfDspRadioPhase, IfDspRadioStatus, RemoteScreenFrame,
+    SettingApplyPhase, SettingApplyReport, SettingChangeOutcome, SettingChangeResult,
+    SettingReadResult, SettingValueRecord,
+};
+pub use bluetooth_link::{
+    BluetoothByteTransport, BluetoothDeviceDiscovery, BluetoothLinkError, BluetoothLinkTarget,
+    BluetoothPairedDevice, discover_paired_bluetooth_devices,
+};
+pub use catalog::{
+    SettingCatalogError, SettingChange, SettingChangeValidation, SettingConversionError,
+    SettingMenu, SettingOption, SettingPlanValidation, SettingPresentation, SettingRecord,
+    SettingStorageTransform, SettingTextEncoding, SettingValue, SettingValueKind,
+    SettingWritePolicy, decode_setting_display_value, encode_setting_display_value,
+    setting_catalog, validate_setting_changes,
+};
+pub use identifiers::{IdentifierError, ScreenLeaseId, SettingSnapshotId};
+pub use if_dsp::{
+    IfDspConfiguration, IfDspError, IfDspFrame, IfDspMode, IfDspProcessor, IfDspSpectrum,
+};
+pub use terminal_mode::{
+    AprsCurrentModeRecoveryError, AprsCurrentModeRecoveryResult, BluetoothRecoverySelector,
+    DvGatewayCatDisableError, DvGatewayCatDisableResult, DvGatewayRecoveryError,
+    DvGatewayRecoveryOperation, DvGatewayRecoveryOutcome, DvGatewayUsbRoutingError,
+    DvGatewayUsbRoutingOperation, DvGatewayUsbRoutingOutcome, DvGatewayUsbRoutingResult,
+    RecoveryOperationFailure, validate_bluetooth_recovery_helper,
+};
+pub use transport::{ByteTransport, ByteTransportError};
+
 #[forbid(unsafe_code)]
 mod aprs;
 #[forbid(unsafe_code)]
@@ -18,6 +53,8 @@ mod bluetooth_link;
 #[forbid(unsafe_code)]
 mod catalog;
 #[forbid(unsafe_code)]
+mod identifiers;
+#[forbid(unsafe_code)]
 mod if_dsp;
 #[forbid(unsafe_code)]
 mod if_dsp_radio;
@@ -25,40 +62,6 @@ mod if_dsp_radio;
 mod terminal_mode;
 #[forbid(unsafe_code)]
 mod transport;
-
-pub use aprs::{
-    AprsActivityDirection, AprsActivityKind, AprsActivityRecord, AprsOperationalSnapshot,
-    AprsPacketDataRate, AprsSessionConfig, AprsSessionPhase, AprsSessionStatus, AprsStartAuthority,
-    AprsStationRecord, TncDataBand,
-};
-pub use automation::{
-    AutomationAbiRecord, AutomationController, AutomationError, FrontPanelKey,
-    GuardedTapDisposition, GuardedTapResult, IfDspRadioPhase, IfDspRadioStatus, RemoteScreenFrame,
-    SettingApplyReport, SettingChangeOutcome, SettingChangeResult, SettingReadResult,
-    SettingValueRecord, connect_automation,
-};
-pub use bluetooth_link::{
-    BluetoothByteTransport, BluetoothDeviceDiscovery, BluetoothLinkError, BluetoothLinkTarget,
-    BluetoothPairedDevice, discover_paired_bluetooth_devices,
-};
-pub use catalog::{
-    SettingChange, SettingChangeValidation, SettingConversionError, SettingMenu, SettingOption,
-    SettingPlanValidation, SettingPresentation, SettingRecord, SettingStorageTransform,
-    SettingTextEncoding, SettingValue, SettingValueKind, SettingWritePolicy,
-    decode_setting_display_value, encode_setting_display_value, setting_catalog,
-    validate_setting_changes,
-};
-pub use if_dsp::{
-    IfDspConfiguration, IfDspError, IfDspFrame, IfDspMode, IfDspProcessor, IfDspSpectrum,
-};
-pub use terminal_mode::{
-    AprsCurrentModeRecoveryError, AprsCurrentModeRecoveryResult, BluetoothRecoverySelector,
-    DvGatewayCatDisableError, DvGatewayCatDisableResult, DvGatewayRecoveryError,
-    DvGatewayRecoveryOperation, DvGatewayRecoveryOutcome, DvGatewayUsbRoutingError,
-    DvGatewayUsbRoutingOperation, DvGatewayUsbRoutingOutcome, DvGatewayUsbRoutingResult,
-    validate_bluetooth_recovery_helper,
-};
-pub use transport::{ByteTransport, ByteTransportError};
 
 uniffi::setup_scaffolding!();
 

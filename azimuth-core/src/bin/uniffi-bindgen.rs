@@ -5,6 +5,7 @@ use async_trait as _;
 use ax25_codec as _;
 use azimuth_core as _;
 use if_dsp as _;
+use kenwood_schema as _;
 use kenwood_thd75 as _;
 use kenwood_transport as _;
 use kiss_tnc as _;

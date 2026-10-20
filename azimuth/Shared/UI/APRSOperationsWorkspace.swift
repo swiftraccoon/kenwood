@@ -1435,7 +1435,7 @@ private struct APRSActivityDetail: View {
                     LabeledContent("Latitude", value: String(format: "%.6f°", latitude))
                     LabeledContent("Longitude", value: String(format: "%.6f°", longitude))
                     if let speed = activity.speedKnots {
-                        LabeledContent("Speed", value: "\(speed) kn")
+                        LabeledContent("Speed", value: String(format: "%.1f kn", speed))
                     }
                     if let course = activity.courseDegrees {
                         LabeledContent("Course", value: "\(course)°")
@@ -1503,7 +1503,7 @@ private struct APRSStationDetail: View {
                     LabeledContent("Latitude", value: String(format: "%.6f°", latitude))
                     LabeledContent("Longitude", value: String(format: "%.6f°", longitude))
                     if let speed = station.speedKnots {
-                        LabeledContent("Speed", value: "\(speed) kn")
+                        LabeledContent("Speed", value: String(format: "%.1f kn", speed))
                     }
                     if let course = station.courseDegrees {
                         LabeledContent("Course", value: "\(course)°")

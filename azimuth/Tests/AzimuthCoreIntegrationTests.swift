@@ -29,19 +29,20 @@ final class AzimuthCoreCatalogTests: XCTestCase {
             "dv.DvGatewayModeDvGateway",
             "radio.UsbFunction",
         ]
-        let records = settingCatalog().filter { $0.writePolicy == .dedicatedLifecycle }
+        let records = try settingCatalog().filter { $0.writePolicy() == .dedicatedLifecycle }
 
-        XCTAssertEqual(Set(records.map(\.id)), disruptiveIDs)
+        XCTAssertEqual(Set(records.map { $0.id() }), disruptiveIDs)
         for record in records {
-            XCTAssertTrue(record.requiresRestart, record.id)
-            XCTAssertTrue(record.requiresReconnect, record.id)
-            XCTAssertNotNil(record.writeRestriction, record.id)
+            let identifier = record.id()
+            XCTAssertTrue(record.requiresRestart(), identifier)
+            XCTAssertTrue(record.requiresReconnect(), identifier)
+            XCTAssertNotNil(record.writeRestriction(), identifier)
 
-            let definition = try XCTUnwrap(catalog.definition(id: record.id))
-            XCTAssertTrue(definition.isSpecializedEditor, record.id)
-            XCTAssertTrue(definition.requiresRestart, record.id)
-            XCTAssertTrue(definition.requiresReconnect, record.id)
-            XCTAssertEqual(definition.summary, record.writeRestriction, record.id)
+            let definition = try XCTUnwrap(catalog.definition(id: identifier))
+            XCTAssertTrue(definition.isSpecializedEditor, identifier)
+            XCTAssertTrue(definition.requiresRestart, identifier)
+            XCTAssertTrue(definition.requiresReconnect, identifier)
+            XCTAssertEqual(definition.summary, record.writeRestriction(), identifier)
 
             let plan = AssistantPlanValidator.validate(
                 request: "Change \(definition.title)",
@@ -50,17 +51,17 @@ final class AzimuthCoreCatalogTests: XCTestCase {
                     needsClarification: false,
                     changes: [
                         .init(
-                            settingID: record.id,
+                            settingID: identifier,
                             proposedValue: "1",
                             rationale: "Requested change"
                         ),
                     ]
                 ),
                 catalog: catalog,
-                currentValues: [record.id: .choice(rawValue: 0)]
+                currentValues: [identifier: .choice(rawValue: 0)]
             )
-            XCTAssertEqual(plan.changes.first?.validation, .specializedEditorRequired, record.id)
-            XCTAssertFalse(plan.isFullyValidated, record.id)
+            XCTAssertEqual(plan.changes.first?.validation, .specializedEditorRequired, identifier)
+            XCTAssertFalse(plan.isFullyValidated, identifier)
         }
     }
 
@@ -168,32 +169,34 @@ final class AzimuthCoreCatalogTests: XCTestCase {
 
     func testAllScaledFieldsUseEditableDisplayUnitDomainsWhileBlobStaysSpecialized() async throws {
         let catalog = try await AzimuthCoreCatalogProvider().catalog()
-        let records = settingCatalog()
+        let records = try settingCatalog()
         let schema = try AzimuthCoreSettingSchema(records: records)
-        let scaledRecords = records.filter { $0.presentation == .scaledInteger }
-        let blobRecords = records.filter { $0.presentation == .blob }
+        let scaledRecords = records.filter { $0.presentation() == .scaledInteger }
+        let blobRecords = records.filter { $0.presentation() == .blob }
 
         XCTAssertEqual(schema.scalarSettingCount, 399)
         XCTAssertEqual(schema.deferredBlobCount, 1)
         XCTAssertEqual(scaledRecords.count, 16)
         for record in scaledRecords {
-            let definition = try XCTUnwrap(catalog.definition(id: record.id))
-            XCTAssertFalse(definition.isSpecializedEditor, record.id)
+            let identifier = record.id()
+            let definition = try XCTUnwrap(catalog.definition(id: identifier))
+            XCTAssertFalse(definition.isSpecializedEditor, identifier)
             guard case .scaledInteger(let scale) = definition.domain else {
-                return XCTFail("\(record.id) did not receive a scaled integer domain")
+                return XCTFail("\(identifier) did not receive a scaled integer domain")
             }
-            XCTAssertEqual(scale.inputUnit, record.storageTransform?.inputUnit)
-            XCTAssertEqual(scale.numerator, record.storageTransform?.numerator)
-            XCTAssertEqual(scale.denominator, record.storageTransform?.denominator)
+            let transform = record.storageTransform()
+            XCTAssertEqual(scale.inputUnit, transform?.inputUnit())
+            XCTAssertEqual(scale.numerator, transform?.numerator())
+            XCTAssertEqual(scale.denominator, transform?.denominator())
             XCTAssertEqual(
                 scale.displayDecimalPlaces,
-                record.storageTransform.map { Int($0.displayDecimalPlaces) }
+                transform.map { Int($0.displayDecimalPlaces()) }
             )
         }
 
-        XCTAssertEqual(blobRecords.map(\.id), ["radio.PoweronBitmap"])
+        XCTAssertEqual(blobRecords.map { $0.id() }, ["radio.PoweronBitmap"])
         for record in blobRecords {
-            XCTAssertEqual(catalog.definition(id: record.id)?.isSpecializedEditor, true, record.id)
+            XCTAssertEqual(catalog.definition(id: record.id())?.isSpecializedEditor, true, record.id())
         }
     }
 
@@ -1377,6 +1380,60 @@ final class AzimuthLiveRadioControllerTests: XCTestCase {
         await controller.disconnect()
     }
 
+    func testRecoveryReleaseFailuresPreserveTheRadioOutcomeAndStopReconnect() async throws {
+        let cases: [(DvGatewayRecoveryError, String)] = [
+            (
+                .CompletedButReleaseFailed(
+                    outcome: .changedRadioRebooting,
+                    detail: "helper release refused"
+                ),
+                "Menu 650 was changed to Off"
+            ),
+            (
+                .OperationAndReleaseFailed(
+                    operation: .radioIdentityMismatch(expected: "C3C10368", actual: "C5310165"),
+                    releaseDetail: "helper release refused"
+                ),
+                "No setting was changed"
+            ),
+        ]
+        for (failure, expectedMessage) in cases {
+            let transport = IntegrationTestTransport()
+            let connector = IntegrationTestCoreConnector(core: IntegrationTestCore())
+            let preflight = IntegrationTestModePreflight(modes: [.mmdvm])
+            let controller = try AzimuthLiveRadioController(
+                transport: transport,
+                connectCore: { transport in try await connector.connect(transport: transport) },
+                prepareRadioForAutomation: { _ in try preflight.nextMode() },
+                recoverUSBMMDVM: { _, _ in
+                    IntegrationTestImmediateCATRecoveryOperation { throw failure }
+                },
+                automaticCATRecoveryAvailable: true
+            )
+            do {
+                try await controller.connect()
+                XCTFail("MMDVM mode must stop ordinary CAT connection")
+            } catch let error as RadioControllerError {
+                XCTAssertEqual(error, .usbMmdvmMode)
+            }
+            do {
+                try await controller.restoreCATFromUSBMMDVM()
+                XCTFail("An unreleased Bluetooth connection must stop reconnection")
+            } catch let error as RadioControllerError {
+                guard case .operationFailed(let detail) = error else {
+                    return XCTFail("Expected recovery and release details, got \(error)")
+                }
+                XCTAssertTrue(detail.contains(expectedMessage), detail)
+                XCTAssertTrue(detail.contains("helper release refused"), detail)
+                XCTAssertTrue(detail.contains("Reconnect before another operation"), detail)
+            }
+            XCTAssertEqual(connector.callCount, 0)
+            XCTAssertEqual(preflight.callCount, 1)
+            XCTAssertFalse(controller.automaticCATRecoveryAvailable)
+            await controller.disconnect()
+        }
+    }
+
     func testMMDVMRecoveryPassesKnownQualifiedBluetoothAddress() async throws {
         let baseTransport = IntegrationTestTransport()
         let transport = IntegrationSameRadioTransport(
@@ -1933,7 +1990,7 @@ final class AzimuthLiveRadioControllerTests: XCTestCase {
             core.lastAprsStartAuthority,
             .settingsSnapshot(
                 snapshotId: 41,
-                expectedKissInterfaceRawValue: 0
+                expectedKissInterface: .usb
             )
         )
         XCTAssertEqual(controller.currentAPRSState.status.phase, .active)
@@ -2005,7 +2062,7 @@ final class AzimuthLiveRadioControllerTests: XCTestCase {
             core.lastAprsStartAuthority,
             .settingsSnapshot(
                 snapshotId: 41,
-                expectedKissInterfaceRawValue: 1
+                expectedKissInterface: .bluetooth
             )
         )
         XCTAssertEqual(controller.currentAPRSState.status.phase, .active)
@@ -3339,16 +3396,16 @@ private final class IntegrationTestImmediateCATRecoveryOperation:
     AzimuthCATRecoveryOperation,
     @unchecked Sendable
 {
-    private let body: @Sendable () -> DvGatewayRecoveryOutcome
+    private let body: @Sendable () throws -> DvGatewayRecoveryOutcome
 
-    init(body: @escaping @Sendable () -> DvGatewayRecoveryOutcome) {
+    init(body: @escaping @Sendable () throws -> DvGatewayRecoveryOutcome) {
         self.body = body
     }
 
     func cancel() {}
 
     func run() async throws -> DvGatewayRecoveryOutcome {
-        body()
+        try body()
     }
 }
 
@@ -4196,10 +4253,10 @@ private final class IntegrationTestCore: AutomationControllerProtocol, @unchecke
 
     func recoverAprsCurrentMode(
         expectedRadioSerialNumber: String,
-        expectedKissInterfaceRawValue: UInt8
+        expectedKissInterface: AprsKissInterface
     ) async throws -> AprsCurrentModeRecoveryResult {
         throw AprsCurrentModeRecoveryError.ControllerUnavailable(
-            detail: "test core has no live APRS current-mode operation for \(expectedRadioSerialNumber) route \(expectedKissInterfaceRawValue)"
+            detail: "test core has no live APRS current-mode operation for \(expectedRadioSerialNumber) route \(expectedKissInterface)"
         )
     }
 

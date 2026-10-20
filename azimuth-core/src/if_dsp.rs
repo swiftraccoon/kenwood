@@ -2,10 +2,16 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use if_dsp::{Channelizer, ChannelizerConfig, DemodMode, INPUT_RATE, SpectrumEstimator};
+use if_dsp::{
+    Bandwidth, Channelizer, ChannelizerConfig, DemodMode, DspError, FftSize, INPUT_RATE,
+    SpectrumEstimator,
+};
 
 /// FFT size used by the live IF spectrum.
-const SPECTRUM_FFT_SIZE: usize = 1_024;
+const SPECTRUM_FFT_SIZE: FftSize = match FftSize::new(1_024) {
+    Ok(size) => size,
+    Err(_) => unreachable!(),
+};
 /// Publish roughly ten spectra per second at the required 48 kHz input rate.
 const SPECTRUM_INTERVAL_SAMPLES: u64 = 4_800;
 /// Hann coherent gain, expressed as the sum of a 1,024-sample Hann window.
@@ -69,7 +75,7 @@ pub struct IfDspSpectrum {
 /// Result of processing one block of real 48 kHz mono IF PCM.
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
 pub struct IfDspFrame {
-    /// Monotonic block sequence since construction or reset.
+    /// Increasing block sequence since construction or reset, saturating at `u64::MAX`.
     pub sequence: u64,
     /// Total physical input samples processed since construction or reset.
     pub input_sample_count: u64,
@@ -80,7 +86,7 @@ pub struct IfDspFrame {
     /// Latest spectrum when its ten-hertz publication interval elapsed.
     /// An absent value means the caller should retain its previous spectrum.
     pub spectrum: Option<IfDspSpectrum>,
-    /// Cumulative input samples at or beyond full scale.
+    /// Cumulative accepted input samples at full scale (`-1` or `1`).
     pub clipped_sample_count: u64,
 }
 
@@ -93,9 +99,21 @@ pub enum IfDspError {
         /// Rejected passband width.
         filter_hz: f32,
     },
+    /// The checked DSP pipeline could not construct or replace its configuration.
+    #[error("IF DSP configuration failed: {reason}")]
+    DspConfiguration {
+        /// Scalar, passband, coefficient or timing failure from the DSP library.
+        reason: String,
+    },
     /// A PCM sample was NaN or infinite.
     #[error("IF DSP PCM sample {sample_index} was not finite")]
     NonFiniteSample {
+        /// Index within the rejected block.
+        sample_index: u64,
+    },
+    /// A finite PCM sample exceeded the normalized full-scale range.
+    #[error("IF DSP PCM sample {sample_index} is outside -1..=1")]
+    SampleOutOfRange {
         /// Index within the rejected block.
         sample_index: u64,
     },
@@ -127,9 +145,8 @@ struct ProcessorState {
 
 impl ProcessorState {
     fn new(configuration: IfDspConfiguration) -> Result<Self, IfDspError> {
-        validate_configuration(configuration)?;
         Ok(Self {
-            channelizer: build_channelizer(configuration),
+            channelizer: build_channelizer(configuration)?,
             spectrum: SpectrumEstimator::new(SPECTRUM_FFT_SIZE),
             configuration,
             sequence: 0,
@@ -144,11 +161,17 @@ impl ProcessorState {
     }
 
     fn set_configuration(&mut self, configuration: IfDspConfiguration) -> Result<(), IfDspError> {
-        validate_configuration(configuration)?;
+        let checked = checked_configuration(configuration)?;
+        let mut replacement = self.channelizer.clone();
         if configuration.mode != self.configuration.mode {
-            self.channelizer.set_mode(configuration.mode.into());
+            replacement
+                .set_mode(checked.mode())
+                .map_err(configuration_error)?;
         }
-        self.channelizer.set_filter_hz(configuration.filter_hz);
+        replacement
+            .set_filter_width(Some(checked.filter_width()))
+            .map_err(configuration_error)?;
+        self.channelizer = replacement;
         self.configuration = configuration;
         Ok(())
     }
@@ -189,7 +212,7 @@ impl ProcessorState {
     }
 
     fn render_spectrum(&mut self) -> IfDspSpectrum {
-        self.spectrum.write_psd(&mut self.spectrum_power);
+        self.spectrum.write_bin_power(&mut self.spectrum_power);
         let mut levels_dbfs = Vec::with_capacity(self.spectrum_power.len());
         for (index, power) in self.spectrum_power.iter().copied().enumerate() {
             let one_sided_scale = if index == 0 || index + 1 == self.spectrum_power.len() {
@@ -223,9 +246,10 @@ impl ProcessorState {
         }
     }
 
-    fn reset(&mut self) {
+    fn reset(&mut self) -> Result<(), IfDspError> {
         let configuration = self.configuration;
-        self.channelizer = build_channelizer(configuration);
+        let replacement = build_channelizer(configuration)?;
+        self.channelizer = replacement;
         self.spectrum.reset();
         self.sequence = 0;
         self.input_sample_count = 0;
@@ -235,6 +259,7 @@ impl ProcessorState {
         self.smoothed_output_rms = 0.0;
         self.output.clear();
         self.spectrum_power.clear();
+        Ok(())
     }
 }
 
@@ -250,7 +275,8 @@ impl IfDspProcessor {
     ///
     /// # Errors
     ///
-    /// Returns [`IfDspError::InvalidFilter`] for an unsafe passband.
+    /// Returns [`IfDspError::InvalidFilter`] for an unsafe passband or
+    /// [`IfDspError::DspConfiguration`] for a checked DSP setup failure.
     #[uniffi::constructor]
     pub fn new(configuration: IfDspConfiguration) -> Result<Arc<Self>, IfDspError> {
         Ok(Arc::new(Self {
@@ -271,7 +297,8 @@ impl IfDspProcessor {
     ///
     /// # Errors
     ///
-    /// Returns an invalid-filter or unavailable-state error.
+    /// Returns an invalid-filter, DSP-configuration or unavailable-state error.
+    /// Rejection preserves configuration, measurements and stream history.
     pub fn set_configuration(
         self: Arc<Self>,
         configuration: IfDspConfiguration,
@@ -279,16 +306,17 @@ impl IfDspProcessor {
         lock(&self.state)?.set_configuration(configuration)
     }
 
-    /// Process one physical PCM block and return live measurements and audio.
+    /// Process one physical PCM block and return live measurements.
     ///
-    /// Input must be normalized, finite, real, mono, 48 kHz PCM. The Apple
+    /// Input must be finite, real, mono, 48 kHz PCM within `-1..=1`. The Apple
     /// integration converts the selected USB input to that format before
     /// calling this method and never calls it from the real-time audio thread.
     ///
     /// # Errors
     ///
-    /// Returns an error for an oversized block, non-finite PCM, or poisoned
-    /// processor state.
+    /// Returns an error for an oversized block, non-finite or out-of-range PCM,
+    /// or poisoned processor state. Rejection preserves the complete stream
+    /// state. Counters saturate at `u64::MAX`; reset starts them at zero.
     #[expect(
         clippy::needless_pass_by_value,
         reason = "UniFFI transfers sequences as owned vectors across the foreign boundary"
@@ -304,6 +332,11 @@ impl IfDspProcessor {
                 sample_index: sample_index as u64,
             });
         }
+        if let Some(sample_index) = samples.iter().position(|sample| sample.abs() > 1.0) {
+            return Err(IfDspError::SampleOutOfRange {
+                sample_index: sample_index as u64,
+            });
+        }
         Ok(lock(&self.state)?.process(&samples))
     }
 
@@ -311,10 +344,11 @@ impl IfDspProcessor {
     ///
     /// # Errors
     ///
-    /// Returns [`IfDspError::StateUnavailable`] if the processor is poisoned.
+    /// Returns [`IfDspError::StateUnavailable`] if the processor is poisoned or
+    /// [`IfDspError::DspConfiguration`] if rebuilding the DSP pipeline fails.
+    /// Failure preserves the previous processor and counters.
     pub fn reset(self: Arc<Self>) -> Result<(), IfDspError> {
-        lock(&self.state)?.reset();
-        Ok(())
+        lock(&self.state)?.reset()
     }
 }
 
@@ -331,12 +365,27 @@ fn validate_configuration(configuration: IfDspConfiguration) -> Result<(), IfDsp
     Ok(())
 }
 
-fn build_channelizer(configuration: IfDspConfiguration) -> Channelizer {
-    Channelizer::new(ChannelizerConfig {
-        mode: configuration.mode.into(),
-        filter_hz: configuration.filter_hz,
-        agc: Some(if_dsp::AgcConfig::default()),
-    })
+fn checked_configuration(
+    configuration: IfDspConfiguration,
+) -> Result<ChannelizerConfig, IfDspError> {
+    validate_configuration(configuration)?;
+    let mut checked = ChannelizerConfig::new(configuration.mode.into());
+    if let Some(hz) = configuration.filter_hz {
+        checked = checked
+            .with_filter_width(Bandwidth::new(hz).map_err(configuration_error)?)
+            .map_err(configuration_error)?;
+    }
+    Ok(checked)
+}
+
+fn build_channelizer(configuration: IfDspConfiguration) -> Result<Channelizer, IfDspError> {
+    Channelizer::new(checked_configuration(configuration)?).map_err(configuration_error)
+}
+
+fn configuration_error(error: DspError) -> IfDspError {
+    IfDspError::DspConfiguration {
+        reason: error.to_string(),
+    }
 }
 
 fn rms(samples: &[f32]) -> f32 {
@@ -465,6 +514,83 @@ mod tests {
             processor.process_pcm(vec![f32::NAN]),
             Err(IfDspError::NonFiniteSample { sample_index: 0 })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_pcm_preserves_counters_and_filter_history() -> Result<(), IfDspError> {
+        let changed = IfDspProcessor::new(configuration(IfDspMode::Usb))?;
+        let original = IfDspProcessor::new(configuration(IfDspMode::Usb))?;
+        let prefix = tone(13_000.0, 137);
+        assert_eq!(
+            changed.clone().process_pcm(prefix.clone())?,
+            original.clone().process_pcm(prefix)?
+        );
+        let rejected = changed.clone().process_pcm(vec![0.0, f32::MAX]);
+        assert!(
+            matches!(
+                rejected,
+                Err(IfDspError::SampleOutOfRange { sample_index: 1 })
+            ),
+            "{rejected:?}"
+        );
+        let suffix = tone(13_000.0, 129);
+        assert_eq!(
+            changed.process_pcm(suffix.clone())?,
+            original.process_pcm(suffix)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_combined_mode_and_width_change_preserves_measurements_and_history()
+    -> Result<(), IfDspError> {
+        let config = configuration(IfDspMode::Usb);
+        let mut changed = ProcessorState::new(config)?;
+        let mut original = ProcessorState::new(config)?;
+        let prefix = tone(13_000.0, 137);
+        assert_eq!(
+            changed.process(&prefix),
+            original.process(&prefix),
+            "initial state"
+        );
+        let rejected = changed.set_configuration(IfDspConfiguration {
+            mode: IfDspMode::Lsb,
+            filter_hz: Some(6_000.0),
+        });
+        assert!(
+            matches!(rejected, Err(IfDspError::InvalidFilter { .. })),
+            "{rejected:?}"
+        );
+        assert_eq!(
+            changed.configuration, original.configuration,
+            "operator configuration"
+        );
+        assert_eq!(
+            changed.channelizer.mode(),
+            original.channelizer.mode(),
+            "active demodulator"
+        );
+        let suffix = tone(13_000.0, 129);
+        assert_eq!(
+            changed.process(&suffix),
+            original.process(&suffix),
+            "measurement counters and levels"
+        );
+        let actual: Vec<_> = changed
+            .output
+            .iter()
+            .map(|sample| sample.to_bits())
+            .collect();
+        let expected: Vec<_> = original
+            .output
+            .iter()
+            .map(|sample| sample.to_bits())
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "rejected changes preserve audio history exactly"
+        );
         Ok(())
     }
 }

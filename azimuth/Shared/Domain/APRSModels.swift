@@ -143,7 +143,7 @@ struct APRSActivity: Identifiable, Equatable, Sendable {
     let rawAX25: Data
     let latitude: Double?
     let longitude: Double?
-    let speedKnots: UInt16?
+    let speedKnots: Double?
     let courseDegrees: UInt16?
 
     var id: UInt64 { sequence }
@@ -155,7 +155,7 @@ struct APRSStation: Identifiable, Equatable, Sendable {
     let packetCount: UInt64
     let latitude: Double?
     let longitude: Double?
-    let speedKnots: UInt16?
+    let speedKnots: Double?
     let courseDegrees: UInt16?
     let path: [String]
     let latestSummary: String

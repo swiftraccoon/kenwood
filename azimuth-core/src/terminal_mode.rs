@@ -1,4 +1,9 @@
 //! Pre-automation recovery from a USB interface that answers as MMDVM.
+//!
+//! Retain each recovery future through completion. Request cancellation through
+//! its operation object and continue awaiting `run`: cancellation prevents MCP
+//! entry only before the atomic gate. Dropping a Rust future can interrupt its
+//! pending protocol exchange and leaves completion and release unobserved.
 
 use std::sync::{
     Arc,
@@ -19,7 +24,7 @@ use kenwood_transport::TransportError;
 #[cfg(target_os = "macos")]
 use kenwood_transport::bluetooth::{self, BluetoothOpenCancellation, PairedBluetoothDevice};
 
-use crate::aprs::TncDataBand;
+use crate::aprs::{AprsKissInterface, TncDataBand};
 use crate::transport::{ByteTransport, SwiftByteTransport};
 
 #[cfg(target_os = "macos")]
@@ -541,8 +546,7 @@ async fn select_matching_bluetooth_device(
             BluetoothDeviceProbe::Unavailable => {}
             BluetoothDeviceProbe::Identified(actual) => {
                 if &actual == expected {
-                    // CAT serial is the stable USB identity used for this
-                    // recovery. Reopen this exact address and verify the same
+                    // Reopen this exact address and verify the same CAT serial
                     // serial again before the MCP mutation gate. Unrelated
                     // paired devices cannot invalidate that positive proof.
                     return Ok(device.clone());
@@ -636,9 +640,8 @@ pub(crate) async fn open_selected_bluetooth_transport(
     }
 
     // With no explicit selection, never trust a paired device's display name.
-    // Enumerate the bounded snapshot and qualify devices by the exact serial
-    // learned from USB before opening
-    // the selected address for the setting operation.
+    // Enumerate the bounded snapshot and match the exact CAT serial retained
+    // from the selected USB connection before opening the setting endpoint.
     let devices =
         enumerate_paired_bluetooth_devices_cancellable(helper_executable.clone(), cancellation)
             .await?;
@@ -658,7 +661,7 @@ pub(crate) async fn open_selected_bluetooth_transport(
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 async fn verify_matching_radio_serial<T: Transport>(
     radio: &mut Radio<T>,
     expected: &SerialNumber,
@@ -693,7 +696,7 @@ async fn verify_matching_radio_serial<T: Transport>(
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 async fn verify_schema_target_before_mcp<T: Transport>(
     radio: &mut Radio<T>,
     cancellation: &RecoveryCancellation,
@@ -738,9 +741,8 @@ impl From<DetachedMcpPageUpdate> for DvGatewayUsbRoutingOutcome {
 
 /// Completed USB routing result and the radio identity needed for Bluetooth.
 ///
-/// The USB descriptor is not an identity source: a conforming TH-D75 can
-/// expose `iSerialNumber = 0`. `radio_serial_number` is instead the exact CAT
-/// `AE` identity read from the schema-qualified radio immediately before the
+/// `radio_serial_number` is the exact CAT `AE` identity read from the
+/// schema-qualified radio immediately before the
 /// Menu 985 / Menu 650 mutation gate. The caller must require this same serial
 /// when it reopens the retained Bluetooth address after the reboot.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -764,7 +766,7 @@ pub struct DvGatewayCatDisableResult {
     pub radio_serial_number: String,
 }
 
-/// Completed caller-approved recovery for an APRS KISS current-mode refusal.
+/// Completed Menu 650 recovery with same-session KISS route verification.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct AprsCurrentModeRecoveryResult {
     /// Whether Menu 650 changed or was already Off.
@@ -777,7 +779,7 @@ pub struct AprsCurrentModeRecoveryResult {
     pub data_band: TncDataBand,
 }
 
-/// Failure of caller-approved APRS current-mode recovery.
+/// Failure of Menu 650 recovery with same-session KISS route verification.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, uniffi::Error)]
 pub enum AprsCurrentModeRecoveryError {
     /// Cancellation won before the MCP operation gate.
@@ -794,12 +796,6 @@ pub enum AprsCurrentModeRecoveryError {
     InvalidExpectedRadioSerial {
         /// Exact validation failure.
         detail: String,
-    },
-    /// The caller supplied a Menu 983 value outside its closed 0/1 domain.
-    #[error("expected Menu 983 route {value} is invalid; expected 0 (USB-C) or 1 (Bluetooth)")]
-    InvalidExpectedKissInterface {
-        /// Invalid raw value.
-        value: u8,
     },
     /// Fresh CAT `AE` identity was unavailable before MCP.
     #[error("could not read the selected CAT radio's serial identity: {detail}")]
@@ -894,14 +890,83 @@ pub enum AprsCurrentModeRecoveryError {
     },
 }
 
+/// Operation failure retained independently from a later transport close failure.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, uniffi::Enum)]
+pub enum RecoveryOperationFailure {
+    /// Cancellation prevented the MCP mutation gate.
+    #[error("cancelled before the MCP mutation gate")]
+    Cancelled,
+    /// A single-use object had already run.
+    #[error("operation already run")]
+    OperationAlreadyRun,
+    /// An exact Bluetooth selector was malformed.
+    #[error("invalid Bluetooth address {address}")]
+    InvalidBluetoothAddress {
+        /// Rejected selector.
+        address: String,
+    },
+    /// The platform cannot provide the required Bluetooth connection.
+    #[error("Bluetooth recovery is unsupported on this platform")]
+    UnsupportedPlatform,
+    /// The alternate Bluetooth connection could not be opened.
+    #[error("Bluetooth unavailable: {detail}")]
+    BluetoothUnavailable {
+        /// Open/discovery failure.
+        detail: String,
+    },
+    /// The actor ended before accepting the operation.
+    #[error("controller unavailable: {detail}")]
+    ControllerUnavailable {
+        /// Actor/channel failure.
+        detail: String,
+    },
+    /// The caller's expected CAT serial was malformed.
+    #[error("invalid expected CAT serial: {detail}")]
+    InvalidExpectedRadioSerial {
+        /// Validation failure.
+        detail: String,
+    },
+    /// The selected connection did not return a usable CAT identity.
+    #[error("CAT identity unavailable: {detail}")]
+    CatIdentityUnavailable {
+        /// Identity query failure.
+        detail: String,
+    },
+    /// The selected connection reached another radio.
+    #[error("CAT identity mismatch: expected {expected}, received {actual}")]
+    RadioIdentityMismatch {
+        /// Retained expected CAT serial.
+        expected: String,
+        /// Fresh CAT serial.
+        actual: String,
+    },
+    /// Model, firmware or schema qualification failed.
+    #[error("radio qualification failed: {detail}")]
+    RadioQualification {
+        /// Qualification failure.
+        detail: String,
+    },
+    /// The operation failed after MCP recovery completed.
+    #[error("radio operation failed: {detail}")]
+    RadioOperation {
+        /// Operation and recovery detail.
+        detail: String,
+    },
+    /// A persistent write may have started without a verified final result.
+    #[error("radio outcome uncertain: {detail}")]
+    OutcomeUncertain {
+        /// Operation and failed recovery detail.
+        detail: String,
+    },
+}
+
 /// Failure while disabling DV Gateway mode over an already-open CAT link.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, uniffi::Error)]
 pub enum DvGatewayCatDisableError {
     /// The operation was cancelled before the Menu 650 mutation gate.
     #[error("DV Gateway disable was cancelled before Menu 650 could be changed")]
     Cancelled,
-    /// The authenticated automation actor ended before it could accept the
-    /// approved operation.
+    /// The authenticated automation actor ended before accepting the operation.
     #[error("the authenticated automation controller is no longer available: {detail}")]
     ControllerUnavailable {
         /// Exact actor/channel failure.
@@ -951,6 +1016,23 @@ pub enum DvGatewayCatDisableError {
     OutcomeUncertain {
         /// Original operation and failed-recovery detail.
         detail: String,
+    },
+    /// The update completed, but closing its consumed CAT connection failed.
+    #[error("DV Gateway disable completed, but releasing CAT failed: {detail}")]
+    CompletedButReleaseFailed {
+        /// Verified update and exact CAT identity.
+        result: DvGatewayCatDisableResult,
+        /// Transport close failure.
+        detail: String,
+    },
+    /// The operation and its final transport close both failed.
+    #[error("{operation}; releasing CAT also failed: {release_detail}")]
+    OperationAndReleaseFailed {
+        /// Original operation classification and payload.
+        #[source]
+        operation: RecoveryOperationFailure,
+        /// Independent transport close failure.
+        release_detail: String,
     },
 }
 
@@ -1024,10 +1106,9 @@ pub(crate) async fn disable_dv_gateway_over_cat<T: Transport>(
     let release = radio.disconnect().await;
     match (result, release) {
         (result, Ok(())) => result,
-        (Ok(_), Err(error)) => Err(DvGatewayCatDisableError::RadioOperation {
-            detail: format!(
-                "the Menu 650 outcome completed, but releasing the CAT transport failed: {error}"
-            ),
+        (Ok(result), Err(error)) => Err(DvGatewayCatDisableError::CompletedButReleaseFailed {
+            result,
+            detail: error.to_string(),
         }),
         (Err(error), Err(release_error)) => Err(cat_disable_release_failure(error, &release_error)),
     }
@@ -1085,25 +1166,50 @@ fn cat_disable_release_failure(
     error: DvGatewayCatDisableError,
     release_error: &RadioError,
 ) -> DvGatewayCatDisableError {
-    match error {
-        DvGatewayCatDisableError::OutcomeUncertain { detail } => {
-            DvGatewayCatDisableError::OutcomeUncertain {
-                detail: format!(
-                    "{detail}; releasing the CAT transport also failed: {release_error}"
-                ),
-            }
+    let operation = match error {
+        DvGatewayCatDisableError::CompletedButReleaseFailed { result, detail } => {
+            return DvGatewayCatDisableError::CompletedButReleaseFailed {
+                result,
+                detail: format!("{detail}; releasing CAT also failed: {release_error}"),
+            };
         }
-        other => DvGatewayCatDisableError::RadioOperation {
-            detail: format!("{other}; releasing the CAT transport also failed: {release_error}"),
-        },
-    }
-}
-
-fn aprs_kiss_interface(raw: u8) -> Result<PcOutputInterface, AprsCurrentModeRecoveryError> {
-    match raw {
-        0 => Ok(PcOutputInterface::Usb),
-        1 => Ok(PcOutputInterface::Bluetooth),
-        value => Err(AprsCurrentModeRecoveryError::InvalidExpectedKissInterface { value }),
+        DvGatewayCatDisableError::OperationAndReleaseFailed {
+            operation,
+            release_detail,
+        } => {
+            return DvGatewayCatDisableError::OperationAndReleaseFailed {
+                operation,
+                release_detail: format!(
+                    "{release_detail}; releasing CAT also failed: {release_error}"
+                ),
+            };
+        }
+        DvGatewayCatDisableError::Cancelled => RecoveryOperationFailure::Cancelled,
+        DvGatewayCatDisableError::ControllerUnavailable { detail } => {
+            RecoveryOperationFailure::ControllerUnavailable { detail }
+        }
+        DvGatewayCatDisableError::InvalidExpectedRadioSerial { detail } => {
+            RecoveryOperationFailure::InvalidExpectedRadioSerial { detail }
+        }
+        DvGatewayCatDisableError::CatIdentityUnavailable { detail } => {
+            RecoveryOperationFailure::CatIdentityUnavailable { detail }
+        }
+        DvGatewayCatDisableError::RadioIdentityMismatch { expected, actual } => {
+            RecoveryOperationFailure::RadioIdentityMismatch { expected, actual }
+        }
+        DvGatewayCatDisableError::RadioQualification { detail } => {
+            RecoveryOperationFailure::RadioQualification { detail }
+        }
+        DvGatewayCatDisableError::RadioOperation { detail } => {
+            RecoveryOperationFailure::RadioOperation { detail }
+        }
+        DvGatewayCatDisableError::OutcomeUncertain { detail } => {
+            RecoveryOperationFailure::OutcomeUncertain { detail }
+        }
+    };
+    DvGatewayCatDisableError::OperationAndReleaseFailed {
+        operation,
+        release_detail: release_error.to_string(),
     }
 }
 
@@ -1241,13 +1347,13 @@ fn zero_write_aprs_recovery_mismatch(error: &RadioError) -> Option<ZeroWriteAprs
 pub(crate) async fn recover_aprs_current_mode_over_cat<T: Transport>(
     mut radio: Radio<T>,
     expected_radio_serial_number: &SerialNumber,
-    expected_kiss_interface_raw_value: u8,
+    expected_kiss_interface: AprsKissInterface,
     cancellation: &RecoveryCancellation,
 ) -> Result<AprsCurrentModeRecoveryResult, AprsCurrentModeRecoveryError> {
     let result = recover_aprs_current_mode_over_cat_inner(
         &mut radio,
         expected_radio_serial_number,
-        expected_kiss_interface_raw_value,
+        expected_kiss_interface,
         cancellation,
     )
     .await;
@@ -1267,10 +1373,13 @@ pub(crate) async fn recover_aprs_current_mode_over_cat<T: Transport>(
 async fn recover_aprs_current_mode_over_cat_inner<T: Transport>(
     radio: &mut Radio<T>,
     expected_radio_serial_number: &SerialNumber,
-    expected_kiss_interface_raw_value: u8,
+    expected_kiss_interface: AprsKissInterface,
     cancellation: &RecoveryCancellation,
 ) -> Result<AprsCurrentModeRecoveryResult, AprsCurrentModeRecoveryError> {
-    let expected_interface = aprs_kiss_interface(expected_kiss_interface_raw_value)?;
+    let expected_interface = match expected_kiss_interface {
+        AprsKissInterface::Usb => PcOutputInterface::Usb,
+        AprsKissInterface::Bluetooth => PcOutputInterface::Bluetooth,
+    };
     verify_aprs_recovery_schema(radio, cancellation).await?;
     let radio_serial_number = verify_aprs_recovery_serial(radio, cancellation).await?;
     if radio_serial_number != *expected_radio_serial_number {
@@ -1346,7 +1455,7 @@ async fn recover_aprs_current_mode_over_cat_inner<T: Transport>(
     Ok(AprsCurrentModeRecoveryResult {
         outcome: recovery_update.update.into(),
         radio_serial_number: radio_serial_number.to_string(),
-        kiss_interface_raw_value: expected_kiss_interface_raw_value,
+        kiss_interface_raw_value: expected_kiss_interface.as_raw(),
         data_band: recovery_update.data_band.into(),
     })
 }
@@ -1428,7 +1537,6 @@ fn aprs_recovery_release_failure(
         error @ (AprsCurrentModeRecoveryError::Cancelled
         | AprsCurrentModeRecoveryError::ControllerUnavailable { .. }
         | AprsCurrentModeRecoveryError::InvalidExpectedRadioSerial { .. }
-        | AprsCurrentModeRecoveryError::InvalidExpectedKissInterface { .. }
         | AprsCurrentModeRecoveryError::CatIdentityUnavailable { .. }
         | AprsCurrentModeRecoveryError::RadioIdentityMismatch { .. }
         | AprsCurrentModeRecoveryError::RadioQualification { .. }) => {
@@ -1479,6 +1587,23 @@ pub enum DvGatewayUsbRoutingError {
         /// Original operation and failed-recovery detail.
         detail: String,
     },
+    /// Routing completed, but closing the consumed USB connection failed.
+    #[error("DV Gateway USB routing completed, but releasing USB failed: {detail}")]
+    CompletedButReleaseFailed {
+        /// Verified routing result and exact CAT identity.
+        result: DvGatewayUsbRoutingResult,
+        /// Transport close failure.
+        detail: String,
+    },
+    /// Routing and closing the consumed connection both failed.
+    #[error("{operation}; releasing USB also failed: {release_detail}")]
+    OperationAndReleaseFailed {
+        /// Original operation classification and payload.
+        #[source]
+        operation: RecoveryOperationFailure,
+        /// Independent transport close failure.
+        release_detail: String,
+    },
 }
 
 /// One single-use, synchronously cancellable operation that routes persistent
@@ -1517,9 +1642,8 @@ impl DvGatewayUsbRoutingOperation {
     ///
     /// The caller must retain the exact Bluetooth endpoint which positively
     /// answered MMDVM, select and open the intended USB radio, and complete CAT
-    /// preflight before constructing this object. A USB descriptor serial is
-    /// deliberately neither accepted nor required; the operation obtains the
-    /// authoritative radio identity from qualified CAT instead.
+    /// preflight before constructing this object. The operation reads CAT `AE`
+    /// on that connection and returns the exact serial for reconnection.
     #[uniffi::constructor]
     pub fn new(transport: Arc<dyn ByteTransport>) -> Arc<Self> {
         Arc::new(Self {
@@ -1622,8 +1746,24 @@ async fn route_dv_gateway_to_usb<T: Transport>(
     mut radio: Radio<T>,
     cancellation: &RecoveryCancellation,
 ) -> Result<DvGatewayUsbRoutingResult, DvGatewayUsbRoutingError> {
-    verify_usb_routing_schema(&mut radio, cancellation).await?;
-    let radio_serial_number = verify_usb_cat_serial(&mut radio, cancellation).await?;
+    let result = route_dv_gateway_to_usb_inner(&mut radio, cancellation).await;
+    let release = radio.disconnect().await;
+    match (result, release) {
+        (result, Ok(())) => result,
+        (Ok(result), Err(error)) => Err(DvGatewayUsbRoutingError::CompletedButReleaseFailed {
+            result,
+            detail: error.to_string(),
+        }),
+        (Err(error), Err(release)) => Err(usb_routing_release_failure(error, &release)),
+    }
+}
+
+async fn route_dv_gateway_to_usb_inner<T: Transport>(
+    radio: &mut Radio<T>,
+    cancellation: &RecoveryCancellation,
+) -> Result<DvGatewayUsbRoutingResult, DvGatewayUsbRoutingError> {
+    verify_usb_routing_schema(radio, cancellation).await?;
+    let radio_serial_number = verify_usb_cat_serial(radio, cancellation).await?;
 
     // This atomic transition is the mutation boundary. Cancellation which
     // linearized first prevents MCP entry. Once MCP wins, never drop the
@@ -1639,7 +1779,6 @@ async fn route_dv_gateway_to_usb<T: Transport>(
         Err(operation_error) => {
             let possibly_wrote = detached_update_has_possible_writes(&operation_error);
             let recovery = radio.recover_from_interrupted_mcp().await;
-            drop(radio.disconnect().await);
             return match recovery {
                 Ok(()) => Err(DvGatewayUsbRoutingError::RadioOperation {
                     detail: operation_error.to_string(),
@@ -1660,14 +1799,53 @@ async fn route_dv_gateway_to_usb<T: Transport>(
         }
     };
 
-    // A changed update deliberately reboots. An unchanged terminal-mode update
-    // still completes an MCP reset, so neither branch is returned as a live CAT
-    // handle. Swift owns the subsequent exact-address Bluetooth proof.
-    drop(radio.disconnect().await);
     Ok(DvGatewayUsbRoutingResult {
         outcome: update.into(),
         radio_serial_number: radio_serial_number.to_string(),
     })
+}
+
+fn usb_routing_release_failure(
+    error: DvGatewayUsbRoutingError,
+    release: &RadioError,
+) -> DvGatewayUsbRoutingError {
+    let operation = match error {
+        DvGatewayUsbRoutingError::Cancelled => RecoveryOperationFailure::Cancelled,
+        DvGatewayUsbRoutingError::UsbCatIdentityUnavailable { detail } => {
+            RecoveryOperationFailure::CatIdentityUnavailable { detail }
+        }
+        DvGatewayUsbRoutingError::RadioQualification { detail } => {
+            RecoveryOperationFailure::RadioQualification { detail }
+        }
+        DvGatewayUsbRoutingError::RadioOperation { detail } => {
+            RecoveryOperationFailure::RadioOperation { detail }
+        }
+        DvGatewayUsbRoutingError::OutcomeUncertain { detail } => {
+            RecoveryOperationFailure::OutcomeUncertain { detail }
+        }
+        DvGatewayUsbRoutingError::CompletedButReleaseFailed { result, detail } => {
+            return DvGatewayUsbRoutingError::CompletedButReleaseFailed {
+                result,
+                detail: format!("{detail}; releasing USB also failed: {release}"),
+            };
+        }
+        DvGatewayUsbRoutingError::OperationAndReleaseFailed {
+            operation,
+            release_detail,
+        } => {
+            return DvGatewayUsbRoutingError::OperationAndReleaseFailed {
+                operation,
+                release_detail: format!("{release_detail}; releasing USB also failed: {release}"),
+            };
+        }
+        DvGatewayUsbRoutingError::OperationAlreadyRun => {
+            RecoveryOperationFailure::OperationAlreadyRun
+        }
+    };
+    DvGatewayUsbRoutingError::OperationAndReleaseFailed {
+        operation,
+        release_detail: release.to_string(),
+    }
 }
 
 /// Result of clearing Menu 650 over the radio's alternate control link.
@@ -1714,9 +1892,7 @@ pub enum DvGatewayRecoveryError {
         address: String,
     },
     /// Bluetooth Classic SPP is not available on this operating system.
-    #[error(
-        "automatic DV Gateway recovery requires the macOS Bluetooth Classic link; iPadOS cannot access the TH-D75 SPP service"
-    )]
+    #[error("automatic DV Gateway recovery requires the macOS Bluetooth Classic connection")]
     UnsupportedPlatform,
     /// The paired radio's alternate Bluetooth control link could not be opened.
     #[error("could not open the paired TH-D75 Bluetooth control link: {detail}")]
@@ -1724,10 +1900,10 @@ pub enum DvGatewayRecoveryError {
         /// Underlying native transport detail.
         detail: String,
     },
-    /// The USB device did not expose a CAT-compatible stable serial identity.
-    #[error("could not qualify the USB radio identity: {detail}")]
-    UsbIdentityUnavailable {
-        /// USB descriptor validation detail.
+    /// The expected CAT `AE` serial supplied at construction was malformed.
+    #[error("the expected CAT radio serial is invalid: {detail}")]
+    InvalidExpectedRadioSerial {
+        /// Exact serial validation failure.
         detail: String,
     },
     /// The alternate Bluetooth radio did not answer its serial query.
@@ -1741,7 +1917,7 @@ pub enum DvGatewayRecoveryError {
         "Bluetooth radio serial {actual} does not match USB radio serial {expected}; no setting was changed"
     )]
     RadioIdentityMismatch {
-        /// Stable serial reported by the USB device descriptor.
+        /// Exact CAT `AE` serial retained from the selected USB connection.
         expected: String,
         /// Exact serial returned by CAT `AE` over Bluetooth.
         actual: String,
@@ -1760,17 +1936,34 @@ pub enum DvGatewayRecoveryError {
         /// Original operation and failed-recovery detail.
         detail: String,
     },
+    /// Menu 650 completed, but the consumed Bluetooth connection did not close.
+    #[error("DV Gateway recovery completed, but releasing Bluetooth failed: {detail}")]
+    CompletedButReleaseFailed {
+        /// Verified Menu 650 update.
+        outcome: DvGatewayRecoveryOutcome,
+        /// Transport close failure.
+        detail: String,
+    },
+    /// Recovery and closing the Bluetooth connection both failed.
+    #[error("{operation}; releasing Bluetooth also failed: {release_detail}")]
+    OperationAndReleaseFailed {
+        /// Original operation classification and payload.
+        #[source]
+        operation: RecoveryOperationFailure,
+        /// Independent transport close failure.
+        release_detail: String,
+    },
 }
 
 /// One single-use, synchronously cancellable Menu 650 recovery attempt.
 ///
 /// Swift cancellation does not implicitly cancel a `UniFFI` async Rust future.
-/// This object provides an explicit synchronous cancellation signal while
-/// retaining native ownership until all helper, radio, and cleanup work has
-/// finished.
+/// This object provides an explicit synchronous cancellation signal. Await
+/// `run` after requesting cancellation to observe helper, radio and cleanup
+/// completion.
 #[derive(uniffi::Object)]
 pub struct DvGatewayRecoveryOperation {
-    expected_radio_serial_number: String,
+    expected_radio_serial_number: SerialNumber,
     bluetooth_address: Option<String>,
     cancellation: RecoveryCancellation,
     run_state: AtomicU8,
@@ -1809,7 +2002,7 @@ impl DvGatewayRecoveryOperation {
 
 #[uniffi::export(async_runtime = "tokio")]
 impl DvGatewayRecoveryOperation {
-    /// Create one recovery attempt for the USB radio's exact stable serial.
+    /// Create one recovery attempt for the exact CAT `AE` serial.
     ///
     /// `bluetooth_selector` may identify one paired device by exact address.
     /// Passing `None` performs bounded paired-device enumeration and exact CAT
@@ -1818,12 +2011,18 @@ impl DvGatewayRecoveryOperation {
     /// # Errors
     ///
     /// Returns [`DvGatewayRecoveryError::InvalidBluetoothAddress`] when the
-    /// explicit selector is not an exact six-octet Bluetooth address.
+    /// explicit selector is not an exact six-octet Bluetooth address, or
+    /// [`DvGatewayRecoveryError::InvalidExpectedRadioSerial`] when the serial
+    /// is malformed. Both inputs validate on every supported platform.
     #[uniffi::constructor]
     pub fn new(
         expected_radio_serial_number: String,
         bluetooth_selector: Option<BluetoothRecoverySelector>,
     ) -> Result<Arc<Self>, DvGatewayRecoveryError> {
+        let expected_radio_serial_number = SerialNumber::try_from(expected_radio_serial_number)
+            .map_err(|error| DvGatewayRecoveryError::InvalidExpectedRadioSerial {
+                detail: error.to_string(),
+            })?;
         let bluetooth_address = bluetooth_selector
             .map(|selector| match selector {
                 BluetoothRecoverySelector::ExactAddress { address } => {
@@ -1852,8 +2051,8 @@ impl DvGatewayRecoveryOperation {
 
     /// Run this recovery attempt exactly once.
     ///
-    /// The caller must first close the USB connection that positively answered
-    /// MMDVM and obtain explicit user consent. The operation opens Bluetooth,
+    /// The caller must first close the USB connection that answered MMDVM and
+    /// retain its exact CAT serial from the selected radio. The operation opens Bluetooth,
     /// proves the same physical radio by exact CAT serial, verifies the exact
     /// supported radio and firmware, and conditionally writes Menu 650 with
     /// read-back verification. The caller still owns the USB reboot wait.
@@ -1863,8 +2062,10 @@ impl DvGatewayRecoveryOperation {
     /// Returns [`DvGatewayRecoveryError::Cancelled`] only when cancellation
     /// wins before the MCP mutation gate, or
     /// [`DvGatewayRecoveryError::OperationAlreadyRun`] after any earlier run.
-    /// Other errors retain the identity, radio-operation, and uncertain-outcome
-    /// distinctions documented by [`DvGatewayRecoveryError`].
+    /// Other errors retain identity, radio-operation and uncertain-outcome
+    /// distinctions. A completed update with failed connection release returns
+    /// [`DvGatewayRecoveryError::CompletedButReleaseFailed`]; a failed update
+    /// and failed release retain both failures independently.
     pub async fn run(self: Arc<Self>) -> Result<DvGatewayRecoveryOutcome, DvGatewayRecoveryError> {
         let _run_guard = self.begin_run()?;
         self.cancellation.check()?;
@@ -1888,22 +2089,16 @@ impl DvGatewayRecoveryOperation {
 
 #[cfg(target_os = "macos")]
 async fn disable_dv_gateway_mode_via_bluetooth(
-    expected_radio_serial_number: &str,
+    expected_serial: &SerialNumber,
     bluetooth_address: Option<String>,
     cancellation: &RecoveryCancellation,
 ) -> Result<DvGatewayRecoveryOutcome, DvGatewayRecoveryError> {
-    cancellation.check()?;
-    let expected_serial = SerialNumber::new(expected_radio_serial_number).map_err(|error| {
-        DvGatewayRecoveryError::UsbIdentityUnavailable {
-            detail: error.to_string(),
-        }
-    })?;
     cancellation.check()?;
     let helper_executable = bundled_bluetooth_helper_executable()?;
     let selection = open_selected_bluetooth_transport(
         helper_executable,
         bluetooth_address,
-        &expected_serial,
+        expected_serial,
         cancellation,
     )
     .await?;
@@ -1923,34 +2118,49 @@ async fn disable_dv_gateway_mode_via_bluetooth(
     let Some(connected) = connected else {
         return Err(DvGatewayRecoveryError::Cancelled);
     };
-    let mut radio = connected.map_err(|error| DvGatewayRecoveryError::RadioOperation {
+    let radio = connected.map_err(|error| DvGatewayRecoveryError::RadioOperation {
         detail: format!("Bluetooth packet-mode recovery failed: {error}"),
     })?;
-    if let Err(error) =
-        verify_matching_radio_serial(&mut radio, &expected_serial, cancellation).await
-    {
-        drop(radio.disconnect().await);
-        return Err(error);
-    }
+    disable_dv_gateway_over_bluetooth(radio, expected_serial, cancellation).await
+}
 
-    if let Err(error) = verify_schema_target_before_mcp(&mut radio, cancellation).await {
-        drop(radio.disconnect().await);
-        return Err(error);
+#[cfg(any(target_os = "macos", test))]
+async fn disable_dv_gateway_over_bluetooth<T: Transport>(
+    mut radio: Radio<T>,
+    expected_serial: &SerialNumber,
+    cancellation: &RecoveryCancellation,
+) -> Result<DvGatewayRecoveryOutcome, DvGatewayRecoveryError> {
+    let result =
+        disable_dv_gateway_over_bluetooth_inner(&mut radio, expected_serial, cancellation).await;
+    let release = radio.disconnect().await;
+    match (result, release) {
+        (result, Ok(())) => result,
+        (Ok(outcome), Err(error)) => Err(DvGatewayRecoveryError::CompletedButReleaseFailed {
+            outcome,
+            detail: error.to_string(),
+        }),
+        (Err(error), Err(release)) => Err(bluetooth_recovery_release_failure(error, &release)),
     }
+}
+
+#[cfg(any(target_os = "macos", test))]
+async fn disable_dv_gateway_over_bluetooth_inner<T: Transport>(
+    radio: &mut Radio<T>,
+    expected_serial: &SerialNumber,
+    cancellation: &RecoveryCancellation,
+) -> Result<DvGatewayRecoveryOutcome, DvGatewayRecoveryError> {
+    verify_matching_radio_serial(radio, expected_serial, cancellation).await?;
+    verify_schema_target_before_mcp(radio, cancellation).await?;
 
     // This atomic transition is the mutation boundary. If cancel linearized
     // first, MCP never begins. Once MCP wins, the setter future is never
     // dropped and cancellation cannot obscure its completed outcome.
-    if let Err(error) = cancellation.begin_mcp_operation() {
-        drop(radio.disconnect().await);
-        return Err(error);
-    }
+    cancellation.begin_mcp_operation()?;
     let update = match radio.disable_dv_gateway_detached_unverified().await {
         Ok(update) => update,
         Err(operation_error) => {
             let possibly_wrote = detached_update_has_possible_writes(&operation_error);
             let recovery = radio.recover_from_interrupted_mcp().await;
-            drop(radio.disconnect().await);
             return match recovery {
                 Ok(()) => Err(DvGatewayRecoveryError::RadioOperation {
                     detail: operation_error.to_string(),
@@ -1971,15 +2181,65 @@ async fn disable_dv_gateway_mode_via_bluetooth(
         }
     };
 
-    match update {
-        DetachedMcpPageUpdate::ChangedRadioRebooting => {
-            // The reboot normally tears down this link. Its final close is
-            // best effort; USB CAT proof is the caller's acceptance gate.
-            drop(radio.disconnect().await);
-        }
-        DetachedMcpPageUpdate::UnchangedCatReady => drop(radio.disconnect().await),
-    }
     Ok(update.into())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn bluetooth_recovery_release_failure(
+    error: DvGatewayRecoveryError,
+    release: &RadioError,
+) -> DvGatewayRecoveryError {
+    let operation = match error {
+        DvGatewayRecoveryError::Cancelled => RecoveryOperationFailure::Cancelled,
+        DvGatewayRecoveryError::OperationAlreadyRun => {
+            RecoveryOperationFailure::OperationAlreadyRun
+        }
+        DvGatewayRecoveryError::InvalidBluetoothAddress { address } => {
+            RecoveryOperationFailure::InvalidBluetoothAddress { address }
+        }
+        DvGatewayRecoveryError::UnsupportedPlatform => {
+            RecoveryOperationFailure::UnsupportedPlatform
+        }
+        DvGatewayRecoveryError::BluetoothUnavailable { detail } => {
+            RecoveryOperationFailure::BluetoothUnavailable { detail }
+        }
+        DvGatewayRecoveryError::InvalidExpectedRadioSerial { detail } => {
+            RecoveryOperationFailure::InvalidExpectedRadioSerial { detail }
+        }
+        DvGatewayRecoveryError::BluetoothIdentityUnavailable { detail } => {
+            RecoveryOperationFailure::CatIdentityUnavailable { detail }
+        }
+        DvGatewayRecoveryError::RadioIdentityMismatch { expected, actual } => {
+            RecoveryOperationFailure::RadioIdentityMismatch { expected, actual }
+        }
+        DvGatewayRecoveryError::RadioOperation { detail } => {
+            RecoveryOperationFailure::RadioOperation { detail }
+        }
+        DvGatewayRecoveryError::OutcomeUncertain { detail } => {
+            RecoveryOperationFailure::OutcomeUncertain { detail }
+        }
+        DvGatewayRecoveryError::CompletedButReleaseFailed { outcome, detail } => {
+            return DvGatewayRecoveryError::CompletedButReleaseFailed {
+                outcome,
+                detail: format!("{detail}; releasing Bluetooth also failed: {release}"),
+            };
+        }
+        DvGatewayRecoveryError::OperationAndReleaseFailed {
+            operation,
+            release_detail,
+        } => {
+            return DvGatewayRecoveryError::OperationAndReleaseFailed {
+                operation,
+                release_detail: format!(
+                    "{release_detail}; releasing Bluetooth also failed: {release}"
+                ),
+            };
+        }
+    };
+    DvGatewayRecoveryError::OperationAndReleaseFailed {
+        operation,
+        release_detail: release.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -2001,6 +2261,122 @@ mod tests {
     const TNC_DATA_BAND_BYTE: usize = 0x0B;
     const GATEWAY_MODE_PAGE: u16 = 0x1C;
     const GATEWAY_MODE_BYTE: usize = 0xA0;
+
+    #[derive(Debug)]
+    struct ClosingTransport {
+        script: MockTransport,
+        closes: Arc<std::sync::atomic::AtomicUsize>,
+        fail_close: bool,
+    }
+
+    impl Transport for ClosingTransport {
+        async fn write(&mut self, bytes: &[u8]) -> Result<(), TransportError> {
+            self.script.write(bytes).await
+        }
+        async fn read(&mut self, bytes: &mut [u8]) -> Result<usize, TransportError> {
+            self.script.read(bytes).await
+        }
+        async fn close(&mut self) -> Result<(), TransportError> {
+            self.script.assert_complete();
+            let _previous = self.closes.fetch_add(1, Ordering::AcqRel);
+            if self.fail_close {
+                Err(TransportError::Disconnected(std::io::Error::other(
+                    "injected close failure",
+                )))
+            } else {
+                self.script.close().await
+            }
+        }
+        async fn reopen(&mut self) -> Result<(), TransportError> {
+            self.script.reopen().await
+        }
+    }
+
+    fn closing_radio(
+        script: MockTransport,
+        fail_close: bool,
+    ) -> (Radio<ClosingTransport>, Arc<std::sync::atomic::AtomicUsize>) {
+        let closes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let radio = Radio::new(ClosingTransport {
+            script,
+            closes: Arc::clone(&closes),
+            fail_close,
+        });
+        (radio, closes)
+    }
+
+    #[tokio::test]
+    async fn usb_routing_preflight_always_closes_and_retains_both_failures()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for fail_close in [false, true] {
+            let mut script = MockTransport::new();
+            script.expect(b"ID\r", b"ID TH-D75\r");
+            script.expect(b"FV\r", b"FV 1.04\r");
+            let (radio, closes) = closing_radio(script, fail_close);
+            let result = route_dv_gateway_to_usb(radio, &RecoveryCancellation::default()).await;
+            assert_eq!(closes.load(Ordering::Acquire), 1);
+            let error = result.err().ok_or("unsupported firmware was accepted")?;
+            if fail_close {
+                assert!(
+                    matches!(
+                        error,
+                        DvGatewayUsbRoutingError::OperationAndReleaseFailed {
+                            operation: RecoveryOperationFailure::RadioQualification { .. },
+                            ..
+                        }
+                    ),
+                    "{error:?}"
+                );
+            } else {
+                assert!(
+                    matches!(error, DvGatewayUsbRoutingError::RadioQualification { .. }),
+                    "{error:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cat_disable_retains_identity_failure_when_close_also_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut script = MockTransport::new();
+        script.expect(b"ID\r", b"ID TH-D75\r");
+        script.expect(b"FV\r", b"FV 1.03.AZM\r");
+        script.expect(b"AE\r", b"AE C5310165,K01\r");
+        let (radio, closes) = closing_radio(script, true);
+        let expected = SerialNumber::new("C3C10368")?;
+        let result =
+            disable_dv_gateway_over_cat(radio, &expected, &RecoveryCancellation::default()).await;
+        assert_eq!(closes.load(Ordering::Acquire), 1);
+        assert!(
+            matches!(result, Err(DvGatewayCatDisableError::OperationAndReleaseFailed {
+            operation: RecoveryOperationFailure::RadioIdentityMismatch { ref expected, ref actual }, ..
+        }) if expected == "C3C10368" && actual == "C5310165"),
+            "{result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bluetooth_recovery_retains_identity_failure_when_close_also_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut script = MockTransport::new();
+        script.expect(b"AE\r", b"AE C5310165,K01\r");
+        let (radio, closes) = closing_radio(script, true);
+        let expected = SerialNumber::new("C3C10368")?;
+        let result =
+            disable_dv_gateway_over_bluetooth(radio, &expected, &RecoveryCancellation::default())
+                .await;
+        assert_eq!(closes.load(Ordering::Acquire), 1);
+        assert!(
+            matches!(result, Err(DvGatewayRecoveryError::OperationAndReleaseFailed {
+            operation: RecoveryOperationFailure::RadioIdentityMismatch { ref expected, ref actual }, ..
+        }) if expected == "C3C10368" && actual == "C5310165"),
+            "{result:?}"
+        );
+        Ok(())
+    }
 
     #[test]
     fn fixed_channel_candidate_failures_allow_the_next_candidate()
@@ -2143,9 +2519,109 @@ mod tests {
     ) {
         transport.expect(
             &programming::build_read_command(page),
-            &mcp_read_response(page.as_raw(), data),
+            mcp_read_response(page.as_raw(), data),
         );
         transport.expect(&[programming::ACK], &[programming::ACK]);
+    }
+
+    fn expect_gateway_disable_update(
+        transport: &mut MockTransport,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        transport.expect(programming::ENTER_PROGRAMMING, programming::ENTER_RESPONSE);
+        let page = McpPage::new(GATEWAY_MODE_PAGE)?;
+        let mut before = [0_u8; programming::PAGE_SIZE];
+        before[GATEWAY_MODE_BYTE] = 1;
+        let after = [0_u8; programming::PAGE_SIZE];
+        expect_mcp_page_read(transport, page, &before);
+        let write =
+            programming::build_write_command(WritableMcpPage::new(GATEWAY_MODE_PAGE)?, &after);
+        transport.expect(&write, &[programming::ACK]);
+        expect_mcp_page_read(transport, page, &after);
+        transport.expect(&[programming::EXIT], &[programming::ACK]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cat_disable_retains_completed_update_when_close_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut script = MockTransport::new();
+        script.expect(b"ID\r", b"ID TH-D75\r");
+        script.expect(b"FV\r", b"FV 1.03.AZM\r");
+        script.expect(b"AE\r", b"AE C3C10368,K01\r");
+        expect_gateway_disable_update(&mut script)?;
+        let (radio, closes) = closing_radio(script, true);
+        let expected = SerialNumber::new("C3C10368")?;
+        let result =
+            disable_dv_gateway_over_cat(radio, &expected, &RecoveryCancellation::default()).await;
+        assert_eq!(closes.load(Ordering::Acquire), 1);
+        assert!(
+            matches!(result, Err(DvGatewayCatDisableError::CompletedButReleaseFailed {
+            result: DvGatewayCatDisableResult { outcome: DvGatewayRecoveryOutcome::ChangedRadioRebooting, ref radio_serial_number }, ..
+        }) if radio_serial_number == "C3C10368"),
+            "{result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bluetooth_recovery_retains_completed_update_when_close_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut script = MockTransport::new();
+        script.expect(b"AE\r", b"AE C3C10368,K01\r");
+        script.expect(b"ID\r", b"ID TH-D75\r");
+        script.expect(b"FV\r", b"FV 1.03.AZM\r");
+        expect_gateway_disable_update(&mut script)?;
+        let (radio, closes) = closing_radio(script, true);
+        let expected = SerialNumber::new("C3C10368")?;
+        let result =
+            disable_dv_gateway_over_bluetooth(radio, &expected, &RecoveryCancellation::default())
+                .await;
+        assert_eq!(closes.load(Ordering::Acquire), 1);
+        assert!(
+            matches!(
+                result,
+                Err(DvGatewayRecoveryError::CompletedButReleaseFailed {
+                    outcome: DvGatewayRecoveryOutcome::ChangedRadioRebooting,
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn usb_routing_retains_completed_update_when_close_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut script = MockTransport::new();
+        script.expect(b"ID\r", b"ID TH-D75\r");
+        script.expect(b"FV\r", b"FV 1.03.AZM\r");
+        script.expect(b"AE\r", b"AE C3C10368,K01\r");
+        script.expect(programming::ENTER_PROGRAMMING, programming::ENTER_RESPONSE);
+        let interface_page = McpPage::new(GATEWAY_INTERFACE_PAGE)?;
+        let mut before = [0_u8; programming::PAGE_SIZE];
+        before[GATEWAY_INTERFACE_BYTE] = u8::from(PcOutputInterface::Bluetooth);
+        let after = [0_u8; programming::PAGE_SIZE];
+        let mode_page = McpPage::new(GATEWAY_MODE_PAGE)?;
+        let mut mode = [0_u8; programming::PAGE_SIZE];
+        mode[GATEWAY_MODE_BYTE] = 1;
+        expect_mcp_page_read(&mut script, interface_page, &before);
+        expect_mcp_page_read(&mut script, mode_page, &mode);
+        let write =
+            programming::build_write_command(WritableMcpPage::new(GATEWAY_INTERFACE_PAGE)?, &after);
+        script.expect(&write, &[programming::ACK]);
+        expect_mcp_page_read(&mut script, interface_page, &after);
+        script.expect(&[programming::EXIT], &[programming::ACK]);
+        let (radio, closes) = closing_radio(script, true);
+        let result = route_dv_gateway_to_usb(radio, &RecoveryCancellation::default()).await;
+        assert_eq!(closes.load(Ordering::Acquire), 1);
+        assert!(
+            matches!(result, Err(DvGatewayUsbRoutingError::CompletedButReleaseFailed {
+            result: DvGatewayUsbRoutingResult { outcome: DvGatewayUsbRoutingOutcome::ChangedRadioRebooting, ref radio_serial_number }, ..
+        }) if radio_serial_number == "C3C10368"),
+            "{result:?}"
+        );
+        Ok(())
     }
 
     #[test]
@@ -2391,6 +2867,7 @@ mod tests {
         transport.expect(&[programming::EXIT], &[programming::ACK]);
         transport.expect_reopen(Ok(()));
         transport.expect(b"ID\r", b"ID TH-D75\r");
+        transport.expect(b"AE\r", b"AE C3C10368,K01\r");
 
         let radio = Radio::new(transport);
         let cancellation = RecoveryCancellation::default();
@@ -2398,7 +2875,7 @@ mod tests {
         let result = recover_aprs_current_mode_over_cat(
             radio,
             &expected_serial,
-            u8::from(PcOutputInterface::Bluetooth),
+            AprsKissInterface::Bluetooth,
             &cancellation,
         )
         .await;
@@ -2452,7 +2929,7 @@ mod tests {
         let result = recover_aprs_current_mode_over_cat(
             radio,
             &expected_serial,
-            u8::from(PcOutputInterface::Bluetooth),
+            AprsKissInterface::Bluetooth,
             &cancellation,
         )
         .await?;
@@ -2496,6 +2973,7 @@ mod tests {
             transport.expect(&[programming::EXIT], &[programming::ACK]);
             transport.expect_reopen(Ok(()));
             transport.expect(b"ID\r", b"ID TH-D75\r");
+            transport.expect(b"AE\r", b"AE C3C10368,K01\r");
 
             let radio = Radio::new(transport);
             let cancellation = RecoveryCancellation::default();
@@ -2503,7 +2981,7 @@ mod tests {
             let result = recover_aprs_current_mode_over_cat(
                 radio,
                 &expected_serial,
-                u8::from(PcOutputInterface::Bluetooth),
+                AprsKissInterface::Bluetooth,
                 &cancellation,
             )
             .await;
@@ -2548,8 +3026,7 @@ mod tests {
     #[tokio::test]
     async fn pre_cancelled_operation_stops_before_identity_or_mutation()
     -> Result<(), Box<dyn std::error::Error>> {
-        let operation =
-            DvGatewayRecoveryOperation::new("not-a-valid-radio-serial".to_owned(), None)?;
+        let operation = DvGatewayRecoveryOperation::new("C3C10368".to_owned(), None)?;
         operation.cancel();
 
         let first = Arc::clone(&operation).run().await;
@@ -2560,6 +3037,22 @@ mod tests {
             second,
             Err(DvGatewayRecoveryError::OperationAlreadyRun)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_constructor_validates_serial_before_platform_work()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let result = DvGatewayRecoveryOperation::new("not-a-valid-radio-serial".to_owned(), None);
+        assert!(
+            matches!(
+                result,
+                Err(DvGatewayRecoveryError::InvalidExpectedRadioSerial { .. })
+            ),
+            "{result:?}"
+        );
+        let operation = DvGatewayRecoveryOperation::new("C3C10368".to_owned(), None)?;
+        assert_eq!(operation.expected_radio_serial_number.as_str(), "C3C10368");
         Ok(())
     }
 

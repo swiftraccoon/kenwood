@@ -1,20 +1,20 @@
 [package]
 name = "azimuth-core"
 version = "0.1.0"
+authors = ["swiftraccoon"]
+categories = ["api-bindings", "hardware-support"]
 edition = "2024"
+keywords = ["amateur-radio", "ios", "kenwood", "th-d75", "uniffi"]
+license = "GPL-2.0-or-later"
+publish = false
+readme = "README.md"
+repository = "https://github.com/swiftraccoon/kenwood"
 rust-version = "1.94"
 description = "Rust control core for the Azimuth TH-D75 iPadOS and macOS app"
-license = "GPL-2.0-or-later"
-authors = ["swiftraccoon"]
-repository = "https://github.com/swiftraccoon/kenwood"
-readme = "README.md"
-keywords = ["amateur-radio", "ios", "kenwood", "th-d75", "uniffi"]
-categories = ["api-bindings", "hardware-support"]
-publish = false
 
 [lib]
-name = "azimuth_core"
 crate-type = ["lib", "staticlib"]
+name = "azimuth_core"
 
 [[bin]]
 name = "azimuth-uniffi-bindgen"
@@ -22,16 +22,17 @@ path = "src/bin/uniffi-bindgen.rs"
 required-features = ["bindgen-cli"]
 
 [features]
-default = []
 bindgen-cli = ["uniffi/cli"]
+default = []
 
 [dependencies]
-kenwood-transport = { path = "../kenwood-transport", default-features = false }
 aprs = { path = "../aprs" }
 async-trait = "0.1"
 ax25-codec = { path = "../ax25-codec" }
 if-dsp = { path = "../if-dsp" }
+kenwood-schema = { path = "../kenwood-schema" }
 kenwood-thd75 = { path = "../thd75" }
+kenwood-transport = { path = "../kenwood-transport", default-features = false }
 kiss-tnc = { path = "../kiss-tnc" }
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
@@ -39,57 +40,59 @@ uniffi = { version = "0.31", features = ["tokio"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 kenwood-transport = { path = "../kenwood-transport", default-features = false, features = [
-  "native-bluetooth",
+    "native-bluetooth",
 ] }
 
-# UniFFI emits the unsafe C ABI entry points required by a static Swift
-# framework. This crate therefore restates workspace lint policy without the
+# KNOWN DIVERGENCE FROM WORKSPACE: UniFFI emits the unsafe C ABI entry points
+# required by a static Swift framework. This crate restates lint policy without
 # workspace-level `unsafe_code = "forbid"` rule. Hand-written source contains
 # no unsafe blocks.
 [lints.rust]
-missing_docs = "deny"
-missing_debug_implementations = "deny"
-unreachable_pub = "deny"
-unused_results = "deny"
 elided_lifetimes_in_paths = "deny"
+missing_debug_implementations = "deny"
+missing_docs = "deny"
 trivial_casts = "deny"
 trivial_numeric_casts = "deny"
+unreachable_pub = "deny"
+unused_results = "deny"
+# `unused_qualifications` is omitted for UniFFI's fully qualified paths.
+# Handwritten code is checked for redundant qualification in review.
+let_underscore_drop = "deny"
 non_ascii_idents = "deny"
 single_use_lifetimes = "deny"
-let_underscore_drop = "deny"
 unused_crate_dependencies = "deny"
 unused_import_braces = "deny"
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }
-pedantic = { level = "deny", priority = -1 }
-nursery = { level = "deny", priority = -1 }
-cargo = { level = "deny", priority = -1 }
-restriction = { level = "allow", priority = -1 }
-undocumented_unsafe_blocks = "deny"
-missing_assert_message = "deny"
-panic = "deny"
-unwrap_used = "deny"
-expect_used = "deny"
-indexing_slicing = "deny"
 allow_attributes = "deny"
 allow_attributes_without_reason = "deny"
-todo = "deny"
-unimplemented = "deny"
+cargo = { level = "deny", priority = -1 }
 dbg_macro = "deny"
-mem_forget = "deny"
+expect_used = "deny"
 format_push_string = "deny"
+indexing_slicing = "deny"
 infinite_loop = "deny"
+mem_forget = "deny"
+missing_assert_message = "deny"
 module_name_repetitions = "allow"
 multiple_crate_versions = "allow"
+nursery = { level = "deny", priority = -1 }
+panic = "deny"
+pedantic = { level = "deny", priority = -1 }
 redundant_pub_crate = "allow"
+restriction = { level = "allow", priority = -1 }
+todo = "deny"
+undocumented_unsafe_blocks = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"
 # Generated UniFFI entry points cannot be `const` functions.
 missing_const_for_fn = "allow"
 
 [lints.rustdoc]
-broken_intra_doc_links = "deny"
-private_intra_doc_links = "deny"
-missing_crate_level_docs = "deny"
-invalid_codeblock_attributes = "deny"
 bare_urls = "deny"
+broken_intra_doc_links = "deny"
+invalid_codeblock_attributes = "deny"
+missing_crate_level_docs = "deny"
+private_intra_doc_links = "deny"
 unescaped_backticks = "deny"

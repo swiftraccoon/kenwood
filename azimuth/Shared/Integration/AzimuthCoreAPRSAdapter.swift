@@ -3,6 +3,20 @@
 
 import Foundation
 
+extension AprsKissInterface {
+    /// Convert an observed Menu 983 byte before queueing a core operation.
+    init(rawStorageValue: UInt8) throws {
+        switch rawStorageValue {
+        case 0: self = .usb
+        case 1: self = .bluetooth
+        default:
+            throw RadioControllerError.capabilityUnavailable(
+                "The KISS route is outside the supported USB-C/Bluetooth choices. Refresh radio settings."
+            )
+        }
+    }
+}
+
 /// Lossless projection of the Rust-owned KISS journal into app-domain models.
 /// Sequence numbers remain the sole merge key so polling cannot duplicate a
 /// transmit row that was returned directly by an explicit send operation.

@@ -97,7 +97,7 @@ private final class AzimuthAutomationAPRSCurrentModeRecoveryOperation:
     func run() async throws -> AprsCurrentModeRecoveryResult {
         try await core.recoverAprsCurrentMode(
             expectedRadioSerialNumber: expectedRadioSerialNumber,
-            expectedKissInterfaceRawValue: expectedKISSInterfaceRawValue
+            expectedKissInterface: AprsKissInterface(rawStorageValue: expectedKISSInterfaceRawValue)
         )
     }
 }
@@ -313,9 +313,9 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
 
     init(
         transport: any AzimuthRadioTransport,
-        records: [SettingRecord] = settingCatalog(),
+        records: [SettingRecord]? = nil,
         connectCore: @escaping CoreConnector = { transport in
-            try await connectAutomation(transport: transport)
+            try await AutomationController.connect(transport: transport)
         },
         prepareRadioForAutomation: @escaping RadioModePreflight = { transport in
             try await AzimuthRadioModePreflight(transport: transport).prepareForAutomation()
@@ -589,14 +589,14 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
                 )
             }
 
-            connectionStage = "AzimuthCore connectAutomation"
-            azimuthRadioCoreLog.notice("[Azimuth Core] connectAutomation started")
+            connectionStage = "AutomationController.connect"
+            azimuthRadioCoreLog.notice("[Azimuth Core] AutomationController.connect started")
             let connectedCore: any AutomationControllerProtocol
             do {
                 connectedCore = try await connectCore(coreTransport)
             } catch {
                 azimuthRadioCoreLog.error(
-                    "[Azimuth Core] connectAutomation failed type=\(azimuthRadioErrorIdentity(error), privacy: .public) detail=\(error.localizedDescription, privacy: .private)"
+                    "[Azimuth Core] AutomationController.connect failed type=\(azimuthRadioErrorIdentity(error), privacy: .public) detail=\(error.localizedDescription, privacy: .private)"
                 )
                 throw error
             }
@@ -623,7 +623,7 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
                 retainingHistory: false
             )
             azimuthRadioCoreLog.notice(
-                "[Azimuth Core] connectAutomation succeeded (ABI \(abi.version, privacy: .public))"
+                "[Azimuth Core] AutomationController.connect succeeded (ABI \(abi.version, privacy: .public))"
             )
             var connectedState = currentState
             connectedState.connection = .connected(
@@ -858,6 +858,10 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
                 }
             } catch {
                 clearBluetoothMMDVMRoutingSlot(id: routingID)
+                if case DvGatewayUsbRoutingError.CompletedButReleaseFailed(let result, _) = error {
+                    routingOutcome = result.outcome
+                    expectedRadioSerialNumber = result.radioSerialNumber
+                }
                 if case DvGatewayUsbRoutingError.Cancelled = error {
                     throw CancellationError()
                 }
@@ -1071,6 +1075,10 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
                 }
             } catch {
                 clearConnectedCATDisableSlot(id: disableID)
+                if case DvGatewayCatDisableError.CompletedButReleaseFailed(let result, _) = error {
+                    completedOutcome = result.outcome
+                    expectedRadioSerialNumber = result.radioSerialNumber
+                }
                 if case DvGatewayCatDisableError.Cancelled = error {
                     throw CancellationError()
                 }
@@ -1971,7 +1979,7 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
             kissInterfaceRawValue = settingsAuthority.kissInterfaceRawValue
             startAuthority = .settingsSnapshot(
                 snapshotId: settingsAuthority.snapshotID,
-                expectedKissInterfaceRawValue: settingsAuthority.kissInterfaceRawValue
+                expectedKissInterface: try AprsKissInterface(rawStorageValue: settingsAuthority.kissInterfaceRawValue)
             )
         }
         guard let radioSerialNumber = currentRadioSerialNumber,
@@ -3653,7 +3661,12 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
             return "\(settingID) changed after review. Refresh and review the plan again."
         case AutomationError.SettingsSnapshotStale(let detail):
             return "The radio settings changed after review; nothing was written. \(detail)"
-        case AutomationError.SettingsApply(let detail): return "Setting apply failed: \(detail)"
+        case AutomationError.SettingsApply(_, let possiblyWrittenPages, let cleanupDetail, let detail):
+            let progress = possiblyWrittenPages.isEmpty
+                ? "No page write started."
+                : "Page writes may have started; reconnect and refresh before another change."
+            let cleanup = cleanupDetail.map { " Cleanup also failed: \($0)" } ?? ""
+            return "Setting apply failed: \(detail) \(progress)\(cleanup)"
         case AutomationError.AprsModeActive:
             return "APRS KISS owns the radio control link. Stop APRS before using CAT controls."
         case AutomationError.AprsModeInactive:
@@ -3685,8 +3698,8 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
             return "Automatic USB MMDVM-to-CAT recovery requires Azimuth for macOS."
         case DvGatewayRecoveryError.BluetoothUnavailable(let detail):
             return "Azimuth could not open the paired TH-D75 Bluetooth control link. \(detail)"
-        case DvGatewayRecoveryError.UsbIdentityUnavailable(let detail):
-            return "Azimuth could not prove a stable serial identity for the USB radio. \(detail)"
+        case DvGatewayRecoveryError.InvalidExpectedRadioSerial(let detail):
+            return "The retained CAT radio serial is invalid. Reconnect and verify the selected radio. \(detail)"
         case DvGatewayRecoveryError.BluetoothIdentityUnavailable(let detail):
             return "Azimuth opened Bluetooth but could not read that radio's serial identity. \(detail)"
         case DvGatewayRecoveryError.RadioIdentityMismatch(let expected, let actual):
@@ -3695,6 +3708,10 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
             return "Azimuth could not turn Menu 650 (DV Gateway) off. \(detail)"
         case DvGatewayRecoveryError.OutcomeUncertain(let detail):
             return "The Menu 650 write outcome is uncertain. \(detail) Power-cycle the radio and inspect Menu 650 before retrying."
+        case DvGatewayRecoveryError.CompletedButReleaseFailed(let outcome, let detail):
+            return "\(Self.connectedCATDisableOutcomeDescription(outcome)), but the Bluetooth connection could not be released. Reconnect before another operation. \(detail)"
+        case DvGatewayRecoveryError.OperationAndReleaseFailed(let operation, let releaseDetail):
+            return "\(Self.describeRecoveryOperationFailure(operation)) The Bluetooth connection also could not be released. Reconnect before another operation. \(releaseDetail)"
         case DvGatewayCatDisableError.Cancelled:
             return "IF-DSP DV Gateway recovery was cancelled before Menu 650 could be changed."
         case DvGatewayCatDisableError.ControllerUnavailable(let detail):
@@ -3711,14 +3728,16 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
             return "Azimuth could not finish turning Menu 650 off after the mutation gate opened. \(detail) Inspect Menu 650 before retrying."
         case DvGatewayCatDisableError.OutcomeUncertain(let detail):
             return "The Menu 650 write outcome is uncertain. \(detail) Power-cycle the radio and inspect Menu 650 before retrying."
+        case DvGatewayCatDisableError.CompletedButReleaseFailed(let result, let detail):
+            return "\(Self.connectedCATDisableOutcomeDescription(result.outcome)) for CAT radio \(result.radioSerialNumber), but the old CAT connection could not be released. Reconnect before another operation. \(detail)"
+        case DvGatewayCatDisableError.OperationAndReleaseFailed(let operation, let releaseDetail):
+            return "\(Self.describeRecoveryOperationFailure(operation)) The old CAT connection also could not be released. Reconnect before another operation. \(releaseDetail)"
         case AprsCurrentModeRecoveryError.Cancelled:
             return "APRS recovery was cancelled before the persistent-setting mutation gate. No radio setting was changed."
         case AprsCurrentModeRecoveryError.ControllerUnavailable(let detail):
             return "The authenticated CAT actor ended before Azimuth could verify Menu 983, Menu 506, and Menu 650 together. \(detail) No radio setting was changed."
         case AprsCurrentModeRecoveryError.InvalidExpectedRadioSerial(let detail):
             return "Azimuth refused to open APRS recovery because the approved CAT serial is invalid. \(detail) No radio setting was changed."
-        case AprsCurrentModeRecoveryError.InvalidExpectedKissInterface(let value):
-            return "Azimuth refused to open APRS recovery because KISS route \(value) is not USB-C or Bluetooth. No radio setting was changed."
         case AprsCurrentModeRecoveryError.CatIdentityUnavailable(let detail):
             return "Azimuth could not re-read the selected endpoint's CAT serial identity. \(detail) No radio setting was changed."
         case AprsCurrentModeRecoveryError.RadioIdentityMismatch(let expected, let actual):
@@ -3760,6 +3779,13 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
             return "Azimuth could not finish routing DV Gateway to USB-C after the mutation gate opened. \(detail) Inspect Menu 985 and Menu 650 before retrying."
         case DvGatewayUsbRoutingError.OutcomeUncertain(let detail):
             return "The Menu 985 and Menu 650 routing outcome is uncertain. \(detail) Power-cycle the radio and inspect both settings before retrying."
+        case DvGatewayUsbRoutingError.CompletedButReleaseFailed(let result, let detail):
+            let outcome = result.outcome == .changedRadioRebooting
+                ? "Menu 985 now routes DV Gateway to USB-C and the radio is rebooting"
+                : "Menu 985 already routes DV Gateway to USB-C and Menu 650 is Reflector Terminal"
+            return "\(outcome) for CAT radio \(result.radioSerialNumber), but the USB-C connection could not be released. Reconnect before another operation. \(detail)"
+        case DvGatewayUsbRoutingError.OperationAndReleaseFailed(let operation, let releaseDetail):
+            return "\(Self.describeRecoveryOperationFailure(operation)) The USB-C connection also could not be released. Reconnect before another operation. \(releaseDetail)"
         case let localized as LocalizedError:
             return localized.errorDescription ?? String(describing: error)
         default:
@@ -3767,11 +3793,48 @@ final class AzimuthLiveRadioController: RadioControlling, APRSControlling, IFDSP
         }
     }
 
+    private static func describeRecoveryOperationFailure(
+        _ failure: RecoveryOperationFailure
+    ) -> String {
+        switch failure {
+        case .cancelled:
+            return "Recovery was cancelled before a persistent setting write started."
+        case .operationAlreadyRun:
+            return "This recovery operation has already finished."
+        case .invalidBluetoothAddress(let address):
+            return "The Bluetooth address is invalid: \(address)."
+        case .unsupportedPlatform:
+            return "Bluetooth recovery requires Azimuth for macOS."
+        case .bluetoothUnavailable(let detail):
+            return "The Bluetooth connection could not be opened. \(detail)"
+        case .controllerUnavailable(let detail):
+            return "The CAT controller ended before accepting recovery. \(detail)"
+        case .invalidExpectedRadioSerial(let detail):
+            return "The retained CAT radio serial is invalid. \(detail)"
+        case .catIdentityUnavailable(let detail):
+            return "The selected endpoint did not return a usable CAT identity. \(detail)"
+        case .radioIdentityMismatch(let expected, let actual):
+            return "The endpoint identifies as CAT radio \(actual); the retained radio is \(expected). No setting was changed."
+        case .radioQualification(let detail):
+            return "The selected radio did not pass model, firmware and schema checks. \(detail)"
+        case .radioOperation(let detail):
+            return "The radio operation failed after MCP recovery completed. Inspect the radio settings before retrying. \(detail)"
+        case .outcomeUncertain(let detail):
+            return "A persistent setting write may have started; its final outcome is uncertain. Inspect the radio settings before retrying. \(detail)"
+        }
+    }
+
     private static func isPostMutationRecoveryResult(_ error: Error) -> Bool {
         switch error {
         case DvGatewayRecoveryError.RadioOperation,
-             DvGatewayRecoveryError.OutcomeUncertain:
+             DvGatewayRecoveryError.OutcomeUncertain,
+             DvGatewayRecoveryError.CompletedButReleaseFailed:
             true
+        case DvGatewayRecoveryError.OperationAndReleaseFailed(let operation, _):
+            switch operation {
+            case .radioOperation, .outcomeUncertain: true
+            default: false
+            }
         default:
             false
         }

@@ -4,14 +4,18 @@ use std::collections::{BTreeMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ::aprs::{
-    AprsData, AprsItem, AprsObject, AprsPosition, AprsSymbol, Latitude, Longitude,
-    MessageAddressee, MessageId, MessageText, PositionReportText, build_aprs_message_packet,
-    build_aprs_position_report_packet, parse_aprs_data_full,
+    AprsData, AprsFrameHeader, AprsItem, AprsObject, AprsPosition, AprsSymbol,
+    DirectMessageAddressee, Latitude, Longitude, MessageId, MessageText, PositionReportText,
+    Tocall,
 };
-use ax25_codec::{Ax25Address, Ax25Packet, DigipeaterPath, build_ax25, parse_ax25};
-use kenwood_thd75::types::{PacketDataRate, TncDataBand as RadioTncDataBand};
+use ax25_codec::{Ax25Address, Ax25Packet, DigipeaterPath};
+use kenwood_thd75::types::{
+    KissDuplex, KissPersistence, KissSlotTime, KissTxDelay, KissTxTail, PacketDataRate,
+    TncDataBand as RadioTncDataBand,
+};
 
 use crate::automation::AutomationError;
+use crate::identifiers::SettingSnapshotId;
 
 /// Maximum number of activity rows retained by the in-memory journal.
 const ACTIVITY_CAPACITY: usize = 1_000;
@@ -61,19 +65,45 @@ impl From<RadioTncDataBand> for TncDataBand {
     }
 }
 
+/// Selected Menu 983 endpoint for an APRS KISS session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum AprsKissInterface {
+    /// USB-C, raw menu value zero.
+    Usb,
+    /// Bluetooth SPP, raw menu value one.
+    Bluetooth,
+}
+
+impl AprsKissInterface {
+    /// Return the exact raw Menu 983 value.
+    #[must_use]
+    pub const fn as_raw(self) -> u8 {
+        match self {
+            Self::Usb => 0,
+            Self::Bluetooth => 1,
+        }
+    }
+}
+
+impl From<AprsKissInterface> for u8 {
+    fn from(value: AprsKissInterface) -> Self {
+        value.as_raw()
+    }
+}
+
 /// One explicit, fail-closed authority for an APRS KISS transition.
 ///
 /// A normal start derives the TNC band from a retained settings snapshot. The
-/// single retry after caller-approved Menu 650 recovery instead re-proves the
+/// single retry after completed Menu 650 recovery instead re-proves the
 /// exact radio identity and live TN band without another MCP/reset cycle.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum AprsStartAuthority {
     /// Consume one retained setting snapshot containing Menu 983 and Menu 506.
     SettingsSnapshot {
         /// Opaque identifier returned by the authoritative settings read.
-        snapshot_id: u64,
-        /// Selected endpoint's expected Menu 983 raw value (0=USB-C, 1=Bluetooth).
-        expected_kiss_interface_raw_value: u8,
+        snapshot_id: SettingSnapshotId,
+        /// Selected endpoint's expected Menu 983 route.
+        expected_kiss_interface: AprsKissInterface,
     },
     /// One retry after a completed same-MCP Menu 983/Menu 506/Menu 650 recovery operation.
     CurrentModeRecovery {
@@ -84,7 +114,7 @@ pub enum AprsStartAuthority {
     },
 }
 
-/// Configuration for one host-owned APRS KISS session.
+/// Foreign input candidates for one host-owned APRS KISS session.
 ///
 /// KISS and CAT are mutually exclusive on the TH-D75. Starting this session
 /// suspends screen capture and persistent setting access until it is stopped.
@@ -244,7 +274,8 @@ pub enum AprsActivityKind {
 /// One timestamped row in the live APRS activity journal.
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
 pub struct AprsActivityRecord {
-    /// Monotonically increasing journal identifier.
+    /// Increasing journal identifier. Zero marks an unretained receipt after
+    /// identifier exhaustion; the snapshot reports truncated history.
     pub sequence: u64,
     /// Session that produced this row.
     pub session_id: u64,
@@ -262,7 +293,8 @@ pub struct AprsActivityRecord {
     pub path: Vec<String>,
     /// Concise human-readable decoded summary.
     pub summary: String,
-    /// Lossless-enough TNC2-style envelope plus lossy text info for inspection.
+    /// TNC2-style envelope with replacement characters for invalid UTF-8;
+    /// `raw_ax25` retains the exact original bytes.
     pub raw_packet: String,
     /// Exact AX.25 bytes from the KISS data field. Empty for system events.
     pub raw_ax25: Vec<u8>,
@@ -271,7 +303,7 @@ pub struct AprsActivityRecord {
     /// Position longitude when the APRS payload decoded to a position.
     pub longitude: Option<f64>,
     /// Reported speed in knots, when present.
-    pub speed_knots: Option<u16>,
+    pub speed_knots: Option<f64>,
     /// Reported course in degrees, when present.
     pub course_degrees: Option<u16>,
 }
@@ -290,7 +322,7 @@ pub struct AprsStationRecord {
     /// Most recently decoded longitude.
     pub longitude: Option<f64>,
     /// Most recently decoded speed in knots.
-    pub speed_knots: Option<u16>,
+    pub speed_knots: Option<f64>,
     /// Most recently decoded course in degrees.
     pub course_degrees: Option<u16>,
     /// Digipeater path from the latest packet.
@@ -314,16 +346,86 @@ pub struct AprsOperationalSnapshot {
     pub history_truncated: bool,
 }
 
-/// Validated Rust-only form of [`AprsSessionConfig`].
-#[derive(Debug, Clone)]
-pub(crate) struct AprsRuntimeConfig {
+/// Checked source, routing, symbol and runtime KISS settings.
+///
+/// Construct through [`AprsSessionConfig::validate`] or [`TryFrom`]. The foreign
+/// record remains editable input; this value protects executable configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AprsConfiguration {
     pub(crate) source: Option<Ax25Address>,
     pub(crate) path: DigipeaterPath,
     pub(crate) symbol: AprsSymbol,
+    pub(crate) data_rate: PacketDataRate,
+    pub(crate) tx_delay: KissTxDelay,
+    pub(crate) persistence: KissPersistence,
+    pub(crate) slot_time: KissSlotTime,
+    pub(crate) tx_tail: KissTxTail,
+    pub(crate) duplex: KissDuplex,
+}
+
+impl AprsConfiguration {
+    /// Borrow the source address, or `None` for receive-only operation.
+    #[must_use]
+    pub const fn source(&self) -> Option<&Ax25Address> {
+        self.source.as_ref()
+    }
+    /// Borrow the complete ordered relay path.
+    #[must_use]
+    pub const fn path(&self) -> &DigipeaterPath {
+        &self.path
+    }
+    /// Return the checked APRS symbol.
+    #[must_use]
+    pub const fn symbol(&self) -> AprsSymbol {
+        self.symbol
+    }
+    /// Return the packet data rate.
+    #[must_use]
+    pub const fn data_rate(&self) -> PacketDataRate {
+        self.data_rate
+    }
+    /// Return the checked TX delay.
+    #[must_use]
+    pub const fn tx_delay(&self) -> KissTxDelay {
+        self.tx_delay
+    }
+    /// Return the checked persistence probability.
+    #[must_use]
+    pub const fn persistence(&self) -> KissPersistence {
+        self.persistence
+    }
+    /// Return the checked slot time.
+    #[must_use]
+    pub const fn slot_time(&self) -> KissSlotTime {
+        self.slot_time
+    }
+    /// Return the checked TX tail.
+    #[must_use]
+    pub const fn tx_tail(&self) -> KissTxTail {
+        self.tx_tail
+    }
+    /// Return full- or half-duplex operation.
+    #[must_use]
+    pub const fn duplex(&self) -> KissDuplex {
+        self.duplex
+    }
+}
+
+impl TryFrom<AprsSessionConfig> for AprsConfiguration {
+    type Error = AutomationError;
+    fn try_from(value: AprsSessionConfig) -> Result<Self, Self::Error> {
+        value.validate()
+    }
 }
 
 impl AprsSessionConfig {
-    pub(crate) fn validate(&self) -> Result<AprsRuntimeConfig, AutomationError> {
+    /// Validate all foreign fields without changing the radio or queueing work.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationError::InvalidAprsConfiguration`] for invalid
+    /// identity, path, symbol, TX delay or slot time.
+    pub fn validate(&self) -> Result<AprsConfiguration, AutomationError> {
         if self.tx_delay_10ms > 120 {
             return Err(invalid_config(
                 "TX delay must be between 0 and 120 (0–1200 ms)",
@@ -351,10 +453,23 @@ impl AprsSessionConfig {
         let symbol = AprsSymbol::from_chars(symbol_table, symbol_code)
             .map_err(|error| invalid_config(&format!("invalid APRS symbol: {error}")))?;
 
-        Ok(AprsRuntimeConfig {
+        Ok(AprsConfiguration {
             source,
             path,
             symbol,
+            data_rate: self.data_rate.into(),
+            tx_delay: KissTxDelay::from_milliseconds(u16::from(self.tx_delay_10ms) * 10)
+                .map_err(|error| invalid_config(&error.to_string()))?,
+            persistence: KissPersistence::new(self.persistence),
+            slot_time: KissSlotTime::from_milliseconds(u16::from(self.slot_time_10ms) * 10)
+                .map_err(|error| invalid_config(&error.to_string()))?,
+            tx_tail: KissTxTail::from_milliseconds(u16::from(self.tx_tail_10ms) * 10)
+                .map_err(|error| invalid_config(&error.to_string()))?,
+            duplex: if self.full_duplex {
+                KissDuplex::Full
+            } else {
+                KissDuplex::Half
+            },
         })
     }
 }
@@ -416,8 +531,17 @@ impl Default for AprsActivityStore {
 }
 
 impl AprsActivityStore {
-    pub(crate) fn begin_start(&mut self, config: AprsSessionConfig) {
-        let session_id = take_identifier(&mut self.next_session_id);
+    pub(crate) fn ensure_can_start(&self) -> Result<(), AutomationError> {
+        if self.next_session_id == 0 || self.next_sequence == 0 {
+            return Err(AutomationError::IdentifierExhausted);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn begin_start(&mut self, config: AprsSessionConfig) -> Result<(), AutomationError> {
+        self.ensure_can_start()?;
+        let session_id = take_identifier(&mut self.next_session_id)
+            .ok_or(AutomationError::IdentifierExhausted)?;
         self.stations.clear();
         self.status = AprsSessionStatus {
             phase: AprsSessionPhase::Starting,
@@ -431,6 +555,7 @@ impl AprsActivityStore {
             last_error: None,
         };
         self.push_system("Entering host KISS mode; CAT screen and settings control are paused.");
+        Ok(())
     }
 
     pub(crate) fn mark_active(&mut self) {
@@ -474,10 +599,16 @@ impl AprsActivityStore {
         }));
     }
 
-    /// Initialize and record a start refusal that left the existing CAT owner
+    /// Initialize and record a start refusal that left the open CAT connection
     /// and automation attestation continuously valid.
-    pub(crate) fn record_start_refusal(&mut self, config: AprsSessionConfig, user_detail: &str) {
-        let session_id = take_identifier(&mut self.next_session_id);
+    pub(crate) fn record_start_refusal(
+        &mut self,
+        config: AprsSessionConfig,
+        user_detail: &str,
+    ) -> Result<(), AutomationError> {
+        self.ensure_can_start()?;
+        let session_id = take_identifier(&mut self.next_session_id)
+            .ok_or(AutomationError::IdentifierExhausted)?;
         self.stations.clear();
         self.status = AprsSessionStatus {
             phase: AprsSessionPhase::Inactive,
@@ -507,6 +638,7 @@ impl AprsActivityStore {
             speed_knots: None,
             course_degrees: None,
         }));
+        Ok(())
     }
 
     pub(crate) fn mark_failed(&mut self, detail: String) {
@@ -561,7 +693,7 @@ impl AprsActivityStore {
     }
 
     pub(crate) fn push_received_ax25(&mut self, raw_ax25: Vec<u8>) -> AprsActivityRecord {
-        match parse_ax25(&raw_ax25) {
+        match Ax25Packet::from_bytes(&raw_ax25) {
             Ok(packet) => {
                 self.status.received_packets = self.status.received_packets.saturating_add(1);
                 let record = activity_from_packet(
@@ -628,10 +760,11 @@ impl AprsActivityStore {
             .ok_or_else(|| AutomationError::AprsOperation {
                 detail: "set a valid source callsign before transmitting".to_owned(),
             })?;
-        let addressee =
-            MessageAddressee::new(addressee).map_err(|error| AutomationError::AprsOperation {
+        let addressee = DirectMessageAddressee::new(addressee).map_err(|error| {
+            AutomationError::AprsOperation {
                 detail: format!("invalid message addressee: {error}"),
-            })?;
+            }
+        })?;
         let text = MessageText::new(text).map_err(|error| AutomationError::AprsOperation {
             detail: format!("invalid message text: {error}"),
         })?;
@@ -641,13 +774,14 @@ impl AprsActivityStore {
             .map_err(|error| AutomationError::AprsOperation {
                 detail: format!("invalid message ID: {error}"),
             })?;
-        Ok(build_aprs_message_packet(
-            &source,
-            &addressee,
-            &text,
-            message_id.as_ref(),
-            &runtime.path,
-        ))
+        let tocall = Tocall::new("APRS").map_err(|error| invalid_config(&error.to_string()))?;
+        Ok(
+            AprsFrameHeader::new(source, tocall, runtime.path).message_packet(
+                &addressee,
+                &text,
+                message_id.as_ref(),
+            ),
+        )
     }
 
     pub(crate) fn build_position(
@@ -673,17 +807,18 @@ impl AprsActivityStore {
             .ok_or_else(|| AutomationError::AprsOperation {
                 detail: "set a valid source callsign before transmitting".to_owned(),
             })?;
-        Ok(build_aprs_position_report_packet(
-            &source,
-            latitude,
-            longitude,
-            runtime.symbol,
-            &comment,
-            &runtime.path,
-        ))
+        let tocall = Tocall::new("APRS").map_err(|error| invalid_config(&error.to_string()))?;
+        Ok(
+            AprsFrameHeader::new(source, tocall, runtime.path).position_report_packet(
+                latitude,
+                longitude,
+                runtime.symbol,
+                &comment,
+            ),
+        )
     }
 
-    fn active_runtime(&self) -> Result<AprsRuntimeConfig, AutomationError> {
+    fn active_runtime(&self) -> Result<AprsConfiguration, AutomationError> {
         if self.status.phase != AprsSessionPhase::Active {
             return Err(AutomationError::AprsModeInactive);
         }
@@ -696,7 +831,7 @@ impl AprsActivityStore {
 
     pub(crate) fn push_transmitted(&mut self, packet: &Ax25Packet) -> AprsActivityRecord {
         self.status.transmitted_packets = self.status.transmitted_packets.saturating_add(1);
-        let raw_ax25 = build_ax25(packet);
+        let raw_ax25 = packet.to_bytes();
         let record = activity_from_packet(
             self.status.session_id,
             AprsActivityDirection::Tx,
@@ -712,7 +847,8 @@ impl AprsActivityStore {
             .activities
             .front()
             .map_or(self.next_sequence, |row| row.sequence);
-        let history_truncated = after > 0 && after.saturating_add(1) < oldest;
+        let history_truncated =
+            self.next_sequence == 0 || (after > 0 && after.saturating_add(1) < oldest);
         let activities = self
             .activities
             .iter()
@@ -730,7 +866,11 @@ impl AprsActivityStore {
             status: self.status.clone(),
             activities,
             stations,
-            latest_sequence: self.next_sequence.saturating_sub(1),
+            latest_sequence: if self.next_sequence == 0 {
+                u64::MAX
+            } else {
+                self.next_sequence - 1
+            },
             history_truncated,
         }
     }
@@ -756,10 +896,29 @@ impl AprsActivityStore {
     }
 
     fn push_record(&mut self, mut record: AprsActivityRecord) -> AprsActivityRecord {
-        record.sequence = take_identifier(&mut self.next_sequence);
+        let Some(sequence) = take_identifier(&mut self.next_sequence) else {
+            self.status.dropped_activities = self.status.dropped_activities.saturating_add(1);
+            record.sequence = 0;
+            return record;
+        };
+        record.sequence = sequence;
         if record.direction == AprsActivityDirection::Rx
             && let Some(source) = record.source.clone()
         {
+            if !self.stations.contains_key(&source) && self.stations.len() >= ACTIVITY_CAPACITY {
+                let oldest = self
+                    .stations
+                    .iter()
+                    .min_by(|(left_call, left), (right_call, right)| {
+                        left.last_heard_unix_ms
+                            .cmp(&right.last_heard_unix_ms)
+                            .then_with(|| left_call.cmp(right_call))
+                    })
+                    .map(|(callsign, _)| callsign.clone());
+                if let Some(oldest) = oldest {
+                    drop(self.stations.remove(&oldest));
+                }
+            }
             let station = self
                 .stations
                 .entry(source.clone())
@@ -800,9 +959,14 @@ fn activity_from_packet(
     packet: &Ax25Packet,
     raw_ax25: Vec<u8>,
 ) -> AprsActivityRecord {
-    let source = packet.source.to_string();
-    let destination = packet.destination.to_string();
-    let path: Vec<String> = packet.digipeaters.iter().map(ToString::to_string).collect();
+    let source = packet.header.source.to_string();
+    let destination = packet.header.destination.to_string();
+    let path: Vec<String> = packet
+        .header
+        .digipeaters
+        .iter()
+        .map(ToString::to_string)
+        .collect();
     let raw_packet = tnc2_packet(&source, &destination, &path, packet.information());
     let decoded = decode_summary(&source, packet);
     AprsActivityRecord {
@@ -830,13 +994,15 @@ struct DecodedSummary {
     summary: String,
     latitude: Option<f64>,
     longitude: Option<f64>,
-    speed_knots: Option<u16>,
+    speed_knots: Option<f64>,
     course_degrees: Option<u16>,
 }
 
 fn decode_summary(source: &str, packet: &Ax25Packet) -> DecodedSummary {
-    let Ok(data) = parse_aprs_data_full(packet.information(), packet.destination.callsign.as_str())
-    else {
+    let Ok(data) = AprsData::from_bytes_with_destination(
+        packet.information(),
+        packet.header.destination.callsign.as_str(),
+    ) else {
         return DecodedSummary {
             kind: AprsActivityKind::Ax25,
             summary: format!(
@@ -854,7 +1020,7 @@ fn decode_summary(source: &str, packet: &Ax25Packet) -> DecodedSummary {
         AprsData::Position(position) => position_summary(source, &position),
         AprsData::Message(message) => DecodedSummary {
             kind: AprsActivityKind::Message,
-            summary: format!("{source} → {}: {}", message.addressee, message.text),
+            summary: format!("{source} → {}: {}", message.addressee(), message.text()),
             latitude: None,
             longitude: None,
             speed_knots: None,
@@ -862,12 +1028,12 @@ fn decode_summary(source: &str, packet: &Ax25Packet) -> DecodedSummary {
         },
         AprsData::Status(status) => simple_summary(
             AprsActivityKind::Status,
-            format!("{source} status: {}", status.text),
+            format!("{source} status: {}", status.text()),
         ),
         AprsData::Object(object) => object_summary(source, &object),
         AprsData::Item(item) => item_summary(source, &item),
         AprsData::PositionlessWeather(report) => {
-            let detail = report.weather.temperature().map_or_else(
+            let detail = report.weather().temperature().map_or_else(
                 || "weather report".to_owned(),
                 |temperature| format!("weather {} °F", temperature.get()),
             );
@@ -875,7 +1041,7 @@ fn decode_summary(source: &str, packet: &Ax25Packet) -> DecodedSummary {
         }
         AprsData::Telemetry(telemetry) => simple_summary(
             AprsActivityKind::Telemetry,
-            format!("{source} telemetry sequence {}", telemetry.sequence),
+            format!("{source} telemetry sequence {}", telemetry.sequence()),
         ),
         AprsData::Query(query) => {
             simple_summary(AprsActivityKind::Query, format!("{source} query {query:?}"))
@@ -901,7 +1067,7 @@ fn decode_summary(source: &str, packet: &Ax25Packet) -> DecodedSummary {
         ),
         AprsData::UserDefined { experiment, .. } => simple_summary(
             AprsActivityKind::UserDefined,
-            format!("{source} user-defined experiment {experiment}"),
+            format!("{source} user-defined experiment {}", experiment.as_byte()),
         ),
         AprsData::InvalidOrTest(_) => simple_summary(
             AprsActivityKind::Test,
@@ -915,21 +1081,22 @@ fn decode_summary(source: &str, packet: &Ax25Packet) -> DecodedSummary {
 }
 
 fn position_summary(source: &str, position: &AprsPosition) -> DecodedSummary {
-    let suffix = if position.comment.is_empty() {
+    let suffix = if position.comment().is_empty() {
         String::new()
     } else {
-        format!(" · {}", position.comment)
+        format!(" · {}", position.comment())
     };
     DecodedSummary {
         kind: AprsActivityKind::Position,
         summary: format!(
             "{source} position {:.5}, {:.5}{suffix}",
-            position.latitude, position.longitude
+            position.latitude().as_degrees(),
+            position.longitude().as_degrees()
         ),
-        latitude: Some(position.latitude),
-        longitude: Some(position.longitude),
-        speed_knots: position.speed_knots,
-        course_degrees: position.course_degrees,
+        latitude: Some(position.latitude().as_degrees()),
+        longitude: Some(position.longitude().as_degrees()),
+        speed_knots: position.speed().map(::aprs::Speed::as_knots),
+        course_degrees: position.course().map(::aprs::Course::as_degrees),
     }
 }
 
@@ -938,9 +1105,9 @@ fn object_summary(source: &str, object: &AprsObject) -> DecodedSummary {
         AprsActivityKind::Object,
         source,
         "object",
-        object.name.as_str(),
-        object.live,
-        &object.position,
+        object.name().as_str(),
+        object.state().is_live(),
+        object.position(),
     )
 }
 
@@ -949,9 +1116,9 @@ fn item_summary(source: &str, item: &AprsItem) -> DecodedSummary {
         AprsActivityKind::Item,
         source,
         "item",
-        &item.name,
-        item.live,
-        &item.position,
+        item.name().as_str(),
+        item.state().is_live(),
+        item.position(),
     )
 }
 
@@ -968,13 +1135,13 @@ fn positioned_entity_summary(
         summary: format!(
             "{source} {label} {name} {} at {:.5}, {:.5}",
             if live { "live" } else { "killed" },
-            position.latitude,
-            position.longitude
+            position.latitude().as_degrees(),
+            position.longitude().as_degrees()
         ),
-        latitude: Some(position.latitude),
-        longitude: Some(position.longitude),
-        speed_knots: position.speed_knots,
-        course_degrees: position.course_degrees,
+        latitude: Some(position.latitude().as_degrees()),
+        longitude: Some(position.longitude().as_degrees()),
+        speed_knots: position.speed().map(::aprs::Speed::as_knots),
+        course_degrees: position.course().map(::aprs::Course::as_degrees),
     }
 }
 
@@ -1017,10 +1184,13 @@ fn unix_milliseconds() -> u64 {
         .unwrap_or(0)
 }
 
-fn take_identifier(next: &mut u64) -> u64 {
+fn take_identifier(next: &mut u64) -> Option<u64> {
     let value = *next;
-    *next = next.wrapping_add(1).max(1);
-    value
+    if value == 0 {
+        return None;
+    }
+    *next = value.checked_add(1).unwrap_or(0);
+    Some(value)
 }
 
 #[cfg(test)]
@@ -1074,17 +1244,16 @@ mod tests {
     #[test]
     fn received_position_is_exactly_journaled_and_updates_station() -> TestResult {
         let source = Ax25Address::new("N0CALL", 7)?;
-        let packet = build_aprs_position_report_packet(
-            &source,
-            Latitude::new(35.25)?,
-            Longitude::new(-97.75)?,
-            AprsSymbol::CAR,
-            &PositionReportText::new("mobile")?,
-            &DigipeaterPath::empty(),
-        );
-        let raw = build_ax25(&packet);
+        let packet = AprsFrameHeader::new(source, Tocall::new("APRS")?, DigipeaterPath::empty())
+            .position_report_packet(
+                Latitude::new(35.25)?,
+                Longitude::new(-97.75)?,
+                AprsSymbol::CAR,
+                &PositionReportText::new("mobile")?,
+            );
+        let raw = packet.to_bytes();
         let mut store = AprsActivityStore::default();
-        store.begin_start(AprsSessionConfig::default());
+        store.begin_start(AprsSessionConfig::default())?;
         store.mark_active();
         let record = store.push_received_ax25(raw.clone());
 
@@ -1103,10 +1272,10 @@ mod tests {
         store.begin_start(AprsSessionConfig {
             station_callsign: "K1ABC-7".to_owned(),
             ..AprsSessionConfig::default()
-        });
+        })?;
         store.mark_active();
         let packet = store.build_message("W1AW", "hello", Some("42"))?;
-        let expected = build_ax25(&packet);
+        let expected = packet.to_bytes();
         let record = store.push_transmitted(&packet);
 
         assert_eq!(record.direction, AprsActivityDirection::Tx);
@@ -1122,7 +1291,7 @@ mod tests {
         store.begin_start(AprsSessionConfig {
             station_callsign: "K1ABC-7".to_owned(),
             ..AprsSessionConfig::default()
-        });
+        })?;
         store.mark_active();
 
         let result = store.build_position(35.25, -97.75, "bad\ntext");
@@ -1134,9 +1303,9 @@ mod tests {
     }
 
     #[test]
-    fn incremental_snapshot_reports_evicted_gap() {
+    fn incremental_snapshot_reports_evicted_gap() -> TestResult {
         let mut store = AprsActivityStore::default();
-        store.begin_start(AprsSessionConfig::default());
+        store.begin_start(AprsSessionConfig::default())?;
         for index in 0..=ACTIVITY_CAPACITY {
             store.push_system(&format!("row {index}"));
         }
@@ -1144,5 +1313,68 @@ mod tests {
         assert!(snapshot.history_truncated, "old sequence must report a gap");
         assert_eq!(snapshot.activities.len(), ACTIVITY_CAPACITY);
         assert!(snapshot.status.dropped_activities > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn exhausted_identifiers_preserve_journal_order_and_refuse_new_sessions() -> TestResult {
+        let mut store = AprsActivityStore {
+            next_session_id: u64::MAX,
+            next_sequence: u64::MAX,
+            ..Default::default()
+        };
+        store.begin_start(AprsSessionConfig::default())?;
+        store.push_system("not retained after exhaustion");
+        let snapshot = store.snapshot(None);
+        assert_eq!(snapshot.latest_sequence, u64::MAX);
+        assert!(
+            snapshot.history_truncated,
+            "identifier exhaustion was hidden"
+        );
+        assert_eq!(snapshot.activities.len(), 1);
+        assert_eq!(
+            snapshot.activities.first().map(|row| row.sequence),
+            Some(u64::MAX)
+        );
+        assert_eq!(snapshot.status.dropped_activities, 1);
+        assert!(matches!(
+            store.ensure_can_start(),
+            Err(AutomationError::IdentifierExhausted)
+        ));
+        assert!(matches!(
+            store.begin_start(AprsSessionConfig::default()),
+            Err(AutomationError::IdentifierExhausted)
+        ));
+        assert_eq!(store.status.session_id, u64::MAX);
+        Ok(())
+    }
+
+    #[test]
+    fn received_station_storage_is_bounded_independently_of_journal_eviction() -> TestResult {
+        let mut store = AprsActivityStore::default();
+        store.begin_start(AprsSessionConfig::default())?;
+        for index in 0..=ACTIVITY_CAPACITY {
+            let source = Ax25Address::new(&format!("A{index:05}"), 0)?;
+            let packet =
+                AprsFrameHeader::new(source, Tocall::new("APRS")?, DigipeaterPath::empty())
+                    .position_report_packet(
+                        Latitude::new(35.0)?,
+                        Longitude::new(-82.0)?,
+                        AprsSymbol::CAR,
+                        &PositionReportText::new("")?,
+                    );
+            drop(store.push_received_ax25(packet.to_bytes()));
+        }
+        let snapshot = store.snapshot(None);
+        assert_eq!(snapshot.stations.len(), ACTIVITY_CAPACITY);
+        assert_eq!(snapshot.activities.len(), ACTIVITY_CAPACITY);
+        assert!(
+            snapshot
+                .stations
+                .iter()
+                .any(|station| station.callsign == "A01000"),
+            "latest station was discarded"
+        );
+        Ok(())
     }
 }

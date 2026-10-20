@@ -31,8 +31,8 @@ struct AzimuthApp: App {
         let operatingSystem = ProcessInfo.processInfo.operatingSystemVersionString
         azimuthAppLog.notice("[Azimuth App] launch version=\(version, privacy: .public) build=\(build, privacy: .public) runtime=\(runtime, privacy: .public) os=\(operatingSystem, privacy: .public)")
 
-        let records = settingCatalog()
         do {
+            let records = try settingCatalog()
             let transport: any AzimuthRadioTransport
             let endpointSelector: any RadioEndpointSelecting
             #if os(macOS)

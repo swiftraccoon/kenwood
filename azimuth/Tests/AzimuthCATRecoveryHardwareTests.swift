@@ -41,7 +41,7 @@ final class AzimuthCATRecoveryHardwareTests: XCTestCase {
             )
         }
 
-        let records = settingCatalog()
+        let records = try settingCatalog()
         let router = try AzimuthSelectableRadioTransport(
             usbFactory: AzimuthPlatformUSBTransportFactory(),
             bluetoothFactory: AzimuthGeneratedBluetoothLinkFactory()
@@ -108,7 +108,7 @@ final class AzimuthCATRecoveryHardwareTests: XCTestCase {
             )
         }
 
-        let records = settingCatalog()
+        let records = try settingCatalog()
         let router = try AzimuthSelectableRadioTransport(
             usbFactory: AzimuthPlatformUSBTransportFactory(),
             bluetoothFactory: AzimuthGeneratedBluetoothLinkFactory()
@@ -195,7 +195,7 @@ final class AzimuthCATRecoveryHardwareTests: XCTestCase {
             throw XCTSkip("Set AZIMUTH_HARDWARE_DV_GATEWAY_RECOVERY=1 for the live radio test.")
         }
 
-        let records = settingCatalog()
+        let records = try settingCatalog()
         let router = try AzimuthSelectableRadioTransport(
             usbFactory: AzimuthPlatformUSBTransportFactory(),
             bluetoothFactory: AzimuthGeneratedBluetoothLinkFactory()

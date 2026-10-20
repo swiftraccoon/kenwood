@@ -19,14 +19,14 @@ use kenwood_transport::Transport;
 pub(crate) const IF_CENTER_HZ: u32 = 12_000;
 
 /// Complete snapshot of every radio value changed by IF capture.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct SavedIfDspRadioState {
     if_tap: IfTapSavedState,
 }
 
 impl SavedIfDspRadioState {
     /// Band-B frequency which was active before IF capture began.
-    pub(crate) const fn band_b_frequency_hz(self) -> u32 {
+    pub(crate) const fn band_b_frequency_hz(&self) -> u32 {
         self.if_tap.band_b_frequency().as_hz()
     }
 }
@@ -73,14 +73,16 @@ pub(crate) enum EngageIfDspError {
 
 /// Engage the 12 kHz USB IF output through the library session.
 ///
-/// Snapshot, configuration, engagement proof, and failure rollback are one
-/// atomic library operation. The library snapshot includes Band B's original
+/// Snapshot, configuration, engagement proof and failure rollback form one
+/// library-managed sequence. The snapshot includes Band B's original
 /// frequency for both status reporting and verified restoration.
 #[cfg(test)]
 async fn engage_if_dsp_radio<T: Transport>(
     radio: &mut Radio<T>,
 ) -> Result<SavedIfDspRadioState, EngageIfDspError> {
-    let config = IfTapConfig::new(OperatingMode::Usb).with_step(StepSize::Hz5000);
+    let config = IfTapConfig::new(OperatingMode::Usb)
+        .map_err(|error| EngageIfDspError::Clean(error.to_string()))?
+        .with_step(StepSize::Hz5000);
     map_engage_result(
         radio
             .enter_if_tap(config)
@@ -93,7 +95,9 @@ async fn engage_if_dsp_radio<T: Transport>(
 pub(crate) async fn engage_if_dsp_session<T: Transport>(
     session: &mut AutomationSession<'_, T>,
 ) -> Result<SavedIfDspRadioState, EngageIfDspError> {
-    let config = IfTapConfig::new(OperatingMode::Usb).with_step(StepSize::Hz5000);
+    let config = IfTapConfig::new(OperatingMode::Usb)
+        .map_err(|error| EngageIfDspError::Clean(error.to_string()))?
+        .with_step(StepSize::Hz5000);
     map_engage_result(session.enter_if_tap(config).await)
 }
 
@@ -145,7 +149,7 @@ fn map_engage_result(
 #[cfg(test)]
 async fn retune_if_dsp_radio<T: Transport>(
     radio: &mut Radio<T>,
-    saved: SavedIfDspRadioState,
+    saved: &SavedIfDspRadioState,
     frequency_hz: u32,
 ) -> Result<(), String> {
     radio
@@ -162,7 +166,7 @@ async fn retune_if_dsp_radio<T: Transport>(
 /// Retune IF output inside the existing attested automation session.
 pub(crate) async fn retune_if_dsp_session<T: Transport>(
     session: &mut AutomationSession<'_, T>,
-    saved: SavedIfDspRadioState,
+    saved: &SavedIfDspRadioState,
     frequency_hz: u32,
 ) -> Result<(), String> {
     session
@@ -387,6 +391,8 @@ mod tests {
         queue_engage_script(&mut mock);
         mock.expect(b"FQ 1\r", b"FQ 1,0145240000\r");
         mock.expect(b"SF 1\r", b"SF 1,0\r");
+        mock.expect(b"VM 1\r", b"VM 1,0\r");
+        mock.expect(b"BC\r", b"BC 1\r");
         mock.expect(b"IO 0\r", b"IO 0\r");
         mock.expect(b"IO\r", b"IO 0\r");
         mock.expect(b"UP\r", b"UP\r");
@@ -426,7 +432,7 @@ mod tests {
         let saved = engage_if_dsp_radio(&mut radio)
             .await
             .map_err(|error| format!("{error:?}"))?;
-        retune_if_dsp_radio(&mut radio, saved, 145_265_000).await?;
+        retune_if_dsp_radio(&mut radio, &saved, 145_265_000).await?;
         let report = restore_if_dsp_radio(&mut radio, saved).await;
         assert!(
             report.is_exact(),
