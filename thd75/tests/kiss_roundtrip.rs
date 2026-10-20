@@ -4,30 +4,25 @@
 //! generates arbitrary well-formed inputs and checks `parse(build(x)) ==
 //! x` for each layer.
 //!
-//! The pure-KISS codec round-trip lives in `kiss-tnc/tests/roundtrip.rs`
-//! (extracted in PR 1 of the KISS / AX.25 / APRS split). AX.25 and
-//! APRS round-trips stay here until those layers are extracted in
-//! PRs 2 and 3.
+//! These properties also exercise the composition of AX.25 and APRS
+//! codecs with KISS framing through the radio integration helpers.
 
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
 
 use aprs::{
-    AprsData, AprsPosition, AprsPositionlessWeatherReport, AprsSymbol, AprsWeather,
-    AprsWeatherTimestamp, BarometricPressure, CompressedPositionText, Course, Fahrenheit, Humidity,
-    Latitude, Longitude, Luminosity, MessageAddressee, MessageId, MessageText, MiceMessage,
-    MiceSpeed, MiceStatusText, PositionReportText, StatusText, ThreeDigitWeatherValue,
-    WeatherComment, WindDirection, build_aprs_message_packet, build_aprs_mice_with_message_packet,
-    build_aprs_position_compressed_packet, build_aprs_position_report_packet,
-    build_aprs_status_packet, build_aprs_weather_packet, parse_aprs_data, parse_aprs_position,
-    parse_mice_position,
+    AprsData, AprsFrameHeader, AprsPosition, AprsPositionlessWeatherReport, AprsSymbol,
+    AprsWeather, AprsWeatherTimestamp, BarometricPressure, CompressedPositionText, Course,
+    DirectMessageAddressee, Fahrenheit, Humidity, Latitude, Longitude, Luminosity, MessageId,
+    MessageText, MiceMessage, MiceReport, MiceSpeed, MiceStatusText, PositionReportText,
+    StatusText, ThreeDigitWeatherValue, Tocall, WeatherComment, WindDirection,
 };
 use ax25_codec::{
-    Ax25Address, Ax25Packet, Ax25Pid, CommandResponse, DigipeaterPath, RouteEntry, build_ax25,
-    parse_ax25,
+    Ax25Address, Ax25Header, Ax25Packet, Ax25Pid, CommandResponse, DigipeaterPath, PollFinal,
+    RouteEntry,
 };
 use kenwood_thd75::aprs::ax25_to_kiss_wire;
-use kiss_tnc::decode_kiss_frame;
+use kiss_tnc::KissFrame;
 
 // Deps visible to every kenwood-thd75 test target but unused here.
 // Acknowledged so `unused_crate_dependencies` stays silent without
@@ -110,9 +105,9 @@ fn arb_message_text() -> impl Strategy<Value = MessageText> {
     })
 }
 
-fn arb_message_addressee() -> impl Strategy<Value = MessageAddressee> {
+fn arb_message_addressee() -> impl Strategy<Value = DirectMessageAddressee> {
     "[A-Z0-9-]{3,9}".prop_filter_map("valid APRS addressee", |value: String| {
-        MessageAddressee::new(&value).ok()
+        DirectMessageAddressee::new(&value).ok()
     })
 }
 
@@ -224,24 +219,26 @@ proptest! {
         info in prop::collection::vec(any::<u8>(), 1..100),
     ) {
         let packet = Ax25Packet::unnumbered_information(
-            source.clone(),
-            dest.clone(),
-            digis.clone(),
-            CommandResponse::Command,
-            false,
+            Ax25Header {
+                source: source.clone(),
+                destination: dest.clone(),
+                digipeaters: digis.clone(),
+                command_response: CommandResponse::Command,
+            },
+            PollFinal::Clear,
             Ax25Pid::NoLayer3,
             info.clone(),
         );
-        let bytes = build_ax25(&packet);
-        let parsed = parse_ax25(&bytes).map_err(to_test_err)?;
-        prop_assert_eq!(parsed.source.callsign.as_str(), source.callsign.as_str());
-        prop_assert_eq!(parsed.source.ssid, source.ssid);
+        let bytes = packet.to_bytes();
+        let parsed = Ax25Packet::from_bytes(&bytes).map_err(to_test_err)?;
+        prop_assert_eq!(parsed.header.source.callsign.as_str(), source.callsign.as_str());
+        prop_assert_eq!(parsed.header.source.ssid, source.ssid);
         prop_assert_eq!(
-            parsed.destination.callsign.as_str(),
+            parsed.header.destination.callsign.as_str(),
             dest.callsign.as_str()
         );
-        prop_assert_eq!(parsed.destination.ssid, dest.ssid);
-        prop_assert_eq!(parsed.digipeaters.len(), digis.len());
+        prop_assert_eq!(parsed.header.destination.ssid, dest.ssid);
+        prop_assert_eq!(parsed.header.digipeaters.len(), digis.len());
         prop_assert_eq!(parsed.information(), info);
     }
 }
@@ -259,22 +256,20 @@ proptest! {
     ) {
         let latitude = Latitude::new(lat).map_err(to_test_err)?;
         let longitude = Longitude::new(lon).map_err(to_test_err)?;
-        let packet = build_aprs_position_report_packet(
-            &source,
+        let packet = AprsFrameHeader::new(source, Tocall::th_d75(), DigipeaterPath::empty()).position_report_packet(
             latitude,
             longitude,
             AprsSymbol::CAR,
             &PositionReportText::default(),
-            &DigipeaterPath::empty(),
         );
         let wire = ax25_to_kiss_wire(&packet);
-        let kiss = decode_kiss_frame(&wire).map_err(to_test_err)?;
-        let parsed_packet = parse_ax25(&kiss.data).map_err(to_test_err)?;
-        let parsed: AprsPosition = parse_aprs_position(parsed_packet.information()).map_err(to_test_err)?;
-        prop_assert!((parsed.latitude - lat).abs() < 0.02,
-            "lat roundtrip failed: in {lat}, out {}", parsed.latitude);
-        prop_assert!((parsed.longitude - lon).abs() < 0.02,
-            "lon roundtrip failed: in {lon}, out {}", parsed.longitude);
+        let kiss = KissFrame::from_bytes(&wire).map_err(to_test_err)?;
+        let parsed_packet = Ax25Packet::from_bytes(&kiss.data).map_err(to_test_err)?;
+        let parsed = AprsPosition::from_bytes(parsed_packet.information()).map_err(to_test_err)?;
+        prop_assert!((parsed.latitude().as_degrees() - lat).abs() < 0.02,
+            "lat roundtrip failed: in {lat}, out {}", parsed.latitude());
+        prop_assert!((parsed.longitude().as_degrees() - lon).abs() < 0.02,
+            "lon roundtrip failed: in {lon}, out {}", parsed.longitude());
     }
 }
 
@@ -291,21 +286,18 @@ proptest! {
     ) {
         let latitude = Latitude::new(lat).map_err(to_test_err)?;
         let longitude = Longitude::new(lon).map_err(to_test_err)?;
-        let packet = build_aprs_position_compressed_packet(
-            &source,
+        let packet = AprsFrameHeader::new(source, Tocall::th_d75(), DigipeaterPath::empty()).position_compressed_packet(
             latitude,
             longitude,
             AprsSymbol::CAR,
             &CompressedPositionText::default(),
-            &DigipeaterPath::empty(),
         );
         let wire = ax25_to_kiss_wire(&packet);
-        let kiss = decode_kiss_frame(&wire).map_err(to_test_err)?;
-        let parsed_packet = parse_ax25(&kiss.data).map_err(to_test_err)?;
-        let parsed: AprsPosition = parse_aprs_position(parsed_packet.information()).map_err(to_test_err)?;
-        // Compressed is less precise than uncompressed, so allow more slop.
-        prop_assert!((parsed.latitude - lat).abs() < 0.1);
-        prop_assert!((parsed.longitude - lon).abs() < 0.1);
+        let kiss = KissFrame::from_bytes(&wire).map_err(to_test_err)?;
+        let parsed_packet = Ax25Packet::from_bytes(&kiss.data).map_err(to_test_err)?;
+        let parsed = AprsPosition::from_bytes(parsed_packet.information()).map_err(to_test_err)?;
+        prop_assert!((parsed.latitude().as_degrees() - lat).abs() < 0.1);
+        prop_assert!((parsed.longitude().as_degrees() - lon).abs() < 0.1);
     }
 }
 
@@ -332,28 +324,26 @@ proptest! {
     ) {
         let latitude = Latitude::new(lat).map_err(to_test_err)?;
         let longitude = Longitude::new(lon).map_err(to_test_err)?;
-        let packet = build_aprs_mice_with_message_packet(
-            &source,
+        let report = MiceReport::new(
             latitude,
             longitude,
             MiceSpeed::new(0).map_err(to_test_err)?,
             Course::new(0).map_err(to_test_err)?,
-            message,
             AprsSymbol::CAR,
-            &MiceStatusText::default(),
-            &DigipeaterPath::empty(),
-        );
+            MiceStatusText::default(),
+        ).map_err(to_test_err)?.with_message(message);
+        let packet = report.to_packet(source, DigipeaterPath::empty());
         let wire = ax25_to_kiss_wire(&packet);
-        let kiss = decode_kiss_frame(&wire).map_err(to_test_err)?;
-        let parsed_packet = parse_ax25(&kiss.data).map_err(to_test_err)?;
-        let parsed = parse_mice_position(
-            &parsed_packet.destination.callsign,
+        let kiss = KissFrame::from_bytes(&wire).map_err(to_test_err)?;
+        let parsed_packet = Ax25Packet::from_bytes(&kiss.data).map_err(to_test_err)?;
+        let parsed = AprsPosition::from_mice_bytes(
+            parsed_packet.header.destination.callsign.as_str(),
             parsed_packet.information(),
         ).map_err(to_test_err)?;
-        prop_assert_eq!(parsed.mice_message, Some(message));
+        prop_assert_eq!(parsed.mice_message(), Some(message));
         // Mic-E encodes position to 0.01 minute → ~18 metre precision.
-        prop_assert!((parsed.latitude - lat).abs() < 0.02);
-        prop_assert!((parsed.longitude - lon).abs() < 0.02);
+        prop_assert!((parsed.latitude().as_degrees() - lat).abs() < 0.02);
+        prop_assert!((parsed.longitude().as_degrees() - lon).abs() < 0.02);
     }
 }
 
@@ -375,18 +365,18 @@ proptest! {
             wx.clone(),
             comment,
         );
-        let packet = build_aprs_weather_packet(&source, &report, &DigipeaterPath::empty());
+        let packet = AprsFrameHeader::new(source, Tocall::th_d75(), DigipeaterPath::empty()).weather_packet(&report);
         let wire = ax25_to_kiss_wire(&packet);
-        let kiss = decode_kiss_frame(&wire).map_err(to_test_err)?;
-        let parsed_packet = parse_ax25(&kiss.data).map_err(to_test_err)?;
-        let data = parse_aprs_data(parsed_packet.information()).map_err(to_test_err)?;
+        let kiss = KissFrame::from_bytes(&wire).map_err(to_test_err)?;
+        let parsed_packet = Ax25Packet::from_bytes(&kiss.data).map_err(to_test_err)?;
+        let data = AprsData::from_bytes(parsed_packet.information()).map_err(to_test_err)?;
         let AprsData::PositionlessWeather(parsed) = data else {
             prop_assert!(false, "expected positionless weather variant");
             return Ok(());
         };
-        prop_assert_eq!(parsed.timestamp, report.timestamp);
+        prop_assert_eq!(parsed.timestamp(), report.timestamp());
         prop_assert_eq!(parsed.comment(), report.comment());
-        prop_assert_eq!(&parsed.weather, &wx);
+        prop_assert_eq!(parsed.weather(), &wx);
     }
 }
 
@@ -402,24 +392,22 @@ proptest! {
         text in arb_message_text(),
         msg_id in prop::option::of(arb_message_id()),
     ) {
-        let packet = build_aprs_message_packet(
-            &source,
+        let packet = AprsFrameHeader::new(source, Tocall::th_d75(), DigipeaterPath::empty()).message_packet(
             &addressee,
             &text,
             msg_id.as_ref(),
-            &DigipeaterPath::empty(),
         );
         let wire = ax25_to_kiss_wire(&packet);
-        let kiss = decode_kiss_frame(&wire).map_err(to_test_err)?;
-        let parsed_packet = parse_ax25(&kiss.data).map_err(to_test_err)?;
-        let data = parse_aprs_data(parsed_packet.information()).map_err(to_test_err)?;
+        let kiss = KissFrame::from_bytes(&wire).map_err(to_test_err)?;
+        let parsed_packet = Ax25Packet::from_bytes(&kiss.data).map_err(to_test_err)?;
+        let data = AprsData::from_bytes(parsed_packet.information()).map_err(to_test_err)?;
         let AprsData::Message(parsed) = data else {
             prop_assert!(false, "expected message variant");
             return Ok(());
         };
-        prop_assert_eq!(parsed.addressee.as_str(), addressee.as_str());
-        prop_assert_eq!(parsed.text.as_str(), text.as_str());
-        prop_assert_eq!(parsed.message_id.as_deref(), msg_id.as_ref().map(MessageId::as_str));
+        prop_assert_eq!(parsed.addressee().as_str(), addressee.as_str());
+        prop_assert_eq!(parsed.text(), text.as_str());
+        prop_assert_eq!(parsed.message_id().map(MessageId::as_str), msg_id.as_ref().map(MessageId::as_str));
     }
 }
 
@@ -433,11 +421,11 @@ proptest! {
         source in arb_ax25_address(),
         text in arb_status_text(),
     ) {
-        let packet = build_aprs_status_packet(&source, &text, &DigipeaterPath::empty());
+        let packet = AprsFrameHeader::new(source, Tocall::th_d75(), DigipeaterPath::empty()).status_packet(&text);
         let wire = ax25_to_kiss_wire(&packet);
-        let kiss = decode_kiss_frame(&wire).map_err(to_test_err)?;
-        let parsed_packet = parse_ax25(&kiss.data).map_err(to_test_err)?;
-        let data = parse_aprs_data(parsed_packet.information()).map_err(to_test_err)?;
+        let kiss = KissFrame::from_bytes(&wire).map_err(to_test_err)?;
+        let parsed_packet = Ax25Packet::from_bytes(&kiss.data).map_err(to_test_err)?;
+        let data = AprsData::from_bytes(parsed_packet.information()).map_err(to_test_err)?;
         let AprsData::Status(parsed) = data else {
             prop_assert!(false, "expected status variant");
             return Ok(());
@@ -452,33 +440,30 @@ proptest! {
         // strips only *trailing* whitespace (that `\r` plus any right
         // padding); leading whitespace is preserved as content. The
         // comparison is therefore `trim_end`, not `trim`.
-        if parsed.timestamp.is_none() && parsed.grid_locator.is_none() {
-            prop_assert_eq!(parsed.text.as_str(), text.as_str().trim_end());
+        if parsed.timestamp().is_none() && parsed.grid_locator().is_none() {
+            prop_assert_eq!(parsed.text(), text.as_str().trim_end());
         }
     }
 }
 
-/// Regression: a status whose text carries leading whitespace must
-/// round-trip with that space intact. `parse_aprs_status` strips only
-/// trailing whitespace (the `\r` terminator and right padding);
-/// leading whitespace is content, as the parser's own grid+comment
-/// handling relies on. The `status_roundtrip` proptest previously
-/// compared against `text.trim()`, which also stripped the leading
-/// space and failed for minimal inputs such as `" A"`.
+/// Status parsing preserves leading content whitespace while removing its
+/// trailing wire terminator and padding.
 #[test]
 fn status_roundtrip_preserves_leading_whitespace() -> Result<(), Box<dyn std::error::Error>> {
     let source = Ax25Address::new("A", 0)?;
     let text = StatusText::new(" A")?;
-    let packet = build_aprs_status_packet(&source, &text, &DigipeaterPath::empty());
+    let packet = AprsFrameHeader::new(source, Tocall::th_d75(), DigipeaterPath::empty())
+        .status_packet(&text);
     let wire = ax25_to_kiss_wire(&packet);
-    let kiss = decode_kiss_frame(&wire)?;
-    let parsed_packet = parse_ax25(&kiss.data)?;
-    let data = parse_aprs_data(parsed_packet.information())?;
+    let kiss = KissFrame::from_bytes(&wire)?;
+    let parsed_packet = Ax25Packet::from_bytes(&kiss.data)?;
+    let data = AprsData::from_bytes(parsed_packet.information())?;
     let AprsData::Status(parsed) = data else {
         return Err("expected status variant".into());
     };
     assert_eq!(
-        parsed.text, " A",
+        parsed.text(),
+        " A",
         "leading whitespace is status content, not strippable padding"
     );
     Ok(())

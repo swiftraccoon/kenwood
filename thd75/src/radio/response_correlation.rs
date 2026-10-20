@@ -457,7 +457,7 @@ mod tests {
 
     #[test]
     fn gps_setters_require_the_complete_typed_echo() -> TestResult {
-        let requested_settings = GpsSettings::new(true, false);
+        let requested_settings = GpsSettings::new().with_enabled(true);
         assert_eq!(
             correlate(
                 &Command::SetGpsSettings {
@@ -475,7 +475,7 @@ mod tests {
                     settings: requested_settings,
                 },
                 &Response::GpsSettings {
-                    settings: GpsSettings::new(false, false),
+                    settings: GpsSettings::new(),
                 },
             ),
             ResponseCorrelation::Mismatch

@@ -1196,10 +1196,10 @@ fn automation_attestation_manifest(
                 "automation_qualified": true,
                 "transport_reopened_before_raw_audit": evidence.transport_reopened_before_raw_audit,
                 "abi": {
-                    "version": evidence.abi.version,
-                    "features": evidence.abi.features,
-                    "max_key": evidence.abi.max_key,
-                    "max_phase": evidence.abi.max_phase,
+                    "version": evidence.abi.version(),
+                    "features": evidence.abi.features(),
+                    "max_key": evidence.abi.max_key(),
+                    "max_phase": evidence.abi.max_phase(),
                 },
             })
         },
@@ -1428,10 +1428,10 @@ fn automation_attestation_record(
     };
     let abi = attestation.map_or(Value::Null, |evidence| {
         json!({
-            "version": evidence.abi.version,
-            "features": evidence.abi.features,
-            "max_key": evidence.abi.max_key,
-            "max_phase": evidence.abi.max_phase,
+            "version": evidence.abi.version(),
+            "features": evidence.abi.features(),
+            "max_key": evidence.abi.max_key(),
+            "max_phase": evidence.abi.max_phase(),
         })
     });
     let error_detail = error.map_or(Value::Null, |detail| match privacy {
@@ -3183,12 +3183,7 @@ mod tests {
         );
 
         let attestation = AutomationAttestation {
-            abi: AutomationAbi {
-                version: 1,
-                features: 0x1F,
-                max_key: 0x18,
-                max_phase: 2,
-            },
+            abi: AutomationAbi::SUPPORTED,
             transport_reopened_before_raw_audit: true,
         };
         let record = automation_attestation_record(
@@ -3222,7 +3217,7 @@ mod tests {
                 .get("abi")
                 .and_then(|abi| abi.get("features"))
                 .and_then(Value::as_u64),
-            Some(0x1F)
+            Some(0x7F)
         );
 
         let manifest = automation_attestation_manifest(config.profile, Some(&attestation));
@@ -3317,7 +3312,7 @@ mod tests {
     async fn precommand_resync_discards_a_stale_partial_frame() -> TestResult {
         let mut transport = MockTransport::new();
         transport.pend_when_empty();
-        transport.expect_reads(b"ID\r", &[b"ID TH-D75\rSTALE"]);
+        transport.expect_reads(b"ID\r", [b"ID TH-D75\rSTALE".to_vec()]);
         transport.expect(b"FV\r", b"FV 1.03\r");
         let mut codec = Codec::new();
 
@@ -3346,7 +3341,7 @@ mod tests {
         transport.pend_when_empty();
         transport.expect_reads(
             b"FQ 0\r",
-            &[b"$GPGGA,private\rFQ 1,0435000000\rFQ 0,0145200000\rAI 0\r"],
+            [b"$GPGGA,private\rFQ 1,0435000000\rFQ 0,0145200000\rAI 0\r".to_vec()],
         );
         let mut codec = Codec::new();
         let spec = CommandSpec::indexed_sensitive("A1-P0-FQ-0-READ", b"FQ 0\r", b"FQ 0,");

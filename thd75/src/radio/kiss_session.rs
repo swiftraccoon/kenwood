@@ -39,9 +39,7 @@
 
 use std::time::Duration;
 
-use kiss_tnc::{
-    FEND, KissCommand, KissError, KissFrame, KissPort, decode_kiss_frame, encode_kiss_frame,
-};
+use kiss_tnc::{FEND, KissCommand, KissError, KissFrame, KissPort};
 
 use crate::error::{Error, ProtocolError};
 use crate::protocol::{Command, Response};
@@ -55,6 +53,9 @@ use super::{BinaryProtocolProof, DesyncedRadio, Radio, cat_restore_state::CatRes
 
 /// Default timeout for KISS receive operations (10 seconds).
 const KISS_RECEIVE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Maximum time allowed for one KISS transport write.
+const KISS_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A KISS TNC session that owns the radio transport.
 ///
@@ -83,6 +84,8 @@ pub struct KissSession<T: Transport> {
     receive_timeout: Duration,
     /// Internal buffer for accumulating KISS bytes from the transport.
     read_buf: Vec<u8>,
+    /// A write began without a complete successful result, or exit began.
+    write_ambiguous: bool,
 }
 
 impl<T: Transport> std::fmt::Debug for KissSession<T> {
@@ -164,6 +167,7 @@ impl<T: Transport> Radio<T> {
             cat_restore,
             receive_timeout: KISS_RECEIVE_TIMEOUT,
             read_buf: Vec::with_capacity(512),
+            write_ambiguous: false,
         })
     }
 
@@ -209,7 +213,7 @@ impl<T: Transport> KissSession<T> {
     /// Write pre-encoded KISS wire bytes directly to the transport.
     ///
     /// Use this when you already have a fully KISS-encoded frame (e.g.,
-    /// from [`build_aprs_message`](::aprs::build_aprs_message) or
+    /// from [`AprsFrameHeader::message`](::aprs::AprsFrameHeader::message) or
     /// [`AprsMessenger::next_frame_to_send`](::aprs::AprsMessenger::next_frame_to_send)).
     /// Unlike [`send_frame`](Self::send_frame) and
     /// [`send_data`](Self::send_data), this does **not** perform any
@@ -217,10 +221,19 @@ impl<T: Transport> KissSession<T> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Transport`] if the write fails.
+    /// Requires one complete non-Return frame of at most 64 KiB. Returns
+    /// [`Error::Kiss`] for invalid framing, [`Error::KissReturnRequiresExit`]
+    /// for Return, or the bounded write failure described by [`Self::send_frame`].
     pub async fn send_wire(&mut self, wire: &[u8]) -> Result<(), Error> {
+        if wire.len() > Self::MAX_READ_BUF {
+            return Err(KissError::FrameTooLong.into());
+        }
+        let frame = KissFrame::from_bytes(wire)?;
+        if frame.command == KissCommand::Return {
+            return Err(Error::KissReturnRequiresExit);
+        }
         tracing::debug!(wire_len = wire.len(), "KISS TX (raw wire)");
-        self.transport.write(wire).await.map_err(Error::Transport)
+        self.write_wire(wire).await
     }
 
     /// Send a KISS frame to the TNC.
@@ -230,16 +243,41 @@ impl<T: Transport> KissSession<T> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Transport`] if the write fails.
+    /// Returns [`Error::KissReturnRequiresExit`] for Return, which requires
+    /// [`Self::exit`]. A write has a ten-second deadline. Transport failure,
+    /// timeout, or cancellation leaves all further I/O refused with
+    /// [`Error::KissWriteAmbiguous`]; consume the session through
+    /// [`Self::into_radio_recovery_required`] and recover CAT framing.
     pub async fn send_frame(&mut self, frame: &KissFrame) -> Result<(), Error> {
-        let wire = encode_kiss_frame(frame);
+        if frame.command == KissCommand::Return {
+            return Err(Error::KissReturnRequiresExit);
+        }
+        if frame.data.len() > Self::MAX_READ_BUF.saturating_sub(3) {
+            return Err(KissError::FrameTooLong.into());
+        }
+        let wire = frame.to_bytes();
         tracing::debug!(
             command = ?frame.command,
             data_len = frame.data.len(),
             wire_len = wire.len(),
             "KISS TX"
         );
-        self.transport.write(&wire).await.map_err(Error::Transport)
+        self.write_wire(&wire).await
+    }
+
+    async fn write_wire(&mut self, wire: &[u8]) -> Result<(), Error> {
+        if wire.len() > Self::MAX_READ_BUF {
+            return Err(KissError::FrameTooLong.into());
+        }
+        if self.write_ambiguous {
+            return Err(Error::KissWriteAmbiguous);
+        }
+        self.write_ambiguous = true;
+        tokio::time::timeout(KISS_WRITE_TIMEOUT, self.transport.write(wire))
+            .await
+            .map_err(|_| Error::Timeout(KISS_WRITE_TIMEOUT))??;
+        self.write_ambiguous = false;
+        Ok(())
     }
 
     /// Receive a KISS frame from the TNC.
@@ -256,6 +294,9 @@ impl<T: Transport> KissSession<T> {
     /// Returns [`Error::Kiss`] when the peer sends a malformed KISS frame or
     /// an unterminated frame exceeds the bounded receive buffer.
     pub async fn receive_frame(&mut self) -> Result<KissFrame, Error> {
+        if self.write_ambiguous {
+            return Err(Error::KissWriteAmbiguous);
+        }
         let timeout_dur = self.receive_timeout;
         tokio::time::timeout(timeout_dur, self.receive_frame_inner())
             .await
@@ -359,12 +400,12 @@ impl<T: Transport> KissSession<T> {
         };
         let frame_end = end_pos + 2; // Include the closing FEND.
         if frame_end > Self::MAX_READ_BUF {
-            buf.clear();
+            drop(buf.drain(..frame_end));
             return Err(KissError::FrameTooLong);
         }
 
         let frame_bytes: Vec<u8> = buf.drain(..frame_end).collect();
-        let frame = decode_kiss_frame(&frame_bytes)?;
+        let frame = KissFrame::from_bytes(&frame_bytes)?;
         tracing::debug!(
             command = ?frame.command,
             data_len = frame.data.len(),
@@ -387,7 +428,7 @@ impl<T: Transport> KissSession<T> {
             "setting KISS TX delay"
         );
         self.send_frame(&KissFrame {
-            port: KissPort::TH_D75,
+            port: KissPort::ZERO,
             command: KissCommand::TxDelay,
             data: vec![delay.to_wire_byte()],
         })
@@ -405,7 +446,7 @@ impl<T: Transport> KissSession<T> {
     pub async fn set_persistence(&mut self, persistence: KissPersistence) -> Result<(), Error> {
         tracing::debug!(%persistence, "setting KISS persistence");
         self.send_frame(&KissFrame {
-            port: KissPort::TH_D75,
+            port: KissPort::ZERO,
             command: KissCommand::Persistence,
             data: vec![persistence.to_wire_byte()],
         })
@@ -426,7 +467,7 @@ impl<T: Transport> KissSession<T> {
             "setting KISS slot time"
         );
         self.send_frame(&KissFrame {
-            port: KissPort::TH_D75,
+            port: KissPort::ZERO,
             command: KissCommand::SlotTime,
             data: vec![slot_time.to_wire_byte()],
         })
@@ -447,7 +488,7 @@ impl<T: Transport> KissSession<T> {
             "setting KISS TX tail"
         );
         self.send_frame(&KissFrame {
-            port: KissPort::TH_D75,
+            port: KissPort::ZERO,
             command: KissCommand::TxTail,
             data: vec![tx_tail.to_wire_byte()],
         })
@@ -462,7 +503,7 @@ impl<T: Transport> KissSession<T> {
     pub async fn set_duplex(&mut self, duplex: KissDuplex) -> Result<(), Error> {
         tracing::debug!(%duplex, "setting KISS duplex mode");
         self.send_frame(&KissFrame {
-            port: KissPort::TH_D75,
+            port: KissPort::ZERO,
             command: KissCommand::FullDuplex,
             data: vec![duplex.to_wire_byte()],
         })
@@ -485,7 +526,7 @@ impl<T: Transport> KissSession<T> {
         };
         tracing::debug!(%data_rate, value, "setting KISS hardware data rate");
         self.send_frame(&KissFrame {
-            port: KissPort::TH_D75,
+            port: KissPort::ZERO,
             command: KissCommand::SetHardware,
             data: vec![value],
         })
@@ -513,12 +554,22 @@ impl<T: Transport> KissSession<T> {
     ///
     /// # Errors
     ///
-    /// Returns the session back together with the error if the exit
-    /// write fails, so the already-owned transport survives for an exact
-    /// retry without an unnecessary reconnect.
+    /// Returns the session and error when the ten-second write fails. The
+    /// returned session refuses further I/O because Return may have arrived
+    /// partially or completely. Consume it with
+    /// [`Self::into_radio_recovery_required`] and recover CAT framing.
     pub async fn exit(mut self) -> Result<DesyncedRadio<T>, (Self, Error)> {
         tracing::info!("exiting KISS mode");
-        if let Err(e) = self.send_frame(&KissFrame::return_command()).await {
+        if self.write_ambiguous {
+            return Err((self, Error::KissWriteAmbiguous));
+        }
+        self.write_ambiguous = true;
+        let wire = KissFrame::return_command().to_bytes();
+        let result = tokio::time::timeout(KISS_WRITE_TIMEOUT, self.transport.write(&wire))
+            .await
+            .map_err(|_| Error::Timeout(KISS_WRITE_TIMEOUT))
+            .and_then(|result| result.map_err(Error::Transport));
+        if let Err(e) = result {
             return Err((self, e));
         }
 
@@ -555,6 +606,120 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
     type BoxErr = Box<dyn std::error::Error>;
+
+    #[derive(Debug, Default)]
+    struct BlockedWriteTransport {
+        writes: usize,
+    }
+
+    impl Transport for BlockedWriteTransport {
+        async fn write(&mut self, _bytes: &[u8]) -> Result<(), TransportError> {
+            self.writes += 1;
+            std::future::pending().await
+        }
+
+        async fn read(&mut self, _bytes: &mut [u8]) -> Result<usize, TransportError> {
+            std::future::pending().await
+        }
+
+        async fn close(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_or_timed_out_writes_refuse_every_later_kiss_operation() -> TestResult {
+        for cancel in [false, true] {
+            let mut radio = Radio::new(BlockedWriteTransport::default());
+            radio.cat_state =
+                super::super::CatState::BinaryProven(BinaryProtocolProof::Kiss(TncDataBand::A));
+            let mut session = radio.into_kiss_session().map_err(|(_, error)| error)?;
+            let frame = KissFrame::data(vec![0xAA]);
+            if cancel {
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(1), session.send_frame(&frame))
+                        .await
+                        .is_err(),
+                    "write must still be pending at cancellation"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        session.send_frame(&frame).await,
+                        Err(Error::Timeout(KISS_WRITE_TIMEOUT))
+                    ),
+                    "write must enforce its deadline"
+                );
+            }
+            assert!(matches!(
+                session.send_frame(&frame).await,
+                Err(Error::KissWriteAmbiguous)
+            ));
+            assert!(matches!(
+                session.send_wire(&frame.to_bytes()).await,
+                Err(Error::KissWriteAmbiguous)
+            ));
+            assert!(matches!(
+                session.receive_frame().await,
+                Err(Error::KissWriteAmbiguous)
+            ));
+            let Err((session, error)) = session.exit().await else {
+                return Err("uncertain write allowed a mode exit".into());
+            };
+            assert!(matches!(error, Error::KissWriteAmbiguous), "{error:?}");
+            assert_eq!(
+                session.transport.writes, 1,
+                "no later operation may touch the wire"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn return_frames_require_consuming_exit_before_any_wire_write() -> TestResult {
+        let radio = mock_radio_for_kiss(TncDataBand::A);
+        let mut session = radio
+            .enter_kiss(TncDataBand::A)
+            .await
+            .map_err(|(_, error)| error)?;
+        let writes = session.transport.writes().len();
+        let frame = KissFrame::return_command();
+        assert!(matches!(
+            session.send_frame(&frame).await,
+            Err(Error::KissReturnRequiresExit)
+        ));
+        assert!(matches!(
+            session.send_wire(&frame.to_bytes()).await,
+            Err(Error::KissReturnRequiresExit)
+        ));
+        assert_eq!(session.transport.writes().len(), writes);
+        session.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_refuses_later_traffic_and_mode_exit() -> TestResult {
+        let radio = mock_radio_for_kiss(TncDataBand::A);
+        let mut session = radio
+            .enter_kiss(TncDataBand::A)
+            .await
+            .map_err(|(_, error)| error)?;
+        let frame = KissFrame::data(vec![0xAA]);
+        assert!(matches!(
+            session.send_frame(&frame).await,
+            Err(Error::Transport(_))
+        ));
+        assert!(matches!(
+            session.send_frame(&frame).await,
+            Err(Error::KissWriteAmbiguous)
+        ));
+        let Err((session, error)) = session.exit().await else {
+            return Err("failed write allowed an exit exchange".into());
+        };
+        assert!(matches!(error, Error::KissWriteAmbiguous), "{error:?}");
+        session.transport.assert_complete();
+        Ok(())
+    }
 
     /// Helper: create a Radio with a mock that expects the TN 2,0 command.
     fn mock_radio_for_kiss(data_band: TncDataBand) -> Radio<MockTransport> {
@@ -799,7 +964,11 @@ mod tests {
         radio.firmware_version = Some(crate::types::FirmwareIdentity::new("1.03.AZM")?);
         radio.tuning_mode_a = Some(crate::types::TuningMode::Memory);
         radio.auto_info_enabled = true;
-        radio.gps_settings = Some(crate::types::GpsSettings::new(true, true));
+        radio.gps_settings = Some(
+            crate::types::GpsSettings::new()
+                .with_enabled(true)
+                .with_pc_output(true),
+        );
         radio.gps_sentences = Some(crate::types::NmeaSentences::all());
         let mut session = radio.enter_kiss(TncDataBand::A).await.map_err(|(_, e)| e)?;
 
@@ -823,7 +992,11 @@ mod tests {
         assert!(radio.auto_info_enabled);
         assert_eq!(
             radio.gps_settings,
-            Some(crate::types::GpsSettings::new(true, true))
+            Some(
+                crate::types::GpsSettings::new()
+                    .with_enabled(true)
+                    .with_pc_output(true)
+            )
         );
         assert_eq!(
             radio.gps_sentences,
@@ -960,14 +1133,19 @@ mod tests {
     }
 
     #[test]
-    fn try_extract_rejects_complete_overlong_frame_and_clears_buffer() {
+    fn try_extract_rejects_only_the_complete_overlong_frame() -> TestResult {
         let mut buf = vec![FEND, 0x00];
         buf.resize(KissSession::<MockTransport>::MAX_READ_BUF, 0x55);
         buf.push(FEND);
+        buf.extend_from_slice(&KissFrame::data(vec![0xAB]).to_bytes());
 
         let result = KissSession::<MockTransport>::try_extract_frame(&mut buf);
         assert!(matches!(result, Err(KissError::FrameTooLong)));
+        let next = KissSession::<MockTransport>::try_extract_frame(&mut buf)?
+            .ok_or("following frame was discarded")?;
+        assert_eq!(next.data, [0xAB]);
         assert!(buf.is_empty());
+        Ok(())
     }
 
     #[tokio::test]
@@ -976,8 +1154,7 @@ mod tests {
         let session = radio.enter_kiss(TncDataBand::A).await.map_err(|(_, e)| e)?;
 
         // No expected exchange for CMD_RETURN, so the write fails. The
-        // session (and its transport) must come back for a retry
-        // instead of being destroyed.
+        // session and transport return for explicit CAT recovery.
         let result = session.exit().await;
         let Err((session, _err)) = result else {
             return Err("exit with a failing write must return the session".into());

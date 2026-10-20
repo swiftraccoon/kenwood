@@ -10,15 +10,15 @@
 //! positions with synthetic values.
 
 use aprs::{
-    AprsData, BarometricPressure, Fahrenheit, Humidity, MessageKind, MiceMessage,
-    ThreeDigitWeatherValue, WindDirection, parse_aprs_data, parse_aprs_data_full,
+    AprsData, BarometricPressure, BulletinNumber, Course, Fahrenheit, Humidity, MessageKind,
+    MiceMessage, MiceSpeed, Speed, ThreeDigitWeatherValue, WindDirection,
 };
 use ax25_codec::{
-    Ax25Address, Ax25Error, Ax25Packet, Ax25Pid, CommandResponse, DigipeaterPath, RouteEntry,
-    build_ax25, parse_ax25,
+    Ax25Address, Ax25Error, Ax25Header, Ax25Packet, Ax25Pid, CommandResponse, DigipeaterPath,
+    PollFinal, RouteEntry,
 };
 use kenwood_thd75::aprs::ax25_to_kiss_wire;
-use kiss_tnc::{KissFrame, decode_kiss_frame, encode_kiss_frame};
+use kiss_tnc::KissFrame;
 
 // Deps visible to every kenwood-thd75 test target but unused here.
 // Acknowledged so `unused_crate_dependencies` stays silent without
@@ -55,16 +55,18 @@ fn make_wire_frame(
         .map(|d| RouteEntry::new(d, 0))
         .collect::<Result<_, _>>()?;
     let packet = Ax25Packet::unnumbered_information(
-        source,
-        destination,
-        DigipeaterPath::new(entries)?,
-        CommandResponse::Command,
-        false,
+        Ax25Header {
+            source,
+            destination,
+            digipeaters: DigipeaterPath::new(entries)?,
+            command_response: CommandResponse::Command,
+        },
+        PollFinal::Clear,
         Ax25Pid::NoLayer3,
         info.to_vec(),
     );
-    let ax25 = build_ax25(&packet);
-    Ok(encode_kiss_frame(&KissFrame::data(ax25)))
+    let ax25 = packet.to_bytes();
+    Ok(KissFrame::data(ax25).to_bytes())
 }
 
 #[test]
@@ -77,63 +79,51 @@ fn real_capture_uncompressed_position() -> TestResult {
         &["WIDE1", "WIDE2"],
         b"!3515.00N/09745.00W>088/015/A=001234Test beacon",
     )?;
-    let kiss = decode_kiss_frame(&wire)?;
-    let packet = parse_ax25(&kiss.data)?;
-    assert_eq!(packet.source.callsign, "N0CALL");
-    let data = parse_aprs_data(packet.information())?;
+    let kiss = KissFrame::from_bytes(&wire)?;
+    let packet = Ax25Packet::from_bytes(&kiss.data)?;
+    assert_eq!(packet.header.source.callsign, "N0CALL");
+    let data = AprsData::from_bytes(packet.information())?;
     let AprsData::Position(pos) = data else {
         return Err(format!("expected Position, got {data:?}").into());
     };
-    assert!((pos.latitude - 35.25).abs() < 0.01);
-    assert!((pos.longitude - (-97.75)).abs() < 0.01);
-    assert_eq!(pos.course_degrees, Some(88));
-    assert_eq!(pos.speed_knots, Some(15));
-    assert_eq!(pos.extensions.altitude_ft, Some(1234));
-    assert!(pos.comment.contains("Test beacon"));
+    assert!((pos.latitude().as_degrees() - 35.25).abs() < 0.01);
+    assert!((pos.longitude().as_degrees() - (-97.75)).abs() < 0.01);
+    assert_eq!(pos.course(), Some(Course::new(88)?));
+    assert_eq!(pos.speed(), Some(Speed::from_knots(15.0)?));
+    assert_eq!(pos.extensions().altitude_feet(), Some(1234));
+    assert!(pos.comment().contains("Test beacon"));
     Ok(())
 }
 
 #[test]
 fn real_capture_mice_emergency() -> TestResult {
-    // Mic-E with emergency message bits (all digits, no custom chars).
-    // Destination chars 0-2 = "354" → bits 000 → Emergency.
-    // Destination chars 3-5 = "N0E" is not valid, so use digit-only
-    // chars instead. Lat 35.4°N requires digits 3,5,4,... etc.
-    // Use "354UPP" where U=N indicator, P=+100 offset, P=W.
-    //
-    // Actually the simplest: construct via the builder and verify parse.
-    use aprs::{
-        AprsSymbol, Course, Latitude, Longitude, MiceSpeed, MiceStatusText,
-        build_aprs_mice_with_message_packet,
-    };
+    use aprs::{AprsSymbol, Latitude, Longitude, MiceReport, MiceStatusText};
     use ax25_codec::Ax25Address;
-    let source =
-        Ax25Address::new("N0CALL", 7).unwrap_or_else(|_| unreachable!("N0CALL-7 is valid"));
-    let packet = build_aprs_mice_with_message_packet(
-        &source,
+    let source = Ax25Address::new("N0CALL", 7)?;
+    let packet = MiceReport::new(
         Latitude::new(35.25)?,
         Longitude::new(-97.75)?,
         MiceSpeed::new(30)?,
         Course::new(180)?,
-        MiceMessage::Emergency,
         AprsSymbol::from_chars('/', 'E')?,
-        &MiceStatusText::new("emergency test")?,
-        &DigipeaterPath::empty(),
-    );
+        MiceStatusText::new("emergency test")?,
+    )?
+    .with_message(MiceMessage::Emergency)
+    .to_packet(source, DigipeaterPath::empty());
     let wire = ax25_to_kiss_wire(&packet);
-    let kiss = decode_kiss_frame(&wire)?;
-    let parsed_packet = parse_ax25(&kiss.data)?;
-    let data = parse_aprs_data_full(
+    let kiss = KissFrame::from_bytes(&wire)?;
+    let parsed_packet = Ax25Packet::from_bytes(&kiss.data)?;
+    let data = AprsData::from_bytes_with_destination(
         parsed_packet.information(),
-        &parsed_packet.destination.callsign,
+        parsed_packet.header.destination.callsign.as_str(),
     )?;
     let AprsData::Position(pos) = data else {
         return Err(format!("expected Position, got {data:?}").into());
     };
-    assert_eq!(pos.mice_message, Some(MiceMessage::Emergency));
-    assert!((pos.latitude - 35.25).abs() < 0.05);
-    assert_eq!(pos.speed_knots, Some(30));
-    assert_eq!(pos.course_degrees, Some(180));
+    assert_eq!(pos.mice_message(), Some(MiceMessage::Emergency));
+    assert!((pos.latitude().as_degrees() - 35.25).abs() < 0.05);
+    assert_eq!(pos.speed(), Some(Speed::from_knots(30.0)?));
+    assert_eq!(pos.course(), Some(Course::new(180)?));
     Ok(())
 }
 
@@ -147,14 +137,14 @@ fn real_capture_weather_station() -> TestResult {
         &[],
         b"!3515.00N/09745.00W_090/010g020t072r001p005P010h55b10135",
     )?;
-    let kiss = decode_kiss_frame(&wire)?;
-    let packet = parse_ax25(&kiss.data)?;
-    let data = parse_aprs_data(packet.information())?;
+    let kiss = KissFrame::from_bytes(&wire)?;
+    let packet = Ax25Packet::from_bytes(&kiss.data)?;
+    let data = AprsData::from_bytes(packet.information())?;
     let AprsData::Position(pos) = data else {
         return Err(format!("expected Position, got {data:?}").into());
     };
-    assert_eq!(pos.symbol_code, '_');
-    let wx = pos.weather.ok_or("expected embedded weather")?;
+    assert_eq!(pos.symbol().code_char(), '_');
+    let wx = pos.weather().ok_or("expected embedded weather")?;
     assert_eq!(wx.wind_direction().map(WindDirection::degrees), Some(90));
     assert_eq!(wx.wind_speed().map(ThreeDigitWeatherValue::value), Some(10),);
     assert_eq!(wx.wind_gust().map(ThreeDigitWeatherValue::value), Some(20),);
@@ -175,13 +165,18 @@ fn real_capture_bulletin_message() -> TestResult {
         &[],
         b":BLN1     :Net tonight at 8 PM on 146.52",
     )?;
-    let kiss = decode_kiss_frame(&wire)?;
-    let packet = parse_ax25(&kiss.data)?;
-    let data = parse_aprs_data(packet.information())?;
+    let kiss = KissFrame::from_bytes(&wire)?;
+    let packet = Ax25Packet::from_bytes(&kiss.data)?;
+    let data = AprsData::from_bytes(packet.information())?;
     let AprsData::Message(msg) = data else {
         return Err(format!("expected Message, got {data:?}").into());
     };
-    assert_eq!(msg.kind(), MessageKind::Bulletin { number: 1 });
+    assert_eq!(
+        msg.kind(),
+        MessageKind::Bulletin {
+            number: BulletinNumber::new(1)?
+        }
+    );
     Ok(())
 }
 
@@ -194,15 +189,15 @@ fn real_capture_object_with_timestamp() -> TestResult {
         &[],
         b";EVENT    *092345z3515.00N/09745.00W>Run marathon",
     )?;
-    let kiss = decode_kiss_frame(&wire)?;
-    let packet = parse_ax25(&kiss.data)?;
-    let data = parse_aprs_data(packet.information())?;
+    let kiss = KissFrame::from_bytes(&wire)?;
+    let packet = Ax25Packet::from_bytes(&kiss.data)?;
+    let data = AprsData::from_bytes(packet.information())?;
     let AprsData::Object(obj) = data else {
         return Err(format!("expected Object, got {data:?}").into());
     };
-    assert_eq!(obj.name.as_str(), "EVENT");
-    assert!(obj.live);
-    assert_eq!(obj.timestamp.to_wire_string(), "092345z");
+    assert_eq!(obj.name().as_str(), "EVENT");
+    assert!(obj.state().is_live());
+    assert_eq!(obj.timestamp().to_wire_string(), "092345z");
     Ok(())
 }
 
@@ -214,15 +209,15 @@ fn real_capture_telemetry() -> TestResult {
         &[],
         b"T#042,123,456,789,012,345,10101010",
     )?;
-    let kiss = decode_kiss_frame(&wire)?;
-    let packet = parse_ax25(&kiss.data)?;
-    let data = parse_aprs_data(packet.information())?;
+    let kiss = KissFrame::from_bytes(&wire)?;
+    let packet = Ax25Packet::from_bytes(&kiss.data)?;
+    let data = AprsData::from_bytes(packet.information())?;
     let AprsData::Telemetry(t) = data else {
         return Err(format!("expected Telemetry, got {data:?}").into());
     };
-    assert_eq!(t.sequence.to_string(), "042");
-    assert_eq!(t.analog.first().ok_or("analog[0] missing")?.value(), 123);
-    assert_eq!(t.digital, 0b1010_1010);
+    assert_eq!(t.sequence().to_string(), "042");
+    assert_eq!(t.analog().first().ok_or("analog[0] missing")?.value(), 123);
+    assert_eq!(t.digital().bits(), 0b1010_1010);
     Ok(())
 }
 
@@ -234,9 +229,9 @@ fn real_capture_third_party() -> TestResult {
         &[],
         b"}W1AW>APK005,TCPIP,N0CALL*:!4903.50N/07201.75W-From the internet",
     )?;
-    let kiss = decode_kiss_frame(&wire)?;
-    let packet = parse_ax25(&kiss.data)?;
-    let data = parse_aprs_data(packet.information())?;
+    let kiss = KissFrame::from_bytes(&wire)?;
+    let packet = Ax25Packet::from_bytes(&kiss.data)?;
+    let data = AprsData::from_bytes(packet.information())?;
     let AprsData::ThirdParty { header, payload } = data else {
         return Err(format!("expected ThirdParty, got {data:?}").into());
     };
@@ -248,12 +243,12 @@ fn real_capture_third_party() -> TestResult {
 #[test]
 fn real_capture_grid_square() -> TestResult {
     let wire = make_wire_frame("N0CALL", "APK005", &[], b"[EM13qc")?;
-    let kiss = decode_kiss_frame(&wire)?;
-    let packet = parse_ax25(&kiss.data)?;
-    let data = parse_aprs_data(packet.information())?;
+    let kiss = KissFrame::from_bytes(&wire)?;
+    let packet = Ax25Packet::from_bytes(&kiss.data)?;
+    let data = AprsData::from_bytes(packet.information())?;
     let AprsData::Grid(grid) = data else {
         return Err(format!("expected Grid, got {data:?}").into());
     };
-    assert_eq!(grid, "EM13qc");
+    assert_eq!(grid.as_str(), "EM13qc");
     Ok(())
 }

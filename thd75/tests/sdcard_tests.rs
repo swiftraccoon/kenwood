@@ -25,8 +25,7 @@ use kenwood_thd75::sdcard::callsign_list::{
     CallsignEntry, parse_callsign_list, write_callsign_list,
 };
 use kenwood_thd75::sdcard::config::{
-    ConfigFileModel, HEADER_SIZE, MAX_CHANNELS, RadioConfig, make_header, parse_config,
-    write_config,
+    ConfigFileModel, HEADER_SIZE, MAX_CHANNELS, RadioConfig, make_header,
 };
 use kenwood_thd75::sdcard::qso_log::{
     QSO_LOG_HEADER, QsoDateTime, QsoDirection, QsoEntry, QsoFastData, QsoFrequency, QsoMode,
@@ -104,7 +103,7 @@ fn make_synthetic_d75() -> Result<Vec<u8>, BoxErr> {
 #[test]
 fn parse_synthetic_d75_header() -> TestResult {
     let data = make_synthetic_d75()?;
-    let config = parse_config(&data)?;
+    let config = RadioConfig::from_bytes(&data)?;
 
     assert_eq!(config.header().model(), ConfigFileModel::ThD75A);
     assert_eq!(config.header().version_bytes(), [0x95, 0xC4, 0x8F, 0x42]);
@@ -117,7 +116,7 @@ fn parse_d75_rejects_bad_model() -> TestResult {
     let mut data = make_synthetic_d75()?;
     // Overwrite model with something invalid
     write_slice(&mut data, 0, b"Data For TH-D74A")?;
-    let err = parse_config(&data)
+    let err = RadioConfig::from_bytes(&data)
         .err()
         .ok_or("expected InvalidModelIdentifier but got Ok")?;
     assert_eq!(
@@ -132,7 +131,7 @@ fn parse_d75_rejects_bad_model() -> TestResult {
 #[test]
 fn parse_d75_rejects_too_small() -> TestResult {
     let data = vec![0u8; 100];
-    let err = parse_config(&data)
+    let err = RadioConfig::from_bytes(&data)
         .err()
         .ok_or("expected FileTooSmall but got Ok")?;
     assert!(
@@ -145,7 +144,7 @@ fn parse_d75_rejects_too_small() -> TestResult {
 #[test]
 fn d75_all_channels_unused_in_empty_file() -> TestResult {
     let data = make_synthetic_d75()?;
-    let config = parse_config(&data)?;
+    let config = RadioConfig::from_bytes(&data)?;
     for channel in RegularChannel::all() {
         let ch = config.channels().get(channel)?;
         assert!(
@@ -171,7 +170,7 @@ fn d75_channel_with_frequency_is_used() -> TestResult {
     write_slice(&mut data, CH_DATA_OFFSET, &145_000_000u32.to_le_bytes())?;
     write_slice(&mut data, CH_FLAGS_OFFSET, &[0x00, 0x00, 0x00, 0xFF])?;
 
-    let config = parse_config(&data)?;
+    let config = RadioConfig::from_bytes(&data)?;
     let ch0 = config.channels().get(RegularChannel::new(0)?)?;
     assert!(ch0.is_programmed());
     assert_eq!(
@@ -191,7 +190,7 @@ fn d75_channel_name_roundtrip() -> TestResult {
     // Write a name for channel 0 at the name table offset
     write_slice(&mut data, CH_NAME_OFFSET, b"2M RPT")?;
 
-    let config = parse_config(&data)?;
+    let config = RadioConfig::from_bytes(&data)?;
     assert_eq!(
         config
             .channels()
@@ -229,8 +228,8 @@ fn d75_write_roundtrip() -> TestResult {
     let config = RadioConfig::new(header, memory_image)?;
 
     // Write then re-parse
-    let bytes = write_config(&config);
-    let parsed = parse_config(&bytes)?;
+    let bytes = config.to_bytes();
+    let parsed = RadioConfig::from_bytes(&bytes)?;
 
     assert_eq!(parsed.header().model(), ConfigFileModel::ThD75A);
     let ch0 = parsed.channels().get(RegularChannel::new(0)?)?;
@@ -500,7 +499,10 @@ fn error_display_coverage() {
         },
         SdCardError::ChannelParse {
             index: 42,
-            detail: "bad".to_owned(),
+            source: kenwood_thd75::memory::MemoryError::ChannelOutOfRange {
+                channel: 42,
+                max: 41,
+            },
         },
     ];
 

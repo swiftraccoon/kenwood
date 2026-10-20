@@ -49,6 +49,46 @@ pub enum Error {
     #[cfg(feature = "dstar")]
     #[error(transparent)]
     Dstar(#[from] ::mmdvm::dstar::DstarError),
+    /// The selected modem wire-configuration profile is unsupported or invalid.
+    #[cfg(feature = "dstar")]
+    #[error(transparent)]
+    MmdvmConfiguration(#[from] ::mmdvm::ConfigurationError),
+    /// The modem task failed while shutting down, retaining its loss summary.
+    #[cfg(feature = "dstar")]
+    #[error(transparent)]
+    MmdvmShutdown(#[from] ::mmdvm::ShutdownFailure),
+    /// Reclaiming the radio failed after the modem task completed.
+    #[cfg(feature = "dstar")]
+    #[error("recovering the radio after MMDVM shutdown failed: {error}")]
+    MmdvmRecovery {
+        /// Authoritative queued-frame loss and retained unread events.
+        summary: ::mmdvm::ShutdownSummary,
+        /// Transport reclamation or mode-exit failure.
+        #[source]
+        error: Box<Self>,
+    },
+    /// D-STAR startup failed, with its independent shutdown/restoration outcome.
+    #[cfg(feature = "dstar")]
+    #[error("D-STAR startup failed: {initialization}; cleanup failure: {cleanup:?}")]
+    DstarStartup {
+        /// Typed initialization failure.
+        #[source]
+        initialization: Box<Self>,
+        /// Independent cleanup failure, when cleanup did not complete.
+        cleanup: Option<Box<Self>>,
+        /// Completed modem shutdown observations, when available.
+        shutdown: Option<::mmdvm::ShutdownSummary>,
+    },
+    /// A failed modem pump was followed by an independent reopen failure.
+    #[cfg(feature = "dstar")]
+    #[error("MMDVM pump failed ({pump}); reopening the transport failed ({reopen})")]
+    MmdvmPumpRecovery {
+        /// Original pump failure.
+        pump: std::io::Error,
+        /// Independent reopen failure.
+        #[source]
+        reopen: TransportError,
+    },
     /// A transport-layer (serial/Bluetooth) error occurred.
     #[error(transparent)]
     Transport(#[from] TransportError),
@@ -66,6 +106,27 @@ pub enum Error {
     #[error(transparent)]
     Kiss(#[from] kiss_tnc::KissError),
 
+    /// A KISS Return command requires consuming the session through `exit`.
+    #[cfg(feature = "aprs")]
+    #[error("use the consuming KISS exit operation for the Return command")]
+    KissReturnRequiresExit,
+
+    /// A KISS write failed, timed out, or was cancelled after submission began.
+    #[cfg(feature = "aprs")]
+    #[error("KISS write boundary is uncertain; consume the session and recover CAT framing")]
+    KissWriteAmbiguous,
+
+    /// Configuring KISS parameters failed and the consuming exit also failed.
+    #[cfg(feature = "aprs")]
+    #[error("KISS configuration failed ({configuration}); exit failed ({cleanup})")]
+    KissStartupCleanup {
+        /// Original parameter-write failure.
+        configuration: Box<Self>,
+        /// Independent exit failure.
+        #[source]
+        cleanup: Box<Self>,
+    },
+
     /// An APRS-IS packet line was malformed or used noncanonical AX.25
     /// identities.
     #[cfg(feature = "aprs")]
@@ -75,6 +136,12 @@ pub enum Error {
     /// An APRS information field was malformed for its declared data type.
     #[error(transparent)]
     AprsPacket(#[from] aprs::AprsError),
+
+    /// An automatic message response cannot use the received sender as a
+    /// direct-message destination.
+    #[cfg(feature = "aprs")]
+    #[error(transparent)]
+    AprsMessageValue(#[from] aprs::MessageValueError),
 
     /// The APRS client was constructed receive-only and cannot transmit.
     #[cfg(feature = "aprs")]
@@ -186,6 +253,22 @@ pub enum Error {
          call Radio::recover_cat before sending another command"
     )]
     CatRecoveryRequired,
+
+    /// A complete AE response differs from the first identity observed by this
+    /// radio handle. Ordinary CAT commands remain blocked; the original
+    /// identity is retained for subsequent recovery attempts.
+    #[error("radio identity changed: expected {expected:?}, observed {actual:?}")]
+    RadioIdentityMismatch {
+        /// Original checked serial number and model code.
+        expected: Box<crate::types::SerialInformation>,
+        /// Different checked serial number or model code just received.
+        actual: Box<crate::types::SerialInformation>,
+    },
+
+    /// Cached AI/GPS restoration requires an AE identity observed before the
+    /// connection was reopened. No cached-state write was sent.
+    #[error("cached streaming state cannot be restored without a previously observed AE identity")]
+    RecoveryIdentityRequired,
 
     /// A caller attempted to wrap a CAT-ready transport as a binary session
     /// before a mode transition or a binary link diagnosis completed on it.
@@ -309,12 +392,12 @@ pub enum Error {
 
     /// MCP cleanup failed and normal CAT operation is unconfirmed.
     ///
-    /// The radio may still be in programming mode, or its USB reset may not
-    /// have completed. Retrying MCP or sending CAT commands is unsafe until
-    /// the radio has been fully power-cycled.
+    /// The retained cause distinguishes an unresolved binary boundary,
+    /// transport failure, and a different AE identity. Ordinary CAT and new
+    /// MCP operations remain blocked until the required recovery succeeds.
     #[error(
         "MCP cleanup failed: {cleanup}; normal CAT restoration is unconfirmed; \
-         fully power-cycle the radio before retrying"
+         resolve the reported recovery failure before retrying"
     )]
     McpCleanupNotProved {
         /// The cleanup or reconnect failure.
@@ -325,8 +408,8 @@ pub enum Error {
     /// Both an MCP operation and its cleanup failed.
     ///
     /// Both errors are retained for diagnosis. When `cleanup` contains
-    /// [`Error::McpCleanupNotProved`], the radio's current mode is unknown
-    /// and that nested error carries the required power-cycle guidance.
+    /// [`Error::McpCleanupNotProved`], normal CAT remains unconfirmed and its
+    /// nested cause identifies the required recovery.
     #[error("MCP operation failed: {operation}; cleanup also failed: {cleanup}")]
     McpOperationAndCleanupFailed {
         /// The original transfer, entry, or write failure.
@@ -399,10 +482,11 @@ pub enum Error {
     )]
     AutomationNotQualified,
 
-    /// A strict GM exchange failed or was cancelled after it may have put bytes
-    /// in flight. Only reopening the transport can exclude a delayed tail.
+    /// A strict GM or recovery identity exchange failed or was cancelled after
+    /// it may have put bytes in flight. Reopening and completing the required
+    /// identity checks excludes a delayed tail before ordinary commands resume.
     #[error(
-        "the GM memory-read stream is poisoned by an incomplete strict exchange; \
+        "the CAT stream is poisoned by an incomplete strict memory or recovery identity exchange; \
          call Radio::recover_cat before sending any more commands"
     )]
     MemoryReadStreamPoisoned,
@@ -444,6 +528,14 @@ pub enum Error {
         /// Tuning mode that band reported.
         current: crate::types::TuningMode,
     },
+
+    /// An IF-tap snapshot belongs to another radio or a completed session.
+    #[error("IF-tap snapshot does not match this radio's pending restoration")]
+    IfTapSnapshotMismatch,
+
+    /// An earlier IF-tap session still has settings to restore.
+    #[error("restore the pending IF-tap settings before entering another session")]
+    IfTapRestorePending,
 
     /// The USB audio output did not engage as requested.
     #[error(
@@ -506,6 +598,19 @@ pub enum Error {
     #[error(transparent)]
     DetachedMcpPageUpdate(#[from] crate::radio::programming::DetachedMcpPageUpdateError),
 
+    /// A bulk write failed after a page write may have started.
+    ///
+    /// The progress survives wrapping by [`Self::McpOperationAndCleanupFailed`];
+    /// use [`Self::mcp_write_progress`] to inspect it through combined errors.
+    #[error("MCP bulk write failed after {} possible writes ({} verified): {source}", progress.possibly_written_pages().len(), progress.verified_written_pages().len())]
+    McpWriteProgress {
+        /// Ordered potentially changed and read-back-verified pages.
+        progress: crate::radio::programming::McpWriteProgress,
+        /// The original write or verification failure.
+        #[source]
+        source: Box<Self>,
+    },
+
     /// A menu-patch compare-exchange referenced a page absent from the
     /// caller's snapshot, so no expected bytes exist to compare against.
     #[error(
@@ -554,6 +659,19 @@ impl Error {
         match self {
             Self::Transport(_) | Self::Timeout(_) => true,
             #[cfg(feature = "dstar")]
+            Self::MmdvmShutdown(_) | Self::MmdvmPumpRecovery { .. } => true,
+            #[cfg(feature = "dstar")]
+            Self::MmdvmRecovery { error, .. } => error.is_link_lost(),
+            #[cfg(feature = "dstar")]
+            Self::DstarStartup {
+                initialization,
+                cleanup,
+                ..
+            } => {
+                initialization.is_link_lost()
+                    || cleanup.as_ref().is_some_and(|error| error.is_link_lost())
+            }
+            #[cfg(feature = "dstar")]
             Self::Dstar(error) => matches!(
                 error,
                 ::mmdvm::dstar::DstarError::Timeout(_)
@@ -564,6 +682,11 @@ impl Error {
                     )
             ),
             Self::McpCleanupNotProved { cleanup } => cleanup.is_link_lost(),
+            #[cfg(feature = "aprs")]
+            Self::KissStartupCleanup {
+                configuration,
+                cleanup,
+            } => configuration.is_link_lost() || cleanup.is_link_lost(),
             Self::McpOperationAndCleanupFailed { operation, cleanup } => {
                 operation.is_link_lost() || cleanup.is_link_lost()
             }
@@ -573,6 +696,7 @@ impl Error {
             } => in_place.is_link_lost() || reconnect.is_link_lost(),
             Self::McpPageExchange(error) => error.is_link_lost(),
             Self::DetachedMcpPageUpdate(error) => error.is_link_lost(),
+            Self::McpWriteProgress { source, .. } => source.is_link_lost(),
             _ => false,
         }
     }
@@ -597,7 +721,18 @@ impl Error {
             return true;
         }
         match self {
+            #[cfg(feature = "aprs")]
+            Self::KissWriteAmbiguous => true,
+            #[cfg(feature = "dstar")]
+            Self::MmdvmRecovery { error, .. } => error.requires_recovery(),
+            #[cfg(feature = "aprs")]
+            Self::KissStartupCleanup {
+                configuration,
+                cleanup,
+            } => configuration.requires_recovery() || cleanup.requires_recovery(),
             Self::CatRecoveryRequired
+            | Self::RadioIdentityMismatch { .. }
+            | Self::RecoveryIdentityRequired
             | Self::MemoryReadStreamPoisoned
             | Self::McpInterrupted
             | Self::McpWireBoundaryUnproved
@@ -607,7 +742,18 @@ impl Error {
             | Self::CatRestorationFailed { .. } => true,
             Self::McpPageExchange(error) => error.requires_recovery(),
             Self::DetachedMcpPageUpdate(error) => error.requires_recovery(),
+            Self::McpWriteProgress { source, .. } => source.requires_recovery(),
             _ => false,
+        }
+    }
+
+    /// Ordered bulk-write progress, including through a combined cleanup error.
+    #[must_use]
+    pub fn mcp_write_progress(&self) -> Option<&crate::radio::programming::McpWriteProgress> {
+        match self {
+            Self::McpWriteProgress { progress, .. } => Some(progress),
+            Self::McpOperationAndCleanupFailed { operation, .. } => operation.mcp_write_progress(),
+            _ => None,
         }
     }
 }
@@ -707,6 +853,18 @@ pub enum ProtocolError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ValidationError {
+    /// Digital voice/repeater modes cannot produce the requested analog tap.
+    #[error("IF tap requires an analog operating mode, got {mode}")]
+    IfTapDigitalMode {
+        /// Rejected digital operating mode.
+        mode: crate::types::OperatingMode,
+    },
+    /// A duration cannot form an absolute deadline on this platform.
+    #[error("duration {duration:?} cannot be represented as an absolute deadline")]
+    UnrepresentableDuration {
+        /// Requested duration.
+        duration: Duration,
+    },
     /// An Internet-to-RF `IGate` eligibility period is zero or exceeds a
     /// protocol-defined maximum.
     #[error("invalid Internet-to-RF IGate {field} period {value:?}: {detail}")]
@@ -1406,8 +1564,8 @@ mod tests {
         }
         for error in [
             ShellError::Nak {
-                command: 2,
-                reason: mmdvm_core::NakReason::BufferFull,
+                command: mmdvm_core::Command::SET_CONFIG,
+                reason: mmdvm_core::NakReason::QueueOrStateRejected,
             },
             ShellError::ResponseTimeout,
             ShellError::BufferFull {

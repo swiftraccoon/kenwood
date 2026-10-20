@@ -84,13 +84,16 @@ async fn write_failure_marks_link_down() -> TestResult {
 #[tokio::test]
 async fn reconnect_restores_auto_info_only_if_enabled() -> TestResult {
     let mut mock = MockTransport::new();
+    mock.expect(b"AE\r", b"AE SYN00001,K01\r");
     mock.expect(b"AI 1\r", b"AI 1\r");
     mock.expect_reopen(Ok(()));
     expect_identify(&mut mock);
+    mock.expect(b"AE\r", b"AE SYN00001,K01\r");
     // Restored exactly once after identify.
     mock.expect(b"AI 1\r", b"AI 1\r");
 
     let mut radio = Radio::new(mock);
+    let _identity = radio.get_serial_information().await?;
     radio.set_auto_info(true).await?;
     radio.reconnect().await?;
     Ok(())
@@ -142,13 +145,18 @@ async fn reconnect_invalidates_and_requalifies_azimuth_firmware_profile() -> Tes
 #[tokio::test]
 async fn reconnect_restores_gps_settings() -> TestResult {
     let mut mock = MockTransport::new();
+    mock.expect(b"AE\r", b"AE SYN00001,K01\r");
     mock.expect(b"GP 1,1\r", b"GP 1,1\r");
     mock.expect_reopen(Ok(()));
     expect_identify(&mut mock);
+    mock.expect(b"AE\r", b"AE SYN00001,K01\r");
     mock.expect(b"GP 1,1\r", b"GP 1,1\r");
 
     let mut radio = Radio::new(mock);
-    radio.set_gps_settings(GpsSettings::new(true, true)).await?;
+    let _identity = radio.get_serial_information().await?;
+    radio
+        .set_gps_settings(GpsSettings::new().with_enabled(true).with_pc_output(true))
+        .await?;
     radio.reconnect().await?;
     Ok(())
 }

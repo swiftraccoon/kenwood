@@ -139,9 +139,7 @@ async fn run_captures(
         capture(idx, "if_tap.wav")?;
     }
 
-    let radio = session.radio();
-    radio.set_usb_audio_output(UsbAudioOutput::Detect).await?;
-    let now = radio.get_usb_audio_output().await?;
+    let now = session.set_output(UsbAudioOutput::Detect).await?;
     if matches!(now, UsbAudioOutput::Detect) {
         println!("IO = Detect engaged (readback confirmed)");
         settle().await;
@@ -153,9 +151,7 @@ async fn run_captures(
     }
 
     // AF reference last: drop to the audio path (exit re-forces it anyway).
-    let radio = session.radio();
-    radio.set_usb_audio_output(UsbAudioOutput::Audio).await?;
-    let now = radio.get_usb_audio_output().await?;
+    let now = session.set_output(UsbAudioOutput::Audio).await?;
     if matches!(now, UsbAudioOutput::Audio) {
         settle().await;
         if let Some(idx) = idx {
@@ -200,7 +196,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // applies single-band B / USB / squelch-open, and proves IF engaged.
     // A mid-configure failure rolls the radio back before returning.
     let mut session = match radio
-        .enter_if_tap(IfTapConfig::new(OperatingMode::Usb))
+        .enter_if_tap(IfTapConfig::new(OperatingMode::Usb)?)
         .await
     {
         Ok(session) => session,

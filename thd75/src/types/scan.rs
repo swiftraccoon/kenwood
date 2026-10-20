@@ -52,6 +52,10 @@ impl ScanResumeMethod {
     /// Number of valid scan resume method values (0-2).
     pub const COUNT: u8 = 3;
 
+    /// Every resume method, in ascending MCP raw-value order.
+    pub const ALL: [Self; Self::COUNT as usize] =
+        [Self::TimeOperated, Self::CarrierOperated, Self::Seek];
+
     /// Convert from the MCP setting's numeric value.
     ///
     /// Returns `None` for unrecognized values.
@@ -153,28 +157,16 @@ pub enum VisualRange {
     Wide,
 }
 
-/// Program scan edges: lower and upper frequency limits for program scan.
-///
-/// These correspond to the Programmable VFO settings (Menu No. 100),
-/// which define the lower and upper tunable frequency boundaries.
-/// Program scan sweeps between these two limits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ProgramScanEdge {
-    /// Lower frequency limit.
-    pub start: Frequency,
-    /// Upper frequency limit.
-    pub end: Frequency,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn scan_resume_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
-        for raw in 0..=2 {
+        for (raw, expected) in (0..ScanResumeMethod::COUNT).zip(ScanResumeMethod::ALL) {
             let method = ScanResumeMethod::from_raw(raw).ok_or("valid resume method rejected")?;
             assert_eq!(method.as_raw(), raw);
+            assert_eq!(method, expected);
         }
         Ok(())
     }
@@ -200,16 +192,6 @@ mod tests {
         };
         assert_eq!(range.center.as_hz(), 145_000_000);
         assert_eq!(range.range, VisualRange::Medium);
-    }
-
-    #[test]
-    fn program_scan_edge_construction() {
-        let edge = ProgramScanEdge {
-            start: Frequency::new(144_000_000),
-            end: Frequency::new(148_000_000),
-        };
-        assert_eq!(edge.start.as_hz(), 144_000_000);
-        assert_eq!(edge.end.as_hz(), 148_000_000);
     }
 
     #[test]

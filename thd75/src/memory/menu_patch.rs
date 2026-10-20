@@ -1,7 +1,7 @@
 //! Safe value planning for generated MCP-D75 menu metadata.
 
-use super::{DecodedFieldValue, FieldValue, MenuField, PatchPlanner, SchemaError};
-use kenwood_schema::{ChoiceError, validate_choices};
+use super::{MenuField, PatchPlanner, SchemaError};
+use kenwood_schema::{ChoiceError, DecodedFieldValue, FieldValue, ValueKind, validate_choices};
 
 impl MenuField {
     pub(super) fn validate_patch_value(&self, value: FieldValue<'_>) -> Result<(), SchemaError> {
@@ -13,7 +13,7 @@ impl MenuField {
         .map_err(|error| match error {
             ChoiceError::TypeMismatch { actual } => SchemaError::TypeMismatch {
                 field: self.descriptor.name,
-                expected: "unsigned",
+                expected: ValueKind::Unsigned,
                 actual,
             },
             ChoiceError::DisallowedValue { value } => SchemaError::DisallowedValue {
@@ -32,7 +32,7 @@ impl MenuField {
     /// # Errors
     ///
     /// Returns an error when the field is outside the image, its descriptor is
-    /// malformed, or its stored value is outside the catalog's accepted
+    /// stale, or its stored value is outside the catalog's accepted
     /// domain.
     pub fn read(&self, image: &[u8]) -> Result<DecodedFieldValue, SchemaError> {
         self.descriptor.read(image)
@@ -49,7 +49,7 @@ impl MenuField {
     /// # Errors
     ///
     /// Returns an error when the field is outside the image, its descriptor
-    /// is malformed, or the stored bytes cannot be represented by its codec.
+    /// is stale, or the stored bytes cannot be represented by its codec.
     pub fn read_stored(&self, image: &[u8]) -> Result<DecodedFieldValue, SchemaError> {
         self.descriptor.read_stored(image)
     }
@@ -68,12 +68,12 @@ impl MenuField {
 
     /// Validate and add a value to a masked patch plan.
     ///
-    /// In addition to storage-codec validation, this rejects gap values for
+    /// In addition to storage-value validation, this rejects gap values for
     /// enum domains. Some official MCP-D75 enums are non-contiguous, so their
     /// numeric minimum and maximum alone are not sufficient validation. A
     /// field with a finite enum or UI-choice domain accepts only
     /// [`FieldValue::Unsigned`]; every other value kind is rejected before
-    /// codec validation, so the domain gate cannot be bypassed by a
+    /// storage encoding, so the domain gate cannot be bypassed by a
     /// mismatched value variant.
     ///
     /// # Errors
@@ -96,6 +96,8 @@ impl MenuField {
 
 #[cfg(test)]
 mod tests {
+    use kenwood_schema::{CodecSpec, FieldCodec};
+
     use super::*;
     use crate::memory::menu_field;
 
@@ -248,7 +250,7 @@ mod tests {
             matches!(
                 result,
                 Err(SchemaError::TypeMismatch {
-                    expected: "unsigned",
+                    expected: ValueKind::Unsigned,
                     ..
                 })
             ),
@@ -288,26 +290,36 @@ mod tests {
     }
 
     #[test]
-    fn catalog_name_with_mismatched_descriptor_is_rejected() -> Result<(), &'static str> {
+    fn catalog_name_with_mismatched_descriptor_is_rejected()
+    -> Result<(), Box<dyn std::error::Error>> {
         let field = gapped_field()?;
-        let stale = super::super::FieldDescriptor::new(
+        let stale_offset = super::super::FieldDescriptor::new(
             field.descriptor.name,
             field.descriptor.offset + 1,
             field.descriptor.codec,
         );
-        let mut planner = PatchPlanner::new();
-        assert!(
-            matches!(
-                planner.set(&stale, FieldValue::Unsigned(2)),
-                Err(SchemaError::CatalogDescriptorMismatch {
-                    field: "radio.AutoWeatherScan",
-                    offset,
-                    expected_offset,
-                }) if offset == field.descriptor.offset + 1
-                    && expected_offset == field.descriptor.offset
-            ),
-            "a catalog name with stale descriptor metadata must fail closed"
+        let stale_codec = super::super::FieldDescriptor::new(
+            field.descriptor.name,
+            field.descriptor.offset,
+            FieldCodec::new(CodecSpec::Byte {
+                min: 0,
+                max: u8::MAX,
+            })?,
         );
+        for stale in [stale_offset, stale_codec] {
+            let mut planner = PatchPlanner::new();
+            assert!(
+                matches!(
+                    planner.set(&stale, FieldValue::Unsigned(2)),
+                    Err(SchemaError::CatalogDescriptorMismatch {
+                        field: "radio.AutoWeatherScan",
+                        offset,
+                        expected_offset,
+                    }) if offset == stale.offset && expected_offset == field.descriptor.offset
+                ),
+                "a catalog name with stale descriptor metadata must fail closed"
+            );
+        }
         Ok(())
     }
 }

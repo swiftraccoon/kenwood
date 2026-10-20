@@ -8,10 +8,10 @@
 //! delay range, and [`ReconnectAttemptLimit`] makes a zero-attempt recovery run
 //! impossible to construct.
 
-mod policy;
-mod recovery;
-
 pub use policy::{ReconnectPolicy, ReconnectPolicyError};
 pub use recovery::{
     LinkEvent, RadioLinkRecovery, ReconnectAttemptLimit, ReconnectAttemptLimitError,
 };
+
+mod policy;
+mod recovery;

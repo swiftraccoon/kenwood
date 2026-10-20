@@ -1,16 +1,10 @@
-//! Connection diagnostics: explaining *why* a link is not carrying CAT.
+//! Connection diagnostics for observed CAT and MMDVM framing.
 //!
-//! When a freshly-opened transport accepts bytes but the radio never
-//! answers a CAT command, the link is physically fine yet logically
-//! unusable. The TH-D75 does this whenever it is in a DV Gateway mode
-//! (Reflector Terminal or Access Point): the firmware swaps its CAT
-//! command parser for the MMDVM data protocol, so `ID\r` and every
-//! other CAT command is silently ignored.
-//!
-//! [`Radio::probe_silent_link`] tells the cases apart by probing with an
-//! MMDVM frame rather than guessing from a CAT timeout. A reply to an
-//! MMDVM `GET_VERSION` is positive proof of MMDVM mode, whereas a CAT
-//! timeout alone cannot distinguish "wrong mode" from "dead cable".
+//! [`Radio::probe_silent_link`] sends a bounded MMDVM version query after a
+//! failed CAT command. A complete reply establishes MMDVM framing on that
+//! connection. Both persistent DV Gateway operation and transient `TN 3,x`
+//! operation use that framing; the active session determines the exit path.
+//! An unanswered probe records an unresponsive connection with an unknown cause.
 
 use std::time::Duration;
 
@@ -19,8 +13,7 @@ use kenwood_transport::Transport;
 
 use super::{BinaryProtocolProof, CatState, LinkState, McpPhase, Radio};
 
-/// How long to wait for an MMDVM reply before concluding the link is
-/// unresponsive. MMDVM answers in roughly 20 ms; this is generous.
+/// Overall write-and-reply budget for one read-only MMDVM version probe.
 const MMDVM_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Why a TH-D75 link is not carrying CAT control traffic.
@@ -29,19 +22,15 @@ const MMDVM_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// only after a CAT command has already failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkDiagnosis {
-    /// A strict GM memory-read or MCP exchange remains unresolved. No
+    /// A strict memory-read, recovery identity, or MCP exchange remains unresolved. No
     /// diagnostic probe was sent because only the operation-specific recovery
     /// can establish a clean stream.
     ReconnectRequired,
-    /// The radio answered an MMDVM probe: it is in a DV Gateway mode
-    /// (Reflector Terminal or Access Point) and speaks the MMDVM data
-    /// protocol over this link, so CAT control is unavailable until
-    /// DV Gateway mode is switched off on the radio.
+    /// A complete MMDVM version frame arrived on this connection.
     MmdvmMode,
     /// The radio answered neither CAT nor an MMDVM probe. The transport
-    /// opened, but nothing the library recognises replied: typically a
-    /// cabling or power problem, the wrong serial device, another
-    /// program holding the port, or KISS routing pointed elsewhere.
+    /// opened, but the probe failed or no recognized reply arrived within its
+    /// deadline. The debug log retains the probe error.
     Unresponsive,
 }
 
@@ -55,19 +44,16 @@ impl LinkDiagnosis {
         match self {
             Self::ReconnectRequired => {
                 "\
-An incomplete GM memory-read or MCP exchange left the command stream untrusted.\n\
+An incomplete memory-read, recovery identity, or MCP exchange left the command stream untrusted.\n\
 \n\
 Reconnect the transport before sending any more commands."
             }
             Self::MmdvmMode => {
                 "\
-The radio is in Reflector Terminal / DV Gateway Mode: it is speaking\n\
-the MMDVM data protocol over this link, so CAT control commands are\n\
-ignored.\n\
+The connection returned an MMDVM version reply.\n\
 \n\
-To restore CAT control, on the radio:\n\
-  - Open Menu No. 650 (DV Gateway) and select [Off].\n\
-  - The green \"TERM\" indicator clears once it is off."
+Exit the active binary session, then reconnect and identify the radio.\n\
+If Menu No. 650 enables DV Gateway, select [Off] before reconnecting."
             }
             Self::Unresponsive => {
                 "\
@@ -154,7 +140,8 @@ impl<T: Transport> Radio<T> {
     /// # Errors
     ///
     /// Returns the unresolved GM or MCP error without touching the transport,
-    /// or a transport error when reopening the same identity fails.
+    /// or the transport-close error without reopening. A failed reopen returns
+    /// its transport error. CAT stays blocked after either transport failure.
     pub async fn reopen_for_link_diagnosis(&mut self) -> Result<(), crate::Error> {
         self.require_unpoisoned_gm_stream()?;
         if self.mcp_phase != McpPhase::Inactive
@@ -173,9 +160,7 @@ impl<T: Transport> Radio<T> {
         self.tuning_mode_b = None;
         let _previous = self.link_state_tx.send_replace(LinkState::Down);
 
-        if let Err(error) = self.close_transport().await {
-            tracing::debug!(%error, "close before diagnostic reopen failed");
-        }
+        self.close_transport().await?;
         self.transport
             .reopen()
             .await
@@ -194,6 +179,69 @@ mod tests {
     const MMDVM_GET_VERSION_PROBE: [u8; 3] = [0xE0, 0x03, 0x00];
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[derive(Debug, Default)]
+    struct FailedClose {
+        closes: usize,
+        reopens: usize,
+        other_io: usize,
+    }
+
+    impl Transport for FailedClose {
+        async fn write(&mut self, _data: &[u8]) -> Result<(), kenwood_transport::TransportError> {
+            self.other_io += 1;
+            Err(kenwood_transport::TransportError::Disconnected(
+                std::io::Error::other("unexpected write"),
+            ))
+        }
+
+        async fn read(
+            &mut self,
+            _data: &mut [u8],
+        ) -> Result<usize, kenwood_transport::TransportError> {
+            self.other_io += 1;
+            Err(kenwood_transport::TransportError::Disconnected(
+                std::io::Error::other("unexpected read"),
+            ))
+        }
+
+        async fn close(&mut self) -> Result<(), kenwood_transport::TransportError> {
+            self.closes += 1;
+            Err(kenwood_transport::TransportError::Disconnected(
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected close failure",
+                ),
+            ))
+        }
+
+        async fn reopen(&mut self) -> Result<(), kenwood_transport::TransportError> {
+            self.reopens += 1;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnostic_reopen_returns_close_failure_without_reopening() {
+        let mut radio = Radio::new(FailedClose::default());
+        let result = radio.reopen_for_link_diagnosis().await;
+        assert!(
+            matches!(result, Err(crate::Error::Transport(kenwood_transport::TransportError::Disconnected(ref source)))
+            if source.kind() == std::io::ErrorKind::PermissionDenied),
+            "{result:?}"
+        );
+        assert!(matches!(
+            radio.require_cat_ready(),
+            Err(crate::Error::CatRecoveryRequired)
+        ));
+        let transport = &radio.transport;
+        assert_eq!(transport.closes, 1);
+        assert_eq!(
+            transport.reopens, 0,
+            "a failed close must not authorize another open"
+        );
+        assert_eq!(transport.other_io, 0);
+    }
 
     #[tokio::test]
     async fn probe_silent_link_detects_mmdvm_mode() -> TestResult {
@@ -322,7 +370,11 @@ mod tests {
         mock.expect_hang(b"ID\r");
         mock.expect_reads(
             &MMDVM_GET_VERSION_PROBE,
-            &[b"\xE0", b"\x0E\x00\x01MMD", b"VM 2018"],
+            [
+                b"\xE0".to_vec(),
+                b"\x0E\x00\x01MMD".to_vec(),
+                b"VM 2018".to_vec(),
+            ],
         );
         let mut radio = Radio::new(mock);
 

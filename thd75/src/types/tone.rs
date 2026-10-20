@@ -19,6 +19,10 @@
 
 use crate::error::ValidationError;
 
+integer_radix_formats!(ToneCode, as_raw);
+integer_radix_formats!(CtcssCode, as_raw);
+integer_radix_formats!(DcsCode, as_raw);
+
 /// CTCSS (Continuous Tone-Coded Squelch System) frequency table.
 ///
 /// 51 entries: 50 sub-audible CTCSS tone frequencies (indices 0-49) plus

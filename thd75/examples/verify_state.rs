@@ -70,7 +70,7 @@ use kenwood_thd75::Radio;
 use kenwood_thd75::radio::memory_read::MemoryReader;
 use kenwood_thd75::transport::SerialTransport;
 use kenwood_thd75::types::{MemoryReadOffset, MemoryReadTarget, ReadLen};
-use kenwood_thd75::verify::{ByteChange, RuntimeOffsetMap};
+use kenwood_thd75::verify::{ByteChange, OffsetMapping, RuntimeOffsetMap};
 
 type Failure = Box<dyn std::error::Error>;
 
@@ -360,7 +360,7 @@ async fn mode_discover(
         }
         let mut map = RuntimeOffsetMap::default();
         let offsets: Vec<MemoryReadOffset> = changes.iter().map(|c| c.offset).collect();
-        map.record("discovered", &offsets);
+        map.record(OffsetMapping::new("discovered", offsets)?);
         println!(
             "\nRecord this in a runtime offset map as:\n{}",
             map.to_text()

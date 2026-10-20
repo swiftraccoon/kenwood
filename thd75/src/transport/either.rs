@@ -1,5 +1,7 @@
 //! Enum transport that dispatches to either Serial, Bluetooth, or Mock.
 
+use std::num::NonZeroU32;
+
 use crate::transport::serial::SerialTransport;
 use kenwood_transport::{MockTransport, Transport, TransportError};
 
@@ -20,7 +22,7 @@ pub enum EitherTransport {
 }
 
 impl Transport for EitherTransport {
-    fn set_baud_rate(&mut self, baud: u32) -> Result<(), TransportError> {
+    fn set_baud_rate(&mut self, baud: NonZeroU32) -> Result<(), TransportError> {
         match self {
             Self::Serial(s) => s.set_baud_rate(baud),
             #[cfg(target_os = "macos")]

@@ -96,6 +96,7 @@ use aprs_is as _;
 use ax25_codec as _;
 use dstar_gateway_core as _;
 use encoding_rs as _;
+#[cfg(not(target_os = "macos"))]
 use kenwood_schema as _;
 #[cfg(not(target_os = "macos"))]
 use kenwood_transport as _;
@@ -118,16 +119,17 @@ mod macos {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+    use kenwood_schema::DecodedFieldValue;
     use kenwood_thd75::Radio;
     use kenwood_thd75::memory::{
-        DecodedFieldValue, FieldCodec, MCP_D75_MENU_FIELDS, MCP_D75_SCHEMA_FIRMWARE,
-        MCP_D75_SCHEMA_MODEL, MCP_D75_SCHEMA_VERSION, MCP_D75_SOURCE_SHA256, MenuField, menu_field,
+        MCP_D75_MENU_FIELDS, MCP_D75_SCHEMA_FIRMWARE, MCP_D75_SCHEMA_MODEL, MCP_D75_SCHEMA_VERSION,
+        MCP_D75_SOURCE_SHA256, menu_field,
     };
     use kenwood_thd75::protocol::programming;
     use kenwood_thd75::radio::automation::{
         AutomationMetadata, AutomationSession, AutomationSnapshot, FrontPanelKey,
         GUARDED_ROUTE_MAX_DURATION, GUARDED_SNAPSHOT_MAX_AGE, GuardedDecimalRoute,
-        GuardedDecimalRouteOutcome, GuardedKeyOutcome, GuardedKeyResult,
+        GuardedDecimalRouteOutcome, GuardedKeyOutcome, GuardedKeyOutcomeKind, GuardedKeyResult,
     };
     use kenwood_thd75::radio::programming::{McpPage, McpPageExchange, WritableMcpPage};
     use kenwood_thd75::screen::SCREEN_WIDTH;
@@ -1611,10 +1613,10 @@ mod macos {
             "first_cat_or_mcp_operation": false,
             "elapsed_ms": millis(qualification_started.elapsed()),
             "abi": {
-                "version": session.abi().version,
-                "features": session.abi().features,
-                "max_key": session.abi().max_key,
-                "max_phase": session.abi().max_phase,
+                "version": session.abi().version(),
+                "features": session.abi().features(),
+                "max_key": session.abi().max_key(),
+                "max_phase": session.abi().max_phase(),
             },
         }))?;
         let observed = normalize_to_home(&mut session, output_dir, journal).await?;
@@ -2118,10 +2120,10 @@ mod macos {
                 "first_cat_or_mcp_operation": true,
                 "elapsed_ms": millis(qualification_started.elapsed()),
                 "abi": {
-                    "version": abi.version,
-                    "features": abi.features,
-                    "max_key": abi.max_key,
-                    "max_phase": abi.max_phase,
+                    "version": abi.version(),
+                    "features": abi.features(),
+                    "max_key": abi.max_key(),
+                    "max_phase": abi.max_phase(),
                 },
             }))?;
 
@@ -2408,10 +2410,10 @@ mod macos {
                                 "missing_snapshot_canary_repeated": false,
                                 "elapsed_ms": millis(qualification_started.elapsed()),
                                 "abi": {
-                                    "version": abi.version,
-                                    "features": abi.features,
-                                    "max_key": abi.max_key,
-                                    "max_phase": abi.max_phase,
+                                    "version": abi.version(),
+                                    "features": abi.features(),
+                                    "max_key": abi.max_key(),
+                                    "max_phase": abi.max_phase(),
                                 },
                             }))?;
                             let baseline =
@@ -2775,10 +2777,10 @@ mod macos {
                 "first_cat_or_mcp_operation": false,
                 "elapsed_ms": millis(qualification_started.elapsed()),
                 "abi": {
-                    "version": session.abi().version,
-                    "features": session.abi().features,
-                    "max_key": session.abi().max_key,
-                    "max_phase": session.abi().max_phase,
+                    "version": session.abi().version(),
+                    "features": session.abi().features(),
+                    "max_key": session.abi().max_key(),
+                    "max_phase": session.abi().max_phase(),
                 },
             }))?;
             let final_home = normalize_to_home(&mut session, output_dir, journal).await?;
@@ -2865,28 +2867,30 @@ mod macos {
         expected_key: FrontPanelKey,
         scenario: &str,
     ) -> AuditResult<()> {
-        let GuardedKeyOutcome::ContextChanged { metadata, receipts } = outcome else {
+        if outcome.kind() != GuardedKeyOutcomeKind::ContextChanged {
             return Err(io::Error::other(format!(
                 "V1.03.AZM {scenario} canary did not return an authenticated context refusal"
             ))
             .into());
-        };
-        let [receipt] = receipts.as_slice() else {
+        }
+        let metadata = outcome.metadata();
+        let receipts = outcome.receipts();
+        let [receipt] = receipts else {
             return Err(io::Error::other(format!(
                 "V1.03.AZM {scenario} canary returned {} receipts instead of exactly one",
                 receipts.len()
             ))
             .into());
         };
-        if receipt.key != expected_key
-            || receipt.result != GuardedKeyResult::ContextChanged
-            || receipt.release_sequence.is_some()
-            || receipt.command_count != metadata.command_count
-            || receipt.seqlock != metadata.seqlock
-            || metadata.last_command != 3
-            || metadata.last_key_result != 2
-            || metadata.last_key != u32::from(expected_key.as_raw())
-            || metadata.last_phase != 0
+        if receipt.key() != expected_key
+            || receipt.result() != GuardedKeyResult::ContextChanged
+            || receipt.release_sequence().is_some()
+            || receipt.command_count() != metadata.command_count()
+            || receipt.seqlock() != metadata.seqlock()
+            || metadata.last_command() != 3
+            || metadata.last_key_result() != 2
+            || metadata.last_key() != u32::from(expected_key.as_raw())
+            || metadata.last_phase() != 0
         {
             return Err(io::Error::other(format!(
                 "V1.03.AZM {scenario} canary did not prove status 02, command 3/result 2, one refused press, and no release"
@@ -2905,11 +2909,13 @@ mod macos {
         outcome: &GuardedKeyOutcome,
         screen_evidence: &Value,
     ) -> AuditResult<()> {
-        let GuardedKeyOutcome::ContextChanged { metadata, receipts } = outcome else {
+        if outcome.kind() != GuardedKeyOutcomeKind::ContextChanged {
             return Err(
                 io::Error::other("only a validated guarded refusal may be journaled").into(),
             );
-        };
+        }
+        let metadata = outcome.metadata();
+        let receipts = outcome.receipts();
         let receipt = receipts.first().ok_or_else(|| {
             io::Error::other("guarded refusal journal requires exactly one receipt")
         })?;
@@ -2922,8 +2928,8 @@ mod macos {
             "wire_reply_status": "02-exact-echo-authenticated",
             "firmware_command": 3,
             "firmware_result": 2,
-            "press_sequence": receipt.press_sequence,
-            "release_sequence": receipt.release_sequence,
+            "press_sequence": receipt.press_sequence(),
+            "release_sequence": receipt.release_sequence(),
             "dispatch": "refused-before-input_dispatch",
             "elapsed_ms": millis(elapsed),
             "metadata": metadata_json(metadata),
@@ -2970,7 +2976,9 @@ mod macos {
         // artifact output, and journal I/O all occurred against `menu_gate`;
         // none occurs between this raw capture and the guarded transaction.
         let frozen_menu = session.capture_screen().await?;
-        if frozen_menu.frame != menu_gate.frame || frozen_menu.metadata.crc32 != menu_gate.crc32 {
+        if frozen_menu.frame() != &menu_gate.frame
+            || frozen_menu.metadata().crc32() != menu_gate.crc32
+        {
             return Err(io::Error::other(
                 "V1.03.AZM changed-context canary snapshot no longer matches the qualified top-level Menu frame",
             )
@@ -3171,7 +3179,9 @@ mod macos {
         // Refresh only after all OCR and journal work so no filesystem I/O
         // consumes the short guarded-route lease.
         let frozen_menu = session.capture_screen().await?;
-        if frozen_menu.frame != menu_gate.frame || frozen_menu.metadata.crc32 != menu_gate.crc32 {
+        if frozen_menu.frame() != &menu_gate.frame
+            || frozen_menu.metadata().crc32() != menu_gate.crc32
+        {
             return Err(io::Error::other(
                 "V1.03.AZM command-4 refusal snapshot no longer matches the qualified top-level Menu frame",
             )
@@ -3181,20 +3191,21 @@ mod macos {
         let outcome = session
             .verify_decimal_route_changed_context_refusal(&frozen_menu, FrontPanelKey::Menu, route)
             .await?;
-        let GuardedDecimalRouteOutcome::ContextChanged(receipt) = &outcome else {
+        if outcome.result() != GuardedKeyResult::ContextChanged {
             return Err(io::Error::other(
                 "V1.03.AZM command-4 canary did not return an authenticated context refusal",
             )
             .into());
-        };
-        if receipt.route != route
-            || receipt.guard_count != 1
-            || receipt.completed_taps != 0
-            || receipt.event_mask != 0
-            || receipt.metadata.last_command != 4
-            || receipt.metadata.last_key_result != 2
-            || receipt.metadata.last_key != u32::from(FrontPanelKey::Pf1_9.as_raw())
-            || receipt.metadata.last_phase != 0
+        }
+        let receipt = outcome.receipt();
+        if receipt.route() != route
+            || receipt.guard_count() != 1
+            || receipt.completed_taps() != 0
+            || receipt.event_mask() != 0
+            || receipt.metadata().last_command() != 4
+            || receipt.metadata().last_key_result() != 2
+            || receipt.metadata().last_key() != u32::from(FrontPanelKey::Pf1_9.as_raw())
+            || receipt.metadata().last_phase() != 0
         {
             return Err(io::Error::other(
                 "V1.03.AZM command-4 refusal receipt was not the exact zero-prefix contract",
@@ -3206,16 +3217,16 @@ mod macos {
             "scenario": "command-4-zero-prefix-context-refusal",
             "wire_reply_status": "02-exact-echo-authenticated",
             "firmware_command": 4,
-            "route": receipt.route.to_string(),
-            "sequence": receipt.sequence,
-            "guard_count": receipt.guard_count,
-            "completed_taps": receipt.completed_taps,
-            "event_mask": format!("{:02X}", receipt.event_mask),
+            "route": receipt.route().to_string(),
+            "sequence": receipt.sequence(),
+            "guard_count": receipt.guard_count(),
+            "completed_taps": receipt.completed_taps(),
+            "event_mask": format!("{:02X}", receipt.event_mask()),
             "first_refused_key": format!("{:?}", FrontPanelKey::Pf1_9),
             "dispatch": "zero-prefix-no-input-event",
             "session_remains_usable": !outcome.requires_recovery(),
             "elapsed_ms": millis(started.elapsed()),
-            "metadata": metadata_json(&receipt.metadata),
+            "metadata": metadata_json(receipt.metadata()),
             "result": "pass",
         }))?;
 
@@ -3563,22 +3574,23 @@ mod macos {
             purpose,
             &evidence,
         )?;
-        match &evidence.outcome {
-            GuardedDecimalRouteOutcome::Dispatched(receipt)
-                if receipt.route == route
-                    && receipt.guard_count == 1
-                    && receipt.completed_taps == 3
-                    && receipt.event_mask == 0x3F =>
+        let receipt = evidence.outcome.receipt();
+        match evidence.outcome.result() {
+            GuardedKeyResult::Dispatched
+                if receipt.route() == route
+                    && receipt.guard_count() == 1
+                    && receipt.completed_taps() == 3
+                    && receipt.event_mask() == 0x3F =>
             {
                 Ok(())
             }
-            GuardedDecimalRouteOutcome::Dispatched(_) => Err(io::Error::other(format!(
+            GuardedKeyResult::Dispatched => Err(io::Error::other(format!(
                 "V1.03.AZM returned a malformed completed receipt for numeric route {dispatched_number}"
             ))
             .into()),
-            GuardedDecimalRouteOutcome::ContextChanged(receipt) => Err(io::Error::other(format!(
+            GuardedKeyResult::ContextChanged => Err(io::Error::other(format!(
                 "V1.03.AZM refused numeric route {dispatched_number} before input with its authenticated zero-prefix receipt (completed taps: {})",
-                receipt.completed_taps
+                receipt.completed_taps()
             ))
             .into()),
             _ => Err(io::Error::other(format!(
@@ -4936,10 +4948,10 @@ mod macos {
             "first_cat_or_mcp_operation": false,
             "elapsed_ms": millis(qualification_started.elapsed()),
             "abi": {
-                "version": abi.version,
-                "features": abi.features,
-                "max_key": abi.max_key,
-                "max_phase": abi.max_phase,
+                "version": abi.version(),
+                "features": abi.features(),
+                "max_key": abi.max_key(),
+                "max_phase": abi.max_phase(),
             },
         }))?;
         normalize_to_home(&mut session, output_dir, journal).await
@@ -4977,10 +4989,10 @@ mod macos {
                 "first_cat_or_mcp_operation": false,
                 "elapsed_ms": millis(qualification_started.elapsed()),
                 "abi": {
-                    "version": session.abi().version,
-                    "features": session.abi().features,
-                    "max_key": session.abi().max_key,
-                    "max_phase": session.abi().max_phase,
+                    "version": session.abi().version(),
+                    "features": session.abi().features(),
+                    "max_key": session.abi().max_key(),
+                    "max_phase": session.abi().max_phase(),
                 },
             }))?;
             restore_startup_single_band_profile(&mut session, output_dir, journal, baseline, phase)
@@ -5076,10 +5088,10 @@ mod macos {
             "first_cat_or_mcp_operation": false,
             "elapsed_ms": millis(qualification_started.elapsed()),
             "abi": {
-                "version": session.abi().version,
-                "features": session.abi().features,
-                "max_key": session.abi().max_key,
-                "max_phase": session.abi().max_phase,
+                "version": session.abi().version(),
+                "features": session.abi().features(),
+                "max_key": session.abi().max_key(),
+                "max_phase": session.abi().max_phase(),
             },
         }))?;
         let recovered = normalize_to_home(&mut session, output_dir, journal).await?;
@@ -5256,7 +5268,8 @@ mod macos {
         let capture_started = Instant::now();
         let snapshot = session.capture_screen().await?;
         let capture_round_trip = capture_started.elapsed();
-        if snapshot.frame != qualified_menu.frame || snapshot.metadata.crc32 != qualified_menu.crc32
+        if snapshot.frame() != &qualified_menu.frame
+            || snapshot.metadata().crc32() != qualified_menu.crc32
         {
             return Err(io::Error::other(
                 "fresh V1.03.AZM numeric-route snapshot does not byte-match the qualified top-level Menu frame; refusing dispatch",
@@ -5280,8 +5293,8 @@ mod macos {
         purpose: &str,
         evidence: &NumericRouteEvidence,
     ) -> AuditResult<()> {
-        let observations = evidence.snapshot.frame.recognize_text()?;
-        let bands = v103_selection_bands(&evidence.snapshot.frame);
+        let observations = evidence.snapshot.frame().recognize_text()?;
+        let bands = v103_selection_bands(evidence.snapshot.frame());
         let selected = selected_text(&observations, &bands)
             .into_iter()
             .map(|observation| observation.text().to_owned())
@@ -5293,7 +5306,7 @@ mod macos {
         let file_name = journal.next_capture_name(&suffix);
         fs::write(
             output_dir.join(&file_name),
-            evidence.snapshot.frame.to_stock_bmp(),
+            evidence.snapshot.frame().to_stock_bmp(),
         )?;
         journal.append(json!({
             "type": "screen-capture",
@@ -5303,7 +5316,7 @@ mod macos {
             "capture_started_unix_ms": evidence.capture_started_unix_ms,
             "capture_elapsed_ms": millis(evidence.capture_round_trip),
             "ocr_timing": "deferred-until-after-guarded-route-outcome",
-            "metadata": metadata_json(&evidence.snapshot.metadata),
+            "metadata": metadata_json(evidence.snapshot.metadata()),
             "selection_bands": bands.iter().map(|band| json!({
                 "top": band.top(),
                 "bottom_exclusive": band.bottom_exclusive(),
@@ -5315,9 +5328,9 @@ mod macos {
             "captured_before-route-and-persisted-after-guarded-outcome": true,
         }))?;
 
-        let (outcome, result) = match &evidence.outcome {
-            GuardedDecimalRouteOutcome::Dispatched(_) => ("dispatched", "pass"),
-            GuardedDecimalRouteOutcome::ContextChanged(_) => {
+        let (outcome, result) = match evidence.outcome.result() {
+            GuardedKeyResult::Dispatched => ("dispatched", "pass"),
+            GuardedKeyResult::ContextChanged => {
                 ("context-changed", "authenticated-zero-prefix-refusal")
             }
             _ => ("unsupported", "fail-closed"),
@@ -5328,10 +5341,10 @@ mod macos {
             "menu_number": evidence_menu_number,
             "dispatched_number": dispatched_number,
             "requested_keys": evidence.requested_keys.iter().map(|key| format!("{key:?}")).collect::<Vec<_>>(),
-            "crc32": format!("{:08X}", evidence.snapshot.metadata.crc32),
-            "generation": evidence.snapshot.metadata.generation,
-            "initial_command_count": evidence.snapshot.metadata.command_count,
-            "initial_seqlock": evidence.snapshot.metadata.seqlock,
+            "crc32": format!("{:08X}", evidence.snapshot.metadata().crc32()),
+            "generation": evidence.snapshot.metadata().generation(),
+            "initial_command_count": evidence.snapshot.metadata().command_count(),
+            "initial_seqlock": evidence.snapshot.metadata().seqlock(),
             "final_metadata": metadata_json(evidence.outcome.metadata()),
             "capture_started_unix_ms": evidence.capture_started_unix_ms,
             "capture_round_trip_ms": millis(evidence.capture_round_trip),
@@ -5341,8 +5354,8 @@ mod macos {
             "context": "byte-identical-to-qualified-top-level-Menu-frame",
             "direct_prefix_parser_state": "firmware-atomic-complete-route-not-host-visible",
             "lease_consumption": "one-snapshot-one-guarded-transaction",
-            "wire_command": format!("GM R{},{:02X}", evidence.route, receipt.sequence),
-            "wire_reply_status": if matches!(&evidence.outcome, GuardedDecimalRouteOutcome::Dispatched(_)) { "00" } else { "02" },
+            "wire_command": format!("GM R{},{:02X}", evidence.route, receipt.sequence()),
+            "wire_reply_status": if evidence.outcome.result() == GuardedKeyResult::Dispatched { "00" } else { "02" },
             "wire_command_count_delta": 1,
             "wire_seqlock_delta": 2,
             "between_digit_host_work": "none-single-firmware-command",
@@ -5352,10 +5365,10 @@ mod macos {
             "context_changed_policy": "exact-zero-prefix-receipt-before-any-route-input-no-retry",
             "session_requires_recovery": evidence.outcome.requires_recovery(),
             "outcome": outcome,
-            "route_sequence": receipt.sequence,
-            "route_guard_count": receipt.guard_count,
-            "route_completed_taps": receipt.completed_taps,
-            "route_event_mask": format!("{:02X}", receipt.event_mask),
+            "route_sequence": receipt.sequence(),
+            "route_guard_count": receipt.guard_count(),
+            "route_completed_taps": receipt.completed_taps(),
+            "route_event_mask": format!("{:02X}", receipt.event_mask()),
             "result": result,
         }))?;
 
@@ -5368,8 +5381,8 @@ mod macos {
                 "key": format!("{key:?}"),
                 "raw_key": key.as_raw(),
                 "submitted_in_atomic_firmware_command": true,
-                "dispatch_authorized_by_start_guard": matches!(&evidence.outcome, GuardedDecimalRouteOutcome::Dispatched(_)),
-                "complete_press_release_authenticated": digit_index < usize::from(receipt.completed_taps),
+                "dispatch_authorized_by_start_guard": evidence.outcome.result() == GuardedKeyResult::Dispatched,
+                "complete_press_release_authenticated": digit_index < usize::from(receipt.completed_taps()),
                 "press_event_bit": digit_index * 2,
                 "release_event_bit": digit_index * 2 + 1,
                 "recorded_after-guarded-transaction-to-protect-prefix-timing": true,
@@ -5379,14 +5392,14 @@ mod macos {
             "type": "guarded-decimal-route-receipt",
             "purpose": purpose,
             "route": evidence.route.to_string(),
-            "sequence": receipt.sequence,
-            "guard_count": receipt.guard_count,
-            "completed_taps": receipt.completed_taps,
-            "event_mask": format!("{:02X}", receipt.event_mask),
-            "command_count": receipt.metadata.command_count,
-            "seqlock": receipt.metadata.seqlock,
-            "bound_snapshot_generation": evidence.snapshot.metadata.generation,
-            "bound_snapshot_crc32": format!("{:08X}", evidence.snapshot.metadata.crc32),
+            "sequence": receipt.sequence(),
+            "guard_count": receipt.guard_count(),
+            "completed_taps": receipt.completed_taps(),
+            "event_mask": format!("{:02X}", receipt.event_mask()),
+            "command_count": receipt.metadata().command_count(),
+            "seqlock": receipt.metadata().seqlock(),
+            "bound_snapshot_generation": evidence.snapshot.metadata().generation(),
+            "bound_snapshot_crc32": format!("{:08X}", evidence.snapshot.metadata().crc32()),
             "authenticated_by_final_metadata": true,
             "recorded_after_guarded_transaction": true,
         }))?;
@@ -5441,9 +5454,9 @@ mod macos {
         let snapshot = session.capture_screen().await?;
         let capture_elapsed = started.elapsed();
         let ocr_started = Instant::now();
-        let observations = snapshot.frame.recognize_text()?;
+        let observations = snapshot.frame().recognize_text()?;
         let ocr_elapsed = ocr_started.elapsed();
-        let bands = v103_selection_bands(&snapshot.frame);
+        let bands = v103_selection_bands(snapshot.frame());
         let selected = selected_text(&observations, &bands)
             .into_iter()
             .map(|observation| observation.text().to_owned())
@@ -5452,8 +5465,8 @@ mod macos {
             journal_screen_text(menu_number, &selected, &observations)?;
         let file_name = journal.next_capture_name(suffix);
         let path = output_dir.join(&file_name);
-        fs::write(&path, snapshot.frame.to_stock_bmp())?;
-        let crc32 = snapshot.metadata.crc32;
+        fs::write(&path, snapshot.frame().to_stock_bmp())?;
+        let crc32 = snapshot.metadata().crc32();
         journal.append(json!({
             "type": "screen-capture",
             "menu_number": menu_number,
@@ -5461,7 +5474,7 @@ mod macos {
             "bmp": file_name,
             "capture_elapsed_ms": millis(capture_elapsed),
             "ocr_elapsed_ms": millis(ocr_elapsed),
-            "metadata": metadata_json(&snapshot.metadata),
+            "metadata": metadata_json(snapshot.metadata()),
             "selection_bands": bands.iter().map(|band| json!({
                 "top": band.top(),
                 "bottom_exclusive": band.bottom_exclusive(),
@@ -5471,8 +5484,9 @@ mod macos {
             "observations": journal_observations,
             "private_value_redaction": redact_private_value.then_some("all-body-and-selected-observations-sha256-only"),
         }))?;
+        let (frame, _) = snapshot.into_parts();
         Ok(CapturedScreen {
-            frame: snapshot.frame,
+            frame,
             observations,
             selected,
             crc32,
@@ -5481,22 +5495,23 @@ mod macos {
 
     fn metadata_json(metadata: &AutomationMetadata) -> Value {
         json!({
-            "seqlock": metadata.seqlock,
-            "generation": metadata.generation,
-            "capture_result": metadata.capture_result,
-            "crc32": format!("{:08X}", metadata.crc32),
-            "capture_attempts": metadata.capture_attempts,
-            "command_count": metadata.command_count,
-            "last_command": metadata.last_command,
-            "last_host_sequence": metadata.last_host_sequence,
-            "last_key": metadata.last_key,
-            "last_phase": metadata.last_phase,
-            "last_key_result": metadata.last_key_result,
-            "rle_encoded_length": metadata.rle_encoded_length,
-            "route_ascii": format!("{:06X}", metadata.route_ascii),
-            "route_guard_count": metadata.route_guard_count,
-            "route_completed_taps": metadata.route_completed_taps,
-            "route_event_mask": format!("{:02X}", metadata.route_event_mask),
+            "seqlock": metadata.seqlock(),
+            "features": metadata.features(),
+            "generation": metadata.generation(),
+            "capture_result": metadata.capture_result(),
+            "crc32": format!("{:08X}", metadata.crc32()),
+            "capture_attempts": metadata.capture_attempts(),
+            "command_count": metadata.command_count(),
+            "last_command": metadata.last_command(),
+            "last_host_sequence": metadata.last_host_sequence(),
+            "last_key": metadata.last_key(),
+            "last_phase": metadata.last_phase(),
+            "last_key_result": metadata.last_key_result(),
+            "rle_encoded_length": metadata.rle_encoded_length(),
+            "route_ascii": format!("{:06X}", metadata.route_ascii()),
+            "route_guard_count": metadata.route_guard_count(),
+            "route_completed_taps": metadata.route_completed_taps(),
+            "route_event_mask": format!("{:02X}", metadata.route_event_mask()),
         })
     }
 
@@ -5895,26 +5910,6 @@ mod macos {
         }
     }
 
-    fn field_len(field: &MenuField) -> AuditResult<usize> {
-        let len = match field.descriptor.codec {
-            FieldCodec::Byte { .. }
-            | FieldCodec::Bool
-            | FieldCodec::BitBool { .. }
-            | FieldCodec::BitField { .. } => 1,
-            FieldCodec::FixedString { len, .. } | FieldCodec::Bytes { len } => len,
-            FieldCodec::Unsigned { width, .. } | FieldCodec::Signed { width, .. } => {
-                usize::from(width)
-            }
-        };
-        if len == 0 {
-            return Err(invalid_input(format!(
-                "MCP field {} has a zero-byte codec",
-                field.descriptor.name
-            )));
-        }
-        Ok(len)
-    }
-
     fn configuration_snapshot_pages() -> AuditResult<Vec<u16>> {
         if MCP_D75_MENU_FIELDS.len() != EXPECTED_CONFIGURATION_SNAPSHOT_FIELD_COUNT {
             return Err(invalid_input(format!(
@@ -5930,7 +5925,7 @@ mod macos {
         }
         let mut pages = BTreeSet::new();
         for field in MCP_D75_MENU_FIELDS {
-            let len = field_len(field)?;
+            let len = field.descriptor.codec.encoded_len();
             let end = field
                 .descriptor
                 .offset
@@ -6583,7 +6578,7 @@ mod macos {
     ) -> AuditResult<DecodedFieldValue> {
         let field = menu_field(field_name)
             .ok_or_else(|| invalid_input(format!("MCP schema has no field {field_name:?}")))?;
-        let len = field_len(field)?;
+        let len = field.descriptor.codec.encoded_len();
         let last_offset = field
             .descriptor
             .offset

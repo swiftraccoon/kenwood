@@ -31,14 +31,43 @@
 //! - APRS spec: <http://www.aprs.org/doc/APRS101.PDF>
 //! - TH-D75 User Manual, Chapter 15: Built-In KISS TNC
 
+use ax25_codec::{
+    Ax25Address, Ax25Error, Ax25Header, Ax25Packet, Ax25Pid, CommandResponse, DigipeaterPath,
+    PollFinal, RouteEntry,
+};
+use kiss_tnc::KissFrame;
+
 pub mod client;
 pub mod stored_settings_bridge;
 
-use aprs::AprsError;
-use ax25_codec::{
-    Ax25Address, Ax25Packet, Ax25Pid, CommandResponse, DigipeaterPath, RouteEntry, build_ax25,
-};
-use kiss_tnc::{KissFrame, encode_kiss_frame};
+/// A path entry failed canonical AX.25 parsing or exceeded path capacity.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("invalid digipeater path entry {entry}: {source}")]
+pub struct DigipeaterPathError {
+    input: String,
+    entry: usize,
+    source: Ax25Error,
+}
+
+impl DigipeaterPathError {
+    /// Borrow the complete original input, including whitespace.
+    #[must_use]
+    pub fn input(&self) -> &str {
+        &self.input
+    }
+
+    /// Return the zero-based failing entry index.
+    #[must_use]
+    pub const fn entry(&self) -> usize {
+        self.entry
+    }
+
+    /// Borrow the canonical address or path-capacity failure.
+    #[must_use]
+    pub const fn error(&self) -> &Ax25Error {
+        &self.source
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Construction helpers for the foreign `Ax25Packet` type
@@ -57,26 +86,28 @@ pub const fn ax25_ui_frame(
     info: Vec<u8>,
 ) -> Ax25Packet {
     Ax25Packet::unnumbered_information(
-        source,
-        destination,
-        path,
-        CommandResponse::Command,
-        false,
+        Ax25Header {
+            source,
+            destination,
+            digipeaters: path,
+            command_response: CommandResponse::Command,
+        },
+        PollFinal::Clear,
         Ax25Pid::NoLayer3,
         info,
     )
 }
 
 /// Encode an [`Ax25Packet`] as a KISS-framed data frame ready for the
-/// wire. Equivalent to wrapping [`build_ax25`] in [`encode_kiss_frame`]
-/// with `port = 0` and `command = Data`.
+/// wire. Wraps [`Ax25Packet::to_bytes`] in a port-zero KISS data frame,
+/// encoded by [`KissFrame::to_bytes`].
 ///
 /// This is a free function for the same ownership reason as
 /// [`ax25_ui_frame`].
 #[must_use]
 pub fn ax25_to_kiss_wire(packet: &Ax25Packet) -> Vec<u8> {
-    let ax25_bytes = build_ax25(packet);
-    encode_kiss_frame(&KissFrame::data(ax25_bytes))
+    let ax25_bytes = packet.to_bytes();
+    KissFrame::data(ax25_bytes).to_bytes()
 }
 
 // ---------------------------------------------------------------------------
@@ -104,7 +135,7 @@ const DEFAULT_DIGIPEATER_PATH: &str = "WIDE1-1,WIDE2-1";
 ///
 /// # Errors
 ///
-/// Returns [`AprsError::InvalidPath`] containing the original input if an
+/// Returns [`DigipeaterPathError`] containing the original input if an
 /// entry is empty or noncanonical, or if the path contains more than eight
 /// entries.
 ///
@@ -112,29 +143,30 @@ const DEFAULT_DIGIPEATER_PATH: &str = "WIDE1-1,WIDE2-1";
 ///
 /// ```
 /// use kenwood_thd75::aprs::parse_digipeater_path;
-/// let path = parse_digipeater_path("WIDE1-1,WIDE2-2").expect("static input is valid");
+/// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let path = parse_digipeater_path("WIDE1-1,WIDE2-2")?;
 /// assert_eq!(path.len(), 2);
-/// let first = path.first().expect("two-entry path has a first entry");
+/// let first = path.first().ok_or("the parsed path is empty")?;
 /// assert_eq!(first.address.callsign, "WIDE1");
 /// assert_eq!(first.address.ssid, 1);
+/// # Ok(())
+/// # }
 /// ```
-pub fn parse_digipeater_path(s: &str) -> Result<DigipeaterPath, AprsError> {
+pub fn parse_digipeater_path(s: &str) -> Result<DigipeaterPath, DigipeaterPathError> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
         return Ok(DigipeaterPath::empty());
     }
     let mut result = DigipeaterPath::empty();
-    for entry in trimmed.split(',') {
-        let entry = entry.trim();
-        if entry.is_empty() {
-            return Err(AprsError::InvalidPath(s.to_owned()));
-        }
-        let address = Ax25Address::from_canonical_str(entry)
-            .map_err(|_| AprsError::InvalidPath(s.to_owned()))?;
+    for (index, entry) in trimmed.split(',').enumerate() {
+        let failure = |source| DigipeaterPathError {
+            input: s.to_owned(),
+            entry: index,
+            source,
+        };
+        let address = Ax25Address::from_canonical_str(entry.trim()).map_err(failure)?;
         let route = RouteEntry::from_address(address);
-        result
-            .try_insert(result.len(), route)
-            .map_err(|_| AprsError::InvalidPath(s.to_owned()))?;
+        result.try_insert(result.len(), route).map_err(failure)?;
     }
     Ok(result)
 }
@@ -143,11 +175,11 @@ pub fn parse_digipeater_path(s: &str) -> Result<DigipeaterPath, AprsError> {
 ///
 /// # Errors
 ///
-/// Returns [`AprsError::InvalidPath`] if the library's static default ever
+/// Returns [`DigipeaterPathError`] if the library's static default ever
 /// stops satisfying the same validation applied to caller-provided paths.
 /// Keeping the check explicit prevents a malformed default from being
 /// silently shortened.
-pub fn default_digipeater_path() -> Result<DigipeaterPath, AprsError> {
+pub fn default_digipeater_path() -> Result<DigipeaterPath, DigipeaterPathError> {
     parse_digipeater_path(DEFAULT_DIGIPEATER_PATH)
 }
 
@@ -225,9 +257,8 @@ mod tests {
             "WIDE1--1",
             "WIDE1-1-2",
         ] {
-            assert_eq!(
-                parse_digipeater_path(invalid),
-                Err(AprsError::InvalidPath(invalid.to_owned())),
+            assert!(
+                parse_digipeater_path(invalid).is_err(),
                 "accepted noncanonical path {invalid:?}",
             );
         }
@@ -236,40 +267,37 @@ mod tests {
     #[test]
     fn parse_digipeater_path_rejects_noncanonical_callsigns() {
         for invalid in ["wide1-1", "WiDE1-1", "WIDE_1-1", "WIDE 1-1", "WIDE1-1*"] {
-            assert_eq!(
-                parse_digipeater_path(invalid),
-                Err(AprsError::InvalidPath(invalid.to_owned())),
+            assert!(
+                parse_digipeater_path(invalid).is_err(),
                 "accepted noncanonical path {invalid:?}",
             );
         }
     }
 
     #[test]
-    fn parse_digipeater_path_error_preserves_the_original_input() {
+    fn parse_digipeater_path_error_preserves_the_original_input() -> TestResult {
         let input = "  WIDE1-1, WIDE2-01  ";
-        assert_eq!(
-            parse_digipeater_path(input),
-            Err(AprsError::InvalidPath(input.to_owned())),
-        );
+        let error = parse_digipeater_path(input)
+            .err()
+            .ok_or("invalid SSID accepted")?;
+        assert_eq!(error.input(), input);
+        assert_eq!(error.entry(), 1);
+        assert!(matches!(error.error(), Ax25Error::InvalidAddress(_)));
+        assert!(std::error::Error::source(&error).is_some());
+        Ok(())
     }
 
     #[test]
     fn parse_digipeater_path_rejects_empty_entries() {
         for invalid in [",WIDE1-1", "WIDE1-1,", "WIDE1-1,,WIDE2-1"] {
-            assert_eq!(
-                parse_digipeater_path(invalid),
-                Err(AprsError::InvalidPath(invalid.to_owned())),
-            );
+            assert!(parse_digipeater_path(invalid).is_err());
         }
     }
 
     #[test]
     fn parse_digipeater_path_rejects_long_callsign() {
         let input = "TOOLONG-1";
-        assert_eq!(
-            parse_digipeater_path(input),
-            Err(AprsError::InvalidPath(input.to_owned())),
-        );
+        assert!(parse_digipeater_path(input).is_err());
     }
 
     #[test]
@@ -278,10 +306,12 @@ mod tests {
         let nine = "WIDE1-1,WIDE1-2,WIDE1-3,WIDE1-4,WIDE1-5,WIDE1-6,WIDE1-7,WIDE1-8,WIDE1-9";
 
         assert_eq!(parse_digipeater_path(eight)?.len(), 8);
-        assert_eq!(
-            parse_digipeater_path(nine),
-            Err(AprsError::InvalidPath(nine.to_owned())),
-        );
+        let error = parse_digipeater_path(nine)
+            .err()
+            .ok_or("ninth hop accepted")?;
+        assert_eq!(error.input(), nine);
+        assert_eq!(error.entry(), 8);
+        assert_eq!(error.error(), &Ax25Error::TooManyDigipeaters);
         Ok(())
     }
 
@@ -308,8 +338,8 @@ mod tests {
         );
         assert_eq!(packet.control_byte(), 0x03);
         assert_eq!(packet.protocol_identifier(), Some(Ax25Pid::NoLayer3));
-        assert_eq!(packet.source.callsign, "N0CALL");
-        assert_eq!(packet.destination.callsign, "APRS");
+        assert_eq!(packet.header.source.callsign, "N0CALL");
+        assert_eq!(packet.header.destination.callsign, "APRS");
         assert_eq!(packet.information(), b"!test");
         Ok(())
     }

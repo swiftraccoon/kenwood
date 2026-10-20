@@ -27,7 +27,7 @@ use tracing as _;
 use kenwood_thd75::protocol::{self, Command, Response};
 use kenwood_thd75::types::tone::{DcsCode, ToneCode};
 use kenwood_thd75::types::*;
-use kiss_tnc::{KissCommand, KissFrame, KissPort, decode_kiss_frame, encode_kiss_frame};
+use kiss_tnc::{KissCommand, KissFrame, KissPort};
 
 /// Convert any debug-printable error into a `TestCaseError` so `?` can be used
 /// in proptest blocks without violating workspace `unwrap_used` policy.
@@ -151,16 +151,16 @@ proptest! {
 
     // KISS frame encode/decode round-trip.
     //
-    // The TH-D75 only ever uses port 0; this exercises every defined
-    // nibble-encoded KISS command with arbitrary payload data.
+    // Exercises every defined nibble-encoded KISS command on port zero
+    // with arbitrary payload data.
     #[test]
     fn kiss_frame_round_trip(
         command in (0u8..7).prop_filter_map("known command", KissCommand::from_byte),
         data in proptest::collection::vec(any::<u8>(), 0..100),
     ) {
-        let frame = KissFrame { port: KissPort::TH_D75, command, data };
-        let encoded = encode_kiss_frame(&frame);
-        let decoded = decode_kiss_frame(&encoded).map_err(to_test_err)?;
+        let frame = KissFrame { port: KissPort::ZERO, command, data };
+        let encoded = frame.to_bytes();
+        let decoded = KissFrame::from_bytes(&encoded).map_err(to_test_err)?;
         prop_assert_eq!(decoded, frame);
     }
 

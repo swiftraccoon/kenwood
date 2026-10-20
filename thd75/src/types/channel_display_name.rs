@@ -86,6 +86,8 @@ impl fmt::Display for RegularChannel {
     }
 }
 
+integer_radix_formats!(RegularChannel, as_raw);
+
 /// A memory channel's user-visible name.
 ///
 /// The TH-D75 stores each name in a 16-byte, NUL-padded field. Valid names are

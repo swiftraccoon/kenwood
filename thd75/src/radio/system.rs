@@ -43,15 +43,23 @@ impl<T: Transport> Radio<T> {
     /// Although the mnemonic begins with `A`, `AE` is an identity query, not
     /// an APRS operation. The returned [`SerialInformation`] retains the exact
     /// eight-byte serial number and three-byte model code as validated types.
+    /// The first successful response is retained across binary sessions and
+    /// reconnects. Later responses must match both fields; a different radio
+    /// cannot replace the retained identity.
     ///
     /// # Errors
     ///
     /// Returns an error if the command fails or the response is unexpected.
+    /// Returns [`Error::RadioIdentityMismatch`] and blocks ordinary CAT traffic
+    /// if either identity field differs from the first observed response.
     pub async fn get_serial_information(&mut self) -> Result<SerialInformation, Error> {
         tracing::debug!("reading radio serial information");
         let response = self.execute(Command::GetSerialInfo).await?;
         match response {
-            Response::SerialInformation(information) => Ok(information),
+            Response::SerialInformation(information) => {
+                self.retain_serial_information(&information)?;
+                Ok(information)
+            }
             other => Err(Error::Protocol(ProtocolError::UnexpectedResponse {
                 expected: "SerialInformation".into(),
                 actual: format!("{other:?}").into_bytes(),

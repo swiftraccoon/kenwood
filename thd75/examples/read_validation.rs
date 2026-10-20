@@ -26,6 +26,7 @@ use tokio_serial as _;
 use tracing as _;
 
 use std::future::Future;
+use std::num::NonZeroU32;
 
 use kenwood_thd75::transport::SerialTransport;
 use kenwood_thd75::types::{Band, MemoryChannelAddress};
@@ -63,7 +64,7 @@ impl<T: Transport> Transport for WireTrace<T> {
         self.inner.close()
     }
 
-    fn set_baud_rate(&mut self, baud: u32) -> Result<(), TransportError> {
+    fn set_baud_rate(&mut self, baud: NonZeroU32) -> Result<(), TransportError> {
         self.inner.set_baud_rate(baud)
     }
 

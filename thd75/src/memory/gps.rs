@@ -224,7 +224,9 @@ impl<'a> GpsAccess<'a> {
     /// Returns [`GpsValueError`] if either stored boolean is missing or
     /// malformed.
     pub fn settings(&self) -> Result<GpsSettings, GpsValueError> {
-        Ok(GpsSettings::new(self.gps_enabled()?, self.pc_output()?))
+        Ok(GpsSettings::new()
+            .with_enabled(self.gps_enabled()?)
+            .with_pc_output(self.pc_output()?))
     }
 
     /// Read GPS/Radio operating mode (`gps.OperatingMode`).
@@ -383,9 +385,9 @@ impl<'a> GpsAccess<'a> {
 mod tests {
     use super::*;
     use crate::memory::menu_fields::menu_field;
-    use crate::memory::{Endian, FieldCodec};
     use crate::protocol::programming::TOTAL_SIZE;
     use crate::types::gps::NmeaSentence;
+    use kenwood_schema::{CodecSpec, Endian};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
     type BoxErr = Box<dyn std::error::Error>;
@@ -481,34 +483,34 @@ mod tests {
 
     #[test]
     fn gps_constants_bind_official_registry_fields() -> TestResult {
-        const ANCHORS: &[(&str, usize, FieldCodec)] = &[
-            ("gps.BuiltInGps", GPS_ENABLED_OFFSET, FieldCodec::Bool),
+        const ANCHORS: &[(&str, usize, CodecSpec)] = &[
+            ("gps.BuiltInGps", GPS_ENABLED_OFFSET, CodecSpec::Bool),
             (
                 "gps.PositionAmbiguity",
                 GPS_POSITION_AMBIGUITY_OFFSET,
-                FieldCodec::Byte { min: 0, max: 4 },
+                CodecSpec::Byte { min: 0, max: 4 },
             ),
             (
                 "gps.OperatingMode",
                 GPS_OPERATING_MODE_OFFSET,
-                FieldCodec::Byte { min: 0, max: 1 },
+                CodecSpec::Byte { min: 0, max: 1 },
             ),
             (
                 "gps.BatterySaver",
                 GPS_BATTERY_SAVER_OFFSET,
-                FieldCodec::Byte { min: 0, max: 5 },
+                CodecSpec::Byte { min: 0, max: 5 },
             ),
-            ("gps.PcOutput", GPS_PC_OUTPUT_OFFSET, FieldCodec::Bool),
-            ("gps.TrackLog", GPS_TRACK_LOG_OFFSET, FieldCodec::Bool),
+            ("gps.PcOutput", GPS_PC_OUTPUT_OFFSET, CodecSpec::Bool),
+            ("gps.TrackLog", GPS_TRACK_LOG_OFFSET, CodecSpec::Bool),
             (
                 "gps.RecodeMethod",
                 GPS_TRACK_RECORD_METHOD_OFFSET,
-                FieldCodec::Byte { min: 0, max: 2 },
+                CodecSpec::Byte { min: 0, max: 2 },
             ),
             (
                 "gps.Interval",
                 GPS_TRACK_INTERVAL_OFFSET,
-                FieldCodec::Unsigned {
+                CodecSpec::Unsigned {
                     width: 2,
                     endian: Endian::Little,
                     min: 2,
@@ -518,7 +520,7 @@ mod tests {
             (
                 "gps.Distance",
                 GPS_TRACK_DISTANCE_OFFSET,
-                FieldCodec::Unsigned {
+                CodecSpec::Unsigned {
                     width: 2,
                     endian: Endian::Little,
                     min: 1,
@@ -538,14 +540,14 @@ mod tests {
         for &(name, offset, codec) in ANCHORS {
             let field = menu_field(name).ok_or_else(|| format!("missing registry field {name}"))?;
             assert_eq!(field.descriptor.offset, offset, "{name} offset");
-            assert_eq!(field.descriptor.codec, codec, "{name} codec");
+            assert_eq!(field.descriptor.codec.spec(), codec, "{name} codec");
         }
         for &(name, mask) in SENTENCE_BITS {
             let field = menu_field(name).ok_or_else(|| format!("missing registry field {name}"))?;
             assert_eq!(field.descriptor.offset, GPS_NMEA_FLAGS_OFFSET, "{name}");
             assert_eq!(
-                field.descriptor.codec,
-                FieldCodec::BitBool { mask },
+                field.descriptor.codec.spec(),
+                CodecSpec::BitBool { mask },
                 "{name}"
             );
         }

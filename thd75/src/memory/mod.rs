@@ -20,6 +20,24 @@
 //! [`crate::sdcard::config::RadioConfig`], which retains its otherwise opaque
 //! 256-byte header alongside this image.
 
+use std::fmt;
+
+use kenwood_schema::DecodedFieldValue;
+
+use crate::protocol::programming;
+use crate::types::{FirmwareIdentity, RadioModel, RegularChannel};
+
+pub use aprs::AprsAccess;
+pub use channels::{ChannelAccess, ChannelEntry, ChannelWriter};
+pub use dstar::DstarAccess;
+pub use gps::{GpsAccess, GpsValueError};
+pub use menu_fields::{
+    MCP_D75_MENU_FIELDS, MCP_D75_SCHEMA_VERSION, MCP_D75_SOURCE_SHA256, MenuField, MenuOption,
+    StorageTransform, menu_field,
+};
+pub use schema::{FieldDescriptor, PagePatch, PatchPlanner, PatchSet, SchemaError};
+pub use settings::{SettingsAccess, SettingsValueError, SettingsWriter};
+
 pub mod aprs;
 pub mod channels;
 pub mod dstar;
@@ -28,11 +46,6 @@ pub mod menu_fields;
 mod menu_patch;
 pub mod schema;
 pub mod settings;
-
-use std::fmt;
-
-use crate::protocol::programming;
-use crate::types::{FirmwareIdentity, RadioModel, RegularChannel};
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -123,31 +136,20 @@ impl fmt::Display for MemoryError {
     }
 }
 
-impl std::error::Error for MemoryError {}
+impl std::error::Error for MemoryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::SettingsValue { source } => Some(source),
+            _ => None,
+        }
+    }
+}
 
 impl From<SettingsValueError> for MemoryError {
     fn from(source: SettingsValueError) -> Self {
         Self::SettingsValue { source }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Re-exports for convenience
-// ---------------------------------------------------------------------------
-
-pub use aprs::AprsAccess;
-pub use channels::{ChannelAccess, ChannelEntry, ChannelWriter};
-pub use dstar::DstarAccess;
-pub use gps::{GpsAccess, GpsValueError};
-pub use menu_fields::{
-    MCP_D75_MENU_FIELDS, MCP_D75_SCHEMA_VERSION, MCP_D75_SOURCE_SHA256, MenuField, MenuOption,
-    StorageTransform, menu_field,
-};
-pub use schema::{
-    DecodedFieldValue, Endian, FieldCodec, FieldDescriptor, FieldValue, PagePatch, PatchPlanner,
-    PatchSet, SchemaError, StringEncoding,
-};
-pub use settings::{SettingsAccess, SettingsValueError, SettingsWriter};
 
 /// Radio model whose live MCP layout is represented by the generated schema.
 pub const MCP_D75_SCHEMA_MODEL: &str = "TH-D75";
@@ -187,7 +189,7 @@ pub fn is_supported_mcp_d75_schema_target(model: RadioModel, firmware: &Firmware
 ///
 /// The image is exactly [`programming::TOTAL_SIZE`] bytes (500,480). Create one
 /// from a raw MCP dump. Parse a complete `.d75` file with
-/// [`crate::sdcard::config::parse_config`] so its opaque header remains paired
+/// [`crate::sdcard::config::RadioConfig::from_bytes`] so its opaque header remains paired
 /// with the image in a [`crate::sdcard::config::RadioConfig`].
 ///
 /// # Examples

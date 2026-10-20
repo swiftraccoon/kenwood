@@ -1,33 +1,24 @@
 [package]
 name = "kenwood-thd75"
 version = "0.1.0"
+authors = ["swiftraccoon"]
+categories = ["hardware-support", "encoding"]
+documentation = "https://swiftraccoon.github.io/kenwood/"
 edition = "2024"
+keywords = ["kenwood", "thd75", "ham-radio", "cat-protocol", "amateur-radio"]
+license = "GPL-2.0-or-later"
+publish = false
+readme = "README.md"
+repository = "https://github.com/swiftraccoon/kenwood"
 rust-version = "1.94"
 description = "Async Rust library for controlling the Kenwood TH-D75 transceiver"
-license = "GPL-2.0-or-later"
-repository = "https://github.com/swiftraccoon/kenwood"
-keywords = ["kenwood", "thd75", "ham-radio", "cat-protocol", "amateur-radio"]
-categories = ["hardware-support", "encoding"]
-authors = ["swiftraccoon"]
-readme = "README.md"
-documentation = "https://swiftraccoon.github.io/kenwood/"
-publish = false
 
 [dependencies]
 kenwood-schema = { path = "../kenwood-schema" }
-kenwood-transport = { path = "../kenwood-transport", features = [
-  "native-bluetooth",
-] }
-tokio = { version = "1", features = [
-  "rt",
-  "macros",
-  "sync",
-  "io-util",
-  "net",
-  "time",
-] }
-tokio-serial = "5"
+kenwood-transport = { path = "../kenwood-transport", features = ["native-bluetooth"] }
 thiserror = "2"
+tokio = { version = "1", features = ["rt", "macros", "sync", "io-util", "net", "time"] }
+tokio-serial = "5"
 tracing = "0.1"
 # The sans-io `aprs` and `ax25-codec` crates are mandatory: the core CAT
 # type layer builds on their validated types (GPS latitude/longitude,
@@ -112,27 +103,27 @@ test = true
 #   by `lint.sh` because they are deliberately not Cargo targets.
 # - Everything else mirrors the workspace policy; see the inline notes.
 [lints.rust]
-unsafe_code = "deny"
-missing_docs = "deny"
 missing_debug_implementations = "deny"
+missing_docs = "deny"
 unreachable_pub = "deny"
+unsafe_code = "deny"
 unused_results = "deny"
 # Prevent accidental future regressions
 elided_lifetimes_in_paths = "deny"
-trivial_casts = "deny"
-trivial_numeric_casts = "deny"
-unused_import_braces = "deny"
-unused_qualifications = "deny"
+let_underscore_drop = "deny"
 non_ascii_idents = "deny"
 single_use_lifetimes = "deny"
-let_underscore_drop = "deny"
+trivial_casts = "deny"
+trivial_numeric_casts = "deny"
 unused_crate_dependencies = "deny"
+unused_import_braces = "deny"
+unused_qualifications = "deny"
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }
-pedantic = { level = "deny", priority = -1 }
-nursery = { level = "deny", priority = -1 }
 cargo = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
 restriction = { level = "allow", priority = -1 }
 # Ban `#[allow]`: every suppression must be `#[expect(..., reason = "...")]`.
 # Mirrors the root `[workspace.lints.clippy]` ban; restated here because this crate's
@@ -140,30 +131,30 @@ restriction = { level = "allow", priority = -1 }
 allow_attributes = "deny"
 allow_attributes_without_reason = "deny"
 # Restriction-lint denies mirror the workspace; no divergence.
-undocumented_unsafe_blocks = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
 missing_assert_message = "deny"
 missing_const_for_fn = "deny"
 panic = "deny"
+undocumented_unsafe_blocks = "deny"
 unwrap_used = "deny"
-expect_used = "deny"
-indexing_slicing = "deny"
 # Forward-protection lints: mirror the workspace block exactly.
-todo = "deny"
-unimplemented = "deny"
 dbg_macro = "deny"
-mem_forget = "deny"
 format_push_string = "deny"
 infinite_loop = "deny"
+mem_forget = "deny"
 module_name_repetitions = "allow"
 multiple_crate_versions = "allow"
 redundant_pub_crate = "allow"
+todo = "deny"
+unimplemented = "deny"
 
 # Mirrors the workspace `[lints.rustdoc]` block; restated here because this crate's
 # `[lints]` block replaces the workspace one entirely.
 [lints.rustdoc]
-broken_intra_doc_links = "deny"
-private_intra_doc_links = "deny"
-missing_crate_level_docs = "deny"
-invalid_codeblock_attributes = "deny"
 bare_urls = "deny"
+broken_intra_doc_links = "deny"
+invalid_codeblock_attributes = "deny"
+missing_crate_level_docs = "deny"
+private_intra_doc_links = "deny"
 unescaped_backticks = "deny"

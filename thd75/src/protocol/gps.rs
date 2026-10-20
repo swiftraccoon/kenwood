@@ -32,7 +32,9 @@ fn parse_gp(payload: &str) -> Result<Response, ProtocolError> {
     let gps_enabled = boolean(gps_str, "GP", "gps_enabled")?;
     let pc_output = boolean(pc_str, "GP", "pc_output")?;
     Ok(Response::GpsSettings {
-        settings: GpsSettings::new(gps_enabled, pc_output),
+        settings: GpsSettings::new()
+            .with_enabled(gps_enabled)
+            .with_pc_output(pc_output),
     })
 }
 

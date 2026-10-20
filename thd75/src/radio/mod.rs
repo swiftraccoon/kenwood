@@ -8,6 +8,18 @@
 //! Generic over [`Transport`], allowing use with
 //! USB serial, Bluetooth SPP, or mock transports for testing.
 
+use std::time::Duration;
+
+use kenwood_transport::{Transport, TransportError};
+
+use crate::error::{Error, ProtocolError};
+use crate::protocol::{self, Codec, Command, Response, command_name};
+use crate::types::{
+    Band, FirmwareIdentity, RadioModel, SerialInformation, TncDataBand, TuningMode,
+};
+pub use recovery::DesyncedRadio;
+use response_correlation::correlate;
+
 pub mod aprs;
 pub mod audio;
 pub mod automation;
@@ -30,21 +42,13 @@ pub mod packet;
 pub mod programming;
 pub mod raw_protocol_session;
 mod recovery;
-pub use recovery::DesyncedRadio;
+mod recovery_identity;
 mod response_correlation;
 pub mod scan;
 pub mod state_monitor;
 pub mod system;
 pub mod terminal_mode;
 pub mod tuning;
-
-use std::time::Duration;
-
-use crate::error::{Error, ProtocolError};
-use crate::protocol::{self, Codec, Command, Response, command_name};
-use crate::types::{Band, FirmwareIdentity, RadioModel, TncDataBand, TuningMode};
-use kenwood_transport::{Transport, TransportError};
-use response_correlation::correlate;
 
 /// Default timeout for command execution (5 seconds).
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -231,6 +235,8 @@ pub struct Radio<T: Transport> {
     pub(crate) timeout: Duration,
     /// Last exact firmware identity returned by a successful `FV` command.
     pub(crate) firmware_version: Option<FirmwareIdentity>,
+    /// First complete AE identity observed on this radio handle.
+    pub(crate) serial_information: Option<SerialInformation>,
     /// Cached tuning mode for band A. `None` until a VM command is observed.
     pub(crate) tuning_mode_a: Option<TuningMode>,
     /// Cached tuning mode for band B. `None` until a VM command is observed.
@@ -246,7 +252,7 @@ pub struct Radio<T: Transport> {
     /// boundary. Unlike `desynced`, this must never be cleared by a short stale
     /// reply drain; only an isolated identity proof may make CAT reusable.
     pub(crate) cat_state: CatState,
-    /// A strict GM exchange failed or was cancelled with bytes potentially in
+    /// A strict GM or recovery identity exchange failed or was cancelled with bytes potentially in
     /// flight. Unlike an ordinary timeout, this cannot be cleared by a short
     /// stale-input drain; only a fresh transport or a completed strict
     /// exchange can make the stream trustworthy again.
@@ -274,6 +280,8 @@ pub struct Radio<T: Transport> {
     /// Last successful NMEA sentence selection, re-asserted by
     /// [`Radio::reconnect`].
     pub(crate) gps_sentences: Option<crate::types::NmeaSentences>,
+    /// Original settings retained across IF-tap entry/restoration cancellation.
+    pub(crate) if_tap_saved: Option<if_tap::IfTapSavedState>,
 }
 
 impl<T: Transport> std::fmt::Debug for Radio<T> {
@@ -309,6 +317,7 @@ impl<T: Transport> Radio<T> {
             notifications: tx,
             timeout: DEFAULT_TIMEOUT,
             firmware_version: None,
+            serial_information: None,
             tuning_mode_a: None,
             tuning_mode_b: None,
             last_cmd_time: None,
@@ -323,6 +332,7 @@ impl<T: Transport> Radio<T> {
             auto_info_enabled: false,
             gps_settings: None,
             gps_sentences: None,
+            if_tap_saved: None,
         }
     }
 
@@ -412,11 +422,10 @@ impl<T: Transport> Radio<T> {
         self.last_cmd_time = None;
         let _previous = self.link_state_tx.send_replace(LinkState::Down);
 
-        let result = self.prove_cat_or_recover_packet_mode().await;
-        if result.is_ok() {
-            self.finish_cat_recovery();
-        }
-        result
+        self.prove_cat_or_recover_packet_mode().await?;
+        self.prove_retained_serial_information().await?;
+        self.finish_cat_recovery();
+        Ok(())
     }
 
     async fn prove_cat_or_recover_packet_mode(&mut self) -> Result<(), Error> {
@@ -450,34 +459,16 @@ impl<T: Transport> Radio<T> {
         // A quiet radio need not answer these writes, but every write must
         // complete. A failed write means the recovery sequence did not reach
         // a trustworthy boundary.
-        self.transport
-            .write(b"\r")
-            .await
-            .map_err(Error::Transport)?;
-        self.transport
-            .write(b"\r")
-            .await
-            .map_err(Error::Transport)?;
+        self.write_cat_recovery_bytes(b"\r").await?;
+        self.write_cat_recovery_bytes(b"\r").await?;
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        self.transport
-            .write(&[0x03])
-            .await
-            .map_err(Error::Transport)?;
-        self.transport
-            .write(&[0xC0, 0xFF, 0xC0])
-            .await
-            .map_err(Error::Transport)?;
+        self.write_cat_recovery_bytes(&[0x03]).await?;
+        self.write_cat_recovery_bytes(&[0xC0, 0xFF, 0xC0]).await?;
         tokio::time::sleep(Duration::from_millis(100)).await;
-        self.transport
-            .write(b"\rTC 1\r")
-            .await
-            .map_err(Error::Transport)?;
+        self.write_cat_recovery_bytes(b"\rTC 1\r").await?;
         tokio::time::sleep(Duration::from_millis(100)).await;
-        self.transport
-            .write(b"TN 0,0\r")
-            .await
-            .map_err(Error::Transport)?;
+        self.write_cat_recovery_bytes(b"TN 0,0\r").await?;
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         // Replies vary with the starting mode and may be split across several
@@ -488,6 +479,13 @@ impl<T: Transport> Radio<T> {
         self.codec.clear();
         self.last_cmd_time = None;
         Ok(())
+    }
+
+    async fn write_cat_recovery_bytes(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        tokio::time::timeout(self.timeout, self.transport.write(bytes))
+            .await
+            .map_err(|_| Error::Timeout(self.timeout))?
+            .map_err(Error::Transport)
     }
 
     async fn drain_cat_recovery_residue(&mut self) -> Result<(), Error> {
@@ -545,7 +543,9 @@ impl<T: Transport> Radio<T> {
     /// Subscribe to auto-info notifications.
     ///
     /// When auto-info is enabled (`set_auto_info(true)`), the radio pushes
-    /// unsolicited status updates. These are routed to all subscribers.
+    /// unsolicited status updates. Command-driven reads route them through a
+    /// 64-entry broadcast channel; there is no background reader. A subscriber
+    /// that falls behind receives [`tokio::sync::broadcast::error::RecvError::Lagged`].
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<Response> {
         self.notifications.subscribe()
     }
@@ -572,10 +572,11 @@ impl<T: Transport> Radio<T> {
         }
     }
 
-    /// Set the timeout duration for command execution.
+    /// Set the separate write and response-read timeout for CAT exchanges.
     ///
-    /// Defaults to 5 seconds. Commands that do not receive a response
-    /// within this duration return [`Error::Timeout`].
+    /// Each wait defaults to five seconds and returns [`Error::Timeout`] when
+    /// it expires. Command pacing and stale-response draining precede these
+    /// waits, so this value is not an overall operation deadline.
     pub const fn set_timeout(&mut self, duration: Duration) {
         self.timeout = duration;
     }
@@ -1045,8 +1046,8 @@ impl<T: Transport> Radio<T> {
             || !matches!(self.mcp_wire_boundary, McpWireBoundary::Quiescent)
     }
 
-    /// Refuse every non-reconnect I/O path after an incomplete strict GM
-    /// exchange.
+    /// Refuse every non-reconnect I/O path after an incomplete strict memory
+    /// or recovery identity exchange.
     pub(crate) const fn require_unpoisoned_gm_stream(&self) -> Result<(), Error> {
         if self.gm_poisoned {
             Err(Error::MemoryReadStreamPoisoned)
@@ -1075,15 +1076,23 @@ impl<T: Transport> Radio<T> {
     ///
     /// Closes what remains of the old connection, asks the transport to
     /// [`reopen`](kenwood_transport::Transport::reopen), verifies the
-    /// radio answers by re-running [`identify`](Radio::identify), and
-    /// restores auto-information and GPS streaming state if they were
-    /// enabled. In-flight commands are never replayed: whatever failed
+    /// radio answers with the exact TH-D75 model identity, and compares its
+    /// AE serial/model response with the first response observed through
+    /// [`Self::get_serial_information`]. Cached auto-information and GPS
+    /// streaming state is restored only after that AE comparison succeeds.
+    /// A handle without an observed AE identity can reconnect when no cached
+    /// streaming state needs restoration; that path checks only the model.
+    /// In-flight commands are never replayed: whatever failed
     /// stays failed, and the caller decides what to re-issue.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Transport`] if the transport cannot reopen, or
-    /// any error from the identify and state-restore commands.
+    /// Returns [`Error::Transport`] if transport close or reopen fails, or
+    /// any error from the identity and state-restore commands. Returns
+    /// [`Error::RadioIdentityMismatch`] for a different AE identity, or
+    /// [`Error::RecoveryIdentityRequired`] if cached streaming state requires
+    /// replay without a previously observed AE identity. Both leave ordinary
+    /// CAT commands blocked and send no cached-state writes.
     pub async fn reconnect(&mut self) -> Result<(), Error> {
         self.reopen_and_identify().await?;
         self.restore_state_after_reconnect().await
@@ -1100,8 +1109,8 @@ impl<T: Transport> Radio<T> {
             return Err(Error::McpInterrupted);
         }
         // Keep the public stream poisoned across every await. The private
-        // identity command below is the only operation allowed to bypass this
-        // gate. Cancellation therefore cannot expose an in-flight ID reply to
+        // identity exchanges below are the only operations allowed to bypass
+        // this gate. Cancellation cannot expose an in-flight identity reply to
         // a later public command.
         self.gm_poisoned = true;
         self.desynced = true;
@@ -1113,9 +1122,7 @@ impl<T: Transport> Radio<T> {
         self.firmware_version = None;
         self.tuning_mode_a = None;
         self.tuning_mode_b = None;
-        if let Err(e) = self.close_transport().await {
-            tracing::debug!(error = %e, "close before reopen failed (link already dead)");
-        }
+        self.close_transport().await?;
         self.transport.reopen().await.map_err(Error::Transport)?;
         // Fresh link: drop any half-parsed frame and stale-response
         // bookkeeping from the dead connection.
@@ -1124,6 +1131,8 @@ impl<T: Transport> Radio<T> {
         self.last_cmd_time = None;
 
         self.prove_reopened_thd75_identity().await?;
+        self.prove_retained_serial_information().await?;
+        self.require_restore_identity()?;
 
         // No await may appear between proof and clearing the poison.
         self.desynced = false;
@@ -1194,6 +1203,56 @@ mod tests {
 
     struct HangingWriteTransport {
         writes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    struct RecoveryWriteTransport {
+        attempted: usize,
+        blocked_after: usize,
+    }
+
+    impl Transport for RecoveryWriteTransport {
+        async fn write(&mut self, _data: &[u8]) -> Result<(), TransportError> {
+            let step = self.attempted;
+            self.attempted += 1;
+            if step == self.blocked_after {
+                std::future::pending().await
+            } else {
+                Ok(())
+            }
+        }
+        async fn read(&mut self, _buffer: &mut [u8]) -> Result<usize, TransportError> {
+            Err(TransportError::Read(std::io::Error::from(
+                std::io::ErrorKind::WouldBlock,
+            )))
+        }
+        async fn close(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cat_recovery_preamble_bounds_every_write_phase() -> TestResult {
+        let deadline = Duration::from_millis(10);
+        for blocked_after in 0..6 {
+            let mut radio = Radio::new(RecoveryWriteTransport {
+                attempted: 0,
+                blocked_after,
+            });
+            radio.timeout = deadline;
+            let result =
+                tokio::time::timeout(Duration::from_secs(2), radio.send_cat_recovery_preamble())
+                    .await?;
+            assert!(
+                matches!(result, Err(Error::Timeout(timeout)) if timeout == deadline),
+                "phase {blocked_after}: {result:?}"
+            );
+            assert_eq!(
+                radio.transport.attempted,
+                blocked_after + 1,
+                "a timed-out write stops the preamble"
+            );
+        }
+        Ok(())
     }
 
     impl Transport for HangingWriteTransport {
@@ -1443,7 +1502,7 @@ mod tests {
         mock.expect(&[0x03], b"");
         mock.expect(&[0xC0, 0xFF, 0xC0], b"");
         mock.expect(b"\rTC 1\r", b"");
-        mock.expect_reads(b"TN 0,0\r", &[b"TN 0,0\r", b"ID TH-D75\r"]);
+        mock.expect_reads(b"TN 0,0\r", [b"TN 0,0\r".to_vec(), b"ID TH-D75\r".to_vec()]);
         mock.expect(b"ID\r", b"ID TH-D75\r");
         mock.expect(b"ID\r", b"ID TH-D75\r");
         mock.pend_when_empty();
@@ -1507,9 +1566,9 @@ mod tests {
         let mut mock = MockTransport::new();
         mock.expect_reads(
             b"MD 0\r",
-            &[
-                b"$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47\r\n",
-                b"MD 0,0\r",
+            [
+                b"$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47\r\n".to_vec(),
+                b"MD 0,0\r".to_vec(),
             ],
         );
         let mut radio = Radio::new(mock);
@@ -1526,7 +1585,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_unsolicited_mnemonic_is_skipped() -> TestResult {
         let mut mock = MockTransport::new();
-        mock.expect_reads(b"MD 0\r", &[b"ZZ 1\r", b"MD 0,0\r"]);
+        mock.expect_reads(b"MD 0\r", [b"ZZ 1\r".to_vec(), b"MD 0,0\r".to_vec()]);
         let mut radio = Radio::new(mock);
         let response = radio
             .execute(Command::GetOperatingMode { band: Band::A })
@@ -1802,7 +1861,7 @@ mod tests {
         // AI pushes carry the same mnemonics as reads (MD/FQ/SQ/BY).
         // A band-B push must not answer a band-A query.
         let mut mock = MockTransport::new();
-        mock.expect_reads(b"MD 0\r", &[b"MD 1,1\r", b"MD 0,0\r"]);
+        mock.expect_reads(b"MD 0\r", [b"MD 1,1\r".to_vec(), b"MD 0,0\r".to_vec()]);
         let mut radio = Radio::new(mock);
         let mut notifications = radio.subscribe();
         let response = radio
@@ -1824,7 +1883,7 @@ mod tests {
     async fn wrong_setter_echo_is_routed_until_exact_echo_arrives() -> TestResult {
         let desired = crate::types::SquelchLevel::new(4)?;
         let mut mock = MockTransport::new();
-        mock.expect_reads(b"SQ 0,4\r", &[b"SQ 0,2\r", b"SQ 0,4\r"]);
+        mock.expect_reads(b"SQ 0,4\r", [b"SQ 0,2\r".to_vec(), b"SQ 0,4\r".to_vec()]);
         let mut radio = Radio::new(mock);
         let mut notifications = radio.subscribe();
 
@@ -1861,7 +1920,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn wrong_vm_echo_never_completes_or_updates_the_tuning_mode_cache() -> TestResult {
         let mut mock = MockTransport::new();
-        mock.expect_reads(b"VM 0,1\r", &[b"VM 0,0\r"]);
+        mock.expect_reads(b"VM 0,1\r", [b"VM 0,0\r".to_vec()]);
         mock.pend_when_empty();
         let mut radio = Radio::new(mock);
         radio.set_timeout(Duration::from_millis(20));

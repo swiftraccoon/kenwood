@@ -29,7 +29,9 @@
 //! snapshot with [`IfTapSession::into_saved_state`] and restore later through
 //! [`Radio::restore_if_tap`].
 
-use crate::error::{Error, ProtocolError};
+use std::sync::Arc;
+
+use crate::error::{Error, ProtocolError, ValidationError};
 use crate::types::{
     Band, BandMode, Frequency, OperatingMode, SquelchLevel, StepSize, TuningMode, UsbAudioOutput,
 };
@@ -53,14 +55,22 @@ pub struct IfTapConfig {
 impl IfTapConfig {
     /// Configuration that engages the intermediate-frequency output with the
     /// squelch held open and the tuning step left untouched.
-    #[must_use]
-    pub const fn new(operating_mode: OperatingMode) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::IfTapDigitalMode`] for DV or DR.
+    pub const fn new(operating_mode: OperatingMode) -> Result<Self, ValidationError> {
+        if matches!(operating_mode, OperatingMode::Dv | OperatingMode::Dr) {
+            return Err(ValidationError::IfTapDigitalMode {
+                mode: operating_mode,
+            });
+        }
+        Ok(Self {
             operating_mode,
             squelch: SquelchLevel::OPEN,
             step: None,
             output: UsbAudioOutput::IntermediateFrequency,
-        }
+        })
     }
 
     /// Also change the Band B tuning step for this session.
@@ -99,10 +109,11 @@ impl IfTapConfig {
 ///
 /// Restored by [`IfTapSession::exit`] or [`Radio::restore_if_tap`]. The
 /// original tuning step is always captured, even when entry leaves it
-/// untouched, because callers can mutate the radio through a live session and
-/// frequency restoration must still use the original tuning raster.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// untouched. Its private session token binds restoration and retuning to the
+/// same radio and pending snapshot. Completed restoration invalidates copies.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IfTapSavedState {
+    lease: Arc<()>,
     active_band: Band,
     band_mode: BandMode,
     output: UsbAudioOutput,
@@ -115,7 +126,7 @@ pub struct IfTapSavedState {
 impl IfTapSavedState {
     /// Band B frequency captured before the IF tap was configured.
     #[must_use]
-    pub const fn band_b_frequency(self) -> Frequency {
+    pub const fn band_b_frequency(&self) -> Frequency {
         self.band_b_frequency
     }
 }
@@ -123,6 +134,8 @@ impl IfTapSavedState {
 /// One step of the ordered IF-tap restore sequence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IfTapRestoreStep {
+    /// Match the supplied snapshot to this radio's pending restoration.
+    MatchSnapshot,
     /// Forcing the USB audio output to the normal audio path first, so the
     /// remaining writes are not rejected by an engaged tap.
     ForceAudioOutput,
@@ -147,6 +160,7 @@ pub enum IfTapRestoreStep {
 impl std::fmt::Display for IfTapRestoreStep {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
+            Self::MatchSnapshot => "matching the pending IF-tap snapshot",
             Self::ForceAudioOutput => "USB audio output to the audio path",
             Self::StepSize => "Band B tuning step",
             Self::Frequency => "Band B frequency",
@@ -199,7 +213,7 @@ impl IfTapRestoreReport {
     }
 }
 
-/// [`Radio::enter_if_tap`] failed; already-applied settings were rolled back.
+/// IF-tap entry failure, its rollback result, and retained restoration state.
 #[derive(Debug, thiserror::Error)]
 #[error("entering the IF tap failed: {source}")]
 pub struct IfTapEnterError {
@@ -210,8 +224,9 @@ pub struct IfTapEnterError {
     pub rollback: IfTapRestoreReport,
     /// The snapshot taken before configuration, retained only when the
     /// rollback did not complete, so the caller can retry
-    /// [`Radio::restore_if_tap`] later. `None` means nothing was left
-    /// changed on the radio.
+    /// [`Radio::restore_if_tap`] later. `None` accompanies a completed rollback
+    /// or rejection before a new snapshot was taken. An existing restoration
+    /// remains available through [`Radio::pending_if_tap_state`].
     pub snapshot: Option<IfTapSavedState>,
 }
 
@@ -219,8 +234,9 @@ pub struct IfTapEnterError {
 ///
 /// Created by [`Radio::enter_if_tap`]. Dropping the session without calling
 /// [`exit`](Self::exit) performs no restore (an async restore cannot run in
-/// `Drop`); detach with [`into_saved_state`](Self::into_saved_state) if the
-/// borrow cannot live long enough and restore later with
+/// `Drop`). [`Radio::pending_if_tap_state`] retains the original settings after
+/// session drop or cancellation. Detach with [`into_saved_state`](Self::into_saved_state)
+/// when the borrow cannot live long enough, then restore later with
 /// [`Radio::restore_if_tap`].
 #[derive(Debug)]
 pub struct IfTapSession<'radio, T: Transport> {
@@ -236,19 +252,36 @@ impl<T: Transport> IfTapSession<'_, T> {
         &self.saved
     }
 
-    /// Access the underlying radio during capture.
-    ///
-    /// Writes that change the saved settings will not be re-captured; the
-    /// restore still re-applies the original snapshot, including the original
-    /// tuning step and frequency raster.
-    pub const fn radio(&mut self) -> &mut Radio<T> {
+    /// Inspect the radio while this session retains its original snapshot.
+    #[must_use]
+    pub const fn radio(&self) -> &Radio<T> {
         self.radio
+    }
+
+    /// Select and read back an audio output while retaining restoration.
+    ///
+    /// # Errors
+    ///
+    /// Returns the setter/readback error or [`Error::IfTapNotEngaged`].
+    pub async fn set_output(&mut self, output: UsbAudioOutput) -> Result<UsbAudioOutput, Error> {
+        engage_output(self.radio, output).await?;
+        self.config.output = output;
+        Ok(output)
+    }
+
+    /// Set and read back Band B's step; exit still restores the original step.
+    ///
+    /// # Errors
+    ///
+    /// Returns the CAT error or a mismatching readback.
+    pub async fn set_step(&mut self, step: StepSize) -> Result<(), Error> {
+        self.radio.write_and_verify_if_tap_step(step).await
     }
 
     /// Detach the snapshot without restoring, for callers that cannot keep
     /// this borrow alive. Restore later with [`Radio::restore_if_tap`].
     #[must_use]
-    pub const fn into_saved_state(self) -> IfTapSavedState {
+    pub fn into_saved_state(self) -> IfTapSavedState {
         self.saved
     }
 
@@ -331,6 +364,20 @@ fn verify_if_tap_value<Value: std::fmt::Debug + PartialEq>(
 }
 
 impl<T: Transport> Radio<T> {
+    /// The original IF-tap settings retained before the first configuration write.
+    ///
+    /// Entry or restoration cancellation leaves this snapshot available. Clone
+    /// it and call [`Self::restore_if_tap`] after recovering any CAT ambiguity.
+    #[must_use]
+    pub const fn pending_if_tap_state(&self) -> Option<&IfTapSavedState> {
+        self.if_tap_saved.as_ref()
+    }
+
+    fn matches_if_tap_state(&self, saved: &IfTapSavedState) -> bool {
+        self.if_tap_saved
+            .as_ref()
+            .is_some_and(|pending| Arc::ptr_eq(&pending.lease, &saved.lease))
+    }
     /// Enter the IF tap: guard preconditions, snapshot the touched settings,
     /// apply `config`, and prove the output engaged.
     ///
@@ -354,7 +401,7 @@ impl<T: Transport> Radio<T> {
     /// let mut radio = Radio::new(transport);
     ///
     /// let mut session = radio
-    ///     .enter_if_tap(IfTapConfig::new(OperatingMode::Usb))
+    ///     .enter_if_tap(IfTapConfig::new(OperatingMode::Usb)?)
     ///     .await?;
     /// session
     ///     .step_to_frequency(Frequency::from_mhz_str("145.240")?)
@@ -381,6 +428,10 @@ impl<T: Transport> Radio<T> {
             snapshot: None,
         };
 
+        if self.if_tap_saved.is_some() {
+            return Err(preflight(Error::IfTapRestorePending));
+        }
+
         let tuning_mode = self.get_tuning_mode(Band::B).await.map_err(&preflight)?;
         if tuning_mode != TuningMode::Vfo {
             return Err(preflight(Error::VfoTuningRequired {
@@ -390,6 +441,7 @@ impl<T: Transport> Radio<T> {
         }
 
         let saved = IfTapSavedState {
+            lease: Arc::new(()),
             active_band: self.get_band().await.map_err(&preflight)?,
             band_mode: self.get_band_mode().await.map_err(&preflight)?,
             output: self.get_usb_audio_output().await.map_err(&preflight)?,
@@ -399,8 +451,10 @@ impl<T: Transport> Radio<T> {
             step: self.get_step_size(Band::B).await.map_err(&preflight)?,
         };
 
+        self.if_tap_saved = Some(saved.clone());
+
         if let Err(source) = self.configure_if_tap(config).await {
-            let rollback = self.restore_if_tap(saved).await;
+            let rollback = self.restore_if_tap(saved.clone()).await;
             let snapshot = if rollback.is_complete() {
                 None
             } else {
@@ -473,10 +527,23 @@ impl<T: Transport> Radio<T> {
         target: Frequency,
         engaged_output: UsbAudioOutput,
     ) -> Result<Frequency, Error> {
+        if !self.matches_if_tap_state(saved) {
+            return Err(Error::IfTapSnapshotMismatch);
+        }
         let current = self.get_frequency(Band::B).await?;
         let step = self.get_step_size(Band::B).await?;
         preflight_walk(current, target, step)?;
         preflight_walk(saved.band_b_frequency, target, saved.step)?;
+        let tuning_mode = self.get_tuning_mode(Band::B).await?;
+        if tuning_mode != TuningMode::Vfo {
+            return Err(Error::VfoTuningRequired {
+                band: Band::B,
+                current: tuning_mode,
+            });
+        }
+        if self.get_band().await? != Band::B {
+            self.write_and_verify_if_tap_band(Band::B).await?;
+        }
         if current == target {
             engage_output(self, engaged_output).await?;
             return Ok(current);
@@ -519,9 +586,21 @@ impl<T: Transport> Radio<T> {
             steps.push(IfTapRestoreStep::SavedOutput);
         }
 
+        if !self.matches_if_tap_state(&saved) {
+            report.failures.push((
+                IfTapRestoreStep::MatchSnapshot,
+                Error::IfTapSnapshotMismatch,
+            ));
+            report.not_attempted = steps;
+            return report;
+        }
+
         let mut remaining = steps.into_iter();
         for step in remaining.by_ref() {
             let outcome = match step {
+                IfTapRestoreStep::MatchSnapshot => {
+                    unreachable!("snapshot validation precedes restoration")
+                }
                 IfTapRestoreStep::ForceAudioOutput => {
                     engage_output(self, UsbAudioOutput::Audio).await
                 }
@@ -553,6 +632,9 @@ impl<T: Transport> Radio<T> {
                     break;
                 }
             }
+        }
+        if report.is_complete() {
+            self.if_tap_saved = None;
         }
         report
     }
@@ -667,14 +749,7 @@ mod tests {
     /// Queue the full happy-path enter script: VFO guard, seven saves (step
     /// included), configure writes, and the engagement proof.
     fn queue_enter_script(mock: &mut MockTransport) {
-        mock.expect(b"VM 1\r", b"VM 1,0\r");
-        mock.expect(b"BC\r", b"BC 0\r");
-        mock.expect(b"DL\r", b"DL 0\r");
-        mock.expect(b"IO\r", b"IO 0\r");
-        mock.expect(b"SQ 1\r", b"SQ 1,2\r");
-        mock.expect(b"MD 1\r", b"MD 1,0\r");
-        mock.expect(b"FQ 1\r", b"FQ 1,0145000000\r");
-        mock.expect(b"SF 1\r", b"SF 1,5\r");
+        queue_snapshot(mock);
         mock.expect(b"BC 1\r", b"BC 1\r");
         mock.expect(b"BC\r", b"BC 1\r");
         mock.expect(b"DL 1\r", b"DL 1\r");
@@ -689,8 +764,21 @@ mod tests {
         mock.expect(b"IO\r", b"IO 1\r");
     }
 
-    const fn usb_if_config() -> IfTapConfig {
-        IfTapConfig::new(OperatingMode::Usb).with_step(StepSize::Hz5000)
+    fn queue_snapshot(mock: &mut MockTransport) {
+        mock.expect(b"VM 1\r", b"VM 1,0\r");
+        mock.expect(b"BC\r", b"BC 0\r");
+        mock.expect(b"DL\r", b"DL 0\r");
+        mock.expect(b"IO\r", b"IO 0\r");
+        mock.expect(b"SQ 1\r", b"SQ 1,2\r");
+        mock.expect(b"MD 1\r", b"MD 1,0\r");
+        mock.expect(b"FQ 1\r", b"FQ 1,0145000000\r");
+        mock.expect(b"SF 1\r", b"SF 1,5\r");
+    }
+
+    fn usb_if_config() -> IfTapConfig {
+        IfTapConfig::new(OperatingMode::Usb)
+            .unwrap_or_else(|_| unreachable!("USB is an analog IF-tap mode"))
+            .with_step(StepSize::Hz5000)
     }
 
     fn detached_saved_state(frequency: Frequency) -> Result<IfTapSavedState, Error> {
@@ -702,6 +790,7 @@ mod tests {
         step: StepSize,
     ) -> Result<IfTapSavedState, Error> {
         Ok(IfTapSavedState {
+            lease: Arc::new(()),
             active_band: Band::A,
             band_mode: BandMode::Dual,
             output: UsbAudioOutput::Audio,
@@ -710,6 +799,145 @@ mod tests {
             band_b_frequency: frequency,
             step,
         })
+    }
+
+    #[test]
+    fn configuration_rejects_digital_voice_and_repeater_modes() {
+        for mode in [OperatingMode::Dv, OperatingMode::Dr] {
+            assert!(
+                matches!(IfTapConfig::new(mode), Err(ValidationError::IfTapDigitalMode { mode: actual }) if actual == mode),
+                "digital mode {mode} must fail before I/O"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_entry_retains_the_original_snapshot_before_the_first_write() -> TestResult {
+        let mut mock = MockTransport::new();
+        queue_snapshot(&mut mock);
+        mock.expect_hang(b"BC 1\r");
+        let mut radio = Radio::new(mock);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                radio.enter_if_tap(usb_if_config())
+            )
+            .await
+            .is_err(),
+            "entry must remain suspended at the first configuration exchange"
+        );
+        let saved = radio
+            .pending_if_tap_state()
+            .ok_or("cancelled entry lost its original settings")?;
+        assert_eq!(saved.active_band, Band::A);
+        assert_eq!(saved.step, StepSize::Hz12500);
+        assert_eq!(saved.band_b_frequency().as_hz(), 145_000_000);
+        assert!(radio.cat_recovery_required());
+        let writes = radio.transport.writes().len();
+        let next = radio.enter_if_tap(usb_if_config()).await;
+        assert!(
+            matches!(next, Err(IfTapEnterError { source, .. }) if matches!(*source, Error::IfTapRestorePending)),
+            "a second entry must retain the first snapshot"
+        );
+        assert_eq!(radio.transport.writes().len(), writes);
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snapshots_from_another_radio_are_refused_before_any_io() -> TestResult {
+        let saved = detached_saved_state(Frequency::new(145_000_000))?;
+        let mut radio = Radio::new(MockTransport::new());
+        radio.if_tap_saved = Some(detached_saved_state(Frequency::new(145_000_000))?);
+        let retune = radio
+            .retune_if_tap(
+                &saved,
+                Frequency::new(145_005_000),
+                UsbAudioOutput::IntermediateFrequency,
+            )
+            .await;
+        assert!(
+            matches!(retune, Err(Error::IfTapSnapshotMismatch)),
+            "{retune:?}"
+        );
+        let report = radio.restore_if_tap(saved).await;
+        assert!(
+            matches!(
+                report.failures(),
+                [(
+                    IfTapRestoreStep::MatchSnapshot,
+                    Error::IfTapSnapshotMismatch
+                )]
+            ),
+            "{report:?}"
+        );
+        assert!(radio.pending_if_tap_state().is_some());
+        assert!(radio.transport.writes().is_empty());
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retuning_refuses_a_fresh_non_vfo_context_before_changing_output() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"FQ 1\r", b"FQ 1,0145000000\r");
+        mock.expect(b"SF 1\r", b"SF 1,0\r");
+        mock.expect(b"VM 1\r", b"VM 1,1\r");
+        let mut radio = Radio::new(mock);
+        let saved = detached_saved_state(Frequency::new(145_000_000))?;
+        radio.if_tap_saved = Some(saved.clone());
+        let result = radio
+            .retune_if_tap(
+                &saved,
+                Frequency::new(145_005_000),
+                UsbAudioOutput::IntermediateFrequency,
+            )
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(Error::VfoTuningRequired {
+                    band: Band::B,
+                    current: TuningMode::Memory
+                })
+            ),
+            "{result:?}"
+        );
+        radio.transport.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retuning_reselects_and_verifies_band_b_before_stepping() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"FQ 1\r", b"FQ 1,0145000000\r");
+        mock.expect(b"SF 1\r", b"SF 1,0\r");
+        mock.expect(b"VM 1\r", b"VM 1,0\r");
+        mock.expect(b"BC\r", b"BC 0\r");
+        mock.expect(b"BC 1\r", b"BC 1\r");
+        mock.expect(b"BC\r", b"BC 1\r");
+        mock.expect(b"IO 0\r", b"IO 0\r");
+        mock.expect(b"IO\r", b"IO 0\r");
+        mock.expect(b"UP\r", b"UP\r");
+        mock.expect(b"FQ 1\r", b"FQ 1,0145005000\r");
+        mock.expect(b"IO 1\r", b"IO 1\r");
+        mock.expect(b"IO\r", b"IO 1\r");
+        let mut radio = Radio::new(mock);
+        let saved = detached_saved_state(Frequency::new(145_000_000))?;
+        radio.if_tap_saved = Some(saved.clone());
+        assert_eq!(
+            radio
+                .retune_if_tap(
+                    &saved,
+                    Frequency::new(145_005_000),
+                    UsbAudioOutput::IntermediateFrequency
+                )
+                .await?
+                .as_hz(),
+            145_005_000
+        );
+        radio.transport.assert_complete();
+        Ok(())
     }
 
     #[tokio::test]
@@ -722,6 +950,7 @@ mod tests {
         assert_eq!(
             session.saved_state(),
             &IfTapSavedState {
+                lease: Arc::new(()),
                 active_band: Band::A,
                 band_mode: BandMode::Dual,
                 output: UsbAudioOutput::Audio,
@@ -766,8 +995,11 @@ mod tests {
         // new 5 kHz live raster while also bounding the target against the
         // saved 12.5 kHz restore raster.
         mock.expect(b"SF 1,0\r", b"SF 1,0\r");
+        mock.expect(b"SF 1\r", b"SF 1,0\r");
         mock.expect(b"FQ 1\r", b"FQ 1,0145000000\r");
         mock.expect(b"SF 1\r", b"SF 1,0\r");
+        mock.expect(b"VM 1\r", b"VM 1,0\r");
+        mock.expect(b"BC\r", b"BC 1\r");
         mock.expect(b"IO 0\r", b"IO 0\r");
         mock.expect(b"IO\r", b"IO 0\r");
         for frequency in [
@@ -807,14 +1039,11 @@ mod tests {
 
         let mut radio = Radio::new(mock);
         let mut session = radio
-            .enter_if_tap(IfTapConfig::new(OperatingMode::Usb))
+            .enter_if_tap(IfTapConfig::new(OperatingMode::Usb)?)
             .await?;
         assert_eq!(session.saved_state().step, StepSize::Hz12500);
 
-        session
-            .radio()
-            .set_step_size(Band::B, StepSize::Hz5000)
-            .await?;
+        session.set_step(StepSize::Hz5000).await?;
         let landed = session
             .step_to_frequency(Frequency::new(145_025_000))
             .await?;
@@ -1174,6 +1403,8 @@ mod tests {
         queue_enter_script(&mut mock);
         mock.expect(b"FQ 1\r", b"FQ 1,0145000000\r");
         mock.expect(b"SF 1\r", b"SF 1,0\r");
+        mock.expect(b"VM 1\r", b"VM 1,0\r");
+        mock.expect(b"BC\r", b"BC 1\r");
         mock.expect(b"IO 0\r", b"IO 0\r");
         mock.expect(b"IO\r", b"IO 0\r");
         mock.expect(b"UP\r", b"UP\r");
@@ -1208,6 +1439,8 @@ mod tests {
         queue_enter_script(&mut mock);
         mock.expect(b"FQ 1\r", b"FQ 1,0145000000\r");
         mock.expect(b"SF 1\r", b"SF 1,0\r");
+        mock.expect(b"VM 1\r", b"VM 1,0\r");
+        mock.expect(b"BC\r", b"BC 1\r");
         mock.expect(b"IO 0\r", b"IO 0\r");
         mock.expect(b"IO\r", b"IO 0\r");
         mock.expect(b"UP\r", b"UP\r");
@@ -1241,6 +1474,8 @@ mod tests {
         queue_enter_script(&mut mock);
         mock.expect(b"FQ 1\r", b"FQ 1,0145000000\r");
         mock.expect(b"SF 1\r", b"SF 1,0\r");
+        mock.expect(b"VM 1\r", b"VM 1,0\r");
+        mock.expect(b"BC\r", b"BC 1\r");
         mock.expect(b"IO 0\r", b"IO 0\r");
         mock.expect(b"IO\r", b"IO 0\r");
         for _ in 0..MAX_RETUNE_STALLS {
@@ -1267,6 +1502,8 @@ mod tests {
         let mut mock = MockTransport::new();
         mock.expect(b"FQ 1\r", b"FQ 1,0145010000\r");
         mock.expect(b"SF 1\r", b"SF 1,0\r");
+        mock.expect(b"VM 1\r", b"VM 1,0\r");
+        mock.expect(b"BC\r", b"BC 1\r");
         mock.expect(b"IO 0\r", b"IO 0\r");
         mock.expect(b"IO\r", b"IO 0\r");
         mock.expect(b"DW\r", b"DW\r");
@@ -1275,6 +1512,7 @@ mod tests {
         mock.expect(b"IO\r", b"IO 1\r");
         let mut radio = Radio::new(mock);
         let saved = detached_saved_state(Frequency::new(145_000_000))?;
+        radio.if_tap_saved = Some(saved.clone());
 
         let landed = radio
             .retune_if_tap(
@@ -1293,10 +1531,13 @@ mod tests {
         let mut mock = MockTransport::new();
         mock.expect(b"FQ 1\r", b"FQ 1,0145005000\r");
         mock.expect(b"SF 1\r", b"SF 1,0\r");
+        mock.expect(b"VM 1\r", b"VM 1,0\r");
+        mock.expect(b"BC\r", b"BC 1\r");
         mock.expect(b"IO 1\r", b"IO 1\r");
         mock.expect(b"IO\r", b"IO 0\r");
         let mut radio = Radio::new(mock);
         let saved = detached_saved_state(Frequency::new(145_000_000))?;
+        radio.if_tap_saved = Some(saved.clone());
 
         let result = radio
             .retune_if_tap(
@@ -1327,6 +1568,7 @@ mod tests {
         mock.expect(b"SF 1\r", b"SF 1,0\r");
         let mut radio = Radio::new(mock);
         let saved = detached_saved_state_with_step(Frequency::new(145_000_000), StepSize::Hz12500)?;
+        radio.if_tap_saved = Some(saved.clone());
 
         let result = radio
             .retune_if_tap(
@@ -1374,12 +1616,25 @@ mod tests {
         mock.expect(b"BC\r", b"BC 0\r");
         let mut radio = Radio::new(mock);
         let saved = detached_saved_state_with_step(Frequency::new(145_000_000), StepSize::Hz12500)?;
+        radio.if_tap_saved = Some(saved.clone());
 
-        let report = radio.restore_if_tap(saved).await;
+        let report = radio.restore_if_tap(saved.clone()).await;
 
         assert!(
             report.is_complete(),
             "frequency restore on the saved raster must complete: {report:?}"
+        );
+        assert!(radio.pending_if_tap_state().is_none());
+        let stale = radio.restore_if_tap(saved).await;
+        assert!(
+            matches!(
+                stale.failures(),
+                [(
+                    IfTapRestoreStep::MatchSnapshot,
+                    Error::IfTapSnapshotMismatch
+                )]
+            ),
+            "completed restoration must invalidate old snapshots: {stale:?}"
         );
         radio.transport.assert_complete();
         Ok(())
@@ -1411,6 +1666,7 @@ mod tests {
         mock.expect(b"BC\r", b"BC 0\r");
         let mut radio = Radio::new(mock);
         let saved = detached_saved_state_with_step(Frequency::new(145_000_000), StepSize::Hz12500)?;
+        radio.if_tap_saved = Some(saved.clone());
 
         let report = radio.restore_if_tap(saved).await;
 
@@ -1428,6 +1684,7 @@ mod tests {
         mock.expect(b"IO 0\r", b"IO invalid\r");
         let mut radio = Radio::new(mock);
         let saved = detached_saved_state(Frequency::new(145_000_000))?;
+        radio.if_tap_saved = Some(saved.clone());
 
         let report = radio.restore_if_tap(saved).await;
 
@@ -1462,6 +1719,8 @@ mod tests {
         // First move one step from the saved frequency.
         mock.expect(b"FQ 1\r", b"FQ 1,0145000000\r");
         mock.expect(b"SF 1\r", b"SF 1,0\r");
+        mock.expect(b"VM 1\r", b"VM 1,0\r");
+        mock.expect(b"BC\r", b"BC 1\r");
         mock.expect(b"IO 0\r", b"IO 0\r");
         mock.expect(b"IO\r", b"IO 0\r");
         mock.expect(b"UP\r", b"UP\r");
@@ -1477,6 +1736,7 @@ mod tests {
         mock.expect(b"SF 1\r", b"SF 1,0\r");
         let mut radio = Radio::new(mock);
         let saved = detached_saved_state(Frequency::new(145_000_000))?;
+        radio.if_tap_saved = Some(saved.clone());
 
         let first = radio
             .retune_if_tap(
@@ -1515,6 +1775,8 @@ mod tests {
 
         mock.expect(b"FQ 1\r", b"FQ 1,0145000000\r");
         mock.expect(b"SF 1\r", b"SF 1,0\r");
+        mock.expect(b"VM 1\r", b"VM 1,0\r");
+        mock.expect(b"BC\r", b"BC 1\r");
         mock.expect(b"IO 0\r", b"IO 0\r");
         mock.expect(b"IO\r", b"IO 0\r");
         mock.expect(b"UP\r", b"UP\r");

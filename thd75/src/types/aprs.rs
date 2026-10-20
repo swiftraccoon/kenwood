@@ -702,11 +702,11 @@ impl From<BeaconInterval> for u8 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct AprsLock {
     /// Prevent frequency changes while APRS lock is active.
-    pub frequency: bool,
+    frequency: bool,
     /// Lock PTT operation.
-    pub ptt: bool,
+    ptt: bool,
     /// Lock the APRS key.
-    pub aprs_key: bool,
+    aprs_key: bool,
 }
 
 impl AprsLock {
@@ -724,14 +724,49 @@ impl AprsLock {
         aprs_key: true,
     };
 
-    /// Creates an APRS lock value from its three independent controls.
+    /// Creates an APRS lock value with every control unlocked.
     #[must_use]
-    pub const fn new(frequency: bool, ptt: bool, aprs_key: bool) -> Self {
-        Self {
-            frequency,
-            ptt,
-            aprs_key,
-        }
+    pub const fn new() -> Self {
+        Self::NONE
+    }
+
+    /// Select whether frequency changes are locked.
+    #[must_use]
+    pub const fn with_frequency(mut self, locked: bool) -> Self {
+        self.frequency = locked;
+        self
+    }
+
+    /// Select whether PTT operation is locked.
+    #[must_use]
+    pub const fn with_ptt(mut self, locked: bool) -> Self {
+        self.ptt = locked;
+        self
+    }
+
+    /// Select whether the APRS key is locked.
+    #[must_use]
+    pub const fn with_aprs_key(mut self, locked: bool) -> Self {
+        self.aprs_key = locked;
+        self
+    }
+
+    /// Return whether frequency changes are locked.
+    #[must_use]
+    pub const fn frequency(self) -> bool {
+        self.frequency
+    }
+
+    /// Return whether PTT operation is locked.
+    #[must_use]
+    pub const fn ptt(self) -> bool {
+        self.ptt
+    }
+
+    /// Return whether the APRS key is locked.
+    #[must_use]
+    pub const fn aprs_key(self) -> bool {
+        self.aprs_key
     }
 }
 
@@ -2899,20 +2934,43 @@ pub struct QsySettings {
 }
 
 impl QsySettings {
-    /// Creates QSY information settings.
+    /// Creates QSY information settings with all optional information disabled.
     #[must_use]
-    pub const fn new(
-        info_in_status: bool,
-        tone_narrow: bool,
-        shift_offset: bool,
-        limit_distance: QsyLimitDistance,
-    ) -> Self {
+    pub const fn new() -> Self {
         Self {
-            info_in_status,
-            tone_narrow,
-            shift_offset,
-            limit_distance,
+            info_in_status: false,
+            tone_narrow: false,
+            shift_offset: false,
+            limit_distance: QsyLimitDistance::Off,
         }
+    }
+
+    /// Select whether status beacons include QSY information.
+    #[must_use]
+    pub const fn with_info_in_status(mut self, enabled: bool) -> Self {
+        self.info_in_status = enabled;
+        self
+    }
+
+    /// Select whether QSY data includes tone and narrow-FM information.
+    #[must_use]
+    pub const fn with_tone_narrow(mut self, enabled: bool) -> Self {
+        self.tone_narrow = enabled;
+        self
+    }
+
+    /// Select whether QSY data includes repeater shift and offset.
+    #[must_use]
+    pub const fn with_shift_offset(mut self, enabled: bool) -> Self {
+        self.shift_offset = enabled;
+        self
+    }
+
+    /// Select the QSY display-distance limit.
+    #[must_use]
+    pub const fn with_limit_distance(mut self, limit: QsyLimitDistance) -> Self {
+        self.limit_distance = limit;
+        self
     }
 
     /// Returns whether status beacons include QSY information.
@@ -3120,7 +3178,7 @@ impl From<VoiceAlertMode> for u8 {
 // ---------------------------------------------------------------------------
 
 /// One Menu No. 594 message group code.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct MessageGroupCode(String);
 
 impl MessageGroupCode {
@@ -3135,7 +3193,12 @@ impl MessageGroupCode {
     /// Returns [`ValidationError::TextLengthOutOfRange`] unless `code` is one
     /// to nine bytes, or [`ValidationError::InvalidTextByte`] at the first
     /// byte outside the documented character set.
-    pub fn new(code: &str) -> Result<Self, ValidationError> {
+    pub fn new(value: &str) -> Result<Self, ValidationError> {
+        Self::validate(value)?;
+        Ok(Self(value.to_owned()))
+    }
+
+    fn validate(code: &str) -> Result<(), ValidationError> {
         if code.is_empty() || code.len() > Self::MAX_LEN {
             return Err(ValidationError::TextLengthOutOfRange {
                 name: "APRS message group code",
@@ -3153,7 +3216,7 @@ impl MessageGroupCode {
                 detail: "must contain only uppercase ASCII letters, digits, hyphen, or wildcard",
             });
         }
-        Ok(Self(code.to_owned()))
+        Ok(())
     }
 
     /// Returns this group code.
@@ -3164,7 +3227,7 @@ impl MessageGroupCode {
 }
 
 /// Up to six message group codes stored by Menu No. 594.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct MessageGroupCodes(Vec<MessageGroupCode>);
 
 impl MessageGroupCodes {
@@ -3210,6 +3273,14 @@ impl MessageGroupCodes {
         if value.is_empty() {
             return Ok(Self(Vec::new()));
         }
+        let count = value.split(',').count();
+        if count > Self::MAX_CODES {
+            return Err(ValidationError::CollectionLengthOutOfRange {
+                name: "APRS message group code list",
+                len: count,
+                detail: "must contain at most 6 entries",
+            });
+        }
         let codes = value
             .split(',')
             .map(MessageGroupCode::new)
@@ -3221,6 +3292,23 @@ impl MessageGroupCodes {
     #[must_use]
     pub fn as_slice(&self) -> &[MessageGroupCode] {
         &self.0
+    }
+
+    /// Borrow the configured codes in radio order.
+    pub fn iter(&self) -> std::slice::Iter<'_, MessageGroupCode> {
+        self.0.iter()
+    }
+
+    /// Return the number of configured codes.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Return whether no message group codes are configured.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 }
 
@@ -3237,7 +3325,7 @@ impl fmt::Display for MessageGroupCodes {
 }
 
 /// One Menu No. 595 bulletin group code.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BulletinGroupCode(String);
 
 impl BulletinGroupCode {
@@ -3252,7 +3340,12 @@ impl BulletinGroupCode {
     /// Returns [`ValidationError::TextLengthOutOfRange`] unless `code` is one
     /// to five bytes, or [`ValidationError::InvalidTextByte`] at the first
     /// byte outside the documented character set.
-    pub fn new(code: &str) -> Result<Self, ValidationError> {
+    pub fn new(value: &str) -> Result<Self, ValidationError> {
+        Self::validate(value)?;
+        Ok(Self(value.to_owned()))
+    }
+
+    fn validate(code: &str) -> Result<(), ValidationError> {
         if code.is_empty() || code.len() > Self::MAX_LEN {
             return Err(ValidationError::TextLengthOutOfRange {
                 name: "APRS bulletin group code",
@@ -3272,7 +3365,7 @@ impl BulletinGroupCode {
                 detail: "must contain only uppercase ASCII letters, digits, or hyphen",
             });
         }
-        Ok(Self(code.to_owned()))
+        Ok(())
     }
 
     /// Returns this group code.
@@ -3283,7 +3376,7 @@ impl BulletinGroupCode {
 }
 
 /// Up to six bulletin group codes stored by Menu No. 595.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
 pub struct BulletinGroupCodes(Vec<BulletinGroupCode>);
 
 impl BulletinGroupCodes {
@@ -3318,6 +3411,14 @@ impl BulletinGroupCodes {
         if value.is_empty() {
             return Ok(Self(Vec::new()));
         }
+        let count = value.split(',').count();
+        if count > Self::MAX_CODES {
+            return Err(ValidationError::CollectionLengthOutOfRange {
+                name: "APRS bulletin group code list",
+                len: count,
+                detail: "must contain at most 6 entries",
+            });
+        }
         let codes = value
             .split(',')
             .map(BulletinGroupCode::new)
@@ -3329,6 +3430,23 @@ impl BulletinGroupCodes {
     #[must_use]
     pub fn as_slice(&self) -> &[BulletinGroupCode] {
         &self.0
+    }
+
+    /// Borrow the configured bulletin codes in radio order.
+    pub fn iter(&self) -> std::slice::Iter<'_, BulletinGroupCode> {
+        self.0.iter()
+    }
+
+    /// Return the number of configured codes.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Return whether no bulletin group codes are configured.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 }
 
@@ -3343,6 +3461,92 @@ impl fmt::Display for BulletinGroupCodes {
         Ok(())
     }
 }
+
+macro_rules! group_code_traits {
+    ($type:ty) => {
+        impl AsRef<str> for $type {
+            fn as_ref(&self) -> &str {
+                self.as_str()
+            }
+        }
+        impl std::str::FromStr for $type {
+            type Err = ValidationError;
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                Self::new(value)
+            }
+        }
+        impl TryFrom<&str> for $type {
+            type Error = ValidationError;
+            fn try_from(value: &str) -> Result<Self, Self::Error> {
+                Self::new(value)
+            }
+        }
+        impl TryFrom<String> for $type {
+            type Error = ValidationError;
+            fn try_from(value: String) -> Result<Self, Self::Error> {
+                Self::validate(&value)?;
+                Ok(Self(value))
+            }
+        }
+        impl From<$type> for String {
+            fn from(value: $type) -> Self {
+                value.0
+            }
+        }
+        impl fmt::Display for $type {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                fmt::Display::fmt(&self.0, formatter)
+            }
+        }
+    };
+}
+
+group_code_traits!(MessageGroupCode);
+group_code_traits!(BulletinGroupCode);
+
+macro_rules! group_collection_traits {
+    ($collection:ty, $code:ty) => {
+        impl TryFrom<Vec<$code>> for $collection {
+            type Error = ValidationError;
+            fn try_from(codes: Vec<$code>) -> Result<Self, Self::Error> {
+                Self::new(codes)
+            }
+        }
+        impl From<$collection> for Vec<$code> {
+            fn from(codes: $collection) -> Self {
+                codes.0
+            }
+        }
+        impl AsRef<[$code]> for $collection {
+            fn as_ref(&self) -> &[$code] {
+                self.as_slice()
+            }
+        }
+        impl std::str::FromStr for $collection {
+            type Err = ValidationError;
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                Self::from_csv(value)
+            }
+        }
+        impl<'input> IntoIterator for &'input $collection {
+            type Item = &'input $code;
+            type IntoIter = std::slice::Iter<'input, $code>;
+            fn into_iter(self) -> Self::IntoIter {
+                self.iter()
+            }
+        }
+        impl IntoIterator for $collection {
+            type Item = $code;
+            type IntoIter = std::vec::IntoIter<$code>;
+            fn into_iter(self) -> Self::IntoIter {
+                self.0.into_iter()
+            }
+        }
+    };
+}
+
+group_collection_traits!(MessageGroupCodes, MessageGroupCode);
+group_collection_traits!(BulletinGroupCodes, BulletinGroupCode);
 
 // ---------------------------------------------------------------------------
 // NAVITRA
@@ -3640,38 +3844,6 @@ pub struct StoredAprsMessage {
 }
 
 // ---------------------------------------------------------------------------
-// APRS station (received position report)
-// ---------------------------------------------------------------------------
-
-/// A received APRS station report from the station list.
-///
-/// The TH-D75 maintains a list of recently heard APRS stations with
-/// their position, status, and other information.
-#[derive(Debug, Clone, PartialEq)]
-pub struct AprsStation {
-    /// Station callsign with SSID.
-    pub callsign: AprsCallsign,
-    /// Station latitude in decimal degrees (positive = North).
-    pub latitude: f64,
-    /// Station longitude in decimal degrees (positive = East).
-    pub longitude: f64,
-    /// Station altitude in meters (if available).
-    pub altitude: Option<f64>,
-    /// Station course in degrees (0-360, if moving).
-    pub course: Option<f64>,
-    /// Station speed in km/h (if moving).
-    pub speed: Option<f64>,
-    /// Station comment text.
-    pub comment: String,
-    /// Station APRS icon.
-    pub icon: AprsIcon,
-    /// Distance from own position in km (calculated by radio).
-    pub distance: Option<f64>,
-    /// Bearing from own position in degrees (calculated by radio).
-    pub bearing: Option<f64>,
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -3958,7 +4130,10 @@ mod tests {
             let lock = AprsLock::try_from(raw)?;
             assert_eq!(u8::from(lock), raw);
         }
-        assert_eq!(AprsLock::try_from(5)?, AprsLock::new(true, false, true));
+        assert_eq!(
+            AprsLock::try_from(5)?,
+            AprsLock::new().with_frequency(true).with_aprs_key(true)
+        );
         assert!(AprsLock::try_from(8).is_err());
         Ok(())
     }
@@ -3970,6 +4145,62 @@ mod tests {
             assert_eq!(u8::from(flags), raw);
         }
         assert!(PacketFilterFlags::try_from(0x80).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_group_collection_conversions_preserve_order_without_truncation() -> TestResult {
+        let codes = ["A", "B", "C", "D", "E", "F"]
+            .into_iter()
+            .map(MessageGroupCode::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        let allocation = codes.as_ptr();
+        let groups = MessageGroupCodes::try_from(codes)?;
+        assert_eq!(groups.len(), 6);
+        assert_eq!(groups.as_ref().as_ptr(), allocation);
+        assert_eq!(
+            (&groups)
+                .into_iter()
+                .map(MessageGroupCode::as_str)
+                .collect::<Vec<_>>(),
+            ["A", "B", "C", "D", "E", "F"]
+        );
+        let recovered = Vec::<MessageGroupCode>::from(groups);
+        assert_eq!(recovered.as_ptr(), allocation);
+        let seventh = vec![MessageGroupCode::new("A")?; 7];
+        assert!(matches!(
+            MessageGroupCodes::try_from(seventh),
+            Err(ValidationError::CollectionLengthOutOfRange { len: 7, .. })
+        ));
+        assert!(matches!(
+            "A,B,C,D,E,F,G".parse::<MessageGroupCodes>(),
+            Err(ValidationError::CollectionLengthOutOfRange { len: 7, .. })
+        ));
+
+        let input = String::from("WX");
+        let allocation = input.as_ptr();
+        let code = BulletinGroupCode::try_from(input)?;
+        assert_eq!(code.as_ref().as_ptr(), allocation);
+        let groups = BulletinGroupCodes::try_from(vec![code, BulletinGroupCode::new("ARES")?])?;
+        assert_eq!(
+            groups
+                .iter()
+                .map(BulletinGroupCode::as_str)
+                .collect::<Vec<_>>(),
+            ["WX", "ARES"]
+        );
+        assert_eq!(
+            groups.into_iter().map(String::from).collect::<Vec<_>>(),
+            ["WX", "ARES"]
+        );
+        assert!(matches!(
+            BulletinGroupCodes::try_from(vec![BulletinGroupCode::new("WX")?; 7]),
+            Err(ValidationError::CollectionLengthOutOfRange { len: 7, .. })
+        ));
+        assert!(matches!(
+            "A,B,C,D,E,F,G".parse::<BulletinGroupCodes>(),
+            Err(ValidationError::CollectionLengthOutOfRange { len: 7, .. })
+        ));
         Ok(())
     }
 

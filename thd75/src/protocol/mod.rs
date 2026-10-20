@@ -14,6 +14,19 @@
 //! the established MCP entry command remains paired with its dedicated binary
 //! programming implementation.
 
+use crate::error::ProtocolError;
+use crate::types::{
+    AfGainLevel, AntennaInput, AprsCallsign, BacklightControl, Band, BandMode, BeaconMode,
+    CatChannelRecord, CatMemoryChannelRecord, CurrentMemorySelector, DstarCallsign, DstarSlot,
+    DstarSuffix, DvGatewayMode, FilterMode, FilterWidthIndex, FineStep, FirmwareIdentity,
+    Frequency, GpsRadioMode, GpsSettings, MemoryChannelAddress, MemoryReadOffset,
+    MyPositionSelection, NmeaSentence, NmeaSentences, OperatingMode, PacketDataRate, PowerLevel,
+    RadioClock, RadioModel, RadioType, ReadLen, SMeterReading, SerialInformation, SquelchLevel,
+    StepSize, TncDataBand, TncMode, TuningMode, UsbAudioOutput, VoxDelay, VoxGain,
+};
+
+pub use codec::Codec;
+
 mod aprs;
 mod bluetooth;
 pub mod codec;
@@ -30,19 +43,6 @@ mod sd;
 mod tone;
 mod user;
 mod vfo;
-
-pub use codec::Codec;
-
-use crate::error::ProtocolError;
-use crate::types::{
-    AfGainLevel, AntennaInput, AprsCallsign, BacklightControl, Band, BandMode, BeaconMode,
-    CatChannelRecord, CatMemoryChannelRecord, CurrentMemorySelector, DstarCallsign, DstarSlot,
-    DstarSuffix, DvGatewayMode, FilterMode, FilterWidthIndex, FineStep, FirmwareIdentity,
-    Frequency, GpsRadioMode, GpsSettings, MemoryChannelAddress, MemoryReadOffset,
-    MyPositionSelection, NmeaSentence, NmeaSentences, OperatingMode, PacketDataRate, PowerLevel,
-    RadioClock, RadioModel, RadioType, ReadLen, SMeterReading, SerialInformation, SquelchLevel,
-    StepSize, TncDataBand, TncMode, TuningMode, UsbAudioOutput, VoxDelay, VoxGain,
-};
 
 /// A typed CAT wire command.
 ///
@@ -544,14 +544,10 @@ pub enum Command {
     GetSdCard,
 
     // === Memory read (requires modified firmware) ===
-    /// Read `len` bytes at `offset` from the radio's readable memory window.
+    /// Offline `GM` memory-read request with individually checked wire fields.
     ///
-    /// # Firmware requirement
-    ///
-    /// Requires firmware modified by the `thd75-fw` project. It reuses the `GM`
-    /// mnemonic, which on stock firmware selects the GPS operating mode, so a
-    /// stock radio refuses this request and [`Command::GetGpsMode`] stops
-    /// working on a modified one. See [`memread`] for the wire format.
+    /// [`memread`] defines its grammar and the separate qualified execution
+    /// boundary that checks complete ranges before I/O.
     ReadMemory {
         /// Offset into the readable window. Not an absolute address.
         offset: MemoryReadOffset,

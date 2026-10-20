@@ -7,18 +7,20 @@
 //!
 //! # Firmware requirement
 //!
-//! Memory reads require firmware modified by the `thd75-fw` project. The
-//! command reuses the `GM` mnemonic, which on stock firmware selects the GPS
-//! operating mode, so a stock radio refuses the request. Callers should confirm
-//! support before trusting a read rather than assuming it.
+//! Stock V1.03 uses `GM` for GPS operating mode. Executable memory reads use
+//! [`crate::radio::memory_read::MemoryReader`], obtained through exact implementation
+//! attestation with [`crate::radio::Radio::qualify_mem_read_for`]. It validates
+//! every complete offset/length span against its qualified target before I/O.
+//! This module's command AST, descriptors, and serializers describe individual
+//! wire fields; they also represent ranges that the qualified reader rejects.
 //!
 //! Because one host library talks to both stock and modified radios, the reply
 //! parser here declines anything not shaped like a memory-read reply, leaving
 //! genuine GPS-mode replies to the GPS parser.
 
-use crate::error::ProtocolError;
 use std::fmt;
 
+use crate::error::ProtocolError;
 use crate::types::{MemoryReadOffset, MemoryReadTarget, ReadLen};
 
 use super::Response;

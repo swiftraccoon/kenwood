@@ -19,31 +19,6 @@
 //! TX/RX, Memory, Audio File, GPS, APRS, Digital (D-STAR), FM
 //! Broadcasting, SD Card, and Configuration.
 
-pub mod aprs;
-pub mod band;
-pub mod bluetooth;
-pub mod channel;
-pub mod channel_display_name;
-pub mod cw;
-pub mod dstar;
-pub mod dtmf;
-pub mod echolink;
-pub mod fm;
-pub mod frequency;
-pub mod gps;
-pub mod identity;
-pub mod kiss;
-pub mod mode;
-pub mod radio_params;
-pub mod repeater;
-pub mod scan;
-pub mod settings;
-pub mod system;
-pub mod tone;
-pub mod voice;
-pub mod weather;
-pub mod wireless;
-
 pub use band::Band;
 pub use channel::{
     CatChannelRecord, CatMemoryChannelRecord, ChannelByte0eBits3To2, ChannelCodeUnidentifiedBits,
@@ -71,12 +46,12 @@ pub use tone::{CTCSS_FREQUENCIES, CtcssCode, DCS_CODES, DcsCode, ToneCode, ToneM
 // APRS subsystem re-exports.
 pub use aprs::{
     AltnetAddress, AprsCallsign, AprsIcon, AprsLock, AprsNetwork, AprsNetworkType, AprsSettings,
-    AprsStation, AprsSymbolCode, AprsSymbolTable, AutoReplyCallsignPrefix, AutoReplyDelay,
-    AutoReplySettings, AutoReplyTarget, BeaconControl, BeaconInterval, BulletinGroupCode,
-    BulletinGroupCodes, DcdSense, DigipeaterFunction, DisplayArea, FloodAlias, InterruptTime,
-    MessageGroupCode, MessageGroupCodes, NavitraGroupCode, NavitraGroupMode, NavitraMessage,
-    NavitraMessageSlot, NavitraSettings, NewNPacketPath, NotificationSettings, Others1PacketPath,
-    Others2PacketPath, Others3PacketPath, PacketFilter, PacketFilterDistance, PacketFilterFlags,
+    AprsSymbolCode, AprsSymbolTable, AutoReplyCallsignPrefix, AutoReplyDelay, AutoReplySettings,
+    AutoReplyTarget, BeaconControl, BeaconInterval, BulletinGroupCode, BulletinGroupCodes,
+    DcdSense, DigipeaterFunction, DisplayArea, FloodAlias, InterruptTime, MessageGroupCode,
+    MessageGroupCodes, NavitraGroupCode, NavitraGroupMode, NavitraMessage, NavitraMessageSlot,
+    NavitraSettings, NewNPacketPath, NotificationSettings, Others1PacketPath, Others2PacketPath,
+    Others3PacketPath, PacketFilter, PacketFilterDistance, PacketFilterFlags,
     PacketFilterPositionLimit, PacketPath, PacketPathAbbreviation, PacketPathHops,
     PositionAmbiguity, PositionComment, QsyDistance, QsyLimitDistance, QsySettings,
     RegionPacketPath, RelayPacketPath, ReplyMessage, RxBeep, StatusTextSlot, StoredAprsMessage,
@@ -92,8 +67,8 @@ pub use dstar::{
     CallsignEntry, CallsignEntryError, CallsignListMemo, CallsignListName, CallsignListTextError,
     DestinationSelect, DigitalSquelch, DigitalSquelchCode, DigitalSquelchType, DstarCallsign,
     DstarGpsAutoTxInterval, DstarGpsDataTxSentence, DstarGpsDataTxSentences,
-    DstarGpsDataTxSettings, DstarMessage, DstarMessageError, DstarQsoEntry, DstarSuffix, DvDrMode,
-    EmrVolume, Module, QsoDirection, ReflectorCallsign, ReflectorCommand, RouteSelect,
+    DstarGpsDataTxSettings, DstarMessage, DstarMessageError, DstarSuffix, DvDrMode, EmrVolume,
+    Module, QsoDirection, ReflectorCallsign, ReflectorCommand, RouteSelect,
 };
 
 // GPS subsystem re-exports.
@@ -107,7 +82,7 @@ pub use gps::{
 pub use fm::{FM_RADIO_CHANNEL_COUNT, FM_RADIO_MAX, FM_RADIO_MIN, FmRadioChannel, FmRadioMode};
 
 // Scan re-exports.
-pub use scan::{ProgramScanEdge, ScanResumeMethod, ScanType, VisualRange, VisualScanRange};
+pub use scan::{ScanResumeMethod, ScanType, VisualRange, VisualScanRange};
 
 // Settings re-exports.
 pub use settings::{
@@ -145,3 +120,28 @@ pub use weather::{WeatherAutoScan, WeatherSettings};
 
 // Wireless remote control re-exports.
 pub use wireless::RemoteControlCode;
+
+pub mod aprs;
+pub mod band;
+pub mod bluetooth;
+pub mod channel;
+pub mod channel_display_name;
+pub mod cw;
+pub mod dstar;
+pub mod dtmf;
+pub mod echolink;
+pub mod fm;
+pub mod frequency;
+pub mod gps;
+pub mod identity;
+pub mod kiss;
+pub mod mode;
+pub mod radio_params;
+pub mod repeater;
+pub mod scan;
+pub mod settings;
+pub mod system;
+pub mod tone;
+pub mod voice;
+pub mod weather;
+pub mod wireless;

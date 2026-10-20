@@ -123,6 +123,12 @@ pub struct AprsCurrentModeRecoveryUpdate {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum TerminalModeTransitionError {
+    /// The window cannot form an absolute deadline on this platform.
+    #[error("terminal-mode transition window {window:?} cannot form an absolute deadline")]
+    UnrepresentableWindow {
+        /// Requested transition window.
+        window: Duration,
+    },
     /// The poll interval is zero or longer than the transition window.
     #[error(
         "terminal-mode poll interval {poll_interval:?} must be nonzero and no longer than the \
@@ -157,8 +163,10 @@ impl TerminalModeTransition {
     /// # Errors
     ///
     /// Returns [`TerminalModeTransitionError::InvalidPollInterval`] when the
-    /// poll interval is zero or exceeds the window.
-    pub const fn new(
+    /// poll interval is zero or exceeds the window, or
+    /// [`TerminalModeTransitionError::UnrepresentableWindow`] when the window
+    /// cannot form an absolute deadline on this platform.
+    pub fn new(
         window: Duration,
         poll_interval: Duration,
     ) -> Result<Self, TerminalModeTransitionError> {
@@ -167,6 +175,9 @@ impl TerminalModeTransition {
                 poll_interval,
                 window,
             });
+        }
+        if tokio::time::Instant::now().checked_add(window).is_none() {
+            return Err(TerminalModeTransitionError::UnrepresentableWindow { window });
         }
         Ok(Self {
             window,
@@ -437,6 +448,18 @@ impl<T: Transport> Radio<T> {
         interface: PcOutputInterface,
         transition: TerminalModeTransition,
     ) -> Result<Self, (Option<Self>, Error)> {
+        if tokio::time::Instant::now()
+            .checked_add(transition.window())
+            .is_none()
+        {
+            return Err((
+                Some(self),
+                crate::error::ValidationError::UnrepresentableDuration {
+                    duration: transition.window(),
+                }
+                .into(),
+            ));
+        }
         if let Err(error) = self.verify_mcp_schema_target().await {
             if self.cat_recovery_required() || error.requires_recovery() {
                 drop(self.disconnect().await);
@@ -472,7 +495,16 @@ impl<T: Transport> Radio<T> {
             }
         }
 
-        let deadline = tokio::time::Instant::now() + transition.window();
+        let Some(deadline) = tokio::time::Instant::now().checked_add(transition.window()) else {
+            drop(self.disconnect().await);
+            return Err((
+                None,
+                crate::error::ValidationError::UnrepresentableDuration {
+                    duration: transition.window(),
+                }
+                .into(),
+            ));
+        };
         loop {
             // Inner scope: the pinned step future borrows `self`, and the
             // borrow must end before an outcome arm can move `self` out.
@@ -518,12 +550,12 @@ mod tests {
     use super::*;
     use crate::memory::menu_fields::menu_field;
     use kenwood_transport::MockTransport;
-    use mmdvm_core::{MMDVM_FRAME_START, MMDVM_GET_VERSION};
+    use mmdvm_core::{Command, MMDVM_FRAME_START};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     /// The same probe bytes the diagnostics module sends.
-    const PROBE: [u8; 3] = [MMDVM_FRAME_START, 0x03, MMDVM_GET_VERSION];
+    const PROBE: [u8; 3] = [MMDVM_FRAME_START, 0x03, Command::GET_VERSION.get()];
 
     #[test]
     fn registry_pins_terminal_and_kiss_interface_offsets() -> TestResult {
@@ -566,9 +598,47 @@ mod tests {
             longer,
             Err(TerminalModeTransitionError::InvalidPollInterval { .. })
         ));
+        assert!(matches!(
+            TerminalModeTransition::new(Duration::MAX, Duration::from_secs(1)),
+            Err(TerminalModeTransitionError::UnrepresentableWindow {
+                window: Duration::MAX
+            })
+        ));
         assert!(
             TerminalModeTransition::new(Duration::from_secs(2), Duration::from_secs(1)).is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn an_unrepresentable_transition_window_is_rejected_before_radio_io() -> TestResult {
+        let radio = Radio::new(MockTransport::new());
+        let policy = TerminalModeTransition {
+            window: Duration::MAX,
+            poll_interval: Duration::from_secs(1),
+        };
+        let result = radio
+            .enter_reflector_terminal_mode(PcOutputInterface::Usb, policy)
+            .await;
+        let Err((Some(radio), error)) = result else {
+            return Err(
+                "an unrepresentable transition did not preserve its untouched radio".into(),
+            );
+        };
+        assert!(
+            matches!(
+                error,
+                Error::Validation(crate::error::ValidationError::UnrepresentableDuration {
+                    duration: Duration::MAX
+                })
+            ),
+            "{error:?}"
+        );
+        assert!(
+            radio.transport.writes().is_empty(),
+            "preflight must precede persistent writes and identity traffic"
+        );
+        radio.transport.assert_complete();
+        Ok(())
     }
 
     /// Queue the schema preflight plus one two-page detached update that
@@ -590,14 +660,14 @@ mod tests {
             programming::build_read_command(programming::McpPage::new(GATEWAY_INTERFACE_PAGE)?);
         mock.expect(
             &interface_read,
-            &build_w_response(GATEWAY_INTERFACE_PAGE, &interface_original),
+            build_w_response(GATEWAY_INTERFACE_PAGE, &interface_original),
         );
         mock.expect(&[programming::ACK], &[programming::ACK]);
         let mode_read =
             programming::build_read_command(programming::McpPage::new(GATEWAY_MODE_PAGE)?);
         mock.expect(
             &mode_read,
-            &build_w_response(GATEWAY_MODE_PAGE, &mode_original),
+            build_w_response(GATEWAY_MODE_PAGE, &mode_original),
         );
         mock.expect(&[programming::ACK], &[programming::ACK]);
 
@@ -608,7 +678,7 @@ mod tests {
         mock.expect(&interface_write, &[programming::ACK]);
         mock.expect(
             &interface_read,
-            &build_w_response(GATEWAY_INTERFACE_PAGE, &interface_modified),
+            build_w_response(GATEWAY_INTERFACE_PAGE, &interface_modified),
         );
         mock.expect(&[programming::ACK], &[programming::ACK]);
         let mode_write = programming::build_write_command(
@@ -618,7 +688,7 @@ mod tests {
         mock.expect(&mode_write, &[programming::ACK]);
         mock.expect(
             &mode_read,
-            &build_w_response(GATEWAY_MODE_PAGE, &mode_modified),
+            build_w_response(GATEWAY_MODE_PAGE, &mode_modified),
         );
         mock.expect(&[programming::ACK], &[programming::ACK]);
         mock.expect(&[programming::EXIT], &[programming::ACK]);
@@ -746,14 +816,14 @@ mod tests {
             programming::build_read_command(programming::McpPage::new(GATEWAY_INTERFACE_PAGE)?);
         mock.expect(
             &interface_read,
-            &build_w_response(GATEWAY_INTERFACE_PAGE, &interface),
+            build_w_response(GATEWAY_INTERFACE_PAGE, &interface),
         );
         mock.expect(&[programming::ACK], &[programming::ACK]);
         let mut mode = [0_u8; programming::PAGE_SIZE];
         mode[GATEWAY_MODE_BYTE] = 1;
         let mode_read =
             programming::build_read_command(programming::McpPage::new(GATEWAY_MODE_PAGE)?);
-        mock.expect(&mode_read, &build_w_response(GATEWAY_MODE_PAGE, &mode));
+        mock.expect(&mode_read, build_w_response(GATEWAY_MODE_PAGE, &mode));
         mock.expect(&[programming::ACK], &[programming::ACK]);
         mock.expect(&[programming::EXIT], &[programming::ACK]);
         mock.expect_reopen(Ok(()));
@@ -781,7 +851,7 @@ mod tests {
         let interface_read = programming::build_read_command(kiss_page);
         mock.expect(
             &interface_read,
-            &build_w_response(KISS_INTERFACE_PAGE, &interface),
+            build_w_response(KISS_INTERFACE_PAGE, &interface),
         );
         mock.expect(&[programming::ACK], &[programming::ACK]);
         let mut data_band = [0_u8; programming::PAGE_SIZE];
@@ -790,14 +860,14 @@ mod tests {
             programming::build_read_command(programming::McpPage::new(TNC_DATA_BAND_PAGE)?);
         mock.expect(
             &data_band_read,
-            &build_w_response(TNC_DATA_BAND_PAGE, &data_band),
+            build_w_response(TNC_DATA_BAND_PAGE, &data_band),
         );
         mock.expect(&[programming::ACK], &[programming::ACK]);
         let mode_page = programming::McpPage::new(GATEWAY_MODE_PAGE)?;
         let mut mode = [0_u8; programming::PAGE_SIZE];
         mode[GATEWAY_MODE_BYTE] = u8::from(DvGatewayMode::ReflectorTerminal);
         let mode_read = programming::build_read_command(mode_page);
-        mock.expect(&mode_read, &build_w_response(GATEWAY_MODE_PAGE, &mode));
+        mock.expect(&mode_read, build_w_response(GATEWAY_MODE_PAGE, &mode));
         mock.expect(&[programming::ACK], &[programming::ACK]);
         mock.expect(&[programming::EXIT], &[programming::ACK]);
         mock.expect_reopen(Ok(()));
@@ -842,7 +912,7 @@ mod tests {
                 programming::build_read_command(programming::McpPage::new(KISS_INTERFACE_PAGE)?);
             mock.expect(
                 &interface_read,
-                &build_w_response(KISS_INTERFACE_PAGE, &interface),
+                build_w_response(KISS_INTERFACE_PAGE, &interface),
             );
             mock.expect(&[programming::ACK], &[programming::ACK]);
             let mut data_band = [0_u8; programming::PAGE_SIZE];
@@ -851,14 +921,14 @@ mod tests {
                 programming::build_read_command(programming::McpPage::new(TNC_DATA_BAND_PAGE)?);
             mock.expect(
                 &data_band_read,
-                &build_w_response(TNC_DATA_BAND_PAGE, &data_band),
+                build_w_response(TNC_DATA_BAND_PAGE, &data_band),
             );
             mock.expect(&[programming::ACK], &[programming::ACK]);
             let mut mode = [0_u8; programming::PAGE_SIZE];
             mode[GATEWAY_MODE_BYTE] = u8::from(DvGatewayMode::ReflectorTerminal);
             let mode_read =
                 programming::build_read_command(programming::McpPage::new(GATEWAY_MODE_PAGE)?);
-            mock.expect(&mode_read, &build_w_response(GATEWAY_MODE_PAGE, &mode));
+            mock.expect(&mode_read, build_w_response(GATEWAY_MODE_PAGE, &mode));
             mock.expect(&[programming::ACK], &[programming::ACK]);
             mock.expect(&[programming::EXIT], &[programming::ACK]);
             mock.expect_reopen(Ok(()));
@@ -906,7 +976,7 @@ mod tests {
             programming::build_read_command(programming::McpPage::new(KISS_INTERFACE_PAGE)?);
         mock.expect(
             &interface_read,
-            &build_w_response(KISS_INTERFACE_PAGE, &interface),
+            build_w_response(KISS_INTERFACE_PAGE, &interface),
         );
         mock.expect(&[programming::ACK], &[programming::ACK]);
         let mut data_band = [0_u8; programming::PAGE_SIZE];
@@ -915,7 +985,7 @@ mod tests {
             programming::build_read_command(programming::McpPage::new(TNC_DATA_BAND_PAGE)?);
         mock.expect(
             &data_band_read,
-            &build_w_response(TNC_DATA_BAND_PAGE, &data_band),
+            build_w_response(TNC_DATA_BAND_PAGE, &data_band),
         );
         mock.expect(&[programming::ACK], &[programming::ACK]);
         let mut mode_before = [0_u8; programming::PAGE_SIZE];
@@ -926,16 +996,13 @@ mod tests {
             programming::build_read_command(programming::McpPage::new(GATEWAY_MODE_PAGE)?);
         mock.expect(
             &mode_read,
-            &build_w_response(GATEWAY_MODE_PAGE, &mode_before),
+            build_w_response(GATEWAY_MODE_PAGE, &mode_before),
         );
         mock.expect(&[programming::ACK], &[programming::ACK]);
         let mode_write =
             programming::build_write_command(WritableMcpPage::new(GATEWAY_MODE_PAGE)?, &mode_after);
         mock.expect(&mode_write, &[programming::ACK]);
-        mock.expect(
-            &mode_read,
-            &build_w_response(GATEWAY_MODE_PAGE, &mode_after),
-        );
+        mock.expect(&mode_read, build_w_response(GATEWAY_MODE_PAGE, &mode_after));
         mock.expect(&[programming::ACK], &[programming::ACK]);
         mock.expect(&[programming::EXIT], &[programming::ACK]);
         let mut radio = Radio::new(mock);
@@ -966,14 +1033,14 @@ mod tests {
             programming::build_read_command(programming::McpPage::new(GATEWAY_INTERFACE_PAGE)?);
         mock.expect(
             &interface_read,
-            &build_w_response(GATEWAY_INTERFACE_PAGE, &interface),
+            build_w_response(GATEWAY_INTERFACE_PAGE, &interface),
         );
         mock.expect(&[programming::ACK], &[programming::ACK]);
         let mut mode = [0_u8; programming::PAGE_SIZE];
         mode[GATEWAY_MODE_BYTE] = 1;
         let mode_read =
             programming::build_read_command(programming::McpPage::new(GATEWAY_MODE_PAGE)?);
-        mock.expect(&mode_read, &build_w_response(GATEWAY_MODE_PAGE, &mode));
+        mock.expect(&mode_read, build_w_response(GATEWAY_MODE_PAGE, &mode));
         mock.expect(&[programming::ACK], &[programming::ACK]);
         // Unchanged: normal exit with CAT restoration.
         mock.expect(&[programming::EXIT], &[programming::ACK]);
@@ -1008,12 +1075,12 @@ mod tests {
             programming::build_read_command(programming::McpPage::new(GATEWAY_INTERFACE_PAGE)?);
         mock.expect(
             &interface_read,
-            &build_w_response(GATEWAY_INTERFACE_PAGE, &interface_original),
+            build_w_response(GATEWAY_INTERFACE_PAGE, &interface_original),
         );
         mock.expect(&[programming::ACK], &[programming::ACK]);
         let mode_read =
             programming::build_read_command(programming::McpPage::new(GATEWAY_MODE_PAGE)?);
-        mock.expect(&mode_read, &build_w_response(GATEWAY_MODE_PAGE, &mode));
+        mock.expect(&mode_read, build_w_response(GATEWAY_MODE_PAGE, &mode));
         mock.expect(&[programming::ACK], &[programming::ACK]);
 
         let interface_write = programming::build_write_command(
@@ -1023,7 +1090,7 @@ mod tests {
         mock.expect(&interface_write, &[programming::ACK]);
         mock.expect(
             &interface_read,
-            &build_w_response(GATEWAY_INTERFACE_PAGE, &interface_modified),
+            build_w_response(GATEWAY_INTERFACE_PAGE, &interface_modified),
         );
         mock.expect(&[programming::ACK], &[programming::ACK]);
         mock.expect(&[programming::EXIT], &[programming::ACK]);

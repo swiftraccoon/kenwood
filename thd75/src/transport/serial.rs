@@ -1,38 +1,15 @@
-//! Serial port transport for USB CDC ACM and Bluetooth SPP connections.
+//! USB CDC ACM and Bluetooth SPP serial endpoints for the TH-D75.
 //!
-//! The MAIN MPU (IC2005, OMAP-L138) communicates with the PC via USB
-//! Type-C (J1) using a Mentor Graphics MUSB USB 2.0 OTG controller
-//! with `MatrixQuest` CDC ACM stack. VID `0x2166` (JVCKENWOOD), PID
-//! `0x9023`. The USB interface presents as CDC ACM (class 0x02,
-//! subclass 0x02, protocol 0x01 V.25ter) with 3 endpoints: interrupt
-//! IN, bulk OUT, bulk IN. The endpoints span two USB interfaces
-//! (hardware-verified via ioreg): the class 02/02 control interface
-//! (`bInterfaceNumber` 0) carries the interrupt IN endpoint, and the
-//! class 0x0A CDC Data interface (`bInterfaceNumber` 1) carries both
-//! bulk endpoints; interfaces 2-3 are the UAC1 audio function. USB
-//! D+/D- run at Full Speed (12 Mbps).
+//! [`SerialTransport::open`] selects 115200 baud without flow control for a
+//! USB endpoint. [`SerialTransport::open_with_baud`] accepts a caller-selected
+//! nonzero USB rate. Classified Bluetooth SPP endpoints always use 9600 baud
+//! with RTS/CTS; opaque port names use [`SerialTransport::open_bluetooth`].
+//! Path classification and USB metadata select candidates; verify the radio's
+//! identity through [`crate::Radio::identify`] before control.
 //!
-//! USB uses 115200 baud (CDC ACM ignores line coding, per the Kenwood
-//! Operating Tips §5.13, "configuring the baud rate is unnecessary,
-//! selecting randomly will suffice" since it's a virtual COM port).
-//! USB also provides audio output (48 kHz, 16-bit, monaural, per §5.13.2).
-//!
-//! Bluetooth SPP runs through BT/GPS IC2044 → level-shift IC2046 →
-//! MAIN MPU UART2. Requires 9600 baud with RTS/CTS hardware flow
-//! control. The D75 supports Bluetooth 3.0 Class 2 with HSP + SPP
-//! profiles only (no BLE, no HFP). Per §5.12, "configuration of the
-//! baud rate is not necessary" for BT serial either, but 9600 is set
-//! explicitly for compatibility.
-//!
-//! The same VID/PID (2166:9023) is used in both normal operation and
-//! firmware update mode (PTT+1 at power-on), though update mode uses
-//! the bootloader's simpler USB implementation rather than `MatrixQuest`.
-//!
-//! [`open`](SerialTransport::open) uses the standard USB rate, while
-//! [`open_with_baud`](SerialTransport::open_with_baud) accepts an explicit
-//! USB rate. Both auto-detect BT ports and apply the required BT settings.
-//! Byte I/O and descriptor ownership are delegated to `kenwood-transport`;
-//! TH-D75 discovery, line presets, and identity-preserving reopen remain here.
+//! Byte I/O and descriptor ownership belong to `kenwood-transport`. This
+//! wrapper retains the selected path, line preset and USB identity so a reopen
+//! cannot silently choose another enumerated radio.
 
 use std::num::NonZeroU32;
 
@@ -42,7 +19,7 @@ use kenwood_transport::serial::{
 use kenwood_transport::{Transport, TransportError};
 
 /// Baud rate for Bluetooth SPP connections.
-const BT_BAUD: u32 = 9600;
+const BT_BAUD: NonZeroU32 = NonZeroU32::new(9600).unwrap();
 
 /// Serial port transport for USB CDC ACM and Bluetooth SPP connections.
 ///
@@ -62,7 +39,7 @@ pub struct SerialTransport {
     path: String,
     /// Last successfully applied host baud. A USB reopen preserves it;
     /// Bluetooth reopens reapply the fixed Bluetooth profile.
-    baud: u32,
+    baud: NonZeroU32,
     /// Stable USB identity captured from enumeration. Reopen uses this
     /// instead of selecting the first radio with the same VID/PID.
     usb_identity: Option<UsbReopenIdentity>,
@@ -233,16 +210,16 @@ fn select_usb_reopen_path(
 /// An opaque `COM` path cannot reconstruct explicit Bluetooth selection.
 fn open_replacement<T>(
     path: &str,
-    baud: u32,
+    baud: NonZeroU32,
     is_bluetooth: bool,
-    open: impl FnOnce(&str, u32, bool) -> Result<T, TransportError>,
+    open: impl FnOnce(&str, NonZeroU32, bool) -> Result<T, TransportError>,
 ) -> Result<T, TransportError> {
     open(path, baud, is_bluetooth)
 }
 
 impl SerialTransport {
     /// Default baud rate for USB CDC ACM.
-    pub const DEFAULT_BAUD: u32 = 115_200;
+    pub const DEFAULT_BAUD: NonZeroU32 = NonZeroU32::new(115_200).unwrap();
 
     /// USB Vendor ID (VID) for JVCKENWOOD Corporation.
     pub const USB_VID: u16 = 0x2166;
@@ -261,22 +238,13 @@ impl SerialTransport {
             || (lower.contains("bluetooth") && !lower.contains("incoming"))
     }
 
-    fn serial_options(
-        requested_baud: u32,
-        is_bluetooth: bool,
-    ) -> Result<SerialOptions, std::io::Error> {
-        let actual_baud = if is_bluetooth {
+    const fn serial_options(requested_baud: NonZeroU32, is_bluetooth: bool) -> SerialOptions {
+        let baud = if is_bluetooth {
             BT_BAUD
         } else {
             requested_baud
         };
-        let baud = NonZeroU32::new(actual_baud).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "serial baud rate must be nonzero",
-            )
-        })?;
-        Ok(SerialOptions {
+        SerialOptions {
             baud,
             flow_control: if is_bluetooth {
                 FlowControl::Hardware
@@ -290,7 +258,7 @@ impl SerialTransport {
             } else {
                 CloseMode::Shutdown
             },
-        })
+        }
     }
 
     /// Open a serial port by path.
@@ -316,10 +284,14 @@ impl SerialTransport {
     ///
     /// # Errors
     ///
-    /// Returns [`TransportError::Open`] if the port cannot be opened, the
-    /// effective baud rate is zero, or no Tokio runtime is active on the
-    /// calling thread. Opening requires an I/O-enabled Tokio reactor.
-    pub fn open_with_baud(path: &str, baud: u32) -> Result<Self, TransportError> {
+    /// Returns [`TransportError::Open`] if the port cannot be opened or no
+    /// Tokio runtime is active. Opening requires an I/O-enabled Tokio reactor.
+    ///
+    /// ```compile_fail
+    /// use kenwood_thd75::SerialTransport;
+    /// let invalid = SerialTransport::open_with_baud("/dev/unused", 0);
+    /// ```
+    pub fn open_with_baud(path: &str, baud: NonZeroU32) -> Result<Self, TransportError> {
         Self::open_classified(path, baud, Self::is_bluetooth_port(path))
     }
 
@@ -339,15 +311,10 @@ impl SerialTransport {
 
     fn open_classified(
         path: &str,
-        requested_baud: u32,
+        requested_baud: NonZeroU32,
         is_bluetooth: bool,
     ) -> Result<Self, TransportError> {
-        let options = Self::serial_options(requested_baud, is_bluetooth).map_err(|source| {
-            TransportError::Open {
-                path: path.to_owned(),
-                source,
-            }
-        })?;
+        let options = Self::serial_options(requested_baud, is_bluetooth);
         tracing::debug!(
             path,
             bluetooth = is_bluetooth,
@@ -365,7 +332,7 @@ impl SerialTransport {
             endpoint,
             is_bluetooth,
             path: path.to_owned(),
-            baud: options.baud.get(),
+            baud: options.baud,
             usb_identity,
         })
     }
@@ -434,7 +401,7 @@ impl SerialTransport {
 }
 
 impl Transport for SerialTransport {
-    fn set_baud_rate(&mut self, baud: u32) -> Result<(), TransportError> {
+    fn set_baud_rate(&mut self, baud: NonZeroU32) -> Result<(), TransportError> {
         self.endpoint.set_baud_rate(baud)?;
         self.baud = baud;
         Ok(())
@@ -518,10 +485,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn constants_match_re_data() {
+    fn constants_match_the_model_presets() {
         assert_eq!(SerialTransport::USB_VID, 0x2166);
         assert_eq!(SerialTransport::USB_PID, 0x9023);
-        assert_eq!(SerialTransport::DEFAULT_BAUD, 115_200);
+        assert_eq!(SerialTransport::DEFAULT_BAUD.get(), 115_200);
     }
 
     #[test]
@@ -558,7 +525,7 @@ mod tests {
     fn serial_open_constructors_have_typed_signatures() {
         fn require_open_signatures(
             _: fn(&str) -> Result<SerialTransport, TransportError>,
-            _: fn(&str, u32) -> Result<SerialTransport, TransportError>,
+            _: fn(&str, NonZeroU32) -> Result<SerialTransport, TransportError>,
             _: fn(&str) -> Result<SerialTransport, TransportError>,
         ) {
         }
@@ -573,7 +540,8 @@ mod tests {
     #[test]
     fn explicit_usb_baud_is_preserved_without_flow_control()
     -> Result<(), Box<dyn std::error::Error>> {
-        let options = SerialTransport::serial_options(57_600, false)?;
+        let options =
+            SerialTransport::serial_options(NonZeroU32::new(57_600).ok_or("nonzero baud")?, false);
         assert_eq!(options.baud.get(), 57_600);
         assert_eq!(options.flow_control, FlowControl::None);
         assert_eq!(options.dtr, LineState::Preserve);
@@ -585,9 +553,12 @@ mod tests {
     #[test]
     fn bluetooth_overrides_requested_baud_and_enables_hardware_flow_control()
     -> Result<(), Box<dyn std::error::Error>> {
-        for requested_baud in [0, 230_400] {
-            let options = SerialTransport::serial_options(requested_baud, true)?;
-            assert_eq!(options.baud.get(), BT_BAUD);
+        for requested_baud in [1, 230_400] {
+            let options = SerialTransport::serial_options(
+                NonZeroU32::new(requested_baud).ok_or("nonzero baud")?,
+                true,
+            );
+            assert_eq!(options.baud, BT_BAUD);
             assert_eq!(options.flow_control, FlowControl::Hardware);
             assert_eq!(options.dtr, LineState::Preserve);
             assert_eq!(options.rts, LineState::Preserve);
@@ -597,35 +568,24 @@ mod tests {
     }
 
     #[test]
-    fn zero_usb_baud_fails_before_open() -> Result<(), Box<dyn std::error::Error>> {
-        let result = SerialTransport::open_with_baud("test-endpoint", 0);
-        let Err(TransportError::Open { path, source }) = result else {
-            return Err(format!("expected a typed open error, got {result:?}").into());
-        };
-        assert_eq!(path, "test-endpoint");
-        assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput);
-        Ok(())
-    }
-
-    #[test]
     fn opaque_bluetooth_reopen_keeps_explicit_classification()
     -> Result<(), Box<dyn std::error::Error>> {
         assert!(!SerialTransport::is_bluetooth_port("COM3"));
-        let options = open_replacement("COM3", 230_400, true, |path, baud, bluetooth| {
-            assert_eq!(path, "COM3");
-            assert_eq!(baud, 230_400);
-            assert!(
-                bluetooth,
-                "reopen discarded explicit Bluetooth classification"
-            );
-            SerialTransport::serial_options(baud, bluetooth).map_err(|source| {
-                TransportError::Open {
-                    path: path.to_owned(),
-                    source,
-                }
-            })
-        })?;
-        assert_eq!(options.baud.get(), BT_BAUD);
+        let options = open_replacement(
+            "COM3",
+            NonZeroU32::new(230_400).ok_or("nonzero baud")?,
+            true,
+            |path, baud, bluetooth| {
+                assert_eq!(path, "COM3");
+                assert_eq!(baud.get(), 230_400);
+                assert!(
+                    bluetooth,
+                    "reopen discarded explicit Bluetooth classification"
+                );
+                Ok(SerialTransport::serial_options(baud, bluetooth))
+            },
+        )?;
+        assert_eq!(options.baud, BT_BAUD);
         assert_eq!(options.flow_control, FlowControl::Hardware);
         assert_eq!(options.close_mode, CloseMode::Drop);
         Ok(())

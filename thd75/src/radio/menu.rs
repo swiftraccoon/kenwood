@@ -7,12 +7,13 @@
 
 use crate::error::Error;
 use crate::memory::menu_fields::MenuField;
-use crate::memory::schema::{DecodedFieldValue, SchemaError};
+use crate::memory::schema::SchemaError;
 use crate::memory::{
     MCP_D75_SCHEMA_FIRMWARE, MCP_D75_SCHEMA_FIRMWARE_IDENTITIES, MCP_D75_SCHEMA_MODEL, PatchSet,
     is_supported_mcp_d75_schema_target,
 };
 use crate::protocol::programming::{self, McpPage, WritableMcpPage};
+use kenwood_schema::DecodedFieldValue;
 use kenwood_transport::Transport;
 
 use super::Radio;
@@ -280,9 +281,10 @@ mod tests {
     use crate::error::Error;
     use crate::memory::PatchPlanner;
     use crate::memory::menu_fields::menu_field;
-    use crate::memory::schema::{DecodedFieldValue, FieldValue, SchemaError};
+    use crate::memory::schema::SchemaError;
     use crate::protocol::programming;
     use crate::radio::Radio;
+    use kenwood_schema::{DecodedFieldValue, FieldValue};
     use kenwood_transport::MockTransport;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -310,7 +312,7 @@ mod tests {
         mock.expect(b"FV\r", b"FV 1.03\r");
         mock.expect(programming::ENTER_PROGRAMMING, programming::ENTER_RESPONSE);
         let read = programming::build_read_command(programming::McpPage::new(0x10)?);
-        mock.expect(&read, &build_w_response(0x10, &stored));
+        mock.expect(&read, build_w_response(0x10, &stored));
         mock.expect(&[programming::ACK], &[programming::ACK]);
         mock.expect(&[programming::EXIT], &[programming::ACK]);
         mock.expect_reopen(Ok(()));
@@ -431,14 +433,14 @@ mod tests {
         mock.expect(b"FV\r", b"FV 1.03\r");
         mock.expect(programming::ENTER_PROGRAMMING, programming::ENTER_RESPONSE);
         let read = programming::build_read_command(programming::McpPage::new(0x10)?);
-        mock.expect(&read, &build_w_response(0x10, &stored));
+        mock.expect(&read, build_w_response(0x10, &stored));
         mock.expect(&[programming::ACK], &[programming::ACK]);
         let write = programming::build_write_command(
             programming::WritableMcpPage::new(0x10)?,
             &replacement,
         );
         mock.expect(&write, &[programming::ACK]);
-        mock.expect(&read, &build_w_response(0x10, &replacement));
+        mock.expect(&read, build_w_response(0x10, &replacement));
         mock.expect(&[programming::ACK], &[programming::ACK]);
         mock.expect(&[programming::EXIT], &[programming::ACK]);
         mock.expect_reopen(Ok(()));

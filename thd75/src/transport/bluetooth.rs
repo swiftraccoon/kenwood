@@ -26,6 +26,15 @@ pub struct BluetoothTransport {
 }
 
 impl BluetoothTransport {
+    /// Exact paired address resolved by the successful selected open.
+    ///
+    /// Retain this value when reopening through a new connection; a display
+    /// name or rediscovered serial path does not identify the same device.
+    #[must_use]
+    pub const fn address(&self) -> &BluetoothAddress {
+        &self.address
+    }
+
     /// Open the default TH-D75 name or an explicit name/address selector.
     ///
     /// Retries once, after a one-second wait and with a fresh helper process,

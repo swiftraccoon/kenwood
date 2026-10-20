@@ -15,10 +15,9 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use kenwood_schema::{
-    BooleanDecoding, ByteClaims, CodecError, DecodeOptions, MaskedByte, PatchError, TextPolicy,
-    ValueDomain,
+    BooleanDecoding, ByteClaims, CodecError, DecodeOptions, DecodedFieldValue, FieldCodec,
+    FieldValue, MaskedByte, PatchError, TextPolicy, ValueDomain, ValueKind,
 };
-pub use kenwood_schema::{DecodedFieldValue, Endian, FieldCodec, FieldValue, StringEncoding};
 
 use crate::protocol::programming::{self, McpPage, WritableMcpPage};
 
@@ -76,11 +75,7 @@ impl FieldDescriptor {
     /// Returns [`SchemaError::OffsetTooLarge`] when the span overflows the
     /// host's address space, or
     /// [`SchemaError::OutOfBounds`] when the span leaves the physical image.
-    /// Malformed storage metadata returns [`SchemaError::Codec`] before allocation.
     pub fn pages(self) -> Result<Vec<McpPage>, SchemaError> {
-        self.codec
-            .validate()
-            .map_err(|source| self.codec_error(source))?;
         let len = self.codec.encoded_len();
         let last_offset = self
             .offset
@@ -120,7 +115,7 @@ impl FieldDescriptor {
     ///
     /// # Errors
     ///
-    /// Returns an error for an out-of-bounds field, malformed codec, invalid
+    /// Returns an error for an out-of-bounds field, stale descriptor, invalid
     /// encoded value, or a value outside the field's declared domain.
     /// [`CodecError::FixedStringDataAfterNul`] identifies an ambiguous
     /// NUL-padded field instead of discarding bytes after its terminator. If
@@ -140,7 +135,7 @@ impl FieldDescriptor {
     ///
     /// # Errors
     ///
-    /// Returns an error for an out-of-bounds field, malformed codec, or an
+    /// Returns an error for an out-of-bounds field, stale descriptor, or an
     /// invalid stored representation such as a non-boolean byte in a boolean
     /// field or malformed fixed-width text.
     pub fn read_stored(self, image: &[u8]) -> Result<DecodedFieldValue, SchemaError> {
@@ -157,8 +152,8 @@ impl FieldDescriptor {
     /// # Errors
     ///
     /// Returns an error for a mismatched value kind, a value wider than the
-    /// storage representation, malformed text or byte lengths, malformed
-    /// codec metadata, or a stale generated descriptor.
+    /// storage representation, malformed text or byte lengths, or a stale
+    /// generated descriptor.
     pub fn validate_stored_value(self, value: FieldValue<'_>) -> Result<(), SchemaError> {
         let _catalog_field = self.validate_catalog_descriptor()?;
         let _encoded = encode_field(&self, value, ValueDomain::Stored)?;
@@ -181,9 +176,6 @@ impl FieldDescriptor {
 
     fn decode(self, image: &[u8], domain: ValueDomain) -> Result<DecodedFieldValue, SchemaError> {
         let menu_field = self.validate_catalog_descriptor()?;
-        self.codec
-            .validate()
-            .map_err(|source| self.codec_error(source))?;
         let bytes = read_range(image, self.name, self.offset, self.codec.encoded_len())?;
         let decoded = self
             .codec
@@ -232,9 +224,9 @@ pub enum SchemaError {
         /// Field name.
         field: &'static str,
         /// Codec's expected value kind.
-        expected: &'static str,
+        expected: ValueKind,
         /// Supplied value kind.
-        actual: &'static str,
+        actual: ValueKind,
     },
     /// An unsigned raw value is not a member of the field's finite domain.
     DisallowedValue {
@@ -502,9 +494,9 @@ impl PatchPlanner {
     /// before merging; an error leaves all previously planned bytes and bit
     /// claims unchanged, and the planner remains usable.
     ///
-    /// The descriptor's storage codec is always validated here. Finite enum
-    /// and UI-choice domains live in the generated [`MenuField`] metadata; if
-    /// this descriptor names a generated menu field, those domains are also
+    /// The descriptor carries a construction-validated storage codec. Finite
+    /// enum and UI-choice domains live in generated [`MenuField`] metadata.
+    /// If this descriptor names a generated menu field, those domains are also
     /// enforced so callers cannot bypass [`MenuField::plan_value`] by passing
     /// its descriptor directly. A descriptor that reuses a generated field
     /// name but does not exactly match its catalog entry is rejected.
@@ -516,7 +508,7 @@ impl PatchPlanner {
     /// [`SchemaError::CatalogDescriptorMismatch`] when generated catalog
     /// metadata has been altered. Other errors cover type mismatches,
     /// out-of-range values, oversized or padding-ambiguous text, invalid byte
-    /// input, malformed descriptors, and conflicting overlapping patches.
+    /// input, invalid spans, and conflicting overlapping patches.
     ///
     /// [`MenuField`]: super::MenuField
     /// [`MenuField::plan_value`]: super::MenuField::plan_value
@@ -596,10 +588,6 @@ fn encode_field(
     value: FieldValue<'_>,
     domain: ValueDomain,
 ) -> Result<Vec<MaskedByte>, SchemaError> {
-    field
-        .codec
-        .validate()
-        .map_err(|source| field.codec_error(source))?;
     let len = field.codec.encoded_len();
     if len > programming::TOTAL_SIZE {
         return Err(SchemaError::OutOfBounds {
@@ -650,28 +638,26 @@ impl super::menu_fields::StorageTransform {
     /// Convert a stored raw integer into its display-unit value, rounded to
     /// one decimal place (the official application's display precision).
     ///
-    /// Returns `None` when the transform's numerator is zero (malformed
-    /// metadata) or the raw value exceeds the exactly-representable integer
-    /// range of `f64`.
+    /// Returns `None` when the raw value exceeds the exactly-representable
+    /// integer range of `f64`. Construction requires positive ratio operands.
     #[must_use]
     pub fn decode_display(&self, raw: u64) -> Option<f64> {
         const EXACT_INTEGER_BOUND: u64 = 1 << 53;
-        if self.numerator == 0 || raw > EXACT_INTEGER_BOUND {
+        if raw > EXACT_INTEGER_BOUND {
             return None;
         }
         #[expect(
             clippy::cast_precision_loss,
-            reason = "raw is bounded to 2^53 above, and generated numerators and denominators \
-                      are small unit ratios, so every conversion here is exact"
+            reason = "raw is bounded to 2^53 above, so its conversion is exact"
         )]
-        let value = (raw as f64) * (self.denominator as f64) / (self.numerator as f64);
+        let value = (raw as f64) * f64::from(self.denominator()) / f64::from(self.numerator());
         Some((value * 10.0).round() / 10.0)
     }
 
     /// Convert a display-unit value into the stored raw integer:
     /// `round(display * numerator / denominator)`.
     ///
-    /// Returns `None` for a non-finite input, a zero denominator, a negative
+    /// Returns `None` for a non-finite input, a negative
     /// result, or a result beyond the exactly-representable integer range of
     /// `f64`. Field-domain validation stays with the patch planner:
     /// [`PatchPlanner::set`] enforces generated domains on the encoded value.
@@ -679,15 +665,11 @@ impl super::menu_fields::StorageTransform {
     pub fn encode_display(&self, display: f64) -> Option<u64> {
         /// Largest f64 value that is still an exactly-representable integer.
         const EXACT_INTEGER_BOUND: f64 = 9_007_199_254_740_992.0;
-        if !display.is_finite() || self.denominator == 0 {
+        if !display.is_finite() {
             return None;
         }
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "generated numerators and denominators are small unit ratios; the \
-                      conversion is exact"
-        )]
-        let encoded = (display * self.numerator as f64 / self.denominator as f64).round();
+        let encoded =
+            (display * f64::from(self.numerator()) / f64::from(self.denominator())).round();
         if !(0.0..=EXACT_INTEGER_BOUND).contains(&encoded) {
             return None;
         }
@@ -704,6 +686,7 @@ impl super::menu_fields::StorageTransform {
 #[cfg(test)]
 mod tests {
     use kenwood_schema::FieldCodec as SharedFieldCodec;
+    use kenwood_schema::{CodecSpec, Endian, StringEncoding};
 
     use super::*;
 
@@ -712,17 +695,20 @@ mod tests {
     const ENABLE: FieldDescriptor = FieldDescriptor::new(
         "test.enable",
         0x1010,
-        FieldCodec::BitField {
+        match FieldCodec::new(CodecSpec::BitField {
             mask: 0b0000_0100,
             shift: 2,
             min: 0,
             max: 1,
+        }) {
+            Ok(codec) => codec,
+            Err(_) => unreachable!(),
         },
     );
 
     #[test]
     fn stored_boolean_stays_canonical_with_a_typed_shared_error() -> TestResult {
-        let codec: SharedFieldCodec = FieldCodec::Bool;
+        let codec: SharedFieldCodec = FieldCodec::BOOL;
         let field = FieldDescriptor::new("test.bool", 0, codec);
         let Err(error) = field.read_stored(&[2]) else {
             return Err("stored decoding must not normalize an invalid boolean".into());
@@ -743,24 +729,18 @@ mod tests {
     }
 
     #[test]
-    fn malformed_spans_are_rejected_before_allocation_or_plan_mutation() -> TestResult {
+    fn oversized_spans_are_rejected_before_allocation_or_plan_mutation() -> TestResult {
         let mut planner = PatchPlanner::new();
         let _planner = planner.set(&ENABLE, FieldValue::Unsigned(1))?;
-        let empty = FieldDescriptor::new("test.empty", 1, FieldCodec::Bytes { len: 0 });
-        assert!(matches!(empty.pages(), Err(SchemaError::Codec { .. })));
-        assert!(matches!(
-            planner.set(&empty, FieldValue::Bytes(&[])),
-            Err(SchemaError::Codec { .. })
-        ));
         for len in [programming::TOTAL_SIZE + 1, usize::MAX] {
             let huge = FieldDescriptor::new(
                 "test.huge",
                 0,
-                FieldCodec::FixedString {
+                FieldCodec::new(CodecSpec::FixedString {
                     len,
                     encoding: StringEncoding::Utf8,
                     padding: 0,
-                },
+                })?,
             );
             assert!(matches!(huge.pages(), Err(SchemaError::OutOfBounds { .. })));
             assert!(matches!(
@@ -781,7 +761,7 @@ mod tests {
         let beyond = FieldDescriptor::new(
             "test.beyond",
             programming::TOTAL_SIZE,
-            FieldCodec::Byte { min: 0, max: 255 },
+            FieldCodec::new(CodecSpec::Byte { min: 0, max: 255 })?,
         );
         assert!(matches!(
             beyond.page(),
@@ -812,7 +792,7 @@ mod tests {
         let field = FieldDescriptor::new(
             "test.boolean_bit",
             0x1010,
-            FieldCodec::BitBool { mask: 0b0000_0100 },
+            FieldCodec::new(CodecSpec::BitBool { mask: 0b0000_0100 })?,
         );
         let mut planner = PatchPlanner::new();
         let _planner = planner.set(&field, FieldValue::Bool(true))?;
@@ -836,12 +816,12 @@ mod tests {
         let second = FieldDescriptor::new(
             "test.second",
             ENABLE.offset,
-            FieldCodec::BitField {
+            FieldCodec::new(CodecSpec::BitField {
                 mask: 0b0000_1000,
                 shift: 3,
                 min: 0,
                 max: 1,
-            },
+            })?,
         );
         let mut planner = PatchPlanner::new();
         let _planner = planner
@@ -859,12 +839,12 @@ mod tests {
         let contradictory = FieldDescriptor::new(
             "test.contradictory",
             ENABLE.offset,
-            FieldCodec::BitField {
+            FieldCodec::new(CodecSpec::BitField {
                 mask: 0b0000_0100,
                 shift: 2,
                 min: 0,
                 max: 1,
-            },
+            })?,
         );
         let mut conflict = PatchPlanner::new();
         let _planner = conflict.set(&ENABLE, FieldValue::Unsigned(1))?;
@@ -885,9 +865,16 @@ mod tests {
 
     #[test]
     fn rejected_assignment_preserves_the_entire_existing_plan() -> TestResult {
-        let anchor =
-            FieldDescriptor::new("test.anchor", 0x1011, FieldCodec::Byte { min: 0, max: 255 });
-        let crossing = FieldDescriptor::new("test.crossing", 0x1010, FieldCodec::Bytes { len: 2 });
+        let anchor = FieldDescriptor::new(
+            "test.anchor",
+            0x1011,
+            FieldCodec::new(CodecSpec::Byte { min: 0, max: 255 })?,
+        );
+        let crossing = FieldDescriptor::new(
+            "test.crossing",
+            0x1010,
+            FieldCodec::new(CodecSpec::Bytes { len: 2 })?,
+        );
         for prefix_claimed in [false, true] {
             let mut planner = PatchPlanner::new();
             let mut expected = PatchPlanner::new();
@@ -925,11 +912,11 @@ mod tests {
         let field = FieldDescriptor::new(
             "test.text",
             0x10FE,
-            FieldCodec::FixedString {
+            FieldCodec::new(CodecSpec::FixedString {
                 len: 5,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            },
+            })?,
         );
         let mut planner = PatchPlanner::new();
         let _planner = planner.set(&field, FieldValue::Text("OK"))?;
@@ -949,15 +936,15 @@ mod tests {
     }
 
     #[test]
-    fn nul_padded_string_rejects_embedded_nul_on_write() {
+    fn nul_padded_string_rejects_embedded_nul_on_write() -> TestResult {
         let field = FieldDescriptor::new(
             "test.nul_text",
             0,
-            FieldCodec::FixedString {
+            FieldCodec::new(CodecSpec::FixedString {
                 len: 5,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            },
+            })?,
         );
         let mut planner = PatchPlanner::new();
         let result = planner.set(&field, FieldValue::Text("A\0B"));
@@ -972,18 +959,19 @@ mod tests {
             ),
             "embedded NUL must not be accepted as semantic text: {result:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn nul_padded_string_rejects_image_data_after_terminator() {
+    fn nul_padded_string_rejects_image_data_after_terminator() -> TestResult {
         let field = FieldDescriptor::new(
             "test.nul_image",
             0,
-            FieldCodec::FixedString {
+            FieldCodec::new(CodecSpec::FixedString {
                 len: 5,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            },
+            })?,
         );
         let image = *b"A\0B\0\0";
         let result = field.read(&image);
@@ -1002,18 +990,19 @@ mod tests {
             ),
             "non-NUL data after the terminator must be rejected: {result:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn space_padded_string_rejects_semantic_trailing_space() {
+    fn space_padded_string_rejects_semantic_trailing_space() -> TestResult {
         let field = FieldDescriptor::new(
             "test.space_text",
             0,
-            FieldCodec::FixedString {
+            FieldCodec::new(CodecSpec::FixedString {
                 len: 5,
                 encoding: StringEncoding::Utf8,
                 padding: b' ',
-            },
+            })?,
         );
         let mut planner = PatchPlanner::new();
         let result = planner.set(&field, FieldValue::Text("AB "));
@@ -1031,6 +1020,7 @@ mod tests {
             ),
             "semantic trailing space would be lost on read: {result:?}"
         );
+        Ok(())
     }
 
     #[test]
@@ -1038,11 +1028,11 @@ mod tests {
         let field = FieldDescriptor::new(
             "test.interior_space",
             0,
-            FieldCodec::FixedString {
+            FieldCodec::new(CodecSpec::FixedString {
                 len: 6,
                 encoding: StringEncoding::Utf8,
                 padding: b' ',
-            },
+            })?,
         );
         let mut planner = PatchPlanner::new();
         let _planner = planner.set(&field, FieldValue::Text("A B"))?;
@@ -1060,11 +1050,11 @@ mod tests {
         let field = FieldDescriptor::new(
             "test.full_width",
             0,
-            FieldCodec::FixedString {
+            FieldCodec::new(CodecSpec::FixedString {
                 len: 5,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            },
+            })?,
         );
         let mut planner = PatchPlanner::new();
         let _planner = planner.set(&field, FieldValue::Text("A BCD"))?;
@@ -1082,11 +1072,11 @@ mod tests {
         let field = FieldDescriptor::new(
             "test.memory_map_text",
             0,
-            FieldCodec::FixedString {
+            FieldCodec::new(CodecSpec::FixedString {
                 len: 4,
                 encoding: StringEncoding::MemoryMap,
                 padding: 0,
-            },
+            })?,
         );
         let mut planner = PatchPlanner::new();
         let _planner = planner.set(&field, FieldValue::Text(" ~"))?;
@@ -1101,15 +1091,15 @@ mod tests {
 
     #[test]
     fn memory_map_text_rejects_non_printable_input_without_mutating_the_plan() -> TestResult {
-        let existing = FieldDescriptor::new("test.existing", 0, FieldCodec::Bool);
+        let existing = FieldDescriptor::new("test.existing", 0, FieldCodec::BOOL);
         let text = FieldDescriptor::new(
             "test.memory_map_text",
             8,
-            FieldCodec::FixedString {
+            FieldCodec::new(CodecSpec::FixedString {
                 len: 4,
                 encoding: StringEncoding::MemoryMap,
                 padding: 0,
-            },
+            })?,
         );
         let mut planner = PatchPlanner::new();
         let _planner = planner.set(&existing, FieldValue::Bool(true))?;
@@ -1137,15 +1127,15 @@ mod tests {
     }
 
     #[test]
-    fn memory_map_text_read_reports_the_exact_non_printable_byte() {
+    fn memory_map_text_read_reports_the_exact_non_printable_byte() -> TestResult {
         let field = FieldDescriptor::new(
             "test.memory_map_text",
             0,
-            FieldCodec::FixedString {
+            FieldCodec::new(CodecSpec::FixedString {
                 len: 4,
                 encoding: StringEncoding::MemoryMap,
                 padding: 0,
-            },
+            })?,
         );
         let image = [b'A', 0x1F, 0, 0];
 
@@ -1159,18 +1149,19 @@ mod tests {
                 },
             })
         ));
+        Ok(())
     }
 
     #[test]
-    fn nonstandard_padding_rejects_semantic_trailing_padding_byte() {
+    fn nonstandard_padding_rejects_semantic_trailing_padding_byte() -> TestResult {
         let field = FieldDescriptor::new(
             "test.other_padding",
             0,
-            FieldCodec::FixedString {
+            FieldCodec::new(CodecSpec::FixedString {
                 len: 5,
                 encoding: StringEncoding::Utf8,
                 padding: b'~',
-            },
+            })?,
         );
         let mut planner = PatchPlanner::new();
         let result = planner.set(&field, FieldValue::Text("END~"));
@@ -1188,6 +1179,7 @@ mod tests {
             ),
             "semantic trailing padding would be lost on read: {result:?}"
         );
+        Ok(())
     }
 
     #[test]
@@ -1195,22 +1187,22 @@ mod tests {
         let little = FieldDescriptor::new(
             "test.le",
             2,
-            FieldCodec::Unsigned {
+            FieldCodec::new(CodecSpec::Unsigned {
                 width: 2,
                 endian: Endian::Little,
                 min: 0,
                 max: u64::from(u16::MAX),
-            },
+            })?,
         );
         let big = FieldDescriptor::new(
             "test.be",
             4,
-            FieldCodec::Signed {
+            FieldCodec::new(CodecSpec::Signed {
                 width: 2,
                 endian: Endian::Big,
                 min: i64::from(i16::MIN),
                 max: i64::from(i16::MAX),
-            },
+            })?,
         );
         let mut planner = PatchPlanner::new();
         let _planner = planner
@@ -1226,63 +1218,17 @@ mod tests {
     }
 
     #[test]
-    fn integer_codecs_reject_invalid_widths_before_accessing_image_data() {
-        let zero_width = FieldDescriptor::new(
-            "test.zero_width",
+    fn validation_rejects_bad_values_and_lengths() -> TestResult {
+        let byte = FieldDescriptor::new(
+            "test.byte",
             0,
-            FieldCodec::Unsigned {
-                width: 0,
-                endian: Endian::Little,
-                min: 0,
-                max: 0,
-            },
+            FieldCodec::new(CodecSpec::Byte { min: 1, max: 3 })?,
         );
-        let oversized = FieldDescriptor::new(
-            "test.oversized_width",
+        let bytes = FieldDescriptor::new(
+            "test.bytes",
             0,
-            FieldCodec::Signed {
-                width: 9,
-                endian: Endian::Big,
-                min: 0,
-                max: 0,
-            },
+            FieldCodec::new(CodecSpec::Bytes { len: 2 })?,
         );
-
-        for (field, value, expected_width) in [
-            (zero_width, FieldValue::Unsigned(0), 0),
-            (oversized, FieldValue::Signed(0), 9),
-        ] {
-            let read = field.read(&[]);
-            assert!(
-                matches!(
-                    read,
-                    Err(SchemaError::Codec {
-                        field: error_field,
-                        source: CodecError::InvalidIntegerWidth { width },
-                    }) if error_field == field.name && width == expected_width
-                ),
-                "invalid width must be rejected before reading the image: {read:?}"
-            );
-
-            let mut planner = PatchPlanner::new();
-            let write = planner.set(&field, value);
-            assert!(
-                matches!(
-                    write,
-                    Err(SchemaError::Codec {
-                        field: error_field,
-                        source: CodecError::InvalidIntegerWidth { width },
-                    }) if error_field == field.name && width == expected_width
-                ),
-                "invalid width must be rejected before encoding: {write:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn validation_rejects_bad_values_and_lengths() {
-        let byte = FieldDescriptor::new("test.byte", 0, FieldCodec::Byte { min: 1, max: 3 });
-        let bytes = FieldDescriptor::new("test.bytes", 0, FieldCodec::Bytes { len: 2 });
         let mut planner = PatchPlanner::new();
         assert!(matches!(
             planner.set(&byte, FieldValue::Unsigned(4)),
@@ -1305,41 +1251,46 @@ mod tests {
                 ..
             })
         ));
+        Ok(())
     }
 
     #[test]
-    fn reads_reject_values_outside_declared_domains() {
-        let byte = FieldDescriptor::new("test.byte", 0, FieldCodec::Byte { min: 1, max: 3 });
-        let boolean = FieldDescriptor::new("test.bool", 1, FieldCodec::Bool);
+    fn reads_reject_values_outside_declared_domains() -> TestResult {
+        let byte = FieldDescriptor::new(
+            "test.byte",
+            0,
+            FieldCodec::new(CodecSpec::Byte { min: 1, max: 3 })?,
+        );
+        let boolean = FieldDescriptor::new("test.bool", 1, FieldCodec::BOOL);
         let bit_field = FieldDescriptor::new(
             "test.bits",
             2,
-            FieldCodec::BitField {
+            FieldCodec::new(CodecSpec::BitField {
                 mask: 0b0000_1100,
                 shift: 2,
                 min: 1,
                 max: 2,
-            },
+            })?,
         );
         let unsigned = FieldDescriptor::new(
             "test.unsigned",
             3,
-            FieldCodec::Unsigned {
+            FieldCodec::new(CodecSpec::Unsigned {
                 width: 2,
                 endian: Endian::Little,
                 min: 10,
                 max: 20,
-            },
+            })?,
         );
         let signed = FieldDescriptor::new(
             "test.signed",
             5,
-            FieldCodec::Signed {
+            FieldCodec::new(CodecSpec::Signed {
                 width: 1,
                 endian: Endian::Little,
                 min: -2,
                 max: 2,
-            },
+            })?,
         );
         let image = [4, 2, 0, 9, 0, 3];
 
@@ -1366,6 +1317,7 @@ mod tests {
                 ..
             })
         ));
+        Ok(())
     }
 
     #[test]
@@ -1373,7 +1325,7 @@ mod tests {
         let field = FieldDescriptor::new(
             "test.beyond",
             programming::TOTAL_SIZE,
-            FieldCodec::Byte { min: 0, max: 255 },
+            FieldCodec::new(CodecSpec::Byte { min: 0, max: 255 })?,
         );
         let mut planner = PatchPlanner::new();
         let _planner = planner.set(&field, FieldValue::Unsigned(1))?;
@@ -1396,7 +1348,7 @@ mod tests {
         let field = FieldDescriptor::new(
             "test.calibration",
             0x7A100,
-            FieldCodec::Byte { min: 0, max: 255 },
+            FieldCodec::new(CodecSpec::Byte { min: 0, max: 255 })?,
         );
         let mut planner = PatchPlanner::new();
         let _planner = planner.set(&field, FieldValue::Unsigned(1))?;
@@ -1416,8 +1368,16 @@ mod tests {
 
     #[test]
     fn apply_to_image_never_partially_patches_on_error() -> TestResult {
-        let low = FieldDescriptor::new("test.low", 0x1000, FieldCodec::Byte { min: 0, max: 255 });
-        let high = FieldDescriptor::new("test.high", 0x1200, FieldCodec::Byte { min: 0, max: 255 });
+        let low = FieldDescriptor::new(
+            "test.low",
+            0x1000,
+            FieldCodec::new(CodecSpec::Byte { min: 0, max: 255 })?,
+        );
+        let high = FieldDescriptor::new(
+            "test.high",
+            0x1200,
+            FieldCodec::new(CodecSpec::Byte { min: 0, max: 255 })?,
+        );
         let mut planner = PatchPlanner::new();
         let _planner = planner
             .set(&low, FieldValue::Unsigned(0xA5))?
@@ -1441,116 +1401,75 @@ mod tests {
     }
 
     #[test]
-    fn integer_domains_must_fit_their_declared_width() {
-        let unsigned = FieldDescriptor::new(
-            "test.wide_unsigned",
-            0,
-            FieldCodec::Unsigned {
-                width: 1,
-                endian: Endian::Little,
-                min: 0,
-                max: 300,
-            },
-        );
-        let signed = FieldDescriptor::new(
-            "test.wide_signed",
-            0,
-            FieldCodec::Signed {
-                width: 2,
-                endian: Endian::Little,
-                min: -40_000,
-                max: 0,
-            },
-        );
-        let mut planner = PatchPlanner::new();
-        let unsigned_result = planner.set(&unsigned, FieldValue::Unsigned(260));
-        assert!(
-            matches!(
-                unsigned_result,
-                Err(SchemaError::Codec {
-                    field: "test.wide_unsigned",
-                    source: CodecError::DomainExceedsWidth { width: 1 },
-                })
+    fn encoded_len_covers_every_codec_shape() -> TestResult {
+        let cases = [
+            (CodecSpec::Byte { min: 0, max: 5 }, 1),
+            (CodecSpec::Bool, 1),
+            (CodecSpec::BitBool { mask: 0x08 }, 1),
+            (
+                CodecSpec::BitField {
+                    mask: 0x30,
+                    shift: 4,
+                    min: 0,
+                    max: 3,
+                },
+                1,
             ),
-            "an over-wide unsigned domain must not truncate: {unsigned_result:?}"
-        );
-        let signed_result = planner.set(&signed, FieldValue::Signed(-40_000));
-        assert!(
-            matches!(
-                signed_result,
-                Err(SchemaError::Codec {
-                    field: "test.wide_signed",
-                    source: CodecError::DomainExceedsWidth { width: 2 },
-                })
+            (
+                CodecSpec::FixedString {
+                    len: 16,
+                    encoding: StringEncoding::Utf8,
+                    padding: 0,
+                },
+                16,
             ),
-            "an over-wide signed domain must not truncate: {signed_result:?}"
-        );
-    }
-
-    #[test]
-    fn encoded_len_covers_every_codec_shape() {
-        assert_eq!(FieldCodec::Byte { min: 0, max: 5 }.encoded_len(), 1);
-        assert_eq!(FieldCodec::Bool.encoded_len(), 1);
-        assert_eq!(FieldCodec::BitBool { mask: 0x08 }.encoded_len(), 1);
-        assert_eq!(
-            FieldCodec::BitField {
-                mask: 0x30,
-                shift: 4,
-                min: 0,
-                max: 3
-            }
-            .encoded_len(),
-            1
-        );
-        assert_eq!(
-            FieldCodec::FixedString {
-                len: 16,
-                encoding: StringEncoding::Utf8,
-                padding: 0
-            }
-            .encoded_len(),
-            16
-        );
-        assert_eq!(
-            FieldCodec::Unsigned {
-                width: 4,
-                endian: Endian::Little,
-                min: 0,
-                max: 100
-            }
-            .encoded_len(),
-            4
-        );
-        assert_eq!(
-            FieldCodec::Signed {
-                width: 2,
-                endian: Endian::Big,
-                min: -5,
-                max: 5
-            }
-            .encoded_len(),
-            2
-        );
-        assert_eq!(FieldCodec::Bytes { len: 300 }.encoded_len(), 300);
+            (
+                CodecSpec::Unsigned {
+                    width: 4,
+                    endian: Endian::Little,
+                    min: 0,
+                    max: 100,
+                },
+                4,
+            ),
+            (
+                CodecSpec::Signed {
+                    width: 2,
+                    endian: Endian::Big,
+                    min: -5,
+                    max: 5,
+                },
+                2,
+            ),
+            (CodecSpec::Bytes { len: 300 }, 300),
+        ];
+        for (spec, expected) in cases {
+            assert_eq!(FieldCodec::new(spec)?.encoded_len(), expected, "{spec:?}");
+        }
+        Ok(())
     }
 
     #[test]
     fn pages_lists_the_whole_span_in_ascending_order() -> TestResult {
-        let single = FieldDescriptor::new("test.single", 10, FieldCodec::Bool);
+        let single = FieldDescriptor::new("test.single", 10, FieldCodec::BOOL);
         assert_eq!(single.pages()?, vec![McpPage::new(0)?]);
 
         let straddles = FieldDescriptor::new(
             "test.straddle",
             programming::PAGE_SIZE - 1,
-            FieldCodec::Bytes { len: 2 },
+            FieldCodec::new(CodecSpec::Bytes { len: 2 })?,
         );
         assert_eq!(straddles.pages()?, vec![McpPage::new(0)?, McpPage::new(1)?]);
 
-        let wide = FieldDescriptor::new("test.wide_span", 0, FieldCodec::Bytes { len: 300 });
+        let wide = FieldDescriptor::new(
+            "test.wide_span",
+            0,
+            FieldCodec::new(CodecSpec::Bytes { len: 300 })?,
+        );
         assert_eq!(wide.pages()?, vec![McpPage::new(0)?, McpPage::new(1)?]);
 
         let outside =
-            FieldDescriptor::new("test.outside", programming::TOTAL_SIZE, FieldCodec::Bool);
+            FieldDescriptor::new("test.outside", programming::TOTAL_SIZE, FieldCodec::BOOL);
         let outside_result = outside.pages();
         assert!(
             matches!(outside_result, Err(SchemaError::OutOfBounds { .. })),
@@ -1565,11 +1484,7 @@ mod tests {
 
         // A real generated ratio: stored per-minute rate for a
         // seconds-denominated display value.
-        let per_minute = StorageTransform {
-            input_unit: "seconds",
-            numerator: 10_000,
-            denominator: 60,
-        };
+        let per_minute = StorageTransform::new("seconds", 10_000, 60).ok_or("valid unit ratio")?;
         assert_eq!(per_minute.encode_display(3.0), Some(500));
         let decoded = per_minute
             .decode_display(500)
@@ -1579,18 +1494,13 @@ mod tests {
             "raw 500 must decode to 3.0 seconds, got {decoded}"
         );
 
-        let zero_numerator = StorageTransform {
-            input_unit: "x",
-            numerator: 0,
-            denominator: 60,
-        };
-        assert_eq!(zero_numerator.decode_display(1), None);
-        let zero_denominator = StorageTransform {
-            input_unit: "x",
-            numerator: 10,
-            denominator: 0,
-        };
-        assert_eq!(zero_denominator.encode_display(1.0), None);
+        assert!(StorageTransform::new("x", 0, 60).is_none());
+        assert!(StorageTransform::new("x", 10, 0).is_none());
+        assert!(StorageTransform::new("", 10, 1).is_none());
+        let maximum =
+            StorageTransform::new("x", u32::MAX, u32::MAX).ok_or("valid maximum ratio")?;
+        assert_eq!(maximum.decode_display(1), Some(1.0));
+        assert_eq!(maximum.encode_display(1.0), Some(1));
         assert_eq!(per_minute.encode_display(f64::NAN), None);
         assert_eq!(per_minute.encode_display(-1.0), None);
         Ok(())

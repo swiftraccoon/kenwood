@@ -8,6 +8,11 @@ use std::fmt;
 
 use crate::error::ValidationError;
 
+integer_radix_formats!(KissTxDelay, as_milliseconds);
+integer_radix_formats!(KissPersistence, to_wire_byte);
+integer_radix_formats!(KissSlotTime, as_milliseconds);
+integer_radix_formats!(KissTxTail, as_milliseconds);
+
 const MILLISECONDS_PER_WIRE_UNIT: u16 = 10;
 
 const fn encode_timing(milliseconds: u16, maximum_milliseconds: u16) -> Option<u8> {

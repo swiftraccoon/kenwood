@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crate::error::Error;
 use crate::protocol::{Codec, Response};
-use crate::types::{FirmwareIdentity, GpsSettings, NmeaSentences, TuningMode};
+use crate::types::{FirmwareIdentity, GpsSettings, NmeaSentences, SerialInformation, TuningMode};
 use kenwood_transport::Transport;
 
 use super::{BinaryProtocolProof, CatState, LinkState, McpPhase, McpWireBoundary, Radio};
@@ -21,12 +21,14 @@ pub(super) struct CatRestoreState {
     notifications: tokio::sync::broadcast::Sender<Response>,
     timeout: Duration,
     firmware_version: Option<FirmwareIdentity>,
+    serial_information: Option<SerialInformation>,
     tuning_mode_a: Option<TuningMode>,
     tuning_mode_b: Option<TuningMode>,
     link_state_tx: tokio::sync::watch::Sender<LinkState>,
     auto_info_enabled: bool,
     gps_settings: Option<GpsSettings>,
     gps_sentences: Option<NmeaSentences>,
+    if_tap_saved: Option<super::if_tap::IfTapSavedState>,
 }
 
 impl<T: Transport> Radio<T> {
@@ -69,6 +71,7 @@ impl<T: Transport> Radio<T> {
             notifications,
             timeout,
             firmware_version,
+            serial_information,
             tuning_mode_a,
             tuning_mode_b,
             last_cmd_time: _,
@@ -83,6 +86,7 @@ impl<T: Transport> Radio<T> {
             auto_info_enabled,
             gps_settings,
             gps_sentences,
+            if_tap_saved,
         } = self;
 
         Ok((
@@ -92,12 +96,14 @@ impl<T: Transport> Radio<T> {
                 notifications,
                 timeout,
                 firmware_version,
+                serial_information,
                 tuning_mode_a,
                 tuning_mode_b,
                 link_state_tx,
                 auto_info_enabled,
                 gps_settings,
                 gps_sentences,
+                if_tap_saved,
             },
         ))
     }
@@ -124,6 +130,7 @@ impl CatRestoreState {
             notifications: self.notifications,
             timeout: self.timeout,
             firmware_version: self.firmware_version,
+            serial_information: self.serial_information,
             tuning_mode_a: self.tuning_mode_a,
             tuning_mode_b: self.tuning_mode_b,
             last_cmd_time: None,
@@ -138,6 +145,7 @@ impl CatRestoreState {
             auto_info_enabled: self.auto_info_enabled,
             gps_settings: self.gps_settings,
             gps_sentences: self.gps_sentences,
+            if_tap_saved: self.if_tap_saved,
         }
     }
 
@@ -182,13 +190,17 @@ mod tests {
         let link_state = radio.link_state();
         radio.set_timeout(Duration::from_millis(731));
         radio.firmware_version = Some(FirmwareIdentity::new("1.03.AZM")?);
+        radio.serial_information = Some(SerialInformation::new(
+            crate::types::SerialNumber::new("SYN00001")?,
+            crate::types::ModelCode::new("K01")?,
+        ));
         radio.tuning_mode_a = Some(TuningMode::Memory);
         radio.tuning_mode_b = Some(TuningMode::Call);
         radio.last_cmd_time = Some(tokio::time::Instant::now());
         radio.desynced = false;
         let _previous = radio.link_state_tx.send_replace(LinkState::Down);
         radio.auto_info_enabled = true;
-        radio.gps_settings = Some(GpsSettings::new(true, true));
+        radio.gps_settings = Some(GpsSettings::new().with_enabled(true).with_pc_output(true));
         radio.gps_sentences = Some(NmeaSentences::all());
         radio.cat_state = CatState::BinaryProven(BinaryProtocolProof::Mmdvm { data_band: None });
 
@@ -212,10 +224,20 @@ mod tests {
             Some("1.03.AZM")
         );
         assert_eq!(radio.cached_tuning_mode(Band::A), Some(TuningMode::Memory));
+        assert_eq!(
+            radio
+                .serial_information
+                .as_ref()
+                .map(|information| information.serial_number().as_str()),
+            Some("SYN00001")
+        );
         assert_eq!(radio.cached_tuning_mode(Band::B), Some(TuningMode::Call));
         assert_eq!(*link_state.borrow(), LinkState::Down);
         assert!(radio.auto_info_enabled);
-        assert_eq!(radio.gps_settings, Some(GpsSettings::new(true, true)));
+        assert_eq!(
+            radio.gps_settings,
+            Some(GpsSettings::new().with_enabled(true).with_pc_output(true))
+        );
         assert_eq!(radio.gps_sentences, Some(NmeaSentences::all()));
 
         assert!(radio.last_cmd_time.is_none());

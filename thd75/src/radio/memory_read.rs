@@ -185,7 +185,7 @@ impl<T: Transport> MemoryReader<'_, T> {
             let bytes = self.read_bytes_range(offset, length).await?;
             captured.push((offset, bytes));
         }
-        Ok(StateSnapshot::from_windows(captured))
+        Ok(StateSnapshot::from_windows(captured)?)
     }
 
     /// Samples DDR at fixed strides.
@@ -248,7 +248,7 @@ impl<T: Transport> MemoryReader<'_, T> {
             let bytes = self.read_bytes(offset, sample_len).await?;
             windows.push((offset, bytes));
         }
-        Ok(StateSnapshot::from_windows(windows))
+        Ok(StateSnapshot::from_windows(windows)?)
     }
 
     const fn require_valid(&self) -> Result<(), Error> {
@@ -761,7 +761,7 @@ mod tests {
     fn queue_checked_read(mock: &mut MockTransport, offset: u32, data: &[u8]) {
         let wire_len = if data.len() == 256 { 0 } else { data.len() };
         let request = format!("GM {offset:06X},{wire_len:02X}\r");
-        mock.expect(request.as_bytes(), &reply(offset, data));
+        mock.expect(request.as_bytes(), reply(offset, data));
         mock.expect(b"ID\r", b"ID TH-D75\r");
     }
 
@@ -938,7 +938,7 @@ mod tests {
     async fn low_nor_qualification_uses_flash_relative_patch_offsets() -> TestResult {
         let mut mock = MockTransport::new();
         queue_low_nor_attestation(&mut mock);
-        mock.expect(b"GM 000010,04\r", &reply(0x10, &[0xDE, 0xAD, 0xBE, 0xEF]));
+        mock.expect(b"GM 000010,04\r", reply(0x10, &[0xDE, 0xAD, 0xBE, 0xEF]));
         let mut radio = Radio::new(mock);
         let mut reader = radio
             .qualify_mem_read_for(MemoryReadTarget::LowNorV103)
@@ -1008,7 +1008,7 @@ mod tests {
     #[tokio::test]
     async fn low_nor_last_byte_is_inside_the_qualified_window() -> TestResult {
         let mut mock = MockTransport::new();
-        mock.expect(b"GM 1FFFFF,01\r", &reply(0x1F_FFFF, &[0x5A]));
+        mock.expect(b"GM 1FFFFF,01\r", reply(0x1F_FFFF, &[0x5A]));
         let mut radio = Radio::new(mock);
         let mut reader = direct_reader(&mut radio, MemoryReadTarget::LowNorV103);
         let bytes = reader
@@ -1060,7 +1060,7 @@ mod tests {
     #[tokio::test]
     async fn strict_reader_rejects_a_wrong_echo() -> TestResult {
         let mut mock = MockTransport::new();
-        mock.expect(b"GM 000010,01\r", &reply(0x11, &[0xAA]));
+        mock.expect(b"GM 000010,01\r", reply(0x11, &[0xAA]));
         let mut radio = Radio::new(mock);
         let mut reader = direct_reader(&mut radio, MemoryReadTarget::LowNorV103);
         let result = reader

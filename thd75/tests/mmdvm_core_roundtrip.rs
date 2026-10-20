@@ -4,10 +4,8 @@
 //! when carrying D-STAR protocol types through the MMDVM binary wire
 //! format.
 
-use dstar_gateway_core::{Callsign, DstarHeader, Suffix, VoiceFrame};
-use mmdvm_core::{
-    MMDVM_DSTAR_DATA, MMDVM_DSTAR_HEADER, MMDVM_FRAME_START, MmdvmFrame, decode_frame, encode_frame,
-};
+use dstar_gateway_core::{Callsign, DstarHeader, HeaderFlags, Suffix, VoiceFrame};
+use mmdvm_core::{Command, MMDVM_FRAME_START, MmdvmFrame};
 
 // Acknowledge dev-deps the integration test binary pulls transitively
 // so `-D unused-crate-dependencies` doesn't fire.
@@ -32,9 +30,7 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 #[test]
 fn dstar_header_survives_mmdvm_wire_roundtrip() -> TestResult {
     let original = DstarHeader {
-        flag1: 0x40,
-        flag2: 0x21,
-        flag3: 0x03,
+        flags: HeaderFlags::from_bytes([0x40, 0x21, 0x03]),
         rpt2: Callsign::from_wire_bytes(*b"REF030 G"),
         rpt1: Callsign::from_wire_bytes(*b"REF030 C"),
         ur_call: Callsign::from_wire_bytes(*b"CQCQCQ  "),
@@ -42,26 +38,28 @@ fn dstar_header_survives_mmdvm_wire_roundtrip() -> TestResult {
         my_suffix: Suffix::from_wire_bytes(*b"ECHO"),
     };
 
-    // Build the wire frame the way the gateway now does: encode the
+    // Build the wire frame used by the gateway: encode the
     // header to 41 bytes, wrap in an `MmdvmFrame` with the D-STAR
     // header command, and run it through `mmdvm-core`'s codec.
     let encoded = original.encode();
-    let frame = MmdvmFrame::with_payload(MMDVM_DSTAR_HEADER, encoded.to_vec());
-    let wire = encode_frame(&frame)?;
+    let frame = MmdvmFrame::with_payload(Command::DSTAR_HEADER, encoded.to_vec())?;
+    let wire = frame.to_bytes();
     assert_eq!(wire.len(), 44);
     assert_eq!(wire.first().copied().ok_or("wire[0]")?, MMDVM_FRAME_START);
     assert_eq!(wire.get(1).copied().ok_or("wire[1]")?, 44);
-    assert_eq!(wire.get(2).copied().ok_or("wire[2]")?, MMDVM_DSTAR_HEADER);
+    assert_eq!(
+        wire.get(2).copied().ok_or("wire[2]")?,
+        Command::DSTAR_HEADER.get()
+    );
 
-    let (decoded_frame, consumed) = decode_frame(&wire)?.ok_or("expected full frame")?;
+    let (decoded_frame, consumed) = MmdvmFrame::from_bytes(&wire)?.ok_or("expected full frame")?;
     assert_eq!(consumed, 44);
-    assert_eq!(decoded_frame.command, MMDVM_DSTAR_HEADER);
+    assert_eq!(decoded_frame.command(), Command::DSTAR_HEADER);
 
     // Re-decode the 41-byte payload back into a `DstarHeader` and
     // compare field-for-field.
     let payload: [u8; 41] = decoded_frame
-        .payload
-        .as_slice()
+        .payload()
         .try_into()
         .map_err(|_| "expected 41-byte D-STAR header payload")?;
     let decoded = DstarHeader::decode(&payload);
@@ -84,12 +82,12 @@ fn voice_frame_survives_mmdvm_wire_roundtrip() -> TestResult {
         .ok_or("data[9..12] in range")?
         .copy_from_slice(&original.slow_data);
 
-    let frame = MmdvmFrame::with_payload(MMDVM_DSTAR_DATA, data.to_vec());
-    let wire = encode_frame(&frame)?;
-    let (decoded_frame, _) = decode_frame(&wire)?.ok_or("expected full frame")?;
-    assert_eq!(decoded_frame.command, MMDVM_DSTAR_DATA);
+    let frame = MmdvmFrame::with_payload(Command::DSTAR_DATA, data.to_vec())?;
+    let wire = frame.to_bytes();
+    let (decoded_frame, _) = MmdvmFrame::from_bytes(&wire)?.ok_or("expected full frame")?;
+    assert_eq!(decoded_frame.command(), Command::DSTAR_DATA);
 
-    let payload = decoded_frame.payload.as_slice();
+    let payload = decoded_frame.payload();
     let mut ambe = [0u8; 9];
     ambe.copy_from_slice(payload.get(..9).ok_or("payload[..9] missing")?);
     let mut slow_data = [0u8; 3];
@@ -101,9 +99,8 @@ fn voice_frame_survives_mmdvm_wire_roundtrip() -> TestResult {
 
 #[test]
 fn non_ascii_callsign_bytes_preserved_verbatim() -> TestResult {
-    // Real reflectors occasionally emit non-printable bytes in callsign
-    // fields. Core's lenient decode accepts them; the MMDVM wire path
-    // must preserve them verbatim too.
+    // The lenient header decoder preserves arbitrary callsign bytes; the
+    // MMDVM wire path retains the same bytes.
     let mut rpt1_bytes = [b' '; 8];
     if let Some(b) = rpt1_bytes.get_mut(0) {
         *b = 0xC3;
@@ -112,9 +109,7 @@ fn non_ascii_callsign_bytes_preserved_verbatim() -> TestResult {
         *b = 0xA9;
     }
     let original = DstarHeader {
-        flag1: 0,
-        flag2: 0,
-        flag3: 0,
+        flags: HeaderFlags::NONE,
         rpt2: Callsign::from_wire_bytes(*b"REF001 G"),
         rpt1: Callsign::from_wire_bytes(rpt1_bytes),
         ur_call: Callsign::from_wire_bytes(*b"CQCQCQ  "),
@@ -123,12 +118,11 @@ fn non_ascii_callsign_bytes_preserved_verbatim() -> TestResult {
     };
 
     let encoded = original.encode();
-    let frame = MmdvmFrame::with_payload(MMDVM_DSTAR_HEADER, encoded.to_vec());
-    let wire = encode_frame(&frame)?;
-    let (decoded_frame, _) = decode_frame(&wire)?.ok_or("expected full frame")?;
+    let frame = MmdvmFrame::with_payload(Command::DSTAR_HEADER, encoded.to_vec())?;
+    let wire = frame.to_bytes();
+    let (decoded_frame, _) = MmdvmFrame::from_bytes(&wire)?.ok_or("expected full frame")?;
     let payload: [u8; 41] = decoded_frame
-        .payload
-        .as_slice()
+        .payload()
         .try_into()
         .map_err(|_| "expected 41-byte D-STAR header payload")?;
     let decoded = DstarHeader::decode(&payload);

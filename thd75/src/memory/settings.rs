@@ -2090,8 +2090,8 @@ impl<'a> SettingsWriter<'a> {
 mod tests {
     use super::*;
     use crate::memory::menu_fields::{MCP_D75_MENU_FIELDS, menu_field};
-    use crate::memory::schema::FieldCodec;
     use crate::protocol::programming::TOTAL_SIZE;
+    use kenwood_schema::CodecSpec;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -3106,21 +3106,21 @@ mod tests {
     /// registry regeneration that changes a domain fails this test
     /// until the accessor is re-audited.
     enum ExpectedCodec {
-        /// `FieldCodec::Bool` (one byte holding 0/1).
+        /// `CodecSpec::Bool` (one byte holding 0/1).
         Bool,
-        /// `FieldCodec::Byte` with this inclusive domain.
+        /// `CodecSpec::Byte` with this inclusive domain.
         Byte {
             /// Smallest legal raw value.
             min: u8,
             /// Largest legal raw value.
             max: u8,
         },
-        /// `FieldCodec::BitBool` with exactly this owned mask.
+        /// `CodecSpec::BitBool` with exactly this owned mask.
         BitBool {
             /// The single bit the accessor reads and writes.
             mask: u8,
         },
-        /// `FieldCodec::FixedString` of this length.
+        /// `CodecSpec::FixedString` of this length.
         FixedString {
             /// Reserved byte count.
             len: usize,
@@ -3385,11 +3385,11 @@ mod tests {
                 field.descriptor.offset, *offset,
                 "{name}: registry offset does not match the settings constant"
             );
-            match (expected, field.descriptor.codec) {
-                (ExpectedCodec::Bool, FieldCodec::Bool) => {}
+            match (expected, field.descriptor.codec.spec()) {
+                (ExpectedCodec::Bool, CodecSpec::Bool) => {}
                 (
                     ExpectedCodec::Byte { min, max },
-                    FieldCodec::Byte {
+                    CodecSpec::Byte {
                         min: reg_min,
                         max: reg_max,
                     },
@@ -3400,7 +3400,7 @@ mod tests {
                         "{name}: accessor domain diverges from the registry domain"
                     );
                 }
-                (ExpectedCodec::BitBool { mask }, FieldCodec::BitBool { mask: reg_mask }) => {
+                (ExpectedCodec::BitBool { mask }, CodecSpec::BitBool { mask: reg_mask }) => {
                     assert_eq!(
                         *mask, reg_mask,
                         "{name}: accessor bit mask diverges from the registry mask"
@@ -3408,7 +3408,7 @@ mod tests {
                 }
                 (
                     ExpectedCodec::FixedString { len },
-                    FieldCodec::FixedString { len: reg_len, .. },
+                    CodecSpec::FixedString { len: reg_len, .. },
                 ) => {
                     assert_eq!(
                         *len, reg_len,
@@ -3423,20 +3423,6 @@ mod tests {
         Ok(())
     }
 
-    /// Byte length occupied by a registry codec, for span checks.
-    fn codec_len(codec: FieldCodec) -> usize {
-        match codec {
-            FieldCodec::Byte { .. }
-            | FieldCodec::Bool
-            | FieldCodec::BitBool { .. }
-            | FieldCodec::BitField { .. } => 1,
-            FieldCodec::FixedString { len, .. } | FieldCodec::Bytes { len } => len,
-            FieldCodec::Unsigned { width, .. } | FieldCodec::Signed { width, .. } => {
-                usize::from(width)
-            }
-        }
-    }
-
     /// The three hardware-verified band-state cells sit below 0x1000
     /// where the MCP-D75 registry has no coverage. If a registry
     /// regeneration ever claims those offsets, a human must re-audit
@@ -3446,7 +3432,7 @@ mod tests {
         for offset in [POWER_LEVEL_A_OFFSET, ATTENUATOR_A_OFFSET, DUAL_BAND_OFFSET] {
             for field in MCP_D75_MENU_FIELDS {
                 let start = field.descriptor.offset;
-                let len = codec_len(field.descriptor.codec);
+                let len = field.descriptor.codec.encoded_len();
                 assert!(
                     offset < start || offset >= start + len,
                     "hardware-verified band-state cell 0x{offset:04X} collides with registry \

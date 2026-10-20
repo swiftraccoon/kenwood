@@ -112,24 +112,52 @@ const AUTOMATION_RUNTIME_OFFSET: u32 = 0x19_D280;
 const AUTOMATION_RUNTIME: &[u8] = automation_runtime::BYTES;
 
 /// Exact automation ABI proved during V1.03.AZM qualification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AutomationAbi {
     /// ABI revision returned by the firmware.
-    pub version: u8,
+    version: u8,
     /// Feature bitmap returned by the firmware.
-    pub features: u8,
+    features: u8,
     /// Largest accepted raw front-panel key identifier.
-    pub max_key: u8,
+    max_key: u8,
     /// Largest accepted event phase.
-    pub max_phase: u8,
+    max_phase: u8,
 }
 
-const EXPECTED_ABI: AutomationAbi = AutomationAbi {
-    version: 3,
-    features: 0x7F,
-    max_key: AUTOMATION_MAX_KEY,
-    max_phase: AUTOMATION_MAX_PHASE,
-};
+impl AutomationAbi {
+    /// Exact ABI description supported by the guarded automation API.
+    ///
+    /// A live [`AutomationSession`] is obtained through firmware qualification.
+    pub const SUPPORTED: Self = Self {
+        version: 3,
+        features: 0x7F,
+        max_key: AUTOMATION_MAX_KEY,
+        max_phase: AUTOMATION_MAX_PHASE,
+    };
+
+    /// Return the firmware ABI revision.
+    #[must_use]
+    pub const fn version(self) -> u8 {
+        self.version
+    }
+    /// Return the firmware feature bitmap.
+    #[must_use]
+    pub const fn features(self) -> u8 {
+        self.features
+    }
+    /// Return the largest accepted raw front-panel key identifier.
+    #[must_use]
+    pub const fn max_key(self) -> u8 {
+        self.max_key
+    }
+    /// Return the largest accepted event phase.
+    #[must_use]
+    pub const fn max_phase(self) -> u8 {
+        self.max_phase
+    }
+}
+
+const EXPECTED_ABI: AutomationAbi = AutomationAbi::SUPPORTED;
 
 /// One of the 25 ordinary input-dispatch identifiers accepted by automation.
 ///
@@ -363,56 +391,172 @@ impl From<KeyPhase> for u8 {
 }
 
 /// One validated, stable automation metadata record.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AutomationMetadata {
     /// Even seqlock value observed before and after the associated data read.
-    pub seqlock: u32,
+    seqlock: u32,
     /// Firmware feature bitmap.
-    pub features: u32,
+    features: u32,
     /// Published frame generation.
-    pub generation: u32,
+    generation: u32,
     /// Result of the most recent snapshot command.
-    pub capture_result: u32,
+    capture_result: u32,
     /// Standard reflected IEEE CRC-32 of the raw RGB565LE frame.
-    pub crc32: u32,
+    crc32: u32,
     /// Number of double-copy attempts used by the most recent capture.
-    pub capture_attempts: u32,
+    capture_attempts: u32,
     /// Number of key and snapshot commands handled since metadata init.
-    pub command_count: u32,
+    command_count: u32,
     /// Most recent command identifier (`1` snapshot, `2` key, `3` guarded key,
     /// `4` guarded decimal route).
-    pub last_command: u32,
+    last_command: u32,
     /// Host sequence echoed by the most recent input or snapshot command.
-    pub last_host_sequence: u32,
+    last_host_sequence: u32,
     /// Raw key identifier recorded by the most recent input command.
-    pub last_key: u32,
+    last_key: u32,
     /// Raw phase recorded by the most recent input command.
-    pub last_phase: u32,
+    last_phase: u32,
     /// Result recorded by the most recent input command.
-    pub last_key_result: u32,
+    last_key_result: u32,
     /// Encoded RLE byte count, or zero when the raw aperture is authoritative.
-    pub rle_encoded_length: u32,
+    rle_encoded_length: u32,
     /// Three route ASCII digits packed little-endian, or zero for other commands.
-    pub route_ascii: u32,
+    route_ascii: u32,
     /// Number of framebuffer guard comparisons attempted by command 4.
-    pub route_guard_count: u32,
+    route_guard_count: u32,
     /// Number of complete press/release pairs dispatched by command 4.
-    pub route_completed_taps: u32,
+    route_completed_taps: u32,
     /// Command 4 event mask: bits `2*i`/`2*i+1` are press/release for digit `i`.
-    pub route_event_mask: u32,
+    route_event_mask: u32,
+}
+
+impl AutomationMetadata {
+    /// Return the matching even seqlock value surrounding the data read.
+    #[must_use]
+    pub const fn seqlock(&self) -> u32 {
+        self.seqlock
+    }
+    /// Return the firmware feature bitmap.
+    #[must_use]
+    pub const fn features(&self) -> u32 {
+        self.features
+    }
+    /// Return the published frame generation.
+    #[must_use]
+    pub const fn generation(&self) -> u32 {
+        self.generation
+    }
+    /// Return the latest snapshot command's result code.
+    #[must_use]
+    pub const fn capture_result(&self) -> u32 {
+        self.capture_result
+    }
+    /// Return the raw RGB565LE frame's reflected IEEE CRC-32.
+    #[must_use]
+    pub const fn crc32(&self) -> u32 {
+        self.crc32
+    }
+    /// Return the latest capture's double-copy attempt count.
+    #[must_use]
+    pub const fn capture_attempts(&self) -> u32 {
+        self.capture_attempts
+    }
+    /// Return the cumulative key and snapshot command count.
+    #[must_use]
+    pub const fn command_count(&self) -> u32 {
+        self.command_count
+    }
+    /// Return the last command identifier: 1 snapshot, 2 key, 3 guarded key, 4 route.
+    #[must_use]
+    pub const fn last_command(&self) -> u32 {
+        self.last_command
+    }
+    /// Return the last input or snapshot command's echoed host sequence.
+    #[must_use]
+    pub const fn last_host_sequence(&self) -> u32 {
+        self.last_host_sequence
+    }
+    /// Return the last input command's raw key identifier.
+    #[must_use]
+    pub const fn last_key(&self) -> u32 {
+        self.last_key
+    }
+    /// Return the last input command's raw phase.
+    #[must_use]
+    pub const fn last_phase(&self) -> u32 {
+        self.last_phase
+    }
+    /// Return the last input command's result code.
+    #[must_use]
+    pub const fn last_key_result(&self) -> u32 {
+        self.last_key_result
+    }
+    /// Return the encoded RLE byte count, or zero for the raw aperture.
+    #[must_use]
+    pub const fn rle_encoded_length(&self) -> u32 {
+        self.rle_encoded_length
+    }
+    /// Return three little-endian packed route ASCII digits, or zero otherwise.
+    #[must_use]
+    pub const fn route_ascii(&self) -> u32 {
+        self.route_ascii
+    }
+    /// Return command 4's framebuffer comparison count.
+    #[must_use]
+    pub const fn route_guard_count(&self) -> u32 {
+        self.route_guard_count
+    }
+    /// Return command 4's completed press/release pair count.
+    #[must_use]
+    pub const fn route_completed_taps(&self) -> u32 {
+        self.route_completed_taps
+    }
+    /// Return command 4's exact press/release bitmask.
+    #[must_use]
+    pub const fn route_event_mask(&self) -> u32 {
+        self.route_event_mask
+    }
 }
 
 /// A stable LCD frame and the exact firmware metadata that authenticated it.
+///
+/// Frame and metadata remain paired until [`Self::into_parts`] consumes the
+/// observation. Callers inspect them through borrowed accessors:
+///
+/// ```compile_fail
+/// use kenwood_thd75::radio::automation::AutomationSnapshot;
+/// fn replace_metadata(target: &mut AutomationSnapshot, other: &AutomationSnapshot) {
+///     target.metadata = other.metadata().clone();
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AutomationSnapshot {
     /// Canonical top-down 240x180 RGB565LE LCD frame.
-    pub frame: ScreenFrame,
+    frame: ScreenFrame,
     /// Stable metadata whose generation and CRC authenticate `frame`.
-    pub metadata: AutomationMetadata,
+    metadata: AutomationMetadata,
+}
+
+impl AutomationSnapshot {
+    /// Borrow the checked 240-by-180 RGB565LE frame.
+    #[must_use]
+    pub const fn frame(&self) -> &ScreenFrame {
+        &self.frame
+    }
+    /// Return the stable metadata paired with this frame.
+    #[must_use]
+    pub const fn metadata(&self) -> &AutomationMetadata {
+        &self.metadata
+    }
+    /// Consume the observation and transfer its frame and matching metadata.
+    #[must_use]
+    pub fn into_parts(self) -> (ScreenFrame, AutomationMetadata) {
+        (self.frame, self.metadata)
+    }
 }
 
 /// Result of one firmware-guarded key press.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum GuardedKeyResult {
     /// The frozen framebuffer still matched and the press/release pair ran.
@@ -423,108 +567,202 @@ pub enum GuardedKeyResult {
 }
 
 /// Receipt for one key in a guarded-input transaction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GuardedKeyReceipt {
     /// Key submitted to the firmware guard.
-    pub key: FrontPanelKey,
+    key: FrontPanelKey,
     /// Eight-bit host sequence used by the guarded press.
-    pub press_sequence: u8,
+    press_sequence: u8,
     /// Host sequence used by the unconditional release, when a press ran.
-    pub release_sequence: Option<u8>,
+    release_sequence: Option<u8>,
     /// Firmware decision for the guarded press.
-    pub result: GuardedKeyResult,
+    result: GuardedKeyResult,
     /// Exact cumulative command count implied by the ordered acknowledged
     /// exchanges.
-    pub command_count: u32,
+    command_count: u32,
     /// Exact cumulative even seqlock implied by the ordered acknowledged
     /// exchanges.
-    pub seqlock: u32,
+    seqlock: u32,
 }
 
-/// Fully authenticated result of one guarded-input transaction.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum GuardedKeyOutcome {
+impl GuardedKeyReceipt {
+    /// Return the submitted front-panel key.
+    #[must_use]
+    pub const fn key(self) -> FrontPanelKey {
+        self.key
+    }
+    /// Return the guarded press's host sequence.
+    #[must_use]
+    pub const fn press_sequence(self) -> u8 {
+        self.press_sequence
+    }
+    /// Return the unconditional release's host sequence when a press ran.
+    #[must_use]
+    pub const fn release_sequence(self) -> Option<u8> {
+        self.release_sequence
+    }
+    /// Return the firmware's guarded-press decision.
+    #[must_use]
+    pub const fn result(self) -> GuardedKeyResult {
+        self.result
+    }
+    /// Return the cumulative command count after the acknowledged exchanges.
+    #[must_use]
+    pub const fn command_count(self) -> u32 {
+        self.command_count
+    }
+    /// Return the cumulative even seqlock after the acknowledged exchanges.
+    #[must_use]
+    pub const fn seqlock(self) -> u32 {
+        self.seqlock
+    }
+}
+
+/// Final disposition of a checked guarded-input transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GuardedKeyOutcomeKind {
     /// Every guarded press matched and was paired with a release.
-    Dispatched {
-        /// Final stable metadata authenticating the aggregate transaction.
-        metadata: AutomationMetadata,
-        /// One ordered receipt per dispatched key.
-        receipts: Vec<GuardedKeyReceipt>,
-    },
+    Dispatched,
     /// Firmware refused one press because no valid snapshot existed or its
     /// full-frame comparison observed a changed LCD.
-    ContextChanged {
-        /// Stable metadata proving command 3, result 2, and exact continuity.
-        metadata: AutomationMetadata,
-        /// Successful receipts followed by the refused guarded press.
-        receipts: Vec<GuardedKeyReceipt>,
-    },
+    ContextChanged,
     /// The host deadline expired before another press or during a completed tap.
-    DeadlineExpired {
-        /// Final stable metadata authenticating every completed pair.
-        metadata: AutomationMetadata,
-        /// Complete press/release pairs sent before the deadline expired.
-        receipts: Vec<GuardedKeyReceipt>,
-    },
+    DeadlineExpired,
+}
+
+/// Checked disposition, matching final metadata, and ordered key receipts.
+///
+/// The observed disposition is immutable:
+///
+/// ```compile_fail
+/// use kenwood_thd75::radio::automation::{GuardedKeyOutcome, GuardedKeyOutcomeKind};
+/// fn relabel(outcome: &mut GuardedKeyOutcome) {
+///     outcome.kind = GuardedKeyOutcomeKind::Dispatched;
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GuardedKeyOutcome {
+    kind: GuardedKeyOutcomeKind,
+    metadata: AutomationMetadata,
+    receipts: Vec<GuardedKeyReceipt>,
 }
 
 impl GuardedKeyOutcome {
+    const fn new(
+        kind: GuardedKeyOutcomeKind,
+        metadata: AutomationMetadata,
+        receipts: Vec<GuardedKeyReceipt>,
+    ) -> Self {
+        Self {
+            kind,
+            metadata,
+            receipts,
+        }
+    }
+
+    /// Return the checked transaction's final disposition.
+    #[must_use]
+    pub const fn kind(&self) -> GuardedKeyOutcomeKind {
+        self.kind
+    }
+
     /// Return the final authenticated firmware metadata.
     #[must_use]
     pub const fn metadata(&self) -> &AutomationMetadata {
-        match self {
-            Self::Dispatched { metadata, .. }
-            | Self::ContextChanged { metadata, .. }
-            | Self::DeadlineExpired { metadata, .. } => metadata,
-        }
+        &self.metadata
     }
 
     /// Return the ordered per-key receipts.
     #[must_use]
     pub fn receipts(&self) -> &[GuardedKeyReceipt] {
-        match self {
-            Self::Dispatched { receipts, .. }
-            | Self::ContextChanged { receipts, .. }
-            | Self::DeadlineExpired { receipts, .. } => receipts,
-        }
+        &self.receipts
+    }
+
+    /// Consume the checked result and transfer its disposition and observations.
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (
+        GuardedKeyOutcomeKind,
+        AutomationMetadata,
+        Vec<GuardedKeyReceipt>,
+    ) {
+        (self.kind, self.metadata, self.receipts)
     }
 }
 
 /// Authenticated receipt for one guarded `GM RDDD,SS` transaction.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GuardedDecimalRouteReceipt {
     /// Exact three-digit route requested by the host and echoed by metadata.
-    pub route: GuardedDecimalRoute,
+    route: GuardedDecimalRoute,
     /// Eight-bit host sequence echoed by the wire reply and metadata.
-    pub sequence: u8,
+    sequence: u8,
     /// Number of framebuffer comparisons attempted, including a failed one.
-    pub guard_count: u8,
+    guard_count: u8,
     /// Number of complete zero-hold press/release pairs dispatched.
-    pub completed_taps: u8,
+    completed_taps: u8,
     /// Exact six-bit press/release event mask for the completed prefix.
-    pub event_mask: u8,
+    event_mask: u8,
     /// Final stable metadata authenticating this receipt.
-    pub metadata: AutomationMetadata,
+    metadata: AutomationMetadata,
 }
 
-/// Fully authenticated result of one guarded decimal route command.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum GuardedDecimalRouteOutcome {
-    /// All three guarded zero-hold taps were dispatched synchronously.
-    Dispatched(GuardedDecimalRouteReceipt),
-    /// The framebuffer comparison failed before any digit was dispatched.
-    ContextChanged(GuardedDecimalRouteReceipt),
+impl GuardedDecimalRouteReceipt {
+    /// Return the requested route echoed by the final metadata.
+    #[must_use]
+    pub const fn route(&self) -> GuardedDecimalRoute {
+        self.route
+    }
+    /// Return the host sequence echoed by reply and metadata.
+    #[must_use]
+    pub const fn sequence(&self) -> u8 {
+        self.sequence
+    }
+    /// Return the number of attempted framebuffer comparisons.
+    #[must_use]
+    pub const fn guard_count(&self) -> u8 {
+        self.guard_count
+    }
+    /// Return the number of completed press/release pairs.
+    #[must_use]
+    pub const fn completed_taps(&self) -> u8 {
+        self.completed_taps
+    }
+    /// Return the six-bit event mask for the completed prefix.
+    #[must_use]
+    pub const fn event_mask(&self) -> u8 {
+        self.event_mask
+    }
+    /// Borrow the stable metadata matching this receipt.
+    #[must_use]
+    pub const fn metadata(&self) -> &AutomationMetadata {
+        &self.metadata
+    }
+}
+
+/// Checked guarded-route decision paired with its matching receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GuardedDecimalRouteOutcome {
+    result: GuardedKeyResult,
+    receipt: GuardedDecimalRouteReceipt,
 }
 
 impl GuardedDecimalRouteOutcome {
+    const fn new(result: GuardedKeyResult, receipt: GuardedDecimalRouteReceipt) -> Self {
+        Self { result, receipt }
+    }
+
+    /// Return whether all three taps ran or the initial comparison refused them.
+    #[must_use]
+    pub const fn result(&self) -> GuardedKeyResult {
+        self.result
+    }
+
     /// Return the exact command-4 receipt for either semantic outcome.
     #[must_use]
     pub const fn receipt(&self) -> &GuardedDecimalRouteReceipt {
-        match self {
-            Self::Dispatched(receipt) | Self::ContextChanged(receipt) => receipt,
-        }
+        &self.receipt
     }
 
     /// Return the final authenticated firmware metadata.
@@ -539,10 +777,13 @@ impl GuardedDecimalRouteOutcome {
     /// never requires recovery.
     #[must_use]
     pub const fn requires_recovery(&self) -> bool {
-        matches!(
-            self,
-            Self::ContextChanged(receipt) if receipt.completed_taps > 0
-        )
+        matches!(self.result, GuardedKeyResult::ContextChanged) && self.receipt.completed_taps > 0
+    }
+
+    /// Consume the checked result and transfer its decision and receipt.
+    #[must_use]
+    pub const fn into_parts(self) -> (GuardedKeyResult, GuardedDecimalRouteReceipt) {
+        (self.result, self.receipt)
     }
 }
 
@@ -992,9 +1233,10 @@ impl<T: Transport> AutomationSession<'_, T> {
             )?;
             Self::validate_guarded_snapshot_state_unchanged(&raw, &metadata, &before)?;
             self.next_key_sequence = press_sequence.wrapping_add(1);
-            Ok(GuardedKeyOutcome::ContextChanged {
+            Ok(GuardedKeyOutcome::new(
+                GuardedKeyOutcomeKind::ContextChanged,
                 metadata,
-                receipts: vec![GuardedKeyReceipt {
+                vec![GuardedKeyReceipt {
                     key,
                     press_sequence,
                     release_sequence: None,
@@ -1002,7 +1244,7 @@ impl<T: Transport> AutomationSession<'_, T> {
                     command_count: expected_command_count,
                     seqlock: expected_seqlock,
                 }],
-            })
+            ))
         }
         .await;
         if let Ok(outcome) = &result {
@@ -1109,9 +1351,10 @@ impl<T: Transport> AutomationSession<'_, T> {
             )?;
             Self::validate_guarded_frame_receipt(&raw, &metadata, &lease)?;
             self.next_key_sequence = guarded_press_sequence.wrapping_add(1);
-            Ok(GuardedKeyOutcome::ContextChanged {
+            Ok(GuardedKeyOutcome::new(
+                GuardedKeyOutcomeKind::ContextChanged,
                 metadata,
-                receipts: vec![GuardedKeyReceipt {
+                vec![GuardedKeyReceipt {
                     key: guarded_probe_key,
                     press_sequence: guarded_press_sequence,
                     release_sequence: None,
@@ -1119,7 +1362,7 @@ impl<T: Transport> AutomationSession<'_, T> {
                     command_count: expected_command_count,
                     seqlock: expected_seqlock,
                 }],
-            })
+            ))
         }
         .await;
         if let Ok(outcome) = &result {
@@ -1219,7 +1462,10 @@ impl<T: Transport> AutomationSession<'_, T> {
                 ));
             }
             self.next_key_sequence = route_sequence.wrapping_add(1);
-            Ok(GuardedDecimalRouteOutcome::ContextChanged(receipt))
+            Ok(GuardedDecimalRouteOutcome::new(
+                GuardedKeyResult::ContextChanged,
+                receipt,
+            ))
         }
         .await;
         if let Ok(outcome) = &result {
@@ -1310,8 +1556,14 @@ impl<T: Transport> AutomationSession<'_, T> {
             )?;
             self.next_key_sequence = sequence.wrapping_add(1);
             match status {
-                GUARDED_STATUS_OK => Ok(GuardedDecimalRouteOutcome::Dispatched(receipt)),
-                2 => Ok(GuardedDecimalRouteOutcome::ContextChanged(receipt)),
+                GUARDED_STATUS_OK => Ok(GuardedDecimalRouteOutcome::new(
+                    GuardedKeyResult::Dispatched,
+                    receipt,
+                )),
+                2 => Ok(GuardedDecimalRouteOutcome::new(
+                    GuardedKeyResult::ContextChanged,
+                    receipt,
+                )),
                 _ => Err(Radio::<T>::strict_protocol_error(
                     "a parsed guarded-route status",
                     [status].to_vec(),
@@ -1345,12 +1597,11 @@ impl<T: Transport> AutomationSession<'_, T> {
     /// state unknowable and poisons the session. Once `GM G` acknowledges a
     /// dispatched press, its `GM K` release is always attempted; if that tap
     /// completes after the deadline, no next press is sent and
-    /// [`GuardedKeyOutcome::DeadlineExpired`] authenticates the completed
+    /// [`GuardedKeyOutcomeKind::DeadlineExpired`] reports the completed
     /// prefix. A firmware context mismatch sends no release because firmware
     /// sent no press; command 3/result 2 metadata proves that refusal. Both
     /// authenticated semantic outcomes leave the session usable but require a
-    /// new capture before any further guarded input. This removes the host-side
-    /// check-to-command gap, but a concurrent framebuffer writer can still race
+    /// new capture before any further guarded input. A concurrent framebuffer writer can still race
     /// the comparison itself and change an already-compared word before input
     /// dispatch.
     ///
@@ -1442,7 +1693,11 @@ impl<T: Transport> AutomationSession<'_, T> {
                     seqlock: expected_seqlock,
                 });
                 self.next_key_sequence = press_sequence.wrapping_add(1);
-                return Ok(GuardedKeyOutcome::ContextChanged { metadata, receipts });
+                return Ok(GuardedKeyOutcome::new(
+                    GuardedKeyOutcomeKind::ContextChanged,
+                    metadata,
+                    receipts,
+                ));
             }
 
             tokio::time::sleep(TAP_HOLD).await;
@@ -1490,7 +1745,11 @@ impl<T: Transport> AutomationSession<'_, T> {
         )?;
         Self::validate_guarded_frame_receipt(&raw, &metadata, lease)?;
         self.next_key_sequence = sequence;
-        Ok(GuardedKeyOutcome::Dispatched { metadata, receipts })
+        Ok(GuardedKeyOutcome::new(
+            GuardedKeyOutcomeKind::Dispatched,
+            metadata,
+            receipts,
+        ))
     }
 
     async fn authenticate_guarded_deadline(
@@ -1520,7 +1779,11 @@ impl<T: Transport> AutomationSession<'_, T> {
         )?;
         Self::validate_guarded_frame_receipt(&raw, &metadata, lease)?;
         self.next_key_sequence = next_sequence;
-        Ok(GuardedKeyOutcome::DeadlineExpired { metadata, receipts })
+        Ok(GuardedKeyOutcome::new(
+            GuardedKeyOutcomeKind::DeadlineExpired,
+            metadata,
+            receipts,
+        ))
     }
 
     fn validate_guarded_snapshot(
@@ -2569,10 +2832,11 @@ mod tests {
         DISPATCH_ATTESTATION_OFFSET, EXPECTED_ABI, FRAME_HEIGHT, FRAME_STRIDE, FRAME_WIDTH,
         FRAMEBUFFER_ADDRESS, FrontPanelKey, GUARDED_ROUTE_MAX_DURATION, GUARDED_SNAPSHOT_MAX_AGE,
         GuardedDecimalRoute, GuardedDecimalRouteOutcome, GuardedInputLease, GuardedKeyError,
-        GuardedKeyOutcome, GuardedKeyResult, IfTapConfig, KeyPhase, MAX_CAPTURE_ATTEMPTS,
-        METADATA_LENGTH, METADATA_OFFSET, PIXEL_FORMAT_RGB565LE, PIXEL_LENGTH, PIXEL_OFFSET,
-        READ_HOOK_ATTESTATION, READ_HOOK_ATTESTATION_OFFSET, RESULT_CONTEXT_CHANGED, RESULT_OK,
-        RLE_MAGIC, RLE_OFFSET, RLE_RELATIVE_OFFSET, SNAPSHOT_ADDRESS,
+        GuardedKeyOutcome, GuardedKeyOutcomeKind, GuardedKeyResult, IfTapConfig, KeyPhase,
+        MAX_CAPTURE_ATTEMPTS, METADATA_LENGTH, METADATA_OFFSET, PIXEL_FORMAT_RGB565LE,
+        PIXEL_LENGTH, PIXEL_OFFSET, READ_HOOK_ATTESTATION, READ_HOOK_ATTESTATION_OFFSET,
+        RESULT_CONTEXT_CHANGED, RESULT_OK, RLE_MAGIC, RLE_OFFSET, RLE_RELATIVE_OFFSET,
+        SNAPSHOT_ADDRESS,
     };
     use crate::error::Error;
     use crate::protocol::memread::encode_hex_upper;
@@ -2712,7 +2976,7 @@ mod tests {
         for chunk in data.chunks(256) {
             let wire_length = if chunk.len() == 256 { 0 } else { chunk.len() };
             let request = format!("GM {cursor:06X},{wire_length:02X}\r");
-            mock.expect(request.as_bytes(), &reply(cursor, chunk));
+            mock.expect(request.as_bytes(), reply(cursor, chunk));
             cursor = cursor
                 .checked_add(u32::try_from(chunk.len())?)
                 .ok_or("mock range cursor overflow")?;
@@ -2909,6 +3173,8 @@ mod tests {
     fn queue_if_tap_retune_to_145_025(mock: &mut MockTransport) {
         mock.expect(b"FQ 1\r", b"FQ 1,0145000000\r");
         mock.expect(b"SF 1\r", b"SF 1,0\r");
+        mock.expect(b"VM 1\r", b"VM 1,0\r");
+        mock.expect(b"BC\r", b"BC 1\r");
         mock.expect(b"IO 0\r", b"IO 0\r");
         mock.expect(b"IO\r", b"IO 0\r");
         for frequency in [
@@ -2984,7 +3250,7 @@ mod tests {
 
         let mut session = direct_automation_session(&mut radio, &snapshot);
         let saved = session
-            .enter_if_tap(IfTapConfig::new(OperatingMode::Usb).with_step(StepSize::Hz5000))
+            .enter_if_tap(IfTapConfig::new(OperatingMode::Usb)?.with_step(StepSize::Hz5000))
             .await?;
         assert!(session.guarded_input_lease.is_none());
         assert!(session.is_valid());
@@ -3029,7 +3295,7 @@ mod tests {
         let mut session = direct_automation_session_without_snapshot(&mut radio);
 
         let result = session
-            .enter_if_tap(IfTapConfig::new(OperatingMode::Usb))
+            .enter_if_tap(IfTapConfig::new(OperatingMode::Usb)?)
             .await;
         let Err(error) = result else {
             return Err("malformed IF entry unexpectedly succeeded".into());
@@ -3059,7 +3325,7 @@ mod tests {
         let mut radio = Radio::new(mock);
         let mut session = direct_automation_session_without_snapshot(&mut radio);
         let saved = session
-            .enter_if_tap(IfTapConfig::new(OperatingMode::Usb).with_step(StepSize::Hz5000))
+            .enter_if_tap(IfTapConfig::new(OperatingMode::Usb)?.with_step(StepSize::Hz5000))
             .await?;
 
         let report = session.restore_if_tap(saved).await;
@@ -3088,7 +3354,7 @@ mod tests {
         let mut session = direct_automation_session(&mut radio, &snapshot);
 
         let result = session
-            .enter_if_tap(IfTapConfig::new(OperatingMode::Usb).with_step(StepSize::Hz5000))
+            .enter_if_tap(IfTapConfig::new(OperatingMode::Usb)?.with_step(StepSize::Hz5000))
             .await;
         let Err(error) = result else {
             return Err("unavailable IF entry unexpectedly succeeded".into());
@@ -3378,7 +3644,7 @@ mod tests {
             let outcome = session
                 .verify_missing_snapshot_refusal(FrontPanelKey::Menu)
                 .await?;
-            assert!(matches!(outcome, GuardedKeyOutcome::ContextChanged { .. }));
+            assert_eq!(outcome.kind(), GuardedKeyOutcomeKind::ContextChanged);
             assert!(session.is_valid());
         }
         radio.transport.assert_complete();
@@ -3410,7 +3676,12 @@ mod tests {
             let outcome = session
                 .verify_changed_context_refusal(&snapshot, FrontPanelKey::Menu, FrontPanelKey::Menu)
                 .await?;
-            let GuardedKeyOutcome::ContextChanged { metadata, receipts } = outcome else {
+            let GuardedKeyOutcome {
+                kind: GuardedKeyOutcomeKind::ContextChanged,
+                metadata,
+                receipts,
+            } = outcome
+            else {
                 return Err("changed context did not return a typed refusal".into());
             };
             assert_eq!(metadata.last_command, COMMAND_GUARDED_KEY);
@@ -3444,7 +3715,11 @@ mod tests {
             let outcome = session
                 .verify_decimal_route_changed_context_refusal(&snapshot, FrontPanelKey::Menu, route)
                 .await?;
-            let GuardedDecimalRouteOutcome::ContextChanged(receipt) = outcome else {
+            let GuardedDecimalRouteOutcome {
+                result: GuardedKeyResult::ContextChanged,
+                receipt,
+            } = outcome
+            else {
                 return Err("changed context did not return a decimal-route refusal".into());
             };
             assert_eq!(receipt.route, route);
@@ -3517,7 +3792,12 @@ mod tests {
         {
             let mut session = direct_automation_session(&mut radio, &snapshot);
             let outcome = session.guarded_tap_keys(&snapshot, &keys).await?;
-            let GuardedKeyOutcome::Dispatched { metadata, receipts } = outcome else {
+            let GuardedKeyOutcome {
+                kind: GuardedKeyOutcomeKind::Dispatched,
+                metadata,
+                receipts,
+            } = outcome
+            else {
                 return Err("matching guarded route was not dispatched".into());
             };
             assert_eq!(metadata.command_count, 16);
@@ -3620,7 +3900,11 @@ mod tests {
         {
             let mut session = direct_automation_session(&mut radio, &snapshot);
             let outcome = session.guarded_decimal_route(&snapshot, route).await?;
-            let GuardedDecimalRouteOutcome::Dispatched(receipt) = outcome else {
+            let GuardedDecimalRouteOutcome {
+                result: GuardedKeyResult::Dispatched,
+                receipt,
+            } = outcome
+            else {
                 return Err("matching batch route was not dispatched".into());
             };
             assert_eq!(receipt.route, route);
@@ -3652,7 +3936,11 @@ mod tests {
         {
             let mut session = direct_automation_session(&mut radio, &snapshot);
             let outcome = session.guarded_decimal_route(&snapshot, route).await?;
-            let GuardedDecimalRouteOutcome::ContextChanged(receipt) = &outcome else {
+            let GuardedDecimalRouteOutcome {
+                result: GuardedKeyResult::ContextChanged,
+                receipt,
+            } = &outcome
+            else {
                 return Err("changed framebuffer did not return a zero-digit refusal".into());
             };
             assert_eq!(receipt.guard_count, 1);
@@ -3678,7 +3966,7 @@ mod tests {
         let mut mock = MockTransport::new();
         mock.queue_read_delayed(
             b"GM R991,0000\r",
-            u64::try_from(GUARDED_ROUTE_MAX_DURATION.as_millis())? + 1,
+            GUARDED_ROUTE_MAX_DURATION + Duration::from_millis(1),
         );
         mock.expect(b"GM R991,00\r", b"");
         let mut radio = Radio::new(mock);
@@ -3723,7 +4011,12 @@ mod tests {
             let outcome = session
                 .guarded_tap_key(&snapshot, FrontPanelKey::Menu)
                 .await?;
-            let GuardedKeyOutcome::ContextChanged { metadata, receipts } = outcome else {
+            let GuardedKeyOutcome {
+                kind: GuardedKeyOutcomeKind::ContextChanged,
+                metadata,
+                receipts,
+            } = outcome
+            else {
                 return Err("changed framebuffer did not return a typed refusal".into());
             };
             assert_eq!(metadata.last_command, COMMAND_GUARDED_KEY);
@@ -3749,7 +4042,7 @@ mod tests {
         let mut mock = MockTransport::new();
         mock.queue_read_delayed(
             b"GM G0B,00000\r",
-            u64::try_from(GUARDED_ROUTE_MAX_DURATION.as_millis())? + 1,
+            GUARDED_ROUTE_MAX_DURATION + Duration::from_millis(1),
         );
         mock.expect(b"GM G0B,000\r", b"");
         let mut radio = Radio::new(mock);
@@ -3789,11 +4082,7 @@ mod tests {
             COMMAND_KEY,
             RESULT_OK,
         )?;
-        let press_delay = u64::try_from(
-            GUARDED_ROUTE_MAX_DURATION
-                .saturating_sub(Duration::from_millis(20))
-                .as_millis(),
-        )?;
+        let press_delay = GUARDED_ROUTE_MAX_DURATION.saturating_sub(Duration::from_millis(20));
         let mut mock = MockTransport::new();
         mock.queue_read_delayed(b"GM G01,00000\r", press_delay);
         mock.expect(b"GM G01,000\r", b"");
@@ -3806,7 +4095,12 @@ mod tests {
             let outcome = session
                 .guarded_tap_key(&snapshot, FrontPanelKey::Menu)
                 .await?;
-            let GuardedKeyOutcome::DeadlineExpired { metadata, receipts } = outcome else {
+            let GuardedKeyOutcome {
+                kind: GuardedKeyOutcomeKind::DeadlineExpired,
+                metadata,
+                receipts,
+            } = outcome
+            else {
                 return Err("overdue final tap did not return its authenticated prefix".into());
             };
             assert_eq!(metadata.command_count, 12);
@@ -3836,7 +4130,7 @@ mod tests {
         mock.queue_read(b"GM G0B,00000\r");
         mock.queue_read_delayed(
             b"GM K0B,10100\r",
-            u64::try_from(GUARDED_ROUTE_MAX_DURATION.as_millis())? + 1,
+            GUARDED_ROUTE_MAX_DURATION + Duration::from_millis(1),
         );
         mock.expect(b"GM G0B,000\r", b"");
         mock.expect(b"GM K0B,101\r", b"");
@@ -3848,7 +4142,12 @@ mod tests {
             let outcome = session
                 .guarded_tap_keys(&snapshot, &[FrontPanelKey::Vfo1, FrontPanelKey::Mr2])
                 .await?;
-            let GuardedKeyOutcome::DeadlineExpired { metadata, receipts } = outcome else {
+            let GuardedKeyOutcome {
+                kind: GuardedKeyOutcomeKind::DeadlineExpired,
+                metadata,
+                receipts,
+            } = outcome
+            else {
                 return Err("slow release did not stop the remaining guarded route".into());
             };
             assert_eq!(metadata.command_count, 12);

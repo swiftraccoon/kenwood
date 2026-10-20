@@ -153,7 +153,7 @@ const fn channel_data_offset(channel: usize) -> usize {
 ///
 /// The header contains a validated model identifier and otherwise preserves
 /// every byte verbatim. Metadata accessors read directly from the bytes that
-/// [`write_config`] emits, so their views cannot diverge from the serialized
+/// [`RadioConfig::to_bytes`] emits, so their views cannot diverge from the serialized
 /// header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigHeader {
@@ -218,7 +218,7 @@ impl TryFrom<[u8; HEADER_SIZE]> for ConfigHeader {
 
 /// Complete, fixed-size radio configuration from a `.d75` file.
 ///
-/// This is the top-level structure returned by [`parse_config`]. The channel
+/// This is the top-level structure returned by [`Self::from_bytes`]. The channel
 /// and settings views all borrow the same canonical [`MemoryImage`], so a
 /// serialized configuration cannot diverge from a second cached copy.
 #[derive(Debug, Clone)]
@@ -291,45 +291,51 @@ impl RadioConfig {
     pub fn into_memory_image(self) -> MemoryImage {
         self.memory_image
     }
+
+    /// Serialize the exact `.d75` header followed by the fixed-size MCP image.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serialize_config_parts(self.memory_image(), self.header())
+    }
 }
 
-/// Parses a `.d75` configuration file from raw bytes.
-///
-/// # Errors
-///
-/// Returns [`SdCardError::FileTooSmall`] if the data is shorter than
-/// the minimum required size, or [`SdCardError::InvalidModelIdentifier`]
-/// if the header model is not recognised.
-pub fn parse_config(data: &[u8]) -> Result<RadioConfig, SdCardError> {
-    let expected_size = HEADER_SIZE + programming::TOTAL_SIZE;
-    if data.len() < expected_size {
-        return Err(SdCardError::FileTooSmall {
-            expected: expected_size,
-            actual: data.len(),
-        });
-    }
-    if data.len() > expected_size {
-        return Err(SdCardError::UnexpectedFileSize {
-            file_type: ".d75 configuration",
-            expected: expected_size,
-            actual: data.len(),
-        });
-    }
+impl RadioConfig {
+    /// Parses a `.d75` configuration file from raw bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SdCardError::FileTooSmall`] if the data is shorter than
+    /// the minimum required size, or [`SdCardError::InvalidModelIdentifier`]
+    /// if the header model is not recognised.
+    pub fn from_bytes(data: &[u8]) -> Result<Self, SdCardError> {
+        let expected_size = HEADER_SIZE + programming::TOTAL_SIZE;
+        if data.len() < expected_size {
+            return Err(SdCardError::FileTooSmall {
+                expected: expected_size,
+                actual: data.len(),
+            });
+        }
+        if data.len() > expected_size {
+            return Err(SdCardError::UnexpectedFileSize {
+                file_type: ".d75 configuration",
+                expected: expected_size,
+                actual: data.len(),
+            });
+        }
 
-    let header = parse_header(data)?;
-    let raw_image = data
-        .get(HEADER_SIZE..)
-        .ok_or(SdCardError::FileTooSmall {
-            expected: HEADER_SIZE,
-            actual: data.len(),
-        })?
-        .to_vec();
-    let memory_image =
-        MemoryImage::from_raw(raw_image).map_err(|error| SdCardError::InvalidMemoryImage {
-            detail: error.to_string(),
-        })?;
+        let header = parse_header(data)?;
+        let raw_image = data
+            .get(HEADER_SIZE..)
+            .ok_or(SdCardError::FileTooSmall {
+                expected: HEADER_SIZE,
+                actual: data.len(),
+            })?
+            .to_vec();
+        let memory_image = MemoryImage::from_raw(raw_image)
+            .map_err(|source| SdCardError::InvalidMemoryImage { source })?;
 
-    RadioConfig::new(header, memory_image)
+        Self::new(header, memory_image)
+    }
 }
 
 /// Parse and validate the fixed-size `.d75` file header.
@@ -351,23 +357,15 @@ fn parse_header(data: &[u8]) -> Result<ConfigHeader, SdCardError> {
 fn validate_regular_channels(memory_image: &MemoryImage) -> Result<(), SdCardError> {
     let channels = memory_image.channels();
     for number in RegularChannel::all() {
-        let _validated_entry = channels
-            .get(number)
-            .map_err(|error| SdCardError::ChannelParse {
-                index: number.as_raw(),
-                detail: error.to_string(),
-            })?;
+        let _validated_entry =
+            channels
+                .get(number)
+                .map_err(|source| SdCardError::ChannelParse {
+                    index: number.as_raw(),
+                    source,
+                })?;
     }
     Ok(())
-}
-
-/// Generates a `.d75` file from a [`RadioConfig`].
-///
-/// The output is the header concatenated with the configuration's canonical,
-/// fixed-size memory image.
-#[must_use]
-pub fn write_config(config: &RadioConfig) -> Vec<u8> {
-    serialize_config_parts(config.memory_image(), config.header())
 }
 
 /// Create a minimal valid `.d75` header for a supported model.
@@ -561,7 +559,7 @@ mod tests {
         let mut raw = vec![0u8; programming::TOTAL_SIZE];
         mark_regular_channels_empty(&mut raw, CHANNEL_FLAGS_OFFSET - HEADER_SIZE)?;
         let config = RadioConfig::new(header, MemoryImage::from_raw(raw)?)?;
-        let d75_bytes = write_config(&config);
+        let d75_bytes = config.to_bytes();
 
         // The output should be header + image.
         assert_eq!(d75_bytes.len(), HEADER_SIZE + programming::TOTAL_SIZE);
@@ -575,7 +573,7 @@ mod tests {
         );
 
         // Round-trip: parse it back and verify.
-        let parsed = parse_config(&d75_bytes)?;
+        let parsed = RadioConfig::from_bytes(&d75_bytes)?;
         assert_eq!(parsed.header().model(), ConfigFileModel::ThD75A);
         assert_eq!(parsed.header().version_bytes(), [0x95, 0xC4, 0x8F, 0x42]);
         assert_eq!(
@@ -604,7 +602,7 @@ mod tests {
             .memory_image_mut()
             .write_region(last_offset, &[0x5A])?;
 
-        let serialized = write_config(&config);
+        let serialized = config.to_bytes();
         assert_eq!(
             serialized
                 .get(..HEADER_SIZE)
@@ -612,7 +610,7 @@ mod tests {
             raw_header.as_slice()
         );
 
-        let parsed = parse_config(&serialized)?;
+        let parsed = RadioConfig::from_bytes(&serialized)?;
         assert_eq!(parsed.header().as_bytes(), &raw_header);
         assert_eq!(
             parsed
@@ -630,11 +628,11 @@ mod tests {
         let mut raw = vec![0u8; programming::TOTAL_SIZE];
         mark_regular_channels_empty(&mut raw, CHANNEL_FLAGS_OFFSET - HEADER_SIZE)?;
         let config = RadioConfig::new(header, MemoryImage::from_raw(raw)?)?;
-        let mut data = write_config(&config);
+        let mut data = config.to_bytes();
         data.push(0xA5);
 
         assert!(matches!(
-            parse_config(&data),
+            RadioConfig::from_bytes(&data),
             Err(SdCardError::UnexpectedFileSize {
                 file_type: ".d75 configuration",
                 expected,
@@ -659,7 +657,7 @@ mod tests {
             set_byte(&mut raw, 0x4000, 0xAB)?;
         }
         let config = RadioConfig::new(header, MemoryImage::from_raw(raw)?)?;
-        let d75_bytes = write_config(&config);
+        let d75_bytes = config.to_bytes();
 
         // The marker should be at file offset HEADER_SIZE + 0x4000.
         assert_eq!(
@@ -704,7 +702,7 @@ mod tests {
             &[0u8; programming::MEMGROUP_PADDING]
         );
 
-        let parsed = parse_config(&data)?;
+        let parsed = RadioConfig::from_bytes(&data)?;
         let parsed_five = parsed.channels().get(RegularChannel::new(5)?)?;
         let parsed_six = parsed.channels().get(RegularChannel::new(6)?)?;
         assert_eq!(
@@ -766,7 +764,7 @@ mod tests {
         }
         let config = RadioConfig::new(header, memory_image)?;
 
-        let written = write_config(&config);
+        let written = config.to_bytes();
         assert_eq!(
             written
                 .get(channel_data_offset(5)..channel_data_offset(5) + CHANNEL_ENTRY_SIZE)
@@ -786,7 +784,7 @@ mod tests {
             &[0xA5; programming::MEMGROUP_PADDING]
         );
 
-        let parsed = parse_config(&written)?;
+        let parsed = RadioConfig::from_bytes(&written)?;
         assert_eq!(
             parsed
                 .channels()
@@ -826,7 +824,7 @@ mod tests {
         // Value 0xF0 => step_size = 15 which is out of range.
         set_byte(&mut d75_data, ch0_offset + 0x08, 0xF0)?;
 
-        let err = parse_config(&d75_data)
+        let err = RadioConfig::from_bytes(&d75_data)
             .err()
             .ok_or("expected ChannelParse error but got Ok")?;
         assert!(

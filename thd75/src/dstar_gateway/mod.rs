@@ -9,7 +9,7 @@
 //! configuration, events, headers and slow-data types come directly from
 //! `mmdvm::dstar` and `dstar_gateway_core`.
 
-pub mod gateway;
-
 pub use crate::radio::mmdvm_session::{PersistentMmdvm, TransientMmdvm};
 pub use gateway::DstarGateway;
+
+pub mod gateway;

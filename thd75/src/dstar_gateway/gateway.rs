@@ -6,19 +6,22 @@
 //! its transport paired with the CAT state needed to restore the radio. Call
 //! `stop` to reclaim the radio; a transient gateway then requires
 //! [`DesyncedRadio::restore`] before any further CAT command.
+//!
+//! The Kenwood configuration layout is unverified. Both startup methods return
+//! [`mmdvm::ConfigurationError::UnsupportedProfile`] before radio I/O.
 
 use std::marker::PhantomData;
 use std::time::Duration;
 
 use dstar_gateway_core::{DstarHeader, VoiceFrame};
-use kenwood_transport::{StreamAdapter, Transport, TransportError};
-use mmdvm::AsyncModem;
+use kenwood_transport::{StreamAdapter, Transport};
 use mmdvm::core::ModemStatus;
 use mmdvm::dstar::{DstarError, DstarEvent, DstarModem, DstarModemConfig, DstarStatusReflector};
+use mmdvm::{AsyncModem, ConfigurationError, ConfigurationProfile, DstarConfiguration};
 
 use crate::Error;
 use crate::radio::mmdvm_session::{
-    MmdvmRadioRestore, MmdvmSession, PersistentMmdvm, TransientMmdvm,
+    MmdvmRadioRestore, MmdvmSession, MmdvmShutdown, PersistentMmdvm, TransientMmdvm,
 };
 use crate::radio::{DesyncedRadio, Radio};
 use crate::types::TncDataBand;
@@ -29,23 +32,15 @@ use crate::types::TncDataBand;
 /// A persistent gateway requires a connection that already carries binary-mode
 /// proof and never sends the transient ASCII exit.
 ///
-/// ```rust,no_run
-/// use kenwood_thd75::{DstarGateway, Radio};
-/// use kenwood_thd75::transport::SerialTransport;
-/// use kenwood_thd75::types::TncDataBand;
-/// use mmdvm::dstar::DstarModemConfig;
+/// ```
+/// use kenwood_thd75::DstarGateway;
+/// use kenwood_transport::MockTransport;
+/// use mmdvm::{ConfigurationError, ConfigurationProfile};
 ///
-/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let config = DstarModemConfig::new("N0CALL")?;
-/// let radio = Radio::new(SerialTransport::open("/dev/tty-example")?);
-/// let mut gateway = DstarGateway::start(radio, TncDataBand::B, config)
-///     .await.map_err(|(_, error)| error)?;
-/// let _event = gateway.next_event().await?;
-/// let radio = gateway.stop().await?.restore().await
-///     .map_err(|(_, error)| error)?;
-/// # drop(radio);
-/// # Ok(())
-/// # }
+/// assert!(matches!(DstarGateway::<MockTransport>::wire_configuration(),
+///     Err(ConfigurationError::UnsupportedProfile {
+///         profile: ConfigurationProfile::KenwoodTerminal
+///     })));
 /// ```
 pub struct DstarGateway<T: Transport + Unpin + 'static, Lifecycle = TransientMmdvm> {
     modem: DstarModem<StreamAdapter<T>>,
@@ -77,15 +72,29 @@ impl<T: Transport + Unpin + 'static> DstarGateway<T> {
         data_band: TncDataBand,
         config: DstarModemConfig,
     ) -> Result<Self, (Option<Radio<T>>, Error)> {
+        let wire_config = match Self::wire_configuration() {
+            Ok(config) => config,
+            Err(error) => return Err((Some(radio), error.into())),
+        };
         let session = match radio.enter_mmdvm(data_band).await {
             Ok(session) => session,
             Err((radio, error)) => return Err((Some(radio), error)),
         };
-        match Self::build_from_session(session, config).await {
+        match Self::build_from_session(session, config, wire_config).await {
             Ok(gateway) => Ok(gateway),
             Err((restore, modem, init_error)) => match restore.exit_and_rebuild(modem).await {
-                Ok(desynced) => Err((Some(desynced.into_radio_unproven()), init_error)),
-                Err(exit_error) => Err((None, double_fault_error(&init_error, &exit_error))),
+                Ok(completed) => {
+                    let (radio, summary) = completed.into_parts();
+                    Err((
+                        Some(radio.into_radio_unproven()),
+                        Error::DstarStartup {
+                            initialization: Box::new(init_error),
+                            cleanup: None,
+                            shutdown: Some(summary),
+                        },
+                    ))
+                }
+                Err(exit_error) => Err((None, startup_cleanup_error(init_error, exit_error))),
             },
         }
     }
@@ -97,7 +106,7 @@ impl<T: Transport + Unpin + 'static> DstarGateway<T> {
     /// # Errors
     ///
     /// Fails on modem shutdown, transport recovery, or the matching TNC exit.
-    pub async fn stop(self) -> Result<DesyncedRadio<T>, Error> {
+    pub async fn stop(self) -> Result<MmdvmShutdown<DesyncedRadio<T>>, Error> {
         self.restore.exit_and_rebuild(self.modem.into_modem()).await
     }
 }
@@ -117,19 +126,32 @@ impl<T: Transport + Unpin + 'static> DstarGateway<T, PersistentMmdvm> {
         radio: Radio<T>,
         config: DstarModemConfig,
     ) -> Result<Self, (Option<Radio<T>>, Error)> {
+        let wire_config = match Self::wire_configuration() {
+            Ok(config) => config,
+            Err(error) => return Err((Some(radio), error.into())),
+        };
         let session = match radio.into_mmdvm_session() {
             Ok(session) => session,
             Err((radio, error)) => return Err((Some(radio), error)),
         };
-        match Self::build_from_session(session, config).await {
+        match Self::build_from_session(session, config, wire_config).await {
             Ok(gateway) => Ok(gateway),
             Err((restore, modem, init_error)) => {
                 match restore.shutdown_and_rebuild_binary(modem).await {
-                    Ok(radio) => Err((Some(radio), init_error)),
-                    Err(reclaim_error) => Err((
-                        None,
-                        binary_reclaim_fault_error(&init_error, &reclaim_error),
-                    )),
+                    Ok(completed) => {
+                        let (radio, summary) = completed.into_parts();
+                        Err((
+                            Some(radio),
+                            Error::DstarStartup {
+                                initialization: Box::new(init_error),
+                                cleanup: None,
+                                shutdown: Some(summary),
+                            },
+                        ))
+                    }
+                    Err(reclaim_error) => {
+                        Err((None, startup_cleanup_error(init_error, reclaim_error)))
+                    }
                 }
             }
         }
@@ -144,7 +166,7 @@ impl<T: Transport + Unpin + 'static> DstarGateway<T, PersistentMmdvm> {
     ///
     /// Fails if either pump cannot be reclaimed cleanly. On failure no `Radio`
     /// is returned and the connection must be reopened and re-proved.
-    pub async fn stop(self) -> Result<Radio<T>, Error> {
+    pub async fn stop(self) -> Result<MmdvmShutdown<Radio<T>>, Error> {
         self.restore
             .shutdown_and_rebuild_binary(self.modem.into_modem())
             .await
@@ -152,6 +174,18 @@ impl<T: Transport + Unpin + 'static> DstarGateway<T, PersistentMmdvm> {
 }
 
 impl<T: Transport + Unpin + 'static, Lifecycle> DstarGateway<T, Lifecycle> {
+    /// Check the Kenwood wire profile before changing any radio mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigurationError::UnsupportedProfile`] for the currently
+    /// unverified [`ConfigurationProfile::KenwoodTerminal`] layout.
+    pub const fn wire_configuration() -> Result<DstarConfiguration, ConfigurationError> {
+        Err(ConfigurationError::UnsupportedProfile {
+            profile: ConfigurationProfile::KenwoodTerminal,
+        })
+    }
+
     /// Inspect shared modem configuration and receive state.
     ///
     /// The runtime stays paired with the CAT state this gateway restores, so
@@ -293,9 +327,10 @@ impl<T: Transport + Unpin + 'static, Lifecycle> DstarGateway<T, Lifecycle> {
     async fn build_from_session(
         session: MmdvmSession<T, Lifecycle>,
         config: DstarModemConfig,
+        wire_config: DstarConfiguration,
     ) -> Result<Self, (MmdvmRadioRestore<T>, AsyncModem<StreamAdapter<T>>, Error)> {
         let (modem, restore) = session.into_parts();
-        match DstarModem::initialize(modem, config).await {
+        match DstarModem::initialize(modem, config, wire_config).await {
             Ok(modem) => Ok(Self {
                 modem,
                 restore,
@@ -306,22 +341,13 @@ impl<T: Transport + Unpin + 'static, Lifecycle> DstarGateway<T, Lifecycle> {
     }
 }
 
-/// Preserve both failures when transient initialization and rollback fail.
-fn double_fault_error(init: &Error, exit: &Error) -> Error {
-    Error::Transport(TransportError::Disconnected(std::io::Error::other(
-        format!(
-            "radio unrecoverable: D-STAR init failed ({init}) and MMDVM exit failed ({exit}); reconnect from scratch"
-        ),
-    )))
-}
-
-/// Preserve both failures without carrying binary proof across a new connection.
-fn binary_reclaim_fault_error(init: &Error, reclaim: &Error) -> Error {
-    Error::Transport(TransportError::Disconnected(std::io::Error::other(
-        format!(
-            "radio unrecoverable: D-STAR init failed ({init}) and the persistent MMDVM link could not be reclaimed ({reclaim}); reconnect and diagnose from scratch"
-        ),
-    )))
+/// Retain the independent initialization and cleanup causes.
+fn startup_cleanup_error(initialization: Error, cleanup: Error) -> Error {
+    Error::DstarStartup {
+        initialization: Box::new(initialization),
+        cleanup: Some(Box::new(cleanup)),
+        shutdown: None,
+    }
 }
 
 #[cfg(test)]
@@ -329,17 +355,9 @@ mod tests {
     use super::*;
     use crate::radio::{BinaryProtocolProof, CatState};
     use kenwood_transport::MockTransport;
-    use mmdvm_core::MMDVM_SET_CONFIG;
     use std::time::Duration;
 
     type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
-
-    fn prepared_mock() -> MockTransport {
-        let mut mock = MockTransport::new();
-        mock.expect_any_write();
-        mock.pend_when_empty();
-        mock
-    }
 
     fn binary_radio(mock: MockTransport) -> Radio<MockTransport> {
         let mut radio = Radio::new(mock);
@@ -347,20 +365,24 @@ mod tests {
         radio
     }
 
-    fn initialization_replies(mock: &mut MockTransport) {
-        mock.queue_read_delayed(&[0xE0, 4, 0x70, 0x02], 20);
-        mock.queue_read_delayed(&[0xE0, 4, 0x70, 0x03], 150);
-    }
-
     #[tokio::test]
-    async fn persistent_start_conversion_failure_returns_the_intact_radio() -> TestResult {
+    async fn persistent_start_rejects_the_unverified_profile_before_conversion_or_io() -> TestResult
+    {
         let radio = Radio::new(MockTransport::new());
         let Err((Some(radio), error)) =
             DstarGateway::start_gateway_mode(radio, DstarModemConfig::new("N0CALL")?).await
         else {
             return Err("unproved CAT radio was not returned after conversion refusal".into());
         };
-        assert!(matches!(error, Error::BinaryModeNotProven));
+        assert!(
+            matches!(
+                error,
+                Error::MmdvmConfiguration(ConfigurationError::UnsupportedProfile {
+                    profile: ConfigurationProfile::KenwoodTerminal
+                })
+            ),
+            "{error:?}"
+        );
         assert_eq!(radio.cat_state, CatState::Ready);
         assert!(radio.transport.writes().is_empty());
         radio.transport.assert_complete();
@@ -368,75 +390,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persistent_init_nak_returns_a_retryable_binary_radio() -> TestResult {
-        let mut mock = prepared_mock();
-        mock.queue_read_delayed(&[0xE0, 5, 0x7F, MMDVM_SET_CONFIG, 4], 20);
-        let Err((Some(radio), error)) =
-            DstarGateway::start_gateway_mode(binary_radio(mock), DstarModemConfig::new("N0CALL")?)
-                .await
+    async fn persistent_profile_refusal_retains_the_original_binary_proof() -> TestResult {
+        let Err((Some(radio), error)) = DstarGateway::start_gateway_mode(
+            binary_radio(MockTransport::new()),
+            DstarModemConfig::new("N0CALL")?,
+        )
+        .await
         else {
-            return Err("persistent init NAK did not return its binary radio".into());
+            return Err("profile refusal did not return its binary radio".into());
         };
-        assert!(matches!(error, Error::Dstar(_)));
+        assert!(
+            matches!(
+                error,
+                Error::MmdvmConfiguration(ConfigurationError::UnsupportedProfile {
+                    profile: ConfigurationProfile::KenwoodTerminal
+                })
+            ),
+            "{error:?}"
+        );
         assert_eq!(
             radio.cat_state,
             CatState::BinaryProven(BinaryProtocolProof::Mmdvm { data_band: None })
         );
-        let session = radio.into_mmdvm_session().map_err(|(_, error)| error)?;
-        let radio = session.shutdown().await?;
-        assert!(
-            radio
-                .transport
-                .writes()
-                .iter()
-                .all(|write| write.first() == Some(&0xE0))
-        );
+        assert!(radio.transport.writes().is_empty());
         radio.transport.assert_complete();
         Ok(())
     }
 
     #[tokio::test]
-    async fn stop_uses_the_entry_lifecycles_distinct_exit_paths() -> TestResult {
-        let mut mock = prepared_mock();
-        mock.queue_read(b"TN 3,1\r");
-        initialization_replies(&mut mock);
-        let transient = DstarGateway::start(
-            Radio::new(mock),
+    async fn transient_profile_refusal_sends_no_tnc_mode_command() -> TestResult {
+        let Err((Some(radio), error)) = DstarGateway::start(
+            Radio::new(MockTransport::new()),
             TncDataBand::B,
             DstarModemConfig::new("N0CALL")?,
         )
         .await
-        .map_err(|(_, error)| error)?;
-        let transient = transient.stop().await?.into_radio_unproven();
-        assert_eq!(transient.cat_state, CatState::RecoveryRequired);
+        else {
+            return Err("unsupported transient profile did not preserve the radio".into());
+        };
         assert!(
-            transient
-                .transport
-                .writes()
-                .iter()
-                .any(|write| write == b"TN 0,1\r"),
-            "transient MMDVM must exit using its entry band"
+            matches!(
+                error,
+                Error::MmdvmConfiguration(ConfigurationError::UnsupportedProfile {
+                    profile: ConfigurationProfile::KenwoodTerminal
+                })
+            ),
+            "{error:?}"
         );
-        let mut mock = prepared_mock();
-        initialization_replies(&mut mock);
-        let persistent =
-            DstarGateway::start_gateway_mode(binary_radio(mock), DstarModemConfig::new("N0CALL")?)
-                .await
-                .map_err(|(_, error)| error)?;
-        let persistent = persistent.stop().await?;
-        assert_eq!(
-            persistent.cat_state,
-            CatState::BinaryProven(BinaryProtocolProof::Mmdvm { data_band: None })
-        );
-        assert!(
-            persistent
-                .transport
-                .writes()
-                .iter()
-                .all(|write| write.first() == Some(&0xE0)),
-            "persistent MMDVM must never receive a transient ASCII exit"
-        );
-        persistent.transport.assert_complete();
+        assert_eq!(radio.cat_state, CatState::Ready);
+        assert!(radio.transport.writes().is_empty());
+        radio.transport.assert_complete();
         Ok(())
     }
 
@@ -446,21 +449,11 @@ mod tests {
         let exit = Error::CommandRejected {
             mnemonic: "0M".to_owned(),
         };
-        for error in [
-            double_fault_error(&init, &exit),
-            binary_reclaim_fault_error(&init, &exit),
-        ] {
-            let mut messages = Vec::new();
-            let mut source: Option<&dyn std::error::Error> = Some(&error);
-            while let Some(error) = source {
-                messages.push(error.to_string());
-                source = error.source();
-            }
-            let chain = messages.join(" | ");
-            assert!(
-                chain.contains("timed out") && chain.contains("rejected the 0M command"),
-                "both failures must remain visible: {chain}"
-            );
-        }
+        let error = startup_cleanup_error(init, exit);
+        assert!(
+            matches!(error, Error::DstarStartup { initialization, cleanup: Some(cleanup), shutdown: None }
+            if matches!(*initialization, Error::Timeout(_)) && matches!(*cleanup, Error::CommandRejected { ref mnemonic } if mnemonic == "0M")),
+            "both typed causes must remain independently accessible"
+        );
     }
 }

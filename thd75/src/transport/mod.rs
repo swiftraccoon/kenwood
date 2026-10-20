@@ -4,28 +4,8 @@
 //! [`kenwood_transport`]. This module owns the TH-D75's physical-interface
 //! choices and reopening policy, not generic transport mechanics.
 //!
-//! The TH-D75 communicates over USB CDC ACM (Communications Device Class
-//! Abstract Control Model) which presents as a standard serial port, and
-//! Bluetooth SPP (Serial Port Profile) via RFCOMM.
-//!
-//! # Bluetooth (per Operating Tips §5.12)
-//!
-//! - Bluetooth version 3.0, Class 2 (range ~10m)
-//! - Profiles: HSP (Headset Profile) + SPP (Serial Port Profile)
-//! - No BLE (Bluetooth Low Energy) and no HFP (Hands-Free Profile)
-//! - BT headset provides mic + earphone for voice; PTT remains on the
-//!   radio body (no BT PTT except via VOX)
-//! - Menu No. 112: BT microphone sensitivity adjustment
-//! - When a BT headset is connected, audio is NOT routed to the USB
-//!   port or external speaker jack
-//! - Menu No. 933: view/manage connected BT devices
-//!
-//! # USB (per Operating Tips §5.13)
-//!
-//! - CDC virtual COM port
-//! - USB audio output: 48 kHz / 16-bit / mono, output only (same as speaker
-//!   output). Adjustable via Menu No. 91A.
-//! - USB Mass Storage: Menu No. 980 (Windows only for mass storage feature)
+//! [Kenwood's TH-D75A/E Operating Tips, §§5.12-5.13][operating-tips],
+//! describes serial access through USB CDC and Bluetooth SPP over RFCOMM.
 //!
 //! Implementations:
 //! - [`SerialTransport`]: USB serial connections, plus serial RFCOMM on
@@ -37,15 +17,15 @@
 //! Bluetooth serial driver drops data for this radio; `BluetoothTransport`
 //! bypasses that device node and talks directly to RFCOMM in an isolated
 //! helper process.
-
-#[cfg(target_os = "macos")]
-pub mod bluetooth;
-pub mod broker;
-pub mod either;
-pub mod serial;
+//!
+//! [operating-tips]: https://www.kenwood.com/i/products/info/amateur/pdf/TH-D75AE_IDM.pdf
 
 #[cfg(target_os = "macos")]
 pub use bluetooth::BluetoothTransport;
-pub use broker::{BrokerHandle, MainThreadBroker};
 pub use either::EitherTransport;
 pub use serial::SerialTransport;
+
+#[cfg(target_os = "macos")]
+pub mod bluetooth;
+pub mod either;
+pub mod serial;

@@ -311,7 +311,7 @@ async fn set_gps_settings() -> TestResult {
     mock.expect(b"GP 1,0\r", b"GP 1,0\r");
     let mut radio = Radio::new(mock);
     radio
-        .set_gps_settings(GpsSettings::new(true, false))
+        .set_gps_settings(GpsSettings::new().with_enabled(true))
         .await?;
     Ok(())
 }
@@ -321,7 +321,9 @@ async fn set_gps_settings_both_on() -> TestResult {
     let mut mock = MockTransport::new();
     mock.expect(b"GP 1,1\r", b"GP 1,1\r");
     let mut radio = Radio::new(mock);
-    radio.set_gps_settings(GpsSettings::new(true, true)).await?;
+    radio
+        .set_gps_settings(GpsSettings::new().with_enabled(true).with_pc_output(true))
+        .await?;
     Ok(())
 }
 
@@ -470,7 +472,7 @@ fn serialize_set_gps_settings() {
     use kenwood_thd75::protocol::{Command, serialize};
     assert_eq!(
         serialize(&Command::SetGpsSettings {
-            settings: GpsSettings::new(true, false)
+            settings: GpsSettings::new().with_enabled(true)
         }),
         b"GP 1,0\r"
     );

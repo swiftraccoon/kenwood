@@ -104,11 +104,14 @@ impl<T: Transport> Radio<T> {
     ///
     /// Call this before reporting that an APRS, KISS, MMDVM, or D-STAR session
     /// has returned to CAT mode. A successful result proves the exact TH-D75
-    /// CAT identity; a failure retains both recovery errors in
+    /// CAT model identity and matches any previously observed AE serial/model
+    /// identity. A failure retains both recovery errors in
     /// [`Error::CatRestorationFailed`].
     ///
     /// # Errors
     ///
+    /// Returns [`Error::RadioIdentityMismatch`] or an identity-exchange error
+    /// when a retained AE identity cannot be verified after the model proof.
     /// Returns [`Error::CatRestorationFailed`] when both the in-place recovery
     /// and the one bounded reopened recovery attempt fail. Caller-selected
     /// auto-information and GPS streaming state is not replayed here; this
@@ -129,6 +132,7 @@ impl<T: Transport> Radio<T> {
         let in_place_result = self.prove_cat_or_recover_packet_mode().await;
         let in_place = match in_place_result {
             Ok(()) => {
+                self.prove_retained_serial_information().await?;
                 self.finish_cat_recovery();
                 return Ok(());
             }
@@ -141,16 +145,15 @@ impl<T: Transport> Radio<T> {
         );
 
         let reconnect_result = async {
-            if let Err(error) = self.close_transport().await {
-                tracing::debug!(%error, "close before mode-exit recovery reopen failed");
-            }
+            self.close_transport().await?;
             self.transport.reopen().await.map_err(Error::Transport)?;
             self.codec.clear();
             self.last_cmd_time = None;
             self.firmware_version = None;
             self.tuning_mode_a = None;
             self.tuning_mode_b = None;
-            self.prove_cat_or_recover_packet_mode().await
+            self.prove_cat_or_recover_packet_mode().await?;
+            self.prove_retained_serial_information().await
         }
         .await;
 
@@ -322,7 +325,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn delayed_binary_residue_cannot_satisfy_the_identity_proof() -> TestResult {
         let mut transport = MockTransport::new();
-        transport.queue_read_delayed(b"binary\rID TH-D75\r", 600);
+        transport.queue_read_delayed(
+            b"binary\rID TH-D75\r",
+            std::time::Duration::from_millis(600),
+        );
         transport.expect_hang(b"ID\r");
         expect_recovery_preamble(&mut transport);
         transport.expect(b"ID\r", b"ID OTHER\r");

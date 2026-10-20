@@ -39,7 +39,13 @@ behavior has been checked against the radio or an exact, lossless file format.
 - **Transport layer**: USB (CDC ACM) and Bluetooth SPP with auto-detection. On
   macOS, potentially unbounded native `IOBluetooth` calls are isolated in a
   killable helper process; Linux and Windows use serial RFCOMM ports.
-- **Session resilience**: `Radio::reconnect()` re-establishes a dropped USB or Bluetooth link on the same transport identity (surviving USB re-enumeration and MCP programming-mode exits), and `RadioLinkRecovery` explicitly retries with capped exponential backoff while broadcasting typed link events. MCP writes verify by read-back before reporting success.
+- **Session resilience**: `Radio::get_serial_information()` retains the first
+  AE serial/model response. Recovery compares it before cached AI/GPS settings
+  are replayed, including after MCP exit. A different identity keeps CAT
+  blocked. Without an observed AE identity, reconnect permits only model-ID
+  proof with no cached streaming state to restore. `RadioLinkRecovery` retries
+  with capped exponential backoff and broadcasts typed link events. MCP writes
+  verify by read-back before reporting success.
 - **Async**: Built on tokio. All radio operations are async.
 
 ## Cargo features
@@ -67,8 +73,11 @@ D-STAR framing, configuration, events, and voice processing live in
 Import `DstarModemConfig` and `DstarEvent` there; protocol values such as
 `DstarHeader` and `UrCallAction` come from `dstar-gateway-core`.
 `DstarGateway` owns only the TH-D75 lifecycle around that shared runtime:
-`start(radio, data_band, config)` enters transient TNC mode, while
-`start_gateway_mode(radio, config)` requires existing binary-mode proof.
+its startup configuration uses the Kenwood Terminal profile, whose
+`SET_CONFIG` layout is unverified. Both startup methods return
+`ConfigurationError::UnsupportedProfile` with the original radio before any
+I/O. Generic MMDVM V1/V2 layouts are not selected for Kenwood hardware.
+`MmdvmSession` remains available for raw framed I/O after verified binary entry.
 Use `modem()` to inspect shared runtime state. Mutating operations such as
 `next_event()` and `send_voice()` delegate through the gateway owner, keeping
 the modem paired with its radio's recovery state. Call `stop()` on that owner
@@ -113,6 +122,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let transport = SerialTransport::open(&port.port_name)?;
 
     let mut radio = Radio::new(transport);
+    let identity = radio.get_serial_information().await?;
+    println!("serial {} model {}", identity.serial_number(), identity.model_code());
 
     let version = radio.get_firmware_version().await?;
     println!("firmware {version}");
@@ -123,6 +134,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+## Offline memory and table values
+
+Snapshots validate complete windows before comparison. Table fields reject
+embedded delimiters and transfer owned strings through `TryFrom<String>`:
+
+```rust
+use kenwood_thd75::sdcard::TsvField;
+use kenwood_thd75::types::MemoryReadOffset;
+use kenwood_thd75::verify::{OffsetMapping, RuntimeOffsetMap, StateSnapshot};
+
+let offset = MemoryReadOffset::new(0x1000)?;
+let before = StateSnapshot::from_windows(vec![(offset, vec![1, 2])])?;
+let after = StateSnapshot::from_windows(vec![(offset, vec![1, 3])])?;
+let changes = before.diff(&after)?;
+assert_eq!(changes.len(), 1);
+
+let mut offsets = RuntimeOffsetMap::default();
+offsets.record(OffsetMapping::new("example", vec![offset])?);
+let loaded = RuntimeOffsetMap::from_text(&offsets.to_text())?;
+assert_eq!(loaded.get("example"), Some([offset].as_slice()));
+
+let field = TsvField::try_from(String::from("one field"))?;
+assert_eq!(String::from(field), "one field");
+assert!(TsvField::new("two\tfields").is_err());
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Live IF capture uses `Radio::enter_if_tap`, `IfTapSession::step_to_frequency`
+and explicit `IfTapSession::exit`. A detached `IfTapSavedState` belongs to
+its original radio: borrow it for retuning and consume it for restoration.
+The radio retains the pending restoration after session drop or cancellation.
+Every restoration result lists failed and unattempted steps separately.
+
+Ordinary bulk MCP failures carry `Error::McpWriteProgress`. Inspect
+`mcp_write_progress()` for possibly-written and independently verified pages;
+`Error::McpOperationAndCleanupFailed` retains both failures when cleanup also
+fails. Recovery and readback still require the original connection and
+supported model/firmware identity.
+
+## API stability
+
+The API is experimental. Construction and ownership corrections may break
+workspace callers; migrate them to the checked APIs without compatibility
+adapters. `AprsClient::queue_message` returns its ID before I/O; `next_event`
+owns first transmission and retries. Messages use `DirectMessageAddressee`,
+and generated packets retain the configured software tocall. Object sending
+takes an `ObjectReport`; configuration-file codecs are
+`sdcard::config::RadioConfig::{from_bytes,to_bytes}`. Automation snapshots,
+metadata and transaction outcomes expose immutable accessors; consuming
+projections transfer their owned data.
 
 ## Tests
 
@@ -213,7 +275,8 @@ actually change, and verifies each write by read-back.
 
 Scalar codecs and atomic masked-bit claims come from
 [`kenwood-schema`](https://github.com/swiftraccoon/kenwood/tree/main/kenwood-schema).
-The memory API exposes those same scalar types. TH-D75 retains generated
+The memory API takes and returns those scalar types; import them from
+`kenwood_schema`. TH-D75 retains generated
 descriptor identity, finite menu domains, page geometry, factory-calibration
 protection, and all radio I/O. Stored-value reads preserve off-menu numeric
 values but still reject noncanonical booleans and malformed text. NUL-padded
@@ -310,7 +373,7 @@ sequence is:
 
 ```rust,no_run
 use kenwood_thd75::radio::automation::{
-    GuardedDecimalRoute, GuardedDecimalRouteOutcome,
+    GuardedDecimalRoute, GuardedKeyResult,
 };
 
 # async fn guarded_route_example<T: kenwood_transport::Transport>(
@@ -324,7 +387,7 @@ let outcome = session
     .guarded_decimal_route(&menu, GuardedDecimalRoute::new([9, 2, 0])?)
     .await?;
 
-if !matches!(outcome, GuardedDecimalRouteOutcome::Dispatched(_)) {
+if outcome.result() != GuardedKeyResult::Dispatched {
     return Err("guarded menu route was not fully dispatched".into());
 }
 # Ok(())
@@ -463,11 +526,14 @@ precedence. A name shared by multiple paired devices is rejected so callers can
 select the intended radio by its exact address.
 
 The parent communicates through nonblocking raw pipes. A failed, timed-out, or
-cancelled write destroys the helper because the transmitted prefix is
-ambiguous; close, reconnect, and drop do the same. A command-response read
+cancelled write retires the helper because the transmitted prefix is
+ambiguous; close, reconnect, and drop also retire that connection. A command-response read
 timeout instead leaves the byte stream available for the radio layer's
-stale-response drain, while helper EOF or a read error destroys it. Cleanup is
-bounded and cannot wedge the application. A dedicated liveness-pipe watchdog
+stale-response drain, while helper EOF or a read error retires it. Drop and
+cancelled-write retirement transfer helper, pipes and connection lease to a
+detached worker without waiting. Explicit close waits up to 600 ms for exit
+plus 100 ms for reap checking; its typed error retains independent failures.
+A dedicated liveness-pipe watchdog
 also exits an orphaned helper if its parent disappears. Native startup uses one
 20-second SDP/baseband/RFCOMM deadline beneath the parent's 22-second bound, and
 buffers radio ingress until the readiness prefix is complete. One helper owns

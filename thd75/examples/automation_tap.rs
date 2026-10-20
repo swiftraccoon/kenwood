@@ -110,9 +110,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     radio.disconnect().await?;
 
     fs::create_dir_all(&output_dir)?;
-    fs::write(output_dir.join("before.bmp"), before.frame.to_stock_bmp())?;
-    fs::write(output_dir.join("after.bmp"), after.frame.to_stock_bmp())?;
-    let changed_pixels = differing_pixels(&before.frame, &after.frame);
+    fs::write(output_dir.join("before.bmp"), before.frame().to_stock_bmp())?;
+    fs::write(output_dir.join("after.bmp"), after.frame().to_stock_bmp())?;
+    let changed_pixels = differing_pixels(before.frame(), after.frame());
     if changed_pixels == 0 {
         return Err(io::Error::other(format!(
             "key 0x{raw_key:02X} produced no framebuffer change"
@@ -121,21 +121,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!(
         "key=0x{raw_key:02X},host_sequence:{:02X},command_count:{},result:{},elapsed_ms:{:.3}",
-        key_metadata.last_host_sequence,
-        key_metadata.command_count,
-        key_metadata.last_key_result,
+        key_metadata.last_host_sequence(),
+        key_metadata.command_count(),
+        key_metadata.last_key_result(),
         key_elapsed.as_secs_f64() * 1_000.0
     );
     println!(
         "before=generation:{},crc32:{:08X}",
-        before.metadata.generation, before.metadata.crc32
+        before.metadata().generation(),
+        before.metadata().crc32()
     );
     println!(
         "after=generation:{},crc32:{:08X},changed_pixels:{changed_pixels}",
-        after.metadata.generation, after.metadata.crc32
+        after.metadata().generation(),
+        after.metadata().crc32()
     );
 
-    let observations = after.frame.recognize_text()?;
+    let observations = after.frame().recognize_text()?;
     for observation in &observations {
         println!(
             "text={:?},confidence:{:.4}",

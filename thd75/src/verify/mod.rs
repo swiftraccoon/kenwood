@@ -14,6 +14,8 @@
 //! fully testable without a radio.
 
 use std::collections::BTreeMap;
+use std::collections::btree_map;
+use std::iter::FusedIterator;
 
 use crate::error::ValidationError;
 use crate::types::MemoryReadOffset;
@@ -32,6 +34,17 @@ pub struct ByteChange {
 /// Errors produced while comparing snapshots or parsing persisted data.
 #[derive(Debug, thiserror::Error)]
 pub enum VerifyError {
+    /// A captured window extends beyond the six-digit offset domain.
+    #[error("snapshot window at {offset} with {length} bytes exceeds the readable offset domain")]
+    WindowOutOfRange {
+        /// First byte's offset.
+        offset: MemoryReadOffset,
+        /// Number of captured bytes.
+        length: usize,
+    },
+    /// A mapping cannot retain its meaning in the persisted text grammar.
+    #[error(transparent)]
+    InvalidMapping(#[from] OffsetMappingError),
     /// The two snapshots do not cover the same windows, so a byte-for-byte
     /// comparison would be meaningless.
     #[error("snapshot window layouts differ: {detail}")]
@@ -62,9 +75,28 @@ pub struct StateSnapshot {
 
 impl StateSnapshot {
     /// Builds a snapshot from windows a caller already read.
-    #[must_use]
-    pub const fn from_windows(windows: Vec<(MemoryReadOffset, Vec<u8>)>) -> Self {
-        Self { windows }
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VerifyError::WindowOutOfRange`] when any complete window
+    /// extends beyond [`MemoryReadOffset::MAX`], including unchanged bytes.
+    pub fn from_windows(windows: Vec<(MemoryReadOffset, Vec<u8>)>) -> Result<Self, VerifyError> {
+        for (offset, bytes) in &windows {
+            if bytes.len()
+                > usize::try_from(MemoryReadOffset::MAX - offset.as_raw() + 1).map_err(|_| {
+                    VerifyError::WindowOutOfRange {
+                        offset: *offset,
+                        length: bytes.len(),
+                    }
+                })?
+            {
+                return Err(VerifyError::WindowOutOfRange {
+                    offset: *offset,
+                    length: bytes.len(),
+                });
+            }
+        }
+        Ok(Self { windows })
     }
 
     /// Returns the captured windows.
@@ -133,6 +165,95 @@ impl StateSnapshot {
     }
 }
 
+/// Why a field-to-offset mapping cannot be persisted losslessly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum OffsetMappingError {
+    /// The field name is empty.
+    #[error("offset-map field name must not be empty")]
+    EmptyField,
+    /// A field byte is a text-format delimiter or control byte.
+    #[error("offset-map field contains control byte {byte:#04X} at index {index}")]
+    FieldControlByte {
+        /// Rejected byte.
+        byte: u8,
+        /// Zero-based byte index.
+        index: usize,
+    },
+    /// The field has no observed offsets.
+    #[error("offset-map entry must contain at least one observed offset")]
+    EmptyOffsets,
+}
+
+/// One nonempty field name and its nonempty ordered observed offsets.
+///
+/// Names contain no ASCII controls, so every value round-trips through
+/// [`RuntimeOffsetMap::to_text`] and [`RuntimeOffsetMap::from_text`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OffsetMapping {
+    field: String,
+    offsets: Vec<MemoryReadOffset>,
+}
+
+impl OffsetMapping {
+    /// Retain an owned name and offset vector after validating text geometry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OffsetMappingError`] for an empty name, an ASCII control byte
+    /// in the name or an empty offset vector.
+    pub fn new(
+        field: impl Into<String>,
+        offsets: Vec<MemoryReadOffset>,
+    ) -> Result<Self, OffsetMappingError> {
+        let field = field.into();
+        if field.is_empty() {
+            return Err(OffsetMappingError::EmptyField);
+        }
+        if let Some((index, byte)) = field
+            .bytes()
+            .enumerate()
+            .find(|(_, byte)| byte.is_ascii_control())
+        {
+            return Err(OffsetMappingError::FieldControlByte { byte, index });
+        }
+        if offsets.is_empty() {
+            return Err(OffsetMappingError::EmptyOffsets);
+        }
+        Ok(Self { field, offsets })
+    }
+
+    /// The persisted field name.
+    #[must_use]
+    pub fn field(&self) -> &str {
+        &self.field
+    }
+
+    /// The observed offsets in their recorded order.
+    #[must_use]
+    pub fn offsets(&self) -> &[MemoryReadOffset] {
+        &self.offsets
+    }
+
+    /// Recover the owned name and offsets without cloning their allocations.
+    #[must_use]
+    pub fn into_parts(self) -> (String, Vec<MemoryReadOffset>) {
+        (self.field, self.offsets)
+    }
+}
+
+impl TryFrom<(String, Vec<MemoryReadOffset>)> for OffsetMapping {
+    type Error = OffsetMappingError;
+    fn try_from((field, offsets): (String, Vec<MemoryReadOffset>)) -> Result<Self, Self::Error> {
+        Self::new(field, offsets)
+    }
+}
+
+impl From<OffsetMapping> for (String, Vec<MemoryReadOffset>) {
+    fn from(entry: OffsetMapping) -> Self {
+        entry.into_parts()
+    }
+}
+
 /// Field-to-offset mappings discovered by differential snapshots.
 ///
 /// Persists as one line per field: the field name, a tab, then the offsets as
@@ -147,10 +268,11 @@ pub struct RuntimeOffsetMap {
 impl RuntimeOffsetMap {
     /// Records the offsets a field was observed to occupy, replacing any
     /// previous record for that field.
-    pub fn record(&mut self, field: &str, offsets: &[MemoryReadOffset]) {
+    pub fn record(&mut self, entry: OffsetMapping) {
         // Replacing an existing record is intentional and the displaced value
         // is not needed. Bound explicitly because `unused_results` is denied.
-        let _previous = self.entries.insert(field.to_owned(), offsets.to_vec());
+        let (field, offsets) = entry.into_parts();
+        let _previous = self.entries.insert(field, offsets);
     }
 
     /// Returns the offsets recorded for a field, if any.
@@ -169,6 +291,14 @@ impl RuntimeOffsetMap {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Iterate over fields in lexical order and their borrowed offset slices.
+    #[must_use]
+    pub fn iter(&self) -> OffsetMapIter<'_> {
+        OffsetMapIter {
+            inner: self.entries.iter(),
+        }
     }
 
     /// Serializes the map to its line-oriented text form.
@@ -219,15 +349,103 @@ impl RuntimeOffsetMap {
                 })?;
                 offsets.push(MemoryReadOffset::new(raw)?);
             }
-            map.record(field, &offsets);
+            map.record(OffsetMapping::new(field, offsets)?);
         }
         Ok(map)
     }
 }
 
+impl Extend<OffsetMapping> for RuntimeOffsetMap {
+    fn extend<I: IntoIterator<Item = OffsetMapping>>(&mut self, entries: I) {
+        for entry in entries {
+            self.record(entry);
+        }
+    }
+}
+
+impl FromIterator<OffsetMapping> for RuntimeOffsetMap {
+    fn from_iter<I: IntoIterator<Item = OffsetMapping>>(entries: I) -> Self {
+        let mut map = Self::default();
+        map.extend(entries);
+        map
+    }
+}
+
+/// Borrowed field/offset entries in lexical field-name order.
+#[derive(Debug, Clone)]
+pub struct OffsetMapIter<'a> {
+    inner: btree_map::Iter<'a, String, Vec<MemoryReadOffset>>,
+}
+
+impl<'a> Iterator for OffsetMapIter<'a> {
+    type Item = (&'a str, &'a [MemoryReadOffset]);
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner
+            .next()
+            .map(|(field, offsets)| (field.as_str(), offsets.as_slice()))
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+impl DoubleEndedIterator for OffsetMapIter<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.inner
+            .next_back()
+            .map(|(field, offsets)| (field.as_str(), offsets.as_slice()))
+    }
+}
+impl ExactSizeIterator for OffsetMapIter<'_> {}
+impl FusedIterator for OffsetMapIter<'_> {}
+
+impl<'a> IntoIterator for &'a RuntimeOffsetMap {
+    type Item = (&'a str, &'a [MemoryReadOffset]);
+    type IntoIter = OffsetMapIter<'a>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+/// Owned checked entries in lexical field-name order.
+#[derive(Debug)]
+pub struct OffsetMapIntoIter {
+    inner: btree_map::IntoIter<String, Vec<MemoryReadOffset>>,
+}
+
+impl Iterator for OffsetMapIntoIter {
+    type Item = OffsetMapping;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner
+            .next()
+            .map(|(field, offsets)| OffsetMapping { field, offsets })
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+impl DoubleEndedIterator for OffsetMapIntoIter {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.inner
+            .next_back()
+            .map(|(field, offsets)| OffsetMapping { field, offsets })
+    }
+}
+impl ExactSizeIterator for OffsetMapIntoIter {}
+impl FusedIterator for OffsetMapIntoIter {}
+
+impl IntoIterator for RuntimeOffsetMap {
+    type Item = OffsetMapping;
+    type IntoIter = OffsetMapIntoIter;
+    fn into_iter(self) -> Self::IntoIter {
+        OffsetMapIntoIter {
+            inner: self.entries.into_iter(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{RuntimeOffsetMap, StateSnapshot};
+    use super::{OffsetMapping, OffsetMappingError, RuntimeOffsetMap, StateSnapshot, VerifyError};
     use crate::types::MemoryReadOffset;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -237,7 +455,7 @@ mod tests {
         Ok(StateSnapshot::from_windows(vec![(
             MemoryReadOffset::new(offset)?,
             bytes.to_vec(),
-        )]))
+        )])?)
     }
 
     #[test]
@@ -301,7 +519,7 @@ mod tests {
         let before = StateSnapshot::from_windows(vec![
             (MemoryReadOffset::new(0x10)?, vec![0]),
             (MemoryReadOffset::new(0x20)?, vec![0]),
-        ]);
+        ])?;
         let after = snap(0x10, &[0])?;
         let result = before.diff(&after);
         assert!(
@@ -314,14 +532,14 @@ mod tests {
     #[test]
     fn offset_map_round_trips_through_text() -> TestResult {
         let mut map = RuntimeOffsetMap::default();
-        map.record(
+        map.record(OffsetMapping::new(
             "radio.BacklightControl",
-            &[MemoryReadOffset::new(0x12_3456)?],
-        );
-        map.record(
+            vec![MemoryReadOffset::new(0x12_3456)?],
+        )?);
+        map.record(OffsetMapping::new(
             "radio.UsbFunction",
-            &[MemoryReadOffset::new(0x10)?, MemoryReadOffset::new(0x20)?],
-        );
+            vec![MemoryReadOffset::new(0x10)?, MemoryReadOffset::new(0x20)?],
+        )?);
 
         let text = map.to_text();
         let parsed = RuntimeOffsetMap::from_text(&text)?;
@@ -377,5 +595,57 @@ mod tests {
         assert!(map.is_empty());
         assert_eq!(map.len(), 0);
         assert_eq!(map.to_text(), "");
+    }
+
+    #[test]
+    fn complete_snapshot_windows_are_checked_even_when_bytes_do_not_change() -> TestResult {
+        let offset = MemoryReadOffset::new(MemoryReadOffset::MAX)?;
+        let result = StateSnapshot::from_windows(vec![(offset, vec![0, 0])]);
+        assert!(
+            matches!(result, Err(VerifyError::WindowOutOfRange { length: 2, .. })),
+            "unchanged overrun bytes must not form a snapshot: {result:?}"
+        );
+        let valid = StateSnapshot::from_windows(vec![(offset, vec![0])])?;
+        assert!(valid.diff(&valid)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn offset_mappings_reject_text_delimiters_and_empty_observations() {
+        for field in ["", "a\tb", "a\nb", "a\rb", "a\0b"] {
+            assert!(
+                OffsetMapping::new(field, vec![MemoryReadOffset::ZERO]).is_err(),
+                "invalid persisted name {field:?}"
+            );
+        }
+        assert_eq!(
+            OffsetMapping::new("field", Vec::new()),
+            Err(OffsetMappingError::EmptyOffsets)
+        );
+    }
+
+    #[test]
+    fn map_collection_roundtrip_retains_owned_inputs_and_checked_entries() -> TestResult {
+        let field = "radio.Field".to_owned();
+        let allocation = field.as_ptr();
+        let offsets = vec![MemoryReadOffset::ZERO];
+        let offset_allocation = offsets.as_ptr();
+        let map: RuntimeOffsetMap = std::iter::once(OffsetMapping::new(field, offsets)?).collect();
+        let (field, offsets) = map.iter().next().ok_or("recorded entry")?;
+        assert_eq!(
+            field.as_ptr(),
+            allocation,
+            "owned field must retain its allocation"
+        );
+        assert_eq!(
+            offsets.as_ptr(),
+            offset_allocation,
+            "owned offsets must retain their allocation"
+        );
+        assert_eq!(RuntimeOffsetMap::from_text(&map.to_text())?, map);
+        let rebuilt: RuntimeOffsetMap = map.clone().into_iter().collect();
+        assert_eq!(rebuilt, map);
+        assert_eq!((&map).into_iter().len(), 1);
+        Ok(())
     }
 }

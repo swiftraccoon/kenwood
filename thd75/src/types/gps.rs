@@ -19,17 +19,34 @@ use crate::error::ValidationError;
 ///
 /// Other GPS menu settings have independent storage and wire domains and are
 /// intentionally not part of this value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct GpsSettings {
     enabled: bool,
     pc_output: bool,
 }
 
 impl GpsSettings {
-    /// Creates the exact state represented by the two `GP` CAT fields.
+    /// Creates a state with the built-in GPS and PC output disabled.
     #[must_use]
-    pub const fn new(enabled: bool, pc_output: bool) -> Self {
-        Self { enabled, pc_output }
+    pub const fn new() -> Self {
+        Self {
+            enabled: false,
+            pc_output: false,
+        }
+    }
+
+    /// Select whether the built-in GPS receiver is enabled.
+    #[must_use]
+    pub const fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    /// Select whether GPS data is sent to the selected PC output port.
+    #[must_use]
+    pub const fn with_pc_output(mut self, pc_output: bool) -> Self {
+        self.pc_output = pc_output;
+        self
     }
 
     /// Returns whether the built-in GPS receiver is enabled.
@@ -47,7 +64,7 @@ impl GpsSettings {
     /// Returns the documented TH-D75 factory state for Menu 400 and 405.
     #[must_use]
     pub const fn factory_default() -> Self {
-        Self::new(true, false)
+        Self::new().with_enabled(true)
     }
 }
 
@@ -466,7 +483,7 @@ impl From<TrackDistanceHundredths> for u16 {
 /// that store latitude, longitude, altitude, timestamp, name, and APRS
 /// icon. A position memory entry can be copied to one of these "My
 /// Position" slots (§5.14.5) or to an APRS Object for transmission.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MyPosition {
     name: PositionName,
     latitude: aprs::Latitude,
@@ -686,7 +703,7 @@ mod tests {
 
     #[test]
     fn gps_settings_model_only_the_gp_fields() {
-        let settings = GpsSettings::new(false, true);
+        let settings = GpsSettings::new().with_pc_output(true);
         assert!(!settings.enabled());
         assert!(settings.pc_output());
 

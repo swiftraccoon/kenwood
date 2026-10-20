@@ -54,6 +54,11 @@
 //! or Shift-JIS without a BOM, depending on its selected radio/display mode.
 //! QSO and GPS logs use their separately documented text encodings.
 
+use std::fmt;
+
+pub use audio::AudioRecordingInfo;
+pub use capture::ScreenCapture;
+
 pub mod audio;
 pub mod callsign_list;
 pub mod capture;
@@ -62,17 +67,12 @@ pub mod gps_log;
 pub mod qso_log;
 pub mod repeater_list;
 
-pub use audio::AudioRecordingInfo;
-pub use capture::ScreenCapture;
-
-use std::fmt;
-
 /// Text that can occupy one unquoted TSV field without changing table shape.
 ///
 /// TH-D75 SD-card tables do not define an escaping or quoting convention, so
 /// tabs and line terminators cannot be represented inside a field. NUL is also
 /// rejected because Kenwood tooling treats it as a string terminator.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TsvField(String);
 
 impl TsvField {
@@ -112,7 +112,71 @@ impl TsvField {
 
 impl fmt::Display for TsvField {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+        fmt::Display::fmt(&self.0, formatter)
+    }
+}
+
+impl AsRef<str> for TsvField {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::str::FromStr for TsvField {
+    type Err = TsvFieldError;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<&str> for TsvField {
+    type Error = TsvFieldError;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<String> for TsvField {
+    type Error = TsvFieldError;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::validate(&value)?;
+        Ok(Self(value))
+    }
+}
+
+impl From<TsvField> for String {
+    fn from(value: TsvField) -> Self {
+        value.0
+    }
+}
+
+#[cfg(test)]
+mod tsv_field_tests {
+    use super::{TsvField, TsvFieldError};
+
+    #[test]
+    fn owned_tsv_fields_preserve_allocation_and_reject_shape_delimiters()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let input = String::from("valid field");
+        let allocation = input.as_ptr();
+        let field = TsvField::try_from(input)?;
+        assert_eq!(field.as_ref().as_ptr(), allocation);
+        let output = String::from(field);
+        assert_eq!(output.as_ptr(), allocation);
+        assert_eq!(output, "valid field");
+        assert_eq!(TsvField::default().as_str(), "");
+        for character in ['\t', '\r', '\n', '\0'] {
+            let text = format!("é{character}suffix");
+            assert_eq!(
+                TsvField::try_from(text),
+                Err(TsvFieldError {
+                    offset: 2,
+                    character
+                })
+            );
+        }
+        assert_eq!("one field".parse::<TsvField>()?.as_str(), "one field");
+        Ok(())
     }
 }
 
@@ -161,8 +225,8 @@ pub enum SdCardError {
 
     /// A `.d75` body cannot form a canonical MCP memory image.
     InvalidMemoryImage {
-        /// Human-readable detail from the memory-image validator.
-        detail: String,
+        /// Typed memory-image validation failure.
+        source: crate::memory::MemoryError,
     },
 
     /// The `.d75` file header contains an unrecognised 16-byte model identifier.
@@ -258,8 +322,8 @@ pub enum SdCardError {
     ChannelParse {
         /// The 0-based channel index.
         index: u16,
-        /// Human-readable detail about the parse failure.
-        detail: String,
+        /// Typed channel read or validation failure.
+        source: crate::memory::MemoryError,
     },
 
     /// A WAV file header is invalid or corrupt.
@@ -314,8 +378,8 @@ impl fmt::Display for SdCardError {
                 f,
                 "unexpected {file_type} size: expected exactly {expected} bytes, got {actual}"
             ),
-            Self::InvalidMemoryImage { detail } => {
-                write!(f, "invalid .d75 memory image: {detail}")
+            Self::InvalidMemoryImage { source } => {
+                write!(f, "invalid .d75 memory image: {source}")
             }
             Self::InvalidModelIdentifier { found } => {
                 write!(f, "invalid model identifier in .d75 header: {found:02X?}")
@@ -377,8 +441,8 @@ impl fmt::Display for SdCardError {
             } => {
                 write!(f, "line {line}, column {column}: {detail}")
             }
-            Self::ChannelParse { index, detail } => {
-                write!(f, "channel {index}: {detail}")
+            Self::ChannelParse { index, source } => {
+                write!(f, "channel {index}: {source}")
             }
             Self::InvalidWavHeader { detail } => {
                 write!(f, "invalid WAV header: {detail}")
@@ -444,7 +508,14 @@ fn fmt_unexpected_image(
     )
 }
 
-impl std::error::Error for SdCardError {}
+impl std::error::Error for SdCardError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidMemoryImage { source } | Self::ChannelParse { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
 
 /// Decode a file whose specified representation is ASCII or UTF-8.
 pub(crate) fn decode_utf8<'a>(

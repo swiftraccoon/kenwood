@@ -147,7 +147,8 @@ impl DstarCallsign {
     /// # Errors
     ///
     /// Returns a validation error for non-ASCII content, CAT delimiters, or
-    /// non-NUL data after the first terminator.
+    /// non-NUL data after the first terminator, or trailing spaces that would
+    /// change under canonical NUL-padded serialization.
     pub fn try_from_flash_bytes(bytes: [u8; Self::WIRE_LEN]) -> Result<Self, ValidationError> {
         let content_length = bytes
             .iter()
@@ -170,7 +171,20 @@ impl DstarCallsign {
         let content = bytes
             .get(..content_length)
             .unwrap_or_else(|| unreachable!("terminator index lies within the callsign field"));
-        Self::from_ascii_bytes(content)
+        let callsign = Self::from_ascii_bytes(content)?;
+        if let Some((offset, (&value, _))) = bytes
+            .iter()
+            .zip(callsign.to_flash_bytes())
+            .enumerate()
+            .find(|(_, (actual, canonical))| **actual != *canonical)
+        {
+            return Err(ValidationError::InvalidDstarCallsignPadding {
+                field: "callsign",
+                offset,
+                value,
+            });
+        }
+        Ok(callsign)
     }
 
     fn from_ascii_bytes(bytes: &[u8]) -> Result<Self, ValidationError> {
@@ -961,6 +975,40 @@ impl CallsignListName {
     }
 }
 
+impl AsRef<str> for CallsignListName {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::str::FromStr for CallsignListName {
+    type Err = CallsignListTextError;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<&str> for CallsignListName {
+    type Error = CallsignListTextError;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<String> for CallsignListName {
+    type Error = CallsignListTextError;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        validate_callsign_list_text(&value, Self::MAX_ENCODED_LEN)?;
+        Ok(Self(value))
+    }
+}
+
+impl From<CallsignListName> for String {
+    fn from(value: CallsignListName) -> Self {
+        value.0
+    }
+}
+
 /// Validated memo in one D-STAR destination-list entry.
 ///
 /// The underlying radio record reserves 32 Shift-JIS bytes for this field.
@@ -990,22 +1038,56 @@ impl CallsignListMemo {
     }
 }
 
+impl AsRef<str> for CallsignListMemo {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::str::FromStr for CallsignListMemo {
+    type Err = CallsignListTextError;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<&str> for CallsignListMemo {
+    type Error = CallsignListTextError;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<String> for CallsignListMemo {
+    type Error = CallsignListTextError;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        validate_callsign_list_text(&value, Self::MAX_ENCODED_LEN)?;
+        Ok(Self(value))
+    }
+}
+
+impl From<CallsignListMemo> for String {
+    fn from(value: CallsignListMemo) -> Self {
+        value.0
+    }
+}
+
 /// Error returned when constructing a D-STAR destination-list entry.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum CallsignEntryError {
     /// The name cannot be represented losslessly by the radio.
     #[error("invalid callsign-list name: {0}")]
-    InvalidName(CallsignListTextError),
+    InvalidName(#[source] CallsignListTextError),
     /// The value is not a valid D-STAR callsign.
     #[error("invalid destination callsign: {0}")]
-    InvalidCallsign(ValidationError),
+    InvalidCallsign(#[source] ValidationError),
     /// An empty destination cannot occupy a list slot.
     #[error("a direct-call list entry requires a callsign")]
     EmptyCallsign,
     /// The memo cannot be represented losslessly by the radio.
     #[error("invalid callsign-list memo: {0}")]
-    InvalidMemo(CallsignListTextError),
+    InvalidMemo(#[source] CallsignListTextError),
 }
 
 /// One validated row in the radio's 300-entry D-STAR callsign list.
@@ -1078,6 +1160,10 @@ fn validate_callsign_list_text(value: &str, maximum: usize) -> Result<(), Callsi
     if had_errors {
         return Err(CallsignListTextError::UnrepresentableShiftJis);
     }
+    let (decoded, decoding_errors) = SHIFT_JIS.decode_without_bom_handling(&encoded);
+    if decoding_errors || decoded != value {
+        return Err(CallsignListTextError::UnrepresentableShiftJis);
+    }
     if encoded.len() > maximum {
         return Err(CallsignListTextError::TooLong {
             encoded_len: encoded.len(),
@@ -1135,47 +1221,6 @@ pub enum RouteSelect {
     Auto,
     /// Use a specific repeater as the gateway destination.
     Specified,
-}
-
-// ---------------------------------------------------------------------------
-// QSO log entry (D-STAR specific fields)
-// ---------------------------------------------------------------------------
-
-/// D-STAR QSO log entry.
-///
-/// Extends the generic QSO log with D-STAR-specific fields from the
-/// 24-column TSV format stored on the SD card at
-/// `/KENWOOD/TH-D75/QSO_LOG/`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct DstarQsoEntry {
-    /// TX or RX direction.
-    pub direction: QsoDirection,
-    /// Source callsign (MYCALL).
-    pub caller: DstarCallsign,
-    /// Destination callsign (URCALL).
-    pub called: DstarCallsign,
-    /// RPT1 callsign (link source repeater).
-    pub rpt1: DstarCallsign,
-    /// RPT2 callsign (link destination repeater).
-    pub rpt2: DstarCallsign,
-    /// D-STAR slow-data message content.
-    pub message: String,
-    /// Break-in flag.
-    pub break_in: bool,
-    /// EMR (emergency) flag.
-    pub emr: bool,
-    /// Fast data flag.
-    pub fast_data: bool,
-    /// Remote station latitude (from D-STAR GPS data).
-    pub remote_latitude: Option<f64>,
-    /// Remote station longitude (from D-STAR GPS data).
-    pub remote_longitude: Option<f64>,
-    /// Remote station altitude in meters.
-    pub remote_altitude: Option<f64>,
-    /// Remote station course in degrees.
-    pub remote_course: Option<f64>,
-    /// Remote station speed in km/h.
-    pub remote_speed: Option<f64>,
 }
 
 /// Whether a logged QSO was transmitted or received.
@@ -1390,6 +1435,51 @@ mod tests {
         assert!(DstarSuffix::try_from_wire_bytes(*b"C,L ").is_err());
         assert!(DstarCallsign::try_from_flash_bytes(*b"N0\0CALL ").is_err());
         assert!(DstarCallsign::try_from_flash_bytes([0xFF; 8]).is_err());
+    }
+
+    #[test]
+    fn flash_callsigns_reject_padding_that_would_change_the_stored_bytes() -> TestResult {
+        for bytes in [*b"A \0\0\0\0\0\0", *b"ABCDEFG ", [b' '; 8]] {
+            assert!(
+                DstarCallsign::try_from_flash_bytes(bytes).is_err(),
+                "noncanonical flash bytes accepted: {bytes:?}"
+            );
+        }
+        for bytes in [*b"A\0\0\0\0\0\0\0", *b"N0CALL A", [0; 8]] {
+            assert_eq!(
+                DstarCallsign::try_from_flash_bytes(bytes)?.to_flash_bytes(),
+                bytes
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn callsign_list_text_requires_a_lossless_shift_jis_roundtrip() -> TestResult {
+        for text in ["\u{00A5}", "\u{203E}"] {
+            assert!(matches!(
+                CallsignListName::new(text),
+                Err(CallsignListTextError::UnrepresentableShiftJis)
+            ));
+            assert!(matches!(
+                CallsignListMemo::new(text),
+                Err(CallsignListTextError::UnrepresentableShiftJis)
+            ));
+        }
+        for text in ["\\", "~", "\u{6771}\u{4EAC}"] {
+            let name = CallsignListName::new(text)?;
+            assert_eq!(name.as_str(), text);
+        }
+        let text = "Owned name".to_owned();
+        let allocation = text.as_ptr();
+        let name = CallsignListName::try_from(text)?;
+        let text = String::from(name);
+        assert_eq!(
+            text.as_ptr(),
+            allocation,
+            "owned conversion must retain its string allocation"
+        );
+        Ok(())
     }
 
     #[test]

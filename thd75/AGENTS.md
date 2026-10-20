@@ -21,8 +21,7 @@ cargo run -p kenwood-thd75 --example pf_screen_capture    # writes MCP memory
 
 - `types/` and `protocol/` have ZERO async and IO dependencies. Protocol is pure `&[u8] <-> types`, testable without hardware. `transport/` and `radio/` are the async (tokio) layers.
 - The macOS OCR bridge is the reason this crate overrides workspace `unsafe_code = "forbid"`. `recognize_text` and its `#[expect(unsafe_code)]` module are `#[cfg(target_os = "macos")]`, so a change to the OCR path can pass a Linux build without ever being compiled.
-- `transport::broker::{MainThreadBroker, BrokerHandle}` has no caller since IOBluetooth moved into the helper process. Do not wire new code to it.
-- Import shared runtime, probe, and transport types from their own crates; TH-D75 namespaces deliberately do not re-export them.
+- Import shared runtime, probe, transport and schema scalar types (`FieldCodec`, `FieldValue`, `DecodedFieldValue`, `Endian`, `StringEncoding`) from their own crates; TH-D75 namespaces deliberately do not re-export them.
 - `DstarGateway::start` keeps transient entry and exit policy; `start_gateway_mode` requires a connection on which a complete MMDVM exchange already succeeded. Consumers get read-only `modem()` plus thin mutating delegates. Never expose a mutable owned runtime: replacing it detaches its stream from the radio's saved restoration state. Probe success shows MMDVM framing on that connection only: not CAT readiness, radio identity, or the Gateway setting.
 - The TH-D75 Bluetooth wrapper owns model policy: default device name `TH-D75`, fixed RFCOMM channel 2, one selected-open retry, a single-attempt probe with no retry, and explicit reopen policy.
 
@@ -98,15 +97,15 @@ The radio uses DIFFERENT encodings for the same field depending on context:
 2. `ME` has 23 fields, not FO's 21: the extra ME-specific fields are at indices 14 and 22.
 3. FO in VFO mode returns values outside normal ranges (shift=8); parsers must tolerate extended values.
 4. Wire fields [7]-[12] map to byte[10] bits: tone(7), ctcss(8), dcs(9), cross(10), reverse(11), shift(12); field [12] combines split and direction (0 simplex, 1 +, 2 -, 4 split).
-5. `ToneCode` range is 0-49 (50 CTCSS tones), not 35.
+5. `ToneCode` admits indices 0-49 for the CTCSS table and 50 for the 1,750 Hz burst. Preserve that distinction when displaying tones.
 6. `SerialTransport::open`/`open_with_baud` check `Handle::try_current` and return a typed `TransportError::Open`; the underlying serial open would still panic without a reactor, so callers on plain threads keep the `rt.enter()` guard.
 7. Charge-only USB-C cables charge the radio but never enumerate, so discovery silently falls back to Bluetooth. "Connected via bluetooth" with a USB cable attached is the tell.
 8. USB charging desenses 2 m packet RX; never validate RX while charging.
 
 ## KISS TNC and APRS glue
 
-- Generic framing lives in `kiss-tnc` (spec-correct per Chepponis/Karn 1987). `KissSession::exit` writes the bare `C0 FF C0` CMD_RETURN frame and returns `DesyncedRadio`, whose `restore` drains the binary residue and re-proves the CAT exchange boundary.
-- The reported CMD_RETURN nibble-splitting firmware bug has no handling anywhere in this crate. Re-verify on hardware KISS before writing code that assumes either behavior.
+- Generic framing lives in `kiss-tnc`, which rejects malformed escape sequences for the whole frame. `KissSession::exit` writes the bare `C0 FF C0` CMD_RETURN frame and returns `DesyncedRadio`, whose `restore` drains the binary residue and re-proves the CAT exchange boundary.
+- No radio-specific return-command rewrite is applied. Verify hardware behavior before adding one.
 - `AprsClient::next_event` reads `Instant::now()` once per iteration and threads it into every call of the sans-io `aprs` crate, which must never read the clock itself.
 - `StoredSmartBeaconingSettings` is the radio-memory binary format; its `TryFrom` bridges to the runtime `aprs::SmartBeaconingConfig` (km/h units).
 - Never put real GPS coordinates in committed code or fixtures; use synthetic data.
@@ -114,4 +113,5 @@ The radio uses DIFFERENT encodings for the same field depending on context:
 ## Testing
 
 - `MockTransport::expect(cmd_bytes, response_bytes)` backs the unit tests. Expectations are strict FIFO, so wire-order tests are real assertions and `assert_complete()` / `assert_reopen_script_complete()` prove nothing extra was sent or skipped.
+- Read `get_serial_information()` before enabling cached AI/GPS state when a workflow reconnects. The first AE serial/model tuple is immutable; recovery compares AE before clearing poison or replaying cached state. Without that tuple, cached replay returns `RecoveryIdentityRequired`. Mismatched identity returns `RadioIdentityMismatch` and keeps CAT blocked.
 - Live Bluetooth work stays in standalone examples rather than `#[test]` so it is an explicit hardware operation. Only one process may own the RFCOMM channel; close the TUI first.

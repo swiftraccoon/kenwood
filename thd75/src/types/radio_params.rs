@@ -1383,8 +1383,8 @@ impl MemoryReadTarget {
 /// Valid range is `0x000000..=0xFFFFFF`, the span expressible in the six
 /// hexadecimal digits of the request grammar.
 ///
-/// Memory reads require firmware modified by the `thd75-fw` project. An
-/// unmodified radio does not support them.
+/// Executable reads use the qualified [`crate::radio::memory_read::MemoryReader`], which
+/// validates complete spans against the installed implementation's bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MemoryReadOffset(u32);
 
@@ -1495,6 +1495,43 @@ impl fmt::Display for ReadLen {
     }
 }
 
+impl TryFrom<u32> for MemoryReadOffset {
+    type Error = ValidationError;
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<MemoryReadOffset> for u32 {
+    fn from(value: MemoryReadOffset) -> Self {
+        value.as_raw()
+    }
+}
+
+impl TryFrom<u16> for ReadLen {
+    type Error = ValidationError;
+    fn try_from(bytes: u16) -> Result<Self, Self::Error> {
+        Self::new(bytes)
+    }
+}
+
+impl From<ReadLen> for u16 {
+    fn from(value: ReadLen) -> Self {
+        value.as_bytes()
+    }
+}
+
+integer_radix_formats!(SquelchLevel, as_raw);
+integer_radix_formats!(AfGainLevel, as_raw);
+integer_radix_formats!(SMeterReading, as_raw);
+integer_radix_formats!(VoxGain, as_raw);
+integer_radix_formats!(VoxDelay, as_raw);
+integer_radix_formats!(MyPositionSelection, as_raw);
+integer_radix_formats!(DstarSlot, as_raw);
+integer_radix_formats!(FilterWidthIndex, as_raw);
+integer_radix_formats!(MemoryReadOffset, as_raw);
+integer_radix_formats!(ReadLen, as_bytes);
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1527,6 +1564,29 @@ mod memread_param_tests {
     fn offset_displays_as_six_hex_digits() -> TestResult {
         assert_eq!(format!("{}", MemoryReadOffset::new(0x17_D1BC)?), "17D1BC");
         assert_eq!(format!("{}", MemoryReadOffset::ZERO), "000000");
+        Ok(())
+    }
+
+    #[test]
+    fn numeric_memory_read_traits_preserve_logical_counts_and_format_flags() -> TestResult {
+        let offset = MemoryReadOffset::try_from(0x00FF_FFFF)?;
+        assert_eq!(u32::from(offset), 0x00FF_FFFF);
+        assert_eq!(
+            format!("{offset:#010X}"),
+            format!("{:#010X}", 0x00FF_FFFF_u32)
+        );
+        assert_eq!(
+            format!("{offset:#030b}"),
+            format!("{:#030b}", 0x00FF_FFFF_u32)
+        );
+        let length = ReadLen::try_from(256)?;
+        assert_eq!(u16::from(length), 256);
+        assert_eq!(format!("{length:#08x}"), format!("{:#08x}", 256_u16));
+        assert_eq!(format!("{length:#08o}"), format!("{:#08o}", 256_u16));
+        assert_eq!(length.as_wire(), 0);
+        assert!(MemoryReadOffset::try_from(0x0100_0000).is_err());
+        assert!(ReadLen::try_from(0).is_err());
+        assert!(ReadLen::try_from(257).is_err());
         Ok(())
     }
 

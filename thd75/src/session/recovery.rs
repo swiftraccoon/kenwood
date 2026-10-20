@@ -201,7 +201,12 @@ impl<T: Transport> RadioLinkRecovery<T> {
                 attempt,
                 next_delay,
             });
-            tokio::time::sleep(next_delay).await;
+            let deadline = tokio::time::Instant::now().checked_add(next_delay).ok_or(
+                crate::error::ValidationError::UnrepresentableDuration {
+                    duration: next_delay,
+                },
+            )?;
+            tokio::time::sleep_until(deadline).await;
             match self.radio.reconnect().await {
                 Ok(()) => {
                     self.policy.reset();

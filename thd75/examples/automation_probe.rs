@@ -96,7 +96,10 @@ mod macos {
             let abi = session.abi();
             println!(
                 "abi=version:{},features:0x{:02X},max_key:0x{:02X},max_phase:{}",
-                abi.version, abi.features, abi.max_key, abi.max_phase
+                abi.version(),
+                abi.features(),
+                abi.max_key(),
+                abi.max_phase()
             );
 
             let baseline_started = Instant::now();
@@ -373,7 +376,7 @@ mod macos {
             captures.qualification_elapsed.as_secs_f64() * 1_000.0
         );
 
-        let baseline_observations = recognize("baseline", &captures.baseline.frame)?;
+        let baseline_observations = recognize("baseline", captures.baseline.frame())?;
         if let Some(expected) = config.expected_baseline_text.as_deref() {
             require_text("baseline", &baseline_observations, expected)?;
         }
@@ -391,8 +394,8 @@ mod macos {
                 print_key_metadata("menu_key", menu_key);
                 print_key_metadata("restore_key", restore_key);
                 println!("restore_menu_taps={}", config.restore_menu_taps);
-                let changed_pixels = differing_pixels(&captures.baseline.frame, &menu.frame);
-                let restore_delta = differing_pixels(&captures.baseline.frame, &restored.frame);
+                let changed_pixels = differing_pixels(captures.baseline.frame(), menu.frame());
+                let restore_delta = differing_pixels(captures.baseline.frame(), restored.frame());
                 if changed_pixels == 0 {
                     return Err(
                         io::Error::other("MENU press produced no framebuffer change").into(),
@@ -418,8 +421,8 @@ mod macos {
                 println!("menu_changed_pixels={changed_pixels}");
                 println!("restored_delta_pixels={restore_delta}");
 
-                let menu_observations = recognize("menu", &menu.frame)?;
-                let restored_observations = recognize("restored", &restored.frame)?;
+                let menu_observations = recognize("menu", menu.frame())?;
+                let restored_observations = recognize("restored", restored.frame())?;
                 if let Some(expected) = config.expected_menu_text.as_deref() {
                     require_text("menu", &menu_observations, expected)?;
                 } else {
@@ -441,7 +444,7 @@ mod macos {
                         print_key_metadata("navigation_key", key_metadata);
                         let label = format!("navigation-{:02X}", key.as_raw());
                         write_snapshot(&config.output_dir, &label, navigated, elapsed)?;
-                        let menu_delta = differing_pixels(&menu.frame, &navigated.frame);
+                        let menu_delta = differing_pixels(menu.frame(), navigated.frame());
                         if menu_delta == 0 {
                             return Err(io::Error::other(format!(
                                 "key 0x{:02X} produced no menu framebuffer change",
@@ -450,7 +453,7 @@ mod macos {
                             .into());
                         }
                         println!("navigation_changed_pixels={menu_delta}");
-                        let observations = recognize("navigation", &navigated.frame)?;
+                        let observations = recognize("navigation", navigated.frame())?;
                         if let Some(expected) = config.expected_navigation_text.as_deref() {
                             require_navigation_text(key, &observations, expected)?;
                         } else {
@@ -483,13 +486,13 @@ mod macos {
         elapsed: std::time::Duration,
     ) -> ProbeResult<()> {
         let path = output_dir.join(format!("{label}.bmp"));
-        fs::write(&path, snapshot.frame.to_stock_bmp())?;
+        fs::write(&path, snapshot.frame().to_stock_bmp())?;
         println!(
             "{label}=generation:{},crc32:{:08X},rle_bytes:{},capture_attempts:{},capture_ms:{:.3},path:{}",
-            snapshot.metadata.generation,
-            snapshot.metadata.crc32,
-            snapshot.metadata.rle_encoded_length,
-            snapshot.metadata.capture_attempts,
+            snapshot.metadata().generation(),
+            snapshot.metadata().crc32(),
+            snapshot.metadata().rle_encoded_length(),
+            snapshot.metadata().capture_attempts(),
             elapsed.as_secs_f64() * 1_000.0,
             path.display()
         );
@@ -499,11 +502,11 @@ mod macos {
     fn print_key_metadata(label: &str, metadata: &AutomationMetadata) {
         println!(
             "{label}=command_count:{},host_sequence:{:02X},key:{:02X},phase:{},result:{}",
-            metadata.command_count,
-            metadata.last_host_sequence,
-            metadata.last_key,
-            metadata.last_phase,
-            metadata.last_key_result
+            metadata.command_count(),
+            metadata.last_host_sequence(),
+            metadata.last_key(),
+            metadata.last_phase(),
+            metadata.last_key_result()
         );
     }
 

@@ -12,6 +12,12 @@ const DEFAULT_RECONNECT_MAX: Duration = Duration::from_secs(30);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ReconnectPolicyError {
+    /// The ceiling cannot form an absolute timer deadline on this platform.
+    #[error("maximum reconnect delay {maximum_delay:?} cannot form an absolute deadline")]
+    UnrepresentableDelay {
+        /// Requested reconnect-delay ceiling.
+        maximum_delay: Duration,
+    },
     /// The first delay is longer than the configured ceiling.
     #[error(
         "initial reconnect delay {initial_delay:?} exceeds maximum reconnect delay {maximum_delay:?}"
@@ -63,8 +69,10 @@ impl ReconnectPolicy {
     /// # Errors
     ///
     /// Returns [`ReconnectPolicyError::InitialDelayExceedsMaximum`] when
-    /// `initial_delay` is longer than `maximum_delay`.
-    pub const fn new(
+    /// `initial_delay` is longer than `maximum_delay`, or
+    /// [`ReconnectPolicyError::UnrepresentableDelay`] when the maximum cannot
+    /// form an absolute timer deadline on this platform.
+    pub fn new(
         initial_delay: Duration,
         maximum_delay: Duration,
     ) -> Result<Self, ReconnectPolicyError> {
@@ -73,6 +81,12 @@ impl ReconnectPolicy {
                 initial_delay,
                 maximum_delay,
             });
+        }
+        if std::time::Instant::now()
+            .checked_add(maximum_delay)
+            .is_none()
+        {
+            return Err(ReconnectPolicyError::UnrepresentableDelay { maximum_delay });
         }
 
         Ok(Self {
@@ -239,20 +253,13 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_policy_duration_overflow_uses_the_ceiling() -> Result<(), ReconnectPolicyError> {
-        let mut policy = ReconnectPolicy::new(Duration::MAX, Duration::MAX)?;
-
+    fn reconnect_policy_rejects_an_unrepresentable_timer() {
         assert_eq!(
-            policy.next_delay(),
-            Duration::MAX,
-            "the first maximum-duration delay must be returned exactly"
+            ReconnectPolicy::new(Duration::MAX, Duration::MAX),
+            Err(ReconnectPolicyError::UnrepresentableDelay {
+                maximum_delay: Duration::MAX
+            })
         );
-        assert_eq!(
-            policy.next_delay(),
-            Duration::MAX,
-            "doubling overflow must leave the next delay at the ceiling"
-        );
-        Ok(())
     }
 
     #[test]

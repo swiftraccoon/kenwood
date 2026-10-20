@@ -50,12 +50,11 @@ use std::fmt::Write as _;
 use std::future::Future;
 use std::io;
 
-use kenwood_schema::CodecError;
+use kenwood_schema::{CodecError, CodecSpec, DecodedFieldValue, FieldCodec, FieldValue, ValueKind};
 use kenwood_thd75::memory::{
-    DecodedFieldValue, FieldCodec, FieldValue, MCP_D75_MENU_FIELDS, MCP_D75_SCHEMA_FIRMWARE,
-    MCP_D75_SCHEMA_FIRMWARE_IDENTITIES, MCP_D75_SCHEMA_MODEL, MCP_D75_SCHEMA_VERSION,
-    MCP_D75_SOURCE_SHA256, MenuField, PatchPlanner, PatchSet, SchemaError,
-    is_supported_mcp_d75_schema_target, menu_field,
+    MCP_D75_MENU_FIELDS, MCP_D75_SCHEMA_FIRMWARE, MCP_D75_SCHEMA_FIRMWARE_IDENTITIES,
+    MCP_D75_SCHEMA_MODEL, MCP_D75_SCHEMA_VERSION, MCP_D75_SOURCE_SHA256, MenuField, PatchPlanner,
+    PatchSet, SchemaError, is_supported_mcp_d75_schema_target, menu_field,
 };
 use kenwood_thd75::protocol::programming;
 #[cfg(target_os = "macos")]
@@ -206,15 +205,15 @@ fn parse_arguments(args: Vec<String>) -> Result<Arguments> {
 }
 
 fn print_field(field: &MenuField) {
-    let domain = match field.descriptor.codec {
-        FieldCodec::Bool | FieldCodec::BitBool { .. } => "boolean".to_owned(),
-        FieldCodec::Byte { min, max } | FieldCodec::BitField { min, max, .. } => {
+    let domain = match field.descriptor.codec.spec() {
+        CodecSpec::Bool | CodecSpec::BitBool { .. } => "boolean".to_owned(),
+        CodecSpec::Byte { min, max } | CodecSpec::BitField { min, max, .. } => {
             format!("unsigned {min}..={max}")
         }
-        FieldCodec::FixedString { len, .. } => format!("text, max {len} bytes"),
-        FieldCodec::Unsigned { min, max, .. } => format!("unsigned {min}..={max}"),
-        FieldCodec::Signed { min, max, .. } => format!("signed {min}..={max}"),
-        FieldCodec::Bytes { len } => format!("exactly {len} bytes"),
+        CodecSpec::FixedString { len, .. } => format!("text, max {len} bytes"),
+        CodecSpec::Unsigned { min, max, .. } => format!("unsigned {min}..={max}"),
+        CodecSpec::Signed { min, max, .. } => format!("signed {min}..={max}"),
+        CodecSpec::Bytes { len } => format!("exactly {len} bytes"),
     };
     print!(
         "{} @ 0x{:05X} ({})",
@@ -246,7 +245,9 @@ fn print_field(field: &MenuField) {
     if let Some(transform) = field.storage_transform {
         print!(
             " [stored = round({} × {} / {})]",
-            transform.input_unit, transform.numerator, transform.denominator
+            transform.input_unit(),
+            transform.numerator(),
+            transform.denominator()
         );
     }
     if field.is_blob {
@@ -293,28 +294,10 @@ fn select_fields(filter: Option<&str>) -> Result<Vec<&'static MenuField>> {
     Ok(selected)
 }
 
-fn field_len(field: &MenuField) -> Result<usize> {
-    let len = match field.descriptor.codec {
-        FieldCodec::Byte { .. }
-        | FieldCodec::Bool
-        | FieldCodec::BitBool { .. }
-        | FieldCodec::BitField { .. } => 1,
-        FieldCodec::FixedString { len, .. } | FieldCodec::Bytes { len } => len,
-        FieldCodec::Unsigned { width, .. } | FieldCodec::Signed { width, .. } => usize::from(width),
-    };
-    if len == 0 {
-        return Err(invalid_input(format!(
-            "field {} has a zero-byte codec",
-            field.descriptor.name
-        )));
-    }
-    Ok(len)
-}
-
 fn required_pages(fields: &[&MenuField]) -> Result<Vec<u16>> {
     let mut pages = BTreeSet::new();
     for field in fields {
-        let len = field_len(field)?;
+        let len = field.descriptor.codec.encoded_len();
         let end = field
             .descriptor
             .offset
@@ -364,7 +347,7 @@ fn assemble_sparse_image(pages: &[(u16, [u8; programming::PAGE_SIZE])]) -> Resul
 }
 
 fn raw_field_bytes<'a>(field: &MenuField, image: &'a [u8]) -> Result<&'a [u8]> {
-    let len = field_len(field)?;
+    let len = field.descriptor.codec.encoded_len();
     let end = field
         .descriptor
         .offset
@@ -438,16 +421,16 @@ const fn observed_scalar_after_validation_error(
     codec: FieldCodec,
     error: &SchemaError,
 ) -> Option<DecodedFieldValue> {
-    match (codec, error) {
+    match (codec.spec(), error) {
         (
-            FieldCodec::Bool,
+            CodecSpec::Bool,
             SchemaError::Codec {
                 source: CodecError::NonCanonicalBoolean { value },
                 ..
             },
         ) => Some(DecodedFieldValue::Bool(*value != 0)),
         (
-            FieldCodec::Byte { .. } | FieldCodec::BitField { .. } | FieldCodec::Unsigned { .. },
+            CodecSpec::Byte { .. } | CodecSpec::BitField { .. } | CodecSpec::Unsigned { .. },
             SchemaError::Codec {
                 source: CodecError::UnsignedOutOfRange { value, .. },
                 ..
@@ -455,7 +438,7 @@ const fn observed_scalar_after_validation_error(
             | SchemaError::DisallowedValue { value, .. },
         ) => Some(DecodedFieldValue::Unsigned(*value)),
         (
-            FieldCodec::Signed { .. },
+            CodecSpec::Signed { .. },
             SchemaError::Codec {
                 source: CodecError::SignedOutOfRange { value, .. },
                 ..
@@ -495,8 +478,8 @@ fn render_field(field: &MenuField, image: &[u8]) -> String {
         }
     };
 
-    let rendered = match (field.descriptor.codec, decoded) {
-        (FieldCodec::Bool, DecodedFieldValue::Bool(value)) => {
+    let rendered = match (field.descriptor.codec.spec(), decoded) {
+        (CodecSpec::Bool, DecodedFieldValue::Bool(value)) => {
             let raw = raw_bytes.first().copied().unwrap_or_default();
             if raw <= 1 {
                 value.to_string()
@@ -504,28 +487,28 @@ fn render_field(field: &MenuField, image: &[u8]) -> String {
                 format!("{value} [noncanonical raw={raw}]")
             }
         }
-        (FieldCodec::BitBool { .. }, DecodedFieldValue::Bool(value)) => value.to_string(),
+        (CodecSpec::BitBool { .. }, DecodedFieldValue::Bool(value)) => value.to_string(),
         (
-            FieldCodec::Byte { min, max } | FieldCodec::BitField { min, max, .. },
+            CodecSpec::Byte { min, max } | CodecSpec::BitField { min, max, .. },
             DecodedFieldValue::Unsigned(raw),
         ) => render_unsigned(field, raw, u64::from(min), u64::from(max)),
-        (FieldCodec::Unsigned { min, max, .. }, DecodedFieldValue::Unsigned(raw)) => {
+        (CodecSpec::Unsigned { min, max, .. }, DecodedFieldValue::Unsigned(raw)) => {
             render_unsigned(field, raw, min, max)
         }
-        (FieldCodec::Signed { min, max, .. }, DecodedFieldValue::Signed(raw)) => {
+        (CodecSpec::Signed { min, max, .. }, DecodedFieldValue::Signed(raw)) => {
             if (min..=max).contains(&raw) {
                 raw.to_string()
             } else {
                 format!("{raw} [outside accepted write range {min}..={max}]")
             }
         }
-        (FieldCodec::FixedString { .. }, DecodedFieldValue::Text(text)) => format!("{text:?}"),
-        (FieldCodec::Bytes { .. }, DecodedFieldValue::Bytes(bytes)) => {
+        (CodecSpec::FixedString { .. }, DecodedFieldValue::Text(text)) => format!("{text:?}"),
+        (CodecSpec::Bytes { .. }, DecodedFieldValue::Bytes(bytes)) => {
             format!("hex:{}", hex_bytes(&bytes))
         }
-        (codec, value) => format!(
+        (_, value) => format!(
             "<decoder mismatch: codec={} value={value:?}>",
-            codec.value_kind()
+            field.descriptor.codec.value_kind()
         ),
     };
     format!("{name} = {rendered}")
@@ -567,42 +550,42 @@ fn decoded_json(field: &MenuField, image: &[u8]) -> Value {
         }
     };
 
-    let mut decoded = match (field.descriptor.codec, value) {
-        (FieldCodec::Bool, DecodedFieldValue::Bool(value)) => json!({
+    let mut decoded = match (field.descriptor.codec.spec(), value) {
+        (CodecSpec::Bool, DecodedFieldValue::Bool(value)) => json!({
             "canonical_raw": raw_bytes.first().is_some_and(|raw| *raw <= 1),
             "kind": "boolean",
             "value": value,
         }),
-        (FieldCodec::BitBool { .. }, DecodedFieldValue::Bool(value)) => json!({
+        (CodecSpec::BitBool { .. }, DecodedFieldValue::Bool(value)) => json!({
             "kind": "boolean",
             "value": value,
         }),
         (
-            FieldCodec::Byte { min, max } | FieldCodec::BitField { min, max, .. },
+            CodecSpec::Byte { min, max } | CodecSpec::BitField { min, max, .. },
             DecodedFieldValue::Unsigned(raw),
         ) => unsigned_json(field, raw, u64::from(min), u64::from(max)),
-        (FieldCodec::Unsigned { min, max, .. }, DecodedFieldValue::Unsigned(raw)) => {
+        (CodecSpec::Unsigned { min, max, .. }, DecodedFieldValue::Unsigned(raw)) => {
             unsigned_json(field, raw, min, max)
         }
-        (FieldCodec::Signed { min, max, .. }, DecodedFieldValue::Signed(value)) => json!({
+        (CodecSpec::Signed { min, max, .. }, DecodedFieldValue::Signed(value)) => json!({
             "accepted_for_write": (min..=max).contains(&value),
             "kind": "signed",
             "value": value,
         }),
-        (FieldCodec::FixedString { .. }, DecodedFieldValue::Text(value)) => json!({
+        (CodecSpec::FixedString { .. }, DecodedFieldValue::Text(value)) => json!({
             "kind": "text",
             "value": value,
         }),
-        (FieldCodec::Bytes { .. }, DecodedFieldValue::Bytes(value)) => json!({
+        (CodecSpec::Bytes { .. }, DecodedFieldValue::Bytes(value)) => json!({
             "hex": hex_bytes(&value),
             "kind": "bytes",
             "length": value.len(),
         }),
-        (codec, value) => json!({
+        (_, value) => json!({
             "kind": "decode_error",
             "message": format!(
                 "decoder mismatch: codec={} value={value:?}",
-                codec.value_kind()
+                field.descriptor.codec.value_kind()
             ),
         }),
     };
@@ -945,23 +928,23 @@ fn add_assignment(planner: &mut PatchPlanner, assignment: &str) -> Result {
     let field = menu_field(name)
         .ok_or_else(|| invalid_input(format!("unknown MCP-D75 menu field `{name}`")))?;
 
-    match field.descriptor.codec {
-        FieldCodec::Byte { .. } | FieldCodec::BitField { .. } | FieldCodec::Unsigned { .. } => {
+    match field.descriptor.codec.value_kind() {
+        ValueKind::Unsigned => {
             let raw = parse_unsigned(field, value)?;
             field.plan_value(planner, FieldValue::Unsigned(raw))?;
         }
-        FieldCodec::Bool | FieldCodec::BitBool { .. } => {
+        ValueKind::Boolean => {
             let boolean = parse_bool(field, value)?;
             field.plan_value(planner, FieldValue::Bool(boolean))?;
         }
-        FieldCodec::FixedString { .. } => {
+        ValueKind::Text => {
             field.plan_value(planner, FieldValue::Text(value))?;
         }
-        FieldCodec::Signed { .. } => {
+        ValueKind::Signed => {
             let signed = parse_signed(value)?;
             field.plan_value(planner, FieldValue::Signed(signed))?;
         }
-        FieldCodec::Bytes { .. } => {
+        ValueKind::Bytes => {
             let bytes = parse_bytes(value)?;
             field.plan_value(planner, FieldValue::Bytes(&bytes))?;
         }
@@ -1115,15 +1098,13 @@ async fn main() -> Result {
 mod tests {
     use super::{
         DEFAULT_USB_PORT, Endpoint, MCP_D75_SCHEMA_FIRMWARE_IDENTITIES, Operation, Result,
-        add_assignment, apply_patches_with_interrupt, field_len, json_snapshot, parse_arguments,
+        add_assignment, apply_patches_with_interrupt, json_snapshot, parse_arguments,
         read_sparse_with_interrupt, render_field, required_pages, select_fields,
         validate_schema_target,
     };
+    use kenwood_schema::{CodecSpec, FieldCodec, StringEncoding};
     use kenwood_thd75::Radio;
-    use kenwood_thd75::memory::{
-        FieldCodec, FieldDescriptor, MenuField, MenuOption, PatchPlanner, StringEncoding,
-        menu_field,
-    };
+    use kenwood_thd75::memory::{FieldDescriptor, MenuField, MenuOption, PatchPlanner, menu_field};
     use kenwood_thd75::protocol::programming;
     use kenwood_thd75::types::{FirmwareIdentity, RadioModel};
     use kenwood_transport::MockTransport;
@@ -1313,18 +1294,18 @@ mod tests {
         let field = synthetic_field(
             "test.cross_page",
             programming::PAGE_SIZE - 1,
-            FieldCodec::Bytes { len: 2 },
+            FieldCodec::new(CodecSpec::Bytes { len: 2 })?,
             NO_OPTIONS,
             false,
         );
-        assert_eq!(field_len(&field)?, 2);
+        assert_eq!(field.descriptor.codec.encoded_len(), 2);
         assert_eq!(required_pages(&[&field])?, vec![0, 1]);
         Ok(())
     }
 
     #[test]
-    fn renderer_flags_noncanonical_and_unknown_values() {
-        let boolean = synthetic_field("test.bool", 0, FieldCodec::Bool, NO_OPTIONS, false);
+    fn renderer_flags_noncanonical_and_unknown_values() -> Result {
+        let boolean = synthetic_field("test.bool", 0, FieldCodec::BOOL, NO_OPTIONS, false);
         let rendered = render_field(&boolean, &[2]);
         assert!(
             rendered.contains("noncanonical raw=2"),
@@ -1334,7 +1315,7 @@ mod tests {
         let enumeration = synthetic_field(
             "test.enum",
             0,
-            FieldCodec::Byte { min: 0, max: 7 },
+            FieldCodec::new(CodecSpec::Byte { min: 0, max: 7 })?,
             ENUM_OPTIONS,
             false,
         );
@@ -1343,6 +1324,7 @@ mod tests {
             rendered.contains("unknown enum raw value"),
             "unknown enum was hidden: {rendered}"
         );
+        Ok(())
     }
 
     #[test]
@@ -1399,15 +1381,15 @@ mod tests {
     }
 
     #[test]
-    fn renderer_escapes_text_and_bounds_blobs() {
+    fn renderer_escapes_text_and_bounds_blobs() -> Result {
         let text = synthetic_field(
             "test.text",
             0,
-            FieldCodec::FixedString {
+            FieldCodec::new(CodecSpec::FixedString {
                 len: 2,
                 encoding: StringEncoding::Utf8,
                 padding: 0,
-            },
+            })?,
             NO_OPTIONS,
             false,
         );
@@ -1416,11 +1398,11 @@ mod tests {
         let invalid_text = synthetic_field(
             "test.invalid_text",
             0,
-            FieldCodec::FixedString {
+            FieldCodec::new(CodecSpec::FixedString {
                 len: 2,
                 encoding: StringEncoding::MemoryMap,
                 padding: 0,
-            },
+            })?,
             NO_OPTIONS,
             false,
         );
@@ -1433,7 +1415,7 @@ mod tests {
         let blob = synthetic_field(
             "test.blob",
             0,
-            FieldCodec::Bytes { len: 4 },
+            FieldCodec::new(CodecSpec::Bytes { len: 4 })?,
             NO_OPTIONS,
             true,
         );
@@ -1446,6 +1428,7 @@ mod tests {
             !rendered.contains("01020304"),
             "blob contents leaked into output: {rendered}"
         );
+        Ok(())
     }
 
     #[test]
@@ -1453,26 +1436,26 @@ mod tests {
         let enumeration = synthetic_field(
             "test.a_enum",
             0,
-            FieldCodec::Byte { min: 0, max: 7 },
+            FieldCodec::new(CodecSpec::Byte { min: 0, max: 7 })?,
             ENUM_OPTIONS,
             false,
         );
-        let boolean = synthetic_field("test.b_bool", 1, FieldCodec::Bool, NO_OPTIONS, false);
+        let boolean = synthetic_field("test.b_bool", 1, FieldCodec::BOOL, NO_OPTIONS, false);
         let invalid_text = synthetic_field(
             "test.c_text",
             2,
-            FieldCodec::FixedString {
+            FieldCodec::new(CodecSpec::FixedString {
                 len: 2,
                 encoding: StringEncoding::MemoryMap,
                 padding: 0,
-            },
+            })?,
             NO_OPTIONS,
             false,
         );
         let blob = synthetic_field(
             "test.d_blob",
             4,
-            FieldCodec::Bytes { len: 2 },
+            FieldCodec::new(CodecSpec::Bytes { len: 2 })?,
             NO_OPTIONS,
             true,
         );

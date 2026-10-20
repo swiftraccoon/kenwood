@@ -9,10 +9,12 @@
 
 use std::collections::{HashMap, HashSet};
 
-use kenwood_schema::CodecError;
+use kenwood_schema::{
+    CodecError, CodecSpec, Endian, FieldCodec, FieldValue, StringEncoding, ValueKind,
+};
 use kenwood_thd75::memory::{
-    Endian, FieldCodec, FieldValue, MCP_D75_MENU_FIELDS, MCP_D75_SCHEMA_VERSION,
-    MCP_D75_SOURCE_SHA256, MenuField, PatchPlanner, SchemaError, StringEncoding, menu_field,
+    MCP_D75_MENU_FIELDS, MCP_D75_SCHEMA_VERSION, MCP_D75_SOURCE_SHA256, MenuField, PatchPlanner,
+    SchemaError, menu_field,
 };
 use kenwood_thd75::protocol::programming::TOTAL_SIZE;
 use serde_json::Value;
@@ -290,13 +292,13 @@ fn bounds_as_u8(name: &str, bounds: (u64, u64)) -> TestResult<(u8, u8)> {
 fn codec_from_manifest(menu: &Value, name: &str, field: &Value) -> TestResult<FieldCodec> {
     let field_codec = codec(field)?;
     let enum_type = optional_str(field_codec, "enum_type");
-    Ok(match required_str(field_codec, "kind")? {
+    Ok(FieldCodec::new(match required_str(field_codec, "kind")? {
         "byte" => {
             let bounds = resolved_unsigned_bounds(menu, field, enum_type, (0, 255))?;
             let (min, max) = bounds_as_u8(name, bounds)?;
-            FieldCodec::Byte { min, max }
+            CodecSpec::Byte { min, max }
         }
-        "bool" => FieldCodec::Bool,
+        "bool" => CodecSpec::Bool,
         "bit_field" => {
             let bit = required_u8(field_codec, "bit")?;
             let width = required_u8(field_codec, "width")?;
@@ -304,12 +306,12 @@ fn codec_from_manifest(menu: &Value, name: &str, field: &Value) -> TestResult<Fi
             let mask = u8::try_from(low_bits << bit)
                 .map_err(|_| invalid_data(format!("field `{name}` bit range exceeds one byte")))?;
             if optional_str(field_codec, "value_type") == Some("bool") {
-                FieldCodec::BitBool { mask }
+                CodecSpec::BitBool { mask }
             } else {
                 let capacity = u64::from(low_bits);
                 let bounds = resolved_unsigned_bounds(menu, field, enum_type, (0, capacity))?;
                 let (min, max) = bounds_as_u8(name, bounds)?;
-                FieldCodec::BitField {
+                CodecSpec::BitField {
                     mask,
                     shift: bit,
                     min,
@@ -327,7 +329,7 @@ fn codec_from_manifest(menu: &Value, name: &str, field: &Value) -> TestResult<Fi
                     )));
                 }
             };
-            FieldCodec::FixedString {
+            CodecSpec::FixedString {
                 len: required_usize(field_codec, "length")?,
                 encoding,
                 padding: required_u8(field_codec, "padding")?,
@@ -341,7 +343,7 @@ fn codec_from_manifest(menu: &Value, name: &str, field: &Value) -> TestResult<Fi
                 (1_u64 << (8 * u32::from(width))) - 1
             };
             let (min, max) = unsigned_domain_bounds(field)?.unwrap_or((0, default_max));
-            FieldCodec::Unsigned {
+            CodecSpec::Unsigned {
                 width,
                 endian: Endian::Little,
                 min,
@@ -357,14 +359,14 @@ fn codec_from_manifest(menu: &Value, name: &str, field: &Value) -> TestResult<Fi
                 (-half, half - 1)
             };
             let (min, max) = signed_domain_bounds(field)?.unwrap_or(defaults);
-            FieldCodec::Signed {
+            CodecSpec::Signed {
                 width,
                 endian: Endian::Little,
                 min,
                 max,
             }
         }
-        "raw_bytes" => FieldCodec::Bytes {
+        "raw_bytes" => CodecSpec::Bytes {
             len: required_usize(field_codec, "length")?,
         },
         unexpected => {
@@ -372,7 +374,7 @@ fn codec_from_manifest(menu: &Value, name: &str, field: &Value) -> TestResult<Fi
                 "unsupported registry codec kind `{unexpected}`"
             )));
         }
-    })
+    })?)
 }
 
 fn assert_options_match(menu: &Value, enum_type: &str, field: &MenuField) -> TestResult {
@@ -480,7 +482,7 @@ fn assert_registry_field_matches(
     if !field.options.is_empty() || !field.allowed_values.is_empty() {
         assert_eq!(
             field.descriptor.codec.value_kind(),
-            "unsigned",
+            ValueKind::Unsigned,
             "finite-domain field `{name}` must use an unsigned storage codec so \
              plan_value's domain gate applies"
         );
@@ -498,17 +500,17 @@ fn assert_transform_matches(json_field: &Value, field: &MenuField) -> TestResult
                 "storage transform kind for `{name}`"
             );
             assert_eq!(
-                actual.input_unit,
+                actual.input_unit(),
                 required_str(json, "input_unit")?,
                 "storage transform unit for `{name}`"
             );
             assert_eq!(
-                actual.numerator,
+                i64::from(actual.numerator()),
                 required_i64(json, "numerator")?,
                 "storage transform numerator for `{name}`"
             );
             assert_eq!(
-                actual.denominator,
+                i64::from(actual.denominator()),
                 required_i64(json, "denominator")?,
                 "storage transform denominator for `{name}`"
             );
@@ -713,8 +715,8 @@ fn aprs_distance_limits_include_off_and_reject_reserved_high_values() -> TestRes
         let field = menu_field(&qualified)
             .ok_or_else(|| invalid_data(format!("missing registry field `{qualified}`")))?;
         assert_eq!(
-            field.descriptor.codec,
-            FieldCodec::Byte { min: 0, max: 250 },
+            field.descriptor.codec.spec(),
+            CodecSpec::Byte { min: 0, max: 250 },
             "{qualified} generated codec"
         );
         for raw in [0, 1, 250] {

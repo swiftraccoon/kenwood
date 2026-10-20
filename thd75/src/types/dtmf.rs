@@ -210,6 +210,19 @@ pub enum DtmfPause {
     Ms2000,
 }
 
+impl DtmfPause {
+    /// Every pause interval, in ascending MCP menu-value order.
+    pub const ALL: [Self; 7] = [
+        Self::Ms100,
+        Self::Ms250,
+        Self::Ms500,
+        Self::Ms750,
+        Self::Ms1000,
+        Self::Ms1500,
+        Self::Ms2000,
+    ];
+}
+
 // ---------------------------------------------------------------------------
 // Validation helper
 // ---------------------------------------------------------------------------

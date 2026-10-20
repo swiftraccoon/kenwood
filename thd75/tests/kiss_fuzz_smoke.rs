@@ -1,20 +1,10 @@
 //! Smoke fuzzing for the AX.25 / APRS parsers.
 //!
-//! Not a real `cargo-fuzz` harness, which requires nightly. Instead,
-//! we feed the parsers a large number of pseudo-random byte sequences
-//! and assert that none of them panic. The seed is fixed so the test
-//! is reproducible.
-//!
-//! The pure-KISS decode fuzz case lives in `kiss-tnc/tests/fuzz_smoke.rs`
-//! (extracted in PR 1 of the KISS / AX.25 / APRS split). AX.25 and
-//! APRS cases stay here until those layers are extracted in PRs 2
-//! and 3.
-//!
-//! For real fuzzing (libfuzzer/AFL), the same body can be lifted into
-//! a `fuzz_targets/` crate.
+//! The AX.25 and APRS parsers receive deterministic pseudo-random byte
+//! sequences. A panic fails the test; fixed seeds reproduce its input.
 
-use aprs::{parse_aprs_data, parse_aprs_position};
-use ax25_codec::parse_ax25;
+use aprs::{AprsData, AprsPosition};
+use ax25_codec::Ax25Packet;
 
 // Deps visible to every kenwood-thd75 test target but unused here.
 // Acknowledged so `unused_crate_dependencies` stays silent without
@@ -64,7 +54,7 @@ fn fuzz_parse_ax25_no_panic() {
         for _ in 0..50 {
             let mut buf = vec![0u8; size];
             rng.fill(&mut buf);
-            drop(parse_ax25(&buf));
+            drop(Ax25Packet::from_bytes(&buf));
         }
     }
 }
@@ -76,7 +66,7 @@ fn fuzz_parse_aprs_data_no_panic() {
         for _ in 0..50 {
             let mut buf = vec![0u8; size];
             rng.fill(&mut buf);
-            drop(parse_aprs_data(&buf));
+            drop(AprsData::from_bytes(&buf));
         }
     }
 }
@@ -98,7 +88,7 @@ fn fuzz_parse_aprs_position_no_panic() {
                     _ => b'@',
                 };
             }
-            drop(parse_aprs_position(&buf));
+            drop(AprsPosition::from_bytes(&buf));
         }
     }
 }
@@ -115,7 +105,7 @@ fn fuzz_parse_aprs_position_with_spaces() {
         b"!4 03.50N/07201.75W>",
     ];
     for tpl in templates {
-        drop(parse_aprs_position(tpl));
+        drop(AprsPosition::from_bytes(tpl));
     }
 }
 
@@ -136,7 +126,7 @@ fn fuzz_parse_aprs_data_known_first_bytes() {
             {
                 rng.fill(tail);
             }
-            drop(parse_aprs_data(&buf));
+            drop(AprsData::from_bytes(&buf));
         }
     }
 }

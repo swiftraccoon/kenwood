@@ -236,7 +236,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if original_tuning != TuningMode::Vfo {
         println!("Band B tuning mode is {original_tuning:?}; demonstrating the VFO guard...");
         let refused = radio
-            .enter_if_tap(IfTapConfig::new(OperatingMode::Usb))
+            .enter_if_tap(IfTapConfig::new(OperatingMode::Usb)?)
             .await;
         check(
             &mut passed,
@@ -261,7 +261,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Enter with an explicit step so the snapshot covers it (the historical
     // step-restore defect is exactly what this proves fixed).
-    let config = IfTapConfig::new(OperatingMode::Usb).with_step(StepSize::Hz5000);
+    let config = IfTapConfig::new(OperatingMode::Usb)?.with_step(StepSize::Hz5000);
     let session = match radio.enter_if_tap(config).await {
         Ok(session) => session,
         Err(error) => {

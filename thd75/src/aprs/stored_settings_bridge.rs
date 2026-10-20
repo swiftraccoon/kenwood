@@ -18,7 +18,7 @@
 //! # Ok::<(), aprs::AprsError>(())
 //! ```
 
-use aprs::{AprsError, Heading, SmartBeaconingConfig, Speed};
+use aprs::{AprsError, Heading, SmartBeaconingConfig, SmartBeaconingParameters, Speed};
 
 use crate::types::{aprs::StoredSmartBeaconingSettings, settings::SpeedDistanceUnit};
 
@@ -48,18 +48,18 @@ impl TryFrom<StoredSmartBeaconingSettings> for SmartBeaconingConfig {
 
     fn try_from(stored: StoredSmartBeaconingSettings) -> Result<Self, Self::Error> {
         let speed_factor = configured_speed_to_kmh(stored.speed_distance_unit);
-        Self::new(
-            Speed::from_kmh(f64::from(u8::from(stored.low_speed)) * speed_factor)?,
-            Speed::from_kmh(f64::from(u8::from(stored.high_speed)) * speed_factor)?,
-            u32::from(u8::from(stored.slow_rate)) * 60,
-            u32::from(u8::from(stored.fast_rate)),
+        Self::new(SmartBeaconingParameters {
+            low_speed: Speed::from_kmh(f64::from(u8::from(stored.low_speed)) * speed_factor)?,
+            high_speed: Speed::from_kmh(f64::from(u8::from(stored.high_speed)) * speed_factor)?,
+            slow_rate_secs: u32::from(u8::from(stored.slow_rate)) * 60,
+            fast_rate_secs: u32::from(u8::from(stored.fast_rate)),
             // The threshold formula divides by speed. Scaling the speed to
             // km/h therefore requires the same scale on the slope to preserve
             // the radio's angle at every physical speed.
-            f64::from(u8::from(stored.turn_slope)) * speed_factor,
-            Heading::new(f64::from(u8::from(stored.turn_angle)))?,
-            u32::from(u8::from(stored.turn_time)),
-        )
+            turn_slope: f64::from(u8::from(stored.turn_slope)) * speed_factor,
+            turn_minimum: Heading::new(f64::from(u8::from(stored.turn_angle)))?,
+            turn_time_secs: u32::from(u8::from(stored.turn_time)),
+        })
     }
 }
 

@@ -4,8 +4,8 @@
 //! position report extraction. Reads raw bytes from the serial port
 //! and decodes any KISS-framed packets received.
 //!
-//! Before running, enable KISS mode on the radio:
-//! Press `[F]`, then `[LIST]`, cycle to "KISS mode ON".
+//! Before running, enable KISS on the interface selected by Menu 983.
+//! This reader opens that existing binary connection without issuing CAT.
 //!
 //! Usage:
 //! ```text
@@ -30,6 +30,8 @@ use thiserror as _;
 use tokio_serial as _;
 use tracing as _;
 
+use std::num::NonZeroU32;
+
 use kenwood_thd75::transport::SerialTransport;
 use kenwood_transport::Transport;
 
@@ -40,13 +42,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "/dev/cu.usbmodem1234".to_owned());
 
     println!("Opening {port} for KISS TNC monitoring...");
-    println!("(Enable KISS mode on the radio first: [F] > [LIST] > KISS mode ON)");
+    println!("Enable KISS on the interface selected by Menu 983 before opening it.");
     println!("Press Ctrl+C to stop.\n");
 
-    let mut transport = SerialTransport::open_with_baud(&port, 9600)?;
+    let mut transport =
+        SerialTransport::open_with_baud(&port, NonZeroU32::new(9600).ok_or("nonzero baud")?)?;
 
     let mut buf = [0u8; 2048];
-    let mut accumulator = Vec::new();
+    let mut decoder = kiss_tnc::KissDecoder::new();
     let mut packet_count: u64 = 0;
 
     loop {
@@ -56,20 +59,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
 
-        accumulator.extend_from_slice(buf.get(..n).unwrap_or(&[]));
+        decoder.push(
+            buf.get(..n)
+                .ok_or("transport returned more bytes than the buffer holds")?,
+        );
 
-        // Scan for complete KISS frames (FEND-delimited).
-        while let Some(frame_data) = extract_kiss_frame(&mut accumulator) {
-            if frame_data.is_empty() {
-                continue;
-            }
-
-            packet_count += 1;
-            print!("[{packet_count:04}] ");
-
-            // Decode the KISS frame.
-            match kiss_tnc::decode_kiss_frame(&frame_data) {
-                Ok(kiss_frame) => {
+        loop {
+            match decoder.next_frame() {
+                Ok(None) => break,
+                Ok(Some(kiss_frame)) => {
+                    packet_count += 1;
+                    print!("[{packet_count:04}] ");
                     if kiss_frame.command != kiss_tnc::KissCommand::Data {
                         println!(
                             "KISS cmd=0x{:02X} ({} bytes)",
@@ -80,22 +80,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     // Parse the AX.25 payload.
-                    if let Ok(ax25) = ax25_codec::parse_ax25(&kiss_frame.data) {
-                        print!("{}>{}", ax25.source, ax25.destination,);
-                        for digi in &ax25.digipeaters {
+                    if let Ok(ax25) = ax25_codec::Ax25Packet::from_bytes(&kiss_frame.data) {
+                        print!("{}>{}", ax25.header.source, ax25.header.destination,);
+                        for digi in &ax25.header.digipeaters {
                             print!(",{digi}");
                         }
                         print!(": ");
 
                         // Try to parse as APRS position report.
-                        if let Ok(pos) = aprs::parse_aprs_position(ax25.information()) {
+                        if let Ok(pos) = aprs::AprsPosition::from_bytes(ax25.information()) {
                             println!(
                                 "APRS {:.4},{:.4} ({}{}) \"{}\"",
-                                pos.latitude,
-                                pos.longitude,
-                                pos.symbol_table,
-                                pos.symbol_code,
-                                pos.comment,
+                                pos.latitude(),
+                                pos.longitude(),
+                                pos.symbol().table_char(),
+                                pos.symbol().code_char(),
+                                pos.comment(),
                             );
                         } else {
                             // Not a position report -- show raw info.
@@ -107,36 +107,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Err(e) => {
-                    println!("KISS decode error: {e:?} ({} bytes)", frame_data.len());
+                    println!("KISS decode error: {e}");
                 }
             }
         }
     }
 
     Ok(())
-}
-
-/// Extract the first complete KISS frame from the accumulator.
-///
-/// Returns `Some(frame_bytes)` if a FEND-delimited frame is found,
-/// removing it (and the delimiters) from the accumulator. Returns
-/// `None` if no complete frame is available yet.
-fn extract_kiss_frame(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
-    // Find first FEND.
-    let start = buf.iter().position(|&b| b == kiss_tnc::FEND)?;
-
-    // Find next FEND after start.
-    let end = buf
-        .get(start + 1..)?
-        .iter()
-        .position(|&b| b == kiss_tnc::FEND)
-        .map(|i| start + 1 + i)?;
-
-    // Extract the frame (between the two FENDs).
-    let frame: Vec<u8> = buf.get(start..=end)?.to_vec();
-
-    // Remove processed bytes from accumulator.
-    drop(buf.drain(..=end));
-
-    Some(frame)
 }
