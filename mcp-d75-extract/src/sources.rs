@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::csharp::{Patterns, fancy_captures, normalize_whitespace, parse_integer};
-use crate::error::{Result, extract_error};
+use crate::error::{ExtractError, Result, extract_error};
 
 /// Decompiled sources in sorted-path order.
 pub(crate) type Sources = Vec<(PathBuf, String)>;
@@ -32,10 +32,10 @@ pub(crate) fn source_label(path: &Path, source_dir: &Path) -> String {
 
 fn collect_cs_files(directory: &Path, found: &mut Vec<PathBuf>) -> Result<()> {
     let entries = std::fs::read_dir(directory)
-        .map_err(|error| extract_error!("cannot read {}: {error}", directory.display()))?;
+        .map_err(|error| ExtractError::io("read source directory", directory, error))?;
     for entry in entries {
-        let entry = entry
-            .map_err(|error| extract_error!("cannot read {}: {error}", directory.display()))?;
+        let entry =
+            entry.map_err(|error| ExtractError::io("read directory entry", directory, error))?;
         let path = entry.path();
         if path.is_dir() {
             collect_cs_files(&path, found)?;
@@ -58,11 +58,11 @@ pub(crate) fn read_sources(source_dir: &Path) -> Result<Sources> {
     paths.sort_by_key(|path| posix_path(path));
     let mut sources = Vec::new();
     for path in paths {
-        let raw = std::fs::read(&path)
-            .map_err(|error| extract_error!("cannot read {}: {error}", path.display()))?;
+        let raw =
+            std::fs::read(&path).map_err(|error| ExtractError::io("read source", &path, error))?;
         let without_bom = raw.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&raw);
         let text = String::from_utf8(without_bom.to_vec()).map_err(|error| {
-            extract_error!("cannot decode {} as UTF-8: {error}", path.display())
+            ExtractError::source(format!("decode {} as UTF-8", path.display()), error)
         })?;
         sources.push((path, text.replace("\r\n", "\n")));
     }

@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use mcp_d75_extract::{
     BuildOptions, Codec, Domain, Manifest, Menu, Operation, RecordEntry, TMD750, Term,
-    build_manifest, json_text, parse_manifest, rust_text,
+    build_manifest, rust_text,
 };
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -22,23 +22,17 @@ fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tmd750")
 }
 
-fn options(strict: bool) -> BuildOptions {
-    BuildOptions {
-        model: &TMD750,
-        mcp_version: "1.00".to_owned(),
-        firmware_target: "1.00".to_owned(),
-        language_file: None,
-        strict_known_layout: strict,
-    }
+fn options(strict: bool) -> Result<BuildOptions, Box<dyn std::error::Error>> {
+    Ok(BuildOptions::new(&TMD750, "1.00", "1.00")?.with_strict_known_layout(strict))
 }
 
 fn manifest() -> Result<Manifest, Box<dyn std::error::Error>> {
-    Ok(build_manifest(&fixtures_dir(), &options(false))?)
+    Ok(build_manifest(&fixtures_dir(), &options(false)?)?)
 }
 
 fn menu<'a>(manifest: &'a Manifest, key: &str) -> Result<&'a Menu, Box<dyn std::error::Error>> {
     manifest
-        .menus
+        .menus()
         .iter()
         .find(|menu| menu.menu == key)
         .ok_or_else(|| format!("menu {key} missing").into())
@@ -71,27 +65,27 @@ fn record_names(menu: &Menu) -> Vec<&str> {
 #[test]
 fn declares_the_slot_dimension_and_discovers_details() -> TestResult {
     let manifest = manifest()?;
-    assert_eq!(manifest.model.image_length, 1_929_472);
-    assert_eq!(manifest.release.assembly_version, "1.0.9699.22639");
-    assert_eq!(manifest.dimensions.len(), 1);
+    assert_eq!(manifest.model().image_length, 1_929_472);
+    assert_eq!(manifest.release().assembly_version, "1.0.9699.22639");
+    assert_eq!(manifest.dimensions().len(), 1);
     assert_eq!(
         manifest
-            .dimensions
+            .dimensions()
             .first()
             .map(|dimension| dimension.anchors.len()),
         Some(2)
     );
-    assert_eq!(manifest.source.writer_class, "n7");
-    assert_eq!(manifest.source.resource_class, "ky");
+    assert_eq!(manifest.source().writer_class, "n7");
+    assert_eq!(manifest.source().resource_class, "ky");
     let keys: Vec<&str> = manifest
-        .source
+        .source()
         .serializer_classes
         .iter()
         .map(|(key, _)| key.as_str())
         .collect();
     assert_eq!(keys, vec!["radio", "gps", "aprs", "dv", "ipnet", "pm"]);
     assert_eq!(
-        manifest.source.detail_classes,
+        manifest.source().detail_classes,
         vec![
             ("radio".to_owned(), "nl".to_owned()),
             ("gps".to_owned(), "m7".to_owned()),
@@ -130,11 +124,11 @@ fn addresses_carry_slot_terms_with_their_anchor_stride() -> TestResult {
         ),
         "{bitmap:?}"
     );
-    assert_eq!(bitmap.category.as_deref(), Some("blob"));
+    assert_eq!(bitmap.category, Some(mcp_d75_extract::FieldCategory::Blob));
     let eq = operation(radio, "TxEqLevel04")?;
     assert!(eq.domain.is_some());
-    assert!(manifest.summary.slot_relative_field_count > 0);
-    assert_eq!(manifest.summary.dimension_count, 1);
+    assert!(manifest.summary().slot_relative_field_count > 0);
+    assert_eq!(manifest.summary().dimension_count, 1);
     Ok(())
 }
 
@@ -145,7 +139,10 @@ fn enums_declared_in_the_serializer_resolve_from_the_detail_class() -> TestResul
     let backlight = operation(radio, "InfoBacklight")?;
     assert_eq!(backlight.writer_class, "nl");
     assert_eq!(backlight.codec.csharp_type(), Some("oa.ad"));
-    assert_eq!(backlight.codec.value_type(), Some("enum"));
+    assert_eq!(
+        backlight.codec.value_type(),
+        Some(mcp_d75_extract::ValueType::Enum)
+    );
     assert_eq!(backlight.codec.enum_type(), Some("oa.ad"));
     let catalog = radio
         .enum_types
@@ -187,7 +184,10 @@ fn records_inherit_the_slot_term_and_fold_pinned_bases() -> TestResult {
     let Some(RecordEntry::Extracted(status)) = aprs.repeated_records.first() else {
         return Err("StatusTextList missing".into());
     };
-    assert_eq!(status.offset_layout.kind, "linear_with_override");
+    assert_eq!(
+        status.offset_layout.kind,
+        mcp_d75_extract::RecordLayout::LinearWithOverride
+    );
     assert_eq!(
         status.record_base_offsets,
         vec![329_504, 329_552, 329_600, 329_648, 329_728]
@@ -240,7 +240,15 @@ fn callsign_records_preserve_the_official_nul_padding() -> TestResult {
     assert_eq!(callsigns.len(), 6);
     for field in callsigns {
         assert!(
-            matches!(&field.codec, Codec::FixedString { encoding, length: 8, padding: 0, .. } if encoding == "utf8"),
+            matches!(
+                &field.codec,
+                Codec::FixedString {
+                    encoding: mcp_d75_extract::TextEncoding::Utf8,
+                    length: 8,
+                    padding: 0,
+                    ..
+                }
+            ),
             "each D750 callsign must retain the writer's eight-byte NUL-padded codec: {:?}",
             field.codec
         );
@@ -354,7 +362,14 @@ fn ipv4_helper_values_use_the_pinned_codec() -> TestResult {
     let ipnet = menu(&manifest, "ipnet")?;
     let ip = operation(ipnet, "IpAddress")?;
     assert!(
-        matches!(&ip.codec, Codec::RawBytes { length: Some(4), encoding: Some(encoding), .. } if encoding == "ipv4_dotted_quad"),
+        matches!(
+            &ip.codec,
+            Codec::RawBytes {
+                length: Some(4),
+                encoding: Some(mcp_d75_extract::RawEncoding::Ipv4DottedQuad),
+                ..
+            }
+        ),
         "{ip:?}"
     );
     assert_eq!(ip.address.terms, vec![slot(8192)]);
@@ -364,8 +379,8 @@ fn ipv4_helper_values_use_the_pinned_codec() -> TestResult {
 #[test]
 fn manifest_round_trips_and_rustgen_emits_slot_terms() -> TestResult {
     let manifest = manifest()?;
-    let json = json_text(&manifest)?;
-    assert_eq!(parse_manifest(&json)?, manifest);
+    let json = manifest.to_json()?;
+    assert_eq!(Manifest::from_json(&json)?, manifest);
     let registry = rust_text(&manifest)?;
     assert!(registry.contains("static MCP_D750_MENU_FIELD_ENTRIES: [MenuField; "));
     assert!(
@@ -419,7 +434,7 @@ fn registry_documents_metadata_as_a_catalog() -> TestResult {
 
 #[test]
 fn strict_known_layout_rejects_fixture() -> TestResult {
-    let result = build_manifest(&fixtures_dir(), &options(true));
+    let result = build_manifest(&fixtures_dir(), &options(true)?);
     let Err(error) = result else {
         return Err("strict known layout unexpectedly accepted the fixture".into());
     };

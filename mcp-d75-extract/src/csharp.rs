@@ -81,12 +81,12 @@ pub(crate) struct Patterns {
 
 fn compile(pattern: &str) -> Result<regex::Regex> {
     regex::Regex::new(pattern)
-        .map_err(|error| extract_error!("internal pattern failed to compile: {error}"))
+        .map_err(|error| ExtractError::source("compile internal pattern", error))
 }
 
 fn compile_fancy(pattern: &str) -> Result<fancy_regex::Regex> {
     fancy_regex::Regex::new(pattern)
-        .map_err(|error| extract_error!("internal pattern failed to compile: {error}"))
+        .map_err(|error| ExtractError::source("compile internal lookaround pattern", error))
 }
 
 impl Patterns {
@@ -150,7 +150,9 @@ pub(crate) fn fancy_captures<'t>(
 ) -> Result<Vec<fancy_regex::Captures<'t>>> {
     pattern
         .captures_iter(text)
-        .map(|capture| capture.map_err(|error| extract_error!("pattern match failed: {error}")))
+        .map(|capture| {
+            capture.map_err(|error| ExtractError::source("match lookaround pattern", error))
+        })
         .collect()
 }
 

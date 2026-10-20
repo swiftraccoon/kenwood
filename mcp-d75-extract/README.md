@@ -4,7 +4,8 @@ Extracts the MCP memory-map layout of Kenwood's TH-D75 and TM-D750 from the
 official Memory Control Programs (MCP-D75, MCP-D750) into a deterministic JSON
 manifest, and diffs manifests across firmware releases. It also generates the
 Rust menu-field registries that power the verified menu patching in
-[`kenwood-thd75`](../thd75/) and [`kenwood-tmd750`](../tmd750/).
+[`kenwood-thd75`](https://github.com/swiftraccoon/kenwood/tree/main/thd75)
+and [`kenwood-tmd750`](https://github.com/swiftraccoon/kenwood/tree/main/tmd750).
 
 The programs are .NET applications. `ilspycmd` decompiles them; the extractor
 reads the serializer write methods and records every write as a name, an
@@ -79,7 +80,72 @@ Extraction fails, naming the class, method, and line, whenever an offset does
 not resolve, a discovery has zero or several candidates, a pinned fact does
 not verify against the source, a nested call reaches a class the spec does
 not describe, or a written value has no resolvable type. There are no
-warnings and no partial manifests.
+warnings and no extraction output is published before extraction and rendering
+both complete. Decompilation is synchronous and waits for the child process;
+its unsuccessful exit is `ExtractError::Subprocess`.
+
+Writing prepares every output in a temporary file in its destination directory
+and syncs the file contents. Each final replacement is atomic, in JSON-then-Rust
+order. `ExtractError::Publication` retains the destinations already replaced if
+a later replacement fails. Retry the same request to complete the pair. Parent
+directories may be created during preparation; this operation does not promise
+directory-entry durability or an atomic transaction across both files. Check
+mode performs no writes.
+
+## Library workflows
+
+Resolve artificial banked addresses without reading source files:
+
+```rust
+use std::collections::HashMap;
+use mcp_d75_extract::{SlotSymbol, SymbolScope, resolve_offset};
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let constants = HashMap::new();
+let slots = [SlotSymbol {
+    symbol: "bank_offset".to_owned(),
+    anchor: "BankAddress".to_owned(),
+    dimension: "bank".to_owned(),
+    stride: 256,
+}];
+let scope = SymbolScope { constants: &constants, slots: &slots, overrides: &[] };
+let address = resolve_offset("0x1000 + bank_offset", &scope)?;
+assert_eq!(address.offset(&[("bank", 3)])?, 0x1300);
+# Ok(())
+# }
+```
+
+Decode complete checked manifests, inspect their fields, compare releases and
+render a registry. Raw `ManifestCandidate` records are editable inputs;
+`validate` checks their cross-record relationships before producing `Manifest`.
+Its accessors borrow immutable views. `into_candidate` transfers allocations for
+editing; `to_candidate` creates an independent copy. Both require validation
+again before generation or comparison.
+`Manifest::from_json`, `FromStr` and Serde decoding enforce the same boundary:
+model identity, dimensions, source-map agreement, codec widths, domains, record
+expansions and retained derived counts. Closed enums retain the schema's wire
+spellings. The two combo-box counters retain extraction provenance because the
+manifest does not store every source expression needed to recompute them.
+`BuildOptions::new` checks version labels before source I/O; named methods select
+the optional language file and strict-layout checks.
+
+```rust,no_run
+use mcp_d75_extract::{Manifest, OutputMode, diff_manifests, rust_text, write_output};
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let old = Manifest::from_json(&std::fs::read_to_string("old.json")?)?;
+let current: Manifest = std::fs::read_to_string("current.json")?.parse()?;
+let report = diff_manifests(&old, &current)?;
+println!("{report}");
+for menu in current.menus() {
+    println!("{}: {} fields", menu.menu, menu.field_count);
+}
+write_output(std::path::Path::new("registry.rs"), &rust_text(&current)?, OutputMode::Replace)?;
+let json = current.to_json()?;
+assert_eq!(Manifest::from_json(&json)?, current);
+# Ok(())
+# }
+```
 
 ## Tests
 
@@ -89,4 +155,5 @@ are pinned inputs: do not regenerate or reformat them. No Kenwood executable
 and no verbatim decompiler output is committed. The constants are extracted
 for interoperability with the radios' own programming format.
 
-Part of the [kenwood](..) workspace. License: GPL-2.0-or-later.
+Part of the [kenwood](https://github.com/swiftraccoon/kenwood) workspace.
+License: GPL-2.0-or-later.

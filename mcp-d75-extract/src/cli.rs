@@ -5,16 +5,15 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Parser, Subcommand};
 
 use crate::diff::diff_manifests;
-use crate::error::{Result, extract_error};
+use crate::error::{ExtractError, Result, extract_error};
 use crate::extract::{BuildOptions, build_manifest};
-use crate::manifest::{Manifest, json_text, parse_manifest};
-use crate::model::model_by_id;
+use crate::manifest::Manifest;
 use crate::rustgen::rust_text;
 
 /// Extract MCP memory-map manifests from ILSpy-decompiled programs.
 #[derive(Debug, Parser)]
 #[command(name = "mcp-d75-extract")]
-pub struct Cli {
+pub(crate) struct Cli {
     /// Subcommand.
     #[command(subcommand)]
     pub command: Command,
@@ -22,7 +21,7 @@ pub struct Cli {
 
 /// Available subcommands.
 #[derive(Debug, Subcommand)]
-pub enum Command {
+pub(crate) enum Command {
     /// Decompile (or read) a program and write its manifest.
     Extract(ExtractArgs),
     /// Report layout changes between two manifests of one radio.
@@ -31,7 +30,7 @@ pub enum Command {
 
 /// Arguments of `diff`.
 #[derive(Debug, Args)]
-pub struct DiffArgs {
+pub(crate) struct DiffArgs {
     /// Manifest of the earlier release.
     pub old: PathBuf,
     /// Manifest of the later release.
@@ -41,10 +40,10 @@ pub struct DiffArgs {
 /// Arguments of `extract`.
 #[derive(Debug, Args)]
 #[command(group(clap::ArgGroup::new("source").required(true).multiple(false)))]
-pub struct ExtractArgs {
+pub(crate) struct ExtractArgs {
     /// Radio spec id: `thd75` or `tmd750`.
-    #[arg(long)]
-    pub model: String,
+    #[arg(long, value_enum)]
+    pub model: crate::RadioModel,
     /// Existing `ILSpy` project directory.
     #[arg(long, group = "source")]
     pub source_dir: Option<PathBuf>,
@@ -77,38 +76,36 @@ pub struct ExtractArgs {
     pub check: bool,
 }
 
-/// Write generated content, or in check mode verify it matches.
+/// The destination operation for generated text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OutputMode {
+    /// Compares existing bytes without creating or changing a destination.
+    Check,
+    /// Prepares and syncs a temporary file, then atomically replaces the destination.
+    Replace,
+}
+
+/// Writes generated text or verifies the existing destination's exact bytes.
 ///
 /// # Errors
 ///
 /// In check mode, returns an error when the output file is missing,
 /// unreadable, or differs from `content`; in write mode, when the file or
-/// its parent directory cannot be created.
-pub fn write_or_check(path: &Path, content: &str, check: bool) -> Result<()> {
-    if check {
-        let existing = std::fs::read_to_string(path).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                extract_error!("--check output does not exist: {}", path.display())
-            } else {
-                extract_error!("cannot read {}: {error}", path.display())
-            }
-        })?;
+/// its parent directory cannot be created. Writing prepares a temporary file,
+/// syncs its contents, then atomically replaces this one destination. No
+/// directory-entry durability is claimed.
+pub fn write_output(path: &Path, content: &str, mode: OutputMode) -> Result<()> {
+    if mode == OutputMode::Check {
+        let existing = std::fs::read_to_string(path)
+            .map_err(|error| ExtractError::io("read checked output", path, error))?;
         if existing != content {
-            return Err(extract_error!(
-                "generated output differs: {}",
-                path.display()
-            ));
+            return Err(ExtractError::GenerationMismatch {
+                path: path.to_owned(),
+            });
         }
         return Ok(());
     }
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| extract_error!("cannot create {}: {error}", parent.display()))?;
-    }
-    std::fs::write(path, content)
-        .map_err(|error| extract_error!("cannot write {}: {error}", path.display()))
+    crate::output::publish(&[(path, content)])
 }
 
 fn find_ilspycmd(explicit: Option<&str>) -> Result<PathBuf> {
@@ -138,14 +135,13 @@ fn decompile(assembly: &Path, output_dir: &Path, ilspycmd: Option<&str>) -> Resu
         .arg(output_dir)
         .arg(assembly)
         .status()
-        .map_err(|error| extract_error!("cannot run ilspycmd: {error}"))?;
+        .map_err(|error| ExtractError::io("run decompiler", assembly, error))?;
     if status.success() {
         Ok(())
     } else {
-        Err(extract_error!(
-            "ILSpy decompilation failed with exit code {}",
-            status.code().unwrap_or(-1)
-        ))
+        Err(ExtractError::Subprocess {
+            code: status.code(),
+        })
     }
 }
 
@@ -155,18 +151,22 @@ fn decompile(assembly: &Path, output_dir: &Path, ilspycmd: Option<&str>) -> Resu
 ///
 /// Returns an error for an unknown model, a missing assembly, a failed
 /// decompilation or extraction, or an output that cannot be written (or,
-/// with `--check`, does not match).
-pub fn run_extract(args: &ExtractArgs) -> Result<()> {
-    let model = model_by_id(&args.model).ok_or_else(|| {
-        extract_error!("unknown model {:?}; expected thd75 or tmd750", args.model)
-    })?;
-    let options = BuildOptions {
-        model,
-        mcp_version: args.mcp_version.clone(),
-        firmware_target: args.firmware.clone(),
-        language_file: args.language_file.clone(),
-        strict_known_layout: args.strict_known_layout,
-    };
+/// with `--check`, does not match). Both outputs are rendered and prepared
+/// before publication. Each destination is replaced atomically in JSON-then-Rust
+/// order; [`ExtractError::Publication`] retains completed destinations if a
+/// later replacement fails. Retrying the same request completes the pair.
+fn run_extract(args: &ExtractArgs) -> Result<()> {
+    if args.source_dir.is_some() == args.assembly.is_some() {
+        return Err(ExtractError::InvalidInput {
+            message: "exactly one of source_dir and assembly is required".to_owned(),
+        });
+    }
+    let model = args.model.specification();
+    let mut options = BuildOptions::new(model, &args.mcp_version, &args.firmware)?
+        .with_strict_known_layout(args.strict_known_layout);
+    if let Some(path) = &args.language_file {
+        options = options.with_language_file(path.clone());
+    }
     let manifest = if let Some(source_dir) = args.source_dir.as_deref() {
         build_manifest(source_dir, &options)?
     } else {
@@ -180,13 +180,32 @@ pub fn run_extract(args: &ExtractArgs) -> Result<()> {
         let temporary = tempfile::Builder::new()
             .prefix("mcp-extract-ilspy-")
             .tempdir()
-            .map_err(|error| extract_error!("cannot create temporary directory: {error}"))?;
+            .map_err(|error| {
+                ExtractError::io(
+                    "create decompiler temporary directory",
+                    &std::env::temp_dir(),
+                    error,
+                )
+            })?;
         decompile(assembly, temporary.path(), args.ilspycmd.as_deref())?;
         build_manifest(temporary.path(), &options)?
     };
-    write_or_check(&args.output, &json_text(&manifest)?, args.check)?;
-    if let Some(rust_output) = args.rust_output.as_deref() {
-        write_or_check(rust_output, &rust_text(&manifest)?, args.check)?;
+    let json = manifest.to_json()?;
+    let rust = args
+        .rust_output
+        .as_ref()
+        .map(|_| rust_text(&manifest))
+        .transpose()?;
+    let mut outputs = vec![(args.output.as_path(), json.as_str())];
+    if let Some((path, text)) = args.rust_output.as_deref().zip(rust.as_deref()) {
+        outputs.push((path, text));
+    }
+    if args.check {
+        for (path, content) in outputs {
+            write_output(path, content, OutputMode::Check)?;
+        }
+    } else {
+        crate::output::publish(&outputs)?;
     }
     Ok(())
 }
@@ -197,11 +216,11 @@ pub fn run_extract(args: &ExtractArgs) -> Result<()> {
 ///
 /// Returns an error when either manifest cannot be read or parsed, or when
 /// the manifests describe different radios.
-pub fn run_diff(args: &DiffArgs) -> Result<i32> {
+fn run_diff(args: &DiffArgs) -> Result<i32> {
     let read = |path: &Path| -> Result<Manifest> {
         let text = std::fs::read_to_string(path)
-            .map_err(|error| extract_error!("cannot read {}: {error}", path.display()))?;
-        parse_manifest(&text)
+            .map_err(|error| ExtractError::io("read manifest", path, error))?;
+        Manifest::from_json(&text)
     };
     let report = diff_manifests(&read(&args.old)?, &read(&args.new)?)?;
     print!("{report}");

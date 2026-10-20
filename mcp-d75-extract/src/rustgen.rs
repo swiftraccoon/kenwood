@@ -13,8 +13,7 @@ use crate::manifest::{
 /// Generator name recorded in the `@generated` header.
 const GENERATOR: &str = env!("CARGO_PKG_NAME");
 
-/// Per-radio rendering choices. The TH-D75 target reproduces the registry
-/// the crate has always emitted, byte for byte.
+/// Per-radio registry names, addressing features and documentation.
 struct Target {
     radio: &'static str,
     prefix: &'static str,
@@ -170,7 +169,7 @@ impl<'a> Field<'a> {
     }
 
     fn is_blob(self) -> bool {
-        matches!(self, Self::Direct(operation) if operation.category.as_deref() == Some("blob"))
+        matches!(self, Self::Direct(operation) if operation.category == Some(crate::FieldCategory::Blob))
     }
 
     const fn has_terms(self) -> bool {
@@ -282,7 +281,7 @@ fn bit_field_codec_lines(
             "invalid bit field coordinates: bit={bit}, width={width}"
         ));
     }
-    if bit + width > 8 {
+    if bit >= 8 || width > 8 - bit {
         return Err(extract_error!(
             "bit field exceeds one byte: bit={bit}, width={width}"
         ));
@@ -295,9 +294,9 @@ fn bit_field_codec_lines(
             ));
         }
         return Ok(vec![
-            "FieldCodec::BitBool {".to_owned(),
+            "field_codec(CodecSpec::BitBool {".to_owned(),
             format!("    mask: 0x{mask:02X},"),
-            "}".to_owned(),
+            "})".to_owned(),
         ]);
     }
     let capacity =
@@ -312,12 +311,12 @@ fn bit_field_codec_lines(
         ));
     }
     Ok(vec![
-        "FieldCodec::BitField {".to_owned(),
+        "field_codec(CodecSpec::BitField {".to_owned(),
         format!("    mask: 0x{mask:02X},"),
         format!("    shift: {bit},"),
         format!("    min: {minimum},"),
         format!("    max: {maximum},"),
-        "}".to_owned(),
+        "})".to_owned(),
     ])
 }
 
@@ -352,16 +351,16 @@ fn integer_codec_lines(width: u64, domain: Option<&Domain>, signed: bool) -> Res
     };
     let variant = if signed { "Signed" } else { "Unsigned" };
     Ok(vec![
-        format!("FieldCodec::{variant} {{"),
+        format!("field_codec(CodecSpec::{variant} {{"),
         format!("    width: {width},"),
         "    endian: Endian::Little,".to_owned(),
         format!("    min: {minimum},"),
         format!("    max: {maximum},"),
-        "}".to_owned(),
+        "})".to_owned(),
     ])
 }
 
-/// Render one manifest codec using the crate's real `FieldCodec` type.
+/// Render one manifest codec for validation in a registry initializer.
 fn rust_codec(
     codec: &Codec,
     catalogs: &HashMap<&str, &EnumCatalog>,
@@ -379,13 +378,13 @@ fn rust_codec(
                 ));
             }
             Ok(vec![
-                "FieldCodec::Byte {".to_owned(),
+                "field_codec(CodecSpec::Byte {".to_owned(),
                 format!("    min: {minimum},"),
                 format!("    max: {maximum},"),
-                "}".to_owned(),
+                "})".to_owned(),
             ])
         }
-        Codec::Bool { .. } => Ok(vec!["FieldCodec::Bool".to_owned()]),
+        Codec::Bool { .. } => Ok(vec!["FieldCodec::BOOL".to_owned()]),
         Codec::BitField {
             bit,
             width,
@@ -395,7 +394,7 @@ fn rust_codec(
         } => bit_field_codec_lines(
             *bit,
             *width,
-            value_type == "bool",
+            *value_type == crate::ValueType::Bool,
             enum_type.as_deref(),
             catalogs,
             domain,
@@ -406,17 +405,22 @@ fn rust_codec(
             padding,
             ..
         } => {
-            let encoding = match encoding.as_str() {
-                "utf8" => "StringEncoding::Utf8",
-                "memory_map" => "StringEncoding::MemoryMap",
-                other => return Err(extract_error!("unsupported string encoding: {other}")),
+            if *length == 0 {
+                return Err(extract_error!("fixed string field length must be positive"));
+            }
+            let padding = u8::try_from(*padding).map_err(|_| {
+                extract_error!("fixed string field padding exceeds one byte: {padding}")
+            })?;
+            let encoding = match encoding {
+                crate::TextEncoding::Utf8 => "StringEncoding::Utf8",
+                crate::TextEncoding::MemoryMap => "StringEncoding::MemoryMap",
             };
             Ok(vec![
-                "FieldCodec::FixedString {".to_owned(),
+                "field_codec(CodecSpec::FixedString {".to_owned(),
                 format!("    len: {},", rust_decimal(*length)),
                 format!("    encoding: {encoding},"),
                 format!("    padding: {padding},"),
-                "}".to_owned(),
+                "})".to_owned(),
             ])
         }
         Codec::SignedLe { width, .. } => integer_codec_lines(*width, domain, true),
@@ -424,10 +428,13 @@ fn rust_codec(
         Codec::RawBytes { length, .. } => {
             let length =
                 length.ok_or_else(|| extract_error!("raw byte field has no inferred length"))?;
+            if length == 0 {
+                return Err(extract_error!("raw byte field length must be positive"));
+            }
             Ok(vec![
-                "FieldCodec::Bytes {".to_owned(),
+                "field_codec(CodecSpec::Bytes {".to_owned(),
                 format!("    len: {},", rust_decimal(length)),
-                "}".to_owned(),
+                "})".to_owned(),
             ])
         }
         Codec::ClearRange { .. } => Err(extract_error!(
@@ -477,14 +484,16 @@ fn rust_storage_transform(transform: Option<&StorageTransform>) -> Result<String
     let Some(transform) = transform else {
         return Ok("None".to_owned());
     };
-    if transform.kind != "scaled_integer" {
+    if transform.input_unit.is_empty()
+        || !matches!(u32::try_from(transform.numerator), Ok(1..))
+        || !matches!(u32::try_from(transform.denominator), Ok(1..))
+    {
         return Err(extract_error!(
-            "unsupported storage transform: {}",
-            transform.kind
+            "storage transform needs a unit and positive u32 ratio terms"
         ));
     }
     Ok(format!(
-        "Some(StorageTransform {{ input_unit: {}, numerator: {}, denominator: {} }})",
+        "Some(match StorageTransform::new({}, {}, {}) {{ Some(value) => value, None => unreachable!() }})",
         rust_string(&transform.input_unit),
         transform.numerator,
         transform.denominator
@@ -533,9 +542,9 @@ fn registry_header_lines(manifest: &Manifest, target: &Target) -> Result<Vec<Str
     let prefix = target.prefix;
     let product = target.product;
     let schema_use = if target.terms {
-        "use super::schema::{Endian, FieldCodec, FieldDescriptor, StringEncoding, Term};"
+        "use super::schema::{FieldDescriptor, Term};"
     } else {
-        "use super::schema::{Endian, FieldCodec, FieldDescriptor, StringEncoding};"
+        "use super::schema::FieldDescriptor;"
     };
     let mut lines = vec![
         format!("// @generated by {GENERATOR}; do not edit."),
@@ -546,7 +555,17 @@ fn registry_header_lines(manifest: &Manifest, target: &Target) -> Result<Vec<Str
     lines.extend(target.module_docs.iter().map(ToString::to_string));
     lines.extend([
         String::new(),
+        "use kenwood_schema::{CodecSpec, Endian, FieldCodec, StringEncoding};".to_owned(),
+        String::new(),
         schema_use.to_owned(),
+        String::new(),
+        "/// Validate a codec specification in a registry initializer.".to_owned(),
+        "const fn field_codec(spec: CodecSpec) -> FieldCodec {".to_owned(),
+        "    match FieldCodec::new(spec) {".to_owned(),
+        "        Ok(codec) => codec,".to_owned(),
+        "        Err(_) => unreachable!(),".to_owned(),
+        "    }".to_owned(),
+        "}".to_owned(),
         String::new(),
         "/// Manifest format version used to generate this registry.".to_owned(),
         format!(
@@ -576,18 +595,8 @@ fn registry_header_lines(manifest: &Manifest, target: &Target) -> Result<Vec<Str
         "    pub resource_key: Option<&'static str>,".to_owned(),
         "}".to_owned(),
         String::new(),
-        "/// Optional scaling between a display value and its stored integer.".to_owned(),
-        "#[derive(Debug, Clone, Copy, PartialEq, Eq)]".to_owned(),
-        "pub struct StorageTransform {".to_owned(),
-        "    /// Unit accepted by the documented transform.".to_owned(),
-        "    pub input_unit: &'static str,".to_owned(),
-        "    /// Encoding multiplier before rounding.".to_owned(),
-        "    pub numerator: i64,".to_owned(),
-        "    /// Encoding divisor before rounding.".to_owned(),
-        "    pub denominator: i64,".to_owned(),
-        "}".to_owned(),
-        String::new(),
     ]);
+    lines.extend(storage_transform_lines().iter().map(ToString::to_string));
     lines.extend(target.field_docs.iter().map(ToString::to_string));
     lines.extend([
         "#[derive(Debug, Clone, Copy, PartialEq, Eq)]".to_owned(),
@@ -618,6 +627,55 @@ fn registry_header_lines(manifest: &Manifest, target: &Target) -> Result<Vec<Str
         String::new(),
     ]);
     Ok(lines)
+}
+
+/// Checked metadata shared by the two registry templates.
+const fn storage_transform_lines() -> &'static [&'static str] {
+    &[
+        "/// Positive scaling between a display value and its stored integer.",
+        "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
+        "pub struct StorageTransform {",
+        "    input_unit: &'static str,",
+        "    numerator: u32,",
+        "    denominator: u32,",
+        "}",
+        "",
+        "impl StorageTransform {",
+        "    /// Construct positive scaling with a nonempty display unit.",
+        "    ///",
+        "    /// Returns `None` for an empty unit or either zero ratio term.",
+        "    #[must_use]",
+        "    pub const fn new(input_unit: &'static str, numerator: u32, denominator: u32) -> Option<Self> {",
+        "        if input_unit.is_empty() || numerator == 0 || denominator == 0 {",
+        "            return None;",
+        "        }",
+        "        Some(Self {",
+        "            input_unit,",
+        "            numerator,",
+        "            denominator,",
+        "        })",
+        "    }",
+        "",
+        "    /// Unit accepted by the documented transform.",
+        "    #[must_use]",
+        "    pub const fn input_unit(self) -> &'static str {",
+        "        self.input_unit",
+        "    }",
+        "",
+        "    /// Positive encoding multiplier before rounding.",
+        "    #[must_use]",
+        "    pub const fn numerator(self) -> u32 {",
+        "        self.numerator",
+        "    }",
+        "",
+        "    /// Positive encoding divisor before rounding.",
+        "    #[must_use]",
+        "    pub const fn denominator(self) -> u32 {",
+        "        self.denominator",
+        "    }",
+        "}",
+        "",
+    ]
 }
 
 /// Render the per-menu enum option constant blocks, filling `option_names`.
@@ -778,14 +836,9 @@ fn menu_field_entry_lines(
 /// or option domains, unrepresentable codec domains, and a rendered field count
 /// that disagrees with the manifest's summary.
 pub fn rust_text(manifest: &Manifest) -> Result<String> {
-    let target = match manifest.model.radio.as_str() {
-        "thd75" => &THD75_TARGET,
-        "tmd750" => &TMD750_TARGET,
-        other => {
-            return Err(extract_error!(
-                "Rust registry generation is defined for thd75 and tmd750; got {other}"
-            ));
-        }
+    let target = match manifest.model.radio {
+        crate::RadioModel::Thd75 => &THD75_TARGET,
+        crate::RadioModel::Tmd750 => &TMD750_TARGET,
     };
     let catalogs = enum_catalogs(manifest)?;
     let mut option_names: HashMap<String, String> = HashMap::new();
@@ -987,6 +1040,84 @@ mod tests {
     use super::*;
 
     type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn bit_field_coordinates_reject_overflow_before_shifting() -> TestResult {
+        let catalogs = HashMap::new();
+        for (bit, width) in [(u64::MAX, 1), (1, u64::MAX), (u64::MAX, u64::MAX)] {
+            let error = bit_field_codec_lines(bit, width, false, None, &catalogs, None)
+                .err()
+                .ok_or("out-of-byte coordinates were rendered as Rust")?;
+            assert_eq!(
+                error.to_string(),
+                format!("bit field exceeds one byte: bit={bit}, width={width}")
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fixed_string_padding_must_fit_one_byte() -> TestResult {
+        let catalogs = HashMap::new();
+        for padding in [256, u64::MAX] {
+            let codec = Codec::FixedString {
+                encoding: crate::TextEncoding::Utf8,
+                length: 1,
+                padding,
+                csharp_type: "string".to_owned(),
+                value_type: crate::ValueType::String,
+            };
+            let error = rust_codec(&codec, &catalogs, None)
+                .err()
+                .ok_or("out-of-byte padding was rendered as Rust")?;
+            assert_eq!(
+                error.to_string(),
+                format!("fixed string field padding exceeds one byte: {padding}")
+            );
+        }
+        let codec = Codec::FixedString {
+            encoding: crate::TextEncoding::Utf8,
+            length: 1,
+            padding: u64::from(u8::MAX),
+            csharp_type: "string".to_owned(),
+            value_type: crate::ValueType::String,
+        };
+        assert!(rust_codec(&codec, &catalogs, None)?.contains(&"    padding: 255,".to_owned()));
+        Ok(())
+    }
+
+    #[test]
+    fn zero_length_storage_is_rejected_before_rust_is_emitted() -> TestResult {
+        let catalogs = HashMap::new();
+        for (codec, message) in [
+            (
+                Codec::FixedString {
+                    encoding: crate::TextEncoding::Utf8,
+                    length: 0,
+                    padding: 0,
+                    csharp_type: "string".to_owned(),
+                    value_type: crate::ValueType::String,
+                },
+                "fixed string field length must be positive",
+            ),
+            (
+                Codec::RawBytes {
+                    csharp_type: Some("byte[]".to_owned()),
+                    value_type: crate::ValueType::Bytes,
+                    length: Some(0),
+                    encoding: None,
+                    value_expression: None,
+                },
+                "raw byte field length must be positive",
+            ),
+        ] {
+            let error = rust_codec(&codec, &catalogs, None)
+                .err()
+                .ok_or("zero-length storage was rendered as Rust")?;
+            assert_eq!(error.to_string(), message);
+        }
+        Ok(())
+    }
 
     #[test]
     fn constant_names_split_runs_humps_and_digits() {

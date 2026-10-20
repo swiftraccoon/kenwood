@@ -9,11 +9,11 @@
 
 use crate::manifest::{Domain, StorageTransform};
 
-mod thd75;
-mod tmd750;
-
 pub use thd75::THD75;
 pub use tmd750::TMD750;
+
+mod thd75;
+mod tmd750;
 
 /// One top-level menu serializer: spec key and public container property.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,7 +115,7 @@ pub struct ValueHelperSpec {
     /// Bytes the helper produces.
     pub length: u64,
     /// Manifest encoding tag (`ipv4_dotted_quad`).
-    pub encoding: &'static str,
+    pub encoding: crate::RawEncoding,
 }
 
 /// Counts pinned by review and checked by `--strict-known-layout`.
@@ -149,7 +149,7 @@ impl StorageTransformSpec {
     #[must_use]
     pub fn to_manifest(self) -> StorageTransform {
         StorageTransform {
-            kind: "scaled_integer".to_owned(),
+            kind: crate::TransformKind::ScaledInteger,
             input_unit: self.input_unit.to_owned(),
             encode: self.encode.to_owned(),
             decode: self.decode.to_owned(),
@@ -188,38 +188,62 @@ pub type RecordDomains = Vec<((&'static str, &'static str), Domain)>;
 #[derive(Debug, Clone, Copy)]
 pub struct ModelSpec {
     /// Spec id used by `--model`.
-    pub id: &'static str,
+    pub(crate) id: crate::RadioModel,
     /// Marketing name.
-    pub product: &'static str,
+    pub(crate) product: &'static str,
     /// Expected `AssemblyProduct`.
-    pub mcp_product: &'static str,
+    pub(crate) mcp_product: &'static str,
     /// Writer image length.
-    pub image_length: u64,
+    pub(crate) image_length: u64,
     /// Menus in manifest order.
-    pub menus: &'static [MenuSpec],
+    pub(crate) menus: &'static [MenuSpec],
     /// Index dimensions.
-    pub dimensions: &'static [DimensionSpec],
+    pub(crate) dimensions: &'static [DimensionSpec],
     /// Public record lists.
-    pub records: &'static [RecordSpec],
+    pub(crate) records: &'static [RecordSpec],
     /// Private sub-writers.
-    pub private_writers: &'static [PrivateWriterSpec],
+    pub(crate) private_writers: &'static [PrivateWriterSpec],
     /// Blob fields.
-    pub blobs: &'static [BlobSpec],
+    pub(crate) blobs: &'static [BlobSpec],
     /// Fixed-string padding overrides.
-    pub padding_overrides: &'static [PaddingOverride],
+    pub(crate) padding_overrides: &'static [PaddingOverride],
     /// Helper-wrapped raw-bytes values.
-    pub value_helpers: &'static [ValueHelperSpec],
+    pub(crate) value_helpers: &'static [ValueHelperSpec],
     /// Reviewed counts.
-    pub reviewed: ReviewedLayout,
+    pub(crate) reviewed: ReviewedLayout,
     /// Symbol tables per record class.
-    pub record_symbols: &'static [(&'static str, &'static [SymbolOverride])],
+    pub(crate) record_symbols: &'static [(&'static str, &'static [SymbolOverride])],
     /// Audited domains for direct fields keyed by `menu.Name`.
-    pub direct_domains: fn() -> DirectDomains,
+    pub(crate) direct_domains: fn() -> DirectDomains,
     /// Audited domains for record fields keyed by `(class, field)`.
-    pub record_domains: fn() -> RecordDomains,
+    pub(crate) record_domains: fn() -> RecordDomains,
 }
 
 impl ModelSpec {
+    /// Identifier used by the command-line model selector.
+    #[must_use]
+    pub const fn id(&self) -> crate::RadioModel {
+        self.id
+    }
+
+    /// Radio product name.
+    #[must_use]
+    pub const fn product(&self) -> &'static str {
+        self.product
+    }
+
+    /// Required product identity in the MCP assembly.
+    #[must_use]
+    pub const fn mcp_product(&self) -> &'static str {
+        self.mcp_product
+    }
+
+    /// Reviewed image length in bytes.
+    #[must_use]
+    pub const fn image_length(&self) -> u64 {
+        self.image_length
+    }
+
     /// Menu spec by key.
     #[must_use]
     pub fn menu(&self, key: &str) -> Option<&'static MenuSpec> {
@@ -315,16 +339,6 @@ impl ModelSpec {
     }
 }
 
-/// Look up a spec by its `--model` id.
-#[must_use]
-pub fn model_by_id(id: &str) -> Option<&'static ModelSpec> {
-    match id {
-        "thd75" => Some(&THD75),
-        "tmd750" => Some(&TMD750),
-        _ => None,
-    }
-}
-
 /// Build an inclusive range domain.
 #[must_use]
 pub fn range_domain(min: i64, max: i64, provenance: &str) -> Domain {
@@ -350,10 +364,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn looks_up_models_by_id() {
-        assert_eq!(model_by_id("thd75").map(|spec| spec.id), Some("thd75"));
-        assert_eq!(model_by_id("tmd750").map(|spec| spec.id), Some("tmd750"));
-        assert!(model_by_id("tm-d710").is_none());
+    fn looks_up_models_by_id() -> Result<(), Box<dyn std::error::Error>> {
+        for model in [crate::RadioModel::Thd75, crate::RadioModel::Tmd750] {
+            assert_eq!(
+                model
+                    .as_str()
+                    .parse::<crate::RadioModel>()?
+                    .specification()
+                    .id(),
+                model
+            );
+        }
+        assert!("tm-d710".parse::<crate::RadioModel>().is_err());
+        Ok(())
     }
 
     #[test]

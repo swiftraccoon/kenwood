@@ -10,7 +10,11 @@
 use serde::{Deserialize, Serialize};
 
 use crate::address::{Address, Term};
-use crate::error::{Result, extract_error};
+use crate::error::{ExtractError, Result};
+use crate::{
+    LanguageEncoding, RadioModel, RawEncoding, RecordLayout, SourceKind, TextEncoding,
+    TransformKind, ValueType,
+};
 
 /// Manifest format version emitted by this generator.
 pub const SCHEMA_VERSION: u64 = 4;
@@ -102,7 +106,7 @@ pub enum Codec {
         #[serde(skip_serializing_if = "Option::is_none")]
         csharp_type: Option<String>,
         /// Classified value type (`byte`, `enum`, `constant`, ...).
-        value_type: String,
+        value_type: ValueType,
         /// Literal expression for constant writes.
         #[serde(skip_serializing_if = "Option::is_none")]
         value_expression: Option<String>,
@@ -116,7 +120,7 @@ pub enum Codec {
         #[serde(skip_serializing_if = "Option::is_none")]
         csharp_type: Option<String>,
         /// Classified value type.
-        value_type: String,
+        value_type: ValueType,
         /// Literal expression for constant writes.
         #[serde(skip_serializing_if = "Option::is_none")]
         value_expression: Option<String>,
@@ -127,13 +131,13 @@ pub enum Codec {
         #[serde(skip_serializing_if = "Option::is_none")]
         csharp_type: Option<String>,
         /// Classified value type.
-        value_type: String,
+        value_type: ValueType,
         /// Byte count, inferred from a clear at the same offset or pinned by a value helper.
         #[serde(skip_serializing_if = "Option::is_none")]
         length: Option<u64>,
         /// Value encoding pinned by a value helper (`ipv4_dotted_quad`).
         #[serde(skip_serializing_if = "Option::is_none")]
-        encoding: Option<String>,
+        encoding: Option<RawEncoding>,
         /// Literal expression for constant writes.
         #[serde(skip_serializing_if = "Option::is_none")]
         value_expression: Option<String>,
@@ -148,7 +152,7 @@ pub enum Codec {
         #[serde(skip_serializing_if = "Option::is_none")]
         csharp_type: Option<String>,
         /// Classified value type.
-        value_type: String,
+        value_type: ValueType,
         /// Literal expression for constant writes.
         #[serde(skip_serializing_if = "Option::is_none")]
         value_expression: Option<String>,
@@ -163,7 +167,7 @@ pub enum Codec {
         /// Decompiled C# type of the written expression.
         csharp_type: String,
         /// Classified value type.
-        value_type: String,
+        value_type: ValueType,
         /// Qualified enum type when the value is enum-valued.
         #[serde(skip_serializing_if = "Option::is_none")]
         enum_type: Option<String>,
@@ -175,7 +179,7 @@ pub enum Codec {
         /// Decompiled C# type of the written expression.
         csharp_type: String,
         /// Classified value type.
-        value_type: String,
+        value_type: ValueType,
         /// Qualified enum type when the value is enum-valued.
         #[serde(skip_serializing_if = "Option::is_none")]
         enum_type: Option<String>,
@@ -183,7 +187,7 @@ pub enum Codec {
     /// A fixed-width padded string.
     FixedString {
         /// `memory_map` or `utf8`.
-        encoding: String,
+        encoding: TextEncoding,
         /// Reserved byte count.
         length: u64,
         /// Fill byte.
@@ -191,7 +195,7 @@ pub enum Codec {
         /// Decompiled C# type of the written expression.
         csharp_type: String,
         /// Classified value type.
-        value_type: String,
+        value_type: ValueType,
     },
     /// A range filled with `fill`.
     ClearRange {
@@ -220,7 +224,7 @@ impl Codec {
 
     /// The classified value type, or `None` for clears.
     #[must_use]
-    pub fn value_type(&self) -> Option<&str> {
+    pub const fn value_type(&self) -> Option<ValueType> {
         match self {
             Self::Byte { value_type, .. }
             | Self::Bool { value_type, .. }
@@ -228,7 +232,7 @@ impl Codec {
             | Self::BitField { value_type, .. }
             | Self::UnsignedLe { value_type, .. }
             | Self::SignedLe { value_type, .. }
-            | Self::FixedString { value_type, .. } => Some(value_type),
+            | Self::FixedString { value_type, .. } => Some(*value_type),
             Self::ClearRange { .. } => None,
         }
     }
@@ -300,7 +304,7 @@ pub enum Domain {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageTransform {
     /// Always `scaled_integer`.
-    pub kind: String,
+    pub kind: TransformKind,
     /// Display unit accepted by the transform.
     pub input_unit: String,
     /// Human-readable encode formula.
@@ -337,7 +341,7 @@ pub struct Operation {
     pub domain: Option<Domain>,
     /// `blob` for large persistent data.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub category: Option<String>,
+    pub category: Option<crate::FieldCategory>,
     /// `false` when sparse radio writes must reject the field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub writable: Option<bool>,
@@ -361,7 +365,7 @@ pub struct NestedSerializer {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OffsetLayout {
     /// Layout kind.
-    pub kind: String,
+    pub kind: RecordLayout,
     /// Slot-zero base of record 0.
     pub base: u64,
     /// Bytes between records, absent for `fixed`.
@@ -564,7 +568,7 @@ pub struct Menu {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelInfo {
     /// Spec id (`thd75`, `tmd750`).
-    pub radio: String,
+    pub radio: RadioModel,
     /// Marketing name.
     pub product: String,
     /// `AssemblyProduct` of the decompiled program.
@@ -623,14 +627,14 @@ pub struct LanguageFileInfo {
     /// SHA-256 of the raw file.
     pub sha256: String,
     /// Always `UTF-16`.
-    pub encoding: String,
+    pub encoding: LanguageEncoding,
 }
 
 /// Source provenance including discovered obfuscated anchors.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceInfo {
     /// Always `ILSpy C# project`.
-    pub kind: String,
+    pub kind: SourceKind,
     /// Digest over label-tagged, newline-normalized sources.
     pub normalized_source_sha256: String,
     /// Menu key to serializer class.
@@ -686,9 +690,11 @@ pub struct Summary {
     pub labeled_enum_option_count: u64,
     /// Members with a resource key.
     pub resource_enum_option_count: u64,
-    /// Combo-backed enum types.
+    /// Combo-backed enum types counted from source expressions. This provenance
+    /// counter cannot be recomputed from the retained menu catalogs alone.
     pub combo_enum_type_count: u64,
-    /// Combo option mappings.
+    /// Combo option mappings counted from source expressions, including mappings
+    /// outside retained enum catalogs. Validation preserves this provenance count.
     pub combo_option_mapping_count: u64,
     /// Declared dimensions.
     pub dimension_count: u64,
@@ -696,9 +702,9 @@ pub struct Summary {
     pub slot_relative_field_count: u64,
 }
 
-/// The complete v4 manifest.
+/// Deserializable v4 manifest candidate; call [`Self::validate`] before use.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Manifest {
+pub struct ManifestCandidate {
     /// Always [`SCHEMA_VERSION`].
     pub schema_version: u64,
     /// Generator crate name.
@@ -717,6 +723,156 @@ pub struct Manifest {
     pub menus: Vec<Menu>,
 }
 
+/// A v4 manifest with checked geometry, codecs, domains, catalogs and counts.
+///
+/// Parse JSON with [`Self::from_json`] or validate a [`ManifestCandidate`].
+/// Inspection borrows through the field accessors. Editing consumes
+/// [`Self::into_candidate`] and requires validation again before generation or comparison.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "ManifestCandidate")]
+pub struct Manifest {
+    pub(crate) schema_version: u64,
+    pub(crate) generator: String,
+    pub(crate) model: ModelInfo,
+    pub(crate) release: ReleaseInfo,
+    pub(crate) dimensions: Vec<Dimension>,
+    pub(crate) source: SourceInfo,
+    pub(crate) summary: Summary,
+    pub(crate) menus: Vec<Menu>,
+}
+
+impl ManifestCandidate {
+    /// Validate the complete manifest without normalizing names, offsets or counts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExtractError::InvalidInput`] for an inconsistent relationship,
+    /// unsupported schema/model, invalid codec or domain, or overflowing geometry.
+    pub fn validate(self) -> Result<Manifest> {
+        self.try_into()
+    }
+}
+
+impl TryFrom<ManifestCandidate> for Manifest {
+    type Error = ExtractError;
+
+    fn try_from(candidate: ManifestCandidate) -> Result<Self> {
+        crate::validation::manifest(&candidate)?;
+        Ok(Self {
+            schema_version: candidate.schema_version,
+            generator: candidate.generator,
+            model: candidate.model,
+            release: candidate.release,
+            dimensions: candidate.dimensions,
+            source: candidate.source,
+            summary: candidate.summary,
+            menus: candidate.menus,
+        })
+    }
+}
+
+impl Manifest {
+    /// Parse and validate a JSON manifest, retaining JSON line/column errors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExtractError::Json`] for invalid JSON and
+    /// [`ExtractError::InvalidInput`] for invalid manifest relationships.
+    pub fn from_json(text: &str) -> Result<Self> {
+        let candidate: ManifestCandidate =
+            serde_json::from_str(text).map_err(|source| ExtractError::Json {
+                operation: "parse",
+                source,
+            })?;
+        candidate.validate()
+    }
+
+    /// Serialize validated content in manifest key order with a trailing newline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExtractError::Json`] if JSON serialization fails.
+    pub fn to_json(&self) -> Result<String> {
+        json_text(self)
+    }
+
+    /// Return an independent candidate for editing; validation is required again.
+    #[must_use]
+    pub fn to_candidate(&self) -> ManifestCandidate {
+        self.clone().into_candidate()
+    }
+
+    /// Transfer the complete candidate without copying its retained allocations.
+    #[must_use]
+    pub fn into_candidate(self) -> ManifestCandidate {
+        ManifestCandidate {
+            schema_version: self.schema_version,
+            generator: self.generator,
+            model: self.model,
+            release: self.release,
+            dimensions: self.dimensions,
+            source: self.source,
+            summary: self.summary,
+            menus: self.menus,
+        }
+    }
+
+    /// Schema format version.
+    #[must_use]
+    pub const fn schema_version(&self) -> u64 {
+        self.schema_version
+    }
+
+    /// Generator identity.
+    #[must_use]
+    pub fn generator(&self) -> &str {
+        &self.generator
+    }
+
+    /// Radio identity and image geometry.
+    #[must_use]
+    pub const fn model(&self) -> &ModelInfo {
+        &self.model
+    }
+
+    /// Declared and extracted release identifiers.
+    #[must_use]
+    pub const fn release(&self) -> &ReleaseInfo {
+        &self.release
+    }
+
+    /// Declared dimensions in specification order.
+    #[must_use]
+    pub fn dimensions(&self) -> &[Dimension] {
+        &self.dimensions
+    }
+
+    /// Source provenance.
+    #[must_use]
+    pub const fn source(&self) -> &SourceInfo {
+        &self.source
+    }
+
+    /// Checked aggregate counts.
+    #[must_use]
+    pub const fn summary(&self) -> &Summary {
+        &self.summary
+    }
+
+    /// Menus in specification order.
+    #[must_use]
+    pub fn menus(&self) -> &[Menu] {
+        &self.menus
+    }
+}
+
+impl std::str::FromStr for Manifest {
+    type Err = ExtractError;
+    fn from_str(text: &str) -> Result<Self> {
+        Self::from_json(text)
+    }
+}
+
 /// Format an offset the way v3 did: `0x` plus at least four upper-case hex digits.
 #[must_use]
 pub fn offset_hex(offset: u64) -> String {
@@ -728,27 +884,12 @@ pub fn offset_hex(offset: u64) -> String {
 /// # Errors
 ///
 /// Returns an error when serialization fails.
-pub fn json_text(manifest: &Manifest) -> Result<String> {
-    let rendered = serde_json::to_string_pretty(manifest)
-        .map_err(|error| extract_error!("cannot serialize manifest: {error}"))?;
+fn json_text(manifest: &Manifest) -> Result<String> {
+    let rendered = serde_json::to_string_pretty(manifest).map_err(|source| ExtractError::Json {
+        operation: "serialize",
+        source,
+    })?;
     Ok(format!("{rendered}\n"))
-}
-
-/// Parse a v4 manifest.
-///
-/// # Errors
-///
-/// Returns an error when the text is not a v4 manifest.
-pub fn parse_manifest(text: &str) -> Result<Manifest> {
-    let manifest: Manifest = serde_json::from_str(text)
-        .map_err(|error| extract_error!("cannot parse manifest: {error}"))?;
-    if manifest.schema_version != SCHEMA_VERSION {
-        return Err(extract_error!(
-            "unsupported manifest schema_version {}; this tool reads version {SCHEMA_VERSION}",
-            manifest.schema_version
-        ));
-    }
-    Ok(manifest)
 }
 
 #[cfg(test)]
@@ -760,11 +901,11 @@ mod tests {
     #[test]
     fn codec_keys_follow_v3_order() -> TestResult {
         let codec = Codec::FixedString {
-            encoding: "utf8".to_owned(),
+            encoding: TextEncoding::Utf8,
             length: 3,
             padding: 0,
             csharp_type: "string".to_owned(),
-            value_type: "string".to_owned(),
+            value_type: ValueType::String,
         };
         assert_eq!(
             serde_json::to_string(&codec)?,
@@ -772,7 +913,7 @@ mod tests {
         );
         let constant = Codec::Byte {
             csharp_type: None,
-            value_type: "constant".to_owned(),
+            value_type: ValueType::Constant,
             value_expression: Some("(byte)0".to_owned()),
             enum_type: None,
         };
@@ -812,7 +953,7 @@ mod tests {
     #[test]
     fn ordered_maps_round_trip_in_document_order() -> TestResult {
         let source = SourceInfo {
-            kind: "ILSpy C# project".to_owned(),
+            kind: SourceKind::IlspyCsharpProject,
             normalized_source_sha256: "00".to_owned(),
             serializer_classes: vec![
                 ("radio".to_owned(), "m9".to_owned()),

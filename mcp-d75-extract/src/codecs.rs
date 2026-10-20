@@ -13,6 +13,7 @@ use crate::error::{Result, extract_error};
 use crate::manifest::{Codec, Role};
 use crate::model::ValueHelperSpec;
 use crate::sources::{ClassTypes, resolve_integer};
+use crate::{TextEncoding, ValueType};
 
 /// A classified direct write.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,7 +36,7 @@ pub(crate) struct ValueMeta {
     /// Declared C# type of that identifier.
     pub(crate) csharp_type: Option<String>,
     /// `bool`, `byte`, `bytes`, `string`, `int`, `uint`, `enum`, `constant`, or `unknown`.
-    pub(crate) value_type: String,
+    pub(crate) value_type: ValueType,
     /// Qualified `<declaring class>.<enum>` name when the value is an enum.
     pub(crate) enum_type: Option<String>,
     /// Trimmed source expression.
@@ -119,17 +120,18 @@ pub(crate) fn value_metadata(
         .and_then(|kind| types.enums.get(kind))
         .cloned();
     let value_type = if cast.as_deref() == Some("byte") && identifier.is_none() {
-        "constant".to_owned()
+        ValueType::Constant
     } else {
         match csharp_type.as_deref() {
-            Some("bool") => "bool".to_owned(),
-            Some("byte") => "byte".to_owned(),
-            Some("byte[]") => "bytes".to_owned(),
-            Some("string") => "string".to_owned(),
-            Some(kind @ ("int" | "uint")) => kind.to_owned(),
-            Some(_) if enum_type.is_some() => "enum".to_owned(),
-            _ if identifier.is_none() => "constant".to_owned(),
-            _ => "unknown".to_owned(),
+            Some("bool") => ValueType::Bool,
+            Some("byte") => ValueType::Byte,
+            Some("byte[]") => ValueType::Bytes,
+            Some("string") => ValueType::String,
+            Some("int") => ValueType::Int,
+            Some("uint") => ValueType::Uint,
+            Some(_) if enum_type.is_some() => ValueType::Enum,
+            _ if identifier.is_none() => ValueType::Constant,
+            _ => ValueType::Unknown,
         }
     };
     ValueMeta {
@@ -200,14 +202,18 @@ fn classify_string(
     let role = value_role(meta.identifier.as_deref(), types);
     Ok(Classified {
         codec: Codec::FixedString {
-            encoding: if method == "c" { "memory_map" } else { "utf8" }.to_owned(),
+            encoding: if method == "c" {
+                TextEncoding::MemoryMap
+            } else {
+                TextEncoding::Utf8
+            },
             length,
             padding: 0,
             csharp_type: meta
                 .csharp_type
                 .clone()
                 .unwrap_or_else(|| "string".to_owned()),
-            value_type: meta.value_type.clone(),
+            value_type: meta.value_type,
         },
         name: meta.identifier,
         role,
@@ -240,14 +246,14 @@ fn classify_signed(
         Codec::SignedLe {
             width,
             csharp_type,
-            value_type: meta.value_type.clone(),
+            value_type: meta.value_type,
             enum_type: meta.enum_type.clone(),
         }
     } else {
         Codec::UnsignedLe {
             width,
             csharp_type,
-            value_type: meta.value_type.clone(),
+            value_type: meta.value_type,
             enum_type: meta.enum_type.clone(),
         }
     };
@@ -288,28 +294,28 @@ fn classify_two_arg_a(
     let codec = if let Some(helper) = meta.helper {
         Codec::RawBytes {
             csharp_type: meta.csharp_type.clone(),
-            value_type: meta.value_type.clone(),
+            value_type: meta.value_type,
             length: Some(helper.length),
-            encoding: Some(helper.encoding.to_owned()),
+            encoding: Some(helper.encoding),
             value_expression,
         }
     } else {
-        match meta.value_type.as_str() {
-            "bytes" => Codec::RawBytes {
+        match meta.value_type {
+            ValueType::Bytes => Codec::RawBytes {
                 csharp_type: meta.csharp_type.clone(),
-                value_type: meta.value_type.clone(),
+                value_type: meta.value_type,
                 length: None,
                 encoding: None,
                 value_expression,
             },
-            "bool" => Codec::Bool {
+            ValueType::Bool => Codec::Bool {
                 csharp_type: meta.csharp_type.clone(),
-                value_type: meta.value_type.clone(),
+                value_type: meta.value_type,
                 value_expression,
             },
             _ => Codec::Byte {
                 csharp_type: meta.csharp_type.clone(),
-                value_type: meta.value_type.clone(),
+                value_type: meta.value_type,
                 value_expression,
                 enum_type: meta.enum_type.clone(),
             },
@@ -345,7 +351,7 @@ fn classify_three_arg_a(
         Codec::UnsignedLe {
             width: middle,
             csharp_type: "uint".to_owned(),
-            value_type: meta.value_type.clone(),
+            value_type: meta.value_type,
             enum_type: meta.enum_type.clone(),
         }
     } else {
@@ -353,7 +359,7 @@ fn classify_three_arg_a(
             bit: middle,
             width: 1,
             csharp_type: meta.csharp_type.clone(),
-            value_type: meta.value_type.clone(),
+            value_type: meta.value_type,
             value_expression,
             enum_type: meta.enum_type.clone(),
         }
@@ -388,7 +394,7 @@ fn classify_four_arg_a(
             bit,
             width,
             csharp_type: meta.csharp_type.clone(),
-            value_type: meta.value_type.clone(),
+            value_type: meta.value_type,
             value_expression,
             enum_type: meta.enum_type.clone(),
         },
@@ -425,6 +431,7 @@ pub(crate) fn classify_call(
 mod tests {
 
     use super::*;
+    use crate::RawEncoding;
     use crate::csharp::split_arguments;
 
     type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
@@ -432,7 +439,7 @@ mod tests {
     static IPV4: [ValueHelperSpec; 1] = [ValueHelperSpec {
         property: "IpAddress",
         length: 4,
-        encoding: "ipv4_dotted_quad",
+        encoding: RawEncoding::Ipv4DottedQuad,
     }];
 
     fn types() -> ClassTypes {
@@ -476,7 +483,7 @@ mod tests {
     fn classifies_the_writer_overloads() -> TestResult {
         let enum_write = classify("a((byte)BeatShift, 4096)")?;
         assert_eq!(enum_write.role, Role::Field);
-        assert_eq!(enum_write.codec.value_type(), Some("enum"));
+        assert_eq!(enum_write.codec.value_type(), Some(ValueType::Enum));
         assert_eq!(enum_write.codec.enum_type(), Some("m9.a"));
         assert_eq!(enum_write.offset_expression, "4096");
         let bit = classify("a(Convert.ToByte(TxInhibit), 0, 4136)")?;
@@ -540,7 +547,14 @@ mod tests {
         assert_eq!(helper.name.as_deref(), Some("IpAddress"));
         assert_eq!(helper.role, Role::Field);
         assert!(
-            matches!(&helper.codec, Codec::RawBytes { length: Some(4), encoding: Some(encoding), .. } if encoding == "ipv4_dotted_quad"),
+            matches!(
+                &helper.codec,
+                Codec::RawBytes {
+                    length: Some(4),
+                    encoding: Some(RawEncoding::Ipv4DottedQuad),
+                    ..
+                }
+            ),
             "{helper:?}"
         );
         Ok(())

@@ -265,8 +265,10 @@ pub(crate) fn child_writer(
         regex::escape(method),
         regex::escape(writer_class)
     );
-    let (body, line) = find_balanced_body(&class.own_text, &signature_pattern)
-        .map_err(|error| extract_error!("{error} in class {}", class.name))?;
+    let (body, line) =
+        find_balanced_body(&class.own_text, &signature_pattern).map_err(|error| {
+            crate::ExtractError::source(format!("find child writer in class {}", class.name), error)
+        })?;
     Ok(MethodRef {
         class: class.name.clone(),
         method: method.to_owned(),
@@ -332,13 +334,17 @@ pub(crate) fn setter_symbol(
 ) -> Result<Option<String>> {
     let property_pattern = format!(r"^\s*public\s+int\s+{}\s*$", regex::escape(property));
     let header = regex::Regex::new(&format!("(?m){property_pattern}"))
-        .map_err(|error| extract_error!("property pattern failed to compile: {error}"))?;
+        .map_err(|error| crate::ExtractError::source("compile property pattern", error))?;
     if !header.is_match(&class.own_text) {
         return Ok(None);
     }
     let (body, _) = find_balanced_body(&class.own_text, &property_pattern)?;
-    let (setter, _) = find_balanced_body(&body, r"^\s*set\s*$")
-        .map_err(|_| extract_error!("property {property} in {} has no setter", class.name))?;
+    let (setter, _) = find_balanced_body(&body, r"^\s*set\s*$").map_err(|error| {
+        crate::ExtractError::source(
+            format!("find setter for property {property} in {}", class.name),
+            error,
+        )
+    })?;
     let assigned: Vec<String> = patterns
         .setter_assign_re
         .captures_iter(&setter)
@@ -387,7 +393,7 @@ pub(crate) fn verify_anchor_assignment(
         regex::escape(list_field),
         regex::escape(anchor)
     ))
-    .map_err(|error| extract_error!("anchor assignment pattern failed to compile: {error}"))?;
+    .map_err(|error| crate::ExtractError::source("compile anchor-assignment pattern", error))?;
     for capture in pattern.captures_iter(&owner.own_text) {
         let index = capture.get(1).map(|m| m.as_str());
         let multiplier = capture.get(3).map(|m| m.as_str());
@@ -421,7 +427,7 @@ pub(crate) fn verify_anchor_passthrough(
         regex::escape(anchor),
         regex::escape(owner_symbol)
     ))
-    .map_err(|error| extract_error!("anchor passthrough pattern failed to compile: {error}"))?;
+    .map_err(|error| crate::ExtractError::source("compile anchor-passthrough pattern", error))?;
     if pattern.is_match(&owner.own_text) {
         Ok(())
     } else {
@@ -439,7 +445,7 @@ pub(crate) fn find_base_override(owner: &ClassInfo, target: &str, property: &str
         regex::escape(target),
         regex::escape(property)
     ))
-    .map_err(|error| extract_error!("base override pattern failed to compile: {error}"))?;
+    .map_err(|error| crate::ExtractError::source("compile base-override pattern", error))?;
     let values: BTreeSet<u64> = pattern
         .captures_iter(&owner.own_text)
         .filter_map(|capture| capture.get(1)?.as_str().parse().ok())
@@ -570,7 +576,7 @@ fn find_serializer(index: &ClassIndex, property: &str) -> Result<(String, String
         r"(?m)^\s*public\s+([@\w]+)\s+{}\s*$",
         regex::escape(property)
     ))
-    .map_err(|error| extract_error!("menu property pattern failed to compile: {error}"))?;
+    .map_err(|error| crate::ExtractError::source("compile menu-property pattern", error))?;
     let mut hits: Vec<(String, String)> = Vec::new();
     for class in index.iter() {
         for capture in pattern.captures_iter(&class.own_text) {

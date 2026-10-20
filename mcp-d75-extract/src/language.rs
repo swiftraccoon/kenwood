@@ -37,28 +37,28 @@ impl ResourcePatterns {
         let escaped = regex::escape(resource_class);
         Ok(Self {
             key: regex::Regex::new(&format!(r"\b{escaped}\.Instance\.([@\w]+)")).map_err(
-                |error| extract_error!("resource key pattern failed to compile: {error}"),
+                |error| crate::ExtractError::source("compile resource-key pattern", error),
             )?,
             format: regex::Regex::new(&format!(
                 r"(?s)^string\.Format\(\s*{escaped}\.Instance\.([@\w]+)\s*,\s*(.*)\)$"
             ))
-            .map_err(|error| extract_error!("format label pattern failed to compile: {error}"))?,
+            .map_err(|error| crate::ExtractError::source("compile format-label pattern", error))?,
             access_key_prefix: format!("{resource_class}.a("),
         })
     }
 }
 
 fn decode_utf16(raw: &[u8], path: &Path) -> Result<String> {
-    let invalid = || {
-        extract_error!(
+    let invalid = || crate::ExtractError::InvalidInput {
+        message: format!(
             "language file is not valid BOM-marked UTF-16: {}",
             path.display()
-        )
+        ),
     };
     let (payload, big_endian) = match raw {
         [0xFF, 0xFE, rest @ ..] => (rest, false),
         [0xFE, 0xFF, rest @ ..] => (rest, true),
-        _ => (raw, false),
+        _ => return Err(invalid()),
     };
     if payload.len() % 2 != 0 {
         return Err(invalid());
@@ -75,7 +75,12 @@ fn decode_utf16(raw: &[u8], path: &Path) -> Result<String> {
             }
         })
         .collect();
-    String::from_utf16(&units).map_err(|_| invalid())
+    String::from_utf16(&units).map_err(|error| {
+        crate::ExtractError::source(
+            format!("decode UTF-16 language file {}", path.display()),
+            error,
+        )
+    })
 }
 
 /// Split text on `\r\n`, `\r`, and `\n` line boundaries.
@@ -117,7 +122,7 @@ pub(crate) fn parse_language_file(
         return Ok((HashMap::new(), None));
     };
     let raw = std::fs::read(path)
-        .map_err(|error| extract_error!("cannot read language file {}: {error}", path.display()))?;
+        .map_err(|error| crate::ExtractError::io("read language file", path, error))?;
     let text = decode_utf16(&raw, path)?;
     let mut sections: LanguageSections = HashMap::new();
     let mut current: Option<String> = None;
@@ -153,7 +158,7 @@ pub(crate) fn parse_language_file(
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default(),
         sha256: format!("{:x}", Sha256::digest(&raw)),
-        encoding: "UTF-16".to_owned(),
+        encoding: crate::LanguageEncoding::Utf16,
     };
     Ok((sections, Some(info)))
 }
@@ -280,7 +285,7 @@ pub(crate) fn parse_combo_options(
     let entry_pattern = regex::Regex::new(&format!(
         r"(?s)Value\s*=\s*({class_pattern})\.([@\w]+)\.([@\w]+)\s*,\s*DisplayMember\s*=\s*(.*?)\s*\n\s*\}}"
     ))
-    .map_err(|error| extract_error!("combo entry pattern failed to compile: {error}"))?;
+    .map_err(|error| crate::ExtractError::source("compile combo-entry pattern", error))?;
     let mut options: ComboOptions = HashMap::new();
     for (path, source) in sources {
         for capture in entry_pattern.captures_iter(source) {
@@ -326,6 +331,26 @@ mod tests {
     use super::*;
 
     type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn utf16_requires_bom_and_complete_valid_code_units() -> TestResult {
+        let path = Path::new("language.lng");
+        assert_eq!(decode_utf16(&[0xff, 0xfe, b'A', 0], path)?, "A");
+        assert_eq!(decode_utf16(&[0xfe, 0xff, 0, b'A'], path)?, "A");
+        for invalid in [b"A\0".as_slice(), &[0xff, 0xfe, b'A']] {
+            assert!(matches!(
+                decode_utf16(invalid, path),
+                Err(crate::ExtractError::InvalidInput { .. })
+            ));
+        }
+        let result = decode_utf16(&[0xff, 0xfe, 0, 0xd8], path);
+        let Err(error) = result else {
+            return Err("accepted an unpaired UTF-16 surrogate".into());
+        };
+        assert!(std::error::Error::source(&error).is_some());
+        assert!(matches!(error, crate::ExtractError::Source { .. }));
+        Ok(())
+    }
 
     #[test]
     fn combo_join_uses_the_discovered_resource_class() -> TestResult {

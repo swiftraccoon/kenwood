@@ -11,8 +11,8 @@ use thiserror as _;
 use std::path::{Path, PathBuf};
 
 use mcp_d75_extract::{
-    BuildOptions, Codec, Manifest, Menu, Operation, RecordEntry, Role, SCHEMA_VERSION, THD75,
-    build_manifest, json_text, main_with_args, parse_manifest, write_or_check,
+    BuildOptions, Codec, Manifest, Menu, Operation, OutputMode, RecordEntry, Role, SCHEMA_VERSION,
+    THD75, build_manifest, main_with_args, write_output,
 };
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -21,18 +21,12 @@ fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/thd75")
 }
 
-fn options() -> BuildOptions {
-    BuildOptions {
-        model: &THD75,
-        mcp_version: "1.03".to_owned(),
-        firmware_target: "1.03".to_owned(),
-        language_file: None,
-        strict_known_layout: false,
-    }
+fn options() -> Result<BuildOptions, Box<dyn std::error::Error>> {
+    Ok(BuildOptions::new(&THD75, "1.03", "1.03")?)
 }
 
 fn fixture_manifest() -> Result<Manifest, Box<dyn std::error::Error>> {
-    Ok(build_manifest(&fixtures_dir(), &options())?)
+    Ok(build_manifest(&fixtures_dir(), &options()?)?)
 }
 
 /// Rewrite text with CRLF line endings, whatever endings it has now (a
@@ -67,14 +61,14 @@ fn crlf_sources_extract_identically() -> TestResult {
         sample.windows(2).any(|pair| pair == b"\r\n"),
         "the CRLF copy must actually contain CRLF"
     );
-    let crlf = build_manifest(temporary.path(), &options())?;
+    let crlf = build_manifest(temporary.path(), &options()?)?;
     assert_eq!(crlf, fixture_manifest()?);
     Ok(())
 }
 
 fn menu<'a>(manifest: &'a Manifest, key: &str) -> Result<&'a Menu, Box<dyn std::error::Error>> {
     manifest
-        .menus
+        .menus()
         .iter()
         .find(|menu| menu.menu == key)
         .ok_or_else(|| format!("menu {key} missing").into())
@@ -85,7 +79,7 @@ fn operation<'a>(
     name: &str,
 ) -> Result<&'a Operation, Box<dyn std::error::Error>> {
     manifest
-        .menus
+        .menus()
         .iter()
         .flat_map(|menu| menu.operations.iter())
         .find(|operation| operation.name.as_deref() == Some(name))
@@ -96,7 +90,7 @@ fn operation<'a>(
 fn discovers_anchors_without_pinned_names() -> TestResult {
     let manifest = fixture_manifest()?;
     assert_eq!(
-        manifest.source.serializer_classes,
+        manifest.source().serializer_classes,
         vec![
             ("radio".to_owned(), "m9".to_owned()),
             ("gps".to_owned(), "m1".to_owned()),
@@ -104,34 +98,34 @@ fn discovers_anchors_without_pinned_names() -> TestResult {
             ("dv".to_owned(), "mu".to_owned()),
         ]
     );
-    assert_eq!(manifest.source.writer_class, "m6");
-    assert_eq!(manifest.source.resource_class, "kb");
+    assert_eq!(manifest.source().writer_class, "m6");
+    assert_eq!(manifest.source().resource_class, "kb");
     assert_eq!(
         manifest
-            .source
+            .source()
             .write_methods
             .first()
             .map(|(_, method)| method.method.as_str()),
         Some("a0")
     );
-    assert!(manifest.source.detail_classes.is_empty());
+    assert!(manifest.source().detail_classes.is_empty());
     Ok(())
 }
 
 #[test]
 fn manifest_is_a_v4_superset_with_absolute_addresses() -> TestResult {
     let manifest = fixture_manifest()?;
-    assert_eq!(manifest.schema_version, SCHEMA_VERSION);
-    assert_eq!(manifest.generator, "mcp-d75-extract");
-    assert_eq!(manifest.model.radio, "thd75");
-    assert_eq!(manifest.model.image_length, 500_480);
-    assert_eq!(manifest.release.assembly_version, "1.0.8717.20367");
-    assert_eq!(manifest.release.mcp_version, "1.03");
-    assert!(manifest.dimensions.is_empty());
-    assert_eq!(manifest.summary.dimension_count, 0);
-    assert_eq!(manifest.summary.slot_relative_field_count, 0);
+    assert_eq!(manifest.schema_version(), SCHEMA_VERSION);
+    assert_eq!(manifest.generator(), "mcp-d75-extract");
+    assert_eq!(manifest.model().radio, mcp_d75_extract::RadioModel::Thd75);
+    assert_eq!(manifest.model().image_length, 500_480);
+    assert_eq!(manifest.release().assembly_version, "1.0.8717.20367");
+    assert_eq!(manifest.release().mcp_version, "1.03");
+    assert!(manifest.dimensions().is_empty());
+    assert_eq!(manifest.summary().dimension_count, 0);
+    assert_eq!(manifest.summary().slot_relative_field_count, 0);
     for operation in manifest
-        .menus
+        .menus()
         .iter()
         .flat_map(|menu| menu.operations.iter())
     {
@@ -142,8 +136,12 @@ fn manifest_is_a_v4_superset_with_absolute_addresses() -> TestResult {
     let radio = menu(&manifest, "radio")?;
     assert_eq!(radio.write_method, "a0(m6 A_0)");
     assert!(radio.detail_class.is_none());
-    let json = json_text(&manifest)?;
-    assert_eq!(parse_manifest(&json)?, manifest, "manifest must round-trip");
+    let json = manifest.to_json()?;
+    assert_eq!(
+        Manifest::from_json(&json)?,
+        manifest,
+        "manifest must round-trip"
+    );
     Ok(())
 }
 
@@ -152,7 +150,10 @@ fn extracts_supported_codecs_and_resolves_lengths() -> TestResult {
     let manifest = fixture_manifest()?;
     let beat_shift = operation(&manifest, "BeatShift")?;
     assert_eq!(beat_shift.offset_hex, "0x1000");
-    assert_eq!(beat_shift.codec.value_type(), Some("enum"));
+    assert_eq!(
+        beat_shift.codec.value_type(),
+        Some(mcp_d75_extract::ValueType::Enum)
+    );
     assert_eq!(beat_shift.codec.enum_type(), Some("m9.a"));
     assert_eq!(operation(&manifest, "TxInhibit")?.codec.kind(), "bool");
     assert_eq!(
@@ -161,14 +162,18 @@ fn extracts_supported_codecs_and_resolves_lengths() -> TestResult {
             bit: 0,
             width: 1,
             csharp_type: Some("bool".to_owned()),
-            value_type: "bool".to_owned(),
+            value_type: mcp_d75_extract::ValueType::Bool,
             value_expression: None,
             enum_type: None,
         }
     );
     assert!(matches!(
         operation(&manifest, "PowerOnMessage")?.codec,
-        Codec::FixedString { length: 16, ref encoding, .. } if encoding == "memory_map"
+        Codec::FixedString {
+            length: 16,
+            encoding: mcp_d75_extract::TextEncoding::MemoryMap,
+            ..
+        }
     ));
     let poweron = operation(&manifest, "PoweronBitmap")?;
     assert!(
@@ -181,14 +186,17 @@ fn extracts_supported_codecs_and_resolves_lengths() -> TestResult {
         ),
         "{poweron:?}"
     );
-    assert_eq!(poweron.category.as_deref(), Some("blob"));
+    assert_eq!(poweron.category, Some(mcp_d75_extract::FieldCategory::Blob));
     assert_eq!(
         operation(&manifest, "Interval")?.codec.kind(),
         "unsigned_le"
     );
     assert!(matches!(
         operation(&manifest, "MyCallsign")?.codec,
-        Codec::FixedString { ref encoding, .. } if encoding == "utf8"
+        Codec::FixedString {
+            encoding: mcp_d75_extract::TextEncoding::Utf8,
+            ..
+        }
     ));
     assert_eq!(
         operation(&manifest, "Sequence")?.codec.kind(),
@@ -240,10 +248,7 @@ fn resolves_utf16_english_labels_and_formats_arguments() -> TestResult {
     std::fs::write(&language_file, encoded)?;
     let manifest = build_manifest(
         &fixtures_dir(),
-        &BuildOptions {
-            language_file: Some(language_file),
-            ..options()
-        },
+        &options()?.with_language_file(language_file),
     )?;
     let radio = menu(&manifest, "radio")?;
     let catalog = radio
@@ -259,7 +264,7 @@ fn resolves_utf16_english_labels_and_formats_arguments() -> TestResult {
     assert_eq!(labels, vec![Some("Off"), Some("Choice 1")]);
     assert_eq!(
         manifest
-            .source
+            .source()
             .language_file
             .as_ref()
             .map(|info| info.file_name.as_str()),
@@ -342,22 +347,22 @@ fn extracts_the_position_record_list() -> TestResult {
         Some(60)
     );
     assert!(encoded.address.is_absolute());
-    assert_eq!(manifest.summary.expanded_record_field_count, 55);
-    assert_eq!(manifest.summary.repeated_record_type_count, 1);
-    assert_eq!(manifest.summary.unsupported_public_record_type_count, 2);
-    assert_eq!(manifest.summary.nested_serializer_call_count, 4);
+    assert_eq!(manifest.summary().expanded_record_field_count, 55);
+    assert_eq!(manifest.summary().repeated_record_type_count, 1);
+    assert_eq!(manifest.summary().unsupported_public_record_type_count, 2);
+    assert_eq!(manifest.summary().nested_serializer_call_count, 4);
     Ok(())
 }
 
 #[test]
 fn output_is_deterministic_and_checkable() -> TestResult {
-    let first = json_text(&fixture_manifest()?)?;
-    let second = json_text(&fixture_manifest()?)?;
+    let first = fixture_manifest()?.to_json()?;
+    let second = fixture_manifest()?.to_json()?;
     assert_eq!(first, second);
     let temporary = tempfile::tempdir()?;
     let output = temporary.path().join("schema.json");
-    write_or_check(&output, &first, false)?;
-    write_or_check(&output, &second, true)?;
+    write_output(&output, &first, OutputMode::Replace)?;
+    write_output(&output, &second, OutputMode::Check)?;
     Ok(())
 }
 
@@ -413,13 +418,7 @@ fn cli_extracts_checks_and_rejects_stale_output() -> TestResult {
 
 #[test]
 fn strict_known_layout_rejects_fixture() -> TestResult {
-    let result = build_manifest(
-        &fixtures_dir(),
-        &BuildOptions {
-            strict_known_layout: true,
-            ..options()
-        },
-    );
+    let result = build_manifest(&fixtures_dir(), &options()?.with_strict_known_layout(true));
     let Err(error) = result else {
         return Err("strict known layout unexpectedly accepted the fixture".into());
     };
@@ -432,15 +431,38 @@ fn strict_known_layout_rejects_fixture() -> TestResult {
 }
 
 #[test]
+fn generated_registry_already_matches_pinned_rustfmt() -> TestResult {
+    let manifest = fixture_manifest()?;
+    let temporary = tempfile::tempdir()?;
+    let output = temporary.path().join("menu_fields.rs");
+    std::fs::write(&output, mcp_d75_extract::rust_text(&manifest)?)?;
+    let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("../rustfmt.toml");
+    let result = std::process::Command::new("rustfmt")
+        .arg("--check")
+        .arg("--config-path")
+        .arg(config)
+        .arg(output)
+        .output()?;
+    assert!(
+        result.status.success(),
+        "generated registry requires reformatting: {}{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    Ok(())
+}
+
+#[test]
 fn rust_registry_is_deterministic_and_checked_by_cli() -> TestResult {
     let manifest = fixture_manifest()?;
     let first = mcp_d75_extract::rust_text(&manifest)?;
     assert_eq!(first, mcp_d75_extract::rust_text(&fixture_manifest()?)?);
     let rendered = u64::try_from(first.matches("    MenuField {").count())?;
-    assert_eq!(rendered, manifest.summary.writable_registry_field_count);
+    assert_eq!(rendered, manifest.summary().writable_registry_field_count);
     assert!(first.contains("pub const MCP_D75_SCHEMA_VERSION: u32 = 4;"));
     assert!(first.contains("FieldDescriptor::new(\n            \"radio.BeatShift\","));
-    assert!(first.contains("FieldCodec::BitBool {"));
+    assert!(first.contains("const fn field_codec(spec: CodecSpec) -> FieldCodec {"));
+    assert!(first.contains("field_codec(CodecSpec::BitBool {"));
     assert!(first.contains("resource_key: Some(\"Edit_Menu_TestBeatShift_Off\")"));
     assert!(first.contains("MyPositionList[4].LongitudeSecondEncoded"));
     let temporary = tempfile::tempdir()?;

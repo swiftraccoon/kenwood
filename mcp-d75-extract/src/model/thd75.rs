@@ -239,7 +239,7 @@ fn record_domains() -> Vec<((&'static str, &'static str), Domain)> {
 
 /// The TH-D75 spec.
 pub static THD75: ModelSpec = ModelSpec {
-    id: "thd75",
+    id: crate::RadioModel::Thd75,
     product: "TH-D75",
     mcp_product: "MCP-D75 Memory Control Program",
     image_length: 500_480,

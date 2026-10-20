@@ -93,11 +93,10 @@ fn record_offset_argument(method: &str, arguments: &[String]) -> Result<usize> {
 fn layout_from(base: &RecordBase) -> OffsetLayout {
     OffsetLayout {
         kind: if base.overrides.is_empty() {
-            "linear"
+            crate::RecordLayout::Linear
         } else {
-            "linear_with_override"
-        }
-        .to_owned(),
+            crate::RecordLayout::LinearWithOverride
+        },
         base: base.base,
         stride: Some(base.stride),
         overrides: base
@@ -193,7 +192,7 @@ fn record_field(
         &[],
         context.scope.spec.value_helpers,
     )?;
-    if classified.codec.value_type() == Some("unknown") {
+    if classified.codec.value_type() == Some(crate::ValueType::Unknown) {
         return Err(extract_error!(
             "{}: the value of A_0.{writer}({argument_text}) is neither a typed member nor a spec'd record symbol",
             context.record_class.name
@@ -531,7 +530,7 @@ pub(crate) fn catalog_private(
         }
         let terms = verify_fixed_base(scope, target, &write, &slots, spec.base)?;
         OffsetLayout {
-            kind: "fixed".to_owned(),
+            kind: crate::RecordLayout::Fixed,
             base: spec.base,
             stride: None,
             overrides: Vec::new(),
@@ -673,7 +672,7 @@ mod tests {
         let pair_class = index.get("m9.a4").ok_or("m9.a4 missing")?;
         let pair = catalog_private(&scope, &owner, pair_spec, pair_class, &pair_refs)?;
         assert_eq!(pair.name, "private_pair_848");
-        assert_eq!(pair.offset_layout.kind, "linear");
+        assert_eq!(pair.offset_layout.kind, crate::RecordLayout::Linear);
         assert_eq!(pair.offset_layout.stride, Some(16));
         let blob_call = NestedCall {
             target: "this.m_c".to_owned(),
@@ -683,7 +682,7 @@ mod tests {
         let blob_spec = THD75.private_writers.get(1).ok_or("no blob spec")?;
         let blob_class = index.get("m9.a5").ok_or("m9.a5 missing")?;
         let blob = catalog_private(&scope, &owner, blob_spec, blob_class, &[&blob_call])?;
-        assert_eq!(blob.offset_layout.kind, "fixed");
+        assert_eq!(blob.offset_layout.kind, crate::RecordLayout::Fixed);
         assert_eq!(blob.offset_layout.base, 880);
         Ok(())
     }

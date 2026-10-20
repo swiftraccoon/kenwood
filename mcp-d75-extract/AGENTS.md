@@ -21,11 +21,11 @@ cargo run -q -p mcp-d75-extract -- extract --model tmd750 \
 
 ## Non-negotiables
 
-- **The TH-D75 registry is the regression proof.** Regenerating
-  `thd75/src/memory/menu_fields.rs` from the real MCP-D75 assembly must
-  reproduce the committed file byte for byte; only a deliberate bump changes
-  `MCP_D75_SCHEMA_VERSION`. Any other changed byte is an extractor defect, and
-  no generated output is ever hand-edited.
+- **Both registries are reproducible.** Unchanged inputs and generator templates
+  reproduce the committed output byte for byte. A deliberate Rust API template
+  change regenerates both registries and states the resulting behavior in its
+  commit. Change `MCP_D75_SCHEMA_VERSION` when the persisted JSON schema changes,
+  rather than for Rust API encapsulation alone. Never hand-edit generated output.
 - **Both manifests and both registries are gated.** Both commands above,
   `--rust-output` included, must pass before any commit touching this crate.
   Regenerate deliberately and say why in the commit.

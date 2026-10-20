@@ -195,7 +195,7 @@ fn record_domains() -> RecordDomains {
 
 /// The TM-D750 spec.
 pub static TMD750: ModelSpec = ModelSpec {
-    id: "tmd750",
+    id: crate::RadioModel::Tmd750,
     product: "TM-D750",
     mcp_product: "MCP-D750 Memory Control Program",
     image_length: 1_929_472,
@@ -352,27 +352,27 @@ pub static TMD750: ModelSpec = ModelSpec {
         ValueHelperSpec {
             property: "IpAddress",
             length: 4,
-            encoding: "ipv4_dotted_quad",
+            encoding: crate::RawEncoding::Ipv4DottedQuad,
         },
         ValueHelperSpec {
             property: "SubnetMask",
             length: 4,
-            encoding: "ipv4_dotted_quad",
+            encoding: crate::RawEncoding::Ipv4DottedQuad,
         },
         ValueHelperSpec {
             property: "DefaultGateway",
             length: 4,
-            encoding: "ipv4_dotted_quad",
+            encoding: crate::RawEncoding::Ipv4DottedQuad,
         },
         ValueHelperSpec {
             property: "PrimaryDnsServer",
             length: 4,
-            encoding: "ipv4_dotted_quad",
+            encoding: crate::RawEncoding::Ipv4DottedQuad,
         },
         ValueHelperSpec {
             property: "SecondaryDnsServer",
             length: 4,
-            encoding: "ipv4_dotted_quad",
+            encoding: crate::RawEncoding::Ipv4DottedQuad,
         },
     ],
     reviewed: ReviewedLayout {

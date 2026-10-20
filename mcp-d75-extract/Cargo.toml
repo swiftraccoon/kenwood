@@ -1,15 +1,16 @@
 [package]
 name = "mcp-d75-extract"
 version = "0.1.0"
-edition = "2024"
-rust-version = "1.94"
-description = "MCP memory-map extractor for the TH-D75 and TM-D750: turns ILSpy-decompiled serializer writes into JSON manifests, the TH-D75 Rust menu-field registry, and firmware-release diffs"
-license = "GPL-2.0-or-later"
 authors = ["swiftraccoon"]
-repository = "https://github.com/swiftraccoon/kenwood"
-keywords = ["kenwood", "thd75", "mcp-d75", "ham-radio", "amateur-radio"]
 categories = ["parser-implementations", "command-line-utilities"]
+edition = "2024"
+keywords = ["kenwood", "thd75", "mcp-d75", "ham-radio", "amateur-radio"]
+license = "GPL-2.0-or-later"
 publish = false
+readme = "README.md"
+repository = "https://github.com/swiftraccoon/kenwood"
+rust-version = "1.94"
+description = "Checked MCP memory-map extraction, registry generation and release comparison"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

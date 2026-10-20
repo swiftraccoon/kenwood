@@ -16,9 +16,9 @@ use crate::enums::attach_enum_catalogs;
 use crate::error::{Result, extract_error};
 use crate::language::{parse_combo_options, parse_language_file};
 use crate::manifest::{
-    Anchor, Dimension, LanguageFileInfo, Manifest, Menu, ModelInfo, NestedSerializer, Operation,
-    PrivateRecord, Record, RecordEntry, ReleaseInfo, Role, SCHEMA_VERSION, SourceInfo, Summary,
-    WriteMethodRef,
+    Anchor, Dimension, LanguageFileInfo, Manifest, ManifestCandidate, Menu, ModelInfo,
+    NestedSerializer, Operation, PrivateRecord, Record, RecordEntry, ReleaseInfo, Role,
+    SCHEMA_VERSION, SourceInfo, Summary, WriteMethodRef,
 };
 use crate::model::{ModelSpec, RecordSpec};
 use crate::operations::{WriteScope, extract_operations};
@@ -29,15 +29,100 @@ use crate::sources::{Sources, parse_constants, parse_types, read_sources, source
 #[derive(Debug, Clone)]
 pub struct BuildOptions {
     /// Radio spec.
-    pub model: &'static ModelSpec,
+    pub(crate) model: &'static ModelSpec,
     /// Declared MCP marketing version.
-    pub mcp_version: String,
+    pub(crate) mcp_version: String,
     /// Declared firmware target.
-    pub firmware_target: String,
+    pub(crate) firmware_target: String,
     /// Optional UTF-16 language file for option labels.
-    pub language_file: Option<PathBuf>,
+    pub(crate) language_file: Option<PathBuf>,
     /// Require the spec's reviewed counts.
-    pub strict_known_layout: bool,
+    pub(crate) strict_known_layout: bool,
+}
+
+impl BuildOptions {
+    /// Selects a supported model and declared MCP and firmware release labels.
+    ///
+    /// Labels are nonempty ASCII words without control characters. They are
+    /// caller declarations; the assembly product and version are extracted
+    /// independently from the input project.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::ExtractError::InvalidInput`] for an invalid release label.
+    pub fn new(
+        model: &'static ModelSpec,
+        mcp_version: impl Into<String>,
+        firmware_target: impl Into<String>,
+    ) -> Result<Self> {
+        let options = Self {
+            model,
+            mcp_version: mcp_version.into(),
+            firmware_target: firmware_target.into(),
+            language_file: None,
+            strict_known_layout: false,
+        };
+        options.validate()?;
+        Ok(options)
+    }
+
+    fn validate(&self) -> Result<()> {
+        for (field, value) in [
+            ("MCP version", &self.mcp_version),
+            ("firmware target", &self.firmware_target),
+        ] {
+            if value.is_empty() || value.bytes().any(|byte| !byte.is_ascii_graphic()) {
+                return Err(crate::ExtractError::InvalidInput {
+                    message: format!("{field} must be a nonempty ASCII word"),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Includes labels from a UTF-16 language file when extracting.
+    #[must_use]
+    pub fn with_language_file(mut self, path: PathBuf) -> Self {
+        self.language_file = Some(path);
+        self
+    }
+
+    /// Selects whether extraction requires the model's reviewed layout counts.
+    #[must_use]
+    pub const fn with_strict_known_layout(mut self, required: bool) -> Self {
+        self.strict_known_layout = required;
+        self
+    }
+
+    /// Returns the supported radio specification.
+    #[must_use]
+    pub const fn model(&self) -> &'static ModelSpec {
+        self.model
+    }
+
+    /// Borrows the declared MCP release label.
+    #[must_use]
+    pub fn mcp_version(&self) -> &str {
+        &self.mcp_version
+    }
+
+    /// Borrows the declared firmware target label.
+    #[must_use]
+    pub fn firmware_target(&self) -> &str {
+        &self.firmware_target
+    }
+
+    /// Borrows the optional language input path.
+    #[must_use]
+    pub fn language_file(&self) -> Option<&Path> {
+        self.language_file.as_deref()
+    }
+
+    /// Returns whether reviewed layout counts are required.
+    #[must_use]
+    pub const fn strict_known_layout(&self) -> bool {
+        self.strict_known_layout
+    }
 }
 
 /// Assembly version from `Properties/AssemblyInfo.cs`, after checking the product.
@@ -523,7 +608,7 @@ fn summarize_menu(summary: &mut Summary, menu: &Menu) -> Result<()> {
     Ok(())
 }
 
-fn summarize(
+pub(crate) fn summarize(
     menus: &[Menu],
     dimensions: usize,
     combo_enum_types: usize,
@@ -580,7 +665,7 @@ fn source_info(
         }
     }
     Ok(SourceInfo {
-        kind: "ILSpy C# project".to_owned(),
+        kind: crate::SourceKind::IlspyCsharpProject,
         normalized_source_sha256: digest,
         serializer_classes: discovered
             .menus
@@ -604,6 +689,7 @@ fn source_info(
 /// deviates from the one-line call shape, when a pinned fact fails
 /// verification, or when `strict_known_layout` detects changed counts.
 pub fn build_manifest(source_dir: &Path, options: &BuildOptions) -> Result<Manifest> {
+    options.validate()?;
     let spec = options.model;
     let patterns = Patterns::new()?;
     let sources = read_sources(source_dir)?;
@@ -675,11 +761,11 @@ pub fn build_manifest(source_dir: &Path, options: &BuildOptions) -> Result<Manif
         })
         .collect();
     let summary = summarize(&menus, dimensions.len(), combo_enum_types, combos.len())?;
-    Ok(Manifest {
+    ManifestCandidate {
         schema_version: SCHEMA_VERSION,
         generator: env!("CARGO_PKG_NAME").to_owned(),
         model: ModelInfo {
-            radio: spec.id.to_owned(),
+            radio: spec.id,
             product: spec.product.to_owned(),
             mcp_product: spec.mcp_product.to_owned(),
             image_length: spec.image_length,
@@ -697,5 +783,6 @@ pub fn build_manifest(source_dir: &Path, options: &BuildOptions) -> Result<Manif
         )?,
         summary,
         menus,
-    })
+    }
+    .validate()
 }

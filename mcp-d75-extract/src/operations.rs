@@ -81,7 +81,7 @@ fn apply_blob_spec(scope: &WriteScope<'_>, operation: &mut Operation) {
     let Some(blob) = scope.spec.blob(name) else {
         return;
     };
-    operation.category = Some("blob".to_owned());
+    operation.category = Some(crate::FieldCategory::Blob);
     if !blob.writable {
         operation.writable = Some(false);
         operation.not_writable_reason = blob.reason.map(ToOwned::to_owned);
@@ -135,8 +135,8 @@ pub(crate) fn extract_operations(
             scope.slots,
             scope.spec.value_helpers,
         )
-        .map_err(|error| extract_error!("{label}: {error}"))?;
-        if classified.codec.value_type() == Some("unknown") {
+        .map_err(|error| crate::ExtractError::source(&label, error))?;
+        if classified.codec.value_type() == Some(crate::ValueType::Unknown) {
             return Err(extract_error!(
                 "{label}: the value of A_0.{method}({}) is neither a typed member of {} nor a spec'd symbol",
                 args.join(", "),
@@ -218,7 +218,7 @@ mod tests {
             ),
             "{gps_log:?}"
         );
-        assert_eq!(gps_log.category.as_deref(), Some("blob"));
+        assert_eq!(gps_log.category, Some(crate::FieldCategory::Blob));
         assert_eq!(gps_log.writable, Some(false));
         let poweron = operations.get(3).ok_or("no fourth operation")?;
         assert_eq!(poweron.writable, None);

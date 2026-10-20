@@ -7,7 +7,7 @@
 //! shape is an affine expression over symbols; this module parses them and
 //! resolves symbols through a [`SymbolScope`].
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -87,6 +87,14 @@ pub struct Affine {
     pub symbols: Vec<String>,
 }
 
+impl std::str::FromStr for Affine {
+    type Err = crate::ExtractError;
+
+    fn from_str(expression: &str) -> Result<Self> {
+        parse_affine(expression)
+    }
+}
+
 fn parse_literal(text: &str) -> Option<i64> {
     let (negative, digits) = text
         .strip_prefix('-')
@@ -128,8 +136,9 @@ fn is_identifier(text: &str) -> bool {
 /// # Errors
 ///
 /// Returns an error for an empty expression, a subtraction, or any term
-/// that is not one of the accepted shapes.
-pub fn parse_affine(expression: &str) -> Result<Affine> {
+/// that is not one of the accepted shapes, or a constant or stride sum that
+/// overflows `i64`.
+pub(crate) fn parse_affine(expression: &str) -> Result<Affine> {
     let compact = compact_expression(expression);
     if compact.is_empty() {
         return Err(extract_error!("empty offset expression"));
@@ -142,12 +151,24 @@ pub fn parse_affine(expression: &str) -> Result<Affine> {
     let mut affine = Affine::default();
     for term in compact.split('+') {
         if term == "A_1" {
-            affine.index_stride = Some(affine.index_stride.unwrap_or(0) + 1);
+            affine.index_stride = Some(
+                affine
+                    .index_stride
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .ok_or_else(|| extract_error!("stride expression overflows: {expression}"))?,
+            );
         } else if let Some(coefficient) = term.strip_suffix("*A_1") {
             let stride = parse_literal(coefficient).ok_or_else(|| {
                 extract_error!("unparsable stride in offset expression: {expression}")
             })?;
-            affine.index_stride = Some(affine.index_stride.unwrap_or(0) + stride);
+            affine.index_stride = Some(
+                affine
+                    .index_stride
+                    .unwrap_or(0)
+                    .checked_add(stride)
+                    .ok_or_else(|| extract_error!("stride expression overflows: {expression}"))?,
+            );
         } else if let Some(literal) = parse_literal(term) {
             affine.constant = affine
                 .constant
@@ -274,10 +295,31 @@ impl RecordBase {
     ///
     /// # Errors
     ///
-    /// Returns an error when an override index is outside `count` or the
-    /// linear formula overflows.
+    /// Returns an error when an override index is duplicated or outside `count`, or the
+    /// linear formula overflows, `count` does not fit an allocation, or the
+    /// allocation cannot be reserved. Every override is checked before allocation.
     pub fn bases(&self, count: u64) -> Result<Vec<u64>> {
         let mut bases = Vec::new();
+        let length = usize::try_from(count)
+            .map_err(|_| extract_error!("record count exceeds the platform allocation range"))?;
+        let mut seen = BTreeSet::new();
+        for (index, _) in &self.overrides {
+            if *index >= count || !seen.insert(*index) {
+                return Err(extract_error!(
+                    "record base override index {index} is duplicate or outside count {count}"
+                ));
+            }
+        }
+        if count != 0 {
+            let _last = self
+                .stride
+                .checked_mul(count - 1)
+                .and_then(|scaled| self.base.checked_add(scaled))
+                .ok_or_else(|| extract_error!("last record base overflows for count {count}"))?;
+        }
+        bases
+            .try_reserve_exact(length)
+            .map_err(|error| crate::ExtractError::source("reserve record base addresses", error))?;
         for index in 0..count {
             let base = self
                 .stride
@@ -428,6 +470,24 @@ mod tests {
     }
 
     #[test]
+    fn affine_stride_accumulation_rejects_both_overflow_forms() -> TestResult {
+        assert_eq!(
+            parse_affine("9223372036854775806*A_1+A_1")?.index_stride,
+            Some(i64::MAX),
+        );
+        for expression in [
+            "9223372036854775807*A_1+A_1",
+            "9223372036854775807*A_1+2*A_1",
+        ] {
+            assert!(
+                parse_affine(expression).is_err(),
+                "accepted overflowing stride {expression}",
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn resolves_direct_offsets_through_scope() -> TestResult {
         let constants = HashMap::from([("oc.bb".to_owned(), 12_i64)]);
         let slots = [slot("r", 8192), slot("g", 256_000)];
@@ -493,6 +553,28 @@ mod tests {
         assert_eq!(folded.base, 334_081);
         assert_eq!(folded.stride, 96);
         assert_eq!(folded.terms.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn record_bases_reject_ambiguous_overrides_and_impossible_allocations() -> TestResult {
+        let mut base = RecordBase {
+            base: 0,
+            stride: 0,
+            overrides: Vec::new(),
+            terms: Vec::new(),
+        };
+        assert!(base.bases(u64::MAX).is_err());
+        base.overrides = vec![(0, 1), (0, 2)];
+        assert!(base.bases(1).is_err());
+        base.overrides = vec![(1, 2)];
+        assert!(base.bases(1).is_err());
+        base.overrides.clear();
+        base.base = u64::MAX;
+        base.stride = 1;
+        assert!(base.bases(2).is_err());
+        assert_eq!(base.bases(1)?, [u64::MAX]);
+        assert!(base.bases(0)?.is_empty());
         Ok(())
     }
 
