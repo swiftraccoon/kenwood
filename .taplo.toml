@@ -1,0 +1,16 @@
+[formatting]
+column_width = 100
+
+[[rule]]
+include = ["Cargo.toml", "**/Cargo.toml"]
+
+[rule.formatting]
+indent_string = "    "
+reorder_keys = true
+
+[[rule]]
+include = ["Cargo.toml", "**/Cargo.toml"]
+keys = ["package"]
+
+[rule.formatting]
+reorder_keys = false

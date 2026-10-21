@@ -1,64 +1,64 @@
 [workspace]
 members = [
-  "kenwood-schema",
-  "kenwood-transport",
-  "thd75",
-  "thd75-tui",
-  "thd75-repl",
-  "dstar-gateway",
-  "dstar-gateway-core",
-  "dstar-gateway-server",
-  "if-dsp",
-  "thd75-listen",
-  "aprs",
-  "aprs-is",
-  "ax25-codec",
-  "kiss-tnc",
-  "mbelib-rs",
-  "mcp-d75-extract",
-  "tmd750",
-  "tmd750-repl",
-  "mmdvm",
-  "mmdvm-core",
-  "dmr-rewind",
-  "dmr-rewind-core",
-  "pulsar",
-  "sextant",
-  "stargazer",
-  "lodestar-core",
-  "azimuth-core",
+    "kenwood-schema",
+    "kenwood-transport",
+    "thd75",
+    "thd75-tui",
+    "thd75-repl",
+    "dstar-gateway",
+    "dstar-gateway-core",
+    "dstar-gateway-server",
+    "if-dsp",
+    "thd75-listen",
+    "aprs",
+    "aprs-is",
+    "ax25-codec",
+    "kiss-tnc",
+    "mbelib-rs",
+    "mcp-d75-extract",
+    "tmd750",
+    "tmd750-repl",
+    "mmdvm",
+    "mmdvm-core",
+    "dmr-rewind",
+    "dmr-rewind-core",
+    "pulsar",
+    "sextant",
+    "stargazer",
+    "lodestar-core",
+    "azimuth-core",
 ]
 resolver = "3"
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
-missing_docs = "deny"
-missing_debug_implementations = "deny"
-unreachable_pub = "deny"
-unused_results = "deny"
 elided_lifetimes_in_paths = "deny"
-trivial_casts = "deny"
-trivial_numeric_casts = "deny"
-unused_qualifications = "deny"
+let_underscore_drop = "deny"
+missing_debug_implementations = "deny"
+missing_docs = "deny"
 non_ascii_idents = "deny"
 single_use_lifetimes = "deny"
-let_underscore_drop = "deny"
+trivial_casts = "deny"
+trivial_numeric_casts = "deny"
+unreachable_pub = "deny"
+unsafe_code = "forbid"
 unused_crate_dependencies = "deny"
 unused_import_braces = "deny"
+unused_qualifications = "deny"
+unused_results = "deny"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
-pedantic = { level = "deny", priority = -1 }
-nursery = { level = "deny", priority = -1 }
 cargo = { level = "deny", priority = -1 }
-restriction = { level = "allow", priority = -1 }
-undocumented_unsafe_blocks = "deny"
-missing_assert_message = "deny"
-missing_const_for_fn = "deny"
-panic = "deny"
-unwrap_used = "deny"
 expect_used = "deny"
 indexing_slicing = "deny"
+missing_assert_message = "deny"
+missing_const_for_fn = "deny"
+nursery = { level = "deny", priority = -1 }
+panic = "deny"
+pedantic = { level = "deny", priority = -1 }
+restriction = { level = "allow", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+unwrap_used = "deny"
 # Workspace-wide ban on `#[allow(...)]`. Use `#[expect(...)]` with a
 # `reason = "..."` field instead; `#[expect]` is self-auditing because
 # clippy reports "unfulfilled lint expectation" when the suppressed lint
@@ -69,14 +69,14 @@ indexing_slicing = "deny"
 allow_attributes = "deny"
 allow_attributes_without_reason = "deny"
 # Forward-protection lints (zero current violations, prevent regressions):
-todo = "deny"
-unimplemented = "deny"
 dbg_macro = "deny"
-mem_forget = "deny"
 format_push_string = "deny"
 infinite_loop = "deny"
+mem_forget = "deny"
 module_name_repetitions = "allow"
 multiple_crate_versions = "allow"
+todo = "deny"
+unimplemented = "deny"
 # Every crate in this workspace has at least one `pub(crate)` private module (that's
 # the pattern `unreachable_pub = "deny"` wants), but `clippy::redundant_pub_crate` (in
 # the `nursery` group we deny) considers the `pub(crate)` redundant on an already-private
@@ -85,9 +85,9 @@ multiple_crate_versions = "allow"
 redundant_pub_crate = "allow"
 
 [workspace.lints.rustdoc]
-broken_intra_doc_links = "deny"
-private_intra_doc_links = "deny"
-missing_crate_level_docs = "deny"
-invalid_codeblock_attributes = "deny"
 bare_urls = "deny"
+broken_intra_doc_links = "deny"
+invalid_codeblock_attributes = "deny"
+missing_crate_level_docs = "deny"
+private_intra_doc_links = "deny"
 unescaped_backticks = "deny"

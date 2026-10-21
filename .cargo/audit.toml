@@ -6,6 +6,11 @@
 
 [advisories]
 ignore = [
+  # RUSTSEC-2026-0374: basic-toml is unmaintained, with no patched release.
+  # Askama's derive macro uses it while compiling UniFFI binding templates.
+  # A compatible UniFFI/Askama update does not remove it. Remove this entry
+  # when that build-time dependency is replaced upstream.
+  "RUSTSEC-2026-0374",
   # RUSTSEC-2024-0436: paste is unmaintained (proc-macro crate).
   #
   # Pulled in transitively by `metal` → `wgpu-hal` → `wgpu-core` /

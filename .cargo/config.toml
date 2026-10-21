@@ -1,0 +1,5 @@
+# Keep release build scripts and proc macros loadable on macOS 27 with Rust 1.94.
+# Stripping debuginfo can misalign Mach-O string pools; revisit on toolchain updates.
+# https://github.com/rust-lang/rust/issues/157750
+[profile.release.build-override]
+strip = "none"

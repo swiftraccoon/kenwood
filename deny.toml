@@ -16,6 +16,10 @@ targets = [
 [advisories]
 version = 2
 ignore = [
+  # Askama's derive macro uses basic-toml to parse its TOML configuration
+  # while compiling UniFFI. No patched release or compatible replacement exists.
+  # Remove when a compatible UniFFI/Askama update replaces this dependency.
+  { id = "RUSTSEC-2026-0374", reason = "basic-toml is an unmaintained build-time parser used by Askama's derive macro through UniFFI; no patched release or compatible upstream replacement is available" },
   # RUSTSEC-2026-0192: ttf-parser is unmaintained.
   #
   # ttf-parser is a TrueType/OpenType font parser pulled in transitively
