@@ -1,12 +1,99 @@
 //! Transport discovery and connection.
 //!
-//! Auto-discovers the TH-D75 via USB or Bluetooth. On macOS, always
-//! uses native `IOBluetooth` RFCOMM for Bluetooth, because the macOS serial
-//! driver (`/dev/cu.TH-D75`) drops bytes and is documented as broken.
-//! On Linux/Windows, serial BT SPP ports are used normally.
+//! Initial discovery prefers USB, then Bluetooth. Reopening a session must
+//! retain its selected physical identity instead of repeating discovery.
+//! macOS Bluetooth uses the process-isolated native RFCOMM transport;
+//! Linux/Windows use enumerated serial SPP endpoints.
+
+use std::num::NonZeroU32;
 
 use kenwood_thd75::transport::{EitherTransport, SerialTransport};
 use kenwood_thd75::types::PcOutputInterface;
+
+#[derive(Debug)]
+enum OpenError {
+    InterfaceRequiresPort,
+    InterfaceConflict {
+        path: String,
+        explicit: PcOutputInterface,
+        enumerated: PcOutputInterface,
+    },
+    #[cfg(any(target_os = "macos", test))]
+    InvalidBluetoothSelector {
+        selector: String,
+    },
+    #[cfg(any(target_os = "macos", test))]
+    UnpairedBluetooth {
+        address: ExactBluetoothAddress,
+        options: String,
+    },
+    #[cfg(target_os = "macos")]
+    InventoryChanged,
+    #[cfg(target_os = "macos")]
+    Bluetooth(kenwood_transport::TransportError),
+    #[cfg(not(target_os = "macos"))]
+    NoRadio,
+}
+
+impl std::fmt::Display for OpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InterfaceRequiresPort => {
+                f.write_str("--port-interface requires a concrete --port path")
+            }
+            Self::InterfaceConflict {
+                path,
+                explicit,
+                enumerated,
+            } => write!(
+                f,
+                "--port-interface {explicit} conflicts with the enumerated {enumerated} endpoint {path}"
+            ),
+            #[cfg(any(target_os = "macos", test))]
+            Self::InvalidBluetoothSelector { selector } => write!(
+                f,
+                "macOS native Bluetooth cannot preserve the physical identity of selector {selector:?}. \
+                 Pass an exact paired Bluetooth address, for example \
+                 --port 00-11-22-33-44-55 --port-interface bluetooth"
+            ),
+            #[cfg(any(target_os = "macos", test))]
+            Self::UnpairedBluetooth { address, options } => write!(
+                f,
+                "Bluetooth address {address} is not in the paired-device inventory. {options}"
+            ),
+            #[cfg(target_os = "macos")]
+            Self::InventoryChanged => {
+                f.write_str("paired Bluetooth selection changed during resolution")
+            }
+            #[cfg(target_os = "macos")]
+            Self::Bluetooth(error) => write!(
+                f,
+                "Bluetooth connection failed: {error}. \
+                Check pairing and whether another application holds the connection"
+            ),
+            #[cfg(not(target_os = "macos"))]
+            Self::NoRadio => {
+                f.write_str("no TH-D75 found on USB or Bluetooth; use --port to specify")
+            }
+        }
+    }
+}
+
+impl std::error::Error for OpenError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Bluetooth(error) => Some(error),
+            Self::InterfaceRequiresPort | Self::InterfaceConflict { .. } => None,
+            #[cfg(any(target_os = "macos", test))]
+            Self::InvalidBluetoothSelector { .. } | Self::UnpairedBluetooth { .. } => None,
+            #[cfg(target_os = "macos")]
+            Self::InventoryChanged => None,
+            #[cfg(not(target_os = "macos"))]
+            Self::NoRadio => None,
+        }
+    }
+}
 
 /// Provenance of the physical endpoint used for Menu 985 routing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,11 +125,11 @@ pub(crate) struct OpenedTransport {
 /// 4. Serial BT SPP ports (Linux/Windows only; skipped on macOS)
 pub(crate) fn discover_and_open(
     port: Option<&str>,
-    baud: u32,
+    baud: NonZeroU32,
     explicit_interface: Option<PcOutputInterface>,
-) -> Result<OpenedTransport, Box<dyn std::error::Error>> {
+) -> super::AppResult<OpenedTransport> {
     if explicit_interface.is_some() && port.is_none_or(|path| path == "auto") {
-        return Err("--port-interface requires a concrete --port path, not auto-discovery".into());
+        return Err(OpenError::InterfaceRequiresPort.into());
     }
     // Explicit port.
     if let Some(path) = port
@@ -70,9 +157,9 @@ pub(crate) fn discover_and_open(
 /// Open an explicitly specified port.
 fn open_explicit(
     path: &str,
-    baud: u32,
+    baud: NonZeroU32,
     explicit_interface: Option<PcOutputInterface>,
-) -> Result<OpenedTransport, Box<dyn std::error::Error>> {
+) -> super::AppResult<OpenedTransport> {
     let endpoint_interface = resolve_explicit_interface(path, explicit_interface)?;
 
     // On macOS, explicit Bluetooth selection must resolve to one exact paired
@@ -97,14 +184,15 @@ fn open_explicit(
 fn resolve_explicit_interface(
     path: &str,
     explicit_interface: Option<PcOutputInterface>,
-) -> Result<EndpointInterface, String> {
+) -> Result<EndpointInterface, OpenError> {
     let inferred_interface = infer_explicit_serial_interface(path);
     match (inferred_interface, explicit_interface) {
         (EndpointInterface::Known(inferred), Some(explicit)) if inferred != explicit => {
-            Err(format!(
-                "--port-interface {explicit} conflicts with the enumerated {inferred} endpoint \
-                 {path}"
-            ))
+            Err(OpenError::InterfaceConflict {
+                path: path.to_owned(),
+                explicit,
+                enumerated: inferred,
+            })
         }
         (EndpointInterface::Known(inferred), _) => Ok(EndpointInterface::Known(inferred)),
         (EndpointInterface::UnspecifiedExplicitPort, Some(explicit)) => {
@@ -120,7 +208,7 @@ fn resolve_explicit_interface(
 /// A generic explicit path stays unknown instead of silently becoming USB.
 fn infer_explicit_serial_interface(path: &str) -> EndpointInterface {
     #[cfg(target_os = "macos")]
-    if canonical_bluetooth_address(path).is_some() {
+    if ExactBluetoothAddress::new(path).is_some() {
         return EndpointInterface::Known(PcOutputInterface::Bluetooth);
     }
     if SerialTransport::is_bluetooth_port(path) {
@@ -148,9 +236,12 @@ fn infer_explicit_serial_interface(path: &str) -> EndpointInterface {
 /// different paired radio. Resolve the caller's address against the bounded
 /// paired-device inventory, then hand that exact record to the native helper.
 #[cfg(target_os = "macos")]
-fn open_explicit_bluetooth(selector: &str) -> Result<OpenedTransport, Box<dyn std::error::Error>> {
-    if canonical_bluetooth_address(selector).is_none() {
-        return Err(exact_bluetooth_selector_guidance(selector).into());
+fn open_explicit_bluetooth(selector: &str) -> super::AppResult<OpenedTransport> {
+    if ExactBluetoothAddress::new(selector).is_none() {
+        return Err(OpenError::InvalidBluetoothSelector {
+            selector: selector.to_owned(),
+        }
+        .into());
     }
     let devices = kenwood_transport::bluetooth::BluetoothTransport::paired_devices()?;
     let identities: Vec<_> = devices
@@ -160,7 +251,7 @@ fn open_explicit_bluetooth(selector: &str) -> Result<OpenedTransport, Box<dyn st
     let selected_index = resolve_exact_paired_device_index(selector, &identities)?;
     let selected = devices
         .get(selected_index)
-        .ok_or("paired Bluetooth selection changed during resolution")?;
+        .ok_or(OpenError::InventoryChanged)?;
     let helper_executable = std::env::current_exe()?;
     let transport = kenwood_thd75::BluetoothTransport::open_paired_device_with_helper_executable(
         selected,
@@ -177,32 +268,23 @@ fn open_explicit_bluetooth(selector: &str) -> Result<OpenedTransport, Box<dyn st
     })
 }
 
-#[cfg(any(target_os = "macos", test))]
-fn exact_bluetooth_selector_guidance(selector: &str) -> String {
-    format!(
-        "macOS native Bluetooth cannot preserve the physical identity of selector {selector:?}. \
-         Pass an exact paired Bluetooth address, for example \
-         --port 00-11-22-33-44-55 --port-interface bluetooth"
-    )
-}
-
 /// Resolve only a syntactically exact Bluetooth address to one paired record.
 /// Display names and serial-device paths are diagnostics, never selectors.
 #[cfg(any(target_os = "macos", test))]
 fn resolve_exact_paired_device_index(
     selector: &str,
     devices: &[(&str, &str)],
-) -> Result<usize, String> {
+) -> Result<usize, OpenError> {
     let options = paired_bluetooth_options(devices);
-    let Some(address) = canonical_bluetooth_address(selector) else {
-        return Err(exact_bluetooth_selector_guidance(selector));
+    let Some(address) = ExactBluetoothAddress::new(selector) else {
+        return Err(OpenError::InvalidBluetoothSelector {
+            selector: selector.to_owned(),
+        });
     };
     devices
         .iter()
-        .position(|(paired_address, _)| paired_address.eq_ignore_ascii_case(&address))
-        .ok_or_else(|| {
-            format!("Bluetooth address {address} is not in the paired-device inventory. {options}")
-        })
+        .position(|(paired_address, _)| paired_address.eq_ignore_ascii_case(address.as_str()))
+        .ok_or(OpenError::UnpairedBluetooth { address, options })
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -218,29 +300,46 @@ fn paired_bluetooth_options(devices: &[(&str, &str)]) -> String {
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn canonical_bluetooth_address(address: &str) -> Option<String> {
-    let bytes = address.as_bytes();
-    if bytes.len() != 17 {
-        return None;
-    }
-    let separator = *bytes.get(2)?;
-    if !matches!(separator, b'-' | b':') {
-        return None;
-    }
-    let mut canonical = String::with_capacity(17);
-    for (index, byte) in bytes.iter().copied().enumerate() {
-        if matches!(index, 2 | 5 | 8 | 11 | 14) {
-            if byte != separator {
-                return None;
-            }
-            canonical.push('-');
-        } else if byte.is_ascii_hexdigit() {
-            canonical.push(char::from(byte.to_ascii_uppercase()));
-        } else {
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ExactBluetoothAddress(String);
+
+#[cfg(any(target_os = "macos", test))]
+impl ExactBluetoothAddress {
+    fn new(address: &str) -> Option<Self> {
+        let bytes = address.as_bytes();
+        if bytes.len() != 17 {
             return None;
         }
+        let separator = *bytes.get(2)?;
+        if !matches!(separator, b'-' | b':') {
+            return None;
+        }
+        let mut canonical = String::with_capacity(17);
+        for (index, byte) in bytes.iter().copied().enumerate() {
+            if matches!(index, 2 | 5 | 8 | 11 | 14) {
+                if byte != separator {
+                    return None;
+                }
+                canonical.push('-');
+            } else if byte.is_ascii_hexdigit() {
+                canonical.push(char::from(byte.to_ascii_uppercase()));
+            } else {
+                return None;
+            }
+        }
+        Some(Self(canonical))
     }
-    Some(canonical)
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl std::fmt::Display for ExactBluetoothAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Open a Bluetooth connection using native `IOBluetooth` RFCOMM.
@@ -250,14 +349,8 @@ fn canonical_bluetooth_address(address: &str) -> Option<String> {
 /// an already-connected Bluetooth baseband as a cleanup strategy; an SPP
 /// channel owned by another process simply makes this open fail.
 #[cfg(target_os = "macos")]
-fn open_bluetooth(_baud: u32) -> Result<OpenedTransport, Box<dyn std::error::Error>> {
-    let bt = kenwood_thd75::BluetoothTransport::open(None).map_err(|e| {
-        format!(
-            "Error: Bluetooth connection failed: {e}. \
-             Confirm that the radio is paired, Bluetooth is enabled, and no \
-             other application currently owns its SPP channel."
-        )
-    })?;
+fn open_bluetooth(_baud: NonZeroU32) -> super::AppResult<OpenedTransport> {
+    let bt = kenwood_thd75::BluetoothTransport::open(None).map_err(OpenError::Bluetooth)?;
     Ok(OpenedTransport {
         label: "bluetooth:TH-D75".into(),
         transport: EitherTransport::Bluetooth(bt),
@@ -271,7 +364,7 @@ fn open_bluetooth(_baud: u32) -> Result<OpenedTransport, Box<dyn std::error::Err
 /// enumerates serial ports that look like Bluetooth TH-D75 pairings and
 /// open the first one at the requested baud rate.
 #[cfg(not(target_os = "macos"))]
-fn open_bluetooth(_baud: u32) -> Result<OpenedTransport, Box<dyn std::error::Error>> {
+fn open_bluetooth(_baud: NonZeroU32) -> super::AppResult<OpenedTransport> {
     let bt_ports = SerialTransport::discover_bluetooth()?;
     if let Some(info) = bt_ports.first() {
         let path = info.port_name.clone();
@@ -282,7 +375,7 @@ fn open_bluetooth(_baud: u32) -> Result<OpenedTransport, Box<dyn std::error::Err
             endpoint_interface: EndpointInterface::Known(PcOutputInterface::Bluetooth),
         });
     }
-    Err("Error: no TH-D75 found on USB or Bluetooth. Use --port to specify.".into())
+    Err(OpenError::NoRadio.into())
 }
 
 #[cfg(test)]
@@ -295,7 +388,7 @@ mod tests {
     ];
 
     #[test]
-    fn exact_bluetooth_address_resolves_one_paired_identity() -> Result<(), String> {
+    fn exact_bluetooth_address_resolves_one_paired_identity() -> super::super::AppResult<()> {
         let selected = resolve_exact_paired_device_index("aa:bb:cc:dd:ee:ff", PAIRED_DEVICES)?;
         assert_eq!(
             selected, 1,
@@ -306,7 +399,8 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn exact_bluetooth_address_proves_the_interface_without_an_override() -> Result<(), String> {
+    fn exact_bluetooth_address_proves_the_interface_without_an_override()
+    -> super::super::AppResult<()> {
         let interface = resolve_explicit_interface("AA-BB-CC-DD-EE-FF", None)?;
         assert_eq!(
             interface,
@@ -321,8 +415,8 @@ mod tests {
         for selector in ["TH-D75 Shack", "/dev/cu.TH-D75-Shack"] {
             let result = resolve_exact_paired_device_index(selector, PAIRED_DEVICES);
             assert!(
-                matches!(result, Err(ref error) if error.contains("exact paired Bluetooth address")
-                    && error.contains("00-11-22-33-44-55")),
+                matches!(result, Err(ref error) if error.to_string().contains("exact paired Bluetooth address")
+                    && error.to_string().contains("00-11-22-33-44-55")),
                 "non-address selector did not receive exact-address guidance: {result:?}"
             );
         }
@@ -330,8 +424,8 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_explicit_serial_node_is_rejected_before_native_open() -> Result<(), String> {
-        let error = open_explicit("/dev/cu.TH-D75", 115_200, None)
+    fn macos_explicit_serial_node_is_rejected_before_native_open() -> super::super::AppResult<()> {
+        let error = open_explicit("/dev/cu.TH-D75", SerialTransport::DEFAULT_BAUD, None)
             .err()
             .ok_or("a macOS Bluetooth serial node was silently redirected")?
             .to_string();
@@ -348,9 +442,9 @@ mod tests {
     fn unpaired_exact_bluetooth_address_lists_available_identities() {
         let result = resolve_exact_paired_device_index("12-34-56-78-9A-BC", PAIRED_DEVICES);
         assert!(
-            matches!(result, Err(ref error) if error.contains("is not in the paired-device inventory")
-                && error.contains("TH-D75 Shack")
-                && error.contains("AA-BB-CC-DD-EE-FF")),
+            matches!(result, Err(ref error) if error.to_string().contains("is not in the paired-device inventory")
+                && error.to_string().contains("TH-D75 Shack")
+                && error.to_string().contains("AA-BB-CC-DD-EE-FF")),
             "unpaired exact address did not list actionable paired identities: {result:?}"
         );
     }
@@ -359,27 +453,27 @@ mod tests {
     fn malformed_bluetooth_addresses_are_never_partially_normalized() {
         for selector in ["00-11:22-33-44-55", "00-11-22-33-44", "GG-11-22-33-44-55"] {
             assert!(
-                canonical_bluetooth_address(selector).is_none(),
+                ExactBluetoothAddress::new(selector).is_none(),
                 "malformed selector was accepted: {selector}"
             );
         }
     }
 
     #[test]
-    fn explicit_interface_rejects_known_path_conflicts() -> Result<(), String> {
+    fn explicit_interface_rejects_known_path_conflicts() -> super::super::AppResult<()> {
         let Err(error) = resolve_explicit_interface("/dev/rfcomm0", Some(PcOutputInterface::Usb))
         else {
-            return Err("a known Bluetooth path accepted a USB override".to_owned());
+            return Err("a known Bluetooth path accepted a USB override".into());
         };
         assert!(
-            error.contains("conflicts"),
+            error.to_string().contains("conflicts"),
             "conflicting override error lost its reason: {error}"
         );
         Ok(())
     }
 
     #[test]
-    fn explicit_interface_qualifies_an_opaque_path() -> Result<(), String> {
+    fn explicit_interface_qualifies_an_opaque_path() -> super::super::AppResult<()> {
         let interface = resolve_explicit_interface(
             "opaque-port-that-cannot-exist",
             Some(PcOutputInterface::Bluetooth),
@@ -393,7 +487,7 @@ mod tests {
     }
 
     #[test]
-    fn opaque_explicit_path_remains_unspecified_without_override() -> Result<(), String> {
+    fn opaque_explicit_path_remains_unspecified_without_override() -> super::super::AppResult<()> {
         let interface = resolve_explicit_interface("opaque-port-that-cannot-exist", None)?;
         assert_eq!(
             interface,

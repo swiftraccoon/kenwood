@@ -1,137 +1,214 @@
-//! Transmit confirmation prompt and script-mode gating.
+//! Transmit confirmation with explicit refusal, EOF and I/O outcomes.
 //!
-//! Every transmit command in the REPL (cq, beacon, position, msg,
-//! echo, link) calls `tx_confirm` before keying the radio. This
-//! guards blind operators from accidentally transmitting on air by
-//! mistyping an argument or pasting the wrong line at the prompt.
-//!
-//! Two global atomic flags steer the prompt behaviour:
-//!
-//! - `CONFIRM_TX` (default `true`) - require the prompt at all.
-//!   Turned off globally by `--yes` or `confirm off`.
-//! - `SCRIPT_MODE` (default `false`) - the REPL is running a
-//!   non-interactive script (stdin piped or `--script` passed). In
-//!   script mode the prompt cannot be answered, so every transmit
-//!   command aborts with a clear error unless confirmation has been
-//!   explicitly disabled via `--yes`.
+//! Confirmation policy is process-wide. Noninteractive sessions refuse a
+//! required prompt without consuming a queued script command.
 
-use std::io::BufRead as _;
-use std::io::Write as _;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::error::Error;
+use std::fmt;
+use std::io::{self, BufRead, Read as _};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
-/// When `true` (the default) every transmit command prompts the user
-/// before keying the radio. Cleared by `--yes` on the command line
-/// and by the interactive `confirm off` command.
-pub static CONFIRM_TX: AtomicBool = AtomicBool::new(true);
+/// Result of a completed transmit-confirmation decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Confirmation {
+    /// Confirmation is disabled or the response is y/yes.
+    Approved,
+    /// The response declined transmission.
+    Declined,
+    /// Input ended before any response.
+    EndOfInput,
+    /// Required confirmation cannot be answered in a script.
+    ScriptRefused,
+}
 
-/// When `true` the REPL is running under a script or `--script`
-/// file. Prompts cannot be answered, so [`tx_confirm`] prints an
-/// error and returns `false` unless [`CONFIRM_TX`] is also cleared.
-pub static SCRIPT_MODE: AtomicBool = AtomicBool::new(false);
+impl Confirmation {
+    /// Whether the caller may start the requested transmission.
+    #[must_use]
+    pub const fn is_approved(self) -> bool {
+        matches!(self, Self::Approved)
+    }
+}
 
-/// Whether a transmit confirmation prompt is currently required.
+/// Confirmation failure before a decision was made.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ConfirmationError {
+    /// The response could not be read.
+    Input(io::Error),
+    /// The prompt could not be written or flushed.
+    Output(io::Error),
+    /// A response exceeded 64 UTF-8 bytes including its line terminator.
+    ResponseTooLong,
+}
+
+impl fmt::Display for ConfirmationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Input(error) => write!(f, "reading transmit confirmation: {error}"),
+            Self::Output(error) => write!(f, "writing transmit confirmation: {error}"),
+            Self::ResponseTooLong => f.write_str("transmit confirmation exceeds 64 bytes"),
+        }
+    }
+}
+
+impl Error for ConfirmationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Input(error) | Self::Output(error) => Some(error),
+            Self::ResponseTooLong => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Configuration {
+    required: bool,
+    script: bool,
+}
+
+impl Default for Configuration {
+    fn default() -> Self {
+        Self {
+            required: true,
+            script: false,
+        }
+    }
+}
+
+fn configuration() -> MutexGuard<'static, Configuration> {
+    static CONFIGURATION: OnceLock<Mutex<Configuration>> = OnceLock::new();
+    CONFIGURATION
+        .get_or_init(|| Mutex::new(Configuration::default()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Read whether transmit confirmation is required.
 #[must_use]
 pub fn is_required() -> bool {
-    CONFIRM_TX.load(Ordering::Relaxed)
+    configuration().required
 }
 
 /// Enable or disable transmit confirmation.
 pub fn set_required(required: bool) {
-    CONFIRM_TX.store(required, Ordering::Relaxed);
+    configuration().required = required;
 }
 
-/// Mark the REPL as running under a non-interactive script.
-pub fn set_script_mode(on: bool) {
-    SCRIPT_MODE.store(on, Ordering::Relaxed);
+/// Select noninteractive policy without exposing mutable configuration storage.
+pub fn set_script_mode(enabled: bool) {
+    configuration().script = enabled;
 }
 
-/// Prompt the user to confirm a transmit action.
+/// Prompt before transmission and return its exact decision.
 ///
-/// Returns `true` when the caller may proceed:
-/// - [`CONFIRM_TX`] is false: confirmation globally disabled.
-/// - The user typed `y` or `yes` (case-insensitive).
+/// Disabled confirmation approves immediately. A required script prompt returns
+/// `Confirmation::ScriptRefused` without reading stdin. Interactive EOF, negative answers and
+/// successful answers remain distinct. Prompt/status messages use shared
+/// escaped stdout/history output. Responses over 64 bytes are drained through
+/// their line ending and rejected.
 ///
-/// Returns `false` when the caller must abort:
-/// - Script mode is active and confirmation is required.
-/// - The user typed anything else, including blank lines.
-/// - Reading from stdin failed.
+/// # Errors
 ///
-/// In the abort path the function prints an explanatory line via
-/// plain `println!` (so the message is *not* suppressed by the
-/// history buffer or the quiet flag; confirmation is always loud).
-pub fn tx_confirm() -> bool {
-    if !is_required() {
-        return true;
+/// Returns Input for read/drain failures, Output for prompt write/flush failure,
+/// or `ConfirmationError::ResponseTooLong`. No transmission is performed.
+pub fn tx_confirm() -> Result<Confirmation, ConfirmationError> {
+    let (required, script) = {
+        let config = configuration();
+        (config.required, config.script)
+    };
+    if !required {
+        return Ok(Confirmation::Approved);
     }
-    if SCRIPT_MODE.load(Ordering::Relaxed) {
-        println!("Error: transmit commands require --yes in script mode.");
-        return false;
+    if script {
+        crate::aprintln!("Error: transmit commands require --yes in script mode.");
+        return Ok(Confirmation::ScriptRefused);
     }
-    println!("Confirm transmit? Type yes or y to proceed, anything else to cancel.");
-    // Flush stdout so the prompt is visible before the blocking read.
-    // A flush failure is fine; the prompt was already sent via
-    // `println!` so there is nothing left buffered.
-    drop(std::io::stdout().flush());
+    crate::aprintln!("Confirm transmit? Type yes or y to proceed; anything else cancels.");
+    if let Some(error) = crate::take_output_error() {
+        return Err(ConfirmationError::Output(error));
+    }
+    let result = read_answer(&mut io::stdin().lock())?;
+    match result {
+        Confirmation::Declined => crate::aprintln!("Transmission cancelled."),
+        Confirmation::EndOfInput => crate::aprintln!("Input ended; transmission cancelled."),
+        Confirmation::Approved | Confirmation::ScriptRefused => {}
+    }
+    Ok(result)
+}
 
-    let stdin = std::io::stdin();
-    let mut line = String::new();
-    if stdin.lock().read_line(&mut line).is_err() {
-        println!("Transmission cancelled.");
-        return false;
+fn read_answer(reader: &mut impl BufRead) -> Result<Confirmation, ConfirmationError> {
+    let mut response = String::new();
+    let read = reader
+        .by_ref()
+        .take(65)
+        .read_line(&mut response)
+        .map_err(ConfirmationError::Input)?;
+    if read == 0 {
+        return Ok(Confirmation::EndOfInput);
     }
-    let trimmed = line.trim().to_lowercase();
-    if trimmed == "y" || trimmed == "yes" {
-        true
-    } else {
-        println!("Transmission cancelled.");
-        false
+    if read > 64 {
+        if !response.ends_with('\n') {
+            let _drained = reader.skip_until(b'\n').map_err(ConfirmationError::Input)?;
+        }
+        return Err(ConfirmationError::ResponseTooLong);
     }
+    let response = response.trim();
+    Ok(
+        if response.eq_ignore_ascii_case("y") || response.eq_ignore_ascii_case("yes") {
+            Confirmation::Approved
+        } else {
+            Confirmation::Declined
+        },
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CONFIRM_TX, SCRIPT_MODE, is_required, set_required, set_script_mode};
-    use std::sync::Mutex;
-    use std::sync::atomic::Ordering;
+    use super::*;
 
-    /// Tests mutate global atomics so they must serialise.
-    static GUARD: Mutex<()> = Mutex::new(());
+    type TestResult = Result<(), Box<dyn Error>>;
 
-    fn reset() {
-        CONFIRM_TX.store(true, Ordering::Relaxed);
-        SCRIPT_MODE.store(false, Ordering::Relaxed);
+    #[test]
+    fn approval_decline_and_eof_are_distinct() -> TestResult {
+        assert_eq!(read_answer(&mut &b"YES\n"[..])?, Confirmation::Approved);
+        assert_eq!(read_answer(&mut &b"n\n"[..])?, Confirmation::Declined);
+        assert_eq!(read_answer(&mut &b""[..])?, Confirmation::EndOfInput);
+        assert_eq!(read_answer(&mut &b"\n"[..])?, Confirmation::Declined);
+        Ok(())
     }
 
     #[test]
-    fn defaults_require_confirmation() {
-        let _g = GUARD
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reset();
-        assert!(is_required());
+    fn long_response_drains_its_line_but_keeps_the_next_command() -> TestResult {
+        let input = format!("{}\nnext command\n", "y".repeat(100));
+        let mut reader = io::Cursor::new(input);
+        let result = read_answer(&mut reader);
+        assert!(
+            matches!(result, Err(ConfirmationError::ResponseTooLong)),
+            "{result:?}"
+        );
+        let mut remaining = String::new();
+        let _read = reader.read_line(&mut remaining)?;
+        assert_eq!(remaining, "next command\n");
+        Ok(())
     }
 
     #[test]
-    fn set_required_toggles_flag() {
-        let _g = GUARD
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reset();
-        set_required(false);
-        assert!(!is_required());
-        set_required(true);
-        assert!(is_required());
-    }
+    fn input_failure_retains_its_io_source() {
+        #[derive(Debug)]
+        struct FailedReader;
 
-    #[test]
-    fn script_mode_persists() {
-        let _g = GUARD
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reset();
-        set_script_mode(true);
-        assert!(SCRIPT_MODE.load(Ordering::Relaxed));
-        set_script_mode(false);
-        assert!(!SCRIPT_MODE.load(Ordering::Relaxed));
+        impl io::Read for FailedReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "lost input"))
+            }
+        }
+
+        let mut reader = io::BufReader::new(FailedReader);
+        let result = read_answer(&mut reader);
+        assert!(
+            matches!(result, Err(ConfirmationError::Input(ref error))
+            if error.kind() == io::ErrorKind::BrokenPipe),
+            "{result:?}"
+        );
     }
 }

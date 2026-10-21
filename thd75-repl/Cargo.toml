@@ -1,16 +1,16 @@
 [package]
 name = "thd75-repl"
 version = "0.1.0"
-edition = "2024"
-rust-version = "1.94"
-description = "Accessible command-line REPL for the Kenwood TH-D75 transceiver"
-license = "GPL-2.0-or-later"
 authors = ["swiftraccoon"]
-repository = "https://github.com/swiftraccoon/kenwood"
-readme = "README.md"
-keywords = ["ham-radio", "kenwood", "accessibility", "amateur-radio"]
 categories = ["command-line-utilities"]
+edition = "2024"
+keywords = ["ham-radio", "kenwood", "accessibility", "amateur-radio"]
+license = "GPL-2.0-or-later"
 publish = false
+readme = "README.md"
+repository = "https://github.com/swiftraccoon/kenwood"
+rust-version = "1.94"
+description = "Line-oriented CAT control and APRS KISS commands for the Kenwood TH-D75"
 
 [lib]
 name = "thd75_repl"
@@ -21,47 +21,39 @@ name = "thd75-repl"
 path = "src/main.rs"
 
 [features]
-# Compiles in extra CLI flags (currently `--mock-radio <scenario>`)
-# used only by integration tests. Not enabled in release builds.
+# Adds `--mock-radio <scenario>` and deterministic integration fixtures.
 testing = []
 
 [dependencies]
-kenwood-transport = { path = "../kenwood-transport", default-features = false }
-kenwood-thd75 = { path = "../thd75" }
-dstar-gateway = { path = "../dstar-gateway" }
-dstar-gateway-core = { path = "../dstar-gateway-core" }
-mmdvm = { path = "../mmdvm", features = ["dstar"] }
+aprs-is = { path = "../aprs-is" }
 clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = [
-  "rt-multi-thread",
-  "macros",
-  "sync",
-  "time",
-  "io-util",
-  "io-std",
-  "process",
-  "signal",
-] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-appender = "0.2"
-# `time` is already in the transitive tree via tracing-appender. We
-# use it directly here only to format the UTC session-start timestamp
-# that names the log file (second granularity), and to print that same
-# path in the startup message so users can copy-paste the real
-# filename for bug reports. No rotating appender is in play; each
-# invocation gets one fresh file via `File::create`.
-time = { version = "0.3", default-features = false, features = [
-  "formatting",
-  "macros",
-] }
-rustyline = "18"
 dirs-next = "2"
+dstar-gateway-core = { path = "../dstar-gateway-core" }
+kenwood-thd75 = { path = "../thd75" }
+kenwood-transport = { path = "../kenwood-transport", default-features = false }
+mmdvm = { path = "../mmdvm", features = ["dstar"] }
+rustyline = "18"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-[target.'cfg(target_os = "macos")'.dependencies]
-kenwood-transport = { path = "../kenwood-transport", default-features = false, features = [
-  "native-bluetooth",
-] }
+# Checked offsets, presentation timestamps and session log filenames.
+[dependencies.time]
+default-features = false
+features = ["formatting", "local-offset", "macros"]
+version = "0.3"
+
+[dependencies.tokio]
+features = ["rt-multi-thread", "macros", "sync", "time", "signal"]
+version = "1"
+
+[dev-dependencies]
+proptest = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies.kenwood-transport]
+default-features = false
+features = ["native-bluetooth"]
+path = "../kenwood-transport"
 
 # KNOWN DIVERGENCE FROM WORKSPACE: a crate-local [lints.<group>] block
 # fully REPLACES the workspace block (no merge). Both blocks below
@@ -70,61 +62,58 @@ kenwood-transport = { path = "../kenwood-transport", default-features = false, f
 # multiple_crate_versions, redundant_pub_crate). This crate contains no
 # FFI and keeps `unsafe_code = "forbid"`.
 [lints.rust]
-unsafe_code = "forbid"
-missing_docs = "deny"
-missing_debug_implementations = "deny"
-unreachable_pub = "deny"
-unused_results = "deny"
 elided_lifetimes_in_paths = "deny"
-trivial_casts = "deny"
-trivial_numeric_casts = "deny"
-unused_import_braces = "deny"
-unused_qualifications = "deny"
+let_underscore_drop = "deny"
+missing_debug_implementations = "deny"
+missing_docs = "deny"
 non_ascii_idents = "deny"
 single_use_lifetimes = "deny"
-let_underscore_drop = "deny"
+trivial_casts = "deny"
+trivial_numeric_casts = "deny"
+unreachable_pub = "deny"
+unsafe_code = "forbid"
 unused_crate_dependencies = "deny"
+unused_import_braces = "deny"
+unused_qualifications = "deny"
+unused_results = "deny"
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }
-pedantic = { level = "deny", priority = -1 }
-nursery = { level = "deny", priority = -1 }
 cargo = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
 restriction = { level = "allow", priority = -1 }
 # Match workspace restriction-lint policy
-undocumented_unsafe_blocks = "deny"
+indexing_slicing = "deny"
 missing_assert_message = "deny"
 missing_const_for_fn = "deny"
-indexing_slicing = "deny"
+undocumented_unsafe_blocks = "deny"
 # `#[allow]` ban: see root workspace.lints.clippy for rationale.
 allow_attributes = "deny"
 allow_attributes_without_reason = "deny"
 # Forward-protection lints: mirror the workspace block exactly.
-todo = "deny"
-unimplemented = "deny"
 dbg_macro = "deny"
-mem_forget = "deny"
+expect_used = "deny"
 format_push_string = "deny"
 infinite_loop = "deny"
-panic = "deny"
-unwrap_used = "deny"
-expect_used = "deny"
+mem_forget = "deny"
 module_name_repetitions = "allow"
 multiple_crate_versions = "allow"
+panic = "deny"
 redundant_pub_crate = "allow"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"
 
 # Mirrors the workspace `[lints.rustdoc]` block; restated here because this crate's
 # `[lints]` block replaces the workspace one entirely.
 [lints.rustdoc]
-broken_intra_doc_links = "deny"
-private_intra_doc_links = "deny"
-missing_crate_level_docs = "deny"
-invalid_codeblock_attributes = "deny"
 bare_urls = "deny"
+broken_intra_doc_links = "deny"
+invalid_codeblock_attributes = "deny"
+missing_crate_level_docs = "deny"
+private_intra_doc_links = "deny"
 unescaped_backticks = "deny"
-
-[dev-dependencies]
-proptest = "1"
 
 # Integration test that spawns the REPL binary with mock radio + fixture scripts.
 # Declaring `required-features = ["testing"]` here means cargo skips compiling it entirely

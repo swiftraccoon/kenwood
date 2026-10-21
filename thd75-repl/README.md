@@ -1,149 +1,157 @@
 # thd75-repl
 
-Accessible command-line REPL for the Kenwood TH-D75 transceiver. Its screen-reader-oriented output contract draws on nine published accessibility standards and guidance sources.
+Line-oriented CAT control and APRS KISS commands for the Kenwood TH-D75,
+with checked command parsing and plain-text output. The library supplies pure
+argument, script, formatting and lint operations; the binary owns connections
+and mode transitions. APIs are experimental and the package is unpublished.
 
-## Features
+## Connections and modes
 
-- CAT radio inspection and verified controls, including frequency reads and
-  stepping, memory recall, mode, squelch, power, and VOX
-- D-STAR reflector gateway (DPlus/DExtra/DCS, REF/XRF/XLX/DCS reflectors)
-- APRS KISS mode (packet radio)
-- Auto-detect a complete DV Gateway/MMDVM wire response on startup
-- Offer to download Pi-Star host files when connecting to a reflector without them
-- Plain text output, one line at a time
-- No box drawing, escape sequences, or cursor repositioning
-- Per-command help via `help <command>` and `help all`
-- Full radio state dump via `status`
-- Re-announce previous output via `last`, `last N`, or `last all`
-- Transmit confirmation on every TX command (disable with `--yes`)
-- Verbose / quiet toggle for monitor modes (`verbose on|off`, `quiet`)
-- Accessibility output self-check via `thd75-repl check`
-- Script mode via `--script <file>` for batch operation
-- Local-time timestamps via `--local-time` and `--utc-offset=+HH:MM`
-
-## Accessibility contract
-
-The output design draws requirements and guidance from:
-
-- WCAG 2.1 Level AA
-- Section 508 of the US Rehabilitation Act
-- CHI 2021 CLI accessibility paper (Pradhan et al.)
-- EN 301 549 v3.2.1
-- ISO 9241-171
-- ITU-T Recommendation F.790
-- BRLTTY compatibility
-- Handi-Ham Program recommendations
-- ARRL accessibility resources
-
-The locally enforceable contract consists of 14 mechanically checked rules (R1-R14) covering line length, ASCII purity, error prefixes, unit spelling, boolean rendering, label format, and more. Tests exercise representative output from each formatter against that rule set. Passing these checks is not an independent certification of complete conformance to every external source above.
-
-Run `thd75-repl check` to verify the mechanically checked output contract. The subcommand exercises every formatter with representative inputs, runs the accessibility lint, and prints a rule-by-rule report. Exit 0 means the generated sample set passes all 14 local rules.
-
-## Usage
-
-```
-thd75-repl [--port /dev/cu.usbmodem1234] [--baud 115200]
+```text
+thd75-repl --port /dev/cu.usbmodem1234 --baud 115200
+thd75-repl --port 00-11-22-33-44-55 --port-interface bluetooth
 ```
 
-### Session-wide flags
+Initial discovery prefers USB, then Bluetooth. An explicit `--port-interface`
+disambiguates an opaque serial path. Baud rates are nonzero; serial Bluetooth
+uses the model library's preset. Native macOS Bluetooth requires an exact
+paired address so reconnecting retains the selected physical radio.
 
-- `--timestamps` / `-t`: prepend `[HH:MM:SS]` to every output line (UTC by default)
-- `--local-time`: use local time in timestamps (detected from `date +%z` on Unix)
-- `--utc-offset=+HH:MM`: override the timezone offset manually
-- `--history-lines=N`: set the `last` command history buffer size (default 30)
-- `--yes`: skip transmit confirmation prompts for this session (use with caution)
+CAT startup reads the model, firmware and AE serial identity before command
+dispatch. Later CAT recovery compares the retained serial/model identity before
+restoring cached streaming settings or accepting further commands. A mismatched
+identity blocks CAT use and reports the original and observed identities.
 
-### Interactive commands
+The binary has CAT, APRS and binary-only MMDVM connection states. CAT commands
+read or change supported settings; `help`, `help <command>` and `help all`
+describe their accepted arguments. An omitted band selects A; an invalid
+supplied band or setter value is rejected before a radio exchange. `lock`
+reports that no verified CAT key-lock operation is available. Direct frequency
+writes remain unavailable; `tune` delegates to the model's checked workflow.
 
-At the `d75>` prompt, the most useful commands are:
+`aprs start W1AW b 7` enters KISS on TNC data Band B with source W1AW-7.
+APRS commands send checked messages, positions, objects, status and motion
+updates. `aprs stop` exits KISS and re-proves CAT synchronization. Required
+transmit confirmations refuse noninteractive input unless `--yes` is supplied.
+APRS startup requires confirmation before entering KISS because it enables
+automatic acknowledgements and query replies. Adding `digi` also enables
+automatic relaying. Refusal keeps the CAT connection unchanged.
+The `igate` command runs the APRS-IS bridge with a checked locality policy;
+uploads wait for a matching server-verified login. It disconnects on Ctrl-C.
 
-- `status`: dump the full radio state in one block
-- `last` / `last 5` / `last all`: re-announce previous output
-- `help` / `help <cmd>` / `help all`: help, per-command or all commands
-- `verbose on` / `quiet`: toggle monitor verbosity
-- `confirm on` / `confirm off`: toggle transmit confirmation
+Kenwood D-STAR modem initialization is unavailable because its configuration
+layout is unverified. `dstar start <callsign> [reflector]` validates its arguments
+and returns the typed unsupported-profile failure before discovery, Terminal
+activation or radio writes in batch startup. Interactive rejection leaves the
+open connection unchanged. This binary provides no reflector relay or echo
+runtime. The shared D-STAR and MMDVM libraries retain their independent APIs.
 
-Standard commands cover frequency reads and stepping, mode, power, squelch,
-attenuator, VOX, dual band, Bluetooth, FM radio, memory recall, GPS, URCALL, and
-reflector linking. Arbitrary direct frequency tuning currently reports a
-fail-closed safety error before radio I/O because direct FO/FQ writes are not
-verified on hardware. The `lock` command reports that no verified CAT key-lock operation
-is available; it does not change the radio.
+A positively identified MMDVM connection blocks CAT commands. With
+`--exit-terminal-mode`, the program waits for an input line after the radio's
+Menu 650 change, then reopens the retained connection and checks CAT identity
+and firmware. EOF or an input failure closes the connection without reopening.
+`--set-gateway-off` instead uses the CAT-capable interface, validates the exact
+supported firmware schema and performs the model's verified Menu 650 update.
+An interrupted MCP exchange completes its bounded protocol cleanup before the
+program reports the signal and resulting radio state.
 
-## Script mode
+## Output, scripts and errors
 
-Run a sequence of commands from a file and exit:
+Program messages pass through one stdout/history operation. LF separates
+logical lines; other controls and non-ASCII characters use visible Rust-style
+escapes. Physical lines contain at most 80 printable ASCII bytes. Wrapped
+continuations begin `Continued: `. A selected timestamp prefixes every physical
+line. Tracing diagnostics are separate, opt-in developer output.
 
-```
-thd75-repl --script ~/contest-setup.txt
-```
+`--timestamps` selects UTC. `--local-time` detects a fixed UTC offset where
+available; `--utc-offset=+05:30` selects a checked explicit offset. `last`,
+`last N` and `last all` replay original stored lines without adding timestamps
+or recording duplicates. `--history-lines` sets capacity, default 30; zero
+clears and disables retention. Output and resizing share one mutex. The first
+stdout write or flush failure stops subsequent writes and is returned before
+process success. Ordinary blocking terminal output has no application deadline.
 
-Lines starting with `#` are comments. Blank lines are skipped. `exit` / `quit` ends the script.
-
-Example `contest-setup.txt`:
-
-```
-# Contest startup
-power a high
-mode a fm
-squelch a 3
-status
-```
-
-Transmit commands in script mode require `--yes` on the command line to run unattended.
-
-## D-STAR Gateway
-
-```
-d75> dstar start KQ4NIT
-dstar> link REF030C
-dstar> monitor
-dstar> echo
-dstar> unlink
-dstar> dstar stop
-```
-
-Startup validates the station identity and reflector before changing radio mode.
-TH-D75 mode entry and restoration remain in `kenwood-thd75`; the shared
-`mmdvm::dstar` runtime handles modem initialization, frame queues, and events.
-Voice remains raw AMBE throughout the relay. `echo` records your own
-transmission and plays it back through the same modem path the reflector relay
-uses, so a working echo confirms the radio-side playback path only.
-
-## Logging
-
-By default no log file is created and no tracing output is written;
-the terminal only shows normal REPL output. File logging is opt-in
-because trace-level capture records every D-STAR voice packet and grows
-quickly.
-
-To enable a log file, pass `--log-level` or `--trace`:
-
-```
-thd75-repl --trace               # trace level: captures every packet
-thd75-repl --log-level=debug     # state transitions + decoded events
-thd75-repl --log-level=info      # high-level session flow only
+```text
+thd75-repl --script commands.txt
+thd75-repl --script - --yes
+thd75-repl check
 ```
 
-File location (one fresh file per session, suffix is the UTC session
-start time at second granularity; nothing rotates, so old files
-accumulate until you delete them):
+Scripts preserve command order, skip blank lines and lines starting with `#`,
+and stop at quit or end of input. Parse errors and ordinary CAT command errors
+are printed while processing continues. Input, confirmation I/O, APRS I/O,
+APRS-IS bridge, mode-restoration or connection-close failures terminate with a
+failing exit status.
+There is no strict-script flag. Batch D-STAR startup is rejected while loading
+commands, before any connection opens. Both quit and end of input explicitly
+exit APRS and close the connection; simultaneous operation and cleanup failures
+retain their typed causes. Closing does not restore a persistent radio setting.
 
-- macOS: `~/Library/Logs/thd75-repl/thd75-repl.log.<YYYY-MM-DD-HHMMSS>`
-- Linux: `~/.local/state/thd75-repl/thd75-repl.log.<YYYY-MM-DD-HHMMSS>`
-- Windows: `%LOCALAPPDATA%\thd75-repl\logs\thd75-repl.log.<YYYY-MM-DD-HHMMSS>`
+`check` evaluates eight line rules on its named samples and identifies six
+other rules requiring command or source tests. Its zero exit status describes
+those evaluated samples. These are local presentation rules, with no external
+accessibility certification claim.
 
-For live stderr output (power users, no file), set `RUST_LOG`:
+## Library examples
 
+Argument parsing validates the complete station identity before I/O:
+
+```rust
+use thd75_repl::aprs_args::StartArgs;
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let request = StartArgs::parse(&["W1AW", "b", "7"])?;
+assert_eq!(request.address().to_string(), "W1AW-7");
+# Ok(()) }
 ```
-RUST_LOG=dstar_gateway=debug thd75-repl
-RUST_LOG=dstar_gateway=trace,mmdvm::dstar=debug thd75-repl
+
+Scripts expose read-only command order or transfer their owned commands:
+
+```rust
+use thd75_repl::script::Script;
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let script = Script::from_reader(&b"# setup\nhelp\nquit\n"[..])?;
+assert_eq!(script.commands(), ["help", "quit"]);
+# Ok(()) }
 ```
 
-`RUST_LOG` and `--log-level` are independent: you can combine them
-(live stderr stream + persistent file) or use either alone.
+Pure rendering and linting can be used without a connection:
 
-## Requirements
+```rust
+use thd75_repl::{lint, render_message};
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let lines = render_message("Station: W1AW\u{1b}", None);
+assert_eq!(lines, [r"Station: W1AW\u{1b}"]);
+lint::check_output(&lines.join("\n"))?;
+# Ok(()) }
+```
 
-- Rust 1.94+
-- Kenwood TH-D75 connected via USB or Bluetooth
+`aprintln!` applies the same rendering, timestamps, history and error retention:
+
+```rust
+thd75_repl::aprintln!("Status: {}", "ready");
+```
+
+History can also retain rendered messages without writing to stdout:
+
+```rust
+use thd75_repl::{last_lines, record_output, set_history_capacity};
+set_history_capacity(2);
+record_output("Status: ready");
+assert_eq!(last_lines(1), ["Status: ready"]);
+```
+
+## Logging and testing
+
+Logging is disabled by default. `--log-level=debug` or `--trace` reserves a new
+file with exclusive creation under the platform log directory. UTC start time
+names the file; same-second collisions receive numbered suffixes, up to 1024
+attempts. Existing logs are never truncated and files do not rotate. The
+asynchronous tracing sink is best effort and can drop records under sustained
+load; it is not a durable capture journal. `RUST_LOG` independently enables
+stderr tracing.
+
+Use the pinned workspace toolchain and `--features testing` for hardware-free
+mock integration tests. The feature can be selected in any build profile.
+Full-tree validation follows
+[CONTRIBUTING](https://github.com/swiftraccoon/kenwood/blob/main/CONTRIBUTING.md).
+GPL-2.0-or-later licensing is preserved.

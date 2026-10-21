@@ -6,9 +6,9 @@
 
 // Dev-dependencies pulled in by sibling integration tests. Acknowledge them here so
 // `unused_crate_dependencies` stays silent for this compilation unit.
+use aprs_is as _;
 use clap as _;
 use dirs_next as _;
-use dstar_gateway as _;
 use dstar_gateway_core as _;
 use kenwood_thd75 as _;
 use kenwood_transport as _;
@@ -74,49 +74,22 @@ fn r10_no_print_without_newline() -> TestResult {
 
 #[test]
 fn r11_no_cursor_move_or_spinner_bytes() -> TestResult {
-    // Scan for `\x1b[`, `\r` (carriage return), and `\x08` (backspace)
-    // inside string literals. These are the three ways to move the
-    // cursor or overwrite content, which screen readers cannot handle.
-    //
-    // Iterate line by line so we can skip comments that legitimately
-    // describe these patterns as part of rule documentation.
+    // The renderer escapes every control byte, including dynamic radio text.
+    // Check that ordinary stdout calls cannot bypass that operation. Wire
+    // parsers and negative fixtures may contain control-byte literals.
     for file in src_files()? {
-        // This test file itself mentions these escape sequences in prose.
-        if file.ends_with("static_rules.rs") {
-            continue;
-        }
-        // lint.rs has unit tests whose inputs deliberately contain
-        // `\x1b[` and `\r` to exercise the lint rule that rejects them.
-        if file.ends_with("lint.rs") {
-            continue;
-        }
-        // mock_scenarios.rs programs CAT wire bytes into a mock
-        // transport. Those bytes are never printed to stdout, so the
-        // `\r` they contain does not violate the cursor-move rule.
-        if file.ends_with("mock_scenarios.rs") {
-            continue;
-        }
         let text = fs::read_to_string(&file)?;
         for (line_no, line) in text.lines().enumerate() {
             let trimmed = line.trim_start();
             if trimmed.starts_with("//") {
                 continue;
             }
+            let raw_println = line.contains("println!(")
+                && !line.contains("aprintln!(")
+                && !line.contains("eprintln!(");
             assert!(
-                !line.contains("\\x1b["),
-                "R11 violation: {} line {}: contains \\x1b[ (ANSI cursor/color)",
-                file.display(),
-                line_no + 1
-            );
-            assert!(
-                !line.contains("\\r"),
-                "R11 violation: {} line {}: contains \\r (carriage return)",
-                file.display(),
-                line_no + 1
-            );
-            assert!(
-                !line.contains("\\x08"),
-                "R11 violation: {} line {}: contains \\x08 (backspace)",
+                !raw_println && (file.ends_with("lib.rs") || !line.contains("stdout()")),
+                "R11 violation: {} line {} bypasses the shared stdout renderer: {line}",
                 file.display(),
                 line_no + 1
             );
@@ -131,13 +104,9 @@ fn r11_no_cursor_move_or_spinner_bytes() -> TestResult {
     reason = "intentional: we scan source files for this literal"
 )]
 fn r13_no_ad_hoc_bracket_timestamps() -> TestResult {
-    // `[HH:MM:SS]` timestamps should only be produced by the
-    // `aprintln!` macro. Anywhere else in the code is an ad-hoc
-    // timestamp that won't get the verbose/quiet treatment right.
-    //
-    // We scan for the literal format pattern used by the timestamp
-    // macro today (two-digit hours, minutes, seconds). Only `lib.rs`
-    // (where the `aprintln!` macro lives) is allowed.
+    // Timestamp prefixes belong to the shared renderer in lib.rs. This
+    // literal-pattern check detects duplicate implementations of that prefix;
+    // runtime tests separately exercise rendering and replay behavior.
     for file in src_files()? {
         let text = fs::read_to_string(&file)?;
         let is_allowed = file.ends_with("lib.rs");
@@ -153,83 +122,23 @@ fn r13_no_ad_hoc_bracket_timestamps() -> TestResult {
     Ok(())
 }
 
-/// Line spans (0-based, inclusive) of the named top-level functions,
-/// found by counting braces from each `fn <name>(` declaration line
-/// until the body's depth returns to zero.
-///
-/// Brace counting ignores braces inside string literals and comments;
-/// that is fine here because format strings keep their braces paired,
-/// so imbalance from literals cannot occur in this crate's source. A
-/// span that ends early would only make the check stricter (an
-/// `eprintln!` would fall outside it and fail loudly), never looser.
-fn function_spans(lines: &[&str], names: &[&str]) -> Vec<(usize, usize)> {
-    let mut spans = Vec::new();
-    let mut line_no = 0;
-    while line_no < lines.len() {
-        let is_decl = lines
-            .get(line_no)
-            .is_some_and(|current| names.iter().any(|n| current.contains(&format!("fn {n}("))));
-        if !is_decl {
-            line_no += 1;
-            continue;
-        }
-        let mut depth = 0i64;
-        let mut body_started = false;
-        let mut end = line_no;
-        for (j, line) in lines.iter().enumerate().skip(line_no) {
-            for c in line.chars() {
-                match c {
-                    '{' => {
-                        depth += 1;
-                        body_started = true;
-                    }
-                    '}' => depth -= 1,
-                    _ => {}
-                }
-            }
-            if body_started && depth <= 0 {
-                end = j;
-                break;
-            }
-        }
-        spans.push((line_no, end));
-        line_no = end + 1;
-    }
-    spans
-}
-
 #[test]
 fn r14_no_eprintln_in_user_output_path() -> TestResult {
-    // User-facing output goes to stdout via println!/aprintln!.
-    // Diagnostics go to stderr via `tracing`. `eprintln!` is a
-    // code smell: it bypasses tracing and bypasses stdout. The
-    // exceptions, checked by actual function span rather than "the
-    // declaration appears somewhere earlier in the file" (which
-    // exempted everything below `init_logging` in main.rs):
-    // - `init_logging` / `run_main`: startup warnings before the
-    //   tracing subscriber exists.
-    // - `main`: the fatal-error printer (renders errors via
-    //   `Display` on stderr with a real exit code).
+    // Ordinary messages use the shared stdout renderer. Fatal errors render
+    // explicitly before writing stderr; opt-in diagnostics use tracing.
     for file in src_files()? {
         let text = fs::read_to_string(&file)?;
-        let lines: Vec<&str> = text.lines().collect();
-        let allowed = function_spans(&lines, &["init_logging", "run_main", "main"]);
-        for (line_no, line) in lines.iter().enumerate() {
+        for (line_no, line) in text.lines().enumerate() {
             if line.trim_start().starts_with("//") {
                 continue;
             }
-            if line.contains("eprintln!") {
-                let in_allowed = allowed
-                    .iter()
-                    .any(|&(start, end)| line_no >= start && line_no <= end);
-                assert!(
-                    in_allowed,
-                    "R14 violation: {} line {}: eprintln! outside init_logging/run_main/main: {}",
-                    file.display(),
-                    line_no + 1,
-                    line.trim()
-                );
-            }
+            assert!(
+                !line.contains("eprintln!"),
+                "R14 violation: {} line {} bypasses rendered errors or tracing: {}",
+                file.display(),
+                line_no + 1,
+                line.trim()
+            );
         }
     }
     Ok(())

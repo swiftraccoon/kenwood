@@ -5,34 +5,11 @@
 //! stdout. All output is plain text, one self-contained line per
 //! datum, designed for screen-reader accessibility.
 //!
-//! # Accessibility standards (WCAG 2.1 + CHI 2021 CLI study)
-//!
-//! These rules are mandatory for all output in this module:
-//!
-//! - **One self-contained line per datum.** Screen readers navigate
-//!   line-by-line; each line must make sense without context from
-//!   adjacent lines. No indented sub-items; repeat the label.
-//! - **Label-colon-value format.** Every response starts with a label
-//!   (e.g. "Band A frequency: 146.52 megahertz"). WCAG 1.3.1.
-//! - **Natural language units.** Say "megahertz" not "MHz", "on"/"off"
-//!   not "true"/"false" or "1"/"0". WCAG 3.1.2.
-//! - **"Error:" prefix on all errors.** Screen reader users search
-//!   for this keyword. WCAG 3.3.1.
-//! - **Explicit confirmation after mutations.** Never return silently
-//!   after a set command. WCAG 3.3.1.
-//! - **Count summary after lists.** "5 programmed channels found."
-//!   tells the user the list is done.
-//! - **No box drawing, ASCII art, Unicode symbols, or spinners.**
-//!   Screen readers read these character-by-character. WCAG 1.1.1.
-//! - **No ANSI color/escape sequences.** They are invisible to screen
-//!   readers. If added later, gate behind `NO_COLOR` and `TERM=dumb`.
-//!   WCAG 1.4.1.
-//! - **No cursor repositioning or line overwriting (`\r`).** Causes
-//!   screen readers to re-announce partial lines.
-//! - **Lines under 80 characters.** Long lines require horizontal
-//!   scrolling, which is painful with character-by-character review.
-//! - **Diagnostics to stderr, user output to stdout.** Separation lets
-//!   users pipe stdout to speech tools or scripts.
+//! Messages follow the local output rules in `thd75_repl::lint`. The shared
+//! emitter escapes dynamic controls/non-ASCII and wraps physical lines at
+//! 80 bytes. Mutation replies describe the local CAT result; setting a routing
+//! destination is not a reflector acknowledgement. These software rules carry
+//! no accessibility certification or hardware-compatibility claim.
 
 use kenwood_thd75::Radio;
 use kenwood_thd75::types::{
@@ -41,12 +18,25 @@ use kenwood_thd75::types::{
 };
 use kenwood_transport::Transport;
 use thd75_repl::aprintln;
+use thd75_repl::confirm::{Confirmation, ConfirmationError};
 
-/// Parse a band argument ("a" or "b"), defaulting to A.
-fn parse_band(s: Option<&&str>) -> Band {
+#[cfg(test)]
+mod tests;
+
+/// Return refusal as a decision and retain confirmation I/O failures for cleanup.
+pub(crate) fn confirm_transmit() -> Result<bool, ConfirmationError> {
+    thd75_repl::confirm::tx_confirm().map(Confirmation::is_approved)
+}
+
+/// Parse a supplied A/B or 0/1 band; omission alone selects A.
+fn parse_band(s: Option<&&str>) -> Option<Band> {
     match s.map(|s| s.to_lowercase()).as_deref() {
-        Some("b" | "1") => Band::B,
-        _ => Band::A,
+        None | Some("a" | "0") => Some(Band::A),
+        Some("b" | "1") => Some(Band::B),
+        Some(other) => {
+            aprintln!("Error: invalid band {other:?}. Use a or b.");
+            None
+        }
     }
 }
 
@@ -118,9 +108,11 @@ pub(crate) async fn clock<T: Transport>(radio: &mut Radio<T>) {
 
 /// Read the current frequency on a band. Args: `[a|b]`, default A.
 pub(crate) async fn frequency<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
-    let band = parse_band(args.first());
+    let Some(band) = parse_band(args.first()) else {
+        return;
+    };
     match radio.get_frequency(band).await {
-        Ok(frequency) => aprintln!("{}", thd75_repl::output::frequency(band, frequency.as_hz())),
+        Ok(frequency) => aprintln!("{}", thd75_repl::output::frequency(band, frequency)),
         Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
     }
 }
@@ -194,13 +186,16 @@ pub(crate) async fn tnc_mode<T: Transport>(radio: &mut Radio<T>, args: &[&str]) 
 /// Auto, smart, and PTT make the radio transmit BY ITSELF while its
 /// TNC is in APRS mode, so those settings go through the transmit
 /// confirmation gate.
-pub(crate) async fn beacon_mode<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
+pub(crate) async fn beacon_mode<T: Transport>(
+    radio: &mut Radio<T>,
+    args: &[&str],
+) -> Result<(), ConfirmationError> {
     let Some(&arg) = args.first() else {
         match radio.get_beacon_mode().await {
             Ok(mode) => aprintln!("{}", thd75_repl::output::beacon_mode_read(mode)),
             Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
         }
-        return;
+        return Ok(());
     };
     let mode = match arg.to_lowercase().as_str() {
         "manual" => kenwood_thd75::types::BeaconMode::Manual,
@@ -213,7 +208,7 @@ pub(crate) async fn beacon_mode<T: Transport>(radio: &mut Radio<T>, args: &[&str
                 thd75_repl::output::error(format_args!("unknown beacon mode: {other}"))
             );
             aprintln!("Valid modes: manual, ptt, auto, smart");
-            return;
+            return Ok(());
         }
     };
     let transmits = matches!(
@@ -222,25 +217,31 @@ pub(crate) async fn beacon_mode<T: Transport>(radio: &mut Radio<T>, args: &[&str
             | kenwood_thd75::types::BeaconMode::Auto
             | kenwood_thd75::types::BeaconMode::SmartBeaconing
     );
-    if transmits && !thd75_repl::confirm::tx_confirm() {
-        return;
+    if transmits && !confirm_transmit()? {
+        return Ok(());
     }
     match radio.set_beacon_mode(mode).await {
         Ok(()) => aprintln!("{}", thd75_repl::output::beacon_mode_set(mode)),
         Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
     }
+    Ok(())
 }
 
 /// Read or set the squelch level. Args: `[a|b] [level]`.
-/// With one arg, reads. With two, sets (level 0-5).
+/// With one arg, reads. With two, sets a checked level from 0 through 6.
 pub(crate) async fn squelch<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
-    let band = parse_band(args.first());
+    let Some(band) = parse_band(args.first()) else {
+        return;
+    };
 
-    // Second arg present and numeric = set squelch.
-    if let Some(Ok(level)) = args.get(1).map(|s| s.parse::<u8>()) {
+    if let Some(token) = args.get(1) {
+        let Ok(level) = token.parse::<u8>() else {
+            aprintln!("Error: invalid squelch level {token:?}. Use a whole number.");
+            return;
+        };
         match kenwood_thd75::types::SquelchLevel::try_from(level) {
             Ok(sq) => match radio.set_squelch(band, sq).await {
-                Ok(()) => aprintln!("{}", thd75_repl::output::squelch_set(band, level)),
+                Ok(()) => aprintln!("{}", thd75_repl::output::squelch_set(band, sq)),
                 Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
             },
             Err(e) => aprintln!(
@@ -252,16 +253,18 @@ pub(crate) async fn squelch<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
     }
 
     match radio.get_squelch(band).await {
-        Ok(sq) => aprintln!("{}", thd75_repl::output::squelch_read(band, u8::from(sq))),
+        Ok(sq) => aprintln!("{}", thd75_repl::output::squelch_read(band, sq)),
         Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
     }
 }
 
 /// Read the signal strength meter on a band. Args: `[a|b]`.
 pub(crate) async fn smeter<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
-    let band = parse_band(args.first());
+    let Some(band) = parse_band(args.first()) else {
+        return;
+    };
     match radio.get_smeter(band).await {
-        Ok(reading) => aprintln!("{}", thd75_repl::output::smeter(band, &reading.to_string())),
+        Ok(reading) => aprintln!("{}", thd75_repl::output::smeter(band, reading)),
         Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
     }
 }
@@ -282,7 +285,11 @@ pub(crate) fn lock<T: Transport>(_radio: &mut Radio<T>, _args: &[&str]) {
 
 /// Read or set Bluetooth state. Args: `[on|off]`.
 pub(crate) async fn bluetooth<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
-    if let Some(val) = args.first().and_then(|s| parse_bool(s)) {
+    if let Some(token) = args.first() {
+        let Some(val) = parse_bool(token) else {
+            aprintln!("Error: invalid Bluetooth state {token:?}. Use on or off.");
+            return;
+        };
         match radio.set_bluetooth(val).await {
             Ok(()) => aprintln!("{}", thd75_repl::output::bluetooth(val)),
             Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
@@ -297,9 +304,15 @@ pub(crate) async fn bluetooth<T: Transport>(radio: &mut Radio<T>, args: &[&str])
 
 /// Read or set the attenuator on a band. Args: `[a|b] [on|off]`.
 pub(crate) async fn attenuator<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
-    let band = parse_band(args.first());
+    let Some(band) = parse_band(args.first()) else {
+        return;
+    };
 
-    if let Some(val) = args.get(1).and_then(|s| parse_bool(s)) {
+    if let Some(token) = args.get(1) {
+        let Some(val) = parse_bool(token) else {
+            aprintln!("Error: invalid attenuator state {token:?}. Use on or off.");
+            return;
+        };
         match radio.set_attenuator(band, val).await {
             Ok(()) => aprintln!("{}", thd75_repl::output::attenuator(band, val)),
             Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
@@ -319,34 +332,32 @@ pub(crate) async fn attenuator<T: Transport>(radio: &mut Radio<T>, args: &[&str]
 
 /// Step frequency up by one increment, then read back. Args: `[a|b]`.
 pub(crate) async fn step_up<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
-    let band = parse_band(args.first());
+    let Some(band) = parse_band(args.first()) else {
+        return;
+    };
     let result = async {
         radio.set_band(band).await?;
         radio.frequency_up().await
     }
     .await;
     match result {
-        Ok(frequency) => aprintln!(
-            "{}",
-            thd75_repl::output::stepped_up(band, frequency.as_hz())
-        ),
+        Ok(frequency) => aprintln!("{}", thd75_repl::output::stepped_up(band, frequency)),
         Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
     }
 }
 
 /// Step frequency down by one increment and read back. Args: `[a|b]`.
 pub(crate) async fn step_down<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
-    let band = parse_band(args.first());
+    let Some(band) = parse_band(args.first()) else {
+        return;
+    };
     let result = async {
         radio.set_band(band).await?;
         radio.frequency_down().await
     }
     .await;
     match result {
-        Ok(frequency) => aprintln!(
-            "{}",
-            thd75_repl::output::stepped_down(band, frequency.as_hz())
-        ),
+        Ok(frequency) => aprintln!("{}", thd75_repl::output::stepped_down(band, frequency)),
         Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
     }
 }
@@ -366,7 +377,9 @@ pub(crate) async fn tune<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
         return;
     }
 
-    let band = parse_band(args.first());
+    let Some(band) = parse_band(args.first()) else {
+        return;
+    };
     let Some(&freq_str) = args.get(1) else {
         return;
     };
@@ -383,7 +396,7 @@ pub(crate) async fn tune<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
         Ok(landed) => aprintln!(
             "Tuned band {} to {}.",
             band_name(band),
-            thd75_repl::output::freq_mhz(landed.as_hz())
+            thd75_repl::output::freq_mhz(landed)
         ),
         Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
     }
@@ -421,10 +434,7 @@ pub(crate) async fn channel<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
     match radio.get_regular_channel_record(channel).await {
         Ok(ch) => aprintln!(
             "{}",
-            thd75_repl::output::channel_read(
-                channel.as_raw(),
-                ch.channel.receive_frequency.as_hz(),
-            )
+            thd75_repl::output::channel_read(channel, ch.channel.receive_frequency,)
         ),
         Err(e) => aprintln!(
             "{}",
@@ -495,7 +505,10 @@ pub(crate) async fn channels<T: Transport>(radio: &mut Radio<T>, args: &[&str]) 
     let last_channel = RegularChannel::new(end - 1)
         .unwrap_or_else(|_| unreachable!("validated exclusive channel range"));
 
-    aprintln!("{}", thd75_repl::output::channels_reading(start, end - 1));
+    aprintln!(
+        "{}",
+        thd75_repl::output::channels_reading(first..=last_channel)
+    );
     match radio
         .read_regular_channel_records(RegularChannel::range_inclusive(first, last_channel))
         .await
@@ -507,10 +520,7 @@ pub(crate) async fn channels<T: Transport>(radio: &mut Radio<T>, args: &[&str]) 
                 for (num, ch) in &channel_entries {
                     aprintln!(
                         "{}",
-                        thd75_repl::output::channel_read(
-                            num.as_raw(),
-                            ch.channel.receive_frequency.as_hz()
-                        )
+                        thd75_repl::output::channel_read(*num, ch.channel.receive_frequency)
                     );
                 }
                 aprintln!(
@@ -530,28 +540,27 @@ pub(crate) async fn channels<T: Transport>(radio: &mut Radio<T>, args: &[&str]) 
 /// Read the full VFO (variable frequency oscillator) state. Args: `[a|b]`.
 /// Reports frequency, step size, transmit offset, and operating mode.
 pub(crate) async fn vfo<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
-    let band = parse_band(args.first());
+    let Some(band) = parse_band(args.first()) else {
+        return;
+    };
 
     match radio.get_frequency_full(band).await {
         Ok(ch) => {
             aprintln!(
                 "{}",
-                thd75_repl::output::frequency(band, ch.receive_frequency.as_hz())
+                thd75_repl::output::frequency(band, ch.receive_frequency)
             );
             aprintln!(
                 "{}",
-                thd75_repl::output::step_size_read(band, &ch.receive_step.to_string())
+                thd75_repl::output::step_size_read(band, ch.receive_step)
             );
             if ch.transmit_offset_or_frequency.as_hz() != 0 {
                 aprintln!(
                     "{}",
-                    thd75_repl::output::tx_offset(band, ch.transmit_offset_or_frequency.as_hz())
+                    thd75_repl::output::tx_offset(band, ch.transmit_offset_or_frequency)
                 );
             }
-            aprintln!(
-                "{}",
-                thd75_repl::output::mode_read(band, &ch.mode.to_string())
-            );
+            aprintln!("{}", thd75_repl::output::mode_read(band, ch.mode.into()));
         }
         Err(e) => {
             aprintln!(
@@ -571,15 +580,19 @@ pub(crate) async fn vfo<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
 pub(crate) async fn set_operating_mode<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
     if args.len() < 2 {
         // Read mode.
-        let band = parse_band(args.first());
+        let Some(band) = parse_band(args.first()) else {
+            return;
+        };
         match radio.get_operating_mode(band).await {
-            Ok(m) => aprintln!("{}", thd75_repl::output::mode_read(band, &m.to_string())),
+            Ok(m) => aprintln!("{}", thd75_repl::output::mode_read(band, m)),
             Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
         }
         return;
     }
 
-    let band = parse_band(args.first());
+    let Some(band) = parse_band(args.first()) else {
+        return;
+    };
     let Some(&mode_arg) = args.get(1) else {
         return;
     };
@@ -604,7 +617,7 @@ pub(crate) async fn set_operating_mode<T: Transport>(radio: &mut Radio<T>, args:
     };
 
     match radio.set_operating_mode(band, mode).await {
-        Ok(()) => aprintln!("{}", thd75_repl::output::mode_set(band, &mode.to_string())),
+        Ok(()) => aprintln!("{}", thd75_repl::output::mode_set(band, mode)),
         Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
     }
 }
@@ -617,7 +630,9 @@ pub(crate) async fn set_operating_mode<T: Transport>(radio: &mut Radio<T>, args:
 /// Valid levels: high (5W), medium (2W), low (0.5W), extra-low (50mW).
 pub(crate) async fn set_power<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
     if args.len() < 2 {
-        let band = parse_band(args.first());
+        let Some(band) = parse_band(args.first()) else {
+            return;
+        };
         match radio.get_power_level(band).await {
             Ok(level) => aprintln!("{}", thd75_repl::output::power_read(band, level)),
             Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
@@ -625,7 +640,9 @@ pub(crate) async fn set_power<T: Transport>(radio: &mut Radio<T>, args: &[&str])
         return;
     }
 
-    let band = parse_band(args.first());
+    let Some(band) = parse_band(args.first()) else {
+        return;
+    };
     let Some(&level_arg) = args.get(1) else {
         return;
     };
@@ -656,20 +673,17 @@ pub(crate) async fn set_power<T: Transport>(radio: &mut Radio<T>, args: &[&str])
 
 /// Read or set voice-operated transmit (VOX) settings.
 /// Args: `[on|off]`, `gain [0-9]`, or `delay [0-6]`.
-#[expect(
-    clippy::cognitive_complexity,
-    reason = "Dispatch for the `vox` command: four sub-command arms (`gain`, `delay`, on/off, \
-              read) each fork into parse-success/parse-failure plus radio-Ok/Err branches. \
-              Splitting into helpers would require passing `&mut Radio<T>` around and multiply \
-              lifetime noise without clarifying the straightforward command structure."
-)]
 pub(crate) async fn vox<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
     match args.first().map(|s| s.to_lowercase()).as_deref() {
         Some("gain") => {
-            if let Some(Ok(g)) = args.get(1).map(|s| s.parse::<u8>()) {
+            if let Some(token) = args.get(1) {
+                let Ok(g) = token.parse::<u8>() else {
+                    aprintln!("Error: invalid VOX gain {token:?}. Use a whole number.");
+                    return;
+                };
                 match kenwood_thd75::types::VoxGain::try_from(g) {
                     Ok(gain) => match radio.set_vox_gain(gain).await {
-                        Ok(()) => aprintln!("{}", thd75_repl::output::vox_gain_set(g)),
+                        Ok(()) => aprintln!("{}", thd75_repl::output::vox_gain_set(gain)),
                         Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
                     },
                     Err(e) => aprintln!(
@@ -679,16 +693,20 @@ pub(crate) async fn vox<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
                 }
             } else {
                 match radio.get_vox_gain().await {
-                    Ok(gain) => aprintln!("{}", thd75_repl::output::vox_gain_read(u8::from(gain))),
+                    Ok(gain) => aprintln!("{}", thd75_repl::output::vox_gain_read(gain)),
                     Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
                 }
             }
         }
         Some("delay") => {
-            if let Some(Ok(d)) = args.get(1).map(|s| s.parse::<u8>()) {
+            if let Some(token) = args.get(1) {
+                let Ok(d) = token.parse::<u8>() else {
+                    aprintln!("Error: invalid VOX delay {token:?}. Use a whole number.");
+                    return;
+                };
                 match kenwood_thd75::types::VoxDelay::try_from(d) {
                     Ok(delay) => match radio.set_vox_delay(delay).await {
-                        Ok(()) => aprintln!("{}", thd75_repl::output::vox_delay_set(d)),
+                        Ok(()) => aprintln!("{}", thd75_repl::output::vox_delay_set(delay)),
                         Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
                     },
                     Err(e) => aprintln!(
@@ -699,7 +717,7 @@ pub(crate) async fn vox<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
             } else {
                 match radio.get_vox_delay().await {
                     Ok(delay) => {
-                        aprintln!("{}", thd75_repl::output::vox_delay_read(u8::from(delay)));
+                        aprintln!("{}", thd75_repl::output::vox_delay_read(delay));
                     }
                     Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
                 }
@@ -728,7 +746,11 @@ pub(crate) async fn vox<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
 
 /// Read or set dual-band display mode. Args: `[on|off]`.
 pub(crate) async fn dual_band<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
-    if let Some(val) = args.first().and_then(|s| parse_bool(s)) {
+    if let Some(token) = args.first() {
+        let Some(val) = parse_bool(token) else {
+            aprintln!("Error: invalid dual-band state {token:?}. Use on or off.");
+            return;
+        };
         let mode = if val {
             BandMode::Dual
         } else {
@@ -758,7 +780,11 @@ pub(crate) async fn dual_band<T: Transport>(radio: &mut Radio<T>, args: &[&str])
 /// A supplied `on`/`off` argument updates Menu 700 through verified MCP
 /// read-modify-write and reconnects to CAT before returning.
 pub(crate) async fn fm_radio<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
-    if let Some(val) = args.first().and_then(|s| parse_bool(s)) {
+    if let Some(token) = args.first() {
+        let Some(val) = parse_bool(token) else {
+            aprintln!("Error: invalid FM receiver state {token:?}. Use on or off.");
+            return;
+        };
         match radio.set_fm_radio_via_mcp(val).await {
             Ok(()) => aprintln!("{}", thd75_repl::output::fm_radio(val)),
             Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
@@ -778,15 +804,18 @@ pub(crate) async fn fm_radio<T: Transport>(radio: &mut Radio<T>, args: &[&str]) 
 /// Read or set the frequency step size. Args: `[a|b] [index]`.
 /// Index 0-11 maps to 5, 6.25, 8.33, 9, 10, 12.5, 15, 20, 25, 30, 50, 100 kHz.
 pub(crate) async fn step_size<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
-    let band = parse_band(args.first());
+    let Some(band) = parse_band(args.first()) else {
+        return;
+    };
 
-    if let Some(Ok(idx)) = args.get(1).map(|s| s.parse::<u8>()) {
+    if let Some(token) = args.get(1) {
+        let Ok(idx) = token.parse::<u8>() else {
+            aprintln!("Error: invalid step index {token:?}. Use a whole number.");
+            return;
+        };
         match kenwood_thd75::types::StepSize::try_from(idx) {
             Ok(step) => match radio.set_step_size(band, step).await {
-                Ok(()) => aprintln!(
-                    "{}",
-                    thd75_repl::output::step_size_set(band, &step.to_string())
-                ),
+                Ok(()) => aprintln!("{}", thd75_repl::output::step_size_set(band, step)),
                 Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
             },
             Err(e) => aprintln!(
@@ -796,10 +825,7 @@ pub(crate) async fn step_size<T: Transport>(radio: &mut Radio<T>, args: &[&str])
         }
     } else {
         match radio.get_step_size(band).await {
-            Ok(step) => aprintln!(
-                "{}",
-                thd75_repl::output::step_size_read(band, &step.to_string())
-            ),
+            Ok(step) => aprintln!("{}", thd75_repl::output::step_size_read(band, step)),
             Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
         }
     }
@@ -816,7 +842,9 @@ pub(crate) async fn recall<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
         return;
     }
 
-    let band = parse_band(args.first());
+    let Some(band) = parse_band(args.first()) else {
+        return;
+    };
     let Some(&ch_str) = args.get(1) else {
         return;
     };
@@ -862,7 +890,9 @@ pub(crate) async fn gps<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
         return;
     };
 
-    let settings = GpsSettings::new(gps_on, pc_on);
+    let settings = GpsSettings::new()
+        .with_enabled(gps_on)
+        .with_pc_output(pc_on);
     match radio.set_gps_settings(settings).await {
         Ok(()) => aprintln!("{}", thd75_repl::output::gps_settings(settings)),
         Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
@@ -879,10 +909,7 @@ pub(crate) async fn urcall<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
     if args.is_empty() {
         match radio.get_urcall().await {
             Ok(entry) => {
-                aprintln!(
-                    "{}",
-                    thd75_repl::output::urcall_read(entry.callsign.as_str(), entry.suffix.as_str())
-                );
+                aprintln!("{}", thd75_repl::output::urcall_read(&entry));
             }
             Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
         }
@@ -907,26 +934,27 @@ pub(crate) async fn urcall<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
             return;
         }
     };
-    let callsign_display = callsign.as_str().to_owned();
+    let success = thd75_repl::output::urcall_set(&callsign);
     match radio.set_urcall(callsign, suffix).await {
-        Ok(()) => aprintln!("{}", thd75_repl::output::urcall_set(&callsign_display)),
+        Ok(()) => aprintln!("{success}"),
         Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
     }
 }
 
 /// Set the D-STAR destination to CQCQCQ (general call to all stations).
-pub(crate) async fn cq<T: Transport>(radio: &mut Radio<T>) {
-    if !thd75_repl::confirm::tx_confirm() {
-        return;
+pub(crate) async fn cq<T: Transport>(radio: &mut Radio<T>) -> Result<(), ConfirmationError> {
+    if !confirm_transmit()? {
+        return Ok(());
     }
     match radio.set_cq().await {
         Ok(()) => aprintln!("{}", thd75_repl::output::cq_set()),
         Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
     }
+    Ok(())
 }
 
-/// Connect to a D-STAR reflector. Args: `<name> <module>`.
-/// Example: `reflector REF030 C` connects to REF030 module C.
+/// Set the radio's reflector-link request destination. Args: `<name> <module>`.
+/// Example: `reflector REF030 C` selects the request for REF030 module C.
 pub(crate) async fn reflector<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
     if args.len() < 2 {
         aprintln!("Usage: reflector <name> <module>");
@@ -960,19 +988,17 @@ pub(crate) async fn reflector<T: Transport>(radio: &mut Radio<T>, args: &[&str])
         );
         return;
     };
+    let success = thd75_repl::output::reflector_link_requested(name_typed, module);
     match radio.prepare_reflector_link(name_typed, module).await {
-        Ok(()) => aprintln!(
-            "{}",
-            thd75_repl::output::reflector_connected(name, module.as_char())
-        ),
+        Ok(()) => aprintln!("{success}"),
         Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
     }
 }
 
-/// Disconnect from the currently linked D-STAR reflector.
+/// Set the radio's reflector-unlink request destination.
 pub(crate) async fn unreflector<T: Transport>(radio: &mut Radio<T>) {
     match radio.prepare_reflector_unlink().await {
-        Ok(()) => aprintln!("{}", thd75_repl::output::reflector_disconnected()),
+        Ok(()) => aprintln!("{}", thd75_repl::output::reflector_unlink_requested()),
         Err(e) => aprintln!("{}", thd75_repl::output::error(e)),
     }
 }
@@ -986,7 +1012,7 @@ pub(crate) async fn unreflector<T: Transport>(radio: &mut Radio<T>) {
 /// The operation band is the band the radio's own controls act on
 /// (BC command). With no argument, reads. Parsing is strict: a setter
 /// must not guess, so anything other than `a` or `b` prints an error
-/// instead of defaulting like the read-path `parse_band` does.
+/// without defaulting a supplied invalid token.
 pub(crate) async fn band<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
     let Some(arg) = args.first() else {
         match radio.get_band().await {
@@ -1067,19 +1093,11 @@ pub(crate) async fn ifout<T: Transport>(radio: &mut Radio<T>, args: &[&str]) {
 /// is independent: a failing call prints a `"not available"` line
 /// and the dump continues with the next field instead of aborting.
 ///
-/// S-meter polls are defensive: the D75 firmware occasionally
-/// returns spurious values on Band B while squelch is open (the
-/// hardware-correct pattern is to gate SM reads on AI-pushed BY
-/// events, not to poll them directly), so the REPL accepts whatever the
-/// radio returns and only falls through to `"not available"` on
-/// an actual transport error. This keeps the command useful as a
-/// one-shot snapshot.
+/// The S-meter value is a single parsed CAT observation. Invalid responses
+/// and transport failures produce `"not available"`, like the other fields.
 #[expect(
     clippy::cognitive_complexity,
-    reason = "`status` intentionally enumerates every per-field fetch so a single flaky CAT \
-              command can't prevent the rest of the snapshot from printing. The linear list of \
-              if-let branches is the simplest way to encode that independence; extracting \
-              helpers would only hide the structure behind noise."
+    reason = "The snapshot reports each independent field and continues after a failed read."
 )]
 pub(crate) async fn status<T: Transport>(radio: &mut Radio<T>) {
     aprintln!("Reading radio status, please wait.");
@@ -1127,12 +1145,12 @@ pub(crate) async fn status<T: Transport>(radio: &mut Radio<T>) {
     for band in [Band::A, Band::B] {
         let name = band_name(band);
         if let Ok(frequency) = radio.get_frequency(band).await {
-            aprintln!("{}", thd75_repl::output::frequency(band, frequency.as_hz()));
+            aprintln!("{}", thd75_repl::output::frequency(band, frequency));
         } else {
             aprintln!("Band {name} frequency: not available");
         }
         if let Ok(m) = radio.get_operating_mode(band).await {
-            aprintln!("{}", thd75_repl::output::mode_read(band, &m.to_string()));
+            aprintln!("{}", thd75_repl::output::mode_read(band, m));
         } else {
             aprintln!("Band {name} mode: not available");
         }
@@ -1142,7 +1160,7 @@ pub(crate) async fn status<T: Transport>(radio: &mut Radio<T>) {
             aprintln!("Band {name} power: not available");
         }
         if let Ok(sq) = radio.get_squelch(band).await {
-            aprintln!("{}", thd75_repl::output::squelch_read(band, u8::from(sq)));
+            aprintln!("{}", thd75_repl::output::squelch_read(band, sq));
         } else {
             aprintln!("Band {name} squelch level: not available");
         }
@@ -1152,7 +1170,7 @@ pub(crate) async fn status<T: Transport>(radio: &mut Radio<T>) {
             aprintln!("Band {name} attenuator: not available");
         }
         if let Ok(reading) = radio.get_smeter(band).await {
-            aprintln!("{}", thd75_repl::output::smeter(band, &reading.to_string()));
+            aprintln!("{}", thd75_repl::output::smeter(band, reading));
         } else {
             aprintln!("Band {name} S-meter: not available");
         }

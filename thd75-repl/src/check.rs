@@ -1,18 +1,22 @@
 //! Accessibility output self-check.
 //!
 //! The `check` subcommand runs without connecting to a radio. It
-//! exercises every `output::*` formatter with representative inputs,
-//! runs the accessibility lint on every result, and prints a report.
+//! exercises the named sample generators below, runs the eight line-level
+//! rules on their output and identifies rules requiring separate tests.
 //!
 //! A blind ham can run `thd75-repl check` and read the report via
-//! their screen reader to verify the mechanically checked output contract.
+//! their screen reader to inspect these sample checks.
 
-use crate::{help_text, lint, output};
-use dstar_gateway_core::{Callsign, Module, ReflectorCallsign};
 use kenwood_thd75::types::{
-    Band, BatteryLevel, BeaconMode, FirmwareIdentity, GpsSettings, PowerLevel, RadioClock,
-    RadioDateTime, RadioModel, TncDataBand, TncMode, UsbAudioOutput,
+    Band, BatteryLevel, BeaconMode, DstarCallsign, DstarCallsignEntry, DstarSuffix,
+    FirmwareIdentity, Frequency, GpsSettings, Module, OperatingMode, PowerLevel, RadioClock,
+    RadioDateTime, RadioModel, ReflectorCallsign, RegularChannel, SMeterReading, SquelchLevel,
+    StepSize, TncDataBand, TncMode, UsbAudioOutput, VoxDelay, VoxGain,
 };
+use kenwood_thd75::{AprsMessage, Ax25Address, MessageId};
+
+use crate::aprs_args::LatLon;
+use crate::{help_text, lint, output};
 
 /// One entry in the coverage table: a human-readable source name and
 /// a generator that produces the representative outputs for that
@@ -51,23 +55,29 @@ const COVERAGE: &[(&str, Generator)] = &[
     ("output::gps_settings", gen_gps_settings),
     ("output::urcall_read", gen_urcall_read),
     ("output::urcall_set", gen_urcall_set),
-    ("output::reflector_connected", gen_reflector_connected),
+    ("output::reflector_link_requested", gen_reflector_requested),
     ("output::operation_band", gen_operation_band),
     ("output::usb_output", gen_usb_output),
     ("output::error", gen_error),
     ("output::warning", gen_warning),
     ("output::aprs_events", gen_aprs_events),
-    ("output::dstar_events", gen_dstar_events),
     ("output::startup", gen_startup),
     ("help_text::for_command", gen_help_text),
     ("help_text::mode_help", gen_mode_help),
 ];
 
+fn sample<T, E: std::fmt::Display>(value: Result<T, E>) -> T {
+    match value {
+        Ok(value) => value,
+        Err(error) => unreachable!("static output-check sample is invalid: {error}"),
+    }
+}
+
 fn gen_frequency() -> Vec<String> {
     let mut v = Vec::new();
     for band in [Band::A, Band::B] {
         for hz in [0u32, 146_520_000, 446_000_000, 1_200_000_000, 1_300_000_000] {
-            v.push(output::frequency(band, hz));
+            v.push(output::frequency(band, Frequency::new(hz)));
         }
     }
     v
@@ -75,30 +85,38 @@ fn gen_frequency() -> Vec<String> {
 
 fn gen_tuned_to() -> Vec<String> {
     vec![
-        output::tuned_to(Band::A, 146_520_000),
-        output::tuned_to(Band::B, 446_000_000),
+        output::tuned_to(Band::A, Frequency::new(146_520_000)),
+        output::tuned_to(Band::B, Frequency::new(446_000_000)),
     ]
 }
 
 fn gen_stepped_up() -> Vec<String> {
-    vec![output::stepped_up(Band::A, 146_525_000)]
+    vec![output::stepped_up(Band::A, Frequency::new(146_525_000))]
 }
 
 fn gen_stepped_down() -> Vec<String> {
-    vec![output::stepped_down(Band::A, 146_515_000)]
+    vec![output::stepped_down(Band::A, Frequency::new(146_515_000))]
 }
 
 fn gen_mode_read() -> Vec<String> {
-    ["FM", "NFM", "AM", "DV", "LSB", "USB", "CW"]
-        .iter()
-        .map(|m| output::mode_read(Band::A, m))
-        .collect()
+    [
+        OperatingMode::Fm,
+        OperatingMode::Nfm,
+        OperatingMode::Am,
+        OperatingMode::Dv,
+        OperatingMode::Lsb,
+        OperatingMode::Usb,
+        OperatingMode::Cw,
+    ]
+    .iter()
+    .map(|m| output::mode_read(Band::A, *m))
+    .collect()
 }
 
 fn gen_mode_set() -> Vec<String> {
-    ["FM", "DV"]
+    [OperatingMode::Fm, OperatingMode::Dv]
         .iter()
-        .map(|m| output::mode_set(Band::A, m))
+        .map(|m| output::mode_set(Band::A, *m))
         .collect()
 }
 
@@ -147,19 +165,20 @@ fn gen_power_set() -> Vec<String> {
 }
 
 fn gen_squelch_read() -> Vec<String> {
-    (0u8..=5)
-        .map(|l| output::squelch_read(Band::A, l))
+    (0u8..=SquelchLevel::MAX)
+        .map(|level| output::squelch_read(Band::A, sample(SquelchLevel::new(level))))
         .collect()
 }
 
 fn gen_squelch_set() -> Vec<String> {
-    (0u8..=5).map(|l| output::squelch_set(Band::A, l)).collect()
+    (0u8..=SquelchLevel::MAX)
+        .map(|level| output::squelch_set(Band::A, sample(SquelchLevel::new(level))))
+        .collect()
 }
 
 fn gen_smeter() -> Vec<String> {
-    ["S0", "S1", "S3", "S5", "S7", "S9"]
-        .iter()
-        .map(|r| output::smeter(Band::A, r))
+    (0..SMeterReading::COUNT)
+        .map(|raw| output::smeter(Band::A, sample(SMeterReading::new(raw))))
         .collect()
 }
 
@@ -225,10 +244,10 @@ fn gen_vox() -> Vec<String> {
         output::vox(true),
         output::vox(false),
         output::vox_set(true),
-        output::vox_gain_read(5),
-        output::vox_gain_set(7),
-        output::vox_delay_read(3),
-        output::vox_delay_set(4),
+        output::vox_gain_read(sample(VoxGain::new(5))),
+        output::vox_gain_set(sample(VoxGain::new(7))),
+        output::vox_delay_read(VoxDelay::MS_1000),
+        output::vox_delay_set(VoxDelay::MS_1500),
     ]
 }
 
@@ -242,15 +261,20 @@ fn gen_fm_radio() -> Vec<String> {
 
 fn gen_channel_read() -> Vec<String> {
     vec![
-        output::channel_read(0, 146_520_000),
-        output::channel_read(999, 446_000_000),
+        output::channel_read(sample(RegularChannel::new(0)), Frequency::new(146_520_000)),
+        output::channel_read(
+            sample(RegularChannel::new(999)),
+            Frequency::new(446_000_000),
+        ),
     ]
 }
 
 fn gen_channels_reading() -> Vec<String> {
     vec![
-        output::channels_reading(0, 19),
-        output::channels_reading(100, 199),
+        output::channels_reading(sample(RegularChannel::new(0))..=sample(RegularChannel::new(19))),
+        output::channels_reading(
+            sample(RegularChannel::new(100))..=sample(RegularChannel::new(199)),
+        ),
     ]
 }
 
@@ -264,42 +288,51 @@ fn gen_channels_summary() -> Vec<String> {
 
 fn gen_tx_offset() -> Vec<String> {
     vec![
-        output::tx_offset(Band::A, 600_000),
-        output::tx_offset(Band::B, 5_000_000),
+        output::tx_offset(Band::A, Frequency::new(600_000)),
+        output::tx_offset(Band::B, Frequency::new(5_000_000)),
     ]
 }
 
 fn gen_step_size() -> Vec<String> {
     vec![
-        output::step_size_read(Band::A, "25 kilohertz"),
-        output::step_size_set(Band::B, "12.5 kilohertz"),
+        output::step_size_read(Band::A, StepSize::Hz25000),
+        output::step_size_set(Band::B, StepSize::Hz12500),
     ]
 }
 
 fn gen_gps_settings() -> Vec<String> {
     vec![
-        output::gps_settings(GpsSettings::new(true, true)),
-        output::gps_settings(GpsSettings::new(false, false)),
-        output::gps_settings(GpsSettings::new(true, false)),
-        output::gps_settings(GpsSettings::new(false, true)),
+        output::gps_settings(GpsSettings::new().with_enabled(true).with_pc_output(true)),
+        output::gps_settings(GpsSettings::new()),
+        output::gps_settings(GpsSettings::new().with_enabled(true)),
+        output::gps_settings(GpsSettings::new().with_pc_output(true)),
     ]
 }
 
 fn gen_urcall_read() -> Vec<String> {
     vec![
-        output::urcall_read("W1AW", ""),
-        output::urcall_read("W1AW", "P"),
+        output::urcall_read(&DstarCallsignEntry::new(
+            sample(DstarCallsign::new("W1AW")),
+            sample(DstarSuffix::new("")),
+        )),
+        output::urcall_read(&DstarCallsignEntry::new(
+            sample(DstarCallsign::new("W1AW")),
+            sample(DstarSuffix::new("P")),
+        )),
     ]
 }
 
 fn gen_urcall_set() -> Vec<String> {
-    vec![output::urcall_set("W1AW")]
+    vec![output::urcall_set(&sample(DstarCallsign::new("W1AW")))]
 }
 
-fn gen_reflector_connected() -> Vec<String> {
+fn gen_reflector_requested() -> Vec<String> {
     vec![
-        output::reflector_connected("REF030", 'C'),
-        output::reflector_disconnected().to_string(),
+        output::reflector_link_requested(
+            sample(ReflectorCallsign::try_from_str("REF030")),
+            Module::C,
+        ),
+        output::reflector_unlink_requested().to_string(),
     ]
 }
 
@@ -335,56 +368,27 @@ fn gen_warning() -> Vec<String> {
 }
 
 fn gen_aprs_events() -> Vec<String> {
+    let source = sample(Ax25Address::new("W1AW", 0));
+    let position = sample(LatLon::parse("35.3", "-82.46"));
+    let message = sample(AprsMessage::from_bytes(b":W1AW     :hi"));
     vec![
-        output::aprs_station_heard("W1AW"),
-        output::aprs_message_received("W1AW", "hi"),
-        output::aprs_message_delivered("1"),
-        output::aprs_message_rejected("2"),
-        output::aprs_message_expired("3"),
-        output::aprs_position("W1AW", 35.3, -82.46),
-        output::aprs_weather("W1AW"),
-        output::aprs_digipeated("W1AW"),
-        output::aprs_query_responded("W1AW"),
-        output::aprs_raw_packet("W1AW"),
+        output::aprs_station_heard(&source),
+        output::aprs_message_received(&message),
+        output::aprs_message_delivered(&sample(MessageId::new("1"))),
+        output::aprs_message_rejected(&sample(MessageId::new("2"))),
+        output::aprs_message_expired(&sample(MessageId::new("3"))),
+        output::aprs_position(&source, position),
+        output::aprs_weather(&source),
+        output::aprs_digipeated(&source),
+        output::aprs_query_responded(&source),
+        output::aprs_raw_packet(&source),
         output::aprs_mode_active().to_string(),
         output::aprs_is_connected().to_string(),
         output::aprs_is_incoming("W1AW>APRS:hello"),
-        output::aprs_station_entry("W1AW", Some((35.3, -82.46)), 12, "2 minutes"),
-        output::aprs_station_entry("W1AW", None, 1, "15 seconds"),
+        output::aprs_station_entry(&source, Some(position), 12, "2 minutes"),
+        output::aprs_station_entry(&source, None, 1, "15 seconds"),
         output::stations_summary(1),
         output::stations_summary(5),
-    ]
-}
-
-fn gen_dstar_events() -> Vec<String> {
-    let reflector = ReflectorCallsign::try_from_str("REF030")
-        .unwrap_or_else(|error| unreachable!("static reflector is valid: {error}"));
-    let destination = Callsign::from_wire_bytes(*b"W1AW    ");
-    vec![
-        output::dstar_voice_start("W1AW", "P", "CQCQCQ"),
-        output::dstar_voice_start("W1AW", "", "W9ABC"),
-        output::dstar_voice_end().to_string(),
-        output::dstar_voice_lost().to_string(),
-        output::dstar_text_message("hello"),
-        output::dstar_gps(""),
-        output::dstar_gps("$GPGGA,123519,4807.038,N"),
-        output::dstar_station_heard("W1AW"),
-        output::dstar_command_cq().to_string(),
-        output::dstar_command_echo().to_string(),
-        output::dstar_command_unlink().to_string(),
-        output::dstar_command_info().to_string(),
-        output::dstar_command_link(&reflector, Module::C),
-        output::dstar_command_callsign(&destination),
-        output::dstar_modem_status(5, false),
-        output::dstar_modem_status(0, true),
-        output::reflector_event_connected().to_string(),
-        output::reflector_event_rejected().to_string(),
-        output::reflector_event_disconnected().to_string(),
-        output::reflector_event_voice_start("W1AW", "", "CQCQCQ"),
-        output::reflector_event_voice_start("W1AW", "P", "CQCQCQ"),
-        output::reflector_event_voice_end(0, 0),
-        output::reflector_event_voice_end(1, 20),
-        output::reflector_event_voice_end(42, 840),
     ]
 }
 
@@ -405,7 +409,6 @@ fn gen_mode_help() -> Vec<String> {
         help_text::CAT_MODE_HELP,
         help_text::MMDVM_MODE_HELP,
         help_text::APRS_MODE_HELP,
-        help_text::DSTAR_MODE_HELP,
     ] {
         for line in blob.lines() {
             v.push(line.to_string());
@@ -428,29 +431,19 @@ fn gen_help_text() -> Vec<String> {
 
 /// Run the output check, print the report, return the exit code.
 ///
-/// Returns 0 if all rules pass, 1 if any violation is found. Prints
-/// the full report to stdout.
+/// Returns zero when the eight evaluated line rules pass, one on a violation.
+/// The six command/source rules are reported as unevaluated. This command
+/// checks the named samples, not every possible formatter input.
 #[must_use]
 pub fn run() -> i32 {
-    println!(
+    crate::aprintln!(
         "Accessibility output check, thd75-repl version {}.",
         env!("CARGO_PKG_VERSION")
     );
-    println!("Reference: WCAG 2.1 Level AA.");
-    println!("Reference: Section 508 of the US Rehabilitation Act.");
-    println!("Reference: CHI 2021 CLI accessibility paper.");
-    println!("Reference: EN 301 549 version 3.2.1.");
-    println!("Reference: ISO 9241-171.");
-    println!("Reference: ITU-T Recommendation F.790.");
-    println!("Reference: BRLTTY compatibility.");
-    println!("Reference: Handi-Ham Program recommendations.");
-    println!("Reference: ARRL accessibility resources.");
-    println!();
+    crate::aprintln!("Scope: eight local line rules on named samples.");
 
     // Collect per-rule counts and violations.
     let mut rule_violations: std::collections::BTreeMap<lint::Rule, Vec<(String, String)>> =
-        std::collections::BTreeMap::new();
-    let mut rule_string_counts: std::collections::BTreeMap<lint::Rule, usize> =
         std::collections::BTreeMap::new();
     let mut total_strings: usize = 0;
 
@@ -459,7 +452,7 @@ pub fn run() -> i32 {
         total_strings += outputs.len();
         for s in &outputs {
             if let Err(violations) = lint::check_output(s) {
-                for v in violations {
+                for v in violations.into_violations() {
                     rule_violations
                         .entry(v.rule)
                         .or_default()
@@ -485,43 +478,46 @@ pub fn run() -> i32 {
         lint::Rule::NoAdHocTimestamps,
         lint::Rule::StdoutStderrSeparation,
     ];
-    for rule in all_rules {
-        let _ = rule_string_counts.insert(rule, total_strings);
-    }
-
     let mut failed = 0usize;
     for rule in all_rules {
-        let count = rule_string_counts.get(&rule).copied().unwrap_or(0);
+        if !rule.is_line_level() {
+            crate::aprintln!(
+                "Rule {} {}: not evaluated; separate tests required.",
+                rule.id(),
+                rule.description()
+            );
+            continue;
+        }
         if let Some(vs) = rule_violations.get(&rule) {
             failed += 1;
-            println!(
-                "Rule {} {}: FAILED, {} violations, {count} strings checked.",
+            crate::aprintln!(
+                "Rule {} {}: FAILED, {} violations, {total_strings} samples.",
                 rule.id(),
                 rule.description(),
                 vs.len()
             );
             for (source, message) in vs.iter().take(5) {
-                println!("  Source: {source}. {message}");
+                crate::aprintln!("Source: {source}. {message}");
             }
         } else {
-            println!(
-                "Rule {} {}: passed, {count} strings checked.",
+            crate::aprintln!(
+                "Rule {} {}: passed, {total_strings} samples.",
                 rule.id(),
                 rule.description()
             );
         }
     }
 
-    println!();
     if failed == 0 {
-        println!(
-            "All 14 rules passed. {total_strings} strings checked from {} sources.",
+        crate::aprintln!("8 line rules passed; 6 rules require separate tests.");
+        crate::aprintln!(
+            "Samples checked: {total_strings} from {} sources.",
             COVERAGE.len()
         );
         0
     } else {
-        println!(
-            "{failed} of 14 rules failed. {total_strings} strings checked from {} sources.",
+        crate::aprintln!(
+            "{failed} of 8 line rules failed; {total_strings} samples from {} sources.",
             COVERAGE.len()
         );
         1

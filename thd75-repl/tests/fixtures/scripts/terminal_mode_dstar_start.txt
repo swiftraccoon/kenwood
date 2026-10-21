@@ -1,4 +1,3 @@
-# Radio starts in Reflector Terminal Mode and the positive MMDVM proof must
-# flow directly into gateway initialization. Script EOF performs a clean,
-# noninteractive gateway shutdown without contacting a reflector.
+# Kenwood startup rejects this command before mock construction or discovery.
+# The unverified modem profile cannot initialize a gateway.
 dstar start KQ4NIT

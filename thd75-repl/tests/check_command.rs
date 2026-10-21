@@ -7,9 +7,9 @@
 
 // Crate-level dev-dependencies pulled in by sibling integration tests. Acknowledge
 // them here so `unused_crate_dependencies` stays silent for this compilation unit.
+use aprs_is as _;
 use clap as _;
 use dirs_next as _;
-use dstar_gateway as _;
 use dstar_gateway_core as _;
 use kenwood_thd75 as _;
 use kenwood_transport as _;
@@ -39,19 +39,40 @@ fn check_subcommand_exits_zero() -> TestResult {
         "check command exited with failure.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
-        stdout.contains("All 14 rules passed"),
-        "expected 'All 14 rules passed' in report.\nstdout:\n{stdout}"
+        stdout.contains("8 line rules passed; 6 rules require separate tests."),
+        "expected evaluated and separate rule counts.\nstdout:\n{stdout}"
     );
+    let timestamped = Command::new(env!("CARGO_BIN_EXE_thd75-repl"))
+        .args(["--timestamps", "check"])
+        .output()?;
+    assert!(timestamped.status.success(), "timestamped check failed");
+    for line in String::from_utf8(timestamped.stdout)?.lines() {
+        assert!(
+            line.starts_with('[') && line.as_bytes().get(9) == Some(&b']'),
+            "the check subcommand bypassed timestamp selection: {line}"
+        );
+        assert!(
+            line.len() <= 80,
+            "timestamped output exceeded its physical bound: {line}"
+        );
+    }
     Ok(())
 }
 
 #[test]
-fn check_subcommand_lists_nine_references() -> TestResult {
+fn check_subcommand_does_not_claim_unevaluated_rules_passed() -> TestResult {
     let output = Command::new(env!("CARGO_BIN_EXE_thd75-repl"))
         .arg("check")
         .output()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let count = stdout.matches("Reference:").count();
-    assert_eq!(count, 9, "expected 9 reference lines, got {count}");
+    let count = stdout
+        .matches("not evaluated; separate tests required.")
+        .count();
+    assert_eq!(count, 6, "unevaluated rules must be explicit: {stdout}");
+    assert!(!stdout.contains("All 14 rules passed"), "{stdout}");
+    assert!(
+        !stdout.contains("Reference:"),
+        "no external certification is evaluated: {stdout}"
+    );
     Ok(())
 }

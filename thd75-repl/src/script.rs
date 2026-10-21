@@ -1,11 +1,4 @@
-//! Script mode: read commands from a file and execute them.
-//!
-//! Script mode is a dual-use feature. For users, it provides a way to
-//! pre-configure the radio by saving a sequence of commands in a file
-//! and replaying them (contest prep, net startup, morning checks).
-//! For tests, it is the vehicle that lets integration tests drive the
-//! full REPL loop from a file and capture output via subprocess
-//! spawning.
+//! Ordered commands read from a UTF-8 script or standard input.
 //!
 //! ## Format
 //!
@@ -20,14 +13,24 @@ use std::io::BufRead;
 use std::path::Path;
 
 /// Parsed lines from a script file, with comments and blanks removed.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Script {
-    /// The non-comment, non-blank command lines in the order they
-    /// appeared in the source file.
-    pub commands: Vec<String>,
+    commands: Vec<String>,
 }
 
 impl Script {
+    /// Nonempty trimmed command lines in source order, without comments.
+    #[must_use]
+    pub fn commands(&self) -> &[String] {
+        &self.commands
+    }
+
+    /// Transfer the parsed commands to their sequential executor.
+    #[must_use]
+    pub fn into_commands(self) -> Vec<String> {
+        self.commands
+    }
+
     /// Parse a script from any reader.
     ///
     /// Returns a [`Script`] containing every non-blank, non-comment
@@ -37,6 +40,13 @@ impl Script {
     /// # Errors
     ///
     /// Propagates any I/O error from reading the underlying reader.
+    ///
+    /// ```
+    /// use thd75_repl::script::Script;
+    /// let script = Script::from_reader(&b"# inspect\nid\nbattery\n"[..])?;
+    /// assert_eq!(script.commands(), ["id", "battery"]);
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
     pub fn from_reader<R: BufRead>(reader: R) -> std::io::Result<Self> {
         let mut commands = Vec::new();
         for line in reader.lines() {

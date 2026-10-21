@@ -1,329 +1,435 @@
-//! Library crate for `thd75-repl`.
-//!
-//! This exposes the internal modules that need to be reachable from
-//! integration tests in `tests/` and from the binary entry point in
-//! `src/main.rs`.
-//!
-//! The binary is a thin wrapper that imports from this library via its
-//! own crate name.
-//!
-//! Public modules here are part of the REPL's internal API, not a
-//! stable library API for external consumers.
+#![doc = include_str!("../README.md")]
 
-// `unsafe_code = "forbid"` and every deny-level lint (missing_docs, the
-// clippy all/pedantic/nursery groups, ...) come from this crate's
-// `[lints.*]` blocks in Cargo.toml, which cover every target (lib, bin,
-// integration tests). No source-level restatement: a crate attribute like
-// `#![deny(clippy::pedantic)]` would re-arm whole groups at a higher
-// precedence than the manifest and silently clobber the manifest's
-// documented per-lint tuning.
-// `unwrap_used`, `expect_used`, and `panic` are denied crate-wide by
-// `[lints.clippy]` in `Cargo.toml`.
-
-// Dev-dependencies / optional deps pulled in only by `src/main.rs` (the binary target).
-// Acknowledge at the lib level so `unused_crate_dependencies` stays silent for the lib
-// compilation unit. When this crate's lib grows to use one of these directly, delete the
-// corresponding `use X as _;` line.
+use aprs_is as _;
 use clap as _;
 use dirs_next as _;
-use dstar_gateway as _;
 use dstar_gateway_core as _;
 use kenwood_transport as _;
 use mmdvm as _;
 use rustyline as _;
-use time as _;
 use tokio as _;
 use tracing as _;
 use tracing_appender as _;
 use tracing_subscriber as _;
 
-// proptest is a dev-dependency, not referenced in the library source. Acknowledge under
-// `cfg(test)` so `unused_crate_dependencies` stays silent for the lib's test build.
 #[cfg(test)]
 use proptest as _;
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use std::io::{self, Write};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
-/// Accessibility lint checker for REPL output lines.
-///
-/// Implements fourteen hard rules (R1 through R14) covering ASCII
-/// purity, line length, ANSI escapes, error and warning prefixes,
-/// list summaries, label-colon-value formatting, boolean rendering,
-/// and unit spelling. See `lint::Rule` for the full enumeration.
-pub mod lint;
+use time::{OffsetDateTime, Time, UtcOffset};
 
-/// Pure format functions for every user-facing string.
-///
-/// Zero I/O, zero async, zero radio access. Tested directly with
-/// golden strings and the lint.
-pub mod output;
-
-/// Per-command detailed help text, returned by `help <command>`, plus
-/// the multi-line mode help blobs used by `help` with no arguments.
+/// Checked pure APRS command parsing.
+pub mod aprs_args;
+/// Hardware-free sample output checks and their actual rule coverage.
+pub mod check;
+/// Transmit confirmation and noninteractive refusal.
+pub mod confirm;
+/// Per-command and mode help text.
 pub mod help_text;
-
-/// Script mode: parse a file of REPL commands and execute them.
-pub mod script;
-
-/// Mock radio scenarios for integration tests (feature-gated).
+/// Local accessibility output rules.
+pub mod lint;
+/// Feature-selected hardware-free integration scenarios.
 #[cfg(feature = "testing")]
 pub mod mock_scenarios;
+/// Named user-message formatting.
+pub mod output;
+/// Ordered script parsing.
+pub mod script;
 
-/// Accessibility output self-check for the `check` subcommand.
-pub mod check;
-
-/// Transmit confirmation prompt and script-mode gating.
-pub mod confirm;
-
-/// Argument parsing for APRS-mode commands (pure, unit-testable).
-pub mod aprs_args;
-
-/// Global flag for timestamp output mode.
-///
-/// When `true`, the [`aprintln!`] macro prepends a `[HH:MM:SS]`
-/// timestamp prefix to every line. Set at startup from the
-/// `--timestamps`, `--local-time`, and `--utc-offset` CLI flags.
-pub static TIMESTAMPS: AtomicBool = AtomicBool::new(false);
-
-/// UTC offset in seconds, added to UTC time when forming timestamps.
-///
-/// Zero means UTC. Set at startup from `--utc-offset`, `--local-time`,
-/// or both; otherwise unused. Atomic so the [`aprintln!`] macro can
-/// read it without synchronisation.
-pub static UTC_OFFSET_SECS: AtomicI32 = AtomicI32::new(0);
-
-/// Global flag for verbose output mode.
-///
-/// When `false` (quiet mode), low-signal recurring events such as
-/// digipeat notifications, APRS query responses, raw packet dumps, and
-/// D-STAR voice-lost frames are suppressed. Defaults to `true`.
-pub static VERBOSE: AtomicBool = AtomicBool::new(true);
-
-/// Read the current verbose flag.
-#[must_use]
-pub fn is_verbose() -> bool {
-    VERBOSE.load(Ordering::Relaxed)
-}
-
-/// Default number of lines retained by the history buffer.
-///
-/// Screen-reader users rely on the `last` command to replay recent
-/// output without rewinding the buffer one line at a time; 30 lines
-/// covers most common single-screen contexts. See [`last_lines`] and
-/// [`record_output`].
+/// Default number of complete output lines retained for replay.
 pub const HISTORY_CAPACITY_DEFAULT: usize = 30;
 
-/// Runtime-adjustable history capacity. Set from
-/// `--history-lines` at startup via [`set_history_capacity`].
-static HISTORY_CAPACITY: AtomicUsize = AtomicUsize::new(HISTORY_CAPACITY_DEFAULT);
-
-/// Rolling buffer of recent user-facing output lines, ordered oldest
-/// to newest. Appended to by every [`aprintln!`] invocation and read
-/// by the `last` REPL command.
-///
-/// Uses `OnceLock` rather than `LazyLock` to keep the accessible REPL
-/// crate compatible with older stable Rust releases.
-#[must_use]
-pub fn last_output() -> &'static Mutex<VecDeque<String>> {
-    static BUF: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
-    BUF.get_or_init(|| Mutex::new(VecDeque::with_capacity(HISTORY_CAPACITY_DEFAULT)))
+/// Timestamp presentation selected before or during a session.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TimestampMode {
+    /// Output without a timestamp.
+    #[default]
+    Disabled,
+    /// Prefix UTC time of day.
+    Utc,
+    /// Prefix time of day at a checked fixed UTC offset.
+    Offset(UtcOffset),
 }
 
-/// Update the history buffer capacity at startup.
-///
-/// Values of 0 are allowed (disables history, `last` will print the
-/// "no previous output" message). Existing entries beyond the new
-/// capacity are dropped from the front (oldest first).
-pub fn set_history_capacity(n: usize) {
-    HISTORY_CAPACITY.store(n, Ordering::Relaxed);
-    if let Ok(mut buf) = last_output().lock() {
-        while buf.len() > n {
-            drop(buf.pop_front());
+#[derive(Debug)]
+struct OutputState {
+    capacity: usize,
+    history: VecDeque<String>,
+    timestamps: TimestampMode,
+    verbose: bool,
+    first_error: Option<io::Error>,
+}
+
+impl Default for OutputState {
+    fn default() -> Self {
+        Self {
+            capacity: HISTORY_CAPACITY_DEFAULT,
+            history: VecDeque::new(),
+            timestamps: TimestampMode::Disabled,
+            verbose: true,
+            first_error: None,
         }
     }
 }
 
-/// Append `line` to the history buffer, evicting the oldest entry
-/// when the buffer would exceed the configured capacity. Intended to
-/// be called only from the [`aprintln!`] macro.
-pub fn record_output(line: String) {
-    let cap = HISTORY_CAPACITY.load(Ordering::Relaxed);
-    if cap == 0 {
-        return;
-    }
-    if let Ok(mut buf) = last_output().lock() {
-        while buf.len() >= cap {
-            drop(buf.pop_front());
+impl OutputState {
+    fn record(&mut self, line: String) {
+        if self.capacity == 0 {
+            return;
         }
-        buf.push_back(line);
+        while self.history.len() >= self.capacity {
+            drop(self.history.pop_front());
+        }
+        self.history.push_back(line);
+    }
+
+    fn set_capacity(&mut self, capacity: usize) {
+        self.capacity = capacity;
+        while self.history.len() > capacity {
+            drop(self.history.pop_front());
+        }
+    }
+
+    fn write_to(
+        &mut self,
+        writer: &mut impl Write,
+        message: &str,
+        timestamp: Option<Time>,
+    ) -> io::Result<()> {
+        for line in render_message(message, timestamp) {
+            writeln!(writer, "{line}")?;
+            self.record(line);
+        }
+        writer.flush()
+    }
+
+    fn emit_to(&mut self, writer: &mut impl Write, message: &str, timestamp: Option<Time>) {
+        if self.first_error.is_none()
+            && let Err(error) = self.write_to(writer, message, timestamp)
+        {
+            self.first_error = Some(error);
+        }
+    }
+
+    fn replay_to(&mut self, writer: &mut impl Write, lines: &[String]) {
+        if self.first_error.is_some() {
+            return;
+        }
+        let result = (|| {
+            for message in lines {
+                for line in render_message(message, None) {
+                    writeln!(writer, "{line}")?;
+                }
+            }
+            writer.flush()
+        })();
+        if let Err(error) = result {
+            self.first_error = Some(error);
+        }
     }
 }
 
-/// Retrieve the most recent `n` lines from the history buffer.
+fn output_state() -> MutexGuard<'static, OutputState> {
+    static STATE: OnceLock<Mutex<OutputState>> = OnceLock::new();
+    STATE
+        .get_or_init(|| Mutex::new(OutputState::default()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Select timestamp presentation atomically with respect to message output.
 ///
-/// Entries are returned oldest-to-newest. Passing `n == 0` always
-/// returns an empty vector. The returned vector clones the stored
-/// strings so the caller may hold them after the buffer advances.
+/// Offset values use the validated `time::UtcOffset` domain. Every physical
+/// output line receives the selected prefix, including wrapped continuations.
+pub fn set_timestamp_mode(mode: TimestampMode) {
+    output_state().timestamps = mode;
+}
+
+/// Read whether recurring monitor details are enabled.
 #[must_use]
-pub fn last_lines(n: usize) -> Vec<String> {
-    if n == 0 {
-        return Vec::new();
-    }
-    last_output().lock().map_or_else(
-        |_| Vec::new(),
-        |buf| {
-            let len = buf.len();
-            let start = len.saturating_sub(n);
-            buf.iter().skip(start).cloned().collect()
-        },
-    )
+pub fn is_verbose() -> bool {
+    output_state().verbose
 }
 
-/// Print a line with an optional `[HH:MM:SS]` timestamp prefix and
-/// record it in the history buffer.
+/// Enable or disable recurring monitor details.
 ///
-/// When [`TIMESTAMPS`] is enabled, prepends a time prefix to every
-/// output line so blind operators can track when events occurred
-/// without checking a clock. The time shown is UTC by default, or
-/// local time if [`UTC_OFFSET_SECS`] has been set from
-/// `--local-time` / `--utc-offset`.
+/// Call sites decide which events are recurring; output emission itself is
+/// unconditional, so errors and confirmation prompts remain visible.
+pub fn set_verbose(enabled: bool) {
+    output_state().verbose = enabled;
+}
+
+/// Change history capacity and discard excess oldest entries in one transaction.
 ///
-/// Every printed line is also appended to the rolling history buffer
-/// so the `last` REPL command can replay recent output. Plain
-/// `println!` calls bypass this recording; use `aprintln!` whenever
-/// a line is user-facing and should be replayable.
+/// Zero clears and disables history. Concurrent output and resizing use the
+/// same mutex. Poisoned locks recover their retained state; no mutable storage
+/// handle is exposed to callers.
+pub fn set_history_capacity(capacity: usize) {
+    output_state().set_capacity(capacity);
+}
+
+/// Store a message as escaped, bounded lines without printing or timestamps.
+///
+/// This supports callers that render to another destination. Prefer
+/// [`aprintln!`] when stdout and history should advance together.
+pub fn record_output(message: &str) {
+    let mut state = output_state();
+    for line in render_message(message, None) {
+        state.record(line);
+    }
+}
+
+/// Clone at most the most recent count lines, oldest first.
+///
+/// Zero returns an empty vector. Snapshots release the mutex before returning.
+#[must_use]
+pub fn last_lines(count: usize) -> Vec<String> {
+    let state = output_state();
+    state
+        .history
+        .iter()
+        .skip(state.history.len().saturating_sub(count))
+        .cloned()
+        .collect()
+}
+
+/// Escape text into printable ASCII lines of at most 80 bytes.
+///
+/// LF separates logical lines. All other controls and non-ASCII characters use
+/// Rust-style visible escapes. A timestamp prefixes every physical line; wrapped
+/// lines add `Continued: `. Escapes are never split. Text is preserved through
+/// escaping/wrapping rather than silently truncated.
+///
+/// ```
+/// use thd75_repl::render_message;
+/// let lines = render_message("Station: A\u{1b}B\u{e9}", None);
+/// assert_eq!(lines, [r"Station: A\u{1b}B\u{e9}"]);
+/// assert!(lines.iter().all(|line| line.len() <= 80));
+/// ```
+#[must_use]
+pub fn render_message(message: &str, timestamp: Option<Time>) -> Vec<String> {
+    let prefix = timestamp.map_or_else(String::new, |time| {
+        let h = time.hour();
+        let m = time.minute();
+        let s = time.second();
+        format!("[{h:02}:{m:02}:{s:02}] ")
+    });
+    let mut lines = Vec::new();
+    for logical in message.split('\n') {
+        let mut line = prefix.clone();
+        for character in logical.chars() {
+            let token = if character.is_ascii() && !character.is_ascii_control() {
+                character.to_string()
+            } else {
+                character.escape_default().to_string()
+            };
+            if line.len() + token.len() > 80 {
+                lines.push(line);
+                line = format!("{prefix}Continued: ");
+            }
+            line.push_str(&token);
+        }
+        lines.push(line);
+    }
+    lines
+}
+
+/// Emit one message through the shared escaped, bounded stdout/history path.
+///
+/// Each successfully written complete line enters history. A write or flush
+/// failure is retained as the first output error and suppresses later writes
+/// until [`take_output_error`] retrieves it. Callers inspect that error before
+/// reporting process success. The operation serializes output and configuration;
+/// ordinary blocking stdout has no application deadline.
+pub fn emit_output(message: &str) {
+    let mut state = output_state();
+    let timestamp = match state.timestamps {
+        TimestampMode::Disabled => None,
+        TimestampMode::Utc => Some(OffsetDateTime::now_utc().time()),
+        TimestampMode::Offset(offset) => Some(OffsetDateTime::now_utc().to_offset(offset).time()),
+    };
+    state.emit_to(&mut io::stdout().lock(), message, timestamp);
+}
+
+/// Print a history snapshot without adding timestamps or recording it again.
+///
+/// Existing printable prefixes are retained. Supplied lines still pass through
+/// [`render_message`], so arbitrary caller text cannot inject controls or exceed
+/// the physical line limit. Write/flush failures follow [`emit_output`]'s
+/// first-error contract.
+pub fn replay_output(lines: &[String]) {
+    output_state().replay_to(&mut io::stdout().lock(), lines);
+}
+
+/// Take the first stdout write/flush error and allow later output attempts.
+///
+/// The binary calls this at completion and returns the original I/O error
+/// instead of reporting success after broken output.
+#[must_use]
+pub fn take_output_error() -> Option<io::Error> {
+    output_state().first_error.take()
+}
+
+/// Format and emit a message with shared timestamps, escaping and history.
+///
+/// Macro expansion requires no caller imports.
+///
+/// ```
+/// thd75_repl::aprintln!("Status: {}", "ready");
+/// ```
 #[macro_export]
 macro_rules! aprintln {
+    () => {{
+        $crate::emit_output("");
+    }};
     ($($arg:tt)*) => {{
-        let body = format!($($arg)*);
-        let line = if $crate::TIMESTAMPS.load(
-            ::std::sync::atomic::Ordering::Relaxed,
-        ) {
-            #[expect(
-                clippy::cast_possible_wrap,
-                reason = "u64 seconds since the epoch will not exceed i64::MAX for billions of \
-                          years, so the cast to i64 is safe for all realistic clock values."
-            )]
-            let utc_secs = ::std::time::SystemTime::now()
-                .duration_since(::std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
-            let offset = i64::from(
-                $crate::UTC_OFFSET_SECS.load(::std::sync::atomic::Ordering::Relaxed),
-            );
-            let local_secs_signed = utc_secs + offset;
-            #[expect(
-                clippy::cast_sign_loss,
-                reason = "The branch explicitly gates on `local_secs_signed < 0`, so the `as u64` \
-                          cast only runs when the value is non-negative."
-            )]
-            let local_secs = if local_secs_signed < 0 {
-                0u64
-            } else {
-                local_secs_signed as u64
-            };
-            let h = (local_secs / 3600) % 24;
-            let m = (local_secs / 60) % 60;
-            let s = local_secs % 60;
-            format!("[{h:02}:{m:02}:{s:02}] {body}")
-        } else {
-            body
-        };
-        println!("{line}");
-        $crate::record_output(line);
+        $crate::emit_output(&::std::format!($($arg)*));
     }};
 }
 
 #[cfg(test)]
-mod lib_tests {
-    //! Tests for the shared library state: history buffer mechanics.
-    //!
-    //! These tests mutate global state ([`HISTORY_CAPACITY`] and the
-    //! `OnceLock` buffer), so they must run serially. A file-local
-    //! mutex guards each test.
-    use super::{
-        HISTORY_CAPACITY_DEFAULT, last_lines, last_output, record_output, set_history_capacity,
-    };
-    use std::sync::Mutex;
+mod tests {
+    use super::*;
 
-    /// Test guard: every test in this module locks this mutex first,
-    /// mutates global state, then drops the lock. Prevents interleaved
-    /// test executions from corrupting each other.
-    static TEST_GUARD: Mutex<()> = Mutex::new(());
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    fn reset() {
-        set_history_capacity(HISTORY_CAPACITY_DEFAULT);
-        if let Ok(mut buf) = last_output().lock() {
-            buf.clear();
+    #[test]
+    fn history_resize_and_record_share_one_bounded_state() {
+        let mut state = OutputState::default();
+        state.set_capacity(3);
+        for line in ["alpha", "bravo", "charlie", "delta"] {
+            state.record(line.to_owned());
+        }
+        assert_eq!(state.history, ["bravo", "charlie", "delta"]);
+        state.set_capacity(1);
+        assert_eq!(state.history, ["delta"]);
+        state.set_capacity(0);
+        state.record("ignored".to_owned());
+        assert!(
+            state.history.is_empty(),
+            "zero capacity clears and disables storage"
+        );
+    }
+
+    #[test]
+    fn controls_unicode_and_long_text_remain_visible_bounded_lines() -> TestResult {
+        let text = format!(
+            "Error: {}{}{}{}",
+            "x".repeat(200),
+            char::from(13),
+            char::from(27),
+            'é'
+        );
+        let timestamp = Time::from_hms(12, 34, 56)?;
+        let lines = render_message(&text, Some(timestamp));
+        assert!(lines.len() > 1);
+        for line in &lines {
+            assert!(line.starts_with("[12:34:56] "), "{line:?}");
+            assert!(line.len() <= 80, "{line:?}");
+            assert!(
+                line.bytes().all(|byte| (32..=126).contains(&byte)),
+                "{line:?}"
+            );
+        }
+        let joined = lines.join("");
+        assert!(joined.contains(r"\r"), "{joined}");
+        assert!(joined.contains(r"\u{1b}"), "{joined}");
+        assert!(joined.contains(r"\u{e9}"), "{joined}");
+        assert_eq!(render_message("one\ntwo", None), ["one", "two"]);
+        Ok(())
+    }
+
+    #[derive(Debug)]
+    struct FailingWriter {
+        written: Vec<u8>,
+        flush_fails: bool,
+    }
+
+    impl Write for FailingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.written.len() >= 6 {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed sink"));
+            }
+            self.written.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if self.flush_fails {
+                Err(io::Error::other("flush failed"))
+            } else {
+                Ok(())
+            }
         }
     }
 
     #[test]
-    fn records_and_retrieves_lines() {
-        let _g = TEST_GUARD
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reset();
-        record_output("alpha".to_string());
-        record_output("bravo".to_string());
-        record_output("charlie".to_string());
-        assert_eq!(last_lines(3), vec!["alpha", "bravo", "charlie"]);
-        assert_eq!(last_lines(1), vec!["charlie"]);
-        assert_eq!(last_lines(2), vec!["bravo", "charlie"]);
+    fn history_records_only_complete_written_lines_and_reports_flush_failure() {
+        let mut state = OutputState::default();
+        let mut writer = FailingWriter {
+            written: Vec::new(),
+            flush_fails: false,
+        };
+        let result = state.write_to(&mut writer, "first\nsecond", None);
+        assert!(
+            matches!(result, Err(ref error) if error.kind() == io::ErrorKind::BrokenPipe),
+            "{result:?}"
+        );
+        assert_eq!(state.history, ["first"]);
+        let mut writer = FailingWriter {
+            written: Vec::new(),
+            flush_fails: true,
+        };
+        let result = state.write_to(&mut writer, "ok", None);
+        assert!(
+            matches!(result, Err(ref error) if error.to_string() == "flush failed"),
+            "{result:?}"
+        );
+        assert_eq!(state.history.back().map(String::as_str), Some("ok"));
     }
 
     #[test]
-    fn evicts_oldest_when_full() {
-        let _g = TEST_GUARD
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reset();
-        set_history_capacity(3);
-        record_output("one".to_string());
-        record_output("two".to_string());
-        record_output("three".to_string());
-        record_output("four".to_string());
-        assert_eq!(last_lines(10), vec!["two", "three", "four"]);
+    fn output_failure_stops_later_writes_until_the_original_error_is_taken() -> TestResult {
+        let mut state = OutputState::default();
+        let mut broken = FailingWriter {
+            written: Vec::new(),
+            flush_fails: true,
+        };
+        state.emit_to(&mut broken, "first", None);
+        let mut later = Vec::new();
+        state.emit_to(&mut later, "second", None);
+        state.replay_to(&mut later, &["replayed".to_owned()]);
+        assert!(
+            later.is_empty(),
+            "later writes must stop after the first failure"
+        );
+        assert_eq!(state.history, ["first"]);
+        let error = state.first_error.take().ok_or("missing output error")?;
+        assert_eq!(error.to_string(), "flush failed");
+        state.emit_to(&mut later, "third", None);
+        assert_eq!(later, b"third\n");
+        assert_eq!(state.history, ["first", "third"]);
+        Ok(())
     }
 
     #[test]
-    fn last_lines_zero_returns_empty() {
-        let _g = TEST_GUARD
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reset();
-        record_output("one".to_string());
-        assert!(last_lines(0).is_empty());
-    }
-
-    #[test]
-    fn set_capacity_zero_disables_recording() {
-        let _g = TEST_GUARD
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reset();
-        set_history_capacity(0);
-        record_output("ignored".to_string());
-        assert!(last_lines(10).is_empty());
-        // Restore default so other tests see the expected state.
-        set_history_capacity(HISTORY_CAPACITY_DEFAULT);
-    }
-
-    #[test]
-    fn shrink_capacity_truncates_front() {
-        let _g = TEST_GUARD
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reset();
-        set_history_capacity(5);
-        record_output("a".to_string());
-        record_output("b".to_string());
-        record_output("c".to_string());
-        record_output("d".to_string());
-        set_history_capacity(2);
-        assert_eq!(last_lines(10), vec!["c", "d"]);
+    fn replay_keeps_original_prefix_and_history_without_duplicate_entries() -> TestResult {
+        let mut state = OutputState::default();
+        let mut original = Vec::new();
+        state.emit_to(
+            &mut original,
+            "Status: ready",
+            Some(Time::from_hms(1, 2, 3)?),
+        );
+        let snapshot: Vec<_> = state.history.iter().cloned().collect();
+        let mut replayed = Vec::new();
+        state.replay_to(&mut replayed, &snapshot);
+        assert_eq!(replayed, original);
+        assert_eq!(state.history.len(), 1);
+        assert!(state.first_error.is_none(), "memory output must succeed");
+        Ok(())
     }
 }

@@ -1,4 +1,4 @@
-# Radio starts in DV Gateway / Reflector Terminal Mode.
+# Radio answers MMDVM binary rather than CAT.
 # A CAT command must be intercepted by the terminal-mode guard with
 # guidance, not sent to the radio (which would block for the timeout).
 mode b

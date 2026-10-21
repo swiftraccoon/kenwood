@@ -1,408 +1,549 @@
-//! Argument parsing for APRS-mode commands.
+//! Checked APRS command arguments parsed before radio mode changes.
 //!
-//! Pure functions (no I/O, no radio access), so every grammar rule is
-//! unit-testable without hardware. Error strings are printed verbatim
-//! by the dispatcher and therefore follow the accessibility phrasing
-//! rules: complete sentences, units spelled out, concrete examples.
+//! Parsers accept token slices from the REPL's whitespace grammar. Text tokens
+//! are joined with one space; quoted or embedded whitespace is not preserved.
+//! Errors identify the argument and retain numeric or domain-validation causes.
+
+use std::error::Error;
+use std::fmt;
 
 use kenwood_thd75::types::TncDataBand;
 use kenwood_thd75::{
-    CompressedPositionText, Course, Heading, Latitude, Longitude, MiceSpeed, MiceStatusText,
-    ObjectName, PositionReportText, Speed,
+    Ax25Address, CompressedPositionText, Course, Heading, Latitude, Longitude, MiceSpeed,
+    MiceStatusText, ObjectName, PositionReportText, Speed,
 };
 
-/// A latitude/longitude pair in decimal degrees.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Command argument whose token failed parsing or domain validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Argument {
+    /// Latitude in decimal degrees.
+    Latitude,
+    /// Longitude in decimal degrees.
+    Longitude,
+    /// Ground speed in the command's documented units.
+    Speed,
+    /// Course or heading in degrees.
+    Course,
+    /// Position or status text.
+    Text,
+    /// APRS object name.
+    ObjectName,
+    /// AX.25 station address.
+    Address,
+    /// AX.25 secondary station identifier.
+    Ssid,
+    /// TNC data-band selector.
+    DataBand,
+    /// Optional command keyword.
+    Keyword,
+}
+
+impl fmt::Display for Argument {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Latitude => "latitude",
+            Self::Longitude => "longitude",
+            Self::Speed => "speed",
+            Self::Course => "course",
+            Self::Text => "text",
+            Self::ObjectName => "object name",
+            Self::Address => "station address",
+            Self::Ssid => "SSID",
+            Self::DataBand => "TNC data band",
+            Self::Keyword => "keyword",
+        })
+    }
+}
+
+/// Argument syntax or validated-domain failure.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ArgumentError {
+    /// Required tokens are missing or extra tokens follow the grammar.
+    Usage {
+        /// Accepted command grammar.
+        usage: &'static str,
+    },
+    /// A numeric parser or checked domain rejected an argument.
+    Invalid {
+        /// Argument with invalid input.
+        argument: Argument,
+        /// Supplied token or joined text.
+        value: String,
+        /// Original numeric or domain-validation error.
+        source: Box<dyn Error + Send + Sync>,
+    },
+    /// A selector or keyword is outside its accepted vocabulary.
+    Token {
+        /// Argument with invalid input.
+        argument: Argument,
+        /// Supplied token.
+        value: String,
+        /// Accepted vocabulary.
+        expected: &'static str,
+    },
+}
+
+impl ArgumentError {
+    fn invalid(
+        argument: Argument,
+        value: &str,
+        source: impl Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::Invalid {
+            argument,
+            value: value.to_owned(),
+            source: Box::new(source),
+        }
+    }
+
+    fn token(argument: Argument, value: &str, expected: &'static str) -> Self {
+        Self::Token {
+            argument,
+            value: value.to_owned(),
+            expected,
+        }
+    }
+}
+
+impl fmt::Display for ArgumentError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Usage { usage } => write!(f, "usage: {usage}."),
+            Self::Invalid {
+                argument,
+                value,
+                source,
+            } => {
+                write!(f, "invalid {argument} {value:?}: {source}.")
+            }
+            Self::Token {
+                argument,
+                value,
+                expected,
+            } => {
+                write!(f, "invalid {argument} {value:?}. Use {expected}.")
+            }
+        }
+    }
+}
+
+impl Error for ArgumentError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Invalid { source, .. } => Some(source.as_ref()),
+            Self::Usage { .. } | Self::Token { .. } => None,
+        }
+    }
+}
+
+/// A checked geographic coordinate pair in decimal degrees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LatLon {
-    /// Latitude in decimal degrees, positive north.
+    /// Latitude, positive north.
     pub latitude: Latitude,
-    /// Longitude in decimal degrees, positive east.
+    /// Longitude, positive east.
     pub longitude: Longitude,
 }
 
-/// Parse latitude and longitude strings in decimal degrees.
-///
-/// # Errors
-///
-/// Returns a screen-reader-friendly message if either value is not a
-/// finite number or is outside latitude ±90 / longitude ±180.
-pub fn parse_lat_lon(lat: &str, lon: &str) -> Result<LatLon, String> {
-    let lat_deg: f64 = lat.parse().map_err(|_| {
-        format!("invalid latitude {lat:?}. Use decimal degrees, for example 35.30.")
-    })?;
-    let lon_deg: f64 = lon.parse().map_err(|_| {
-        format!("invalid longitude {lon:?}. Use decimal degrees, for example -82.46.")
-    })?;
-    let latitude = Latitude::new(lat_deg)
-        .map_err(|_| format!("latitude {lat} is out of range. Use -90 through 90."))?;
-    let longitude = Longitude::new(lon_deg)
-        .map_err(|_| format!("longitude {lon} is out of range. Use -180 through 180."))?;
-    Ok(LatLon {
-        latitude,
-        longitude,
-    })
+impl LatLon {
+    /// Parse finite decimal degrees within latitude ±90 and longitude ±180.
+    ///
+    /// # Errors
+    ///
+    /// Returns an argument-specific numeric or range failure.
+    ///
+    /// ```
+    /// use thd75_repl::aprs_args::LatLon;
+    /// let position = LatLon::parse("35.30", "-82.46")?;
+    /// assert_eq!(position.latitude.as_degrees(), 35.30);
+    /// # Ok::<(), thd75_repl::aprs_args::ArgumentError>(())
+    /// ```
+    pub fn parse(lat: &str, lon: &str) -> Result<Self, ArgumentError> {
+        let lat_degrees = lat
+            .parse::<f64>()
+            .map_err(|error| ArgumentError::invalid(Argument::Latitude, lat, error))?;
+        let lon_degrees = lon
+            .parse::<f64>()
+            .map_err(|error| ArgumentError::invalid(Argument::Longitude, lon, error))?;
+        Ok(Self {
+            latitude: Latitude::new(lat_degrees)
+                .map_err(|error| ArgumentError::invalid(Argument::Latitude, lat, error))?,
+            longitude: Longitude::new(lon_degrees)
+                .map_err(|error| ArgumentError::invalid(Argument::Longitude, lon, error))?,
+        })
+    }
 }
 
-/// Parsed arguments for the uncompressed `position` beacon command.
-#[derive(Debug, Clone, PartialEq)]
+/// Checked uncompressed-position beacon arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PositionArgs {
     /// Beacon position.
     pub pos: LatLon,
-    /// Free-form comment appended to the beacon (may be empty).
+    /// Position-report text, possibly empty.
     pub comment: PositionReportText,
 }
 
-/// Parse `<latitude> <longitude> [comment...]`.
-///
-/// # Errors
-///
-/// Returns a usage message when arguments are missing and a range
-/// message for invalid coordinates.
-pub fn parse_position(args: &[&str]) -> Result<PositionArgs, String> {
-    let [lat, lon, comment @ ..] = args else {
-        return Err(
-            "usage: <latitude> <longitude> then an optional comment. Example: 35.30 -82.46 Portable."
-                .to_string(),
-        );
-    };
-    Ok(PositionArgs {
-        pos: parse_lat_lon(lat, lon)?,
-        comment: PositionReportText::new(&comment.join(" "))
-            .map_err(|error| format!("invalid position text: {error}."))?,
-    })
+impl PositionArgs {
+    /// Parse latitude, longitude and optional space-joined text.
+    ///
+    /// # Errors
+    ///
+    /// Returns usage, coordinate or position-text validation errors.
+    /// See the [coordinate example](LatLon::parse).
+    pub fn parse(args: &[&str]) -> Result<Self, ArgumentError> {
+        let [lat, lon, comment @ ..] = args else {
+            return Err(ArgumentError::Usage {
+                usage: "position <latitude> <longitude> [comment]",
+            });
+        };
+        let text = comment.join(" ");
+        Ok(Self {
+            pos: LatLon::parse(lat, lon)?,
+            comment: PositionReportText::new(&text)
+                .map_err(|error| ArgumentError::invalid(Argument::Text, &text, error))?,
+        })
+    }
 }
 
-/// Parsed arguments for the `compressed` beacon command.
-#[derive(Debug, Clone, PartialEq)]
+/// Checked compressed-position beacon arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompressedPositionArgs {
     /// Beacon position.
     pub pos: LatLon,
-    /// Text after the compressed position's fixed `csT` bytes.
+    /// Text after the compressed position's fixed csT bytes.
     pub comment: CompressedPositionText,
 }
 
-/// Parse `<latitude> <longitude> [comment...]` for a compressed position.
-///
-/// # Errors
-///
-/// Returns a usage message for missing coordinates or an exact APRS text
-/// validation error for a comment that cannot fit on air.
-pub fn parse_compressed_position(args: &[&str]) -> Result<CompressedPositionArgs, String> {
-    let [lat, lon, comment @ ..] = args else {
-        return Err(
-            "usage: compressed <latitude> <longitude> then an optional comment. Example: compressed 35.30 -82.46 Portable."
-                .to_string(),
-        );
-    };
-    Ok(CompressedPositionArgs {
-        pos: parse_lat_lon(lat, lon)?,
-        comment: CompressedPositionText::new(&comment.join(" "))
-            .map_err(|error| format!("invalid compressed-position text: {error}."))?,
-    })
+impl CompressedPositionArgs {
+    /// Parse latitude, longitude and optional space-joined compressed text.
+    ///
+    /// # Errors
+    ///
+    /// Returns usage, coordinate or compressed-text validation errors.
+    /// See the [coordinate example](LatLon::parse).
+    pub fn parse(args: &[&str]) -> Result<Self, ArgumentError> {
+        let [lat, lon, comment @ ..] = args else {
+            return Err(ArgumentError::Usage {
+                usage: "compressed <latitude> <longitude> [comment]",
+            });
+        };
+        let text = comment.join(" ");
+        Ok(Self {
+            pos: LatLon::parse(lat, lon)?,
+            comment: CompressedPositionText::new(&text)
+                .map_err(|error| ArgumentError::invalid(Argument::Text, &text, error))?,
+        })
+    }
 }
 
-/// Parsed arguments for the `mice` beacon command.
-#[derive(Debug, Clone, PartialEq)]
+/// Checked Mic-E beacon arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MiceArgs {
     /// Beacon position.
     pub pos: LatLon,
-    /// Ground speed in knots (Mic-E wire range 0 through 799).
+    /// Speed in knots, 0 through 799.
     pub speed: MiceSpeed,
-    /// Course in degrees. Zero means unknown; 1 through 360 is a heading.
+    /// Course in degrees; zero means unknown.
     pub course: Course,
-    /// Mic-E status text appended to the beacon (may be empty).
+    /// Mic-E status text, possibly empty.
     pub status_text: MiceStatusText,
 }
 
-/// Parse `<latitude> <longitude> <speed in knots> <course in degrees> [comment...]`.
-///
-/// # Errors
-///
-/// Returns a usage message when arguments are missing, and range
-/// messages for coordinates, speed above 799 knots, or course above
-/// 360 degrees.
-pub fn parse_mice(args: &[&str]) -> Result<MiceArgs, String> {
-    let [lat, lon, speed, course, comment @ ..] = args else {
-        return Err(
-            "usage: mice <latitude> <longitude> <speed in knots> <course in degrees> then an optional comment. Example: mice 35.30 -82.46 25 90 testing."
-                .to_string(),
-        );
-    };
-    let pos = parse_lat_lon(lat, lon)?;
-    let speed = speed
-        .parse::<u16>()
-        .ok()
-        .and_then(|knots| MiceSpeed::new(knots).ok())
-        .ok_or_else(|| format!("invalid speed {speed:?}. Use whole knots from 0 through 799."))?;
-    let course = course
-        .parse::<u16>()
-        .ok()
-        .and_then(|degrees| Course::new(degrees).ok())
-        .ok_or_else(|| {
-            format!(
-                "invalid course {course:?}. Use whole degrees from 0 through 360. Zero means unknown."
-            )
-        })?;
-    Ok(MiceArgs {
-        pos,
-        speed,
-        course,
-        status_text: MiceStatusText::new(&comment.join(" "))
-            .map_err(|error| format!("invalid Mic-E status text: {error}."))?,
-    })
+impl MiceArgs {
+    /// Parse latitude, longitude, whole knots, whole degrees and optional text.
+    ///
+    /// # Errors
+    ///
+    /// Returns usage or typed coordinate, numeric, speed, course or text errors.
+    /// See the [coordinate example](LatLon::parse).
+    pub fn parse(args: &[&str]) -> Result<Self, ArgumentError> {
+        let [lat, lon, speed, course, comment @ ..] = args else {
+            return Err(ArgumentError::Usage {
+                usage: "mice <latitude> <longitude> <knots> <degrees> [comment]",
+            });
+        };
+        let knots = speed
+            .parse::<u16>()
+            .map_err(|error| ArgumentError::invalid(Argument::Speed, speed, error))?;
+        let degrees = course
+            .parse::<u16>()
+            .map_err(|error| ArgumentError::invalid(Argument::Course, course, error))?;
+        let text = comment.join(" ");
+        Ok(Self {
+            pos: LatLon::parse(lat, lon)?,
+            speed: MiceSpeed::new(knots)
+                .map_err(|error| ArgumentError::invalid(Argument::Speed, speed, error))?,
+            course: Course::new(degrees)
+                .map_err(|error| ArgumentError::invalid(Argument::Course, course, error))?,
+            status_text: MiceStatusText::new(&text)
+                .map_err(|error| ArgumentError::invalid(Argument::Text, &text, error))?,
+        })
+    }
 }
 
-/// Parsed arguments for the `motion` `SmartBeaconing` command.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Checked `SmartBeaconing` motion arguments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MotionArgs {
     /// Current position.
     pub pos: LatLon,
     /// Ground speed in kilometers per hour.
     pub speed: Speed,
-    /// Course in degrees, 0 through 360.
+    /// Heading in degrees.
     pub heading: Heading,
 }
 
-/// Parse `<latitude> <longitude> <speed in km/h> <course in degrees>`.
-///
-/// # Errors
-///
-/// Returns a usage message when arguments are missing or out of range.
-pub fn parse_motion(args: &[&str]) -> Result<MotionArgs, String> {
-    let [lat, lon, speed, course] = args else {
-        return Err(
-            "usage: motion <latitude> <longitude> <speed in kilometers per hour> <course in degrees>. Example: motion 35.30 -82.46 55 180."
-                .to_string(),
-        );
-    };
-    let pos = parse_lat_lon(lat, lon)?;
-    let speed = speed
-        .parse::<f64>()
-        .ok()
-        .and_then(|kmh| Speed::from_kmh(kmh).ok())
-        .ok_or_else(|| {
-            format!("invalid speed {speed:?}. Use kilometers per hour, zero or more.")
-        })?;
-    let heading = course
-        .parse::<f64>()
-        .ok()
-        .and_then(|degrees| Heading::new(degrees).ok())
-        .ok_or_else(|| format!("invalid course {course:?}. Use degrees from 0 through 360."))?;
-    Ok(MotionArgs {
-        pos,
-        speed,
-        heading,
-    })
+impl MotionArgs {
+    /// Parse latitude, longitude, kilometers per hour and heading.
+    ///
+    /// # Errors
+    ///
+    /// Returns usage or typed coordinate, numeric, speed or heading errors.
+    /// See the [coordinate example](LatLon::parse).
+    pub fn parse(args: &[&str]) -> Result<Self, ArgumentError> {
+        let [lat, lon, speed, course] = args else {
+            return Err(ArgumentError::Usage {
+                usage: "motion <latitude> <longitude> <kilometers per hour> <degrees>",
+            });
+        };
+        let kmh = speed
+            .parse::<f64>()
+            .map_err(|error| ArgumentError::invalid(Argument::Speed, speed, error))?;
+        let degrees = course
+            .parse::<f64>()
+            .map_err(|error| ArgumentError::invalid(Argument::Course, course, error))?;
+        Ok(Self {
+            pos: LatLon::parse(lat, lon)?,
+            speed: Speed::from_kmh(kmh)
+                .map_err(|error| ArgumentError::invalid(Argument::Speed, speed, error))?,
+            heading: Heading::new(degrees)
+                .map_err(|error| ArgumentError::invalid(Argument::Course, course, error))?,
+        })
+    }
 }
 
-/// Parsed arguments for the `object` report command.
-#[derive(Debug, Clone, PartialEq)]
+/// Checked APRS object-report arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectArgs {
-    /// Validated object name, 1 through 9 printable ASCII bytes.
+    /// Validated object name.
     pub name: ObjectName,
     /// Object position.
     pub pos: LatLon,
-    /// Validated position-report text (may be empty).
+    /// Position-report text, possibly empty.
     pub comment: PositionReportText,
 }
 
-/// Parse `<name> <latitude> <longitude> [comment...]`.
-///
-/// # Errors
-///
-/// Returns a usage message when arguments are missing, or a validation
-/// message when the object name cannot be represented on air.
-pub fn parse_object(args: &[&str]) -> Result<ObjectArgs, String> {
-    let [name, lat, lon, comment @ ..] = args else {
-        return Err(
-            "usage: object <name> <latitude> <longitude> then an optional comment. Example: object CAMP 35.31 -82.45 Field day site."
-                .to_string(),
-        );
-    };
-    let name = ObjectName::new(name).map_err(|error| format!("invalid object name: {error}."))?;
-    Ok(ObjectArgs {
-        name,
-        pos: parse_lat_lon(lat, lon)?,
-        comment: PositionReportText::new(&comment.join(" "))
-            .map_err(|error| format!("invalid object position text: {error}."))?,
-    })
+impl ObjectArgs {
+    /// Parse an object name, latitude, longitude and optional text.
+    ///
+    /// # Errors
+    ///
+    /// Returns usage or typed name, coordinate or position-text errors.
+    /// See the [coordinate example](LatLon::parse).
+    pub fn parse(args: &[&str]) -> Result<Self, ArgumentError> {
+        let [name, lat, lon, comment @ ..] = args else {
+            return Err(ArgumentError::Usage {
+                usage: "object <name> <latitude> <longitude> [comment]",
+            });
+        };
+        let text = comment.join(" ");
+        Ok(Self {
+            name: ObjectName::new(name)
+                .map_err(|error| ArgumentError::invalid(Argument::ObjectName, name, error))?,
+            pos: LatLon::parse(lat, lon)?,
+            comment: PositionReportText::new(&text)
+                .map_err(|error| ArgumentError::invalid(Argument::Text, &text, error))?,
+        })
+    }
 }
 
-/// Parsed arguments for `aprs start`.
+/// Validated station identity and KISS routing for APRS startup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartArgs {
-    /// Station callsign, upper-cased for the AX.25 wire.
-    pub callsign: String,
-    /// TNC data band used by the one `TN 2,x` KISS transition.
-    pub data_band: TncDataBand,
-    /// AX.25 SSID, 0 through 15.
-    pub ssid: u8,
-    /// Whether to enable the WIDE1-1 fill-in digipeater.
-    pub digi: bool,
+    address: Ax25Address,
+    data_band: TncDataBand,
+    digi: bool,
 }
 
-/// Parse `<callsign> <a|b> [ssid] [digi]`.
-///
-/// The callsign is upper-cased (AX.25 callsigns are upper-case on the
-/// wire, so `aprs start w1aw a` behaves like the intended call). The
-/// TNC data band is mandatory because it is a distinct radio routing
-/// choice, not a packet-speed encoding. SSID defaults to 0. A trailing `digi`
-/// keyword enables the WIDE1-1 fill-in digipeater.
-///
-/// # Errors
-///
-/// Returns a message when the callsign or data band is missing, the band is
-/// not A or B, the SSID is not a number from 0 through 15, or extra arguments
-/// follow.
-pub fn parse_start(args: &[&str]) -> Result<StartArgs, String> {
-    let [raw_callsign, raw_data_band, rest @ ..] = args else {
-        return Err(
-            "callsign and data band required. Usage: aprs start <callsign> <a or b> [ssid] [digi]. Example: aprs start W1AW b 7."
-                .to_string(),
-        );
-    };
-    let callsign = raw_callsign.to_ascii_uppercase();
-    let data_band = match raw_data_band.to_ascii_lowercase().as_str() {
-        "a" => TncDataBand::A,
-        "b" => TncDataBand::B,
-        _ => {
-            return Err(format!(
-                "invalid TNC data band {raw_data_band:?}. Use a or b."
-            ));
-        }
-    };
-    let mut ssid: u8 = 0;
-    let mut digi = false;
-    match rest {
-        [] => {}
-        [one] if one.eq_ignore_ascii_case("digi") => digi = true,
-        [one] => ssid = parse_ssid(one)?,
-        [one, two] if two.eq_ignore_ascii_case("digi") => {
-            ssid = parse_ssid(one)?;
-            digi = true;
-        }
-        [_, two] => {
-            return Err(format!("unexpected argument {two:?}. Did you mean digi?"));
-        }
-        _ => {
-            return Err(
-                "too many arguments. Usage: aprs start <callsign> <a or b> [ssid] [digi]."
-                    .to_string(),
-            );
-        }
+impl StartArgs {
+    /// Parse a base callsign, mandatory A/B band, optional SSID and digi keyword.
+    ///
+    /// ASCII callsign letters are uppercased before AX.25 validation. The SSID
+    /// defaults to zero; a callsign containing a separate SSID suffix is rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns usage, unknown-token, integer or checked address errors before
+    /// any radio mode change.
+    ///
+    /// ```
+    /// use thd75_repl::aprs_args::StartArgs;
+    /// let start = StartArgs::parse(&["w1aw", "b", "7", "digi"])?;
+    /// assert_eq!(start.address().to_string(), "W1AW-7");
+    /// assert!(start.digipeater());
+    /// # Ok::<(), thd75_repl::aprs_args::ArgumentError>(())
+    /// ```
+    pub fn parse(args: &[&str]) -> Result<Self, ArgumentError> {
+        let [callsign, band, rest @ ..] = args else {
+            return Err(ArgumentError::Usage {
+                usage: "aprs start <callsign> <a or b> [ssid] [digi]",
+            });
+        };
+        let data_band = if band.eq_ignore_ascii_case("a") {
+            TncDataBand::A
+        } else if band.eq_ignore_ascii_case("b") {
+            TncDataBand::B
+        } else {
+            return Err(ArgumentError::token(Argument::DataBand, band, "a or b"));
+        };
+        let (ssid, digi) = match rest {
+            [] => (0, false),
+            [keyword] if keyword.eq_ignore_ascii_case("digi") => (0, true),
+            [ssid] => (parse_ssid(ssid)?, false),
+            [ssid, keyword] if keyword.eq_ignore_ascii_case("digi") => (parse_ssid(ssid)?, true),
+            [_, keyword] => {
+                return Err(ArgumentError::token(Argument::Keyword, keyword, "digi"));
+            }
+            _ => {
+                return Err(ArgumentError::Usage {
+                    usage: "aprs start <callsign> <a or b> [ssid] [digi]",
+                });
+            }
+        };
+        let address = Ax25Address::new(&callsign.to_ascii_uppercase(), ssid)
+            .map_err(|error| ArgumentError::invalid(Argument::Address, callsign, error))?;
+        Ok(Self {
+            address,
+            data_band,
+            digi,
+        })
     }
-    Ok(StartArgs {
-        callsign,
-        data_band,
-        ssid,
-        digi,
-    })
+
+    /// Complete checked AX.25 station address.
+    #[must_use]
+    pub const fn address(&self) -> &Ax25Address {
+        &self.address
+    }
+
+    /// TNC data band for the one KISS transition.
+    #[must_use]
+    pub const fn data_band(&self) -> TncDataBand {
+        self.data_band
+    }
+
+    /// Whether WIDE1-1 fill-in digipeating was requested.
+    #[must_use]
+    pub const fn digipeater(&self) -> bool {
+        self.digi
+    }
+
+    /// Transfer the checked station address to its client configuration.
+    #[must_use]
+    pub fn into_address(self) -> Ax25Address {
+        self.address
+    }
 }
 
-/// Parse an SSID token as a number from 0 through 15.
-fn parse_ssid(s: &str) -> Result<u8, String> {
-    match s.parse::<u8>() {
-        Ok(n) if n <= 15 => Ok(n),
-        _ => Err(format!(
-            "invalid SSID {s:?}. Use a number from 0 through 15."
-        )),
-    }
+fn parse_ssid(value: &str) -> Result<u8, ArgumentError> {
+    value
+        .parse::<u8>()
+        .map_err(|error| ArgumentError::invalid(Argument::Ssid, value, error))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    type TestResult = Result<(), Box<dyn std::error::Error>>;
+    type TestResult = Result<(), Box<dyn Error>>;
 
     #[test]
-    fn lat_lon_parses_and_range_checks() -> TestResult {
-        let ok = parse_lat_lon("35.30", "-82.46")?;
-        assert!((ok.latitude.as_degrees() - 35.30).abs() < f64::EPSILON);
-        assert!((ok.longitude.as_degrees() + 82.46).abs() < f64::EPSILON);
-        assert!(parse_lat_lon("91", "0").is_err());
-        assert!(parse_lat_lon("0", "-181").is_err());
-        assert!(parse_lat_lon("NaN", "0").is_err());
-        assert!(parse_lat_lon("north", "0").is_err());
+    fn coordinates_reject_nonfinite_and_outside_values_before_rounding() -> TestResult {
+        let position = LatLon::parse("35.30", "-82.46")?;
+        assert_eq!(position.latitude, Latitude::new(35.30)?);
+        for latitude in ["NaN", "inf", "91", "-90.000000001", "north"] {
+            assert!(LatLon::parse(latitude, "0").is_err(), "{latitude}");
+        }
+        for longitude in ["NaN", "-inf", "-181", "180.000000001", "east"] {
+            assert!(LatLon::parse("0", longitude).is_err(), "{longitude}");
+        }
         Ok(())
     }
 
     #[test]
-    fn position_wants_two_coordinates() -> TestResult {
-        let p = parse_position(&["35.30", "-82.46", "two", "words"])?;
-        assert_eq!(p.comment.as_str(), "two words");
-        assert!(parse_position(&["35.30"]).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn compressed_position_enforces_40_byte_comment_limit() -> TestResult {
-        let maximum = "c".repeat(CompressedPositionText::MAX_LEN);
-        let parsed = parse_compressed_position(&["35.30", "-82.46", &maximum])?;
-        assert_eq!(parsed.comment.as_str(), maximum);
-
-        let too_long = "c".repeat(CompressedPositionText::MAX_LEN + 1);
-        assert!(parse_compressed_position(&["35.30", "-82.46", &too_long]).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn mice_bounds_and_status_text_semantics() -> TestResult {
-        let m = parse_mice(&["35.30", "-82.46", "25", "90", "hi"])?;
-        assert_eq!((m.speed.as_knots(), m.course.as_degrees()), (25, 90));
-        assert_eq!(m.status_text.as_str(), "hi");
-        assert!(parse_mice(&["35.30", "-82.46", "800", "90"]).is_err());
-        assert!(parse_mice(&["35.30", "-82.46", "25", "361"]).is_err());
-        assert!(parse_mice(&["35.30", "-82.46", "25"]).is_err());
-        let comma_status = parse_mice(&["35.30", "-82.46", "25", "90", ",ordinary", "status"])?;
-        assert_eq!(comma_status.status_text.as_str(), ",ordinary status");
-        assert!(parse_mice(&["35.30", "-82.46", "25", "90", "`telemetry"]).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn motion_takes_floats_and_rejects_negatives() -> TestResult {
-        let m = parse_motion(&["35.30", "-82.46", "55.5", "180"])?;
-        assert!((m.speed.as_kmh() - 55.5).abs() < f64::EPSILON);
-        assert!((m.heading.as_degrees() - 180.0).abs() < f64::EPSILON);
-        assert!(parse_motion(&["35.30", "-82.46", "-5", "180"]).is_err());
-        assert!(parse_motion(&["35.30", "-82.46", "55"]).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn object_name_length_is_enforced() -> TestResult {
-        let o = parse_object(&["CAMP", "35.31", "-82.45"])?;
-        assert_eq!(o.name.as_str(), "CAMP");
-        assert!(o.comment.as_str().is_empty());
-        assert!(parse_object(&["TENCHARSXX", "35.31", "-82.45"]).is_err());
-        assert!(parse_object(&["CAMPé", "35.31", "-82.45"]).is_err());
-        assert!(parse_object(&["CAMP\n", "35.31", "-82.45"]).is_err());
-        assert!(parse_object(&["CAMP"]).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn start_grammar_covers_ssid_and_digi() -> TestResult {
+    fn startup_rejects_invalid_identity_band_ssid_and_extra_tokens() -> TestResult {
+        let start = StartArgs::parse(&["w1aw", "B", "7", "DIGI"])?;
+        assert_eq!(start.address(), &Ax25Address::new("W1AW", 7)?);
+        assert_eq!(start.data_band(), TncDataBand::B);
+        assert!(start.digipeater());
         assert_eq!(
-            parse_start(&["w1aw", "a"])?,
-            StartArgs {
-                callsign: "W1AW".to_string(),
-                data_band: TncDataBand::A,
-                ssid: 0,
-                digi: false
-            }
+            StartArgs::parse(&["W1AW", "a"])?.address(),
+            &Ax25Address::new("W1AW", 0)?
         );
-        assert_eq!(parse_start(&["W1AW", "b", "7"])?.ssid, 7);
-        assert_eq!(parse_start(&["W1AW", "B"])?.data_band, TncDataBand::B);
-        assert!(parse_start(&["W1AW", "a", "digi"])?.digi);
-        let both = parse_start(&["W1AW", "b", "7", "DIGI"])?;
-        assert!(both.digi && both.ssid == 7 && both.data_band == TncDataBand::B);
-        assert!(parse_start(&[]).is_err());
-        assert!(parse_start(&["W1AW"]).is_err());
-        assert!(parse_start(&["W1AW", "c"]).is_err());
-        assert!(parse_start(&["W1AW", "a", "16"]).is_err());
-        assert!(parse_start(&["W1AW", "b", "7", "loud"]).is_err());
+        for invalid in ["", "TOOLONG", "W1-AW", "W1AW-7", "W1AW\n", "é"] {
+            assert!(StartArgs::parse(&[invalid, "a"]).is_err(), "{invalid:?}");
+        }
+        for args in [
+            vec![],
+            vec!["W1AW"],
+            vec!["W1AW", "c"],
+            vec!["W1AW", "a", "16"],
+            vec!["W1AW", "a", "seven"],
+            vec!["W1AW", "a", "7", "loud"],
+            vec!["W1AW", "a", "7", "digi", "extra"],
+        ] {
+            assert!(StartArgs::parse(&args).is_err(), "{args:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn parse_error_retains_numeric_and_domain_causes() {
+        let numeric = LatLon::parse("north", "0");
+        assert!(
+            matches!(numeric, Err(ArgumentError::Invalid {
+            argument: Argument::Latitude, ref source, ..
+        }) if source.downcast_ref::<std::num::ParseFloatError>().is_some()),
+            "{numeric:?}"
+        );
+        let domain = StartArgs::parse(&["W1-AW", "a"]);
+        assert!(
+            matches!(domain, Err(ArgumentError::Invalid {
+            argument: Argument::Address, ref source, ..
+        }) if source.downcast_ref::<kenwood_thd75::Ax25Error>().is_some()),
+            "{domain:?}"
+        );
+    }
+
+    #[test]
+    fn beacon_text_motion_and_object_domains_are_checked() -> TestResult {
+        let position = PositionArgs::parse(&["35.30", "-82.46", "two", "words"])?;
+        assert_eq!(position.comment.as_str(), "two words");
+        assert!(PositionArgs::parse(&["35.30"]).is_err());
+        let maximum = "c".repeat(CompressedPositionText::MAX_LEN);
+        assert_eq!(
+            CompressedPositionArgs::parse(&["35.30", "-82.46", &maximum])?
+                .comment
+                .as_str(),
+            maximum
+        );
+        assert!(
+            CompressedPositionArgs::parse(&["35.30", "-82.46", &format!("{maximum}c")]).is_err()
+        );
+        let mice = MiceArgs::parse(&["35.30", "-82.46", "25", "90", ",ordinary", "status"])?;
+        assert_eq!(mice.speed.as_knots(), 25);
+        assert_eq!(mice.status_text.as_str(), ",ordinary status");
+        assert!(MiceArgs::parse(&["35.30", "-82.46", "800", "90"]).is_err());
+        assert!(MiceArgs::parse(&["35.30", "-82.46", "25", "361"]).is_err());
+        assert!(MiceArgs::parse(&["35.30", "-82.46", "25", "90", "`telemetry"]).is_err());
+        let motion = MotionArgs::parse(&["35.30", "-82.46", "55.5", "180"])?;
+        assert_eq!(motion.speed, Speed::from_kmh(55.5)?);
+        assert!(MotionArgs::parse(&["35.30", "-82.46", "-5", "180"]).is_err());
+        assert!(MotionArgs::parse(&["35.30", "-82.46", "55", "NaN"]).is_err());
+        let object = ObjectArgs::parse(&["CAMP", "35.31", "-82.45"])?;
+        assert_eq!(object.name.as_str(), "CAMP");
+        for name in ["TENCHARSXX", "CAMPé", "CAMP\n"] {
+            assert!(ObjectArgs::parse(&[name, "35.31", "-82.45"]).is_err());
+        }
         Ok(())
     }
 }

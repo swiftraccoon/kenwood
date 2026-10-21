@@ -1,6 +1,6 @@
 # CAT mode smoke test.
 # Order matters: the mock scenario programs exchanges in sequence
-# (startup ID/FV, then BC, then IO), so band and ifout run before
+# (startup ID/FV/AE, then BC, then IO), so band and ifout run before
 # the repeated id.
 band
 ifout

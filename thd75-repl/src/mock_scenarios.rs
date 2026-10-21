@@ -1,7 +1,7 @@
 //! Mock radio scenarios for integration tests.
 //!
-//! This module is gated behind the `testing` cargo feature; it is not
-//! compiled into release builds. Each scenario is a pre-scripted
+//! The `testing` Cargo feature enables this module in any build profile.
+//! Each scenario is a scripted
 //! sequence of `(request_bytes, response_bytes)` pairs that drive a
 //! [`MockTransport`](kenwood_transport::MockTransport) through
 //! a known exchange.
@@ -11,10 +11,8 @@
 //!
 //! ## Coverage
 //!
-//! The normal CAT scenario is intentionally minimal. APRS and D-STAR
-//! scenarios pair command-script fixtures with exact byte sequences here,
-//! because their binary KISS and MMDVM frames cannot be represented by the
-//! transport's text fixture format.
+//! CAT, APRS and positive binary-mode diagnosis use deterministic transport
+//! scripts. No mock supplies an unverified Kenwood modem configuration.
 
 use kenwood_transport::MockTransport;
 
@@ -22,14 +20,11 @@ use kenwood_transport::MockTransport;
 ///
 /// Returns `None` if `name` does not match a known scenario. Known
 /// names: `"simple"` (minimal CAT identification flow), `"empty"`
-/// (empty mock that rejects every write), `"mmdvm"` (radio in DV
-/// Gateway / Reflector Terminal Mode: CAT identification fails and an
-/// MMDVM probe answers, so the REPL takes the terminal-mode path), and
+/// (empty mock that rejects every write), `"mmdvm"` (failed CAT identification
+/// followed by valid MMDVM replies, selecting the binary connection guard), and
 /// `"mmdvm_takeover"` (CAT preparation succeeds before the radio switches to
-/// persistent MMDVM during startup qualification), and
-/// `"mmdvm_dstar"` (the same startup followed by a strict D-STAR modem
-/// initialization and noninteractive shutdown). `"mmdvm_dstar_idle"` allows
-/// periodic status writes for an interactive prompt-liveness test.
+/// persistent MMDVM during startup qualification), `"startup"` (CAT identity
+/// followed by idle input) and `"aprs"` (APRS entry and transmit commands).
 #[must_use]
 pub fn build(name: &str) -> Option<MockTransport> {
     match name {
@@ -37,19 +32,29 @@ pub fn build(name: &str) -> Option<MockTransport> {
         "empty" => Some(MockTransport::new()),
         "mmdvm" => Some(mmdvm_scenario()),
         "mmdvm_takeover" => Some(mmdvm_takeover_scenario()),
-        "mmdvm_dstar" => Some(mmdvm_dstar_scenario()),
-        "mmdvm_dstar_idle" => Some(mmdvm_dstar_idle_scenario()),
+        "startup" => Some(startup_scenario()),
         "aprs" => Some(aprs_scenario()),
         _ => None,
     }
 }
 
+/// CAT startup with model, firmware and serial identity, then idle input.
+fn startup_scenario() -> MockTransport {
+    let mut mock = MockTransport::new();
+    mock.expect(b"ID\r", b"ID TH-D75\r");
+    mock.expect(b"ID\r", b"ID TH-D75\r");
+    mock.expect(b"FV\r", b"FV 1.03.00\r");
+    mock.expect(b"AE\r", b"AE SYN00001,K01\r");
+    mock.pend_when_empty();
+    mock
+}
+
 /// Minimal scenario covering the read-only CAT startup proof plus one
-/// `identify` round-trip and one `get_firmware_version` round-trip.
+/// model, firmware and serial-information round-trips.
 ///
 /// An exact `ID TH-D75` response takes the CAT-preserving fast path, so startup
 /// must not send the packet-mode recovery preamble. The subsequent CAT reads
-/// match the `ID\r` and `FV\r` commands issued by the REPL startup.
+/// match the `ID\r`, `FV\r` and `AE\r` commands issued by the REPL startup.
 fn simple_scenario() -> MockTransport {
     let mut mock = MockTransport::new();
 
@@ -58,9 +63,10 @@ fn simple_scenario() -> MockTransport {
     mock.expect(b"ID\r", b"ID TH-D75\r");
 
     // CAT identification round-trips. The REPL startup calls
-    // radio.identify() then radio.get_firmware_version().
+    // radio.identify(), get_firmware_version(), then get_serial_information().
     mock.expect(b"ID\r", b"ID TH-D75\r");
     mock.expect(b"FV\r", b"FV 1.03.00\r");
+    mock.expect(b"AE\r", b"AE SYN00001,K01\r");
 
     // Scripted command round-trips (cat_basics.txt), in script order.
     mock.expect(b"BC\r", b"BC 0\r");
@@ -78,7 +84,7 @@ fn simple_scenario() -> MockTransport {
 /// Radio that identifies normally, then accepts a KISS-mode entry so
 /// the APRS transmit commands can be driven end-to-end.
 ///
-/// Extends the [`simple_scenario`] startup (read-only CAT proof + `ID` + `FV`)
+/// Extends the [`simple_scenario`] startup (`ID`, `FV` and `AE`)
 /// with the `TN 2,0\r` KISS-entry echo that
 /// [`AprsClient::start`](kenwood_thd75::AprsClient) waits for at the
 /// default 1200 bps. After that, [`MockTransport::expect_any_write`]
@@ -98,6 +104,7 @@ fn aprs_scenario() -> MockTransport {
     // Startup identification, so the REPL enters normal CAT mode.
     mock.expect(b"ID\r", b"ID TH-D75\r");
     mock.expect(b"FV\r", b"FV 1.03.00\r");
+    mock.expect(b"AE\r", b"AE SYN00001,K01\r");
 
     // `aprs start` enters KISS mode on TNC data Band A (wire value 0), which
     // sends `TN 2,0\r` and waits for the echo. Packet speed is configured
@@ -109,6 +116,7 @@ fn aprs_scenario() -> MockTransport {
     // ID exchange remains queued until restore_cat_after_mode_exit sends it.
     mock.expect_any_write();
     mock.expect(b"ID\r", b"ID TH-D75\r");
+    mock.expect(b"AE\r", b"AE SYN00001,K01\r");
     // CAT restoration proves a quiet boundary both before and after the
     // identity exchange. An idle serial link waits; it does not report a
     // read error merely because no byte is immediately available.
@@ -117,7 +125,7 @@ fn aprs_scenario() -> MockTransport {
     mock
 }
 
-/// Radio in a DV Gateway / Reflector Terminal Mode: both the read-only CAT
+/// Binary connection: both the read-only CAT
 /// proof and the exact proof after packet-mode fallback fail because the radio
 /// speaks MMDVM binary, not CAT. The subsequent MMDVM `GET_VERSION` probe
 /// answers, so `Radio::probe_silent_link` classifies the retained link as
@@ -171,71 +179,6 @@ fn mmdvm_takeover_scenario() -> MockTransport {
     mock.expect(b"FV\r", b"?\r");
     mock.expect(b"\xE0\x03\x00", b"\xE0\x0E\x00\x01MMDVM 2018");
     mock.pend_when_empty();
-
-    mock
-}
-
-/// Radio already in Reflector Terminal Mode, followed by the exact MMDVM
-/// writes needed to initialize a D-STAR gateway session.
-///
-/// This scenario deliberately has no catch-all write allowance. In
-/// particular, a CAT recovery preamble sent after the positive binary-mode
-/// proof fails immediately instead of being mistaken for valid gateway I/O.
-fn mmdvm_dstar_scenario() -> MockTransport {
-    let mut mock = mmdvm_dstar_init_scenario();
-
-    // Script EOF stops the host gateway while preserving persistent Menu 650
-    // mode. Shutdown must not emit the transient CAT-side `TN 0,0` command.
-    mock.pend_when_empty();
-
-    mock
-}
-
-/// Interactive D-STAR scenario that accepts periodic status polls while the
-/// input prompt remains idle, then shuts the host gateway down at EOF without
-/// a transient CAT-side exit.
-fn mmdvm_dstar_idle_scenario() -> MockTransport {
-    let mut mock = mmdvm_dstar_init_scenario();
-
-    // The 250 ms MMDVM status poll is intentionally variable with wall-clock
-    // scheduling. Accept those write-only frames while retaining the exact
-    // shutdown boundary. The strict sibling scenario independently rejects
-    // every unexpected startup/init write.
-    mock.expect_any_write();
-    mock.pend_when_empty();
-
-    mock
-}
-
-/// Exact common startup through acknowledged D-STAR `SetMode`.
-fn mmdvm_dstar_init_scenario() -> MockTransport {
-    let mut mock = MockTransport::new();
-
-    // Persistent MMDVM cannot answer the read-only CAT fast path.
-    mock.expect(b"ID\r", b"?\r");
-
-    // The packet-mode fallback cannot disable persistent Menu 650 mode.
-    mock.expect(b"\r", b"");
-    mock.expect(b"\r", b"");
-    mock.expect(&[0x03], b"");
-    mock.expect(&[0xC0, 0xFF, 0xC0], b"");
-    mock.expect(b"\rTC 1\r", b"");
-    mock.expect(b"TN 0,0\r", b"");
-
-    // The post-fallback CAT proof also fails. The complete MMDVM version frame
-    // then proves the binary protocol boundary and authorizes conversion into
-    // the typed session.
-    mock.expect(b"ID\r", b"?\r");
-    mock.expect(b"\xE0\x03\x00", b"\xE0\x0E\x00\x01MMDVM 2018");
-
-    // AsyncModem's initial version and status requests precede gateway init.
-    mock.expect(b"\xE0\x03\x00", b"");
-    mock.expect(b"\xE0\x03\x01", b"");
-
-    // D-STAR-only SetConfig, then SetMode(Dstar), each with its correlated
-    // MMDVM acknowledgement.
-    mock.expect(b"\xE0\x09\x02\x00\x01\x0A\x01\x80\x80", b"\xE0\x04\x70\x02");
-    mock.expect(b"\xE0\x04\x03\x01", b"\xE0\x04\x70\x03");
 
     mock
 }

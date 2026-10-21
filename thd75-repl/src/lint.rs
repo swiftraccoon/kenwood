@@ -1,21 +1,15 @@
 //! Accessibility lint checker for REPL output.
 //!
-//! Implements fourteen hard rules (R1 through R14) derived from concerns
-//! covered by nine published accessibility standards and guidance sources:
-//! WCAG 2.1 Level AA, Section 508 of the US Rehabilitation Act, the
-//! CHI 2021 CLI accessibility paper, EN 301 549 version 3.2.1,
-//! ISO 9241-171, ITU-T Recommendation F.790, BRLTTY compatibility,
-//! the Handi-Ham Program recommendations, and the ARRL accessibility
-//! resources. These local checks do not independently certify complete
-//! conformance to each source. Each `Rule` variant carries its own doc
-//! comment describing the specific constraint.
+//! Eight line-level rules inspect captured text. Six other local rules concern
+//! command results or source structure and are checked by separate tests.
+//! These are project presentation rules, not external accessibility certification.
 
 use std::fmt;
 
 /// An identifier for one of the 14 hard accessibility rules. Each
 /// variant carries its own doc comment describing the specific
 /// constraint the rule enforces.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Rule {
     /// R1: Every byte is ASCII printable (0x20–0x7E) or `\n`.
     AsciiOnly,
@@ -37,7 +31,7 @@ pub enum Rule {
     BooleanWords,
     /// R10: No `print!` without a trailing newline. (Static grep rule.)
     NoNakedPrint,
-    /// R11: No cursor-move sequences or spinners. (Static grep rule.)
+    /// R11: Controls are escaped by the shared renderer; source checks reject stdout bypasses.
     NoCursorMoves,
     /// R12: Numeric units spelled out (megahertz, watts, etc.).
     UnitsSpelledOut,
@@ -48,6 +42,22 @@ pub enum Rule {
 }
 
 impl Rule {
+    /// Whether captured text alone can check this rule.
+    #[must_use]
+    pub const fn is_line_level(self) -> bool {
+        matches!(
+            self,
+            Self::AsciiOnly
+                | Self::LineLength
+                | Self::NoAnsi
+                | Self::ErrorPrefix
+                | Self::WarningPrefix
+                | Self::LabelColonValue
+                | Self::BooleanWords
+                | Self::UnitsSpelledOut
+        )
+    }
+
     /// Short identifier used in error messages and the compliance
     /// report: `"R1"`, `"R2"`, etc.
     #[must_use]
@@ -120,6 +130,38 @@ impl fmt::Display for Violation {
         )
     }
 }
+
+/// Nonempty collection of violations from a line or output check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckError {
+    violations: Vec<Violation>,
+}
+
+impl CheckError {
+    /// All violations in scan order, with zero-based input line numbers.
+    #[must_use]
+    pub fn violations(&self) -> &[Violation] {
+        &self.violations
+    }
+
+    /// Transfer the complete violation list to a report renderer.
+    #[must_use]
+    pub fn into_violations(self) -> Vec<Violation> {
+        self.violations
+    }
+}
+
+impl fmt::Display for CheckError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} output rule violations",
+            self.violations.len()
+        )
+    }
+}
+
+impl std::error::Error for CheckError {}
 
 /// Shorthand unit tokens rejected by R12. Longer units (`MHz`,
 /// `kHz`, `GHz`) are listed before the short `Hz` so the per-unit
@@ -240,19 +282,15 @@ fn check_r12_units(line: &str, violations: &mut Vec<Violation>) {
     let bytes = line.as_bytes();
     for unit in BAD_UNITS {
         let mut search_start = 0;
-        while let Some(rel_offset) = line[search_start..].find(unit) {
+        while let Some(rel_offset) = line.get(search_start..).and_then(|text| text.find(unit)) {
             let offset = search_start + rel_offset;
             search_start = offset + unit.len();
 
-            #[expect(
-                clippy::indexing_slicing,
-                reason = "The `if offset == 0` guard above ensures `offset - 1` is \
-                          non-negative when this branch runs, and `offset` came from \
-                          `find(unit)` on `bytes`, so `offset < bytes.len()`; the index \
-                          is always in-bounds. Using `bytes.get(offset - 1)` and \
-                          unwrapping would add noise without catching a real bug."
-            )]
-            let prev = if offset == 0 { b' ' } else { bytes[offset - 1] };
+            let prev = offset
+                .checked_sub(1)
+                .and_then(|index| bytes.get(index))
+                .copied()
+                .unwrap_or(b' ');
             let next = bytes.get(offset + unit.len()).copied().unwrap_or(b' ');
 
             let prev_ok = !prev.is_ascii_alphanumeric();
@@ -291,7 +329,7 @@ fn check_r8_label_colon(line: &str, violations: &mut Vec<Violation>) {
         if !line.starts_with(prefix) || line.contains(": ") {
             continue;
         }
-        let rest = &line[prefix.len()..];
+        let rest = line.get(prefix.len()..).unwrap_or_default();
         // Check for direct past-tense verbs (`tuned`, `stepped`).
         let first = rest.split_whitespace().next().unwrap_or("");
         if DIRECT_VERBS.contains(&first) {
@@ -318,15 +356,21 @@ fn check_r8_label_colon(line: &str, violations: &mut Vec<Violation>) {
 ///
 /// # Errors
 ///
-/// Returns a `Vec` of all violations found on the line. A fully-
-/// conformant line returns `Ok(())`.
-pub fn check_line(line: &str) -> Result<(), Vec<Violation>> {
+/// Returns all applicable violations in a typed error, or success.
+///
+/// ```
+/// use thd75_repl::lint::{check_line, Rule};
+/// let error = check_line("Band A frequency: 146.52 MHz");
+/// assert!(matches!(error, Err(ref error) if error.violations().iter()
+///     .any(|violation| violation.rule == Rule::UnitsSpelledOut)));
+/// ```
+pub fn check_line(line: &str) -> Result<(), CheckError> {
     let mut violations = Vec::new();
 
     // R3 must run first and short-circuit: ESC would otherwise also
     // trip R1, and the duplicate pair would be confusing.
     if check_r3_no_ansi(line, &mut violations) {
-        return Err(violations);
+        return Err(CheckError { violations });
     }
 
     check_r1_ascii(line, &mut violations);
@@ -340,21 +384,20 @@ pub fn check_line(line: &str) -> Result<(), Vec<Violation>> {
     if violations.is_empty() {
         Ok(())
     } else {
-        Err(violations)
+        Err(CheckError { violations })
     }
 }
 
 /// Check multi-line output against all applicable rules.
 ///
 /// Splits on `\n` and runs [`check_line`] on each line. Also runs
-/// cross-line rules that need the full output (e.g. error-prefix
-/// classification requires looking at the line as a whole).
+/// eight line-level rules; command/source rules require separate tests.
 ///
 /// # Errors
 ///
-/// Returns a `Vec` of all violations found across all lines. A
-/// fully-conformant output returns `Ok(())`.
-pub fn check_output(output: &str) -> Result<(), Vec<Violation>> {
+/// Returns a typed error containing all violations across the input.
+/// See the [line-check example](check_line).
+pub fn check_output(output: &str) -> Result<(), CheckError> {
     let mut violations = Vec::new();
     // Strip a single trailing `\n` so we don't see the phantom empty
     // string that `split` produces for newline-terminated inputs.
@@ -362,7 +405,7 @@ pub fn check_output(output: &str) -> Result<(), Vec<Violation>> {
     // checked normally.
     let trimmed = output.strip_suffix('\n').unwrap_or(output);
     for (line_no, line) in trimmed.split('\n').enumerate() {
-        if let Err(mut v) = check_line(line) {
+        if let Err(CheckError { violations: mut v }) = check_line(line) {
             for violation in &mut v {
                 violation.line = line_no;
             }
@@ -372,7 +415,7 @@ pub fn check_output(output: &str) -> Result<(), Vec<Violation>> {
     if violations.is_empty() {
         Ok(())
     } else {
-        Err(violations)
+        Err(CheckError { violations })
     }
 }
 
@@ -386,32 +429,23 @@ mod tests {
     /// line unexpectedly passed.
     fn violations_of(line: &str) -> Result<Vec<Violation>, String> {
         match check_line(line) {
-            Err(violations) => Ok(violations),
+            Err(error) => Ok(error.into_violations()),
             Ok(()) => Err(format!("expected lint violations for {line:?}")),
         }
     }
 
     #[test]
-    fn stub_check_line_accepts_empty() {
+    fn check_line_accepts_empty() {
         assert!(check_line("").is_ok());
     }
 
     #[test]
-    fn stub_check_output_accepts_empty() {
+    fn check_output_accepts_empty() {
         assert!(check_output("").is_ok());
     }
 
     #[test]
     fn check_output_processes_intentional_blank_lines() {
-        // A blank line in the middle of the output should be visible
-        // to check_line (which currently accepts it because the stub
-        // always returns Ok, but once rule logic lands this test
-        // becomes meaningful; e.g. R1 must still run on the blank
-        // line to confirm it has no control characters).
-        //
-        // This test locks in the fix for the bug where
-        // `if line.is_empty() && line_no > 0 { continue; }` was
-        // silently skipping mid-output blank lines.
         let result = check_output("first line\n\nthird line\n");
         assert!(result.is_ok(), "check_output should process blank lines");
     }

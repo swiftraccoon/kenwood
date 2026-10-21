@@ -7,10 +7,8 @@
 //! test in this module iterates the list and runs the accessibility
 //! lint over every entry.
 //!
-//! This module also holds the three multi-line help blobs that list
-//! commands for each REPL mode: CAT, APRS, and D-STAR. Keeping them
-//! here lets the lint test exercise them uniformly with the
-//! per-command entries.
+//! Mode help covers CAT commands, APRS commands and the binary-only connection
+//! guard. Kenwood D-STAR startup is rejected before connection discovery.
 
 /// The names of every command that has a detailed help entry. Used by
 /// `help all` to iterate and by the lint test to assert coverage.
@@ -109,10 +107,6 @@ pub fn for_command(cmd: &str) -> Option<&'static str> {
 
 // ---------------------------------------------------------------------------
 // Mode help text (multi-line blobs listing all commands per mode).
-// These replace the old `commands::help()`, `commands::aprs_help()`,
-// and `commands::dstar_help()` functions that called `println!`
-// repeatedly. Returning them as constants lets the lint test in this
-// module check every line.
 // ---------------------------------------------------------------------------
 
 /// CAT mode help text listing all available commands.
@@ -137,7 +131,7 @@ fm: FM broadcast radio on or off
 vfo: Full variable frequency oscillator state (or: vfo b)
 -- Changing settings --
 mode a fm: Set mode. Options: fm, nfm, am, dv, lsb, usb, cw, dr, wfm
-squelch a 3: Set squelch level, 0 through 5
+squelch a 3: Set squelch level, 0 through 6
 power a high: Set power. Options: high, medium, low, extra-low
 att a on: Set attenuator on or off
 dualband on: Set dual band on or off
@@ -162,22 +156,21 @@ channels 0 100: List programmed channels 0 through 99
 urcall: Read destination callsign (D-STAR your-call field)
 urcall W1AW: Set destination callsign
 cq: Set destination to CQ CQ CQ (general call)
-reflector REF030 C: Connect to reflector, module C
-unreflector: Disconnect from reflector
+reflector REF030 C: Set a reflector-link request destination
+unreflector: Set the reflector-unlink request destination
 -- GPS --
 gps on on: Set GPS receiver on, PC output on
 gps off off: Set GPS receiver off, PC output off
 -- APRS packet radio mode --
 aprs start MYCALL b 7: Enter APRS on TNC Band B with callsign and SSID
--- D-STAR gateway mode --
-dstar start MYCALL XRF030C: Enter D-STAR gateway with reflector";
+-- D-STAR gateway availability --
+dstar start MYCALL: Rejected; no verified Kenwood modem configuration";
 
 /// Help shown when startup proved MMDVM framing but no gateway session is
 /// active yet. Framing alone does not identify the Menu 650 mode.
 pub const MMDVM_MODE_HELP: &str = "The selected radio link speaks DV Gateway/MMDVM.
 CAT commands are unavailable on this link.
-dstar start MYCALL: Start the D-STAR gateway without a reflector
-dstar start MYCALL REF030C: Start and connect to a reflector
+D-STAR startup is unavailable without a verified Kenwood configuration.
 help dstar: Show detailed D-STAR startup help
 quit: Exit without changing the radio setting
 To restore CAT, set Menu 650 (DV Gateway) to Off and restart.";
@@ -198,21 +191,6 @@ stations: List recently heard stations
 igate r/35.30/-82.46/100 2 60 30 30: Bridge RF and APRS-IS
 Requires explicit locality and time limits for Internet-to-RF gating.
 aprs stop: Leave APRS mode, return to normal radio control
-quit: Exit the program";
-
-/// D-STAR gateway mode help text.
-pub const DSTAR_MODE_HELP: &str = "You are in D-STAR digital voice gateway mode.
--- D-STAR gateway commands --
-monitor: Start listening for voice and reflector events (Ctrl-C to stop)
-link REF030C: Connect to a reflector and start monitoring
-  Supported prefixes: REF (DPlus), XRF/XLX (DExtra), DCS
-unlink: Disconnect from the reflector
-echo: Test your audio. Records your transmission, plays it back
-text Hello: Set a text message to embed in your next voice transmission
-text clear: Remove the outgoing text message
-heard: List recently heard stations
-status: Modem and reflector connection status
-dstar stop: Leave D-STAR mode, return to normal radio control
 quit: Exit the program";
 
 // ---------------------------------------------------------------------------
@@ -251,7 +229,7 @@ Example: mode b dv
 Related commands: freq, vfo";
 
 const SQUELCH_HELP: &str = "squelch: Read or set the squelch level on a band.
-Syntax: squelch [a or b] [0 through 5]
+Syntax: squelch [a or b] [0 through 6]
 Example: squelch
 Example: squelch a 3
 Related commands: meter";
@@ -409,12 +387,12 @@ Sets the urcall field to the general call destination.
 Example: cq
 Related commands: urcall";
 
-const REFLECTOR_HELP: &str = "reflector: Connect to a D-STAR reflector.
+const REFLECTOR_HELP: &str = "reflector: Set a D-STAR reflector-link request destination.
 Syntax: reflector [name] [module]
 Example: reflector REF030 C
 Related commands: unreflector, dstar";
 
-const UNREFLECTOR_HELP: &str = "unreflector: Disconnect from the linked reflector.
+const UNREFLECTOR_HELP: &str = "unreflector: Set the reflector-unlink request destination.
 Syntax: unreflector
 Example: unreflector
 Related commands: reflector";
@@ -426,11 +404,12 @@ Example: aprs start W1AW b 7
 The required a or b value selects the TNC data band, not packet speed.
 Related commands: beacon, msg, position";
 
-const DSTAR_HELP: &str = "dstar: Enter or leave D-STAR gateway mode.
-Syntax: dstar start [callsign] [reflector]
-Syntax: dstar stop
-Example: dstar start W1AW XRF030C
-Related commands: link, unlink, echo";
+const DSTAR_HELP: &str =
+    "dstar: Check startup arguments and report unsupported Kenwood configuration.
+Syntax: dstar start <callsign> [reflector]
+No verified Kenwood modem configuration is available.
+Startup rejects before discovery, Terminal activation or radio writes.
+Use --exit-terminal-mode to guide manual return to CAT on a binary link.";
 
 const LAST_HELP: &str = "last: Re-announce previous output lines.
 Syntax: last
@@ -443,12 +422,12 @@ Example: last all";
 const STATUS_HELP: &str = "status: Dump the full radio state in one block.
 Syntax: status
 Reads model, firmware, battery, clock, and both bands' settings.
-Takes 2 to 3 seconds because it issues many CAT commands.
+Issues sequential CAT queries; elapsed time depends on the connection.
 Example: status";
 
 const CHECK_HELP: &str = "check: Run the accessibility output self-check.
 Syntax: check
-Exercises every formatter, runs the lint, prints a report.
+Evaluates eight line rules on named samples; six other rules need tests.
 Also available without connecting a radio: thd75-repl check
 Example: check";
 
@@ -460,7 +439,7 @@ Example: verbose off";
 
 const CONFIRM_HELP: &str = "confirm: Toggle transmit-command confirmation.
 Syntax: confirm [on or off]
-When on, beacon, position, msg, cq, echo, and link prompt first.
+When on, transmitting APRS commands and CAT routing requests prompt first.
 Default is on. Disabling lasts for the current session.
 Example: confirm off
 Example: confirm on";
@@ -526,7 +505,6 @@ mod tests {
             ("CAT_MODE_HELP", CAT_MODE_HELP),
             ("MMDVM_MODE_HELP", MMDVM_MODE_HELP),
             ("APRS_MODE_HELP", APRS_MODE_HELP),
-            ("DSTAR_MODE_HELP", DSTAR_MODE_HELP),
         ] {
             let lint_result = lint::check_output(text);
             assert!(lint_result.is_ok(), "{name} lints clean: {lint_result:?}");
