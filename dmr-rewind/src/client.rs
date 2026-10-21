@@ -5,58 +5,83 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::fmt;
+use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, SystemTime};
 
 use dmr_rewind_core::{
-    FullLinkControl, MAX_DATAGRAM_LEN, MAX_PAYLOAD_LEN, Packet, PacketFlags, PacketType, Payload,
-    SERVICE_OPEN_TERMINAL, SessionType, Subscription as WireSubscription, VersionData,
-    authentication_digest, decode, encode,
+    DmrAudioSubtype, FullLinkControl, MAX_DATAGRAM_LEN, MAX_PAYLOAD_LEN, Packet, PacketFlags,
+    PacketType, Payload, SERVICE_OPEN_TERMINAL, Subscription as WireSubscription,
+    TransportSequence, VersionData, authentication_digest,
 };
 use tokio::net::UdpSocket;
 use tokio::time::{Instant, timeout_at};
+
+use crate::config::{ConfigError, DestinationId, SubscriberId, SubscriptionKind};
 
 /// Default maximum interval without a valid server datagram.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Default periodic Open DMR Terminal keepalive interval.
 pub const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+/// Default deadline for one socket setup operation or control datagram send.
+pub const DEFAULT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 /// Maximum operational events retained while authentication/subscription
 /// recovery temporarily prevents delivery to the caller.
 pub const MAX_PENDING_EVENTS: usize = 1_024;
 /// Maximum exact datagram bytes retained by the handshake/recovery backlog.
 pub const MAX_PENDING_BYTES: usize = 4 * 1024 * 1024;
 const MAX_DESCRIPTION_LEN: usize = MAX_PAYLOAD_LEN - 5;
-const MIN_DMR_ID: u32 = 1_000_000;
-const MAX_DMR_ID: u32 = 9_999_999;
-const MAX_DESTINATION_ID: u32 = 0x00ff_ffff;
 
 /// One group- or private-voice destination requested from a master.
+///
+/// See the [connection example](crate#example).
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Subscription {
     /// Kind of DMR voice session.
-    pub session_type: SessionType,
+    kind: SubscriptionKind,
     /// Talkgroup or private DMR ID.
-    pub destination_id: u32,
+    destination_id: DestinationId,
 }
 
 impl Subscription {
     /// Create a group-voice subscription.
     #[must_use]
-    pub const fn group(destination_id: u32) -> Self {
+    pub const fn group(destination_id: DestinationId) -> Self {
         Self {
-            session_type: SessionType::GroupVoice,
+            kind: SubscriptionKind::Group,
             destination_id,
         }
     }
 
     /// Create a private-voice subscription.
     #[must_use]
-    pub const fn private(destination_id: u32) -> Self {
+    pub const fn private(destination_id: DestinationId) -> Self {
         Self {
-            session_type: SessionType::PrivateVoice,
+            kind: SubscriptionKind::Private,
             destination_id,
         }
+    }
+
+    /// Construct one subscription from its validated kind and destination.
+    #[must_use]
+    pub const fn new(kind: SubscriptionKind, destination_id: DestinationId) -> Self {
+        Self {
+            kind,
+            destination_id,
+        }
+    }
+
+    /// Return the outbound voice-session kind.
+    #[must_use]
+    pub const fn kind(self) -> SubscriptionKind {
+        self.kind
+    }
+
+    /// Return the validated destination.
+    #[must_use]
+    pub const fn destination_id(self) -> DestinationId {
+        self.destination_id
     }
 }
 
@@ -65,16 +90,18 @@ impl Subscription {
 /// Hostname resolution deliberately belongs to the caller. Supplying an exact
 /// [`SocketAddr`] lets a supervisor choose IPv4 or IPv6 and makes reconnect
 /// behavior explicit.
+/// See the [connection example](crate#example).
 #[derive(Clone)]
 pub struct ClientConfig {
     server: SocketAddr,
     bind: SocketAddr,
-    dmr_id: u32,
+    dmr_id: SubscriberId,
     password: String,
     description: String,
     subscriptions: Vec<Subscription>,
     timeout: Duration,
     keepalive_interval: Duration,
+    send_timeout: Duration,
 }
 
 impl ClientConfig {
@@ -83,13 +110,21 @@ impl ClientConfig {
     ///
     /// `dmr_id` is the operator's seven-digit `RadioID` allocation and
     /// `password` is that ID's `BrandMeister` hotspot-security password.
-    #[must_use]
-    pub fn new(server: SocketAddr, dmr_id: u32, password: String) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::ZeroServerPort`] or [`ConfigError::EmptyPassword`]
+    /// before retaining a usable configuration.
+    pub fn new(
+        server: SocketAddr,
+        dmr_id: SubscriberId,
+        password: String,
+    ) -> Result<Self, ConfigError> {
         let bind_ip = match server.ip() {
             IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
         };
-        Self {
+        let config = Self {
             server,
             bind: SocketAddr::new(bind_ip, 0),
             dmr_id,
@@ -98,42 +133,88 @@ impl ClientConfig {
             subscriptions: Vec::new(),
             timeout: DEFAULT_TIMEOUT,
             keepalive_interval: DEFAULT_KEEPALIVE_INTERVAL,
-        }
+            send_timeout: DEFAULT_SEND_TIMEOUT,
+        };
+        config.validate()?;
+        Ok(config)
     }
 
     /// Set the local UDP address.
-    #[must_use]
-    pub const fn with_bind(mut self, bind: SocketAddr) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::AddressFamily`] when local and remote families differ.
+    pub fn with_bind(mut self, bind: SocketAddr) -> Result<Self, ConfigError> {
         self.bind = bind;
-        self
+        self.validate()?;
+        Ok(self)
     }
 
     /// Set the UTF-8 client description sent in keepalives.
-    #[must_use]
-    pub fn with_description(mut self, description: String) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::EmptyDescription`] or [`ConfigError::DescriptionTooLong`].
+    pub fn with_description(mut self, description: String) -> Result<Self, ConfigError> {
         self.description = description;
-        self
+        self.validate()?;
+        Ok(self)
     }
 
     /// Replace the group/private subscription list.
-    #[must_use]
-    pub fn with_subscriptions(mut self, subscriptions: Vec<Subscription>) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::DuplicateSubscription`] for duplicate kind/destination pairs.
+    pub fn with_subscriptions(
+        mut self,
+        subscriptions: Vec<Subscription>,
+    ) -> Result<Self, ConfigError> {
         self.subscriptions = subscriptions;
-        self
+        self.validate()?;
+        Ok(self)
     }
 
     /// Set the maximum interval without a valid server datagram.
-    #[must_use]
-    pub const fn with_timeout(mut self, timeout: Duration) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::TimerRelationship`] when the timeout does not exceed
+    /// the keepalive, or [`ConfigError::ClockRange`] if it cannot form a deadline.
+    pub fn with_timeout(mut self, timeout: Duration) -> Result<Self, ConfigError> {
         self.timeout = timeout;
-        self
+        self.validate()?;
+        Ok(self)
     }
 
     /// Set the periodic keepalive interval.
-    #[must_use]
-    pub const fn with_keepalive_interval(mut self, interval: Duration) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::TimerRelationship`] for zero or an interval not below
+    /// the timeout, or [`ConfigError::ClockRange`] for an unrepresentable deadline.
+    pub fn with_keepalive_interval(mut self, interval: Duration) -> Result<Self, ConfigError> {
         self.keepalive_interval = interval;
-        self
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Set a positive deadline for each socket setup operation and control send.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::ZeroSendTimeout`] for zero, or [`ConfigError::ClockRange`]
+    /// when the runtime cannot represent its deadline.
+    pub fn with_send_timeout(mut self, timeout: Duration) -> Result<Self, ConfigError> {
+        self.send_timeout = timeout;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Return the socket setup and control-send deadline interval.
+    #[must_use]
+    pub const fn send_timeout(&self) -> Duration {
+        self.send_timeout
     }
 
     /// Return the configured master endpoint.
@@ -150,7 +231,7 @@ impl ClientConfig {
 
     /// Return the seven-digit DMR ID.
     #[must_use]
-    pub const fn dmr_id(&self) -> u32 {
+    pub const fn dmr_id(&self) -> SubscriberId {
         self.dmr_id
     }
 
@@ -178,82 +259,48 @@ impl ClientConfig {
         self.keepalive_interval
     }
 
-    fn validate(&self) -> Result<(), Error> {
+    fn validate(&self) -> Result<(), ConfigError> {
         if self.server.port() == 0 {
-            return Err(Error::InvalidConfig(
-                "server port must be greater than zero".to_owned(),
-            ));
+            return Err(ConfigError::ZeroServerPort);
         }
-        if !(MIN_DMR_ID..=MAX_DMR_ID).contains(&self.dmr_id) {
-            return Err(Error::InvalidConfig(
-                "dmr_id must be a seven-digit RadioID allocation".to_owned(),
-            ));
+        if self.bind.is_ipv4() != self.server.is_ipv4() {
+            return Err(ConfigError::AddressFamily);
         }
         if self.password.is_empty() {
-            return Err(Error::InvalidConfig(
-                "hotspot-security password must not be empty".to_owned(),
-            ));
+            return Err(ConfigError::EmptyPassword);
         }
         if self.description.is_empty() {
-            return Err(Error::InvalidConfig(
-                "client description must not be empty".to_owned(),
-            ));
+            return Err(ConfigError::EmptyDescription);
         }
         if self.description.len() > MAX_DESCRIPTION_LEN {
-            return Err(Error::InvalidConfig(format!(
-                "client description is {} bytes; maximum is {MAX_DESCRIPTION_LEN}",
-                self.description.len()
-            )));
+            return Err(ConfigError::DescriptionTooLong {
+                actual: self.description.len(),
+                maximum: MAX_DESCRIPTION_LEN,
+            });
         }
-        if self.timeout.is_zero() {
-            return Err(Error::InvalidConfig(
-                "timeout must be greater than zero".to_owned(),
-            ));
+        if self.keepalive_interval.is_zero() || self.timeout <= self.keepalive_interval {
+            return Err(ConfigError::TimerRelationship {
+                timeout: self.timeout,
+                keepalive: self.keepalive_interval,
+            });
         }
-        if self.keepalive_interval.is_zero() {
-            return Err(Error::InvalidConfig(
-                "keepalive interval must be greater than zero".to_owned(),
-            ));
-        }
-        if self.timeout <= self.keepalive_interval {
-            return Err(Error::InvalidConfig(
-                "timeout must be greater than the keepalive interval".to_owned(),
-            ));
+        if self.send_timeout.is_zero() {
+            return Err(ConfigError::ZeroSendTimeout);
         }
         let validation_instant = Instant::now();
-        if validation_instant.checked_add(self.timeout).is_none() {
-            return Err(Error::InvalidConfig(
-                "timeout is too large for the runtime clock".to_owned(),
-            ));
-        }
-        if validation_instant
-            .checked_add(self.keepalive_interval)
-            .is_none()
-        {
-            return Err(Error::InvalidConfig(
-                "keepalive interval is too large for the runtime clock".to_owned(),
-            ));
+        for duration in [self.timeout, self.keepalive_interval, self.send_timeout] {
+            if validation_instant.checked_add(duration).is_none() {
+                return Err(ConfigError::ClockRange { duration });
+            }
         }
 
         let mut unique = HashSet::with_capacity(self.subscriptions.len());
         for subscription in &self.subscriptions {
-            if subscription.destination_id == 0 || subscription.destination_id > MAX_DESTINATION_ID
-            {
-                return Err(Error::InvalidConfig(format!(
-                    "subscription destination {} is outside the 24-bit DMR ID range",
-                    subscription.destination_id
-                )));
-            }
-            if matches!(subscription.session_type, SessionType::Unknown(_)) {
-                return Err(Error::InvalidConfig(
-                    "subscription session type must be group or private voice".to_owned(),
-                ));
-            }
             if !unique.insert(*subscription) {
-                return Err(Error::InvalidConfig(format!(
-                    "duplicate {:?} subscription for {}",
-                    subscription.session_type, subscription.destination_id
-                )));
+                return Err(ConfigError::DuplicateSubscription {
+                    kind: subscription.kind,
+                    destination: subscription.destination_id,
+                });
             }
         }
         Ok(())
@@ -272,102 +319,275 @@ impl fmt::Debug for ClientConfig {
             .field("subscriptions", &self.subscriptions)
             .field("timeout", &self.timeout)
             .field("keepalive_interval", &self.keepalive_interval)
+            .field("send_timeout", &self.send_timeout)
             .finish()
     }
 }
 
 /// Transport metadata shared by every received event.
+///
+/// See the [event example](crate#example) and
+/// [fidelity contract](crate#event-fidelity).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EventMetadata {
     /// REWIND transport sequence.
-    pub sequence: u32,
+    sequence: TransportSequence,
     /// REWIND envelope flags, including unknown future bits.
-    pub flags: PacketFlags,
+    flags: PacketFlags,
     /// Payload length declared by the REWIND envelope.
-    pub payload_len: u16,
+    payload_len: u16,
     /// Exact UDP datagram received from the connected master.
-    pub raw_datagram: Vec<u8>,
+    raw_datagram: Vec<u8>,
     /// Local wall-clock receipt time.
-    pub received_at: SystemTime,
+    received_at: SystemTime,
 }
 
 /// Exact DMR voice-header event.
+///
+/// See the [event example](crate#example) and
+/// [fidelity contract](crate#event-fidelity).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VoiceHeaderEvent {
     /// Transport and receipt metadata.
-    pub metadata: EventMetadata,
-    /// REWIND DMR-data subtype (`1` for a voice header).
-    pub subtype: u8,
-    /// Exact 12-byte DMR voice header with Full Link Control.
-    pub data: [u8; 12],
-    /// Parsed fields from `data`.
-    pub link_control: FullLinkControl,
+    metadata: EventMetadata,
+    /// The authoritative full-link-control fields; raw data is derived from them.
+    link_control: FullLinkControl,
 }
 
 /// Exact DMR terminator event.
+///
+/// See the [event example](crate#example) and
+/// [fidelity contract](crate#event-fidelity).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TerminatorEvent {
     /// Transport and receipt metadata.
-    pub metadata: EventMetadata,
-    /// REWIND DMR-data subtype (`2` for a terminator).
-    pub subtype: u8,
-    /// Exact 12-byte DMR terminator with Full Link Control, when supplied.
-    ///
-    /// Some Open Terminal implementations send an empty terminator.
-    pub data: Option<[u8; 12]>,
-    /// Parsed fields from `data`, when supplied.
-    pub link_control: Option<FullLinkControl>,
+    metadata: EventMetadata,
+    /// The authoritative full-link-control fields, or an observed empty body.
+    link_control: Option<FullLinkControl>,
 }
 
 /// Exact packed AMBE+2 audio event.
+///
+/// See the [event example](crate#example) and
+/// [fidelity contract](crate#event-fidelity).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AudioEvent {
     /// Transport and receipt metadata.
-    pub metadata: EventMetadata,
+    metadata: EventMetadata,
     /// REWIND audio subtype in `0..=6`.
-    pub subtype: u8,
+    subtype: DmrAudioSubtype,
     /// Three exact nine-byte AMBE+2 mode-33 codewords.
-    pub data: [u8; 27],
+    data: [u8; 27],
 }
 
-/// Exact embedded-link-control event.
+/// Uninterpreted DMR embedded-data event.
+///
+/// See the [event example](crate#example) and
+/// [fidelity contract](crate#event-fidelity).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EmbeddedDataEvent {
     /// Transport and receipt metadata.
-    pub metadata: EventMetadata,
-    /// REWIND audio/data subtype (`7` for embedded data).
-    pub subtype: u8,
-    /// Exact 10-byte embedded-link-control payload.
-    pub data: [u8; 10],
+    metadata: EventMetadata,
+    /// Exact body bytes, bounded by the outer REWIND datagram limit.
+    data: Vec<u8>,
 }
 
 /// Parsed 32-byte call-metadata superheader event.
+///
+/// See the [event example](crate#example) and
+/// [fidelity contract](crate#event-fidelity).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SuperHeaderEvent {
     /// Transport and receipt metadata.
-    pub metadata: EventMetadata,
+    metadata: EventMetadata,
     /// Parsed source, destination, session type, and callsigns.
-    pub data: dmr_rewind_core::SuperHeader,
+    data: dmr_rewind_core::SuperHeader,
 }
 
 /// Opaque server report, failure, or busy-notice event.
+///
+/// See the [event example](crate#example) and
+/// [fidelity contract](crate#event-fidelity).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NoticeEvent {
     /// Transport and receipt metadata.
-    pub metadata: EventMetadata,
+    metadata: EventMetadata,
     /// Exact notice payload bytes.
-    pub data: Vec<u8>,
+    data: Vec<u8>,
 }
 
 /// Any decoded packet without a dedicated [`Event`] variant.
+///
+/// See the [event example](crate#example) and
+/// [fidelity contract](crate#event-fidelity).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OtherEvent {
     /// Transport and receipt metadata.
-    pub metadata: EventMetadata,
+    metadata: EventMetadata,
     /// Known or future REWIND packet type.
-    pub packet_type: PacketType,
+    packet_type: PacketType,
     /// Typed or opaque decoded payload.
-    pub payload: Payload,
+    payload: Payload,
+}
+
+impl EventMetadata {
+    /// Return the exact transport sequence word.
+    #[must_use]
+    pub const fn sequence(&self) -> TransportSequence {
+        self.sequence
+    }
+
+    /// Return every envelope flag bit.
+    #[must_use]
+    pub const fn flags(&self) -> PacketFlags {
+        self.flags
+    }
+
+    /// Return the validated envelope's declared payload byte count.
+    #[must_use]
+    pub const fn payload_len(&self) -> u16 {
+        self.payload_len
+    }
+
+    /// Borrow the exact datagram, including its envelope.
+    #[must_use]
+    pub fn raw_datagram(&self) -> &[u8] {
+        &self.raw_datagram
+    }
+
+    /// Return the local wall-clock receipt timestamp.
+    #[must_use]
+    pub const fn received_at(&self) -> SystemTime {
+        self.received_at
+    }
+
+    /// Transfer the exact datagram without cloning its allocation.
+    #[must_use]
+    pub fn into_raw_datagram(self) -> Vec<u8> {
+        self.raw_datagram
+    }
+}
+
+// Every concrete event retains the same immutable envelope view.
+macro_rules! metadata_accessors {
+    ($($event:ty),+ $(,)?) => { $(
+        impl $event {
+            /// Borrow the immutable transport and receipt metadata.
+            #[must_use]
+            pub const fn metadata(&self) -> &EventMetadata { &self.metadata }
+        }
+    )+ };
+}
+
+metadata_accessors!(
+    VoiceHeaderEvent,
+    TerminatorEvent,
+    AudioEvent,
+    EmbeddedDataEvent,
+    SuperHeaderEvent,
+    NoticeEvent,
+    OtherEvent
+);
+
+impl VoiceHeaderEvent {
+    /// Return the authoritative full-link-control fields.
+    #[must_use]
+    pub const fn link_control(&self) -> FullLinkControl {
+        self.link_control
+    }
+
+    /// Return the exact twelve wire bytes derived from full link control.
+    #[must_use]
+    pub const fn data(&self) -> [u8; 12] {
+        self.link_control.to_bytes()
+    }
+}
+
+impl TerminatorEvent {
+    /// Return full link control, or `None` for an observed empty terminator.
+    #[must_use]
+    pub const fn link_control(&self) -> Option<FullLinkControl> {
+        self.link_control
+    }
+
+    /// Return the exact observed twelve-byte body, or `None` for an empty body.
+    #[must_use]
+    pub const fn data(&self) -> Option<[u8; 12]> {
+        match self.link_control {
+            Some(control) => Some(control.to_bytes()),
+            None => None,
+        }
+    }
+}
+
+impl AudioEvent {
+    /// Return the validated audio subtype in zero through six.
+    #[must_use]
+    pub const fn subtype(&self) -> DmrAudioSubtype {
+        self.subtype
+    }
+
+    /// Return the three exact nine-byte AMBE+2 codewords.
+    #[must_use]
+    pub const fn data(&self) -> [u8; 27] {
+        self.data
+    }
+}
+
+impl EmbeddedDataEvent {
+    /// Borrow the uninterpreted body under the outer datagram limit.
+    #[must_use]
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// Transfer the uninterpreted body without cloning its allocation.
+    #[must_use]
+    pub fn into_data(self) -> Vec<u8> {
+        self.data
+    }
+}
+
+impl SuperHeaderEvent {
+    /// Return the parsed call metadata with all four-byte identity bits intact.
+    #[must_use]
+    pub const fn data(&self) -> dmr_rewind_core::SuperHeader {
+        self.data
+    }
+}
+
+impl NoticeEvent {
+    /// Borrow the exact server notice bytes.
+    #[must_use]
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// Transfer the notice bytes without cloning their allocation.
+    #[must_use]
+    pub fn into_data(self) -> Vec<u8> {
+        self.data
+    }
+}
+
+impl OtherEvent {
+    /// Return the known or unmodeled packet code.
+    #[must_use]
+    pub const fn packet_type(&self) -> PacketType {
+        self.packet_type
+    }
+
+    /// Borrow the parsed payload.
+    #[must_use]
+    pub const fn payload(&self) -> &Payload {
+        &self.payload
+    }
+
+    /// Transfer the parsed payload without cloning its storage.
+    #[must_use]
+    pub fn into_payload(self) -> Payload {
+        self.payload
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -377,17 +597,31 @@ struct PacketEnvelope {
     received_at: SystemTime,
 }
 
-/// One operational packet received from an authenticated terminal session.
+/// One datagram with immutable, mutually consistent wire and parsed views.
+///
+/// Live clients construct events from received datagrams. [`Self::from_datagram`]
+/// supports offline captures and does not authenticate their sender. See the
+/// [event example](crate#example) and
+/// [fidelity contract](crate#event-fidelity).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Event {
+    kind: EventKind,
+}
+
+/// The owned packet-specific view of a validated [`Event`].
+///
+/// Inspect through [`Event::kind`] or consume through [`Event::into_kind`].
+/// This enum is an inspection value, not an event-construction boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
-pub enum Event {
+pub enum EventKind {
     /// Twelve-byte DMR full-link-control voice header.
     VoiceHeader(VoiceHeaderEvent),
     /// Twelve-byte DMR full-link-control terminator.
     Terminator(TerminatorEvent),
     /// Twenty-seven-byte, three-codeword AMBE+2 burst.
     Audio(AudioEvent),
-    /// Ten-byte embedded link-control payload.
+    /// Uninterpreted DMR embedded-data payload.
     EmbeddedData(EmbeddedDataEvent),
     /// Optional source/destination metadata supplied by the master.
     SuperHeader(SuperHeaderEvent),
@@ -404,28 +638,59 @@ pub enum Event {
 }
 
 impl Event {
+    /// Parse exact datagram bytes and retain them with a caller-supplied receipt time.
+    ///
+    /// # Errors
+    ///
+    /// Returns the malformed-envelope/body errors from [`Packet::from_bytes`].
+    pub fn from_datagram(
+        raw_datagram: Vec<u8>,
+        received_at: SystemTime,
+    ) -> Result<Self, dmr_rewind_core::CodecError> {
+        let packet = Packet::from_bytes(&raw_datagram)?;
+        Ok(Self::from_envelope(PacketEnvelope {
+            packet,
+            raw_datagram,
+            received_at,
+        }))
+    }
+
+    /// Borrow the packet-specific view without exposing mutable state.
+    #[must_use]
+    pub const fn kind(&self) -> &EventKind {
+        &self.kind
+    }
+
+    /// Transfer the packet-specific view and its existing payload storage.
+    #[must_use]
+    pub fn into_kind(self) -> EventKind {
+        self.kind
+    }
+
     /// Borrow transport and receipt metadata.
     #[must_use]
     pub const fn metadata(&self) -> &EventMetadata {
-        match self {
-            Self::VoiceHeader(event) => &event.metadata,
-            Self::Terminator(event) => &event.metadata,
-            Self::Audio(event) => &event.metadata,
-            Self::EmbeddedData(event) => &event.metadata,
-            Self::SuperHeader(event) => &event.metadata,
-            Self::Report(event) | Self::Failure(event) | Self::BusyNotice(event) => &event.metadata,
-            Self::Close(metadata) => metadata,
-            Self::Other(event) => &event.metadata,
+        match &self.kind {
+            EventKind::VoiceHeader(event) => &event.metadata,
+            EventKind::Terminator(event) => &event.metadata,
+            EventKind::Audio(event) => &event.metadata,
+            EventKind::EmbeddedData(event) => &event.metadata,
+            EventKind::SuperHeader(event) => &event.metadata,
+            EventKind::Report(event) | EventKind::Failure(event) | EventKind::BusyNotice(event) => {
+                &event.metadata
+            }
+            EventKind::Close(metadata) => metadata,
+            EventKind::Other(event) => &event.metadata,
         }
     }
 
-    fn from_envelope(envelope: PacketEnvelope) -> Result<Self, Error> {
+    fn from_envelope(envelope: PacketEnvelope) -> Self {
         let PacketEnvelope {
             packet,
             raw_datagram,
             received_at,
         } = envelope;
-        let Packet { header, payload } = packet;
+        let (header, payload) = packet.into_parts();
         let metadata = EventMetadata {
             sequence: header.sequence,
             flags: header.flags,
@@ -433,66 +698,61 @@ impl Event {
             raw_datagram,
             received_at,
         };
-        let event = match (header.packet_type, payload) {
+        let kind = match (header.packet_type, payload) {
             (PacketType::DmrVoiceHeader, Payload::DmrVoiceHeader(link_control)) => {
-                Self::VoiceHeader(VoiceHeaderEvent {
+                EventKind::VoiceHeader(VoiceHeaderEvent {
                     metadata,
-                    subtype: 1,
-                    data: link_control.to_bytes()?,
                     link_control,
                 })
             }
             (PacketType::DmrTerminator, Payload::DmrTerminator(link_control)) => {
-                let data = link_control.map(FullLinkControl::to_bytes).transpose()?;
-                Self::Terminator(TerminatorEvent {
+                EventKind::Terminator(TerminatorEvent {
                     metadata,
-                    subtype: 2,
-                    data,
                     link_control,
                 })
             }
-            (PacketType::DmrAudio(subtype), Payload::DmrAudio(data)) => Self::Audio(AudioEvent {
-                metadata,
-                subtype,
-                data,
-            }),
-            (PacketType::DmrEmbeddedData, Payload::DmrEmbeddedData(data)) => {
-                Self::EmbeddedData(EmbeddedDataEvent {
+            (PacketType::DmrAudio(subtype), Payload::DmrAudio(data)) => {
+                EventKind::Audio(AudioEvent {
                     metadata,
-                    subtype: 7,
+                    subtype,
                     data,
                 })
             }
+            (PacketType::DmrEmbeddedData, Payload::DmrEmbeddedData(data)) => {
+                EventKind::EmbeddedData(EmbeddedDataEvent { metadata, data })
+            }
             (PacketType::SuperHeader, Payload::SuperHeader(data)) => {
-                Self::SuperHeader(SuperHeaderEvent { metadata, data })
+                EventKind::SuperHeader(SuperHeaderEvent { metadata, data })
             }
             (PacketType::Report, Payload::Report(data)) => {
-                Self::Report(NoticeEvent { metadata, data })
+                EventKind::Report(NoticeEvent { metadata, data })
             }
             (PacketType::Failure, Payload::Failure(data)) => {
-                Self::Failure(NoticeEvent { metadata, data })
+                EventKind::Failure(NoticeEvent { metadata, data })
             }
             (PacketType::BusyNotice, Payload::Busy(data)) => {
-                Self::BusyNotice(NoticeEvent { metadata, data })
+                EventKind::BusyNotice(NoticeEvent { metadata, data })
             }
-            (PacketType::Close, Payload::Close) => Self::Close(metadata),
-            (packet_type, payload) => Self::Other(OtherEvent {
+            (PacketType::Close, Payload::Close) => EventKind::Close(metadata),
+            (packet_type, payload) => EventKind::Other(OtherEvent {
                 metadata,
                 packet_type,
                 payload,
             }),
         };
-        Ok(event)
+        Self { kind }
     }
 }
 
 /// Open DMR Terminal socket, protocol, or configuration failure.
+///
+/// See the [fallible connection example](crate#example).
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
     /// A setting cannot produce a valid terminal session.
     #[error("invalid Open DMR Terminal configuration: {0}")]
-    InvalidConfig(String),
+    InvalidConfig(#[from] ConfigError),
     /// The local UDP socket could not be created.
     #[error("bind UDP socket {address}: {source}")]
     Bind {
@@ -515,7 +775,7 @@ pub enum Error {
     #[error("{operation}: {source}")]
     Send {
         /// Protocol operation being attempted.
-        operation: &'static str,
+        operation: ControlOperation,
         /// Operating-system error.
         #[source]
         source: io::Error,
@@ -523,7 +783,7 @@ pub enum Error {
     /// A UDP datagram could not be received.
     #[error("receive from Open DMR Terminal master: {0}")]
     Receive(#[source] io::Error),
-    /// A datagram was malformed or an outbound packet could not be encoded.
+    /// A datagram was malformed or an outbound packet could not be constructed.
     #[error("REWIND codec: {0}")]
     Codec(#[from] dmr_rewind_core::CodecError),
     /// A handshake phase received no valid response before its deadline.
@@ -560,10 +820,10 @@ pub enum Error {
         /// Configured valid-packet timeout.
         timeout: Duration,
     },
-    /// A bounded wait duration cannot be represented by the runtime clock.
-    #[error("event wait duration {duration:?} is too large")]
+    /// A requested deadline interval cannot be represented by the runtime clock.
+    #[error("deadline interval {duration:?} is too large")]
     InvalidWaitDuration {
-        /// Requested maximum wait.
+        /// Requested interval from the current runtime instant.
         duration: Duration,
     },
     /// Operational traffic exceeded the bounded handshake/recovery backlog.
@@ -583,6 +843,47 @@ pub enum Error {
     /// The local client was already closed.
     #[error("Open DMR Terminal client is closed")]
     ClientClosed,
+    /// A socket setup operation or control send exceeded its configured deadline.
+    #[error("{operation} exceeded its {timeout:?} deadline")]
+    ControlTimeout {
+        /// Operation whose deadline expired.
+        operation: ControlOperation,
+        /// Configured budget for that operation.
+        timeout: Duration,
+    },
+    /// A caller dropped a future while a control datagram send was pending.
+    #[error("a control send was interrupted; drop this client and reconnect")]
+    ControlSendInterrupted,
+}
+
+/// One bounded socket setup or outbound control operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ControlOperation {
+    /// Create the local UDP endpoint.
+    Bind,
+    /// Connect it to the selected remote endpoint.
+    Connect,
+    /// Send the terminal description or keepalive.
+    Keepalive,
+    /// Send the challenge response.
+    Authentication,
+    /// Install one group/private subscription.
+    Subscription,
+    /// Send a graceful Close datagram.
+    Close,
+}
+
+impl fmt::Display for ControlOperation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Bind => "bind UDP socket",
+            Self::Connect => "connect UDP socket",
+            Self::Keepalive => "send keepalive",
+            Self::Authentication => "send authentication",
+            Self::Subscription => "send subscription",
+            Self::Close => "send close",
+        })
+    }
 }
 
 #[derive(Debug, Default)]
@@ -634,7 +935,7 @@ impl PendingEvents {
 }
 
 impl SequenceCounters {
-    const fn next(&mut self, flags: PacketFlags) -> u32 {
+    const fn next(&mut self, flags: PacketFlags) -> TransportSequence {
         let counter = if flags.contains(PacketFlags::REAL_TIME_1) {
             &mut self.real_time_one
         } else {
@@ -642,7 +943,7 @@ impl SequenceCounters {
         };
         let sequence = *counter;
         *counter = counter.wrapping_add(1);
-        sequence
+        TransportSequence::new(sequence)
     }
 }
 
@@ -662,15 +963,18 @@ enum RuntimeState {
 ///
 /// The client intentionally has no DMR transmit method. Reconnection and DNS
 /// policies belong to its caller.
+/// See the [connection example](crate#example) and
+/// [event contract](crate#event-fidelity).
 pub struct Client {
     socket: UdpSocket,
     server: SocketAddr,
-    dmr_id: u32,
+    dmr_id: SubscriberId,
     password: String,
     description: Vec<u8>,
     subscriptions: Vec<Subscription>,
     timeout: Duration,
     keepalive_interval: Duration,
+    send_timeout: Duration,
     sequences: SequenceCounters,
     pending: PendingEvents,
     last_valid_packet: Instant,
@@ -678,6 +982,7 @@ pub struct Client {
     receive_buffer: Vec<u8>,
     runtime_state: RuntimeState,
     closed: bool,
+    control_pending: bool,
 }
 
 impl fmt::Debug for Client {
@@ -705,24 +1010,45 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Returns [`Error`] for invalid settings, socket failures, malformed
+    /// Returns [`Error`] for socket failures, malformed
     /// packets, a rejected login, a phase timeout, or a bounded pending-event
     /// backlog overflow.
+    ///
+    /// Each handshake receive phase uses the configured packet timeout. Each
+    /// socket bind, connect and control send has its own configured send budget;
+    /// these are per-operation deadlines, not one total handshake deadline.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping this future closes its local socket without sending Close.
+    /// Already sent handshake datagrams remain visible to the master.
     pub async fn connect(config: ClientConfig) -> Result<Self, Error> {
-        config.validate()?;
-        let socket = UdpSocket::bind(config.bind)
-            .await
-            .map_err(|source| Error::Bind {
+        let socket = bounded_control(
+            UdpSocket::bind(config.bind),
+            config.send_timeout,
+            ControlOperation::Bind,
+        )
+        .await
+        .map_err(|error| match error {
+            ControlFailure::Io(source) => Error::Bind {
                 address: config.bind,
                 source,
-            })?;
-        socket
-            .connect(config.server)
-            .await
-            .map_err(|source| Error::Connect {
+            },
+            ControlFailure::Deadline(error) => error,
+        })?;
+        bounded_control(
+            socket.connect(config.server),
+            config.send_timeout,
+            ControlOperation::Connect,
+        )
+        .await
+        .map_err(|error| match error {
+            ControlFailure::Io(source) => Error::Connect {
                 address: config.server,
                 source,
-            })?;
+            },
+            ControlFailure::Deadline(error) => error,
+        })?;
 
         let now = Instant::now();
         let mut client = Self {
@@ -734,20 +1060,22 @@ impl Client {
             subscriptions: config.subscriptions,
             timeout: config.timeout,
             keepalive_interval: config.keepalive_interval,
+            send_timeout: config.send_timeout,
             sequences: SequenceCounters::default(),
             pending: PendingEvents::default(),
             last_valid_packet: now,
-            next_keepalive: now + config.keepalive_interval,
-            receive_buffer: vec![0_u8; MAX_DATAGRAM_LEN],
+            next_keepalive: deadline_after(now, config.keepalive_interval)?,
+            receive_buffer: vec![0_u8; MAX_DATAGRAM_LEN + 1],
             runtime_state: RuntimeState::Operational,
             closed: false,
+            control_pending: false,
         };
 
         client.send_keepalive().await?;
         let challenge = client.await_challenge().await?;
         client.finish_authentication(challenge).await?;
         client.subscribe_all().await?;
-        client.next_keepalive = Instant::now() + client.keepalive_interval;
+        client.next_keepalive = deadline_after(Instant::now(), client.keepalive_interval)?;
         Ok(client)
     }
 
@@ -766,10 +1094,10 @@ impl Client {
         self.socket.local_addr()
     }
 
-    /// Return whether this client has sent or received a graceful close.
+    /// Return whether close, a failed send or an interrupted send ended this session.
     #[must_use]
     pub const fn is_closed(&self) -> bool {
-        self.closed
+        self.closed || self.control_pending
     }
 
     /// Wait for the next operational packet.
@@ -783,6 +1111,15 @@ impl Client {
     /// Returns [`Error`] for transport/codec failures, reauthentication
     /// failure, pending-event backlog overflow, session timeout, or use after
     /// close.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping while receiving preserves queued events and recovery state; a
+    /// datagram already received can have been consumed. Dropping during a
+    /// control send leaves it unconfirmed: the next operation returns
+    /// [`Error::ControlSendInterrupted`], after which the caller drops this client
+    /// and reconnects. Use [`Self::next_event_for`] to bound receive waiting
+    /// without cancelling an in-progress control send.
     pub async fn next_event(&mut self) -> Result<Event, Error> {
         loop {
             if let Some(event) = self.next_event_until(None).await? {
@@ -791,18 +1128,27 @@ impl Client {
         }
     }
 
-    /// Wait at most `max_wait` for an operational packet.
+    /// Wait for an operational packet with a receive deadline of `max_wait`.
     ///
     /// Unlike placing an external timeout around [`Self::next_event`], this
     /// method owns its deadline and persists authentication/subscription
     /// recovery state across calls. It continues to send due keepalives and
     /// enforce the configured session timeout while waiting.
+    /// Datagrams already queued for delivery are returned immediately. Control
+    /// sends use their configured deadline and can extend the call beyond
+    /// `max_wait` by at most one send budget. Already started sends are completed
+    /// before the receive deadline is reported; they are not cancelled by it.
     ///
     /// # Errors
     ///
     /// Returns the same failures as [`Self::next_event`], plus
     /// [`Error::InvalidWaitDuration`] when `max_wait` overflows the runtime
     /// clock.
+    ///
+    /// # Cancellation
+    ///
+    /// Returns `Ok(None)` at its receive deadline while retaining recovery state.
+    /// Dropping its future has the same effects as [`Self::next_event`].
     pub async fn next_event_for(&mut self, max_wait: Duration) -> Result<Option<Event>, Error> {
         let caller_deadline = Instant::now()
             .checked_add(max_wait)
@@ -814,17 +1160,18 @@ impl Client {
         &mut self,
         caller_deadline: Option<Instant>,
     ) -> Result<Option<Event>, Error> {
+        ensure_usable(self.control_pending, &mut self.closed)?;
         if matches!(self.runtime_state, RuntimeState::Operational)
             && let Some(event) = self.pending.pop()
         {
             return Ok(Some(event));
         }
-        if self.closed {
-            return Err(Error::ClientClosed);
-        }
 
         loop {
-            let timeout_deadline = self.last_valid_packet + self.timeout;
+            if caller_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Ok(None);
+            }
+            let timeout_deadline = deadline_after(self.last_valid_packet, self.timeout)?;
             let state_deadline = match self.runtime_state {
                 RuntimeState::Operational => self.next_keepalive,
                 RuntimeState::Authentication { deadline }
@@ -855,7 +1202,7 @@ impl Client {
             }
             if matches!(self.runtime_state, RuntimeState::Operational) {
                 self.send_keepalive().await?;
-                self.next_keepalive = now + self.keepalive_interval;
+                self.next_keepalive = deadline_after(now, self.keepalive_interval)?;
             }
         }
     }
@@ -882,7 +1229,7 @@ impl Client {
         &mut self,
         envelope: PacketEnvelope,
     ) -> Result<Option<Event>, Error> {
-        match envelope.packet.payload.clone() {
+        match envelope.packet.payload() {
             Payload::KeepAlive(_) => Ok(None),
             Payload::Challenge(challenge) => {
                 self.begin_runtime_authentication(challenge, None).await?;
@@ -890,9 +1237,9 @@ impl Client {
             }
             Payload::Close => {
                 self.closed = true;
-                Event::from_envelope(envelope).map(Some)
+                Ok(Some(Event::from_envelope(envelope)))
             }
-            _ => Event::from_envelope(envelope).map(Some),
+            _ => Ok(Some(Event::from_envelope(envelope))),
         }
     }
 
@@ -902,7 +1249,7 @@ impl Client {
         deadline: Instant,
     ) -> Result<Option<Event>, Error> {
         let phase = "authentication acknowledgement";
-        match envelope.packet.payload.clone() {
+        match envelope.packet.payload() {
             Payload::KeepAlive(_) => {
                 self.begin_runtime_subscriptions().await?;
                 Ok(self.pending_event_if_recovered())
@@ -914,16 +1261,16 @@ impl Client {
             }
             Payload::Close => {
                 self.closed = true;
-                Event::from_envelope(envelope).map(Some)
+                Ok(Some(Event::from_envelope(envelope)))
             }
-            Payload::Failure(message) => Err(handshake_rejection(&message)),
+            Payload::Failure(message) => Err(handshake_rejection(message)),
             _ if is_operational(&envelope.packet) => {
                 self.queue_pending(envelope)?;
                 Ok(None)
             }
             _ => Err(Error::UnexpectedHandshakePacket {
                 phase,
-                packet_type: envelope.packet.header.packet_type,
+                packet_type: envelope.packet.header().packet_type,
             }),
         }
     }
@@ -934,14 +1281,14 @@ impl Client {
         acknowledged_index: usize,
     ) -> Result<Option<Event>, Error> {
         let phase = "subscription acknowledgement";
-        match envelope.packet.payload.clone() {
+        match envelope.packet.payload() {
             Payload::Subscription(acknowledgement)
                 if self
                     .subscriptions
                     .get(acknowledged_index)
                     .copied()
                     .is_some_and(|expected| {
-                        subscription_acknowledges(acknowledgement, expected)
+                        subscription_acknowledges(*acknowledgement, expected)
                     }) =>
             {
                 self.advance_runtime_subscription(acknowledged_index)
@@ -955,44 +1302,43 @@ impl Client {
             }
             Payload::Close => {
                 self.closed = true;
-                Event::from_envelope(envelope).map(Some)
+                Ok(Some(Event::from_envelope(envelope)))
             }
-            Payload::Failure(message) => Err(handshake_rejection(&message)),
+            Payload::Failure(message) => Err(handshake_rejection(message)),
             _ if is_operational(&envelope.packet) => {
                 self.queue_pending(envelope)?;
                 Ok(None)
             }
             _ => Err(Error::UnexpectedHandshakePacket {
                 phase,
-                packet_type: envelope.packet.header.packet_type,
+                packet_type: envelope.packet.header().packet_type,
             }),
         }
     }
 
     async fn begin_runtime_authentication(
         &mut self,
-        challenge: Vec<u8>,
+        challenge: &[u8],
         existing_deadline: Option<Instant>,
     ) -> Result<(), Error> {
-        if challenge.len() != 4 {
-            return Err(Error::InvalidChallengeLength {
-                actual: challenge.len(),
-            });
-        }
-        let deadline = existing_deadline.unwrap_or_else(|| Instant::now() + self.timeout);
+        let challenge = challenge_bytes(challenge)?;
+        let deadline = match existing_deadline {
+            Some(deadline) => deadline,
+            None => deadline_after(Instant::now(), self.timeout)?,
+        };
         let digest = authentication_digest(&challenge, self.password.as_bytes());
         self.runtime_state = RuntimeState::Authentication { deadline };
         self.send_payload(
             PacketType::Authentication,
             Payload::Authentication(digest),
-            "send authentication",
+            ControlOperation::Authentication,
         )
         .await
     }
 
     async fn begin_runtime_subscriptions(&mut self) -> Result<(), Error> {
         let Some(subscription) = self.subscriptions.first().copied() else {
-            self.finish_runtime_recovery();
+            self.finish_runtime_recovery()?;
             return Ok(());
         };
         self.send_runtime_subscription(0, subscription).await
@@ -1004,7 +1350,7 @@ impl Client {
     ) -> Result<(), Error> {
         let next_index = acknowledged_index.saturating_add(1);
         let Some(subscription) = self.subscriptions.get(next_index).copied() else {
-            self.finish_runtime_recovery();
+            self.finish_runtime_recovery()?;
             return Ok(());
         };
         self.send_runtime_subscription(next_index, subscription)
@@ -1017,15 +1363,17 @@ impl Client {
         subscription: Subscription,
     ) -> Result<(), Error> {
         self.runtime_state = RuntimeState::Subscription {
-            deadline: Instant::now() + self.timeout,
+            deadline: deadline_after(Instant::now(), self.timeout)?,
             acknowledged_index: index,
         };
         self.send_subscription(subscription).await
     }
 
-    fn finish_runtime_recovery(&mut self) {
+    fn finish_runtime_recovery(&mut self) -> Result<(), Error> {
+        let next_keepalive = deadline_after(Instant::now(), self.keepalive_interval)?;
         self.runtime_state = RuntimeState::Operational;
-        self.next_keepalive = Instant::now() + self.keepalive_interval;
+        self.next_keepalive = next_keepalive;
+        Ok(())
     }
 
     fn pending_event_if_recovered(&mut self) -> Option<Event> {
@@ -1056,27 +1404,41 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Send`] if the close datagram could not be sent.
+    /// Returns [`Error::Send`] or [`Error::ControlTimeout`] if the close datagram
+    /// could not be sent within its budget, or [`Error::ControlSendInterrupted`]
+    /// after a caller-cancelled control send.
+    ///
+    /// # Cancellation
+    ///
+    /// The send has the configured send deadline. Dropping it while pending
+    /// leaves an unconfirmed send: the next operation reports
+    /// [`Error::ControlSendInterrupted`]. Drop the client to release its socket;
+    /// no background task continues the send. Successful completion marks it
+    /// closed without awaiting a response from the master.
     pub async fn close(&mut self) -> Result<(), Error> {
         if self.closed {
             return Ok(());
         }
-        self.send_payload(PacketType::Close, Payload::Close, "send close")
+        if self.control_pending {
+            self.closed = true;
+            return Err(Error::ControlSendInterrupted);
+        }
+        self.send_payload(PacketType::Close, Payload::Close, ControlOperation::Close)
             .await?;
         self.closed = true;
         Ok(())
     }
 
-    async fn await_challenge(&mut self) -> Result<Vec<u8>, Error> {
+    async fn await_challenge(&mut self) -> Result<[u8; 4], Error> {
         let phase = "authentication challenge";
-        let deadline = Instant::now() + self.timeout;
+        let deadline = deadline_after(Instant::now(), self.timeout)?;
         loop {
             let envelope = self.receive_handshake(deadline, phase).await?;
-            match envelope.packet.payload.clone() {
-                Payload::Challenge(challenge) => return Ok(challenge),
+            match envelope.packet.payload() {
+                Payload::Challenge(challenge) => return challenge_bytes(challenge),
                 Payload::Close => return Err(remote_close_rejection()),
                 Payload::Failure(message) => {
-                    return Err(handshake_rejection(&message));
+                    return Err(handshake_rejection(message));
                 }
                 _ if is_operational(&envelope.packet) => {
                     self.queue_pending(envelope)?;
@@ -1084,41 +1446,36 @@ impl Client {
                 _ => {
                     return Err(Error::UnexpectedHandshakePacket {
                         phase,
-                        packet_type: envelope.packet.header.packet_type,
+                        packet_type: envelope.packet.header().packet_type,
                     });
                 }
             }
         }
     }
 
-    async fn finish_authentication(&mut self, mut challenge: Vec<u8>) -> Result<(), Error> {
+    async fn finish_authentication(&mut self, mut challenge: [u8; 4]) -> Result<(), Error> {
         let phase = "authentication acknowledgement";
-        let deadline = Instant::now() + self.timeout;
+        let deadline = deadline_after(Instant::now(), self.timeout)?;
         loop {
-            if challenge.len() != 4 {
-                return Err(Error::InvalidChallengeLength {
-                    actual: challenge.len(),
-                });
-            }
             let digest = authentication_digest(&challenge, self.password.as_bytes());
             self.send_payload(
                 PacketType::Authentication,
                 Payload::Authentication(digest),
-                "send authentication",
+                ControlOperation::Authentication,
             )
             .await?;
 
             loop {
                 let envelope = self.receive_handshake(deadline, phase).await?;
-                match envelope.packet.payload.clone() {
+                match envelope.packet.payload() {
                     Payload::KeepAlive(_) => return Ok(()),
                     Payload::Challenge(replacement) => {
-                        challenge = replacement;
+                        challenge = challenge_bytes(replacement)?;
                         break;
                     }
                     Payload::Close => return Err(remote_close_rejection()),
                     Payload::Failure(message) => {
-                        return Err(handshake_rejection(&message));
+                        return Err(handshake_rejection(message));
                     }
                     _ if is_operational(&envelope.packet) => {
                         self.queue_pending(envelope)?;
@@ -1126,7 +1483,7 @@ impl Client {
                     _ => {
                         return Err(Error::UnexpectedHandshakePacket {
                             phase,
-                            packet_type: envelope.packet.header.packet_type,
+                            packet_type: envelope.packet.header().packet_type,
                         });
                     }
                 }
@@ -1150,23 +1507,24 @@ impl Client {
     /// Return `true` when reauthentication requires restarting subscriptions.
     async fn await_subscription_ack(&mut self, expected: Subscription) -> Result<bool, Error> {
         let phase = "subscription acknowledgement";
-        let deadline = Instant::now() + self.timeout;
+        let deadline = deadline_after(Instant::now(), self.timeout)?;
         loop {
             let envelope = self.receive_handshake(deadline, phase).await?;
-            match envelope.packet.payload.clone() {
+            match envelope.packet.payload() {
                 Payload::Subscription(acknowledgement)
-                    if subscription_acknowledges(acknowledgement, expected) =>
+                    if subscription_acknowledges(*acknowledgement, expected) =>
                 {
                     return Ok(false);
                 }
                 Payload::Subscription(_) | Payload::KeepAlive(_) => {}
                 Payload::Challenge(challenge) => {
-                    self.finish_authentication(challenge).await?;
+                    self.finish_authentication(challenge_bytes(challenge)?)
+                        .await?;
                     return Ok(true);
                 }
                 Payload::Close => return Err(remote_close_rejection()),
                 Payload::Failure(message) => {
-                    return Err(handshake_rejection(&message));
+                    return Err(handshake_rejection(message));
                 }
                 _ if is_operational(&envelope.packet) => {
                     self.queue_pending(envelope)?;
@@ -1174,7 +1532,7 @@ impl Client {
                 _ => {
                     return Err(Error::UnexpectedHandshakePacket {
                         phase,
-                        packet_type: envelope.packet.header.packet_type,
+                        packet_type: envelope.packet.header().packet_type,
                     });
                 }
             }
@@ -1183,19 +1541,19 @@ impl Client {
 
     async fn send_subscription(&mut self, subscription: Subscription) -> Result<(), Error> {
         let wire = WireSubscription {
-            session_type: subscription.session_type,
-            target: subscription.destination_id,
+            session_type: subscription.kind.into(),
+            target: subscription.destination_id.into(),
         };
         self.send_payload(
             PacketType::Subscription,
             Payload::Subscription(Some(wire)),
-            "send subscription",
+            ControlOperation::Subscription,
         )
         .await
     }
 
     fn queue_pending(&mut self, envelope: PacketEnvelope) -> Result<(), Error> {
-        self.pending.push(Event::from_envelope(envelope)?)
+        self.pending.push(Event::from_envelope(envelope))
     }
 
     async fn send_keepalive(&mut self) -> Result<(), Error> {
@@ -1203,11 +1561,11 @@ impl Client {
         self.send_payload(
             PacketType::KeepAlive,
             Payload::KeepAlive(Some(VersionData {
-                remote_id: self.dmr_id,
+                remote_id: self.dmr_id.get().into(),
                 service: SERVICE_OPEN_TERMINAL,
                 description,
             })),
-            "send keepalive",
+            ControlOperation::Keepalive,
         )
         .await
     }
@@ -1216,26 +1574,20 @@ impl Client {
         &mut self,
         packet_type: PacketType,
         payload: Payload,
-        operation: &'static str,
+        operation: ControlOperation,
     ) -> Result<(), Error> {
         let flags = PacketFlags::NONE;
         let packet = Packet::new(packet_type, flags, self.sequences.next(flags), payload)?;
-        let datagram = encode(&packet)?;
-        let sent = self
-            .socket
-            .send(&datagram)
-            .await
-            .map_err(|source| Error::Send { operation, source })?;
-        if sent != datagram.len() {
-            return Err(Error::Send {
-                operation,
-                source: io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "UDP socket reported a partial datagram send",
-                ),
-            });
-        }
-        Ok(())
+        let datagram = packet.to_bytes();
+        complete_control_send(
+            &mut self.control_pending,
+            &mut self.closed,
+            self.socket.send(&datagram),
+            datagram.len(),
+            self.send_timeout,
+            operation,
+        )
+        .await
     }
 
     async fn receive_handshake(
@@ -1268,7 +1620,7 @@ impl Client {
                 ))
             })?
             .to_vec();
-        let packet = decode(&datagram)?;
+        let packet = Packet::from_bytes(&datagram)?;
         self.last_valid_packet = Instant::now();
         Ok(PacketEnvelope {
             packet,
@@ -1280,7 +1632,7 @@ impl Client {
 
 const fn is_operational(packet: &Packet) -> bool {
     !matches!(
-        packet.header.packet_type,
+        packet.header().packet_type,
         PacketType::KeepAlive
             | PacketType::Close
             | PacketType::Challenge
@@ -1291,15 +1643,99 @@ const fn is_operational(packet: &Packet) -> bool {
     )
 }
 
+fn deadline_after(start: Instant, duration: Duration) -> Result<Instant, Error> {
+    start
+        .checked_add(duration)
+        .ok_or(Error::InvalidWaitDuration { duration })
+}
+
+const fn ensure_usable(control_pending: bool, closed: &mut bool) -> Result<(), Error> {
+    if control_pending {
+        *closed = true;
+        return Err(Error::ControlSendInterrupted);
+    }
+    if *closed {
+        Err(Error::ClientClosed)
+    } else {
+        Ok(())
+    }
+}
+
+async fn complete_control_send(
+    pending: &mut bool,
+    closed: &mut bool,
+    future: impl Future<Output = io::Result<usize>>,
+    length: usize,
+    budget: Duration,
+    operation: ControlOperation,
+) -> Result<(), Error> {
+    *pending = true;
+    let result = bounded_control(future, budget, operation).await;
+    *pending = false;
+    let sent = match result {
+        Ok(sent) => sent,
+        Err(error) => {
+            *closed = true;
+            return Err(match error {
+                ControlFailure::Io(source) => Error::Send { operation, source },
+                ControlFailure::Deadline(error) => error,
+            });
+        }
+    };
+    if sent != length {
+        *closed = true;
+        return Err(Error::Send {
+            operation,
+            source: io::Error::new(
+                io::ErrorKind::WriteZero,
+                "UDP socket reported a partial datagram send",
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+enum ControlFailure {
+    Io(io::Error),
+    Deadline(Error),
+}
+
+/// Bound socket setup and datagram sends before polling their I/O future.
+async fn bounded_control<T>(
+    operation: impl Future<Output = io::Result<T>>,
+    budget: Duration,
+    kind: ControlOperation,
+) -> Result<T, ControlFailure> {
+    let deadline = deadline_after(Instant::now(), budget).map_err(ControlFailure::Deadline)?;
+    timeout_at(deadline, operation)
+        .await
+        .map_err(|_| {
+            ControlFailure::Deadline(Error::ControlTimeout {
+                operation: kind,
+                timeout: budget,
+            })
+        })?
+        .map_err(ControlFailure::Io)
+}
+
 fn subscription_acknowledges(
     acknowledgement: Option<WireSubscription>,
     expected: Subscription,
 ) -> bool {
     let wire_expected = WireSubscription {
-        session_type: expected.session_type,
-        target: expected.destination_id,
+        session_type: expected.kind.into(),
+        target: expected.destination_id.into(),
     };
     acknowledgement.is_none_or(|actual| actual == wire_expected)
+}
+
+fn challenge_bytes(challenge: &[u8]) -> Result<[u8; 4], Error> {
+    challenge
+        .try_into()
+        .map_err(|_| Error::InvalidChallengeLength {
+            actual: challenge.len(),
+        })
 }
 
 fn handshake_rejection(message: &[u8]) -> Error {
@@ -1322,18 +1758,23 @@ fn remote_close_rejection() -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dmr_rewind_core::SessionType;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     fn queued_event(raw_datagram_len: usize) -> Event {
-        Event::Report(NoticeEvent {
-            metadata: EventMetadata {
-                sequence: 0,
-                flags: PacketFlags::NONE,
-                payload_len: 0,
-                raw_datagram: vec![0; raw_datagram_len],
-                received_at: SystemTime::UNIX_EPOCH,
-            },
-            data: Vec::new(),
-        })
+        Event {
+            kind: EventKind::Report(NoticeEvent {
+                metadata: EventMetadata {
+                    sequence: TransportSequence::new(0),
+                    flags: PacketFlags::NONE,
+                    payload_len: 0,
+                    raw_datagram: vec![0; raw_datagram_len],
+                    received_at: SystemTime::UNIX_EPOCH,
+                },
+                data: Vec::new(),
+            }),
+        }
     }
 
     #[test]
@@ -1436,8 +1877,8 @@ mod tests {
     }
 
     #[test]
-    fn subscription_ack_must_be_generic_or_match_the_outstanding_request() {
-        let expected = Subscription::group(91);
+    fn subscription_ack_must_be_generic_or_match_the_outstanding_request() -> TestResult {
+        let expected = Subscription::group(DestinationId::new(91)?);
         assert!(
             subscription_acknowledges(None, expected),
             "a generic acknowledgement is protocol-compatible"
@@ -1446,7 +1887,7 @@ mod tests {
             subscription_acknowledges(
                 Some(WireSubscription {
                     session_type: SessionType::GroupVoice,
-                    target: 91,
+                    target: 91.into(),
                 }),
                 expected,
             ),
@@ -1456,7 +1897,7 @@ mod tests {
             !subscription_acknowledges(
                 Some(WireSubscription {
                     session_type: SessionType::PrivateVoice,
-                    target: 91,
+                    target: 91.into(),
                 }),
                 expected,
             ),
@@ -1466,11 +1907,118 @@ mod tests {
             !subscription_acknowledges(
                 Some(WireSubscription {
                     session_type: SessionType::GroupVoice,
-                    target: 92,
+                    target: 92.into(),
                 }),
                 expected,
             ),
             "an acknowledgement for another target must be ignored"
         );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blocked_control_send_expires_and_retires_the_session() -> TestResult {
+        let mut pending = false;
+        let mut closed = false;
+        let budget = Duration::from_millis(10);
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            complete_control_send(
+                &mut pending,
+                &mut closed,
+                std::future::pending(),
+                18,
+                budget,
+                ControlOperation::Close,
+            ),
+        )
+        .await?;
+        assert!(
+            matches!(result, Err(Error::ControlTimeout { operation: ControlOperation::Close, timeout }) if timeout == budget),
+            "result {result:?}"
+        );
+        assert!(!pending, "completed timeout clears the in-flight marker");
+        assert!(closed, "an unconfirmed control send ends the local session");
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_control_send_poisoned_session_cannot_resume() {
+        let mut pending = false;
+        let mut closed = false;
+        let result = tokio::time::timeout(
+            Duration::from_millis(1),
+            complete_control_send(
+                &mut pending,
+                &mut closed,
+                std::future::pending(),
+                18,
+                Duration::from_secs(5),
+                ControlOperation::Authentication,
+            ),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "the outer caller cancelled an unfinished send"
+        );
+        assert!(
+            pending,
+            "cancellation must retain the unfinished-send marker"
+        );
+        assert!(matches!(
+            ensure_usable(pending, &mut closed),
+            Err(Error::ControlSendInterrupted)
+        ));
+        assert!(
+            closed,
+            "interrupted control sends require a fresh connection"
+        );
+        let valid = bounded_control(
+            std::future::ready(Ok(7)),
+            Duration::from_secs(1),
+            ControlOperation::Bind,
+        )
+        .await;
+        assert!(matches!(valid, Ok(7)), "ordinary completion remains usable");
+    }
+
+    #[tokio::test]
+    async fn failed_or_partial_control_send_cannot_resume() {
+        for result in [
+            Ok(17),
+            Err(io::Error::new(io::ErrorKind::ConnectionRefused, "fixture")),
+        ] {
+            let mut pending = false;
+            let mut closed = false;
+            let outcome = complete_control_send(
+                &mut pending,
+                &mut closed,
+                std::future::ready(result),
+                18,
+                Duration::from_secs(1),
+                ControlOperation::Keepalive,
+            )
+            .await;
+            assert!(
+                matches!(
+                    outcome,
+                    Err(Error::Send {
+                        operation: ControlOperation::Keepalive,
+                        ..
+                    })
+                ),
+                "{outcome:?}"
+            );
+            assert!(!pending, "returned sends clear their in-flight marker");
+            assert!(
+                closed,
+                "a send without a complete datagram ends the session"
+            );
+            assert!(matches!(
+                ensure_usable(pending, &mut closed),
+                Err(Error::ClientClosed)
+            ));
+        }
     }
 }

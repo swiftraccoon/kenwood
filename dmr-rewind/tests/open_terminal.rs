@@ -5,15 +5,19 @@
 
 use std::error::Error;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
-use dmr_rewind::{Client, ClientConfig, Error as ClientError, Event, EventMetadata, Subscription};
-use dmr_rewind_core::{
-    Callsign, FullLinkControl, Packet, PacketFlags, PacketType, Payload, SERVICE_OPEN_TERMINAL,
-    SessionType, Subscription as WireSubscription, SuperHeader, VersionData, authentication_digest,
-    decode, encode,
+use dmr_rewind::{
+    Client, ClientConfig, DestinationId, Error as ClientError, Event, EventKind, EventMetadata,
+    SubscriberId, Subscription,
 };
+use dmr_rewind_core::{
+    Callsign, CodecError, DmrAudioSubtype, FullLinkControl, MAX_DATAGRAM_LEN, MAX_PAYLOAD_LEN,
+    Packet, PacketFlags, PacketType, Payload, SERVICE_OPEN_TERMINAL, SessionType,
+    Subscription as WireSubscription, SuperHeader, VersionData, authentication_digest,
+};
+use socket2::SockRef;
 use thiserror as _;
 use tokio::net::UdpSocket;
 use tokio::time::{sleep, timeout};
@@ -22,6 +26,18 @@ type TestError = Box<dyn Error + Send + Sync>;
 type TestResult<T = ()> = Result<T, TestError>;
 
 const DMR_ID: u32 = 1_234_567;
+const SUBSCRIBER: SubscriberId = match SubscriberId::new(DMR_ID) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+const GROUP_DESTINATION: DestinationId = match DestinationId::new(91) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
+const PRIVATE_DESTINATION: DestinationId = match DestinationId::new(DMR_ID) {
+    Ok(value) => value,
+    Err(_) => unreachable!(),
+};
 const PASSWORD: &str = "correct horse battery staple";
 const CHALLENGE: [u8; 4] = [0x10, 0x32, 0x54, 0x76];
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
@@ -32,7 +48,7 @@ const TERMINATOR: [u8; 12] = [
     0x00, 0x01, 0x82, 0x00, 0x00, 0x5b, 0x12, 0xd6, 0x87, 0xdd, 0xee, 0xff,
 ];
 const AUDIO: [u8; 27] = [0xa5; 27];
-const EMBEDDED: [u8; 10] = [0x5a; 10];
+const EMBEDDED: [u8; 11] = [0x5a; 11];
 
 #[derive(Debug)]
 struct EventDatagrams {
@@ -78,7 +94,7 @@ async fn receive_packet(socket: &UdpSocket) -> TestResult<(Packet, SocketAddr)> 
     let datagram = buffer
         .get(..received)
         .ok_or_else(|| io::Error::other("fake-server receive overflow"))?;
-    Ok((decode(datagram)?, peer))
+    Ok((Packet::from_bytes(datagram)?, peer))
 }
 
 async fn send_packet(
@@ -89,8 +105,8 @@ async fn send_packet(
     sequence: u32,
     payload: Payload,
 ) -> TestResult<Vec<u8>> {
-    let packet = Packet::new(packet_type, flags, sequence, payload)?;
-    let datagram = encode(&packet)?;
+    let packet = Packet::new(packet_type, flags, sequence.into(), payload)?;
+    let datagram = packet.to_bytes();
     let sent = socket.send_to(&datagram, peer).await?;
     if sent != datagram.len() {
         return Err(io::Error::new(
@@ -117,19 +133,21 @@ async fn accept_handshake(
 async fn receive_initial_keepalive(socket: &UdpSocket) -> TestResult<SocketAddr> {
     let (keepalive, peer) = receive_packet(socket).await?;
     assert_eq!(
-        keepalive.header.packet_type,
+        keepalive.header().packet_type,
         PacketType::KeepAlive,
         "Open Terminal must start with a keepalive"
     );
     assert_eq!(
-        keepalive.header.sequence, 0,
+        keepalive.header().sequence.get(),
+        0,
         "first client sequence must be zero"
     );
-    let Payload::KeepAlive(Some(version)) = keepalive.payload else {
+    let Payload::KeepAlive(Some(version)) = keepalive.into_payload() else {
         return Err(io::Error::other("initial keepalive did not contain version data").into());
     };
     assert_eq!(
-        version.remote_id, DMR_ID,
+        version.remote_id.get(),
+        DMR_ID,
         "keepalive must use the configured DMR ID"
     );
     assert_eq!(
@@ -164,23 +182,24 @@ async fn accept_authentication(
         "authentication peer must remain stable"
     );
     assert_eq!(
-        authentication.header.packet_type,
+        authentication.header().packet_type,
         PacketType::Authentication,
         "challenge must be followed by authentication"
     );
     assert_eq!(
-        authentication.header.sequence, 1,
+        authentication.header().sequence.get(),
+        1,
         "authentication must use the next routine sequence"
     );
     assert_eq!(
-        authentication.payload,
+        authentication.into_payload(),
         Payload::Authentication(authentication_digest(&CHALLENGE, PASSWORD.as_bytes(),)),
         "authentication digest must be SHA-256(challenge || password)"
     );
 
     let acknowledgement = if version_ack {
         Payload::KeepAlive(Some(VersionData {
-            remote_id: 9_999_999,
+            remote_id: 9_999_999.into(),
             service: SERVICE_OPEN_TERMINAL,
             description: b"version-bearing acknowledgement".to_vec(),
         }))
@@ -212,18 +231,18 @@ async fn accept_subscriptions(
             "subscription peer must remain stable"
         );
         assert_eq!(
-            subscription.header.packet_type,
+            subscription.header().packet_type,
             PacketType::Subscription,
             "Open Terminal must subscribe directly without Configuration"
         );
         assert_eq!(
-            subscription.payload,
-            Payload::Subscription(Some(*expected)),
+            subscription.payload(),
+            &Payload::Subscription(Some(*expected)),
             "subscription order and payload must be preserved"
         );
         let sequence_offset = u32::try_from(position)?;
         assert_eq!(
-            subscription.header.sequence,
+            subscription.header().sequence.get(),
             2_u32.saturating_add(sequence_offset),
             "client control sequence must increase"
         );
@@ -259,7 +278,7 @@ async fn send_call_start(socket: &UdpSocket, peer: SocketAddr) -> TestResult<Cal
     let audio = send_packet(
         socket,
         peer,
-        PacketType::DmrAudio(4),
+        PacketType::DmrAudio(DmrAudioSubtype::new(4)?),
         realtime,
         501,
         Payload::DmrAudio(AUDIO),
@@ -271,15 +290,15 @@ async fn send_call_start(socket: &UdpSocket, peer: SocketAddr) -> TestResult<Cal
         PacketType::DmrEmbeddedData,
         realtime,
         502,
-        Payload::DmrEmbeddedData(EMBEDDED),
+        Payload::DmrEmbeddedData(EMBEDDED.to_vec()),
     )
     .await?;
     let super_header_value = SuperHeader {
         session_type: SessionType::GroupVoice,
-        source_id: DMR_ID,
-        target_id: 91,
-        source_call: Callsign::from_raw(*b"N0CALL\0\0\0\0"),
-        target_call: Callsign::from_raw(*b"TG91\0\0\0\0\0\0"),
+        source_id: DMR_ID.into(),
+        target_id: 91.into(),
+        source_call: Callsign::from_bytes(*b"N0CALL\0\0\0\0"),
+        target_call: Callsign::from_bytes(*b"TG91\0\0\0\0\0\0"),
     };
     let super_header = send_packet(
         socket,
@@ -329,7 +348,7 @@ async fn send_notices(socket: &UdpSocket, peer: SocketAddr) -> TestResult<Notice
     let unknown = send_packet(
         socket,
         peer,
-        PacketType::Unknown(0x7f00),
+        PacketType::from_raw(0x7f00),
         PacketFlags::from_bits(0x4000),
         507,
         Payload::Opaque(vec![1, 3, 3, 7]),
@@ -383,11 +402,11 @@ async fn serve_event_stream(socket: UdpSocket) -> TestResult<EventDatagrams> {
     let subscriptions = [
         WireSubscription {
             session_type: SessionType::GroupVoice,
-            target: 91,
+            target: 91.into(),
         },
         WireSubscription {
             session_type: SessionType::PrivateVoice,
-            target: DMR_ID,
+            target: DMR_ID.into(),
         },
     ];
     let peer = accept_handshake(&socket, &subscriptions, true, true).await?;
@@ -410,8 +429,8 @@ async fn serve_event_stream(socket: UdpSocket) -> TestResult<EventDatagrams> {
 }
 
 async fn connect(server: SocketAddr, subscriptions: Vec<Subscription>) -> TestResult<Client> {
-    let config =
-        ClientConfig::new(server, DMR_ID, PASSWORD.to_owned()).with_subscriptions(subscriptions);
+    let config = ClientConfig::new(server, SUBSCRIBER, PASSWORD.to_owned())?
+        .with_subscriptions(subscriptions)?;
     Ok(timeout(IO_TIMEOUT, Client::connect(config)).await??)
 }
 
@@ -426,63 +445,67 @@ fn assert_metadata(
     raw_datagram: &[u8],
 ) {
     assert_eq!(
-        metadata.sequence, sequence,
+        metadata.sequence().get(),
+        sequence,
         "event must retain transport sequence"
     );
-    assert_eq!(metadata.flags, flags, "event must retain all flag bits");
+    assert_eq!(metadata.flags(), flags, "event must retain all flag bits");
     assert_eq!(
-        metadata.raw_datagram, raw_datagram,
+        metadata.raw_datagram(),
+        raw_datagram,
         "event must retain the exact UDP datagram"
     );
 }
 
 async fn assert_call_start_events(client: &mut Client, datagrams: &EventDatagrams) -> TestResult {
     let realtime = PacketFlags::from_bits(0x8001);
-    let Event::VoiceHeader(event) = next_event(client).await? else {
+    let EventKind::VoiceHeader(event) = next_event(client).await?.into_kind() else {
         return Err(io::Error::other("expected voice-header event").into());
     };
     assert_eq!(
-        event.data, VOICE_HEADER,
+        event.data(),
+        VOICE_HEADER,
         "voice header must retain exact bytes"
     );
     assert_eq!(
-        event.link_control,
+        event.link_control(),
         FullLinkControl::from_bytes(VOICE_HEADER),
         "voice header must expose parsed Full Link Control"
     );
-    assert_eq!(event.subtype, 1, "voice-header subtype must be one");
-    assert_metadata(&event.metadata, 500, realtime, &datagrams.voice_header);
+    assert_metadata(event.metadata(), 500, realtime, &datagrams.voice_header);
 
-    let Event::Audio(event) = next_event(client).await? else {
+    let EventKind::Audio(event) = next_event(client).await?.into_kind() else {
         return Err(io::Error::other("expected audio event").into());
     };
-    assert_eq!(event.data, AUDIO, "audio must retain all 27 bytes");
-    assert_eq!(event.subtype, 4, "audio subtype must be retained");
-    assert_metadata(&event.metadata, 501, realtime, &datagrams.audio);
+    assert_eq!(event.data(), AUDIO, "audio must retain all 27 bytes");
+    assert_eq!(event.subtype().get(), 4, "audio subtype must be retained");
+    assert_metadata(event.metadata(), 501, realtime, &datagrams.audio);
 
-    let Event::EmbeddedData(event) = next_event(client).await? else {
+    let EventKind::EmbeddedData(event) = next_event(client).await?.into_kind() else {
         return Err(io::Error::other("expected embedded-data event").into());
     };
     assert_eq!(
-        event.data, EMBEDDED,
-        "embedded data must retain all ten bytes"
+        event.data(),
+        EMBEDDED,
+        "embedded data must retain the variable body without a fixed-length restriction"
     );
-    assert_eq!(event.subtype, 7, "embedded-data subtype must be seven");
-    assert_metadata(&event.metadata, 502, realtime, &datagrams.embedded);
+    assert_metadata(event.metadata(), 502, realtime, &datagrams.embedded);
 
-    let Event::SuperHeader(event) = next_event(client).await? else {
+    let EventKind::SuperHeader(event) = next_event(client).await?.into_kind() else {
         return Err(io::Error::other("expected superheader event").into());
     };
     assert_eq!(
-        event.data.source_id, DMR_ID,
+        event.data().source_id.get(),
+        DMR_ID,
         "superheader source must be parsed"
     );
     assert_eq!(
-        event.data.target_id, 91,
+        event.data().target_id.get(),
+        91,
         "superheader destination must be parsed"
     );
     assert_metadata(
-        &event.metadata,
+        event.metadata(),
         503,
         PacketFlags::NONE,
         &datagrams.super_header,
@@ -491,42 +514,43 @@ async fn assert_call_start_events(client: &mut Client, datagrams: &EventDatagram
 }
 
 async fn assert_notice_events(client: &mut Client, datagrams: &EventDatagrams) -> TestResult {
-    let Event::Report(event) = next_event(client).await? else {
+    let EventKind::Report(event) = next_event(client).await?.into_kind() else {
         return Err(io::Error::other("expected report event").into());
     };
-    assert_eq!(event.data, b"connected", "report bytes must be retained");
-    assert_metadata(&event.metadata, 504, PacketFlags::NONE, &datagrams.report);
+    assert_eq!(event.data(), b"connected", "report bytes must be retained");
+    assert_metadata(event.metadata(), 504, PacketFlags::NONE, &datagrams.report);
 
-    let Event::Failure(event) = next_event(client).await? else {
+    let EventKind::Failure(event) = next_event(client).await?.into_kind() else {
         return Err(io::Error::other("expected runtime failure event").into());
     };
     assert_eq!(
-        event.data, b"late warning",
+        event.data(),
+        b"late warning",
         "runtime failure must be delivered instead of failing the client"
     );
-    assert_metadata(&event.metadata, 505, PacketFlags::NONE, &datagrams.failure);
+    assert_metadata(event.metadata(), 505, PacketFlags::NONE, &datagrams.failure);
 
-    let Event::BusyNotice(event) = next_event(client).await? else {
+    let EventKind::BusyNotice(event) = next_event(client).await?.into_kind() else {
         return Err(io::Error::other("expected busy-notice event").into());
     };
-    assert_eq!(event.data, b"busy", "busy-notice bytes must be retained");
-    assert_metadata(&event.metadata, 506, PacketFlags::NONE, &datagrams.busy);
+    assert_eq!(event.data(), b"busy", "busy-notice bytes must be retained");
+    assert_metadata(event.metadata(), 506, PacketFlags::NONE, &datagrams.busy);
 
-    let Event::Other(event) = next_event(client).await? else {
+    let EventKind::Other(event) = next_event(client).await?.into_kind() else {
         return Err(io::Error::other("expected unknown event").into());
     };
     assert_eq!(
-        event.packet_type,
-        PacketType::Unknown(0x7f00),
+        event.packet_type(),
+        PacketType::from_raw(0x7f00),
         "unknown packet type must be retained"
     );
     assert_eq!(
-        event.payload,
-        Payload::Opaque(vec![1, 3, 3, 7]),
+        event.payload(),
+        &Payload::Opaque(vec![1, 3, 3, 7]),
         "unknown packet payload must be retained"
     );
     assert_metadata(
-        &event.metadata,
+        event.metadata(),
         507,
         PacketFlags::from_bits(0x4000),
         &datagrams.unknown,
@@ -536,40 +560,42 @@ async fn assert_notice_events(client: &mut Client, datagrams: &EventDatagrams) -
 
 async fn assert_call_end_events(client: &mut Client, datagrams: &EventDatagrams) -> TestResult {
     let realtime = PacketFlags::from_bits(0x8001);
-    let Event::Terminator(event) = next_event(client).await? else {
+    let EventKind::Terminator(event) = next_event(client).await?.into_kind() else {
         return Err(io::Error::other("expected terminator event").into());
     };
     assert_eq!(
-        event.data,
+        event.data(),
         Some(TERMINATOR),
         "terminator must retain exact bytes"
     );
     assert_eq!(
-        event.link_control,
+        event.link_control(),
         Some(FullLinkControl::from_bytes(TERMINATOR)),
         "terminator must expose parsed Full Link Control"
     );
-    assert_eq!(event.subtype, 2, "terminator subtype must be two");
-    assert_metadata(&event.metadata, 508, realtime, &datagrams.terminator);
+    assert_metadata(event.metadata(), 508, realtime, &datagrams.terminator);
 
-    let Event::Terminator(event) = next_event(client).await? else {
+    let EventKind::Terminator(event) = next_event(client).await?.into_kind() else {
         return Err(io::Error::other("expected empty terminator event").into());
     };
     assert_eq!(
-        event.data, None,
+        event.data(),
+        None,
         "empty terminator must not synthesize Full Link Control bytes"
     );
     assert_eq!(
-        event.link_control, None,
+        event.link_control(),
+        None,
         "empty terminator must not synthesize parsed fields"
     );
     assert_eq!(
-        event.metadata.payload_len, 0,
+        event.metadata().payload_len(),
+        0,
         "empty terminator must retain its zero payload length"
     );
-    assert_metadata(&event.metadata, 509, realtime, &datagrams.empty_terminator);
+    assert_metadata(event.metadata(), 509, realtime, &datagrams.empty_terminator);
 
-    let Event::Close(metadata) = next_event(client).await? else {
+    let EventKind::Close(metadata) = next_event(client).await?.into_kind() else {
         return Err(io::Error::other("expected remote close event").into());
     };
     assert_metadata(&metadata, 510, PacketFlags::NONE, &datagrams.close);
@@ -585,9 +611,12 @@ async fn authenticates_subscribes_and_delivers_typed_events() -> TestResult {
     let socket = UdpSocket::bind("127.0.0.1:0").await?;
     let server_address = socket.local_addr()?;
     let server_task = tokio::spawn(serve_event_stream(socket));
-    let subscriptions = vec![Subscription::group(91), Subscription::private(DMR_ID)];
-    let config = ClientConfig::new(server_address, DMR_ID, PASSWORD.to_owned())
-        .with_subscriptions(subscriptions);
+    let subscriptions = vec![
+        Subscription::group(GROUP_DESTINATION),
+        Subscription::private(PRIVATE_DESTINATION),
+    ];
+    let config = ClientConfig::new(server_address, SUBSCRIBER, PASSWORD.to_owned())?
+        .with_subscriptions(subscriptions)?;
     let config_debug = format!("{config:?}");
     assert!(
         !config_debug.contains(PASSWORD),
@@ -614,7 +643,7 @@ async fn authenticates_subscribes_and_delivers_typed_events() -> TestResult {
 async fn serve_invalid_challenge(socket: UdpSocket) -> TestResult {
     let (keepalive, peer) = receive_packet(&socket).await?;
     assert_eq!(
-        keepalive.header.packet_type,
+        keepalive.header().packet_type,
         PacketType::KeepAlive,
         "client must start with keepalive"
     );
@@ -639,9 +668,9 @@ async fn rejects_non_four_byte_challenge() -> TestResult {
         IO_TIMEOUT,
         Client::connect(ClientConfig::new(
             server_address,
-            DMR_ID,
+            SUBSCRIBER,
             PASSWORD.to_owned(),
-        )),
+        )?),
     )
     .await?;
     assert!(
@@ -655,14 +684,62 @@ async fn rejects_non_four_byte_challenge() -> TestResult {
     Ok(())
 }
 
+async fn serve_oversized_datagram(socket: UdpSocket) -> TestResult {
+    let peer = accept_handshake(&socket, &[], false, false).await?;
+    let valid_prefix = Packet::new(
+        PacketType::from_raw(0xbeef),
+        PacketFlags::NONE,
+        123.into(),
+        Payload::Opaque(vec![0xa5; MAX_PAYLOAD_LEN]),
+    )?;
+    let mut datagram = valid_prefix.to_bytes();
+    datagram.push(0xff);
+    let sent = socket.send_to(&datagram, peer).await?;
+    assert_eq!(
+        sent,
+        MAX_DATAGRAM_LEN + 1,
+        "the fake master must send the oversized suffix"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_oversized_ipv6_datagrams_with_valid_truncated_prefixes() -> TestResult {
+    let socket = std::net::UdpSocket::bind((Ipv6Addr::LOCALHOST, 0))?;
+    SockRef::from(&socket).set_send_buffer_size(128 * 1_024)?;
+    socket.set_nonblocking(true)?;
+    let server_address = socket.local_addr()?;
+    let socket = UdpSocket::from_std(socket)?;
+    let server_task = tokio::spawn(serve_oversized_datagram(socket));
+    let config = ClientConfig::new(server_address, SUBSCRIBER, PASSWORD.to_owned())?;
+    let mut client = timeout(IO_TIMEOUT, Client::connect(config)).await??;
+    let result = timeout(IO_TIMEOUT, client.next_event()).await?;
+    let observed = match &result {
+        Ok(event) => format!(
+            "accepted sequence {} with {} datagram bytes",
+            event.metadata().sequence(),
+            event.metadata().raw_datagram().len(),
+        ),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        matches!(result, Err(ClientError::Codec(CodecError::DatagramTooLong {
+            actual, maximum: MAX_DATAGRAM_LEN,
+        })) if actual == MAX_DATAGRAM_LEN + 1),
+        "oversized input must not be accepted after truncation: {observed}",
+    );
+    server_task.await??;
+    Ok(())
+}
+
 async fn serve_mismatched_initial_subscription_ack(socket: UdpSocket) -> TestResult {
     let first = WireSubscription {
         session_type: SessionType::GroupVoice,
-        target: 91,
+        target: 91.into(),
     };
     let second = WireSubscription {
         session_type: SessionType::PrivateVoice,
-        target: DMR_ID,
+        target: DMR_ID.into(),
     };
     let peer = receive_initial_keepalive(&socket).await?;
     accept_authentication(&socket, peer, false).await?;
@@ -673,7 +750,7 @@ async fn serve_mismatched_initial_subscription_ack(socket: UdpSocket) -> TestRes
         "first subscription peer must remain stable"
     );
     assert_eq!(
-        first_request.payload,
+        first_request.into_payload(),
         Payload::Subscription(Some(first)),
         "client must request the first configured subscription"
     );
@@ -693,7 +770,7 @@ async fn serve_mismatched_initial_subscription_ack(socket: UdpSocket) -> TestRes
         "second subscription peer must remain stable"
     );
     assert_eq!(
-        second_request.payload,
+        second_request.into_payload(),
         Payload::Subscription(Some(second)),
         "client must request the second configured subscription"
     );
@@ -723,8 +800,11 @@ async fn ignores_mismatched_initial_subscription_ack() -> TestResult {
     let socket = UdpSocket::bind("127.0.0.1:0").await?;
     let server_address = socket.local_addr()?;
     let server_task = tokio::spawn(serve_mismatched_initial_subscription_ack(socket));
-    let config = ClientConfig::new(server_address, DMR_ID, PASSWORD.to_owned())
-        .with_subscriptions(vec![Subscription::group(91), Subscription::private(DMR_ID)]);
+    let config = ClientConfig::new(server_address, SUBSCRIBER, PASSWORD.to_owned())?
+        .with_subscriptions(vec![
+            Subscription::group(GROUP_DESTINATION),
+            Subscription::private(PRIVATE_DESTINATION),
+        ])?;
 
     let result = timeout(IO_TIMEOUT, Client::connect(config)).await?;
     assert!(
@@ -742,11 +822,11 @@ async fn ignores_mismatched_initial_subscription_ack() -> TestResult {
 async fn serve_mismatched_runtime_subscription_ack(socket: UdpSocket) -> TestResult {
     let first = WireSubscription {
         session_type: SessionType::GroupVoice,
-        target: 91,
+        target: 91.into(),
     };
     let second = WireSubscription {
         session_type: SessionType::PrivateVoice,
-        target: DMR_ID,
+        target: DMR_ID.into(),
     };
     let peer = accept_handshake(&socket, &[first, second], false, true).await?;
     let runtime_challenge = [0xde, 0xad, 0xbe, 0xef];
@@ -765,7 +845,7 @@ async fn serve_mismatched_runtime_subscription_ack(socket: UdpSocket) -> TestRes
         "runtime authentication peer must remain stable"
     );
     assert_eq!(
-        authentication.payload,
+        authentication.into_payload(),
         Payload::Authentication(authentication_digest(
             &runtime_challenge,
             PASSWORD.as_bytes(),
@@ -788,7 +868,7 @@ async fn serve_mismatched_runtime_subscription_ack(socket: UdpSocket) -> TestRes
         "first restored subscription peer must remain stable"
     );
     assert_eq!(
-        first_request.payload,
+        first_request.into_payload(),
         Payload::Subscription(Some(first)),
         "runtime recovery must reinstall the first subscription"
     );
@@ -808,7 +888,7 @@ async fn serve_mismatched_runtime_subscription_ack(socket: UdpSocket) -> TestRes
         "second restored subscription peer must remain stable"
     );
     assert_eq!(
-        second_request.payload,
+        second_request.into_payload(),
         Payload::Subscription(Some(second)),
         "runtime recovery must reinstall the second subscription"
     );
@@ -840,7 +920,10 @@ async fn ignores_mismatched_runtime_subscription_ack() -> TestResult {
     let server_task = tokio::spawn(serve_mismatched_runtime_subscription_ack(socket));
     let mut client = connect(
         server_address,
-        vec![Subscription::group(91), Subscription::private(DMR_ID)],
+        vec![
+            Subscription::group(GROUP_DESTINATION),
+            Subscription::private(PRIVATE_DESTINATION),
+        ],
     )
     .await?;
 
@@ -860,7 +943,7 @@ async fn ignores_mismatched_runtime_subscription_ack() -> TestResult {
 async fn serve_reauthentication(socket: UdpSocket) -> TestResult {
     let subscription = WireSubscription {
         session_type: SessionType::GroupVoice,
-        target: 91,
+        target: 91.into(),
     };
     let peer = accept_handshake(&socket, &[subscription], false, false).await?;
     let second_challenge = [0xde, 0xad, 0xbe, 0xef];
@@ -875,7 +958,7 @@ async fn serve_reauthentication(socket: UdpSocket) -> TestResult {
     .await?;
     let (authentication, _) = receive_packet(&socket).await?;
     assert_eq!(
-        authentication.payload,
+        authentication.into_payload(),
         Payload::Authentication(authentication_digest(
             &second_challenge,
             PASSWORD.as_bytes(),
@@ -894,7 +977,7 @@ async fn serve_reauthentication(socket: UdpSocket) -> TestResult {
     .await?;
     let (reinstalled, _) = receive_packet(&socket).await?;
     assert_eq!(
-        reinstalled.payload,
+        reinstalled.into_payload(),
         Payload::Subscription(Some(subscription)),
         "reauthentication must reinstall subscriptions"
     );
@@ -910,7 +993,7 @@ async fn serve_reauthentication(socket: UdpSocket) -> TestResult {
     let _audio = send_packet(
         &socket,
         peer,
-        PacketType::DmrAudio(0),
+        PacketType::DmrAudio(DmrAudioSubtype::new(0)?),
         PacketFlags::REAL_TIME_1,
         203,
         Payload::DmrAudio(AUDIO),
@@ -924,17 +1007,17 @@ async fn reauthenticates_and_reinstalls_subscriptions() -> TestResult {
     let socket = UdpSocket::bind("127.0.0.1:0").await?;
     let server_address = socket.local_addr()?;
     let server_task = tokio::spawn(serve_reauthentication(socket));
-    let mut client = connect(server_address, vec![Subscription::group(91)]).await?;
+    let mut client = connect(server_address, vec![Subscription::group(GROUP_DESTINATION)]).await?;
     let interrupted_reauthentication = client.next_event_for(Duration::from_millis(50)).await?;
     assert!(
         interrupted_reauthentication.is_none(),
         "bounded wait must persist an in-progress authentication phase"
     );
     let event = client.next_event_for(IO_TIMEOUT).await?;
-    let Some(Event::Audio(audio)) = event else {
+    let Some(EventKind::Audio(audio)) = event.map(Event::into_kind) else {
         return Err(io::Error::other("expected audio after transparent reauthentication").into());
     };
-    assert_eq!(audio.data, AUDIO, "audio after reauth must be delivered");
+    assert_eq!(audio.data(), AUDIO, "audio after reauth must be delivered");
     server_task.await??;
     Ok(())
 }
@@ -947,7 +1030,7 @@ async fn serve_bounded_wait(socket: UdpSocket) -> TestResult {
         "periodic keepalive peer must remain stable"
     );
     assert!(
-        matches!(keepalive.payload, Payload::KeepAlive(Some(_))),
+        matches!(keepalive.into_payload(), Payload::KeepAlive(Some(_))),
         "periodic keepalive must carry Open Terminal version data"
     );
     sleep(Duration::from_millis(80)).await;
@@ -968,21 +1051,25 @@ async fn bounded_wait_services_keepalive_and_preserves_next_event() -> TestResul
     let socket = UdpSocket::bind("127.0.0.1:0").await?;
     let server_address = socket.local_addr()?;
     let server_task = tokio::spawn(serve_bounded_wait(socket));
-    let config = ClientConfig::new(server_address, DMR_ID, PASSWORD.to_owned())
-        .with_keepalive_interval(Duration::from_millis(20))
-        .with_timeout(Duration::from_millis(500));
+    let config = ClientConfig::new(server_address, SUBSCRIBER, PASSWORD.to_owned())?
+        .with_keepalive_interval(Duration::from_millis(20))?
+        .with_timeout(Duration::from_millis(500))?;
     let mut client = timeout(IO_TIMEOUT, Client::connect(config)).await??;
     let before_report = client.next_event_for(Duration::from_millis(50)).await?;
     assert!(
         before_report.is_none(),
         "bounded wait must return None at its own deadline"
     );
-    let Some(Event::Report(report)) = client.next_event_for(Duration::from_millis(200)).await?
+    let Some(EventKind::Report(report)) = client
+        .next_event_for(Duration::from_millis(200))
+        .await?
+        .map(Event::into_kind)
     else {
         return Err(io::Error::other("subsequent wait must deliver the report").into());
     };
     assert_eq!(
-        report.data, b"after deadline",
+        report.data(),
+        b"after deadline",
         "event after a bounded timeout must not be lost"
     );
     server_task.await??;
@@ -1001,9 +1088,9 @@ async fn reports_session_timeout_despite_periodic_keepalives() -> TestResult {
     let server_address = socket.local_addr()?;
     let server_task = tokio::spawn(serve_silent_session(socket));
     let session_timeout = Duration::from_millis(80);
-    let config = ClientConfig::new(server_address, DMR_ID, PASSWORD.to_owned())
-        .with_keepalive_interval(Duration::from_millis(20))
-        .with_timeout(session_timeout);
+    let config = ClientConfig::new(server_address, SUBSCRIBER, PASSWORD.to_owned())?
+        .with_keepalive_interval(Duration::from_millis(20))?
+        .with_timeout(session_timeout)?;
     let mut client = timeout(IO_TIMEOUT, Client::connect(config)).await??;
     let result = timeout(IO_TIMEOUT, client.next_event()).await?;
     assert!(
@@ -1023,12 +1110,12 @@ async fn serve_graceful_close(socket: UdpSocket) -> TestResult {
     let (close, close_peer) = receive_packet(&socket).await?;
     assert_eq!(close_peer, peer, "close peer must remain stable");
     assert_eq!(
-        close.header.packet_type,
+        close.header().packet_type,
         PacketType::Close,
         "graceful shutdown must send Close"
     );
     assert_eq!(
-        close.payload,
+        close.into_payload(),
         Payload::Close,
         "Close must have an empty payload"
     );

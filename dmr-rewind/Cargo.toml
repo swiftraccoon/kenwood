@@ -1,11 +1,16 @@
 [package]
 name = "dmr-rewind"
 version = "0.1.0"
+authors = ["swiftraccoon"]
+categories = ["network-programming"]
 edition = "2024"
-rust-version = "1.94"
-description = "Receive-only Tokio client for BrandMeister's REWIND Open DMR Terminal"
+keywords = ["dmr", "brandmeister", "ham-radio", "udp"]
 license = "GPL-2.0-or-later"
 publish = false
+readme = "README.md"
+repository = "https://github.com/swiftraccoon/kenwood"
+rust-version = "1.94"
+description = "Receive-only Tokio client for BrandMeister's REWIND Open DMR Terminal"
 
 [dependencies]
 dmr-rewind-core = { path = "../dmr-rewind-core" }
@@ -13,12 +18,8 @@ thiserror = "2"
 tokio = { version = "1", features = ["net", "time"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = [
-  "macros",
-  "net",
-  "rt-multi-thread",
-  "time",
-] }
+socket2 = "0.6"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "test-util", "time"] }
 
 [lints]
 workspace = true
