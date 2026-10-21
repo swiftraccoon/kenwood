@@ -111,11 +111,10 @@ pub(crate) fn header(app: &mut App, ui: &mut egui::Ui) {
                 .text_style(egui::TextStyle::Small)
                 .color(crate::theme::TEXT_SECONDARY),
         );
-        // Third on-air indicator (with the hero and the TX strip
-        // button): a PTT state change must be visible everywhere.
+        // Mirror outgoing-audio state beside connection status.
         if app.active_tx {
             ui.label(
-                egui::RichText::new("● ON AIR")
+                egui::RichText::new("● TX ACTIVE")
                     .text_style(egui::TextStyle::Small)
                     .color(crate::theme::TX),
             );

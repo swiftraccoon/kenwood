@@ -83,8 +83,12 @@ fn row(
     if let Some(msg) = &station.last_message {
         detail.push(format!("“{msg}”"));
     }
-    if let Some((lat, lon)) = station.last_gps {
-        detail.push(format!("⌖ {lat:.4}° {lon:.4}°"));
+    if let Some(position) = station.last_gps {
+        detail.push(format!(
+            "⌖ {:.4}° {:.4}°",
+            position.latitude(),
+            position.longitude()
+        ));
     }
     detail.push(format!("{}×", station.stream_count));
     ui.label(

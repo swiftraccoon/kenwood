@@ -1,153 +1,157 @@
 # sextant
 
-Desktop GUI client for D-STAR reflectors (`DExtra` / `DPlus` / `DCS`).
-Companion to the POLARIS test reflector, exercising the full
-laptop-only `dstar-gateway` + `mbelib-rs` encode/decode pipeline with
-no radio in the loop.
+Desktop GUI client for D-STAR reflectors using DExtra, DPlus or DCS over UDP.
+It decodes received AMBE voice and encodes microphone or WAV input. Connection,
+meter and TX indicators describe the application's UDP and audio state; RF
+transmission or reception requires independent observation.
 
-**WIP: protocol details and audio quality still churn. Fine for
-listening; treat transmit as experimental.**
-
-![Sextant operator page: hero callsign readout, heard-station list, and transmit strip](operator.png)
-
-## Features
-
-- Connect to DExtra / DPlus / DCS reflectors: searchable directory
-  (bundled entries + DPlus auth host list), favorites, recent-connection
-  shortcuts, auto-reconnect with backoff.
-- Receive voice: AMBE decode with packet-loss concealment, playback
-  priming against network jitter, click-free stream boundaries, and
-  per-stream loss statistics.
-- Transmit voice: PTT button or spacebar, mic level metering, TX
-  silence test, transmit-from-WAV.
-- Slow data both ways: text messages and GPS (DPRS / NMEA) decoded
-  and displayed; operator text + GPS beacon on transmit.
-- Heard-station list (optionally persisted), event log, link-health
-  readout (reflector last-heard age).
-- Audio device selection, RX recording to WAV, local WAV playback.
-- Windowed-sinc resampling between the hardware rate and the 8 kHz
-  codec rate (anti-aliasing built in).
-
-On the first launch after upgrading from a version that used the plaintext
-XLX registry, Sextant resets the saved reflector target plus host-bearing
-favorites and recents. Those older settings did not record whether an address
-was entered manually or copied from the registry; unrelated settings are kept,
-and newly entered manual targets persist normally.
-
-## UI
-
-One window, two pages, toggled in the header:
-
-- **Operator**: the everyday face. A hero display shows who is
-  talking right now (callsign, slow-data text, GPS, elapsed time,
-  loss), with the heard list beside it and a transmit strip along the
-  bottom (TRANSMIT toggle, mic meter, slow-data message, GPS beacon).
-  Clicking the reflector name in the header opens the connect sheet:
-  a searchable directory with favorites and recents first, and a
-  collapsed manual host form for unlisted reflectors.
-- **Debug**: the engineering surface. Timestamped, filterable event
-  log with copy-to-clipboard, live stream statistics, TX test tools
-  (silence, WAV), and audio device controls.
-
-![Sextant debug page: filterable event log, stream statistics, and TX tools](debug.png)
-
-The gear opens settings: operator callsign, auto-reconnect, heard
-persistence, audio devices. Errors appear as a dismissable strip
-under the header on both pages. Color is used as signal only: amber
-means live RF, red means you are transmitting, green means the link
-is healthy. The dark instrument theme embeds the Inter and JetBrains
-Mono fonts (both SIL OFL; license texts in `assets/`).
-
-## Usage
+## Operation
 
 ```text
 cargo run -p sextant
 ```
 
-### macOS: microphone permission
+The Operator page contains the received callsign, slow-data text, position,
+elapsed time, received-frame counters and heard-station list. The Debug page
+contains the event log, audio controls, WAV controls and a two-second silence
+transmission. Settings contains operator identity, reconnect behavior, optional
+heard-history persistence, audio-device selection and RX enhancement.
 
-Unbundled CLI binaries (like `cargo run`) don't get their own mic
-permission prompt; they inherit from the Terminal that launched
-them.  If mic capture goes silent, stop transmitting and look for the
-`TX mic-level summary:` line in the logs; a `MIC LIKELY DENIED`
-diagnosis on that line means macOS has denied access.
+1. Set your operator callsign in Settings. Routing identities contain one through
+   seven printable ASCII bytes. Form input is trimmed and ASCII letters are
+   uppercased; saved reflector identities cannot contain `|`.
+2. Open the reflector directory and choose a target, or enter its host, nonzero
+   UDP port, protocol, callsign and modules manually. DNS names, IPv4 literals
+   and IPv6 literals are accepted; IPv6 may be bracketed. DCS targets require
+   an uppercase `DCS` prefix.
+3. Click TRANSMIT or hold Space to send microphone audio. Release Space or click
+   TX ACTIVE to stop. Space is suppressed while an editable field has focus;
+   releasing it still stops a transmission started before focus changed.
+4. Use Disconnect to cancel connection setup or retire an established session.
 
-**Fastest fix** is to grant your terminal permission once:
+The default target is the bundled local POLARIS entry. To exercise a local
+reflector, start `cargo run -p dstar-gateway-server --bin polaris` in another
+terminal. Receiving your outgoing audio requires a second client on the same
+reflector module.
 
-1. System Settings > Privacy & Security > Microphone
-2. Enable the toggle for Terminal / iTerm / whichever shell you use
-3. Restart the terminal, rerun `cargo run -p sextant`
+Amber indicates received activity or navigation accents; red indicates active
+outgoing audio; green indicates connection state or audio level. TX ACTIVE is
+updated by the worker after its start request enters the session queue. Header,
+voice and EOT send failures appear in the error strip and event log.
 
-**Cleaner fix** is to run sextant as a proper `.app` bundle with its own
-Info.plist declaring `NSMicrophoneUsageDescription`:
+## Directory and connection setup
+
+Directory sources are the bundled POLARIS target and the DPlus authentication
+server's host list. DPlus-directory rows take precedence when a
+callsign/protocol pair appears in both sources. Manual targets, favorites and
+recents use checked addresses, ports, routing identities and modules. A recent
+target is the submitted connection snapshot, even if its editable form changes
+while connecting. At most 128 favorites and eight recents are retained.
+
+A connection has one ten-second total budget for DNS resolution, optional DPlus
+authentication and UDP handshake. DNS selects the first resolved address; the
+local UDP socket uses that address's IP family. DPlus authentication failure
+falls back to an empty host list before attempting the UDP link. A rejected link
+is reported independently of that authentication result.
+
+Only one directory fetch is retained at a time. Disconnect cancels it and any
+pending connect or silence operation. Optional reconnect uses delays of zero,
+three, ten and then twenty seconds; explicit Disconnect clears that schedule.
+
+On the first load of settings from before the trusted-source address migration,
+Sextant resets the current reflector target, favorites and recents. Unrelated
+form settings remain. The persisted epoch marker preserves subsequent manually
+entered targets; plaintext XLX registry caches are never loaded.
+
+## Audio and files
+
+Device input and output run on one dedicated thread. Named selections require
+the named device; unavailable names are reported rather than substituted. The
+supported device configuration is one through eight channels at 8 through
+192 kHz using `f32`, signed 16-bit or unsigned 16-bit samples. RX enhancement
+defaults to raw decoder output and can be toggled during a stream.
+
+Local playback and file transmission accept 16-bit integer PCM WAV files,
+one through eight channels, at 8 through 192 kHz, no larger than 64 MiB or five
+minutes. Channels are averaged to mono. Files decode incrementally through a
+bounded sinc-resampling buffer; malformed headers, unsupported formats and
+sample errors are reported. File transmission emits at most one 160-sample
+codec frame every 20 ms and resumes after a stall without a catch-up burst. Its
+short final frame is zero-padded, then two zero-input frames release the
+encoder's 40 ms lookahead before EOT.
+
+The Debug page shows remaining file audio and separate Stop playback and Stop
+transmission controls. Stopping local playback cancels decoding; samples already
+in the one-second speaker ring drain as the device consumes them. Recording
+captures received 8 kHz mono PCM in exclusively created WAV files under the
+application configuration directory's `recordings` subdirectory. Stop recording
+and application exit explicitly finalize and sync the recording; write,
+finalization and sync failures remain visible.
+
+Microphone and speaker rings each retain one second of samples at their device
+rate. Overflow reports the rejected sample count. The ordinary audio queue
+retains 256 operations and the session queue retains 32. A rejected operation is
+reported; a retained EOT is retried before another outgoing stream can start.
+Stop, playback-stop, recording-stop, Disconnect and shutdown have independent
+control storage, so ordinary queue capacity cannot discard them.
+
+### macOS microphone authorization
+
+Create a bundle from the selected build profile:
 
 ```text
-./sextant/macos-bundle.sh         # or --release
+cargo run -p sextant -- --bundle
+# For an optimized executable:
+cargo run --release -p sextant -- --bundle
 open target/Sextant.app
 ```
 
-On first launch macOS will prompt specifically for Sextant (not
-Terminal).  You can revoke/grant later under Privacy & Security.
+An optional path after `--bundle` selects another destination. The Rust command
+copies the running executable and writes `Contents/Info.plist`, including
+`NSMicrophoneUsageDescription`. Each file is synced and replaced individually;
+success confirms both files. The command neither signs the enclosing bundle nor
+grants microphone authorization.
 
-### End-to-end test against POLARIS
+Check System Settings > Privacy & Security > Microphone for the application's
+authorization. Silent or low-level input also warrants checking the selected
+device, mute and gain. See Apple's [media authorization documentation](https://developer.apple.com/documentation/bundleresources/requesting-authorization-for-media-capture-on-macos)
+and [microphone privacy settings](https://support.apple.com/en-us/102071).
 
-Two terminals, server then client:
+## Slow data and persistence
 
-```text
-# Terminal 1: start the local reflector
-cargo run -p dstar-gateway-server --bin polaris
+Outgoing text contains at most 20 printable ASCII bytes. Manual beacons use
+checked coordinates, a primary-table APRS symbol and a printable ASCII comment
+of at most 43 bytes. Both the D-STAR header and DPRS source use the identity
+captured by the established connection.
 
-# Terminal 2: launch the GUI
-cargo run -p sextant
-```
+Received GPS assembly retains at most 256 bytes including its terminator and
+requires adjacent slow-data fragment pairs. Invalid lengths, byte values,
+sequence gaps, oversized sentences and parse failures produce diagnostics.
+DPRS verifies its CRC. The NMEA receive policy accepts checksumless sentences;
+when a checksum is present it must match exactly. RMC requires active status;
+GGA requires positive fix quality. Geographic fields require valid minute
+values, matching hemispheres and checked latitude/longitude ranges.
 
-In the GUI:
+Settings and heard history each have a 1 MiB encoded read/write limit. Settings
+preserves partial editable strings with lossless quote, backslash and control
+escaping. Saved targets are validated on restoration; invalid or duplicate rows
+are skipped with a log diagnostic. History retains at most 100 stations, UTC
+timestamps and checked restored positions. Its tab-separated message field
+replaces tabs and line breaks with spaces.
 
-1. Open the gear (top right) and set **Callsign** to your own
-   (≤ 8 ASCII chars, uppercase).
-2. Click the reflector name in the header (or **Open directory** on
-   the not-linked screen) and pick **POLARIS**; it's bundled, no
-   fetch needed. Clicking a row connects immediately.
-3. Click **TRANSMIT** (or hold **Space**) to start transmitting
-   (mic audio → AMBE → reflector). Click again / release to stop
-   (EOT is sent).
-4. Any other client on the same module hears your audio; anyone
-   transmitting on your module plays through your speakers and
-   lights up the hero display.
+Saving writes an exclusive temporary file, syncs it and renames it over the
+snapshot. Unix success also syncs its containing directory; other platforms
+report file sync plus rename. A directory-sync failure is reported after the
+replacement has occurred. Errors appear in the GUI and logs.
 
-A second client is needed to hear yourself: `thd75-repl` can link
-to `POLARIS` identically, or run a second `sextant` instance.
-
-## Architecture
-
-```text
-GUI thread (egui)           tokio runtime               std thread (cpal)
-─────────────────           ─────────────               ─────────────────
-App::update()               session::run()              audio::run_audio_worker()
-  ├─ draws UI                 ├─ AsyncSession<P>          ├─ cpal input stream
-  ├─ sends SessionCommand     ├─ forwards events ◄─────── │   (fills mic ringbuf)
-  │   (Connect/Disconnect/    │                            ├─ cpal output stream
-  │    StartTx/TxFrame/EndTx) │                            │   (drains speaker ringbuf)
-  │   ───────────────────►    ├─ sends voice frames        ├─ AmbeEncoder (TX path)
-  ├─ sends AudioCommand ───►  └─ receives voice frames ─►  ├─ AmbeDecoder (RX path)
-  │   (StartTx/StopTx/                                      └─ sinc resampler
-  │    RxFrame/RxLost/RxEnd)
-  └─ drains SessionEvent
-```
-
-- Sessions are tokio tasks (the `dstar-gateway` shell). They talk
-  UDP to the reflector, decode the core's `VoiceStart` / `VoiceFrame` /
-  `VoiceEnd` events, and forward `SessionEvent`s to the GUI while
-  pushing `AudioCommand::Rx*` to the audio thread.
-- Audio I/O lives on its own `std::thread` because `cpal::Stream` is
-  `!Send` on some platforms. The thread owns both streams, two
-  ring buffers (mic → worker, worker → speakers), and the codec
-  instances.
-- `let _unused = ` on GUI channel sends is intentional: if the
-  session task has gone away (shutdown), dropping the send is the
-  right thing to do.
+GUI observations are bounded and current status is coalesced. Excess events or
+audio diagnostics produce a loss count. On window exit, `main` requests session
+shutdown, joins the audio worker after recording finalization, then observes the
+session task's completion before destroying the runtime. Device-backend calls
+and filesystem sync can delay that explicit cleanup.
 
 ## License
 
-GPL-2.0-or-later (base) / GPL-3.0-or-later (through `mbelib-rs`'s
-encoder feature). See `LICENSE` at the workspace root.
+`GPL-2.0-or-later OR GPL-3.0-or-later`; see the workspace `LICENSE`. Embedded font
+licenses are [Inter](assets/LICENSE-Inter.txt) and
+[JetBrains Mono](assets/OFL-JetBrainsMono.txt).

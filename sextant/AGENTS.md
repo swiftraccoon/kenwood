@@ -10,7 +10,10 @@ Desktop egui D-STAR reflector client. No radio hardware.
 
 - The audio worker runs on a dedicated `std::thread` so the tokio runtime never owns a `cpal::Stream`, which is `!Send` on some platforms.
 - Resampling is `rubato`'s windowed sinc, which bandlimits as it resamples: there is no separate anti-alias filter to add.
-- ALL colors come from `theme.rs` consts; never inline `Color32::from_rgb` in a panel. Color discipline: `LIVE` amber for live RF only, `TX` red for on-air only, `OK` green for link health and meters only.
+- All colors come from `theme.rs` constants; never inline `Color32::from_rgb` in a panel. `LIVE` amber marks received activity and navigation accents, `TX` red marks active outgoing audio, and `OK` green marks connection state and meters. UI state describes the local UDP/audio path; it cannot establish RF transmission.
+- Stop, recording-stop, playback-stop and session termination use their independent control registers. Never route terminal requests through a bounded ordinary-command queue.
+- Keep unique worker/task completion handles in `main`; join cleanup after the GUI exits and before destroying the runtime. Backend device operations and file sync have no portable cancellation deadline.
+- WAV playback accepts only bounded 16-bit integer PCM with validated channel/rate geometry. Preserve sample errors, 20 ms file cadence and counted ring/diagnostic overflow.
 - At most one `Overlay` is open at a time; model overlay visibility as that enum, never as per-overlay bools (`struct_excessive_bools` counts every bool in `App`).
 - Heard history uses UTC wall-clock timestamps, not `Instant`, so the persisted file survives restarts. The debug event log stamps in the operator's `TimeMode`, which defaults to Local.
 - Connect handshakes and TX stream-ID generation delegate to `dstar_gateway::tokio_shell` (`drive_connecting`, `fresh_stream_id`); do not hand-roll either.
@@ -25,7 +28,7 @@ Desktop egui D-STAR reflector client. No radio hardware.
 - Do not fetch the XLX self-registration registry: its server exposes only unauthenticated plaintext HTTP, and its generated addresses must not be trusted for connections. `hosts.rs` never reads `reflectors.tsv`, the operator-local cache of those rows; that file is untracked and is not expected in the tree.
 - Pre-hardening settings may contain addresses copied from that cache. `reflector_address_epoch` gates a one-time migration that resets the current target and clears host-bearing favorites and recents while preserving unrelated settings. Do not remove or bypass that marker.
 - Directory sources are the bundled POLARIS entry and the DPlus auth `HostList`, plus manual host entry. DPlus auth entries have dedup precedence and the picker shows per-row provenance.
-- `hosts.rs` is hand-rolled and deliberately does not use `dstar_gateway_core::hosts::HostFile`, which lodestar-core uses. The two solve different problems: core `HostFile` parses and merges Pi-Star-style host FILES, while sextant has no file sources at all, only provenance-per-row runtime state plus the hardening epoch migration. Forcing `HostFile` underneath would add a conversion layer without deleting any policy code. New FILE-based host work still starts in core.
+- `hosts.rs` merges provenance-tagged runtime directory rows; it has no host-file sources. File-based host ingestion belongs in core `HostFile`. A single directory future stays in the session loop and is cancelled with that session's terminal request.
 
 ## License
 

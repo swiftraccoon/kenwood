@@ -4,9 +4,8 @@
 //! Instrument design system: colour tokens, typography, and the app
 //! `Style`.
 //!
-//! Palette discipline: [`LIVE`] amber marks live RF activity only,
-//! [`TX`] red marks "you are radiating" only, [`OK`] green marks link
-//! health and audio meters only. No token is reused outside its role.
+//! [`LIVE`] amber marks received activity and navigation accents, [`TX`] red
+//! marks active outgoing audio, and [`OK`] green marks connection state and meters.
 
 use eframe::egui::{
     self, Color32, FontData, FontDefinitions, FontFamily, FontId, Margin, Rounding, Stroke,
@@ -31,11 +30,11 @@ pub(crate) const TEXT_PRIMARY: Color32 = Color32::from_rgb(0xE8, 0xE8, 0xEA);
 pub(crate) const TEXT_SECONDARY: Color32 = Color32::from_rgb(0x9A, 0x9B, 0xA3);
 /// Hints and timestamps.
 pub(crate) const TEXT_TERTIARY: Color32 = Color32::from_rgb(0x63, 0x66, 0x6E);
-/// Live-RF amber: active RX callsign, page-toggle accent, favorites.
+/// Received-activity amber: RX callsign, page-toggle accent and favorites.
 pub(crate) const LIVE: Color32 = Color32::from_rgb(0xFF, 0xB3, 0x40);
 /// Healthy-link green: status dot, mic/RX meters.
 pub(crate) const OK: Color32 = Color32::from_rgb(0x34, 0xC7, 0x59);
-/// On-air red: active TRANSMIT fill and hero tint only.
+/// Outgoing-audio red: active TRANSMIT fill and hero tint.
 pub(crate) const TX: Color32 = Color32::from_rgb(0xFF, 0x45, 0x3A);
 /// Error red: log errors and the error strip.
 pub(crate) const ERR: Color32 = Color32::from_rgb(0xFF, 0x5F, 0x57);

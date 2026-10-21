@@ -131,7 +131,9 @@ fn saved_row(app: &mut App, ui: &mut egui::Ui, saved: &crate::settings::SavedHos
         }
         let label = format!(
             "{}  ·  {}  ·  {}",
-            saved.callsign, saved.protocol, saved.host
+            saved.callsign(),
+            saved.protocol_name(),
+            saved.host()
         );
         if ui.selectable_label(false, label).clicked() {
             app.apply_saved_host(saved);

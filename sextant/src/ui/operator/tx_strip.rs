@@ -36,11 +36,11 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
     beacon_popup(app, ui);
 }
 
-/// The primary TRANSMIT toggle: red fill while on air.
+/// The primary TRANSMIT toggle: red fill while outgoing audio is active.
 fn transmit_button(app: &mut App, ui: &mut egui::Ui) {
     let connected = matches!(app.status, ConnStatus::Connected { .. });
     let (label, fill) = if app.active_tx {
-        ("ON AIR", theme::TX)
+        ("TX ACTIVE", theme::TX)
     } else {
         ("TRANSMIT", theme::BG_CONTROL)
     };

@@ -94,7 +94,7 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
             }
         });
     if save {
-        app.snapshot_settings().save();
+        app.persist_settings();
     }
     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         app.overlay = Overlay::None;

@@ -3,7 +3,7 @@
 
 //! Hero display: the deck's main instrument. One of four states:
 //! not-linked invitation, dimmed listening, amber receiving, red
-//! on-air.
+//! outgoing audio.
 
 use eframe::egui;
 
@@ -13,8 +13,7 @@ use crate::theme;
 use crate::ui::Overlay;
 use crate::ui::format::elapsed_mmss;
 
-/// Which face the hero shows. Precedence: on-air beats receiving
-/// (if you key up over a stream, YOUR state is what matters).
+/// Local outgoing audio takes display precedence over an incoming stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HeroState {
     /// No session: invite the operator to pick a reflector.
@@ -23,8 +22,8 @@ pub(crate) enum HeroState {
     Listening,
     /// An RX voice stream is playing.
     Receiving,
-    /// The local station is transmitting.
-    OnAir,
+    /// Local microphone capture or outgoing file audio is active.
+    Transmitting,
 }
 
 /// Derive the hero state from session flags.
@@ -32,7 +31,7 @@ pub(crate) const fn derive_state(connected: bool, active_tx: bool, rx_active: bo
     if !connected {
         HeroState::NotLinked
     } else if active_tx {
-        HeroState::OnAir
+        HeroState::Transmitting
     } else if rx_active {
         HeroState::Receiving
     } else {
@@ -50,7 +49,7 @@ pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
             HeroState::NotLinked => not_linked(app, ui),
             HeroState::Listening => listening(app, ui),
             HeroState::Receiving => receiving(app, ui),
-            HeroState::OnAir => on_air(app, ui),
+            HeroState::Transmitting => transmitting(app, ui),
         }
     });
 }
@@ -77,7 +76,7 @@ fn not_linked(app: &mut App, ui: &mut egui::Ui) {
         ui.add_space(8.0);
         ui.horizontal_wrapped(|ui| {
             for saved in app.favorites.clone().iter().take(4) {
-                let chip = format!("★ {} {}", saved.callsign, saved.module);
+                let chip = format!("★ {} {}", saved.callsign(), saved.module().as_char());
                 if ui
                     .button(egui::RichText::new(chip).color(theme::LIVE))
                     .clicked()
@@ -167,7 +166,7 @@ fn receiving(app: &App, ui: &mut egui::Ui) {
             .color(theme::TEXT_TERTIARY),
         );
     }
-    // Live decoded-audio level: confidence the stream is audible.
+    // Decoded sample peak before device playback.
     ui.add_space(4.0);
     ui.scope(|ui| {
         ui.set_max_width(200.0);
@@ -203,14 +202,15 @@ fn route_line(app: &App, ui: &mut egui::Ui) {
 /// Speaker position, with distance + bearing from the operator's own
 /// beacon coordinates when those are set.
 fn position_line(app: &App, ui: &mut egui::Ui) {
-    let Some((lat, lon)) = app.last_gps else {
+    let Some(position) = app.last_gps else {
         return;
     };
+    let (lat, lon) = (position.latitude(), position.longitude());
     let mut line = format!("⌖ {lat:.4}°  {lon:.4}°");
     if let Some(me) = app.parse_tx_gps() {
-        let from = (me.latitude, me.longitude);
-        let km = crate::geo::haversine_km(from, (lat, lon));
-        let bearing = crate::geo::initial_bearing_deg(from, (lat, lon));
+        let from = me.position();
+        let km = crate::geo::haversine_km(from, position);
+        let bearing = crate::geo::initial_bearing_deg(from, position);
         let _w =
             std::fmt::Write::write_fmt(&mut line, format_args!("  ·  {km:.0} km @ {bearing:.0}°"));
     }
@@ -222,9 +222,9 @@ fn position_line(app: &App, ui: &mut egui::Ui) {
 }
 
 /// Transmitting: the local callsign in primary on a red-tinted panel.
-fn on_air(app: &App, ui: &mut egui::Ui) {
+fn transmitting(app: &App, ui: &mut egui::Ui) {
     ui.label(
-        egui::RichText::new("● ON AIR")
+        egui::RichText::new("● TX ACTIVE")
             .text_style(egui::TextStyle::Small)
             .color(theme::TX),
     );
@@ -252,8 +252,8 @@ mod tests {
         assert_eq!(derive_state(false, true, true), HeroState::NotLinked);
         assert_eq!(derive_state(true, false, false), HeroState::Listening);
         assert_eq!(derive_state(true, false, true), HeroState::Receiving);
-        assert_eq!(derive_state(true, true, false), HeroState::OnAir);
+        assert_eq!(derive_state(true, true, false), HeroState::Transmitting);
         // On-air beats receiving.
-        assert_eq!(derive_state(true, true, true), HeroState::OnAir);
+        assert_eq!(derive_state(true, true, true), HeroState::Transmitting);
     }
 }

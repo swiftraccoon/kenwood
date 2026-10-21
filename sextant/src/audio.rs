@@ -26,18 +26,19 @@
 //! playback paths are all driven from here.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc as std_mpsc;
-use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cpal::SampleFormat;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use dstar_gateway_core::dprs::{DprsReport, Latitude, Longitude, encode_dprs};
-use dstar_gateway_core::slowdata::{SlowDataTextMessage, encode_text_message, scramble};
-use dstar_gateway_core::types::Callsign;
+use dstar_gateway_core::dprs::DprsSource;
+use dstar_gateway_core::slowdata::{SlowDataTextMessage, scramble};
+use dstar_gateway_core::types::{FrameSequence, RoutingCallsign};
 use dstar_gateway_core::voice::{DSTAR_NULL_SLOW_DATA_BYTES, DSTAR_SYNC_BYTES, VoiceFrame};
 use mbelib_rs::enhance_live::{LiveWaveEnhancer, LiveWaveStream};
-use mbelib_rs::{AmbeDecoder, AmbeEncoder};
+use mbelib_rs::{AmbeDecoder, AmbeEncoder, PcmError, PcmFrame, PcmSamples};
 use ringbuf::HeapRb;
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use rubato::{
@@ -46,8 +47,17 @@ use rubato::{
 use tokio::sync::mpsc as tokio_mpsc;
 use tracing::{error, info, warn};
 
+use crate::audio::control::AudioControl;
+pub(crate) use crate::audio::control::{AudioMailbox, AudioWorkerOwner};
+use crate::audio::error::{AudioError, DeviceError, Direction};
+pub(crate) use crate::audio::wav::FileProgress;
+use crate::audio::wav::WavStream;
 use crate::geo::TxPosition;
 use crate::session::SessionCommand;
+
+mod control;
+mod error;
+mod wav;
 
 /// AMBE native sample rate.
 const AMBE_SAMPLE_RATE: u32 = 8000;
@@ -82,8 +92,17 @@ const RX_FADE_SAMPLES: usize = 80;
 /// audio to arrive in bursts that underflow the speaker ring buffer.
 #[derive(Debug, Clone)]
 pub(crate) struct AudioHandle {
-    cmd_tx: std_mpsc::Sender<AudioCommand>,
-    _worker: std::sync::Arc<JoinHandle<()>>,
+    cmd_tx: std_mpsc::SyncSender<QueuedAudioCommand>,
+    control: Arc<AudioControl>,
+    status: AudioMailbox,
+}
+
+#[derive(Debug)]
+struct QueuedAudioCommand {
+    generation: u64,
+    recording_generation: u64,
+    playback_generation: u64,
+    command: AudioCommand,
 }
 
 /// Commands emitted by the GUI and consumed by the audio worker.
@@ -92,10 +111,7 @@ pub(crate) enum AudioCommand {
     /// Begin mic capture; the worker also wires a `StartTx` through the
     /// session command channel so the session task emits the header
     /// before the first voice frame arrives.
-    StartTx {
-        /// Callsign to embed in `my_call`.
-        my_call: String,
-    },
+    StartTx,
     /// Stop mic capture and tell the session task to emit EOT.
     StopTx,
     /// A new RX voice stream is starting. The audio worker resets the
@@ -147,6 +163,8 @@ pub(crate) enum AudioCommand {
         /// Path to a WAV file.
         path: std::path::PathBuf,
     },
+    /// Cancel local file decoding; already buffered speaker samples drain.
+    StopPlayback,
     /// Transmit a WAV file as an outgoing voice stream.
     TransmitFile {
         /// Path to a WAV file.
@@ -156,7 +174,7 @@ pub(crate) enum AudioCommand {
 
 /// Status pushed from the audio worker to the GUI. Drained every
 /// frame by `App::drain_audio_status`.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) enum AudioStatus {
     /// Enumerated device names (input list, output list).
     DeviceList {
@@ -174,6 +192,14 @@ pub(crate) enum AudioStatus {
     },
     /// Recording started (`true`) or stopped (`false`).
     Recording(bool),
+    /// Outgoing audio capture or file transmission is active.
+    Transmitting(bool),
+    /// Current local file decoding progress, or its completion/cancellation.
+    Playback(Option<FileProgress>),
+    /// Current outgoing file decoding progress, or its completion/cancellation.
+    FileTx(Option<FileProgress>),
+    /// An operation failed; its original cause remains inspectable.
+    Error(AudioError),
 }
 
 /// Direction of a raised-cosine amplitude ramp.
@@ -216,7 +242,7 @@ fn apply_fade(pcm: &mut [i16; AMBE_FRAME_SAMPLES], direction: FadeDirection) {
 /// The most recent decoded frame waits here and is released only
 /// when its successor arrives, so end-of-stream can fade the final
 /// frame's tail before it reaches the speaker. Costs one frame
-/// (20 ms) of RX latency, inaudible for reflector listening.
+/// (20 ms) of RX latency.
 #[derive(Debug, Default)]
 struct RxPlayback {
     /// Held-back most recent frame (8 kHz, pre-resample).
@@ -309,14 +335,14 @@ fn rx_sample_to_i16(v: f32) -> i16 {
 trait EnhanceStream {
     /// Feed unit-scale samples; returns every enhanced sample that
     /// has become final, in order.
-    fn push_samples(&mut self, samples: &[f32]) -> Vec<f32>;
+    fn push_samples(&mut self, samples: PcmSamples<'_>) -> Vec<f32>;
     /// End of stream: drain the residual lookahead so total output
     /// length equals total input length.
     fn finish(&mut self) -> Vec<f32>;
 }
 
 impl EnhanceStream for LiveWaveStream {
-    fn push_samples(&mut self, samples: &[f32]) -> Vec<f32> {
+    fn push_samples(&mut self, samples: PcmSamples<'_>) -> Vec<f32> {
         self.push_samples_f32(samples)
     }
 
@@ -441,11 +467,8 @@ impl<S: EnhanceStream> RxTailRouter<S> {
     fn push_frame(&mut self, pcm: &[i16; AMBE_FRAME_SAMPLES]) {
         self.raw.extend(pcm.iter().copied());
         if let Some(stream) = self.stream.as_mut() {
-            let mut f32_frame = [0.0_f32; AMBE_FRAME_SAMPLES];
-            for (slot, &s) in f32_frame.iter_mut().zip(pcm.iter()) {
-                *slot = rx_sample_to_f32(s);
-            }
-            let ready = stream.push_samples(&f32_frame);
+            let frame = PcmFrame::from(*pcm);
+            let ready = stream.push_samples(frame.as_pcm_samples());
             self.append_enhanced(&ready);
         }
     }
@@ -470,16 +493,18 @@ impl<S: EnhanceStream> RxTailRouter<S> {
     /// one (the raw path drains its tail every arrival), the switch
     /// completes after the one-frame grace plus a short hold that
     /// the playout reserve covers.
-    fn enhance_on(&mut self, mut stream: S) {
+    fn enhance_on(&mut self, mut stream: S) -> Result<(), PcmError> {
+        let backlog: Vec<f32> = self.raw.iter().map(|&s| rx_sample_to_f32(s)).collect();
+        let checked = PcmSamples::new(&backlog)?;
         self.enhanced.clear();
         self.enhanced_debt = 0;
         self.xfade_prev = None;
-        let backlog: Vec<f32> = self.raw.iter().map(|&s| rx_sample_to_f32(s)).collect();
-        let ready = stream.push_samples(&backlog);
+        let ready = stream.push_samples(checked);
         self.stream = Some(stream);
         self.enhance_selected = true;
         self.append_enhanced(&ready);
         self.grace_available = self.served_any;
+        Ok(())
     }
 
     /// Toggle OFF mid-stream: switch the selection back to the
@@ -592,16 +617,23 @@ struct TxSlowData {
 impl TxSlowData {
     /// Rebuild the fragment sequence from the operator's current text
     /// and position. `my_call` names the DPRS sentence's station.
-    fn set(&mut self, text: Option<SlowDataTextMessage>, gps: Option<&TxPosition>, my_call: &str) {
+    fn set(
+        &mut self,
+        text: Option<SlowDataTextMessage>,
+        gps: Option<&TxPosition>,
+        my_call: &str,
+    ) -> Result<(), dstar_gateway_core::dprs::DprsError> {
+        self.fragments.clear();
+        self.cursor = 0;
         let mut fragments = Vec::new();
         if let Some(message) = text {
-            fragments.extend(encode_text_message(message));
+            fragments.extend(message.encode());
         }
-        if let Some(pos) = gps.and_then(TxPosition::validated) {
-            fragments.extend(encode_gps_fragments(pos, my_call));
+        if let Some(pos) = gps {
+            fragments.extend(encode_gps_fragments(pos, my_call)?);
         }
         self.fragments = fragments;
-        self.cursor = 0;
+        Ok(())
     }
 
     /// Next fragment for a non-sync frame, or `None` when nothing is
@@ -614,41 +646,19 @@ impl TxSlowData {
 }
 
 /// Fragment a DPRS sentence for `pos` into scrambled `0x3X` slow-data
-/// blocks (Kenwood layout: type byte + 5 payload bytes per 6-byte
-/// block, two 3-byte halves). Returns an empty vec if the position or
-/// callsign can't be encoded: lenient, never panics.
-fn encode_gps_fragments(pos: &TxPosition, my_call: &str) -> Vec<[u8; 3]> {
-    let Ok(callsign) = Callsign::try_from_str(my_call) else {
-        return Vec::new();
-    };
-    let (Ok(latitude), Ok(longitude)) = (
-        Latitude::try_new(pos.latitude),
-        Longitude::try_new(pos.longitude),
-    ) else {
-        return Vec::new();
-    };
-    let report = DprsReport {
-        callsign,
-        latitude,
-        longitude,
-        symbol: pos.symbol,
-        comment: if pos.comment.is_empty() {
-            None
-        } else {
-            Some(pos.comment.clone())
-        },
-    };
-    let mut sentence = String::new();
-    if encode_dprs(&report, &mut sentence).is_err() {
-        return Vec::new();
-    }
-    // DPRS sentences terminate with CR; the RX assembler scans for it.
-    sentence.push('\r');
+/// blocks: type byte + 1..=5 payload bytes per 6-byte block, sent
+/// as two 3-byte halves. Returns a checked source-identity failure.
+fn encode_gps_fragments(
+    pos: &TxPosition,
+    my_call: &str,
+) -> Result<Vec<[u8; 3]>, dstar_gateway_core::dprs::DprsError> {
+    let source = DprsSource::new(my_call.trim())?;
+    let sentence = pos.report(source).to_sentence();
 
     let mut out = Vec::new();
     for chunk in sentence.as_bytes().chunks(5) {
         let mut block = [0u8; 6];
-        block[0] = 0x30; // GPS NMEA-passthrough type nibble.
+        block[0] = 0x30 | u8::try_from(chunk.len()).unwrap_or(5);
         for (slot, &b) in block.iter_mut().skip(1).zip(chunk) {
             *slot = b;
         }
@@ -658,10 +668,37 @@ fn encode_gps_fragments(pos: &TxPosition, my_call: &str) -> Vec<[u8; 3]> {
             out.push(scramble(frag));
         }
     }
-    out
+    Ok(out)
 }
 
 impl AudioHandle {
+    #[cfg(test)]
+    pub(crate) fn test_handle() -> (Self, AudioMailbox) {
+        let (cmd_tx, _receiver) = std_mpsc::sync_channel(1);
+        let status = AudioMailbox::default();
+        (
+            Self {
+                cmd_tx,
+                control: Arc::new(AudioControl::default()),
+                status: status.clone(),
+            },
+            status,
+        )
+    }
+
+    /// Retire transmission directly when its session closes, independent of GUI.
+    pub(crate) fn set_connected(&self, identity: Option<RoutingCallsign>) {
+        *self
+            .control
+            .identity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = identity;
+        if identity.is_none() {
+            self.control.stop();
+            self.status.send(AudioStatus::Transmitting(false));
+        }
+    }
+
     /// Spawn the audio worker thread.
     ///
     /// `session_tx` is used to push `StartTx` / `TxFrame` / `EndTx`
@@ -675,37 +712,78 @@ impl AudioHandle {
     /// caller (`main`) treats this as fatal.
     pub(crate) fn start(
         session_tx: tokio_mpsc::Sender<SessionCommand>,
-    ) -> Result<(Self, std_mpsc::Receiver<AudioStatus>), std::io::Error> {
-        let (cmd_tx, cmd_rx) = std_mpsc::channel();
-        let (status_tx, status_rx) = std_mpsc::channel();
+    ) -> Result<(Self, AudioMailbox, AudioWorkerOwner), std::io::Error> {
+        let (cmd_tx, cmd_rx) = std_mpsc::sync_channel(256);
+        let status = AudioMailbox::default();
+        let status_tx = status.clone();
+        let control = Arc::new(AudioControl::default());
+        let worker_control = Arc::clone(&control);
         let worker = std::thread::Builder::new()
             .name("sextant-audio".into())
-            .spawn(move || run_audio_worker(cmd_rx, session_tx, status_tx))?;
+            .spawn(move || run_audio_worker(cmd_rx, session_tx, status_tx, worker_control))?;
         Ok((
             Self {
                 cmd_tx,
-                _worker: std::sync::Arc::new(worker),
+                control: Arc::clone(&control),
+                status: status.clone(),
             },
-            status_rx,
+            status,
+            AudioWorkerOwner { control, worker },
         ))
     }
 
-    /// Send a command to the audio worker. Drops silently if the
-    /// worker has exited.
+    /// Queue a bounded operation, reporting rejection through the status mailbox.
+    /// Stop requests use independent storage and cannot be rejected by capacity.
     pub(crate) fn send(&self, cmd: AudioCommand) {
-        let _unused = self.cmd_tx.send(cmd);
+        if self.control.shutdown.load(Ordering::Acquire) {
+            self.status
+                .send(AudioStatus::Error(AudioError::WorkerStopped));
+            return;
+        }
+        if matches!(cmd, AudioCommand::StopTx) {
+            self.control.stop();
+            return;
+        }
+        if matches!(cmd, AudioCommand::StopRecording) {
+            let _previous = self
+                .control
+                .recording_generation
+                .fetch_add(1, Ordering::AcqRel);
+            return;
+        }
+        if matches!(cmd, AudioCommand::StopPlayback) {
+            let _previous = self
+                .control
+                .playback_generation
+                .fetch_add(1, Ordering::AcqRel);
+            return;
+        }
+        let queued = QueuedAudioCommand {
+            generation: self.control.stop_generation.load(Ordering::Acquire),
+            recording_generation: self.control.recording_generation.load(Ordering::Acquire),
+            playback_generation: self.control.playback_generation.load(Ordering::Acquire),
+            command: cmd,
+        };
+        if let Err(error) = self.cmd_tx.try_send(queued) {
+            let error = match error {
+                std_mpsc::TrySendError::Full(_) => AudioError::QueueFull,
+                std_mpsc::TrySendError::Disconnected(_) => AudioError::WorkerStopped,
+            };
+            self.status.send(AudioStatus::Error(error));
+        }
     }
 }
 
 fn run_audio_worker(
-    cmd_rx: std_mpsc::Receiver<AudioCommand>,
+    cmd_rx: std_mpsc::Receiver<QueuedAudioCommand>,
     session_tx: tokio_mpsc::Sender<SessionCommand>,
-    status_tx: std_mpsc::Sender<AudioStatus>,
+    status_tx: AudioMailbox,
+    control: Arc<AudioControl>,
 ) {
     // Init failure is not fatal: the worker keeps running with
     // no device so the operator can pick a working one from the audio
     // panel. The error is still surfaced to the GUI.
-    let audio = match AudioIo::init() {
+    let audio = match AudioIo::init(&status_tx) {
         Ok(a) => {
             info!(
                 in_rate = a.input_rate,
@@ -718,12 +796,7 @@ fn run_audio_worker(
         }
         Err(e) => {
             error!(error = %e, "audio init failed; TX/RX disabled until a device is selected");
-            // Surface to the GUI via the session task so the user sees
-            // a real error banner. `try_send` because the session task
-            // may not yet be polling; the bounded channel queues it.
-            if let Err(send_err) = session_tx.try_send(SessionCommand::AudioInitError(e)) {
-                error!(error = %send_err, "could not surface audio init error to GUI");
-            }
+            status_tx.send(AudioStatus::Error(AudioError::Device(e)));
             None
         }
     };
@@ -743,48 +816,10 @@ fn run_audio_worker(
         }
     };
 
-    let mut worker = AudioWorker {
-        audio,
-        // 40 ms-lookahead pitch tracker matches OP25's reference
-        // (`pitch_est.cc` 2-frame DP) and recovers ~10-15 % more
-        // cross-correlation on real voice vs the zero-latency
-        // single-frame fallback. The latency cost is one-way,
-        // hidden inside the codec (the resampler/jitter buffer
-        // between mic and AMBE encoder is already several frames
-        // worth), so end-users perceive no extra delay.
-        encoder: AmbeEncoder::new_with_lookahead(),
-        decoder: AmbeDecoder::new(),
-        tx_active: false,
-        mic_scratch: Vec::with_capacity(65_536),
-        resampled_in: Vec::with_capacity(AMBE_FRAME_SAMPLES),
-        resampled_out: Vec::with_capacity(65_536),
-        cmd_rx,
-        session_tx,
-        status_tx,
-        tx_stats: TxStats::default(),
-        tx_superframe_idx: 0,
-        tx_slow_data: TxSlowData::default(),
-        tx_my_call: String::new(),
-        tx_peak: 0.0,
-        rx_peak: 0.0,
-        level_tick: 0,
-        recorder: None,
-        tx_file: None,
-        rx_playback: RxPlayback::default(),
-        rx_router: RxTailRouter::new(),
-        rx_enhancer,
-        rx_enhance_enabled: false,
-        rx_prime: Vec::with_capacity(65_536),
-        rx_prime_frames: 0,
-        rx_prime_target: RX_PRIME_FRAMES,
-        rx_primed: false,
-    };
+    let mut worker = AudioWorker::new(audio, rx_enhancer, cmd_rx, session_tx, status_tx, control);
     // Enumerate devices once at startup so the GUI's pickers populate
     // without waiting for an explicit EnumerateDevices command.
-    let (inputs, outputs) = enumerate_devices();
-    let _unused = worker
-        .status_tx
-        .send(AudioStatus::DeviceList { inputs, outputs });
+    worker.refresh_device_list();
     worker.run();
     info!("audio worker shutting down");
 }
@@ -800,27 +835,30 @@ struct AudioWorker {
     mic_scratch: Vec<f32>,
     resampled_in: Vec<f32>,
     resampled_out: Vec<f32>,
-    cmd_rx: std_mpsc::Receiver<AudioCommand>,
+    cmd_rx: std_mpsc::Receiver<QueuedAudioCommand>,
     session_tx: tokio_mpsc::Sender<SessionCommand>,
     /// Channel for pushing device lists, level meters, and recording
     /// state to the GUI.
-    status_tx: std_mpsc::Sender<AudioStatus>,
-    /// Mic-level statistics for the current TX session, reset on
-    /// `StartTx` and logged on `StopTx`.  A summary at TX end shows
-    /// unambiguously whether the mic is producing meaningful
-    /// audio (`peak_max` ≥ ~0.1, roughly -20 dBFS, typical for spoken
-    /// voice) or just floor noise / zeros (common when macOS denies
-    /// permission without prompting).
+    status_tx: AudioMailbox,
+    control: Arc<AudioControl>,
+    stop_generation: u64,
+    recording_generation: u64,
+    playback_generation: u64,
+    /// The next queue slot belongs to EOT; no new stream starts before it.
+    pending_end: Option<SessionCommand>,
+    /// Mic peak statistics reset on `StartTx` and logged on `StopTx`.
+    /// Silence alone cannot distinguish mute, device choice or authorization.
     tx_stats: TxStats,
     /// Frame index inside the current 21-frame superframe, cycled
     /// `0 → 20 → 0 → ...` across the TX stream. Used to pick the
     /// slow-data payload: sync pattern at frame 0, scrambled null
-    /// filler otherwise. Reset on `StartTx` so the very first voice
-    /// frame after the header carries the sync pattern, which is what
-    /// the receiving MMDVM modem locks onto to start audio decode.
-    tx_superframe_idx: u8,
+    /// filler otherwise. Reset on `StartTx` so the first voice frame
+    /// after the header carries the sync pattern.
+    tx_superframe_idx: FrameSequence,
     /// Operator's TX slow-data schedule (text + GPS beacon).
     tx_slow_data: TxSlowData,
+    tx_text: Option<SlowDataTextMessage>,
+    tx_gps: Option<TxPosition>,
     /// Operator callsign captured on `StartTx`, used for the DPRS
     /// sentence in `tx_slow_data`.
     tx_my_call: String,
@@ -831,11 +869,17 @@ struct AudioWorker {
     /// `run`-loop ticks since the last `AudioStatus::Levels` push.
     level_tick: u8,
     /// Active WAV recording writer, `Some` while recording RX audio.
-    recorder: Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>>,
-    /// 8 kHz mono samples of a file being transmitted, `Some` while a
-    /// transmit-from-file is in progress. `pump_tx` pulls frames from
-    /// here instead of the mic.
-    tx_file: Option<std::vec::IntoIter<f32>>,
+    recorder: Option<Recording>,
+    /// Incremental 8 kHz mono decoder for the outgoing file, if active.
+    tx_file: Option<WavStream>,
+    /// Zero-input frames emitted after EOF to release the encoder's lookahead.
+    tx_file_tail_frames: u8,
+    /// Incremental local playback decoder at the selected output rate.
+    playback_file: Option<WavStream>,
+    /// Earliest time another outgoing 20 ms frame may be encoded.
+    tx_pacer: FramePacer,
+    /// Earliest time another local playback frame may enter the speaker ring.
+    playback_pacer: FramePacer,
     /// RX one-frame holdback + fade bookkeeping.
     rx_playback: RxPlayback,
     /// Two-tail raw/enhanced RX router feeding the holdback.
@@ -865,9 +909,7 @@ struct TxStats {
     frames: u32,
     peak_max: f32,
     peak_sum: f64,
-    /// Count of frames whose peak was below the typical floor-noise
-    /// threshold of -46 dBFS (0.005 linear).  A high ratio here
-    /// with low `peak_max` is the "macOS denied mic" smoking gun.
+    /// Count of frames below the application's 0.005 linear peak threshold.
     silent_frames: u32,
     /// True iff the first-frame peak has been reported.
     logged_first: bool,
@@ -909,13 +951,119 @@ struct FirstFrameInfo {
     peak: f32,
 }
 
+/// A 20 ms source cadence that never bursts to catch up after a stall.
+#[derive(Debug)]
+struct FramePacer {
+    next: Instant,
+}
+
+impl FramePacer {
+    const fn new(now: Instant) -> Self {
+        Self { next: now }
+    }
+
+    fn take(&mut self, now: Instant) -> bool {
+        if now < self.next {
+            return false;
+        }
+        self.next = now + Duration::from_millis(20);
+        true
+    }
+}
+
 impl AudioWorker {
+    fn new(
+        audio: Option<AudioIo>,
+        rx_enhancer: Option<LiveWaveEnhancer>,
+        cmd_rx: std_mpsc::Receiver<QueuedAudioCommand>,
+        session_tx: tokio_mpsc::Sender<SessionCommand>,
+        status_tx: AudioMailbox,
+        control: Arc<AudioControl>,
+    ) -> Self {
+        Self {
+            audio,
+            encoder: AmbeEncoder::new_with_lookahead(),
+            decoder: AmbeDecoder::new(),
+            tx_active: false,
+            mic_scratch: Vec::with_capacity(65_536),
+            resampled_in: Vec::with_capacity(AMBE_FRAME_SAMPLES),
+            resampled_out: Vec::with_capacity(65_536),
+            cmd_rx,
+            session_tx,
+            status_tx,
+            control,
+            stop_generation: 0,
+            recording_generation: 0,
+            playback_generation: 0,
+            pending_end: None,
+            tx_stats: TxStats::default(),
+            tx_superframe_idx: FrameSequence::ZERO,
+            tx_slow_data: TxSlowData::default(),
+            tx_text: None,
+            tx_gps: None,
+            tx_my_call: String::new(),
+            tx_peak: 0.0,
+            rx_peak: 0.0,
+            level_tick: 0,
+            recorder: None,
+            tx_file: None,
+            tx_file_tail_frames: 0,
+            playback_file: None,
+            tx_pacer: FramePacer::new(Instant::now()),
+            playback_pacer: FramePacer::new(Instant::now()),
+            rx_playback: RxPlayback::default(),
+            rx_router: RxTailRouter::new(),
+            rx_enhancer,
+            rx_enhance_enabled: false,
+            rx_prime: Vec::with_capacity(65_536),
+            rx_prime_frames: 0,
+            rx_prime_target: RX_PRIME_FRAMES,
+            rx_primed: false,
+        }
+    }
+
     fn run(&mut self) {
         loop {
+            if self.control.shutdown.load(Ordering::Acquire) {
+                break;
+            }
+            let generation = self.control.stop_generation.load(Ordering::Acquire);
+            if generation != self.stop_generation {
+                self.stop_generation = generation;
+                self.stop_tx_capture();
+            }
+            let recording_generation = self.control.recording_generation.load(Ordering::Acquire);
+            if recording_generation != self.recording_generation {
+                self.recording_generation = recording_generation;
+                self.stop_recording();
+            }
+            let playback_generation = self.control.playback_generation.load(Ordering::Acquire);
+            if playback_generation != self.playback_generation {
+                self.playback_generation = playback_generation;
+                self.stop_playback();
+            }
+            self.flush_end();
             let mut shutdown = false;
-            loop {
+            for _ in 0..256 {
                 match self.cmd_rx.try_recv() {
-                    Ok(cmd) => self.handle_command(cmd),
+                    Ok(queued) => {
+                        let stale_start = matches!(
+                            queued.command,
+                            AudioCommand::StartTx | AudioCommand::TransmitFile { .. }
+                        ) && queued.generation
+                            != self.control.stop_generation.load(Ordering::Acquire);
+                        let stale_recording =
+                            matches!(queued.command, AudioCommand::StartRecording)
+                                && queued.recording_generation
+                                    != self.control.recording_generation.load(Ordering::Acquire);
+                        let stale_playback =
+                            matches!(queued.command, AudioCommand::PlayFile { .. })
+                                && queued.playback_generation
+                                    != self.control.playback_generation.load(Ordering::Acquire);
+                        if !stale_start && !stale_recording && !stale_playback {
+                            self.handle_command(queued.command);
+                        }
+                    }
                     Err(std_mpsc::TryRecvError::Empty) => break,
                     Err(std_mpsc::TryRecvError::Disconnected) => {
                         shutdown = true;
@@ -926,12 +1074,19 @@ impl AudioWorker {
             if shutdown {
                 break;
             }
-            self.pump_tx();
+            self.pump_tx(Instant::now());
+            self.pump_playback();
+            if let Some(audio) = self.audio.as_ref() {
+                let lost = audio.capture_lost.swap(0, Ordering::AcqRel);
+                if lost > 0 {
+                    self.report_audio_error(AudioError::CaptureOverflow(lost));
+                }
+            }
             // Push level meters to the GUI ~every 50 ms (10 ticks).
             self.level_tick += 1;
             if self.level_tick >= 10 {
                 self.level_tick = 0;
-                let _unused = self.status_tx.send(AudioStatus::Levels {
+                self.status_tx.send(AudioStatus::Levels {
                     tx_peak: self.tx_peak,
                     rx_peak: self.rx_peak,
                 });
@@ -943,51 +1098,42 @@ impl AudioWorker {
             // the speaker ringbuf (~1 s of headroom at HW rate).
             std::thread::sleep(Duration::from_millis(5));
         }
+        self.stop_tx_capture();
+        self.stop_playback();
+        self.finish_rx_stream();
+        self.stop_recording();
+        self.control.shutdown.store(true, Ordering::Release);
     }
 
     fn handle_command(&mut self, cmd: AudioCommand) {
+        if matches!(
+            cmd,
+            AudioCommand::StartTx | AudioCommand::TransmitFile { .. }
+        ) && !self.prepare_tx_identity()
+        {
+            return;
+        }
         match cmd {
-            AudioCommand::StartTx { my_call } => {
-                // Purge any stale mic samples so each keying starts
-                // fresh. `AudioIo::drain_mic` is non-blocking.
-                if let Some(audio) = self.audio.as_mut() {
-                    audio.drain_mic();
-                }
-                self.tx_active = true;
-                self.tx_stats.reset();
-                // First voice frame after the header is frame 0 of the
-                // superframe (sync). The receiving MMDVM modem locks
-                // its slow-data scrambler/descrambler to this 21-frame
-                // boundary; without sync at the right cadence the radio
-                // gets the header but never enters audio decode.
-                self.tx_superframe_idx = 0;
-                // Match the constructor in `start_audio_worker`:
-                // lookahead encoder for OP25-parity voice quality.
-                self.encoder = AmbeEncoder::new_with_lookahead();
-                // Remember the callsign for the DPRS slow-data sentence.
-                self.tx_my_call.clone_from(&my_call);
-                if let Err(e) = self.session_tx.try_send(SessionCommand::StartTx {
-                    my_call: my_call.clone(),
-                }) {
-                    warn!(error = %e, "session StartTx enqueue failed");
-                }
-                tracing::info!(my_call, "TX path enabled; mic capture active");
-            }
+            AudioCommand::StartTx => self.start_tx_capture(),
             AudioCommand::SetSlowData { text, gps } => {
-                self.tx_slow_data.set(text, gps.as_ref(), &self.tx_my_call);
+                self.tx_text = text;
+                self.tx_gps = gps;
+                if !self.tx_my_call.is_empty()
+                    && let Err(error) =
+                        self.tx_slow_data
+                            .set(self.tx_text, self.tx_gps.as_ref(), &self.tx_my_call)
+                {
+                    self.report_audio_error(AudioError::Gps(error));
+                }
             }
-            AudioCommand::EnumerateDevices => {
-                let (inputs, outputs) = enumerate_devices();
-                let _unused = self
-                    .status_tx
-                    .send(AudioStatus::DeviceList { inputs, outputs });
-            }
+            AudioCommand::EnumerateDevices => self.refresh_device_list(),
             AudioCommand::SelectDevices { input, output } => {
                 self.select_devices(input.as_deref(), output.as_deref());
             }
             AudioCommand::StartRecording => self.start_recording(),
             AudioCommand::StopRecording => self.stop_recording(),
             AudioCommand::PlayFile { path } => self.play_file(&path),
+            AudioCommand::StopPlayback => self.stop_playback(),
             AudioCommand::TransmitFile { path } => self.transmit_file(&path),
             AudioCommand::StopTx => self.stop_tx_capture(),
             AudioCommand::RxStart => {
@@ -1032,6 +1178,58 @@ impl AudioWorker {
         }
     }
 
+    /// Use the connection's checked identity for both header and DPRS source.
+    fn prepare_tx_identity(&mut self) -> bool {
+        let identity = *self
+            .control
+            .identity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(identity) = identity else {
+            self.report_audio_error(AudioError::NotConnected);
+            return false;
+        };
+        self.tx_my_call = identity.to_string();
+        if let Err(error) =
+            self.tx_slow_data
+                .set(self.tx_text, self.tx_gps.as_ref(), &self.tx_my_call)
+        {
+            self.report_audio_error(AudioError::Gps(error));
+            return false;
+        }
+        true
+    }
+
+    /// Admit capture only after its header command can enter the session queue.
+    fn start_tx_capture(&mut self) {
+        if self.tx_active || self.pending_end.is_some() {
+            self.report_audio_error(if self.pending_end.is_some() {
+                AudioError::TxEnding
+            } else {
+                AudioError::AlreadyTransmitting
+            });
+            return;
+        }
+        if self.audio.is_none() {
+            self.report_audio_error(AudioError::Device(DeviceError::Missing(Direction::Input)));
+            return;
+        }
+        if self.session_tx.try_send(SessionCommand::StartTx).is_err() {
+            self.report_audio_error(AudioError::SessionBusy);
+            return;
+        }
+        if let Some(audio) = self.audio.as_mut() {
+            audio.drain_mic();
+        }
+        self.tx_active = true;
+        self.tx_pacer = FramePacer::new(Instant::now());
+        self.tx_stats.reset();
+        self.tx_superframe_idx = FrameSequence::ZERO;
+        self.encoder = AmbeEncoder::new_with_lookahead();
+        self.status_tx.send(AudioStatus::Transmitting(true));
+        tracing::info!(callsign = %self.tx_my_call, "TX capture active");
+    }
+
     /// Flip the RX-enhancement toggle, reconfiguring the router
     /// mid-stream when one is in flight. A repeat of the current
     /// state is a no-op.
@@ -1048,7 +1246,11 @@ impl AudioWorker {
                 );
                 return;
             };
-            self.rx_router.enhance_on(enhancer.stream());
+            if let Err(error) = self.rx_router.enhance_on(enhancer.stream()) {
+                error!(%error, "RX enhancement rejected PCM; audio stays raw");
+                self.rx_enhance_enabled = false;
+                return;
+            }
         } else {
             self.rx_router.enhance_off();
         }
@@ -1107,8 +1309,16 @@ impl AudioWorker {
         // While recording, tee the decoded 8 kHz PCM straight
         // to the WAV (the codec's native rate, no resampling).
         if let Some(writer) = self.recorder.as_mut() {
+            let mut failure = None;
             for &s in pcm_i16 {
-                let _unused = writer.write_sample(s);
+                if let Err(error) = writer.writer.write_sample(s) {
+                    failure = Some(error);
+                    break;
+                }
+            }
+            if let Some(error) = failure {
+                self.report_audio_error(AudioError::Recording(error));
+                self.stop_recording();
             }
         }
         // Convert to f32 for resampling.
@@ -1123,13 +1333,20 @@ impl AudioWorker {
         self.rx_peak = self.rx_peak.max(rx_pk);
         // Resample to HW output rate.
         if let Some(audio) = self.audio.as_mut() {
-            self.resampled_out = audio.rx_resampler.process(&self.resampled_in);
+            match audio.rx_resampler.process(&self.resampled_in) {
+                Ok(samples) => self.resampled_out = samples,
+                Err(error) => {
+                    self.report_audio_error(AudioError::Resample(error));
+                    return;
+                }
+            }
         } else {
             return;
         }
         if self.rx_primed {
             if let Some(audio) = self.audio.as_mut() {
-                audio.push_speaker(&self.resampled_out);
+                let lost = audio.push_speaker(&self.resampled_out);
+                self.report_speaker_loss(lost);
             }
         } else {
             // Accumulate the stream's first frames so playback opens
@@ -1151,62 +1368,76 @@ impl AudioWorker {
         if !self.rx_prime.is_empty()
             && let Some(audio) = self.audio.as_mut()
         {
-            audio.push_speaker(&self.rx_prime);
+            let lost = audio.push_speaker(&self.rx_prime);
+            self.report_speaker_loss(lost);
         }
         self.rx_prime.clear();
         self.rx_primed = true;
     }
 
+    fn refresh_device_list(&self) {
+        match enumerate_devices() {
+            Ok(DeviceNames { inputs, outputs }) => self
+                .status_tx
+                .send(AudioStatus::DeviceList { inputs, outputs }),
+            Err(error) => self.report_audio_error(AudioError::Device(error)),
+        }
+    }
+
     /// Rebuild audio I/O on the named devices, surfacing any failure
     /// to the GUI. Tears the old streams down first.
     fn select_devices(&mut self, input: Option<&str>, output: Option<&str>) {
+        self.stop_tx_capture();
+        self.stop_playback();
+        self.finish_rx_stream();
         // Some hosts allow only one stream per device; drop the old
         // `AudioIo` before opening the new one.
         self.audio = None;
-        match AudioIo::init_with(input, output) {
+        match AudioIo::init_with(input, output, &self.status_tx) {
             Ok(io) => self.audio = Some(io),
             Err(e) => {
-                error!(error = %e, "device switch failed");
-                if let Err(send_err) = self.session_tx.try_send(SessionCommand::AudioInitError(e)) {
-                    error!(error = %send_err, "could not surface device error");
-                }
+                self.report_audio_error(AudioError::Device(e));
             }
         }
     }
 
     /// Open a WAV recording, surfacing any failure to the GUI.
     fn start_recording(&mut self) {
+        if self.recorder.is_some() {
+            return;
+        }
         match open_recording_writer() {
             Ok(w) => {
                 self.recorder = Some(w);
-                let _unused = self.status_tx.send(AudioStatus::Recording(true));
+                self.status_tx.send(AudioStatus::Recording(true));
             }
             Err(e) => {
-                error!(error = %e, "could not start recording");
-                if let Err(se) = self.session_tx.try_send(SessionCommand::AudioInitError(e)) {
-                    error!(error = %se, "recording error not surfaced");
-                }
+                self.report_audio_error(e);
             }
         }
     }
 
     /// Finalize and close the active recording, if any.
     fn stop_recording(&mut self) {
-        if let Some(w) = self.recorder.take() {
-            if let Err(e) = w.finalize() {
-                error!(error = %e, "finalize recording");
+        if let Some(recording) = self.recorder.take() {
+            if let Err(e) = recording.writer.finalize() {
+                self.report_audio_error(AudioError::Recording(e));
             }
-            let _unused = self.status_tx.send(AudioStatus::Recording(false));
+            if let Err(error) = recording.file.sync_all() {
+                self.report_audio_error(AudioError::Io(error));
+            }
+            self.status_tx.send(AudioStatus::Recording(false));
         }
     }
 
-    /// Stop a live mic transmission and log a one-line mic-health
-    /// verdict so the operator can tell whether the mic was alive.
+    /// Stop transmission, retain its EOT and report captured sample levels.
     fn stop_tx_capture(&mut self) {
         if !self.tx_active {
             return;
         }
         self.tx_active = false;
+        self.tx_file = None;
+        self.tx_file_tail_frames = 0;
         let stats = &self.tx_stats;
         let mean = stats.mean_peak();
         let silence_ratio = if stats.frames == 0 {
@@ -1215,19 +1446,13 @@ impl AudioWorker {
             f64::from(stats.silent_frames) / f64::from(stats.frames)
         };
         let diagnosis = if stats.peak_max < 0.001 {
-            "MIC LIKELY DENIED: peak never exceeded -60 dBFS; \
-             cpal is receiving zeros. macOS permission not granted. \
-             Run via `open target/Sextant.app` (rebuild the bundle first)."
+            "Input peak remained below -60 dBFS; check input device, mute, gain and microphone authorization."
         } else if stats.peak_max < 0.02 {
-            "MIC VERY QUIET: peak never exceeded -34 dBFS. Either \
-             the mic is muted, the input device is wrong, or the \
-             gain is set very low. The AMBE encoder will treat \
-             this as silence."
+            "Input peak remained below -34 dBFS; check input device, mute and gain."
         } else if silence_ratio > 0.7 {
-            "MIC MOSTLY SILENT: <30% of frames had usable audio. \
-             Speak louder/closer to the mic."
+            "More than 70% of frames were below the 0.005 peak threshold; check input level while speaking."
         } else {
-            "MIC OK: producing signal above the floor-noise threshold."
+            "Input produced samples above the 0.005 peak threshold."
         };
         tracing::info!(
             frames = stats.frames,
@@ -1237,70 +1462,139 @@ impl AudioWorker {
             silence_ratio = format_args!("{:.1}%", silence_ratio * 100.0),
             "TX mic-level summary: {diagnosis}"
         );
-        if let Err(e) = self.session_tx.try_send(SessionCommand::EndTx) {
-            warn!(error = %e, "session EndTx enqueue failed");
-        }
+        self.status_tx.send(AudioStatus::Transmitting(false));
+        self.status_tx.send(AudioStatus::FileTx(None));
+        self.pending_end = Some(SessionCommand::EndTx);
+        self.flush_end();
         tracing::info!("TX path disabled; mic capture stopped");
+    }
+
+    /// Retry the retained EOT before admitting another stream or frame.
+    fn flush_end(&mut self) {
+        let Some(command) = self.pending_end.take() else {
+            return;
+        };
+        match self.session_tx.try_send(command) {
+            Ok(()) => {}
+            Err(tokio_mpsc::error::TrySendError::Full(command)) => self.pending_end = Some(command),
+            Err(tokio_mpsc::error::TrySendError::Closed(_)) => {
+                self.report_audio_error(AudioError::WorkerStopped);
+            }
+        }
     }
 
     /// Play a WAV file to the speakers locally (not transmitted).
     fn play_file(&mut self, path: &std::path::Path) {
-        let Some(audio) = self.audio.as_mut() else {
+        let Some(audio) = self.audio.as_ref() else {
+            self.report_audio_error(AudioError::NoOutput);
             return;
         };
-        match load_wav_resampled(path, audio.output_rate) {
-            Ok(samples) => audio.push_speaker(&samples),
-            Err(e) => {
-                error!(error = %e, "play-file: load failed");
-                if let Err(se) = self.session_tx.try_send(SessionCommand::AudioInitError(e)) {
-                    error!(error = %se, "file error not surfaced");
-                }
+        match WavStream::open(path, audio.output_rate) {
+            Ok(file) => {
+                self.status_tx
+                    .send(AudioStatus::Playback(Some(file.progress())));
+                self.playback_file = Some(file);
+                self.playback_pacer = FramePacer::new(Instant::now());
             }
+            Err(error) => self.report_audio_error(AudioError::Wav(error)),
+        }
+    }
+
+    fn stop_playback(&mut self) {
+        self.playback_file = None;
+        self.status_tx.send(AudioStatus::Playback(None));
+    }
+
+    /// Decode one local playback frame only when the speaker can retain it.
+    fn pump_playback(&mut self) {
+        let (Some(audio), Some(file)) = (self.audio.as_mut(), self.playback_file.as_mut()) else {
+            return;
+        };
+        let count = hw_samples_per_frame(audio.output_rate);
+        if audio.speaker_tx.vacant_len() < count || !self.playback_pacer.take(Instant::now()) {
+            return;
+        }
+        match file.next_samples(count) {
+            Ok(samples) if samples.is_empty() => self.stop_playback(),
+            Ok(samples) => {
+                self.status_tx
+                    .send(AudioStatus::Playback(Some(file.progress())));
+                let lost = audio.push_speaker(&samples);
+                self.report_speaker_loss(lost);
+            }
+            Err(error) => {
+                self.stop_playback();
+                self.report_audio_error(AudioError::Wav(error));
+            }
+        }
+    }
+
+    /// Present a file/device processing failure without replacing its cause
+    /// at the decoding or resampling boundary.
+    fn report_audio_error(&self, failure: AudioError) {
+        error!(error = %failure, "audio operation failed");
+        self.status_tx.send(AudioStatus::Error(failure));
+    }
+
+    fn report_speaker_loss(&self, samples: usize) {
+        if samples > 0 {
+            self.report_audio_error(AudioError::SpeakerOverflow(samples));
         }
     }
 
     /// Begin transmitting a WAV file as an outgoing voice stream.
     /// Refused while a live-mic TX is already active.
     fn transmit_file(&mut self, path: &std::path::Path) {
-        if self.tx_active {
-            warn!("transmit-from-file ignored: already transmitting");
+        if self.tx_active || self.pending_end.is_some() {
+            self.report_audio_error(if self.pending_end.is_some() {
+                AudioError::TxEnding
+            } else {
+                AudioError::AlreadyTransmitting
+            });
             return;
         }
-        let samples = match load_wav_resampled(path, AMBE_SAMPLE_RATE) {
-            Ok(s) => s,
-            Err(e) => {
-                error!(error = %e, "transmit-from-file: load failed");
-                if let Err(se) = self.session_tx.try_send(SessionCommand::AudioInitError(e)) {
-                    error!(error = %se, "file error not surfaced");
-                }
+        let file = match WavStream::open(path, AMBE_SAMPLE_RATE) {
+            Ok(file) => file,
+            Err(error) => {
+                self.report_audio_error(AudioError::Wav(error));
                 return;
             }
         };
-        self.tx_superframe_idx = 0;
-        self.encoder = AmbeEncoder::new_with_lookahead();
-        self.tx_file = Some(samples.into_iter());
-        self.tx_active = true;
-        if let Err(e) = self.session_tx.try_send(SessionCommand::StartTx {
-            my_call: self.tx_my_call.clone(),
-        }) {
-            warn!(error = %e, "file-transmit StartTx enqueue failed");
+        if self.session_tx.try_send(SessionCommand::StartTx).is_err() {
+            self.report_audio_error(AudioError::SessionBusy);
+            return;
         }
+        self.tx_superframe_idx = FrameSequence::ZERO;
+        self.encoder = AmbeEncoder::new_with_lookahead();
+        self.status_tx
+            .send(AudioStatus::FileTx(Some(file.progress())));
+        self.tx_file = Some(file);
+        self.tx_file_tail_frames = 0;
+        self.tx_pacer = FramePacer::new(Instant::now());
+        self.tx_active = true;
+        self.status_tx.send(AudioStatus::Transmitting(true));
     }
 
     /// Pull the next 160-sample frame from a transmit-from-file, or
     /// `None` when the file is exhausted (which ends the stream).
     fn next_file_frame(&mut self) -> Option<Vec<f32>> {
-        let chunk: Vec<f32> = self
-            .tx_file
-            .as_mut()
-            .map_or_else(Vec::new, |f| f.by_ref().take(AMBE_FRAME_SAMPLES).collect());
-        if chunk.is_empty() {
-            // File exhausted; end the outgoing stream.
-            self.tx_file = None;
-            self.tx_active = false;
-            if let Err(e) = self.session_tx.try_send(SessionCommand::EndTx) {
-                warn!(error = %e, "file-transmit EndTx enqueue failed");
+        let file = self.tx_file.as_mut()?;
+        let chunk = match file.next_samples(AMBE_FRAME_SAMPLES) {
+            Ok(samples) => samples,
+            Err(error) => {
+                self.report_audio_error(AudioError::Wav(error));
+                self.stop_tx_capture();
+                return None;
             }
+        };
+        self.status_tx
+            .send(AudioStatus::FileTx(Some(file.progress())));
+        if chunk.is_empty() {
+            if self.tx_file_tail_frames < 2 {
+                self.tx_file_tail_frames += 1;
+                return Some(vec![0.0; AMBE_FRAME_SAMPLES]);
+            }
+            self.stop_tx_capture();
             return None;
         }
         Some(chunk)
@@ -1315,7 +1609,7 @@ impl AudioWorker {
         if !audio.pop_mic(hw_per_frame, &mut self.mic_scratch) {
             return None;
         }
-        // Raw HW-rate mic peak, feeding the mic-health verdict.
+        // Raw device-rate peak for the input-level summary.
         let mic_peak = self
             .mic_scratch
             .iter()
@@ -1327,12 +1621,19 @@ impl AudioWorker {
                 "TX: first mic-chunk peak captured"
             );
         }
-        Some(audio.tx_resampler.process(&self.mic_scratch))
+        match audio.tx_resampler.process(&self.mic_scratch) {
+            Ok(samples) => Some(samples),
+            Err(error) => {
+                self.report_audio_error(AudioError::Resample(error));
+                self.stop_tx_capture();
+                None
+            }
+        }
     }
 
     /// Source 20-ms voice frames (mic or file), encode each, attach
     /// the slow-data fragment, and forward to the session task.
-    fn pump_tx(&mut self) {
+    fn pump_tx(&mut self, now: Instant) {
         if !self.tx_active {
             // Avoid letting the mic ringbuf bloat while not transmitting.
             if let Some(audio) = self.audio.as_mut() {
@@ -1340,14 +1641,17 @@ impl AudioWorker {
             }
             return;
         }
-        loop {
+        if !self.tx_pacer.take(now) {
+            return;
+        }
+        {
             let from_file = self.tx_file.is_some();
             let Some(mut codec_frame) = (if from_file {
                 self.next_file_frame()
             } else {
                 self.next_mic_frame()
             }) else {
-                break;
+                return;
             };
 
             // Pad / truncate to exactly one codec frame.
@@ -1359,21 +1663,34 @@ impl AudioWorker {
             let frame_peak = codec_frame.iter().fold(0.0_f32, |acc, &s| acc.max(s.abs()));
             self.tx_peak = self.tx_peak.max(frame_peak);
 
-            let ambe = self.encoder.encode_frame(&codec_frame);
+            let checked = match captured_pcm_frame(&codec_frame) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    self.report_audio_error(AudioError::Pcm(error));
+                    self.stop_tx_capture();
+                    return;
+                }
+            };
+            let ambe = self.encoder.encode_frame(&checked);
             // Slow-data superframe pattern: sync at frame 0, then the
             // operator's scheduled slow-data fragment (text / GPS) at
             // frames 1-20, or the scrambled null filler otherwise.
-            let slow_data = if self.tx_superframe_idx == 0 {
+            let slow_data = if self.tx_superframe_idx == FrameSequence::ZERO {
                 DSTAR_SYNC_BYTES
             } else {
                 self.tx_slow_data
                     .next_fragment()
                     .unwrap_or(DSTAR_NULL_SLOW_DATA_BYTES)
             };
-            self.tx_superframe_idx = (self.tx_superframe_idx + 1) % 21;
+            self.tx_superframe_idx = self.tx_superframe_idx.next();
             let frame = VoiceFrame { ambe, slow_data };
-            if let Err(e) = self.session_tx.try_send(SessionCommand::TxFrame(frame)) {
-                warn!(error = %e, "TxFrame enqueue dropped");
+            if self
+                .session_tx
+                .try_send(SessionCommand::TxFrame(frame))
+                .is_err()
+            {
+                self.report_audio_error(AudioError::SessionBusy);
+                self.stop_tx_capture();
             }
         }
     }
@@ -1395,133 +1712,153 @@ struct AudioIo {
     tx_resampler: Resampler,
     /// 8 kHz codec rate → HW-rate speaker.
     rx_resampler: Resampler,
+    /// Mono capture samples rejected by the bounded ring since the last tick.
+    capture_lost: Arc<std::sync::atomic::AtomicU64>,
 }
 
-/// Resample a whole buffer with a fixed-chunk sinc resampler. The
-/// final chunk is zero-padded. Empty on resampler-build failure.
-fn resample_buffer(samples: &[f32], in_rate: u32, out_rate: u32) -> Vec<f32> {
-    const CHUNK: usize = 1024;
-    if in_rate == out_rate || samples.is_empty() {
-        return samples.to_vec();
+/// Reject nonfinite capture and clip finite resampler overshoot to unit scale.
+fn captured_pcm_frame(samples: &[f32]) -> Result<PcmFrame, PcmError> {
+    let mut frame: [f32; AMBE_FRAME_SAMPLES] =
+        samples.try_into().map_err(|_| PcmError::Length {
+            expected: AMBE_FRAME_SAMPLES,
+            actual: samples.len(),
+        })?;
+    for (index, sample) in frame.iter_mut().enumerate() {
+        if !sample.is_finite() {
+            return Err(PcmError::NonFinite {
+                index,
+                value: *sample,
+            });
+        }
+        *sample = sample.clamp(-1.0, 1.0);
     }
-    let Some(mut rs) = Resampler::new(in_rate, out_rate, CHUNK) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for window in samples.chunks(CHUNK) {
-        let mut frame = window.to_vec();
-        frame.resize(CHUNK, 0.0);
-        out.extend(rs.process(&frame));
-    }
-    out
+    PcmFrame::new(frame)
 }
 
-/// Read a WAV file as mono `f32` resampled to `target_rate`.
-///
-/// 16-bit PCM only; samples that don't decode as `i16` are dropped
-/// (a non-16-bit file therefore plays as silence rather than an
-/// error). Multi-channel input is folded to mono.
-fn load_wav_resampled(path: &std::path::Path, target_rate: u32) -> Result<Vec<f32>, String> {
-    let mut reader = hound::WavReader::open(path).map_err(|e| format!("open wav: {e}"))?;
-    let spec = reader.spec();
-    let channels = usize::from(spec.channels.max(1));
-    let raw: Vec<i16> = reader.samples::<i16>().filter_map(Result::ok).collect();
-    let mono: Vec<f32> = raw
-        .chunks(channels)
-        .map(|frame| {
-            let sum: f32 = frame.iter().map(|&s| f32::from(s) / 32768.0).sum();
-            #[expect(
-                clippy::cast_precision_loss,
-                reason = "channel count is a tiny integer (1..=8); exact in f32."
-            )]
-            let n = frame.len().max(1) as f32;
-            sum / n
-        })
-        .collect();
-    Ok(resample_buffer(&mono, spec.sample_rate, target_rate))
+/// A recording writer and independent handle for explicit post-finalize sync.
+struct Recording {
+    writer: hound::WavWriter<std::io::BufWriter<std::fs::File>>,
+    file: std::fs::File,
 }
 
-/// Open a new timestamped 8 kHz mono 16-bit WAV recording writer in
+/// Open an exclusively created 8 kHz mono 16-bit WAV recording writer in
 /// `<config dir>/sextant/recordings/`.
-fn open_recording_writer() -> Result<hound::WavWriter<std::io::BufWriter<std::fs::File>>, String> {
-    let mut dir = dirs_next::config_dir().ok_or("no config dir")?;
+fn open_recording_writer() -> Result<Recording, AudioError> {
+    static NEXT_RECORDING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut dir = dirs_next::config_dir().ok_or(AudioError::NoConfigurationDirectory)?;
     dir.push("sextant");
     dir.push("recordings");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create recordings dir: {e}"))?;
+    std::fs::create_dir_all(&dir).map_err(AudioError::Io)?;
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let path = dir.join(format!("rx-{stamp}.wav"));
+    let ticket = NEXT_RECORDING.fetch_add(1, Ordering::Relaxed);
+    let path = dir.join(format!("rx-{stamp}-{}-{ticket}.wav", std::process::id()));
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(AudioError::Io)?;
+    let sync_file = file.try_clone().map_err(AudioError::Io)?;
     let spec = hound::WavSpec {
         channels: 1,
         sample_rate: AMBE_SAMPLE_RATE,
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
-    hound::WavWriter::create(&path, spec).map_err(|e| format!("create wav: {e}"))
+    let writer = hound::WavWriter::new(std::io::BufWriter::new(file), spec)
+        .map_err(AudioError::Recording)?;
+    Ok(Recording {
+        writer,
+        file: sync_file,
+    })
 }
 
-/// Enumerate cpal device names. Returns `(input names, output names)`.
-/// Devices whose name can't be read are skipped.
-fn enumerate_devices() -> (Vec<String>, Vec<String>) {
+/// Readable input and output device names from one host enumeration.
+struct DeviceNames {
+    inputs: Vec<String>,
+    outputs: Vec<String>,
+}
+
+/// Enumerate names or retain the original enumeration/name failure.
+fn enumerate_devices() -> Result<DeviceNames, DeviceError> {
     let host = cpal::default_host();
     let inputs = host
         .input_devices()
-        .map(|devs| devs.filter_map(|d| d.name().ok()).collect())
-        .unwrap_or_default();
+        .map_err(DeviceError::Enumerate)?
+        .map(|device| device.name().map_err(DeviceError::Name))
+        .collect::<Result<Vec<_>, _>>()?;
     let outputs = host
         .output_devices()
-        .map(|devs| devs.filter_map(|d| d.name().ok()).collect())
-        .unwrap_or_default();
-    (inputs, outputs)
+        .map_err(DeviceError::Enumerate)?
+        .map(|device| device.name().map_err(DeviceError::Name))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(DeviceNames { inputs, outputs })
 }
 
-/// Find a device by name, or the host default. `is_input` selects
-/// which device list / default to consult.
-fn pick_device(host: &cpal::Host, name: Option<&str>, is_input: bool) -> Option<cpal::Device> {
+/// Select the exact requested device, or the default when no name is supplied.
+fn pick_device(
+    host: &cpal::Host,
+    name: Option<&str>,
+    direction: Direction,
+) -> Result<cpal::Device, DeviceError> {
     if let Some(want) = name {
-        let devices = if is_input {
-            host.input_devices().ok()
+        let devices = if matches!(direction, Direction::Input) {
+            host.input_devices()
         } else {
-            host.output_devices().ok()
-        };
-        if let Some(found) =
-            devices.and_then(|mut d| d.find(|dev| dev.name().is_ok_and(|n| n == want)))
-        {
-            return Some(found);
+            host.output_devices()
         }
+        .map_err(DeviceError::Enumerate)?;
+        for device in devices {
+            if device.name().map_err(DeviceError::Name)? == want {
+                return Ok(device);
+            }
+        }
+        return Err(DeviceError::NamedMissing {
+            direction,
+            name: want.to_owned(),
+        });
     }
-    if is_input {
+    let device = if matches!(direction, Direction::Input) {
         host.default_input_device()
     } else {
         host.default_output_device()
-    }
+    };
+    device.ok_or(DeviceError::Missing(direction))
 }
 
 impl AudioIo {
-    fn init() -> Result<Self, String> {
-        Self::init_with(None, None)
+    fn init(status: &AudioMailbox) -> Result<Self, DeviceError> {
+        Self::init_with(None, None, status)
     }
 
     /// Open the named input / output devices, falling back to the host
-    /// default when a name is `None` or not found.
-    fn init_with(input_name: Option<&str>, output_name: Option<&str>) -> Result<Self, String> {
+    /// default when a name is `None`. Unavailable named devices are errors.
+    fn init_with(
+        input_name: Option<&str>,
+        output_name: Option<&str>,
+        status: &AudioMailbox,
+    ) -> Result<Self, DeviceError> {
         let host = cpal::default_host();
-        let input_device = pick_device(&host, input_name, true).ok_or("no audio input device")?;
-        let output_device =
-            pick_device(&host, output_name, false).ok_or("no audio output device")?;
+        let input_device = pick_device(&host, input_name, Direction::Input)?;
+        let output_device = pick_device(&host, output_name, Direction::Output)?;
 
         let input_cfg = input_device
             .default_input_config()
-            .map_err(|e| format!("default input config: {e}"))?;
+            .map_err(DeviceError::Configuration)?;
         let output_cfg = output_device
             .default_output_config()
-            .map_err(|e| format!("default output config: {e}"))?;
+            .map_err(DeviceError::Configuration)?;
 
         let input_channels = input_cfg.channels();
         let output_channels = output_cfg.channels();
         let input_rate = input_cfg.sample_rate().0;
         let output_rate = output_cfg.sample_rate().0;
+        for (channels, rate) in [(input_channels, input_rate), (output_channels, output_rate)] {
+            if !(1..=8).contains(&channels) || !(8000..=192_000).contains(&rate) {
+                return Err(DeviceError::Geometry { channels, rate });
+            }
+        }
 
         // ~1 s of buffer at HW rate: plenty of headroom for GC /
         // scheduler hiccups without burning memory.
@@ -1530,16 +1867,25 @@ impl AudioIo {
         let (mic_prod, mic_rx) = HeapRb::<f32>::new(mic_cap).split();
         let (speaker_tx, speaker_cons) = HeapRb::<f32>::new(speaker_cap).split();
 
-        let input_stream = build_input_stream(&input_device, &input_cfg, input_channels, mic_prod)?;
-        let output_stream =
-            build_output_stream(&output_device, &output_cfg, output_channels, speaker_cons)?;
+        let capture_lost = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let input_stream = build_input_stream(
+            &input_device,
+            &input_cfg,
+            input_channels,
+            mic_prod,
+            status.clone(),
+            Arc::clone(&capture_lost),
+        )?;
+        let output_stream = build_output_stream(
+            &output_device,
+            &output_cfg,
+            output_channels,
+            speaker_cons,
+            status.clone(),
+        )?;
 
-        input_stream
-            .play()
-            .map_err(|e| format!("start input stream: {e}"))?;
-        output_stream
-            .play()
-            .map_err(|e| format!("start output stream: {e}"))?;
+        input_stream.play().map_err(DeviceError::Play)?;
+        output_stream.play().map_err(DeviceError::Play)?;
 
         // Per-direction sinc resamplers. The TX resampler consumes one
         // 20 ms HW-rate mic frame; the RX resampler consumes one 160-
@@ -1549,9 +1895,9 @@ impl AudioIo {
             AMBE_SAMPLE_RATE,
             hw_samples_per_frame(input_rate),
         )
-        .ok_or("build TX resampler")?;
+        .map_err(DeviceError::Resampler)?;
         let rx_resampler = Resampler::new(AMBE_SAMPLE_RATE, output_rate, AMBE_FRAME_SAMPLES)
-            .ok_or("build RX resampler")?;
+            .map_err(DeviceError::Resampler)?;
 
         Ok(Self {
             _input_stream: input_stream,
@@ -1564,6 +1910,7 @@ impl AudioIo {
             output_channels,
             tx_resampler,
             rx_resampler,
+            capture_lost,
         })
     }
 
@@ -1585,24 +1932,27 @@ impl AudioIo {
         while self.mic_rx.try_pop().is_some() {}
     }
 
-    fn push_speaker(&mut self, samples: &[f32]) {
-        for &s in samples {
-            if self.speaker_tx.try_push(s).is_err() {
-                // Speaker ringbuf full: drop the rest. Implies
-                // output is back-pressuring (shouldn't happen with
-                // 1s of buffer unless the speaker stream stalled).
-                return;
-            }
+    /// Return the number of samples rejected by the bounded speaker ring.
+    fn push_speaker(&mut self, samples: &[f32]) -> usize {
+        push_speaker_samples(&mut self.speaker_tx, samples)
+    }
+}
+
+/// Admit the retained prefix and return the exact rejected suffix length.
+fn push_speaker_samples(speaker: &mut ringbuf::HeapProd<f32>, samples: &[f32]) -> usize {
+    for (index, &sample) in samples.iter().enumerate() {
+        if speaker.try_push(sample).is_err() {
+            return samples.len() - index;
         }
     }
+    0
 }
 
 /// Sinc resampler for one mono direction, wrapping `rubato::SincFixedIn`.
 ///
 /// `SincFixedIn` consumes a fixed input chunk and bandlimits with its
-/// own windowed-sinc filter, so it both resamples and anti-aliases in
-/// one step, replacing the previous hand-rolled linear-interpolation
-/// and FIR cascade. Both sextant directions resample fixed-size
+/// own windowed-sinc filter, so it resamples and anti-aliases in
+/// one step. Both directions resample fixed-size
 /// frames (160 samples at 8 kHz on RX, one HW-rate frame on TX),
 /// which is exactly the fixed-input contract `SincFixedIn` wants.
 struct Resampler {
@@ -1611,8 +1961,12 @@ struct Resampler {
 
 impl Resampler {
     /// Build a resampler from `in_rate` to `out_rate` for fixed input
-    /// chunks of `chunk` samples. `None` if rubato rejects the params.
-    fn new(in_rate: u32, out_rate: u32, chunk: usize) -> Option<Self> {
+    /// chunks of `chunk` samples. Returns rubato's construction failure.
+    fn new(
+        in_rate: u32,
+        out_rate: u32,
+        chunk: usize,
+    ) -> Result<Self, rubato::ResamplerConstructionError> {
         let params = SincInterpolationParameters {
             sinc_len: 128,
             f_cutoff: 0.95,
@@ -1621,18 +1975,27 @@ impl Resampler {
             window: WindowFunction::BlackmanHarris2,
         };
         let ratio = f64::from(out_rate) / f64::from(in_rate);
-        let inner = SincFixedIn::new(ratio, 1.0, params, chunk, 1).ok()?;
-        Some(Self { inner })
+        let inner = SincFixedIn::new(ratio, 1.0, params, chunk, 1)?;
+        Ok(Self { inner })
     }
 
     /// Resample one fixed-size chunk. `input.len()` must equal the
-    /// `chunk` the resampler was built with; a mismatch yields an
-    /// empty result rather than a panic.
-    fn process(&mut self, input: &[f32]) -> Vec<f32> {
-        self.inner.process(&[input], None).map_or_else(
-            |_| Vec::new(),
-            |out| out.into_iter().next().unwrap_or_default(),
-        )
+    /// `chunk` the resampler was built with. Returns the original processing
+    /// failure or an output-channel mismatch if the mono contract is broken.
+    fn process(&mut self, input: &[f32]) -> Result<Vec<f32>, rubato::ResampleError> {
+        let mut output = self.inner.process(&[input], None)?;
+        if output.len() != 1 {
+            return Err(rubato::ResampleError::WrongNumberOfOutputChannels {
+                expected: 1,
+                actual: output.len(),
+            });
+        }
+        output
+            .pop()
+            .ok_or(rubato::ResampleError::WrongNumberOfOutputChannels {
+                expected: 1,
+                actual: 0,
+            })
     }
 }
 
@@ -1653,20 +2016,22 @@ fn build_input_stream(
     cfg: &cpal::SupportedStreamConfig,
     channels: u16,
     mut mic_prod: ringbuf::HeapProd<f32>,
-) -> Result<cpal::Stream, String> {
-    let err_fn = |e| error!(error = %e, "cpal input callback error");
+    status: AudioMailbox,
+    capture_lost: Arc<std::sync::atomic::AtomicU64>,
+) -> Result<cpal::Stream, DeviceError> {
+    let err_fn = move |error| status.send(AudioStatus::Error(AudioError::Stream(error)));
     let stream_cfg = cfg.config();
     match cfg.sample_format() {
         SampleFormat::F32 => device
             .build_input_stream(
                 &stream_cfg,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    write_mono(data, channels, &mut mic_prod);
+                    write_mono(data, channels, &mut mic_prod, &capture_lost);
                 },
                 err_fn,
                 None,
             )
-            .map_err(|e| format!("build input stream (f32): {e}")),
+            .map_err(DeviceError::Build),
         SampleFormat::I16 => device
             .build_input_stream(
                 &stream_cfg,
@@ -1681,13 +2046,15 @@ fn build_input_stream(
                                       precision is the standard."
                         )]
                         let avg = sum / chunk.len() as f32;
-                        let _unused = mic_prod.try_push(avg);
+                        if mic_prod.try_push(avg).is_err() {
+                            let _previous = capture_lost.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 },
                 err_fn,
                 None,
             )
-            .map_err(|e| format!("build input stream (i16): {e}")),
+            .map_err(DeviceError::Build),
         SampleFormat::U16 => device
             .build_input_stream(
                 &stream_cfg,
@@ -1705,14 +2072,16 @@ fn build_input_stream(
                                       precision is the standard."
                         )]
                         let avg = sum / chunk.len() as f32;
-                        let _unused = mic_prod.try_push(avg);
+                        if mic_prod.try_push(avg).is_err() {
+                            let _previous = capture_lost.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 },
                 err_fn,
                 None,
             )
-            .map_err(|e| format!("build input stream (u16): {e}")),
-        other => Err(format!("unsupported input sample format: {other:?}")),
+            .map_err(DeviceError::Build),
+        other => Err(DeviceError::Format(Direction::Input, other)),
     }
 }
 
@@ -1721,8 +2090,9 @@ fn build_output_stream(
     cfg: &cpal::SupportedStreamConfig,
     channels: u16,
     mut speaker_cons: ringbuf::HeapCons<f32>,
-) -> Result<cpal::Stream, String> {
-    let err_fn = |e| error!(error = %e, "cpal output callback error");
+    status: AudioMailbox,
+) -> Result<cpal::Stream, DeviceError> {
+    let err_fn = move |error| status.send(AudioStatus::Error(AudioError::Stream(error)));
     let stream_cfg = cfg.config();
     match cfg.sample_format() {
         SampleFormat::F32 => device
@@ -1734,7 +2104,7 @@ fn build_output_stream(
                 err_fn,
                 None,
             )
-            .map_err(|e| format!("build output stream (f32): {e}")),
+            .map_err(DeviceError::Build),
         SampleFormat::I16 => device
             .build_output_stream(
                 &stream_cfg,
@@ -1756,7 +2126,7 @@ fn build_output_stream(
                 err_fn,
                 None,
             )
-            .map_err(|e| format!("build output stream (i16): {e}")),
+            .map_err(DeviceError::Build),
         SampleFormat::U16 => device
             .build_output_stream(
                 &stream_cfg,
@@ -1779,12 +2149,17 @@ fn build_output_stream(
                 err_fn,
                 None,
             )
-            .map_err(|e| format!("build output stream (u16): {e}")),
-        other => Err(format!("unsupported output sample format: {other:?}")),
+            .map_err(DeviceError::Build),
+        other => Err(DeviceError::Format(Direction::Output, other)),
     }
 }
 
-fn write_mono(data: &[f32], channels: u16, mic_prod: &mut ringbuf::HeapProd<f32>) {
+fn write_mono(
+    data: &[f32],
+    channels: u16,
+    mic_prod: &mut ringbuf::HeapProd<f32>,
+    lost: &std::sync::atomic::AtomicU64,
+) {
     for chunk in data.chunks(channels as usize) {
         let sum: f32 = chunk.iter().sum();
         #[expect(
@@ -1794,7 +2169,9 @@ fn write_mono(data: &[f32], channels: u16, mic_prod: &mut ringbuf::HeapProd<f32>
                       audio-averaging where f32 precision is the standard."
         )]
         let avg = sum / chunk.len() as f32;
-        let _unused = mic_prod.try_push(avg);
+        if mic_prod.try_push(avg).is_err() {
+            let _previous = lost.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -1813,21 +2190,313 @@ fn fill_stereo_from_mono_f32(
 
 #[cfg(test)]
 mod tests {
-    use super::Resampler;
+    use super::{AudioMailbox, AudioWorker, FramePacer, PcmSamples, Resampler, captured_pcm_frame};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn paced_file_transmission_releases_encoder_lookahead_before_eot() -> TestResult {
+        static NEXT_FILE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let ticket = NEXT_FILE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "sextant-file-tail-{}-{ticket}.wav",
+            std::process::id()
+        ));
+        let mut writer = hound::WavWriter::create(
+            &path,
+            hound::WavSpec {
+                channels: 1,
+                sample_rate: 8000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            },
+        )?;
+        for _ in 0..160 {
+            writer.write_sample(8192_i16)?;
+        }
+        writer.finalize()?;
+        let (mut worker, _unused, _status) = worker();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+        worker.session_tx = sender;
+        worker.tx_file = Some(super::WavStream::open(&path, 8000)?);
+        worker.tx_active = true;
+        let start = std::time::Instant::now();
+        worker.tx_pacer = FramePacer::new(start);
+        let mut frames = Vec::new();
+        let mut ended = false;
+        for tick in 0..5 {
+            worker.pump_tx(start + std::time::Duration::from_millis(tick * 20));
+            while let Ok(command) = receiver.try_recv() {
+                match command {
+                    crate::session::SessionCommand::TxFrame(frame) => {
+                        assert!(!ended, "voice followed EOT");
+                        frames.push(frame.ambe);
+                    }
+                    crate::session::SessionCommand::EndTx => ended = true,
+                    _ => return Err("unexpected file-transmit command".into()),
+                }
+            }
+        }
+        let mut reference = mbelib_rs::AmbeEncoder::new_with_lookahead();
+        let input = mbelib_rs::PcmFrame::from([8192_i16; 160]);
+        let silence = mbelib_rs::PcmFrame::from([0_i16; 160]);
+        let expected = [
+            reference.encode_frame(&input),
+            reference.encode_frame(&silence),
+            reference.encode_frame(&silence),
+        ];
+        assert_eq!(
+            frames, expected,
+            "file completion lost the codec's buffered input"
+        );
+        assert!(ended, "completed file omitted EOT");
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_audio_rings_report_exact_capture_and_playback_loss() -> TestResult {
+        use ringbuf::traits::{Consumer as _, Split as _};
+
+        let (mut microphone, mut input) = ringbuf::HeapRb::<f32>::new(1).split();
+        let lost = std::sync::atomic::AtomicU64::new(0);
+        super::write_mono(
+            &[0.25, 0.75, 1.0, -1.0, 0.5, 0.5],
+            2,
+            &mut microphone,
+            &lost,
+        );
+        assert_eq!(
+            lost.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "capture overflow was hidden"
+        );
+        let sample = input.try_pop().ok_or("retained capture sample missing")?;
+        assert!(
+            (sample - 0.5).abs() < f32::EPSILON,
+            "stereo fold changed the retained sample"
+        );
+        let (mut speaker, mut output) = ringbuf::HeapRb::<f32>::new(1).split();
+        assert_eq!(
+            super::push_speaker_samples(&mut speaker, &[0.25, 0.5, 0.75]),
+            2,
+            "speaker overflow count changed"
+        );
+        assert!(
+            output.try_pop().is_some(),
+            "speaker discarded the retained prefix"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn beacon_source_uses_connection_identity_and_retirement_clears_it() -> TestResult {
+        let (mut worker, _session, _status) = worker();
+        let identity = dstar_gateway_core::types::RoutingCallsign::new("W1AW")?;
+        *worker
+            .control
+            .identity
+            .lock()
+            .map_err(|_| "identity lock poisoned")? = Some(identity);
+        worker.tx_my_call = "OTHER".to_owned();
+        worker.tx_gps = Some(crate::geo::TxPosition::new(35.5, -82.5, '>', "test")?);
+        assert!(
+            worker.prepare_tx_identity(),
+            "checked connection identity was rejected"
+        );
+        assert_eq!(
+            worker.tx_my_call, "W1AW",
+            "beacon retained an unrelated form identity"
+        );
+        assert!(
+            !worker.tx_slow_data.fragments.is_empty(),
+            "valid beacon was silently discarded"
+        );
+        *worker
+            .control
+            .identity
+            .lock()
+            .map_err(|_| "identity lock poisoned")? = None;
+        assert!(
+            !worker.prepare_tx_identity(),
+            "retired identity authorized transmission"
+        );
+        Ok(())
+    }
+
+    fn worker() -> (
+        AudioWorker,
+        tokio::sync::mpsc::Receiver<crate::session::SessionCommand>,
+        AudioMailbox,
+    ) {
+        let (_commands, receiver) = std::sync::mpsc::sync_channel(1);
+        let (session, session_receiver) = tokio::sync::mpsc::channel(1);
+        let status = AudioMailbox::default();
+        let worker = AudioWorker::new(
+            None,
+            None,
+            receiver,
+            session,
+            status.clone(),
+            std::sync::Arc::default(),
+        );
+        (worker, session_receiver, status)
+    }
+
+    #[test]
+    fn end_transmission_is_retained_until_session_capacity_returns() -> TestResult {
+        use crate::session::SessionCommand;
+
+        let (mut worker, mut session, _status) = worker();
+        worker.session_tx.try_send(SessionCommand::TxSilence)?;
+        worker.tx_active = true;
+        worker.stop_tx_capture();
+        assert!(!worker.tx_active, "capture continued after stop");
+        assert!(worker.pending_end.is_some(), "full queue discarded EOT");
+        worker.flush_end();
+        assert!(
+            worker.pending_end.is_some(),
+            "retry discarded EOT while still full"
+        );
+        assert!(
+            matches!(session.try_recv()?, SessionCommand::TxSilence),
+            "queued operation changed"
+        );
+        worker.flush_end();
+        assert!(
+            matches!(session.try_recv()?, SessionCommand::EndTx),
+            "EOT was never delivered"
+        );
+        assert!(
+            worker.pending_end.is_none(),
+            "completed EOT remained pending"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stop_requests_bypass_capacity_and_invalidate_queued_starts() -> TestResult {
+        use super::{AudioCommand, AudioHandle};
+
+        let (commands, receiver) = std::sync::mpsc::sync_channel(1);
+        let control = std::sync::Arc::new(super::AudioControl::default());
+        let handle = AudioHandle {
+            cmd_tx: commands,
+            control: std::sync::Arc::clone(&control),
+            status: AudioMailbox::default(),
+        };
+        handle.send(AudioCommand::StartTx);
+        handle.send(AudioCommand::StopTx);
+        let queued = receiver.try_recv()?;
+        assert_ne!(
+            queued.generation,
+            control
+                .stop_generation
+                .load(std::sync::atomic::Ordering::Acquire),
+            "queued start survived stop"
+        );
+        handle.send(AudioCommand::StartRecording);
+        handle.send(AudioCommand::StopRecording);
+        let queued = receiver.try_recv()?;
+        assert_ne!(
+            queued.recording_generation,
+            control
+                .recording_generation
+                .load(std::sync::atomic::Ordering::Acquire),
+            "queued recording survived stop"
+        );
+        handle.send(AudioCommand::PlayFile {
+            path: "unused.wav".into(),
+        });
+        handle.send(AudioCommand::StopPlayback);
+        let queued = receiver.try_recv()?;
+        assert_ne!(
+            queued.playback_generation,
+            control
+                .playback_generation
+                .load(std::sync::atomic::Ordering::Acquire),
+            "queued playback survived stop"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn shutdown_finalizes_recording_before_worker_completion() -> TestResult {
+        static NEXT_TEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let ticket = NEXT_TEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "sextant-shutdown-{}-{ticket}.wav",
+            std::process::id()
+        ));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        let mut writer = hound::WavWriter::new(
+            std::io::BufWriter::new(file.try_clone()?),
+            hound::WavSpec {
+                channels: 1,
+                sample_rate: 8000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            },
+        )?;
+        for _ in 0..160 {
+            writer.write_sample(123_i16)?;
+        }
+        let (mut worker, _session, status) = worker();
+        worker.recorder = Some(super::Recording { writer, file });
+        worker
+            .control
+            .shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+        worker.run();
+        assert!(
+            worker.recorder.is_none(),
+            "recording cleanup was deferred to Drop"
+        );
+        assert!(
+            status
+                .drain()
+                .iter()
+                .any(|item| matches!(item, super::AudioStatus::Recording(false))),
+            "recording completion was not reported"
+        );
+        let reader = hound::WavReader::open(&path)?;
+        assert_eq!(reader.duration(), 160, "recording header was not finalized");
+        drop(reader);
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn file_frame_clock_waits_twenty_ms_and_never_catches_up_in_a_burst() {
+        let start = std::time::Instant::now();
+        let mut pacer = FramePacer::new(start);
+        assert!(pacer.take(start), "first frame was delayed");
+        assert!(!pacer.take(start), "two frames shared one timestamp");
+        assert!(
+            !pacer.take(start + std::time::Duration::from_millis(19)),
+            "frame was sent early"
+        );
+        assert!(
+            pacer.take(start + std::time::Duration::from_millis(20)),
+            "second frame was delayed"
+        );
+        let stalled = start + std::time::Duration::from_secs(10);
+        assert!(pacer.take(stalled), "a stalled source did not resume");
+        assert!(!pacer.take(stalled), "a stalled source burst to catch up");
+    }
 
     /// rubato's sinc resampler must not alias: a 6500 Hz tone
     /// resampled 48 kHz → 8 kHz must not produce 1500 Hz content
     /// (6500 folds to 8000 − 6500 = 1500 without an anti-alias
     /// filter). rubato's windowed-sinc kernel bandlimits before
-    /// downsampling. This guards the property the old hand-rolled
-    /// FIR provided; losing it brings sextant↔sextant "garble noise"
-    /// back.
+    /// downsampling. The test bounds the 1500 Hz alias amplitude.
     #[test]
     fn resampler_does_not_alias_6500hz_tone() -> TestResult {
         let chunk = 960_usize; // one 20 ms frame at 48 kHz
-        let mut rs = Resampler::new(48_000, 8_000, chunk).ok_or("build resampler")?;
+        let mut rs = Resampler::new(48_000, 8_000, chunk)?;
 
         // 10 chunks of a 6500 Hz tone at 48 kHz, peak amplitude 0.5.
         let mut down: Vec<f32> = Vec::new();
@@ -1841,7 +2510,7 @@ mod tests {
                 let t = (c * chunk + i) as f32 / 48_000.0;
                 frame.push(0.5 * (t * 2.0 * std::f32::consts::PI * 6500.0).sin());
             }
-            down.extend(rs.process(&frame));
+            down.extend(rs.process(&frame)?);
         }
 
         // Single-bin DFT at 1500 Hz (the would-be alias frequency).
@@ -1867,29 +2536,22 @@ mod tests {
             alias_mag < 0.05,
             "1500 Hz alias amplitude {alias_mag:.4} exceeds 0.05: the \
              resampler is leaking high-frequency content into the speech \
-             band (sextant↔sextant garble noise)."
+             band."
         );
         Ok(())
     }
 
-    /// Full sextant↔sextant simulation: generate a voice-like signal,
-    /// resample 48 → 8 kHz (TX), AMBE-encode, AMBE-decode, resample
-    /// 8 → 48 kHz (RX), and verify the output is audible, not the
-    /// "garble noise" / "no voice" symptom. If this passes, the codec
-    /// and resampler pipeline is internally consistent; any remaining
-    /// sextant↔sextant failure is in cpal I/O, the network, or
-    /// operator configuration.
+    /// A synthesized harmonic signal passes 48 kHz/8 kHz resampling,
+    /// AMBE encoding and decoding; output energy is checked after warmup.
     #[test]
-    fn end_to_end_voice_pipeline_produces_audible_output() -> TestResult {
+    fn codec_pipeline_preserves_bounded_nonzero_energy() -> TestResult {
         use super::{AMBE_FRAME_SAMPLES, AMBE_SAMPLE_RATE};
         use mbelib_rs::{AmbeDecoder, AmbeEncoder};
 
         let hw_rate = 48_000_u32;
         let frame_hw = 960_usize; // 20 ms at 48 kHz
-        let mut tx_rs =
-            Resampler::new(hw_rate, AMBE_SAMPLE_RATE, frame_hw).ok_or("build TX resampler")?;
-        let mut rx_rs = Resampler::new(AMBE_SAMPLE_RATE, hw_rate, AMBE_FRAME_SAMPLES)
-            .ok_or("build RX resampler")?;
+        let mut tx_rs = Resampler::new(hw_rate, AMBE_SAMPLE_RATE, frame_hw)?;
+        let mut rx_rs = Resampler::new(AMBE_SAMPLE_RATE, hw_rate, AMBE_FRAME_SAMPLES)?;
 
         // 1. ~2 s of voice-like signal at 48 kHz: F0 ≈ 130 Hz with
         //    vibrato + 8 decaying harmonics and a syllabic envelope.
@@ -1925,14 +2587,14 @@ mod tests {
         for f in 0..n_frames {
             let start = f * frame_hw;
             let chunk = hw_input.get(start..start + frame_hw).unwrap_or(&[]);
-            let mut resampled = tx_rs.process(chunk);
+            let mut resampled = tx_rs.process(chunk)?;
             // Pad / truncate to exactly one codec frame.
             if resampled.len() < AMBE_FRAME_SAMPLES {
                 resampled.resize(AMBE_FRAME_SAMPLES, 0.0);
             } else if resampled.len() > AMBE_FRAME_SAMPLES {
                 resampled.truncate(AMBE_FRAME_SAMPLES);
             }
-            wire.push(enc.encode_frame(&resampled));
+            wire.push(enc.encode_frame(&captured_pcm_frame(&resampled)?));
         }
 
         // 3. RX: AMBE-decode, resample 8 → 48 kHz.
@@ -1941,7 +2603,7 @@ mod tests {
         for ambe in &wire {
             let pcm = dec.decode_frame(ambe);
             let norm: Vec<f32> = pcm.iter().map(|&s| f32::from(s) / 32768.0).collect();
-            hw_output.extend(rx_rs.process(&norm));
+            hw_output.extend(rx_rs.process(&norm)?);
         }
 
         // 4. Skip warmup: encoder, decoder, and both resamplers take
@@ -1976,7 +2638,7 @@ mod tests {
 
         let mut sched = super::TxSlowData::default();
         let message = SlowDataTextMessage::try_from_text("CQ TEST")?;
-        sched.set(Some(message), None, "W1AW");
+        sched.set(Some(message), None, "W1AW")?;
         // `encode_text_message` yields exactly 8 fragments; pull them
         // and feed the RX collector at seq 1..=8.
         let mut collector = SlowDataTextCollector::new();
@@ -1988,17 +2650,18 @@ mod tests {
         }
         let msg = collector.take_message();
         assert!(
-            matches!(&msg, Some(m) if m.starts_with(b"CQ TEST")),
+            matches!(&msg, Some(m) if m.as_bytes().starts_with(b"CQ TEST")),
             "TX-scheduled text must decode back through the RX collector, got {msg:?}"
         );
         Ok(())
     }
 
     #[test]
-    fn tx_slow_data_empty_yields_no_fragments() {
+    fn tx_slow_data_empty_yields_no_fragments() -> TestResult {
         let mut sched = super::TxSlowData::default();
-        sched.set(None, None, "W1AW");
+        sched.set(None, None, "W1AW")?;
         assert!(sched.next_fragment().is_none());
+        Ok(())
     }
 
     /// Fade-in silences the very first sample and leaves everything
@@ -2120,8 +2783,8 @@ mod tests {
     }
 
     impl super::EnhanceStream for FakeStream {
-        fn push_samples(&mut self, samples: &[f32]) -> Vec<f32> {
-            self.seen.extend_from_slice(samples);
+        fn push_samples(&mut self, samples: PcmSamples<'_>) -> Vec<f32> {
+            self.seen.extend_from_slice(samples.as_slice());
             if self.seen.len() < self.floor {
                 return Vec::new();
             }
@@ -2248,7 +2911,7 @@ mod tests {
         for v in [3000_i16, 4000, 5000, 6000] {
             router.push_frame(&frame_of(v));
         }
-        router.enhance_on(FakeStream::new(512, 447));
+        router.enhance_on(FakeStream::new(512, 447))?;
         let spliced = router.next_frame().ok_or("enhanced ready immediately")?;
         assert_eq!(
             spliced.first().copied(),
@@ -2281,7 +2944,7 @@ mod tests {
             router.push_frame(&frame_of(v));
             let _served = router.next_frame().ok_or("raw serve")?;
         }
-        router.enhance_on(FakeStream::new(320, 200));
+        router.enhance_on(FakeStream::new(320, 200))?;
         assert!(
             router.next_frame().is_none(),
             "no backlog, nothing to serve"
@@ -2360,7 +3023,7 @@ mod tests {
     /// enhanced-from-start, and a mid-stream toggle all play exactly
     /// the samples that arrived: no more, no less.
     #[test]
-    fn router_rx_end_totals_match_across_modes() {
+    fn router_rx_end_totals_match_across_modes() -> TestResult {
         fn drain(router: &mut RxTailRouter<FakeStream>) -> usize {
             let mut total = 0_usize;
             while let Some(frame) = router.next_frame() {
@@ -2404,7 +3067,7 @@ mod tests {
             mixed.push_frame(&frame_of(v * 1000));
             mixed_total += drain(&mut mixed);
         }
-        mixed.enhance_on(FakeStream::new(320, 200));
+        mixed.enhance_on(FakeStream::new(320, 200))?;
         for v in 2..n_frames {
             mixed.push_frame(&frame_of(v * 1000));
             mixed_total += drain(&mut mixed);
@@ -2415,5 +3078,6 @@ mod tests {
             mixed_total, expected,
             "a mid-stream toggle (grace path) preserves the total"
         );
+        Ok(())
     }
 }

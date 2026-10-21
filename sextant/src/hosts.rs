@@ -9,7 +9,7 @@
 //! `DPlus` connect. Entries are deduplicated by `(callsign, protocol)`;
 //! the authoritative auth entry wins a collision.
 
-use dstar_gateway_core::types::ProtocolKind;
+use dstar_gateway_core::types::{ProtocolKind, RoutingCallsign};
 
 /// Where a directory entry came from. Decides dedup precedence and
 /// is shown in the picker so a surprising address is explainable.
@@ -69,7 +69,7 @@ pub(crate) enum DirectoryUpdate {
         hosts: Vec<ReflectorHost>,
     },
     /// The auth fetch failed; carries the error text for the status line.
-    AuthFailed(String),
+    AuthFailed(dstar_gateway::auth::AuthError),
 }
 
 /// Fetch the authoritative REF host list from the `DPlus` auth
@@ -77,15 +77,9 @@ pub(crate) enum DirectoryUpdate {
 /// startup). Runs on the tokio runtime; the caller forwards the
 /// returned [`DirectoryUpdate`] to the GUI. Failures are reported
 /// but harmless: the bundled directory remains available.
-pub(crate) async fn fetch_auth_directory(callsign: String) -> DirectoryUpdate {
-    let callsign = match dstar_gateway_core::types::Callsign::try_from_str(callsign.trim()) {
-        Ok(c) => c,
-        Err(e) => {
-            return DirectoryUpdate::AuthFailed(format!("auth callsign {callsign:?}: {e}"));
-        }
-    };
+pub(crate) async fn fetch_auth_directory(callsign: RoutingCallsign) -> DirectoryUpdate {
     match dstar_gateway::auth::AuthClient::new()
-        .authenticate(callsign)
+        .authenticate(callsign.callsign())
         .await
     {
         Ok(host_list) => {
@@ -93,7 +87,7 @@ pub(crate) async fn fetch_auth_directory(callsign: String) -> DirectoryUpdate {
                 .hosts()
                 .iter()
                 .map(|h| ReflectorHost {
-                    callsign: h.callsign.clone(),
+                    callsign: h.callsign.as_str().to_owned(),
                     host: h.address.to_string(),
                     port: 20001,
                     protocol: ProtocolKind::DPlus,
@@ -102,7 +96,7 @@ pub(crate) async fn fetch_auth_directory(callsign: String) -> DirectoryUpdate {
                 .collect();
             DirectoryUpdate::AuthLoaded { hosts }
         }
-        Err(e) => DirectoryUpdate::AuthFailed(format!("dstargateway auth list: {e}")),
+        Err(e) => DirectoryUpdate::AuthFailed(e),
     }
 }
 

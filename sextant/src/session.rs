@@ -13,28 +13,38 @@
 //! operator keys PTT the audio worker sends `StartTx`, then a
 //! `TxFrame(VoiceFrame)` per encoded frame while PTT is held, then
 //! `EndTx` on release; this task turns those into the header,
-//! `send_voice` calls, and EOT on the wire. `TxSilence { seconds }`
-//! remains as a diagnostic that transmits the AMBE silence pattern to
-//! prove the header + voice + EOT path without the mic.
+//! `send_voice` calls, and EOT on the wire. `TxSilence` sends 100
+//! silence frames at 20 ms intervals, followed by EOT.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::audio::{AudioCommand, AudioHandle};
-use crate::geo::{GpsPosition, parse_gps_sentence};
+use crate::geo::{GpsPosition, MAX_GPS_SENTENCE_BYTES, parse_gps_sentence};
+use crate::hosts::DirectoryUpdate;
 use dstar_gateway::tokio_shell::{
-    AnyAsyncSession, AnyEvent, AsyncSession, ConnectError, drive_connecting, fresh_stream_id,
+    AnyAsyncSession, AnyEvent, AsyncSession, ConnectError, ShellError, drive_connecting,
+    fresh_stream_id,
 };
-use dstar_gateway_core::header::DstarHeader;
+use dstar_gateway_core::codec::dplus::DPlusHost;
+use dstar_gateway_core::header::{DstarHeader, RelayRouting};
 use dstar_gateway_core::session::client::{
     Configured, DExtra, DPlus, Dcs, Session, VoiceEndReason,
 };
 use dstar_gateway_core::slowdata::{SlowDataTextCollector, SlowDataTextMessage};
-use dstar_gateway_core::types::{Callsign, Module, ProtocolKind, StreamId, Suffix};
+use dstar_gateway_core::types::{DcsReflector, FrameSequence, RoutingCallsign, StreamId, Suffix};
 use dstar_gateway_core::voice::{AMBE_SILENCE, DSTAR_SYNC_BYTES, VoiceFrame};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
+use tokio::sync::watch;
+
+pub(crate) use self::config::{ConnectConfig, ConnectionIdentity, Endpoint};
+use self::config::{ConnectionProtocol, local_bind_address};
+pub(crate) use self::control::{ControlState, SessionEvents, SessionHandle};
+
+mod config;
+mod control;
 
 /// Pair an active runtime session with the configuration it was
 /// established with. The cfg fields (operator callsign, modules,
@@ -46,24 +56,39 @@ struct ActiveSession {
     cfg: ConnectConfig,
 }
 
-/// Configuration captured by the GUI and handed to the session task
-/// when the user clicks Connect.
-#[derive(Debug, Clone)]
-pub(crate) struct ConnectConfig {
-    /// Protocol family.
-    pub(crate) protocol: ProtocolKind,
-    /// Operator callsign (max 8 ASCII, uppercase).
-    pub(crate) callsign: Callsign,
-    /// Module letter claimed locally.
-    pub(crate) local_module: Module,
-    /// Reflector callsign (embedded in DCS wire packets).
-    pub(crate) reflector_callsign: Callsign,
-    /// Module letter on the reflector being linked.
-    pub(crate) reflector_module: Module,
-    /// Reflector UDP peer address.
-    pub(crate) peer: SocketAddr,
-    /// Auto-reconnect after a reflector-driven disconnect.
-    pub(crate) reconnect_on_drop: bool,
+/// Connection failure retained through resolution, socket and protocol layers.
+#[derive(Debug)]
+enum ConnectFailure {
+    Resolve(std::io::Error),
+    Bind(std::io::Error),
+    NoAddress,
+    Deadline,
+    Core(dstar_gateway_core::error::Error),
+    Handshake(ConnectError),
+}
+
+impl std::fmt::Display for ConnectFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Resolve(error) => write!(f, "resolve reflector: {error}"),
+            Self::Bind(error) => write!(f, "bind reflector socket: {error}"),
+            Self::NoAddress => f.write_str("reflector hostname returned no address"),
+            Self::Deadline => f.write_str("connection exceeded its total deadline"),
+            Self::Core(error) => error.fmt(f),
+            Self::Handshake(error) => f.write_str(&describe_dplus_handshake_error(error)),
+        }
+    }
+}
+
+impl std::error::Error for ConnectFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Resolve(error) | Self::Bind(error) => Some(error),
+            Self::Core(error) => Some(error),
+            Self::Handshake(error) => Some(error),
+            Self::NoAddress | Self::Deadline => None,
+        }
+    }
 }
 
 /// Command emitted by the GUI (or audio worker), consumed by the
@@ -72,29 +97,19 @@ pub(crate) struct ConnectConfig {
 pub(crate) enum SessionCommand {
     /// Establish a session with the given reflector.
     Connect(ConnectConfig),
-    /// Gracefully tear down the current session.
-    Disconnect,
-    /// Send N seconds of AMBE silence for pipeline sanity checks.
-    /// Useful before wiring real mic capture; proves header + voice
-    /// + EOT reach the reflector.
-    TxSilence { seconds: f32 },
+    /// Refresh the directory with one bounded, cancellable authentication.
+    RefreshDirectory(RoutingCallsign),
+    /// Send 100 AMBE silence frames at 20 ms intervals, then EOT.
+    TxSilence,
     /// Begin a TX stream. The audio worker sends this when the
     /// operator keys PTT. The session task generates a fresh stream-id, sends
     /// the header, and starts accepting `TxFrame`s.
-    StartTx {
-        /// Callsign to embed in the D-STAR header `my_call`.
-        my_call: String,
-    },
+    StartTx,
     /// One encoded voice frame from the audio worker. Ignored if no
     /// TX stream is active.
     TxFrame(VoiceFrame),
     /// End the active TX stream: emits EOT and clears state.
     EndTx,
-    /// The audio worker hit a fatal init error (no devices, format
-    /// unsupported, etc.). Forwarded to the GUI as
-    /// [`SessionEvent::Error`] so the user sees "audio is dead"
-    /// instead of pretending PTT works while no frames flow.
-    AudioInitError(String),
 }
 
 /// Routing fields from an RX stream's D-STAR header, display-trimmed.
@@ -128,7 +143,7 @@ pub(crate) enum ConnStatus {
     /// Idle, not connected.
     Disconnected,
     /// Handshake in progress.
-    Connecting { peer: SocketAddr },
+    Connecting { peer: Endpoint },
     /// Connected, showing the remote reflector + module.
     Connected {
         /// Reflector callsign (display-form).
@@ -150,7 +165,7 @@ pub(crate) enum SessionEvent {
     /// An incoming voice stream started.
     VoiceStart {
         /// Stream identifier.
-        stream_id: u16,
+        stream_id: StreamId,
         /// Source callsign (if known).
         from: String,
         /// Routing fields from the stream's D-STAR header.
@@ -159,11 +174,11 @@ pub(crate) enum SessionEvent {
     /// An incoming voice stream ended.
     VoiceEnd {
         /// Stream identifier.
-        stream_id: u16,
+        stream_id: StreamId,
         /// Number of voice frames observed.
         frames: u32,
         /// Reason reported by the core state machine.
-        reason: String,
+        reason: VoiceEndReason,
     },
     /// Hard error: the session task is returning to Disconnected.
     Error(String),
@@ -171,22 +186,22 @@ pub(crate) enum SessionEvent {
     /// assembled from incoming voice frames.
     SlowDataMessage {
         /// Source stream-id (so the GUI can correlate with `VoiceStart`).
-        stream_id: u16,
+        stream_id: StreamId,
         /// Exact 20-byte wire message with a separately validated text view.
         message: SlowDataTextMessage,
     },
     /// A GPS position decoded from incoming slow data.
     GpsPosition {
         /// Source stream-id (correlates with `VoiceStart`).
-        stream_id: u16,
-        /// Latitude, decimal degrees.
-        latitude: f64,
-        /// Longitude, decimal degrees.
-        longitude: f64,
+        stream_id: StreamId,
+        /// Checked geographic position.
+        position: GpsPosition,
     },
     /// Reflector hosts learned from the `DPlus` auth server, forwarded
     /// so the GUI can merge them into the reflector directory.
-    ReflectorHosts(Vec<(String, std::net::IpAddr)>),
+    ReflectorHosts(Vec<DPlusHost>),
+    /// Result of the single in-progress directory request.
+    DirectoryUpdate(DirectoryUpdate),
     /// Per-stream RX link-quality counters. Emitted when a stream
     /// ends (final values) and once per second while one is active.
     RxStats {
@@ -205,12 +220,12 @@ pub(crate) enum SessionEvent {
     },
 }
 
-/// Protocol-generic wrapper over `AsyncSession<P>`. Borrowed verbatim
-/// from the pattern in `thd75-repl/src/main.rs`; same runtime-state
-/// dispatch so the event-pump code can be protocol-agnostic.
 /// Protocol-erased reflector session; the GUI-facing event mapping is
 /// [`RuntimeEvent::from`] over the erased [`AnyEvent`].
 type RuntimeSession = AnyAsyncSession;
+
+/// One owned directory operation, polled alongside session control.
+type DirectoryFetch = std::pin::Pin<Box<dyn Future<Output = DirectoryUpdate> + Send>>;
 
 /// Lightweight state kept while an outgoing voice stream is live.
 ///
@@ -223,15 +238,14 @@ type RuntimeSession = AnyAsyncSession;
 #[derive(Debug)]
 struct TxStream {
     sid: StreamId,
-    seq: u8,
+    seq: FrameSequence,
 }
 
 /// D-STAR superframe length: seq wraps mod this value.
 const SUPERFRAME_LEN: u8 = 21;
 
-/// Longest sequence gap concealed frame-by-frame (10 frames =
-/// 200 ms). Beyond this, repeating one voice posture sounds worse
-/// than a clean dropout, so the stream resyncs instead.
+/// Longest sequence gap concealed frame-by-frame: ten frames or 200 ms.
+/// Larger gaps resynchronize without generating concealment frames.
 const MAX_CONCEAL: u8 = 10;
 
 /// Frames within this distance BEHIND the expected sequence are
@@ -324,46 +338,105 @@ impl From<AnyEvent> for RuntimeEvent {
     }
 }
 
-/// Assembles incoming GPS slow-data: pairs 3-byte fragments into
-/// 6-byte Kenwood blocks (type byte + 5 payload bytes), accumulates
-/// `0x3X` GPS payloads into a sentence buffer, and yields a position
-/// when a `$$CRC` / `$GPRMC` / `$GPGGA` sentence completes. Mirrors
-/// the proven `lodestar-core` block-assembly layout.
+/// A GPS fragment or sentence rejected before position publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GpsAssemblyError {
+    SequenceGap,
+    BlockLength,
+    InvalidByte,
+    Overflow,
+    InvalidSentence,
+}
+
+impl std::fmt::Display for GpsAssemblyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::SequenceGap => "GPS sequence gap; partial sentence discarded",
+            Self::BlockLength => "GPS block length is invalid; partial sentence discarded",
+            Self::InvalidByte => "GPS byte is invalid; discarding through the line terminator",
+            Self::Overflow => {
+                "GPS sentence exceeded 256 bytes; discarding through the line terminator"
+            }
+            Self::InvalidSentence => "GPS sentence was rejected; awaiting another sentence",
+        })
+    }
+}
+
+/// Pairs adjacent odd/even fragments and bounds one ASCII GPS sentence.
+///
+/// `ircDDBGateway/Common/APRSCollector.cpp::writeData` pairs six-byte blocks;
+/// `SlowDataEncoder.cpp::setGPSData` encodes their one-to-five-byte payload width.
+/// A zero low nibble retains the collector's fixed-five-byte receive form.
 #[derive(Debug, Default)]
 struct GpsSlowData {
     /// In-progress 6-byte block (first half in [0..3], second in [3..6]).
     block: [u8; 6],
-    /// True once the first 3-byte half of the current block is in.
-    have_first_half: bool,
+    first_sequence: Option<u8>,
+    last_sequence: Option<u8>,
     /// Accumulated GPS sentence bytes awaiting a terminator.
-    buffer: String,
+    buffer: Vec<u8>,
+    discarding: bool,
+    error: Option<GpsAssemblyError>,
 }
 
 impl GpsSlowData {
     /// Drop all partial state; call on stream boundaries.
     fn reset(&mut self) {
         self.block = [0u8; 6];
-        self.have_first_half = false;
+        self.first_sequence = None;
+        self.last_sequence = None;
         self.buffer.clear();
+        self.discarding = false;
+        self.error = None;
     }
 
     /// Feed one voice frame's slow-data fragment at superframe `seq`.
     /// Returns a [`GpsPosition`] when a sentence completes.
     fn push(&mut self, fragment: [u8; 3], seq: u8) -> Option<GpsPosition> {
-        // seq 0 is the superframe sync frame: no slow data, resync.
+        if seq > 20 {
+            self.reject(GpsAssemblyError::SequenceGap, false);
+            return None;
+        }
+        if self
+            .last_sequence
+            .is_some_and(|last| (last + 1) % 21 != seq)
+        {
+            if !self.buffer.is_empty()
+                || self.discarding
+                || (self.first_sequence.is_some() && self.block[0] & 0xF0 == 0x30)
+            {
+                self.reject(GpsAssemblyError::SequenceGap, false);
+            } else {
+                self.first_sequence = None;
+            }
+        }
+        self.last_sequence = Some(seq);
         if seq == 0 {
-            self.have_first_half = false;
+            self.first_sequence = None;
             return None;
         }
         let plain = dstar_gateway_core::slowdata::descramble(fragment);
-        if self.have_first_half {
+        if seq.is_multiple_of(2) {
+            if self.first_sequence.take() != Some(seq - 1) {
+                return None;
+            }
             self.block[3..6].copy_from_slice(&plain);
-            self.have_first_half = false;
             return self.commit_block();
         }
         self.block[0..3].copy_from_slice(&plain);
-        self.have_first_half = true;
+        self.first_sequence = Some(seq);
         None
+    }
+
+    fn reject(&mut self, error: GpsAssemblyError, discarding: bool) {
+        self.buffer.clear();
+        self.first_sequence = None;
+        self.discarding = discarding;
+        self.error = Some(error);
+    }
+
+    const fn take_error(&mut self) -> Option<GpsAssemblyError> {
+        self.error.take()
     }
 
     /// A complete 6-byte block assembled: route GPS payloads.
@@ -372,14 +445,42 @@ impl GpsSlowData {
         if self.block[0] & 0xF0 != 0x30 {
             return None;
         }
-        // 5 payload bytes follow the type byte.
-        let payload = String::from_utf8_lossy(&self.block[1..6]);
-        self.buffer.push_str(&payload);
-        // GPS sentences terminate with CR (DPRS) or LF (NMEA). Scan
-        // for a complete sentence each time the buffer grows.
-        let end = self.buffer.find(['\r', '\n'])?;
-        let sentence: String = self.buffer.drain(..=end).collect();
-        parse_gps_sentence(&sentence)
+        let length = match self.block[0] & 0x0F {
+            0 => 5,
+            count @ 1..=5 => usize::from(count),
+            _ => {
+                self.reject(GpsAssemblyError::BlockLength, true);
+                return None;
+            }
+        };
+        let mut position = None;
+        for index in 1..=length {
+            let byte = *self.block.get(index)?;
+            if matches!(byte, b'\r' | b'\n') {
+                if !self.discarding && !self.buffer.is_empty() {
+                    position = std::str::from_utf8(&self.buffer)
+                        .ok()
+                        .and_then(parse_gps_sentence);
+                    if position.is_none() {
+                        self.error = Some(GpsAssemblyError::InvalidSentence);
+                    }
+                }
+                self.buffer.clear();
+                self.discarding = false;
+            } else if !self.discarding {
+                if self.buffer.is_empty() && byte != b'$' {
+                    continue;
+                }
+                if !(b' '..=b'~').contains(&byte) {
+                    self.reject(GpsAssemblyError::InvalidByte, true);
+                } else if self.buffer.len() >= MAX_GPS_SENTENCE_BYTES - 1 {
+                    self.reject(GpsAssemblyError::Overflow, true);
+                } else {
+                    self.buffer.push(byte);
+                }
+            }
+        }
+        position
     }
 }
 
@@ -404,7 +505,7 @@ struct EventState {
     /// Stream-id of the currently-active incoming stream, kept so the
     /// `SlowDataMessage` event can correlate with the originating
     /// `VoiceStart` in the GUI log.
-    rx_stream_id: u16,
+    rx_stream_id: Option<StreamId>,
     /// Next expected wire seq (0..21) on the active RX stream;
     /// `None` until the stream's first frame arrives (and between
     /// streams).
@@ -483,6 +584,47 @@ fn apply_gap_policy(state: &mut EventState, seq: u8, decisions: &mut Vec<EventDe
 /// Translate a runtime event into a list of decisions for the run
 /// loop to execute. Pure function; mutates only the supplied
 /// `EventState` counter and slow-data collector.
+fn reject_frame_sequence(seq: u8, state: &mut EventState) -> Vec<EventDecision> {
+    state.frames_late = state.frames_late.saturating_add(1);
+    state.gps.reset();
+    vec![EventDecision::EmitSessionEvent(SessionEvent::Log(format!(
+        "Voice sequence {seq} is outside 0 through 20; frame discarded"
+    )))]
+}
+
+fn decide_voice_frame(seq: u8, frame: VoiceFrame, state: &mut EventState) -> Vec<EventDecision> {
+    if seq > 20 {
+        return reject_frame_sequence(seq, state);
+    }
+    let mut decisions = Vec::new();
+    if !apply_gap_policy(state, seq, &mut decisions) {
+        return decisions;
+    }
+    state.expected_seq = Some((seq + 1) % SUPERFRAME_LEN);
+    state.rx_frame_count = state.rx_frame_count.saturating_add(1);
+    let slow = frame.slow_data;
+    state.slow_data.push(slow, seq);
+    let gps = state.gps.push(slow, seq);
+    if let Some(error) = state.gps.take_error() {
+        decisions.push(EventDecision::EmitSessionEvent(SessionEvent::Log(
+            error.to_string(),
+        )));
+    }
+    decisions.push(EventDecision::AudioRxFrame(frame));
+    if let (Some(message), Some(stream_id)) = (state.slow_data.take_message(), state.rx_stream_id) {
+        decisions.push(EventDecision::EmitSessionEvent(
+            SessionEvent::SlowDataMessage { stream_id, message },
+        ));
+    }
+    if let (Some(position), Some(stream_id)) = (gps, state.rx_stream_id) {
+        decisions.push(EventDecision::EmitSessionEvent(SessionEvent::GpsPosition {
+            stream_id,
+            position,
+        }));
+    }
+    decisions
+}
+
 fn decide_runtime_event(event: RuntimeEvent, state: &mut EventState) -> Vec<EventDecision> {
     match event {
         RuntimeEvent::VoiceStart {
@@ -491,7 +633,7 @@ fn decide_runtime_event(event: RuntimeEvent, state: &mut EventState) -> Vec<Even
             route,
         } => {
             state.rx_frame_count = 0;
-            state.rx_stream_id = stream_id.get();
+            state.rx_stream_id = Some(stream_id);
             state.expected_seq = None;
             state.frames_lost = 0;
             state.frames_late = 0;
@@ -502,49 +644,18 @@ fn decide_runtime_event(event: RuntimeEvent, state: &mut EventState) -> Vec<Even
             vec![
                 EventDecision::AudioRxStart,
                 EventDecision::EmitSessionEvent(SessionEvent::VoiceStart {
-                    stream_id: stream_id.get(),
+                    stream_id,
                     from: my_call,
                     route,
                 }),
             ]
         }
-        RuntimeEvent::VoiceFrame { seq, frame } => {
-            let mut decisions = Vec::new();
-            if !apply_gap_policy(state, seq, &mut decisions) {
-                // Late duplicate, dropped whole, including its
-                // slow-data fragment (its superframe slot has passed).
-                return decisions;
-            }
-            state.expected_seq = Some((seq + 1) % SUPERFRAME_LEN);
-            state.rx_frame_count = state.rx_frame_count.saturating_add(1);
-            // `slow_data` is `[u8; 3]` (`Copy`), so read it out before
-            // `frame` is moved into the `AudioRxFrame` decision so both
-            // the text collector and the GPS assembler can be fed.
-            let slow = frame.slow_data;
-            state.slow_data.push(slow, seq);
-            let gps = state.gps.push(slow, seq);
-            decisions.push(EventDecision::AudioRxFrame(frame));
-            if let Some(message) = state.slow_data.take_message() {
-                decisions.push(EventDecision::EmitSessionEvent(
-                    SessionEvent::SlowDataMessage {
-                        stream_id: state.rx_stream_id,
-                        message,
-                    },
-                ));
-            }
-            if let Some(pos) = gps {
-                decisions.push(EventDecision::EmitSessionEvent(SessionEvent::GpsPosition {
-                    stream_id: state.rx_stream_id,
-                    latitude: pos.latitude,
-                    longitude: pos.longitude,
-                }));
-            }
-            decisions
-        }
+        RuntimeEvent::VoiceFrame { seq, frame } => decide_voice_frame(seq, frame, state),
         RuntimeEvent::VoiceEnd { stream_id, reason } => {
             let frames = state.rx_frame_count;
             let lost = state.frames_lost;
             let late = state.frames_late;
+            state.rx_stream_id = None;
             state.rx_frame_count = 0;
             state.expected_seq = None;
             state.frames_lost = 0;
@@ -561,13 +672,14 @@ fn decide_runtime_event(event: RuntimeEvent, state: &mut EventState) -> Vec<Even
                     late,
                 }),
                 EventDecision::EmitSessionEvent(SessionEvent::VoiceEnd {
-                    stream_id: stream_id.get(),
+                    stream_id,
                     frames,
-                    reason: format!("{reason:?}"),
+                    reason,
                 }),
             ]
         }
         RuntimeEvent::Disconnected { reason } => {
+            state.rx_stream_id = None;
             state.slow_data.reset();
             state.gps.reset();
             vec![
@@ -598,7 +710,8 @@ fn decide_runtime_event(event: RuntimeEvent, state: &mut EventState) -> Vec<Even
 )]
 pub(crate) async fn run(
     mut cmd_rx: mpsc::Receiver<SessionCommand>,
-    evt_tx: mpsc::Sender<SessionEvent>,
+    mut terminal: watch::Receiver<ControlState>,
+    evt_tx: SessionEvents,
     audio: AudioHandle,
 ) {
     let mut session: Option<ActiveSession> = None;
@@ -621,19 +734,53 @@ pub(crate) async fn run(
     // connect) don't burst-catch-up.
     let mut health_tick = tokio::time::interval(Duration::from_secs(1));
     health_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut terminal_generation = 0;
+    let mut directory_fetch: Option<DirectoryFetch> = None;
 
     loop {
+        let request = *terminal.borrow_and_update();
+        if request.generation != terminal_generation || request.shutdown {
+            terminal_generation = request.generation;
+            last_cfg = None;
+            reconnect_at = None;
+            directory_fetch = None;
+            while cmd_rx.try_recv().is_ok() {}
+            retire_session(&mut session, &mut tx_stream, &audio, &evt_tx).await;
+            if request.shutdown {
+                break;
+            }
+        }
         tokio::select! {
+            biased;
+            changed = terminal.changed() => {
+                if changed.is_err() { break; }
+            }
+            update = next_directory_update(&mut directory_fetch), if directory_fetch.is_some() => {
+                directory_fetch = None;
+                let _sent = evt_tx.send(SessionEvent::DirectoryUpdate(update)).await;
+            }
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break };
                 match cmd {
+                    SessionCommand::RefreshDirectory(callsign) => {
+                        if directory_fetch.is_none() {
+                            directory_fetch = Some(Box::pin(crate::hosts::fetch_auth_directory(callsign)));
+                        } else {
+                            let _sent = evt_tx.send(SessionEvent::Log("directory request already in progress".to_owned())).await;
+                        }
+                    }
                     SessionCommand::Connect(cfg) => {
                         if session.is_some() {
                             let _unused = evt_tx.send(SessionEvent::Log("already connected; ignoring Connect".into())).await;
                             continue;
                         }
-                        let _unused = evt_tx.send(SessionEvent::Status(ConnStatus::Connecting { peer: cfg.peer })).await;
-                        match connect(&cfg).await {
+                        let _unused = evt_tx.send(SessionEvent::Status(ConnStatus::Connecting { peer: cfg.endpoint.clone() })).await;
+                        let result = tokio::select! {
+                            biased;
+                            _ = terminal.changed() => continue,
+                            result = connect(&cfg) => result,
+                        };
+                        match result {
                             Ok((rs, auth, hosts)) => {
                                 let _unused = evt_tx.send(SessionEvent::Status(ConnStatus::Connected {
                                     reflector: cfg.reflector_callsign.to_string(),
@@ -667,6 +814,7 @@ pub(crate) async fn run(
                                 // drop can replay it (if reconnect is on).
                                 last_cfg = Some(cfg.clone());
                                 reconnect_at = None;
+                                audio.set_connected(Some(cfg.callsign));
                                 session = Some(ActiveSession { runtime: rs, cfg });
                             }
                             Err(e) => {
@@ -675,20 +823,7 @@ pub(crate) async fn run(
                             }
                         }
                     }
-                    SessionCommand::Disconnect => {
-                        // A user-initiated disconnect must never trigger
-                        // the auto-reconnect path.
-                        last_cfg = None;
-                        reconnect_at = None;
-                        if let Some(mut active) = session.take() {
-                            let _unused = evt_tx.send(SessionEvent::Status(ConnStatus::Disconnecting)).await;
-                            if let Err(e) = active.runtime.disconnect().await {
-                                let _unused = evt_tx.send(SessionEvent::Log(format!("disconnect: {e}"))).await;
-                            }
-                            let _unused = evt_tx.send(SessionEvent::Status(ConnStatus::Disconnected)).await;
-                        }
-                    }
-                    SessionCommand::TxSilence { seconds } => {
+                    SessionCommand::TxSilence => {
                         let Some(active) = session.as_mut() else {
                             let _unused = evt_tx.send(SessionEvent::Log("TX: not connected".into())).await;
                             continue;
@@ -701,12 +836,19 @@ pub(crate) async fn run(
                             )).await;
                             continue;
                         }
-                        if let Err(e) = tx_silence(active, seconds, &evt_tx).await {
+                        let result = tokio::select! {
+                            biased;
+                            _ = terminal.changed() => continue,
+                            result = tx_silence(active, &mut tx_stream, &evt_tx) => result,
+                        };
+                        if let Err(e) = result {
                             let _unused = evt_tx.send(SessionEvent::Error(format!("TX error: {e}"))).await;
+                            retire_session(&mut session, &mut tx_stream, &audio, &evt_tx).await;
                         }
                     }
-                    SessionCommand::StartTx { my_call } => {
+                    SessionCommand::StartTx => {
                         let Some(active) = session.as_mut() else {
+                            audio.set_connected(None);
                             let _unused = evt_tx.send(SessionEvent::Log("StartTx: not connected".into())).await;
                             continue;
                         };
@@ -714,26 +856,13 @@ pub(crate) async fn run(
                             let _unused = evt_tx.send(SessionEvent::Log("StartTx: already transmitting; ignoring".into())).await;
                             continue;
                         }
-                        // Audio-worker-supplied `my_call` is a diagnostic
-                        // hint; the wire identity comes from the
-                        // already-validated `cfg.callsign` so the operator
-                        // can't TX with a callsign different from the one
-                        // they connected with.
-                        if my_call.trim() != active.cfg.callsign.to_string().trim() {
-                            tracing::warn!(
-                                gui_my_call = %my_call,
-                                cfg_callsign = %active.cfg.callsign,
-                                "StartTx: GUI callsign drifted from connect-time callsign; using cfg",
-                            );
-                        }
-                        match start_tx(active).await {
-                            Ok(ts) => {
+                        match start_tx(active, &mut tx_stream).await {
+                            Ok(sid) => {
                                 let _unused = evt_tx.send(SessionEvent::Log(format!(
                                     "TX started sid=0x{:04X} my_call={}",
-                                    ts.sid.get(),
+                                    sid.get(),
                                     active.cfg.callsign,
                                 ))).await;
-                                tx_stream = Some(ts);
                                 // Reset frame counter on stream start.
                                 // `EndTx` only resets when both `session` and
                                 // `tx_stream` are Some; if the session dropped
@@ -744,6 +873,7 @@ pub(crate) async fn run(
                             }
                             Err(e) => {
                                 let _unused = evt_tx.send(SessionEvent::Error(format!("StartTx: {e}"))).await;
+                                retire_session(&mut session, &mut tx_stream, &audio, &evt_tx).await;
                             }
                         }
                     }
@@ -754,28 +884,23 @@ pub(crate) async fn run(
                         tx_frame_count = tx_frame_count.saturating_add(1);
                         tracing::trace!(
                             sid = format_args!("{:#06X}", ts.sid.get()),
-                            seq,
+                            seq = seq.get(),
                             frame_num = tx_frame_count,
                             "TX voice frame"
                         );
                         if let Err(e) = active.runtime.send_voice(ts.sid, seq, frame).await {
                             let _unused = evt_tx.send(SessionEvent::Error(format!("TxFrame: {e}"))).await;
+                            retire_session(&mut session, &mut tx_stream, &audio, &evt_tx).await;
+                            continue;
                         }
-                        ts.seq = (ts.seq + 1) % SUPERFRAME_LEN;
-                    }
-                    SessionCommand::AudioInitError(msg) => {
-                        // Surface once per init failure; the audio worker
-                        // only reports this when it can't open devices.
-                        let _unused = evt_tx.send(SessionEvent::Error(format!(
-                            "audio init failed: {msg}; TX/RX disabled until restart"
-                        ))).await;
+                        ts.seq = ts.seq.next();
                     }
                     SessionCommand::EndTx => {
                         if let (Some(active), Some(ts)) = (session.as_mut(), tx_stream.take()) {
                             let seq = ts.seq;
                             tracing::info!(
                                 sid = format_args!("{:#06X}", ts.sid.get()),
-                                eot_seq = seq,
+                                eot_seq = seq.get(),
                                 frames = tx_frame_count,
                                 "TX ending; sending EOT"
                             );
@@ -796,7 +921,7 @@ pub(crate) async fn run(
                 let Some(ev) = event else {
                     // Session ended / channel closed.
                     let _unused = evt_tx.send(SessionEvent::Log("session event channel closed".into())).await;
-                    session = None;
+                    retire_session(&mut session, &mut tx_stream, &audio, &evt_tx).await;
                     let _unused = evt_tx.send(SessionEvent::Status(ConnStatus::Disconnected)).await;
                     continue;
                 };
@@ -819,7 +944,7 @@ pub(crate) async fn run(
                             audio.send(AudioCommand::RxEnd);
                         }
                         EventDecision::ClearSession => {
-                            session = None;
+                            retire_session(&mut session, &mut tx_stream, &audio, &evt_tx).await;
                             // Schedule an auto-reconnect if the link was
                             // configured for it. First attempt fires
                             // immediately; later attempts back off.
@@ -867,10 +992,15 @@ pub(crate) async fn run(
                 {
                     let _unused = evt_tx
                         .send(SessionEvent::Status(ConnStatus::Connecting {
-                            peer: cfg.peer,
+                            peer: cfg.endpoint.clone(),
                         }))
                         .await;
-                    match connect(&cfg).await {
+                    let result = tokio::select! {
+                        biased;
+                        _ = terminal.changed() => continue,
+                        result = connect(&cfg) => result,
+                    };
+                    match result {
                         Ok((rs, _auth, _hosts)) => {
                             let _unused = evt_tx
                                 .send(SessionEvent::Status(ConnStatus::Connected {
@@ -878,6 +1008,7 @@ pub(crate) async fn run(
                                     module: cfg.reflector_module.as_char(),
                                 }))
                                 .await;
+                            audio.set_connected(Some(cfg.callsign));
                             session = Some(ActiveSession { runtime: rs, cfg });
                         }
                         Err(e) => {
@@ -897,6 +1028,50 @@ pub(crate) async fn run(
             }
         }
     }
+    retire_session(&mut session, &mut tx_stream, &audio, &evt_tx).await;
+}
+
+async fn next_directory_update(request: &mut Option<DirectoryFetch>) -> DirectoryUpdate {
+    match request {
+        Some(future) => future.await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Retain the active handle until EOT, unlink and task completion are observed.
+async fn retire_session(
+    session: &mut Option<ActiveSession>,
+    tx_stream: &mut Option<TxStream>,
+    audio: &AudioHandle,
+    events: &SessionEvents,
+) {
+    audio.set_connected(None);
+    if let Some(mut active) = session.take() {
+        let _sent = events
+            .send(SessionEvent::Status(ConnStatus::Disconnecting))
+            .await;
+        if let Some(stream) = tx_stream.take()
+            && let Err(error) = active.runtime.send_eot(stream.sid, stream.seq).await
+        {
+            let _sent = events
+                .send(SessionEvent::Error(format!("end transmission: {error}")))
+                .await;
+        }
+        if let Err(error) = active.runtime.disconnect().await {
+            let _sent = events
+                .send(SessionEvent::Error(format!("disconnect: {error}")))
+                .await;
+        }
+        if let Err(error) = active.runtime.join().await {
+            let _sent = events
+                .send(SessionEvent::Error(format!("session completion: {error}")))
+                .await;
+        }
+    }
+    *tx_stream = None;
+    let _sent = events
+        .send(SessionEvent::Status(ConnStatus::Disconnected))
+        .await;
 }
 
 /// Reconnect backoff: 0s, 3s, 10s, then 20s for every later attempt.
@@ -941,36 +1116,51 @@ enum AuthOutcome {
 
 async fn connect(
     cfg: &ConnectConfig,
-) -> Result<(RuntimeSession, AuthOutcome, Vec<(String, std::net::IpAddr)>), String> {
+) -> Result<(RuntimeSession, AuthOutcome, Vec<DPlusHost>), ConnectFailure> {
+    connect_with_budget(cfg, HANDSHAKE_DEADLINE).await
+}
+
+/// One total budget includes resolution, optional authentication and handshake.
+async fn connect_with_budget(
+    cfg: &ConnectConfig,
+    budget: Duration,
+) -> Result<(RuntimeSession, AuthOutcome, Vec<DPlusHost>), ConnectFailure> {
+    tokio::time::timeout(budget, async {
+        let peer = cfg.endpoint.resolve().await?;
+        connect_resolved(cfg, peer).await
+    })
+    .await
+    .map_err(|_| ConnectFailure::Deadline)?
+}
+
+async fn connect_resolved(
+    cfg: &ConnectConfig,
+    peer: SocketAddr,
+) -> Result<(RuntimeSession, AuthOutcome, Vec<DPlusHost>), ConnectFailure> {
     match cfg.protocol {
-        ProtocolKind::DExtra => Ok((
-            RuntimeSession::DExtra(connect_dextra(cfg).await?),
+        ConnectionProtocol::DExtra => Ok((
+            RuntimeSession::DExtra(connect_dextra(cfg, peer).await?),
             AuthOutcome::NotApplicable,
             Vec::new(),
         )),
-        ProtocolKind::DPlus => {
-            let (session, auth, host_list) = connect_dplus(cfg).await?;
-            let hosts = host_list
-                .hosts()
-                .iter()
-                .map(|h| (h.callsign.clone(), h.address))
-                .collect();
+        ConnectionProtocol::DPlus => {
+            let (session, auth, host_list) = connect_dplus(cfg, peer).await?;
+            let hosts = host_list.hosts().to_vec();
             Ok((RuntimeSession::DPlus(session), auth, hosts))
         }
-        ProtocolKind::Dcs => Ok((
-            RuntimeSession::Dcs(connect_dcs(cfg).await?),
+        ConnectionProtocol::Dcs(reflector) => Ok((
+            RuntimeSession::Dcs(connect_dcs(cfg, peer, reflector).await?),
             AuthOutcome::NotApplicable,
             Vec::new(),
         )),
-        other => Err(format!("unsupported protocol: {other:?}")),
     }
 }
 
 /// Bind a fresh ephemeral UDP socket for the session.
-async fn bind_session_socket() -> Result<Arc<UdpSocket>, String> {
-    let sock = UdpSocket::bind("0.0.0.0:0")
+async fn bind_session_socket(peer: SocketAddr) -> Result<Arc<UdpSocket>, ConnectFailure> {
+    let sock = UdpSocket::bind(local_bind_address(peer))
         .await
-        .map_err(|e| format!("bind UDP: {e}"))?;
+        .map_err(ConnectFailure::Bind)?;
     Ok(Arc::new(sock))
 }
 
@@ -978,40 +1168,43 @@ async fn bind_session_socket() -> Result<Arc<UdpSocket>, String> {
 /// `dstar-gateway` polls inside this window).
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
 
-async fn connect_dextra(cfg: &ConnectConfig) -> Result<AsyncSession<DExtra>, String> {
-    let sock = bind_session_socket().await?;
+async fn connect_dextra(
+    cfg: &ConnectConfig,
+    peer: SocketAddr,
+) -> Result<AsyncSession<DExtra>, ConnectFailure> {
+    let sock = bind_session_socket(peer).await?;
     let configured = Session::<DExtra, Configured>::builder()
         .callsign(cfg.callsign)
         .local_module(cfg.local_module)
         .reflector_module(cfg.reflector_module)
-        .reflector_callsign(cfg.reflector_callsign)
-        .peer(cfg.peer)
+        .peer(peer)
         .build();
     let connecting = configured
         .connect(Instant::now())
-        .map_err(|f| format!("connect: {}", f.error))?;
+        .map_err(|f| ConnectFailure::Core(f.error))?;
     let connected = drive_connecting(connecting, &sock, HANDSHAKE_DEADLINE)
         .await
-        .map_err(|e| format!("handshake: {e}"))?;
+        .map_err(ConnectFailure::Handshake)?;
     Ok(AsyncSession::spawn(connected, sock))
 }
 
 async fn connect_dplus(
     cfg: &ConnectConfig,
+    peer: SocketAddr,
 ) -> Result<
     (
         AsyncSession<DPlus>,
         AuthOutcome,
         dstar_gateway_core::codec::dplus::HostList,
     ),
-    String,
+    ConnectFailure,
 > {
     // Local test setups rarely have the DPlus TCP auth server so we
     // treat auth as best-effort: try it first, and if it fails use an
     // empty `HostList` to satisfy the typestate. The UDP handshake is
     // identical to DExtra after that.
     let (host_list, auth) = match dstar_gateway::auth::AuthClient::new()
-        .authenticate(cfg.callsign)
+        .authenticate(cfg.callsign.callsign())
         .await
     {
         Ok(h) => (h, AuthOutcome::Authenticated),
@@ -1023,54 +1216,55 @@ async fn connect_dplus(
             )
         }
     };
-    let sock = bind_session_socket().await?;
+    let sock = bind_session_socket(peer).await?;
     let configured = Session::<DPlus, Configured>::builder()
         .callsign(cfg.callsign)
         .local_module(cfg.local_module)
         .reflector_module(cfg.reflector_module)
-        .reflector_callsign(cfg.reflector_callsign)
-        .peer(cfg.peer)
+        .peer(peer)
         .build();
     let authed = configured
         .authenticate(host_list.clone())
-        .map_err(|f| format!("authenticate: {}", f.error))?;
+        .map_err(|f| ConnectFailure::Core(f.error))?;
     let connecting = authed
         .connect(Instant::now())
-        .map_err(|f| format!("connect: {}", f.error))?;
+        .map_err(|f| ConnectFailure::Core(f.error))?;
     let connected = drive_connecting(connecting, &sock, HANDSHAKE_DEADLINE)
         .await
-        .map_err(describe_dplus_handshake_error)?;
+        .map_err(ConnectFailure::Handshake)?;
     Ok((AsyncSession::spawn(connected, sock), auth, host_list))
 }
 
 /// A login NAK (`DPlus` BUSY) closes the session and surfaces as
-/// [`ConnectError::Rejected`]; name the likely cause instead of
-/// passing a bare rejection to the operator.
-fn describe_dplus_handshake_error(e: ConnectError) -> String {
+/// [`ConnectError::Rejected`]; the refusal alone identifies no cause.
+fn describe_dplus_handshake_error(e: &ConnectError) -> String {
     match e {
-        ConnectError::Rejected => "reflector refused the link (BUSY); \
-             DPlus authorization for your callsign/IP may still be \
-             propagating"
-            .to_string(),
+        ConnectError::Rejected => {
+            "reflector refused the link (BUSY); verify the target and authorization".to_string()
+        }
         other => format!("handshake: {other}"),
     }
 }
 
-async fn connect_dcs(cfg: &ConnectConfig) -> Result<AsyncSession<Dcs>, String> {
-    let sock = bind_session_socket().await?;
+async fn connect_dcs(
+    cfg: &ConnectConfig,
+    peer: SocketAddr,
+    reflector: DcsReflector,
+) -> Result<AsyncSession<Dcs>, ConnectFailure> {
+    let sock = bind_session_socket(peer).await?;
     let configured = Session::<Dcs, Configured>::builder()
         .callsign(cfg.callsign)
         .local_module(cfg.local_module)
         .reflector_module(cfg.reflector_module)
-        .reflector_callsign(cfg.reflector_callsign)
-        .peer(cfg.peer)
+        .dcs_reflector(reflector)
+        .peer(peer)
         .build();
     let connecting = configured
         .connect(Instant::now())
-        .map_err(|f| format!("connect: {}", f.error))?;
+        .map_err(|f| ConnectFailure::Core(f.error))?;
     let connected = drive_connecting(connecting, &sock, HANDSHAKE_DEADLINE)
         .await
-        .map_err(|e| format!("handshake: {e}"))?;
+        .map_err(ConnectFailure::Handshake)?;
     Ok(AsyncSession::spawn(connected, sock))
 }
 
@@ -1078,14 +1272,19 @@ async fn connect_dcs(cfg: &ConnectConfig) -> Result<AsyncSession<Dcs>, String> {
 /// return the tracking state. The header is built via
 /// [`DstarHeader::for_relay`] so `rpt1[7]` / `rpt2[7]` carry the
 /// validated module letters strict reflectors (xlxd-derived) demand.
-async fn start_tx(active: &mut ActiveSession) -> Result<TxStream, String> {
+async fn start_tx(
+    active: &mut ActiveSession,
+    stream: &mut Option<TxStream>,
+) -> Result<StreamId, ShellError> {
     let sid = fresh_stream_id();
     let header = DstarHeader::for_relay(
-        active.cfg.callsign,
-        active.cfg.local_module,
-        active.cfg.reflector_callsign,
-        active.cfg.reflector_module,
-        active.cfg.callsign,
+        RelayRouting {
+            operator: active.cfg.callsign,
+            local_module: active.cfg.local_module,
+            reflector: active.cfg.reflector_callsign,
+            reflector_module: active.cfg.reflector_module,
+        },
+        active.cfg.callsign.callsign(),
         Suffix::EMPTY,
     );
     tracing::info!(
@@ -1097,58 +1296,26 @@ async fn start_tx(active: &mut ActiveSession) -> Result<TxStream, String> {
         rpt2_module = %active.cfg.reflector_module,
         "TX starting; sending header"
     );
-    active
-        .runtime
-        .send_header(header, sid)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(TxStream { sid, seq: 0 })
+    *stream = Some(TxStream {
+        sid,
+        seq: FrameSequence::ZERO,
+    });
+    active.runtime.send_header(header, sid).await?;
+    Ok(sid)
 }
 
-/// TX pipeline sanity check: send `seconds` worth of AMBE silence.
-/// Proves header + voice + EOT reach the reflector without needing
-/// mic capture or the AMBE encoder. Uses the operator's configured
-/// callsign and the same [`DstarHeader::for_relay`] convention as
-/// real PTT, so the silence test exercises the same wire identity
-/// the operator will be transmitting under.
+/// Send 100 AMBE silence frames using the established routing identity.
+/// Cancellation retains the active stream for explicit EOT during retirement.
 async fn tx_silence(
     active: &mut ActiveSession,
-    seconds: f32,
-    evt_tx: &mpsc::Sender<SessionEvent>,
-) -> Result<(), String> {
-    // D-STAR voice frame rate is 50 fps (20 ms). Clamp sane bounds:
-    // 0.2 s minimum (10 frames, enough for a header + EOT pair with a
-    // brief gap), 10 s maximum to keep an accidental infinite loop
-    // from holding the mic open on a shared reflector.
-    let frames_f = (seconds.clamp(0.2, 10.0) * 50.0).round();
-    #[expect(
-        clippy::cast_sign_loss,
-        clippy::cast_possible_truncation,
-        reason = "seconds is clamped to 0.2..=10.0 and multiplied by 50, yielding \
-                  10.0..=500.0 before rounding; the result is always a small positive \
-                  integer that fits in u32 with no sign loss or truncation."
-    )]
-    let total_frames = frames_f as u32;
-
-    let sid = fresh_stream_id();
-
-    let header = DstarHeader::for_relay(
-        active.cfg.callsign,
-        active.cfg.local_module,
-        active.cfg.reflector_callsign,
-        active.cfg.reflector_module,
-        active.cfg.callsign,
-        Suffix::EMPTY,
-    );
-
-    active
-        .runtime
-        .send_header(header, sid)
-        .await
-        .map_err(|e| e.to_string())?;
+    tx_stream: &mut Option<TxStream>,
+    evt_tx: &SessionEvents,
+) -> Result<(), ShellError> {
+    let sid = start_tx(active, tx_stream).await?;
+    let total_frames = 100_u32;
     let _unused = evt_tx
         .send(SessionEvent::Log(format!(
-            "TX: sent header, sending {total_frames} silence frames ({seconds:.1}s)"
+            "TX: sent header, sending {total_frames} silence frames"
         )))
         .await;
 
@@ -1156,44 +1323,20 @@ async fn tx_silence(
         ambe: AMBE_SILENCE,
         slow_data: DSTAR_SYNC_BYTES,
     };
-    let start = Instant::now();
-    // D-STAR encodes seq in the low 6 bits of the wire byte with bit 6
-    // reserved as the EOT flag.  Wrapping mod 256 (as a prior revision
-    // did) sets bit 6 at `i == 64`, which the reflector parses as an
-    // EOT and silently closes the stream, 1.28 s into the helper's
-    // supposedly-10-s run.  Wrap mod SUPERFRAME_LEN (21) to match the
-    // real-mic TxFrame handler above and stay clear of bit 6.
-    for i in 0..total_frames {
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "Modulo SUPERFRAME_LEN (21) keeps the result in 0..=20, which \
-                      trivially fits in u8."
-        )]
-        let seq = (i % u32::from(SUPERFRAME_LEN)) as u8;
-        active
-            .runtime
-            .send_voice(sid, seq, frame)
-            .await
-            .map_err(|e| e.to_string())?;
-        // Natural 20 ms pacing that avoids flooding the reflector. Real
-        // mic capture will inherently pace itself at 50 fps.
-        tokio::time::sleep_until(tokio::time::Instant::from_std(
-            start + Duration::from_millis(20 * u64::from(i + 1)),
-        ))
-        .await;
+    for _ in 0..total_frames {
+        let Some(stream) = tx_stream.as_mut() else {
+            return Ok(());
+        };
+        let sequence = stream.seq;
+        active.runtime.send_voice(sid, sequence, frame).await?;
+        stream.seq = sequence.next();
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "Modulo SUPERFRAME_LEN (21) keeps the result in 0..=20, which \
-                  trivially fits in u8."
-    )]
-    let eot_seq = (total_frames % u32::from(SUPERFRAME_LEN)) as u8;
-    active
-        .runtime
-        .send_eot(sid, eot_seq)
-        .await
-        .map_err(|e| e.to_string())?;
+    if let Some(stream) = tx_stream.as_ref() {
+        active.runtime.send_eot(sid, stream.seq).await?;
+    }
+    *tx_stream = None;
     let _unused = evt_tx
         .send(SessionEvent::Log(format!(
             "TX: sent EOT ({total_frames} frames)"
@@ -1311,9 +1454,9 @@ mod tests {
         assert!(matches!(
             second,
             EventDecision::EmitSessionEvent(SessionEvent::VoiceStart {
-                stream_id: 0x1234,
+                stream_id,
                 ..
-            })
+            }) if stream_id.get() == 0x1234
         ));
         Ok(())
     }
@@ -1346,7 +1489,7 @@ mod tests {
         use dstar_gateway_core::slowdata::scramble;
 
         let mut state = EventState {
-            rx_stream_id: 0xABCD,
+            rx_stream_id: Some(sid(0xABCD)),
             ..EventState::default()
         };
         // 8 half-blocks (4 blocks × 2 halves) at non-zero seqs;
@@ -1376,7 +1519,8 @@ mod tests {
                 }) = d
                 {
                     assert_eq!(
-                        stream_id, 0xABCD,
+                        stream_id.get(),
+                        0xABCD,
                         "slow-data message tagged with active stream"
                     );
                     emitted_message = Some(message);
@@ -1393,7 +1537,7 @@ mod tests {
         use dstar_gateway_core::slowdata::scramble;
 
         let mut state = EventState {
-            rx_stream_id: 0xBEEF,
+            rx_stream_id: Some(sid(0xBEEF)),
             ..EventState::default()
         };
         let halves: [[u8; 3]; 8] = [
@@ -1531,7 +1675,7 @@ mod tests {
         else {
             return Err(format!("expected VoiceEnd decision, got {third:?}").into());
         };
-        assert_eq!(*stream_id, 0x9ABC);
+        assert_eq!(stream_id.get(), 0x9ABC);
         assert_eq!(
             *frames, 42,
             "frame count must be the value at the moment of EOT"
@@ -1568,19 +1712,14 @@ mod tests {
         );
     }
 
-    /// Feeding the fixed-6-byte-block GPS slow-data for a complete
-    /// DPRS sentence must surface a `GpsPosition` decision once the
-    /// sentence terminator (`\r`) lands. The sentence literal is the
-    /// Asheville example from the `dprs` parser's own test corpus
-    /// (35°30.00'N / 82°33.00'W).
+    /// A complete CRC-checked sentence spans a sync frame without losing bytes.
     #[test]
     fn slow_data_assembles_gps_position() -> TestResult {
         use dstar_gateway_core::slowdata::scramble;
 
-        let sentence: &[u8] =
-            b"$$CRC0000,W1AW    *>APDPRS,DSTAR*:!3530.00N/08233.00W#/Asheville test\r";
+        let sentence: &[u8] = b"$$CRC8FF2,W1AW>APDPRS,DSTAR*:!3530.00N/08233.00W>Asheville test\r";
         let mut state = EventState {
-            rx_stream_id: 0x5678,
+            rx_stream_id: Some(sid(0x5678)),
             ..EventState::default()
         };
         let mut emitted: Option<(f64, f64)> = None;
@@ -1603,15 +1742,28 @@ mod tests {
                     decide_runtime_event(RuntimeEvent::VoiceFrame { seq, frame }, &mut state);
                 for d in decisions {
                     if let EventDecision::EmitSessionEvent(SessionEvent::GpsPosition {
-                        latitude,
-                        longitude,
+                        position,
                         ..
                     }) = d
                     {
-                        emitted = Some((latitude, longitude));
+                        emitted = Some((position.latitude(), position.longitude()));
                     }
                 }
-                seq = if seq >= 20 { 1 } else { seq + 1 };
+                if seq == 20 {
+                    let _sync = decide_runtime_event(
+                        RuntimeEvent::VoiceFrame {
+                            seq: 0,
+                            frame: VoiceFrame {
+                                ambe: AMBE_SILENCE,
+                                slow_data: DSTAR_SYNC_BYTES,
+                            },
+                        },
+                        &mut state,
+                    );
+                    seq = 1;
+                } else {
+                    seq += 1;
+                }
             }
         }
         let (lat, lon) = emitted.ok_or("no GPS position decoded from slow data")?;
@@ -1624,6 +1776,57 @@ mod tests {
             "Asheville longitude {lon} out of expected band"
         );
         Ok(())
+    }
+
+    #[test]
+    fn gps_overflow_and_invalid_framing_are_observable() {
+        use super::{GpsAssemblyError, GpsSlowData, MAX_GPS_SENTENCE_BYTES};
+        use dstar_gateway_core::slowdata::scramble;
+        let mut gps = GpsSlowData {
+            block: *b"\x35$AAAA",
+            ..GpsSlowData::default()
+        };
+        let _position = gps.commit_block();
+        gps.block = *b"\x35AAAAA";
+        for _ in 0..MAX_GPS_SENTENCE_BYTES {
+            let _position = gps.commit_block();
+        }
+        assert!(gps.buffer.len() < MAX_GPS_SENTENCE_BYTES);
+        assert!(gps.discarding);
+        assert_eq!(gps.take_error(), Some(GpsAssemblyError::Overflow));
+        gps.block = *b"\x35\rxxxx";
+        let _position = gps.commit_block();
+        assert!(!gps.discarding);
+        let _position = gps.push(scramble(*b"\x35$G"), 1);
+        let _position = gps.push(scramble(*b"PRM"), 3);
+        assert_eq!(gps.take_error(), Some(GpsAssemblyError::SequenceGap));
+        gps.block = *b"\x36$AAAA";
+        let _position = gps.commit_block();
+        assert_eq!(gps.take_error(), Some(GpsAssemblyError::BlockLength));
+        gps.reset();
+        gps.block = [0x35, b'$', 0xff, b'A', b'A', b'A'];
+        let _position = gps.commit_block();
+        assert_eq!(gps.take_error(), Some(GpsAssemblyError::InvalidByte));
+    }
+
+    #[test]
+    fn unknown_receive_sequence_cannot_overflow_gap_arithmetic() {
+        let mut state = EventState::default();
+        let decisions = decide_runtime_event(
+            RuntimeEvent::VoiceFrame {
+                seq: u8::MAX,
+                frame: VoiceFrame {
+                    ambe: AMBE_SILENCE,
+                    slow_data: DSTAR_SYNC_BYTES,
+                },
+            },
+            &mut state,
+        );
+        assert_eq!(state.frames_late, 1);
+        assert!(matches!(
+            decisions.as_slice(),
+            [EventDecision::EmitSessionEvent(SessionEvent::Log(_))]
+        ));
     }
 
     /// The mod-21 ring is split into zones: exact match, concealable
@@ -1826,7 +2029,7 @@ mod tests {
         use dstar_gateway::tokio_shell::{ConnectError, drive_connecting};
         use dstar_gateway_core::codec::dplus::HostList;
         use dstar_gateway_core::session::client::{Configured, DPlus, Session};
-        use dstar_gateway_core::types::{Callsign, Module};
+        use dstar_gateway_core::types::{Module, RoutingCallsign};
 
         // Fake reflector: reply BUSY to every datagram, like a REF
         // refusing an unauthorized IP.
@@ -1842,12 +2045,11 @@ mod tests {
             }
         });
 
-        let sock = super::bind_session_socket().await?;
+        let sock = super::bind_session_socket(peer).await?;
         let configured = Session::<DPlus, Configured>::builder()
-            .callsign(Callsign::try_from_str("W1AW")?)
+            .callsign(RoutingCallsign::new("W1AW")?)
             .local_module(Module::C)
             .reflector_module(Module::C)
-            .reflector_callsign(Callsign::try_from_str("REF030")?)
             .peer(peer)
             .build();
         let authed = configured
@@ -1864,10 +2066,96 @@ mod tests {
             matches!(error, ConnectError::Rejected),
             "BUSY must surface as a rejection, not a timeout: {error:?}"
         );
-        let message = super::describe_dplus_handshake_error(error);
+        let message = super::describe_dplus_handshake_error(&error);
         assert!(
             message.contains("refused"),
             "operator message names the refusal: {message}"
+        );
+        Ok(())
+    }
+}
+#[cfg(test)]
+mod lifecycle_tests {
+    fn loopback_config(
+        peer: std::net::SocketAddr,
+    ) -> Result<super::ConnectConfig, Box<dyn std::error::Error>> {
+        use dstar_gateway_core::types::{Module, ProtocolKind, RoutingCallsign};
+
+        let identity = super::ConnectionIdentity {
+            operator: RoutingCallsign::new("W1AW")?,
+            local_module: Module::A,
+            reflector: RoutingCallsign::new("POLARIS")?,
+            reflector_module: Module::B,
+        };
+        Ok(super::ConnectConfig::new(
+            ProtocolKind::DExtra,
+            identity,
+            super::Endpoint::new(
+                peer.ip().into(),
+                std::num::NonZeroU16::new(peer.port()).ok_or("loopback port is nonzero")?,
+            ),
+            false,
+        )?)
+    }
+
+    #[tokio::test]
+    async fn connection_budget_covers_the_entire_silent_handshake()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        let config = loopback_config(server.local_addr()?)?;
+        let started = std::time::Instant::now();
+        let result = super::connect_with_budget(&config, std::time::Duration::from_millis(7)).await;
+        assert!(
+            matches!(result, Err(super::ConnectFailure::Deadline)),
+            "total budget was ignored: {result:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "connection waited for the nested handshake deadline"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disconnect_cancels_an_in_progress_handshake_without_audio_devices()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        let config = loopback_config(server.local_addr()?)?;
+        let (handle, commands, terminal) = super::SessionHandle::channel();
+        let events = super::SessionEvents::default();
+        let (audio, _status) = crate::audio::AudioHandle::test_handle();
+        let mut task = tokio::spawn(super::run(commands, terminal, events.clone(), audio));
+        handle.try_send(super::SessionCommand::Connect(config))?;
+        let mut bytes = [0; 64];
+        let _packet = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            server.recv_from(&mut bytes),
+        )
+        .await??;
+        handle.disconnect();
+        let disconnected = tokio::time::timeout(std::time::Duration::from_millis(200), async {
+            loop {
+                if matches!(
+                    events.try_recv(),
+                    Ok(super::SessionEvent::Status(super::ConnStatus::Disconnected))
+                ) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        handle.shutdown();
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(1), &mut task).await;
+        if completed.is_err() {
+            task.abort();
+            let _cancelled = task.await;
+            return Err("session ignored shutdown during handshake".into());
+        }
+        completed??;
+        assert!(
+            disconnected.is_ok(),
+            "disconnect waited for connection completion"
         );
         Ok(())
     }

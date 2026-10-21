@@ -19,21 +19,22 @@
 //! `ui::settings_popup`). A dismissable error strip sits under the
 //! header on both pages.
 
-use std::net::SocketAddr;
-use std::sync::mpsc as std_mpsc;
+use std::num::NonZeroU16;
 
+use dstar_gateway_core::hosts::HostAddress;
 use dstar_gateway_core::slowdata::SlowDataTextMessage;
-use dstar_gateway_core::types::{Callsign, Module, ProtocolKind};
+use dstar_gateway_core::types::{Module, ProtocolKind, RoutingCallsign};
 use eframe::egui;
-use tokio::runtime::Runtime;
-use tokio::sync::mpsc;
 
-use crate::audio::{AudioCommand, AudioHandle, AudioStatus};
-use crate::geo::TxPosition;
+use crate::audio::{AudioCommand, AudioHandle, AudioMailbox, AudioStatus, FileProgress};
+use crate::geo::{GpsPosition, TxPosition};
 use crate::heard::HeardList;
 use crate::hosts::{DirectoryUpdate, ReflectorDirectory};
-use crate::session::{ConnStatus, ConnectConfig, RxRoute, SessionCommand, SessionEvent};
-use crate::settings::{self, RxAudioMode, SavedHost, Settings, TimeMode};
+use crate::session::{
+    ConnStatus, ConnectConfig, ConnectionIdentity, Endpoint, RxRoute, SessionCommand, SessionEvent,
+    SessionEvents, SessionHandle,
+};
+use crate::settings::{self, RxAudioMode, SavedHost, SavedHostFields, Settings, TimeMode};
 use crate::ui;
 
 /// Maximum lines kept in the event-log buffer. Older lines drop off
@@ -81,7 +82,7 @@ pub(crate) struct App {
     /// Stations heard this session.
     pub(crate) heard: HeardList,
     /// Most recent decoded RX position (latitude, longitude).
-    pub(crate) last_gps: Option<(f64, f64)>,
+    pub(crate) last_gps: Option<GpsPosition>,
     /// Loss counters for the current (or most recent) RX stream.
     pub(crate) last_rx_stats: Option<RxStreamStats>,
     /// Seconds since the reflector was last heard from (1 Hz sample).
@@ -104,7 +105,7 @@ pub(crate) struct App {
     /// Set while an RX voice stream is active (drives the hero
     /// elapsed timer); cleared on `VoiceEnd` / disconnect.
     pub(crate) rx_active_since: Option<std::time::Instant>,
-    /// Set while transmitting (drives the ON AIR elapsed timer).
+    /// Set while transmitting (drives the TX ACTIVE elapsed timer).
     pub(crate) tx_active_since: Option<std::time::Instant>,
     /// Timestamp display mode (heard list + event log).
     pub(crate) time_mode: TimeMode,
@@ -132,19 +133,13 @@ pub(crate) struct App {
     pub(crate) recents: Vec<SavedHost>,
 
     // --- channels ---
-    cmd_tx: mpsc::Sender<SessionCommand>,
-    evt_rx: mpsc::Receiver<SessionEvent>,
+    cmd_tx: SessionHandle,
+    /// The submitted target, retained until connection completion.
+    pending_target: Option<SavedHost>,
+    evt_rx: SessionEvents,
     audio: AudioHandle,
     /// Status channel from the audio worker.
-    audio_status_rx: std_mpsc::Receiver<AudioStatus>,
-    /// Result channel for background directory fetches.
-    directory_rx: std_mpsc::Receiver<DirectoryUpdate>,
-    /// Sender cloned into each spawned fetch task.
-    directory_tx: std_mpsc::Sender<DirectoryUpdate>,
-
-    // Owns the runtime so it lives for the whole app lifetime; also
-    // used to spawn background directory fetches.
-    runtime: Runtime,
+    audio_status_rx: AudioMailbox,
 }
 
 /// One line in the event log.
@@ -213,6 +208,10 @@ pub(crate) struct AudioState {
     pub(crate) rx_level: f32,
     /// True while a recording is active.
     pub(crate) recording: bool,
+    /// Remaining local file audio, while decoding is active.
+    pub(crate) playback: Option<FileProgress>,
+    /// Remaining outgoing file audio, while decoding is active.
+    pub(crate) file_tx: Option<FileProgress>,
 }
 
 /// The operator's manual GPS-beacon entry form. Latitude / longitude
@@ -250,11 +249,10 @@ impl App {
     /// `audio`.
     pub(crate) fn new(
         cc: &eframe::CreationContext<'_>,
-        cmd_tx: mpsc::Sender<SessionCommand>,
-        evt_rx: mpsc::Receiver<SessionEvent>,
+        cmd_tx: SessionHandle,
+        evt_rx: SessionEvents,
         audio: AudioHandle,
-        audio_status_rx: std_mpsc::Receiver<AudioStatus>,
-        runtime: Runtime,
+        audio_status_rx: AudioMailbox,
         local_offset: Option<time::UtcOffset>,
     ) -> Self {
         crate::theme::apply(&cc.egui_ctx);
@@ -286,15 +284,10 @@ impl App {
         // intentionally not loaded because their plaintext source cannot be
         // authenticated.
         let directory = ReflectorDirectory::bundled_only();
-        let (directory_tx, directory_rx) = std_mpsc::channel();
+        if let Ok(callsign) = RoutingCallsign::new(&settings.callsign.trim().to_ascii_uppercase())
+            && let Err(error) = cmd_tx.try_send(SessionCommand::RefreshDirectory(callsign))
         {
-            // Authoritative REF list from the DPlus auth server, the
-            // same startup exchange every DPlus dongle performs.
-            let tx = directory_tx.clone();
-            let callsign = settings.callsign.clone();
-            let _join = runtime.spawn(async move {
-                let _send = tx.send(crate::hosts::fetch_auth_directory(callsign).await);
-            });
+            tracing::error!(%error, "startup directory request was rejected");
         }
         Self {
             callsign: settings.callsign,
@@ -346,19 +339,17 @@ impl App {
             favorites: settings.favorites,
             recents: settings.recents,
             cmd_tx,
+            pending_target: None,
             evt_rx,
             audio,
             audio_status_rx,
-            directory_rx,
-            directory_tx,
-            runtime,
         }
     }
 
     /// Drain pending [`AudioStatus`] messages from the audio worker
     /// into the GUI's audio-state fields.
     fn drain_audio_status(&mut self) {
-        while let Ok(status) = self.audio_status_rx.try_recv() {
+        for status in self.audio_status_rx.drain() {
             match status {
                 AudioStatus::DeviceList { inputs, outputs } => {
                     self.audio_state.inputs = inputs;
@@ -371,45 +362,62 @@ impl App {
                 AudioStatus::Recording(active) => {
                     self.audio_state.recording = active;
                 }
-            }
-        }
-    }
-
-    /// Drain pending [`DirectoryUpdate`]s from background `DPlus` auth
-    /// fetches into the directory.
-    fn drain_directory(&mut self) {
-        while let Ok(update) = self.directory_rx.try_recv() {
-            match update {
-                DirectoryUpdate::AuthLoaded { hosts } => {
-                    let count = hosts.len();
-                    self.directory.replace_auth_hosts(hosts);
-                    self.append_log_line(
-                        LogLevel::Info,
-                        format!("loaded {count} REF hosts from the dstargateway auth server"),
-                    );
+                AudioStatus::Transmitting(active) => {
+                    self.active_tx = active;
+                    self.tx_active_since = active.then(std::time::Instant::now);
                 }
-                DirectoryUpdate::AuthFailed(err) => {
-                    self.directory.set_status(format!(
-                        "reflector list: DPlus auth fetch failed ({err}); bundled list available"
-                    ));
-                    self.append_log_line(
-                        LogLevel::Error,
-                        format!("DPlus reflector directory fetch failed: {err}"),
-                    );
+                AudioStatus::Playback(progress) => self.audio_state.playback = progress,
+                AudioStatus::FileTx(progress) => self.audio_state.file_tx = progress,
+                AudioStatus::Error(error) => {
+                    let message = error.to_string();
+                    self.last_error = Some(message.clone());
+                    self.append_log_line(LogLevel::Error, message);
                 }
             }
         }
     }
 
-    /// Spawn an on-demand refresh of the authoritative dstargateway REF list.
+    /// Apply the completed, session-owned directory operation.
+    fn apply_directory(&mut self, update: DirectoryUpdate) {
+        match update {
+            DirectoryUpdate::AuthLoaded { hosts } => {
+                let count = hosts.len();
+                self.directory.replace_auth_hosts(hosts);
+                self.append_log_line(
+                    LogLevel::Info,
+                    format!("loaded {count} REF hosts from the dstargateway auth server"),
+                );
+            }
+            DirectoryUpdate::AuthFailed(err) => {
+                self.directory.set_status(format!(
+                    "reflector list: DPlus auth fetch failed ({err}); bundled list available"
+                ));
+                self.append_log_line(
+                    LogLevel::Error,
+                    format!("DPlus reflector directory fetch failed: {err}"),
+                );
+            }
+        }
+    }
+
+    /// Queue a refresh of the authoritative dstargateway REF list.
     pub(crate) fn refresh_directory(&mut self) {
         self.directory
             .set_status("reflector list: fetching DPlus auth directory…".into());
-        let tx = self.directory_tx.clone();
-        let callsign = self.callsign.clone();
-        let _join = self.runtime.spawn(async move {
-            let _send = tx.send(crate::hosts::fetch_auth_directory(callsign).await);
-        });
+        let result = RoutingCallsign::new(&self.callsign.trim().to_ascii_uppercase());
+        match result {
+            Ok(callsign) => {
+                if let Err(error) = self
+                    .cmd_tx
+                    .try_send(SessionCommand::RefreshDirectory(callsign))
+                {
+                    self.last_error = Some(format!(
+                        "Directory request rejected: {error}; retry when the session is ready"
+                    ));
+                }
+            }
+            Err(error) => self.last_error = Some(format!("Directory callsign rejected: {error}")),
+        }
     }
 
     /// The UTC offset timestamps are displayed in, per the operator's
@@ -444,6 +452,7 @@ impl App {
         // When we disconnect, make sure the PTT toggle resets so the
         // GUI can't get stuck "transmitting" without an active session.
         if matches!(s, ConnStatus::Disconnected) {
+            self.pending_target = None;
             self.active_tx = false;
             self.audio.send(AudioCommand::StopTx);
             // Clear stale RX state from the prior session;
@@ -465,15 +474,10 @@ impl App {
             // Remember the connection and persist: a successful
             // connect is a natural checkpoint, and saving here means
             // recents survive a crash.
-            let entry = SavedHost {
-                callsign: self.reflector_callsign.trim().to_uppercase(),
-                host: self.reflector_host.clone(),
-                port: self.reflector_port.clone(),
-                protocol: format!("{:?}", self.protocol),
-                module: self.reflector_module,
-            };
-            settings::push_recent(&mut self.recents, entry);
-            self.snapshot_settings().save();
+            if let Some(entry) = self.pending_target.take() {
+                settings::push_recent(&mut self.recents, entry);
+            }
+            self.persist_settings();
         }
     }
 
@@ -514,7 +518,7 @@ impl App {
                 } => {
                     self.append_log_line(
                         LogLevel::Event,
-                        format!("VoiceEnd sid=0x{stream_id:04X} frames={frames} reason={reason}"),
+                        format!("VoiceEnd sid=0x{stream_id:04X} frames={frames} reason={reason:?}"),
                     );
                     self.rx_active_since = None;
                 }
@@ -535,17 +539,20 @@ impl App {
                 }
                 SessionEvent::GpsPosition {
                     stream_id,
-                    latitude,
-                    longitude,
+                    position,
                 } => {
                     self.append_log_line(
                         LogLevel::Event,
-                        format!("GPS sid=0x{stream_id:04X} {latitude:.4},{longitude:.4}"),
+                        format!(
+                            "GPS sid=0x{stream_id:04X} {:.4},{:.4}",
+                            position.latitude(),
+                            position.longitude()
+                        ),
                     );
                     if let Some(callsign) = self.current_rx_callsign.clone() {
-                        self.heard.record_gps(&callsign, latitude, longitude);
+                        self.heard.record_gps(&callsign, position);
                     }
-                    self.last_gps = Some((latitude, longitude));
+                    self.last_gps = Some(position);
                 }
                 SessionEvent::RxStats {
                     received,
@@ -568,9 +575,9 @@ impl App {
                     let count = hosts.len();
                     let merged = hosts
                         .into_iter()
-                        .map(|(callsign, addr)| crate::hosts::ReflectorHost {
-                            callsign,
-                            host: addr.to_string(),
+                        .map(|host| crate::hosts::ReflectorHost {
+                            callsign: host.callsign.as_str().to_owned(),
+                            host: host.address.to_string(),
                             port: 20001,
                             protocol: ProtocolKind::DPlus,
                             source: crate::hosts::HostSource::DPlusAuth,
@@ -582,11 +589,18 @@ impl App {
                         format!("loaded {count} REF hosts from DPlus auth"),
                     );
                 }
+                SessionEvent::DirectoryUpdate(update) => self.apply_directory(update),
             }
         }
     }
 
     pub(crate) fn try_connect(&mut self) {
+        if self.pending_target.is_some() || !matches!(self.status, ConnStatus::Disconnected) {
+            self.last_error = Some(
+                "Connection already active; disconnect before choosing another target".to_owned(),
+            );
+            return;
+        }
         let cfg = match self.build_connect_config() {
             Ok(c) => c,
             Err(e) => {
@@ -595,30 +609,75 @@ impl App {
                 return;
             }
         };
-        // Record the identity every attempt goes out as: a stale
-        // callsign silently poisons DPlus auth, so the log must make
-        // it visible per-attempt.
+        let target = match SavedHost::new(SavedHostFields {
+            callsign: &self.reflector_callsign.trim().to_ascii_uppercase(),
+            host: self.reflector_host.trim(),
+            port: self.reflector_port.trim(),
+            protocol: &format!("{:?}", self.protocol),
+            module: self.reflector_module,
+        }) {
+            Ok(target) => target,
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                return;
+            }
+        };
         self.append_log_line(
             LogLevel::Info,
             format!(
                 "connecting as {} → {} module {}",
-                cfg.callsign,
+                cfg.callsign(),
                 self.reflector_callsign.trim().to_uppercase(),
                 self.reflector_module
             ),
         );
-        let _unused = self.cmd_tx.try_send(SessionCommand::Connect(cfg));
+        match self.cmd_tx.try_send(SessionCommand::Connect(cfg)) {
+            Ok(()) => self.pending_target = Some(target),
+            Err(error) => {
+                self.last_error = Some(format!(
+                    "Connection request rejected: {error}; retry when the session is ready"
+                ));
+            }
+        }
     }
 
-    pub(crate) fn try_disconnect(&self) {
-        let _unused = self.cmd_tx.try_send(SessionCommand::Disconnect);
+    pub(crate) fn try_disconnect(&mut self) {
+        self.cmd_tx.disconnect();
         // Persist current form state when the user voluntarily
         // disconnects; this is the natural checkpoint where they're
         // most likely to have settled on the values they want next time.
-        self.snapshot_settings().save();
+        self.persist_settings();
         if self.persist_heard_list {
-            self.heard.save();
+            self.persist_heard();
         }
+    }
+
+    pub(crate) fn persist_settings(&mut self) {
+        let result = self.snapshot_settings().save();
+        self.report_save("settings", result);
+    }
+
+    fn persist_heard(&mut self) {
+        let result = self.heard.save();
+        self.report_save("heard stations", result);
+    }
+
+    fn report_save(
+        &mut self,
+        snapshot: &str,
+        result: Result<Option<crate::persistence::SaveOutcome>, crate::persistence::SnapshotError>,
+    ) {
+        let message = match result {
+            Ok(Some(outcome)) => {
+                tracing::debug!(snapshot, ?outcome, "snapshot saved");
+                return;
+            }
+            Ok(None) => format!("{snapshot} were not saved: configuration directory unavailable"),
+            Err(error) => format!("{snapshot} were not saved completely: {error}"),
+        };
+        tracing::error!(%message);
+        self.last_error = Some(message.clone());
+        self.append_log_line(LogLevel::Error, message);
     }
 
     pub(crate) fn snapshot_settings(&self) -> Settings {
@@ -650,106 +709,92 @@ impl App {
     /// True when `host` is starred (matched by callsign + protocol,
     /// the same key the directory dedupes on).
     pub(crate) fn is_favorite(&self, host: &crate::hosts::ReflectorHost) -> bool {
-        let proto = format!("{:?}", host.protocol);
-        self.favorites
-            .iter()
-            .any(|f| f.callsign.eq_ignore_ascii_case(&host.callsign) && f.protocol == proto)
+        self.favorites.iter().any(|f| {
+            f.callsign()
+                .to_string()
+                .eq_ignore_ascii_case(&host.callsign)
+                && f.protocol() == host.protocol
+        })
     }
 
     /// Star / unstar a directory entry and persist immediately.
     pub(crate) fn toggle_favorite(&mut self, host: &crate::hosts::ReflectorHost) {
         let proto = format!("{:?}", host.protocol);
-        if let Some(pos) = self
-            .favorites
-            .iter()
-            .position(|f| f.callsign.eq_ignore_ascii_case(&host.callsign) && f.protocol == proto)
-        {
+        if let Some(pos) = self.favorites.iter().position(|f| {
+            f.callsign()
+                .to_string()
+                .eq_ignore_ascii_case(&host.callsign)
+                && f.protocol() == host.protocol
+        }) {
             let _removed = self.favorites.remove(pos);
         } else {
-            self.favorites.push(SavedHost {
-                callsign: host.callsign.clone(),
-                host: host.host.clone(),
-                port: host.port.to_string(),
-                protocol: proto,
+            if self.favorites.len() >= settings::FAVORITES_CAP {
+                self.last_error =
+                    Some("Favorite list full; remove a target before adding another".to_owned());
+                return;
+            }
+            let saved = SavedHost::new(SavedHostFields {
+                callsign: &host.callsign,
+                host: &host.host,
+                port: &host.port.to_string(),
+                protocol: &proto,
                 module: self.reflector_module,
             });
+            match saved {
+                Ok(saved) => self.favorites.push(saved),
+                Err(error) => {
+                    self.last_error = Some(error.to_string());
+                    return;
+                }
+            }
         }
-        self.snapshot_settings().save();
+        self.persist_settings();
     }
 
     /// Fill the connection form from a saved favorite / recent.
     pub(crate) fn apply_saved_host(&mut self, saved: &SavedHost) {
-        self.reflector_callsign.clone_from(&saved.callsign);
-        self.reflector_host.clone_from(&saved.host);
-        self.reflector_port.clone_from(&saved.port);
-        self.protocol = match saved.protocol.as_str() {
-            "DPlus" => ProtocolKind::DPlus,
-            "Dcs" | "DCS" => ProtocolKind::Dcs,
-            _ => ProtocolKind::DExtra,
-        };
-        self.reflector_module = saved.module;
+        self.reflector_callsign = saved.callsign().to_string();
+        self.reflector_host = saved.host().to_string();
+        self.reflector_port = saved.port().to_string();
+        self.protocol = saved.protocol();
+        self.reflector_module = saved.module().as_char();
     }
 
     pub(crate) fn toggle_ptt(&mut self) {
         if self.active_tx {
-            self.active_tx = false;
-            self.tx_active_since = None;
             self.audio.send(AudioCommand::StopTx);
         } else if matches!(self.status, ConnStatus::Connected { .. }) {
-            self.active_tx = true;
-            self.tx_active_since = Some(std::time::Instant::now());
-            self.audio.send(AudioCommand::StartTx {
-                my_call: self.callsign.clone(),
-            });
+            self.audio.send(AudioCommand::StartTx);
         } else {
             self.append_log_line(LogLevel::Error, "cannot TX: not connected".into());
         }
     }
 
-    /// Push-to-talk via the spacebar. Press = key down (TX on), release
-    /// = key up (TX off + EOT). Suppressed while a text field has
-    /// focus so typing a space in the callsign / host fields doesn't
-    /// inadvertently key up the radio.
-    fn handle_ptt_keybinding(&mut self, ctx: &egui::Context) {
-        let typing = ctx.memory(|m| m.focused().is_some());
-        if typing {
-            return;
-        }
+    /// Start transmission on Space outside an editable field; always stop on
+    /// release, including when focus changes during the transmission.
+    fn handle_ptt_keybinding(&self, ctx: &egui::Context) {
         let connected = matches!(self.status, ConnStatus::Connected { .. });
-        let (pressed, released) = ctx.input(|i| {
-            (
-                i.key_pressed(egui::Key::Space),
-                i.key_released(egui::Key::Space),
-            )
-        });
-        if pressed && connected && !self.active_tx {
-            self.active_tx = true;
-            self.tx_active_since = Some(std::time::Instant::now());
-            self.audio.send(AudioCommand::StartTx {
-                my_call: self.callsign.clone(),
-            });
-        }
-        if released && self.active_tx {
-            self.active_tx = false;
-            self.tx_active_since = None;
-            self.audio.send(AudioCommand::StopTx);
+        if let Some(command) = ptt_command(ctx, connected, self.active_tx) {
+            self.audio.send(command);
         }
     }
 
-    pub(crate) fn tx_silence_test(&self) {
-        let _unused = self
-            .cmd_tx
-            .try_send(SessionCommand::TxSilence { seconds: 2.0 });
+    pub(crate) fn tx_silence_test(&mut self) {
+        if let Err(error) = self.cmd_tx.try_send(SessionCommand::TxSilence) {
+            self.last_error = Some(format!(
+                "Silence request rejected: {error}; retry when the session is ready"
+            ));
+        }
     }
 
     /// Apply the selected audio devices to the worker and persist the
     /// choice. Called when the operator changes a device in the panel.
-    pub(crate) fn apply_audio_devices(&self) {
+    pub(crate) fn apply_audio_devices(&mut self) {
         self.audio.send(AudioCommand::SelectDevices {
             input: (!self.input_device.is_empty()).then(|| self.input_device.clone()),
             output: (!self.output_device.is_empty()).then(|| self.output_device.clone()),
         });
-        self.snapshot_settings().save();
+        self.persist_settings();
     }
 
     /// Ask the audio worker to re-enumerate available devices.
@@ -783,6 +828,11 @@ impl App {
         }
     }
 
+    /// Stop local WAV decoding while buffered speaker samples drain.
+    pub(crate) fn stop_playback(&self) {
+        self.audio.send(AudioCommand::StopPlayback);
+    }
+
     /// Transmit the WAV at `wav_path` as an outgoing voice stream.
     pub(crate) fn transmit_wav(&self) {
         let path = self.wav_path.trim();
@@ -800,6 +850,9 @@ impl App {
         } else {
             None
         };
+        if self.tx_gps.enabled && gps.is_none() {
+            self.last_error = Some("GPS beacon is disabled: correct the coordinates, one ASCII symbol and a printable comment of at most 43 bytes".to_owned());
+        }
         let (command, error) = build_slow_data_update(&self.tx_slow_text, gps);
         self.audio.send(command);
         if let Some(error) = error {
@@ -808,18 +861,16 @@ impl App {
     }
 
     /// Parse the manual GPS fields into a [`TxPosition`], or `None` if
-    /// the latitude / longitude fields aren't valid in-range numbers.
+    /// coordinates, primary-table symbol or plain-text comment are invalid.
     pub(crate) fn parse_tx_gps(&self) -> Option<TxPosition> {
         let latitude: f64 = self.tx_gps.lat.trim().parse().ok()?;
         let longitude: f64 = self.tx_gps.lon.trim().parse().ok()?;
-        let symbol = self.tx_gps.symbol.chars().next().unwrap_or('/');
-        let pos = TxPosition {
-            latitude,
-            longitude,
-            symbol,
-            comment: self.tx_gps.comment.clone(),
-        };
-        pos.validated().cloned()
+        let mut symbols = self.tx_gps.symbol.chars();
+        let symbol = symbols.next()?;
+        if symbols.next().is_some() {
+            return None;
+        }
+        TxPosition::new(latitude, longitude, symbol, &self.tx_gps.comment).ok()
     }
 
     /// Operator page: interim composition re-homing the existing
@@ -845,10 +896,11 @@ impl App {
     }
 
     fn build_connect_config(&self) -> Result<ConnectConfig, String> {
-        let callsign = Callsign::try_from_str(&self.callsign)
+        let callsign = RoutingCallsign::new(&self.callsign.trim().to_ascii_uppercase())
             .map_err(|e| format!("callsign {:?}: {e}", self.callsign))?;
-        let reflector_callsign = Callsign::try_from_str(&self.reflector_callsign)
-            .map_err(|e| format!("reflector callsign {:?}: {e}", self.reflector_callsign))?;
+        let reflector_callsign =
+            RoutingCallsign::new(&self.reflector_callsign.trim().to_ascii_uppercase())
+                .map_err(|e| format!("reflector callsign {:?}: {e}", self.reflector_callsign))?;
         let local_module = Module::try_from_char(self.local_module)
             .map_err(|e| format!("local module {}: {e}", self.local_module))?;
         let reflector_module = Module::try_from_char(self.reflector_module)
@@ -858,19 +910,21 @@ impl App {
             .trim()
             .parse()
             .map_err(|e| format!("port {:?}: {e}", self.reflector_port))?;
-        let addr_str = format!("{}:{}", self.reflector_host.trim(), port);
-        let peer: SocketAddr = addr_str
-            .parse()
-            .map_err(|e| format!("peer {addr_str:?}: {e}"))?;
-        Ok(ConnectConfig {
-            protocol: self.protocol,
-            callsign,
-            local_module,
-            reflector_callsign,
-            reflector_module,
-            peer,
-            reconnect_on_drop: self.reconnect_on_drop,
-        })
+        let port = NonZeroU16::new(port).ok_or("reflector port must be nonzero")?;
+        let host = HostAddress::new(self.reflector_host.trim())
+            .map_err(|error| format!("reflector address: {error}"))?;
+        ConnectConfig::new(
+            self.protocol,
+            ConnectionIdentity {
+                operator: callsign,
+                local_module,
+                reflector: reflector_callsign,
+                reflector_module,
+            },
+            Endpoint::new(host, port),
+            self.reconnect_on_drop,
+        )
+        .map_err(|error| error.to_string())
     }
 }
 
@@ -913,16 +967,15 @@ impl eframe::App for App {
     /// Persist form state when the window closes, covering the common
     /// case of quitting without an explicit disconnect.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.snapshot_settings().save();
+        self.persist_settings();
         if self.persist_heard_list {
-            self.heard.save();
+            self.persist_heard();
         }
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
         self.drain_audio_status();
-        self.drain_directory();
         self.handle_ptt_keybinding(ctx);
 
         let _unused = egui::TopBottomPanel::top("header")
@@ -955,25 +1008,91 @@ impl eframe::App for App {
     }
 }
 
+/// Translate keyboard state into a worker request with release taking priority.
+fn ptt_command(ctx: &egui::Context, connected: bool, active: bool) -> Option<AudioCommand> {
+    let typing = ctx.memory(|memory| memory.focused().is_some());
+    ctx.input(|input| {
+        if input.key_released(egui::Key::Space) {
+            Some(AudioCommand::StopTx)
+        } else if input.key_pressed(egui::Key::Space) && !typing && connected && !active {
+            Some(AudioCommand::StartTx)
+        } else {
+            None
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{LogFilter, LogLevel, build_slow_data_update};
+    use super::{LogFilter, LogLevel, build_slow_data_update, egui};
     use crate::audio::AudioCommand;
     use crate::geo::TxPosition;
 
     #[test]
-    fn status_text_covers_every_variant() {
-        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    fn space_release_stops_transmission_after_focus_moves_into_a_field() {
+        let context = egui::Context::default();
+        let key = |pressed| egui::Event::Key {
+            key: egui::Key::Space,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        context.begin_pass(egui::RawInput {
+            events: vec![key(true)],
+            ..Default::default()
+        });
+        assert!(matches!(
+            super::ptt_command(&context, true, false),
+            Some(AudioCommand::StartTx)
+        ));
+        let _output = context.end_pass();
 
-        use crate::session::ConnStatus;
+        context.begin_pass(egui::RawInput {
+            events: vec![key(false)],
+            ..Default::default()
+        });
+        context.memory_mut(|memory| memory.request_focus(egui::Id::new("callsign")));
+        assert!(
+            context.memory(|memory| memory.focused().is_some()),
+            "test must exercise focused input"
+        );
+        assert!(
+            matches!(
+                super::ptt_command(&context, true, true),
+                Some(AudioCommand::StopTx)
+            ),
+            "focused input swallowed the stop request"
+        );
+        let _output = context.end_pass();
+
+        context.begin_pass(egui::RawInput {
+            events: vec![key(true)],
+            ..Default::default()
+        });
+        context.memory_mut(|memory| memory.request_focus(egui::Id::new("callsign")));
+        assert!(
+            super::ptt_command(&context, true, false).is_none(),
+            "typing a space started transmission"
+        );
+        let _output = context.end_pass();
+    }
+
+    #[test]
+    fn status_text_covers_every_variant() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::session::{ConnStatus, Endpoint};
         use crate::ui::fmt_status;
         assert_eq!(fmt_status(&ConnStatus::Disconnected), "disconnected");
-        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30001);
+        let peer = Endpoint::new(
+            dstar_gateway_core::hosts::HostAddress::new("127.0.0.1")?,
+            std::num::NonZeroU16::new(30001).ok_or("nonzero port")?,
+        );
         assert!(
             fmt_status(&ConnStatus::Connecting { peer }).contains("127.0.0.1"),
             "connecting shows the peer"
         );
         assert_eq!(fmt_status(&ConnStatus::Disconnecting), "disconnecting…");
+        Ok(())
     }
 
     #[test]
@@ -988,13 +1107,9 @@ mod tests {
     }
 
     #[test]
-    fn rejected_slow_data_text_clears_stale_text_and_keeps_gps() {
-        let gps = TxPosition {
-            latitude: 35.5951,
-            longitude: -82.5515,
-            symbol: '/',
-            comment: "test".to_owned(),
-        };
+    fn rejected_slow_data_text_clears_stale_text_and_keeps_gps()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let gps = TxPosition::new(35.5951, -82.5515, '/', "test")?;
         let (command, error) = build_slow_data_update(&"X".repeat(21), Some(gps.clone()));
 
         assert!(
@@ -1011,5 +1126,6 @@ mod tests {
             ),
             "a rejected edit must clear scheduled text without dropping valid GPS"
         );
+        Ok(())
     }
 }

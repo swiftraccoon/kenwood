@@ -17,16 +17,6 @@
 
 #![windows_subsystem = "windows"]
 
-mod app;
-mod audio;
-mod geo;
-mod heard;
-mod hosts;
-mod session;
-mod settings;
-mod theme;
-mod ui;
-
 use std::env;
 use std::path::PathBuf;
 
@@ -38,11 +28,26 @@ use tracing_subscriber::fmt;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
+mod app;
+mod audio;
+mod bundle;
+mod geo;
+mod heard;
+mod hosts;
+mod persistence;
+mod session;
+mod settings;
+mod theme;
+mod ui;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // MUST be the first statement: the local UTC offset can only be
     // read soundly while the process is single-threaded (Unix env
     // rules); logging and the tokio runtime both spawn threads.
     let local_offset = time::UtcOffset::current_local_offset().ok();
+    if bundle::run_if_requested(env::args_os().skip(1))? {
+        return Ok(());
+    }
 
     let _log_guard = init_logging();
 
@@ -55,21 +60,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Channels between the GUI thread and the async session task.
     // `cmd` flows GUI -> session (connect, disconnect, start/stop TX).
-    // `evt` flows session -> GUI (status changes, log lines, RX audio
-    // frames). Bounded capacities keep memory usage predictable; GUI
-    // updates are lossless because `evt` is drained every redraw.
-    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(32);
-    let (evt_tx, evt_rx) = tokio::sync::mpsc::channel(1024);
+    // `evt` flows session -> GUI with coalesced status and counted overflow.
+    // Incoming audio uses the worker's separate bounded command path.
+    let (session_control, cmd_rx, terminal) = session::SessionHandle::channel();
+    let cmd_tx = session_control.clone();
+    let evt_rx = session::SessionEvents::default();
+    let evt_tx = evt_rx.clone();
+    let final_session_events = evt_rx.clone();
 
-    // Build the audio worker BEFORE the session so we can hand its
-    // `AudioHandle` down into the session loop.  The session task
-    // routes incoming voice frames straight to the audio worker
-    // (bypassing the GUI) so decode + playback aren't gated by the
-    // egui redraw cadence (~50 ms → would mangle the 50 fps voice
-    // stream otherwise).
-    let (audio, audio_status_rx) = audio::AudioHandle::start(cmd_tx.clone())?;
+    // The session routes incoming frames directly to the audio worker,
+    // independently of the GUI's 50 ms repaint cadence.
+    let (audio, audio_status_rx, audio_worker) = audio::AudioHandle::start(cmd_tx.audio_sender())?;
+    let final_audio_status = audio_status_rx.clone();
     let audio_for_session = audio.clone();
-    let _session_handle = runtime.spawn(session::run(cmd_rx, evt_tx, audio_for_session));
+    let session_handle = runtime.spawn(session::run(cmd_rx, terminal, evt_tx, audio_for_session));
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -79,7 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
 
-    eframe::run_native(
+    let gui_result = eframe::run_native(
         "sextant",
         native_options,
         Box::new(move |cc| {
@@ -89,12 +93,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 evt_rx,
                 audio,
                 audio_status_rx,
-                runtime,
                 local_offset,
             )))
         }),
     )
-    .map_err(|e| format!("eframe error: {e}").into())
+    .map_err(|e| format!("eframe error: {e}"));
+    session_control.shutdown();
+    let mut failures = Vec::new();
+    if let Err(error) = gui_result {
+        failures.push(error);
+    }
+    if audio_worker.shutdown().is_err() {
+        failures.push("audio worker panicked during shutdown".to_owned());
+    }
+    if let Err(error) = runtime.block_on(session_handle) {
+        failures.push(format!("session task failed: {error}"));
+    }
+    for status in final_audio_status.drain() {
+        if let audio::AudioStatus::Error(error) = status {
+            failures.push(format!("audio completion: {error}"));
+        }
+    }
+    while let Ok(event) = final_session_events.try_recv() {
+        if let session::SessionEvent::Error(error) = event {
+            failures.push(format!("session completion: {error}"));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; ").into())
+    }
 }
 
 /// Set up tracing: always-on file sink (`~/Library/Logs/sextant/` on

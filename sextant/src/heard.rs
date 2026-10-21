@@ -12,6 +12,9 @@ use std::path::PathBuf;
 
 use time::OffsetDateTime;
 
+use crate::geo::GpsPosition;
+use crate::persistence::{SaveOutcome, SnapshotError, read_snapshot, save_snapshot};
+
 /// Maximum stations retained; oldest-heard evicted past this.
 const MAX_STATIONS: usize = 100;
 
@@ -28,7 +31,7 @@ pub(crate) struct HeardStation {
     /// Most recent slow-data text message, if any.
     pub(crate) last_message: Option<String>,
     /// Most recent decoded position (latitude, longitude), if any.
-    pub(crate) last_gps: Option<(f64, f64)>,
+    pub(crate) last_gps: Option<GpsPosition>,
 }
 
 /// Recency-ordered heard-station list, bounded to `MAX_STATIONS`.
@@ -63,9 +66,9 @@ impl HeardList {
     }
 
     /// Attach a decoded position to the named station.
-    pub(crate) fn record_gps(&mut self, callsign: &str, lat: f64, lon: f64) {
+    pub(crate) fn record_gps(&mut self, callsign: &str, position: GpsPosition) {
         if let Some(s) = self.stations.iter_mut().find(|s| s.callsign == callsign) {
-            s.last_gps = Some((lat, lon));
+            s.last_gps = Some(position);
         }
     }
 
@@ -115,15 +118,24 @@ impl HeardList {
                 body.push_str(&ts.unix_timestamp().to_string());
             }
             body.push('\t');
-            if let Some((lat, lon)) = s.last_gps {
-                let _w = write!(body, "{lat:.6}\t{lon:.6}");
+            if let Some(position) = s.last_gps {
+                let _w = write!(
+                    body,
+                    "{:.6}\t{:.6}",
+                    position.latitude(),
+                    position.longitude()
+                );
             } else {
                 body.push('\t');
             }
             body.push('\t');
             if let Some(msg) = &s.last_message {
                 for ch in msg.chars() {
-                    body.push(if ch == '\t' || ch == '\n' { ' ' } else { ch });
+                    body.push(if matches!(ch, '\t' | '\n' | '\r') {
+                        ' '
+                    } else {
+                        ch
+                    });
                 }
             }
             body.push('\n');
@@ -158,8 +170,11 @@ impl HeardList {
                 last_heard,
                 stream_count: count.parse().unwrap_or(0),
                 last_message,
-                last_gps: lat.zip(lon),
+                last_gps: lat
+                    .zip(lon)
+                    .and_then(|(lat, lon)| GpsPosition::new(lat, lon)),
             });
+            list.evict_oldest();
         }
         list
     }
@@ -169,26 +184,18 @@ impl HeardList {
         let Some(path) = Self::path() else {
             return Self::default();
         };
-        let Ok(raw) = std::fs::read_to_string(&path) else {
+        let Ok(raw) = read_snapshot(&path) else {
             return Self::default();
         };
         Self::deserialize(&raw)
     }
 
-    /// Persist the current station list. Logs and swallows IO errors;
-    /// heard-list persistence must never block shutdown.
-    pub(crate) fn save(&self) {
+    /// Publish the station snapshot atomically and return its durability boundary.
+    pub(crate) fn save(&self) -> Result<Option<SaveOutcome>, SnapshotError> {
         let Some(path) = Self::path() else {
-            return;
+            return Ok(None);
         };
-        if let Some(parent) = path.parent()
-            && std::fs::create_dir_all(parent).is_err()
-        {
-            return;
-        }
-        if let Err(e) = std::fs::write(&path, self.serialize()) {
-            tracing::warn!(error = %e, "could not write heard-list");
-        }
+        save_snapshot(&path, self.serialize().as_bytes()).map(Some)
     }
 }
 
@@ -245,7 +252,10 @@ mod tests {
         list.record_stream("W1AW", t0);
         list.record_stream("W1AW", t0);
         list.record_message("W1AW", "73 de CT".into());
-        list.record_gps("W1AW", 41.714_775, -72.727_260);
+        list.record_gps(
+            "W1AW",
+            GpsPosition::new(41.714_775, -72.727_260).ok_or("position")?,
+        );
         list.record_stream("K4XYZ", ts(1_800_000_100)?);
 
         let restored = HeardList::deserialize(&list.serialize());
@@ -262,7 +272,8 @@ mod tests {
             Some("73 de CT"),
             "message survives"
         );
-        let (lat, lon) = w1aw.last_gps.ok_or("position survives")?;
+        let position = w1aw.last_gps.ok_or("position survives")?;
+        let (lat, lon) = (position.latitude(), position.longitude());
         assert!((lat - 41.714_775).abs() < 1e-5, "lat survives, got {lat}");
         assert!((lon - -72.727_260).abs() < 1e-5, "lon survives, got {lon}");
         Ok(())

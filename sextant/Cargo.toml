@@ -1,70 +1,48 @@
 [package]
 name = "sextant"
 version = "0.1.0"
-edition = "2024"
-rust-version = "1.94"
-description = "Desktop GUI client for D-STAR reflectors (DExtra / DPlus / DCS). Companion to the POLARIS test reflector."
-license = "GPL-2.0-or-later OR GPL-3.0-or-later"
 authors = ["swiftraccoon"]
-repository = "https://github.com/swiftraccoon/kenwood"
-readme = "README.md"
-keywords = ["dstar", "ham-radio", "reflector", "gui"]
 categories = ["multimedia", "network-programming"]
+edition = "2024"
+keywords = ["dstar", "ham-radio", "reflector", "gui"]
+license = "GPL-2.0-or-later OR GPL-3.0-or-later"
 publish = false
+readme = "README.md"
+repository = "https://github.com/swiftraccoon/kenwood"
+rust-version = "1.94"
+description = "Desktop GUI client for D-STAR reflectors (DExtra / DPlus / DCS)"
 
 [[bin]]
 name = "sextant"
 path = "src/main.rs"
 
 [dependencies]
-# Protocol.
+cpal = "0.15"
+dirs-next = "2"
 dstar-gateway = { path = "../dstar-gateway" }
 dstar-gateway-core = { path = "../dstar-gateway-core" }
-# Voice codec: enable encoder feature for TX path. This pulls the
-# GPL-3.0-or-later provisions in via mbelib-rs's encoder module, which
-# is why this crate is dual-licensed GPL-2+/GPL-3+. wave-enhance adds
-# the causal live waveform enhancer behind the "Enhance RX audio"
-# operator toggle (off by default at runtime).
-mbelib-rs = { path = "../mbelib-rs", features = ["encoder", "wave-enhance"] }
-
-# Async runtime.
-tokio = { version = "1", features = [
-  "rt-multi-thread",
-  "macros",
-  "sync",
-  "time",
-  "net",
-  "signal",
-] }
-
-# GUI.
 eframe = { version = "0.29", default-features = false, features = [
-  "default_fonts",
-  "glow",
-  "wayland",
-  "x11",
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
 ] }
 egui = "0.29"
-
-# Audio I/O.
-cpal = "0.15"
+hound = "3"
+# Encoder and causal waveform enhancement are selected explicitly; RX enhancement
+# remains an operator setting that defaults to raw decoder output.
+mbelib-rs = { path = "../mbelib-rs", features = ["encoder", "wave-enhance"] }
 ringbuf = "0.5"
 rubato = "0.16"
-hound = "3"
-
-# Tracing.
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", default-features = false, features = [
-  "fmt",
-  "env-filter",
-] }
-tracing-appender = "0.2"
 time = { version = "0.3", default-features = false, features = [
-  "formatting",
-  "local-offset",
-  "macros",
+    "formatting",
+    "local-offset",
+    "macros",
 ] }
-dirs-next = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
 
 [lints]
 workspace = true

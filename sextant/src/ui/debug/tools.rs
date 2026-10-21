@@ -59,7 +59,27 @@ fn tx_tools_section(app: &mut App, ui: &mut egui::Ui) {
         {
             app.transmit_wav();
         }
+        if app.active_tx && ui.button("Stop transmission").clicked() {
+            app.toggle_ptt();
+        }
     });
+    if let Some(progress) = app.audio_state.playback {
+        ui.label(format!(
+            "Local playback: {}s remaining of {}s",
+            progress.remaining().as_secs(),
+            progress.total().as_secs()
+        ));
+        if ui.button("Stop playback").clicked() {
+            app.stop_playback();
+        }
+    }
+    if let Some(progress) = app.audio_state.file_tx {
+        ui.label(format!(
+            "File transmission: {}s remaining of {}s",
+            progress.remaining().as_secs(),
+            progress.total().as_secs()
+        ));
+    }
 }
 
 /// Device pickers, RX meter, record toggle.

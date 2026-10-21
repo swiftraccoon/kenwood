@@ -5,28 +5,33 @@
 //!
 //! Saves the user-editable fields (callsign, reflector host/port,
 //! protocol, modules) to a `key = value` text file in the platform's
-//! config directory and reloads them on the next launch. Hand-rolled
-//! parser keeps the dep footprint at zero.
+//! config directory and reloads them on the next launch.
 //!
 //! The file lives at:
 //! - macOS:   `~/Library/Application Support/sextant/settings.toml`
 //! - Linux:   `~/.config/sextant/settings.toml` (or `$XDG_CONFIG_HOME/sextant/settings.toml`)
 //! - Windows: `%APPDATA%\sextant\settings.toml`
 //!
-//! `.toml` extension is for editor syntax highlighting; the actual
-//! parser only handles `key = "value"` lines so it's a strict subset
-//! of TOML.
+//! The supported TOML subset contains quoted strings, escaped controls and bare
+//! booleans. Missing keys use defaults; malformed files fall back to defaults.
 //!
-//! Save/load failures are logged at `warn` and ignored; the user
-//! still gets defaults if the file is missing or malformed, and a
-//! corrupt file is overwritten on the next save.
+//! Saving returns the file/directory completion boundary or a typed failure.
+//! A failed temporary-file write preserves the previous snapshot.
 
 use std::path::PathBuf;
 
 use tracing::{debug, warn};
 
+pub(crate) use self::saved::{SavedHost, SavedHostFields};
+use self::saved::{decode_saved, encode_saved};
+use crate::persistence::{SaveOutcome, SnapshotError, read_snapshot, save_snapshot};
+
+mod saved;
+
 /// Maximum entries kept in the recent-connections list.
 pub(crate) const RECENTS_CAP: usize = 8;
+/// Maximum starred targets retained by the application.
+pub(crate) const FAVORITES_CAP: usize = 128;
 
 /// Marks settings whose persisted reflector addresses were created after
 /// automatic plaintext-XLX directory ingestion was removed. Older settings
@@ -102,56 +107,12 @@ impl RxAudioMode {
     }
 }
 
-/// One remembered reflector connection (a favorite or a recent).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SavedHost {
-    /// Reflector callsign (e.g. `REF030`).
-    pub(crate) callsign: String,
-    /// Host name or IP.
-    pub(crate) host: String,
-    /// UDP port (string form, matching the form fields it fills).
-    pub(crate) port: String,
-    /// Protocol family as its `Debug` repr (`DExtra`, `DPlus`, `Dcs`).
-    pub(crate) protocol: String,
-    /// Reflector module letter.
-    pub(crate) module: char,
-}
-
 /// Insert (or promote) `entry` at the front of `recents`,
 /// deduplicating and truncating to [`RECENTS_CAP`].
 pub(crate) fn push_recent(recents: &mut Vec<SavedHost>, entry: SavedHost) {
     recents.retain(|e| e != &entry);
     recents.insert(0, entry);
     recents.truncate(RECENTS_CAP);
-}
-
-/// `callsign|host|port|protocol|module`; `|` never appears in
-/// callsigns, hostnames, ports, or protocol names.
-fn encode_saved(s: &SavedHost) -> String {
-    format!(
-        "{}|{}|{}|{}|{}",
-        s.callsign, s.host, s.port, s.protocol, s.module
-    )
-}
-
-/// Parse the [`encode_saved`] format; `None` on any shape mismatch.
-fn decode_saved(v: &str) -> Option<SavedHost> {
-    let mut parts = v.split('|');
-    let callsign = parts.next()?.to_owned();
-    let host = parts.next()?.to_owned();
-    let port = parts.next()?.to_owned();
-    let protocol = parts.next()?.to_owned();
-    let module = parts.next()?.chars().next()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    Some(SavedHost {
-        callsign,
-        host,
-        port,
-        protocol,
-        module,
-    })
 }
 
 /// User-editable form state that survives across app launches.
@@ -202,8 +163,7 @@ pub(crate) struct Settings {
 }
 
 impl Default for Settings {
-    /// Defaults match the historical hardcoded values in `App::new`
-    /// so first-launch UX is unchanged.
+    /// First-launch form state selects W1TEST and the local POLARIS target.
     fn default() -> Self {
         Self {
             callsign: "W1TEST".into(),
@@ -246,7 +206,7 @@ impl Settings {
         let Some(path) = Self::path() else {
             return Self::default();
         };
-        let raw = match std::fs::read_to_string(&path) {
+        let raw = match read_snapshot(&path) {
             Ok(s) => s,
             Err(e) => {
                 debug!(path = %path.display(), error = %e, "no settings file, using defaults");
@@ -271,24 +231,14 @@ impl Settings {
         }
     }
 
-    /// Persist to disk. Logs and swallows errors: settings persistence
-    /// must never block app shutdown or interaction.
-    pub(crate) fn save(&self) {
+    /// Publish a complete settings snapshot after syncing its temporary file.
+    /// Returns the reached durability boundary or the failing publication step.
+    pub(crate) fn save(&self) -> Result<Option<SaveOutcome>, SnapshotError> {
         let Some(path) = Self::path() else {
-            return;
+            return Ok(None);
         };
-        if let Some(parent) = path.parent()
-            && let Err(e) = std::fs::create_dir_all(parent)
-        {
-            warn!(path = %parent.display(), error = %e, "could not create settings dir");
-            return;
-        }
         let body = serialize(self);
-        if let Err(e) = std::fs::write(&path, body) {
-            warn!(path = %path.display(), error = %e, "could not write settings");
-        } else {
-            debug!(path = %path.display(), "saved settings");
-        }
+        save_snapshot(&path, body.as_bytes()).map(Some)
     }
 }
 
@@ -364,6 +314,13 @@ fn push_string(out: &mut String, key: &str, value: &str) {
         match ch {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            other if other.is_control() => {
+                use std::fmt::Write as _;
+                let _written = write!(out, "\\u{:04X}", u32::from(other));
+            }
             other => out.push(other),
         }
     }
@@ -376,30 +333,75 @@ fn push_bool(out: &mut String, key: &str, value: bool) {
     out.push_str(if value { " = true\n" } else { " = false\n" });
 }
 
+/// A finite settings grammar failure with a one-based input line number.
+#[derive(Debug)]
+struct ParseError {
+    line: usize,
+    problem: ParseProblem,
+}
+
+#[derive(Debug)]
+enum ParseProblem {
+    Assignment,
+    QuotedString,
+    Boolean,
+    Module,
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let problem = match self.problem {
+            ParseProblem::Assignment => "expected a key = value pair",
+            ParseProblem::QuotedString => "expected a supported double-quoted string",
+            ParseProblem::Boolean => "expected true or false",
+            ParseProblem::Module => "expected exactly one valid module letter",
+        };
+        write!(f, "line {}: {problem}", self.line)
+    }
+}
+
+impl std::error::Error for ParseError {}
+
+fn restore_saved(settings: &mut Settings, key: &str, encoded: &str) {
+    let favorite = key.starts_with("favorite.");
+    let numbered = key
+        .split_once('.')
+        .is_some_and(|(_, index)| index.parse::<usize>().is_ok());
+    let Some(entry) = decode_saved(encoded).filter(|_| numbered) else {
+        warn!(key, "skipping malformed saved-host entry");
+        return;
+    };
+    let (entries, limit) = if favorite {
+        (&mut settings.favorites, FAVORITES_CAP)
+    } else {
+        (&mut settings.recents, RECENTS_CAP)
+    };
+    if entries.len() < limit && !entries.contains(&entry) {
+        entries.push(entry);
+    } else {
+        warn!(key, "skipping duplicate or over-capacity saved-host entry");
+    }
+}
+
 /// Parse a settings file; missing keys fall back to defaults.
-fn parse(raw: &str) -> Result<Settings, String> {
+fn parse(raw: &str) -> Result<Settings, ParseError> {
     let mut out = Settings::default();
     for (lineno, line) in raw.lines().enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        let (key, value) = split_kv(trimmed)
-            .ok_or_else(|| format!("line {}: not a `key = value` pair", lineno + 1))?;
+        let failure = |problem| ParseError {
+            line: lineno + 1,
+            problem,
+        };
+        let (key, value) = split_kv(trimmed).ok_or_else(|| failure(ParseProblem::Assignment))?;
         // Saved-host lists use numbered keys (`favorite.N`,
         // `recent.N`); entries load in file order, which is the
         // order `serialize` wrote them.
         if key.starts_with("favorite.") || key.starts_with("recent.") {
-            let value = parse_quoted(value).ok_or_else(|| {
-                format!("line {}: value must be a double-quoted string", lineno + 1)
-            })?;
-            match decode_saved(&value) {
-                Some(entry) if key.starts_with("favorite.") => out.favorites.push(entry),
-                Some(entry) => out.recents.push(entry),
-                // Malformed entries are skipped, not fatal: one bad
-                // line must not cost the user their whole settings.
-                None => warn!(key, "skipping malformed saved-host entry"),
-            }
+            let value = parse_quoted(value).ok_or_else(|| failure(ParseProblem::QuotedString))?;
+            restore_saved(&mut out, key, &value);
             continue;
         }
         // Boolean keys carry a bare `true` / `false`, not a quoted
@@ -408,12 +410,7 @@ fn parse(raw: &str) -> Result<Settings, String> {
             let flag = match value {
                 "true" => true,
                 "false" => false,
-                other => {
-                    return Err(format!(
-                        "line {}: expected true/false, got {other:?}",
-                        lineno + 1
-                    ));
-                }
+                _ => return Err(failure(ParseProblem::Boolean)),
             };
             match key {
                 "reconnect_on_drop" => out.reconnect_on_drop = flag,
@@ -422,22 +419,26 @@ fn parse(raw: &str) -> Result<Settings, String> {
             }
             continue;
         }
-        let value = parse_quoted(value)
-            .ok_or_else(|| format!("line {}: value must be a double-quoted string", lineno + 1))?;
+        let value = parse_quoted(value).ok_or_else(|| failure(ParseProblem::QuotedString))?;
         match key {
             "callsign" => out.callsign = value,
             "reflector_host" => out.reflector_host = value,
             "reflector_port" => out.reflector_port = value,
             "reflector_callsign" => out.reflector_callsign = value,
             "protocol" => out.protocol = value,
-            "local_module" => {
-                if let Some(ch) = value.chars().next() {
-                    out.local_module = ch;
-                }
-            }
-            "reflector_module" => {
-                if let Some(ch) = value.chars().next() {
-                    out.reflector_module = ch;
+            "local_module" | "reflector_module" => {
+                let mut letters = value.chars();
+                let module = letters
+                    .next()
+                    .filter(|letter| {
+                        letters.next().is_none()
+                            && dstar_gateway_core::types::Module::try_from_char(*letter).is_ok()
+                    })
+                    .ok_or_else(|| failure(ParseProblem::Module))?;
+                if key == "local_module" {
+                    out.local_module = module;
+                } else {
+                    out.reflector_module = module;
                 }
             }
             "time_mode" => out.time_mode = TimeMode::from_str(&value),
@@ -473,9 +474,21 @@ fn parse_quoted(value: &str) -> Option<String> {
             match chars.next()? {
                 '"' => out.push('"'),
                 '\\' => out.push('\\'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                'u' => {
+                    let code: String = chars.by_ref().take(4).collect();
+                    if code.len() != 4 {
+                        return None;
+                    }
+                    out.push(char::from_u32(u32::from_str_radix(&code, 16).ok()?)?);
+                }
                 // Unknown escape sequence: bail.
                 _ => return None,
             }
+        } else if ch == '"' || ch.is_control() {
+            return None;
         } else {
             out.push(ch);
         }
@@ -493,7 +506,7 @@ mod tests {
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     #[test]
-    fn defaults_match_historical_hardcoded_values() {
+    fn defaults_select_local_polaris_and_raw_audio() {
         let s = Settings::default();
         assert_eq!(s.callsign, "W1TEST");
         assert_eq!(s.reflector_host, "127.0.0.1");
@@ -526,8 +539,8 @@ mod tests {
             tx_comment: "home QTH".into(),
             input_device: "Built-in Microphone".into(),
             output_device: "External Headphones".into(),
-            favorites: vec![saved("REF001")],
-            recents: vec![saved("XRF757")],
+            favorites: vec![saved("REF001")?],
+            recents: vec![saved("XRF757")?],
         };
         let serialized = serialize(&original);
         let parsed = parse(&serialized).map_err(|e| format!("parse: {e}"))?;
@@ -540,7 +553,13 @@ mod tests {
         let raw = "callsign = \"W1AW\"\nbroken line without equals\n";
         let result = parse(raw);
         assert!(
-            matches!(result, Err(ref e) if e.contains("line 2")),
+            matches!(
+                result,
+                Err(super::ParseError {
+                    line: 2,
+                    problem: super::ParseProblem::Assignment
+                })
+            ),
             "parser must reject malformed lines and report line number, got: {result:?}"
         );
     }
@@ -577,21 +596,21 @@ mod tests {
         Ok(())
     }
 
-    fn saved(callsign: &str) -> SavedHost {
-        SavedHost {
-            callsign: callsign.to_owned(),
-            host: "example.org".into(),
-            port: "20001".into(),
-            protocol: "DPlus".into(),
+    fn saved(callsign: &str) -> Result<SavedHost, Box<dyn std::error::Error>> {
+        Ok(SavedHost::new(super::SavedHostFields {
+            callsign,
+            host: "example.org",
+            port: "20001",
+            protocol: "DPlus",
             module: 'C',
-        }
+        })?)
     }
 
     #[test]
     fn favorites_and_recents_roundtrip() -> TestResult {
         let original = Settings {
-            favorites: vec![saved("REF030"), saved("XRF757")],
-            recents: vec![saved("DCS001")],
+            favorites: vec![saved("REF030")?, saved("XRF757")?],
+            recents: vec![saved("DCS001")?],
             ..Settings::default()
         };
         let parsed = parse(&serialize(&original)).map_err(|e| format!("parse: {e}"))?;
@@ -634,7 +653,7 @@ mod tests {
     fn current_settings_epoch_preserves_explicit_addresses() -> TestResult {
         let original = Settings {
             reflector_host: "manual.example".into(),
-            favorites: vec![saved("XRF757")],
+            favorites: vec![saved("XRF757")?],
             ..Settings::default()
         };
         let raw = serialize(&original);
@@ -657,27 +676,31 @@ mod tests {
     }
 
     #[test]
-    fn push_recent_promotes_dedupes_and_caps() {
+    fn push_recent_promotes_dedupes_and_caps() -> TestResult {
         let mut recents = Vec::new();
         for i in 0..10 {
-            push_recent(&mut recents, saved(&format!("REF{i:03}")));
+            push_recent(&mut recents, saved(&format!("REF{i:03}"))?);
         }
         assert_eq!(recents.len(), RECENTS_CAP, "capped at {RECENTS_CAP}");
         assert_eq!(
-            recents.first().map(|r| r.callsign.as_str()),
-            Some("REF009"),
+            recents.first().map(|r| r.callsign().to_string()),
+            Some("REF009".to_owned()),
             "most recent first"
         );
         // Re-connecting to an existing entry promotes, not duplicates.
-        push_recent(&mut recents, saved("REF005"));
+        push_recent(&mut recents, saved("REF005")?);
         assert_eq!(recents.len(), RECENTS_CAP);
         assert_eq!(
-            recents.first().map(|r| r.callsign.as_str()),
-            Some("REF005"),
+            recents.first().map(|r| r.callsign().to_string()),
+            Some("REF005".to_owned()),
             "existing entry promoted to front"
         );
-        let count = recents.iter().filter(|r| r.callsign == "REF005").count();
+        let count = recents
+            .iter()
+            .filter(|r| r.callsign().to_string() == "REF005")
+            .count();
         assert_eq!(count, 1, "no duplicate entries");
+        Ok(())
     }
 
     #[test]
@@ -692,6 +715,20 @@ mod tests {
         let serialized = serialize(&original);
         let parsed = parse(&serialized).map_err(|e| format!("parse: {e}"))?;
         assert_eq!(parsed.callsign, "W\"AW");
+        Ok(())
+    }
+
+    #[test]
+    fn multiline_partial_forms_and_control_characters_roundtrip() -> TestResult {
+        let original = Settings {
+            tx_message: "first\nsecond\r\t\0\u{7f}\"\\".to_owned(),
+            input_device: "Audio\nDevice".to_owned(),
+            ..Settings::default()
+        };
+        let serialized = serialize(&original);
+        assert_eq!(parse(&serialized)?, original);
+        assert!(!serialized.contains("first\nsecond"));
+        assert!(super::parse_quoted("\"unescaped\"quote\"").is_none());
         Ok(())
     }
 }
