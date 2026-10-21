@@ -3,7 +3,7 @@
 //! Contains the CAT setup, 12 kHz `ADC stream IN` capture, `if-dsp`
 //! demodulation, playback, and accessible prompt pipeline. Startup and the
 //! `tune` command land Band B on the requested frequency through the
-//! library's verified UP/DW stepping retune; off-step or distant targets
+//! library's read-back-checked UP/DW stepping retune; off-step or distant targets
 //! are refused with guidance.
 //!
 //! Design notes:
@@ -15,14 +15,9 @@
 //!   once-per-session announcement.
 //! - Radio state discipline lives in the library's IF-tap session:
 //!   `enter_if_tap` saves every touched setting (including the tuning step)
-//!   and proves engagement; `restore_if_tap` restores in the
-//!   hardware-required order, including the original frequency on the saved
-//!   tuning raster, and reports per-step failures.
-
-// The accessibility-lint dev-dependency is used by the library's unit
-// tests; the bin's test build links dev-deps too.
-#[cfg(test)]
-use thd75_repl as _;
+//!   and checks engagement through CAT readback; `restore_if_tap` restores
+//!   the saved tuning step before walking the original frequency, and reports
+//!   per-step failures.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -30,19 +25,20 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use if_dsp::{Channelizer, ChannelizerConfig, DemodMode};
+use if_dsp::{Bandwidth, Channelizer, ChannelizerConfig, DemodMode, DspError};
 use kenwood_thd75::transport::SerialTransport;
 use kenwood_thd75::types::{Frequency, OperatingMode, StepSize, UsbAudioOutput};
 use kenwood_thd75::{IfTapConfig, IfTapRestoreReport, IfTapSavedState, Radio};
 use thd75_listen::output;
-use thd75_listen::parser::{self, Command};
+use thd75_listen::parser::{Command, FilterWidth, ListenerFrequency, SignalLevel, Volume};
+#[cfg(test)]
+use thd75_repl as _;
 
-/// Default startup frequency: the 70 cm slot the IF tap was
-/// hardware-verified on.
+/// Default startup frequency in hertz.
 const DEFAULT_FREQ_HZ: u32 = 435_640_000;
 
 /// Default volume percentage at startup.
-const DEFAULT_VOLUME: u8 = 60;
+const DEFAULT_VOLUME_PERCENT: u8 = 60;
 
 /// Bound on each audio channel (chunks, not samples): deep enough to
 /// ride out scheduling hiccups, shallow enough to cap latency.
@@ -53,7 +49,7 @@ enum DspCmd {
     /// Switch demodulation mode.
     SetMode(DemodMode),
     /// Change the audio passband width in hertz.
-    SetFilter(f32),
+    SetFilter(Bandwidth),
 }
 
 /// State shared with the real-time audio callbacks via atomics.
@@ -77,7 +73,8 @@ struct SharedAudio {
 
 /// Logarithmic volume taper: 0 is mute, 100 is unity, each step below
 /// 100 removes half a decibel.
-fn taper(percent: u8) -> f32 {
+fn taper(volume: Volume) -> f32 {
+    let percent = volume.percent();
     if percent == 0 {
         0.0
     } else {
@@ -88,20 +85,24 @@ fn taper(percent: u8) -> f32 {
 /// The DSP thread: demodulate incoming IF chunks, publish a signal
 /// level, and hand audio chunks to the output callback. Exits when
 /// either channel closes.
+///
+/// # Errors
+///
+/// Returns a checked DSP reconfiguration failure before processing another block.
 fn dsp_thread(
+    mut channelizer: Channelizer,
     rx_in: &Receiver<Vec<f32>>,
     tx_out: &SyncSender<Vec<f32>>,
     rx_cmd: &Receiver<DspCmd>,
-    shared: &Arc<SharedAudio>,
-) {
-    let mut channelizer = Channelizer::new(ChannelizerConfig::default());
+    shared: &SharedAudio,
+) -> Result<(), DspError> {
     let mut audio = Vec::new();
     let mut level_rms = 0.0_f32;
     while let Ok(block) = rx_in.recv() {
         while let Ok(cmd) = rx_cmd.try_recv() {
             match cmd {
-                DspCmd::SetMode(mode) => channelizer.set_mode(mode),
-                DspCmd::SetFilter(hz) => channelizer.set_filter_hz(Some(hz)),
+                DspCmd::SetMode(mode) => channelizer.set_mode(mode)?,
+                DspCmd::SetFilter(width) => channelizer.set_filter_width(Some(width))?,
             }
         }
         channelizer.process(&block, &mut audio);
@@ -109,7 +110,7 @@ fn dsp_thread(
         // audio, published as decibels relative to full scale.
         #[expect(
             clippy::cast_precision_loss,
-            reason = "audio block lengths are tiny; usize -> f32 is exact"
+            reason = "RMS normalization rounds the positive sample count to f32; this affects only the displayed signal estimate"
         )]
         let block_len = audio.len().max(1) as f32;
         let sum_sq: f32 = audio.iter().map(|s| s * s).sum();
@@ -123,9 +124,10 @@ fn dsp_thread(
         shared.level_db_bits.store(db.to_bits(), Ordering::Relaxed);
         let outgoing = std::mem::take(&mut audio);
         if tx_out.send(outgoing).is_err() {
-            return;
+            return Ok(());
         }
     }
+    Ok(())
 }
 
 /// Locate the radio's audio input device ("ADC stream IN") and the
@@ -167,12 +169,13 @@ fn find_serial_port(port_arg: Option<String>) -> Result<String, String> {
 
 struct CliArgs {
     port: Option<String>,
-    freq_hz: u32,
+    frequency: ListenerFrequency,
 }
 
 fn parse_args() -> Result<CliArgs, String> {
     let mut port = None;
-    let mut freq_hz = DEFAULT_FREQ_HZ;
+    let mut frequency = ListenerFrequency::new(Frequency::new(DEFAULT_FREQ_HZ))
+        .map_err(|error| error.to_string())?;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -181,15 +184,15 @@ fn parse_args() -> Result<CliArgs, String> {
             }
             "--freq" => {
                 let raw = args.next().ok_or("--freq needs megahertz")?;
-                match parser::parse(&format!("tune {raw}")) {
-                    Ok(Command::Tune(freq)) => freq_hz = freq.as_hz(),
+                match format!("tune {raw}").parse::<Command>() {
+                    Ok(Command::Tune(freq)) => frequency = freq,
                     Ok(_) | Err(_) => return Err(format!("invalid --freq value {raw:?}")),
                 }
             }
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
-    Ok(CliArgs { port, freq_hz })
+    Ok(CliArgs { port, frequency })
 }
 
 fn main() -> std::process::ExitCode {
@@ -205,6 +208,9 @@ fn main() -> std::process::ExitCode {
 
 fn run() -> Result<(), String> {
     let args = parse_args()?;
+    let config = IfTapConfig::new(OperatingMode::Usb)
+        .map_err(|error| format!("configuring the radio for listening: {error}"))?
+        .with_step(StepSize::Hz5000);
 
     // Audio first: if the IF interface is absent there is no point in
     // touching (and having to restore) the radio at all.
@@ -234,7 +240,6 @@ fn run() -> Result<(), String> {
     // band mode, output, squelch, operating mode, and the tuning step),
     // applies the listening configuration, and proves IF output engaged by
     // readback; a mid-configure failure rolls the radio back first.
-    let config = IfTapConfig::new(OperatingMode::Usb).with_step(StepSize::Hz5000);
     let saved: IfTapSavedState = match rt.block_on(radio.enter_if_tap(config)) {
         Ok(session) => session.into_saved_state(),
         Err(enter_error) => {
@@ -246,14 +251,14 @@ fn run() -> Result<(), String> {
         }
     };
 
-    // Every path from here restores the radio before returning.
+    // Report restoration failures or an unavailable CAT recovery path before return.
     let result = run_session(
         &rt,
         &mut radio,
         &saved,
         &input_dev,
         &output_dev,
-        args.freq_hz,
+        args.frequency,
     );
     let recovery_error = if radio.cat_recovery_required() {
         rt.block_on(radio.recover_cat()).err()
@@ -302,17 +307,20 @@ fn run_session(
     saved: &IfTapSavedState,
     input_dev: &cpal::Device,
     output_dev: &cpal::Device,
-    freq_hz: u32,
+    frequency: ListenerFrequency,
 ) -> Result<(), String> {
+    let default_volume = Volume::new(DEFAULT_VOLUME_PERCENT).map_err(|error| error.to_string())?;
+    let channelizer = Channelizer::new(ChannelizerConfig::default())
+        .map_err(|error| format!("configuring audio processing: {error}"))?;
     // Land Band B on the requested frequency. When it already matches this
     // is a pure verification; otherwise the library steps there with the
     // verified UP/DW commands, dropping the IF output during the walk
     // (frequency writes are rejected while the tap is engaged) and
     // re-engaging it afterwards with a readback proof.
-    rt.block_on(retune(radio, saved, Frequency::new(freq_hz)))?;
+    rt.block_on(retune(radio, saved, frequency.frequency()))?;
 
     let shared = Arc::new(SharedAudio {
-        volume_bits: AtomicU32::new(taper(DEFAULT_VOLUME).to_bits()),
+        volume_bits: AtomicU32::new(taper(default_volume).to_bits()),
         level_db_bits: AtomicU32::new((-120.0_f32).to_bits()),
         overruns: AtomicUsize::new(0),
         underruns: AtomicUsize::new(0),
@@ -324,9 +332,6 @@ fn run_session(
     let (tx_in, rx_in) = sync_channel::<Vec<f32>>(CHANNEL_DEPTH);
     let (tx_out, rx_out) = sync_channel::<Vec<f32>>(CHANNEL_DEPTH);
     let (tx_cmd, rx_cmd) = std::sync::mpsc::channel::<DspCmd>();
-
-    let dsp_shared = Arc::clone(&shared);
-    let dsp = std::thread::spawn(move || dsp_thread(&rx_in, &tx_out, &rx_cmd, &dsp_shared));
 
     let in_config = input_dev
         .default_input_config()
@@ -418,6 +423,10 @@ fn run_session(
         )
         .map_err(|e| format!("opening the speaker stream: {e}"))?;
 
+    let mut rl = rustyline::DefaultEditor::new().map_err(|e| format!("terminal: {e}"))?;
+    let mut current_filter =
+        FilterWidth::new(DemodMode::Usb.default_filter_hz()).map_err(|error| error.to_string())?;
+
     input_stream
         .play()
         .map_err(|e| format!("starting the radio audio stream: {e}"))?;
@@ -425,14 +434,18 @@ fn run_session(
         .play()
         .map_err(|e| format!("starting the speaker stream: {e}"))?;
 
-    let mut current_hz = freq_hz;
-    let mut current_mode = DemodMode::Usb;
-    let mut current_filter = current_mode.default_filter_hz();
-    let mut current_volume = DEFAULT_VOLUME;
-    let mut underrun_announced = false;
-    println!("{}", output::ready(current_hz, current_mode));
+    let dsp_shared = Arc::clone(&shared);
+    let dsp = std::thread::Builder::new()
+        .name("if-dsp".to_owned())
+        .spawn(move || dsp_thread(channelizer, &rx_in, &tx_out, &rx_cmd, &dsp_shared))
+        .map_err(|error| format!("starting audio processing: {error}"))?;
 
-    let mut rl = rustyline::DefaultEditor::new().map_err(|e| format!("terminal: {e}"))?;
+    let mut current_frequency = frequency;
+    let mut current_mode = DemodMode::Usb;
+    let mut current_volume = default_volume;
+    let mut underrun_announced = false;
+    println!("{}", output::ready(current_frequency, current_mode));
+
     loop {
         let line = match rl.readline("listen> ") {
             Ok(line) => line,
@@ -448,7 +461,7 @@ fn run_session(
             continue;
         }
         drop(rl.add_history_entry(&line));
-        let command = match parser::parse(&line) {
+        let command = match line.parse::<Command>() {
             Ok(c) => c,
             Err(msg) => {
                 println!("{}", output::error(msg));
@@ -456,29 +469,46 @@ fn run_session(
             }
         };
         match command {
-            Command::Tune(freq) => match rt.block_on(retune(radio, saved, freq)) {
+            Command::Tune(freq) => match rt.block_on(retune(radio, saved, freq.frequency())) {
                 Ok(()) => {
-                    current_hz = freq.as_hz();
-                    println!("{}", output::tuned(freq.as_hz()));
+                    current_frequency = freq;
+                    println!("{}", output::tuned(freq));
                 }
                 Err(e) => println!("{}", output::error(e)),
             },
             Command::Mode(mode) => {
-                current_mode = mode;
-                current_filter = mode.default_filter_hz();
+                let width = match FilterWidth::new(mode.default_filter_hz()) {
+                    Ok(width) => width,
+                    Err(error) => {
+                        println!("{}", output::error(error));
+                        continue;
+                    }
+                };
                 if tx_cmd.send(DspCmd::SetMode(mode)).is_err() {
                     println!("{}", output::error("audio engine stopped"));
                     break;
                 }
+                current_mode = mode;
+                current_filter = width;
                 println!("{}", output::mode_set(mode));
             }
-            Command::Filter(hz) => {
-                current_filter = hz;
-                if tx_cmd.send(DspCmd::SetFilter(hz)).is_err() {
+            Command::Filter(filter) => {
+                let checked = Bandwidth::new(filter.hz()).and_then(|width| {
+                    ChannelizerConfig::new(current_mode).with_filter_width(width)
+                });
+                let width = match checked {
+                    Ok(config) => config.filter_width(),
+                    Err(error) => {
+                        println!("{}", output::error(error));
+                        continue;
+                    }
+                };
+                if tx_cmd.send(DspCmd::SetFilter(width)).is_err() {
                     println!("{}", output::error("audio engine stopped"));
                     break;
                 }
-                println!("{}", output::filter_set(hz));
+                current_filter = filter;
+                println!("{}", output::filter_set(filter));
             }
             Command::Volume(pct) => {
                 current_volume = pct;
@@ -489,7 +519,10 @@ fn run_session(
             }
             Command::Signal => {
                 let db = f32::from_bits(shared.level_db_bits.load(Ordering::Relaxed));
-                println!("{}", output::signal(db));
+                match SignalLevel::new(db) {
+                    Ok(level) => println!("{}", output::signal(level)),
+                    Err(error) => println!("{}", output::error(error)),
+                }
             }
             Command::Status => {
                 let health = output::StreamHealth {
@@ -501,7 +534,7 @@ fn run_session(
                 println!(
                     "{}",
                     output::status(
-                        current_hz,
+                        current_frequency,
                         current_mode,
                         current_filter,
                         current_volume,
@@ -524,8 +557,9 @@ fn run_session(
     drop(input_stream);
     drop(output_stream);
     drop(tx_cmd);
-    drop(dsp.join());
-    Ok(())
+    dsp.join()
+        .map_err(|_| "audio engine stopped".to_owned())?
+        .map_err(|error| format!("audio processing: {error}"))
 }
 
 /// Land Band B on `target` under the engaged IF tap.
@@ -556,10 +590,10 @@ fn print_restore_report(report: &IfTapRestoreReport) {
     }
 }
 
-/// Audio-callback error hook: cpal reports stream errors here from a
-/// real-time context, so just count on stderr-free best effort.
+/// Ignore the callback error without allocating, locking or performing I/O.
+///
+/// Callback counters and underruns remain available through `status`; this
+/// hook does not record a separate device-error count.
 const fn tracing_error(e: &cpal::StreamError) {
-    // Streams report errors rarely (device unplugged); the prompt loop
-    // surfaces the consequence (underruns / silence) accessibly.
     let _ = e;
 }

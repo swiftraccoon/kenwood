@@ -7,6 +7,8 @@
 
 use if_dsp::DemodMode;
 
+use crate::parser::{FilterWidth, ListenerFrequency, SignalLevel, Volume};
+
 /// `TH-D75 IF listener, version {v}.`
 #[must_use]
 pub fn banner(version: &str) -> String {
@@ -15,8 +17,8 @@ pub fn banner(version: &str) -> String {
 
 /// `{x} megahertz` with trailing zeros trimmed (`435.64 megahertz`).
 #[must_use]
-pub fn mhz(freq_hz: u32) -> String {
-    let mhz = f64::from(freq_hz) / 1_000_000.0;
+pub fn mhz(frequency: ListenerFrequency) -> String {
+    let mhz = f64::from(frequency.as_hz()) / 1_000_000.0;
     let s = format!("{mhz:.6}");
     let s = s.trim_end_matches('0');
     let s = if s.ends_with('.') {
@@ -29,17 +31,17 @@ pub fn mhz(freq_hz: u32) -> String {
 
 /// `Listening on {mhz}, {mode} mode. Type help for commands.`
 #[must_use]
-pub fn ready(freq_hz: u32, mode: DemodMode) -> String {
+pub fn ready(frequency: ListenerFrequency, mode: DemodMode) -> String {
     format!(
         "Listening on {}, {mode} mode. Type help for commands.",
-        mhz(freq_hz)
+        mhz(frequency)
     )
 }
 
 /// `Tuned to {mhz}.`
 #[must_use]
-pub fn tuned(freq_hz: u32) -> String {
-    format!("Tuned to {}.", mhz(freq_hz))
+pub fn tuned(frequency: ListenerFrequency) -> String {
+    format!("Tuned to {}.", mhz(frequency))
 }
 
 /// `Mode set to {mode}.`
@@ -50,40 +52,40 @@ pub fn mode_set(mode: DemodMode) -> String {
 
 /// `Filter width set to {x} kilohertz.`
 #[must_use]
-pub fn filter_set(hz: f32) -> String {
-    format!("Filter width set to {} kilohertz.", hz / 1_000.0)
+pub fn filter_set(width: FilterWidth) -> String {
+    format!("Filter width set to {} kilohertz.", width.hz() / 1_000.0)
 }
 
 /// `Volume set to {p} percent.`
 #[must_use]
-pub fn volume_set(percent: u8) -> String {
-    format!("Volume set to {percent} percent.")
+pub fn volume_set(volume: Volume) -> String {
+    format!("Volume set to {} percent.", volume.percent())
 }
 
 /// `Signal: {x} decibels below full scale.`
 ///
-/// `db` is a dBFS value (zero or negative in practice); the spoken
-/// form uses the magnitude. Values are clamped to the sane readout
-/// range before formatting.
+/// The validated input carries a finite reading clamped to -120 through
+/// zero dBFS; the spoken form uses its magnitude.
 #[must_use]
-pub fn signal(db: f32) -> String {
-    let below = (-db).clamp(0.0, 120.0);
+pub fn signal(level: SignalLevel) -> String {
+    let below = level.dbfs().abs();
     format!("Signal: {below:.1} decibels below full scale.")
 }
 
 /// Multi-line status block; every line is self-contained.
 #[must_use]
 pub fn status(
-    freq_hz: u32,
+    frequency: ListenerFrequency,
     mode: DemodMode,
-    filter_hz: f32,
-    volume: u8,
+    filter: FilterWidth,
+    volume: Volume,
     stream: &StreamHealth,
 ) -> String {
     format!(
-        "Frequency: {}\nMode: {mode}\nFilter width: {} kilohertz\nVolume: {volume} percent\nAudio input blocks: {}\nAudio output blocks: {}\nAudio input overruns: {}\nAudio output underruns: {}",
-        mhz(freq_hz),
-        filter_hz / 1_000.0,
+        "Frequency: {}\nMode: {mode}\nFilter width: {} kilohertz\nVolume: {} percent\nAudio input blocks: {}\nAudio output blocks: {}\nAudio input overruns: {}\nAudio output underruns: {}",
+        mhz(frequency),
+        filter.hz() / 1_000.0,
+        volume.percent(),
         stream.input_blocks,
         stream.output_blocks,
         stream.overruns,
@@ -92,7 +94,7 @@ pub fn status(
 }
 
 /// Audio stream health counters for the status block.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct StreamHealth {
     /// Input callbacks delivered so far.
     pub input_blocks: usize,
@@ -165,6 +167,8 @@ mod tests {
     use super::*;
     use thd75_repl::lint;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     fn assert_lint(s: &str) {
         if let Err(v) = lint::check_output(s) {
             unreachable!("line {s:?} failed accessibility lint: {v:?}");
@@ -172,10 +176,11 @@ mod tests {
     }
 
     #[test]
-    fn mhz_trims_trailing_zeros() {
-        assert_eq!(mhz(435_640_000), "435.64 megahertz");
-        assert_eq!(mhz(146_000_000), "146.0 megahertz");
-        assert_eq!(mhz(14_074_000), "14.074 megahertz");
+    fn mhz_trims_trailing_zeros() -> TestResult {
+        assert_eq!(mhz("435.640".parse()?), "435.64 megahertz");
+        assert_eq!(mhz("146.000".parse()?), "146.0 megahertz");
+        assert_eq!(mhz("14.075".parse()?), "14.075 megahertz");
+        Ok(())
     }
 
     #[test]
@@ -189,39 +194,56 @@ mod tests {
     }
 
     #[test]
-    fn tuning_and_mode_lines() {
-        assert_eq!(tuned(435_640_000), "Tuned to 435.64 megahertz.");
+    fn tuning_and_mode_lines() -> TestResult {
+        let frequency = "435.640".parse()?;
+        assert_eq!(tuned(frequency), "Tuned to 435.64 megahertz.");
         assert_eq!(mode_set(DemodMode::Usb), "Mode set to USB.");
         assert_eq!(mode_set(DemodMode::Lsb), "Mode set to LSB.");
-        assert_lint(&tuned(435_640_000));
+        assert_lint(&tuned(frequency));
         assert_lint(&mode_set(DemodMode::Cw));
-        assert_lint(&ready(435_640_000, DemodMode::Usb));
+        assert_lint(&ready(frequency, DemodMode::Usb));
+        Ok(())
     }
 
     #[test]
-    fn filter_volume_signal_lines() {
-        assert_eq!(filter_set(2_400.0), "Filter width set to 2.4 kilohertz.");
-        assert_eq!(volume_set(50), "Volume set to 50 percent.");
-        assert_eq!(signal(-12.34), "Signal: 12.3 decibels below full scale.");
-        assert_eq!(signal(5.0), "Signal: 0.0 decibels below full scale.");
-        assert_lint(&filter_set(2_400.0));
-        assert_lint(&volume_set(0));
-        assert_lint(&signal(-60.0));
+    fn filter_volume_signal_lines() -> TestResult {
+        let width = FilterWidth::new(2400.0)?;
+        assert_eq!(filter_set(width), "Filter width set to 2.4 kilohertz.");
+        assert_eq!(volume_set(Volume::new(50)?), "Volume set to 50 percent.");
+        assert_eq!(
+            signal(SignalLevel::new(-12.34)?),
+            "Signal: 12.3 decibels below full scale."
+        );
+        assert_eq!(
+            signal(SignalLevel::new(5.0)?),
+            "Signal: 0.0 decibels below full scale."
+        );
+        assert_lint(&filter_set(width));
+        assert_lint(&volume_set(Volume::new(0)?));
+        assert_lint(&signal(SignalLevel::new(-60.0)?));
+        Ok(())
     }
 
     #[test]
-    fn status_block_lints_per_line() {
+    fn status_block_lints_per_line() -> TestResult {
         let health = StreamHealth {
             input_blocks: 500,
             output_blocks: 498,
             overruns: 0,
             underruns: 2,
         };
-        let s = status(435_640_000, DemodMode::Usb, 2_600.0, 40, &health);
+        let s = status(
+            "435.640".parse()?,
+            DemodMode::Usb,
+            FilterWidth::new(2600.0)?,
+            Volume::new(40)?,
+            &health,
+        );
         assert!(s.contains("Frequency: 435.64 megahertz"), "{s}");
         assert!(s.contains("Audio input blocks: 500"), "{s}");
         assert!(s.contains("Audio output underruns: 2"), "{s}");
         assert_lint(&s);
+        Ok(())
     }
 
     #[test]

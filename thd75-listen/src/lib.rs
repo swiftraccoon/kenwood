@@ -1,8 +1,4 @@
-//! Library side of the accessible TH-D75 IF demodulator.
-//!
-//! Pure command parsing, output formatting, and radio session state
-//! handling. The binary owns all I/O (cpal audio, serial CAT, the
-//! terminal).
+#![doc = include_str!("../README.md")]
 
 // Bin-only deps, acknowledged so `unused_crate_dependencies` stays
 // silent for the lib compilation unit.
