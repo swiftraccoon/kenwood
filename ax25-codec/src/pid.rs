@@ -7,6 +7,7 @@ use crate::error::Ax25Error;
 /// Values with named [`Ax25Pid`] variants and the `0xFF` escape prefix cannot
 /// be represented here. Obtain this value by matching the [`Ax25Pid::Other`]
 /// result of [`Ax25Pid::from_byte`].
+/// See the [PID example](crate#control-fields-and-protocol-identifiers).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct UnknownPid(u8);
 
@@ -22,12 +23,20 @@ impl UnknownPid {
     }
 }
 
+impl From<UnknownPid> for u8 {
+    fn from(value: UnknownPid) -> Self {
+        value.as_byte()
+    }
+}
+
 /// AX.25 PID (Protocol Identifier) field.
 ///
 /// Per AX.25 v2.2 §3.4 Figure 3.2. Only a small subset is observed on APRS
 /// (`0xF0` = no layer 3). Most identifiers occupy one octet; `0xFF` is an
 /// escape prefix and requires a second protocol octet, represented by
 /// [`Self::Escape`].
+/// See the
+/// [control and PID examples](crate#control-fields-and-protocol-identifiers).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Ax25Pid {
     /// ISO 8208 / X.25 PLP (layer 3).
@@ -63,6 +72,14 @@ pub enum Ax25Pid {
     },
     /// Any unassigned one-octet identifier the library does not classify.
     Other(UnknownPid),
+}
+
+impl TryFrom<u8> for Ax25Pid {
+    type Error = Ax25Error;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        Self::from_byte(value)
+    }
 }
 
 impl Ax25Pid {
@@ -160,7 +177,7 @@ mod tests {
             if b == 0xFF {
                 continue;
             }
-            let pid = Ax25Pid::from_byte(b)?;
+            let pid = Ax25Pid::try_from(b)?;
             assert_eq!(pid.as_byte(), b, "PID {b:#04x} must survive decode→encode");
             assert_eq!(pid.extension_byte(), None);
             assert_eq!(pid.wire_len(), 1);
@@ -171,7 +188,7 @@ mod tests {
     #[test]
     fn bare_escape_prefix_is_not_a_complete_pid() {
         assert_eq!(
-            Ax25Pid::from_byte(0xFF),
+            Ax25Pid::try_from(0xFF),
             Err(Ax25Error::MissingProtocolIdentifierExtension),
         );
     }

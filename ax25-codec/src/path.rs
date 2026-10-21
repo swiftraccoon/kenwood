@@ -6,11 +6,10 @@ use core::slice;
 use crate::address::RouteEntry;
 use crate::error::Ax25Error;
 
-/// Maximum number of digipeater addresses in an AX.25 frame.
+/// Maximum number of digipeater addresses accepted by this codec.
 ///
-/// Matches AX.25 v2.0 / APRS deployment convention and Linux kernel
-/// `AX25_MAX_DIGIS`. AX.25 v2.2 §3.12.5 reduced this to 2 but no APRS
-/// network respects that limit.
+/// Paths contain at most eight entries. See the
+/// [address and path examples](crate#addresses-and-paths).
 pub const MAX_DIGIPEATERS: usize = 8;
 
 /// A validated AX.25 digipeater path.
@@ -18,6 +17,7 @@ pub const MAX_DIGIPEATERS: usize = 8;
 /// The path always contains at most [`MAX_DIGIPEATERS`] entries. Structural
 /// mutation is fallible so an [`crate::Ax25Packet`] cannot represent a frame
 /// with an oversized address field.
+/// See the [address and path examples](crate#addresses-and-paths).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DigipeaterPath(Vec<RouteEntry>);
 
@@ -141,6 +141,12 @@ impl TryFrom<Vec<RouteEntry>> for DigipeaterPath {
 
     fn try_from(entries: Vec<RouteEntry>) -> Result<Self, Self::Error> {
         Self::new(entries)
+    }
+}
+
+impl From<DigipeaterPath> for Vec<RouteEntry> {
+    fn from(value: DigipeaterPath) -> Self {
+        value.into_vec()
     }
 }
 

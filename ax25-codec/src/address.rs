@@ -1,10 +1,8 @@
 //! AX.25 address type (callsign + SSID) and its components.
 //!
-//! Strongly-typed primitives for AX.25 addressing: [`Callsign`] holds a
-//! 1-6 byte base callsign, [`Ssid`] holds a 0-15 secondary station
-//! identifier, and [`Ax25Address`] combines them with the AX.25
-//! has-been-repeated (H-bit) and command/response (C-bit) flags that
-//! ride on the wire SSID byte.
+//! [`Ax25Address`] combines a validated [`Callsign`] and [`Ssid`].
+//! [`RouteEntry`] adds a repeater's H-bit; command/response classification
+//! belongs to [`crate::Ax25Header`].
 
 use alloc::string::{String, ToString};
 use core::fmt;
@@ -17,7 +15,7 @@ use crate::error::Ax25Error;
 
 /// An AX.25 base callsign (without SSID).
 ///
-/// Per AX.25 v2.2 §3.2, a callsign is **1 to 6 ASCII characters**, each of
+/// Per AX.25 v2.2 §3.12, a callsign is **1 to 6 ASCII characters**, each of
 /// which is an uppercase letter (`A`-`Z`) or a digit (`0`-`9`). The wire
 /// format left-shifts each byte by one bit; this type stores the plain
 /// ASCII form and does the shifting at encode time.
@@ -25,6 +23,7 @@ use crate::error::Ax25Error;
 /// Use [`Ssid`] alongside this type to represent the full 7-byte AX.25
 /// address. For APRS-IS login strings or display, format with `-` between
 /// callsign and SSID (e.g. `"N0CALL-7"`).
+/// See the [address and path examples](crate#addresses-and-paths).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[doc(alias = "call-sign")]
 #[doc(alias = "operator")]
@@ -47,6 +46,11 @@ impl Callsign {
     /// Returns [`Ax25Error::InvalidCallsign`] if the input fails any of
     /// the above rules.
     pub fn new(s: &str) -> Result<Self, Ax25Error> {
+        Self::validate(s)?;
+        Ok(Self(s.to_string()))
+    }
+
+    fn validate(s: &str) -> Result<(), Ax25Error> {
         if s.is_empty() {
             return Err(Ax25Error::InvalidCallsign("must not be empty".to_string()));
         }
@@ -63,7 +67,7 @@ impl Callsign {
                 ));
             }
         }
-        Ok(Self(s.to_string()))
+        Ok(())
     }
 
     /// Like [`Self::new`] but uppercases lowercase ASCII first.
@@ -72,8 +76,7 @@ impl Callsign {
     ///
     /// Same as [`Self::new`] after case conversion.
     pub fn new_case_insensitive(s: &str) -> Result<Self, Ax25Error> {
-        let upper = s.to_ascii_uppercase();
-        Self::new(&upper)
+        Self::try_from(s.to_ascii_uppercase())
     }
 
     /// Return the callsign as a string slice.
@@ -94,8 +97,9 @@ impl Callsign {
         self.0.len()
     }
 
-    /// Always `false`; a valid [`Callsign`] is never empty. Provided for
-    /// slice-convention parity with `len`.
+    /// Report whether the callsign contains zero bytes.
+    ///
+    /// Valid callsigns contain at least one byte, so this returns `false`.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         false
@@ -115,6 +119,23 @@ impl core::str::FromStr for Callsign {
     }
 }
 
+impl TryFrom<&str> for Callsign {
+    type Error = Ax25Error;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<String> for Callsign {
+    type Error = Ax25Error;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::validate(&value)?;
+        Ok(Self(value))
+    }
+}
+
 impl From<Callsign> for String {
     fn from(c: Callsign) -> Self {
         c.0
@@ -124,13 +145,6 @@ impl From<Callsign> for String {
 impl From<&Callsign> for String {
     fn from(c: &Callsign) -> Self {
         c.0.clone()
-    }
-}
-
-impl core::ops::Deref for Callsign {
-    type Target = str;
-    fn deref(&self) -> &str {
-        &self.0
     }
 }
 
@@ -182,21 +196,16 @@ impl PartialEq<Callsign> for String {
 
 /// An AX.25 Secondary Station Identifier (0-15).
 ///
-/// SSIDs distinguish multiple stations running under the same callsign.
-/// Conventional meanings on APRS:
-/// - `0`: home station (fixed)
-/// - `1`: generic digipeater
-/// - `5`: other networks (Dstar, iGate)
-/// - `7`: handheld radio
-/// - `9`: mobile (car)
-/// - `15`: generic / other
+/// SSIDs distinguish stations using the same callsign. Construction accepts
+/// `0..=15`; conversion to `u8` preserves the numeric value. See the
+/// [address and path examples](crate#addresses-and-paths).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[doc(alias = "SSID")]
 #[doc(alias = "callsign-ssid")]
 pub struct Ssid(u8);
 
 impl Ssid {
-    /// The `-0` SSID (home station / no suffix on display).
+    /// SSID zero, displayed without a suffix in an [`Ax25Address`].
     pub const ZERO: Self = Self(0);
 
     /// Maximum legal SSID value.
@@ -238,6 +247,20 @@ impl fmt::Display for Ssid {
     }
 }
 
+impl TryFrom<u8> for Ssid {
+    type Error = Ax25Error;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<Ssid> for u8 {
+    fn from(value: Ssid) -> Self {
+        value.get()
+    }
+}
+
 impl PartialEq<u8> for Ssid {
     fn eq(&self, other: &u8) -> bool {
         self.0 == *other
@@ -267,6 +290,7 @@ impl PartialOrd<u8> for Ssid {
 /// a `has_repeated` flag for the AX.25 v2.2 §3.12.1 H-bit. The single
 /// physical wire bit at SSID-byte bit 7 is reconstructed at encode/decode
 /// time from frame-level context; it is *not* a field on this struct.
+/// See the [address and path examples](crate#addresses-and-paths).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Ax25Address {
     /// Station callsign (1-6 uppercase ASCII alphanumerics).
@@ -372,6 +396,7 @@ impl core::str::FromStr for Ax25Address {
 /// in an [`crate::Ax25Packet`] is a `RouteEntry`, distinguishing it
 /// structurally from endpoint addresses (which use [`Ax25Address`]
 /// directly and carry no H-bit at all).
+/// See the [address and path examples](crate#addresses-and-paths).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RouteEntry {
     /// Repeater callsign + SSID.
@@ -404,15 +429,20 @@ impl RouteEntry {
         }
     }
 
-    /// Return a copy of this entry with the H-bit set ("has been
-    /// repeated"). Borrows-and-clones so callers with `&RouteEntry`
-    /// can use it ergonomically.
+    /// Consume this entry and set its has-been-repeated H-bit.
+    ///
+    /// The callsign allocation is retained. Clone before calling when the
+    /// original entry must remain available.
     #[must_use]
-    pub fn marked_used(&self) -> Self {
-        Self {
-            address: self.address.clone(),
-            has_repeated: true,
-        }
+    pub const fn marked_used(mut self) -> Self {
+        self.has_repeated = true;
+        self
+    }
+}
+
+impl From<Ax25Address> for RouteEntry {
+    fn from(address: Ax25Address) -> Self {
+        Self::from_address(address)
     }
 }
 
@@ -487,6 +517,30 @@ mod tests {
         let a = Callsign::new_case_insensitive("n0call")?;
         let b = Callsign::new("N0CALL")?;
         assert_eq!(a, b);
+        Ok(())
+    }
+
+    #[test]
+    fn owned_callsign_conversion_preserves_the_allocation() -> TestResult {
+        let input = String::from("N0CALL");
+        let allocation = input.as_ptr();
+        let callsign = Callsign::try_from(input)?;
+        assert_eq!(callsign.as_str(), "N0CALL");
+        assert_eq!(callsign.as_str().as_ptr(), allocation);
+        let recovered = String::from(callsign);
+        assert_eq!(recovered.as_ptr(), allocation);
+        Ok(())
+    }
+
+    #[test]
+    fn ssid_conversions_preserve_values_and_reject_out_of_range() -> TestResult {
+        for value in 0..=u8::MAX {
+            let converted = Ssid::try_from(value);
+            assert_eq!(converted, Ssid::new(value), "SSID {value}");
+            if value <= Ssid::MAX {
+                assert_eq!(u8::from(converted?), value);
+            }
+        }
         Ok(())
     }
 

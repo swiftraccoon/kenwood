@@ -5,15 +5,21 @@ use alloc::string::String;
 use thiserror::Error;
 
 /// Errors produced by AX.25 frame encode/decode and address construction.
+///
+/// See the [packet example](crate#encoding-and-decoding-a-packet) and
+/// [construction errors](crate#frame-validation).
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum Ax25Error {
     /// Packet is too short to contain required AX.25 fields.
     #[error("AX.25 packet too short")]
     PacketTooShort,
-    /// Address field has invalid length (must be multiple of 7).
-    #[error("AX.25 address field has invalid length (not a multiple of 7)")]
+    /// A repeater address ends before all seven octets are available.
+    #[error("AX.25 repeater address is shorter than seven octets")]
     InvalidAddressLength,
+    /// An address-extension bit is set before the final SSID octet.
+    #[error("AX.25 address-extension bit precedes the final address octet")]
+    InvalidAddressExtension,
     /// A textual AX.25 address is not in canonical `CALLSIGN` or
     /// `CALLSIGN-SSID` form.
     #[error("invalid AX.25 address: {0}")]
@@ -46,11 +52,8 @@ pub enum Ax25Error {
         /// Number of unexpected information bytes.
         length: usize,
     },
-    /// Packet carries more than 8 digipeater addresses. AX.25 v2.0 / APRS
-    /// convention; matches Linux kernel `AX25_MAX_DIGIS`. AX.25 v2.2
-    /// §3.12.5 reduced this to 2 but APRS networks do not respect that
-    /// limit.
-    #[error("AX.25 packet has more than 8 digipeater addresses (APRS/v2.0 convention)")]
+    /// A path exceeds the codec's eight-digipeater capacity.
+    #[error("AX.25 path has more than eight digipeater addresses")]
     TooManyDigipeaters,
     /// A requested insertion position is beyond the end of the current
     /// digipeater path. Insertion at `len` is valid and appends an entry.
@@ -61,23 +64,20 @@ pub enum Ax25Error {
         /// The path length when insertion was attempted.
         len: usize,
     },
-    /// A callsign byte decoded to something other than an ASCII
-    /// alphanumeric character or space padding.
-    #[error("AX.25 callsign byte decoded to non-alphanumeric character {0:#04x}")]
+    /// A callsign byte is neither ASCII alphanumeric nor space padding,
+    /// or an alphanumeric character occurs after padding has started.
+    #[error("AX.25 callsign contains invalid or misplaced character {0:#04x}")]
     InvalidCallsignByte(u8),
-    /// The protocol identifier (PID) byte is unknown or unsupported.
-    #[error("AX.25 unknown PID byte {0:#04x}")]
-    UnknownPid(u8),
     /// A modulo-8 send or receive sequence number is outside 0..=7.
     #[error("invalid AX.25 modulo-8 sequence number: {0}")]
     InvalidSequenceNumber(u8),
     /// A raw unnumbered control pattern is not an unknown canonical U-frame kind.
     #[error("invalid unknown AX.25 unnumbered control pattern: {0:#04x}")]
     InvalidUnknownUnnumberedKind(u8),
-    /// Callsign is outside the 1-6 ASCII uppercase/digit range per AX.25 v2.2 §3.2.
+    /// Callsign is outside the 1-6 ASCII uppercase/digit range in AX.25 §3.12.
     #[error("invalid callsign: {0}")]
     InvalidCallsign(String),
-    /// SSID is outside the 0-15 range per AX.25 v2.2 §3.2.
+    /// SSID is outside the 0-15 range in AX.25 v2.2 §3.12.
     #[error("invalid SSID: {0}")]
     InvalidSsid(u8),
 }

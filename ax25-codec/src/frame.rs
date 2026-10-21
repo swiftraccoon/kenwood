@@ -1,14 +1,15 @@
 //! AX.25 frame encode/decode.
 //!
 //! This module hosts the [`Ax25Packet`] frame type, the byte-level
-//! [`parse_ax25`]/[`build_ax25`] codec, and the FCS helper [`ax25_fcs`].
+//! [`Ax25Packet::from_bytes`]/[`Ax25Packet::to_bytes`] codec, and the
+//! FCS helper [`ax25_fcs`].
 //! All APIs are `no_std`-compatible.
 
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::address::{Ax25Address, Callsign, RouteEntry, Ssid};
-use crate::control::{Ax25Control, CommandResponse, UnnumberedKind};
+use crate::control::{Ax25Control, CommandResponse, PollFinal, UnnumberedKind};
 use crate::error::Ax25Error;
 use crate::path::{DigipeaterPath, MAX_DIGIPEATERS};
 use crate::pid::Ax25Pid;
@@ -22,6 +23,7 @@ use crate::pid::Ax25Pid;
 /// over a transport that does expect the FCS (e.g. a software modem,
 /// SDR, or packet capture tool). The byte order on the wire is
 /// little-endian: emit `(crc & 0xFF)` then `(crc >> 8)`.
+/// See the [FCS example](crate#frame-check-sequence).
 #[must_use]
 pub fn ax25_fcs(bytes: &[u8]) -> u16 {
     let mut crc: u16 = 0xFFFF;
@@ -39,14 +41,12 @@ pub fn ax25_fcs(bytes: &[u8]) -> u16 {
     !crc
 }
 
-/// A parsed AX.25 frame.
+/// Named source, destination, repeater path, and command/response fields.
 ///
-/// Command/Response classification (AX.25 v2.2 §6.1.2) lives at the
-/// frame level rather than per-address, because the encoding rule is
-/// joint over the destination and source SSID-byte C-bits. See
-/// [`Self::command_or_response`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Ax25Packet {
+/// Each field can change independently while preserving a packet's structural
+/// validity. See the [packet example](crate#encoding-and-decoding-a-packet).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Ax25Header {
     /// Source station address.
     pub source: Ax25Address,
     /// Destination address (often an APRS "tocall" like `APxxxx`).
@@ -57,7 +57,19 @@ pub struct Ax25Packet {
     /// - `(dest_c=1, src_c=0)` → `Command` (APRS convention)
     /// - `(dest_c=0, src_c=1)` → `Response`
     /// - both equal → the corresponding lossless pre-v2.0 variant
-    pub command_or_response: CommandResponse,
+    pub command_response: CommandResponse,
+}
+
+/// An AX.25 modulo-8 frame with validated control, PID, and payload fields.
+///
+/// Construction checks the relationships between those fields. Header values
+/// remain independently mutable. See the
+/// [packet example](crate#encoding-and-decoding-a-packet) and
+/// [frame validation example](crate#frame-validation).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Ax25Packet {
+    /// Source, destination, repeater path, and command/response classification.
+    pub header: Ax25Header,
     control: Ax25Control,
     protocol: Option<Ax25Pid>,
     information: Vec<u8>,
@@ -79,21 +91,15 @@ impl Ax25Packet {
     /// [`Ax25Error::UnexpectedProtocolIdentifier`], or
     /// [`Ax25Error::UnexpectedInformationField`] when the fields do not
     /// match the control-field type.
-    pub fn try_new(
-        source: Ax25Address,
-        destination: Ax25Address,
-        digipeaters: DigipeaterPath,
-        command_or_response: CommandResponse,
+    pub fn new(
+        header: Ax25Header,
         control: Ax25Control,
         protocol: Option<Ax25Pid>,
         information: Vec<u8>,
     ) -> Result<Self, Ax25Error> {
         validate_frame_fields(control, protocol, &information)?;
         Ok(Self {
-            source,
-            destination,
-            digipeaters,
-            command_or_response,
+            header,
             control,
             protocol,
             information,
@@ -104,21 +110,16 @@ impl Ax25Packet {
     ///
     /// UI is the connectionless frame used by APRS. Unlike the general
     /// constructor, this common valid shape is infallible.
+    /// See the [packet example](crate#encoding-and-decoding-a-packet).
     #[must_use]
     pub const fn unnumbered_information(
-        source: Ax25Address,
-        destination: Ax25Address,
-        digipeaters: DigipeaterPath,
-        command_or_response: CommandResponse,
-        poll_final: bool,
+        header: Ax25Header,
+        poll_final: PollFinal,
         protocol: Ax25Pid,
         information: Vec<u8>,
     ) -> Self {
         Self {
-            source,
-            destination,
-            digipeaters,
-            command_or_response,
+            header,
             control: Ax25Control::Unnumbered {
                 kind: UnnumberedKind::UnnumberedInformation,
                 pf: poll_final,
@@ -174,6 +175,79 @@ impl Ax25Packet {
     #[must_use]
     pub const fn is_ui(&self) -> bool {
         self.control.is_ui()
+    }
+
+    /// Decode one AX.25 frame from bytes without flags or FCS.
+    ///
+    /// Handles modulo-8 I, S, and U frames. Only I and UI frames carry a PID.
+    /// Information is accepted for I, UI, FRMR, XID, TEST, and unknown U-frame
+    /// modifiers. A complete escaped PID consumes its `0xff` prefix and
+    /// extension octet before the information field.
+    ///
+    /// Callsigns are normalized to uppercase. Reserved SSID bits are ignored
+    /// on input and set to one by [`Self::to_bytes`]. Every callsign octet and
+    /// the destination SSID octet must have a clear address-extension bit.
+    ///
+    /// The decoder allocates owned callsigns, the bounded repeater path, and
+    /// a copy of the information bytes. It imposes no information-length limit;
+    /// callers cap input length before decoding when a resource limit is needed.
+    /// See the [packet example](crate#encoding-and-decoding-a-packet).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Ax25Error::PacketTooShort`] for fewer than 15 bytes,
+    /// [`Ax25Error::InvalidAddressExtension`] for a premature extension bit,
+    /// [`Ax25Error::InvalidCallsignByte`] for invalid or embedded-padding
+    /// characters, and [`Ax25Error::InvalidCallsign`] for an empty callsign.
+    /// A truncated repeater address returns [`Ax25Error::InvalidAddressLength`];
+    /// more than eight repeaters return [`Ax25Error::TooManyDigipeaters`].
+    /// Missing control or PID octets return [`Ax25Error::MissingControlFields`],
+    /// [`Ax25Error::MissingProtocolIdentifier`], or
+    /// [`Ax25Error::MissingProtocolIdentifierExtension`]. Forbidden trailing
+    /// information returns [`Ax25Error::UnexpectedInformationField`].
+    pub fn from_bytes(data: &[u8]) -> Result<Self, Ax25Error> {
+        decode_packet(data)
+    }
+
+    /// Encode this frame without flags or FCS into a new byte vector.
+    ///
+    /// Output starts with the destination address and ends with information
+    /// bytes. Each address occupies seven octets; the control occupies one;
+    /// a PID, when present, occupies one or two. Reserved SSID bits are set
+    /// to one. The final address alone carries the extension bit.
+    /// See the [packet example](crate#encoding-and-decoding-a-packet).
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let (dest_c, src_c) = match self.header.command_response {
+            CommandResponse::Command => (true, false),
+            CommandResponse::Response => (false, true),
+            CommandResponse::LegacyBothClear => (false, false),
+            CommandResponse::LegacyBothSet => (true, true),
+        };
+        let no_digis = self.header.digipeaters.is_empty();
+        let total_len = 14
+            + self.header.digipeaters.len() * 7
+            + 1
+            + self.protocol.map_or(0, Ax25Pid::wire_len)
+            + self.information.len();
+        let mut out = Vec::with_capacity(total_len);
+        out.extend_from_slice(&encode_address(&self.header.destination, dest_c, false));
+        out.extend_from_slice(&encode_address(&self.header.source, src_c, no_digis));
+
+        let digi_count = self.header.digipeaters.len();
+        for (i, entry) in self.header.digipeaters.iter().enumerate() {
+            let is_last = i + 1 == digi_count;
+            out.extend_from_slice(&encode_address(&entry.address, entry.has_repeated, is_last));
+        }
+        out.push(self.control.as_byte());
+        if let Some(protocol) = self.protocol {
+            out.push(protocol.as_byte());
+            if let Some(extension) = protocol.extension_byte() {
+                out.push(extension);
+            }
+        }
+        out.extend_from_slice(&self.information);
+        out
     }
 }
 
@@ -239,13 +313,16 @@ const fn validate_frame_fields(
 /// validated [`Ax25Address`] plus the raw wire bit 7 (interpretation
 /// depends on slot; caller decides).
 ///
-/// Rejects callsign bytes outside ASCII A-Z / 0-9 (after the AX.25
-/// `<< 1` shift is undone) and rejects embedded spaces (only trailing
-/// space padding is permitted per §3.12.2).
+/// Normalizes ASCII letters to uppercase and permits trailing space padding.
+/// Callsign extension bits and embedded padding are rejected per AX.25 v2.2
+/// §3.12 and §3.12.2.
 fn decode_address(bytes: [u8; 7]) -> Result<(Ax25Address, bool), Ax25Error> {
     let mut callsign = String::with_capacity(6);
     let mut in_pad = false;
     for &b in bytes.iter().take(6) {
+        if b & 0x01 != 0 {
+            return Err(Ax25Error::InvalidAddressExtension);
+        }
         let ch = b >> 1;
         if ch == b' ' {
             in_pad = true;
@@ -263,8 +340,8 @@ fn decode_address(bytes: [u8; 7]) -> Result<(Ax25Address, bool), Ax25Error> {
     let ssid_byte = *bytes.get(6).ok_or(Ax25Error::PacketTooShort)?;
     let ssid_raw = (ssid_byte >> 1) & 0x0F;
     let bit7 = ssid_byte & 0x80 != 0;
-    let callsign = Callsign::new(&callsign).map_err(|_| Ax25Error::InvalidCallsignByte(0))?;
-    let ssid = Ssid::new(ssid_raw).map_err(|_| Ax25Error::InvalidCallsignByte(ssid_raw))?;
+    let callsign = Callsign::try_from(callsign)?;
+    let ssid = Ssid::new(ssid_raw)?;
     Ok((Ax25Address::from_parts(callsign, ssid), bit7))
 }
 
@@ -291,16 +368,8 @@ fn encode_address(addr: &Ax25Address, bit7: bool, is_last: bool) -> [u8; 7] {
     bytes
 }
 
-/// Parse an AX.25 packet from raw bytes (as received in a KISS data frame).
-///
-/// Handles modulo-8 I, S, and U frames. A PID byte is consumed only for I
-/// and UI frames. Information bytes are accepted only for I, UI, FRMR, XID,
-/// TEST, and unknown U-frame modifier patterns.
-///
-/// # Errors
-///
-/// Returns [`Ax25Error`] if the packet structure is invalid.
-pub fn parse_ax25(data: &[u8]) -> Result<Ax25Packet, Ax25Error> {
+/// Decode the address sequence, control field, PID, and information.
+fn decode_packet(data: &[u8]) -> Result<Ax25Packet, Ax25Error> {
     // Minimum: dest(7) + src(7) + control(1) = 15. I and UI frames are
     // checked for their required PID after the control field is classified.
     if data.len() < 15 {
@@ -316,10 +385,14 @@ pub fn parse_ax25(data: &[u8]) -> Result<Ax25Packet, Ax25Error> {
         .and_then(|s| <[u8; 7]>::try_from(s).ok())
         .ok_or(Ax25Error::PacketTooShort)?;
 
+    if dest_bytes.get(6).is_some_and(|byte| byte & 0x01 != 0) {
+        return Err(Ax25Error::InvalidAddressExtension);
+    }
+
     let (destination, dest_c_bit) = decode_address(dest_bytes)?;
     let (source, src_c_bit) = decode_address(src_bytes)?;
 
-    let command_or_response = match (dest_c_bit, src_c_bit) {
+    let command_response = match (dest_c_bit, src_c_bit) {
         (true, false) => CommandResponse::Command,
         (false, true) => CommandResponse::Response,
         (false, false) => CommandResponse::LegacyBothClear,
@@ -381,56 +454,17 @@ pub fn parse_ax25(data: &[u8]) -> Result<Ax25Packet, Ax25Error> {
     };
     let information = data.get(information_start..).unwrap_or(&[]).to_vec();
 
-    Ax25Packet::try_new(
-        source,
-        destination,
-        digipeaters,
-        command_or_response,
+    Ax25Packet::new(
+        Ax25Header {
+            source,
+            destination,
+            digipeaters,
+            command_response,
+        },
         control,
         protocol,
         information,
     )
-}
-
-/// Build an AX.25 frame from an [`Ax25Packet`].
-///
-/// Returns the raw bytes suitable for encapsulation in a KISS data frame.
-///
-#[must_use]
-pub fn build_ax25(packet: &Ax25Packet) -> Vec<u8> {
-    let (dest_c, src_c) = match packet.command_or_response {
-        CommandResponse::Command => (true, false),
-        CommandResponse::Response => (false, true),
-        CommandResponse::LegacyBothClear => (false, false),
-        CommandResponse::LegacyBothSet => (true, true),
-    };
-    let no_digis = packet.digipeaters.is_empty();
-    let total_len = 14
-        + packet.digipeaters.len() * 7
-        + 1
-        + packet.protocol.map_or(0, Ax25Pid::wire_len)
-        + packet.information.len();
-    let mut out = Vec::with_capacity(total_len);
-
-    out.extend_from_slice(&encode_address(&packet.destination, dest_c, false));
-    out.extend_from_slice(&encode_address(&packet.source, src_c, no_digis));
-
-    let digi_count = packet.digipeaters.len();
-    for (i, entry) in packet.digipeaters.iter().enumerate() {
-        let is_last = i + 1 == digi_count;
-        out.extend_from_slice(&encode_address(&entry.address, entry.has_repeated, is_last));
-    }
-
-    out.push(packet.control.as_byte());
-    if let Some(protocol) = packet.protocol {
-        out.push(protocol.as_byte());
-        if let Some(extension) = protocol.extension_byte() {
-            out.push(extension);
-        }
-    }
-    out.extend_from_slice(&packet.information);
-
-    out
 }
 
 // ---------------------------------------------------------------------------
@@ -462,11 +496,13 @@ mod tests {
         information: Vec<u8>,
     ) -> Ax25Packet {
         Ax25Packet::unnumbered_information(
-            source,
-            destination,
-            digipeaters,
-            command_or_response,
-            poll_final,
+            Ax25Header {
+                source,
+                destination,
+                digipeaters,
+                command_response: command_or_response,
+            },
+            PollFinal::from(poll_final),
             Ax25Pid::NoLayer3,
             information,
         )
@@ -497,15 +533,18 @@ mod tests {
     #[test]
     fn parse_ax25_basic() -> TestResult {
         let data = make_test_ax25_bytes();
-        let packet = parse_ax25(&data)?;
-        assert_eq!(packet.destination.callsign, "APRS");
-        assert_eq!(packet.destination.ssid, 0);
-        assert_eq!(packet.source.callsign, "N0CALL");
-        assert_eq!(packet.source.ssid, 7);
-        assert!(packet.digipeaters.is_empty());
+        let packet = Ax25Packet::from_bytes(&data)?;
+        assert_eq!(packet.header.destination.callsign, "APRS");
+        assert_eq!(packet.header.destination.ssid, 0);
+        assert_eq!(packet.header.source.callsign, "N0CALL");
+        assert_eq!(packet.header.source.ssid, 7);
+        assert!(packet.header.digipeaters.is_empty());
         assert_eq!(packet.control_byte(), 0x03);
         assert_eq!(packet.protocol_identifier(), Some(Ax25Pid::NoLayer3));
-        assert_eq!(packet.command_or_response, CommandResponse::LegacyBothClear);
+        assert_eq!(
+            packet.header.command_response,
+            CommandResponse::LegacyBothClear
+        );
         assert_eq!(packet.information(), b"!4903.50N/07201.75W-Test");
         Ok(())
     }
@@ -533,12 +572,12 @@ mod tests {
         frame.push(0xF0);
         frame.extend_from_slice(b"=test data");
 
-        let packet = parse_ax25(&frame)?;
-        assert_eq!(packet.source.callsign, "W6DJY");
-        assert_eq!(packet.source.ssid, 9);
-        assert_eq!(packet.digipeaters.len(), 2);
-        let digi0 = packet.digipeaters.first().ok_or("missing digi 0")?;
-        let digi1 = packet.digipeaters.get(1).ok_or("missing digi 1")?;
+        let packet = Ax25Packet::from_bytes(&frame)?;
+        assert_eq!(packet.header.source.callsign, "W6DJY");
+        assert_eq!(packet.header.source.ssid, 9);
+        assert_eq!(packet.header.digipeaters.len(), 2);
+        let digi0 = packet.header.digipeaters.first().ok_or("missing digi 0")?;
+        let digi1 = packet.header.digipeaters.get(1).ok_or("missing digi 1")?;
         assert_eq!(digi0.address.callsign, "WIDE1");
         assert_eq!(digi0.address.ssid, 1);
         assert!(!digi0.has_repeated);
@@ -552,12 +591,12 @@ mod tests {
         let mut wire = make_address_field_bytes();
         wire.push(0x01); // RR, N(R)=0, P/F clear.
 
-        let packet = parse_ax25(&wire)?;
+        let packet = Ax25Packet::from_bytes(&wire)?;
         assert_eq!(packet.control_byte(), 0x01);
         assert_eq!(packet.protocol_identifier(), None);
         assert!(!packet.has_information_field());
         assert_eq!(packet.information(), b"");
-        assert_eq!(build_ax25(&packet), wire);
+        assert_eq!(packet.to_bytes(), wire);
         Ok(())
     }
 
@@ -566,11 +605,11 @@ mod tests {
         let mut wire = make_address_field_bytes();
         wire.extend_from_slice(&[0x00, 0xCC, 0x45, 0x00]);
 
-        let packet = parse_ax25(&wire)?;
+        let packet = Ax25Packet::from_bytes(&wire)?;
         assert!(matches!(packet.control(), Ax25Control::Information { .. }));
         assert_eq!(packet.protocol_identifier(), Some(Ax25Pid::Ip));
         assert_eq!(packet.information(), [0x45, 0x00]);
-        assert_eq!(build_ax25(&packet), wire);
+        assert_eq!(packet.to_bytes(), wire);
         Ok(())
     }
 
@@ -580,7 +619,7 @@ mod tests {
             let mut wire = make_address_field_bytes();
             wire.extend_from_slice(&[control_byte, 0xFF, 0xCC, 0x45, 0x00]);
 
-            let packet = parse_ax25(&wire)?;
+            let packet = Ax25Packet::from_bytes(&wire)?;
             assert_eq!(
                 packet.protocol_identifier(),
                 Some(Ax25Pid::Escape { extension: 0xCC }),
@@ -591,7 +630,7 @@ mod tests {
                 [0x45, 0x00],
                 "escaped PID extension must not leak into information",
             );
-            assert_eq!(build_ax25(&packet), wire);
+            assert_eq!(packet.to_bytes(), wire);
         }
         Ok(())
     }
@@ -603,7 +642,7 @@ mod tests {
             wire.extend_from_slice(&[control_byte, 0xFF]);
 
             assert_eq!(
-                parse_ax25(&wire),
+                Ax25Packet::from_bytes(&wire),
                 Err(Ax25Error::MissingProtocolIdentifierExtension),
                 "control {control_byte:#04x}",
             );
@@ -615,17 +654,17 @@ mod tests {
         let mut wire = make_address_field_bytes();
         wire.extend_from_slice(&[0xAF, 0x82, 0x80, 0x00, 0x00]);
 
-        let packet = parse_ax25(&wire)?;
+        let packet = Ax25Packet::from_bytes(&wire)?;
         assert_eq!(
             packet.control(),
             Ax25Control::Unnumbered {
                 kind: UnnumberedKind::ExchangeIdentification,
-                pf: false,
+                pf: PollFinal::Clear,
             }
         );
         assert_eq!(packet.protocol_identifier(), None);
         assert_eq!(packet.information(), [0x82, 0x80, 0x00, 0x00]);
-        assert_eq!(build_ax25(&packet), wire);
+        assert_eq!(packet.to_bytes(), wire);
         Ok(())
     }
 
@@ -635,7 +674,7 @@ mod tests {
         wire.extend_from_slice(&[0x6F, 0xAA]); // SABME cannot carry information.
 
         assert_eq!(
-            parse_ax25(&wire),
+            Ax25Packet::from_bytes(&wire),
             Err(Ax25Error::UnexpectedInformationField {
                 control: 0x6F,
                 length: 1,
@@ -649,7 +688,7 @@ mod tests {
             let mut wire = make_address_field_bytes();
             wire.push(control_byte);
             assert_eq!(
-                parse_ax25(&wire),
+                Ax25Packet::from_bytes(&wire),
                 Err(Ax25Error::MissingProtocolIdentifier {
                     control: control_byte,
                 }),
@@ -665,11 +704,13 @@ mod tests {
         let rr = Ax25Control::from_byte(0x01);
 
         assert_eq!(
-            Ax25Packet::try_new(
-                source.clone(),
-                destination.clone(),
-                DigipeaterPath::empty(),
-                CommandResponse::Response,
+            Ax25Packet::new(
+                Ax25Header {
+                    source: source.clone(),
+                    destination: destination.clone(),
+                    digipeaters: DigipeaterPath::empty(),
+                    command_response: CommandResponse::Response,
+                },
                 rr,
                 Some(Ax25Pid::NoLayer3),
                 Vec::new(),
@@ -677,11 +718,13 @@ mod tests {
             Err(Ax25Error::UnexpectedProtocolIdentifier { control: 0x01 })
         );
         assert_eq!(
-            Ax25Packet::try_new(
-                source,
-                destination,
-                DigipeaterPath::empty(),
-                CommandResponse::Response,
+            Ax25Packet::new(
+                Ax25Header {
+                    source,
+                    destination,
+                    digipeaters: DigipeaterPath::empty(),
+                    command_response: CommandResponse::Response,
+                },
                 rr,
                 None,
                 vec![0xAA],
@@ -695,7 +738,7 @@ mod tests {
     }
 
     #[test]
-    fn constructor_enforces_the_complete_known_frame_field_matrix() -> TestResult {
+    fn constructor_permits_information_for_supported_frame_types() -> TestResult {
         let source = Ax25Address::new("N0CALL", 7)?;
         let destination = Ax25Address::new("APRS", 0)?;
 
@@ -704,11 +747,13 @@ mod tests {
         for control_byte in [0x00, 0x03, 0x87, 0xAF, 0xE3] {
             let control = Ax25Control::from_byte(control_byte);
             let protocol = control_requires_protocol(control).then_some(Ax25Pid::NoLayer3);
-            let mut packet = Ax25Packet::try_new(
-                source.clone(),
-                destination.clone(),
-                DigipeaterPath::empty(),
-                CommandResponse::LegacyBothClear,
+            let mut packet = Ax25Packet::new(
+                Ax25Header {
+                    source: source.clone(),
+                    destination: destination.clone(),
+                    digipeaters: DigipeaterPath::empty(),
+                    command_response: CommandResponse::LegacyBothClear,
+                },
                 control,
                 protocol,
                 vec![0xAA],
@@ -722,6 +767,13 @@ mod tests {
                 "control {control_byte:#04x} must permit information mutation",
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn constructor_enforces_forbidden_fields_and_required_pid() -> TestResult {
+        let source = Ax25Address::new("N0CALL", 7)?;
+        let destination = Ax25Address::new("APRS", 0)?;
 
         // All S frames and every other known U frame must end immediately
         // after the control byte.
@@ -730,11 +782,13 @@ mod tests {
             0x2F, 0x6F, 0x43, 0x0F, 0x63, // SABM, SABME, DISC, DM, UA
         ] {
             let control = Ax25Control::from_byte(control_byte);
-            let packet = Ax25Packet::try_new(
-                source.clone(),
-                destination.clone(),
-                DigipeaterPath::empty(),
-                CommandResponse::LegacyBothClear,
+            let packet = Ax25Packet::new(
+                Ax25Header {
+                    source: source.clone(),
+                    destination: destination.clone(),
+                    digipeaters: DigipeaterPath::empty(),
+                    command_response: CommandResponse::LegacyBothClear,
+                },
                 control,
                 None,
                 Vec::new(),
@@ -744,11 +798,13 @@ mod tests {
                 "control {control_byte:#04x} must not expose an information field",
             );
             assert_eq!(
-                Ax25Packet::try_new(
-                    source.clone(),
-                    destination.clone(),
-                    DigipeaterPath::empty(),
-                    CommandResponse::LegacyBothClear,
+                Ax25Packet::new(
+                    Ax25Header {
+                        source: source.clone(),
+                        destination: destination.clone(),
+                        digipeaters: DigipeaterPath::empty(),
+                        command_response: CommandResponse::LegacyBothClear,
+                    },
                     control,
                     None,
                     vec![0xAA],
@@ -760,11 +816,13 @@ mod tests {
                 "control {control_byte:#04x} accepted forbidden information",
             );
             assert_eq!(
-                Ax25Packet::try_new(
-                    source.clone(),
-                    destination.clone(),
-                    DigipeaterPath::empty(),
-                    CommandResponse::LegacyBothClear,
+                Ax25Packet::new(
+                    Ax25Header {
+                        source: source.clone(),
+                        destination: destination.clone(),
+                        digipeaters: DigipeaterPath::empty(),
+                        command_response: CommandResponse::LegacyBothClear,
+                    },
                     control,
                     Some(Ax25Pid::NoLayer3),
                     Vec::new(),
@@ -778,11 +836,13 @@ mod tests {
 
         for control_byte in [0x00, 0x03] {
             assert_eq!(
-                Ax25Packet::try_new(
-                    source.clone(),
-                    destination.clone(),
-                    DigipeaterPath::empty(),
-                    CommandResponse::LegacyBothClear,
+                Ax25Packet::new(
+                    Ax25Header {
+                        source: source.clone(),
+                        destination: destination.clone(),
+                        digipeaters: DigipeaterPath::empty(),
+                        command_response: CommandResponse::LegacyBothClear,
+                    },
                     Ax25Control::from_byte(control_byte),
                     None,
                     Vec::new(),
@@ -802,7 +862,7 @@ mod tests {
             let mut wire = make_address_field_bytes();
             wire.extend_from_slice(&[control_byte, 0xF0, 0xAA]);
 
-            let packet = parse_ax25(&wire)?;
+            let packet = Ax25Packet::from_bytes(&wire)?;
             let Ax25Control::Unnumbered {
                 kind: UnnumberedKind::Other(kind),
                 pf,
@@ -811,10 +871,10 @@ mod tests {
                 return Err("fixture must classify as an unknown U frame".into());
             };
             assert_eq!(kind.as_byte(), 0x07);
-            assert_eq!(pf, control_byte & 0x10 != 0);
+            assert_eq!(pf.is_set(), control_byte & 0x10 != 0);
             assert_eq!(packet.protocol_identifier(), None);
             assert_eq!(packet.information(), [0xF0, 0xAA]);
-            assert_eq!(build_ax25(&packet), wire);
+            assert_eq!(packet.to_bytes(), wire);
         }
         Ok(())
     }
@@ -833,8 +893,8 @@ mod tests {
             b"!4903.50N/07201.75W-Test 73".to_vec(),
         );
 
-        let bytes = build_ax25(&original);
-        let parsed = parse_ax25(&bytes)?;
+        let bytes = original.to_bytes();
+        let parsed = Ax25Packet::from_bytes(&bytes)?;
 
         assert_eq!(parsed, original);
         Ok(())
@@ -842,11 +902,89 @@ mod tests {
 
     #[test]
     fn parse_ax25_too_short() {
-        let r = parse_ax25(&[0; 10]);
+        let r = Ax25Packet::from_bytes(&[0; 10]);
         assert!(
             matches!(r, Err(Ax25Error::PacketTooShort)),
             "expected PacketTooShort, got {r:?}",
         );
+    }
+
+    #[test]
+    fn destination_extension_bit_cannot_end_the_address_field() -> TestResult {
+        let mut wire = make_test_ax25_bytes();
+        *wire.get_mut(6).ok_or("destination SSID octet")? |= 0x01;
+        assert_eq!(
+            Ax25Packet::from_bytes(&wire),
+            Err(Ax25Error::InvalidAddressExtension),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn premature_callsign_extension_bits_are_rejected_in_every_address() -> TestResult {
+        let canonical = [
+            0x82, 0xA0, 0xA4, 0xA6, 0x40, 0x40, 0xE0, 0x9C, 0x60, 0x86, 0x82, 0x98, 0x98, 0x6E,
+            0xAE, 0x92, 0x88, 0x8A, 0x62, 0x40, 0x63, 0x03, 0xF0,
+        ];
+        let packet = Ax25Packet::from_bytes(&canonical)?;
+        assert_eq!(packet.header.digipeaters.len(), 1);
+        for address_start in [0, 7, 14] {
+            for character in 0..6 {
+                let index = address_start + character;
+                let mut wire = canonical;
+                *wire.get_mut(index).ok_or("callsign octet")? |= 0x01;
+                assert_eq!(
+                    Ax25Packet::from_bytes(&wire),
+                    Err(Ax25Error::InvalidAddressExtension),
+                    "extension bit at octet {index}",
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn all_space_wire_callsign_reports_its_empty_value() -> TestResult {
+        let mut wire = make_test_ax25_bytes();
+        wire.get_mut(..6).ok_or("destination callsign")?.fill(0x40);
+        let result = Ax25Packet::from_bytes(&wire);
+        assert!(
+            matches!(result, Err(Ax25Error::InvalidCallsign(_))),
+            "{result:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lowercase_and_reserved_bits_normalize_to_canonical_output() -> TestResult {
+        let canonical = make_test_ax25_bytes();
+        let mut wire = canonical.clone();
+        for (octet, character) in wire
+            .get_mut(7..13)
+            .ok_or("source callsign")?
+            .iter_mut()
+            .zip(b"n0call")
+        {
+            *octet = *character << 1;
+        }
+        for index in [6, 13] {
+            *wire.get_mut(index).ok_or("SSID octet")? &= !0x60;
+        }
+        let packet = Ax25Packet::from_bytes(&wire)?;
+        assert_eq!(packet.header.source.callsign.as_str(), "N0CALL");
+        assert_eq!(packet.to_bytes(), canonical);
+        Ok(())
+    }
+
+    #[test]
+    fn public_values_and_errors_remain_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<Ax25Header>();
+        assert_send_sync::<Ax25Packet>();
+        assert_send_sync::<Ax25Error>();
+        assert_send_sync::<Callsign>();
+        assert_send_sync::<DigipeaterPath>();
     }
 
     #[test]
@@ -870,17 +1008,15 @@ mod tests {
         frame.push(0x03);
         frame.push(0xF0);
         frame.extend_from_slice(b"!test");
-        assert_eq!(parse_ax25(&frame), Err(Ax25Error::TooManyDigipeaters));
+        assert_eq!(
+            Ax25Packet::from_bytes(&frame),
+            Err(Ax25Error::TooManyDigipeaters)
+        );
     }
 
-    /// Absolute wire pin for the encoder, hand-derived from AX.25
-    /// v2.2 §3.12. Every other encode check in this crate round-trips
-    /// through this crate's parser, which masks the reserved SSID bits the
-    /// encoder writes (`(ssid_byte >> 1) & 0x0F`), so an encoder
-    /// emitting `0x00`-base SSID bytes would pass the entire suite
-    /// while producing frames other TNCs may reject. Layout per SSID
-    /// byte: C/H in bit 7, reserved `0b11` in bits 6-5, SSID in bits
-    /// 4-1, address-extension in bit 0 (last address only).
+    /// Encoder bytes match AX.25 v2.2 §3.12 independently of the decoder.
+    /// SSID octets contain C/H at bit 7, reserved ones at bits 6-5, SSID
+    /// at bits 4-1, and the extension bit at bit 0 of the final address.
     #[test]
     fn build_matches_hand_derived_wire_bytes() -> TestResult {
         let destination = Ax25Address::from_parts(
@@ -906,7 +1042,7 @@ mod tests {
             false,
             b"hello".to_vec(),
         );
-        let wire = build_ax25(&packet);
+        let wire = packet.to_bytes();
         let expected: [u8; 28] = [
             // "APRS  " shifted << 1; SSID byte 0xE0 = C-bit (command)
             // | 0x60 reserved | ssid 0 | ext 0.
@@ -928,20 +1064,16 @@ mod tests {
         Ok(())
     }
 
-    /// Wire-level idempotence for canonical inputs:
-    /// `build(parse(bytes)) == bytes`. Decode tolerates lowercase
-    /// wire callsigns as NORMALIZATION (uppercasing on the way in),
-    /// so identity holds only for canonical frames, which is exactly
-    /// what this pins: the parser/encoder pair must not silently
-    /// rewrite any bit of an already-canonical frame.
+    /// Canonical wire bytes retain all address, control, PID, and payload
+    /// fields through decode and encode.
     #[test]
     fn canonical_wire_bytes_survive_parse_then_build() -> TestResult {
         let canonical: [u8; 28] = [
             0x82, 0xA0, 0xA4, 0xA6, 0x40, 0x40, 0xE0, 0x9C, 0x60, 0x86, 0x82, 0x98, 0x98, 0x6E,
             0xAE, 0x92, 0x88, 0x8A, 0x62, 0x40, 0xE3, 0x03, 0xF0, b'h', b'e', b'l', b'l', b'o',
         ];
-        let packet = parse_ax25(&canonical).map_err(|_| "canonical frame must parse")?;
-        let rebuilt = build_ax25(&packet);
+        let packet = Ax25Packet::from_bytes(&canonical)?;
+        let rebuilt = packet.to_bytes();
         assert_eq!(
             rebuilt.as_slice(),
             canonical.as_slice(),
@@ -977,7 +1109,6 @@ mod tests {
 
     #[test]
     fn ax25_command_roundtrip_preserves_classification() -> TestResult {
-        // Regression for Bug 1: command frames must survive build → parse.
         let original = make_ui_packet(
             Ax25Address::new("N0CALL", 7)?,
             Ax25Address::new("APRS", 0)?,
@@ -986,9 +1117,9 @@ mod tests {
             false,
             b"!".to_vec(),
         );
-        let bytes = build_ax25(&original);
-        let parsed = parse_ax25(&bytes)?;
-        assert_eq!(parsed.command_or_response, CommandResponse::Command);
+        let bytes = original.to_bytes();
+        let parsed = Ax25Packet::from_bytes(&bytes)?;
+        assert_eq!(parsed.header.command_response, CommandResponse::Command);
         Ok(())
     }
 
@@ -1002,9 +1133,9 @@ mod tests {
             false,
             b"!".to_vec(),
         );
-        let bytes = build_ax25(&original);
-        let parsed = parse_ax25(&bytes)?;
-        assert_eq!(parsed.command_or_response, CommandResponse::Response);
+        let bytes = original.to_bytes();
+        let parsed = Ax25Packet::from_bytes(&bytes)?;
+        assert_eq!(parsed.header.command_response, CommandResponse::Response);
         Ok(())
     }
 
@@ -1022,10 +1153,10 @@ mod tests {
                 false,
                 b"!".to_vec(),
             );
-            let bytes = build_ax25(&original);
-            let parsed = parse_ax25(&bytes)?;
-            assert_eq!(parsed.command_or_response, legacy);
-            assert_eq!(build_ax25(&parsed), bytes);
+            let bytes = original.to_bytes();
+            let parsed = Ax25Packet::from_bytes(&bytes)?;
+            assert_eq!(parsed.header.command_response, legacy);
+            assert_eq!(parsed.to_bytes(), bytes);
         }
         Ok(())
     }
@@ -1042,10 +1173,10 @@ mod tests {
             false,
             b"!".to_vec(),
         );
-        let bytes = build_ax25(&original);
-        let parsed = parse_ax25(&bytes)?;
-        assert_eq!(parsed.digipeaters.len(), 1);
-        let d0 = parsed.digipeaters.first().ok_or("missing digi 0")?;
+        let bytes = original.to_bytes();
+        let parsed = Ax25Packet::from_bytes(&bytes)?;
+        assert_eq!(parsed.header.digipeaters.len(), 1);
+        let d0 = parsed.header.digipeaters.first().ok_or("missing digi 0")?;
         assert!(d0.has_repeated);
         Ok(())
     }
@@ -1071,7 +1202,6 @@ mod tests {
 
     #[test]
     fn parse_ax25_rejects_embedded_space_in_callsign() {
-        // Regression for Bug 3.
         let mut frame = Vec::new();
         for &c in b"A B   " {
             frame.push(c << 1);
@@ -1085,7 +1215,7 @@ mod tests {
         frame.push(0xF0);
         frame.push(b'!');
 
-        let r = parse_ax25(&frame);
+        let r = Ax25Packet::from_bytes(&frame);
         assert!(
             matches!(r, Err(Ax25Error::InvalidCallsignByte(_))),
             "embedded space should be rejected, got {r:?}",
@@ -1165,7 +1295,8 @@ mod tests {
             arb_pid(),
             proptest::collection::vec(any::<u8>(), 0..=256),
         )
-            .prop_map(
+            .prop_filter_map(
+                "valid frame fields",
                 |(source, destination, digipeaters, command_or_response, byte, pid, info)| {
                     let control = Ax25Control::from_byte(byte);
                     let protocol = control_requires_protocol(control).then_some(pid);
@@ -1174,35 +1305,35 @@ mod tests {
                     } else {
                         Vec::new()
                     };
-                    Ax25Packet::try_new(
-                        source,
-                        destination,
-                        digipeaters,
-                        command_or_response,
+                    Ax25Packet::new(
+                        Ax25Header {
+                            source,
+                            destination,
+                            digipeaters,
+                            command_response: command_or_response,
+                        },
                         control,
                         protocol,
                         information,
                     )
-                    .unwrap_or_else(|_| unreachable!("strategy produces valid frame fields"))
+                    .ok()
                 },
             )
     }
 
     proptest! {
-        /// Any well-formed Ax25Packet roundtrips through build → parse.
-        /// Would have caught Bug 1 (C-bit silently dropped on encode).
+        /// Every constructed packet survives encode and decode.
         #[test]
         fn ax25_packet_roundtrips(p in arb_packet()) {
-            let bytes = build_ax25(&p);
-            let parsed = parse_ax25(&bytes).map_err(to_test_err)?;
+            let bytes = p.to_bytes();
+            let parsed = Ax25Packet::from_bytes(&bytes).map_err(to_test_err)?;
             prop_assert_eq!(parsed, p);
         }
 
-        /// Parser never panics on arbitrary input. Would have caught
-        /// Bug 3 (embedded-space stripping) via structural divergence.
+        /// Arbitrary input produces a decoded packet or a structured error.
         #[test]
         fn parse_ax25_never_panics(data in proptest::collection::vec(any::<u8>(), 0..=512)) {
-            drop(parse_ax25(&data));
+            drop(Ax25Packet::from_bytes(&data));
         }
     }
 }
