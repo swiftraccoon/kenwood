@@ -15,16 +15,17 @@ workspace root from its own location.
 ## FFI contract (this crate owns it; Swift consumes)
 
 - `CatCommand`: `Identify` (`ID\r`) and `FirmwareVersion` (`FV\r`). `CatResponse`: `Identify`, `FirmwareVersion`, `Unknown` (radio replied `?`), `NotAvailableInMode` (`N`), `Raw`.
-- `connect_reflector(...)` is async and returns `Arc<ReflectorSession>`. `ReflectorObserver` is a Swift-implemented callback interface invoked from a background tokio task, so implementations must not block.
+- `ReflectorConnectionConfig::new` validates the foreign connection candidate without I/O; `ReflectorSession::connect` consumes that checked configuration asynchronously. `ReflectorObserver` callbacks run on the session task and must return promptly.
 - `ReflectorEvent` carries `SlowDataUpdate` (sticky; fires whenever assembled text or DPRS position changes mid-stream) and `Unknown { detail }` alongside the voice and lifecycle variants. Adding a variant is a Swift-side breaking change; `Unknown` exists so an unrecognised event is never conflated with teardown.
 - `header_bytes` is the raw 41-byte on-wire D-STAR header (MMDVM command `0x10`); `voice_bytes` is a raw 12-byte frame, 9 bytes AMBE plus 3 bytes slow data (MMDVM command `0x11`).
 - One background task per session owns the `AsyncSession<P>` and pumps `next_event()`. `disconnect()` signals it over a `oneshot` and awaits the task; the TX path reaches the same task through a bounded `mpsc` with per-command `oneshot` replies.
 - DPlus connect runs `AuthClient::authenticate()` over TCP before the UDP handshake. When both fail the returned error says so and points at XRF/DCS, which need no auth. Consumers surface that message instead of inventing one.
-- Stream-ID validation lives here: every `send_*` path rejects zero. Generation is caller-side via `dstar_gateway::tokio_shell::fresh_stream_id`.
+- `VoiceStreamId` and `VoiceSequence` use checked foreign lifting; transmission rejects zero IDs and indices above 20 before queueing. Swift aliases remain `UInt16` and `UInt8`; generated values wrap indices modulo 21. Raw radio bytes remain separate observations.
+- MCP pages have immutable 256-byte contents. Only `McpPage::write_command` admits a writable address; a parsed calibration page remains read-only.
 
 ## Known duplication sites (propagate fixes)
 
-- `drive_handshake_to_connected` delegates to `dstar_gateway::tokio_shell::drive_connecting`, as do the sextant, stargazer and thd75-repl equivalents. Protocol fixes go there.
+- `drive_handshake_to_connected` delegates to `dstar_gateway::tokio_shell::drive_connecting`, as do the Sextant and Stargazer equivalents. Protocol fixes go there.
 - `mcp.rs` owns Lodestar's typed MCP-D75 schema: model and firmware identities, Menu 985 interface routing at `0x1093`, Menu 650 gateway mode at `0x1CA0`. These duplicate `kenwood-thd75`, whose registry pins remain the watchdog. Swift consumes the UniFFI schema and must not duplicate identities, offsets or stored values.
 - `reflector.rs` owns host-list machinery; sextant's `hosts.rs` is a deliberately separate implementation, with the rationale in `sextant/AGENTS.md`.
 

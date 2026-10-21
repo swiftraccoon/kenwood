@@ -31,14 +31,14 @@ final class LodestarCoreFFITests: XCTestCase {
     }
 
     func testParseWFrameRejectsNonzeroOffsetAcrossSwiftBridge() throws {
-        var frame = try buildWritePageCmd(
+        var frame = try McpPage(
             page: 0x001C,
             data: Data(repeating: 0xA5, count: 256)
-        )
+        ).writeCommand()
         frame[3] = 0x00
         frame[4] = 0x01
 
-        XCTAssertThrowsError(try parseWFrame(bytes: frame)) { error in
+        XCTAssertThrowsError(try McpPage.parse(bytes: frame)) { error in
             guard let mcpError = error as? McpError else {
                 return XCTFail("expected McpError, got \(error)")
             }

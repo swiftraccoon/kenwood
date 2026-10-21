@@ -163,7 +163,7 @@ public actor McpSession {
         do {
             log.info("MCP write page 0x\(String(page, radix: 16, uppercase: true))")
 
-            let cmd = try buildWritePageCmd(page: page, data: data)
+            let cmd = try McpPage(page: page, data: data).writeCommand()
             writeWireStarted = true
             try await writeWithDeadline(
                 Array(cmd),
@@ -280,16 +280,18 @@ public actor McpSession {
             // the radio with only half of the requested setting pair changed.
             let currentInterface = try await readPageOwned(interfacePage)
             let currentMode = try await readPageOwned(modePage)
-            let patchedInterface = try patchPageByte(
-                pageData: currentInterface,
+            let patchedInterface = try McpPage(
+                page: interfacePage, data: currentInterface
+            ).withByte(
                 offset: interfaceByte,
                 value: settings.interfaceValue
-            )
-            let patchedMode = try patchPageByte(
-                pageData: currentMode,
+            ).data()
+            let patchedMode = try McpPage(
+                page: modePage, data: currentMode
+            ).withByte(
                 offset: modeByte,
                 value: settings.modeValue
-            )
+            ).data()
 
             // Route the interface first, then enable the mode. Each write is
             // followed by a complete page read-back before the next begins.
@@ -441,7 +443,7 @@ public actor McpSession {
         let frame = try await readExact(
             count: 261, timeoutSeconds: pageReadTimeoutSeconds
         )
-        let parsed = try parseWFrame(bytes: frame)
+        let parsed = try McpPage.parse(bytes: frame)
 
         // A complete W frame always requires the host ACK before the
         // radio emits its trailing ACK. Finish that exchange even when
@@ -459,7 +461,7 @@ public actor McpSession {
                 let got = ack.first ?? 0
                 mcpDesynchronized = true
                 throw McpOrchestratorError.badPageReadAck(
-                    page: parsed.page, actual: got
+                    page: parsed.page(), actual: got
                 )
             }
         } catch {
@@ -469,18 +471,18 @@ public actor McpSession {
                 throw error
             }
             throw McpOrchestratorError.pageReadAckNotProved(
-                page: parsed.page, detail: error.displayMessage
+                page: parsed.page(), detail: error.displayMessage
             )
         }
 
-        guard parsed.page == page else {
+        guard parsed.page() == page else {
             throw McpOrchestratorError.pageEchoMismatch(
-                requested: page, actual: parsed.page
+                requested: page, actual: parsed.page()
             )
         }
 
         log.info("MCP read page 0x\(String(page, radix: 16, uppercase: true)) complete")
-        return parsed.data
+        return parsed.data()
     }
 
     private func sendExitOnce() async throws {

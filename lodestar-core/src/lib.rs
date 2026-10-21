@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Swift Raccoon
 // SPDX-License-Identifier: GPL-2.0-or-later OR GPL-3.0-or-later
 
+#![doc = include_str!("../README.md")]
+
 //! Lodestar core: Rust library powering the Lodestar native macOS and
 //! iPadOS D-STAR gateway app for the Kenwood TH-D75.
 //!
@@ -20,7 +22,7 @@
 //!   from bundled `ircDDBGateway` host files, plus Pi-Star hosts-text
 //!   parsing and a provenance-aware merge over bundled and `DPlus`
 //!   auth-server sources.
-//! - [`session`]: async `connect_reflector` + [`session::ReflectorSession`]
+//! - [`session`]: async [`ReflectorSession::connect`]
 //!   driving the full radio-to-reflector voice loop, plus the
 //!   [`session::ReflectorObserver`] callback trait Swift implements to
 //!   receive voice events, slow-data text updates, and parsed GPS
@@ -28,6 +30,31 @@
 //! - Logging bridge: [`init_tracing`] installs a `tracing` subscriber that
 //!   forwards each event to a Swift-implemented [`LogSink`] (tagged with
 //!   [`LogLevel`]) for the in-app Log Viewer and Apple's Unified Log.
+
+pub use audio::{RxAudioError, RxAudioPipeline, RxStreamEnd, RxStreamStats};
+pub use cat::{CatCommand, CatResponse, encode_cat, parse_cat_line};
+pub use mcp::{
+    GATEWAY_INTERFACE_OFFSET, GATEWAY_MODE_ACCESS_POINT, GATEWAY_MODE_OFF, GATEWAY_MODE_OFFSET,
+    GATEWAY_MODE_REFLECTOR_TERMINAL, MCP_D75_SCHEMA_FIRMWARE_IDENTITIES, MCP_D75_SCHEMA_MODEL,
+    McpD75SchemaTarget, McpError, McpPage, PcOutputInterface, ReflectorTerminalSettings,
+    build_enter_cmd, build_exit_cmd, build_read_page_cmd, byte_of, mcp_d75_schema_target, page_of,
+    reflector_terminal_settings,
+};
+pub use mmdvm::{
+    MMDVM_CMD_GET_VERSION, MMDVM_START_BYTE, MmdvmDecodeResult, MmdvmFrame, MmdvmFrameError,
+    MmdvmVersionResponse, build_mmdvm_frame, decode_mmdvm_bytes, mmdvm_get_version_probe,
+    parse_mmdvm_version_payload,
+};
+pub use reflector::{
+    DirectoryEntry, DirectorySource, Reflector, ReflectorProtocol, default_reflectors,
+    merge_directories, parse_hosts_text,
+};
+pub use session::{
+    DisconnectCause, ReflectorConnectionCandidate, ReflectorConnectionConfig, ReflectorError,
+    ReflectorSession, VoiceEndCause, fetch_dplus_directory,
+};
+pub use tracing_layer::init_tracing;
+pub use wire::{VoiceSequence, VoiceStreamId, WireValueError};
 
 #[forbid(unsafe_code)]
 pub mod audio;
@@ -41,29 +68,8 @@ pub mod mmdvm;
 pub mod reflector;
 #[forbid(unsafe_code)]
 pub mod session;
-
-pub use audio::{RxAudioPipeline, RxStreamEnd, RxStreamStats};
-pub use cat::{CatCommand, CatResponse, encode_cat, parse_cat_line};
-pub use mcp::{
-    GATEWAY_INTERFACE_OFFSET, GATEWAY_MODE_ACCESS_POINT, GATEWAY_MODE_OFF, GATEWAY_MODE_OFFSET,
-    GATEWAY_MODE_REFLECTOR_TERMINAL, MCP_D75_SCHEMA_FIRMWARE_IDENTITIES, MCP_D75_SCHEMA_MODEL,
-    McpD75SchemaTarget, McpError, McpPage, PcOutputInterface, ReflectorTerminalSettings,
-    build_enter_cmd, build_exit_cmd, build_read_page_cmd, build_write_page_cmd, byte_of,
-    mcp_d75_schema_target, page_of, parse_w_frame, patch_page_byte, reflector_terminal_settings,
-};
-pub use mmdvm::{
-    MMDVM_CMD_GET_VERSION, MMDVM_START_BYTE, MmdvmDecodeResult, MmdvmFrame, MmdvmFrameError,
-    MmdvmVersionResponse, build_mmdvm_frame, decode_mmdvm_bytes, mmdvm_get_version_probe,
-    parse_mmdvm_version_payload,
-};
-pub use reflector::{
-    DirectoryEntry, DirectorySource, Reflector, ReflectorProtocol, default_reflectors,
-    merge_directories, parse_hosts_text,
-};
-pub use session::{
-    DisconnectCause, ReflectorError, ReflectorSession, VoiceEndCause, connect_reflector,
-    fetch_dplus_directory,
-};
+#[forbid(unsafe_code)]
+mod wire;
 
 uniffi::include_scaffolding!("lodestar");
 
@@ -74,7 +80,7 @@ pub fn version() -> String {
 }
 
 /// Level label passed to a [`LogSink`]; mirrors `tracing::Level`.
-#[derive(Debug, Clone, Copy, uniffi::Enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum LogLevel {
     /// `tracing::Level::TRACE`: finest-grained diagnostic.
     Trace,
@@ -101,57 +107,52 @@ pub trait LogSink: Send + Sync + std::fmt::Debug {
     fn log(&self, level: LogLevel, target: String, message: String);
 }
 
-/// Install the `tracing` subscriber that forwards every event to the
-/// given [`LogSink`]. Idempotent across calls; subsequent sinks are
-/// ignored because `tracing`'s global dispatcher can only be set once.
-#[uniffi::export]
-pub fn init_tracing(sink: std::sync::Arc<dyn LogSink>) {
-    use tracing_subscriber::EnvFilter;
-    use tracing_subscriber::layer::SubscriberExt as _;
-    use tracing_subscriber::util::SubscriberInitExt as _;
-
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new("info,lodestar_core=debug,dstar_gateway_core=debug,dstar_gateway=debug")
-    });
-    let layer = tracing_layer::SinkLayer::new(sink);
-    drop(
-        tracing_subscriber::registry()
-            .with(filter)
-            .with(layer)
-            .try_init(),
-    );
-}
-
-/// Internal `tracing_subscriber::Layer` impl used by [`init_tracing`].
-///
-/// Exposed as `pub` only because `tracing_subscriber`'s `.with(...)`
-/// builder chain requires the layer type to be nameable; callers
-/// don't construct this directly.
-pub mod tracing_layer {
+/// Tracing event projection used by [`init_tracing`].
+mod tracing_layer {
     use super::{LogLevel, LogSink};
     use std::fmt::Write as _;
     use std::sync::Arc;
     use tracing::Event;
     use tracing::field::{Field, Visit};
-    use tracing::span::Span;
     use tracing_subscriber::Layer;
     use tracing_subscriber::layer::Context;
     use tracing_subscriber::registry::LookupSpan;
 
-    /// Tracing `Layer` that forwards each event to the foreign
-    /// [`LogSink`]. `pub` because `tracing_subscriber`'s
-    /// `.with(...)` chain requires the type to be nameable outside
-    /// its module.
-    pub struct SinkLayer {
+    /// Tracing layer that forwards admitted events to the foreign sink.
+    struct SinkLayer {
         sink: Arc<dyn LogSink>,
     }
 
     impl SinkLayer {
         /// Wrap a foreign sink.
         #[must_use]
-        pub fn new(sink: Arc<dyn LogSink>) -> Self {
+        fn new(sink: Arc<dyn LogSink>) -> Self {
             Self { sink }
         }
+    }
+
+    /// Attempt to install the process-wide tracing subscriber using `RUST_LOG`.
+    ///
+    /// Missing or invalid filters use
+    /// `info,lodestar_core=debug,dstar_gateway_core=debug,dstar_gateway=debug`.
+    /// Only admitted events reach `sink`. An existing subscriber is retained;
+    /// installation failure is ignored. The sink runs synchronously on each
+    /// emitting thread and must return promptly without reentering tracing.
+    #[uniffi::export]
+    pub fn init_tracing(sink: Arc<dyn LogSink>) {
+        use tracing_subscriber::EnvFilter;
+        use tracing_subscriber::layer::SubscriberExt as _;
+        use tracing_subscriber::util::SubscriberInitExt as _;
+
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            EnvFilter::new("info,lodestar_core=debug,dstar_gateway_core=debug,dstar_gateway=debug")
+        });
+        drop(
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(SinkLayer::new(sink))
+                .try_init(),
+        );
     }
 
     impl std::fmt::Debug for SinkLayer {
@@ -176,17 +177,6 @@ pub mod tracing_layer {
             let mut collector = MessageCollector(String::new());
             event.record(&mut collector);
             self.sink.log(level, meta.target().to_owned(), collector.0);
-        }
-
-        fn on_new_span(
-            &self,
-            _attrs: &tracing::span::Attributes<'_>,
-            _id: &tracing::span::Id,
-            _ctx: Context<'_, S>,
-        ) {
-            // Intentionally ignore span lifecycle: only flat events
-            // make it to the sink, which is what our UI needs.
-            drop(Span::none());
         }
     }
 

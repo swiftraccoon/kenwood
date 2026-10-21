@@ -14,7 +14,7 @@ final class AudioPipelineFFITests: XCTestCase {
         ])
         var pcm: [Int16] = []
         for seq in UInt8(0)..<5 {
-            let ready = p.pushVoice(seq: seq, voiceBytes: frame)
+            let ready = try p.pushVoice(seq: seq, voiceBytes: frame)
             if seq < 3 {
                 XCTAssertTrue(
                     ready.isEmpty,
@@ -24,10 +24,23 @@ final class AudioPipelineFFITests: XCTestCase {
             XCTAssertEqual(ready.count % 160, 0)
             pcm.append(contentsOf: ready)
         }
-        let end = p.endStream()
+        let end = try p.endStream()
         pcm.append(contentsOf: end.tailPcm)
         XCTAssertEqual(pcm.count, 5 * 160)
         XCTAssertEqual(end.stats.received, 5)
         XCTAssertEqual(end.stats.lost, 0)
+    }
+
+    func testInvalidVoiceInputsAreErrorsAndLeaveTheStreamEmpty() throws {
+        let pipeline = RxAudioPipeline()
+        pipeline.startStream()
+        XCTAssertThrowsError(try pipeline.pushVoice(seq: 0, voiceBytes: Data(repeating: 0, count: 5))) { error in
+            XCTAssertEqual(error as? RxAudioError, .WrongVoiceLength(actual: 5))
+        }
+        XCTAssertThrowsError(try pipeline.pushVoice(seq: 21, voiceBytes: Data(repeating: 0, count: 12)))
+        let end = try pipeline.endStream()
+        XCTAssertEqual(end.stats.received, 0)
+        XCTAssertEqual(end.stats.lost, 0)
+        XCTAssertTrue(end.tailPcm.isEmpty)
     }
 }

@@ -1,20 +1,20 @@
 [package]
 name = "lodestar-core"
 version = "0.1.0"
-edition = "2024"
-rust-version = "1.94"
-description = "Rust core for Lodestar, the native macOS + iPadOS D-STAR gateway app for the Kenwood TH-D75."
-license = "GPL-2.0-or-later OR GPL-3.0-or-later"
 authors = ["swiftraccoon"]
-repository = "https://github.com/swiftraccoon/kenwood"
-readme = "README.md"
-keywords = ["dstar", "ham-radio", "ios", "kenwood", "th-d75"]
 categories = ["multimedia", "api-bindings"]
+edition = "2024"
+keywords = ["dstar", "ham-radio", "ios", "kenwood", "th-d75"]
+license = "GPL-2.0-or-later OR GPL-3.0-or-later"
 publish = false
+readme = "README.md"
+repository = "https://github.com/swiftraccoon/kenwood"
+rust-version = "1.94"
+description = "Rust control, reflector and audio core for the Lodestar TH-D75 app"
 
 [lib]
-name = "lodestar_core"
 crate-type = ["lib", "staticlib"]
+name = "lodestar_core"
 
 [[bin]]
 name = "uniffi-bindgen"
@@ -34,14 +34,7 @@ mmdvm-core = { path = "../mmdvm-core" }
 # always-enhanced on-device reflector audio monitoring.
 mbelib-rs = { path = "../mbelib-rs", features = ["wave-enhance"] }
 # Runtime: reused across FFI calls that drive reflector I/O.
-tokio = { version = "1", features = [
-  "net",
-  "time",
-  "sync",
-  "rt",
-  "macros",
-  "io-util",
-] }
+tokio = { version = "1", features = ["net", "time", "sync", "rt", "macros", "io-util"] }
 # Error wrapping for the FFI-visible ReflectorError enum.
 thiserror = "2"
 # Tracing for diagnostics inside the async session tasks.
@@ -53,6 +46,7 @@ tracing-subscriber = { version = "0.3", features = ["registry", "env-filter"] }
 uniffi = { version = "0.31", features = ["build"] }
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 uniffi = { version = "0.31", features = ["bindgen-tests"] }
 
 # KNOWN DIVERGENCE FROM WORKSPACE: inherit workspace strictness but opt
@@ -62,13 +56,13 @@ uniffi = { version = "0.31", features = ["bindgen-tests"] }
 # The `kenwood-transport` Bluetooth helper and `kenwood-thd75` Vision OCR
 # bridge instead retain package-level denial with narrow audited exceptions.
 [lints.rust]
-missing_docs = "deny"
-missing_debug_implementations = "deny"
-unreachable_pub = "deny"
-unused_results = "deny"
 elided_lifetimes_in_paths = "deny"
+missing_debug_implementations = "deny"
+missing_docs = "deny"
 trivial_casts = "deny"
 trivial_numeric_casts = "deny"
+unreachable_pub = "deny"
+unused_results = "deny"
 # `unused_qualifications = "deny"` is intentionally omitted: UniFFI's
 # generated scaffolding emits fully qualified paths like
 # `std::vec::Vec<u8>` that trip this lint, and the scaffolding is
@@ -76,38 +70,38 @@ trivial_numeric_casts = "deny"
 # scoped out of the generated code. NOTE: no clippy lint backstops this
 # for hand-written code; redundant qualification here is caught only
 # in review.
+let_underscore_drop = "deny"
 non_ascii_idents = "deny"
 single_use_lifetimes = "deny"
-let_underscore_drop = "deny"
 unused_crate_dependencies = "deny"
 unused_import_braces = "deny"
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }
-pedantic = { level = "deny", priority = -1 }
-nursery = { level = "deny", priority = -1 }
 cargo = { level = "deny", priority = -1 }
-restriction = { level = "allow", priority = -1 }
-undocumented_unsafe_blocks = "deny"
-missing_assert_message = "deny"
-panic = "deny"
-unwrap_used = "deny"
 expect_used = "deny"
 indexing_slicing = "deny"
+missing_assert_message = "deny"
+nursery = { level = "deny", priority = -1 }
+panic = "deny"
+pedantic = { level = "deny", priority = -1 }
+restriction = { level = "allow", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+unwrap_used = "deny"
 # Ban `#[allow]`: every suppression must be `#[expect(..., reason = "...")]`.
 # Mirrors the root `[workspace.lints.clippy]` ban; restated here because this crate's
 # `[lints]` block replaces the workspace one entirely (cargo does not merge).
 allow_attributes = "deny"
 allow_attributes_without_reason = "deny"
 # Forward-protection lints; these mirror the workspace block exactly.
-todo = "deny"
-unimplemented = "deny"
 dbg_macro = "deny"
-mem_forget = "deny"
 format_push_string = "deny"
 infinite_loop = "deny"
+mem_forget = "deny"
 module_name_repetitions = "allow"
 multiple_crate_versions = "allow"
+todo = "deny"
+unimplemented = "deny"
 # UniFFI's generated scaffolding declares top-level FFI functions
 # (`extern "C" fn ...`) that clippy flags as candidates for `const`.
 # They can't be const; they're the `#[unsafe(no_mangle)]` FFI surface.
@@ -116,9 +110,9 @@ multiple_crate_versions = "allow"
 missing_const_for_fn = "allow"
 
 [lints.rustdoc]
-broken_intra_doc_links = "deny"
-private_intra_doc_links = "deny"
-missing_crate_level_docs = "deny"
-invalid_codeblock_attributes = "deny"
 bare_urls = "deny"
+broken_intra_doc_links = "deny"
+invalid_codeblock_attributes = "deny"
+missing_crate_level_docs = "deny"
+private_intra_doc_links = "deny"
 unescaped_backticks = "deny"

@@ -4,9 +4,8 @@
 //! Minimal CAT command codec exposed to Swift.
 //!
 //! Covers the `ID` identify and `FV` firmware-version commands used to
-//! qualify a radio before firmware-specific MCP access. Broader CAT
-//! coverage lives in `kenwood-thd75`'s protocol module and can be
-//! surfaced here on demand.
+//! qualify a radio before firmware-specific MCP access. The shared
+//! [codec workflow](crate#pure-codecs-and-audio) covers these operations.
 
 /// CAT commands that Lodestar can send over the transport.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,6 +14,23 @@ pub enum CatCommand {
     Identify,
     /// Firmware-version query: `FV\r`.
     FirmwareVersion,
+}
+
+impl CatCommand {
+    /// Encode this query with its final carriage return.
+    #[must_use]
+    pub fn encode(self) -> Vec<u8> {
+        match self {
+            Self::Identify => b"ID\r".to_vec(),
+            Self::FirmwareVersion => b"FV\r".to_vec(),
+        }
+    }
+}
+
+impl From<CatCommand> for Vec<u8> {
+    fn from(value: CatCommand) -> Self {
+        value.encode()
+    }
 }
 
 /// Parsed CAT response received from the radio.
@@ -44,42 +60,52 @@ pub enum CatResponse {
 /// Encode a [`CatCommand`] to the wire bytes the radio expects.
 #[must_use]
 pub fn encode_cat(command: CatCommand) -> Vec<u8> {
-    match command {
-        CatCommand::Identify => b"ID\r".to_vec(),
-        CatCommand::FirmwareVersion => b"FV\r".to_vec(),
+    command.encode()
+}
+
+impl CatResponse {
+    /// Parse a single CAT line, with or without its carriage return.
+    ///
+    /// Invalid UTF-8 is replaced lossily; leading/trailing Unicode whitespace
+    /// is trimmed. Unknown shapes remain [`Self::Raw`] diagnostic observations.
+    #[must_use]
+    pub fn parse(line: &[u8]) -> Self {
+        let text = String::from_utf8_lossy(line).trim().to_owned();
+
+        if text == "?" {
+            return Self::Unknown;
+        }
+        if text == "N" {
+            return Self::NotAvailableInMode;
+        }
+        if let Some(rest) = text.strip_prefix("ID ") {
+            return Self::Identify {
+                model: rest.trim().to_owned(),
+            };
+        }
+        if let Some(rest) = text.strip_prefix("FV ") {
+            return Self::FirmwareVersion {
+                version: rest.trim().to_owned(),
+            };
+        }
+        Self::Raw { line: text }
     }
 }
 
-/// Parse a complete `\r`-terminated CAT response line.
-///
-/// `line` must be the bytes of a single response line WITHOUT the
-/// trailing `\r`. Leading/trailing ASCII whitespace is trimmed;
-/// non-ASCII bytes are replaced via [`String::from_utf8_lossy`].
+impl From<&[u8]> for CatResponse {
+    fn from(value: &[u8]) -> Self {
+        Self::parse(value)
+    }
+}
+
+/// Foreign UDL entry point for [`CatResponse::parse`].
 #[must_use]
 #[expect(
     clippy::needless_pass_by_value,
-    reason = "UniFFI FFI boundary: `sequence<u8>` in UDL maps to owned `Vec<u8>`; a `&[u8]` signature wouldn't cross the FFI."
+    reason = "UDL byte sequences transfer owned vectors across the FFI"
 )]
 pub fn parse_cat_line(line: Vec<u8>) -> CatResponse {
-    let text = String::from_utf8_lossy(&line).trim().to_owned();
-
-    if text == "?" {
-        return CatResponse::Unknown;
-    }
-    if text == "N" {
-        return CatResponse::NotAvailableInMode;
-    }
-    if let Some(rest) = text.strip_prefix("ID ") {
-        return CatResponse::Identify {
-            model: rest.trim().to_owned(),
-        };
-    }
-    if let Some(rest) = text.strip_prefix("FV ") {
-        return CatResponse::FirmwareVersion {
-            version: rest.trim().to_owned(),
-        };
-    }
-    CatResponse::Raw { line: text }
+    CatResponse::parse(&line)
 }
 
 #[cfg(test)]

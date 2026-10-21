@@ -6,9 +6,11 @@
 //! The default reflector list is parsed at startup from the
 //! ircDDBGateway Pi-Star hosts files bundled as `data/DPlus_Hosts.txt`,
 //! `data/DExtra_Hosts.txt`, and `data/DCS_Hosts.txt`. These are the
-//! same files `thd75-repl` consumes and match the community-maintained
-//! hosts list on <https://hosts.pistar.uk/hosts/>.
+//! snapshots use the `ircDDBGateway`/Pi-Star hosts format.
+//! [`parse_hosts_text`] accepts updated snapshots supplied by the caller.
 
+use std::net::IpAddr;
+use std::num::NonZeroU16;
 use std::sync::OnceLock;
 
 use dstar_gateway_core::codec::{dcs, dextra, dplus};
@@ -26,13 +28,18 @@ pub enum ReflectorProtocol {
     Dcs,
 }
 
-impl From<CoreProtocolKind> for ReflectorProtocol {
-    fn from(value: CoreProtocolKind) -> Self {
-        match value {
-            CoreProtocolKind::DExtra => Self::DExtra,
-            CoreProtocolKind::Dcs => Self::Dcs,
-            // DPlus, plus any future core protocol kinds, map to DPlus.
-            _ => Self::DPlus,
+impl ReflectorProtocol {
+    /// The protocol's nonzero default UDP port.
+    #[must_use]
+    pub const fn default_port(self) -> NonZeroU16 {
+        let raw = match self {
+            Self::DPlus => dplus::consts::DEFAULT_PORT,
+            Self::DExtra => dextra::consts::DEFAULT_PORT,
+            Self::Dcs => dcs::consts::DEFAULT_PORT,
+        };
+        match NonZeroU16::new(raw) {
+            Some(port) => port,
+            None => unreachable!(),
         }
     }
 }
@@ -47,12 +54,15 @@ impl From<ReflectorProtocol> for CoreProtocolKind {
     }
 }
 
-/// A single reflector the user can link to.
+/// Editable foreign directory/endpoint candidate.
+///
+/// [`crate::ReflectorConnectionConfig::new`] checks the complete candidate
+/// before any connection I/O. Directory metadata alone never opens a socket.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Reflector {
     /// Uppercase reflector callsign prefix, e.g. `REF030`, `XRF030`, `DCS001`.
     pub name: String,
-    /// DNS hostname or IPv4 literal for the reflector.
+    /// Candidate DNS hostname or unscoped IPv4/IPv6 literal, without a port.
     pub host: String,
     /// UDP port the reflector listens on.
     pub port: u16,
@@ -62,9 +72,7 @@ pub struct Reflector {
     pub description: String,
 }
 
-/// Bundled hosts files from `ircDDBGateway/Data/`. Small enough
-/// (1309 lines total) to embed in the binary, which saves a network fetch
-/// on first launch and means the list always works offline.
+/// Bundled `ircDDBGateway/Data/` host files, available without network I/O.
 const DPLUS_HOSTS: &str = include_str!("../data/DPlus_Hosts.txt");
 const DEXTRA_HOSTS: &str = include_str!("../data/DExtra_Hosts.txt");
 const DCS_HOSTS: &str = include_str!("../data/DCS_Hosts.txt");
@@ -93,16 +101,20 @@ fn prefer_hostname_ordering(text: &str) -> String {
 /// pre-ordered so hostname rows win over IP literals.
 fn hostfile_reflectors(
     text: &str,
-    default_port: u16,
+    default_port: NonZeroU16,
     protocol: ReflectorProtocol,
 ) -> Vec<Reflector> {
     let mut file = HostFile::new();
-    file.parse(&prefer_hostname_ordering(text), default_port);
+    for line in prefer_hostname_ordering(text).lines() {
+        if let Err(error) = file.parse(line, default_port) {
+            tracing::debug!(%error, "skipping invalid hosts-file row");
+        }
+    }
     file.iter()
         .map(|e| Reflector {
-            name: e.name.clone(),
-            host: e.address.clone(),
-            port: e.port,
+            name: e.name().to_string(),
+            host: e.address().to_string(),
+            port: e.port().get(),
             protocol,
             description: String::new(),
         })
@@ -117,17 +129,17 @@ fn parsed_hosts() -> &'static Vec<Reflector> {
         let mut out: Vec<Reflector> = Vec::new();
         out.extend(hostfile_reflectors(
             DPLUS_HOSTS,
-            dplus::consts::DEFAULT_PORT,
+            ReflectorProtocol::DPlus.default_port(),
             ReflectorProtocol::DPlus,
         ));
         out.extend(hostfile_reflectors(
             DEXTRA_HOSTS,
-            dextra::consts::DEFAULT_PORT,
+            ReflectorProtocol::DExtra.default_port(),
             ReflectorProtocol::DExtra,
         ));
         out.extend(hostfile_reflectors(
             DCS_HOSTS,
-            dcs::consts::DEFAULT_PORT,
+            ReflectorProtocol::Dcs.default_port(),
             ReflectorProtocol::Dcs,
         ));
         out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -135,12 +147,13 @@ fn parsed_hosts() -> &'static Vec<Reflector> {
     })
 }
 
-/// Cheap heuristic: if every character is a digit or dot, treat as IP.
+/// Recognize complete IPv4/IPv6 literals, including bracketed IPv6.
 fn is_ip_literal(host: &str) -> bool {
-    !host.is_empty()
-        && host
-            .chars()
-            .all(|c| c.is_ascii_digit() || c == '.' || c == ':')
+    host.strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host)
+        .parse::<IpAddr>()
+        .is_ok()
 }
 
 /// Returns the full curated list of well-known public reflectors (REF,
@@ -163,7 +176,7 @@ pub enum DirectorySource {
 }
 
 /// A reflector tagged with the source it came from.
-#[derive(Debug, Clone, uniffi::Record)]
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct DirectoryEntry {
     /// The reflector row.
     pub reflector: Reflector,
@@ -189,22 +202,7 @@ const fn source_priority(source: DirectorySource) -> u8 {
 )]
 #[must_use]
 pub fn parse_hosts_text(protocol: ReflectorProtocol, text: String) -> Vec<Reflector> {
-    let default_port = match protocol {
-        ReflectorProtocol::DPlus => dplus::consts::DEFAULT_PORT,
-        ReflectorProtocol::DExtra => dextra::consts::DEFAULT_PORT,
-        ReflectorProtocol::Dcs => dcs::consts::DEFAULT_PORT,
-    };
-    let mut file = HostFile::new();
-    file.parse(&text, default_port);
-    file.iter()
-        .map(|e| Reflector {
-            name: e.name.clone(),
-            host: e.address.clone(),
-            port: e.port,
-            protocol,
-            description: String::new(),
-        })
-        .collect()
+    hostfile_reflectors(&text, protocol.default_port(), protocol)
 }
 
 /// Stable ordering for same-name entries across protocols, so the
@@ -430,15 +428,13 @@ mod tests {
     }
 
     #[test]
-    fn protocol_kind_round_trips() {
-        for p in [
-            ReflectorProtocol::DPlus,
-            ReflectorProtocol::DExtra,
-            ReflectorProtocol::Dcs,
+    fn protocol_kind_conversions_preserve_every_selected_protocol() {
+        for (selected, expected) in [
+            (ReflectorProtocol::DPlus, CoreProtocolKind::DPlus),
+            (ReflectorProtocol::DExtra, CoreProtocolKind::DExtra),
+            (ReflectorProtocol::Dcs, CoreProtocolKind::Dcs),
         ] {
-            let core: CoreProtocolKind = p.into();
-            let back: ReflectorProtocol = core.into();
-            assert_eq!(p, back, "round-trip lost info for {p:?}");
+            assert_eq!(CoreProtocolKind::from(selected), expected);
         }
     }
 
@@ -446,6 +442,9 @@ mod tests {
     fn ip_literal_detection() {
         assert!(is_ip_literal("192.168.1.1"));
         assert!(is_ip_literal("44.103.34.3"));
+        assert!(is_ip_literal("2001:db8::1"));
+        assert!(is_ip_literal("[2001:db8::1]"));
+        assert!(!is_ip_literal("999.1.1.1"));
         assert!(!is_ip_literal("ref030.dstargateway.org"));
         assert!(!is_ip_literal("xrf030.oe3xht.at"));
         assert!(!is_ip_literal(""));

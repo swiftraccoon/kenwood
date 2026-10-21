@@ -12,10 +12,12 @@
 //! can fade the tail.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 
-use mbelib_rs::AmbeDecoder;
 use mbelib_rs::enhance_live::{LiveWaveEnhancer, LiveWaveStream};
+use mbelib_rs::{AmbeDecoder, PcmFrame};
+
+use crate::VoiceSequence;
 
 /// Samples per 20 ms AMBE frame at 8 kHz.
 pub(crate) const FRAME_SAMPLES: usize = 160;
@@ -54,7 +56,7 @@ const fn classify_gap(expected: u8, seq: u8) -> GapClass {
 }
 
 /// Per-stream RX statistics.
-#[derive(Debug, Clone, Copy, Default, uniffi::Record)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, uniffi::Record)]
 pub struct RxStreamStats {
     /// Frames decoded from the wire.
     pub received: u32,
@@ -65,13 +67,27 @@ pub struct RxStreamStats {
 }
 
 /// Result of finishing a stream: the faded tail plus statistics.
-#[derive(Debug, Clone, uniffi::Record)]
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct RxStreamEnd {
     /// Final PCM: any output still inside the enhancer followed by
     /// the held-back frame with a 10 ms fade-out. Possibly empty.
     pub tail_pcm: Vec<i16>,
     /// Loss/late counters for the whole stream.
     pub stats: RxStreamStats,
+}
+
+/// Audio input rejected before decoder or enhancement state changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error, uniffi::Error)]
+pub enum RxAudioError {
+    /// A voice frame did not contain nine AMBE and three slow-data bytes.
+    #[error("voice frame must have 12 bytes, got {actual}")]
+    WrongVoiceLength {
+        /// Rejected byte count, saturated at `u32::MAX`.
+        actual: u32,
+    },
+    /// A prior panic interrupted the pipeline while holding its state lock.
+    #[error("audio state is unavailable; start a new stream before processing")]
+    StateUnavailable,
 }
 
 struct PipelineInner {
@@ -101,20 +117,17 @@ impl PipelineInner {
         }
     }
 
-    /// Feed one decoded or concealed frame through the always-on live
+    /// Feed one decoded or concealed frame through the configured live
     /// enhancer, then release every complete enhanced frame it makes
     /// ready. When the embedded model could not be loaded at startup,
-    /// preserve audio with the same raw fallback Sextant uses.
+    /// pass base-decoder PCM directly to the edge fades.
     fn enhance(&mut self, pcm: &[i16; FRAME_SAMPLES], out: &mut Vec<i16>) {
         let Some(stream) = self.enhancement.as_mut() else {
             self.release(pcm, out);
             return;
         };
-        let mut samples = [0.0_f32; FRAME_SAMPLES];
-        for (slot, &sample) in samples.iter_mut().zip(pcm.iter()) {
-            *slot = sample_to_f32(sample);
-        }
-        let ready = stream.push_samples_f32(&samples);
+        let samples = PcmFrame::from(*pcm);
+        let ready = stream.push_samples_f32(samples.as_pcm_samples());
         self.append_enhanced(&ready);
         self.drain_enhanced(out);
     }
@@ -205,11 +218,18 @@ impl RxAudioPipeline {
         })
     }
 
-    /// Reset for a new stream (fresh decoder and enhancer state,
-    /// zeroed counters).
+    /// Replace decoder, enhancer, holdback and counters with a fresh stream.
+    ///
+    /// This complete replacement also clears a poisoned state lock.
     pub fn start_stream(&self) {
         let fresh = self.fresh_inner();
-        *self.lock() = fresh;
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = fresh;
+        self.inner.clear_poison();
+        drop(guard);
     }
 
     /// Feed one 12-byte voice frame (9 AMBE + 3 slow-data). Returns
@@ -217,34 +237,46 @@ impl RxAudioPipeline {
     /// empty while the causal enhancer is filling its initial
     /// lookahead and for late duplicates; multiple frames when a gap
     /// was concealed or buffered output becomes ready.
+    ///
+    /// Invalid lengths leave all decoder/history/counters unchanged. Sequence
+    /// values use checked foreign lifting and never normalize malformed flags.
+    /// Counters saturate at `u32::MAX`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RxAudioError::WrongVoiceLength`] unless the payload has exactly
+    /// 12 bytes, or [`RxAudioError::StateUnavailable`] for poisoned state.
     #[expect(
         clippy::needless_pass_by_value,
         reason = "UniFFI FFI boundary requires owned Vec<u8> (Swift Data)"
     )]
-    #[must_use]
-    pub fn push_voice(&self, seq: u8, voice_bytes: Vec<u8>) -> Vec<i16> {
-        let Some(ambe_slice) = voice_bytes.get(..9) else {
-            return Vec::new();
-        };
-        let Ok(ambe) = <[u8; 9]>::try_from(ambe_slice) else {
-            return Vec::new();
+    pub fn push_voice(
+        &self,
+        seq: VoiceSequence,
+        voice_bytes: Vec<u8>,
+    ) -> Result<Vec<i16>, RxAudioError> {
+        let invalid_length = || RxAudioError::WrongVoiceLength {
+            actual: u32::try_from(voice_bytes.len()).unwrap_or(u32::MAX),
         };
         if voice_bytes.len() != 12 {
-            return Vec::new();
+            return Err(invalid_length());
         }
-        // Wire seq is 0..21 on a well-formed stream, but the value
-        // arrives off the network; normalize so a hostile or corrupt
-        // frame can't overflow the mod-21 ring arithmetic below.
-        let seq = seq % SUPERFRAME_LEN;
+        let Some(ambe_slice) = voice_bytes.get(..9) else {
+            return Err(invalid_length());
+        };
+        let Ok(ambe) = <[u8; 9]>::try_from(ambe_slice) else {
+            return Err(invalid_length());
+        };
+        let seq = seq.get();
         let mut out = Vec::new();
-        let mut inner = self.lock();
+        let mut inner = self.lock()?;
         match inner
             .expected_seq
             .map(|expected| classify_gap(expected, seq))
         {
             Some(GapClass::Late) => {
                 inner.stats.late = inner.stats.late.saturating_add(1);
-                return out;
+                return Ok(out);
             }
             Some(GapClass::Conceal(n)) => {
                 inner.stats.lost = inner.stats.lost.saturating_add(u32::from(n));
@@ -262,15 +294,20 @@ impl RxAudioPipeline {
         inner.enhance(&pcm, &mut out);
         inner.stats.received = inner.stats.received.saturating_add(1);
         inner.expected_seq = Some((seq + 1) % SUPERFRAME_LEN);
-        out
+        drop(inner);
+        Ok(out)
     }
 
     /// Finish the stream: returns the faded tail and the stats, then
     /// resets to idle.
-    #[must_use]
-    pub fn end_stream(&self) -> RxStreamEnd {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RxAudioError::StateUnavailable`] for poisoned state. A new
+    /// [`Self::start_stream`] replaces that state before later processing.
+    pub fn end_stream(&self) -> Result<RxStreamEnd, RxAudioError> {
         let fresh = self.fresh_inner();
-        let mut inner = self.lock();
+        let mut inner = self.lock()?;
         let mut tail = Vec::new();
         inner.finish_enhancement(&mut tail);
         if let Some(mut last) = inner.held.take() {
@@ -283,10 +320,10 @@ impl RxAudioPipeline {
         let stats = inner.stats;
         *inner = fresh;
         drop(inner);
-        RxStreamEnd {
+        Ok(RxStreamEnd {
             tail_pcm: tail,
             stats,
-        }
+        })
     }
 }
 
@@ -295,8 +332,10 @@ impl RxAudioPipeline {
         PipelineInner::fresh(self.enhancer.as_ref().map(LiveWaveEnhancer::stream))
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, PipelineInner> {
-        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, PipelineInner>, RxAudioError> {
+        self.inner
+            .lock()
+            .map_err(|_| RxAudioError::StateUnavailable)
     }
 }
 
@@ -311,11 +350,6 @@ fn take_frame(tail: &mut VecDeque<i16>) -> Option<[i16; FRAME_SAMPLES]> {
         *slot = tail.pop_front()?;
     }
     Some(frame)
-}
-
-/// Decoder-domain `i16` to the live enhancer's unit-scale input.
-fn sample_to_f32(sample: i16) -> f32 {
-    f32::from(sample) / 32_768.0
 }
 
 /// Live-enhancer unit-scale output back to decoder-domain `i16`.
@@ -364,7 +398,8 @@ mod tests {
     use mbelib_rs::AmbeDecoder;
     use mbelib_rs::enhance_live::LiveWaveEnhancer;
 
-    use super::{FRAME_SAMPLES, RxAudioPipeline, fade_in, fade_out};
+    use super::{FRAME_SAMPLES, RxAudioError, RxAudioPipeline, fade_in, fade_out};
+    use crate::VoiceSequence;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -381,14 +416,19 @@ mod tests {
         frame
     }
 
-    fn run_tone_stream(pipeline: &RxAudioPipeline, frame_count: u8) -> Vec<i16> {
+    fn run_tone_stream(
+        pipeline: &RxAudioPipeline,
+        frame_count: u8,
+    ) -> Result<Vec<i16>, Box<dyn std::error::Error>> {
         pipeline.start_stream();
         let mut output = Vec::new();
         for seq in 0..frame_count {
-            output.extend(pipeline.push_voice(seq, voice_frame(&TONE_FRAME)));
+            output.extend(
+                pipeline.push_voice(VoiceSequence::new(seq % 21)?, voice_frame(&TONE_FRAME))?,
+            );
         }
-        output.extend(pipeline.end_stream().tail_pcm);
-        output
+        output.extend(pipeline.end_stream()?.tail_pcm);
+        Ok(output)
     }
 
     fn expected_enhanced_tone(frame_count: usize) -> Result<Vec<i16>, Box<dyn std::error::Error>> {
@@ -426,7 +466,7 @@ mod tests {
         p.start_stream();
         let mut pcm = Vec::new();
         for seq in 0_u8..5 {
-            let ready = p.push_voice(seq, voice_frame(&TONE_FRAME));
+            let ready = p.push_voice(VoiceSequence::new(seq)?, voice_frame(&TONE_FRAME))?;
             if seq < 3 {
                 assert!(
                     ready.is_empty(),
@@ -440,7 +480,7 @@ mod tests {
             );
             pcm.extend(ready);
         }
-        let end = p.end_stream();
+        let end = p.end_stream()?;
         pcm.extend_from_slice(&end.tail_pcm);
         assert_eq!(
             pcm.len(),
@@ -454,25 +494,26 @@ mod tests {
     }
 
     #[test]
-    fn enhancer_and_decoder_reset_between_streams() {
+    fn enhancer_and_decoder_reset_between_streams() -> TestResult {
         let p = RxAudioPipeline::new();
-        let first = run_tone_stream(&p, 5);
-        let second = run_tone_stream(&p, 5);
+        let first = run_tone_stream(&p, 5)?;
+        let second = run_tone_stream(&p, 5)?;
         assert_eq!(
             first, second,
             "a new transmission must not inherit recurrent or decoder state"
         );
+        Ok(())
     }
 
     #[test]
-    fn small_gap_is_concealed() {
+    fn small_gap_is_concealed() -> TestResult {
         let p = RxAudioPipeline::new();
         p.start_stream();
-        drop(p.push_voice(0, silence_frame()));
+        drop(p.push_voice(VoiceSequence::ZERO, silence_frame())?);
         // seq jumps 0 → 3: two frames lost, concealed, plus the release
         // cascade: two concealed frames plus the arriving frame.
-        let mut out = p.push_voice(3, silence_frame());
-        let end = p.end_stream();
+        let mut out = p.push_voice(VoiceSequence::new(3)?, silence_frame())?;
+        let end = p.end_stream()?;
         out.extend_from_slice(&end.tail_pcm);
         assert_eq!(
             out.len(),
@@ -481,36 +522,39 @@ mod tests {
         );
         assert_eq!(end.stats.lost, 2);
         assert_eq!(end.stats.received, 2);
+        Ok(())
     }
 
     #[test]
-    fn late_frame_is_dropped() {
+    fn late_frame_is_dropped() -> TestResult {
         let p = RxAudioPipeline::new();
         p.start_stream();
-        drop(p.push_voice(0, silence_frame()));
-        drop(p.push_voice(1, silence_frame()));
+        drop(p.push_voice(VoiceSequence::ZERO, silence_frame())?);
+        drop(p.push_voice(VoiceSequence::new(1)?, silence_frame())?);
         assert!(
-            p.push_voice(0, silence_frame()).is_empty(),
+            p.push_voice(VoiceSequence::ZERO, silence_frame())?
+                .is_empty(),
             "late duplicate never plays"
         );
-        let end = p.end_stream();
+        let end = p.end_stream()?;
         assert_eq!(
             end.tail_pcm.len(),
             2 * FRAME_SAMPLES,
             "late input does not advance the enhancer"
         );
         assert_eq!(end.stats.late, 1);
+        Ok(())
     }
 
     #[test]
-    fn long_dropout_resyncs_without_concealment() {
+    fn long_dropout_resyncs_without_concealment() -> TestResult {
         let p = RxAudioPipeline::new();
         p.start_stream();
-        drop(p.push_voice(0, silence_frame()));
+        drop(p.push_voice(VoiceSequence::ZERO, silence_frame())?);
         // Gap of 14 (> MAX_CONCEAL, < 21-REORDER_WINDOW): resync
         // without feeding concealment into the enhancer.
-        let mut out = p.push_voice(15, silence_frame());
-        let end = p.end_stream();
+        let mut out = p.push_voice(VoiceSequence::new(15)?, silence_frame())?;
+        let end = p.end_stream()?;
         out.extend_from_slice(&end.tail_pcm);
         assert_eq!(
             out.len(),
@@ -518,28 +562,73 @@ mod tests {
             "dropout must contain only the two received frames"
         );
         assert_eq!(end.stats.lost, 14);
+        Ok(())
     }
 
     #[test]
-    fn out_of_range_wire_seq_is_normalized_not_panicking() {
+    fn rejected_voice_input_preserves_decoder_history_and_counters() -> TestResult {
         let p = RxAudioPipeline::new();
         p.start_stream();
-        drop(p.push_voice(0, silence_frame()));
-        // 255 % 21 == 3: behaves exactly like a seq-3 arrival (2 concealed).
-        let mut out = p.push_voice(255, silence_frame());
-        let end = p.end_stream();
-        out.extend_from_slice(&end.tail_pcm);
-        assert_eq!(out.len(), 4 * FRAME_SAMPLES);
-        assert_eq!(end.stats.lost, 2);
+        drop(p.push_voice(VoiceSequence::ZERO, voice_frame(&TONE_FRAME))?);
+        for raw in [21, 0x40, 255] {
+            assert!(
+                VoiceSequence::new(raw).is_err(),
+                "malformed sequence was normalized"
+            );
+        }
+        for length in [0, 5, 11, 13] {
+            let result = p.push_voice(VoiceSequence::new(1)?, vec![0; length]);
+            assert!(
+                matches!(result, Err(RxAudioError::WrongVoiceLength { .. })),
+                "invalid audio was silently buffered: {result:?}"
+            );
+        }
+        let mut actual = p.push_voice(VoiceSequence::new(1)?, voice_frame(&TONE_FRAME))?;
+        let end = p.end_stream()?;
+        actual.extend(end.tail_pcm);
+        assert_eq!(actual, run_tone_stream(&RxAudioPipeline::new(), 2)?);
         assert_eq!(end.stats.received, 2);
+        assert_eq!(end.stats.lost, 0);
+        Ok(())
     }
 
     #[test]
-    fn wrong_length_frame_is_ignored() {
+    fn wrong_length_frame_is_reported_without_advancing_state() -> TestResult {
         let p = RxAudioPipeline::new();
         p.start_stream();
-        assert!(p.push_voice(0, vec![0u8; 5]).is_empty());
-        let end = p.end_stream();
+        let result = p.push_voice(VoiceSequence::ZERO, vec![0u8; 5]);
+        assert!(
+            matches!(result, Err(RxAudioError::WrongVoiceLength { actual: 5 })),
+            "{result:?}"
+        );
+        let end = p.end_stream()?;
         assert_eq!(end.stats.received, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn poisoned_audio_state_requires_a_complete_stream_reset() -> TestResult {
+        let pipeline = RxAudioPipeline::new();
+        let interrupted = pipeline.clone();
+        let worker = std::thread::spawn(move || -> Result<(), String> {
+            let _guard = interrupted
+                .inner
+                .lock()
+                .map_err(|error| error.to_string())?;
+            std::panic::resume_unwind(Box::new(()));
+        });
+        assert!(
+            worker.join().is_err(),
+            "test worker did not poison the pipeline"
+        );
+        assert_eq!(
+            pipeline.push_voice(VoiceSequence::ZERO, silence_frame()),
+            Err(RxAudioError::StateUnavailable)
+        );
+        assert_eq!(pipeline.end_stream(), Err(RxAudioError::StateUnavailable));
+        pipeline.start_stream();
+        drop(pipeline.push_voice(VoiceSequence::ZERO, silence_frame())?);
+        assert_eq!(pipeline.end_stream()?.stats.received, 1);
+        Ok(())
     }
 }

@@ -356,7 +356,7 @@ final class McpSessionTests: XCTestCase {
     }
 
     private func pageFrame(_ page: UInt16, data: [UInt8]) throws -> [UInt8] {
-        Array(try buildWritePageCmd(page: page, data: Data(data)))
+        Array(try McpPage(page: page, data: Data(data)).writeCommand())
     }
 
     private func assertReflectorTerminalModeUpdate(
@@ -1002,7 +1002,7 @@ final class McpSessionTests: XCTestCase {
         var actual = expected
         actual[173] = 0x44
 
-        let write = Array(try buildWritePageCmd(page: page, data: Data(expected)))
+        let write = Array(try McpPage(page: page, data: Data(expected)).writeCommand())
         await mock.script(response: [0x06], for: write)
         await mock.script(
             response: try pageFrame(page, data: actual),

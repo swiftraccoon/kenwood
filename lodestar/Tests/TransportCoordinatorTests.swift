@@ -7,7 +7,7 @@ import XCTest
 @MainActor
 final class TransportCoordinatorTests: XCTestCase {
     private func pageFrame(_ page: UInt16, data: [UInt8]) throws -> [UInt8] {
-        Array(try buildWritePageCmd(page: page, data: Data(data)))
+        Array(try McpPage(page: page, data: Data(data)).writeCommand())
     }
 
     private func mmdvmVersionResponse() -> [UInt8] {

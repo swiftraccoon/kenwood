@@ -12,21 +12,28 @@
 //! from the foreground `ReflectorSession` handle to the task.
 //!
 //! `DPlus` also runs the [`AuthClient`] TCP handshake before the UDP
-//! connect; failure falls back to an empty host list so a stale but
-//! valid auth on the reflector can still land the UDP LINK.
+//! connect. A failed authentication is retained while the UDP handshake is
+//! attempted with an empty host list; a combined failure reports both details.
 
+use std::future::Future;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::num::NonZeroU16;
 use std::sync::Arc;
 
 use dstar_gateway::auth::AuthClient;
 use dstar_gateway::tokio_shell::AsyncSession;
 use dstar_gateway_core::codec::dplus::HostList;
+use dstar_gateway_core::dprs::{DprsReport, Latitude, Longitude};
 use dstar_gateway_core::header::{DstarHeader, ENCODED_LEN as HEADER_ENCODED_LEN};
+use dstar_gateway_core::hosts::HostAddress;
 use dstar_gateway_core::session::client::{
     Connected, Connecting, DExtra, DPlus, Dcs, DisconnectReason, Event, Session, VoiceEndReason,
 };
 use dstar_gateway_core::slowdata::{SlowDataTextCollector, descramble};
 use dstar_gateway_core::voice::VoiceFrame;
-use dstar_gateway_core::{Callsign, Module, StreamId, parse_dprs};
+use dstar_gateway_core::{
+    Callsign, DcsReflector, FrameSequence, Module, RelayRouting, RoutingCallsign, StreamId,
+};
 use thiserror::Error;
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, oneshot};
@@ -34,10 +41,90 @@ use tokio::task::JoinHandle;
 use tracing::debug;
 
 use crate::reflector::{Reflector, ReflectorProtocol};
+use crate::wire::{VoiceSequence, VoiceStreamId};
+
+#[cfg(test)]
+#[path = "session_tests.rs"]
+mod tests;
 
 /// Handshake timeout: how long the session waits for the reflector to
 /// ACK the LINK before giving up.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const SETUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(35);
+
+/// Editable foreign connection inputs; construction of the executable
+/// [`ReflectorConnectionConfig`] validates the complete candidate without I/O.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ReflectorConnectionCandidate {
+    /// Local station prefix, occupying at most seven routing bytes.
+    pub callsign: String,
+    /// Directory or manually entered endpoint candidate.
+    pub reflector: Reflector,
+    /// Local A-Z module letter.
+    pub local_module: String,
+    /// Remote A-Z module letter.
+    pub reflector_module: String,
+}
+
+/// Immutable checked identity, endpoint and protocol used by a connection.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Object)]
+pub struct ReflectorConnectionConfig {
+    station: RoutingCallsign,
+    reflector: RoutingCallsign,
+    address: HostAddress,
+    port: NonZeroU16,
+    local: Module,
+    remote: Module,
+    protocol: ReflectorProtocol,
+    dcs: Option<DcsReflector>,
+}
+
+#[uniffi::export]
+impl ReflectorConnectionConfig {
+    /// Validate all fields before DNS, authentication or socket creation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReflectorError::InvalidCallsign`],
+    /// [`ReflectorError::InvalidModule`] or [`ReflectorError::InvalidEndpoint`]
+    /// for malformed routing identities, module letters, address or zero port.
+    #[uniffi::constructor]
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "UniFFI constructors receive owned foreign records"
+    )]
+    pub fn new(candidate: ReflectorConnectionCandidate) -> Result<Arc<Self>, ReflectorError> {
+        let station = RoutingCallsign::new(&candidate.callsign)
+            .map_err(|error| ReflectorError::InvalidCallsign(error.to_string()))?;
+        let reflector = RoutingCallsign::new(&candidate.reflector.name)
+            .map_err(|error| ReflectorError::InvalidCallsign(error.to_string()))?;
+        let address = HostAddress::new(&candidate.reflector.host)
+            .map_err(|error| ReflectorError::InvalidEndpoint(error.to_string()))?;
+        let port = NonZeroU16::new(candidate.reflector.port).ok_or_else(|| {
+            ReflectorError::InvalidEndpoint("UDP port must be nonzero".to_owned())
+        })?;
+        let local = parse_module(&candidate.local_module)?;
+        let remote = parse_module(&candidate.reflector_module)?;
+        let dcs = if candidate.reflector.protocol == ReflectorProtocol::Dcs {
+            Some(
+                DcsReflector::try_from(reflector)
+                    .map_err(|error| ReflectorError::InvalidCallsign(error.to_string()))?,
+            )
+        } else {
+            None
+        };
+        Ok(Arc::new(Self {
+            station,
+            reflector,
+            address,
+            port,
+            local,
+            remote,
+            protocol: candidate.reflector.protocol,
+            dcs,
+        }))
+    }
+}
 
 /// Opaque [`UniFFI`](https://mozilla.github.io/uniffi-rs/) handle to a
 /// live (or previously-live) reflector session.
@@ -52,9 +139,9 @@ pub struct ReflectorSession {
     // Typed copies of the identity strings, validated at connect time
     // and reused on every outbound header rewrite. Built here so the
     // `send_header` hot path never has to re-parse.
-    station_callsign: Callsign,
+    station_callsign: RoutingCallsign,
     local_module_typed: Module,
-    reflector_callsign: Callsign,
+    reflector_callsign: RoutingCallsign,
     reflector_module_typed: Module,
 }
 
@@ -71,6 +158,16 @@ impl std::fmt::Debug for ReflectorSession {
 }
 
 impl ReflectorSession {
+    async fn sender(&self) -> Result<tokio::sync::mpsc::Sender<TxCommand>, ReflectorError> {
+        self.backend
+            .lock()
+            .await
+            .as_ref()
+            .filter(|backend| backend.shutdown.is_some() && !backend.join.is_finished())
+            .map(|backend| backend.tx.clone())
+            .ok_or(ReflectorError::AlreadyDisconnected)
+    }
+
     /// Rewrite a radio-emitted D-STAR header for reflector ingestion.
     ///
     /// - `rpt1[0..7]` = operator callsign (7 bytes, space-padded).
@@ -85,20 +182,22 @@ impl ReflectorSession {
         // `for_relay` zeroes the flags (correct for a TX-from-scratch
         // client); chain the radio's source flags back on for this relay.
         DstarHeader::for_relay(
-            self.station_callsign,
-            self.local_module_typed,
-            self.reflector_callsign,
-            self.reflector_module_typed,
+            RelayRouting {
+                operator: self.station_callsign,
+                local_module: self.local_module_typed,
+                reflector: self.reflector_callsign,
+                reflector_module: self.reflector_module_typed,
+            },
             radio.my_call,
             radio.my_suffix,
         )
-        .with_flags(radio.flag1, radio.flag2, radio.flag3)
+        .with_flags(radio.flags)
     }
 }
 
 /// Background task handle for a live reflector session.
 struct Backend {
-    shutdown: oneshot::Sender<()>,
+    shutdown: Option<oneshot::Sender<()>>,
     join: JoinHandle<Result<(), String>>,
     tx: tokio::sync::mpsc::Sender<TxCommand>,
 }
@@ -113,13 +212,13 @@ enum TxCommand {
     },
     Voice {
         stream_id: StreamId,
-        seq: u8,
+        seq: FrameSequence,
         frame: VoiceFrame,
         reply: oneshot::Sender<Result<(), String>>,
     },
     Eot {
         stream_id: StreamId,
-        seq: u8,
+        seq: FrameSequence,
         /// Reply carries the assembled 20-char TX text (if the radio
         /// sent a complete 4-block message during the stream) alongside
         /// the shell result so Swift can include it in the local
@@ -134,7 +233,7 @@ enum TxCommand {
 /// a local TX is relayed to the reflector. Reflectors typically do not
 /// echo the sender's packets back, so a recently-heard entry is
 /// synthesised for the relayed stream instead.
-#[derive(Debug, Clone, uniffi::Record)]
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct DecodedRadioHeader {
     /// Trimmed operator callsign (`MY`).
     pub mycall: String,
@@ -150,6 +249,9 @@ pub struct DecodedRadioHeader {
 
 /// Decode a 41-byte on-wire D-STAR header emitted by the TH-D75 in
 /// Reflector Terminal Mode. Returns `None` for any wrong-length input.
+///
+/// Every 41-byte value yields field observations; callsign formatting retains
+/// malformed bytes as diagnostic escapes. CRC checking is left to the caller.
 #[uniffi::export]
 #[expect(
     clippy::needless_pass_by_value,
@@ -164,11 +266,11 @@ pub fn decode_radio_header(bytes: Vec<u8>) -> Option<DecodedRadioHeader> {
     arr.copy_from_slice(&bytes);
     let h = DstarHeader::decode(&arr);
     Some(DecodedRadioHeader {
-        mycall: h.my_call.as_str().trim().to_owned(),
-        suffix: h.my_suffix.as_str().trim().to_owned(),
-        urcall: h.ur_call.as_str().trim().to_owned(),
-        rpt1: h.rpt1.as_str().trim().to_owned(),
-        rpt2: h.rpt2.as_str().trim().to_owned(),
+        mycall: h.my_call.to_string(),
+        suffix: h.my_suffix.to_string(),
+        urcall: h.ur_call.to_string(),
+        rpt1: h.rpt1.to_string(),
+        rpt2: h.rpt2.to_string(),
     })
 }
 
@@ -181,15 +283,43 @@ pub fn decode_radio_header(bytes: Vec<u8>) -> Option<DecodedRadioHeader> {
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
 pub struct GpsPosition {
     /// Reporting station callsign, trimmed.
-    pub callsign: String,
+    callsign: String,
     /// Latitude in decimal degrees (north positive).
-    pub latitude: f64,
+    latitude: f64,
     /// Longitude in decimal degrees (east positive).
-    pub longitude: f64,
+    longitude: f64,
     /// APRS symbol character (e.g. `"["` for a jogger).
-    pub symbol: String,
+    symbol: String,
     /// Free-form comment appended to the DPRS sentence, if any.
-    pub comment: Option<String>,
+    comment: Option<String>,
+}
+
+impl GpsPosition {
+    /// Reporting station text, empty for NMEA without an APRS source.
+    #[must_use]
+    pub fn callsign(&self) -> &str {
+        &self.callsign
+    }
+    /// Latitude in decimal degrees within `-90..=90`, north positive.
+    #[must_use]
+    pub const fn latitude(&self) -> f64 {
+        self.latitude
+    }
+    /// Longitude in decimal degrees within `-180..=180`, east positive.
+    #[must_use]
+    pub const fn longitude(&self) -> f64 {
+        self.longitude
+    }
+    /// APRS symbol code, empty for NMEA-only positions.
+    #[must_use]
+    pub fn symbol(&self) -> &str {
+        &self.symbol
+    }
+    /// Optional position comment.
+    #[must_use]
+    pub fn comment(&self) -> Option<&str> {
+        self.comment.as_deref()
+    }
 }
 
 /// Why the reflector link ended, typed so Swift can pattern-match
@@ -304,7 +434,7 @@ pub enum ReflectorEvent {
 /// Foreign-implemented trait that receives translated reflector events.
 ///
 /// Swift implements this protocol and passes an instance when calling
-/// [`connect_reflector`]. The background task holds the observer via
+/// [`ReflectorSession::connect`]. The background task holds the observer via
 /// `Arc<dyn ReflectorObserver>` and releases it when the session ends.
 #[uniffi::export(with_foreign)]
 pub trait ReflectorObserver: Send + Sync + std::fmt::Debug {
@@ -314,7 +444,7 @@ pub trait ReflectorObserver: Send + Sync + std::fmt::Debug {
 }
 
 /// Error variants surfaced across the FFI boundary.
-#[derive(Debug, Error, uniffi::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error, uniffi::Error)]
 #[non_exhaustive]
 pub enum ReflectorError {
     /// Caller-supplied callsign is not a valid D-STAR callsign.
@@ -323,6 +453,9 @@ pub enum ReflectorError {
     /// Module letter was missing or not A-Z.
     #[error("invalid module letter: {0}")]
     InvalidModule(String),
+    /// Host syntax or UDP port was invalid before any I/O.
+    #[error("invalid reflector endpoint: {0}")]
+    InvalidEndpoint(String),
     /// DNS lookup for the reflector host failed.
     #[error("DNS lookup failed: {0}")]
     DnsFailed(String),
@@ -341,6 +474,9 @@ pub enum ReflectorError {
     /// Handshake timed out.
     #[error("handshake timed out")]
     HandshakeTimeout,
+    /// The complete DNS, authentication and UDP connection budget expired.
+    #[error("reflector connection exceeded the 35-second setup deadline")]
+    ConnectionTimeout,
     /// Session is already disconnected.
     #[error("already disconnected")]
     AlreadyDisconnected,
@@ -350,9 +486,6 @@ pub enum ReflectorError {
     /// Background task died without a clean shutdown signal.
     #[error("session task panicked: {0}")]
     TaskPanic(String),
-    /// Stream ID was zero (not allowed by `StreamId`).
-    #[error("stream ID cannot be zero")]
-    ZeroStreamId,
     /// D-STAR header payload was not exactly 41 bytes.
     #[error("D-STAR header must be {expected} bytes, got {got}")]
     BadHeaderLength {
@@ -367,10 +500,6 @@ pub enum ReflectorError {
         /// Supplied length.
         got: u32,
     },
-    /// TX was attempted on a session owned by the background task, from
-    /// outside that task.
-    #[error("cannot send TX frames on a background-owned session outside its task")]
-    SessionInBackground,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -407,7 +536,11 @@ impl ReflectorSession {
 
     /// `true` while the background task is still running.
     pub async fn is_connected(self: Arc<Self>) -> bool {
-        self.backend.lock().await.is_some()
+        self.backend
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|backend| backend.shutdown.is_some() && !backend.join.is_finished())
     }
 
     /// Send a D-STAR header opening a new outbound voice stream.
@@ -417,14 +550,22 @@ impl ReflectorSession {
     ///
     /// # Errors
     ///
-    /// - [`ReflectorError::BadHeaderLength`] / [`ReflectorError::ZeroStreamId`]
-    ///   for invalid inputs.
+    /// - [`ReflectorError::BadHeaderLength`] for an invalid payload.
+    ///   Stream identifiers use checked foreign lifting before queueing.
     /// - [`ReflectorError::AlreadyDisconnected`] if the session has been torn down.
     /// - [`ReflectorError::Shell`] for failures inside `dstar-gateway`.
+    ///
+    /// # Cancellation and completion
+    ///
+    /// The 64-request queue accepts work when `send` finishes. Cancelling
+    /// before acceptance queues nothing; abandoning the response afterwards
+    /// permits the datagram to finish. Success observes UDP send completion,
+    /// not reflector receipt. Never retry an uncertain send automatically.
+    /// [`Self::disconnect`] rejects new requests and waits for task completion.
     pub async fn send_header(
         self: Arc<Self>,
         header_bytes: Vec<u8>,
-        stream_id: u16,
+        stream_id: VoiceStreamId,
     ) -> Result<(), ReflectorError> {
         if header_bytes.len() != HEADER_ENCODED_LEN {
             return Err(ReflectorError::BadHeaderLength {
@@ -432,32 +573,18 @@ impl ReflectorSession {
                 got: u32::try_from(header_bytes.len()).unwrap_or(u32::MAX),
             });
         }
-        let sid = StreamId::new(stream_id).ok_or(ReflectorError::ZeroStreamId)?;
+        let sid = stream_id.core();
         let mut arr = [0u8; HEADER_ENCODED_LEN];
         arr.copy_from_slice(&header_bytes);
         let radio_header = DstarHeader::decode(&arr);
 
-        // The TH-D75 in Reflector Terminal Mode emits its TX header
-        // with rpt1/rpt2 both set to the literal `"DIRECT  "` (the
-        // radio doesn't know the gateway's callsign). xlxd and
-        // ircDDBGateway read rpt1[7]/rpt2[7] as the module letter and
-        // silently drop any packet where it isn't a valid module;
-        // `"DIRECT  "` has 'T' at byte 7, so the reflector eats the
-        // stream without a NAK or log line. We rewrite rpt1/rpt2 /
-        // ur_call to the hotspot-to-reflector convention here.
-        //
-        // See `thd75-repl::build_reflector_header` (main.rs) for the
-        // verified-working reference implementation.
+        // Build repeater routes from the session's validated callsigns and
+        // modules. The label `DIRECT  ` contains T at byte 5 and spaces at
+        // bytes 6 and 7; build_reflector_header sets the module at byte 7.
+        // The operator identity, suffix and source flags remain unchanged.
         let ref_header = self.build_reflector_header(&radio_header);
 
-        let tx = self
-            .backend
-            .lock()
-            .await
-            .as_ref()
-            .ok_or(ReflectorError::AlreadyDisconnected)?
-            .tx
-            .clone();
+        let tx = self.sender().await?;
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(TxCommand::Header {
             header: Box::new(ref_header),
@@ -476,11 +603,13 @@ impl ReflectorSession {
     ///
     /// # Errors
     ///
-    /// See [`ReflectorSession::send_header`].
+    /// Returns [`ReflectorError::BadVoiceLength`] unless exactly 12 bytes are
+    /// supplied. Connection, queue, cancellation and completion behavior
+    /// follows [`Self::send_header`]; `seq` is a checked 0-through-20 index.
     pub async fn send_voice(
         self: Arc<Self>,
-        stream_id: u16,
-        seq: u8,
+        stream_id: VoiceStreamId,
+        seq: VoiceSequence,
         voice_bytes: Vec<u8>,
     ) -> Result<(), ReflectorError> {
         if voice_bytes.len() != 12 {
@@ -488,7 +617,7 @@ impl ReflectorSession {
                 got: u32::try_from(voice_bytes.len()).unwrap_or(u32::MAX),
             });
         }
-        let sid = StreamId::new(stream_id).ok_or(ReflectorError::ZeroStreamId)?;
+        let sid = stream_id.core();
         let mut ambe = [0u8; 9];
         let mut slow = [0u8; 3];
         // `.get(range)` returns Option instead of panicking; the length
@@ -505,18 +634,11 @@ impl ReflectorSession {
             ambe,
             slow_data: slow,
         };
-        let tx = self
-            .backend
-            .lock()
-            .await
-            .as_ref()
-            .ok_or(ReflectorError::AlreadyDisconnected)?
-            .tx
-            .clone();
+        let tx = self.sender().await?;
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(TxCommand::Voice {
             stream_id: sid,
-            seq,
+            seq: seq.core(),
             frame,
             reply: reply_tx,
         })
@@ -537,25 +659,20 @@ impl ReflectorSession {
     ///
     /// # Errors
     ///
-    /// See [`ReflectorSession::send_header`].
+    /// Connection, queue, cancellation and completion behavior follows
+    /// [`Self::send_header`]. The checked sequence excludes EOT flag bits;
+    /// the protocol encoder adds termination separately.
     pub async fn send_eot(
         self: Arc<Self>,
-        stream_id: u16,
-        seq: u8,
+        stream_id: VoiceStreamId,
+        seq: VoiceSequence,
     ) -> Result<Option<String>, ReflectorError> {
-        let sid = StreamId::new(stream_id).ok_or(ReflectorError::ZeroStreamId)?;
-        let tx = self
-            .backend
-            .lock()
-            .await
-            .as_ref()
-            .ok_or(ReflectorError::AlreadyDisconnected)?
-            .tx
-            .clone();
+        let sid = stream_id.core();
+        let tx = self.sender().await?;
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(TxCommand::Eot {
             stream_id: sid,
-            seq,
+            seq: seq.core(),
             reply: reply_tx,
         })
         .await
@@ -569,8 +686,11 @@ impl ReflectorSession {
     /// Graceful disconnect. Signals the background task to send the
     /// goodbye packet and then awaits the task's completion.
     ///
-    /// Idempotent: a second call returns
-    /// [`ReflectorError::AlreadyDisconnected`].
+    /// New sends are refused once shutdown starts. Cancelling this future
+    /// retains the task handle and its eventual result; another call can
+    /// resume waiting. After a completed call, another call returns
+    /// [`ReflectorError::AlreadyDisconnected`]. Dropping the session only
+    /// signals shutdown; it neither waits nor observes cleanup failures.
     ///
     /// # Errors
     ///
@@ -580,93 +700,144 @@ impl ReflectorSession {
     ///   attempt returned an error from `dstar-gateway`.
     /// - [`ReflectorError::TaskPanic`] if the task panicked.
     pub async fn disconnect(self: Arc<Self>) -> Result<(), ReflectorError> {
-        let backend = {
-            let mut guard = self.backend.lock().await;
-            guard.take().ok_or(ReflectorError::AlreadyDisconnected)?
-        };
-        // Best-effort shutdown signal: if the receiver already dropped,
-        // the task is exiting on its own and we just await its result.
-        let _ = backend.shutdown.send(());
-        match backend.join.await {
+        let mut guard = self.backend.lock().await;
+        let backend = guard.as_mut().ok_or(ReflectorError::AlreadyDisconnected)?;
+        if let Some(shutdown) = backend.shutdown.take() {
+            let _sent = shutdown.send(());
+        }
+        let result = match (&mut backend.join).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(msg)) => Err(ReflectorError::Shell(msg)),
             Err(join_err) => Err(ReflectorError::TaskPanic(format!("{join_err}"))),
-        }
+        };
+        drop(guard.take());
+        result
     }
 }
 
-/// Connect to a reflector and return an opaque session handle.
-///
-/// Drives the full per-protocol handshake synchronously, then spawns a
-/// tokio task that owns the session and pumps events into `observer`.
-/// The returned `ReflectorSession` is already in the Connected state.
-///
-/// # Errors
-///
-/// Returns [`ReflectorError`] variants describing whichever step of
-/// the connect flow failed: invalid input, DNS, socket bind, session
-/// builder rejection, reflector handshake failure, or timeout.
 #[uniffi::export(async_runtime = "tokio")]
-pub async fn connect_reflector(
-    callsign: String,
-    reflector: Reflector,
-    local_module: String,
-    reflector_module: String,
+impl ReflectorSession {
+    /// Connect a checked configuration, then start its single observer task.
+    ///
+    /// The complete DNS/authentication/UDP setup budget is 35 seconds. DNS has
+    /// five seconds; at most eight resolved endpoints are attempted with a
+    /// matching IPv4 or IPv6 socket and a five-second UDP handshake each.
+    /// Cancellation before return drops the in-progress socket and handshake.
+    /// The observer runs synchronously on the task and must return promptly.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed DNS, bind, authentication or handshake failures, or
+    /// [`ReflectorError::ConnectionTimeout`] at the complete setup deadline.
+    #[uniffi::constructor(name = "connect")]
+    pub async fn connect(
+        configuration: Arc<ReflectorConnectionConfig>,
+        observer: Arc<dyn ReflectorObserver>,
+    ) -> Result<Arc<Self>, ReflectorError> {
+        with_setup_deadline(connect_checked(&configuration, observer)).await
+    }
+}
+
+async fn with_setup_deadline<T>(
+    operation: impl Future<Output = Result<T, ReflectorError>>,
+) -> Result<T, ReflectorError> {
+    tokio::time::timeout(SETUP_BUDGET, operation)
+        .await
+        .map_err(|_| ReflectorError::ConnectionTimeout)?
+}
+
+enum ConnectedReflector {
+    DExtra(AsyncSession<DExtra>),
+    Dcs(AsyncSession<Dcs>),
+    DPlus(AsyncSession<DPlus>),
+}
+
+async fn connect_checked(
+    config: &ReflectorConnectionConfig,
     observer: Arc<dyn ReflectorObserver>,
 ) -> Result<Arc<ReflectorSession>, ReflectorError> {
-    debug!(
-        target: "lodestar_core::session",
-        callsign = %callsign,
-        reflector = %reflector.name,
-        protocol = ?reflector.protocol,
-        "connect_reflector invoked"
-    );
-
-    let station = Callsign::try_from_str(&callsign)
-        .map_err(|e| ReflectorError::InvalidCallsign(format!("{callsign}: {e}")))?;
-    let ref_cs = Callsign::try_from_str(&reflector.name)
-        .map_err(|e| ReflectorError::InvalidCallsign(format!("{}: {e}", reflector.name)))?;
-    let local = parse_module(&local_module)?;
-    let remote = parse_module(&reflector_module)?;
-
-    let peer = resolve_peer(&reflector).await?;
-    let socket = bind_local_socket().await?;
-
+    let peers = resolve_peers(config).await?;
+    let mut connected = None;
+    let mut last_failure = None;
+    for peer in peers {
+        let socket = match bind_local_socket(peer).await {
+            Ok(socket) => socket,
+            Err(error) => {
+                last_failure = Some(error);
+                continue;
+            }
+        };
+        let result = match config.protocol {
+            ReflectorProtocol::DExtra => {
+                connect_dextra(config.station, peer, config.local, config.remote, socket)
+                    .await
+                    .map(ConnectedReflector::DExtra)
+            }
+            ReflectorProtocol::Dcs => {
+                let target = config.dcs.ok_or_else(|| {
+                    ReflectorError::BuildFailed(
+                        "DCS target missing from checked configuration".to_owned(),
+                    )
+                })?;
+                connect_dcs(
+                    config.station,
+                    peer,
+                    config.local,
+                    config.remote,
+                    target,
+                    socket,
+                )
+                .await
+                .map(ConnectedReflector::Dcs)
+            }
+            ReflectorProtocol::DPlus => {
+                connect_dplus(config.station, peer, config.local, config.remote, socket)
+                    .await
+                    .map(ConnectedReflector::DPlus)
+            }
+        };
+        match result {
+            Ok(session) => {
+                connected = Some(session);
+                break;
+            }
+            Err(error) => last_failure = Some(error),
+        }
+    }
+    let connected = connected.ok_or_else(|| {
+        last_failure.unwrap_or_else(|| {
+            ReflectorError::DnsFailed("resolver returned no usable endpoints".to_owned())
+        })
+    })?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let (tx_cmd, tx_rx) = tokio::sync::mpsc::channel::<TxCommand>(64);
-
-    let join = match reflector.protocol {
-        ReflectorProtocol::DExtra => {
-            let session =
-                connect_dextra(station, peer, local, remote, ref_cs, socket.clone()).await?;
+    let join = match connected {
+        ConnectedReflector::DExtra(session) => {
             tokio::spawn(run_session_task(session, observer, shutdown_rx, tx_rx))
         }
-        ReflectorProtocol::Dcs => {
-            let session = connect_dcs(station, peer, local, remote, ref_cs, socket.clone()).await?;
+        ConnectedReflector::Dcs(session) => {
             tokio::spawn(run_session_task(session, observer, shutdown_rx, tx_rx))
         }
-        ReflectorProtocol::DPlus => {
-            let session =
-                connect_dplus(station, peer, local, remote, ref_cs, socket.clone()).await?;
+        ConnectedReflector::DPlus(session) => {
             tokio::spawn(run_session_task(session, observer, shutdown_rx, tx_rx))
         }
     };
 
     Ok(Arc::new(ReflectorSession {
         backend: Mutex::new(Some(Backend {
-            shutdown: shutdown_tx,
+            shutdown: Some(shutdown_tx),
             join,
             tx: tx_cmd,
         })),
-        callsign,
-        reflector_name: reflector.name,
-        local_module,
-        reflector_module,
-        protocol: reflector.protocol,
-        station_callsign: station,
-        local_module_typed: local,
-        reflector_callsign: ref_cs,
-        reflector_module_typed: remote,
+        callsign: config.station.to_string(),
+        reflector_name: config.reflector.to_string(),
+        local_module: config.local.to_string(),
+        reflector_module: config.remote.to_string(),
+        protocol: config.protocol,
+        station_callsign: config.station,
+        local_module_typed: config.local,
+        reflector_callsign: config.reflector,
+        reflector_module_typed: config.remote,
     }))
 }
 
@@ -691,7 +862,7 @@ pub async fn fetch_dplus_directory(callsign: String) -> Result<Vec<Reflector>, R
         .hosts()
         .iter()
         .map(|h| Reflector {
-            name: h.callsign.clone(),
+            name: h.callsign.to_string(),
             host: h.address.to_string(),
             port: dstar_gateway_core::codec::dplus::consts::DEFAULT_PORT,
             protocol: ReflectorProtocol::DPlus,
@@ -709,36 +880,20 @@ pub async fn fetch_dplus_directory(callsign: String) -> Result<Vec<Reflector>, R
 /// reported back to Swift when the stream ends; used for local
 /// recently-heard entries.
 ///
-/// Outbound `slow_data` bytes are SCRAMBLED (wire format) because the
-/// radio emits them that way in MMDVM D-STAR data frames. The Kenwood
-/// D-STAR sync frame carries `[0x55, 0x55, 0x55]` plain, which lines
-/// up with the collector's `frame_index == 0` resync trigger, so sync
-/// frames are detected by matching the wire bytes directly rather
-/// than by the outbound seq counter (which is monotonic and does not
-/// wrap on superframe boundaries).
+/// Outbound slow-data bytes retain MMDVM wire scrambling. The checked
+/// transmit index resets half-block assembly at zero and pairs adjacent
+/// odd/even indices within each 21-frame superframe.
 #[derive(Default)]
 struct TxTextState {
     collector: SlowDataTextCollector,
     latest: Option<String>,
-    frame_index: u8,
 }
 
 impl TxTextState {
-    fn ingest(&mut self, slow_data: [u8; 3]) {
-        // Detect D-STAR superframe sync by the raw wire bytes; the
-        // radio always emits 0x55,0x55,0x55 as slow-data filler on
-        // sync frames. When we see it, feed the collector with
-        // frame_index==0 so it resets its half-block phase.
-        let index = if slow_data == [0x55, 0x55, 0x55] {
-            self.frame_index = 0;
-            0
-        } else {
-            self.frame_index = self.frame_index.wrapping_add(1).max(1);
-            self.frame_index
-        };
-        self.collector.push(slow_data, index);
+    fn ingest(&mut self, slow_data: [u8; 3], sequence: FrameSequence) {
+        self.collector.push(slow_data, sequence.get());
         if let Some(msg) = self.collector.take_message()
-            && let Some(cleaned) = clean_slow_data_text(&msg)
+            && let Some(cleaned) = clean_slow_data_text(msg.as_bytes())
         {
             self.latest = Some(cleaned);
         }
@@ -783,7 +938,9 @@ struct StreamSlowDataState {
 
     /// Growing buffer of GPS-block payloads. Sentences are delimited
     /// by `\r` (`$$CRC...` DPRS) or `\n` (`$GPRMC` / `$GPGGA` NMEA).
-    gps_buffer: String,
+    gps_buffer: Vec<u8>,
+
+    last_sequence: Option<u8>,
 
     latest_text: Option<String>,
     latest_position: Option<GpsPosition>,
@@ -828,7 +985,8 @@ impl StreamSlowDataState {
             block_buffer: [0u8; 6],
             block_phase: BlockPhase::First,
             text_collector: SlowDataTextCollector::new(),
-            gps_buffer: String::new(),
+            gps_buffer: Vec::new(),
+            last_sequence: None,
             latest_text: None,
             latest_position: None,
         }
@@ -837,6 +995,16 @@ impl StreamSlowDataState {
     /// Ingest one voice-frame slow-data fragment. `seq` is the reflector
     /// frame index (0 every 21 frames → D-STAR superframe sync).
     fn push(&mut self, slow_data: [u8; 3], seq: u8) -> SlowDataDelta {
+        if seq >= 21 {
+            return SlowDataDelta::default();
+        }
+        if self
+            .last_sequence
+            .is_some_and(|last| seq != (last + 1) % 21)
+        {
+            self.block_phase = BlockPhase::First;
+        }
+        self.last_sequence = Some(seq);
         tracing::trace!(
             target: "lodestar_core::session::slow_data",
             seq,
@@ -861,21 +1029,22 @@ impl StreamSlowDataState {
         // type byte and route GPS payloads, even when the text
         // collector decides the block isn't for it.
         let plain = descramble(slow_data);
-        match self.block_phase {
-            BlockPhase::First => {
+        match (self.block_phase, seq.is_multiple_of(2)) {
+            (_, false) => {
                 if let Some(dst) = self.block_buffer.get_mut(0..3) {
                     dst.copy_from_slice(&plain);
                 }
                 self.block_phase = BlockPhase::Second;
                 SlowDataDelta::default()
             }
-            BlockPhase::Second => {
+            (BlockPhase::Second, true) => {
                 if let Some(dst) = self.block_buffer.get_mut(3..6) {
                     dst.copy_from_slice(&plain);
                 }
                 self.block_phase = BlockPhase::First;
                 self.commit_block()
             }
+            (BlockPhase::First, true) => SlowDataDelta::default(),
         }
     }
 
@@ -906,15 +1075,16 @@ impl StreamSlowDataState {
             }
             SLOW_DATA_TYPE_GPS => {
                 // 5 bytes of GPS sentence payload at positions 1..=5.
-                // Copy out to a short String so we're not holding a
-                // borrow on `self` while `ingest_gps_chunk` mutates it.
+                // Copy the bounded payload before updating sentence state.
                 let payload: [u8; 5] = self
                     .block_buffer
                     .get(1..6)
                     .and_then(|s| <[u8; 5]>::try_from(s).ok())
                     .unwrap_or([0u8; 5]);
-                let chunk = String::from_utf8_lossy(&payload).into_owned();
-                delta.position_changed = ingest_gps_chunk(self, &chunk);
+                let length = usize::from(type_byte & 0x0F);
+                if let Some(chunk) = payload.get(..length) {
+                    delta.position_changed = ingest_gps_chunk(self, chunk);
+                }
             }
             _ => {
                 // Header retx, fast data, squelch, unknown: ignore.
@@ -929,7 +1099,7 @@ impl StreamSlowDataState {
         let Some(msg) = self.text_collector.take_message() else {
             return false;
         };
-        let Some(cleaned) = clean_slow_data_text(&msg) else {
+        let Some(cleaned) = clean_slow_data_text(msg.as_bytes()) else {
             return false;
         };
         if Some(&cleaned) == self.latest_text.as_ref() {
@@ -985,7 +1155,7 @@ where
                         drop(reply.send(r));
                     }
                     TxCommand::Voice { stream_id, seq, frame, reply } => {
-                        tx_text_state.ingest(frame.slow_data);
+                        tx_text_state.ingest(frame.slow_data, seq);
                         let r = session
                             .send_voice(stream_id, seq, frame)
                             .await
@@ -1008,7 +1178,7 @@ where
             maybe_event = session.next_event() => {
                 match maybe_event {
                     Some(event) => {
-                        handle_event(&event, &observer, &mut slow_state);
+                        handle_event(&event, observer.as_ref(), &mut slow_state);
                     }
                     None => {
                         break Ok(());
@@ -1027,7 +1197,7 @@ where
 ///   * enriched `VoiceEnd` carrying the final text + position when the stream ends.
 fn handle_event<P>(
     event: &Event<P>,
-    observer: &Arc<dyn ReflectorObserver>,
+    observer: &dyn ReflectorObserver,
     slow_state: &mut Option<StreamSlowDataState>,
 ) where
     P: dstar_gateway_core::session::client::Protocol + std::fmt::Debug,
@@ -1080,8 +1250,7 @@ fn handle_event<P>(
 }
 
 /// Every recognised GPS sentence prefix paired with its terminator.
-const GPS_SENTENCE_PATTERNS: [(&str, char); 3] =
-    [("$$CRC", '\r'), ("$GPRMC", '\n'), ("$GPGGA", '\n')];
+const GPS_SENTENCE_PATTERNS: [&[u8]; 3] = [b"$$CRC", b"$GPRMC", b"$GPGGA"];
 
 /// Append a 5-byte GPS block payload to the running buffer, then
 /// scan for complete sentences and parse each. Returns `true` if the
@@ -1097,72 +1266,38 @@ const GPS_SENTENCE_PATTERNS: [(&str, char); 3] =
 /// blocks can contain leading padding or the tail of a prior sentence.
 /// Any bytes preceding a recognised prefix are dropped as noise once
 /// the sentence lands.
-fn ingest_gps_chunk(state: &mut StreamSlowDataState, chunk: &str) -> bool {
-    tracing::debug!(
-        target: "lodestar_core::session::gps",
-        chunk = %chunk,
-        chunk_bytes = ?chunk.as_bytes(),
-        "slow-data GPS block"
-    );
-    state.gps_buffer.push_str(chunk);
-
+fn ingest_gps_chunk(state: &mut StreamSlowDataState, chunk: &[u8]) -> bool {
     let mut changed = false;
-    loop {
-        // Earliest recognised prefix anywhere in the buffer.
-        let earliest = GPS_SENTENCE_PATTERNS
-            .iter()
-            .filter_map(|(prefix, term)| {
-                state
-                    .gps_buffer
-                    .find(prefix)
-                    .map(|idx| (idx, *prefix, *term))
-            })
-            .min_by_key(|(idx, _, _)| *idx);
-
-        let Some((start, prefix, terminator)) = earliest else {
-            break;
-        };
-
-        // Terminator must appear after the prefix start.
-        let Some(rel_end) = state
-            .gps_buffer
-            .get(start..)
-            .and_then(|s| s.find(terminator))
-        else {
-            // Sentence still assembling. Drop the noise before the
-            // prefix so the buffer doesn't grow unbounded while we
-            // wait for the terminator.
-            if start > 0 {
-                drop(state.gps_buffer.drain(..start));
+    for &byte in chunk {
+        if matches!(byte, b'\r' | b'\n') {
+            for start in 0..state.gps_buffer.len() {
+                let Some(tail) = state.gps_buffer.get(start..) else {
+                    continue;
+                };
+                if !GPS_SENTENCE_PATTERNS
+                    .iter()
+                    .any(|prefix| tail.starts_with(prefix))
+                {
+                    continue;
+                }
+                let Ok(sentence) = std::str::from_utf8(tail) else {
+                    continue;
+                };
+                if let Some(position) = parse_gps_sentence(sentence) {
+                    if state.latest_position.as_ref() != Some(&position) {
+                        state.latest_position = Some(position);
+                        changed = true;
+                    }
+                    break;
+                }
             }
-            break;
-        };
-        let end = start + rel_end;
-        let sentence: String = state
-            .gps_buffer
-            .get(start..end)
-            .map(ToOwned::to_owned)
-            .unwrap_or_default();
-        drop(state.gps_buffer.drain(..=end));
-
-        tracing::debug!(
-            target: "lodestar_core::session::gps",
-            prefix,
-            sentence = %sentence,
-            "parsing GPS sentence"
-        );
-        if let Some(position) = parse_gps_sentence(&sentence, prefix)
-            && state.latest_position.as_ref() != Some(&position)
-        {
-            state.latest_position = Some(position);
-            changed = true;
+            state.gps_buffer.clear();
+            continue;
         }
-    }
-
-    // Prevent pathological growth on malformed / unterminated sentences.
-    if state.gps_buffer.len() > GPS_BUFFER_CAP {
-        let keep_from = state.gps_buffer.len().saturating_sub(GPS_BUFFER_CAP / 2);
-        drop(state.gps_buffer.drain(..keep_from));
+        if state.gps_buffer.len() == GPS_BUFFER_CAP {
+            drop(state.gps_buffer.drain(..GPS_BUFFER_CAP / 2));
+        }
+        state.gps_buffer.push(byte);
     }
     changed
 }
@@ -1170,15 +1305,16 @@ fn ingest_gps_chunk(state: &mut StreamSlowDataState, chunk: &str) -> bool {
 /// Parse a complete GPS sentence into a [`GpsPosition`]. The prefix
 /// has already been identified by the ingest loop, so this dispatches
 /// directly.
-fn parse_gps_sentence(sentence: &str, prefix: &str) -> Option<GpsPosition> {
-    match prefix {
-        "$$CRC" => match parse_dprs(sentence) {
+fn parse_gps_sentence(sentence: &str) -> Option<GpsPosition> {
+    if sentence.starts_with("$$CRC") {
+        return match sentence.parse::<DprsReport>() {
             Ok(report) => Some(GpsPosition {
-                callsign: report.callsign.as_str().trim().to_owned(),
-                latitude: report.latitude.degrees(),
-                longitude: report.longitude.degrees(),
-                symbol: report.symbol.to_string(),
-                comment: report.comment.clone(),
+                callsign: report.source().as_str().to_owned(),
+                latitude: report.latitude().degrees(),
+                longitude: report.longitude().degrees(),
+                symbol: report.symbol().code().as_char().to_string(),
+                comment: (!report.comment().as_str().is_empty())
+                    .then(|| report.comment().as_str().to_owned()),
             }),
             Err(e) => {
                 tracing::debug!(
@@ -1189,28 +1325,61 @@ fn parse_gps_sentence(sentence: &str, prefix: &str) -> Option<GpsPosition> {
                 );
                 None
             }
-        },
-        "$GPRMC" => parse_nmea_rmc(sentence),
-        "$GPGGA" => parse_nmea_gga(sentence),
+        };
+    }
+    let body = checked_nmea_body(sentence)?;
+    match body.split(',').next()? {
+        "GPRMC" => parse_nmea_rmc(body),
+        "GPGGA" => parse_nmea_gga(body),
         _ => None,
     }
+}
+
+/// Verify the complete ASCII XOR envelope, matching
+/// `ircDDBGateway/Common/APRSCollector.cpp::checkXOR`.
+fn checked_nmea_body(sentence: &str) -> Option<&str> {
+    if sentence.len() >= 300 || !sentence.is_ascii() {
+        return None;
+    }
+    let (body, checksum) = sentence.strip_prefix('$')?.split_once('*')?;
+    if checksum.len() != 2 || !checksum.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let expected = u8::from_str_radix(checksum, 16).ok()?;
+    (body.bytes().fold(0, |sum, byte| sum ^ byte) == expected).then_some(body)
 }
 
 /// Decode a comma-delimited NMEA coordinate field (`DDMM.MMMM`) plus
 /// a hemisphere char (`N`/`S` or `E`/`W`) into decimal degrees.
 fn nmea_coord_to_degrees(raw: &str, hemisphere: &str, deg_width: usize) -> Option<f64> {
-    if raw.len() < deg_width + 2 {
+    let (whole, fraction) = raw.split_once('.').unwrap_or((raw, ""));
+    if whole.len() != deg_width + 2
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        || (raw.contains('.') && fraction.is_empty())
+    {
         return None;
     }
     let deg: f64 = raw.get(..deg_width)?.parse().ok()?;
     let minutes: f64 = raw.get(deg_width..)?.parse().ok()?;
+    let maximum = if deg_width == 2 { 90.0 } else { 180.0 };
+    if !minutes.is_finite() || deg > maximum || (deg >= maximum && minutes > 0.0) {
+        return None;
+    }
+    if !(0.0..60.0).contains(&minutes) {
+        return None;
+    }
     let mut decimal = deg + minutes / 60.0;
-    match hemisphere {
-        "S" | "W" => decimal = -decimal,
-        "N" | "E" => {}
+    match (deg_width, hemisphere) {
+        (2, "S") | (3, "W") => decimal = -decimal,
+        (2, "N") | (3, "E") => {}
         _ => return None,
     }
-    Some(decimal)
+    match deg_width {
+        2 => Latitude::new(decimal).ok().map(Latitude::degrees),
+        3 => Longitude::new(decimal).ok().map(Longitude::degrees),
+        _ => None,
+    }
 }
 
 /// Parse a `$GPRMC` sentence. Only lat/lon are extracted; the rest of
@@ -1220,6 +1389,9 @@ fn parse_nmea_rmc(sentence: &str) -> Option<GpsPosition> {
     // $GPRMC,hhmmss.ss,A,DDMM.MMMM,N,DDDMM.MMMM,W,speed,course,ddmmyy,...
     //   0    1         2 3         4 5          6
     let fields: Vec<&str> = sentence.split(',').collect();
+    if fields.get(2) != Some(&"A") || fields.get(12) == Some(&"N") {
+        return None;
+    }
     let lat_raw = fields.get(3)?;
     let lat_hem = fields.get(4)?;
     let lon_raw = fields.get(5)?;
@@ -1241,6 +1413,9 @@ fn parse_nmea_gga(sentence: &str) -> Option<GpsPosition> {
     // $GPGGA,hhmmss.ss,DDMM.MMMM,N,DDDMM.MMMM,W,fix,sats,...
     //   0    1         2         3 4          5
     let fields: Vec<&str> = sentence.split(',').collect();
+    if !matches!(fields.get(6), Some(&("1" | "2" | "3" | "4" | "5" | "6"))) {
+        return None;
+    }
     let lat_raw = fields.get(2)?;
     let lat_hem = fields.get(3)?;
     let lon_raw = fields.get(4)?;
@@ -1288,11 +1463,11 @@ where
             stream_id, header, ..
         } => ReflectorEvent::VoiceStart {
             stream_id: stream_id.get(),
-            mycall: header.my_call.as_str().trim().to_owned(),
-            suffix: header.my_suffix.as_str().trim().to_owned(),
-            urcall: header.ur_call.as_str().trim().to_owned(),
-            rpt1: header.rpt1.as_str().trim().to_owned(),
-            rpt2: header.rpt2.as_str().trim().to_owned(),
+            mycall: header.my_call.to_string(),
+            suffix: header.my_suffix.to_string(),
+            urcall: header.ur_call.to_string(),
+            rpt1: header.rpt1.to_string(),
+            rpt2: header.rpt2.to_string(),
             header_bytes: header.encode().to_vec(),
         },
         Event::VoiceFrame {
@@ -1372,19 +1547,40 @@ fn parse_module(s: &str) -> Result<Module, ReflectorError> {
 }
 
 /// Resolve a reflector's host+port to a concrete [`std::net::SocketAddr`].
-async fn resolve_peer(reflector: &Reflector) -> Result<std::net::SocketAddr, ReflectorError> {
-    let authority = format!("{}:{}", reflector.host, reflector.port);
-    let mut addrs = tokio::net::lookup_host(&authority)
-        .await
-        .map_err(|e| ReflectorError::DnsFailed(format!("{authority}: {e}")))?;
-    addrs
-        .next()
-        .ok_or_else(|| ReflectorError::DnsFailed(format!("{authority}: no addresses")))
+async fn resolve_peers(
+    config: &ReflectorConnectionConfig,
+) -> Result<Vec<SocketAddr>, ReflectorError> {
+    if let Some(ip) = config.address.ip() {
+        return Ok(vec![SocketAddr::new(ip, config.port.get())]);
+    }
+    let host = config
+        .address
+        .dns_name()
+        .ok_or_else(|| ReflectorError::DnsFailed("checked DNS address missing".to_owned()))?;
+    let addrs = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::net::lookup_host((host, config.port.get())),
+    )
+    .await
+    .map_err(|_| ReflectorError::DnsFailed("DNS exceeded five seconds".to_owned()))?
+    .map_err(|error| ReflectorError::DnsFailed(error.to_string()))?;
+    let peers: Vec<_> = addrs.take(8).collect();
+    if peers.is_empty() {
+        return Err(ReflectorError::DnsFailed(
+            "resolver returned no addresses".to_owned(),
+        ));
+    }
+    Ok(peers)
 }
 
 /// Bind an ephemeral local UDP socket for a new reflector session.
-async fn bind_local_socket() -> Result<Arc<UdpSocket>, ReflectorError> {
-    UdpSocket::bind("0.0.0.0:0")
+async fn bind_local_socket(peer: SocketAddr) -> Result<Arc<UdpSocket>, ReflectorError> {
+    let ip = if peer.is_ipv6() {
+        IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+    } else {
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+    };
+    UdpSocket::bind(SocketAddr::new(ip, 0))
         .await
         .map(Arc::new)
         .map_err(|e| ReflectorError::SocketBindFailed(format!("{e}")))
@@ -1412,18 +1608,16 @@ where
 
 /// Build, connect, and spawn a `DExtra` session.
 async fn connect_dextra(
-    station: Callsign,
+    station: RoutingCallsign,
     peer: std::net::SocketAddr,
     local_module: Module,
     reflector_module: Module,
-    reflector_callsign: Callsign,
     socket: Arc<UdpSocket>,
 ) -> Result<AsyncSession<DExtra>, ReflectorError> {
     let configured = Session::<DExtra, _>::builder()
         .callsign(station)
         .local_module(local_module)
         .reflector_module(reflector_module)
-        .reflector_callsign(reflector_callsign)
         .peer(peer)
         .build();
 
@@ -1437,18 +1631,18 @@ async fn connect_dextra(
 
 /// Build, connect, and spawn a `Dcs` session.
 async fn connect_dcs(
-    station: Callsign,
+    station: RoutingCallsign,
     peer: std::net::SocketAddr,
     local_module: Module,
     reflector_module: Module,
-    reflector_callsign: Callsign,
+    reflector_callsign: DcsReflector,
     socket: Arc<UdpSocket>,
 ) -> Result<AsyncSession<Dcs>, ReflectorError> {
     let configured = Session::<Dcs, _>::builder()
         .callsign(station)
         .local_module(local_module)
         .reflector_module(reflector_module)
-        .reflector_callsign(reflector_callsign)
+        .dcs_reflector(reflector_callsign)
         .peer(peer)
         .build();
 
@@ -1462,19 +1656,16 @@ async fn connect_dcs(
 
 /// Build, authenticate, and drive a full `DPlus` (REF) connect handshake.
 ///
-/// If auth fails the UDP handshake is still attempted (the same
-/// best-effort behaviour as `thd75-repl`); if the handshake also
-/// fails, the returned error is prefixed with the auth failure so the
-/// real cause is visible.
+/// Authentication failure is retained while the UDP handshake is attempted
+/// with an empty host list. If that also fails, both failures are returned.
 async fn connect_dplus(
-    station: Callsign,
+    station: RoutingCallsign,
     peer: std::net::SocketAddr,
     local_module: Module,
     reflector_module: Module,
-    reflector_callsign: Callsign,
     socket: Arc<UdpSocket>,
 ) -> Result<AsyncSession<DPlus>, ReflectorError> {
-    let (hosts, auth_warning) = match AuthClient::new().authenticate(station).await {
+    let (hosts, auth_warning) = match AuthClient::new().authenticate(station.callsign()).await {
         Ok(h) => (h, None),
         Err(e) => {
             let msg = format!("{e}");
@@ -1491,7 +1682,6 @@ async fn connect_dplus(
         .callsign(station)
         .local_module(local_module)
         .reflector_module(reflector_module)
-        .reflector_callsign(reflector_callsign)
         .peer(peer)
         .build();
 
@@ -1508,9 +1698,7 @@ async fn connect_dplus(
         Ok(connected) => Ok(AsyncSession::spawn(connected, socket)),
         Err(e) => {
             if let Some(auth_warning) = auth_warning {
-                // Auth failed AND LINK1 was rejected. The common cause is
-                // an unregistered callsign, so say so instead of
-                // making the user guess.
+                // Preserve independent authentication and handshake failures.
                 Err(ReflectorError::AuthFailed(format!(
                     "{e}. DPlus auth also failed: {auth_warning}. \
                      Register your callsign at dstargateway.org, or try an XRF/DCS reflector \
@@ -1592,8 +1780,9 @@ mod slow_data_gps_tests {
         let mut seq: u8 = 1;
         for &frame in frames {
             let _delta = state.push(frame, seq);
-            seq = seq.wrapping_add(1);
-            if seq == 0 {
+            seq += 1;
+            if seq == 21 {
+                let _sync = state.push([0x55; 3], 0);
                 seq = 1;
             }
         }
@@ -1602,7 +1791,7 @@ mod slow_data_gps_tests {
 
     #[test]
     fn decodes_dprs_sentence_with_cr_terminator() -> TestResult {
-        let sentence = "$$CRC1234,W1AW    >APDPRS,DSTAR*:!4321.12N/07123.45W>Test\r";
+        let sentence = "$$CRC7FE5,W1AW    >APDPRS,DSTAR*:!4321.12N/07123.45W>Test\r";
         let frames = encode_dprs_to_scrambled_frames(sentence);
         assert!(
             frames.len() >= 20,
@@ -1638,7 +1827,7 @@ mod slow_data_gps_tests {
 
     #[test]
     fn nmea_rmc_sentence_decodes() -> TestResult {
-        let sentence = "$GPRMC,123456.00,A,4321.1200,N,07123.4500,W,0.0,0.0,010125,,*31\n";
+        let sentence = "$GPRMC,123456.00,A,4321.1200,N,07123.4500,W,0.0,0.0,010125,,*20\n";
         let frames = encode_dprs_to_scrambled_frames(sentence);
         let pos = decode_frames(&frames).ok_or("decoder should recover GPRMC")?;
         let expected_lat = 43.0 + 21.12 / 60.0;
@@ -1646,6 +1835,150 @@ mod slow_data_gps_tests {
             (pos.latitude - expected_lat).abs() < 0.01,
             "lat {}",
             pos.latitude
+        );
+        Ok(())
+    }
+
+    fn nmea(body: &str) -> String {
+        let checksum = body.bytes().fold(0_u8, |sum, byte| sum ^ byte);
+        format!("${body}*{checksum:02X}\r\n")
+    }
+
+    #[test]
+    fn malformed_bytes_are_bounded_and_do_not_hide_a_following_fix() -> TestResult {
+        let mut state = StreamSlowDataState::new(StreamId::new(1).ok_or("stream")?);
+        for _ in 0..400 {
+            let _changed = ingest_gps_chunk(&mut state, &[0xFF; 5]);
+            assert!(
+                state.gps_buffer.len() <= GPS_BUFFER_CAP,
+                "GPS retention exceeded its byte cap"
+            );
+        }
+        let sentence = "$GPRMC,123456.00,A,4321.1200,N,07123.4500,W,0.0,0.0,010125,,*20\n";
+        for chunk in sentence.as_bytes().chunks(5) {
+            let _changed = ingest_gps_chunk(&mut state, chunk);
+        }
+        assert!(
+            state.latest_position.is_some(),
+            "valid following ASCII sentence was discarded"
+        );
+        assert!(
+            state.gps_buffer.is_empty(),
+            "complete sentence left retained bytes"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_utf8_through_the_real_dispatcher_remains_bounded_and_recovers() -> TestResult {
+        let stream = StreamId::new(1).ok_or("stream")?;
+        let mut state = StreamSlowDataState::new(stream);
+        let mut sequence = 1;
+        for _ in 0..400 {
+            for plain in [[0x35, 0xFF, 0xFF], [0xFF; 3]] {
+                let _changed = state.push(scramble(plain), sequence);
+                sequence += 1;
+                if sequence == 21 {
+                    let _sync = state.push([0x55; 3], 0);
+                    sequence = 1;
+                }
+            }
+            assert!(
+                state.gps_buffer.len() <= GPS_BUFFER_CAP,
+                "dispatcher expanded malformed bytes beyond the cap"
+            );
+        }
+        let sentence = "$GPRMC,123456.00,A,4321.1200,N,07123.4500,W,0.0,0.0,010125,,*20\n";
+        for frame in encode_dprs_to_scrambled_frames(sentence) {
+            let _changed = state.push(frame, sequence);
+            sequence += 1;
+            if sequence == 21 {
+                let _sync = state.push([0x55; 3], 0);
+                sequence = 1;
+            }
+        }
+        let position = state
+            .latest_position
+            .ok_or("valid following fix was lost")?;
+        assert!(
+            (position.latitude - (43.0 + 21.12 / 60.0)).abs() < 1e-9,
+            "following fix has the wrong latitude"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn numeric_integrity_and_fix_status_are_required() {
+        for (latitude, north_south, longitude, east_west) in [
+            ("9000.0001", "N", "07123.45", "W"),
+            ("4360.00", "N", "07123.45", "W"),
+            ("43NaN", "N", "07123.45", "W"),
+            ("4321.12", "E", "07123.45", "W"),
+            ("4321.12", "N", "18000.001", "E"),
+            ("4321.12", "N", "07123.45", "S"),
+            ("+321.12", "N", "07123.45", "W"),
+        ] {
+            let wire = nmea(&format!(
+                "GPRMC,123456,A,{latitude},{north_south},{longitude},{east_west},0,0,010125,,"
+            ));
+            assert!(
+                parse_gps_sentence(wire.trim_end()).is_none(),
+                "invalid coordinate admitted: {wire}"
+            );
+        }
+        for body in [
+            "GPRMC,123456,V,4321.12,N,07123.45,W,0,0,010125,,",
+            "GPGGA,123456,4321.12,N,07123.45,W,0,8,1,0,M,0,M,,",
+        ] {
+            assert!(
+                parse_gps_sentence(nmea(body).trim_end()).is_none(),
+                "invalid fix admitted: {body}"
+            );
+        }
+        assert!(
+            parse_gps_sentence("$GPRMC,123456.00,A,4321.1200,N,07123.4500,W,0.0,0.0,010125,,*31")
+                .is_none(),
+            "bad NMEA XOR was accepted"
+        );
+        assert!(
+            parse_gps_sentence("$$CRC1234,W1AW    >APDPRS,DSTAR*:!4321.12N/07123.45W>Test")
+                .is_none(),
+            "bad DPRS CRC was accepted"
+        );
+        let endpoints = nmea("GPRMC,123456,A,9000,N,18000,E,0,0,010125,,");
+        assert!(
+            parse_gps_sentence(endpoints.trim_end()).is_some(),
+            "geographic endpoints were rejected"
+        );
+        let gga = nmea("GPGGA,123456,4321.12,N,07123.45,W,1,8,1,0,M,0,M,,");
+        assert!(
+            parse_gps_sentence(gga.trim_end()).is_some(),
+            "valid GGA was rejected"
+        );
+    }
+
+    #[test]
+    fn a_position_comment_cannot_override_its_enclosing_valid_report() -> TestResult {
+        let embedded = nmea("GPRMC,000000,A,1000,N,02000,E,,,010125");
+        assert!(
+            parse_gps_sentence(embedded.trim_end()).is_some(),
+            "embedded NMEA fixture is invalid"
+        );
+        let body = format!(
+            "W1AW>APDPRS,DSTAR*:!3530.00N/08233.00W>{}",
+            embedded.trim_end()
+        );
+        let crc = dstar_gateway_core::dprs::compute_crc(format!("{body}\r").as_bytes());
+        let wire = format!("$$CRC{crc:04X},{body}\r");
+        let _verified: DprsReport = wire.parse()?;
+        let mut state = StreamSlowDataState::new(StreamId::new(1).ok_or("stream")?);
+        let _changed = ingest_gps_chunk(&mut state, wire.as_bytes());
+        let position = state
+            .latest_position
+            .ok_or("enclosing DPRS position missing")?;
+        assert!(
+            (position.latitude - 35.5).abs() < f64::EPSILON,
+            "embedded NMEA text replaced the enclosing report"
         );
         Ok(())
     }

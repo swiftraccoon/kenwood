@@ -17,6 +17,19 @@ private enum MmdvmCmd {
     static let dstarEot: UInt8 = 0x13
 }
 
+/// Generates valid D-STAR indices independently of raw radio counter bytes.
+struct RelayVoiceSequence: Sendable {
+    private var index: UInt8 = 0
+
+    var current: VoiceSequence { index }
+
+    mutating func take() -> VoiceSequence {
+        let value = index
+        index = index == 20 ? 0 : index + 1
+        return value
+    }
+}
+
 /// Bridges MMDVM D-STAR frames between a TH-D75 in Reflector Terminal
 /// Mode and an active `ReflectorSession`. When started:
 ///
@@ -57,7 +70,7 @@ public final class RelayCoordinator {
 
     /// Outbound (radio→reflector) stream state. `nil` between streams.
     private var outboundStreamId: UInt16?
-    private var outboundSeq: UInt8 = 0
+    private var outboundSequence = RelayVoiceSequence()
 
     /// Summary of the current local TX, captured on header and flushed
     /// on EOT so a recently-heard entry can be inserted for the
@@ -176,7 +189,7 @@ public final class RelayCoordinator {
                 // stream ID (non-zero) and forward the 41-byte header.
                 let streamId = Self.freshStreamId()
                 outboundStreamId = streamId
-                outboundSeq = 0
+                outboundSequence = RelayVoiceSequence()
                 // Decode the radio's header so we can synthesise a
                 // recently-heard entry for our own TX on EOT; the
                 // reflector won't echo it back.
@@ -199,21 +212,20 @@ public final class RelayCoordinator {
                     log.warning("Relay: ignoring DStarData with no header yet")
                     return
                 }
-                let seq = outboundSeq
-                outboundSeq &+= 1
+                let seq = outboundSequence.take()
                 if localTx != nil {
                     localTx?.frames &+= 1
                 }
                 try await session.sendVoice(streamId: sid, seq: seq, voiceBytes: frame.payload)
             case MmdvmCmd.dstarEot, MmdvmCmd.dstarLost:
                 guard let sid = outboundStreamId else { return }
-                let seq = outboundSeq
+                let seq = outboundSequence.current
                 // send_eot returns the assembled TX message (Kenwood
                 // 4-block text) the radio transmitted during this
                 // stream, so we can include it in the local heard entry.
                 let txText = try await session.sendEot(streamId: sid, seq: seq)
                 outboundStreamId = nil
-                outboundSeq = 0
+                outboundSequence = RelayVoiceSequence()
                 if let tx = localTx {
                     reflectorCoordinator.logLocalTransmission(
                         mycall: tx.mycall,
@@ -282,7 +294,7 @@ public final class RelayCoordinator {
         readerTask = nil
         mmdvmReader = nil
         outboundStreamId = nil
-        outboundSeq = 0
+        outboundSequence = RelayVoiceSequence()
         if let tx = localTx {
             reflectorCoordinator.logLocalTransmission(
                 mycall: tx.mycall, suffix: tx.suffix, urcall: tx.urcall,

@@ -6,6 +6,20 @@ import XCTest
 
 @MainActor
 final class RelayCoordinatorTests: XCTestCase {
+    func testOutboundIndicesRepeatCompleteSuperframesAndResetForANewStream() {
+        var sequence = RelayVoiceSequence()
+        let expected = Array(UInt8(0)...20)
+        for _ in 0..<2 {
+            let actual = expected.map { _ in sequence.take() }
+            XCTAssertEqual(actual, expected)
+            XCTAssertEqual(sequence.current, 0)
+        }
+        XCTAssertEqual(sequence.take(), 0)
+        XCTAssertEqual(sequence.current, 1)
+        sequence = RelayVoiceSequence()
+        XCTAssertEqual(sequence.current, 0)
+    }
+
     func testReaderStreamEndClearsRelayHook() async throws {
         let transportCoordinator = TransportCoordinator()
         let mock = MockRadioTransport()

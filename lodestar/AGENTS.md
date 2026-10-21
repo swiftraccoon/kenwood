@@ -84,6 +84,6 @@ unit tests (`RailState`-style), and that is the only automated layout-test layer
 - Switch over `ReflectorEvent` exhaustively; new variants are a Swift-side breaking change.
 - `headerBytes` and `voiceBytes` are forwarded to the radio as MMDVM frames unchanged. Swift never re-frames or pads them.
 - The reflector list comes from the host files bundled in `lodestar-core/data/`. Never hand-roll a list on the Swift side.
-- Relay runs only when the radio mode is `.mmdvm` and a reflector session is live; both preconditions are checked in `RelayCoordinator.start()`. Outbound picks a fresh non-zero u16 stream ID per header and increments `seq` per frame; inbound uses the reflector's stream ID.
+- Relay runs only when the radio mode is `.mmdvm` and a reflector session is live; both preconditions are checked in `RelayCoordinator.start()`. Outbound picks a fresh nonzero stream ID per header and wraps `seq` modulo 21; inbound retains the reflector's stream ID. Rust checks foreign stream/sequence values before queueing.
 - `RadioModeProber` sends `[0xE0, 0x03, 0x00]` and classifies: `0xE0` first byte is `.mmdvm`; no response is `.cat` (MMDVM firmware always answers, so silence means CAT); `?` or `N` is `.cat` (CAT mode can reply); anything else is `.unrecognized`.
 - `TransportCoordinator.probeRadioMode()` runs inside `connect()`. Gate it on `transport != nil`, never on `state == .connected`, which is set asynchronously by the state-observer task and races the probe.

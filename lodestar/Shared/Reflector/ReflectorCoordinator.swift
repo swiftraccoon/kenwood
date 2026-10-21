@@ -230,11 +230,14 @@ public final class ReflectorCoordinator: ReflectorObserver {
 
         do {
             let observer: any ReflectorObserver = self
-            let s = try await connectReflector(
+            let configuration = try ReflectorConnectionConfig(candidate: ReflectorConnectionCandidate(
                 callsign: callsign,
                 reflector: reflector,
                 localModule: localModule,
-                reflectorModule: reflectorModule,
+                reflectorModule: reflectorModule
+            ))
+            let s = try await ReflectorSession.connect(
+                configuration: configuration,
                 observer: observer
             )
             session = s
@@ -420,7 +423,12 @@ public final class ReflectorCoordinator: ReflectorObserver {
             // user-initiated disconnects released it already.
             // Flush decoder state; the tail PCM is discarded because the
             // link is gone and there's nothing left to play through.
-            _ = rxPipeline.endStream()
+            do {
+                _ = try rxPipeline.endStream()
+            } catch {
+                log.error("RX audio could not finish after disconnect: \(error.displayMessage)")
+                rxPipeline.startStream()
+            }
             finalizeCurrentStream(reason: reasonText)
             if !wasUserInitiated {
                 NotificationManager.shared.reflectorDisconnected(reason: reasonText)
@@ -453,8 +461,14 @@ public final class ReflectorCoordinator: ReflectorObserver {
                 s.framesReceived &+= 1
                 currentStream = s
             }
-            let pcm = rxPipeline.pushVoice(seq: seq, voiceBytes: voiceBytes)
-            audioPlayer.enqueue(pcm)
+            do {
+                let pcm = try rxPipeline.pushVoice(seq: seq, voiceBytes: voiceBytes)
+                audioPlayer.enqueue(pcm)
+            } catch {
+                let detail = "RX audio frame was rejected: \(error.displayMessage)"
+                lastError = detail
+                log.error("\(detail)")
+            }
 
         case .slowDataUpdate(let streamId, let text, let position):
             if var s = currentStream, s.id == streamId {
@@ -464,22 +478,29 @@ public final class ReflectorCoordinator: ReflectorObserver {
             }
 
         case .voiceEnd(let streamId, let reason, let text, let position):
-            let streamEnd = rxPipeline.endStream()
-            audioPlayer.enqueue(streamEnd.tailPcm)
-            lastStreamStats = streamEnd.stats
-            if let s = currentStream, s.id == streamId {
-                // Prefer the authoritative values carried on VoiceEnd;
-                // fall back to whatever the snapshot last saw.
-                var endReason = reason.displayText
-                if streamEnd.stats.lost > 0 {
-                    endReason += " · \(streamEnd.stats.lost) lost"
+            do {
+                let streamEnd = try rxPipeline.endStream()
+                audioPlayer.enqueue(streamEnd.tailPcm)
+                lastStreamStats = streamEnd.stats
+                if let s = currentStream, s.id == streamId {
+                    // Prefer the authoritative values carried on VoiceEnd;
+                    // fall back to whatever the snapshot last saw.
+                    var endReason = reason.displayText
+                    if streamEnd.stats.lost > 0 {
+                        endReason += " · \(streamEnd.stats.lost) lost"
+                    }
+                    appendHeard(
+                        from: s,
+                        endReason: endReason,
+                        text: text ?? s.latestText,
+                        position: position ?? s.latestPosition
+                    )
                 }
-                appendHeard(
-                    from: s,
-                    endReason: endReason,
-                    text: text ?? s.latestText,
-                    position: position ?? s.latestPosition
-                )
+            } catch {
+                lastError = "RX audio could not finish: \(error.displayMessage)"
+                lastStreamStats = nil
+                finalizeCurrentStream(reason: "audio processing failed")
+                rxPipeline.startStream()
             }
             currentStream = nil
 

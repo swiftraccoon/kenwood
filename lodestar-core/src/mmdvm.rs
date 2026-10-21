@@ -5,7 +5,8 @@
 //!
 //! The TH-D75 in Reflector Terminal Mode (Menu 650 = 1) speaks MMDVM
 //! binary framing on its BT/USB channel rather than CAT ASCII. The
-//! wire format is `[0xE0, len, cmd, payload...]`. This module exposes
+//! short wire format is `[0xE0, len, cmd, payload...]`; extended frames use
+//! `[0xE0, 0, total_length_minus_255, cmd, payload...]`. This module exposes
 //! the minimum FFI surface Lodestar needs to:
 //!
 //! - Build MMDVM frames (for example, `GetVersion` for mode probing and
@@ -17,8 +18,9 @@
 //! Heavy lifting lives in the `mmdvm-core` crate; this module is a
 //! thin `UniFFI` wrapper.
 
-use mmdvm_core::frame::{MmdvmFrame as CoreFrame, decode_frame, encode_frame};
-use mmdvm_core::{MMDVM_FRAME_START, MMDVM_GET_VERSION, VersionResponse as CoreVersionResponse};
+use mmdvm_core::{
+    Command, MMDVM_FRAME_START, MmdvmFrame as CoreFrame, VersionResponse as CoreVersionResponse,
+};
 use thiserror::Error;
 
 /// The MMDVM frame-start byte (`0xE0`).
@@ -28,27 +30,19 @@ use thiserror::Error;
 pub const MMDVM_START_BYTE: u8 = MMDVM_FRAME_START;
 
 /// MMDVM `GetVersion` command byte (`0x00`).
-pub const MMDVM_CMD_GET_VERSION: u8 = MMDVM_GET_VERSION;
+pub const MMDVM_CMD_GET_VERSION: u8 = Command::GET_VERSION.get();
 
 /// Errors surfaced by the MMDVM primitives.
 #[derive(Debug, Clone, Error, PartialEq, Eq, uniffi::Error)]
 #[non_exhaustive]
 pub enum MmdvmFrameError {
-    /// Payload is longer than a single-byte length field can address.
+    /// Payload exceeds the extended frame's 506-byte capacity.
     #[error("payload too large: {len} bytes (max {max})")]
     PayloadTooLarge {
         /// Supplied payload length.
         len: u32,
-        /// Maximum payload length (252).
+        /// Maximum payload length (506).
         max: u32,
-    },
-    /// Decoder consumed bytes but the frame is still incomplete.
-    #[error("need more bytes to complete the frame (have {got}, need {need})")]
-    Incomplete {
-        /// Bytes present in the buffer so far.
-        got: u32,
-        /// Minimum bytes required for the current in-progress frame.
-        need: u32,
     },
     /// Length byte was below the 3-byte minimum.
     #[error("length byte {got} below minimum 3")]
@@ -65,6 +59,12 @@ pub enum MmdvmFrameError {
     /// `GetVersion` payload was not a proved protocol v1/v2 response.
     #[error("invalid MMDVM GetVersion response payload")]
     InvalidVersionResponse,
+    /// A codec failure outside the framing and version categories above.
+    #[error("MMDVM codec failed: {message}")]
+    Codec {
+        /// Original codec error description.
+        message: String,
+    },
 }
 
 impl From<mmdvm_core::MmdvmError> for MmdvmFrameError {
@@ -72,45 +72,86 @@ impl From<mmdvm_core::MmdvmError> for MmdvmFrameError {
         match err {
             mmdvm_core::MmdvmError::PayloadTooLarge { len } => Self::PayloadTooLarge {
                 len: u32::try_from(len).unwrap_or(u32::MAX),
-                max: u32::try_from(mmdvm_core::frame::MAX_PAYLOAD_LEN).unwrap_or(u32::MAX),
+                max: u32::try_from(mmdvm_core::MAX_PAYLOAD_LEN).unwrap_or(u32::MAX),
             },
             mmdvm_core::MmdvmError::InvalidLength { len } => Self::ShortLength {
                 got: u32::from(len),
             },
             mmdvm_core::MmdvmError::InvalidStartByte { got } => Self::BadStart { actual: got },
-            mmdvm_core::MmdvmError::InvalidVersionResponse => Self::InvalidVersionResponse,
-            // Response-parsing errors (wrong status layout, version
-            // payload) aren't reachable from `encode_frame` or
-            // `decode_frame`, but enum is `#[non_exhaustive]` so cover them.
-            _ => Self::BadStart { actual: 0 },
+            mmdvm_core::MmdvmError::InvalidVersionResponse
+            | mmdvm_core::MmdvmError::UnsupportedProtocolVersion { .. }
+            | mmdvm_core::MmdvmError::InvalidVersionText { .. }
+            | mmdvm_core::MmdvmError::VersionDescriptionControl { .. } => {
+                Self::InvalidVersionResponse
+            }
+            error => Self::Codec {
+                message: error.to_string(),
+            },
         }
     }
 }
 
-/// FFI-friendly mirror of [`mmdvm_core::frame::MmdvmFrame`].
+/// FFI frame fields, checked when encoding or converting to [`mmdvm_core::MmdvmFrame`].
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct MmdvmFrame {
     /// MMDVM command / response byte.
     pub command: u8,
-    /// Payload bytes (0-252 bytes).
+    /// Candidate payload bytes; encoding admits at most 506 bytes.
     pub payload: Vec<u8>,
+}
+
+impl MmdvmFrame {
+    /// Validate and encode this foreign candidate using short or extended framing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MmdvmFrameError::PayloadTooLarge`] above 506 payload bytes.
+    pub fn encode(self) -> Result<Vec<u8>, MmdvmFrameError> {
+        Ok(CoreFrame::try_from(self)?.to_bytes())
+    }
+
+    /// Decode one frame at the beginning of a borrowed buffer.
+    ///
+    /// A partial frame returns no frame and zero consumed bytes. Complete
+    /// decoding leaves trailing bytes for the caller's next invocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MmdvmFrameError::BadStart`] without `0xE0`, or
+    /// [`MmdvmFrameError::ShortLength`] for an invalid total length.
+    pub fn decode(bytes: &[u8]) -> Result<MmdvmDecodeResult, MmdvmFrameError> {
+        match CoreFrame::from_bytes(bytes)? {
+            Some((frame, consumed)) => Ok(MmdvmDecodeResult {
+                frame: Some(frame.into()),
+                bytes_consumed: u32::try_from(consumed).unwrap_or(u32::MAX),
+            }),
+            None => Ok(MmdvmDecodeResult {
+                frame: None,
+                bytes_consumed: 0,
+            }),
+        }
+    }
 }
 
 impl From<CoreFrame> for MmdvmFrame {
     fn from(f: CoreFrame) -> Self {
         Self {
-            command: f.command,
-            payload: f.payload,
+            command: f.command().get(),
+            payload: f.into_payload(),
         }
     }
 }
 
-impl From<MmdvmFrame> for CoreFrame {
-    fn from(f: MmdvmFrame) -> Self {
-        Self {
-            command: f.command,
-            payload: f.payload,
-        }
+impl TryFrom<MmdvmFrame> for CoreFrame {
+    type Error = mmdvm_core::MmdvmError;
+
+    /// Validate the candidate payload through [`CoreFrame::with_payload`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`mmdvm_core::MmdvmError::PayloadTooLarge`] above 506 bytes.
+    fn try_from(f: MmdvmFrame) -> Result<Self, Self::Error> {
+        Self::with_payload(Command::from(f.command), f.payload)
     }
 }
 
@@ -118,37 +159,80 @@ impl From<MmdvmFrame> for CoreFrame {
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct MmdvmDecodeResult {
     /// The decoded frame, if one was complete at the start of the buffer.
-    pub frame: Option<MmdvmFrame>,
+    frame: Option<MmdvmFrame>,
     /// Number of bytes consumed. `0` means the buffer holds a partial
     /// frame; the caller should keep accumulating and try again.
-    pub bytes_consumed: u32,
+    bytes_consumed: u32,
+}
+
+impl MmdvmDecodeResult {
+    /// Borrow the complete decoded frame, if present.
+    #[must_use]
+    pub const fn frame(&self) -> Option<&MmdvmFrame> {
+        self.frame.as_ref()
+    }
+    /// Bytes belonging to the complete frame, or zero for incomplete input.
+    #[must_use]
+    pub const fn bytes_consumed(&self) -> u32 {
+        self.bytes_consumed
+    }
 }
 
 /// Proved protocol and description from an MMDVM `GetVersion` payload.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct MmdvmVersionResponse {
     /// MMDVM protocol version. Lodestar accepts only version 1 or 2.
-    pub protocol: u8,
+    protocol: u8,
     /// Nonempty modem description supplied by the radio.
-    pub description: String,
+    description: String,
+}
+
+impl MmdvmVersionResponse {
+    /// The proved protocol version, either one or two.
+    #[must_use]
+    pub const fn protocol(&self) -> u8 {
+        self.protocol
+    }
+    /// The nonempty checked description, without trailing padding.
+    #[must_use]
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+
+    /// Parse a supported `GetVersion` payload with a nonempty description.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MmdvmFrameError::InvalidVersionResponse`] for missing fields,
+    /// unsupported protocol, invalid UTF-8, empty text or embedded controls.
+    pub fn parse(payload: &[u8]) -> Result<Self, MmdvmFrameError> {
+        let version = CoreVersionResponse::parse(payload)
+            .map_err(|_| MmdvmFrameError::InvalidVersionResponse)?;
+        if version.description().is_empty() {
+            return Err(MmdvmFrameError::InvalidVersionResponse);
+        }
+        Ok(Self {
+            protocol: version.protocol().get(),
+            description: version.into_description(),
+        })
+    }
 }
 
 /// Build the 3-byte `GetVersion` probe frame: `[0xE0, 0x03, 0x00]`.
 #[must_use]
 #[uniffi::export]
 pub fn mmdvm_get_version_probe() -> Vec<u8> {
-    vec![MMDVM_FRAME_START, 0x03, MMDVM_GET_VERSION]
+    CoreFrame::new(Command::GET_VERSION).to_bytes()
 }
 
 /// Build any MMDVM frame.
 ///
 /// # Errors
 ///
-/// - [`MmdvmFrameError::PayloadTooLarge`] if `payload.len() > 252`.
+/// - [`MmdvmFrameError::PayloadTooLarge`] if `payload.len() > 506`.
 #[uniffi::export]
 pub fn build_mmdvm_frame(command: u8, payload: Vec<u8>) -> Result<Vec<u8>, MmdvmFrameError> {
-    let frame = CoreFrame { command, payload };
-    encode_frame(&frame).map_err(MmdvmFrameError::from)
+    MmdvmFrame { command, payload }.encode()
 }
 
 /// Decode one MMDVM frame from the start of `bytes`.
@@ -160,23 +244,15 @@ pub fn build_mmdvm_frame(command: u8, payload: Vec<u8>) -> Result<Vec<u8>, Mmdvm
 /// # Errors
 ///
 /// - [`MmdvmFrameError::BadStart`] if the first byte isn't `0xE0`.
-/// - [`MmdvmFrameError::ShortLength`] if the length byte is below 3.
+/// - [`MmdvmFrameError::ShortLength`] if the length byte is 1 or 2.
+///   Zero starts an extended header.
 #[expect(
     clippy::needless_pass_by_value,
     reason = "UniFFI FFI boundary: `sequence<u8>` in UDL maps to owned `Vec<u8>`."
 )]
 #[uniffi::export]
 pub fn decode_mmdvm_bytes(bytes: Vec<u8>) -> Result<MmdvmDecodeResult, MmdvmFrameError> {
-    match decode_frame(&bytes)? {
-        Some((frame, consumed)) => Ok(MmdvmDecodeResult {
-            frame: Some(frame.into()),
-            bytes_consumed: u32::try_from(consumed).unwrap_or(u32::MAX),
-        }),
-        None => Ok(MmdvmDecodeResult {
-            frame: None,
-            bytes_consumed: 0,
-        }),
-    }
+    MmdvmFrame::decode(&bytes)
 }
 
 /// Parse and validate one MMDVM `GetVersion` response payload.
@@ -188,7 +264,8 @@ pub fn decode_mmdvm_bytes(bytes: Vec<u8>) -> Result<MmdvmDecodeResult, MmdvmFram
 /// # Errors
 ///
 /// Returns [`MmdvmFrameError::InvalidVersionResponse`] for an empty,
-/// truncated, unsupported, or description-free payload.
+/// truncated, unsupported, description-free or invalid UTF-8 payload, or a
+/// description containing a control character before its trailing padding.
 #[expect(
     clippy::needless_pass_by_value,
     reason = "UniFFI FFI boundary: `sequence<u8>` in UDL maps to owned `Vec<u8>`."
@@ -197,15 +274,7 @@ pub fn decode_mmdvm_bytes(bytes: Vec<u8>) -> Result<MmdvmDecodeResult, MmdvmFram
 pub fn parse_mmdvm_version_payload(
     payload: Vec<u8>,
 ) -> Result<MmdvmVersionResponse, MmdvmFrameError> {
-    let version = CoreVersionResponse::parse(&payload)
-        .map_err(|_| MmdvmFrameError::InvalidVersionResponse)?;
-    if !matches!(version.protocol, 1 | 2) || version.description.is_empty() {
-        return Err(MmdvmFrameError::InvalidVersionResponse);
-    }
-    Ok(MmdvmVersionResponse {
-        protocol: version.protocol,
-        description: version.description,
-    })
+    MmdvmVersionResponse::parse(&payload)
 }
 
 #[cfg(test)]
@@ -240,15 +309,30 @@ mod tests {
 
     #[test]
     fn build_frame_rejects_oversize() {
-        let big = vec![0u8; 300];
+        let big = vec![0u8; 507];
         let result = build_mmdvm_frame(0x10, big);
         assert!(
             matches!(
                 result,
-                Err(MmdvmFrameError::PayloadTooLarge { len: 300, .. })
+                Err(MmdvmFrameError::PayloadTooLarge { len: 507, max: 506 })
             ),
             "got {result:?}"
         );
+    }
+
+    #[test]
+    fn extended_frames_round_trip_across_the_ffi_boundary() -> TestResult {
+        for length in [252, 253, 506] {
+            let payload = vec![0xA5; length];
+            let wire = build_mmdvm_frame(0x65, payload.clone())?;
+            let expected_header = if length == 252 { 3 } else { 4 };
+            assert_eq!(wire.len(), payload.len() + expected_header);
+            let decoded = decode_mmdvm_bytes(wire)?;
+            let frame = decoded.frame.ok_or("extended frame missing")?;
+            assert_eq!(frame.command, 0x65);
+            assert_eq!(frame.payload, payload);
+        }
+        Ok(())
     }
 
     #[test]
