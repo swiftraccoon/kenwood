@@ -1,13 +1,14 @@
 //! Numerically controlled oscillator.
 
-use crate::Complex32;
+use crate::{Complex32, Frequency, SampleRate};
 
 /// Complex oscillator with an `f64` phase accumulator.
 ///
 /// The accumulator stays in `f64` so phase error does not build up
-/// over long runs, and phase is wrapped to `(-PI, PI]` every sample so
+/// over long runs, and phase is wrapped to `[-PI, PI]` every sample so
 /// the trigonometric argument never grows. Samples are emitted as
 /// unit-magnitude [`Complex32`] values.
+/// See the [standalone stages example](crate#use-standalone-stages).
 #[derive(Debug, Clone)]
 pub struct Nco {
     phase: f64,
@@ -15,18 +16,22 @@ pub struct Nco {
 }
 
 impl Nco {
-    /// Create an oscillator emitting `freq_hz` at `sample_rate` samples
-    /// per second. Negative frequencies rotate clockwise (used for
-    /// down-mixing an IF to baseband).
+    /// Create a zero-phase oscillator with a finite signed frequency.
+    ///
+    /// Frequencies are reduced modulo the sample rate before division,
+    /// including frequencies beyond Nyquist. Negative frequencies rotate
+    /// clockwise, as used to mix an IF down to baseband.
     #[must_use]
-    pub const fn new(freq_hz: f64, sample_rate: f64) -> Self {
-        Self {
-            phase: 0.0,
-            step: std::f64::consts::TAU * freq_hz / sample_rate,
+    pub fn new(frequency: Frequency, sample_rate: SampleRate) -> Self {
+        let rate = f64::from(sample_rate.get());
+        let mut step = std::f64::consts::TAU * (frequency.get().rem_euclid(rate) / rate);
+        if step > std::f64::consts::PI {
+            step -= std::f64::consts::TAU;
         }
+        Self { phase: 0.0, step }
     }
 
-    /// Next unit-magnitude sample.
+    /// Return the current unit-magnitude sample, then advance the phase.
     #[expect(
         clippy::cast_possible_truncation,
         reason = "sin/cos of a wrapped phase are within [-1, 1]; narrowing \
@@ -49,9 +54,15 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn to_test_err<E: std::fmt::Debug>(error: E) -> TestCaseError {
+        TestCaseError::fail(format!("{error:?}"))
+    }
+
     #[test]
-    fn matches_reference_cosine_over_long_run() {
-        let mut nco = Nco::new(1_000.0, 48_000.0);
+    fn matches_reference_cosine_over_long_run() -> TestResult {
+        let mut nco = Nco::new(Frequency::new(1_000.0)?, SampleRate::new(48_000.0)?);
         for n in 0_u32..100_000 {
             let s = nco.next_sample();
             let ref_phase = std::f64::consts::TAU * 1_000.0 * f64::from(n) / 48_000.0;
@@ -66,6 +77,7 @@ mod tests {
                 "sample {n} diverged: got {s:?}, expected ({rc}, {rs})"
             );
         }
+        Ok(())
     }
 
     proptest! {
@@ -74,7 +86,7 @@ mod tests {
             freq in -20_000.0_f64..20_000.0,
             steps in 1_usize..2_000,
         ) {
-            let mut nco = Nco::new(freq, 48_000.0);
+            let mut nco = Nco::new(Frequency::new(freq).map_err(to_test_err)?, SampleRate::new(48_000.0).map_err(to_test_err)?);
             let expected_step = std::f64::consts::TAU * freq / 48_000.0;
             let mut prev = nco.next_sample();
             for _ in 0..steps {
@@ -93,5 +105,25 @@ mod tests {
                 prev = cur;
             }
         }
+    }
+
+    #[test]
+    fn extreme_finite_aliases_keep_a_bounded_unit_oscillator() -> TestResult {
+        for frequency in [f64::MAX, -f64::MAX, 0.0] {
+            let mut nco = Nco::new(
+                Frequency::new(frequency)?,
+                SampleRate::new(f32::from_bits(1))?,
+            );
+            for _ in 0..100 {
+                let sample = nco.next_sample();
+                assert!(
+                    sample.re.is_finite() && sample.im.is_finite(),
+                    "frequency {frequency}"
+                );
+                assert!((sample.norm() - 1.0).abs() < 1e-6, "unit magnitude");
+                assert!(nco.phase.abs() <= std::f64::consts::PI, "bounded phase");
+            }
+        }
+        Ok(())
     }
 }

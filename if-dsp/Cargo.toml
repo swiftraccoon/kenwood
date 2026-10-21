@@ -1,15 +1,15 @@
 [package]
 name = "if-dsp"
 version = "0.1.0"
-edition = "2024"
-rust-version = "1.94"
-description = "Sans-io DSP for a 12 kHz low-IF audio stream: mixing, filtering, SSB/CW/AM demodulation, AGC, spectrum estimation"
-license = "GPL-2.0-or-later"
 authors = ["swiftraccoon"]
-repository = "https://github.com/swiftraccoon/kenwood"
-keywords = ["dsp", "sdr", "ssb", "ham-radio", "amateur-radio"]
 categories = ["multimedia::audio", "science"]
+edition = "2024"
+keywords = ["dsp", "sdr", "ssb", "ham-radio", "amateur-radio"]
+license = "GPL-2.0-or-later"
 publish = false
+repository = "https://github.com/swiftraccoon/kenwood"
+rust-version = "1.94"
+description = "Sans-io filtering and demodulation for low-IF audio streams"
 
 [dependencies]
 rustfft = "6"
