@@ -24,6 +24,7 @@
 
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
 use ax25_codec::{
@@ -31,7 +32,8 @@ use ax25_codec::{
 };
 
 #[cfg(test)]
-use ax25_codec::{Ax25Control, CommandResponse};
+use ax25_codec::{Ax25Control, Ax25Header, CommandResponse, PollFinal};
+use thiserror::Error;
 
 use crate::error::AprsError;
 
@@ -49,6 +51,129 @@ pub const DEFAULT_DEDUP_TTL: Duration = Duration::from_secs(30);
 /// actually relays the packet within the window, the local pending
 /// relay is cancelled. Disabled (0) by default.
 pub const DEFAULT_VISCOUS_DELAY: Duration = Duration::from_secs(0);
+
+/// The bounded runtime collection that refused a digipeater operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DigipeaterQueue {
+    /// Recently relayed identities, including reservations for pending relays.
+    Dedup,
+    /// Relay frames waiting for the viscous-delay window.
+    Viscous,
+}
+
+impl std::fmt::Display for DigipeaterQueue {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Dedup => "deduplication identities",
+            Self::Viscous => "pending viscous relays",
+        })
+    }
+}
+
+/// A proposed capacity was smaller than the state already retained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("{queue} retains {retained} entries, exceeding proposed capacity {requested}")]
+pub struct DigipeaterCapacityError {
+    queue: DigipeaterQueue,
+    retained: usize,
+    requested: NonZeroUsize,
+}
+
+impl DigipeaterCapacityError {
+    /// Return the collection whose retained entries prevented the change.
+    #[must_use]
+    pub const fn queue(self) -> DigipeaterQueue {
+        self.queue
+    }
+    /// Return the number of retained entries or reserved identity slots.
+    #[must_use]
+    pub const fn retained(self) -> usize {
+        self.retained
+    }
+    /// Return the proposed entry capacity.
+    #[must_use]
+    pub const fn requested(self) -> NonZeroUsize {
+        self.requested
+    }
+}
+
+/// Nonzero host memory limits for a digipeater's retained runtime state.
+///
+/// The default allows 1024 deduplication identities and 128 pending relays.
+/// These are library resource policies, independent of radio menu settings.
+/// Every pending relay reserves a deduplication identity slot, including when
+/// deduplication is disabled, so draining a queue never evicts another entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DigipeaterLimits {
+    dedup_entries: NonZeroUsize,
+    pending_relays: NonZeroUsize,
+}
+
+impl DigipeaterLimits {
+    /// Default host policy: 1024 identities and 128 pending relays.
+    pub const DEFAULT: Self = Self {
+        dedup_entries: NonZeroUsize::new(1024).unwrap(),
+        pending_relays: NonZeroUsize::new(128).unwrap(),
+    };
+
+    /// Set the deduplication identity capacity with the default pending limit.
+    #[must_use]
+    pub const fn new(dedup_entries: NonZeroUsize) -> Self {
+        Self {
+            dedup_entries,
+            pending_relays: Self::DEFAULT.pending_relays,
+        }
+    }
+    /// Set the pending-relay capacity.
+    ///
+    /// Pending relays also remain subject to the deduplication capacity.
+    #[must_use]
+    pub const fn with_pending_relays(mut self, pending_relays: NonZeroUsize) -> Self {
+        self.pending_relays = pending_relays;
+        self
+    }
+    /// Return the deduplication identity capacity.
+    #[must_use]
+    pub const fn dedup_entries(self) -> NonZeroUsize {
+        self.dedup_entries
+    }
+    /// Return the pending-relay capacity.
+    #[must_use]
+    pub const fn pending_relays(self) -> NonZeroUsize {
+        self.pending_relays
+    }
+}
+
+impl Default for DigipeaterLimits {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// Why a New-N digipeater alias base was rejected.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum DigipeaterAliasError {
+    /// The base contained no bytes.
+    #[error("alias base must not be empty")]
+    Empty,
+    /// A byte was outside the case-insensitive ASCII letter/digit domain.
+    #[error("invalid alias byte {byte:#04x} at index {index}")]
+    InvalidByte {
+        /// Zero-based byte offset.
+        index: usize,
+        /// Rejected byte.
+        byte: u8,
+    },
+    /// The base failed AX.25 callsign validation.
+    #[error("invalid AX.25 alias base: {0}")]
+    Callsign(#[source] ax25_codec::Ax25Error),
+    /// The base left no byte for the requested-hop digit.
+    #[error("alias base must contain at most five bytes (got {bytes})")]
+    TooLong {
+        /// Rejected byte count.
+        bytes: usize,
+    },
+}
 
 /// A typed digipeater alias.
 ///
@@ -74,18 +199,34 @@ impl DigipeaterAlias {
     /// longer than five bytes, or contains anything other than ASCII letters
     /// and digits. Five bytes is the maximum because a New-N path callsign
     /// appends one requested-hop digit within AX.25's six-byte field.
-    pub fn new(s: &str) -> Result<Self, AprsError> {
-        let callsign = Callsign::new_case_insensitive(s).map_err(|_| {
-            AprsError::InvalidDigipeaterAlias(
-                "must be 1-5 ASCII letters or digits without an SSID suffix",
-            )
-        })?;
-        if callsign.len() > Self::MAX_LEN {
+    pub fn new(value: &str) -> Result<Self, AprsError> {
+        Self::validate(value)?;
+        Self::try_from(value.to_owned())
+    }
+
+    fn validate(candidate: &str) -> Result<(), AprsError> {
+        if candidate.is_empty() {
             return Err(AprsError::InvalidDigipeaterAlias(
-                "must leave room for the New-N hop digit (maximum 5 bytes)",
+                DigipeaterAliasError::Empty,
             ));
         }
-        Ok(Self(callsign))
+        if candidate.len() > Self::MAX_LEN {
+            return Err(AprsError::InvalidDigipeaterAlias(
+                DigipeaterAliasError::TooLong {
+                    bytes: candidate.len(),
+                },
+            ));
+        }
+        if let Some((index, byte)) = candidate
+            .bytes()
+            .enumerate()
+            .find(|(_, byte)| !byte.is_ascii_alphanumeric())
+        {
+            return Err(AprsError::InvalidDigipeaterAlias(
+                DigipeaterAliasError::InvalidByte { index, byte },
+            ));
+        }
+        Ok(())
     }
 
     /// Return the alias as a string slice.
@@ -107,9 +248,57 @@ impl std::fmt::Display for DigipeaterAlias {
     }
 }
 
+impl AsRef<str> for DigipeaterAlias {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::str::FromStr for DigipeaterAlias {
+    type Err = AprsError;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<&str> for DigipeaterAlias {
+    type Error = AprsError;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<String> for DigipeaterAlias {
+    type Error = AprsError;
+    fn try_from(mut value: String) -> Result<Self, Self::Error> {
+        Self::validate(&value)?;
+        value.make_ascii_uppercase();
+        Callsign::try_from(value).map(Self).map_err(|source| {
+            AprsError::InvalidDigipeaterAlias(DigipeaterAliasError::Callsign(source))
+        })
+    }
+}
+
+impl From<DigipeaterAlias> for String {
+    fn from(alias: DigipeaterAlias) -> Self {
+        alias.0.into()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
+
+/// Named alias families consumed by [`DigipeaterConfig::new`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DigipeaterAliases {
+    /// Exact path addresses handled by `UIdigipeat`.
+    pub uidigipeat: Vec<Ax25Address>,
+    /// Optional New-N base handled by `UIflood`.
+    pub uiflood: Option<DigipeaterAlias>,
+    /// Optional New-N base handled by `UItrace`.
+    pub uitrace: Option<DigipeaterAlias>,
+}
 
 /// Digipeater configuration.
 ///
@@ -118,6 +307,7 @@ impl std::fmt::Display for DigipeaterAlias {
 /// packets seen more than once within [`DigipeaterConfig::dedup_ttl`].
 #[derive(Debug, Clone)]
 pub struct DigipeaterConfig {
+    limits: DigipeaterLimits,
     /// Local callsign (used for `UIdigipeat` and `UItrace` path insertion).
     callsign: Ax25Address,
     /// Exact `UIdigipeat` addresses (e.g., `WIDE1-1`). Relay if the path
@@ -163,23 +353,56 @@ pub struct DigipeaterConfig {
 impl DigipeaterConfig {
     /// Build a new config with empty runtime caches and default timing.
     #[must_use]
-    pub fn new(
-        callsign: Ax25Address,
-        uidigipeat_aliases: Vec<Ax25Address>,
-        uiflood_alias: Option<DigipeaterAlias>,
-        uitrace_alias: Option<DigipeaterAlias>,
-    ) -> Self {
+    pub fn new(callsign: Ax25Address, aliases: DigipeaterAliases) -> Self {
         Self {
+            limits: DigipeaterLimits::default(),
             callsign,
-            uidigipeat_aliases,
-            uiflood_alias,
-            uitrace_alias,
+            uidigipeat_aliases: aliases.uidigipeat,
+            uiflood_alias: aliases.uiflood,
+            uitrace_alias: aliases.uitrace,
             dedup_ttl: DEFAULT_DEDUP_TTL,
             viscous_delay: DEFAULT_VISCOUS_DELAY,
             dedup_cache: HashMap::new(),
             last_prune: None,
             pending_viscous: HashMap::new(),
         }
+    }
+
+    /// Return the current runtime entry capacities.
+    #[must_use]
+    pub const fn limits(&self) -> DigipeaterLimits {
+        self.limits
+    }
+
+    /// Change runtime capacities while preserving every retained entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DigipeaterCapacityError`] when a capacity is smaller than
+    /// the retained state. A rejected change preserves both limits and queues.
+    pub fn set_limits(&mut self, limits: DigipeaterLimits) -> Result<(), DigipeaterCapacityError> {
+        let dedup_retained = self
+            .dedup_cache
+            .len()
+            .saturating_add(self.pending_viscous.len());
+        for (queue, retained, requested) in [
+            (DigipeaterQueue::Dedup, dedup_retained, limits.dedup_entries),
+            (
+                DigipeaterQueue::Viscous,
+                self.pending_viscous.len(),
+                limits.pending_relays,
+            ),
+        ] {
+            if retained > requested.get() {
+                return Err(DigipeaterCapacityError {
+                    queue,
+                    retained,
+                    requested,
+                });
+            }
+        }
+        self.limits = limits;
+        Ok(())
     }
 
     /// Return this station's digipeater address.
@@ -270,7 +493,11 @@ impl DigipeaterConfig {
     ///
     /// The caller provides `now` so this module remains sans-io; pass the
     /// same `Instant` used for the surrounding [`Self::process`] calls.
+    /// Returned frames transfer to the caller, which retains them until its
+    /// chosen transport completes each write. Their deduplication timestamps
+    /// are committed when this method returns them.
     pub fn drain_ready_viscous(&mut self, now: Instant) -> Vec<Ax25Packet> {
+        self.prune_dedup(now);
         let delay = self.viscous_delay;
         let mut ready = Vec::new();
         let mut remaining = HashMap::new();
@@ -301,6 +528,13 @@ impl DigipeaterConfig {
 /// Result of digipeater processing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DigiAction {
+    /// A relay decision exceeded a configured runtime entry capacity.
+    ///
+    /// No relay is returned and existing retained entries are preserved.
+    CapacityExceeded {
+        /// Collection whose configured limit was reached.
+        queue: DigipeaterQueue,
+    },
     /// Do not relay this packet (no alias matched).
     Drop,
     /// The packet was not a UI frame (the control byte does not
@@ -346,7 +580,10 @@ impl DigipeaterConfig {
     /// the same `Instant` to every stateful call in a single loop
     /// iteration keeps timing invariants consistent.
     ///
-    /// Returns [`DigiAction::Drop`] if any check fails or no alias matches.
+    /// A returned relay decision records its deduplication timestamp. The
+    /// caller retains the returned frame before beginning cancellable I/O and
+    /// decides whether to retry a failed transmission. Full queues return
+    /// [`DigiAction::CapacityExceeded`] without evicting existing entries.
     pub fn process(&mut self, packet: &Ax25Packet, now: Instant) -> DigiAction {
         // --- 1. UI frame check ---
         // Typed classification instead of a raw `!= 0x03` compare: UI
@@ -357,15 +594,14 @@ impl DigipeaterConfig {
         }
 
         // --- 2. Own-callsign loop detection ---
-        if own_callsign_already_relayed(&self.callsign, &packet.digipeaters) {
+        if own_callsign_already_relayed(&self.callsign, &packet.header.digipeaters) {
             return DigiAction::LoopDetected;
         }
 
         // --- 3. Dedup check (timestamp-aware), with amortized prune ---
         // The duplicate decision reads the stored relay time directly so it
         // stays correct regardless of when the cache is next swept; the sweep
-        // below is throttled to at most once per `dedup_ttl` purely to bound
-        // memory. An entry counts as a duplicate only while younger than the
+        // below is throttled to at most once per `dedup_ttl`. An entry counts as a duplicate only while younger than the
         // TTL; a stale entry that has not yet been reclaimed is ignored.
         self.prune_dedup(now);
         let packet_hash = hash_packet_identity(packet);
@@ -388,11 +624,16 @@ impl DigipeaterConfig {
         }
 
         // --- 4. First-unused entry alias matching ---
-        let Some(first_unused) = packet.digipeaters.iter().position(|d| !is_used_digi(d)) else {
+        let Some(first_unused) = packet
+            .header
+            .digipeaters
+            .iter()
+            .position(|d| !is_used_digi(d))
+        else {
             return DigiAction::Drop;
         };
 
-        let Some(digi) = packet.digipeaters.get(first_unused) else {
+        let Some(digi) = packet.header.digipeaters.get(first_unused) else {
             // `position` just returned `Some(first_unused)`, so this
             // branch is unreachable; fall through as a drop to preserve
             // the "no relay" invariant without panicking.
@@ -426,26 +667,55 @@ impl DigipeaterConfig {
                 DigiAction::Drop
             };
 
-        // --- 5. Record successful relay in dedup cache ---
-        if let DigiAction::Relay {
-            ref modified_packet,
-        } = action
-        {
-            if !self.viscous_delay.is_zero() {
-                // Defer the relay: hold it in the viscous queue. The
-                // dedup cache is only populated once we actually
-                // transmit (in `drain_ready_viscous`).
-                let _prev = self
-                    .pending_viscous
-                    .insert(packet_hash, (now, modified_packet.clone()));
-                return DigiAction::Drop;
-            }
-            if !self.dedup_ttl.is_zero() {
-                let _previous = self.dedup_cache.insert(packet_hash, now);
-            }
-        }
+        self.record_relay(action, packet_hash, now)
+    }
 
-        action
+    fn record_relay(&mut self, action: DigiAction, packet_hash: u64, now: Instant) -> DigiAction {
+        let DigiAction::Relay { modified_packet } = action else {
+            return action;
+        };
+        if !self.viscous_delay.is_zero() {
+            if self.pending_viscous.len() >= self.limits.pending_relays.get() {
+                return DigiAction::CapacityExceeded {
+                    queue: DigipeaterQueue::Viscous,
+                };
+            }
+            if !self.has_dedup_capacity(now) {
+                return DigiAction::CapacityExceeded {
+                    queue: DigipeaterQueue::Dedup,
+                };
+            }
+            let _previous = self
+                .pending_viscous
+                .insert(packet_hash, (now, modified_packet));
+            return DigiAction::Drop;
+        }
+        if !self.dedup_ttl.is_zero() {
+            if !self.has_dedup_capacity(now) {
+                return DigiAction::CapacityExceeded {
+                    queue: DigipeaterQueue::Dedup,
+                };
+            }
+            let _previous = self.dedup_cache.insert(packet_hash, now);
+        }
+        DigiAction::Relay { modified_packet }
+    }
+
+    fn has_dedup_capacity(&mut self, now: Instant) -> bool {
+        if self
+            .dedup_cache
+            .len()
+            .saturating_add(self.pending_viscous.len())
+            < self.limits.dedup_entries.get()
+        {
+            return true;
+        }
+        self.last_prune = None;
+        self.prune_dedup(now);
+        self.dedup_cache
+            .len()
+            .saturating_add(self.pending_viscous.len())
+            < self.limits.dedup_entries.get()
     }
 
     /// Remove dedup entries older than [`Self::dedup_ttl`], at most once per
@@ -493,10 +763,10 @@ impl DigipeaterConfig {
 /// or stored beyond the current process.
 fn hash_packet_identity(packet: &Ax25Packet) -> u64 {
     let mut h = DefaultHasher::new();
-    packet.source.callsign.as_str().hash(&mut h);
-    packet.source.ssid.get().hash(&mut h);
-    packet.destination.callsign.as_str().hash(&mut h);
-    packet.destination.ssid.get().hash(&mut h);
+    packet.header.source.callsign.as_str().hash(&mut h);
+    packet.header.source.ssid.get().hash(&mut h);
+    packet.header.destination.callsign.as_str().hash(&mut h);
+    packet.header.destination.ssid.get().hash(&mut h);
     packet.information().hash(&mut h);
     h.finish()
 }
@@ -518,14 +788,14 @@ fn own_callsign_already_relayed(own: &Ax25Address, path: &DigipeaterPath) -> boo
 /// `UIdigipeat`: replace the alias entry with the local callsign, marked as used.
 fn apply_uidigipeat(callsign: &Ax25Address, packet: &Ax25Packet, idx: usize) -> DigiAction {
     let mut modified = packet.clone();
-    if let Some(slot) = modified.digipeaters.get_mut(idx) {
+    if let Some(slot) = modified.header.digipeaters.get_mut(idx) {
         *slot = RouteEntry {
             address: callsign.clone(),
             has_repeated: true,
         };
     } else {
         // Caller only invokes this with an `idx` produced by `position`
-        // on `packet.digipeaters`, so the slot is always present. If
+        // on `packet.header.digipeaters`, so the slot is always present. If
         // the packet has been mutated in the meantime, prefer a drop
         // over a panic.
         return DigiAction::Drop;
@@ -537,14 +807,14 @@ fn apply_uidigipeat(callsign: &Ax25Address, packet: &Ax25Packet, idx: usize) -> 
 
 /// `UIflood`: decrement the hop count. Mark as used when exhausted.
 fn apply_uiflood(packet: &Ax25Packet, idx: usize) -> DigiAction {
-    let Some(digi) = packet.digipeaters.get(idx) else {
+    let Some(digi) = packet.header.digipeaters.get(idx) else {
         return DigiAction::Drop;
     };
     let new_ssid = digi.address.ssid.saturating_decrement();
     let callsign = digi.address.callsign.clone();
 
     let mut modified = packet.clone();
-    let Some(slot) = modified.digipeaters.get_mut(idx) else {
+    let Some(slot) = modified.header.digipeaters.get_mut(idx) else {
         return DigiAction::Drop;
     };
     if new_ssid == Ssid::ZERO {
@@ -569,14 +839,14 @@ fn apply_uitrace(callsign: &Ax25Address, packet: &Ax25Packet, idx: usize) -> Dig
     // the codec-level maximum (see `ax25_codec::MAX_DIGIPEATERS`, currently
     // 8 per AX.25 v2.0 / Linux `AX25_MAX_DIGIS` convention), we must drop
     // rather than overflow the slot count.
-    if packet.digipeaters.len() >= MAX_DIGIPEATERS {
+    if packet.header.digipeaters.len() >= MAX_DIGIPEATERS {
         return DigiAction::Drop;
     }
 
     // Snapshot the alias digipeater's callsign + current hop count;
-    // after `modified.digipeaters.try_insert` the indices shift and we can
+    // after insertion into `modified.header.digipeaters`, indices shift and we
     // no longer borrow from the original slice without re-indexing.
-    let Some(source_digi) = packet.digipeaters.get(idx) else {
+    let Some(source_digi) = packet.header.digipeaters.get(idx) else {
         return DigiAction::Drop;
     };
     let alias_callsign = source_digi.address.callsign.clone();
@@ -586,6 +856,7 @@ fn apply_uitrace(callsign: &Ax25Address, packet: &Ax25Packet, idx: usize) -> Dig
 
     // Insert our callsign (marked as used) before the current entry.
     if modified
+        .header
         .digipeaters
         .try_insert(
             idx,
@@ -601,7 +872,7 @@ fn apply_uitrace(callsign: &Ax25Address, packet: &Ax25Packet, idx: usize) -> Dig
 
     // The original entry shifted to idx+1; update its hop count.
     let trace_idx = idx + 1;
-    let Some(slot) = modified.digipeaters.get_mut(trace_idx) else {
+    let Some(slot) = modified.header.digipeaters.get_mut(trace_idx) else {
         return DigiAction::Drop;
     };
     if new_ssid == Ssid::ZERO {
@@ -637,7 +908,7 @@ const fn is_used_digi(entry: &RouteEntry) -> bool {
 /// `WIDE`, `CA`), `n` is the *originally requested* hop count baked into the
 /// callsign field, and `N` is the *remaining* hop count carried in the SSID.
 /// Because the trailing `n` digit is part of the AX.25 callsign field, an
-/// on-wire `WIDE2-2` entry decodes (see `ax25_codec::parse_ax25`) to
+/// on-wire `WIDE2-2` entry decodes (see [`Ax25Packet::from_bytes`]) to
 /// `callsign == "WIDE2"`, `ssid == 2`, **not** `callsign == "WIDE"`.
 ///
 /// This returns `true` when `callsign` is either:
@@ -716,12 +987,15 @@ mod tests {
 
     fn make_packet_with_poll_final(digipeaters: Vec<RouteEntry>, poll_final: bool) -> Ax25Packet {
         Ax25Packet::unnumbered_information(
-            make_addr("N0CALL", 7),
-            make_addr("APK005", 0),
-            DigipeaterPath::new(digipeaters)
-                .unwrap_or_else(|_| unreachable!("test fixtures use at most eight digipeaters")),
-            CommandResponse::Command,
-            poll_final,
+            Ax25Header {
+                source: make_addr("N0CALL", 7),
+                destination: make_addr("APK005", 0),
+                digipeaters: DigipeaterPath::new(digipeaters).unwrap_or_else(|_| {
+                    unreachable!("test fixtures use at most eight digipeaters")
+                }),
+                command_response: CommandResponse::Command,
+            },
+            PollFinal::from(poll_final),
             Ax25Pid::NoLayer3,
             b"!3518.00N/08414.00W-test".to_vec(),
         )
@@ -730,9 +1004,11 @@ mod tests {
     fn make_config() -> DigipeaterConfig {
         DigipeaterConfig::new(
             make_addr("MYDIGI", 0),
-            vec![make_addr("WIDE1", 1)],
-            Some(make_alias("CA")),
-            Some(make_alias("WIDE")),
+            DigipeaterAliases {
+                uidigipeat: vec![make_addr("WIDE1", 1)],
+                uiflood: Some(make_alias("CA")),
+                uitrace: Some(make_alias("WIDE")),
+            },
         )
     }
 
@@ -747,6 +1023,7 @@ mod tests {
         match config.process(&packet, t0) {
             DigiAction::Relay { modified_packet } => {
                 let d0 = modified_packet
+                    .header
                     .digipeaters
                     .first()
                     .ok_or("missing digi 0")?;
@@ -754,7 +1031,11 @@ mod tests {
                 assert!(d0.has_repeated);
                 assert_eq!(d0.address.ssid, 0);
                 // Second entry unchanged.
-                let d1 = modified_packet.digipeaters.get(1).ok_or("missing digi 1")?;
+                let d1 = modified_packet
+                    .header
+                    .digipeaters
+                    .get(1)
+                    .ok_or("missing digi 1")?;
                 assert_eq!(d1.address.callsign, "WIDE2");
                 assert_eq!(d1.address.ssid, 1);
             }
@@ -773,13 +1054,18 @@ mod tests {
             DigiAction::Relay { modified_packet } => {
                 // First entry untouched (already used).
                 let d0 = modified_packet
+                    .header
                     .digipeaters
                     .first()
                     .ok_or("missing digi 0")?;
                 assert_eq!(d0.address.callsign, "N1ABC");
                 assert!(d0.has_repeated);
                 // Second entry replaced.
-                let d1 = modified_packet.digipeaters.get(1).ok_or("missing digi 1")?;
+                let d1 = modified_packet
+                    .header
+                    .digipeaters
+                    .get(1)
+                    .ok_or("missing digi 1")?;
                 assert_eq!(d1.address.callsign, "MYDIGI");
                 assert!(d1.has_repeated);
             }
@@ -801,9 +1087,10 @@ mod tests {
     fn uidigipeat_requires_an_exact_address_match() {
         let mut config = DigipeaterConfig::new(
             make_addr("MYDIGI", 0),
-            vec![make_addr("WIDE1", 1)],
-            None,
-            None,
+            DigipeaterAliases {
+                uidigipeat: vec![make_addr("WIDE1", 1)],
+                ..DigipeaterAliases::default()
+            },
         );
         let packet = make_packet(vec![make_digi("WIDE1", 2)]);
 
@@ -833,7 +1120,11 @@ mod tests {
 
         match config.process(&packet, t0) {
             DigiAction::Relay { modified_packet } => {
-                let d1 = modified_packet.digipeaters.get(1).ok_or("missing digi 1")?;
+                let d1 = modified_packet
+                    .header
+                    .digipeaters
+                    .get(1)
+                    .ok_or("missing digi 1")?;
                 assert_eq!(d1.address.callsign, "CA");
                 assert_eq!(d1.address.ssid, 2);
             }
@@ -855,16 +1146,18 @@ mod tests {
         info: &[u8],
     ) -> Result<Ax25Packet, Box<dyn std::error::Error>> {
         let packet = Ax25Packet::unnumbered_information(
-            make_addr("N0CALL", 7),
-            make_addr("APK005", 0),
-            DigipeaterPath::new(digipeaters)?,
-            CommandResponse::Command,
-            false,
+            Ax25Header {
+                source: make_addr("N0CALL", 7),
+                destination: make_addr("APK005", 0),
+                digipeaters: DigipeaterPath::new(digipeaters)?,
+                command_response: CommandResponse::Command,
+            },
+            PollFinal::Clear,
             Ax25Pid::NoLayer3,
             info.to_vec(),
         );
-        let bytes = ax25_codec::build_ax25(&packet);
-        let parsed = ax25_codec::parse_ax25(&bytes)?;
+        let bytes = packet.to_bytes();
+        let parsed = Ax25Packet::from_bytes(&bytes)?;
         assert_eq!(parsed, packet, "codec round-trip must be lossless");
         Ok(parsed)
     }
@@ -874,7 +1167,7 @@ mod tests {
         // Sanity-check the on-wire model our matcher relies on: `WIDE2-2`
         // round-trips through the codec to callsign "WIDE2" + ssid 2.
         let packet = parsed_packet(vec![make_digi("WIDE2", 2)], b"!new-n wire")?;
-        let d0 = packet.digipeaters.first().ok_or("missing digi 0")?;
+        let d0 = packet.header.digipeaters.first().ok_or("missing digi 0")?;
         assert_eq!(d0.address.callsign, "WIDE2");
         assert_eq!(d0.address.ssid, 2);
         assert!(!d0.has_repeated);
@@ -895,14 +1188,19 @@ mod tests {
             DigiAction::Relay { modified_packet } => {
                 // UItrace inserts our callsign, then decrements the SSID
                 // (WIDE2-2 -> WIDE2-1) while preserving the "WIDE2" callsign.
-                assert_eq!(modified_packet.digipeaters.len(), 2);
+                assert_eq!(modified_packet.header.digipeaters.len(), 2);
                 let d0 = modified_packet
+                    .header
                     .digipeaters
                     .first()
                     .ok_or("missing digi 0")?;
                 assert_eq!(d0.address.callsign, "MYDIGI");
                 assert!(d0.has_repeated);
-                let d1 = modified_packet.digipeaters.get(1).ok_or("missing digi 1")?;
+                let d1 = modified_packet
+                    .header
+                    .digipeaters
+                    .get(1)
+                    .ok_or("missing digi 1")?;
                 assert_eq!(d1.address.callsign, "WIDE2");
                 assert_eq!(d1.address.ssid, 1);
                 assert!(!d1.has_repeated);
@@ -922,23 +1220,29 @@ mod tests {
         // base so this exclusively exercises the New-N UItrace last hop.
         let mut config = DigipeaterConfig::new(
             make_addr("MYDIGI", 0),
-            vec![],
-            None,
-            Some(make_alias("WIDE")),
+            DigipeaterAliases {
+                uitrace: Some(make_alias("WIDE")),
+                ..DigipeaterAliases::default()
+            },
         );
         let packet = parsed_packet(vec![make_digi("WIDE7", 1)], b"!widen last")?;
         let t0 = Instant::now();
 
         match config.process(&packet, t0) {
             DigiAction::Relay { modified_packet } => {
-                assert_eq!(modified_packet.digipeaters.len(), 2);
+                assert_eq!(modified_packet.header.digipeaters.len(), 2);
                 let d0 = modified_packet
+                    .header
                     .digipeaters
                     .first()
                     .ok_or("missing digi 0")?;
                 assert_eq!(d0.address.callsign, "MYDIGI");
                 assert!(d0.has_repeated);
-                let d1 = modified_packet.digipeaters.get(1).ok_or("missing digi 1")?;
+                let d1 = modified_packet
+                    .header
+                    .digipeaters
+                    .get(1)
+                    .ok_or("missing digi 1")?;
                 assert_eq!(d1.address.callsign, "WIDE7");
                 assert_eq!(d1.address.ssid, 0);
                 assert!(d1.has_repeated);
@@ -959,8 +1263,9 @@ mod tests {
 
         match config.process(&packet, t0) {
             DigiAction::Relay { modified_packet } => {
-                assert_eq!(modified_packet.digipeaters.len(), 1);
+                assert_eq!(modified_packet.header.digipeaters.len(), 1);
                 let d0 = modified_packet
+                    .header
                     .digipeaters
                     .first()
                     .ok_or("missing digi 0")?;
@@ -988,17 +1293,26 @@ mod tests {
         match config.process(&packet, t0) {
             DigiAction::Relay { modified_packet } => {
                 // Our callsign inserted before the (now-used) WIDE2 entry.
-                assert_eq!(modified_packet.digipeaters.len(), 3);
+                assert_eq!(modified_packet.header.digipeaters.len(), 3);
                 let used0 = modified_packet
+                    .header
                     .digipeaters
                     .first()
                     .ok_or("missing digi 0")?;
                 assert_eq!(used0.address.callsign, "WIDE1");
                 assert!(used0.has_repeated);
-                let inserted = modified_packet.digipeaters.get(1).ok_or("missing digi 1")?;
+                let inserted = modified_packet
+                    .header
+                    .digipeaters
+                    .get(1)
+                    .ok_or("missing digi 1")?;
                 assert_eq!(inserted.address.callsign, "MYDIGI");
                 assert!(inserted.has_repeated);
-                let exhausted = modified_packet.digipeaters.get(2).ok_or("missing digi 2")?;
+                let exhausted = modified_packet
+                    .header
+                    .digipeaters
+                    .get(2)
+                    .ok_or("missing digi 2")?;
                 assert_eq!(exhausted.address.callsign, "WIDE2");
                 assert_eq!(exhausted.address.ssid, 0);
                 assert!(exhausted.has_repeated);
@@ -1034,9 +1348,11 @@ mod tests {
         // A `WIDE2-2` entry must not be matched by an unrelated flood base.
         let mut config = DigipeaterConfig::new(
             make_addr("MYDIGI", 0),
-            vec![],
-            Some(make_alias("CA")),   // flood base CA
-            Some(make_alias("GATE")), // trace base GATE
+            DigipeaterAliases {
+                uiflood: Some(make_alias("CA")),
+                uitrace: Some(make_alias("GATE")),
+                ..DigipeaterAliases::default()
+            },
         );
         let packet = make_packet(vec![make_digi("WIDE2", 2)]);
         let t0 = Instant::now();
@@ -1052,6 +1368,7 @@ mod tests {
         match config.process(&packet, t0) {
             DigiAction::Relay { modified_packet } => {
                 let d0 = modified_packet
+                    .header
                     .digipeaters
                     .first()
                     .ok_or("missing digi 0")?;
@@ -1083,9 +1400,10 @@ mod tests {
 
         match config.process(&packet, t0) {
             DigiAction::Relay { modified_packet } => {
-                assert_eq!(modified_packet.digipeaters.len(), 2);
+                assert_eq!(modified_packet.header.digipeaters.len(), 2);
                 // Our callsign inserted first, marked used.
                 let d0 = modified_packet
+                    .header
                     .digipeaters
                     .first()
                     .ok_or("missing digi 0")?;
@@ -1093,7 +1411,11 @@ mod tests {
                 assert!(d0.has_repeated);
                 assert_eq!(d0.address.ssid, 0);
                 // Original entry with decremented hop.
-                let d1 = modified_packet.digipeaters.get(1).ok_or("missing digi 1")?;
+                let d1 = modified_packet
+                    .header
+                    .digipeaters
+                    .get(1)
+                    .ok_or("missing digi 1")?;
                 assert_eq!(d1.address.callsign, "WIDE");
                 assert_eq!(d1.address.ssid, 2);
             }
@@ -1110,14 +1432,19 @@ mod tests {
 
         match config.process(&packet, t0) {
             DigiAction::Relay { modified_packet } => {
-                assert_eq!(modified_packet.digipeaters.len(), 2);
+                assert_eq!(modified_packet.header.digipeaters.len(), 2);
                 let d0 = modified_packet
+                    .header
                     .digipeaters
                     .first()
                     .ok_or("missing digi 0")?;
                 assert_eq!(d0.address.callsign, "MYDIGI");
                 assert!(d0.has_repeated);
-                let d1 = modified_packet.digipeaters.get(1).ok_or("missing digi 1")?;
+                let d1 = modified_packet
+                    .header
+                    .digipeaters
+                    .get(1)
+                    .ok_or("missing digi 1")?;
                 assert_eq!(d1.address.callsign, "WIDE");
                 assert!(d1.has_repeated);
                 assert_eq!(d1.address.ssid, 0);
@@ -1149,16 +1476,8 @@ mod tests {
     fn non_ui_frame_yields_not_ui_frame() {
         let mut config = make_config();
         let ui = make_packet(vec![make_digi("WIDE1", 1)]);
-        let packet = Ax25Packet::try_new(
-            ui.source,
-            ui.destination,
-            ui.digipeaters,
-            ui.command_or_response,
-            Ax25Control::from_byte(0x01),
-            None,
-            Vec::new(),
-        )
-        .unwrap_or_else(|_| unreachable!("RR without PID or information is valid"));
+        let packet = Ax25Packet::new(ui.header, Ax25Control::from_byte(0x01), None, Vec::new())
+            .unwrap_or_else(|_| unreachable!("RR without PID or information is valid"));
         let t0 = Instant::now();
 
         assert_eq!(config.process(&packet, t0), DigiAction::NotUiFrame);
@@ -1195,7 +1514,7 @@ mod tests {
         };
         // Identical path modification; the frame keeps its own control
         // byte on retransmission.
-        assert_eq!(pf_relay.digipeaters, plain_relay.digipeaters);
+        assert_eq!(pf_relay.header.digipeaters, plain_relay.header.digipeaters);
         assert_eq!(pf_relay.control_byte(), 0x13);
         Ok(())
     }
@@ -1247,9 +1566,10 @@ mod tests {
     fn case_insensitive_alias_match() -> TestResult {
         let mut config = DigipeaterConfig::new(
             make_addr("MYDIGI", 0),
-            vec![make_addr("wide1", 1)],
-            None,
-            None,
+            DigipeaterAliases {
+                uidigipeat: vec![make_addr("wide1", 1)],
+                ..DigipeaterAliases::default()
+            },
         );
         let packet = make_packet(vec![make_digi("WIDE1", 1)]);
         let t0 = Instant::now();
@@ -1266,9 +1586,11 @@ mod tests {
         // the correct one should match.
         let mut config = DigipeaterConfig::new(
             make_addr("MYDIGI", 0),
-            vec![],
-            Some(make_alias("CA")),
-            Some(make_alias("WIDE")),
+            DigipeaterAliases {
+                uiflood: Some(make_alias("CA")),
+                uitrace: Some(make_alias("WIDE")),
+                ..DigipeaterAliases::default()
+            },
         );
 
         let t0 = Instant::now();
@@ -1282,8 +1604,9 @@ mod tests {
         match config.process(&flood_pkt, t0) {
             DigiAction::Relay { modified_packet } => {
                 // Should NOT insert callsign (flood, not trace).
-                assert_eq!(modified_packet.digipeaters.len(), 1);
+                assert_eq!(modified_packet.header.digipeaters.len(), 1);
                 let d0 = modified_packet
+                    .header
                     .digipeaters
                     .first()
                     .ok_or("missing digi 0")?;
@@ -1301,7 +1624,7 @@ mod tests {
         match config.process(&trace_pkt, t0) {
             DigiAction::Relay { modified_packet } => {
                 // Should insert callsign (trace).
-                assert_eq!(modified_packet.digipeaters.len(), 2);
+                assert_eq!(modified_packet.header.digipeaters.len(), 2);
             }
             other => return Err(format!("expected trace relay, got {other:?}").into()),
         }
@@ -1309,6 +1632,186 @@ mod tests {
     }
 
     // ---- Dedup cache tests ----
+
+    fn distinct_packet(label: u8) -> Result<Ax25Packet, Box<dyn std::error::Error>> {
+        let mut packet = make_packet(vec![make_digi("WIDE1", 1)]);
+        *packet
+            .information_mut()
+            .ok_or("UI packet must retain information")? = vec![label];
+        Ok(packet)
+    }
+
+    #[test]
+    fn full_dedup_capacity_preserves_entries_and_refuses_new_relays() -> TestResult {
+        let mut config = make_config();
+        let limits = DigipeaterLimits::new(NonZeroUsize::new(2).ok_or("two is nonzero")?);
+        config.set_limits(limits)?;
+        let now = Instant::now();
+        let first = distinct_packet(1)?;
+        let second = distinct_packet(2)?;
+        let third = distinct_packet(3)?;
+        assert!(matches!(
+            config.process(&first, now),
+            DigiAction::Relay { .. }
+        ));
+        assert!(matches!(
+            config.process(&second, now),
+            DigiAction::Relay { .. }
+        ));
+        assert_eq!(
+            config.process(&third, now),
+            DigiAction::CapacityExceeded {
+                queue: DigipeaterQueue::Dedup
+            }
+        );
+        assert_eq!(config.dedup_cache_len(), 2);
+        assert_eq!(config.process(&first, now), DigiAction::Duplicate);
+        let earlier = now
+            .checked_sub(Duration::from_secs(1))
+            .ok_or("one second fits")?;
+        assert_eq!(
+            config.process(&third, earlier),
+            DigiAction::CapacityExceeded {
+                queue: DigipeaterQueue::Dedup
+            }
+        );
+        assert_eq!(config.process(&second, earlier), DigiAction::Duplicate);
+        let result = config.set_limits(DigipeaterLimits::new(NonZeroUsize::MIN));
+        assert!(matches!(
+            result,
+            Err(DigipeaterCapacityError {
+                queue: DigipeaterQueue::Dedup,
+                retained: 2,
+                ..
+            })
+        ));
+        assert_eq!(config.limits(), limits);
+        assert_eq!(config.dedup_cache_len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn pending_relays_reserve_identity_capacity_through_drain() -> TestResult {
+        let mut config = make_config();
+        config.set_viscous_delay(Duration::from_secs(5));
+        let limits = DigipeaterLimits::new(NonZeroUsize::new(2).ok_or("two is nonzero")?)
+            .with_pending_relays(NonZeroUsize::new(3).ok_or("three is nonzero")?);
+        config.set_limits(limits)?;
+        let now = Instant::now();
+        let first = distinct_packet(1)?;
+        let second = distinct_packet(2)?;
+        let third = distinct_packet(3)?;
+        assert_eq!(config.process(&first, now), DigiAction::Drop);
+        assert_eq!(config.process(&second, now), DigiAction::Drop);
+        assert_eq!(
+            config.process(&third, now),
+            DigiAction::CapacityExceeded {
+                queue: DigipeaterQueue::Dedup
+            }
+        );
+        assert_eq!(config.pending_viscous.len(), 2);
+        assert_eq!(config.dedup_cache_len(), 0);
+        assert!(
+            config
+                .set_limits(DigipeaterLimits::new(NonZeroUsize::MIN))
+                .is_err()
+        );
+        let result = config.set_limits(limits.with_pending_relays(NonZeroUsize::MIN));
+        assert!(matches!(
+            result,
+            Err(DigipeaterCapacityError {
+                queue: DigipeaterQueue::Viscous,
+                retained: 2,
+                ..
+            })
+        ));
+        assert_eq!(config.limits(), limits);
+        let earlier = now
+            .checked_sub(Duration::from_secs(1))
+            .ok_or("one second fits")?;
+        assert!(config.drain_ready_viscous(earlier).is_empty());
+        assert_eq!(config.pending_viscous.len(), 2);
+        let ready = config.drain_ready_viscous(now + Duration::from_secs(5));
+        assert_eq!(ready.len(), 2);
+        assert!(
+            ready
+                .iter()
+                .any(|packet| packet.information() == first.information())
+        );
+        assert!(
+            ready
+                .iter()
+                .any(|packet| packet.information() == second.information())
+        );
+        assert_eq!(config.dedup_cache_len(), 2);
+        assert_eq!(
+            config.process(&third, now + Duration::from_secs(5)),
+            DigiAction::CapacityExceeded {
+                queue: DigipeaterQueue::Dedup
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn full_viscous_capacity_preserves_the_first_queued_frame() -> TestResult {
+        let mut config = make_config();
+        config.set_viscous_delay(Duration::from_secs(5));
+        config.set_limits(DigipeaterLimits::default().with_pending_relays(NonZeroUsize::MIN))?;
+        let now = Instant::now();
+        let first = distinct_packet(1)?;
+        assert_eq!(config.process(&first, now), DigiAction::Drop);
+        for label in 2..=100 {
+            assert_eq!(
+                config.process(&distinct_packet(label)?, now),
+                DigiAction::CapacityExceeded {
+                    queue: DigipeaterQueue::Viscous
+                }
+            );
+            assert_eq!(config.pending_viscous.len(), 1);
+        }
+        let ready = config.drain_ready_viscous(now + Duration::from_secs(5));
+        assert_eq!(ready.len(), 1);
+        assert_eq!(
+            ready
+                .first()
+                .ok_or("first queued relay must remain")?
+                .information(),
+            first.information()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn full_capacity_reclaims_expired_entries_before_the_sweep_interval() -> TestResult {
+        let mut config = make_config();
+        config.set_dedup_ttl(Duration::from_secs(10));
+        config.set_limits(DigipeaterLimits::new(
+            NonZeroUsize::new(2).ok_or("two is nonzero")?,
+        ))?;
+        let now = Instant::now();
+        for (label, elapsed) in [(1, 0), (2, 5), (3, 12), (4, 16)] {
+            assert!(matches!(
+                config.process(&distinct_packet(label)?, now + Duration::from_secs(elapsed)),
+                DigiAction::Relay { .. }
+            ));
+        }
+        assert_eq!(config.dedup_cache_len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn owned_alias_normalization_retains_the_allocation() -> TestResult {
+        let input = String::from("wide");
+        let allocation = input.as_ptr();
+        let alias = DigipeaterAlias::try_from(input)?;
+        assert_eq!(alias.as_ref(), "WIDE");
+        assert_eq!(alias.as_ref().as_ptr(), allocation);
+        let output = String::from(alias);
+        assert_eq!(output.as_ptr(), allocation);
+        assert_eq!(output, "WIDE");
+        Ok(())
+    }
 
     #[test]
     fn duplicate_packet_within_window_is_dropped() {
@@ -1553,7 +2056,7 @@ mod tests {
         assert_eq!(ready.len(), 1);
         let p = ready.first().ok_or("missing ready packet")?;
         // Our callsign was inserted by UIdigipeat substitution.
-        let d0 = p.digipeaters.first().ok_or("missing digi 0")?;
+        let d0 = p.header.digipeaters.first().ok_or("missing digi 0")?;
         assert_eq!(d0.address.callsign, "MYDIGI");
         Ok(())
     }
@@ -1584,6 +2087,33 @@ mod tests {
                 Err(AprsError::InvalidDigipeaterAlias(_))
             ));
         }
+    }
+
+    #[test]
+    fn alias_borrowed_and_owned_validation_preserve_typed_reasons() -> TestResult {
+        for (text, expected) in [
+            ("", DigipeaterAliasError::Empty),
+            ("123456", DigipeaterAliasError::TooLong { bytes: 6 }),
+            (
+                "WI_DE",
+                DigipeaterAliasError::InvalidByte {
+                    index: 2,
+                    byte: b'_',
+                },
+            ),
+        ] {
+            assert_eq!(
+                DigipeaterAlias::new(text),
+                Err(AprsError::InvalidDigipeaterAlias(expected.clone()))
+            );
+            assert_eq!(
+                DigipeaterAlias::try_from(text.to_owned()),
+                Err(AprsError::InvalidDigipeaterAlias(expected))
+            );
+        }
+        let alias = DigipeaterAlias::new("wide")?;
+        assert_eq!(alias.as_str(), "WIDE");
+        Ok(())
     }
 
     #[test]

@@ -1,71 +1,28 @@
 //! APRS packet wrapper, data enum, data extensions, and PHG field.
 //!
 //! This module contains the top-level [`AprsData`] enum (one variant per
-//! APRS data type identifier), the [`parse_aprs_data`] dispatcher, and a
+//! APRS data type identifier), the [`AprsData::from_bytes`] dispatcher, and a
 //! handful of shared primitive types: [`AprsDataExtension`], [`Phg`],
-//! [`PhgDirectivity`], [`PositionAmbiguity`], [`ParseContext`],
-//! [`AprsReportTimestamp`], [`TelemetryDefinition`], and [`TelemetryParameters`].
+//! [`PhgDirectivity`], [`PositionAmbiguity`],
+//! [`AprsReportTimestamp`] and [`TelemetryDefinition`].
+//!
+//! Shared workflows cover [packet parsing](crate#packet-construction-and-parsing)
+//! and [telemetry](crate#weather-and-telemetry).
 
 use core::fmt;
 
-use crate::error::AprsError;
-use crate::item::{
-    AprsItem, AprsObject, AprsQuery, parse_aprs_item, parse_aprs_object, parse_aprs_query,
+use crate::error::{AprsError, AprsWireTextField};
+use crate::item::{AprsItem, AprsObject, AprsQuery};
+use crate::message::{AnnouncementLetter, AprsMessage, BulletinGroup, BulletinNumber};
+use crate::position::AprsPosition;
+use crate::status::AprsStatus;
+use crate::telemetry::{
+    AprsTelemetry, TelemetryBits, TelemetryEquationCoefficients, TelemetryLabels,
+    TelemetryProjectTitle,
 };
-use crate::message::{AprsMessage, parse_aprs_message};
-use crate::position::{AprsPosition, parse_aprs_position};
-use crate::status::{AprsStatus, parse_aprs_status};
-use crate::telemetry::{AprsTelemetry, parse_aprs_telemetry};
 use crate::text::decode_wire_ascii;
-use crate::weather::{AprsPositionlessWeatherReport, parse_aprs_weather_positionless};
-
-// ---------------------------------------------------------------------------
-// ParseContext
-// ---------------------------------------------------------------------------
-
-/// Diagnostic context for a parse failure.
-///
-/// Carries the byte offset within the input where the parser stopped,
-/// alongside an error variant. Most parser entry points return the
-/// bare error type for backwards compatibility; use
-/// [`ParseContext::with_error`] to wrap one when richer diagnostics are
-/// useful (e.g. when reporting failures from a fuzz harness or when
-/// logging untrusted wire data).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParseContext<E> {
-    /// Underlying error.
-    pub error: E,
-    /// Byte offset within the input where the parser noticed the
-    /// problem (0 if unknown).
-    pub offset: usize,
-    /// Optional human-readable name for the field that failed.
-    pub field: Option<&'static str>,
-}
-
-impl<E> ParseContext<E> {
-    /// Wrap an error with the given byte offset and optional field name.
-    pub const fn with_error(error: E, offset: usize, field: Option<&'static str>) -> Self {
-        Self {
-            error,
-            offset,
-            field,
-        }
-    }
-}
-
-impl<E: fmt::Display> fmt::Display for ParseContext<E> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(field) = self.field {
-            write!(
-                f,
-                "{} (at byte {} in field {field})",
-                self.error, self.offset
-            )
-        } else {
-            write!(f, "{} (at byte {})", self.error, self.offset)
-        }
-    }
-}
+use crate::units::{Course, Speed};
+use crate::weather::AprsPositionlessWeatherReport;
 
 // ---------------------------------------------------------------------------
 // PositionAmbiguity
@@ -84,7 +41,7 @@ impl<E: fmt::Display> fmt::Display for ParseContext<E> {
 /// | 2     | `4903.  N`            | 1 minute            |
 /// | 3     | `490 .  N`            | 10 minutes          |
 /// | 4     | `49  .  N`            | 1 degree            |
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum PositionAmbiguity {
     /// No ambiguity: full DDMM.HH precision.
     None,
@@ -98,9 +55,81 @@ pub enum PositionAmbiguity {
     FourDigits,
 }
 
+impl PositionAmbiguity {
+    /// Return how many trailing minute digits the report omits.
+    #[must_use]
+    pub const fn masked_digits(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::OneDigit => 1,
+            Self::TwoDigits => 2,
+            Self::ThreeDigits => 3,
+            Self::FourDigits => 4,
+        }
+    }
+    pub(crate) const fn mask_minute_hundredths(self, value: u16) -> u16 {
+        match self {
+            Self::None => value,
+            Self::OneDigit => value / 10 * 10,
+            Self::TwoDigits => value / 100 * 100,
+            Self::ThreeDigits => value / 1000 * 1000,
+            Self::FourDigits => 0,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // AprsReportTimestamp
 // ---------------------------------------------------------------------------
+
+/// Calendar component or wire-shape failure in an APRS timestamp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TimestampError {
+    /// A report timestamp is not exactly seven bytes.
+    ReportLength,
+    /// A positionless-weather timestamp is not exactly eight bytes.
+    WeatherLength,
+    /// A report timestamp lacks the z, slash or h suffix.
+    UnknownSuffix,
+    /// Status reports require the day/hour/minute UTC form.
+    StatusFormat,
+    /// A two-digit component is truncated.
+    Truncated,
+    /// A component contains a nondecimal byte.
+    NonDecimal,
+    /// Month is outside 1 through 12.
+    Month,
+    /// Day is outside 1 through 31.
+    Day,
+    /// Day does not occur in the supplied month, allowing February 29.
+    DayForMonth,
+    /// Hour is greater than 23.
+    Hour,
+    /// Minute is greater than 59.
+    Minute,
+    /// Second is greater than 59.
+    Second,
+}
+
+impl fmt::Display for TimestampError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::ReportLength => "report timestamp must be exactly 7 bytes",
+            Self::WeatherLength => "weather timestamp must be exactly 8 bytes",
+            Self::UnknownSuffix => "7-byte timestamp must end in 'z', '/', or 'h'",
+            Self::StatusFormat => "status timestamp must use DDHHMMz day/hour/minute UTC format",
+            Self::Truncated => "timestamp is too short",
+            Self::NonDecimal => "timestamp components must be decimal digits",
+            Self::Month => "month must be 1-12",
+            Self::Day => "day must be 1-31",
+            Self::DayForMonth => "day is not valid for month",
+            Self::Hour => "hour must be 0-23",
+            Self::Minute => "minute must be 0-59",
+            Self::Second => "second must be 0-59",
+        })
+    }
+}
+impl std::error::Error for TimestampError {}
 
 /// A validated seven-byte APRS timestamp used by position and object reports
 /// (APRS 1.0.1 §6.1).
@@ -183,13 +212,13 @@ impl AprsReportTimestamp {
         second: u8,
     ) -> Result<Self, AprsError> {
         if hour > 23 {
-            return Err(AprsError::InvalidTimestamp("hour must be 0-23"));
+            return Err(AprsError::InvalidTimestamp(TimestampError::Hour));
         }
         if minute > 59 {
-            return Err(AprsError::InvalidTimestamp("minute must be 0-59"));
+            return Err(AprsError::InvalidTimestamp(TimestampError::Minute));
         }
         if second > 59 {
-            return Err(AprsError::InvalidTimestamp("second must be 0-59"));
+            return Err(AprsError::InvalidTimestamp(TimestampError::Second));
         }
         Ok(Self(AprsReportTimestampValue::HourMinuteSecondUtc {
             hour,
@@ -249,14 +278,10 @@ impl AprsReportTimestamp {
                     Some(b'z') => Self::day_hour_minute_utc(p0, p1, p2),
                     Some(b'/') => Self::day_hour_minute_local(p0, p1, p2),
                     Some(b'h') => Self::hour_minute_second_utc(p0, p1, p2),
-                    _ => Err(AprsError::InvalidTimestamp(
-                        "7-byte timestamp must end in 'z', '/', or 'h'",
-                    )),
+                    _ => Err(AprsError::InvalidTimestamp(TimestampError::UnknownSuffix)),
                 }
             }
-            _ => Err(AprsError::InvalidTimestamp(
-                "report timestamp must be exactly 7 bytes",
-            )),
+            _ => Err(AprsError::InvalidTimestamp(TimestampError::ReportLength)),
         }
     }
 }
@@ -315,7 +340,7 @@ impl AprsWeatherTimestamp {
         minute: u8,
     ) -> Result<Self, AprsError> {
         if month == 0 || month > 12 {
-            return Err(AprsError::InvalidTimestamp("month must be 1-12"));
+            return Err(AprsError::InvalidTimestamp(TimestampError::Month));
         }
         validate_day_hour_minute(day, hour, minute)?;
         let maximum_day = match month {
@@ -324,7 +349,7 @@ impl AprsWeatherTimestamp {
             _ => 31,
         };
         if day > maximum_day {
-            return Err(AprsError::InvalidTimestamp("day is not valid for month"));
+            return Err(AprsError::InvalidTimestamp(TimestampError::DayForMonth));
         }
         Ok(Self {
             month,
@@ -342,9 +367,7 @@ impl AprsWeatherTimestamp {
     /// non-decimal bytes, or out-of-range components.
     pub fn from_wire(wire: &str) -> Result<Self, AprsError> {
         if wire.len() != 8 {
-            return Err(AprsError::InvalidTimestamp(
-                "weather timestamp must be exactly 8 bytes",
-            ));
+            return Err(AprsError::InvalidTimestamp(TimestampError::WeatherLength));
         }
         Self::month_day_hour_minute_utc(
             parse_timestamp_pair(wire, 0)?,
@@ -383,27 +406,25 @@ fn parse_timestamp_pair(wire: &str, index: usize) -> Result<u8, AprsError> {
     let bytes = wire.as_bytes();
     let high = *bytes
         .get(index)
-        .ok_or(AprsError::InvalidTimestamp("timestamp is too short"))?;
+        .ok_or(AprsError::InvalidTimestamp(TimestampError::Truncated))?;
     let low = *bytes
         .get(index + 1)
-        .ok_or(AprsError::InvalidTimestamp("timestamp is too short"))?;
+        .ok_or(AprsError::InvalidTimestamp(TimestampError::Truncated))?;
     if !high.is_ascii_digit() || !low.is_ascii_digit() {
-        return Err(AprsError::InvalidTimestamp(
-            "timestamp components must be decimal digits",
-        ));
+        return Err(AprsError::InvalidTimestamp(TimestampError::NonDecimal));
     }
     Ok((high - b'0') * 10 + (low - b'0'))
 }
 
 const fn validate_day_hour_minute(day: u8, hour: u8, minute: u8) -> Result<(), AprsError> {
     if day == 0 || day > 31 {
-        return Err(AprsError::InvalidTimestamp("day must be 1-31"));
+        return Err(AprsError::InvalidTimestamp(TimestampError::Day));
     }
     if hour > 23 {
-        return Err(AprsError::InvalidTimestamp("hour must be 0-23"));
+        return Err(AprsError::InvalidTimestamp(TimestampError::Hour));
     }
     if minute > 59 {
-        return Err(AprsError::InvalidTimestamp("minute must be 0-59"));
+        return Err(AprsError::InvalidTimestamp(TimestampError::Minute));
     }
     Ok(())
 }
@@ -430,10 +451,6 @@ const fn validate_day_hour_minute(day: u8, hour: u8, minute: u8) -> Result<(), A
 /// | `7`  | North-West                 | 315     |
 /// | `8`  | North                      | 360     |
 /// | `9`  | Undefined (treat as omni)  | n/a     |
-///
-/// The 45° step is the canonical interpretation in every published
-/// reference implementation (`aprx`, `Xastir`, `aprs.fi`). The bug fixed
-/// in commit history was an incorrect 20° step table.
 ///
 /// Use [`Self::from_code`] to construct from the raw `0..=9` ASCII
 /// digit value, [`Self::to_degrees`] to recover degrees from cardinal
@@ -469,6 +486,22 @@ pub enum PhgDirectivity {
 }
 
 impl PhgDirectivity {
+    /// Return the original numeric directivity code, from zero through nine.
+    #[must_use]
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Omni => 0,
+            Self::NorthEast => 1,
+            Self::East => 2,
+            Self::SouthEast => 3,
+            Self::South => 4,
+            Self::SouthWest => 5,
+            Self::West => 6,
+            Self::NorthWest => 7,
+            Self::North => 8,
+            Self::Undefined => 9,
+        }
+    }
     /// Parse a directivity code (`0..=9`) into the typed enum.
     ///
     /// Returns `None` for any code outside that range.
@@ -518,6 +551,18 @@ impl PhgDirectivity {
     }
 }
 
+impl TryFrom<u8> for PhgDirectivity {
+    type Error = AprsError;
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        Self::from_code(value).ok_or(AprsError::InvalidFormat)
+    }
+}
+impl From<PhgDirectivity> for u8 {
+    fn from(value: PhgDirectivity) -> Self {
+        value.code()
+    }
+}
+
 impl fmt::Display for PhgDirectivity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
@@ -539,24 +584,269 @@ impl fmt::Display for PhgDirectivity {
 /// Power-Height-Gain-Directivity data (APRS 1.0.1 Chapter 7).
 ///
 /// PHG provides station RF characteristics for range-circle calculations.
-/// The four single-digit codes in a `PHGNhgd` extension map to physical
+/// The four codes in a `PHGNhgd` extension map to physical
 /// quantities via the spec's Table 7-1 / 7-2:
 ///
 /// - `N` (power) → `N² watts` (e.g. `5` → 25 W).
-/// - `h` (height) → `10 × 2ʰ feet` AGL (e.g. `3` → 80 ft).
+/// - `h` (height) → `10 × 2ʰ feet` above average terrain (e.g. `3` → 80 ft).
 /// - `g` (gain) → `g dB` direct (no scaling).
 /// - `d` (directivity) → see [`PhgDirectivity`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Phg {
-    /// Effective radiated power in watts (`N²` for code `N` in `0..=9`).
-    pub power_watts: u32,
-    /// Antenna height above average terrain in feet (`10 × 2ʰ` for code
-    /// `h` in `0..=9`).
-    pub height_feet: u32,
-    /// Antenna gain in dB (single-digit `0..=9`, direct).
-    pub gain_db: u8,
-    /// Typed antenna directivity. See [`PhgDirectivity`].
-    pub directivity: PhgDirectivity,
+    power_digit: u8,
+    height_exponent: u8,
+    gain_db: u8,
+    directivity: PhgDirectivity,
+}
+
+impl Phg {
+    /// Decode the four wire codes following `PHG`, preserving every ASCII height.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsError::InvalidFormat`] unless power/gain/directivity are
+    /// decimal digits and height is an ASCII byte at or above `0`.
+    pub fn from_bytes(codes: [u8; 4]) -> Result<Self, AprsError> {
+        let [power, height, gain, directivity] = codes;
+        if !power.is_ascii_digit()
+            || !gain.is_ascii_digit()
+            || !directivity.is_ascii_digit()
+            || !(b'0'..=127).contains(&height)
+        {
+            return Err(AprsError::InvalidFormat);
+        }
+        Ok(Self {
+            power_digit: power - b'0',
+            height_exponent: height - b'0',
+            gain_db: gain - b'0',
+            directivity: PhgDirectivity::from_code(directivity - b'0')
+                .ok_or(AprsError::InvalidFormat)?,
+        })
+    }
+    /// Return the encoded transmitter power in watts.
+    #[must_use]
+    pub fn power_watts(self) -> u32 {
+        let code = u32::from(self.power_digit);
+        code * code
+    }
+    /// Return the encoded height exponent in `10 × 2^h` feet above average terrain.
+    #[must_use]
+    pub const fn height_exponent(self) -> u8 {
+        self.height_exponent
+    }
+    /// Return height in feet above average terrain; every ASCII exponent fits f64.
+    #[must_use]
+    pub fn height_feet(self) -> f64 {
+        10.0 * 2.0_f64.powi(i32::from(self.height_exponent))
+    }
+    /// Return height as u32, or None when its representation exceeds u32.
+    ///
+    /// Exponents above 28 remain valid PHG data and are available through
+    /// [`Self::height_exponent`] and [`Self::height_feet`].
+    #[must_use]
+    pub const fn height_feet_u32(self) -> Option<u32> {
+        if self.height_exponent <= 28 {
+            Some(10_u32 << self.height_exponent)
+        } else {
+            None
+        }
+    }
+    /// Return antenna gain in decibels.
+    #[must_use]
+    pub const fn gain_db(self) -> u8 {
+        self.gain_db
+    }
+    /// Return the encoded antenna directivity.
+    #[must_use]
+    pub const fn directivity(self) -> PhgDirectivity {
+        self.directivity
+    }
+}
+
+impl TryFrom<[u8; 4]> for Phg {
+    type Error = AprsError;
+    fn try_from(value: [u8; 4]) -> Result<Self, Self::Error> {
+        Self::from_bytes(value)
+    }
+}
+impl From<Phg> for [u8; 4] {
+    fn from(value: Phg) -> Self {
+        [
+            b'0' + value.power_digit,
+            b'0' + value.height_exponent,
+            b'0' + value.gain_db,
+            b'0' + value.directivity.code(),
+        ]
+    }
+}
+
+/// A course and speed expressed in their checked geographic domains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CourseSpeed {
+    course: Course,
+    speed: Speed,
+}
+
+impl CourseSpeed {
+    /// Combine a validated course and nonnegative finite speed.
+    #[must_use]
+    pub const fn new(course: Course, speed: Speed) -> Self {
+        Self { course, speed }
+    }
+    /// Return the course, including the wire value zero when reported.
+    #[must_use]
+    pub const fn course(self) -> Course {
+        self.course
+    }
+    /// Return speed without rounding away compressed-format precision.
+    #[must_use]
+    pub const fn speed(self) -> Speed {
+        self.speed
+    }
+}
+
+/// One base-91 datum identifier in a DAO extension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DaoDatum(u8);
+
+impl DaoDatum {
+    /// Validate a datum byte in ASCII `!` through `{`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsError::InvalidFormat`] outside the base-91 range.
+    pub const fn new(byte: u8) -> Result<Self, AprsError> {
+        if byte >= b'!' && byte <= b'{' {
+            Ok(Self(byte))
+        } else {
+            Err(AprsError::InvalidFormat)
+        }
+    }
+    /// Return the transmitted datum byte, preserving case and local identifiers.
+    #[must_use]
+    pub const fn as_byte(self) -> u8 {
+        self.0
+    }
+}
+
+impl TryFrom<u8> for DaoDatum {
+    type Error = AprsError;
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+impl From<DaoDatum> for u8 {
+    fn from(value: DaoDatum) -> Self {
+        value.0
+    }
+}
+
+/// Precision interpretation selected by the DAO datum byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaoPrecision {
+    /// Both precision characters are spaces: datum identity only.
+    None,
+    /// Uppercase datum: one decimal thousandth-of-minute digit per coordinate.
+    Decimal,
+    /// Lowercase datum: one base-91 fraction of a hundredth of a minute.
+    Base91,
+    /// A local/other datum with preserved base-91 bytes and no defined scale.
+    Unspecified,
+}
+
+/// A datum-first `!DAO!` precision extension with immutable wire identity.
+///
+/// See the [primary precision/datum proposal](https://www.aprs.org/datum.txt).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DaoExtension {
+    datum: DaoDatum,
+    latitude: u8,
+    longitude: u8,
+    precision: DaoPrecision,
+}
+
+impl DaoExtension {
+    /// Decode exactly `!`, datum, latitude precision, longitude precision, `!`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsError::InvalidFormat`] for delimiters, invalid datum,
+    /// mismatched null characters, or precision characters outside their encoding.
+    pub fn from_bytes(bytes: [u8; 5]) -> Result<Self, AprsError> {
+        let [start, datum, latitude, longitude, end] = bytes;
+        if start != b'!' || end != b'!' {
+            return Err(AprsError::InvalidFormat);
+        }
+        let datum = DaoDatum::new(datum)?;
+        let precision = if latitude == b' ' && longitude == b' ' {
+            DaoPrecision::None
+        } else if datum.0.is_ascii_uppercase()
+            && latitude.is_ascii_digit()
+            && longitude.is_ascii_digit()
+        {
+            DaoPrecision::Decimal
+        } else if (b'!'..=b'{').contains(&latitude) && (b'!'..=b'{').contains(&longitude) {
+            if datum.0.is_ascii_lowercase() {
+                DaoPrecision::Base91
+            } else if !datum.0.is_ascii_alphabetic() {
+                DaoPrecision::Unspecified
+            } else {
+                return Err(AprsError::InvalidFormat);
+            }
+        } else {
+            return Err(AprsError::InvalidFormat);
+        };
+        Ok(Self {
+            datum,
+            latitude,
+            longitude,
+            precision,
+        })
+    }
+    /// Return the exact datum identifier, including its precision-selecting case.
+    #[must_use]
+    pub const fn datum(self) -> DaoDatum {
+        self.datum
+    }
+    /// Return the precision encoding.
+    #[must_use]
+    pub const fn precision(self) -> DaoPrecision {
+        self.precision
+    }
+    /// Return latitude's nonnegative increment in degrees, or None for datum-only/undefined scale.
+    #[must_use]
+    pub fn latitude_offset_degrees(self) -> Option<f64> {
+        self.offset(self.latitude)
+    }
+    /// Return longitude's nonnegative increment in degrees, or None for datum-only/undefined scale.
+    #[must_use]
+    pub fn longitude_offset_degrees(self) -> Option<f64> {
+        self.offset(self.longitude)
+    }
+    /// Return all five original bytes, without allocating.
+    #[must_use]
+    pub const fn to_bytes(self) -> [u8; 5] {
+        [b'!', self.datum.0, self.latitude, self.longitude, b'!']
+    }
+    fn offset(self, byte: u8) -> Option<f64> {
+        match self.precision {
+            DaoPrecision::Decimal => Some(f64::from(byte - b'0') / 60_000.0),
+            DaoPrecision::Base91 => Some(f64::from(byte - b'!') / (91.0 * 6_000.0)),
+            DaoPrecision::None | DaoPrecision::Unspecified => None,
+        }
+    }
+}
+
+impl TryFrom<[u8; 5]> for DaoExtension {
+    type Error = AprsError;
+    fn try_from(value: [u8; 5]) -> Result<Self, Self::Error> {
+        Self::from_bytes(value)
+    }
+}
+impl From<DaoExtension> for [u8; 5] {
+    fn from(value: DaoExtension) -> Self {
+        value.to_bytes()
+    }
 }
 
 /// Parsed APRS data extensions from the position comment field.
@@ -564,42 +854,69 @@ pub struct Phg {
 /// Position reports can carry structured data in the comment string
 /// after the coordinates. This struct captures the extensions defined
 /// in APRS101 Chapters 6-7.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AprsDataExtension {
     /// Course in degrees (0-360) and speed in knots, from CSE/SPD.
-    pub course_speed: Option<(u16, u16)>,
+    course_speed: Option<CourseSpeed>,
     /// Power, Height, Gain, Directivity (PHG).
-    pub phg: Option<Phg>,
+    phg: Option<Phg>,
     /// Altitude in feet (from `/A=NNNNNN` in comment).
-    pub altitude_ft: Option<i32>,
+    altitude_ft: Option<i32>,
     /// DAO precision extension (`!DAO!` for extra lat/lon digits).
-    pub dao: Option<(f64, f64)>,
+    dao: Option<DaoExtension>,
 }
 
-/// Parse data extensions from an APRS position comment string.
-///
-/// Extracts CSE/SPD, PHG, altitude (`/A=NNNNNN`), and DAO (`!DAO!`)
-/// extensions per APRS101 Chapters 6-7.
-///
-/// # Parameters
-///
-/// - `comment`: The comment string after the APRS position fields.
-///
-/// # Returns
-///
-/// An [`AprsDataExtension`] with each field populated if found.
-#[must_use]
-pub fn parse_aprs_extensions(comment: &str) -> AprsDataExtension {
-    let course_speed = parse_cse_spd(comment);
-    let phg = parse_phg(comment);
-    let altitude_ft = parse_altitude(comment);
-    let dao = parse_dao(comment);
+impl AprsDataExtension {
+    /// Return the initial course/speed extension when present.
+    #[must_use]
+    pub const fn course_speed(&self) -> Option<CourseSpeed> {
+        self.course_speed
+    }
+    /// Return decoded power/height/gain/directivity.
+    #[must_use]
+    pub const fn phg(&self) -> Option<Phg> {
+        self.phg
+    }
+    /// Return altitude in feet from the comment or compressed-position body.
+    #[must_use]
+    pub const fn altitude_feet(&self) -> Option<i32> {
+        self.altitude_ft
+    }
+    /// Return datum identity and precision encoding without applying a datum transform.
+    #[must_use]
+    pub const fn dao(&self) -> Option<DaoExtension> {
+        self.dao
+    }
+    pub(crate) const fn with_altitude(mut self, altitude: i32) -> Self {
+        self.altitude_ft = Some(altitude);
+        self
+    }
 
-    AprsDataExtension {
-        course_speed,
-        phg,
-        altitude_ft,
-        dao,
+    /// Parse data extensions from an APRS position comment string.
+    ///
+    /// Extracts CSE/SPD, PHG, altitude (`/A=NNNNNN`), and DAO (`!DAO!`)
+    /// extensions per APRS101 Chapters 6-7.
+    ///
+    /// # Parameters
+    ///
+    /// - `comment`: The comment string after the APRS position fields.
+    ///
+    /// # Returns
+    ///
+    /// An [`AprsDataExtension`] with each field populated if found.
+    #[must_use]
+    pub fn from_comment(comment: &str) -> Self {
+        let course_speed = parse_cse_spd(comment);
+        let phg = parse_phg(comment);
+        let altitude_ft = parse_altitude(comment);
+        let dao = parse_dao(comment);
+
+        Self {
+            course_speed,
+            phg,
+            altitude_ft,
+            dao,
+        }
     }
 }
 
@@ -608,7 +925,7 @@ pub fn parse_aprs_extensions(comment: &str) -> AprsDataExtension {
 /// Format: `DDD/SSS` where DDD is 3-digit course (000-360) and SSS is
 /// 3-digit speed in knots. Per APRS101 Chapter 7, this must be at the
 /// start of the comment and use the exact `NNN/NNN` format.
-fn parse_cse_spd(comment: &str) -> Option<(u16, u16)> {
+fn parse_cse_spd(comment: &str) -> Option<CourseSpeed> {
     let bytes = comment.as_bytes();
     let header = bytes.get(..7)?;
     if header.get(3) != Some(&b'/') {
@@ -624,70 +941,27 @@ fn parse_cse_spd(comment: &str) -> Option<(u16, u16)> {
     if course > 360 {
         return None;
     }
-    Some((course, speed))
-}
-
-/// PHG power-code lookup: `N²` watts for code `N` in `0..=9`.
-///
-/// Per APRS 1.0.1 Table 7-1, the power digit encodes effective radiated
-/// power as the square of the digit (`0`=0 W, `1`=1 W, `2`=4 W, … `9`=81 W).
-const PHG_POWER: [u32; 10] = [0, 1, 4, 9, 16, 25, 36, 49, 64, 81];
-
-/// Maximum legal PHG height digit value (yields `10 × 2²⁸` feet =
-/// ~2.68 billion ft, the largest height that fits a `u32`).
-///
-/// In practice values above ~20 are unphysical (10 × 2²⁰ ≈ 3 200 km
-/// AGL, well beyond LEO). The spec deliberately leaves the upper bound
-/// open; the value is capped at the u32 boundary to keep the cast safe.
-const PHG_HEIGHT_MAX_DIGIT: u32 = 28;
-
-/// Decode a PHG height code into feet above average terrain.
-///
-/// Per APRS 1.0.1 §7 p.28: "The height code may in fact be any ASCII
-/// character `0` and above. This is so that larger heights for
-/// balloons, aircraft or satellites may be specified." The encoding
-/// is `10 × 2ʰ` feet where `h` is the digit value `byte - b'0'`:
-///
-/// | Wire byte | `h` | Feet AGL |
-/// |-----------|-----|----------|
-/// | `'0'`     | 0   | 10       |
-/// | `'9'`     | 9   | 5 120    |
-/// | `':'`     | 10  | 10 240   |
-/// | `';'`     | 11  | 20 480   |
-/// | `'<'`     | 12  | 40 960   |
-/// | …         | …   | …        |
-///
-/// Returns `None` for bytes below ASCII `'0'` or above the `u32`-safe
-/// cap [`PHG_HEIGHT_MAX_DIGIT`]; both pre-`'0'` and absurd-height
-/// inputs are spec-disallowed.
-const fn phg_decode_height(byte: u8) -> Option<u32> {
-    if byte < b'0' {
-        return None;
-    }
-    let digit = (byte - b'0') as u32;
-    if digit > PHG_HEIGHT_MAX_DIGIT {
-        return None;
-    }
-    // 10 × 2^digit. Bounded by `digit <= 28` so no overflow.
-    Some(10u32 << digit)
+    Some(CourseSpeed::new(
+        Course::new(course).ok()?,
+        Speed::from_knots(f64::from(speed)).ok()?,
+    ))
 }
 
 /// Parse a PHG extension from the comment string.
 ///
 /// Format: `PHGNhgd` anywhere in the comment, where:
 ///
-/// - `N` is an ASCII digit `'0'..='9'` (power). Mapped via [`PHG_POWER`].
+/// - `N` is an ASCII digit `'0'..='9'` (power).
 /// - `h` is any ASCII character `'0'` and above (height), spec-allowed
 ///   to extend beyond `'9'` for balloons, aircraft, and satellites.
-///   Decoded via [`phg_decode_height`].
+///   Its exponent is preserved by [`Phg`].
 /// - `g` is an ASCII digit `'0'..='9'` (gain, direct in dB).
 /// - `d` is an ASCII digit `'0'..='9'` (directivity); mapped via
 ///   [`PhgDirectivity::from_code`].
 ///
 /// Returns `None` if `PHG` is absent or any field fails its validation
-/// rule. Note the height field's relaxed acceptance: earlier code
-/// generations rejected `':'` (10 240 ft, common in balloon trackers),
-/// which produced silent loss of PHG data on receive.
+/// rule. Large height exponents remain available even when a u32 cannot
+/// represent the corresponding feet value.
 fn parse_phg(comment: &str) -> Option<Phg> {
     let idx = comment.find("PHG")?;
     let rest = comment.get(idx + 3..)?;
@@ -703,16 +977,7 @@ fn parse_phg(comment: &str) -> Option<Phg> {
         return None;
     }
 
-    let p = (p_byte - b'0') as usize;
-    let g = g_byte - b'0';
-    let d = d_byte - b'0';
-
-    Some(Phg {
-        power_watts: *PHG_POWER.get(p)?,
-        height_feet: phg_decode_height(h_byte)?,
-        gain_db: g,
-        directivity: PhgDirectivity::from_code(d)?,
-    })
+    Phg::from_bytes([p_byte, h_byte, g_byte, d_byte]).ok()
 }
 
 /// Parse altitude extension from the comment string.
@@ -728,43 +993,13 @@ fn parse_altitude(comment: &str) -> Option<i32> {
 
 /// Parse a DAO extension from the comment string.
 ///
-/// Format: `!DAO!` where D and O are extra precision digits for latitude
-/// and longitude respectively. The middle character indicates the encoding:
-/// - Uppercase letter (W): human-readable. D and O are ASCII digits (0-9)
-///   representing hundredths of a minute increment (divide by 60 for degrees).
-/// - Lowercase letter (w): base-91 encoded. D and O are base-91 characters
-///   giving finer precision.
-///
-/// Returns `(lat_correction, lon_correction)` in decimal degrees.
-fn parse_dao(comment: &str) -> Option<(f64, f64)> {
-    // Find `!` followed by 3 chars and another `!`.
-    let bytes = comment.as_bytes();
-    for i in 0..bytes.len().saturating_sub(4) {
-        let window = bytes.get(i..i + 5)?;
-        if window.first() != Some(&b'!') || window.get(4) != Some(&b'!') {
-            continue;
-        }
-        let d = *window.get(1)?;
-        let a = *window.get(2)?;
-        let o = *window.get(3)?;
-
-        if a.is_ascii_uppercase() {
-            // Human-readable: D and O are ASCII digits.
-            if d.is_ascii_digit() && o.is_ascii_digit() {
-                let lat_extra = f64::from(d - b'0') / 600.0;
-                let lon_extra = f64::from(o - b'0') / 600.0;
-                return Some((lat_extra, lon_extra));
-            }
-        } else if a.is_ascii_lowercase() {
-            // Base-91: D and O are base-91 chars (33-123).
-            if (33..=123).contains(&d) && (33..=123).contains(&o) {
-                let lat_extra = f64::from(d - 33) / (91.0 * 60.0);
-                let lon_extra = f64::from(o - 33) / (91.0 * 60.0);
-                return Some((lat_extra, lon_extra));
-            }
-        }
-    }
-    None
+/// The first component identifies the datum and precision encoding. Invalid
+/// candidates are skipped while searching for a complete later extension.
+fn parse_dao(comment: &str) -> Option<DaoExtension> {
+    comment.as_bytes().windows(5).find_map(|window| {
+        let bytes: [u8; 5] = window.try_into().ok()?;
+        DaoExtension::from_bytes(bytes).ok()
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -778,8 +1013,7 @@ fn parse_dao(comment: &str) -> Option<(f64, f64)> {
 /// spec defines five distinct bulletin-family forms at §14 pp.73-74,
 /// and a "BLN" addressee that starts with a *letter* (announcement)
 /// is structurally different from one that starts with a *digit*
-/// (general or group bulletin). Earlier code generations collapsed
-/// announcements into `GroupBulletin`.
+/// (general or group bulletin).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum MessageKind {
     /// Direct station-to-station message.
@@ -788,18 +1022,16 @@ pub enum MessageKind {
     /// the `BLN` prefix followed by a single ASCII digit).
     Bulletin {
         /// Bulletin number (0-9).
-        number: u8,
+        number: BulletinNumber,
     },
     /// Group bulletin (addressee `BLN<digit><group>` per APRS 1.0.1
     /// §14 p.74: `BLN` prefix, then a single digit ID, then a 1-5
-    /// character group name, e.g. `BLN4WX___` for weather group
-    /// bulletin number 4). The current parser accepts the looser
-    /// "BLN + 1-5 alnum starting with anything except a single digit
-    /// or single letter" form for tolerance; canonical spec form has
-    /// digit-then-name.
+    /// character group name, e.g. `BLN4WX` for weather group bulletin number 4).
     GroupBulletin {
-        /// Group identifier (1-5 alphanumeric characters).
-        group: String,
+        /// Bulletin number (0-9).
+        number: BulletinNumber,
+        /// Group identifier (1-5 visible ASCII characters).
+        group: BulletinGroup,
     },
     /// Announcement (addressee `BLNA`-`BLNZ`, i.e. exactly the `BLN`
     /// prefix followed by a single uppercase ASCII letter). Per APRS
@@ -809,18 +1041,18 @@ pub enum MessageKind {
     /// group identifier) and `Bulletin` (which is numeric).
     Announcement {
         /// Announcement letter (A-Z).
-        letter: char,
+        letter: AnnouncementLetter,
     },
     /// National Weather Service bulletin (addressee `NWS-*`, `SKY-*`,
     /// `CWA-*`, `BOM-*`).
     NwsBulletin,
-    /// An APRS ack/rej control frame (text begins with `ack` or `rej`
-    /// followed by 1-5 alnum).
+    /// A complete `ack`/`rej` control body followed by a validated ID,
+    /// without a separate message-ID trailer.
     AckRej,
 }
 
 // ---------------------------------------------------------------------------
-// TelemetryDefinition / TelemetryParameters
+// TelemetryDefinition
 // ---------------------------------------------------------------------------
 
 /// Telemetry parameter definitions sent as APRS messages.
@@ -834,30 +1066,20 @@ pub enum MessageKind {
 pub enum TelemetryDefinition {
     /// `PARM.P1,P2,P3,P4,P5,B1,B2,B3,B4,B5,B6,B7,B8`: human-readable
     /// names for 5 analog + 8 digital channels.
-    Parameters(TelemetryParameters),
+    Parameters(TelemetryLabels),
     /// `UNIT.U1,U2,U3,U4,U5,B1,B2,B3,B4,B5,B6,B7,B8`: unit labels.
-    Units(TelemetryParameters),
-    /// `EQNS.a1,b1,c1,a2,b2,c2,...`: calibration coefficients for the
-    /// 5 analog channels (`y = a*x² + b*x + c`, 15 values total).
-    Equations([Option<(f64, f64, f64)>; 5]),
+    Units(TelemetryLabels),
+    /// `EQNS.a1,b1,c1,a2,b2,c2,...`: an exact prefix of up to fifteen
+    /// calibration coefficients for `y = a*x² + b*x + c`.
+    Equations(TelemetryEquationCoefficients),
     /// `BITS.b1b2b3b4b5b6b7b8,project_title`: active-bit mask plus
     /// project title.
     Bits {
-        /// 8-character binary string specifying which digital bits are
-        /// "active" (`'1'`) vs "inactive" (`'0'`).
-        bits: String,
+        /// Eight digital-channel polarity bits, most significant channel first.
+        bits: TelemetryBits,
         /// Free-form project title (up to 23 characters).
-        title: String,
+        title: TelemetryProjectTitle,
     },
-}
-
-/// 5 analog + 8 digital channel labels used by both `PARM.` and `UNIT.`.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct TelemetryParameters {
-    /// Analog channel labels (5 entries, `None` when omitted).
-    pub analog: [Option<String>; 5],
-    /// Digital channel labels (8 entries, `None` when omitted).
-    pub digital: [Option<String>; 8],
 }
 
 impl TelemetryDefinition {
@@ -865,106 +1087,259 @@ impl TelemetryDefinition {
     /// text portion of an [`AprsMessage`] (everything after the second
     /// `:` in the wire frame).
     ///
-    /// Returns `None` when the text doesn't start with a known keyword.
-    #[must_use]
-    pub fn from_text(text: &str) -> Option<Self> {
+    /// Returns `Ok(None)` when the text doesn't start with a known keyword.
+    /// Parsing examines at most 13 labels or 15 coefficients before rejecting
+    /// excess fields. Missing trailing coefficients remain omitted, including
+    /// a final partial triple; malformed/nonfinite supplied fields are errors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsError::InvalidFormat`] for malformed recognized definitions,
+    /// excessive fields, invalid positional widths, nonfinite coefficients or
+    /// an invalid bit mask/title. PARM/UNIT retain the documented 68-byte maximum
+    /// layout adaptation; other definition bodies are at most 67 bytes.
+    pub fn from_text(text: &str) -> Result<Option<Self>, AprsError> {
         let trimmed = text.trim_end_matches(['\r', '\n']);
         if let Some(rest) = trimmed.strip_prefix("PARM.") {
-            return Some(Self::Parameters(parse_telemetry_labels(rest)));
+            if trimmed.len() > 68 {
+                return Err(AprsError::InvalidFormat);
+            }
+            return Ok(Some(Self::Parameters(parse_telemetry_labels(rest)?)));
         }
         if let Some(rest) = trimmed.strip_prefix("UNIT.") {
-            return Some(Self::Units(parse_telemetry_labels(rest)));
+            if trimmed.len() > 68 {
+                return Err(AprsError::InvalidFormat);
+            }
+            return Ok(Some(Self::Units(parse_telemetry_labels(rest)?)));
         }
         if let Some(rest) = trimmed.strip_prefix("EQNS.") {
-            return Some(Self::Equations(parse_telemetry_equations(rest)));
+            if trimmed.len() > 67 {
+                return Err(AprsError::InvalidFormat);
+            }
+            return Ok(Some(Self::Equations(parse_telemetry_equations(rest)?)));
         }
         if let Some(rest) = trimmed.strip_prefix("BITS.") {
+            if trimmed.len() > 67 {
+                return Err(AprsError::InvalidFormat);
+            }
             let (bits, title) = rest.split_once(',').unwrap_or((rest, ""));
             // APRS 1.0.1 §13 p.70: the bit-sense field is exactly 8 binary
             // digits (`b1..b8`). Reject any other length (e.g. an empty
             // mask from a bare "BITS.") or non-binary content rather than
             // surfacing a malformed zero-length active-bit mask.
             if bits.len() != 8 || !bits.bytes().all(|b| b == b'0' || b == b'1') {
-                return None;
+                return Err(AprsError::InvalidFormat);
             }
-            return Some(Self::Bits {
-                bits: bits.to_owned(),
-                title: title.to_owned(),
-            });
+            let mask = bits
+                .bytes()
+                .fold(0_u8, |mask, bit| (mask << 1) | (bit - b'0'));
+            return Ok(Some(Self::Bits {
+                bits: TelemetryBits::from_bits(mask),
+                title: TelemetryProjectTitle::new(title).map_err(|_| AprsError::InvalidFormat)?,
+            }));
         }
-        None
+        Ok(None)
     }
 }
 
 /// Parse a comma-separated label list for `PARM.` / `UNIT.`.
-fn parse_telemetry_labels(s: &str) -> TelemetryParameters {
-    let mut params = TelemetryParameters::default();
-    for (i, field) in s.split(',').enumerate() {
-        let field = field.trim();
-        if i < 5 {
-            if !field.is_empty()
-                && let Some(slot) = params.analog.get_mut(i)
-            {
-                *slot = Some(field.to_owned());
-            }
-        } else if i < 13 {
-            if !field.is_empty()
-                && let Some(slot) = params.digital.get_mut(i - 5)
-            {
-                *slot = Some(field.to_owned());
-            }
-        } else {
-            break;
-        }
+fn parse_telemetry_labels(s: &str) -> Result<TelemetryLabels, AprsError> {
+    let mut fields = [""; 13];
+    let mut count = 0;
+    for field in s.split(',') {
+        let slot = fields.get_mut(count).ok_or(AprsError::InvalidFormat)?;
+        *slot = field;
+        count += 1;
     }
-    params
+    TelemetryLabels::new(fields.get(..count).ok_or(AprsError::InvalidFormat)?)
+        .map_err(|_| AprsError::InvalidFormat)
 }
 
-/// Parse an `EQNS.` coefficient list into 5 `(a, b, c)` tuples.
+/// Parse the exact nonempty prefix of at most 15 finite coefficients.
 ///
 /// The wire format is 15 comma-separated decimal values per APRS 1.0.1
 /// §13 p.70: three coefficients (a, b, c) for each of five analog
 /// telemetry channels. The equation is `y = a·v² + b·v + c` where `v`
 /// is the raw channel value.
 ///
-/// **Strictness**: every coefficient is parsed via [`str::parse::<f64>`].
-/// If *any* of the three coefficients for a slot fails to parse (the
-/// field is empty, contains non-numeric text, or is missing entirely),
-/// that slot remains `None`. Earlier code generations substituted
-/// `0.0` for parse failures, which produced all-zero coefficients on
-/// malformed input, silently coercing a parsing bug into a "valid"
-/// equation `y = 0·v² + 0·v + 0 = 0`.
-fn parse_telemetry_equations(s: &str) -> [Option<(f64, f64, f64)>; 5] {
-    // Parse each comma-separated field into `Option<f64>`; we deliberately
-    // do NOT fall through to 0.0 on parse failure; a missing/bad value
-    // disables the whole slot.
-    let values: Vec<Option<f64>> = s.split(',').map(|v| v.trim().parse::<f64>().ok()).collect();
-    let mut out: [Option<(f64, f64, f64)>; 5] = [None, None, None, None, None];
-    for (i, slot) in out.iter_mut().enumerate() {
-        let base = i * 3;
-        // All three coefficients (a, b, c) must be present AND parsed
-        // successfully for the slot to be populated.
-        if let (Some(Some(a)), Some(Some(b)), Some(Some(c))) = (
-            values.get(base).copied(),
-            values.get(base + 1).copied(),
-            values.get(base + 2).copied(),
-        ) {
-            *slot = Some((a, b, c));
-        }
+/// A malformed supplied field rejects the complete definition; omitted tail
+/// fields and a final partial triple remain distinct from supplied zeros.
+fn parse_telemetry_equations(s: &str) -> Result<TelemetryEquationCoefficients, AprsError> {
+    let mut values = [0.0; 15];
+    let mut count = 0;
+    for field in s.split(',') {
+        let slot = values.get_mut(count).ok_or(AprsError::InvalidFormat)?;
+        *slot = field
+            .trim()
+            .parse::<f64>()
+            .map_err(|_| AprsError::InvalidFormat)?;
+        count += 1;
     }
-    out
+    TelemetryEquationCoefficients::new(values.get(..count).ok_or(AprsError::InvalidFormat)?)
+        .map_err(|_| AprsError::InvalidFormat)
 }
 
 // ---------------------------------------------------------------------------
 // AprsData and AprsPacket
 // ---------------------------------------------------------------------------
 
+/// A four- or six-character Maidenhead locator from an APRS grid report.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MaidenheadGrid(String);
+
+impl MaidenheadGrid {
+    /// Validate field letters A-R, square digits and optional subsquare a-x.
+    ///
+    /// Letters are checked case-insensitively; the received ASCII case is retained.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsError::InvalidFormat`] for another length or character layout.
+    pub fn new(value: &str) -> Result<Self, AprsError> {
+        Self::validate(value)?;
+        Ok(Self(value.to_owned()))
+    }
+
+    fn validate(value: &str) -> Result<(), AprsError> {
+        let bytes = value.as_bytes();
+        let valid = match bytes {
+            [field_lon, field_lat, square_lon, square_lat] => {
+                (b'A'..=b'R').contains(&field_lon.to_ascii_uppercase())
+                    && (b'A'..=b'R').contains(&field_lat.to_ascii_uppercase())
+                    && square_lon.is_ascii_digit()
+                    && square_lat.is_ascii_digit()
+            }
+            [
+                field_lon,
+                field_lat,
+                square_lon,
+                square_lat,
+                subsquare_lon,
+                subsquare_lat,
+            ] => {
+                (b'A'..=b'R').contains(&field_lon.to_ascii_uppercase())
+                    && (b'A'..=b'R').contains(&field_lat.to_ascii_uppercase())
+                    && square_lon.is_ascii_digit()
+                    && square_lat.is_ascii_digit()
+                    && (b'a'..=b'x').contains(&subsquare_lon.to_ascii_lowercase())
+                    && (b'a'..=b'x').contains(&subsquare_lat.to_ascii_lowercase())
+            }
+            _ => false,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(AprsError::InvalidFormat)
+        }
+    }
+    /// Borrow the exact validated locator.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+impl std::str::FromStr for MaidenheadGrid {
+    type Err = AprsError;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+impl TryFrom<&str> for MaidenheadGrid {
+    type Error = AprsError;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+impl TryFrom<String> for MaidenheadGrid {
+    type Error = AprsError;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::validate(&value)?;
+        Ok(Self(value))
+    }
+}
+impl AsRef<str> for MaidenheadGrid {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+impl fmt::Display for MaidenheadGrid {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+impl From<MaidenheadGrid> for String {
+    fn from(value: MaidenheadGrid) -> Self {
+        value.0
+    }
+}
+
+/// Legacy raw-weather identifier; its payload remains uninterpreted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RawWeatherFormat {
+    /// The `#` identifier.
+    Hash,
+    /// The `*` identifier.
+    Asterisk,
+}
+
+impl RawWeatherFormat {
+    /// Return the original data-type identifier.
+    #[must_use]
+    pub const fn as_byte(self) -> u8 {
+        match self {
+            Self::Hash => b'#',
+            Self::Asterisk => b'*',
+        }
+    }
+}
+impl TryFrom<u8> for RawWeatherFormat {
+    type Error = AprsError;
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            b'#' => Ok(Self::Hash),
+            b'*' => Ok(Self::Asterisk),
+            _ => Err(AprsError::InvalidFormat),
+        }
+    }
+}
+impl From<RawWeatherFormat> for u8 {
+    fn from(value: RawWeatherFormat) -> Self {
+        value.as_byte()
+    }
+}
+
+/// An opaque one-byte user-defined experiment identifier, preserving all octets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ExperimentId(u8);
+impl ExperimentId {
+    /// Preserve one received identifier byte, including unknown extensions.
+    #[must_use]
+    pub const fn from_byte(byte: u8) -> Self {
+        Self(byte)
+    }
+    /// Return the exact identifier octet.
+    #[must_use]
+    pub const fn as_byte(self) -> u8 {
+        self.0
+    }
+}
+impl From<u8> for ExperimentId {
+    fn from(value: u8) -> Self {
+        Self(value)
+    }
+}
+impl From<ExperimentId> for u8 {
+    fn from(value: ExperimentId) -> Self {
+        value.0
+    }
+}
+
 /// A parsed APRS data frame, covering all major APRS data types.
 ///
 /// Per APRS101.PDF, the data type is determined by the first byte of the
-/// AX.25 information field. This enum covers the types most relevant to
-/// the TH-D75's APRS implementation.
-#[derive(Debug, Clone, PartialEq)]
+/// AX.25 information field. Structured variants retain checked values;
+/// uninterpreted extension formats retain their original payload bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AprsData {
     /// Position report (uncompressed, compressed, or Mic-E).
     Position(AprsPosition),
@@ -995,7 +1370,7 @@ pub enum AprsData {
     },
     /// Maidenhead grid locator (data type `[`). The string form is the
     /// 4-6 character grid square, e.g. `"EM13qc"` or `"FM18lv"`.
-    Grid(String),
+    Grid(MaidenheadGrid),
     /// Raw GPS sentence / Ultimeter 2000 data (data type `$`).
     ///
     /// APRS 1.0.1 §5.2: anything starting with `$GP`, `$GN`, `$GL`,
@@ -1021,7 +1396,7 @@ pub enum AprsData {
     /// the rest.
     UserDefined {
         /// One-character experiment identifier (immediately follows `{`).
-        experiment: char,
+        experiment: ExperimentId,
         /// Everything after the experiment ID.
         data: Vec<u8>,
     },
@@ -1042,19 +1417,31 @@ pub enum AprsData {
     /// for diagnostic purposes.
     RawWeather {
         /// Original data-type identifier byte (`b'#'` or `b'*'`).
-        data_type: u8,
+        data_type: RawWeatherFormat,
         /// Everything after the type byte, byte-for-byte.
         payload: Vec<u8>,
     },
 }
 
-/// A parsed APRS packet. Currently just a thin wrapper over [`AprsData`];
-/// future extensions may add envelope-level fields (source callsign,
-/// digipeater path) if the APRS layer ever owns the AX.25 context.
-#[derive(Debug, Clone, PartialEq)]
+/// A decoded APRS payload without an AX.25 routing envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AprsPacket {
     /// Decoded APRS data payload.
     pub data: AprsData,
+}
+
+impl AprsData {
+    /// Parse one complete AX.25 information field, without reading a clock or I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsError::MicERequiresDestination`] for Mic-E identifiers;
+    /// [`Self::from_bytes_with_destination`] accepts their required destination.
+    /// Other malformed recognized fields propagate their documented parse error;
+    /// an empty or unknown type returns [`AprsError::InvalidFormat`].
+    pub fn from_bytes(info: &[u8]) -> Result<Self, AprsError> {
+        parse_aprs_data(info)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1065,10 +1452,10 @@ pub struct AprsPacket {
 ///
 /// Dispatches based on the data type identifier (first byte) to the
 /// appropriate parser. For Mic-E positions, use
-/// [`crate::mic_e::parse_mice_position`] directly since it also requires
+/// [`AprsPosition::from_mice_bytes`] directly since it also requires
 /// the destination address.
 ///
-/// **Prefer [`crate::mic_e::parse_aprs_data_full`] when the AX.25
+/// **Prefer [`AprsData::from_bytes_with_destination`] when the AX.25
 /// destination address is available**, since it handles all data types
 /// including Mic-E.
 ///
@@ -1076,38 +1463,38 @@ pub struct AprsPacket {
 ///
 /// | Byte | Type | Parser |
 /// |------|------|--------|
-/// | `!`, `=` | Position (no timestamp) | [`parse_aprs_position`] |
-/// | `/`, `@` | Position (with timestamp) | [`parse_aprs_position`] |
+/// | `!`, `=` | Position (no timestamp) | [`AprsPosition::from_bytes`] |
+/// | `/`, `@` | Position (with timestamp) | [`AprsPosition::from_bytes`] |
 /// | `:` | Message | Inline |
 /// | `>` | Status | Inline |
 /// | `;` | Object | Inline |
 /// | `)` | Item | Inline |
 /// | `_` | Positionless weather | Inline |
-/// | `` ` ``, `'` | Mic-E | Returns error (use [`crate::mic_e::parse_mice_position`]) |
+/// | `` ` ``, `'` | Mic-E | Returns error (use [`AprsPosition::from_mice_bytes`]) |
 ///
 /// # Errors
 ///
 /// Returns [`AprsError`] if the format is unrecognized or data is invalid.
-pub fn parse_aprs_data(info: &[u8]) -> Result<AprsData, AprsError> {
+fn parse_aprs_data(info: &[u8]) -> Result<AprsData, AprsError> {
     let first = *info.first().ok_or(AprsError::InvalidFormat)?;
 
     match first {
         // Position reports (uncompressed and compressed)
-        b'!' | b'=' | b'/' | b'@' => parse_aprs_position(info).map(AprsData::Position),
+        b'!' | b'=' | b'/' | b'@' => AprsPosition::from_bytes(info).map(AprsData::Position),
         // Message
-        b':' => parse_aprs_message(info).map(AprsData::Message),
+        b':' => AprsMessage::from_bytes(info).map(AprsData::Message),
         // Status
-        b'>' => parse_aprs_status(info).map(AprsData::Status),
+        b'>' => AprsStatus::from_bytes(info).map(AprsData::Status),
         // Object
-        b';' => parse_aprs_object(info).map(AprsData::Object),
+        b';' => AprsObject::from_bytes(info).map(AprsData::Object),
         // Item
-        b')' => parse_aprs_item(info).map(AprsData::Item),
+        b')' => AprsItem::from_bytes(info).map(AprsData::Item),
         // Positionless weather
-        b'_' => parse_aprs_weather_positionless(info).map(AprsData::PositionlessWeather),
+        b'_' => AprsPositionlessWeatherReport::from_bytes(info).map(AprsData::PositionlessWeather),
         // Telemetry
-        b'T' => parse_aprs_telemetry(info).map(AprsData::Telemetry),
+        b'T' => AprsTelemetry::from_bytes(info).map(AprsData::Telemetry),
         // Query
-        b'?' => parse_aprs_query(info).map(AprsData::Query),
+        b'?' => AprsQuery::from_bytes(info).map(AprsData::Query),
         // Third-party traffic (APRS 1.0.1 §17): `}source>dest,path:payload`
         b'}' => parse_aprs_third_party(info),
         // Maidenhead grid locator (APRS 1.0.1 §5.6): `[EM13qc`
@@ -1133,10 +1520,10 @@ pub fn parse_aprs_data(info: &[u8]) -> Result<AprsData, AprsError> {
         // downstream code can choose to parse Peet Bros format
         // separately or just log the bytes.
         b'#' | b'*' => Ok(AprsData::RawWeather {
-            data_type: first,
+            data_type: RawWeatherFormat::try_from(first)?,
             payload: info.get(1..).unwrap_or(&[]).to_vec(),
         }),
-        // Mic-E (` ' 0x1C 0x1D) needs destination address: use parse_mice_position().
+        // Mic-E identifiers need the destination supplied to from_bytes_with_destination.
         b'`' | b'\'' | 0x1C | 0x1D => Err(AprsError::MicERequiresDestination),
         // All other types are unrecognized.
         _ => Err(AprsError::InvalidFormat),
@@ -1162,7 +1549,7 @@ fn parse_aprs_third_party(info: &[u8]) -> Result<AprsData, AprsError> {
         .get(colon + 1..)
         .ok_or(AprsError::InvalidFormat)?
         .to_vec();
-    let header = decode_wire_ascii("APRS third-party header", header_bytes)?.to_owned();
+    let header = decode_wire_ascii(AprsWireTextField::ThirdPartyHeader, header_bytes)?.to_owned();
     Ok(AprsData::ThirdParty { header, payload })
 }
 
@@ -1174,48 +1561,9 @@ fn parse_aprs_grid(info: &[u8]) -> Result<AprsData, AprsError> {
         return Err(AprsError::InvalidFormat);
     }
     let tail = info.get(1..).unwrap_or(&[]);
-    let body = decode_wire_ascii("APRS Maidenhead grid", tail)?
-        .trim_end_matches(['\r', '\n', ' '])
-        .to_owned();
-    // Maidenhead locators are built in 2-char pairs, so only even lengths
-    // are well-formed. Accept the 4-char (field+square) and 6-char
-    // (+sub-square) forms; reject 5 (the old `4..=6` guard let a 5-char
-    // body through and never validated its trailing byte) and any other
-    // length.
-    if !matches!(body.len(), 4 | 6) {
-        return Err(AprsError::InvalidFormat);
-    }
-    let bytes = body.as_bytes();
-    // First two: letters A-R. Next two: digits 0-9. Last two (optional):
-    // letters a-x. Every byte of whatever length we accept must be
-    // validated: an odd length leaves a trailing byte unchecked, so only
-    // the even Maidenhead pair-lengths {4, 6} are valid here. (The spec
-    // also defines an 8-char extended-square locator, but this `[` data
-    // type dispatcher only emits 4-/6-char grids, so 8 is rejected too.)
-    let b0 = *bytes.first().ok_or(AprsError::InvalidFormat)?;
-    let b1 = *bytes.get(1).ok_or(AprsError::InvalidFormat)?;
-    let b2 = *bytes.get(2).ok_or(AprsError::InvalidFormat)?;
-    let b3 = *bytes.get(3).ok_or(AprsError::InvalidFormat)?;
-    if !b0.is_ascii_uppercase()
-        || !b1.is_ascii_uppercase()
-        || !b2.is_ascii_digit()
-        || !b3.is_ascii_digit()
-        || b0 > b'R'
-        || b1 > b'R'
-    {
-        return Err(AprsError::InvalidFormat);
-    }
-    // 6-char form carries a sub-square pair (letters a-x). The length guard
-    // above guarantees a 6-char body has both bytes present, so a 5-char
-    // body can no longer slip past with an unchecked byte 4.
-    if body.len() == 6 {
-        let b4 = *bytes.get(4).ok_or(AprsError::InvalidFormat)?;
-        let b5 = *bytes.get(5).ok_or(AprsError::InvalidFormat)?;
-        if !b4.is_ascii_lowercase() || !b5.is_ascii_lowercase() || b4 > b'x' || b5 > b'x' {
-            return Err(AprsError::InvalidFormat);
-        }
-    }
-    Ok(AprsData::Grid(body))
+    let body = decode_wire_ascii(AprsWireTextField::MaidenheadGrid, tail)?
+        .trim_end_matches(['\r', '\n', ' ']);
+    Ok(AprsData::Grid(MaidenheadGrid::new(body)?))
 }
 
 /// Parse an APRS raw GPS / NMEA frame (data type `$`).
@@ -1228,7 +1576,7 @@ fn parse_aprs_raw_gps(info: &[u8]) -> Result<AprsData, AprsError> {
         return Err(AprsError::InvalidFormat);
     }
     let tail = info.get(1..).unwrap_or(&[]);
-    let body = decode_wire_ascii("APRS NMEA sentence", tail)?
+    let body = decode_wire_ascii(AprsWireTextField::NmeaSentence, tail)?
         .trim_end_matches(['\r', '\n'])
         .to_owned();
     Ok(AprsData::RawGps(body))
@@ -1245,7 +1593,8 @@ fn parse_aprs_capabilities(info: &[u8]) -> Result<AprsData, AprsError> {
         return Err(AprsError::InvalidFormat);
     }
     let tail = info.get(1..).unwrap_or(&[]);
-    let body = decode_wire_ascii("APRS station capabilities", tail)?.trim_end_matches(['\r', '\n']);
+    let body = decode_wire_ascii(AprsWireTextField::StationCapabilities, tail)?
+        .trim_end_matches(['\r', '\n']);
     let mut tokens: Vec<(String, String)> = Vec::new();
     for entry in body.split(',') {
         let entry = entry.trim();
@@ -1269,7 +1618,7 @@ fn parse_aprs_user_defined(info: &[u8]) -> Result<AprsData, AprsError> {
     if info.first() != Some(&b'{') {
         return Err(AprsError::InvalidFormat);
     }
-    let experiment = *info.get(1).ok_or(AprsError::InvalidFormat)? as char;
+    let experiment = ExperimentId::from_byte(*info.get(1).ok_or(AprsError::InvalidFormat)?);
     let data = info.get(2..).unwrap_or(&[]).to_vec();
     Ok(AprsData::UserDefined { experiment, data })
 }
@@ -1362,7 +1711,7 @@ mod tests {
         assert_eq!(
             parse_aprs_data(info),
             Err(AprsError::InvalidTextByte {
-                field: "APRS third-party header",
+                field: AprsWireTextField::ThirdPartyHeader,
                 index: 0,
                 byte: 0xFF,
             }),
@@ -1374,7 +1723,7 @@ mod tests {
         let info = b"[EM13qc";
         let result = parse_aprs_data(info)?;
         assert!(
-            matches!(&result, AprsData::Grid(g) if g == "EM13qc"),
+            matches!(&result, AprsData::Grid(g) if g.as_str() == "EM13qc"),
             "expected Grid, got {result:?}",
         );
         Ok(())
@@ -1385,7 +1734,7 @@ mod tests {
         assert_eq!(
             parse_aprs_data(b"[EM13\xFFc"),
             Err(AprsError::InvalidTextByte {
-                field: "APRS Maidenhead grid",
+                field: AprsWireTextField::MaidenheadGrid,
                 index: 4,
                 byte: 0xFF,
             }),
@@ -1397,7 +1746,7 @@ mod tests {
         let info = b"[FM18";
         let result = parse_aprs_data(info)?;
         assert!(
-            matches!(&result, AprsData::Grid(g) if g == "FM18"),
+            matches!(&result, AprsData::Grid(g) if g.as_str() == "FM18"),
             "expected Grid, got {result:?}",
         );
         Ok(())
@@ -1411,10 +1760,7 @@ mod tests {
 
     #[test]
     fn dispatch_grid_five_char_rejected() {
-        // Verified bug: a 5-char locator passed the old `4..=6` length
-        // guard but its 5th byte was never validated, so "[AA00!" was
-        // accepted as Grid("AA00!"). Maidenhead locators are even-length
-        // pairs; 5 is invalid.
+        // Maidenhead locators consist of complete two-character pairs.
         assert!(
             parse_aprs_data(b"[AA00!").is_err(),
             "5-char locator must be rejected",
@@ -1425,7 +1771,7 @@ mod tests {
     fn dispatch_grid_four_char_accepted() -> TestResult {
         let result = parse_aprs_data(b"[AA00")?;
         assert!(
-            matches!(&result, AprsData::Grid(g) if g == "AA00"),
+            matches!(&result, AprsData::Grid(g) if g.as_str() == "AA00"),
             "expected Grid(AA00), got {result:?}",
         );
         Ok(())
@@ -1435,7 +1781,7 @@ mod tests {
     fn dispatch_grid_six_char_accepted() -> TestResult {
         let result = parse_aprs_data(b"[FN20qa")?;
         assert!(
-            matches!(&result, AprsData::Grid(g) if g == "FN20qa"),
+            matches!(&result, AprsData::Grid(g) if g.as_str() == "FN20qa"),
             "expected Grid(FN20qa), got {result:?}",
         );
         Ok(())
@@ -1503,7 +1849,7 @@ mod tests {
             matches!(
                 &result,
                 AprsData::UserDefined { experiment, data }
-                    if *experiment == 'A' && data == b"data payload"
+                    if experiment.as_byte() == b'A' && data == b"data payload"
             ),
             "expected UserDefined, got {result:?}",
         );
@@ -1532,7 +1878,7 @@ mod tests {
             matches!(
                 &result,
                 AprsData::RawWeather { data_type, payload }
-                    if *data_type == b'#' && payload == b"0123*4567"
+                    if *data_type == RawWeatherFormat::Hash && payload == b"0123*4567"
             ),
             "expected RawWeather(#), got {result:?}",
         );
@@ -1548,7 +1894,7 @@ mod tests {
             matches!(
                 &result,
                 AprsData::RawWeather { data_type, payload }
-                    if *data_type == b'*' && payload == b"0123 4567"
+                    if *data_type == RawWeatherFormat::Asterisk && payload == b"0123 4567"
             ),
             "expected RawWeather(*), got {result:?}",
         );
@@ -1566,23 +1912,6 @@ mod tests {
             ),
             "expected MicERequiresDestination",
         );
-    }
-
-    // ---- ParseContext tests ----
-
-    #[test]
-    fn parse_context_display_with_field() {
-        let ctx = ParseContext::with_error(AprsError::InvalidFormat, 17, Some("addressee"));
-        let s = format!("{ctx}");
-        assert!(s.contains("byte 17"), "expected byte 17 in {s:?}");
-        assert!(s.contains("addressee"), "expected addressee in {s:?}");
-    }
-
-    #[test]
-    fn parse_context_display_without_field() {
-        let ctx = ParseContext::with_error(AprsError::InvalidCoordinates, 4, None);
-        let s = format!("{ctx}");
-        assert!(s.contains("byte 4"), "expected byte 4 in {s:?}");
     }
 
     // ---- Timestamp tests ----
@@ -1604,45 +1933,51 @@ mod tests {
     // ---- Extensions parser tests ----
 
     #[test]
-    fn parse_extensions_cse_spd() {
-        let ext = parse_aprs_extensions("088/036");
-        assert_eq!(ext.course_speed, Some((88, 36)));
+    fn parse_extensions_cse_spd() -> TestResult {
+        let ext = AprsDataExtension::from_comment("088/036");
+        let motion = ext.course_speed().ok_or("course/speed")?;
+        assert_eq!(motion.course().as_degrees(), 88);
+        assert!((motion.speed().as_knots() - 36.0).abs() < f64::EPSILON);
         assert!(ext.phg.is_none());
         assert!(ext.altitude_ft.is_none());
         assert!(ext.dao.is_none());
+        Ok(())
     }
 
     #[test]
-    fn parse_extensions_cse_spd_with_comment() {
-        let ext = parse_aprs_extensions("270/015via Mic-E");
-        assert_eq!(ext.course_speed, Some((270, 15)));
+    fn parse_extensions_cse_spd_with_comment() -> TestResult {
+        let ext = AprsDataExtension::from_comment("270/015via Mic-E");
+        let motion = ext.course_speed().ok_or("course/speed")?;
+        assert_eq!(motion.course().as_degrees(), 270);
+        assert!((motion.speed().as_knots() - 15.0).abs() < f64::EPSILON);
+        Ok(())
     }
 
     #[test]
     fn parse_extensions_cse_spd_invalid_course() {
         // Course 999 > 360 is invalid.
-        let ext = parse_aprs_extensions("999/050");
+        let ext = AprsDataExtension::from_comment("999/050");
         assert!(ext.course_speed.is_none());
     }
 
     #[test]
     fn parse_extensions_cse_spd_not_at_start() {
         // CSE/SPD must be at position 0.
-        let ext = parse_aprs_extensions("xx088/036");
+        let ext = AprsDataExtension::from_comment("xx088/036");
         assert!(ext.course_speed.is_none());
     }
 
     #[test]
     fn parse_extensions_phg() -> TestResult {
-        // PHG5132: power=5²=25 W, height=10×2²=40 ft? No: '1' → 20 ft.
+        // PHG5132: power=5²=25 W, height=10×2¹=20 feet above average terrain.
         // gain=3 dB, directivity code 2 → East (90°).
-        let ext = parse_aprs_extensions("PHG5132");
+        let ext = AprsDataExtension::from_comment("PHG5132");
         let phg = ext.phg.ok_or("phg missing")?;
-        assert_eq!(phg.power_watts, 25);
-        assert_eq!(phg.height_feet, 20);
-        assert_eq!(phg.gain_db, 3);
-        assert_eq!(phg.directivity, PhgDirectivity::East);
-        assert_eq!(phg.directivity.to_degrees(), Some(90));
+        assert_eq!(phg.power_watts(), 25);
+        assert!((phg.height_feet() - 20.0).abs() < f64::EPSILON);
+        assert_eq!(phg.gain_db(), 3);
+        assert_eq!(phg.directivity(), PhgDirectivity::East);
+        assert_eq!(phg.directivity().to_degrees(), Some(90));
         Ok(())
     }
 
@@ -1650,22 +1985,22 @@ mod tests {
     fn parse_extensions_phg_omni() -> TestResult {
         // PHG2360: power=2²=4 W, height=10×2³=80 ft, gain=6 dB,
         // directivity code 0 → Omni.
-        let ext = parse_aprs_extensions("PHG2360");
+        let ext = AprsDataExtension::from_comment("PHG2360");
         let phg = ext.phg.ok_or("phg missing")?;
-        assert_eq!(phg.power_watts, 4);
-        assert_eq!(phg.height_feet, 80);
-        assert_eq!(phg.gain_db, 6);
-        assert_eq!(phg.directivity, PhgDirectivity::Omni);
-        assert_eq!(phg.directivity.to_degrees(), None);
-        assert!(phg.directivity.is_omni());
+        assert_eq!(phg.power_watts(), 4);
+        assert!((phg.height_feet() - 80.0).abs() < f64::EPSILON);
+        assert_eq!(phg.gain_db(), 6);
+        assert_eq!(phg.directivity(), PhgDirectivity::Omni);
+        assert_eq!(phg.directivity().to_degrees(), None);
+        assert!(phg.directivity().is_omni());
         Ok(())
     }
 
     #[test]
     fn parse_extensions_phg_in_comment() -> TestResult {
-        let ext = parse_aprs_extensions("some text PHG5132 more text");
+        let ext = AprsDataExtension::from_comment("some text PHG5132 more text");
         let phg = ext.phg.ok_or("phg missing")?;
-        assert_eq!(phg.power_watts, 25);
+        assert_eq!(phg.power_watts(), 25);
         Ok(())
     }
 
@@ -1680,10 +2015,7 @@ mod tests {
 
     #[test]
     fn phg_directivity_all_codes_round_trip() -> TestResult {
-        // Verify the spec table: every code in 0..=9 decodes to a known
-        // variant and re-encodes to the same direction string. Catches
-        // the previous-generation bug where 20° increments were used
-        // instead of 45° increments.
+        // Every code in the primary table retains its direction and label.
         let expectations: [(u8, PhgDirectivity, Option<u16>, &str); 10] = [
             (0, PhgDirectivity::Omni, None, "omni"),
             (1, PhgDirectivity::NorthEast, Some(45), "NE"),
@@ -1719,18 +2051,21 @@ mod tests {
         // digit may be any ASCII character `'0'` and above, allowing
         // balloons/satellites to encode heights beyond 5 120 ft (the
         // `'9'` cap). Earlier code rejected `':'` via `is_ascii_digit`.
-        let ext = parse_aprs_extensions("PHG5:30");
+        let ext = AprsDataExtension::from_comment("PHG5:30");
         let phg = ext.phg.ok_or("phg missing")?;
-        assert_eq!(phg.height_feet, 10_240, "':' should decode to 10240 ft");
+        assert!(
+            (phg.height_feet() - 10_240.0).abs() < f64::EPSILON,
+            "':' should decode to 10240 ft"
+        );
         Ok(())
     }
 
     #[test]
     fn phg_height_balloon_range() -> TestResult {
-        // `';'` (h=11) → 20 480 ft AGL, high-altitude balloon territory.
-        let ext = parse_aprs_extensions("PHG3;30");
+        // `';'` (h=11) is 20 480 feet above average terrain.
+        let ext = AprsDataExtension::from_comment("PHG3;30");
         let phg = ext.phg.ok_or("phg missing")?;
-        assert_eq!(phg.height_feet, 20_480);
+        assert!((phg.height_feet() - 20_480.0).abs() < f64::EPSILON);
         Ok(())
     }
 
@@ -1738,7 +2073,7 @@ mod tests {
     fn phg_height_rejects_below_zero_ascii() {
         // Bytes below ASCII `'0'` (e.g. ` ` = 32) are not valid PHG
         // height codes and must produce None.
-        let ext = parse_aprs_extensions("PHG5 30");
+        let ext = AprsDataExtension::from_comment("PHG5 30");
         assert!(ext.phg.is_none(), "space height should be rejected");
     }
 
@@ -1840,67 +2175,97 @@ mod tests {
     }
 
     #[test]
-    fn phg_height_rejects_overflow_digit() {
-        // The u32-safe cap is `digit <= 28` → byte `'0' + 28 = 'L'`.
-        // A byte at `'M'` would overflow on `10 << 29` and is rejected.
-        let ext = parse_aprs_extensions("PHG5M30");
+    fn phg_height_separates_protocol_and_integer_representation() -> TestResult {
+        let phg = AprsDataExtension::from_comment("PHG5M30")
+            .phg()
+            .ok_or("PHG height")?;
+        assert_eq!(phg.height_exponent(), 29);
+        assert!((phg.height_feet() - 5_368_709_120.0).abs() < f64::EPSILON);
+        assert_eq!(phg.height_feet_u32(), None);
         assert!(
-            ext.phg.is_none(),
-            "height byte beyond u32-safe cap should be rejected"
+            Phg::from_bytes([b'5', 127, b'3', b'0'])?
+                .height_feet()
+                .is_finite()
         );
+        assert!(Phg::from_bytes([b'5', 128, b'3', b'0']).is_err());
+        Ok(())
     }
 
     #[test]
     fn parse_extensions_altitude() {
-        let ext = parse_aprs_extensions("some comment /A=001234 more");
+        let ext = AprsDataExtension::from_comment("some comment /A=001234 more");
         assert_eq!(ext.altitude_ft, Some(1234));
     }
 
     #[test]
     fn parse_extensions_altitude_negative() {
-        let ext = parse_aprs_extensions("/A=-00100");
+        let ext = AprsDataExtension::from_comment("/A=-00100");
         assert_eq!(ext.altitude_ft, Some(-100));
     }
 
     #[test]
     fn parse_extensions_altitude_zeros() {
-        let ext = parse_aprs_extensions("/A=000000");
+        let ext = AprsDataExtension::from_comment("/A=000000");
         assert_eq!(ext.altitude_ft, Some(0));
     }
 
     #[test]
     fn parse_extensions_dao_human_readable() -> TestResult {
-        // !W5!: W is uppercase, so digits 5 and 5.
-        let ext = parse_aprs_extensions("text !5W5! more");
-        let (lat, lon) = ext.dao.ok_or("dao missing")?;
-        let expected = 5.0 / 600.0;
-        assert!((lat - expected).abs() < 1e-9, "lat={lat}");
-        assert!((lon - expected).abs() < 1e-9, "lon={lon}");
+        let dao = AprsDataExtension::from_comment("text !W23! more")
+            .dao()
+            .ok_or("dao missing")?;
+        assert_eq!(dao.to_bytes(), *b"!W23!");
+        assert_eq!(dao.precision(), DaoPrecision::Decimal);
+        assert!(
+            (dao.latitude_offset_degrees().ok_or("latitude precision")? - 2.0 / 60_000.0).abs()
+                < 1e-15
+        );
+        assert!(
+            (dao.longitude_offset_degrees()
+                .ok_or("longitude precision")?
+                - 3.0 / 60_000.0)
+                .abs()
+                < 1e-15
+        );
         Ok(())
     }
 
     #[test]
     fn parse_extensions_dao_base91() -> TestResult {
-        // !w"!: w is lowercase, " is char 34, so base-91 value = 34-33 = 1
-        let ext = parse_aprs_extensions("!\"w\"!");
-        let (lat, lon) = ext.dao.ok_or("dao missing")?;
-        let expected = 1.0 / (91.0 * 60.0);
-        assert!((lat - expected).abs() < 1e-9, "lat={lat}");
-        assert!((lon - expected).abs() < 1e-9, "lon={lon}");
+        let dao = AprsDataExtension::from_comment("!wAb!")
+            .dao()
+            .ok_or("dao missing")?;
+        assert_eq!(dao.to_bytes(), *b"!wAb!");
+        assert_eq!(dao.precision(), DaoPrecision::Base91);
+        assert!(
+            (dao.latitude_offset_degrees().ok_or("latitude precision")? - 32.0 / (91.0 * 6_000.0))
+                .abs()
+                < 1e-15
+        );
+        assert!(
+            (dao.longitude_offset_degrees()
+                .ok_or("longitude precision")?
+                - 65.0 / (91.0 * 6_000.0))
+                .abs()
+                < 1e-15
+        );
         Ok(())
     }
 
     #[test]
-    fn parse_extensions_combined() {
-        let ext = parse_aprs_extensions("088/036PHG5132/A=001234");
-        assert_eq!(ext.course_speed, Some((88, 36)));
+    fn parse_extensions_combined() -> TestResult {
+        let ext = AprsDataExtension::from_comment("088/036PHG5132/A=001234");
+        let motion = ext.course_speed().ok_or("course/speed")?;
+        assert_eq!(motion.course().as_degrees(), 88);
+        assert!((motion.speed().as_knots() - 36.0).abs() < f64::EPSILON);
         assert!(ext.phg.is_some());
         assert_eq!(ext.altitude_ft, Some(1234));
+        Ok(())
     }
 
     #[test]
     fn parse_extensions_empty() {
-        let ext = parse_aprs_extensions("");
+        let ext = AprsDataExtension::from_comment("");
         assert!(ext.course_speed.is_none());
         assert!(ext.phg.is_none());
         assert!(ext.altitude_ft.is_none());
@@ -1912,85 +2277,84 @@ mod tests {
     #[test]
     fn telemetry_definition_parm() -> TestResult {
         let def =
-            TelemetryDefinition::from_text("PARM.Volts,Temp,Humid,Wind,Rain,Door,Light,Heat,,,,,")
+            TelemetryDefinition::from_text("PARM.Volts,Temp,Humid,Wind,Rain,Door,Lit,Hot,,,,,")?
                 .ok_or("missing")?;
         let TelemetryDefinition::Parameters(p) = def else {
             return Err("expected Parameters".into());
         };
-        assert_eq!(p.analog.first().and_then(Option::as_deref), Some("Volts"));
-        assert_eq!(p.analog.get(4).and_then(Option::as_deref), Some("Rain"));
-        assert_eq!(p.digital.first().and_then(Option::as_deref), Some("Door"));
-        assert_eq!(p.digital.get(2).and_then(Option::as_deref), Some("Heat"));
+        assert_eq!(p.as_slice().first().map(String::as_str), Some("Volts"));
+        assert_eq!(p.as_slice().get(4).map(String::as_str), Some("Rain"));
+        assert_eq!(p.as_slice().get(5).map(String::as_str), Some("Door"));
+        assert_eq!(p.as_slice().get(7).map(String::as_str), Some("Hot"));
+        assert!(
+            TelemetryDefinition::from_text("PARM.Volts,Temp,Humid,Wind,Rain,Door,Light,Heat")
+                .is_err()
+        );
         Ok(())
     }
 
     #[test]
     fn telemetry_definition_unit() -> TestResult {
-        let def = TelemetryDefinition::from_text("UNIT.Vdc,C,%,mph,in,open,lit,on,,,,,")
+        let def = TelemetryDefinition::from_text("UNIT.Vdc,C,%,mph,in,open,lit,on,,,,,")?
             .ok_or("missing")?;
         let TelemetryDefinition::Units(p) = def else {
             return Err("expected Units".into());
         };
-        assert_eq!(p.analog.get(1).and_then(Option::as_deref), Some("C"));
+        assert_eq!(p.as_slice().get(1).map(String::as_str), Some("C"));
         Ok(())
     }
 
     #[test]
     fn telemetry_definition_eqns() -> TestResult {
-        let def = TelemetryDefinition::from_text("EQNS.0,0.1,0,0,0.5,0,0,1,0,0,2,0,0,3,0")
+        let def = TelemetryDefinition::from_text("EQNS.0,0.1,0,0,0.5,0,0,1,0,0,2,0,0,3,0")?
             .ok_or("missing")?;
         let TelemetryDefinition::Equations(eqs) = def else {
             return Err("expected Equations".into());
         };
-        assert_eq!(eqs.first(), Some(&Some((0.0, 0.1, 0.0))));
-        assert_eq!(eqs.get(1), Some(&Some((0.0, 0.5, 0.0))));
-        assert_eq!(eqs.get(4), Some(&Some((0.0, 3.0, 0.0))));
+        assert_eq!(
+            eqs.as_slice(),
+            &[
+                0.0, 0.1, 0.0, 0.0, 0.5, 0.0, 0.0, 1.0, 0.0, 0.0, 2.0, 0.0, 0.0, 3.0, 0.0
+            ]
+        );
         Ok(())
     }
 
     #[test]
-    fn telemetry_definition_eqns_strict_rejects_malformed_slot() -> TestResult {
-        // Regression guard: a non-numeric field must
-        // disable the affected slot rather than substituting 0.0
-        // (which would silently produce a valid-looking equation).
-        // Here channel 1 has a bad `b` coefficient ('hello'), so the
-        // entire slot must be None.
-        let def = TelemetryDefinition::from_text("EQNS.0,0.1,0,0,hello,0,0,1,0,0,2,0,0,3,0")
-            .ok_or("missing")?;
-        let TelemetryDefinition::Equations(eqs) = def else {
-            return Err("expected Equations".into());
-        };
-        assert_eq!(eqs.first(), Some(&Some((0.0, 0.1, 0.0))), "slot 0 OK");
-        assert_eq!(eqs.get(1), Some(&None), "slot 1 must be None on bad coeff");
-        assert_eq!(eqs.get(2), Some(&Some((0.0, 1.0, 0.0))), "slot 2 OK");
-        Ok(())
+    fn telemetry_definition_eqns_strict_rejects_malformed_slot() {
+        for text in [
+            "EQNS.0,0.1,0,0,hello,0,0,1,0,0,2,0,0,3,0",
+            "EQNS.NaN",
+            "EQNS.inf",
+            "EQNS.1,,2",
+        ] {
+            assert!(
+                TelemetryDefinition::from_text(text).is_err(),
+                "accepted {text}"
+            );
+        }
     }
 
     #[test]
     fn telemetry_definition_eqns_strict_rejects_missing_slot() -> TestResult {
-        // A short input (fewer than 15 fields) leaves later slots None,
-        // never coerces missing fields to 0.0.
-        let def = TelemetryDefinition::from_text("EQNS.0,0.1,0,0,0.5,0").ok_or("missing")?;
+        // A short input retains its exact prefix, including a partial triple.
+        let def = TelemetryDefinition::from_text("EQNS.0,0.1,0,0,0.5,0,2")?.ok_or("missing")?;
         let TelemetryDefinition::Equations(eqs) = def else {
             return Err("expected Equations".into());
         };
-        assert_eq!(eqs.first(), Some(&Some((0.0, 0.1, 0.0))));
-        assert_eq!(eqs.get(1), Some(&Some((0.0, 0.5, 0.0))));
-        for i in 2..5 {
-            assert_eq!(eqs.get(i), Some(&None), "slot {i} must be None");
-        }
+        assert_eq!(eqs.as_slice(), &[0.0, 0.1, 0.0, 0.0, 0.5, 0.0, 2.0]);
         Ok(())
     }
 
     #[test]
     fn telemetry_definition_bits() -> TestResult {
-        let def = TelemetryDefinition::from_text("BITS.11111111,WX station telemetry")
+        let def = TelemetryDefinition::from_text("BITS.11111111,WX station telemetry")?
             .ok_or("missing")?;
         let TelemetryDefinition::Bits { bits, title } = def else {
             return Err("expected Bits".into());
         };
-        assert_eq!(bits, "11111111");
-        assert_eq!(title, "WX station telemetry");
+        assert_eq!(bits.bits(), 255);
+        assert_eq!(title.as_str(), "WX station telemetry");
         Ok(())
     }
 
@@ -1998,35 +2362,81 @@ mod tests {
     fn telemetry_definition_bits_exactly_eight() -> TestResult {
         // APRS 1.0.1 §13 p.70: the bit-sense field is exactly 8 binary
         // digits. A correct 8-digit mask parses.
-        let def = TelemetryDefinition::from_text("BITS.10110000,Title").ok_or("expected Bits")?;
+        let def = TelemetryDefinition::from_text("BITS.10110000,Title")?.ok_or("expected Bits")?;
         let TelemetryDefinition::Bits { bits, title } = def else {
             return Err("expected Bits".into());
         };
-        assert_eq!(bits, "10110000");
-        assert_eq!(title, "Title");
+        assert_eq!(bits.bits(), 0b1011_0000);
+        assert_eq!(title.as_str(), "Title");
         Ok(())
     }
 
     #[test]
     fn telemetry_definition_bits_rejects_empty_mask() {
         // A bare "BITS." has no active-bit mask and must be rejected.
-        assert!(TelemetryDefinition::from_text("BITS.").is_none());
+        assert!(TelemetryDefinition::from_text("BITS.").is_err());
     }
 
     #[test]
     fn telemetry_definition_bits_rejects_short_mask() {
         // Fewer than 8 digits is malformed.
-        assert!(TelemetryDefinition::from_text("BITS.101").is_none());
+        assert!(TelemetryDefinition::from_text("BITS.101").is_err());
     }
 
     #[test]
     fn telemetry_definition_bits_rejects_non_binary() {
         // Right length but a non-binary digit is malformed.
-        assert!(TelemetryDefinition::from_text("BITS.10110002,Title").is_none());
+        assert!(TelemetryDefinition::from_text("BITS.10110002,Title").is_err());
     }
 
     #[test]
     fn telemetry_definition_unknown_returns_none() {
-        assert!(TelemetryDefinition::from_text("hello world").is_none());
+        assert_eq!(TelemetryDefinition::from_text("hello world"), Ok(None));
+    }
+
+    #[test]
+    fn telemetry_definitions_enforce_bounded_positional_records() -> TestResult {
+        assert!(TelemetryDefinition::from_text("PARM.a,b,c,d,e,f,g,h,i,j,k,l,m,n").is_err());
+        assert!(TelemetryDefinition::from_text("EQNS.0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0").is_err());
+        let labels = TelemetryDefinition::from_text("PARM.A,,C")?.ok_or("labels")?;
+        let TelemetryDefinition::Parameters(labels) = labels else {
+            return Err("parameters".into());
+        };
+        assert_eq!(labels.as_slice(), &["A", "", "C"]);
+        for locator in ["aa00", "AA00XX", "Aa00bX", "IO91SX"] {
+            assert_eq!(MaidenheadGrid::new(locator)?.as_str(), locator);
+        }
+        let owned = String::from("Aa00bX");
+        let allocation = owned.as_ptr();
+        let grid = MaidenheadGrid::try_from(owned)?;
+        assert_eq!(grid.as_str().as_ptr(), allocation);
+        assert!(MaidenheadGrid::try_from(String::from("ZZ00")).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn dao_null_unknown_datum_and_malformed_candidates_are_distinct() -> TestResult {
+        let null = DaoExtension::from_bytes(*b"!W  !")?;
+        assert_eq!(null.datum().as_byte(), b'W');
+        assert_eq!(null.precision(), DaoPrecision::None);
+        assert_eq!(null.latitude_offset_degrees(), None);
+        let unknown = DaoExtension::from_bytes(*b"!123!")?;
+        assert_eq!(unknown.precision(), DaoPrecision::Unspecified);
+        assert_eq!(unknown.to_bytes(), *b"!123!");
+        assert_eq!(unknown.longitude_offset_degrees(), None);
+        for bytes in [*b"!W2 !", *b"!WAB!", *b"!w|b!", *b"xW23!"] {
+            assert!(
+                DaoExtension::from_bytes(bytes).is_err(),
+                "accepted {bytes:?}"
+            );
+        }
+        assert_eq!(
+            AprsDataExtension::from_comment("!WAB! !W23!")
+                .dao()
+                .ok_or("later DAO")?
+                .to_bytes(),
+            *b"!W23!"
+        );
+        Ok(())
     }
 }

@@ -2,8 +2,8 @@
 
 use crate::error::AprsError;
 use crate::packet::AprsReportTimestamp;
-use crate::position::{AprsPosition, parse_compressed_body, parse_uncompressed_body};
-use crate::text::{ObjectName, decode_wire_ascii};
+use crate::position::AprsPosition;
+use crate::text::{ItemName, ObjectName, QueryText, decode_wire_ascii};
 
 /// An APRS object report (data type `;`).
 ///
@@ -11,32 +11,127 @@ use crate::text::{ObjectName, decode_wire_ascii};
 /// hurricanes, marathon runners, event locations. They include a
 /// name (9 chars), a live/killed flag, a timestamp, and a position.
 ///
-/// Per User Manual Chapter 14: the TH-D75 can transmit Object
-/// information via Menu No. 550 (Object 1-3).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AprsObject {
     /// Validated object name (up to 9 printable ASCII bytes).
-    pub name: ObjectName,
-    /// Whether the object is live (`true`) or killed (`false`).
-    pub live: bool,
+    name: ObjectName,
+    /// Live or killed state advertised by the report.
+    state: ReportState,
     /// Required seven-byte DHM or HMS timestamp.
-    pub timestamp: AprsReportTimestamp,
+    timestamp: AprsReportTimestamp,
     /// Position data.
-    pub position: AprsPosition,
+    position: AprsPosition,
+}
+
+/// Whether an object or item is advertised as live or withdrawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReportState {
+    /// The reported object or item is live.
+    Live,
+    /// The report withdraws the object or item.
+    Killed,
+}
+
+impl ReportState {
+    /// Returns whether the report advertises a live object or item.
+    #[must_use]
+    pub const fn is_live(self) -> bool {
+        matches!(self, Self::Live)
+    }
+}
+
+impl AprsObject {
+    /// Retains a checked name, state, report timestamp and position observation.
+    #[must_use]
+    pub const fn new(
+        name: ObjectName,
+        state: ReportState,
+        timestamp: AprsReportTimestamp,
+        position: AprsPosition,
+    ) -> Self {
+        Self {
+            name,
+            state,
+            timestamp,
+            position,
+        }
+    }
+    /// Borrows the unpadded object name.
+    #[must_use]
+    pub const fn name(&self) -> &ObjectName {
+        &self.name
+    }
+    /// Returns the live or killed state.
+    #[must_use]
+    pub const fn state(&self) -> ReportState {
+        self.state
+    }
+    /// Returns the object report's timestamp.
+    #[must_use]
+    pub const fn timestamp(&self) -> AprsReportTimestamp {
+        self.timestamp
+    }
+    /// Borrows the position observation.
+    #[must_use]
+    pub const fn position(&self) -> &AprsPosition {
+        &self.position
+    }
+    /// Decodes a padded name, state, seven-byte timestamp and position.
+    ///
+    /// # Errors
+    /// Returns framing, name, timestamp or position errors from [`AprsError`].
+    pub fn from_bytes(info: &[u8]) -> Result<Self, AprsError> {
+        parse_aprs_object(info)
+    }
 }
 
 /// An APRS item report (data type `)` ).
 ///
 /// Items are similar to objects but simpler (no timestamp). They
 /// represent static entities like event locations or landmarks.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AprsItem {
     /// Item name (3-9 characters).
-    pub name: String,
-    /// Whether the item is live (`true`) or killed (`false`).
-    pub live: bool,
+    name: ItemName,
+    /// Live or killed state advertised by the report.
+    state: ReportState,
     /// Position data.
-    pub position: AprsPosition,
+    position: AprsPosition,
+}
+
+impl AprsItem {
+    /// Retains a checked name, state and position observation.
+    #[must_use]
+    pub const fn new(name: ItemName, state: ReportState, position: AprsPosition) -> Self {
+        Self {
+            name,
+            state,
+            position,
+        }
+    }
+    /// Borrows the item name.
+    #[must_use]
+    pub const fn name(&self) -> &ItemName {
+        &self.name
+    }
+    /// Returns the live or killed state.
+    #[must_use]
+    pub const fn state(&self) -> ReportState {
+        self.state
+    }
+    /// Borrows the position observation.
+    #[must_use]
+    pub const fn position(&self) -> &AprsPosition {
+        &self.position
+    }
+    /// Decodes a three-to-nine-byte name, live/killed delimiter and position.
+    ///
+    /// # Errors
+    /// Returns [`AprsError::InvalidFormat`] for invalid framing, names or
+    /// delimiters, or the position decoder's error.
+    pub fn from_bytes(info: &[u8]) -> Result<Self, AprsError> {
+        parse_aprs_item(info)
+    }
 }
 
 /// Parsed APRS query.
@@ -65,7 +160,18 @@ pub enum AprsQuery {
     Heard,
     /// General query with raw text (everything after the leading `?`,
     /// not one of the well-known forms).
-    Other(String),
+    Other(QueryText),
+}
+
+impl AprsQuery {
+    /// Decodes a query's leading `?` and recognized selector or retained body.
+    ///
+    /// # Errors
+    /// Returns [`AprsError::InvalidFormat`] without `?`, or
+    /// [`AprsError::InvalidTextByte`] for non-ASCII bytes.
+    pub fn from_bytes(info: &[u8]) -> Result<Self, AprsError> {
+        parse_aprs_query(info)
+    }
 }
 
 /// Parse an APRS object report (`;name_____*DDHHMMzpos...`).
@@ -75,42 +181,41 @@ pub enum AprsQuery {
 /// Returns [`AprsError::InvalidFormat`] if the info field is shorter
 /// than 27 bytes, is missing the leading `;`, has an invalid live/killed
 /// flag, or has malformed position data.
-pub fn parse_aprs_object(info: &[u8]) -> Result<AprsObject, AprsError> {
+pub(crate) fn parse_aprs_object(info: &[u8]) -> Result<AprsObject, AprsError> {
     if info.first() != Some(&b';') {
         return Err(AprsError::InvalidFormat);
     }
     // ; + 9-char name + * or _ + 7-char timestamp + position (≥8 bytes) = 27 min
     let name_bytes = info.get(1..10).ok_or(AprsError::InvalidFormat)?;
     let flag = *info.get(10).ok_or(AprsError::InvalidFormat)?;
-    let live = match flag {
-        b'*' => true,
-        b'_' => false,
+    let state = match flag {
+        b'*' => ReportState::Live,
+        b'_' => ReportState::Killed,
         _ => return Err(AprsError::InvalidFormat),
     };
 
-    let name_wire = decode_wire_ascii("APRS object name", name_bytes)?;
-    let name = ObjectName::new(name_wire.trim_end_matches(' ')).map_err(|_| {
-        AprsError::InvalidObjectName("wire name must contain 1-9 printable ASCII bytes")
-    })?;
+    let name_wire = decode_wire_ascii(crate::AprsWireTextField::ObjectName, name_bytes)?;
+    let name =
+        ObjectName::new(name_wire.trim_end_matches(' ')).map_err(AprsError::InvalidObjectName)?;
 
     // After the name and live/killed flag, there's a 7-char timestamp
     // then position data.
     let pos_body = info.get(11..).ok_or(AprsError::InvalidFormat)?;
     let ts_bytes = pos_body.get(..7).ok_or(AprsError::InvalidFormat)?;
-    let timestamp_wire = decode_wire_ascii("APRS object timestamp", ts_bytes)?;
+    let timestamp_wire = decode_wire_ascii(crate::AprsWireTextField::ObjectTimestamp, ts_bytes)?;
     let timestamp = AprsReportTimestamp::from_wire(timestamp_wire)?;
     let pos_data = pos_body.get(7..).ok_or(AprsError::InvalidFormat)?;
 
     let first = *pos_data.first().ok_or(AprsError::InvalidFormat)?;
     let position = if first.is_ascii_digit() {
-        parse_uncompressed_body(pos_data)?
+        AprsPosition::from_uncompressed_body(pos_data)?
     } else {
-        parse_compressed_body(pos_data)?
+        AprsPosition::from_compressed_body(pos_data)?
     };
 
     Ok(AprsObject {
         name,
-        live,
+        state,
         timestamp,
         position,
     })
@@ -127,15 +232,14 @@ pub fn parse_aprs_object(info: &[u8]) -> Result<AprsObject, AprsError> {
 /// Returns [`AprsError::InvalidFormat`] for any violation of the spec:
 /// missing leading `)`, name outside the 3-9 character range, missing
 /// terminator, non-printable ASCII in name, or malformed position data.
-pub fn parse_aprs_item(info: &[u8]) -> Result<AprsItem, AprsError> {
+pub(crate) fn parse_aprs_item(info: &[u8]) -> Result<AprsItem, AprsError> {
     if info.first() != Some(&b')') {
         return Err(AprsError::InvalidFormat);
     }
     let body = info.get(1..).ok_or(AprsError::InvalidFormat)?;
 
-    // Scan the first 9 bytes for a terminator. Anything beyond that is
-    // outside the spec-legal range and the frame is malformed.
-    let search_len = std::cmp::min(body.len(), 9);
+    // The delimiter follows a name of at most nine bytes.
+    let search_len = std::cmp::min(body.len(), ItemName::MAX_LEN + 1);
     let search = body.get(..search_len).ok_or(AprsError::InvalidFormat)?;
     let terminator_pos = search
         .iter()
@@ -148,29 +252,33 @@ pub fn parse_aprs_item(info: &[u8]) -> Result<AprsItem, AprsError> {
     }
 
     let term_byte = *body.get(terminator_pos).ok_or(AprsError::InvalidFormat)?;
-    let live = term_byte == b'!';
+    let state = if term_byte == b'!' {
+        ReportState::Live
+    } else {
+        ReportState::Killed
+    };
     let name_bytes = body.get(..terminator_pos).ok_or(AprsError::InvalidFormat)?;
     // Reject non-printable ASCII in names.
     if name_bytes.iter().any(|&b| !(0x20..=0x7E).contains(&b)) {
         return Err(AprsError::InvalidFormat);
     }
-    let name = std::str::from_utf8(name_bytes)
-        .map_err(|_| AprsError::InvalidFormat)?
-        .to_owned();
+    let name =
+        ItemName::new(std::str::from_utf8(name_bytes).map_err(|_| AprsError::InvalidFormat)?)
+            .map_err(|_| AprsError::InvalidFormat)?;
     let pos_data = body
         .get(terminator_pos + 1..)
         .ok_or(AprsError::InvalidFormat)?;
 
     let first = *pos_data.first().ok_or(AprsError::InvalidFormat)?;
     let position = if first.is_ascii_digit() {
-        parse_uncompressed_body(pos_data)?
+        AprsPosition::from_uncompressed_body(pos_data)?
     } else {
-        parse_compressed_body(pos_data)?
+        AprsPosition::from_compressed_body(pos_data)?
     };
 
     Ok(AprsItem {
         name,
-        live,
+        state,
         position,
     })
 }
@@ -181,14 +289,14 @@ pub fn parse_aprs_item(info: &[u8]) -> Result<AprsItem, AprsError> {
 ///
 /// Returns [`AprsError::InvalidFormat`] if the info field does not begin
 /// with `?`.
-pub fn parse_aprs_query(info: &[u8]) -> Result<AprsQuery, AprsError> {
+pub(crate) fn parse_aprs_query(info: &[u8]) -> Result<AprsQuery, AprsError> {
     if info.first() != Some(&b'?') {
         return Err(AprsError::InvalidFormat);
     }
 
     let body_bytes = info.get(1..).unwrap_or(&[]);
-    let body = decode_wire_ascii("APRS query body", body_bytes)?;
-    let text = body.trim_end_matches('\r');
+    let body = decode_wire_ascii(crate::AprsWireTextField::QueryBody, body_bytes)?;
+    let text = body.trim_end_matches(['\r', '\n']);
 
     // Standard APRS queries per APRS 1.0.1 Chapter 15.
     match text {
@@ -201,7 +309,9 @@ pub fn parse_aprs_query(info: &[u8]) -> Result<AprsQuery, AprsError> {
         "WX" => Ok(AprsQuery::Weather),
         "PING" | "PING?" => Ok(AprsQuery::Ping),
         "IGATE" | "IGATE?" => Ok(AprsQuery::IGate),
-        _ => Ok(AprsQuery::Other(text.to_owned())),
+        _ => Ok(AprsQuery::Other(
+            QueryText::new(text).map_err(|_| AprsError::InvalidFormat)?,
+        )),
     }
 }
 
@@ -222,10 +332,10 @@ mod tests {
         let info = b";TORNADO  *092345z4903.50N/07201.75W-Tornado warning";
         let obj = parse_aprs_object(info)?;
         assert_eq!(obj.name.as_str(), "TORNADO");
-        assert!(obj.live);
+        assert!(obj.state().is_live());
         assert_eq!(obj.timestamp.to_wire_string(), "092345z");
         assert!(
-            (obj.position.latitude - 49.058_333).abs() < 0.001,
+            (obj.position().latitude().as_degrees() - 49.058_333).abs() < 0.001,
             "lat check"
         );
         Ok(())
@@ -236,7 +346,7 @@ mod tests {
         let info = b";MARATHON _092345z4903.50N/07201.75W-Event over";
         let obj = parse_aprs_object(info)?;
         assert_eq!(obj.name.as_str(), "MARATHON");
-        assert!(!obj.live);
+        assert!(!obj.state().is_live());
         Ok(())
     }
 
@@ -253,7 +363,7 @@ mod tests {
         assert_eq!(
             parse_aprs_object(info),
             Err(AprsError::InvalidTimestamp(
-                "7-byte timestamp must end in 'z', '/', or 'h'",
+                crate::TimestampError::UnknownSuffix,
             )),
         );
     }
@@ -278,7 +388,7 @@ mod tests {
         assert_eq!(
             parse_aprs_object(&info),
             Err(AprsError::InvalidTextByte {
-                field: "APRS object name",
+                field: crate::AprsWireTextField::ObjectName,
                 index: 0,
                 byte: 0xFF,
             }),
@@ -292,10 +402,10 @@ mod tests {
     fn parse_item_live() -> TestResult {
         let info = b")AID#2!4903.50N/07201.75W-First aid";
         let item = parse_aprs_item(info)?;
-        assert_eq!(item.name, "AID#2");
-        assert!(item.live);
+        assert_eq!(item.name.as_str(), "AID#2");
+        assert!(item.state().is_live());
         assert!(
-            (item.position.latitude - 49.058_333).abs() < 0.001,
+            (item.position().latitude().as_degrees() - 49.058_333).abs() < 0.001,
             "lat check"
         );
         Ok(())
@@ -305,7 +415,7 @@ mod tests {
     fn parse_item_killed() -> TestResult {
         let info = b")AID#2_4903.50N/07201.75W-Closed";
         let item = parse_aprs_item(info)?;
-        assert!(!item.live);
+        assert!(!item.state().is_live());
         Ok(())
     }
 
@@ -317,6 +427,26 @@ mod tests {
             matches!(parse_aprs_item(info), Err(AprsError::InvalidFormat)),
             "short name must be rejected",
         );
+    }
+
+    #[test]
+    fn item_name_boundaries_include_the_terminal_delimiter() -> TestResult {
+        for length in [3, 8, 9, 10] {
+            for live in [true, false] {
+                let name = "A".repeat(length);
+                let delimiter = if live { '!' } else { '_' };
+                let wire = format!("){name}{delimiter}4903.50N/07201.75W-");
+                let parsed = parse_aprs_item(wire.as_bytes());
+                if length <= ItemName::MAX_LEN {
+                    let item = parsed?;
+                    assert_eq!(item.name.as_str(), name);
+                    assert_eq!(item.state().is_live(), live);
+                } else {
+                    assert!(parsed.is_err(), "ten-byte item name accepted");
+                }
+            }
+        }
+        Ok(())
     }
 
     // ---- APRS query tests ----
@@ -385,7 +515,7 @@ mod tests {
     fn parse_query_other() -> TestResult {
         assert_eq!(
             parse_aprs_query(b"?FOOBAR")?,
-            AprsQuery::Other("FOOBAR".to_owned())
+            AprsQuery::Other(QueryText::new("FOOBAR")?)
         );
         Ok(())
     }
@@ -401,7 +531,7 @@ mod tests {
         assert_eq!(
             parse_aprs_query(b"?PING\xFF"),
             Err(AprsError::InvalidTextByte {
-                field: "APRS query body",
+                field: crate::AprsWireTextField::QueryBody,
                 index: 4,
                 byte: 0xFF,
             }),

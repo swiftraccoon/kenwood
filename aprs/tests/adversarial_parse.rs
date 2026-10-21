@@ -5,7 +5,7 @@
 //!
 //! Every byte this crate parses arrives from the open airwaves or a
 //! public APRS-IS feed; hostile and malformed input is the norm, not
-//! an edge case. `parse_aprs_data_full` is the single dispatcher that
+//! an edge case. `AprsData::from_bytes_with_destination` is the dispatcher that
 //! fans arbitrary bytes into ~15 sub-parsers (position, Mic-E,
 //! compressed, weather, telemetry, message, object, item, status...),
 //! several of which run float parsing and power arithmetic on
@@ -15,7 +15,7 @@
 //! returns `Ok` or `Err`, never panics and never hangs. A crash here
 //! is a remote denial of service on any station running the stack.
 
-use aprs::{parse_aprs_data, parse_aprs_data_full};
+use aprs::AprsData;
 use proptest::prelude::{ProptestConfig, any, prop_assert, proptest};
 
 // Sibling crates appear in the workspace dev-dep graph for this
@@ -38,7 +38,7 @@ proptest! {
     ) {
         // The contract is total-ness: any classification is fine, a
         // panic or hang is not.
-        let parsed = parse_aprs_data_full(&info, &dest);
+        let parsed = AprsData::from_bytes_with_destination(&info, &dest);
         prop_assert!(parsed.is_ok() || parsed.is_err());
     }
 
@@ -47,7 +47,7 @@ proptest! {
     fn parse_aprs_data_never_panics(
         info in proptest::collection::vec(any::<u8>(), 0..512),
     ) {
-        let parsed = parse_aprs_data(&info);
+        let parsed = AprsData::from_bytes(&info);
         prop_assert!(parsed.is_ok() || parsed.is_err());
     }
 
@@ -65,7 +65,7 @@ proptest! {
     ) {
         let mut info = vec![type_id];
         info.extend_from_slice(&rest);
-        let parsed = parse_aprs_data_full(&info, &dest);
+        let parsed = AprsData::from_bytes_with_destination(&info, &dest);
         prop_assert!(parsed.is_ok() || parsed.is_err());
     }
 
@@ -79,7 +79,7 @@ proptest! {
     ) {
         let mut info = vec![b'!'];
         info.extend_from_slice(body.as_bytes());
-        let parsed = parse_aprs_data(&info);
+        let parsed = AprsData::from_bytes(&info);
         prop_assert!(parsed.is_ok() || parsed.is_err());
     }
 }

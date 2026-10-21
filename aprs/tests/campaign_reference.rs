@@ -9,10 +9,9 @@
 //! `cargo nextest run -p aprs --test campaign_reference --no-capture`
 
 use aprs::{
-    AprsData, AprsSymbol, CompressedPositionText, Course, Latitude, Longitude, MiceMessage,
-    MiceSpeed, MiceStatusText, PositionReportText, StatusText, build_aprs_mice_with_message_packet,
-    build_aprs_position_compressed_packet, build_aprs_position_report_packet,
-    build_aprs_status_packet, parse_aprs_data, parse_aprs_data_full,
+    AprsData, AprsFrameHeader, AprsSymbol, CompressedPositionText, Course, Latitude, Longitude,
+    MiceMessage, MiceReport, MiceSpeed, MiceStatusText, PositionReportText, Speed, StatusText,
+    Tocall,
 };
 use ax25_codec::{Ax25Address, DigipeaterPath};
 use kiss_tnc as _;
@@ -42,14 +41,13 @@ fn mice_reference_text() -> Result<MiceStatusText, Box<dyn std::error::Error>> {
 
 #[test]
 fn uncompressed_reference_is_exact() -> TestResult {
-    let pkt = build_aprs_position_report_packet(
-        &source()?,
-        Latitude::new(LAT)?,
-        Longitude::new(LON)?,
-        AprsSymbol::CAR,
-        &reference_text()?,
-        &DigipeaterPath::empty(),
-    );
+    let pkt = AprsFrameHeader::new(source()?, Tocall::th_d75(), DigipeaterPath::empty())
+        .position_report_packet(
+            Latitude::new(LAT)?,
+            Longitude::new(LON)?,
+            AprsSymbol::CAR,
+            &reference_text()?,
+        );
     assert_eq!(pkt.information(), b"!3518.00N/08227.60W>ref".to_vec());
     println!(
         "uncompressed info: {}",
@@ -60,22 +58,21 @@ fn uncompressed_reference_is_exact() -> TestResult {
 
 #[test]
 fn compressed_reference_roundtrips() -> TestResult {
-    let pkt = build_aprs_position_compressed_packet(
-        &source()?,
-        Latitude::new(LAT)?,
-        Longitude::new(LON)?,
-        AprsSymbol::CAR,
-        &compressed_reference_text()?,
-        &DigipeaterPath::empty(),
-    );
+    let pkt = AprsFrameHeader::new(source()?, Tocall::th_d75(), DigipeaterPath::empty())
+        .position_compressed_packet(
+            Latitude::new(LAT)?,
+            Longitude::new(LON)?,
+            AprsSymbol::CAR,
+            &compressed_reference_text()?,
+        );
     assert_eq!(
         pkt.information().first().copied().ok_or("empty info")?,
         b'!'
     );
-    let parsed = parse_aprs_data(pkt.information())?;
+    let parsed = AprsData::from_bytes(pkt.information())?;
     assert!(
         matches!(&parsed, AprsData::Position(p)
-            if (p.latitude - LAT).abs() < 0.001 && (p.longitude - LON).abs() < 0.001),
+            if (p.latitude().as_degrees() - LAT).abs() < 0.001 && (p.longitude().as_degrees() - LON).abs() < 0.001),
         "compressed roundtrip drifted: {parsed:?}"
     );
     println!(
@@ -87,25 +84,24 @@ fn compressed_reference_roundtrips() -> TestResult {
 
 #[test]
 fn mice_reference_roundtrips() -> TestResult {
-    let pkt = build_aprs_mice_with_message_packet(
-        &source()?,
+    let report = MiceReport::new(
         Latitude::new(LAT)?,
         Longitude::new(LON)?,
         MiceSpeed::new(25)?,
         Course::new(90)?,
-        MiceMessage::OffDuty,
         AprsSymbol::CAR,
-        &mice_reference_text()?,
-        &DigipeaterPath::empty(),
-    );
-    let dest = pkt.destination.to_string();
-    let parsed = parse_aprs_data_full(pkt.information(), &dest)?;
+        mice_reference_text()?,
+    )?
+    .with_message(MiceMessage::OffDuty);
+    let pkt = report.to_packet(source()?, DigipeaterPath::empty());
+    let dest = pkt.header.destination.to_string();
+    let parsed = AprsData::from_bytes_with_destination(pkt.information(), &dest)?;
     assert!(
         matches!(&parsed, AprsData::Position(p)
-            if (p.latitude - LAT).abs() < 0.01
-                && (p.longitude - LON).abs() < 0.01
-                && p.speed_knots == Some(25)
-                && p.course_degrees == Some(90)),
+            if (p.latitude().as_degrees() - LAT).abs() < 0.01
+                && (p.longitude().as_degrees() - LON).abs() < 0.01
+                && p.speed().map(Speed::as_knots) == Some(25.0)
+                && p.course().map(Course::as_degrees) == Some(90)),
         "Mic-E roundtrip drifted: {parsed:?}"
     );
     println!("mice destination: {dest}");
@@ -118,7 +114,8 @@ fn status_reference_is_exact() -> TestResult {
     // The trailing carriage return is part of the documented status
     // wire format (`>text\r`), so the on-air comparison must expect it.
     let text = StatusText::new("ref")?;
-    let pkt = build_aprs_status_packet(&source()?, &text, &DigipeaterPath::empty());
+    let pkt = AprsFrameHeader::new(source()?, Tocall::th_d75(), DigipeaterPath::empty())
+        .status_packet(&text);
     assert_eq!(pkt.information(), b">ref\r".to_vec());
     println!(
         "status info: {}",

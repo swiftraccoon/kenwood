@@ -1,39 +1,91 @@
 //! Mic-E compressed position encoding (APRS 1.0.1 ch. 10).
 //!
-//! Mic-E is a compact encoding used by Kenwood HTs (including the TH-D75)
-//! that splits the position across two fields: latitude is encoded in the
+//! Mic-E splits the position across two fields: latitude is encoded in the
 //! 6-character AX.25 destination address, and longitude + speed/course
 //! are in the info field body.
+//!
+//! See [packet construction and parsing](crate#packet-construction-and-parsing).
 
-use crate::error::AprsError;
-use crate::packet::{AprsData, PositionAmbiguity, parse_aprs_extensions};
-use crate::position::AprsPosition;
+use crate::error::{AprsError, AprsWireTextField};
+use crate::packet::{AprsData, PositionAmbiguity};
+use crate::position::{AprsPosition, PositionMotion};
 use crate::text::decode_wire_ascii;
-use crate::weather::extract_position_weather;
+use crate::units::{AprsSymbol, Course, Latitude, Longitude, MiceSpeed, Speed};
+
+/// Width or byte failure in an optional Mic-E telemetry block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MiceTelemetryError {
+    /// The two-channel hexadecimal payload is not four bytes.
+    HexadecimalTwoLength {
+        /// Supplied payload bytes.
+        actual: usize,
+    },
+    /// The five-channel hexadecimal payload is not ten bytes.
+    HexadecimalFiveLength {
+        /// Supplied payload bytes.
+        actual: usize,
+    },
+    /// The five-channel binary payload is not five bytes.
+    BinaryFiveLength {
+        /// Supplied payload bytes.
+        actual: usize,
+    },
+    /// A two-digit hexadecimal channel value is truncated.
+    TruncatedHex,
+    /// A channel value contains a nonhexadecimal octet.
+    NonHexadecimal {
+        /// Rejected octet.
+        byte: u8,
+    },
+}
+
+impl std::fmt::Display for MiceTelemetryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HexadecimalTwoLength { actual } => write!(
+                formatter,
+                "two-channel hexadecimal telemetry requires 4 digits; received {actual}"
+            ),
+            Self::HexadecimalFiveLength { actual } => write!(
+                formatter,
+                "five-channel hexadecimal telemetry requires 10 digits; received {actual}"
+            ),
+            Self::BinaryFiveLength { actual } => write!(
+                formatter,
+                "five-channel binary telemetry requires 5 bytes; received {actual}"
+            ),
+            Self::TruncatedHex => formatter.write_str("truncated hexadecimal value"),
+            Self::NonHexadecimal { byte } => write!(
+                formatter,
+                "telemetry channel contains nonhexadecimal byte {byte:#04X}"
+            ),
+        }
+    }
+}
+impl std::error::Error for MiceTelemetryError {}
 
 /// Mic-E standard message code.
 ///
-/// Per APRS 1.0.1 §10.1, the three message bits (A/B/C) encoded by the
-/// "custom" status of destination chars 0-2 select one of 8 standard
-/// messages, or the eighth code indicates that a custom status is carried
-/// in the comment.
+/// APRS 1.0.1 pp.44-45 defines seven standard messages and Emergency.
+/// Destination characters from the custom alphabet are retained as an
+/// unknown message (`None`) by [`AprsPosition::mice_message`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MiceMessage {
-    /// M0: "Off Duty" (111 standard, 000 custom).
+    /// Standard message bits 111: "Off Duty".
     OffDuty,
-    /// M1: "En Route" (110, 001).
+    /// Standard message bits 110: "En Route".
     EnRoute,
-    /// M2: "In Service" (101, 010).
+    /// Standard message bits 101: "In Service".
     InService,
-    /// M3: "Returning" (100, 011).
+    /// Standard message bits 100: "Returning".
     Returning,
-    /// M4: "Committed" (011, 100).
+    /// Standard message bits 011: "Committed".
     Committed,
-    /// M5: "Special" (010, 101).
+    /// Standard message bits 010: "Special".
     Special,
-    /// M6: "Priority" (001, 110).
+    /// Standard message bits 001: "Priority".
     Priority,
-    /// Emergency: (000, 111) always means emergency.
+    /// Standard message bits 000: "Emergency".
     Emergency,
 }
 
@@ -59,13 +111,12 @@ pub enum MiceTelemetry {
 
 /// Parse a Mic-E encoded APRS position (APRS101.PDF Chapter 10).
 ///
-/// Mic-E is a compact encoding used by Kenwood HTs (including the TH-D75)
-/// that splits the position across two fields:
+/// Mic-E splits the position across two fields:
 /// - **Latitude** is encoded in the 6-character AX.25 destination address
 /// - **Longitude** and speed/course are in the info field body
 ///
 /// Data type identifiers: `` ` `` (0x60, current Mic-E) or `'` (0x27, old Mic-E).
-/// The TH-D75 uses current Mic-E (`` ` ``).
+/// The legacy `0x1C` and `0x1D` identifiers are also accepted.
 ///
 /// # Parameters
 ///
@@ -75,22 +126,20 @@ pub enum MiceTelemetry {
 /// # Errors
 ///
 /// Returns [`AprsError`] if the Mic-E encoding is invalid.
-pub fn parse_mice_position(destination: &str, info: &[u8]) -> Result<AprsPosition, AprsError> {
+fn parse_mice_position(destination: &str, info: &[u8]) -> Result<AprsPosition, AprsError> {
     let header = info.get(..9).ok_or(AprsError::InvalidFormat)?;
     let dest = destination.as_bytes();
-    let dest_head = dest.get(..6).ok_or(AprsError::InvalidFormat)?;
+    let dest_head: &[u8; 6] = dest.try_into().map_err(|_| AprsError::InvalidFormat)?;
 
     let data_type = *header.first().ok_or(AprsError::InvalidFormat)?;
     if data_type != b'`' && data_type != b'\'' && data_type != 0x1C && data_type != 0x1D {
         return Err(AprsError::InvalidFormat);
     }
 
-    // Validate Mic-E longitude bytes are in valid range (28-127 per APRS101).
+    // Longitude degree/minute/hundredth byte ranges (APRS101,pp47-48).
     let lon_bytes = header.get(1..4).ok_or(AprsError::InvalidFormat)?;
-    for &b in lon_bytes {
-        if b < 28 {
-            return Err(AprsError::InvalidCoordinates);
-        }
+    if !matches!(lon_bytes, [38..=127, 38..=97, 28..=127]) {
+        return Err(AprsError::InvalidCoordinates);
     }
 
     // --- Latitude from destination address ---
@@ -99,11 +148,26 @@ pub fn parse_mice_position(destination: &str, info: &[u8]) -> Result<AprsPositio
     let mut lat_digits = [0u8; 6];
     let mut north = true;
     let mut lon_offset = 0i16;
+    let mut ambiguity_start = None;
 
     // Per APRS 1.0.1 §10 destination table (document p.44), chars 3-5
     // carry hemisphere/offset flags. `mice_dest_digit` returns the
     // North/+100/West indicator (true only for the std-set chars P-Z).
     for (i, &ch) in dest_head.iter().enumerate() {
+        if i >= 3 && (b'A'..=b'K').contains(&ch) {
+            return Err(AprsError::InvalidCoordinates);
+        }
+        let masked = matches!(ch, b'K' | b'L' | b'Z');
+        if masked {
+            if i < 2 {
+                return Err(AprsError::InvalidCoordinates);
+            }
+            if ambiguity_start.is_none() {
+                ambiguity_start = Some(i);
+            }
+        } else if ambiguity_start.is_some() {
+            return Err(AprsError::InvalidCoordinates);
+        }
         let (digit, north_offset_west) = mice_dest_digit(ch)?;
         if let Some(slot) = lat_digits.get_mut(i) {
             *slot = digit;
@@ -128,10 +192,22 @@ pub fn parse_mice_position(destination: &str, info: &[u8]) -> Result<AprsPositio
     let d5 = f64::from(*lat_digits.get(5).ok_or(AprsError::InvalidCoordinates)?);
     let lat_deg = d0.mul_add(10.0, d1);
     let lat_min = d2.mul_add(10.0, d3) + d4 / 10.0 + d5 / 100.0;
+    if lat_min >= 60.0 {
+        return Err(AprsError::InvalidCoordinates);
+    }
     let mut latitude = lat_deg + lat_min / 60.0;
     if !north {
         latitude = -latitude;
     }
+    let latitude = Latitude::new(latitude).map_err(|_| AprsError::InvalidCoordinates)?;
+    let ambiguity = match ambiguity_start {
+        None => PositionAmbiguity::None,
+        Some(5) => PositionAmbiguity::OneDigit,
+        Some(4) => PositionAmbiguity::TwoDigits,
+        Some(3) => PositionAmbiguity::ThreeDigits,
+        Some(2) => PositionAmbiguity::FourDigits,
+        _ => return Err(AprsError::InvalidCoordinates),
+    };
 
     // --- Longitude from info field ---
     // info[1] = degrees (d+28), info[2] = minutes (m+28), info[3] = hundredths (h+28)
@@ -150,52 +226,56 @@ pub fn parse_mice_position(destination: &str, info: &[u8]) -> Result<AprsPositio
     }
 
     let lon_min = if m >= 60 { m - 60 } else { m };
-    let longitude_abs = f64::from(lon_deg) + (f64::from(lon_min) + f64::from(h) / 100.0) / 60.0;
+    let minute_hundredths =
+        u16::try_from(lon_min * 100 + h).map_err(|_| AprsError::InvalidCoordinates)?;
+    let longitude_abs = f64::from(lon_deg)
+        + f64::from(ambiguity.mask_minute_hundredths(minute_hundredths)) / 6_000.0;
 
-    // Char 5 of destination: custom = West
+    // The final destination indicator selects west versus east.
     let dest5 = *dest_head.get(5).ok_or(AprsError::InvalidCoordinates)?;
-    let west = mice_dest_is_custom(dest5);
-    let longitude = if west { -longitude_abs } else { longitude_abs };
+    let west = mice_indicator_set(dest5);
+    let longitude = Longitude::new(if west { -longitude_abs } else { longitude_abs })
+        .map_err(|_| AprsError::InvalidCoordinates)?;
 
-    let (speed_knots, course_degrees) = decode_mice_speed_course(header);
+    let motion = decode_mice_speed_course(header)?;
 
     // Symbol: info[7] = symbol code, info[8] = symbol table
-    let symbol_code = header.get(7).map_or('/', |&b| b as char);
-    let symbol_table = header.get(8).map_or('/', |&b| b as char);
+    let symbol_code = char::from(*header.get(7).ok_or(AprsError::InvalidFormat)?);
+    let symbol_table = char::from(*header.get(8).ok_or(AprsError::InvalidFormat)?);
+    let symbol = AprsSymbol::from_chars(symbol_table, symbol_code)?;
 
     let optional_bytes = info.get(9..).ok_or(AprsError::InvalidFormat)?;
     let (comment, mice_telemetry) = decode_mice_optional_data(optional_bytes)?;
 
     // Decode the Mic-E standard message code from destination chars 0-2
     // (APRS 1.0.1 §10.1 Table 10). `None` if any char is in the custom range.
-    let c0 = *dest_head.first().ok_or(AprsError::InvalidCoordinates)?;
-    let c1 = *dest_head.get(1).ok_or(AprsError::InvalidCoordinates)?;
-    let c2 = *dest_head.get(2).ok_or(AprsError::InvalidCoordinates)?;
-    let mice_message = mice_decode_message([c0, c1, c2]);
+    let [message_a, message_b, message_c, ..] = *dest_head;
+    let mice_message = mice_decode_message([message_a, message_b, message_c]);
 
     // Look for optional altitude in the comment (`<ccc>}` base-91, metres
     // offset from -10000) per APRS 1.0.1 §10.1.1.
     let mice_altitude_m = mice_decode_altitude(&comment);
 
-    let weather = extract_position_weather(symbol_code, &comment)?;
-    let extensions = parse_aprs_extensions(&comment);
-    Ok(AprsPosition {
-        timestamp: None,
-        latitude,
-        longitude,
-        symbol_table,
-        symbol_code,
-        speed_knots,
-        course_degrees,
-        comment,
-        weather,
-        extensions,
-        mice_message,
-        mice_altitude_m,
-        mice_telemetry,
-        // Mic-E positions are not subject to §8.1.6 ambiguity masking.
-        ambiguity: PositionAmbiguity::None,
-    })
+    Ok(AprsPosition::new(latitude, longitude, symbol)
+        .with_motion(motion)
+        .with_comment(&comment)?
+        .with_mice(mice_message, mice_altitude_m, mice_telemetry, ambiguity))
+}
+
+impl AprsPosition {
+    /// Decode a Mic-E information field with its exact six-byte destination.
+    ///
+    /// Ambiguity markers form a contiguous suffix of the four minute digits;
+    /// the same precision masks longitude. Returned coordinates retain the
+    /// lower magnitude bound of the declared cell (APRS101,pp53-54).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsError`] for malformed destination positions, coordinate
+    /// bytes/ranges, symbol, motion, optional telemetry or non-ASCII status text.
+    pub fn from_mice_bytes(destination: &str, info: &[u8]) -> Result<Self, AprsError> {
+        parse_mice_position(destination, info)
+    }
 }
 
 /// Decode the optional field following a Mic-E symbol-table byte.
@@ -209,12 +289,12 @@ fn decode_mice_optional_data(bytes: &[u8]) -> Result<(String, Option<MiceTelemet
 
     let telemetry = match flag {
         b'`' => {
-            let payload = bytes.get(1..).ok_or(AprsError::InvalidMiceTelemetry(
-                "missing two-channel hexadecimal payload",
-            ))?;
+            let payload = bytes.get(1..).unwrap_or(&[]);
             if payload.len() != 4 {
                 return Err(AprsError::InvalidMiceTelemetry(
-                    "two-channel hexadecimal telemetry must contain exactly 4 digits",
+                    MiceTelemetryError::HexadecimalTwoLength {
+                        actual: payload.len(),
+                    },
                 ));
             }
             MiceTelemetry::HexadecimalTwo {
@@ -223,12 +303,12 @@ fn decode_mice_optional_data(bytes: &[u8]) -> Result<(String, Option<MiceTelemet
             }
         }
         b'\'' => {
-            let payload = bytes.get(1..).ok_or(AprsError::InvalidMiceTelemetry(
-                "missing five-channel hexadecimal payload",
-            ))?;
+            let payload = bytes.get(1..).unwrap_or(&[]);
             if payload.len() != 10 {
                 return Err(AprsError::InvalidMiceTelemetry(
-                    "five-channel hexadecimal telemetry must contain exactly 10 digits",
+                    MiceTelemetryError::HexadecimalFiveLength {
+                        actual: payload.len(),
+                    },
                 ));
             }
             let mut channels = [0_u8; 5];
@@ -238,21 +318,16 @@ fn decode_mice_optional_data(bytes: &[u8]) -> Result<(String, Option<MiceTelemet
             MiceTelemetry::HexadecimalFive(channels)
         }
         0x1D => {
-            let payload: [u8; 5] = bytes
-                .get(1..)
-                .ok_or(AprsError::InvalidMiceTelemetry(
-                    "missing five-channel binary payload",
-                ))?
-                .try_into()
-                .map_err(|_| {
-                    AprsError::InvalidMiceTelemetry(
-                        "five-channel binary telemetry must contain exactly 5 bytes",
-                    )
-                })?;
+            let raw = bytes.get(1..).unwrap_or(&[]);
+            let payload: [u8; 5] = raw.try_into().map_err(|_| {
+                AprsError::InvalidMiceTelemetry(MiceTelemetryError::BinaryFiveLength {
+                    actual: raw.len(),
+                })
+            })?;
             MiceTelemetry::BinaryFive(payload)
         }
         _ => {
-            let comment = decode_wire_ascii("APRS Mic-E comment", bytes)?.to_owned();
+            let comment = decode_wire_ascii(AprsWireTextField::MiceComment, bytes)?.to_owned();
             return Ok((comment, None));
         }
     };
@@ -262,18 +337,18 @@ fn decode_mice_optional_data(bytes: &[u8]) -> Result<(String, Option<MiceTelemet
 
 fn decode_hex_byte(bytes: &[u8], offset: usize) -> Result<u8, AprsError> {
     let high = *bytes.get(offset).ok_or(AprsError::InvalidMiceTelemetry(
-        "truncated hexadecimal value",
+        MiceTelemetryError::TruncatedHex,
     ))?;
     let low = *bytes
         .get(offset + 1)
         .ok_or(AprsError::InvalidMiceTelemetry(
-            "truncated hexadecimal value",
+            MiceTelemetryError::TruncatedHex,
         ))?;
     let high = hex_nibble(high).ok_or(AprsError::InvalidMiceTelemetry(
-        "telemetry values must use ASCII hexadecimal digits",
+        MiceTelemetryError::NonHexadecimal { byte: high },
     ))?;
     let low = hex_nibble(low).ok_or(AprsError::InvalidMiceTelemetry(
-        "telemetry values must use ASCII hexadecimal digits",
+        MiceTelemetryError::NonHexadecimal { byte: low },
     ))?;
     Ok((high << 4) | low)
 }
@@ -294,7 +369,7 @@ const fn hex_nibble(byte: u8) -> Option<u8> {
 /// unmodulated:
 ///
 /// ```text
-///   speed_raw  = (SP-28) × 10 + (DC-28) / 10        (knots, 0..1999)
+///   speed_raw  = (SP-28) × 10 + (DC-28) / 10        (knots, 0..999)
 ///   course_raw = ((DC-28) mod 10) × 100 + (SE-28)   (degrees, 0..999)
 /// ```
 ///
@@ -303,33 +378,22 @@ const fn hex_nibble(byte: u8) -> Option<u8> {
 /// - if `speed_raw  >= 800` → `speed  = speed_raw  - 800`
 /// - if `course_raw >= 400` → `course = course_raw - 400`
 ///
-/// These are not optional. The spec's own decoding worked example on
-/// p.53 (info bytes `` `(_fn"Oj/ `` decoding to speed = 20 kt and
-/// course = 251°) depends on subtracting 800 and 400 respectively.
-/// Spec-compliant transmitters routinely use the alt range to expand
-/// the encodable space for low speeds and back-quadrant courses;
-/// refusing to apply the subtraction silently drops these decodes
-/// (earlier code generations did exactly that).
-///
-/// After adjustment, the returned tuple has:
-///
-/// - `speed`  is `Some(0..=799)` knots, or `None` if the raw value is
-///   outside the spec's representable range (impossible from a
-///   spec-conformant transmitter).
-/// - `course` is `Some(1..=360)` degrees, or `None` if the value is
-///   `0` (the spec's "unknown / not relevant" sentinel, §10 p.49).
-///
-/// The byte-range guard (each of SP/DC/SE must be ≥ 28 per §10 p.47)
-/// is enforced; a byte < 28 yields `(None, None)` rather than wrapping
-/// via `saturating_sub`, which would silently produce a junk decode.
-fn decode_mice_speed_course(header: &[u8]) -> (Option<u16>, Option<u16>) {
+/// The worked example on p.53 (`` `(_fn"Oj/ ``) returns 20 knots and
+/// 251 degrees. Each input byte must be in `28..=127`; after folding,
+/// speed must fit `0..=799` knots and course must fit `0..=360` degrees.
+/// Course zero represents unknown and returns `None`. Other invalid
+/// values return [`AprsError`].
+fn decode_mice_speed_course(header: &[u8]) -> Result<PositionMotion, AprsError> {
     let (Some(&speed_high), Some(&speed_course), Some(&course_low)) =
         (header.get(4), header.get(5), header.get(6))
     else {
-        return (None, None);
+        return Err(AprsError::InvalidFormat);
     };
-    if speed_high < 28 || speed_course < 28 || course_low < 28 {
-        return (None, None);
+    if !(28..=127).contains(&speed_high)
+        || !(28..=127).contains(&speed_course)
+        || !(28..=127).contains(&course_low)
+    {
+        return Err(AprsError::InvalidFormat);
     }
     let sp = u16::from(speed_high - 28);
     let dc = u16::from(speed_course - 28);
@@ -343,9 +407,16 @@ fn decode_mice_speed_course(header: &[u8]) -> (Option<u16>, Option<u16>) {
     if course_raw >= 400 {
         course_raw -= 400;
     }
-    let speed_opt = (speed_raw < 800).then_some(speed_raw);
-    let course_opt = (course_raw > 0 && course_raw <= 360).then_some(course_raw);
-    (speed_opt, course_opt)
+    let _representable = MiceSpeed::new(speed_raw)?;
+    let course = if course_raw == 0 {
+        None
+    } else {
+        Some(Course::new(course_raw)?)
+    };
+    Ok(PositionMotion::new(
+        Some(Speed::from_knots(f64::from(speed_raw))?),
+        course,
+    ))
 }
 
 /// Extract a latitude digit (0-9, or 0 for a space) from a Mic-E
@@ -381,7 +452,7 @@ const fn mice_dest_digit(ch: u8) -> Result<(u8, bool), AprsError> {
 /// only the standard-set characters `P`-`Z` decode North/+100/West;
 /// digits `0`-`9` and the ambiguity space `L` decode South/+0/East. The
 /// custom-message range `A`-`K` is not used in bytes 4-6.
-const fn mice_dest_is_custom(ch: u8) -> bool {
+const fn mice_indicator_set(ch: u8) -> bool {
     matches!(ch, b'P'..=b'Z')
 }
 
@@ -445,9 +516,9 @@ fn mice_decode_message(chars: [u8; 3]) -> Option<MiceMessage> {
 /// Per APRS 1.0.1 §10.1 Table 10. Returns `(bit_a, bit_b, bit_c)` where
 /// `true` means "standard-1" (uppercase P-Y in the destination char).
 ///
-/// Used by the Mic-E TX builder [`crate::build_aprs_mice`].
+/// Used by the Mic-E report builder [`crate::MiceReport`].
 #[must_use]
-pub const fn mice_message_bits(msg: MiceMessage) -> (bool, bool, bool) {
+pub(crate) const fn mice_message_bits(msg: MiceMessage) -> (bool, bool, bool) {
     match msg {
         MiceMessage::OffDuty => (true, true, true),      // 111
         MiceMessage::EnRoute => (true, true, false),     // 110
@@ -500,13 +571,13 @@ fn mice_decode_altitude(comment: &str) -> Option<i32> {
 /// This is the recommended entry point when the full AX.25 packet is
 /// available. For Mic-E data type identifiers (`` ` ``, `'`, `0x1C`,
 /// `0x1D`), the destination callsign is used to decode the latitude
-/// via [`parse_mice_position`]. All other types delegate to
-/// [`crate::packet::parse_aprs_data`].
+/// via [`AprsPosition::from_mice_bytes`]. All other types delegate to
+/// [`AprsData::from_bytes`].
 ///
 /// # Errors
 ///
 /// Returns [`AprsError`] if the format is unrecognized or data is invalid.
-pub fn parse_aprs_data_full(info: &[u8], destination: &str) -> Result<AprsData, AprsError> {
+fn parse_aprs_data_full(info: &[u8], destination: &str) -> Result<AprsData, AprsError> {
     let first = *info.first().ok_or(AprsError::InvalidFormat)?;
 
     match first {
@@ -514,7 +585,19 @@ pub fn parse_aprs_data_full(info: &[u8], destination: &str) -> Result<AprsData, 
         b'`' | b'\'' | 0x1C | 0x1D => {
             parse_mice_position(destination, info).map(AprsData::Position)
         }
-        _ => crate::packet::parse_aprs_data(info),
+        _ => AprsData::from_bytes(info),
+    }
+}
+
+impl AprsData {
+    /// Parse an information field, using the six destination bytes for Mic-E only.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`AprsPosition::from_mice_bytes`] failures for Mic-E identifiers;
+    /// all other fields use [`Self::from_bytes`] and ignore the destination.
+    pub fn from_bytes_with_destination(info: &[u8], destination: &str) -> Result<Self, AprsError> {
+        parse_aprs_data_full(info, destination)
     }
 }
 
@@ -547,17 +630,21 @@ mod tests {
         ];
 
         let pos = parse_mice_position(dest, info)?;
-        assert_eq!(pos.timestamp, None);
-        assert!((pos.latitude - 35.258).abs() < 0.01, "lat={}", pos.latitude);
+        assert_eq!(pos.timestamp(), None);
         assert!(
-            (pos.longitude - (-97.755)).abs() < 0.01,
-            "lon={}",
-            pos.longitude
+            (pos.latitude().as_degrees() - 35.258).abs() < 0.01,
+            "lat={}",
+            pos.latitude().as_degrees()
         );
-        assert_eq!(pos.symbol_code, '>');
-        assert_eq!(pos.symbol_table, '/');
-        assert_eq!(pos.speed_knots, Some(121));
-        assert_eq!(pos.course_degrees, Some(212));
+        assert!(
+            (pos.longitude().as_degrees() - (-97.755)).abs() < 0.01,
+            "lon={}",
+            pos.longitude().as_degrees()
+        );
+        assert_eq!(pos.symbol().code_char(), '>');
+        assert_eq!(pos.symbol().table_char(), '/');
+        assert_eq!(pos.speed().map(Speed::as_knots), Some(121.0));
+        assert_eq!(pos.course().map(Course::as_degrees), Some(212));
         Ok(())
     }
 
@@ -568,7 +655,7 @@ mod tests {
         assert_eq!(
             parse_mice_position("SUQU5P", info),
             Err(AprsError::InvalidTextByte {
-                field: "APRS Mic-E comment",
+                field: AprsWireTextField::MiceComment,
                 index: 2,
                 byte: 0xFF,
             }),
@@ -583,11 +670,11 @@ mod tests {
 
         let position = parse_mice_position("SUQU5P", info)?;
         assert_eq!(
-            position.mice_telemetry,
+            position.mice_telemetry(),
             Some(MiceTelemetry::BinaryFive([0x80, 0x00, 0xFF, 0x7F, 0x01]))
         );
-        assert!(position.comment.is_empty());
-        assert_eq!(position.mice_altitude_m, None);
+        assert!(position.comment().is_empty());
+        assert_eq!(position.mice_altitude_m(), None);
         Ok(())
     }
 
@@ -598,7 +685,7 @@ mod tests {
         let mut two = mandatory.to_vec();
         two.extend_from_slice(b"`00fF");
         assert_eq!(
-            parse_mice_position("SUQU5P", &two)?.mice_telemetry,
+            parse_mice_position("SUQU5P", &two)?.mice_telemetry(),
             Some(MiceTelemetry::HexadecimalTwo {
                 channel_1: 0,
                 channel_3: 255,
@@ -608,7 +695,7 @@ mod tests {
         let mut five = mandatory.to_vec();
         five.extend_from_slice(b"'00017f80FF");
         assert_eq!(
-            parse_mice_position("SUQU5P", &five)?.mice_telemetry,
+            parse_mice_position("SUQU5P", &five)?.mice_telemetry(),
             Some(MiceTelemetry::HexadecimalFive([0, 1, 127, 128, 255]))
         );
         Ok(())
@@ -635,14 +722,14 @@ mod tests {
     fn mice_dest_char_l_is_standard_not_custom() -> TestResult {
         // APRS 1.0.1 §10 destination table (document p.44): 'L' is the
         // standard-set ambiguity/space code: N/S = South, Long Offset =
-        // +0, W/E = East. It is NOT a North/+100/West (custom) indicator.
-        assert!(!mice_dest_is_custom(b'L'), "L must decode East/South/+0");
+        // +0, W/E = East.
+        assert!(!mice_indicator_set(b'L'), "L must decode East/South/+0");
         assert_eq!(mice_dest_digit(b'L')?, (0, false), "L: space digit, Std");
         // Spot-check the rest of the table's bytes-4-6 classification.
-        assert!(!mice_dest_is_custom(b'0'), "0-9 decode East/South/+0");
-        assert!(!mice_dest_is_custom(b'9'), "0-9 decode East/South/+0");
-        assert!(mice_dest_is_custom(b'P'), "P-Z decode West/North/+100");
-        assert!(mice_dest_is_custom(b'Z'), "P-Z decode West/North/+100");
+        assert!(!mice_indicator_set(b'0'), "0-9 decode East/South/+0");
+        assert!(!mice_indicator_set(b'9'), "0-9 decode East/South/+0");
+        assert!(mice_indicator_set(b'P'), "P-Z decode West/North/+100");
+        assert!(mice_indicator_set(b'Z'), "P-Z decode West/North/+100");
         assert_eq!(mice_dest_digit(b'Z')?, (0, true), "Z: space digit, Std-1");
         Ok(())
     }
@@ -657,35 +744,33 @@ mod tests {
         let info: &[u8] = &[0x60, 125, 73, 58, 40, 40, 40, b'>', b'/'];
         let pos = parse_mice_position(dest, info)?;
         assert!(
-            pos.longitude > 0.0,
+            pos.longitude().as_degrees() > 0.0,
             "expected East (positive) for 'L', got lon={}",
-            pos.longitude
+            pos.longitude().as_degrees()
         );
         assert!(
-            (pos.longitude - 97.755).abs() < 0.01,
+            (pos.longitude().as_degrees() - 97.755).abs() < 0.01,
             "lon={}",
-            pos.longitude
+            pos.longitude().as_degrees()
         );
         Ok(())
     }
 
     #[test]
     fn parse_mice_l_decodes_south_and_east() -> TestResult {
-        // Destination "350L5L": char 3 = 'L' (N/S = South), char 5 = 'L'
-        // (W/E = East) per document p.44. Latitude must be negative
-        // (South) and longitude positive (East).
-        let dest = "350L5L";
+        // Three trailing ambiguity digits select South, +0 and East.
+        let dest = "350LLL";
         let info: &[u8] = &[0x60, 125, 73, 58, 40, 40, 40, b'>', b'/'];
         let pos = parse_mice_position(dest, info)?;
         assert!(
-            pos.latitude < 0.0,
+            pos.latitude().as_degrees() < 0.0,
             "expected South (negative) for 'L' at char 3, got lat={}",
-            pos.latitude
+            pos.latitude().as_degrees()
         );
         assert!(
-            pos.longitude > 0.0,
+            pos.longitude().as_degrees() > 0.0,
             "expected East (positive) for 'L' at char 5, got lon={}",
-            pos.longitude
+            pos.longitude().as_degrees()
         );
         Ok(())
     }
@@ -714,7 +799,7 @@ mod tests {
         let dest = "SUQU5P";
         let info: &[u8] = &[0x60, 125, 73, 58, 108, 28, 28, b'>', b'/'];
         let pos = parse_mice_position(dest, info)?;
-        assert_eq!(pos.speed_knots, Some(0));
+        assert_eq!(pos.speed().map(Speed::as_knots), Some(0.0));
         Ok(())
     }
 
@@ -727,7 +812,7 @@ mod tests {
         let dest = "SUQU5P";
         let info: &[u8] = &[0x60, 125, 73, 58, b'n', 28, 28, b'>', b'/'];
         let pos = parse_mice_position(dest, info)?;
-        assert_eq!(pos.speed_knots, Some(20));
+        assert_eq!(pos.speed().map(Speed::as_knots), Some(20.0));
         Ok(())
     }
 
@@ -742,8 +827,16 @@ mod tests {
         // spec example (`n`, `"`, `O` → 110, 34, 79).
         let info: &[u8] = &[0x60, 125, 73, 58, b'n', b'"', b'O', b'j', b'/'];
         let pos = parse_mice_position(dest, info)?;
-        assert_eq!(pos.speed_knots, Some(20), "spec p.53 speed");
-        assert_eq!(pos.course_degrees, Some(251), "spec p.53 course");
+        assert_eq!(
+            pos.speed().map(Speed::as_knots),
+            Some(20.0),
+            "spec p.53 speed"
+        );
+        assert_eq!(
+            pos.course().map(Course::as_degrees),
+            Some(251),
+            "spec p.53 course"
+        );
         Ok(())
     }
 
@@ -788,8 +881,8 @@ mod tests {
         let mut info = vec![0x60u8, 125, 73, 58, 40, 40, 40, b'>', b'/'];
         info.extend_from_slice(b"\"3r}");
         let pos = parse_mice_position("SUQU5P", &info)?;
-        assert_eq!(pos.mice_message, Some(MiceMessage::OffDuty));
-        assert_eq!(pos.mice_altitude_m, Some(0));
+        assert_eq!(pos.mice_message(), Some(MiceMessage::OffDuty));
+        assert_eq!(pos.mice_altitude_m(), Some(0));
         Ok(())
     }
 
@@ -800,8 +893,8 @@ mod tests {
         let dest = "SUQU5P";
         let info: &[u8] = &[0x60, 125, 73, 58, 28, 28, 28, b'>', b'/'];
         let pos = parse_mice_position(dest, info)?;
-        assert_eq!(pos.speed_knots, Some(0));
-        assert_eq!(pos.course_degrees, None);
+        assert_eq!(pos.speed().map(Speed::as_knots), Some(0.0));
+        assert_eq!(pos.course(), None);
         Ok(())
     }
 
@@ -809,7 +902,7 @@ mod tests {
 
     #[test]
     fn mice_rejects_low_longitude_bytes() {
-        // info[1] = 27 (below valid Mic-E range of 28)
+        // Longitude degrees start at byte 38 in the Mic-E wire table.
         let dest = "SUQU5P";
         let info: &[u8] = &[0x60, 27, 73, 58, 40, 40, 40, b'>', b'/'];
         assert_eq!(
@@ -831,35 +924,24 @@ mod tests {
     #[test]
     fn mice_accepts_minimum_valid_byte() {
         let dest = "SUQU5P";
-        let info: &[u8] = &[0x60, 28, 28, 28, 40, 40, 40, b'>', b'/'];
+        let info: &[u8] = &[0x60, 38, 38, 28, 40, 40, 40, b'>', b'/'];
         assert!(parse_mice_position(dest, info).is_ok(), "min bytes ok");
     }
 
     #[test]
-    fn mice_speed_byte_below_28_yields_none() -> TestResult {
-        // §10 p.47 IMPORTANT NOTE: SP/DC/SE bytes must be ≥ 28
-        // (the wire offset). Earlier code used `saturating_sub`
-        // which would silently fold an invalid byte to 0 and produce
-        // a fake decode. Post-fix the parser surfaces these as
-        // `None` for the affected field.
+    fn mice_speed_byte_below_28_is_rejected() {
         let dest = "SUQU5P";
         // Byte 4 = 27 (SP+28 with SP < 0: impossible, must reject).
         let info: &[u8] = &[0x60, 125, 73, 58, 27, 40, 40, b'>', b'/'];
-        let pos = parse_mice_position(dest, info)?;
-        assert_eq!(pos.speed_knots, None);
-        assert_eq!(pos.course_degrees, None);
-        Ok(())
+        assert!(parse_mice_position(dest, info).is_err());
     }
 
     #[test]
-    fn mice_course_byte_below_28_yields_none() -> TestResult {
+    fn mice_course_byte_below_28_is_rejected() {
         let dest = "SUQU5P";
         // Byte 6 = 27 (SE byte below valid range).
         let info: &[u8] = &[0x60, 125, 73, 58, 40, 40, 27, b'>', b'/'];
-        let pos = parse_mice_position(dest, info)?;
-        assert_eq!(pos.speed_knots, None);
-        assert_eq!(pos.course_degrees, None);
-        Ok(())
+        assert!(parse_mice_position(dest, info).is_err());
     }
 
     // ---- parse_aprs_data_full tests ----
@@ -911,5 +993,70 @@ mod tests {
     #[test]
     fn full_dispatch_empty_info() {
         assert!(parse_aprs_data_full(b"", "APRS").is_err(), "empty rejected");
+    }
+
+    #[test]
+    fn mice_ambiguity_masks_both_coordinates_from_the_primary_example() -> TestResult {
+        let info = b"`(_fn\"Oj/";
+        let position = AprsPosition::from_mice_bytes("T4SQZZ", info)?;
+        assert_eq!(position.ambiguity(), PositionAmbiguity::TwoDigits);
+        assert!((position.latitude().as_degrees() - (44.0 + 31.0 / 60.0)).abs() < 1e-12);
+        assert!((position.longitude().as_degrees() + 112.0 + 7.0 / 60.0).abs() < 1e-12);
+        for (destination, ambiguity, minutes) in [
+            ("T4SQPZ", PositionAmbiguity::OneDigit, 7.7),
+            ("T4SQZZ", PositionAmbiguity::TwoDigits, 7.0),
+            ("T4SZZZ", PositionAmbiguity::ThreeDigits, 0.0),
+            ("T4ZZZZ", PositionAmbiguity::FourDigits, 0.0),
+        ] {
+            let position = AprsPosition::from_mice_bytes(destination, info)?;
+            assert_eq!(position.ambiguity(), ambiguity);
+            assert!(
+                (position.longitude().as_degrees() + 112.0 + minutes / 60.0).abs() < 1e-12,
+                "{destination}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mice_destination_and_coordinate_bytes_enforce_the_wire_table() -> TestResult {
+        let valid = [b'`', 125, 73, 58, 40, 40, 40, b'>', b'/'];
+        for destination in [
+            "SUQU5PX", "KUQU5P", "SUQUKP", "SUQA5P", "SUQULP", "SUQUZP", "960000",
+        ] {
+            assert!(
+                AprsPosition::from_mice_bytes(destination, &valid).is_err(),
+                "accepted {destination}"
+            );
+        }
+        for (index, byte) in [
+            (1, 37),
+            (1, 128),
+            (2, 37),
+            (2, 98),
+            (3, 27),
+            (3, 128),
+            (4, 128),
+            (5, 128),
+            (6, 128),
+        ] {
+            let mut malformed = valid;
+            *malformed.get_mut(index).ok_or("coordinate field")? = byte;
+            assert!(
+                AprsPosition::from_mice_bytes("SUQU5P", &malformed).is_err(),
+                "accepted byte {byte} at {index}"
+            );
+        }
+        // Degree 179 is the largest Mic-E longitude degree; 180 is folded by its wire table.
+        let edge = [b'`', 107, 87, 127, 28, 28, 28, b'>', b'/'];
+        assert!(
+            (AprsPosition::from_mice_bytes("SUQUPP", &edge)?
+                .longitude()
+                .as_degrees()
+                + 179.999_833_333_333)
+                .abs()
+                < 1e-9
+        );
+        Ok(())
     }
 }

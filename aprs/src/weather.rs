@@ -8,7 +8,7 @@ use std::fmt;
 
 use thiserror::Error;
 
-use crate::error::AprsError;
+use crate::error::{AprsError, AprsWireTextField};
 use crate::packet::AprsWeatherTimestamp;
 use crate::text::{WeatherComment, decode_wire_ascii};
 use crate::units::Fahrenheit;
@@ -225,6 +225,26 @@ macro_rules! impl_weather_integer_traits {
                 fmt::Display::fmt(&self.0, formatter)
             }
         }
+        impl fmt::Binary for $type {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                fmt::Binary::fmt(&self.0, formatter)
+            }
+        }
+        impl fmt::Octal for $type {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                fmt::Octal::fmt(&self.0, formatter)
+            }
+        }
+        impl fmt::LowerHex for $type {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                fmt::LowerHex::fmt(&self.0, formatter)
+            }
+        }
+        impl fmt::UpperHex for $type {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                fmt::UpperHex::fmt(&self.0, formatter)
+            }
+        }
     };
 }
 
@@ -403,13 +423,25 @@ impl AprsWeather {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AprsPositionlessWeatherReport {
     /// Required month/day/hour/minute UTC timestamp.
-    pub timestamp: AprsWeatherTimestamp,
+    timestamp: AprsWeatherTimestamp,
     /// Decoded weather measurements.
-    pub weather: AprsWeather,
+    weather: AprsWeather,
     comment: WeatherComment,
 }
 
 impl AprsPositionlessWeatherReport {
+    /// Return the required UTC month/day/hour/minute timestamp.
+    #[must_use]
+    pub const fn timestamp(&self) -> AprsWeatherTimestamp {
+        self.timestamp
+    }
+
+    /// Return the decoded weather measurements.
+    #[must_use]
+    pub const fn weather(&self) -> &AprsWeather {
+        &self.weather
+    }
+
     /// Create a report without a trailing station comment.
     #[must_use]
     pub fn new(timestamp: AprsWeatherTimestamp, weather: AprsWeather) -> Self {
@@ -447,103 +479,104 @@ impl AprsPositionlessWeatherReport {
     }
 }
 
-/// Try to extract weather data embedded in a position report's comment.
-///
-/// Per APRS 1.0.1 §12.1, a "complete weather report" is a position report
-/// with symbol code `_` (weather station) whose comment begins with the
-/// CSE/SPD extension format `DDD/SSS` encoding wind direction and speed,
-/// followed by the remaining weather fields (`gGGG tTTT rRRR …`) in the
-/// standard order.
-///
-/// Returns `Ok(None)` if the symbol is not `_` or the comment does not start
-/// with a `DDD/SSS` extension. Once a weather-shaped extension is recognized,
-/// malformed, out-of-range, duplicate, or reordered fields are rejected.
-///
-/// # Errors
-///
-/// Returns [`AprsError::InvalidFormat`] when a recognized weather extension
-/// violates its fixed-width field grammar or ordering.
-pub fn extract_position_weather(
-    symbol_code: char,
-    comment: &str,
-) -> Result<Option<AprsWeather>, AprsError> {
-    if symbol_code != '_' {
-        return Ok(None);
-    }
-    let bytes = comment.as_bytes();
-    let Some(header) = bytes.get(..7) else {
-        return Ok(None);
-    };
-    if header.get(3) != Some(&b'/') {
-        return Ok(None);
-    }
-    let dir_bytes = header.get(..3).ok_or(AprsError::InvalidFormat)?;
-    let speed_bytes = header.get(4..7).ok_or(AprsError::InvalidFormat)?;
-    if !is_unsigned_or_placeholder(dir_bytes) || !is_unsigned_or_placeholder(speed_bytes) {
-        return Ok(None);
-    }
+impl AprsWeather {
+    /// Try to extract weather data embedded in a position report's comment.
+    ///
+    /// Per APRS 1.0.1 §12.1, a "complete weather report" is a position report
+    /// with symbol code `_` (weather station) whose comment begins with the
+    /// CSE/SPD extension format `DDD/SSS` encoding wind direction and speed,
+    /// followed by the remaining weather fields (`gGGG tTTT rRRR …`) in the
+    /// standard order.
+    ///
+    /// Returns `Ok(None)` if the symbol is not `_` or the comment does not start
+    /// with a `DDD/SSS` extension. Once a weather-shaped extension is recognized,
+    /// malformed, out-of-range, duplicate, or reordered fields are rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsError::InvalidFormat`] when a recognized weather extension
+    /// violates its fixed-width field grammar or ordering.
+    pub fn from_position_comment(
+        symbol_code: char,
+        comment: &str,
+    ) -> Result<Option<Self>, AprsError> {
+        if symbol_code != '_' {
+            return Ok(None);
+        }
+        let bytes = comment.as_bytes();
+        let Some(header) = bytes.get(..7) else {
+            return Ok(None);
+        };
+        if header.get(3) != Some(&b'/') {
+            return Ok(None);
+        }
+        let dir_bytes = header.get(..3).ok_or(AprsError::InvalidFormat)?;
+        let speed_bytes = header.get(4..7).ok_or(AprsError::InvalidFormat)?;
+        if !is_unsigned_or_placeholder(dir_bytes) || !is_unsigned_or_placeholder(speed_bytes) {
+            return Ok(None);
+        }
 
-    let wind_direction = parse_unsigned_field(dir_bytes)?
-        .map(|value| {
-            let value = u16::try_from(value).map_err(|_| AprsError::InvalidFormat)?;
-            WindDirection::new(value).map_err(|_| AprsError::InvalidFormat)
-        })
-        .transpose()?;
-    let wind_speed = parse_unsigned_field(speed_bytes)?
-        .map(|value| {
-            let value = u16::try_from(value).map_err(|_| AprsError::InvalidFormat)?;
-            ThreeDigitWeatherValue::new(value).map_err(|_| AprsError::InvalidFormat)
-        })
-        .transpose()?;
-    let tail = bytes.get(7..).ok_or(AprsError::InvalidFormat)?;
-    let (mut weather, _) = parse_weather_fields(tail)?;
-    weather.set_wind_direction(wind_direction);
-    weather.set_wind_speed(wind_speed);
-    Ok(Some(weather))
+        let wind_direction = parse_unsigned_field(dir_bytes)?
+            .map(|value| {
+                let value = u16::try_from(value).map_err(|_| AprsError::InvalidFormat)?;
+                WindDirection::new(value).map_err(|_| AprsError::InvalidFormat)
+            })
+            .transpose()?;
+        let wind_speed = parse_unsigned_field(speed_bytes)?
+            .map(|value| {
+                let value = u16::try_from(value).map_err(|_| AprsError::InvalidFormat)?;
+                ThreeDigitWeatherValue::new(value).map_err(|_| AprsError::InvalidFormat)
+            })
+            .transpose()?;
+        let tail = bytes.get(7..).ok_or(AprsError::InvalidFormat)?;
+        let (mut weather, _) = parse_weather_fields(tail)?;
+        weather.set_wind_direction(wind_direction);
+        weather.set_wind_speed(wind_speed);
+        Ok(Some(weather))
+    }
 }
 
-/// Parse a positionless APRS weather report (`_MMDDHHMMdata`).
-///
-/// Weather data uses single-letter field tags followed by fixed-width
-/// numeric values. Common fields:
-/// - `c` = wind direction (3 digits, degrees)
-/// - `s` = wind speed (3 digits, mph)
-/// - `g` = gust (3 digits, mph)
-/// - `t` = temperature (3 digits, Fahrenheit, may be negative)
-/// - `r` = rain last hour (3 digits, hundredths of inch)
-/// - `p` = rain last 24h (3 digits, hundredths of inch)
-/// - `P` = rain since midnight (3 digits, hundredths of inch)
-/// - `h` = humidity (2 digits, 00=100%)
-/// - `b` = barometric pressure (5 digits, tenths of mbar)
-/// - `L`/`l` = luminosity below/above 1000 watts per square metre
-///
-/// # Errors
-///
-/// Returns [`AprsError::InvalidFormat`] for an invalid prefix, missing
-/// mandatory `c`/`s`/`g`/`t` tag, malformed fixed-width value, out-of-range
-/// measurement, or duplicate/reordered tag.
-pub fn parse_aprs_weather_positionless(
-    info: &[u8],
-) -> Result<AprsPositionlessWeatherReport, AprsError> {
-    if info.first() != Some(&b'_') {
-        return Err(AprsError::InvalidFormat);
-    }
-    let timestamp_bytes = info.get(1..9).ok_or(AprsError::InvalidFormat)?;
-    let timestamp_wire = decode_wire_ascii("APRS weather timestamp", timestamp_bytes)?;
-    let timestamp = AprsWeatherTimestamp::from_wire(timestamp_wire)?;
-    let data = info.get(9..).ok_or(AprsError::InvalidFormat)?;
-    for (offset, required_tag) in [(0, b'c'), (4, b's'), (8, b'g'), (12, b't')] {
-        if data.get(offset) != Some(&required_tag) {
+impl AprsPositionlessWeatherReport {
+    /// Parse a positionless APRS weather report (`_MMDDHHMMdata`).
+    ///
+    /// Weather data uses single-letter field tags followed by fixed-width
+    /// numeric values. Common fields:
+    /// - `c` = wind direction (3 digits, degrees)
+    /// - `s` = wind speed (3 digits, mph)
+    /// - `g` = gust (3 digits, mph)
+    /// - `t` = temperature (3 digits, Fahrenheit, may be negative)
+    /// - `r` = rain last hour (3 digits, hundredths of inch)
+    /// - `p` = rain last 24h (3 digits, hundredths of inch)
+    /// - `P` = rain since midnight (3 digits, hundredths of inch)
+    /// - `h` = humidity (2 digits, 00=100%)
+    /// - `b` = barometric pressure (5 digits, tenths of mbar)
+    /// - `L`/`l` = luminosity below/above 1000 watts per square metre
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsError::InvalidFormat`] for an invalid prefix, missing
+    /// mandatory `c`/`s`/`g`/`t` tag, malformed fixed-width value, out-of-range
+    /// measurement, or duplicate/reordered tag.
+    pub fn from_bytes(info: &[u8]) -> Result<Self, AprsError> {
+        if info.first() != Some(&b'_') {
             return Err(AprsError::InvalidFormat);
         }
+        let timestamp_bytes = info.get(1..9).ok_or(AprsError::InvalidFormat)?;
+        let timestamp_wire =
+            decode_wire_ascii(AprsWireTextField::WeatherTimestamp, timestamp_bytes)?;
+        let timestamp = AprsWeatherTimestamp::from_wire(timestamp_wire)?;
+        let data = info.get(9..).ok_or(AprsError::InvalidFormat)?;
+        for (offset, required_tag) in [(0, b'c'), (4, b's'), (8, b'g'), (12, b't')] {
+            if data.get(offset) != Some(&required_tag) {
+                return Err(AprsError::InvalidFormat);
+            }
+        }
+        let (weather, consumed) = parse_weather_fields(data)?;
+        let comment_bytes = data.get(consumed..).ok_or(AprsError::InvalidFormat)?;
+        let comment = decode_wire_ascii(AprsWireTextField::WeatherComment, comment_bytes)?;
+        let comment = WeatherComment::new(comment).map_err(|_| AprsError::InvalidFormat)?;
+        Ok(Self::with_comment(timestamp, weather, comment))
     }
-    let (weather, consumed) = parse_weather_fields(data)?;
-    let comment_bytes = data.get(consumed..).ok_or(AprsError::InvalidFormat)?;
-    let comment = decode_wire_ascii("APRS weather comment", comment_bytes)?;
-    let comment = WeatherComment::new(comment).map_err(|_| AprsError::InvalidFormat)?;
-    Ok(AprsPositionlessWeatherReport::with_comment(
-        timestamp, weather, comment,
-    ))
 }
 
 /// Parse APRS weather data fields from a byte slice.
@@ -562,12 +595,8 @@ pub fn parse_aprs_weather_positionless(
 /// malformed values are errors. Tags must be strictly increasing in the order
 /// above, which also rejects duplicates.
 ///
-/// This is strictly more correct than a `find()`-based scan, which would
-/// false-match tag letters appearing inside comment text (e.g. `"canada"`
-/// matching `c` for wind direction).
-///
-/// Private by design: callers outside this crate should use
-/// [`parse_aprs_weather_positionless`] (which validates the leading
+/// Callers outside this crate use
+/// [`AprsPositionlessWeatherReport::from_bytes`] (which validates the leading
 /// `_` + 8-byte timestamp and then delegates here) to avoid mistaking
 /// non-weather bytes for weather data.
 fn parse_weather_fields(data: &[u8]) -> Result<(AprsWeather, usize), AprsError> {
@@ -763,6 +792,26 @@ mod tests {
 
         assert_eq!(WindDirection::try_from(180)?.to_string(), "180");
         assert_eq!(u16::from(ThreeDigitWeatherValue::new(42)?), 42);
+        assert_eq!(
+            format!("{:#08X}", WindDirection::try_from(360)?),
+            format!("{:#08X}", 360_u16)
+        );
+        assert_eq!(
+            format!("{:#012b}", ThreeDigitWeatherValue::try_from(999)?),
+            format!("{:#012b}", 999_u16)
+        );
+        assert_eq!(
+            format!("{:#06o}", Humidity::try_from(100)?),
+            format!("{:#06o}", 100_u8)
+        );
+        assert_eq!(
+            format!("{:#010x}", BarometricPressure::try_from(99_999)?),
+            format!("{:#010x}", 99_999_u32)
+        );
+        assert_eq!(
+            format!("{:+08}", Luminosity::try_from(1_999)?),
+            format!("{:+08}", 1_999_u16)
+        );
         Ok(())
     }
 
@@ -784,12 +833,15 @@ mod tests {
 
     #[test]
     fn parse_weather_positionless_full_preserves_every_field() -> TestResult {
-        let report = parse_aprs_weather_positionless(
+        let report = AprsPositionlessWeatherReport::from_bytes(
             b"_01011234c180s005g010t075r001p010P020h55b10135L875Dvs",
         )?;
-        assert_eq!(report.timestamp.to_wire_string(), "01011234");
+        assert_eq!(report.timestamp().to_wire_string(), "01011234");
         assert_eq!(
-            report.weather.wind_direction().map(WindDirection::degrees),
+            report
+                .weather()
+                .wind_direction()
+                .map(WindDirection::degrees),
             Some(180)
         );
         assert_eq!(
@@ -843,7 +895,7 @@ mod tests {
 
     #[test]
     fn parse_weather_lowercase_luminosity_adds_thousands_offset() -> TestResult {
-        let report = parse_aprs_weather_positionless(b"_01011234c...s...g...t...l234")?;
+        let report = AprsPositionlessWeatherReport::from_bytes(b"_01011234c...s...g...t...l234")?;
         assert_eq!(
             report
                 .weather
@@ -856,7 +908,7 @@ mod tests {
 
     #[test]
     fn parse_weather_missing_fields_and_humidity_100() -> TestResult {
-        let report = parse_aprs_weather_positionless(b"_01011234c...s   g...t072h00")?;
+        let report = AprsPositionlessWeatherReport::from_bytes(b"_01011234c...s   g...t072h00")?;
         assert_eq!(report.weather.wind_direction(), None);
         assert_eq!(report.weather.wind_speed(), None);
         assert_eq!(report.weather.temperature().map(Fahrenheit::get), Some(72));
@@ -866,7 +918,7 @@ mod tests {
 
     #[test]
     fn parse_weather_stops_only_on_unknown_comment_tag() -> TestResult {
-        let report = parse_aprs_weather_positionless(b"_01011234c...s...g...t072Jim")?;
+        let report = AprsPositionlessWeatherReport::from_bytes(b"_01011234c...s...g...t072Jim")?;
         assert_eq!(report.weather.temperature().map(Fahrenheit::get), Some(72));
         assert_eq!(report.comment(), "Jim");
         Ok(())
@@ -913,7 +965,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    parse_aprs_weather_positionless(info),
+                    AprsPositionlessWeatherReport::from_bytes(info),
                     Err(AprsError::InvalidFormat)
                 ),
                 "malformed known field accepted: {info:?}",
@@ -931,7 +983,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    parse_aprs_weather_positionless(info),
+                    AprsPositionlessWeatherReport::from_bytes(info),
                     Err(AprsError::InvalidFormat)
                 ),
                 "duplicate/reordered weather field accepted: {info:?}",
@@ -950,7 +1002,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    parse_aprs_weather_positionless(info),
+                    AprsPositionlessWeatherReport::from_bytes(info),
                     Err(AprsError::InvalidFormat)
                 ),
                 "positionless report missing required core tag was accepted: {info:?}",
@@ -960,7 +1012,7 @@ mod tests {
 
     #[test]
     fn extract_position_weather_preserves_typed_values() -> TestResult {
-        let dotted = extract_position_weather('_', ".../...g005t072h50b10132")?
+        let dotted = AprsWeather::from_position_comment('_', ".../...g005t072h50b10132")?
             .ok_or("dotted wind must still parse as weather")?;
         assert_eq!(dotted.wind_direction(), None);
         assert_eq!(dotted.wind_speed(), None);
@@ -970,8 +1022,9 @@ mod tests {
         );
         assert_eq!(dotted.temperature().map(Fahrenheit::get), Some(72));
 
-        let populated = extract_position_weather('_', "220/004g005t077r000p000P000h50b09900L999")?
-            .ok_or("digit wind must parse")?;
+        let populated =
+            AprsWeather::from_position_comment('_', "220/004g005t077r000p000P000h50b09900L999")?
+                .ok_or("digit wind must parse")?;
         assert_eq!(
             populated.wind_direction().map(WindDirection::degrees),
             Some(220)
@@ -995,16 +1048,20 @@ mod tests {
 
     #[test]
     fn extract_position_weather_distinguishes_non_extension_and_invalid_weather() -> TestResult {
-        assert_eq!(extract_position_weather('_', "abc/defghi")?, None);
-        assert_eq!(extract_position_weather('>', "220/004g005")?, None);
-        assert!(extract_position_weather('_', "361/004g005").is_err());
-        assert!(extract_position_weather('_', "220/004t077g005").is_err());
+        assert_eq!(AprsWeather::from_position_comment('_', "abc/defghi")?, None);
+        assert_eq!(
+            AprsWeather::from_position_comment('>', "220/004g005")?,
+            None
+        );
+        assert!(AprsWeather::from_position_comment('_', "361/004g005").is_err());
+        assert!(AprsWeather::from_position_comment('_', "220/004t077g005").is_err());
         Ok(())
     }
 
     #[test]
     fn parse_weather_fully_dotted_spec_example() -> TestResult {
-        let report = parse_aprs_weather_positionless(b"_10090556c...s...g...t...P012Jim")?;
+        let report =
+            AprsPositionlessWeatherReport::from_bytes(b"_10090556c...s...g...t...P012Jim")?;
         assert_eq!(report.weather.wind_direction(), None);
         assert_eq!(report.weather.wind_speed(), None);
         assert_eq!(report.weather.wind_gust(), None);
@@ -1032,9 +1089,29 @@ mod tests {
             b"_01AA1234t072".as_slice(),
         ] {
             assert!(
-                parse_aprs_weather_positionless(info).is_err(),
+                AprsPositionlessWeatherReport::from_bytes(info).is_err(),
                 "invalid weather timestamp accepted: {info:?}"
             );
         }
+    }
+
+    #[test]
+    fn weather_ascii_errors_identify_the_exact_wire_field_and_index() {
+        assert_eq!(
+            AprsPositionlessWeatherReport::from_bytes(b"_0101\xFF234c...s...g...t..."),
+            Err(AprsError::InvalidTextByte {
+                field: AprsWireTextField::WeatherTimestamp,
+                index: 4,
+                byte: 0xFF
+            }),
+        );
+        assert_eq!(
+            AprsPositionlessWeatherReport::from_bytes(b"_01011234c...s...g...t...D\xFF"),
+            Err(AprsError::InvalidTextByte {
+                field: AprsWireTextField::WeatherComment,
+                index: 1,
+                byte: 0xFF
+            }),
+        );
     }
 }

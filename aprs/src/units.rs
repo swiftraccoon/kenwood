@@ -7,8 +7,127 @@
 use core::{fmt, num::NonZeroU16};
 
 use ax25_codec::Callsign;
+use thiserror::Error;
 
 use crate::error::AprsError;
+
+/// Why a decimal geographic coordinate was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum CoordinateError {
+    /// The coordinate was infinite or NaN.
+    #[error("coordinate must be finite")]
+    NonFinite,
+    /// The coordinate exceeded the latitude or longitude domain.
+    #[error("coordinate exceeds its geographic degree range")]
+    OutOfRange,
+}
+
+/// Why a physical or Mic-E wire speed was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum SpeedError {
+    /// The supplied measurement was infinite or NaN.
+    #[error("speed must be finite")]
+    NonFinite,
+    /// The supplied measurement was negative.
+    #[error("speed must be non-negative")]
+    Negative,
+    /// Converting a finite measurement to kilometers per hour overflowed.
+    #[error("speed conversion exceeds the finite kilometer-per-hour range")]
+    ConversionOverflow,
+    /// A whole-knot value exceeded Mic-E's three-digit representation.
+    #[error("Mic-E speed must be 0..=799 knots (got {knots})")]
+    MiceOutOfRange {
+        /// Rejected whole-knot measurement.
+        knots: u16,
+    },
+}
+
+/// Why a decimal heading or integer APRS course was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum CourseError {
+    /// The decimal heading was infinite or NaN.
+    #[error("heading must be finite")]
+    NonFinite,
+    /// The heading or course exceeded `0..=360` degrees.
+    #[error("heading or course must be 0..=360 degrees")]
+    OutOfRange,
+}
+
+/// Why an APRS message identifier was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum MessageIdError {
+    /// The identifier was empty or exceeded five bytes.
+    #[error("message identifier must contain 1..=5 bytes (got {bytes})")]
+    Length {
+        /// Rejected byte count.
+        bytes: usize,
+    },
+    /// An identifier byte was not an ASCII letter or digit.
+    #[error("message identifier byte {byte:#04X} at index {index} is not ASCII alphanumeric")]
+    InvalidByte {
+        /// Zero-based byte index.
+        index: usize,
+        /// Rejected byte.
+        byte: u8,
+    },
+}
+
+/// Why an APRS weather temperature was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum TemperatureError {
+    /// The Fahrenheit measurement exceeded the signed three-byte field.
+    #[error("temperature must be -99..=999 degrees Fahrenheit (got {value})")]
+    OutOfRange {
+        /// Rejected Fahrenheit measurement.
+        value: i16,
+    },
+}
+
+/// Why a standard or compressed APRS symbol-table selector was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum SymbolTableError {
+    /// The byte was not `/`, `\\`, a digit, or an uppercase ASCII letter.
+    #[error("invalid symbol-table selector {byte:#04X}")]
+    InvalidSelector {
+        /// Rejected byte.
+        byte: u8,
+    },
+    /// An overlay was not a digit or uppercase ASCII letter.
+    #[error("invalid symbol overlay {byte:#04X}")]
+    InvalidOverlay {
+        /// Rejected byte.
+        byte: u8,
+    },
+    /// A compressed numeric overlay used its uncompressed digit.
+    #[error("compressed numeric overlay {byte:#04X} must encode as a..=j")]
+    CompressedNumericOverlay {
+        /// Rejected digit byte.
+        byte: u8,
+    },
+    /// A selector character could not fit in one ASCII wire byte.
+    #[error("symbol-table selector {character:?} is not ASCII")]
+    NonAscii {
+        /// Rejected character.
+        character: char,
+    },
+}
+
+/// Why an APRS symbol code was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum SymbolError {
+    /// The byte was outside printable non-space ASCII.
+    #[error("symbol code must be 0x21..=0x7E (got {byte:#04X})")]
+    InvalidCode {
+        /// Rejected byte.
+        byte: u8,
+    },
+    /// A character could not fit in one ASCII wire byte.
+    #[error("symbol code {character:?} is not ASCII")]
+    NonAscii {
+        /// Rejected character.
+        character: char,
+    },
+}
 
 // ---------------------------------------------------------------------------
 // Shared DDMM.hh formatter
@@ -67,7 +186,7 @@ pub(crate) fn format_ddmm_hundredths(value_abs: f64, deg_width: usize) -> String
 ///
 /// Positive = North, negative = South. Rejects NaN and out-of-range
 /// values.
-#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Latitude(f64);
 
 impl Latitude {
@@ -85,10 +204,11 @@ impl Latitude {
     /// Returns [`AprsError::InvalidLatitude`] if `degrees` is not finite
     /// or not in `[-90.0, 90.0]`.
     pub fn new(degrees: f64) -> Result<Self, AprsError> {
-        if !degrees.is_finite() || !(Self::MIN..=Self::MAX).contains(&degrees) {
-            return Err(AprsError::InvalidLatitude(
-                "must be finite and in [-90.0, 90.0]",
-            ));
+        if !degrees.is_finite() {
+            return Err(AprsError::InvalidLatitude(CoordinateError::NonFinite));
+        }
+        if !(Self::MIN..=Self::MAX).contains(&degrees) {
+            return Err(AprsError::InvalidLatitude(CoordinateError::OutOfRange));
         }
         Ok(Self(degrees))
     }
@@ -107,7 +227,7 @@ impl Latitude {
     /// field is always whole minutes `00..=59` plus hundredths
     /// `00..=99` per APRS 1.0.1 §6 p.23 (never the malformed `60.00`).
     #[must_use]
-    pub fn as_aprs_uncompressed(self) -> String {
+    pub fn to_aprs_uncompressed(self) -> String {
         let hemisphere = if self.0 >= 0.0 { 'N' } else { 'S' };
         let core = format_ddmm_hundredths(self.0.abs(), 2);
         format!("{core}{hemisphere}")
@@ -117,7 +237,7 @@ impl Latitude {
 /// Geographic longitude in decimal degrees, validated to `[-180.0, 180.0]`.
 ///
 /// Positive = East, negative = West. Rejects NaN and out-of-range values.
-#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Longitude(f64);
 
 impl Longitude {
@@ -135,10 +255,11 @@ impl Longitude {
     /// Returns [`AprsError::InvalidLongitude`] if `degrees` is not finite
     /// or not in `[-180.0, 180.0]`.
     pub fn new(degrees: f64) -> Result<Self, AprsError> {
-        if !degrees.is_finite() || !(Self::MIN..=Self::MAX).contains(&degrees) {
-            return Err(AprsError::InvalidLongitude(
-                "must be finite and in [-180.0, 180.0]",
-            ));
+        if !degrees.is_finite() {
+            return Err(AprsError::InvalidLongitude(CoordinateError::NonFinite));
+        }
+        if !(Self::MIN..=Self::MAX).contains(&degrees) {
+            return Err(AprsError::InvalidLongitude(CoordinateError::OutOfRange));
         }
         Ok(Self(degrees))
     }
@@ -157,7 +278,7 @@ impl Longitude {
     /// field is always whole minutes `00..=59` plus hundredths
     /// `00..=99` per APRS 1.0.1 §6 p.24 (never the malformed `60.00`).
     #[must_use]
-    pub fn as_aprs_uncompressed(self) -> String {
+    pub fn to_aprs_uncompressed(self) -> String {
         let hemisphere = if self.0 >= 0.0 { 'E' } else { 'W' };
         let core = format_ddmm_hundredths(self.0.abs(), 3);
         format!("{core}{hemisphere}")
@@ -174,7 +295,8 @@ impl Longitude {
 /// make the caller's input unit explicit and reject negative, non-finite, or
 /// conversion-overflowing values. Accessors return decimal values and never
 /// silently round to an integer wire field.
-#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+/// [`fmt::Display`] writes the canonical kilometer-per-hour value.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Speed(f64);
 
 impl Speed {
@@ -190,7 +312,8 @@ impl Speed {
     /// Returns [`AprsError::InvalidSpeed`] unless `kmh` is finite and
     /// non-negative.
     pub fn from_kmh(kmh: f64) -> Result<Self, AprsError> {
-        Self::from_converted_kmh(kmh)
+        Self::validate_measurement(kmh)?;
+        Ok(Self(kmh))
     }
 
     /// Create a speed measured in knots.
@@ -200,11 +323,7 @@ impl Speed {
     /// Returns [`AprsError::InvalidSpeed`] unless `knots` and its converted
     /// value are finite and non-negative.
     pub fn from_knots(knots: f64) -> Result<Self, AprsError> {
-        if !knots.is_finite() || knots < 0.0 {
-            return Err(AprsError::InvalidSpeed(
-                "knots must be finite and non-negative",
-            ));
-        }
+        Self::validate_measurement(knots)?;
         Self::from_converted_kmh(knots * Self::KNOTS_TO_KMH)
     }
 
@@ -215,21 +334,25 @@ impl Speed {
     /// Returns [`AprsError::InvalidSpeed`] unless `mph` and its converted
     /// value are finite and non-negative.
     pub fn from_mph(mph: f64) -> Result<Self, AprsError> {
-        if !mph.is_finite() || mph < 0.0 {
-            return Err(AprsError::InvalidSpeed(
-                "miles per hour must be finite and non-negative",
-            ));
-        }
+        Self::validate_measurement(mph)?;
         Self::from_converted_kmh(mph * Self::MPH_TO_KMH)
     }
 
-    fn from_converted_kmh(kmh: f64) -> Result<Self, AprsError> {
-        if !kmh.is_finite() || kmh < 0.0 {
-            return Err(AprsError::InvalidSpeed(
-                "speed must be finite and non-negative",
-            ));
+    const fn from_converted_kmh(kmh: f64) -> Result<Self, AprsError> {
+        if !kmh.is_finite() {
+            return Err(AprsError::InvalidSpeed(SpeedError::ConversionOverflow));
         }
         Ok(Self(kmh))
+    }
+
+    fn validate_measurement(value: f64) -> Result<(), AprsError> {
+        if !value.is_finite() {
+            return Err(AprsError::InvalidSpeed(SpeedError::NonFinite));
+        }
+        if value < 0.0 {
+            return Err(AprsError::InvalidSpeed(SpeedError::Negative));
+        }
+        Ok(())
     }
 
     /// Return the speed in kilometers per hour.
@@ -269,9 +392,9 @@ impl MiceSpeed {
     /// Returns [`AprsError::InvalidSpeed`] when `knots > 799`.
     pub const fn new(knots: u16) -> Result<Self, AprsError> {
         if knots > Self::MAX_KNOTS {
-            return Err(AprsError::InvalidSpeed(
-                "Mic-E speed must be 0-799 whole knots",
-            ));
+            return Err(AprsError::InvalidSpeed(SpeedError::MiceOutOfRange {
+                knots,
+            }));
         }
         Ok(Self(knots))
     }
@@ -288,7 +411,7 @@ impl MiceSpeed {
 /// Unlike [`Course`], this type retains fractional sensor precision and does
 /// not assign a special "unknown" meaning to zero. Use it for navigation and
 /// `SmartBeaconing` calculations.
-#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Heading(f64);
 
 impl Heading {
@@ -299,10 +422,11 @@ impl Heading {
     /// Returns [`AprsError::InvalidCourse`] unless `degrees` is finite and
     /// inside `0..=360`.
     pub fn new(degrees: f64) -> Result<Self, AprsError> {
-        if !degrees.is_finite() || !(0.0..=360.0).contains(&degrees) {
-            return Err(AprsError::InvalidCourse(
-                "heading must be finite and in 0-360 degrees",
-            ));
+        if !degrees.is_finite() {
+            return Err(AprsError::InvalidCourse(CourseError::NonFinite));
+        }
+        if !(0.0..=360.0).contains(&degrees) {
+            return Err(AprsError::InvalidCourse(CourseError::OutOfRange));
         }
         Ok(Self(degrees))
     }
@@ -339,7 +463,7 @@ impl Course {
         if degrees <= Self::MAX {
             Ok(Self(degrees))
         } else {
-            Err(AprsError::InvalidCourse("must be 0-360 degrees"))
+            Err(AprsError::InvalidCourse(CourseError::OutOfRange))
         }
     }
 
@@ -359,7 +483,7 @@ impl Course {
 /// Per APRS 1.0.1 §14, message IDs in the `{NNNNN` trailer and in ack/rej
 /// frames are 1-5 characters drawn from `[A-Za-z0-9]`. This type enforces
 /// those rules at construction.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct MessageId(String);
 
 impl MessageId {
@@ -372,14 +496,29 @@ impl MessageId {
     ///
     /// Returns [`AprsError::InvalidMessageId`] if the input is empty,
     /// longer than 5 characters, or contains non-alphanumeric bytes.
-    pub fn new(s: &str) -> Result<Self, AprsError> {
-        if s.is_empty() || s.len() > Self::MAX_LEN {
-            return Err(AprsError::InvalidMessageId("must be 1-5 characters"));
+    /// [`TryFrom<String>`] transfers an owned allocation after validation.
+    pub fn new(value: &str) -> Result<Self, AprsError> {
+        Self::validate(value)?;
+        Ok(Self(value.to_owned()))
+    }
+
+    fn validate(text: &str) -> Result<(), AprsError> {
+        if text.is_empty() || text.len() > Self::MAX_LEN {
+            return Err(AprsError::InvalidMessageId(MessageIdError::Length {
+                bytes: text.len(),
+            }));
         }
-        if !s.bytes().all(|b| b.is_ascii_alphanumeric()) {
-            return Err(AprsError::InvalidMessageId("must be ASCII alphanumeric"));
+        if let Some((index, byte)) = text
+            .bytes()
+            .enumerate()
+            .find(|(_, byte)| !byte.is_ascii_alphanumeric())
+        {
+            return Err(AprsError::InvalidMessageId(MessageIdError::InvalidByte {
+                index,
+                byte,
+            }));
         }
-        Ok(Self(s.to_owned()))
+        Ok(())
     }
 
     /// Create the decimal message ID for a nonzero sequence number.
@@ -402,7 +541,7 @@ impl MessageId {
 
 impl fmt::Display for MessageId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        fmt::Display::fmt(&self.0, f)
     }
 }
 
@@ -426,7 +565,46 @@ pub enum SymbolTable {
     Alternate,
     /// Overlay character (digit or uppercase letter) on the alternate
     /// table.
-    Overlay(u8),
+    Overlay(SymbolOverlay),
+}
+
+/// A numeric or uppercase ASCII overlay on the APRS alternate symbol table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SymbolOverlay(u8);
+
+impl SymbolOverlay {
+    /// Validate an overlay byte from `0` through `9` or `A` through `Z`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsError::InvalidSymbolTable`] for any other byte.
+    pub const fn new(byte: u8) -> Result<Self, AprsError> {
+        match byte {
+            b'0'..=b'9' | b'A'..=b'Z' => Ok(Self(byte)),
+            _ => Err(AprsError::InvalidSymbolTable(
+                SymbolTableError::InvalidOverlay { byte },
+            )),
+        }
+    }
+
+    /// Standard overlay byte, independent of the position encoding format.
+    #[must_use]
+    pub const fn as_byte(self) -> u8 {
+        self.0
+    }
+}
+
+impl TryFrom<u8> for SymbolOverlay {
+    type Error = AprsError;
+    fn try_from(byte: u8) -> Result<Self, Self::Error> {
+        Self::new(byte)
+    }
+}
+
+impl From<SymbolOverlay> for u8 {
+    fn from(overlay: SymbolOverlay) -> Self {
+        overlay.as_byte()
+    }
 }
 
 impl SymbolTable {
@@ -440,9 +618,9 @@ impl SymbolTable {
         match b {
             b'/' => Ok(Self::Primary),
             b'\\' => Ok(Self::Alternate),
-            b'0'..=b'9' | b'A'..=b'Z' => Ok(Self::Overlay(b)),
+            b'0'..=b'9' | b'A'..=b'Z' => Ok(Self::Overlay(SymbolOverlay(b))),
             _ => Err(AprsError::InvalidSymbolTable(
-                "must be '/', '\\\\', 0-9, or A-Z",
+                SymbolTableError::InvalidSelector { byte: b },
             )),
         }
     }
@@ -453,7 +631,31 @@ impl SymbolTable {
         match self {
             Self::Primary => b'/',
             Self::Alternate => b'\\',
-            Self::Overlay(b) => b,
+            Self::Overlay(overlay) => overlay.as_byte(),
+        }
+    }
+
+    /// Table selector for a compressed position; numeric overlays encode as `a`-`j`.
+    #[must_use]
+    pub const fn compressed_byte(self) -> u8 {
+        match self {
+            Self::Overlay(SymbolOverlay(byte @ b'0'..=b'9')) => b'a' + byte - b'0',
+            _ => self.as_byte(),
+        }
+    }
+
+    /// Parse a compressed table selector, normalizing `a`-`j` to numeric overlays.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsError::InvalidSymbolTable`] for an invalid compressed selector.
+    pub const fn from_compressed_byte(byte: u8) -> Result<Self, AprsError> {
+        match byte {
+            b'a'..=b'j' => Ok(Self::Overlay(SymbolOverlay(b'0' + byte - b'a'))),
+            b'0'..=b'9' => Err(AprsError::InvalidSymbolTable(
+                SymbolTableError::CompressedNumericOverlay { byte },
+            )),
+            _ => Self::from_byte(byte),
         }
     }
 }
@@ -494,9 +696,9 @@ impl AprsSymbol {
     /// ASCII (`!` through `~`), as required by APRS 1.0.1 §5.1.
     pub const fn new(table: SymbolTable, code: u8) -> Result<Self, AprsError> {
         if code < b'!' || code > b'~' {
-            return Err(AprsError::InvalidSymbol(
-                "code must be printable ASCII (0x21-0x7E)",
-            ));
+            return Err(AprsError::InvalidSymbol(SymbolError::InvalidCode {
+                byte: code,
+            }));
         }
         Ok(Self { table, code })
     }
@@ -513,14 +715,14 @@ impl AprsSymbol {
     /// [`AprsError::InvalidSymbol`] for a non-ASCII/non-printable code.
     pub fn from_chars(table: char, code: char) -> Result<Self, AprsError> {
         if !table.is_ascii() {
-            return Err(AprsError::InvalidSymbolTable(
-                "must be one ASCII byte: '/', '\\\\', 0-9, or A-Z",
-            ));
+            return Err(AprsError::InvalidSymbolTable(SymbolTableError::NonAscii {
+                character: table,
+            }));
         }
         if !code.is_ascii() {
-            return Err(AprsError::InvalidSymbol(
-                "code must be one printable ASCII byte (0x21-0x7E)",
-            ));
+            return Err(AprsError::InvalidSymbol(SymbolError::NonAscii {
+                character: code,
+            }));
         }
         let table = SymbolTable::from_byte(table as u8)?;
         Self::new(table, code as u8)
@@ -583,7 +785,9 @@ impl Fahrenheit {
     /// `-99..=999`.
     pub const fn new(f: i16) -> Result<Self, AprsError> {
         if f < Self::MIN || f > Self::MAX {
-            return Err(AprsError::InvalidTemperature("must be -99..=999"));
+            return Err(AprsError::InvalidTemperature(
+                TemperatureError::OutOfRange { value: f },
+            ));
         }
         Ok(Self(f))
     }
@@ -608,14 +812,13 @@ impl Fahrenheit {
 /// uppercase alphanumerics, just like [`Callsign`]) with well-known
 /// constants for common devices.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct Tocall(String);
+pub struct Tocall(Callsign);
 
 impl Tocall {
     /// Maximum length of a tocall.
     pub const MAX_LEN: usize = 6;
 
-    /// The tocall assigned to the Kenwood TH-D75 / TH-D74 family
-    /// (registered as `APK005` in the APRS tocall registry).
+    /// The tocall assigned to the Kenwood TH-D75 in the APRS tocall registry.
     pub const TH_D75: &'static str = "APK005";
 
     /// Create a tocall from a string, enforcing the same rules as
@@ -624,32 +827,262 @@ impl Tocall {
     /// # Errors
     ///
     /// Returns [`AprsError::InvalidTocall`] on invalid input.
-    pub fn new(s: &str) -> Result<Self, AprsError> {
-        // Reuse Callsign's validation rules; tocalls are structurally
-        // identical to callsigns, they're just a different namespace.
-        // `Callsign::new` lives in ax25-codec and returns `Ax25Error`;
-        // map to this crate's `AprsError` at the boundary.
-        let _validated = Callsign::new(s)
-            .map_err(|_| AprsError::InvalidTocall("must be 1-6 uppercase A-Z or 0-9"))?;
-        Ok(Self(s.to_owned()))
+    pub fn new(value: &str) -> Result<Self, AprsError> {
+        Callsign::new(value)
+            .map(Self)
+            .map_err(AprsError::InvalidTocall)
     }
 
-    /// Build the TH-D75 tocall constant without going through validation.
+    /// Construct the registered TH-D75 software destination `APK005`.
     #[must_use]
     pub fn th_d75() -> Self {
-        Self(Self::TH_D75.to_owned())
+        Self::new(Self::TH_D75)
+            .unwrap_or_else(|_| unreachable!("the registered TH-D75 tocall is valid"))
     }
 
     /// Return the tocall as a string slice.
     #[must_use]
     pub fn as_str(&self) -> &str {
-        &self.0
+        self.0.as_str()
     }
 }
 
 impl fmt::Display for Tocall {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+macro_rules! finite_value_traits {
+    ($type:ty) => {
+        impl Eq for $type {}
+        impl Ord for $type {
+            fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+                if self.0 == 0.0 && other.0 == 0.0 {
+                    core::cmp::Ordering::Equal
+                } else {
+                    self.0.total_cmp(&other.0)
+                }
+            }
+        }
+        impl PartialOrd for $type {
+            fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl core::hash::Hash for $type {
+            fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+                let canonical = if self.0 == 0.0 { 0.0 } else { self.0 };
+                core::hash::Hash::hash(&canonical.to_bits(), state);
+            }
+        }
+        impl fmt::LowerExp for $type {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                fmt::LowerExp::fmt(&self.0, formatter)
+            }
+        }
+        impl fmt::UpperExp for $type {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                fmt::UpperExp::fmt(&self.0, formatter)
+            }
+        }
+    };
+}
+
+finite_value_traits!(Latitude);
+finite_value_traits!(Longitude);
+finite_value_traits!(Speed);
+finite_value_traits!(Heading);
+
+impl fmt::Display for Speed {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, formatter)
+    }
+}
+
+macro_rules! integer_traits {
+    ($type:ty, $integer:ty, $accessor:ident) => {
+        impl TryFrom<$integer> for $type {
+            type Error = AprsError;
+            fn try_from(value: $integer) -> Result<Self, Self::Error> {
+                Self::new(value)
+            }
+        }
+        impl From<$type> for $integer {
+            fn from(value: $type) -> Self {
+                value.$accessor()
+            }
+        }
+        impl fmt::Display for $type {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                fmt::Display::fmt(&self.0, formatter)
+            }
+        }
+        impl fmt::Binary for $type {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                fmt::Binary::fmt(&self.0, formatter)
+            }
+        }
+        impl fmt::Octal for $type {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                fmt::Octal::fmt(&self.0, formatter)
+            }
+        }
+        impl fmt::LowerHex for $type {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                fmt::LowerHex::fmt(&self.0, formatter)
+            }
+        }
+        impl fmt::UpperHex for $type {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                fmt::UpperHex::fmt(&self.0, formatter)
+            }
+        }
+    };
+}
+
+integer_traits!(MiceSpeed, u16, as_knots);
+integer_traits!(Course, u16, as_degrees);
+integer_traits!(Fahrenheit, i16, get);
+
+macro_rules! degree_traits {
+    ($type:ty) => {
+        impl TryFrom<f64> for $type {
+            type Error = AprsError;
+            fn try_from(degrees: f64) -> Result<Self, Self::Error> {
+                Self::new(degrees)
+            }
+        }
+        impl From<$type> for f64 {
+            fn from(value: $type) -> Self {
+                value.as_degrees()
+            }
+        }
+        impl fmt::Display for $type {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                fmt::Display::fmt(&self.0, formatter)
+            }
+        }
+    };
+}
+
+degree_traits!(Latitude);
+degree_traits!(Longitude);
+degree_traits!(Heading);
+
+macro_rules! string_traits {
+    ($type:ty) => {
+        impl AsRef<str> for $type {
+            fn as_ref(&self) -> &str {
+                self.as_str()
+            }
+        }
+        impl core::str::FromStr for $type {
+            type Err = AprsError;
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                Self::new(value)
+            }
+        }
+        impl TryFrom<&str> for $type {
+            type Error = AprsError;
+            fn try_from(value: &str) -> Result<Self, Self::Error> {
+                Self::new(value)
+            }
+        }
+    };
+}
+
+string_traits!(MessageId);
+string_traits!(Tocall);
+
+impl TryFrom<String> for MessageId {
+    type Error = AprsError;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::validate(&value)?;
+        Ok(Self(value))
+    }
+}
+
+impl TryFrom<String> for Tocall {
+    type Error = AprsError;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Callsign::try_from(value)
+            .map(Self)
+            .map_err(AprsError::InvalidTocall)
+    }
+}
+
+impl From<MessageId> for String {
+    fn from(value: MessageId) -> Self {
+        value.0
+    }
+}
+
+impl From<Tocall> for String {
+    fn from(value: Tocall) -> Self {
+        value.0.into()
+    }
+}
+
+impl From<Tocall> for Callsign {
+    fn from(value: Tocall) -> Self {
+        value.0
+    }
+}
+
+impl From<Callsign> for Tocall {
+    fn from(value: Callsign) -> Self {
+        Self(value)
+    }
+}
+
+impl TryFrom<u8> for SymbolTable {
+    type Error = AprsError;
+    fn try_from(byte: u8) -> Result<Self, Self::Error> {
+        Self::from_byte(byte)
+    }
+}
+
+impl From<SymbolTable> for u8 {
+    fn from(table: SymbolTable) -> Self {
+        table.as_byte()
+    }
+}
+
+impl TryFrom<char> for SymbolOverlay {
+    type Error = AprsError;
+    fn try_from(character: char) -> Result<Self, Self::Error> {
+        if !character.is_ascii() {
+            return Err(AprsError::InvalidSymbolTable(SymbolTableError::NonAscii {
+                character,
+            }));
+        }
+        Self::new(character as u8)
+    }
+}
+
+impl From<SymbolOverlay> for char {
+    fn from(overlay: SymbolOverlay) -> Self {
+        Self::from(overlay.as_byte())
+    }
+}
+
+impl fmt::Display for SymbolOverlay {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&char::from(*self), formatter)
+    }
+}
+
+impl TryFrom<[u8; 2]> for AprsSymbol {
+    type Error = AprsError;
+    fn try_from(bytes: [u8; 2]) -> Result<Self, Self::Error> {
+        Self::new(SymbolTable::try_from(bytes[0])?, bytes[1])
+    }
+}
+
+impl From<AprsSymbol> for [u8; 2] {
+    fn from(symbol: AprsSymbol) -> Self {
+        [symbol.table_byte(), symbol.code()]
     }
 }
 
@@ -662,6 +1095,197 @@ mod tests {
     use super::*;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn owned_identifiers_transfer_the_original_allocation() -> TestResult {
+        let input = String::from("A1234");
+        let allocation = input.as_ptr();
+        let identifier = MessageId::try_from(input)?;
+        assert_eq!(identifier.as_ref().as_ptr(), allocation);
+        let output = String::from(identifier);
+        assert_eq!(output.as_ptr(), allocation);
+        assert_eq!(output, "A1234");
+
+        let input = String::from("APK005");
+        let allocation = input.as_ptr();
+        let tocall = Tocall::try_from(input)?;
+        assert_eq!(tocall.as_ref().as_ptr(), allocation);
+        let output = String::from(tocall);
+        assert_eq!(output.as_ptr(), allocation);
+        assert_eq!(output, Tocall::TH_D75);
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_scalar_values_preserve_typed_reasons() {
+        assert_eq!(
+            Latitude::new(f64::NAN),
+            Err(AprsError::InvalidLatitude(CoordinateError::NonFinite))
+        );
+        assert_eq!(
+            Latitude::new(90.000_001),
+            Err(AprsError::InvalidLatitude(CoordinateError::OutOfRange))
+        );
+        assert_eq!(
+            Longitude::new(f64::INFINITY),
+            Err(AprsError::InvalidLongitude(CoordinateError::NonFinite))
+        );
+        assert_eq!(
+            Longitude::new(-180.000_001),
+            Err(AprsError::InvalidLongitude(CoordinateError::OutOfRange))
+        );
+        assert_eq!(
+            Speed::from_kmh(-1.0),
+            Err(AprsError::InvalidSpeed(SpeedError::Negative))
+        );
+        assert_eq!(
+            Speed::from_knots(f64::NAN),
+            Err(AprsError::InvalidSpeed(SpeedError::NonFinite))
+        );
+        assert_eq!(
+            Speed::from_mph(f64::MAX),
+            Err(AprsError::InvalidSpeed(SpeedError::ConversionOverflow))
+        );
+        assert_eq!(
+            MiceSpeed::try_from(800),
+            Err(AprsError::InvalidSpeed(SpeedError::MiceOutOfRange {
+                knots: 800
+            }))
+        );
+        assert_eq!(
+            Heading::try_from(f64::NAN),
+            Err(AprsError::InvalidCourse(CourseError::NonFinite))
+        );
+        assert_eq!(
+            Course::try_from(361),
+            Err(AprsError::InvalidCourse(CourseError::OutOfRange))
+        );
+        assert_eq!(
+            Fahrenheit::try_from(-100),
+            Err(AprsError::InvalidTemperature(
+                TemperatureError::OutOfRange { value: -100 }
+            ))
+        );
+    }
+
+    #[test]
+    fn rejected_text_and_symbol_values_preserve_typed_reasons() {
+        assert_eq!(
+            MessageId::new("ABCDEF"),
+            Err(AprsError::InvalidMessageId(MessageIdError::Length {
+                bytes: 6
+            }))
+        );
+        assert_eq!(
+            MessageId::new("AB-1"),
+            Err(AprsError::InvalidMessageId(MessageIdError::InvalidByte {
+                index: 2,
+                byte: b'-'
+            }))
+        );
+        for (text, reason) in [
+            ("", MessageIdError::Length { bytes: 0 }),
+            ("ABCDEF", MessageIdError::Length { bytes: 6 }),
+            (
+                "AB-1",
+                MessageIdError::InvalidByte {
+                    index: 2,
+                    byte: b'-',
+                },
+            ),
+        ] {
+            assert_eq!(
+                MessageId::try_from(text.to_owned()),
+                Err(AprsError::InvalidMessageId(reason))
+            );
+        }
+        for text in ["", "TOOLONG", "aptest", "AP_1"] {
+            assert!(matches!(
+                Tocall::try_from(text.to_owned()),
+                Err(AprsError::InvalidTocall(_))
+            ));
+        }
+        assert_eq!(
+            SymbolOverlay::new(b'a'),
+            Err(AprsError::InvalidSymbolTable(
+                SymbolTableError::InvalidOverlay { byte: b'a' }
+            ))
+        );
+        assert_eq!(
+            SymbolTable::from_compressed_byte(b'5'),
+            Err(AprsError::InvalidSymbolTable(
+                SymbolTableError::CompressedNumericOverlay { byte: b'5' }
+            ))
+        );
+        assert_eq!(
+            AprsSymbol::from_chars('/', 'é'),
+            Err(AprsError::InvalidSymbol(SymbolError::NonAscii {
+                character: 'é'
+            }))
+        );
+    }
+
+    #[test]
+    fn finite_values_preserve_equality_order_and_hash_for_signed_zero() -> TestResult {
+        use std::collections::{BTreeSet, HashSet};
+
+        let north = Latitude::try_from(0.0)?;
+        let south = Latitude::try_from(-0.0)?;
+        assert_eq!(north, south);
+        assert_eq!(north.cmp(&south), core::cmp::Ordering::Equal);
+        assert_eq!(BTreeSet::from([north, south]).len(), 1);
+        assert_eq!(HashSet::from([north, south]).len(), 1);
+        assert_eq!(
+            HashSet::from([Longitude::try_from(0.0)?, Longitude::try_from(-0.0)?]).len(),
+            1
+        );
+        assert_eq!(
+            HashSet::from([Speed::from_kmh(0.0)?, Speed::from_kmh(-0.0)?]).len(),
+            1
+        );
+        assert_eq!(
+            HashSet::from([Heading::try_from(0.0)?, Heading::try_from(-0.0)?]).len(),
+            1
+        );
+        assert!(Latitude::try_from(-90.0)? < north);
+        assert!(Longitude::try_from(180.0)? > Longitude::PRIME_MERIDIAN);
+        Ok(())
+    }
+
+    #[test]
+    fn numeric_and_symbol_conversions_preserve_units_and_format_flags() -> TestResult {
+        let speed = MiceSpeed::try_from(799)?;
+        assert_eq!(u16::from(speed), 799);
+        assert_eq!(format!("{speed:#08X}"), format!("{:#08X}", 799_u16));
+        let course = Course::try_from(360)?;
+        assert_eq!(format!("{course:#014b}"), format!("{:#014b}", 360_u16));
+        let temperature = Fahrenheit::try_from(-99)?;
+        assert_eq!(format!("{temperature:#08x}"), format!("{:#08x}", -99_i16));
+        assert_eq!(format!("{temperature:+06}"), format!("{:+06}", -99_i16));
+        assert_eq!(
+            f64::from(Latitude::try_from(12.5)?).to_bits(),
+            12.5_f64.to_bits()
+        );
+        let latitude = Latitude::new(12.5)?;
+        let longitude = Longitude::new(-45.25)?;
+        let speed = Speed::from_kmh(25.5)?;
+        let heading = Heading::new(359.5)?;
+        assert_eq!(
+            format!("{latitude:+012.3e}"),
+            format!("{:+012.3e}", 12.5_f64)
+        );
+        assert_eq!(
+            format!("{longitude:>16.2E}"),
+            format!("{:>16.2E}", -45.25_f64)
+        );
+        assert_eq!(format!("{speed:+012.3e}"), format!("{:+012.3e}", 25.5_f64));
+        assert_eq!(format!("{heading:>16.2E}"), format!("{:>16.2E}", 359.5_f64));
+        let symbol = AprsSymbol::try_from(*b"5>")?;
+        assert_eq!(<[u8; 2]>::from(symbol), *b"5>");
+        assert_eq!(u8::from(SymbolTable::try_from(b'/')?), b'/');
+        assert_eq!(char::from(SymbolOverlay::try_from('A')?), 'A');
+        Ok(())
+    }
 
     #[test]
     fn latitude_accepts_valid_range() -> TestResult {
@@ -836,8 +1460,14 @@ mod tests {
     fn symbol_table_parse() -> TestResult {
         assert_eq!(SymbolTable::from_byte(b'/')?, SymbolTable::Primary);
         assert_eq!(SymbolTable::from_byte(b'\\')?, SymbolTable::Alternate);
-        assert_eq!(SymbolTable::from_byte(b'9')?, SymbolTable::Overlay(b'9'));
-        assert_eq!(SymbolTable::from_byte(b'Z')?, SymbolTable::Overlay(b'Z'));
+        assert_eq!(
+            SymbolTable::from_byte(b'9')?,
+            SymbolTable::Overlay(SymbolOverlay::new(b'9')?)
+        );
+        assert_eq!(
+            SymbolTable::from_byte(b'Z')?,
+            SymbolTable::Overlay(SymbolOverlay::new(b'Z')?)
+        );
         assert!(matches!(
             SymbolTable::from_byte(b'a'),
             Err(AprsError::InvalidSymbolTable(_))
@@ -934,7 +1564,7 @@ mod tests {
     #[test]
     fn latitude_aprs_format_north() -> TestResult {
         let lat = Latitude::new(49.058_333)?;
-        let s = lat.as_aprs_uncompressed();
+        let s = lat.to_aprs_uncompressed();
         assert_eq!(s.len(), 8);
         assert!(s.ends_with('N'));
         assert!(s.starts_with("49"));
@@ -944,7 +1574,7 @@ mod tests {
     #[test]
     fn latitude_aprs_format_south() -> TestResult {
         let lat = Latitude::new(-33.856)?;
-        let s = lat.as_aprs_uncompressed();
+        let s = lat.to_aprs_uncompressed();
         assert!(s.ends_with('S'));
         Ok(())
     }
@@ -952,7 +1582,7 @@ mod tests {
     #[test]
     fn longitude_aprs_format_west() -> TestResult {
         let lon = Longitude::new(-72.029_166)?;
-        let s = lon.as_aprs_uncompressed();
+        let s = lon.to_aprs_uncompressed();
         assert_eq!(s.len(), 9);
         assert!(s.ends_with('W'));
         assert!(s.starts_with("072"));
@@ -962,7 +1592,7 @@ mod tests {
     #[test]
     fn longitude_aprs_format_east() -> TestResult {
         let lon = Longitude::new(151.209)?;
-        let s = lon.as_aprs_uncompressed();
+        let s = lon.to_aprs_uncompressed();
         assert!(s.ends_with('E'));
         assert!(s.starts_with("151"));
         Ok(())
@@ -1062,7 +1692,7 @@ mod tests {
     fn latitude_newtype_carry_boundary_no_60_minutes() -> TestResult {
         // The Latitude newtype method must also carry correctly.
         let lat = Latitude::new(33.999_999)?;
-        let s = lat.as_aprs_uncompressed();
+        let s = lat.to_aprs_uncompressed();
         assert_eq!(s, "3400.00N", "expected carry to 3400.00N, got {s}");
         assert_eq!(s.len(), 8, "latitude field is 8 bytes");
         Ok(())
@@ -1072,7 +1702,7 @@ mod tests {
     fn longitude_newtype_carry_boundary_no_60_minutes() -> TestResult {
         // The Longitude newtype method (western hemisphere) must carry.
         let lon = Longitude::new(-97.999_983)?;
-        let s = lon.as_aprs_uncompressed();
+        let s = lon.to_aprs_uncompressed();
         assert_eq!(s, "09800.00W", "expected carry to 09800.00W, got {s}");
         assert_eq!(s.len(), 9, "longitude field is 9 bytes");
         Ok(())

@@ -45,8 +45,58 @@
 
 use std::time::{Duration, Instant};
 
+use thiserror::Error;
+
 use crate::error::AprsError;
 use crate::units::{Heading, Speed};
+
+/// Why a set of `SmartBeaconing` parameters cannot define a valid schedule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum SmartBeaconingConfigError {
+    /// The low-speed threshold was zero.
+    #[error("low speed must be positive")]
+    ZeroLowSpeed,
+    /// The high-speed threshold preceded the low-speed threshold.
+    #[error("high speed must be greater than or equal to low speed")]
+    ReversedSpeedThresholds,
+    /// The stopped/slow beacon interval was zero.
+    #[error("slow beacon interval must be nonzero")]
+    ZeroSlowInterval,
+    /// The high-speed beacon interval was zero.
+    #[error("fast beacon interval must be nonzero")]
+    ZeroFastInterval,
+    /// The turn-slope coefficient was non-finite or negative.
+    #[error("turn slope must be finite and non-negative")]
+    InvalidTurnSlope,
+    /// The maximum turn-threshold adjustment overflowed.
+    #[error("turn-slope calculation exceeds the finite degree range")]
+    TurnAdjustmentOverflow,
+    /// The minimum turn angle exceeded the algorithm's ceiling.
+    #[error("minimum turn angle must not exceed 120 degrees")]
+    TurnMinimumTooLarge,
+    /// An interpolated interval could exceed the whole-second result type.
+    #[error("interpolated interval exceeds the u32 second range")]
+    IntervalOverflow,
+}
+
+/// Named candidate values checked by [`SmartBeaconingConfig::new`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SmartBeaconingParameters {
+    /// Positive threshold below which the slow interval applies.
+    pub low_speed: Speed,
+    /// Threshold at or above which the fast interval applies.
+    pub high_speed: Speed,
+    /// Nonzero stopped/slow beacon interval in seconds.
+    pub slow_rate_secs: u32,
+    /// Nonzero high-speed beacon interval in seconds.
+    pub fast_rate_secs: u32,
+    /// Finite non-negative turn coefficient for a km/h denominator.
+    pub turn_slope: f64,
+    /// Minimum turn angle, at most 120 degrees.
+    pub turn_minimum: Heading,
+    /// Minimum seconds between turn beacons; zero permits immediate turns.
+    pub turn_time_secs: u32,
+}
 
 /// Configuration for the `SmartBeaconing` algorithm.
 ///
@@ -91,49 +141,50 @@ impl SmartBeaconingConfig {
     ///
     /// Returns [`AprsError::InvalidSmartBeaconingConfig`] when the values
     /// cannot define a finite, nonzero beacon schedule.
-    pub fn new(
-        low_speed: Speed,
-        high_speed: Speed,
-        slow_rate_secs: u32,
-        fast_rate_secs: u32,
-        turn_slope: f64,
-        turn_minimum: Heading,
-        turn_time_secs: u32,
-    ) -> Result<Self, AprsError> {
+    pub fn new(parameters: SmartBeaconingParameters) -> Result<Self, AprsError> {
+        let SmartBeaconingParameters {
+            low_speed,
+            high_speed,
+            slow_rate_secs,
+            fast_rate_secs,
+            turn_slope,
+            turn_minimum,
+            turn_time_secs,
+        } = parameters;
         if low_speed.as_kmh() <= 0.0 {
             return Err(AprsError::InvalidSmartBeaconingConfig(
-                "low speed must be greater than zero",
+                SmartBeaconingConfigError::ZeroLowSpeed,
             ));
         }
         if high_speed < low_speed {
             return Err(AprsError::InvalidSmartBeaconingConfig(
-                "high speed must be greater than or equal to low speed",
+                SmartBeaconingConfigError::ReversedSpeedThresholds,
             ));
         }
         if slow_rate_secs == 0 {
             return Err(AprsError::InvalidSmartBeaconingConfig(
-                "slow beacon rate must be at least one second",
+                SmartBeaconingConfigError::ZeroSlowInterval,
             ));
         }
         if fast_rate_secs == 0 {
             return Err(AprsError::InvalidSmartBeaconingConfig(
-                "fast beacon rate must be at least one second",
+                SmartBeaconingConfigError::ZeroFastInterval,
             ));
         }
         if !turn_slope.is_finite() || turn_slope < 0.0 {
             return Err(AprsError::InvalidSmartBeaconingConfig(
-                "turn slope must be finite and non-negative",
+                SmartBeaconingConfigError::InvalidTurnSlope,
             ));
         }
         let maximum_turn_adjustment = (turn_slope * 10.0) / low_speed.as_kmh();
         if !maximum_turn_adjustment.is_finite() {
             return Err(AprsError::InvalidSmartBeaconingConfig(
-                "turn-slope calculation exceeds the supported range",
+                SmartBeaconingConfigError::TurnAdjustmentOverflow,
             ));
         }
         if turn_minimum.as_degrees() > 120.0 {
             return Err(AprsError::InvalidSmartBeaconingConfig(
-                "minimum turn angle must not exceed 120 degrees",
+                SmartBeaconingConfigError::TurnMinimumTooLarge,
             ));
         }
 
@@ -143,7 +194,7 @@ impl SmartBeaconingConfig {
             || maximum_interpolated_interval > f64::from(u32::MAX)
         {
             return Err(AprsError::InvalidSmartBeaconingConfig(
-                "interpolated beacon interval exceeds the supported range",
+                SmartBeaconingConfigError::IntervalOverflow,
             ));
         }
 
@@ -209,16 +260,37 @@ impl Default for SmartBeaconingConfig {
             .unwrap_or_else(|_| unreachable!("the default high speed is valid"));
         let turn_minimum =
             Heading::new(28.0).unwrap_or_else(|_| unreachable!("the default turn angle is valid"));
-        Self::new(
+        Self::new(SmartBeaconingParameters {
             low_speed,
             high_speed,
-            1800,
-            120,
-            41.842_944,
+            slow_rate_secs: 1800,
+            fast_rate_secs: 120,
+            turn_slope: 41.842_944,
             turn_minimum,
-            60,
-        )
+            turn_time_secs: 60,
+        })
         .unwrap_or_else(|_| unreachable!("the default SmartBeaconing configuration is valid"))
+    }
+}
+
+impl TryFrom<SmartBeaconingParameters> for SmartBeaconingConfig {
+    type Error = AprsError;
+    fn try_from(parameters: SmartBeaconingParameters) -> Result<Self, Self::Error> {
+        Self::new(parameters)
+    }
+}
+
+impl From<SmartBeaconingConfig> for SmartBeaconingParameters {
+    fn from(config: SmartBeaconingConfig) -> Self {
+        Self {
+            low_speed: config.low_speed,
+            high_speed: config.high_speed,
+            slow_rate_secs: config.slow_rate_secs,
+            fast_rate_secs: config.fast_rate_secs,
+            turn_slope: config.turn_slope,
+            turn_minimum: config.turn_minimum,
+            turn_time_secs: config.turn_time_secs,
+        }
     }
 }
 
@@ -244,7 +316,7 @@ pub enum BeaconReason {
 /// [`SmartBeaconing::beacon_sent_with`]. The state holds the last
 /// beacon's heading and speed so subsequent turn-threshold checks have
 /// the reference data they need.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BeaconState {
     /// No beacon has been sent yet; the first call to `should_beacon` /
     /// `beacon_reason` will return `Some(BeaconReason::First)`.
@@ -498,29 +570,29 @@ mod tests {
         turn_minimum_degrees: f64,
         turn_time_secs: u32,
     ) -> SmartBeaconingConfig {
-        SmartBeaconingConfig::new(
-            speed(low_speed_kmh),
-            speed(high_speed_kmh),
+        SmartBeaconingConfig::new(SmartBeaconingParameters {
+            low_speed: speed(low_speed_kmh),
+            high_speed: speed(high_speed_kmh),
             slow_rate_secs,
             fast_rate_secs,
             turn_slope,
-            heading(turn_minimum_degrees),
+            turn_minimum: heading(turn_minimum_degrees),
             turn_time_secs,
-        )
+        })
         .unwrap_or_else(|_| unreachable!("test configuration is valid"))
     }
 
     fn immediate_turn_config() -> SmartBeaconingConfig {
         let defaults = SmartBeaconingConfig::default();
-        SmartBeaconingConfig::new(
-            defaults.low_speed(),
-            defaults.high_speed(),
-            defaults.slow_rate_secs(),
-            defaults.fast_rate_secs(),
-            defaults.turn_slope(),
-            defaults.turn_minimum(),
-            0,
-        )
+        SmartBeaconingConfig::new(SmartBeaconingParameters {
+            low_speed: defaults.low_speed(),
+            high_speed: defaults.high_speed(),
+            slow_rate_secs: defaults.slow_rate_secs(),
+            fast_rate_secs: defaults.fast_rate_secs(),
+            turn_slope: defaults.turn_slope(),
+            turn_minimum: defaults.turn_minimum(),
+            turn_time_secs: 0,
+        })
         .unwrap_or_else(|_| unreachable!("zero turn time remains a valid schedule"))
     }
 
@@ -763,46 +835,109 @@ mod tests {
 
     #[test]
     fn invalid_configurations_are_rejected() -> TestResult {
-        let valid_low = speed(5.0);
-        let valid_high = speed(70.0);
-        let valid_turn = heading(28.0);
+        let valid = SmartBeaconingParameters {
+            low_speed: Speed::from_kmh(5.0)?,
+            high_speed: Speed::from_kmh(70.0)?,
+            slow_rate_secs: 1800,
+            fast_rate_secs: 120,
+            turn_slope: 26.0,
+            turn_minimum: Heading::new(28.0)?,
+            turn_time_secs: 60,
+        };
+        let candidates = [
+            (
+                SmartBeaconingParameters {
+                    low_speed: Speed::from_kmh(0.0)?,
+                    ..valid
+                },
+                SmartBeaconingConfigError::ZeroLowSpeed,
+            ),
+            (
+                SmartBeaconingParameters {
+                    high_speed: Speed::from_kmh(4.0)?,
+                    ..valid
+                },
+                SmartBeaconingConfigError::ReversedSpeedThresholds,
+            ),
+            (
+                SmartBeaconingParameters {
+                    slow_rate_secs: 0,
+                    ..valid
+                },
+                SmartBeaconingConfigError::ZeroSlowInterval,
+            ),
+            (
+                SmartBeaconingParameters {
+                    fast_rate_secs: 0,
+                    ..valid
+                },
+                SmartBeaconingConfigError::ZeroFastInterval,
+            ),
+            (
+                SmartBeaconingParameters {
+                    high_speed: Speed::from_kmh(f64::MAX)?,
+                    ..valid
+                },
+                SmartBeaconingConfigError::IntervalOverflow,
+            ),
+        ];
+        for (candidate, reason) in candidates {
+            assert_eq!(
+                SmartBeaconingConfig::new(candidate),
+                Err(AprsError::InvalidSmartBeaconingConfig(reason))
+            );
+        }
+        let _accepted = SmartBeaconingConfig::new(valid)?;
+        Ok(())
+    }
 
-        assert!(
-            SmartBeaconingConfig::new(speed(0.0), valid_high, 1800, 120, 26.0, valid_turn, 60,)
-                .is_err()
-        );
-        assert!(
-            SmartBeaconingConfig::new(valid_high, valid_low, 1800, 120, 26.0, valid_turn, 60,)
-                .is_err()
-        );
-        for (slow_rate, fast_rate) in [(0, 120), (1800, 0)] {
-            assert!(
-                SmartBeaconingConfig::new(
-                    valid_low, valid_high, slow_rate, fast_rate, 26.0, valid_turn, 60,
-                )
-                .is_err()
+    #[test]
+    fn invalid_turn_configurations_preserve_typed_reasons() -> TestResult {
+        let valid = SmartBeaconingParameters::from(SmartBeaconingConfig::default());
+        let candidates = [
+            (
+                SmartBeaconingParameters {
+                    turn_slope: f64::NAN,
+                    ..valid
+                },
+                SmartBeaconingConfigError::InvalidTurnSlope,
+            ),
+            (
+                SmartBeaconingParameters {
+                    turn_slope: f64::INFINITY,
+                    ..valid
+                },
+                SmartBeaconingConfigError::InvalidTurnSlope,
+            ),
+            (
+                SmartBeaconingParameters {
+                    turn_slope: -1.0,
+                    ..valid
+                },
+                SmartBeaconingConfigError::InvalidTurnSlope,
+            ),
+            (
+                SmartBeaconingParameters {
+                    turn_slope: f64::MAX,
+                    ..valid
+                },
+                SmartBeaconingConfigError::TurnAdjustmentOverflow,
+            ),
+            (
+                SmartBeaconingParameters {
+                    turn_minimum: Heading::new(121.0)?,
+                    ..valid
+                },
+                SmartBeaconingConfigError::TurnMinimumTooLarge,
+            ),
+        ];
+        for (candidate, reason) in candidates {
+            assert_eq!(
+                SmartBeaconingConfig::new(candidate),
+                Err(AprsError::InvalidSmartBeaconingConfig(reason))
             );
         }
-        for turn_slope in [f64::NAN, f64::INFINITY, f64::MAX, -1.0] {
-            assert!(
-                SmartBeaconingConfig::new(
-                    valid_low, valid_high, 1800, 120, turn_slope, valid_turn, 60,
-                )
-                .is_err()
-            );
-        }
-        assert!(
-            SmartBeaconingConfig::new(
-                valid_low,
-                valid_high,
-                1800,
-                120,
-                26.0,
-                Heading::new(121.0)?,
-                60,
-            )
-            .is_err()
-        );
+        let _accepted = SmartBeaconingConfig::new(valid)?;
         Ok(())
     }
 

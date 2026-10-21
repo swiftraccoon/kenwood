@@ -37,6 +37,8 @@ pub enum AprsTextField {
     ObjectName,
     /// The semantic value of a variable-width APRS item name.
     ItemName,
+    /// An unrecognized query body after its leading `?`.
+    QueryText,
 }
 
 impl fmt::Display for AprsTextField {
@@ -53,6 +55,7 @@ impl fmt::Display for AprsTextField {
             Self::MiceStatusText => "APRS Mic-E status text",
             Self::ObjectName => "APRS object name",
             Self::ItemName => "APRS item name",
+            Self::QueryText => "APRS query text",
         })
     }
 }
@@ -233,7 +236,7 @@ impl MessageText {
 /// message bodies: both permit up to 67 printable ASCII bytes and reserve
 /// `|` and `~`, but `{` is ordinary bulletin text rather than an optional
 /// message-ID delimiter. Use this type with
-/// [`crate::build_aprs_bulletin`] instead of [`MessageText`].
+/// [`crate::AprsFrameHeader::bulletin_packet`] instead of [`MessageText`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BulletinText(String);
 
@@ -459,6 +462,29 @@ impl MiceStatusText {
     }
 }
 
+/// Printable-ASCII text of an unrecognized APRS query, without its leading `?`.
+///
+/// Empty text and extension syntax are retained. No selector grammar is inferred.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct QueryText(String);
+
+impl QueryText {
+    /// Checks the query's text encoding without interpreting extension syntax.
+    ///
+    /// # Errors
+    /// Returns [`AprsTextError`] for non-ASCII or control characters.
+    pub fn new(value: &str) -> Result<Self, AprsTextError> {
+        validate_query_text(value)?;
+        Ok(Self(value.to_owned()))
+    }
+
+    /// Borrows the exact extension query text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// An APRS object name before padding to its fixed nine-byte on-air field.
 ///
 /// Object names are case-sensitive and may contain printable ASCII bytes.
@@ -574,12 +600,13 @@ impl_text_value_traits!(CompressedPositionText, validate_compressed_position_tex
 impl_text_value_traits!(MiceStatusText, validate_mice_status_text);
 impl_text_value_traits!(ObjectName, validate_object_name);
 impl_text_value_traits!(ItemName, validate_item_name);
+impl_text_value_traits!(QueryText, validate_query_text);
 
 /// Decode a seven-bit ASCII field without replacing malformed wire bytes.
-pub(crate) fn decode_wire_ascii<'a>(
-    field: &'static str,
-    bytes: &'a [u8],
-) -> Result<&'a str, AprsError> {
+pub(crate) fn decode_wire_ascii(
+    field: crate::AprsWireTextField,
+    bytes: &[u8],
+) -> Result<&str, AprsError> {
     if let Some((index, byte)) = bytes
         .iter()
         .copied()
@@ -592,6 +619,10 @@ pub(crate) fn decode_wire_ascii<'a>(
     // Every ASCII byte sequence is UTF-8. Retain a defensive error mapping
     // so this helper remains total if its validation changes.
     std::str::from_utf8(bytes).map_err(|_| AprsError::InvalidFormat)
+}
+
+fn validate_query_text(value: &str) -> Result<(), AprsTextError> {
+    validate_printable_ascii(value, AprsTextField::QueryText, usize::MAX, true)
 }
 
 fn validate_message_addressee(value: &str) -> Result<(), AprsTextError> {

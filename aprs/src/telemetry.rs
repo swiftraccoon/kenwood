@@ -196,6 +196,124 @@ pub enum TelemetryValueError {
     },
 }
 
+/// All eight telemetry digital channels, with B1 in the most significant bit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TelemetryBits(u8);
+
+impl TelemetryBits {
+    /// Retains all eight channel bits; every byte is valid.
+    #[must_use]
+    pub const fn from_bits(bits: u8) -> Self {
+        Self(bits)
+    }
+
+    /// Returns B1 through B8 packed most-significant bit first.
+    #[must_use]
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// Returns a digital channel's state, or `None` for an analog channel.
+    #[must_use]
+    pub const fn channel(self, channel: TelemetryChannel) -> Option<bool> {
+        let shift = match channel {
+            TelemetryChannel::Digital1 => 7,
+            TelemetryChannel::Digital2 => 6,
+            TelemetryChannel::Digital3 => 5,
+            TelemetryChannel::Digital4 => 4,
+            TelemetryChannel::Digital5 => 3,
+            TelemetryChannel::Digital6 => 2,
+            TelemetryChannel::Digital7 => 1,
+            TelemetryChannel::Digital8 => 0,
+            TelemetryChannel::Analog1
+            | TelemetryChannel::Analog2
+            | TelemetryChannel::Analog3
+            | TelemetryChannel::Analog4
+            | TelemetryChannel::Analog5 => return None,
+        };
+        Some(self.0 & (1 << shift) != 0)
+    }
+}
+
+impl From<u8> for TelemetryBits {
+    fn from(value: u8) -> Self {
+        Self::from_bits(value)
+    }
+}
+
+impl From<TelemetryBits> for u8 {
+    fn from(value: TelemetryBits) -> Self {
+        value.bits()
+    }
+}
+
+impl fmt::Display for TelemetryBits {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:08b}", self.0)
+    }
+}
+
+impl fmt::Binary for TelemetryBits {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Binary::fmt(&self.0, formatter)
+    }
+}
+
+impl fmt::LowerHex for TelemetryBits {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::LowerHex::fmt(&self.0, formatter)
+    }
+}
+
+impl fmt::UpperHex for TelemetryBits {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::UpperHex::fmt(&self.0, formatter)
+    }
+}
+
+impl fmt::Octal for TelemetryBits {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Octal::fmt(&self.0, formatter)
+    }
+}
+
+/// Finite coefficients of one analog channel's `a*x*x + b*x + c` equation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TelemetryEquation {
+    a: f64,
+    b: f64,
+    c: f64,
+}
+
+impl TelemetryEquation {
+    /// Checks all three coefficients without constraining their physical units.
+    ///
+    /// # Errors
+    /// Returns [`TelemetryValueError::NonFiniteEquationCoefficient`] for NaN or infinity.
+    pub fn new(a: f64, b: f64, c: f64) -> Result<Self, TelemetryValueError> {
+        if let Some(index) = [a, b, c].iter().position(|value| !value.is_finite()) {
+            return Err(TelemetryValueError::NonFiniteEquationCoefficient { index });
+        }
+        Ok(Self { a, b, c })
+    }
+
+    /// Returns the quadratic coefficient.
+    #[must_use]
+    pub const fn a(self) -> f64 {
+        self.a
+    }
+    /// Returns the linear coefficient.
+    #[must_use]
+    pub const fn b(self) -> f64 {
+        self.b
+    }
+    /// Returns the constant coefficient.
+    #[must_use]
+    pub const fn c(self) -> f64 {
+        self.c
+    }
+}
+
 /// One of the five analog or eight digital APRS telemetry channels.
 ///
 /// APRS 1.0.1 §13 p.69 assigns different definition-field widths to each
@@ -425,6 +543,18 @@ impl From<TelemetryAnalogValue> for u16 {
     }
 }
 
+macro_rules! telemetry_analog_format {
+    ($($trait:ident),+ $(,)?) => { $(
+        impl fmt::$trait for TelemetryAnalogValue {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                fmt::$trait::fmt(&self.0, formatter)
+            }
+        }
+    )+ };
+}
+
+telemetry_analog_format!(Binary, Octal, LowerHex, UpperHex, LowerExp, UpperExp);
+
 /// A non-empty printable-ASCII comment following a telemetry digital value.
 ///
 /// The wire format has no separator before this comment. The first eight
@@ -511,8 +641,9 @@ impl TelemetryLabels {
     /// than 13 fields, or a field violates its positional width, printable
     /// ASCII representation, or delimiter rules.
     pub fn new(fields: &[&str]) -> Result<Self, TelemetryValueError> {
+        validate_definition_fields(fields)?;
         let owned = fields.iter().map(|field| (*field).to_owned()).collect();
-        Self::from_strings(owned)
+        Ok(Self(owned))
     }
 
     /// Create a telemetry label/unit prefix without copying owned strings.
@@ -529,6 +660,33 @@ impl TelemetryLabels {
     #[must_use]
     pub fn as_slice(&self) -> &[String] {
         &self.0
+    }
+
+    /// Iterates over the exact prefix, including explicit empty fields.
+    pub fn iter(&self) -> std::slice::Iter<'_, String> {
+        self.0.iter()
+    }
+}
+
+impl AsRef<[String]> for TelemetryLabels {
+    fn as_ref(&self) -> &[String] {
+        self.as_slice()
+    }
+}
+
+impl IntoIterator for TelemetryLabels {
+    type Item = String;
+    type IntoIter = std::vec::IntoIter<String>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+impl<'labels> IntoIterator for &'labels TelemetryLabels {
+    type Item = &'labels String;
+    type IntoIter = std::slice::Iter<'labels, String>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
     }
 }
 
@@ -581,7 +739,8 @@ impl TelemetryEquationCoefficients {
     /// than 15 coefficients, contains a non-finite value, or its canonical
     /// `EQNS.` representation would exceed 67 bytes.
     pub fn new(values: &[f64]) -> Result<Self, TelemetryValueError> {
-        Self::from_values(values.to_vec())
+        validate_equation_coefficients(values)?;
+        Ok(Self(values.to_vec()))
     }
 
     /// Create a coefficient prefix without copying an owned vector.
@@ -598,6 +757,33 @@ impl TelemetryEquationCoefficients {
     #[must_use]
     pub fn as_slice(&self) -> &[f64] {
         &self.0
+    }
+
+    /// Iterates over the supplied coefficient prefix in wire order.
+    pub fn iter(&self) -> std::slice::Iter<'_, f64> {
+        self.0.iter()
+    }
+}
+
+impl AsRef<[f64]> for TelemetryEquationCoefficients {
+    fn as_ref(&self) -> &[f64] {
+        self.as_slice()
+    }
+}
+
+impl IntoIterator for TelemetryEquationCoefficients {
+    type Item = f64;
+    type IntoIter = std::vec::IntoIter<f64>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+impl<'coefficients> IntoIterator for &'coefficients TelemetryEquationCoefficients {
+    type Item = &'coefficients f64;
+    type IntoIter = std::slice::Iter<'coefficients, f64>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
     }
 }
 
@@ -624,6 +810,19 @@ impl TryFrom<Vec<f64>> for TelemetryEquationCoefficients {
 impl From<TelemetryEquationCoefficients> for Vec<f64> {
     fn from(coefficients: TelemetryEquationCoefficients) -> Self {
         coefficients.0
+    }
+}
+
+impl TryFrom<[f64; 3]> for TelemetryEquation {
+    type Error = TelemetryValueError;
+    fn try_from([a, b, c]: [f64; 3]) -> Result<Self, Self::Error> {
+        Self::new(a, b, c)
+    }
+}
+
+impl From<TelemetryEquation> for [f64; 3] {
+    fn from(value: TelemetryEquation) -> Self {
+        [value.a(), value.b(), value.c()]
     }
 }
 
@@ -701,13 +900,63 @@ impl From<TelemetryProjectTitle> for String {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AprsTelemetry {
     /// Three-character numeric or `MIC` sequence.
-    pub sequence: TelemetrySequence,
+    sequence: TelemetrySequence,
     /// Exactly five analog-channel readings.
-    pub analog: [TelemetryAnalogValue; 5],
+    analog: [TelemetryAnalogValue; 5],
     /// Eight digital-channel bits packed most-significant bit first.
-    pub digital: u8,
+    digital: TelemetryBits,
     /// Optional printable-ASCII text following the digital bits.
-    pub comment: Option<TelemetryComment>,
+    comment: Option<TelemetryComment>,
+}
+
+impl AprsTelemetry {
+    /// Creates one complete checked five-channel report.
+    #[must_use]
+    pub const fn new(
+        sequence: TelemetrySequence,
+        analog: [TelemetryAnalogValue; 5],
+        digital: TelemetryBits,
+        comment: Option<TelemetryComment>,
+    ) -> Self {
+        Self {
+            sequence,
+            analog,
+            digital,
+            comment,
+        }
+    }
+
+    /// Returns the numeric or `MIC` sequence.
+    #[must_use]
+    pub const fn sequence(&self) -> TelemetrySequence {
+        self.sequence
+    }
+    /// Borrows the five analog readings in channel order.
+    #[must_use]
+    pub const fn analog(&self) -> &[TelemetryAnalogValue; 5] {
+        &self.analog
+    }
+    /// Returns the eight digital channel states.
+    #[must_use]
+    pub const fn digital(&self) -> TelemetryBits {
+        self.digital
+    }
+    /// Borrows the trailing printable comment when present.
+    #[must_use]
+    pub const fn comment(&self) -> Option<&TelemetryComment> {
+        self.comment.as_ref()
+    }
+
+    /// Decodes `T#`, an exact three-byte sequence, five three-digit analogs,
+    /// eight digital bits and an optional printable-ASCII comment.
+    /// Both `MIC` separator forms are accepted; numeric sequences require a comma.
+    ///
+    /// # Errors
+    /// Returns [`AprsError::InvalidFormat`] for invalid framing or fields and
+    /// [`AprsError::InvalidTextByte`] for non-ASCII bytes.
+    pub fn from_bytes(info: &[u8]) -> Result<Self, AprsError> {
+        parse_aprs_telemetry(info)
+    }
 }
 
 /// Parse an APRS telemetry data report.
@@ -722,13 +971,13 @@ pub struct AprsTelemetry {
 /// Returns [`AprsError::InvalidFormat`] for a malformed prefix, sequence,
 /// field count, analog field, digital field, or comment control byte.
 /// Non-ASCII input is reported as [`AprsError::InvalidTextByte`].
-pub fn parse_aprs_telemetry(info: &[u8]) -> Result<AprsTelemetry, AprsError> {
+fn parse_aprs_telemetry(info: &[u8]) -> Result<AprsTelemetry, AprsError> {
     if info.first() != Some(&b'T') || info.get(1) != Some(&b'#') {
         return Err(AprsError::InvalidFormat);
     }
 
     let body_bytes = info.get(2..).ok_or(AprsError::InvalidFormat)?;
-    let body = decode_wire_ascii("APRS telemetry body", body_bytes)?;
+    let body = decode_wire_ascii(crate::AprsWireTextField::TelemetryBody, body_bytes)?;
     let sequence_wire = body.get(..3).ok_or(AprsError::InvalidFormat)?;
     let after_sequence = body.get(3..).ok_or(AprsError::InvalidFormat)?;
 
@@ -778,7 +1027,7 @@ pub fn parse_aprs_telemetry(info: &[u8]) -> Result<AprsTelemetry, AprsError> {
     Ok(AprsTelemetry {
         sequence,
         analog,
-        digital,
+        digital: TelemetryBits::from_bits(digital),
         comment,
     })
 }
@@ -836,7 +1085,7 @@ fn validate_comment(value: &str) -> Result<(), TelemetryValueError> {
     Ok(())
 }
 
-fn validate_definition_fields(fields: &[String]) -> Result<(), TelemetryValueError> {
+fn validate_definition_fields<S: AsRef<str>>(fields: &[S]) -> Result<(), TelemetryValueError> {
     if fields.is_empty() {
         return Err(TelemetryValueError::EmptyDefinitionFields);
     }
@@ -848,6 +1097,7 @@ fn validate_definition_fields(fields: &[String]) -> Result<(), TelemetryValueErr
     }
 
     for (index, field) in fields.iter().enumerate() {
+        let field = field.as_ref();
         let Some(channel) = TelemetryChannel::from_index(index) else {
             return Err(TelemetryValueError::TooManyDefinitionFields {
                 maximum: TelemetryLabels::MAX_FIELDS,
@@ -1035,6 +1285,37 @@ mod tests {
             TelemetryAnalogValue::new(1000),
             Err(TelemetryValueError::AnalogValueOutOfRange { value: 1000 })
         );
+        Ok(())
+    }
+
+    #[test]
+    fn digital_channel_order_and_equation_domains_are_explicit() -> TestResult {
+        let first = TelemetryBits::from_bits(0x80);
+        assert_eq!(first.channel(TelemetryChannel::Digital1), Some(true));
+        assert_eq!(first.channel(TelemetryChannel::Digital8), Some(false));
+        let last = TelemetryBits::from_bits(1);
+        assert_eq!(last.channel(TelemetryChannel::Digital1), Some(false));
+        assert_eq!(last.channel(TelemetryChannel::Digital8), Some(true));
+        assert_eq!(first.channel(TelemetryChannel::Analog1), None);
+        assert_eq!(first.to_string(), "10000000");
+        assert_eq!(format!("{first:#04X}"), "0x80");
+        assert_eq!(
+            format!("{:#06x}", TelemetryAnalogValue::new(255)?),
+            "0x00ff"
+        );
+        let equation = TelemetryEquation::new(1.0, 2.0, 3.0)?;
+        assert_eq!(
+            <[f64; 3]>::from(equation).map(f64::to_bits),
+            [1.0_f64, 2.0, 3.0].map(f64::to_bits)
+        );
+        assert!(matches!(
+            TelemetryEquation::new(1.0, f64::NAN, 3.0),
+            Err(TelemetryValueError::NonFiniteEquationCoefficient { index: 1 })
+        ));
+        assert!(matches!(
+            TelemetryEquation::new(1.0, 2.0, f64::INFINITY),
+            Err(TelemetryValueError::NonFiniteEquationCoefficient { index: 2 })
+        ));
         Ok(())
     }
 
@@ -1252,7 +1533,7 @@ mod tests {
         let telemetry = parse_aprs_telemetry(info)?;
         assert_eq!(telemetry.sequence, TelemetrySequence::new(123)?);
         assert_eq!(telemetry.analog, analog([100, 200, 300, 400, 500])?);
-        assert_eq!(telemetry.digital, 0b1010_1010);
+        assert_eq!(telemetry.digital.bits(), 0b1010_1010);
         assert_eq!(
             telemetry.comment.as_ref().map(TelemetryComment::as_str),
             Some("1, pump,OK")
@@ -1269,7 +1550,7 @@ mod tests {
             let telemetry = parse_aprs_telemetry(info)?;
             assert_eq!(telemetry.sequence, TelemetrySequence::MIC);
             assert_eq!(telemetry.analog, analog([1, 2, 3, 4, 5])?);
-            assert_eq!(telemetry.digital, 0xFF);
+            assert_eq!(telemetry.digital.bits(), 0xFF);
             assert_eq!(telemetry.comment, None);
         }
         Ok(())
@@ -1280,7 +1561,7 @@ mod tests {
         let telemetry = parse_aprs_telemetry(b"T#000,000,000,000,000,000,00000000")?;
         assert_eq!(telemetry.sequence, TelemetrySequence::new(0)?);
         assert_eq!(telemetry.analog, analog([0, 0, 0, 0, 0])?);
-        assert_eq!(telemetry.digital, 0);
+        assert_eq!(telemetry.digital.bits(), 0);
         assert_eq!(telemetry.comment, None);
         Ok(())
     }
@@ -1337,7 +1618,7 @@ mod tests {
         assert_eq!(
             parse_aprs_telemetry(b"T#001,001,002,003,004,005,00000000\xFF"),
             Err(AprsError::InvalidTextByte {
-                field: "APRS telemetry body",
+                field: crate::AprsWireTextField::TelemetryBody,
                 index: 32,
                 byte: 0xFF,
             }),

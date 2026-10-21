@@ -7,18 +7,19 @@
 //! 2. **With timestamp**: `>DDHHMMzFREE_TEXT` (DHM Zulu + 55 chars).
 //! 3. **With Maidenhead grid + symbol**: `>IO91SX/G` (4 or 6 char grid
 //!    locator + `/` + symbol code, optionally followed by a comment).
-//! 4. **With beam-heading + ERP**: a 4-char `^DCK` suffix where `^`
-//!    introduces a 3-digit course (000-359 in 10° steps, hex-encoded)
-//!    and a 1-char power letter (table on p.81). Not yet implemented.
+//! 4. **With beam heading and ERP**: a three-byte `^HP` suffix. `H` encodes
+//!    heading in ten-degree steps (`0`-`9`, then `A`-`Z`); `P` is the power
+//!    code from the table on p.81. This suffix remains in the status text.
 //!
-//! Earlier code generations parsed only sub-format (1), discarding the
-//! structural data of the others.
+//! The parser separates recognized timestamp and grid prefixes and retains
+//! the trailing text, including an uninterpreted beam-heading/ERP suffix.
 
 use std::fmt;
 
 use crate::error::AprsError;
-use crate::packet::{AprsReportTimestamp, AprsReportTimestampFormat};
+use crate::packet::{AprsReportTimestamp, AprsReportTimestampFormat, MaidenheadGrid};
 use crate::text::decode_wire_ascii;
+use crate::{AprsSymbol, StatusText, SymbolTable, TimestampedStatusText};
 
 /// A validated APRS status timestamp in day/hour/minute UTC form.
 ///
@@ -86,7 +87,7 @@ impl TryFrom<AprsReportTimestamp> for AprsStatusTimestamp {
             Ok(Self(timestamp))
         } else {
             Err(AprsError::InvalidTimestamp(
-                "status timestamp must use DDHHMMz day/hour/minute UTC format",
+                crate::TimestampError::StatusFormat,
             ))
         }
     }
@@ -94,42 +95,89 @@ impl TryFrom<AprsReportTimestamp> for AprsStatusTimestamp {
 
 /// An APRS status report (data type `>`).
 ///
-/// Captures the spec-defined sub-formats from APRS 1.0.1 §16
-/// (pp.80-82).
-///
-/// The `text` field always carries the human-readable trailing
-/// portion (the part a station operator would type); the other
-/// fields decompose the structured prefix when present.
+/// Separates a recognized timestamp or grid/symbol prefix from the trailing
+/// text. Beam-heading and ERP suffixes remain part of that text.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AprsStatus {
     /// Status text (trailing free-form portion, structured prefix
     /// stripped). When the status carries no structured prefix this
     /// is the entire body.
-    pub text: String,
+    text: String,
     /// Optional 7-byte DHM-Zulu timestamp prefix (`DDHHMMz`). Per APRS 1.0.1
     /// §16 p.80 a status report's timestamp can only be day/hour/minute UTC.
     /// `None` when the
     /// body did not begin with a well-formed DHM-Zulu timestamp (an HMS or
     /// DHM-local 7-byte prefix is treated as status text, not a
     /// timestamp).
-    pub timestamp: Option<AprsStatusTimestamp>,
+    timestamp: Option<AprsStatusTimestamp>,
     /// Optional Maidenhead grid locator prefix (4 or 6 ASCII chars
     /// per APRS 1.0.1 §6 grid-square rules).
-    pub grid_locator: Option<String>,
+    grid_locator: Option<MaidenheadGrid>,
     /// Optional 2-byte symbol pair following a Maidenhead grid prefix.
     /// First byte is the symbol-table character (`/` primary, `\\`
     /// alternate); second byte is the symbol code.
-    pub symbol: Option<(char, char)>,
+    symbol: Option<AprsSymbol>,
+}
+
+impl AprsStatus {
+    /// Creates a plain status from checked text.
+    #[must_use]
+    pub fn new(text: StatusText) -> Self {
+        Self {
+            text: text.into(),
+            timestamp: None,
+            grid_locator: None,
+            symbol: None,
+        }
+    }
+    /// Creates a DHM-UTC status with its checked 55-byte text.
+    #[must_use]
+    pub fn timestamped(timestamp: AprsStatusTimestamp, text: TimestampedStatusText) -> Self {
+        Self {
+            text: text.into(),
+            timestamp: Some(timestamp),
+            grid_locator: None,
+            symbol: None,
+        }
+    }
+    /// Borrows text after any recognized structured prefix.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+    /// Returns the DHM-UTC observation timestamp when present.
+    #[must_use]
+    pub const fn timestamp(&self) -> Option<AprsStatusTimestamp> {
+        self.timestamp
+    }
+    /// Borrows the case-preserved grid prefix when present.
+    #[must_use]
+    pub const fn grid_locator(&self) -> Option<&MaidenheadGrid> {
+        self.grid_locator.as_ref()
+    }
+    /// Returns the checked symbol following a grid prefix.
+    #[must_use]
+    pub const fn symbol(&self) -> Option<AprsSymbol> {
+        self.symbol
+    }
+    /// Decodes plain, timestamped or grid-prefixed status text.
+    /// Receive compatibility retains overlong printable bodies and unrecognized
+    /// timestamp-like prefixes as text; send-side text types enforce their limits.
+    ///
+    /// # Errors
+    /// Returns [`AprsError::InvalidFormat`] without `>` or for control bytes,
+    /// and [`AprsError::InvalidTextByte`] for non-ASCII input.
+    pub fn from_bytes(info: &[u8]) -> Result<Self, AprsError> {
+        parse_aprs_status(info)
+    }
 }
 
 /// Maximum status text length per APRS 1.0.1 §16 p.80.
 ///
 /// The spec quote is "up to 62 characters". With a 7-byte timestamp
 /// the spec allows 55 characters; with a 6-char Maidenhead+symbol
-/// prefix it allows 54. The parser is length-tolerant on receive
-/// (accepts overlong text without error) because the spec text says
-/// "should" rather than "must"; the constant is exposed for callers
-/// that want to enforce on send.
+/// prefix it allows 54. Receive compatibility retains overlong text in an
+/// immutable observation; outgoing text types enforce the corresponding limits.
 pub const MAX_APRS_STATUS_TEXT_LEN: usize = 62;
 
 /// Parse an APRS status report (`>text`).
@@ -151,12 +199,16 @@ pub const MAX_APRS_STATUS_TEXT_LEN: usize = 62;
 ///
 /// Returns [`AprsError::InvalidFormat`] if the info field does not
 /// begin with `>`.
-pub fn parse_aprs_status(info: &[u8]) -> Result<AprsStatus, AprsError> {
+pub(crate) fn parse_aprs_status(info: &[u8]) -> Result<AprsStatus, AprsError> {
     if info.first() != Some(&b'>') {
         return Err(AprsError::InvalidFormat);
     }
     let body = info.get(1..).unwrap_or(&[]);
-    let body_str = decode_wire_ascii("APRS status body", body)?;
+    let body_str = decode_wire_ascii(crate::AprsWireTextField::StatusBody, body)?;
+    let body_str = body_str.trim_end_matches(['\r', '\n']);
+    if body_str.bytes().any(|byte| !(b' '..=b'~').contains(&byte)) {
+        return Err(AprsError::InvalidFormat);
+    }
 
     // Sub-format 2: DHM-Zulu timestamp prefix (7 bytes).
     //
@@ -188,16 +240,14 @@ pub fn parse_aprs_status(info: &[u8]) -> Result<AprsStatus, AprsError> {
     // valid grid format, then `/`, then exactly one byte.
     for grid_len in [6usize, 4usize] {
         if let Some(grid_candidate) = body_str.get(..grid_len)
-            && is_valid_grid_locator(grid_candidate)
+            && let Ok(grid) = MaidenheadGrid::new(grid_candidate)
             && body_str.as_bytes().get(grid_len) == Some(&b'/')
             && let Some(sym_byte) = body_str.as_bytes().get(grid_len + 1).copied()
+            && let Ok(symbol) = AprsSymbol::new(SymbolTable::Primary, sym_byte)
         {
-            let grid = grid_candidate.to_owned();
             // The symbol-table is implicit `/` (primary) per APRS 1.0.1
             // p.81 example "IO91SX/G": the `/` here is the table marker
             // and `G` is the code.
-            let symbol_table = '/';
-            let symbol_code = sym_byte as char;
             let rest = body_str
                 .get(grid_len + 2..)
                 .unwrap_or("")
@@ -207,7 +257,7 @@ pub fn parse_aprs_status(info: &[u8]) -> Result<AprsStatus, AprsError> {
                 text: rest,
                 timestamp: None,
                 grid_locator: Some(grid),
-                symbol: Some((symbol_table, symbol_code)),
+                symbol: Some(symbol),
             });
         }
     }
@@ -226,61 +276,9 @@ pub fn parse_aprs_status(info: &[u8]) -> Result<AprsStatus, AprsError> {
 /// Form: 2 letters (field, `A..R` case-insensitive) + 2 digits
 /// (square) + optionally 2 letters (sub-square, `a..x` case-
 /// insensitive). Both 4-char and 6-char forms are accepted.
+#[cfg(test)]
 fn is_valid_grid_locator(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    match bytes.len() {
-        4 => grid_field_ok(bytes.get(..2)) && grid_square_ok(bytes.get(2..4)),
-        6 => {
-            grid_field_ok(bytes.get(..2))
-                && grid_square_ok(bytes.get(2..4))
-                && grid_subsquare_ok(bytes.get(4..6))
-        }
-        _ => false,
-    }
-}
-
-/// Field pair check: two letters in `A..R` (case-insensitive).
-fn grid_field_ok(slot: Option<&[u8]>) -> bool {
-    let Some(pair) = slot else {
-        return false;
-    };
-    if pair.len() != 2 {
-        return false;
-    }
-    pair.iter().all(|b| {
-        let up = b.to_ascii_uppercase();
-        (b'A'..=b'R').contains(&up)
-    })
-}
-
-/// Square pair check: two ASCII digits.
-fn grid_square_ok(slot: Option<&[u8]>) -> bool {
-    let Some(pair) = slot else {
-        return false;
-    };
-    if pair.len() != 2 {
-        return false;
-    }
-    pair.iter().all(u8::is_ascii_digit)
-}
-
-/// Sub-square pair check: two letters in `a..x` (case-insensitive).
-///
-/// The spec's own example on p.25 (`IO91SX`) uses uppercase even
-/// though the canonical Maidenhead form is lowercase, so both are
-/// accepted. Letters beyond `x` / `X` (i.e. `y`/`z`) are rejected
-/// since they would index outside the sub-square grid.
-fn grid_subsquare_ok(slot: Option<&[u8]>) -> bool {
-    let Some(pair) = slot else {
-        return false;
-    };
-    if pair.len() != 2 {
-        return false;
-    }
-    pair.iter().all(|b| {
-        let low = b.to_ascii_lowercase();
-        (b'a'..=b'x').contains(&low)
-    })
+    MaidenheadGrid::new(s).is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -317,7 +315,7 @@ mod tests {
         assert_eq!(
             parse_aprs_status(b">ok\xFF"),
             Err(AprsError::InvalidTextByte {
-                field: "APRS status body",
+                field: crate::AprsWireTextField::StatusBody,
                 index: 2,
                 byte: 0xFF,
             }),
@@ -361,9 +359,7 @@ mod tests {
 
     #[test]
     fn parse_status_hms_lookalike_freetext_not_truncated() -> TestResult {
-        // Verified bug: ">120000hrs since reset" must keep its full text;
-        // the old parser mis-read "120000h" as an HMS timestamp and
-        // truncated the text to "rs since reset".
+        // An HMS-like prefix remains part of the complete status text.
         let info = b">120000hrs since reset";
         let status = parse_aprs_status(info)?;
         assert_eq!(status.timestamp, None);
@@ -425,8 +421,14 @@ mod tests {
         // Sub-format 3: spec example from §16 p.81.
         let info = b">IO91SX/G";
         let status = parse_aprs_status(info)?;
-        assert_eq!(status.grid_locator.as_deref(), Some("IO91SX"));
-        assert_eq!(status.symbol, Some(('/', 'G')));
+        assert_eq!(
+            status.grid_locator().map(MaidenheadGrid::as_str),
+            Some("IO91SX")
+        );
+        assert_eq!(
+            status.symbol(),
+            Some(AprsSymbol::new(SymbolTable::Primary, b'G')?)
+        );
         assert_eq!(status.text, "");
         Ok(())
     }
@@ -435,8 +437,14 @@ mod tests {
     fn parse_status_with_grid_locator_and_comment() -> TestResult {
         let info = b">IO91SX/G Net active";
         let status = parse_aprs_status(info)?;
-        assert_eq!(status.grid_locator.as_deref(), Some("IO91SX"));
-        assert_eq!(status.symbol, Some(('/', 'G')));
+        assert_eq!(
+            status.grid_locator().map(MaidenheadGrid::as_str),
+            Some("IO91SX")
+        );
+        assert_eq!(
+            status.symbol(),
+            Some(AprsSymbol::new(SymbolTable::Primary, b'G')?)
+        );
         assert_eq!(status.text, " Net active");
         Ok(())
     }
@@ -445,8 +453,14 @@ mod tests {
     fn parse_status_with_4char_grid() -> TestResult {
         let info = b">IO91/V";
         let status = parse_aprs_status(info)?;
-        assert_eq!(status.grid_locator.as_deref(), Some("IO91"));
-        assert_eq!(status.symbol, Some(('/', 'V')));
+        assert_eq!(
+            status.grid_locator().map(MaidenheadGrid::as_str),
+            Some("IO91")
+        );
+        assert_eq!(
+            status.symbol(),
+            Some(AprsSymbol::new(SymbolTable::Primary, b'V')?)
+        );
         Ok(())
     }
 

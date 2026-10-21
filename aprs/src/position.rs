@@ -1,12 +1,13 @@
 //! APRS position reports (uncompressed and compressed).
+//!
+//! See the [packet construction and parsing example](crate#packet-construction-and-parsing).
 
-use crate::error::AprsError;
+use crate::error::{AprsError, AprsWireTextField};
 use crate::mic_e::{MiceMessage, MiceTelemetry};
-use crate::packet::{
-    AprsDataExtension, AprsReportTimestamp, PositionAmbiguity, parse_aprs_extensions,
-};
+use crate::packet::{AprsDataExtension, AprsReportTimestamp, CourseSpeed, PositionAmbiguity};
 use crate::text::decode_wire_ascii;
-use crate::weather::{AprsWeather, extract_position_weather};
+use crate::units::{AprsSymbol, Course, Latitude, Longitude, Speed, SymbolTable};
+use crate::weather::AprsWeather;
 
 /// A parsed APRS position report.
 ///
@@ -15,54 +16,369 @@ use crate::weather::{AprsWeather, extract_position_weather};
 /// the weather-station symbol code `_`. Data extensions (course/speed,
 /// PHG, altitude, DAO) found in the comment field are parsed
 /// automatically and exposed via [`Self::extensions`].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AprsPosition {
     /// Optional seven-byte timestamp carried by `/` and `@` reports.
     /// Untimestamped `!`/`=` reports and Mic-E positions use `None`.
-    pub timestamp: Option<AprsReportTimestamp>,
+    timestamp: Option<AprsReportTimestamp>,
     /// Latitude in decimal degrees (positive = North).
-    pub latitude: f64,
+    latitude: Latitude,
     /// Longitude in decimal degrees (positive = East).
-    pub longitude: f64,
+    longitude: Longitude,
     /// APRS symbol table identifier character.
-    pub symbol_table: char,
-    /// APRS symbol code character.
-    pub symbol_code: char,
-    /// Speed in knots (from Mic-E or course/speed extension).
-    pub speed_knots: Option<u16>,
-    /// Course in degrees (from Mic-E or course/speed extension).
-    pub course_degrees: Option<u16>,
+    symbol: AprsSymbol,
+    /// Motion reported in the position body, taking priority over comment extensions.
+    motion: PositionMotion,
     /// Optional comment/extension text after the position.
-    pub comment: String,
+    comment: String,
     /// Optional weather data embedded in the position comment.
     ///
     /// Populated when the symbol code is `_` (weather station) and the
     /// comment starts with the `DDD/SSS` wind direction/speed extension,
     /// followed by the remaining weather fields. See APRS 1.0.1 §12.1.
-    pub weather: Option<AprsWeather>,
+    weather: Option<AprsWeather>,
     /// Parsed data extensions (course/speed, PHG, altitude, DAO) found in
     /// the comment field.
     ///
-    /// Populated automatically by [`parse_aprs_position`] via
-    /// [`parse_aprs_extensions`]. Fields that aren't present in the
+    /// Populated automatically by [`Self::from_bytes`] through
+    /// [`AprsDataExtension::from_comment`]. Fields that aren't present in the
     /// comment are `None`.
-    pub extensions: AprsDataExtension,
+    extensions: AprsDataExtension,
     /// Mic-E standard message code (only populated by
-    /// [`crate::mic_e::parse_mice_position`]).
-    pub mice_message: Option<MiceMessage>,
+    /// [`Self::from_mice_bytes`]).
+    mice_message: Option<MiceMessage>,
     /// Mic-E altitude in metres, decoded from the comment per APRS 1.0.1
     /// §10.1.1 (three base-91 chars followed by `}`, offset from -10000).
-    pub mice_altitude_m: Option<i32>,
+    mice_altitude_m: Option<i32>,
     /// Optional Mic-E telemetry decoded from the field that is mutually
     /// exclusive with Mic-E status text.
-    pub mice_telemetry: Option<MiceTelemetry>,
+    mice_telemetry: Option<MiceTelemetry>,
     /// Position ambiguity level (APRS 1.0.1 §8.1.6).
     ///
     /// Stations can deliberately reduce their precision by replacing
     /// trailing lat/lon digits with spaces; this field records how many
-    /// digits were masked. Mic-E and compressed positions do not use
-    /// ambiguity and always report [`PositionAmbiguity::None`].
-    pub ambiguity: PositionAmbiguity,
+    /// digits were masked. Mic-E masks the corresponding longitude digits;
+    /// compressed positions use [`PositionAmbiguity::None`].
+    ambiguity: PositionAmbiguity,
+    compressed: Option<CompressedPositionData>,
+}
+
+/// Independently reported speed and course, with checked units and domains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PositionMotion {
+    speed: Option<Speed>,
+    course: Option<Course>,
+}
+
+impl PositionMotion {
+    /// Combine available motion components; either may be unknown independently.
+    #[must_use]
+    pub const fn new(speed: Option<Speed>, course: Option<Course>) -> Self {
+        Self { speed, course }
+    }
+    /// Return reported speed without format-dependent integer rounding.
+    #[must_use]
+    pub const fn speed(self) -> Option<Speed> {
+        self.speed
+    }
+    /// Return reported course, or None when the encoding marks it unknown.
+    #[must_use]
+    pub const fn course(self) -> Option<Course> {
+        self.course
+    }
+}
+
+/// One compressed radio-range digit, measured as `2 × 1.08^s` statute miles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CompressedRange(u8);
+impl CompressedRange {
+    /// Validate the base-91 numeric digit `0..=90`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsError::InvalidFormat`] for a digit above 90.
+    pub const fn from_code(code: u8) -> Result<Self, AprsError> {
+        if code <= 90 {
+            Ok(Self(code))
+        } else {
+            Err(AprsError::InvalidFormat)
+        }
+    }
+    /// Return the exact received base-91 numeric digit.
+    #[must_use]
+    pub const fn code(self) -> u8 {
+        self.0
+    }
+    /// Return pre-calculated radio range in statute miles.
+    #[must_use]
+    pub fn miles(self) -> f64 {
+        2.0 * 1.08_f64.powi(i32::from(self.0))
+    }
+}
+impl TryFrom<u8> for CompressedRange {
+    type Error = AprsError;
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        Self::from_code(value)
+    }
+}
+impl From<CompressedRange> for u8 {
+    fn from(value: CompressedRange) -> Self {
+        value.0
+    }
+}
+
+/// The checked two-digit exponent of compressed altitude in feet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CompressedAltitude(u16);
+impl CompressedAltitude {
+    /// Validate a combined two-digit exponent, accepting `0..=8280`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsError::InvalidFormat`] above the largest two-digit value.
+    pub const fn from_exponent(exponent: u16) -> Result<Self, AprsError> {
+        if exponent <= 8280 {
+            Ok(Self(exponent))
+        } else {
+            Err(AprsError::InvalidFormat)
+        }
+    }
+    /// Validate and combine two base-91 numeric digits, each `0..=90`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsError::InvalidFormat`] when either digit exceeds 90.
+    pub fn from_codes(high: u8, low: u8) -> Result<Self, AprsError> {
+        if high > 90 || low > 90 {
+            return Err(AprsError::InvalidFormat);
+        }
+        Self::from_exponent(u16::from(high) * 91 + u16::from(low))
+    }
+    /// Return the exact exponent, from zero through 8280.
+    #[must_use]
+    pub const fn exponent(self) -> u16 {
+        self.0
+    }
+    /// Return altitude in feet, preserving fractional precision.
+    #[must_use]
+    pub fn feet(self) -> f64 {
+        1.002_f64.powi(i32::from(self.0))
+    }
+}
+impl TryFrom<[u8; 2]> for CompressedAltitude {
+    type Error = AprsError;
+    fn try_from([high, low]: [u8; 2]) -> Result<Self, Self::Error> {
+        Self::from_codes(high, low)
+    }
+}
+impl TryFrom<u16> for CompressedAltitude {
+    type Error = AprsError;
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        Self::from_exponent(value)
+    }
+}
+impl From<CompressedAltitude> for u16 {
+    fn from(value: CompressedAltitude) -> Self {
+        value.0
+    }
+}
+
+/// Mutually exclusive interpretation of the compressed `csT` tail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompressedPositionData {
+    /// The leading `c` is space; the other two bytes are uninterpreted fillers.
+    None,
+    /// Course/speed for other, GLL or RMC source bits.
+    CourseSpeed(CourseSpeed),
+    /// `c` is `{`, with a pre-calculated radio range.
+    RadioRange(CompressedRange),
+    /// GGA source bits select altitude.
+    Altitude(CompressedAltitude),
+}
+
+impl AprsPosition {
+    /// Construct an exact position from validated coordinates and symbol.
+    #[must_use]
+    pub fn new(latitude: Latitude, longitude: Longitude, symbol: AprsSymbol) -> Self {
+        Self {
+            timestamp: None,
+            latitude,
+            longitude,
+            symbol,
+            motion: PositionMotion::default(),
+            comment: String::new(),
+            weather: None,
+            extensions: AprsDataExtension::default(),
+            mice_message: None,
+            mice_altitude_m: None,
+            mice_telemetry: None,
+            ambiguity: PositionAmbiguity::None,
+            compressed: None,
+        }
+    }
+    /// Parse a complete uncompressed or compressed position information field.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsError`] for an invalid type, timestamp, coordinate, symbol,
+    /// compression digit or ASCII comment. Mic-E uses [`Self::from_mice_bytes`].
+    pub fn from_bytes(info: &[u8]) -> Result<Self, AprsError> {
+        parse_aprs_position(info)
+    }
+    /// Parse the 19-byte uncompressed position body and its optional comment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsError`] for missing bytes, malformed coordinates/symbol or non-ASCII text.
+    pub fn from_uncompressed_body(body: &[u8]) -> Result<Self, AprsError> {
+        parse_uncompressed_body(body)
+    }
+    /// Parse the 13-byte compressed position body and its optional comment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsError`] for missing bytes, out-of-range coordinates, symbol,
+    /// compression digits or non-ASCII text.
+    pub fn from_compressed_body(body: &[u8]) -> Result<Self, AprsError> {
+        parse_compressed_body(body)
+    }
+    /// Return the validated latitude; ambiguous reports retain their lower magnitude bound.
+    #[must_use]
+    pub const fn latitude(&self) -> Latitude {
+        self.latitude
+    }
+    /// Return the validated longitude; ambiguous reports retain their lower magnitude bound.
+    #[must_use]
+    pub const fn longitude(&self) -> Longitude {
+        self.longitude
+    }
+    /// Return the complete validated symbol.
+    #[must_use]
+    pub const fn symbol(&self) -> AprsSymbol {
+        self.symbol
+    }
+    /// Return the report's optional observation timestamp.
+    #[must_use]
+    pub const fn timestamp(&self) -> Option<AprsReportTimestamp> {
+        self.timestamp
+    }
+    /// Return motion encoded in the position body, before comment-extension fallback.
+    #[must_use]
+    pub const fn motion(&self) -> PositionMotion {
+        self.motion
+    }
+    /// Return native motion speed, falling back to the initial comment extension.
+    #[must_use]
+    pub fn speed(&self) -> Option<Speed> {
+        self.motion
+            .speed
+            .or_else(|| self.extensions.course_speed().map(CourseSpeed::speed))
+    }
+    /// Return native motion course, falling back to the initial comment extension.
+    #[must_use]
+    pub fn course(&self) -> Option<Course> {
+        self.motion
+            .course
+            .or_else(|| self.extensions.course_speed().map(CourseSpeed::course))
+    }
+    /// Borrow the exact decoded ASCII comment.
+    #[must_use]
+    pub fn comment(&self) -> &str {
+        &self.comment
+    }
+    /// Borrow weather derived from this symbol and comment.
+    #[must_use]
+    pub const fn weather(&self) -> Option<&AprsWeather> {
+        self.weather.as_ref()
+    }
+    /// Borrow immutable comment extensions, including a rounded compressed altitude when present.
+    #[must_use]
+    pub const fn extensions(&self) -> &AprsDataExtension {
+        &self.extensions
+    }
+    /// Return the number of masked coordinate digits.
+    #[must_use]
+    pub const fn ambiguity(&self) -> PositionAmbiguity {
+        self.ambiguity
+    }
+    /// Return the compressed tail interpretation, retaining range and altitude precision.
+    #[must_use]
+    pub const fn compressed_data(&self) -> Option<CompressedPositionData> {
+        self.compressed
+    }
+    /// Return the Mic-E standard message code when present.
+    #[must_use]
+    pub const fn mice_message(&self) -> Option<MiceMessage> {
+        self.mice_message
+    }
+    /// Return Mic-E altitude in metres when present.
+    #[must_use]
+    pub const fn mice_altitude_m(&self) -> Option<i32> {
+        self.mice_altitude_m
+    }
+    /// Return the mutually exclusive Mic-E telemetry block when present.
+    #[must_use]
+    pub const fn mice_telemetry(&self) -> Option<MiceTelemetry> {
+        self.mice_telemetry
+    }
+    /// Replace native motion and discard a compressed course/speed interpretation.
+    #[must_use]
+    pub(crate) const fn with_motion(mut self, motion: PositionMotion) -> Self {
+        self.motion = motion;
+        if matches!(
+            self.compressed,
+            Some(CompressedPositionData::CourseSpeed(_))
+        ) {
+            self.compressed = None;
+        }
+        self
+    }
+    /// Replace ASCII comment text and recompute all comment-derived views.
+    ///
+    /// Native position-body motion and compressed altitude retain priority.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsError`] for non-ASCII text, malformed embedded weather, or
+    /// nonempty text on a Mic-E report carrying mutually exclusive telemetry.
+    /// Validation completes before the replacement's correlated fields change.
+    pub(crate) fn with_comment(mut self, comment: &str) -> Result<Self, AprsError> {
+        if self.mice_telemetry.is_some() && !comment.is_empty() {
+            return Err(AprsError::InvalidFormat);
+        }
+        let comment = decode_wire_ascii(
+            AprsWireTextField::UncompressedPositionComment,
+            comment.as_bytes(),
+        )?;
+        let weather = AprsWeather::from_position_comment(char::from(self.symbol.code()), comment)?;
+        let mut extensions = AprsDataExtension::from_comment(comment);
+        if let Some(CompressedPositionData::Altitude(altitude)) = self.compressed {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "the checked exponent is at most 8280; rounded 1.002^8280 feet fits i32"
+            )]
+            {
+                extensions = extensions.with_altitude(altitude.feet().round() as i32);
+            }
+        }
+        comment.clone_into(&mut self.comment);
+        self.weather = weather;
+        self.extensions = extensions;
+        Ok(self)
+    }
+    pub(crate) const fn with_mice(
+        mut self,
+        message: Option<MiceMessage>,
+        altitude: Option<i32>,
+        telemetry: Option<MiceTelemetry>,
+        ambiguity: PositionAmbiguity,
+    ) -> Self {
+        self.mice_message = message;
+        self.mice_altitude_m = altitude;
+        self.mice_telemetry = telemetry;
+        self.ambiguity = ambiguity;
+        self
+    }
 }
 
 /// Parse APRS latitude from the standard `DDMM.HH[N/S]` format.
@@ -193,6 +509,9 @@ fn unmask_coord_digits(
         if b == b' ' && !masked.contains(&i) {
             return Err(AprsError::InvalidCoordinates);
         }
+        if i != dot_idx && b != b' ' && !b.is_ascii_digit() {
+            return Err(AprsError::InvalidCoordinates);
+        }
     }
     let ambiguity = match count {
         0 => PositionAmbiguity::None,
@@ -211,13 +530,13 @@ fn unmask_coord_digits(
 /// - **Compressed**: `!`/`=`/`/`/`@` with base-91 encoded lat/lon (13 bytes)
 ///
 /// For **Mic-E** positions (`` ` ``/`'`), use
-/// [`crate::mic_e::parse_mice_position`] which also requires the AX.25
+/// [`AprsPosition::from_mice_bytes`] which also requires the AX.25
 /// destination address.
 ///
 /// # Errors
 ///
 /// Returns [`AprsError`] if the format is unrecognized or coordinates are invalid.
-pub fn parse_aprs_position(info: &[u8]) -> Result<AprsPosition, AprsError> {
+fn parse_aprs_position(info: &[u8]) -> Result<AprsPosition, AprsError> {
     let data_type = *info.first().ok_or(AprsError::InvalidFormat)?;
     let (body, timestamp) = match data_type {
         // Position without timestamp: ! or =
@@ -226,7 +545,8 @@ pub fn parse_aprs_position(info: &[u8]) -> Result<AprsPosition, AprsError> {
         // Timestamp is exactly 7 characters after the type byte.
         b'/' | b'@' => {
             let timestamp_bytes = info.get(1..8).ok_or(AprsError::InvalidFormat)?;
-            let timestamp_wire = decode_wire_ascii("APRS position timestamp", timestamp_bytes)?;
+            let timestamp_wire =
+                decode_wire_ascii(AprsWireTextField::PositionTimestamp, timestamp_bytes)?;
             let timestamp = AprsReportTimestamp::from_wire(timestamp_wire)?;
             (
                 info.get(8..).ok_or(AprsError::InvalidFormat)?,
@@ -257,51 +577,45 @@ pub fn parse_aprs_position(info: &[u8]) -> Result<AprsPosition, AprsError> {
 /// Returns [`AprsError::InvalidFormat`] if the body is shorter than 19
 /// bytes or [`AprsError::InvalidCoordinates`] if the latitude or
 /// longitude fields are malformed.
-pub fn parse_uncompressed_body(body: &[u8]) -> Result<AprsPosition, AprsError> {
+fn parse_uncompressed_body(body: &[u8]) -> Result<AprsPosition, AprsError> {
     let lat_slice = body.get(..8).ok_or(AprsError::InvalidFormat)?;
     let (latitude, lat_ambig) = parse_aprs_latitude(lat_slice)?;
     let symbol_table = *body.get(8).ok_or(AprsError::InvalidFormat)? as char;
     let lon_slice = body.get(9..18).ok_or(AprsError::InvalidFormat)?;
     let (longitude, lon_ambig) = parse_aprs_longitude(lon_slice)?;
     let symbol_code = *body.get(18).ok_or(AprsError::InvalidFormat)? as char;
-    // A position's ambiguity is the maximum of the two component
-    // ambiguities: whichever field was masked more aggressively wins.
-    let ambiguity = std::cmp::max_by_key(lat_ambig, lon_ambig, |a| match a {
-        PositionAmbiguity::None => 0,
-        PositionAmbiguity::OneDigit => 1,
-        PositionAmbiguity::TwoDigits => 2,
-        PositionAmbiguity::ThreeDigits => 3,
-        PositionAmbiguity::FourDigits => 4,
-    });
+    let symbol = AprsSymbol::from_chars(symbol_table, symbol_code)?;
+    if lon_ambig != PositionAmbiguity::None && lon_ambig != lat_ambig {
+        return Err(AprsError::InvalidCoordinates);
+    }
+    // Latitude declares both coordinates' ambiguity (APRS101 chapter6,p24).
+    let mut longitude_wire: [u8; 9] = lon_slice
+        .try_into()
+        .map_err(|_| AprsError::InvalidCoordinates)?;
+    for index in [7, 6, 4, 3]
+        .into_iter()
+        .take(usize::from(lat_ambig.masked_digits()))
+    {
+        *longitude_wire
+            .get_mut(index)
+            .ok_or(AprsError::InvalidCoordinates)? = b'0';
+    }
+    let (longitude, _) = if lat_ambig == PositionAmbiguity::None {
+        (longitude, lon_ambig)
+    } else {
+        parse_aprs_longitude(&longitude_wire)?
+    };
 
     let comment_bytes = body.get(19..).ok_or(AprsError::InvalidFormat)?;
-    let comment =
-        decode_wire_ascii("APRS uncompressed-position comment", comment_bytes)?.to_owned();
-
-    let weather = extract_position_weather(symbol_code, &comment)?;
-    let extensions = parse_aprs_extensions(&comment);
-    // If the comment had a CSE/SPD extension, surface it on speed/course
-    // too so callers that only read those fields see the data.
-    let (speed_knots, course_degrees) = match extensions.course_speed {
-        Some((course, speed)) => (Some(speed), Some(course)),
-        None => (None, None),
-    };
-    Ok(AprsPosition {
-        timestamp: None,
-        latitude,
-        longitude,
-        symbol_table,
-        symbol_code,
-        speed_knots,
-        course_degrees,
-        comment,
-        weather,
-        extensions,
-        mice_message: None,
-        mice_altitude_m: None,
-        mice_telemetry: None,
-        ambiguity,
-    })
+    let comment = decode_wire_ascii(
+        AprsWireTextField::UncompressedPositionComment,
+        comment_bytes,
+    )?;
+    let mut position =
+        AprsPosition::new(Latitude::new(latitude)?, Longitude::new(longitude)?, symbol)
+            .with_comment(comment)?;
+    position.ambiguity = lat_ambig;
+    Ok(position)
 }
 
 /// Parse compressed APRS position body (APRS101.PDF Chapter 9).
@@ -318,122 +632,76 @@ pub fn parse_uncompressed_body(body: &[u8]) -> Result<AprsPosition, AprsError> {
 /// Returns [`AprsError::InvalidFormat`] if the body is shorter than 13
 /// bytes or [`AprsError::InvalidCoordinates`] if the base-91 lat/lon
 /// fields contain bytes outside the `33..=123` range.
-pub fn parse_compressed_body(body: &[u8]) -> Result<AprsPosition, AprsError> {
+fn parse_compressed_body(body: &[u8]) -> Result<AprsPosition, AprsError> {
     // Require the full 13-byte compressed body upfront.
     let header = body.get(..13).ok_or(AprsError::InvalidFormat)?;
-    let symbol_table = *header.first().ok_or(AprsError::InvalidFormat)? as char;
+    let table =
+        SymbolTable::from_compressed_byte(*header.first().ok_or(AprsError::InvalidFormat)?)?;
     let lat_bytes = header.get(1..5).ok_or(AprsError::InvalidFormat)?;
     let lon_bytes = header.get(5..9).ok_or(AprsError::InvalidFormat)?;
     let lat_val = decode_base91_4(lat_bytes)?;
     let lon_val = decode_base91_4(lon_bytes)?;
-    let symbol_code = *header.get(9).ok_or(AprsError::InvalidFormat)? as char;
+    let symbol = AprsSymbol::new(table, *header.get(9).ok_or(AprsError::InvalidFormat)?)?;
 
-    let latitude = 90.0 - f64::from(lat_val) / 380_926.0;
-    let longitude = -180.0 + f64::from(lon_val) / 190_463.0;
+    let latitude = Latitude::new(90.0 - f64::from(lat_val) / 380_926.0)?;
+    let longitude = Longitude::new(-180.0 + f64::from(lon_val) / 190_463.0)?;
 
     // Decode the 3-byte cs/s/t tail per APRS 1.0.1 §9.
     let cs_byte = *header.get(10).ok_or(AprsError::InvalidFormat)?;
     let s_byte = *header.get(11).ok_or(AprsError::InvalidFormat)?;
     let t_byte = *header.get(12).ok_or(AprsError::InvalidFormat)?;
-    let (compressed_altitude_ft, compressed_course_speed) =
-        decode_compressed_tail(cs_byte, s_byte, t_byte);
+    let compressed = decode_compressed_tail(cs_byte, s_byte, t_byte)?;
 
     let comment_bytes = body.get(13..).ok_or(AprsError::InvalidFormat)?;
-    let comment = decode_wire_ascii("APRS compressed-position comment", comment_bytes)?.to_owned();
-
-    let weather = extract_position_weather(symbol_code, &comment)?;
-    let extensions = parse_aprs_extensions(&comment);
-    // Surface course/speed into the direct fields too.
-    let (speed_knots, course_degrees) =
-        compressed_course_speed.map_or((None, None), |(course, speed)| (Some(speed), Some(course)));
-    let final_extensions = if let Some(alt) = compressed_altitude_ft {
-        AprsDataExtension {
-            altitude_ft: Some(alt),
-            ..extensions
-        }
-    } else {
-        extensions
-    };
-    Ok(AprsPosition {
-        timestamp: None,
-        latitude,
-        longitude,
-        symbol_table,
-        symbol_code,
-        speed_knots,
-        course_degrees,
-        comment,
-        weather,
-        extensions: final_extensions,
-        mice_message: None,
-        mice_altitude_m: None,
-        mice_telemetry: None,
-        // Compressed positions do not use APRS §8.1.6 ambiguity.
-        ambiguity: PositionAmbiguity::None,
-    })
+    let comment = decode_wire_ascii(AprsWireTextField::CompressedPositionComment, comment_bytes)?;
+    let mut position = AprsPosition::new(latitude, longitude, symbol);
+    position.compressed = Some(compressed);
+    if let CompressedPositionData::CourseSpeed(motion) = compressed {
+        position.motion = PositionMotion::new(Some(motion.speed()), Some(motion.course()));
+    }
+    position.with_comment(comment)
 }
 
 /// Decode the 3-byte `cs`/`s`/`t` compression tail of a compressed APRS
 /// position report per APRS 1.0.1 §9 Table 10.
 ///
-/// Returns `(altitude_ft, course_speed)` where either may be `None`.
-fn decode_compressed_tail(cs: u8, s: u8, t: u8) -> (Option<i32>, Option<(u16, u16)>) {
+/// Course/speed, radio range and altitude are mutually exclusive.
+fn decode_compressed_tail(cs: u8, s: u8, t: u8) -> Result<CompressedPositionData, AprsError> {
     // Space in the `cs` column means "no data."
     if cs == b' ' {
-        return (None, None);
+        return Ok(CompressedPositionData::None);
+    }
+    if !(b'!'..=b'{').contains(&cs) || !(b'!'..=b'{').contains(&s) || !(b'!'..=b'`').contains(&t) {
+        return Err(AprsError::InvalidFormat);
     }
     // The `t` byte minus 33 gives a 6-bit compression type value. Bits
     // 3-4 (0x18) select the semantic meaning of `cs`/`s`.
-    let t_val = t.saturating_sub(33);
+    let t_val = t - 33;
     let type_bits = (t_val >> 3) & 0x03;
     match type_bits {
-        // 0b00 / 0b01: course (c) + speed (s). Course is (cs - 33) * 4
+        // Other, GLL and RMC sources carry course/speed or the c='{' range form.
         // degrees. Speed is 1.08^(s - 33) - 1 knots.
-        0 | 1 => {
-            let c = cs.saturating_sub(33);
-            let s_val = s.saturating_sub(33);
-            #[expect(
-                clippy::cast_possible_truncation,
-                clippy::cast_sign_loss,
-                reason = "APRS 1.0.1 §8.4 compressed speed is `1.08^s - 1` knots where `s` is \
-                          in [0, 89] (single printable-ASCII byte minus 33). Max value is \
-                          `1.08^89 - 1 ≈ 934` knots, trivially fits in u16. \
-                          `cast_possible_truncation` fires on `.round() as u16` because \
-                          clippy can't prove the f64 is bounded; `cast_sign_loss` fires \
-                          because `1.08^x - 1` is non-negative for x >= 0 but the type \
-                          system can't see that."
-            )]
-            let speed_knots = (1.08_f64.powi(i32::from(s_val)) - 1.0).round() as u16;
-            let course_deg = u16::from(c) * 4;
-            // Course 0 == "no data" per spec convention.
-            if course_deg == 0 && speed_knots == 0 {
-                (None, None)
-            } else {
-                (None, Some((course_deg, speed_knots)))
+        0 | 1 | 3 => {
+            if cs == b'{' {
+                return Ok(CompressedPositionData::RadioRange(
+                    CompressedRange::from_code(s - b'!')?,
+                ));
             }
+            let c = cs - 33;
+            let s_val = s - 33;
+            let speed = Speed::from_knots(1.08_f64.powi(i32::from(s_val)) - 1.0)?;
+            let course_deg = u16::from(c) * 4;
+            Ok(CompressedPositionData::CourseSpeed(CourseSpeed::new(
+                Course::new(course_deg)?,
+                speed,
+            )))
         }
         // 0b10: altitude. cs,s = base-91 two-char altitude, value =
         // 1.002^((cs-33)*91 + (s-33)) feet.
-        2 => {
-            let c = i32::from(cs.saturating_sub(33));
-            let s_val = i32::from(s.saturating_sub(33));
-            let exponent = c * 91 + s_val;
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "APRS 1.0.1 §8.5 compressed altitude is `1.002^(c*91 + s)` feet \
-                          where c,s are in [0, 90] (single printable-ASCII byte minus 33), \
-                          so `exponent` is in [0, 8281]. Max altitude ≈ `1.002^8281 ≈ 1.56e7` \
-                          feet, comfortably within i32 range. `cast_possible_truncation` \
-                          fires on `.round() as i32` because clippy can't prove the f64 is \
-                          bounded; f64→i32 is signed-to-signed so `cast_sign_loss` doesn't \
-                          apply and `cast_precision_loss` is for integer→float narrowing \
-                          (neither fires here)."
-            )]
-            let alt_ft = 1.002_f64.powi(exponent).round() as i32;
-            (Some(alt_ft), None)
-        }
-        // 0b11 (range): not currently surfaced.
-        _ => (None, None),
+        2 => Ok(CompressedPositionData::Altitude(
+            CompressedAltitude::from_codes(cs - b'!', s - b'!')?,
+        )),
+        _ => unreachable!("two-bit source has four alternatives"),
     }
 }
 
@@ -449,7 +717,7 @@ fn decode_compressed_tail(cs: u8, s: u8, t: u8) -> (Option<i32>, Option<(u16, u1
 /// 4 bytes or any byte is outside the `33..=123` base-91 range. ASCII
 /// `'|'` (124) and above are not valid base-91 digits (they would encode
 /// digit 91, one past the legal maximum) and are rejected.
-pub fn decode_base91_4(bytes: &[u8]) -> Result<u32, AprsError> {
+fn decode_base91_4(bytes: &[u8]) -> Result<u32, AprsError> {
     let window = bytes.get(..4).ok_or(AprsError::InvalidCoordinates)?;
     let mut val: u32 = 0;
     for &b in window {
@@ -479,22 +747,22 @@ mod tests {
     fn parse_aprs_position_no_timestamp() -> TestResult {
         let info = b"!4903.50N/07201.75W-Test comment";
         let pos = parse_aprs_position(info)?;
-        assert_eq!(pos.timestamp, None);
+        assert_eq!(pos.timestamp(), None);
         // 49 degrees 3.50 minutes N = 49.058333...
         assert!(
-            (pos.latitude - 49.058_333).abs() < 0.001,
+            (pos.latitude().as_degrees() - 49.058_333).abs() < 0.001,
             "lat={}",
-            pos.latitude
+            pos.latitude().as_degrees()
         );
         // 72 degrees 1.75 minutes W = -72.029166...
         assert!(
-            (pos.longitude - (-72.029_166)).abs() < 0.001,
+            (pos.longitude().as_degrees() - (-72.029_166)).abs() < 0.001,
             "lon={}",
-            pos.longitude
+            pos.longitude().as_degrees()
         );
-        assert_eq!(pos.symbol_table, '/');
-        assert_eq!(pos.symbol_code, '-');
-        assert_eq!(pos.comment, "Test comment");
+        assert_eq!(pos.symbol().table_char(), '/');
+        assert_eq!(pos.symbol().code_char(), '-');
+        assert_eq!(pos.comment(), "Test comment");
         Ok(())
     }
 
@@ -508,7 +776,7 @@ mod tests {
         assert_eq!(
             parse_aprs_position(&info),
             Err(AprsError::InvalidTextByte {
-                field: "APRS uncompressed-position comment",
+                field: AprsWireTextField::UncompressedPositionComment,
                 index: 6,
                 byte: 0xFF,
             }),
@@ -522,11 +790,17 @@ mod tests {
         let info = b"@092345z4903.50N/07201.75W-";
         let pos = parse_aprs_position(info)?;
         assert_eq!(
-            pos.timestamp,
+            pos.timestamp(),
             Some(AprsReportTimestamp::day_hour_minute_utc(9, 23, 45)?),
         );
-        assert!((pos.latitude - 49.058_333).abs() < 0.001, "lat check");
-        assert!((pos.longitude - (-72.029_166)).abs() < 0.001, "lon check");
+        assert!(
+            (pos.latitude().as_degrees() - 49.058_333).abs() < 0.001,
+            "lat check"
+        );
+        assert!(
+            (pos.longitude().as_degrees() - (-72.029_166)).abs() < 0.001,
+            "lon check"
+        );
         Ok(())
     }
 
@@ -535,7 +809,7 @@ mod tests {
         let pos = parse_aprs_position(b"/110000/4903.50N/07201.75W-")?;
 
         assert_eq!(
-            pos.timestamp,
+            pos.timestamp(),
             Some(AprsReportTimestamp::day_hour_minute_local(11, 0, 0)?),
         );
         Ok(())
@@ -546,14 +820,14 @@ mod tests {
         let info = b"!3356.65S/15113.72E>";
         let pos = parse_aprs_position(info)?;
         assert!(
-            pos.latitude < 0.0,
+            pos.latitude().as_degrees() < 0.0,
             "expected South, got lat={}",
-            pos.latitude
+            pos.latitude().as_degrees()
         );
         assert!(
-            pos.longitude > 0.0,
+            pos.longitude().as_degrees() > 0.0,
             "expected East, got lon={}",
-            pos.longitude
+            pos.longitude().as_degrees()
         );
         Ok(())
     }
@@ -562,8 +836,11 @@ mod tests {
     fn parse_aprs_position_messaging_enabled() -> TestResult {
         let info = b"=4903.50N/07201.75W-";
         let pos = parse_aprs_position(info)?;
-        assert_eq!(pos.timestamp, None);
-        assert!((pos.latitude - 49.058_333).abs() < 0.001, "lat check");
+        assert_eq!(pos.timestamp(), None);
+        assert!(
+            (pos.latitude().as_degrees() - 49.058_333).abs() < 0.001,
+            "lat check"
+        );
         Ok(())
     }
 
@@ -595,11 +872,15 @@ mod tests {
 
         assert_eq!(
             parse_aprs_position(uncompressed),
-            Err(AprsError::InvalidTimestamp("day must be 1-31")),
+            Err(AprsError::InvalidTimestamp(
+                crate::packet::TimestampError::Day
+            )),
         );
         assert_eq!(
             parse_aprs_position(compressed),
-            Err(AprsError::InvalidTimestamp("hour must be 0-23")),
+            Err(AprsError::InvalidTimestamp(
+                crate::packet::TimestampError::Hour
+            )),
         );
     }
 
@@ -617,7 +898,7 @@ mod tests {
         assert_eq!(
             parse_aprs_position(&uncompressed),
             Err(AprsError::InvalidTextByte {
-                field: "APRS position timestamp",
+                field: AprsWireTextField::PositionTimestamp,
                 index: 2,
                 byte: 0xFF,
             }),
@@ -625,7 +906,7 @@ mod tests {
         assert_eq!(
             parse_aprs_position(&compressed),
             Err(AprsError::InvalidTextByte {
-                field: "APRS position timestamp",
+                field: AprsWireTextField::PositionTimestamp,
                 index: 5,
                 byte: 0x80,
             }),
@@ -635,8 +916,7 @@ mod tests {
 
     #[test]
     fn parse_position_rejects_out_of_range_latitude() {
-        // Degrees 91 with minutes 60 is an impossible latitude; pre-fix
-        // this parsed to 92°.
+        // Degrees 91 with minutes 60 is an impossible latitude.
         let r = parse_aprs_position(b"!9160.00N/07201.75W-");
         assert!(
             matches!(r, Err(AprsError::InvalidCoordinates)),
@@ -683,14 +963,14 @@ mod tests {
         // Exactly 90°00.00' / 180°00.00': the boundary itself is valid.
         let pos = parse_aprs_position(b"!9000.00N/18000.00E-")?;
         assert!(
-            (pos.latitude - 90.0).abs() < f64::EPSILON,
+            (pos.latitude().as_degrees() - 90.0).abs() < f64::EPSILON,
             "lat={}",
-            pos.latitude
+            pos.latitude().as_degrees()
         );
         assert!(
-            (pos.longitude - 180.0).abs() < f64::EPSILON,
+            (pos.longitude().as_degrees() - 180.0).abs() < f64::EPSILON,
             "lon={}",
-            pos.longitude
+            pos.longitude().as_degrees()
         );
         Ok(())
     }
@@ -734,15 +1014,19 @@ mod tests {
         info.extend_from_slice(body);
 
         let pos = parse_aprs_position(&info)?;
-        assert_eq!(pos.timestamp, None);
-        assert!((pos.latitude - 80.828).abs() < 0.01, "lat={}", pos.latitude);
+        assert_eq!(pos.timestamp(), None);
         assert!(
-            (pos.longitude - (-156.018)).abs() < 0.01,
-            "lon={}",
-            pos.longitude
+            (pos.latitude().as_degrees() - 80.828).abs() < 0.01,
+            "lat={}",
+            pos.latitude().as_degrees()
         );
-        assert_eq!(pos.symbol_table, '/');
-        assert_eq!(pos.symbol_code, '>');
+        assert!(
+            (pos.longitude().as_degrees() - (-156.018)).abs() < 0.01,
+            "lon={}",
+            pos.longitude().as_degrees()
+        );
+        assert_eq!(pos.symbol().table_char(), '/');
+        assert_eq!(pos.symbol().code_char(), '>');
         Ok(())
     }
 
@@ -756,7 +1040,7 @@ mod tests {
         assert_eq!(
             parse_aprs_position(&info),
             Err(AprsError::InvalidTextByte {
-                field: "APRS compressed-position comment",
+                field: AprsWireTextField::CompressedPositionComment,
                 index: 6,
                 byte: 0xFF,
             }),
@@ -772,10 +1056,13 @@ mod tests {
         info.extend_from_slice(b"/%Ztl'&XW> sT"); // compressed body
         let pos = parse_aprs_position(&info)?;
         assert_eq!(
-            pos.timestamp,
+            pos.timestamp(),
             Some(AprsReportTimestamp::day_hour_minute_utc(9, 23, 45)?),
         );
-        assert!((pos.latitude - 80.828).abs() < 0.01, "lat check");
+        assert!(
+            (pos.latitude().as_degrees() - 80.828).abs() < 0.01,
+            "lat check"
+        );
         Ok(())
     }
 
@@ -788,6 +1075,83 @@ mod tests {
     #[test]
     fn base91_decode_zero() -> TestResult {
         assert_eq!(decode_base91_4(b"!!!!")?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn compressed_reference_vectors_preserve_rmc_altitude_range_and_no_data() -> TestResult {
+        let rmc = parse_aprs_position(b"=/5L!!<*e7>7P[")?;
+        assert_eq!(rmc.course().map(Course::as_degrees), Some(88));
+        assert!(
+            (rmc.speed().ok_or("RMC speed")?.as_knots() - (1.08_f64.powi(47) - 1.0)).abs() < 1e-12
+        );
+        let range = parse_aprs_position(b"=/5L!!<*e7>{?!")?;
+        assert!(range.course().is_none());
+        assert!(range.speed().is_none());
+        let Some(CompressedPositionData::RadioRange(range)) = range.compressed_data() else {
+            return Err("radio range missing".into());
+        };
+        assert_eq!(range.code(), 30);
+        assert!(2.0_f64.mul_add(-1.08_f64.powi(30), range.miles()).abs() < 1e-12);
+        let altitude = parse_aprs_position(b"=/5L!!<*e7OS]S")?;
+        assert_eq!(altitude.extensions().altitude_feet(), Some(10_005));
+        assert!(altitude.course().is_none());
+        let no_data = parse_aprs_position(b"=/5L!!<*e7> sT")?;
+        assert!(no_data.course().is_none());
+        assert!(no_data.speed().is_none());
+        assert_eq!(
+            no_data.compressed_data(),
+            Some(CompressedPositionData::None)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compressed_geography_and_tail_domains_are_checked() -> TestResult {
+        let boundary = AprsPosition::from_bytes(b"=/{{!!{{!!>   ")?;
+        assert!((boundary.latitude().as_degrees() + 90.0).abs() < f64::EPSILON);
+        assert!((boundary.longitude().as_degrees() - 180.0).abs() < f64::EPSILON);
+        assert!(AprsPosition::from_bytes(b"=/{{!\"{{!!>   ").is_err());
+        assert!(AprsPosition::from_bytes(b"=/{{!!{{!\">   ").is_err());
+        assert!(parse_aprs_position(b"=/{{{{<*e7>7P[").is_err());
+        assert!(parse_aprs_position(b"=/5L!!{{{{>7P[").is_err());
+        for tail in [b"~P[", b"7 [", b"7P~", b"7Pa"] {
+            let mut packet = b"=/5L!!<*e7>".to_vec();
+            packet.extend_from_slice(tail);
+            assert!(
+                parse_aprs_position(&packet).is_err(),
+                "accepted invalid tail {tail:?}"
+            );
+        }
+        let north_stationary = parse_aprs_position(b"=/5L!!<*e7>!!!")?;
+        assert_eq!(north_stationary.course().map(Course::as_degrees), Some(0));
+        assert_eq!(north_stationary.speed().map(Speed::as_knots), Some(0.0));
+        Ok(())
+    }
+
+    #[test]
+    fn all_overlay_selectors_are_validated_and_compressed_digits_are_normalized() -> TestResult {
+        for byte in u8::MIN..=u8::MAX {
+            let accepted = byte.is_ascii_digit() || byte.is_ascii_uppercase();
+            assert_eq!(
+                crate::SymbolOverlay::new(byte).is_ok(),
+                accepted,
+                "overlay byte {byte}"
+            );
+            if accepted {
+                let table = SymbolTable::from_byte(byte)?;
+                assert_eq!(
+                    SymbolTable::from_compressed_byte(table.compressed_byte())?,
+                    table
+                );
+                let mut packet = b"=/5L!!<*e7>   ".to_vec();
+                *packet.get_mut(1).ok_or("table selector")? = table.compressed_byte();
+                assert_eq!(
+                    parse_aprs_position(&packet)?.symbol().table_char(),
+                    char::from(byte)
+                );
+            }
+        }
         Ok(())
     }
 
@@ -829,8 +1193,15 @@ mod tests {
     fn parse_position_with_one_digit_ambiguity() -> TestResult {
         let info = b"!4903.5 N/07201.75W-";
         let pos = parse_aprs_position(info)?;
-        assert_eq!(pos.ambiguity, PositionAmbiguity::OneDigit);
-        assert!((pos.latitude - 49.0583).abs() < 0.001, "lat check");
+        assert_eq!(pos.ambiguity(), PositionAmbiguity::OneDigit);
+        assert!(
+            (pos.latitude().as_degrees() - 49.0583).abs() < 0.001,
+            "lat check"
+        );
+        assert!(
+            (pos.longitude().as_degrees() + 72.0 + 1.70 / 60.0).abs() < 1e-12,
+            "latitude ambiguity also masks longitude"
+        );
         Ok(())
     }
 
@@ -838,7 +1209,8 @@ mod tests {
     fn parse_position_with_two_digit_ambiguity() -> TestResult {
         let info = b"!4903.  N/07201.75W-";
         let pos = parse_aprs_position(info)?;
-        assert_eq!(pos.ambiguity, PositionAmbiguity::TwoDigits);
+        assert_eq!(pos.ambiguity(), PositionAmbiguity::TwoDigits);
+        assert!((pos.longitude().as_degrees() + 72.0 + 1.0 / 60.0).abs() < 1e-12);
         Ok(())
     }
 
@@ -846,7 +1218,8 @@ mod tests {
     fn parse_position_with_four_digit_ambiguity() -> TestResult {
         let info = b"!49  .  N/072  .  W-";
         let pos = parse_aprs_position(info)?;
-        assert_eq!(pos.ambiguity, PositionAmbiguity::FourDigits);
+        assert_eq!(pos.ambiguity(), PositionAmbiguity::FourDigits);
+        assert!((pos.longitude().as_degrees() + 72.0).abs() < f64::EPSILON);
         Ok(())
     }
 
@@ -854,7 +1227,7 @@ mod tests {
     fn parse_position_full_precision_has_no_ambiguity() -> TestResult {
         let info = b"!4903.50N/07201.75W-";
         let pos = parse_aprs_position(info)?;
-        assert_eq!(pos.ambiguity, PositionAmbiguity::None);
+        assert_eq!(pos.ambiguity(), PositionAmbiguity::None);
         Ok(())
     }
 
@@ -862,10 +1235,15 @@ mod tests {
     fn parse_position_populates_extensions_from_comment() -> TestResult {
         let info = b"!3515.00N/09745.00W>088/036/A=001234hello";
         let pos = parse_aprs_position(info)?;
-        assert_eq!(pos.extensions.course_speed, Some((88, 36)));
-        assert_eq!(pos.extensions.altitude_ft, Some(1234));
-        assert_eq!(pos.speed_knots, Some(36));
-        assert_eq!(pos.course_degrees, Some(88));
+        let motion = pos
+            .extensions()
+            .course_speed()
+            .ok_or("course/speed extension")?;
+        assert_eq!(motion.course().as_degrees(), 88);
+        assert!((motion.speed().as_knots() - 36.0).abs() < f64::EPSILON);
+        assert_eq!(pos.extensions().altitude_feet(), Some(1234));
+        assert_eq!(pos.speed().map(Speed::as_knots), Some(36.0));
+        assert_eq!(pos.course().map(Course::as_degrees), Some(88));
         Ok(())
     }
 
@@ -873,8 +1251,8 @@ mod tests {
     fn parse_position_embedded_weather() -> TestResult {
         let info = b"!3515.00N/09745.00W_090/010g015t072r001P020h55b10135";
         let pos = parse_aprs_position(info)?;
-        assert_eq!(pos.symbol_code, '_');
-        let wx = pos.weather.ok_or("embedded weather missing")?;
+        assert_eq!(pos.symbol().code_char(), '_');
+        let wx = pos.weather().ok_or("embedded weather missing")?;
         assert_eq!(wx.wind_direction().map(WindDirection::degrees), Some(90));
         assert_eq!(wx.wind_speed().map(ThreeDigitWeatherValue::value), Some(10),);
         assert_eq!(wx.wind_gust().map(ThreeDigitWeatherValue::value), Some(15),);
@@ -896,7 +1274,7 @@ mod tests {
     fn parse_position_without_weather_symbol_has_no_weather() -> TestResult {
         let info = b"!3515.00N/09745.00W>mobile comment";
         let pos = parse_aprs_position(info)?;
-        assert!(pos.weather.is_none(), "no weather expected");
+        assert!(pos.weather().is_none(), "no weather expected");
         Ok(())
     }
 
@@ -904,7 +1282,63 @@ mod tests {
     fn parse_position_weather_symbol_bad_format_has_no_weather() -> TestResult {
         let info = b"!3515.00N/09745.00W_hello";
         let pos = parse_aprs_position(info)?;
-        assert!(pos.weather.is_none(), "bad format → no weather");
+        assert!(pos.weather().is_none(), "bad format → no weather");
+        Ok(())
+    }
+
+    #[test]
+    fn immutable_position_updates_keep_derived_views_consistent() -> TestResult {
+        let position = AprsPosition::from_bytes(b"=/5L!!<*e7>7P[")?;
+        let changed =
+            position.with_motion(PositionMotion::new(Some(Speed::from_knots(1.5)?), None));
+        assert_eq!(changed.compressed_data(), None);
+        assert_eq!(changed.speed().map(Speed::as_knots), Some(1.5));
+        let weather = AprsPosition::new(
+            Latitude::new(0.0)?,
+            Longitude::new(0.0)?,
+            AprsSymbol::from_chars('/', '_')?,
+        )
+        .with_comment("090/010g015t072")?;
+        assert!(weather.weather().is_some());
+        let weather = weather.with_comment("plain text")?;
+        assert!(weather.weather().is_none());
+        assert!(weather.extensions().course_speed().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn coordinate_syntax_and_ambiguity_are_consistent() -> TestResult {
+        for body in [
+            b"+903.50N/07201.75W-".as_slice(),
+            b"4903.50N/+7201.75W-",
+            b"490 .50N/07201.75W-",
+            b"4903.5 N/07201.  W-",
+        ] {
+            assert!(
+                AprsPosition::from_uncompressed_body(body).is_err(),
+                "accepted {body:?}"
+            );
+        }
+        let position = AprsPosition::from_bytes(b"!490 .  N/07201.75W-")?;
+        assert_eq!(position.ambiguity(), PositionAmbiguity::ThreeDigits);
+        assert!((position.longitude().as_degrees() + 72.0).abs() < f64::EPSILON);
+        Ok(())
+    }
+
+    #[test]
+    fn compressed_domains_include_their_full_wire_ranges() -> TestResult {
+        assert_eq!(CompressedRange::from_code(90)?.code(), 90);
+        assert!(CompressedRange::from_code(91).is_err());
+        let altitude = CompressedAltitude::from_codes(90, 90)?;
+        assert_eq!(altitude.exponent(), 8280);
+        assert!(CompressedAltitude::from_exponent(8281).is_err());
+        assert!(altitude.feet().is_finite());
+        assert!(CompressedAltitude::from_codes(91, 0).is_err());
+        assert!(CompressedAltitude::from_codes(0, 91).is_err());
+        assert_eq!(
+            decode_compressed_tail(b' ', 0, 255)?,
+            CompressedPositionData::None
+        );
         Ok(())
     }
 }

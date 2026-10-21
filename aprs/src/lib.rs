@@ -1,31 +1,4 @@
-//! APRS (Automatic Packet Reporting System) protocol stack.
-//!
-//! This crate provides a std-only, sans-io implementation of the APRS
-//! protocol over AX.25, including the core stateful algorithms used by
-//! real APRS clients: digipeater path handling, `SmartBeaconing`, messaging
-//! ack/rej tracking, and heard-station lists.
-//!
-//! # Scope
-//!
-//! - APRS 1.0.1 / 1.2 info-field parsing: position (compressed and
-//!   uncompressed), Mic-E, messages, status, weather, telemetry,
-//!   items, objects, queries.
-//! - Builders for constructing outgoing info fields.
-//! - Stateful algorithms: [`DigipeaterConfig`] (with 30s dup cache and
-//!   viscous delay), [`SmartBeaconing`] (`HamHUD` formula), [`AprsMessenger`]
-//!   (ack/rej + retry), [`StationList`] (heard-station DB with expiry).
-//!
-//! # Time handling
-//!
-//! This crate is sans-io and never calls `std::time::Instant::now()`.
-//! Every stateful method accepts a `now: Instant` parameter; callers
-//! in the tokio shell layer (e.g. `kenwood-thd75::aprs::AprsClient`)
-//! read the wall clock once per iteration and thread it down.
-//!
-//! # References
-//!
-//! - APRS 1.0.1: <http://www.aprs.org/doc/APRS101.PDF>
-//! - APRS 1.2: <http://www.aprs.org/aprs12.html>
+#![doc = include_str!("../README.md")]
 
 // `proptest` is a dev-dependency used by `tests/adversarial_parse.rs`
 // (the never-panics net over the parse entry points). Each test target
@@ -33,6 +6,57 @@
 // target must acknowledge it or `unused_crate_dependencies` fires.
 #[cfg(test)]
 use proptest as _;
+
+pub use digipeater::{
+    DEFAULT_DEDUP_TTL, DEFAULT_VISCOUS_DELAY, DigiAction, DigipeaterAlias, DigipeaterAliasError,
+    DigipeaterAliases, DigipeaterCapacityError, DigipeaterConfig, DigipeaterLimits,
+    DigipeaterQueue,
+};
+pub use error::{AprsError, AprsWireTextField};
+pub use item::{AprsItem, AprsObject, AprsQuery, ReportState};
+pub use message::{
+    AnnouncementLetter, AprsMessage, BulletinAddressee, BulletinGroup, BulletinNumber,
+    DirectMessageAddressee, MAX_APRS_MESSAGE_TEXT_LEN, MessageControl, MessageValueError,
+};
+pub use messenger::{
+    AprsMessenger, INCOMING_DEDUP_WINDOW, MAX_RETRIES, MessengerConfig, RETRY_INTERVAL,
+};
+pub use mic_e::{MiceMessage, MiceTelemetry, MiceTelemetryError};
+pub use packet::{
+    AprsData, AprsDataExtension, AprsPacket, AprsReportTimestamp, AprsReportTimestampFormat,
+    AprsWeatherTimestamp, CourseSpeed, DaoDatum, DaoExtension, DaoPrecision, ExperimentId,
+    MaidenheadGrid, MessageKind, Phg, PhgDirectivity, PositionAmbiguity, RawWeatherFormat,
+    TelemetryDefinition, TimestampError,
+};
+pub use position::{
+    AprsPosition, CompressedAltitude, CompressedPositionData, CompressedRange, PositionMotion,
+};
+pub use reports::{AprsFrameHeader, ItemReport, MiceReport, ObjectReport, PositionReport};
+pub use smart_beaconing::{
+    BeaconReason, BeaconState, SmartBeaconing, SmartBeaconingConfig, SmartBeaconingConfigError,
+    SmartBeaconingParameters,
+};
+pub use station_list::{StationEntry, StationIter, StationList, StationRadius, StationRadiusError};
+pub use status::{AprsStatus, AprsStatusTimestamp, MAX_APRS_STATUS_TEXT_LEN};
+pub use telemetry::{
+    AprsTelemetry, TelemetryAnalogValue, TelemetryBits, TelemetryChannel, TelemetryComment,
+    TelemetryEquation, TelemetryEquationCoefficients, TelemetryLabels, TelemetryProjectTitle,
+    TelemetrySequence, TelemetryValueError,
+};
+pub use text::{
+    AprsTextError, AprsTextField, BulletinText, CompressedPositionText, ItemName, MessageAddressee,
+    MessageText, MiceStatusText, ObjectName, PositionReportText, QueryText, StatusText,
+    TimestampedStatusText, WeatherComment,
+};
+pub use units::{
+    AprsSymbol, CoordinateError, Course, CourseError, Fahrenheit, Heading, Latitude, Longitude,
+    MessageId, MessageIdError, MiceSpeed, Speed, SpeedError, SymbolError, SymbolOverlay,
+    SymbolTable, SymbolTableError, TemperatureError, Tocall,
+};
+pub use weather::{
+    AprsPositionlessWeatherReport, AprsWeather, BarometricPressure, Humidity, Luminosity,
+    ThreeDigitWeatherValue, WeatherValueError, WindDirection,
+};
 
 mod build;
 mod digipeater;
@@ -43,6 +67,7 @@ mod messenger;
 mod mic_e;
 mod packet;
 mod position;
+mod reports;
 mod smart_beaconing;
 mod station_list;
 mod status;
@@ -50,63 +75,3 @@ mod telemetry;
 mod text;
 mod units;
 mod weather;
-
-pub use build::{
-    build_aprs_bulletin, build_aprs_bulletin_packet, build_aprs_item, build_aprs_item_packet,
-    build_aprs_message, build_aprs_message_packet, build_aprs_mice, build_aprs_mice_with_message,
-    build_aprs_mice_with_message_packet, build_aprs_object, build_aprs_object_packet,
-    build_aprs_position_compressed, build_aprs_position_compressed_packet,
-    build_aprs_position_report, build_aprs_position_report_packet, build_aprs_position_weather,
-    build_aprs_position_weather_packet, build_aprs_status, build_aprs_status_packet,
-    build_aprs_telemetry, build_aprs_telemetry_bits, build_aprs_telemetry_bits_packet,
-    build_aprs_telemetry_eqns, build_aprs_telemetry_eqns_packet, build_aprs_telemetry_packet,
-    build_aprs_telemetry_parm, build_aprs_telemetry_parm_packet, build_aprs_telemetry_unit,
-    build_aprs_telemetry_unit_packet, build_aprs_timestamped_status,
-    build_aprs_timestamped_status_packet, build_aprs_weather, build_aprs_weather_packet,
-    build_query_response_position,
-};
-pub use digipeater::{
-    DEFAULT_DEDUP_TTL, DEFAULT_VISCOUS_DELAY, DigiAction, DigipeaterAlias, DigipeaterConfig,
-};
-pub use error::AprsError;
-pub use item::{
-    AprsItem, AprsObject, AprsQuery, parse_aprs_item, parse_aprs_object, parse_aprs_query,
-};
-pub use message::{AprsMessage, MAX_APRS_MESSAGE_TEXT_LEN, classify_ack_rej, parse_aprs_message};
-pub use messenger::{
-    AprsMessenger, INCOMING_DEDUP_WINDOW, MAX_RETRIES, MessengerConfig, RETRY_INTERVAL,
-};
-pub use mic_e::{
-    MiceMessage, MiceTelemetry, mice_message_bits, parse_aprs_data_full, parse_mice_position,
-};
-pub use packet::{
-    AprsData, AprsDataExtension, AprsPacket, AprsReportTimestamp, AprsReportTimestampFormat,
-    AprsWeatherTimestamp, MessageKind, ParseContext, Phg, PhgDirectivity, PositionAmbiguity,
-    TelemetryDefinition, TelemetryParameters, parse_aprs_data, parse_aprs_extensions,
-};
-pub use position::{
-    AprsPosition, decode_base91_4, parse_aprs_position, parse_compressed_body,
-    parse_uncompressed_body,
-};
-pub use smart_beaconing::{BeaconReason, BeaconState, SmartBeaconing, SmartBeaconingConfig};
-pub use station_list::{StationEntry, StationList};
-pub use status::{AprsStatus, AprsStatusTimestamp, MAX_APRS_STATUS_TEXT_LEN, parse_aprs_status};
-pub use telemetry::{
-    AprsTelemetry, TelemetryAnalogValue, TelemetryChannel, TelemetryComment,
-    TelemetryEquationCoefficients, TelemetryLabels, TelemetryProjectTitle, TelemetrySequence,
-    TelemetryValueError, parse_aprs_telemetry,
-};
-pub use text::{
-    AprsTextError, AprsTextField, BulletinText, CompressedPositionText, ItemName, MessageAddressee,
-    MessageText, MiceStatusText, ObjectName, PositionReportText, StatusText, TimestampedStatusText,
-    WeatherComment,
-};
-pub use units::{
-    AprsSymbol, Course, Fahrenheit, Heading, Latitude, Longitude, MessageId, MiceSpeed, Speed,
-    SymbolTable, Tocall,
-};
-pub use weather::{
-    AprsPositionlessWeatherReport, AprsWeather, BarometricPressure, Humidity, Luminosity,
-    ThreeDigitWeatherValue, WeatherValueError, WindDirection, extract_position_weather,
-    parse_aprs_weather_positionless,
-};
