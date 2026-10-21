@@ -4,6 +4,8 @@ Rust workspace for the Kenwood TH-D75 and TM-D750, a D-STAR reflector stack, a B
 
 ## Standard
 
+- Follow [RUST_STANDARDS.md](RUST_STANDARDS.md): the adopted Rust Style Guide, every applicable Rust API Guideline, and the enumerated Google additions. Read [CONTRIBUTING.md](CONTRIBUTING.md) for the review workflow. Keep contracts in rustdoc and READMEs, and document scoped policy deviations with their rationale.
+- Style rules prioritize readability and maintainability over writeability. Apply this principle within the safety, protocol, dependency and lint requirements; record scoped deviations rather than silently weakening a rule.
 - These crates are the reference Rust implementation for the TH-D75 and TM-D750: usable without reading the source, safe by construction, and documented to the standard library's level. The bar is the highest level of professionalism found in any comparable project and nothing lower; difficulty, verbosity or slower delivery never justify relaxing a rule in this file.
 - Linting and typing are as strict as the toolchain allows: every lint group in the Clippy policy stays denied, no suppression is added for convenience, and every boundary uses validated newtypes and enums that reject invalid values at construction, never raw integers or strings.
 - `kenwood-thd75` and `kenwood-tmd750` carry the smallest dependency set that works, ideally none beyond the shared workspace crates. Every external crate must do something the standard library cannot and must meet the dependency rule under Workspace boundaries.
@@ -19,10 +21,11 @@ Rust workspace for the Kenwood TH-D75 and TM-D750, a D-STAR reflector stack, a B
 - Split staged work into several commits by unstaging the other paths (`git reset -q -- <paths>`) and running `git commit` without a pathspec; `git commit -- <paths>` commits working-tree contents and sweeps in unstaged edits.
 - NEVER use bulk text replacement (sed, perl, awk, python one-liners, shell loops over files) on source or prose. Read each file and edit it individually; every bulk insertion in this codebase has broken a file.
 - Library crates must be compiling, tested and lint-clean before their TUI or REPL consumers are touched.
-- Run `./lint.sh` before every commit and `./ci-local.sh` before every push.
+- Run `./lint.sh` once on the completed working tree before committing. Reuse that result while splitting or rewriting commits when the checked files are unchanged; check intermediate snapshots when changed commit boundaries introduce new code combinations. Run `./ci-local.sh` before every push.
 - Do not reflexively pipe output through `head` or `tail`; `grep` for what you need or redirect to a file.
 - Commit messages describe behavior and policy, not the cleanup job: no line or test counts, no file paths, no "squash/consolidated" framing.
-- Every commit subject starts with a scope prefix: the package name (`kenwood-tmd750:`, `tmd750-repl:`) or `docs:`, `ci:`, `build:`, `lint:`, `workspace:`, `README:` for workspace-level changes, followed by a lowercase description.
+- Every commit subject starts with the package name (`kenwood-tmd750:`, `tmd750-repl:`) or `docs:`, `ci:`, `build:`, `lint:`, `README:` for shared configuration and documentation, followed by a lowercase description. Never use a `workspace:` scope for crate changes.
+- Group related work into one commit per crate. Use 1,000 changed lines as a batching guideline, not a minimum for a complete crate change; after that point, smaller focused follow-up commits may stand alone. Keep each crate's changes under its package scope.
 - Fold a fix into an unpushed commit with `git commit --fixup=<sha>` then `git rebase --autosquash origin/main`; git 2.55 needs no `-i`.
 - Reword while folding with an `amend! <subject>` commit whose body is the full new message; to fold into a commit already on `origin`, rebase onto that commit's parent. Merge non-adjacent commits by rebuilding on a branch from `origin/main` (`git cherry-pick -n <shas>` per group, `git commit --date=<base author date>`), check `git diff --quiet <old> <new>`, then `git checkout -B main`.
 - A rebase stopped by `index.lock: File exists` hit a transient lock from another git process; resume with `git -c core.editor=true rebase --continue`.
@@ -69,7 +72,7 @@ cargo test -p <package> --doc                            # doctests; nextest nev
 
 ## Workspace boundaries
 
-- Shared crates (`kenwood-transport`, `kenwood-schema`, `mmdvm`) are imported canonically and there are no compatibility adapters. Model crates never re-export their types, except the five scalar codec types each `memory::schema` facade re-exports for its descriptors and generated registry (`kenwood-schema/AGENTS.md`).
+- Shared crates (`kenwood-transport`, `kenwood-schema`, `mmdvm`) are imported canonically; model crates never re-export their types and there are no compatibility adapters.
 - The two MCP live-session engines (TH-D75 and TM-D750) stay separate: framing, retry, entry/exit timing and recovery differ. Do not merge them.
 - The two model libraries share many type names, but the types diverged by design (different `Frequency` domains, tone tables in f64 Hz vs u16 decihertz, field-parser semantics, per-crate `ProtocolError`); only the standard `DCS_CODES` array is byte-identical. Do not fold them into a shared CAT crate; the shared layer is `kenwood-schema`, `kenwood-transport` and `mmdvm`.
 - `kenwood-tmd750` and `tmd750-repl` never depend on `kenwood-thd75`; seam tests in both crates enforce it.
@@ -89,17 +92,18 @@ cargo test -p <package> --doc                            # doctests; nextest nev
 
 ## CI
 
-- All platforms pin Rust 1.94.0; `rust-toolchain.toml` matches. Symptom of drift: dozens of new clippy lints and trybuild stderr mismatches that CI never sees.
+- Build, lint and test platforms pin Rust 1.94.0; `rust-toolchain.toml` matches. Instrumented fuzz execution uses nightly. Symptom of unintended drift: dozens of new clippy lints and trybuild stderr mismatches that CI never sees.
 - A new RUSTSEC advisory fails the gate: try `cargo update <crate>` first. With no semver-compatible fix, add paired documented ignores in both `.cargo/audit.toml` and `deny.toml`. A duplicate-version `skip` names a whole release line (`crate@0.5`, never `crate@0.5.2`), since a pinned patch goes stale when a fresh lockfile picks up the next release; drop entries a fresh lockfile reports as unmatched or unnecessary.
 - CI resolves a fresh lockfile, so a green local gate proves nothing about it. Reproduce cargo-deny duplicates with `cargo generate-lockfile` (back up `Cargo.lock` first) and `cargo deny check bans`.
 - The persistent `target/clippy-gate` dir and CI's rust-cache reuse clippy fingerprints, so a pre-existing `-D warnings` violation (e.g. `missing_assert_message`) stays hidden until an edit to that module or its dependencies invalidates the fingerprint; a green gate is not proof the whole tree is clippy-clean.
+- Scratch source snapshots use a separate Cargo target directory; their path-dependency metadata must not replace the main gate cache.
 - `gh run list --commit <sha>` returns nothing here; list unfiltered with `--json headSha` and filter. A scratch `git worktree` with CRLF-converted files stands in for the Windows runner.
 - nextest flags tests `slow` when the first run after a source change includes the rebuild; rerun before diagnosing.
 - Platform CI runs per-crate `cargo test` with a `working-directory` per crate so each crate compiles with only its own features; there are no separate `cargo check` steps. Docs publishing runs on macOS so native transport API pages exist; the publisher keeps implicit library-over-binary target selection. A successful local render is not a Pages deployment.
 - KI4LAX spec comparisons in `thd75/tests/spec_audit.rs` are `#[ignore]`; run them with `THD75_KI4LAX_SPEC=/absolute/path.json cargo test -p kenwood-thd75 --test spec_audit -- --ignored`.
 - `lint.sh` requires `cargo-audit`, `cargo-deny`, `cargo-machete`, `shellcheck`, `taplo` and `mdbook`; a missing tool fails the gate.
 - Windows: D-STAR fixtures that touch directory durability go through the explicit durability seam, never a Unix directory open plus sync.
-- `ci-local.sh` runs Ubuntu and Fedora on k8s pods; its macOS step is commented out, so `./lint.sh` covers macOS. Its snapshot omits the gitignored `Cargo.lock`, so the pods resolve a fresh lockfile like GitHub CI, and a crates.io release after the run can still fail the push. Stuck `ci-ubuntu`/`ci-fedora` pods from a killed run must be force-deleted first; the script silences kubectl errors, so "no pod output" is the symptom. macOS `ar` warnings starting `warning: kenwood-thd75@` are harmless. zsh: `$pipestatus` is lowercase and unquoted variables do not word-split (use `xargs` or `${=var}`).
+- `ci-local.sh` runs Ubuntu and Fedora on k8s pods; its macOS step is commented out, so `./lint.sh` covers macOS. Its source snapshot includes the ignored `Cargo.lock`; the pods check that resolved graph, while GitHub CI resolves a fresh one. The script deletes stale pods before starting and reports kubectl errors. macOS `ar` warnings starting `warning: kenwood-thd75@` are harmless. zsh: `$pipestatus` is lowercase and unquoted variables do not word-split (use `xargs` or `${=var}`).
 - `ci-local.sh` catches Linux-only `dead_code` the macOS `lint.sh` cannot: an item used only under `#[cfg(any(target_os = "macos", test))]` is dead in a Linux non-test build and fails `-D warnings`. Gate such helpers with the same `cfg`.
 - A test through a `cfg!(target_os = "macos")` early return passes `lint.sh` and fails Linux and Windows CI: assert each platform's outcome, or gate the test with `#[cfg(target_os = "macos")]`.
 - `ci-local.sh` snapshots the tree with `git ls-files --cached`; stage tracked-file deletions (`git rm`) before running it, or its tar fails with `Cannot stat` on the removed paths.
@@ -123,7 +127,7 @@ cargo test -p <package> --doc                            # doctests; nextest nev
 - `cargo doc` resolves intra-doc links only on items it renders, so `lint.sh` runs `--document-private-items`.
 - Removing a `use` can break an intra-doc link that resolved through it; clippy still passes. Link by full path instead.
 - Implicit `cargo doc` selection prefers a library over its same-name binary (`thd75-repl` is the trap); the full gate selects `--lib --bins`. Do not add `--lib` to a bin-only package such as `sextant`.
-- `cargo test --doc` never sees ```` ```text ```` or ```` ```ignore ```` fences, binary crates, or README prose. `thd75`, `tmd750`, `kenwood-transport`, `kenwood-schema`, `mmdvm`, `mbelib-rs`, `dstar-gateway` and `azimuth-core` include their README through `#![doc = include_str!]`, so README identifiers need backticks (`clippy::doc_markdown`), a fence that opens a port is ```` ```rust,no_run ````, and relative links must be absolute GitHub URLs. Those READMEs are the published API front pages.
+- `cargo test --doc` never sees ```` ```text ```` or ```` ```ignore ```` fences, binary crates, or README prose. `thd75`, `thd75-repl`, `tmd750`, `kenwood-transport`, `kenwood-schema`, `ax25-codec`, `kiss-tnc`, `aprs`, `aprs-is`, `mmdvm-core`, `mmdvm`, `dmr-rewind-core`, `dmr-rewind`, `if-dsp`, `mbelib-rs`, `dstar-gateway-core`, `dstar-gateway`, `mcp-d75-extract`, `thd75-listen`, `pulsar`, `lodestar-core` and `azimuth-core` include their README through `#![doc = include_str!]`, so README identifiers need backticks (`clippy::doc_markdown`), a fence that opens a port is ```` ```rust,no_run ````, and relative links must be absolute GitHub URLs. Those READMEs are the published API front pages.
 - The only mdBook is `dstar-gateway/book`; its `book.toml` sets `create-missing = false`. mdbook does not validate inline `[text](page.md)` links; check them by hand when deleting a page.
 - Generated registries (`thd75/src/memory/menu_fields.rs`, `tmd750/src/memory/menu_fields.rs`) and manifests are never hand-edited; change the generator templates in `mcp-d75-extract/src/rustgen.rs`, regenerate, and keep the untouched artifacts SHA-identical.
 
@@ -144,13 +148,13 @@ cargo test -p <package> --doc                            # doctests; nextest nev
 - Fix the code instead of suppressing: `buf.get(..n).expect("n within buf")` not `&buf[..n]`; `unreachable!` not `panic!`; `assert!(expr.is_err())` not `expect_err`; `HashSet<Enum>` instead of `struct_excessive_bools`.
 - `#[cfg_attr(test, expect(...))]` is banned: it checks the build predicate, not that the item is a test.
 - `dead_code` expectations cannot stage a new module: a module-level expect makes everything live, and an item-level expect on a test-only caller is unfulfilled in the test build. Wire a real consumer instead.
-- `#[expect]` is evaluated per target, not per cfg block; split `#[cfg(target_os)]` branches into separate functions. `./lint.sh` runs on macOS only; `./ci-local.sh` catches Linux.
+- `#[expect]` is evaluated per target, not per cfg block; split `#[cfg(target_os)]` branches into separate functions. Local `./lint.sh` covers macOS; the portable GitHub gate and `./ci-local.sh` cover Linux.
 - `drop(map.insert(..))` on a `Copy` value is `dropping_copy_types`; bind it as `let _previous = ...`.
 - An `#[expect(deprecated)]` for a dependency's deprecation needs that release as the dependency's minimum version (`tokio = "1.54"`); an older lockfile otherwise fails it as unfulfilled.
 
 ## Cargo `[lints]` inheritance
 
-- A crate-level `[lints.<group>]` block replaces the workspace block entirely; `workspace = true` cannot be mixed with per-lint overrides. Override crates (`thd75`, `thd75-tui`, `thd75-repl`, `lodestar-core`, `azimuth-core`) restate every workspace lint and carry a "KNOWN DIVERGENCE FROM WORKSPACE" comment; add no new override without one.
+- A crate-level `[lints.<group>]` block replaces the workspace block entirely; `workspace = true` cannot be mixed with per-lint overrides. Override crates (`kenwood-transport`, `thd75`, `thd75-tui`, `thd75-repl`, `lodestar-core`, `azimuth-core`) restate every workspace lint except documented generated-code exceptions and carry a "KNOWN DIVERGENCE FROM WORKSPACE" comment; add no new override without one.
 - `unsafe_code = "forbid"` cannot be weakened at crate level from source; crates that need unsafe or generated FFI override `[lints.rust]` in Cargo.toml and still deny unsafe outside the audited files.
 - `unused_crate_dependencies` fires per compilation unit: fix with `use <dep> as _;` in `src/main.rs`, every `tests/*.rs`, and `#[cfg(test)]` in `lib.rs` for dev-dependencies; never with a blanket allow.
 
@@ -164,4 +168,4 @@ cargo test -p <package> --doc                            # doctests; nextest nev
 - Const: `Option::unwrap` is const since 1.83; `Result::unwrap` is not (match with `unreachable!`). `const fn` cannot deref a `Vec` or call `try_from`; make such functions non-const rather than `as`-narrowing.
 - A test whose only `?` is removed trips `unnecessary_wraps`; keep one real fallible step and bind its value (`let _baseline = parse(&arguments())?;`) so `unused_results` stays satisfied.
 - `MockTransport` never fails on unconsumed expectations: end tests that own the mock with `assert_complete()`; where a host consumes it, assert a value only the script's last replies produce.
-- Script a held reply with `expect_reads(command, &[])` then `queue_read_delayed(reply, ms)`; the delay is real time, so keep it just past the deadline under test.
+- Script a held reply with `expect_reads(command, &[])` then `queue_read_delayed(reply, delay)` with a `Duration`; the delay is real time, so keep it just past the deadline under test.

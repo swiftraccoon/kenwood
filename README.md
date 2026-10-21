@@ -87,14 +87,25 @@ For developers: build the Rust core with `./azimuth-core/scripts/build-xcframewo
 
 ## Building
 
+Contributor workflow and required checks are in [CONTRIBUTING.md](CONTRIBUTING.md).
+The workspace adopts the Rust Style Guide, Rust API Guidelines and selected
+Google Rust rules through [RUST_STANDARDS.md](RUST_STANDARDS.md).
+
 ```
 cargo build --workspace
 cargo test --workspace
 ./lint.sh       # unsafe audit, clippy --all-targets, nextest + doctests, docs, fmt, audit, deny, machete, shellcheck, taplo, mdbook
-./ci-local.sh   # cross-platform CI: macOS locally, Ubuntu + Fedora in k8s pods
+./ci-local.sh   # Ubuntu and Fedora CI in k8s pods; lint.sh covers macOS
 ```
 
-Rust 1.94+, edition 2024. Workspace-level lints enforce `unsafe_code = "forbid"`, `missing_docs = "deny"`, and clippy `pedantic`/`nursery`/`cargo`. A crate's `[lints]` table replaces the workspace one rather than merging, so five crates restate it: `thd75` denies (rather than forbids) `unsafe_code` only for the audited macOS `IOBluetooth` helper and Vision OCR bridge FFI, `thd75-tui` forbids it, `lodestar-core` and `azimuth-core` permit generated UniFFI scaffolding, and `thd75-repl` restates the table only to diverge on other lints; it forbids `unsafe_code` and contains no FFI. Every `unsafe` block outside that allowlist is rejected by `./lint.sh`'s unsafe audit.
+Rust 1.94.0, edition 2024. Workspace-level lints enforce `unsafe_code = "forbid"`,
+`missing_docs = "deny"`, and Clippy `all`/`pedantic`/`nursery`/`cargo`. Six crates
+restate the lint tables, which Cargo replaces rather than merges:
+`kenwood-transport` permits its audited native Bluetooth helper, `thd75` permits
+its audited Vision OCR bridge, and `lodestar-core` and `azimuth-core` accommodate
+generated UniFFI scaffolding. `thd75-tui` and `thd75-repl` retain the unsafe ban
+while restating other lint settings. The local gate rejects unsafe syntax
+outside the audited source allowlist.
 
 ## License
 

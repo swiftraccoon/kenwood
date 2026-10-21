@@ -34,6 +34,8 @@ thd75_re/
 *.ambe
 
 !README.md
+!/CONTRIBUTING.md
+!/RUST_STANDARDS.md
 !azimuth/README.md
 !azimuth-core/README.md
 
