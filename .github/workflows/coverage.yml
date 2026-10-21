@@ -33,9 +33,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
       # One instrumented run of every test target in every workspace
-      # crate (unit + integration). This is also the only CI job that
-      # executes the full workspace test suite on Linux, so a test
-      # failure here must fail the job: no `|| true`.
+      # crate (unit + integration). Test failures fail this job as well
+      # as the separate portable gate: no `|| true`.
       #
       # `--features testing` enables thd75-repl's `script_integration`
       # suite (behind `required-features`), which is otherwise invisible

@@ -6,126 +6,61 @@ on:
     branches: [main]
 permissions:
   contents: read
-# Superseded PR pushes cancel their stale runs; main pushes never
-# cancel so every landed commit keeps a complete CI record.
 concurrency:
   group: ubuntu-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 env:
-  # Incremental artifacts are useless on throwaway runners and bloat
-  # the cache; line-tables-only keeps file:line in backtraces while
-  # skipping the full debuginfo that CI never loads in a debugger.
   CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
 jobs:
   ci:
+    name: Isolated packages (ubuntu-latest)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.94.0
         with:
           components: clippy, rustfmt
-      # Cargo.lock is intentionally gitignored; resolve it first so
-      # rust-cache gets a stable, content-addressed key.
+      - name: Install Linux audio headers
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - run: cargo generate-lockfile
       - uses: Swatinem/rust-cache@v2
-      # No `cargo check` / `cargo build` steps: clippy IS check plus
-      # lints (and `--all-targets` covers strictly more targets), and
-      # `cargo test` compiles and links the same lib/bin/example
-      # targets. Neither dropped step produced artifacts the later
-      # steps reuse; clippy's driver fingerprints differently from
-      # check, so those passes were pure duplicate work.
-      - run: cargo clippy --all-targets -- -D warnings
-        working-directory: kenwood-schema
-      - run: cargo test
-        working-directory: kenwood-schema
-      - run: cargo clippy --all-targets -- -D warnings
+      - name: Check every package with its own default features
+        run: cargo run --quiet -p workspace-policy -- ci
+      - name: Check transport without serial support
         working-directory: kenwood-transport
-      - run: cargo clippy --all-targets --no-default-features -- -D warnings
+        run: |
+          cargo clippy --all-targets --no-default-features -- -D warnings
+          cargo test --no-default-features
+      - name: Check portable Bluetooth selectors without serial support
         working-directory: kenwood-transport
-      - run: cargo test
-        working-directory: kenwood-transport
-      - run: cargo test --no-default-features
-        working-directory: kenwood-transport
-      - run: cargo clippy --all-targets -- -D warnings
+        run: |
+          cargo clippy --all-targets --no-default-features --features native-bluetooth -- -D warnings
+          cargo test --no-default-features --features native-bluetooth
+      - name: Check CAT-only TH-D75
         working-directory: thd75
-      - run: cargo clippy --all-targets --no-default-features -- -D warnings
-        working-directory: thd75
-      - run: cargo clippy --all-targets -- -D warnings
-        working-directory: thd75-tui
-      - run: cargo clippy --all-targets -- -D warnings
-        working-directory: dstar-gateway
-      - run: cargo clippy --all-targets -- -D warnings
+        run: |
+          cargo clippy --all-targets --no-default-features -- -D warnings
+          cargo test --no-default-features
+      - name: Check REPL integration feature
         working-directory: thd75-repl
-      - run: cargo clippy --all-targets --features testing -- -D warnings
-        working-directory: thd75-repl
-      - run: cargo clippy --all-targets -- -D warnings
+        run: |
+          cargo clippy --all-targets --features testing -- -D warnings
+          cargo test --features testing
+      - name: Check voice encoder feature variants
         working-directory: mbelib-rs
-      - run: cargo clippy --all-targets -- -D warnings
-        working-directory: stargazer
-      - run: cargo clippy --all-targets -- -D warnings
-        working-directory: dmr-rewind-core
-      - run: cargo clippy --all-targets -- -D warnings
-        working-directory: dmr-rewind
-      - run: cargo clippy --all-targets -- -D warnings
-        working-directory: pulsar
-      - run: cargo clippy --all-targets -- -D warnings
-        working-directory: tmd750
-      - run: cargo clippy --all-targets -- -D warnings
-        working-directory: tmd750-repl
-      - run: cargo test
-        working-directory: thd75
-      - run: cargo test --no-default-features
-        working-directory: thd75
-      - run: cargo test
-        working-directory: thd75-tui
-      - run: cargo test
-        working-directory: dstar-gateway
-      - run: cargo test
-        working-directory: thd75-repl
-      - run: cargo test --features testing
-        working-directory: thd75-repl
-      - run: cargo test
-        working-directory: mbelib-rs
-      - run: cargo test --features encoder
-        working-directory: mbelib-rs
-      - run: cargo test --features kenwood-tables
-        working-directory: mbelib-rs
-      - run: cargo test
-        working-directory: mcp-d75-extract
-      - run: cargo test
-        working-directory: tmd750
-      - run: cargo test
-        working-directory: tmd750-repl
-      - run: cargo test
-        working-directory: mmdvm-core
-      - run: cargo test
-        working-directory: mmdvm
-      - run: cargo clippy --all-targets --no-default-features -- -D warnings
-        working-directory: mmdvm
-      - run: cargo test --no-default-features
-        working-directory: mmdvm
-      - name: Isolated MMDVM feature checks
+        run: |
+          cargo test --features encoder
+          cargo test --features kenwood-tables
+      - name: Check isolated MMDVM feature variants
         working-directory: mmdvm
         run: |
-          for mmdvm_features in runtime probe dstar; do
+          cargo clippy --all-targets --no-default-features -- -D warnings
+          cargo test --no-default-features
+          for mmdvm_features in probe dstar; do
             cargo clippy --all-targets --no-default-features --features "$mmdvm_features" -- -D warnings
             cargo test --no-default-features --features "$mmdvm_features"
           done
-      - run: cargo test --bins
-        working-directory: stargazer
-      - run: cargo test
-        working-directory: dmr-rewind-core
-      - run: cargo test
-        working-directory: dmr-rewind
-      - run: cargo test
-        working-directory: pulsar
-      - run: cargo doc --no-deps
-        working-directory: thd75
-        env:
-          RUSTDOCFLAGS: "-D warnings"
-      # Check both public and private links before merge. Separate output
-      # directories prevent feature variants from reusing rendered docs.
       - name: Check isolated schema documentation
         run: cargo doc --no-deps --document-private-items --lib
         working-directory: kenwood-schema
@@ -138,31 +73,21 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D warnings"
           CARGO_TARGET_DIR: ../target/doc-transport-default
-      - name: Check transport core documentation without optional backends
+      - name: Check transport documentation without optional backends
         run: cargo doc --no-deps --document-private-items --no-default-features --lib
         working-directory: kenwood-transport
         env:
           RUSTDOCFLAGS: "-D warnings"
           CARGO_TARGET_DIR: ../target/doc-transport-core
-      - run: cargo doc --no-deps --document-private-items --lib
+      - name: Check isolated TM-D750 documentation
+        run: cargo doc --no-deps --document-private-items --lib
         working-directory: tmd750
         env:
           RUSTDOCFLAGS: "-D warnings"
-          CARGO_TARGET_DIR: ../target/doc-tmd750-default
-      - run: cargo doc --no-deps --document-private-items --all-features --lib
-        working-directory: tmd750
-        env:
-          RUSTDOCFLAGS: "-D warnings"
-          CARGO_TARGET_DIR: ../target/doc-tmd750-all
-      - run: cargo doc --no-deps --document-private-items --bins
+          CARGO_TARGET_DIR: ../target/doc-tmd750
+      - name: Check isolated TM-D750 REPL documentation
+        run: cargo doc --no-deps --document-private-items --bins
         working-directory: tmd750-repl
         env:
           RUSTDOCFLAGS: "-D warnings"
-          CARGO_TARGET_DIR: ../target/doc-tmd750-repl-default
-      - run: cargo doc --no-deps --document-private-items --all-features --bins
-        working-directory: tmd750-repl
-        env:
-          RUSTDOCFLAGS: "-D warnings"
-          CARGO_TARGET_DIR: ../target/doc-tmd750-repl-all
-      - name: Check formatting across all workspace crates
-        run: cargo fmt --all -- --check
+          CARGO_TARGET_DIR: ../target/doc-tmd750-repl

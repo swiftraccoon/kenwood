@@ -17,14 +17,4 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.94.0
       - uses: taiki-e/install-action@cargo-machete
-      - run: cargo machete kenwood-schema/
-      - run: cargo machete kenwood-transport/
-      - run: cargo machete thd75/
-      - run: cargo machete thd75-tui/
-      - run: cargo machete mbelib-rs/
-      - run: cargo machete stargazer/
-      - run: cargo machete dmr-rewind-core/
-      - run: cargo machete dmr-rewind/
-      - run: cargo machete pulsar/
-      - run: cargo machete tmd750/
-      - run: cargo machete tmd750-repl/
+      - run: cargo machete --skip-target-dir .

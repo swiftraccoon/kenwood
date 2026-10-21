@@ -1,0 +1,31 @@
+name: Rust standards
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: rust-standards-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+jobs:
+  gate:
+    name: Complete portable gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+        with:
+          components: clippy, rustfmt
+      - name: Install native build requirements
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev shellcheck
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest,cargo-audit,cargo-deny,cargo-machete,taplo-cli@0.10.0,mdbook
+      - run: cargo generate-lockfile
+      - uses: Swatinem/rust-cache@v2
+      - run: ./lint.sh -q
