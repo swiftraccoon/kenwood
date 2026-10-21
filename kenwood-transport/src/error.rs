@@ -2,6 +2,27 @@
 
 use thiserror::Error;
 
+/// Bluetooth input whose constructor rejected the supplied value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BluetoothParameterKind {
+    /// Exact six-octet Bluetooth address.
+    Address,
+    /// Nonempty paired-device display name.
+    DisplayName,
+    /// RFCOMM server channel from 1 through 30.
+    RfcommChannel,
+}
+
+impl std::fmt::Display for BluetoothParameterKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Address => "address",
+            Self::DisplayName => "display name",
+            Self::RfcommChannel => "RFCOMM channel",
+        })
+    }
+}
+
 /// Host-observed stage at which one native Bluetooth opening attempt failed.
 ///
 /// A stage names the helper operation that failed on this host, not a cause in
@@ -102,7 +123,7 @@ pub enum TransportError {
     #[error("invalid Bluetooth {parameter}: {value:?}")]
     BluetoothParameter {
         /// Parameter whose domain was violated.
-        parameter: &'static str,
+        parameter: BluetoothParameterKind,
         /// Rejected input, retained without normalization.
         value: String,
     },
@@ -178,16 +199,4 @@ pub enum TransportError {
     /// [`Transport::reopen`]: crate::Transport::reopen
     #[error("this transport cannot reopen its connection")]
     ReopenUnsupported,
-
-    /// A thread-affine third-party transport refused this reopen call.
-    ///
-    /// Process-isolated transports do not have this restriction. This variant
-    /// is available to custom transports whose platform API requires its
-    /// original opening thread.
-    #[error("reopen must run on the thread that opened the transport")]
-    WrongThread,
-
-    /// The main-thread broker has been dropped and cannot execute more jobs.
-    #[error("the main-thread transport broker is no longer available")]
-    BrokerUnavailable,
 }

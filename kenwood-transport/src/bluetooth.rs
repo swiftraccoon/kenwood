@@ -20,11 +20,14 @@
 //! [`BluetoothService`] for explicit service policy. Native callers must also
 //! follow the transport type's process-wide exclusivity and cleanup contracts.
 
-mod types;
+#[cfg(target_os = "macos")]
+pub use inner::BluetoothTransport;
 pub use types::{
     BluetoothAddress, BluetoothDeviceName, BluetoothDeviceSelector, BluetoothOpenCancellation,
     BluetoothService, PairedBluetoothDevice, RfcommChannel,
 };
+
+mod types;
 
 #[cfg(target_os = "macos")]
 #[expect(
@@ -197,9 +200,9 @@ mod inner {
     /// [`Transport::close`] is async-shaped but performs synchronous helper
     /// teardown without yielding: a 600 ms graceful wait, then up to 100 ms
     /// of synchronous reap checking when necessary. An async timeout cannot
-    /// interrupt that poll. Drop can perform the same work, so do not rely on
-    /// another task on a single-thread executor to remain responsive during
-    /// cleanup.
+    /// interrupt that poll. Run explicit close on a retained, joined blocking
+    /// worker. Drop transfers the child, pipes and process lease to a retirement
+    /// worker and never waits for helper exit. The lease remains held until reap.
     ///
     /// Explicit close retains its first outcome, including failure, for later
     /// calls. Preserve it separately from I/O errors. Only a successful close
@@ -666,7 +669,7 @@ mod inner {
         if Instant::now() >= deadline {
             return Err(helper_readiness_error(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "Bluetooth helper opening completed after its deadline",
+                "Bluetooth helper operation exceeded its deadline",
             )));
         }
         Ok(())
@@ -780,9 +783,12 @@ mod inner {
         let mut echoed = Vec::with_capacity(HELPER_VALIDATION_CHALLENGE.len());
         let mut buffer = [0_u8; 64];
         loop {
+            check_open_completion(deadline, &cancellation)?;
             match stdout.read(&mut buffer) {
                 Ok(0) => {
-                    let status = await_helper_exit_after_stdout_eof(child, &cancellation)?;
+                    let reap_deadline = deadline.min(Instant::now() + HELPER_EOF_EXIT_BUDGET);
+                    let status = await_helper_exit_until(child, reap_deadline, &cancellation)?;
+                    check_open_completion(deadline, &cancellation)?;
                     if !status.success() {
                         return Err(bluetooth_helper_error(
                             "validating the Bluetooth helper launch",
@@ -901,9 +907,11 @@ mod inner {
                     )
                 })
                 .and_then(|payload| {
-                    parse_paired_device_payload(&payload).map_err(|source| {
+                    let devices = parse_paired_device_payload(&payload).map_err(|source| {
                         bluetooth_helper_error("parsing paired Bluetooth devices", source)
-                    })
+                    })?;
+                    check_open_completion(deadline, cancellation)?;
+                    Ok(devices)
                 });
         drop(helper_stdout);
 
@@ -922,17 +930,19 @@ mod inner {
 
     fn collect_paired_device_payload(
         child: &mut Child,
-        stdout: &mut ChildStdout,
+        stdout: &mut impl io::Read,
         deadline: Instant,
         cancellation: &BluetoothOpenCancellation,
     ) -> Result<Vec<u8>, TransportError> {
         let mut payload = Vec::new();
         let mut buffer = [0_u8; 4096];
         loop {
-            cancellation.check()?;
+            check_open_completion(deadline, cancellation)?;
             match stdout.read(&mut buffer) {
                 Ok(0) => {
-                    let status = await_helper_exit_after_stdout_eof(child, cancellation)?;
+                    let reap_deadline = deadline.min(Instant::now() + HELPER_EOF_EXIT_BUDGET);
+                    let status = await_helper_exit_until(child, reap_deadline, cancellation)?;
+                    check_open_completion(deadline, cancellation)?;
                     if status.success() {
                         return Ok(payload);
                     }
@@ -1256,7 +1266,17 @@ mod inner {
 
     impl Drop for BluetoothTransport {
         fn drop(&mut self) {
-            self.terminate_helper(true);
+            self.helper_healthy = false;
+            drop(self.helper_stdin.take());
+            if let Some(child) = self.child.take() {
+                retire_child(DeferredRetirement {
+                    child,
+                    slot: self.process_slot.take(),
+                    liveness: self.parent_liveness.take(),
+                    stdout: self.helper_stdout.take(),
+                    graceful: true,
+                });
+            }
         }
     }
 
@@ -1341,12 +1361,14 @@ mod inner {
                         pid,
                         "terminating Bluetooth helper after cancelled/failed pipe write"
                     );
-                    *self.close_outcome = Some(terminate_child_checked(
+                    retire_child(DeferredRetirement {
                         child,
-                        self.process_slot.take(),
-                        self.parent_liveness.take(),
-                        false,
-                    ));
+                        slot: self.process_slot.take(),
+                        liveness: self.parent_liveness.take(),
+                        stdout: None,
+                        graceful: false,
+                    });
+                    *self.close_outcome = Some(Err(BluetoothCloseFailure::ReapPending));
                 } else {
                     drop(self.process_slot.take());
                     drop(self.parent_liveness.take());
@@ -1441,13 +1463,6 @@ mod inner {
                 format!("Bluetooth helper exited with {status}"),
             )),
         }
-    }
-
-    fn await_helper_exit_after_stdout_eof(
-        child: &mut Child,
-        cancellation: &BluetoothOpenCancellation,
-    ) -> Result<ExitStatus, TransportError> {
-        await_helper_exit_until(child, Instant::now() + HELPER_EOF_EXIT_BUDGET, cancellation)
     }
 
     fn await_helper_exit_until(
@@ -1625,6 +1640,52 @@ mod inner {
     struct PendingReap {
         child: Child,
         slot: Option<HelperProcessSlot>,
+    }
+
+    /// Resources retained through fallback retirement, including the stdout reader.
+    struct DeferredRetirement {
+        child: Child,
+        slot: Option<HelperProcessSlot>,
+        liveness: Option<OwnedFd>,
+        stdout: Option<ChildStdout>,
+        graceful: bool,
+    }
+
+    /// Transfer cleanup without joining, sleeping or waiting for a resource.
+    fn retire_child(retirement: DeferredRetirement) {
+        let (sender, receiver) = mpsc::sync_channel::<DeferredRetirement>(1);
+        let worker = std::thread::Builder::new()
+            .name(format!("kenwood-bt-retire-{}", retirement.child.id()))
+            .spawn(move || {
+                if let Ok(retirement) = receiver.recv() {
+                    let _outcome = terminate_child_checked(
+                        retirement.child,
+                        retirement.slot,
+                        retirement.liveness,
+                        retirement.graceful,
+                    );
+                    drop(retirement.stdout);
+                }
+            });
+        match worker {
+            Ok(_handle) => {
+                if let Err(mpsc::SendError(retirement)) = sender.send(retirement) {
+                    retain_failed_retirement(retirement);
+                }
+            }
+            Err(_) => retain_failed_retirement(retirement),
+        }
+    }
+
+    /// A failed worker handoff kills promptly and retains the exclusive lease.
+    fn retain_failed_retirement(mut retirement: DeferredRetirement) {
+        drop(retirement.liveness.take());
+        let _kill = retirement.child.kill();
+        retain_pending_reap(PendingReap {
+            child: retirement.child,
+            slot: retirement.slot,
+        });
+        drop(retirement.stdout);
     }
 
     fn retain_pending_reap(pending: PendingReap) {
@@ -2184,6 +2245,62 @@ mod inner {
             reads: usize,
         }
 
+        struct CompletingPayloadReader<F> {
+            completion: F,
+        }
+
+        impl<F: FnMut()> io::Read for CompletingPayloadReader<F> {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                (self.completion)();
+                Ok(0)
+            }
+        }
+
+        #[test]
+        fn final_inventory_eof_cannot_admit_a_late_or_cancelled_result() -> TestResult {
+            for cancel in [false, true] {
+                let mut child = Command::new("/usr/bin/true").spawn()?;
+                let status = child.wait()?;
+                assert!(status.success(), "inventory fixture did not exit cleanly");
+                let cancellation = BluetoothOpenCancellation::default();
+                let deadline = Instant::now() + Duration::from_secs(1);
+                let mut completions = 0;
+                let mut reader = CompletingPayloadReader {
+                    completion: || {
+                        completions += 1;
+                        if cancel {
+                            cancellation.cancel();
+                        } else {
+                            while Instant::now() < deadline {
+                                std::thread::sleep(
+                                    deadline.saturating_duration_since(Instant::now()),
+                                );
+                            }
+                        }
+                    },
+                };
+                let result = super::collect_paired_device_payload(
+                    &mut child,
+                    &mut reader,
+                    deadline,
+                    &cancellation,
+                );
+                assert_eq!(completions, 1, "the fixture must complete the final read");
+                if cancel {
+                    assert!(matches!(
+                        result,
+                        Err(TransportError::BluetoothOpenInterrupted)
+                    ));
+                } else {
+                    assert!(
+                        matches!(result, Err(TransportError::BluetoothHelper { source, .. })
+                        if source.kind() == io::ErrorKind::TimedOut)
+                    );
+                }
+            }
+            Ok(())
+        }
+
         impl<F: FnMut()> io::Read for CompletingEndpointReader<F> {
             fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
                 let endpoint = b"00-11-22-33-44-55\x1b";
@@ -2458,6 +2575,40 @@ mod inner {
                 }
                 if Instant::now() >= deadline {
                     return Err("pending helper lease was not released".into());
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn transport_drop_transfers_waiting_without_releasing_the_live_helper_lease() -> TestResult
+        {
+            let _isolation = PROCESS_SLOT_TEST_LOCK
+                .lock()
+                .map_err(|_poison| "process-slot test lock poisoned")?;
+            let transport = owned_pending_test_transport()?;
+            let started = Instant::now();
+            drop(transport);
+            assert!(
+                started.elapsed() < GRACEFUL_EXIT_BUDGET / 2,
+                "transport drop waited for the helper's graceful exit window"
+            );
+            assert!(
+                matches!(HelperProcessSlot::reserve(), Err(TransportError::BluetoothHelper { source, .. })
+                    if source.kind() == io::ErrorKind::WouldBlock),
+                "drop released the helper lease before retirement completed"
+            );
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if let Ok(slot) = HelperProcessSlot::reserve() {
+                    drop(slot);
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    return Err(
+                        "retirement worker did not release the reaped helper's lease".into(),
+                    );
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }
@@ -3174,7 +3325,7 @@ mod inner {
             assert!(child.is_none());
             assert!(matches!(
                 close_outcome,
-                Some(Err(super::BluetoothCloseFailure::ForcedTermination))
+                Some(Err(super::BluetoothCloseFailure::ReapPending))
             ));
 
             let deadline = Instant::now() + Duration::from_secs(1);
@@ -3266,6 +3417,3 @@ mod inner {
         }
     }
 }
-
-#[cfg(target_os = "macos")]
-pub use inner::BluetoothTransport;

@@ -11,6 +11,7 @@ use std::sync::{
 };
 
 use crate::TransportError;
+use crate::error::BluetoothParameterKind;
 
 /// Sticky thread-safe cancellation for one bounded native helper operation.
 ///
@@ -25,6 +26,12 @@ pub struct BluetoothOpenCancellation {
 }
 
 impl BluetoothOpenCancellation {
+    /// Create a clear cancellation flag shared by any later clones.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     /// Request cancellation, including before an operation starts.
     pub fn cancel(&self) {
         self.requested.store(true, Ordering::Release);
@@ -105,7 +112,7 @@ impl FromStr for BluetoothAddress {
                 }
             })
         {
-            return Err(invalid("address", value));
+            return Err(invalid(BluetoothParameterKind::Address, value));
         }
         Ok(Self(
             value
@@ -125,13 +132,25 @@ impl fmt::Display for BluetoothAddress {
     }
 }
 
+impl AsRef<str> for BluetoothAddress {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl From<BluetoothAddress> for String {
+    fn from(value: BluetoothAddress) -> Self {
+        value.0
+    }
+}
+
 /// Nonempty Bluetooth display name; ambiguity is refused during native selection.
 ///
 /// Available on every platform with `native-bluetooth`. Names contain 1 through
 /// 1,024 UTF-8 bytes and no Unicode control characters. Text that parses as a
 /// [`BluetoothAddress`] is rejected. Case, spaces and other non-control Unicode
 /// characters are retained exactly; there is no trimming or normalization.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BluetoothDeviceName(String);
 
 impl BluetoothDeviceName {
@@ -142,15 +161,16 @@ impl BluetoothDeviceName {
     /// Returns [`TransportError::BluetoothParameter`] for an empty name, more
     /// than 1,024 UTF-8 bytes, a Unicode control character, or text accepted by
     /// [`BluetoothAddress`]. An address must use an exact-address selector.
-    pub fn new(value: &str) -> Result<Self, TransportError> {
+    pub fn new(value: impl Into<String>) -> Result<Self, TransportError> {
+        let value = value.into();
         if value.is_empty()
             || value.len() > 1024
             || value.chars().any(char::is_control)
             || value.parse::<BluetoothAddress>().is_ok()
         {
-            Err(invalid("display name", value))
+            Err(invalid(BluetoothParameterKind::DisplayName, value))
         } else {
-            Ok(Self(value.to_owned()))
+            Ok(Self(value))
         }
     }
 
@@ -158,6 +178,50 @@ impl BluetoothDeviceName {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl AsRef<str> for BluetoothDeviceName {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl From<BluetoothDeviceName> for String {
+    fn from(value: BluetoothDeviceName) -> Self {
+        value.0
+    }
+}
+
+impl TryFrom<String> for BluetoothDeviceName {
+    type Error = TransportError;
+
+    /// Consume and validate display-name text through [`BluetoothDeviceName::new`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation errors as [`BluetoothDeviceName::new`].
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl fmt::Display for BluetoothDeviceName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for BluetoothDeviceName {
+    type Err = TransportError;
+
+    /// Validate the display-name grammar described on [`BluetoothDeviceName`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation errors as [`BluetoothDeviceName::new`].
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
     }
 }
 
@@ -184,6 +248,12 @@ impl BluetoothDeviceSelector {
     }
 }
 
+impl AsRef<str> for BluetoothDeviceSelector {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
 /// Validated RFCOMM server channel in the Bluetooth domain 1 through 30.
 ///
 /// Available on every platform with `native-bluetooth`.
@@ -200,7 +270,10 @@ impl RfcommChannel {
         if (1..=30).contains(&value) {
             Ok(Self(value))
         } else {
-            Err(invalid("RFCOMM channel", &value.to_string()))
+            Err(invalid(
+                BluetoothParameterKind::RfcommChannel,
+                value.to_string(),
+            ))
         }
     }
 
@@ -208,6 +281,55 @@ impl RfcommChannel {
     #[must_use]
     pub const fn get(self) -> u8 {
         self.0
+    }
+}
+
+impl TryFrom<u8> for RfcommChannel {
+    type Error = TransportError;
+
+    /// Validate a channel through [`RfcommChannel::new`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::BluetoothParameter`] outside 1 through 30.
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<RfcommChannel> for u8 {
+    fn from(value: RfcommChannel) -> Self {
+        value.get()
+    }
+}
+
+impl fmt::Display for RfcommChannel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, formatter)
+    }
+}
+
+impl fmt::Binary for RfcommChannel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Binary::fmt(&self.0, formatter)
+    }
+}
+
+impl fmt::Octal for RfcommChannel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Octal::fmt(&self.0, formatter)
+    }
+}
+
+impl fmt::LowerHex for RfcommChannel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::LowerHex::fmt(&self.0, formatter)
+    }
+}
+
+impl fmt::UpperHex for RfcommChannel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::UpperHex::fmt(&self.0, formatter)
     }
 }
 
@@ -253,10 +375,10 @@ impl PairedBluetoothDevice {
     }
 }
 
-fn invalid(parameter: &'static str, value: &str) -> TransportError {
+fn invalid(parameter: BluetoothParameterKind, value: impl Into<String>) -> TransportError {
     TransportError::BluetoothParameter {
         parameter,
-        value: value.to_owned(),
+        value: value.into(),
     }
 }
 
@@ -283,26 +405,28 @@ mod tests {
             assert!(matches!(
                 value.parse::<BluetoothAddress>(),
                 Err(TransportError::BluetoothParameter {
-                    parameter: "address",
+                    parameter: BluetoothParameterKind::Address,
                     ..
                 })
             ));
         }
         assert_eq!(expected.to_string(), "AA-BB-CC-DD-EE-FF");
+        assert_eq!(AsRef::<str>::as_ref(&expected), expected.as_str());
         Ok(())
     }
 
     #[test]
     fn channels_cover_the_entire_byte_domain_and_names_cannot_hide_addresses() -> TestResult {
         for value in u8::MIN..=u8::MAX {
-            let channel = RfcommChannel::new(value);
+            let channel = RfcommChannel::try_from(value);
             if (1..=30).contains(&value) {
-                assert_eq!(channel?.get(), value);
+                let channel = channel?;
+                assert_eq!(u8::from(channel), value);
             } else {
                 assert!(matches!(
                     channel,
                     Err(TransportError::BluetoothParameter {
-                        parameter: "RFCOMM channel",
+                        parameter: BluetoothParameterKind::RfcommChannel,
                         ..
                     })
                 ));
@@ -311,11 +435,14 @@ mod tests {
         for value in ["", "AA-BB-CC-DD-EE-FF", "Radio\0name", "Radio\nname"] {
             assert!(BluetoothDeviceName::new(value).is_err());
         }
-        assert!(BluetoothDeviceName::new(&"a".repeat(1025)).is_err());
+        assert!(BluetoothDeviceName::new("a".repeat(1025)).is_err());
         assert_eq!(
             BluetoothDeviceName::new("Field 日本")?.as_str(),
             "Field 日本"
         );
+        let name: BluetoothDeviceName = "Field 日本".parse()?;
+        assert_eq!(name.as_ref(), "Field 日本");
+        assert_eq!(name.to_string(), "Field 日本");
         Ok(())
     }
 

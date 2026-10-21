@@ -152,6 +152,11 @@ impl SerialTransport {
     /// Returns [`TransportError::Open`] when no Tokio runtime is active, the
     /// endpoint cannot be opened, or an explicit modem-line request fails.
     /// Operating-system error kinds and messages are preserved.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an endpoint opens successfully inside a Tokio runtime whose
+    /// I/O driver is disabled. Enable I/O when constructing the runtime.
     pub fn open(path: &str, options: SerialOptions) -> Result<Self, TransportError> {
         if tokio::runtime::Handle::try_current().is_err() {
             return Err(open_error(
@@ -225,22 +230,13 @@ impl Transport for SerialTransport {
 
     /// Apply a nonzero baud rate without changing the endpoint identity.
     ///
-    /// Closed access returns [`TransportError::Disconnected`]. Zero or an OS
+    /// Closed access returns [`TransportError::Disconnected`]. An OS
     /// failure returns [`TransportError::Open`], retaining the last successful
     /// rate. This synchronous host call has no intrinsic deadline.
-    fn set_baud_rate(&mut self, baud: u32) -> Result<(), TransportError> {
+    fn set_baud_rate(&mut self, baud: NonZeroU32) -> Result<(), TransportError> {
         let path = self.path.clone();
         let previous_baud = self.baud;
         let port = self.port_mut()?;
-        let baud = NonZeroU32::new(baud).ok_or_else(|| {
-            open_error(
-                &path,
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "serial baud rate must be nonzero",
-                ),
-            )
-        })?;
         tracing::debug!(path, %previous_baud, %baud, "serial baud change requested");
         port.set_baud_rate(baud.get())
             .map_err(|error| open_error(&path, error))?;
@@ -649,7 +645,7 @@ mod tests {
         for result in [
             transport.write(b"abc").await,
             transport.read(&mut buffer).await.map(|_| ()),
-            transport.set_baud_rate(9_600),
+            transport.set_baud_rate(TEST_BAUD),
         ] {
             assert!(
                 matches!(result, Err(TransportError::Disconnected(error)) if error.kind() == std::io::ErrorKind::NotConnected)
@@ -666,7 +662,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn pseudo_terminal_exchanges_bytes_and_rejects_zero_baud() -> TestResult {
+    async fn pseudo_terminal_exchanges_bytes_after_read_cancellation() -> TestResult {
         let (port, mut peer) = SerialStream::pair()?;
         let mut transport = SerialTransport {
             port: Some(port),
@@ -680,10 +676,15 @@ mod tests {
             let received_count = peer.read_exact(&mut received).await?;
             assert_eq!(received_count, received.len());
             assert_eq!(received, *b"abc");
-            assert!(tokio::time::timeout(
-                std::time::Duration::from_millis(1),
-                transport.read(&mut received),
-            ).await.is_err(), "PTY read completed without a peer reply");
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(1),
+                    transport.read(&mut received),
+                )
+                .await
+                .is_err(),
+                "PTY read completed without a peer reply"
+            );
             peer.write_all(b"xyz").await?;
             let mut total = 0;
             while total < received.len() {
@@ -693,13 +694,12 @@ mod tests {
                 total += count;
             }
             assert_eq!(received, *b"xyz");
-            let result = transport.set_baud_rate(0);
-            assert!(matches!(result, Err(TransportError::Open { path, source }) if path == "owned-test-pty" && source.kind() == std::io::ErrorKind::InvalidInput));
             assert_eq!(transport.baud, TEST_BAUD);
             transport.close().await?;
             assert!(transport.port.is_none());
             Ok::<(), Box<dyn std::error::Error>>(())
-        }).await??;
+        })
+        .await??;
         Ok(())
     }
 }

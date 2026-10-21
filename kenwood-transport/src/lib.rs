@@ -1,5 +1,14 @@
 #![doc = include_str!("../README.md")]
 
+use std::future::Future;
+use std::num::NonZeroU32;
+
+pub use error::TransportError;
+pub use mock::MockTransport;
+#[cfg(feature = "serial")]
+pub use serial::SerialTransport;
+pub use stream::{StreamAdapter, StreamRecoveryError};
+
 #[cfg(feature = "native-bluetooth")]
 pub mod bluetooth;
 pub mod error;
@@ -7,14 +16,6 @@ pub mod mock;
 #[cfg(feature = "serial")]
 pub mod serial;
 pub mod stream;
-
-use std::future::Future;
-
-pub use error::TransportError;
-pub use mock::MockTransport;
-#[cfg(feature = "serial")]
-pub use serial::SerialTransport;
-pub use stream::{StreamAdapter, StreamRecoveryError};
 
 /// An asynchronous, exclusively owned byte connection.
 ///
@@ -27,6 +28,11 @@ pub use stream::{StreamAdapter, StreamRecoveryError};
 /// preserve operation and cleanup errors separately, and consult the concrete
 /// backend before canceling an operation or treating a closed connection as
 /// fully released.
+///
+/// Implement this trait for application-specific byte connections. It uses
+/// statically dispatched futures, so it is intended for generic bounds rather
+/// than trait objects. The [crate examples](crate) show mock exchanges and the
+/// Tokio stream adapter.
 pub trait Transport: Send + Sync {
     /// Submit all supplied bytes according to the backend's completion contract.
     ///
@@ -85,6 +91,8 @@ pub trait Transport: Send + Sync {
     /// Returns [`TransportError::Read`] for a backend read failure, or an
     /// implementation-specific connection error. Previously returned bytes
     /// remain the caller's responsibility after an error.
+    /// A mock reports [`std::io::ErrorKind::InvalidInput`] when its scripted
+    /// delay exceeds the monotonic clock's representable range.
     fn read(
         &mut self,
         buf: &mut [u8],
@@ -124,10 +132,20 @@ pub trait Transport: Send + Sync {
     /// # Errors
     ///
     /// The serial backend returns [`TransportError::Open`] if the baud rate
-    /// is zero or cannot be applied, and [`TransportError::Disconnected`] if
+    /// cannot be applied, and [`TransportError::Disconnected`] if
     /// its descriptor is closed. The default implementation always succeeds;
     /// other implementations define their own errors.
-    fn set_baud_rate(&mut self, _baud: u32) -> Result<(), TransportError> {
+    ///
+    /// # Examples
+    ///
+    /// Zero cannot cross the transport boundary:
+    ///
+    /// ```compile_fail
+    /// use kenwood_transport::{MockTransport, Transport};
+    /// let mut transport = MockTransport::new();
+    /// let _result = transport.set_baud_rate(0);
+    /// ```
+    fn set_baud_rate(&mut self, _baud: NonZeroU32) -> Result<(), TransportError> {
         Ok(())
     }
 

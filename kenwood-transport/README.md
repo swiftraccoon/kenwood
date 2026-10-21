@@ -27,6 +27,12 @@ selection and lifecycle policy. All examples marked `rust` execute offline as
 doctests. The serial/native opening examples are `no_run`: they compile but
 must not be run without a deliberately selected endpoint.
 
+Baud changes use `std::num::NonZeroU32`, matching `SerialOptions::baud`.
+Construct the value before passing it through model, capture or FFI adapters;
+zero is rejected before transport I/O. Bluetooth parameter errors identify the
+invalid address, display name or channel through
+`error::BluetoothParameterKind`.
+
 ## Completion and ownership
 
 Transport success is a host-side observation, not command acceptance by a
@@ -109,9 +115,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 Recovering the transport does not close or reopen it, and it does not restore
 any device mode. If the pump fails, `StreamRecoveryError::into_parts` returns
-the failure's reconstructed `io::ErrorKind` and display text and, when available,
-the owned transport. It does not preserve the original typed source/downcast
-identity. The `StreamRecoveryError` rustdoc includes an executable EOF example
+the failure's `io::ErrorKind`, display text and original typed source chain and,
+when available, the owned transport. Repeated I/O errors share the original
+failure; traverse `std::error::Error::source` to inspect its causes.
+The `StreamRecoveryError` rustdoc includes an executable EOF example
 that retains the operation error while closing the recovered mock separately.
 A pump-task panic cannot retain that ownership.
 
@@ -241,8 +248,11 @@ Native `close` performs synchronous teardown in one poll despite its async
 signature: a 600 ms graceful window plus, when needed, 100 ms of synchronous
 reap checking. OS calls and scheduling are not a real-time guarantee. A Tokio
 timeout cannot interrupt that poll, and another task on the same single-thread
-executor cannot run during it. Drop can perform the same work. Close retains
-its first outcome, including errors; repeated calls cannot turn an uncertain
+executor cannot run during it. Drop transfers the helper, pipes and exclusive
+lease to a retirement worker without waiting for helper exit. If a worker cannot
+start, it kills the helper and retains the lease for later nonblocking reap
+checks. Cancelled writes use the same transfer and retain `ReapPending` as their
+cleanup outcome. Close retains its first outcome, including errors; repeated calls cannot turn an uncertain
 cleanup into a confirmed close. Unconfirmed native closure, an unsuccessful
 helper exit, forced termination and pending reaping all leave the channel
 possibly open. Await close explicitly and retain its independent result;

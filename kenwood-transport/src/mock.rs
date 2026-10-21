@@ -6,8 +6,10 @@
 //! caller-owned recovery policy. The mock models no descriptor lifecycle:
 //! close and reopen change only the script.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::path::Path;
+use std::time::Duration;
 
 use crate::error::TransportError;
 
@@ -18,10 +20,10 @@ use super::Transport;
 enum MockRead {
     /// Deliver these bytes.
     Data(Vec<u8>),
-    /// Sleep for the given milliseconds, then deliver these bytes.
+    /// Wait for the given duration, then deliver these bytes.
     /// Models a response with real wire latency (needed when the
     /// consumer correlates a response to a write it must make first).
-    Delayed(Vec<u8>, u64),
+    Delayed { bytes: Vec<u8>, delay: Duration },
     /// Return `Ok(0)`: transport EOF (device unplugged / port closed).
     Eof,
     /// Never resolve: a wedged link. Pair with a timeout in the test.
@@ -46,6 +48,7 @@ enum MockRead {
 /// exchanges and reopen results. It does not track a closed/open descriptor
 /// state: later writes need no preceding reopen. Reopen consumes its separate
 /// result script and otherwise succeeds.
+/// The [crate example](crate#script-an-exchange) shows an exact exchange.
 #[derive(Debug)]
 pub struct MockTransport {
     exchanges: VecDeque<(Vec<u8>, Vec<MockRead>)>,
@@ -93,13 +96,19 @@ impl MockTransport {
     /// is smaller than the response. An empty `response` means
     /// "expect the write, queue nothing" (use [`Self::expect_eof`] to
     /// model a disconnect instead).
-    pub fn expect(&mut self, command: &[u8], response: &[u8]) {
+    pub fn expect<'input>(
+        &mut self,
+        command: impl Into<Cow<'input, [u8]>>,
+        response: impl Into<Cow<'input, [u8]>>,
+    ) {
+        let response = response.into();
         let reads = if response.is_empty() {
             Vec::new()
         } else {
-            vec![MockRead::Data(response.to_vec())]
+            vec![MockRead::Data(response.into_owned())]
         };
-        self.exchanges.push_back((command.to_vec(), reads));
+        self.exchanges
+            .push_back((command.into().into_owned(), reads));
     }
 
     /// Queue an expected command followed by several read chunks,
@@ -107,37 +116,43 @@ impl MockTransport {
     /// splits a chunk across reads without dropping its suffix.
     ///
     /// Models unsolicited traffic arriving on the stream before the expected
-    /// response.
-    pub fn expect_reads(&mut self, command: &[u8], responses: &[&[u8]]) {
-        let reads = responses
-            .iter()
-            .map(|r| MockRead::Data(r.to_vec()))
-            .collect();
-        self.exchanges.push_back((command.to_vec(), reads));
+    /// response. The iterator transfers each chunk's allocation into the script.
+    pub fn expect_reads<'input, B: Into<Cow<'input, [u8]>>>(
+        &mut self,
+        command: B,
+        responses: impl IntoIterator<Item = Vec<u8>>,
+    ) {
+        let reads = responses.into_iter().map(MockRead::Data).collect();
+        self.exchanges
+            .push_back((command.into().into_owned(), reads));
     }
 
     /// Queue an expected command whose next `read()` reports EOF
     /// (`Ok(0)`), i.e. the device disappeared mid-command.
-    pub fn expect_eof(&mut self, command: &[u8]) {
+    pub fn expect_eof<'input, B: Into<Cow<'input, [u8]>>>(&mut self, command: B) {
         self.exchanges
-            .push_back((command.to_vec(), vec![MockRead::Eof]));
+            .push_back((command.into().into_owned(), vec![MockRead::Eof]));
     }
 
     /// Queue an expected command whose `read()` never resolves, i.e. a
     /// wedged link. The caller's timeout machinery must fire.
-    pub fn expect_hang(&mut self, command: &[u8]) {
+    pub fn expect_hang<'input, B: Into<Cow<'input, [u8]>>>(&mut self, command: B) {
         self.exchanges
-            .push_back((command.to_vec(), vec![MockRead::Hang]));
+            .push_back((command.into().into_owned(), vec![MockRead::Hang]));
     }
 
     /// Queue an expected command whose response begins with `partial` and
     /// then never completes.
     ///
     /// Models a truncated frame on a live but wedged transport.
-    pub fn expect_partial_then_hang(&mut self, command: &[u8], partial: &[u8]) {
+    pub fn expect_partial_then_hang<'input>(
+        &mut self,
+        command: impl Into<Cow<'input, [u8]>>,
+        partial: impl Into<Cow<'input, [u8]>>,
+    ) {
         self.exchanges.push_back((
-            command.to_vec(),
-            vec![MockRead::Data(partial.to_vec()), MockRead::Hang],
+            command.into().into_owned(),
+            vec![MockRead::Data(partial.into().into_owned()), MockRead::Hang],
         ));
     }
 
@@ -146,18 +161,18 @@ impl MockTransport {
     ///
     /// Models a truncated exchange whose delayed tail can be mistaken for a
     /// later command's response.
-    pub fn expect_partial_then_hang_with_late(
+    pub fn expect_partial_then_hang_with_late<'input>(
         &mut self,
-        command: &[u8],
-        partial: &[u8],
-        late: &[u8],
+        command: impl Into<Cow<'input, [u8]>>,
+        partial: impl Into<Cow<'input, [u8]>>,
+        late: impl Into<Cow<'input, [u8]>>,
     ) {
         self.exchanges.push_back((
-            command.to_vec(),
+            command.into().into_owned(),
             vec![
-                MockRead::Data(partial.to_vec()),
+                MockRead::Data(partial.into().into_owned()),
                 MockRead::Hang,
-                MockRead::Data(late.to_vec()),
+                MockRead::Data(late.into().into_owned()),
             ],
         ));
     }
@@ -180,7 +195,7 @@ impl MockTransport {
     ///
     /// Returns an error if the file cannot be read as UTF-8. Malformed fixture
     /// records do not return an error.
-    pub fn from_fixture(path: &Path) -> Result<Self, std::io::Error> {
+    pub fn from_fixture(path: impl AsRef<Path>) -> Result<Self, std::io::Error> {
         let content = std::fs::read_to_string(path)?;
         let mut mock = Self::new();
         let mut current_command: Option<Vec<u8>> = None;
@@ -206,16 +221,23 @@ impl MockTransport {
     /// Useful for unsolicited incoming data and stale late responses.
     /// Multiple calls queue multiple chunks in call order. A small read buffer
     /// splits a chunk across calls while retaining its suffix.
-    pub fn queue_read(&mut self, data: &[u8]) {
-        self.pending.push_back(MockRead::Data(data.to_vec()));
+    pub fn queue_read<'input, B: Into<Cow<'input, [u8]>>>(&mut self, data: B) {
+        self.pending
+            .push_back(MockRead::Data(data.into().into_owned()));
     }
 
     /// Queue data delivered by a subsequent `read()` only after the
     /// given delay. Models wire latency so the consumer can perform
     /// the write this data responds to before it arrives.
-    pub fn queue_read_delayed(&mut self, data: &[u8], delay_ms: u64) {
-        self.pending
-            .push_back(MockRead::Delayed(data.to_vec(), delay_ms));
+    pub fn queue_read_delayed<'input, B: Into<Cow<'input, [u8]>>>(
+        &mut self,
+        data: B,
+        delay: Duration,
+    ) {
+        self.pending.push_back(MockRead::Delayed {
+            bytes: data.into().into_owned(),
+            delay,
+        });
     }
 
     /// Accept otherwise-unscripted subsequent `write()` calls without
@@ -365,15 +387,20 @@ impl Transport for MockTransport {
         // for a Delayed entry BEFORE popping it, and measure the
         // delay from its first attempt so cancelled reads still make
         // progress toward delivery.
-        if let Some(MockRead::Delayed(_, delay_ms)) = self.pending.front() {
-            let delay = std::time::Duration::from_millis(*delay_ms);
+        if let Some(MockRead::Delayed { delay, .. }) = self.pending.front() {
+            let delay = *delay;
             let started = *self
                 .delay_started
                 .get_or_insert_with(tokio::time::Instant::now);
-            let deadline = started + delay;
+            let deadline = started.checked_add(delay).ok_or_else(|| {
+                TransportError::Read(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "mock response delay exceeds the monotonic clock range",
+                ))
+            })?;
             tokio::time::sleep_until(deadline).await;
             self.delay_started = None;
-            if let Some(MockRead::Delayed(data, _)) = self.pending.pop_front() {
+            if let Some(MockRead::Delayed { bytes: data, .. }) = self.pending.pop_front() {
                 let len = self.deliver_data(&data, buf)?;
                 tracing::debug!(bytes = len, "mock: delayed read");
                 return Ok(len);
@@ -395,7 +422,7 @@ impl Transport for MockTransport {
                 tracing::debug!(bytes = len, "mock: read");
                 Ok(len)
             }
-            MockRead::Delayed(..) => {
+            MockRead::Delayed { .. } => {
                 // Handled above via the peek path; unreachable here.
                 Ok(0)
             }
@@ -416,6 +443,7 @@ impl Transport for MockTransport {
         // scripted future exchanges survive: they model traffic the
         // test expects after a reopen (reconnect flows close first).
         self.pending.clear();
+        self.delay_started = None;
         Ok(())
     }
 
@@ -446,6 +474,31 @@ mod tests {
         let mut buf = [0u8; 64];
         let n = mock.read(&mut buf).await?;
         assert_eq!(read_prefix(&buf, n)?, b"ID TH-D75\r");
+        mock.assert_complete();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn streamed_owned_chunks_preserve_allocations_and_fifo_tails() -> TestResult {
+        let command = b"ID\r".to_vec();
+        let response = b"ID TH-D75\r".to_vec();
+        let command_address = command.as_ptr();
+        let response_address = response.as_ptr();
+        let mut mock = MockTransport::new();
+        mock.expect_reads(command, std::iter::once(response));
+        let (queued_command, chunks) = mock.exchanges.front().ok_or("missing exchange")?;
+        assert_eq!(queued_command.as_ptr(), command_address);
+        let Some(MockRead::Data(chunk)) = chunks.first() else {
+            return Err("missing owned response".into());
+        };
+        assert_eq!(chunk.as_ptr(), response_address);
+        mock.write(b"ID\r").await?;
+        let mut bytes = [0; 3];
+        assert_eq!(mock.read(&mut bytes).await?, 3);
+        assert_eq!(&bytes, b"ID ");
+        let mut tail = [0; 16];
+        let count = mock.read(&mut tail).await?;
+        assert_eq!(read_prefix(&tail, count)?, b"TH-D75\r");
         mock.assert_complete();
         Ok(())
     }
@@ -541,13 +594,32 @@ mod tests {
     #[tokio::test]
     async fn delayed_reads_preserve_their_unread_suffix() -> TestResult {
         let mut mock = MockTransport::new();
-        mock.queue_read_delayed(b"abcd", 0);
+        mock.queue_read_delayed(b"abcd", Duration::ZERO);
         let mut buf = [0u8; 3];
 
         let first = mock.read(&mut buf).await?;
         assert_eq!(read_prefix(&buf, first)?, b"abc");
         let second = mock.read(&mut buf).await?;
         assert_eq!(read_prefix(&buf, second)?, b"d");
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_discards_the_canceled_reads_delay_clock() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.queue_read_delayed(b"old", Duration::from_millis(100));
+        let mut buffer = [0_u8; 3];
+        let result = tokio::time::timeout(Duration::from_millis(40), mock.read(&mut buffer)).await;
+        assert!(result.is_err(), "the old response arrived before its delay");
+        mock.close().await?;
+        mock.queue_read_delayed(b"new", Duration::from_millis(100));
+
+        let started = tokio::time::Instant::now();
+        let count = mock.read(&mut buffer).await?;
+        assert_eq!(count, buffer.len());
+        assert_eq!(&buffer, b"new");
+        assert_eq!(started.elapsed(), Duration::from_millis(100));
+        mock.assert_complete();
         Ok(())
     }
 

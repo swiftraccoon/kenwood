@@ -83,23 +83,34 @@ const READ_CHANNEL_CAPACITY: usize = 64;
 /// [`Transport::read`] call.
 const READ_CHUNK_SIZE: usize = 512;
 
-/// Cloneable description of a terminal I/O failure.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Shared terminal I/O failure, including its original source chain.
+#[derive(Debug, Clone)]
 struct IoFailure {
-    kind: io::ErrorKind,
-    message: Arc<str>,
+    source: Arc<io::Error>,
 }
 
 impl IoFailure {
-    fn from_error(error: &io::Error) -> Self {
+    fn from_error(error: io::Error) -> Self {
         Self {
-            kind: error.kind(),
-            message: Arc::from(error.to_string()),
+            source: Arc::new(error),
         }
     }
 
     fn to_error(&self) -> io::Error {
-        io::Error::new(self.kind, self.message.to_string())
+        io::Error::new(self.source.kind(), self.clone())
+    }
+}
+
+impl std::fmt::Display for IoFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.source, formatter)
+    }
+}
+
+impl std::error::Error for IoFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        let original: &(dyn std::error::Error + 'static) = self.source.as_ref();
+        Some(self.source.get_ref().map_or(original, |cause| cause))
     }
 }
 
@@ -196,9 +207,9 @@ struct PumpExit<T> {
 ///
 /// A transport-level pump failure still leaves ownership of the transport in
 /// [`Self::transport`], allowing caller-selected cleanup or recovery while
-/// retaining the failure's [`io::ErrorKind`] and display text. The returned
-/// [`io::Error`] is reconstructed; its original typed source and downcast
-/// identity are not preserved. A pump-task panic cannot preserve `T`
+/// retaining the failure's [`io::ErrorKind`], display text and typed source
+/// chain. Each returned [`io::Error`] wraps the shared original error; callers
+/// can traverse [`std::error::Error::source`] to inspect its causes. A pump-task panic cannot preserve `T`
 /// because unwinding has already dropped it, so `transport` is `None` on that
 /// path.
 ///
@@ -249,10 +260,10 @@ impl<T> StreamRecoveryError<T> {
         self.transport.as_ref()
     }
 
-    /// Separate the recoverable transport from the reconstructed I/O failure.
+    /// Separate the recoverable transport from the shared I/O failure.
     ///
-    /// The error retains its kind and display text, not its original typed
-    /// source chain. `None` means the pump task panicked and `T` was dropped
+    /// The error retains its kind, display text and original typed source
+    /// chain. `None` means the pump task panicked and `T` was dropped
     /// during unwinding.
     #[must_use]
     pub fn into_parts(self) -> (Option<T>, io::Error) {
@@ -448,7 +459,7 @@ impl<T: Transport + 'static> StreamAdapter<T> {
             };
             match pump.await {
                 Ok(exit) => Ok(exit),
-                Err(join_error) => Err(pump_join_failure(&join_error)),
+                Err(join_error) => Err(pump_join_failure(join_error)),
             }
         };
 
@@ -522,7 +533,7 @@ impl<T: Transport + 'static> StreamAdapter<T> {
             let result = match Pin::new(pump).poll(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Ok(exit)) => Ok(exit),
-                Poll::Ready(Err(join_error)) => Err(pump_join_failure(&join_error)),
+                Poll::Ready(Err(join_error)) => Err(pump_join_failure(join_error)),
             };
             drop(self.pump.take());
             self.pump_result = Some(result);
@@ -542,10 +553,8 @@ impl<T: Transport + 'static> StreamAdapter<T> {
     }
 }
 
-fn pump_join_failure(error: &tokio::task::JoinError) -> IoFailure {
-    IoFailure::from_error(&io::Error::other(format!(
-        "StreamAdapter: pump task failed: {error}"
-    )))
+fn pump_join_failure(error: tokio::task::JoinError) -> IoFailure {
+    IoFailure::from_error(io::Error::other(error))
 }
 
 /// Convert a [`TransportError`] to [`io::Error`] for the tokio traits.
@@ -554,29 +563,25 @@ fn transport_err_to_io(err: TransportError) -> io::Error {
         TransportError::Disconnected(e) => io::Error::new(io::ErrorKind::BrokenPipe, e),
         TransportError::Read(e) | TransportError::Write(e) => e,
         TransportError::NotFound => io::Error::new(io::ErrorKind::NotFound, "device not found"),
-        TransportError::Open { path, source } => {
-            io::Error::new(source.kind(), format!("failed to open {path}: {source}"))
+        error @ (TransportError::Open { .. } | TransportError::BluetoothHelper { .. }) => {
+            let kind = match &error {
+                TransportError::Open { source, .. }
+                | TransportError::BluetoothHelper { source, .. } => source.kind(),
+                _ => unreachable!("opening errors have an I/O source"),
+            };
+            io::Error::new(kind, error)
         }
-        TransportError::BluetoothHelper { context, source } => io::Error::new(
-            source.kind(),
-            format!("Bluetooth helper failed during {context}: {source}"),
-        ),
         error @ (TransportError::BluetoothDeviceNameAmbiguous
         | TransportError::BluetoothParameter { .. }) => {
-            io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
+            io::Error::new(io::ErrorKind::InvalidInput, error)
         }
         error @ TransportError::BluetoothOpenInterrupted => {
-            io::Error::new(io::ErrorKind::Interrupted, error.to_string())
+            io::Error::new(io::ErrorKind::Interrupted, error)
         }
         error @ (TransportError::BluetoothClose { .. }
         | TransportError::BluetoothOpen { .. }
         | TransportError::BluetoothOpenWithCleanup { .. }) => io::Error::other(error),
-        TransportError::BrokerUnavailable => {
-            io::Error::new(io::ErrorKind::BrokenPipe, "transport broker unavailable")
-        }
-        e @ (TransportError::ReopenUnsupported | TransportError::WrongThread) => {
-            io::Error::new(io::ErrorKind::Unsupported, e.to_string())
-        }
+        e @ TransportError::ReopenUnsupported => io::Error::new(io::ErrorKind::Unsupported, e),
     }
 }
 
@@ -651,7 +656,7 @@ fn handle_read_result(
                 "transport read returned EOF; pump exiting"
             );
             let error = io::Error::new(io::ErrorKind::UnexpectedEof, "transport EOF");
-            terminal_read_failure(terminal_failure, &error)
+            terminal_read_failure(terminal_failure, error)
         }
         Ok(n) => {
             let Some(slice) = scratch.get(..n) else {
@@ -668,7 +673,7 @@ fn handle_read_result(
                     cap = READ_CHUNK_SIZE,
                     "transport read reported impossible length; pump exiting"
                 );
-                return terminal_read_failure(terminal_failure, &error);
+                return terminal_read_failure(terminal_failure, error);
             };
             match read_tx.try_send(slice.to_vec()) {
                 Ok(()) => PumpAction::Continue(None),
@@ -689,12 +694,12 @@ fn handle_read_result(
                 "transport read failed; pump exiting"
             );
             let error = transport_err_to_io(error);
-            terminal_read_failure(terminal_failure, &error)
+            terminal_read_failure(terminal_failure, error)
         }
     }
 }
 
-fn terminal_read_failure(terminal_failure: &TerminalFailure, error: &io::Error) -> PumpAction {
+fn terminal_read_failure(terminal_failure: &TerminalFailure, error: io::Error) -> PumpAction {
     let failure = IoFailure::from_error(error);
     store_terminal_failure(terminal_failure, &failure);
     PumpAction::Exit(Some(failure))
@@ -773,7 +778,7 @@ async fn perform_write<T: Transport>(
                 "transport write failed; pump task exiting"
             );
             let error = transport_err_to_io(error);
-            let failure = IoFailure::from_error(&error);
+            let failure = IoFailure::from_error(error);
             store_terminal_failure(terminal_failure, &failure);
             drop(completion.send(Err(failure.clone())));
             Err(failure)
@@ -945,6 +950,10 @@ mod tests {
         }
     }
 
+    #[derive(Debug, thiserror::Error)]
+    #[error("deliberate transport write failure")]
+    struct WriteFailureMarker;
+
     #[derive(Debug)]
     struct FailingWriteTransport;
 
@@ -952,7 +961,7 @@ mod tests {
         async fn write(&mut self, _data: &[u8]) -> Result<(), TransportError> {
             Err(TransportError::Write(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "deliberate transport write failure",
+                WriteFailureMarker,
             )))
         }
 
@@ -995,6 +1004,17 @@ mod tests {
         }
     }
 
+    fn find_source<'a, T: std::error::Error + 'static>(
+        mut error: &'a (dyn std::error::Error + 'static),
+    ) -> Option<&'a T> {
+        loop {
+            if let Some(typed) = error.downcast_ref() {
+                return Some(typed);
+            }
+            error = error.source()?;
+        }
+    }
+
     fn assert_write_error(error: &io::Error) {
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert!(
@@ -1003,14 +1023,19 @@ mod tests {
                 .contains("deliberate transport write failure"),
             "transport error text was not preserved: {error}",
         );
+        assert!(
+            find_source::<WriteFailureMarker>(error).is_some(),
+            "the original typed write failure was lost: {error:?}",
+        );
     }
 
     #[test]
     fn bluetooth_helper_error_keeps_io_kind_and_context() {
-        let error = transport_err_to_io(TransportError::BluetoothHelper {
+        let error = IoFailure::from_error(transport_err_to_io(TransportError::BluetoothHelper {
             context: "launching /Applications/AzimuthBluetoothHelper".to_owned(),
             source: io::Error::new(io::ErrorKind::PermissionDenied, "sandbox denied exec"),
-        });
+        }))
+        .to_error();
 
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert!(
@@ -1018,8 +1043,13 @@ mod tests {
             "helper context was not preserved: {error}"
         );
         assert!(
-            error.to_string().contains("sandbox denied exec"),
-            "helper I/O failure was not preserved: {error}"
+            matches!(
+                find_source::<TransportError>(&error),
+                Some(TransportError::BluetoothHelper { source, .. })
+                    if source.kind() == io::ErrorKind::PermissionDenied
+                        && source.to_string() == "sandbox denied exec"
+            ),
+            "helper I/O source was not preserved: {error:?}"
         );
     }
 
@@ -1094,7 +1124,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn outgoing_write_cancels_a_read_without_restarting_its_delay() -> TestResult {
         let mut mock = MockTransport::new();
-        mock.queue_read_delayed(b"ready", 100);
+        mock.queue_read_delayed(b"ready", Duration::from_millis(100));
         mock.expect(b"PING\r", b"");
         mock.pend_when_empty();
         let mut adapter = StreamAdapter::new(mock);
