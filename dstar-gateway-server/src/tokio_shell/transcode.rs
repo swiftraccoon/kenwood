@@ -16,9 +16,8 @@
 //!   packet; when transcoding `DCS` → `DPlus`/`DExtra`, the
 //!   endpoint emits a synthetic header frame on the first `DCS`
 //!   packet of a stream and data frames for subsequent packets.
-//! - `DPlus`/`DExtra` → `DCS` requires building a 100-byte DCS
-//!   voice frame for every data packet, with the cached header
-//!   embedded.
+//! - `DPlus`/`DExtra` → `DCS` caches stream-start headers without an
+//!   output packet, then embeds the header in every 100-byte voice/end packet.
 //!
 //! The function is deliberately sans-io: it only touches the
 //! caller-supplied scratch buffer and reads from the caller-supplied
@@ -31,7 +30,7 @@ use std::net::SocketAddr;
 use dstar_gateway_core::EncodeError;
 use dstar_gateway_core::codec::{dcs, dextra, dplus};
 use dstar_gateway_core::header::DstarHeader;
-use dstar_gateway_core::types::{Module, ProtocolKind, StreamId};
+use dstar_gateway_core::types::{FrameSequence, Module, ProtocolKind, StreamId};
 use dstar_gateway_core::voice::VoiceFrame;
 
 /// Broadcast envelope pushed onto the `Reflector`'s cross-protocol
@@ -41,7 +40,7 @@ use dstar_gateway_core::voice::VoiceFrame;
 /// `CrossProtocolEvent`. Every other endpoint subscribes to the
 /// broadcast and re-encodes the event via [`transcode_voice`] in
 /// its own protocol before sending to its module members.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CrossProtocolEvent {
     /// Which protocol the source endpoint speaks.
     pub source_protocol: ProtocolKind,
@@ -64,7 +63,7 @@ pub struct CrossProtocolEvent {
 /// one of these variants for each frame it wants to broadcast to
 /// peers on other protocols. The same variant is re-encoded by
 /// [`transcode_voice`] into each destination protocol's wire format.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VoiceEvent {
     /// Start of a stream. Requires the D-STAR header.
     StreamStart {
@@ -78,7 +77,7 @@ pub enum VoiceEvent {
         /// The stream id.
         stream_id: StreamId,
         /// Frame sequence number.
-        seq: u8,
+        seq: FrameSequence,
         /// 9 bytes AMBE + 3 bytes slow data.
         frame: VoiceFrame,
     },
@@ -87,7 +86,7 @@ pub enum VoiceEvent {
         /// The stream id.
         stream_id: StreamId,
         /// Final seq value.
-        seq: u8,
+        seq: FrameSequence,
     },
 }
 
@@ -98,51 +97,54 @@ pub enum TranscodeError {
     /// Underlying encoder rejected the buffer.
     #[error("encode failed: {0}")]
     Encode(#[from] EncodeError),
-    /// `DCS` encoding requires the header to be cached on every
-    /// frame (including `Frame` and `StreamEnd` variants) because
-    /// every `DCS` voice packet embeds the header. The caller must
-    /// pass `Some` for every `DCS` transcode.
+    /// `DCS` frame/end encoding requires a cached header because every
+    /// combined voice packet embeds it. Stream-start conversion writes nothing.
     #[error("cached header is required for DCS transcoding but was None")]
     MissingCachedHeader,
+    /// The target protocol has no implemented voice encoder.
+    #[error("unsupported transcode target: {0:?}")]
+    UnsupportedProtocol(ProtocolKind),
 }
 
 /// Encode a voice event in the given target protocol's wire format.
 ///
-/// For `DCS`, `cached_header` must be `Some` on stream-start AND on
-/// every subsequent frame (because each `DCS` voice packet embeds
-/// the header). For `DPlus` and `DExtra`, `cached_header` is only
-/// consulted on the header frame itself (and on `StreamEnd` where
-/// the downstream protocol still needs the header for its own
-/// framing on some encoders, currently unused but kept for
-/// symmetry).
+/// For `DCS`, frame/end packets require `cached_header` because the wire packet
+/// embeds it. A stream-start writes nothing and returns zero; the caller caches
+/// that header for subsequent frames. `DPlus` and `DExtra` use `StreamStart`'s header;
+/// their frame and end encoders ignore `cached_header`.
 ///
 /// Returns the number of bytes written into `out`.
+///
+/// ```
+/// use dstar_gateway_core::{FrameSequence, ProtocolKind, StreamId, VoiceFrame};
+/// use dstar_gateway_server::{VoiceEvent, transcode_voice};
+/// let event = VoiceEvent::Frame {
+///     stream_id: StreamId::new(0x1234).ok_or("zero stream")?,
+///     seq: FrameSequence::ZERO, frame: VoiceFrame::silence(),
+/// };
+/// let mut output = [0; 128];
+/// assert_eq!(transcode_voice(ProtocolKind::DPlus, &event, None, &mut output)?, 29);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 ///
 /// # Errors
 ///
 /// - [`TranscodeError::Encode`] wrapping [`EncodeError::BufferTooSmall`]
 ///   if `out` is too small for the chosen target protocol's packet
 ///   size.
-/// - [`TranscodeError::MissingCachedHeader`] if `target == Dcs` and
-///   `cached_header` is `None`.
+/// - [`TranscodeError::MissingCachedHeader`] for a `DCS` frame/end without a cached header.
+/// - [`TranscodeError::UnsupportedProtocol`] for a target without an encoder.
 pub fn transcode_voice(
     target: ProtocolKind,
     event: &VoiceEvent,
     cached_header: Option<&DstarHeader>,
     out: &mut [u8],
 ) -> Result<usize, TranscodeError> {
-    // `ProtocolKind` is `#[non_exhaustive]`; cover every known
-    // variant explicitly and fall through to `BufferTooSmall` with
-    // a zero-byte write for any hypothetical future variant we
-    // don't yet know how to encode.
     match target {
         ProtocolKind::DExtra => transcode_dextra(event, out),
         ProtocolKind::DPlus => transcode_dplus(event, out),
         ProtocolKind::Dcs => transcode_dcs(event, cached_header, out),
-        _ => Err(TranscodeError::Encode(EncodeError::BufferTooSmall {
-            need: 0,
-            have: 0,
-        })),
+        _ => Err(TranscodeError::UnsupportedProtocol(target)),
     }
 }
 
@@ -193,35 +195,22 @@ fn transcode_dcs(
     cached_header: Option<&DstarHeader>,
     out: &mut [u8],
 ) -> Result<usize, TranscodeError> {
-    // DCS is special: every voice packet embeds the header, so
-    // `cached_header` is required for every `VoiceEvent` variant.
-    let header = cached_header.ok_or(TranscodeError::MissingCachedHeader)?;
+    // xlxd/cdcsprotocol.cpp::HandleQueue caches headers and emits packets only
+    // for voice/end frames. Header conversion cannot insert synthetic audio.
     match event {
-        VoiceEvent::StreamStart { stream_id, .. } => {
-            // Build a "first frame" packet. We use silence payload
-            // because the header packet itself on `DCS` doesn't
-            // carry an AMBE frame; the stream starts with a
-            // regular voice frame. The caller that converts a
-            // `StreamStart` into a DCS packet should really follow
-            // it with a real frame; this branch exists so the
-            // transcoder is total over the variant set.
-            let frame = VoiceFrame::silence();
-            let n = dcs::encode_voice(out, header, *stream_id, 0, &frame, false)?;
-            Ok(n)
-        }
+        VoiceEvent::StreamStart { .. } => Ok(0),
         VoiceEvent::Frame {
             stream_id,
             seq,
             frame,
         } => {
+            let header = cached_header.ok_or(TranscodeError::MissingCachedHeader)?;
             let n = dcs::encode_voice(out, header, *stream_id, *seq, frame, false)?;
             Ok(n)
         }
         VoiceEvent::StreamEnd { stream_id, seq } => {
-            // DCS EOT is signaled in the slow_data bytes; the
-            // encoder handles that when `is_end = true`. We pass a
-            // silence frame because the EOT packet's AMBE payload
-            // is conventionally silence.
+            let header = cached_header.ok_or(TranscodeError::MissingCachedHeader)?;
+            // The encoder sets the sequence byte's 0x40 end bit.
             let frame = VoiceFrame::silence();
             let n = dcs::encode_voice(out, header, *stream_id, *seq, &frame, true)?;
             Ok(n)
@@ -243,9 +232,7 @@ mod tests {
 
     fn test_header() -> DstarHeader {
         DstarHeader {
-            flag1: 0,
-            flag2: 0,
-            flag3: 0,
+            flags: dstar_gateway_core::header::HeaderFlags::from_bytes([0; 3]),
             rpt2: Callsign::from_wire_bytes(*b"REF030 G"),
             rpt1: Callsign::from_wire_bytes(*b"REF030 C"),
             ur_call: Callsign::from_wire_bytes(*b"CQCQCQ  "),
@@ -286,7 +273,7 @@ mod tests {
     fn transcode_dplus_to_dcs_requires_cached_header() {
         let event = VoiceEvent::Frame {
             stream_id: sid(),
-            seq: 3,
+            seq: const { FrameSequence::new(3).unwrap() },
             frame: test_frame(),
         };
         let mut out = [0u8; 128];
@@ -302,7 +289,7 @@ mod tests {
         let frame = test_frame();
         let event = VoiceEvent::Frame {
             stream_id: sid(),
-            seq: 5,
+            seq: const { FrameSequence::new(5).unwrap() },
             frame,
         };
         let mut out = [0u8; 128];
@@ -322,7 +309,7 @@ mod tests {
         let frame = test_frame();
         let event = VoiceEvent::Frame {
             stream_id: sid(),
-            seq: 7,
+            seq: const { FrameSequence::new(7).unwrap() },
             frame,
         };
         let mut out = [0u8; 128];
@@ -341,7 +328,7 @@ mod tests {
         let frame = test_frame();
         let event = VoiceEvent::Frame {
             stream_id: sid(),
-            seq: 4,
+            seq: const { FrameSequence::new(4).unwrap() },
             frame,
         };
         let mut out = [0u8; 128];
@@ -365,7 +352,7 @@ mod tests {
     fn transcode_dextra_eot_has_0x40_bit_set() -> TestResult {
         let event = VoiceEvent::StreamEnd {
             stream_id: sid(),
-            seq: 20,
+            seq: const { FrameSequence::new(20).unwrap() },
         };
         let mut out = [0u8; 128];
         let n = transcode_voice(ProtocolKind::DExtra, &event, None, &mut out)?;
@@ -382,7 +369,7 @@ mod tests {
     fn transcode_buffer_too_small_is_error() {
         let event = VoiceEvent::Frame {
             stream_id: sid(),
-            seq: 1,
+            seq: const { FrameSequence::new(1).unwrap() },
             frame: test_frame(),
         };
         let mut out = [0u8; 4];
@@ -391,5 +378,21 @@ mod tests {
             matches!(result, Err(TranscodeError::Encode(_))),
             "expected Encode error, got {result:?}"
         );
+    }
+
+    #[test]
+    fn dcs_stream_start_writes_no_synthetic_voice_packet() -> TestResult {
+        let mut output = [0xA5; 128];
+        let event = VoiceEvent::StreamStart {
+            header: test_header(),
+            stream_id: sid(),
+        };
+        let length = transcode_voice(ProtocolKind::Dcs, &event, None, &mut output)?;
+        assert_eq!(length, 0, "DCS has no separate header datagram");
+        assert_eq!(
+            output, [0xA5; 128],
+            "header conversion must leave output untouched"
+        );
+        Ok(())
     }
 }

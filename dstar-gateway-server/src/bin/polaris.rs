@@ -28,16 +28,12 @@
 
 use std::collections::HashSet;
 use std::env;
-use std::sync::Arc;
 
-use dstar_gateway_core::types::{Callsign, Module, ProtocolKind};
-use dstar_gateway_server::{AllowAllAuthorizer, Reflector, ReflectorConfig};
+use dstar_gateway_core::types::{Module, ProtocolKind, RoutingCallsign};
+use dstar_gateway_server::{AllowAllAuthorizer, Reflector, ReflectorConfig, ShellError};
 use tracing_subscriber::EnvFilter;
 
 // Workspace deps used elsewhere in the lib but not by this binary.
-#[cfg(test)]
-use proptest as _;
-use thiserror as _;
 #[cfg(test)]
 use trybuild as _;
 
@@ -47,6 +43,28 @@ use trybuild as _;
 /// during a specific diagnosis.
 const DEFAULT_FILTER: &str = "dstar_gateway=debug,dstar_gateway_server=debug,polaris=debug,info";
 
+/// Signal registration and reflector shutdown failures, preserving both causes.
+#[derive(Debug, thiserror::Error)]
+enum RunError {
+    #[error("reflector failed: {0}")]
+    Reflector(#[from] ShellError),
+    #[error("Ctrl-C handler failed: {0}")]
+    Signal(#[source] std::io::Error),
+    #[error("Ctrl-C handler failed ({signal}); reflector shutdown failed ({reflector})")]
+    SignalAndReflector {
+        signal: std::io::Error,
+        reflector: ShellError,
+    },
+}
+
+fn environment_value(name: &str, fallback: &str) -> Result<String, env::VarError> {
+    match env::var(name) {
+        Ok(value) => Ok(value),
+        Err(env::VarError::NotPresent) => Ok(fallback.to_owned()),
+        Err(error) => Err(error),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -55,9 +73,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let bind_str = env::var("POLARIS_BIND").unwrap_or_else(|_| "0.0.0.0:30001".to_string());
-    let callsign_str = env::var("POLARIS_CALLSIGN").unwrap_or_else(|_| "POLARIS".to_string());
-    let modules_str = env::var("POLARIS_MODULES").unwrap_or_else(|_| "ABCD".to_string());
+    let bind_str = environment_value("POLARIS_BIND", "0.0.0.0:30001")?;
+    let callsign_str = environment_value("POLARIS_CALLSIGN", "POLARIS")?;
+    let modules_str = environment_value("POLARIS_MODULES", "ABCD")?;
 
     let mut modules = HashSet::new();
     for ch in modules_str.chars() {
@@ -65,7 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let config = ReflectorConfig::builder()
-        .callsign(Callsign::try_from_str(&callsign_str)?)
+        .callsign(RoutingCallsign::new(&callsign_str)?)
         .module_set(modules)
         .bind(bind_str.parse()?)
         .disable(ProtocolKind::DPlus)
@@ -80,21 +98,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "POLARIS reflector starting"
     );
 
-    let reflector = Arc::new(Reflector::new(config, AllowAllAuthorizer));
-    let reflector_clone = Arc::clone(&reflector);
-
-    let run_task = tokio::spawn(async move { reflector_clone.run().await });
-
+    let reflector = Reflector::new(config, AllowAllAuthorizer);
+    let shutdown = reflector.shutdown_handle();
+    let run = reflector.run();
+    tokio::pin!(run);
     tokio::select! {
-        res = run_task => {
-            match res {
-                Ok(Ok(())) => tracing::info!("reflector exited cleanly"),
-                Ok(Err(e)) => tracing::error!(error = %e, "reflector error"),
-                Err(e) => tracing::error!(error = %e, "reflector task join error"),
+        result = &mut run => result.map_err(RunError::Reflector)?,
+        signal = tokio::signal::ctrl_c() => {
+            shutdown.shutdown();
+            match (signal, run.await) {
+                (Ok(()), Ok(())) => {}
+                (Ok(()), Err(error)) => return Err(RunError::Reflector(error).into()),
+                (Err(error), Ok(())) => return Err(RunError::Signal(error).into()),
+                (Err(signal), Err(reflector)) => return Err(RunError::SignalAndReflector { signal, reflector }.into()),
             }
-        }
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("Ctrl-C received, shutting down");
         }
     }
 

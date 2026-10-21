@@ -1,35 +1,26 @@
 [package]
 name = "dstar-gateway-server"
 version = "0.1.0"
+authors = ["swiftraccoon"]
+categories = ["network-programming"]
 edition = "2024"
+keywords = ["dstar", "ham-radio", "reflector", "amateur-radio"]
+license = "GPL-2.0-or-later"
+publish = false
+readme = "README.md"
+repository = "https://github.com/swiftraccoon/kenwood"
 rust-version = "1.94"
 description = "Multi-client D-STAR reflector server (DPlus, DExtra, DCS)"
-license = "GPL-2.0-or-later"
-authors = ["swiftraccoon"]
-keywords = ["dstar", "ham-radio", "reflector", "amateur-radio"]
-categories = ["network-programming"]
-repository = "https://github.com/swiftraccoon/kenwood"
-readme = "README.md"
-publish = false
 
 [dependencies]
 dstar-gateway-core = { path = "../dstar-gateway-core" }
-tokio = { version = "1", features = [
-  "net",
-  "time",
-  "sync",
-  "macros",
-  "io-util",
-  "rt",
-  "rt-multi-thread",
-  "signal",
-] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", default-features = false, features = [
-  "fmt",
-  "env-filter",
-] }
 thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
+
+[dependencies.tokio]
+features = ["macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"]
+version = "1"
 
 [[bin]]
 name = "polaris"
@@ -37,13 +28,12 @@ path = "src/bin/polaris.rs"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
-tracing-subscriber = { version = "0.3", default-features = false, features = [
-  "fmt",
-  "json",
-  "env-filter",
-] }
-proptest = "1"
 trybuild = "1"
+
+[dev-dependencies.tracing-subscriber]
+default-features = false
+features = ["env-filter", "fmt", "json"]
+version = "0.3"
 
 [lints]
 workspace = true

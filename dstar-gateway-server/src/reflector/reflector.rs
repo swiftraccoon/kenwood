@@ -29,13 +29,40 @@ use crate::tokio_shell::transcode::CrossProtocolEvent;
 
 /// Capacity of the cross-protocol voice broadcast channel.
 ///
-/// A voice stream runs at 20 fps; a 256-slot buffer holds roughly
-/// 12 seconds of traffic per protocol source. If a receiver lags
+/// A voice stream runs at 50 frames/s; 256 slots hold about five seconds
+/// for one source. If a receiver lags
 /// further than that, `broadcast::Receiver::recv` returns
 /// `Err(RecvError::Lagged)` and the subscriber catches up by
 /// skipping to the newest frame, which for voice is the right
 /// behavior (dropping old frames beats stale-audio artifacts).
 const CROSS_PROTOCOL_BUS_CAPACITY: usize = 256;
+
+/// Optional pre-bound sockets, named by the protocol that exclusively drives them.
+#[derive(Debug, Default)]
+pub struct ProtocolSockets {
+    /// `DExtra` socket; `None` binds the configured address.
+    pub dextra: Option<Arc<UdpSocket>>,
+    /// `DPlus` socket; `None` binds the configured address.
+    pub dplus: Option<Arc<UdpSocket>>,
+    /// `DCS` socket; `None` binds the configured address.
+    pub dcs: Option<Arc<UdpSocket>>,
+}
+
+/// Cloneable stop signal for one consuming [`Reflector::run`] invocation.
+///
+/// Calling [`Self::shutdown`] requests shutdown. Awaiting `run` confirms that
+/// every endpoint task has finished and released its task-owned resources.
+#[derive(Debug, Clone)]
+pub struct ShutdownHandle {
+    sender: watch::Sender<bool>,
+}
+
+impl ShutdownHandle {
+    /// Request shutdown, including when called before `run` is first polled.
+    pub fn shutdown(&self) {
+        let _previous = self.sender.send_replace(true);
+    }
+}
 
 /// Multi-protocol multi-client D-STAR reflector.
 ///
@@ -91,25 +118,25 @@ impl Reflector {
     /// ```no_run
     /// use std::collections::HashSet;
     /// use std::sync::Arc;
-    /// use dstar_gateway_core::types::{Callsign, Module, ProtocolKind};
+    /// use dstar_gateway_core::types::{RoutingCallsign, Module, ProtocolKind};
     /// use dstar_gateway_server::{AllowAllAuthorizer, Reflector, ReflectorConfig};
     ///
     /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
     /// let mut modules = HashSet::new();
     /// let _ = modules.insert(Module::try_from_char('C')?);
     /// let config = ReflectorConfig::builder()
-    ///     .callsign(Callsign::try_from_str("REF999")?)
+    ///     .callsign(RoutingCallsign::new("REF999")?)
     ///     .module_set(modules)
     ///     .bind("0.0.0.0:30001".parse()?)
     ///     .disable(ProtocolKind::DPlus)
     ///     .disable(ProtocolKind::Dcs)
     ///     .build()?;
-    /// let reflector = Arc::new(Reflector::new(config, AllowAllAuthorizer));
+    /// let reflector = Reflector::new(config, AllowAllAuthorizer);
     /// reflector.run().await?;
     /// # Ok(()) }
     /// ```
     pub fn new<A: ClientAuthorizer + 'static>(config: ReflectorConfig, authorizer: A) -> Self {
-        Self::new_with_sockets(config, authorizer, None, None, None)
+        Self::new_with_sockets(config, authorizer, ProtocolSockets::default())
     }
 
     /// Construct a reflector with a pre-bound `DExtra` socket.
@@ -123,7 +150,14 @@ impl Reflector {
         authorizer: A,
         socket: Arc<UdpSocket>,
     ) -> Self {
-        Self::new_with_sockets(config, authorizer, Some(socket), None, None)
+        Self::new_with_sockets(
+            config,
+            authorizer,
+            ProtocolSockets {
+                dextra: Some(socket),
+                ..ProtocolSockets::default()
+            },
+        )
     }
 
     /// Construct a reflector with pre-bound sockets for each enabled
@@ -137,27 +171,14 @@ impl Reflector {
     pub fn new_with_sockets<A: ClientAuthorizer + 'static>(
         config: ReflectorConfig,
         authorizer: A,
-        dextra_socket: Option<Arc<UdpSocket>>,
-        dplus_socket: Option<Arc<UdpSocket>>,
-        dcs_socket: Option<Arc<UdpSocket>>,
+        sockets: ProtocolSockets,
     ) -> Self {
-        // `ReflectorConfigBuilder::build` rejects empty module sets,
-        // so `modules` always contains at least one entry in
-        // well-formed configs. The const fallback below is only
-        // reachable if a `ReflectorConfig` is constructed outside
-        // the builder path (which currently isn't possible).
-        const FALLBACK: dstar_gateway_core::types::Module = {
-            match dstar_gateway_core::types::Module::try_from_char('A') {
-                Ok(m) => m,
-                Err(_) => unreachable!(),
-            }
-        };
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let authorizer_arc: Arc<dyn ClientAuthorizer> = Arc::new(authorizer);
         // Pick a deterministic default module from the configured
         // set; the endpoint uses this as the seed `reflector_module`
-        // for every new `ServerSessionCore`. DExtra/DCS sessions
-        // overwrite it from the LINK packet on the wire; DPlus
+        // for DPlus, whose LINK2 carries no module. DExtra/DCS
+        // sessions select their requested configured module; DPlus
         // sessions keep the default because the LINK2 packet doesn't
         // carry a module. Sorted `min` gives stable test behavior.
         let default_module = config
@@ -165,7 +186,7 @@ impl Reflector {
             .iter()
             .min_by_key(|m| m.as_byte())
             .copied()
-            .unwrap_or(FALLBACK);
+            .unwrap_or_else(|| unreachable!("validated configuration contains a module"));
         // Allocate the cross-protocol voice bus iff forwarding is
         // enabled. The receiver side is created by each endpoint
         // via `subscribe()` at spawn time; we only keep the sender.
@@ -221,9 +242,9 @@ impl Reflector {
             dextra,
             dplus,
             dcs,
-            dextra_socket,
-            dplus_socket,
-            dcs_socket,
+            dextra_socket: sockets.dextra,
+            dplus_socket: sockets.dplus,
+            dcs_socket: sockets.dcs,
             voice_bus,
             shutdown_tx,
             shutdown_rx,
@@ -237,7 +258,8 @@ impl Reflector {
     /// `false`; otherwise returns a clone of the broadcast sender
     /// suitable for subscribing a receiver.
     #[must_use]
-    pub fn voice_bus(&self) -> Option<broadcast::Sender<CrossProtocolEvent>> {
+    #[cfg(test)]
+    fn voice_bus(&self) -> Option<broadcast::Sender<CrossProtocolEvent>> {
         self.voice_bus.clone()
     }
 
@@ -247,14 +269,12 @@ impl Reflector {
         &self.config
     }
 
-    /// Signal all endpoint tasks to shut down.
-    ///
-    /// The `run` future resolves cleanly once every spawned endpoint
-    /// task observes the shutdown flag and returns.
-    pub fn shutdown(&self) {
-        // Ignore send errors: the only failure mode is "no
-        // receivers", which already means we're shutting down.
-        let _ = self.shutdown_tx.send(true);
+    /// Obtain the stop signal before transferring this reflector into `run`.
+    #[must_use]
+    pub fn shutdown_handle(&self) -> ShutdownHandle {
+        ShutdownHandle {
+            sender: self.shutdown_tx.clone(),
+        }
     }
 
     /// Run until shutdown.
@@ -265,75 +285,90 @@ impl Reflector {
     ///
     /// # Errors
     ///
-    /// Returns [`ShellError::Io`] if a socket bind fails or if an
-    /// endpoint task panics.
+    /// Returns [`ShellError::Io`] if binding fails before tasks start. After
+    /// tasks start, [`ShellError::Endpoints`] retains every endpoint failure,
+    /// including typed [`ShellError::Task`] causes. The first failure requests
+    /// shutdown of the other endpoints and every task is joined before return.
     ///
     /// # Cancellation safety
     ///
-    /// This method is cancel-safe in the sense that dropping the
-    /// future aborts the internal [`tokio::task::JoinSet`] cleanly:
-    /// every spawned endpoint task is aborted and the sockets are
-    /// released. For a graceful shutdown call [`Self::shutdown`] first
-    /// and then `await` the `run()` future to completion; for an
-    /// abrupt shutdown just drop the future. Never race `run()`
-    /// against a second long-lived future with `tokio::select!`
-    /// unless the intent is to kill the reflector.
-    pub async fn run(&self) -> Result<(), ShellError> {
+    /// Consuming `self` prevents a second run from reusing client state. Dropping
+    /// the future requests abort through the `JoinSet`; task destruction is
+    /// asynchronous and is not joined by `Drop`. Signal [`ShutdownHandle`] and
+    /// await this future for confirmed completion. A send pass finishes before
+    /// observing shutdown, with a two-second deadline for each recipient.
+    pub async fn run(self) -> Result<(), ShellError> {
         let mut tasks: JoinSet<Result<(), ShellError>> = JoinSet::new();
+
+        if *self.shutdown_rx.borrow() {
+            return Ok(());
+        }
+        // Bind every enabled socket before starting any task. A bind failure
+        // therefore cannot strand previously started endpoint tasks.
+        let dextra_socket = match (&self.dextra, self.dextra_socket) {
+            (Some(_), Some(socket)) => Some(socket),
+            (Some(_), None) => Some(Arc::new(
+                UdpSocket::bind(self.config.bind_addr_for(ProtocolKind::DExtra)).await?,
+            )),
+            (None, _) => None,
+        };
+        let dplus_socket = match (&self.dplus, self.dplus_socket) {
+            (Some(_), Some(socket)) => Some(socket),
+            (Some(_), None) => Some(Arc::new(
+                UdpSocket::bind(self.config.bind_addr_for(ProtocolKind::DPlus)).await?,
+            )),
+            (None, _) => None,
+        };
+        let dcs_socket = match (&self.dcs, self.dcs_socket) {
+            (Some(_), Some(socket)) => Some(socket),
+            (Some(_), None) => Some(Arc::new(
+                UdpSocket::bind(self.config.bind_addr_for(ProtocolKind::Dcs)).await?,
+            )),
+            (None, _) => None,
+        };
 
         // Each protocol binds its own resolved address (explicit
         // override → ephemeral → verbatim single-protocol → standard
         // port; see `ReflectorConfig::bind_addr_for`) so the
         // library-default config with all three protocols enabled
         // can start on a fixed base port without `AddrInUse`.
-        if let Some(endpoint) = self.dextra.as_ref() {
-            let socket = match self.dextra_socket.clone() {
-                Some(s) => s,
-                None => Arc::new(
-                    UdpSocket::bind(self.config.bind_addr_for(ProtocolKind::DExtra)).await?,
-                ),
-            };
+        if let (Some(endpoint), Some(socket)) = (self.dextra.as_ref(), dextra_socket) {
             let shutdown = self.shutdown_rx.clone();
             let endpoint = Arc::clone(endpoint);
             let _handle = tasks.spawn(async move { endpoint.run(socket, shutdown).await });
         }
 
-        if let Some(endpoint) = self.dplus.as_ref() {
-            let socket = match self.dplus_socket.clone() {
-                Some(s) => s,
-                None => {
-                    Arc::new(UdpSocket::bind(self.config.bind_addr_for(ProtocolKind::DPlus)).await?)
-                }
-            };
+        if let (Some(endpoint), Some(socket)) = (self.dplus.as_ref(), dplus_socket) {
             let shutdown = self.shutdown_rx.clone();
             let endpoint = Arc::clone(endpoint);
             let _handle = tasks.spawn(async move { endpoint.run(socket, shutdown).await });
         }
 
-        if let Some(endpoint) = self.dcs.as_ref() {
-            let socket = match self.dcs_socket.clone() {
-                Some(s) => s,
-                None => {
-                    Arc::new(UdpSocket::bind(self.config.bind_addr_for(ProtocolKind::Dcs)).await?)
-                }
-            };
+        if let (Some(endpoint), Some(socket)) = (self.dcs.as_ref(), dcs_socket) {
             let shutdown = self.shutdown_rx.clone();
             let endpoint = Arc::clone(endpoint);
             let _handle = tasks.spawn(async move { endpoint.run(socket, shutdown).await });
         }
 
+        let mut failures = Vec::new();
         while let Some(join_result) = tasks.join_next().await {
             match join_result {
                 Ok(Ok(())) => {}
-                Ok(Err(e)) => return Err(e),
+                Ok(Err(e)) => {
+                    failures.push(e);
+                    let _previous = self.shutdown_tx.send_replace(true);
+                }
                 Err(join_err) => {
-                    return Err(ShellError::Protocol(format!(
-                        "endpoint task aborted: {join_err}"
-                    )));
+                    failures.push(ShellError::Task(join_err));
+                    let _previous = self.shutdown_tx.send_replace(true);
                 }
             }
         }
-        Ok(())
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(ShellError::Endpoints { failures })
+        }
     }
 }
 
@@ -343,7 +378,7 @@ mod tests {
     use crate::reflector::authorizer::AllowAllAuthorizer;
     use crate::reflector::config::ReflectorConfig;
     use dstar_gateway_core::types::ProtocolKind;
-    use dstar_gateway_core::types::{Callsign, Module};
+    use dstar_gateway_core::types::{Module, RoutingCallsign};
     use std::collections::HashSet;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
@@ -352,6 +387,10 @@ mod tests {
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     const BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+    const REFLECTOR: RoutingCallsign = match RoutingCallsign::from_padded_bytes(*b"REF030 ") {
+        Ok(value) => value,
+        Err(_) => unreachable!(),
+    };
 
     fn module_set(modules: &[Module]) -> HashSet<Module> {
         let mut set = HashSet::new();
@@ -363,7 +402,7 @@ mod tests {
 
     fn config() -> Result<ReflectorConfig, Box<dyn std::error::Error>> {
         let cfg = ReflectorConfig::builder()
-            .callsign(Callsign::from_wire_bytes(*b"REF030  "))
+            .callsign(REFLECTOR)
             .module_set(module_set(&[Module::C]))
             .bind(BIND)
             .disable(ProtocolKind::DPlus)
@@ -393,7 +432,7 @@ mod tests {
     #[tokio::test]
     async fn voice_bus_is_some_when_cross_protocol_forwarding_enabled() -> TestResult {
         let cfg = ReflectorConfig::builder()
-            .callsign(Callsign::from_wire_bytes(*b"REF030  "))
+            .callsign(REFLECTOR)
             .module_set(module_set(&[Module::C]))
             .bind(BIND)
             .disable(ProtocolKind::DPlus)
@@ -424,7 +463,7 @@ mod tests {
         // running polaris or an overlapping test suite.
         let ephemeral = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
         let cfg = ReflectorConfig::builder()
-            .callsign(Callsign::from_wire_bytes(*b"REF030  "))
+            .callsign(REFLECTOR)
             .module_set(module_set(&[Module::C]))
             .bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 45123))
             .protocol_bind(ProtocolKind::DExtra, ephemeral)
@@ -436,13 +475,13 @@ mod tests {
             3,
             "library default enables all three protocols"
         );
-        let reflector = Arc::new(Reflector::new(cfg, AllowAllAuthorizer));
-        let r2 = Arc::clone(&reflector);
-        let run_task = tokio::spawn(async move { r2.run().await });
+        let reflector = Reflector::new(cfg, AllowAllAuthorizer);
+        let shutdown = reflector.shutdown_handle();
+        let run_task = tokio::spawn(reflector.run());
         // Give all three endpoint tasks a moment to bind and start;
         // a bind conflict surfaces as an early Err from `run`.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        reflector.shutdown();
+        shutdown.shutdown();
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), run_task).await??;
         assert!(
             result.is_ok(),
@@ -457,18 +496,70 @@ mod tests {
         let socket = UdpSocket::bind("127.0.0.1:0").await?;
         let bound = socket.local_addr()?;
         let cfg = ReflectorConfig::builder()
-            .callsign(Callsign::from_wire_bytes(*b"REF030  "))
+            .callsign(REFLECTOR)
             .module_set(module_set(&[Module::C]))
             .bind(bound)
             .disable(ProtocolKind::DPlus)
             .disable(ProtocolKind::Dcs)
             .build()?;
         let reflector = Reflector::new_with_socket(cfg, AllowAllAuthorizer, Arc::new(socket));
-        reflector.shutdown();
+        reflector.shutdown_handle().shutdown();
         // `run` should return immediately because shutdown is already `true`.
         let result =
             tokio::time::timeout(std::time::Duration::from_secs(2), reflector.run()).await?;
         assert!(result.is_ok());
+        Ok(())
+    }
+
+    struct UnwindingAuthorizer;
+
+    impl crate::ClientAuthorizer for UnwindingAuthorizer {
+        fn authorize(
+            &self,
+            _request: &crate::LinkAttempt,
+        ) -> Result<crate::AccessPolicy, crate::RejectReason> {
+            std::panic::resume_unwind(Box::new("injected endpoint failure"))
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_panic_retains_typed_cause_and_joins_other_endpoints() -> TestResult {
+        let dextra = Arc::new(UdpSocket::bind(BIND).await?);
+        let dplus = Arc::new(UdpSocket::bind(BIND).await?);
+        let peer = dextra.local_addr()?;
+        let config = ReflectorConfig::builder()
+            .callsign(REFLECTOR)
+            .module_set(HashSet::from([Module::C]))
+            .bind(BIND)
+            .disable(ProtocolKind::Dcs)
+            .build()?;
+        let reflector = Reflector::new_with_sockets(
+            config,
+            UnwindingAuthorizer,
+            super::ProtocolSockets {
+                dextra: Some(dextra),
+                dplus: Some(dplus),
+                dcs: None,
+            },
+        );
+        let retained = Arc::downgrade(reflector.dplus.as_ref().ok_or("DPlus endpoint")?);
+        let _shutdown = reflector.shutdown_handle();
+        let task = tokio::spawn(reflector.run());
+        let client = UdpSocket::bind(BIND).await?;
+        let _sent = client.send_to(b"W1AW    BC\0", peer).await?;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), task).await??;
+        let Err(crate::ShellError::Endpoints { failures }) = result else {
+            return Err(format!("unexpected completion: {result:?}").into());
+        };
+        assert_eq!(failures.len(), 1, "one endpoint failed");
+        assert!(
+            matches!(failures.first(), Some(crate::ShellError::Task(error)) if error.is_panic()),
+            "{failures:?}"
+        );
+        assert!(
+            retained.upgrade().is_none(),
+            "run must join and drop the other endpoint before returning"
+        );
         Ok(())
     }
 }

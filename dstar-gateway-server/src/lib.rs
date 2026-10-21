@@ -1,35 +1,20 @@
-//! Multi-client D-STAR reflector server.
-//!
-//! Supports all three reflector protocols (`DExtra`, `DPlus`, and
-//! `DCS`) behind a common [`Reflector`] front-end. Each enabled
-//! endpoint runs on its own tokio task and (when
-//! `cross_protocol_forwarding = true` in the config) publishes to a
-//! shared broadcast bus so voice frames received on one protocol
-//! are transcoded and re-broadcast on the other two.
-
-pub mod client_pool;
-pub mod reflector;
-pub mod tokio_shell;
+#![doc = include_str!("../README.md")]
 
 pub use client_pool::{
-    ClientHandle, ClientPool, DEFAULT_TX_BUDGET_MAX_TOKENS, DEFAULT_TX_BUDGET_REFILL_PER_SEC,
-    DEFAULT_UNHEALTHY_THRESHOLD, SweepEntry, TokenBucket, UnhealthyOutcome,
+    ClientSnapshot, DEFAULT_TX_BUDGET_MAX_TOKENS, DEFAULT_TX_BUDGET_REFILL_PER_SEC, FrameRate,
+    FrameRateError, TokenBucket,
 };
 pub use reflector::{
-    AccessPolicy, AllowAllAuthorizer, ClientAuthorizer, ConfigError, DenyAllAuthorizer,
-    LinkAttempt, ReadOnlyAuthorizer, Reflector, ReflectorConfig, ReflectorConfigBuilder,
-    RejectReason, STANDARD_DCS_PORT, STANDARD_DEXTRA_PORT, STANDARD_DPLUS_PORT, StreamCache,
+    AccessPolicy, AllowAllAuthorizer, ClientAuthorizer, ConfigDuration, ConfigError,
+    DenyAllAuthorizer, LinkAttempt, ProtocolSockets, ReadOnlyAuthorizer, Reflector,
+    ReflectorConfig, ReflectorConfigBuilder, RejectReason, STANDARD_DCS_PORT, STANDARD_DEXTRA_PORT,
+    STANDARD_DPLUS_PORT, ShutdownHandle, StreamCache, StreamSource,
 };
 pub use tokio_shell::{
-    CrossProtocolEvent, EndpointOutcome, EndpointSettings, FanOutReport, ProtocolEndpoint,
-    ShellError, VoiceEvent, fan_out_voice, fan_out_voice_at, transcode_voice,
+    CrossProtocolEvent, EndpointOutcome, ProtocolEndpoint, ShellError, VoiceEvent, VoiceRoute,
+    transcode_voice,
 };
 
-// `proptest` is a dev-dependency used by future property tests.
-// Acknowledge it so `-D unused-crate-dependencies` stays quiet until
-// the test file lands.
-#[cfg(test)]
-use proptest as _;
 // `trybuild` is consumed by the compile-fail runner under `tests/`,
 // which is a separate compilation unit from this lib. Acknowledge it
 // here so the dev-dep lint pass stays silent in this crate.
@@ -39,3 +24,7 @@ use trybuild as _;
 // `ref_reflector` example (separate compilation units). Acknowledge
 // here so the lib's `unused-crate-dependencies` lint stays silent.
 use tracing_subscriber as _;
+
+mod client_pool;
+pub mod reflector;
+pub mod tokio_shell;

@@ -9,9 +9,11 @@
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use dstar_gateway_core::types::{Callsign, Module, ProtocolKind};
+use dstar_gateway_core::types::{Module, ProtocolKind, RoutingCallsign};
+
+use crate::client_pool::{DEFAULT_TX_BUDGET_REFILL_PER_SEC, FrameRate};
 
 /// Standard `DExtra` reflector UDP port (`xlxd/src/main.h`, `DEXTRA_PORT`).
 pub const STANDARD_DEXTRA_PORT: u16 = 30001;
@@ -45,11 +47,38 @@ pub struct Provided;
 
 /// Errors produced by [`ReflectorConfigBuilder::build`].
 #[non_exhaustive]
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
 pub enum ConfigError {
     /// `modules` was set but contained zero entries.
     #[error("reflector module set must contain at least one module")]
     EmptyModules,
+    /// Every supported protocol was disabled.
+    #[error("reflector must enable at least one protocol")]
+    EmptyProtocols,
+    /// A configured duration cannot be added to the current monotonic clock.
+    #[error("{0} exceeds the monotonic clock range")]
+    DurationOverflow(ConfigDuration),
+}
+
+/// Configuration duration whose deadline exceeds the monotonic clock range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConfigDuration {
+    /// Keepalive maintenance interval.
+    KeepaliveInterval,
+    /// Silent-client eviction interval.
+    KeepaliveInactivity,
+    /// Stalled-stream eviction interval.
+    VoiceInactivity,
+}
+
+impl std::fmt::Display for ConfigDuration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::KeepaliveInterval => "keepalive interval",
+            Self::KeepaliveInactivity => "keepalive inactivity timeout",
+            Self::VoiceInactivity => "voice inactivity timeout",
+        })
+    }
 }
 
 /// Complete configuration for a multi-client reflector.
@@ -59,12 +88,12 @@ pub enum ConfigError {
 /// callable. All other fields carry defaults documented on
 /// [`ReflectorConfigBuilder`].
 #[non_exhaustive]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReflectorConfig {
     /// Reflector's own callsign (e.g. `REF030`).
-    pub callsign: Callsign,
+    pub(crate) callsign: RoutingCallsign,
     /// Modules this reflector exposes.
-    pub modules: HashSet<Module>,
+    pub(crate) modules: HashSet<Module>,
     /// UDP bind address.
     ///
     /// This is the *base* address: the address each endpoint
@@ -73,32 +102,32 @@ pub struct ReflectorConfig {
     /// from [`ReflectorConfigBuilder::protocol_bind`] and falls back
     /// to the standard reflector ports when several protocols would
     /// otherwise contend for one fixed port.
-    pub bind: SocketAddr,
+    pub(crate) bind: SocketAddr,
     /// Explicit per-protocol bind overrides.
     ///
     /// Populated by [`ReflectorConfigBuilder::protocol_bind`]; an
     /// entry here wins over every other resolution rule in
     /// [`Self::bind_addr_for`].
-    pub protocol_binds: HashMap<ProtocolKind, SocketAddr>,
+    pub(crate) protocol_binds: HashMap<ProtocolKind, SocketAddr>,
     /// Maximum clients allowed per module.
     ///
     /// A LINK attempt that would push a module's membership past
     /// this count is rejected with the protocol's reject reply
     /// (`DExtra`/`DCS` NAK, `DPlus` BUSY) and a `ClientRejected`
     /// event.
-    pub max_clients_per_module: usize,
+    pub(crate) max_clients_per_module: usize,
     /// Maximum clients allowed across all modules.
     ///
     /// A LINK attempt from a new address while the endpoint's pool
     /// already holds this many clients is rejected with the
     /// protocol's reject reply and a `ClientRejected` event.
-    pub max_total_clients: usize,
+    pub(crate) max_total_clients: usize,
     /// Which protocol endpoints are enabled.
     ///
     /// Default: all three (`DPlus`, `DExtra`, `DCS`). Use
     /// [`ReflectorConfigBuilder::disable`] to remove one from the
     /// set before building.
-    pub enabled_protocols: HashSet<ProtocolKind>,
+    pub(crate) enabled_protocols: HashSet<ProtocolKind>,
     /// Interval between keepalive polls sent to each client.
     ///
     /// Each endpoint's maintenance sweep sends every linked client
@@ -106,37 +135,94 @@ pub struct ReflectorConfig {
     /// (`DExtra`: 9-byte reflector-callsign poll; `DPlus`: 3-byte
     /// poll; `DCS`: 22-byte per-client keepalive, matching the forms
     /// xlxd sends).
-    pub keepalive_interval: Duration,
+    pub(crate) keepalive_interval: Duration,
     /// Inactivity window after which a silent client is evicted.
     ///
     /// Measured against the last datagram received from the peer;
     /// eviction removes the pool entry and emits a `ClientEvicted`
     /// event.
-    pub keepalive_inactivity_timeout: Duration,
+    pub(crate) keepalive_inactivity_timeout: Duration,
     /// Inactivity window after which a stalled voice stream's cache
     /// entry is dropped.
     ///
     /// Frees the module's one-stream header cache when a talker
     /// disappears without sending an end-of-transmission frame, so
     /// the next stream on the module can be tracked.
-    pub voice_inactivity_timeout: Duration,
+    pub(crate) voice_inactivity_timeout: Duration,
     /// Whether voice from one protocol should be forwarded to clients on another protocol.
-    pub cross_protocol_forwarding: bool,
+    pub(crate) cross_protocol_forwarding: bool,
     /// Per-client TX rate limit, in voice frames per second.
     ///
-    /// Defaults to `60.0` (3× the nominal 20 fps D-STAR voice rate)
-    /// so a legitimate voice stream never hits the limit, but a
-    /// client trying to saturate the reflector with a burst of
-    /// 200+ fps gets rate-limited. Set higher if you expect large
-    /// bursts of legitimate traffic.
+    /// Defaults to 60 frames/s, above the 50-frame/s D-STAR cadence.
+    /// Traffic exceeding the available burst and refill budget is dropped.
     ///
     /// Applied to every new client's fan-out token bucket: refill
     /// runs at this rate and the burst capacity is one second of
     /// traffic at this rate.
-    pub tx_rate_limit_frames_per_sec: f64,
+    pub(crate) tx_rate_limit_frames_per_sec: FrameRate,
 }
 
 impl ReflectorConfig {
+    /// Validated seven-byte reflector routing identity.
+    #[must_use]
+    pub const fn callsign(&self) -> RoutingCallsign {
+        self.callsign
+    }
+
+    /// Nonempty set of served modules.
+    #[must_use]
+    pub const fn modules(&self) -> &HashSet<Module> {
+        &self.modules
+    }
+
+    /// Base socket address before per-protocol resolution.
+    #[must_use]
+    pub const fn bind(&self) -> SocketAddr {
+        self.bind
+    }
+
+    /// Maximum clients per module; zero rejects every new member.
+    #[must_use]
+    pub const fn max_clients_per_module(&self) -> usize {
+        self.max_clients_per_module
+    }
+
+    /// Maximum clients per endpoint; zero rejects every new client.
+    #[must_use]
+    pub const fn max_total_clients(&self) -> usize {
+        self.max_total_clients
+    }
+
+    /// Recipient voice-frame refill rate and one-second burst policy.
+    #[must_use]
+    pub const fn tx_rate_limit_frames_per_sec(&self) -> FrameRate {
+        self.tx_rate_limit_frames_per_sec
+    }
+
+    /// Whether voice is relayed between protocol endpoints.
+    #[must_use]
+    pub const fn cross_protocol_forwarding(&self) -> bool {
+        self.cross_protocol_forwarding
+    }
+
+    /// Configured poll interval; the maintenance timer runs no faster than 100 ms.
+    #[must_use]
+    pub const fn keepalive_interval(&self) -> Duration {
+        self.keepalive_interval
+    }
+
+    /// Silent-client eviction interval.
+    #[must_use]
+    pub const fn keepalive_inactivity_timeout(&self) -> Duration {
+        self.keepalive_inactivity_timeout
+    }
+
+    /// Stalled-stream eviction interval.
+    #[must_use]
+    pub const fn voice_inactivity_timeout(&self) -> Duration {
+        self.voice_inactivity_timeout
+    }
+
     /// Check whether a specific protocol endpoint is enabled.
     #[must_use]
     pub fn is_enabled(&self, protocol: ProtocolKind) -> bool {
@@ -189,14 +275,14 @@ impl ReflectorConfig {
     ///
     /// ```
     /// use std::collections::HashSet;
-    /// use dstar_gateway_core::types::{Callsign, Module};
+    /// use dstar_gateway_core::types::{RoutingCallsign, Module};
     /// use dstar_gateway_server::ReflectorConfig;
     ///
     /// let mut modules = HashSet::new();
     /// let _ = modules.insert(Module::try_from_char('C')?);
     ///
     /// let config = ReflectorConfig::builder()
-    ///     .callsign(Callsign::try_from_str("REF999")?)
+    ///     .callsign(RoutingCallsign::new("REF999")?)
     ///     .module_set(modules)
     ///     .bind("0.0.0.0:30001".parse()?)
     ///     .disable(dstar_gateway_core::types::ProtocolKind::DPlus)
@@ -224,7 +310,7 @@ impl ReflectorConfig {
 /// a compile error.
 #[derive(Debug)]
 pub struct ReflectorConfigBuilder<Cs, Ms, Bn> {
-    callsign: Option<Callsign>,
+    callsign: Option<RoutingCallsign>,
     modules: Option<HashSet<Module>>,
     bind: Option<SocketAddr>,
     protocol_binds: HashMap<ProtocolKind, SocketAddr>,
@@ -235,7 +321,7 @@ pub struct ReflectorConfigBuilder<Cs, Ms, Bn> {
     keepalive_inactivity_timeout: Duration,
     voice_inactivity_timeout: Duration,
     cross_protocol_forwarding: bool,
-    tx_rate_limit_frames_per_sec: f64,
+    tx_rate_limit_frames_per_sec: FrameRate,
     _cs: PhantomData<Cs>,
     _ms: PhantomData<Ms>,
     _bn: PhantomData<Bn>,
@@ -263,7 +349,7 @@ impl ReflectorConfigBuilder<Missing, Missing, Missing> {
             keepalive_inactivity_timeout: Duration::from_secs(30),
             voice_inactivity_timeout: Duration::from_secs(2),
             cross_protocol_forwarding: false,
-            tx_rate_limit_frames_per_sec: 60.0,
+            tx_rate_limit_frames_per_sec: DEFAULT_TX_BUDGET_REFILL_PER_SEC,
             _cs: PhantomData,
             _ms: PhantomData,
             _bn: PhantomData,
@@ -274,7 +360,7 @@ impl ReflectorConfigBuilder<Missing, Missing, Missing> {
 impl<Cs, Ms, Bn> ReflectorConfigBuilder<Cs, Ms, Bn> {
     /// Set the reflector callsign.
     #[must_use]
-    pub fn callsign(self, callsign: Callsign) -> ReflectorConfigBuilder<Provided, Ms, Bn> {
+    pub fn callsign(self, callsign: RoutingCallsign) -> ReflectorConfigBuilder<Provided, Ms, Bn> {
         ReflectorConfigBuilder {
             callsign: Some(callsign),
             modules: self.modules,
@@ -416,12 +502,10 @@ impl<Cs, Ms, Bn> ReflectorConfigBuilder<Cs, Ms, Bn> {
     /// Override the per-client TX rate limit in frames per second
     /// (default `60.0`).
     ///
-    /// The default is 3× the nominal 20 fps D-STAR voice rate, so
-    /// legitimate voice streams never hit the limit. Lower it to
-    /// tighten the `DoS` envelope; raise it if you expect large bursts
-    /// of legitimate traffic.
+    /// The default provides 60 frames/s against a nominal 50-frame/s stream.
+    /// Every recipient shares this budget across same-protocol and transcoded voice.
     #[must_use]
-    pub const fn tx_rate_limit_frames_per_sec(mut self, value: f64) -> Self {
+    pub const fn tx_rate_limit_frames_per_sec(mut self, value: FrameRate) -> Self {
         self.tx_rate_limit_frames_per_sec = value;
         self
     }
@@ -433,8 +517,10 @@ impl ReflectorConfigBuilder<Provided, Provided, Provided> {
     /// # Errors
     ///
     /// Returns [`ConfigError::EmptyModules`] if the supplied module
-    /// set was empty. All other required fields are guaranteed
-    /// non-`None` by the typestate markers.
+    /// set was empty, [`ConfigError::EmptyProtocols`] if every protocol was
+    /// disabled, or [`ConfigError::DurationOverflow`] when a duration cannot
+    /// form a monotonic deadline. Zero durations are accepted: maintenance
+    /// runs no faster than 100 ms, and zero inactivity evicts on the next sweep.
     pub fn build(self) -> Result<ReflectorConfig, ConfigError> {
         let Some(callsign) = self.callsign else {
             unreachable!("Provided marker guarantees callsign is Some");
@@ -447,6 +533,25 @@ impl ReflectorConfigBuilder<Provided, Provided, Provided> {
         };
         if modules.is_empty() {
             return Err(ConfigError::EmptyModules);
+        }
+        if self.enabled_protocols.is_empty() {
+            return Err(ConfigError::EmptyProtocols);
+        }
+        let now = Instant::now();
+        for (field, duration) in [
+            (ConfigDuration::KeepaliveInterval, self.keepalive_interval),
+            (
+                ConfigDuration::KeepaliveInactivity,
+                self.keepalive_inactivity_timeout,
+            ),
+            (
+                ConfigDuration::VoiceInactivity,
+                self.voice_inactivity_timeout,
+            ),
+        ] {
+            if now.checked_add(duration).is_none() {
+                return Err(ConfigError::DurationOverflow(field));
+            }
         }
         Ok(ReflectorConfig {
             callsign,
@@ -468,7 +573,8 @@ impl ReflectorConfigBuilder<Provided, Provided, Provided> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Callsign, ConfigError, Duration, HashSet, Module, ProtocolKind, ReflectorConfig, SocketAddr,
+        ConfigError, Duration, HashSet, Module, ProtocolKind, ReflectorConfig, RoutingCallsign,
+        SocketAddr,
     };
     use std::net::{IpAddr, Ipv4Addr};
 
@@ -483,15 +589,19 @@ mod tests {
     }
 
     const BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30001);
+    const REFLECTOR: RoutingCallsign = match RoutingCallsign::from_padded_bytes(*b"REF030 ") {
+        Ok(value) => value,
+        Err(_) => unreachable!(),
+    };
 
     #[test]
     fn happy_path_builds_with_defaults() -> TestResult {
         let config = ReflectorConfig::builder()
-            .callsign(Callsign::from_wire_bytes(*b"REF030  "))
+            .callsign(REFLECTOR)
             .module_set(module_set(&[Module::A, Module::B, Module::C]))
             .bind(BIND)
             .build()?;
-        assert_eq!(config.callsign, Callsign::from_wire_bytes(*b"REF030  "));
+        assert_eq!(config.callsign(), REFLECTOR);
         assert_eq!(config.modules.len(), 3);
         assert_eq!(config.bind, BIND);
         // Defaults
@@ -510,7 +620,7 @@ mod tests {
     #[test]
     fn empty_module_set_is_rejected() {
         let result = ReflectorConfig::builder()
-            .callsign(Callsign::from_wire_bytes(*b"REF030  "))
+            .callsign(REFLECTOR)
             .module_set(HashSet::new())
             .bind(BIND)
             .build();
@@ -520,7 +630,7 @@ mod tests {
     #[test]
     fn overrides_replace_defaults() -> TestResult {
         let config = ReflectorConfig::builder()
-            .callsign(Callsign::from_wire_bytes(*b"REF030  "))
+            .callsign(REFLECTOR)
             .module_set(module_set(&[Module::C]))
             .bind(BIND)
             .max_clients_per_module(10)
@@ -547,7 +657,7 @@ mod tests {
     #[test]
     fn cross_protocol_forwarding_defaults_false() -> TestResult {
         let config = ReflectorConfig::builder()
-            .callsign(Callsign::from_wire_bytes(*b"REF030  "))
+            .callsign(REFLECTOR)
             .module_set(module_set(&[Module::C]))
             .bind(BIND)
             .build()?;
@@ -561,7 +671,7 @@ mod tests {
     fn bind_addr_rule1_explicit_protocol_override_wins_verbatim() -> TestResult {
         let dcs_override = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)), 40999);
         let config = ReflectorConfig::builder()
-            .callsign(Callsign::from_wire_bytes(*b"REF030  "))
+            .callsign(REFLECTOR)
             .module_set(module_set(&[Module::C]))
             .bind(BIND)
             .protocol_bind(ProtocolKind::Dcs, dcs_override)
@@ -584,7 +694,7 @@ mod tests {
     fn bind_addr_rule2_ephemeral_base_port_stays_ephemeral() -> TestResult {
         let ephemeral = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
         let config = ReflectorConfig::builder()
-            .callsign(Callsign::from_wire_bytes(*b"REF030  "))
+            .callsign(REFLECTOR)
             .module_set(module_set(&[Module::C]))
             .bind(ephemeral)
             .build()?;
@@ -601,7 +711,7 @@ mod tests {
     #[test]
     fn bind_addr_rule3_single_enabled_protocol_uses_bind_verbatim() -> TestResult {
         let config = ReflectorConfig::builder()
-            .callsign(Callsign::from_wire_bytes(*b"REF030  "))
+            .callsign(REFLECTOR)
             .module_set(module_set(&[Module::C]))
             .bind(BIND)
             .disable(ProtocolKind::DPlus)
@@ -618,7 +728,7 @@ mod tests {
     #[test]
     fn bind_addr_rule4_multi_protocol_fixed_port_uses_standard_ports() -> TestResult {
         let config = ReflectorConfig::builder()
-            .callsign(Callsign::from_wire_bytes(*b"REF030  "))
+            .callsign(REFLECTOR)
             .module_set(module_set(&[Module::C]))
             .bind(BIND)
             .build()?;
@@ -635,5 +745,36 @@ mod tests {
             SocketAddr::new(BIND.ip(), 30051)
         );
         Ok(())
+    }
+
+    #[test]
+    fn disabled_protocols_and_unrepresentable_deadlines_are_rejected() {
+        let result = ReflectorConfig::builder()
+            .callsign(REFLECTOR)
+            .module_set(HashSet::from([Module::C]))
+            .bind(BIND)
+            .disable(ProtocolKind::DExtra)
+            .disable(ProtocolKind::DPlus)
+            .disable(ProtocolKind::Dcs)
+            .build();
+        assert!(
+            matches!(result, Err(ConfigError::EmptyProtocols)),
+            "{result:?}"
+        );
+        let result = ReflectorConfig::builder()
+            .callsign(REFLECTOR)
+            .module_set(HashSet::from([Module::C]))
+            .bind(BIND)
+            .keepalive_interval(Duration::MAX)
+            .build();
+        assert!(
+            matches!(
+                result,
+                Err(ConfigError::DurationOverflow(
+                    super::ConfigDuration::KeepaliveInterval
+                ))
+            ),
+            "{result:?}"
+        );
     }
 }

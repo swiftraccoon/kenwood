@@ -14,9 +14,42 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use dstar_gateway_core::header::DstarHeader;
-use dstar_gateway_core::types::StreamId;
+use dstar_gateway_core::types::{ProtocolKind, StreamId};
+
+/// Protocol endpoint and UDP peer that originated a cached stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StreamSource {
+    /// Source wire protocol.
+    pub protocol: ProtocolKind,
+    /// Source UDP address.
+    pub peer: SocketAddr,
+}
 
 /// Cached state for one active voice stream on one module.
+///
+/// ```
+/// use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+/// use std::time::{Duration, Instant};
+/// use dstar_gateway_core::{
+///     DstarHeader, Module, ProtocolKind, RelayRouting, RoutingCallsign, StreamId, Suffix,
+/// };
+/// use dstar_gateway_server::{StreamCache, StreamSource};
+/// let station = RoutingCallsign::new("W1AW")?;
+/// let header = DstarHeader::for_relay(RelayRouting {
+///     operator: station, local_module: Module::B,
+///     reflector: RoutingCallsign::new("REF030")?, reflector_module: Module::C,
+/// }, station.callsign(), Suffix::EMPTY);
+/// let source = StreamSource {
+///     protocol: ProtocolKind::DExtra,
+///     peer: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30001),
+/// };
+/// let start = Instant::now();
+/// let stream = StreamId::new(0x1234).ok_or("zero stream")?;
+/// let mut cache = StreamCache::new(stream, header, source, start);
+/// cache.record_frame(start + Duration::from_millis(20));
+/// assert!(!cache.should_evict(start, Duration::from_secs(2)));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[derive(Debug, Clone)]
 pub struct StreamCache {
     stream_id: StreamId,
@@ -28,7 +61,7 @@ pub struct StreamCache {
     seq_counter: u32,
     started_at: Instant,
     last_activity: Instant,
-    from: SocketAddr,
+    source: StreamSource,
 }
 
 impl StreamCache {
@@ -41,7 +74,7 @@ impl StreamCache {
     pub const fn new(
         stream_id: StreamId,
         header: DstarHeader,
-        from: SocketAddr,
+        source: StreamSource,
         now: Instant,
     ) -> Self {
         Self {
@@ -51,7 +84,7 @@ impl StreamCache {
             seq_counter: 0,
             started_at: now,
             last_activity: now,
-            from,
+            source,
         }
     }
 
@@ -66,7 +99,7 @@ impl StreamCache {
         stream_id: StreamId,
         header: DstarHeader,
         header_bytes: Vec<u8>,
-        from: SocketAddr,
+        source: StreamSource,
         now: Instant,
     ) -> Self {
         Self {
@@ -76,7 +109,7 @@ impl StreamCache {
             seq_counter: 0,
             started_at: now,
             last_activity: now,
-            from,
+            source,
         }
     }
 
@@ -93,9 +126,9 @@ impl StreamCache {
     ///
     /// Increments the internal sequence counter and refreshes
     /// `last_activity` so the inactivity watchdog stays armed.
-    pub const fn record_frame(&mut self, now: Instant) {
-        self.seq_counter = self.seq_counter.saturating_add(1);
-        self.last_activity = now;
+    pub fn record_frame(&mut self, now: Instant) {
+        self.seq_counter = (self.seq_counter + 1) % 21;
+        self.last_activity = self.last_activity.max(now);
     }
 
     /// Whether the cached header should be rebroadcast on the next tick.
@@ -111,7 +144,7 @@ impl StreamCache {
     /// Whether this stream has been idle long enough to be evicted.
     #[must_use]
     pub fn should_evict(&self, now: Instant, timeout: Duration) -> bool {
-        now.duration_since(self.last_activity) >= timeout
+        now.saturating_duration_since(self.last_activity) >= timeout
     }
 
     /// The cached voice header.
@@ -126,10 +159,16 @@ impl StreamCache {
         self.stream_id
     }
 
-    /// The peer that originated the stream (so fan-out can avoid echo).
+    /// Complete source identity used together with the stream ID.
     #[must_use]
-    pub const fn from(&self) -> SocketAddr {
-        self.from
+    pub const fn source(&self) -> StreamSource {
+        self.source
+    }
+
+    /// Whether both the source and stream ID identify this entry.
+    #[must_use]
+    pub fn matches(&self, source: StreamSource, stream_id: StreamId) -> bool {
+        self.source == source && self.stream_id == stream_id
     }
 
     /// When the stream first began (useful for duration metrics).
@@ -147,22 +186,23 @@ impl StreamCache {
 
 #[cfg(test)]
 mod tests {
-    use super::{Duration, Instant, SocketAddr, StreamCache, StreamId};
+    use super::{Duration, Instant, ProtocolKind, SocketAddr, StreamCache, StreamId, StreamSource};
     use dstar_gateway_core::header::DstarHeader;
     use dstar_gateway_core::types::{Callsign, Suffix};
     use std::net::{IpAddr, Ipv4Addr};
 
     const PEER: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30001);
 
-    fn peer() -> SocketAddr {
-        PEER
+    fn source() -> StreamSource {
+        StreamSource {
+            protocol: ProtocolKind::DExtra,
+            peer: PEER,
+        }
     }
 
     fn header() -> DstarHeader {
         DstarHeader {
-            flag1: 0,
-            flag2: 0,
-            flag3: 0,
+            flags: dstar_gateway_core::header::HeaderFlags::from_bytes([0; 3]),
             rpt2: Callsign::from_wire_bytes(*b"REF030 G"),
             rpt1: Callsign::from_wire_bytes(*b"REF030 C"),
             ur_call: Callsign::from_wire_bytes(*b"CQCQCQ  "),
@@ -181,9 +221,9 @@ mod tests {
     #[test]
     fn accessors_return_constructor_inputs() {
         let now = Instant::now();
-        let cache = StreamCache::new(sid(), header(), peer(), now);
+        let cache = StreamCache::new(sid(), header(), source(), now);
         assert_eq!(cache.stream_id(), sid());
-        assert_eq!(cache.from(), peer());
+        assert_eq!(cache.source().peer, PEER);
         assert_eq!(cache.started_at(), now);
         assert_eq!(cache.last_activity(), now);
         // header() returns a borrowed reference; compare field-by-field
@@ -194,7 +234,7 @@ mod tests {
     #[test]
     fn should_rebroadcast_header_fires_every_21_frames() {
         let now = Instant::now();
-        let mut cache = StreamCache::new(sid(), header(), peer(), now);
+        let mut cache = StreamCache::new(sid(), header(), source(), now);
         // First 19 frames: counter becomes 1..=19, (n+1)%21 != 0 until n=20.
         let mut rebroadcasts = 0_u32;
         for _ in 0..50 {
@@ -214,7 +254,7 @@ mod tests {
     #[test]
     fn should_rebroadcast_header_is_false_initially() {
         let now = Instant::now();
-        let cache = StreamCache::new(sid(), header(), peer(), now);
+        let cache = StreamCache::new(sid(), header(), source(), now);
         // seq_counter=0, (0+1)%21 = 1 != 0
         assert!(!cache.should_rebroadcast_header());
     }
@@ -222,7 +262,7 @@ mod tests {
     #[test]
     fn should_evict_triggers_after_timeout() {
         let start = Instant::now();
-        let mut cache = StreamCache::new(sid(), header(), peer(), start);
+        let mut cache = StreamCache::new(sid(), header(), source(), start);
         let timeout = Duration::from_secs(2);
         // Fresh cache: not yet evicted at start.
         assert!(!cache.should_evict(start, timeout));
@@ -238,10 +278,21 @@ mod tests {
     #[test]
     fn record_frame_updates_last_activity() {
         let start = Instant::now();
-        let mut cache = StreamCache::new(sid(), header(), peer(), start);
+        let mut cache = StreamCache::new(sid(), header(), source(), start);
         assert_eq!(cache.last_activity(), start);
         let t1 = start + Duration::from_millis(100);
         cache.record_frame(t1);
         assert_eq!(cache.last_activity(), t1);
+    }
+
+    #[test]
+    fn regressing_frame_time_cannot_move_the_expiry_observation_back() {
+        let start = Instant::now();
+        let later = start + Duration::from_secs(1);
+        let mut cache = StreamCache::new(sid(), header(), source(), start);
+        cache.record_frame(later);
+        cache.record_frame(start);
+        assert_eq!(cache.last_activity(), later);
+        assert!(!cache.should_evict(start + Duration::from_secs(2), Duration::from_secs(2)));
     }
 }

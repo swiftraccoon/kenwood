@@ -8,11 +8,8 @@
 //!
 //! This runner only covers the server crate's own public API,
 //! specifically `ReflectorConfig`'s typed-builder required-field
-//! enforcement. Server-side session typestate compile-fail tests
-//! (state-gated `handle_voice_data` / `handle_link2` /
-//! `handle_unlink`) live in `dstar-gateway-core/tests/compile_fail/`
-//! because the types they exercise (`ServerSession<P, S>`,
-//! state markers) are defined in `dstar-gateway-core`.
+//! enforcement. The core's runtime tests check server handshake and
+//! stream transitions.
 
 // Integration tests are separate compilation units. Acknowledge
 // workspace deps that this runner does not reference directly so the
@@ -21,7 +18,6 @@
 // by the compile_fail targets that trybuild compiles separately.
 use dstar_gateway_core as _;
 use dstar_gateway_server as _;
-use proptest as _;
 use thiserror as _;
 use tokio as _;
 use tracing as _;

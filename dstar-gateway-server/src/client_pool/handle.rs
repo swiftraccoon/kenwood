@@ -1,16 +1,7 @@
-//! `ClientHandle`: one linked client as tracked by the reflector.
-//!
-//! The pool stores protocol-erased [`ServerSessionCore`] instances
-//! keyed by `SocketAddr`. A phantom `P: Protocol` marker threads the
-//! protocol type through the API so callers can get DExtra/DPlus/DCS
-//! typed accessors without the storage itself being generic.
-//!
-//! This module also defines [`TokenBucket`], the per-client rate
-//! limiter used to cap the number of fan-out voice frames a single
-//! client can consume per second. It lives here (rather than in a
-//! dedicated module) to keep the per-handle state co-located.
+//! Per-client protocol state and an injected-time recipient token bucket.
 
 use std::marker::PhantomData;
+use std::net::SocketAddr;
 use std::time::Instant;
 
 use dstar_gateway_core::ServerSessionCore;
@@ -19,56 +10,48 @@ use dstar_gateway_core::types::Module;
 
 use crate::reflector::AccessPolicy;
 
-/// Default burst capacity for per-client TX rate limiting, in frames.
-///
-/// Sized to absorb a ~1 second burst of voice at the nominal 20 fps
-/// D-STAR rate plus headroom.
+use super::FrameRate;
+
+/// Default one-second recipient burst capacity, in frames.
 pub const DEFAULT_TX_BUDGET_MAX_TOKENS: u32 = 60;
 
-/// Default steady-state refill rate for per-client TX rate limiting,
-/// in frames per second.
+/// Default recipient refill rate, 60 frames/s.
 ///
-/// Set to `60.0` (3× the nominal 20 fps D-STAR voice rate) to leave
-/// headroom for jitter and burstiness. A client legitimately
-/// transmitting audio will never hit the limit; a client trying to
-/// `DoS` the reflector with 200 fps of voice will.
-pub const DEFAULT_TX_BUDGET_REFILL_PER_SEC: f64 = 60.0;
+/// This local policy gives headroom above the 50-frame/s voice cadence;
+/// arrivals exceeding the configured burst/rate can still be dropped.
+pub const DEFAULT_TX_BUDGET_REFILL_PER_SEC: FrameRate = match FrameRate::new(60.0) {
+    Ok(rate) => rate,
+    Err(_) => unreachable!(),
+};
 
-/// Rate limiter that caps the number of tokens consumed per second.
+/// Injected-time token bucket for one recipient's outbound frame budget.
 ///
-/// Used on [`ClientHandle`] to throttle how many fan-out voice
-/// frames a single client can absorb per second, so one slow or
-/// adversarial client can't monopolize the reflector's fan-out
-/// loop. Classic leaky/token-bucket hybrid: the bucket starts full
-/// and [`Self::try_consume`] refills by `refill_rate_per_sec *
-/// elapsed` tokens (capped at `max_tokens`) before attempting to
-/// withdraw.
+/// Starts full, refills at a checked rate up to its capacity, and withdraws
+/// only when sufficient tokens exist. Zero capacity permits only zero-cost
+/// operations. Regressing input time never moves the refill timestamp back.
 ///
-/// This is a sans-io state machine: [`Self::try_consume`] takes
-/// the caller's current [`Instant`] and never calls
-/// [`Instant::now`] itself. Tests drive the clock forward by
-/// constructing synthetic instants.
-#[derive(Debug, Clone, Copy)]
+/// ```
+/// use std::time::{Duration, Instant};
+/// use dstar_gateway_server::{FrameRate, TokenBucket};
+/// let start = Instant::now();
+/// let mut budget = TokenBucket::new(2, FrameRate::new(1.0)?, start);
+/// assert!(budget.try_consume(start, 2));
+/// assert!(!budget.try_consume(start, 1));
+/// assert!(budget.try_consume(start + Duration::from_secs(1), 1));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TokenBucket {
     tokens: f64,
     max_tokens: f64,
-    refill_rate_per_sec: f64,
+    refill_rate_per_sec: FrameRate,
     last_refill: Instant,
 }
 
 impl TokenBucket {
-    /// Construct a new bucket full of tokens.
-    ///
-    /// - `max_tokens`: burst capacity; the bucket starts with this
-    ///   many tokens and refills up to (but never beyond) this
-    ///   value.
-    /// - `refill_rate_per_sec`: steady-state refill rate in tokens
-    ///   per second. A nominal 20 fps D-STAR voice stream would set
-    ///   this to `60.0` (3× nominal) to leave headroom for jitter.
-    /// - `now`: the wall-clock instant at which the bucket is
-    ///   constructed, used as the seed for the first refill delta.
+    /// Start with `max_tokens` available at the given injected instant.
     #[must_use]
-    pub fn new(max_tokens: u32, refill_rate_per_sec: f64, now: Instant) -> Self {
+    pub fn new(max_tokens: u32, refill_rate_per_sec: FrameRate, now: Instant) -> Self {
         let max_tokens = f64::from(max_tokens);
         Self {
             tokens: max_tokens,
@@ -78,249 +61,188 @@ impl TokenBucket {
         }
     }
 
-    /// Attempt to withdraw `tokens` from the bucket at time `now`.
+    /// Withdraw a frame cost after refilling through now.
     ///
-    /// Returns `true` if the bucket had enough tokens (withdrawal
-    /// committed); returns `false` otherwise.
+    /// Returns false without withdrawing when the balance is insufficient.
+    /// Clock regression contributes no refill and preserves the prior timestamp.
     pub fn try_consume(&mut self, now: Instant, tokens: u32) -> bool {
-        let elapsed = now.saturating_duration_since(self.last_refill);
-        let refill = elapsed.as_secs_f64() * self.refill_rate_per_sec;
-        self.tokens = (self.tokens + refill).min(self.max_tokens);
-        self.last_refill = now;
-
-        let cost = f64::from(tokens);
-        if self.tokens >= cost {
-            self.tokens -= cost;
-            true
-        } else {
-            false
+        if now > self.last_refill {
+            let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+            let refill = elapsed * self.refill_rate_per_sec.get();
+            self.tokens = (self.tokens + refill).min(self.max_tokens);
+            self.last_refill = now;
         }
+        let cost = f64::from(tokens);
+        if self.tokens < cost {
+            return false;
+        }
+        self.tokens -= cost;
+        true
     }
 
-    /// Construct a bucket sized for a frames-per-second rate limit.
+    /// Use one second of configured traffic as capacity, with at least one frame.
     ///
-    /// The burst capacity is one second of traffic at `rate_per_sec`
-    /// (clamped to at least one token so any positive rate can send
-    /// at least one frame), matching the relationship between
-    /// [`DEFAULT_TX_BUDGET_MAX_TOKENS`] and
-    /// [`DEFAULT_TX_BUDGET_REFILL_PER_SEC`]. Used by the reflector
-    /// endpoint to apply
-    /// [`ReflectorConfig::tx_rate_limit_frames_per_sec`] to each new
-    /// client handle. A negative `rate_per_sec` is clamped to zero
-    /// refill (the bucket empties and stays empty); it must never
-    /// drain below zero over elapsed time.
-    ///
-    /// [`ReflectorConfig::tx_rate_limit_frames_per_sec`]: crate::ReflectorConfig::tx_rate_limit_frames_per_sec
+    /// Fractional rates below one frame/s therefore permit an initial single
+    /// frame, then refill at their actual configured rate.
     #[must_use]
-    pub const fn from_rate(rate_per_sec: f64, now: Instant) -> Self {
-        let max_tokens = rate_per_sec.max(1.0);
+    pub const fn from_rate(rate_per_sec: FrameRate, now: Instant) -> Self {
+        let max_tokens = rate_per_sec.get().max(1.0);
         Self {
             tokens: max_tokens,
             max_tokens,
-            refill_rate_per_sec: rate_per_sec.max(0.0),
+            refill_rate_per_sec: rate_per_sec,
             last_refill: now,
         }
     }
 
-    /// Current (refill-approximated) token count, for tests/metrics.
+    /// Current token balance after the last attempted withdrawal.
     #[must_use]
     pub const fn tokens(&self) -> f64 {
         self.tokens
     }
 
-    /// Maximum tokens the bucket can hold.
+    /// Maximum token balance.
     #[must_use]
     pub const fn max_tokens(&self) -> f64 {
         self.max_tokens
     }
 
-    /// Refill rate in tokens per second.
+    /// Validated refill rate in frames per second.
     #[must_use]
-    pub const fn refill_rate_per_sec(&self) -> f64 {
+    pub const fn refill_rate_per_sec(&self) -> FrameRate {
         self.refill_rate_per_sec
     }
 }
 
-/// One entry in [`super::ClientPool`].
+/// One uniquely owned protocol client tracked by a pool.
 ///
-/// Tracks the per-peer server session, its module membership (if
-/// any), the last time a datagram arrived from the client, the access policy
-/// the authorizer granted, a running count of send failures so the
-/// fan-out engine can evict unhealthy peers, and a per-client TX
-/// token bucket used to rate-limit how many fan-out voice frames
-/// one client can consume per second.
+/// Construction derives the core protocol from P and binds the same peer
+/// address used by the pool. Public observations cannot mutate indexed fields.
 #[derive(Debug)]
-pub struct ClientHandle<P: Protocol> {
-    /// Protocol-erased server session state machine.
-    pub session: ServerSessionCore,
-    /// Module the client has linked to, if any.
-    pub module: Option<Module>,
-    /// Last time a datagram arrived from this client.
-    pub last_heard: Instant,
-    /// Access policy granted by the authorizer.
-    pub access: AccessPolicy,
-    /// Monotonically increasing count of fan-out send failures.
-    pub send_failure_count: u32,
-    /// Per-client TX token bucket. Each outbound voice frame in
-    /// fan-out consumes one token; when the bucket is empty, the
-    /// frame is dropped for THIS peer (the other peers on the same
-    /// module still receive it). Rate-limited is NOT the same as
-    /// broken: the peer is not marked unhealthy.
-    pub tx_budget: TokenBucket,
+pub(crate) struct ClientHandle<P> {
+    pub(crate) session: ServerSessionCore,
+    pub(crate) module: Option<Module>,
+    pub(crate) last_heard: Instant,
+    pub(crate) access: AccessPolicy,
+    pub(crate) send_failure_count: u32,
+    pub(crate) tx_budget: TokenBucket,
     _protocol: PhantomData<fn() -> P>,
 }
 
 impl<P: Protocol> ClientHandle<P> {
-    /// Construct a new handle for a freshly observed client.
-    ///
-    /// The TX budget is initialized with [`DEFAULT_TX_BUDGET_MAX_TOKENS`]
-    /// capacity and [`DEFAULT_TX_BUDGET_REFILL_PER_SEC`] refill rate.
+    /// Create an unlinked client for P using the default recipient budget.
     #[must_use]
-    pub fn new(session: ServerSessionCore, access: AccessPolicy, now: Instant) -> Self {
-        Self::new_with_tx_budget(
-            session,
-            access,
-            now,
-            DEFAULT_TX_BUDGET_MAX_TOKENS,
-            DEFAULT_TX_BUDGET_REFILL_PER_SEC,
-        )
-    }
-
-    /// Construct a new handle whose TX budget is derived from a
-    /// frames-per-second rate limit.
-    ///
-    /// The bucket is built via [`TokenBucket::from_rate`]: refill
-    /// runs at `rate_per_sec` and the burst capacity is one second
-    /// of traffic at that rate. This is how the reflector endpoint
-    /// applies the configured
-    /// `ReflectorConfig::tx_rate_limit_frames_per_sec` to every new
-    /// client.
-    #[must_use]
-    pub fn new_with_tx_rate(
-        session: ServerSessionCore,
+    pub(crate) fn new(
+        peer: SocketAddr,
+        default_module: Module,
         access: AccessPolicy,
         now: Instant,
-        rate_per_sec: f64,
     ) -> Self {
         Self {
-            session,
+            session: ServerSessionCore::new(P::KIND, peer, default_module),
             module: None,
             last_heard: now,
             access,
             send_failure_count: 0,
-            tx_budget: TokenBucket::from_rate(rate_per_sec, now),
+            tx_budget: TokenBucket::new(
+                DEFAULT_TX_BUDGET_MAX_TOKENS,
+                DEFAULT_TX_BUDGET_REFILL_PER_SEC,
+                now,
+            ),
             _protocol: PhantomData,
         }
     }
 
-    /// Construct a new handle with a caller-specified TX budget.
-    ///
-    /// Primarily used by tests that need to drive the rate limiter
-    /// past its limit in a single tick without waiting for real
-    /// wall-clock refill.
+    /// Replace the recipient budget before transferring this handle to a pool.
     #[must_use]
-    pub fn new_with_tx_budget(
-        session: ServerSessionCore,
-        access: AccessPolicy,
-        now: Instant,
-        max_tokens: u32,
-        refill_rate_per_sec: f64,
-    ) -> Self {
-        Self {
-            session,
-            module: None,
-            last_heard: now,
-            access,
-            send_failure_count: 0,
-            tx_budget: TokenBucket::new(max_tokens, refill_rate_per_sec, now),
-            _protocol: PhantomData,
-        }
+    pub(crate) const fn with_tx_budget(mut self, budget: TokenBucket) -> Self {
+        self.tx_budget = budget;
+        self
+    }
+
+    /// Peer address fixed at construction.
+    #[must_use]
+    #[cfg(test)]
+    pub(crate) const fn peer(&self) -> SocketAddr {
+        self.session.peer()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::TokenBucket;
-    use std::time::{Duration, Instant};
+    use super::*;
+    use std::time::Duration;
+
+    const ONE: FrameRate = match FrameRate::new(1.0) {
+        Ok(rate) => rate,
+        Err(_) => unreachable!(),
+    };
 
     #[test]
-    fn bucket_starts_full() {
-        let now = Instant::now();
-        let bucket = TokenBucket::new(5, 1.0, now);
-        assert!((bucket.tokens() - 5.0).abs() < 1e-9);
-        assert!((bucket.max_tokens() - 5.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn from_rate_negative_rate_does_not_drain() {
-        let t0 = Instant::now();
-        let mut bucket = TokenBucket::from_rate(-5.0, t0);
-        // Capacity is clamped, so the initial burst still allows one frame.
-        assert!(
-            bucket.try_consume(t0, 1),
-            "clamped bucket allows its initial burst"
-        );
-        // A negative configured rate must clamp to zero refill: the
-        // bucket empties and stays empty; it must not drain further
-        // negative as time elapses.
-        let later = t0 + Duration::from_secs(60);
-        assert!(!bucket.try_consume(later, 1), "no refill at zero rate");
-        assert!(
-            bucket.tokens() >= 0.0,
-            "a negative rate must not drain the bucket below zero: {}",
-            bucket.tokens()
-        );
-    }
-
-    #[test]
-    fn consume_under_budget_succeeds() {
-        let now = Instant::now();
-        let mut bucket = TokenBucket::new(3, 1.0, now);
-        assert!(bucket.try_consume(now, 1));
-        assert!(bucket.try_consume(now, 1));
-        assert!(bucket.try_consume(now, 1));
-    }
-
-    #[test]
-    fn consume_over_budget_fails() {
-        let now = Instant::now();
-        let mut bucket = TokenBucket::new(1, 1.0, now);
-        assert!(bucket.try_consume(now, 1), "first consume succeeds");
-        assert!(!bucket.try_consume(now, 1), "empty bucket rejects");
-    }
-
-    #[test]
-    fn bucket_refills_over_time() {
+    fn capacity_and_elapsed_refill_bound_withdrawals() {
         let start = Instant::now();
-        let mut bucket = TokenBucket::new(1, 1.0, start);
-        assert!(bucket.try_consume(start, 1), "first consume");
-        assert!(!bucket.try_consume(start, 1), "second fails at t0");
-        let t1 = start + Duration::from_secs(1);
-        assert!(bucket.try_consume(t1, 1), "refilled to 1 after 1s");
+        let mut bucket = TokenBucket::new(2, ONE, start);
+        assert!(
+            bucket.try_consume(start, 2),
+            "initial capacity is available"
+        );
+        assert!(
+            !bucket.try_consume(start, 1),
+            "same-instant overdraft is refused"
+        );
+        let half = start + Duration::from_millis(500);
+        assert!(
+            !bucket.try_consume(half, 1),
+            "fractional refill is insufficient"
+        );
+        assert!(
+            bucket.try_consume(start + Duration::from_secs(1), 1),
+            "one elapsed second refills one"
+        );
+        assert!(
+            bucket.try_consume(start + Duration::from_secs(100), 2),
+            "refill caps at capacity"
+        );
+        assert!(
+            !bucket.try_consume(start + Duration::from_secs(100), 1),
+            "no extra overflow credit"
+        );
     }
 
     #[test]
-    fn bucket_refill_clamps_to_max_tokens() {
+    fn rewinding_time_cannot_refill_the_same_interval_twice() {
         let start = Instant::now();
-        let mut bucket = TokenBucket::new(2, 10.0, start);
-        assert!(bucket.try_consume(start, 2));
-        let t1 = start + Duration::from_secs(10);
-        assert!(bucket.try_consume(t1, 2), "bucket refills to max");
-        assert!(!bucket.try_consume(t1, 1), "bucket empty again");
+        let later = start + Duration::from_secs(1);
+        let mut bucket = TokenBucket::new(1, ONE, start);
+        assert!(bucket.try_consume(start, 1));
+        assert!(bucket.try_consume(later, 1));
+        assert!(
+            bucket.try_consume(start, 0),
+            "zero cost remains valid during regression"
+        );
+        assert!(
+            !bucket.try_consume(later, 1),
+            "previously credited time cannot be reused"
+        );
     }
 
     #[test]
-    fn consume_zero_tokens_always_succeeds() {
-        let now = Instant::now();
-        let mut bucket = TokenBucket::new(0, 0.0, now);
-        assert!(bucket.try_consume(now, 0), "zero cost always succeeds");
-    }
-
-    #[test]
-    fn regressing_clock_does_not_underflow() {
-        let later = Instant::now();
-        let mut bucket = TokenBucket::new(1, 1.0, later);
-        let earlier = later.checked_sub(Duration::from_secs(1)).unwrap_or(later);
-        assert!(bucket.try_consume(earlier, 1));
+    fn zero_capacity_and_fractional_rate_have_explicit_behavior()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let start = Instant::now();
+        let mut disabled = TokenBucket::new(0, ONE, start);
+        assert!(disabled.try_consume(start, 0));
+        assert!(!disabled.try_consume(start + Duration::from_secs(1), 1));
+        let mut slow = TokenBucket::from_rate(FrameRate::new(0.05)?, start);
+        assert!(
+            slow.try_consume(start, 1),
+            "sub-one rate permits one initial frame"
+        );
+        assert!(!slow.try_consume(start + Duration::from_secs(1), 1));
+        assert!(
+            slow.try_consume(start + Duration::from_secs(20), 1),
+            "fractional rate remains effective"
+        );
+        Ok(())
     }
 }

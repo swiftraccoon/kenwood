@@ -3,15 +3,13 @@
 //! Demonstrates the shape of a production authorizer:
 //! - Loads a banlist from the `BANLIST_FILE` env var (one callsign
 //!   per line). When the variable is absent, a small hardcoded demo
-//!   set is used; an unreadable configured file logs a warning and
-//!   produces an empty set.
+//!   set is used. A configured file must be readable and every entry valid.
 //! - Rejects any linking client whose callsign is on the list with
 //!   [`RejectReason::Banned`].
 //! - Accepts everyone else with [`AccessPolicy::ReadWrite`].
 //!
-//! The example compiles hermetically; the only I/O at runtime is
-//! the reflector's own UDP bind, which happens inside `run()` and is
-//! not triggered by `cargo build --example`.
+//! Runtime I/O consists of the optional banlist read and reflector UDP service.
+//! Building this example performs neither operation.
 //!
 //! ```text
 //! BANLIST_FILE=./banlist.txt cargo run -p dstar-gateway-server \
@@ -21,16 +19,14 @@
 use std::collections::HashSet;
 use std::env;
 use std::fs;
-use std::sync::Arc;
+use std::path::Path;
 
-use dstar_gateway_core::types::{Callsign, Module, ProtocolKind};
+use dstar_gateway_core::types::{Callsign, Module, ProtocolKind, RoutingCallsign};
 use dstar_gateway_server::{
     AccessPolicy, ClientAuthorizer, LinkAttempt, Reflector, ReflectorConfig, RejectReason,
 };
 
 // Acknowledged workspace dev-deps.
-use proptest as _;
-use thiserror as _;
 use tracing as _;
 use tracing_subscriber as _;
 use trybuild as _;
@@ -38,56 +34,48 @@ use trybuild as _;
 /// A simple banlist authorizer.
 ///
 /// Stores banned callsigns in a [`HashSet`] so lookups are O(1).
-/// Construction is infallible: an I/O failure while reading the
-/// banlist file falls back to an empty set and logs a warning, so
-/// the reflector still comes up.
+/// A configured file must parse completely before the reflector starts.
 #[derive(Debug, Default, Clone)]
 struct BanlistAuthorizer {
     banned: HashSet<Callsign>,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum BanlistError {
+    #[error("cannot read banlist: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("invalid callsign on banlist line {line}: {source}")]
+    Entry {
+        line: usize,
+        source: dstar_gateway_core::TypeError,
+    },
 }
 
 impl BanlistAuthorizer {
     /// Build an authorizer from a file on disk.
     ///
     /// The file format is one callsign per line. Blank lines and
-    /// comment lines starting with `#` are ignored. Unparsable
-    /// callsigns are logged and skipped.
-    fn from_file(path: &str) -> Self {
-        let contents = match fs::read_to_string(path) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("could not read banlist at {path}: {e}; using empty list");
-                return Self::default();
-            }
-        };
+    /// comment lines starting with `#` are ignored. I/O or malformed entries
+    /// return a typed error before any listening socket is opened.
+    fn from_file(path: &Path) -> Result<Self, BanlistError> {
+        Self::parse(&fs::read_to_string(path)?)
+    }
+
+    fn parse(contents: &str) -> Result<Self, BanlistError> {
         let mut banned = HashSet::new();
-        for line in contents.lines() {
+        for (index, line) in contents.lines().enumerate() {
             let trimmed = line.trim();
             if trimmed.is_empty() || trimmed.starts_with('#') {
                 continue;
             }
-            match Callsign::try_from_str(trimmed) {
-                Ok(cs) => {
-                    let _ = banned.insert(cs);
-                }
-                Err(e) => {
-                    eprintln!("skipping malformed banlist entry {trimmed:?}: {e}");
-                }
-            }
+            let callsign =
+                Callsign::try_from_str(trimmed).map_err(|source| BanlistError::Entry {
+                    line: index + 1,
+                    source,
+                })?;
+            let _previous = banned.insert(callsign);
         }
-        Self { banned }
-    }
-
-    /// Build an authorizer from an in-memory banlist, useful for
-    /// tests and for the example's fallback when no file is set.
-    fn from_callsigns(list: &[&str]) -> Self {
-        let mut banned = HashSet::new();
-        for entry in list {
-            if let Ok(cs) = Callsign::try_from_str(entry) {
-                let _ = banned.insert(cs);
-            }
-        }
-        Self { banned }
+        Ok(Self { banned })
     }
 }
 
@@ -95,7 +83,7 @@ impl ClientAuthorizer for BanlistAuthorizer {
     fn authorize(&self, request: &LinkAttempt) -> Result<AccessPolicy, RejectReason> {
         if self.banned.contains(&request.callsign) {
             Err(RejectReason::Banned {
-                reason: format!("{} is on the banlist", request.callsign.as_str().trim()),
+                reason: format!("{} is on the banlist", request.callsign),
             })
         } else {
             Ok(AccessPolicy::ReadWrite)
@@ -109,10 +97,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build the authorizer from the env var, or fall back to a
     // small hardcoded list for the demo path.
-    let authorizer = env::var("BANLIST_FILE").map_or_else(
-        |_| BanlistAuthorizer::from_callsigns(&["BADACT1", "BADACT2"]),
-        |path| BanlistAuthorizer::from_file(&path),
-    );
+    let authorizer = match env::var_os("BANLIST_FILE") {
+        Some(path) => BanlistAuthorizer::from_file(Path::new(&path))?,
+        None => BanlistAuthorizer::parse("BADACT1\nBADACT2\n")?,
+    };
 
     let mut modules = HashSet::new();
     let _ = modules.insert(Module::try_from_char('A')?);
@@ -120,7 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = modules.insert(Module::try_from_char('C')?);
 
     let config = ReflectorConfig::builder()
-        .callsign(Callsign::try_from_str("REF999")?)
+        .callsign(RoutingCallsign::new("REF999")?)
         .module_set(modules)
         .bind("0.0.0.0:30001".parse()?)
         .disable(ProtocolKind::DPlus)
@@ -128,7 +116,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .max_clients_per_module(50)
         .build()?;
 
-    let reflector = Arc::new(Reflector::new(config, authorizer));
+    let reflector = Reflector::new(config, authorizer);
     reflector.run().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_banlist_is_rejected_instead_of_skipping_policy() {
+        let result = BanlistAuthorizer::parse("W1AW\nCALLSIGN-TOO-LONG\nK1ABC\n");
+        assert!(
+            matches!(result, Err(BanlistError::Entry { line: 2, .. })),
+            "{result:?}"
+        );
+    }
 }

@@ -24,16 +24,18 @@ use dstar_gateway_core::codec::dextra::{
 };
 use dstar_gateway_core::header::DstarHeader;
 use dstar_gateway_core::session::client::DExtra;
-use dstar_gateway_core::types::{Callsign, Module, ProtocolKind, StreamId, Suffix};
+use dstar_gateway_core::types::{
+    Callsign, FrameSequence, Module, ProtocolKind, RepeaterIdentity, RoutingCallsign, StreamId,
+    Suffix,
+};
 use dstar_gateway_core::voice::VoiceFrame;
 use dstar_gateway_server::{
-    AllowAllAuthorizer, EndpointSettings, ProtocolEndpoint, Reflector, ReflectorConfig, ShellError,
+    AllowAllAuthorizer, ProtocolEndpoint, Reflector, ReflectorConfig, ShellError,
 };
 
 // Workspace dev-deps used by sibling test targets. Acknowledge them
 // here so the strict `unused_crate_dependencies` lint stays silent
 // for this integration test.
-use proptest as _;
 use thiserror as _;
 use tracing as _;
 use tracing_subscriber as _;
@@ -48,9 +50,7 @@ const fn sid() -> StreamId {
 
 const fn header_for(my: [u8; 8]) -> DstarHeader {
     DstarHeader {
-        flag1: 0,
-        flag2: 0,
-        flag3: 0,
+        flags: dstar_gateway_core::header::HeaderFlags::from_bytes([0; 3]),
         rpt2: Callsign::from_wire_bytes(*b"REF030 G"),
         rpt1: Callsign::from_wire_bytes(*b"REF030 C"),
         ur_call: Callsign::from_wire_bytes(*b"CQCQCQ  "),
@@ -84,6 +84,19 @@ async fn drain_one(sock: &UdpSocket, buf: &mut [u8], label: &str) -> Result<usiz
         .map(|(n, _)| n)
 }
 
+fn dextra_configuration(
+    bind: std::net::SocketAddr,
+) -> Result<ReflectorConfig, Box<dyn std::error::Error>> {
+    Ok(ReflectorConfig::builder()
+        .callsign(RoutingCallsign::new("REF030")?)
+        .module_set(std::collections::HashSet::from([Module::C]))
+        .bind(bind)
+        .keepalive_interval(Duration::from_secs(3600))
+        .disable(ProtocolKind::DPlus)
+        .disable(ProtocolKind::Dcs)
+        .build()?)
+}
+
 #[tokio::test]
 async fn three_clients_fan_out_voice_without_echo() -> Result<(), Box<dyn std::error::Error>> {
     // Endpoint socket, simulating the reflector binding :30001.
@@ -97,16 +110,10 @@ async fn three_clients_fan_out_voice_without_echo() -> Result<(), Box<dyn std::e
     // cannot interleave keepalive datagrams with the exact packet
     // sequence this test asserts on (keepalive emission has its own
     // dedicated tests).
-    let endpoint = Arc::new(ProtocolEndpoint::<DExtra>::new_with_settings(
-        ProtocolKind::DExtra,
-        Module::C,
+    let config = dextra_configuration(endpoint_addr)?;
+    let endpoint = Arc::new(ProtocolEndpoint::<DExtra>::from_config(
+        &config,
         Arc::new(AllowAllAuthorizer),
-        None,
-        EndpointSettings {
-            keepalive_interval: Duration::from_secs(3600),
-            ..EndpointSettings::default()
-        },
-        std::collections::HashSet::from([Module::C]),
     ));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let endpoint_task = {
@@ -128,7 +135,14 @@ async fn three_clients_fan_out_voice_without_echo() -> Result<(), Box<dyn std::e
         (&client_c, Callsign::from_wire_bytes(*b"K2ABC   ")),
     ] {
         let mut link_buf = [0u8; 16];
-        let n = encode_connect_link(&mut link_buf, &callsign, Module::C, Module::B)?;
+        let n = encode_connect_link(
+            &mut link_buf,
+            RepeaterIdentity {
+                callsign: RoutingCallsign::try_from(callsign)?,
+                module: Module::B,
+            },
+            Module::C,
+        )?;
         send_frame(sock, &link_buf, n, endpoint_addr).await?;
     }
 
@@ -164,11 +178,15 @@ async fn three_clients_fan_out_voice_without_echo() -> Result<(), Box<dyn std::e
     let frame = VoiceFrame::silence();
     let mut data_buf = [0u8; 64];
     for seq in 0_u8..2 {
-        let n = encode_voice_data(&mut data_buf, sid(), seq, &frame)?;
+        let n = encode_voice_data(&mut data_buf, sid(), FrameSequence::try_from(seq)?, &frame)?;
         send_frame(&client_a, &data_buf, n, endpoint_addr).await?;
     }
     let mut eot_buf = [0u8; 64];
-    let eot_len = encode_voice_eot(&mut eot_buf, sid(), 0x40 | 2)?;
+    let eot_len = encode_voice_eot(
+        &mut eot_buf,
+        sid(),
+        const { FrameSequence::new(2).unwrap() },
+    )?;
     send_frame(&client_a, &eot_buf, eot_len, endpoint_addr).await?;
 
     // Clients B and C each receive 4 fan-out packets.
@@ -219,28 +237,15 @@ async fn reflector_new_with_socket_shutdown_smoke_test() -> Result<(), Box<dyn s
     let socket = UdpSocket::bind("127.0.0.1:0").await?;
     let bound = socket.local_addr()?;
 
-    let mut modules = std::collections::HashSet::new();
-    let _ = modules.insert(Module::C);
+    let config = dextra_configuration(bound)?;
 
-    let config = ReflectorConfig::builder()
-        .callsign(Callsign::from_wire_bytes(*b"REF030  "))
-        .module_set(modules)
-        .bind(bound)
-        .disable(ProtocolKind::DPlus)
-        .disable(ProtocolKind::Dcs)
-        .build()?;
-
-    let reflector = Arc::new(Reflector::new_with_socket(
-        config,
-        AllowAllAuthorizer,
-        Arc::new(socket),
-    ));
+    let reflector = Reflector::new_with_socket(config, AllowAllAuthorizer, Arc::new(socket));
 
     // Schedule shutdown after a short delay, then run.
-    let r2 = Arc::clone(&reflector);
-    let _t = tokio::spawn(async move {
+    let shutdown = reflector.shutdown_handle();
+    let signal_task = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        r2.shutdown();
+        shutdown.shutdown();
     });
 
     let result: Result<Result<(), ShellError>, tokio::time::error::Elapsed> =
@@ -252,5 +257,6 @@ async fn reflector_new_with_socket_shutdown_smoke_test() -> Result<(), Box<dyn s
             return Err(format!("reflector.run did not exit within 2s: {elapsed}").into());
         }
     }
+    signal_task.await?;
     Ok(())
 }

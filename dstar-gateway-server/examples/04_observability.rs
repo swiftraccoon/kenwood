@@ -25,9 +25,8 @@
 //!   available to examples and tests but not to downstream consumers.
 
 use std::collections::HashSet;
-use std::sync::Arc;
 
-use dstar_gateway_core::types::{Callsign, Module, ProtocolKind};
+use dstar_gateway_core::types::{Module, ProtocolKind, RoutingCallsign};
 use dstar_gateway_server::{AllowAllAuthorizer, Reflector, ReflectorConfig};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt;
@@ -35,7 +34,6 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 // Acknowledged workspace dev-deps.
-use proptest as _;
 use thiserror as _;
 use trybuild as _;
 
@@ -63,14 +61,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = modules.insert(Module::try_from_char('C')?);
 
     let config = ReflectorConfig::builder()
-        .callsign(Callsign::try_from_str("REF999")?)
+        .callsign(RoutingCallsign::new("REF999")?)
         .module_set(modules)
         .bind("0.0.0.0:30001".parse()?)
         .disable(ProtocolKind::DPlus)
         .disable(ProtocolKind::Dcs)
         .build()?;
 
-    let reflector = Arc::new(Reflector::new(config, AllowAllAuthorizer));
+    let reflector = Reflector::new(config, AllowAllAuthorizer);
     reflector.run().await?;
     tracing::info!("reflector shut down cleanly");
     Ok(())

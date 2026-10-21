@@ -19,6 +19,8 @@ use dstar_gateway_core::types::{Callsign, Module, ProtocolKind};
 /// attempt. Returning `Ok(AccessPolicy)` admits the client with the
 /// given access; returning `Err(RejectReason)` rejects the link and
 /// causes the reflector to send the protocol-appropriate NAK.
+/// Implementations run synchronously inside one endpoint transaction and must
+/// perform bounded, nonblocking work. Load external policy data before serving.
 pub trait ClientAuthorizer: Send + Sync + 'static {
     /// Called when a new client attempts to link.
     ///
@@ -36,7 +38,7 @@ pub trait ClientAuthorizer: Send + Sync + 'static {
 /// (protocol, callsign, peer address, and requested module) without
 /// leaking any wire-level details.
 #[non_exhaustive]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LinkAttempt {
     /// Protocol the link came in on.
     pub protocol: ProtocolKind,
@@ -53,7 +55,7 @@ pub struct LinkAttempt {
 /// The reflector uses this value to gate whether inbound voice from
 /// the client is forwarded to other members of the module.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AccessPolicy {
     /// Full RX + TX.
     ReadWrite,
@@ -67,7 +69,7 @@ pub enum AccessPolicy {
 /// per-protocol endpoints translate each variant into the correct
 /// wire-level NAK (or silent drop, for protocols without one).
 #[non_exhaustive]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RejectReason {
     /// Reflector at capacity.
     Busy,
@@ -89,19 +91,14 @@ pub enum RejectReason {
     },
 }
 
-impl RejectReason {
-    /// Convert this reject reason into the core-level
-    /// [`ClientRejectedReason`] surfaced on `ServerEvent`.
-    ///
-    /// Variants map one-to-one and preserve any carried strings.
-    #[must_use]
-    pub fn into_core_reason(self) -> ClientRejectedReason {
-        match self {
-            Self::Busy => ClientRejectedReason::Busy,
-            Self::Banned { reason } => ClientRejectedReason::Banned { reason },
-            Self::UnknownModule => ClientRejectedReason::UnknownModule,
-            Self::MaxClients => ClientRejectedReason::MaxClients,
-            Self::Custom { code, message } => ClientRejectedReason::Custom { code, message },
+impl From<RejectReason> for ClientRejectedReason {
+    fn from(reason: RejectReason) -> Self {
+        match reason {
+            RejectReason::Busy => Self::Busy,
+            RejectReason::Banned { reason } => Self::Banned { reason },
+            RejectReason::UnknownModule => Self::UnknownModule,
+            RejectReason::MaxClients => Self::MaxClients,
+            RejectReason::Custom { code, message } => Self::Custom { code, message },
         }
     }
 }
