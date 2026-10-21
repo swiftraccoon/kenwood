@@ -1,41 +1,21 @@
 # pulsar
 
-Receive-only BrandMeister DMR call recorder. Pulsar connects as a
-software-only [BrandMeister Open Terminal][open-terminal-protocol], subscribes to
-configured group and private IDs, and stores each received call as raw AMBE+2
-plus metadata. It does not represent itself as an RF hotspot or repeater and
-does not send DMR voice.
+Receive-only `BrandMeister` DMR call recorder over
+[Open Terminal](https://github.com/swiftraccoon/kenwood/tree/main/dmr-rewind-core).
+The library provides checked configuration, an I/O-free capture state machine,
+JSON projection, blocking persistence and an owned asynchronous recorder. The
+binary subscribes to configured group/private destinations and stores raw
+AMBE+2 plus metadata. It sends no DMR voice and has no audio decoder or WAV output.
+DMR AMBE+2 cannot be sent to the workspace's D-STAR AMBE 3600x2400 decoder.
 
-Pulsar deliberately does not decode audio. DMR uses AMBE+2, which the
-repository's current software vocoder does not support, so recordings have no
-WAV derivative. The raw container remains available for later playback or
-decoding with a compatible vocoder.
+## Configure and run
 
-## Before you start
-
-Open Terminal setup is self-service; it does not require a Simple External
-Application allocation from a master administrator:
-
-1. Obtain your own seven-digit DMR ID from [RadioID.net][radioid].
-2. [Register a BrandMeister account][bm-register] for that DMR ID.
-3. In BrandMeister SelfCare, [set a Hotspot Security password][bm-hotspot].
-4. Choose the BrandMeister master you will use for the terminal connection.
-
-The terminal identity is your seven-digit DMR ID. Its authentication secret is
-the Hotspot Security password you set in SelfCare, not your BrandMeister
-account password, dashboard API key, or an administrator-issued application
-password. Open Terminal normally uses port **54006/UDP**.
-
-## Configuration
-
-From the repository root, copy the checked-in starter file, then replace
-the placeholder DMR ID and review the selected master and destinations:
-
-```bash
-cp pulsar.example.toml pulsar.toml
-```
-
-The starter is equivalent to:
+Copy the tracked `pulsar.example.toml` from the workspace root to `pulsar.toml`.
+Use your seven-digit subscriber DMR ID and a master you can access. Consult
+[`BrandMeister` account setup](https://help.brandmeister.network/dashboard/register-for-an-account/)
+and [Hotspot Security](https://help.brandmeister.network/dashboard/hotspot-security/)
+for service credentials. Passwords come only from named environment variables;
+never store a password in TOML or logs.
 
 ```toml
 recordings_dir = "dmr-recordings"
@@ -44,7 +24,7 @@ call_hang_secs = 3
 server_timeout_secs = 15
 
 [[master]]
-name = "bm-us-chicago"
+name = "chosen-master"
 host = "3104.master.brandmeister.network"
 port = 54006
 dmr_id = 3101234
@@ -54,132 +34,162 @@ talkgroups = [91, 3100]
 private_ids = []
 ```
 
-Talkgroup 91 (Worldwide) and 3100 (USA) are examples only. Choose destinations
-appropriate for the traffic you lawfully intend to archive and the communities
-whose practices you will follow.
+The destination list is an example. Select traffic appropriate to your lawful
+archival use and the practices of its community.
 
-Never put the Hotspot Security password in TOML. `password_env` names the
-environment variable from which Pulsar reads it. Supply the variable through a
-service manager or secret store; for a local shell:
-
-```bash
+```sh
 read -rs PULSAR_CHOSEN_MASTER_PASSWORD
 export PULSAR_CHOSEN_MASTER_PASSWORD
-```
-
-The configuration fields are:
-
-| Field | Default | Meaning |
-|---|---|---|
-| `recordings_dir` | `"dmr-recordings"` | Base output directory |
-| `max_capture_records_per_call` | required | Nonzero ceiling shared by retained audio, voice-header, and embedded link-control records for one call |
-| `call_hang_secs` | `3` | Quiet time after the last frame before an incomplete call is finalized |
-| `server_timeout_secs` | `15` | No-receive interval before a master connection is considered lost; must exceed 5 seconds |
-| `[[master]].name` | required | Unique operator label (sanitized for output paths) |
-| `[[master]].host` | required | BrandMeister master hostname or IP |
-| `[[master]].port` | `54006` | Open Terminal UDP port |
-| `[[master]].dmr_id` | required | Your seven-digit subscriber DMR ID |
-| `[[master]].password_env` | required | Environment variable containing your Hotspot Security password |
-| `[[master]].bind` | `"0.0.0.0:0"` | Local UDP bind address |
-| `[[master]].talkgroups` | required | Nonempty group-voice destination IDs |
-| `[[master]].private_ids` | `[]` | Private-voice destination IDs |
-
-Use a distinct environment-variable name if you configure more than one
-credential.
-
-## Check and run
-
-From the repository root:
-
-```bash
 cargo run -p pulsar -- check --config pulsar.toml
 cargo run -p pulsar -- --config pulsar.toml
 ```
 
-`check` validates the file, subscription IDs, and referenced password
-environment variables without starting the recorder. The normal command runs
-until Ctrl-C, finalizes calls already in progress, and drains its recording
-queue during orderly shutdown. `cargo run -p pulsar -- --help` is the
-authoritative command summary if the CLI is being developed alongside this
-README.
+`check` loads configuration and referenced credentials without opening a
+connection. Normal operation runs until Ctrl-C, finalizes open calls and drains
+the writer queue. `cargo run -p pulsar -- --help` describes CLI arguments.
 
-## Subscription behavior
+| Setting | Contract |
+| --- | --- |
+| `recordings_dir` | Nonempty path; defaults to `dmr-recordings`. |
+| `max_capture_records_per_call` | Required nonzero count representable by the host. |
+| `call_hang_secs` | Positive monotonic quiet interval; defaults to 3 seconds. |
+| `server_timeout_secs` | Valid-packet timeout greater than 5 seconds; defaults to 15. |
+| `[[master]].name` | Nonempty trimmed label, unique under ASCII case folding. |
+| `[[master]].host` | IP literal or ASCII DNS name, without a scheme or port. |
+| `[[master]].port` | Nonzero remote UDP port; defaults to 54006. |
+| `[[master]].dmr_id` | Seven-digit outbound subscriber allocation. |
+| `[[master]].password_env` | Name matching `[A-Za-z_][A-Za-z0-9_]*`. |
+| `[[master]].bind` | Local endpoint, default `0.0.0.0:0`; port zero is ephemeral. |
+| `[[master]].talkgroups` | Nonempty, distinct nonzero 24-bit group destinations. |
+| `[[master]].private_ids` | Distinct nonzero 24-bit private destinations; defaults empty. |
 
-All talkgroup and private-ID subscriptions in one `[[master]]` entry share one
-Open Terminal stream. They are filters on that stream, not independent tuners
-or simultaneous sessions. If subscribed calls overlap, only the call selected
-for that terminal stream can be received and archived; adding IDs does not
-provide concurrent coverage.
+DNS resolution is fallible network I/O and must return the bind's IP family.
+All subscriptions for one master share one terminal stream. Adding destinations
+does not provide simultaneous coverage of overlapping calls.
 
-## Recording format
+## Recording and completion
 
-Each completed call has a raw `.ambe` container and a JSON metadata sidecar. A
-recording exists **only when its JSON sidecar exists**. Pulsar writes and syncs
-temporary data, installs the raw file first, and installs the synced JSON last
-as the commit marker. On Unix it also syncs the containing directory after
-each rename. A crash may leave a temporary file or an uncommitted raw file, but
-readers must ignore either when the matching JSON is absent. Power-loss
-durability on other platforms still depends on that operating system and
-filesystem.
+Files are grouped by sanitized master label, destination and UTC date. A
+recording exists when its JSON sidecar exists. The writer atomically reserves
+the whole stem across processes, writes/syncs temporary bytes, then installs
+raw `.ambe` first and synced JSON last with non-overwriting hard links. The
+filesystem must support same-directory hard links. On Unix, the directory
+hierarchy and ancestor entries are synced before installation; the containing
+directory is synced after each final file installation. Other platforms sync
+file contents and make no directory-durability promise.
 
-Completed calls enter a bounded writer queue, so normal file syncing does not
-pause UDP reception. If storage remains slower than incoming completed calls
-for long enough to fill the queue, the recorder applies backpressure rather
-than growing memory without limit. Any persistence failure stops the process
-with an error instead of silently discarding later calls.
+A crash may leave `.reserve`, `.tmp` or raw-only files; readers ignore those
+without JSON, and later writes skip their stems. An error after JSON
+installation can leave a visible complete pair, including a final directory-sync
+error. Inspect JSON visibility before recovery; existing recordings are never
+overwritten. Filesystem synchronization is blocking and has no overall timeout.
 
-Live call retention is also bounded. `max_capture_records_per_call` counts
-each retained audio packet, voice-header record, and embedded link-control
-record against one shared per-call budget. The example value permits 20 minutes
-when every retained record is a 60 ms audio packet. A call that attempts one
-more record is discarded in full and stops Pulsar with an explicit error;
-Pulsar never writes a silently truncated recording. Choose a limit that covers
-the longest call you intend to archive within the memory budget of the host.
+Completed calls pass through a bounded writer queue. A full queue pauses UDP
+consumption and can lose datagrams. Persistence or capture-limit failure stops
+the recorder. The retention limit is one budget shared by audio packets, voice
+headers and embedded records. Overflow discards the entire partial call. A
+20,000-record budget covers twenty minutes when every record is a 60 ms audio
+packet; ancillary records consume the same budget.
 
-The raw container preserves every accepted 27-byte Open Terminal DMR audio
-payload in arrival order. All integers are little-endian:
+UTC timestamps describe recordings. Independently supplied monotonic elapsed
+readings determine inactivity, so UTC clock adjustments do not end calls early
+or postpone expiry. Missing metadata stays explicit. A conflicting terminator
+retains its raw bytes without replacing the active call's identity. Only an
+observed terminator produces a terminator-ended call.
+
+Version 1 stores the accepted 27 audio bytes unchanged, in arrival order. All
+integers are little-endian:
 
 ```text
-Header (16 bytes):
-  magic       [u8; 8] = "PLSRAMBE"
-  version     u16     = 1
-  record_len  u16     = 34
-  reserved    u32     = 0
-
-Records (34 bytes each):
-  sequence    u32       Open Terminal transport sequence
-  flags       u16       Open Terminal transport flags
-  subtype     u8        DMR audio subtype
-  ambe        [u8; 27]  encoded AMBE+2 payload, unchanged
+Header (16 bytes): magic [u8;8] = "PLSRAMBE", version u16 = 1,
+                   record_len u16 = 34, reserved u32 = 0
+Record (34 bytes): sequence u32, flags u16, subtype u8, ambe [u8;27]
 ```
 
-The JSON is the searchable call record. It identifies the configured master
-and terminal DMR ID, group/private session, source and target identities when
-the superheader supplied them, timing and end reason, audio counts, transport
-sequences, and raw filename. It also retains raw 12-byte voice-header Full Link
-Control, 10-byte embedded Link Control, and the final terminator. Some masters
-send the terminator with 12-byte Full Link Control and some send it empty;
-Pulsar preserves either form. A timeout-ended or otherwise incomplete call has
-no terminator record. Missing metadata remains explicit rather than being
-inferred from a later call.
+The `pulsar-recording/1` JSON view contains connection/call identity, UTC timing,
+end reason, counts, transport sequences, the raw filename, raw twelve-byte
+voice headers, variable embedded bodies and an empty or twelve-byte terminator.
+It retains master-provided callsign text as a lossy display view and exact ten
+wire bytes separately as `callsign_wire_hex`. The raw-container version remains 1.
 
-There is deliberately no WAV field or file. Do not feed these frames to the
-D-STAR AMBE 3600x2400 decoder: DMR AMBE+2 is a different codec.
+## Library workflows
 
-## Security, law, and community
+```rust
+use std::time::Duration;
+use chrono::{DateTime, Utc};
+use dmr_rewind_core::{DmrAudioSubtype, PacketFlags};
+use pulsar::capture::{AudioPacket, CaptureManager, CaptureRecordLimit,
+    CaptureTime, FinishReason, StreamOrigin};
+use pulsar::config::Config;
+use pulsar::writer::{container_bytes, RecordingDoc};
 
-Open Terminal is an unencrypted UDP service. Keep the terminal host and secret
-restricted, use a trusted network path, and do not expose the local listener
-unnecessarily.
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let config: Config = r#"
+max_capture_records_per_call = 1
+[[master]]
+name = "local"
+host = "127.0.0.1"
+dmr_id = 3101234
+password_env = "PULSAR_PASSWORD"
+talkgroups = [91]
+"#.parse()?;
+let master = config.masters().first().ok_or("no master")?;
+let origin = StreamOrigin::new(master, "127.0.0.1:54006".parse()?);
+let now = CaptureTime::new(DateTime::<Utc>::UNIX_EPOCH, Duration::ZERO);
+let packet = AudioPacket { transport_seq: u32::MAX.into(),
+    flags: PacketFlags::from_bits(0x8001), subtype: DmrAudioSubtype::new(6)?,
+    ambe: [0xA5;27] };
+let mut capture = CaptureManager::new(origin.clone(), config.max_capture_records_per_call());
+capture.on_audio(packet, now)?;
+assert!(capture.on_audio(packet, now).is_err());
+assert!(!capture.is_active());
 
-Use Pulsar only for private, lawful, receive-only archival. Access to traffic
-does not by itself grant permission to transcribe or republish it. Follow
-applicable law, BrandMeister policy, and the practices of each talkgroup
-community. This is not legal advice.
+let mut capture = CaptureManager::new(origin, CaptureRecordLimit::new(2)?);
+capture.on_audio(packet, now)?;
+let call = capture.finish(FinishReason::Shutdown,
+    CaptureTime::new(now.wall(), Duration::from_millis(60))).ok_or("no call")?;
+assert!(call.terminator().is_none());
+let raw = container_bytes(call.audio_packets());
+assert_eq!(raw.len(), 16 + 34);
+assert_eq!(raw.get(23..50), Some(&[0xA5;27][..]));
+let metadata = serde_json::to_value(RecordingDoc::from(&call))?;
+assert_eq!(metadata.pointer("/audio/packets").and_then(serde_json::Value::as_u64), Some(1));
+# Ok(())
+# }
+```
+
+Completed records provide immutable accessors. Persistence adds the reserved raw
+filename while retaining the stable JSON view:
+
+```rust,no_run
+use pulsar::{capture::CompletedRecording, writer::{Writer, WriteError}};
+fn persist(call: &CompletedRecording) -> Result<std::path::PathBuf, WriteError> {
+    Writer::new("dmr-recordings".into()).write(call)
+}
+```
+
+`Recorder::wait` retains task ownership when its future is cancelled. Dropping
+the handle requests shutdown; its coordinator continues draining on the
+runtime. Keep the runtime alive and await completion to collect failures.
+Signal-handler failure takes the same drain path as an ordinary interrupt.
+Queue draining and blocking filesystem synchronization have no overall deadline.
+
+```rust,no_run
+use std::time::Duration;
+use pulsar::{config::Config, session::{Error, Recorder}};
+async fn record_for_one_minute(config: Config) -> Result<(), Error> {
+    let mut recorder = Recorder::start(config)?;
+    tokio::select! {
+        completed = recorder.wait() => return completed,
+        () = tokio::time::sleep(Duration::from_secs(60)) => {}
+    }
+    recorder.shutdown().await
+}
+```
+
+This unpublished API is experimental. Configuration uses checked constructors,
+accessors and `FromStr`; capture records carry canonical wire types; external
+completion reasons cannot invent terminators; metadata projection is
+`RecordingDoc::new`/`From`; and recorder handles expose explicit shutdown.
 
 Pulsar is GPL-2.0-or-later.
-
-[open-terminal-protocol]: ../dmr-rewind-core/README.md
-[bm-register]: https://help.brandmeister.network/dashboard/register-for-an-account/
-[bm-hotspot]: https://help.brandmeister.network/dashboard/hotspot-security/
-[radioid]: https://radioid.net/account/register

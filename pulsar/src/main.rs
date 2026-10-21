@@ -6,19 +6,19 @@
 // The binary is a separate compilation unit. These dependencies are
 // used by the library target and acknowledged here so the workspace's
 // `unused_crate_dependencies` lint remains useful.
+use std::path::PathBuf;
+use std::process::ExitCode;
+
 use chrono as _;
+use clap::{Parser, Subcommand};
 use dmr_rewind as _;
+use dmr_rewind_core as _;
 use serde as _;
 use serde_json as _;
 #[cfg(test)]
 use tempfile as _;
 use thiserror as _;
 use toml as _;
-
-use std::path::PathBuf;
-use std::process::ExitCode;
-
-use clap::{Parser, Subcommand};
 
 /// Receive-only `BrandMeister` DMR call recorder.
 #[derive(Debug, Parser)]
@@ -46,7 +46,7 @@ async fn main() -> ExitCode {
     let args = Args::parse();
     init_tracing(args.verbose);
 
-    let config = match pulsar::config::load(&args.config) {
+    let config = match pulsar::config::Config::load(&args.config) {
         Ok(config) => config,
         Err(error) => {
             tracing::error!(
@@ -71,22 +71,22 @@ async fn main() -> ExitCode {
 }
 
 fn check(config: &pulsar::config::Config) -> ExitCode {
-    for master in &config.masters {
+    for master in config.masters() {
         if let Err(error) = master.load_password() {
-            tracing::error!(master = %master.name, error = %error, "credential check failed");
+            tracing::error!(master = master.name(), error = %error, "credential check failed");
             return ExitCode::FAILURE;
         }
     }
-    let subscriptions = config.masters.iter().fold(0usize, |total, master| {
+    let subscriptions = config.masters().iter().fold(0usize, |total, master| {
         total
-            .saturating_add(master.talkgroups.len())
-            .saturating_add(master.private_ids.len())
+            .saturating_add(master.talkgroups().len())
+            .saturating_add(master.private_ids().len())
     });
     println!(
         "valid: {} master connection(s), {subscriptions} subscription(s), output {}, max {} capture records/call",
-        config.masters.len(),
-        config.recordings_dir.display(),
-        config.max_capture_records_per_call.get()
+        config.masters().len(),
+        config.recordings_dir().display(),
+        config.max_capture_records_per_call().get()
     );
     ExitCode::SUCCESS
 }

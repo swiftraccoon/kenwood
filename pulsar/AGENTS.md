@@ -16,7 +16,7 @@ tracked starter.
 
 - Receive-only: Pulsar never sends DMR voice or presents itself as a hotspot or repeater.
 - No audio decode and no WAV. DMR AMBE+2 is not the D-STAR AMBE 3600x2400 codec, and `mbelib-rs` deliberately does not implement AMBE+2; never route these frames to its decoder.
-- Write order: the synced raw `.ambe` is installed first and the synced JSON last as the commit marker, with a directory sync after each rename on Unix, so a recording exists iff its JSON exists. Any persistence failure stops the process rather than dropping later calls.
+- Write order: reserve the whole stem with `create_new`, install synced raw `.ambe` first and synced JSON last through non-overwriting hard links. Sync the hierarchy and ancestor directory entries before installation and the containing directory after each install on Unix. A recording exists iff its JSON exists, including an error after JSON installation; never overwrite that pair on retry. Any persistence failure stops the process rather than dropping later calls.
 - Completed calls pass through a bounded writer queue, so slow storage applies backpressure instead of growing memory.
 - `max_capture_records_per_call` is one budget shared by audio, voice-header and embedded link-control records. A call that exceeds it is discarded whole and stops Pulsar with an error; never write a truncated recording.
 - The container is a reader contract: magic `PLSRAMBE`, version 1, 34-byte little-endian records (`sequence u32`, `flags u16`, `subtype u8`, the 27 AMBE+2 bytes unchanged). A layout change changes the version.

@@ -1,11 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Swift Raccoon
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! DMR call recorder for `BrandMeister`'s REWIND application interface.
-//!
-//! This library contains the I/O-free call capture model, validated
-//! configuration, and atomic raw AMBE+2/metadata writer. Network session
-//! supervision lives in the `pulsar` binary.
+#![doc = include_str!("../README.md")]
 
 // These dependencies are used by the binary target. Acknowledging them here
 // keeps the workspace's per-target dependency lint useful.
