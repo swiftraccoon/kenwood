@@ -1,33 +1,91 @@
 //! Events emitted by the APRS-IS client.
 
+use std::borrow::Cow;
+
+/// The server's correlated acknowledgement for the current connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LoginState {
+    /// No matching login response has arrived.
+    Pending,
+    /// The server accepted the identity for packet uploads.
+    Verified,
+    /// The server accepted a feed-only login using passcode `-1`.
+    ReceiveOnly,
+    /// The server rejected the supplied nonnegative passcode.
+    Rejected,
+}
+
+impl std::fmt::Display for LoginState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Pending => "pending",
+            Self::Verified => "verified",
+            Self::ReceiveOnly => "receive-only",
+            Self::Rejected => "rejected",
+        })
+    }
+}
+
 /// An APRS-IS packet line as received from the server.
 ///
-/// Carries both the **wire-truth bytes** (`raw`, with the trailing
-/// `\r\n` stripped) and a **lossy UTF-8 view** (`line`) for parsing and
-/// display. The lossy view is built via [`String::from_utf8_lossy`],
-/// which replaces invalid UTF-8 sequences with the U+FFFD replacement
-/// character. This prevents a single non-UTF-8 byte (common in Mic-E
-/// payloads, raw weather data, and Latin-1 comments) from killing the
-/// TCP connection, while keeping the raw bytes available for callers
-/// that need exact wire fidelity (e.g. `IGate` forwarding, packet
-/// captures).
-///
-/// Pre-2026 versions of this crate decoded via `BufReader::read_line`,
-/// which returns `Err(io::Error::InvalidData)` on the first non-UTF-8
-/// byte. That error tore down the long-lived TCP session on the first
-/// real binary-bearing packet.
+/// Retains the original bytes without trailing line terminators. [`Self::line`]
+/// derives a lossy UTF-8 view from those bytes for display; forwarding and
+/// captures use [`Self::raw`] to preserve binary information fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AprsIsPacket {
-    /// Wire-truth bytes for the packet line, **without** the trailing
-    /// `\r` / `\n`. Callers that need to forward the packet across an
-    /// `IGate` or write it to a capture file should use this field:
-    /// `line` may carry replacement characters in place of any non-UTF-8
-    /// byte and is not byte-identical to what the server sent.
-    pub raw: Vec<u8>,
-    /// Lossy UTF-8 view of `raw`, suitable for parsing via
-    /// [`crate::parse_is_line`] and for display. Any byte that is not
-    /// valid UTF-8 is replaced with U+FFFD.
-    pub line: String,
+    raw: Vec<u8>,
+}
+
+impl AprsIsPacket {
+    pub(crate) const fn from_received(raw: Vec<u8>) -> Self {
+        Self { raw }
+    }
+
+    /// Borrows the exact received packet bytes without line terminators.
+    #[must_use]
+    pub fn raw(&self) -> &[u8] {
+        &self.raw
+    }
+
+    /// Borrows valid UTF-8 or replaces malformed sequences with U+FFFD.
+    #[must_use]
+    pub fn line(&self) -> Cow<'_, str> {
+        String::from_utf8_lossy(&self.raw)
+    }
+
+    /// Transfers the exact received bytes without copying their allocation.
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.raw
+    }
+}
+
+impl AsRef<[u8]> for AprsIsPacket {
+    fn as_ref(&self) -> &[u8] {
+        self.raw()
+    }
+}
+
+/// A correlated server response that rejected passcode authentication.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum LoginRejection {
+    /// The server returned `unverified` for this connection's passcode login.
+    #[error("server returned unverified: {response}")]
+    Unverified {
+        /// Complete received response text without line terminators.
+        response: String,
+    },
+}
+
+impl LoginRejection {
+    /// Borrows the complete response for diagnostics.
+    #[must_use]
+    pub fn response(&self) -> &str {
+        match self {
+            Self::Unverified { response } => response,
+        }
+    }
 }
 
 /// An event from the APRS-IS server.
@@ -48,11 +106,10 @@ pub enum AprsIsEvent {
     /// killing the connection.
     Comment(String),
 
-    /// The server accepted the login (`# logresp ... verified, server ...`).
+    /// The server acknowledged this connection's login identity.
     ///
-    /// Emitted the first time a `logresp` line confirming `verified` is
-    /// seen. `server` is the upstream server's hostname extracted from
-    /// the comment, if present.
+    /// Emitted once for `verified`, or for `unverified` with receive-only
+    /// authentication. `server` is extracted from the response when present.
     LoggedIn {
         /// APRS-IS server hostname from the `logresp` line (e.g. `T2TEST`).
         server: Option<String>,
@@ -63,8 +120,8 @@ pub enum AprsIsEvent {
     /// Emitted when the passcode does not validate for the given
     /// callsign. `reason` carries the full comment text for diagnosis.
     LoginRejected {
-        /// Raw reason text from the server's `logresp` line.
-        reason: String,
+        /// Typed rejection retaining the server's complete response.
+        reason: LoginRejection,
     },
 
     /// The TCP connection was closed (EOF from server).

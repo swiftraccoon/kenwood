@@ -2,10 +2,85 @@
 
 use crate::uplink::AprsIsUplinkLineError;
 
+/// The checked login setting that rejected an input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LoginField {
+    /// Callsign and optional APRS-IS SSID.
+    Callsign,
+    /// Server hostname or IP address.
+    Server,
+    /// Software-name login word.
+    SoftwareName,
+    /// Software-version login word.
+    SoftwareVersion,
+    /// Raw filter extension text.
+    Filter,
+}
+
+impl std::fmt::Display for LoginField {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Callsign => "callsign",
+            Self::Server => "server",
+            Self::SoftwareName => "software_name",
+            Self::SoftwareVersion => "software_version",
+            Self::Filter => "filter",
+        })
+    }
+}
+
+/// The violated login-field construction rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
+#[non_exhaustive]
+pub enum LoginFieldError {
+    /// A field required ASCII but contained another encoding.
+    #[error("must contain only ASCII characters")]
+    NonAscii,
+    /// The complete callsign and SSID exceeded nine bytes.
+    #[error("must not exceed 9 ASCII characters including SSID")]
+    IdentityTooLong,
+    /// More than one SSID separator occurred.
+    #[error("may contain only one SSID separator")]
+    MultipleSsidSeparators,
+    /// The base callsign contained fewer than three characters.
+    #[error("base callsign must contain at least 3 alphanumeric characters")]
+    BaseTooShort,
+    /// The base contained a byte outside ASCII letters and digits.
+    #[error("base callsign must contain only ASCII alphanumeric characters")]
+    InvalidBase,
+    /// The SSID contained zero or more than two characters.
+    #[error("SSID must contain 1 or 2 characters")]
+    InvalidSsidLength,
+    /// The SSID contained a byte outside ASCII letters and digits.
+    #[error("SSID must contain only ASCII alphanumeric characters")]
+    InvalidSsid,
+    /// The explicit SSID `-0` was supplied instead of omitting it.
+    #[error("SSID zero must be omitted")]
+    ExplicitZeroSsid,
+    /// Eight hexadecimal characters are reserved for server IP identities.
+    #[error("eight hexadecimal characters are reserved for server identities")]
+    ReservedServerIdentity,
+    /// A required software word was empty.
+    #[error("must not be empty")]
+    Empty,
+    /// A software word contained whitespace or a control byte.
+    #[error("must be one word without whitespace or control characters")]
+    NotSingleWord,
+    /// A raw filter contained a control byte.
+    #[error("must not contain control characters")]
+    ControlCharacter,
+    /// A server setting was neither a DNS hostname nor an IP address.
+    #[error("must be a DNS hostname or IP address")]
+    InvalidEndpoint,
+}
+
 /// Errors that can occur during APRS-IS operations.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum AprsIsError {
+    /// Structured filter clauses violate their combination rules.
+    #[error("invalid APRS-IS filter: {0}")]
+    InvalidFilter(#[from] crate::FilterError),
     /// The TCP connection could not be established.
     #[error("APRS-IS connect failed: {0}")]
     Connect(#[source] std::io::Error),
@@ -18,13 +93,22 @@ pub enum AprsIsError {
     #[error("APRS-IS write failed: {0}")]
     Write(#[source] std::io::Error),
 
-    /// The initial login handshake timed out.
+    /// A previous send failed or was cancelled after taking the write half.
+    /// Reconnect before sending another line.
+    #[error("APRS-IS outgoing stream is retired; reconnect before sending")]
+    ConnectionRetired,
+
+    /// A packet upload was attempted before a verified server acknowledgement.
+    /// The rejected line writes no bytes and leaves the stream available.
+    #[error("APRS-IS packet upload requires a verified login; current state is {state}")]
+    UnverifiedConnection {
+        /// The current connection's correlated login state.
+        state: crate::LoginState,
+    },
+
+    /// The shared connection deadline expired while writing the login line.
     #[error("APRS-IS login timed out")]
     LoginTimeout,
-
-    /// The server rejected the login credentials.
-    #[error("APRS-IS login rejected: {0}")]
-    LoginRejected(String),
 
     /// Outbound bytes did not form one safe, correctly framed APRS-IS
     /// line.
@@ -51,8 +135,8 @@ pub enum AprsIsError {
     #[error("APRS-IS login field {field} is invalid: {reason}")]
     InvalidLoginField {
         /// Name of the offending field (e.g. `"software_name"`).
-        field: &'static str,
+        field: LoginField,
         /// Human-readable reason the value was rejected.
-        reason: &'static str,
+        reason: LoginFieldError,
     },
 }

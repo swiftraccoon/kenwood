@@ -39,7 +39,7 @@ fn utc_label() -> String {
 }
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let Some(call) = args.next() else {
         println!("usage: monitor <CALLSIGN> [extra filter terms...]");
@@ -55,8 +55,7 @@ async fn main() {
 
     // Distinct SSID so a same-callsign igate can hold its own APRS-IS
     // session at the same time.
-    let mut config = AprsIsConfig::receive_only(&format!("{call}-14"));
-    config.filter.clone_from(&filter);
+    let config = AprsIsConfig::receive_only(&format!("{call}-14"))?.with_raw_filter(&filter)?;
 
     println!(
         "[{}] connecting as {call}-14, filter: {filter}",
@@ -80,7 +79,7 @@ async fn main() {
                 }
             }
             Ok(Ok(AprsIsEvent::Packet(pkt))) => {
-                println!("[{}] {}", utc_label(), pkt.line);
+                println!("[{}] {}", utc_label(), pkt.line());
             }
             Ok(Ok(AprsIsEvent::Comment(line))) => {
                 println!("[{}] # {line}", utc_label());
@@ -103,4 +102,5 @@ async fn main() {
             }
         }
     }
+    Ok(())
 }

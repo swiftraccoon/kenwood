@@ -17,5 +17,6 @@ on-air validation phase runner that pairs with this witness is listed in
 
 - `ax25-codec` is a direct dependency because `Ax25Address`, `RouteEntry` and `Ax25Packet` appear in the public IGate and q-construct signatures. They are NOT re-exported through `aprs`, so do not try to reach them that way.
 - The default server and port are set in `AprsIsConfig::new`, not in `client.rs`.
-- `AprsIsFilter` implements a subset of the APRS-IS filter grammar (`raw`, `negated`, `as_wire`, `join`); the real grammar is wider, so check before assuming a filter form is supported.
-- There is no automatic retry loop. `AprsIsClient::reconnect()` re-dials and re-logins; callers own their backoff policy.
+- `AprsIsFilter` implements a subset of the APRS-IS filter grammar (`raw`, `negated`, `to_wire`, `join`); check the public grammar before assuming a filter form is supported. Structured payloads and combination limits are checked; raw extensions check framing only.
+- Reconnection is explicit. `connect_with_retry()` retries transport failures with a nonzero limit or indefinitely; `reconnect()` preserves the old client until replacement succeeds.
+- A packet upload requires `LoginState::Verified`, established by the matching server login response. `Passcode::Verified` supplies credentials only. Use `IgateMessaging::Bidirectional` for `qAR` and `IgateMessaging::ReceiveOnly` for `qAO`; both require verified Internet login.

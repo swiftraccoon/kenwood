@@ -1,11 +1,8 @@
 //! APRS-IS Q-construct classification and `IGate` path rewriting.
 //!
-//! The Q-construct is a single ASCII token, beginning with `qA`, that
-//! every packet carries in its APRS-IS path. It records *how* the
-//! packet entered the network: directly from RF via a verified `IGate`,
-//! from a server peer, from a client app, and so on. APRS-IS servers
-//! propagate the construct unchanged; the originating station (`IGate`
-//! or client) inserts it.
+//! Q-constructs identify packet entry and tracing in the APRS-IS path.
+//! Servers insert constructs for their connection type; an RF `IGate` appends
+//! `qAR` for messaging support or `qAO` when it provides no return RF path.
 //!
 //! This module exposes:
 //!
@@ -20,42 +17,37 @@
 //!   when the sender opted out, then gates the heard path **verbatim**
 //!   (every hop preserved, including its has-been-repeated `*` marker)
 //!   and appends exactly `,<qconstruct>,<IGATECALL>` to the end. The
-//!   q-construct is `qAR` for a verified login and `qAO` for a
-//!   receive-only login. IGating.aspx is explicit: "No modification of
+//!   q-construct is `qAR` for a usable RF return-message path and `qAO`
+//!   otherwise. Both require a verified Internet login when sent.
+//!   IGating.aspx is explicit: "No modification of
 //!   the TNC2 format line should be made except to add ,qAR,IGATECALL
 //!   to the end of the path."
 //!
-//! Earlier versions of this crate advertised "`IGate` path rewriting"
-//! while shipping only the naive append helper. The strict rewriter
-//! lives in [`igate_format_for_is`].
 
 use ax25_codec::{Ax25Address, RouteEntry};
 
-use crate::login::Passcode;
 use crate::uplink::{AprsIsUplinkLine, AprsIsUplinkLineError};
 
 /// APRS-IS Q-construct tag (path identifier that records how a packet
 /// entered the APRS-IS network).
 ///
 /// Per <https://www.aprs-is.net/q.aspx>, every packet seen by an APRS-IS
-/// server has exactly one Q-construct inserted into its path. Servers
-/// that relay packets propagate the construct unchanged; servers that
-/// originate packets add one based on the packet's source.
+/// server records its entry connection or tracing mode with this path tag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum QConstruct {
-    /// `qAC`: client-owned, server verified the login.
+    /// `qAC`: directly received from a matching verified client login.
     QAC,
-    /// `qAX`: client-owned, server did *not* verify the login.
+    /// `qAX`: directly received from an unverified login; deprecated upstream.
     QAX,
-    /// `qAU`: client-owned, received via UDP submit.
+    /// `qAU`: received directly through UDP submission.
     QAU,
-    /// `qAo`: server-owned, received from a different server.
+    /// `qAo`: gated through a client-only port with matching legacy gate identity.
     QAo,
-    /// `qAO`: server-owned, originated on RF (`IGATE`).
+    /// `qAO`: RF gate without messaging, or indirect/send-only client-port traffic.
     QAO,
-    /// `qAS`: server-owned, received from a peer.
+    /// `qAS`: server-originated traffic or a server packet without a Q-construct.
     QAS,
-    /// `qAr`: gated from RF with no callsign substitution.
+    /// `qAr`: received indirectly from a remote gate using the legacy `,I` path.
     QAr,
     /// `qAR`: gated from RF by a verified login.
     QAR,
@@ -127,19 +119,8 @@ impl std::fmt::Display for QConstruct {
 /// Injects the Q-construct + gate callsign immediately after `path`,
 /// producing `source>destination,path,qXX,gate:data\r\n`.
 ///
-/// # Scope (and what this is **not**)
-///
-/// This is a *naive* line builder for callers that have already
-/// computed the correct construct externally. It does not:
-///
-/// - validate the packet against `IGate` gating rules
-///   (`NOGATE` / `RFONLY` / `TCPIP` / `TCPXX`),
-/// - strip has-been-repeated (`*`) markers from the path,
-/// - remove an existing q-construct from `path` before appending,
-/// - pick `qAR` vs `qAr` from the login verification state.
-///
-/// Use [`igate_format_for_is`] when you need the full
-/// <https://www.aprs-is.net/q.aspx> rewriting algorithm.
+/// The caller selects the construct and gate identity. Use
+/// [`igate_format_for_is`] to apply RF gating opt-outs and loop checks.
 ///
 /// # Errors
 ///
@@ -147,26 +128,25 @@ impl std::fmt::Display for QConstruct {
 /// contains a carriage return or line feed, or
 /// [`AprsIsUplinkLineError::TooLong`] if the completed wire line exceeds 512
 /// bytes including its trailing `CRLF`.
-pub fn format_is_packet_with_qconstruct(
+/// [`AprsIsUplinkLineError::InvalidPacket`] retains malformed header diagnostics,
+/// including a second Q-construct already present in the path.
+pub fn format_is_packet_with_qconstruct<'path, I>(
     source: &str,
     destination: &str,
-    path: &[&str],
+    path: I,
     qconstruct: QConstruct,
-    gate_callsign: &str,
+    gate_callsign: &'path str,
     data: &str,
-) -> Result<AprsIsUplinkLine, AprsIsUplinkLineError> {
-    let mut packet = format!("{source}>{destination}");
-    for p in path {
-        packet.push(',');
-        packet.push_str(p);
-    }
-    packet.push(',');
-    packet.push_str(qconstruct.as_str());
-    packet.push(',');
-    packet.push_str(gate_callsign);
-    packet.push(':');
-    packet.push_str(data);
-    AprsIsUplinkLine::from_body_bytes(packet.as_bytes())
+) -> Result<AprsIsUplinkLine, AprsIsUplinkLineError>
+where
+    I: IntoIterator<Item = &'path str>,
+{
+    crate::format_is_packet(
+        source,
+        destination,
+        path.into_iter().chain([qconstruct.as_str(), gate_callsign]),
+        data,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -237,32 +217,27 @@ pub enum IGateFormatError {
     MissingIdentity,
 }
 
-/// Pick the Q-construct to insert when gating an RF-heard packet into
-/// APRS-IS, per the "Client Generated" table at
-/// <https://www.aprs-is.net/q.aspx>.
+/// The RF return-message capability advertised for one forwarded packet.
 ///
-/// The choice depends solely on the `IGate`'s login state:
-///
-/// - A verified login (real callsign + valid passcode) uses
-///   [`QConstruct::QAR`], per q.aspx: "qAR - Gated packet from RF. Packet
-///   is placed on APRS-IS by an `IGate` from RF."
-/// - A receive-only login uses [`QConstruct::QAO`] (capital letter O),
-///   per q.aspx: "qAO - (letter O) Gated packet from RF without messaging…
-///   Receive-only `IGates` will use this exclusively for all packets
-///   gated to APRS-IS."
-///
-/// Note: `qAr` (lowercase r) and `qAo` (lowercase o) are *server-side*
-/// constructs for packets that arrived **indirectly** via the legacy
-/// `,I` path from a remote `IGate` (q.aspx "Server Generated" table);
-/// they are never inserted by the `IGate` that heard the packet on RF,
-/// so they are not selectable here. The other constructs (`qAS`,
-/// `qAC`, `qAX`, `qAU`, `qAZ`, `qAI`) are likewise not applicable to an
-/// `IGate` placing RF traffic onto APRS-IS.
-#[must_use]
-const fn qconstruct_for_igate(passcode: Passcode) -> QConstruct {
-    match passcode {
-        Passcode::Verified(_) => QConstruct::QAR,
-        Passcode::ReceiveOnly => QConstruct::QAO,
+/// The client-generated constructs follow <https://www.aprs-is.net/q.aspx>.
+/// An RF receive-only gate still uses a verified Internet login to upload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IgateMessaging {
+    /// This gateway can return messages to the packet's RF source.
+    Bidirectional,
+    /// This gateway has no RF return path to this source, including an RF
+    /// receive-only gateway or a source outside its return-message coverage.
+    ReceiveOnly,
+}
+
+impl IgateMessaging {
+    /// Returns `qAR` for a return-message path or `qAO` without one.
+    #[must_use]
+    pub const fn qconstruct(self) -> QConstruct {
+        match self {
+            Self::Bidirectional => QConstruct::QAR,
+            Self::ReceiveOnly => QConstruct::QAO,
+        }
     }
 }
 
@@ -294,8 +269,8 @@ const fn qconstruct_for_igate(passcode: Passcode) -> QConstruct {
 ///    receivers about the propagation history and violate the
 ///    append-only rule.
 /// 3. **Append the q-construct + `IGate` callsign** at the end. The
-///    construct is [`QConstruct::QAR`] for a verified login,
-///    [`QConstruct::QAO`] (letter O) for a receive-only login.
+///    construct is [`QConstruct::QAR`] for an RF return-message path,
+///    [`QConstruct::QAO`] (letter O) without one.
 /// 4. **Normalize terminal TNC framing.** Some radios put one or more `CR`
 ///    or `LF` delimiter bytes at the end of the AX.25 information field.
 ///    TNC2/APRS-IS represents those as line framing, not payload, so they are
@@ -316,8 +291,7 @@ const fn qconstruct_for_igate(passcode: Passcode) -> QConstruct {
 ///   above.
 /// - `igate`: This `IGate`'s callsign + SSID, as appears on the wire
 ///   after the q-construct.
-/// - `passcode`: The `IGate`'s login state. Verified → `qAR`,
-///   receive-only → `qAO` (letter O).
+/// - `messaging`: The RF return-message capability for this source.
 ///
 /// # Errors
 ///
@@ -330,27 +304,30 @@ const fn qconstruct_for_igate(passcode: Passcode) -> QConstruct {
 ///
 /// ```
 /// use ax25_codec::{Ax25Address, RouteEntry};
-/// use aprs_is::{Passcode, igate_format_for_is};
+/// use aprs_is::{IgateMessaging, igate_format_for_is};
 ///
-/// let src = Ax25Address::new("W1AW", 0).unwrap();
-/// let dst = Ax25Address::new("APK005", 0).unwrap();
-/// let mut wide1 = RouteEntry::new("WIDE1", 1).unwrap();
+/// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let src = Ax25Address::new("W1AW", 0)?;
+/// let dst = Ax25Address::new("APK005", 0)?;
+/// let mut wide1 = RouteEntry::new("WIDE1", 1)?;
 /// wide1.has_repeated = true;
 /// let path = vec![wide1];
-/// let igate = Ax25Address::new("N0CALL", 7).unwrap();
-/// let pass = Passcode::Verified(12345);
+/// let igate = Ax25Address::new("N0CALL", 7)?;
+/// let messaging = IgateMessaging::Bidirectional;
 ///
 /// let line = igate_format_for_is(
 ///     &src, &dst, &path,
 ///     b"!4903.50N/07201.75W-",
-///     &igate, pass,
-/// ).unwrap();
+///     &igate, messaging,
+/// )?;
 /// // The heard `WIDE1-1*` is preserved verbatim (marker and all);
 /// // only `,qAR,N0CALL-7` is appended.
 /// assert_eq!(
 ///     line.as_bytes(),
 ///     b"W1AW>APK005,WIDE1-1*,qAR,N0CALL-7:!4903.50N/07201.75W-\r\n",
 /// );
+/// # Ok(())
+/// # }
 /// ```
 ///
 /// # Notes
@@ -365,9 +342,9 @@ pub fn igate_format_for_is(
     rf_path: &[RouteEntry],
     info: &[u8],
     igate: &Ax25Address,
-    passcode: Passcode,
+    messaging: IgateMessaging,
 ) -> Result<AprsIsUplinkLine, IGateFormatError> {
-    let path_parts = igate_rewritten_path(source, rf_path, info, igate, passcode)?;
+    let path_parts = igate_rewritten_path(source, rf_path, info, igate, messaging)?;
     let source_str = source.to_string();
     let destination_str = destination.to_string();
 
@@ -397,8 +374,8 @@ fn trim_terminal_tnc_framing(mut info: &[u8]) -> &[u8] {
 /// Convenience wrapper around [`igate_format_for_is`] for callers that
 /// already have a fully-formed `Ax25Packet` and just want the IS line.
 ///
-/// Equivalent to passing `packet.source`, `packet.destination`,
-/// `packet.digipeaters`, and `packet.information()` to
+/// Equivalent to passing `packet.header.source`, `packet.header.destination`,
+/// `packet.header.digipeaters`, and `packet.information()` to
 /// [`igate_format_for_is`].
 ///
 /// # Errors
@@ -407,15 +384,15 @@ fn trim_terminal_tnc_framing(mut info: &[u8]) -> &[u8] {
 pub fn igate_format_packet_for_is(
     packet: &ax25_codec::Ax25Packet,
     igate: &Ax25Address,
-    passcode: Passcode,
+    messaging: IgateMessaging,
 ) -> Result<AprsIsUplinkLine, IGateFormatError> {
     igate_format_for_is(
-        &packet.source,
-        &packet.destination,
-        packet.digipeaters.as_slice(),
+        &packet.header.source,
+        &packet.header.destination,
+        packet.header.digipeaters.as_slice(),
         packet.information(),
         igate,
-        passcode,
+        messaging,
     )
 }
 
@@ -436,7 +413,7 @@ pub fn igate_rewritten_path(
     rf_path: &[RouteEntry],
     info: &[u8],
     igate: &Ax25Address,
-    passcode: Passcode,
+    messaging: IgateMessaging,
 ) -> Result<Vec<String>, IGateError> {
     let src_call = source.callsign.as_str();
     if src_call == "TCPIP" || src_call == "TCPXX" {
@@ -459,7 +436,7 @@ pub fn igate_rewritten_path(
     // Append-only: gate the heard path verbatim (preserving each `*`),
     // then add the q-construct + IGate callsign. See
     // `igate_format_for_is` for the IGating.aspx / q.aspx rationale.
-    let qconstruct = qconstruct_for_igate(passcode);
+    let qconstruct = messaging.qconstruct();
     let mut path_parts: Vec<String> = Vec::with_capacity(rf_path.len() + 2);
     for entry in rf_path {
         path_parts.push(entry.to_string());
@@ -540,7 +517,7 @@ mod tests {
         let pkt = format_is_packet_with_qconstruct(
             "N0CALL",
             "APK005",
-            &["WIDE1-1"],
+            ["WIDE1-1"],
             QConstruct::QAC,
             "N0CALL",
             "!4903.50N/07201.75W-",
@@ -558,7 +535,7 @@ mod tests {
             format_is_packet_with_qconstruct(
                 "N0CALL\rFORGED",
                 "APK005",
-                &[],
+                [],
                 QConstruct::QAC,
                 "GATE",
                 "data",
@@ -566,7 +543,7 @@ mod tests {
             format_is_packet_with_qconstruct(
                 "N0CALL",
                 "APK005\nFORGED",
-                &[],
+                [],
                 QConstruct::QAC,
                 "GATE",
                 "data",
@@ -574,7 +551,7 @@ mod tests {
             format_is_packet_with_qconstruct(
                 "N0CALL",
                 "APK005",
-                &["WIDE1-1\r\nFORGED"],
+                ["WIDE1-1\r\nFORGED"],
                 QConstruct::QAC,
                 "GATE",
                 "data",
@@ -582,7 +559,7 @@ mod tests {
             format_is_packet_with_qconstruct(
                 "N0CALL",
                 "APK005",
-                &[],
+                [],
                 QConstruct::QAC,
                 "GATE\nFORGED",
                 "data",
@@ -590,7 +567,7 @@ mod tests {
             format_is_packet_with_qconstruct(
                 "N0CALL",
                 "APK005",
-                &[],
+                [],
                 QConstruct::QAC,
                 "GATE",
                 "data\r\nFORGED>APRS:packet",
@@ -610,7 +587,7 @@ mod tests {
         let maximum = format_is_packet_with_qconstruct(
             "N0CALL",
             "APK005",
-            &[],
+            [],
             QConstruct::QAC,
             "GATE",
             &maximum_data,
@@ -622,7 +599,7 @@ mod tests {
             format_is_packet_with_qconstruct(
                 "N0CALL",
                 "APK005",
-                &[],
+                [],
                 QConstruct::QAC,
                 "GATE",
                 &oversized_data,
@@ -635,16 +612,23 @@ mod tests {
     // ----- igate_format_for_is rewriter -----
 
     #[test]
-    fn igate_format_verified_appends_qar() -> TestResult {
+    fn igate_format_with_return_messaging_appends_qar() -> TestResult {
         // A heard (H-bit set) hop is gated verbatim with its `*`
         // marker; only `,qAR,N0CALL-7` is appended.
         let src = addr("W1AW", 0);
         let dst = addr("APK005", 0);
         let path = vec![used_digi("WIDE1", 1)];
         let igate = addr("N0CALL", 7);
-        let pass = Passcode::Verified(12_345);
+        let messaging = IgateMessaging::Bidirectional;
 
-        let line = igate_format_for_is(&src, &dst, &path, b"!4903.50N/07201.75W-", &igate, pass)?;
+        let line = igate_format_for_is(
+            &src,
+            &dst,
+            &path,
+            b"!4903.50N/07201.75W-",
+            &igate,
+            messaging,
+        )?;
         assert_eq!(
             line.as_bytes(),
             b"W1AW>APK005,WIDE1-1*,qAR,N0CALL-7:!4903.50N/07201.75W-\r\n"
@@ -660,9 +644,16 @@ mod tests {
         let dst = addr("APK005", 0);
         let path = vec![used_digi("WIDE1", 1)];
         let igate = addr("N0CALL", 7);
-        let pass = Passcode::ReceiveOnly;
+        let messaging = IgateMessaging::ReceiveOnly;
 
-        let line = igate_format_for_is(&src, &dst, &path, b"!4903.50N/07201.75W-", &igate, pass)?;
+        let line = igate_format_for_is(
+            &src,
+            &dst,
+            &path,
+            b"!4903.50N/07201.75W-",
+            &igate,
+            messaging,
+        )?;
         assert_eq!(
             line.as_bytes(),
             b"W1AW>APK005,WIDE1-1*,qAO,N0CALL-7:!4903.50N/07201.75W-\r\n"
@@ -697,9 +688,9 @@ mod tests {
             unused_digi("WIDE3", 3),
         ];
         let igate = addr("N0CALL", 7);
-        let pass = Passcode::Verified(12_345);
+        let messaging = IgateMessaging::Bidirectional;
 
-        let line = igate_format_for_is(&src, &dst, &path, b"!data", &igate, pass)?;
+        let line = igate_format_for_is(&src, &dst, &path, b"!data", &igate, messaging)?;
         assert_eq!(
             line.as_bytes(),
             b"W1AW>APK005,WIDE1-1*,WIDE2-2*,WIDE3-3,qAR,N0CALL-7:!data\r\n"
@@ -709,16 +700,14 @@ mod tests {
 
     #[test]
     fn igate_format_preserves_unused_digipeaters() -> TestResult {
-        // Append-only gating keeps every heard hop, even ones whose
-        // H-bit is clear; the older "drop unused slots" behavior
-        // violated IGating.aspx and is gone.
+        // Append-only gating keeps every heard hop, including unused hops.
         let src = addr("W1AW", 0);
         let dst = addr("APK005", 0);
         let path = vec![used_digi("WIDE1", 1), unused_digi("WIDE2", 1)];
         let igate = addr("N0CALL", 7);
-        let pass = Passcode::Verified(12_345);
+        let messaging = IgateMessaging::Bidirectional;
 
-        let line = igate_format_for_is(&src, &dst, &path, b"test", &igate, pass)?;
+        let line = igate_format_for_is(&src, &dst, &path, b"test", &igate, messaging)?;
         // Heard hop keeps `*`; unrepeated hop is kept without `*`.
         assert!(
             contains_bytes(line.as_bytes(), b",WIDE1-1*,WIDE2-1,qAR,"),
@@ -738,9 +727,9 @@ mod tests {
         let dst = addr("APK005", 0);
         let path = vec![used_digi("WIDE1", 1)];
         let igate = addr("N0CALL", 7);
-        let pass = Passcode::Verified(12_345);
+        let messaging = IgateMessaging::Bidirectional;
 
-        let line = igate_format_for_is(&src, &dst, &path, b"test", &igate, pass)?;
+        let line = igate_format_for_is(&src, &dst, &path, b"test", &igate, messaging)?;
         assert_eq!(
             line.as_bytes()
                 .windows(b",qAR,".len())
@@ -758,9 +747,9 @@ mod tests {
         let dst = addr("APK005", 0);
         let path = vec![used_digi("WIDE1", 1), used_digi("NOGATE", 0)];
         let igate = addr("N0CALL", 7);
-        let pass = Passcode::Verified(12_345);
+        let messaging = IgateMessaging::Bidirectional;
 
-        let result = igate_format_for_is(&src, &dst, &path, b"test", &igate, pass);
+        let result = igate_format_for_is(&src, &dst, &path, b"test", &igate, messaging);
         assert_eq!(
             result,
             Err(IGateFormatError::GatingRefused(
@@ -775,10 +764,10 @@ mod tests {
         let dst = addr("APK005", 0);
         let path = vec![used_digi("RFONLY", 0)];
         let igate = addr("N0CALL", 7);
-        let pass = Passcode::Verified(12_345);
+        let messaging = IgateMessaging::Bidirectional;
 
         assert_eq!(
-            igate_format_for_is(&src, &dst, &path, b"test", &igate, pass),
+            igate_format_for_is(&src, &dst, &path, b"test", &igate, messaging),
             Err(IGateFormatError::GatingRefused(IGateError::PathIsRfOnly))
         );
     }
@@ -789,10 +778,10 @@ mod tests {
         let dst = addr("APK005", 0);
         let path = vec![used_digi("TCPIP", 0)];
         let igate = addr("N0CALL", 7);
-        let pass = Passcode::Verified(12_345);
+        let messaging = IgateMessaging::Bidirectional;
 
         assert_eq!(
-            igate_format_for_is(&src, &dst, &path, b"test", &igate, pass),
+            igate_format_for_is(&src, &dst, &path, b"test", &igate, messaging),
             Err(IGateFormatError::GatingRefused(
                 IGateError::PathAlreadyGated
             ))
@@ -805,10 +794,10 @@ mod tests {
         let dst = addr("APK005", 0);
         let path = vec![];
         let igate = addr("N0CALL", 7);
-        let pass = Passcode::Verified(12_345);
+        let messaging = IgateMessaging::Bidirectional;
 
         assert_eq!(
-            igate_format_for_is(&src, &dst, &path, b"test", &igate, pass),
+            igate_format_for_is(&src, &dst, &path, b"test", &igate, messaging),
             Err(IGateFormatError::GatingRefused(
                 IGateError::SourceIsInternet
             ))
@@ -821,11 +810,11 @@ mod tests {
         let dst = addr("APK005", 0);
         let path = vec![];
         let igate = addr("N0CALL", 7);
-        let pass = Passcode::Verified(12_345);
+        let messaging = IgateMessaging::Bidirectional;
 
         // Info field starts with `}` (third-party header).
         assert_eq!(
-            igate_format_for_is(&src, &dst, &path, b"}wrapped", &igate, pass),
+            igate_format_for_is(&src, &dst, &path, b"}wrapped", &igate, messaging),
             Err(IGateFormatError::GatingRefused(
                 IGateError::ThirdPartyPacket
             ))
@@ -839,10 +828,10 @@ mod tests {
         let igate = addr("N0CALL", 7);
         // Same callsign+SSID in the path → loop.
         let path = vec![used_digi("N0CALL", 7)];
-        let pass = Passcode::Verified(12_345);
+        let messaging = IgateMessaging::Bidirectional;
 
         assert_eq!(
-            igate_format_for_is(&src, &dst, &path, b"test", &igate, pass),
+            igate_format_for_is(&src, &dst, &path, b"test", &igate, messaging),
             Err(IGateFormatError::GatingRefused(IGateError::LoopDetected))
         );
     }
@@ -854,9 +843,16 @@ mod tests {
         let dst = addr("APK005", 0);
         let path = vec![];
         let igate = addr("N0CALL", 7);
-        let pass = Passcode::Verified(12_345);
+        let messaging = IgateMessaging::Bidirectional;
 
-        let line = igate_format_for_is(&src, &dst, &path, b"!4903.50N/07201.75W-", &igate, pass)?;
+        let line = igate_format_for_is(
+            &src,
+            &dst,
+            &path,
+            b"!4903.50N/07201.75W-",
+            &igate,
+            messaging,
+        )?;
         assert_eq!(
             line.as_bytes(),
             b"W1AW>APK005,qAR,N0CALL-7:!4903.50N/07201.75W-\r\n"
@@ -871,10 +867,10 @@ mod tests {
         let dst = addr("APK005", 0);
         let path = vec![];
         let igate = addr("N0CALL", 7);
-        let pass = Passcode::Verified(12_345);
+        let messaging = IgateMessaging::Bidirectional;
 
         let info: &[u8] = &[b'`', 0xC1, 0x82, b'X'];
-        let line = igate_format_for_is(&src, &dst, &path, info, &igate, pass)?;
+        let line = igate_format_for_is(&src, &dst, &path, info, &igate, messaging)?;
         let mut expected = b"W1AW>APK005,qAR,N0CALL-7:".to_vec();
         expected.extend_from_slice(info);
         expected.extend_from_slice(b"\r\n");
@@ -887,9 +883,10 @@ mod tests {
         let src = addr("W1AW", 0);
         let dst = addr("APK005", 0);
         let igate = addr("N0CALL", 7);
-        let pass = Passcode::Verified(12_345);
+        let messaging = IgateMessaging::Bidirectional;
 
-        let result = igate_format_for_is(&src, &dst, &[], b"good\r\nEVIL>X:forged", &igate, pass);
+        let result =
+            igate_format_for_is(&src, &dst, &[], b"good\r\nEVIL>X:forged", &igate, messaging);
         assert!(matches!(
             result,
             Err(IGateFormatError::InvalidUplinkLine(
@@ -903,10 +900,10 @@ mod tests {
         let src = addr("W1AW", 0);
         let dst = addr("APK005", 0);
         let igate = addr("N0CALL", 7);
-        let pass = Passcode::Verified(12_345);
+        let messaging = IgateMessaging::Bidirectional;
 
         for terminated in [b">status\r".as_slice(), b">status\n", b">status\r\n"] {
-            let line = igate_format_for_is(&src, &dst, &[], terminated, &igate, pass)?;
+            let line = igate_format_for_is(&src, &dst, &[], terminated, &igate, messaging)?;
             assert_eq!(line.as_bytes(), b"W1AW>APK005,qAR,N0CALL-7:>status\r\n");
         }
 
@@ -916,7 +913,7 @@ mod tests {
             &[],
             b">status\r\nEVIL>APRS:forged\r",
             &igate,
-            pass,
+            messaging,
         );
         assert!(matches!(
             injected,
@@ -932,16 +929,16 @@ mod tests {
         let src = addr("W1AW", 0);
         let dst = addr("APK005", 0);
         let igate = addr("N0CALL", 7);
-        let pass = Passcode::Verified(12_345);
+        let messaging = IgateMessaging::Bidirectional;
         let prefix = b"W1AW>APK005,qAR,N0CALL-7:";
 
         let maximum_info = vec![b'A'; crate::MAX_IS_LINE_BYTES - prefix.len() - 2];
-        let maximum = igate_format_for_is(&src, &dst, &[], &maximum_info, &igate, pass)?;
+        let maximum = igate_format_for_is(&src, &dst, &[], &maximum_info, &igate, messaging)?;
         assert_eq!(maximum.as_bytes().len(), crate::MAX_IS_LINE_BYTES);
 
         let oversized_info = vec![b'A'; maximum_info.len() + 1];
         assert!(matches!(
-            igate_format_for_is(&src, &dst, &[], &oversized_info, &igate, pass),
+            igate_format_for_is(&src, &dst, &[], &oversized_info, &igate, messaging),
             Err(IGateFormatError::InvalidUplinkLine(
                 AprsIsUplinkLineError::TooLong { .. }
             ))
@@ -978,9 +975,9 @@ mod tests {
         let src = addr("W1AW", 0);
         let path = vec![used_digi("WIDE1", 1), unused_digi("WIDE2", 1)];
         let igate = addr("N0CALL", 7);
-        let pass = Passcode::Verified(12_345);
+        let messaging = IgateMessaging::Bidirectional;
 
-        let parts = igate_rewritten_path(&src, &path, b"test", &igate, pass)?;
+        let parts = igate_rewritten_path(&src, &path, b"test", &igate, messaging)?;
         assert_eq!(parts, vec!["WIDE1-1*", "WIDE2-1", "qAR", "N0CALL-7"]);
         Ok(())
     }
@@ -990,9 +987,9 @@ mod tests {
         let src = addr("W1AW", 0);
         let path = vec![used_digi("WIDE1", 1)];
         let igate = addr("N0CALL", 7);
-        let pass = Passcode::ReceiveOnly;
+        let messaging = IgateMessaging::ReceiveOnly;
 
-        let parts = igate_rewritten_path(&src, &path, b"test", &igate, pass)?;
+        let parts = igate_rewritten_path(&src, &path, b"test", &igate, messaging)?;
         assert_eq!(parts, vec!["WIDE1-1*", "qAO", "N0CALL-7"]);
         Ok(())
     }

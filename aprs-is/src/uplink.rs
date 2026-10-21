@@ -1,5 +1,7 @@
 //! Validated, byte-preserving APRS-IS uplink lines.
 
+use std::borrow::Cow;
+
 /// Maximum APRS-IS line length on the wire, in bytes, including the
 /// trailing `CRLF`.
 ///
@@ -8,9 +10,12 @@
 pub const MAX_IS_LINE_BYTES: usize = 512;
 
 /// Why bytes cannot form one safe APRS-IS uplink line.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum AprsIsUplinkLineError {
+    /// A structured packet builder received an invalid TNC2 header.
+    #[error("invalid APRS-IS packet envelope: {0}")]
+    InvalidPacket(#[from] crate::AprsIsLineError),
     /// Wire bytes did not end in exactly one `CRLF` terminator.
     #[error("APRS-IS uplink bytes must end with CRLF")]
     MissingCrlf,
@@ -62,7 +67,10 @@ impl AprsIsUplinkLine {
     /// contains carriage return or line feed, or
     /// [`AprsIsUplinkLineError::TooLong`] when the body plus `CRLF`
     /// exceeds [`MAX_IS_LINE_BYTES`].
-    pub fn from_body_bytes(body: &[u8]) -> Result<Self, AprsIsUplinkLineError> {
+    pub fn from_body_bytes<'bytes, B: Into<Cow<'bytes, [u8]>>>(
+        body: B,
+    ) -> Result<Self, AprsIsUplinkLineError> {
+        let body = body.into();
         let wire_len = body
             .len()
             .checked_add(2)
@@ -76,10 +84,9 @@ impl AprsIsUplinkLine {
                 max: MAX_IS_LINE_BYTES,
             });
         }
-        validate_body(body)?;
-
-        let mut wire = Vec::with_capacity(wire_len);
-        wire.extend_from_slice(body);
+        validate_body(&body)?;
+        let mut wire = body.into_owned();
+        wire.reserve(2);
         wire.extend_from_slice(b"\r\n");
         Ok(Self(wire))
     }
@@ -97,7 +104,10 @@ impl AprsIsUplinkLine {
     /// when the body contains another framing byte, or
     /// [`AprsIsUplinkLineError::TooLong`] when the input exceeds
     /// [`MAX_IS_LINE_BYTES`].
-    pub fn from_wire_bytes(wire: &[u8]) -> Result<Self, AprsIsUplinkLineError> {
+    pub fn from_wire_bytes<'bytes, B: Into<Cow<'bytes, [u8]>>>(
+        wire: B,
+    ) -> Result<Self, AprsIsUplinkLineError> {
+        let wire = wire.into();
         if wire.len() > MAX_IS_LINE_BYTES {
             return Err(AprsIsUplinkLineError::TooLong {
                 actual: wire.len(),
@@ -108,7 +118,7 @@ impl AprsIsUplinkLine {
             return Err(AprsIsUplinkLineError::MissingCrlf);
         };
         validate_body(body)?;
-        Ok(Self(wire.to_vec()))
+        Ok(Self(wire.into_owned()))
     }
 
     /// Borrow the complete, CRLF-terminated wire bytes.
@@ -138,6 +148,28 @@ impl AsRef<[u8]> for AprsIsUplinkLine {
     }
 }
 
+impl TryFrom<Vec<u8>> for AprsIsUplinkLine {
+    type Error = AprsIsUplinkLineError;
+
+    fn try_from(wire: Vec<u8>) -> Result<Self, Self::Error> {
+        Self::from_wire_bytes(wire)
+    }
+}
+
+impl TryFrom<&[u8]> for AprsIsUplinkLine {
+    type Error = AprsIsUplinkLineError;
+
+    fn try_from(wire: &[u8]) -> Result<Self, Self::Error> {
+        Self::from_wire_bytes(wire)
+    }
+}
+
+impl From<AprsIsUplinkLine> for Vec<u8> {
+    fn from(line: AprsIsUplinkLine) -> Self {
+        line.into_bytes()
+    }
+}
+
 fn validate_body(body: &[u8]) -> Result<(), AprsIsUplinkLineError> {
     if let Some((offset, &byte)) = body
         .iter()
@@ -154,6 +186,21 @@ mod tests {
     use super::*;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn owned_wire_and_body_inputs_keep_their_allocations() -> TestResult {
+        let wire = b"N0CALL>APRS:exact\r\n".to_vec();
+        let pointer = wire.as_ptr();
+        let line = AprsIsUplinkLine::try_from(wire)?;
+        assert_eq!(line.as_bytes().as_ptr(), pointer);
+        let mut body = Vec::with_capacity(64);
+        body.extend_from_slice(b"N0CALL>APRS:exact");
+        let pointer = body.as_ptr();
+        let line = AprsIsUplinkLine::from_body_bytes(body)?;
+        assert_eq!(line.as_bytes().as_ptr(), pointer);
+        assert_eq!(line.as_bytes(), b"N0CALL>APRS:exact\r\n");
+        Ok(())
+    }
 
     #[test]
     fn body_constructor_preserves_non_utf8_bytes_and_adds_crlf() -> TestResult {

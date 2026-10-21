@@ -25,21 +25,23 @@ pub fn parse_is_line(line: &str) -> Option<&str> {
 /// commas. The returned proof type guarantees exactly one trailing `CRLF`, no
 /// framing bytes in the body, and the APRS-IS 512-byte line limit.
 ///
-/// **Note:** the APRS-IS server ignores / overwrites the Q-construct
-/// element in the path if one isn't present (it adds its own based on
-/// how the packet arrived). For explicit Q-construct handling use
-/// [`crate::format_is_packet_with_qconstruct`].
+/// The strict parser checks source, destination and streamed path operands.
+/// For explicit Q-construct appending use [`crate::format_is_packet_with_qconstruct`].
 /// # Errors
 ///
 /// Returns [`AprsIsUplinkLineError::EmbeddedNewline`] if any input contains a
 /// carriage return or line feed, or [`AprsIsUplinkLineError::TooLong`] if the
 /// completed wire line exceeds 512 bytes.
-pub fn format_is_packet(
+/// [`AprsIsUplinkLineError::InvalidPacket`] retains malformed header diagnostics.
+pub fn format_is_packet<'path, I>(
     source: &str,
     destination: &str,
-    path: &[&str],
+    path: I,
     data: &str,
-) -> Result<AprsIsUplinkLine, AprsIsUplinkLineError> {
+) -> Result<AprsIsUplinkLine, AprsIsUplinkLineError>
+where
+    I: IntoIterator<Item = &'path str>,
+{
     let mut packet = format!("{source}>{destination}");
     for p in path {
         packet.push(',');
@@ -47,7 +49,9 @@ pub fn format_is_packet(
     }
     packet.push(':');
     packet.push_str(data);
-    AprsIsUplinkLine::from_body_bytes(packet.as_bytes())
+    let line = AprsIsUplinkLine::from_body_bytes(packet.into_bytes())?;
+    let _packet = AprsIsLine::parse(line.body_bytes())?;
+    Ok(line)
 }
 
 /// Address-bearing part of an APRS-IS packet header.
@@ -143,6 +147,19 @@ pub enum AprsIsLineError {
 pub struct AprsIsIdentity(Box<str>);
 
 impl AprsIsIdentity {
+    /// Checks an identity for a source, destination, or path position.
+    ///
+    /// Sources require at least three base characters; other positions require
+    /// one. Every form has at most nine ASCII bytes and an optional nonzero
+    /// one- or two-character alphanumeric SSID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsIsLineError::NonAsciiIdentity`] or
+    /// [`AprsIsLineError::InvalidIdentity`] for the selected field's grammar.
+    pub fn new(value: &str, field: AprsIsAddressField) -> Result<Self, AprsIsLineError> {
+        parse_identity(value.as_bytes(), field)
+    }
     /// Return the exact validated identity.
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -161,6 +178,12 @@ impl AprsIsIdentity {
 impl fmt::Display for AprsIsIdentity {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
+    }
+}
+
+impl AsRef<str> for AprsIsIdentity {
+    fn as_ref(&self) -> &str {
+        self.as_str()
     }
 }
 
@@ -530,7 +553,7 @@ mod tests {
 
     #[test]
     fn format_packet_no_path() -> TestResult {
-        let packet = format_is_packet("N0CALL", "APK005", &[], "!4903.50N/07201.75W-Test")?;
+        let packet = format_is_packet("N0CALL", "APK005", [], "!4903.50N/07201.75W-Test")?;
         assert_eq!(
             packet.as_bytes(),
             b"N0CALL>APK005:!4903.50N/07201.75W-Test\r\n"
@@ -543,7 +566,7 @@ mod tests {
         let packet = format_is_packet(
             "N0CALL",
             "APK005",
-            &["WIDE1-1", "qAR", "W1AW"],
+            ["WIDE1-1", "qAR", "W1AW"],
             "!4903.50N/07201.75W-Test",
         )?;
         assert_eq!(
@@ -556,16 +579,42 @@ mod tests {
     #[test]
     fn format_packet_rejects_framing_in_every_component() {
         for result in [
-            format_is_packet("N0CALL\r\nFORGED", "APK005", &[], "data"),
-            format_is_packet("N0CALL", "APK005\nFORGED", &[], "data"),
-            format_is_packet("N0CALL", "APK005", &["WIDE1-1\rFORGED"], "data"),
-            format_is_packet("N0CALL", "APK005", &[], "data\r\nFORGED>X:x"),
+            format_is_packet("N0CALL\r\nFORGED", "APK005", [], "data"),
+            format_is_packet("N0CALL", "APK005\nFORGED", [], "data"),
+            format_is_packet("N0CALL", "APK005", ["WIDE1-1\rFORGED"], "data"),
+            format_is_packet("N0CALL", "APK005", [], "data\r\nFORGED>X:x"),
         ] {
             assert!(matches!(
                 result,
                 Err(AprsIsUplinkLineError::EmbeddedNewline { .. })
             ));
         }
+    }
+
+    #[test]
+    fn formatted_packets_validate_envelope_grammar_and_streamed_paths() -> TestResult {
+        for (source, destination, path) in [
+            ("NO", "APRS", vec![]),
+            ("N0_CALL", "APRS", vec![]),
+            ("N0CALL", "AP/RS", vec![]),
+            ("N0CALL", "APRS", vec!["BAD HOP"]),
+            ("N0CALL", "APRS", vec!["qAR*", "GATE"]),
+        ] {
+            let result = format_is_packet(source, destination, path, "data");
+            assert!(
+                matches!(result, Err(AprsIsUplinkLineError::InvalidPacket(_))),
+                "{result:?}"
+            );
+        }
+        let path = ["WIDE1-1", "qAR", "GATE"];
+        let line = format_is_packet(
+            "N0CALL",
+            "APRS",
+            path.into_iter().filter(|element| !element.is_empty()),
+            "data",
+        )?;
+        assert_eq!(line.as_bytes(), b"N0CALL>APRS,WIDE1-1,qAR,GATE:data\r\n");
+        Ok(())
     }
 
     #[test]

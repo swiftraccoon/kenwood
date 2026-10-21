@@ -7,23 +7,65 @@
 //! compute it.
 
 use crate::error::AprsIsError;
+use crate::{LoginField, LoginFieldError};
+use std::num::NonZeroU16;
+
+/// A passcode in the APRS-IS 15-bit wire domain, including zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct VerifiedPasscode(u16);
+
+impl VerifiedPasscode {
+    /// Returns `None` when `value` exceeds 32767.
+    #[must_use]
+    pub const fn new(value: u16) -> Option<Self> {
+        if value <= 0x7fff {
+            Some(Self(value))
+        } else {
+            None
+        }
+    }
+
+    /// Returns the validated wire value.
+    #[must_use]
+    pub const fn value(self) -> u16 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for VerifiedPasscode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl TryFrom<u16> for VerifiedPasscode {
+    type Error = std::num::TryFromIntError;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        i16::try_from(value).map(|_| Self(value))
+    }
+}
+
+impl From<VerifiedPasscode> for u16 {
+    fn from(value: VerifiedPasscode) -> Self {
+        value.value()
+    }
+}
 
 /// APRS-IS authentication passcode.
 ///
 /// Per the APRS-IS authentication spec, a valid passcode is a 15-bit
-/// positive integer computed from the callsign via the public
+/// nonnegative integer computed from the callsign via the public
 /// [`aprs_is_passcode`] hash. Clients that don't hold a verified passcode
 /// (e.g. read-only monitors) may authenticate as "receive-only" which
 /// maps to the wire value `-1`.
 ///
-/// This enum replaces the previous `i32` field that used `-1` as a magic
-/// sentinel, making illegal states unrepresentable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Passcode {
-    /// A verified 15-bit passcode computed from the station callsign.
-    Verified(u16),
-    /// Receive-only connection: the server accepts incoming packets
-    /// from this client but does not forward its packets to RF.
+    /// A 15-bit credential awaiting the server's verification.
+    Verified(VerifiedPasscode),
+    /// Receive-only connection; the server delivers its feed and rejects
+    /// packets submitted by this client.
     ReceiveOnly,
 }
 
@@ -33,8 +75,8 @@ impl Passcode {
     #[must_use]
     pub fn for_callsign(callsign: &str) -> Self {
         let value = aprs_is_passcode(callsign);
-        // `aprs_is_passcode` masks with 0x7FFF so the result fits in u16.
-        Self::Verified(u16::try_from(value).unwrap_or(0))
+        let value = u16::try_from(value).unwrap_or_else(|_| unreachable!("hash is 15-bit"));
+        Self::Verified(VerifiedPasscode(value))
     }
 
     /// Convert to the wire representation used in the APRS-IS login
@@ -42,7 +84,7 @@ impl Passcode {
     #[must_use]
     pub const fn as_wire(self) -> i32 {
         match self {
-            Self::Verified(n) => n as i32,
+            Self::Verified(n) => n.value() as i32,
             Self::ReceiveOnly => -1,
         }
     }
@@ -62,29 +104,33 @@ impl std::fmt::Display for Passcode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AprsIsConfig {
     /// Callsign with optional SSID (e.g., "N0CALL-10").
-    pub callsign: String,
+    pub(crate) callsign: String,
     /// APRS-IS passcode (computed from callsign, or `ReceiveOnly`).
-    pub passcode: Passcode,
+    pub(crate) passcode: Passcode,
     /// Server hostname (e.g., "rotate.aprs2.net").
-    pub server: String,
+    pub(crate) server: String,
     /// Server port (default 14580).
-    pub port: u16,
+    pub(crate) port: u16,
     /// APRS-IS filter string (e.g., "r/35.25/-97.75/100" for 100km radius).
-    pub filter: String,
+    pub(crate) filter: String,
     /// Software name for login.
-    pub software_name: String,
+    pub(crate) software_name: String,
     /// Software version for login.
-    pub software_version: String,
+    pub(crate) software_version: String,
 }
 
 impl AprsIsConfig {
-    /// Create a new APRS-IS configuration with sensible defaults.
+    /// Creates a checked APRS-IS login with the callsign-derived passcode.
     ///
     /// Computes the passcode automatically from the callsign. Defaults to
     /// `rotate.aprs2.net:14580` with no filter.
-    #[must_use]
-    pub fn new(callsign: &str) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsIsError::InvalidLoginField`] for an invalid login identity.
+    pub fn new(callsign: &str) -> Result<Self, AprsIsError> {
+        validate_login_callsign(callsign)?;
+        Ok(Self {
             callsign: callsign.to_owned(),
             passcode: Passcode::for_callsign(callsign),
             server: "rotate.aprs2.net".to_owned(),
@@ -92,22 +138,146 @@ impl AprsIsConfig {
             filter: String::new(),
             software_name: "aprs-is".to_owned(),
             software_version: env!("CARGO_PKG_VERSION").to_owned(),
-        }
+        })
     }
 
     /// Create a receive-only APRS-IS configuration for the given
-    /// callsign. The server does not forward this client's transmissions to RF.
-    #[must_use]
-    pub fn receive_only(callsign: &str) -> Self {
-        Self {
-            callsign: callsign.to_owned(),
-            passcode: Passcode::ReceiveOnly,
-            server: "rotate.aprs2.net".to_owned(),
-            port: 14580,
-            filter: String::new(),
-            software_name: "aprs-is".to_owned(),
-            software_version: env!("CARGO_PKG_VERSION").to_owned(),
+    /// callsign. The server rejects packets submitted by this login.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsIsError::InvalidLoginField`] for an invalid login identity.
+    pub fn receive_only(callsign: &str) -> Result<Self, AprsIsError> {
+        Self::new(callsign)?.with_passcode(Passcode::ReceiveOnly)
+    }
+
+    /// Selects a DNS hostname or IP address and a nonzero TCP port.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsIsError::InvalidLoginField`] for an invalid hostname.
+    pub fn with_endpoint(
+        mut self,
+        server: impl Into<String>,
+        port: NonZeroU16,
+    ) -> Result<Self, AprsIsError> {
+        let server = server.into();
+        let host = server.strip_suffix('.').unwrap_or(&server);
+        let valid_dns = !host.is_empty()
+            && host.len() <= 253
+            && host.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+            });
+        if server.parse::<std::net::IpAddr>().is_err() && !valid_dns {
+            return Err(AprsIsError::InvalidLoginField {
+                field: LoginField::Server,
+                reason: LoginFieldError::InvalidEndpoint,
+            });
         }
+        self.server = server;
+        self.port = port.get();
+        Ok(self)
+    }
+
+    /// Selects authentication while preserving the complete login-line bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsIsError::InvalidUplinkLine`] if the login exceeds 512 bytes.
+    pub fn with_passcode(mut self, passcode: Passcode) -> Result<Self, AprsIsError> {
+        self.passcode = passcode;
+        self.checked()
+    }
+
+    /// Selects nonempty ASCII software-name and version words.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsIsError::InvalidLoginField`] for invalid words, or
+    /// [`AprsIsError::InvalidUplinkLine`] if the login exceeds 512 bytes.
+    pub fn with_software(
+        mut self,
+        name: impl Into<String>,
+        version: impl Into<String>,
+    ) -> Result<Self, AprsIsError> {
+        self.software_name = name.into();
+        self.software_version = version.into();
+        self.checked()
+    }
+
+    /// Selects a raw server filter extension without interpreting its grammar.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsIsError::InvalidLoginField`] for non-ASCII or control bytes,
+    /// or [`AprsIsError::InvalidUplinkLine`] if the login exceeds 512 bytes.
+    pub fn with_raw_filter(mut self, filter: impl Into<String>) -> Result<Self, AprsIsError> {
+        self.filter = filter.into();
+        self.checked()
+    }
+
+    /// Selects streamed clauses with checked order and spatial limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AprsIsError::InvalidFilter`] for an invalid combination, or
+    /// [`AprsIsError::InvalidUplinkLine`] when the complete login exceeds 512 bytes.
+    pub fn with_filter<'filters, I>(self, filters: I) -> Result<Self, AprsIsError>
+    where
+        I: IntoIterator<Item = &'filters crate::AprsIsFilter>,
+    {
+        self.with_raw_filter(crate::AprsIsFilter::join(filters)?)
+    }
+
+    fn checked(self) -> Result<Self, AprsIsError> {
+        let _line =
+            crate::AprsIsUplinkLine::from_wire_bytes(build_login_string(&self)?.as_bytes())?;
+        Ok(self)
+    }
+
+    /// Returns the case-preserved checked login identity.
+    #[must_use]
+    pub fn callsign(&self) -> &str {
+        &self.callsign
+    }
+
+    /// Returns the selected authentication mode.
+    #[must_use]
+    pub const fn passcode(&self) -> Passcode {
+        self.passcode
+    }
+
+    /// Returns the server hostname or IP address without a port.
+    #[must_use]
+    pub fn server(&self) -> &str {
+        &self.server
+    }
+
+    /// Returns the nonzero TCP port.
+    #[must_use]
+    pub const fn port(&self) -> NonZeroU16 {
+        match NonZeroU16::new(self.port) {
+            Some(port) => port,
+            None => unreachable!(),
+        }
+    }
+
+    /// Returns the unprefixed filter expression, or an empty string.
+    #[must_use]
+    pub fn filter(&self) -> &str {
+        &self.filter
+    }
+
+    /// Returns the software name and version as validated login words.
+    #[must_use]
+    pub fn software(&self) -> (&str, &str) {
+        (&self.software_name, &self.software_version)
     }
 }
 
@@ -124,7 +294,7 @@ impl AprsIsConfig {
 /// 3. Starting with hash = 0x73E2, XOR each pair of bytes: first byte
 ///    shifted left 8 bits, second byte as-is. If the callsign has an odd
 ///    number of characters, the last byte is XOR'd shifted left 8 bits.
-/// 4. Mask with 0x7FFF to produce a positive 15-bit value.
+/// 4. Mask with 0x7FFF to produce a nonnegative 15-bit value.
 #[must_use]
 pub fn aprs_is_passcode(callsign: &str) -> i32 {
     // Strip SSID.
@@ -155,44 +325,41 @@ pub fn aprs_is_passcode(callsign: &str) -> i32 {
 /// Validate an APRS-IS login identity against the published wire grammar.
 fn validate_login_callsign(value: &str) -> Result<(), AprsIsError> {
     let invalid = |reason| AprsIsError::InvalidLoginField {
-        field: "callsign",
+        field: LoginField::Callsign,
         reason,
     };
 
     if !value.is_ascii() {
-        return Err(invalid("must contain only ASCII characters"));
+        return Err(invalid(LoginFieldError::NonAscii));
     }
     if value.len() > 9 {
-        return Err(invalid("must not exceed 9 ASCII characters including SSID"));
+        return Err(invalid(LoginFieldError::IdentityTooLong));
+    }
+    if value.len() == 8 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(invalid(LoginFieldError::ReservedServerIdentity));
     }
     if value.matches('-').count() > 1 {
-        return Err(invalid("may contain only one SSID separator"));
+        return Err(invalid(LoginFieldError::MultipleSsidSeparators));
     }
 
     let (base, suffix) = value
         .split_once('-')
         .map_or((value, None), |(base, suffix)| (base, Some(suffix)));
     if base.len() < 3 {
-        return Err(invalid(
-            "base callsign must contain at least 3 alphanumeric characters",
-        ));
+        return Err(invalid(LoginFieldError::BaseTooShort));
     }
     if !base.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
-        return Err(invalid(
-            "base callsign must contain only ASCII alphanumeric characters",
-        ));
+        return Err(invalid(LoginFieldError::InvalidBase));
     }
     if let Some(suffix) = suffix {
         if !(1..=2).contains(&suffix.len()) {
-            return Err(invalid("SSID must contain 1 or 2 characters"));
+            return Err(invalid(LoginFieldError::InvalidSsidLength));
         }
         if !suffix.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
-            return Err(invalid(
-                "SSID must contain only ASCII alphanumeric characters",
-            ));
+            return Err(invalid(LoginFieldError::InvalidSsid));
         }
         if suffix == "0" {
-            return Err(invalid("SSID zero must be omitted"));
+            return Err(invalid(LoginFieldError::ExplicitZeroSsid));
         }
     }
     Ok(())
@@ -204,17 +371,23 @@ fn validate_login_callsign(value: &str) -> Result<(), AprsIsError> {
 /// version must each be one word ("Do not use spaces"). The login line is
 /// space-delimited, so any embedded whitespace or control character would
 /// shift the keyword parsing or inject another handshake line.
-fn validate_login_word(field: &'static str, value: &str) -> Result<(), AprsIsError> {
+fn validate_login_word(field: LoginField, value: &str) -> Result<(), AprsIsError> {
     if value.is_empty() {
         return Err(AprsIsError::InvalidLoginField {
             field,
-            reason: "must not be empty",
+            reason: LoginFieldError::Empty,
+        });
+    }
+    if !value.is_ascii() {
+        return Err(AprsIsError::InvalidLoginField {
+            field,
+            reason: LoginFieldError::NonAscii,
         });
     }
     if value.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err(AprsIsError::InvalidLoginField {
             field,
-            reason: "must be one word with no whitespace or control characters",
+            reason: LoginFieldError::NotSingleWord,
         });
     }
     Ok(())
@@ -223,15 +396,19 @@ fn validate_login_word(field: &'static str, value: &str) -> Result<(), AprsIsErr
 /// Validate the filter clause, which legitimately contains spaces
 /// between sub-clauses but must not carry a `CR`/`LF`.
 ///
-/// Per <https://www.aprs-is.net/Connecting.aspx> the `servercommand`
-/// (e.g. `filter r/33/-96/25`) allows spaces, so unlike the software
-/// name/version only the line terminators are rejected: a `\r`/`\n` inside
-/// the filter would inject a second handshake line.
+/// Per <https://www.aprs-is.net/Connecting.aspx>, the server command permits
+/// spaces. This implementation accepts ASCII and rejects every control byte.
 fn validate_filter(value: &str) -> Result<(), AprsIsError> {
-    if value.contains('\r') || value.contains('\n') {
+    if !value.is_ascii() {
         return Err(AprsIsError::InvalidLoginField {
-            field: "filter",
-            reason: "must not contain a carriage return or line feed",
+            field: LoginField::Filter,
+            reason: LoginFieldError::NonAscii,
+        });
+    }
+    if value.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err(AprsIsError::InvalidLoginField {
+            field: LoginField::Filter,
+            reason: LoginFieldError::ControlCharacter,
         });
     }
     Ok(())
@@ -259,8 +436,8 @@ fn validate_filter(value: &str) -> Result<(), AprsIsError> {
 /// whitespace/control characters, or the filter contains a `\r`/`\n`.
 pub fn build_login_string(config: &AprsIsConfig) -> Result<String, AprsIsError> {
     validate_login_callsign(&config.callsign)?;
-    validate_login_word("software_name", &config.software_name)?;
-    validate_login_word("software_version", &config.software_version)?;
+    validate_login_word(LoginField::SoftwareName, &config.software_name)?;
+    validate_login_word(LoginField::SoftwareVersion, &config.software_version)?;
     validate_filter(&config.filter)?;
 
     let mut login = format!(
@@ -299,7 +476,7 @@ mod tests {
 
     #[test]
     fn passcode_is_positive() {
-        // The result must always be a positive 15-bit value.
+        // The result must always be a nonnegative 15-bit value.
         let code = aprs_is_passcode("W1AW");
         assert!(
             (0..=0x7FFF).contains(&code),
@@ -324,38 +501,49 @@ mod tests {
     }
 
     #[test]
-    fn config_defaults() {
-        let config = AprsIsConfig::new("N0CALL-10");
+    fn config_defaults() -> Result<(), Box<dyn std::error::Error>> {
+        let config = AprsIsConfig::new("N0CALL-10")?;
         assert_eq!(config.callsign, "N0CALL-10");
-        assert_eq!(config.passcode, Passcode::Verified(13023));
+        assert_eq!(config.passcode.as_wire(), 13023);
         assert_eq!(config.server, "rotate.aprs2.net");
         assert_eq!(config.port, 14580);
         assert!(config.filter.is_empty());
         assert_eq!(config.software_name, "aprs-is");
+        Ok(())
     }
 
     #[test]
-    fn receive_only_config() {
-        let config = AprsIsConfig::receive_only("N0CALL");
+    fn receive_only_config() -> Result<(), Box<dyn std::error::Error>> {
+        let config = AprsIsConfig::receive_only("N0CALL")?;
         assert_eq!(config.passcode, Passcode::ReceiveOnly);
         assert_eq!(config.passcode.as_wire(), -1);
+        Ok(())
     }
 
     #[test]
     fn passcode_for_callsign_matches_hash() {
-        assert_eq!(Passcode::for_callsign("N0CALL"), Passcode::Verified(13023));
-        assert_eq!(Passcode::for_callsign("W1AW"), Passcode::Verified(25988));
+        assert_eq!(Passcode::for_callsign("N0CALL").as_wire(), 13023);
+        assert_eq!(Passcode::for_callsign("W1AW").as_wire(), 25988);
     }
 
     #[test]
     fn passcode_receive_only_as_wire() {
         assert_eq!(Passcode::ReceiveOnly.as_wire(), -1);
-        assert_eq!(Passcode::Verified(13023).as_wire(), 13023);
+        assert_eq!(
+            VerifiedPasscode::new(0).map(VerifiedPasscode::value),
+            Some(0)
+        );
+        assert_eq!(
+            VerifiedPasscode::new(32767).map(VerifiedPasscode::value),
+            Some(32767)
+        );
+        assert_eq!(VerifiedPasscode::new(32768), None);
+        assert_eq!(VerifiedPasscode::new(u16::MAX), None);
     }
 
     #[test]
     fn login_string_no_filter() -> Result<(), Box<dyn std::error::Error>> {
-        let config = AprsIsConfig::new("N0CALL");
+        let config = AprsIsConfig::new("N0CALL")?;
         let login = build_login_string(&config)?;
         assert!(
             login.starts_with("user N0CALL pass 13023 vers aprs-is "),
@@ -371,8 +559,7 @@ mod tests {
 
     #[test]
     fn login_string_with_filter() -> Result<(), Box<dyn std::error::Error>> {
-        let mut config = AprsIsConfig::new("N0CALL");
-        config.filter = "r/35.25/-97.75/100".to_owned();
+        let config = AprsIsConfig::new("N0CALL")?.with_raw_filter("r/35.25/-97.75/100")?;
         let login = build_login_string(&config)?;
         assert!(
             login.contains("filter r/35.25/-97.75/100"),
@@ -383,75 +570,71 @@ mod tests {
     }
 
     #[test]
-    fn login_string_rejects_software_name_with_space() {
+    fn login_string_rejects_software_name_with_space() -> Result<(), Box<dyn std::error::Error>> {
         // Connecting.html: "softwarename=one word name of the client
         // software. Do not use spaces." A space would shift the
         // space-delimited keyword parsing.
-        let mut config = AprsIsConfig::new("N0CALL");
-        config.software_name = "my app".to_owned();
-        let result = build_login_string(&config);
+        let result = AprsIsConfig::new("N0CALL")?.with_software("my app", "1");
         assert!(
             matches!(
                 result,
                 Err(AprsIsError::InvalidLoginField {
-                    field: "software_name",
+                    field: LoginField::SoftwareName,
                     ..
                 })
             ),
             "expected InvalidLoginField(software_name), got {result:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn login_string_rejects_software_version_with_space() {
+    fn login_string_rejects_software_version_with_space() -> Result<(), Box<dyn std::error::Error>>
+    {
         // Connecting.html: "softwarevers=version number of the client
         // software. Do not use spaces."
-        let mut config = AprsIsConfig::new("N0CALL");
-        config.software_version = "1 0".to_owned();
-        let result = build_login_string(&config);
+        let result = AprsIsConfig::new("N0CALL")?.with_software("test", "1 0");
         assert!(
             matches!(
                 result,
                 Err(AprsIsError::InvalidLoginField {
-                    field: "software_version",
+                    field: LoginField::SoftwareVersion,
                     ..
                 })
             ),
             "expected InvalidLoginField(software_version), got {result:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn login_string_rejects_filter_with_crlf() {
+    fn login_string_rejects_filter_with_crlf() -> Result<(), Box<dyn std::error::Error>> {
         // A `\r\n` in the filter would inject a second handshake line
         // onto the stream after the login line.
-        let mut config = AprsIsConfig::new("N0CALL");
-        config.filter = "r/1/2/3\r\ninject".to_owned();
-        let result = build_login_string(&config);
+        let result = AprsIsConfig::new("N0CALL")?.with_raw_filter("r/1/2/3\r\ninject");
         assert!(
             matches!(
                 result,
                 Err(AprsIsError::InvalidLoginField {
-                    field: "filter",
+                    field: LoginField::Filter,
                     ..
                 })
             ),
             "expected InvalidLoginField(filter), got {result:?}"
         );
+        Ok(())
     }
 
     #[test]
     fn login_string_rejects_callsign_with_whitespace() {
         // A space/CRLF in the callsign would corrupt the `user CALL`
         // keyword pair.
-        let mut config = AprsIsConfig::new("N0CALL");
-        config.callsign = "N0 CALL".to_owned();
-        let result = build_login_string(&config);
+        let result = AprsIsConfig::new("N0 CALL");
         assert!(
             matches!(
                 result,
                 Err(AprsIsError::InvalidLoginField {
-                    field: "callsign",
+                    field: LoginField::Callsign,
                     ..
                 })
             ),
@@ -473,13 +656,14 @@ mod tests {
             "N0CALL1234",
             "NØCALL",
             "N0CALL*",
+            "DEADBEEF",
+            "deadbeef",
         ] {
-            let config = AprsIsConfig::new(invalid);
             assert!(
                 matches!(
-                    build_login_string(&config),
+                    AprsIsConfig::new(invalid),
                     Err(AprsIsError::InvalidLoginField {
-                        field: "callsign",
+                        field: LoginField::Callsign,
                         ..
                     })
                 ),
@@ -491,7 +675,7 @@ mod tests {
     #[test]
     fn login_string_accepts_case_preserved_two_character_ssid()
     -> Result<(), Box<dyn std::error::Error>> {
-        let config = AprsIsConfig::new("ae5pl-TS");
+        let config = AprsIsConfig::new("ae5pl-TS")?;
         let login = build_login_string(&config)?;
         assert!(login.starts_with("user ae5pl-TS pass "));
         Ok(())
@@ -499,15 +683,56 @@ mod tests {
 
     #[test]
     fn login_string_allows_filter_with_internal_spaces() -> Result<(), Box<dyn std::error::Error>> {
-        // Filters legitimately separate sub-clauses with spaces; only
-        // CR/LF is rejected.
-        let mut config = AprsIsConfig::new("N0CALL");
-        config.filter = "m/200 -p/CW".to_owned();
+        // Spaces separate clauses in the raw-expression extension.
+        let config = AprsIsConfig::new("N0CALL")?.with_raw_filter("m/200 -p/CW")?;
         let login = build_login_string(&config)?;
         assert!(
             login.contains("filter m/200 -p/CW"),
             "multi-clause filter not preserved: {login:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn config_builders_reject_invalid_endpoints_and_complete_login_overflow()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for invalid in [
+            "",
+            "host:14580",
+            "host/name",
+            "bad host",
+            "-host",
+            "host..name",
+            "host\n",
+        ] {
+            assert!(
+                AprsIsConfig::new("N0CALL")?
+                    .with_endpoint(invalid, NonZeroU16::MIN)
+                    .is_err(),
+                "{invalid:?}"
+            );
+        }
+        let config = AprsIsConfig::new("N0CALL")?.with_endpoint("::1", NonZeroU16::MIN)?;
+        assert_eq!(config.server(), "::1");
+        assert_eq!(config.port(), NonZeroU16::MIN);
+        for invalid in ["a\tfilter", "a\0filter", "é"] {
+            assert!(config.clone().with_raw_filter(invalid).is_err());
+        }
+        let prefix_len = build_login_string(&config)?.len() + " filter ".len();
+        let maximum = config
+            .clone()
+            .with_raw_filter("x".repeat(crate::MAX_IS_LINE_BYTES - prefix_len))?;
+        assert_eq!(
+            build_login_string(&maximum)?.len(),
+            crate::MAX_IS_LINE_BYTES
+        );
+        let result = config.with_raw_filter("x".repeat(crate::MAX_IS_LINE_BYTES - prefix_len + 1));
+        assert!(matches!(
+            result,
+            Err(AprsIsError::InvalidUplinkLine(
+                crate::AprsIsUplinkLineError::TooLong { .. }
+            ))
+        ));
         Ok(())
     }
 }

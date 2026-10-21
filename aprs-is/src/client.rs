@@ -12,13 +12,13 @@
 //! use aprs_is::{AprsIsClient, AprsIsConfig, AprsIsEvent};
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! let mut config = AprsIsConfig::new("N0CALL");
-//! config.filter = "r/35.25/-97.75/100".to_owned();
+//! let config = AprsIsConfig::new("N0CALL")?
+//!     .with_raw_filter("r/35.25/-97.75/100")?;
 //! let mut client = AprsIsClient::connect(config).await?;
 //!
 //! loop {
 //!     match client.next_event().await? {
-//!         AprsIsEvent::Packet(pkt) => println!("Got: {}", pkt.line),
+//!         AprsIsEvent::Packet(pkt) => println!("Got: {}", pkt.line()),
 //!         AprsIsEvent::Comment(line) => println!("Server: {line}"),
 //!         AprsIsEvent::LoggedIn { server } => {
 //!             println!("Authenticated (server {server:?})");
@@ -36,8 +36,8 @@
 //!
 //! # Keepalive
 //!
-//! APRS-IS expects a comment line every ~2 minutes if the client is
-//! otherwise idle. Call [`AprsIsClient::send_keepalive`] on a timer, or
+//! The client offers a 120-second idle-write policy. Call
+//! [`AprsIsClient::send_keepalive`] on a timer, or
 //! use [`AprsIsClient::maybe_send_keepalive`] which only sends if the
 //! keepalive interval has elapsed since the last write.
 //!
@@ -47,6 +47,7 @@
 //! re-establish the TCP connection and re-login. Callers typically wrap
 //! this in an exponential backoff loop.
 
+use std::num::NonZeroU32;
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -54,33 +55,47 @@ use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
 use crate::error::AprsIsError;
-use crate::events::{AprsIsEvent, AprsIsPacket};
+use crate::events::{AprsIsEvent, AprsIsPacket, LoginState};
 use crate::line::{format_is_packet, parse_is_line};
 use crate::login::{AprsIsConfig, Passcode, build_login_string};
 use crate::uplink::AprsIsUplinkLine;
 
-/// Extract the server hostname from a `# logresp ... verified, server X`
-/// comment line. Returns `None` if the `server` clause is absent.
-fn parse_logresp_server(line: &str) -> Option<String> {
-    let idx = line.find("server ")?;
-    let rest = line.get(idx + "server ".len()..)?;
-    // Skip any extra whitespace after "server" and take the next
-    // whitespace-delimited token.
-    let name = rest
-        .split_whitespace()
-        .next()
-        .map(|s| s.trim_matches(',').to_owned())?;
-    if name.is_empty() { None } else { Some(name) }
+/// Recognizes a complete login-response prefix for this connection's identity.
+fn parse_logresp<'line>(line: &'line str, callsign: &str) -> Option<(bool, Option<&'line str>)> {
+    let mut words = line.split_ascii_whitespace();
+    if words.next()? != "#"
+        || words.next()? != "logresp"
+        || !words.next()?.eq_ignore_ascii_case(callsign)
+    {
+        return None;
+    }
+    let verified = match words.next()? {
+        "verified," => true,
+        "unverified," => false,
+        _ => return None,
+    };
+    let server = if words.next() == Some("server") {
+        words
+            .next()
+            .map(|name| name.trim_end_matches(','))
+            .filter(|name| !name.is_empty())
+    } else {
+        None
+    };
+    Some((verified, server))
 }
 
 /// Default APRS-IS keepalive interval.
 ///
-/// APRS-IS servers expect the client to send something (a packet or a
-/// comment line) at least every 2 minutes or they may disconnect.
+/// This is the client's optional idle-write policy. Server idle limits vary.
 pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(120);
 
-/// Default connect timeout for the initial TCP handshake + login.
+/// Total deadline for TCP establishment and writing the login line.
+/// Server login verification arrives later through [`AprsIsClient::next_event`].
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Deadline for one complete outgoing line or explicit socket shutdown.
+pub const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Maximum length, in bytes, of a single inbound line read from the
 /// server before the reader gives up and resynchronises.
@@ -90,11 +105,9 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// `read_until(b'\n', ..)` would grow the line buffer until the process
 /// runs out of memory (a denial-of-service). This cap bounds the buffer.
 ///
-/// The value is double [`crate::MAX_IS_LINE_BYTES`] (the *outbound* 512-byte
-/// spec limit including `CRLF`). APRS-IS payloads sit well under 512
-/// bytes, but inbound lines can legitimately carry a verbose server
-/// comment or a long path, so the doubled headroom avoids rejecting any
-/// valid line while still capping memory at a fixed, small bound. A line that
+/// The value is double [`crate::MAX_IS_LINE_BYTES`] (the outbound 512-byte
+/// protocol limit including `CRLF`), allowing additional room for comments.
+/// It is an implementation limit on all incoming lines. A line that
 /// exceeds this length (including its newline when present) yields
 /// [`AprsIsError::ReadLineTooLong`]; an exact-cap final line at EOF remains
 /// valid.
@@ -106,9 +119,9 @@ const KEEPALIVE_COMMENT: &str = "# aprs-is keepalive";
 /// Read one newline-terminated line from `reader` into `buf`, bounding
 /// the line length at `max` bytes.
 ///
-/// On success returns `Ok(n)` where `n` is the number of bytes appended
-/// to `buf` (including the terminating `\n`, if any). `Ok(0)` signals
-/// clean EOF. `buf` is **not** cleared; the caller clears it.
+/// Returns the complete retained byte count, including prefixes from cancelled
+/// calls and the terminating newline when present. Zero signals clean EOF.
+/// The caller clears the buffer and overflow flag after a completed line.
 ///
 /// Unlike [`AsyncBufReadExt::read_until`], this caps the amount of data
 /// buffered for a single line: once more than `max` bytes arrive, the function
@@ -121,19 +134,19 @@ const KEEPALIVE_COMMENT: &str = "# aprs-is keepalive";
 async fn read_is_line<R>(
     reader: &mut R,
     buf: &mut Vec<u8>,
+    overflowed: &mut bool,
     max: usize,
 ) -> Result<usize, AprsIsError>
 where
     R: AsyncBufReadExt + Unpin,
 {
-    let mut copied = 0usize;
-    let mut overflowed = false;
+    let mut copied = buf.len();
     loop {
         let chunk = reader.fill_buf().await.map_err(AprsIsError::Read)?;
         if chunk.is_empty() {
             // EOF. Surface an in-cap unterminated final line, but never turn
             // the retained prefix of an oversized line into a valid packet.
-            return if overflowed {
+            return if *overflowed {
                 Err(AprsIsError::ReadLineTooLong { max })
             } else {
                 Ok(copied)
@@ -150,7 +163,7 @@ where
             // Always consume through the newline so the stream stays
             // framed regardless of whether we accept or reject.
             let consume_n = pos + 1;
-            let fits = copied.saturating_add(upto.len()) <= max;
+            let fits = !*overflowed && copied.saturating_add(upto.len()) <= max;
             if fits {
                 buf.extend_from_slice(upto);
                 copied += upto.len();
@@ -178,7 +191,7 @@ where
             copied += take;
         }
         if take < chunk.len() {
-            overflowed = true;
+            *overflowed = true;
         }
         let consume_n = chunk.len();
         reader.consume(consume_n);
@@ -193,36 +206,20 @@ where
 /// Owns a single TCP connection to an APRS-IS server, handles the login
 /// handshake, and exposes line-at-a-time read/write methods.
 ///
-/// Not `Clone` and not `Send`-across-the-await; typical usage is to own
-/// it from a single task.
+/// The client is `Send` and `Sync`; one task exclusively borrows it for each
+/// operation. Connection ownership is unique.
 ///
 /// # TLS support
 ///
-/// This client speaks plaintext TCP only. APRS-IS T2 servers also
-/// support TLS on port 24580. To use it, build the connection
-/// yourself with your preferred TLS library (e.g. `tokio-rustls` or
-/// `tokio-native-tls`) and use the line-level helpers at the crate
-/// root ([`crate::build_login_string`], [`crate::format_is_packet`],
-/// [`crate::AprsIsLine`]):
-///
-/// ```no_run
-/// use aprs_is::{AprsIsConfig, AprsIsLine, build_login_string, format_is_packet};
-/// // 1. TLS handshake against `core.aprs2.net:24580` using your TLS library.
-/// // 2. Send the result of `build_login_string(&config)` over the stream.
-/// // 3. Read lines from the stream and parse them with `AprsIsLine::parse`.
-/// // 4. Send packets formatted via `format_is_packet`.
-/// # let _ = (AprsIsConfig::new("N0CALL"), build_login_string, format_is_packet,
-/// #     |line: &str| AprsIsLine::parse(line));
-/// ```
-///
-/// The library deliberately does not bundle a TLS implementation so
-/// callers can choose their preferred backend.
+/// This client uses plaintext TCP. A caller that owns a TLS stream can use
+/// [`crate::build_login_string`], [`crate::AprsIsLine`], and
+/// [`crate::AprsIsUplinkLine`] for its connection's login and packet framing.
 #[derive(Debug)]
 pub struct AprsIsClient {
     config: AprsIsConfig,
     reader: BufReader<OwnedReadHalf>,
-    writer: OwnedWriteHalf,
-    /// Persistent byte buffer for `read_until`. The client reads raw
+    writer: Option<OwnedWriteHalf>,
+    /// Persistent byte buffer for the bounded line reader. The client reads raw
     /// bytes (not `String` via `read_line`) so non-UTF-8 sequences in
     /// APRS info fields (Mic-E, raw weather, Latin-1 comments) do not
     /// surface as `io::ErrorKind::InvalidData` and tear down the
@@ -231,19 +228,24 @@ pub struct AprsIsClient {
     /// need byte-exact fidelity get the raw bytes in
     /// [`AprsIsPacket::raw`].
     line_buf: Vec<u8>,
+    line_overflowed: bool,
+    line_complete: bool,
     last_write: Instant,
-    logged_in_emitted: bool,
+    login_state: LoginState,
 }
 
 impl AprsIsClient {
     /// Connect to the APRS-IS server and perform the login handshake.
     ///
-    /// Performs TCP connect, sends the login string, and returns as soon
-    /// as the socket is writable. Login verification (the `# logresp`
+    /// Establishes TCP, writes and flushes the login line, then returns.
+    /// Login verification (the `# logresp`
     /// line) is reported asynchronously via [`AprsIsEvent::LoggedIn`]
     /// from [`next_event`](Self::next_event).
+    /// Packet uploads remain disabled until [`Self::login_state`] becomes
+    /// [`LoginState::Verified`].
     ///
-    /// Times out after [`CONNECT_TIMEOUT`] (10 seconds) during TCP connect.
+    /// TCP establishment and login writing share [`CONNECT_TIMEOUT`]. Cancelling
+    /// this future drops its newly opened socket; no client is returned.
     ///
     /// # Errors
     ///
@@ -254,54 +256,51 @@ impl AprsIsClient {
     /// [`AprsIsError::Connect`] if TCP connect fails or times out, or
     /// [`AprsIsError::Write`] if the login string cannot be sent.
     pub async fn connect(config: AprsIsConfig) -> Result<Self, AprsIsError> {
+        let deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
         let addr = format!("{}:{}", config.server, config.port);
         tracing::info!(server = %addr, callsign = %config.callsign, "APRS-IS connecting");
 
-        // Build + validate the login line before opening the socket so an
-        // invalid field (whitespace/CRLF that could corrupt or inject the
-        // handshake) fails fast without a wasted TCP connection.
+        // Login validation precedes every socket side effect.
         let login = build_login_string(&config)?;
         let login = AprsIsUplinkLine::from_wire_bytes(login.as_bytes())?;
 
-        let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr))
-            .await
-            .map_err(|_| {
-                AprsIsError::Connect(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "TCP connect timed out",
-                ))
-            })?
-            .map_err(AprsIsError::Connect)?;
+        let stream = tokio::time::timeout_at(
+            deadline,
+            TcpStream::connect((config.server.as_str(), config.port)),
+        )
+        .await
+        .map_err(|_| {
+            AprsIsError::Connect(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "TCP connect timed out",
+            ))
+        })?
+        .map_err(AprsIsError::Connect)?;
 
-        // Disable Nagle's algorithm per the explicit recommendation at
-        // <https://www.aprs-is.net/Connecting.aspx>: "If your client
-        // software is bidirectional (sends and receives), turn off the
-        // Nagle algorithm when connecting to APRS-IS as it can
-        // introduce significant delays (TCP_NODELAY)." APRS lines are
-        // short and latency-sensitive (ack/rej + IGate forwarding);
-        // leaving Nagle on would batch a single-frame send with the
-        // following keepalive write, adding hundreds of milliseconds
-        // round-trip.
+        // Connecting.aspx recommends TCP_NODELAY for bidirectional clients.
         stream.set_nodelay(true).map_err(AprsIsError::Connect)?;
 
         let (read_half, mut write_half) = stream.into_split();
 
-        // Send the login string built+validated above.
-        write_half
-            .write_all(login.as_bytes())
-            .await
-            .map_err(AprsIsError::Write)?;
-        write_half.flush().await.map_err(AprsIsError::Write)?;
+        tokio::time::timeout_at(deadline, async {
+            write_half.write_all(login.as_bytes()).await?;
+            write_half.flush().await
+        })
+        .await
+        .map_err(|_| AprsIsError::LoginTimeout)?
+        .map_err(AprsIsError::Write)?;
 
         tracing::debug!("APRS-IS login sent");
 
         Ok(Self {
             config,
             reader: BufReader::new(read_half),
-            writer: write_half,
+            writer: Some(write_half),
             line_buf: Vec::with_capacity(512),
+            line_overflowed: false,
+            line_complete: false,
             last_write: Instant::now(),
-            logged_in_emitted: false,
+            login_state: LoginState::Pending,
         })
     }
 
@@ -316,16 +315,20 @@ impl AprsIsClient {
     /// Returns the last [`AprsIsError`] after exhausting all attempts.
     pub async fn connect_with_retry(
         config: AprsIsConfig,
-        max_attempts: Option<u32>,
+        max_attempts: Option<NonZeroU32>,
     ) -> Result<Self, AprsIsError> {
         let mut delay = Duration::from_secs(1);
         let mut attempt: u32 = 0;
         loop {
-            attempt += 1;
+            attempt = attempt.saturating_add(1);
             match Self::connect(config.clone()).await {
                 Ok(client) => return Ok(client),
                 Err(e) => {
-                    if max_attempts.is_some_and(|max| attempt >= max) {
+                    if !matches!(
+                        e,
+                        AprsIsError::Connect(_) | AprsIsError::Write(_) | AprsIsError::LoginTimeout
+                    ) || max_attempts.is_some_and(|max| attempt >= max.get())
+                    {
                         return Err(e);
                     }
                     tracing::warn!(
@@ -343,8 +346,8 @@ impl AprsIsClient {
 
     /// Reconnect to the APRS-IS server after a disconnect.
     ///
-    /// Drops the current connection (if any) and performs a fresh
-    /// connect + login. Preserves the configuration.
+    /// Keeps the old connection until replacement TCP establishment and login
+    /// writing succeed. A cancelled or failed replacement retains the old state.
     ///
     /// # Errors
     ///
@@ -352,19 +355,15 @@ impl AprsIsClient {
     pub async fn reconnect(&mut self) -> Result<(), AprsIsError> {
         tracing::info!("APRS-IS reconnecting");
         let new = Self::connect(self.config.clone()).await?;
-        self.reader = new.reader;
-        self.writer = new.writer;
-        self.line_buf.clear();
-        self.last_write = new.last_write;
-        self.logged_in_emitted = false;
+        *self = new;
         Ok(())
     }
 
     /// Read the next event from the server.
     ///
     /// Returns when a complete line arrives or the connection closes.
-    /// This is a blocking read; wrap in a `tokio::select!` with a
-    /// keepalive timer if you need concurrency.
+    /// No intrinsic read deadline applies. Cancellation retains partial bytes
+    /// and oversized-line draining state; the next call resumes the same line.
     ///
     /// # Encoding policy
     ///
@@ -387,26 +386,33 @@ impl AprsIsClient {
     /// oversized line is discarded and the stream resynchronises, so the
     /// caller may continue calling `next_event`).
     pub async fn next_event(&mut self) -> Result<AprsIsEvent, AprsIsError> {
-        self.line_buf.clear();
+        if self.line_complete {
+            self.line_buf.clear();
+            self.line_overflowed = false;
+            self.line_complete = false;
+        }
         // Bounded read: a malicious/buggy server could otherwise stream
         // bytes with no `\n` and grow `line_buf` until OOM. See
         // `read_is_line` and `MAX_IS_READ_LINE_BYTES`. On overflow the
         // helper drains the oversized line up to the next newline and
         // returns `ReadLineTooLong`, leaving the stream resynchronised.
-        let bytes =
-            read_is_line(&mut self.reader, &mut self.line_buf, MAX_IS_READ_LINE_BYTES).await?;
+        let result = read_is_line(
+            &mut self.reader,
+            &mut self.line_buf,
+            &mut self.line_overflowed,
+            MAX_IS_READ_LINE_BYTES,
+        )
+        .await;
+        self.line_complete =
+            result.is_ok() || matches!(&result, Err(AprsIsError::ReadLineTooLong { .. }));
+        let bytes = result?;
 
         if bytes == 0 {
             tracing::info!("APRS-IS connection closed by server");
             return Ok(AprsIsEvent::Disconnected);
         }
 
-        // Strip CRLF / LF / lone CR from the tail. `raw_len` is bounded
-        // by the buffer length by construction (rposition can only
-        // return an in-bounds index), so the `get(..raw_len)` lookup is
-        // guaranteed to return `Some`. We still go through `get` to
-        // satisfy `-D clippy::indexing-slicing` and document the
-        // invariant explicitly.
+        // Strip terminal line delimiters while retaining information bytes.
         let raw_len = self
             .line_buf
             .iter()
@@ -423,48 +429,40 @@ impl AprsIsClient {
         let line_str = String::from_utf8_lossy(raw_bytes);
         let line: &str = line_str.as_ref();
 
-        if let Some(packet) = parse_is_line(line) {
-            return Ok(AprsIsEvent::Packet(AprsIsPacket {
-                raw: raw_bytes.to_vec(),
-                line: packet.to_owned(),
-            }));
+        if parse_is_line(line).is_some() {
+            return Ok(AprsIsEvent::Packet(AprsIsPacket::from_received(
+                raw_bytes.to_vec(),
+            )));
         }
 
-        // Comment line. Check for login response on first one.
-        if !self.logged_in_emitted && line.contains("logresp") {
-            // The verified response has the form
-            //   "# logresp CALL verified, server T2FOO"
-            // and the rejected response has
-            //   "# logresp CALL unverified, ..."
-            // We have to check `unverified` before `verified` because the
-            // latter is a substring of the former.
-            if line.contains("unverified") {
-                self.logged_in_emitted = true;
-                // "unverified" is the expected success response to a
-                // receive-only (wire passcode -1) login: the server
-                // keeps the connection open and serves the filtered
-                // feed, it just will not gate our packets to RF. Only
-                // a login that sent a real passcode treats
-                // "unverified" as a rejection (wrong passcode).
-                if self.config.passcode == Passcode::ReceiveOnly {
-                    let server = parse_logresp_server(line);
-                    tracing::info!(response = %line, ?server, "APRS-IS receive-only login accepted");
-                    return Ok(AprsIsEvent::LoggedIn { server });
-                }
-                tracing::warn!(response = %line, "APRS-IS login rejected");
-                return Ok(AprsIsEvent::LoginRejected {
-                    reason: line.to_owned(),
+        if self.login_state == LoginState::Pending
+            && let Some((verified, server)) = parse_logresp(line, &self.config.callsign)
+        {
+            if verified || self.config.passcode == Passcode::ReceiveOnly {
+                self.login_state = if verified {
+                    LoginState::Verified
+                } else {
+                    LoginState::ReceiveOnly
+                };
+                return Ok(AprsIsEvent::LoggedIn {
+                    server: server.map(str::to_owned),
                 });
             }
-            if line.contains("verified") {
-                self.logged_in_emitted = true;
-                let server = parse_logresp_server(line);
-                tracing::info!(response = %line, ?server, "APRS-IS login verified");
-                return Ok(AprsIsEvent::LoggedIn { server });
-            }
+            self.login_state = LoginState::Rejected;
+            return Ok(AprsIsEvent::LoginRejected {
+                reason: crate::LoginRejection::Unverified {
+                    response: line.to_owned(),
+                },
+            });
         }
 
         Ok(AprsIsEvent::Comment(line.to_owned()))
+    }
+
+    /// Returns the server acknowledgement state for this connection.
+    #[must_use]
+    pub const fn login_state(&self) -> LoginState {
+        self.login_state
     }
 
     /// Send a formatted APRS packet to the server.
@@ -477,6 +475,7 @@ impl AprsIsClient {
     /// Returns [`AprsIsError::InvalidUplinkLine`] if any input inserts a
     /// framing byte or makes the completed line exceed 512 bytes, or
     /// [`AprsIsError::Write`] if the socket write or flush fails.
+    /// Login and stream availability errors follow [`Self::send_uplink_line`].
     pub async fn send_packet(
         &mut self,
         source: &str,
@@ -484,7 +483,7 @@ impl AprsIsClient {
         path: &[&str],
         data: &str,
     ) -> Result<(), AprsIsError> {
-        let line = format_is_packet(source, destination, path, data)?;
+        let line = format_is_packet(source, destination, path.iter().copied(), data)?;
         self.send_uplink_line(&line).await
     }
 
@@ -496,16 +495,44 @@ impl AprsIsClient {
     /// The [`AprsIsUplinkLine`] type proves that the bytes have exactly
     /// one trailing `CRLF`, no embedded framing bytes, and fit within the
     /// APRS-IS 512-byte line limit.
+    /// Packet lines require [`LoginState::Verified`]; comments and empty lines
+    /// are permitted in every login state. A rejected upload writes no bytes.
+    ///
+    /// Writing and flushing share [`SEND_TIMEOUT`]. Cancellation, a timeout,
+    /// or an I/O failure retires the outgoing stream because a partial line
+    /// may have reached the peer. Subsequent sends return
+    /// [`AprsIsError::ConnectionRetired`] until reconnection succeeds.
     ///
     /// # Errors
     ///
-    /// Returns [`AprsIsError::Write`] if the socket write or flush fails.
+    /// Returns [`AprsIsError::Write`] if writing fails or times out, or
+    /// [`AprsIsError::ConnectionRetired`] if an earlier send retired the stream.
+    /// Returns [`AprsIsError::UnverifiedConnection`] for a packet upload before
+    /// the server's verified acknowledgement.
     pub async fn send_uplink_line(&mut self, line: &AprsIsUplinkLine) -> Result<(), AprsIsError> {
-        self.writer
-            .write_all(line.as_bytes())
-            .await
-            .map_err(AprsIsError::Write)?;
-        self.writer.flush().await.map_err(AprsIsError::Write)?;
+        if self.writer.is_none() {
+            return Err(AprsIsError::ConnectionRetired);
+        }
+        let first = line.as_bytes().first().copied();
+        if !matches!(first, Some(b'#' | b'\r')) && self.login_state != LoginState::Verified {
+            return Err(AprsIsError::UnverifiedConnection {
+                state: self.login_state,
+            });
+        }
+        let mut writer = self.writer.take().ok_or(AprsIsError::ConnectionRetired)?;
+        tokio::time::timeout(SEND_TIMEOUT, async {
+            writer.write_all(line.as_bytes()).await?;
+            writer.flush().await
+        })
+        .await
+        .map_err(|_| {
+            AprsIsError::Write(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "APRS-IS line write timed out",
+            ))
+        })?
+        .map_err(AprsIsError::Write)?;
+        self.writer = Some(writer);
         self.last_write = Instant::now();
         Ok(())
     }
@@ -522,6 +549,7 @@ impl AprsIsClient {
     /// Returns [`AprsIsError::InvalidUplinkLine`] when framing, injection,
     /// or length validation fails, or [`AprsIsError::Write`] when the
     /// socket write or flush fails.
+    /// Login and stream availability errors follow [`Self::send_uplink_line`].
     pub async fn send_raw_bytes(&mut self, wire: &[u8]) -> Result<(), AprsIsError> {
         let line = AprsIsUplinkLine::from_wire_bytes(wire)?;
         self.send_uplink_line(&line).await
@@ -529,7 +557,7 @@ impl AprsIsClient {
 
     /// Validate and send a UTF-8 APRS-IS wire line.
     ///
-    /// This compatibility helper is appropriate for text-only callers.
+    /// This helper accepts text-only callers.
     /// RF uplinks should use [`send_uplink_line`](Self::send_uplink_line)
     /// or [`send_raw_bytes`](Self::send_raw_bytes) so no UTF-8 conversion
     /// can alter the information bytes.
@@ -578,12 +606,26 @@ impl AprsIsClient {
 
     /// Gracefully shut down the TCP connection.
     ///
+    /// Consumes the client and bounds write-half shutdown by [`SEND_TIMEOUT`].
+    /// Cancellation drops both halves. An already retired write half requires
+    /// no further shutdown operation.
+    ///
     /// # Errors
     ///
     /// Returns [`AprsIsError::Write`] if the shutdown flush fails.
     pub async fn shutdown(mut self) -> Result<(), AprsIsError> {
         tracing::debug!("APRS-IS shutting down");
-        self.writer.shutdown().await.map_err(AprsIsError::Write)?;
+        if let Some(mut writer) = self.writer.take() {
+            tokio::time::timeout(SEND_TIMEOUT, writer.shutdown())
+                .await
+                .map_err(|_| {
+                    AprsIsError::Write(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "APRS-IS shutdown timed out",
+                    ))
+                })?
+                .map_err(AprsIsError::Write)?;
+        }
         Ok(())
     }
 }
@@ -704,6 +746,217 @@ mod tests {
         }
     }
 
+    async fn spawn_verified_server<F, Fut>(
+        handler: F,
+    ) -> Result<std::net::SocketAddr, std::io::Error>
+    where
+        F: FnOnce(TcpStream) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send,
+    {
+        spawn_mock_server(|mut stream| async move {
+            write_all_ignore(&mut stream, b"# logresp N0CALL verified, server T2TEST\r\n").await;
+            handler(stream).await;
+        })
+        .await
+    }
+
+    async fn connect_verified(
+        addr: std::net::SocketAddr,
+    ) -> Result<AprsIsClient, Box<dyn std::error::Error>> {
+        let config = test_config(addr).with_passcode(Passcode::for_callsign("N0CALL"))?;
+        let mut client = AprsIsClient::connect(config).await?;
+        assert_eq!(client.login_state(), LoginState::Pending);
+        assert!(matches!(
+            client.next_event().await?,
+            AprsIsEvent::LoggedIn { .. }
+        ));
+        assert_eq!(client.login_state(), LoginState::Verified);
+        Ok(client)
+    }
+
+    #[tokio::test]
+    async fn packet_upload_waits_for_verified_login_without_retiring_writer() -> TestResult {
+        for (passcode, response, state) in [
+            (
+                Passcode::ReceiveOnly,
+                b"unverified".as_slice(),
+                LoginState::ReceiveOnly,
+            ),
+            (
+                Passcode::for_callsign("N0CALL"),
+                b"unverified".as_slice(),
+                LoginState::Rejected,
+            ),
+            (
+                Passcode::for_callsign("N0CALL"),
+                b"verified".as_slice(),
+                LoginState::Verified,
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let config = test_config(listener.local_addr()?).with_passcode(passcode)?;
+            let (client, accepted) = tokio::join!(AprsIsClient::connect(config), listener.accept());
+            let mut client = client?;
+            let (mut peer, _) = accepted?;
+            let login = read_lines_capture(&mut peer, 1).await;
+            assert!(login.starts_with(b"user N0CALL "));
+            let packet = AprsIsUplinkLine::from_body_bytes(b"N0CALL>APRS:test".as_slice())?;
+            let result = client.send_uplink_line(&packet).await;
+            assert!(
+                matches!(
+                    result,
+                    Err(AprsIsError::UnverifiedConnection {
+                        state: LoginState::Pending
+                    })
+                ),
+                "{result:?}"
+            );
+            assert!(client.writer.is_some());
+            client.send_keepalive().await?;
+            assert_eq!(
+                read_lines_capture(&mut peer, 1).await,
+                b"# aprs-is keepalive\r\n"
+            );
+            let mut acknowledgement = b"# logresp N0CALL ".to_vec();
+            acknowledgement.extend_from_slice(response);
+            acknowledgement.extend_from_slice(b", server T2TEST\r\n");
+            peer.write_all(&acknowledgement).await?;
+            let event = client.next_event().await?;
+            assert_eq!(client.login_state(), state);
+            assert_eq!(
+                matches!(event, AprsIsEvent::LoginRejected { .. }),
+                state == LoginState::Rejected
+            );
+            let result = client.send_uplink_line(&packet).await;
+            if state == LoginState::Verified {
+                result?;
+                assert_eq!(read_lines_capture(&mut peer, 1).await, packet.as_bytes());
+            } else {
+                assert!(
+                    matches!(result, Err(AprsIsError::UnverifiedConnection { state: actual }) if actual == state),
+                    "{result:?}"
+                );
+                client.send_keepalive().await?;
+                assert_eq!(
+                    read_lines_capture(&mut peer, 1).await,
+                    b"# aprs-is keepalive\r\n"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn cancel_pending<F: Future>(future: F) -> TestResult {
+        let mut future = std::pin::pin!(future);
+        std::future::poll_fn(|cx| match future.as_mut().poll(cx) {
+            std::task::Poll::Pending => std::task::Poll::Ready(Ok(())),
+            std::task::Poll::Ready(_) => std::task::Poll::Ready(Err(
+                "operation completed before its cancellation boundary".into(),
+            )),
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn cancelled_reads_retain_prefix_and_oversized_line_state() -> TestResult {
+        for oversized in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let config = test_config(listener.local_addr()?);
+            let (client, accepted) = tokio::join!(AprsIsClient::connect(config), listener.accept());
+            let mut client = client?;
+            let (mut peer, _) = accepted?;
+            let prefix = if oversized {
+                vec![b'X'; MAX_IS_READ_LINE_BYTES + 17]
+            } else {
+                b"N0CALL>APRS:retained".to_vec()
+            };
+            peer.write_all(&prefix).await?;
+            let _ = client.reader.fill_buf().await?;
+            cancel_pending(client.next_event()).await?;
+            assert_eq!(
+                client.line_buf.len(),
+                prefix.len().min(MAX_IS_READ_LINE_BYTES)
+            );
+            assert_eq!(client.line_overflowed, oversized);
+            peer.write_all(b" suffix\r\nN1CALL>APRS:next\r\n").await?;
+            let resumed = client.next_event().await;
+            if oversized {
+                assert!(
+                    matches!(resumed, Err(AprsIsError::ReadLineTooLong { .. })),
+                    "{resumed:?}"
+                );
+            } else {
+                let AprsIsEvent::Packet(packet) = resumed? else {
+                    return Err("resumed ordinary line was not a packet".into());
+                };
+                assert_eq!(packet.raw(), b"N0CALL>APRS:retained suffix");
+            }
+            let AprsIsEvent::Packet(packet) = client.next_event().await? else {
+                return Err("reader did not resume at the following packet".into());
+            };
+            assert_eq!(packet.raw(), b"N1CALL>APRS:next");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_oversized_eof_stays_rejected() -> TestResult {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let config = test_config(listener.local_addr()?);
+        let (client, accepted) = tokio::join!(AprsIsClient::connect(config), listener.accept());
+        let mut client = client?;
+        let (mut peer, _) = accepted?;
+        peer.write_all(&vec![b'X'; MAX_IS_READ_LINE_BYTES + 17])
+            .await?;
+        let _ = client.reader.fill_buf().await?;
+        cancel_pending(client.next_event()).await?;
+        assert!(client.line_overflowed);
+        peer.shutdown().await?;
+        let result = client.next_event().await;
+        assert!(
+            matches!(result, Err(AprsIsError::ReadLineTooLong { .. })),
+            "{result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_blocked_send_retires_the_outgoing_stream() -> TestResult {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let config = test_config(listener.local_addr()?);
+        let (client, accepted) = tokio::join!(AprsIsClient::connect(config), listener.accept());
+        let mut client = client?;
+        let (_peer, _) = accepted?;
+        let writer = client.writer.as_ref().ok_or("missing initial write half")?;
+        let mut blocked = false;
+        let fill = vec![b'X'; 65_536];
+        for _ in 0..512 {
+            match writer.try_write(&fill) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    blocked = true;
+                    break;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        assert!(
+            blocked,
+            "loopback peer did not apply send-buffer backpressure"
+        );
+        cancel_pending(client.send_keepalive()).await?;
+        assert!(
+            client.writer.is_none(),
+            "cancelled write half remained reusable"
+        );
+        let result = client.send_keepalive().await;
+        assert!(
+            matches!(result, Err(AprsIsError::ConnectionRetired)),
+            "{result:?}"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn connect_sends_login_string() -> TestResult {
         let (tx, rx) = oneshot::channel::<Vec<u8>>();
@@ -739,8 +992,8 @@ mod tests {
         let AprsIsEvent::Packet(ref pkt) = event else {
             return Err(format!("expected Packet, got {event:?}").into());
         };
-        assert_eq!(pkt.line, "N0CALL>APK005:!4903.50N/07201.75W-Test");
-        assert_eq!(pkt.raw, b"N0CALL>APK005:!4903.50N/07201.75W-Test");
+        assert_eq!(pkt.line(), "N0CALL>APK005:!4903.50N/07201.75W-Test");
+        assert_eq!(pkt.raw(), b"N0CALL>APK005:!4903.50N/07201.75W-Test");
         Ok(())
     }
 
@@ -774,18 +1027,18 @@ mod tests {
         let expected_raw = payload
             .get(..payload.len().saturating_sub(2))
             .ok_or("payload too short")?;
-        assert_eq!(pkt.raw.as_slice(), expected_raw);
+        assert_eq!(pkt.raw(), expected_raw);
         // The lossy view contains U+FFFD replacement characters for the
         // invalid UTF-8 bytes but is otherwise the original ASCII.
         assert!(
-            pkt.line.contains('\u{FFFD}'),
+            pkt.line().contains('\u{FFFD}'),
             "expected U+FFFD in lossy view, got {:?}",
-            pkt.line
+            pkt.line()
         );
         assert!(
-            pkt.line.starts_with("N0CALL>APK005:`"),
+            pkt.line().starts_with("N0CALL>APK005:`"),
             "ASCII prefix should survive: {:?}",
-            pkt.line
+            pkt.line()
         );
         Ok(())
     }
@@ -849,7 +1102,7 @@ mod tests {
         let mut client = AprsIsClient::connect(config).await?;
         let event = client.next_event().await?;
         assert!(
-            matches!(event, AprsIsEvent::LoginRejected { ref reason } if reason.contains("unverified")),
+            matches!(event, AprsIsEvent::LoginRejected { ref reason } if reason.response().contains("unverified")),
             "expected LoginRejected, got {event:?}"
         );
         Ok(())
@@ -862,7 +1115,7 @@ mod tests {
             let _ = read_some(&mut stream, &mut buf).await;
             write_all_ignore(
                 &mut stream,
-                b"# logresp N0CALL-14 unverified, server T2TEST\r\n",
+                b"# logresp N0CALL unverified, server T2TEST\r\n",
             )
             .await;
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -882,16 +1135,49 @@ mod tests {
     }
 
     #[test]
-    fn parse_logresp_server_extracts_name() {
+    fn login_responses_require_an_exact_prefix_status_and_matching_identity() {
         assert_eq!(
-            parse_logresp_server("# logresp N0CALL verified, server T2TEST"),
-            Some("T2TEST".to_owned())
+            parse_logresp("# logresp n0call verified, server T2TEST", "N0CALL"),
+            Some((true, Some("T2TEST")))
         );
         assert_eq!(
-            parse_logresp_server("# logresp N0CALL verified, server  T2A "),
-            Some("T2A".to_owned())
+            parse_logresp("# logresp N0CALL unverified, server  T2A ", "N0CALL"),
+            Some((false, Some("T2A")))
         );
-        assert_eq!(parse_logresp_server("# javAPRSSrvr 4.2.0b05"), None);
+        for invalid in [
+            "# javAPRSSrvr logresp N0CALL verified, server T2TEST",
+            "# logresp N1CALL verified, server T2TEST",
+            "# logresp N0CALL-14 verified, server T2TEST",
+            "# logresp N0CALL notverified, server T2TEST",
+            "# logresp N0CALL invalid, verified, server T2TEST",
+            "logresp N0CALL verified, server T2TEST",
+        ] {
+            assert_eq!(parse_logresp(invalid, "N0CALL"), None, "{invalid:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unrelated_login_comments_do_not_consume_the_login_response() -> TestResult {
+        let addr = spawn_mock_server(|mut stream| async move {
+            let mut buf = [0_u8; 512];
+            let _ = read_some(&mut stream, &mut buf).await;
+            write_all_ignore(&mut stream,
+                b"# logresp N1CALL verified, server T2OTHER\r\n# banner logresp N0CALL verified, server T2OTHER\r\n# logresp N0CALL verified, server T2TEST\r\n").await;
+        }).await?;
+        let mut client = AprsIsClient::connect(test_config(addr)).await?;
+        assert!(matches!(
+            client.next_event().await?,
+            AprsIsEvent::Comment(_)
+        ));
+        assert!(matches!(
+            client.next_event().await?,
+            AprsIsEvent::Comment(_)
+        ));
+        let event = client.next_event().await?;
+        assert!(
+            matches!(event, AprsIsEvent::LoggedIn { server } if server.as_deref() == Some("T2TEST"))
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -915,14 +1201,14 @@ mod tests {
     #[tokio::test]
     async fn send_packet_formats_line() -> TestResult {
         let (tx, rx) = oneshot::channel::<Vec<u8>>();
-        let addr = spawn_mock_server(move |mut stream| async move {
+        let addr = spawn_verified_server(move |mut stream| async move {
             // Login line + packet line.
             let captured = read_lines_capture(&mut stream, 2).await;
             drop(tx.send(captured));
         })
         .await?;
 
-        let mut client = AprsIsClient::connect(test_config(addr)).await?;
+        let mut client = connect_verified(addr).await?;
         client
             .send_packet("N0CALL", "APK005", &["WIDE1-1"], "!4903.50N/07201.75W-Test")
             .await?;
@@ -999,59 +1285,28 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn connect_timeout() -> TestResult {
-        // Connect to a non-routable IP to trigger timeout.
-        // Using 198.51.100.1 (TEST-NET-2) which should not respond.
-        //
-        // `start_paused`: the connect deadline is a tokio timer wrapping
-        // the pending socket, so once the runtime parks with no I/O
-        // readiness the clock auto-advances to the deadline. The test
-        // exercises the same timeout path in virtual time instead of
-        // sleeping out the real 10-second CONNECT_TIMEOUT.
-        let config = AprsIsConfig {
-            callsign: "N0CALL".to_owned(),
-            passcode: Passcode::ReceiveOnly,
-            server: "198.51.100.1".to_owned(),
-            port: 14580,
-            filter: String::new(),
-            software_name: "test".to_owned(),
-            software_version: "0.1".to_owned(),
-        };
-        // `connect` bounds the TCP handshake at CONNECT_TIMEOUT (10s), so
-        // a single attempt must resolve within that plus margin (both
-        // measured on the paused clock). If the outer timer fires, the
-        // client hung past its own deadline (exactly the regression this
-        // test guards) and the `?` fails the test.
-        let result = tokio::time::timeout(
-            CONNECT_TIMEOUT + Duration::from_secs(5),
-            AprsIsClient::connect_with_retry(config, Some(1)),
-        )
-        .await
-        .map_err(|_| "connect_with_retry hung past CONNECT_TIMEOUT + margin")?;
-        // Within the deadline the attempt must have failed: fast-reject
-        // networks yield Connect(unreachable) immediately, SYN-dropping
-        // networks yield Connect(TimedOut) at CONNECT_TIMEOUT. Either
-        // way, reaching a TEST-NET-2 address is a failure.
-        assert!(
-            result.is_err(),
-            "expected connect to TEST-NET-2 to fail, got Ok"
-        );
+    async fn refused_loopback_connection_obeys_attempt_limit() -> TestResult {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let config = test_config(listener.local_addr()?);
+        drop(listener);
+        let started = tokio::time::Instant::now();
+        let result = AprsIsClient::connect_with_retry(config, NonZeroU32::new(3)).await;
+        assert!(matches!(result, Err(AprsIsError::Connect(_))), "{result:?}");
+        assert!(tokio::time::Instant::now() - started >= Duration::from_secs(3));
         Ok(())
     }
-
-    // --- Bounded inbound read (BUG 1: unbounded line-read DoS) ---
 
     #[tokio::test]
     async fn read_is_line_reads_a_normal_line() -> TestResult {
         let data: &[u8] = b"N0CALL>APK005:hello\r\nnext line\n";
         let mut reader = BufReader::new(data);
         let mut buf = Vec::new();
-        let n = read_is_line(&mut reader, &mut buf, MAX_IS_READ_LINE_BYTES).await?;
+        let n = read_is_line(&mut reader, &mut buf, &mut false, MAX_IS_READ_LINE_BYTES).await?;
         assert_eq!(n, buf.len());
         assert_eq!(buf.as_slice(), b"N0CALL>APK005:hello\r\n");
         // The next line is still readable (consume positioned correctly).
         buf.clear();
-        let _ = read_is_line(&mut reader, &mut buf, MAX_IS_READ_LINE_BYTES).await?;
+        let _ = read_is_line(&mut reader, &mut buf, &mut false, MAX_IS_READ_LINE_BYTES).await?;
         assert_eq!(buf.as_slice(), b"next line\n");
         Ok(())
     }
@@ -1064,7 +1319,7 @@ mod tests {
         data.extend_from_slice(b"\r\n");
         let mut reader = BufReader::new(data.as_slice());
         let mut buf = Vec::new();
-        let n = read_is_line(&mut reader, &mut buf, MAX_IS_READ_LINE_BYTES).await?;
+        let n = read_is_line(&mut reader, &mut buf, &mut false, MAX_IS_READ_LINE_BYTES).await?;
         assert_eq!(n, 602, "long valid line should be returned whole");
         assert_eq!(buf.len(), 602);
         Ok(())
@@ -1078,7 +1333,7 @@ mod tests {
         let data = vec![b'A'; MAX_IS_READ_LINE_BYTES * 64];
         let mut reader = BufReader::new(data.as_slice());
         let mut buf = Vec::new();
-        let result = read_is_line(&mut reader, &mut buf, MAX_IS_READ_LINE_BYTES).await;
+        let result = read_is_line(&mut reader, &mut buf, &mut false, MAX_IS_READ_LINE_BYTES).await;
         assert!(
             buf.len() <= MAX_IS_READ_LINE_BYTES,
             "buffer grew past the cap: {} > {}",
@@ -1100,7 +1355,7 @@ mod tests {
         let data = vec![b'A'; MAX_IS_READ_LINE_BYTES];
         let mut reader = BufReader::new(data.as_slice());
         let mut buf = Vec::new();
-        let n = read_is_line(&mut reader, &mut buf, MAX_IS_READ_LINE_BYTES).await?;
+        let n = read_is_line(&mut reader, &mut buf, &mut false, MAX_IS_READ_LINE_BYTES).await?;
         assert_eq!(n, MAX_IS_READ_LINE_BYTES);
         assert_eq!(buf, data);
         Ok(())
@@ -1117,7 +1372,7 @@ mod tests {
         let mut reader = BufReader::new(data.as_slice());
 
         let mut buf = Vec::new();
-        let first = read_is_line(&mut reader, &mut buf, MAX_IS_READ_LINE_BYTES).await;
+        let first = read_is_line(&mut reader, &mut buf, &mut false, MAX_IS_READ_LINE_BYTES).await;
         assert!(
             matches!(first, Err(AprsIsError::ReadLineTooLong { max }) if max == MAX_IS_READ_LINE_BYTES),
             "expected ReadLineTooLong, got {first:?}"
@@ -1130,12 +1385,10 @@ mod tests {
 
         // Resync: the following well-formed line is delivered intact.
         buf.clear();
-        let _ = read_is_line(&mut reader, &mut buf, MAX_IS_READ_LINE_BYTES).await?;
+        let _ = read_is_line(&mut reader, &mut buf, &mut false, MAX_IS_READ_LINE_BYTES).await?;
         assert_eq!(buf.as_slice(), b"N0CALL>APK005:ok\r\n");
         Ok(())
     }
-
-    // --- CRLF injection on the uplink (BUG 2) ---
 
     #[tokio::test]
     async fn send_packet_rejects_crlf_injection_in_data() -> TestResult {
@@ -1187,14 +1440,14 @@ mod tests {
 
     #[tokio::test]
     async fn send_raw_line_rejects_embedded_newline_but_allows_crlf() -> TestResult {
-        let addr = spawn_mock_server(|mut stream| async move {
+        let addr = spawn_verified_server(|mut stream| async move {
             let mut buf = [0u8; 1024];
             let _ = read_some(&mut stream, &mut buf).await;
             tokio::time::sleep(Duration::from_millis(80)).await;
         })
         .await?;
 
-        let mut client = AprsIsClient::connect(test_config(addr)).await?;
+        let mut client = connect_verified(addr).await?;
         // Embedded newline in the body is rejected.
         let injected = client.send_raw_line("good\r\nEVIL>X:forged\r\n").await;
         assert!(
@@ -1214,13 +1467,13 @@ mod tests {
     #[tokio::test]
     async fn send_raw_bytes_preserves_non_utf8_wire_bytes() -> TestResult {
         let (tx, rx) = oneshot::channel::<Vec<u8>>();
-        let addr = spawn_mock_server(move |mut stream| async move {
+        let addr = spawn_verified_server(move |mut stream| async move {
             let captured = read_lines_capture(&mut stream, 2).await;
             drop(tx.send(captured));
         })
         .await?;
 
-        let mut client = AprsIsClient::connect(test_config(addr)).await?;
+        let mut client = connect_verified(addr).await?;
         let packet: &[u8] = b"N0CALL>APK005:`\xC1\x82\x91\r\n";
         client.send_raw_bytes(packet).await?;
 
@@ -1270,14 +1523,14 @@ mod tests {
     #[tokio::test]
     async fn send_packet_normal_still_sends() -> TestResult {
         let (tx, rx) = oneshot::channel::<Vec<u8>>();
-        let addr = spawn_mock_server(move |mut stream| async move {
+        let addr = spawn_verified_server(move |mut stream| async move {
             // Login line + packet line.
             let captured = read_lines_capture(&mut stream, 2).await;
             drop(tx.send(captured));
         })
         .await?;
 
-        let mut client = AprsIsClient::connect(test_config(addr)).await?;
+        let mut client = connect_verified(addr).await?;
         client
             .send_packet("N0CALL", "APK005", &[], "!4903.50N/07201.75W-Test")
             .await?;
@@ -1297,19 +1550,17 @@ mod tests {
         Ok(())
     }
 
-    // --- Login validation (BUG 3) reaches connect() ---
-
     #[tokio::test]
     async fn connect_rejects_invalid_login_field() -> TestResult {
         // A software_name with a space must fail before any socket work.
-        let mut config = AprsIsConfig::new("N0CALL");
+        let mut config = AprsIsConfig::new("N0CALL")?;
         config.software_name = "my app".to_owned();
         let result = AprsIsClient::connect(config).await;
         assert!(
             matches!(
                 result,
                 Err(AprsIsError::InvalidLoginField {
-                    field: "software_name",
+                    field: crate::LoginField::SoftwareName,
                     ..
                 })
             ),
@@ -1320,8 +1571,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_rejects_oversized_login_before_opening_socket() {
-        let mut config = AprsIsConfig::new("N0CALL");
+    async fn connect_rejects_oversized_login_before_opening_socket() -> TestResult {
+        let mut config = AprsIsConfig::new("N0CALL")?;
         config.filter = "A".repeat(crate::MAX_IS_LINE_BYTES);
 
         let result = AprsIsClient::connect(config).await;
@@ -1331,5 +1582,6 @@ mod tests {
                 crate::AprsIsUplinkLineError::TooLong { .. }
             ))
         ));
+        Ok(())
     }
 }
