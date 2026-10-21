@@ -1,16 +1,16 @@
 [package]
 name = "dmr-rewind-core"
 version = "0.1.0"
+authors = ["swiftraccoon"]
+categories = ["encoding", "network-programming", "parser-implementations"]
 edition = "2024"
+keywords = ["dmr", "brandmeister", "ham-radio", "codec"]
+license = "GPL-2.0-or-later"
+publish = false
+readme = "README.md"
+repository = "https://github.com/swiftraccoon/kenwood"
 rust-version = "1.94"
 description = "Sans-I/O codec for BrandMeister's REWIND DMR application protocol"
-license = "GPL-2.0-or-later"
-authors = ["swiftraccoon"]
-keywords = ["dmr", "brandmeister", "ham-radio", "codec"]
-categories = ["encoding", "network-programming", "parser-implementations"]
-repository = "https://github.com/swiftraccoon/kenwood"
-readme = "README.md"
-publish = false
 
 [dependencies]
 sha2 = "0.10"
