@@ -11,7 +11,6 @@ use std::marker::PhantomData;
 use std::net::SocketAddr;
 
 use crate::header::DstarHeader;
-use crate::session::client::Protocol;
 use crate::types::{Callsign, Module, StreamId};
 use crate::voice::VoiceFrame;
 
@@ -26,7 +25,7 @@ use crate::voice::VoiceFrame;
 /// layer so the core can surface rejections without a cross-crate
 /// dependency on the server-side authorizer types.
 #[non_exhaustive]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ClientRejectedReason {
     /// Reflector at capacity.
     Busy,
@@ -56,8 +55,8 @@ pub enum ClientRejectedReason {
 /// [`ServerEvent::__Phantom`] variant that cannot be constructed
 /// (its payload is an uninhabited [`Infallible`]).
 #[non_exhaustive]
-#[derive(Debug, Clone)]
-pub enum ServerEvent<P: Protocol> {
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ServerEvent<P> {
     /// A new client has linked to a module.
     ClientLinked {
         /// Client peer address.

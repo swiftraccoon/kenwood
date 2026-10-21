@@ -10,7 +10,7 @@
 //! See `ircDDBGateway/Common/HeaderData.cpp:619-623` for the
 //! reference receive-path pattern this type mirrors.
 
-use super::type_error::TypeError;
+use super::type_error::{TextFieldError, TypeError};
 use super::wire_text::{WireTextError, diagnostic_wire_bytes, trimmed_printable_ascii};
 
 /// D-STAR callsign (8 bytes, ASCII, space-padded on the right).
@@ -51,16 +51,25 @@ impl Callsign {
     pub fn try_from_str(s: &str) -> Result<Self, TypeError> {
         let trimmed = s.trim_end_matches(' ');
         if trimmed.is_empty() {
-            return Err(TypeError::InvalidCallsign { reason: "empty" });
+            return Err(TypeError::InvalidCallsign {
+                reason: TextFieldError::Empty,
+            });
         }
         if trimmed.len() > 8 {
             return Err(TypeError::InvalidCallsign {
-                reason: "longer than 8 bytes",
+                reason: TextFieldError::TooLong {
+                    got: trimmed.len(),
+                    max: 8,
+                },
             });
         }
-        if !trimmed.bytes().all(|byte| (b' '..=b'~').contains(&byte)) {
+        if let Some((offset, byte)) = trimmed
+            .bytes()
+            .enumerate()
+            .find(|(_, byte)| !(b' '..=b'~').contains(byte))
+        {
             return Err(TypeError::InvalidCallsign {
-                reason: "byte outside printable ASCII",
+                reason: TextFieldError::NonPrintable { offset, byte },
             });
         }
         let mut buf = [b' '; 8];
@@ -107,18 +116,45 @@ impl Callsign {
     pub fn text(&self) -> Result<&str, WireTextError> {
         trimmed_printable_ascii(&self.0)
     }
+}
 
-    /// Return text for a valid callsign or an exact escaped diagnostic.
-    ///
-    /// This compatibility view never inserts Unicode replacement characters.
-    /// Use [`Self::text`] for semantic decisions, because it distinguishes
-    /// validated callsign text from malformed receive bytes.
-    #[must_use]
-    pub fn as_str(&self) -> std::borrow::Cow<'_, str> {
-        self.text().map_or_else(
-            |_| std::borrow::Cow::Owned(diagnostic_wire_bytes(&self.0)),
-            std::borrow::Cow::Borrowed,
-        )
+impl std::str::FromStr for Callsign {
+    type Err = TypeError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::try_from_str(value)
+    }
+}
+
+impl TryFrom<&str> for Callsign {
+    type Error = TypeError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::try_from_str(value)
+    }
+}
+
+impl AsRef<[u8; 8]> for Callsign {
+    fn as_ref(&self) -> &[u8; 8] {
+        self.as_bytes()
+    }
+}
+
+impl AsRef<[u8]> for Callsign {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl From<[u8; 8]> for Callsign {
+    fn from(value: [u8; 8]) -> Self {
+        Self::from_wire_bytes(value)
+    }
+}
+
+impl From<Callsign> for [u8; 8] {
+    fn from(value: Callsign) -> Self {
+        value.0
     }
 }
 
@@ -228,7 +264,10 @@ mod tests {
                 byte: 0xC3,
             })
         );
-        assert_eq!(cs.as_str(), "<invalid wire bytes: 41 C3 43 20 20 20 20 20>");
+        assert_eq!(
+            cs.to_string(),
+            "<invalid wire bytes: 41 C3 43 20 20 20 20 20>"
+        );
     }
 
     #[test]

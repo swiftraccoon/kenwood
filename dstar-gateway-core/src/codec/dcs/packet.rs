@@ -4,14 +4,18 @@
 //! reflector. `ServerPacket` represents every packet a reflector sends
 //! to a client. The codec is symmetric; both directions are
 //! first-class.
+//!
+//! Packet values are decoded observations. Each `seq` retains the complete
+//! wire byte, including end and unknown bits. Transmit encoders take a
+//! checked [`crate::FrameSequence`] and select termination separately.
 
 use crate::header::DstarHeader;
-use crate::types::{Callsign, Module, StreamId};
+use crate::types::{Callsign, Module, ModuleSlot, StreamId};
 use crate::voice::VoiceFrame;
 
 /// Packets a `DCS` client sends to a reflector.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ClientPacket {
     /// 519-byte LINK request with embedded HTML client identifier.
     Link {
@@ -62,12 +66,14 @@ pub enum ClientPacket {
 
 /// Packets a `DCS` reflector sends to a client.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ServerPacket {
     /// 14-byte ACK reply to a LINK request.
     ConnectAck {
         /// Echoed callsign.
         callsign: Callsign,
+        /// Echoed client module from byte 8.
+        client_module: Module,
         /// Echoed reflector module.
         reflector_module: Module,
     },
@@ -76,8 +82,10 @@ pub enum ServerPacket {
     ConnectNak {
         /// Echoed callsign.
         callsign: Callsign,
-        /// Echoed reflector module.
-        reflector_module: Module,
+        /// Echoed client module from byte 8.
+        client_module: Module,
+        /// Requested reflector module or a space NAK/disconnect slot.
+        reflector_module: ModuleSlot,
     },
 
     /// 17-byte keepalive poll echo.
@@ -105,7 +113,7 @@ pub enum ServerPacket {
 
 /// Result of a `DCS` connect attempt.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConnectResult {
     /// `b"ACK"` reply.
     Accept,
@@ -119,7 +127,7 @@ pub enum ConnectResult {
 /// the four cases the reference implementation writes into the HTML
 /// template.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GatewayType {
     /// Standard D-STAR repeater (default).
     Repeater,
@@ -180,6 +188,7 @@ mod tests {
     fn server_packet_connect_ack_carries_module() {
         let p = ServerPacket::ConnectAck {
             callsign: CS_DCS001,
+            client_module: Module::B,
             reflector_module: Module::C,
         };
         assert!(

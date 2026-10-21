@@ -1,6 +1,6 @@
 //! DPRS CRC: CRC-CCITT over the DPRS payload bytes.
 //!
-//! Reference: `ircDDBGateway/Common/APRSCollector.cpp:371-394`
+//! Reference: `ircDDBGateway/Common/APRSCollector.cpp::calcCRC`
 //! (`CAPRSCollector::calcCRC`). The algorithm is:
 //!
 //! - initial value `0xFFFF`
@@ -17,6 +17,8 @@ use crate::header::crc_ccitt;
 /// Matches `CAPRSCollector::calcCRC` from ircDDBGateway: reflected
 /// polynomial `0x8408`, initial value `0xFFFF`, final `~accumulator`.
 /// Equivalent to [`crate::header::crc_ccitt`].
+/// This function checks exactly the supplied bytes. DPRS sentence verification
+/// also includes the carriage return; [`super::DprsReport`] handles that framing.
 ///
 /// # Example
 /// ```
@@ -28,6 +30,20 @@ use crate::header::crc_ccitt;
 #[must_use]
 pub fn compute_crc(bytes: &[u8]) -> u16 {
     crc_ccitt(bytes)
+}
+
+/// Continue the reflected CRC state with the DPRS carriage-return terminator.
+pub(crate) fn compute_sentence_crc(body: &[u8]) -> u16 {
+    let mut state = compute_crc(body) ^ 0xFFFF;
+    state ^= u16::from(b'\r');
+    for _ in 0..8 {
+        state = if state & 1 == 0 {
+            state >> 1
+        } else {
+            (state >> 1) ^ 0x8408
+        };
+    }
+    state ^ 0xFFFF
 }
 
 #[cfg(test)]

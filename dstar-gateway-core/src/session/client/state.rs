@@ -1,4 +1,8 @@
 //! Sealed `ClientState` markers for the typestate session.
+//!
+//! Markers describe consuming transitions. Driver input, timeouts and
+//! in-place disconnect can subsequently change runtime state; send methods
+//! check that state and return [`crate::StateError::WrongState`] on refusal.
 
 /// Sealed marker for client connection states.
 pub trait ClientState: sealed::Sealed + 'static {}
@@ -8,27 +12,27 @@ mod sealed {
 }
 
 /// Built but no I/O happened.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Configured;
 
 /// (`DPlus` only) TCP auth completed, host list cached.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Authenticated;
 
 /// LINK1 sent, awaiting LINK1-ACK or LINK2-ACK.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Connecting;
 
-/// Connected and operational. The only state where `send_*` exists.
-#[derive(Debug, Clone, Copy)]
+/// Wrapper produced by a completed connection transition, exposing `send_*`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Connected;
 
 /// UNLINK sent, awaiting confirmation or timeout.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Disconnecting;
 
 /// Terminal state; must be rebuilt to use again.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Closed;
 
 impl sealed::Sealed for Configured {}

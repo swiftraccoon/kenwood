@@ -15,8 +15,6 @@ use crate::types::StreamId;
 use crate::validator::Diagnostic;
 use crate::voice::VoiceFrame;
 
-use super::protocol::Protocol;
-
 /// One event surfaced by the client session machine.
 ///
 /// The `P: Protocol` parameter is a phantom; every variant carries
@@ -28,8 +26,8 @@ use super::protocol::Protocol;
 /// All variants are populated: [`Event::Connected`], [`Event::Disconnected`],
 /// [`Event::PollEcho`], and the voice events.
 #[non_exhaustive]
-#[derive(Debug, Clone)]
-pub enum Event<P: Protocol> {
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Event<P> {
     /// Session has transitioned to `Connected`.
     Connected {
         /// Peer address of the reflector.
@@ -93,8 +91,10 @@ pub enum Event<P: Protocol> {
 
 /// Why the session disconnected.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DisconnectReason {
+    /// An injected instant cannot represent the protocol timer deadlines.
+    ClockRange,
     /// Reflector explicitly NAK'd the connection.
     Rejected,
     /// Reflector acknowledged the unlink.
@@ -107,7 +107,7 @@ pub enum DisconnectReason {
 
 /// Why a voice stream ended.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VoiceEndReason {
     /// Real EOT packet received.
     Eot,

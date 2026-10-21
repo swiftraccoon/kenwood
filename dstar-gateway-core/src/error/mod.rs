@@ -4,22 +4,22 @@
 //! can pattern-match to distinguish I/O failures from timeouts from
 //! protocol errors from type-validation errors.
 
-mod encode;
-mod io_operation;
-mod protocol;
-mod state;
-mod timeout;
-
 pub use crate::codec::dcs::error::DcsError;
 pub use crate::codec::dextra::error::DExtraError;
 pub use crate::codec::dplus::error::DPlusError;
 pub use encode::EncodeError;
 pub use io_operation::IoOperation;
 pub use protocol::ProtocolError;
-pub use state::StateError;
+pub use state::{StateError, StateOperation};
 pub use timeout::TimeoutError;
 
 use crate::types::TypeError;
+
+mod encode;
+mod io_operation;
+mod protocol;
+mod state;
+mod timeout;
 
 /// Top-level error type for `dstar-gateway-core`.
 ///

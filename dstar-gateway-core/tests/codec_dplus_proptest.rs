@@ -23,7 +23,7 @@ use dstar_gateway_core::codec::dplus::{
     encode_voice_eot, encode_voice_header,
 };
 use dstar_gateway_core::validator::NullSink;
-use dstar_gateway_core::{Callsign, DstarHeader, StreamId, Suffix, VoiceFrame};
+use dstar_gateway_core::{Callsign, DstarHeader, FrameSequence, StreamId, Suffix, VoiceFrame};
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
 
@@ -61,9 +61,7 @@ prop_compose! {
 
 const fn ref030_header(my_call: Callsign) -> DstarHeader {
     DstarHeader {
-        flag1: 0,
-        flag2: 0,
-        flag3: 0,
+        flags: dstar_gateway_core::HeaderFlags::NONE,
         rpt2: Callsign::from_wire_bytes(*b"REF030 G"),
         rpt1: Callsign::from_wire_bytes(*b"REF030 C"),
         ur_call: Callsign::from_wire_bytes(*b"CQCQCQ  "),
@@ -154,7 +152,8 @@ proptest! {
         frame in any_voice_frame(),
     ) {
         let mut buf = [0u8; 64];
-        let n = encode_voice_data(&mut buf, sid, seq, &frame).map_err(to_test_err)?;
+        let index = FrameSequence::try_from(seq).map_err(to_test_err)?;
+        let n = encode_voice_data(&mut buf, sid, index, &frame).map_err(to_test_err)?;
         let pkt = decode_server_to_client(wire(&buf, n)?, &mut NullSink).map_err(to_test_err)?;
         match pkt {
             ServerPacket::VoiceData { stream_id, seq: s, frame: f } => {
@@ -170,7 +169,8 @@ proptest! {
     #[test]
     fn voice_eot_server_roundtrips(sid in any_stream_id(), seq in 0u8..21) {
         let mut buf = [0u8; 64];
-        let n = encode_voice_eot(&mut buf, sid, seq).map_err(to_test_err)?;
+        let index = FrameSequence::try_from(seq).map_err(to_test_err)?;
+        let n = encode_voice_eot(&mut buf, sid, index).map_err(to_test_err)?;
         let pkt = decode_server_to_client(wire(&buf, n)?, &mut NullSink).map_err(to_test_err)?;
         match pkt {
             ServerPacket::VoiceEot { stream_id, seq: s } => {

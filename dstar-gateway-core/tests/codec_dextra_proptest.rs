@@ -21,7 +21,10 @@ use dstar_gateway_core::codec::dextra::{
     encode_voice_data, encode_voice_eot, encode_voice_header,
 };
 use dstar_gateway_core::validator::NullSink;
-use dstar_gateway_core::{Callsign, DstarHeader, Module, StreamId, Suffix, VoiceFrame};
+use dstar_gateway_core::{
+    Callsign, DstarHeader, FrameSequence, Module, ModuleSlot, RepeaterIdentity, RoutingCallsign,
+    StreamId, Suffix, VoiceFrame,
+};
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
 
@@ -81,9 +84,7 @@ prop_compose! {
 
 const fn xrf030_header(my_call: Callsign) -> DstarHeader {
     DstarHeader {
-        flag1: 0,
-        flag2: 0,
-        flag3: 0,
+        flags: dstar_gateway_core::HeaderFlags::NONE,
         rpt2: Callsign::from_wire_bytes(*b"XRF030 G"),
         rpt1: Callsign::from_wire_bytes(*b"XRF030 C"),
         ur_call: Callsign::from_wire_bytes(*b"CQCQCQ  "),
@@ -103,7 +104,8 @@ proptest! {
         client in any_module(),
     ) {
         let mut buf = [0u8; 16];
-        let n = encode_connect_link(&mut buf, &cs, refl, client).map_err(to_test_err)?;
+        let identity = RepeaterIdentity { callsign: RoutingCallsign::try_from(cs).map_err(to_test_err)?, module: client };
+        let n = encode_connect_link(&mut buf, identity, refl).map_err(to_test_err)?;
         let pkt = decode_client_to_server(wire(&buf, n)?, &mut NullSink).map_err(to_test_err)?;
         match pkt {
             ClientPacket::Link { callsign, reflector_module, client_module } => {
@@ -118,7 +120,8 @@ proptest! {
     #[test]
     fn unlink_client_roundtrips(cs in any_connect_callsign(), client in any_module()) {
         let mut buf = [0u8; 16];
-        let n = encode_unlink(&mut buf, &cs, client).map_err(to_test_err)?;
+        let identity = RepeaterIdentity { callsign: RoutingCallsign::try_from(cs).map_err(to_test_err)?, module: client };
+        let n = encode_unlink(&mut buf, identity).map_err(to_test_err)?;
         let pkt = decode_client_to_server(wire(&buf, n)?, &mut NullSink).map_err(to_test_err)?;
         match pkt {
             ClientPacket::Unlink { callsign, client_module } => {
@@ -143,13 +146,15 @@ proptest! {
     }
 
     #[test]
-    fn connect_ack_server_roundtrips(cs in any_connect_callsign(), refl in any_module()) {
+    fn connect_ack_server_roundtrips(cs in any_connect_callsign(), refl in any_module(), client in any_module()) {
         let mut buf = [0u8; 16];
-        let n = encode_connect_ack(&mut buf, &cs, refl).map_err(to_test_err)?;
+        let identity = RepeaterIdentity { callsign: RoutingCallsign::try_from(cs).map_err(to_test_err)?, module: client };
+        let n = encode_connect_ack(&mut buf, identity, refl).map_err(to_test_err)?;
         let pkt = decode_server_to_client(wire(&buf, n)?, &mut NullSink).map_err(to_test_err)?;
         match pkt {
-            ServerPacket::ConnectAck { callsign, reflector_module } => {
+            ServerPacket::ConnectAck { callsign, client_module, reflector_module } => {
                 prop_assert_eq!(callsign, cs);
+                prop_assert_eq!(client_module, client);
                 prop_assert_eq!(reflector_module, refl);
             }
             _ => prop_assert!(false, "expected ConnectAck"),
@@ -157,14 +162,17 @@ proptest! {
     }
 
     #[test]
-    fn connect_nak_server_roundtrips(cs in any_connect_callsign(), refl in any_module()) {
+    fn connect_nak_server_roundtrips(cs in any_connect_callsign(), refl in prop::option::of(any_module()), client in any_module()) {
         let mut buf = [0u8; 16];
-        let n = encode_connect_nak(&mut buf, &cs, refl).map_err(to_test_err)?;
+        let identity = RepeaterIdentity { callsign: RoutingCallsign::try_from(cs).map_err(to_test_err)?, module: client };
+        let target = refl.map_or(ModuleSlot::Empty, ModuleSlot::Module);
+        let n = encode_connect_nak(&mut buf, identity, target).map_err(to_test_err)?;
         let pkt = decode_server_to_client(wire(&buf, n)?, &mut NullSink).map_err(to_test_err)?;
         match pkt {
-            ServerPacket::ConnectNak { callsign, reflector_module } => {
+            ServerPacket::ConnectNak { callsign, client_module, reflector_module } => {
                 prop_assert_eq!(callsign, cs);
-                prop_assert_eq!(reflector_module, refl);
+                prop_assert_eq!(client_module, client);
+                prop_assert_eq!(reflector_module, target);
             }
             _ => prop_assert!(false, "expected ConnectNak"),
         }
@@ -191,7 +199,8 @@ proptest! {
         frame in any_voice_frame(),
     ) {
         let mut buf = [0u8; 64];
-        let n = encode_voice_data(&mut buf, sid, seq, &frame).map_err(to_test_err)?;
+        let index = FrameSequence::try_from(seq).map_err(to_test_err)?;
+        let n = encode_voice_data(&mut buf, sid, index, &frame).map_err(to_test_err)?;
         let pkt = decode_server_to_client(wire(&buf, n)?, &mut NullSink).map_err(to_test_err)?;
         match pkt {
             ServerPacket::VoiceData { stream_id, seq: s, frame: f } => {
@@ -207,7 +216,8 @@ proptest! {
     #[test]
     fn voice_eot_server_roundtrips(sid in any_stream_id(), seq in 0u8..21) {
         let mut buf = [0u8; 64];
-        let n = encode_voice_eot(&mut buf, sid, seq).map_err(to_test_err)?;
+        let index = FrameSequence::try_from(seq).map_err(to_test_err)?;
+        let n = encode_voice_eot(&mut buf, sid, index).map_err(to_test_err)?;
         let pkt = decode_server_to_client(wire(&buf, n)?, &mut NullSink).map_err(to_test_err)?;
         match pkt {
             ServerPacket::VoiceEot { stream_id, seq: s } => {

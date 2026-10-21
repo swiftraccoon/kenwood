@@ -10,12 +10,6 @@
 //! - `ircDDBGateway/Common/AMBEData.cpp:318-345` (voice data + EOT)
 //! - `xlxd/src/cdextraprotocol.cpp` (mirror reference)
 
-pub mod consts;
-pub mod decode;
-pub mod encode;
-pub mod error;
-pub mod packet;
-
 pub use decode::{decode_client_to_server, decode_server_to_client};
 pub use encode::{
     encode_connect_ack, encode_connect_link, encode_connect_nak, encode_poll, encode_poll_echo,
@@ -23,3 +17,9 @@ pub use encode::{
 };
 pub use error::DExtraError;
 pub use packet::{ClientPacket, ConnectResult, ServerPacket};
+
+pub mod consts;
+pub mod decode;
+pub mod encode;
+pub mod error;
+pub mod packet;

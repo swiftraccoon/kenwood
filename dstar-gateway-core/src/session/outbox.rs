@@ -5,8 +5,7 @@
 //! packet whose `not_before` is at or before `now`. Used by both
 //! the immediate-send path and the retransmit scheduler.
 
-use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
 use std::time::Instant;
 
@@ -18,28 +17,10 @@ pub(crate) struct OutboundPacket {
     pub(crate) not_before: Instant,
 }
 
-impl PartialEq for OutboundPacket {
-    fn eq(&self, other: &Self) -> bool {
-        self.not_before == other.not_before
-    }
-}
-impl Eq for OutboundPacket {}
-impl PartialOrd for OutboundPacket {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for OutboundPacket {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // Reversed ordering so BinaryHeap pops the EARLIEST first.
-        other.not_before.cmp(&self.not_before)
-    }
-}
-
-/// Priority queue of outbound packets ordered by `not_before`.
+/// Packets ordered by deadline, then by insertion within each deadline.
 #[derive(Debug, Default)]
 pub(crate) struct Outbox {
-    queue: BinaryHeap<OutboundPacket>,
+    queue: BTreeMap<Instant, VecDeque<OutboundPacket>>,
 }
 
 impl Outbox {
@@ -48,19 +29,26 @@ impl Outbox {
     }
 
     pub(crate) fn enqueue(&mut self, packet: OutboundPacket) {
-        self.queue.push(packet);
+        self.queue
+            .entry(packet.not_before)
+            .or_default()
+            .push_back(packet);
     }
 
     pub(crate) fn pop_ready(&mut self, now: Instant) -> Option<OutboundPacket> {
-        if self.queue.peek().is_some_and(|p| p.not_before <= now) {
-            self.queue.pop()
-        } else {
-            None
+        let mut entry = self.queue.first_entry()?;
+        if *entry.key() > now {
+            return None;
         }
+        let packet = entry.get_mut().pop_front();
+        if entry.get().is_empty() {
+            let _removed = entry.remove();
+        }
+        packet
     }
 
     pub(crate) fn peek_next_deadline(&self) -> Option<Instant> {
-        self.queue.peek().map(|p| p.not_before)
+        self.queue.first_key_value().map(|(&deadline, _)| deadline)
     }
 }
 
@@ -71,6 +59,33 @@ mod tests {
     use std::time::Duration;
 
     const ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30001);
+
+    #[test]
+    fn same_deadline_preserves_header_data_and_eot_order() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut outbox = Outbox::new();
+        let now = Instant::now();
+        for index in 0_u8..64 {
+            outbox.enqueue(OutboundPacket {
+                dst: ADDR,
+                payload: vec![index],
+                not_before: now,
+            });
+        }
+        for expected in 0_u8..64 {
+            let packet = outbox.pop_ready(now).ok_or("queued packet missing")?;
+            assert_eq!(
+                packet.payload,
+                [expected],
+                "equal deadlines preserve insertion order"
+            );
+        }
+        assert!(
+            outbox.pop_ready(now).is_none(),
+            "all queued packets were returned"
+        );
+        Ok(())
+    }
 
     #[test]
     fn empty_pop_returns_none() {

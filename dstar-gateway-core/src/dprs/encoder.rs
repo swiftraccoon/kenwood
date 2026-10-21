@@ -1,195 +1,180 @@
-//! DPRS sentence encoder.
+//! Canonical CR-terminated DPRS position encoding.
 
-use std::fmt::Write as _;
+use super::DprsReport;
+use super::crc::compute_sentence_crc;
 
-use super::crc::compute_crc;
-use super::error::DprsError;
-use super::parser::DprsReport;
-
-/// Encode a `DprsReport` into a DPRS sentence with a correct
-/// `$$CRC<hex>` checksum.
-///
-/// On success, the output `String` is replaced with the encoded sentence; on
-/// error, it is left unchanged. The CRC is computed over the sentence body
-/// (everything after the
-/// comma following `$$CRC<hex>`) using [`super::compute_crc`]:
-/// CRC-CCITT with reflected polynomial `0x8408`, initial value
-/// `0xFFFF`, final `~accumulator`, matching the ircDDBGateway
-/// reference.
-///
-/// # Errors
-///
-/// Returns [`DprsError::InvalidCallsign`] if a receive-side callsign contains
-/// bytes that cannot be represented in the ASCII DPRS sentence, or
-/// [`DprsError::MalformedCoordinates`] if the report's lat/lon values can't
-/// be formatted. The latter should not happen with validated
-/// [`super::coordinates::Latitude`] / [`super::coordinates::Longitude`]
-/// newtypes.
-///
-/// # See also
-///
-/// `ircDDBGateway/Common/APRSCollector.cpp:371-394` for the
-/// reference CRC + sentence layout this encoder mirrors.
-pub fn encode_dprs(report: &DprsReport, out: &mut String) -> Result<(), DprsError> {
-    // Build the sentence body (everything that comes after the CRC
-    // prefix + comma) in a scratch buffer first so we can compute
-    // the CRC over it, then emit the whole sentence with the real
-    // CRC prefixed.
-    let mut body = String::new();
-
-    // Callsign (space-padded to 8 bytes). Receive-side callsigns preserve
-    // arbitrary wire bytes, but a DPRS sentence is ASCII text; reject an
-    // invalid field instead of expanding bytes >= 0x80 into multi-byte UTF-8.
-    let cs_bytes = report.callsign.as_bytes();
-    let callsign = report
-        .callsign
-        .text()
-        .map_err(|_| DprsError::InvalidCallsign {
-            reason: "wire field contains a byte outside printable ASCII",
-        })?;
-    if callsign.is_empty() {
-        return Err(DprsError::InvalidCallsign {
-            reason: "wire field is empty after removing padding",
-        });
+impl DprsReport {
+    /// Encode a canonical source, route, uncompressed position and checksum.
+    ///
+    /// The result ends with one CR. Its CRC covers every body byte including
+    /// that CR, following `ircDDBGateway/Common/APRSCollector.cpp::checkCRC`.
+    /// The route is `APDPRS,DSTAR*`. Coordinates round to hundredths of a
+    /// minute, carrying a rounded 60 minutes into the next degree. Table and
+    /// code occupy their distinct APRS positions; comment bytes are unchanged.
+    /// All field construction has already validated width and syntax.
+    #[must_use]
+    pub fn to_sentence(&self) -> String {
+        let latitude = coordinate(self.latitude().degrees(), 2, 'N', 'S');
+        let longitude = coordinate(self.longitude().degrees(), 3, 'E', 'W');
+        let symbol = self.symbol();
+        let body = format!(
+            "{}>APDPRS,DSTAR*:!{latitude}{}{longitude}{}{}",
+            self.source(),
+            symbol.table(),
+            symbol.code(),
+            self.comment()
+        );
+        let crc = compute_sentence_crc(body.as_bytes());
+        format!("$$CRC{crc:04X},{body}\r")
     }
-    let callsign_wire = std::str::from_utf8(cs_bytes)
-        .unwrap_or_else(|_| unreachable!("validated printable ASCII is valid UTF-8"));
-    body.push_str(callsign_wire);
+}
 
-    body.push_str("*>APDPRS,DSTAR*:!");
-
-    // Latitude DDMM.MM[NS]
-    let lat = report.latitude.degrees();
-    let lat_hemi = if lat < 0.0 { 'S' } else { 'N' };
-    let lat_abs = lat.abs();
-    let lat_int = lat_abs.trunc();
-    let lat_min = (lat_abs - lat_int) * 60.0;
-    // Width 2, leading zeros, precision 0: prints e.g. "35" for
-    // 35.0. `lat_int` has already been truncated, so `{:.0}` does
-    // not round away from the integer-degree value.
-    write!(body, "{lat_int:02.0}{lat_min:05.2}{lat_hemi}")
-        .map_err(|_| DprsError::MalformedCoordinates)?;
-
-    body.push('/');
-
-    // Longitude DDDMM.MM[EW]
-    let lon = report.longitude.degrees();
-    let lon_hemi = if lon < 0.0 { 'W' } else { 'E' };
-    let lon_abs = lon.abs();
-    let lon_int = lon_abs.trunc();
-    let lon_min = (lon_abs - lon_int) * 60.0;
-    write!(body, "{lon_int:03.0}{lon_min:05.2}{lon_hemi}")
-        .map_err(|_| DprsError::MalformedCoordinates)?;
-
-    // Overlay '#' + symbol glyph.
-    body.push('#');
-    body.push(report.symbol);
-
-    if let Some(comment) = &report.comment {
-        body.push_str(comment);
-    }
-
-    // Now compute the CRC over the body and emit the final sentence.
-    let crc = compute_crc(body.as_bytes());
-    out.clear();
-    write!(out, "$$CRC{crc:04X},").map_err(|_| DprsError::MalformedCoordinates)?;
-    out.push_str(&body);
-
-    Ok(())
+/// Format a finite, range-checked coordinate without narrowing float casts.
+fn coordinate(value: f64, width: usize, positive: char, negative: char) -> String {
+    let magnitude = value.abs();
+    let mut degrees = magnitude.trunc();
+    let hundredths = ((magnitude - degrees) * 6000.0).round();
+    let minutes = if hundredths >= 6000.0 {
+        degrees += 1.0;
+        0.0
+    } else {
+        hundredths / 100.0
+    };
+    let hemisphere = if value < 0.0 { negative } else { positive };
+    format!("{degrees:0width$.0}{minutes:05.2}{hemisphere}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dprs::coordinates::{Latitude, Longitude};
+    use crate::dprs::{
+        DprsComment, DprsPosition, DprsSource, DprsSymbol, Latitude, Longitude, SymbolCode,
+        SymbolOverlay, SymbolTable,
+    };
     use crate::types::Callsign;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
+    fn report(latitude: f64, longitude: f64) -> Result<DprsReport, super::super::DprsError> {
+        Ok(DprsReport::new(
+            DprsSource::new("W1AW")?,
+            DprsPosition {
+                latitude: Latitude::new(latitude)?,
+                longitude: Longitude::new(longitude)?,
+            },
+            DprsSymbol::new(SymbolTable::Primary, SymbolCode::new('>')?),
+            DprsComment::new("Asheville test")?,
+        ))
+    }
+
     #[test]
-    fn encode_round_trips_through_parser() -> TestResult {
-        let original = DprsReport {
-            callsign: Callsign::from_wire_bytes(*b"W1AW    "),
-            latitude: Latitude::try_new(35.5)?,
-            longitude: Longitude::try_new(-82.55)?,
-            symbol: '/',
-            comment: Some("Asheville test".to_string()),
-        };
-        let mut encoded = String::new();
-        encode_dprs(&original, &mut encoded)?;
-        // Sentence must start with `$$CRC<4hex>,` (the hex is the
-        // real CRC-CCITT over the body, not a placeholder).
-        assert!(encoded.starts_with("$$CRC"));
+    fn independent_wire_vector_includes_the_symbol_and_crc_terminator() -> TestResult {
+        let report = report(35.5, -82.55)?;
+        let wire = report.to_sentence();
         assert_eq!(
-            encoded.as_bytes().get(9),
-            Some(&b','),
-            "comma after 4 hex digits"
+            wire, "$$CRC8FF2,W1AW>APDPRS,DSTAR*:!3530.00N/08233.00W>Asheville test\r",
+            "fixed wire bytes distinguish source width, symbol placement and inclusion of CR in the checksum"
         );
-        // And the 4 CRC chars must be uppercase ASCII hex digits.
-        for b in encoded.as_bytes().get(5..9).unwrap_or(&[]) {
-            assert!(b.is_ascii_hexdigit(), "CRC byte {b:02X} is not hex");
+        assert_eq!(wire.parse::<DprsReport>()?, report);
+        Ok(())
+    }
+
+    #[test]
+    fn rounded_minutes_carry_without_creating_out_of_domain_coordinates() -> TestResult {
+        let north = report(12.999_999_9, -179.999_999_9)?.to_sentence();
+        assert!(
+            north.contains("1300.00N/18000.00W>"),
+            "rounded minutes must carry before formatting: {north:?}"
+        );
+        let north: DprsReport = north.parse()?;
+        assert_eq!(north.latitude(), Latitude::new(13.0)?);
+        assert_eq!(north.longitude(), Longitude::new(-180.0)?);
+        let south = report(-89.999_999_9, 179.999_999_9)?.to_sentence();
+        assert!(
+            south.contains("9000.00S/18000.00E>"),
+            "both endpoint hemispheres remain valid: {south:?}"
+        );
+        let south: DprsReport = south.parse()?;
+        assert_eq!(south.latitude(), Latitude::new(-90.0)?);
+        assert_eq!(south.longitude(), Longitude::new(180.0)?);
+        Ok(())
+    }
+
+    #[test]
+    fn source_symbol_and_plain_comment_domains_reject_invalid_construction() -> TestResult {
+        assert_eq!(
+            DprsSource::try_from(Callsign::from_wire_bytes(*b"N0CALL C"))?.as_str(),
+            "N0CALL-C"
+        );
+        assert_eq!(DprsSource::new("n0call-15")?.as_str(), "N0CALL-15");
+        assert!(
+            DprsSource::try_from(Callsign::from_wire_bytes([
+                b'W', b'1', 0x80, b'W', b' ', b' ', b' ', b' '
+            ],))
+            .is_err(),
+            "invalid receive bytes must fail before text encoding or allocation into the report"
+        );
+        for invalid in [
+            "",
+            "N0CALL-16",
+            "N0CALL-",
+            "N0CALL-A-B",
+            " N0CALL",
+            "N0CALL\n",
+            "N0,CALL",
+        ] {
+            assert!(
+                DprsSource::new(invalid).is_err(),
+                "invalid source {invalid:?}"
+            );
         }
-        assert!(encoded.contains("W1AW"));
-        assert!(encoded.contains("3530.00N"));
-        assert!(encoded.contains("08233.00W"));
-        assert!(encoded.contains("Asheville test"));
-        Ok(())
-    }
-
-    #[test]
-    fn encode_crc_matches_compute_crc_over_body() -> TestResult {
-        use super::super::crc::compute_crc;
-        let original = DprsReport {
-            callsign: Callsign::from_wire_bytes(*b"W1AW    "),
-            latitude: Latitude::try_new(35.5)?,
-            longitude: Longitude::try_new(-82.55)?,
-            symbol: '/',
-            comment: Some("Asheville test".to_string()),
-        };
-        let mut encoded = String::new();
-        encode_dprs(&original, &mut encoded)?;
-        // The body is everything after `$$CRC<4hex>,`.
-        let body = encoded.get(10..).ok_or("body after prefix")?;
-        let expected_crc = compute_crc(body.as_bytes());
-        let crc_str = encoded.get(5..9).ok_or("crc field")?;
-        let actual_crc = u16::from_str_radix(crc_str, 16)?;
-        assert_eq!(actual_crc, expected_crc);
-        Ok(())
-    }
-
-    #[test]
-    fn encode_then_parse_roundtrip() -> TestResult {
-        let original = DprsReport {
-            callsign: Callsign::from_wire_bytes(*b"W1AW    "),
-            latitude: Latitude::try_new(35.5)?,
-            longitude: Longitude::try_new(-82.55)?,
-            symbol: '/',
-            comment: None,
-        };
-        let mut encoded = String::new();
-        encode_dprs(&original, &mut encoded)?;
-        let parsed = super::super::parser::parse_dprs(&encoded)?;
-        assert_eq!(parsed.callsign, original.callsign);
-        assert!((parsed.latitude.degrees() - original.latitude.degrees()).abs() < 0.001);
-        assert!((parsed.longitude.degrees() - original.longitude.degrees()).abs() < 0.001);
-        Ok(())
-    }
-
-    #[test]
-    fn encode_rejects_non_ascii_receive_callsign_without_utf8_expansion() -> TestResult {
-        let report = DprsReport {
-            callsign: Callsign::from_wire_bytes([b'W', b'1', 0x80, b'W', b' ', b' ', b' ', b' ']),
-            latitude: Latitude::try_new(35.5)?,
-            longitude: Longitude::try_new(-82.55)?,
-            symbol: '/',
-            comment: None,
-        };
-        let mut encoded = String::from("unchanged until call");
-        assert!(matches!(
-            encode_dprs(&report, &mut encoded),
-            Err(DprsError::InvalidCallsign { .. })
-        ));
-        assert_eq!(encoded, "unchanged until call");
+        let comment = "a".repeat(43);
+        assert_eq!(DprsComment::new(&comment)?.as_str(), comment);
+        for invalid in [
+            "a".repeat(44),
+            "line\rbreak".to_owned(),
+            "x|y".to_owned(),
+            "x~y".to_owned(),
+            "é".to_owned(),
+        ] {
+            assert!(
+                DprsComment::new(&invalid).is_err(),
+                "invalid plain comment {invalid:?}"
+            );
+        }
+        for invalid in [' ', '\n', 'é'] {
+            assert!(
+                SymbolCode::new(invalid).is_err(),
+                "invalid symbol code {invalid:?}"
+            );
+        }
+        for invalid in ['#', 'a', 'é', ' '] {
+            assert!(
+                SymbolTable::try_from(invalid).is_err(),
+                "invalid uncompressed table selector {invalid:?}"
+            );
+        }
+        assert!(
+            SymbolOverlay::new('a').is_err(),
+            "lowercase overlay selectors belong to compressed formats"
+        );
+        let overlay = SymbolOverlay::new('3')?;
+        let symbol = DprsSymbol::new(SymbolTable::Overlay(overlay), SymbolCode::new('>')?);
+        let report = DprsReport::new(
+            DprsSource::new("W1AW")?,
+            DprsPosition {
+                latitude: Latitude::new(0.0)?,
+                longitude: Longitude::new(0.0)?,
+            },
+            symbol,
+            DprsComment::EMPTY,
+        );
+        let parsed: DprsReport = report.to_sentence().parse()?;
+        assert_eq!(
+            parsed.symbol(),
+            symbol,
+            "the overlay belongs between the coordinates"
+        );
         Ok(())
     }
 }

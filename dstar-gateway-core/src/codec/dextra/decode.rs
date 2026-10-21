@@ -10,7 +10,7 @@
 //! return `Err`.
 
 use crate::header::{DstarHeader, ENCODED_LEN};
-use crate::types::{Callsign, Module, ProtocolKind, StreamId};
+use crate::types::{Callsign, Module, ModuleSlot, ProtocolKind, StreamId};
 use crate::validator::{Diagnostic, DiagnosticSink};
 use crate::voice::VoiceFrame;
 
@@ -84,10 +84,8 @@ pub fn decode_server_to_client(
 
 /// Extract an 8-byte callsign from a packet prefix (positions `[0..8]`).
 ///
-/// Callers must have already verified that the slice is at least 8
-/// bytes long. Any zeros in the callsign field are normalized to
-/// spaces so that `Callsign::from_wire_bytes` records a clean wire
-/// representation.
+/// Callers have verified the slice contains eight bytes. Every byte,
+/// including NUL and nonprintable data, is preserved.
 ///
 /// On the connect-packet wire format, byte `[7]` is the pad slot
 /// (space from `memset`) and byte `[8]` (outside the 8-byte
@@ -104,11 +102,6 @@ fn extract_callsign(bytes: &[u8]) -> Callsign {
     let mut cs = [b' '; 8];
     if let Some(src) = bytes.get(..8) {
         cs.copy_from_slice(src);
-    }
-    for b in &mut cs {
-        if *b == 0 {
-            *b = b' ';
-        }
     }
     Callsign::from_wire_bytes(cs)
 }
@@ -145,13 +138,14 @@ fn decode_client_connect(bytes: &[u8]) -> Result<ClientPacket, DExtraError> {
 /// Decode a 14-byte ACK or NAK reply from the server.
 fn decode_server_connect_reply(bytes: &[u8]) -> Result<ServerPacket, DExtraError> {
     let cs = extract_callsign(bytes);
+    let client_byte = bytes.get(8).copied().unwrap_or(0);
+    let client_module =
+        Module::try_from(client_byte).map_err(|_| DExtraError::InvalidModuleByte {
+            offset: 8,
+            byte: client_byte,
+        })?;
     // Position [9] carries the reflector module letter.
     let module_byte = bytes.get(9).copied().unwrap_or(0);
-    let reflector_module =
-        Module::try_from_byte(module_byte).map_err(|_| DExtraError::InvalidModuleByte {
-            offset: 9,
-            byte: module_byte,
-        })?;
     // Tag is at [10..13], NUL at [13], per
     // `ircDDBGateway/Common/ConnectData.cpp:302-316`.
     let mut tag = [0u8; 3];
@@ -159,13 +153,25 @@ fn decode_server_connect_reply(bytes: &[u8]) -> Result<ServerPacket, DExtraError
         tag.copy_from_slice(src);
     }
     if tag == CONNECT_ACK_TAG {
+        let reflector_module =
+            Module::try_from(module_byte).map_err(|_| DExtraError::InvalidModuleByte {
+                offset: 9,
+                byte: module_byte,
+            })?;
         Ok(ServerPacket::ConnectAck {
             callsign: cs,
+            client_module,
             reflector_module,
         })
     } else if tag == CONNECT_NAK_TAG {
+        let reflector_module =
+            ModuleSlot::try_from(module_byte).map_err(|_| DExtraError::InvalidModuleByte {
+                offset: 9,
+                byte: module_byte,
+            })?;
         Ok(ServerPacket::ConnectNak {
             callsign: cs,
+            client_module,
             reflector_module,
         })
     } else {
@@ -269,12 +275,13 @@ fn parse_dsvt_header(
     let mut arr = [0u8; ENCODED_LEN];
     arr.copy_from_slice(hdr_slice);
     let decoded = DstarHeader::decode(&arr);
-    if decoded.flag1 != 0 || decoded.flag2 != 0 || decoded.flag3 != 0 {
+    let [flag1, flag2, flag3] = *decoded.flags.as_bytes();
+    if decoded.flags != crate::HeaderFlags::NONE {
         sink.record(Diagnostic::HeaderFlagsNonZero {
             protocol: ProtocolKind::DExtra,
-            flag1: decoded.flag1,
-            flag2: decoded.flag2,
-            flag3: decoded.flag3,
+            flag1,
+            flag2,
+            flag3,
         });
     }
     Ok((stream_id, decoded))
@@ -309,10 +316,25 @@ mod tests {
         encode_connect_ack, encode_connect_link, encode_connect_nak, encode_poll, encode_unlink,
         encode_voice_data, encode_voice_eot, encode_voice_header,
     };
-    use crate::types::Suffix;
+    use crate::types::{FrameSequence, Suffix};
     use crate::validator::NullSink;
+    use crate::{RepeaterIdentity, RoutingCallsign};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+    const LOCAL: RepeaterIdentity = RepeaterIdentity {
+        callsign: match RoutingCallsign::from_padded_bytes(*b"W1AW   ") {
+            Ok(value) => value,
+            Err(_) => unreachable!(),
+        },
+        module: Module::B,
+    };
+    const REPLY_IDENTITY: RepeaterIdentity = RepeaterIdentity {
+        callsign: match RoutingCallsign::from_padded_bytes(*b"XRF030 ") {
+            Ok(value) => value,
+            Err(_) => unreachable!(),
+        },
+        module: Module::B,
+    };
 
     const fn cs(bytes: [u8; 8]) -> Callsign {
         Callsign::from_wire_bytes(bytes)
@@ -329,9 +351,7 @@ mod tests {
 
     fn test_header() -> DstarHeader {
         DstarHeader {
-            flag1: 0,
-            flag2: 0,
-            flag3: 0,
+            flags: crate::HeaderFlags::NONE,
             rpt2: cs(*b"XRF030 G"),
             rpt1: cs(*b"XRF030 C"),
             ur_call: cs(*b"CQCQCQ  "),
@@ -349,7 +369,7 @@ mod tests {
         // (space at byte 7) and extracts the module from [8]
         // separately, so the round-trip is exact.
         let mut buf = [0u8; 16];
-        let n = encode_connect_link(&mut buf, &cs(*b"W1AW    "), Module::C, Module::B)?;
+        let n = encode_connect_link(&mut buf, LOCAL, Module::C)?;
         let pkt = decode_client_to_server(buf.get(..n).ok_or("n within buf")?, &mut NullSink)?;
         match pkt {
             ClientPacket::Link {
@@ -369,7 +389,7 @@ mod tests {
     #[test]
     fn unlink_client_roundtrip() -> TestResult {
         let mut buf = [0u8; 16];
-        let n = encode_unlink(&mut buf, &cs(*b"W1AW    "), Module::B)?;
+        let n = encode_unlink(&mut buf, LOCAL)?;
         let pkt = decode_client_to_server(buf.get(..n).ok_or("n within buf")?, &mut NullSink)?;
         match pkt {
             ClientPacket::Unlink {
@@ -420,7 +440,7 @@ mod tests {
             slow_data: [0x22; 3],
         };
         let mut buf = [0u8; 64];
-        let n = encode_voice_data(&mut buf, sid(0x1234), 5, &frame)?;
+        let n = encode_voice_data(&mut buf, sid(0x1234), FrameSequence::try_from(5)?, &frame)?;
         let pkt = decode_client_to_server(buf.get(..n).ok_or("n within buf")?, &mut NullSink)?;
         match pkt {
             ClientPacket::VoiceData {
@@ -441,7 +461,7 @@ mod tests {
     #[test]
     fn voice_eot_client_roundtrip() -> TestResult {
         let mut buf = [0u8; 64];
-        let n = encode_voice_eot(&mut buf, sid(0x1234), 7)?;
+        let n = encode_voice_eot(&mut buf, sid(0x1234), FrameSequence::try_from(7)?)?;
         let pkt = decode_client_to_server(buf.get(..n).ok_or("n within buf")?, &mut NullSink)?;
         match pkt {
             ClientPacket::VoiceEot { stream_id, seq } => {
@@ -458,14 +478,16 @@ mod tests {
     #[test]
     fn connect_ack_server_roundtrip() -> TestResult {
         let mut buf = [0u8; 16];
-        let n = encode_connect_ack(&mut buf, &cs(*b"XRF030  "), Module::C)?;
+        let n = encode_connect_ack(&mut buf, REPLY_IDENTITY, Module::C)?;
         let pkt = decode_server_to_client(buf.get(..n).ok_or("n within buf")?, &mut NullSink)?;
         match pkt {
             ServerPacket::ConnectAck {
                 callsign,
+                client_module,
                 reflector_module,
             } => {
                 assert_eq!(callsign, cs(*b"XRF030  "));
+                assert_eq!(client_module, Module::B);
                 assert_eq!(reflector_module, Module::C);
             }
             other => return Err(format!("expected ConnectAck, got {other:?}").into()),
@@ -476,15 +498,17 @@ mod tests {
     #[test]
     fn connect_nak_server_roundtrip() -> TestResult {
         let mut buf = [0u8; 16];
-        let n = encode_connect_nak(&mut buf, &cs(*b"XRF030  "), Module::C)?;
+        let n = encode_connect_nak(&mut buf, REPLY_IDENTITY, ModuleSlot::Module(Module::C))?;
         let pkt = decode_server_to_client(buf.get(..n).ok_or("n within buf")?, &mut NullSink)?;
         match pkt {
             ServerPacket::ConnectNak {
                 callsign,
+                client_module,
                 reflector_module,
             } => {
                 assert_eq!(callsign, cs(*b"XRF030  "));
-                assert_eq!(reflector_module, Module::C);
+                assert_eq!(client_module, Module::B);
+                assert_eq!(reflector_module, ModuleSlot::Module(Module::C));
             }
             other => return Err(format!("expected ConnectNak, got {other:?}").into()),
         }
@@ -502,6 +526,25 @@ mod tests {
             }
             other => return Err(format!("expected PollEcho, got {other:?}").into()),
         }
+        Ok(())
+    }
+
+    #[test]
+    fn receive_control_callsign_preserves_nul_and_unknown_bytes() -> TestResult {
+        let bytes = [b'W', b'1', b'A', b'W', 0, 0x80, b' ', b' ', 0];
+        let packet = decode_server_to_client(&bytes, &mut NullSink)?;
+        let ServerPacket::PollEcho { callsign } = packet else {
+            return Err("expected poll".into());
+        };
+        assert_eq!(
+            callsign.as_bytes(),
+            bytes.get(..8).ok_or("callsign bytes")?,
+            "wire observations cannot replace unknown bytes with padding"
+        );
+        assert!(
+            callsign.text().is_err(),
+            "text interpretation remains checked separately"
+        );
         Ok(())
     }
 
@@ -527,7 +570,7 @@ mod tests {
             slow_data: [0x44; 3],
         };
         let mut buf = [0u8; 64];
-        let n = encode_voice_data(&mut buf, sid(0x4321), 9, &frame)?;
+        let n = encode_voice_data(&mut buf, sid(0x4321), FrameSequence::try_from(9)?, &frame)?;
         let pkt = decode_server_to_client(buf.get(..n).ok_or("n within buf")?, &mut NullSink)?;
         match pkt {
             ServerPacket::VoiceData {
@@ -548,7 +591,7 @@ mod tests {
     #[test]
     fn voice_eot_server_roundtrip() -> TestResult {
         let mut buf = [0u8; 64];
-        let n = encode_voice_eot(&mut buf, sid(0x1234), 7)?;
+        let n = encode_voice_eot(&mut buf, sid(0x1234), FrameSequence::try_from(7)?)?;
         let pkt = decode_server_to_client(buf.get(..n).ok_or("n within buf")?, &mut NullSink)?;
         match pkt {
             ServerPacket::VoiceEot { stream_id, seq } => {

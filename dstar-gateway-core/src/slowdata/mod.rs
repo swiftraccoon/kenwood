@@ -15,6 +15,13 @@
 //! Reference: `ircDDBGateway/Common/SlowDataEncoder.cpp`,
 //! `ircDDBGateway/Common/DStarDefines.h:85-92, 111-113`.
 
+pub use assembler::SlowDataAssembler;
+pub use block::{SlowDataBlock, SlowDataBlockKind};
+pub use error::SlowDataError;
+pub use scrambler::{descramble, scramble};
+pub use text::{SlowDataText, SlowDataTextMessage, SlowDataTextMessageError};
+pub use text_collector::{MAX_MESSAGE_LEN, SlowDataTextCollector};
+
 mod assembler;
 mod block;
 mod encoder;
@@ -22,11 +29,3 @@ mod error;
 mod scrambler;
 mod text;
 mod text_collector;
-
-pub use assembler::SlowDataAssembler;
-pub use block::{SlowDataBlock, SlowDataBlockKind};
-pub use encoder::encode_text_message;
-pub use error::SlowDataError;
-pub use scrambler::{descramble, scramble};
-pub use text::{SlowDataText, SlowDataTextMessage, SlowDataTextMessageError};
-pub use text_collector::{MAX_MESSAGE_LEN, SlowDataTextCollector};

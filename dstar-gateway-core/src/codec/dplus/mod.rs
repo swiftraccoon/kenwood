@@ -12,13 +12,6 @@
 //! - `ircDDBGateway/Common/AMBEData.cpp` (voice data + EOT)
 //! - `xlxd/src/cdplusprotocol.cpp` (mirror reference)
 
-pub mod auth;
-pub mod consts;
-pub mod decode;
-pub mod encode;
-pub mod error;
-pub mod packet;
-
 pub use auth::{DPlusHost, HostList, parse_auth_response};
 pub use decode::{decode_client_to_server, decode_server_to_client};
 pub use encode::{
@@ -28,3 +21,10 @@ pub use encode::{
 };
 pub use error::DPlusError;
 pub use packet::{ClientPacket, Link2Result, ServerPacket};
+
+pub mod auth;
+pub mod consts;
+pub mod decode;
+pub mod encode;
+pub mod error;
+pub mod packet;

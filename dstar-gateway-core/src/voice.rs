@@ -17,10 +17,8 @@ pub const AMBE_SILENCE: [u8; 9] = [0x9E, 0x8D, 0x32, 0x88, 0x26, 0x1A, 0x3F, 0x6
 /// D-STAR slow-data sync pattern (3 bytes).
 ///
 /// Placed in the slow-data field at frame 0 of every 21-frame
-/// superframe. The receiver locks onto this pattern to align
-/// superframe boundaries; without it the MMDVM modem firmware
-/// (TH-D75 included) gets the voice header but never enters audio
-/// decode for the network voice stream, so the listener hears nothing.
+/// superframe. The pattern marks the boundary before the twenty slow-data
+/// frames that follow it.
 ///
 /// Reference: `g4klx/MMDVMHost/DStarDefines.h:73` (`DSTAR_SYNC_BYTES`),
 /// matched against `DSTAR_NULL_SLOW_SYNC_BYTES` at line 34.
@@ -43,7 +41,7 @@ pub const DSTAR_NULL_SLOW_DATA_BYTES: [u8; 3] = [0x16, 0x29, 0xF5];
 /// 21 frames form one superframe. Frame 0 carries the sync pattern,
 /// frames 1-20 carry slow data. At 20 ms per frame, one superframe
 /// is 420 ms of audio.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct VoiceFrame {
     /// AMBE 3600x2450 codec voice data (9 bytes).
     pub ambe: [u8; 9],

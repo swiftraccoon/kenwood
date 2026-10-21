@@ -1,4 +1,4 @@
-//! Golden-byte regression tests for `encode_text_message`.
+//! Golden-byte regression tests for `SlowDataTextMessage::encode`.
 //!
 //! These vectors pin the exact scrambled output of the encoder against
 //! hand-computed byte sequences derived from the D-STAR slow-data
@@ -23,9 +23,7 @@ use thiserror as _;
 use tracing as _;
 use trybuild as _;
 
-use dstar_gateway_core::slowdata::{
-    SlowDataTextMessage, SlowDataTextMessageError, encode_text_message,
-};
+use dstar_gateway_core::slowdata::{SlowDataTextMessage, SlowDataTextMessageError};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -44,7 +42,7 @@ fn golden_hi_padded() -> TestResult {
     //   Block 3: type=0x43, rest spaces
     //     half1 = [0x33, 0x6F, 0xB3]
     //     half2 = [0x50, 0x6F, 0xB3]
-    let out = encode_text_message(SlowDataTextMessage::try_from_text("Hi")?);
+    let out = SlowDataTextMessage::try_from_text("Hi")?.encode();
     assert_eq!(out.len(), 8);
     assert_eq!(*out.first().ok_or("index 0 in range")?, [0x30, 0x07, 0xFA]);
     assert_eq!(*out.get(1).ok_or("index 1 in range")?, [0x50, 0x6F, 0xB3]);
@@ -59,7 +57,7 @@ fn golden_hi_padded() -> TestResult {
 
 #[test]
 fn golden_empty_is_an_explicit_all_space_message() -> TestResult {
-    let out = encode_text_message(SlowDataTextMessage::try_from_text("")?);
+    let out = SlowDataTextMessage::try_from_text("")?.encode();
     assert_eq!(out[0], [0x30, 0x6F, 0xB3]);
     assert_eq!(out[1], [0x50, 0x6F, 0xB3]);
     assert_eq!(out[6], [0x33, 0x6F, 0xB3]);
@@ -74,7 +72,7 @@ fn golden_exactly_20_chars_preserves_all_chars() -> TestResult {
     //   half1 = [(0x40|i)^0x70, 'A'^0x4F, 'A'^0x93] = [0x30|i, 0x0E, 0xD2]
     //   half2 = ['A'^0x70, 'A'^0x4F, 'A'^0x93]      = [0x31, 0x0E, 0xD2]
     //   (0x41 = 'A')
-    let out = encode_text_message(SlowDataTextMessage::try_from_text("AAAAAAAAAAAAAAAAAAAA")?);
+    let out = SlowDataTextMessage::try_from_text("AAAAAAAAAAAAAAAAAAAA")?.encode();
     assert_eq!(out.len(), 8);
     assert_eq!(*out.first().ok_or("index 0 in range")?, [0x30, 0x0E, 0xD2]);
     assert_eq!(*out.get(1).ok_or("index 1 in range")?, [0x31, 0x0E, 0xD2]);
@@ -113,7 +111,7 @@ fn golden_alphanumeric_roundtrip_exact() -> TestResult {
     // Block 3: [0x43, ' ',' ',' ',' ',' ']
     //   half1 = [0x33, 0x6F, 0xB3]
     //   half2 = [0x50, 0x6F, 0xB3]
-    let out = encode_text_message(SlowDataTextMessage::try_from_text("HELLO WORLD")?);
+    let out = SlowDataTextMessage::try_from_text("HELLO WORLD")?.encode();
     assert_eq!(out.len(), 8);
     assert_eq!(*out.first().ok_or("index 0 in range")?, [0x30, 0x07, 0xD6]);
     assert_eq!(*out.get(1).ok_or("index 1 in range")?, [0x3C, 0x03, 0xDC]);

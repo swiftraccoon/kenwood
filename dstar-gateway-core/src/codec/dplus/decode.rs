@@ -243,12 +243,13 @@ fn parse_dsvt_common(bytes: &[u8], sink: &mut dyn DiagnosticSink) -> Result<Dsvt
         arr.copy_from_slice(hdr_slice);
         let decoded = DstarHeader::decode(&arr);
         // Lenient: diagnose non-zero flag bytes but still return the header.
-        if decoded.flag1 != 0 || decoded.flag2 != 0 || decoded.flag3 != 0 {
+        let [flag1, flag2, flag3] = *decoded.flags.as_bytes();
+        if decoded.flags != crate::HeaderFlags::NONE {
             sink.record(Diagnostic::HeaderFlagsNonZero {
                 protocol: ProtocolKind::DPlus,
-                flag1: decoded.flag1,
-                flag2: decoded.flag2,
-                flag3: decoded.flag3,
+                flag1,
+                flag2,
+                flag3,
             });
         }
         Some(decoded)
@@ -283,7 +284,7 @@ mod tests {
         encode_link1, encode_link2, encode_link2_reply, encode_poll, encode_unlink,
         encode_voice_data, encode_voice_eot, encode_voice_header,
     };
-    use crate::types::Suffix;
+    use crate::types::{FrameSequence, Suffix};
     use crate::validator::NullSink;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -303,9 +304,7 @@ mod tests {
 
     fn test_header() -> DstarHeader {
         DstarHeader {
-            flag1: 0,
-            flag2: 0,
-            flag3: 0,
+            flags: crate::HeaderFlags::NONE,
             rpt2: cs(*b"REF030 G"),
             rpt1: cs(*b"REF030 C"),
             ur_call: cs(*b"CQCQCQ  "),
@@ -462,7 +461,7 @@ mod tests {
             slow_data: [0x22; 3],
         };
         let mut buf = [0u8; 64];
-        let n = encode_voice_data(&mut buf, sid(0x1234), 5, &frame)?;
+        let n = encode_voice_data(&mut buf, sid(0x1234), FrameSequence::try_from(5)?, &frame)?;
         let mut sink = NullSink;
         let pkt = decode_server_to_client(buf.get(..n).ok_or("n within buf")?, &mut sink)?;
         match pkt {
@@ -484,7 +483,7 @@ mod tests {
     #[test]
     fn voice_eot_server_roundtrip() -> TestResult {
         let mut buf = [0u8; 64];
-        let n = encode_voice_eot(&mut buf, sid(0x1234), 7)?;
+        let n = encode_voice_eot(&mut buf, sid(0x1234), FrameSequence::try_from(7)?)?;
         let mut sink = NullSink;
         let pkt = decode_server_to_client(buf.get(..n).ok_or("n within buf")?, &mut sink)?;
         match pkt {

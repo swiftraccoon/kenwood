@@ -16,12 +16,15 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use crate::codec::{dcs, dextra, dplus};
-use crate::error::{DcsError, Error, ProtocolError, StateError};
+use crate::error::{DcsError, Error, ProtocolError, StateError, StateOperation};
 use crate::header::DstarHeader;
 use crate::session::driver::Transmit;
 use crate::session::outbox::{OutboundPacket, Outbox};
-use crate::session::timer_wheel::TimerWheel;
-use crate::types::{Callsign, Module, ProtocolKind, StreamId};
+use crate::session::timer_wheel::{TimerId, TimerWheel};
+use crate::types::{
+    Callsign, DcsReflector, FrameSequence, Module, ModuleSlot, ProtocolKind, RepeaterIdentity,
+    RoutingCallsign, StreamId,
+};
 use crate::validator::{Diagnostic, VecSink};
 use crate::voice::VoiceFrame;
 
@@ -30,11 +33,11 @@ use super::protocol::Protocol;
 use super::state::ClientStateKind;
 
 /// Named timer: keepalive poll.
-const TIMER_KEEPALIVE: &str = "keepalive";
+const TIMER_KEEPALIVE: TimerId = TimerId::Keepalive;
 /// Named timer: keepalive inactivity (peer silent for too long).
-const TIMER_KEEPALIVE_INACTIVITY: &str = "keepalive_inactivity";
+const TIMER_KEEPALIVE_INACTIVITY: TimerId = TimerId::KeepaliveInactivity;
 /// Named timer: waiting for disconnect ACK from reflector.
-const TIMER_DISCONNECT_DEADLINE: &str = "disconnect_deadline";
+const TIMER_DISCONNECT_DEADLINE: TimerId = TimerId::DisconnectDeadline;
 /// Named timer: voice frames stopped flowing on the active stream.
 ///
 /// Re-armed on every voice frame / header for the active stream id.
@@ -46,26 +49,11 @@ const TIMER_DISCONNECT_DEADLINE: &str = "disconnect_deadline";
 /// retransmitting the header after voice data stopped) leaves the
 /// session stuck reporting "still talking" forever and suppressing
 /// every subsequent header retransmit as a duplicate.
-const TIMER_VOICE_INACTIVITY: &str = "voice_inactivity";
+const TIMER_VOICE_INACTIVITY: TimerId = TimerId::VoiceInactivity;
 
-/// How long the currently-active inbound stream must be silent
-/// (no voice frames / no matching-`stream_id` headers) before a
-/// different `stream_id` is allowed to take over as the active
-/// stream.
-///
-/// Reflectors that bridge multiple upstream gateways can forward
-/// two simultaneous talkers' packets to the same module, producing
-/// rapidly-alternating `stream_id` values (observed: ~2-5 swaps
-/// per second at REF030 C during a round-table). Swapping
-/// `active_rx_stream` on every change tears the radio modem down
-/// and re-keys it at that frequency and destroys the audio.
-///
-/// The threshold is deliberately longer than `DPlus`'s ~420 ms
-/// superframe boundary so a normal inter-header gap (during which
-/// voice frames still flow) doesn't count as silence, but shorter
-/// than a real talker pause (which usually takes >1 s to release
-/// PTT cleanly). 500 ms hits the right balance on live reflector
-/// traffic.
+/// Local receive policy: 500 ms without an active-stream voice frame before
+/// another stream identifier may take over. Duplicate headers do not renew
+/// that activity. The interval is independent of the voice-inactivity timer.
 const STREAM_TAKEOVER_THRESHOLD: Duration = Duration::from_millis(500);
 
 /// Internal protocol-erased event record.
@@ -124,26 +112,13 @@ pub struct SessionCore {
     /// Which protocol this session speaks.
     kind: ProtocolKind,
     /// Logged-in client callsign.
-    callsign: Callsign,
+    callsign: RoutingCallsign,
     /// Client local module letter.
     local_module: Module,
     /// Reflector module letter linked (or linking) to.
     reflector_module: Module,
-    /// Reflector's own callsign (e.g. `REF030`, `XLX307`, `DCS030`).
-    ///
-    /// Required by the DCS wire format: the 519-byte LINK packet,
-    /// the 19-byte UNLINK packet, and the 17-byte POLL packet all
-    /// embed the target reflector's callsign at specific offsets.
-    /// If the DCS client sends the wrong reflector callsign the
-    /// target reflector will drop the packet with no response.
-    ///
-    /// `None` means the caller did not supply one. For `DPlus` and
-    /// `DExtra` this is harmless: neither protocol embeds the
-    /// reflector callsign on the wire. For `DCS` the session falls
-    /// back to a `DCS001  ` default and emits a warning at construction
-    /// time so the operator can see why connections to
-    /// non-DCS001 reflectors fail.
-    reflector_callsign: Option<Callsign>,
+    /// Protocol-specific configuration, including a required DCS target.
+    protocol: super::ClientProtocol,
     /// Peer address of the reflector.
     peer: SocketAddr,
     /// Runtime state discriminator.
@@ -198,23 +173,9 @@ pub struct SessionCore {
     /// Wall-clock instant of the most recent voice frame or header
     /// that belonged to [`Self::active_rx_stream`].
     ///
-    /// Used by [`Self::emit_voice_start_if_new`] to distinguish a
-    /// legitimate mid-stream takeover (new talker picks up where
-    /// the previous one stopped) from a concurrent stream (reflector
-    /// interleaves frames from two simultaneous talkers). A header
-    /// for a different `stream_id` that arrives while the active
-    /// stream is still producing frames indicates the latter, and
-    /// must not swap `active_rx_stream`: doing so tears down and
-    /// re-keys the radio modem 2-4 times per second and produces
-    /// audible chopping between talkers. Observed live at REF030 C
-    /// when two gateways forwarded the same QSO to the reflector,
-    /// 252 mid-stream sid changes in a single session log before
-    /// this guard was added.
-    ///
-    /// Cleared on `VoiceEnd` and on session reset. Updated on every
-    /// voice frame / header push for the active stream (and only
-    /// the active stream, because concurrent streams must not keep the
-    /// liveness timer alive).
+    /// Used by [`Self::emit_voice_start_if_new`] to gate takeover after
+    /// [`STREAM_TAKEOVER_THRESHOLD`]. Cleared on stream end or session reset;
+    /// frames from concurrent streams never refresh this timestamp.
     last_voice_activity_at: Option<Instant>,
     /// Diagnostic sink for lenient parser warnings.
     ///
@@ -231,7 +192,7 @@ impl std::fmt::Debug for SessionCore {
             .field("callsign", &self.callsign)
             .field("local_module", &self.local_module)
             .field("reflector_module", &self.reflector_module)
-            .field("reflector_callsign", &self.reflector_callsign)
+            .field("protocol", &self.protocol)
             .field("peer", &self.peer)
             .field("state", &self.state)
             .field("outbox", &self.outbox)
@@ -283,13 +244,8 @@ impl SessionCore {
                 // inactivity timer.
             }
             Some(old_sid) => {
-                // Different stream_id arrived while another is
-                // active. Only honour this as a takeover if the
-                // active stream has been silent for longer than
-                // [`STREAM_TAKEOVER_THRESHOLD`]. Otherwise the
-                // reflector is forwarding two simultaneous talkers
-                // and swapping `active_rx_stream` would re-key the
-                // radio modem 2-4x per second.
+                // A different identifier may take over only after the
+                // active stream's voice-activity threshold expires.
                 let active_stale = self
                     .last_voice_activity_at
                     .is_none_or(|t| now.saturating_duration_since(t) >= STREAM_TAKEOVER_THRESHOLD);
@@ -373,65 +329,14 @@ impl SessionCore {
     /// wraps this constructor and enforces per-protocol state-transition
     /// rules.
     #[must_use]
-    pub fn new(
-        kind: ProtocolKind,
-        callsign: Callsign,
-        local_module: Module,
-        reflector_module: Module,
-        peer: SocketAddr,
-    ) -> Self {
-        Self::new_with_reflector_callsign(
-            kind,
-            callsign,
-            local_module,
-            reflector_module,
-            peer,
-            None,
-        )
-    }
-
-    /// Build a new [`SessionCore`] with an explicit reflector
-    /// callsign.
-    ///
-    /// Required for `DCS` sessions that target a non-`DCS001`
-    /// reflector: the DCS codec embeds the reflector callsign in
-    /// every LINK/UNLINK/POLL packet, and the default fallback is
-    /// `DCS001  `. Optional for `DPlus` and `DExtra`, which do not
-    /// carry the reflector callsign on the wire.
-    ///
-    /// Emits a `tracing::warn!` at construction time if the
-    /// protocol is `DCS` and `reflector_callsign` is `None`, so
-    /// operators can see why connections to non-DCS001 reflectors
-    /// fail without the real callsign.
-    #[must_use]
-    pub fn new_with_reflector_callsign(
-        kind: ProtocolKind,
-        callsign: Callsign,
-        local_module: Module,
-        reflector_module: Module,
-        peer: SocketAddr,
-        reflector_callsign: Option<Callsign>,
-    ) -> Self {
-        if kind == ProtocolKind::Dcs && reflector_callsign.is_none() {
-            tracing::warn!(
-                target: "dstar_gateway_core::session",
-                %callsign,
-                %peer,
-                "DCS session constructed without reflector_callsign, \
-                 falling back to \"DCS001  \" default. Connections to \
-                 any other DCS reflector will fail silently because the \
-                 target reflector reads the callsign field from the \
-                 LINK packet and drops mismatched traffic. Call \
-                 SessionBuilder::reflector_callsign to fix."
-            );
-        }
+    pub fn new(config: super::SessionConfig) -> Self {
         Self {
-            kind,
-            callsign,
-            local_module,
-            reflector_module,
-            reflector_callsign,
-            peer,
+            kind: config.protocol.kind(),
+            callsign: config.callsign,
+            local_module: config.local_module,
+            reflector_module: config.reflector_module,
+            protocol: config.protocol,
+            peer: config.peer,
             state: ClientStateKind::Configured,
             outbox: Outbox::new(),
             timers: TimerWheel::new(),
@@ -472,7 +377,7 @@ impl SessionCore {
     /// Client callsign.
     #[must_use]
     pub const fn callsign(&self) -> Callsign {
-        self.callsign
+        self.callsign.callsign()
     }
 
     /// Client local module letter.
@@ -520,7 +425,7 @@ impl SessionCore {
     pub fn attach_host_list(&mut self, list: dplus::HostList) -> Result<(), Error> {
         if self.kind != ProtocolKind::DPlus || self.state != ClientStateKind::Configured {
             return Err(Error::State(StateError::WrongState {
-                operation: "attach_host_list",
+                operation: StateOperation::AttachHostList,
                 state: self.state,
                 protocol: self.kind,
             }));
@@ -537,10 +442,26 @@ impl SessionCore {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Protocol`] if a codec encoder reports a
+    /// Returns [`StateError::WrongState`] outside the protocol's initial
+    /// configured/authenticated state, [`StateError::DeadlineOverflow`] for
+    /// an unrepresentable timer span, or [`Error::Protocol`] if a codec reports a
     /// buffer-too-small (should never happen, since the scratch
     /// buffers in this core are oversized for every known packet).
     pub fn enqueue_connect(&mut self, now: Instant) -> Result<(), Error> {
+        self.validate_time(now)?;
+        let expected = if self.kind == ProtocolKind::DPlus {
+            ClientStateKind::Authenticated
+        } else {
+            ClientStateKind::Configured
+        };
+        if self.state != expected {
+            return Err(StateError::WrongState {
+                operation: StateOperation::Connect,
+                state: self.state,
+                protocol: self.kind,
+            }
+            .into());
+        }
         let packet = match self.kind {
             ProtocolKind::DPlus => {
                 let mut buf = [0u8; 32];
@@ -557,9 +478,8 @@ impl SessionCore {
                 let mut buf = [0u8; 16];
                 let n = dextra::encode_connect_link(
                     &mut buf,
-                    &self.callsign,
+                    self.local_identity(),
                     self.reflector_module,
-                    self.local_module,
                 )
                 .map_err(dextra::DExtraError::from)
                 .map_err(ProtocolError::DExtra)?;
@@ -574,10 +494,9 @@ impl SessionCore {
                 let reflector_callsign = self.dcs_reflector_callsign();
                 let n = dcs::encode_connect_link(
                     &mut buf,
-                    &self.callsign,
-                    self.local_module,
+                    self.local_identity(),
                     self.reflector_module,
-                    &reflector_callsign,
+                    reflector_callsign,
                     dcs::GatewayType::Dongle,
                 )
                 .map_err(DcsError::from)
@@ -601,8 +520,22 @@ impl SessionCore {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Protocol`] if a codec encoder fails.
+    /// Returns [`StateError::WrongState`] outside connecting/connected state,
+    /// [`StateError::DeadlineOverflow`] for an unrepresentable timer span, or
+    /// [`Error::Protocol`] if a codec encoder fails.
     pub fn enqueue_disconnect(&mut self, now: Instant) -> Result<(), Error> {
+        self.validate_time(now)?;
+        if !matches!(
+            self.state,
+            ClientStateKind::Connecting | ClientStateKind::Connected
+        ) {
+            return Err(StateError::WrongState {
+                operation: StateOperation::Disconnect,
+                state: self.state,
+                protocol: self.kind,
+            }
+            .into());
+        }
         let packet = match self.kind {
             ProtocolKind::DPlus => {
                 let mut buf = [0u8; 16];
@@ -617,7 +550,7 @@ impl SessionCore {
             }
             ProtocolKind::DExtra => {
                 let mut buf = [0u8; 16];
-                let n = dextra::encode_unlink(&mut buf, &self.callsign, self.local_module)
+                let n = dextra::encode_unlink(&mut buf, self.local_identity())
                     .map_err(dextra::DExtraError::from)
                     .map_err(ProtocolError::DExtra)?;
                 OutboundPacket {
@@ -629,14 +562,10 @@ impl SessionCore {
             ProtocolKind::Dcs => {
                 let mut buf = [0u8; 32];
                 let reflector_callsign = self.dcs_reflector_callsign();
-                let n = dcs::encode_connect_unlink(
-                    &mut buf,
-                    &self.callsign,
-                    self.local_module,
-                    &reflector_callsign,
-                )
-                .map_err(DcsError::from)
-                .map_err(ProtocolError::Dcs)?;
+                let n =
+                    dcs::encode_connect_unlink(&mut buf, self.local_identity(), reflector_callsign)
+                        .map_err(DcsError::from)
+                        .map_err(ProtocolError::Dcs)?;
                 OutboundPacket {
                     dst: self.peer,
                     payload: buf.get(..n).unwrap_or(&[]).to_vec(),
@@ -681,7 +610,7 @@ impl SessionCore {
     ) -> Result<(), Error> {
         if self.state != ClientStateKind::Connected {
             return Err(Error::State(StateError::WrongState {
-                operation: "enqueue_send_header",
+                operation: StateOperation::SendHeader,
                 state: self.state,
                 protocol: self.kind,
             }));
@@ -700,9 +629,16 @@ impl SessionCore {
                 // (seq=0) carries the embedded header. Emit a silence
                 // frame at seq=0 to start the stream.
                 let silence = VoiceFrame::silence();
-                dcs::encode_voice(&mut buf, header, stream_id, 0, &silence, false)
-                    .map_err(DcsError::from)
-                    .map_err(ProtocolError::Dcs)?
+                dcs::encode_voice(
+                    &mut buf,
+                    header,
+                    stream_id,
+                    FrameSequence::ZERO,
+                    &silence,
+                    false,
+                )
+                .map_err(DcsError::from)
+                .map_err(ProtocolError::Dcs)?
             }
         };
         self.outbox.enqueue(OutboundPacket {
@@ -735,12 +671,12 @@ impl SessionCore {
         &mut self,
         now: Instant,
         stream_id: StreamId,
-        seq: u8,
+        seq: FrameSequence,
         frame: &VoiceFrame,
     ) -> Result<(), Error> {
         if self.state != ClientStateKind::Connected {
             return Err(Error::State(StateError::WrongState {
-                operation: "enqueue_send_voice",
+                operation: StateOperation::SendVoice,
                 state: self.state,
                 protocol: self.kind,
             }));
@@ -793,11 +729,11 @@ impl SessionCore {
         &mut self,
         now: Instant,
         stream_id: StreamId,
-        seq: u8,
+        seq: FrameSequence,
     ) -> Result<(), Error> {
         if self.state != ClientStateKind::Connected {
             return Err(Error::State(StateError::WrongState {
-                operation: "enqueue_send_eot",
+                operation: StateOperation::SendEot,
                 state: self.state,
                 protocol: self.kind,
             }));
@@ -837,21 +773,24 @@ impl SessionCore {
     /// packets as needed. Protocol-erased dispatch: matches on
     /// [`Self::protocol_kind`] and calls the appropriate codec.
     ///
-    /// The `peer` argument is the source address of the datagram.
-    /// The typestate wrapper filters out datagrams whose source does
-    /// not match the expected reflector; the core accepts whatever
-    /// the shell passes it.
+    /// `peer` is the source address. Foreign peers and input after closure
+    /// are ignored before parsing or updating timers.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Protocol`] wrapping the codec error if the
-    /// datagram cannot be parsed.
+    /// Returns [`StateError::DeadlineOverflow`] before processing when a
+    /// protocol timer cannot be represented. Malformed wire datagrams are
+    /// logged and ignored by the protocol-specific dispatchers.
     pub fn handle_input(
         &mut self,
         now: Instant,
         peer: SocketAddr,
         bytes: &[u8],
     ) -> Result<(), Error> {
+        if peer != self.peer || self.state == ClientStateKind::Closed {
+            return Ok(());
+        }
+        self.validate_time(now)?;
         match self.kind {
             ProtocolKind::DPlus => self.handle_dplus_input(now, peer, bytes),
             ProtocolKind::DExtra => self.handle_dextra_input(now, peer, bytes),
@@ -884,13 +823,24 @@ impl SessionCore {
                 return Ok(());
             }
         };
+        if self.state != ClientStateKind::Connected
+            && matches!(
+                pkt,
+                dplus::ServerPacket::PollEcho
+                    | dplus::ServerPacket::VoiceHeader { .. }
+                    | dplus::ServerPacket::VoiceData { .. }
+                    | dplus::ServerPacket::VoiceEot { .. }
+            )
+        {
+            return Ok(());
+        }
         match pkt {
             dplus::ServerPacket::Link1Ack => {
                 if self.state == ClientStateKind::Connecting {
                     // First half of the two-step DPlus handshake:
                     // reply with LINK2 immediately.
                     let mut buf = [0u8; 32];
-                    let n = dplus::encode_link2(&mut buf, &self.callsign)
+                    let n = dplus::encode_link2(&mut buf, &self.callsign.callsign())
                         .map_err(dplus::DPlusError::from)
                         .map_err(ProtocolError::DPlus)?;
                     self.outbox.enqueue(OutboundPacket {
@@ -918,10 +868,11 @@ impl SessionCore {
                 }
                 Ok(())
             }
-            dplus::ServerPacket::Link2Echo { .. } => {
+            dplus::ServerPacket::Link2Echo { callsign } => {
                 // Some DPlus servers echo the full 28-byte LINK2 instead
                 // of OKRW. Treat it as an accept.
-                if self.state == ClientStateKind::Connecting {
+                if self.state == ClientStateKind::Connecting && callsign == self.callsign.callsign()
+                {
                     self.finalize_connected(peer, now);
                 }
                 Ok(())
@@ -948,36 +899,7 @@ impl SessionCore {
                 frame,
             } => {
                 self.arm_keepalive_inactivity(now);
-                // Only emit frames for the currently-active stream.
-                // When the reflector forwards a second concurrent
-                // talker's packets, this drops them cleanly rather
-                // than mixing both streams' audio into the modem's
-                // single-stream FIFO.
-                if self.active_rx_stream == Some(stream_id) {
-                    self.events.push_back(RawEvent::VoiceFrame {
-                        stream_id,
-                        seq,
-                        frame,
-                    });
-                    self.arm_voice_inactivity(now);
-                    self.last_voice_activity_at = Some(now);
-                } else {
-                    // Concurrent stream's voice frame dropped. The
-                    // corresponding header suppression logs at
-                    // debug in `emit_voice_start_if_new`; this trace
-                    // makes every single dropped frame visible so
-                    // operators can confirm the magnitude of a
-                    // doubling event without having to estimate
-                    // from the (superframe-cadence) header log.
-                    let _ = frame;
-                    tracing::trace!(
-                        target: "dstar_gateway_core::session::client",
-                        concurrent_sid = format_args!("{:#06X}", stream_id.get()),
-                        active_sid = ?self.active_rx_stream.map(StreamId::get),
-                        seq,
-                        "dropping voice frame for concurrent stream"
-                    );
-                }
+                self.emit_voice_frame(now, stream_id, seq, frame);
                 Ok(())
             }
             dplus::ServerPacket::VoiceEot { stream_id, seq: _ } => {
@@ -1013,17 +935,49 @@ impl SessionCore {
                 return Ok(());
             }
         };
+        if self.state != ClientStateKind::Connected
+            && matches!(
+                pkt,
+                dextra::ServerPacket::PollEcho { .. }
+                    | dextra::ServerPacket::VoiceHeader { .. }
+                    | dextra::ServerPacket::VoiceData { .. }
+                    | dextra::ServerPacket::VoiceEot { .. }
+            )
+        {
+            return Ok(());
+        }
         match pkt {
-            dextra::ServerPacket::ConnectAck { .. } => {
-                if self.state == ClientStateKind::Connecting {
+            dextra::ServerPacket::ConnectAck {
+                callsign,
+                client_module,
+                reflector_module,
+            } => {
+                if callsign == self.callsign.callsign()
+                    && client_module == self.local_module
+                    && reflector_module == self.reflector_module
+                    && self.state == ClientStateKind::Connecting
+                {
                     self.finalize_connected(peer, now);
                 }
                 Ok(())
             }
-            dextra::ServerPacket::ConnectNak { .. } => {
+            dextra::ServerPacket::ConnectNak {
+                callsign,
+                client_module,
+                reflector_module,
+            } => {
+                if callsign != self.callsign.callsign()
+                    || client_module != self.local_module
+                    || (reflector_module != ModuleSlot::Empty
+                        && reflector_module != ModuleSlot::Module(self.reflector_module))
+                {
+                    return Ok(());
+                }
                 if self.state == ClientStateKind::Connecting {
                     self.finalize_rejected();
-                } else if self.state == ClientStateKind::Disconnecting {
+                } else if self.state == ClientStateKind::Disconnecting
+                    && reflector_module == ModuleSlot::Empty
+                {
                     // DExtra reflectors echo the unlink as a NAK on
                     // module-space. Treat it as the unlink ACK.
                     self.finalize_disconnect(DisconnectReason::UnlinkAcked);
@@ -1046,27 +1000,7 @@ impl SessionCore {
                 frame,
             } => {
                 self.arm_keepalive_inactivity(now);
-                // See the DPlus branch above: emit only for the
-                // active stream so concurrent talkers' frames don't
-                // mix into the modem FIFO.
-                if self.active_rx_stream == Some(stream_id) {
-                    self.events.push_back(RawEvent::VoiceFrame {
-                        stream_id,
-                        seq,
-                        frame,
-                    });
-                    self.arm_voice_inactivity(now);
-                    self.last_voice_activity_at = Some(now);
-                } else {
-                    let _ = frame;
-                    tracing::trace!(
-                        target: "dstar_gateway_core::session::client",
-                        concurrent_sid = format_args!("{:#06X}", stream_id.get()),
-                        active_sid = ?self.active_rx_stream.map(StreamId::get),
-                        seq,
-                        "dropping voice frame for concurrent stream"
-                    );
-                }
+                self.emit_voice_frame(now, stream_id, seq, frame);
                 Ok(())
             }
             dextra::ServerPacket::VoiceEot { stream_id, seq: _ } => {
@@ -1102,18 +1036,47 @@ impl SessionCore {
                 return Ok(());
             }
         };
+        if self.state != ClientStateKind::Connected
+            && matches!(
+                pkt,
+                dcs::ServerPacket::PollEcho { .. } | dcs::ServerPacket::Voice { .. }
+            )
+        {
+            return Ok(());
+        }
         match pkt {
-            dcs::ServerPacket::ConnectAck { .. } => {
-                if self.state == ClientStateKind::Connecting {
+            dcs::ServerPacket::ConnectAck {
+                callsign,
+                client_module,
+                reflector_module,
+            } => {
+                if callsign == self.callsign.callsign()
+                    && client_module == self.local_module
+                    && reflector_module == self.reflector_module
+                    && self.state == ClientStateKind::Connecting
+                {
                     self.finalize_connected(peer, now);
-                } else if self.state == ClientStateKind::Disconnecting {
-                    self.finalize_disconnect(DisconnectReason::UnlinkAcked);
                 }
                 Ok(())
             }
-            dcs::ServerPacket::ConnectNak { .. } => {
+            dcs::ServerPacket::ConnectNak {
+                callsign,
+                client_module,
+                reflector_module,
+            } => {
+                if callsign != self.callsign.callsign()
+                    || client_module != self.local_module
+                    || (reflector_module != ModuleSlot::Empty
+                        && reflector_module != ModuleSlot::Module(self.reflector_module))
+                {
+                    return Ok(());
+                }
                 if self.state == ClientStateKind::Connecting {
                     self.finalize_rejected();
+                } else if self.state == ClientStateKind::Disconnecting
+                    && reflector_module == ModuleSlot::Empty
+                {
+                    self.finalize_disconnect(DisconnectReason::UnlinkAcked);
                 }
                 Ok(())
             }
@@ -1139,36 +1102,34 @@ impl SessionCore {
                     // [`Self::emit_voice_start_if_new`], but ALWAYS
                     // surface the frame as `VoiceFrame` too, because the
                     // `seq == 0` frame carries real voice data plus
-                    // the superframe sync pattern in slow-data, so
-                    // dropping it (as the pre-fix code did) left
-                    // audible gaps every 420 ms.
+                    // the superframe sync pattern in slow-data.
                     //
-                    // Frames for a concurrent stream whose header
-                    // was suppressed by
-                    // [`Self::emit_voice_start_if_new`] are dropped
-                    // here; see the DPlus branch for rationale.
                     self.emit_voice_start_if_new(now, stream_id, header);
-                    if self.active_rx_stream == Some(stream_id) {
-                        self.events.push_back(RawEvent::VoiceFrame {
-                            stream_id,
-                            seq,
-                            frame,
-                        });
-                        self.arm_voice_inactivity(now);
-                        self.last_voice_activity_at = Some(now);
-                    } else {
-                        let _ = frame;
-                        tracing::trace!(
-                            target: "dstar_gateway_core::session::client",
-                            concurrent_sid = format_args!("{:#06X}", stream_id.get()),
-                            active_sid = ?self.active_rx_stream.map(StreamId::get),
-                            seq,
-                            "dropping voice frame for concurrent stream"
-                        );
-                    }
+                    self.emit_voice_frame(now, stream_id, seq, frame);
                 }
                 Ok(())
             }
+        }
+    }
+
+    /// Queue only the active stream's frame and renew its activity timer.
+    fn emit_voice_frame(&mut self, now: Instant, stream_id: StreamId, seq: u8, frame: VoiceFrame) {
+        if self.active_rx_stream == Some(stream_id) {
+            self.events.push_back(RawEvent::VoiceFrame {
+                stream_id,
+                seq,
+                frame,
+            });
+            self.arm_voice_inactivity(now);
+            self.last_voice_activity_at = Some(now);
+        } else {
+            tracing::trace!(
+                target: "dstar_gateway_core::session::client",
+                concurrent_sid = format_args!("{:#06X}", stream_id.get()),
+                active_sid = ?self.active_rx_stream.map(StreamId::get),
+                seq,
+                "dropping voice frame for concurrent stream"
+            );
         }
     }
 
@@ -1187,11 +1148,22 @@ impl SessionCore {
     ///   transition to Closed, emit [`Event::Disconnected`] with
     ///   reason [`DisconnectReason::DisconnectTimeout`]
     pub fn handle_timeout(&mut self, now: Instant) {
+        if self.validate_time(now).is_err() {
+            if self.state != ClientStateKind::Closed {
+                self.outbox = Outbox::new();
+                self.active_rx_stream = None;
+                self.last_voice_activity_at = None;
+                self.finalize_disconnect(DisconnectReason::ClockRange);
+            }
+            return;
+        }
         if self.state == ClientStateKind::Connected && self.timers.is_expired(TIMER_KEEPALIVE, now)
         {
             self.enqueue_poll(now);
-            self.timers
-                .set(TIMER_KEEPALIVE, now + self.keepalive_interval());
+            self.timers.set(
+                TIMER_KEEPALIVE,
+                timer_deadline(now, self.keepalive_interval()),
+            );
         }
 
         // Voice-inactivity expiry: the active inbound stream has
@@ -1199,10 +1171,7 @@ impl SessionCore {
         // (2 s on all three protocols). Synthesize a
         // `VoiceEnd(Inactivity)` so the consumer isn't left with a
         // dangling "in progress" stream when the reflector drops
-        // an EOT packet or the remote source de-keys too fast for
-        // the EOT to be forwarded (observed at REF030 C: 15 frames
-        // of M6JBE audio relayed cleanly, then silence with no
-        // EOT, stream stuck "active" indefinitely).
+        // an EOT packet or the source stops without forwarding an EOT.
         //
         // The timer is armed on each voice frame, so the deadline
         // always sits `VOICE_INACTIVITY_TIMEOUT` past the latest real
@@ -1220,7 +1189,7 @@ impl SessionCore {
                 self.emit_voice_end(stream_id, VoiceEndReason::Inactivity);
             } else {
                 // Defensive: timer fired but no active stream.
-                // Clear it so we don't spin-loop in a stuck state.
+                // Remove the expired timer outside the disconnect state.
                 self.timers.clear(TIMER_VOICE_INACTIVITY);
             }
         }
@@ -1261,8 +1230,12 @@ impl SessionCore {
     /// Pop the next consumer-visible event.
     ///
     /// The `P` type parameter re-attaches the protocol phantom at
-    /// drain time; the event queue itself is protocol-erased.
+    /// drain time; the event queue itself is protocol-erased. Returns `None`
+    /// without draining when `P` does not match [`Self::protocol_kind`].
     pub fn pop_event<P: Protocol>(&mut self) -> Option<Event<P>> {
+        if P::KIND != self.kind {
+            return None;
+        }
         let raw = self.events.pop_front()?;
         Some(match raw {
             RawEvent::Connected { peer } => Event::Connected { peer },
@@ -1307,6 +1280,19 @@ impl SessionCore {
 
     // ── Internal helpers ──────────────────────────────────────
 
+    /// Check all protocol-specific timer spans before mutating the session.
+    fn validate_time(&self, now: Instant) -> Result<(), Error> {
+        let longest = self
+            .keepalive_interval()
+            .max(self.keepalive_inactivity_timeout())
+            .max(self.voice_inactivity_timeout())
+            .max(self.disconnect_timeout());
+        let _deadline = now
+            .checked_add(longest)
+            .ok_or(StateError::DeadlineOverflow)?;
+        Ok(())
+    }
+
     /// Enqueue the protocol-appropriate keepalive poll packet.
     ///
     /// Encoder failures are swallowed: the scratch buffers in this
@@ -1324,14 +1310,14 @@ impl SessionCore {
             }
             ProtocolKind::DExtra => {
                 let mut buf = [0u8; 16];
-                dextra::encode_poll(&mut buf, &self.callsign)
+                dextra::encode_poll(&mut buf, &self.callsign.callsign())
                     .ok()
                     .and_then(|n| buf.get(..n).map(<[u8]>::to_vec))
             }
             ProtocolKind::Dcs => {
                 let mut buf = [0u8; 32];
                 let reflector_callsign = self.dcs_reflector_callsign();
-                dcs::encode_poll_request(&mut buf, &self.callsign, &reflector_callsign)
+                dcs::encode_poll_request(&mut buf, self.callsign, reflector_callsign)
                     .ok()
                     .and_then(|n| buf.get(..n).map(<[u8]>::to_vec))
             }
@@ -1348,8 +1334,10 @@ impl SessionCore {
     /// Transition to Connected, arm keepalive timers, emit event.
     fn finalize_connected(&mut self, peer: SocketAddr, now: Instant) {
         self.state = ClientStateKind::Connected;
-        self.timers
-            .set(TIMER_KEEPALIVE, now + self.keepalive_interval());
+        self.timers.set(
+            TIMER_KEEPALIVE,
+            timer_deadline(now, self.keepalive_interval()),
+        );
         self.arm_keepalive_inactivity(now);
         self.events.push_back(RawEvent::Connected { peer });
     }
@@ -1370,7 +1358,7 @@ impl SessionCore {
         self.events.push_back(RawEvent::Disconnected { reason });
     }
 
-    fn clear_timers(&mut self) {
+    const fn clear_timers(&mut self) {
         self.timers.clear(TIMER_KEEPALIVE);
         self.timers.clear(TIMER_KEEPALIVE_INACTIVITY);
         self.timers.clear(TIMER_DISCONNECT_DEADLINE);
@@ -1380,7 +1368,7 @@ impl SessionCore {
     fn arm_keepalive_inactivity(&mut self, now: Instant) {
         self.timers.set(
             TIMER_KEEPALIVE_INACTIVITY,
-            now + self.keepalive_inactivity_timeout(),
+            timer_deadline(now, self.keepalive_inactivity_timeout()),
         );
     }
 
@@ -1399,13 +1387,15 @@ impl SessionCore {
     fn arm_voice_inactivity(&mut self, now: Instant) {
         self.timers.set(
             TIMER_VOICE_INACTIVITY,
-            now + self.voice_inactivity_timeout(),
+            timer_deadline(now, self.voice_inactivity_timeout()),
         );
     }
 
     fn arm_disconnect_deadline(&mut self, now: Instant) {
-        self.timers
-            .set(TIMER_DISCONNECT_DEADLINE, now + self.disconnect_timeout());
+        self.timers.set(
+            TIMER_DISCONNECT_DEADLINE,
+            timer_deadline(now, self.disconnect_timeout()),
+        );
     }
 
     const fn keepalive_interval(&self) -> Duration {
@@ -1442,17 +1432,26 @@ impl SessionCore {
 
     /// Return the stored reflector callsign for DCS codec paths.
     ///
-    /// Returns the value supplied via
-    /// [`Self::new_with_reflector_callsign`] when present, or a
-    /// `DCS001  ` fallback when the caller did not supply one. The
-    /// fallback is only correct for sessions targeting the DCS001
-    /// reflector; for any other target the caller MUST supply the
-    /// real reflector callsign via the builder or the DCS server
-    /// will drop the LINK packet silently.
-    fn dcs_reflector_callsign(&self) -> Callsign {
-        self.reflector_callsign
-            .unwrap_or_else(|| Callsign::from_wire_bytes(*b"DCS001  "))
+    /// The constructor requires this value in [`super::ClientProtocol::Dcs`].
+    const fn dcs_reflector_callsign(&self) -> DcsReflector {
+        let super::ClientProtocol::Dcs(target) = self.protocol else {
+            unreachable!();
+        };
+        target
     }
+
+    const fn local_identity(&self) -> RepeaterIdentity {
+        RepeaterIdentity {
+            callsign: self.callsign,
+            module: self.local_module,
+        }
+    }
+}
+
+/// Public time-bearing entry points validate every timer span first.
+/// A direct internal call at the limit schedules an immediately due timer.
+fn timer_deadline(now: Instant, duration: Duration) -> Instant {
+    now.checked_add(duration).unwrap_or(now)
 }
 
 #[cfg(test)]
@@ -1460,33 +1459,134 @@ mod tests {
     use super::*;
     use crate::codec::dplus::HostList;
     use crate::codec::{dcs as dcs_codec, dextra as dextra_codec, dplus as dplus_codec};
+    use crate::error::DcsError;
+    use crate::header::DstarHeader;
     use crate::session::client::protocol::{DExtra, DPlus, Dcs};
+    use crate::types::{StreamId, Suffix};
+    use crate::voice::VoiceFrame;
+    use crate::{ClientProtocol, DcsReflector, RoutingCallsign, SessionConfig};
     use std::net::{IpAddr, Ipv4Addr};
 
+    fn clock_limit() -> Instant {
+        let mut limit = Instant::now();
+        for bit in (0..64).rev() {
+            if let Some(later) = limit.checked_add(Duration::from_secs(1_u64 << bit)) {
+                limit = later;
+            }
+        }
+        limit
+    }
+
+    #[test]
+    fn clock_limit_rejects_partial_transitions_and_timeout_closes_once() -> TestResult {
+        let limit = clock_limit();
+        for mut core in [new_dextra(), new_dplus(), new_dcs()] {
+            let result = core.enqueue_connect(limit);
+            assert!(
+                matches!(result, Err(Error::State(StateError::DeadlineOverflow))),
+                "unrepresentable deadline must be typed: {result:?}"
+            );
+            assert_eq!(core.state_kind(), ClientStateKind::Configured);
+            assert!(
+                core.next_deadline().is_none(),
+                "failed connect cannot enqueue packets or timers"
+            );
+            if core.kind == ProtocolKind::DPlus {
+                core.attach_host_list(HostList::new())?;
+            }
+            core.enqueue_connect(Instant::now())?;
+            core.handle_timeout(limit);
+            assert_eq!(core.state_kind(), ClientStateKind::Closed);
+            assert!(
+                core.next_deadline().is_none(),
+                "clock-range failure retires every queued deadline"
+            );
+            assert!(
+                matches!(
+                    core.pop_event::<DExtra>(),
+                    Some(Event::Disconnected {
+                        reason: DisconnectReason::ClockRange
+                    })
+                ) || matches!(
+                    core.pop_event::<DPlus>(),
+                    Some(Event::Disconnected {
+                        reason: DisconnectReason::ClockRange
+                    })
+                ) || matches!(
+                    core.pop_event::<Dcs>(),
+                    Some(Event::Disconnected {
+                        reason: DisconnectReason::ClockRange
+                    })
+                ),
+                "one clock-range completion must remain observable"
+            );
+            core.handle_timeout(limit);
+            assert!(
+                core.events.is_empty(),
+                "repeated timeout cannot duplicate completion"
+            );
+        }
+        Ok(())
+    }
     const fn cs() -> Callsign {
         Callsign::from_wire_bytes(*b"W1AW    ")
+    }
+
+    const fn sequence(index: u8) -> FrameSequence {
+        match FrameSequence::new(index) {
+            Some(index) => index,
+            None => unreachable!(),
+        }
     }
 
     const ADDR_DEXTRA: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30001);
     const ADDR_DPLUS: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 20001);
     const ADDR_DCS: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30051);
+    const LOCAL: RoutingCallsign = match RoutingCallsign::from_padded_bytes(*b"W1AW   ") {
+        Ok(value) => value,
+        Err(_) => unreachable!(),
+    };
+    const DCS_PREFIX: RoutingCallsign = match RoutingCallsign::from_padded_bytes(*b"DCS001 ") {
+        Ok(value) => value,
+        Err(_) => unreachable!(),
+    };
+    const DCS_TARGET: DcsReflector = match DcsReflector::try_from_routing(DCS_PREFIX) {
+        Ok(value) => value,
+        Err(_) => unreachable!(),
+    };
+    const LOCAL_IDENTITY: RepeaterIdentity = RepeaterIdentity {
+        callsign: LOCAL,
+        module: Module::B,
+    };
 
     fn new_dextra() -> SessionCore {
-        SessionCore::new(
-            ProtocolKind::DExtra,
-            cs(),
-            Module::B,
-            Module::C,
-            ADDR_DEXTRA,
-        )
+        SessionCore::new(SessionConfig {
+            protocol: ClientProtocol::DExtra,
+            callsign: LOCAL,
+            local_module: Module::B,
+            reflector_module: Module::C,
+            peer: ADDR_DEXTRA,
+        })
     }
 
     fn new_dplus() -> SessionCore {
-        SessionCore::new(ProtocolKind::DPlus, cs(), Module::B, Module::C, ADDR_DPLUS)
+        SessionCore::new(SessionConfig {
+            protocol: ClientProtocol::DPlus,
+            callsign: LOCAL,
+            local_module: Module::B,
+            reflector_module: Module::C,
+            peer: ADDR_DPLUS,
+        })
     }
 
     fn new_dcs() -> SessionCore {
-        SessionCore::new(ProtocolKind::Dcs, cs(), Module::B, Module::C, ADDR_DCS)
+        SessionCore::new(SessionConfig {
+            protocol: ClientProtocol::Dcs(DCS_TARGET),
+            callsign: LOCAL,
+            local_module: Module::B,
+            reflector_module: Module::C,
+            peer: ADDR_DCS,
+        })
     }
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -1500,7 +1600,7 @@ mod tests {
         core.enqueue_connect(t0)?;
         let _ = core.pop_transmit(t0).ok_or("no link")?;
         let mut ack = [0u8; 16];
-        let n = dextra_codec::encode_connect_ack(&mut ack, &cs(), Module::C)?;
+        let n = dextra_codec::encode_connect_ack(&mut ack, LOCAL_IDENTITY, Module::C)?;
         core.handle_input(t0, ADDR_DEXTRA, ack.get(..n).ok_or("n > buf")?)?;
         drop(core.pop_event::<DExtra>().ok_or("no connected event")?);
         Ok((core, t0))
@@ -1531,14 +1631,87 @@ mod tests {
         core.enqueue_connect(t0)?;
         let _ = core.pop_transmit(t0).ok_or("no link")?;
         let mut ack = [0u8; 16];
-        let n = dcs_codec::encode_connect_ack(
-            &mut ack,
-            &Callsign::from_wire_bytes(*b"DCS001  "),
-            Module::C,
-        )?;
+        let n = dcs_codec::encode_connect_ack(&mut ack, LOCAL_IDENTITY, Module::C)?;
         core.handle_input(t0, ADDR_DCS, ack.get(..n).ok_or("n > buf")?)?;
         drop(core.pop_event::<Dcs>().ok_or("no connected event")?);
         Ok((core, t0))
+    }
+
+    #[test]
+    fn receive_activity_requires_a_connected_client() -> TestResult {
+        let now = Instant::now();
+        for mut core in [new_dplus(), new_dextra(), new_dcs()] {
+            let mut voice = [0_u8; 100];
+            let mut poll = [0_u8; 32];
+            let (voice_len, poll_len) = match core.kind {
+                ProtocolKind::DPlus => (
+                    dplus_codec::encode_voice_header(&mut voice, sid(0x1234), &test_header())?,
+                    dplus_codec::encode_poll_echo(&mut poll)?,
+                ),
+                ProtocolKind::DExtra => (
+                    dextra_codec::encode_voice_header(&mut voice, sid(0x1234), &test_header())?,
+                    dextra_codec::encode_poll_echo(&mut poll, &cs())?,
+                ),
+                ProtocolKind::Dcs => (
+                    dcs_codec::encode_voice(
+                        &mut voice,
+                        &test_header(),
+                        sid(0x1234),
+                        FrameSequence::ZERO,
+                        &VoiceFrame::silence(),
+                        false,
+                    )?,
+                    dcs_codec::encode_poll_reply(&mut poll, &cs(), &DCS_TARGET.callsign())?,
+                ),
+            };
+            let voice = voice.get(..voice_len).ok_or("invalid voice length")?;
+            let poll = poll.get(..poll_len).ok_or("invalid poll length")?;
+            for state in [
+                ClientStateKind::Configured,
+                ClientStateKind::Authenticated,
+                ClientStateKind::Connecting,
+                ClientStateKind::Disconnecting,
+            ] {
+                core.state = state;
+                core.handle_input(now, core.peer, voice)?;
+                core.handle_input(now, core.peer, poll)?;
+                assert!(core.events.is_empty(), "{state:?}: {:?}", core.events);
+                assert_eq!(core.active_rx_stream, None, "{state:?}");
+                assert_eq!(core.next_deadline(), None, "{state:?}");
+            }
+            core.state = ClientStateKind::Connected;
+            core.handle_input(now, core.peer, voice)?;
+            assert!(
+                matches!(core.events.front(), Some(RawEvent::VoiceStart { .. })),
+                "the same packet must be usable after linking"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn dplus_link_echo_requires_the_requested_identity() -> TestResult {
+        let mut core = new_dplus();
+        core.attach_host_list(HostList::new())?;
+        let now = Instant::now();
+        core.enqueue_connect(now)?;
+        let mut packet = [0_u8; 28];
+        let foreign = Callsign::from_wire_bytes(*b"OTHER   ");
+        let n = dplus_codec::encode_link2(&mut packet, &foreign)?;
+        core.handle_input(
+            now,
+            ADDR_DPLUS,
+            packet.get(..n).ok_or("invalid echo length")?,
+        )?;
+        assert_eq!(core.state_kind(), ClientStateKind::Connecting);
+        let n = dplus_codec::encode_link2(&mut packet, &cs())?;
+        core.handle_input(
+            now,
+            ADDR_DPLUS,
+            packet.get(..n).ok_or("invalid echo length")?,
+        )?;
+        assert_eq!(core.state_kind(), ClientStateKind::Connected);
+        Ok(())
     }
 
     // ── DExtra happy path ─────────────────────────────────────
@@ -1558,7 +1731,7 @@ mod tests {
 
         // Build the server-side ACK using the codec.
         let mut ack = [0u8; 16];
-        let n = dextra_codec::encode_connect_ack(&mut ack, &cs(), Module::C)?;
+        let n = dextra_codec::encode_connect_ack(&mut ack, LOCAL_IDENTITY, Module::C)?;
         core.handle_input(
             t0,
             ADDR_DEXTRA,
@@ -1573,6 +1746,46 @@ mod tests {
     }
 
     #[test]
+    fn control_replies_require_correlated_identity_module_and_phase() -> TestResult {
+        let now = Instant::now();
+        for mut core in [new_dextra(), new_dcs()] {
+            core.enqueue_connect(now)?;
+            let _link = core.pop_transmit(now).ok_or("LINK request")?;
+            for invalid in [b"N0CALL  BCACK\0", b"W1AW    ACACK\0", b"W1AW    BDACK\0"] {
+                core.handle_input(now, core.peer(), invalid)?;
+                assert_eq!(
+                    core.state_kind(),
+                    ClientStateKind::Connecting,
+                    "an unrelated identity or module cannot finish the link"
+                );
+            }
+            core.handle_input(now, core.peer(), b"W1AW    BCACK\0")?;
+            assert_eq!(core.state_kind(), ClientStateKind::Connected);
+            core.enqueue_disconnect(now)?;
+            let _unlink = core.pop_transmit(now).ok_or("UNLINK request")?;
+            core.handle_input(now, core.peer(), b"W1AW    BCACK\0")?;
+            assert_eq!(
+                core.state_kind(),
+                ClientStateKind::Disconnecting,
+                "a delayed LINK acknowledgment cannot complete UNLINK"
+            );
+            core.handle_input(now, core.peer(), b"W1AW    BCNAK\0")?;
+            assert_eq!(
+                core.state_kind(),
+                ClientStateKind::Disconnecting,
+                "a link rejection with a selected module cannot finish UNLINK"
+            );
+            core.handle_input(now, core.peer(), b"W1AW    B NAK\0")?;
+            assert_eq!(
+                core.state_kind(),
+                ClientStateKind::Closed,
+                "the matched space-slot NAK acknowledges disconnect"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn dextra_connect_rejected() -> Result<(), Box<dyn std::error::Error>> {
         let mut core = new_dextra();
         let t0 = Instant::now();
@@ -1580,7 +1793,11 @@ mod tests {
         let _ = core.pop_transmit(t0).ok_or("no link packet")?;
 
         let mut nak = [0u8; 16];
-        let n = dextra_codec::encode_connect_nak(&mut nak, &cs(), Module::C)?;
+        let n = dextra_codec::encode_connect_nak(
+            &mut nak,
+            LOCAL_IDENTITY,
+            ModuleSlot::Module(Module::C),
+        )?;
         core.handle_input(t0, ADDR_DEXTRA, nak.get(..n).ok_or("n > buf")?)?;
         assert_eq!(core.state_kind(), ClientStateKind::Closed);
 
@@ -1642,7 +1859,7 @@ mod tests {
 
         // DExtra echoes the unlink as a NAK on space module.
         let mut nak = [0u8; 16];
-        let n = dextra_codec::encode_connect_nak(&mut nak, &cs(), Module::C)?;
+        let n = dextra_codec::encode_connect_nak(&mut nak, LOCAL_IDENTITY, ModuleSlot::Empty)?;
         core.handle_input(t0, ADDR_DEXTRA, nak.get(..n).ok_or("n > buf")?)?;
         assert_eq!(core.state_kind(), ClientStateKind::Closed);
 
@@ -1742,11 +1959,7 @@ mod tests {
         assert_eq!(tx.payload.len(), 519);
 
         let mut ack = [0u8; 16];
-        let n = dcs_codec::encode_connect_ack(
-            &mut ack,
-            &Callsign::from_wire_bytes(*b"DCS001  "),
-            Module::C,
-        )?;
+        let n = dcs_codec::encode_connect_ack(&mut ack, LOCAL_IDENTITY, Module::C)?;
         core.handle_input(t0, ADDR_DCS, ack.get(..n).ok_or("n > buf")?)?;
         assert_eq!(core.state_kind(), ClientStateKind::Connected);
 
@@ -1763,11 +1976,8 @@ mod tests {
         let _ = core.pop_transmit(t0).ok_or("no link")?;
 
         let mut nak = [0u8; 16];
-        let n = dcs_codec::encode_connect_nak(
-            &mut nak,
-            &Callsign::from_wire_bytes(*b"DCS001  "),
-            Module::C,
-        )?;
+        let n =
+            dcs_codec::encode_connect_nak(&mut nak, LOCAL_IDENTITY, ModuleSlot::Module(Module::C))?;
         core.handle_input(t0, ADDR_DCS, nak.get(..n).ok_or("n > buf")?)?;
         assert_eq!(core.state_kind(), ClientStateKind::Closed);
 
@@ -1879,12 +2089,24 @@ mod tests {
         assert!(core.pop_event::<DExtra>().is_none());
     }
 
-    // ── Voice TX / RX ────────────────────────────────────────
+    #[test]
+    fn wrong_protocol_marker_preserves_queued_client_event() -> TestResult {
+        let (mut core, now) = connected_dextra()?;
+        let mut bytes = [0_u8; 9];
+        let length = dextra_codec::encode_poll_echo(&mut bytes, &cs())?;
+        core.handle_input(now, ADDR_DEXTRA, bytes.get(..length).ok_or("poll length")?)?;
+        assert!(
+            core.pop_event::<DPlus>().is_none(),
+            "a DPlus marker cannot claim a DExtra event"
+        );
+        assert!(
+            matches!(core.pop_event::<DExtra>(), Some(Event::PollEcho { .. })),
+            "refused marker must leave the original event queued"
+        );
+        Ok(())
+    }
 
-    use crate::error::DcsError;
-    use crate::header::DstarHeader;
-    use crate::types::{StreamId, Suffix};
-    use crate::voice::VoiceFrame;
+    // ── Voice TX / RX ────────────────────────────────────────
 
     #[expect(
         clippy::unwrap_used,
@@ -1900,9 +2122,7 @@ mod tests {
 
     const fn test_header() -> DstarHeader {
         DstarHeader {
-            flag1: 0,
-            flag2: 0,
-            flag3: 0,
+            flags: crate::HeaderFlags::NONE,
             rpt2: Callsign::from_wire_bytes(*b"XRF030 G"),
             rpt1: Callsign::from_wire_bytes(*b"XRF030 C"),
             ur_call: Callsign::from_wire_bytes(*b"CQCQCQ  "),
@@ -1913,16 +2133,7 @@ mod tests {
 
     // ── Junk datagrams must not kill a live session ───────────
 
-    /// REF030 emits a 10-byte packet after every voice EOT, and real
-    /// reflectors send assorted unrecognized traffic (status
-    /// heartbeats, legacy framing). A decode error on any of it must
-    /// be SWALLOWED: propagating it through `?` is what killed the
-    /// tokio shell's run loop in production. The fix lives in the
-    /// three `handle_*_input` arms, but nothing fed junk to a
-    /// CONNECTED session, so a refactor could restore the `?` and no
-    /// test would notice.
-    ///
-    /// The session must survive and stay functional: after the junk,
+    /// Unrecognized datagrams leave a connected session usable: after the junk,
     /// a real voice header still produces a `VoiceStart`.
     ///
     /// Note the codecs dispatch on datagram LENGTH, so a payload that
@@ -2015,7 +2226,7 @@ mod tests {
             &mut voice,
             &test_header(),
             sid(0x1234),
-            0,
+            FrameSequence::ZERO,
             &VoiceFrame::silence(),
             false,
         )?;
@@ -2066,7 +2277,7 @@ mod tests {
     fn dplus_connected_enqueue_send_voice_produces_29_bytes() -> TestResult {
         let (mut core, _) = connected_dplus()?;
         let now = Instant::now();
-        core.enqueue_send_voice(now, sid(0x1234), 5, &VoiceFrame::silence())?;
+        core.enqueue_send_voice(now, sid(0x1234), sequence(5), &VoiceFrame::silence())?;
         let tx = core.pop_transmit(now).ok_or("no voice tx")?;
         assert_eq!(tx.payload.len(), 29, "DPlus voice data is 29 bytes");
         Ok(())
@@ -2076,7 +2287,7 @@ mod tests {
     fn dextra_connected_enqueue_send_voice_produces_27_bytes() -> TestResult {
         let (mut core, _) = connected_dextra()?;
         let now = Instant::now();
-        core.enqueue_send_voice(now, sid(0x1234), 5, &VoiceFrame::silence())?;
+        core.enqueue_send_voice(now, sid(0x1234), sequence(5), &VoiceFrame::silence())?;
         let tx = core.pop_transmit(now).ok_or("no voice tx")?;
         assert_eq!(tx.payload.len(), 27, "DExtra voice data is 27 bytes");
         Ok(())
@@ -2088,7 +2299,7 @@ mod tests {
     fn dplus_connected_enqueue_send_eot_produces_32_bytes() -> TestResult {
         let (mut core, _) = connected_dplus()?;
         let now = Instant::now();
-        core.enqueue_send_eot(now, sid(0x1234), 21)?;
+        core.enqueue_send_eot(now, sid(0x1234), FrameSequence::ZERO)?;
         let tx = core.pop_transmit(now).ok_or("no eot tx")?;
         assert_eq!(tx.payload.len(), 32, "DPlus voice EOT is 32 bytes");
         Ok(())
@@ -2098,7 +2309,7 @@ mod tests {
     fn dextra_connected_enqueue_send_eot_produces_27_bytes() -> TestResult {
         let (mut core, _) = connected_dextra()?;
         let now = Instant::now();
-        core.enqueue_send_eot(now, sid(0x1234), 21)?;
+        core.enqueue_send_eot(now, sid(0x1234), FrameSequence::ZERO)?;
         let tx = core.pop_transmit(now).ok_or("no eot tx")?;
         assert_eq!(tx.payload.len(), 27, "DExtra voice EOT is 27 bytes");
         Ok(())
@@ -2110,7 +2321,7 @@ mod tests {
     fn dcs_send_voice_without_header_errors() -> TestResult {
         let (mut core, _) = connected_dcs()?;
         let now = Instant::now();
-        let result = core.enqueue_send_voice(now, sid(0x1234), 1, &VoiceFrame::silence());
+        let result = core.enqueue_send_voice(now, sid(0x1234), sequence(1), &VoiceFrame::silence());
         assert!(
             matches!(
                 result,
@@ -2125,7 +2336,7 @@ mod tests {
     fn dcs_send_eot_without_header_errors() -> TestResult {
         let (mut core, _) = connected_dcs()?;
         let now = Instant::now();
-        let result = core.enqueue_send_eot(now, sid(0x1234), 1);
+        let result = core.enqueue_send_eot(now, sid(0x1234), sequence(1));
         assert!(
             matches!(
                 result,
@@ -2142,7 +2353,7 @@ mod tests {
         let now = Instant::now();
         core.enqueue_send_header(now, &test_header(), sid(0x1234))?;
         let _ = core.pop_transmit(now).ok_or("no header tx")?;
-        core.enqueue_send_voice(now, sid(0x1234), 1, &VoiceFrame::silence())?;
+        core.enqueue_send_voice(now, sid(0x1234), sequence(1), &VoiceFrame::silence())?;
         let voice_tx = core.pop_transmit(now).ok_or("no voice tx")?;
         assert_eq!(voice_tx.payload.len(), 100);
         Ok(())
@@ -2154,7 +2365,7 @@ mod tests {
         let now = Instant::now();
         core.enqueue_send_header(now, &test_header(), sid(0x1234))?;
         let _ = core.pop_transmit(now).ok_or("no header tx")?;
-        core.enqueue_send_eot(now, sid(0x1234), 21)?;
+        core.enqueue_send_eot(now, sid(0x1234), FrameSequence::ZERO)?;
         let eot_tx = core.pop_transmit(now).ok_or("no eot tx")?;
         assert_eq!(eot_tx.payload.len(), 100);
         Ok(())
@@ -2177,7 +2388,7 @@ mod tests {
     fn enqueue_send_voice_in_configured_state_errors() {
         let mut core = new_dextra();
         let now = Instant::now();
-        let result = core.enqueue_send_voice(now, sid(0x1234), 1, &VoiceFrame::silence());
+        let result = core.enqueue_send_voice(now, sid(0x1234), sequence(1), &VoiceFrame::silence());
         assert!(matches!(
             result,
             Err(Error::State(StateError::WrongState { .. }))
@@ -2188,7 +2399,7 @@ mod tests {
     fn enqueue_send_eot_in_configured_state_errors() {
         let mut core = new_dextra();
         let now = Instant::now();
-        let result = core.enqueue_send_eot(now, sid(0x1234), 1);
+        let result = core.enqueue_send_eot(now, sid(0x1234), sequence(1));
         assert!(matches!(
             result,
             Err(Error::State(StateError::WrongState { .. }))
@@ -2211,13 +2422,7 @@ mod tests {
 
     #[test]
     fn dextra_retransmitted_voice_header_does_not_re_emit_voice_start() -> TestResult {
-        // Regression test: D-STAR voice headers are retransmitted by
-        // reflectors every superframe (~21 frames / 420 ms) so late
-        // joiners can decode. The previous client emitted VoiceStart
-        // on every header packet, which reset per-stream decoder
-        // state in the consumer (heard as "first ~80 ms of the
-        // stream repeating over and over"). The fix is to track the
-        // currently-active stream and suppress duplicate headers.
+        // Retransmitted headers retain the active stream and its decoder state.
         let (mut core, _) = connected_dextra()?;
         let now = Instant::now();
         let mut buf = [0u8; 64];
@@ -2282,13 +2487,18 @@ mod tests {
         let mut buf = [0u8; 64];
         let n = dextra_codec::encode_voice_header(&mut buf, sid(0xAAAA), &test_header())?;
         core.handle_input(now, ADDR_DEXTRA, buf.get(..n).ok_or("n > buf")?)?;
-        let n = dextra_codec::encode_voice_data(&mut buf, sid(0xAAAA), 1, &VoiceFrame::silence())?;
+        let n = dextra_codec::encode_voice_data(
+            &mut buf,
+            sid(0xAAAA),
+            sequence(1),
+            &VoiceFrame::silence(),
+        )?;
         core.handle_input(
             now + Duration::from_millis(20),
             ADDR_DEXTRA,
             buf.get(..n).ok_or("n > buf")?,
         )?;
-        // Drain the two events we expect for stream A.
+        // Drain stream A's start and frame events.
         drop(core.pop_event::<DExtra>().ok_or("no VoiceStart")?);
         drop(core.pop_event::<DExtra>().ok_or("no VoiceFrame")?);
         // B's header arrives only 50 ms after A's last activity,
@@ -2305,7 +2515,12 @@ mod tests {
             "concurrent stream's header must not emit any event"
         );
         // And a voice frame for B is dropped silently too.
-        let n = dextra_codec::encode_voice_data(&mut buf, sid(0xBBBB), 2, &VoiceFrame::silence())?;
+        let n = dextra_codec::encode_voice_data(
+            &mut buf,
+            sid(0xBBBB),
+            sequence(2),
+            &VoiceFrame::silence(),
+        )?;
         core.handle_input(
             now + Duration::from_millis(80),
             ADDR_DEXTRA,
@@ -2317,7 +2532,7 @@ mod tests {
         );
         // A's EOT ends the active stream normally; B's EOT (if it
         // arrived) would be ignored as non-active.
-        let n = dextra_codec::encode_voice_eot(&mut buf, sid(0xAAAA), 21)?;
+        let n = dextra_codec::encode_voice_eot(&mut buf, sid(0xAAAA), FrameSequence::ZERO)?;
         core.handle_input(
             now + Duration::from_millis(100),
             ADDR_DEXTRA,
@@ -2342,7 +2557,12 @@ mod tests {
         let n = dextra_codec::encode_voice_header(&mut buf, sid(0x1234), &test_header())?;
         core.handle_input(now, ADDR_DEXTRA, buf.get(..n).ok_or("n > buf")?)?;
         drop(core.pop_event::<DExtra>().ok_or("no VoiceStart")?);
-        let n = dextra_codec::encode_voice_data(&mut buf, sid(0x1234), 7, &VoiceFrame::silence())?;
+        let n = dextra_codec::encode_voice_data(
+            &mut buf,
+            sid(0x1234),
+            sequence(7),
+            &VoiceFrame::silence(),
+        )?;
         core.handle_input(now, ADDR_DEXTRA, buf.get(..n).ok_or("n > buf")?)?;
         let event = core.pop_event::<DExtra>().ok_or("no event")?;
         assert!(
@@ -2361,7 +2581,7 @@ mod tests {
         let n = dextra_codec::encode_voice_header(&mut buf, sid(0x1234), &test_header())?;
         core.handle_input(now, ADDR_DEXTRA, buf.get(..n).ok_or("n > buf")?)?;
         drop(core.pop_event::<DExtra>().ok_or("no VoiceStart")?);
-        let n = dextra_codec::encode_voice_eot(&mut buf, sid(0x1234), 21)?;
+        let n = dextra_codec::encode_voice_eot(&mut buf, sid(0x1234), FrameSequence::ZERO)?;
         core.handle_input(now, ADDR_DEXTRA, buf.get(..n).ok_or("n > buf")?)?;
         let event = core.pop_event::<DExtra>().ok_or("no event")?;
         assert!(
@@ -2391,14 +2611,14 @@ mod tests {
                 let n = dextra_codec::encode_voice_data(
                     &mut buf,
                     sid(0x19C9),
-                    seq,
+                    sequence(seq),
                     &VoiceFrame::silence(),
                 )?;
                 core.handle_input(now, ADDR_DEXTRA, buf.get(..n).ok_or("n > buf")?)?;
             }
         }
         // Then EOT.
-        let n = dextra_codec::encode_voice_eot(&mut buf, sid(0x19C9), 21)?;
+        let n = dextra_codec::encode_voice_eot(&mut buf, sid(0x19C9), FrameSequence::ZERO)?;
         core.handle_input(now, ADDR_DEXTRA, buf.get(..n).ok_or("n > buf")?)?;
 
         // Drain events and count per variant.
@@ -2463,7 +2683,7 @@ mod tests {
             let n = dextra_codec::encode_voice_data(
                 &mut buf,
                 sid(0x2BE9),
-                seq,
+                sequence(seq),
                 &VoiceFrame::silence(),
             )?;
             core.handle_input(
@@ -2529,7 +2749,7 @@ mod tests {
                     &mut buf,
                     &test_header(),
                     sid(0x789A),
-                    seq,
+                    sequence(seq),
                     &non_silence_frame(),
                     false,
                 )?;
@@ -2542,7 +2762,7 @@ mod tests {
             &mut buf,
             &test_header(),
             sid(0x789A),
-            21,
+            FrameSequence::ZERO,
             &VoiceFrame::silence(),
             true,
         )?;
@@ -2603,7 +2823,7 @@ mod tests {
         let n = dplus_codec::encode_voice_header(&mut buf, sid(0x4567), &test_header())?;
         core.handle_input(now, ADDR_DPLUS, buf.get(..n).ok_or("n > buf")?)?;
         drop(core.pop_event::<DPlus>().ok_or("no VoiceStart")?);
-        let n = dplus_codec::encode_voice_eot(&mut buf, sid(0x4567), 21)?;
+        let n = dplus_codec::encode_voice_eot(&mut buf, sid(0x4567), FrameSequence::ZERO)?;
         core.handle_input(now, ADDR_DPLUS, buf.get(..n).ok_or("n > buf")?)?;
         let event = core.pop_event::<DPlus>().ok_or("no event")?;
         assert!(matches!(event, Event::VoiceEnd { .. }));
@@ -2626,7 +2846,7 @@ mod tests {
             &mut buf,
             &test_header(),
             sid(0x789A),
-            0,
+            FrameSequence::ZERO,
             &non_silence_frame(),
             false,
         )?;
@@ -2650,7 +2870,7 @@ mod tests {
             &mut buf,
             &test_header(),
             sid(0x789A),
-            5,
+            sequence(5),
             &non_silence_frame(),
             false,
         )?;
@@ -2684,7 +2904,7 @@ mod tests {
             &mut buf,
             &test_header(),
             sid(0x789A),
-            0,
+            FrameSequence::ZERO,
             &non_silence_frame(),
             false,
         )?;
@@ -2695,7 +2915,7 @@ mod tests {
             &mut buf,
             &test_header(),
             sid(0x789A),
-            21,
+            FrameSequence::ZERO,
             &VoiceFrame::silence(),
             true,
         )?;

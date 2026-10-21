@@ -22,8 +22,9 @@ use crate::voice::VoiceFrame;
 /// Default recording cap: 60 seconds at 50 frames per second.
 pub const DEFAULT_MAX_FRAMES: usize = 60 * 50;
 
-/// Default pause between the recorded stream's end and playback,
-/// per ircDDBGateway `REPLY_TIME`.
+/// Local playback policy: wait 500 ms after the recorded stream ends.
+///
+/// This is shorter than ircDDBGateway's two-second `REPLY_TIME`.
 pub const DEFAULT_REPLY_DELAY: Duration = Duration::from_millis(500);
 
 /// The UR field value that requests an echo test.
@@ -186,9 +187,7 @@ impl EchoUnit {
         };
         Some(EchoPlayback {
             header: DstarHeader {
-                flag1: header.flag1,
-                flag2: header.flag2,
-                flag3: header.flag3,
+                flags: header.flags,
                 rpt2: header.rpt2,
                 rpt1: header.rpt1,
                 ur_call: Callsign::from_wire_bytes(*b"CQCQCQ  "),
@@ -206,9 +205,7 @@ mod tests {
 
     fn request_header() -> DstarHeader {
         DstarHeader {
-            flag1: 0x40,
-            flag2: 0x01,
-            flag3: 0x02,
+            flags: crate::HeaderFlags::from_bytes([0x40, 0x01, 0x02]),
             rpt2: Callsign::from_wire_bytes(*b"XRF001 G"),
             rpt1: Callsign::from_wire_bytes(*b"XRF001 B"),
             ur_call: Callsign::from_wire_bytes(ECHO_UR),
@@ -265,7 +262,7 @@ mod tests {
             Callsign::from_wire_bytes(*b"CQCQCQ  ")
         );
         // Original flags and repeater fields ride along unchanged.
-        assert_eq!(playback.header.flag1, 0x40);
+        assert_eq!(playback.header.flags.as_bytes(), &[0x40, 0x01, 0x02]);
         assert_eq!(
             playback.header.rpt1,
             Callsign::from_wire_bytes(*b"XRF001 B")

@@ -109,14 +109,6 @@ impl AsRef<[u8; MAX_MESSAGE_LEN]> for SlowDataTextMessage {
     }
 }
 
-impl std::ops::Deref for SlowDataTextMessage {
-    type Target = [u8; MAX_MESSAGE_LEN];
-
-    fn deref(&self) -> &Self::Target {
-        self.as_bytes()
-    }
-}
-
 impl std::fmt::Debug for SlowDataTextMessage {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -132,21 +124,21 @@ impl std::fmt::Debug for SlowDataTextMessage {
 /// This is the block-level representation produced by
 /// [`super::SlowDataAssembler`]. A complete radio message is represented by
 /// [`SlowDataTextMessage`] instead.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SlowDataText {
-    bytes: Vec<u8>,
+    bytes: [u8; 5],
 }
 
 impl SlowDataText {
     /// Preserve one decoded block payload exactly.
     #[must_use]
-    pub const fn from_wire_bytes(bytes: Vec<u8>) -> Self {
+    pub const fn from_wire_bytes(bytes: [u8; 5]) -> Self {
         Self { bytes }
     }
 
     /// Return the exact decoded block payload.
     #[must_use]
-    pub fn as_bytes(&self) -> &[u8] {
+    pub const fn as_bytes(&self) -> &[u8; 5] {
         &self.bytes
     }
 
@@ -157,6 +149,24 @@ impl SlowDataText {
     /// Returns [`WireTextError`] at the first byte outside printable ASCII.
     pub fn text(&self) -> Result<&str, WireTextError> {
         trimmed_printable_ascii(&self.bytes)
+    }
+}
+
+impl AsRef<[u8; 5]> for SlowDataText {
+    fn as_ref(&self) -> &[u8; 5] {
+        self.as_bytes()
+    }
+}
+
+impl From<[u8; 5]> for SlowDataText {
+    fn from(bytes: [u8; 5]) -> Self {
+        Self::from_wire_bytes(bytes)
+    }
+}
+
+impl From<SlowDataText> for [u8; 5] {
+    fn from(value: SlowDataText) -> Self {
+        value.bytes
     }
 }
 
@@ -235,8 +245,8 @@ mod tests {
 
     #[test]
     fn block_text_preserves_control_byte_and_rejects_text_view() {
-        let text = SlowDataText::from_wire_bytes(vec![b'A', 0, b'B']);
-        assert_eq!(text.as_bytes(), &[b'A', 0, b'B']);
+        let text = SlowDataText::from_wire_bytes([b'A', 0, b'B', b' ', b' ']);
+        assert_eq!(text.as_bytes(), &[b'A', 0, b'B', b' ', b' ']);
         assert_eq!(text.text(), Err(WireTextError { index: 1, byte: 0 }));
     }
 }

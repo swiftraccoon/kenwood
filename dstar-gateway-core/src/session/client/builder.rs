@@ -1,222 +1,181 @@
-//! Typed [`SessionBuilder`] for [`Session<P, Configured>`].
-//!
-//! The typestate builder uses marker types to track which required
-//! fields have been set. Each setter consumes `self` and returns a new
-//! [`SessionBuilder`] with the corresponding marker type flipped from
-//! [`Missing`] to [`Provided`]. The [`SessionBuilder::build`] method
-//! is only implemented on
-//! `SessionBuilder<P, Provided, Provided, Provided, Provided>`; a
-//! missing field turns `.build()` into a compile error.
+//! Required-field builder for typed client sessions.
 
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 
-use crate::types::{Callsign, Module};
+use crate::types::{DcsReflector, Module, RoutingCallsign};
 
-use super::core::SessionCore;
-use super::protocol::Protocol;
-use super::session::Session;
-use super::state::Configured;
+use super::{
+    ClientProtocol, Configured, DExtra, DPlus, Dcs, Protocol, Session, SessionConfig, SessionCore,
+};
 
-/// Marker indicating a required builder field has NOT been set.
-#[derive(Debug)]
+/// A required builder input has not been supplied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Missing;
 
-/// Marker indicating a required builder field HAS been set.
-#[derive(Debug)]
+/// A required builder input has been supplied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Provided;
 
-/// Typestate builder for [`Session<P, Configured>`].
+/// Builder for [`Session<P, Configured>`], with compile-time required inputs.
 ///
-/// Parameters:
-///
-/// - `P`: protocol marker ([`super::DPlus`], [`super::DExtra`],
-///   [`super::Dcs`])
-/// - `Cs`: [`Missing`] or [`Provided`], tracks whether the callsign
-///   has been set
-/// - `Lm`: tracks local module
-/// - `Rm`: tracks reflector module
-/// - `Pe`: tracks peer address
-///
-/// All four `Missing`/`Provided` type parameters start as
-/// [`Missing`] and must be flipped to [`Provided`] before
-/// [`Self::build`] becomes callable. The phantoms add zero runtime
-/// cost.
+/// `Cs`, `Lm`, `Rm`, and `Pe` track callsign, local module, reflector module
+/// and peer. `Rc` tracks the additional target identity required only by DCS.
+/// Setters consume the builder; [`Missing`] inputs prevent `build`.
 #[derive(Debug)]
-pub struct SessionBuilder<P: Protocol, Cs, Lm, Rm, Pe> {
-    callsign: Option<Callsign>,
+pub struct SessionBuilder<P, Cs, Lm, Rm, Pe, Rc = Missing> {
+    callsign: Option<RoutingCallsign>,
     local_module: Option<Module>,
     reflector_module: Option<Module>,
     peer: Option<SocketAddr>,
-    /// Optional reflector callsign, only required for `DCS`
-    /// sessions targeting a non-`DCS001` reflector. `None` means
-    /// `SessionCore` falls back to its `DCS001  ` default (and
-    /// logs a warning if the protocol is `DCS`).
-    reflector_callsign: Option<Callsign>,
-    _protocol: PhantomData<P>,
-    _cs: PhantomData<Cs>,
-    _lm: PhantomData<Lm>,
-    _rm: PhantomData<Rm>,
-    _pe: PhantomData<Pe>,
+    dcs_reflector: Option<DcsReflector>,
+    marker: PhantomData<(P, Cs, Lm, Rm, Pe, Rc)>,
 }
 
-impl<P: Protocol, Cs, Lm, Rm, Pe> SessionBuilder<P, Cs, Lm, Rm, Pe> {
-    /// Set the station callsign.
+impl<P: Protocol, Cs, Lm, Rm, Pe, Rc> SessionBuilder<P, Cs, Lm, Rm, Pe, Rc> {
+    /// Set the checked local callsign prefix.
     #[must_use]
-    pub const fn callsign(self, callsign: Callsign) -> SessionBuilder<P, Provided, Lm, Rm, Pe> {
+    pub const fn callsign(
+        self,
+        callsign: RoutingCallsign,
+    ) -> SessionBuilder<P, Provided, Lm, Rm, Pe, Rc> {
         SessionBuilder {
             callsign: Some(callsign),
             local_module: self.local_module,
             reflector_module: self.reflector_module,
             peer: self.peer,
-            reflector_callsign: self.reflector_callsign,
-            _protocol: PhantomData,
-            _cs: PhantomData,
-            _lm: PhantomData,
-            _rm: PhantomData,
-            _pe: PhantomData,
+            dcs_reflector: self.dcs_reflector,
+            marker: PhantomData,
         }
     }
 
-    /// Set the local module letter (the module on the client side).
+    /// Set the local module letter.
     #[must_use]
-    pub const fn local_module(self, module: Module) -> SessionBuilder<P, Cs, Provided, Rm, Pe> {
+    pub const fn local_module(self, module: Module) -> SessionBuilder<P, Cs, Provided, Rm, Pe, Rc> {
         SessionBuilder {
             callsign: self.callsign,
             local_module: Some(module),
             reflector_module: self.reflector_module,
             peer: self.peer,
-            reflector_callsign: self.reflector_callsign,
-            _protocol: PhantomData,
-            _cs: PhantomData,
-            _lm: PhantomData,
-            _rm: PhantomData,
-            _pe: PhantomData,
+            dcs_reflector: self.dcs_reflector,
+            marker: PhantomData,
         }
     }
 
-    /// Set the reflector module letter (the module to link to).
+    /// Set the target reflector module.
     #[must_use]
-    pub const fn reflector_module(self, module: Module) -> SessionBuilder<P, Cs, Lm, Provided, Pe> {
+    pub const fn reflector_module(
+        self,
+        module: Module,
+    ) -> SessionBuilder<P, Cs, Lm, Provided, Pe, Rc> {
         SessionBuilder {
             callsign: self.callsign,
             local_module: self.local_module,
             reflector_module: Some(module),
             peer: self.peer,
-            reflector_callsign: self.reflector_callsign,
-            _protocol: PhantomData,
-            _cs: PhantomData,
-            _lm: PhantomData,
-            _rm: PhantomData,
-            _pe: PhantomData,
+            dcs_reflector: self.dcs_reflector,
+            marker: PhantomData,
         }
     }
 
-    /// Set the reflector peer address.
+    /// Set the remote UDP endpoint.
     #[must_use]
-    pub const fn peer(self, peer: SocketAddr) -> SessionBuilder<P, Cs, Lm, Rm, Provided> {
+    pub const fn peer(self, peer: SocketAddr) -> SessionBuilder<P, Cs, Lm, Rm, Provided, Rc> {
         SessionBuilder {
             callsign: self.callsign,
             local_module: self.local_module,
             reflector_module: self.reflector_module,
             peer: Some(peer),
-            reflector_callsign: self.reflector_callsign,
-            _protocol: PhantomData,
-            _cs: PhantomData,
-            _lm: PhantomData,
-            _rm: PhantomData,
-            _pe: PhantomData,
+            dcs_reflector: self.dcs_reflector,
+            marker: PhantomData,
         }
-    }
-
-    /// Set the target reflector's own callsign.
-    ///
-    /// **Required for `DCS` sessions targeting any reflector other
-    /// than `DCS001`.** The DCS wire format embeds the reflector
-    /// callsign in every LINK / UNLINK / POLL packet, and a real
-    /// `DCS030` reflector will silently drop traffic whose embedded
-    /// reflector callsign reads `DCS001  `. For `DPlus` and
-    /// `DExtra` this is metadata only: the protocols do not carry
-    /// the reflector callsign on the wire, so the setter is
-    /// harmless when unused.
-    ///
-    /// Unlike the four required fields, this setter does not flip
-    /// a typestate marker; sessions that do not need a reflector
-    /// callsign keep building with four setters, and DCS sessions
-    /// that forget it get a runtime warning at construction time
-    /// plus a `DCS001  ` fallback. Upgrading this to a compile-time
-    /// requirement for `Session<Dcs, _>` specifically is a future
-    /// design refinement.
-    #[must_use]
-    pub const fn reflector_callsign(mut self, reflector_callsign: Callsign) -> Self {
-        self.reflector_callsign = Some(reflector_callsign);
-        self
     }
 }
 
-impl<P: Protocol> SessionBuilder<P, Provided, Provided, Provided, Provided> {
-    /// Build the [`Session<P, Configured>`].
-    ///
-    /// Only callable when all four required fields have been set;
-    /// any [`Missing`] marker turns this into a compile error.
-    ///
-    /// The [`Provided`] type parameters are the typestate proof that
-    /// every field was set; the `Option` unwrapping below is
-    /// therefore infallible at the type level, so the impossible
-    /// branches use [`unreachable!`] rather than
-    /// [`Option::expect`] (which is lint-denied in lib code).
+impl<Cs, Lm, Rm, Pe, Rc> SessionBuilder<Dcs, Cs, Lm, Rm, Pe, Rc> {
+    /// Supply the exact DCS reflector identity carried in LINK/UNLINK/POLL.
     #[must_use]
-    pub fn build(self) -> Session<P, Configured> {
-        let Some(callsign) = self.callsign else {
-            unreachable!("Provided marker guarantees callsign is Some");
+    pub const fn dcs_reflector(
+        self,
+        target: DcsReflector,
+    ) -> SessionBuilder<Dcs, Cs, Lm, Rm, Pe, Provided> {
+        SessionBuilder {
+            callsign: self.callsign,
+            local_module: self.local_module,
+            reflector_module: self.reflector_module,
+            peer: self.peer,
+            dcs_reflector: Some(target),
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<P: Protocol, Rc> SessionBuilder<P, Provided, Provided, Provided, Provided, Rc> {
+    fn finish(self, protocol: ClientProtocol) -> Session<P, Configured> {
+        let (Some(callsign), Some(local_module), Some(reflector_module), Some(peer)) = (
+            self.callsign,
+            self.local_module,
+            self.reflector_module,
+            self.peer,
+        ) else {
+            unreachable!("Provided markers require every common field");
         };
-        let Some(local_module) = self.local_module else {
-            unreachable!("Provided marker guarantees local_module is Some");
-        };
-        let Some(reflector_module) = self.reflector_module else {
-            unreachable!("Provided marker guarantees reflector_module is Some");
-        };
-        let Some(peer) = self.peer else {
-            unreachable!("Provided marker guarantees peer is Some");
-        };
-        let core = SessionCore::new_with_reflector_callsign(
-            P::KIND,
-            callsign,
-            local_module,
-            reflector_module,
-            peer,
-            self.reflector_callsign,
-        );
         Session {
-            inner: core,
+            inner: SessionCore::new(SessionConfig {
+                protocol,
+                callsign,
+                local_module,
+                reflector_module,
+                peer,
+            }),
             _protocol: PhantomData,
             _state: PhantomData,
         }
     }
 }
 
+impl SessionBuilder<DPlus, Provided, Provided, Provided, Provided> {
+    /// Build a configured D-Plus session after all four common setters.
+    #[must_use]
+    pub fn build(self) -> Session<DPlus, Configured> {
+        self.finish(ClientProtocol::DPlus)
+    }
+}
+
+impl SessionBuilder<DExtra, Provided, Provided, Provided, Provided> {
+    /// Build a configured `DExtra` session after all four common setters.
+    #[must_use]
+    pub fn build(self) -> Session<DExtra, Configured> {
+        self.finish(ClientProtocol::DExtra)
+    }
+}
+
+impl SessionBuilder<Dcs, Provided, Provided, Provided, Provided, Provided> {
+    /// Build a configured DCS session after all five required setters.
+    #[must_use]
+    pub fn build(self) -> Session<Dcs, Configured> {
+        let Some(target) = self.dcs_reflector else {
+            unreachable!("Provided target marker");
+        };
+        self.finish(ClientProtocol::Dcs(target))
+    }
+}
+
 impl<P: Protocol> Session<P, Configured> {
-    /// Entry point for building a typed [`Session<P, Configured>`].
+    /// Start a builder requiring callsign, both modules and the remote endpoint.
     ///
-    /// Returns a builder with every required field marked
-    /// [`Missing`]. Chain `.callsign()`, `.local_module()`,
-    /// `.reflector_module()`, and `.peer()` in any order, then call
-    /// `.build()`. Skipping any of the four setters turns the
-    /// `.build()` call into a compile error.
-    ///
-    /// # Example
+    /// DCS additionally requires [`SessionBuilder::dcs_reflector`].
     ///
     /// ```
-    /// use dstar_gateway_core::session::client::{Configured, DExtra, Session};
-    /// use dstar_gateway_core::types::{Callsign, Module};
-    ///
-    /// let session: Session<DExtra, Configured> =
-    ///     Session::<DExtra, Configured>::builder()
-    ///         .callsign(Callsign::try_from_str("W1AW")?)
-    ///         .local_module(Module::try_from_char('B')?)
-    ///         .reflector_module(Module::try_from_char('C')?)
-    ///         .peer("127.0.0.1:30001".parse()?)
-    ///         .build();
+    /// use dstar_gateway_core::{Configured, Dcs, DcsReflector, Module, RoutingCallsign, Session};
+    /// let session = Session::<Dcs, Configured>::builder()
+    ///     .callsign(RoutingCallsign::new("W1AW")?)
+    ///     .local_module(Module::B)
+    ///     .reflector_module(Module::C)
+    ///     .peer("127.0.0.1:30051".parse()?)
+    ///     .dcs_reflector(DcsReflector::new("DCS030")?)
+    ///     .build();
+    /// assert_eq!(session.peer().port(), 30051);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     #[must_use]
@@ -226,12 +185,8 @@ impl<P: Protocol> Session<P, Configured> {
             local_module: None,
             reflector_module: None,
             peer: None,
-            reflector_callsign: None,
-            _protocol: PhantomData,
-            _cs: PhantomData,
-            _lm: PhantomData,
-            _rm: PhantomData,
-            _pe: PhantomData,
+            dcs_reflector: None,
+            marker: PhantomData,
         }
     }
 }
@@ -239,47 +194,83 @@ impl<P: Protocol> Session<P, Configured> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::client::protocol::{DExtra, DPlus};
-    use crate::session::client::state::ClientStateKind;
+    use crate::ClientStateKind;
     use std::net::{IpAddr, Ipv4Addr};
 
-    const CS: Callsign = Callsign::from_wire_bytes(*b"W1AW    ");
+    const CS: RoutingCallsign = match RoutingCallsign::from_padded_bytes(*b"W1AW   ") {
+        Ok(callsign) => callsign,
+        Err(_) => unreachable!(),
+    };
     const ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30001);
-    const ADDR_DPLUS: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 20001);
 
     #[test]
-    fn dextra_builder_happy_path() {
-        let session = Session::<DExtra, Configured>::builder()
-            .callsign(CS)
-            .local_module(Module::B)
-            .reflector_module(Module::C)
-            .peer(ADDR)
-            .build();
-        assert_eq!(session.state_kind(), ClientStateKind::Configured);
-        assert_eq!(session.peer(), ADDR);
-        assert_eq!(session.local_callsign(), CS);
-    }
-
-    #[test]
-    fn dextra_builder_field_order_independent() {
-        // Same as above but setters in a different order.
-        let session = Session::<DExtra, Configured>::builder()
+    fn builders_preserve_order_independence_and_protocol_configuration() {
+        let dextra = Session::<DExtra, Configured>::builder()
             .peer(ADDR)
             .reflector_module(Module::C)
             .local_module(Module::B)
             .callsign(CS)
             .build();
-        assert_eq!(session.state_kind(), ClientStateKind::Configured);
-    }
-
-    #[test]
-    fn dplus_builder_builds_configured() {
-        let session = Session::<DPlus, Configured>::builder()
+        assert_eq!(dextra.state_kind(), ClientStateKind::Configured);
+        assert_eq!(dextra.local_callsign(), CS.callsign());
+        let dplus = Session::<DPlus, Configured>::builder()
             .callsign(CS)
             .local_module(Module::B)
             .reflector_module(Module::C)
-            .peer(ADDR_DPLUS)
+            .peer(ADDR)
             .build();
-        assert_eq!(session.state_kind(), ClientStateKind::Configured);
+        assert_eq!(dplus.state_kind(), ClientStateKind::Configured);
+    }
+
+    #[test]
+    fn dcs_target_is_preserved_in_link_poll_and_unlink() -> Result<(), Box<dyn std::error::Error>> {
+        let target = DcsReflector::new("dcs030")?;
+        assert_eq!(target.callsign().text(), Ok("DCS030"));
+        assert!(DcsReflector::new("REF030").is_err());
+        assert!(DcsReflector::new("DCS030AB").is_err());
+        let mut core = Session::<Dcs, Configured>::builder()
+            .callsign(CS)
+            .local_module(Module::B)
+            .reflector_module(Module::C)
+            .peer(ADDR)
+            .dcs_reflector(target)
+            .build()
+            .inner;
+        let now = std::time::Instant::now();
+        core.enqueue_connect(now)?;
+        let link = core.pop_transmit(now).ok_or("LINK missing")?;
+        assert_eq!(
+            link.payload.get(11..19),
+            Some(b"DCS030  ".as_slice()),
+            "LINK must use its configured target"
+        );
+        let mut reply = [0_u8; 14];
+        let length = crate::codec::dcs::encode_connect_ack(
+            &mut reply,
+            crate::RepeaterIdentity {
+                callsign: CS,
+                module: Module::B,
+            },
+            Module::C,
+        )?;
+        core.handle_input(now, ADDR, reply.get(..length).ok_or("ACK length")?)?;
+        let poll_time = now
+            .checked_add(crate::codec::dcs::consts::KEEPALIVE_INTERVAL)
+            .ok_or("poll deadline")?;
+        core.handle_timeout(poll_time);
+        let poll = core.pop_transmit(poll_time).ok_or("POLL missing")?;
+        assert_eq!(
+            poll.payload.get(9..17),
+            Some(b"DCS030  ".as_slice()),
+            "POLL must use its configured target"
+        );
+        core.enqueue_disconnect(poll_time)?;
+        let unlink = core.pop_transmit(poll_time).ok_or("UNLINK missing")?;
+        assert_eq!(
+            unlink.payload.get(11..19),
+            Some(b"DCS030  ".as_slice()),
+            "UNLINK must use its configured target"
+        );
+        Ok(())
     }
 }

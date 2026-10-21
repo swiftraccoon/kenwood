@@ -5,7 +5,7 @@
 
 use crate::error::EncodeError;
 use crate::header::DstarHeader;
-use crate::types::{Callsign, Module, StreamId};
+use crate::types::{Callsign, FrameSequence, Module, ModuleSlot, RepeaterIdentity, StreamId};
 use crate::voice::{AMBE_SILENCE, DSTAR_SYNC_BYTES, VoiceFrame};
 
 use super::consts::{
@@ -35,11 +35,10 @@ use super::consts::{
 /// mirrors.
 pub fn encode_connect_link(
     out: &mut [u8],
-    callsign: &Callsign,
+    identity: RepeaterIdentity,
     reflector_module: Module,
-    client_module: Module,
 ) -> Result<usize, EncodeError> {
-    write_connect_common(out, *callsign, client_module, reflector_module.as_byte())?;
+    write_connect_common(out, identity, ModuleSlot::Module(reflector_module))?;
     Ok(CONNECT_LEN)
 }
 
@@ -56,12 +55,8 @@ pub fn encode_connect_link(
 ///
 /// `ircDDBGateway/Common/ConnectData.cpp:298-300` (`getDExtraData`
 /// `CT_UNLINK` branch).
-pub fn encode_unlink(
-    out: &mut [u8],
-    callsign: &Callsign,
-    client_module: Module,
-) -> Result<usize, EncodeError> {
-    write_connect_common(out, *callsign, client_module, b' ')?;
+pub fn encode_unlink(out: &mut [u8], identity: RepeaterIdentity) -> Result<usize, EncodeError> {
+    write_connect_common(out, identity, ModuleSlot::Empty)?;
     Ok(CONNECT_LEN)
 }
 
@@ -87,10 +82,15 @@ pub fn encode_unlink(
 /// `CT_ACK` branch) for the reference encoder.
 pub fn encode_connect_ack(
     out: &mut [u8],
-    callsign: &Callsign,
+    identity: RepeaterIdentity,
     reflector_module: Module,
 ) -> Result<usize, EncodeError> {
-    write_connect_reply(out, *callsign, reflector_module, CONNECT_ACK_TAG)?;
+    write_connect_reply(
+        out,
+        identity,
+        ModuleSlot::Module(reflector_module),
+        CONNECT_ACK_TAG,
+    )?;
     Ok(CONNECT_REPLY_LEN)
 }
 
@@ -108,10 +108,10 @@ pub fn encode_connect_ack(
 /// `CT_NAK` branch).
 pub fn encode_connect_nak(
     out: &mut [u8],
-    callsign: &Callsign,
-    reflector_module: Module,
+    identity: RepeaterIdentity,
+    reflector_module: ModuleSlot,
 ) -> Result<usize, EncodeError> {
-    write_connect_reply(out, *callsign, reflector_module, CONNECT_NAK_TAG)?;
+    write_connect_reply(out, identity, reflector_module, CONNECT_NAK_TAG)?;
     Ok(CONNECT_REPLY_LEN)
 }
 
@@ -260,7 +260,7 @@ pub fn encode_voice_header(
 pub fn encode_voice_data(
     out: &mut [u8],
     stream_id: StreamId,
-    seq: u8,
+    seq: FrameSequence,
     frame: &VoiceFrame,
 ) -> Result<usize, EncodeError> {
     if out.len() < VOICE_DATA_LEN {
@@ -269,7 +269,7 @@ pub fn encode_voice_data(
             have: out.len(),
         });
     }
-    write_voice_prefix(out, stream_id, seq);
+    write_voice_prefix(out, stream_id, seq.get());
     if let Some(dst) = out.get_mut(15..24) {
         dst.copy_from_slice(&frame.ambe);
     }
@@ -299,7 +299,7 @@ pub fn encode_voice_data(
 pub fn encode_voice_eot(
     out: &mut [u8],
     stream_id: StreamId,
-    seq: u8,
+    seq: FrameSequence,
 ) -> Result<usize, EncodeError> {
     if out.len() < VOICE_EOT_LEN {
         return Err(EncodeError::BufferTooSmall {
@@ -307,7 +307,7 @@ pub fn encode_voice_eot(
             have: out.len(),
         });
     }
-    write_voice_prefix(out, stream_id, seq | 0x40);
+    write_voice_prefix(out, stream_id, seq.get() | 0x40);
     if let Some(dst) = out.get_mut(15..24) {
         dst.copy_from_slice(&AMBE_SILENCE);
     }
@@ -375,9 +375,8 @@ fn write_voice_prefix(out: &mut [u8], stream_id: StreamId, seq: u8) {
 /// ```
 fn write_connect_common(
     out: &mut [u8],
-    callsign: Callsign,
-    client_module: Module,
-    byte9: u8,
+    identity: RepeaterIdentity,
+    reflector_module: ModuleSlot,
 ) -> Result<(), EncodeError> {
     if out.len() < CONNECT_LEN {
         return Err(EncodeError::BufferTooSmall {
@@ -393,24 +392,19 @@ fn write_connect_common(
     if let Some(region) = out.get_mut(..CONNECT_LEN) {
         region.fill(b' ');
     }
-    // out[0..7] = first 7 chars of the callsign. Loop `i < 7` in
-    // the reference, so we intentionally stop at 7 and never touch
-    // out[7].
-    let cs = callsign.as_bytes();
-    if let Some(dst) = out.get_mut(..7)
-        && let Some(src) = cs.get(..7)
-    {
-        dst.copy_from_slice(src);
+    // Copy the seven-byte prefix; byte 7 remains a padding space.
+    if let Some(dst) = out.get_mut(..7) {
+        dst.copy_from_slice(identity.callsign.as_bytes());
     }
     // out[8] = client module letter (= 8th char of repeater per
     // the reference convention).
     if let Some(b) = out.get_mut(8) {
-        *b = client_module.as_byte();
+        *b = identity.module.as_byte();
     }
     // out[9] = reflector module letter for LINK, or space for
     // UNLINK (handed in by the caller).
     if let Some(b) = out.get_mut(9) {
-        *b = byte9;
+        *b = reflector_module.as_byte();
     }
     // out[10] = 0x00 NUL terminator.
     if let Some(b) = out.get_mut(10) {
@@ -432,8 +426,8 @@ fn write_connect_common(
 /// - `[13]` `0x00` NUL terminator
 fn write_connect_reply(
     out: &mut [u8],
-    callsign: Callsign,
-    reflector_module: Module,
+    identity: RepeaterIdentity,
+    reflector_module: ModuleSlot,
     tag: [u8; 3],
 ) -> Result<(), EncodeError> {
     if out.len() < CONNECT_REPLY_LEN {
@@ -444,22 +438,19 @@ fn write_connect_reply(
     }
     // Mirror `memset(data, ' ', 8)` + the rest of the trailing
     // positions. Filling with spaces ensures out[7] is a space,
-    // and any bytes we don't explicitly overwrite stay as spaces
+    // and every position without an explicit value remains a space
     // rather than leaking arbitrary prior contents.
     if let Some(region) = out.get_mut(..CONNECT_REPLY_LEN) {
         region.fill(b' ');
     }
     // out[0..7] = first 7 chars of the callsign.
-    let cs = callsign.as_bytes();
-    if let Some(dst) = out.get_mut(..7)
-        && let Some(src) = cs.get(..7)
-    {
-        dst.copy_from_slice(src);
+    if let Some(dst) = out.get_mut(..7) {
+        dst.copy_from_slice(identity.callsign.as_bytes());
     }
     // out[8] = 8th char of the callsign (the repeater/client
-    // module letter from the original LINK request we're echoing).
+    // module letter from the original LINK request).
     if let Some(b) = out.get_mut(8) {
-        *b = cs.get(7).copied().unwrap_or(b' ');
+        *b = identity.module.as_byte();
     }
     // out[9] = reflector module letter.
     if let Some(b) = out.get_mut(9) {
@@ -479,6 +470,7 @@ fn write_connect_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RoutingCallsign;
     use crate::types::Suffix;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -498,9 +490,7 @@ mod tests {
 
     const fn test_header() -> DstarHeader {
         DstarHeader {
-            flag1: 0,
-            flag2: 0,
-            flag3: 0,
+            flags: crate::HeaderFlags::NONE,
             rpt2: Callsign::from_wire_bytes(*b"XRF030 G"),
             rpt1: Callsign::from_wire_bytes(*b"XRF030 C"),
             ur_call: Callsign::from_wire_bytes(*b"CQCQCQ  "),
@@ -509,11 +499,26 @@ mod tests {
         }
     }
 
+    const LOCAL: RepeaterIdentity = RepeaterIdentity {
+        callsign: match RoutingCallsign::from_padded_bytes(*b"W1AW   ") {
+            Ok(value) => value,
+            Err(_) => unreachable!(),
+        },
+        module: Module::B,
+    };
+    const REFLECTOR: RepeaterIdentity = RepeaterIdentity {
+        callsign: match RoutingCallsign::from_padded_bytes(*b"XRF030 ") {
+            Ok(value) => value,
+            Err(_) => unreachable!(),
+        },
+        module: Module::C,
+    };
+
     // ─── Connect (LINK) tests ──────────────────────────────────
     #[test]
     fn encode_connect_link_writes_11_bytes() -> TestResult {
         let mut buf = [0u8; 16];
-        let n = encode_connect_link(&mut buf, &cs(*b"W1AW    "), Module::C, Module::B)?;
+        let n = encode_connect_link(&mut buf, LOCAL, Module::C)?;
         assert_eq!(n, 11);
         // First 7 chars of the callsign at [0..7]. "W1AW" pads to
         // "W1AW   " (4 chars + 3 spaces).
@@ -531,8 +536,7 @@ mod tests {
     #[test]
     fn encode_connect_link_rejects_small_buffer() -> TestResult {
         let mut buf = [0u8; 10];
-        let Err(err) = encode_connect_link(&mut buf, &cs(*b"W1AW    "), Module::C, Module::B)
-        else {
+        let Err(err) = encode_connect_link(&mut buf, LOCAL, Module::C) else {
             return Err("expected too small".into());
         };
         assert_eq!(err, EncodeError::BufferTooSmall { need: 11, have: 10 });
@@ -543,7 +547,7 @@ mod tests {
     #[test]
     fn encode_unlink_writes_11_bytes_with_space_at_9() -> TestResult {
         let mut buf = [0u8; 16];
-        let n = encode_unlink(&mut buf, &cs(*b"W1AW    "), Module::B)?;
+        let n = encode_unlink(&mut buf, LOCAL)?;
         assert_eq!(n, 11);
         assert_eq!(&buf[..7], b"W1AW   ", "callsign chars 0..7");
         assert_eq!(buf[7], b' ', "pad slot before module letter");
@@ -556,7 +560,7 @@ mod tests {
     #[test]
     fn encode_unlink_rejects_small_buffer() -> TestResult {
         let mut buf = [0u8; 5];
-        let Err(err) = encode_unlink(&mut buf, &cs(*b"W1AW    "), Module::B) else {
+        let Err(err) = encode_unlink(&mut buf, LOCAL) else {
             return Err("expected too small".into());
         };
         assert_eq!(err, EncodeError::BufferTooSmall { need: 11, have: 5 });
@@ -570,7 +574,7 @@ mod tests {
         // Test case: callsign "XRF030 C" so the 8th char of the
         // callsign is 'C', the client/repeater module letter we
         // want echoed at byte [8]. The reflector module is 'B'.
-        let n = encode_connect_ack(&mut buf, &cs(*b"XRF030 C"), Module::B)?;
+        let n = encode_connect_ack(&mut buf, REFLECTOR, Module::B)?;
         assert_eq!(n, 14);
         // First 7 chars of callsign: "XRF030 " (6 chars + trailing space).
         assert_eq!(&buf[..7], b"XRF030 ", "callsign chars 0..7");
@@ -589,7 +593,7 @@ mod tests {
     #[test]
     fn encode_connect_nak_writes_14_bytes() -> TestResult {
         let mut buf = [0u8; 16];
-        let n = encode_connect_nak(&mut buf, &cs(*b"XRF030 C"), Module::B)?;
+        let n = encode_connect_nak(&mut buf, REFLECTOR, ModuleSlot::Module(Module::B))?;
         assert_eq!(n, 14);
         assert_eq!(&buf[..7], b"XRF030 ");
         assert_eq!(buf[7], b' ');
@@ -603,7 +607,7 @@ mod tests {
     #[test]
     fn encode_connect_ack_rejects_small_buffer() -> TestResult {
         let mut buf = [0u8; 13];
-        let Err(err) = encode_connect_ack(&mut buf, &cs(*b"XRF030  "), Module::C) else {
+        let Err(err) = encode_connect_ack(&mut buf, REFLECTOR, Module::C) else {
             return Err("expected too small".into());
         };
         assert_eq!(err, EncodeError::BufferTooSmall { need: 14, have: 13 });
@@ -687,7 +691,7 @@ mod tests {
             ambe: [0x11; 9],
             slow_data: [0x22; 3],
         };
-        let n = encode_voice_data(&mut buf, sid(0x1234), 5, &frame)?;
+        let n = encode_voice_data(&mut buf, sid(0x1234), FrameSequence::try_from(5)?, &frame)?;
         assert_eq!(n, 27);
         assert_eq!(&buf[..4], b"DSVT");
         assert_eq!(buf[4], 0x20, "voice type");
@@ -713,7 +717,7 @@ mod tests {
             ambe: [0; 9],
             slow_data: [0; 3],
         };
-        let Err(err) = encode_voice_data(&mut buf, sid(0x1234), 0, &frame) else {
+        let Err(err) = encode_voice_data(&mut buf, sid(0x1234), FrameSequence::ZERO, &frame) else {
             return Err("expected too small".into());
         };
         assert_eq!(err, EncodeError::BufferTooSmall { need: 27, have: 10 });
@@ -724,7 +728,7 @@ mod tests {
     #[test]
     fn encode_voice_eot_writes_27_bytes() -> TestResult {
         let mut buf = [0u8; 64];
-        let n = encode_voice_eot(&mut buf, sid(0x1234), 7)?;
+        let n = encode_voice_eot(&mut buf, sid(0x1234), FrameSequence::try_from(7)?)?;
         assert_eq!(n, 27);
         assert_eq!(&buf[..4], b"DSVT");
         assert_eq!(buf[4], 0x20);
@@ -738,7 +742,7 @@ mod tests {
     #[test]
     fn encode_voice_eot_rejects_small_buffer() -> TestResult {
         let mut buf = [0u8; 20];
-        let Err(err) = encode_voice_eot(&mut buf, sid(0x1234), 0) else {
+        let Err(err) = encode_voice_eot(&mut buf, sid(0x1234), FrameSequence::ZERO) else {
             return Err("expected too small".into());
         };
         assert_eq!(err, EncodeError::BufferTooSmall { need: 27, have: 20 });

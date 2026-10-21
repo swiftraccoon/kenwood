@@ -7,6 +7,7 @@
 
 use std::net::IpAddr;
 
+use crate::hosts::HostName;
 use crate::validator::{AuthHostSkipReason, Diagnostic, DiagnosticSink};
 
 use super::error::DPlusError;
@@ -17,16 +18,16 @@ const IP_FIELD_SIZE: usize = 16;
 const CALLSIGN_FIELD_SIZE: usize = 8;
 
 /// A single entry from the `DPlus` auth server's host list response.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DPlusHost {
     /// Reflector callsign (e.g. `"REF030"`), trimmed of trailing spaces.
-    pub callsign: String,
-    /// Reflector IPv4 address.
+    pub callsign: HostName,
+    /// Reflector IP address parsed from the record's literal.
     pub address: IpAddr,
 }
 
 /// Parsed host list from the `DPlus` auth TCP response.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct HostList {
     hosts: Vec<DPlusHost>,
 }
@@ -42,6 +43,11 @@ impl HostList {
     #[must_use]
     pub fn hosts(&self) -> &[DPlusHost] {
         &self.hosts
+    }
+
+    /// Borrow entries in their response or insertion order.
+    pub fn iter(&self) -> std::slice::Iter<'_, DPlusHost> {
+        self.hosts.iter()
     }
 
     /// Number of hosts in the list.
@@ -61,7 +67,39 @@ impl HostList {
     pub fn find(&self, callsign: &str) -> Option<&DPlusHost> {
         self.hosts
             .iter()
-            .find(|h| h.callsign.eq_ignore_ascii_case(callsign))
+            .find(|host| host.callsign.as_str().eq_ignore_ascii_case(callsign))
+    }
+}
+
+impl<'a> IntoIterator for &'a HostList {
+    type Item = &'a DPlusHost;
+    type IntoIter = std::slice::Iter<'a, DPlusHost>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.hosts.iter()
+    }
+}
+
+impl IntoIterator for HostList {
+    type Item = DPlusHost;
+    type IntoIter = std::vec::IntoIter<DPlusHost>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.hosts.into_iter()
+    }
+}
+
+impl Extend<DPlusHost> for HostList {
+    fn extend<T: IntoIterator<Item = DPlusHost>>(&mut self, values: T) {
+        self.hosts.extend(values);
+    }
+}
+
+impl FromIterator<DPlusHost> for HostList {
+    fn from_iter<T: IntoIterator<Item = DPlusHost>>(values: T) -> Self {
+        Self {
+            hosts: values.into_iter().collect(),
+        }
     }
 }
 
@@ -225,10 +263,14 @@ fn parse_record(
         return None;
     };
 
-    Some(DPlusHost {
-        callsign: callsign_str.to_owned(),
-        address,
-    })
+    let Ok(callsign) = HostName::new(callsign_str) else {
+        sink.record(Diagnostic::AuthHostSkipped {
+            offset: record_offset,
+            reason: AuthHostSkipReason::MalformedCallsign,
+        });
+        return None;
+    };
+    Some(DPlusHost { callsign, address })
 }
 
 #[cfg(test)]
@@ -296,7 +338,8 @@ mod tests {
             list.hosts()
                 .first()
                 .ok_or("expected at least one host")?
-                .callsign,
+                .callsign
+                .as_str(),
             "REF030"
         );
         Ok(())

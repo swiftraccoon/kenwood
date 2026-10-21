@@ -18,12 +18,6 @@
 //! - `ircDDBGateway/Common/DCSHandler.cpp:54-55` (timer constants)
 //! - `xlxd/src/cdcsprotocol.cpp` (mirror reference)
 
-pub mod consts;
-pub mod decode;
-pub mod encode;
-pub mod error;
-pub mod packet;
-
 pub use decode::{decode_client_to_server, decode_server_to_client};
 pub use encode::{
     encode_connect_ack, encode_connect_link, encode_connect_nak, encode_connect_unlink,
@@ -31,3 +25,9 @@ pub use encode::{
 };
 pub use error::DcsError;
 pub use packet::{ClientPacket, ConnectResult, GatewayType, ServerPacket};
+
+pub mod consts;
+pub mod decode;
+pub mod encode;
+pub mod error;
+pub mod packet;

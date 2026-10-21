@@ -5,7 +5,7 @@
 
 use crate::error::EncodeError;
 use crate::header::DstarHeader;
-use crate::types::{Callsign, StreamId};
+use crate::types::{Callsign, FrameSequence, StreamId};
 use crate::voice::{AMBE_SILENCE, VoiceFrame};
 
 use super::consts::{
@@ -144,9 +144,8 @@ pub fn encode_link2(out: &mut [u8], callsign: &Callsign) -> Result<usize, Encode
     if let Some(dst) = out.get_mut(..LINK2_HEADER.len()) {
         dst.copy_from_slice(&LINK2_HEADER);
     }
-    // Callsign at offset 4. The Callsign type guarantees 8 bytes
-    // already space-padded; we want the trimmed length followed by
-    // zeros up to offset 20, matching the reference encoder.
+    // Copy the eight-byte callsign without trailing spaces, then leave
+    // NUL padding through offset 20, matching the reference encoder.
     let bytes = callsign.as_bytes();
     let trimmed_len = bytes.iter().rposition(|&b| b != b' ').map_or(0, |p| p + 1);
     if let Some(dst) = out.get_mut(4..4 + trimmed_len)
@@ -313,7 +312,7 @@ pub fn encode_voice_header(
 pub fn encode_voice_data(
     out: &mut [u8],
     stream_id: StreamId,
-    seq: u8,
+    seq: FrameSequence,
     frame: &VoiceFrame,
 ) -> Result<usize, EncodeError> {
     const LEN: usize = 29;
@@ -323,7 +322,7 @@ pub fn encode_voice_data(
             have: out.len(),
         });
     }
-    write_voice_prefix(out, VOICE_DATA_PREFIX, stream_id, seq);
+    write_voice_prefix(out, VOICE_DATA_PREFIX, stream_id, seq.get());
     if let Some(dst) = out.get_mut(17..26) {
         dst.copy_from_slice(&frame.ambe);
     }
@@ -353,7 +352,7 @@ pub fn encode_voice_data(
 pub fn encode_voice_eot(
     out: &mut [u8],
     stream_id: StreamId,
-    seq: u8,
+    seq: FrameSequence,
 ) -> Result<usize, EncodeError> {
     const LEN: usize = 32;
     if out.len() < LEN {
@@ -362,7 +361,7 @@ pub fn encode_voice_eot(
             have: out.len(),
         });
     }
-    write_voice_prefix(out, VOICE_EOT_PREFIX, stream_id, seq | 0x40);
+    write_voice_prefix(out, VOICE_EOT_PREFIX, stream_id, seq.get() | 0x40);
     if let Some(dst) = out.get_mut(17..26) {
         dst.copy_from_slice(&AMBE_SILENCE);
     }
@@ -442,9 +441,7 @@ mod tests {
 
     fn test_header() -> DstarHeader {
         DstarHeader {
-            flag1: 0,
-            flag2: 0,
-            flag3: 0,
+            flags: crate::HeaderFlags::NONE,
             rpt2: Callsign::from_wire_bytes(*b"REF030 G"),
             rpt1: Callsign::from_wire_bytes(*b"REF030 C"),
             ur_call: Callsign::from_wire_bytes(*b"CQCQCQ  "),
@@ -628,7 +625,7 @@ mod tests {
             ambe: [0x11; 9],
             slow_data: [0x22; 3],
         };
-        let n = encode_voice_data(&mut buf, sid(0x1234), 5, &frame)?;
+        let n = encode_voice_data(&mut buf, sid(0x1234), FrameSequence::try_from(5)?, &frame)?;
         assert_eq!(n, 29);
         assert_eq!(buf[0], 0x1D, "DPlus prefix");
         assert_eq!(buf[1], 0x80, "DSVT type");
@@ -645,7 +642,7 @@ mod tests {
     #[test]
     fn encode_voice_eot_writes_32_bytes() -> TestResult {
         let mut buf = [0u8; 64];
-        let n = encode_voice_eot(&mut buf, sid(0x1234), 7)?;
+        let n = encode_voice_eot(&mut buf, sid(0x1234), FrameSequence::try_from(7)?)?;
         assert_eq!(n, 32);
         assert_eq!(buf[0], 0x20, "EOT prefix");
         assert_eq!(buf[1], 0x80, "DSVT type");

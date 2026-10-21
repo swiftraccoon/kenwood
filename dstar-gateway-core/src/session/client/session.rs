@@ -8,16 +8,20 @@
 //! The `Session<P, S>` is a thin wrapper over [`SessionCore`] (the
 //! protocol-erased state machine). The phantom types add zero
 //! runtime cost; the entire typestate machinery compiles away.
+//!
+//! Driver input and timeouts update the runtime state behind a marker.
+//! Sending requires that state to remain connected; a timeout or in-place
+//! disconnect makes later sends return [`StateError::WrongState`].
 
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::time::Instant;
 
 use crate::codec::dplus::HostList;
-use crate::error::{Error, StateError};
+use crate::error::{Error, StateError, StateOperation};
 use crate::header::DstarHeader;
 use crate::session::driver::{Driver, Transmit};
-use crate::types::{Callsign, StreamId};
+use crate::types::{Callsign, FrameSequence, StreamId};
 use crate::validator::Diagnostic;
 use crate::voice::VoiceFrame;
 
@@ -43,7 +47,7 @@ use super::state::{
 /// protocol-erased state machine). The phantom types add zero
 /// runtime cost; the entire typestate machinery compiles away.
 #[derive(Debug)]
-pub struct Session<P: Protocol, S: ClientState> {
+pub struct Session<P, S> {
     pub(crate) inner: SessionCore,
     pub(crate) _protocol: PhantomData<P>,
     pub(crate) _state: PhantomData<S>,
@@ -220,26 +224,16 @@ impl Session<DPlus, Authenticated> {
         }
     }
 
-    /// Get the cached host list from the TCP auth step.
+    /// Borrow the cached host list supplied by the TCP authentication step.
     ///
     /// The [`Authenticated`] state is entered only after
     /// [`SessionCore::attach_host_list`] succeeds, so the host list is
-    /// always present here. A `None` would indicate a bug in
-    /// [`SessionCore`]; the fallback is a module-level empty
-    /// sentinel rather than a panic so lib code stays
-    /// `expect_used`-clean.
+    /// remains present for the lifetime of this session.
     #[must_use]
     pub fn host_list(&self) -> &HostList {
-        self.inner.host_list().unwrap_or(&EMPTY_HOST_LIST)
+        self.inner.host_list().unwrap_or_else(|| unreachable!())
     }
 }
-
-/// Module-level sentinel returned by
-/// [`Session::<DPlus, Authenticated>::host_list`] when the core's
-/// internal host list is (impossibly) `None`. Defined as a `static`
-/// so callers can hold a `&'static HostList` without lifetime
-/// gymnastics.
-static EMPTY_HOST_LIST: HostList = HostList::new();
 
 // ─── Connecting -> Connected (promote) ─────────────────────────
 
@@ -273,7 +267,7 @@ impl<P: Protocol> Session<P, Connecting> {
             })
         } else {
             let error = Error::State(StateError::WrongState {
-                operation: "Session::promote",
+                operation: StateOperation::Promote,
                 state: self.inner.state_kind(),
                 protocol: self.inner.protocol_kind(),
             });
@@ -356,7 +350,9 @@ impl<P: Protocol> Session<P, Connected> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Protocol`] if the codec encoder fails.
+    /// Returns [`Error::Protocol`] if the codec encoder fails and
+    /// [`Error::State`] with [`StateError::WrongState`] when runtime state
+    /// is no longer [`ClientStateKind::Connected`].
     pub fn send_header(
         &mut self,
         now: Instant,
@@ -372,7 +368,9 @@ impl<P: Protocol> Session<P, Connected> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Protocol`] if the codec encoder fails.
+    /// Returns [`Error::Protocol`] if the codec encoder fails and
+    /// [`Error::State`] with [`StateError::WrongState`] when runtime state
+    /// is no longer [`ClientStateKind::Connected`].
     /// On DCS, returns [`Error::Protocol`] with
     /// [`crate::error::DcsError::NoTxHeader`] if [`Self::send_header`]
     /// has not been called first.
@@ -380,7 +378,7 @@ impl<P: Protocol> Session<P, Connected> {
         &mut self,
         now: Instant,
         stream_id: StreamId,
-        seq: u8,
+        seq: FrameSequence,
         frame: &VoiceFrame,
     ) -> Result<(), Error> {
         self.inner.enqueue_send_voice(now, stream_id, seq, frame)
@@ -394,11 +392,18 @@ impl<P: Protocol> Session<P, Connected> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Protocol`] if the codec encoder fails.
+    /// Returns [`Error::Protocol`] if the codec encoder fails and
+    /// [`Error::State`] with [`StateError::WrongState`] when runtime state
+    /// is no longer [`ClientStateKind::Connected`].
     /// On DCS, returns [`Error::Protocol`] with
     /// [`crate::error::DcsError::NoTxHeader`] if [`Self::send_header`]
     /// has not been called first.
-    pub fn send_eot(&mut self, now: Instant, stream_id: StreamId, seq: u8) -> Result<(), Error> {
+    pub fn send_eot(
+        &mut self,
+        now: Instant,
+        stream_id: StreamId,
+        seq: FrameSequence,
+    ) -> Result<(), Error> {
         self.inner.enqueue_send_eot(now, stream_id, seq)
     }
 }
@@ -430,7 +435,7 @@ impl<P: Protocol> Session<P, Disconnecting> {
             })
         } else {
             let error = Error::State(StateError::WrongState {
-                operation: "Session::promote",
+                operation: StateOperation::Promote,
                 state: self.inner.state_kind(),
                 protocol: self.inner.protocol_kind(),
             });
@@ -447,25 +452,37 @@ mod tests {
     use super::*;
     use crate::codec::dextra::encode_connect_ack;
     use crate::session::client::protocol::DExtra;
-    use crate::types::{Module, ProtocolKind};
+    use crate::types::{Module, RoutingCallsign, Suffix};
+    use crate::{ClientProtocol, SessionConfig};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::time::Duration;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     const ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30001);
+    const IDENTITY: crate::RepeaterIdentity = crate::RepeaterIdentity {
+        callsign: match RoutingCallsign::from_padded_bytes(*b"W1AW   ") {
+            Ok(value) => value,
+            Err(_) => unreachable!(),
+        },
+        module: Module::B,
+    };
     const fn cs(bytes: [u8; 8]) -> Callsign {
         Callsign::from_wire_bytes(bytes)
     }
 
     fn new_dextra_configured() -> Session<DExtra, Configured> {
-        let core = SessionCore::new(
-            ProtocolKind::DExtra,
-            cs(*b"W1AW    "),
-            Module::B,
-            Module::C,
-            ADDR,
-        );
+        const LOCAL: RoutingCallsign = match RoutingCallsign::from_padded_bytes(*b"W1AW   ") {
+            Ok(value) => value,
+            Err(_) => unreachable!(),
+        };
+        let core = SessionCore::new(SessionConfig {
+            protocol: ClientProtocol::DExtra,
+            callsign: LOCAL,
+            local_module: Module::B,
+            reflector_module: Module::C,
+            peer: ADDR,
+        });
         Session {
             inner: core,
             _protocol: PhantomData,
@@ -499,7 +516,7 @@ mod tests {
         );
 
         let mut ack_buf = [0u8; 16];
-        let n = encode_connect_ack(&mut ack_buf, &cs(*b"W1AW    "), Module::C)?;
+        let n = encode_connect_ack(&mut ack_buf, IDENTITY, Module::C)?;
         connecting.handle_input(now, ADDR, ack_buf.get(..n).ok_or("slice")?)?;
 
         assert_eq!(connecting.state_kind(), ClientStateKind::Connected);
@@ -519,7 +536,7 @@ mod tests {
         );
 
         let mut ack_buf = [0_u8; 16];
-        let n = encode_connect_ack(&mut ack_buf, &cs(*b"W1AW    "), Module::C)?;
+        let n = encode_connect_ack(&mut ack_buf, IDENTITY, Module::C)?;
         let unexpected = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 39999);
         connecting.handle_input(now, unexpected, ack_buf.get(..n).ok_or("slice")?)?;
 
@@ -551,7 +568,7 @@ mod tests {
         let session = new_dextra_configured();
         let mut connecting = session.connect(now)?;
         let mut ack_buf = [0u8; 16];
-        let n = encode_connect_ack(&mut ack_buf, &cs(*b"W1AW    "), Module::C)?;
+        let n = encode_connect_ack(&mut ack_buf, IDENTITY, Module::C)?;
         connecting.handle_input(now, ADDR, ack_buf.get(..n).ok_or("slice")?)?;
         let connected = connecting.promote()?;
         let disconnecting = connected.disconnect(now + Duration::from_secs(1))?;
@@ -579,13 +596,9 @@ mod tests {
 
     // ─── Voice TX on Session<P, Connected> ─────────────────────
 
-    use crate::types::Suffix;
-
     const fn test_header() -> DstarHeader {
         DstarHeader {
-            flag1: 0,
-            flag2: 0,
-            flag3: 0,
+            flags: crate::HeaderFlags::NONE,
             rpt2: Callsign::from_wire_bytes(*b"XRF030 G"),
             rpt1: Callsign::from_wire_bytes(*b"XRF030 C"),
             ur_call: Callsign::from_wire_bytes(*b"CQCQCQ  "),
@@ -608,7 +621,7 @@ mod tests {
         let session = new_dextra_configured();
         let mut connecting = session.connect(now)?;
         let mut ack_buf = [0u8; 16];
-        let n = encode_connect_ack(&mut ack_buf, &cs(*b"W1AW    "), Module::C)?;
+        let n = encode_connect_ack(&mut ack_buf, IDENTITY, Module::C)?;
         connecting.handle_input(now, ADDR, ack_buf.get(..n).ok_or("slice")?)?;
         Ok(connecting.promote()?)
     }
@@ -629,7 +642,7 @@ mod tests {
         let mut session = dextra_connected()?;
         let now = Instant::now();
         let frame = VoiceFrame::silence();
-        session.send_voice(now, sid(0x1234), 5, &frame)?;
+        session.send_voice(now, sid(0x1234), FrameSequence::try_from(5)?, &frame)?;
         let _link = session.poll_transmit(now).ok_or("link tx")?;
         let voice_tx = session.poll_transmit(now).ok_or("voice tx")?;
         assert_eq!(voice_tx.payload.len(), 27);
@@ -640,7 +653,7 @@ mod tests {
     fn dextra_connected_send_eot_succeeds() -> TestResult {
         let mut session = dextra_connected()?;
         let now = Instant::now();
-        session.send_eot(now, sid(0x1234), 21)?;
+        session.send_eot(now, sid(0x1234), FrameSequence::ZERO)?;
         let _link = session.poll_transmit(now).ok_or("link tx")?;
         let eot_tx = session.poll_transmit(now).ok_or("eot tx")?;
         assert_eq!(eot_tx.payload.len(), 27);

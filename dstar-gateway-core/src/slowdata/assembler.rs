@@ -143,7 +143,10 @@ impl SlowDataAssembler {
         match kind {
             SlowDataBlockKind::Gps => SlowDataBlock::Gps(payload.to_vec()),
             SlowDataBlockKind::Text => {
-                SlowDataBlock::Text(SlowDataText::from_wire_bytes(payload.to_vec()))
+                let [_, byte0, byte1, byte2, byte3, byte4] = self.block;
+                SlowDataBlock::Text(SlowDataText::from_wire_bytes([
+                    byte0, byte1, byte2, byte3, byte4,
+                ]))
             }
             SlowDataBlockKind::HeaderRetx => unreachable!("header blocks use commit_header_block"),
             SlowDataBlockKind::FastData1 | SlowDataBlockKind::FastData2 => {
@@ -279,9 +282,7 @@ mod tests {
     fn test_header() -> DstarHeader {
         use crate::types::{Callsign, Suffix};
         DstarHeader {
-            flag1: 0,
-            flag2: 0,
-            flag3: 0,
+            flags: crate::HeaderFlags::NONE,
             rpt2: Callsign::from_wire_bytes(*b"REF030 G"),
             rpt1: Callsign::from_wire_bytes(*b"REF030 C"),
             ur_call: Callsign::from_wire_bytes(*b"CQCQCQ  "),

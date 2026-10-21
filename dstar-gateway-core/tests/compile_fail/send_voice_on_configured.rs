@@ -8,26 +8,28 @@
 //! session.
 
 use dstar_gateway_core::session::client::{DExtra, Session};
-use dstar_gateway_core::types::{Callsign, Module, StreamId};
+use dstar_gateway_core::types::{FrameSequence, Module, RoutingCallsign, StreamId};
 use dstar_gateway_core::voice::VoiceFrame;
 use std::time::Instant;
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut session = Session::<DExtra, _>::builder()
-        .callsign(Callsign::try_from_str("W1AW").unwrap())
-        .local_module(Module::try_from_char('B').unwrap())
-        .reflector_module(Module::try_from_char('C').unwrap())
-        .peer("127.0.0.1:30001".parse().unwrap())
+        .callsign(RoutingCallsign::new("W1AW")?)
+        .local_module(Module::B)
+        .reflector_module(Module::C)
+        .peer("127.0.0.1:30001".parse()?)
         .build();
 
     // ERROR: no method named `send_voice` found for
     // `Session<DExtra, Configured>`; `send_voice` is only
     // implemented on `Session<P, Connected>`.
     let frame = VoiceFrame::silence();
+    const STREAM: StreamId = StreamId::new(0x1234).unwrap();
     let _ = session.send_voice(
         Instant::now(),
-        StreamId::new(0x1234).unwrap(),
-        0,
+        STREAM,
+        FrameSequence::ZERO,
         &frame,
     );
+    Ok(())
 }

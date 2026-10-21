@@ -21,7 +21,10 @@ use dstar_gateway_core::codec::dcs::{
     encode_poll_reply, encode_poll_request, encode_voice,
 };
 use dstar_gateway_core::validator::NullSink;
-use dstar_gateway_core::{Callsign, DstarHeader, Module, StreamId, Suffix, VoiceFrame};
+use dstar_gateway_core::{
+    Callsign, DcsReflector, DstarHeader, FrameSequence, Module, ModuleSlot, RepeaterIdentity,
+    RoutingCallsign, StreamId, Suffix, VoiceFrame,
+};
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
 
@@ -81,9 +84,7 @@ prop_compose! {
 
 const fn dcs_header(my_call: Callsign) -> DstarHeader {
     DstarHeader {
-        flag1: 0,
-        flag2: 0,
-        flag3: 0,
+        flags: dstar_gateway_core::HeaderFlags::NONE,
         rpt2: Callsign::from_wire_bytes(*b"DCS001 G"),
         rpt1: Callsign::from_wire_bytes(*b"DCS001 C"),
         ur_call: Callsign::from_wire_bytes(*b"CQCQCQ  "),
@@ -104,7 +105,8 @@ proptest! {
     ) {
         let refl = Callsign::from_wire_bytes(*b"DCS001  ");
         let mut buf = [0u8; 600];
-        let n = encode_connect_link(&mut buf, &cs, cm, rm, &refl, GatewayType::Repeater)
+        let identity = RepeaterIdentity { callsign: RoutingCallsign::try_from(cs).map_err(to_test_err)?, module: cm };
+        let n = encode_connect_link(&mut buf, identity, rm, DcsReflector::try_from(refl).map_err(to_test_err)?, GatewayType::Repeater)
             .map_err(to_test_err)?;
         let pkt = decode_client_to_server(wire(&buf, n)?, &mut NullSink).map_err(to_test_err)?;
         match pkt {
@@ -128,7 +130,8 @@ proptest! {
     fn unlink_client_roundtrips(cs in any_connect_callsign(), cm in any_module()) {
         let refl = Callsign::from_wire_bytes(*b"DCS001  ");
         let mut buf = [0u8; 32];
-        let n = encode_connect_unlink(&mut buf, &cs, cm, &refl).map_err(to_test_err)?;
+        let identity = RepeaterIdentity { callsign: RoutingCallsign::try_from(cs).map_err(to_test_err)?, module: cm };
+        let n = encode_connect_unlink(&mut buf, identity, DcsReflector::try_from(refl).map_err(to_test_err)?).map_err(to_test_err)?;
         let pkt = decode_client_to_server(wire(&buf, n)?, &mut NullSink).map_err(to_test_err)?;
         match pkt {
             ClientPacket::Unlink {
@@ -145,10 +148,11 @@ proptest! {
     }
 
     #[test]
-    fn poll_request_roundtrips(cs in any_callsign()) {
+    fn poll_request_roundtrips(cs in any_connect_callsign()) {
         let refl = Callsign::from_wire_bytes(*b"DCS001  ");
         let mut buf = [0u8; 32];
-        let n = encode_poll_request(&mut buf, &cs, &refl).map_err(to_test_err)?;
+        let n = encode_poll_request(&mut buf, RoutingCallsign::try_from(cs).map_err(to_test_err)?,
+            DcsReflector::try_from(refl).map_err(to_test_err)?).map_err(to_test_err)?;
         let pkt = decode_client_to_server(wire(&buf, n)?, &mut NullSink).map_err(to_test_err)?;
         match pkt {
             ClientPacket::Poll {
@@ -182,16 +186,19 @@ proptest! {
 
     // ─── Connect reply round-trips ──────────────────────────
     #[test]
-    fn connect_ack_server_roundtrips(cs in any_connect_callsign(), m in any_module()) {
+    fn connect_ack_server_roundtrips(cs in any_connect_callsign(), m in any_module(), client in any_module()) {
         let mut buf = [0u8; 32];
-        let n = encode_connect_ack(&mut buf, &cs, m).map_err(to_test_err)?;
+        let identity = RepeaterIdentity { callsign: RoutingCallsign::try_from(cs).map_err(to_test_err)?, module: client };
+        let n = encode_connect_ack(&mut buf, identity, m).map_err(to_test_err)?;
         let pkt = decode_server_to_client(wire(&buf, n)?, &mut NullSink).map_err(to_test_err)?;
         match pkt {
             ServerPacket::ConnectAck {
                 callsign,
+                client_module,
                 reflector_module,
             } => {
                 prop_assert_eq!(callsign, cs);
+                prop_assert_eq!(client_module, client);
                 prop_assert_eq!(reflector_module, m);
             }
             _ => prop_assert!(false, "expected ConnectAck"),
@@ -199,17 +206,21 @@ proptest! {
     }
 
     #[test]
-    fn connect_nak_server_roundtrips(cs in any_connect_callsign(), m in any_module()) {
+    fn connect_nak_server_roundtrips(cs in any_connect_callsign(), m in prop::option::of(any_module()), client in any_module()) {
         let mut buf = [0u8; 32];
-        let n = encode_connect_nak(&mut buf, &cs, m).map_err(to_test_err)?;
+        let identity = RepeaterIdentity { callsign: RoutingCallsign::try_from(cs).map_err(to_test_err)?, module: client };
+        let target = m.map_or(ModuleSlot::Empty, ModuleSlot::Module);
+        let n = encode_connect_nak(&mut buf, identity, target).map_err(to_test_err)?;
         let pkt = decode_server_to_client(wire(&buf, n)?, &mut NullSink).map_err(to_test_err)?;
         match pkt {
             ServerPacket::ConnectNak {
                 callsign,
+                client_module,
                 reflector_module,
             } => {
                 prop_assert_eq!(callsign, cs);
-                prop_assert_eq!(reflector_module, m);
+                prop_assert_eq!(client_module, client);
+                prop_assert_eq!(reflector_module, target);
             }
             _ => prop_assert!(false, "expected ConnectNak"),
         }
@@ -225,7 +236,8 @@ proptest! {
     ) {
         let header = dcs_header(my);
         let mut buf = [0u8; 128];
-        let n = encode_voice(&mut buf, &header, sid, seq, &frame, false).map_err(to_test_err)?;
+        let index = FrameSequence::try_from(seq).map_err(to_test_err)?;
+        let n = encode_voice(&mut buf, &header, sid, index, &frame, false).map_err(to_test_err)?;
         let pkt = decode_client_to_server(wire(&buf, n)?, &mut NullSink).map_err(to_test_err)?;
         match pkt {
             ClientPacket::Voice {
@@ -255,12 +267,13 @@ proptest! {
     ) {
         let header = dcs_header(my);
         let mut buf = [0u8; 128];
-        let n = encode_voice(&mut buf, &header, sid, seq, &frame, true).map_err(to_test_err)?;
+        let index = FrameSequence::try_from(seq).map_err(to_test_err)?;
+        let n = encode_voice(&mut buf, &header, sid, index, &frame, true).map_err(to_test_err)?;
         let pkt = decode_client_to_server(wire(&buf, n)?, &mut NullSink).map_err(to_test_err)?;
         match pkt {
             ClientPacket::Voice { is_end, seq: s, .. } => {
                 prop_assert!(is_end, "is_end should be true for EOT");
-                prop_assert_eq!(s, seq);
+                prop_assert_eq!(s, seq | 0x40);
             }
             _ => prop_assert!(false, "expected Voice"),
         }
@@ -275,7 +288,8 @@ proptest! {
     ) {
         let header = dcs_header(my);
         let mut buf = [0u8; 128];
-        let n = encode_voice(&mut buf, &header, sid, seq, &frame, false).map_err(to_test_err)?;
+        let index = FrameSequence::try_from(seq).map_err(to_test_err)?;
+        let n = encode_voice(&mut buf, &header, sid, index, &frame, false).map_err(to_test_err)?;
         let pkt = decode_server_to_client(wire(&buf, n)?, &mut NullSink).map_err(to_test_err)?;
         match pkt {
             ServerPacket::Voice {

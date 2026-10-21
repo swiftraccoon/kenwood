@@ -5,7 +5,7 @@
 //! Same construction discipline as [`super::callsign::Callsign`]:
 //! strict on the TX path, lenient on the RX path.
 
-use super::type_error::TypeError;
+use super::type_error::{TextFieldError, TypeError};
 use super::wire_text::{WireTextError, diagnostic_wire_bytes, trimmed_printable_ascii};
 
 /// 4-byte D-STAR callsign suffix.
@@ -43,12 +43,19 @@ impl Suffix {
         let trimmed = s.trim_end_matches(' ');
         if trimmed.len() > 4 {
             return Err(TypeError::InvalidSuffix {
-                reason: "longer than 4 bytes",
+                reason: TextFieldError::TooLong {
+                    got: trimmed.len(),
+                    max: 4,
+                },
             });
         }
-        if !trimmed.bytes().all(|byte| (b' '..=b'~').contains(&byte)) {
+        if let Some((offset, byte)) = trimmed
+            .bytes()
+            .enumerate()
+            .find(|(_, byte)| !(b' '..=b'~').contains(byte))
+        {
             return Err(TypeError::InvalidSuffix {
-                reason: "byte outside printable ASCII",
+                reason: TextFieldError::NonPrintable { offset, byte },
             });
         }
         let mut buf = [b' '; 4];
@@ -86,18 +93,51 @@ impl Suffix {
     pub fn text(&self) -> Result<&str, WireTextError> {
         trimmed_printable_ascii(&self.0)
     }
+}
 
-    /// Return text for a valid suffix or an exact escaped diagnostic.
-    ///
-    /// This compatibility view never inserts Unicode replacement characters.
-    /// Use [`Self::text`] for semantic decisions, because it distinguishes
-    /// validated suffix text from malformed receive bytes.
-    #[must_use]
-    pub fn as_str(&self) -> std::borrow::Cow<'_, str> {
-        self.text().map_or_else(
-            |_| std::borrow::Cow::Owned(diagnostic_wire_bytes(&self.0)),
-            std::borrow::Cow::Borrowed,
-        )
+impl std::str::FromStr for Suffix {
+    type Err = TypeError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::try_from_str(value)
+    }
+}
+
+impl TryFrom<&str> for Suffix {
+    type Error = TypeError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::try_from_str(value)
+    }
+}
+
+impl AsRef<[u8; 4]> for Suffix {
+    fn as_ref(&self) -> &[u8; 4] {
+        self.as_bytes()
+    }
+}
+
+impl AsRef<[u8]> for Suffix {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl From<[u8; 4]> for Suffix {
+    fn from(value: [u8; 4]) -> Self {
+        Self::from_wire_bytes(value)
+    }
+}
+
+impl From<Suffix> for [u8; 4] {
+    fn from(value: Suffix) -> Self {
+        value.0
+    }
+}
+
+impl Default for Suffix {
+    fn default() -> Self {
+        Self::EMPTY
     }
 }
 

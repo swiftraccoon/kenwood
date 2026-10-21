@@ -1,50 +1,47 @@
-//! D-STAR radio header (41 bytes on the wire with CRC-CCITT).
+//! D-STAR radio header: 39 field bytes followed by a two-byte CRC.
 //!
-//! The header is transmitted at the start of every D-STAR voice
-//! stream. It contains routing information (repeater callsigns,
-//! destination, origin) and 3 flag bytes for control signaling.
-//!
-//! # Wire format (per JARL D-STAR specification)
-//!
-//! ```text
-//! Offset  Length  Field
-//! 0       1       Flag 1 (control)
-//! 1       1       Flag 2 (reserved)
-//! 2       1       Flag 3 (reserved)
-//! 3       8       RPT2 callsign (space-padded)
-//! 11      8       RPT1 callsign (space-padded)
-//! 19      8       YOUR callsign (space-padded)
-//! 27      8       MY callsign (space-padded)
-//! 35      4       MY suffix (space-padded)
-//! 39      2       CRC-CCITT (little-endian)
-//! ```
-//!
-//! # CRC-CCITT
-//!
-//! Reflected polynomial 0x8408, initial value 0xFFFF, final XOR
-//! 0xFFFF. Computed over bytes 0-38, stored little-endian at 39-40.
-//!
-//! See `ircDDBGateway/Common/HeaderData.cpp:637-684` (`getDPlusData`)
-//! and `ircDDBGateway/Common/CCITTChecksum.cpp` for the reference
-//! implementation this module mirrors.
+//! Field order is flags (3), RPT2 (8), RPT1 (8), YOUR (8), MY (8),
+//! suffix (4), and little-endian CRC (2). The receive representation
+//! preserves every field byte; encoding recomputes the CRC. See
+//! `ircDDBGateway/Common/HeaderData.cpp::{setDPlusData,getDPlusData}`.
 
-use crate::types::{Callsign, Module, Suffix};
+pub use flags::{HeaderFlag, HeaderFlags, RepeaterControl};
 
-/// Size of the encoded header on the wire (including CRC).
+use crate::types::{Callsign, Module, RoutingCallsign, Suffix};
+
+mod flags;
+
+/// Encoded header length, including its two-byte CRC.
 pub const ENCODED_LEN: usize = 41;
 
-/// D-STAR radio header.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Named repeater prefixes and module selections for a reflector relay.
+///
+/// Each checked prefix occupies seven bytes; its module occupies byte eight.
+/// Module syntax is A-Z. The remote reflector determines which modules exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RelayRouting {
+    /// Local gateway's callsign prefix for RPT1.
+    pub operator: RoutingCallsign,
+    /// Local module carried in RPT1.
+    pub local_module: Module,
+    /// Target reflector's callsign prefix for RPT2.
+    pub reflector: RoutingCallsign,
+    /// Target module carried in RPT2.
+    pub reflector_module: Module,
+}
+
+/// Lossless fields of one D-STAR radio header.
+///
+/// Received callsigns, suffix and flags may contain unknown bytes. Their
+/// checked text views distinguish printable protocol text from diagnostic
+/// formatting. [`Self::for_relay`] constructs checked repeater routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DstarHeader {
-    /// Control flag byte 1.
-    pub flag1: u8,
-    /// Reserved flag byte 2.
-    pub flag2: u8,
-    /// Reserved flag byte 3.
-    pub flag3: u8,
-    /// Repeater 2 callsign (gateway).
+    /// Independent flags, repeater-control code and reserved bytes.
+    pub flags: HeaderFlags,
+    /// Repeater 2 callsign and module (gateway).
     pub rpt2: Callsign,
-    /// Repeater 1 callsign (access).
+    /// Repeater 1 callsign and module (access).
     pub rpt1: Callsign,
     /// Destination callsign (YOUR).
     pub ur_call: Callsign,
@@ -55,220 +52,151 @@ pub struct DstarHeader {
 }
 
 impl DstarHeader {
-    /// Encode the header into 41 bytes with CRC.
+    /// Encode all fields into 41 bytes, recomputing CRC over bytes 0 through 38.
     #[must_use]
     pub fn encode(&self) -> [u8; ENCODED_LEN] {
-        let mut buf = [0u8; ENCODED_LEN];
-        if let Some(b) = buf.get_mut(0) {
-            *b = self.flag1;
+        let mut bytes = [0_u8; ENCODED_LEN];
+        if let Some(destination) = bytes.get_mut(..3) {
+            destination.copy_from_slice(self.flags.as_bytes());
         }
-        if let Some(b) = buf.get_mut(1) {
-            *b = self.flag2;
+        for (range, callsign) in [
+            (3..11, self.rpt2),
+            (11..19, self.rpt1),
+            (19..27, self.ur_call),
+            (27..35, self.my_call),
+        ] {
+            if let Some(destination) = bytes.get_mut(range) {
+                destination.copy_from_slice(callsign.as_bytes());
+            }
         }
-        if let Some(b) = buf.get_mut(2) {
-            *b = self.flag3;
+        if let Some(destination) = bytes.get_mut(35..39) {
+            destination.copy_from_slice(self.my_suffix.as_bytes());
         }
-        if let Some(s) = buf.get_mut(3..11) {
-            s.copy_from_slice(self.rpt2.as_bytes());
+        let checksum = crc_ccitt(bytes.get(..39).unwrap_or(&[])).to_le_bytes();
+        if let Some(destination) = bytes.get_mut(39..) {
+            destination.copy_from_slice(&checksum);
         }
-        if let Some(s) = buf.get_mut(11..19) {
-            s.copy_from_slice(self.rpt1.as_bytes());
-        }
-        if let Some(s) = buf.get_mut(19..27) {
-            s.copy_from_slice(self.ur_call.as_bytes());
-        }
-        if let Some(s) = buf.get_mut(27..35) {
-            s.copy_from_slice(self.my_call.as_bytes());
-        }
-        if let Some(s) = buf.get_mut(35..39) {
-            s.copy_from_slice(self.my_suffix.as_bytes());
-        }
-
-        let crc = crc_ccitt(buf.get(..39).unwrap_or(&[]));
-        if let Some(b) = buf.get_mut(39) {
-            *b = (crc & 0xFF) as u8;
-        }
-        if let Some(b) = buf.get_mut(40) {
-            *b = (crc >> 8) as u8;
-        }
-        buf
+        bytes
     }
 
-    /// Encode the header for embedding in a DSVT voice header packet.
+    /// Encode DSVT header fields with zero flags and a matching recomputed CRC.
     ///
-    /// Identical to [`Self::encode`] except the three flag bytes are
-    /// forced to zero BEFORE CRC computation. Matches
-    /// `ircDDBGateway/Common/HeaderData.cpp:665-667` (`getDPlusData`).
-    ///
-    /// DCS voice packets carry real flag bytes; use [`Self::encode`]
-    /// for those.
+    /// Matches `ircDDBGateway/Common/HeaderData.cpp::getDPlusData`.
+    /// DCS embedding preserves [`Self::flags`] instead.
     #[must_use]
     pub fn encode_for_dsvt(&self) -> [u8; ENCODED_LEN] {
-        let mut h = *self;
-        h.flag1 = 0;
-        h.flag2 = 0;
-        h.flag3 = 0;
-        h.encode()
+        self.with_flags(HeaderFlags::NONE).encode()
     }
 
-    /// Build a header for the reflector-relay path.
+    /// Construct CQ reflector routing and preserve the supplied speaker identity.
     ///
-    /// This is the canonical builder for any client (sextant,
-    /// thd75-repl, future hotspot crates) sending voice into a
-    /// `DPlus` / `DExtra` / `DCS` reflector. Per the convention
-    /// validated against `ircDDBGateway/Common/DPlusHandler.cpp:77-79`
-    /// and xlxd's `cdplusprotocol.cpp:209`:
-    ///
-    /// - `rpt1[0..7]` = `operator` callsign (first 7 bytes,
-    ///   space-padded)
-    /// - `rpt1[7]`   = `local_module` letter (A-Z, NEVER `'G'`)
-    /// - `rpt2[0..7]` = `reflector` callsign (first 7 bytes,
-    ///   space-padded)
-    /// - `rpt2[7]`   = `reflector_module` letter (A-Z, NEVER `'G'`)
-    /// - `ur_call`    = `CQCQCQ`
-    /// - `flag1`/`flag2`/`flag3` = 0
-    ///
-    /// Both `rpt1[7]` and `rpt2[7]` are real module letters. xlxd's
-    /// `IsValidModule` rejects `'G'` and silently drops the packet
-    /// (no NAK, no log line, no retry), so any header with `rpt1[7]`
-    /// outside `b'A'..=b'Z'` will be invisible to other clients.
-    /// The `Module` type's invariant (`b'A'..=b'Z'`) is what makes
-    /// this safe to express infallibly.
-    ///
-    /// `my_call` and `my_suffix` carry the operator's identity into
-    /// the stream, surfaced to other clients as the speaker.
-    ///
-    /// Callers that need to preserve the original flag bytes (e.g.
-    /// `thd75-repl` relaying a radio's TX header) chain
-    /// [`Self::with_flags`] afterwards.
+    /// RPT1 combines the operator prefix and local module; RPT2 combines the
+    /// reflector prefix and target module. YOUR is `CQCQCQ` and flags are zero.
+    /// This is the relay convention in `ircDDBGateway/Common/DPlusHandler.cpp`
+    /// and `xlxd/src/cdplusprotocol.cpp`. Use [`Self::with_flags`] when relaying
+    /// source flag bytes.
     #[must_use]
-    pub fn for_relay(
-        operator: Callsign,
-        local_module: Module,
-        reflector: Callsign,
-        reflector_module: Module,
-        my_call: Callsign,
-        my_suffix: Suffix,
-    ) -> Self {
+    pub const fn for_relay(routing: RelayRouting, my_call: Callsign, my_suffix: Suffix) -> Self {
         Self {
-            flag1: 0,
-            flag2: 0,
-            flag3: 0,
-            rpt2: rpt_field(reflector, reflector_module),
-            rpt1: rpt_field(operator, local_module),
+            flags: HeaderFlags::NONE,
+            rpt2: rpt_field(routing.reflector, routing.reflector_module),
+            rpt1: rpt_field(routing.operator, routing.local_module),
             ur_call: Callsign::from_wire_bytes(*b"CQCQCQ  "),
             my_call,
             my_suffix,
         }
     }
 
-    /// Replace the three flag bytes, keeping every other field.
-    ///
-    /// [`DstarHeader::for_relay`] zeroes the flags, which is correct for a
-    /// TX-from-scratch client; a relay path that must preserve the source
-    /// header's repeater flags chains this on afterwards.
+    /// Replace the complete flag value, preserving every other field.
     #[must_use]
-    pub const fn with_flags(mut self, flag1: u8, flag2: u8, flag3: u8) -> Self {
-        self.flag1 = flag1;
-        self.flag2 = flag2;
-        self.flag3 = flag3;
+    pub const fn with_flags(mut self, flags: HeaderFlags) -> Self {
+        self.flags = flags;
         self
     }
 
-    /// Rebuild an incoming network header for radio-side RF playout.
+    /// Construct a local radio relay header using the repeater convention.
     ///
-    /// The `MMDVMHost` radio-header convention (`MMDVMHost/DStarControl.cpp:749-754`):
-    /// `rpt1` and `rpt2` both carry the local station callsign plus module,
-    /// `ur_call` becomes `CQCQCQ`, and the repeater bit (`0x40`) is set on
-    /// `flag1`. The remaining flag bytes and the speaker identity are
-    /// preserved from the incoming header.
+    /// RPT1 and RPT2 both contain the station plus local module, YOUR becomes
+    /// `CQCQCQ`, and the repeater bit is set. Other flag bits and the speaker
+    /// identity are preserved. Reference: `MMDVMHost/DStarControl.cpp`.
     #[must_use]
-    pub fn for_radio_relay(station: Callsign, local_module: Module, incoming: &Self) -> Self {
-        /// D-STAR flag1 repeater bit.
-        const REPEATER_MASK: u8 = 0x40;
-        let rpt = rpt_field(station, local_module);
+    pub const fn for_radio_relay(
+        station: RoutingCallsign,
+        local_module: Module,
+        incoming: &Self,
+    ) -> Self {
+        let repeater = rpt_field(station, local_module);
         Self {
-            flag1: incoming.flag1 | REPEATER_MASK,
-            flag2: incoming.flag2,
-            flag3: incoming.flag3,
-            rpt2: rpt,
-            rpt1: rpt,
+            flags: incoming.flags.with(HeaderFlag::Repeater, true),
+            rpt2: repeater,
+            rpt1: repeater,
             ur_call: Callsign::from_wire_bytes(*b"CQCQCQ  "),
             my_call: incoming.my_call,
             my_suffix: incoming.my_suffix,
         }
     }
 
-    /// Decode a 41-byte header.
+    /// Decode exactly 41 bytes, preserving flag, callsign and suffix bytes.
     ///
-    /// **Infallible.** Mirrors `ircDDBGateway`'s `setDPlusData` /
-    /// `setDExtraData` / `setDCSData` reference implementations,
-    /// which do raw `memcpy` of the callsign fields with zero
-    /// validation and skip the CRC check. Real reflectors emit
-    /// headers with bad CRCs and non-printable callsign bytes; a
-    /// strict decoder would silently drop real-world traffic.
+    /// CRC verification belongs to the enclosing codec's diagnostic policy.
+    /// This follows `ircDDBGateway`'s field-copying receive path.
     #[must_use]
     pub fn decode(data: &[u8; ENCODED_LEN]) -> Self {
-        let mut rpt2_bytes = [0u8; 8];
-        if let Some(s) = data.get(3..11) {
-            rpt2_bytes.copy_from_slice(s);
+        let mut flags = [0_u8; 3];
+        if let Some(source) = data.get(..3) {
+            flags.copy_from_slice(source);
         }
-        let mut rpt1_bytes = [0u8; 8];
-        if let Some(s) = data.get(11..19) {
-            rpt1_bytes.copy_from_slice(s);
+        let mut fields = [[0_u8; 8]; 4];
+        for (field, range) in fields.iter_mut().zip([3..11, 11..19, 19..27, 27..35]) {
+            if let Some(source) = data.get(range) {
+                field.copy_from_slice(source);
+            }
         }
-        let mut ur_bytes = [0u8; 8];
-        if let Some(s) = data.get(19..27) {
-            ur_bytes.copy_from_slice(s);
+        let [rpt2, rpt1, destination, speaker] = fields;
+        let mut suffix = [0_u8; 4];
+        if let Some(source) = data.get(35..39) {
+            suffix.copy_from_slice(source);
         }
-        let mut my_bytes = [0u8; 8];
-        if let Some(s) = data.get(27..35) {
-            my_bytes.copy_from_slice(s);
-        }
-        let mut suffix_bytes = [0u8; 4];
-        if let Some(s) = data.get(35..39) {
-            suffix_bytes.copy_from_slice(s);
-        }
-
         Self {
-            flag1: *data.first().unwrap_or(&0),
-            flag2: *data.get(1).unwrap_or(&0),
-            flag3: *data.get(2).unwrap_or(&0),
-            rpt2: Callsign::from_wire_bytes(rpt2_bytes),
-            rpt1: Callsign::from_wire_bytes(rpt1_bytes),
-            ur_call: Callsign::from_wire_bytes(ur_bytes),
-            my_call: Callsign::from_wire_bytes(my_bytes),
-            my_suffix: Suffix::from_wire_bytes(suffix_bytes),
+            flags: HeaderFlags::from_bytes(flags),
+            rpt2: Callsign::from_wire_bytes(rpt2),
+            rpt1: Callsign::from_wire_bytes(rpt1),
+            ur_call: Callsign::from_wire_bytes(destination),
+            my_call: Callsign::from_wire_bytes(speaker),
+            my_suffix: Suffix::from_wire_bytes(suffix),
         }
     }
 }
 
-/// Build an `rpt1`/`rpt2` field: 7-byte callsign + 1-byte module
-/// letter at index 7. The `Module` type's `b'A'..=b'Z'` invariant is
-/// what guarantees byte 7 is a valid module letter, so no runtime check
-/// needed.
-fn rpt_field(callsign: Callsign, module: Module) -> Callsign {
-    let cs = callsign.as_bytes();
-    let mut buf = [b' '; 8];
-    buf[..7].copy_from_slice(&cs[..7]);
-    buf[7] = module.as_byte();
-    Callsign::from_wire_bytes(buf)
+/// Place the module after the complete checked prefix without truncation.
+const fn rpt_field(callsign: RoutingCallsign, module: Module) -> Callsign {
+    let [byte0, byte1, byte2, byte3, byte4, byte5, byte6] = *callsign.as_bytes();
+    Callsign::from_wire_bytes([
+        byte0,
+        byte1,
+        byte2,
+        byte3,
+        byte4,
+        byte5,
+        byte6,
+        module.as_byte(),
+    ])
 }
 
-/// CRC-CCITT (reflected polynomial 0x8408, init 0xFFFF, final XOR 0xFFFF).
+/// Reflected CRC-CCITT: polynomial `0x8408`, initial and final XOR `0xFFFF`.
 ///
-/// Per `g4klx/MMDVMHost` `DSTARCRC.cpp` and JARL D-STAR specification.
+/// Reference: `ircDDBGateway/Common/CCITTChecksum.cpp`.
 #[must_use]
 pub fn crc_ccitt(data: &[u8]) -> u16 {
-    let mut crc: u16 = 0xFFFF;
+    let mut crc = 0xFFFF_u16;
     for &byte in data {
         crc ^= u16::from(byte);
         for _ in 0..8 {
-            if crc & 1 != 0 {
-                crc = (crc >> 1) ^ 0x8408;
+            crc = if crc & 1 == 0 {
+                crc >> 1
             } else {
-                crc >>= 1;
-            }
+                (crc >> 1) ^ 0x8408
+            };
         }
     }
     crc ^ 0xFFFF
@@ -278,272 +206,121 @@ pub fn crc_ccitt(data: &[u8]) -> u16 {
 mod tests {
     use super::*;
 
-    const fn cs(bytes: [u8; 8]) -> Callsign {
-        Callsign::from_wire_bytes(bytes)
-    }
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    fn test_header() -> DstarHeader {
-        DstarHeader {
-            flag1: 0x00,
-            flag2: 0x00,
-            flag3: 0x00,
-            rpt2: cs(*b"REF030 G"),
-            rpt1: cs(*b"REF030 C"),
-            ur_call: cs(*b"CQCQCQ  "),
-            my_call: cs(*b"W1AW    "),
-            my_suffix: Suffix::EMPTY,
-        }
-    }
-
-    #[test]
-    fn encode_decode_roundtrip() {
-        let header = test_header();
-        let encoded = header.encode();
-        assert_eq!(encoded.len(), ENCODED_LEN);
-        let decoded = DstarHeader::decode(&encoded);
-        assert_eq!(decoded, header);
+    fn relay() -> Result<DstarHeader, Box<dyn std::error::Error>> {
+        Ok(DstarHeader::for_relay(
+            RelayRouting {
+                operator: RoutingCallsign::new("W1AW")?,
+                local_module: Module::C,
+                reflector: RoutingCallsign::new("REF030")?,
+                reflector_module: Module::B,
+            },
+            Callsign::try_from_str("KQ4NIT")?,
+            Suffix::try_from_str("D75")?,
+        ))
     }
 
     #[test]
-    fn decode_accepts_bad_crc() {
-        // Per ircDDBGateway/Common/DPlusProtocolHandler.cpp:172
-        // ("DPlus checksums are unreliable") the receive path skips
-        // CRC checks. We mirror that: decode is infallible.
-        let header = test_header();
-        let mut encoded = header.encode();
-        if let Some(byte) = encoded.get_mut(40) {
-            *byte ^= 0xFF;
-        }
-        let decoded = DstarHeader::decode(&encoded);
-        assert_eq!(decoded.my_call, header.my_call);
+    fn relay_routes_preserve_both_named_modules_and_speaker() -> TestResult {
+        let header = relay()?;
+        assert_eq!(header.rpt1.as_bytes(), b"W1AW   C");
+        assert_eq!(header.rpt2.as_bytes(), b"REF030 B");
+        assert_eq!(header.ur_call.as_bytes(), b"CQCQCQ  ");
+        assert_eq!(header.my_call.text(), Ok("KQ4NIT"));
+        assert_eq!(header.my_suffix.text(), Ok("D75"));
+        assert_eq!(header.flags, HeaderFlags::NONE);
+        assert_eq!(DstarHeader::decode(&header.encode()), header);
+        Ok(())
     }
 
     #[test]
-    fn decode_accepts_non_ascii_callsign_verbatim() {
-        // Real-world reflector traffic includes non-printable bytes
-        // in callsign fields. Lenient receive: bytes preserved.
-        let header = test_header();
-        let mut encoded = header.encode();
-        if let Some(byte) = encoded.get_mut(27) {
-            *byte = 0xC3;
+    fn routing_constructor_rejects_truncation_and_invalid_receive_text() -> TestResult {
+        let longest = RoutingCallsign::new("ABCDEFG")?;
+        assert_eq!(longest.callsign().as_bytes(), b"ABCDEFG ");
+        for text in ["", "OPERATOR", "A\tB", "é"] {
+            assert!(
+                RoutingCallsign::new(text).is_err(),
+                "invalid prefix {text:?}"
+            );
         }
-        let decoded = DstarHeader::decode(&encoded);
-        assert_eq!(decoded.my_call.as_bytes()[0], 0xC3);
+        assert!(
+            RoutingCallsign::try_from(Callsign::from_wire_bytes(*b"OPERATOR")).is_err(),
+            "the eighth byte cannot be discarded"
+        );
+        assert!(
+            RoutingCallsign::try_from(Callsign::from_wire_bytes(*b"W1AW\0   ")).is_err(),
+            "lossless receive bytes require validation before routing"
+        );
+        Ok(())
     }
 
     #[test]
-    fn encode_for_dsvt_zeros_flag_bytes_before_crc() {
-        let hdr = DstarHeader {
-            flag1: 0xAA,
-            flag2: 0xBB,
-            flag3: 0xCC,
-            ..test_header()
-        };
-        let dsvt = hdr.encode_for_dsvt();
-        assert_eq!(dsvt[0], 0, "flag1 zeroed in DSVT encoding");
-        assert_eq!(dsvt[1], 0, "flag2 zeroed in DSVT encoding");
-        assert_eq!(dsvt[2], 0, "flag3 zeroed in DSVT encoding");
+    fn flag_operations_preserve_reserved_bytes_and_separate_control_code() -> TestResult {
+        let header = relay()?.with_flags(HeaderFlags::from_bytes([0xA5, 0xBB, 0xCC]));
+        assert_eq!(header.flags.control(), RepeaterControl::Unassigned);
+        let flags = header
+            .flags
+            .with(HeaderFlag::Repeater, true)
+            .with(HeaderFlag::Interrupted, false)
+            .with_control(RepeaterControl::Acknowledge);
+        assert_eq!(flags.as_bytes(), &[0xC3, 0xBB, 0xCC]);
+        assert!(flags.contains(HeaderFlag::Data));
+        assert!(flags.contains(HeaderFlag::Repeater));
+        assert!(!flags.contains(HeaderFlag::Interrupted));
+        assert_eq!(DstarHeader::decode(&header.encode()).flags, header.flags);
+        let radio = DstarHeader::for_radio_relay(RoutingCallsign::new("W1AW")?, Module::G, &header);
+        assert_eq!(radio.flags.as_bytes(), &[0xE5, 0xBB, 0xCC]);
+        assert_eq!(radio.rpt1.as_bytes(), b"W1AW   G");
+        assert_eq!(radio.rpt2, radio.rpt1);
+        assert_eq!(radio.my_call, header.my_call);
+        assert_eq!(radio.my_suffix, header.my_suffix);
+        Ok(())
     }
 
     #[test]
-    fn crc_ccitt_known_vector_w1aw_header() {
-        // Canonical 39-byte header body for the W1AW CQ via REF030 C
-        // example. Cross-checked against ircDDBGateway's
-        // CCITTChecksum.cpp table-based impl.
-        let mut body = [0u8; 39];
-        if let Some(s) = body.get_mut(3..11) {
-            s.copy_from_slice(b"REF030 G");
-        }
-        if let Some(s) = body.get_mut(11..19) {
-            s.copy_from_slice(b"REF030 C");
-        }
-        if let Some(s) = body.get_mut(19..27) {
-            s.copy_from_slice(b"CQCQCQ  ");
-        }
-        if let Some(s) = body.get_mut(27..35) {
-            s.copy_from_slice(b"W1AW    ");
-        }
-        if let Some(s) = body.get_mut(35..39) {
-            s.copy_from_slice(b"    ");
-        }
-        let crc = crc_ccitt(&body);
-        assert_eq!(crc, 0x1073);
+    fn dsvt_zeroes_flags_before_computing_its_crc() -> TestResult {
+        let header = relay()?.with_flags(HeaderFlags::from_bytes([0xAA, 0xBB, 0xCC]));
+        let encoded = header.encode_for_dsvt();
+        let expected = header.with_flags(HeaderFlags::NONE).encode();
+        assert_eq!(
+            encoded, expected,
+            "flags and their covered checksum must both change"
+        );
+        assert_ne!(encoded.get(39..), header.encode().get(39..));
+        Ok(())
     }
 
     #[test]
-    fn for_relay_rpt1_carries_local_module_byte() {
+    fn receive_preserves_nonprintable_fields_and_ignores_crc_in_field_decode() -> TestResult {
+        let mut bytes = relay()?.encode();
+        *bytes.get_mut(27).ok_or("MY offset")? = 0xC3;
+        *bytes.get_mut(40).ok_or("CRC offset")? ^= 0xFF;
+        let decoded = DstarHeader::decode(&bytes);
+        assert_eq!(decoded.my_call.as_bytes().first(), Some(&0xC3));
+        assert!(decoded.my_call.text().is_err());
+        assert_eq!(decoded.my_suffix.text(), Ok("D75"));
+        Ok(())
+    }
+
+    #[test]
+    fn crc_ccitt_known_vector_w1aw_header() -> TestResult {
         let header = DstarHeader::for_relay(
-            Callsign::from_wire_bytes(*b"W1AW    "),
-            Module::C,
-            Callsign::from_wire_bytes(*b"REF030  "),
-            Module::B,
-            Callsign::from_wire_bytes(*b"W1AW    "),
+            RelayRouting {
+                operator: RoutingCallsign::new("REF030")?,
+                local_module: Module::C,
+                reflector: RoutingCallsign::new("REF030")?,
+                reflector_module: Module::G,
+            },
+            Callsign::try_from_str("W1AW")?,
             Suffix::EMPTY,
         );
+        let bytes = header.encode();
         assert_eq!(
-            header.rpt1.as_bytes()[7],
-            b'C',
-            "rpt1[7] must be the local module letter; xlxd silently drops if invalid"
+            bytes.get(39..),
+            Some([0x73, 0x10].as_slice()),
+            "independent header checksum vector"
         );
-        assert_eq!(
-            &header.rpt1.as_bytes()[..7],
-            b"W1AW   ",
-            "rpt1[0..7] must be the operator callsign space-padded to 7 bytes"
-        );
-    }
-
-    #[test]
-    fn for_relay_rpt2_carries_reflector_module_byte() {
-        let header = DstarHeader::for_relay(
-            Callsign::from_wire_bytes(*b"W1AW    "),
-            Module::C,
-            Callsign::from_wire_bytes(*b"REF030  "),
-            Module::B,
-            Callsign::from_wire_bytes(*b"W1AW    "),
-            Suffix::EMPTY,
-        );
-        assert_eq!(
-            header.rpt2.as_bytes()[7],
-            b'B',
-            "rpt2[7] must be the reflector module letter"
-        );
-        assert_eq!(
-            &header.rpt2.as_bytes()[..7],
-            b"REF030 ",
-            "rpt2[0..7] must be the reflector callsign space-padded to 7 bytes"
-        );
-    }
-
-    #[test]
-    fn for_relay_ur_call_is_cqcqcq() {
-        let header = DstarHeader::for_relay(
-            Callsign::from_wire_bytes(*b"W1AW    "),
-            Module::C,
-            Callsign::from_wire_bytes(*b"REF030  "),
-            Module::B,
-            Callsign::from_wire_bytes(*b"W1AW    "),
-            Suffix::EMPTY,
-        );
-        assert_eq!(
-            header.ur_call.as_bytes(),
-            b"CQCQCQ  ",
-            "ur_call must be CQCQCQ space-padded for relay headers"
-        );
-    }
-
-    #[test]
-    fn for_relay_zeroes_flag_bytes() {
-        let header = DstarHeader::for_relay(
-            Callsign::from_wire_bytes(*b"W1AW    "),
-            Module::C,
-            Callsign::from_wire_bytes(*b"REF030  "),
-            Module::B,
-            Callsign::from_wire_bytes(*b"W1AW    "),
-            Suffix::EMPTY,
-        );
-        assert_eq!(header.flag1, 0);
-        assert_eq!(header.flag2, 0);
-        assert_eq!(header.flag3, 0);
-    }
-
-    #[test]
-    fn for_relay_passes_through_my_call_and_suffix() {
-        let header = DstarHeader::for_relay(
-            Callsign::from_wire_bytes(*b"GATEWAY "),
-            Module::C,
-            Callsign::from_wire_bytes(*b"REF030  "),
-            Module::B,
-            Callsign::from_wire_bytes(*b"W1AW    "),
-            Suffix::from_wire_bytes(*b"ECHO"),
-        );
-        assert_eq!(
-            header.my_call.as_bytes(),
-            b"W1AW    ",
-            "my_call distinct from operator (relay scenario)"
-        );
-        assert_eq!(header.my_suffix.as_bytes(), b"ECHO");
-    }
-
-    #[test]
-    fn for_relay_truncates_callsign_to_7_bytes_for_rpt() {
-        // Even with a fully-populated 8-byte callsign, only the first
-        // 7 bytes feed rpt1; byte 7 is reserved for the module letter.
-        // (Real callsigns are ≤6 chars so this only matters for
-        // adversarial inputs, but the invariant must hold.)
-        let header = DstarHeader::for_relay(
-            Callsign::from_wire_bytes(*b"OPERATOR"),
-            Module::A,
-            Callsign::from_wire_bytes(*b"REFCALLR"),
-            Module::E,
-            Callsign::from_wire_bytes(*b"OPERATOR"),
-            Suffix::EMPTY,
-        );
-        assert_eq!(&header.rpt1.as_bytes()[..7], b"OPERATO");
-        assert_eq!(header.rpt1.as_bytes()[7], b'A');
-        assert_eq!(&header.rpt2.as_bytes()[..7], b"REFCALL");
-        assert_eq!(header.rpt2.as_bytes()[7], b'E');
-    }
-
-    #[test]
-    fn suffix_roundtrip_nonempty() {
-        let hdr = DstarHeader {
-            my_suffix: Suffix::from_wire_bytes(*b"ECHO"),
-            ..test_header()
-        };
-        let encoded = hdr.encode();
-        let decoded = DstarHeader::decode(&encoded);
-        assert_eq!(decoded.my_suffix.as_bytes(), b"ECHO");
-    }
-
-    #[test]
-    fn with_flags_overrides_only_the_flag_bytes() {
-        let relayed = DstarHeader::for_relay(
-            Callsign::from_wire_bytes(*b"W1AW    "),
-            Module::C,
-            Callsign::from_wire_bytes(*b"REF030  "),
-            Module::C,
-            Callsign::from_wire_bytes(*b"W1AW    "),
-            Suffix::from_wire_bytes(*b"D75 "),
-        )
-        .with_flags(0x40, 0x01, 0x02);
-        assert_eq!(relayed.flag1, 0x40);
-        assert_eq!(relayed.flag2, 0x01);
-        assert_eq!(relayed.flag3, 0x02);
-        assert_eq!(relayed.ur_call.as_bytes(), b"CQCQCQ  ");
-        assert_eq!(relayed.rpt1.as_bytes(), b"W1AW   C");
-        assert_eq!(relayed.rpt2.as_bytes(), b"REF030 C");
-    }
-
-    #[test]
-    fn radio_relay_header_follows_the_repeater_convention() {
-        let incoming = DstarHeader {
-            flag1: 0x00,
-            flag2: 0x01,
-            flag3: 0x02,
-            my_call: Callsign::from_wire_bytes(*b"KQ4NIT  "),
-            my_suffix: Suffix::from_wire_bytes(*b"D75 "),
-            ..test_header()
-        };
-        let radio = DstarHeader::for_radio_relay(
-            Callsign::from_wire_bytes(*b"W1AW    "),
-            Module::C,
-            &incoming,
-        );
-        assert_eq!(radio.flag1, 0x40, "the repeater bit must be set");
-        assert_eq!(radio.flag2, 0x01, "other flags must be preserved");
-        assert_eq!(radio.flag3, 0x02);
-        assert_eq!(radio.rpt1.as_bytes(), b"W1AW   C");
-        assert_eq!(
-            radio.rpt2.as_bytes(),
-            b"W1AW   C",
-            "rpt1 and rpt2 both carry the local station"
-        );
-        assert_eq!(radio.ur_call.as_bytes(), b"CQCQCQ  ");
-        assert_eq!(
-            radio.my_call.as_bytes(),
-            b"KQ4NIT  ",
-            "the speaker identity must be preserved"
-        );
-        assert_eq!(radio.my_suffix.as_bytes(), b"D75 ");
+        Ok(())
     }
 }

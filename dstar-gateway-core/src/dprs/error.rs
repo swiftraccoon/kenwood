@@ -33,11 +33,54 @@ pub enum DprsError {
         got: f64,
     },
 
-    /// Callsign field fails `Callsign::try_from_str`.
-    #[error("DPRS sentence callsign field is invalid: {reason}")]
-    InvalidCallsign {
-        /// Why the callsign failed.
-        reason: &'static str,
+    /// Source identifier fails its checked text grammar.
+    #[error(transparent)]
+    InvalidSource(#[from] super::source::DprsSourceError),
+    /// The four hexadecimal CRC digits or following comma are malformed.
+    #[error("DPRS checksum requires four hexadecimal digits followed by a comma")]
+    MalformedCrcField,
+    /// The source/destination separator, route, or position delimiter is malformed.
+    #[error("DPRS TNC2 header or uncompressed position delimiter is malformed")]
+    MalformedHeader,
+    /// The sentence exceeds the implementation's bounded receive policy.
+    #[error("DPRS sentence has {got} bytes including CR; maximum is {maximum}")]
+    SentenceTooLong {
+        /// Observed or reconstructed CR-terminated length.
+        got: usize,
+        /// Implementation resource limit, not a universal DPRS wire maximum.
+        maximum: usize,
+    },
+    /// Table selector is not primary, alternate, or an uncompressed overlay.
+    #[error("invalid APRS symbol table selector {got:?}")]
+    InvalidSymbolTable {
+        /// Rejected character.
+        got: char,
+    },
+    /// Overlay is not a decimal digit or uppercase ASCII letter.
+    #[error("invalid uncompressed APRS overlay {got:?}")]
+    InvalidSymbolOverlay {
+        /// Rejected character.
+        got: char,
+    },
+    /// Symbol code is outside printable non-space ASCII.
+    #[error("invalid APRS symbol code {got:?}")]
+    InvalidSymbolCode {
+        /// Rejected character.
+        got: char,
+    },
+    /// Uncompressed position comment exceeds its 43-byte field.
+    #[error("APRS position comment has {got} bytes; maximum is 43")]
+    CommentTooLong {
+        /// Supplied byte length.
+        got: usize,
+    },
+    /// Plain comment contains a control, non-ASCII, or reserved TNC switch byte.
+    #[error("APRS position comment byte {index} is invalid: 0x{byte:02X}")]
+    InvalidCommentByte {
+        /// Zero-based byte index.
+        index: usize,
+        /// Rejected original byte.
+        byte: u8,
     },
 
     /// CRC mismatch: computed vs on-wire disagree.

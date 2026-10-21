@@ -1,9 +1,14 @@
 [package]
 name = "dstar-gateway-core-fuzz"
 version = "0.0.0"
-publish = false
+authors = ["swiftraccoon"]
+categories = ["development-tools::testing"]
 edition = "2024"
+keywords = ["dstar", "fuzzing"]
 license = "GPL-2.0-or-later"
+publish = false
+repository = "https://github.com/swiftraccoon/kenwood"
+description = "Fuzz targets for the D-STAR gateway protocol core"
 
 [package.metadata]
 cargo-fuzz = true
@@ -18,75 +23,127 @@ path = ".."
 [workspace]
 members = ["."]
 
+[lints]
+workspace = true
+
+[workspace.lints.rust]
+elided_lifetimes_in_paths = "deny"
+let_underscore_drop = "deny"
+missing_debug_implementations = "deny"
+missing_docs = "deny"
+non_ascii_idents = "deny"
+single_use_lifetimes = "deny"
+trivial_casts = "deny"
+trivial_numeric_casts = "deny"
+unreachable_pub = "deny"
+unsafe_code = "forbid"
+unused_crate_dependencies = "deny"
+unused_import_braces = "deny"
+unused_qualifications = "deny"
+unused_results = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+cargo = { level = "deny", priority = -1 }
+dbg_macro = "deny"
+expect_used = "deny"
+format_push_string = "deny"
+indexing_slicing = "deny"
+infinite_loop = "deny"
+mem_forget = "deny"
+missing_assert_message = "deny"
+missing_const_for_fn = "deny"
+module_name_repetitions = "allow"
+multiple_crate_versions = "allow"
+nursery = { level = "deny", priority = -1 }
+panic = "deny"
+pedantic = { level = "deny", priority = -1 }
+redundant_pub_crate = "allow"
+restriction = { level = "allow", priority = -1 }
+todo = "deny"
+undocumented_unsafe_blocks = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"
+
+[workspace.lints.rustdoc]
+bare_urls = "deny"
+broken_intra_doc_links = "deny"
+invalid_codeblock_attributes = "deny"
+missing_crate_level_docs = "deny"
+private_intra_doc_links = "deny"
+unescaped_backticks = "deny"
+
 [profile.release]
 debug = 1
 
 [[bin]]
+bench = false
+doc = false
 name = "dplus_decode_server_to_client"
 path = "fuzz_targets/dplus_decode_server_to_client.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "dplus_decode_client_to_server"
 path = "fuzz_targets/dplus_decode_client_to_server.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "dplus_parse_auth_response"
 path = "fuzz_targets/dplus_parse_auth_response.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "dextra_decode_server_to_client"
 path = "fuzz_targets/dextra_decode_server_to_client.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "dextra_decode_client_to_server"
 path = "fuzz_targets/dextra_decode_client_to_server.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "dcs_decode_server_to_client"
 path = "fuzz_targets/dcs_decode_server_to_client.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "dcs_decode_client_to_server"
 path = "fuzz_targets/dcs_decode_client_to_server.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "header_decode"
 path = "fuzz_targets/header_decode.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "slow_data_descramble"
 path = "fuzz_targets/slow_data_descramble.rs"
 test = false
-doc = false
-bench = false
 
 [[bin]]
+bench = false
+doc = false
 name = "dprs_parse"
 path = "fuzz_targets/dprs_parse.rs"
 test = false
-doc = false
-bench = false

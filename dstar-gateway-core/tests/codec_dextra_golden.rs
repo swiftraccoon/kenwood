@@ -16,7 +16,7 @@ use trybuild as _;
 use dstar_gateway_core::codec::dextra::{
     encode_connect_ack, encode_connect_link, encode_connect_nak, encode_poll, encode_unlink,
 };
-use dstar_gateway_core::types::{Callsign, Module};
+use dstar_gateway_core::types::{Callsign, Module, ModuleSlot, RepeaterIdentity, RoutingCallsign};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -24,15 +24,18 @@ fn cs(s: &str) -> Result<Callsign, Box<dyn std::error::Error>> {
     Ok(Callsign::try_from_str(s)?)
 }
 
-fn m(c: char) -> Result<Module, Box<dyn std::error::Error>> {
-    Ok(Module::try_from_char(c)?)
-}
-
 #[test]
 fn golden_connect_link() -> TestResult {
     let expected = include_bytes!("golden/dextra/connect_link.bin");
     let mut buf = [0u8; 16];
-    let n = encode_connect_link(&mut buf, &cs("W1AW")?, m('C')?, m('B')?)?;
+    let n = encode_connect_link(
+        &mut buf,
+        RepeaterIdentity {
+            callsign: RoutingCallsign::new("W1AW")?,
+            module: Module::B,
+        },
+        Module::C,
+    )?;
     assert_eq!(buf.get(..n).ok_or("n out of range")?, &expected[..]);
     Ok(())
 }
@@ -41,7 +44,13 @@ fn golden_connect_link() -> TestResult {
 fn golden_unlink() -> TestResult {
     let expected = include_bytes!("golden/dextra/unlink.bin");
     let mut buf = [0u8; 16];
-    let n = encode_unlink(&mut buf, &cs("W1AW")?, m('B')?)?;
+    let n = encode_unlink(
+        &mut buf,
+        RepeaterIdentity {
+            callsign: RoutingCallsign::new("W1AW")?,
+            module: Module::B,
+        },
+    )?;
     assert_eq!(buf.get(..n).ok_or("n out of range")?, &expected[..]);
     Ok(())
 }
@@ -59,7 +68,14 @@ fn golden_poll() -> TestResult {
 fn golden_connect_ack() -> TestResult {
     let expected = include_bytes!("golden/dextra/connect_ack.bin");
     let mut buf = [0u8; 16];
-    let n = encode_connect_ack(&mut buf, &cs("XRF030")?, m('C')?)?;
+    let n = encode_connect_ack(
+        &mut buf,
+        RepeaterIdentity {
+            callsign: RoutingCallsign::new("XRF030")?,
+            module: Module::B,
+        },
+        Module::C,
+    )?;
     assert_eq!(buf.get(..n).ok_or("n out of range")?, &expected[..]);
     Ok(())
 }
@@ -68,7 +84,14 @@ fn golden_connect_ack() -> TestResult {
 fn golden_connect_nak() -> TestResult {
     let expected = include_bytes!("golden/dextra/connect_nak.bin");
     let mut buf = [0u8; 16];
-    let n = encode_connect_nak(&mut buf, &cs("XRF030")?, m('C')?)?;
+    let n = encode_connect_nak(
+        &mut buf,
+        RepeaterIdentity {
+            callsign: RoutingCallsign::new("XRF030")?,
+            module: Module::B,
+        },
+        ModuleSlot::Module(Module::C),
+    )?;
     assert_eq!(buf.get(..n).ok_or("n out of range")?, &expected[..]);
     Ok(())
 }

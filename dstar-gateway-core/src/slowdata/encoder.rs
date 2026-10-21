@@ -8,47 +8,48 @@
 
 use super::{SlowDataTextMessage, scrambler::scramble};
 
-/// Encode a text message into eight scrambled 3-byte slow-data payloads.
-///
-/// Construction of [`SlowDataTextMessage`] proves that the input is exactly
-/// 20 wire bytes containing printable ASCII plus right-side space padding.
-/// The output is therefore always exactly eight payloads (four blocks × two
-/// halves), with no encoder-side truncation or replacement.
-#[must_use]
-pub const fn encode_text_message(message: SlowDataTextMessage) -> [[u8; 3]; 8] {
-    let [
-        b0,
-        b1,
-        b2,
-        b3,
-        b4,
-        b5,
-        b6,
-        b7,
-        b8,
-        b9,
-        b10,
-        b11,
-        b12,
-        b13,
-        b14,
-        b15,
-        b16,
-        b17,
-        b18,
-        b19,
-    ] = message.into_bytes();
+impl SlowDataTextMessage {
+    /// Encode all 20 stored bytes into eight scrambled 3-byte fragments.
+    ///
+    /// Four five-byte text blocks occupy two voice-frame fragments each.
+    /// Transmit construction supplies printable ASCII plus right-side padding;
+    /// a received message retains every original byte when re-encoded.
+    #[must_use]
+    pub const fn encode(self) -> [[u8; 3]; 8] {
+        let [
+            b0,
+            b1,
+            b2,
+            b3,
+            b4,
+            b5,
+            b6,
+            b7,
+            b8,
+            b9,
+            b10,
+            b11,
+            b12,
+            b13,
+            b14,
+            b15,
+            b16,
+            b17,
+            b18,
+            b19,
+        ] = self.into_bytes();
 
-    [
-        scramble([0x40, b0, b1]),
-        scramble([b2, b3, b4]),
-        scramble([0x41, b5, b6]),
-        scramble([b7, b8, b9]),
-        scramble([0x42, b10, b11]),
-        scramble([b12, b13, b14]),
-        scramble([0x43, b15, b16]),
-        scramble([b17, b18, b19]),
-    ]
+        [
+            scramble([0x40, b0, b1]),
+            scramble([b2, b3, b4]),
+            scramble([0x41, b5, b6]),
+            scramble([b7, b8, b9]),
+            scramble([0x42, b10, b11]),
+            scramble([b12, b13, b14]),
+            scramble([0x43, b15, b16]),
+            scramble([b17, b18, b19]),
+        ]
+    }
 }
 
 #[cfg(test)]
@@ -61,7 +62,7 @@ mod tests {
 
     #[test]
     fn empty_text_is_an_explicit_all_space_message() -> TestResult {
-        let out = encode_text_message(SlowDataTextMessage::try_from_text("")?);
+        let out = SlowDataTextMessage::try_from_text("")?.encode();
         let mut collector = SlowDataTextCollector::new();
         for (index, fragment) in (1u8..).zip(out) {
             collector.push(fragment, index);
@@ -73,7 +74,7 @@ mod tests {
 
     #[test]
     fn short_input_pads_with_spaces() -> TestResult {
-        let out = encode_text_message(SlowDataTextMessage::try_from_text("Hi")?);
+        let out = SlowDataTextMessage::try_from_text("Hi")?.encode();
         assert_eq!(out.len(), 8);
 
         let mut c = SlowDataTextCollector::new();
@@ -87,7 +88,7 @@ mod tests {
 
     #[test]
     fn exactly_20_chars_roundtrip() -> TestResult {
-        let out = encode_text_message(SlowDataTextMessage::try_from_text("ABCDEFGHIJKLMNOPQRST")?);
+        let out = SlowDataTextMessage::try_from_text("ABCDEFGHIJKLMNOPQRST")?.encode();
         let mut c = SlowDataTextCollector::new();
         for (idx, h) in (1u8..).zip(out.iter()) {
             c.push(*h, idx);
@@ -101,7 +102,7 @@ mod tests {
     fn output_is_always_eight_payloads() -> TestResult {
         for text in &["A", "Hello", "Hello world", "X".repeat(20).as_str()] {
             let message = SlowDataTextMessage::try_from_text(text)?;
-            let out = encode_text_message(message);
+            let out = message.encode();
             assert_eq!(out.len(), 8, "text = {text:?}");
         }
         Ok(())
@@ -109,7 +110,7 @@ mod tests {
 
     #[test]
     fn descramble_reveals_block_index_and_text_chars() -> TestResult {
-        let out = encode_text_message(SlowDataTextMessage::try_from_text("ABCDEFGHIJKLMNOPQRST")?);
+        let out = SlowDataTextMessage::try_from_text("ABCDEFGHIJKLMNOPQRST")?.encode();
         for block in 0u8..4 {
             let half1 = *out
                 .get(usize::from(block) * 2)

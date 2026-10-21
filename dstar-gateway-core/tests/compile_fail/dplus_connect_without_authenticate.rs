@@ -7,19 +7,20 @@
 //! proves the trait bound keeps DPlus out.
 
 use dstar_gateway_core::session::client::{DPlus, Session};
-use dstar_gateway_core::types::{Callsign, Module};
+use dstar_gateway_core::types::{Module, RoutingCallsign};
 use std::time::Instant;
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let session = Session::<DPlus, _>::builder()
-        .callsign(Callsign::try_from_str("W1AW").unwrap())
-        .local_module(Module::try_from_char('B').unwrap())
-        .reflector_module(Module::try_from_char('C').unwrap())
-        .peer("127.0.0.1:20001".parse().unwrap())
+        .callsign(RoutingCallsign::new("W1AW")?)
+        .local_module(Module::B)
+        .reflector_module(Module::C)
+        .peer("127.0.0.1:20001".parse()?)
         .build();
 
     // ERROR: no method named `connect` found for `Session<DPlus, Configured>`
     // because DPlus does not implement `NoAuthRequired`. Must call
     // `.authenticate(hosts)` first.
     let _connecting = session.connect(Instant::now());
+    Ok(())
 }

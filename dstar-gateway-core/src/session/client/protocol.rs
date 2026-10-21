@@ -22,15 +22,15 @@ mod sealed {
 }
 
 /// `DPlus` (REF reflectors). Requires TCP authentication.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DPlus;
 
 /// `DExtra` (XRF/XLX reflectors).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DExtra;
 
 /// `DCS` reflectors.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Dcs;
 
 impl sealed::Sealed for DPlus {}

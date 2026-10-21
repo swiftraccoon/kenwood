@@ -5,4 +5,6 @@ error[E0599]: no method named `build` found for struct `SessionBuilder<dstar_gat
    |                            ^^^^^ method not found in `SessionBuilder<dstar_gateway_core::DExtra, Missing, Provided, Provided, Provided>`
    |
    = note: the method was found for
-           - `SessionBuilder<P, Provided, Provided, Provided, Provided>`
+           - `SessionBuilder<dstar_gateway_core::DExtra, Provided, Provided, Provided, Provided>`
+           - `SessionBuilder<dstar_gateway_core::DPlus, Provided, Provided, Provided, Provided>`
+           - `SessionBuilder<dstar_gateway_core::Dcs, Provided, Provided, Provided, Provided, Provided>`

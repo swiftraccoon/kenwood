@@ -128,6 +128,50 @@ impl std::fmt::Display for Module {
     }
 }
 
+impl TryFrom<char> for Module {
+    type Error = TypeError;
+
+    fn try_from(value: char) -> Result<Self, Self::Error> {
+        Self::try_from_char(value)
+    }
+}
+
+impl TryFrom<u8> for Module {
+    type Error = TypeError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        Self::try_from_byte(value)
+    }
+}
+
+impl std::str::FromStr for Module {
+    type Err = TypeError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.len() != 1 {
+            return Err(TypeError::InvalidModuleLength { got: value.len() });
+        }
+        let byte = value
+            .as_bytes()
+            .first()
+            .copied()
+            .ok_or(TypeError::InvalidModuleLength { got: 0 })?;
+        Self::try_from_byte(byte)
+    }
+}
+
+impl From<Module> for char {
+    fn from(value: Module) -> Self {
+        value.as_char()
+    }
+}
+
+impl From<Module> for u8 {
+    fn from(value: Module) -> Self {
+        value.as_byte()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

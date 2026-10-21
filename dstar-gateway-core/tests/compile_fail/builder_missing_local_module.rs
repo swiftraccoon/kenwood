@@ -4,15 +4,16 @@
 //! builder field independently, not just the first one.
 
 use dstar_gateway_core::session::client::{DExtra, Session};
-use dstar_gateway_core::types::{Callsign, Module};
+use dstar_gateway_core::types::{Module, RoutingCallsign};
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let builder = Session::<DExtra, _>::builder()
-        .callsign(Callsign::try_from_str("W1AW").unwrap())
-        .reflector_module(Module::try_from_char('C').unwrap())
-        .peer("127.0.0.1:30001".parse().unwrap());
+        .callsign(RoutingCallsign::new("W1AW")?)
+        .reflector_module(Module::C)
+        .peer("127.0.0.1:30001".parse()?);
 
     // ERROR: no method named `build` found for
     // `SessionBuilder<DExtra, Provided, Missing, Provided, Provided>`.
     let _session = builder.build();
+    Ok(())
 }

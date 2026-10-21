@@ -10,7 +10,7 @@ use super::text::SlowDataText;
 /// Reference: `ircDDBGateway/Common/DStarDefines.h:85-92`
 /// (`SLOW_DATA_TYPE_GPS = 0x30`, `SLOW_DATA_TYPE_TEXT = 0x40`, etc.).
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SlowDataBlockKind {
     /// `0x3X`: GPS NMEA passthrough.
     Gps,
@@ -51,7 +51,7 @@ impl SlowDataBlockKind {
 
 /// A complete slow data block extracted from a stream of voice frames.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SlowDataBlock {
     /// GPS/NMEA payload bytes preserved exactly as received.
     ///

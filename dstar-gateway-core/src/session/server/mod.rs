@@ -5,10 +5,8 @@
 //! dispatches all three through dedicated per-protocol
 //! `handle_inbound_*` methods on `ProtocolEndpoint<P>`.
 //!
-//! The server-side machinery mirrors the client-side split:
-//! [`ServerSessionCore`] is the protocol-erased state machine,
-//! [`ServerSession<P, S>`] is the typestate wrapper. The
-//! `dstar-gateway-server` shell spawns one [`ServerSessionCore`] per
+//! [`ServerSessionCore`] checks the runtime state of one peer. The
+//! `dstar-gateway-server` shell creates one [`ServerSessionCore`] per
 //! inbound peer and routes datagrams through
 //! [`ServerSessionCore::handle_input`].
 //!
@@ -17,16 +15,12 @@
 //! fan-out engine uses it to avoid re-encoding the same bytes
 //! per destination.
 
-mod core;
-mod event;
-mod forwardable;
-mod session;
-mod state;
-
 pub use self::core::ServerSessionCore;
 pub use event::{ClientRejectedReason, ServerEvent};
 pub use forwardable::ForwardableFrame;
-pub use session::ServerSession;
-pub use state::{
-    Closed, Link1Received, Linked, ServerState, ServerStateKind, Streaming, Unknown, Unlinking,
-};
+pub use state::ServerStateKind;
+
+mod core;
+mod event;
+mod forwardable;
+mod state;

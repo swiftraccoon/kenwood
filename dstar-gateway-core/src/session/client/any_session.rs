@@ -18,7 +18,7 @@ use super::state::{
 /// a known cost of full typestate.
 #[non_exhaustive]
 #[derive(Debug)]
-pub enum AnySession<P: Protocol> {
+pub enum AnySession<P> {
     /// [`Configured`] state: session built but no I/O has happened.
     Configured(Session<P, Configured>),
     /// [`Authenticated`] state: `DPlus` only, TCP auth completed.
@@ -53,20 +53,25 @@ mod tests {
     use super::*;
     use crate::session::client::core::SessionCore;
     use crate::session::client::protocol::DExtra;
-    use crate::types::{Callsign, Module, ProtocolKind};
+    use crate::types::{Module, RoutingCallsign};
+    use crate::{ClientProtocol, SessionConfig};
     use std::marker::PhantomData;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     const PEER: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30001);
 
     fn dextra_configured_any() -> AnySession<DExtra> {
-        let core = SessionCore::new(
-            ProtocolKind::DExtra,
-            Callsign::from_wire_bytes(*b"W1AW    "),
-            Module::B,
-            Module::C,
-            PEER,
-        );
+        const LOCAL: RoutingCallsign = match RoutingCallsign::from_padded_bytes(*b"W1AW   ") {
+            Ok(value) => value,
+            Err(_) => unreachable!(),
+        };
+        let core = SessionCore::new(SessionConfig {
+            protocol: ClientProtocol::DExtra,
+            callsign: LOCAL,
+            local_module: Module::B,
+            reflector_module: Module::C,
+            peer: PEER,
+        });
         AnySession::Configured(Session {
             inner: core,
             _protocol: PhantomData,

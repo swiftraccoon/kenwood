@@ -4,10 +4,10 @@
 //! See [`driver`] for the trait definition. Per-protocol client
 //! sessions live in [`client`]. Server sessions live in [`server`].
 
+pub use driver::{Driver, Transmit};
+
 pub mod client;
 pub mod driver;
 pub mod outbox;
 pub mod server;
 pub mod timer_wheel;
-
-pub use driver::{Driver, Transmit};

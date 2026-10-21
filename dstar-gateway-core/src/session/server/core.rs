@@ -36,7 +36,9 @@ use crate::header::DstarHeader;
 use crate::session::client::Protocol;
 use crate::session::driver::Transmit;
 use crate::session::outbox::{OutboundPacket, Outbox};
-use crate::types::{Callsign, Module, ProtocolKind, StreamId};
+use crate::types::{
+    Callsign, Module, ModuleSlot, ProtocolKind, RepeaterIdentity, RoutingCallsign, StreamId,
+};
 use crate::validator::VecSink;
 use crate::voice::VoiceFrame;
 
@@ -113,22 +115,15 @@ enum RawServerEvent {
 ///
 /// Each instance tracks one client. The `dstar-gateway-server` shell
 /// spawns a `ServerSessionCore` per inbound peer and routes datagrams
-/// through [`Self::handle_input`]. The typestate wrapper
-/// [`super::ServerSession`] sits on top and adds compile-time state
-/// discrimination.
+/// through [`Self::handle_input`]. A linked peer keeps its callsign and
+/// module until disconnect. During a voice stream, only its active stream
+/// identifier can deliver frames or end the stream.
 pub struct ServerSessionCore {
     /// Which protocol this client speaks.
     kind: ProtocolKind,
     /// Client peer address.
     peer: SocketAddr,
-    /// Default reflector module for this session.
-    ///
-    /// `DPlus` LINK2 does not carry a module letter on the wire;
-    /// the reflector's own identity is what implicitly selects it.
-    /// This field carries the module the reflector endpoint is
-    /// bound to so `DPlus` sessions have something to put in their
-    /// `ClientLinked` event. `DExtra` and `DCS` LINK packets carry
-    /// their own `reflector_module` and will overwrite this on LINK.
+    /// Reflector module selected by the endpoint.
     reflector_module: Module,
     /// Runtime state.
     state: InternalState,
@@ -136,14 +131,7 @@ pub struct ServerSessionCore {
     client_callsign: Option<Callsign>,
     /// Local module letter of the linked client.
     client_module: Option<Module>,
-    /// Last stream id surfaced as a `StreamStarted` event.
-    ///
-    /// DCS voice packets carry the D-STAR header embedded in every
-    /// 100-byte frame, so the server can't distinguish "start of
-    /// stream" by packet type alone; it must track whether the
-    /// incoming `stream_id` is the same as the last frame's or a
-    /// fresh one. A fresh id emits `StreamStarted` first, then the
-    /// `StreamFrame`; the same id emits only `StreamFrame`.
+    /// Active stream identifier, cleared by its EOT or disconnect.
     last_stream_id: Option<StreamId>,
     /// Outbound packet queue.
     outbox: Outbox,
@@ -180,9 +168,8 @@ impl ServerSessionCore {
     /// protocol, peer, and reflector module.
     ///
     /// `reflector_module` is the module this reflector endpoint is
-    /// bound to, used as the default for `DPlus` `ClientLinked`
-    /// events and overwritten on LINK for `DExtra`/`DCS` which carry
-    /// their own module in the wire packet.
+    /// bound to. `DExtra` and `DCS` LINK requests for another module
+    /// are ignored.
     #[must_use]
     pub fn new(kind: ProtocolKind, peer: SocketAddr, reflector_module: Module) -> Self {
         Self {
@@ -247,11 +234,28 @@ impl ServerSessionCore {
     /// Returns [`Error::Protocol`] wrapping the codec error if the
     /// datagram cannot be parsed.
     pub fn handle_input(&mut self, now: Instant, bytes: &[u8]) -> Result<(), Error> {
-        match self.kind {
+        if self.state == InternalState::Closed {
+            return Ok(());
+        }
+        let result = match self.kind {
             ProtocolKind::DExtra => self.handle_dextra_input(now, bytes),
             ProtocolKind::DPlus => self.handle_dplus_input(now, bytes),
             ProtocolKind::Dcs => self.handle_dcs_input(now, bytes),
+        };
+        if matches!(
+            &result,
+            Err(Error::Protocol(
+                ProtocolError::DExtra(
+                    crate::codec::dextra::DExtraError::UnknownPacketLength { .. }
+                ) | ProtocolError::DPlus(
+                    crate::codec::dplus::DPlusError::UnknownPacketLength { .. }
+                ) | ProtocolError::Dcs(crate::codec::dcs::DcsError::UnknownPacketLength { .. })
+            ))
+        ) {
+            tracing::debug!(protocol = ?self.kind, length = bytes.len(), "ignored unknown server datagram length");
+            return Ok(());
         }
+        result
     }
 
     fn handle_dextra_input(&mut self, now: Instant, bytes: &[u8]) -> Result<(), Error> {
@@ -263,8 +267,11 @@ impl ServerSessionCore {
                 reflector_module,
                 client_module,
             } => self.on_dextra_link(now, callsign, reflector_module, client_module),
-            ClientPacket::Unlink { callsign, .. } => {
-                self.on_dextra_unlink(callsign);
+            ClientPacket::Unlink {
+                callsign,
+                client_module,
+            } => {
+                self.on_dextra_unlink(callsign, client_module);
                 Ok(())
             }
             ClientPacket::Poll { callsign } => self.on_dextra_poll(now, callsign),
@@ -294,12 +301,28 @@ impl ServerSessionCore {
         reflector_module: Module,
         client_module: Module,
     ) -> Result<(), Error> {
-        if self.state != InternalState::Unknown && self.state != InternalState::Linked {
+        if !matches!(
+            self.state,
+            InternalState::Unknown | InternalState::Linked | InternalState::Streaming
+        ) || reflector_module != self.reflector_module
+            || self
+                .client_callsign
+                .is_some_and(|existing| existing != callsign)
+            || self
+                .client_module
+                .is_some_and(|existing| existing != client_module)
+        {
             return Ok(());
         }
+        let identity = RepeaterIdentity {
+            callsign: RoutingCallsign::try_from(callsign)?,
+            module: client_module,
+        };
         self.client_callsign = Some(callsign);
         self.client_module = Some(client_module);
-        self.state = InternalState::Linked;
+        if self.state != InternalState::Streaming {
+            self.state = InternalState::Linked;
+        }
         self.events.push_back(RawServerEvent::Linked {
             peer: self.peer,
             callsign,
@@ -307,7 +330,7 @@ impl ServerSessionCore {
         });
         // Enqueue a 14-byte ACK to send back.
         let mut buf = [0u8; 32];
-        let n = encode_connect_ack(&mut buf, &callsign, reflector_module)
+        let n = encode_connect_ack(&mut buf, identity, reflector_module)
             .map_err(|e| Error::Protocol(ProtocolError::DExtra(e.into())))?;
         let payload = buf.get(..n).unwrap_or(&[]).to_vec();
         self.outbox.enqueue(OutboundPacket {
@@ -318,17 +341,16 @@ impl ServerSessionCore {
         Ok(())
     }
 
-    fn on_dextra_unlink(&mut self, callsign: Callsign) {
-        if self.client_callsign != Some(callsign) {
+    fn on_dextra_unlink(&mut self, callsign: Callsign, client_module: Module) {
+        if self.client_callsign != Some(callsign) || self.client_module != Some(client_module) {
             return;
         }
         self.state = InternalState::Unlinking;
         self.events
             .push_back(RawServerEvent::Unlinked { peer: self.peer });
-        // Transition straight to Closed; we don't wait for our ACK
-        // to be sent. The fan-out engine will drop this session
-        // reference on the next tick.
+        // Revision-zero DExtra UNLINK closes without a reply.
         self.state = InternalState::Closed;
+        self.last_stream_id = None;
     }
 
     fn on_dextra_poll(&mut self, now: Instant, callsign: Callsign) -> Result<(), Error> {
@@ -353,6 +375,7 @@ impl ServerSessionCore {
             return;
         }
         self.state = InternalState::Streaming;
+        self.last_stream_id = Some(stream_id);
         self.events.push_back(RawServerEvent::StreamStarted {
             peer: self.peer,
             stream_id,
@@ -361,7 +384,7 @@ impl ServerSessionCore {
     }
 
     fn on_dextra_voice_data(&mut self, stream_id: StreamId, seq: u8, frame: VoiceFrame) {
-        if self.state != InternalState::Streaming {
+        if self.state != InternalState::Streaming || self.last_stream_id != Some(stream_id) {
             return;
         }
         self.events.push_back(RawServerEvent::StreamFrame {
@@ -373,10 +396,11 @@ impl ServerSessionCore {
     }
 
     fn on_dextra_voice_eot(&mut self, stream_id: StreamId) {
-        if self.state != InternalState::Streaming {
+        if self.state != InternalState::Streaming || self.last_stream_id != Some(stream_id) {
             return;
         }
         self.state = InternalState::Linked;
+        self.last_stream_id = None;
         self.events.push_back(RawServerEvent::StreamEnded {
             peer: self.peer,
             stream_id,
@@ -512,6 +536,7 @@ impl ServerSessionCore {
         self.events
             .push_back(RawServerEvent::Unlinked { peer: self.peer });
         self.state = InternalState::Closed;
+        self.last_stream_id = None;
         Ok(())
     }
 
@@ -545,7 +570,7 @@ impl ServerSessionCore {
     }
 
     fn on_dplus_voice_data(&mut self, stream_id: StreamId, seq: u8, frame: VoiceFrame) {
-        if self.state != InternalState::Streaming {
+        if self.state != InternalState::Streaming || self.last_stream_id != Some(stream_id) {
             return;
         }
         self.events.push_back(RawServerEvent::StreamFrame {
@@ -557,7 +582,7 @@ impl ServerSessionCore {
     }
 
     fn on_dplus_voice_eot(&mut self, stream_id: StreamId) {
-        if self.state != InternalState::Streaming {
+        if self.state != InternalState::Streaming || self.last_stream_id != Some(stream_id) {
             return;
         }
         self.state = InternalState::Linked;
@@ -580,10 +605,11 @@ impl ServerSessionCore {
                 reflector_module,
                 ..
             } => self.on_dcs_link(now, callsign, client_module, reflector_module),
-            DcsClientPacket::Unlink { callsign, .. } => {
-                self.on_dcs_unlink(callsign);
-                Ok(())
-            }
+            DcsClientPacket::Unlink {
+                callsign,
+                client_module,
+                ..
+            } => self.on_dcs_unlink(now, callsign, client_module),
             DcsClientPacket::Poll {
                 callsign,
                 reflector_callsign,
@@ -611,9 +637,20 @@ impl ServerSessionCore {
         if !matches!(
             self.state,
             InternalState::Unknown | InternalState::Linked | InternalState::Streaming
-        ) {
+        ) || reflector_module != self.reflector_module
+            || self
+                .client_callsign
+                .is_some_and(|existing| existing != callsign)
+            || self
+                .client_module
+                .is_some_and(|existing| existing != client_module)
+        {
             return Ok(());
         }
+        let identity = RepeaterIdentity {
+            callsign: RoutingCallsign::try_from(callsign)?,
+            module: client_module,
+        };
         self.client_callsign = Some(callsign);
         self.client_module = Some(client_module);
         if self.state != InternalState::Streaming {
@@ -625,7 +662,7 @@ impl ServerSessionCore {
             module: reflector_module,
         });
         let mut buf = [0u8; 32];
-        let n = dcs_codec::encode_connect_ack(&mut buf, &callsign, reflector_module)
+        let n = dcs_codec::encode_connect_ack(&mut buf, identity, reflector_module)
             .map_err(|e| Error::Protocol(ProtocolError::Dcs(e.into())))?;
         let payload = buf.get(..n).unwrap_or(&[]).to_vec();
         // DCS ACK is enqueued without a rate-limit delay; the caller
@@ -638,13 +675,32 @@ impl ServerSessionCore {
         Ok(())
     }
 
-    fn on_dcs_unlink(&mut self, callsign: Callsign) {
-        if self.client_callsign != Some(callsign) {
-            return;
+    fn on_dcs_unlink(
+        &mut self,
+        now: Instant,
+        callsign: Callsign,
+        client_module: Module,
+    ) -> Result<(), Error> {
+        if self.client_callsign != Some(callsign) || self.client_module != Some(client_module) {
+            return Ok(());
         }
+        let identity = RepeaterIdentity {
+            callsign: RoutingCallsign::try_from(callsign)?,
+            module: client_module,
+        };
+        let mut bytes = [0_u8; 14];
+        let length = dcs_codec::encode_connect_nak(&mut bytes, identity, ModuleSlot::Empty)
+            .map_err(|error| Error::Protocol(ProtocolError::Dcs(error.into())))?;
+        self.outbox.enqueue(OutboundPacket {
+            dst: self.peer,
+            payload: bytes.get(..length).unwrap_or(&[]).to_vec(),
+            not_before: now,
+        });
         self.events
             .push_back(RawServerEvent::Unlinked { peer: self.peer });
         self.state = InternalState::Closed;
+        self.last_stream_id = None;
+        Ok(())
     }
 
     fn on_dcs_poll(
@@ -680,6 +736,12 @@ impl ServerSessionCore {
         is_end: bool,
     ) {
         if !matches!(self.state, InternalState::Linked | InternalState::Streaming) {
+            return;
+        }
+        if self
+            .last_stream_id
+            .is_some_and(|active| active != stream_id)
+        {
             return;
         }
         // DCS embeds the header in every voice packet, so detect
@@ -725,8 +787,12 @@ impl ServerSessionCore {
     /// Drain the next event, typed with the correct protocol marker.
     ///
     /// The `P` type parameter re-attaches the protocol phantom at
-    /// drain time; the event queue itself is protocol-erased.
+    /// drain time; the event queue itself is protocol-erased. Returns `None`
+    /// without draining when `P` does not match [`Self::protocol_kind`].
     pub fn pop_event<P: Protocol>(&mut self) -> Option<ServerEvent<P>> {
+        if P::KIND != self.kind {
+            return None;
+        }
         let raw = self.events.pop_front()?;
         Some(match raw {
             RawServerEvent::Linked {
@@ -791,7 +857,9 @@ mod tests {
     };
     use crate::header::DstarHeader;
     use crate::session::client::{DExtra, DPlus, Dcs};
-    use crate::types::{Callsign, Module, StreamId, Suffix};
+    use crate::types::{
+        Callsign, FrameSequence, Module, RepeaterIdentity, RoutingCallsign, StreamId, Suffix,
+    };
     use crate::voice::VoiceFrame;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::time::Instant;
@@ -801,6 +869,22 @@ mod tests {
     const PEER: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30001);
     const DPLUS_PEER: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 20001);
     const DCS_PEER: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30051);
+    const LOCAL: RepeaterIdentity = RepeaterIdentity {
+        callsign: match RoutingCallsign::from_padded_bytes(*b"W1AW   ") {
+            Ok(value) => value,
+            Err(_) => unreachable!(),
+        },
+        module: Module::B,
+    };
+    const DCS_TARGET: crate::DcsReflector = match crate::DcsReflector::try_from_routing(
+        match RoutingCallsign::from_padded_bytes(*b"DCS030 ") {
+            Ok(value) => value,
+            Err(_) => unreachable!(),
+        },
+    ) {
+        Ok(value) => value,
+        Err(_) => unreachable!(),
+    };
 
     const fn cs(bytes: [u8; 8]) -> Callsign {
         Callsign::from_wire_bytes(bytes)
@@ -808,9 +892,7 @@ mod tests {
 
     const fn test_header(my: [u8; 8]) -> DstarHeader {
         DstarHeader {
-            flag1: 0,
-            flag2: 0,
-            flag3: 0,
+            flags: crate::HeaderFlags::NONE,
             rpt2: Callsign::from_wire_bytes(*b"REF030 G"),
             rpt1: Callsign::from_wire_bytes(*b"REF030 C"),
             ur_call: Callsign::from_wire_bytes(*b"CQCQCQ  "),
@@ -826,6 +908,164 @@ mod tests {
     )]
     const fn sid(n: u16) -> StreamId {
         StreamId::new(n).unwrap()
+    }
+
+    fn linked_server<P: crate::Protocol>() -> Result<ServerSessionCore, Box<dyn std::error::Error>>
+    {
+        let mut core = ServerSessionCore::new(P::KIND, PEER, Module::C);
+        let mut bytes = [0_u8; 600];
+        let length = match P::KIND {
+            ProtocolKind::DExtra => encode_connect_link(&mut bytes, LOCAL, Module::C)?,
+            ProtocolKind::DPlus => {
+                let length = encode_link1(&mut bytes)?;
+                core.handle_input(Instant::now(), bytes.get(..length).ok_or("LINK1 length")?)?;
+                encode_link2(&mut bytes, &cs(*b"W1AW    "))?
+            }
+            ProtocolKind::Dcs => dcs_encode_link(
+                &mut bytes,
+                LOCAL,
+                Module::C,
+                DCS_TARGET,
+                crate::codec::dcs::GatewayType::Repeater,
+            )?,
+        };
+        core.handle_input(Instant::now(), bytes.get(..length).ok_or("LINK length")?)?;
+        assert!(
+            matches!(
+                core.pop_event::<P>(),
+                Some(ServerEvent::ClientLinked { .. })
+            ),
+            "complete protocol handshake must publish a linked client"
+        );
+        Ok(core)
+    }
+
+    fn stream_id_guard<P: crate::Protocol>() -> TestResult {
+        let mut core = linked_server::<P>()?;
+        let active = sid(0x1234);
+        let unrelated = sid(0x5678);
+        let header = test_header(*b"W1AW    ");
+        let frame = VoiceFrame {
+            ambe: [0x11; 9],
+            slow_data: [0x22; 3],
+        };
+        match P::KIND {
+            ProtocolKind::DExtra => core.on_dextra_voice_header(active, header),
+            ProtocolKind::DPlus => core.on_dplus_voice_header(active, header),
+            ProtocolKind::Dcs => core.on_dcs_voice(header, active, 0, frame, false),
+        }
+        while core.pop_event::<P>().is_some() {}
+        match P::KIND {
+            ProtocolKind::DExtra => {
+                core.on_dextra_voice_data(unrelated, 1, frame);
+                core.on_dextra_voice_eot(unrelated);
+            }
+            ProtocolKind::DPlus => {
+                core.on_dplus_voice_data(unrelated, 1, frame);
+                core.on_dplus_voice_eot(unrelated);
+            }
+            ProtocolKind::Dcs => core.on_dcs_voice(header, unrelated, 1, frame, true),
+        }
+        assert_eq!(
+            core.state_kind(),
+            ServerStateKind::Streaming,
+            "an unrelated stream cannot end the active stream"
+        );
+        assert!(
+            core.pop_event::<P>().is_none(),
+            "unrelated voice must never reach fan-out events"
+        );
+        match P::KIND {
+            ProtocolKind::DExtra => core.on_dextra_voice_eot(active),
+            ProtocolKind::DPlus => core.on_dplus_voice_eot(active),
+            ProtocolKind::Dcs => core.on_dcs_voice(header, active, 2, frame, true),
+        }
+        assert_eq!(core.state_kind(), ServerStateKind::Linked);
+        let mut ended = false;
+        while let Some(event) = core.pop_event::<P>() {
+            if matches!(event, ServerEvent::ClientStreamEnded { stream_id, .. } if stream_id == active)
+            {
+                ended = true;
+            }
+        }
+        assert!(ended, "only the active EOT publishes completion");
+        Ok(())
+    }
+
+    #[test]
+    fn every_server_protocol_preserves_the_active_stream() -> TestResult {
+        stream_id_guard::<DExtra>()?;
+        stream_id_guard::<DPlus>()?;
+        stream_id_guard::<Dcs>()
+    }
+
+    #[test]
+    fn linked_identity_cannot_be_reassigned_and_closed_input_is_inert() -> TestResult {
+        let now = Instant::now();
+        let mut dextra = linked_server::<DExtra>()?;
+        dextra.on_dextra_link(now, cs(*b"N0CALL  "), Module::C, Module::B)?;
+        dextra.on_dextra_link(now, cs(*b"W1AW    "), Module::C, Module::A)?;
+        dextra.on_dextra_link(now, cs(*b"W1AW    "), Module::D, Module::B)?;
+        assert_eq!(dextra.client_callsign(), Some(cs(*b"W1AW    ")));
+        assert_eq!(dextra.client_module(), Some(Module::B));
+        assert!(dextra.pop_event::<DExtra>().is_none());
+        let mut dcs = linked_server::<Dcs>()?;
+        dcs.on_dcs_link(now, cs(*b"N0CALL  "), Module::B, Module::C)?;
+        dcs.on_dcs_link(now, cs(*b"W1AW    "), Module::A, Module::C)?;
+        dcs.on_dcs_link(now, cs(*b"W1AW    "), Module::B, Module::D)?;
+        assert_eq!(dcs.client_callsign(), Some(cs(*b"W1AW    ")));
+        assert_eq!(dcs.client_module(), Some(Module::B));
+        assert!(dcs.pop_event::<Dcs>().is_none());
+        dextra.on_dextra_unlink(cs(*b"W1AW    "), Module::B);
+        let _unlinked = dextra.pop_event::<DExtra>();
+        dextra.handle_input(now, &[0xFF; 10])?;
+        assert_eq!(dextra.state_kind(), ServerStateKind::Closed);
+        assert!(dextra.pop_event::<DExtra>().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_datagram_lengths_leave_server_sessions_usable() -> TestResult {
+        let now = Instant::now();
+        for protocol in [ProtocolKind::DExtra, ProtocolKind::DPlus, ProtocolKind::Dcs] {
+            let mut core = ServerSessionCore::new(protocol, PEER, Module::C);
+            core.handle_input(now, &[0xEE; 10])?;
+            assert_eq!(core.state_kind(), ServerStateKind::Unknown);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn control_replies_echo_the_linked_client_module_and_match_unlink_identity() -> TestResult {
+        for mut core in [linked_server::<DExtra>()?, linked_server::<Dcs>()?] {
+            let now = Instant::now();
+            let ack = core.pop_transmit(now).ok_or("LINK acknowledgment")?;
+            assert_eq!(
+                ack.payload, b"W1AW    BCACK\0",
+                "independent reply vector retains client B separately from target C"
+            );
+            let (wrong, matching): (&[u8], &[u8]) = match core.protocol_kind() {
+                ProtocolKind::DExtra => (b"W1AW    A \0", b"W1AW    B \0"),
+                ProtocolKind::Dcs => (b"W1AW    A \0DCS030  ", b"W1AW    B \0DCS030  "),
+                ProtocolKind::DPlus => unreachable!(),
+            };
+            core.handle_input(now, wrong)?;
+            assert_eq!(
+                core.state_kind(),
+                ServerStateKind::Linked,
+                "another client module cannot unlink the stored identity"
+            );
+            core.handle_input(now, matching)?;
+            assert_eq!(core.state_kind(), ServerStateKind::Closed);
+            if core.protocol_kind() == ProtocolKind::Dcs {
+                let unlink = core.pop_transmit(now).ok_or("DCS unlink acknowledgment")?;
+                assert_eq!(
+                    unlink.payload, b"W1AW    B NAK\0",
+                    "DCS disconnect uses the primary-source space target slot"
+                );
+            }
+        }
+        Ok(())
     }
 
     // ─── DExtra tests ────────────────────────────────────────────
@@ -847,7 +1087,7 @@ mod tests {
         assert_eq!(core.state_kind(), ServerStateKind::Unknown);
 
         let mut buf = [0u8; 16];
-        let n = encode_connect_link(&mut buf, &cs(*b"W1AW    "), Module::C, Module::B)?;
+        let n = encode_connect_link(&mut buf, LOCAL, Module::C)?;
         let slice = buf.get(..n).ok_or("n bytes")?;
         core.handle_input(Instant::now(), slice)?;
 
@@ -861,10 +1101,33 @@ mod tests {
     }
 
     #[test]
+    fn wrong_protocol_marker_preserves_queued_server_event() -> TestResult {
+        let mut core = ServerSessionCore::new(ProtocolKind::DExtra, PEER, Module::C);
+        let mut bytes = [0_u8; 16];
+        let length = encode_connect_link(&mut bytes, LOCAL, Module::C)?;
+        core.handle_input(
+            Instant::now(),
+            bytes.get(..length).ok_or("encoded LINK length")?,
+        )?;
+        assert!(
+            core.pop_event::<DPlus>().is_none(),
+            "a DPlus marker cannot claim a DExtra event"
+        );
+        assert!(
+            matches!(
+                core.pop_event::<DExtra>(),
+                Some(ServerEvent::ClientLinked { .. })
+            ),
+            "refused marker must leave the original event queued"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn dextra_link_enqueues_ack() -> TestResult {
         let mut core = ServerSessionCore::new(ProtocolKind::DExtra, PEER, Module::C);
         let mut buf = [0u8; 16];
-        let n = encode_connect_link(&mut buf, &cs(*b"W1AW    "), Module::C, Module::B)?;
+        let n = encode_connect_link(&mut buf, LOCAL, Module::C)?;
         let slice = buf.get(..n).ok_or("n bytes")?;
         core.handle_input(Instant::now(), slice)?;
 
@@ -880,7 +1143,7 @@ mod tests {
     fn dextra_poll_from_linked_client_is_echoed() -> TestResult {
         let mut core = ServerSessionCore::new(ProtocolKind::DExtra, PEER, Module::C);
         let mut link_buf = [0u8; 16];
-        let n = encode_connect_link(&mut link_buf, &cs(*b"W1AW    "), Module::C, Module::B)?;
+        let n = encode_connect_link(&mut link_buf, LOCAL, Module::C)?;
         let slice = link_buf.get(..n).ok_or("n bytes")?;
         core.handle_input(Instant::now(), slice)?;
         let _ack = core.pop_transmit(Instant::now()).ok_or("ack")?;
@@ -901,7 +1164,7 @@ mod tests {
     fn dextra_poll_from_unknown_callsign_is_ignored() -> TestResult {
         let mut core = ServerSessionCore::new(ProtocolKind::DExtra, PEER, Module::C);
         let mut link_buf = [0u8; 16];
-        let n = encode_connect_link(&mut link_buf, &cs(*b"W1AW    "), Module::C, Module::B)?;
+        let n = encode_connect_link(&mut link_buf, LOCAL, Module::C)?;
         let slice = link_buf.get(..n).ok_or("n bytes")?;
         core.handle_input(Instant::now(), slice)?;
         let _ack = core.pop_transmit(Instant::now()).ok_or("ack")?;
@@ -923,14 +1186,14 @@ mod tests {
     fn dextra_unlink_transitions_to_closed() -> TestResult {
         let mut core = ServerSessionCore::new(ProtocolKind::DExtra, PEER, Module::C);
         let mut link_buf = [0u8; 16];
-        let n = encode_connect_link(&mut link_buf, &cs(*b"W1AW    "), Module::C, Module::B)?;
+        let n = encode_connect_link(&mut link_buf, LOCAL, Module::C)?;
         let slice = link_buf.get(..n).ok_or("n bytes")?;
         core.handle_input(Instant::now(), slice)?;
         let _ack = core.pop_transmit(Instant::now()).ok_or("ack")?;
         let _event: Option<ServerEvent<DExtra>> = core.pop_event();
 
         let mut ulink_buf = [0u8; 16];
-        let n = encode_unlink(&mut ulink_buf, &cs(*b"W1AW    "), Module::B)?;
+        let n = encode_unlink(&mut ulink_buf, LOCAL)?;
         let slice = ulink_buf.get(..n).ok_or("n bytes")?;
         core.handle_input(Instant::now(), slice)?;
 
@@ -944,14 +1207,20 @@ mod tests {
     fn dextra_unlink_from_wrong_callsign_is_ignored() -> TestResult {
         let mut core = ServerSessionCore::new(ProtocolKind::DExtra, PEER, Module::C);
         let mut link_buf = [0u8; 16];
-        let n = encode_connect_link(&mut link_buf, &cs(*b"W1AW    "), Module::C, Module::B)?;
+        let n = encode_connect_link(&mut link_buf, LOCAL, Module::C)?;
         let slice = link_buf.get(..n).ok_or("n bytes")?;
         core.handle_input(Instant::now(), slice)?;
         let _ack = core.pop_transmit(Instant::now()).ok_or("ack")?;
         let _event: Option<ServerEvent<DExtra>> = core.pop_event();
 
         let mut ulink_buf = [0u8; 16];
-        let n = encode_unlink(&mut ulink_buf, &cs(*b"N0CALL  "), Module::B)?;
+        let n = encode_unlink(
+            &mut ulink_buf,
+            RepeaterIdentity {
+                callsign: RoutingCallsign::new("N0CALL")?,
+                module: Module::B,
+            },
+        )?;
         let slice = ulink_buf.get(..n).ok_or("n bytes")?;
         core.handle_input(Instant::now(), slice)?;
 
@@ -1092,7 +1361,12 @@ mod tests {
 
         let frame = VoiceFrame::silence();
         let mut data_buf = [0u8; 128];
-        let n = crate::codec::dplus::encode_voice_data(&mut data_buf, sid(0xCAFE), 3, &frame)?;
+        let n = crate::codec::dplus::encode_voice_data(
+            &mut data_buf,
+            sid(0xCAFE),
+            FrameSequence::try_from(3)?,
+            &frame,
+        )?;
         core.handle_input(Instant::now(), data_buf.get(..n).ok_or("bytes")?)?;
 
         let event: Option<ServerEvent<DPlus>> = core.pop_event();
@@ -1126,7 +1400,11 @@ mod tests {
         let _ev: Option<ServerEvent<DPlus>> = core.pop_event();
 
         let mut eot_buf = [0u8; 128];
-        let n = crate::codec::dplus::encode_voice_eot(&mut eot_buf, sid(0xCAFE), 20)?;
+        let n = crate::codec::dplus::encode_voice_eot(
+            &mut eot_buf,
+            sid(0xCAFE),
+            FrameSequence::try_from(20)?,
+        )?;
         core.handle_input(Instant::now(), eot_buf.get(..n).ok_or("bytes")?)?;
 
         assert_eq!(core.state_kind(), ServerStateKind::Linked);
@@ -1192,10 +1470,9 @@ mod tests {
         let mut buf = [0u8; 520];
         let n = dcs_encode_link(
             &mut buf,
-            &cs(*b"W1AW    "),
-            Module::B,
+            LOCAL,
             Module::C,
-            &cs(*b"DCS030  "),
+            DCS_TARGET,
             crate::codec::dcs::GatewayType::Repeater,
         )?;
         core.handle_input(Instant::now(), buf.get(..n).ok_or("bytes")?)?;
@@ -1230,10 +1507,9 @@ mod tests {
         let mut lb = [0u8; 520];
         let n = dcs_encode_link(
             &mut lb,
-            &cs(*b"W1AW    "),
-            Module::B,
+            LOCAL,
             Module::C,
-            &cs(*b"DCS030  "),
+            DCS_TARGET,
             crate::codec::dcs::GatewayType::Repeater,
         )?;
         core.handle_input(Instant::now(), lb.get(..n).ok_or("bytes")?)?;
@@ -1246,7 +1522,7 @@ mod tests {
             &mut vb,
             &test_header(*b"W1AW    "),
             sid(0xBEEF),
-            0,
+            FrameSequence::ZERO,
             &frame,
             false,
         )?;
@@ -1266,10 +1542,9 @@ mod tests {
         let mut lb = [0u8; 520];
         let n = dcs_encode_link(
             &mut lb,
-            &cs(*b"W1AW    "),
-            Module::B,
+            LOCAL,
             Module::C,
-            &cs(*b"DCS030  "),
+            DCS_TARGET,
             crate::codec::dcs::GatewayType::Repeater,
         )?;
         core.handle_input(Instant::now(), lb.get(..n).ok_or("bytes")?)?;
@@ -1282,7 +1557,7 @@ mod tests {
             &mut vb,
             &test_header(*b"W1AW    "),
             sid(0xBEEF),
-            0,
+            FrameSequence::ZERO,
             &frame,
             false,
         )?;
@@ -1295,7 +1570,7 @@ mod tests {
             &mut vb2,
             &test_header(*b"W1AW    "),
             sid(0xBEEF),
-            1,
+            FrameSequence::try_from(1)?,
             &frame,
             false,
         )?;
@@ -1316,10 +1591,9 @@ mod tests {
         let mut lb = [0u8; 520];
         let n = dcs_encode_link(
             &mut lb,
-            &cs(*b"W1AW    "),
-            Module::B,
+            LOCAL,
             Module::C,
-            &cs(*b"DCS030  "),
+            DCS_TARGET,
             crate::codec::dcs::GatewayType::Repeater,
         )?;
         core.handle_input(Instant::now(), lb.get(..n).ok_or("bytes")?)?;
@@ -1332,7 +1606,7 @@ mod tests {
             &mut vb,
             &test_header(*b"W1AW    "),
             sid(0xBEEF),
-            5,
+            FrameSequence::try_from(5)?,
             &frame,
             true,
         )?;
@@ -1352,10 +1626,9 @@ mod tests {
         let mut lb = [0u8; 520];
         let n = dcs_encode_link(
             &mut lb,
-            &cs(*b"W1AW    "),
-            Module::B,
+            LOCAL,
             Module::C,
-            &cs(*b"DCS030  "),
+            DCS_TARGET,
             crate::codec::dcs::GatewayType::Repeater,
         )?;
         core.handle_input(Instant::now(), lb.get(..n).ok_or("bytes")?)?;
@@ -1363,7 +1636,7 @@ mod tests {
         let _ev: Option<ServerEvent<Dcs>> = core.pop_event();
 
         let mut pb = [0u8; 32];
-        let n = dcs_encode_poll(&mut pb, &cs(*b"W1AW    "), &cs(*b"DCS030  "))?;
+        let n = dcs_encode_poll(&mut pb, LOCAL.callsign, DCS_TARGET)?;
         core.handle_input(Instant::now(), pb.get(..n).ok_or("bytes")?)?;
 
         let tx = core.pop_transmit(Instant::now()).ok_or("echo")?;
@@ -1377,10 +1650,9 @@ mod tests {
         let mut lb = [0u8; 520];
         let n = dcs_encode_link(
             &mut lb,
-            &cs(*b"W1AW    "),
-            Module::B,
+            LOCAL,
             Module::C,
-            &cs(*b"DCS030  "),
+            DCS_TARGET,
             crate::codec::dcs::GatewayType::Repeater,
         )?;
         core.handle_input(Instant::now(), lb.get(..n).ok_or("bytes")?)?;
@@ -1388,7 +1660,7 @@ mod tests {
         let _ev: Option<ServerEvent<Dcs>> = core.pop_event();
 
         let mut ub = [0u8; 32];
-        let n = dcs_encode_unlink(&mut ub, &cs(*b"W1AW    "), Module::B, &cs(*b"DCS030  "))?;
+        let n = dcs_encode_unlink(&mut ub, LOCAL, DCS_TARGET)?;
         core.handle_input(Instant::now(), ub.get(..n).ok_or("bytes")?)?;
 
         assert_eq!(core.state_kind(), ServerStateKind::Closed);

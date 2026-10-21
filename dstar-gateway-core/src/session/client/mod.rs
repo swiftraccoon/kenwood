@@ -1,16 +1,8 @@
 //! Client-side session machinery.
 
-mod any_session;
-mod builder;
-mod core;
-mod event;
-mod failed;
-mod protocol;
-mod session;
-mod state;
-
 pub use any_session::AnySession;
 pub use builder::{Missing, Provided, SessionBuilder};
+pub use config::{ClientProtocol, SessionConfig};
 pub use core::SessionCore;
 pub use event::{DisconnectReason, Event, VoiceEndReason};
 pub use failed::Failed;
@@ -20,3 +12,13 @@ pub use state::{
     Authenticated, ClientState, ClientStateKind, Closed, Configured, Connected, Connecting,
     Disconnecting,
 };
+
+mod any_session;
+mod builder;
+mod config;
+mod core;
+mod event;
+mod failed;
+mod protocol;
+mod session;
+mod state;

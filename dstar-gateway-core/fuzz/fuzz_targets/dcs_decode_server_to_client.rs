@@ -1,3 +1,4 @@
+//! Exercise lenient DCS server packet decoding with arbitrary datagrams.
 #![no_main]
 
 use dstar_gateway_core::codec::dcs::decode_server_to_client;

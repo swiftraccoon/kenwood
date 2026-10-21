@@ -153,7 +153,7 @@ impl SlowDataTextCollector {
                 self.block_buffer[0], self.block_buffer[1], self.block_buffer[2],
                 self.block_buffer[3], self.block_buffer[4], self.block_buffer[5]
             ),
-            chars = ?SlowDataText::from_wire_bytes(src.to_vec()).text(),
+            chars = ?SlowDataText::from_wire_bytes(*slot).text(),
             "text block accepted"
         );
     }

@@ -37,10 +37,8 @@ impl StreamId {
     /// Derive a valid stream ID from arbitrary seed bits.
     ///
     /// Non-zero seeds map to themselves; the protocol-reserved zero
-    /// maps to `1`. D-STAR stream IDs only need to differ from the
-    /// previous stream on the same link (receivers key state on the
-    /// ID changing), so callers can feed clock bits or any other
-    /// cheap entropy without a rejection-and-retry loop.
+    /// maps to `1`. The caller selects seeds and handles collisions
+    /// with other streams on the same link.
     #[must_use]
     pub const fn from_seed(seed: u16) -> Self {
         match NonZeroU16::new(seed) {
@@ -53,6 +51,56 @@ impl StreamId {
 impl std::fmt::Display for StreamId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "0x{:04X}", self.0.get())
+    }
+}
+
+impl std::fmt::Binary for StreamId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Binary::fmt(&self.0, formatter)
+    }
+}
+
+impl std::fmt::Octal for StreamId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Octal::fmt(&self.0, formatter)
+    }
+}
+
+impl std::fmt::LowerHex for StreamId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::LowerHex::fmt(&self.0, formatter)
+    }
+}
+
+impl std::fmt::UpperHex for StreamId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::UpperHex::fmt(&self.0, formatter)
+    }
+}
+
+impl TryFrom<u16> for StreamId {
+    type Error = std::num::TryFromIntError;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        NonZeroU16::try_from(value).map(Self)
+    }
+}
+
+impl From<StreamId> for u16 {
+    fn from(value: StreamId) -> Self {
+        value.get()
+    }
+}
+
+impl From<NonZeroU16> for StreamId {
+    fn from(value: NonZeroU16) -> Self {
+        Self(value)
+    }
+}
+
+impl From<StreamId> for NonZeroU16 {
+    fn from(value: StreamId) -> Self {
+        value.0
     }
 }
 

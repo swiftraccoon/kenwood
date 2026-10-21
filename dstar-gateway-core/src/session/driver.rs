@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::time::Instant;
 
 /// One outbound datagram from the sans-io core.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Transmit<'a> {
     /// Destination address.
     pub dst: SocketAddr,
@@ -38,8 +38,8 @@ pub trait Driver {
     ///
     /// # Errors
     ///
-    /// Returns the protocol-specific error if the bytes cannot be
-    /// parsed.
+    /// Returns the implementation's typed state, deadline or protocol error.
+    /// Its receive contract specifies which malformed packets are ignored.
     fn handle_input(
         &mut self,
         now: Instant,

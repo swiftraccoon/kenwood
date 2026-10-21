@@ -3,10 +3,46 @@
 use crate::session::client::ClientStateKind;
 use crate::types::{ProtocolKind, StreamId};
 
+/// Client operation rejected by a runtime state check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StateOperation {
+    /// Attach an authenticated D-Plus host list.
+    AttachHostList,
+    /// Start a link handshake.
+    Connect,
+    /// Start an unlink handshake.
+    Disconnect,
+    /// Enqueue a voice header.
+    SendHeader,
+    /// Enqueue a voice data frame.
+    SendVoice,
+    /// Enqueue an end-of-transmission frame.
+    SendEot,
+    /// Consume a typed wrapper after its runtime transition.
+    Promote,
+}
+
+impl std::fmt::Display for StateOperation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::AttachHostList => "attach_host_list",
+            Self::Connect => "enqueue_connect",
+            Self::Disconnect => "enqueue_disconnect",
+            Self::SendHeader => "enqueue_send_header",
+            Self::SendVoice => "enqueue_send_voice",
+            Self::SendEot => "enqueue_send_eot",
+            Self::Promote => "Session::promote",
+        })
+    }
+}
+
 /// Runtime state-machine errors that the typestate cannot prevent.
 #[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum StateError {
+    /// The injected instant cannot represent every protocol timer deadline.
+    #[error("injected instant is too close to the platform clock limit")]
+    DeadlineOverflow,
     /// `send_header` for stream X while stream Y is still streaming.
     #[error("stream {already_active} is still streaming; cannot start {requested}")]
     StreamAlreadyActive {
@@ -44,7 +80,7 @@ pub enum StateError {
     #[error("{operation} is not valid in {state:?} for protocol {protocol:?}")]
     WrongState {
         /// Which operation was attempted.
-        operation: &'static str,
+        operation: StateOperation,
         /// The current runtime state.
         state: ClientStateKind,
         /// The runtime protocol discriminator.
@@ -79,7 +115,7 @@ mod tests {
     #[test]
     fn state_error_wrong_state_display() {
         let err = StateError::WrongState {
-            operation: "enqueue_connect",
+            operation: StateOperation::Connect,
             state: ClientStateKind::Connected,
             protocol: ProtocolKind::DPlus,
         };

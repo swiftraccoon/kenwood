@@ -4,6 +4,10 @@
 //! reflector. `ServerPacket` represents every packet a reflector
 //! sends to a client. The codec is symmetric; both directions are
 //! first-class.
+//!
+//! Packet values are decoded observations. Each `seq` retains the complete
+//! wire byte, including end and unknown bits. Transmit encoders take a
+//! checked [`crate::FrameSequence`] and select termination separately.
 
 use crate::header::DstarHeader;
 use crate::types::{Callsign, StreamId};
@@ -11,7 +15,7 @@ use crate::voice::VoiceFrame;
 
 /// Packets the **client** sends (and the server receives).
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ClientPacket {
     /// 5-byte LINK1 connect request `[0x05, 0x00, 0x18, 0x00, 0x01]`.
     Link1,
@@ -40,7 +44,7 @@ pub enum ClientPacket {
     VoiceData {
         /// D-STAR stream id.
         stream_id: StreamId,
-        /// Frame sequence number (0..21 cycle).
+        /// Complete received sequence byte.
         seq: u8,
         /// 9 AMBE bytes + 3 slow data bytes.
         frame: VoiceFrame,
@@ -50,14 +54,14 @@ pub enum ClientPacket {
     VoiceEot {
         /// D-STAR stream id.
         stream_id: StreamId,
-        /// Final seq value (0x40 bit will be OR'd in by the encoder).
+        /// Complete received EOT sequence byte.
         seq: u8,
     },
 }
 
 /// Packets the **server** sends (and the client receives).
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ServerPacket {
     /// 5-byte LINK1 ACK echo (server replies to client's LINK1).
     Link1Ack,
@@ -109,7 +113,7 @@ pub enum ServerPacket {
 
 /// Result of a `DPlus` LINK2 reply.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Link2Result {
     /// Server returned `b"OKRW"`: login accepted.
     Accept,

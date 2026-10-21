@@ -1,3 +1,4 @@
+//! Exercise lenient `DPlus` client packet decoding with arbitrary datagrams.
 #![no_main]
 
 use dstar_gateway_core::codec::dplus::decode_client_to_server;

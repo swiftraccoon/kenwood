@@ -37,9 +37,7 @@ impl ReflectorCallsign {
     pub fn try_from_str(s: &str) -> Result<Self, TypeError> {
         let callsign = Callsign::try_from_str(s)?;
         let protocol =
-            ProtocolKind::from_reflector_prefix(s).ok_or(TypeError::InvalidReflectorCallsign {
-                reason: "prefix is not REF/XRF/XLX/DCS",
-            })?;
+            ProtocolKind::from_reflector_prefix(s).ok_or(TypeError::InvalidReflectorCallsign)?;
         Ok(Self { callsign, protocol })
     }
 
@@ -59,6 +57,34 @@ impl ReflectorCallsign {
 impl std::fmt::Display for ReflectorCallsign {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.callsign)
+    }
+}
+
+impl std::str::FromStr for ReflectorCallsign {
+    type Err = TypeError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::try_from_str(value)
+    }
+}
+
+impl TryFrom<&str> for ReflectorCallsign {
+    type Error = TypeError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::try_from_str(value)
+    }
+}
+
+impl AsRef<Callsign> for ReflectorCallsign {
+    fn as_ref(&self) -> &Callsign {
+        self.callsign()
+    }
+}
+
+impl From<ReflectorCallsign> for Callsign {
+    fn from(value: ReflectorCallsign) -> Self {
+        value.callsign
     }
 }
 
@@ -102,7 +128,7 @@ mod tests {
         let Err(err) = ReflectorCallsign::try_from_str("W1AW") else {
             unreachable!("W1AW has no reflector prefix");
         };
-        assert!(matches!(err, TypeError::InvalidReflectorCallsign { .. }));
+        assert!(matches!(err, TypeError::InvalidReflectorCallsign));
     }
 
     #[test]

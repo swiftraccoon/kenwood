@@ -11,14 +11,12 @@ use std::time::Duration;
 
 use crate::types::{Callsign, ProtocolKind, StreamId};
 
-/// One observable malformation detected by a lenient parser.
+/// Structured parser observations and caller-supplied validation results.
 ///
-/// **Lenient parsing rule**: the codec must NEVER reject a packet
-/// solely because of a recoverable malformation. Every malformation
-/// becomes a `Diagnostic` and the packet still parses with whatever
-/// content was extractable. Strict-mode is implemented in the
-/// consumer's `DiagnosticSink`, never in the parser.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Codecs report the recoverable conditions described by their individual
+/// contracts. A sink can retain those observations for its caller's rejection
+/// policy; receiving a value does not imply every variant was checked.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Diagnostic {
     // ─── Header (any DSVT-framed protocol) ──────────────────────
@@ -136,7 +134,7 @@ pub enum Diagnostic {
 
 /// Which callsign field a [`Diagnostic::CallsignNonPrintable`] refers to.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CallsignField {
     /// RPT2 (gateway repeater).
     Rpt2,
@@ -156,8 +154,10 @@ pub enum CallsignField {
 
 /// Reason an auth host record was skipped during chunk parsing.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AuthHostSkipReason {
+    /// Callsign contains whitespace, a comment delimiter or non-ASCII bytes.
+    MalformedCallsign,
     /// Record's active flag (high bit of byte 25) was clear.
     Inactive,
     /// Callsign field starts with `XRF`; the reference filters these

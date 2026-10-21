@@ -4,14 +4,18 @@
 //! reflector. `ServerPacket` represents every packet a reflector sends
 //! to a client. The codec is symmetric; both directions are
 //! first-class.
+//!
+//! Packet values are decoded observations. Each `seq` retains the complete
+//! wire byte, including end and unknown bits. Transmit encoders take a
+//! checked [`crate::FrameSequence`] and select termination separately.
 
 use crate::header::DstarHeader;
-use crate::types::{Callsign, Module, StreamId};
+use crate::types::{Callsign, Module, ModuleSlot, StreamId};
 use crate::voice::VoiceFrame;
 
 /// Packets a `DExtra` client sends to a reflector.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ClientPacket {
     /// 11-byte LINK request.
     Link {
@@ -59,20 +63,22 @@ pub enum ClientPacket {
     VoiceEot {
         /// D-STAR stream id.
         stream_id: StreamId,
-        /// Final seq value (encoder OR's in 0x40).
+        /// Complete received EOT sequence byte.
         seq: u8,
     },
 }
 
 /// Packets a `DExtra` reflector sends to a client.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ServerPacket {
     /// 14-byte connect ACK: echoed callsign + module at `[0..10]`,
     /// `b"ACK"` at `[10..13]`, NUL at `[13]`.
     ConnectAck {
         /// Echoed callsign.
         callsign: Callsign,
+        /// Echoed client module from byte 8.
+        client_module: Module,
         /// Echoed reflector module.
         reflector_module: Module,
     },
@@ -82,8 +88,10 @@ pub enum ServerPacket {
     ConnectNak {
         /// Echoed callsign.
         callsign: Callsign,
+        /// Echoed client module from byte 8.
+        client_module: Module,
         /// Echoed reflector module.
-        reflector_module: Module,
+        reflector_module: ModuleSlot,
     },
 
     /// 9-byte poll echo.
@@ -121,7 +129,7 @@ pub enum ServerPacket {
 
 /// Result of a `DExtra` connect attempt.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConnectResult {
     /// `b"ACK"` reply.
     Accept,
@@ -147,6 +155,7 @@ mod tests {
     fn server_packet_connect_ack_carries_module() {
         let p = ServerPacket::ConnectAck {
             callsign: Callsign::from_wire_bytes(*b"XRF030  "),
+            client_module: Module::B,
             reflector_module: Module::C,
         };
         assert!(
