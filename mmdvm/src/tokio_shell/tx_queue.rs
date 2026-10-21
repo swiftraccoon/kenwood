@@ -11,7 +11,7 @@
 
 use std::collections::VecDeque;
 
-use mmdvm_core::{MMDVM_DSTAR_DATA, MMDVM_DSTAR_EOT, MMDVM_DSTAR_HEADER, ModemMode};
+use mmdvm_core::{Command, ModemMode};
 
 /// D-STAR header slot cost (`MMDVMHost` `Modem.cpp:1053`).
 pub(crate) const DSTAR_HEADER_SLOTS: u8 = 4;
@@ -23,10 +23,7 @@ pub(crate) const DSTAR_EOT_SLOTS: u8 = 1;
 /// Maximum number of frames the host-side TX queue holds before
 /// `push_*` refuses with [`TxQueueFull`].
 ///
-/// Mirrors `MMDVMHost`'s fixed-size host-side ring
-/// (`CRingBuffer m_txDStarData`, ~60 serialized data frames). A
-/// bounded queue gives callers backpressure instead of unbounded
-/// memory growth when the modem stops granting FIFO space.
+/// This host policy bounds memory when the modem stops granting FIFO space.
 pub(crate) const MAX_TX_QUEUE_FRAMES: usize = 64;
 
 /// The TX queue is at capacity; the frame was not enqueued.
@@ -45,7 +42,7 @@ impl std::error::Error for TxQueueFull {}
 #[derive(Debug, Clone)]
 pub(crate) struct QueuedFrame {
     /// MMDVM command byte.
-    pub(crate) command: u8,
+    pub(crate) command: Command,
     /// Raw payload bytes.
     pub(crate) payload: Vec<u8>,
     /// How many FIFO slots this frame costs on the modem.
@@ -64,7 +61,6 @@ pub(crate) struct QueuedFrame {
 #[derive(Debug, Default)]
 pub(crate) struct TxQueue {
     dstar: VecDeque<QueuedFrame>,
-    // Future modes: dmr_slot1, dmr_slot2, ysf, p25, nxdn, pocsag, fm.
 }
 
 impl TxQueue {
@@ -82,7 +78,7 @@ impl TxQueue {
     /// [`TxQueueFull`] if the queue holds [`MAX_TX_QUEUE_FRAMES`].
     pub(crate) fn push_dstar_header(&mut self, bytes: [u8; 41]) -> Result<(), TxQueueFull> {
         self.push(QueuedFrame {
-            command: MMDVM_DSTAR_HEADER,
+            command: Command::DSTAR_HEADER,
             payload: bytes.to_vec(),
             slots_required: DSTAR_HEADER_SLOTS,
             mode: ModemMode::Dstar,
@@ -96,7 +92,7 @@ impl TxQueue {
     /// [`TxQueueFull`] if the queue holds [`MAX_TX_QUEUE_FRAMES`].
     pub(crate) fn push_dstar_data(&mut self, bytes: [u8; 12]) -> Result<(), TxQueueFull> {
         self.push(QueuedFrame {
-            command: MMDVM_DSTAR_DATA,
+            command: Command::DSTAR_DATA,
             payload: bytes.to_vec(),
             slots_required: DSTAR_DATA_SLOTS,
             mode: ModemMode::Dstar,
@@ -110,7 +106,7 @@ impl TxQueue {
     /// [`TxQueueFull`] if the queue holds [`MAX_TX_QUEUE_FRAMES`].
     pub(crate) fn push_dstar_eot(&mut self) -> Result<(), TxQueueFull> {
         self.push(QueuedFrame {
-            command: MMDVM_DSTAR_EOT,
+            command: Command::DSTAR_EOT,
             payload: Vec::new(),
             slots_required: DSTAR_EOT_SLOTS,
             mode: ModemMode::Dstar,
@@ -132,9 +128,8 @@ impl TxQueue {
     ///
     /// The strict `>` mirrors the reference
     /// (`MMDVMHost/Modem.cpp:1053-1055`: header needs `> 4`, data and
-    /// EOT need `> 1`); one slot of margin absorbs estimation drift
-    /// between 250 ms status polls and prevents modem TX-FIFO
-    /// overflow.
+    /// EOT need `> 1`). The host retains that one-slot margin between status
+    /// updates.
     pub(crate) fn pop_if_space_allows(&mut self, dstar_space: u8) -> Option<QueuedFrame> {
         let head = self.dstar.front()?;
         if dstar_space > head.slots_required {
@@ -170,7 +165,7 @@ mod tests {
         let head = q
             .pop_if_space_allows(DSTAR_HEADER_SLOTS + 1)
             .ok_or("expected frame")?;
-        assert_eq!(head.command, MMDVM_DSTAR_HEADER);
+        assert_eq!(head.command, Command::DSTAR_HEADER);
         assert_eq!(head.slots_required, DSTAR_HEADER_SLOTS);
         assert_eq!(head.mode, ModemMode::Dstar);
         assert!(q.is_empty());
@@ -202,7 +197,7 @@ mod tests {
         // Data can't drain at 1, drains at 2.
         assert!(q.pop_if_space_allows(1).is_none());
         let d = q.pop_if_space_allows(2).ok_or("expected data")?;
-        assert_eq!(d.command, MMDVM_DSTAR_DATA);
+        assert_eq!(d.command, Command::DSTAR_DATA);
         Ok(())
     }
 
@@ -212,7 +207,7 @@ mod tests {
         q.push_dstar_eot()?;
         assert!(q.pop_if_space_allows(1).is_none());
         let eot = q.pop_if_space_allows(2).ok_or("expected eot")?;
-        assert_eq!(eot.command, MMDVM_DSTAR_EOT);
+        assert_eq!(eot.command, Command::DSTAR_EOT);
         assert!(eot.payload.is_empty());
         Ok(())
     }
@@ -241,16 +236,16 @@ mod tests {
 
         // Large space so every pop succeeds.
         let f1 = q.pop_if_space_allows(255).ok_or("f1")?;
-        assert_eq!(f1.command, MMDVM_DSTAR_HEADER);
+        assert_eq!(f1.command, Command::DSTAR_HEADER);
         assert_eq!(f1.payload.first().copied(), Some(1));
         let f2 = q.pop_if_space_allows(255).ok_or("f2")?;
-        assert_eq!(f2.command, MMDVM_DSTAR_DATA);
+        assert_eq!(f2.command, Command::DSTAR_DATA);
         assert_eq!(f2.payload.first().copied(), Some(2));
         let f3 = q.pop_if_space_allows(255).ok_or("f3")?;
-        assert_eq!(f3.command, MMDVM_DSTAR_DATA);
+        assert_eq!(f3.command, Command::DSTAR_DATA);
         assert_eq!(f3.payload.first().copied(), Some(3));
         let f4 = q.pop_if_space_allows(255).ok_or("f4")?;
-        assert_eq!(f4.command, MMDVM_DSTAR_EOT);
+        assert_eq!(f4.command, Command::DSTAR_EOT);
         assert!(q.is_empty());
         Ok(())
     }

@@ -1,31 +1,33 @@
 //! Events emitted by the modem loop to consumers.
 
-use mmdvm_core::{ModemStatus, NakReason, VersionResponse};
+use mmdvm_core::{Command, ModemStatus, NakReason, VersionResponse};
 
 /// Events emitted by the modem loop to the consumer via
 /// [`super::AsyncModem::next_event`].
-#[derive(Debug, Clone)]
+/// See the [runtime example](crate#drive-and-reclaim-a-modem).
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Event {
-    /// Modem firmware version + capabilities (one-shot, typically at
-    /// init).
+    /// A firmware version response to an initial or explicit query.
     Version(VersionResponse),
-    /// Modem status update: periodic (from internal 250 ms poll) OR
-    /// unsolicited (from the modem itself after TX transitions etc.).
+    /// A modem status update parsed using a confirmed supported version.
+    ///
+    /// Status received before the first valid version response is rejected as
+    /// [`Self::ProtocolViolation`] and cannot grant transmission capacity.
     Status(ModemStatus),
     /// Positive acknowledgement for a sent command.
     Ack {
         /// The command byte the modem ACK'd.
-        command: u8,
+        command: Command,
     },
     /// Negative acknowledgement for a sent command.
     Nak {
         /// The command byte the modem rejected.
-        command: u8,
+        command: Command,
         /// The reason the modem gave.
         reason: NakReason,
     },
-    /// D-STAR header received from the radio's MMDVM TX (41 bytes).
+    /// D-STAR header received from the modem (41 bytes).
     DstarHeaderRx {
         /// The 41 raw header bytes.
         bytes: [u8; 41],
@@ -40,13 +42,16 @@ pub enum Event {
     DstarLost,
     /// D-STAR end-of-transmission from the radio side.
     DstarEot,
-    /// Debug text from the modem firmware
-    /// (`MMDVM_DEBUG1..DEBUG5`).
+    /// Firmware debug response, including text and any binary integer suffix.
+    ///
+    /// `DEBUG1` through `DEBUG5` carry zero through four appended integers;
+    /// `DEBUG_DUMP` carries diagnostic bytes. The command and payload are
+    /// retained without imposing a severity level or lossy text conversion.
     Debug {
-        /// Debug level (1..=5).
-        level: u8,
-        /// Decoded UTF-8 text (NUL-trimmed, lossy where needed).
-        text: String,
+        /// The debug response identifier.
+        command: Command,
+        /// Complete payload, unchanged from the wire.
+        payload: Vec<u8>,
     },
     /// Serial passthrough data from the modem.
     SerialData(Vec<u8>),
@@ -57,11 +62,11 @@ pub enum Event {
     /// with the payload preserved verbatim.
     UnhandledResponse {
         /// The command byte.
-        command: u8,
+        command: Command,
         /// The raw payload bytes.
         payload: Vec<u8>,
     },
-    /// The transport closed gracefully (e.g. serial device unplug).
+    /// The underlying stream returned EOF.
     TransportClosed,
     /// The modem loop hit a fatal error and is about to exit. After
     /// the event channel drains, [`super::AsyncModem::next_event`]
@@ -72,10 +77,11 @@ pub enum Event {
         /// loop.
         message: String,
     },
-    /// Queued TX frames were discarded because the loop exited before
-    /// the modem granted enough FIFO space to send them. Without
-    /// this, a transmission truncates silently even though every
-    /// `send_dstar_*` call reported success.
+    /// Queued TX frames were discarded when the loop exited.
+    ///
+    /// The count covers frames still queued. A frame already removed for a
+    /// failed write can have made partial progress and is reported by the
+    /// terminal error rather than included in this count.
     TxDropped {
         /// Number of frames discarded.
         frames: usize,
@@ -97,7 +103,7 @@ pub enum Event {
     /// consumer detect a degrading link.
     ProtocolViolation {
         /// The command byte of the offending frame.
-        command: u8,
+        command: Command,
         /// What was wrong with it.
         detail: String,
     },

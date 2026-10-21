@@ -1,46 +1,40 @@
 [package]
 name = "mmdvm"
 version = "0.1.0"
+authors = ["swiftraccoon"]
+categories = ["network-programming", "asynchronous"]
 edition = "2024"
+keywords = ["ham-radio", "mmdvm", "dstar", "amateur-radio", "tokio"]
+license = "GPL-2.0-or-later"
+publish = false
+readme = "README.md"
+repository = "https://github.com/swiftraccoon/kenwood"
 rust-version = "1.94"
 description = "Tokio async shell for the MMDVM ham radio digital voice modem protocol"
-readme = "README.md"
-license = "GPL-2.0-or-later"
-repository = "https://github.com/swiftraccoon/kenwood"
-keywords = ["ham-radio", "mmdvm", "dstar", "amateur-radio", "tokio"]
-categories = ["network-programming", "asynchronous"]
-authors = ["swiftraccoon"]
-publish = false
 
 [features]
 default = ["runtime"]
-runtime = []
 dstar = ["runtime", "dep:dstar-gateway-core"]
 probe = ["dep:kenwood-transport"]
+runtime = []
 
 [dependencies]
-mmdvm-core = { path = "../mmdvm-core" }
 dstar-gateway-core = { path = "../dstar-gateway-core", optional = true }
 kenwood-transport = { path = "../kenwood-transport", default-features = false, optional = true }
-tokio = { version = "1", features = [
-  "rt",
-  "macros",
-  "sync",
-  "io-util",
-  "time",
-] }
+mmdvm-core = { path = "../mmdvm-core" }
 thiserror = "2"
+tokio = { version = "1", features = ["rt", "macros", "sync", "io-util", "time"] }
 tracing = "0.1"
 
 [dev-dependencies]
 kenwood-transport = { path = "../kenwood-transport", default-features = false }
 tokio = { version = "1", features = [
-  "rt-multi-thread",
-  "test-util",
-  "macros",
-  "sync",
-  "io-util",
-  "time",
+    "rt-multi-thread",
+    "test-util",
+    "macros",
+    "sync",
+    "io-util",
+    "time",
 ] }
 
 [lints]

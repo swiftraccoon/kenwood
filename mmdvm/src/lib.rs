@@ -4,6 +4,21 @@
 
 #![doc = include_str!("../README.md")]
 
+pub use error::ShellError;
+pub use mmdvm_core as core;
+#[cfg(feature = "runtime")]
+pub use tokio_shell::{
+    AsyncModem, ConfigurationError, ConfigurationProfile, DstarConfiguration, Event, ModemShutdown,
+    ShutdownFailure, ShutdownSummary, SignalLevel, SignalLevels, TxDelay,
+};
+pub use transport::Transport;
+
+#[cfg(all(test, not(any(feature = "dstar", feature = "probe"))))]
+use kenwood_transport as _;
+
+#[cfg(not(any(feature = "runtime", feature = "probe")))]
+use tracing as _;
+
 #[cfg(feature = "dstar")]
 pub mod dstar;
 pub mod error;
@@ -12,15 +27,3 @@ pub mod probe;
 #[cfg(feature = "runtime")]
 pub mod tokio_shell;
 pub mod transport;
-
-pub use error::ShellError;
-pub use mmdvm_core as core;
-#[cfg(feature = "runtime")]
-pub use tokio_shell::{AsyncModem, Event};
-pub use transport::Transport;
-
-#[cfg(all(test, not(any(feature = "dstar", feature = "probe"))))]
-use kenwood_transport as _;
-
-#[cfg(not(any(feature = "runtime", feature = "probe")))]
-use tracing as _;

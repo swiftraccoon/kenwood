@@ -78,25 +78,49 @@ The caller must establish the binary protocol before spawning the modem.
 
 ```rust,no_run
 # #[cfg(feature = "runtime")]
-async fn drive<S: mmdvm::Transport + 'static>(stream: S) -> Result<S, mmdvm::ShellError> {
+async fn drive<S: mmdvm::Transport + 'static>(stream: S) -> Result<S, mmdvm::ShutdownFailure> {
     let mut modem = mmdvm::AsyncModem::spawn(stream);
     if let Some(event) = modem.next_event().await {
         println!("{event:?}");
     }
-    modem.shutdown().await
+    let completed = modem.shutdown().await?;
+    println!("queued frames discarded: {:?}", completed.summary().dropped_frames());
+    Ok(completed.into_transport())
 }
 ```
 
 Spawning sends `GetVersion` and `GetStatus`; the loop then polls status every
-250 ms. D-STAR frames leave its bounded TX queue only when the modem reports
+250 ms. Status is accepted only after a supported version reply. D-STAR frames
+leave its bounded TX queue only when a status in that confirmed layout reports
 sufficient FIFO space. Submission success means queued, not transmitted.
-`Event::TxDropped` reports queued frames discarded during shutdown or failure.
+`Event::TxDropped` reports queued frames discarded when the loop exits.
+Command identifiers use `core::Command`, including unknown wire bytes. Raw
+submissions validate the 506-byte payload bound before entering the command
+channel; `SET_MODE` and `SET_CONFIG` are reserved for their correlated operations.
+A failed write or flush retires
+the stream, since an incomplete frame cannot safely be followed by another.
 
-`shutdown` awaits the modem task and returns its stream when recovery succeeds.
+`set_mode` uses one two-second deadline for channel submission and response
+waiting. After a written change times out or its caller cancels, the loop rejects
+another change with `ShellError::ModeChangePending` until the earlier ACK or NAK
+arrives. The new call's total deadline still applies while waiting for the loop.
+The caller may instead shut down and retire the connection. Received debug
+events retain their command and binary payload; the debug command numbers do
+not represent severity levels.
+
+`shutdown` awaits the modem task and returns `ModemShutdown`, containing its
+stream and a `ShutdownSummary`. Inspect the summary before calling
+`into_transport`: it retains the authoritative queued-frame-drop count, up to
+256 unread events, and the exact number of unread events the ring overwrote.
+`ShutdownFailure` retains the same summary alongside its typed cause. A task
+interrupted before returning its result has an unknown dropped-frame count.
 For a `StreamAdapter`, also await `shutdown_and_recover` before using its inner
 transport. Only then may model-specific cleanup or restoration proceed.
 Shutdown itself sends no CAT exit, close, or reopen command. Dropping a handle
 does not await cleanup, and a failed modem task can make its stream unrecoverable.
+The shutdown drain budget is two seconds after the task accepts shutdown,
+checked between operations; a write and flush can additionally take five
+seconds. This is not a two-second bound on the complete shutdown future.
 
 ## Add D-STAR voice operation
 
@@ -106,9 +130,12 @@ ASCII, and commas are rejected instead of truncated or repaired. The callsign
 and suffix getters return fixed-width protocol values. Receive events preserve
 opaque wire bytes independently of this transmit-configuration validation.
 
-Pass a prepared `AsyncModem` and that configuration to
-`DstarModem::initialize`. It sends D-STAR-only `SetConfig`, waits for its matching
-ACK, then sends correlated `SetMode(Dstar)`. Initialization failure returns the
+Also construct `DstarConfiguration` with an explicit `ConfigurationProfile`,
+checked `TxDelay` in ten-millisecond units, and `SignalLevel` receive/transmit
+settings before mode entry. Pass the prepared `AsyncModem`, identity, and wire
+configuration to `DstarModem::initialize`. It waits for a matching version,
+sends D-STAR-only `SetConfig`, waits for its matching ACK, then sends correlated
+`SetMode(Dstar)`. Initialization failure returns the
 original modem handle alongside a typed `DstarError`. `into_modem` returns the
 running handle without I/O, leaving shutdown and radio restoration to its owner.
 The `mmdvm::dstar` module contains a complete initialization/recovery example.
@@ -139,6 +166,28 @@ Important operating boundaries:
 
 Only D-STAR transmission is driven by this shell today. Other digital-voice
 formats have core codec support but no corresponding shell TX workflow.
+
+## Supported configuration layouts
+
+`DstarConfiguration` encodes the public MMDVM version 1 and version 2 layouts:
+[`MMDVMHost/Modem.cpp`](https://github.com/g4klx/MMDVM-Host/blob/be804801ac33f5b5d93278a2ad1507db0c269023/Modem.cpp)
+builds 23 and 37 payload bytes respectively, and
+[`MMDVM/SerialPort.cpp`](https://github.com/g4klx/MMDVM/blob/57e692ad8ca380891b56a0988478ca76817e9f64/SerialPort.cpp)
+requires at least 37 for its protocol-2 parser. The supported configurations
+select simplex, normal signal polarity, D-STAR only, initial Idle mode, neutral
+DC offsets, zero levels for disabled modes, and zero reserved fields. Signal
+levels and key-up delay are explicit caller inputs. Matching a reported version
+does not establish that a particular radio firmware implements either layout.
+`ConfigurationProfile::KenwoodTerminal` returns
+`ConfigurationError::UnsupportedProfile` during construction, before I/O; no
+verified Kenwood configuration layout is supplied.
+
+`configure_dstar` uses one two-second deadline for submission, version
+confirmation, write, and ACK waiting. A version mismatch fails before any
+configuration byte is written. Once written, cancellation or timeout retains
+the configuration reservation: another attempt returns
+`ShellError::ConfigurationPending` until the previous ACK/NAK arrives or the
+connection is retired. An unwritten expired request sends no configuration.
 
 ## Reference and status
 

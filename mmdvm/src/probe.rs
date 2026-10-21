@@ -9,11 +9,14 @@ use std::time::Duration;
 
 use kenwood_transport::{Transport, TransportError};
 use mmdvm_core::{
-    MIN_FRAME_LEN, MMDVM_FRAME_START, MMDVM_GET_STATUS, MMDVM_GET_VERSION, MmdvmError, MmdvmFrame,
-    ModemStatus, VersionResponse, decode_frame,
+    Command, MIN_FRAME_LEN, MMDVM_FRAME_START, MmdvmError, MmdvmFrame, ModemStatus, VersionResponse,
 };
 
+#[cfg(test)]
+mod diagnostic_tests;
+
 /// Failures from bounded MMDVM identification and status exchanges.
+/// See the [probe example](crate#identify-a-caller-selected-connection).
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ProbeError {
@@ -25,19 +28,6 @@ pub enum ProbeError {
     UnknownStatusMode {
         /// Unrecognized raw mode byte.
         mode: u8,
-    },
-    /// The original version description is not valid UTF-8.
-    #[error("invalid UTF-8 in MMDVM version description: {0}")]
-    InvalidDescriptionEncoding(#[source] std::str::Utf8Error),
-    /// A control character remains after trimming documented trailing padding.
-    #[error(
-        "MMDVM version description contains control character {character:?} at byte {byte_offset}"
-    )]
-    DescriptionControlCharacter {
-        /// Rejected control character, never silently removed or repaired.
-        character: char,
-        /// Byte offset within the description, excluding the protocol prefix.
-        byte_offset: usize,
     },
     /// The requested timeout is zero or cannot be represented as a deadline.
     #[error("invalid MMDVM probe timeout: {timeout:?}")]
@@ -77,6 +67,7 @@ pub enum ProbeError {
 ///
 /// A failed status exchange leaves the version already read on this connection
 /// intact.
+/// See the [probe workflow](crate#identify-a-caller-selected-connection).
 #[derive(Debug)]
 pub struct DiagnosticResponse {
     /// Complete protocol-1 or protocol-2 version response.
@@ -162,8 +153,8 @@ pub async fn probe_diagnostics_until<T: Transport>(
 /// complete frames and non-frame bytes are skipped within that same budget.
 /// The response must include a nonempty version description, so a bare echo of
 /// the request is rejected. Original description bytes must be valid UTF-8.
-/// Trailing NUL bytes are removed first, then trailing Unicode whitespace,
-/// matching the core codec's padding semantics. Any remaining control
+/// Trailing NULs and ASCII whitespace are removed together, matching the core
+/// codec's padding semantics. Any remaining control
 /// character is rejected rather than repaired or silently discarded.
 /// Reads stop at each advertised frame boundary, leaving
 /// any following bytes for the consumer that takes over this same connection.
@@ -194,51 +185,32 @@ async fn read_version<T: Transport>(
     transport: &mut T,
     deadline: Deadline,
 ) -> Result<VersionResponse, ProbeError> {
-    deadline.write_request(transport, MMDVM_GET_VERSION).await?;
+    deadline
+        .write_request(transport, Command::GET_VERSION)
+        .await?;
     loop {
         let frame = deadline.read_frame(transport).await?;
-        if frame.command == MMDVM_GET_VERSION
-            && let Ok(version) = VersionResponse::parse(&frame.payload)
-            && matches!(version.protocol, 1 | 2)
-            && !version.description.is_empty()
-        {
-            validate_description(&frame.payload, version.protocol)?;
-            tracing::info!(
-                protocol = version.protocol,
-                description = %version.description,
-                "validated MMDVM GET_VERSION response"
-            );
-            return Ok(version);
+        if frame.command() != Command::GET_VERSION {
+            continue;
         }
+        let version = match VersionResponse::parse(frame.payload()) {
+            Ok(version) => version,
+            Err(
+                error @ (MmdvmError::InvalidVersionText { .. }
+                | MmdvmError::VersionDescriptionControl { .. }),
+            ) => return Err(error.into()),
+            Err(_) => continue,
+        };
+        if version.description().is_empty() {
+            continue;
+        }
+        tracing::info!(
+            protocol = version.protocol().get(),
+            description = %version.description(),
+            "validated MMDVM GET_VERSION response"
+        );
+        return Ok(version);
     }
-}
-
-/// Validate the original description before accepting the codec's owned text.
-fn validate_description(payload: &[u8], protocol: u8) -> Result<(), ProbeError> {
-    // Protocol 1 places the description after its protocol byte. Protocol 2
-    // adds capability bytes, CPU type, and the sixteen-byte device identifier.
-    let offset = match protocol {
-        1 => 1,
-        2 => 20,
-        _ => return Err(MmdvmError::InvalidVersionResponse.into()),
-    };
-    let raw = payload
-        .get(offset..)
-        .ok_or(MmdvmError::InvalidVersionResponse)?;
-    let description = std::str::from_utf8(raw)
-        .map_err(ProbeError::InvalidDescriptionEncoding)?
-        .trim_end_matches('\0')
-        .trim_end();
-    if let Some((byte_offset, character)) = description
-        .char_indices()
-        .find(|(_, character)| character.is_control())
-    {
-        return Err(ProbeError::DescriptionControlCharacter {
-            character,
-            byte_offset,
-        });
-    }
-    Ok(())
 }
 
 /// A version borrowed from this call selects the status decoder.
@@ -247,19 +219,21 @@ async fn read_status<T: Transport>(
     deadline: Deadline,
     version: &VersionResponse,
 ) -> Result<ModemStatus, ProbeError> {
-    deadline.write_request(transport, MMDVM_GET_STATUS).await?;
+    deadline
+        .write_request(transport, Command::GET_STATUS)
+        .await?;
     loop {
         let frame = deadline.read_frame(transport).await?;
-        if frame.command != MMDVM_GET_STATUS {
+        if frame.command() != Command::GET_STATUS {
             continue;
         }
-        let (status, mode_offset) = match version.protocol {
-            1 => (ModemStatus::parse_v1(&frame.payload)?, 1),
-            2 => (ModemStatus::parse_v2(&frame.payload)?, 0),
+        let (status, mode_offset) = match version.protocol().get() {
+            1 => (ModemStatus::parse_v1(frame.payload())?, 1),
+            2 => (ModemStatus::parse_v2(frame.payload())?, 0),
             _ => return Err(MmdvmError::InvalidVersionResponse.into()),
         };
         let mode = frame
-            .payload
+            .payload()
             .get(mode_offset)
             .copied()
             .ok_or(ProbeError::IncompleteFrame)?;
@@ -270,10 +244,6 @@ async fn read_status<T: Transport>(
         return Ok(status);
     }
 }
-
-#[cfg(test)]
-#[path = "probe/diagnostic_tests.rs"]
-mod diagnostic_tests;
 
 /// One budget shared by all fragments, never renewed by received noise.
 #[derive(Debug, Clone, Copy)]
@@ -307,10 +277,10 @@ impl Deadline {
     async fn write_request<T: Transport>(
         self,
         transport: &mut T,
-        command: u8,
+        command: Command,
     ) -> Result<(), ProbeError> {
         self.ensure_remaining()?;
-        let request = [MMDVM_FRAME_START, MIN_FRAME_LEN, command];
+        let request = MmdvmFrame::new(command).to_bytes();
         tokio::time::timeout_at(self.at, transport.write(&request))
             .await
             .map_err(|_| self.expired())??;
@@ -345,7 +315,8 @@ impl Deadline {
                 .get_mut(consumed..)
                 .ok_or(ProbeError::IncompleteFrame)?;
             self.read_exact(transport, remaining).await?;
-            let (frame, consumed) = decode_frame(&wire)?.ok_or(ProbeError::IncompleteFrame)?;
+            let (frame, consumed) =
+                MmdvmFrame::from_bytes(&wire)?.ok_or(ProbeError::IncompleteFrame)?;
             if consumed != wire.len() {
                 return Err(ProbeError::IncompleteFrame);
             }
@@ -388,6 +359,7 @@ impl Deadline {
 #[cfg(test)]
 mod tests {
     use std::io;
+    use std::num::NonZeroU32;
 
     use kenwood_transport::MockTransport;
 
@@ -464,7 +436,7 @@ mod tests {
             Ok(())
         }
 
-        fn set_baud_rate(&mut self, _baud: u32) -> Result<(), TransportError> {
+        fn set_baud_rate(&mut self, _baud: NonZeroU32) -> Result<(), TransportError> {
             self.controls.push("baud");
             Ok(())
         }
@@ -480,11 +452,15 @@ mod tests {
         let mut transport = MockTransport::new();
         transport.expect_reads(
             REQUEST,
-            &[b"noise\xE0", b"\x08\x00", b"\x01TEST\xE0\x04\x70\x02"],
+            [
+                b"noise\xE0".to_vec(),
+                b"\x08\x00".to_vec(),
+                b"\x01TEST\xE0\x04\x70\x02".to_vec(),
+            ],
         );
         let version = probe_version(&mut transport, BUDGET).await?;
-        assert_eq!(version.protocol, 1);
-        assert_eq!(version.description, "TEST");
+        assert_eq!(version.protocol().get(), 1);
+        assert_eq!(version.description(), "TEST");
         let mut following = [0; 4];
         let count = transport.read(&mut following).await?;
         assert_eq!(count, following.len());
@@ -496,9 +472,16 @@ mod tests {
     #[tokio::test]
     async fn non_version_frames_do_not_prove_identity() -> TestResult {
         let mut transport = MockTransport::new();
-        transport.expect_reads(REQUEST, &[b"\xE0\x03\x00", b"\xE0\x04\x70\x02", VERSION]);
+        transport.expect_reads(
+            REQUEST,
+            [
+                b"\xE0\x03\x00".to_vec(),
+                b"\xE0\x04\x70\x02".to_vec(),
+                VERSION.to_vec(),
+            ],
+        );
         let version = probe_version(&mut transport, BUDGET).await?;
-        assert_eq!(version.description, "TEST");
+        assert_eq!(version.description(), "TEST");
         transport.assert_complete();
         Ok(())
     }
@@ -523,8 +506,8 @@ mod tests {
     async fn fragmented_reads_share_one_deadline() {
         let mut transport = MockTransport::new();
         transport.expect(REQUEST, b"");
-        transport.queue_read_delayed(b"\xE0", 1_100);
-        transport.queue_read_delayed(b"\x08", 1_100);
+        transport.queue_read_delayed(b"\xE0", Duration::from_millis(1_100));
+        transport.queue_read_delayed(b"\x08", Duration::from_millis(1_100));
         let started = tokio::time::Instant::now();
         let result = probe_version(&mut transport, BUDGET).await;
         assert!(matches!(result, Err(ProbeError::Timeout { timeout }) if timeout == BUDGET));
@@ -552,10 +535,10 @@ mod tests {
         let mut transport = MockTransport::new();
         transport.expect(REQUEST, &response);
         let version = probe_version(&mut transport, BUDGET).await?;
-        assert_eq!(version.protocol, 2);
-        assert_eq!(version.description, "TEST");
+        assert_eq!(version.protocol().get(), 2);
+        assert_eq!(version.description(), "TEST");
         let capabilities = version
-            .capabilities
+            .capabilities()
             .ok_or("protocol two requires capabilities")?;
         assert!(capabilities.has_dstar());
         assert!(capabilities.has_fm());
@@ -647,8 +630,8 @@ mod tests {
         let mut transport = MockTransport::new();
         transport.expect(REQUEST, &response);
         let version = probe_version(&mut transport, BUDGET).await?;
-        assert_eq!(version.protocol, 1);
-        assert_eq!(version.description, "A".repeat(253));
+        assert_eq!(version.protocol().get(), 1);
+        assert_eq!(version.description(), "A".repeat(253));
         let mut following = [0; 4];
         assert_eq!(transport.read(&mut following).await?, following.len());
         assert_eq!(following, *b"next");

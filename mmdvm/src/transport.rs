@@ -2,12 +2,8 @@
 //!
 //! Consumers provide any type that implements both [`AsyncRead`] and
 //! [`AsyncWrite`]. The shell takes ownership and drives it from the
-//! internal modem loop. Typical concrete types:
-//!
-//! - `tokio::io::DuplexStream` for unit tests
-//! - `tokio_serial::SerialStream` for USB-CDC (Kenwood TH-D75)
-//! - `kenwood_transport::StreamAdapter<kenwood_thd75::EitherTransport>`
-//!   for the USB/Bluetooth SPP auto-selection used by the TH-D75 crates
+//! internal modem loop. A `tokio::io::DuplexStream` supplies an in-memory
+//! stream; `kenwood_transport::StreamAdapter` adapts an already-open transport.
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -16,6 +12,10 @@ use tokio::io::{AsyncRead, AsyncWrite};
 /// Blanket-implemented for any type that is both [`AsyncRead`] +
 /// [`AsyncWrite`] + [`Send`] + [`Unpin`]. See [`mmdvm_core`] for the
 /// wire-format specifics the bytes on this stream must follow.
+/// Implementers provide the inherited Tokio read, write and flush contracts.
+/// This marker is object-safe and remains open to downstream stream types;
+/// shared access through `Sync` is not required.
+/// See the [runtime example](crate#drive-and-reclaim-a-modem).
 ///
 /// [`mmdvm_core`]: crate::core
 pub trait Transport: AsyncRead + AsyncWrite + Send + Unpin {}

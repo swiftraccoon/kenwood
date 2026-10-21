@@ -3,6 +3,7 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::io;
+use std::num::NonZeroU32;
 
 use kenwood_transport::MockTransport;
 use mmdvm_core::ModemMode;
@@ -77,7 +78,7 @@ impl Transport for TimedTransport {
         Ok(())
     }
 
-    fn set_baud_rate(&mut self, _baud: u32) -> Result<(), TransportError> {
+    fn set_baud_rate(&mut self, _baud: NonZeroU32) -> Result<(), TransportError> {
         self.controls.push("baud");
         Ok(())
     }
@@ -94,7 +95,7 @@ async fn version_then_status_sends_only_two_queries() -> TestResult {
     transport.expect(VERSION_REQUEST, VERSION);
     transport.expect(STATUS_REQUEST, STATUS);
     let report = probe_diagnostics(&mut transport, BUDGET).await?;
-    assert_eq!(report.version.description, "TEST");
+    assert_eq!(report.version.description(), "TEST");
     let status = report.status?;
     assert_eq!(status.mode, ModemMode::Dstar);
     assert_eq!(status.dstar_space, 7);
@@ -117,7 +118,7 @@ async fn protocol_two_status_uses_the_identified_layout() -> TestResult {
         b"\xE0\x0F\x01\x01\x40\x00\x07\x03\x04\x05\x06\x08\x00\x09\x0A",
     );
     let report = probe_diagnostics(&mut transport, BUDGET).await?;
-    assert_eq!(report.version.protocol, 2);
+    assert_eq!(report.version.protocol().get(), 2);
     let status = report.status?;
     assert_eq!(status.mode, ModemMode::Dstar);
     assert_eq!(status.dstar_space, 7);
@@ -144,7 +145,7 @@ async fn failed_status_preserves_complete_version_evidence() -> TestResult {
     transport.expect(VERSION_REQUEST, VERSION);
     transport.expect_hang(STATUS_REQUEST);
     let report = probe_diagnostics(&mut transport, BUDGET).await?;
-    assert_eq!(report.version.description, "TEST");
+    assert_eq!(report.version.description(), "TEST");
     assert!(matches!(report.status, Err(ProbeError::Timeout { .. })));
     assert_eq!(transport.writes(), [VERSION_REQUEST, STATUS_REQUEST]);
     transport.assert_complete();
@@ -156,11 +157,11 @@ async fn version_and_status_share_the_same_absolute_deadline() -> TestResult {
     let mut transport = MockTransport::new();
     transport.expect(VERSION_REQUEST, b"");
     transport.expect(STATUS_REQUEST, b"");
-    transport.queue_read_delayed(VERSION, 1_100);
-    transport.queue_read_delayed(STATUS, 1_100);
+    transport.queue_read_delayed(VERSION, Duration::from_millis(1_100));
+    transport.queue_read_delayed(STATUS, Duration::from_millis(1_100));
     let started = tokio::time::Instant::now();
     let report = probe_diagnostics(&mut transport, BUDGET).await?;
-    assert_eq!(report.version.description, "TEST");
+    assert_eq!(report.version.description(), "TEST");
     assert!(matches!(report.status, Err(ProbeError::Timeout { .. })));
     assert_eq!(started.elapsed(), BUDGET);
     transport.assert_complete();
@@ -173,7 +174,7 @@ async fn short_status_is_a_codec_failure_not_readiness() -> TestResult {
     transport.expect(VERSION_REQUEST, VERSION);
     transport.expect(STATUS_REQUEST, b"\xE0\x06\x01\x01\x01\x00");
     let report = probe_diagnostics(&mut transport, BUDGET).await?;
-    assert_eq!(report.version.description, "TEST");
+    assert_eq!(report.version.description(), "TEST");
     assert!(matches!(
         report.status,
         Err(ProbeError::Frame(MmdvmError::InvalidStatusLength {
@@ -217,7 +218,7 @@ async fn cancelled_after_version_retains_evidence_without_status_write() -> Test
         previous != 0
     })
     .await?;
-    assert_eq!(report.version.description, "TEST");
+    assert_eq!(report.version.description(), "TEST");
     assert!(matches!(report.status, Err(ProbeError::Cancelled)));
     assert_eq!(transport.writes(), [VERSION_REQUEST]);
     transport.assert_complete();
@@ -227,10 +228,10 @@ async fn cancelled_after_version_retains_evidence_without_status_write() -> Test
 #[tokio::test]
 async fn version_does_not_retain_earlier_unsolicited_status_for_later_query() -> TestResult {
     let mut transport = MockTransport::new();
-    transport.expect_reads(VERSION_REQUEST, &[STATUS, VERSION]);
+    transport.expect_reads(VERSION_REQUEST, [STATUS.to_vec(), VERSION.to_vec()]);
     transport.expect_eof(STATUS_REQUEST);
     let report = probe_diagnostics(&mut transport, BUDGET).await?;
-    assert_eq!(report.version.description, "TEST");
+    assert_eq!(report.version.description(), "TEST");
     assert!(matches!(report.status, Err(ProbeError::UnexpectedEof)));
     transport.assert_complete();
     Ok(())
@@ -242,10 +243,10 @@ async fn fragmented_status_leaves_following_frame_unread() -> TestResult {
     transport.expect(VERSION_REQUEST, VERSION);
     transport.expect_reads(
         STATUS_REQUEST,
-        &[
-            b"noise\xE0\x04\x70\x01\xE0",
-            b"\x0A\x01\x01\x01\x40",
-            b"\x07\x03\x04\x05next",
+        [
+            b"noise\xE0\x04\x70\x01\xE0".to_vec(),
+            b"\x0A\x01\x01\x01\x40".to_vec(),
+            b"\x07\x03\x04\x05next".to_vec(),
         ],
     );
     let report = probe_diagnostics(&mut transport, BUDGET).await?;
@@ -272,7 +273,7 @@ async fn both_writes_consume_the_same_budget_without_control_operations() -> Tes
     let mut transport = TimedTransport::new(Duration::from_millis(1_100), StatusWrite::Complete);
     let started = tokio::time::Instant::now();
     let report = probe_diagnostics(&mut transport, BUDGET).await?;
-    assert_eq!(report.version.description, "TEST");
+    assert_eq!(report.version.description(), "TEST");
     assert!(matches!(report.status, Err(ProbeError::Timeout { .. })));
     assert_eq!(started.elapsed(), BUDGET);
     assert_eq!(transport.writes, [VERSION_REQUEST, STATUS_REQUEST]);
@@ -285,7 +286,7 @@ async fn both_writes_consume_the_same_budget_without_control_operations() -> Tes
 async fn failed_status_write_preserves_error_and_version_without_retries() -> TestResult {
     let mut transport = TimedTransport::new(Duration::ZERO, StatusWrite::Fail);
     let report = probe_diagnostics(&mut transport, BUDGET).await?;
-    assert_eq!(report.version.description, "TEST");
+    assert_eq!(report.version.description(), "TEST");
     assert!(matches!(
         report.status,
         Err(ProbeError::Transport(TransportError::Write(error)))
@@ -303,7 +304,7 @@ async fn pending_status_write_expires_at_original_deadline() -> TestResult {
     let mut transport = TimedTransport::new(Duration::from_millis(500), StatusWrite::Pending);
     let started = tokio::time::Instant::now();
     let report = probe_diagnostics(&mut transport, BUDGET).await?;
-    assert_eq!(report.version.description, "TEST");
+    assert_eq!(report.version.description(), "TEST");
     assert!(matches!(report.status, Err(ProbeError::Timeout { .. })));
     assert_eq!(started.elapsed(), BUDGET);
     assert_eq!(transport.writes, [VERSION_REQUEST, STATUS_REQUEST]);
@@ -330,9 +331,9 @@ async fn noise_during_status_does_not_renew_the_deadline() -> TestResult {
     transport.expect(VERSION_REQUEST, b"");
     transport.expect(STATUS_REQUEST, b"");
     transport.queue_read(VERSION);
-    transport.queue_read_delayed(b"\xE0\x04\x70\x01", 700);
-    transport.queue_read_delayed(b"unrelated", 700);
-    transport.queue_read_delayed(b"\xE0\x04\x70\x01", 700);
+    transport.queue_read_delayed(b"\xE0\x04\x70\x01", Duration::from_millis(700));
+    transport.queue_read_delayed(b"unrelated", Duration::from_millis(700));
+    transport.queue_read_delayed(b"\xE0\x04\x70\x01", Duration::from_millis(700));
     let started = tokio::time::Instant::now();
     let report = probe_diagnostics(&mut transport, BUDGET).await?;
     assert!(matches!(report.status, Err(ProbeError::Timeout { .. })));
@@ -366,7 +367,7 @@ fn version_wire(protocol: u8, description: &[u8]) -> Result<Vec<u8>, MmdvmError>
         payload.extend_from_slice(&[0; 16]);
     }
     payload.extend_from_slice(description);
-    mmdvm_core::encode_frame(&MmdvmFrame::with_payload(MMDVM_GET_VERSION, payload))
+    Ok(MmdvmFrame::with_payload(Command::GET_VERSION, payload)?.to_bytes())
 }
 
 #[tokio::test]
@@ -377,7 +378,10 @@ async fn invalid_utf8_is_rejected_in_both_version_description_layouts() -> TestR
             transport.expect(VERSION_REQUEST, &version_wire(protocol, description)?);
             let result = probe_version(&mut transport, BUDGET).await;
             assert!(
-                matches!(result, Err(ProbeError::InvalidDescriptionEncoding(_))),
+                matches!(
+                    result,
+                    Err(ProbeError::Frame(MmdvmError::InvalidVersionText { .. }))
+                ),
                 "invalid UTF-8 must not become repaired evidence: {result:?}"
             );
             assert_eq!(transport.writes(), [VERSION_REQUEST]);
@@ -401,10 +405,10 @@ async fn interior_controls_are_rejected_in_both_version_description_layouts() ->
             assert!(
                 matches!(
                     result,
-                    Err(ProbeError::DescriptionControlCharacter {
+                    Err(ProbeError::Frame(MmdvmError::VersionDescriptionControl {
                         character: actual,
                         byte_offset: 4,
-                    }) if actual == character
+                    })) if actual == character
                 ),
                 "interior controls must not become description evidence: {result:?}"
             );
@@ -422,8 +426,8 @@ async fn valid_unicode_and_trailing_padding_remain_lossless() -> TestResult {
             let mut transport = MockTransport::new();
             transport.expect(VERSION_REQUEST, &version_wire(protocol, padded.as_bytes())?);
             let version = probe_version(&mut transport, BUDGET).await?;
-            assert_eq!(version.protocol, protocol);
-            assert_eq!(version.description, description);
+            assert_eq!(version.protocol().get(), protocol);
+            assert_eq!(version.description(), description);
             transport.assert_complete();
         }
     }
@@ -438,7 +442,7 @@ async fn rejected_description_never_admits_the_status_query() -> TestResult {
         let result = probe_diagnostics(&mut transport, BUDGET).await;
         assert!(matches!(
             result,
-            Err(ProbeError::InvalidDescriptionEncoding(_))
+            Err(ProbeError::Frame(MmdvmError::InvalidVersionText { .. }))
         ));
         assert_eq!(transport.writes(), [VERSION_REQUEST]);
         transport.assert_complete();
@@ -515,7 +519,7 @@ async fn always_ready_status_noise_stops_before_its_finite_input_is_exhausted() 
     let mut transport = ReadyNoiseTransport::new(VERSION);
     let budget = Duration::from_millis(50);
     let result = probe_diagnostics(&mut transport, budget).await?;
-    assert_eq!(result.version.description, "TEST");
+    assert_eq!(result.version.description(), "TEST");
     assert!(matches!(result.status, Err(ProbeError::Timeout { timeout }) if timeout == budget));
     assert!(transport.noise_reads > 0);
     assert!(transport.remaining_noise_reads > 0);

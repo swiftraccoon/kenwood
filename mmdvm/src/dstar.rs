@@ -16,24 +16,47 @@
 //! belong to the caller. This module never sends CAT commands or reopens a
 //! transport. Initialization failure returns the original modem handle, and
 //! [`DstarModem::into_modem`] hands it back for explicit shutdown and recovery.
+//! Initialization requires an explicit public MMDVM configuration layout and a
+//! matching version response. Construct that configuration before mode entry;
+//! the Kenwood Terminal profile currently returns an unsupported-profile error.
 //!
 //! ```rust,no_run
-//! use mmdvm::{AsyncModem, Transport};
-//! use mmdvm::dstar::{DstarModem, DstarModemConfig};
+//! use mmdvm::{
+//!     AsyncModem, ConfigurationProfile, DstarConfiguration, SignalLevel, SignalLevels,
+//!     Transport, TxDelay,
+//! };
+//! use mmdvm::dstar::{DstarModem, DstarModemConfig, DstarStatusReflector};
 //!
 //! # async fn example<S: Transport + 'static>(stream: S)
 //! # -> Result<(), Box<dyn std::error::Error>> {
 //! // `stream` must already be proved to speak MMDVM by the caller.
+//! let wire_config = DstarConfiguration::new(
+//!     ConfigurationProfile::MmdvmV2, TxDelay::try_from(10)?,
+//!     SignalLevels { receive: SignalLevel::new(128), transmit: SignalLevel::new(128) },
+//! )?;
 //! let modem = AsyncModem::spawn(stream);
 //! let config = DstarModemConfig::new("N0CALL")?.with_suffix("/P")?;
-//! let runtime = match DstarModem::initialize(modem, config).await {
+//! let mut runtime = match DstarModem::initialize(modem, config, wire_config).await {
 //!     Ok(runtime) => runtime,
 //!     Err((modem, error)) => {
-//!         let _stream = modem.shutdown().await?;
+//!         let completed = modem.shutdown().await?;
+//!         println!("dropped frames: {:?}", completed.summary().dropped_frames());
+//!         let _stream = completed.into_transport();
 //!         return Err(error.into());
 //!     }
 //! };
-//! let _stream = runtime.into_modem().shutdown().await?;
+//! let reflector = DstarStatusReflector::new("REF030", 'C')?;
+//! runtime.send_status_header(Some(reflector)).await?;
+//! if let Some(event) = runtime.next_event().await? {
+//!     println!("{event:?}");
+//! }
+//! for station in runtime.last_heard() {
+//!     let wire: &[u8] = station.callsign.as_ref();
+//!     println!("{wire:?}: {:?}", station.age(std::time::Instant::now()));
+//! }
+//! let completed = runtime.into_modem().shutdown().await?;
+//! println!("dropped frames: {:?}", completed.summary().dropped_frames());
+//! let _stream = completed.into_transport();
 //! // The stream is free again; mode restoration belongs to the model crate.
 //! # Ok(())
 //! # }
@@ -42,12 +65,13 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use crate::{AsyncModem, Event, ShellError, Transport};
 use dstar_gateway_core::{
     Callsign, DstarHeader, Module, ReflectorCallsign, SlowDataTextCollector, SlowDataTextMessage,
     Suffix, TypeError, UrCallAction, VoiceFrame, WireTextError,
 };
-use mmdvm_core::{MMDVM_SET_CONFIG, ModemMode, ModemStatus};
+use mmdvm_core::{ModemMode, ModemStatus};
+
+use crate::{AsyncModem, DstarConfiguration, Event, ShellError, Transport};
 
 /// Default receive timeout for `next_event` polling (500 ms).
 ///
@@ -60,7 +84,8 @@ const EVENT_POLL_TIMEOUT: Duration = Duration::from_millis(500);
 /// The fixed 3,000-frame resource policy permits 60 seconds at the nominal
 /// 20 ms voice cadence, retaining at most 36,000 bytes of voice payload. This
 /// is a frame-count bound, not an elapsed-time deadline. The next frame
-/// discards the entire recording and emits [`DstarEvent::EchoRecordingAborted`].
+/// discards the entire recording and emits
+/// [`DstarEvent::EchoRecordingAborted`].
 /// Normal receive events continue; only a new header can begin another echo.
 pub const MAX_ECHO_RECORDING_FRAMES: usize = 3000;
 
@@ -70,18 +95,6 @@ const STATUS_POLL_TIMEOUT: Duration = Duration::from_secs(2);
 /// Default maximum entries in the last-heard list.
 const DEFAULT_MAX_LAST_HEARD: usize = 100;
 
-/// Timeout waiting for each ACK during the D-STAR init handshake.
-const INIT_ACK_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Default TX delay for MMDVM `SetConfig` (in 10 ms units).
-const DEFAULT_TX_DELAY: u8 = 10;
-
-/// Default RX audio level for MMDVM `SetConfig`.
-const DEFAULT_RX_LEVEL: u8 = 128;
-
-/// Default TX audio level for MMDVM `SetConfig`.
-const DEFAULT_TX_LEVEL: u8 = 128;
-
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -90,7 +103,8 @@ const DEFAULT_TX_LEVEL: u8 = 128;
 ///
 /// Identity fields are private and validated before modem I/O. Unlike raw
 /// receive callsigns, they cannot contain opaque bytes or require truncation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// See the [initialization example](self).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DstarModemConfig {
     /// Validated MY callsign, space-padded when encoded on the wire.
     callsign: Callsign,
@@ -103,7 +117,7 @@ pub struct DstarModemConfig {
 }
 
 impl DstarModemConfig {
-    /// Create a new configuration with sensible defaults.
+    /// Construct a transmit identity with an empty suffix and 100-entry history.
     ///
     /// - Suffix: empty (encoded as four spaces)
     /// - Max last-heard: 100 entries
@@ -146,7 +160,7 @@ impl DstarModemConfig {
 }
 
 /// Transmit identity field whose validation failed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IdentityField {
     /// Eight-byte MY callsign.
     Callsign,
@@ -155,7 +169,7 @@ pub enum IdentityField {
 }
 
 /// Invalid transmit identity; no modem I/O has occurred.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum DstarConfigError {
     /// Core D-STAR identity validation failed.
@@ -214,6 +228,12 @@ pub enum DstarError {
     /// An absolute response deadline expired.
     #[error("D-STAR modem response timed out after {0:?}")]
     Timeout(Duration),
+    /// The receive timeout cannot be represented as a monotonic deadline.
+    #[error("invalid D-STAR event timeout: {timeout:?}")]
+    InvalidEventTimeout {
+        /// Rejected polling duration.
+        timeout: Duration,
+    },
     /// The modem transport or event stream closed.
     #[error("D-STAR modem transport closed")]
     TransportClosed,
@@ -231,6 +251,7 @@ pub enum DstarError {
 /// its module in the eighth. [`ReflectorCallsign`] alone permits eight-byte
 /// names, so this gateway-specific type validates the narrower wire invariant
 /// before any transmission begins.
+/// See the [status-header example](self).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DstarStatusReflector {
     name: ReflectorCallsign,
@@ -336,6 +357,7 @@ pub enum DstarStatusReflectorError {
 /// transmission, this receive-boundary type preserves all eight wire bytes.
 /// Use [`Self::text`] when semantic text is required and [`Self::as_bytes`]
 /// when inspecting a malformed or unidentified field.
+/// See the [receive-history example](self).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ObservedDstarCallsign(Callsign);
 
@@ -362,6 +384,18 @@ impl From<Callsign> for ObservedDstarCallsign {
     }
 }
 
+impl From<ObservedDstarCallsign> for Callsign {
+    fn from(callsign: ObservedDstarCallsign) -> Self {
+        callsign.0
+    }
+}
+
+impl AsRef<[u8]> for ObservedDstarCallsign {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
 impl std::fmt::Display for ObservedDstarCallsign {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(formatter)
@@ -381,7 +415,8 @@ impl std::fmt::Debug for ObservedDstarCallsign {
 ///
 /// Tracks the most recent transmission heard from each unique callsign.
 /// Updated each time a D-STAR header is received from the radio.
-#[derive(Debug, Clone)]
+/// See the [receive-history example](self).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LastHeardEntry {
     /// Exact origin callsign (MY field), including its fixed-width padding.
     pub callsign: ObservedDstarCallsign,
@@ -508,7 +543,7 @@ pub enum DstarEvent {
 /// Dropping this value signals its modem task to stop but does not await
 /// completion. Use [`Self::into_modem`] and [`AsyncModem::shutdown`] when the
 /// underlying stream must be recovered before another consumer takes it.
-pub struct DstarModem<S: Transport + 'static> {
+pub struct DstarModem<S> {
     /// The underlying MMDVM async modem.
     modem: AsyncModem<S>,
     /// Gateway configuration.
@@ -536,8 +571,8 @@ pub struct DstarModem<S: Transport + 'static> {
     /// Last observed TX state from the modem's status responses. Used
     /// to emit a `StatusUpdate` event only on rising / falling edges,
     /// which keeps the event channel from being flooded with the modem's
-    /// 4 Hz status stream while still surfacing the moment the radio
-    /// keys (`tx() = true`) or stops transmitting (`tx() = false`).
+    /// periodic status stream while surfacing observed changes in
+    /// `tx()`.
     /// `None` until the first status response arrives.
     last_tx_active: Option<bool>,
     /// Previous status health bits (overflow/lockout, TX and CD bits
@@ -545,7 +580,7 @@ pub struct DstarModem<S: Transport + 'static> {
     last_health_bits: Option<u8>,
 }
 
-impl<S: Transport + 'static> std::fmt::Debug for DstarModem<S> {
+impl<S> std::fmt::Debug for DstarModem<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DstarModem")
             .field("config", &self.config)
@@ -558,7 +593,8 @@ impl<S: Transport + 'static> std::fmt::Debug for DstarModem<S> {
 impl<S: Transport + 'static> DstarModem<S> {
     /// Initialize D-STAR on a modem whose binary protocol is already proved.
     ///
-    /// Sends D-STAR-only `SetConfig`, awaits its matching ACK, then issues
+    /// Confirms the selected `wire_config` version, sends D-STAR-only
+    /// `SetConfig`, awaits its matching ACK, then issues
     /// correlated `SetMode(Dstar)`. Neither CAT commands nor mode restoration
     /// are part of this operation.
     ///
@@ -576,8 +612,9 @@ impl<S: Transport + 'static> DstarModem<S> {
     pub async fn initialize(
         mut modem: AsyncModem<S>,
         config: DstarModemConfig,
+        wire_config: DstarConfiguration,
     ) -> Result<Self, (AsyncModem<S>, DstarError)> {
-        if let Err(e) = init_dstar(&mut modem).await {
+        if let Err(e) = init_dstar(&mut modem, wire_config).await {
             return Err((modem, e));
         }
 
@@ -623,6 +660,8 @@ impl<S: Transport + 'static> DstarModem<S> {
     /// # Errors
     ///
     /// Returns terminal modem failures or a failed automatic echo response.
+    /// Returns [`DstarError::InvalidEventTimeout`] when the configured timeout
+    /// cannot be represented as a monotonic deadline.
     /// Malformed receive frames are surfaced as nonfatal diagnostic events.
     ///
     /// # Cancellation
@@ -642,7 +681,9 @@ impl<S: Transport + 'static> DstarModem<S> {
         // draining under one absolute deadline so status cannot prematurely
         // end a caller's drain loop or extend its requested time budget.
         let timeout = self.event_timeout;
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or(DstarError::InvalidEventTimeout { timeout })?;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
@@ -769,7 +810,7 @@ impl<S: Transport + 'static> DstarModem<S> {
             }
             // Periodic status arrives at 4 Hz. Emit a `StatusUpdate` only on a
             // TX-flag edge, so the event channel is not flooded while callers
-            // still see the exact moment the radio keys or unkeys.
+            // still see observed changes in the modem's TX flag.
             Event::Status(status) => {
                 let event = self.handle_status(status);
                 Ok(event)
@@ -859,7 +900,7 @@ impl<S: Transport + 'static> DstarModem<S> {
             repeater2: header.rpt2.into(),
             timestamp: Instant::now(),
         };
-        self.update_last_heard(entry.clone());
+        self.update_last_heard(entry);
         self.pending_events
             .push_back(DstarEvent::StationHeard(entry));
 
@@ -1000,9 +1041,7 @@ impl<S: Transport + 'static> DstarModem<S> {
         let rpt_bytes = reflector.map_or(*b"DIRECT  ", DstarStatusReflector::to_wire_bytes);
 
         let header = DstarHeader {
-            flag1: 0x00,
-            flag2: 0x00,
-            flag3: 0x00,
+            flags: dstar_gateway_core::HeaderFlags::NONE,
             rpt2: Callsign::from_wire_bytes(rpt_bytes),
             rpt1: Callsign::from_wire_bytes(rpt_bytes),
             ur_call: Callsign::from_wire_bytes(*b"CQCQCQ  "),
@@ -1015,9 +1054,9 @@ impl<S: Transport + 'static> DstarModem<S> {
 
     /// Set the receive timeout for `next_event` polling.
     ///
-    /// Lower values make the event loop more responsive but increase
-    /// CPU usage. Use short timeouts (10-50ms) when actively relaying
-    /// voice from a reflector.
+    /// Zero permits only already buffered D-STAR events to be returned.
+    /// [`Self::next_event`] returns [`DstarError::InvalidEventTimeout`] if a
+    /// monotonic deadline cannot represent this duration.
     pub const fn set_event_timeout(&mut self, timeout: Duration) {
         self.event_timeout = timeout;
     }
@@ -1162,9 +1201,7 @@ impl<S: Transport + 'static> DstarModem<S> {
         }
 
         let echo_header = DstarHeader {
-            flag1: orig_header.flag1,
-            flag2: orig_header.flag2,
-            flag3: orig_header.flag3,
+            flags: orig_header.flags,
             rpt2: Callsign::from_wire_bytes(rpt2_bytes),
             rpt1: orig_header.rpt1,
             ur_call: orig_header.my_call,
@@ -1188,88 +1225,14 @@ impl<S: Transport + 'static> DstarModem<S> {
     }
 }
 
-/// Initialise the MMDVM modem for D-STAR: send `SetConfig` with
-/// D-STAR-only flags, then `SetMode(Dstar)`.
-///
-/// `SetConfig` goes out as a raw write, so its ACK is awaited from
-/// the event stream; `set_mode` correlates the modem's ACK/NAK into
-/// its own return value, so its result is authoritative on its own.
-/// `Version` and `Status` events delivered by the modem's startup
-/// handshake are accepted silently.
-async fn init_dstar<S: Transport + 'static>(modem: &mut AsyncModem<S>) -> Result<(), DstarError> {
-    // Send SetConfig: D-STAR-only, default levels.
-    let config_payload = vec![
-        0x00, // invert
-        0x01, // mode flags: D-STAR only
-        DEFAULT_TX_DELAY,
-        ModemMode::Dstar.as_byte(),
-        DEFAULT_RX_LEVEL,
-        DEFAULT_TX_LEVEL,
-    ];
-    modem
-        .send_raw(MMDVM_SET_CONFIG, config_payload)
-        .await
-        .map_err(DstarError::from)?;
-    await_ack(modem, MMDVM_SET_CONFIG).await?;
-
-    // Send SetMode. It resolves with the modem's ACK/NAK directly, so
-    // a rejection or a silent modem surfaces here as an error.
-    modem
-        .set_mode(ModemMode::Dstar)
-        .await
-        .map_err(DstarError::from)?;
-
-    Ok(())
-}
-
-/// Wait for an ACK for the given command byte, dropping Version /
-/// Status events that arrive in the meantime.
-async fn await_ack<S: Transport + 'static>(
+/// Complete the correlated configuration before changing the runtime mode.
+async fn init_dstar<S: Transport + 'static>(
     modem: &mut AsyncModem<S>,
-    expected_command: u8,
+    wire_config: DstarConfiguration,
 ) -> Result<(), DstarError> {
-    let deadline = tokio::time::Instant::now() + INIT_ACK_TIMEOUT;
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(DstarError::Timeout(INIT_ACK_TIMEOUT));
-        }
-        let Ok(maybe_evt) = tokio::time::timeout(remaining, modem.next_event()).await else {
-            return Err(DstarError::Timeout(INIT_ACK_TIMEOUT));
-        };
-        let Some(evt) = maybe_evt else {
-            return Err(DstarError::TransportClosed);
-        };
-        if let Some(err) = terminal_event_error(&evt) {
-            return Err(err);
-        }
-        match evt {
-            Event::Ack { command } if command == expected_command => return Ok(()),
-            Event::Nak { command, reason } if command == expected_command => {
-                return Err(ShellError::Nak { command, reason }.into());
-            }
-            Event::Version(_) | Event::Status(_) | Event::Ack { .. } | Event::Nak { .. } => {
-                // Drop stray handshake events.
-            }
-            Event::Debug { level, text } => {
-                tracing::trace!(level, ?text, "MMDVM debug during init");
-            }
-            // Any protocol frames during init are unexpected but non-fatal.
-            Event::DstarHeaderRx { .. }
-            | Event::DstarDataRx { .. }
-            | Event::DstarLost
-            | Event::DstarEot
-            | Event::SerialData(_)
-            | Event::TransparentData(_)
-            | Event::UnhandledResponse { .. } => {
-                tracing::debug!("unexpected MMDVM event during init; ignoring");
-            }
-            // Other diagnostic events do not acknowledge this command.
-            _ => {
-                tracing::debug!("unrecognised MMDVM event during init; ignoring");
-            }
-        }
-    }
+    modem.configure_dstar(wire_config).await?;
+    modem.set_mode(ModemMode::Dstar).await?;
+    Ok(())
 }
 
 /// Map a terminal [`Event`], one that means the modem loop is
@@ -1329,14 +1292,14 @@ fn log_noise_event(event: &Event) {
         ),
         Event::Version(v) => tracing::debug!(
             target: "mmdvm::dstar",
-            protocol = v.protocol,
-            description = %v.description,
+            protocol = v.protocol().get(),
+            description = %v.description(),
             "MMDVM Version (ignored)"
         ),
-        Event::Debug { level, text } => tracing::trace!(
+        Event::Debug { command, payload } => tracing::trace!(
             target: "mmdvm::dstar",
-            level = *level,
-            text = %text,
+            command = %command,
+            ?payload,
             "MMDVM debug"
         ),
         Event::SerialData(data) => tracing::trace!(
@@ -1372,18 +1335,28 @@ fn log_noise_event(event: &Event) {
 mod tests {
     use super::*;
     use kenwood_transport::{MockTransport, StreamAdapter};
+    use mmdvm_core::{Command, MmdvmFrame};
 
     fn test_config() -> Result<DstarModemConfig, BoxTestErr> {
         Ok(DstarModemConfig::new("N0CALL")?)
+    }
+
+    fn test_wire_config() -> Result<DstarConfiguration, BoxTestErr> {
+        Ok(DstarConfiguration::new(
+            crate::ConfigurationProfile::MmdvmV2,
+            crate::TxDelay::try_from(10)?,
+            crate::SignalLevels {
+                receive: crate::SignalLevel::new(128),
+                transmit: crate::SignalLevel::new(128),
+            },
+        )?)
     }
 
     fn test_header(my_call: &str, ur_call: [u8; 8]) -> Result<DstarHeader, BoxTestErr> {
         use dstar_gateway_core::{Callsign, Suffix};
 
         Ok(DstarHeader {
-            flag1: 0,
-            flag2: 0,
-            flag3: 0,
+            flags: dstar_gateway_core::HeaderFlags::NONE,
             rpt2: Callsign::try_from_str("DIRECT")?,
             rpt1: Callsign::try_from_str("DIRECT")?,
             ur_call: Callsign::from_wire_bytes(ur_call),
@@ -1484,7 +1457,7 @@ mod tests {
         assert!(matches!(
             DstarStatusReflector::new("W1AW", 'C'),
             Err(DstarStatusReflectorError::InvalidValue(
-                TypeError::InvalidReflectorCallsign { .. }
+                TypeError::InvalidReflectorCallsign
             ))
         ));
         assert!(matches!(
@@ -1639,43 +1612,74 @@ mod tests {
         // The pump reads continuously, so pend instead of erroring when
         // the script runs dry.
         mock.pend_when_empty();
+        let mut version = vec![0_u8; 20];
+        *version.first_mut().ok_or("version header byte")? = 2;
+        version.extend_from_slice(b"TEST");
+        let version = MmdvmFrame::with_payload(Command::GET_VERSION, version)?.to_bytes();
+        mock.queue_read_delayed(&version, Duration::ZERO);
         // ACK for SetConfig (0x02), then for SetMode (0x03). The
         // SetMode ACK is delayed so it lands after set_mode's write
         // (its reply is correlated, not scanned from the event log).
-        mock.queue_read_delayed(&[0xE0, 4, 0x70, 0x02], 20);
-        mock.queue_read_delayed(&[0xE0, 4, 0x70, 0x03], 150);
+        mock.queue_read_delayed(&[0xE0, 4, 0x70, 0x02], Duration::from_millis(20));
+        mock.queue_read_delayed(&[0xE0, 4, 0x70, 0x03], Duration::from_millis(150));
         for (data, delay) in extra_reads {
-            mock.queue_read_delayed(data, *delay);
+            mock.queue_read_delayed(*data, Duration::from_millis(*delay));
         }
 
         let modem = AsyncModem::spawn(StreamAdapter::new(mock));
-        DstarModem::initialize(modem, test_config()?)
+        let mut runtime = DstarModem::initialize(modem, test_config()?, test_wire_config()?)
             .await
-            .map_err(|(_, e)| -> BoxTestErr { format!("gateway start failed: {e}").into() })
+            .map_err(|(_, error)| error)?;
+        assert!(
+            matches!(runtime.modem.next_event().await, Some(Event::Version(_))),
+            "startup version remains observable after correlated configuration"
+        );
+        assert!(
+            matches!(
+                runtime.modem.next_event().await,
+                Some(Event::Ack {
+                    command: Command::SET_CONFIG,
+                })
+            ),
+            "configuration ACK remains observable after its correlated reply"
+        );
+        Ok(runtime)
     }
 
     type BoxTestErr = Box<dyn std::error::Error + Send + Sync>;
 
     /// Strict startup transcript, with no periodic status tick needed.
-    fn initialization_transport(config_response: &[u8]) -> MockTransport {
+    fn initialization_transport(config_response: &[u8]) -> Result<MockTransport, BoxTestErr> {
         let mut mock = MockTransport::new();
         mock.pend_when_empty();
-        mock.expect(&[0xE0, 3, 0x00], &[]);
+        let mut version = vec![0_u8; 20];
+        *version.first_mut().ok_or("version header byte")? = 2;
+        version.extend_from_slice(b"TEST");
+        let version = MmdvmFrame::with_payload(Command::GET_VERSION, version)?.to_bytes();
+        mock.expect(&[0xE0, 3, 0x00], &version);
         mock.expect(&[0xE0, 3, 0x01], &[]);
-        mock.expect(&[0xE0, 9, 0x02, 0, 1, 10, 1, 128, 128], config_response);
-        mock
+        mock.expect(
+            &[
+                0xE0, 40, 0x02, 0x80, 1, 0, 10, 0, 128, 128, 128, 0, 128, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 0, 0, 0, 0, 0, 0, 0, 0,
+            ],
+            config_response,
+        );
+        Ok(mock)
     }
 
     #[tokio::test(start_paused = true)]
     async fn initialization_pins_wire_order_and_recovers_the_same_stream() -> Result<(), BoxTestErr>
     {
-        let mut mock = initialization_transport(&[0xE0, 4, 0x70, 0x02]);
+        let mut mock = initialization_transport(&[0xE0, 4, 0x70, 0x02])?;
         mock.expect(&[0xE0, 4, 0x03, 1], &[0xE0, 4, 0x70, 0x03]);
         let modem = AsyncModem::spawn(StreamAdapter::new(mock));
-        let runtime = DstarModem::initialize(modem, test_config()?)
+        let runtime = DstarModem::initialize(modem, test_config()?, test_wire_config()?)
             .await
             .map_err(|(_, error)| error)?;
-        let adapter = runtime.into_modem().shutdown().await?;
+        let completed = runtime.into_modem().shutdown().await?;
+        assert_eq!(completed.summary().dropped_frames(), Some(0));
+        let adapter = completed.into_transport();
         let recovered = adapter.shutdown_and_recover().await?;
         recovered.assert_complete();
         assert_eq!(
@@ -1683,7 +1687,10 @@ mod tests {
             &[
                 vec![0xE0, 3, 0x00],
                 vec![0xE0, 3, 0x01],
-                vec![0xE0, 9, 0x02, 0, 1, 10, 1, 128, 128],
+                vec![
+                    0xE0, 40, 0x02, 0x80, 1, 0, 10, 0, 128, 128, 128, 0, 128, 0, 0, 0, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 0, 0, 0, 0, 0, 0, 0, 0
+                ],
                 vec![0xE0, 4, 0x03, 1],
             ]
         );
@@ -1692,16 +1699,21 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn config_nak_returns_the_modem_without_issuing_set_mode() -> Result<(), BoxTestErr> {
-        let mock = initialization_transport(&[0xE0, 5, 0x7F, 0x02, 4]);
+        let mock = initialization_transport(&[0xE0, 5, 0x7F, 0x02, 4])?;
         let modem = AsyncModem::spawn(StreamAdapter::new(mock));
-        let Err((modem, error)) = DstarModem::initialize(modem, test_config()?).await else {
+        let Err((modem, error)) =
+            DstarModem::initialize(modem, test_config()?, test_wire_config()?).await
+        else {
             return Err("rejected SetConfig must return the owned modem".into());
         };
         assert!(matches!(
             error,
-            DstarError::Shell(ShellError::Nak { command: 0x02, .. })
+            DstarError::Shell(ShellError::Nak {
+                command: Command::SET_CONFIG,
+                ..
+            })
         ));
-        let adapter = modem.shutdown().await?;
+        let adapter = modem.shutdown().await?.into_transport();
         let recovered = adapter.shutdown_and_recover().await?;
         recovered.assert_complete();
         assert_eq!(recovered.writes().len(), 3);
@@ -1711,17 +1723,22 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn set_mode_nak_preserves_typed_rejection_and_stream_ownership() -> Result<(), BoxTestErr>
     {
-        let mut mock = initialization_transport(&[0xE0, 4, 0x70, 0x02]);
+        let mut mock = initialization_transport(&[0xE0, 4, 0x70, 0x02])?;
         mock.expect(&[0xE0, 4, 0x03, 1], &[0xE0, 5, 0x7F, 0x03, 4]);
         let modem = AsyncModem::spawn(StreamAdapter::new(mock));
-        let Err((modem, error)) = DstarModem::initialize(modem, test_config()?).await else {
+        let Err((modem, error)) =
+            DstarModem::initialize(modem, test_config()?, test_wire_config()?).await
+        else {
             return Err("rejected SetMode must return the owned modem".into());
         };
         assert!(matches!(
             error,
-            DstarError::Shell(ShellError::Nak { command: 0x03, .. })
+            DstarError::Shell(ShellError::Nak {
+                command: Command::SET_MODE,
+                ..
+            })
         ));
-        let adapter = modem.shutdown().await?;
+        let adapter = modem.shutdown().await?.into_transport();
         let recovered = adapter.shutdown_and_recover().await?;
         recovered.assert_complete();
         assert_eq!(recovered.writes().len(), 4);
@@ -1730,16 +1747,21 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn unrelated_ack_does_not_satisfy_config_deadline() -> Result<(), BoxTestErr> {
-        let mut mock = initialization_transport(&[0xE0, 4, 0x70, 0x03]);
+        let mut mock = initialization_transport(&[0xE0, 4, 0x70, 0x03])?;
         mock.expect_any_write();
         let modem = AsyncModem::spawn(StreamAdapter::new(mock));
         let started = tokio::time::Instant::now();
-        let Err((modem, error)) = DstarModem::initialize(modem, test_config()?).await else {
+        let Err((modem, error)) =
+            DstarModem::initialize(modem, test_config()?, test_wire_config()?).await
+        else {
             return Err("an unrelated ACK must not initialize D-STAR".into());
         };
-        assert!(matches!(error, DstarError::Timeout(INIT_ACK_TIMEOUT)));
-        assert_eq!(started.elapsed(), INIT_ACK_TIMEOUT);
-        let adapter = modem.shutdown().await?;
+        assert!(matches!(
+            error,
+            DstarError::Shell(ShellError::ResponseTimeout)
+        ));
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+        let adapter = modem.shutdown().await?.into_transport();
         let recovered = adapter.shutdown_and_recover().await?;
         recovered.assert_complete();
         assert!(
@@ -1759,7 +1781,9 @@ mod tests {
         let mut runtime = started_gateway(&[(&frame, 1000)]).await?;
         assert!(matches!(
             runtime.next_event().await?,
-            Some(DstarEvent::ModemEvent(Event::Ack { command: 0x03 }))
+            Some(DstarEvent::ModemEvent(Event::Ack {
+                command: Command::SET_MODE
+            }))
         ));
         assert!(
             tokio::time::timeout(Duration::from_millis(1), runtime.next_event())
@@ -1849,7 +1873,7 @@ mod tests {
             Some(DstarEvent::VoiceEnd)
         ));
 
-        let adapter = runtime.into_modem().shutdown().await?;
+        let adapter = runtime.into_modem().shutdown().await?.into_transport();
         let recovered = adapter.shutdown_and_recover().await?;
         assert!(
             recovered
@@ -1934,13 +1958,13 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn poll_status_deadline_includes_a_stalled_request_write() -> Result<(), BoxTestErr> {
-        let mut mock = initialization_transport(&[0xE0, 4, 0x70, 0x02]);
+        let mut mock = initialization_transport(&[0xE0, 4, 0x70, 0x02])?;
         mock.expect(&[0xE0, 4, 0x03, 1], &[0xE0, 4, 0x70, 0x03]);
         let modem = AsyncModem::spawn(StreamAdapter::new(LimitedWrites {
             inner: mock,
             remaining: 4,
         }));
-        let mut runtime = DstarModem::initialize(modem, test_config()?)
+        let mut runtime = DstarModem::initialize(modem, test_config()?, test_wire_config()?)
             .await
             .map_err(|(_, error)| error)?;
         let started = tokio::time::Instant::now();
@@ -1956,14 +1980,14 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn poll_status_deadline_includes_echo_dispatch_and_retains_voice_end()
     -> Result<(), BoxTestErr> {
-        let mut mock = initialization_transport(&[0xE0, 4, 0x70, 0x02]);
+        let mut mock = initialization_transport(&[0xE0, 4, 0x70, 0x02])?;
         mock.expect(&[0xE0, 4, 0x03, 1], &[0xE0, 4, 0x70, 0x03, 0xE0, 3, 0x13]);
         mock.expect_any_write();
         let modem = AsyncModem::spawn(StreamAdapter::new(LimitedWrites {
             inner: mock,
             remaining: 5,
         }));
-        let mut runtime = DstarModem::initialize(modem, test_config()?)
+        let mut runtime = DstarModem::initialize(modem, test_config()?, test_wire_config()?)
             .await
             .map_err(|(_, error)| error)?;
         runtime.handle_voice_start(test_header("W1AW", *b"       E")?);
@@ -2044,9 +2068,7 @@ mod tests {
                 let mut gateway = started_gateway(&[]).await?;
                 gateway.config.max_last_heard = 0;
                 gateway.handle_voice_start(DstarHeader {
-                    flag1: 0,
-                    flag2: 0,
-                    flag3: 0,
+                    flags: dstar_gateway_core::HeaderFlags::NONE,
                     rpt2: Callsign::try_from_str("DIRECT")?,
                     rpt1: Callsign::try_from_str("DIRECT")?,
                     ur_call: Callsign::try_from_str("CQCQCQ")?,
@@ -2058,6 +2080,20 @@ mod tests {
                 Ok(())
             })
             .await
+    }
+
+    #[tokio::test]
+    async fn unrepresentable_event_timeout_returns_an_error_before_waiting()
+    -> Result<(), BoxTestErr> {
+        let mut gateway = started_gateway(&[]).await?;
+        gateway.set_event_timeout(Duration::MAX);
+        let result = gateway.next_event().await;
+        assert!(
+            matches!(result, Err(DstarError::InvalidEventTimeout { timeout })
+            if timeout == Duration::MAX),
+            "{result:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -2366,14 +2402,14 @@ mod tests {
 
                 let violation = gateway
                     .dispatch_event(Event::ProtocolViolation {
-                        command: 0x31,
+                        command: Command::P25_LDU,
                         detail: "expected 12 payload bytes, got 11".to_owned(),
                     })
                     .await?;
                 assert!(matches!(
                     violation,
                     Some(DstarEvent::ModemEvent(Event::ProtocolViolation {
-                        command: 0x31,
+                        command: Command::P25_LDU,
                         detail,
                     })) if detail == "expected 12 payload bytes, got 11"
                 ));
@@ -2381,14 +2417,14 @@ mod tests {
                 let payload = vec![0x00, 0x7F, 0x80, 0xFF];
                 let unhandled = gateway
                     .dispatch_event(Event::UnhandledResponse {
-                        command: 0x19,
+                        command: Command::DMR_LOST1,
                         payload: payload.clone(),
                     })
                     .await?;
                 assert!(matches!(
                     unhandled,
                     Some(DstarEvent::ModemEvent(Event::UnhandledResponse {
-                        command: 0x19,
+                        command: Command::DMR_LOST1,
                         payload: actual,
                     })) if actual == payload
                 ));
@@ -2519,7 +2555,7 @@ mod tests {
         );
         assert!(
             terminal_event_error(&Event::ProtocolViolation {
-                command: 0x01,
+                command: Command::GET_STATUS,
                 detail: String::new(),
             })
             .is_none()

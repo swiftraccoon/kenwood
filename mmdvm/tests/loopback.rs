@@ -6,10 +6,7 @@
 use std::time::Duration;
 
 use mmdvm::{AsyncModem, Event, ShellError};
-use mmdvm_core::{
-    MMDVM_ACK, MMDVM_DSTAR_EOT, MMDVM_DSTAR_HEADER, MMDVM_GET_STATUS, MMDVM_GET_VERSION, MMDVM_NAK,
-    MMDVM_SET_MODE, MmdvmFrame, ModemMode, NakReason, decode_frame, encode_frame,
-};
+use mmdvm_core::{Command, MmdvmFrame, ModemMode, NakReason};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::time::timeout;
 
@@ -61,7 +58,7 @@ where
 
         // Try decoding as many frames as possible.
         loop {
-            match decode_frame(&buf) {
+            match MmdvmFrame::from_bytes(&buf) {
                 Ok(Some((frame, consumed))) => {
                     let maybe_hit = pred(&frame);
                     out.push(frame);
@@ -85,7 +82,7 @@ where
 
 /// Shorthand: write one frame from the modem side.
 async fn modem_write(stream: &mut DuplexStream, frame: &MmdvmFrame) -> TestResult {
-    let bytes = encode_frame(frame)?;
+    let bytes = frame.to_bytes();
     stream.write_all(&bytes).await?;
     stream.flush().await?;
     Ok(())
@@ -106,18 +103,18 @@ async fn spawn_issues_initial_version_and_status_probes() -> TestResult {
             .await
             .ok_or("collect timed out")?;
 
-    let saw_version = frames.iter().any(|f| f.command == MMDVM_GET_VERSION);
-    let saw_status = frames.iter().any(|f| f.command == MMDVM_GET_STATUS);
+    let saw_version = frames.iter().any(|f| f.command() == Command::GET_VERSION);
+    let saw_status = frames.iter().any(|f| f.command() == Command::GET_STATUS);
 
     assert!(
         saw_version,
         "expected GetVersion at startup, got: {:?}",
-        frames.iter().map(|f| f.command).collect::<Vec<_>>()
+        frames.iter().map(MmdvmFrame::command).collect::<Vec<_>>()
     );
     assert!(
         saw_status,
         "expected GetStatus at startup, got: {:?}",
-        frames.iter().map(|f| f.command).collect::<Vec<_>>()
+        frames.iter().map(MmdvmFrame::command).collect::<Vec<_>>()
     );
     Ok(())
 }
@@ -135,7 +132,7 @@ async fn status_poll_fires_every_250ms() -> TestResult {
             .ok_or("initial collect timed out")?;
     let initial_status = initial
         .iter()
-        .filter(|f| f.command == MMDVM_GET_STATUS)
+        .filter(|f| f.command() == Command::GET_STATUS)
         .count();
 
     // Advance in 250 ms slices and drain each time so the duplex
@@ -151,7 +148,7 @@ async fn status_poll_fires_every_250ms() -> TestResult {
                 .ok_or("batch collect timed out")?;
         periodic_status += batch
             .iter()
-            .filter(|f| f.command == MMDVM_GET_STATUS)
+            .filter(|f| f.command() == Command::GET_STATUS)
             .count();
     }
 
@@ -172,7 +169,7 @@ async fn send_dstar_header_writes_after_space_reported() -> TestResult {
     let (initial, _) = collect_frames_until(
         &mut modem_side,
         |f| {
-            if f.command == MMDVM_GET_STATUS {
+            if f.command() == Command::GET_STATUS {
                 Some(())
             } else {
                 None
@@ -183,7 +180,7 @@ async fn send_dstar_header_writes_after_space_reported() -> TestResult {
     .await
     .ok_or("initial handshake collect timed out")?;
     assert!(
-        initial.iter().any(|f| f.command == MMDVM_GET_VERSION),
+        initial.iter().any(|f| f.command() == Command::GET_VERSION),
         "expected GetVersion"
     );
 
@@ -202,9 +199,20 @@ async fn send_dstar_header_writes_after_space_reported() -> TestResult {
             .await
             .ok_or("pre-status collect timed out")?;
     assert!(
-        !pre_status.iter().any(|f| f.command == MMDVM_DSTAR_HEADER),
+        !pre_status
+            .iter()
+            .any(|f| f.command() == Command::DSTAR_HEADER),
         "header must NOT be written before space is known: {pre_status:?}"
     );
+
+    let mut version = vec![0_u8; 20];
+    *version.first_mut().ok_or("version header byte")? = 2;
+    version.extend_from_slice(b"TEST");
+    modem_write(
+        &mut modem_side,
+        &MmdvmFrame::with_payload(Command::GET_VERSION, version)?,
+    )
+    .await?;
 
     // Now simulate the modem reporting dstar_space=10 (v2 layout).
     //  mode=Dstar(1), state=0, reserved=0, dstar=10, dmr1=0, dmr2=0,
@@ -212,7 +220,7 @@ async fn send_dstar_header_writes_after_space_reported() -> TestResult {
     let status_payload = vec![1u8, 0, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0];
     modem_write(
         &mut modem_side,
-        &MmdvmFrame::with_payload(MMDVM_GET_STATUS, status_payload),
+        &MmdvmFrame::with_payload(Command::GET_STATUS, status_payload)?,
     )
     .await?;
 
@@ -223,7 +231,7 @@ async fn send_dstar_header_writes_after_space_reported() -> TestResult {
     let (post_status, _) = collect_frames_until(
         &mut modem_side,
         |f| {
-            if f.command == MMDVM_DSTAR_HEADER {
+            if f.command() == Command::DSTAR_HEADER {
                 Some(())
             } else {
                 None
@@ -235,9 +243,14 @@ async fn send_dstar_header_writes_after_space_reported() -> TestResult {
     .ok_or("post-status collect timed out")?;
 
     assert!(
-        post_status.iter().any(|f| f.command == MMDVM_DSTAR_HEADER),
+        post_status
+            .iter()
+            .any(|f| f.command() == Command::DSTAR_HEADER),
         "header MUST be written after space reported: {:?}",
-        post_status.iter().map(|f| f.command).collect::<Vec<_>>()
+        post_status
+            .iter()
+            .map(MmdvmFrame::command)
+            .collect::<Vec<_>>()
     );
     Ok(())
 }
@@ -252,7 +265,7 @@ async fn dstar_header_rx_emits_event() -> TestResult {
     let _drained = collect_frames_until(
         &mut modem_side,
         |f| {
-            if f.command == MMDVM_GET_STATUS {
+            if f.command() == Command::GET_STATUS {
                 Some(())
             } else {
                 None
@@ -266,7 +279,7 @@ async fn dstar_header_rx_emits_event() -> TestResult {
     let header = vec![0xAAu8; 41];
     modem_write(
         &mut modem_side,
-        &MmdvmFrame::with_payload(MMDVM_DSTAR_HEADER, header.clone()),
+        &MmdvmFrame::with_payload(Command::DSTAR_HEADER, header.clone())?,
     )
     .await?;
 
@@ -298,10 +311,7 @@ async fn frame_fragmented_byte_at_a_time_reassembles() -> TestResult {
     // Serial and Bluetooth SPP transports routinely deliver a frame
     // in arbitrary fragments; feed a D-STAR data frame one byte at
     // a time.
-    let wire = encode_frame(&MmdvmFrame::with_payload(
-        mmdvm_core::MMDVM_DSTAR_DATA,
-        (0..12u8).collect(),
-    ))?;
+    let wire = MmdvmFrame::with_payload(Command::DSTAR_DATA, (0..12u8).collect())?.to_bytes();
     for byte in wire {
         modem_side.write_all(&[byte]).await?;
         modem_side.flush().await?;
@@ -336,11 +346,8 @@ async fn two_frames_in_one_write_produce_ordered_events() -> TestResult {
         collect_frames_until(&mut modem_side, |_| None::<()>, Duration::from_millis(100)).await;
 
     // USB-CDC coalesces: one read can deliver several frames.
-    let mut batch = encode_frame(&MmdvmFrame::with_payload(
-        mmdvm_core::MMDVM_DSTAR_DATA,
-        vec![0x11; 12],
-    ))?;
-    batch.extend(encode_frame(&MmdvmFrame::new(MMDVM_DSTAR_EOT))?);
+    let mut batch = MmdvmFrame::with_payload(Command::DSTAR_DATA, vec![0x11; 12])?.to_bytes();
+    batch.extend(MmdvmFrame::new(Command::DSTAR_EOT).to_bytes());
     modem_side.write_all(&batch).await?;
     modem_side.flush().await?;
 
@@ -376,7 +383,7 @@ async fn v1_handshake_selects_v1_status_offsets() -> TestResult {
     // Protocol-v1 version response: [proto=1, description...].
     modem_write(
         &mut modem_side,
-        &MmdvmFrame::with_payload(MMDVM_GET_VERSION, b"\x01MMDVM 2018".to_vec()),
+        &MmdvmFrame::with_payload(Command::GET_VERSION, b"\x01MMDVM 2018".to_vec())?,
     )
     .await?;
 
@@ -386,7 +393,7 @@ async fn v1_handshake_selects_v1_status_offsets() -> TestResult {
     // reject the 7-byte payload as too short.
     modem_write(
         &mut modem_side,
-        &MmdvmFrame::with_payload(MMDVM_GET_STATUS, vec![0, 1, 0x40, 12, 0, 0, 0]),
+        &MmdvmFrame::with_payload(Command::GET_STATUS, vec![0, 1, 0x40, 12, 0, 0, 0])?,
     )
     .await?;
 
@@ -396,7 +403,7 @@ async fn v1_handshake_selects_v1_status_offsets() -> TestResult {
         tokio::time::advance(Duration::from_millis(11)).await;
         match timeout(Duration::from_millis(50), modem.next_event()).await {
             Ok(Some(Event::Version(v))) => {
-                assert_eq!(v.protocol, 1);
+                assert_eq!(v.protocol().get(), 1);
                 saw_version = true;
             }
             Ok(Some(Event::Status(s))) => {
@@ -450,10 +457,14 @@ async fn ack_and_nak_decode_exact_fields() -> TestResult {
             _ => {}
         }
     }
-    assert_eq!(ack, Some(0x02), "ACK must carry the ACK'd command byte");
+    assert_eq!(
+        ack,
+        Some(Command::SET_CONFIG),
+        "ACK must carry the ACK'd command byte"
+    );
     assert_eq!(
         nak,
-        Some((0x03, NakReason::WrongMode)),
+        Some((Command::SET_MODE, NakReason::CommandUnavailable)),
         "NAK must decode command and reason exactly"
     );
     Ok(())
@@ -472,7 +483,7 @@ async fn resync_recovers_past_spurious_frame_start_in_garbage() -> TestResult {
     // immediately followed by a real EOT frame in the same write.
     // The resync must skip the phantom and decode the real frame.
     let mut junk = vec![0x13u8, 0x37, 0xE0, 0x02, 0xDE];
-    junk.extend(encode_frame(&MmdvmFrame::new(MMDVM_DSTAR_EOT))?);
+    junk.extend(MmdvmFrame::new(Command::DSTAR_EOT).to_bytes());
     modem_side.write_all(&junk).await?;
     modem_side.flush().await?;
 
@@ -509,7 +520,7 @@ async fn extended_length_frame_decodes_through_the_loop() -> TestResult {
     // modeled mode, so it must surface as UnhandledResponse intact,
     // NOT shredded by the resync path.
     let total = 255 + 45;
-    let mut wire = vec![0xE0, 0x00, 45, mmdvm_core::MMDVM_FM_DATA];
+    let mut wire = vec![0xE0, 0x00, 45, Command::FM_DATA.get()];
     wire.resize(total, 0x5A);
     modem_side.write_all(&wire).await?;
     modem_side.flush().await?;
@@ -520,7 +531,7 @@ async fn extended_length_frame_decodes_through_the_loop() -> TestResult {
         if let Ok(Some(Event::UnhandledResponse { command, payload })) =
             timeout(Duration::from_millis(50), modem.next_event()).await
         {
-            assert_eq!(command, mmdvm_core::MMDVM_FM_DATA);
+            assert_eq!(command, Command::FM_DATA);
             payload_len = Some(payload.len());
             break;
         }
@@ -546,7 +557,7 @@ async fn set_mode_resolves_ok_on_ack() -> TestResult {
         // Wait for the SetMode frame on the wire, then ACK it.
         let hit = collect_frames_until(
             &mut modem_side,
-            |f| (f.command == MMDVM_SET_MODE).then_some(()),
+            |f| (f.command() == Command::SET_MODE).then_some(()),
             Duration::from_millis(500),
         )
         .await;
@@ -555,7 +566,7 @@ async fn set_mode_resolves_ok_on_ack() -> TestResult {
         }
         modem_write(
             &mut modem_side,
-            &MmdvmFrame::with_payload(MMDVM_ACK, vec![MMDVM_SET_MODE]),
+            &MmdvmFrame::with_payload(Command::ACK, vec![Command::SET_MODE.get()])?,
         )
         .await
     });
@@ -579,17 +590,17 @@ async fn set_mode_resolves_err_on_nak() -> TestResult {
     let (set_result, drive_result) = tokio::join!(modem.set_mode(ModemMode::Dstar), async {
         let hit = collect_frames_until(
             &mut modem_side,
-            |f| (f.command == MMDVM_SET_MODE).then_some(()),
+            |f| (f.command() == Command::SET_MODE).then_some(()),
             Duration::from_millis(500),
         )
         .await;
         if hit.and_then(|(_, h)| h).is_none() {
             return Err::<(), Box<dyn std::error::Error>>("SetMode frame never seen".into());
         }
-        // NAK with reason 2 = wrong mode.
+        // NAK code 2 reports that the command is unavailable in the active mode.
         modem_write(
             &mut modem_side,
-            &MmdvmFrame::with_payload(MMDVM_NAK, vec![MMDVM_SET_MODE, 2]),
+            &MmdvmFrame::with_payload(Command::NAK, vec![Command::SET_MODE.get(), 2])?,
         )
         .await
     });
@@ -598,8 +609,8 @@ async fn set_mode_resolves_err_on_nak() -> TestResult {
         matches!(
             set_result,
             Err(ShellError::Nak {
-                command: MMDVM_SET_MODE,
-                reason: NakReason::WrongMode,
+                command: Command::SET_MODE,
+                reason: NakReason::CommandUnavailable,
             })
         ),
         "a NAK'd set_mode must fail with the correlated reason: {set_result:?}"
@@ -627,6 +638,217 @@ async fn set_mode_times_out_on_silent_modem() -> TestResult {
     Ok(())
 }
 
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn cancelled_or_timed_out_mode_change_cannot_be_overwritten() -> TestResult {
+    for wait in [Duration::from_millis(25), Duration::from_secs(3)] {
+        let (client, mut peer) = duplex_pair();
+        let mut modem = AsyncModem::spawn(client);
+        let _initial =
+            collect_frames_until(&mut peer, |_| None::<()>, Duration::from_millis(10)).await;
+        let first = timeout(wait, modem.set_mode(ModemMode::Dstar)).await;
+        assert!(
+            matches!(first, Err(_) | Ok(Err(ShellError::ResponseTimeout))),
+            "{first:?}"
+        );
+        let blocked = modem.set_mode(ModemMode::Idle).await;
+        assert!(
+            matches!(blocked, Err(ShellError::ModeChangePending)),
+            "{blocked:?}"
+        );
+        let raw = modem.send_raw(Command::SET_MODE, vec![0]).await;
+        assert!(
+            matches!(
+                raw,
+                Err(ShellError::ReservedCommand {
+                    command: Command::SET_MODE
+                })
+            ),
+            "{raw:?}"
+        );
+        let (written, _) =
+            collect_frames_until(&mut peer, |_| None::<()>, Duration::from_millis(10))
+                .await
+                .ok_or("missing write collection")?;
+        let changes: Vec<_> = written
+            .iter()
+            .filter(|frame| frame.command() == Command::SET_MODE)
+            .collect();
+        assert_eq!(
+            changes.len(),
+            1,
+            "a second mode change reached the wire: {written:?}"
+        );
+        assert_eq!(changes.first().ok_or("first mode missing")?.payload(), [1]);
+
+        modem_write(&mut peer, &MmdvmFrame::with_payload(Command::ACK, vec![3])?).await?;
+        loop {
+            let event = timeout(Duration::from_millis(50), modem.next_event())
+                .await?
+                .ok_or("session closed before late ACK")?;
+            if matches!(
+                event,
+                Event::Ack {
+                    command: Command::SET_MODE
+                }
+            ) {
+                break;
+            }
+        }
+        let (change, response) = tokio::join!(modem.set_mode(ModemMode::Idle), async {
+            let next = collect_frames_until(
+                &mut peer,
+                |frame| (frame.command() == Command::SET_MODE).then_some(frame.payload().to_vec()),
+                Duration::from_millis(50),
+            )
+            .await
+            .ok_or("missing next mode write")?;
+            assert_eq!(next.1, Some(vec![0]));
+            modem_write(&mut peer, &MmdvmFrame::with_payload(Command::ACK, vec![3])?).await
+        });
+        response?;
+        change?;
+    }
+    Ok(())
+}
+
+/// Complete the startup writes, then reject the first explicit request.
+#[derive(Debug)]
+struct FailThirdWrite {
+    attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl tokio::io::AsyncRead for FailThirdWrite {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Pending
+    }
+}
+
+impl tokio::io::AsyncWrite for FailThirdWrite {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buffer: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let attempt = self
+            .attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if attempt == 2 {
+            return std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "request write failed after startup",
+            )));
+        }
+        std::task::Poll::Ready(Ok(buffer.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn request_write_failure_retires_the_stream_before_another_write() -> TestResult {
+    let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut modem = AsyncModem::spawn(FailThirdWrite {
+        attempts: attempts.clone(),
+    });
+    tokio::task::yield_now().await;
+    let result = modem.request_version().await;
+    assert!(
+        matches!(result, Err(ShellError::Io(ref error))
+        if error.kind() == std::io::ErrorKind::BrokenPipe
+            && error.to_string() == "request write failed after startup"),
+        "{result:?}"
+    );
+    let terminal = timeout(Duration::from_millis(50), modem.next_event())
+        .await?
+        .ok_or("missing fatal event")?;
+    assert!(
+        matches!(terminal, Event::Fatal { ref message } if message.contains("request write failed")),
+        "{terminal:?}"
+    );
+    assert_eq!(
+        timeout(Duration::from_millis(50), modem.next_event()).await?,
+        None
+    );
+    assert!(matches!(
+        modem.request_status().await,
+        Err(ShellError::SessionClosed)
+    ));
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert!(matches!(modem.shutdown().await, Err(error)
+        if matches!(error.error(), ShellError::Io(source)
+            if source.kind() == std::io::ErrorKind::BrokenPipe)));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn debug_responses_preserve_binary_payloads_and_identifiers() -> TestResult {
+    let (client, mut peer) = duplex_pair();
+    let mut modem = AsyncModem::spawn(client);
+    let _initial = collect_frames_until(&mut peer, |_| None::<()>, Duration::from_millis(10)).await;
+    for command in [Command::DEBUG1, Command::DEBUG5, Command::DEBUG_DUMP] {
+        let payload = vec![b'T', b'X', 0, 0xFF, 0x80, 0x01];
+        modem_write(
+            &mut peer,
+            &MmdvmFrame::with_payload(command, payload.clone())?,
+        )
+        .await?;
+        let event = timeout(Duration::from_millis(50), modem.next_event())
+            .await?
+            .ok_or("missing debug response")?;
+        assert_eq!(event, Event::Debug { command, payload });
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn raw_payload_bounds_are_checked_before_submission() -> TestResult {
+    let (client, mut peer) = duplex_pair();
+    let mut modem = AsyncModem::spawn(client);
+    let invalid = modem.send_raw(Command::FM_DATA, vec![0; 507]).await;
+    assert!(
+        matches!(
+            invalid,
+            Err(ShellError::Core(mmdvm_core::MmdvmError::PayloadTooLarge {
+                len: 507
+            }))
+        ),
+        "{invalid:?}"
+    );
+    modem.send_raw(Command::FM_DATA, vec![0xA5; 506]).await?;
+    let (frames, payload) = collect_frames_until(
+        &mut peer,
+        |frame| (frame.command() == Command::FM_DATA).then_some(frame.payload().to_vec()),
+        Duration::from_millis(50),
+    )
+    .await
+    .ok_or("missing maximum raw frame")?;
+    assert_eq!(payload, Some(vec![0xA5; 506]));
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| frame.command() == Command::FM_DATA)
+            .count(),
+        1
+    );
+    Ok(())
+}
+
 /// An ACK correlated to a DIFFERENT command must not resolve a
 /// pending `set_mode`: a stray ACK (raw command, firmware quirk)
 /// would otherwise report success while the mode never changed. The
@@ -646,7 +868,7 @@ async fn set_mode_ignores_ack_for_a_different_command() -> TestResult {
         async {
             let hit = collect_frames_until(
                 &mut modem_side,
-                |f| (f.command == MMDVM_SET_MODE).then_some(()),
+                |f| (f.command() == Command::SET_MODE).then_some(()),
                 Duration::from_millis(500),
             )
             .await;
@@ -656,7 +878,7 @@ async fn set_mode_ignores_ack_for_a_different_command() -> TestResult {
             // ACK correlated to GET_STATUS, not SET_MODE.
             modem_write(
                 &mut modem_side,
-                &MmdvmFrame::with_payload(MMDVM_ACK, vec![MMDVM_GET_STATUS]),
+                &MmdvmFrame::with_payload(Command::ACK, vec![Command::GET_STATUS.get()])?,
             )
             .await
         }
@@ -752,6 +974,106 @@ impl tokio::io::AsyncWrite for WedgedWriteTransport {
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn mode_deadline_includes_command_channel_backpressure() -> TestResult {
+    let mut modem = AsyncModem::spawn(WedgedWriteTransport);
+    for _ in 0..32 {
+        let queued = timeout(Duration::from_millis(1), modem.request_version()).await;
+        assert!(
+            queued.is_err(),
+            "startup write must still be pending: {queued:?}"
+        );
+    }
+    let started = tokio::time::Instant::now();
+    let result = timeout(Duration::from_secs(3), modem.set_mode(ModemMode::Dstar)).await?;
+    assert!(
+        matches!(result, Err(ShellError::ResponseTimeout)),
+        "{result:?}"
+    );
+    assert_eq!(started.elapsed(), Duration::from_secs(2));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn configuration_deadline_includes_command_channel_backpressure() -> TestResult {
+    let mut modem = AsyncModem::spawn(WedgedWriteTransport);
+    for _ in 0..32 {
+        let queued = timeout(Duration::from_millis(1), modem.request_version()).await;
+        assert!(
+            queued.is_err(),
+            "startup write must leave the request queue full"
+        );
+    }
+    let configuration = mmdvm::DstarConfiguration::new(
+        mmdvm::ConfigurationProfile::MmdvmV1,
+        mmdvm::TxDelay::try_from(10)?,
+        mmdvm::SignalLevels {
+            receive: mmdvm::SignalLevel::new(128),
+            transmit: mmdvm::SignalLevel::new(128),
+        },
+    )?;
+    let started = tokio::time::Instant::now();
+    let result = timeout(Duration::from_secs(3), modem.configure_dstar(configuration)).await?;
+    assert!(
+        matches!(result, Err(ShellError::ResponseTimeout)),
+        "{result:?}"
+    );
+    assert_eq!(
+        started.elapsed(),
+        Duration::from_secs(2),
+        "configuration submission shares the response deadline"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn expired_unwritten_configuration_cannot_start_after_a_late_version() -> TestResult {
+    let (client, mut peer) = duplex_pair();
+    let mut modem = AsyncModem::spawn(client);
+    let _initial = collect_frames_until(&mut peer, |_| None::<()>, Duration::from_millis(1)).await;
+    let configuration = mmdvm::DstarConfiguration::new(
+        mmdvm::ConfigurationProfile::MmdvmV1,
+        mmdvm::TxDelay::try_from(10)?,
+        mmdvm::SignalLevels {
+            receive: mmdvm::SignalLevel::new(128),
+            transmit: mmdvm::SignalLevel::new(128),
+        },
+    )?;
+    let started = tokio::time::Instant::now();
+    let result = modem.configure_dstar(configuration).await;
+    assert!(
+        matches!(result, Err(ShellError::ResponseTimeout)),
+        "{result:?}"
+    );
+    assert_eq!(started.elapsed(), Duration::from_secs(2));
+    modem_write(
+        &mut peer,
+        &MmdvmFrame::with_payload(Command::GET_VERSION, b"\x01TEST".to_vec())?,
+    )
+    .await?;
+    let (frames, _) = collect_frames_until(&mut peer, |_| None::<()>, Duration::from_millis(20))
+        .await
+        .ok_or("configuration observations")?;
+    assert!(
+        frames
+            .iter()
+            .all(|frame| frame.command() != Command::SET_CONFIG),
+        "a version arriving after timeout must not dispatch a discarded request"
+    );
+    assert!(
+        matches!(
+            modem.send_raw(Command::SET_CONFIG, vec![]).await,
+            Err(ShellError::ReservedCommand {
+                command: Command::SET_CONFIG
+            })
+        ),
+        "raw configuration cannot bypass correlation even with an empty payload"
+    );
+    let completed = modem.shutdown().await?;
+    assert_eq!(completed.summary().dropped_frames(), Some(0));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn wedged_transport_write_times_out_with_fatal_event() -> TestResult {
     // The very first handshake write wedges. Without a write
     // deadline the loop freezes forever (no reads, no commands, no
@@ -839,21 +1161,45 @@ async fn malformed_responses_emit_protocol_violation() -> TestResult {
     let _init =
         collect_frames_until(&mut modem_side, |_| None::<()>, Duration::from_millis(100)).await;
 
+    let mut version = vec![0_u8; 20];
+    *version.first_mut().ok_or("version header byte")? = 2;
+    version.extend_from_slice(b"TEST");
+    modem_write(
+        &mut modem_side,
+        &MmdvmFrame::with_payload(Command::GET_VERSION, version)?,
+    )
+    .await?;
+
     // Status response too short for the v2 layout (5-byte payload).
     modem_write(
         &mut modem_side,
-        &MmdvmFrame::with_payload(MMDVM_GET_STATUS, vec![1, 0, 0, 4, 0]),
+        &MmdvmFrame::with_payload(Command::GET_STATUS, vec![1, 0, 0, 4, 0])?,
     )
     .await?;
     // D-STAR header with the wrong payload size (10 bytes, not 41).
     modem_write(
         &mut modem_side,
-        &MmdvmFrame::with_payload(MMDVM_DSTAR_HEADER, vec![0u8; 10]),
+        &MmdvmFrame::with_payload(Command::DSTAR_HEADER, vec![0u8; 10])?,
     )
     .await?;
     // ACK with an empty payload (reference always carries the
     // ACK'd command byte).
-    modem_write(&mut modem_side, &MmdvmFrame::new(MMDVM_ACK)).await?;
+    modem_write(&mut modem_side, &MmdvmFrame::new(Command::ACK)).await?;
+    modem_write(
+        &mut modem_side,
+        &MmdvmFrame::with_payload(Command::ACK, vec![3, 0])?,
+    )
+    .await?;
+    modem_write(
+        &mut modem_side,
+        &MmdvmFrame::with_payload(Command::NAK, vec![3])?,
+    )
+    .await?;
+    modem_write(
+        &mut modem_side,
+        &MmdvmFrame::with_payload(Command::NAK, vec![3, 2, 0])?,
+    )
+    .await?;
 
     let mut violations = Vec::new();
     for _ in 0..30 {
@@ -861,7 +1207,7 @@ async fn malformed_responses_emit_protocol_violation() -> TestResult {
         match timeout(Duration::from_millis(50), modem.next_event()).await {
             Ok(Some(Event::ProtocolViolation { command, .. })) => {
                 violations.push(command);
-                if violations.len() == 3 {
+                if violations.len() == 6 {
                     break;
                 }
             }
@@ -876,7 +1222,14 @@ async fn malformed_responses_emit_protocol_violation() -> TestResult {
     }
     assert_eq!(
         violations,
-        vec![MMDVM_GET_STATUS, MMDVM_DSTAR_HEADER, MMDVM_ACK],
+        vec![
+            Command::GET_STATUS,
+            Command::DSTAR_HEADER,
+            Command::ACK,
+            Command::ACK,
+            Command::NAK,
+            Command::NAK
+        ],
         "each malformed frame must surface as a ProtocolViolation"
     );
     Ok(())
@@ -897,7 +1250,7 @@ async fn lagging_event_consumer_gets_exact_loss_without_blocking_loop() -> TestR
     // another command (the deadlock: consumer waits on the loop, the
     // loop waits on the consumer).
     for _ in 0..300 {
-        modem_write(&mut modem_side, &MmdvmFrame::new(MMDVM_DSTAR_EOT)).await?;
+        modem_write(&mut modem_side, &MmdvmFrame::new(Command::DSTAR_EOT)).await?;
     }
     tokio::time::advance(Duration::from_millis(50)).await;
 
@@ -929,7 +1282,7 @@ async fn malformed_bytes_are_swallowed() -> TestResult {
     let _drained = collect_frames_until(
         &mut modem_side,
         |f| {
-            if f.command == MMDVM_GET_STATUS {
+            if f.command() == Command::GET_STATUS {
                 Some(())
             } else {
                 None
@@ -944,7 +1297,7 @@ async fn malformed_bytes_are_swallowed() -> TestResult {
         .write_all(&[0x13, 0x37, 0xDE, 0xAD, 0xBE, 0xEF])
         .await?;
     // Then an actually-valid DstarEot frame.
-    modem_write(&mut modem_side, &MmdvmFrame::new(MMDVM_DSTAR_EOT)).await?;
+    modem_write(&mut modem_side, &MmdvmFrame::new(Command::DSTAR_EOT)).await?;
 
     // Loop should still be alive and able to emit events.
     let mut saw_eot = false;

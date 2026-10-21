@@ -1,35 +1,36 @@
 //! User-facing handle for an async MMDVM modem running in a spawned
 //! task.
 
-use mmdvm_core::ModemMode;
+use std::fmt;
+
+use mmdvm_core::{Command, MmdvmFrame, ModemMode};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::error::ShellError;
 use crate::transport::Transport;
 
-use super::{Command, Event, ModemLoop};
+use super::{
+    DstarConfiguration, Event, ModemLoop, ModemShutdown, Request, ShutdownFailure, ShutdownSummary,
+    TaskCompletion,
+};
 
 /// Capacity of the command channel between handle and modem task.
 ///
-/// Commands are small (frame enqueues, mode changes). 32 provides
-/// headroom for bursts without unbounded memory use. If the loop is
-/// running behind, `send_*` awaits backpressure rather than blocking
-/// unboundedly.
+/// At most 32 requests wait for the modem task; further submissions await
+/// channel capacity. Each raw request already carries a bounded core frame.
 const COMMAND_CHANNEL_CAPACITY: usize = 32;
 
 /// Capacity of the event ring from modem task to handle.
 ///
-/// Events cover both periodic status pushes and inbound radio frames.
-/// 256 covers a full D-STAR transmission (~100 voice frames) plus
-/// status polls at 4 Hz with generous headroom.
+/// At most 256 events remain available to a receiver; overwritten events are
+/// reported by [`Event::EventsDropped`].
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 
 /// How long [`AsyncModem::set_mode`] waits for the modem's ACK/NAK
 /// before failing with [`ShellError::ResponseTimeout`].
 ///
-/// The firmware acknowledges `SetMode` immediately on receipt; 2 s is
-/// generous even over Bluetooth SPP.
+/// This host policy covers channel submission and waiting for the reply.
 const SET_MODE_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Async handle to an MMDVM modem running in a spawned tokio task.
@@ -41,23 +42,75 @@ const SET_MODE_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from
 ///
 /// Dropping the handle closes the command channel, which causes the
 /// spawned loop to exit on its next iteration. For a graceful
-/// shutdown that also flushes the pending TX queue AND recovers the
-/// inner transport, call [`AsyncModem::shutdown`].
-#[derive(Debug)]
-pub struct AsyncModem<T: Transport + 'static> {
-    command_tx: mpsc::Sender<Command>,
+/// shutdown that attempts to drain the pending TX queue and recovers the
+/// transport after a clean exit, call [`AsyncModem::shutdown`].
+/// See the [runtime example](crate#drive-and-reclaim-a-modem).
+pub struct AsyncModem<T> {
+    command_tx: mpsc::Sender<Request>,
     event_rx: broadcast::Receiver<Event>,
-    join_handle: Option<JoinHandle<Result<T, ShellError>>>,
+    join_handle: JoinHandle<TaskCompletion<T>>,
+}
+impl<T> fmt::Debug for AsyncModem<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AsyncModem")
+            .field("command_capacity", &self.command_tx.capacity())
+            .field("task_finished", &self.join_handle.is_finished())
+            .finish_non_exhaustive()
+    }
 }
 
 impl<T: Transport + 'static> AsyncModem<T> {
-    /// Spawn the modem loop on the current tokio runtime and return
+    /// Configure a public MMDVM D-STAR layout and await its matching ACK.
+    ///
+    /// One two-second deadline covers submission, the startup version response,
+    /// and the configuration reply. The selected version must match that
+    /// response before any configuration bytes are written. An unwritten
+    /// request is discarded after cancellation or timeout. Once written, its
+    /// reservation survives cancellation and blocks another configuration until
+    /// the matching ACK/NAK arrives or the stream is retired.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShellError::ConfigurationProtocolMismatch`] before writing for
+    /// a different confirmed version, [`ShellError::ConfigurationPending`] for
+    /// an unresolved configuration, [`ShellError::ResponseTimeout`] at the total
+    /// deadline, or the typed NAK, I/O, or closed-session error.
+    pub async fn configure_dstar(
+        &mut self,
+        configuration: DstarConfiguration,
+    ) -> Result<(), ShellError> {
+        let (tx, rx) = oneshot::channel();
+        let deadline = tokio::time::Instant::now() + SET_MODE_RESPONSE_TIMEOUT;
+        tokio::time::timeout_at(
+            deadline,
+            self.command_tx.send(Request::ConfigureDstar {
+                configuration,
+                deadline,
+                reply: tx,
+            }),
+        )
+        .await
+        .map_err(|_| ShellError::ResponseTimeout)?
+        .map_err(|_| ShellError::SessionClosed)?;
+        match tokio::time::timeout_at(deadline, rx).await {
+            Ok(reply) => reply.map_err(|_| ShellError::SessionClosed)?,
+            Err(_elapsed) => Err(ShellError::ResponseTimeout),
+        }
+    }
+
+    /// Spawn the modem loop on the current Tokio runtime and return
     /// a handle for controlling it.
     ///
     /// The `transport` must be an already-connected duplex byte
     /// stream (serial port, Bluetooth SPP, test duplex). The shell
-    /// takes ownership; it is automatically dropped when the loop
-    /// exits.
+    /// takes ownership. A clean shutdown returns the stream; a failed task
+    /// drops it. Initial version and status requests are sent asynchronously.
+    /// The runtime must have its time driver enabled for polling and deadlines.
+    ///
+    /// # Panics
+    ///
+    /// Panics outside an active Tokio runtime.
     ///
     /// # Example
     ///
@@ -84,7 +137,7 @@ impl<T: Transport + 'static> AsyncModem<T> {
         Self {
             command_tx,
             event_rx,
-            join_handle: Some(join_handle),
+            join_handle,
         }
     }
 
@@ -128,7 +181,7 @@ impl<T: Transport + 'static> AsyncModem<T> {
     pub async fn send_dstar_header(&mut self, bytes: [u8; 41]) -> Result<(), ShellError> {
         let (tx, rx) = oneshot::channel();
         self.command_tx
-            .send(Command::SendDStarHeader { bytes, reply: tx })
+            .send(Request::SendDStarHeader { bytes, reply: tx })
             .await
             .map_err(|_| ShellError::SessionClosed)?;
         rx.await.map_err(|_| ShellError::SessionClosed)?
@@ -144,10 +197,7 @@ impl<T: Transport + 'static> AsyncModem<T> {
     /// - [`ShellError::BufferFull`] if the TX queue is at capacity.
     /// - [`ShellError::SessionClosed`] if the loop has exited.
     pub async fn send_dstar_data(&mut self, bytes: [u8; 12]) -> Result<(), ShellError> {
-        // Hang-hunt: two awaits here. Trace both sides so a repro
-        // log narrows the freeze to "command_tx full" (ModemLoop
-        // not draining command_rx) vs. "reply never came"
-        // (ModemLoop received but stuck before replying).
+        // Trace channel backpressure separately from the queue result.
         let (tx, rx) = oneshot::channel();
         tracing::trace!(
             target: "mmdvm::hang_hunt",
@@ -155,7 +205,7 @@ impl<T: Transport + 'static> AsyncModem<T> {
             "send_dstar_data: awaiting command_tx.send"
         );
         self.command_tx
-            .send(Command::SendDStarData { bytes, reply: tx })
+            .send(Request::SendDStarData { bytes, reply: tx })
             .await
             .map_err(|_| ShellError::SessionClosed)?;
         tracing::trace!(
@@ -182,7 +232,7 @@ impl<T: Transport + 'static> AsyncModem<T> {
     pub async fn send_dstar_eot(&mut self) -> Result<(), ShellError> {
         let (tx, rx) = oneshot::channel();
         self.command_tx
-            .send(Command::SendDStarEot { reply: tx })
+            .send(Request::SendDStarEot { reply: tx })
             .await
             .map_err(|_| ShellError::SessionClosed)?;
         rx.await.map_err(|_| ShellError::SessionClosed)?
@@ -190,27 +240,37 @@ impl<T: Transport + 'static> AsyncModem<T> {
 
     /// Set the modem's operating mode.
     ///
-    /// Resolves only after the modem acknowledges the mode change:
-    /// an `Ok(())` means the modem actually switched, not merely
-    /// that the request was written. (The corresponding
+    /// Resolves only after the modem acknowledges the requested command.
+    /// An `Ok(())` means its ACK was received. The corresponding
     /// [`Event::Ack`]/[`Event::Nak`] is still emitted on the event
-    /// stream as well.)
+    /// stream as well. One two-second deadline covers channel submission and
+    /// response waiting. Cancellation or timeout can leave an already-written
+    /// change in effect. Until its reply arrives, another mode change is
+    /// rejected; a caller can also shut down and retire the stream.
     ///
     /// # Errors
     ///
     /// - [`ShellError::Nak`] if the modem rejected the mode change.
     /// - [`ShellError::ResponseTimeout`] if the modem did not answer
-    ///   within 2 s.
+    ///   within the total two-second deadline.
+    /// - [`ShellError::ModeChangePending`] if an earlier change is unresolved.
     /// - [`ShellError::SessionClosed`] if the loop has exited.
     /// - [`ShellError::Io`] if writing to the transport fails.
-    /// - [`ShellError::Core`] if the codec rejects the frame.
     pub async fn set_mode(&mut self, mode: ModemMode) -> Result<(), ShellError> {
         let (tx, rx) = oneshot::channel();
-        self.command_tx
-            .send(Command::SetMode { mode, reply: tx })
-            .await
-            .map_err(|_| ShellError::SessionClosed)?;
-        match tokio::time::timeout(SET_MODE_RESPONSE_TIMEOUT, rx).await {
+        let deadline = tokio::time::Instant::now() + SET_MODE_RESPONSE_TIMEOUT;
+        tokio::time::timeout_at(
+            deadline,
+            self.command_tx.send(Request::SetMode {
+                mode,
+                deadline,
+                reply: tx,
+            }),
+        )
+        .await
+        .map_err(|_| ShellError::ResponseTimeout)?
+        .map_err(|_| ShellError::SessionClosed)?;
+        match tokio::time::timeout_at(deadline, rx).await {
             Ok(reply) => reply.map_err(|_| ShellError::SessionClosed)?,
             Err(_elapsed) => Err(ShellError::ResponseTimeout),
         }
@@ -218,6 +278,8 @@ impl<T: Transport + 'static> AsyncModem<T> {
 
     /// Trigger a `GetVersion` request. The response arrives as
     /// [`Event::Version`].
+    /// Request completion means written and flushed, not that a response was
+    /// received. Cancellation after submission can leave the request in flight.
     ///
     /// # Errors
     ///
@@ -226,7 +288,7 @@ impl<T: Transport + 'static> AsyncModem<T> {
     pub async fn request_version(&mut self) -> Result<(), ShellError> {
         let (tx, rx) = oneshot::channel();
         self.command_tx
-            .send(Command::GetVersion { reply: tx })
+            .send(Request::GetVersion { reply: tx })
             .await
             .map_err(|_| ShellError::SessionClosed)?;
         rx.await.map_err(|_| ShellError::SessionClosed)?
@@ -236,6 +298,8 @@ impl<T: Transport + 'static> AsyncModem<T> {
     /// arrives as [`Event::Status`]. The loop also polls status
     /// every 250 ms on its own, so this is only needed for explicit
     /// "check now" flows.
+    /// Request completion means written and flushed. Cancellation after
+    /// submission can leave the request in flight.
     ///
     /// # Errors
     ///
@@ -244,14 +308,19 @@ impl<T: Transport + 'static> AsyncModem<T> {
     pub async fn request_status(&mut self) -> Result<(), ShellError> {
         let (tx, rx) = oneshot::channel();
         self.command_tx
-            .send(Command::GetStatus { reply: tx })
+            .send(Request::GetStatus { reply: tx })
             .await
             .map_err(|_| ShellError::SessionClosed)?;
         rx.await.map_err(|_| ShellError::SessionClosed)?
     }
 
-    /// Send a raw frame: the escape hatch for protocols without a typed
-    /// command.
+    /// Write and flush a bounded payload with a typed command identifier.
+    ///
+    /// This bypasses D-STAR FIFO gating. Use the typed D-STAR submission
+    /// methods for voice traffic. `SET_MODE` and `SET_CONFIG` are reserved for
+    /// [`Self::set_mode`] and [`Self::configure_dstar`] so their ACKs cannot
+    /// resolve another operation. Payload validation precedes
+    /// channel submission. See [`Self::send_dstar_header`] for cancellation.
     ///
     /// # Errors
     ///
@@ -259,31 +328,38 @@ impl<T: Transport + 'static> AsyncModem<T> {
     /// - [`ShellError::Io`] if writing to the transport fails.
     /// - [`ShellError::Core`] if the codec rejects the frame (e.g.
     ///   oversized payload).
-    pub async fn send_raw(&mut self, command: u8, payload: Vec<u8>) -> Result<(), ShellError> {
+    /// - [`ShellError::ReservedCommand`] for `SET_MODE` or `SET_CONFIG`.
+    pub async fn send_raw(&mut self, command: Command, payload: Vec<u8>) -> Result<(), ShellError> {
+        if matches!(command, Command::SET_MODE | Command::SET_CONFIG) {
+            return Err(ShellError::ReservedCommand { command });
+        }
+        let frame = MmdvmFrame::with_payload(command, payload)?;
         let (tx, rx) = oneshot::channel();
         self.command_tx
-            .send(Command::SendRaw {
-                command,
-                payload,
-                reply: tx,
-            })
+            .send(Request::SendRaw { frame, reply: tx })
             .await
             .map_err(|_| ShellError::SessionClosed)?;
         rx.await.map_err(|_| ShellError::SessionClosed)?
     }
 
-    /// Graceful shutdown: flushes the TX queue (bounded by an
-    /// internal ~2 s deadline), exits the loop, and returns the
-    /// recovered transport.
+    /// Attempt to drain the TX queue, stop the task and reclaim its stream.
     ///
     /// Consumes the handle. After `shutdown` returns, the task has
     /// fully wound down and ownership of the transport is handed back
     /// to the caller so it can be reused (e.g. to switch back to CAT
     /// mode on a serial port). If the modem never grants FIFO space
     /// for queued frames, the flush deadline expires, the remaining
-    /// frames are dropped (logged and reported as
-    /// [`Event::TxDropped`]), and shutdown still completes; it never
-    /// hangs on a wedged modem.
+    /// frames are counted in [`ShutdownSummary::dropped_frames`] and also
+    /// reported as [`Event::TxDropped`]. Unread events are retained in the
+    /// bounded completion summary. The
+    /// two-second drain deadline starts when the loop accepts shutdown; it is
+    /// checked between operations. A write and flush can take up to five
+    /// seconds, including one already in progress before shutdown is accepted.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping this future detaches the task and loses recovery of its stream.
+    /// Already submitted commands and queued frames may still take effect.
     ///
     /// Works even if the loop already exited on its own (EOF or
     /// transport error): the transport recovered by the task is
@@ -293,13 +369,15 @@ impl<T: Transport + 'static> AsyncModem<T> {
     ///
     /// - [`ShellError::Io`] / [`ShellError::Core`] if the loop exited
     ///   with that error (the transport is not recoverable).
-    /// - [`ShellError::SessionClosed`] if the task panicked or was
-    ///   aborted before it could hand the transport back.
-    pub async fn shutdown(mut self) -> Result<T, ShellError> {
+    /// - [`ShellError::Task`] if the task panicked or was aborted before it
+    ///   could hand the transport back. Its dropped-frame count is unknown.
+    ///
+    /// Every failure retains its observations in [`ShutdownFailure::summary`].
+    pub async fn shutdown(mut self) -> Result<ModemShutdown<T>, ShutdownFailure> {
         let (tx, rx) = oneshot::channel();
         if self
             .command_tx
-            .send(Command::Shutdown { reply: tx })
+            .send(Request::Shutdown { reply: tx })
             .await
             .is_ok()
         {
@@ -314,36 +392,33 @@ impl<T: Transport + 'static> AsyncModem<T> {
             }
         }
 
-        // Drain any remaining events so the loop can finish its
-        // flush. Once the send half drops (when the loop exits), this
-        // terminates, also immediately if the loop was already gone.
-        while self.next_event().await.is_some() {}
-
-        // Reclaim the transport from the task.
-        let handle = self.join_handle.take().ok_or(ShellError::SessionClosed)?;
-        match handle.await {
-            Ok(transport_result) => transport_result,
-            Err(join_err) => {
-                // A panic in the loop would otherwise vanish into a
-                // generic "session closed".
-                tracing::warn!(
-                    target: "mmdvm::tokio_shell",
-                    error = %join_err,
-                    "modem task did not complete cleanly"
-                );
-                Err(ShellError::SessionClosed)
+        // Broadcast delivery never waits for a receiver. Joining first bounds
+        // the following drain to the final retained ring, even on a busy link.
+        let (transport, dropped_frames) = match self.join_handle.await {
+            Ok(completion) => (completion.transport, Some(completion.dropped_frames)),
+            Err(error) => (Err(ShellError::Task(error)), None),
+        };
+        let mut summary = ShutdownSummary {
+            dropped_frames,
+            events: Vec::new(),
+            skipped_events: 0,
+        };
+        loop {
+            match self.event_rx.try_recv() {
+                Ok(event) => summary.events.push(event),
+                Err(broadcast::error::TryRecvError::Lagged(count)) => {
+                    // The sender has stopped, so at most one lag notification
+                    // precedes the static retained suffix.
+                    summary.skipped_events = count;
+                }
+                Err(
+                    broadcast::error::TryRecvError::Closed | broadcast::error::TryRecvError::Empty,
+                ) => break,
             }
         }
-    }
-}
-
-impl<T: Transport + 'static> Drop for AsyncModem<T> {
-    fn drop(&mut self) {
-        // Dropping command_tx closes the channel, which signals the
-        // modem task to exit on its next loop iteration. The spawned
-        // task's JoinHandle is detached: if the caller never invoked
-        // `shutdown`, we do not await the task (awaiting in Drop would
-        // require blocking). The tokio runtime detaches the task and
-        // its transport will be dropped when the task finishes.
+        match transport {
+            Ok(transport) => Ok(ModemShutdown { transport, summary }),
+            Err(error) => Err(ShutdownFailure { error, summary }),
+        }
     }
 }

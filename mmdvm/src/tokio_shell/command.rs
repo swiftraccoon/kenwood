@@ -1,15 +1,26 @@
-//! `Command` enum for the channel between an [`super::AsyncModem`]
+//! Requests between an [`super::AsyncModem`]
 //! handle and the spawned [`super::ModemLoop`] task.
 
-use mmdvm_core::ModemMode;
+use mmdvm_core::{MmdvmFrame, ModemMode};
 use tokio::sync::oneshot;
 
 use crate::error::ShellError;
 
+use super::DstarConfiguration;
+
 /// Commands the consumer sends to the modem loop via
 /// [`super::AsyncModem`].
 #[derive(Debug)]
-pub(crate) enum Command {
+pub(crate) enum Request {
+    /// Configure D-STAR after confirming the selected protocol version.
+    ConfigureDstar {
+        /// Validated version-specific configuration.
+        configuration: DstarConfiguration,
+        /// Total submission, version, and ACK deadline.
+        deadline: tokio::time::Instant,
+        /// Resolves with the configuration ACK, NAK, or pre-write rejection.
+        reply: oneshot::Sender<Result<(), ShellError>>,
+    },
     /// Send a `GetVersion` request.
     GetVersion {
         /// Reply channel: `Ok(())` once the request is framed and
@@ -26,6 +37,8 @@ pub(crate) enum Command {
     SetMode {
         /// Target mode.
         mode: ModemMode,
+        /// Absolute deadline, including channel backpressure.
+        deadline: tokio::time::Instant,
         /// Reply channel, resolved with the modem's ACK/NAK for the
         /// mode change, not merely with the write result.
         reply: oneshot::Sender<Result<(), ShellError>>,
@@ -56,10 +69,8 @@ pub(crate) enum Command {
     /// Send a raw frame: the escape hatch for modes without a typed
     /// command.
     SendRaw {
-        /// The command byte.
-        command: u8,
-        /// The payload bytes (may be empty).
-        payload: Vec<u8>,
+        /// A frame whose payload length has already been validated.
+        frame: MmdvmFrame,
         /// Reply channel.
         reply: oneshot::Sender<Result<(), ShellError>>,
     },

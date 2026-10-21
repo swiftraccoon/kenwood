@@ -10,7 +10,7 @@
 //! 1. Send `GetVersion` + `GetStatus` immediately to learn the
 //!    protocol version and initial FIFO depths.
 //! 2. Enter the main `tokio::select!` (biased, in priority order):
-//!    - receive from [`Command`] channel (handle → loop)
+//!    - receive from [`Request`] channel (handle → loop)
 //!    - 250 ms periodic `GetStatus` poll (matches `MMDVMHost`'s
 //!      `m_statusTimer(1000, 0, 250)` at `Modem.cpp:245`)
 //!    - 10 ms playout tick to drain the [`TxQueue`] into the wire
@@ -23,11 +23,7 @@
 use std::time::Duration;
 
 use mmdvm_core::{
-    MMDVM_ACK, MMDVM_DEBUG_DUMP, MMDVM_DEBUG1, MMDVM_DEBUG2, MMDVM_DEBUG3, MMDVM_DEBUG4,
-    MMDVM_DEBUG5, MMDVM_DSTAR_DATA, MMDVM_DSTAR_EOT, MMDVM_DSTAR_HEADER, MMDVM_DSTAR_LOST,
-    MMDVM_GET_STATUS, MMDVM_GET_VERSION, MMDVM_NAK, MMDVM_SERIAL_DATA, MMDVM_SET_MODE,
-    MMDVM_TRANSPARENT, MmdvmFrame, ModemMode, ModemStatus, NakReason, VersionResponse,
-    decode_frame, encode_frame,
+    Command, MmdvmFrame, ModemMode, ModemStatus, NakReason, ProtocolVersion, VersionResponse,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -36,7 +32,7 @@ use tokio::time::Instant;
 use crate::error::ShellError;
 use crate::transport::Transport;
 
-use super::{Command, Event, TxQueue};
+use super::{DstarConfiguration, Event, Request, TaskCompletion, TxQueue};
 
 /// Period between automatic `GetStatus` polls.
 ///
@@ -48,27 +44,21 @@ const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// Mirrors `m_playoutTimer(1000, 0, 10)` in `MMDVMHost/Modem.cpp:247`.
 const PLAYOUT_INTERVAL: Duration = Duration::from_millis(10);
 
-/// RX buffer grow-as-needed chunk size, aligned with maximum MMDVM
-/// frame length (255).
+/// Bytes requested per transport read, enough for a maximum 510-byte frame.
 const RX_READ_CHUNK: usize = 512;
 
 /// Deadline for a single transport write (frame bytes + flush).
 ///
-/// A wedged write side (kernel TX buffer full under asserted flow
-/// control, hung USB endpoint) would otherwise freeze the entire
-/// loop inside a handler `.await`: no reads, no commands, no
-/// shutdown. 5 s is far beyond any healthy serial or Bluetooth SPP
-/// latency; on expiry the loop exits with [`Event::Fatal`].
+/// On expiry the loop emits [`Event::Fatal`] and retires the stream because a
+/// partially written frame cannot safely be followed by another command.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long a graceful shutdown keeps trying to flush queued TX
 /// frames before force-exiting.
 ///
-/// The queue holds at most 64 frames draining at one per 10 ms
-/// playout tick (~640 ms), plus status-poll latency to learn about
-/// freed FIFO space; 2 s covers the worst healthy case. A modem
-/// that grants no space within that window is treated as wedged;
-/// undelivered frames surface as [`Event::TxDropped`].
+/// Checked between loop operations after shutdown is accepted. A write and
+/// flush may additionally take [`WRITE_TIMEOUT`]. Undelivered frames are
+/// reported through [`Event::TxDropped`].
 const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Maximum retained RX buffer capacity, guarding against a malformed
@@ -77,31 +67,41 @@ const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 /// and the loop resyncs.
 const RX_BUFFER_HARD_CAP: usize = 8 * 1024;
 
+/// A configuration waiting for a version, or already written awaiting its reply.
+enum PendingConfiguration {
+    WaitingVersion {
+        configuration: DstarConfiguration,
+        deadline: Instant,
+        reply: oneshot::Sender<Result<(), ShellError>>,
+    },
+    Written(oneshot::Sender<Result<(), ShellError>>),
+}
+
 /// Main tokio task driving a single MMDVM modem.
 pub(crate) struct ModemLoop<T: Transport> {
     transport: T,
     rx_buffer: Vec<u8>,
-    command_rx: mpsc::Receiver<Command>,
+    command_rx: mpsc::Receiver<Request>,
     event_tx: broadcast::Sender<Event>,
     tx_queue: TxQueue,
     dstar_space: u8,
-    protocol_version: u8,
+    protocol_version: Option<ProtocolVersion>,
     shutting_down: bool,
     /// Deadline for the shutdown TX flush, set when the `Shutdown`
     /// command arrives; the loop force-exits once it passes.
     flush_deadline: Option<Instant>,
     /// Reply channel of an in-flight `SetMode` awaiting the modem's
-    /// ACK/NAK. The firmware acknowledges every `SetMode`
-    /// (`MMDVM/SerialPort.cpp` `processMessage`), so the caller's
-    /// result reflects whether the mode change actually happened.
+    /// ACK/NAK. A dropped or timed-out receiver does not remove this entry;
+    /// another mode change is refused until the previous reply arrives.
     pending_set_mode: Option<oneshot::Sender<Result<(), ShellError>>>,
+    pending_configuration: Option<PendingConfiguration>,
 }
 
 impl<T: Transport> ModemLoop<T> {
     /// Build a new loop.
     pub(crate) fn new(
         transport: T,
-        command_rx: mpsc::Receiver<Command>,
+        command_rx: mpsc::Receiver<Request>,
         event_tx: broadcast::Sender<Event>,
     ) -> Self {
         Self {
@@ -111,12 +111,11 @@ impl<T: Transport> ModemLoop<T> {
             event_tx,
             tx_queue: TxQueue::new(),
             dstar_space: 0,
-            // TH-D75 and newer MMDVMHost firmwares speak v2, so assume
-            // that until the first `VersionResponse` corrects us.
-            protocol_version: 2,
+            protocol_version: None,
             shutting_down: false,
             flush_deadline: None,
             pending_set_mode: None,
+            pending_configuration: None,
         }
     }
 
@@ -125,7 +124,7 @@ impl<T: Transport> ModemLoop<T> {
     ///
     /// On error the transport is dropped along with the loop state,
     /// since a failed transport is not useful to recover.
-    pub(crate) async fn run(mut self) -> Result<T, ShellError> {
+    pub(crate) async fn run(mut self) -> TaskCompletion<T> {
         let result = self.run_inner().await;
 
         // Every send_dstar_* call for these frames already reported
@@ -164,16 +163,20 @@ impl<T: Transport> ModemLoop<T> {
                 });
             }
         }
-        result.map(|()| self.transport)
+        TaskCompletion {
+            transport: result.map(|()| self.transport),
+            dropped_frames: undelivered,
+        }
     }
 
     async fn run_inner(&mut self) -> Result<(), ShellError> {
         // Initial handshake: send GetVersion, then GetStatus, so the
         // consumer's first couple of events describe the hardware
         // and its current state.
-        self.write_frame(&MmdvmFrame::new(MMDVM_GET_VERSION))
+        self.write_frame(&MmdvmFrame::new(Command::GET_VERSION))
             .await?;
-        self.write_frame(&MmdvmFrame::new(MMDVM_GET_STATUS)).await?;
+        self.write_frame(&MmdvmFrame::new(Command::GET_STATUS))
+            .await?;
 
         let mut read_chunk = [0u8; RX_READ_CHUNK];
 
@@ -188,6 +191,7 @@ impl<T: Transport> ModemLoop<T> {
         playout_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
+            self.dispatch_configuration().await?;
             if self.shutting_down {
                 if self.tx_queue.is_empty() {
                     tracing::debug!(
@@ -243,7 +247,7 @@ impl<T: Transport> ModemLoop<T> {
                     // response is the only way to learn that FIFO
                     // space freed up, which is exactly what the flush
                     // is waiting for.
-                    self.write_frame(&MmdvmFrame::new(MMDVM_GET_STATUS)).await?;
+                    self.write_frame(&MmdvmFrame::new(Command::GET_STATUS)).await?;
                     tracing::trace!(target: "mmdvm::hang_hunt", "select: status_tick handled");
                 }
 
@@ -286,28 +290,50 @@ impl<T: Transport> ModemLoop<T> {
     }
 
     /// Apply a command from the handle.
-    async fn apply_command(&mut self, cmd: Command) -> Result<(), ShellError> {
+    async fn apply_command(&mut self, cmd: Request) -> Result<(), ShellError> {
         match cmd {
-            Command::GetVersion { reply } => {
-                let result = self.write_frame(&MmdvmFrame::new(MMDVM_GET_VERSION)).await;
-                let _send_result = reply.send(result);
-            }
-            Command::GetStatus { reply } => {
-                let result = self.write_frame(&MmdvmFrame::new(MMDVM_GET_STATUS)).await;
-                let _send_result = reply.send(result);
-            }
-            Command::SetMode { mode, reply } => {
-                let frame = MmdvmFrame::with_payload(MMDVM_SET_MODE, vec![mode.as_byte()]);
-                match self.write_frame(&frame).await {
-                    // Written: the caller's reply now waits for the
-                    // modem's ACK/NAK (resolved in dispatch_frame).
-                    Ok(()) => self.pending_set_mode = Some(reply),
-                    Err(e) => {
-                        let _send_result = reply.send(Err(e));
-                    }
+            Request::ConfigureDstar {
+                configuration,
+                deadline,
+                reply,
+            } => {
+                if self.pending_configuration.is_some() {
+                    let _send_result = reply.send(Err(ShellError::ConfigurationPending));
+                } else {
+                    self.pending_configuration = Some(PendingConfiguration::WaitingVersion {
+                        configuration,
+                        deadline,
+                        reply,
+                    });
                 }
             }
-            Command::SendDStarHeader { bytes, reply } => {
+            Request::GetVersion { reply } => {
+                let reply = self
+                    .write_for_request(&MmdvmFrame::new(Command::GET_VERSION), reply)
+                    .await?;
+                let _send_result = reply.send(Ok(()));
+            }
+            Request::GetStatus { reply } => {
+                let reply = self
+                    .write_for_request(&MmdvmFrame::new(Command::GET_STATUS), reply)
+                    .await?;
+                let _send_result = reply.send(Ok(()));
+            }
+            Request::SetMode {
+                mode,
+                deadline,
+                reply,
+            } => {
+                if self.pending_set_mode.is_some() {
+                    let _send_result = reply.send(Err(ShellError::ModeChangePending));
+                } else if reply.is_closed() || Instant::now() >= deadline {
+                    let _send_result = reply.send(Err(ShellError::ResponseTimeout));
+                } else {
+                    let frame = MmdvmFrame::with_payload(Command::SET_MODE, vec![mode.as_byte()])?;
+                    self.pending_set_mode = Some(self.write_for_request(&frame, reply).await?);
+                }
+            }
+            Request::SendDStarHeader { bytes, reply } => {
                 let result =
                     self.tx_queue
                         .push_dstar_header(bytes)
@@ -316,7 +342,7 @@ impl<T: Transport> ModemLoop<T> {
                         });
                 let _send_result = reply.send(result);
             }
-            Command::SendDStarData { bytes, reply } => {
+            Request::SendDStarData { bytes, reply } => {
                 let result =
                     self.tx_queue
                         .push_dstar_data(bytes)
@@ -325,7 +351,7 @@ impl<T: Transport> ModemLoop<T> {
                         });
                 let _send_result = reply.send(result);
             }
-            Command::SendDStarEot { reply } => {
+            Request::SendDStarEot { reply } => {
                 let result = self
                     .tx_queue
                     .push_dstar_eot()
@@ -334,16 +360,11 @@ impl<T: Transport> ModemLoop<T> {
                     });
                 let _send_result = reply.send(result);
             }
-            Command::SendRaw {
-                command,
-                payload,
-                reply,
-            } => {
-                let frame = MmdvmFrame::with_payload(command, payload);
-                let result = self.write_frame(&frame).await;
-                let _send_result = reply.send(result);
+            Request::SendRaw { frame, reply } => {
+                let reply = self.write_for_request(&frame, reply).await?;
+                let _send_result = reply.send(Ok(()));
             }
-            Command::Shutdown { reply } => {
+            Request::Shutdown { reply } => {
                 self.shutting_down = true;
                 self.flush_deadline = Some(Instant::now() + SHUTDOWN_FLUSH_TIMEOUT);
                 let _send_result = reply.send(());
@@ -352,11 +373,62 @@ impl<T: Transport> ModemLoop<T> {
         Ok(())
     }
 
+    /// Send a waiting configuration only after a matching version is confirmed.
+    async fn dispatch_configuration(&mut self) -> Result<(), ShellError> {
+        let Some(pending) = self.pending_configuration.take() else {
+            return Ok(());
+        };
+        let PendingConfiguration::WaitingVersion {
+            configuration,
+            deadline,
+            reply,
+        } = pending
+        else {
+            self.pending_configuration = Some(pending);
+            return Ok(());
+        };
+        if reply.is_closed() || Instant::now() >= deadline {
+            let _send_result = reply.send(Err(ShellError::ResponseTimeout));
+        } else if let Some(got) = self.protocol_version {
+            let expected = configuration.protocol();
+            if expected == got {
+                let frame = MmdvmFrame::with_payload(
+                    Command::SET_CONFIG,
+                    configuration.payload().to_vec(),
+                )?;
+                let reply = self.write_for_request(&frame, reply).await?;
+                self.pending_configuration = Some(PendingConfiguration::Written(reply));
+            } else {
+                let _send_result = reply.send(Err(ShellError::ConfigurationProtocolMismatch {
+                    expected,
+                    got,
+                }));
+            }
+        } else {
+            self.pending_configuration = Some(PendingConfiguration::WaitingVersion {
+                configuration,
+                deadline,
+                reply,
+            });
+        }
+        Ok(())
+    }
+
+    /// Resolve a reply only for a configuration that reached the wire.
+    fn complete_configuration(&mut self, result: Result<(), ShellError>) {
+        match self.pending_configuration.take() {
+            Some(PendingConfiguration::Written(reply)) => {
+                let _send_result = reply.send(result);
+            }
+            pending => self.pending_configuration = pending,
+        }
+    }
+
     /// Walk the RX buffer, decoding every complete frame currently
     /// available.
     fn drain_rx(&mut self) {
         loop {
-            match decode_frame(&self.rx_buffer) {
+            match MmdvmFrame::from_bytes(&self.rx_buffer) {
                 Ok(Some((frame, consumed))) => {
                     // Drop the consumed prefix. `drain` returns an
                     // iterator that clears the range when dropped.
@@ -415,90 +487,107 @@ impl<T: Transport> ModemLoop<T> {
 
     /// Dispatch a decoded frame to the appropriate event variant.
     fn dispatch_frame(&mut self, frame: MmdvmFrame) {
-        match frame.command {
-            MMDVM_GET_VERSION => self.handle_version(&frame.payload),
-            MMDVM_GET_STATUS => self.handle_status(&frame.payload),
-            MMDVM_ACK => {
-                // The reference always sends the ACK'd command byte;
-                // defaulting a missing byte to 0 would misattribute
-                // the ACK to GetVersion (0x00).
-                if let Some(&cmd) = frame.payload.first() {
-                    if cmd == MMDVM_SET_MODE
+        match frame.command() {
+            Command::GET_VERSION => self.handle_version(frame.payload()),
+            Command::GET_STATUS => self.handle_status(frame.payload()),
+            Command::ACK => {
+                if let [cmd] = frame.payload() {
+                    let command = Command::from(*cmd);
+                    if command == Command::SET_MODE
                         && let Some(reply) = self.pending_set_mode.take()
                     {
                         let _send_result = reply.send(Ok(()));
                     }
-                    self.emit_event(Event::Ack { command: cmd });
+                    if command == Command::SET_CONFIG {
+                        self.complete_configuration(Ok(()));
+                    }
+                    self.emit_event(Event::Ack { command });
                 } else {
-                    self.protocol_violation(MMDVM_ACK, "empty ACK payload");
+                    self.protocol_violation(Command::ACK, "ACK requires one command byte");
                 }
             }
-            MMDVM_NAK => {
-                if let Some(&cmd) = frame.payload.first() {
-                    let reason = NakReason::from_byte(frame.payload.get(1).copied().unwrap_or(0));
-                    if cmd == MMDVM_SET_MODE
+            Command::NAK => {
+                if let [cmd, reason] = frame.payload() {
+                    let command = Command::from(*cmd);
+                    let reason = NakReason::from(*reason);
+                    if command == Command::SET_MODE
                         && let Some(reply) = self.pending_set_mode.take()
                     {
-                        let _send_result = reply.send(Err(ShellError::Nak {
-                            command: cmd,
-                            reason,
-                        }));
+                        let _send_result = reply.send(Err(ShellError::Nak { command, reason }));
                     }
-                    self.emit_event(Event::Nak {
-                        command: cmd,
-                        reason,
-                    });
+                    if command == Command::SET_CONFIG {
+                        self.complete_configuration(Err(ShellError::Nak { command, reason }));
+                    }
+                    self.emit_event(Event::Nak { command, reason });
                 } else {
-                    self.protocol_violation(MMDVM_NAK, "empty NAK payload");
+                    self.protocol_violation(Command::NAK, "NAK requires command and reason bytes");
                 }
             }
-            MMDVM_DSTAR_HEADER => self.emit_dstar_header(&frame.payload),
-            MMDVM_DSTAR_DATA => self.emit_dstar_data(&frame.payload),
-            MMDVM_DSTAR_LOST => {
+            Command::DSTAR_HEADER => self.emit_dstar_header(frame.payload()),
+            Command::DSTAR_DATA => self.emit_dstar_data(frame.payload()),
+            Command::DSTAR_LOST => {
                 self.emit_event(Event::DstarLost);
             }
-            MMDVM_DSTAR_EOT => {
+            Command::DSTAR_EOT => {
                 self.emit_event(Event::DstarEot);
             }
-            MMDVM_DEBUG1 | MMDVM_DEBUG2 | MMDVM_DEBUG3 | MMDVM_DEBUG4 | MMDVM_DEBUG5
-            | MMDVM_DEBUG_DUMP => {
-                self.emit_debug(frame.command, &frame.payload);
+            Command::DEBUG1
+            | Command::DEBUG2
+            | Command::DEBUG3
+            | Command::DEBUG4
+            | Command::DEBUG5
+            | Command::DEBUG_DUMP => {
+                self.emit_event(Event::Debug {
+                    command: frame.command(),
+                    payload: frame.into_payload(),
+                });
             }
-            MMDVM_SERIAL_DATA => {
-                self.emit_event(Event::SerialData(frame.payload));
+            Command::SERIAL_DATA => {
+                self.emit_event(Event::SerialData(frame.into_payload()));
             }
-            MMDVM_TRANSPARENT => {
-                self.emit_event(Event::TransparentData(frame.payload));
+            Command::TRANSPARENT => {
+                self.emit_event(Event::TransparentData(frame.into_payload()));
             }
             other => {
                 self.emit_event(Event::UnhandledResponse {
                     command: other,
-                    payload: frame.payload,
+                    payload: frame.into_payload(),
                 });
             }
         }
     }
 
-    /// Handle an `MMDVM_GET_VERSION` response payload.
+    /// Handle a `GET_VERSION` response payload.
     fn handle_version(&mut self, payload: &[u8]) {
         match VersionResponse::parse(payload) {
             Ok(v) => {
-                self.protocol_version = v.protocol;
+                self.protocol_version = Some(v.protocol());
+                self.dstar_space = 0;
                 self.emit_event(Event::Version(v));
             }
-            // A dropped version response means the assumed protocol
-            // version was never confirmed; if it's wrong, every
-            // status parse reads shifted offsets. Surface it.
-            Err(e) => self.protocol_violation(MMDVM_GET_VERSION, &e.to_string()),
+            Err(e) => self.protocol_violation(Command::GET_VERSION, &e.to_string()),
         }
     }
 
-    /// Handle an `MMDVM_GET_STATUS` response payload.
+    /// Handle a `GET_STATUS` response payload.
     fn handle_status(&mut self, payload: &[u8]) {
-        let parsed = if self.protocol_version >= 2 {
-            ModemStatus::parse_v2(payload)
-        } else {
-            ModemStatus::parse_v1(payload)
+        let Some(protocol) = self.protocol_version else {
+            self.protocol_violation(
+                Command::GET_STATUS,
+                "status arrived before a supported version response",
+            );
+            return;
+        };
+        let parsed = match protocol {
+            ProtocolVersion::V1 => ModemStatus::parse_v1(payload),
+            ProtocolVersion::V2 => ModemStatus::parse_v2(payload),
+            _ => {
+                self.protocol_violation(
+                    Command::GET_STATUS,
+                    "confirmed version has no supported status layout",
+                );
+                return;
+            }
         };
         match parsed {
             Ok(s) => {
@@ -508,14 +597,14 @@ impl<T: Transport> ModemLoop<T> {
             // A status that never parses freezes dstar_space and
             // stalls TX forever with every send reporting success, so
             // the consumer must be able to see that happening.
-            Err(e) => self.protocol_violation(MMDVM_GET_STATUS, &e.to_string()),
+            Err(e) => self.protocol_violation(Command::GET_STATUS, &e.to_string()),
         }
     }
 
     /// Emit [`Event::ProtocolViolation`] for a frame whose payload
     /// doesn't match its command's wire layout, with a matching
     /// `warn` log.
-    fn protocol_violation(&self, command: u8, detail: &str) {
+    fn protocol_violation(&self, command: Command, detail: &str) {
         tracing::warn!(
             target: "mmdvm::tokio_shell",
             command = format!("0x{command:02X}"),
@@ -553,7 +642,7 @@ impl<T: Transport> ModemLoop<T> {
             self.emit_event(Event::DstarHeaderRx { bytes });
         } else {
             self.protocol_violation(
-                MMDVM_DSTAR_HEADER,
+                Command::DSTAR_HEADER,
                 &format!(
                     "D-STAR header payload is {} bytes, expected 41",
                     payload.len()
@@ -569,34 +658,13 @@ impl<T: Transport> ModemLoop<T> {
             self.emit_event(Event::DstarDataRx { bytes });
         } else {
             self.protocol_violation(
-                MMDVM_DSTAR_DATA,
+                Command::DSTAR_DATA,
                 &format!(
                     "D-STAR data payload is {} bytes, expected 12",
                     payload.len()
                 ),
             );
         }
-    }
-
-    /// Decode a debug payload and emit it as [`Event::Debug`].
-    ///
-    /// `command` selects the level: DEBUG1..DEBUG5 map to 1..5, and
-    /// `MMDVM_DEBUG_DUMP` uses level 0 as a sentinel for "this is a
-    /// raw hex dump rather than readable text".
-    fn emit_debug(&self, command: u8, payload: &[u8]) {
-        let level = match command {
-            MMDVM_DEBUG1 => 1,
-            MMDVM_DEBUG2 => 2,
-            MMDVM_DEBUG3 => 3,
-            MMDVM_DEBUG4 => 4,
-            MMDVM_DEBUG5 => 5,
-            _ => 0,
-        };
-        let text = String::from_utf8_lossy(payload)
-            .trim_end_matches('\0')
-            .trim_end()
-            .to_owned();
-        self.emit_event(Event::Debug { level, text });
     }
 
     /// Release at most ONE queued D-STAR frame per playout tick,
@@ -608,7 +676,7 @@ impl<T: Transport> ModemLoop<T> {
     /// overshoot the modem's real FIFO.
     async fn drain_tx_queue(&mut self) -> Result<(), ShellError> {
         if let Some(frame) = self.tx_queue.pop_if_space_allows(self.dstar_space) {
-            let wire = MmdvmFrame::with_payload(frame.command, frame.payload);
+            let wire = MmdvmFrame::with_payload(frame.command, frame.payload)?;
             tracing::trace!(
                 target: "mmdvm::tokio_shell",
                 command = format!("0x{:02X}", frame.command),
@@ -626,12 +694,12 @@ impl<T: Transport> ModemLoop<T> {
     /// Encode `frame` and push the bytes to the transport, bounded
     /// by [`WRITE_TIMEOUT`] so a wedged write side cannot freeze the
     /// loop indefinitely.
-    async fn write_frame(&mut self, frame: &MmdvmFrame) -> Result<(), ShellError> {
-        let bytes = encode_frame(frame)?;
+    async fn write_frame(&mut self, frame: &MmdvmFrame) -> Result<(), std::io::Error> {
+        let bytes = frame.to_bytes();
         tracing::trace!(
             target: "mmdvm::hang_hunt",
             len = bytes.len(),
-            cmd = format!("0x{:02X}", frame.command),
+            cmd = format!("0x{:02X}", frame.command()),
             "write_frame: awaiting transport.write_all"
         );
         let write = async {
@@ -641,13 +709,242 @@ impl<T: Transport> ModemLoop<T> {
         match tokio::time::timeout(WRITE_TIMEOUT, write).await {
             Ok(result) => result?,
             Err(_elapsed) => {
-                return Err(ShellError::Io(std::io::Error::new(
+                return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     format!("transport write timed out after {WRITE_TIMEOUT:?}"),
-                )));
+                ));
             }
         }
         tracing::trace!(target: "mmdvm::hang_hunt", "write_frame: flushed");
+        Ok(())
+    }
+
+    /// Preserve the caller's write error and retire the partially written stream.
+    async fn write_for_request(
+        &mut self,
+        frame: &MmdvmFrame,
+        reply: oneshot::Sender<Result<(), ShellError>>,
+    ) -> Result<oneshot::Sender<Result<(), ShellError>>, ShellError> {
+        if let Err(error) = self.write_frame(frame).await {
+            let fatal = std::io::Error::new(error.kind(), error.to_string());
+            let _send_result = reply.send(Err(ShellError::Io(error)));
+            return Err(ShellError::Io(fatal));
+        }
+        Ok(reply)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{
+        ConfigurationError, ConfigurationProfile, SignalLevel, SignalLevels, TxDelay,
+    };
+    use super::*;
+
+    fn configuration(
+        profile: ConfigurationProfile,
+    ) -> Result<DstarConfiguration, ConfigurationError> {
+        DstarConfiguration::new(
+            profile,
+            TxDelay::try_from(10)?,
+            SignalLevels {
+                receive: SignalLevel::new(128),
+                transmit: SignalLevel::new(128),
+            },
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configuration_requires_matching_version_before_any_configuration_write()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (transport, mut peer) = tokio::io::duplex(128);
+        let (_commands, receiver) = mpsc::channel(1);
+        let (sender, _events) = broadcast::channel(8);
+        let mut modem = ModemLoop::new(transport, receiver, sender);
+        let (reply, response) = oneshot::channel();
+        modem
+            .apply_command(Request::ConfigureDstar {
+                configuration: configuration(ConfigurationProfile::MmdvmV2)?,
+                deadline: Instant::now() + Duration::from_secs(2),
+                reply,
+            })
+            .await?;
+        modem.dispatch_configuration().await?;
+        assert!(
+            matches!(
+                modem.pending_configuration,
+                Some(PendingConfiguration::WaitingVersion { .. })
+            ),
+            "an unconfirmed layout cannot reach the transport"
+        );
+        modem.handle_version(b"\x01TEST");
+        modem.dispatch_configuration().await?;
+        let response = tokio::time::timeout(Duration::from_millis(1), response).await;
+        assert!(
+            matches!(
+                response,
+                Ok(Ok(Err(ShellError::ConfigurationProtocolMismatch {
+                    expected: ProtocolVersion::V2,
+                    got: ProtocolVersion::V1,
+                })))
+            ),
+            "a different confirmed version rejects the selected configuration: {response:?}"
+        );
+        let mut byte = [0_u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), peer.read(&mut byte))
+                .await
+                .is_err(),
+            "neither unconfirmed nor mismatched configuration may write even a prefix"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_configuration_retains_reservation_until_its_own_reply()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (transport, mut peer) = tokio::io::duplex(128);
+        let (_commands, receiver) = mpsc::channel(1);
+        let (sender, _events) = broadcast::channel(8);
+        let mut modem = ModemLoop::new(transport, receiver, sender);
+        modem.handle_version(b"\x01TEST");
+        let configuration = configuration(ConfigurationProfile::MmdvmV1)?;
+        let (reply, response) = oneshot::channel();
+        modem
+            .apply_command(Request::ConfigureDstar {
+                configuration,
+                deadline: Instant::now() + Duration::from_secs(2),
+                reply,
+            })
+            .await?;
+        modem.dispatch_configuration().await?;
+        drop(response);
+        modem.dispatch_configuration().await?;
+        modem.dispatch_frame(MmdvmFrame::with_payload(
+            Command::ACK,
+            vec![Command::SET_MODE.get()],
+        )?);
+        let (reply, response) = oneshot::channel();
+        modem
+            .apply_command(Request::ConfigureDstar {
+                configuration,
+                deadline: Instant::now() + Duration::from_secs(2),
+                reply,
+            })
+            .await?;
+        let response = tokio::time::timeout(Duration::from_millis(1), response).await;
+        assert!(
+            matches!(response, Ok(Ok(Err(ShellError::ConfigurationPending)))),
+            "cancellation and an unrelated ACK cannot release a written configuration: {response:?}"
+        );
+        modem.dispatch_frame(MmdvmFrame::with_payload(
+            Command::ACK,
+            vec![Command::SET_CONFIG.get()],
+        )?);
+        let (reply, response) = oneshot::channel();
+        modem
+            .apply_command(Request::ConfigureDstar {
+                configuration,
+                deadline: Instant::now() + Duration::from_secs(2),
+                reply,
+            })
+            .await?;
+        modem.dispatch_configuration().await?;
+        modem.dispatch_frame(MmdvmFrame::with_payload(
+            Command::NAK,
+            vec![Command::SET_CONFIG.get(), 4],
+        )?);
+        assert!(
+            matches!(
+                response.await?,
+                Err(ShellError::Nak {
+                    command: Command::SET_CONFIG,
+                    reason: NakReason::DataIncorrect,
+                })
+            ),
+            "the new configuration receives its own rejection after the late ACK retires the first"
+        );
+        let mut bytes = [0_u8; 52];
+        let _read = peer.read_exact(&mut bytes).await?;
+        let (first, consumed) = MmdvmFrame::from_bytes(&bytes)?.ok_or("first configuration")?;
+        let (_, second) = bytes.split_at(consumed);
+        let (second, consumed) = MmdvmFrame::from_bytes(second)?.ok_or("second configuration")?;
+        assert_eq!(
+            consumed, 26,
+            "only two complete v1 configurations were written"
+        );
+        assert_eq!(
+            first, second,
+            "the refused overlap must write no third configuration"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn status_cannot_grant_capacity_before_a_supported_version()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (transport, _peer) = tokio::io::duplex(64);
+        let (_commands, receiver) = mpsc::channel(1);
+        let (sender, mut events) = broadcast::channel(8);
+        let mut modem = ModemLoop::new(transport, receiver, sender);
+        let status = [1, 0, 0, 255, 0, 0, 0, 0, 0, 0, 0, 0];
+
+        modem.handle_status(&status);
+        assert_eq!(
+            modem.dstar_space, 0,
+            "unsolicited status cannot grant FIFO capacity"
+        );
+        assert!(
+            matches!(
+                events.try_recv()?,
+                Event::ProtocolViolation {
+                    command: Command::GET_STATUS,
+                    ..
+                }
+            ),
+            "status before a version is an explicit protocol violation"
+        );
+        modem.handle_version(&[3]);
+        assert!(
+            matches!(
+                events.try_recv()?,
+                Event::ProtocolViolation {
+                    command: Command::GET_VERSION,
+                    ..
+                }
+            ),
+            "an unsupported version cannot establish the status layout"
+        );
+        modem.handle_status(&status);
+        assert_eq!(
+            modem.dstar_space, 0,
+            "a rejected version leaves transmission blocked"
+        );
+        assert!(
+            matches!(
+                events.try_recv()?,
+                Event::ProtocolViolation {
+                    command: Command::GET_STATUS,
+                    ..
+                }
+            ),
+            "status remains rejected after a malformed version"
+        );
+
+        modem.handle_version(b"\x01TEST");
+        assert!(
+            matches!(events.try_recv()?, Event::Version(_)),
+            "a supported version establishes the layout"
+        );
+        modem.handle_status(&[0, 1, 0, 17, 0, 0, 0]);
+        assert_eq!(
+            modem.dstar_space, 17,
+            "only confirmed-layout status grants capacity"
+        );
+        assert!(
+            matches!(events.try_recv()?, Event::Status(_)),
+            "confirmed status is observable"
+        );
         Ok(())
     }
 }
