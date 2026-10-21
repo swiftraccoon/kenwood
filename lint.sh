@@ -481,6 +481,8 @@ ensure_lockfiles() {
 
 run_inline "Cargo lockfiles present" ensure_lockfiles
 
+run cargo run --quiet -p workspace-policy -- check
+
 # ---------- parallel job groups ----------
 # Independent checks are separate jobs, not one background subshell
 # containing a serial command list. Output remains buffered per step so

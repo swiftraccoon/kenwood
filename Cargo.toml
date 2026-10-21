@@ -27,6 +27,7 @@ members = [
     "stargazer",
     "lodestar-core",
     "azimuth-core",
+    "workspace-policy",
 ]
 resolver = "3"
 

@@ -1,0 +1,182 @@
+version = 1
+
+[[packages]]
+name = "kenwood-schema"
+path = "kenwood-schema"
+
+[[packages]]
+name = "kenwood-transport"
+path = "kenwood-transport"
+
+[[packages]]
+name = "kenwood-thd75"
+path = "thd75"
+
+[[packages]]
+name = "thd75-tui"
+path = "thd75-tui"
+
+[[packages]]
+name = "thd75-repl"
+path = "thd75-repl"
+
+[[packages]]
+name = "dstar-gateway"
+path = "dstar-gateway"
+
+[[packages]]
+name = "dstar-gateway-core"
+path = "dstar-gateway-core"
+
+[[packages]]
+name = "dstar-gateway-server"
+path = "dstar-gateway-server"
+
+[[packages]]
+name = "if-dsp"
+path = "if-dsp"
+
+[[packages]]
+name = "thd75-listen"
+path = "thd75-listen"
+
+[[packages]]
+name = "aprs"
+path = "aprs"
+
+[[packages]]
+name = "aprs-is"
+path = "aprs-is"
+
+[[packages]]
+name = "ax25-codec"
+path = "ax25-codec"
+
+[[packages]]
+name = "kiss-tnc"
+path = "kiss-tnc"
+
+[[packages]]
+name = "mbelib-rs"
+path = "mbelib-rs"
+
+[[packages]]
+name = "mcp-d75-extract"
+path = "mcp-d75-extract"
+
+[[packages]]
+name = "kenwood-tmd750"
+path = "tmd750"
+
+[[packages]]
+name = "tmd750-repl"
+path = "tmd750-repl"
+
+[[packages]]
+name = "mmdvm"
+path = "mmdvm"
+
+[[packages]]
+name = "mmdvm-core"
+path = "mmdvm-core"
+
+[[packages]]
+name = "dmr-rewind"
+path = "dmr-rewind"
+
+[[packages]]
+name = "dmr-rewind-core"
+path = "dmr-rewind-core"
+
+[[packages]]
+name = "pulsar"
+path = "pulsar"
+
+[[packages]]
+name = "sextant"
+path = "sextant"
+
+[[packages]]
+name = "stargazer"
+path = "stargazer"
+
+[[packages]]
+name = "lodestar-core"
+path = "lodestar-core"
+
+[[packages]]
+name = "azimuth-core"
+path = "azimuth-core"
+
+[[packages]]
+name = "workspace-policy"
+path = "workspace-policy"
+
+[[fuzz]]
+manifest = "dstar-gateway-core/fuzz/Cargo.toml"
+
+[[fuzz]]
+manifest = "tmd750/fuzz/Cargo.toml"
+
+[[deviations]]
+package = "kenwood-transport"
+group = "rust"
+lint = "unsafe_code"
+level = "deny"
+reason = "The audited native Bluetooth module requires a narrow source expectation; all other unsafe remains denied."
+
+[[deviations]]
+package = "kenwood-thd75"
+group = "rust"
+lint = "unsafe_code"
+level = "deny"
+reason = "The audited Vision bridge requires a narrow source expectation; all other unsafe remains denied."
+
+[[deviations]]
+package = "lodestar-core"
+group = "rust"
+lint = "unsafe_code"
+level = "omitted"
+reason = "UniFFI generates required unsafe ABI entry points; handwritten modules and the source allowlist retain their separate enforcement."
+
+[[deviations]]
+package = "lodestar-core"
+group = "rust"
+lint = "unused_qualifications"
+level = "omitted"
+reason = "Generated UniFFI scaffolding uses fully qualified paths in the crate root; handwritten qualification requires review."
+
+[[deviations]]
+package = "lodestar-core"
+group = "clippy"
+lint = "missing_const_for_fn"
+level = "allow"
+reason = "Generated UniFFI ABI entry points cannot be const functions."
+
+[[deviations]]
+package = "lodestar-core"
+group = "clippy"
+lint = "redundant_pub_crate"
+level = "omitted"
+reason = "Nursery denial remains effective; this bridge does not enable the workspace's redundant-visibility exception."
+
+[[deviations]]
+package = "azimuth-core"
+group = "rust"
+lint = "unsafe_code"
+level = "omitted"
+reason = "UniFFI generates required unsafe ABI entry points; handwritten modules and the source allowlist retain their separate enforcement."
+
+[[deviations]]
+package = "azimuth-core"
+group = "rust"
+lint = "unused_qualifications"
+level = "omitted"
+reason = "Generated UniFFI scaffolding uses fully qualified paths in the crate root; handwritten qualification requires review."
+
+[[deviations]]
+package = "azimuth-core"
+group = "clippy"
+lint = "missing_const_for_fn"
+level = "allow"
+reason = "Generated UniFFI ABI entry points cannot be const functions."

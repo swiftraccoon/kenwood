@@ -1,0 +1,19 @@
+[package]
+name = "workspace-policy"
+version = "0.1.0"
+authors = ["swiftraccoon"]
+categories = ["development-tools"]
+edition = "2024"
+keywords = ["workspace", "policy", "lint", "ci"]
+license = "GPL-2.0-or-later"
+publish = false
+readme = "README.md"
+repository = "https://github.com/swiftraccoon/kenwood"
+rust-version = "1.94"
+description = "Checks Rust standards inventories and isolated workspace CI coverage"
+
+[dependencies]
+toml = "0.8"
+
+[lints]
+workspace = true
